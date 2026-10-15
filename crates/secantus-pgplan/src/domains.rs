@@ -32,7 +32,16 @@ thread_local! {
 }
 
 /// Install this database's domains.
-pub fn set_user_domains(domains: Vec<Domain>) {
+///
+/// A domain named after a `pg_catalog` type (`create domain int4 ...`) is
+/// held as `public.int4`: the bare name is the built-in, searched first
+/// (measured on 15.19), so only the qualified name reaches the domain.
+pub fn set_user_domains(mut domains: Vec<Domain>) {
+    for d in &mut domains {
+        if crate::pgtypes::shadowed_by_catalog(&d.name) {
+            d.name = format!("public.{}", d.name);
+        }
+    }
     PLAN_USER_DOMAINS.with(|d| *d.borrow_mut() = domains);
 }
 
@@ -43,10 +52,10 @@ pub fn user_domain(name: &str) -> Option<Domain> {
         Some(inner) => inner.to_string(),
         None => trimmed.to_ascii_lowercase(),
     };
-    let target = target
-        .strip_prefix("public.")
-        .unwrap_or(&target)
-        .to_string();
+    let target = match target.strip_prefix("public.") {
+        Some(bare) if !crate::pgtypes::shadowed_by_catalog(bare) => bare.to_string(),
+        _ => target,
+    };
     PLAN_USER_DOMAINS.with(|d| d.borrow().iter().find(|x| x.name == target).cloned())
 }
 

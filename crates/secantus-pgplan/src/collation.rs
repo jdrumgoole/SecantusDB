@@ -163,15 +163,37 @@ pub fn resolve(name: &str) -> Result<Resolved> {
             },
         });
     }
-    if let Some(tag) = name.strip_suffix("-x-icu") {
-        if tag.parse::<icu_locale::Locale>().is_ok() {
-            return Ok(Resolved::Icu {
-                locale: tag.to_string(),
-                deterministic: true,
-            });
-        }
+    if let Some(locale) = icu_builtin(name) {
+        return Ok(Resolved::Icu {
+            locale: locale.to_string(),
+            deterministic: true,
+        });
     }
     Err(does_not_exist(name))
+}
+
+/// PostgreSQL 15.19's ICU collations, as `pg_collation` lists them there:
+/// see the file's header for the ones left out.
+const ICU_COLLATIONS: &str = include_str!("pg_icu_collations.tsv");
+
+/// The built-in ICU collations served here, as `(oid, name, ICU locale)`.
+/// A `<tag>-x-icu` name is a collation only when it is one of these, as in
+/// PostgreSQL, where `initdb` creates one per locale its ICU knows.
+pub fn icu_collations() -> impl Iterator<Item = (i64, &'static str, &'static str)> {
+    ICU_COLLATIONS
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let mut p = l.split('\t');
+            Some((p.next()?.parse().ok()?, p.next()?, p.next()?))
+        })
+}
+
+/// The ICU locale of a built-in ICU collation.
+fn icu_builtin(name: &str) -> Option<&'static str> {
+    icu_collations()
+        .find(|(_, n, _)| *n == name)
+        .map(|(_, _, l)| l)
 }
 
 /// Is `locale` one ICU can build a collator for? (`CREATE COLLATION`'s
@@ -289,6 +311,55 @@ pub fn collatable(ty: &str) -> bool {
 }
 
 /// A `COLLATE` clause's collation name.
+/// Every `COLLATE` in a statement names a collation that exists: 42704 at
+/// the clause otherwise, as PostgreSQL's parse analysis reports it. Checked
+/// once here because some paths that only ORDER by a collation (an
+/// aggregate's `ORDER BY ... COLLATE`) fell back to no ordering at all.
+pub(crate) fn check_clauses(stmt: &N) -> Result<()> {
+    let check = |cc: &pg_query::protobuf::CollateClause| -> Result<()> {
+        resolve(&clause_name(cc)).map(|_| ()).inspect_err(|_| {
+            if cc.location >= 0 {
+                crate::set_error_location(cc.location);
+            }
+        })
+    };
+    // Over a column the type comes first (`int_col COLLATE "x"` is 42804
+    // `collations are not supported by type integer`), which only the
+    // planner can tell; it checks those itself.
+    let over_column = |cc: &pg_query::protobuf::CollateClause| {
+        matches!(
+            cc.arg.as_deref().and_then(|a| a.node.as_ref()),
+            Some(N::ColumnRef(_))
+        )
+    };
+    for (n, _, _, _) in stmt.nodes() {
+        match n {
+            pg_query::NodeRef::CollateClause(cc) if !over_column(cc) => check(cc)?,
+            // The node walk does not enter an aggregate's own ORDER BY.
+            pg_query::NodeRef::FuncCall(f) => {
+                for o in &f.agg_order {
+                    let Some(N::SortBy(sb)) = o.node.as_ref() else {
+                        continue;
+                    };
+                    let Some(inner) = sb.node.as_deref().and_then(|x| x.node.as_ref()) else {
+                        continue;
+                    };
+                    for (m, _, _, _) in inner.nodes() {
+                        if let pg_query::NodeRef::CollateClause(cc) = m {
+                            check(cc)?;
+                        }
+                    }
+                    if let N::CollateClause(cc) = inner {
+                        check(cc)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub fn clause_name(cc: &pg_query::protobuf::CollateClause) -> String {
     cc.collname
         .iter()
@@ -382,15 +453,15 @@ pub(crate) fn plan_create(d: &pg_query::protobuf::DefineStmt) -> Result<Statemen
             },
             _ => match user_collations().into_iter().find(|u| u.name == source) {
                 Some(u) => UserCollation { name, oid: 0, ..u },
-                None => match source.strip_suffix("-x-icu") {
-                    Some(tag) if tag.parse::<icu_locale::Locale>().is_ok() => UserCollation {
+                None => match icu_builtin(&source) {
+                    Some(locale) => UserCollation {
                         name,
                         provider: 'i',
-                        locale: tag.to_string(),
+                        locale: locale.to_string(),
                         deterministic: true,
                         oid: 0,
                     },
-                    _ => return Err(does_not_exist(&source)),
+                    None => return Err(does_not_exist(&source)),
                 },
             },
         }

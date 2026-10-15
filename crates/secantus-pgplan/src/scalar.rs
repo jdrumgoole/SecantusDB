@@ -76,6 +76,7 @@ const CATALOG_NAMES: &[&str] = &[
     "current_catalog",
     "current_setting",
     "pg_backend_pid",
+    "pg_client_encoding",
     "pg_reload_conf",
     "format_type",
     "obj_description",
@@ -84,6 +85,10 @@ const CATALOG_NAMES: &[&str] = &[
     "pg_get_expr",
     "pg_table_is_visible",
     "pg_relation_is_publishable",
+    "pg_relation_is_updatable",
+    "pg_column_is_updatable",
+    "pg_is_other_temp_schema",
+    "pg_settings_get_flags",
     "pg_get_userbyid",
     "pg_get_function_sqlbody",
     "pg_type_is_visible",
@@ -175,6 +180,8 @@ const SCALAR_NAMES: &[&str] = &[
     "lpad",
     "rpad",
     "to_hex",
+    "acldefault",
+    "makeaclitem",
     "cash_words",
     "getdatabaseencoding",
     "pg_encoding_to_char",
@@ -221,6 +228,9 @@ const SCALAR_NAMES: &[&str] = &[
     "now",
     // The planner's own: an inet / cidr value's order key (`enum_order`).
     "__net_sortkey",
+    "__range_sortkey",
+    "__typmod_coerce",
+    "__alias_check",
     "__net_op",
     "__net_arith",
     "__net_diff",
@@ -317,6 +327,11 @@ pub(crate) fn text(v: &Bson) -> String {
         // A boolean's text form is `t` / `f`: `concat(true)` is `t`
         // (measured), never `true`.
         Bson::Boolean(b) => (if *b { "t" } else { "f" }).to_string(),
+        // A record prints as its output function does: `concat(t)` over a
+        // row is `("ab ",1)` (15.19).
+        other if crate::record_value_text(other).is_some() => {
+            crate::record_value_text(other).unwrap_or_default()
+        }
         other => format!("{other:?}"),
     }
 }
@@ -776,6 +791,28 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         "__net_diff" => {
             need(2)?;
             crate::net::diff(&arg(0), &arg(1))
+        }
+        // `__alias_check` is evaluated by `const_value`, which can type its
+        // arguments; here (no types) it is the expression it wraps.
+        "__alias_check" => {
+            need(2)?;
+            Ok(arg(1))
+        }
+        // `__typmod_coerce(value, type, typmod)`: a modifier applied as a
+        // column assignment applies it (`typmod_cast`).
+        "__typmod_coerce" => {
+            need(3)?;
+            if arg(0) == Bson::Null || arg(2) == Bson::Null {
+                return Ok(Bson::Null);
+            }
+            let typmod = as_i64(&arg(2))
+                .and_then(|t| i32::try_from(t).ok())
+                .ok_or_else(|| wrong_args(name))?;
+            crate::fit_length(arg(0), &s(1), typmod)
+        }
+        "__range_sortkey" => {
+            need(2)?;
+            crate::range_ops::sort_key(&arg(0), &s(1))
         }
         "__net_sortkey" => {
             need(1)?;
@@ -1298,6 +1335,29 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                     .map_or(-1, |i| i as i32),
             ))
         }
+        // `acldefault` / `makeaclitem` (acl.c): strict, so a NULL is NULL.
+        "acldefault" | "makeaclitem" if args.contains(&Bson::Null) => Ok(Bson::Null),
+        "acldefault" => {
+            need(2)?;
+            let owner = as_i64(&arg(1)).ok_or_else(|| wrong_args(name))?;
+            Ok(Bson::Array(
+                crate::acl::acldefault(&text(&arg(0)), owner)?
+                    .into_iter()
+                    .map(Bson::String)
+                    .collect(),
+            ))
+        }
+        "makeaclitem" => {
+            need(4)?;
+            let oid = |i: usize| as_i64(&arg(i)).ok_or_else(|| wrong_args(name));
+            let grantable = matches!(arg(3), Bson::Boolean(true));
+            Ok(Bson::String(crate::acl::makeaclitem(
+                oid(0)?,
+                oid(1)?,
+                &text(&arg(2)),
+                grantable,
+            )?))
+        }
         "cash_words" => {
             need(1)?;
             match crate::money::cents_of(&arg(0)) {
@@ -1675,6 +1735,10 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             Ok(Bson::Array(out))
         }
         "pg_backend_pid" => Ok(Bson::Int32(BACKEND_PID.with(|p| p.get()))),
+        // The session's `client_encoding`, by its canonical name.
+        "pg_client_encoding" => Ok(Bson::String(
+            crate::session_setting("client_encoding").unwrap_or_else(|| "UTF8".into()),
+        )),
         // PostgreSQL answers true once the signal is sent, whatever the
         // reload then makes of the files.
         "pg_reload_conf" => {
@@ -1748,6 +1812,77 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                 crate::value_text(other).trim().parse().unwrap_or(-1),
             )),
         }),
+        // `pg_relation_is_updatable(rel, include_triggers)`: the events a
+        // relation takes, as a mask (insert 8, update 4, delete 16 -- 28 for
+        // all three): a table (a catalog too, measured on 15.19) takes all,
+        // a view all when it is automatically updatable and none otherwise,
+        // an oid naming nothing none. `pg_column_is_updatable` follows it.
+        "pg_relation_is_updatable" | "pg_column_is_updatable" => {
+            if args.contains(&Bson::Null) {
+                return Ok(Bson::Null);
+            }
+            let oid = args
+                .first()
+                .and_then(|v| crate::regclass_oid(v).or_else(|| as_i64(v)))
+                .unwrap_or(0);
+            let relation = crate::regclass_text(oid);
+            let mask = if oid == 0 || relation == oid.to_string() {
+                0
+            } else {
+                let bare = relation.trim_matches('"');
+                match crate::view_definition(bare).or_else(|| crate::view_definition(&relation)) {
+                    Some(sql) if !crate::view_dml::is_updatable(&sql) => 0,
+                    _ => 28,
+                }
+            };
+            Ok(if name == "pg_relation_is_updatable" {
+                Bson::Int32(mask)
+            } else {
+                Bson::Boolean(mask & 4 == 4)
+            })
+        }
+        // `pg_settings_get_flags(name)`: a setting's flags, from PostgreSQL
+        // 15.19's own (`pg_settings_flags.tsv`); the name is matched without
+        // case, and one no setting has is NULL.
+        "pg_settings_get_flags" => {
+            const FLAGS: &str = include_str!("pg_settings_flags.tsv");
+            let v = arg(0);
+            if v == Bson::Null {
+                return Ok(Bson::Null);
+            }
+            let wanted = text(&v).to_ascii_lowercase();
+            Ok(FLAGS
+                .lines()
+                .filter(|l| !l.starts_with('#'))
+                .filter_map(|l| l.split_once('\t'))
+                .find(|(n, _)| n.to_ascii_lowercase() == wanted)
+                .map_or(Bson::Null, |(_, flags)| {
+                    Bson::Array(
+                        flags
+                            .split(',')
+                            .filter(|f| !f.is_empty())
+                            .map(|f| Bson::String(f.to_string()))
+                            .collect(),
+                    )
+                }))
+        }
+        // `pg_is_other_temp_schema(oid)`: another session's `pg_temp_N`.
+        "pg_is_other_temp_schema" => {
+            let v = arg(0);
+            if v == Bson::Null {
+                return Ok(Bson::Null);
+            }
+            let oid = crate::regobj::from_bson(&v)
+                .map(|(_, o)| o)
+                .or_else(|| as_i64(&v));
+            let name = oid
+                .map(|o| crate::regobj::text("regnamespace", o))
+                .unwrap_or_default();
+            let own = crate::schemas::temp_schema();
+            Ok(Bson::Boolean(
+                name.starts_with("pg_temp_") && own.as_deref() != Some(name.as_str()),
+            ))
+        }
         "pg_relation_is_publishable" => Ok(
             match args.first().and_then(|a| match a {
                 Bson::Null => None,
@@ -1814,12 +1949,13 @@ fn format_type_call(args: &[Bson]) -> Result<Bson> {
     let Some(oid) = args.first().and_then(|v| match v {
         Bson::Int32(x) => Some(i64::from(*x)),
         Bson::Int64(x) => Some(*x),
-        _ => None,
+        // `format_type('timestamp'::regtype, 3)`: a regtype is its oid.
+        other => crate::regtype_oid(other),
     }) else {
         // A NULL OID is the one argument that DOES make it NULL.
         return Ok(Bson::Null);
     };
-    let Some(name) = crate::pgtypes::name_of_oid(oid) else {
+    let Some(name) = crate::pgtypes::type_name_of_oid(oid) else {
         // A user type (enum, composite, range, domain, ...) prints as its
         // regtype name; only an oid nothing knows is `???`.
         let text = crate::regtype_text(oid);
@@ -1834,27 +1970,64 @@ fn format_type_call(args: &[Bson]) -> Result<Bson> {
         Bson::Int64(x) => i32::try_from(*x).ok(),
         _ => None,
     });
-    Ok(Bson::String(format_type_text(name, typmod)))
+    Ok(Bson::String(format_type_text(&name, typmod)))
 }
 
 /// `format_type`'s rendering: the display name, with the declared width or
 /// precision put back on when the modifier carries one.
-pub(crate) fn format_type_text_public(name: &str, typmod: Option<i32>) -> String {
+pub fn format_type_text_public(name: &str, typmod: Option<i32>) -> String {
     format_type_text(name, typmod)
 }
 
 pub(crate) fn format_type_text(name: &str, typmod: Option<i32>) -> String {
+    // An array prints its element with the modifier, then `[]`
+    // (`timestamp(2) without time zone[]`).
+    if let Some(element) = name.strip_suffix("[]") {
+        return format!("{}[]", format_type_text(element, typmod));
+    }
     let display = crate::display_type(name);
-    let Some(typmod) = typmod.filter(|m| *m >= 4) else {
+    let Some(typmod) = typmod.filter(|m| *m >= 0) else {
         return display;
     };
+    // Each type's own `typmodout`, measured on PostgreSQL 15.19.
     match name {
-        // A `numeric`'s two numbers are packed into one modifier.
-        "numeric" | "decimal" => {
+        // A `numeric`'s two numbers are packed into one modifier; the scale
+        // is an 11-bit signed field.
+        "numeric" | "decimal" if typmod >= 4 => {
             let packed = typmod - 4;
-            format!("{display}({},{})", packed >> 16, packed & 0xffff)
+            let scale = ((packed & 0x7ff) ^ 1024) - 1024;
+            format!("{display}({},{scale})", (packed >> 16) & 0xffff)
         }
-        "varchar" | "bpchar" => format!("{display}({})", typmod - 4),
+        "varchar" | "bpchar" if typmod >= 4 => format!("{display}({})", typmod - 4),
+        "bit" | "varbit" => format!("{display}({typmod})"),
+        "timestamp" | "timestamptz" | "time" | "timetz" => {
+            let (base, rest) = display.split_once(' ').unwrap_or((display.as_str(), ""));
+            format!("{base}({typmod}) {rest}").trim_end().to_string()
+        }
+        "interval" => {
+            let (range, precision) = (typmod >> 16, typmod & 0xffff);
+            let fields = match range {
+                4 => " year",
+                2 => " month",
+                8 => " day",
+                1024 => " hour",
+                2048 => " minute",
+                4096 => " second",
+                6 => " year to month",
+                1032 => " day to hour",
+                3080 => " day to minute",
+                7176 => " day to second",
+                3072 => " hour to minute",
+                7168 => " hour to second",
+                6144 => " minute to second",
+                _ => "",
+            };
+            if precision == 0xffff {
+                format!("interval{fields}")
+            } else {
+                format!("interval{fields}({precision})")
+            }
+        }
         _ => display,
     }
 }
@@ -2496,14 +2669,19 @@ pub fn static_result_type(name: &str) -> &'static str {
         "abs" | "ceil" | "ceiling" | "floor" | "round" | "trunc" | "mod" | "div" => "numeric",
         "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow" | "sign" => "float8",
         "scale" | "min_scale" => "int4",
-        "current_schema" | "current_database" | "current_user" | "session_user" => "name",
+        "current_schema" | "current_database" | "current_user" | "session_user"
+        | "pg_client_encoding" => "name",
         "current_schemas" => "name[]",
         "char" => crate::QUOTED_CHAR,
         "trim_scale" => "numeric",
         "numeric_send" => "bytea",
         "starts_with" => "bool",
         n if n.starts_with("pg_") && n.ends_with("_is_visible") => "bool",
-        "pg_relation_is_publishable" => "bool",
+        "pg_relation_is_publishable" | "pg_column_is_updatable" | "pg_is_other_temp_schema" => {
+            "bool"
+        }
+        "pg_relation_is_updatable" => "int4",
+        "pg_settings_get_flags" => "text[]",
         "pg_get_userbyid" | "getdatabaseencoding" | "pg_encoding_to_char" => "name",
         "pg_char_to_encoding" => "int4",
         "pg_get_function_sqlbody" => "text",
@@ -2520,6 +2698,8 @@ pub fn static_result_type(name: &str) -> &'static str {
         | "jsonb_path_query_array"
         | "jsonb_path_query_first_tz"
         | "jsonb_path_query_array_tz" => "jsonb",
+        "acldefault" => "aclitem[]",
+        "makeaclitem" => "aclitem",
         "lpad" | "rpad" | "to_hex" | "cash_words" | "translate" | "overlay" | "quote_literal"
         | "quote_nullable" | "unistr" | "convert_from" | "normalize" => "text",
         "regexp_split_to_array" => "text[]",

@@ -984,6 +984,8 @@ impl PgHandler {
             && sel.distinct == secantus_pgplan::Distinct::None
             && sel.order.iter().all(|k| k.expr.is_none())
             && sel.offset >= 0
+            // WITH TIES reads past the LIMIT the top-k keeps.
+            && !sel.with_ties
             && sel.lock.is_none()
             && sel.lock_clauses.is_empty();
         if !plain_outer {

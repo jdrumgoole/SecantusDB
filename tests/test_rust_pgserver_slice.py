@@ -371,10 +371,10 @@ def test_duplicate_key_reports_what_postgres_reports(home: Path) -> None:
         # has no such operator, so this moved from 0A000 to 42883 rather than
         # becoming legal. It used to return no rows, silently.
         ("SELECT * FROM t WHERE n LIKE 'x'", "42883"),
-        # `ORDER BY n + 1` is IMPLEMENTED now, so it is no longer a refusal.
-        # `ORDER BY ... USING` still is, and keeps this row exercising the
-        # ORDER BY path rather than losing the coverage entirely.
-        ("SELECT * FROM t ORDER BY n USING <", "0A000"),
+        # `ORDER BY n + 1` and `ORDER BY ... USING <` are IMPLEMENTED now;
+        # an operator the type has none of is PostgreSQL 15.19's 42883, which
+        # keeps this row exercising the ORDER BY path.
+        ("SELECT * FROM t ORDER BY n USING @@", "42883"),
         # The PK is the document's `_id`, which storage treats as immutable.
         ("UPDATE t SET nope = 1", "42703"),
         ("DELETE FROM missing", "42P01"),

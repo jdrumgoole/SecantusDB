@@ -508,6 +508,47 @@ fn eval(op: &str, lhs: &Bson, rhs: &Bson, lt: &str, rt: &str) -> Result<Bson> {
                 })?;
             Ok(Bson::Boolean(if op == "=" { same } else { !same }))
         }
+        // multirangetypes.c: the position tests compare the multiranges'
+        // spans (first lower bound, last upper bound); an empty one is
+        // never before, after, beside or overlapping-left of anything.
+        "<<" | ">>" | "&<" | "&>" | "-|-" => {
+            let (x, y) = (norm(ma)?, norm(mb)?);
+            let (Some(xf), Some(xl), Some(yf), Some(yl)) =
+                (x.first(), x.last(), y.first(), y.last())
+            else {
+                return Ok(Bson::Boolean(false));
+            };
+            Ok(Bson::Boolean(match op {
+                "<<" => cmp(&upper(xl), &lower(yf), &e)?.is_lt(),
+                ">>" => cmp(&lower(xf), &upper(yl), &e)?.is_gt(),
+                "&<" => cmp(&upper(xl), &upper(yl), &e)?.is_le(),
+                "&>" => cmp(&lower(xf), &lower(yf), &e)?.is_ge(),
+                _ => {
+                    bounds_adjacent(&upper(xl), &lower(yf), &e)?
+                        || bounds_adjacent(&upper(yl), &lower(xf), &e)?
+                }
+            }))
+        }
+        // `multirange_cmp`: range by range, then the shorter is smaller.
+        "<" | "<=" | ">" | ">=" => {
+            let (x, y) = (norm(ma)?, norm(mb)?);
+            let mut ord = std::cmp::Ordering::Equal;
+            for (p, q) in x.iter().zip(&y) {
+                ord = range_order(p, q, &e)?;
+                if ord.is_ne() {
+                    break;
+                }
+            }
+            if ord.is_eq() {
+                ord = x.len().cmp(&y.len());
+            }
+            Ok(Bson::Boolean(match op {
+                "<" => ord.is_lt(),
+                "<=" => ord.is_le(),
+                ">" => ord.is_gt(),
+                _ => ord.is_ge(),
+            }))
+        }
         _ => Err(Error::Unsupported(format!("multirange operator {op}"))),
     }
 }
@@ -530,4 +571,112 @@ pub fn result_type(op: &str, lt: &str, rt: &str) -> Option<String> {
         }
         _ => "bool".to_string(),
     })
+}
+
+/// An element as a string whose byte order is its type's order, ending in a
+/// byte below every byte it can contain so a longer value sorts after its
+/// prefix. Integers are offset into unsigned hex; a numeric is its sign,
+/// exponent and digits (inverted when negative); the date / time types
+/// are their canonical text, which already sorts.
+fn element_key(v: &str, element: &str) -> String {
+    match element {
+        "int4" | "int8" => match v.trim().parse::<i64>() {
+            Ok(i) => format!("{:016x} ", (i as u64) ^ (1 << 63)),
+            Err(_) => format!("{v} "),
+        },
+        "numeric" => numeric_key(v.trim()),
+        _ => format!("{v} "),
+    }
+}
+
+/// `numeric` order as text: `0` below `1` (zero) below `2`, then a biased
+/// decimal exponent and the significant digits; a negative value inverts
+/// both so a larger magnitude sorts first.
+fn numeric_key(v: &str) -> String {
+    let (neg, body) = match v.strip_prefix('-') {
+        Some(b) => (true, b),
+        None => (false, v.strip_prefix('+').unwrap_or(v)),
+    };
+    if body.eq_ignore_ascii_case("nan") {
+        return "3 ".into();
+    }
+    if body.eq_ignore_ascii_case("infinity") {
+        return if neg { "/ ".into() } else { "2~ ".into() };
+    }
+    let (int, frac) = body.split_once('.').unwrap_or((body, ""));
+    let digits: String = format!("{int}{frac}");
+    let lead = digits.len() - digits.trim_start_matches('0').len();
+    let sig = digits.trim_start_matches('0').trim_end_matches('0');
+    if sig.is_empty() {
+        return "1 ".into();
+    }
+    // The exponent of the first significant digit, biased positive.
+    let exp = int.len() as i64 - lead as i64 + 50_000;
+    if neg {
+        let inv: String = sig
+            .chars()
+            .map(|c| char::from(b'9' - (c as u8 - b'0')))
+            .collect();
+        format!("0{:05}{inv}~", 99_999 - exp)
+    } else {
+        format!("2{exp:05}{sig} ")
+    }
+}
+
+/// One bound's key: an infinite lower bound first and an infinite upper
+/// bound last; at one value an inclusive lower bound sorts before an
+/// exclusive one and an exclusive upper bound before an inclusive one
+/// (`range_cmp_bounds`).
+fn bound_key(b: &Bound, element: &str) -> String {
+    match (&b.val, b.lower) {
+        (None, true) => "0".into(),
+        (None, false) => "2".into(),
+        (Some(v), lower) => {
+            let flag = if lower == b.inclusive { '0' } else { '1' };
+            format!("1{}{flag}", element_key(v, element))
+        }
+    }
+}
+
+fn one_range_key(r: &Range, element: &str) -> String {
+    if r.empty {
+        return "0".into();
+    }
+    format!(
+        "1{}{}",
+        bound_key(&lower(r), element),
+        bound_key(&upper(r), element)
+    )
+}
+
+/// `__range_sortkey(value, type)`: a string whose order is `range_cmp` for a
+/// range, `multirange_cmp` for a multirange (range by range, a shorter one
+/// first) and `charlt` for a `"char"`, so ORDER BY can sort the value by it.
+pub fn sort_key(v: &Bson, ty: &str) -> Result<Bson> {
+    if *v == Bson::Null {
+        return Ok(Bson::Null);
+    }
+    // A `"char"`: its one byte, which its text spells `\ooo` when the high
+    // bit is set (and as nothing for the zero byte).
+    if ty == crate::QUOTED_CHAR {
+        let text = crate::render_value_text(v);
+        let byte = match text.strip_prefix('\\') {
+            Some(oct) if oct.len() == 3 => u8::from_str_radix(oct, 8).unwrap_or(0),
+            _ => text.bytes().next().unwrap_or(0),
+        };
+        return Ok(Bson::String(format!("{byte:02x}")));
+    }
+    Ok(Bson::String(match side(v, ty)? {
+        Side::Range(r, t) => one_range_key(&r, &element(&t)?),
+        Side::Multi(m, t) => {
+            let e = element(&t)?;
+            let mut key: String = range::normalise_multirange(m, &t)?
+                .iter()
+                .map(|r| format!("1{}", one_range_key(r, &e)))
+                .collect();
+            key.push('0');
+            key
+        }
+        Side::Elem(e) => crate::render_value_text(&e),
+    }))
 }

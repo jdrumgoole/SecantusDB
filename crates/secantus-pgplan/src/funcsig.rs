@@ -215,6 +215,63 @@ pub(crate) fn operator_resolves(op: &str, l: &str, r: &str) -> Option<bool> {
     Some(cands.iter().any(|(a, b)| accepts(a, l) && accepts(b, r)))
 }
 
+/// Is `l op r` over two known built-in types AMBIGUOUS -- PostgreSQL's
+/// 42725 `operator is not unique`? `oper_select_candidate` narrows the
+/// operators that take the operands (exactly or by implicit cast) as
+/// `func_select_candidate` narrows functions: most exact matches, then most
+/// exact-or-preferred matches; more than one left is ambiguous (`macaddr =
+/// macaddr8`, each castable to the other, measured on 15.19). Not judged
+/// (false) for arrays, `unknown`, or a polymorphic candidate.
+pub(crate) fn operator_ambiguous(op: &str, l: &str, r: &str) -> bool {
+    let cats = categories();
+    if l == "unknown"
+        || r == "unknown"
+        || l.ends_with("[]")
+        || r.ends_with("[]")
+        || !cats.contains_key(l)
+        || !cats.contains_key(r)
+    {
+        return false;
+    }
+    let Some(all) = binary_operators().get(op) else {
+        return false;
+    };
+    let mut cands: Vec<&(String, String)> = all
+        .iter()
+        .filter(|(a, b)| accepts(a, l) && accepts(b, r))
+        .collect();
+    let args = [l, r];
+    let params = |c: &(String, String)| [c.0.clone(), c.1.clone()];
+    if cands.len() < 2
+        || cands.iter().any(|c| *c.0 == *l && *c.1 == *r)
+        || cands.iter().flat_map(|c| params(c)).any(|p| {
+            p.starts_with("any") || matches!(p.as_str(), "record" | "internal" | "cstring")
+        })
+    {
+        return false;
+    }
+    let keep_best = |cands: &mut Vec<&(String, String)>, score: &dyn Fn(&str, &str) -> bool| {
+        let count = |c: &&(String, String)| {
+            params(c)
+                .iter()
+                .zip(args)
+                .filter(|(p, a)| score(p, a))
+                .count()
+        };
+        let best = cands.iter().map(count).max().unwrap_or(0);
+        cands.retain(|c| count(c) == best);
+    };
+    keep_best(&mut cands, &|p, a| p == a);
+    keep_best(&mut cands, &|p, a| {
+        p == a
+            || matches!(
+                (cats.get(p), cats.get(a)),
+                (Some((pc, true)), Some((ac, _))) if pc == ac
+            )
+    });
+    cands.len() > 1
+}
+
 /// `pg_type.typcategory` of a built-in type, by oid.
 pub(crate) fn category_of_oid(oid: i64) -> Option<char> {
     let name = crate::pgtypes::name_of_oid(oid)?;
@@ -312,6 +369,88 @@ fn select_candidates<'a>(name: &str, args: &[String]) -> Option<Vec<&'a Sig>> {
 /// category if any candidate offers it there, else the one category every
 /// candidate agrees on, keeping a preferred type where one is offered.
 /// `None` unless exactly one non-variadic, non-polymorphic overload is left.
+/// The concrete parameter types of the one polymorphic overload a call of
+/// constants reaches, the polymorphic ones fixed by its typed arguments
+/// (`enforce_generic_type_consistency`): `array_append('{1}', 2)` reads its
+/// literal as `int4[]`. With no typed argument, the `anycompatible` family
+/// reads every literal as `text` (`array_cat('{1}', '{2}')` is `text[]`).
+/// Only the element / array / non-array families; `None` when typed
+/// arguments disagree, which needs PostgreSQL's common-type rules.
+pub(crate) fn polymorphic_args(name: &str, args: &[String]) -> Option<Vec<String>> {
+    if crate::scalar::is_catalog_reader(name) || name.starts_with("pg_") || args.is_empty() {
+        return None;
+    }
+    let cats = categories();
+    if args
+        .iter()
+        .any(|a| a != "unknown" && !cats.contains_key(a.as_str()))
+    {
+        return None;
+    }
+    let overloads = sigs().get(name)?;
+    let cands: Vec<&Sig> = overloads
+        .iter()
+        .filter(|s| !s.variadic && s.args.len() == args.len() && sig_accepts(s, args))
+        .collect();
+    let [only] = cands.as_slice() else {
+        return None;
+    };
+    let scalar = |p: &str| {
+        matches!(
+            p,
+            "anyelement" | "anynonarray" | "anycompatible" | "anycompatiblenonarray"
+        )
+    };
+    let array = |p: &str| matches!(p, "anyarray" | "anycompatiblearray");
+    if only
+        .args
+        .iter()
+        .any(|p| p.starts_with("any") && p != "any" && !scalar(p) && !array(p))
+    {
+        return None;
+    }
+    let mut element: Option<String> = None;
+    for (p, a) in only.args.iter().zip(args) {
+        if a == "unknown" {
+            continue;
+        }
+        let e = if array(p) {
+            a.strip_suffix("[]")?.to_string()
+        } else if scalar(p) {
+            a.clone()
+        } else {
+            continue;
+        };
+        match &element {
+            Some(have) if *have != e => return None,
+            _ => element = Some(e),
+        }
+    }
+    let compatible = only.args.iter().any(|p| p.starts_with("anycompatible"));
+    let element = match element {
+        Some(e) => e,
+        None if compatible => "text".to_string(),
+        None => return None,
+    };
+    if !only.args.iter().any(|p| scalar(p) || array(p)) {
+        return None;
+    }
+    Some(
+        only.args
+            .iter()
+            .map(|p| {
+                if array(p) {
+                    format!("{element}[]")
+                } else if scalar(p) {
+                    element.clone()
+                } else {
+                    p.clone()
+                }
+            })
+            .collect(),
+    )
+}
+
 pub(crate) fn resolved_args(name: &str, args: &[String]) -> Option<Vec<String>> {
     resolved_sig(name, args).map(|s| s.args.clone())
 }
@@ -335,6 +474,48 @@ fn resolved_sig(name: &str, args: &[String]) -> Option<&'static Sig> {
 /// A call with untyped arguments that `func_select_candidate` cannot
 /// settle: several overloads remain, or the unknown positions' categories
 /// conflict. PostgreSQL's 42725 `function f(unknown) is not unique`.
+/// PostgreSQL's 42804 `could not determine polymorphic type because input
+/// has type unknown`: the one overload a call of constants can reach takes a
+/// polymorphic parameter (`anyarray`, `anyelement`, ..., not the
+/// `anycompatible` family) and every argument
+/// in such a position is an untyped literal, so nothing fixes the type
+/// (`array_length('{1,2,3}', 1)`, measured on 15.19).
+pub(crate) fn unknown_polymorphic(name: &str, args: &[String]) -> bool {
+    if crate::scalar::is_catalog_reader(name) || name.starts_with("pg_") || args.is_empty() {
+        return false;
+    }
+    let cats = categories();
+    if args
+        .iter()
+        .any(|a| a != "unknown" && !cats.contains_key(a.as_str()))
+    {
+        return false;
+    }
+    let Some(overloads) = sigs().get(name) else {
+        return false;
+    };
+    let cands: Vec<&Sig> = overloads
+        .iter()
+        .filter(|s| !s.variadic && s.args.len() == args.len() && sig_accepts(s, args))
+        .collect();
+    let [only] = cands.as_slice() else {
+        return false;
+    };
+    // The `anycompatible` family reads an untyped literal as `text`
+    // instead (`array_cat('{1}', '{2}')` is `{1,2}`); `any` is no
+    // polymorphic type at all.
+    let polymorphic =
+        |p: &str| p.starts_with("any") && p != "any" && !p.starts_with("anycompatible");
+    let positions: Vec<usize> = only
+        .args
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| polymorphic(p))
+        .map(|(i, _)| i)
+        .collect();
+    !positions.is_empty() && positions.iter().all(|&i| args[i] == "unknown")
+}
+
 pub(crate) fn unknown_ambiguous(name: &str, args: &[String]) -> bool {
     matches!(unknown_resolution(name, args), Some(Err(())))
 }
@@ -361,11 +542,16 @@ fn unknown_resolution(
         .iter()
         .filter(|s| !s.variadic && s.args.len() == args.len() && sig_accepts(s, args))
         .collect();
-    if cands
+    // A polymorphic candidate is judged only when every argument is
+    // untyped, and only for ambiguity: its parameters' category is the
+    // pseudo-types' `P`, so `unnest('{1,2}')` (anyarray, anymultirange,
+    // tsvector) has candidates of two categories and is 42725, while one
+    // left standing would need the polymorphic rules, not modelled here.
+    let polymorphic = cands
         .iter()
         .flat_map(|s| s.args.iter())
-        .any(|p| p.starts_with("any") || matches!(p.as_str(), "record" | "internal" | "cstring"))
-    {
+        .any(|p| p.starts_with("any") || matches!(p.as_str(), "record" | "internal" | "cstring"));
+    if polymorphic && !args.iter().all(|a| a == "unknown") {
         return None;
     }
     let keep_best = |cands: &mut Vec<&Sig>, score: &dyn Fn(&str, &str) -> bool| {
@@ -387,39 +573,77 @@ fn unknown_resolution(
                 (Some((pc, true)), Some((ac, _))) if pc == ac
             )
     });
-    for (i, a) in args.iter().enumerate() {
-        if a != "unknown" || cands.len() < 2 {
-            continue;
-        }
-        let at = |s: &Sig| cats.get(s.args[i].as_str()).copied();
-        let mut chosen: Option<char> = None;
-        let mut conflict = false;
-        for s in &cands {
-            let (c, _) = at(s)?;
-            if c == 'S' {
-                chosen = Some('S');
-                conflict = false;
+    // The unknown positions, as `func_select_candidate` takes them: a
+    // category for EACH position over all the remaining candidates (a
+    // string category wins a conflict, any other conflict leaves the
+    // unknowns unresolved), and only then the candidates that agree at
+    // every position -- kept if any do. Deciding one position at a time
+    // let `ts_headline('english', 'a b c', 'b')` settle on one overload
+    // where PostgreSQL 15 finds none agreeing at all three (42725).
+    if cands.len() > 1 {
+        let mut slots: Vec<(usize, char, bool)> = Vec::new();
+        let mut resolved = true;
+        for (i, a) in args.iter().enumerate() {
+            if a != "unknown" {
+                continue;
+            }
+            let mut slot: Option<(char, bool)> = None;
+            let mut conflict = false;
+            for s in &cands {
+                let (c, p) = *cats.get(s.args[i].as_str())?;
+                match slot {
+                    None => slot = Some((c, p)),
+                    Some((sc, sp)) if sc == c => slot = Some((sc, sp || p)),
+                    Some(_) if c == 'S' => slot = Some((c, p)),
+                    Some(_) => conflict = true,
+                }
+            }
+            let (c, p) = slot?;
+            if conflict && c != 'S' {
+                resolved = false;
                 break;
             }
-            match chosen {
-                None => chosen = Some(c),
-                Some(x) if x != c => conflict = true,
-                _ => {}
+            slots.push((i, c, p));
+        }
+        if resolved {
+            let keep: Vec<&Sig> = cands
+                .iter()
+                .copied()
+                .filter(|s| {
+                    slots.iter().all(|&(i, c, p)| {
+                        cats.get(s.args[i].as_str())
+                            .is_some_and(|&(sc, sp)| sc == c && (!p || sp))
+                    })
+                })
+                .collect();
+            if !keep.is_empty() {
+                cands = keep;
             }
         }
-        if conflict {
-            return Some(Err(()));
-        }
-        let chosen = chosen?;
-        cands.retain(|s| at(s).is_some_and(|(c, _)| c == chosen));
-        if cands.iter().any(|s| at(s).is_some_and(|(_, p)| p)) {
-            cands.retain(|s| at(s).is_some_and(|(_, p)| p));
+    }
+    // Last gasp: the known arguments all of one type, with the unknowns
+    // taken as that type, may leave exactly one candidate.
+    if cands.len() > 1 {
+        let mut known = args.iter().filter(|a| *a != "unknown");
+        if let Some(first) = known.next() {
+            if known.all(|k| k == first) {
+                let as_known: Vec<String> = args.iter().map(|_| first.clone()).collect();
+                let fits: Vec<&Sig> = cands
+                    .iter()
+                    .copied()
+                    .filter(|s| sig_accepts(s, &as_known))
+                    .collect();
+                if let [one] = fits.as_slice() {
+                    cands = vec![*one];
+                }
+            }
         }
     }
     match cands.as_slice() {
+        [_, _, ..] => Some(Err(())),
+        _ if polymorphic => None,
         [s] => Some(Ok(*s)),
         [] => None,
-        _ => Some(Err(())),
     }
 }
 

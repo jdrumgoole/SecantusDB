@@ -336,6 +336,25 @@ fn substitute(
 /// `inner` has had its own uncorrelated subqueries resolved already; `outer`
 /// is the column names the enclosing query's FROM exposes, which is what
 /// tells a correlation from a typo for an UNQUALIFIED reference.
+/// Whether a FROM-less subquery names a column of the outer query: it has
+/// nothing else a bare name could mean, so it is correlated.
+pub(crate) fn fromless_outer_ref(inner: &pg_query::protobuf::SelectStmt, outer: &[String]) -> bool {
+    if !inner.from_clause.is_empty() {
+        return false;
+    }
+    let mut found = false;
+    let mut probe = inner.clone();
+    let _ = walk_select(&mut probe, &mut |n| {
+        if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+            if let Some(parts) = parts_of(c) {
+                found |= parts.len() == 1 && outer.contains(&parts[0]);
+            }
+        }
+        Ok(())
+    });
+    found
+}
+
 pub(crate) fn correlate(
     sl: &pg_query::protobuf::SubLink,
     inner: &pg_query::protobuf::SelectStmt,
@@ -362,8 +381,11 @@ pub(crate) fn correlate(
     walk_select(&mut probe, &mut |n| {
         if let Some(N::ColumnRef(c)) = n.node.as_ref() {
             if let Some(parts) = parts_of(c) {
-                if parts.len() >= 2
-                    && !names.contains(&parts[parts.len() - 2])
+                // With no FROM of its own, a bare name can only be the
+                // outer row's (`SET v = (SELECT v + 1)`).
+                let bare_outer =
+                    parts.len() == 1 && inner.from_clause.is_empty() && outer.contains(&parts[0]);
+                if (bare_outer || parts.len() >= 2 && !names.contains(&parts[parts.len() - 2]))
                     && !outer_refs.contains(&parts)
                 {
                     outer_refs.push(parts);
@@ -498,7 +520,7 @@ pub(crate) fn pop_outer_from(depth: usize) {
 }
 
 /// The columns (name, type) of one FROM item, and the names it answers to.
-fn from_item_def(
+pub(crate) fn from_item_def(
     item: &pg_query::protobuf::Node,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
@@ -707,7 +729,26 @@ fn eval(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Bson> {
         inner_params.push(const_value(&f.args[i], params)?);
     }
     debug_assert!(inner_params.len() >= n_params);
-    let rows = run(&sql, &inner_params)?;
+    // The inner SQL numbers its parameters `$1..`, the statement's own and
+    // then one per outer reference, so it is planned under THEIR types: each
+    // argument is a parameter of the evaluation around it (a row's fields
+    // are declared past the statement's own), whose declared type it takes.
+    // Left as they were, `$1` took the outer row's first field's type, and
+    // `outer.c = 'x'` over a `char(3)` compared an integer.
+    let declared = PLAN_PARAM_TYPES.with(|t| t.borrow().clone());
+    let inner_types: Vec<Option<String>> = f.args[6..]
+        .iter()
+        .map(|a| match a.node.as_ref() {
+            Some(N::ParamRef(p)) => usize::try_from(p.number - 1)
+                .ok()
+                .and_then(|i| declared.get(i).cloned().flatten()),
+            _ => None,
+        })
+        .collect();
+    let previous = PLAN_PARAM_TYPES.with(|t| t.replace(inner_types));
+    let rows = run(&sql, &inner_params);
+    PLAN_PARAM_TYPES.with(|t| *t.borrow_mut() = previous);
+    let rows = rows?;
     let first = |r: &Vec<Bson>| r.first().cloned().unwrap_or(Bson::Null);
     match kind {
         SubLinkType::ExistsSublink => Ok(Bson::Boolean(!rows.is_empty())),

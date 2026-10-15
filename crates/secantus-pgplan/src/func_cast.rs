@@ -209,6 +209,7 @@ fn fix(slot: &mut pg_query::protobuf::Node) -> bool {
     match user_ops::replacement(slot)
         .or_else(|| as_cast(slot))
         .or_else(|| builtin_alias::replacement(slot))
+        .or_else(|| typmod_cast::replacement(slot))
     {
         Some(cast) => {
             *slot = cast;
@@ -234,7 +235,9 @@ fn fix_all(slots: &mut [pg_query::protobuf::Node]) -> bool {
 pub(crate) fn rewrite(node: &mut N) {
     let wanted = user_ops::wanted(node)
         || node.nodes().iter().any(|(n, _, _, _)| match n {
-            pg_query::NodeRef::FuncCall(f) => cast_target(f).is_some() || builtin_alias::wanted(f),
+            pg_query::NodeRef::FuncCall(f) => {
+                cast_target(f).is_some() || builtin_alias::wanted(f) || typmod_cast::wanted(f)
+            }
             pg_query::NodeRef::JsonParseExpr(_) => true,
             _ => false,
         });
@@ -260,7 +263,10 @@ pub(crate) fn rewrite(node: &mut N) {
                             if let Some(N::FuncCall(f)) =
                                 rt.val.as_deref().and_then(|v| v.node.as_ref())
                             {
-                                if cast_target(f).is_some() || builtin_alias::wanted(f) {
+                                if cast_target(f).is_some()
+                                    || builtin_alias::wanted(f)
+                                    || typmod_cast::wanted(f)
+                                {
                                     if let Some(name) = func_name(f) {
                                         rt.name = name;
                                     }
@@ -306,6 +312,81 @@ pub(crate) fn rewrite(node: &mut N) {
             }
         }
         if !replaced {
+            return;
+        }
+    }
+}
+
+/// `f(a, VARIADIC ARRAY[x, y])` is `f(a, x, y)`: VARIADIC hands the array
+/// to the variadic parameter, which is what spreading its elements does
+/// (`jsonb_extract_path(j, VARIADIC ARRAY['a', 'b'])`, `concat(VARIADIC
+/// ARRAY['a', 'b'])`). Only an array CONSTRUCTOR with elements is spread; any
+/// other array value keeps the VARIADIC form.
+pub(crate) fn spread_variadic(node: &mut N) {
+    // The json path functions and `jsonb_delete` are their operators over
+    // the whole array (any array, not only a constructor): renamed to the
+    // template `builtin_alias` rewrites them by.
+    const AS_OPERATOR: [&str; 5] = [
+        "jsonb_delete",
+        "jsonb_extract_path",
+        "jsonb_extract_path_text",
+        "json_extract_path",
+        "json_extract_path_text",
+    ];
+    let operator_form = |f: &pg_query::protobuf::FuncCall| {
+        f.func_variadic
+            && f.args.len() == 2
+            && func_name(f).is_some_and(|n| AS_OPERATOR.contains(&n.as_str()))
+    };
+    let spreadable = |f: &pg_query::protobuf::FuncCall| {
+        operator_form(f)
+            || f.func_variadic
+                && matches!(
+                    f.args.last().and_then(|a| a.node.as_ref()),
+                    Some(N::AArrayExpr(a)) if !a.elements.is_empty()
+                )
+    };
+    if !node
+        .nodes()
+        .iter()
+        .any(|(n, _, _, _)| matches!(n, pg_query::NodeRef::FuncCall(f) if spreadable(f)))
+    {
+        return;
+    }
+    for _ in 0..10_000 {
+        let mut changed = false;
+        // SAFETY: as in `rewrite`, each pointer is used only until the first
+        // change, after which the walk restarts over a fresh list.
+        unsafe {
+            for (n, _, _) in node.nodes_mut() {
+                let pg_query::NodeMut::FuncCall(f) = n else {
+                    continue;
+                };
+                let f = &mut *f;
+                if !spreadable(f) {
+                    continue;
+                }
+                if operator_form(f) {
+                    let name = func_name(f).unwrap_or_default();
+                    f.funcname = vec![pg_query::protobuf::Node {
+                        node: Some(N::String(pg_query::protobuf::String {
+                            sval: format!("\u{1f}variadic_{name}"),
+                        })),
+                    }];
+                    f.func_variadic = false;
+                    changed = true;
+                    break;
+                }
+                let Some(N::AArrayExpr(a)) = f.args.pop().and_then(|a| a.node) else {
+                    continue;
+                };
+                f.args.extend(a.elements);
+                f.func_variadic = false;
+                changed = true;
+                break;
+            }
+        }
+        if !changed {
             return;
         }
     }

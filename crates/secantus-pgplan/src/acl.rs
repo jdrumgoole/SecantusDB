@@ -142,6 +142,125 @@ fn putid(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// `acldefault(objtype, owner)`: the privileges an object of this kind has
+/// before any GRANT (`acldefault` in acl.c, PostgreSQL 15.19), owner first
+/// after PUBLIC's.
+pub fn acldefault(objtype: &str, owner: i64) -> Result<Vec<String>> {
+    let (public, owner_rights) = match objtype {
+        "c" => return Ok(Vec::new()),
+        "r" => ("", "arwdDxt"),
+        "s" => ("", "rwU"),
+        "d" => ("Tc", "CTc"),
+        "f" => ("X", "X"),
+        "l" => ("U", "U"),
+        "L" => ("", "rw"),
+        "n" => ("", "UC"),
+        "t" => ("", "C"),
+        "F" => ("", "U"),
+        "S" => ("", "U"),
+        "T" => ("U", "U"),
+        "p" => ("", "sA"),
+        other => {
+            return Err(Error::Sqlstate(
+                "XX000",
+                format!("unrecognized objtype abbreviation: {other}"),
+            ))
+        }
+    };
+    let owner = putid(&crate::regobj::role_name_or_oid(owner));
+    let mut out = Vec::new();
+    if !public.is_empty() {
+        out.push(format!("={public}/{owner}"));
+    }
+    out.push(format!("{owner}={owner_rights}/{owner}"));
+    Ok(out)
+}
+
+/// `makeaclitem(grantee, grantor, privilege, is_grantable)`: one privilege
+/// word in PostgreSQL 15 (a comma list is 16's), any case; grantee 0 is
+/// PUBLIC.
+pub fn makeaclitem(grantee: i64, grantor: i64, privilege: &str, grantable: bool) -> Result<String> {
+    const WORDS: &[(&str, char)] = &[
+        ("SELECT", 'r'),
+        ("INSERT", 'a'),
+        ("UPDATE", 'w'),
+        ("DELETE", 'd'),
+        ("TRUNCATE", 'D'),
+        ("REFERENCES", 'x'),
+        ("TRIGGER", 't'),
+        ("EXECUTE", 'X'),
+        ("USAGE", 'U'),
+        ("CREATE", 'C'),
+        ("TEMP", 'T'),
+        ("TEMPORARY", 'T'),
+        ("CONNECT", 'c'),
+        ("SET", 's'),
+        ("ALTER SYSTEM", 'A'),
+    ];
+    let Some((_, c)) = WORDS
+        .iter()
+        .find(|(w, _)| w.eq_ignore_ascii_case(privilege))
+    else {
+        return Err(Error::Sqlstate(
+            "22023",
+            format!("unrecognized privilege type: \"{privilege}\""),
+        ));
+    };
+    Ok(format!(
+        "{}={c}{}/{}",
+        putid(&crate::regobj::role_name_or_oid(grantee)),
+        if grantable { "*" } else { "" },
+        putid(&crate::regobj::role_name_or_oid(grantor))
+    ))
+}
+
+/// `aclexplode`'s rows for one aclitem's text: `(grantor, grantee,
+/// privilege, grantable)` per privilege, in the mask's bit order.
+pub fn explode(item: &str) -> Result<Vec<(i64, i64, &'static str, bool)>> {
+    const NAMES: [&str; 14] = [
+        "INSERT",
+        "SELECT",
+        "UPDATE",
+        "DELETE",
+        "TRUNCATE",
+        "REFERENCES",
+        "TRIGGER",
+        "EXECUTE",
+        "USAGE",
+        "CREATE",
+        "TEMPORARY",
+        "CONNECT",
+        "SET",
+        "ALTER SYSTEM",
+    ];
+    let (grantee, rest) = getid(item)?;
+    let rest = rest.strip_prefix('=').unwrap_or(rest);
+    let (privs, grantor) = rest.split_once('/').unwrap_or((rest, ""));
+    let (grantor, _) = getid(grantor)?;
+    let oid = |n: &str| {
+        crate::regobj::role_oid(n)
+            .ok_or_else(|| Error::Sqlstate("42704", format!("role \"{n}\" does not exist")))
+    };
+    let (grantee, grantor) = (oid(&grantee)?, oid(&grantor)?);
+    let mut held: Vec<(usize, bool)> = Vec::new();
+    let mut chars = privs.chars().peekable();
+    while let Some(c) = chars.next() {
+        let Some(bit) = ALL_RIGHTS.find(c) else {
+            continue;
+        };
+        let grantable = chars.peek() == Some(&'*');
+        if grantable {
+            chars.next();
+        }
+        held.push((bit, grantable));
+    }
+    held.sort_by_key(|(b, _)| *b);
+    Ok(held
+        .into_iter()
+        .map(|(b, g)| (grantor, grantee, NAMES[b], g))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse;

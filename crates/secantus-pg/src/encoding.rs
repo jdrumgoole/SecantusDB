@@ -6,19 +6,15 @@
 //! transcoded from UTF-8 to the client encoding, and an incoming text parameter
 //! is decoded from the client encoding to UTF-8.
 //!
-//! Only two encodings need real byte-for-byte transcoding: `LATIN1` and
-//! `LATIN9`. `UTF8` is the internal form itself, and `SQL_ASCII` passes bytes
-//! through unchanged -- both leave the internal UTF-8 bytes exactly as they are,
-//! which is what the server already emitted before this module existed. Every
-//! other real PostgreSQL encoding name (`EUC_TW`, `WIN1252`, ...) is accepted as
-//! a session setting and reported back verbatim, but its output is passed
-//! through as UTF-8: a client that lacks the Python codec (`EUC_TW`) raises
-//! before it ever decodes a value, exactly as it does against real PostgreSQL,
-//! and no measured client round-trips non-ASCII through an unconverted encoding.
+//! `UTF8` is the internal form itself, and `SQL_ASCII` passes bytes through
+//! unchanged -- both leave the internal UTF-8 bytes exactly as they are. Every
+//! other encoding a client can choose is transcoded: the single-byte ones by
+//! their tables, the multi-byte ones (`SJIS`, `EUC_JP`, `BIG5`, ...) by the maps
+//! measured from PostgreSQL 15 (`secantus_pgplan`'s `mbcs`), verified first as
+//! PostgreSQL verifies a client's bytes.
 //!
-//! Keeping the transcoding gated on `LATIN1` / `LATIN9` is deliberate: the
-//! default `UTF8` path is byte-identical to the pre-existing code, so declaring
-//! and reporting `client_encoding` cannot regress a UTF-8 client.
+//! The default `UTF8` path is byte-identical to the code before any of this,
+//! so declaring and reporting `client_encoding` cannot regress a UTF-8 client.
 
 /// The client encoding as it bears on transcoding.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -34,19 +30,25 @@ pub enum ClientEncoding {
     /// the table PostgreSQL 15 converts it with (`secantus_pgplan`'s, measured
     /// from it). A byte the table has no character for is refused.
     Single(&'static str, &'static [u16; 128]),
+    /// A multi-byte encoding (`SJIS`, `EUC_JP`, `GB18030`, ...), by the maps
+    /// PostgreSQL 15 converts it with. Bytes its verifier refuses are 22021,
+    /// a character with no mapping 22P05.
+    Multi(&'static str),
     /// Bytes pass through unchanged in both directions, exactly as UTF8 does
-    /// (the server's internal form is UTF-8). Covers `SQL_ASCII` and every
-    /// accepted-but-not-transcoded encoding.
+    /// (the server's internal form is UTF-8). Covers `SQL_ASCII`.
     Passthrough,
 }
 
 impl ClientEncoding {
-    /// Whether outgoing / incoming text bytes must be transcoded. Only LATIN1
-    /// and LATIN9 differ from the internal UTF-8 form.
+    /// Whether outgoing / incoming text bytes must be transcoded: every
+    /// encoding but UTF8 and SQL_ASCII.
     pub fn transcodes(self) -> bool {
         matches!(
             self,
-            ClientEncoding::Latin1 | ClientEncoding::Latin9 | ClientEncoding::Single(..)
+            ClientEncoding::Latin1
+                | ClientEncoding::Latin9
+                | ClientEncoding::Single(..)
+                | ClientEncoding::Multi(_)
         )
     }
 
@@ -55,7 +57,7 @@ impl ClientEncoding {
         match self {
             ClientEncoding::Latin1 => "LATIN1",
             ClientEncoding::Latin9 => "LATIN9",
-            ClientEncoding::Single(name, _) => name,
+            ClientEncoding::Single(name, _) | ClientEncoding::Multi(name) => name,
             ClientEncoding::Utf8 | ClientEncoding::Passthrough => "UTF8",
         }
     }
@@ -179,19 +181,27 @@ pub fn client_encoding(canonical: &str) -> ClientEncoding {
         "UTF8" => ClientEncoding::Utf8,
         "LATIN1" => ClientEncoding::Latin1,
         "LATIN9" => ClientEncoding::Latin9,
-        other => match secantus_pgplan::single_byte_table(other) {
-            // The `&'static str` the table is filed under, not `other`.
-            Some(table) => ClientEncoding::Single(
-                CANONICAL
-                    .iter()
-                    .find(|n| **n == other)
-                    .copied()
-                    .unwrap_or("UTF8"),
-                table,
-            ),
-            None => ClientEncoding::Passthrough,
-        },
+        other => {
+            // The `&'static str` the encoding is filed under, not `other`.
+            let name = CANONICAL
+                .iter()
+                .find(|n| **n == other)
+                .copied()
+                .unwrap_or("UTF8");
+            match secantus_pgplan::single_byte_table(other) {
+                Some(table) => ClientEncoding::Single(name, table),
+                None if secantus_pgplan::multi_byte_encoding(other) => ClientEncoding::Multi(name),
+                None => ClientEncoding::Passthrough,
+            }
+        }
     }
+}
+
+/// Why a client's bytes are not text: PostgreSQL's SQLSTATE and message.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Undecodable {
+    pub sqlstate: &'static str,
+    pub message: String,
 }
 
 /// The eight LATIN9 positions that differ from LATIN1: `(byte, code point)`.
@@ -210,12 +220,13 @@ const LATIN9_DIFFS: &[(u8, char)] = &[
 ///
 /// LATIN1 and LATIN9 are single-byte encodings in which every byte is valid, so
 /// they cannot fail; another single-byte encoding refuses a byte its table has
-/// no character for (`Err(byte)`, PostgreSQL's 22P05), rather than store a
-/// replacement character. Every other encoding takes the UTF-8 path (the
-/// internal form), where invalid bytes are the caller's concern.
-pub fn decode(enc: ClientEncoding, bytes: &[u8]) -> Result<String, u8> {
+/// no character for (PostgreSQL's 22P05), rather than store a replacement
+/// character, and a multi-byte one refuses what its verifier does (22021) as
+/// well. UTF8 and SQL_ASCII take the UTF-8 path (the internal form), where
+/// invalid bytes are the caller's concern.
+pub fn decode(enc: ClientEncoding, bytes: &[u8]) -> Result<String, Undecodable> {
     Ok(match enc {
-        ClientEncoding::Single(_, table) => {
+        ClientEncoding::Single(name, table) => {
             return bytes
                 .iter()
                 .map(|&b| {
@@ -224,9 +235,19 @@ pub fn decode(enc: ClientEncoding, bytes: &[u8]) -> Result<String, u8> {
                     }
                     char::from_u32(u32::from(table[usize::from(b - 0x80)]))
                         .filter(|c| *c != '\0')
-                        .ok_or(b)
+                        .ok_or_else(|| Undecodable {
+                            sqlstate: "22P05",
+                            message: format!(
+                                "character with byte sequence 0x{b:02x} in encoding \"{name}\" \
+                                 has no equivalent in encoding \"UTF8\""
+                            ),
+                        })
                 })
                 .collect()
+        }
+        ClientEncoding::Multi(name) => {
+            return secantus_pgplan::decode_multi_byte(name, bytes)
+                .map_err(|(sqlstate, message)| Undecodable { sqlstate, message })
         }
         ClientEncoding::Latin1 => bytes.iter().map(|&b| b as char).collect(),
         ClientEncoding::Latin9 => bytes
@@ -245,17 +266,14 @@ pub fn decode(enc: ClientEncoding, bytes: &[u8]) -> Result<String, u8> {
     })
 }
 
-/// PostgreSQL's 22P05 for a byte of the client's encoding with no Unicode
-/// character (`0xa5` in LATIN3).
-pub fn undecodable(enc: ClientEncoding, byte: u8) -> pgwire::error::PgWireError {
+/// PostgreSQL's error for bytes of the client's encoding that are not text:
+/// 22P05 for a character with no Unicode one (`0xa5` in LATIN3), 22021 for
+/// bytes that are not a character of the encoding at all.
+pub fn undecodable(_enc: ClientEncoding, e: Undecodable) -> pgwire::error::PgWireError {
     pgwire::error::PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
         "ERROR".into(),
-        "22P05".into(),
-        format!(
-            "character with byte sequence 0x{byte:02x} in encoding \"{}\" has no equivalent \
-             in encoding \"UTF8\"",
-            enc.name()
-        ),
+        e.sqlstate.into(),
+        e.message,
     )))
 }
 
@@ -281,6 +299,7 @@ pub fn encode(enc: ClientEncoding, utf8: &[u8]) -> Result<Vec<u8>, char> {
                     .ok_or(c)
             })
             .collect(),
+        ClientEncoding::Multi(name) => secantus_pgplan::encode_multi_byte(name, &text),
         ClientEncoding::Latin1 => text
             .chars()
             .map(|c| u8::try_from(c as u32).map_err(|_| c))
@@ -379,7 +398,22 @@ mod tests {
     fn a_byte_with_no_character_is_refused() {
         // LATIN3 has no character at 0xA5: PostgreSQL's 22P05, not U+FFFD.
         let enc = client_encoding("LATIN3");
-        assert_eq!(decode(enc, &[b'a', 0xA5]), Err(0xA5));
+        assert_eq!(decode(enc, &[b'a', 0xA5]).unwrap_err().sqlstate, "22P05");
+    }
+
+    #[test]
+    fn multi_byte_encodings_are_verified_and_converted() {
+        let enc = client_encoding("SJIS");
+        assert_eq!(enc, ClientEncoding::Multi("SJIS"));
+        assert_eq!(encode(enc, "あ".as_bytes()).unwrap(), vec![0x82, 0xA0]);
+        assert_eq!(decode(enc, &[0x82, 0xA0]).unwrap(), "あ");
+        assert_eq!(encode(enc, "é".as_bytes()), Err('é'));
+        let bad = decode(enc, &[0x82]).unwrap_err();
+        assert_eq!(bad.sqlstate, "22021");
+        assert_eq!(
+            bad.message,
+            "invalid byte sequence for encoding \"SJIS\": 0x82"
+        );
     }
 
     #[test]

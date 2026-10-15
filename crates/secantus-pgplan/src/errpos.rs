@@ -29,6 +29,20 @@ fn quoted_between<'a>(m: &'a str, prefix: &str) -> Option<&'a str> {
     rest.split_once('"').map(|(name, _)| name)
 }
 
+/// The string literal a `regprocedure` / `regoperator` cast reads
+/// (`'abs(int'::regprocedure`), whose input errors are reported at it.
+fn reg_literal(toks: &[Tok]) -> Option<usize> {
+    toks.windows(3)
+        .find(|w| {
+            w[0].text.starts_with('\'')
+                && w[1].text == "::"
+                && ["regprocedure", "regoperator"]
+                    .iter()
+                    .any(|k| w[2].text.eq_ignore_ascii_case(k))
+        })
+        .map(|w| w[0].start)
+}
+
 /// The position in `sql` of an error with this SQLSTATE and primary
 /// message, when it can be found.
 pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize> {
@@ -63,10 +77,17 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
         .iter()
         .filter_map(|t| {
             let (s, e) = (t.start as usize, t.end as usize);
-            Some(Tok {
-                start: s,
-                text: sql.get(s..e)?,
-            })
+            let text = sql.get(s..e)?;
+            // An escape literal is matched as the plain literal it spells
+            // when it has no escapes (`E'x'` is `'x'`), still positioned at
+            // its `E`: under `standard_conforming_strings = off` every
+            // plain literal reaches here rewritten as one
+            // (`escape_strings`), and the `E` maps back to its quote.
+            let text = match text.get(..2) {
+                Some("E'" | "e'") => &text[1..],
+                _ => text,
+            };
+            Some(Tok { start: s, text })
         })
         .collect();
     let pos = |start: usize| Some(sql.get(..start)?.chars().count() + 1);
@@ -161,6 +182,12 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
             }
             pos(inner.first()?.start)
         }
+        // `there is no parameter $2`: at its first `$2` (15.19: position 22
+        // of `select 1 fetch first $1 rows only`).
+        "42P02" if m.starts_with("there is no parameter ") => {
+            let n = m.strip_prefix("there is no parameter ")?;
+            pos(toks.iter().find(|t| t.text == n)?.start)
+        }
         // `ORDER BY position 5 is not in select list`: at the number.
         "42P10" if m.ends_with(" is not in select list") => {
             let (clause, rest) = m.split_once(" position ")?;
@@ -235,6 +262,24 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
                 }
             }
         }
+        // An object a `reg*` type's input reads from a string
+        // (`'nope'::regconfig`, `to_tsvector('nope', ...)`, `'x'::regrole`,
+        // `'s'::regnamespace`): at the literal, as on PostgreSQL 15.19.
+        "42704" | "3F000"
+            if [
+                "text search configuration ",
+                "text search dictionary ",
+                "role ",
+                "schema ",
+                "collation ",
+            ]
+            .iter()
+            .any(|p| m.starts_with(p)) =>
+        {
+            let name = m.split_once('"')?.1.split_once('"')?.0;
+            let lit = format!("'{}'", name.replace('\'', "''"));
+            pos(toks.iter().find(|t| t.text == lit)?.start)
+        }
         "42704" => {
             let name = quoted_between(m, "type ")?;
             let name = name.rsplit('.').next()?;
@@ -262,7 +307,29 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
             })?;
             pos(toks[i].start)
         }
+        // A name read from a string by a `reg*` type's input
+        // (`'+'::regoper`, `'f'::regproc`): at the literal.
+        "42725" => {
+            let name = m
+                .strip_prefix("more than one operator named ")
+                .map(str::to_string)
+                .or_else(|| {
+                    quoted_between(m, "more than one function named ").map(str::to_string)
+                })?;
+            let lit = format!("'{}'", name.replace('\'', "''"));
+            pos(toks.iter().find(|t| t.text == lit)?.start)
+        }
         "42883" => {
+            let literal = |v: &str| {
+                let lit = format!("'{}'", v.replace('\'', "''"));
+                toks.iter().find(|t| t.text == lit).map(|t| t.start)
+            };
+            if let Some(at) = quoted_between(m, "function ")
+                .or_else(|| m.strip_prefix("operator does not exist: "))
+                .and_then(literal)
+            {
+                return pos(at);
+            }
             if let Some(call) = m
                 .strip_prefix("function ")
                 .or_else(|| m.strip_prefix("procedure "))
@@ -313,11 +380,35 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
             pos(toks.iter().find(|t| t.text == lit)?.start)
         }
         "22P02" => {
+            if matches!(
+                m,
+                "expected a left parenthesis" | "expected a right parenthesis"
+            ) {
+                return reg_literal(&toks).and_then(pos);
+            }
             // `invalid input syntax for type integer: "abc"`: the literal.
             let (_, value) = m.rsplit_once(": \"")?;
             let value = value.strip_suffix('"')?;
             let lit = format!("'{}'", value.replace('\'', "''"));
-            pos(toks.iter().find(|t| t.text == lit)?.start)
+            let i = toks.iter().position(|t| t.text == lit)?;
+            // A literal cast to a string type first is a text VALUE when the
+            // target's input function reads it, at execution, where there is
+            // no position (`int8('x'::text)`, measured on 15.19).
+            let string_type = |t: &str| {
+                ["text", "varchar", "name", "bpchar"]
+                    .iter()
+                    .any(|k| t.eq_ignore_ascii_case(k))
+            };
+            if toks.get(i + 1).is_some_and(|t| t.text == "::")
+                && toks.get(i + 2).is_some_and(|t| string_type(t.text))
+            {
+                return None;
+            }
+            pos(toks[i].start)
+        }
+        // `regoperator`'s own refusals of its input: at the literal.
+        "42P02" | "54023" if matches!(m, "missing argument" | "too many arguments") => {
+            reg_literal(&toks).and_then(pos)
         }
         "42601" => {
             if m == "syntax error at end of input" {

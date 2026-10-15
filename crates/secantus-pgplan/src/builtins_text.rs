@@ -6,17 +6,19 @@ use bson::Bson;
 
 use crate::{Error, Result};
 
-/// The encodings a conversion here knows: UTF8, and the single-byte ones
-/// whose every octet is its own code point. Any other encoding PostgreSQL
-/// names is `Other`: its ASCII range is ASCII, and anything above it needs a
-/// conversion table this server does not carry, so it is refused rather than
-/// read as LATIN1.
+/// The encodings a conversion here knows: UTF8, LATIN1, SQL_ASCII, the
+/// single-byte ones by their tables and the multi-byte ones by theirs. The
+/// one left is MULE_INTERNAL (`Other`): its ASCII range is ASCII, and
+/// anything above it needs a conversion this server does not carry, so it
+/// is refused rather than guessed.
 pub(crate) enum Encoding {
     Utf8,
     Latin1,
     Ascii,
     /// A single-byte encoding with its upper half's table (`sbcs`).
     Single(&'static str, &'static [u16; 128]),
+    /// A multi-byte encoding (`mbcs`).
+    Multi(crate::mbcs::Mb),
     Other(&'static str),
 }
 
@@ -155,9 +157,10 @@ pub(crate) fn encoding(name: &str, role: &str) -> Result<(Encoding, String)> {
         "UTF8" => Encoding::Utf8,
         "LATIN1" => Encoding::Latin1,
         "SQL_ASCII" => Encoding::Ascii,
-        other => match crate::sbcs::table(other) {
-            Some(table) => Encoding::Single(other, table),
-            None => Encoding::Other(other),
+        other => match (crate::sbcs::table(other), crate::mbcs::by_name(other)) {
+            (Some(table), _) => Encoding::Single(other, table),
+            (None, Some(mb)) => Encoding::Multi(mb),
+            (None, None) => Encoding::Other(other),
         },
     };
     Ok((enc, canonical.to_string()))
@@ -242,6 +245,9 @@ pub(crate) fn decode(bytes: &[u8], from: &Encoding) -> Result<String> {
                     })
             })
             .collect(),
+        Encoding::Multi(mb) => mb
+            .decode(bytes)
+            .map_err(|(state, msg)| Error::Sqlstate(state, msg)),
         Encoding::Other(_) if bytes.is_ascii() => Ok(bytes.iter().map(|b| *b as char).collect()),
         Encoding::Other(canonical) => Err(no_table(canonical)),
     }
@@ -263,6 +269,7 @@ pub(crate) fn encode(s: &str, to: &Encoding, to_name: &str) -> Result<Vec<u8>> {
                     .ok_or_else(|| no_equivalent(c, to_name))
             })
             .collect(),
+        Encoding::Multi(mb) => mb.encode(s).map_err(|c| no_equivalent(c, to_name)),
         Encoding::Other(_) if s.is_ascii() => Ok(s.as_bytes().to_vec()),
         Encoding::Other(canonical) => Err(no_table(canonical)),
         Encoding::Latin1 => s

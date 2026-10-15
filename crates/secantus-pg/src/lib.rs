@@ -52,6 +52,7 @@ mod fdw;
 mod grace_join;
 mod hba;
 mod ident;
+mod info_columns;
 mod largeobjects;
 mod live;
 mod live_notices;
@@ -77,6 +78,8 @@ mod stream_join;
 mod table_locks;
 mod tls;
 mod triggers;
+mod ts_catalogs;
+mod tuplesort;
 mod txn_gucs;
 mod window_order;
 mod wire_portals;
@@ -3024,6 +3027,10 @@ pub struct PgHandler {
     /// `RAISE NOTICE` / `WARNING` / `INFO`), sent to the client by the query
     /// handlers before the statement's own result or error.
     pending_notices: Mutex<Vec<ErrorInfo>>,
+    /// The texts `apply_string_syntax` rewrote, newest last: (rewritten,
+    /// as sent, the map between them), so an error positioned in the
+    /// rewritten text is reported where the client wrote it.
+    string_maps: Mutex<Vec<StringMap>>,
     /// While a statement runs: a way to send notices to the client NOW,
     /// before the statement ends (see `live_notices`).
     live_notices: Mutex<Option<live_notices::SendNotices>>,
@@ -3535,6 +3542,7 @@ impl PgHandler {
             block_scans: Mutex::new(Vec::new()),
             settings: Arc::new(Mutex::new(GucMap::from(default_settings()))),
             pending_notices: Mutex::new(Vec::new()),
+            string_maps: Mutex::new(Vec::new()),
             live_notices: Mutex::new(None),
             pending_params: Mutex::new(Vec::new()),
             copy_in: Mutex::new(None),
@@ -4408,6 +4416,7 @@ impl PgHandler {
                     .iter()
                     .filter(|t| {
                         !t.temp
+                            && !t.extra.get_bool("unlogged").unwrap_or(false)
                             && !matviews.contains(&t.name)
                             && !secantus_pgplan::fdw::is_foreign(t)
                     })
@@ -4425,10 +4434,32 @@ impl PgHandler {
         );
     }
 
+    /// `information_schema.columns`' `data_type` and `udt_name` for a column
+    /// of `pg_type`, as the view computes them: `ARRAY` for any type with an
+    /// element and a variable length (arrays, `int2vector`, `oidvector`),
+    /// `USER-DEFINED` for a type outside `pg_catalog`, else `format_type`;
+    /// the udt is the `pg_type.typname`, `_int4` for `int4[]` (measured on
+    /// 15.19).
+    fn information_schema_type(pg_type: &str) -> (String, String) {
+        let bare = |t: &str| t.rsplit('.').next().unwrap_or(t).to_string();
+        if let Some(element) = pg_type.strip_suffix("[]") {
+            return ("ARRAY".into(), format!("_{}", bare(element)));
+        }
+        if matches!(pg_type, "int2vector" | "oidvector") {
+            return ("ARRAY".into(), pg_type.to_string());
+        }
+        if secantus_pgplan::pgtypes::is_builtin_type(pg_type) {
+            return (secantus_pgplan::display_type(pg_type), pg_type.to_string());
+        }
+        ("USER-DEFINED".into(), bare(pg_type))
+    }
+
     /// The name a user type resolves under: its bare name in `public` (on the
-    /// default search_path), else `schema.name`.
+    /// default search_path), else `schema.name`. A `public` name that a
+    /// `pg_catalog` type shares is `public.name` too: `pg_catalog` is searched
+    /// first, so the bare name is the built-in.
     fn type_resolution(schema: &str, name: &str) -> String {
-        if schema == "public" {
+        if schema == "public" && !secantus_pgplan::pgtypes::shadowed_by_catalog(name) {
             name.to_string()
         } else {
             format!("{schema}.{name}")
@@ -5357,35 +5388,42 @@ impl PgHandler {
     ) -> PgWireResult<Vec<(Vec<Option<Bson>>, Vec<Bson>)>> {
         // Sort on the GROUP KEY, by index -- so `GROUP BY s ORDER BY s`
         // works even when `s` is not projected.
-        if !agg.order.is_empty() {
-            groups.sort_by(|a, b| {
-                for key in &agg.order {
-                    let (l, r) = (&a.0[key.group_index], &b.0[key.group_index]);
-                    let ord = match (l, r) {
-                        (None, None) => Ordering::Equal,
-                        (None, Some(_)) => match key.nulls {
-                            Nulls::First => Ordering::Less,
-                            Nulls::Last => Ordering::Greater,
-                        },
-                        (Some(_), None) => match key.nulls {
-                            Nulls::First => Ordering::Greater,
-                            Nulls::Last => Ordering::Less,
-                        },
-                        (Some(x), Some(y)) => {
-                            let c = compare_values(x, y);
-                            if key.ascending {
-                                c
-                            } else {
-                                c.reverse()
-                            }
+        // Stable, not PostgreSQL's quicksort (`tuplesort.rs`): the quicksort
+        // leaves ties where PostgreSQL's do only over the same input order,
+        // and the groups do not arrive in PostgreSQL's (HashAggregate /
+        // GroupAggregate) order. Over them a stable sort matched more
+        // (b67_grouping_sets' ROLLUP rows, RP-028).
+        #[allow(clippy::type_complexity)]
+        let order_cmp = |a: &(Vec<Option<Bson>>, Vec<Bson>), b: &(Vec<Option<Bson>>, Vec<Bson>)| {
+            for key in &agg.order {
+                let (l, r) = (&a.0[key.group_index], &b.0[key.group_index]);
+                let ord = match (l, r) {
+                    (None, None) => Ordering::Equal,
+                    (None, Some(_)) => match key.nulls {
+                        Nulls::First => Ordering::Less,
+                        Nulls::Last => Ordering::Greater,
+                    },
+                    (Some(_), None) => match key.nulls {
+                        Nulls::First => Ordering::Greater,
+                        Nulls::Last => Ordering::Less,
+                    },
+                    (Some(x), Some(y)) => {
+                        let c = compare_values(x, y);
+                        if key.ascending {
+                            c
+                        } else {
+                            c.reverse()
                         }
-                    };
-                    if ord != Ordering::Equal {
-                        return ord;
                     }
+                };
+                if ord != Ordering::Equal {
+                    return ord;
                 }
-                Ordering::Equal
-            });
+            }
+            Ordering::Equal
+        };
+        if !agg.order.is_empty() {
+            groups.sort_by(order_cmp);
         }
         // HAVING filters the GROUPS, before DISTINCT, ORDER BY and LIMIT see
         // them -- and after the aggregates are computed, which is the whole
@@ -5436,7 +5474,13 @@ impl PgHandler {
             groups = groups.into_iter().skip(skip).collect();
         }
         if let Some(limit) = agg.limit {
-            groups.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
+            let take = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
+            let take = if agg.with_ties {
+                with_ties_end(&groups, take, order_cmp)
+            } else {
+                take
+            };
+            groups.truncate(take);
         }
         if max_rows > 0 {
             groups.truncate(max_rows);
@@ -6144,7 +6188,7 @@ impl PgHandler {
     }
 
     fn join_docs(&self, join: &secantus_pgplan::JoinSelect) -> PgWireResult<Vec<Document>> {
-        self.join_docs_with(join, None, None)
+        self.join_docs_with(join, None, None, None, false)
     }
 
     /// `join_docs` with optional pre-materialised rows for a side that is a
@@ -6390,6 +6434,8 @@ impl PgHandler {
         join: &secantus_pgplan::JoinSelect,
         left_rows: Option<Vec<Document>>,
         right_rows: Option<Vec<Document>>,
+        bound: Option<usize>,
+        keep_order_key: bool,
     ) -> PgWireResult<Vec<Document>> {
         let mut left_rows = Some(match left_rows {
             Some(r) => r,
@@ -6418,7 +6464,8 @@ impl PgHandler {
             // PostgreSQL sorts NULLS LAST ascending / FIRST descending, which
             // the LEFT-JOIN misses rely on.
             let key = |d: &Document| d.get("__join_order").cloned().unwrap_or(Bson::Null);
-            out.sort_by(|a, b| {
+            // PostgreSQL's sort, as every ORDER BY here (`tuplesort.rs`).
+            out = tuplesort::sort(out, bound, &mut |a, b| {
                 let (ka, kb) = (key(a), key(b));
                 let ord = match (&ka, &kb) {
                     (Bson::Null, Bson::Null) => std::cmp::Ordering::Equal,
@@ -6433,8 +6480,10 @@ impl PgHandler {
                     ord.reverse()
                 }
             });
-            for d in &mut out {
-                d.remove("__join_order");
+            if !keep_order_key {
+                for d in &mut out {
+                    d.remove("__join_order");
+                }
             }
         }
         Ok(out)
@@ -7528,6 +7577,16 @@ impl PgHandler {
         })
     }
 
+    /// Does a built-in type name keep a new `public` type from taking it?
+    /// Only a spelling that is not itself a `pg_type` name (`int`, a
+    /// keyword's alias): a real one (`uuid`, `text`, `int4range`) is
+    /// `pg_catalog`'s, and PostgreSQL creates `public.uuid` beside it, which
+    /// a bare name never reaches (measured on 15.19).
+    fn builtin_name_taken(name: &str) -> bool {
+        secantus_pgplan::pgtypes::oid_of_name(name).is_some()
+            && !secantus_pgplan::pgtypes::shadowed_by_catalog(name)
+    }
+
     /// Is `name` taken by ANY type in the default search_path -- an enum, a
     /// composite, a range, a base type (shell or not), or a builtin? The
     /// 42710 `type "x" already exists` gate every CREATE TYPE shares.
@@ -7536,7 +7595,7 @@ impl PgHandler {
             || self.enums()?.iter().any(|(n, _, _)| n == name)
             || self.ranges()?.iter().any(|(n, _, _)| n == name)
             || self.base_types()?.iter().any(|b| b.name == name)
-            || secantus_pgplan::pgtypes::oid_of_name(name).is_some())
+            || Self::builtin_name_taken(name))
     }
 
     /// Raise a NOTICE for the statement in flight: sent at once when a
@@ -11504,7 +11563,7 @@ impl PgHandler {
         let taken = self.domains()?.iter().any(|x| x.name == d.name)
             || self.enums()?.iter().any(|(n, _, _)| *n == d.name)
             || self.composites()?.iter().any(|(n, _, _)| *n == d.name)
-            || secantus_pgplan::pgtypes::oid_of_name(&d.name).is_some();
+            || Self::builtin_name_taken(&d.name);
         if taken {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
@@ -12643,34 +12702,7 @@ impl PgHandler {
             // views are called `tables` / `columns` / `sequences` -- names a
             // user table may have, and a virtual relation wins over the
             // catalog. See `secantus_pgplan::relation_name`.
-            "information_schema.columns" => Some(TableDef::new(
-                "columns",
-                vec![
-                    Column::new("table_catalog", "name", false),
-                    Column::new("table_schema", "name", false),
-                    Column::new("table_name", "name", false),
-                    Column::new("column_name", "name", false),
-                    Column::new("ordinal_position", "int4", false),
-                    Column::new("column_default", "varchar", false),
-                    Column::new("is_nullable", "varchar", false),
-                    Column::new("data_type", "varchar", false),
-                    Column::new("character_maximum_length", "int4", false),
-                    Column::new("numeric_precision", "int4", false),
-                    Column::new("numeric_scale", "int4", false),
-                    Column::new("datetime_precision", "int4", false),
-                    Column::new("udt_name", "name", false),
-                    Column::new("is_identity", "varchar", false),
-                    Column::new("identity_generation", "varchar", false),
-                    Column::new("collation_catalog", "name", false),
-                    Column::new("collation_schema", "name", false),
-                    Column::new("collation_name", "name", false),
-                    Column::new("domain_catalog", "name", false),
-                    Column::new("domain_schema", "name", false),
-                    Column::new("domain_name", "name", false),
-                    Column::new("is_generated", "varchar", false),
-                    Column::new("generation_expression", "varchar", false),
-                ],
-            )),
+            "information_schema.columns" => Some(info_columns::def()),
             "information_schema.views" => Some(TableDef::new(
                 "views",
                 vec![
@@ -13275,9 +13307,11 @@ impl PgHandler {
                 ],
             )),
             "pg_collation" => Some(catalog_fill::pg_collation_def()),
+            other if secantus_pgplan::ts_catalog::NAMES.contains(&other) => ts_catalogs::def(other),
             "pg_am" => Some(catalog_fill::pg_am_def()),
             "pg_policy" => Some(catalog_fill::pg_policy_def()),
             "pg_sequence" => Some(catalog_fill::pg_sequence_def()),
+            "pg_sequences" => Some(catalog_fill::pg_sequences_def()),
             "pg_description" => Some(catalog_fill::pg_description_def()),
             "pg_opclass" => Some(catalog_fill::pg_opclass_def()),
             "pg_cast" => Some(casts::pg_cast_def()),
@@ -13303,9 +13337,13 @@ impl PgHandler {
                 rows.extend(self.user_collation_rows(&def));
                 rows
             }
+            other if secantus_pgplan::ts_catalog::NAMES.contains(&other) => {
+                ts_catalogs::rows(other, &def)
+            }
             "pg_am" => self.pg_am_rows(&def),
             "pg_policy" => self.pg_policy_rows(&def),
             "pg_sequence" => self.pg_sequence_rows(&def),
+            "pg_sequences" => self.pg_sequences_rows(&def),
             "pg_description" => self.pg_description_rows(&def),
             "pg_opclass" => self.pg_opclass_rows(&def),
             "pg_cast" => self.pg_cast_rows(&def),
@@ -13334,13 +13372,14 @@ impl PgHandler {
                         // A text `YES` / `NO`, not a boolean: this is the SQL
                         // standard's view and PostgreSQL follows it.
                         d.insert(f("is_nullable"), if c.nullable { "YES" } else { "NO" });
-                        d.insert(f("data_type"), secantus_pgplan::display_type(&c.pg_type));
+                        let (data_type, udt_name) = Self::information_schema_type(&c.pg_type);
+                        d.insert(f("data_type"), data_type.clone());
                         let (precision, scale, length) = Self::typmod_parts(c);
                         d.insert(f("character_maximum_length"), length);
                         d.insert(f("numeric_precision"), precision);
                         d.insert(f("numeric_scale"), scale);
                         d.insert(f("datetime_precision"), Bson::Null);
-                        d.insert(f("udt_name"), c.pg_type.as_str());
+                        d.insert(f("udt_name"), udt_name);
                         d.insert(
                             f("is_identity"),
                             if c.identity.is_some() { "YES" } else { "NO" },
@@ -13402,6 +13441,29 @@ impl PgHandler {
                                 })
                                 .map_or(Bson::Null, Bson::String),
                         );
+                        let udt_schema = if data_type == "USER-DEFINED" {
+                            "public"
+                        } else {
+                            "pg_catalog"
+                        };
+                        info_columns::fill(
+                            &mut d,
+                            &def,
+                            &c.pg_type,
+                            c.typmod,
+                            i + 1,
+                            udt_schema,
+                            &db,
+                        );
+                        if c.identity.is_some() {
+                            if let Some(seq) = c
+                                .sequence
+                                .as_deref()
+                                .and_then(|n| self.sequence_doc(n).ok().flatten())
+                            {
+                                info_columns::fill_identity(&mut d, &def, &seq);
+                            }
+                        }
                         rows.push(d);
                     }
                 }
@@ -13420,9 +13482,11 @@ impl PgHandler {
                     };
                     let defaults = v.get_document("defaults").ok();
                     for (i, fd) in fields.iter().enumerate() {
-                        let ty =
-                            secantus_pgplan::pgtypes::name_of_oid(i64::from(fd.datatype().oid()))
-                                .unwrap_or("text");
+                        let oid = fd.datatype().oid();
+                        let ty = secantus_pgplan::pgtypes::type_name_of_oid(i64::from(oid))
+                            .or_else(|| self.user_type_name_for_oid(oid))
+                            .unwrap_or_else(|| "text".to_string());
+                        let (data_type, udt_name) = Self::information_schema_type(&ty);
                         let mut d = Document::new();
                         d.insert(f("table_catalog"), db.as_str());
                         d.insert(f("table_schema"), "public");
@@ -13436,7 +13500,7 @@ impl PgHandler {
                                 .map_or(Bson::Null, |s| Bson::String(s.to_string())),
                         );
                         d.insert(f("is_nullable"), "YES");
-                        d.insert(f("data_type"), secantus_pgplan::display_type(ty));
+                        d.insert(f("data_type"), data_type.clone());
                         for k in [
                             "character_maximum_length",
                             "numeric_precision",
@@ -13450,9 +13514,20 @@ impl PgHandler {
                         ] {
                             d.insert(f(k), Bson::Null);
                         }
-                        d.insert(f("udt_name"), ty);
+                        let udt_schema = if data_type == "USER-DEFINED" {
+                            "public"
+                        } else {
+                            "pg_catalog"
+                        };
+                        d.insert(f("udt_name"), udt_name);
                         d.insert(f("is_identity"), "NO");
                         d.insert(f("is_generated"), "NEVER");
+                        info_columns::fill(&mut d, &def, &ty, -1, i + 1, udt_schema, &db);
+                        if !secantus_pgplan::view_dml::is_updatable(
+                            v.get_str("definition").unwrap_or_default(),
+                        ) {
+                            d.insert(f("is_updatable"), "NO");
+                        }
                         rows.push(d);
                     }
                 }
@@ -13701,7 +13776,14 @@ impl PgHandler {
                         d.insert(f("sequence_catalog"), db.as_str());
                         d.insert(f("sequence_schema"), "public");
                         d.insert(f("sequence_name"), s.get_str("_id").unwrap_or_default());
-                        d.insert(f("data_type"), "bigint");
+                        d.insert(
+                            f("data_type"),
+                            match s.get_str("data_type") {
+                                Ok("int2") => "smallint",
+                                Ok("int4") => "integer",
+                                _ => "bigint",
+                            },
+                        );
                         // The bounds are TEXT in this view, which is the SQL
                         // standard's shape for a value that may not fit the
                         // view's own numeric type.
@@ -13788,7 +13870,16 @@ impl PgHandler {
                         f("relowner"),
                         Bson::Int64(owner_oid(t.extra.get_str("owner").ok())),
                     );
-                    d.insert(f("relpersistence"), if t.temp { "t" } else { "p" });
+                    d.insert(
+                        f("relpersistence"),
+                        if t.temp {
+                            "t"
+                        } else if t.extra.get_bool("unlogged").unwrap_or(false) {
+                            "u"
+                        } else {
+                            "p"
+                        },
+                    );
                     let (rls, forced) = self.row_security(&t.name);
                     d.insert(f("relrowsecurity"), rls);
                     d.insert(f("relforcerowsecurity"), forced);
@@ -17139,6 +17230,29 @@ fn canonical_bool_guc(name: &str, value: &str) -> PgWireResult<String> {
     })
 }
 
+/// `backslash_quote`, an enum GUC: guc.c's `backslash_quote_options` --
+/// `safe_encoding`, `on`, `off`, and the hidden `true` / `yes` / `1` (on)
+/// and `false` / `no` / `0` (off), matched without regard to case and never
+/// by a prefix (`of` is refused; measured on PostgreSQL 15.19).
+fn canonical_backslash_quote(value: &str) -> PgWireResult<String> {
+    let v = value.to_ascii_lowercase();
+    let canonical = match v.as_str() {
+        "safe_encoding" => "safe_encoding",
+        "on" | "true" | "yes" | "1" => "on",
+        "off" | "false" | "no" | "0" => "off",
+        _ => {
+            let mut info = ErrorInfo::new(
+                "ERROR".into(),
+                "22023".into(),
+                format!("invalid value for parameter \"backslash_quote\": \"{value}\""),
+            );
+            info.hint = Some("Available values: safe_encoding, on, off.".into());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+    };
+    Ok(canonical.to_string())
+}
+
 /// The settings a fresh connection starts with, matching what a client expects
 /// to read back before it has set anything.
 fn default_settings() -> HashMap<String, String> {
@@ -17263,9 +17377,90 @@ pub(crate) fn is_internal_setting(key: &str) -> bool {
 /// `internal` setting never changes, a `postmaster` one only at a restart, a
 /// `sighup` one only in the configuration file, a `backend` one only at
 /// connection start. `None` for a setting a session may change.
+/// A text `apply_string_syntax` rewrote: (rewritten, as sent, the map).
+type StringMap = Arc<(String, String, secantus_pgplan::escape_strings::PositionMap)>;
+
+/// How many rewritten texts a session keeps maps for: enough for the
+/// statements a client keeps prepared at once, and no more.
+const STRING_MAPS_KEPT: usize = 64;
+
+/// PostgreSQL 15's parameters that `pg15_settings.tsv` leaves out (the
+/// machine-specific ones); each is still a parameter, refused for its
+/// context rather than as unknown.
+const UNDUMPED_SETTINGS: [&str; 7] = [
+    "config_file",
+    "data_directory",
+    "hba_file",
+    "ident_file",
+    "log_timezone",
+    "port",
+    "unix_socket_directories",
+];
+
+/// PostgreSQL 15's parameters that `pg_settings` hides (`GUC_NO_SHOW_ALL`),
+/// and so the dump lacks, beside `role` / `session_authorization` (measured
+/// on 15.19: each SHOWs, and `set is_superuser` is "cannot be changed").
+const HIDDEN_SETTINGS: [&str; 6] = [
+    "role",
+    "session_authorization",
+    "is_superuser",
+    "seed",
+    "ssl_renegotiation_limit",
+    "default_with_oids",
+];
+
+impl PgHandler {
+    /// `find_option`'s answer for a name a statement sets, resets or ALTERs:
+    /// PostgreSQL knows its own parameters and takes any dotted (custom)
+    /// name as a placeholder; anything else is 42704 `unrecognized
+    /// configuration parameter`, worded with the name as written (measured
+    /// on 15.19, `set "NoSuch" = 1` keeps the case).
+    pub(crate) fn check_setting_known(&self, name: &str) -> PgWireResult<()> {
+        let key = canonical_setting(name);
+        let known = key.contains('.')
+            || pg15_settings::pg15_setting(&key).is_some()
+            || UNDUMPED_SETTINGS.contains(&key.as_str())
+            || is_internal_setting(&key)
+            || self.server_defaults().contains_key(&key)
+            || HIDDEN_SETTINGS.contains(&key.as_str());
+        if known {
+            return Ok(());
+        }
+        Err(Self::user_error(
+            "42704",
+            format!("unrecognized configuration parameter \"{name}\""),
+        ))
+    }
+
+    /// `RESET transaction_isolation` (and `SET ... TO DEFAULT`) outside a
+    /// block: ExecSetVariableStmt's `WarnNoTransactionBlock(isTopLevel,
+    /// "RESET TRANSACTION")`.
+    fn warn_reset_transaction(&self, key: &str) {
+        if key == "transaction_isolation"
+            && !self
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.warning(
+                "25P01",
+                "RESET TRANSACTION can only be used in transaction blocks".into(),
+            );
+        }
+    }
+}
+
 pub(crate) fn setting_change_refusal(key: &str) -> Option<String> {
-    if is_internal_setting(key) {
+    if is_internal_setting(key) || key == "is_superuser" {
         return Some(format!("parameter \"{key}\" cannot be changed"));
+    }
+    // The undumped ones: `log_timezone` is sighup, the rest postmaster.
+    if UNDUMPED_SETTINGS.contains(&key) {
+        let why = if key == "log_timezone" {
+            "cannot be changed now"
+        } else {
+            "cannot be changed without restarting the server"
+        };
+        return Some(format!("parameter \"{key}\" {why}"));
     }
     let why = match pg15_settings::pg15_setting(key)?.context {
         "postmaster" => "cannot be changed without restarting the server",
@@ -17310,8 +17505,13 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             603 => "box",
             24 => "regproc",
             2202 => "regprocedure",
+            2203 => "regoper",
+            2204 => "regoperator",
             4089 => "regnamespace",
             4096 => "regrole",
+            4191 => "regcollation",
+            3734 => "regconfig",
+            3769 => "regdictionary",
             600 => "point",
             601 => "lseg",
             602 => "path",
@@ -17494,6 +17694,9 @@ fn wire_type(pg_type: &str) -> Type {
         "uuid" => Type::UUID,
         // An anonymous record (`ROW(...)`): oid 2249, rendered as `(...)` text.
         "record" => Type::RECORD,
+        // `array[row(1)]`: an array of anonymous records (2287), each element
+        // sent as its own record.
+        "record[]" => Type::RECORD_ARRAY,
         "interval" => Type::INTERVAL,
         "json" => Type::JSON,
         "xml" => Type::XML,
@@ -17520,8 +17723,11 @@ fn wire_type(pg_type: &str) -> Type {
         "regclass" => Type::REGCLASS,
         "regnamespace" => Type::REGNAMESPACE,
         "regrole" => Type::REGROLE,
+        "regcollation" => Type::REGCOLLATION,
         "regproc" => Type::REGPROC,
         "regprocedure" => Type::REGPROCEDURE,
+        "regoper" => Type::REGOPER,
+        "regoperator" => Type::REGOPERATOR,
         // A real oid column type: psycopg's numeric tests read the oid back
         // and check `ftype(0) == 26`.
         "oid" => Type::OID,
@@ -17603,6 +17809,8 @@ fn wire_type(pg_type: &str) -> Type {
         "cid[]" => Type::CID_ARRAY,
         "regproc[]" => Type::REGPROC_ARRAY,
         "regprocedure[]" => Type::REGPROCEDURE_ARRAY,
+        "regoper[]" => Type::REGOPER_ARRAY,
+        "regoperator[]" => Type::REGOPERATOR_ARRAY,
         "regnamespace[]" => Type::REGNAMESPACE_ARRAY,
         "regrole[]" => Type::REGROLE_ARRAY,
         "regconfig[]" => Type::REGCONFIG_ARRAY,
@@ -17689,22 +17897,14 @@ impl StartupHandler for PgHandler {
             .cloned()
             .unwrap_or_else(|| self.databases.default_db().to_string());
         if let Err(e) = self.select_database(&requested) {
+            // PostgreSQL proves the login first and looks the database up
+            // after (`complete_login` sends this): a wrong password for a
+            // database that is not there is a wrong password.
             let info: ErrorInfo = e.into();
-            if self.hba.is_some() {
-                // PostgreSQL proves the login first and looks the database
-                // up after: a wrong password for a database that is not
-                // there is a wrong password.
-                *self
-                    .database_error
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(info);
-            } else {
-                client
-                    .send(PgWireBackendMessage::ErrorResponse(info.into()))
-                    .await?;
-                client.close().await?;
-                return Ok(());
-            }
+            *self
+                .database_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(info);
         }
 
         // A role that HAS a password must prove it -- SCRAM-SHA-256, as
@@ -18701,7 +18901,11 @@ impl SimpleQueryHandler for PgHandler {
                 Err(e) => {
                     self.note_failure();
                     self.flush_notices(_c).await?;
-                    return Err(Self::err_in(&e, query));
+                    let map = self.string_map(query);
+                    return Err(Self::restore_position(
+                        Self::err_in(&e, query),
+                        map.as_ref(),
+                    ));
                 }
             },
         };
@@ -18734,9 +18938,19 @@ impl SimpleQueryHandler for PgHandler {
         let out = match out {
             Err(PgWireError::UserError(info)) if lone.is_some() && info.code == "42601" => {
                 Err(match secantus_pgplan::split_statements(query) {
-                    Err(e) => Self::err_in(&e, query),
+                    Err(e) => {
+                        let map = self.string_map(query);
+                        Self::restore_position(Self::err_in(&e, query), map.as_ref())
+                    }
                     Ok(_) => PgWireError::UserError(info),
                 })
+            }
+            // Several commands: positions were counted into the whole text
+            // (`run_batch`), so they map back by it. (One command was
+            // mapped by `run`.)
+            Err(e) if stmts.len() > 1 => {
+                let map = self.string_map(query);
+                Err(Self::restore_position(e, map.as_ref()))
             }
             out => out,
         };
@@ -20792,12 +21006,43 @@ impl PgHandler {
             ))));
         }
         let ascending = increment > 0;
-        let min_value = options
-            .min_value
-            .unwrap_or(if ascending { 1 } else { i64::MIN + 1 });
+        // `AS type`: the range MIN / MAX default to and may not leave
+        // (`init_params`, PostgreSQL 15.19; bigint when not named).
+        let data_type = options.data_type.as_deref().unwrap_or("int8");
+        let (type_min, type_max, type_name) = match data_type {
+            "int2" => (i64::from(i16::MIN), i64::from(i16::MAX), "smallint"),
+            "int4" => (i64::from(i32::MIN), i64::from(i32::MAX), "integer"),
+            _ => (i64::MIN, i64::MAX, "bigint"),
+        };
+        let invalid = |msg: String| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "22023".into(),
+                msg,
+            )))
+        };
         let max_value = options
             .max_value
-            .unwrap_or(if ascending { i64::MAX } else { -1 });
+            .unwrap_or(if ascending { type_max } else { -1 });
+        if !(type_min..=type_max).contains(&max_value) {
+            return Err(invalid(format!(
+                "MAXVALUE ({max_value}) is out of range for sequence data type {type_name}"
+            )));
+        }
+        let min_value = options
+            .min_value
+            .unwrap_or(if ascending { 1 } else { type_min });
+        if !(type_min..=type_max).contains(&min_value) {
+            return Err(invalid(format!(
+                "MINVALUE ({min_value}) is out of range for sequence data type {type_name}"
+            )));
+        }
+        let cache = options.cache.unwrap_or(1);
+        if cache < 1 {
+            return Err(invalid(format!(
+                "CACHE ({cache}) must be greater than zero"
+            )));
+        }
         if min_value > max_value {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
@@ -20839,6 +21084,8 @@ impl PgHandler {
             "cycle": options.cycle.unwrap_or(false),
             "is_called": false,
             "owned_by": options.owned_by.clone().unwrap_or_default(),
+            "data_type": data_type,
+            "cache": cache,
         })
     }
 
@@ -20873,6 +21120,48 @@ impl PgHandler {
         if let Some(v) = options.owned_by.clone() {
             doc.insert("owned_by", v);
         }
+        if let Some(cache) = options.cache {
+            if cache < 1 {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "22023".into(),
+                    format!("CACHE ({cache}) must be greater than zero"),
+                ))));
+            }
+            doc.insert("cache", cache);
+        }
+        // `AS type`: a bound left at the OLD type's limit moves to the new
+        // type's (`init_params`), and both must fit the new type.
+        if let Some(ty) = options.data_type.as_deref() {
+            let range = |t: &str| match t {
+                "int2" => (i64::from(i16::MIN), i64::from(i16::MAX), "smallint"),
+                "int4" => (i64::from(i32::MIN), i64::from(i32::MAX), "integer"),
+                _ => (i64::MIN, i64::MAX, "bigint"),
+            };
+            let (old_min, old_max, _) = range(doc.get_str("data_type").unwrap_or("int8"));
+            let (new_min, new_max, name) = range(ty);
+            if options.max_value.is_none()
+                && doc.get("max_value").and_then(bson_i64) == Some(old_max)
+            {
+                doc.insert("max_value", new_max);
+            }
+            if options.min_value.is_none()
+                && doc.get("min_value").and_then(bson_i64) == Some(old_min)
+            {
+                doc.insert("min_value", new_min);
+            }
+            for (key, label) in [("max_value", "MAXVALUE"), ("min_value", "MINVALUE")] {
+                let v = doc.get(key).and_then(bson_i64).unwrap_or(0);
+                if !(new_min..=new_max).contains(&v) {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "22023".into(),
+                        format!("{label} ({v}) is out of range for sequence data type {name}"),
+                    ))));
+                }
+            }
+            doc.insert("data_type", ty);
+        }
         // RESTART last, and it un-calls the sequence: the next `nextval`
         // returns the restart value itself rather than one past it. Bare
         // `RESTART` goes back to the sequence's START.
@@ -20882,6 +21171,38 @@ impl PgHandler {
                 .unwrap_or(1);
             doc.insert("last_value", to);
             doc.insert("is_called", false);
+        }
+        // The bounds as they now stand must hold the start and the current
+        // value (`init_params`, in PostgreSQL's order).
+        let get = |k: &str| doc.get(k).and_then(bson_i64);
+        let (min, max) = (
+            get("min_value").unwrap_or(1),
+            get("max_value").unwrap_or(i64::MAX),
+        );
+        let refuse = |msg: String| {
+            Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "22023".into(),
+                msg,
+            ))))
+        };
+        if min > max {
+            return refuse(format!(
+                "MINVALUE ({min}) must be less than MAXVALUE ({max})"
+            ));
+        }
+        for (key, label) in [("start", "START"), ("last_value", "RESTART")] {
+            let Some(v) = get(key) else { continue };
+            if v < min {
+                return refuse(format!(
+                    "{label} value ({v}) cannot be less than MINVALUE ({min})"
+                ));
+            }
+            if v > max {
+                return refuse(format!(
+                    "{label} value ({v}) cannot be greater than MAXVALUE ({max})"
+                ));
+            }
         }
         Ok(())
     }
@@ -21747,7 +22068,9 @@ impl PgHandler {
             None,
         );
         // An error can also surface while the rows STREAM (a value that
-        // fails to evaluate on some row): it gets the same position.
+        // fails to evaluate on some row): it gets the same position. Either
+        // is reported in the text as the client sent it.
+        let map = self.string_map(query);
         result
             .map(|responses| {
                 responses
@@ -21759,15 +22082,17 @@ impl PgHandler {
                                 &mut q.data_rows,
                                 Box::pin(futures::stream::empty()),
                             );
-                            q.data_rows =
-                                Box::pin(rows.map_err(move |e| Self::positioned(e, &sql)));
+                            let map = map.clone();
+                            q.data_rows = Box::pin(rows.map_err(move |e| {
+                                Self::restore_position(Self::positioned(e, &sql), map.as_ref())
+                            }));
                             Response::Query(q)
                         }
                         other => other,
                     })
                     .collect()
             })
-            .map_err(|e| Self::positioned(e, query))
+            .map_err(|e| Self::restore_position(Self::positioned(e, query), map.as_ref()))
     }
 
     /// Record what `pg_stat_activity` shows for this backend: the state, and
@@ -22794,22 +23119,49 @@ impl PgHandler {
     /// -- the simple `Query` and the extended `Parse` -- because that is when
     /// PostgreSQL's scanner reads it: a statement prepared under one setting
     /// keeps its meaning when the setting later changes.
+    ///
+    /// `backslash_quote` is read here too, conforming or not: it refuses a
+    /// `\'` in any literal read with backslash escapes when it is `off`, or
+    /// `safe_encoding` under a client-only client encoding (scan.l's
+    /// `xeescape`, `PG_ENCODING_IS_CLIENT_ONLY`).
     fn apply_string_syntax(&self, sql: &str) -> PgWireResult<String> {
-        let (conforming, warn) = {
+        let syntax = {
             let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-            (
-                settings
+            let client_only = settings.get("client_encoding").is_some_and(|e| {
+                matches!(
+                    e.as_str(),
+                    "SJIS" | "BIG5" | "GBK" | "UHC" | "GB18030" | "JOHAB" | "SHIFT_JIS_2004"
+                )
+            });
+            secantus_pgplan::escape_strings::Syntax {
+                conforming: settings
                     .get("standard_conforming_strings")
                     .is_none_or(|v| v != "off"),
-                settings
+                warn_escapes: settings
                     .get("escape_string_warning")
                     .is_none_or(|v| v != "off"),
-            )
+                refuse_backslash_quote: match settings.get("backslash_quote").map(String::as_str) {
+                    Some("off") => true,
+                    Some("on") => false,
+                    _ => client_only,
+                },
+            }
         };
-        if conforming {
+        if syntax.conforming && (!syntax.refuse_backslash_quote || !sql.contains("\\'")) {
             return Ok(sql.to_string());
         }
-        let (rewritten, warnings) = secantus_pgplan::escape_strings::rewrite(sql, warn);
+        let (rewritten, warnings, position, map) =
+            secantus_pgplan::escape_strings::rewrite_mapped(sql, syntax);
+        if let Ok(text) = rewritten.as_ref() {
+            if !map.is_identity() {
+                let mut maps = self.string_maps.lock().unwrap_or_else(|e| e.into_inner());
+                maps.retain(|m| m.0 != *text);
+                if maps.len() >= STRING_MAPS_KEPT {
+                    maps.remove(0);
+                }
+                maps.push(Arc::new((text.clone(), sql.to_string(), map)));
+            }
+        }
         if !warnings.is_empty() {
             let mut pending = self
                 .pending_notices
@@ -22826,7 +23178,39 @@ impl PgHandler {
                 pending.push(info);
             }
         }
-        rewritten.map_err(|e| Self::err(&e))
+        rewritten.map_err(|e| {
+            let mut out = Self::err(&e);
+            if let (PgWireError::UserError(info), Some(p)) = (&mut out, position) {
+                info.position = Some(p.to_string());
+            }
+            out
+        })
+    }
+
+    /// The map `apply_string_syntax` kept for `rewritten`, if it rewrote it.
+    fn string_map(&self, rewritten: &str) -> Option<StringMap> {
+        self.string_maps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .rev()
+            .find(|m| m.0 == rewritten)
+            .cloned()
+    }
+
+    /// `e` with its position put back into the text as the client sent it,
+    /// when `map` rewrote it (`escape_strings::PositionMap`).
+    fn restore_position(mut e: PgWireError, map: Option<&StringMap>) -> PgWireError {
+        if let (PgWireError::UserError(info), Some(m)) = (&mut e, map) {
+            if let Some(p) = info
+                .position
+                .as_deref()
+                .and_then(|p| p.parse::<usize>().ok())
+            {
+                info.position = Some(m.2.original(&m.0, &m.1, p).to_string());
+            }
+        }
+        e
     }
 
     fn collect_planner_warnings(&self) {
@@ -22937,6 +23321,7 @@ impl PgHandler {
                     Bson::Null => String::new(),
                     other => format!("{other}"),
                 };
+                self.check_setting_known(name)?;
                 let key = canonical_setting(name);
                 if let Some(msg) = setting_change_refusal(&key) {
                     return Err(Self::user_error("55P02", msg));
@@ -22965,6 +23350,8 @@ impl PgHandler {
                         secantus_pgplan::DateStyle::parse(&text).canonical()
                     } else if BOOL_GUCS.contains(&key.as_str()) {
                         canonical_bool_guc(&key, &text)?
+                    } else if key == "backslash_quote" {
+                        canonical_backslash_quote(&text)?
                     } else {
                         text
                     };
@@ -25499,7 +25886,16 @@ impl PgHandler {
                     Some(stmt) => Some(self.sub_plan_rows(stmt)?),
                     None => None,
                 };
-                let docs = self.join_docs_with(join, left_rows, right_rows)?;
+                // The join's own ORDER BY is the statement's, so the LIMIT
+                // bounds its sort.
+                let bound = if sel.order.is_empty() {
+                    sort_bound(sel)
+                } else {
+                    None
+                };
+                // WITH TIES finds its ties by the join's sort key.
+                let keep_key = sel.with_ties && sel.order.is_empty();
+                let docs = self.join_docs_with(join, left_rows, right_rows, bound, keep_key)?;
                 let def = secantus_pgplan::join_output_def(join, &|n| self.lookup(n))
                     .map_err(|e| Self::err(&e))?;
                 (docs, def)
@@ -25607,8 +26003,12 @@ impl PgHandler {
             }
             docs = kept;
         }
+        // The order the windows' last Sort left the rows in: PostgreSQL
+        // plans no Sort for an ORDER BY that order already satisfies.
+        let mut window_sorted: Vec<OrderKey> = Vec::new();
         if !sel.windows.is_empty() {
-            materialise_windows(&mut docs, &sel.windows, &sel.order).map_err(|e| Self::err(&e))?;
+            window_sorted = materialise_windows(&mut docs, &sel.windows, &sel.order)
+                .map_err(|e| Self::err(&e))?;
             // The synthetic `__winN` columns go into the def HERE rather than
             // only in `select_def`, because every reader of a select's schema
             // -- the row encoder, `rows_with_schema`, `COPY (query)` -- takes
@@ -25652,9 +26052,25 @@ impl PgHandler {
             docs = kept;
         }
 
-        if !sel.order.is_empty() {
+        if !sel.order.is_empty()
+            && !(!sel.windows.is_empty() && window_order::presorted(&sel.order, &window_sorted))
+        {
             materialise_order_exprs(&mut docs, &sel.order).map_err(|e| Self::err(&e))?;
-            sort_rows(&mut docs, &sel.order);
+            // A LIMIT directly over the Sort bounds it (`ExecSetTupleBound`,
+            // OFFSET + LIMIT), which changes where ties land; a Unique (any
+            // DISTINCT) or a LockRows between them passes no bound down.
+            if matches!(sel.distinct, secantus_pgplan::Distinct::On(_)) {
+                // Stable: the DISTINCT ON below keeps the first row of each
+                // key, and a DISTINCT over a nondeterministic collation
+                // (citext) is planned as one -- where PostgreSQL runs a
+                // HashAggregate, which keeps the first row in scan order.
+                // The two cannot be told apart here, so a real DISTINCT ON
+                // keeps the stable order too (RP-028 leaves it).
+                docs.sort_by(|a, b| compare_rows(a, b, &sel.order));
+            } else {
+                let bound = sort_bound(sel).filter(|_| row_lock.is_none());
+                docs = tuplesort::sort(docs, bound, &mut |a, b| compare_rows(a, b, &sel.order));
+            }
         }
         // `DISTINCT ON (keys)` keeps one row per key, the FIRST in the sort
         // order -- which is why it runs after the sort and DISTINCT does not.
@@ -25729,6 +26145,34 @@ impl PgHandler {
             // A negative LIMIT is a PostgreSQL error, but the parser
             // hands it through; clamp rather than panic on the cast.
             let take = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
+            // The ORDER BY of a two-table join is the join's own sort, by
+            // the key it kept under `__join_order` for this (nulls last
+            // ascending, first descending).
+            let join_key: Vec<OrderKey> = match sel.join.as_ref().and_then(|j| j.order.as_ref()) {
+                Some((_, _, ascending)) if sel.with_ties && sel.order.is_empty() => {
+                    vec![OrderKey {
+                        field: "__join_order".into(),
+                        ascending: *ascending,
+                        nulls: if *ascending {
+                            Nulls::Last
+                        } else {
+                            Nulls::First
+                        },
+                        expr: None,
+                    }]
+                }
+                _ => Vec::new(),
+            };
+            let tie_order = if join_key.is_empty() {
+                &sel.order
+            } else {
+                &join_key
+            };
+            let take = if sel.with_ties {
+                with_ties_end(&docs, take, |a, b| compare_rows(a, b, tie_order))
+            } else {
+                take
+            };
             docs.truncate(take);
         }
         // `Execute` may cap rows independently of any SQL LIMIT; 0 means
@@ -26340,45 +26784,52 @@ impl PgHandler {
             }
             out = kept;
         }
-        if !set.order.is_empty() {
-            out.sort_by(|a, b| {
-                for key in &set.order {
-                    let l = a.get(key.index).and_then(|v| v.as_ref());
-                    let r = b.get(key.index).and_then(|v| v.as_ref());
-                    let l_null = matches!(l, None | Some(Bson::Null));
-                    let r_null = matches!(r, None | Some(Bson::Null));
-                    let ord = match (l_null, r_null) {
-                        (true, true) => Ordering::Equal,
-                        (true, false) => match key.nulls {
-                            Nulls::First => Ordering::Less,
-                            Nulls::Last => Ordering::Greater,
-                        },
-                        (false, true) => match key.nulls {
-                            Nulls::First => Ordering::Greater,
-                            Nulls::Last => Ordering::Less,
-                        },
-                        (false, false) => {
-                            let cmp = compare_values(l.expect("not null"), r.expect("not null"));
-                            if key.ascending {
-                                cmp
-                            } else {
-                                cmp.reverse()
-                            }
+        let order_cmp = |a: &Vec<Option<Bson>>, b: &Vec<Option<Bson>>| {
+            for key in &set.order {
+                let l = a.get(key.index).and_then(|v| v.as_ref());
+                let r = b.get(key.index).and_then(|v| v.as_ref());
+                let l_null = matches!(l, None | Some(Bson::Null));
+                let r_null = matches!(r, None | Some(Bson::Null));
+                let ord = match (l_null, r_null) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => match key.nulls {
+                        Nulls::First => Ordering::Less,
+                        Nulls::Last => Ordering::Greater,
+                    },
+                    (false, true) => match key.nulls {
+                        Nulls::First => Ordering::Greater,
+                        Nulls::Last => Ordering::Less,
+                    },
+                    (false, false) => {
+                        let cmp = compare_values(l.expect("not null"), r.expect("not null"));
+                        if key.ascending {
+                            cmp
+                        } else {
+                            cmp.reverse()
                         }
-                    };
-                    if ord != Ordering::Equal {
-                        return ord;
                     }
+                };
+                if ord != Ordering::Equal {
+                    return ord;
                 }
-                Ordering::Equal
-            });
+            }
+            Ordering::Equal
+        };
+        if !set.order.is_empty() {
+            out.sort_by(order_cmp);
         }
         if set.offset > 0 {
             let skip = usize::try_from(set.offset).unwrap_or(usize::MAX);
             out = out.into_iter().skip(skip).collect();
         }
         if let Some(limit) = set.limit {
-            out.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
+            let take = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
+            let take = if set.with_ties {
+                with_ties_end(&out, take, order_cmp)
+            } else {
+                take
+            };
+            out.truncate(take);
         }
         Ok((schema, out))
     }
@@ -26751,6 +27202,7 @@ impl PgHandler {
                 | Statement::Show(_)
                 | Statement::Set { .. }
                 | Statement::SetLocal { .. }
+                | Statement::SetDefault { .. }
                 | Statement::Reset(_)
                 | Statement::SetTransaction(_)
                 | Statement::SetSessionCharacteristics(_)
@@ -26833,12 +27285,15 @@ impl PgHandler {
                 }
                 let tz = self.session_timezone();
                 let run = |stmt: &Statement| self.subquery_rows(stmt);
+                // The types `correlated::eval` declared for the inner SQL's
+                // parameters: the statement's own, then each outer column's.
+                let types = secantus_pgplan::declared_param_types();
                 let stmt = secantus_pgplan::planning_to_execute(|| {
                     secantus_pgplan::plan_with_session_types_and_subqueries(
                         sql,
                         &|n| self.lookup(n),
                         params,
-                        &[],
+                        &types,
                         &tz,
                         Some(&run),
                     )
@@ -27024,6 +27479,16 @@ impl PgHandler {
             }
             Statement::RuleRewrite(p) => self.run_rule_plan(p, max_rows),
             Statement::CreateTable(mut def, if_not_exists) => {
+                // An identity column's sequence options: taken out of the
+                // column so they are not stored with the table.
+                let identity_options: HashMap<String, Document> = def
+                    .columns
+                    .iter_mut()
+                    .filter_map(|c| {
+                        let o = c.extra.remove(secantus_pgplan::IDENTITY_OPTIONS)?;
+                        Some((c.name.clone(), o.as_document()?.clone()))
+                    })
+                    .collect();
                 if self.lookup(&def.name).is_some()
                     || self.views()?.iter().any(|(n, _)| *n == def.name)
                     || self
@@ -27138,18 +27603,61 @@ impl PgHandler {
                     .iter()
                     .filter_map(|c| c.sequence.as_deref().map(|seq| (c, seq)))
                     .map(|(c, seq)| {
-                        let max_value = match c.pg_type.as_str() {
-                            "int2" => i64::from(i16::MAX),
-                            "int8" => i64::MAX,
-                            _ => i64::from(i32::MAX),
+                        let (type_min, max_value) = match c.pg_type.as_str() {
+                            "int2" => (i64::from(i16::MIN), i64::from(i16::MAX)),
+                            "int8" => (i64::MIN, i64::MAX),
+                            _ => (i64::from(i32::MIN), i64::from(i32::MAX)),
                         };
                         let owned_by = format!("{}.{}", def.name, c.name);
-                        encode_doc(&secantus_pgcatalog::sequence_document(
-                            seq, &owned_by, max_value,
-                        ))
+                        let Some(o) = identity_options.get(&c.name) else {
+                            let mut doc =
+                                secantus_pgcatalog::sequence_document(seq, &owned_by, max_value);
+                            // A serial's sequence is typed by its column.
+                            doc.insert(
+                                "data_type",
+                                match c.pg_type.as_str() {
+                                    "int2" | "int8" => c.pg_type.as_str(),
+                                    _ => "int4",
+                                },
+                            );
+                            return encode_doc(&doc)
+                                .map_err(|e| Self::storage_err("could not encode a sequence", e));
+                        };
+                        // The bounds a sequence of the column's type takes by
+                        // default, for the direction its increment runs.
+                        let int = |k: &str| o.get(k).and_then(bson_i64);
+                        let increment = int("increment");
+                        let ascending = increment.unwrap_or(1) > 0;
+                        let options = secantus_pgplan::SequenceOptions {
+                            start: int("start"),
+                            increment,
+                            min_value: int("min_value").or(Some(if ascending {
+                                1
+                            } else {
+                                type_min
+                            })),
+                            max_value: int("max_value").or(Some(if ascending {
+                                max_value
+                            } else {
+                                -1
+                            })),
+                            cycle: o.get_bool("cycle").ok(),
+                            restart: None,
+                            owned_by: Some(owned_by.clone()),
+                            data_type: Some(
+                                match c.pg_type.as_str() {
+                                    "int2" | "int8" => c.pg_type.as_str(),
+                                    _ => "int4",
+                                }
+                                .to_string(),
+                            ),
+                            cache: None,
+                        };
+                        let doc = Self::new_sequence_doc(seq, &options)?;
+                        encode_doc(&doc)
+                            .map_err(|e| Self::storage_err("could not encode a sequence", e))
                     })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| Self::storage_err("could not encode a sequence", e))?;
+                    .collect::<PgWireResult<Vec<_>>>()?;
                 if !sequences.is_empty() {
                     self.ensure_collection(SEQUENCE_COLLECTION)?;
                     // A sequence left behind by a dropped table of the same
@@ -27739,7 +28247,7 @@ impl PgHandler {
                 let taken = composite_dup
                     || (unqualified
                         && (self.enums()?.iter().any(|(n, _, _)| *n == name)
-                            || secantus_pgplan::pgtypes::oid_of_name(&name).is_some()));
+                            || Self::builtin_name_taken(&name)));
                 if taken {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -27808,7 +28316,7 @@ impl PgHandler {
                     || (unqualified
                         && (self.composites()?.iter().any(|(n2, _, _)| *n2 == name)
                             || self.enums()?.iter().any(|(n2, _, _)| *n2 == name)
-                            || secantus_pgplan::pgtypes::oid_of_name(&name).is_some()));
+                            || Self::builtin_name_taken(&name)));
                 if taken {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -28664,7 +29172,7 @@ impl PgHandler {
                     .any(|(s, n, _, _)| *s == schema_name && *n == name);
                 let exists = enum_dup
                     || (unqualified
-                        && (secantus_pgplan::pgtypes::oid_of_name(&name).is_some()
+                        && (Self::builtin_name_taken(&name)
                             || self.composites()?.iter().any(|(n, _, _)| *n == name)
                             || self.ranges()?.iter().any(|(n, _, _)| *n == name)));
                 if exists {
@@ -28705,6 +29213,17 @@ impl PgHandler {
                 self.ensure_collection(Self::COMPOSITE_COLLECTION)?;
                 self.ensure_collection(Self::RANGE_COLLECTION)?;
                 for name in &names {
+                    // A bare built-in name is pg_catalog's type, even beside a
+                    // `public` one of that name (measured on 15.19).
+                    if secantus_pgplan::pgtypes::shadowed_by_catalog(name) {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "2BP01".into(), // dependent_objects_still_exist
+                            format!(
+                                "cannot drop type {name} because it is required by the database system"
+                            ),
+                        ))));
+                    }
                     // Functions whose signature names it, and casts naming
                     // it, depend on any other kind of type. (A base type
                     // tracks its I/O functions below.)
@@ -28786,7 +29305,10 @@ impl PgHandler {
                         info.hint = Some(format!("You can drop table {name} instead."));
                         return Err(PgWireError::UserError(Box::new(info)));
                     }
-                    let filter = bson::doc! {"_id": name};
+                    // A `public` type named after a built-in is keyed by its
+                    // qualified name or its bare one, by kind.
+                    let bare = name.strip_prefix("public.").unwrap_or(name);
+                    let filter = bson::doc! {"_id": {"$in": [name.as_str(), bare]}};
                     let from_enum = self
                         .storage
                         .delete_matching(
@@ -30309,12 +30831,31 @@ impl PgHandler {
                 // Release the settings lock BEFORE building the field:
                 // `field` reads `client_encoding` from the same (non-reentrant)
                 // mutex to transcode the column name.
-                let value = self
+                let stored = self
                     .settings
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .get(&key)
-                    .cloned()
+                    .cloned();
+                // Two hidden parameters PostgreSQL derives from the roles:
+                // `is_superuser` follows the effective role (`SET ROLE`),
+                // `session_authorization` the session user.
+                let value = stored
+                    .or_else(|| match key.as_str() {
+                        "is_superuser" => {
+                            let role = self.current_role_name();
+                            Some(
+                                if self.is_superuser(&role) {
+                                    "on"
+                                } else {
+                                    "off"
+                                }
+                                .into(),
+                            )
+                        }
+                        "session_authorization" => Some(self.session_user_name()),
+                        _ => None,
+                    })
                     .ok_or_else(|| {
                         PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".into(),
@@ -30686,8 +31227,42 @@ impl PgHandler {
             }
 
             // `SET LOCAL`: a SET the end of the block takes back.
+            Statement::SetDefault { name, local } => {
+                // PostgreSQL's `set_config_option` with no value: the
+                // setting's reset value -- what RESET restores (a database's
+                // own default first) -- set the way `SET` / `SET LOCAL` set
+                // it, so a transaction undoes it and it is reported
+                // (measured on 15.19: `SET LOCAL datestyle TO DEFAULT` in a
+                // block reads `ISO, MDY`, and the session's `German, DMY`
+                // is back after COMMIT).
+                self.check_setting_known(&name)?;
+                let key = canonical_setting(&name);
+                self.warn_reset_transaction(&key);
+                let value = self
+                    .db_setting_defaults()
+                    .into_iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v)
+                    .or_else(|| self.server_defaults().get(&key).cloned())
+                    // `SET ROLE` has no stored default: it is NONE.
+                    .unwrap_or_else(|| {
+                        if key == "role" {
+                            "none".into()
+                        } else {
+                            String::new()
+                        }
+                    });
+                let stmt = if local {
+                    Statement::SetLocal { name, value }
+                } else {
+                    Statement::Set { name, value }
+                };
+                self.execute_statement(stmt, max_rows)
+            }
             Statement::SetLocal { name, value } => {
                 if !self.set_local_allowed() {
+                    // The WARNING first, then the name is looked up.
+                    self.check_setting_known(&name)?;
                     return Ok(vec![Response::Execution(Tag::new("SET"))]);
                 }
                 let key = canonical_setting(&name);
@@ -30698,6 +31273,7 @@ impl PgHandler {
                 out
             }
             Statement::Set { name, value } => {
+                self.check_setting_known(&name)?;
                 let key = canonical_setting(&name);
                 if let Some(msg) = setting_change_refusal(&key) {
                     return Err(Self::user_error("55P02", msg));
@@ -30759,6 +31335,23 @@ impl PgHandler {
                         canonical_ms_guc(&key, &value)?
                     } else if BOOL_GUCS.contains(&key.as_str()) {
                         canonical_bool_guc(&key, &value)?
+                    } else if key == "default_text_search_config" {
+                        // A configuration by name, kept qualified as
+                        // PostgreSQL shows it (`German` -> `pg_catalog.german`).
+                        match secantus_pgplan::ts_catalog::oid_of(&value, false)
+                            .and_then(|o| secantus_pgplan::ts_catalog::name_of(o, false))
+                        {
+                            Some(name) => format!("pg_catalog.{name}"),
+                            None => {
+                                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".into(),
+                                    "22023".into(),
+                                    format!("invalid value for parameter \"{key}\": \"{value}\""),
+                                ))))
+                            }
+                        }
+                    } else if key == "backslash_quote" {
+                        canonical_backslash_quote(&value)?
                     } else if key == "TimeZone" {
                         // A bare number of hours is recorded as its POSIX
                         // spec, as PostgreSQL shows it (`3` -> `<+03>-03`).
@@ -30877,7 +31470,14 @@ impl PgHandler {
                     *settings = self.server_defaults().into();
                     settings.extend(db_defaults);
                 } else {
+                    drop(settings);
+                    self.check_setting_known(&name)?;
                     let key = canonical_setting(&name);
+                    if let Some(msg) = setting_change_refusal(&key) {
+                        return Err(Self::user_error("55P02", msg));
+                    }
+                    self.warn_reset_transaction(&key);
+                    let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
                     // RESET restores the DEFAULT, which is not the same as
                     // removing the setting: a client reading it back afterwards
                     // must see the default, not an error. A database's own
@@ -30892,6 +31492,12 @@ impl PgHandler {
                             let d = d.clone();
                             drop(settings);
                             self.note_reportable_guc(&key, &d);
+                        }
+                        // A custom (dotted) name RESET is a placeholder
+                        // that reads empty (15.19: `reset myapp.y; show
+                        // myapp.y` is '').
+                        None if key.contains('.') => {
+                            settings.insert(key.clone(), String::new());
                         }
                         None => {
                             settings.remove(&key);
@@ -35077,7 +35683,7 @@ fn materialise_windows(
     docs: &mut [Document],
     windows: &[secantus_pgplan::WindowItem],
     query_order: &[OrderKey],
-) -> Result<(), PlanError> {
+) -> Result<Vec<OrderKey>, PlanError> {
     // A computed PARTITION BY / ORDER BY key has no stored field, so it is
     // evaluated per row into its own `__wkeyN` first and then read back
     // like any column -- one comparator rather than two. All of them before
@@ -35143,7 +35749,7 @@ fn materialise_windows(
     for (slot, d) in docs.iter_mut().zip(taken.drain(..)) {
         *slot = d;
     }
-    Ok(())
+    Ok(sorted_by)
 }
 
 /// The row indices of each partition, in the rows' original order.
@@ -35858,8 +36464,42 @@ fn materialise_order_exprs(docs: &mut [Document], order: &[OrderKey]) -> Result<
     Ok(())
 }
 
+/// The bound a select's LIMIT passes down to the Sort beneath it
+/// (`ExecSetTupleBound`: OFFSET + LIMIT), when it reaches one: a Unique (any
+/// DISTINCT) or a LockRows in between passes none.
+fn sort_bound(sel: &secantus_pgplan::Select) -> Option<usize> {
+    // `compute_tuples_needed`: none under WITH TIES, whose last rows are
+    // not known until the ties end.
+    if sel.distinct != secantus_pgplan::Distinct::None
+        || !sel.lock_clauses.is_empty()
+        || sel.with_ties
+    {
+        return None;
+    }
+    let count = |n: i64| usize::try_from(n.max(0)).unwrap_or(usize::MAX);
+    sel.limit
+        .map(|l| count(l).saturating_add(count(sel.offset)))
+}
+
+/// How many of `rows` (sorted, OFFSET already taken) a `FETCH FIRST n ROWS
+/// WITH TIES` returns: the first `n`, then every row equal under the ORDER BY
+/// to the last of them (nodeLimit.c's `LIMIT_WINDOWEND_TIES`). `n = 0` is no
+/// rows: the Limit node never reads one.
+fn with_ties_end<T>(rows: &[T], n: usize, mut cmp: impl FnMut(&T, &T) -> Ordering) -> usize {
+    if n == 0 || n >= rows.len() {
+        return n.min(rows.len());
+    }
+    let mut end = n;
+    while end < rows.len() && cmp(&rows[n - 1], &rows[end]) == Ordering::Equal {
+        end += 1;
+    }
+    end
+}
+
+/// PostgreSQL's in-memory sort (`tuplesort.c`'s quicksort), so rows that
+/// tie land where PostgreSQL's do -- it is not stable (`tuplesort.rs`).
 fn sort_rows(docs: &mut [Document], order: &[OrderKey]) {
-    docs.sort_by(|a, b| compare_rows(a, b, order));
+    window_order::pg_qsort(docs, &mut |a, b| compare_rows(a, b, order));
 }
 
 /// Two rows compared by a sort spec, in PostgreSQL's order.
@@ -38366,7 +39006,13 @@ impl ExtendedQueryHandler for PgHandler {
         // Positioned as from a simple query (RP-012).
         let fields = self
             .describe_fields(&target.statement.sql, param_types.len(), &param_types)
-            .map_err(|e| Self::syntax_positioned(e, &target.statement.sql))?;
+            .map_err(|e| {
+                let map = self.string_map(&target.statement.sql);
+                Self::restore_position(
+                    Self::syntax_positioned(e, &target.statement.sql),
+                    map.as_ref(),
+                )
+            })?;
         if let Some(fields) = &fields {
             check_field_names(self.client_encoding(), fields)?;
         }
@@ -38588,7 +39234,13 @@ impl ExtendedQueryHandler for PgHandler {
                 param_types.len(),
                 &param_types,
             )
-            .map_err(|e| Self::syntax_positioned(e, &target.statement.statement.sql))?;
+            .map_err(|e| {
+                let map = self.string_map(&target.statement.statement.sql);
+                Self::restore_position(
+                    Self::syntax_positioned(e, &target.statement.statement.sql),
+                    map.as_ref(),
+                )
+            })?;
         if let Some(fields) = &fields {
             check_field_names(self.client_encoding(), fields)?;
         }
@@ -38841,13 +39493,35 @@ impl CopyHandler for PgHandler {
         let rows: Vec<Vec<Option<Bson>>> = match state.format {
             CopyFormat::Binary => self.parse_binary_copy(&state.buffer, &state.types)?,
             format => {
-                let text = String::from_utf8(state.buffer.clone()).map_err(|_| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".into(),
-                        "22021".into(), // character_not_in_repertoire
-                        "COPY data is not valid UTF-8".into(),
-                    )))
-                })?;
+                // COPY's text arrives in the client encoding, and PostgreSQL
+                // converts it as it does a query's (22021 / 22P05 by name).
+                let cenc = self.client_encoding();
+                let text = if cenc.transcodes() {
+                    encoding::decode(cenc, &state.buffer)
+                        .map_err(|e| encoding::undecodable(cenc, e))?
+                } else {
+                    String::from_utf8(state.buffer.clone()).map_err(|e| {
+                        // `report_invalid_encoding`: the bad character's
+                        // bytes, as many as its lead byte says it has.
+                        let bad = &state.buffer[e.utf8_error().valid_up_to()..];
+                        let len = match bad.first() {
+                            Some(0xc0..=0xdf) => 2,
+                            Some(0xe0..=0xef) => 3,
+                            Some(0xf0..=0xf7) => 4,
+                            _ => 1,
+                        };
+                        let shown: Vec<String> =
+                            bad.iter().take(len).map(|b| format!("0x{b:02x}")).collect();
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "22021".into(), // character_not_in_repertoire
+                            format!(
+                                "invalid byte sequence for encoding \"UTF8\": {}",
+                                shown.join(" ")
+                            ),
+                        )))
+                    })?
+                };
                 let mut parsed = copy_parse_text(&text, format);
                 if state.header && !parsed.is_empty() {
                     parsed.remove(0);

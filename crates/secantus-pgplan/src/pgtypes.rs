@@ -44,6 +44,8 @@ pub const BUILTIN_TYPES: &[(&str, i64, i64)] = &[
     ("regclass", 2205, 2210),
     ("regproc", 24, 1008),
     ("regprocedure", 2202, 2207),
+    ("regoper", 2203, 2208),
+    ("regoperator", 2204, 2209),
     ("regnamespace", 4089, 4090),
     ("regrole", 4096, 4097),
     ("regcollation", 4191, 4192),
@@ -67,6 +69,7 @@ pub const BUILTIN_TYPES: &[(&str, i64, i64)] = &[
     ("tsvector", 3614, 3643),
     ("tsquery", 3615, 3645),
     ("regconfig", 3734, 3735),
+    ("regdictionary", 3769, 3770),
     ("jsonpath", 4072, 4073),
     ("jsonb", 3802, 3807),
     ("int4range", 3904, 3905),
@@ -138,6 +141,16 @@ pub fn oid_of_name(name: &str) -> Option<i64> {
         .iter()
         .find(|(t, _, _)| *t == internal)
         .map(|(_, oid, _)| *oid)
+        // An array type's own name is its element's with a leading `_`
+        // (`'_timestamp'::regtype` is `timestamp without time zone[]`).
+        .or_else(|| {
+            let element = internal.strip_prefix('_')?;
+            BUILTIN_TYPES
+                .iter()
+                .find(|(t, _, _)| *t == element)
+                .map(|(_, _, arr)| *arr)
+                .filter(|a| *a != 0)
+        })
 }
 
 /// The internal name for a scalar OR ARRAY type oid (`int4`, `int4[]`).
@@ -263,6 +276,15 @@ const CATALOG_TYPE_NAMES: &[&str] = &[
     "xid8",
     "xml",
 ];
+
+/// Whether a type called `name` in `public` is hidden by `pg_catalog`'s
+/// own: PostgreSQL searches `pg_catalog` first, so a bare `tid` is the
+/// built-in even when a table `tid` exists, and the table's row type is
+/// reached (and printed, by `format_type`) only as `public.tid` (measured on
+/// 15.19). Only a real `pg_type` name: `int` is grammar, not a type.
+pub fn shadowed_by_catalog(name: &str) -> bool {
+    CATALOG_TYPE_NAMES.contains(&name)
+}
 
 /// Whether `name` (an array's element name, or a scalar's) is a built-in
 /// type, in any spelling PostgreSQL accepts.

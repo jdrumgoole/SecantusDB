@@ -59,14 +59,6 @@ one beside it.
   `send_query_params`, then a blocking `PQcancel` at a chosen offset.
   Backlog-ID: RP-002
   Verify: tests/backlog/test_rp_triage.py::test_cancel_during_parse_is_honoured_at_once
-- [ ] RUST pgserver: `standard_conforming_strings = off` is honoured by a lexer
-  pass (`secantus-pgplan/src/escape_strings.rs`) that rewrites each plain
-  literal to the `E'...'` it means before pg_query (which has the setting
-  hard-wired on) sees it, with the `escape_string_warning` notices. Left:
-  `N'...'` literals are not rewritten (they keep the conforming reading), and
-  `backslash_quote` is not a setting (2026-09-09).
-  Backlog-ID: RP-003
-  Verify: tests/backlog/test_rp_triage.py::test_national_literal_under_nonconforming_strings,tests/backlog/test_rp_triage.py::test_backslash_quote_off_refuses_backslash_quote
 - **Scope decision — a `LANGUAGE internal` wrapper over a C function with no
   SQL form** (an I/O function such as `int4out`, an aggregate transition
   function) is a catalog row that answers 42883 when called. PostgreSQL calls
@@ -125,17 +117,18 @@ one beside it.
   table refuses reads and writes with PostgreSQL's own `55000` for a
   handler-less wrapper; `postgres_fdw` / `file_fdw` are contrib modules this
   server does not ship.
-- [ ] **RUST pgserver: `pg_collation` lists only `und-x-icu` / `en-x-icu`
-  among the ICU collations.** The list was limited because ordering by a
-  locale once needed CLDR data the server did not have. `secantus-pgplan/src/
-  collation.rs` now evaluates any `<tag>-x-icu` name with ICU4X over CLDR
-  data, but `regobj::collation_names` and `secantus-pg/src/collations.rs`
-  still list only `und-x-icu` (12713) and `en-x-icu` (12860). Reproduce:
-  `select collname from pg_collation where collprovider = 'i'` on both
-  servers; PostgreSQL 15 lists hundreds (`de-x-icu`, `sv-x-icu`, ...). Check
-  first that each listed locale orders as PostgreSQL does.
+- [ ] **RUST pgserver: 27 of PostgreSQL 15.19's 907 ICU collations are
+  refused.** `pg_collation` lists the other 880 (`pg_icu_collations.tsv`),
+  each checked to ORDER BY as PostgreSQL does over a 97-string probe across
+  scripts. Left out, because ICU4X's CLDR data tailors them differently
+  (most order as the root locale): `az-Cyrl`, `haw`, `hi-Latn`, `kl`,
+  `kok-Latn`, `lkt`, `pa-Arab`, `se`, `smn`, `uz-Arab`, `uz-Cyrl`, `yi`,
+  `en-US-u-va-posix` and their regional forms; each is 42704. Related, not
+  tested: none of PostgreSQL's libc collations beyond `C` / `POSIX` exists
+  here (`COLLATE "en_US"` is 42704), and which ones a server has is the
+  host's locale list.
   Backlog-ID: RP-005
-  Verify: tests/backlog/test_rp_triage.py::test_pg_collation_lists_locale_icu_collations
+  Verify: tests/backlog/test_rp_triage.py::test_tailored_icu_collation_orders_as_postgres
 - **Scope decision — pgcrypto Blowfish and CAST5** PGP messages are verified
   against GnuPG, because both reference servers' OpenSSL 3 builds refuse
   those ciphers. Do not "fix" them to agree with a PG error.
@@ -326,10 +319,6 @@ one beside it.
     - **A `map=` on a method other than `cert` is refused**; PostgreSQL
       takes it for `ident`, `peer`, `gss` and `sspi` too, none of which is
       read here.
-    - **Without a `pg_hba.conf` the database is still looked up before the
-      login is proved**, so a wrong password for a database that is not
-      there reads "database does not exist". With one the order is
-      PostgreSQL's.
     - A password past its `VALID UNTIL` runs the exchange and fails it,
       where the path without a file fails at once. PostgreSQL does the
       first; not probed here.
@@ -363,68 +352,54 @@ one beside it.
     take a revocation list, a user name map or `clientname=DN` as
     options**; a `pg_hba.conf` passed as `hba_file` can say the last two.
   Backlog-ID: RP-013
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_unknown_user_is_asked_for_a_password,tests/backlog/test_rust_postgres_gaps.py::test_wrong_password_checked_before_the_database
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_unknown_user_is_asked_for_a_password
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **RUST pgserver: `UPDATE ... SET (a, b) = (SELECT ...)` is refused.**
-  It is 0A000 `MultiAssignRef is not supported yet`; PostgreSQL 15.19
-  assigns each listed column from the subquery's one row. Found 2026-10-15
-  by RP-029's work.
-  Backlog-ID: RP-031
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_update_multi_column_assignment_from_a_subquery
-
-- [ ] **RUST pgserver: a record's text form drops a `char(n)` field's
-  padding.** `(t)::text` over a `char(3)` holding `ab` is `(ab)`;
-  PostgreSQL 15.19 prints `("ab ")` (the padded value, quoted because of
-  its blank). Found 2026-10-15 by RP-029's work.
+- [ ] **RUST pgserver: a text literal cast to a table's row type does not
+  pad its `char(n)` fields.** `'(ab,x)'::t::text` over `t (c char(3), v
+  text)` is `(ab,x)`; PostgreSQL 15.19 prints `("ab ",x)`. A whole-row
+  value keeps the padding (fixed 2026-10-15), but a row type's entry in
+  `__sql_composites__` records each field as `[name, type, null]` with no
+  width, so a literal has nothing to pad to. Recording it is a change to a
+  catalog document the Python server shares.
   Backlog-ID: RP-032
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_record_text_keeps_char_padding
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_record_literal_pads_char_field
 
-- [ ] **RUST pgserver: what the 2026-10-15 typed-value work left.** That
-  batch made values print by their type, refused the casts and operators
-  PostgreSQL 15's `pg_cast` / `pg_operator` have no entry for, and typed
-  untyped literals in set operations and NULLIF (corpus
-  `typed_value_render`, 634 checks). Still different:
-  - `array[row(1)]` comes back as the one string `{(1)}`, not an array.
-  - `'now()'::regprocedure` is 42883 and `regoper` does not exist.
-  - A refused function-style cast (`int8(true)`) is 42846; PostgreSQL
-    calls it a function and says 42883.
-  - ORDER BY over `point` (no ordering operator) and set operations over
-    it (no equality operator) succeed where PostgreSQL refuses.
-  - `information_schema.columns.data_type` says `tid[]` where PostgreSQL
-    says `ARRAY`; `=` over `int2vector` / `oidvector` / `path` is refused;
-    `time` compared with `timetz` / `interval` and `macaddr` with
-    `macaddr8` resolve differently; an input-cast error carries a position
-    PostgreSQL does not give.
+- [ ] **RUST pgserver: what the typed-value work left (2026-10-15).**
+  - Comparing arrays of records whose fields are untyped
+    (`array[row(1, null)] = array[row(1, null)]`) stays 0A000; PostgreSQL
+    errors at execution with messages that vary by case.
   Backlog-ID: RP-025
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_typed_value_residue
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_untyped_record_array_compare
 
-- [ ] **RUST pgserver: a table named after a built-in type shadows it.**
-  `create table tid (d date)` now succeeds, as on PostgreSQL 15.19 (it
-  was 42710), but then a bare `tid` in a cast resolves to the table's row
-  type (`'(0,1)'::tid` is a malformed record literal) and the table's
-  whole-row value is typed as the built-in (`row_to_json(x)` over it is
-  42883). PostgreSQL searches `pg_catalog` first, so a bare name is the
-  built-in, while the row type is `public.tid`. Composite types are found
-  by name here (`user_composite`), so this needs them told apart by schema.
-  Found 2026-10-15 merging the `tid` type.
-  Backlog-ID: RP-030
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_table_named_after_a_builtin_type
+- [ ] **RUST pgserver: what the 2026-10-15 batch saw beside its items.**
+  Each measured on PostgreSQL 15.19:
+  - An operator's function called over typed columns it does not take
+    (`int4pl(text_col, int_col)`) is 42883 at the right place, worded
+    `operator does not exist: text + integer`; PostgreSQL names the
+    function, `function int4pl(text, integer) does not exist`. (Over
+    constants it is worded as PostgreSQL has it.)
+  - `pg_typeof` of a column of a domain type prints the base type, not
+    the domain's name (`pg_typeof(1::d)` is right).
+  - `create type int` / `create type integer` are 42710; PostgreSQL makes
+    `public."int"`. They are grammar spellings with no pg_type row, and the
+    planner folds `int` to `int4`, so the fix has to keep the two apart.
+  Backlog-ID: RP-038
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_batch_residue,tests/backlog/test_rust_postgres_gaps.py::test_pg_typeof_names_the_domain,tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_int
 
-- [ ] **RUST pgserver: rows that tie under ORDER BY come out in a
-  different order from PostgreSQL's.** The sort here is stable;
-  PostgreSQL's quicksort (`sort_template.h`) is not, from 7 rows up: six
-  rows tied at `v = 1` come out `7, 10, 3, 4, 5, 9` there and in insertion
-  order here. SQL leaves the order unspecified, but a client sees it.
-  `window_order::pg_qsort` is a transcription of that quicksort (the
-  window path uses it since RP-024); using it for ORDER BY would change
-  every sorted query, so it wants a corpus sweep of its own. Related, not
-  covered by the test: DISTINCT and grouped queries where PostgreSQL picks
-  a HashAggregate come out in hash-table order. Found 2026-10-15 while
-  fixing RP-024.
+- [ ] **RUST pgserver: grouped and DISTINCT ON rows that tie under ORDER BY
+  come out in another order from PostgreSQL's.** A plain ORDER BY (and an
+  aggregate's, and a LIMIT's bounded heap) now sorts with PostgreSQL's
+  quicksort (`tuplesort.rs`, fixed 2026-10-15). A grouped query's groups
+  and DISTINCT ON's rows still reach the sort in this server's order, not
+  the HashAggregate's or scan's PostgreSQL feeds it, so they keep a stable
+  sort: `select g, count(*) ... group by g order by count(*)` gives `(1,6),
+  (0,6)` where PostgreSQL 15.19 gives `(0,6), (1,6)`. DISTINCT ON needs a
+  planner flag (a citext DISTINCT is planned as one). Sorts that spill to
+  disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_order_by_ties_as_postgres_quicksort_leaves_them
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_grouped_output_ties_as_postgres_leaves_them
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
@@ -492,47 +467,32 @@ one beside it.
       before working an item.
 
       What is left:
-      - **The multi-byte encodings** (EUC_JP, EUC_CN, EUC_KR, EUC_TW,
-        SJIS, BIG5, GBK, UHC, GB18030, JOHAB, SHIFT_JIS_2004,
-        EUC_JIS_2004) convert only their ASCII range, in `convert*` and as
-        a `client_encoding` (passed through as UTF-8). The single-byte ones
-        are done from tables measured on PostgreSQL (`sbcs.rs`); these need
-        PostgreSQL's mapping tables, which are large.
-      - **Text search**: a `regconfig` / `regdictionary` by oid
-        (`3748::regconfig`) and `pg_ts_config` do not exist; `null::tsquery`
-        sends a spurious "doesn't contain lexemes" NOTICE; a bad
-        configuration name carries no position; `ts_headline` refuses its
-        `MaxWords` / `MinWords` / `ShortWord` / `MaxFragments` options,
-        chooses its words by a rule of its own, and answers an all-untyped
-        call PostgreSQL refuses as not unique (42725); `ts_rewrite`'s
-        substitute loses its AND/OR nesting (a tsquery is carried as its
-        canonical text), its SELECT form checks the column count only on
-        rows it gets back, and a syntax error in that SQL has a position
-        PostgreSQL does not give.
-      - **`aclexplode`, `acldefault`, `makeaclitem`** need role oids;
-        **`pg_relation_is_updatable`**, **`pg_is_other_temp_schema`**,
-        **`pg_settings_get_flags`** need catalog or GUC state the planner
-        does not see; `table_to_xml` and the other XML exports, and the
-        `fmgr_*` / `postgresql_fdw_validator` validators, are not written.
-      - **An untyped literal beside a typed argument** is not resolved by
-        `func_select_candidate`'s rules (only an all-constant call is,
-        `unknown_args.rs`); `abs(NULL)`'s column is described as text (its
-        `pg_typeof` is right); `array_length('{1,2,3}', 1)` is not
-        PostgreSQL's 42804 polymorphic error.
-      - **Smaller**: only `line <-> point` measures with `pg_hypot`; a
-        `"char"` with the high bit set orders by its `\ooo` text; an alias
-        call with a COLUMN of the wrong type still runs
-        (`int4pl(numeric_col, 2)`); `pg_relation_is_publishable` is true for
-        an unlogged table.
-      - **Refused operators** the probe reached through their functions:
-        multirange `-|-` / `<<` / `>>` / `&<` / `&>` and its ordering
-        comparisons; `macaddr` / `macaddr8` `&` `|` `~`; geometric `box #
-        box`, `<^` / `>^`, circle `&<` `&>` `&<|` `|&>`, `##` for six pairs,
-        `<->` between a line or box and a segment, `line # line`, `?#`,
-        the `path` count comparisons, `point <> point`; `tsquery @>` / `<@`
-        by function name; `json[b]_extract_path[_text]` / `jsonb_delete`
-        given `VARIADIC array`. Casts by function name (`int4("char")`,
-        `bpchar(bpchar, int4, bool)`, `numeric(numeric, int4)`, ...).
+      - **Text search**: `null::tsquery` sends a spurious "doesn't
+        contain lexemes" NOTICE from a FROM-less select; `ts_headline`
+        refuses its `MaxWords` / `MinWords` / `ShortWord` / `MaxFragments`
+        options, chooses its words by a rule of its own, and answers an
+        all-untyped call PostgreSQL refuses as not unique (42725);
+        `ts_rewrite`'s substitute loses its AND/OR nesting (a tsquery is
+        carried as its canonical text), its SELECT form checks the column
+        count only on rows it gets back, and a syntax error in that SQL has
+        a position PostgreSQL does not give.
+      - **`aclexplode` in a select list** (`(aclexplode(a)).privilege_type`)
+        is refused, and an aclitem naming a role oid no role has cannot be
+        read back (items are carried as text, PostgreSQL's as oids);
+        the XML schema exports (`query_to_xmlschema`, `table_to_xmlschema`,
+        the `*_and_xmlschema` forms), `cursor_to_xml` and the schema /
+        database forms, and the `fmgr_*` / `postgresql_fdw_validator`
+        validators, are not written (`query_to_xml` / `table_to_xml` are).
+      - **An untyped literal beside a typed argument** is resolved only
+        for a polymorphic overload that is the one candidate (`unknown_args`,
+        `funcsig::polymorphic_args`); `func_select_candidate`'s other steps
+        are not followed (only an all-constant call is). `unnest('{1,2}')`
+        is not PostgreSQL's 42725 (three overloads), and a bad literal read
+        through `array_append('{1.5}', 2)` has no position. `abs(NULL)`'s
+        column is described as `numeric` (oid 1700); PostgreSQL says
+        `float8` (701), and its `pg_typeof` is right here.
+      - **A VARIADIC argument** that is neither an `ARRAY[...]` constructor
+        nor a json path / `jsonb_delete` call (`concat(VARIADIC arr_col)`).
       - **Not to be closed by an alias**: `bttextcmp`, `bpcharcmp` and
         `byteacmp` answer what the C library's `memcmp` returns (14 for
         `bttextcmp('b', 'a')` on macOS, 1 elsewhere); the type input/output,

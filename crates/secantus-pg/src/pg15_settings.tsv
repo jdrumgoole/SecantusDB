@@ -3,7 +3,7 @@ allow_system_table_mods	off	off		Developer Options	Allows modifications of the s
 archive_cleanup_command				Write-Ahead Log / Archive Recovery	Sets the shell command that will be executed at every restart point.	sighup	string			
 archive_command	(disabled)	(disabled)		Write-Ahead Log / Archiving	Sets the shell command that will be called to archive a WAL file.	sighup	string			
 archive_library				Write-Ahead Log / Archiving	Sets the library that will be called to archive a WAL file.	sighup	string			
-archive_mode	off	off		Write-Ahead Log / Archiving	Allows archiving of WAL files using archive_command.	postmaster	enum			off
+archive_mode	off	off		Write-Ahead Log / Archiving	Allows archiving of WAL files using archive_command.	postmaster	enum			off	always,on,off
 archive_timeout	0	0	s	Write-Ahead Log / Archiving	Sets the amount of time to wait before forcing a switch to the next WAL file.	sighup	integer	0	1073741823	0
 array_nulls	on	on		Version and Platform Compatibility / Previous PostgreSQL Versions	Enable input of NULL elements in arrays.	user	bool			on
 authentication_timeout	1min	60	s	Connections and Authentication / Authentication	Sets the maximum allowed time to complete client authentication.	sighup	integer	1	600	60
@@ -22,7 +22,7 @@ autovacuum_vacuum_scale_factor	0.2	0.2		Autovacuum	Number of tuple updates or de
 autovacuum_vacuum_threshold	50	50		Autovacuum	Minimum number of tuple updates or deletes prior to vacuum.	sighup	integer	0	2147483647	50
 autovacuum_work_mem	-1	-1	kB	Resource Usage / Memory	Sets the maximum memory to be used by each autovacuum worker process.	sighup	integer	-1	2147483647	-1
 backend_flush_after	0	0	8kB	Resource Usage / Asynchronous Behavior	Number of pages after which previously performed writes are flushed to disk.	user	integer	0	256	0
-backslash_quote	safe_encoding	safe_encoding		Version and Platform Compatibility / Previous PostgreSQL Versions	Sets whether "\'" is allowed in string literals.	user	enum			safe_encoding
+backslash_quote	safe_encoding	safe_encoding		Version and Platform Compatibility / Previous PostgreSQL Versions	Sets whether "\'" is allowed in string literals.	user	enum			safe_encoding	safe_encoding,on,off
 backtrace_functions				Developer Options	Log backtrace for errors in these functions.	superuser	string			
 bgwriter_delay	200ms	200	ms	Resource Usage / Background Writer	Background writer sleep time between rounds.	sighup	integer	10	10000	200
 bgwriter_flush_after	0	0	8kB	Resource Usage / Background Writer	Number of pages after which previously performed writes are flushed to disk.	sighup	integer	0	256	0
@@ -31,7 +31,7 @@ bgwriter_lru_multiplier	2	2		Resource Usage / Background Writer	Multiple of the 
 block_size	8192	8192		Preset Options	Shows the size of a disk block.	internal	integer	8192	8192	8192
 bonjour	off	off		Connections and Authentication / Connection Settings	Enables advertising the server via Bonjour.	postmaster	bool			off
 bonjour_name				Connections and Authentication / Connection Settings	Sets the Bonjour service name.	postmaster	string			
-bytea_output	hex	hex		Client Connection Defaults / Statement Behavior	Sets the output format for bytea.	user	enum			hex
+bytea_output	hex	hex		Client Connection Defaults / Statement Behavior	Sets the output format for bytea.	user	enum			hex	escape,hex
 check_function_bodies	on	on		Client Connection Defaults / Statement Behavior	Check routine bodies during CREATE FUNCTION and CREATE PROCEDURE.	user	bool			on
 checkpoint_completion_target	0.9	0.9		Write-Ahead Log / Checkpoints	Time spent flushing dirty buffers during checkpoint, as fraction of checkpoint interval.	sighup	real	0	1	0.9
 checkpoint_flush_after	0	0	8kB	Write-Ahead Log / Checkpoints	Number of pages after which previously performed writes are flushed to disk.	sighup	integer	0	256	0
@@ -39,12 +39,12 @@ checkpoint_timeout	5min	300	s	Write-Ahead Log / Checkpoints	Sets the maximum tim
 checkpoint_warning	30s	30	s	Write-Ahead Log / Checkpoints	Sets the maximum time before warning if checkpoints triggered by WAL volume happen too frequently.	sighup	integer	0	2147483647	30
 client_connection_check_interval	0	0	ms	Connections and Authentication / Connection Settings	Sets the time interval between checks for disconnection while running queries.	user	integer	0	2147483647	0
 client_encoding	UTF8	UTF8		Client Connection Defaults / Locale and Formatting	Sets the client's character set encoding.	user	string			SQL_ASCII
-client_min_messages	notice	notice		Client Connection Defaults / Statement Behavior	Sets the message levels that are sent to the client.	user	enum			notice
+client_min_messages	notice	notice		Client Connection Defaults / Statement Behavior	Sets the message levels that are sent to the client.	user	enum			notice	debug5,debug4,debug3,debug2,debug1,log,notice,warning,error
 cluster_name				Reporting and Logging / Process Title	Sets the name of the cluster, which is included in the process title.	postmaster	string			
 commit_delay	0	0		Write-Ahead Log / Settings	Sets the delay in microseconds between transaction commit and flushing WAL to disk.	superuser	integer	0	100000	0
 commit_siblings	5	5		Write-Ahead Log / Settings	Sets the minimum number of concurrent open transactions required before performing commit_delay.	user	integer	0	1000	5
-compute_query_id	auto	auto		Statistics / Monitoring	Enables in-core computation of query identifiers.	superuser	enum			auto
-constraint_exclusion	partition	partition		Query Tuning / Other Planner Options	Enables the planner to use constraints to optimize queries.	user	enum			partition
+compute_query_id	auto	auto		Statistics / Monitoring	Enables in-core computation of query identifiers.	superuser	enum			auto	auto,regress,on,off
+constraint_exclusion	partition	partition		Query Tuning / Other Planner Options	Enables the planner to use constraints to optimize queries.	user	enum			partition	partition,on,off
 cpu_index_tuple_cost	0.005	0.005		Query Tuning / Planner Cost Constants	Sets the planner's estimate of the cost of processing each index entry during an index scan.	user	real	0	1.79769e+308	0.005
 cpu_operator_cost	0.0025	0.0025		Query Tuning / Planner Cost Constants	Sets the planner's estimate of the cost of processing each operator or function call.	user	real	0	1.79769e+308	0.0025
 cpu_tuple_cost	0.01	0.01		Query Tuning / Planner Cost Constants	Sets the planner's estimate of the cost of processing each tuple (row).	user	real	0	1.79769e+308	0.01
@@ -65,12 +65,12 @@ default_statistics_target	100	100		Query Tuning / Other Planner Options	Sets the
 default_table_access_method	heap	heap		Client Connection Defaults / Statement Behavior	Sets the default table access method for new tables.	user	string			heap
 default_tablespace				Client Connection Defaults / Statement Behavior	Sets the default tablespace to create tables and indexes in.	user	string			
 default_text_search_config	pg_catalog.english	pg_catalog.english		Client Connection Defaults / Locale and Formatting	Sets default text search configuration.	user	string			pg_catalog.simple
-default_toast_compression	pglz	pglz		Client Connection Defaults / Statement Behavior	Sets the default compression method for compressible values.	user	enum			pglz
+default_toast_compression	pglz	pglz		Client Connection Defaults / Statement Behavior	Sets the default compression method for compressible values.	user	enum			pglz	pglz,lz4
 default_transaction_deferrable	off	off		Client Connection Defaults / Statement Behavior	Sets the default deferrable status of new transactions.	user	bool			off
-default_transaction_isolation	read committed	read committed		Client Connection Defaults / Statement Behavior	Sets the transaction isolation level of each new transaction.	user	enum			read committed
+default_transaction_isolation	read committed	read committed		Client Connection Defaults / Statement Behavior	Sets the transaction isolation level of each new transaction.	user	enum			read committed	serializable,repeatable read,read committed,read uncommitted
 default_transaction_read_only	off	off		Client Connection Defaults / Statement Behavior	Sets the default read-only status of new transactions.	user	bool			off
 dynamic_library_path	$libdir	$libdir		Client Connection Defaults / Other Defaults	Sets the path for dynamically loadable modules.	superuser	string			$libdir
-dynamic_shared_memory_type	posix	posix		Resource Usage / Memory	Selects the dynamic shared memory implementation used.	postmaster	enum			posix
+dynamic_shared_memory_type	posix	posix		Resource Usage / Memory	Selects the dynamic shared memory implementation used.	postmaster	enum			posix	posix,sysv,mmap
 effective_cache_size	4GB	524288	8kB	Query Tuning / Planner Cost Constants	Sets the planner's assumption about the total size of the data caches.	user	integer	1	2147483647	524288
 effective_io_concurrency	0	0		Resource Usage / Asynchronous Behavior	Number of simultaneous requests that can be handled efficiently by the disk subsystem.	user	integer	0	1000	0
 enable_async_append	on	on		Query Tuning / Planner Method Configuration	Enables the planner's use of async append plans.	user	bool			on
@@ -98,7 +98,7 @@ event_source	PostgreSQL	PostgreSQL		Reporting and Logging / Where to Log	Sets th
 exit_on_error	off	off		Error Handling	Terminate session on any error.	user	bool			off
 external_pid_file				File Locations	Writes the postmaster PID to the specified file.	postmaster	string			
 extra_float_digits	1	1		Client Connection Defaults / Locale and Formatting	Sets the number of digits displayed for floating-point values.	user	integer	-15	3	1
-force_parallel_mode	off	off		Developer Options	Forces use of parallel query facilities.	user	enum			off
+force_parallel_mode	off	off		Developer Options	Forces use of parallel query facilities.	user	enum			off	off,on,regress
 from_collapse_limit	8	8		Query Tuning / Other Planner Options	Sets the FROM-list size beyond which subqueries are not collapsed.	user	integer	1	2147483647	8
 fsync	on	on		Write-Ahead Log / Settings	Forces synchronization of updates to disk.	sighup	bool			on
 full_page_writes	on	on		Write-Ahead Log / Settings	Writes full pages to WAL when first modified after a checkpoint.	sighup	bool			on
@@ -115,7 +115,7 @@ hash_mem_multiplier	2	2		Resource Usage / Memory	Multiple of work_mem to use for
 hot_standby	on	on		Replication / Standby Servers	Allows connections and queries during recovery.	postmaster	bool			on
 hot_standby_feedback	off	off		Replication / Standby Servers	Allows feedback from a hot standby to the primary that will avoid query conflicts.	sighup	bool			off
 huge_page_size	0	0	kB	Resource Usage / Memory	The size of huge page that should be requested.	postmaster	integer	0	2147483647	0
-huge_pages	try	try		Resource Usage / Memory	Use of huge pages on Linux or Windows.	postmaster	enum			try
+huge_pages	try	try		Resource Usage / Memory	Use of huge pages on Linux or Windows.	postmaster	enum			try	off,on,try
 idle_in_transaction_session_timeout	0	0	ms	Client Connection Defaults / Statement Behavior	Sets the maximum allowed idle time between queries, when in a transaction.	user	integer	0	2147483647	0
 idle_session_timeout	0	0	ms	Client Connection Defaults / Statement Behavior	Sets the maximum allowed idle time between queries, when not in a transaction.	user	integer	0	2147483647	0
 ignore_checksum_failure	off	off		Developer Options	Continues processing after a checksum failure.	superuser	bool			off
@@ -123,7 +123,7 @@ ignore_invalid_pages	off	off		Developer Options	Continues recovery after an inva
 ignore_system_indexes	off	off		Developer Options	Disables reading from system indexes.	backend	bool			off
 in_hot_standby	off	off		Preset Options	Shows whether hot standby is currently active.	internal	bool			off
 integer_datetimes	on	on		Preset Options	Shows whether datetimes are integer based.	internal	bool			on
-IntervalStyle	postgres	postgres		Client Connection Defaults / Locale and Formatting	Sets the display format for interval values.	user	enum			postgres
+IntervalStyle	postgres	postgres		Client Connection Defaults / Locale and Formatting	Sets the display format for interval values.	user	enum			postgres	postgres,postgres_verbose,sql_standard,iso_8601
 jit	on	on		Query Tuning / Other Planner Options	Allow JIT compilation.	user	bool			on
 jit_above_cost	100000	100000		Query Tuning / Planner Cost Constants	Perform JIT compilation if query is more expensive.	user	real	-1	1.79769e+308	100000
 jit_debugging_support	off	off		Developer Options	Register JIT-compiled functions with debugger.	superuser-backend	bool			off
@@ -154,7 +154,7 @@ log_destination	stderr	stderr		Reporting and Logging / Where to Log	Sets the des
 log_directory	log	log		Reporting and Logging / Where to Log	Sets the destination directory for log files.	sighup	string			log
 log_disconnections	off	off		Reporting and Logging / What to Log	Logs end of a session, including duration.	superuser-backend	bool			off
 log_duration	off	off		Reporting and Logging / What to Log	Logs the duration of each completed SQL statement.	superuser	bool			off
-log_error_verbosity	default	default		Reporting and Logging / What to Log	Sets the verbosity of logged messages.	superuser	enum			default
+log_error_verbosity	default	default		Reporting and Logging / What to Log	Sets the verbosity of logged messages.	superuser	enum			default	terse,default,verbose
 log_executor_stats	off	off		Statistics / Monitoring	Writes executor performance statistics to the server log.	superuser	bool			off
 log_file_mode	0600	0600		Reporting and Logging / Where to Log	Sets the file permissions for log files.	sighup	integer	0	511	384
 log_filename	postgresql-%Y-%m-%d_%H%M%S.log	postgresql-%Y-%m-%d_%H%M%S.log		Reporting and Logging / Where to Log	Sets the file name pattern for log files.	sighup	string			postgresql-%Y-%m-%d_%H%M%S.log
@@ -163,8 +163,8 @@ log_line_prefix	%m [%p] 	%m [%p] 		Reporting and Logging / What to Log	Controls 
 log_lock_waits	off	off		Reporting and Logging / What to Log	Logs long lock waits.	superuser	bool			off
 log_min_duration_sample	-1	-1	ms	Reporting and Logging / When to Log	Sets the minimum execution time above which a sample of statements will be logged. Sampling is determined by log_statement_sample_rate.	superuser	integer	-1	2147483647	-1
 log_min_duration_statement	-1	-1	ms	Reporting and Logging / When to Log	Sets the minimum execution time above which all statements will be logged.	superuser	integer	-1	2147483647	-1
-log_min_error_statement	error	error		Reporting and Logging / When to Log	Causes all statements generating error at or above this level to be logged.	superuser	enum			error
-log_min_messages	warning	warning		Reporting and Logging / When to Log	Sets the message levels that are logged.	superuser	enum			warning
+log_min_error_statement	error	error		Reporting and Logging / When to Log	Causes all statements generating error at or above this level to be logged.	superuser	enum			error	debug5,debug4,debug3,debug2,debug1,info,notice,warning,error,log,fatal,panic
+log_min_messages	warning	warning		Reporting and Logging / When to Log	Sets the message levels that are logged.	superuser	enum			warning	debug5,debug4,debug3,debug2,debug1,info,notice,warning,error,log,fatal,panic
 log_parameter_max_length	-1	-1	B	Reporting and Logging / What to Log	Sets the maximum length in bytes of data logged for bind parameter values when logging statements.	superuser	integer	-1	1073741823	-1
 log_parameter_max_length_on_error	0	0	B	Reporting and Logging / What to Log	Sets the maximum length in bytes of data logged for bind parameter values when logging statements, on error.	user	integer	-1	1073741823	0
 log_parser_stats	off	off		Statistics / Monitoring	Writes parser performance statistics to the server log.	superuser	bool			off
@@ -174,7 +174,7 @@ log_replication_commands	off	off		Reporting and Logging / What to Log	Logs each 
 log_rotation_age	1d	1440	min	Reporting and Logging / Where to Log	Sets the amount of time to wait before forcing log file rotation.	sighup	integer	0	35791394	1440
 log_rotation_size	10MB	10240	kB	Reporting and Logging / Where to Log	Sets the maximum size a log file can reach before being rotated.	sighup	integer	0	2097151	10240
 log_startup_progress_interval	10s	10000	ms	Reporting and Logging / When to Log	Time between progress updates for long-running startup operations.	sighup	integer	0	2147483647	10000
-log_statement	none	none		Reporting and Logging / What to Log	Sets the type of statements logged.	superuser	enum			none
+log_statement	none	none		Reporting and Logging / What to Log	Sets the type of statements logged.	superuser	enum			none	none,ddl,mod,all
 log_statement_sample_rate	1	1		Reporting and Logging / When to Log	Fraction of statements exceeding log_min_duration_sample to be logged.	superuser	real	0	1	1
 log_statement_stats	off	off		Statistics / Monitoring	Writes cumulative performance statistics to the server log.	superuser	bool			off
 log_temp_files	-1	-1	kB	Reporting and Logging / What to Log	Log the use of temporary files larger than this number of kilobytes.	superuser	integer	-1	2147483647	-1
@@ -216,8 +216,8 @@ output_plugin_libraries	pgoutput, test_decoding	pgoutput, test_decoding		Replica
 parallel_leader_participation	on	on		Resource Usage / Asynchronous Behavior	Controls whether Gather and Gather Merge also run subplans.	user	bool			on
 parallel_setup_cost	1000	1000		Query Tuning / Planner Cost Constants	Sets the planner's estimate of the cost of starting up worker processes for parallel query.	user	real	0	1.79769e+308	1000
 parallel_tuple_cost	0.1	0.1		Query Tuning / Planner Cost Constants	Sets the planner's estimate of the cost of passing each tuple (row) from worker to leader backend.	user	real	0	1.79769e+308	0.1
-password_encryption	scram-sha-256	scram-sha-256		Connections and Authentication / Authentication	Chooses the algorithm for encrypting passwords.	user	enum			scram-sha-256
-plan_cache_mode	auto	auto		Query Tuning / Other Planner Options	Controls the planner's selection of custom or generic plan.	user	enum			auto
+password_encryption	scram-sha-256	scram-sha-256		Connections and Authentication / Authentication	Chooses the algorithm for encrypting passwords.	user	enum			scram-sha-256	md5,scram-sha-256
+plan_cache_mode	auto	auto		Query Tuning / Other Planner Options	Controls the planner's selection of custom or generic plan.	user	enum			auto	auto,force_generic_plan,force_custom_plan
 post_auth_delay	0	0	s	Developer Options	Sets the amount of time to wait after authentication on connection startup.	backend	integer	0	2147	0
 pre_auth_delay	0	0	s	Developer Options	Sets the amount of time to wait before authentication on connection startup.	sighup	integer	0	60	0
 primary_conninfo				Replication / Standby Servers	Sets the connection string to be used to connect to the sending server.	sighup	string			
@@ -226,11 +226,11 @@ promote_trigger_file				Replication / Standby Servers	Specifies a file name whos
 quote_all_identifiers	off	off		Version and Platform Compatibility / Previous PostgreSQL Versions	When generating SQL fragments, quote all identifiers.	user	bool			off
 random_page_cost	4	4		Query Tuning / Planner Cost Constants	Sets the planner's estimate of the cost of a nonsequentially fetched disk page.	user	real	0	1.79769e+308	4
 recovery_end_command				Write-Ahead Log / Archive Recovery	Sets the shell command that will be executed once at the end of recovery.	sighup	string			
-recovery_init_sync_method	fsync	fsync		Error Handling	Sets the method for synchronizing the data directory before crash recovery.	sighup	enum			fsync
+recovery_init_sync_method	fsync	fsync		Error Handling	Sets the method for synchronizing the data directory before crash recovery.	sighup	enum			fsync	fsync
 recovery_min_apply_delay	0	0	ms	Replication / Standby Servers	Sets the minimum delay for applying changes during recovery.	sighup	integer	0	2147483647	0
-recovery_prefetch	try	try		Write-Ahead Log / Recovery	Prefetch referenced blocks during recovery.	sighup	enum			try
+recovery_prefetch	try	try		Write-Ahead Log / Recovery	Prefetch referenced blocks during recovery.	sighup	enum			try	off,on,try
 recovery_target				Write-Ahead Log / Recovery Target	Set to "immediate" to end recovery as soon as a consistent state is reached.	postmaster	string			
-recovery_target_action	pause	pause		Write-Ahead Log / Recovery Target	Sets the action to perform upon reaching the recovery target.	postmaster	enum			pause
+recovery_target_action	pause	pause		Write-Ahead Log / Recovery Target	Sets the action to perform upon reaching the recovery target.	postmaster	enum			pause	pause,promote,shutdown
 recovery_target_inclusive	on	on		Write-Ahead Log / Recovery Target	Sets whether to include or exclude transaction with recovery target.	postmaster	bool			on
 recovery_target_lsn				Write-Ahead Log / Recovery Target	Sets the LSN of the write-ahead log location up to which recovery will proceed.	postmaster	string			
 recovery_target_name				Write-Ahead Log / Recovery Target	Sets the named restore point up to which recovery will proceed.	postmaster	string			
@@ -250,11 +250,11 @@ server_encoding	UTF8	UTF8		Preset Options	Shows the server (database) character 
 server_version	15.19 (Homebrew)	15.19 (Homebrew)		Preset Options	Shows the server version.	internal	string			15.19 (Homebrew)
 server_version_num	150019	150019		Preset Options	Shows the server version as an integer.	internal	integer	150019	150019	150019
 session_preload_libraries				Client Connection Defaults / Shared Library Preloading	Lists shared libraries to preload into each backend.	superuser	string			
-session_replication_role	origin	origin		Client Connection Defaults / Statement Behavior	Sets the session's behavior for triggers and rewrite rules.	superuser	enum			origin
+session_replication_role	origin	origin		Client Connection Defaults / Statement Behavior	Sets the session's behavior for triggers and rewrite rules.	superuser	enum			origin	origin,replica,local
 shared_buffers	128MB	16384	8kB	Resource Usage / Memory	Sets the number of shared memory buffers used by the server.	postmaster	integer	16	1073741823	16384
 shared_memory_size	144MB	144	MB	Preset Options	Shows the size of the server's main shared memory area (rounded up to the nearest MB).	internal	integer	0	2147483647	0
 shared_memory_size_in_huge_pages	-1	-1		Preset Options	Shows the number of huge pages needed for the main shared memory area.	internal	integer	-1	2147483647	-1
-shared_memory_type	mmap	mmap		Resource Usage / Memory	Selects the shared memory implementation used for the main shared memory region.	postmaster	enum			mmap
+shared_memory_type	mmap	mmap		Resource Usage / Memory	Selects the shared memory implementation used for the main shared memory region.	postmaster	enum			mmap	sysv,mmap
 shared_preload_libraries				Client Connection Defaults / Shared Library Preloading	Lists shared libraries to preload into server.	postmaster	string			
 ssl	off	off		Connections and Authentication / SSL	Enables SSL connections.	sighup	bool			off
 ssl_ca_file				Connections and Authentication / SSL	Location of the SSL certificate authority file.	sighup	string			
@@ -266,19 +266,19 @@ ssl_dh_params_file				Connections and Authentication / SSL	Location of the SSL D
 ssl_ecdh_curve	prime256v1	prime256v1		Connections and Authentication / SSL	Sets the curve to use for ECDH.	sighup	string			prime256v1
 ssl_key_file	server.key	server.key		Connections and Authentication / SSL	Location of the SSL server private key file.	sighup	string			server.key
 ssl_library	OpenSSL	OpenSSL		Preset Options	Shows the name of the SSL library.	internal	string			OpenSSL
-ssl_max_protocol_version				Connections and Authentication / SSL	Sets the maximum SSL/TLS protocol version to use.	sighup	enum			
-ssl_min_protocol_version	TLSv1.2	TLSv1.2		Connections and Authentication / SSL	Sets the minimum SSL/TLS protocol version to use.	sighup	enum			TLSv1.2
+ssl_max_protocol_version				Connections and Authentication / SSL	Sets the maximum SSL/TLS protocol version to use.	sighup	enum				,TLSv1,TLSv1.1,TLSv1.2,TLSv1.3
+ssl_min_protocol_version	TLSv1.2	TLSv1.2		Connections and Authentication / SSL	Sets the minimum SSL/TLS protocol version to use.	sighup	enum			TLSv1.2	TLSv1,TLSv1.1,TLSv1.2,TLSv1.3
 ssl_passphrase_command				Connections and Authentication / SSL	Command to obtain passphrases for SSL.	sighup	string			
 ssl_passphrase_command_supports_reload	off	off		Connections and Authentication / SSL	Controls whether ssl_passphrase_command is called during server reload.	sighup	bool			off
 ssl_prefer_server_ciphers	on	on		Connections and Authentication / SSL	Give priority to server ciphersuite order.	sighup	bool			on
 standard_conforming_strings	on	on		Version and Platform Compatibility / Previous PostgreSQL Versions	Causes '...' strings to treat backslashes literally.	user	bool			on
 statement_timeout	0	0	ms	Client Connection Defaults / Statement Behavior	Sets the maximum allowed duration of any statement.	user	integer	0	2147483647	0
-stats_fetch_consistency	cache	cache		Statistics / Cumulative Query and Index Statistics	Sets the consistency of accesses to statistics data.	user	enum			cache
+stats_fetch_consistency	cache	cache		Statistics / Cumulative Query and Index Statistics	Sets the consistency of accesses to statistics data.	user	enum			cache	none,cache,snapshot
 superuser_reserved_connections	3	3		Connections and Authentication / Connection Settings	Sets the number of connection slots reserved for superusers.	postmaster	integer	0	262143	3
 synchronize_seqscans	on	on		Version and Platform Compatibility / Previous PostgreSQL Versions	Enable synchronized sequential scans.	user	bool			on
-synchronous_commit	on	on		Write-Ahead Log / Settings	Sets the current transaction's synchronization level.	user	enum			on
+synchronous_commit	on	on		Write-Ahead Log / Settings	Sets the current transaction's synchronization level.	user	enum			on	local,remote_write,remote_apply,on,off
 synchronous_standby_names				Replication / Primary Server	Number of synchronous standbys and list of names of potential synchronous ones.	sighup	string			
-syslog_facility	local0	local0		Reporting and Logging / Where to Log	Sets the syslog "facility" to be used when syslog enabled.	sighup	enum			local0
+syslog_facility	local0	local0		Reporting and Logging / Where to Log	Sets the syslog "facility" to be used when syslog enabled.	sighup	enum			local0	local0,local1,local2,local3,local4,local5,local6,local7
 syslog_ident	postgres	postgres		Reporting and Logging / Where to Log	Sets the program name used to identify PostgreSQL messages in syslog.	sighup	string			postgres
 syslog_sequence_numbers	on	on		Reporting and Logging / Where to Log	Add sequence number to syslog messages to avoid duplicate suppression.	sighup	bool			on
 syslog_split_messages	on	on		Reporting and Logging / Where to Log	Split messages sent to syslog by lines and to fit into 1024 bytes.	sighup	bool			on
@@ -291,17 +291,17 @@ temp_file_limit	-1	-1	kB	Resource Usage / Disk	Limits the total size of all temp
 temp_tablespaces				Client Connection Defaults / Statement Behavior	Sets the tablespace(s) to use for temporary tables and sort files.	user	string			
 timezone_abbreviations	Default	Default		Client Connection Defaults / Locale and Formatting	Selects a file of time zone abbreviations.	user	string			
 trace_notify	off	off		Developer Options	Generates debugging output for LISTEN and NOTIFY.	user	bool			off
-trace_recovery_messages	log	log		Developer Options	Enables logging of recovery-related debugging information.	sighup	enum			log
+trace_recovery_messages	log	log		Developer Options	Enables logging of recovery-related debugging information.	sighup	enum			log	debug5,debug4,debug3,debug2,debug1,log,notice,warning,error
 trace_sort	off	off		Developer Options	Emit information about resource usage in sorting.	user	bool			off
 track_activities	on	on		Statistics / Cumulative Query and Index Statistics	Collects information about executing commands.	superuser	bool			on
 track_activity_query_size	1kB	1024	B	Statistics / Cumulative Query and Index Statistics	Sets the size reserved for pg_stat_activity.query, in bytes.	postmaster	integer	100	1048576	1024
 track_commit_timestamp	off	off		Replication / Sending Servers	Collects transaction commit time.	postmaster	bool			off
 track_counts	on	on		Statistics / Cumulative Query and Index Statistics	Collects statistics on database activity.	superuser	bool			on
-track_functions	none	none		Statistics / Cumulative Query and Index Statistics	Collects function-level statistics on database activity.	superuser	enum			none
+track_functions	none	none		Statistics / Cumulative Query and Index Statistics	Collects function-level statistics on database activity.	superuser	enum			none	none,pl,all
 track_io_timing	off	off		Statistics / Cumulative Query and Index Statistics	Collects timing statistics for database I/O activity.	superuser	bool			off
 track_wal_io_timing	off	off		Statistics / Cumulative Query and Index Statistics	Collects timing statistics for WAL I/O activity.	superuser	bool			off
 transaction_deferrable	off	off		Client Connection Defaults / Statement Behavior	Whether to defer a read-only serializable transaction until it can be executed with no possible serialization failures.	user	bool			off
-transaction_isolation	read committed	read committed		Client Connection Defaults / Statement Behavior	Sets the current transaction's isolation level.	user	enum			read committed
+transaction_isolation	read committed	read committed		Client Connection Defaults / Statement Behavior	Sets the current transaction's isolation level.	user	enum			read committed	serializable,repeatable read,read committed,read uncommitted
 transaction_read_only	off	off		Client Connection Defaults / Statement Behavior	Sets the current transaction's read-only status.	user	bool			off
 transform_null_equals	off	off		Version and Platform Compatibility / Other Platforms and Clients	Treats "expr=NULL" as "expr IS NULL".	user	bool			off
 unix_socket_group				Connections and Authentication / Connection Settings	Sets the owning group of the Unix-domain socket.	postmaster	string			
@@ -321,12 +321,12 @@ vacuum_multixact_freeze_min_age	5000000	5000000		Client Connection Defaults / St
 vacuum_multixact_freeze_table_age	150000000	150000000		Client Connection Defaults / Statement Behavior	Multixact age at which VACUUM should scan whole table to freeze tuples.	user	integer	0	2000000000	150000000
 wal_block_size	8192	8192		Preset Options	Shows the block size in the write ahead log.	internal	integer	8192	8192	8192
 wal_buffers	4MB	512	8kB	Write-Ahead Log / Settings	Sets the number of disk-page buffers in shared memory for WAL.	postmaster	integer	-1	262143	-1
-wal_compression	off	off		Write-Ahead Log / Settings	Compresses full-page writes written in WAL file with specified method.	superuser	enum			off
+wal_compression	off	off		Write-Ahead Log / Settings	Compresses full-page writes written in WAL file with specified method.	superuser	enum			off	pglz,lz4,zstd,on,off
 wal_consistency_checking				Developer Options	Sets the WAL resource managers for which WAL consistency checks are done.	superuser	string			
 wal_decode_buffer_size	512kB	524288	B	Write-Ahead Log / Recovery	Buffer size for reading ahead in the WAL during recovery.	postmaster	integer	65536	1073741823	524288
 wal_init_zero	on	on		Write-Ahead Log / Settings	Writes zeroes to new WAL files before first use.	superuser	bool			on
 wal_keep_size	0	0	MB	Replication / Sending Servers	Sets the size of WAL files held for standby servers.	sighup	integer	0	2147483647	0
-wal_level	replica	replica		Write-Ahead Log / Settings	Sets the level of information written to the WAL.	postmaster	enum			replica
+wal_level	replica	replica		Write-Ahead Log / Settings	Sets the level of information written to the WAL.	postmaster	enum			replica	minimal,replica,logical
 wal_log_hints	off	off		Write-Ahead Log / Settings	Writes full pages to WAL when first modified after a checkpoint, even for a non-critical modification.	postmaster	bool			off
 wal_receiver_create_temp_slot	off	off		Replication / Standby Servers	Sets whether a WAL receiver should create a temporary replication slot if no permanent slot is configured.	sighup	bool			off
 wal_receiver_status_interval	10s	10	s	Replication / Standby Servers	Sets the maximum interval between WAL receiver status reports to the sending server.	sighup	integer	0	2147483	10
@@ -336,10 +336,10 @@ wal_retrieve_retry_interval	5s	5000	ms	Replication / Standby Servers	Sets the ti
 wal_segment_size	16MB	16777216	B	Preset Options	Shows the size of write ahead log segments.	internal	integer	1048576	1073741824	16777216
 wal_sender_timeout	1min	60000	ms	Replication / Sending Servers	Sets the maximum time to wait for WAL replication.	user	integer	0	2147483647	60000
 wal_skip_threshold	2MB	2048	kB	Write-Ahead Log / Settings	Minimum size of new file to fsync instead of writing WAL.	user	integer	0	2147483647	2048
-wal_sync_method	open_datasync	open_datasync		Write-Ahead Log / Settings	Selects the method used for forcing WAL updates to disk.	sighup	enum			open_datasync
+wal_sync_method	open_datasync	open_datasync		Write-Ahead Log / Settings	Selects the method used for forcing WAL updates to disk.	sighup	enum			open_datasync	fsync,fsync_writethrough,fdatasync,open_sync,open_datasync
 wal_writer_delay	200ms	200	ms	Write-Ahead Log / Settings	Time between WAL flushes performed in the WAL writer.	sighup	integer	1	10000	200
 wal_writer_flush_after	1MB	128	8kB	Write-Ahead Log / Settings	Amount of WAL written out by WAL writer that triggers a flush.	sighup	integer	0	2147483647	128
 work_mem	4MB	4096	kB	Resource Usage / Memory	Sets the maximum memory to be used for query workspaces.	user	integer	64	2147483647	4096
-xmlbinary	base64	base64		Client Connection Defaults / Statement Behavior	Sets how binary values are to be encoded in XML.	user	enum			base64
-xmloption	content	content		Client Connection Defaults / Statement Behavior	Sets whether XML data in implicit parsing and serialization operations is to be considered as documents or content fragments.	user	enum			content
+xmlbinary	base64	base64		Client Connection Defaults / Statement Behavior	Sets how binary values are to be encoded in XML.	user	enum			base64	base64,hex
+xmloption	content	content		Client Connection Defaults / Statement Behavior	Sets whether XML data in implicit parsing and serialization operations is to be considered as documents or content fragments.	user	enum			content	content,document
 zero_damaged_pages	off	off		Developer Options	Continues processing past damaged page headers.	superuser	bool			off

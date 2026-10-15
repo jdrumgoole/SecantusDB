@@ -79,6 +79,11 @@ impl PgHandler {
                     .into(),
             ));
         }
+        // A value names a parameter PostgreSQL must know (42704 otherwise);
+        // RESET of an unknown name is accepted (measured on 15.19).
+        if let (Some(n), Some(_)) = (name.as_deref(), value.as_ref()) {
+            self.check_setting_known(n)?;
+        }
         let key = name.as_deref().map(canonical_setting);
         if let Some(msg) = key.as_deref().and_then(super::setting_change_refusal) {
             return Err(Self::user_error("55P02", msg));
@@ -167,6 +172,14 @@ impl PgHandler {
                         d.insert(field("vartype"), p.vartype);
                         d.insert(field("min_val"), opt(p.min_val));
                         d.insert(field("max_val"), opt(p.max_val));
+                        if p.vartype == "enum" {
+                            let vals: Vec<Bson> = p
+                                .enumvals
+                                .split(',')
+                                .map(|v| Bson::String(v.into()))
+                                .collect();
+                            d.insert(field("enumvals"), vals);
+                        }
                     }
                     None => {
                         d.insert(field("context"), if internal { "internal" } else { "user" });

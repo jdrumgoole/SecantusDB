@@ -730,6 +730,8 @@ const FUNCTIONS: &[&str] = &[
     "xml_is_well_formed",
     "xml_is_well_formed_document",
     "xml_is_well_formed_content",
+    "query_to_xml",
+    "table_to_xml",
 ];
 
 pub fn is_function(name: &str) -> bool {
@@ -738,7 +740,7 @@ pub fn is_function(name: &str) -> bool {
 
 pub fn result_type(name: &str) -> Option<&'static str> {
     Some(match name {
-        "xmlcomment" => "xml",
+        "xmlcomment" | "query_to_xml" | "table_to_xml" => "xml",
         "xpath" => "xml[]",
         "xpath_exists" | "xmlexists" => "bool",
         "xml_is_well_formed" | "xml_is_well_formed_document" | "xml_is_well_formed_content" => {
@@ -756,6 +758,9 @@ pub fn call(name: &str, args: &[bson::Bson]) -> Option<Result<bson::Bson>> {
     }
     if matches!(name, "xpath" | "xpath_exists" | "xmlexists") {
         return Some(xpath_call(name, args));
+    }
+    if matches!(name, "query_to_xml" | "table_to_xml") {
+        return Some(crate::xml_export::call(name, args));
     }
     if args.len() != 1 {
         return Some(Err(Error::UndefinedFunction(format!(

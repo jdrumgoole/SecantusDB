@@ -155,8 +155,8 @@ impl PgHandler {
         Ok(vec![Response::Execution(Tag::new("DROP COLLATION"))])
     }
 
-    /// `pg_collation`'s rows for the user collations and the ICU built-ins
-    /// clients look up by name.
+    /// `pg_collation`'s rows for the user collations and PostgreSQL 15's ICU
+    /// built-ins (`collation::icu_collations`).
     pub(crate) fn user_collation_rows(&self, def: &TableDef) -> Vec<Document> {
         let f = |name: &str| def.field_of(name).expect("column");
         let row =
@@ -183,10 +183,9 @@ impl PgHandler {
                 }
                 d
             };
-        let mut rows = vec![
-            row(12713, "und-x-icu", 'i', true, "und", 11),
-            row(12860, "en-x-icu", 'i', true, "en", 11),
-        ];
+        let mut rows: Vec<Document> = secantus_pgplan::collation::icu_collations()
+            .map(|(oid, name, locale)| row(oid, name, 'i', true, locale, 11))
+            .collect();
         for c in self.user_collations() {
             rows.push(row(
                 c.oid,

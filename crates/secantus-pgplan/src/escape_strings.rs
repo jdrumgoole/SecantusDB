@@ -16,6 +16,17 @@
 //! The scanner's `escape_string_warning` notices ride along: one `22P06`
 //! WARNING per literal, for the FIRST escape in it, worded by that escape
 //! (measured on PostgreSQL 16).
+//!
+//! `N'...'` is the same plain literal behind an `NCHAR` keyword (scan.l's
+//! `xnstart` eats only the `n`), so it gets the old rules too: it becomes
+//! `nchar E'...'`, the tokens the scanner hands the grammar for it.
+//!
+//! `backslash_quote` is checked by the same walk, whatever the conforming
+//! setting: scan.l's `xeescape` refuses a `\'` in a literal read with
+//! backslash escapes when it is `off` (or `safe_encoding` under a
+//! client-only encoding), as 22P06 at the literal's token (measured on
+//! PostgreSQL 15.19: `select E'a\'b'` points at the `E`, `select N'a\'b'`
+//! at the quote, since the `n` was a token of its own).
 
 use crate::{Error, Result};
 
@@ -46,16 +57,107 @@ enum Body {
 /// raises them as it goes: the ones before an unterminated literal are sent
 /// before its error.
 pub fn rewrite(sql: &str, warn_escapes: bool) -> (Result<String>, Vec<EscapeWarning>) {
-    let mut warnings = Vec::new();
-    let out = rewrite_into(sql, warn_escapes, &mut warnings);
+    let (out, warnings, _) = rewrite_with(
+        sql,
+        Syntax {
+            conforming: false,
+            warn_escapes,
+            refuse_backslash_quote: false,
+        },
+    );
     (out, warnings)
+}
+
+/// The session settings the scanner reads a literal by.
+#[derive(Debug, Clone, Copy)]
+pub struct Syntax {
+    /// `standard_conforming_strings`: when on, the text is not rewritten.
+    pub conforming: bool,
+    /// `escape_string_warning`.
+    pub warn_escapes: bool,
+    /// `backslash_quote` refuses `\'`: it is `off`, or `safe_encoding`
+    /// under a client-only encoding.
+    pub refuse_backslash_quote: bool,
+}
+
+/// The message and hint of the `backslash_quote` refusal (22P06).
+pub const UNSAFE_BACKSLASH_QUOTE: &str = "unsafe use of \\' in a string literal\nHint: Use '' to write quotes in strings. \\' is insecure in client-only encodings.";
+
+/// `rewrite` under `syntax`, plus the 1-based character position of the
+/// error when there is one the scanner positions (the `backslash_quote`
+/// refusal).
+pub fn rewrite_with(
+    sql: &str,
+    syntax: Syntax,
+) -> (Result<String>, Vec<EscapeWarning>, Option<usize>) {
+    let (out, warnings, position, _) = rewrite_mapped(sql, syntax);
+    (out, warnings, position)
+}
+
+/// What the rewrite inserted, so a position the parser or executor reports
+/// in the rewritten text can be put back where the client wrote it: each
+/// `(byte offset in the rewritten text, bytes inserted there)`, in order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PositionMap {
+    inserts: Vec<(usize, usize)>,
+}
+
+impl PositionMap {
+    /// Whether the rewrite moved anything.
+    pub fn is_identity(&self) -> bool {
+        self.inserts.is_empty()
+    }
+
+    /// The 1-based character position in `original` of the 1-based
+    /// character position `pos` of `rewritten`. A position inside inserted
+    /// text is the original character it was inserted before.
+    pub fn original(&self, rewritten: &str, original: &str, pos: usize) -> usize {
+        let byte = rewritten
+            .char_indices()
+            .nth(pos.saturating_sub(1))
+            .map_or(rewritten.len(), |(b, _)| b);
+        let mut shift = 0usize;
+        for &(at, len) in &self.inserts {
+            if at >= byte {
+                break;
+            }
+            shift += len.min(byte - at);
+        }
+        let orig = (byte - shift).min(original.len());
+        let orig = (0..=orig)
+            .rev()
+            .find(|b| original.is_char_boundary(*b))
+            .unwrap_or(0);
+        original[..orig].chars().count() + 1
+    }
+}
+
+/// `rewrite_with`, plus the map from the rewritten text's positions back to
+/// `sql`'s.
+pub fn rewrite_mapped(
+    sql: &str,
+    syntax: Syntax,
+) -> (
+    Result<String>,
+    Vec<EscapeWarning>,
+    Option<usize>,
+    PositionMap,
+) {
+    let mut warnings = Vec::new();
+    let mut position = None;
+    let mut map = PositionMap::default();
+    let out = rewrite_into(sql, syntax, &mut warnings, &mut position, &mut map.inserts);
+    (out, warnings, position, map)
 }
 
 fn rewrite_into(
     sql: &str,
-    warn_escapes: bool,
+    syntax: Syntax,
     warnings: &mut Vec<EscapeWarning>,
+    error_position: &mut Option<usize>,
+    inserts: &mut Vec<(usize, usize)>,
 ) -> Result<String> {
+    let warn_escapes = syntax.warn_escapes && !syntax.conforming;
     let b = sql.as_bytes();
     let mut out = String::with_capacity(sql.len() + 8);
     let mut i = 0;
@@ -93,7 +195,7 @@ fn rewrite_into(
             }
         }
         if c == b'\'' {
-            let (body, keep) = literal_kind(b, i);
+            let (body, keep) = literal_kind(b, i, syntax.conforming);
             if body.is_none() {
                 // `U&'...'`: PostgreSQL refuses it outright when the setting
                 // is off, rather than guess what the backslashes mean.
@@ -102,18 +204,40 @@ fn rewrite_into(
                 ));
             }
             let body = body.unwrap_or(Body::Standard);
-            let position = sql[..i].chars().count() + 1;
+            // `N'`: the `n` (already copied) is a token of its own, so the
+            // literal and its position start at the quote.
+            let national = !keep && is_national(b, i);
+            let start = if keep { prefix_start(b, i) } else { i };
+            let position = sql[..start].chars().count() + 1;
             let mut warned = false;
-            if !keep {
-                // A plain literal: the parser must read it as `E'...'`.
-                out.push('E');
-                if warn_escapes {
-                    if let Some(w) = first_escape_warning(b, i + 1, position) {
-                        warnings.push(w);
-                        warned = true;
-                    }
-                }
+            if national {
+                // `N` + `'...'` is the NCHAR keyword then a plain literal;
+                // the `n` stands where the `N` was.
+                out.pop();
+                out.push('n');
+                inserts.push((out.len(), 5));
+                out.push_str("char ");
             }
+            if !keep {
+                // A plain literal: the parser must read it as `E'...'`. After
+                // a word (`int4'1'`, a typed literal) the `E` is a token of
+                // its own, or it would join the type name (`int4E`).
+                let at = out.len();
+                if !national && prev_is_ident(b, i) {
+                    out.push(' ');
+                }
+                out.push('E');
+                inserts.push((at, out.len() - at));
+            }
+            let mut segment = Segment {
+                warn: !keep && warn_escapes,
+                refuse: syntax.refuse_backslash_quote && body == Body::Escaped,
+                position,
+                warned: &mut warned,
+                warnings: &mut *warnings,
+                error_position: &mut *error_position,
+            };
+            segment.scan(b, i + 1)?;
             // An unterminated PLAIN literal is reported here, naming the text
             // the client wrote: the parser would name the rewritten `E'...'`.
             let unterminated = || {
@@ -124,22 +248,17 @@ fn rewrite_into(
             let mut end = match skip_literal(b, i + 1, body) {
                 Some(end) => end,
                 None if keep => b.len(),
-                None => return Err(unterminated()),
+                None => return Err(segment.fail(unterminated())),
             };
             // `'a'` <newline> `'b'` continues the same literal in the same
             // state, so the continuation of a plain literal needs the escaped
             // body rule too (and, being one literal, no second `E`).
             while let Some(next) = continuation_after(b, end) {
-                if !keep && warn_escapes && !warned {
-                    if let Some(w) = first_escape_warning(b, next + 1, position) {
-                        warnings.push(w);
-                        warned = true;
-                    }
-                }
+                segment.scan(b, next + 1)?;
                 end = match skip_literal(b, next + 1, body) {
                     Some(end) => end,
                     None if keep => b.len(),
-                    None => return Err(unterminated()),
+                    None => return Err(segment.fail(unterminated())),
                 };
             }
             out.push_str(&sql[i..end]);
@@ -152,6 +271,48 @@ fn rewrite_into(
         i += len;
     }
     Ok(out)
+}
+
+/// What the scanner raises over one literal (or one continuation of it):
+/// the `escape_string_warning` for the literal's first escape, and the
+/// `backslash_quote` refusal. `xeescape` refuses a `\\'` BEFORE it warns,
+/// so a literal whose first escape is the refused one only errors.
+struct Segment<'a> {
+    warn: bool,
+    refuse: bool,
+    position: usize,
+    warned: &'a mut bool,
+    warnings: &'a mut Vec<EscapeWarning>,
+    error_position: &'a mut Option<usize>,
+}
+
+impl Segment<'_> {
+    fn scan(&mut self, b: &[u8], from: usize) -> Result<()> {
+        let refused = self.refuse && has_backslash_quote(b, from);
+        if self.warn && !*self.warned {
+            if let Some(w) = first_escape_warning(b, from, self.position) {
+                if refused && w.message.contains("\\'") {
+                    return Err(self.refusal());
+                }
+                self.warnings.push(w);
+                *self.warned = true;
+            }
+        }
+        if refused {
+            return Err(self.refusal());
+        }
+        Ok(())
+    }
+
+    fn refusal(&mut self) -> Error {
+        self.fail(Error::Sqlstate(SQLSTATE, UNSAFE_BACKSLASH_QUOTE.into()))
+    }
+
+    /// `e`, raised at the literal's position.
+    fn fail(&mut self, e: Error) -> Error {
+        *self.error_position = Some(self.position);
+        e
+    }
 }
 
 fn utf8_len(first: u8) -> usize {
@@ -245,7 +406,9 @@ fn dollar_tag_end(b: &[u8], i: usize) -> Option<usize> {
 /// The rule for the literal whose opening quote is at `i`, and whether it
 /// already carries a prefix the parser reads itself (`keep`). `None` for a
 /// `U&'` literal, which the old syntax cannot carry.
-fn literal_kind(b: &[u8], i: usize) -> (Option<Body>, bool) {
+/// When `conforming`, nothing is rewritten: a plain literal is kept with
+/// the standard body and `U&'` is the parser's own.
+fn literal_kind(b: &[u8], i: usize, conforming: bool) -> (Option<Body>, bool) {
     // `E'`, `B'`, `X'` when the letter is a token of its own.
     if i >= 1 && !prev_is_ident(b, i - 1) {
         match b[i - 1] {
@@ -254,10 +417,59 @@ fn literal_kind(b: &[u8], i: usize) -> (Option<Body>, bool) {
             _ => {}
         }
     }
+    if conforming {
+        return (Some(Body::Standard), true);
+    }
     if i >= 2 && b[i - 1] == b'&' && matches!(b[i - 2], b'u' | b'U') && !prev_is_ident(b, i - 2) {
         return (None, true);
     }
     (Some(Body::Escaped), false)
+}
+
+/// Is the quote at `i` the start of `N'...'` (an `n` that is a token of
+/// its own)?
+fn is_national(b: &[u8], i: usize) -> bool {
+    i >= 1 && matches!(b[i - 1], b'n' | b'N') && !prev_is_ident(b, i - 1)
+}
+
+/// Where a kept literal's token starts: at its one-letter prefix, or at
+/// the `U&`.
+fn prefix_start(b: &[u8], i: usize) -> usize {
+    if i >= 2 && b[i - 1] == b'&' && matches!(b[i - 2], b'u' | b'U') && !prev_is_ident(b, i - 2) {
+        i - 2
+    } else if i >= 1
+        && matches!(b[i - 1], b'e' | b'E' | b'b' | b'B' | b'x' | b'X')
+        && !prev_is_ident(b, i - 1)
+    {
+        i - 1
+    } else {
+        i
+    }
+}
+
+/// Does the escaped literal body starting at `from` hold a `\'` before it
+/// ends? (`xeescape` matches a backslash and the character after it.)
+fn has_backslash_quote(b: &[u8], from: usize) -> bool {
+    let mut i = from;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => {
+                if b.get(i + 1) == Some(&b'\'') {
+                    return true;
+                }
+                i += 2;
+            }
+            b'\'' => {
+                if b.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                } else {
+                    return false;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 /// Past the closing quote of a literal body starting at `from`; `None` when
@@ -411,5 +623,88 @@ mod tests {
         // Positions count characters, not bytes.
         let (_, w) = rewrite("select '\u{20ac}', 'a\\nb'", true);
         assert_eq!(w[0].position, 13);
+    }
+
+    fn syntax(conforming: bool, refuse: bool) -> Syntax {
+        Syntax {
+            conforming,
+            warn_escapes: true,
+            refuse_backslash_quote: refuse,
+        }
+    }
+
+    #[test]
+    fn national_literals_get_the_old_rules_behind_nchar() {
+        assert_eq!(
+            rw(r"select N'a\\b', n'x'"),
+            (
+                r"select nchar E'a\\b', nchar E'x'".into(),
+                vec![r"nonstandard use of \\ in a string literal@9".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn backslash_quote_refuses_where_backslashes_escape() {
+        let refused = |sql: &str, conforming: bool| {
+            let (out, w, pos) = rewrite_with(sql, syntax(conforming, true));
+            (
+                matches!(out, Err(Error::Sqlstate("22P06", m)) if m.starts_with("unsafe use of")),
+                w.len(),
+                pos,
+            )
+        };
+        // Its first escape is the refused one: no warning, only the error.
+        assert_eq!(refused(r"select 'a\'b'", false), (true, 0, Some(8)));
+        // An earlier escape warns first.
+        assert_eq!(refused(r"select 'a\\b\'c'", false), (true, 1, Some(8)));
+        assert_eq!(refused(r"select 1, E'a\'b'", false), (true, 0, Some(11)));
+        assert_eq!(refused(r"select N'a\'b'", false), (true, 0, Some(9)));
+        assert_eq!(refused(r"select E'a\'b'", true), (true, 0, Some(8)));
+        // Conforming, a plain literal has no escapes; nor has a dollar body.
+        assert_eq!(refused(r"select 'a\', $$\'$$", true), (false, 0, None));
+        assert_eq!(refused(r"select 'a\\''b'", false), (false, 1, None));
+        assert_eq!(
+            rewrite_with(r"select 'a\'b'", syntax(false, false)).0,
+            Ok(r"select E'a\'b'".into())
+        );
+    }
+
+    #[test]
+    fn a_typed_literal_keeps_its_type_name() {
+        assert_eq!(
+            rw(r"select int4'1', date'2020-01-02', x'1f', n'a', (1)||'b'"),
+            (
+                r"select int4 E'1', date E'2020-01-02', x'1f', nchar E'a', (1)||E'b'".into(),
+                vec![]
+            )
+        );
+    }
+
+    #[test]
+    fn positions_map_back_to_the_text_as_written() {
+        let sql = r"select N'q', int4'x', 1/0, 'a\b'::int";
+        let (out, _, _, map) = rewrite_mapped(
+            sql,
+            Syntax {
+                conforming: false,
+                warn_escapes: false,
+                refuse_backslash_quote: false,
+            },
+        );
+        let out = out.unwrap();
+        assert_eq!(out, r"select nchar E'q', int4 E'x', 1/0, E'a\b'::int");
+        let at = |needle: &str| out.find(needle).unwrap() + 1;
+        let orig = |needle: &str| sql.find(needle).unwrap() + 1;
+        // A token's start in the rewritten text is the same token's start in
+        // the original: the `n` of `nchar` is the `N`, an `E` the quote.
+        assert_eq!(map.original(&out, sql, at("nchar")), orig("N'q'"));
+        assert_eq!(map.original(&out, sql, at("E'q'")), orig("'q'"));
+        assert_eq!(map.original(&out, sql, at("int4 E")), orig("int4'"));
+        assert_eq!(map.original(&out, sql, at("E'x'")), orig("'x'"));
+        assert_eq!(map.original(&out, sql, at("1/0")), orig("1/0"));
+        assert_eq!(map.original(&out, sql, at("E'a")), orig("'a"));
+        assert_eq!(map.original(&out, sql, at("::int")), orig("::int"));
+        assert!(!map.is_identity());
     }
 }
