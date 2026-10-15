@@ -364,3 +364,20 @@ def test_table_named_after_a_builtin_type(pg: Any, sql: str, expected: Any) -> N
         assert pg_answer(pg, sql) == expected
     finally:
         pg.execute("drop table if exists tid")
+
+
+# RP-025: what the 2026-10-15 typed-value work left, each compared with the
+# live PostgreSQL 15 reference.
+_RP025 = {
+    "array-of-row": "select array[row(1)]",
+    "regprocedure-input": "select 'now()'::regprocedure::text",
+    "bytea-concat-untyped": "select '\\x01'::bytea || 'x'",
+    "function-style-refused-cast": "select int8(true)",
+    "point-order-by": "select p from (values (point '(1,1)'), (point '(0,0)')) v(p) order by p",
+}
+
+
+@pytest.mark.backlog("RP-025")
+@pytest.mark.parametrize("sql", list(_RP025.values()), ids=list(_RP025))
+def test_typed_value_residue(pg: Any, pg15: Any, sql: str) -> None:
+    _same_as_reference(pg, pg15, sql)

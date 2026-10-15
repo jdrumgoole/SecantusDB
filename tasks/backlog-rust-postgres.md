@@ -367,6 +367,28 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **RUST pgserver: what the 2026-10-15 typed-value work left.** That
+  batch made values print by their type, refused the casts and operators
+  PostgreSQL 15's `pg_cast` / `pg_operator` have no entry for, and typed
+  untyped literals in set operations and NULLIF (corpus
+  `typed_value_render`, 634 checks). Still different:
+  - `'\x01'::bytea || 'x'` answers `\x01`, DROPPING the `x`; PostgreSQL
+    reads the untyped side as `bytea` (`\x0178`). The same for `bit` /
+    `varbit`.
+  - `array[row(1)]` comes back as the one string `{(1)}`, not an array.
+  - `'now()'::regprocedure` is 42883 and `regoper` does not exist.
+  - A refused function-style cast (`int8(true)`) is 42846; PostgreSQL
+    calls it a function and says 42883.
+  - ORDER BY over `point` (no ordering operator) and set operations over
+    it (no equality operator) succeed where PostgreSQL refuses.
+  - `information_schema.columns.data_type` says `tid[]` where PostgreSQL
+    says `ARRAY`; `=` over `int2vector` / `oidvector` / `path` is refused;
+    `time` compared with `timetz` / `interval` and `macaddr` with
+    `macaddr8` resolve differently; an input-cast error carries a position
+    PostgreSQL does not give.
+  Backlog-ID: RP-025
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_typed_value_residue
+
 - [ ] **RUST pgserver: a table named after a built-in type shadows it.**
   `create table tid (d date)` now succeeds, as on PostgreSQL 15.19 (it
   was 42710), but then a bare `tid` in a cast resolves to the table's row
