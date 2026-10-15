@@ -822,7 +822,7 @@ over a raw connection (`$geoWithin`, `$geoIntersects`, `$near`,
 holds and refuses). A read is compared by its whole reply, a double to nine
 digits; an index build or a write by its reply and by what the collection
 and its indexes hold afterwards. mongod answered the same on three runs
-against itself. The Rust server differs on 137 replies. Pinned by
+against itself. The Rust server differs on 113 replies (137 before 2026-10-15). Pinned by
 `crates/secantus-storage-adapter/tests/geo_queries_wt.rs`.
 
 mongod tests `$geometry` on the sphere (an edge is the great-circle arc
@@ -832,7 +832,7 @@ sphere, `$near`, what an index holds), `secantus-commands/src/near.rs`
 (where `$near` may stand, its index, nearest first),
 `aggregate::apply_geo_near`.
 
-Still different, all 137:
+Still different, all 113:
 
 - [ ] **The order under a geo index** (about 100). mongod returns a
       `$geoWithin` or `$geoIntersects` in the order of its index scan: S2
@@ -841,34 +841,32 @@ Still different, all 137:
       order too; here points first, then insertion order.
       Backlog-ID: RM-041
       Verify: tests/backlog/test_rm_029_056.py::test_geo_within_in_2dsphere_scan_order,tests/backlog/test_rm_029_056.py::test_geo_within_in_2d_scan_order,tests/backlog/test_rm_029_056.py::test_near_ties_in_scan_order
-- [ ] **`2d` index options** (11): `bits` outside 1 to 32 and `min` not
-      below `max` are refused by mongod (72) and built here; `bits`, `min`
-      and `max` are not listed as given.
-      Backlog-ID: RM-042
-      Verify: tests/backlog/test_rm_029_056.py::test_2d_index_options_refused,tests/backlog/test_rm_029_056.py::test_2d_index_options_listed
-- [ ] **A `2d` index with its own range** (7): a `$near` centre outside
-      the range is mongod's 16433, and the two ends of the range.
-      Backlog-ID: RM-043
-      Verify: tests/backlog/test_rm_029_056.py::test_near_centre_outside_2d_range
 - [ ] **A hinted geo index** (10): `find({}, hint: <2dsphere index>)`
       returns what the index holds in its order; a `$near` with a hint to
       another index is refused.
       Backlog-ID: RM-044
       Verify: tests/backlog/test_rm_029_056.py::test_hinted_2dsphere_index_order,tests/backlog/test_rm_029_056.py::test_near_hinted_to_another_index
-- [ ] `2dsphereIndexVersion: 2.5`, two indexes with one key in one
-      `createIndexes` (85), `$geoNear` inside `$lookup` and `$unionWith`
-      (mongod's wrapper on the 291).
-      Backlog-ID: RM-045
-      Verify: tests/backlog/test_rm_029_056.py::test_2dsphere_index_version_not_an_integer,tests/backlog/test_rm_029_056.py::test_two_indexes_one_key_in_one_create_indexes,tests/backlog/test_rm_029_056.py::test_geo_near_in_lookup_wrapper
-- [ ] **Approximations in the sphere tests.** A point is on an edge when it
-      is within 1.5e-9 radians of it, where mongod asks whether the polygon
-      may meet the point's leaf cell. A polygon is taken to be the side its
-      vertices' centre is on, so one larger than a hemisphere is read as its
-      complement, as mongod reads it without a `crs`; the `strictwinding`
-      `crs` is not read. `$centerSphere` holds a line or polygon when every
-      vertex is inside.
-      Backlog-ID: RM-047
-      Verify: tests/backlog/test_rm_029_056.py::test_center_sphere_and_a_line_bulging_out,tests/backlog/test_rm_029_056.py::test_strictwinding_crs
+- [ ] **A point exactly on an edge's great circle.** S2 settles a point
+      or vertex exactly on another edge's great circle with exact
+      predicates and symbolic perturbation; here it is floats. A line
+      ending exactly on another line's edge: `$geoIntersects` of
+      `[[1,5],[11,5]]` against `[[1,1],[11,1],[11,11]]` matches here and
+      not in mongod. Collinear vertices on lng 180 differ the same way.
+      Line within polygon, polygon within polygon and line against line
+      are still vertex and crossing tests with a 1.5e-9 tolerance, not S2's
+      clipping (they agreed with mongod on everything probed).
+      Backlog-ID: RM-148
+      Verify: tests/backlog/test_rm_geo_residuals.py::test_line_ending_exactly_on_another_line
+- [ ] **`coarsestIndexedLevel` / `finestIndexedLevel` are refused** (197)
+      on a `2dsphere` index; mongod accepts and lists them after
+      `2dsphereIndexVersion`.
+      Backlog-ID: RM-149
+      Verify: tests/backlog/test_rm_geo_residuals.py::test_2dsphere_cell_levels_accepted_and_listed
+- [ ] **A refused index spec leaves the collection the request created.**
+      `createIndexes` on a new collection with a spec missing `name` answers
+      mongod's 9, but the collection stays; mongod leaves none.
+      Backlog-ID: RM-150
+      Verify: tests/backlog/test_rm_geo_residuals.py::test_refused_spec_leaves_no_created_collection
 - [ ] **A bounded `$geoNear` reads every document.** Its `$centerSphere`
       candidate fetch left out a line or polygon whose nearest point is
       inside the distance and a vertex outside (`geo_near_index_filter`,
