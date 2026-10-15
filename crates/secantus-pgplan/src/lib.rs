@@ -22033,6 +22033,17 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("to_regclass") => {
             "regclass".to_string()
         }
+        // `__typmod_coerce(value, 'type', typmod)` (`typmod_cast`): the type
+        // its second argument names.
+        Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("__typmod_coerce") => {
+            match f.args.get(1).and_then(|a| a.node.as_ref()) {
+                Some(N::AConst(c)) => match c.val.as_ref() {
+                    Some(a_const::Val::Sval(sv)) => sv.sval.clone(),
+                    _ => "text".to_string(),
+                },
+                _ => "text".to_string(),
+            }
+        }
         Some(N::FuncCall(f))
             if func_name(f)
                 .as_deref()
@@ -23968,7 +23979,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         // from the CALL. Reading it off the value instead made
                         // `string_to_array('', 'x')` -- an empty array -- report
                         // `int4[]`, and every NULL-returning one report `text`.
-                        let t = if arrays::is_array_function(&name) {
+                        let t = if arrays::is_array_function(&name) || name == "__typmod_coerce" {
                             match rt.val.as_deref() {
                                 Some(n) => static_type(n, &value),
                                 None => inferred_type(&value).to_string(),
