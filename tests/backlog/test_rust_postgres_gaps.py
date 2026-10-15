@@ -596,7 +596,7 @@ def test_order_by_a_range(pg: Any, pg15: Any, sql: str) -> None:
     _same_as_reference(pg, pg15, sql)
 
 
-@pytest.mark.backlog("RP-025")
+@pytest.mark.backlog_fixed("RP-025")
 def test_untyped_record_array_compare(pg: Any, pg15: Any) -> None:
     """PostgreSQL 15.19: comparing arrays of records with an untyped field
     is 42883 `could not identify an equality operator for type unknown`;

@@ -366,13 +366,6 @@ one beside it.
   Backlog-ID: RP-032
   Verify: tests/backlog/test_rust_postgres_gaps.py::test_record_literal_pads_char_field
 
-- [ ] **RUST pgserver: what the typed-value work left (2026-10-15).**
-  - Comparing arrays of records whose fields are untyped
-    (`array[row(1, null)] = array[row(1, null)]`) stays 0A000; PostgreSQL
-    errors at execution with messages that vary by case.
-  Backlog-ID: RP-025
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_untyped_record_array_compare
-
 - [ ] **RUST pgserver: what the 2026-10-15 batch saw beside its items.**
   Each measured on PostgreSQL 15.19:
   - An operator's function called over typed columns it does not take

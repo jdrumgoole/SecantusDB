@@ -10,6 +10,14 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   list or a WHERE. Part of RP-038
   (`tests/backlog/test_rust_postgres_gaps.py::test_pg_typeof_names_the_domain`).
 
+- Arrays of `ROW(...)` records compare as PostgreSQL's `array_eq` /
+  `array_cmp` over `record_eq` / `record_cmp` do: an untyped field reached
+  is 42883 (`could not identify an equality operator for type unknown`),
+  two field types that differ are 42804 naming the column, and records of
+  different widths are 42804 once their common columns are equal. These
+  were 0A000, and an all-typed width mismatch answered `false`. Fixes
+  RP-025 (`tests/backlog/test_rust_postgres_gaps.py::test_untyped_record_array_compare`).
+
 #### Added
 
-- Corpus `domain_typeof`.
+- Corpora `domain_typeof` and `record_arrays`.

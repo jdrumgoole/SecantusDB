@@ -25282,6 +25282,114 @@ fn compared_fields(v: &Bson) -> Option<Vec<Bson>> {
     )
 }
 
+/// `array_eq` / `array_cmp` over arrays of `ROW(...)` records
+/// (`array[row(1, null)]`), as PostgreSQL 15 runs them: element pairs in
+/// order, each through `record_eq` / `record_cmp`, which check every field
+/// pair they reach -- 42804 for two different types, 42883 for `unknown`,
+/// which has no equality operator or comparison function. A pair decided
+/// before such a field is never checked (`array[row(1, null)] =
+/// array[row(2, null)]` is false). `None` for any other comparison.
+fn record_array_compare(op: &str, l: &Bson, r: &Bson) -> Option<Result<Bson>> {
+    use std::cmp::Ordering;
+    fn flat(v: &Bson, out: &mut Vec<Bson>) {
+        match v {
+            Bson::Array(items) => items.iter().for_each(|i| flat(i, out)),
+            other => out.push(other.clone()),
+        }
+    }
+    let (Bson::Array(_), Bson::Array(_)) = (arrays::strip(l), arrays::strip(r)) else {
+        return None;
+    };
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    flat(&arrays::strip(l), &mut a);
+    flat(&arrays::strip(r), &mut b);
+    // Only records that carry their fields' types (a `ROW(...)`); a
+    // composite value is compared by the general path.
+    let typed = |v: &Bson| record_field_types(v).is_some();
+    if !a.iter().chain(b.iter()).any(typed) {
+        return None;
+    }
+    let equality = matches!(op, "=" | "<>" | "!=");
+    if !matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
+        return None;
+    }
+    // `array_eq`: arrays of different shapes are unequal, nothing compared.
+    if equality && a.len() != b.len() {
+        return Some(Ok(Bson::Boolean(op != "=")));
+    }
+    let mut ord = Ordering::Equal;
+    'pairs: for (x, y) in a.iter().zip(b.iter()) {
+        let o = match (x, y) {
+            (Bson::Null, Bson::Null) => Ordering::Equal,
+            (Bson::Null, _) => Ordering::Greater,
+            (_, Bson::Null) => Ordering::Less,
+            _ => {
+                let (Some(fx), Some(fy)) = (record_fields(x), record_fields(y)) else {
+                    return None;
+                };
+                let tx = record_field_types(x).unwrap_or_default();
+                let ty = record_field_types(y).unwrap_or_default();
+                let mut o = Ordering::Equal;
+                for (i, (vx, vy)) in fx.iter().zip(fy.iter()).enumerate() {
+                    let (Some(t1), Some(t2)) = (tx.get(i), ty.get(i)) else {
+                        return None;
+                    };
+                    if t1 != t2 {
+                        return Some(Err(Error::DatatypeMismatch(format!(
+                            "cannot compare dissimilar column types {} and {} at record column {}",
+                            display_type(t1),
+                            display_type(t2),
+                            i + 1
+                        ))));
+                    }
+                    if t1 == "unknown" {
+                        let what = if equality {
+                            "an equality operator"
+                        } else {
+                            "a comparison function"
+                        };
+                        return Some(Err(Error::UndefinedFunction(format!(
+                            "could not identify {what} for type unknown"
+                        ))));
+                    }
+                    // Two NULLs are equal and a NULL sorts after a value.
+                    o = match (vx, vy) {
+                        (Bson::Null, Bson::Null) => Ordering::Equal,
+                        (Bson::Null, _) => Ordering::Greater,
+                        (_, Bson::Null) => Ordering::Less,
+                        _ => compare_constants(vx, vy)?,
+                    };
+                    if o != Ordering::Equal {
+                        break;
+                    }
+                }
+                // Checked once the columns both have are compared equal.
+                if o == Ordering::Equal && fx.len() != fy.len() {
+                    return Some(Err(Error::DatatypeMismatch(
+                        "cannot compare record types with different numbers of columns".into(),
+                    )));
+                }
+                o
+            }
+        };
+        if o != Ordering::Equal {
+            ord = o;
+            break 'pairs;
+        }
+    }
+    if ord == Ordering::Equal {
+        ord = a.len().cmp(&b.len());
+    }
+    Some(Ok(Bson::Boolean(match op {
+        "=" => ord == Ordering::Equal,
+        "<>" | "!=" => ord != Ordering::Equal,
+        "<" => ord == Ordering::Less,
+        "<=" => ord != Ordering::Greater,
+        ">" => ord == Ordering::Greater,
+        _ => ord != Ordering::Less,
+    })))
+}
+
 /// Compare two records with PostgreSQL's rules, which DIFFER by operator AND
 /// by whether the operands are ROW CONSTRUCTORS or composite VALUES.
 ///
@@ -32283,6 +32391,9 @@ pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
             let r = widen(rhs, &l)?;
             (l, r)
         };
+        if let Some(out) = record_array_compare(op, &lhs, &rhs) {
+            return out;
+        }
         let ord = compare_constants(&lhs, &rhs).ok_or_else(|| {
             // Name the OPERAND TYPES. "comparing these operands" was the second
             // largest failure signature on the psycopg gauge and said nothing
