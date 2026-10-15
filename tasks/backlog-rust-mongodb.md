@@ -742,10 +742,13 @@ Still different:
       `setParameter` changes six (`cursorTimeoutMillis` and
       `transactionLifetimeLimitSeconds` among them, each applied to its
       registry, and `notablescan`); the others mongod changes at runtime are
-      20 here. `notablescan`'s refusal has mongod's code and closing words
+      20 here: of those this server reports, `scramIterationCount` and
+      `scramSHA256IterationCount` (mongod sets both at runtime; a fix must
+      make the value govern the credentials `createUser` / `updateUser`
+      write afterwards, not just store it). `notablescan`'s refusal has mongod's code and closing words
       (`... running with 'notablescan' 2`) but not its query-tree text.
       Backlog-ID: RM-035
-      Verify: tests/backlog/test_rm_029_056.py::test_notablescan_parameter
+      Verify: tests/backlog/test_rm_found_2026_10_15.py::test_scram_iteration_count_is_settable_at_runtime
 - [ ] **Commands answered only as far as this server honours them.**
       `features` has no `js` block (there is no script engine) and refuses
       `oidReset`; `getClusterParameter` has six of mongod's fifteen
@@ -758,6 +761,32 @@ Still different:
       is a feature to build, not a reply to change.
       Backlog-ID: RM-143
       Verify: tests/backlog/test_rm_029_056.py::test_features_reports_the_script_engine,tests/backlog/test_rm_029_056.py::test_features_oid_reset,tests/backlog/test_rm_029_056.py::test_plan_cache_set_filter,tests/backlog/test_rm_029_056.py::test_resize_oplog_min_retention_hours,tests/backlog/test_rm_029_056.py::test_every_cluster_parameter
+- [ ] **A frame with an opcode the server does not serve closes the
+      connection.** mongod 8.2.11 sends nothing back for opcode 9999, or 1
+      (`OP_REPLY`) sent as a request, and answers the next request on the
+      same socket; this server resets the connection, losing anything else
+      in flight on it. Found 2026-10-15.
+      Backlog-ID: RM-144
+      Verify: tests/backlog/test_rm_found_2026_10_15.py::test_unknown_opcode_is_ignored_and_the_connection_kept
+- [ ] **A legacy `OP_GET_MORE` closes the connection.** mongod 8.2.11
+      answers an `OP_REPLY` (flags 2, cursor 0) holding `{$err: "OP_GET_MORE
+      is no longer supported. ...", code: 5739101, ok: 0}` and keeps the
+      connection. Found 2026-10-15.
+      Backlog-ID: RM-145
+      Verify: tests/backlog/test_rm_found_2026_10_15.py::test_legacy_op_get_more_is_refused_with_an_op_reply
+- [ ] **An exhaust `getMore` whose last batch is short sends one frame too
+      many.** With 10 documents and `batchSize: 3`, mongod 8.2.11 sends
+      `[3,4,5]` and `[6,7,8]` with `moreToCome`, then `[9]` without it and
+      cursor id 0; this server sends `[9]` with `moreToCome` and the live
+      id, then an empty final frame. Found 2026-10-15.
+      Backlog-ID: RM-146
+      Verify: tests/backlog/test_rm_found_2026_10_15.py::test_exhaust_get_more_ends_with_the_short_batch
+- [ ] **`serverStatus` has no `network.compression`.** mongod 8.2.11
+      reports `bytesIn` / `bytesOut` for each compressor and decompressor
+      (snappy, zstd, zlib; int64, zero on a fresh server). This server
+      speaks all three since 2026-10-15 and counts none of them.
+      Backlog-ID: RM-147
+      Verify: tests/backlog/test_rm_found_2026_10_15.py::test_server_status_reports_compression_counters
 - **Scope decision — `buildInfo.secantusVersion` and `serverStatus.secantus`
   stay** (Joe, 2026-10-15). Each names this build beside mongod's own
   fields. They are additive, documented (`CLAUDE.md`, `docs/compatibility.md`,
