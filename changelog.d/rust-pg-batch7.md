@@ -14,3 +14,7 @@ More of the Rust PostgreSQL server's backlog, measured against PostgreSQL
   `inet_server_port()`, typed `inet` / `integer`
   (`crates/secantus-pg/tests/connection_addrs.rs`). pgwire's `ClientInfo`
   carries the connection's local address for them.
+- A `pg_ident.conf` pattern is read as the SQL `~` operator reads one,
+  POSIX classes and all (`[[:alpha:]]` counts `é`), so a map and a query
+  agree on what a pattern matches (`ident.rs`,
+  `a_pattern_reads_posix_classes_as_sql_does`).

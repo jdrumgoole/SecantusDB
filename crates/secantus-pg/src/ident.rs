@@ -109,12 +109,16 @@ fn parse(text: &str, map: &str) -> Result<UserMap, (usize, String)> {
             ));
         };
         let system = match system.strip_prefix('/') {
-            Some(pattern) => SystemName::Pattern(Regex::new(pattern).map_err(|e| {
-                (
-                    number,
-                    format!("invalid regular expression \"{pattern}\": {e}"),
-                )
-            })?),
+            // Read as the SQL `~` operator reads a pattern, POSIX classes
+            // and all, so a map and a query agree on what one matches.
+            Some(pattern) => SystemName::Pattern(
+                Regex::new(&secantus_pgplan::scalar::pg_regex_source(pattern)).map_err(|e| {
+                    (
+                        number,
+                        format!("invalid regular expression \"{pattern}\": {e}"),
+                    )
+                })?,
+            ),
             None => SystemName::Exact(system.clone()),
         };
         if let SystemName::Pattern(pattern) = &system {
@@ -227,6 +231,7 @@ exact   \"CN=alice,OU=Eng,O=Ex\\, ample,C=IE\"  alice
 fixed   /^svc-            service
 long    a_very_long_name \\
         mapped
+letters \"/^([[:alpha:]]+)$\"   \\1
 ";
 
     fn map(name: &str) -> UserMap {
@@ -258,6 +263,15 @@ long    a_very_long_name \\
         let fixed = map("fixed");
         assert!(fixed.allows("svc-backup", "service"));
         assert!(!fixed.allows("backup", "service"));
+    }
+
+    #[test]
+    fn a_pattern_reads_posix_classes_as_sql_does() {
+        // `[[:alpha:]]` counts `é` as a letter, as PostgreSQL's does under a
+        // UTF-8 locale and as the SQL `~` operator here does.
+        let letters = map("letters");
+        assert!(letters.allows("émile", "émile"));
+        assert!(!letters.allows("emile2", "emile2"));
     }
 
     #[test]

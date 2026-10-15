@@ -311,7 +311,9 @@ one beside it.
     - **A revocation list with a critical extension is refused at
       startup** (`crl.rs`): one scoped by an issuing distribution point, a
       delta list, an indirect list. OpenSSL handles the first.
-    - **A user name map's patterns are the `regex` crate's**, not
+    - **A user name map's patterns are read as the SQL `~` operator reads
+      them** (the `regex` crate, through `pg_regex_source`'s POSIX-class
+      translation, 2026-10-15), so they share that engine's distance from
       PostgreSQL's advanced regular expressions; `@file` inclusion in
       `pg_ident.conf` is refused.
     - **SIGHUP reloads only on a server started with TLS**; without TLS it

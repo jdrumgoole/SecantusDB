@@ -429,7 +429,7 @@ fn substring(s: &str, start: i64, len: Option<i64>) -> String {
 /// `C.UTF-8` ctype reads them. The regex crate's `[[:alpha:]]` is ASCII-only,
 /// where PostgreSQL under a UTF-8 locale counts `é` as a letter; `[:digit:]`
 /// stays ASCII, as PostgreSQL's does (measured on 14 under `C.UTF-8`).
-pub(crate) fn pg_regex_source(pattern: &str) -> String {
+pub fn pg_regex_source(pattern: &str) -> String {
     let chars: Vec<char> = pattern.chars().collect();
     let mut out = String::with_capacity(pattern.len());
     let mut in_bracket = false;
