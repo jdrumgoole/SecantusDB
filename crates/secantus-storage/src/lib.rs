@@ -54,6 +54,8 @@ pub mod pitr_archive;
 pub mod replay;
 pub mod share_locks;
 
+mod scan_bounds;
+
 /// Filename of the advisory PITR manifest embedded in a backup archive.
 pub(crate) const PITR_MANIFEST_NAME: &str = "pitr-manifest.json";
 
@@ -2652,7 +2654,8 @@ fn predicate_may_match_missing(clause: Option<&Bson>) -> bool {
         if NULL_COMPARABLE_OPS.contains(&op.as_str()) && matches!(arg, Bson::Null) {
             return true;
         }
-        if op == "$in" {
+        // `$all: [null]` is an equality to null too.
+        if op == "$in" || op == "$all" {
             if let Some(arr) = arg.as_array() {
                 if arr.iter().any(|v| matches!(v, Bson::Null)) {
                     return true;
@@ -2726,6 +2729,24 @@ pub struct MatchedRows {
     /// The one index whose entries gave the rows their order; `None` when
     /// they are in RecordId order.
     pub via: Option<String>,
+}
+
+/// A wide read gives its index's order to the matches of a scan when at
+/// least one row in this many matched; fewer are left for the caller to
+/// place.
+const WIDE_ORDER_SHARE: usize = 16;
+
+/// How the router reads a filter's candidates ([`Storage::router_access`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouterAccess {
+    /// The whole collection.
+    Collection,
+    /// The `_id` index, by the values the filter names.
+    IdLookup,
+    /// One index; `in_order` when its rows come out in the order of its keys.
+    Index { name: String, in_order: bool },
+    /// Several indexes (an `$or`).
+    Indexes,
 }
 
 fn no_geo_keys(doc: &Document, why: &str) -> String {
@@ -2830,6 +2851,8 @@ enum Routed {
     #[default]
     Nothing,
     One(String),
+    /// One index, read out of the order of its keys (`note_unordered`).
+    Unordered(String),
     Several,
 }
 
@@ -2843,10 +2866,67 @@ fn note_routed(name: &str) {
         let mut r = r.borrow_mut();
         *r = match &*r {
             Routed::Nothing => Routed::One(name.to_string()),
-            Routed::One(have) if have == name => return,
+            Routed::One(have) | Routed::Unordered(have) if have == name => return,
             _ => Routed::Several,
         };
     });
+}
+
+/// The one index the router has read for the query in hand, if one.
+fn routed_one() -> Option<String> {
+    ROUTED.with(|r| match &*r.borrow() {
+        Routed::One(n) => Some(n.clone()),
+        _ => None,
+    })
+}
+
+/// The router read an index, but not in the order of its keys (a multikey
+/// stretch, a key that does not sort where its value does): its rows are to
+/// be put in RecordId order, and no index is reported as giving their order.
+fn note_unordered() {
+    ROUTED.with(|r| {
+        let mut r = r.borrow_mut();
+        *r = match std::mem::take(&mut *r) {
+            Routed::One(n) | Routed::Unordered(n) => Routed::Unordered(n),
+            _ => Routed::Several,
+        };
+    });
+}
+
+thread_local! {
+    /// While set, the router may take a WIDE read: a predicate whose bounds
+    /// are most of an index (a negation, a type, `$exists`). Such a read
+    /// gains nothing but the index's ORDER, so only `matching_rows`, which
+    /// returns that order, asks for one; every other caller scans the
+    /// collection for such a predicate, as it always did.
+    static WIDE_OK: Cell<bool> = const { Cell::new(false) };
+    /// Set when the route taken was a wide read.
+    static WIDE_USED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `f` with `WIDE_OK` set to `on`, restored on return.
+fn with_wide<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WIDE_OK.with(|n| n.set(self.0));
+        }
+    }
+    let _r = Restore(WIDE_OK.with(|n| n.replace(on)));
+    f()
+}
+
+/// Whether a read of bounds that are `broad` may go ahead (and if so, that
+/// it is noted as wide).
+fn wide_read_allowed(broad: bool) -> bool {
+    if !broad {
+        return true;
+    }
+    if !WIDE_OK.with(|w| w.get()) {
+        return false;
+    }
+    WIDE_USED.with(|u| u.set(true));
+    true
 }
 
 thread_local! {
@@ -3103,19 +3183,6 @@ fn conflict_key_value(
         out.insert(f.clone(), get_path(doc, f).cloned().unwrap_or(Bson::Null));
     }
     out
-}
-
-/// Flip a range operator for a DESC field (whose stored bytes are inverted, so
-/// the comparison reverses). Non-range ops pass through. Mirrors the
-/// `{$gt:$lt, ...}` table in `storage.py`.
-fn flip_range_op(op: &str) -> &str {
-    match op {
-        "$gt" => "$lt",
-        "$gte" => "$lte",
-        "$lt" => "$gt",
-        "$lte" => "$gte",
-        other => other,
-    }
 }
 
 /// The `id_key`s to fetch for an `{_id: <spec>}` equality predicate, or `None`
@@ -3654,6 +3721,9 @@ fn partition_compound_range_filter(filter: &Document) -> Option<(Document, Strin
             }
             operator_field = Some(f.clone());
             operator_ops = Some(opd.clone());
+        } else if matches!(v, Bson::RegularExpression(_)) {
+            // A pattern, not a key to pin.
+            return None;
         } else {
             eq_fields.insert(f.clone(), v.clone());
         }
@@ -14369,7 +14439,15 @@ impl Storage {
                 self.candidates_from_hint(&session, db, coll, &resolved, sort_field, sort_dir)?;
             in_sort_order = ord;
             cands
-        } else if let Some(id_keys) = self.try_index_id_keys(&session, db, coll, filter)? {
+        } else if let Some(id_keys) = {
+            ROUTED.with(|r| *r.borrow_mut() = Routed::Nothing);
+            self.try_index_id_keys(&session, db, coll, filter)?
+        } {
+            // The one index the router read in the order of its keys, if so.
+            let read_in_order = ROUTED.with(|r| match &*r.borrow() {
+                Routed::One(name) => Some(name.clone()),
+                _ => None,
+            });
             let mut docs = self.docs_by_recordids(&session, db, coll, &id_keys)?;
             // Single-field filter on the sort field: the index walk already
             // ordered the candidates (modulo direction).
@@ -14377,11 +14455,15 @@ impl Storage {
                 let single = filter.len() == 1 && filter.keys().next().is_some_and(|f| f == sf);
                 // Only a non-multikey index's walk is a sort (see
                 // `sort_walk_index`); otherwise the post-sort below orders it.
+                // And only when the router read THAT index, in key order: it
+                // may have read another (`{n: {$elemMatch: {k: 1}}}` reads
+                // `n.k`), or its keys out of order (a collapsed number).
                 let walk = if single {
                     self.sort_walk_index(&session, db, coll, sf, filter)?
                 } else {
                     None
                 };
+                let walk = walk.filter(|(name, _, _)| read_in_order.as_deref() == Some(name));
                 if let Some((_name, idx_dir, _compound)) = walk {
                     in_sort_order = true;
                     if sort_dir != idx_dir {
@@ -14630,6 +14712,47 @@ impl Storage {
         })
     }
 
+    /// How [`Self::matching_rows`] reads `filter` with no hint and no
+    /// collation: the collection, or which index. Not on the wire; for tests
+    /// of the router.
+    pub fn router_access(&self, db: &str, coll: &str, filter: &Document) -> Result<RouterAccess> {
+        let session = self.op_session()?;
+        if filter.is_empty() {
+            return Ok(RouterAccess::Collection);
+        }
+        ROUTED.with(|r| *r.borrow_mut() = Routed::Nothing);
+        // As `matching_rows`: only the direct route gives its index's order,
+        // and only it may read widely.
+        if with_wide(true, || self.try_index_id_keys(&session, db, coll, filter))?.is_some() {
+            return Ok(match ROUTED.with(|r| r.take()) {
+                Routed::Nothing => RouterAccess::IdLookup,
+                Routed::One(name) => RouterAccess::Index {
+                    name,
+                    in_order: true,
+                },
+                Routed::Unordered(name) => RouterAccess::Index {
+                    name,
+                    in_order: false,
+                },
+                Routed::Several => RouterAccess::Indexes,
+            });
+        }
+        ROUTED.with(|r| *r.borrow_mut() = Routed::Nothing);
+        let routed = match self.try_residual_index_id_keys(&session, db, coll, filter)? {
+            Some(ids) => Some(ids),
+            None => self.try_or_index_id_keys(&session, db, coll, filter)?,
+        };
+        Ok(match (routed, ROUTED.with(|r| r.take())) {
+            (None, _) => RouterAccess::Collection,
+            (Some(_), Routed::One(name) | Routed::Unordered(name)) => RouterAccess::Index {
+                name,
+                in_order: false,
+            },
+            (Some(_), Routed::Nothing) => RouterAccess::IdLookup,
+            (Some(_), Routed::Several) => RouterAccess::Indexes,
+        })
+    }
+
     fn matching_rows_inner(
         &self,
         db: &str,
@@ -14698,7 +14821,8 @@ impl Storage {
             Ok(true)
         };
         let mut via: Option<String> = None;
-        let routed = if filter.is_empty() || coll_opt.is_some() || hint.is_some() {
+        let routable = !(filter.is_empty() || coll_opt.is_some() || hint.is_some());
+        let routed = if !routable {
             None
         } else {
             ROUTED.with(|r| *r.borrow_mut() = Routed::Nothing);
@@ -14730,6 +14854,7 @@ impl Storage {
             // The collection, in RecordId order: a document is copied only
             // once it is known to be kept.
             None => {
+                let mut scanned = 0usize;
                 let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
                     Ok(c) => c,
                     Err(e) if e.is_missing_table() => {
@@ -14762,7 +14887,51 @@ impl Storage {
                     if keep(blob)? {
                         out.push((recordid, blob.to_vec()));
                     }
+                    scanned += 1;
                     more = cur.next()?;
+                }
+                // A predicate only a WIDE read of an index bounds (a
+                // negation, a type, `$exists`): reading most of the
+                // collection a row at a time by RecordId costs more than the
+                // scan, so the index's keys are read only for their order --
+                // and only when enough matched that placing them one by one
+                // would cost more.
+                if routable
+                    && out.len() >= 2
+                    && out.len().saturating_mul(WIDE_ORDER_SHARE) >= scanned
+                {
+                    ROUTED.with(|r| *r.borrow_mut() = Routed::Nothing);
+                    WIDE_USED.with(|u| u.set(false));
+                    let wide =
+                        with_wide(true, || self.try_index_id_keys(&session, db, coll, filter))?;
+                    let name = match ROUTED.with(|r| r.take()) {
+                        Routed::One(name) if WIDE_USED.with(|u| u.get()) => Some(name),
+                        _ => None,
+                    };
+                    if let (Some(order), Some(name)) = (wide, name) {
+                        let places = order.len();
+                        let mut pos: HashMap<i64, usize> = HashMap::with_capacity(places);
+                        for (at, rid) in order.into_iter().enumerate() {
+                            pos.entry(rid).or_insert(at);
+                        }
+                        let held = out.iter().all(|(rid, _)| pos.contains_key(rid));
+                        // Every match has an entry inside its predicate's
+                        // bounds; one that does not is a router bug, and
+                        // the rows stay in RecordId order without a claim.
+                        debug_assert!(held, "a wide index read missed a match of {filter}");
+                        if held {
+                            // Each row straight to its place: a sort would look
+                            // its position up at every comparison.
+                            let mut slots: Vec<Option<(i64, Vec<u8>)>> =
+                                std::iter::repeat_with(|| None).take(places).collect();
+                            for row in out.drain(..) {
+                                let at = pos[&row.0];
+                                slots[at] = Some(row);
+                            }
+                            out = slots.into_iter().flatten().collect();
+                            via = Some(name);
+                        }
+                    }
                 }
             }
         }
@@ -17073,9 +17242,20 @@ impl Storage {
         coll: &str,
         filter: &Document,
     ) -> Result<Option<Vec<i64>>> {
-        for sub in residual_subfilters(filter) {
-            if let Some(ids) = self.try_index_id_keys(session, db, coll, &sub)? {
-                return Ok(Some(ids));
+        // A narrow read of any field first: a wide one (a negation, a type)
+        // reads most of an index, where another field may name a few keys.
+        let subs = residual_subfilters(filter);
+        let wide = WIDE_OK.with(|w| w.get());
+        for pass_wide in [false, true] {
+            if pass_wide && !wide {
+                break;
+            }
+            for sub in &subs {
+                let found =
+                    with_wide(pass_wide, || self.try_index_id_keys(session, db, coll, sub))?;
+                if let Some(ids) = found {
+                    return Ok(Some(ids));
+                }
             }
         }
         Ok(None)
@@ -17123,12 +17303,16 @@ impl Storage {
                 let Bson::Document(branch) = arm else {
                     continue 'or;
                 };
-                let found = match self.try_index_id_keys(session, db, coll, branch)? {
-                    Some(found) => found,
-                    None => match self.try_residual_index_id_keys(session, db, coll, branch)? {
-                        Some(found) => found,
-                        None => continue 'or,
-                    },
+                // A wide read per branch would read most of an index for
+                // each; the collection once is cheaper.
+                let found = with_wide(false, || {
+                    match self.try_index_id_keys(session, db, coll, branch)? {
+                        Some(found) => Ok(Some(found)),
+                        None => self.try_residual_index_id_keys(session, db, coll, branch),
+                    }
+                })?;
+                let Some(found) = found else {
+                    continue 'or;
                 };
                 ids.extend(found);
             }
@@ -17145,6 +17329,148 @@ impl Storage {
         Ok(best)
     }
 
+    /// A filter with an explicit `$and`. Its conjuncts and the filter's other
+    /// fields, when no field repeats and none is an operator, are the plain
+    /// filter they spell. Otherwise each conjunct is a condition every match
+    /// meets, so the first that routes gives the candidates -- a narrow read
+    /// first, then a wide one. Through a multikey index the order is not
+    /// claimed: mongod may bound such an index by another conjunct.
+    fn try_and_id_keys(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+    ) -> Result<Option<Vec<i64>>> {
+        let Ok(conjuncts) = filter.get_array("$and") else {
+            return Ok(None);
+        };
+        let rest: Document = filter
+            .iter()
+            .filter(|(k, _)| k.as_str() != "$and")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if rest.keys().any(|k| k.starts_with('$')) {
+            return Ok(None);
+        }
+        let mut parts: Vec<Document> = Vec::new();
+        if !rest.is_empty() {
+            parts.push(rest);
+        }
+        for c in conjuncts {
+            match c {
+                Bson::Document(d) if !d.is_empty() => parts.push(d.clone()),
+                _ => return Ok(None),
+            }
+        }
+        // A field in two conjuncts is one operator document (`$eq` for an
+        // equality), unless an operator repeats or one is a regex.
+        let as_ops = |v: &Bson| -> Option<Document> {
+            match v {
+                Bson::RegularExpression(_) => None,
+                Bson::Document(d) if !d.is_empty() && d.keys().all(|k| k.starts_with('$')) => {
+                    Some(d.clone())
+                }
+                other => {
+                    let mut d = Document::new();
+                    d.insert("$eq", other.clone());
+                    Some(d)
+                }
+            }
+        };
+        let mut merged = Document::new();
+        let mut plain = true;
+        for part in &parts {
+            for (k, v) in part {
+                if k.starts_with('$') {
+                    plain = false;
+                }
+                let Some(have) = merged.get(k) else {
+                    merged.insert(k.clone(), v.clone());
+                    continue;
+                };
+                match (as_ops(have), as_ops(v)) {
+                    (Some(mut a), Some(b)) if b.keys().all(|op| !a.contains_key(op)) => {
+                        a.extend(b);
+                        merged.insert(k.clone(), Bson::Document(a));
+                    }
+                    _ => plain = false,
+                }
+            }
+        }
+        let route = |part: &Document| -> Result<Option<Vec<i64>>> {
+            match self.try_index_id_keys(session, db, coll, part)? {
+                Some(ids) => Ok(Some(ids)),
+                None => self.try_residual_index_id_keys(session, db, coll, part),
+            }
+        };
+        let mut found = None;
+        if plain {
+            found = route(&merged)?;
+        } else {
+            let wide = WIDE_OK.with(|w| w.get());
+            'passes: for pass_wide in [false, true] {
+                if pass_wide && !wide {
+                    break;
+                }
+                for part in &parts {
+                    found = with_wide(pass_wide, || route(part))?;
+                    if found.is_some() {
+                        break 'passes;
+                    }
+                }
+            }
+        }
+        if found.is_some() {
+            if let Some(name) = routed_one() {
+                if self.flagged_multikey(session, db, coll, &name)? {
+                    note_unordered();
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// `{field: {$elemMatch: {sub: pred, ...}}}`, the object form: a match has
+    /// an element whose `sub` meets `pred`, so an index on `field.sub` holds
+    /// it under that value -- unless `pred` can match an element WITHOUT
+    /// `sub`, which such an index has no entry for.
+    fn try_elem_match_id_keys(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        field: &str,
+        value: &Bson,
+    ) -> Result<Option<Vec<i64>>> {
+        let Some(inner) = value
+            .as_document()
+            .filter(|d| d.len() == 1)
+            .and_then(|d| d.get_document("$elemMatch").ok())
+        else {
+            return Ok(None);
+        };
+        if inner.is_empty() || inner.keys().all(|k| k.starts_with('$')) {
+            return Ok(None);
+        }
+        for (sub, pred) in inner {
+            if sub.starts_with('$') || predicate_may_match_missing(Some(pred)) {
+                continue;
+            }
+            let path = format!("{field}.{sub}");
+            let mut synthetic = Document::new();
+            synthetic.insert(path.clone(), pred.clone());
+            let Some(idx) = self.find_leading_field_index(session, db, coll, &path, &synthetic)?
+            else {
+                continue;
+            };
+            if let Some(ids) = self.bounded_id_keys(session, db, coll, &idx, pred)? {
+                return Ok(Some(ids));
+            }
+        }
+        Ok(None)
+    }
+
     /// Route `filter` to a set of candidate `id_key`s via an index, or `None`
     /// (caller does a COLLSCAN). The `_id` point-lookup fast path, compound
     /// bare-equality prefix, compound prefix + trailing operator, and
@@ -17159,6 +17485,9 @@ impl Storage {
     ) -> Result<Option<Vec<i64>>> {
         if filter.is_empty() {
             return Ok(None);
+        }
+        if filter.contains_key("$and") {
+            return self.try_and_id_keys(session, db, coll, filter);
         }
         if filter.keys().any(|f| f.starts_with('$')) {
             return Ok(None);
@@ -17182,6 +17511,9 @@ impl Storage {
                     }
                     return Ok(Some(rids));
                 }
+                if let Some(rids) = self.try_id_range_id_keys(session, db, coll, spec)? {
+                    return Ok(Some(rids));
+                }
             }
         }
         // Geo dispatch: a `$geoWithin` on a 2d-indexed field scans the geohash
@@ -17194,7 +17526,11 @@ impl Storage {
         }
         // Bare-equality filters of any size can use a compound (or single-field)
         // index whose leading fields cover them.
-        if filter.values().all(|v| !matches!(v, Bson::Document(_))) {
+        // (A regex is a pattern, not a key.)
+        if filter
+            .values()
+            .all(|v| !matches!(v, Bson::Document(_) | Bson::RegularExpression(_)))
+        {
             if let Some(r) = self.try_compound_eq_id_keys(session, db, coll, filter)? {
                 return Ok(Some(r));
             }
@@ -17207,6 +17543,9 @@ impl Storage {
         }
         if filter.len() == 1 {
             let (field, value) = filter.iter().next().unwrap();
+            if let Some(r) = self.try_elem_match_id_keys(session, db, coll, field, value)? {
+                return Ok(Some(r));
+            }
             let idx = match self.find_leading_field_index(session, db, coll, field, filter)? {
                 Some(m) => m,
                 None => return Ok(None),
@@ -17522,6 +17861,10 @@ impl Storage {
         let (name, direction, is_compound) = (idx.0.as_str(), idx.1, idx.2);
         let opdoc = match value {
             Bson::Document(d) => d,
+            // A regex matches strings by pattern; its own key is one stored regex.
+            Bson::RegularExpression(_) => {
+                return self.bounded_id_keys(session, db, coll, idx, value);
+            }
             _ => {
                 return Ok(Some(self.eq_id_keys(
                     session,
@@ -17535,57 +17878,41 @@ impl Storage {
             }
         };
         if opdoc.is_empty() || !opdoc.keys().all(|k| k.starts_with('$')) {
-            return Ok(None);
-        }
-        if !index_can_bound(opdoc) {
-            return Ok(None);
-        }
-        if opdoc.contains_key("$in") {
-            if opdoc.len() != 1 {
+            if opdoc.keys().any(|k| k.starts_with('$')) {
                 return Ok(None);
             }
-            let vals = match opdoc.get("$in") {
-                Some(Bson::Array(a)) => a,
-                _ => return Ok(None),
-            };
-            if vals.iter().any(|v| matches!(v, Bson::Document(_))) {
-                return Ok(None);
-            }
-            let mut seen: HashSet<i64> = HashSet::new();
-            let mut out: Vec<i64> = Vec::new();
-            for v in in_index_order(vals, direction)? {
-                for id_k in self.eq_id_keys(session, db, coll, name, direction, is_compound, v)? {
-                    if seen.insert(id_k) {
-                        out.push(id_k);
+            // An equality to a document.
+            return self.bounded_id_keys(session, db, coll, idx, value);
+        }
+        let plain = |v: &Bson| !matches!(v, Bson::Document(_) | Bson::RegularExpression(_));
+        if opdoc.len() == 1 {
+            if let Some(Bson::Array(vals)) = opdoc.get("$in") {
+                if vals.iter().all(plain) {
+                    let mut seen: HashSet<i64> = HashSet::new();
+                    let mut out: Vec<i64> = Vec::new();
+                    for v in in_index_order(vals, direction)? {
+                        for id_k in
+                            self.eq_id_keys(session, db, coll, name, direction, is_compound, v)?
+                        {
+                            if seen.insert(id_k) {
+                                out.push(id_k);
+                            }
+                        }
                     }
+                    // Inverted, a string still sorts before its extensions.
+                    if direction == -1
+                        && vals
+                            .iter()
+                            .any(|v| scan_bounds::open_ended_rank(scan_bounds::rank(v)))
+                    {
+                        note_unordered();
+                    }
+                    return Ok(Some(out));
                 }
             }
-            return Ok(Some(out));
         }
-        let mut lower: Option<Vec<u8>> = None;
-        let mut lower_incl = true;
-        let mut upper: Option<Vec<u8>> = None;
-        let mut upper_incl = true;
-        for (op, bound) in opdoc {
-            // `$gte: {}` -- every document (the type bracket's floor): the
-            // keys from the empty document's up to the next type's first.
-            // The one document bound walked; the PostgreSQL server marks a
-            // wide numeric's rows with it so they can share the index.
-            if let Bson::Document(d) = bound {
-                if op == "$gte" && d.is_empty() && direction == 1 && opdoc.len() == 1 {
-                    let floor = enc_dir(bound, direction)?;
-                    let Some(&rank) = floor.first() else {
-                        return Ok(None);
-                    };
-                    lower = Some(floor);
-                    lower_incl = true;
-                    upper = Some(vec![rank.saturating_add(1)]);
-                    upper_incl = false;
-                    continue;
-                }
-                return Ok(None);
-            }
-            if op == "$eq" {
+        if let Some(v) = opdoc.get("$eq") {
+            if plain(v) {
                 return Ok(Some(self.eq_id_keys(
                     session,
                     db,
@@ -17593,52 +17920,11 @@ impl Storage {
                     name,
                     direction,
                     is_compound,
-                    bound,
+                    v,
                 )?));
             }
-            let kb = enc_dir(bound, direction)?;
-            // DESC field: stored bytes are inverted, so the comparison flips.
-            let eff = if direction == -1 {
-                flip_range_op(op)
-            } else {
-                op.as_str()
-            };
-            match eff {
-                "$gt" => (lower, lower_incl) = (Some(kb), false),
-                "$gte" => (lower, lower_incl) = (Some(kb), true),
-                "$lt" => (upper, upper_incl) = (Some(kb), false),
-                "$lte" => (upper, upper_incl) = (Some(kb), true),
-                _ => {}
-            }
         }
-        if lower.is_some() && upper.is_some() && self.flagged_multikey(session, db, coll, name)? {
-            upper = None;
-        }
-        if is_compound {
-            // Walk the compound index using its leading field only; boundary
-            // detection accounts for the escaped compound separator.
-            return Ok(Some(self.range_scan_index_leading(
-                session,
-                db,
-                coll,
-                name,
-                lower.as_deref(),
-                lower_incl,
-                upper.as_deref(),
-                upper_incl,
-            )?));
-        }
-        Ok(Some(self.range_scan_index(
-            session,
-            db,
-            coll,
-            name,
-            lower.as_deref(),
-            lower_incl,
-            upper.as_deref(),
-            upper_incl,
-            None,
-        )?))
+        self.bounded_id_keys(session, db, coll, idx, value)
     }
 
     /// `id_key`s whose index entry equals `value` on the leading field: an exact
@@ -17809,83 +18095,236 @@ impl Storage {
         Ok(out)
     }
 
-    /// Range-scan a compound index using only its leading field. Each row's
-    /// escaped kb is `escape(enc(leading)) + escape(SEP) + escape(enc(rest))`;
-    /// boundary detection uses `starts_with(esc_X + escape(SEP))` to find rows
-    /// whose leading field equals `X` (an escaped numeric terminator can overlap
-    /// the escaped separator, so a literal split is unreliable). Mirrors
-    /// `storage._range_scan_index_leading`.
+    /// Read index `name` over `spans` (stored bytes, from
+    /// [`scan_bounds::to_spans`]) of one column, each behind `prefix` (the
+    /// escaped equality columns and separator before it in a compound index;
+    /// empty for a leading column). `more` says whether columns follow it.
+    /// The RecordIds come in entry order, span after span. Also whether that
+    /// is the order of the values: not once a key that does not sort where
+    /// its value does was read -- a collapsed number, or on a descending
+    /// column a string, JavaScript or regex key.
     #[allow(clippy::too_many_arguments)]
-    fn range_scan_index_leading(
+    fn scan_spans(
         &self,
         session: &Session,
         db: &str,
         coll: &str,
         name: &str,
-        lower: Option<&[u8]>,
-        lower_inclusive: bool,
-        upper: Option<&[u8]>,
-        upper_inclusive: bool,
-    ) -> Result<Vec<i64>> {
+        spans: &[scan_bounds::Span],
+        prefix: &[u8],
+        dir: i32,
+        more: bool,
+    ) -> Result<(Vec<i64>, bool)> {
         note_routed(name);
-        let esc_compound_sep = escape_kb(COMPOUND_SEP);
-        let esc_lower = lower.map(escape_kb);
-        let esc_upper = upper.map(escape_kb);
-        let seed: Vec<u8> = esc_lower.clone().unwrap_or_default();
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
-        cur.set_key_sssu(db, coll, name, &seed);
-        let mut out = Vec::new();
-        let mut more = match cur.search_near() {
-            Ok(cmp) => {
-                if cmp < 0 {
-                    cur.next()?
+        let sep = escape_kb(COMPOUND_SEP);
+        let collapsed: Vec<Vec<u8>> = scan_bounds::collapsed_keys()
+            .iter()
+            .map(|k| {
+                let directed: Vec<u8> = if dir == -1 {
+                    k.iter().map(|b| b ^ 0xFF).collect()
                 } else {
-                    true
+                    k.clone()
+                };
+                let mut e = prefix.to_vec();
+                e.extend(escape_kb(&directed));
+                if more {
+                    e.extend_from_slice(&sep);
                 }
+                e
+            })
+            .collect();
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let mut out = Vec::new();
+        let mut ordered = true;
+        for span in spans {
+            let mut lo = prefix.to_vec();
+            if let Some(l) = &span.lo {
+                lo.extend_from_slice(l);
             }
-            Err(e) if e.is_not_found() => return Ok(out),
-            Err(e) => return Err(e.into()),
-        };
-        let eq_prefix = |b: &[u8]| -> Vec<u8> {
-            let mut p = b.to_vec();
-            p.extend_from_slice(&esc_compound_sep);
-            p
-        };
-        let lower_eq_prefix = esc_lower.as_deref().map(eq_prefix);
-        let upper_eq_prefix = esc_upper.as_deref().map(eq_prefix);
-        while more {
-            // Data-sized loop: honour a `maxTimeMS` budget (see `scan_docs`).
-            if deadline::check().is_err() {
-                return Err(StorageError::MaxTimeExpired);
+            let mut hi = prefix.to_vec();
+            match &span.hi {
+                Some(h) => hi.extend_from_slice(h),
+                // No column's first byte is 0xff: it is a type rank, or one
+                // inverted.
+                None => hi.push(0xFF),
             }
-            let (d, c, n, packed) = cur.get_key_sssu()?;
-            if d != db || c != coll || n != name {
-                break;
-            }
-            let (row_esc, row_id) = unpack_entry(&packed);
-            if let Some(lep) = &lower_eq_prefix {
-                if !lower_inclusive && row_esc.starts_with(lep.as_slice()) {
-                    more = cur.next()?;
-                    continue;
-                }
-            }
-            if let Some(eu) = &esc_upper {
-                if upper_inclusive {
-                    if row_esc > eu.as_slice()
-                        && !row_esc.starts_with(upper_eq_prefix.as_ref().unwrap().as_slice())
-                    {
-                        break;
+            cur.reset()?;
+            cur.set_key_sssu(db, coll, name, &lo);
+            let mut more_rows = match cur.search_near() {
+                Ok(cmp) => {
+                    if cmp < 0 {
+                        cur.next()?
+                    } else {
+                        true
                     }
-                } else if row_esc >= eu.as_slice() {
+                }
+                Err(e) if e.is_not_found() => false,
+                Err(e) => return Err(e.into()),
+            };
+            while more_rows {
+                if deadline::check().is_err() {
+                    return Err(StorageError::MaxTimeExpired);
+                }
+                // Read in place: this loop meets most of an index.
+                let step = cur.with_key_sssu(|d, c, n, packed| {
+                    if d != db.as_bytes() || c != coll.as_bytes() || n != name.as_bytes() {
+                        return None;
+                    }
+                    let (row_esc, row_id) = unpack_entry(packed);
+                    if row_esc >= hi.as_slice() {
+                        return None;
+                    }
+                    let mut in_order = true;
+                    let hit = |ck: &Vec<u8>| {
+                        if more {
+                            row_esc.starts_with(ck)
+                        } else {
+                            row_esc == ck.as_slice()
+                        }
+                    };
+                    if ordered && collapsed.iter().any(hit) {
+                        in_order = false;
+                    }
+                    if ordered && dir == -1 {
+                        if let Some(b) = row_esc.get(prefix.len()) {
+                            if scan_bounds::open_ended_rank(0xFF - b) {
+                                in_order = false;
+                            }
+                        }
+                    }
+                    Some((row_id, in_order))
+                })?;
+                let Some((row_id, in_order)) = step else {
+                    break;
+                };
+                ordered &= in_order;
+                if let Some(rid) = row_id {
+                    out.push(rid);
+                }
+                more_rows = cur.next()?;
+            }
+        }
+        Ok((out, ordered))
+    }
+
+    /// Candidates for `pred` through the index `idx` leads with, read between
+    /// the bounds the predicate puts on that field ([`scan_bounds`]): what
+    /// mongod's plan scans for `$ne`, `$not`, `$exists`, `$type`, `$mod`, a
+    /// regex, `$all`, `$elemMatch`, an equality to a document and a range.
+    /// The caller's full-filter pass decides; this only has to hold every
+    /// match. `None`: the predicate bounds nothing here, or only widely and
+    /// the caller has not asked for a wide read (`WIDE_OK`).
+    fn bounded_id_keys(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        idx: &LeadingFieldMatch,
+        pred: &Bson,
+    ) -> Result<Option<Vec<i64>>> {
+        let (name, dir, is_compound) = (idx.0.as_str(), idx.1, idx.2);
+        let multikey = self.flagged_multikey(session, db, coll, name)?;
+        let Some(bounds) = scan_bounds::for_predicate(pred, multikey, dir == -1) else {
+            return Ok(None);
+        };
+        if !wide_read_allowed(bounds.broad) {
+            return Ok(None);
+        }
+        let spans = scan_bounds::to_spans(&bounds, dir, escape_kb);
+        let (ids, mut ordered) =
+            self.scan_spans(session, db, coll, name, &spans, &[], dir, is_compound)?;
+        // On a multikey index a document comes out where its FIRST key in the
+        // stretches is, which is mongod's order only for single keys.
+        if multikey && !bounds.scalar_points() {
+            ordered = false;
+        }
+        // A later descending column orders the strings of equal leading keys
+        // the way the inverted bytes do (see `scan_bounds`).
+        if is_compound && self.has_descending_column(session, db, coll, name)? {
+            ordered = false;
+        }
+        if !ordered {
+            note_unordered();
+        }
+        Ok(Some(ids))
+    }
+
+    /// Whether index `name` has a descending column.
+    fn has_descending_column(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+    ) -> Result<bool> {
+        Ok(self
+            .iter_indexes(session, db, coll)?
+            .into_iter()
+            .any(|(n, key, _)| n == name && key.values().any(|d| direction_of(d) == Some(-1))))
+    }
+
+    /// Candidates for a predicate on `_id` that is not a point lookup -- a
+    /// range, a negation, a type -- read from the `_id` index between the
+    /// predicate's bounds. That index keys a document `_id` by its raw BSON
+    /// (`sortkey::encode_id_key`), not by value, so its documents are read
+    /// whole and out of order.
+    fn try_id_range_id_keys(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        spec: &Bson,
+    ) -> Result<Option<Vec<i64>>> {
+        let Some(mut bounds) = scan_bounds::for_predicate(spec, false, false) else {
+            return Ok(None);
+        };
+        if !wide_read_allowed(bounds.broad) {
+            return Ok(None);
+        }
+        let legacy = [scan_bounds::rank_doc(), scan_bounds::rank_array()];
+        bounds.widen_ranks(&legacy);
+        let spans = scan_bounds::to_spans(&bounds, 1, |k| k.to_vec());
+        note_routed("_id_");
+        let collapsed = scan_bounds::collapsed_keys();
+        let kc = key_coll(db, coll);
+        let cur = session.open_cursor(NAT_SEQ_TABLE, None)?;
+        let mut out = Vec::new();
+        let mut ordered = true;
+        for span in &spans {
+            let lo = span.lo.clone().unwrap_or_default();
+            let hi = span.hi.clone().unwrap_or_else(|| vec![0xFF]);
+            cur.reset()?;
+            cur.set_key_ssu(db, &kc, &lo);
+            let mut more = match cur.search_near() {
+                Ok(cmp) => {
+                    if cmp < 0 {
+                        cur.next()?
+                    } else {
+                        true
+                    }
+                }
+                Err(e) if e.is_not_found() => false,
+                Err(e) => return Err(e.into()),
+            };
+            while more {
+                if deadline::check().is_err() {
+                    return Err(StorageError::MaxTimeExpired);
+                }
+                let (d, c, idk) = cur.get_key_ssu()?;
+                if d != db || c != kc.as_ref() || idk.as_slice() >= hi.as_slice() {
                     break;
                 }
+                if idk.first().is_some_and(|r| legacy.contains(r)) || collapsed.contains(&idk) {
+                    ordered = false;
+                }
+                out.push(cur.get_value_q()?);
+                more = cur.next()?;
             }
-            if let Some(rid) = row_id {
-                out.push(rid);
-            }
-            more = cur.next()?;
         }
-        Ok(out)
+        if !ordered {
+            note_unordered();
+        }
+        Ok(Some(out))
     }
 
     /// Fetch documents by `id_key` (deduped, order-preserving — a multikey index
@@ -18268,77 +18707,65 @@ impl Storage {
             Ok(kb)
         };
 
-        if operator_ops.contains_key("$in") {
-            if operator_ops.len() != 1 {
-                return Ok(None);
-            }
-            let vals = match operator_ops.get("$in") {
-                Some(Bson::Array(a)) => a,
-                _ => return Ok(None),
-            };
-            if vals.iter().any(|v| matches!(v, Bson::Document(_))) {
-                return Ok(None);
-            }
-            let mut seen: HashSet<i64> = HashSet::new();
-            let mut out: Vec<i64> = Vec::new();
-            for v in in_index_order(vals, op_dir)? {
-                let inner = make_kb(v)?;
-                for id_k in
-                    self.scan_index_for_id_keys(session, db, coll, &name, &inner, use_prefix)?
-                {
-                    if seen.insert(id_k) {
-                        out.push(id_k);
+        let plain = |v: &Bson| !matches!(v, Bson::Document(_) | Bson::RegularExpression(_));
+        // Inverted, a string still sorts before its extensions.
+        let desc_text =
+            |v: &Bson| op_dir == -1 && scan_bounds::open_ended_rank(scan_bounds::rank(v));
+        if operator_ops.len() == 1 {
+            if let Some(Bson::Array(vals)) = operator_ops.get("$in") {
+                if vals.iter().all(plain) {
+                    let mut seen: HashSet<i64> = HashSet::new();
+                    let mut out: Vec<i64> = Vec::new();
+                    for v in in_index_order(vals, op_dir)? {
+                        let inner = make_kb(v)?;
+                        for id_k in self
+                            .scan_index_for_id_keys(session, db, coll, &name, &inner, use_prefix)?
+                        {
+                            if seen.insert(id_k) {
+                                out.push(id_k);
+                            }
+                        }
                     }
+                    if vals.iter().any(desc_text) {
+                        note_unordered();
+                    }
+                    return Ok(Some(out));
                 }
             }
-            return Ok(Some(out));
-        }
-        if operator_ops.contains_key("$eq") {
-            if operator_ops.len() != 1 {
-                return Ok(None);
-            }
-            let inner = make_kb(operator_ops.get("$eq").unwrap())?;
-            return Ok(Some(self.scan_index_for_id_keys(
-                session, db, coll, &name, &inner, use_prefix,
-            )?));
-        }
-        let mut lower: Option<Vec<u8>> = None;
-        let mut lower_incl = true;
-        let mut upper: Option<Vec<u8>> = None;
-        let mut upper_incl = true;
-        for (op, bound) in &operator_ops {
-            if matches!(bound, Bson::Document(_)) {
-                return Ok(None);
-            }
-            let mut full = prefix_with_sep.clone();
-            full.extend_from_slice(&enc_dir(bound, op_dir)?);
-            let eff = if op_dir == -1 {
-                flip_range_op(op)
-            } else {
-                op.as_str()
-            };
-            match eff {
-                "$gt" => (lower, lower_incl) = (Some(full), false),
-                "$gte" => (lower, lower_incl) = (Some(full), true),
-                "$lt" => (upper, upper_incl) = (Some(full), false),
-                "$lte" => (upper, upper_incl) = (Some(full), true),
-                _ => return Ok(None),
+            if let Some(v) = operator_ops.get("$eq") {
+                if plain(v) {
+                    let inner = make_kb(v)?;
+                    return Ok(Some(self.scan_index_for_id_keys(
+                        session, db, coll, &name, &inner, use_prefix,
+                    )?));
+                }
             }
         }
-        if lower.is_some() && upper.is_some() && self.flagged_multikey(session, db, coll, &name)? {
-            upper = None;
+        // A range, or anything else: between the bounds the operators put on
+        // the column ([`scan_bounds`]), behind the pinned prefix.
+        let multikey = self.flagged_multikey(session, db, coll, &name)?;
+        let Some(bounds) = scan_bounds::for_predicate(
+            &Bson::Document(operator_ops.clone()),
+            multikey,
+            op_dir == -1,
+        ) else {
+            return Ok(None);
+        };
+        let spans = scan_bounds::to_spans(&bounds, op_dir, escape_kb);
+        let prefix = escape_kb(&prefix_with_sep);
+        let (ids, mut ordered) = self.scan_spans(
+            session, db, coll, &name, &spans, &prefix, op_dir, use_prefix,
+        )?;
+        if multikey && !bounds.scalar_points() {
+            ordered = false;
         }
-        Ok(Some(self.range_scan_index(
-            session,
-            db,
-            coll,
-            &name,
-            lower.as_deref(),
-            lower_incl,
-            upper.as_deref(),
-            upper_incl,
-            Some(&prefix_with_sep),
-        )?))
+        if self.has_descending_column(session, db, coll, &name)? {
+            ordered = false;
+        }
+        if !ordered {
+            note_unordered();
+        }
+        Ok(Some(ids))
     }
 }
 
