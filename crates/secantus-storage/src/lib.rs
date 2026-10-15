@@ -3650,6 +3650,43 @@ fn sort_values_are_nested(blobs: &[Vec<u8>], spec: &[(String, i32)]) -> bool {
     })
 }
 
+/// `docs`, walked from an index of key pattern `spec`, in that pattern's
+/// order (stable, so equal keys keep their walk order) when a descending
+/// column of some document holds text -- the one case the walk misorders.
+fn order_by_key_pattern_if_text(
+    docs: Vec<Vec<u8>>,
+    spec: &[(String, i32)],
+) -> Result<Vec<Vec<u8>>> {
+    let mut decoded = Vec::with_capacity(docs.len());
+    let mut text = false;
+    for blob in &docs {
+        let d = decode_doc(blob)?;
+        text |= spec.iter().any(|(path, dir)| {
+            *dir == -1
+                && matches!(
+                    get_path(&d, path),
+                    Some(
+                        Bson::String(_)
+                            | Bson::Symbol(_)
+                            | Bson::JavaScriptCode(_)
+                            | Bson::JavaScriptCodeWithScope(_)
+                            | Bson::RegularExpression(_)
+                    )
+                )
+        });
+        decoded.push(d);
+    }
+    if !text {
+        return Ok(docs);
+    }
+    let mut keyed: Vec<(Vec<SortPart>, Vec<u8>)> = Vec::with_capacity(docs.len());
+    for (d, blob) in decoded.iter().zip(docs) {
+        keyed.push((sort_key(d, spec, None)?, blob));
+    }
+    keyed.sort_by(|a, b| compare_sort_keys(&a.0, &b.0, spec));
+    Ok(keyed.into_iter().map(|(_, b)| b).collect())
+}
+
 fn raw_path_is_nested(raw: &bson::RawDocument, path: &str) -> bool {
     let mut cur = raw;
     let mut parts = path.split('.').peekable();
@@ -17169,10 +17206,49 @@ impl Storage {
             }
             more = cur.next()?;
         }
+        // A descending column keys a string (JavaScript, regex) by its
+        // inverted bytes, which do not reverse a prefix: inverted, "s" still
+        // comes before "sa", where the index order has "sa" first. Such a walk
+        // is put in the key pattern's order before it is used as one.
+        if let Some(spec) = self.descending_text_spec(session, db, coll, name)? {
+            let docs = self.docs_by_recordids(session, db, coll, &recordids)?;
+            let mut docs = order_by_key_pattern_if_text(docs, &spec)?;
+            if reverse {
+                docs.reverse();
+            }
+            return Ok(docs);
+        }
         if reverse {
             recordids.reverse();
         }
         self.docs_by_recordids(session, db, coll, &recordids)
+    }
+
+    /// The key pattern of index `name` when it has a descending column and is
+    /// not multikey: the walks whose order `walk_index_in_order` checks.
+    fn descending_text_spec(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+    ) -> Result<Option<Vec<(String, i32)>>> {
+        for (n, key, opts) in self.iter_indexes(session, db, coll)? {
+            if n != name {
+                continue;
+            }
+            if opts.get_bool("multikey").unwrap_or(false) {
+                return Ok(None);
+            }
+            let spec: Option<Vec<(String, i32)>> = key
+                .iter()
+                .map(|(f, d)| direction_of(d).map(|di| (f.clone(), di)))
+                .collect();
+            return Ok(spec.filter(|p| {
+                p.iter().all(|(_, d)| d.abs() == 1) && p.iter().any(|(_, d)| *d == -1)
+            }));
+        }
+        Ok(None)
     }
 
     /// A compound index whose key spec exactly matches `sort_fields` (forward) or
@@ -17899,12 +17975,13 @@ impl Storage {
                             }
                         }
                     }
-                    // Inverted, a string still sorts before its extensions.
-                    if direction == -1
-                        && vals
-                            .iter()
-                            .any(|v| scan_bounds::open_ended_rank(scan_bounds::rank(v)))
-                    {
+                    // Inverted, a string still sorts before its extensions;
+                    // and numbers outside the encoder's exponent range share
+                    // one key, whatever their values.
+                    if vals.iter().any(|v| {
+                        (direction == -1 && scan_bounds::open_ended_rank(scan_bounds::rank(v)))
+                            || scan_bounds::is_collapsed(v)
+                    }) {
                         note_unordered();
                     }
                     return Ok(Some(out));
@@ -18726,7 +18803,10 @@ impl Storage {
                             }
                         }
                     }
-                    if vals.iter().any(desc_text) {
+                    if vals
+                        .iter()
+                        .any(|v| desc_text(v) || scan_bounds::is_collapsed(v))
+                    {
                         note_unordered();
                     }
                     return Ok(Some(out));
