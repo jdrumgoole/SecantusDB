@@ -741,6 +741,8 @@ pub enum Statement {
         schema: Option<String>,
         /// (field name, field type name), in declared order.
         fields: Vec<(String, String)>,
+        /// Each field's declared modifier (`atttypmod`, -1 for none).
+        typmods: Vec<i32>,
     },
     /// `CREATE TYPE <name> AS RANGE (subtype = <type>)` -- a custom range type.
     CreateRange {
@@ -4238,21 +4240,23 @@ fn plan_node(
                 Some(typevar.schemaname.clone())
             };
             let mut fields = Vec::new();
+            let mut typmods = Vec::new();
             for col in &ct.coldeflist {
                 let Some(N::ColumnDef(cd)) = col.node.as_ref() else {
                     return Err(Error::Unsupported("this composite field".into()));
                 };
-                let ty = cd
+                let tn = cd
                     .type_name
                     .as_ref()
-                    .map(type_name_of)
                     .ok_or_else(|| Error::Parse("composite field without a type".into()))?;
-                fields.push((cd.colname.clone(), ty));
+                fields.push((cd.colname.clone(), type_name_of(tn)));
+                typmods.push(declared_typmod(tn));
             }
             Ok(Statement::CreateComposite {
                 name,
                 schema,
                 fields,
+                typmods,
             })
         }
         // `CREATE TYPE ... AS ENUM`. The name may be schema-qualified; with no
@@ -25815,7 +25819,19 @@ fn composite_value(value: Bson, target: &str, fields: &[(String, String)]) -> Re
         });
     }
     let mut out = Vec::with_capacity(raw.len());
-    for (v, (_, ty)) in raw.into_iter().zip(fields.iter()) {
+    // A table's row type pads a `char(n)` field to the column's width, as
+    // the column itself does (`'(ab,x)'::t` is `("ab ",x)` on 15.19).
+    let widths = user_composite_widths(target).unwrap_or_default();
+    for (i, (v, (_, ty))) in raw.into_iter().zip(fields.iter()).enumerate() {
+        let width = widths.get(i).copied().flatten();
+        let v = if let (true, Some(n)) = (ty == "bpchar", width) {
+            // The column's typmod applies as on input: excess blanks are cut,
+            // anything else is 22001.
+            let n32 = i32::try_from(n).unwrap_or(i32::MAX - 4);
+            pad_bpchar(fit_length(cast_value_inner(v, ty)?, ty, n32 + 4)?, width)
+        } else {
+            v
+        };
         // A `char(n)` field keeps the blanks it arrived with: a whole-row
         // value is padded to the column's width before it gets here, and a
         // record prints its fields padded (`("ab ",1)` on 15.19), where
@@ -27358,6 +27374,30 @@ pub type CompositeType = (String, i64, CompositeFields);
 /// Composite types: `(resolution name, oid, [(field name, field type)])`.
 pub fn set_user_composites(composites: Vec<CompositeType>) {
     PLAN_USER_COMPOSITES.with(|t| *t.borrow_mut() = composites);
+}
+
+thread_local! {
+    /// The `char(n)` width of each field of a table's row type, by
+    /// resolution name (`None` for a field that is not `char(n)`).
+    static PLAN_COMPOSITE_WIDTHS: std::cell::RefCell<std::collections::HashMap<String, Vec<Option<usize>>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The `char(n)` widths of the row types' fields, installed with them.
+pub fn set_user_composite_widths(widths: std::collections::HashMap<String, Vec<Option<usize>>>) {
+    PLAN_COMPOSITE_WIDTHS.with(|t| *t.borrow_mut() = widths);
+}
+
+/// A composite's field widths, found as `user_composite` finds the type.
+fn user_composite_widths(name: &str) -> Option<Vec<Option<usize>>> {
+    let target = canonical_type_ref(name);
+    let fold = !name.trim().contains('"');
+    PLAN_COMPOSITE_WIDTHS.with(|t| {
+        t.borrow()
+            .iter()
+            .find(|(n, _)| **n == target || (fold && n.eq_ignore_ascii_case(&target)))
+            .map(|(_, w)| w.clone())
+    })
 }
 
 /// A composite type's `(oid, fields)` by name, folded exactly as `user_enum`:

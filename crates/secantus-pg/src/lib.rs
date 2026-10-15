@@ -4322,6 +4322,28 @@ impl PgHandler {
         // resolves only as `schema.name`, so `to_regtype('testschema.t')` finds
         // it while `to_regtype('t')` does not (matching PostgreSQL).
         let mut composites: Vec<secantus_pgplan::CompositeType> = Vec::new();
+        // A table row type's `char(n)` widths, which a text literal cast to it
+        // pads to.
+        let widths: std::collections::HashMap<String, Vec<Option<usize>>> = self
+            .type_catalog_docs(Self::COMPOSITE_COLLECTION)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|d| {
+                let w = d.get_array("widths").ok()?;
+                let schema = d.get_str("schema").unwrap_or("public");
+                let name = d.get_str("composite").ok()?;
+                Some((
+                    Self::type_resolution(schema, name),
+                    w.iter()
+                        .map(|v| match v {
+                            Bson::Int32(n) => usize::try_from(*n).ok(),
+                            _ => None,
+                        })
+                        .collect(),
+                ))
+            })
+            .collect();
+        secantus_pgplan::set_user_composite_widths(widths);
         for (schema, name, oid, fields) in self.composites_with_schema().unwrap_or_default() {
             let resolution = Self::type_resolution(&schema, &name);
             types.push((resolution.clone(), oid, Vec::new()));
@@ -20750,8 +20772,33 @@ impl PgHandler {
         Ok(!self.table_docs(table)?.is_empty())
     }
 
+    /// A table's row type as the type catalog records it: each column as
+    /// `[name, type, null]` (the Python server's shape) and, apart, the
+    /// width of each `char(n)` column (`null` for any other), which a text
+    /// literal cast to the row type pads to.
+    fn row_type_fields(def: &TableDef) -> (Vec<Bson>, Vec<Bson>) {
+        def.columns
+            .iter()
+            .map(|c| {
+                (
+                    Bson::Array(vec![
+                        Bson::String(c.name.clone()),
+                        Bson::String(c.pg_type.clone()),
+                        Bson::Null,
+                    ]),
+                    if c.pg_type == "bpchar" && c.typmod > 4 {
+                        Bson::Int32(c.typmod - 4)
+                    } else {
+                        Bson::Null
+                    },
+                )
+            })
+            .unzip()
+    }
+
     /// Replace a table's catalog row with `def`, and make it visible to the
-    /// rest of this transaction.
+    /// rest of this transaction. Its row type follows its columns: an ALTER
+    /// that adds, drops or retypes one changes what `'(...)'::t` reads.
     fn rewrite_catalog(&self, name: &str, def: &TableDef) -> PgWireResult<()> {
         self.ensure_collection(CATALOG_COLLECTION)?;
         self.delete_catalog(name)?;
@@ -20763,6 +20810,45 @@ impl PgHandler {
             "could not record the table",
         )?;
         self.note_uncommitted(name, Some(def.clone()));
+        self.refresh_row_type(def)
+    }
+
+    /// Rewrite a table's row type from its columns, keeping its oid. A table
+    /// created before row types were recorded has none, and gets none here.
+    fn refresh_row_type(&self, def: &TableDef) -> PgWireResult<()> {
+        self.ensure_collection(Self::COMPOSITE_COLLECTION)?;
+        let filter = bson::doc! { "_id": &def.name, "relation": true };
+        let Some(mut row_type) = self
+            .type_catalog_docs(Self::COMPOSITE_COLLECTION)?
+            .iter()
+            .find(|d| {
+                d.get_str("_id") == Ok(def.name.as_str()) && d.get_bool("relation").unwrap_or(false)
+            })
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let (fields, widths) = Self::row_type_fields(def);
+        row_type.insert("fields", fields);
+        row_type.insert("widths", widths);
+        self.storage
+            .delete_matching(
+                self.db(),
+                Self::COMPOSITE_COLLECTION,
+                &filter,
+                0,
+                &Document::new(),
+                None,
+            )
+            .map_err(|e| Self::storage_err("could not update the row type", e))?;
+        let bytes = encode_doc(&row_type)
+            .map_err(|e| Self::storage_err("could not encode the row type", e))?;
+        self.insert_checked(
+            Self::COMPOSITE_COLLECTION,
+            vec![bytes],
+            "could not record the row type",
+        )?;
+        self.note_uncommitted_type(Self::COMPOSITE_COLLECTION, &def.name, Some(row_type));
         Ok(())
     }
 
@@ -27736,22 +27822,13 @@ impl PgHandler {
                 self.ensure_collection(Self::COMPOSITE_COLLECTION)?;
                 self.ensure_collection(Self::ENUM_META_COLLECTION)?;
                 let oid = self.mint_composite_oid()?;
-                let field_docs: Vec<Bson> = def
-                    .columns
-                    .iter()
-                    .map(|c| {
-                        Bson::Array(vec![
-                            Bson::String(c.name.clone()),
-                            Bson::String(c.pg_type.clone()),
-                            Bson::Null,
-                        ])
-                    })
-                    .collect();
+                let (field_docs, widths) = Self::row_type_fields(&def);
                 let row_type = bson::doc! {
                     "_id": &def.name,
                     "composite": &def.name,
                     "schema": "public",
                     "fields": field_docs,
+                    "widths": widths,
                     "oid": oid,
                     "relation": true,
                 };
@@ -28278,6 +28355,7 @@ impl PgHandler {
                 name,
                 schema,
                 fields,
+                typmods,
             } => {
                 // A schema-qualified name (`CREATE TYPE s.t`) is a distinct type
                 // from a bare `t`; unqualified lands in `public`. A duplicate is
@@ -28324,11 +28402,25 @@ impl PgHandler {
                 } else {
                     format!("{schema_name}.{name}")
                 };
+                // A `char(n)` field's width, which a value cast to the type
+                // is padded to (as `row_type_fields` records a table's).
+                let widths: Vec<Bson> = fields
+                    .iter()
+                    .zip(typmods.iter())
+                    .map(|((_, t), m)| {
+                        if t == "bpchar" && *m > 4 {
+                            Bson::Int32(*m - 4)
+                        } else {
+                            Bson::Null
+                        }
+                    })
+                    .collect();
                 let doc = bson::doc! {
                     "_id": &id_key,
                     "composite": &name,
                     "schema": &schema_name,
                     "fields": field_docs,
+                    "widths": widths,
                     "oid": oid,
                 };
                 let bytes = encode_doc(&doc)
