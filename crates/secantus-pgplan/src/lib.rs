@@ -8439,6 +8439,12 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
         def.extra.insert("pk_column_order", table_pk.clone());
     }
     def.temp = temp;
+    // `CREATE UNLOGGED TABLE` (`relpersistence` `u`): kept so `pg_class`
+    // and `pg_relation_is_publishable` can say so; nothing else differs here,
+    // where there is no WAL to skip.
+    if relation.relpersistence == "u" {
+        def.extra.insert("unlogged", true);
+    }
     // A self-referencing FOREIGN KEY reads this table's own PK, which is only
     // settled now; a FK to another table is checked against the catalog by
     // the server, which has it.

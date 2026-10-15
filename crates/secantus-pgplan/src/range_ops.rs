@@ -650,11 +650,21 @@ fn one_range_key(r: &Range, element: &str) -> String {
 }
 
 /// `__range_sortkey(value, type)`: a string whose order is `range_cmp` for a
-/// range and `multirange_cmp` for a multirange (range by range, a shorter
-/// one first), so ORDER BY can sort a range value by it.
+/// range, `multirange_cmp` for a multirange (range by range, a shorter one
+/// first) and `charlt` for a `"char"`, so ORDER BY can sort the value by it.
 pub fn sort_key(v: &Bson, ty: &str) -> Result<Bson> {
     if *v == Bson::Null {
         return Ok(Bson::Null);
+    }
+    // A `"char"`: its one byte, which its text spells `\ooo` when the high
+    // bit is set (and as nothing for the zero byte).
+    if ty == crate::QUOTED_CHAR {
+        let text = crate::render_value_text(v);
+        let byte = match text.strip_prefix('\\') {
+            Some(oct) if oct.len() == 3 => u8::from_str_radix(oct, 8).unwrap_or(0),
+            _ => text.bytes().next().unwrap_or(0),
+        };
+        return Ok(Bson::String(format!("{byte:02x}")));
     }
     Ok(Bson::String(match side(v, ty)? {
         Side::Range(r, t) => one_range_key(&r, &element(&t)?),

@@ -4411,6 +4411,7 @@ impl PgHandler {
                     .iter()
                     .filter(|t| {
                         !t.temp
+                            && !t.extra.get_bool("unlogged").unwrap_or(false)
                             && !matviews.contains(&t.name)
                             && !secantus_pgplan::fdw::is_foreign(t)
                     })
@@ -13854,7 +13855,16 @@ impl PgHandler {
                         f("relowner"),
                         Bson::Int64(owner_oid(t.extra.get_str("owner").ok())),
                     );
-                    d.insert(f("relpersistence"), if t.temp { "t" } else { "p" });
+                    d.insert(
+                        f("relpersistence"),
+                        if t.temp {
+                            "t"
+                        } else if t.extra.get_bool("unlogged").unwrap_or(false) {
+                            "u"
+                        } else {
+                            "p"
+                        },
+                    );
                     let (rls, forced) = self.row_security(&t.name);
                     d.insert(f("relrowsecurity"), rls);
                     d.insert(f("relforcerowsecurity"), forced);

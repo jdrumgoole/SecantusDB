@@ -156,12 +156,14 @@ fn derived_def(
             if let Some(coll) = collation {
                 c.extra.insert("collation", coll);
             }
-            // A range or multirange column: a row casting to one types it,
-            // so ORDER BY sorts it by `__range_sortkey`.
+            // A range, multirange or `"char"` column: a row casting to one
+            // types it, so ORDER BY sorts it by `__range_sortkey`.
             let ranged = all.iter().find_map(|r| match r.get(i)?.node.as_ref() {
                 Some(N::TypeCast(tc)) => {
                     let t = type_name_of(tc.type_name.as_ref()?);
-                    (crate::range::is_range_type(&t) || crate::range::is_multirange_type(&t))
+                    (crate::range::is_range_type(&t)
+                        || crate::range::is_multirange_type(&t)
+                        || t == crate::QUOTED_CHAR)
                         .then_some(t)
                 }
                 _ => None,
@@ -297,6 +299,21 @@ impl Rewriter<'_> {
             Some(N::ColumnRef(c)) => self.column_of(c).and_then(|c| ranged(&c.pg_type)),
             Some(N::TypeCast(tc)) => ranged(&tc.type_name.as_ref().map(type_name_of)?),
             _ => None,
+        }
+    }
+
+    /// Whether `node` is statically a `"char"`, which sorts by its byte
+    /// (`charlt`), where its text form spells a high byte as `\ooo`.
+    fn char_of(&self, node: &pg_query::protobuf::Node) -> bool {
+        match node.node.as_ref() {
+            Some(N::ColumnRef(c)) => self
+                .column_of(c)
+                .is_some_and(|c| c.pg_type == crate::QUOTED_CHAR),
+            Some(N::TypeCast(tc)) => tc
+                .type_name
+                .as_ref()
+                .is_some_and(|t| type_name_of(t) == crate::QUOTED_CHAR),
+            _ => false,
         }
     }
 
@@ -809,6 +826,9 @@ impl Rewriter<'_> {
                     self.changed = true;
                 } else if let Some(ty) = self.range_of(key) {
                     sb.node = Some(Box::new(Self::range_key(key.clone(), &ty)));
+                    self.changed = true;
+                } else if self.range_of(key).is_none() && self.char_of(key) {
+                    sb.node = Some(Box::new(Self::range_key(key.clone(), crate::QUOTED_CHAR)));
                     self.changed = true;
                 } else if let Some((collation, _)) = self.coll_of(key) {
                     sb.node = Some(Box::new(Self::coll_key(key, &collation)));

@@ -471,21 +471,10 @@ pub fn from_binary(ty: &str, bytes: &[u8]) -> Result<Geo> {
 // Measures
 // ---------------------------------------------------------------------------
 
-fn seg_closest(p: P, a: P, b: P) -> P {
-    let (dx, dy) = (b.x - a.x, b.y - a.y);
-    let len2 = dx * dx + dy * dy;
-    if len2 == 0.0 {
-        return a;
-    }
-    let t = (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0);
-    P {
-        x: a.x + t * dx,
-        y: a.y + t * dy,
-    }
-}
-
+/// `dist_ps`: through `lseg_closept_point`, as geo_ops.c measures it (a
+/// projection parameter overflows for coordinates near the float range).
 fn dist_ps(p: P, a: P, b: P) -> f64 {
-    p.dist(seg_closest(p, a, b))
+    super::geom_closest::lseg_closept_point(a, b, p).1
 }
 
 fn segments(pts: &[P], closed: bool) -> Vec<(P, P)> {
@@ -595,16 +584,7 @@ fn dist_point(p: P, g: &Geo) -> Option<f64> {
         Geo::Point(q) => p.dist(*q),
         Geo::Lseg(a, b) => dist_ps(p, *a, *b),
         Geo::Line(a, b, c) => line_dist(p, *a, *b, *c),
-        Geo::Box(h, l) => {
-            if in_box(p, *h, *l) {
-                0.0
-            } else {
-                segments(&box_pts(*h, *l), true)
-                    .into_iter()
-                    .map(|(a, b)| dist_ps(p, a, b))
-                    .fold(f64::MAX, f64::min)
-            }
-        }
+        Geo::Box(h, l) => super::geom_closest::box_closept_point(*h, *l, p).1,
         Geo::Path { closed, pts } => {
             if pts.len() == 1 {
                 p.dist(pts[0])
@@ -1023,9 +1003,6 @@ pub fn operator(op: &str, lhs: &Geo, rhs: &Geo) -> Option<Result<Bson>> {
                 line_interpt_line((*a1, *b1, *c1), (*a2, *b2, *c2)).is_some()
             )))
         }
-        ("?#", Lseg(a1, a2), Lseg(b1, b2)) => {
-            Some(Ok(b(lseg_interpt_lseg(*a1, *a2, *b1, *b2).is_some())))
-        }
         ("#", Lseg(a1, a2), Lseg(b1, b2)) => {
             Some(Ok(match lseg_interpt_lseg(*a1, *a2, *b1, *b2) {
                 Some(p) => to_bson(&Point(p)),
@@ -1053,7 +1030,6 @@ pub fn operator(op: &str, lhs: &Geo, rhs: &Geo) -> Option<Result<Bson>> {
                 && fp_eq(*b1, k * b2)
                 && fp_eq(*c1, k * c2))))
         }
-        ("?#", Line(a1, b1, _), Line(a2, b2, _)) => Some(Ok(b(!fp_eq(a1 * b2, a2 * b1)))),
         ("?||", Line(a1, b1, _), Line(a2, b2, _)) => Some(Ok(b(fp_eq(a1 * b2, a2 * b1)))),
         ("?-|", Line(a1, b1, _), Line(a2, b2, _)) => Some(Ok(b(fp_eq(a1 * a2 + b1 * b2, 0.0)))),
         (

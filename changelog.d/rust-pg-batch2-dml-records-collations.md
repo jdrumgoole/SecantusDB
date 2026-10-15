@@ -173,6 +173,11 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
 - The closest-point operators `##` (point to segment, box and line;
   segment to box and segment; line to segment) and `<->` between a line or
   box and a segment, transcribed from geo_ops.c. Part of RP-015.
+- Distances to a segment or a box use geo_ops.c's own routines, so they
+  hold at the float range (`lseg <-> point` had been NaN there); a
+  `"char"` sorts by its byte (a high byte had sorted by its `\ooo` text);
+  an UNLOGGED table is `relpersistence` `u` and not publishable. Part of
+  RP-015.
 - `pg_sequences`.
 - `pg_relation_is_updatable`, `pg_column_is_updatable`,
   `pg_is_other_temp_schema` and `pg_settings_get_flags` (PostgreSQL
@@ -191,4 +196,4 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
 - Corpora `multi_assign_update`, `returning_star`, `icu_collations`,
   `to_reg_functions`, `typed_value_residue`, `ts_catalogs`, `typmods`, `sequence_types`, `polymorphic_literals`, `acl_functions`, `relation_updatable`, `order_ties`,
   `string_syntax_settings`, `record_fields_using`, `fetch_ties_settings`
-  `series_order_exprs`, `multibyte_encodings`, `geometric_ops_2`, `tsquery_containment`, `variadic_calls`, `macaddr_bitops`, `multirange_ops`, `range_order` and `geometric_closest`.
+  `series_order_exprs`, `multibyte_encodings`, `geometric_ops_2`, `tsquery_containment`, `variadic_calls`, `macaddr_bitops`, `multirange_ops`, `range_order`, `geometric_closest` and `builtin_small`.
