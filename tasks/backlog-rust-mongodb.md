@@ -1120,22 +1120,32 @@ plan over the collection's documents. Pinned by
 
 What is left, all on the RUST MongoDB server:
 
-- [ ] **`aggregate` stages pushed into the slot-based engine** (16
-      replies). mongod runs `$group`, `$count`, `$sortByCount`, `$bucket`
-      and `$lookup` in its slot-based engine and reports `explainVersion:
-      "2"`, a `winningPlan` of `{queryPlan, slotBasedPlan}` and SBE stage
-      trees at `executionStats`. The `slotBasedPlan` and the SBE statistics
-      are that engine's own programs, which this server does not have, so
-      none of it is reproduced (a stand-in is Joe's call). The classic
-      aggregate explain is: the cursor's dependency projection,
-      `$groupByDistinctScan`, the moves ahead of `$unwind`, stages as
-      mongod parses them, per-stage counts under `$limit`. Also open in
-      the listings: constant folding (`{$abs: -1}` is `{$const: 1}`) and
-      the field order of object-form operators (`$dateToString`).
+- [ ] **`aggregate` stages mongod runs in its slot-based engine** (14
+      replies). mongod 8.2.11 pushes a `$group` not served by a
+      DISTINCT_SCAN, and `$count`, `$sortByCount`, `$bucket` and `$lookup`,
+      into SBE and explains them with `explainVersion: "2"`, a
+      `winningPlan` of `{queryPlan, slotBasedPlan}` and executionStats made
+      of SBE stages with slot expressions. This server reports the classic
+      `$cursor` / `stages` shape. The `queryPlan` tree could be derived
+      from the rules this server follows; `slotBasedPlan` and the SBE
+      statistics are the engine's own programs and are not reproduced.
+      Sending `queryPlan` alone is Joe's call. `explain_commands.py`
+      replies: `aggregate: stages after the cursor` 6, 7, 8, 11;
+      `aggregate: $group and $lookup` 1, 2, 3, 5, 6, 7; `executionStats:
+      aggregate` 5, 6; `a collection that does not exist` 9. The rest of
+      the aggregate explain is reproduced (the cursor's dependency
+      projection, `$groupByDistinctScan`, `$match` and `$sort` moved ahead
+      of `$unwind`, stages as mongod parses them, per-stage counts under
+      `$limit`). Also open in listings: mongod constant-folds (`{$abs: -1}`
+      is `{$const: 1}`) and orders the fields of object-form operators its
+      own way (`$dateToString`).
       Backlog-ID: RM-071
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_a_group_pushed_into_the_query
-- [ ] **`count` and `distinct` on a view** report the cursor and the
-      desugared stages, not mongod's slot-based `GROUP`.
+- [ ] **`count` on a view** is explained by mongod 8.2.11 as an SBE plan
+      (`explainVersion: "2"`, a `queryPlan` of `GROUP` over the view's
+      scan); this server reports the classic cursor and the `$count`
+      stage. The same decision as RM-071. `distinct` and `aggregate` on a
+      view match mongod. `explain_commands.py`: `a view` 4 and 5.
       Backlog-ID: RM-072
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view
 - [ ] **Smaller:** `$expr` is not rewritten (`{$expr: false}` is not an
