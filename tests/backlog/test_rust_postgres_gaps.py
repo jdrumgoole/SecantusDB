@@ -381,3 +381,25 @@ _RP025 = {
 @pytest.mark.parametrize("sql", list(_RP025.values()), ids=list(_RP025))
 def test_typed_value_residue(pg: Any, pg15: Any, sql: str) -> None:
     _same_as_reference(pg, pg15, sql)
+
+
+@pytest.mark.backlog("RP-031")
+def test_update_multi_column_assignment_from_a_subquery(pg: Any) -> None:
+    """PostgreSQL 15.19: `update t set (v, t) = (select 5, 'z')` assigns both
+    columns from the subquery's one row; here it is 0A000 (MultiAssignRef)."""
+    pg.execute("drop table if exists rp031_t")
+    pg.execute("create table rp031_t (k int, v int, t text)")
+    pg.execute("insert into rp031_t values (1, 0, 'a')")
+    got = pg_answer(pg, "update rp031_t set (v, t) = (select 5, 'z') where k = 1")
+    assert got[0] == "ok", got
+    assert pg_answer(pg, "select v, t from rp031_t") == ("ok", [(5, "z")])
+
+
+@pytest.mark.backlog("RP-032")
+def test_record_text_keeps_char_padding(pg: Any) -> None:
+    """PostgreSQL 15.19: a record's text form prints a `char(3)` field with its
+    padding, quoted: `("ab ")`; here it is `(ab)`."""
+    pg.execute("drop table if exists rp032_t")
+    pg.execute("create table rp032_t (c char(3))")
+    pg.execute("insert into rp032_t values ('ab')")
+    assert pg_answer(pg, "select (t)::text from rp032_t t") == ("ok", [('("ab ")',)])

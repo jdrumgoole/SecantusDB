@@ -367,6 +367,20 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **RUST pgserver: `UPDATE ... SET (a, b) = (SELECT ...)` is refused.**
+  It is 0A000 `MultiAssignRef is not supported yet`; PostgreSQL 15.19
+  assigns each listed column from the subquery's one row. Found 2026-10-15
+  by RP-029's work.
+  Backlog-ID: RP-031
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_update_multi_column_assignment_from_a_subquery
+
+- [ ] **RUST pgserver: a record's text form drops a `char(n)` field's
+  padding.** `(t)::text` over a `char(3)` holding `ab` is `(ab)`;
+  PostgreSQL 15.19 prints `("ab ")` (the padded value, quoted because of
+  its blank). Found 2026-10-15 by RP-029's work.
+  Backlog-ID: RP-032
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_record_text_keeps_char_padding
+
 - [ ] **RUST pgserver: what the 2026-10-15 typed-value work left.** That
   batch made values print by their type, refused the casts and operators
   PostgreSQL 15's `pg_cast` / `pg_operator` have no entry for, and typed
