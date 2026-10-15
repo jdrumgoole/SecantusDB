@@ -3230,7 +3230,7 @@ pub struct PgHandler {
     /// Messages of one cycle are being processed: set by the first message
     /// after a `ReadyForQuery`, cleared when the next one is sent. See
     /// `begin_message_cycle`.
-    cycle_open: AtomicBool,
+    cycle_open: Arc<AtomicBool>,
     /// A statement in the open group failed: the group rolls back at `Sync`.
     group_failed: AtomicBool,
     /// NOTIFYs of the open transaction, `(channel, payload)` in first-issue
@@ -3584,7 +3584,7 @@ impl PgHandler {
             constraint_modes: Mutex::new((None, HashMap::new())),
             commit_failed: AtomicBool::new(false),
             implicit_extended: AtomicBool::new(false),
-            cycle_open: AtomicBool::new(false),
+            cycle_open: Arc::new(AtomicBool::new(false)),
             group_failed: AtomicBool::new(false),
             pending_notifies: Mutex::new(Vec::new()),
             pending_listens: Mutex::new(Vec::new()),
@@ -9357,6 +9357,12 @@ impl PgHandler {
     /// Read off the SQL rather than the plan, so a view is still a view and a
     /// subquery -- correlated or not -- is still part of the statement.
     fn check_sql_privileges(&self, sql: &str) -> PgWireResult<()> {
+        // It parses the statement before planning does: a cancel that lands
+        // during that parse is seen there too.
+        self.with_cancel_hook(|| self.check_sql_privileges_inner(sql))
+    }
+
+    fn check_sql_privileges_inner(&self, sql: &str) -> PgWireResult<()> {
         let role = self.current_role_name();
         self.check_schema_create(&role, sql)?;
         self.check_builtin_execute(&role, sql)?;
@@ -18754,6 +18760,19 @@ impl PgHandler {
         // client reading an `ERROR: ... \u{20ac}` expects the single byte 0xA4,
         // not UTF-8. The transcoder reads the setting at send time, so a later
         // SET takes effect.
+        // A message cycle opens at a message's FIRST byte, so a cancel that
+        // lands while a long statement is still arriving is kept, as
+        // PostgreSQL keeps it; one from before the message is stale and is
+        // cleared (`begin_message_cycle`).
+        let cycle = Arc::clone(&self.cycle_open);
+        let backend = Arc::clone(&self.backend);
+        _c.session_extensions()
+            .insert(pgwire::api::MessageStartHook(Arc::new(move || {
+                use std::sync::atomic::Ordering::Relaxed;
+                if !cycle.swap(true, Relaxed) {
+                    backend.cancel.store(false, Relaxed);
+                }
+            })));
         let settings = Arc::clone(&self.settings);
         _c.session_extensions()
             .insert(pgwire::api::BackendMessageTranscoder(Arc::new(move |s| {
@@ -18948,11 +18967,20 @@ impl SimpleQueryHandler for PgHandler {
         // semicolons and answers with one result each. The extended protocol
         // does not, and still refuses -- see `Error::MultipleCommands`.
         // A Query message is a cycle of its own: whatever cancel was pending
-        // when it arrived targeted nothing.
-        self.end_message_cycle();
-        self.backend
-            .cancel
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // before its first byte arrived targeted nothing. The cycle opened
+        // then (the session's `MessageStartHook`), so a cancel that landed
+        // while the text was still arriving, or is being split or parsed, is
+        // kept; opening it here is for a session without the hook.
+        self.begin_message_cycle();
+        // ... and closes when the Query's answer is done, however it ends, so
+        // a cancel sent while the backend is idle again targets nothing.
+        struct CloseCycle<'a>(&'a PgHandler);
+        impl Drop for CloseCycle<'_> {
+            fn drop(&mut self) {
+                self.0.end_message_cycle();
+            }
+        }
+        let _close_cycle = CloseCycle(self);
         // The simple protocol carries no `Bind`, so its results are always text.
         self.binary_results
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -21607,6 +21635,18 @@ impl PgHandler {
 
     /// Run `f` with the executor's callbacks installed: correlated subqueries
     /// and sequence functions inside expressions both need the store.
+    /// Run `f` where the planner can see a cancel that lands while a large
+    /// statement is still parsing (`secantus_pgplan::cancel`). The flag is
+    /// only looked at there; `check_cancel` takes it.
+    fn with_cancel_hook<R>(&self, f: impl FnOnce() -> R) -> R {
+        let cancel = || {
+            self.backend
+                .cancel
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        secantus_pgplan::cancel::with_cancel_hook(&cancel, f)
+    }
+
     fn with_executor_hooks<R>(&self, f: impl FnOnce() -> R) -> R {
         let hook = |name: &str, args: &[Bson]| -> std::result::Result<Bson, PlanError> {
             // `nextval` / `setval` write the sequence, so a READ ONLY
@@ -21680,9 +21720,13 @@ impl PgHandler {
             }
             found
         };
-        secantus_pgplan::with_function_hook(&functions, || {
-            secantus_pgplan::with_sequence_hook(&hook, || {
-                secantus_pgplan::with_expr_index_hook(&expr_indexes, || self.correlated_scope(f))
+        self.with_cancel_hook(|| {
+            secantus_pgplan::with_function_hook(&functions, || {
+                secantus_pgplan::with_sequence_hook(&hook, || {
+                    secantus_pgplan::with_expr_index_hook(&expr_indexes, || {
+                        self.correlated_scope(f)
+                    })
+                })
             })
         })
     }
@@ -22428,7 +22472,7 @@ impl PgHandler {
         // start before the check. An aborted block answers 25P02 instead.
         if !self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) {
             self.within_block(|| self.check_sql_privileges(sql))?;
-            self.wait_for_table_locks(sql)?;
+            self.with_cancel_hook(|| self.wait_for_table_locks(sql))?;
             self.isolate_for_planning(sql)?;
         }
         // Whatever path the statement takes, a planning transaction it left

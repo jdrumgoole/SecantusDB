@@ -71,6 +71,7 @@ pub fn encode_multi_byte(canonical: &str, text: &str) -> std::result::Result<Vec
     mb.encode(text)
 }
 pub mod bytea;
+pub mod cancel;
 pub mod catalog_stmts;
 pub mod correlated;
 pub mod datetime;
@@ -3799,23 +3800,24 @@ fn parse_guarded(sql: &str) -> Result<pg_query::ParseResult> {
     if sql.len() <= DIRECT_CHARS {
         return pg_query::parse(sql).map_err(parse_error);
     }
-    let bound = nesting_bound(sql);
-    if bound <= MAX_EXPR_DEPTH as usize {
+    // Up to 64 KiB, a statement nested no deeper than PostgreSQL allows
+    // parses here, quickly enough that a cancel can wait for it. Beyond
+    // that it is parsed where a cancel can still reach it
+    // (`cancel::interruptible`), on a stack deep enough for its nesting.
+    const INTERRUPTIBLE_CHARS: usize = 64 * 1024;
+    if sql.len() <= INTERRUPTIBLE_CHARS && nesting_bound(sql) <= MAX_EXPR_DEPTH as usize {
         return pg_query::parse(sql).map_err(parse_error);
     }
-    if bound > MAX_BOUND {
-        return Err(Error::Sqlstate(
-            "54001",
-            "stack depth limit exceeded".into(),
-        ));
-    }
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(BIG_STACK_BYTES)
-            .spawn_scoped(scope, || pg_query::parse(sql).map_err(parse_error))
-            .map_err(|e| Error::Sqlstate("54001", format!("stack depth limit exceeded: {e}")))?
-            .join()
-            .map_err(|_| Error::Sqlstate("XX000", "the parser thread panicked".into()))?
+    let owned = sql.to_string();
+    cancel::interruptible(BIG_STACK_BYTES, move || {
+        let bound = nesting_bound(&owned);
+        if bound > MAX_BOUND {
+            return Err(Error::Sqlstate(
+                "54001",
+                "stack depth limit exceeded".into(),
+            ));
+        }
+        pg_query::parse(&owned).map_err(parse_error)
     })
 }
 

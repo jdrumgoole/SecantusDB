@@ -84,6 +84,12 @@ fn element_literal(toks: &[Tok], value: &str) -> Option<usize> {
 /// message, when it can be found.
 pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize> {
     let location = take_error_location();
+    // A cancelled or terminated statement has no position on PostgreSQL,
+    // and looking for one in a large statement would hold the cancel's
+    // answer back.
+    if matches!(sqlstate, "57014" | "57P01") {
+        return None;
+    }
     // `CREATE CAST` / `DROP CAST` resolve their types and function by name,
     // outside any expression, and PostgreSQL reports no position for them.
     let head: String = sql

@@ -41,6 +41,10 @@ pub struct PgWireMessageServerCodec<S> {
     pub client_info: DefaultClient<S>,
     #[new(default)]
     decode_context: DecodeContext,
+    /// SecantusDB patch: a message's first bytes have arrived and it is not
+    /// yet whole (see `MessageStartHook`).
+    #[new(default)]
+    reading_message: bool,
 }
 
 impl<S> Decoder for PgWireMessageServerCodec<S> {
@@ -67,7 +71,23 @@ impl<S> Decoder for PgWireMessageServerCodec<S> {
             }
         }
 
-        PgWireFrontendMessage::decode(src, &self.decode_context)
+        // SecantusDB patch: tell the session when a message's first bytes
+        // arrive, before it is whole (see `MessageStartHook`).
+        if !self.reading_message && !src.is_empty() {
+            self.reading_message = true;
+            if let Some(hook) = self
+                .client_info
+                .session_extensions()
+                .get::<crate::api::MessageStartHook>()
+            {
+                (hook.0)();
+            }
+        }
+        let decoded = PgWireFrontendMessage::decode(src, &self.decode_context);
+        if !matches!(decoded, Ok(None)) {
+            self.reading_message = false;
+        }
+        decoded
     }
 }
 

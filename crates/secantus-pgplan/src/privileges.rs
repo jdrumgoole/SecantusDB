@@ -134,6 +134,9 @@ pub fn sql_relations(sql: &str) -> Vec<(String, &'static str)> {
         let (schema, name) = r.split_once('\u{1f}').unwrap_or(("", r.as_str()));
         push(&mut out, &key_parts(schema, name), p);
     }
+    if crate::cancel::pending() {
+        return out;
+    }
     // Resolving installs nothing, so the epoch read above still holds.
     RESOLVED.with(|m| {
         let mut m = m.borrow_mut();
@@ -163,6 +166,10 @@ fn memoised<V: Clone>(
         return v;
     }
     let v = f(sql);
+    // A parse a cancel cut short answered nothing; it is not the text's.
+    if crate::cancel::pending() {
+        return v;
+    }
     memo.with(|m| {
         let mut m = m.borrow_mut();
         if m.len() >= MEMO_MAX {

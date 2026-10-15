@@ -46,19 +46,6 @@ one beside it.
   call sequence (7 of 10 rounds), and `pproxy` cannot start under this
   venv's uvloop on Python 3.12. `psycopg_validation/include_paths.py` keeps
   them out of the macOS gauge. Nothing to do server-side.
-- [ ] RUST pgserver: a cancel that arrives during Parse / Bind / Describe is kept
-  (fixed 2026-10-09), but two differences from PostgreSQL remain. It is
-  honoured at the first cancellation point of EXECUTION, not during the parse
-  itself: against a statement that takes 2.8 s to parse here, PostgreSQL 15
-  answers 57014 in 30 ms and this server answers it after the parse. And the
-  idle window is wider: a cancel that lands while the server is still READING
-  a large message is dropped (0-5 ms after a 1.4 MB statement in a debug
-  build), where PostgreSQL has finished reading by then. Closing the second
-  needs a hook in the vendored `secantus-pgwire` at the point a message's
-  first byte is read. Probe: send `select pg_sleep(3), 1 in (0..200000)` with
-  `send_query_params`, then a blocking `PQcancel` at a chosen offset.
-  Backlog-ID: RP-002
-  Verify: tests/backlog/test_rp_triage.py::test_cancel_during_parse_is_honoured_at_once
 - **Scope decision — a `LANGUAGE internal` wrapper over a C function with no
   SQL form** (an I/O function such as `int4out`, an aggregate transition
   function) is a catalog row that answers 42883 when called. PostgreSQL calls
