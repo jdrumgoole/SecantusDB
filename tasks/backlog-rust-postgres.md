@@ -508,7 +508,9 @@ one beside it.
         carried as its canonical text), its SELECT form checks the column
         count only on rows it gets back, and a syntax error in that SQL has
         a position PostgreSQL does not give.
-      - **`aclexplode`, `acldefault`, `makeaclitem`** need role oids;
+      - **`aclexplode` in a select list** (`(aclexplode(a)).privilege_type`)
+        is refused, and an aclitem naming a role oid no role has cannot be
+        read back (items are carried as text, PostgreSQL's as oids);
         **`pg_relation_is_updatable`**, **`pg_is_other_temp_schema`**,
         **`pg_settings_get_flags`** need catalog or GUC state the planner
         does not see; `table_to_xml` and the other XML exports, and the

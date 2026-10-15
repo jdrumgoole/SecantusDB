@@ -175,6 +175,8 @@ const SCALAR_NAMES: &[&str] = &[
     "lpad",
     "rpad",
     "to_hex",
+    "acldefault",
+    "makeaclitem",
     "cash_words",
     "getdatabaseencoding",
     "pg_encoding_to_char",
@@ -1302,6 +1304,29 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                     .and_then(|w| PG_ENCODINGS.iter().position(|n| *n == w))
                     .map_or(-1, |i| i as i32),
             ))
+        }
+        // `acldefault` / `makeaclitem` (acl.c): strict, so a NULL is NULL.
+        "acldefault" | "makeaclitem" if args.contains(&Bson::Null) => Ok(Bson::Null),
+        "acldefault" => {
+            need(2)?;
+            let owner = as_i64(&arg(1)).ok_or_else(|| wrong_args(name))?;
+            Ok(Bson::Array(
+                crate::acl::acldefault(&text(&arg(0)), owner)?
+                    .into_iter()
+                    .map(Bson::String)
+                    .collect(),
+            ))
+        }
+        "makeaclitem" => {
+            need(4)?;
+            let oid = |i: usize| as_i64(&arg(i)).ok_or_else(|| wrong_args(name));
+            let grantable = matches!(arg(3), Bson::Boolean(true));
+            Ok(Bson::String(crate::acl::makeaclitem(
+                oid(0)?,
+                oid(1)?,
+                &text(&arg(2)),
+                grantable,
+            )?))
         }
         "cash_words" => {
             need(1)?;
@@ -2563,6 +2588,8 @@ pub fn static_result_type(name: &str) -> &'static str {
         | "jsonb_path_query_array"
         | "jsonb_path_query_first_tz"
         | "jsonb_path_query_array_tz" => "jsonb",
+        "acldefault" => "aclitem[]",
+        "makeaclitem" => "aclitem",
         "lpad" | "rpad" | "to_hex" | "cash_words" | "translate" | "overlay" | "quote_literal"
         | "quote_nullable" | "unistr" | "convert_from" | "normalize" => "text",
         "regexp_split_to_array" => "text[]",

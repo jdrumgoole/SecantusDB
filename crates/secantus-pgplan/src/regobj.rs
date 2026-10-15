@@ -52,6 +52,34 @@ pub fn role_name(oid: i64) -> String {
     })
 }
 
+/// A role's name by oid, or the oid as text for one no role has -- what an
+/// `aclitem` prints for it (`{99999=arwdDxt/99999}` on PostgreSQL 15.19).
+pub fn role_name_or_oid(oid: i64) -> String {
+    if oid == 0 {
+        return String::new();
+    }
+    ROLES
+        .with(|t| {
+            t.borrow()
+                .iter()
+                .find(|(_, o)| *o == oid)
+                .map(|(n, _)| n.clone())
+        })
+        .unwrap_or_else(|| oid.to_string())
+}
+
+/// A role's oid by name: PUBLIC (the empty name) is 0, and a run of digits
+/// no role is named is the oid `aclitemout` printed for a role it did not
+/// find.
+pub fn role_oid(name: &str) -> Option<i64> {
+    if name.is_empty() {
+        return Some(0);
+    }
+    ROLES
+        .with(|t| t.borrow().iter().find(|(n, _)| n == name).map(|(_, o)| *o))
+        .or_else(|| name.parse().ok())
+}
+
 /// Whether a role of this name exists (the published role catalog).
 pub fn role_known(name: &str) -> bool {
     ROLES.with(|t| t.borrow().iter().any(|(n, _)| n == name))

@@ -11830,6 +11830,41 @@ fn srf_rows(
                 rows,
             )));
         }
+        // `aclexplode(aclitem[])`: one row per privilege of each item.
+        "aclexplode" => {
+            let a = args(1)?;
+            let mut rows = Vec::new();
+            if let Bson::Array(items) = arrays::strip(&a[0]) {
+                // `check_acl`: an empty array has no dimension at all.
+                if items.is_empty() {
+                    return Err(Error::Sqlstate(
+                        "22023",
+                        "ACL arrays must be one-dimensional".into(),
+                    ));
+                }
+                for item in items.iter().filter(|i| **i != Bson::Null) {
+                    for (grantor, grantee, privilege, grantable) in acl::explode(&value_text(item))?
+                    {
+                        rows.push(vec![
+                            Bson::Int64(grantor),
+                            Bson::Int64(grantee),
+                            Bson::String(privilege.into()),
+                            Bson::Boolean(grantable),
+                        ]);
+                    }
+                }
+            }
+            return Ok(Some((
+                vec![
+                    "grantor".into(),
+                    "grantee".into(),
+                    "privilege_type".into(),
+                    "is_grantable".into(),
+                ],
+                vec!["oid".into(), "oid".into(), "text".into(), "bool".into()],
+                rows,
+            )));
+        }
         // `pg_options_to_table(text[])`: each `name=value` split at its
         // first `=`; an option with none has a NULL value.
         "pg_options_to_table" => {
@@ -23779,8 +23814,10 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                             || declared == "timestamptz"
                             || declared == "name"
                             || declared == "name[]"
-                            // A `"char"` is carried as its text.
+                            // A `"char"` is carried as its text, and so is an
+                            // `aclitem`.
                             || declared == QUOTED_CHAR
+                            || declared.starts_with("aclitem")
                             || fts::result_type(&name).is_some()
                             || xml::result_type(&name).is_some()
                             || jsonops::result_type(&name).is_some()
