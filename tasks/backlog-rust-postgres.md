@@ -114,6 +114,13 @@ one beside it.
   tested: none of PostgreSQL's libc collations beyond `C` / `POSIX` exists
   here (`COLLATE "en_US"` is 42704), and which ones a server has is the
   host's locale list.
+  **Decision needed (2026-10-16):** the fix is ICU data, not code. These
+  locales order as the root because ICU4X's compiled data carries only its
+  standard locales; `icu4x-datagen` can generate their collation data from
+  ICU's `icuexport` release (the same tailorings ICU4C has, e.g. `haw`'s
+  `&a<e<i<o<u<h<k<l<...`), loaded through a blob or baked provider. That
+  means committing a generated data artifact (a blob, or a large generated
+  `baked` source tree), which CLAUDE.md reserves for Joe's say-so.
   Backlog-ID: RP-005
   Verify: tests/backlog/test_rp_triage.py::test_tailored_icu_collation_orders_as_postgres
 - **Scope decision — pgcrypto Blowfish and CAST5** PGP messages are verified
