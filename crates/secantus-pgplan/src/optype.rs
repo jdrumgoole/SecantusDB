@@ -911,7 +911,9 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             // type can define one (`hstore - text` exists).
             let string = |t: &str| category(t) == Some("string");
             let known = category(&l).is_some() && category(&r).is_some();
-            if known && (l == "bool" || r == "bool" || string(&l) || string(&r)) {
+            // `jsonb - text` is a key's delete, checked below.
+            let jsonb_delete = op == "-" && l == "jsonb";
+            if known && !jsonb_delete && (l == "bool" || r == "bool" || string(&l) || string(&r)) {
                 return Err(mismatch(&op, &l, &r, e.location));
             }
         }

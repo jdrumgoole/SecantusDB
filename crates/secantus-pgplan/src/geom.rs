@@ -832,6 +832,8 @@ fn closest(a: &Geo, b: &Geo) -> Option<P> {
         // `close_lseg` answers NULL for parallel segments (equal slopes).
         (Lseg(a0, a1), Lseg(b0, b1)) if point_sl(*a0, *a1) == point_sl(*b0, *b1) => return None,
         (Lseg(a0, a1), Lseg(b0, b1)) => c::lseg_closept_lseg((*b0, *b1), (*a0, *a1)).0,
+        // `close_ls` answers NULL for a segment parallel to the line.
+        (Line(la, lb, _), Lseg(s0, s1)) if point_sl(*s0, *s1) == line_sl(*la, *lb) => return None,
         (Line(la, lb, lc), Lseg(s0, s1)) => c::lseg_closept_line(*s0, *s1, (*la, *lb, *lc)).0,
         _ => return None,
     })
@@ -843,7 +845,7 @@ pub fn operator(op: &str, lhs: &Geo, rhs: &Geo) -> Option<Result<Bson>> {
     match (op, lhs, rhs) {
         // The closest-point operators and the distances geo_ops.c defines
         // through them (`geom_closest`).
-        ("##", Lseg(..), Lseg(..)) => Some(Ok(
+        ("##", Lseg(..), Lseg(..)) | ("##", Line(..), Lseg(..)) => Some(Ok(
             closest(lhs, rhs).map_or(Bson::Null, |p| to_bson(&Point(p)))
         )),
         ("##", _, _) => closest(lhs, rhs).map(|p| Ok(to_bson(&Point(p)))),
@@ -855,6 +857,22 @@ pub fn operator(op: &str, lhs: &Geo, rhs: &Geo) -> Option<Result<Bson>> {
         ))),
         ("<->", Line(a, bb, c), Point(p)) | ("<->", Point(p), Line(a, bb, c)) => {
             Some(Ok(d(line_closept_dist((*a, *bb, *c), *p))))
+        }
+        // `line_distance`: 0 where the lines meet, else the gap between
+        // parallel lines, their C terms scaled by the A (or B) ratio.
+        ("<->", Line(a1, b1, c1), Line(a2, b2, c2)) => {
+            if line_interpt_line((*a1, *b1, *c1), (*a2, *b2, *c2)).is_some() {
+                return Some(Ok(d(0.0)));
+            }
+            let usable = |v: f64| !fp_eq(v, 0.0) && !v.is_nan();
+            let ratio = if usable(*a1) && usable(*a2) {
+                a1 / a2
+            } else if usable(*b1) && usable(*b2) {
+                b1 / b2
+            } else {
+                1.0
+            };
+            Some(Ok(d((c1 - ratio * c2).abs() / a1.hypot(*b1))))
         }
         ("<->", _, _) => distance(lhs, rhs).map(|v| Ok(d(v))),
         ("@>", _, _) => contains(lhs, rhs).map(|v| Ok(b(v))),
@@ -973,6 +991,17 @@ pub fn operator(op: &str, lhs: &Geo, rhs: &Geo) -> Option<Result<Bson>> {
         }
         ("?#", Lseg(a1, a2), Lseg(b1, b2)) => {
             Some(Ok(b(lseg_interpt_lseg(*a1, *a2, *b1, *b2).is_some())))
+        }
+        // `inter_sl`: the segment meets the line.
+        ("?#", Lseg(p0, p1), Line(a, bb, c)) => {
+            Some(Ok(b(lseg_interpt_line(*p0, *p1, (*a, *bb, *c)).is_some())))
+        }
+        // `inter_lb`: the line meets one of the box's four edges.
+        ("?#", Line(a, bb, c), Box(h, l)) => {
+            let corners = box_pts(*h, *l);
+            Some(Ok(b((0..4).any(|i| {
+                lseg_interpt_line(corners[i], corners[(i + 1) % 4], (*a, *bb, *c)).is_some()
+            }))))
         }
         // `inter_sb`: an endpoint inside the box, or the segment crossing
         // one of its edges.
@@ -1102,6 +1131,18 @@ fn point_eq_point(a: P, b: P) -> bool {
         return a.x == b.x && a.y == b.y;
     }
     fp_eq(a.x, b.x) && fp_eq(a.y, b.y)
+}
+
+/// `line_sl`: a line's slope, 0 for a horizontal one and infinite for a
+/// vertical one.
+fn line_sl(a: f64, b: f64) -> f64 {
+    if fp_eq(a, 0.0) {
+        return 0.0;
+    }
+    if fp_eq(b, 0.0) {
+        return f64::INFINITY;
+    }
+    a / -b
 }
 
 /// `point_sl`: infinite for a vertical pair (and for one point twice).

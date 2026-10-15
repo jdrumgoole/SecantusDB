@@ -84,6 +84,22 @@ pub(crate) fn result_type(name: &str, types: &[String]) -> Option<String> {
             | "anycompatiblenonarray_out",
             1,
         ) => "cstring",
+        ("in_range", 5) => "bool",
+        ("btvarstrequalimage", 1) => "bool",
+        // A type's modifier as a declaration writes it (`(3)`).
+        (
+            "bittypmodout"
+            | "bpchartypmodout"
+            | "intervaltypmodout"
+            | "numerictypmodout"
+            | "timestamptypmodout"
+            | "timestamptztypmodout"
+            | "timetypmodout"
+            | "timetztypmodout"
+            | "varbittypmodout"
+            | "varchartypmodout",
+            1,
+        ) => "cstring",
         // A discrete range type's canonical function, called by name.
         ("int4range_canonical", 1) => "int4range",
         ("int8range_canonical", 1) => "int8range",
@@ -125,9 +141,61 @@ pub(crate) fn result_type(name: &str, types: &[String]) -> Option<String> {
         ("multirange", 1) if crate::range::is_range_type(t(0)) => {
             return Some(crate::range::multirange_name_for(t(0)));
         }
-        _ => return None,
+        _ => {
+            return crate::typsend::result_type(name, types.len())
+                .or_else(|| crate::agg_support::result_type(name, types.len()))
+                .or_else(|| crate::hashfn::result_type(name, types.len()))
+                .map(String::from)
+        }
     };
     Some(out.to_string())
+}
+
+/// The `*typmodout` functions (varchar.c, numeric.c, varbit.c,
+/// timestamp.c's `anytime_typmodout` and `intervaltypmodout`).
+fn typmod_out(name: &str, typmod: i32) -> Result<String> {
+    let zone = match name {
+        "timestamptypmodout" | "timetypmodout" => Some(" without time zone"),
+        "timestamptztypmodout" | "timetztypmodout" => Some(" with time zone"),
+        _ => None,
+    };
+    if let Some(zone) = zone {
+        return Ok(if typmod >= 0 {
+            format!("({typmod}){zone}")
+        } else {
+            zone.to_string()
+        });
+    }
+    Ok(match name {
+        "varchartypmodout" | "bpchartypmodout" if typmod > 4 => format!("({})", typmod - 4),
+        "bittypmodout" | "varbittypmodout" if typmod >= 0 => format!("({typmod})"),
+        "numerictypmodout" if typmod >= 4 => {
+            let t = typmod - 4;
+            let scale = ((t & 0x7ff) ^ 1024) - 1024;
+            format!("({},{scale})", (t >> 16) & 0xffff)
+        }
+        "intervaltypmodout" if typmod >= 0 => {
+            let (mask, precision) = (typmod >> 16, typmod & 0xffff);
+            let fields = crate::typmod_cast::INTERVAL_RANGES
+                .iter()
+                .find(|(m, _)| *m == mask)
+                .map(|(_, f)| *f)
+                .ok_or_else(|| {
+                    Error::Sqlstate("XX000", format!("invalid INTERVAL typmod: 0x{typmod:x}"))
+                })?;
+            let fields = if fields.is_empty() {
+                String::new()
+            } else {
+                format!(" {fields}")
+            };
+            if precision != 0xffff {
+                format!("{fields}({precision})")
+            } else {
+                fields
+            }
+        }
+        _ => String::new(),
+    })
 }
 
 /// A type one end of an `OVERLAPS` period may have.
@@ -339,6 +407,30 @@ pub(crate) fn call(name: &str, args: &[Bson], types: &[String], variadic: bool) 
         return Ok(Bson::Null);
     }
     let bytes = |i: usize| bytea::parse(&args[i]);
+    if let Some(out) = crate::agg_support::call(name, args) {
+        return out;
+    }
+    if name == "in_range" {
+        if let Some(out) = crate::agg_support::in_range(args, types) {
+            return out;
+        }
+    }
+    // Called with no index to say which collation: PostgreSQL cannot tell.
+    if name == "btvarstrequalimage" {
+        return Err(Error::Sqlstate(
+            "42P22",
+            "could not determine which collation to use for string comparison".into(),
+        ));
+    }
+    if let Some(out) = crate::hashfn::call(name, args, types.first().map_or("", String::as_str)) {
+        return out;
+    }
+    if args.len() == 1 {
+        let ty = types.first().map_or("", String::as_str);
+        if let Some(out) = crate::typsend::call(name, &args[0], ty) {
+            return out;
+        }
+    }
     match name {
         "substr" | "substring" => {
             let count = args.get(2).map(|v| int(v, "integer")).transpose()?;
@@ -480,6 +572,10 @@ pub(crate) fn call(name: &str, args: &[Bson], types: &[String], variadic: bool) 
             }
             let at = format!("{day} {}", crate::value_text(&args[1]));
             crate::cast_value(Bson::String(at), name)
+        }
+        name if name.ends_with("typmodout") => {
+            let typmod = i32::try_from(int(&args[0], "integer")?).unwrap_or(-1);
+            typmod_out(name, typmod).map(Bson::String)
         }
         "anyarray_out"
         | "anycompatiblearray_out"

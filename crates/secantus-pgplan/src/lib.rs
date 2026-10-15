@@ -15,8 +15,10 @@ use bson::{doc, Bson, Document};
 
 pub mod acl;
 mod agg_hoist;
+mod agg_support;
 mod expr_where;
 mod filter_sublink;
+mod hashfn;
 mod like_match;
 mod multi_assign;
 mod record_fields;
@@ -90,6 +92,7 @@ mod funcsig;
 pub mod timezones;
 mod ts_debug;
 mod ts_rewrite;
+pub mod typsend;
 pub mod validators;
 pub mod wparser;
 mod xml_catalog;
@@ -3866,9 +3869,112 @@ fn parse_one(sql: &str) -> Result<N> {
     Ok(node)
 }
 
+/// A qualified type name's schema must exist: `1::nosuch.t` is 3F000 at the
+/// type name, before anything looks for the type (15.19).
+/// The type names a statement writes: a cast's, a column's, and any the
+/// walk reaches on its own (it does not descend into the first two).
+fn statement_type_names(node: &N) -> Vec<pg_query::protobuf::TypeName> {
+    let mut out = Vec::new();
+    let columns = |elts: &[pg_query::protobuf::Node],
+                   out: &mut Vec<pg_query::protobuf::TypeName>| {
+        for e in elts {
+            if let Some(N::ColumnDef(cd)) = e.node.as_ref() {
+                out.extend(cd.type_name.clone());
+            }
+        }
+    };
+    match node {
+        N::CreateStmt(c) => columns(&c.table_elts, &mut out),
+        N::AlterTableStmt(a) => {
+            for cmd in &a.cmds {
+                if let Some(N::AlterTableCmd(c)) = cmd.node.as_ref() {
+                    if let Some(def) = c.def.as_deref() {
+                        columns(std::slice::from_ref(def), &mut out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    for (n, _, _, _) in node.nodes() {
+        match n {
+            pg_query::NodeRef::TypeName(tn) => out.push(tn.clone()),
+            pg_query::NodeRef::TypeCast(tc) => out.extend(tc.type_name.clone()),
+            pg_query::NodeRef::ColumnDef(cd) => out.extend(cd.type_name.clone()),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn check_type_schemas(node: &N) -> Result<()> {
+    for tn in statement_type_names(node) {
+        {
+            let parts: Vec<&str> = tn
+                .names
+                .iter()
+                .filter_map(|n| match n.node.as_ref() {
+                    Some(N::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if let [schema, _] | [_, schema, _] = parts.as_slice() {
+                if !type_schema_exists(schema) {
+                    set_error_location(tn.location);
+                    return Err(Error::Sqlstate(
+                        "3F000",
+                        format!("schema \"{schema}\" does not exist"),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A missing type is named as the statement wrote it, schema and all
+/// (`type "public.nosuch" does not exist`): the planner's own message
+/// carries the bare name its lowering kept.
+fn qualify_type_error(e: Error, node: &pg_query::protobuf::Node) -> Error {
+    let Error::UndefinedObject(m) = &e else {
+        return e;
+    };
+    let Some(name) = m
+        .strip_prefix("type \"")
+        .and_then(|r| r.strip_suffix("\" does not exist"))
+    else {
+        return e;
+    };
+    let bare = name.strip_suffix("[]").unwrap_or(name);
+    let Some(inner) = node.node.as_ref() else {
+        return e;
+    };
+    for tn in statement_type_names(inner) {
+        {
+            let parts: Vec<String> = tn
+                .names
+                .iter()
+                .filter_map(|n| match n.node.as_ref() {
+                    Some(N::String(s)) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .collect();
+            if parts.len() >= 2 && parts.last().map(String::as_str) == Some(bare) {
+                let array = if tn.array_bounds.is_empty() { "" } else { "[]" };
+                return Error::UndefinedObject(format!(
+                    "type \"{}{array}\" does not exist",
+                    parts.join(".")
+                ));
+            }
+        }
+    }
+    e
+}
+
 /// The analysis-time rewrites every statement passes through before it is
 /// planned.
 fn rewrite_statement(node: &mut N) -> Result<()> {
+    check_type_schemas(node)?;
     func_cast::check_variadic_arity(node)?;
     func_cast::spread_variadic(node);
     func_cast::rewrite(node);
@@ -4024,6 +4130,18 @@ pub fn plan_with_subqueries(
     let node = pg_query::protobuf::Node {
         node: Some(parse_one_as_sent(sql)?),
     };
+    let original = node.clone();
+    plan_with_subqueries_parsed(sql, node, lookup, params, run)
+        .map_err(|e| qualify_type_error(e, &original))
+}
+
+fn plan_with_subqueries_parsed(
+    sql: &str,
+    node: pg_query::protobuf::Node,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+    run: SubqueryRunner<'_>,
+) -> Result<Statement> {
     // A cursor's query is a statement of its own: subqueries, views and
     // CTEs are resolved in it as in a bare SELECT.
     if let Some(N::DeclareCursorStmt(d)) = node.node.as_ref() {
@@ -30085,10 +30203,27 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
                         Some(shell) => {
                             Error::UndefinedObject(format!("type \"{shell}\" is only a shell"))
                         }
-                        None => Error::UndefinedObject(format!(
-                            "type \"{}\" does not exist",
-                            pgtypes::user_type_catalog_name(name.trim())
-                        )),
+                        None => match parsed_type_name(&name) {
+                            // `TypeNameToString`: the parts as parsed, quotes
+                            // gone; an unknown schema is named first.
+                            Some((parts, _))
+                                if parts.len() == 2 && !type_schema_exists(&parts[0]) =>
+                            {
+                                Error::Sqlstate(
+                                    "3F000",
+                                    format!("schema \"{}\" does not exist", parts[0]),
+                                )
+                            }
+                            Some((parts, array)) => Error::UndefinedObject(format!(
+                                "type \"{}{}\" does not exist",
+                                pgtypes::user_type_catalog_name(&parts.join(".")),
+                                if array { "[]" } else { "" }
+                            )),
+                            None => Error::UndefinedObject(format!(
+                                "type \"{}\" does not exist",
+                                pgtypes::user_type_catalog_name(name.trim())
+                            )),
+                        },
                     }),
                 }
             }
@@ -30587,6 +30722,10 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
         )?))),
         // `record_in`: text cannot be read as an anonymous record, which
         // has no field types to read it by (15.19, at the literal).
+        "cstring" => Ok(match value {
+            Bson::Null => Bson::Null,
+            v => Bson::String(as_text(&v)),
+        }),
         "record" if matches!(value, Bson::String(_)) => Err(Error::Sqlstate(
             "0A000",
             "input of anonymous composite types is not implemented".into(),
@@ -32927,6 +33066,57 @@ pub fn compare_values(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
     compare_constants(a, b)
 }
 
+/// A type name as the grammar reads it (`public."Nosuch"[]`): its parts,
+/// quotes removed, and whether it names an array.
+fn parsed_type_name(text: &str) -> Option<(Vec<String>, bool)> {
+    let parsed = pg_query::parse(&format!("SELECT NULL::{text}")).ok()?;
+    let stmt = parsed
+        .protobuf
+        .stmts
+        .first()?
+        .stmt
+        .as_ref()?
+        .node
+        .as_ref()?;
+    let N::SelectStmt(s) = stmt else { return None };
+    let Some(N::ResTarget(rt)) = s.target_list.first()?.node.as_ref() else {
+        return None;
+    };
+    let Some(N::TypeCast(tc)) = rt.val.as_deref()?.node.as_ref() else {
+        return None;
+    };
+    let tn = tc.type_name.as_ref()?;
+    let parts = tn
+        .names
+        .iter()
+        .filter_map(|n| match n.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect();
+    Some((parts, !tn.array_bounds.is_empty()))
+}
+
+/// Does a type name's schema exist (`pg_catalog`, `public`, a user schema)?
+pub(crate) fn type_schema_exists(schema: &str) -> bool {
+    matches!(
+        schema,
+        "pg_catalog" | "public" | "information_schema" | "pg_toast"
+    ) || schema == "pg_temp"
+        || schema.starts_with("pg_temp_")
+        || schemas::schema_exists(schema)
+}
+
+/// `1` for `infinity`, `-1` for `-infinity`, as an infinite timestamp is
+/// carried.
+fn infinite_instant(v: &Bson) -> Option<i8> {
+    match v {
+        Bson::String(s) if s == "infinity" => Some(1),
+        Bson::String(s) if s == "-infinity" => Some(-1),
+        _ => None,
+    }
+}
+
 pub(crate) fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Bson::String(x), Bson::String(y)) => Some(x.cmp(y)),
@@ -33006,6 +33196,15 @@ pub(crate) fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering
         // `tsrange` has to order its own bounds to canonicalise.
         (a2, b2) if instant_micros(a2).is_some() && instant_micros(b2).is_some() => {
             Some(instant_micros(a2)?.cmp(&instant_micros(b2)?))
+        }
+        // An infinite timestamp is carried as its text: `infinity` follows
+        // every instant and `-infinity` precedes every one (15.19).
+        (a2, b2)
+            if (infinite_instant(a2).is_some() && instant_micros(b2).is_some())
+                || (instant_micros(a2).is_some() && infinite_instant(b2).is_some()) =>
+        {
+            let rank = |v: &Bson| infinite_instant(v).unwrap_or(0);
+            Some(rank(a2).cmp(&rank(b2)))
         }
         // Intervals compare FLATTENED -- 30-day months, 24-hour days -- even
         // though they are stored as three independent parts for arithmetic.
@@ -35212,6 +35411,31 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
             .ok_or_else(|| Error::Parse("cast with no operand".into()))?;
         let value = const_value(arg, params)?;
         let target = tc.type_name.as_ref().map(type_name_of).unwrap_or_default();
+        // `cstring` is a value's output text (an I/O conversion): the text
+        // cast's, except that a `char(n)` keeps its padding (`bpcharout`).
+        if target == "cstring" {
+            if value == Bson::Null {
+                return Ok(Bson::Null);
+            }
+            match static_type(arg, &value).as_str() {
+                "bpchar" => return Ok(Bson::String(value_text(&value))),
+                // `boolout` is `t` / `f`, where the text cast spells it out.
+                "bool" => {
+                    if let Bson::Boolean(b) = value {
+                        return Ok(Bson::String(if b { "t" } else { "f" }.into()));
+                    }
+                }
+                _ => {}
+            }
+            let mut as_text = (**tc).clone();
+            as_text.type_name = Some(type_name_node("text"));
+            return const_value_inner(
+                &pg_query::protobuf::Node {
+                    node: Some(N::TypeCast(Box::new(as_text))),
+                },
+                params,
+            );
+        }
         // A user BASE type (`CREATE TYPE t (input = ..., output = ...)`) is
         // carried as its text, but it has no cast to anything but the string
         // types and itself: `'a'::t::int` is 42846 on PostgreSQL rather than a
@@ -35314,6 +35538,12 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                     "cannot cast type {} to money",
                     display_type(&source)
                 )));
+            }
+            // An aclitem to itself is no conversion: re-reading its text
+            // would refuse an item naming an oid no role has, which
+            // PostgreSQL carries as the oid (`makeaclitem(12345, ...)`).
+            if source == "aclitem" && target == "aclitem" {
+                return Ok(value);
             }
             // An aclitem casts to the string types (I/O conversion) and to
             // itself; nothing else (`'x=r/x'::aclitem::oid` is 42846).
@@ -36461,6 +36691,12 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                     if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))));
                 if untyped {
                     return cast_value(v, &element);
+                }
+                // An element already of the element type is not re-read: an
+                // aclitem naming an oid no role has is carried as the oid
+                // there, and its text would not read back (RP-015).
+                if static_type(n, &v) == element {
+                    return Ok(v);
                 }
                 to_common_type(v, &element)
             })

@@ -331,9 +331,6 @@ one beside it.
     in BOTH the plain and TLS runs is printed and does not fail the
     `psycopg-tls.yml` lane, which is the plain gauge's number and has no
     Linux lane that gates it.
-  - The embedded Python handle (`_secantus_server.PgServer`) **does not
-    take a revocation list, a user name map or `clientname=DN` as
-    options**; a `pg_hba.conf` passed as `hba_file` can say the last two.
   Backlog-ID: RP-013
   Verify: tests/backlog/test_rust_postgres_gaps.py::test_unknown_user_is_asked_for_a_password
 
@@ -351,21 +348,17 @@ one beside it.
   Backlog-ID: RP-043
   Verify: tests/backlog/test_rust_postgres_gaps.py::test_join_cursor_ordered_by_its_key_cannot_scroll
 
-- [ ] **RUST pgserver: type-name divergences found beside RP-038
-  (2026-10-15).** Each measured on PostgreSQL 15.19:
-  - `'a'::public.nosuch` is 42704 `type "public.nosuch" does not exist`;
-    here the schema is dropped from the name (`pg_catalog.` likewise), an
-    unknown schema (`1::nosuch.t`) is this 42704 where PostgreSQL says 3F000
-    `schema "nosuch" does not exist`, and `'"nosuch"'::regtype` keeps the
-    quotes in its message. The qualifier is dropped where a type name is
-    lowered to the planner's string (`type_name_of`). (The positions were
-    fixed 2026-10-15.)
-  - `create type "Int"` / `"Int4"` are 42710; PostgreSQL creates them. The
-    gate is a one-line change, measured: the planner then folds the quoted
-    name to `int` and the new type captures `1::int`. Type names need to
-    keep their case through the planner first.
+- [ ] **RUST pgserver: a quoted mixed-case type name is folded where it is
+  looked up.** The planner hands a type name on as a plain string, so a
+  quoted `"Dom"` and an unquoted `dom` arrive the same, and the user-type
+  lookups (`user_domain`, `user_enum`, `user_composite_widths`, ...) fold
+  both sides to match them. On PostgreSQL 15.19 a domain `"Dom"` is reached
+  by `5::"Dom"` (here 42704) and an enum `"MyType"` is NOT reached by
+  `'y'::"mytype"` (here it is). Names have to keep their case from the
+  parse to the lookup, with only a type name read from TEXT folded (as
+  `'MyDom'::regtype` is); a built-in already refuses a capital (2026-10-15).
   Backlog-ID: RP-041
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_qualified_unknown_type_is_named_qualified,tests/backlog/test_rust_postgres_gaps.py::test_quoted_mixed_case_type_name
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_mixed_case_type_is_found_only_as_written
 
 - [ ] **RUST pgserver: grouped and DISTINCT ON rows that tie under ORDER BY
   come out in another order from PostgreSQL's.** A plain ORDER BY (and an
@@ -445,20 +438,20 @@ one beside it.
       `test_builtin_coverage_fixed` and the corpora it added). Re-run it
       before working an item.
 
-      What is left (re-measured 2026-10-15 against 15.19):
-      - **An aclitem naming a role oid no role has** (`makeaclitem(12345,
-        ...)`) cannot be read back once it is in an array: items are
-        carried as their TEXT (`12345=r/postgres`), and building
-        `ARRAY[...]` of them re-reads each through the aclitem input,
-        which (as PostgreSQL's) refuses an unknown role name, so
-        `aclexplode` over one is 42704 where PostgreSQL answers the oid.
-        PostgreSQL carries the item as oids; `acl::explode` already reads
-        such a text back as its oid.
-      - **Not to be closed by an alias**: `bttextcmp`, `bpcharcmp` and
-        `byteacmp` answer what the C library's `memcmp` returns (14 for
-        `bttextcmp('b', 'a')` on macOS, 1 elsewhere); the type input/output,
-        index support and aggregate transition functions take or return
-        `cstring` / `internal` and are not called by a statement.
+      What is left (re-measured 2026-10-15 against 15.19, 1,890 of 1,934
+      the same; everything else the probe reports is below):
+      - **Decision needed -- the comparisons that answer a `memcmp`
+        difference** (16): `bttextcmp`, `bpcharcmp`, `byteacmp`, `bitcmp`,
+        `varbitcmp`, `btnamecmp` and its text forms, the `*_pattern_cmp`
+        pair, `network_cmp`, `jsonb_cmp`, `tsvector_cmp`, `tsquery_cmp`,
+        `gin_cmp_tslexeme`, `gin_compare_jsonb`. Each returns what the C
+        library's `memcmp` / `strcoll` does on the reference machine
+        (`bttextcmp('b', 'a')` is 14 on the macOS reference,
+        `bitcmp(B'101', B'100')` 32), and only the sign is promised.
+        Answering the reference's magnitude is one rule; answering -1 / 1 is
+        another. Which one is Joe's call, so none is answered yet.
+      - `table_to_xml` / `database_to_xml` over the catalog or the whole
+        database differ only by what each database holds.
       Backlog-ID: RP-015
       Verify: tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_residue
 

@@ -333,3 +333,72 @@ def test_refuse_unknown_users(tmp_path: Path) -> None:
             assert conn.execute("SELECT current_user").fetchone() == ("known",)
         with pytest.raises(psycopg.OperationalError):
             psycopg.connect(f"{base} user=nobody password=x", connect_timeout=10).close()
+
+
+def test_a_user_name_map_names_the_role_a_certificate_logs_in_as(tmp_path: Path) -> None:
+    """`tls_ident_file` / `tls_user_map` are `pg_ident.conf` and `map=`, as
+    `secantusd-pg --tls-ident-file --tls-user-map` takes them: under
+    `tls_client_cert="cert"` the certificate's common name logs in as the
+    role a line of the map gives it, and as no other."""
+    ca = trustme.CA()
+    issued = ca.issue_cert("127.0.0.1", "localhost")
+    client = ca.issue_cert("client.example", common_name="laptop")
+    paths = {n: tmp_path / n for n in ("ca.pem", "server.crt", "server.key", "c.crt", "c.key")}
+    ca.cert_pem.write_to_path(str(paths["ca.pem"]))
+    issued.cert_chain_pems[0].write_to_path(str(paths["server.crt"]))
+    issued.private_key_pem.write_to_path(str(paths["server.key"]))
+    client.cert_chain_pems[0].write_to_path(str(paths["c.crt"]))
+    client.private_key_pem.write_to_path(str(paths["c.key"]))
+    # libpq refuses a client key others can read.
+    paths["c.key"].chmod(0o600)
+    ident = tmp_path / "pg_ident.conf"
+    ident.write_text("m laptop alice\n")
+    with _server(
+        tmp_path / "home",
+        tls_cert_file=str(paths["server.crt"]),
+        tls_key_file=str(paths["server.key"]),
+        tls_ca_file=str(paths["ca.pem"]),
+        tls_client_cert="cert",
+        tls_ident_file=str(ident),
+        tls_user_map="m",
+    ) as server:
+
+        def login(user: str) -> psycopg.Connection:
+            return psycopg.connect(
+                server.dsn,
+                user=user,
+                sslmode="verify-full",
+                sslrootcert=str(paths["ca.pem"]),
+                sslcert=str(paths["c.crt"]),
+                sslkey=str(paths["c.key"]),
+                autocommit=True,
+                connect_timeout=10,
+            )
+
+        with login("alice") as conn:
+            assert conn.execute("SELECT current_user").fetchone() == ("alice",)
+        with pytest.raises(psycopg.OperationalError, match="certificate authentication failed"):
+            login("postgres").close()
+
+
+def test_the_tls_file_options_are_checked_as_the_binary_checks_them(tmp_path: Path) -> None:
+    """The revocation list, the client name and the user name map need the
+    certificate pair; the map's file and name go together; a client name is
+    `CN` or `DN`. Each is a `ValueError`, before any store is opened."""
+    _ca, cert, key = _certificates(tmp_path)
+    home = tmp_path / "home"
+    ident = str(tmp_path / "pg_ident.conf")
+    for kwargs, message in (
+        ({"tls_crl_file": "x.pem"}, "need tls_cert_file"),
+        ({"tls_client_name": "DN"}, "need tls_cert_file"),
+        ({"tls_ident_file": ident, "tls_user_map": "m"}, "need tls_cert_file"),
+        (
+            {"tls_cert_file": cert, "tls_key_file": key, "tls_ident_file": ident},
+            "needs tls_user_map",
+        ),
+        ({"tls_cert_file": cert, "tls_key_file": key, "tls_user_map": "m"}, "needs tls_ident_file"),
+        ({"tls_cert_file": cert, "tls_key_file": key, "tls_client_name": "XX"}, "tls_client_name"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            _secantus_server.PgServer(str(home), **kwargs)
+    assert not home.exists()
