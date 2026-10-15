@@ -842,3 +842,24 @@ def test_drop_domain_cascade_drops_every_column(pg: Any) -> None:
     finally:
         pg.execute("drop table if exists rp041_v")
     assert (got, notices) == (("ok", [(1,)]), ["drop cascades to 2 other objects"])
+
+
+@pytest.mark.backlog_fixed("RP-013")
+def test_restricted_builtin_needs_a_grant(pg: Any) -> None:
+    """PostgreSQL 15.19 ships `pg_reload_conf()` (and 58 more) with EXECUTE
+    revoked from PUBLIC: a role without a GRANT gets 42501 under SET ROLE,
+    and one with a GRANT may call it. Here any role could reload."""
+    pg.execute("drop role if exists rp013_rl")
+    pg.execute("create role rp013_rl")
+    try:
+        pg.execute("set role rp013_rl")
+        denied = pg_answer(pg, "select pg_reload_conf()")
+        pg.execute("reset role")
+        pg.execute("grant execute on function pg_reload_conf() to rp013_rl")
+        pg.execute("set role rp013_rl")
+        granted = pg_answer(pg, "select pg_reload_conf()")
+    finally:
+        pg.execute("reset role")
+        pg.execute("revoke execute on function pg_reload_conf() from rp013_rl")
+        pg.execute("drop role rp013_rl")
+    assert denied[:2] == ("err", "42501") and granted == ("ok", [(True,)])

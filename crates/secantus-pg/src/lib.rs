@@ -18916,14 +18916,12 @@ impl PgHandler {
         if let Some(user) = _c.metadata().get("user") {
             *self.session_user.lock().unwrap_or_else(|e| e.into_inner()) = user.clone();
         }
-        // `pg_reload_conf()` is a superuser's by default; the answer is
-        // taken at login.
-        let may_reload = self.is_superuser(&self.session_user_name());
+        // `pg_reload_conf()` is a superuser's by default: who may call it is
+        // the built-in EXECUTE check's (`restricted_builtins`), for the role
+        // in effect at the call, GRANTs included; a call that reaches here
+        // reloads.
         let reloader = self.reloader.clone();
         secantus_pgplan::scalar::set_reload_conf(Some(Box::new(move || {
-            if !may_reload {
-                return false;
-            }
             if let Some(Err(e)) = reloader.as_ref().map(live::Reloader::reload) {
                 eprintln!("secantusd-pg: configuration was not reloaded: {e}");
             }

@@ -71,6 +71,15 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   corpus sweep had reported, in `b38_misc` and `b40_types`, which no
   backlog item recorded. Those two corpora pin it.
 
+- The 59 built-ins PostgreSQL 15.19 ships with EXECUTE revoked from
+  PUBLIC -- `pg_reload_conf`, `pg_stat_reset`, the `pg_ls_*dir` and
+  `pg_read_file` family, `lo_import` / `lo_export` and the rest -- are
+  refused (42501) to a role without a GRANT or the predefined role
+  (`pg_monitor`, `pg_read_all_stats`) PostgreSQL grants them to, for the
+  role in effect at the call. Any role could call them, and
+  `pg_reload_conf()` judged by the login role and ignored a GRANT. Part of
+  RP-013 (`tests/backlog/test_rust_postgres_gaps.py::test_restricted_builtin_needs_a_grant`).
+
 #### Added
 
 - The language validators `fmgr_internal_validator`, `fmgr_c_validator`,
@@ -82,4 +91,4 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   foreign server or user mapping may set. Part of RP-015
   (`tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed[fmgr-validator]`,
   `[fdw-validator]`).
-- Corpora `row_type_char_overflow`, `fmgr_validators`, `type_named_like_grammar`, `drop_type_dependents` and `enum_literal_analysis`.
+- Corpora `row_type_char_overflow`, `fmgr_validators`, `type_named_like_grammar`, `drop_type_dependents`, `enum_literal_analysis` and `restricted_builtins`.

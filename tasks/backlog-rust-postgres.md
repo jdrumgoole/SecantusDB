@@ -316,8 +316,6 @@ one beside it.
     - **A user name map's patterns are the `regex` crate's**, not
       PostgreSQL's advanced regular expressions; `@file` inclusion in
       `pg_ident.conf` is refused.
-    - **`pg_reload_conf()` checks superuser as of login**, not the role
-      `SET ROLE` chose, and a GRANT of EXECUTE on it is not honoured.
     - **SIGHUP reloads only on a server started with TLS**; without TLS it
       still stops the server (`ctrlc`'s termination handler).
   - **`pg_stat_ssl` prints `UNDEF` for an attribute type outside

@@ -1,0 +1,60 @@
+# PostgreSQL 15.19's built-ins with EXECUTE revoked from PUBLIC: the signature as the privilege check keys it, and the predefined roles granted it (none: superusers only). Dumped from pg_proc where proacl names no PUBLIC grant.
+lo_export(oid,text)	
+lo_import(text)	
+lo_import(text,oid)	
+pg_backup_start(text,bool)	
+pg_backup_stop(bool)	
+pg_config()	
+pg_create_restore_point(text)	
+pg_current_logfile()	
+pg_current_logfile(text)	
+pg_get_backend_memory_contexts()	pg_read_all_stats
+pg_get_shmem_allocations()	pg_read_all_stats
+pg_hba_file_rules()	
+pg_ident_file_mappings()	
+pg_log_backend_memory_contexts(int4)	
+pg_ls_archive_statusdir()	pg_monitor
+pg_ls_dir(text)	
+pg_ls_dir(text,bool,bool)	
+pg_ls_logdir()	pg_monitor
+pg_ls_logicalmapdir()	pg_monitor
+pg_ls_logicalsnapdir()	pg_monitor
+pg_ls_replslotdir(text)	pg_monitor
+pg_ls_tmpdir()	pg_monitor
+pg_ls_tmpdir(oid)	pg_monitor
+pg_ls_waldir()	pg_monitor
+pg_promote(bool,int4)	
+pg_read_binary_file(text)	
+pg_read_binary_file(text,int8,int8)	
+pg_read_binary_file(text,int8,int8,bool)	
+pg_read_file(text)	
+pg_read_file(text,int8,int8)	
+pg_read_file(text,int8,int8,bool)	
+pg_reload_conf()	
+pg_replication_origin_advance(text,pg_lsn)	
+pg_replication_origin_create(text)	
+pg_replication_origin_drop(text)	
+pg_replication_origin_oid(text)	
+pg_replication_origin_progress(text,bool)	
+pg_replication_origin_session_is_setup()	
+pg_replication_origin_session_progress(bool)	
+pg_replication_origin_session_reset()	
+pg_replication_origin_session_setup(text)	
+pg_replication_origin_xact_reset()	
+pg_replication_origin_xact_setup(pg_lsn,timestamptz)	
+pg_rotate_logfile()	
+pg_show_all_file_settings()	
+pg_show_replication_origin_status()	
+pg_stat_file(text)	
+pg_stat_file(text,bool)	
+pg_stat_have_stats(text,oid,oid)	
+pg_stat_reset()	
+pg_stat_reset_replication_slot(text)	
+pg_stat_reset_shared(text)	
+pg_stat_reset_single_function_counters(oid)	
+pg_stat_reset_single_table_counters(oid)	
+pg_stat_reset_slru(text)	
+pg_stat_reset_subscription_stats(oid)	
+pg_switch_wal()	
+pg_wal_replay_pause()	
+pg_wal_replay_resume()	
