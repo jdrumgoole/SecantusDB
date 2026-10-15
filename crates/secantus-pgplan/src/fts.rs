@@ -433,172 +433,6 @@ const ENGLISH_STOP: &[&str] = &[
 enum Kind {
     /// A word (possibly a hyphenated compound or part): stemmed by `english`.
     Word,
-    /// Anything else indexed -- numbers, emails, hosts, URLs: `simple`.
-    Other,
-}
-
-/// Split text into the tokens the default parser indexes, in order.
-fn tokens(text: &str) -> Vec<(String, Kind)> {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    let mut out = Vec::new();
-    let mut i = 0;
-    let is_word = word_char;
-    while i < n {
-        let c = chars[i];
-        // A protocol (`http://`) is a token no configuration indexes; the
-        // URL after it is.
-        if c.is_ascii_alphabetic() {
-            let rest: String = chars[i..n.min(i + 10)].iter().collect();
-            let lower = rest.to_ascii_lowercase();
-            if let Some(p) = ["https://", "http://", "ftp://"]
-                .iter()
-                .find(|p| lower.starts_with(**p))
-            {
-                i += p.len();
-                continue;
-            }
-        }
-        let at_boundary = i == 0 || !is_word(chars[i - 1]);
-        let signed = c == '-' && i + 1 < n && chars[i + 1].is_ascii_digit() && at_boundary;
-        let path = c == '/'
-            && i + 1 < n
-            && is_word(chars[i + 1])
-            && (i == 0 || chars[i - 1].is_whitespace());
-        if !is_word(c) && !signed && !path {
-            i += 1;
-            continue;
-        }
-        // The longest run of word characters and inner connectors.
-        let start = i;
-        let mut j = i;
-        if chars[j] == '-' || chars[j] == '/' {
-            j += 1;
-        }
-        while j < n {
-            let c = chars[j];
-            let joiner = matches!(c, '-' | '.' | '@' | '/' | '_' | '+')
-                && j + 1 < n
-                && is_word(chars[j + 1])
-                && j > start;
-            if is_word(c) || joiner {
-                j += 1;
-            } else {
-                break;
-            }
-        }
-        let raw: String = chars[start..j].iter().collect();
-        i = j;
-        emit(&raw, &mut out);
-    }
-    out
-}
-
-fn all_digits(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
-}
-
-fn is_number(s: &str) -> bool {
-    let body = s.strip_prefix('-').unwrap_or(s);
-    if all_digits(body) {
-        return true;
-    }
-    // float, version, sfloat (`1e5`, `1.5e-3`)
-    let (mant, exp) = match body.find(['e', 'E']) {
-        Some(p) => (&body[..p], Some(&body[p + 1..])),
-        None => (body, None),
-    };
-    let mant_ok = !mant.is_empty() && mant.split('.').all(all_digits);
-    let exp_ok = exp.is_none_or(|e| all_digits(e.strip_prefix(['-', '+']).unwrap_or(e)));
-    mant_ok && exp_ok
-}
-
-fn is_host(s: &str) -> bool {
-    let labels: Vec<&str> = s.split('.').collect();
-    labels.len() >= 2
-        && labels
-            .iter()
-            .all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
-        && labels
-            .last()
-            .is_some_and(|l| l.len() >= 2 && l.chars().all(|c| c.is_ascii_alphabetic()))
-}
-
-/// Classify one connected run into the tokens PostgreSQL's parser emits.
-fn emit(raw: &str, out: &mut Vec<(String, Kind)>) {
-    if is_number(raw) {
-        out.push((raw.to_string(), Kind::Other));
-        return;
-    }
-    if let Some((local, host)) = raw.split_once('@') {
-        if !local.is_empty() && is_host(host) && !host.contains('@') {
-            out.push((raw.to_string(), Kind::Other));
-            return;
-        }
-    }
-    if let Some(slash) = raw.find('/') {
-        let (host, path) = raw.split_at(slash);
-        if is_host(host) {
-            out.push((raw.to_string(), Kind::Other));
-            out.push((host.to_string(), Kind::Other));
-            out.push((path.to_string(), Kind::Other));
-            return;
-        }
-    }
-    if is_host(raw) {
-        out.push((raw.to_string(), Kind::Other));
-        return;
-    }
-    // A path, or a dotted run of alphanumerics (`v1.2.3`, `file.txt`), is
-    // one token.
-    if raw.starts_with('/')
-        || (raw.contains('.')
-            && raw
-                .split('.')
-                .all(|seg| !seg.is_empty() && seg.chars().all(word_char)))
-    {
-        out.push((raw.to_string(), Kind::Other));
-        return;
-    }
-    // Split on the connectors that are not part of a word token.
-    let mut pieces: Vec<&str> = Vec::new();
-    for seg in raw.split(['.', '@', '/', '_', '+']) {
-        if !seg.is_empty() {
-            pieces.push(seg);
-        }
-    }
-    for seg in pieces {
-        let parts: Vec<&str> = seg.split('-').filter(|p| !p.is_empty()).collect();
-        let word_like = |p: &str| p.chars().any(letter_char);
-        if parts.len() > 1
-            && seg.split('-').all(|p| !p.is_empty())
-            && parts.iter().any(|p| word_like(p))
-        {
-            // A hyphenated word: the compound, then each part.
-            let numeric = parts.iter().any(|p| p.chars().any(|c| c.is_ascii_digit()));
-            out.push((
-                seg.to_string(),
-                if numeric { Kind::Other } else { Kind::Word },
-            ));
-            for p in parts {
-                let kind = if p.chars().any(|c| c.is_ascii_digit()) {
-                    Kind::Other
-                } else {
-                    Kind::Word
-                };
-                out.push((p.to_string(), kind));
-            }
-        } else {
-            for p in parts {
-                let kind = if is_number(p) || p.chars().any(|c| c.is_ascii_digit()) {
-                    Kind::Other
-                } else {
-                    Kind::Word
-                };
-                out.push((p.to_string(), kind));
-            }
-        }
-    }
 }
 
 /// A letter to PostgreSQL's parser under the UTF-8 locale this server
@@ -633,7 +467,7 @@ fn normalise(token: &str, kind: Kind, cfg: Config) -> Option<String> {
         }
     };
     match (cfg, kind) {
-        (Config::Simple, _) | (_, Kind::Other) => Some(lower),
+        (Config::Simple, _) => Some(lower),
         (Config::English, Kind::Word) => english(lower),
         // `russian` sends its ASCII words to english_stem.
         (Config::Snowball(Lang::Russian), Kind::Word) if lower.is_ascii() => english(lower),
@@ -647,23 +481,60 @@ fn normalise(token: &str, kind: Kind, cfg: Config) -> Option<String> {
     }
 }
 
+/// The dictionary a built-in configuration maps a parser token type to, and
+/// that dictionary's `ts_lexize` of `token` -- `ts_debug`'s `dictionary` and
+/// `lexemes` (`[]` for a stop-word). `None` for the types no configuration
+/// maps (blank, tag, protocol, entity). Every built-in configuration has the
+/// same map (`pg_ts_config_map`, dumped from PostgreSQL 15): the six word
+/// types go to the language's Snowball stemmer, except that `russian` and
+/// `hindi` send the three ASCII ones to `english_stem`; every other type
+/// goes to `simple`.
+pub(crate) fn debug_lexize(cfg: Config, toktype: u8, token: &str) -> Option<(String, Vec<String>)> {
+    use crate::wparser as w;
+    let ascii = matches!(toktype, w::ASCIIWORD | w::ASCIIPARTHWORD | w::ASCIIHWORD);
+    let word = ascii || matches!(toktype, w::WORD_T | w::PARTHWORD | w::HWORD);
+    if matches!(toktype, w::SPACE | w::TAG_T | w::PROTOCOL | w::XMLENTITY) {
+        return None;
+    }
+    let lower: String = token.chars().map(crate::scalar::simple_lower).collect();
+    let stemmed = |stop: bool, stem: String| if stop { Vec::new() } else { vec![stem] };
+    Some(match cfg {
+        Config::Snowball(l) if word && !(ascii && matches!(l, Lang::Russian | Lang::Hindi)) => (
+            format!("{}_stem", l.name()),
+            stemmed(l.is_stop(&lower), l.stem(&lower)),
+        ),
+        Config::English | Config::Snowball(_) if word => (
+            "english_stem".into(),
+            stemmed(ENGLISH_STOP.contains(&lower.as_str()), stem(&lower)),
+        ),
+        _ => ("simple".into(), vec![lower]),
+    })
+}
+
 /// PostgreSQL's longest indexable lexeme, in bytes.
 const MAX_LEXEME: usize = 2047;
 /// The largest position; later ones are clamped to it.
 const MAX_POS: u16 = 16383;
 
 /// `(position, lexeme)` for every indexed token; a stop-word yields a
-/// position with no lexeme.
+/// position with no lexeme. The tokens are the default parser's
+/// (`wparser.rs`), each through the dictionary its type maps to; a type no
+/// dictionary takes (a blank, a tag) takes no position.
 fn parse_document(text: &str, cfg: Config) -> Vec<(u16, Option<String>)> {
     let mut out = Vec::new();
     let mut pos: u16 = 0;
-    for (tok, kind) in tokens(text) {
-        if tok.len() > MAX_LEXEME {
+    for (ty, tok) in crate::wparser::parse(text) {
+        // `parsetext`'s `lenlemm >= MAXSTRLEN`: a token of 2047 bytes is
+        // already too long (measured), whatever its type.
+        if tok.len() >= MAX_LEXEME {
             notice("word is too long to be indexed");
             continue;
         }
+        let Some((_, lexemes)) = debug_lexize(cfg, ty, &tok) else {
+            continue;
+        };
         pos = (pos + 1).min(MAX_POS);
-        out.push((pos, normalise(&tok, kind, cfg)));
+        out.push((pos, lexemes.into_iter().next()));
     }
     out
 }
@@ -2406,6 +2277,7 @@ const FUNCTIONS: &[&str] = &[
     "get_current_ts_config",
     "ts_rank",
     "ts_rank_cd",
+    "ts_rewrite",
 ];
 
 /// Is `name` one of the full-text functions?
@@ -2425,7 +2297,8 @@ pub fn result_type(name: &str) -> Option<&'static str> {
         | "tsquery_and"
         | "tsquery_or"
         | "tsquery_not"
-        | "tsquery_phrase" => "tsquery",
+        | "tsquery_phrase"
+        | "ts_rewrite" => "tsquery",
         "tsvector_to_array" => "text[]",
         "numnode" | "tsvector_length" => "int4",
         "querytree" | "ts_headline" => "text",
@@ -2566,6 +2439,53 @@ fn query_out(q: &Option<Query>) -> Bson {
     Bson::String(render_query(q))
 }
 
+/// `ts_rewrite(query, select)`: the SELECT must return two tsquery
+/// columns (`22023` otherwise, checked on the rows it returns: a query
+/// returning no rows rewrites nothing and is not checked), and its rows are
+/// applied in the order it returns them.
+fn rewrite_by_query(q: &Option<Query>, sql: &str) -> Result<Option<Query>> {
+    if q.is_none() {
+        return Ok(None);
+    }
+    let rows = crate::correlated::run_sql(sql)?;
+    let bad = || {
+        Error::Sqlstate(
+            "22023",
+            "ts_rewrite query must return two tsquery columns".into(),
+        )
+    };
+    if let Some(first) = rows.first() {
+        if first.len() != 2 {
+            return Err(bad());
+        }
+        let types = crate::correlated::run_sql(&format!(
+            "select pg_typeof(s.a)::text, pg_typeof(s.b)::text from ({sql}) s(a, b) limit 1"
+        ))?;
+        let tsquery = |v: Option<&Bson>| v.is_some_and(|v| text_of(v) == "tsquery");
+        if !types
+            .first()
+            .is_some_and(|t| tsquery(t.first()) && tsquery(t.get(1)))
+        {
+            return Err(bad());
+        }
+    }
+    // The rows are tsquery VALUES, not input: an empty one raises no
+    // "doesn't contain lexemes" notice.
+    let stored = |v: &Bson| {
+        let n = notices_len();
+        let q = query_arg(v);
+        truncate_notices(n);
+        q
+    };
+    crate::ts_rewrite::rewrite_rows(
+        q,
+        rows.iter().map(|r| match (&r[0], &r[1]) {
+            (Bson::Null, _) | (_, Bson::Null) => Ok(None),
+            (ex, subs) => Ok(Some((stored(ex)?, stored(subs)?))),
+        }),
+    )
+}
+
 /// Evaluate a full-text function. `None`: not one of these.
 pub fn call(name: &str, args: &[Bson]) -> Option<Result<Bson>> {
     if !is_function(name) {
@@ -2683,6 +2603,15 @@ fn call_inner(name: &str, args: &[Bson]) -> Result<Bson> {
             });
             Ok(vector_out(&v))
         }
+        "ts_rewrite" => match args {
+            [q, ex, subs] => Ok(query_out(&crate::ts_rewrite::rewrite(
+                &query_arg(q)?,
+                &query_arg(ex)?,
+                &query_arg(subs)?,
+            ))),
+            [q, sql] => rewrite_by_query(&query_arg(q)?, &text_of(sql)).map(|q| query_out(&q)),
+            _ => Err(wrong(name)),
+        },
         "numnode" => Ok(Bson::Int32(numnode(&query_arg(&args[0])?))),
         "querytree" => Ok(Bson::String(querytree(&query_arg(&args[0])?))),
         "tsquery_and" | "tsquery_or" => {
