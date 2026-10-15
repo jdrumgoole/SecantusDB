@@ -164,28 +164,27 @@ Size: two batches; 1a is the larger one.
       `electionCandidateMetrics`. (`replSetReconfig` is RM-143.)
 - [x] Commands not there: `lockInfo`, `features`, `getClusterParameter`,
       the plan-cache commands. (`$listCatalog` is below.)
-- [ ] `serverStatus` sections (about 30), each only with numbers this server
-      really has; a section with nothing true to say stays absent (RM-034).
-- [ ] `listDatabases` lists `config` (it needs `config.system.sessions`,
-      which mongod flushes sessions to); `connectionStatus` privileges;
-      `$indexStats` use counts; `collStats` `wiredTiger` (RM-040). Done:
-      `admin`, `hostInfo` `system`, `dbStats` view definitions.
-- [x] Runtime-settable parameters `cursorTimeoutMillis`,
-      `transactionLifetimeLimitSeconds`.
-- [ ] `notablescan` (RM-035), decided 2026-10-15: refuse with 291 a query
-      the `explain` planner answers with a collection scan; an empty filter
-      runs; mongod's code and closing words, not its query-tree text.
-- [ ] `$listCatalog` (RM-040), decided 2026-10-15: build it from this
-      server's catalog; `ident` is the shard table holding the collection,
-      `idxIdent` the shared index table, no `multikeyPaths`.
+- [x] `serverStatus` sections from real counters (RM-034); `locks` stays
+      absent, as there is no lock manager to count.
+- [x] `$indexStats` use counts; `$listCatalog` from this server's own
+      catalog (decided 2026-10-15).
+- [x] `notablescan` (RM-035, decided 2026-10-15): 291 for a query the
+      `explain` planner answers with a collection scan.
+- [x] The profiler (RM-038) and `OP_COMPRESSED` (RM-039).
 - Decided 2026-10-15: `buildInfo.secantusVersion` and `serverStatus.secantus`
   stay (a scope decision in 7.082).
-- [ ] The profiler (RM-038) and `OP_COMPRESSED` (RM-039).
+- Left, in the backlog: `listDatabases` lists `config` (it needs
+  `config.system.sessions`, which mongod flushes sessions to);
+  `connectionStatus` privileges; `collStats.wiredTiger` (no per-collection
+  table to report); `validate` with `background: true` (RM-033);
+  `scramIterationCount` at runtime (RM-035); the opcode and exhaust items
+  found in batch 2 (RM-144 to RM-147).
 
-  **Batch 1 done 2026-10-15** (branch `rust-admin-diag`). Found on the way
-  and fixed: writes to `local` were logged in the oplog, and `find`'s
-  raw projection path sorted the fields. Batch 2 is `serverStatus`, the
-  remaining RM-040 pieces, the profiler and compression.
+  **Done 2026-10-15** in two batches (`rust-admin-diag`, then
+  `rust-admin-diag-2`, built by five agents in parallel). Found on the way
+  and fixed: writes to `local` were logged in the oplog; `find`'s raw
+  projection path sorted the fields; `serverStatus` failed outright on a
+  store opened without WiredTiger statistics.
 
 Size: two batches.
 

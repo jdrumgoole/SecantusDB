@@ -27,7 +27,7 @@ def test_date_from_parts_month_out_of_range_is_refused(rust_mongo: Any) -> None:
     assert _code(mongo_answer(lambda: list(db.aggregate(pipeline)))) == ("err", 31034)
 
 
-@pytest.mark.backlog("RM-140")
+@pytest.mark.backlog_fixed("RM-140")
 def test_profile_accepts_a_negative_slowms(rust_mongo: Any) -> None:
     """mongod 8.2.11 accepts `profile` with `slowms: -1` at levels 0 and 1
     and reads it back; the Rust server refused it (2)."""

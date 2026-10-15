@@ -22,3 +22,7 @@ crate-type = ["rlib"]
 
 [dependencies]
 bson = { workspace = true }
+# OP_COMPRESSED (2012): mongod's three default network compressors.
+snap = "1"
+flate2 = "1"
+zstd = { version = "0.13", default-features = false }

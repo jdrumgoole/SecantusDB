@@ -59,13 +59,17 @@ pub mod find;
 pub mod findandmodify;
 pub mod handshake;
 mod hostinfo;
+mod list_catalog;
 pub mod logbuf;
 pub mod mapreduce;
 pub mod mongod_codes;
 mod mongod_commands;
 mod near;
+mod notablescan;
 pub mod params;
 mod privileges;
+mod procstats;
+pub mod profiler;
 pub mod rbac;
 mod replset_admin;
 pub mod roles;
@@ -74,6 +78,7 @@ pub mod serverinfo;
 mod session;
 pub mod slowop;
 mod stats_admin;
+pub mod status;
 pub mod stepdown;
 pub mod storage;
 mod timeseries;
@@ -206,6 +211,16 @@ pub struct CommandContext {
     /// `profile`. `None` off-server (unit tests) ⇒ `profile` keeps the values
     /// with the database's profiling level, as it always did.
     pub slow_ops: Option<Arc<slowop::SlowOpSettings>>,
+    /// Every database's profiling level and filter, shared server-wide. A
+    /// context without one gets its own on the first `profile` command.
+    pub profiler: Option<Arc<profiler::Profiler>>,
+    /// The operation `dispatch` is profiling, from its start to its end.
+    pub(crate) profiling: Option<profiler::Pending>,
+    /// The request came as a legacy `OP_QUERY`, and is answered `OP_REPLY`.
+    pub op_query: bool,
+    /// Set when the database has a profile filter: whether the filter
+    /// matched, which decides the slow-query log line in place of `slowms`.
+    pub slow_log: Option<bool>,
     /// Time this request spent WAITING for data rather than working: an
     /// awaitData `getMore` blocked on the oplog. Left out of the time the
     /// slow-operation log measures, or every idle change stream would log a
@@ -268,6 +283,10 @@ impl CommandContext {
             conn_stats: None,
             top_stats: None,
             slow_ops: None,
+            profiler: None,
+            profiling: None,
+            op_query: false,
+            slow_log: None,
             awaited: std::cell::Cell::new(std::time::Duration::ZERO),
             pending_batch: None,
             raw_insert_documents: None,
@@ -320,6 +339,12 @@ impl CommandContext {
     /// Attach the server-wide slow-operation settings (builder-style).
     pub fn with_slow_ops(mut self, settings: Arc<slowop::SlowOpSettings>) -> Self {
         self.slow_ops = Some(settings);
+        self
+    }
+
+    /// Attach the server-wide profiler settings (builder-style).
+    pub fn with_profiler(mut self, profiler: Arc<profiler::Profiler>) -> Self {
+        self.profiler = Some(profiler);
         self
     }
 
@@ -660,10 +685,15 @@ fn configure_fail_point(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
 /// are shaped into `ok: 0`), so the connection survives any single command.
 pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     handshake::process_started();
-    if let Some(stats) = &ctx.top_stats {
+    let started = std::time::Instant::now();
+    let stats = ctx.top_stats.clone();
+    if let Some(stats) = &stats {
         stats.count_op(doc);
     }
     let name = command_name(doc);
+    let _active = stats
+        .as_ref()
+        .map(|s| s.status.activate(status::OpKind::of(name)));
     // The write concern a write with none of its own is held to: the stored
     // default, read BEFORE the command runs, so `setDefaultRWConcern`'s own
     // write answers for the default it replaces (mongod's order).
@@ -681,7 +711,29 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     } else {
         0
     };
+    ctx.profiling = profiler::begin(name, doc, ctx);
     let mut reply = dispatch_inner(doc, ctx);
+    // An unacknowledged write's reply is zeroed below; its profile entry
+    // records what it did.
+    let inner_n = ctx.profiling.as_ref().and_then(|_| match reply.get("n") {
+        Some(Bson::Int32(n)) => Some(i64::from(*n)),
+        Some(Bson::Int64(n)) => Some(*n),
+        _ => None,
+    });
+    // `dropDatabase` resets the database's profiling settings (measured
+    // 8.2.11: the level and filter are gone afterwards).
+    if name == "dropDatabase" && reply.get_f64("ok").unwrap_or(0.0) == 1.0 {
+        if let Some(p) = &ctx.profiler {
+            p.forget(&ctx.db_name);
+        }
+    }
+    // Counted before a `w: 0` write's reply is emptied: mongod counts what
+    // the write did, not what it told the client.
+    if let Some(stats) = &stats {
+        let pending = ctx.pending_batch.as_ref().map_or(0, |b| b.batch.len());
+        stats.status.record(doc, &reply, pending, started.elapsed());
+        status_authentication(&stats.status, name, doc, &reply, ctx, started);
+    }
     // A user or role may have changed: every connection's effective
     // privileges are recomputed on its next command (`rbac::effective`).
     if umc::is_user_or_role_command(name) || name == "secantusAdmin.restoreArchive" {
@@ -706,7 +758,52 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     }
     attach_cluster_time_gossip(doc, &mut reply, ctx);
     order_write_reply(doc, &mut reply);
+    profiler::finish(name, doc, inner_n, &reply, ctx);
     reply
+}
+
+/// Count an authentication for `serverStatus.security` (measured 8.2.11): a
+/// `saslStart` or `authenticate` is one received; it succeeds when the
+/// conversation ends `done`, and its time runs from the first command to the
+/// last.
+fn status_authentication(
+    counters: &status::StatusCounters,
+    name: &str,
+    doc: &Document,
+    reply: &Document,
+    ctx: &CommandContext,
+    started: std::time::Instant,
+) {
+    if matches!(name, "hello" | "isMaster" | "ismaster") {
+        if doc.contains_key("saslSupportedMechs") {
+            counters.sasl_supported_mechs_received();
+        }
+        return;
+    }
+    if !matches!(name, "saslStart" | "saslContinue" | "authenticate") {
+        return;
+    }
+    let ok = reply.get_f64("ok").unwrap_or(0.0) == 1.0;
+    let done = !ok || name == "authenticate" || reply.get_bool("done").unwrap_or(false);
+    let Some(auth) = ctx.conn_auth.as_ref() else {
+        return;
+    };
+    let mut auth = auth.lock().unwrap_or_else(|e| e.into_inner());
+    let begun = if name == "saslContinue" {
+        auth.auth_started.take()
+    } else {
+        let mechanism = doc.get_str("mechanism").unwrap_or("").to_string();
+        counters.authentication_received(&mechanism);
+        Some((mechanism, started))
+    };
+    let Some((mechanism, since)) = begun else {
+        return;
+    };
+    if done {
+        counters.authentication_ended(&mechanism, ok, since.elapsed());
+    } else {
+        auth.auth_started = Some((mechanism, since));
+    }
 }
 
 /// A write sent with `w: 0` asked not to be told what happened, and mongod
@@ -1433,8 +1530,7 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
             if let Some(e) = reject_synthetic_view_write(name, doc, &ctx.db_name) {
                 return e.into_reply();
             }
-            // Time profile-eligible commands so dispatch can record a
-            // `system.profile` entry when the per-database level requires it.
+            // A time-series bucket namespace and a view answer here.
             // (A statement of a transaction is refused inside it, in
             // `session`, because the refusal aborts the transaction.)
             if doc.get("autocommit") != Some(&Bson::Boolean(false)) {
@@ -1446,7 +1542,7 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
                     return reply;
                 }
             }
-            let start = profile_eligible(name, doc).then(std::time::Instant::now);
+            profiler::mark_reached(ctx);
             let mut reply = session::run(name, handler, doc, ctx);
             // A failpoint-configured writeConcernError attaches to a successful reply,
             // AND so do the failpoint's errorLabels. The labels are what make the
@@ -1473,9 +1569,6 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
                         }
                     }
                 }
-            }
-            if let Some(start) = start {
-                maybe_record_profile(name, doc, &reply, start, ctx);
             }
             reply
         }
@@ -1636,112 +1729,6 @@ fn abort_transaction(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
             Some(reply) => Ok(reply),
         },
         _ => Ok(doc! { "ok": 1.0 }),
-    }
-}
-
-/// Commands dispatch never profiles (handshake / auth / session / cursor
-/// framing + `profile` itself), mirroring `commands.py::_PROFILE_SKIP_COMMANDS`.
-fn profile_skip_command(name: &str) -> bool {
-    matches!(
-        name,
-        "hello"
-            | "isMaster"
-            | "ismaster"
-            | "ping"
-            | "buildInfo"
-            | "buildinfo"
-            | "whatsmyuri"
-            | "saslStart"
-            | "saslContinue"
-            | "logout"
-            | "connectionStatus"
-            | "startSession"
-            | "endSessions"
-            | "refreshSessions"
-            | "getMore"
-            | "killCursors"
-            | "profile"
-    )
-}
-
-/// Whether dispatch should time + maybe record this command in `system.profile`.
-/// Excludes framing commands and any op against `system.profile` itself (a
-/// recursion / unbounded-growth guard). Mirrors `_profile_eligible_command`.
-fn profile_eligible(name: &str, doc: &Document) -> bool {
-    if profile_skip_command(name) {
-        return false;
-    }
-    !matches!(doc.get(name), Some(Bson::String(s)) if s == "system.profile")
-}
-
-/// mongod's profiler `op` bucket for a command (`find` → `query`, writes →
-/// `insert`/`update`/`remove`, everything else → `command`).
-fn profile_op_label(name: &str) -> &'static str {
-    match name {
-        "find" => "query",
-        "insert" => "insert",
-        "update" => "update",
-        "delete" => "remove",
-        _ => "command",
-    }
-}
-
-/// The mongod-shaped `system.profile` entry for a finished command, recorded
-/// when the per-database profiling level requires it. Ports
-/// `commands.py::_maybe_record_profile` (sample-rate skipping omitted — the
-/// gauge uses the default rate of 1.0). Failures are swallowed: the command
-/// already produced its reply.
-fn maybe_record_profile(
-    name: &str,
-    doc: &Document,
-    reply: &Document,
-    start: std::time::Instant,
-    ctx: &CommandContext,
-) {
-    let Some(storage) = ctx.storage.clone() else {
-        return;
-    };
-    let db = ctx.db_name.clone();
-    let Ok(settings) = storage.get_profile(&db) else {
-        return;
-    };
-    let level = settings.get_i32("level").unwrap_or(0);
-    if level == 0 {
-        return;
-    }
-    let duration_ms = start.elapsed().as_millis() as i64;
-    let slowms = settings.get_i32("slowms").unwrap_or(100) as i64;
-    if level == 1 && duration_ms < slowms {
-        return;
-    }
-    // `ns`: db.coll when the command names a collection, else db.
-    let ns = match doc.get(name) {
-        Some(Bson::String(c)) if !c.is_empty() => format!("{db}.{c}"),
-        _ => db.clone(),
-    };
-    // `command`: the request minus framing fields.
-    let mut command = doc.clone();
-    for k in ["$db", "$clusterTime", "lsid", "$readPreference"] {
-        command.remove(k);
-    }
-    let ok = reply.get_f64("ok").unwrap_or(0.0) == 1.0;
-    let mut entry = doc! {
-        "ts": bson::DateTime::now(),
-        "op": profile_op_label(name),
-        "ns": ns,
-        "command": command,
-        "millis": duration_ms as i32,
-        "ok": if ok { 1.0 } else { 0.0 },
-        "client": "",
-    };
-    if !ok {
-        if let Ok(em) = reply.get_str("errmsg") {
-            entry.insert("errMsg", em.to_string());
-        }
-    }
-    let mut bytes = Vec::new();
-    if entry.to_writer(&mut bytes).is_ok() {
-        let _ = storage.insert(&db, "system.profile", vec![bytes], true);
     }
 }
 

@@ -572,6 +572,150 @@ fn index_names(node: &Node, out: &mut Vec<String>) {
     }
 }
 
+thread_local! {
+    /// Set while `explain` runs a command for what it says of itself: an
+    /// explained plan uses no index (measured 8.2.11).
+    static UNCOUNTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` without counting the indexes its plans read.
+pub(crate) fn uncounted<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            UNCOUNTED.with(|u| u.set(self.0));
+        }
+    }
+    let _restore = Restore(UNCOUNTED.with(|u| u.replace(true)));
+    f()
+}
+
+/// What a command does with the documents a plan reads, for counting the
+/// indexes it uses.
+#[derive(Clone, Copy)]
+pub(crate) enum Uses<'a> {
+    Find,
+    Count,
+    Distinct(&'a str),
+    /// An update (`delete` false) or a delete; `returns`: findAndModify.
+    Write {
+        delete: bool,
+        multi: bool,
+        upsert: bool,
+        returns: bool,
+    },
+}
+
+/// Count one use of each index the plan for `ask` reads, as mongod counts
+/// one per plan it runs, however many documents or batches it returns
+/// (`$indexStats`' `accesses.ops`; measured 8.2.11: two finds through
+/// `a_1` are 2, a `getMore` and an `explain` count nothing).
+pub(crate) fn count_index_use(storage: &dyn Storage, ask: &Ask, uses: Uses) {
+    if UNCOUNTED.with(std::cell::Cell::get) {
+        return;
+    }
+    // A read of everything in storage order reads no index.
+    if ask.filter.is_empty()
+        && ask.sort.is_none_or(|s| s.is_empty())
+        && ask.hint.is_none()
+        && !matches!(uses, Uses::Distinct(_))
+    {
+        return;
+    }
+    let Ok(catalog) = catalog(storage, ask.db, ask.coll, None) else {
+        return;
+    };
+    if catalog.is_empty() {
+        return;
+    }
+    // `{_id: <value>}` with no hint or sort is a lookup in the `_id` index
+    // for every command (mongod's express and IDHACK plans), when the value
+    // is one no collation compares differently.
+    if ask.hint.is_none()
+        && ask.sort.is_none_or(|s| s.is_empty())
+        && ask.filter.len() == 1
+        && ask.filter.get("_id").is_some_and(|v| {
+            !matches!(
+                v,
+                Bson::Document(_)
+                    | Bson::Array(_)
+                    | Bson::String(_)
+                    | Bson::Symbol(_)
+                    | Bson::RegularExpression(_)
+            )
+        })
+        && catalog.iter().any(|ix| ix.name == "_id_")
+    {
+        storage.record_index_use(ask.db, ask.coll, &["_id_".to_string()]);
+        return;
+    }
+    let canonical = parsed::parsed_query(ask.filter);
+    let implied = |partial: &Document| storage.query_implies_partial(ask.filter, partial);
+    let Ok(hint) = resolve_hint(ask.hint, &catalog) else {
+        return;
+    };
+    let query = Query {
+        canonical: &canonical,
+        sort: ask.sort,
+        projection: None,
+        skip: 0,
+        limit: ask.limit,
+        hint,
+        collation: ask.collation,
+        min_max: false,
+        return_key: false,
+        show_record_id: false,
+        batch_size: false,
+        keys_only: false,
+        wanted: None,
+        implies: &implied,
+        trial: None,
+    };
+    let node = match uses {
+        Uses::Find => plan::plan(&query, &catalog),
+        Uses::Count => plan::count(&query, &catalog),
+        Uses::Distinct(key) => plan::distinct(&query, &catalog, key),
+        Uses::Write {
+            delete,
+            multi,
+            upsert,
+            returns,
+        } => plan::write(&query, &catalog, delete, multi, upsert, returns),
+    };
+    let mut names = Vec::new();
+    used_indexes(&node, &mut names);
+    names.dedup();
+    storage.record_index_use(ask.db, ask.coll, &names);
+}
+
+/// Every index a plan reads, into `out`: its scans, and the `_id` index a
+/// lookup by `_id` reads.
+fn used_indexes(node: &Node, out: &mut Vec<String>) {
+    match node {
+        Node::IxScan(ix) | Node::CountScan(ix) | Node::DistinctScan(ix, _) => {
+            out.push(ix.index.name.clone())
+        }
+        Node::Express { index, .. } | Node::ExpressWrite { index, .. } => {
+            out.push(index.name.clone())
+        }
+        Node::IdHack(_) => out.push("_id_".to_string()),
+        Node::Fetch { input, .. }
+        | Node::Sort { input, .. }
+        | Node::Skip(_, input)
+        | Node::Limit(_, input)
+        | Node::Projection { input, .. }
+        | Node::ReturnKey(input)
+        | Node::Subplan(input)
+        | Node::Count(input)
+        | Node::Update(input)
+        | Node::Delete { input, .. } => used_indexes(input, out),
+        Node::Or(inputs) | Node::SortMerge { inputs, .. } => {
+            inputs.iter().for_each(|n| used_indexes(n, out))
+        }
+        _ => {}
+    }
+}
+
 /// `Storage::find_collated`, in mongod's order.
 pub(crate) fn find(storage: &dyn Storage, ask: &Ask) -> Result<Vec<Vec<u8>>, StorageError> {
     match ordered_rows(storage, ask)? {

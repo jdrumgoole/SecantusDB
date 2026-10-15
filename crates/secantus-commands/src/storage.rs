@@ -791,6 +791,20 @@ pub trait Storage: Send + Sync {
     /// a setting alone. Default: nothing to set.
     fn set_ttl_monitor(&self, _sleep_secs: Option<i64>, _enabled: Option<bool>) {}
 
+    /// The storage engine's own statistics, `(description, value)` in its
+    /// order, and its version string: what `serverStatus.wiredTiger` reports.
+    /// Default: `None`, a backend that is not WiredTiger.
+    #[allow(clippy::type_complexity)]
+    fn engine_statistics(&self) -> Option<Result<(String, Vec<(String, i64)>), StorageError>> {
+        None
+    }
+
+    /// Writes queued for an admission ticket right now. Default: 0, a backend
+    /// with no admission control, where no write ever waits for one.
+    fn writes_waiting(&self) -> usize {
+        0
+    }
+
     /// Run TTL pruning across every collection, returning the number of docs
     /// deleted. Backs `secantusAdmin.pruneTtl` — an immediate pass (the WT
     /// backend also sweeps on a background cadence). Default: unsupported; the
@@ -909,6 +923,34 @@ pub trait Storage: Send + Sync {
     /// `dbStats`.
     fn index_sizes(&self, _db: &str, _coll: &str) -> Result<Document, StorageError> {
         Ok(Document::new())
+    }
+
+    /// The WiredTiger table that holds the collection's documents, for
+    /// `$listCatalog`'s `ident`. `None` from a store that has no such table.
+    fn collection_ident(&self, _db: &str, _coll: &str) -> Option<String> {
+        None
+    }
+
+    /// The WiredTiger table that holds index `name`'s entries, for
+    /// `$listCatalog`'s `idxIdent`.
+    fn index_ident(&self, _db: &str, _coll: &str, _name: &str) -> Option<String> {
+        None
+    }
+
+    /// Count one use of each of `names`, the indexes a plan just read
+    /// (`$indexStats`' `accesses.ops`).
+    fn record_index_use(&self, _db: &str, _coll: &str, _names: &[String]) {}
+
+    /// How many times index `name` has been used, and since when: the
+    /// moment it was created, or (`None`) since this process began. `None`
+    /// altogether when nothing is known of it.
+    fn index_use(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _name: &str,
+    ) -> Option<(i64, Option<bson::DateTime>)> {
+        None
     }
 
     // --- users (R5 auth) ----------------------------------------------------

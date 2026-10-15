@@ -1051,7 +1051,10 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         Some(Bson::Document(vars)) => argtypes::let_problem(vars),
         _ => None,
     };
+    // Each statement that runs is profiled on its own.
+    let mut statements = crate::profiler::Statements::start();
     for (index, spec) in deletes.iter().copied().enumerate() {
+        statements.close(n, 0, 0, &write_errors);
         let Bson::Document(spec) = spec else { continue };
         let mut refused: Option<(i32, String)> = let_problem.clone();
         if refused.is_none() {
@@ -1133,6 +1136,28 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // nothing else and refuses the whole command before any statement
         // runs (`write_command_problem`).
         let limit = delete_limit(spec.get("limit"))?;
+        statements.delete(&ctx.db_name, &coll, spec, n, write_errors.len());
+        if let Err(e) = crate::notablescan::check(
+            ctx,
+            &crate::notablescan::Read {
+                coll: &coll,
+                filter: &filter,
+                sort: None,
+                hint: argtypes::given_hint(spec),
+                collation: collation.as_ref(),
+            },
+        ) {
+            write_errors.push(Bson::Document(doc! {
+                "index": index as i32,
+                "code": e.code,
+                "errmsg": e.errmsg,
+            }));
+            if ordered {
+                break;
+            }
+            continue;
+        }
+        let statement_started = std::time::Instant::now();
         // A delete of ONE document removes the first its query matches in
         // the order mongod reads them.
         let first = if limit == 1 {
@@ -1165,9 +1190,36 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 argtypes::given_hint(spec),
             )
         });
+        if deleted.is_ok() {
+            crate::explain::order::count_index_use(
+                storage,
+                &crate::explain::order::Ask {
+                    db: &ctx.db_name,
+                    coll: &coll,
+                    filter: &filter,
+                    sort: None,
+                    hint: argtypes::given_hint(spec),
+                    collation: collation.as_ref(),
+                    vars: &let_vars,
+                    limit: 0,
+                    asked: Default::default(),
+                },
+                crate::explain::order::Uses::Write {
+                    delete: true,
+                    multi: limit != 1,
+                    upsert: false,
+                    returns: false,
+                },
+            );
+        }
         match deleted {
             Ok(deleted) => {
                 n += deleted as i32;
+                if let (0, Some(stats)) = (limit, &ctx.top_stats) {
+                    stats
+                        .status
+                        .many_statement(false, deleted as u64, statement_started.elapsed());
+                }
                 if deleted > 0 {
                     crate::transactions::note_statement(
                         index,
@@ -1191,6 +1243,7 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
 
+    statements.close(n, 0, 0, &write_errors);
     let mut reply = doc! { "n": n, "ok": 1.0 };
     if !write_errors.is_empty() {
         reply.insert("writeErrors", write_errors);
@@ -1326,6 +1379,16 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .and_then(|d| d.get("n").and_then(as_i64))
             .unwrap_or(0)
     } else if let Some(hint) = argtypes::given_hint(doc) {
+        crate::notablescan::check(
+            ctx,
+            &crate::notablescan::Read {
+                coll: &coll,
+                filter: &filter,
+                sort: None,
+                hint: Some(hint),
+                collation: collation.as_ref(),
+            },
+        )?;
         // A `hint` forces a specific index; for an empty filter this still walks
         // that index, so hinting a sparse index counts only the docs present in
         // it (php-lib Count `testHintOption`). Count via the hinted find, which
@@ -1348,10 +1411,37 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             near.check_index(storage, &ctx.db_name, &coll, Default::default())
                 .map_err(command_error)?;
         }
+        crate::notablescan::check(
+            ctx,
+            &crate::notablescan::Read {
+                coll: &coll,
+                filter: &filter,
+                sort: None,
+                hint: None,
+                collation: collation.as_ref(),
+            },
+        )?;
         storage
             .count_collated(&ctx.db_name, &coll, &filter, collation.as_ref())
             .map_err(command_error)? as i64
     };
+    if view_on.is_none() {
+        crate::explain::order::count_index_use(
+            ctx.storage()?,
+            &crate::explain::order::Ask {
+                db: &ctx.db_name,
+                coll: &coll,
+                filter: &filter,
+                sort: None,
+                hint: argtypes::given_hint(doc),
+                collation: collation.as_ref(),
+                vars: &Document::new(),
+                limit: 0,
+                asked: Default::default(),
+            },
+            crate::explain::order::Uses::Count,
+        );
+    }
     if skip > 0 {
         n = n.saturating_sub(skip).max(0);
     }
@@ -1514,15 +1604,28 @@ fn update_command_problem(doc: &Document) -> Option<CommandError> {
 }
 
 pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    update_in(doc, &ctx.db_name, ctx.storage()?)
+    let notablescan = crate::notablescan::enabled(ctx);
+    update_in(
+        doc,
+        &ctx.db_name,
+        ctx.storage()?,
+        notablescan,
+        ctx.top_stats.as_deref(),
+    )
 }
 
 /// [`update`] against a named database: `$merge` writes its documents with
-/// it, as mongod writes them with the update command.
+/// it, as mongod writes them with the update command. `notablescan`: the
+/// server parameter is set, so a statement mongod would answer with a
+/// collection scan is refused (`$merge` passes false: its `on` fields have
+/// a unique index, so it never plans one). `status_counters` is the
+/// server's, when the statements are an `update` command's own.
 pub(crate) fn update_in(
     doc: &Document,
     db_name: &str,
     storage: &dyn crate::Storage,
+    notablescan: bool,
+    status_counters: Option<&crate::topstats::TopStats>,
 ) -> HandlerResult {
     argtypes::require_object(doc, "let", "update.let")?;
     argtypes::require_bool_field(doc, "ordered", "update.ordered")?;
@@ -1592,7 +1695,10 @@ pub(crate) fn update_in(
         _ => None,
     };
 
+    // Each statement that runs is profiled on its own.
+    let mut statements = crate::profiler::Statements::start();
     for (index, spec) in updates.iter().enumerate() {
+        statements.close(n, n_modified, upserted.len(), &write_errors);
         let Bson::Document(spec) = spec else { continue };
 
         argtypes::require_write_statement(spec, "update")?;
@@ -1727,6 +1833,29 @@ pub(crate) fn update_in(
         };
         let _active = secantus_core::collation::activate(collation.as_ref());
         let mut q = doc_field(spec, "q");
+        if notablescan {
+            if let Err(e) = crate::notablescan::check_in(
+                storage,
+                db_name,
+                &crate::notablescan::Read {
+                    coll: &coll,
+                    filter: &q,
+                    sort: sort_spec.as_ref(),
+                    hint: argtypes::given_hint(spec),
+                    collation: collation.as_ref(),
+                },
+            ) {
+                write_errors.push(Bson::Document(doc! {
+                    "index": index as i32,
+                    "code": e.code,
+                    "errmsg": e.errmsg,
+                }));
+                if ordered {
+                    break;
+                }
+                continue;
+            }
+        }
         if let Some(sort) = &sort_spec {
             // Resolve WHICH document sorts first, then pin the update to it.
             // Nothing matched -> leave the filter alone, so an upsert still
@@ -1832,6 +1961,7 @@ pub(crate) fn update_in(
         // The statement is still read first: a malformed one is refused.
         let absent = !upsert && !storage.collection_exists(db_name, &coll).unwrap_or(true);
 
+        let statement_started = std::time::Instant::now();
         // Pipeline-form `u` (`[...]`) vs operator/replacement-form (`{...}`).
         // An update of ONE document changes the first its query matches in
         // the order mongod reads them.
@@ -1915,6 +2045,15 @@ pub(crate) fn update_in(
                 }
                 continue;
             }
+            statements.update(
+                db_name,
+                &coll,
+                spec,
+                n,
+                n_modified,
+                upserted.len(),
+                write_errors.len(),
+            );
             if absent {
                 continue;
             }
@@ -1966,6 +2105,15 @@ pub(crate) fn update_in(
                 }
                 continue;
             }
+            statements.update(
+                db_name,
+                &coll,
+                spec,
+                n,
+                n_modified,
+                upserted.len(),
+                write_errors.len(),
+            );
             if absent {
                 continue;
             }
@@ -1987,10 +2135,40 @@ pub(crate) fn update_in(
             })
         };
 
+        if outcome.is_ok() {
+            // The statement's own query: a sort has pinned `q` to a document.
+            crate::explain::order::count_index_use(
+                storage,
+                &crate::explain::order::Ask {
+                    db: db_name,
+                    coll: &coll,
+                    filter: &doc_field(spec, "q"),
+                    sort: None,
+                    hint: argtypes::given_hint(spec),
+                    collation: collation.as_ref(),
+                    vars: &stmt_vars,
+                    limit: 0,
+                    asked: Default::default(),
+                },
+                crate::explain::order::Uses::Write {
+                    delete: false,
+                    multi,
+                    upsert,
+                    returns: false,
+                },
+            );
+        }
         match outcome {
             Ok(outcome) => {
                 n += outcome.matched as i32;
                 n_modified += outcome.modified as i32;
+                if let (true, Some(stats)) = (multi, status_counters) {
+                    stats.status.many_statement(
+                        true,
+                        outcome.matched as u64,
+                        statement_started.elapsed(),
+                    );
+                }
                 if outcome.modified > 0 {
                     crate::transactions::note_statement(
                         index,
@@ -2099,6 +2277,7 @@ pub(crate) fn update_in(
         }
     }
 
+    statements.close(n, n_modified, upserted.len(), &write_errors);
     let mut reply = doc! { "n": n, "nModified": n_modified, "ok": 1.0 };
     if !upserted.is_empty() {
         reply.insert("upserted", upserted);

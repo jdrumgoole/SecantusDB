@@ -84,6 +84,12 @@ pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
 
+    // Settled after the arguments, the awaitable fields and the `client`
+    // metadata are accepted, and before `saslSupportedMechs` and
+    // `speculativeAuthenticate` are looked at: an error from either of those
+    // still leaves the new compressors in place (mongod 8.2.11, 2026-10-15).
+    let compression = negotiate_compression(doc, ctx);
+
     // `saslSupportedMechs: "<db>.<user>"` — drivers ask which mechanisms to
     // attempt for a principal. mongod 8.2.11 lists the user's own SCRAM
     // mechanisms, OMITS the field for an unknown user, and refuses a name with
@@ -98,6 +104,13 @@ pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             ));
         };
         mechanisms = user_scram_mechanisms(ctx, db, user);
+    }
+    if matches!(doc.get("speculativeAuthenticate"), Some(Bson::Document(spec)) if spec.is_empty()) {
+        return Err(CommandError::new(
+            2,
+            "BadValue",
+            "hello.speculativeAuthenticate must be a non-empty Object",
+        ));
     }
 
     let now = DateTime::now();
@@ -121,6 +134,10 @@ pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     };
 
     let mut response = Document::new();
+    // mongod answers `compression` before anything else, `helloOk` included.
+    if let Some(names) = compression {
+        response.insert("compression", names);
+    }
     // A driver puts `helloOk: true` in its handshake to ask whether this server
     // understands the modern `hello`; the server echoes it back to say yes, and
     // the driver then uses `hello` for the life of the connection. Measured on
@@ -230,8 +247,9 @@ fn wrong_type(path: &str, value: &Bson, expected: &str) -> CommandError {
 /// `hello.` for the older names too, and a field the parser does not know is
 /// accepted. Returns whether the client asked for `helloOk`.
 ///
-/// `compression` is checked and then not answered: this server does not
-/// speak `OP_COMPRESSED`, so it names no compressor it shares.
+/// `compression` is checked here and answered by [`negotiate_compression`].
+/// An empty `speculativeAuthenticate` is refused later, after
+/// `saslSupportedMechs`, where mongod refuses it.
 fn validate_hello_arguments(doc: &Document) -> Result<bool, CommandError> {
     let mut hello_ok = false;
     for (key, value) in doc {
@@ -268,20 +286,54 @@ fn validate_hello_arguments(doc: &Document) -> Result<bool, CommandError> {
             ("loadBalanced", v) => return Err(wrong_type(&path, v, "type 'bool'")),
             ("internalClient", Bson::Document(_)) => {}
             ("internalClient", v) => return Err(wrong_type(&path, v, "type 'object'")),
-            ("speculativeAuthenticate", Bson::Document(spec)) => {
-                if spec.is_empty() {
-                    return Err(CommandError::new(
-                        2,
-                        "BadValue",
-                        "hello.speculativeAuthenticate must be a non-empty Object",
-                    ));
-                }
-            }
+            ("speculativeAuthenticate", Bson::Document(_)) => {}
             ("speculativeAuthenticate", v) => return Err(wrong_type(&path, v, "type 'object'")),
             _ => {}
         }
     }
     Ok(hello_ok)
+}
+
+/// The compressors a `hello` settles on for this connection, as mongod 8.2.11
+/// settles them (measured 2026-10-15 over `hello`, `isMaster` and `ismaster`,
+/// by `OP_MSG` and by `OP_QUERY`):
+///
+/// - A `compression` array replaces the connection's list with the names it
+///   holds that this server speaks (`snappy`, `zstd`, `zlib`), in the
+///   client's order, repeats kept; `noop`, `"ZLIB"` and unknown names drop.
+///   An empty array, or one naming none of the three, clears it.
+/// - A `hello` without the field, or with `null` there, keeps the list.
+/// - The list, when it is not empty, is answered, by every `hello`.
+///
+/// Settling the list does not decide what the connection may send: mongod
+/// decompresses a request under any compressor it has enabled, negotiated or
+/// not, and answers it under the same one (`secantus-server`).
+fn negotiate_compression(doc: &Document, ctx: &CommandContext) -> Option<Vec<String>> {
+    let offered = match doc.get("compression") {
+        Some(Bson::Array(names)) => Some(
+            names
+                .iter()
+                .filter_map(|n| match n {
+                    Bson::String(name) => secantus_wire::Compressor::from_name(name),
+                    _ => None,
+                })
+                .map(|c| c.name().to_string())
+                .collect::<Vec<_>>(),
+        ),
+        _ => None,
+    };
+    let names = match ctx.conn_auth.as_ref().and_then(|a| a.lock().ok()) {
+        Some(mut guard) => {
+            if let Some(offered) = offered {
+                guard.compressors = offered;
+            }
+            guard.compressors.clone()
+        }
+        // No connection state (a handshake-only context): answer this
+        // request's own list.
+        None => offered.unwrap_or_default(),
+    };
+    (!names.is_empty()).then_some(names)
 }
 
 /// mongod's check of a driver's `client` metadata (measured 8.2.11,

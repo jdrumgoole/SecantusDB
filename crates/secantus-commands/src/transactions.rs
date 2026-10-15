@@ -72,7 +72,6 @@ pub struct Transaction {
     /// statement creates it.
     pub handle: Option<Box<dyn Any + Send>>,
     pub last_use: f64,
-    #[allow(dead_code)]
     pub started_at: f64,
     /// The collections this transaction created, as `db.coll`, and whether
     /// it has since put a document in each.
@@ -400,6 +399,26 @@ pub struct TransactionRegistry {
     /// while the server runs.
     lifetime: std::sync::atomic::AtomicU64,
     clock: Clock,
+    /// Started, committed, aborted, and the microseconds the ended ones ran:
+    /// `serverStatus.transactions` and `opLatencies.transactions`.
+    counts: [std::sync::atomic::AtomicI64; 4],
+}
+
+/// `serverStatus.transactions`' counts, measured as mongod 8.2.11 keeps them:
+/// a transaction is started by its first statement and ends when it commits
+/// or aborts (by the client, by a failed statement, by the reaper, or by a
+/// newer transaction on its session).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TxnCounts {
+    /// Open and running a statement right now.
+    pub current_active: i64,
+    /// Open and idle.
+    pub current_inactive: i64,
+    pub total_aborted: i64,
+    pub total_committed: i64,
+    pub total_started: i64,
+    /// How long the ended transactions ran, from their first statement.
+    pub latency_micros: i64,
 }
 
 impl TransactionRegistry {
@@ -415,6 +434,44 @@ impl TransactionRegistry {
             rollback,
             lifetime: std::sync::atomic::AtomicU64::new(lifetime_seconds.to_bits()),
             clock,
+            counts: Default::default(),
+        }
+    }
+
+    /// A transaction left `InProgress`: count how it ended and how long it ran.
+    fn ended(&self, t: &Transaction, committed: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.counts[if committed { 1 } else { 2 }].fetch_add(1, Relaxed);
+        let micros = (((self.clock)() - t.started_at) * 1e6).max(0.0) as i64;
+        self.counts[3].fetch_add(micros, Relaxed);
+    }
+
+    /// The counts `serverStatus.transactions` reports.
+    pub fn counts(&self) -> TxnCounts {
+        use std::sync::atomic::Ordering::Relaxed;
+        let [started, committed, aborted, micros] =
+            std::array::from_fn(|i| self.counts[i].load(Relaxed));
+        // A transaction running a statement holds its own lock.
+        let active = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sessions
+            .values()
+            .filter(|s| match &s.kind {
+                Kind::Txn(c) => c.try_lock().is_err(),
+                Kind::Retryable(_) => false,
+            })
+            .count() as i64;
+        let open = (started - committed - aborted).max(0);
+        let active = active.min(open);
+        TxnCounts {
+            current_active: active,
+            current_inactive: open - active,
+            total_aborted: aborted,
+            total_committed: committed,
+            total_started: started,
+            latency_micros: micros,
         }
     }
 
@@ -472,6 +529,7 @@ impl TransactionRegistry {
                 txn_number,
                 now,
             )));
+            self.counts[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             inner.sessions.insert(
                 lsid_bytes.to_vec(),
                 Session {
@@ -553,12 +611,14 @@ impl TransactionRegistry {
                 match (self.commit)(&mut t) {
                     Ok(()) => {
                         t.state = TxnState::Committed;
+                        self.ended(&t, true);
                         None
                     }
                     // Nothing of it was committed: the transaction is over,
                     // and the client is told why.
                     Err(e) => {
                         t.state = TxnState::Aborted;
+                        self.ended(&t, false);
                         let mut reply = crate::util::command_error(e).into_reply();
                         let code = reply.get_i32("code").unwrap_or(0);
                         if crate::failpoints::is_transient_txn_code(code) {
@@ -586,6 +646,7 @@ impl TransactionRegistry {
                 (self.rollback)(&mut t);
                 t.state = TxnState::Aborted;
                 t.last_use = (self.clock)();
+                self.ended(&t, false);
                 None
             }
         }
@@ -601,7 +662,15 @@ impl TransactionRegistry {
     /// the transaction back and leave the session as if it had never been
     /// sent.
     pub fn forget_started(&self, lsid_bytes: &[u8], txn: &Arc<Mutex<Transaction>>) {
-        self.abort_locked(txn);
+        {
+            let mut t = txn.lock().unwrap_or_else(|e| e.into_inner());
+            if t.state == TxnState::InProgress {
+                (self.rollback)(&mut t);
+                t.state = TxnState::Aborted;
+                // Never started, so never ended either.
+                self.counts[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let ours = matches!(
             inner.sessions.get(lsid_bytes),
@@ -694,6 +763,16 @@ impl TransactionRegistry {
         }
     }
 
+    /// Sessions holding transaction or retryable-write state: mongod's
+    /// session catalog.
+    pub fn session_count(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sessions
+            .len()
+    }
+
     /// Count of in-progress transactions (test/introspection helper).
     pub fn in_progress_count(&self) -> usize {
         self.inner
@@ -715,6 +794,7 @@ impl TransactionRegistry {
         if t.state == TxnState::InProgress {
             (self.rollback)(&mut t);
             t.state = TxnState::Aborted;
+            self.ended(&t, false);
         }
     }
 
@@ -738,6 +818,7 @@ impl TransactionRegistry {
                 if t.state == TxnState::InProgress && t.last_use < cutoff {
                     (self.rollback)(&mut t);
                     t.state = TxnState::Aborted;
+                    self.ended(&t, false);
                 }
             }
         }

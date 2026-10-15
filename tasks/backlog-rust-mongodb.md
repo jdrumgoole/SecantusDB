@@ -229,7 +229,7 @@ These are explicit non-goals. Don't add them without a reason.
 - **`$where`** — runs JavaScript. We don't ship a JS runtime.
 - **`$function`, `$accumulator`** (aggregation expressions) — same reason: both evaluate user-supplied JavaScript and need an embedded JS engine + sandbox + BSON↔JS shim layer. Would also require a `--javascriptEnabled` gate (mongod gates JS behind this; many prod deployments disable it). Adding the runtime would let us implement these three operators + `mapReduce` together for ~600–1000 LOC + a heavyweight binary dep (PythonMonkey / QuickJS / V8 — each with maintenance trade-offs). Most pipelines that reach for `$function` can be expressed in the existing aggregation expression library. **`lang: "python"` as a SecantusDB extension was considered and rejected (May 2026)**: would break the conformance contract (pipelines that work locally would explode in production with `Unrecognized lang value: 'python'`), and CPython's sandboxing story is worse than embedded JS engines. If a real user need ever surfaces, the right escape hatch is a server-side trusted-plugin registry — `{$secantusFunction: {name: "<pre-registered>", args: [...]}}` — not user code at query time.
 - **`mapReduce`** — same JS-runtime dependency as `$where` / `$function` / `$accumulator`, and deprecated by MongoDB (removed from the Stable API in 5.0). **WILL NOT BUILD** (decided 2026-09-27). The canonical `emit(this.<field>, 1)` + `values.length` "count by field" pattern is translated to an equivalent `$group` aggregation; non-canonical map / reduce bodies return `{results: [], ok: 1}`, and `out: "<coll>"` (non-inline) is rejected with FailedToParse 9 (`mapReduce on this server only supports {out: {inline: 1}}`). mongo-java-driver's `testMapReduceWithGenerics` writes to a NAMED output collection and so fails permanently; that failure is accepted rather than tracked.
-- **Profiling: `planSummary` / `keysExamined` / `docsExamined` / `nreturned` in `system.profile` entries** — out of scope today (would need post-handler stats plumbing).
+- **Profiling: `planSummary` / `keysExamined` / `docsExamined` / `execStats` in `system.profile` entries** — out of scope today: the profiler (2026-10-15) writes each entry from what the command did, and these are per-batch execution statistics this server does not keep (`explain` derives totals for the whole query). Also absent for the same reason: `locks`, `flowControl`, `storage`, the query hashes, `cpuNanos`, and a `getmore` entry's `originatingCommand` (a cursor does not keep its command). A `$jsonSchema` profile filter reads back as given, where mongod expands it.
 
 ## 5. Known bugs and edge cases to watch
 
@@ -240,11 +240,6 @@ These are explicit non-goals. Don't add them without a reason.
   ranges have not been checked. Found 2026-10-14.
   Backlog-ID: RM-139
   Verify: tests/backlog/test_rm_found_2026_10_14.py::test_date_from_parts_month_out_of_range_is_refused
-- [ ] **`profile` refuses a negative `slowms`.** `{profile: 0, slowms: -1}`
-  (and level 1) answers 2 `slowms must be non-negative`; mongod 8.2.11
-  accepts it and reads `slowms: -1` back. Found 2026-10-14.
-  Backlog-ID: RM-140
-  Verify: tests/backlog/test_rm_found_2026_10_14.py::test_profile_accepts_a_negative_slowms
 - [ ] **`saslStart` for a user that does not exist continues the
   conversation.** mongod 8.2.11 fails the first step with 18
   `Authentication failed.`; this server answers `ok: 1, done: false` and
@@ -724,24 +719,36 @@ Still different:
       collection's buckets or a unique index's claims.)
       Backlog-ID: RM-033
       Verify: tests/backlog/test_rm_029_056.py::test_background_validate_of_an_uncheckpointed_collection
-- [ ] **`serverStatus` sections** (about 30): `asserts`, `mem`,
-      `globalLock`, `transactions`, `repl`, `metrics` beyond the two this
-      server keeps, `wiredTiger` and the rest are absent. None is reported
-      as zeros.
+- [ ] **`serverStatus.locks` is absent**, and with it the gap test's last
+      section. mongod counts its lock manager's acquisitions per resource
+      and mode, and this server has no such lock manager. The other
+      sections are reported from real counters (`asserts`, `mem`,
+      `extra_info`, `globalLock`, `logicalSessionRecordCache`,
+      `opLatencies`, `security`, `transactions`, `wiredTiger`,
+      `metrics.{commands, document, operation, query}`); those that need a
+      mechanism this server lacks stay absent rather than zero: `repl`, the
+      plan-cache and sort metrics, `queues`, `transportSecurity`.
+      Counted differently from mongod: `asserts.user` moves by 1 where
+      mongod raises an error twice internally (an invalid sort, an index
+      build, a duplicate in an unordered insert); an `aggregate` whose stage
+      does not parse counts as a run; `$out` / `$merge` writes are not in
+      `metrics.document`; a `bulkWrite` multi-update counts its documents
+      in `metrics.query`.
       Backlog-ID: RM-034
-      Verify: tests/backlog/test_rm_029_056.py::test_server_status_sections,tests/backlog/test_rm_029_056.py::test_server_status_metrics
+      Verify: tests/backlog/test_rm_029_056.py::test_server_status_sections
 - [ ] **Server parameters** (about 30). `getParameter` reports the
       thirteen parameters that are true of this server
       (`serverinfo::parameters`) and mongod has several hundred.
       `setParameter` changes six (`cursorTimeoutMillis` and
       `transactionLifetimeLimitSeconds` among them, each applied to its
-      registry); the others mongod changes at runtime are 20 here.
-      `notablescan` is not there to set, so a scan is never refused. Decided
-      2026-10-15: add it, refusing with 291 a query the `explain` planner
-      would answer with a collection scan (an empty filter still runs), with
-      mongod's code and closing words but not its query-tree text.
+      registry, and `notablescan`); the others mongod changes at runtime are
+      20 here: of those this server reports, `scramIterationCount` and
+      `scramSHA256IterationCount` (mongod sets both at runtime; a fix must
+      make the value govern the credentials `createUser` / `updateUser`
+      write afterwards, not just store it). `notablescan`'s refusal has mongod's code and closing words
+      (`... running with 'notablescan' 2`) but not its query-tree text.
       Backlog-ID: RM-035
-      Verify: tests/backlog/test_rm_029_056.py::test_notablescan_parameter
+      Verify: tests/backlog/test_rm_found_2026_10_15.py::test_scram_iteration_count_is_settable_at_runtime
 - [ ] **Commands answered only as far as this server honours them.**
       `features` has no `js` block (there is no script engine) and refuses
       `oidReset`; `getClusterParameter` has six of mongod's fifteen
@@ -754,37 +761,58 @@ Still different:
       is a feature to build, not a reply to change.
       Backlog-ID: RM-143
       Verify: tests/backlog/test_rm_029_056.py::test_features_reports_the_script_engine,tests/backlog/test_rm_029_056.py::test_features_oid_reset,tests/backlog/test_rm_029_056.py::test_plan_cache_set_filter,tests/backlog/test_rm_029_056.py::test_resize_oplog_min_retention_hours,tests/backlog/test_rm_029_056.py::test_every_cluster_parameter
-- [ ] **The profiler** (6): nothing is profiled. A level is recorded and
-      no operation is written to `system.profile`, which is not created
-      (mongod creates it, capped, at level 1 or 2), and a `filter` document
-      is refused (238) where mongod stores it. Creating an empty
-      `system.profile` would claim a profiler there is not: this needs one.
-      Backlog-ID: RM-038
-      Verify: tests/backlog/test_rm_029_056.py::test_profile_filter_is_stored,tests/backlog/test_rm_029_056.py::test_profile_level_creates_system_profile
+- [ ] **A frame with an opcode the server does not serve closes the
+      connection.** mongod 8.2.11 sends nothing back for opcode 9999, or 1
+      (`OP_REPLY`) sent as a request, and answers the next request on the
+      same socket; this server resets the connection, losing anything else
+      in flight on it. Found 2026-10-15.
+      Backlog-ID: RM-144
+      Verify: tests/backlog/test_rm_found_2026_10_15.py::test_unknown_opcode_is_ignored_and_the_connection_kept
+- [ ] **A legacy `OP_GET_MORE` closes the connection.** mongod 8.2.11
+      answers an `OP_REPLY` (flags 2, cursor 0) holding `{$err: "OP_GET_MORE
+      is no longer supported. ...", code: 5739101, ok: 0}` and keeps the
+      connection. Found 2026-10-15.
+      Backlog-ID: RM-145
+      Verify: tests/backlog/test_rm_found_2026_10_15.py::test_legacy_op_get_more_is_refused_with_an_op_reply
+- [ ] **An exhaust `getMore` whose last batch is short sends one frame too
+      many.** With 10 documents and `batchSize: 3`, mongod 8.2.11 sends
+      `[3,4,5]` and `[6,7,8]` with `moreToCome`, then `[9]` without it and
+      cursor id 0; this server sends `[9]` with `moreToCome` and the live
+      id, then an empty final frame. Found 2026-10-15.
+      Backlog-ID: RM-146
+      Verify: tests/backlog/test_rm_found_2026_10_15.py::test_exhaust_get_more_ends_with_the_short_batch
+- [ ] **`serverStatus` has no `network.compression`.** mongod 8.2.11
+      reports `bytesIn` / `bytesOut` for each compressor and decompressor
+      (snappy, zstd, zlib; int64, zero on a fresh server). This server
+      speaks all three since 2026-10-15 and counts none of them.
+      Backlog-ID: RM-147
+      Verify: tests/backlog/test_rm_found_2026_10_15.py::test_server_status_reports_compression_counters
 - **Scope decision — `buildInfo.secantusVersion` and `serverStatus.secantus`
   stay** (Joe, 2026-10-15). Each names this build beside mongod's own
   fields. They are additive, documented (`CLAUDE.md`, `docs/compatibility.md`,
   `docs/servers.md`), and how the admin UI tells this server from mongod;
   no driver compares a whole `buildInfo` reply.
-- [ ] **`hello` names no compressor.** `OP_COMPRESSED` is not spoken, so a
-      `compression` list is checked and not answered (2).
-      Backlog-ID: RM-039
-      Verify: tests/backlog/test_rm_029_056.py::test_hello_names_compressors
 - [ ] `buildInfo` has no per-OS block; `collStats` has no `wiredTiger` or
-      `indexDetails`;
-      `$indexStats` counts no use of an index and `latencyStats` is zeros;
-      `listDatabases` lists no `config` (mongod writes its sessions to
-      `config.system.sessions`; here they are kept in memory), so `dbHash`
-      on `config` differs, as on `admin` does (`admin.system.keys` holds
-      random signing keys there, a digest no server could match);
-      `connectionStatus` lists no privileges for a user who has some;
-      `$listCatalog`
-      is unknown (decided 2026-10-15: build it from this server's own
-      catalog, `ident` naming the shard table that holds the collection and
-      `idxIdent` the shared index table, with no `multikeyPaths`);
-      `hostInfo.extra` is empty on Linux.
+      `indexDetails` (they are WiredTiger statistics of the collection's
+      and each index's own table, and here collections share a documents
+      shard table and every index one entries table, so no per-collection
+      statistics exist; the shard table's own would count other
+      collections too); `latencyStats` is zeros; `listDatabases` lists no
+      `config` (mongod writes its sessions to `config.system.sessions`;
+      here they are kept in memory), so `dbHash` on `config` differs, as on
+      `admin` does (`admin.system.keys` holds random signing keys there, a
+      digest no server could match); `connectionStatus` lists no
+      privileges for a user who has some; `hostInfo.extra` is empty on
+      Linux. `$indexStats` counts the plan the `explain` planner picks:
+      where several indexes could serve, mongod's trial may pick another
+      (measured: `find({a: 1, b: 6})` counts `b_1` on mongod, `a_1` here).
+      `$listCatalog` (decided 2026-10-15) names this store's own tables and
+      has no `multikeyPaths`; it has no `ident` for `local.oplog.rs` (the
+      oplog spans several tables), lists by database and then name rather
+      than creation order, gives an index `spec` in `listIndexes`' key
+      order, and reads a geo index's `multikey` from the documents now.
       Backlog-ID: RM-040
-      Verify: tests/backlog/test_rm_029_056.py::test_coll_stats_wiredtiger_and_index_details,tests/backlog/test_rm_029_056.py::test_index_stats_counts_use,tests/backlog/test_rm_029_056.py::test_list_databases_lists_admin_and_config,tests/backlog/test_rm_029_056.py::test_list_catalog_stage
+      Verify: tests/backlog/test_rm_029_056.py::test_coll_stats_wiredtiger_and_index_details,tests/backlog/test_rm_029_056.py::test_list_databases_lists_admin_and_config
 
 ### 7.081 Geo queries -- 2026-10-13
 

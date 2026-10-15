@@ -43,7 +43,7 @@ The MongoDB column describes `mongod` 7.0 itself and is the reference.
 | --- | --- | --- | --- |
 | `OP_MSG` (incl. kind-1 document sequences) | ✅ | ✅ | ✅ |
 | Legacy `OP_QUERY` handshake | ✅ | ✅ | ✅ |
-| `OP_COMPRESSED` | ✅ | ❌ | ❌ |
+| `OP_COMPRESSED` (`snappy`, `zstd`, `zlib`) | ✅ | ❌ | ✅ |
 | Wire-valid error replies (`ok: 0`, `code`, `codeName`) | ✅ | ✅ | ✅ |
 | Unknown command → `CommandNotFound` (59), connection survives | ✅ | ✅ | ✅ |
 
@@ -286,7 +286,7 @@ remainder.
 Anything that depends on real cluster topology or an embedded JavaScript
 runtime is out of scope by design, in both servers: multi-node replica sets,
 elections, sharding, cross-node oplog; `$where`, `$function`, `$accumulator`,
-JS `mapReduce`; text / hashed / wildcard indexes; `OP_COMPRESSED`; Atlas
+JS `mapReduce`; text / hashed / wildcard indexes; Atlas
 Search / Vector Search; LDAP / Kerberos / AWS / OIDC auth. See
 [Compatibility](compatibility.md) for the per-feature detail and
 [the validation reports](validation-summary.md) for the machine-checked

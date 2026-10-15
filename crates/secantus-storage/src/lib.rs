@@ -251,6 +251,9 @@ pub struct UserTransactionHandle {
     /// or rollback changes what other sessions see there, so it moves
     /// [`COLL_TABLE_GEN`] on again when it ends.
     wrote_registry: bool,
+    /// Planner writes the transaction has made ([`note_planner_write`]),
+    /// released when it ends.
+    planner_pending: u64,
     /// Collections created inside the transaction are held here, not
     /// written to the registry, until it commits (`set_defer_collection_creates`):
     /// `(db, collection) -> options blob`. Only the transaction itself reads
@@ -418,6 +421,11 @@ impl Drop for UserTransactionHandle {
         // that rollback completes is safe — the ranges just become permanent
         // seq holes, which the shard merge tolerates.
         self.deregister_minted();
+        // Its planner writes are undone, so none of them is in flight.
+        let pending = std::mem::take(&mut self.planner_pending);
+        if pending > 0 {
+            PLANNER_FINISHED.fetch_add(pending, Ordering::SeqCst);
+        }
     }
 }
 
@@ -512,6 +520,27 @@ fn doc_table_for(db: &str, coll: &str) -> String {
     doc_shard_name(doc_shard_hash(db, coll) % DOC_SHARDS)
 }
 
+/// The WiredTiger table that holds `(db, coll)`'s documents (`$listCatalog`'s
+/// `ident`): one of the shared shard tables.
+pub fn collection_table(db: &str, coll: &str) -> String {
+    doc_table_for(db, coll)
+}
+
+/// The WiredTiger table that holds index `name`'s entries (`$listCatalog`'s
+/// `idxIdent`): the `_id` index is the `_id -> RecordId` map, every other
+/// index is in the one shared entries table.
+pub fn index_table(name: &str) -> &'static str {
+    if name == ID_INDEX_NAME {
+        NAT_SEQ_TABLE
+    } else {
+        IDX_ENTRIES_TABLE
+    }
+}
+
+/// The WiredTiger table of the collection registry, which is where a
+/// database's view definitions are kept.
+pub const CATALOG_TABLE: &str = COLL_TABLE;
+
 /// A scanned document row: `(RecordId, id_key, blob)`. The RecordId is the
 /// doc-table key; the id_key and blob are unframed from the value (see
 /// [`frame_doc_value`]).
@@ -543,15 +572,43 @@ const WRITE_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// dirty trigger while bounding the number of commits for a large drop.
 const PURGE_CHUNK_MAX_ROWS: usize = 4000;
 
-/// Whether an oplog entry is for the `local` database, which mongod does not
-/// replicate and so does not log.
+/// Whether an oplog entry is for something mongod does not replicate, and
+/// so does not log: the `local` database, and a database's
+/// `system.profile` -- its documents, and its creation and drop (measured
+/// 8.2.11: none of them reaches the oplog).
 fn oplog_entry_is_local(e: &OplogEntry) -> bool {
-    let ns = match e {
-        OplogEntry::Doc(d) => d.get_str("ns").ok(),
-        OplogEntry::Raw(buf) => buf.get_str("ns").ok(),
+    let (ns, target) = match e {
+        OplogEntry::Doc(d) => (
+            d.get_str("ns").ok(),
+            d.get_document("o")
+                .ok()
+                .and_then(|o| o.iter().next())
+                .and_then(|(_, v)| v.as_str()),
+        ),
+        OplogEntry::Raw(buf) => (
+            buf.get_str("ns").ok(),
+            buf.get_document("o")
+                .ok()
+                .and_then(|o| o.iter().next())
+                .and_then(|el| el.ok())
+                .and_then(|(_, v)| v.as_str()),
+        ),
     };
-    ns.is_some_and(|ns| ns == "local" || ns.starts_with("local."))
+    let Some(ns) = ns else {
+        return false;
+    };
+    if ns == "local" || ns.starts_with("local.") {
+        return true;
+    }
+    if ns.ends_with(".system.profile") {
+        return true;
+    }
+    ns.ends_with(".$cmd") && target == Some(PROFILE_COLLECTION)
 }
+
+/// The collection the profiler writes. It is not replicated, and its
+/// documents have no `_id` (mongod gives it no `_id` index).
+const PROFILE_COLLECTION: &str = "system.profile";
 
 /// Approximate encoded size of an oplog entry, for the user-transaction
 /// dirty budget. `Raw` is exact; `Doc` (the rare DDL / noop shapes) pays one
@@ -1731,10 +1788,14 @@ enum ResolvedHint {
 /// pressure lever; Findings 6/13). This matches the daemon's and the Python
 /// `RustServer` handle's 4G-cap default, closing the gap where an embedded
 /// library user hit eviction pressure the daemon never would.
+///
+/// `statistics=(fast)` is mongod's own setting: the engine keeps the cheap
+/// counters that `serverStatus.wiredTiger` reports ([`Storage::wt_statistics`]).
 const DEFAULT_CONFIG: &str = "create,session_max=1000,cache_size=4G,\
                               eviction=(threads_min=4,threads_max=4),\
                               log=(enabled=true,file_max=128MB,prealloc=false),\
-                              transaction_sync=(enabled=false,method=fsync)";
+                              transaction_sync=(enabled=false,method=fsync),\
+                              statistics=(fast)";
 
 /// Build the WiredTiger connection config string from the tunable knobs the
 /// `secantusdb` daemon exposes (`--cache-size`, `--session-max`,
@@ -1748,7 +1809,7 @@ pub fn wt_config(
     log_file_max: &str,
 ) -> String {
     let mut cfg = format!(
-        "create,session_max={session_max},cache_size={cache_size},eviction=(threads_min=4,threads_max=4),log=(enabled=true,file_max={log_file_max},prealloc=false),transaction_sync=(enabled={},method=fsync)",
+        "create,session_max={session_max},cache_size={cache_size},eviction=(threads_min=4,threads_max=4),log=(enabled=true,file_max={log_file_max},prealloc=false),transaction_sync=(enabled={},method=fsync),statistics=(fast)",
         if sync_on_commit { "true" } else { "false" }
     );
     // `SECANTUS_WT_CONFIG_EXTRA` appends raw WiredTiger connection config — a
@@ -3706,6 +3767,9 @@ pub struct Storage {
     /// Only ever grows between those, as mongod's does. It orders results and
     /// never decides which documents match.
     multikey_paths: Mutex<HashMap<(String, String, String), MultikeyPaths>>,
+    /// `planner_indexes` answers by `(db, collection)`, each with the
+    /// [`PLANNER_FINISHED`] value it was read under.
+    planner_cache: std::sync::RwLock<PlannerCache>,
     /// Dirty budget for one multi-document transaction: ~15% of the cache
     /// (0.75 x WT's ~20% dirty-eviction trigger, the shape of mongod's
     /// `TransactionTooLargeForCache` threshold). A transaction's dirty
@@ -5606,6 +5670,7 @@ impl Storage {
             write_tickets: crate::admission::Tickets::new(opts.write_tickets.unwrap_or(0)),
             ddl_generation: AtomicU64::new(0),
             multikey_paths: Mutex::new(HashMap::new()),
+            planner_cache: std::sync::RwLock::new(HashMap::new()),
             txn_dirty_limit: (parse_cache_bytes(config) as f64 * 0.20 * 0.75) as u64,
             oplog_shards_created,
             ttl: TtlMonitor::default(),
@@ -5845,6 +5910,8 @@ impl Storage {
         if matches!(session, OpSession::Txn(_)) {
             return f();
         }
+        // Released after the commit or rollback below.
+        let _planner = PlannerScope::new();
         // Async oplog: mark this statement so `emit_oplog_entries` buffers its
         // entries instead of writing them in-transaction. The buffer is minted +
         // handed to the drainer only on a successful commit (below), and cleared
@@ -7140,6 +7207,8 @@ impl Storage {
     /// if needed) — e.g. `{changeStreamPreAndPostImages: {enabled: true}}`.
     /// Mirrors `storage.set_collection_options`.
     pub fn set_collection_options(&self, db: &str, coll: &str, opts: &Document) -> Result<()> {
+        // Planner writes made here are released once they are visible.
+        let _planner = PlannerScope::new();
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
@@ -7174,6 +7243,8 @@ impl Storage {
         opts: &Document,
         given: &Document,
     ) -> Result<()> {
+        // Planner writes made here are released once they are visible.
+        let _planner = PlannerScope::new();
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
@@ -7223,6 +7294,8 @@ impl Storage {
     /// The collection's 16-byte UUID (minting + persisting one on first use).
     /// Mirrors `storage.collection_uuid`.
     pub fn collection_uuid(&self, db: &str, coll: &str) -> Result<Vec<u8>> {
+        // Planner writes made here are released once they are visible.
+        let _planner = PlannerScope::new();
         // Fast path: already minted — plain lock-free read (this runs on
         // change-stream open, so it shouldn't queue behind writers). Mirrors
         // `storage._collection_uuid`'s fast path.
@@ -7680,6 +7753,25 @@ impl Storage {
         (self.write_tickets.in_flight(), self.write_tickets.limit())
     }
 
+    /// Writes waiting for an admission ticket right now (0 while admission
+    /// control is off: nothing waits).
+    pub fn writes_waiting(&self) -> usize {
+        self.write_tickets.waiting()
+    }
+
+    /// The engine's version string, and the connection's statistics as
+    /// WiredTiger's `statistics:` cursor lists them: each one's description
+    /// (`"cache: bytes currently in the cache"`) and value, in its order.
+    pub fn wt_statistics(&self) -> Result<(String, Vec<(String, i64)>)> {
+        let session = self.conn.open_session()?;
+        let cursor = session.open_cursor("statistics:", None)?;
+        let mut stats = Vec::new();
+        while cursor.next()? {
+            stats.push(cursor.get_value_stat()?);
+        }
+        Ok((secantus_wt::version_string(), stats))
+    }
+
     /// Open a dedicated WT session for a new multi-document transaction. The WT
     /// `begin_transaction` is deferred to the first `with_user_transaction`.
     pub fn begin_user_transaction(&self) -> Result<UserTransactionHandle> {
@@ -7713,6 +7805,7 @@ impl Storage {
             locked: Vec::new(),
             doomed: false,
             wrote_registry: false,
+            planner_pending: 0,
             defer_creates: false,
             deferred_creates: BTreeMap::new(),
             deferred_keys: BTreeMap::new(),
@@ -7985,6 +8078,7 @@ impl Storage {
         }
         // Whatever the outcome, the registry others see may change here --
         // moved on AFTER the commit call (the guard drops last).
+        let _planner = PlannerScope::ending(handle);
         let wrote_registry = handle.wrote_registry;
         let _registry = RegistryEnd(std::mem::take(&mut handle.wrote_registry));
         if let Some(session) = handle.session.take() {
@@ -8126,6 +8220,7 @@ impl Storage {
         handle: &mut UserTransactionHandle,
         release_shared: bool,
     ) -> Result<()> {
+        let _planner = PlannerScope::ending(handle);
         let _registry = RegistryEnd(std::mem::take(&mut handle.wrote_registry));
         handle.deferred_creates.clear();
         handle.deferred_keys.clear();
@@ -9258,6 +9353,10 @@ impl Storage {
                     if assigned_id {
                         doc.insert("_id", Bson::ObjectId(ObjectId::new()));
                     }
+                    // A profile entry is stored as written, with no `_id`:
+                    // mongod's `system.profile` has no `_id` index. The id
+                    // minted above only keys the row.
+                    let unkeyed = assigned_id && coll == PROFILE_COLLECTION;
                     let id = doc.get("_id").expect("_id present").clone();
                     let mut key = id_key(&id)?;
                     // Timeseries: suffix the doc-table key so duplicate `_id`s coexist.
@@ -9316,7 +9415,7 @@ impl Storage {
                     // reorder case encode_doc handles).
                     let id_first = doc.keys().next().map(String::as_str) == Some("_id");
                     let reencoded;
-                    let blob: &[u8] = if !assigned_id && id_first {
+                    let blob: &[u8] = if unkeyed || (!assigned_id && id_first) {
                         doc_bytes
                     } else {
                         reencoded = encode_doc(&doc)?;
@@ -9867,6 +9966,8 @@ impl Storage {
         coll: &str,
         options: &Document,
     ) -> Result<bool> {
+        // Planner writes made here are released once they are visible.
+        let _planner = PlannerScope::new();
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
@@ -9905,6 +10006,8 @@ impl Storage {
     /// its registry row. Returns whether it existed. Emits an `op: "c"` `drop`
     /// oplog entry when it existed. Mirrors `storage.drop_collection`.
     pub fn drop_collection(&self, db: &str, coll: &str) -> Result<bool> {
+        // Planner writes made here are released once they are visible.
+        let _planner = PlannerScope::new();
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
@@ -10016,6 +10119,10 @@ impl Storage {
     /// tombstone. Caller holds whatever exclusion it needs (the drop path holds
     /// the global + namespace locks; open-time recovery runs single-threaded).
     fn purge_dropped_collection(&self, db: &str, coll: &str) -> Result<()> {
+        // Planner writes made here are released once they are visible.
+        let _planner = PlannerScope::new();
+        // It writes the index catalog.
+        note_planner_write();
         loop {
             let n = self.retry_write_conflicts("drop_collection purge(uniq)", || {
                 let session = self.op_session()?;
@@ -10120,6 +10227,8 @@ impl Storage {
     /// Emits one `op: "c"` `drop` per collection plus a final `dropDatabase: 1`
     /// command oplog entry (no `ui`). Mirrors `storage.drop_database`.
     pub fn drop_database(&self, db: &str) -> Result<()> {
+        // Planner writes made here are released once they are visible.
+        let _planner = PlannerScope::new();
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let colls = {
             let session = self.conn.open_session()?;
@@ -10242,6 +10351,10 @@ impl Storage {
         dst_coll: &str,
         drop_target: bool,
     ) -> Result<(bool, Option<String>)> {
+        // Planner writes made here are released once they are visible.
+        let _planner = PlannerScope::new();
+        // It writes the index catalog.
+        note_planner_write();
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // Both namespaces' write locks, in sorted key order so two renames
         // touching the same pair can't ABBA-deadlock (global first, then
@@ -10512,6 +10625,8 @@ impl Storage {
         dst_coll: &str,
         drop_target: bool,
     ) -> Result<(bool, Option<String>)> {
+        // It writes the index catalog.
+        note_planner_write();
         if coll_options(session, src_db, src_coll)?.is_none() {
             return Ok((
                 false,
@@ -11074,6 +11189,10 @@ impl Storage {
         key_spec: &Document,
         options: &Document,
     ) -> Result<bool> {
+        // Planner writes made here are released once they are visible.
+        let _planner = PlannerScope::new();
+        // It writes the index catalog.
+        note_planner_write();
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
@@ -11131,6 +11250,8 @@ impl Storage {
         options: &Document,
         logged: bool,
     ) -> Result<bool> {
+        // It writes the index catalog.
+        note_planner_write();
         let geo = parse_geo_2d(key_spec, options);
         let geo_sphere = parse_geo_sphere(key_spec);
         ensure_collection(session, db, coll, self.data_nonlogged)?;
@@ -11393,7 +11514,12 @@ impl Storage {
         id_idx.insert("v", 2i32);
         id_idx.insert("key", Bson::Document(id_key_spec));
         id_idx.insert("name", ID_INDEX_NAME.to_string());
-        let mut out: Vec<Document> = vec![id_idx];
+        // `system.profile` has no `_id` index (mongod 8.2.11).
+        let mut out: Vec<Document> = if coll == PROFILE_COLLECTION {
+            Vec::new()
+        } else {
+            vec![id_idx]
+        };
         for (name, key_spec, opts) in self.iter_indexes(&session, db, coll)? {
             let mut e = Document::new();
             e.insert("v", 2i32);
@@ -11441,6 +11567,10 @@ impl Storage {
         name: &str,
         expire_after_seconds: i64,
     ) -> Result<bool> {
+        // Planner writes made here are released once they are visible.
+        let _planner = PlannerScope::new();
+        // It writes the index catalog.
+        note_planner_write();
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
@@ -11477,6 +11607,10 @@ impl Storage {
         name: &str,
         new_opts: &Document,
     ) -> Result<bool> {
+        // Planner writes made here are released once they are visible.
+        let _planner = PlannerScope::new();
+        // It writes the index catalog.
+        note_planner_write();
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
@@ -11561,6 +11695,10 @@ impl Storage {
     /// Drop the index named `name` (and all its entries). Returns `false` if no
     /// such index, or `name == "_id_"`. Mirrors `storage.drop_index`.
     pub fn drop_index(&self, db: &str, coll: &str, name: &str) -> Result<bool> {
+        // Planner writes made here are released once they are visible.
+        let _planner = PlannerScope::new();
+        // It writes the index catalog.
+        note_planner_write();
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
@@ -11620,6 +11758,10 @@ impl Storage {
     /// Drop every (non-`_id_`) index on `(db, coll)`. Returns how many were
     /// dropped. Mirrors `storage.drop_all_indexes` (used by drop-collection).
     pub fn drop_all_indexes(&self, db: &str, coll: &str) -> Result<usize> {
+        // Planner writes made here are released once they are visible.
+        let _planner = PlannerScope::new();
+        // It writes the index catalog.
+        note_planner_write();
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
@@ -12225,6 +12367,7 @@ impl Storage {
             if opts.get_bool("multikey").unwrap_or(false) {
                 continue; // already flagged — nothing to do
             }
+            note_planner_write();
             opts.insert("multikey", Bson::Boolean(true));
             payload.insert("options", Bson::Document(opts));
             let blob = encode_doc(&payload)?;
@@ -12984,6 +13127,10 @@ impl Storage {
     /// and dropping a user's index here would be a decision the user did not
     /// make.
     fn rebuild_outdated_indexes(&self) -> Result<()> {
+        // Planner writes made here are released once they are visible.
+        let _planner = PlannerScope::new();
+        // It writes the index catalog.
+        note_planner_write();
         let session = self.conn.open_session()?;
         let mut outdated: Vec<(String, String, String, Document, Document)> = Vec::new();
         {
@@ -13521,6 +13668,8 @@ impl Storage {
     }
 
     fn purge_collection_tables(&self, session: &Session, db: &str, coll: &str) -> Result<()> {
+        // It writes the index catalog.
+        note_planner_write();
         // Unique-key claims die with the namespace (see purge_unique_claims):
         // a surviving claim would reject a later insert of the same value
         // against a row that no longer exists.
@@ -14739,8 +14888,43 @@ impl Storage {
     }
 
     /// Every index of the collection as `listIndexes` gives it, each with
-    /// its multikey paths, from one read of the catalog.
-    pub fn planner_indexes(
+    /// its multikey paths, from one read of the catalog -- or from the last
+    /// such read, while nothing it read has been written since
+    /// ([`PLANNER_FINISHED`]). Inside a user transaction, which may see a
+    /// catalog of its own, it is always read.
+    pub fn planner_indexes(&self, db: &str, coll: &str) -> Result<Vec<PlannerIndex>> {
+        let shared = !self.in_user_txn();
+        let generation = planner_settled().filter(|_| shared);
+        if let Some(generation) = generation {
+            let cache = self.planner_cache.read().unwrap_or_else(|e| e.into_inner());
+            if let Some((cached, indexes)) = cache.get(&(db.to_string(), coll.to_string())) {
+                if *cached == generation {
+                    return Ok(indexes.clone());
+                }
+            }
+        }
+        let indexes = self.read_planner_indexes(db, coll)?;
+        if let Some(generation) = generation {
+            if planner_settled() == Some(generation) {
+                let mut cache = self
+                    .planner_cache
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner());
+                // One generation's answers at a time.
+                if cache.values().any(|(g, _)| *g != generation) {
+                    cache.clear();
+                }
+                cache.insert(
+                    (db.to_string(), coll.to_string()),
+                    (generation, indexes.clone()),
+                );
+            }
+        }
+        Ok(indexes)
+    }
+
+    /// [`Self::planner_indexes`], read from the catalog.
+    fn read_planner_indexes(
         &self,
         db: &str,
         coll: &str,
@@ -14857,6 +15041,7 @@ impl Storage {
                 paths: vec![Vec::new(); found.len()],
             };
         }
+        let before = entry.paths.clone();
         for (have, new) in entry.paths.iter_mut().zip(found) {
             for part in new {
                 if !have.contains(&part) {
@@ -14864,6 +15049,9 @@ impl Storage {
                 }
             }
             have.sort();
+        }
+        if entry.paths != before {
+            note_planner_change();
         }
         entry.scanned = true;
         Ok(entry.paths.clone())
@@ -14893,9 +15081,13 @@ impl Storage {
         if entry.paths.len() != key_spec.len() {
             return;
         }
+        let before = entry.paths.clone();
         for (field, parts) in key_spec.keys().zip(entry.paths.iter_mut()) {
             array_components(doc, field, parts);
             parts.sort();
+        }
+        if entry.paths != before {
+            note_planner_change();
         }
     }
 
@@ -18336,10 +18528,106 @@ const MOVE_REPLAY_ATTEMPTS: u32 = 100;
 /// answer read from the registry under one value stays true while it holds.
 static COLL_TABLE_GEN: AtomicU64 = AtomicU64::new(1);
 
+/// One index as the planner reads it: its `listIndexes` spec, and per key
+/// field the path components that hold an array.
+pub type PlannerIndex = (Document, Vec<Vec<String>>);
+
+/// `planner_indexes` answers by `(db, collection)`, each with the generation
+/// it was read under.
+type PlannerCache = HashMap<(String, String), (u64, Vec<PlannerIndex>)>;
+
+/// What the query planner reads of a collection (`planner_indexes`: the
+/// registry, the index catalog, each index's multikey flag and paths) is
+/// cached while no write of any of it is in flight. Every such write moves
+/// [`PLANNER_STARTED`] on when it is made, and [`PLANNER_FINISHED`] once it
+/// is visible to every session: after its statement or user transaction
+/// commits or rolls back. A read cached when both were equal, and still
+/// equal after it, holds while [`PLANNER_FINISHED`] keeps that value.
+static PLANNER_STARTED: AtomicU64 = AtomicU64::new(0);
+static PLANNER_FINISHED: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// Planner writes made on this thread outside a user transaction and not
+    /// yet visible: released by the [`PlannerScope`] they were made in.
+    static PLANNER_PENDING: Cell<u64> = const { Cell::new(0) };
+}
+
+/// A write of something the planner reads is being made on this thread.
+fn note_planner_write() {
+    PLANNER_STARTED.fetch_add(1, Ordering::SeqCst);
+    if !ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
+        let hp = ACTIVE_HANDLE.with(|c| c.get());
+        if !hp.is_null() {
+            // SAFETY: as `note_coll_table_write`.
+            unsafe { (*hp).planner_pending += 1 };
+            return;
+        }
+    }
+    PLANNER_PENDING.with(|p| p.set(p.get() + 1));
+}
+
+/// An in-memory change the planner reads, visible at once.
+fn note_planner_change() {
+    PLANNER_STARTED.fetch_add(1, Ordering::SeqCst);
+    PLANNER_FINISHED.fetch_add(1, Ordering::SeqCst);
+}
+
+/// The generation `Storage::planner_indexes` caches under, `None` while a
+/// write of something it reads is in flight (and nothing is cached).
+pub fn planner_generation() -> Option<u64> {
+    planner_settled()
+}
+
+/// The planner generation, when no planner write is in flight.
+fn planner_settled() -> Option<u64> {
+    let finished = PLANNER_FINISHED.load(Ordering::SeqCst);
+    (PLANNER_STARTED.load(Ordering::SeqCst) == finished).then_some(finished)
+}
+
+/// Releases, when dropped, the planner writes this thread made during the
+/// scope (plus `extra`, a user transaction's): declared before anything that
+/// commits, so it drops after the commit has made them visible.
+struct PlannerScope {
+    base: u64,
+    extra: u64,
+}
+
+impl PlannerScope {
+    fn new() -> Self {
+        PlannerScope {
+            base: PLANNER_PENDING.with(Cell::get),
+            extra: 0,
+        }
+    }
+
+    /// The end of a user transaction: what it wrote becomes visible (or is
+    /// undone) now, including what its commit writes itself.
+    fn ending(handle: &mut UserTransactionHandle) -> Self {
+        let mut scope = PlannerScope::new();
+        scope.extra = std::mem::take(&mut handle.planner_pending);
+        if handle.wrote_registry {
+            PLANNER_STARTED.fetch_add(1, Ordering::SeqCst);
+            scope.extra += 1;
+        }
+        scope
+    }
+}
+
+impl Drop for PlannerScope {
+    fn drop(&mut self) {
+        let made = PLANNER_PENDING.with(|p| p.replace(self.base)) - self.base;
+        let done = made + self.extra;
+        if done > 0 {
+            PLANNER_FINISHED.fetch_add(done, Ordering::SeqCst);
+        }
+    }
+}
+
 /// A write of the collection registry is being made on this thread: move
 /// [`COLL_TABLE_GEN`] on, and mark the user transaction it is part of.
 fn note_coll_table_write() {
     COLL_TABLE_GEN.fetch_add(1, Ordering::SeqCst);
+    note_planner_write();
     if ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
         return;
     }

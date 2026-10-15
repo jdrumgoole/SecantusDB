@@ -1160,6 +1160,19 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     let coll = coll_arg(doc, "drop")?;
     let ns = format!("{}.{}", ctx.db_name, coll);
+    // mongod keeps the profiler's collection while it writes to it.
+    if coll == crate::profiler::PROFILE_COLLECTION
+        && ctx
+            .profiler
+            .as_ref()
+            .is_some_and(|p| p.settings(&ctx.db_name).level != 0)
+    {
+        return Err(CommandError::new(
+            20,
+            "IllegalOperation",
+            "turn off profiling before dropping system.profile collection",
+        ));
+    }
     let storage = ctx.storage()?;
     // `system.views` holds every view's definition: dropping it drops them
     // all. It used to answer ok and leave the views in place.
@@ -1194,10 +1207,12 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // for a collection with two secondary indexes, where this always said 1
     // (measured 8.2.11, 2026-09-30). A collection that does not exist lists
     // nothing, and that branch reports no count at all.
-    let n_indexes = storage
-        .list_indexes(&ctx.db_name, &coll)
-        .map(|ix| ix.len().max(1))
-        .unwrap_or(1);
+    // `system.profile` alone has no `_id` index to count.
+    let n_indexes = match storage.list_indexes(&ctx.db_name, &coll) {
+        Ok(ix) if coll == crate::profiler::PROFILE_COLLECTION => ix.len(),
+        Ok(ix) => ix.len().max(1),
+        Err(_) => 1,
+    };
     // A time-series collection has no `_id` index to count.
     let n_indexes = if storage
         .get_collection_options(&ctx.db_name, &coll)
@@ -1385,18 +1400,7 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         .and_then(Bson::as_document)
         .filter(|d| !d.is_empty());
     let name_only = bool_field(doc, "nameOnly", false);
-    let mut names = storage
-        .list_collections(&ctx.db_name)
-        .map_err(command_error)?;
-    // A set member's oplog is `local.oplog.rs`. Here it is the oplog table,
-    // with no catalog entry, so it is added by name.
-    if ctx.db_name == "local"
-        && ctx.replica_set_name.is_some()
-        && !names.iter().any(|n| n == "oplog.rs")
-    {
-        names.push("oplog.rs".to_string());
-        names.sort();
-    }
+    let mut names = listed_collection_names(storage, &ctx.db_name, ctx.replica_set_name.is_some())?;
     // `authorizedCollections` lists only the collections the user has any
     // action on, which leaves out a system collection unless the user has
     // `anyResource` or that collection's name (measured 8.2.11: `read` on
@@ -1412,10 +1416,50 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
             });
         }
     }
+    let mut entries = collection_entries(storage, &ctx.db_name, &names)?;
+    // With `nameOnly` the filter sees what is returned, the name and the
+    // type: `{"options.capped": true}` then matches nothing (mongod 8.2.11).
+    if name_only {
+        for e in &mut entries {
+            let name = e.get_str("name").unwrap_or("").to_string();
+            let ty = e.get_str("type").unwrap_or("collection").to_string();
+            *e = doc! { "name": name, "type": ty };
+        }
+    }
+    if let Some(f) = filter {
+        entries.retain(|e| {
+            secantus_core::query::matches(e, f, &Document::new(), None).unwrap_or(false)
+        });
+    }
+    let ns = format!("{}.$cmd.listCollections", ctx.db_name);
+    // Honour `cursor: {batchSize: N}` so a client that asks for a small batch
+    // gets a real getMore (drivers' "listCollections getMore is monitored"
+    // tests force this); absent ⇒ the wire default.
+    let batch_size = doc
+        .get("cursor")
+        .and_then(Bson::as_document)
+        .and_then(|c| c.get("batchSize"))
+        .and_then(as_i64)
+        .unwrap_or(DEFAULT_BATCH_SIZE as i64);
+    let (first, cid) = split_into_cursor(encode_docs(entries)?, batch_size, &ns, cursors, true)?;
+    Ok(doc! {
+        "cursor": { "id": Bson::Int64(cid), "ns": ns, "firstBatch": docs_to_bson(first)? },
+        "ok": 1.0,
+    })
+}
+
+/// `listCollections`' entry for each of `names` in `db`, followed by those
+/// of what mongod keeps beside them and this server derives: a
+/// `system.buckets.<name>` per time-series collection, and `system.views`.
+pub(crate) fn collection_entries(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    names: &[String],
+) -> Result<Vec<Document>, CommandError> {
     let mut entries: Vec<Document> = Vec::with_capacity(names.len());
-    for n in &names {
+    for n in names {
         let mut options = storage
-            .get_collection_options(&ctx.db_name, n)
+            .get_collection_options(db, n)
             .map_err(command_error)?;
         // A `viewOn` collection is a read-only view: type "view", readOnly true,
         // no `_id` index, and the stored `viewPipeline` surfaces as `pipeline`.
@@ -1501,10 +1545,10 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         // right type.
         let mut info = doc! { "readOnly": is_view };
         // A view is a definition, not a collection: it has no uuid.
-        let uuid = if ctx.db_name == "local" && n == "oplog.rs" {
+        let uuid = if db == "local" && n == "oplog.rs" {
             Ok(crate::serverinfo::oplog_uuid(storage))
         } else {
-            storage.collection_uuid(&ctx.db_name, n)
+            storage.collection_uuid(db, n)
         };
         if let (false, Ok(uuid)) = (is_view, uuid) {
             if uuid.len() == 16 {
@@ -1529,7 +1573,12 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         };
         // A clustered collection has no separate `_id_` index (the clustering
         // key IS the index), so mongod omits `idIndex` for it — same as views.
-        if !is_view && !is_clustered && coll_type != "timeseries" {
+        // Nor has `system.profile` (mongod 8.2.11).
+        if !is_view
+            && !is_clustered
+            && coll_type != "timeseries"
+            && n.as_str() != crate::profiler::PROFILE_COLLECTION
+        {
             let mut id_index = doc! {
                 "v": 2,
                 "key": { "_id": 1 },
@@ -1562,7 +1611,7 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         };
         let time = definition.get_str("timeField").unwrap_or_default();
         let mut info = doc! { "readOnly": false };
-        if let Ok(uuid) = storage.collection_uuid(&ctx.db_name, name) {
+        if let Ok(uuid) = storage.collection_uuid(db, name) {
             info.insert("uuid", crate::ts_buckets::derived_uuid(&uuid, 1));
         }
         derived.push(doc! {
@@ -1586,7 +1635,7 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
             "options": {},
             "info": {
                 "readOnly": false,
-                "uuid": crate::ts_buckets::derived_uuid(ctx.db_name.as_bytes(), 2),
+                "uuid": crate::ts_buckets::derived_uuid(db.as_bytes(), 2),
             },
             "idIndex": { "v": 2, "key": { "_id": 1 }, "name": "_id_" },
         });
@@ -1604,35 +1653,24 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
             None => entries.push(entry),
         }
     }
-    // With `nameOnly` the filter sees what is returned, the name and the
-    // type: `{"options.capped": true}` then matches nothing (mongod 8.2.11).
-    if name_only {
-        for e in &mut entries {
-            let name = e.get_str("name").unwrap_or("").to_string();
-            let ty = e.get_str("type").unwrap_or("collection").to_string();
-            *e = doc! { "name": name, "type": ty };
-        }
+    Ok(entries)
+}
+
+/// The collections `listCollections` names in `db`. `set_member`: this
+/// server is a replica-set member, whose oplog is `local.oplog.rs`.
+pub(crate) fn listed_collection_names(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    set_member: bool,
+) -> Result<Vec<String>, CommandError> {
+    let mut names = storage.list_collections(db).map_err(command_error)?;
+    // A set member's oplog is `local.oplog.rs`. Here it is the oplog table,
+    // with no catalog entry, so it is added by name.
+    if db == "local" && set_member && !names.iter().any(|n| n == "oplog.rs") {
+        names.push("oplog.rs".to_string());
+        names.sort();
     }
-    if let Some(f) = filter {
-        entries.retain(|e| {
-            secantus_core::query::matches(e, f, &Document::new(), None).unwrap_or(false)
-        });
-    }
-    let ns = format!("{}.$cmd.listCollections", ctx.db_name);
-    // Honour `cursor: {batchSize: N}` so a client that asks for a small batch
-    // gets a real getMore (drivers' "listCollections getMore is monitored"
-    // tests force this); absent ⇒ the wire default.
-    let batch_size = doc
-        .get("cursor")
-        .and_then(Bson::as_document)
-        .and_then(|c| c.get("batchSize"))
-        .and_then(as_i64)
-        .unwrap_or(DEFAULT_BATCH_SIZE as i64);
-    let (first, cid) = split_into_cursor(encode_docs(entries)?, batch_size, &ns, cursors, true)?;
-    Ok(doc! {
-        "cursor": { "id": Bson::Int64(cid), "ns": ns, "firstBatch": docs_to_bson(first)? },
-        "ok": 1.0,
-    })
+    Ok(names)
 }
 
 /// `listIndexes` — a cursor over the indexes of a collection.
@@ -1658,95 +1696,19 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "listIndexes")?;
     let storage = ctx.storage()?;
     let cursors = ctx.cursors()?;
-    let mut indexes = storage
-        .list_indexes(&ctx.db_name, &coll)
-        .map_err(command_error)?;
-    // `_id_` is always listed first, as on mongod. The rest come back in name
-    // order here (mongod: creation order), which put an index named `$**_1`
-    // or `A_1` ahead of it.
-    indexes.sort_by_key(|ix| ix.get_str("name") != Ok("_id_"));
-    // `hidden` is listed only on an index that is hidden.
-    for ix in &mut indexes {
-        if ix.get_bool("hidden") == Ok(false) {
-            ix.remove("hidden");
-        }
-        // Listed only while it is armed: a unique index has nothing to prepare.
-        if ix.get_bool("prepareUnique") == Ok(false) || ix.get_bool("unique") == Ok(true) {
-            ix.remove("prepareUnique");
-        }
-    }
-    // A collection that exists always has at least the synthesised `_id_` index, so
-    // an empty result means the namespace doesn't exist — mongod errors
-    // NamespaceNotFound (mongo-ruby-driver `Index::View#each ... collection does not
-    // exist`). Mirrors commands.py's `if not indexes`. A set member's oplog
-    // exists and has no index at all.
     let oplog = ctx.db_name == "local" && coll == "oplog.rs" && ctx.replica_set_name.is_some();
-    if indexes.is_empty() && !oplog {
+    let Some(indexes) = listed_indexes(storage, &ctx.db_name, &coll, oplog)? else {
+        // A collection that exists always has at least the synthesised `_id_`
+        // index, so none at all means the namespace doesn't exist — mongod
+        // errors NamespaceNotFound (mongo-ruby-driver `Index::View#each ...
+        // collection does not exist`). Mirrors commands.py's `if not indexes`.
         return Ok(CommandError::new(
             26,
             "NamespaceNotFound",
             format!("ns does not exist: {}.{}", ctx.db_name, coll),
         )
         .into_reply());
-    }
-    // A time-series collection has no `_id` index to list.
-    if storage
-        .get_collection_options(&ctx.db_name, &coll)
-        .is_ok_and(|o| o.contains_key("timeseries"))
-    {
-        indexes.retain(|ix| ix.get_str("name") != Ok("_id_"));
-    }
-    // `multikey` is SecantusDB's internal catalog flag. mongod keeps the
-    // equivalent in the durable catalog and never echoes it from `listIndexes`
-    // (probed 6.0.16) — drivers see it only as explain's `isMultiKey`. Keep it
-    // off the wire. Mirrors commands.py.
-    // `entryFormat` is likewise internal — the on-disk index-entry layout
-    // version (see `ENTRY_FORMAT_RECORDID`). mongod has no such field.
-    for ix in &mut indexes {
-        ix.remove("multikey");
-        ix.remove("entryFormat");
-        ix.remove("collationKeys");
-        ix.remove("geoKeys");
-        ix.remove("pythonKeys");
-    }
-    // The `_id` index of a collection with a default collation carries it.
-    if let Some(default) = crate::util::default_collation(storage, &ctx.db_name, &coll) {
-        for ix in &mut indexes {
-            if ix.get_str("name") == Ok("_id_") {
-                ix.insert("collation", default.spec().clone());
-            }
-        }
-    }
-    // A clustered collection's clustering key IS its index: mongod reports a
-    // single entry carrying `clustered: true` (with the user's name) in place of
-    // the synthesised `_id_`. Mirrors commands.py.
-    let options = storage
-        .get_collection_options(&ctx.db_name, &coll)
-        .unwrap_or_default();
-    if let Ok(ci) = options.get_document("clusteredIndex") {
-        let mut clustered = doc! {
-            "v": ci.get_i32("v").unwrap_or(2),
-            "key": { "_id": 1i32 },
-            "name": ci.get_str("name").unwrap_or("_id_").to_string(),
-            "unique": true,
-        };
-        // The collection's own expiry is its clustered index's (measured
-        // 8.2.11, 2026-10-13); it was left out.
-        if let Some(seconds) = options.get("expireAfterSeconds") {
-            // As an int where it fits one, which is how mongod lists it.
-            let listed = match crate::util::as_i64(seconds).map(i32::try_from) {
-                Some(Ok(n)) => Bson::Int32(n),
-                _ => seconds.clone(),
-            };
-            clustered.insert("expireAfterSeconds", listed);
-        }
-        clustered.insert("clustered", true);
-        let mut rest: Vec<Document> = indexes
-            .into_iter()
-            .filter(|ix| ix.get_str("name") != Ok("_id_"))
-            .collect();
-        indexes = std::iter::once(clustered).chain(rest.drain(..)).collect();
-    }
+    };
     // mongod reports a listIndexes cursor under the PLAIN collection namespace
     // (`db.coll`), not a `$cmd.` pseudo-namespace -- probed on 8.3.4. That is
     // also what drivers put in the follow-up getMore's `collection` field, so a
@@ -1785,6 +1747,96 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         "cursor": { "id": Bson::Int64(cid), "ns": ns, "firstBatch": docs_to_bson(first)? },
         "ok": 1.0,
     })
+}
+
+/// The indexes of `db.coll` as `listIndexes` lists them, `None` when the
+/// collection does not exist. `oplog`: the collection is a set member's
+/// oplog, which exists and has no index at all.
+pub(crate) fn listed_indexes(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    oplog: bool,
+) -> Result<Option<Vec<Document>>, CommandError> {
+    let mut indexes = storage.list_indexes(db, coll).map_err(command_error)?;
+    // `system.profile` exists and has no index at all (mongod creates it
+    // without one), like a set member's oplog.
+    let unindexed = coll == crate::profiler::PROFILE_COLLECTION
+        && storage.collection_exists(db, coll).unwrap_or(false);
+    if indexes.is_empty() && !oplog && !unindexed {
+        return Ok(None);
+    }
+    // `_id_` is always listed first, as on mongod. The rest come back in name
+    // order here (mongod: creation order), which put an index named `$**_1`
+    // or `A_1` ahead of it.
+    indexes.sort_by_key(|ix| ix.get_str("name") != Ok("_id_"));
+    // `hidden` is listed only on an index that is hidden.
+    for ix in &mut indexes {
+        if ix.get_bool("hidden") == Ok(false) {
+            ix.remove("hidden");
+        }
+        // Listed only while it is armed: a unique index has nothing to prepare.
+        if ix.get_bool("prepareUnique") == Ok(false) || ix.get_bool("unique") == Ok(true) {
+            ix.remove("prepareUnique");
+        }
+    }
+    // A time-series collection has no `_id` index to list.
+    if storage
+        .get_collection_options(db, coll)
+        .is_ok_and(|o| o.contains_key("timeseries"))
+    {
+        indexes.retain(|ix| ix.get_str("name") != Ok("_id_"));
+    }
+    // `multikey` is SecantusDB's internal catalog flag. mongod keeps the
+    // equivalent in the durable catalog and never echoes it from `listIndexes`
+    // (probed 6.0.16) — drivers see it only as explain's `isMultiKey`. Keep it
+    // off the wire. Mirrors commands.py.
+    // `entryFormat` is likewise internal — the on-disk index-entry layout
+    // version (see `ENTRY_FORMAT_RECORDID`). mongod has no such field.
+    for ix in &mut indexes {
+        ix.remove("multikey");
+        ix.remove("entryFormat");
+        ix.remove("collationKeys");
+        ix.remove("geoKeys");
+        ix.remove("pythonKeys");
+    }
+    // The `_id` index of a collection with a default collation carries it.
+    if let Some(default) = crate::util::default_collation(storage, db, coll) {
+        for ix in &mut indexes {
+            if ix.get_str("name") == Ok("_id_") {
+                ix.insert("collation", default.spec().clone());
+            }
+        }
+    }
+    // A clustered collection's clustering key IS its index: mongod reports a
+    // single entry carrying `clustered: true` (with the user's name) in place of
+    // the synthesised `_id_`. Mirrors commands.py.
+    let options = storage.get_collection_options(db, coll).unwrap_or_default();
+    if let Ok(ci) = options.get_document("clusteredIndex") {
+        let mut clustered = doc! {
+            "v": ci.get_i32("v").unwrap_or(2),
+            "key": { "_id": 1i32 },
+            "name": ci.get_str("name").unwrap_or("_id_").to_string(),
+            "unique": true,
+        };
+        // The collection's own expiry is its clustered index's (measured
+        // 8.2.11, 2026-10-13); it was left out.
+        if let Some(seconds) = options.get("expireAfterSeconds") {
+            // As an int where it fits one, which is how mongod lists it.
+            let listed = match crate::util::as_i64(seconds).map(i32::try_from) {
+                Some(Ok(n)) => Bson::Int32(n),
+                _ => seconds.clone(),
+            };
+            clustered.insert("expireAfterSeconds", listed);
+        }
+        clustered.insert("clustered", true);
+        let mut rest: Vec<Document> = indexes
+            .into_iter()
+            .filter(|ix| ix.get_str("name") != Ok("_id_"))
+            .collect();
+        indexes = std::iter::once(clustered).chain(rest.drain(..)).collect();
+    }
+    Ok(Some(indexes))
 }
 
 /// `createIndexes` — create one or more indexes (auto-creating the collection).
@@ -3365,11 +3417,15 @@ pub(crate) fn time_series_stats(coll: &str, ctx: &CommandContext) -> HandlerResu
     })
 }
 
-/// `serverStatus` — a minimal subset (host / version / process / uptime), plus a
-/// live `metrics.cursor.open.total` so drivers can track cursor lifecycle
-/// (mongo-php-driver `cursor-destruct-001` opens a batched cursor and asserts the
-/// count rises by one, then returns to baseline after `killCursors`).
-pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+/// `serverStatus` — the sections this server has true numbers for, in
+/// mongod's order (`crate::status` has the counting rules). A section of
+/// mongod's that needs a mechanism this server does not have (`locks`, a lock
+/// manager's acquisitions; `repl`; the plan cache) is absent rather than
+/// reported as zeros. `metrics.cursor.open.total` is live so drivers can track
+/// cursor lifecycle (mongo-php-driver `cursor-destruct-001` opens a batched
+/// cursor and asserts the count rises by one, then returns to baseline after
+/// `killCursors`).
+pub fn server_status(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // `CursorRegistry::len` prunes idle cursors then counts the live ones — the
     // count rises while a batched cursor is open and drops on killCursors.
     let open_cursors = ctx.cursors().map(|c| c.len()).unwrap_or(0) as i64;
@@ -3378,11 +3434,23 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     // Defaults to persistent when there is no storage (unit-test contexts),
     // matching the Python server's fallback rather than erroring the command.
     let persistent = ctx.storage().map(|s| !s.in_memory()).unwrap_or(true);
-    let mut metrics = doc! {
-        "cursor": {
+    let status = ctx.top_stats.as_ref().map(|s| &s.status);
+    let txns = ctx.transactions.as_ref().map(|t| t.counts());
+    let mut metrics = Document::new();
+    if let Some(status) = status {
+        metrics.insert("commands", status.commands());
+    }
+    metrics.insert(
+        "cursor",
+        doc! {
             "open": { "total": open_cursors, "pinned": 0i64, "noTimeout": 0i64 },
         },
-    };
+    );
+    if let Some(status) = status {
+        metrics.insert("document", status.document());
+        metrics.insert("operation", status.operation());
+        metrics.insert("query", status.query());
+    }
     // The TTL monitor's counters. Drivers' and users' tests wait on `passes`
     // to know a sweep has happened instead of sleeping for one.
     if let Some((_, _, passes, deleted)) = ctx.storage().ok().and_then(|s| s.ttl_monitor()) {
@@ -3421,7 +3489,8 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         .as_ref()
         .map(|s| s.network())
         .unwrap_or_default();
-    Ok(doc! {
+    // mongod's order: the sections by name, then `mem` and `metrics`.
+    let mut reply = doc! {
         "host": host,
         "version": crate::SERVER_VERSION,
         "process": "mongod",
@@ -3430,38 +3499,66 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         "uptimeMillis": Bson::Int64(up_millis),
         "uptimeEstimate": Bson::Int64(up_millis / 1000),
         "localTime": now,
-        "metrics": metrics,
-        // mongo-c-driver's `/Client/exhaust_cursor/{single,pool}` read
-        // `connections.totalCreated` off serverStatus to check the connection
-        // pool wasn't cleared. Omitting the section made those fail with
-        // "'connections.totalCreated' field not found" — a serverStatus gap
-        // that looked like an exhaust-cursor bug. Mirrors the Python server's
-        // zeroed block; SecantusDB keeps no pool counters.
-        // Int32, not Int64: libmongoc reads these with `bson_lookup_int32`,
-        // which type-checks rather than coercing ("'connections.totalCreated'
-        // is not a int32"). The Python server emits plain ints, which encode
-        // as Int32, so it never hit this.
-        "connections": {
+    };
+    if let Some(status) = status {
+        reply.insert("asserts", status.asserts());
+    }
+    // mongo-c-driver's `/Client/exhaust_cursor/{single,pool}` read
+    // `connections.totalCreated` off serverStatus to check the connection
+    // pool wasn't cleared. Omitting the section made those fail with
+    // "'connections.totalCreated' field not found" — a serverStatus gap
+    // that looked like an exhaust-cursor bug. Mirrors the Python server's
+    // zeroed block; SecantusDB keeps no pool counters.
+    // Int32, not Int64: libmongoc reads these with `bson_lookup_int32`,
+    // which type-checks rather than coercing ("'connections.totalCreated'
+    // is not a int32"). The Python server emits plain ints, which encode
+    // as Int32, so it never hit this.
+    reply.insert(
+        "connections",
+        doc! {
             "current": conns.current as i32,
             "available": 0i32,
             "totalCreated": conns.total_created as i32,
         },
-        "opcounters": opcounters,
-        // What the server has read and written, counted off the sockets.
-        "network": {
+    );
+    if let Some(extra) = crate::procstats::extra_info() {
+        reply.insert("extra_info", extra);
+    }
+    if let Some(status) = status {
+        reply.insert("globalLock", global_lock(status, up_millis, ctx));
+    }
+    reply.insert(
+        "logicalSessionRecordCache",
+        logical_session_record_cache(ctx),
+    );
+    // What the server has read and written, counted off the sockets.
+    reply.insert(
+        "network",
+        doc! {
             "bytesIn": Bson::Int64(network[1]),
             "bytesOut": Bson::Int64(network[2]),
             "numRequests": Bson::Int64(network[0]),
         },
-        // Storage-engine identity. Drivers gate real behaviour on this:
-        // mongo-php-library's `skipIfTransactionsNotSupported` reads
-        // `storageEngine.name` and throws "Could not determine server storage
-        // engine" when the key is absent, turning ~27 transaction tests into
-        // ERRORs instead of the clean skip the helper intends. Reporting
-        // "wiredTiger" is honest — SecantusDB is WiredTiger-backed, the same
-        // engine mongod uses. Kept byte-identical to the Python server's
-        // `_storage_engine_section`.
-        "storageEngine": {
+    );
+    if let Some(status) = status {
+        let txn_latency = txns.map(|t| (t.latency_micros, t.total_committed + t.total_aborted));
+        reply.insert("opLatencies", status.op_latencies(txn_latency));
+    }
+    reply.insert("opcounters", opcounters);
+    if let Some(status) = status {
+        reply.insert("security", status.security());
+    }
+    // Storage-engine identity. Drivers gate real behaviour on this:
+    // mongo-php-library's `skipIfTransactionsNotSupported` reads
+    // `storageEngine.name` and throws "Could not determine server storage
+    // engine" when the key is absent, turning ~27 transaction tests into
+    // ERRORs instead of the clean skip the helper intends. Reporting
+    // "wiredTiger" is honest — SecantusDB is WiredTiger-backed, the same
+    // engine mongod uses. Kept byte-identical to the Python server's
+    // `_storage_engine_section`.
+    reply.insert(
+        "storageEngine",
+        doc! {
             "name": "wiredTiger",
             "supportsCommittedReads": true,
             "supportsPendingDrops": true,
@@ -3470,14 +3567,151 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             "persistent": persistent,
             "backupCursorOpen": false,
         },
-        // Categorical self-identification: real mongod never has this key.
-        // Tooling (the conformance-gauge tripwire, ad-hoc smoke scripts)
-        // checks it to prove it's talking to SecantusDB rather than an
-        // accidental real MongoDB on the same address. The Python server
-        // reports `server: "python"`.
-        "secantus": { "server": "rust", "version": env!("CARGO_PKG_VERSION") },
-        "ok": 1.0,
-    })
+    );
+    if let Some(t) = txns {
+        let (retried_commands, retried_statements) =
+            status.map(|s| s.retried()).unwrap_or_default();
+        reply.insert(
+            "transactions",
+            doc! {
+                "retriedCommandsCount": Bson::Int64(retried_commands),
+                "retriedStatementsCount": Bson::Int64(retried_statements),
+                "currentActive": Bson::Int64(t.current_active),
+                "currentInactive": Bson::Int64(t.current_inactive),
+                "currentOpen": Bson::Int64(t.current_active + t.current_inactive),
+                "totalAborted": Bson::Int64(t.total_aborted),
+                "totalCommitted": Bson::Int64(t.total_committed),
+                "totalStarted": Bson::Int64(t.total_started),
+            },
+        );
+    }
+    let engine_statistics = if section_wanted(doc, "wiredTiger") {
+        ctx.storage().ok().and_then(|s| s.engine_statistics())
+    } else {
+        None
+    };
+    // Statistics the engine cannot give (a store opened with
+    // `statistics=(none)`) degrade the section, not the command: mongod
+    // 8.2.11 answers `ok: 1` with this error triple in their place.
+    match engine_statistics {
+        Some(Ok((version, stats))) => {
+            reply.insert("wiredTiger", wired_tiger_section(&version, stats));
+        }
+        Some(Err(e)) => {
+            let errmsg = crate::util::command_error(e).errmsg;
+            let reason = wired_tiger_reason(&errmsg);
+            reply.insert(
+                "wiredTiger",
+                doc! {
+                    "error": "unable to retrieve statistics",
+                    "code": 43_i32,
+                    "reason": format!("unable to open cursor at URI statistics:. reason: {reason}"),
+                },
+            );
+        }
+        None => {}
+    }
+    if let Some(mem) = crate::procstats::mem() {
+        reply.insert("mem", mem);
+    }
+    reply.insert("metrics", metrics);
+    // Categorical self-identification: real mongod never has this key.
+    // Tooling (the conformance-gauge tripwire, ad-hoc smoke scripts)
+    // checks it to prove it's talking to SecantusDB rather than an
+    // accidental real MongoDB on the same address. The Python server
+    // reports `server: "python"`.
+    reply.insert(
+        "secantus",
+        doc! { "server": "rust", "version": env!("CARGO_PKG_VERSION") },
+    );
+    // A section asked for as `name: 0` (or `false`) is left out, as mongod
+    // leaves it out; the process's own fields always stay.
+    for (key, _) in doc.iter().skip(1) {
+        if !section_wanted(doc, key) && reply.get_document(key).is_ok() && key != "secantus" {
+            reply.remove(key);
+        }
+    }
+    reply.insert("ok", 1.0);
+    Ok(reply)
+}
+
+/// Whether `serverStatus` reports `section`: unless the command turns it off
+/// with a false value.
+fn section_wanted(doc: &Document, section: &str) -> bool {
+    !matches!(
+        doc.get(section),
+        Some(Bson::Boolean(false) | Bson::Int32(0) | Bson::Int64(0))
+    ) && !matches!(doc.get(section), Some(Bson::Double(d)) if *d == 0.0)
+}
+
+/// `globalLock`: how long the server has run, the reads and writes running,
+/// and the ones queued. This server has no global lock; what queues an
+/// operation here is the storage engine's write admission (off unless
+/// configured), which is where mongod queues one too -- its tickets are
+/// taken with the global lock. A read never queues here.
+fn global_lock(
+    status: &crate::status::StatusCounters,
+    up_millis: i64,
+    ctx: &CommandContext,
+) -> Document {
+    let (readers, writers) = status.active_clients();
+    let queued = ctx
+        .storage()
+        .map(|s| s.writes_waiting() as i32)
+        .unwrap_or(0);
+    doc! {
+        "totalTime": Bson::Int64(up_millis.saturating_mul(1000)),
+        "currentQueue": { "total": queued, "readers": 0i32, "writers": queued },
+        "activeClients": {
+            "total": (readers + writers) as i32,
+            "readers": readers as i32,
+            "writers": writers as i32,
+        },
+    }
+}
+
+/// `logicalSessionRecordCache`: the sessions in use (what
+/// `$listLocalSessions` lists) and the sessions holding transaction or
+/// retryable-write state. mongod's other fields time its periodic refresh of
+/// `config.system.sessions`, which this server does not run.
+fn logical_session_record_cache(ctx: &CommandContext) -> Document {
+    let active = ctx.server_params.as_ref().map_or(0, |p| p.sessions().len());
+    let catalog = ctx.transactions.as_ref().map_or(0, |t| t.session_count());
+    doc! {
+        "activeSessionsCount": active as i32,
+        "sessionCatalogSize": catalog as i32,
+    }
+}
+
+/// `serverStatus.wiredTiger`, as mongod builds it from the same cursor: the
+/// statistics grouped by the category their description begins with
+/// (`"cache: bytes currently in the cache"`), in the engine's order.
+/// WiredTiger's own words for a failure, out of this server's rendering
+/// of it (`WtError { code: 22, message: "Invalid argument" }`).
+fn wired_tiger_reason(errmsg: &str) -> &str {
+    errmsg
+        .split_once("message: \"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map_or(errmsg, |(message, _)| message)
+}
+
+fn wired_tiger_section(version: &str, stats: Vec<(String, i64)>) -> Document {
+    let mut out = doc! { "uri": "statistics:", "version": version };
+    for (description, value) in stats {
+        let (category, name) = description
+            .split_once(": ")
+            .unwrap_or(("", description.as_str()));
+        let value = i32::try_from(value).map_or(Bson::Int64(value), Bson::Int32);
+        match out.get_mut(category) {
+            Some(Bson::Document(group)) => {
+                group.insert(name, value);
+            }
+            _ => {
+                out.insert(category, doc! { name: value });
+            }
+        }
+    }
+    out
 }
 
 /// `currentOp` — mongod's in-flight-operation introspection. SecantusDB runs
@@ -3771,37 +4005,23 @@ pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     Ok(reply)
 }
 
-/// `profile` — get / set per-database profiling level. `{profile: -1}` reads;
-/// `{profile: 0|1|2, slowms, sampleRate}` updates. The reply carries the
-/// PREVIOUS values under `was` / `slowms` / `sampleRate`. Ports
-/// `commands.py::_profile`. (SecantusDB records the level but does no actual
-/// slow-op profiling — `system.profile` stays a faithful stub.)
+/// `profile` -- read or change the database's profiling settings
+/// ([`crate::profiler`]). The reply carries the settings as they were:
+/// `was` (the level), the server-wide `slowms` and `sampleRate`, the
+/// `filter` when one was set, and mongod's `note` whenever a filter was set
+/// or is being given.
+///
+/// mongod's reading of the arguments (8.2.11): the level is any number,
+/// truncated; one outside 0..=2 leaves the level alone but still applies
+/// `slowms`, `sampleRate` and `filter`. `slowms` is any number, truncated and
+/// not range-checked; `sampleRate` is a number from 0 to 1; `filter` is a
+/// document or the string "unset" (null is refused). Setting level 1 or 2
+/// creates `system.profile` at once.
 pub fn profile(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let db = ctx.db_name.clone();
-    let storage = ctx.storage()?;
-    let prev = storage.get_profile(&db).map_err(command_error)?;
-    let prev_level = prev.get_i32("level").unwrap_or(0);
-    // `slowms` and `sampleRate` are server-wide on mongod: set through one
-    // database, read back through every other (probed on 8.2.11). Only the
-    // level is per-database.
-    let slow_ops = ctx.slow_ops.clone();
-    let (prev_slowms, prev_rate) = match &slow_ops {
-        Some(s) => (s.slow_ms(), s.sample_rate()),
-        None => (
-            prev.get_i32("slowms").unwrap_or(100),
-            prev.get_f64("sampleRate").unwrap_or(1.0),
-        ),
-    };
-    let was = doc! {
-        "was": prev_level,
-        "slowms": prev_slowms,
-        "sampleRate": prev_rate,
-        "ok": 1.0,
-    };
-    // mongod's reading of the arguments (8.2.11): the level is any number,
-    // truncated; one outside 0..=2 changes nothing and reads the settings.
-    // `slowms` is any number, truncated and not range-checked; `sampleRate`
-    // is a number from 0 to 1; `filter` is a document or the string "unset".
+    let profiler = ctx.profiler.get_or_insert_with(Default::default).clone();
+    let slow_ops = ctx.slow_ops.get_or_insert_with(Default::default).clone();
+    let prev = profiler.settings(&db);
     let number = |field: &str| -> Result<Option<f64>, CommandError> {
         match doc.get(field) {
             None => Ok(None),
@@ -3836,19 +4056,12 @@ pub fn profile(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             "'sampleRate' must be between 0.0 and 1.0 inclusive",
         ));
     }
-    match doc.get("filter") {
-        None | Some(Bson::Null) => {}
-        Some(Bson::String(word)) if word == "unset" => {}
-        // A filter chooses what is profiled, and this profiler has none:
-        // taking one and profiling as before would be a setting that does
-        // nothing, so it is refused.
-        Some(Bson::Document(_)) => {
-            return Err(CommandError::new(
-                238,
-                "NotImplemented",
-                "a profile filter is not supported by this server",
-            ));
-        }
+    let filter = match doc.get("filter") {
+        None => None,
+        Some(Bson::String(word)) if word == "unset" => Some(None),
+        Some(Bson::Document(f)) => Some(Some(std::sync::Arc::new(
+            crate::profiler::filter::ProfileFilter::parse(f)?,
+        ))),
         Some(_) => {
             return Err(CommandError::new(
                 2,
@@ -3856,17 +4069,50 @@ pub fn profile(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 "Expected an object, or the string 'unset'.",
             ));
         }
+    };
+    let mut was = doc! {
+        "was": prev.level,
+        "slowms": slow_ops.slow_ms(),
+        "sampleRate": slow_ops.sample_rate(),
+    };
+    if let Some(f) = &prev.filter {
+        was.insert("filter", f.serialized().clone());
     }
-    if !(0..=2).contains(&level) {
-        return Ok(was);
+    if prev.filter.is_some() || filter.is_some() {
+        was.insert(
+            "note",
+            "When a filter expression is set, slowms and sampleRate are not used for \
+             profiling and slow-query log lines.",
+        );
     }
-    let slowms = slowms.unwrap_or(prev_slowms);
-    let rate = rate.unwrap_or(prev_rate);
-    storage
-        .set_profile(&db, level as i32, slowms, rate)
-        .map_err(command_error)?;
-    if let Some(s) = &slow_ops {
-        s.set(slowms, rate);
+    was.insert("ok", 1.0);
+    let level = (0..=2).contains(&level).then_some(level as i32);
+    if slowms.is_some() || rate.is_some() {
+        slow_ops.set(
+            slowms.unwrap_or_else(|| slow_ops.slow_ms()),
+            rate.unwrap_or_else(|| slow_ops.sample_rate()),
+        );
+    }
+    if level.is_some() || filter.is_some() {
+        profiler.set(&db, level, filter);
+    }
+    if level.is_some_and(|l| l > 0) {
+        let storage = ctx.storage()?;
+        if !storage
+            .collection_exists(&db, crate::profiler::PROFILE_COLLECTION)
+            .map_err(command_error)?
+        {
+            storage
+                .create_collection_with_options(
+                    &db,
+                    crate::profiler::PROFILE_COLLECTION,
+                    &doc! {
+                        "capped": true,
+                        "size": crate::profiler::PROFILE_COLLECTION_BYTES,
+                    },
+                )
+                .map_err(command_error)?;
+        }
     }
     Ok(was)
 }

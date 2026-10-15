@@ -274,7 +274,7 @@ See the [SQL / PostgreSQL interface](sql.md).
 Both servers share the project-wide non-goals — anything that depends on **real
 cluster topology** (multi-node replica sets, sharding, elections, cross-node
 oplog), auth mechanisms beyond SCRAM (SHA-1 / SHA-256) and `MONGODB-X509`,
-`OP_COMPRESSED`, text / hashed / wildcard indexes, and
+text / hashed / wildcard indexes, and
 `$where` / `$function` / `$accumulator` / JS `mapReduce` (no embedded JS
 runtime).
 These are out of scope for **both** servers; the per-feature detail lives in
@@ -287,9 +287,9 @@ divergences are the stopgaps and known edge cases enumerated in
 [Compatibility](compatibility.md) — the `_id` numeric-type bridge is
 undefined for `NaN` / infinity, `top` counters are always zero, and a handful
 of date-format and
-`$group`-ordering edge cases. There is no *feature* the Python server is
-missing relative to the in-scope set; it is the conformance reference the Rust
-server is measured against.
+`$group`-ordering edge cases. It does not speak `OP_COMPRESSED`, which the
+Rust server does (`snappy`, `zstd`, `zlib`); a driver asked to compress
+simply sends uncompressed to it.
 
 ### Rust server
 

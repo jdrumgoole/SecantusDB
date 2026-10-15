@@ -123,7 +123,7 @@ def test_server_status_sections(rust_mongo: Any) -> None:
     assert want - got == set()
 
 
-@pytest.mark.backlog("RM-034")
+@pytest.mark.backlog_fixed("RM-034")
 def test_server_status_metrics(rust_mongo: Any) -> None:
     """mongod 8.2.11's `metrics` holds `document`, `operation`, `query`,
     `commands` beside `cursor` and `ttl`."""
@@ -146,7 +146,7 @@ def test_set_parameter_at_runtime(rust_mongo: Any) -> None:
     assert (a, b) == (("ok", 600000), ("ok", 60))
 
 
-@pytest.mark.backlog("RM-035")
+@pytest.mark.backlog_fixed("RM-035")
 def test_notablescan_parameter(rust_mongo: Any) -> None:
     """mongod 8.2.11 has `notablescan` (false by default)."""
     got = mongo_answer(
@@ -211,7 +211,7 @@ def test_admin_only_command_parses_its_argument_first(rust_mongo: Any) -> None:
     )
 
 
-@pytest.mark.backlog("RM-038")
+@pytest.mark.backlog_fixed("RM-038")
 def test_profile_filter_is_stored(rust_mongo: Any) -> None:
     """mongod 8.2.11 stores a profile `filter` and reports it, normalised."""
     db = _fresh(rust_mongo, "rm038")
@@ -223,7 +223,7 @@ def test_profile_filter_is_stored(rust_mongo: Any) -> None:
     assert mongo_answer(run) == ("ok", {"op": {"$eq": "query"}})
 
 
-@pytest.mark.backlog("RM-038")
+@pytest.mark.backlog_fixed("RM-038")
 def test_profile_level_creates_system_profile(rust_mongo: Any) -> None:
     """mongod 8.2.11: setting level 1 or 2 creates `system.profile` at once,
     capped."""
@@ -238,7 +238,7 @@ def test_profile_level_creates_system_profile(rust_mongo: Any) -> None:
     assert got == [(True, ("ok", True))] * 2
 
 
-@pytest.mark.backlog("RM-039")
+@pytest.mark.backlog_fixed("RM-039")
 def test_hello_names_compressors(rust_mongo: Any) -> None:
     """mongod 8.2.11 answers a `compression` list with the ones it speaks."""
     reply = rust_mongo.admin.command("hello", compression=["zlib", "snappy", "zstd"])
@@ -276,7 +276,7 @@ def test_coll_stats_wiredtiger_and_index_details(rust_mongo: Any) -> None:
     assert ("wiredTiger" in stats, "indexDetails" in stats) == (True, True)
 
 
-@pytest.mark.backlog("RM-040")
+@pytest.mark.backlog_fixed("RM-040")
 def test_index_stats_counts_use(rust_mongo: Any) -> None:
     """mongod 8.2.11: two finds through `a_1` count two accesses."""
     db = _fresh(rust_mongo, "rm040ix")
@@ -309,7 +309,7 @@ def test_list_databases_lists_admin_and_config(rust_mongo: Any) -> None:
     assert {"admin", "config", "local"} - names == set()
 
 
-@pytest.mark.backlog("RM-040")
+@pytest.mark.backlog_fixed("RM-040")
 def test_list_catalog_stage(rust_mongo: Any) -> None:
     """mongod 8.2.11 has `$listCatalog`."""
     got = mongo_answer(lambda: len(list(rust_mongo.admin.aggregate([{"$listCatalog": {}}]))) > 0)

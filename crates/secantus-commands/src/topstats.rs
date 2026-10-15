@@ -99,6 +99,8 @@ pub struct TopStats {
     ops: [std::sync::atomic::AtomicI64; 6],
     /// `serverStatus.network`: requests read, bytes read, bytes written.
     net: [std::sync::atomic::AtomicI64; 3],
+    /// The rest of `serverStatus`'s counters.
+    pub status: crate::status::StatusCounters,
 }
 
 /// The names of `serverStatus.opcounters`, in mongod's order.

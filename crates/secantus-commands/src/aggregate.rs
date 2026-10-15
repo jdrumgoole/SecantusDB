@@ -180,9 +180,16 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if let Err(e) = validate_stage_names(&pipeline) {
         return Ok(e.into_reply());
     }
+    if let Err(e) = crate::list_catalog::spec_problem(&pipeline) {
+        return Ok(e.into_reply());
+    }
     if let Err(e) = source_stage_problem(&pipeline, &ctx.db_name, coll.as_deref()) {
         return Ok(e.into_reply());
     }
+    if let Err(e) = crate::list_catalog::place_problem(&pipeline, &ctx.db_name, coll.as_deref()) {
+        return Ok(e.into_reply());
+    }
+    crate::list_catalog::set_member(ctx.replica_set_name.is_some());
     let seen = ctx
         .server_params
         .as_ref()
@@ -434,8 +441,21 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             // (recursively for a view-on-a-view). The reply ns keeps the queried
             // (view) name; only the fetch reads the base collection. Mirrors
             // commands._resolve_view.
-            let (base_coll, pipeline) = resolve_view(storage, &ctx.db_name, c, pipeline)?;
+            // `$listCatalog` reads the catalog, not the documents: a
+            // namespace this server derives (`system.views`, a time-series
+            // collection's buckets) is listed as the collection mongod
+            // keeps, not read as the view it is here.
+            let derived = first_stage_has(&pipeline, crate::list_catalog::STAGE)
+                && (c == "system.views"
+                    || crate::ts_buckets::bucketed(storage, &ctx.db_name, c).is_some());
+            let (base_coll, pipeline) = if derived {
+                (c.clone(), pipeline)
+            } else {
+                resolve_view(storage, &ctx.db_name, c, pipeline)?
+            };
             let c = base_coll.as_str();
+            // A view's stages go in front of a `$listCatalog`.
+            crate::list_catalog::place_problem(&pipeline, &ctx.db_name, Some(c))?;
             // Stages that generate / read their own input start from no docs.
             if first_stage_has_any(
                 &pipeline,
@@ -448,7 +468,24 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 ],
             ) {
                 (ns, Vec::new(), pipeline)
+            } else if first_stage_has(&pipeline, crate::list_catalog::STAGE) {
+                // Through a view, the entry of the collection beneath it.
+                let entries = crate::list_catalog::entries(storage, &ctx.db_name, Some(c))?;
+                (ns, entries, pipeline[1..].to_vec())
             } else {
+                if crate::notablescan::enabled(ctx) {
+                    let (filter, sort) = crate::explain::pipeline_query(c, &pipeline);
+                    crate::notablescan::check(
+                        ctx,
+                        &crate::notablescan::Read {
+                            coll: c,
+                            filter: &filter,
+                            sort: sort.as_ref(),
+                            hint,
+                            collation: collation.as_ref(),
+                        },
+                    )?;
+                }
                 // Lift a leading $match into the fetch filter (dropping it from
                 // the pipeline). A leading bounded $geoNear instead rides its geo
                 // index via a conservative $geoWithin candidate fetch — the stage
@@ -509,6 +546,27 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     None => read(None, 0),
                 }
                 .map_err(command_error)?;
+                // The plan the pipeline's first read runs uses its indexes
+                // once (a `$lookup`'s reads count none: measured 8.2.11).
+                crate::explain::order::count_index_use(
+                    storage,
+                    &crate::explain::order::Ask {
+                        db: &ctx.db_name,
+                        coll: c,
+                        filter: lead
+                            .filter
+                            .as_ref()
+                            .filter(|_| lead.sort.is_some())
+                            .unwrap_or(&filter),
+                        sort: lead.sort.as_ref(),
+                        hint,
+                        collation: collation.as_ref(),
+                        vars: &vars,
+                        limit: lead.limit,
+                        asked: Default::default(),
+                    },
+                    crate::explain::order::Uses::Find,
+                );
                 // A time-series collection scans bucket by bucket.
                 let bytes = crate::ts_buckets::as_read(storage, &ctx.db_name, c, bytes, false)?;
                 // Reduce the leading $skip/$limit/$match prefix over raw BSON so
@@ -538,6 +596,8 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         ),
     };
 
+    // A stage that reads another collection is held to `notablescan` too.
+    let _notablescan = crate::notablescan::aggregate(ctx, &ns);
     // The connection's handshake `client` doc, for `$currentOp`'s appName /
     // clientMetadata (read before the borrow of `ctx` below).
     let client_metadata: Option<Document> = ctx
@@ -867,6 +927,7 @@ pub(crate) fn recognized_stage(name: &str) -> bool {
             | "$group"
             | "$indexStats"
             | "$limit"
+            | "$listCatalog"
             | "$listLocalSessions"
             | "$listSessions"
             | "$lookup"
@@ -1356,6 +1417,12 @@ fn run_segmented(
             }
             let spec = stage.as_document().and_then(|d| d.get(name));
             docs = documents_stage(spec, vars, coll)?;
+        } else if name == crate::list_catalog::STAGE {
+            if !buffer.is_empty() {
+                let _ = core_run(docs, &buffer, vars, collation, Some(&ns))?;
+                buffer.clear();
+            }
+            docs = crate::list_catalog::entries(storage, db, coll)?;
         } else if is_source_stage(name) {
             // Source stages (e.g. `$currentOp` / `$listLocalSessions`) ignore the
             // input and emit a synthetic row. Run (and discard) any buffered
@@ -1698,6 +1765,25 @@ fn apply_lookup(
         }
     }
 
+    // The pipeline form runs its pipeline's query on the foreign collection
+    // for each outer document (the simple form's join is not checked:
+    // whether mongod plans it depends on which engine runs it).
+    if let (Some(sub), None, None, false) =
+        (sub_pipeline, local_field, foreign_field, docs.is_empty())
+    {
+        let (filter, sort) = crate::explain::pipeline_query(from, sub);
+        crate::notablescan::check_foreign(
+            storage,
+            db,
+            &crate::notablescan::Read {
+                coll: from,
+                filter: &filter,
+                sort: sort.as_ref(),
+                hint: None,
+                collation,
+            },
+        )?;
+    }
     // Materialise the foreign collection once (the whole join's candidate pool).
     let foreign: Vec<Document> =
         collection_documents(storage, db, from, &Document::new(), collation)?;
@@ -1847,6 +1933,31 @@ fn apply_graph_lookup(
         .get("restrictSearchWithMatch")
         .and_then(Bson::as_document);
 
+    // Each walk queries the foreign collection for `connectToField` equal to
+    // the values it chases, within `restrictSearchWithMatch`.
+    if let Some(first) = docs.first() {
+        if let Ok(seed) = secantus_core::expressions::evaluate(first, start_with, vars) {
+            let wanted = match seed {
+                Bson::Array(values) => doc! { connect_to: { "$in": values } },
+                value => doc! { connect_to: value },
+            };
+            let filter = match restrict.filter(|r| !r.is_empty()) {
+                Some(r) => doc! { "$and": [wanted, r.clone()] },
+                None => wanted,
+            };
+            crate::notablescan::check_foreign(
+                storage,
+                db,
+                &crate::notablescan::Read {
+                    coll: from,
+                    filter: &filter,
+                    sort: None,
+                    hint: None,
+                    collation: None,
+                },
+            )?;
+        }
+    }
     let foreign: Vec<Document> = collection_documents(storage, db, from, &Document::new(), None)?;
 
     let mut out = Vec::with_capacity(docs.len());
@@ -1936,6 +2047,13 @@ fn apply_facet(
                         "$geoNear is not allowed to be used within a $facet stage",
                     ));
                 }
+                Bson::Document(d) if d.contains_key(crate::list_catalog::STAGE) => {
+                    return Err(CommandError::new(
+                        40600,
+                        "Location40600",
+                        "$listCatalog is not allowed to be used within a $facet stage",
+                    ));
+                }
                 Bson::Document(d) if !d.is_empty() => {}
                 _ => {
                     return Err(CommandError::new(
@@ -2013,6 +2131,20 @@ fn apply_union_with(
             ))
         }
     };
+    if let Some(sub) = sub_pipeline {
+        let (filter, sort) = crate::explain::pipeline_query(from, sub);
+        crate::notablescan::check_foreign(
+            storage,
+            db,
+            &crate::notablescan::Read {
+                coll: from,
+                filter: &filter,
+                sort: sort.as_ref(),
+                hint: None,
+                collation,
+            },
+        )?;
+    }
     let mut foreign: Vec<Document> =
         collection_documents(storage, db, from, &Document::new(), collation)?;
     if let Some(sub) = sub_pipeline {
@@ -2937,13 +3069,18 @@ fn apply_index_stats(
                     spec.insert(option.clone(), value.clone());
                 }
             }
+            let name = ix.get_str("name").unwrap_or("").to_string();
+            // Each plan that read the index, since it was made or this
+            // process began, whichever was later.
+            let (ops, since) = storage.index_use(db, coll, &name).unwrap_or((0, None));
             doc! {
-                "name": ix.get_str("name").unwrap_or("").to_string(),
+                "name": name,
                 "key": ix.get_document("key").cloned().unwrap_or_default(),
                 "host": "secantus",
-                // Uses of an index are not counted here; `since` is when
-                // this process began, which is when the count began.
-                "accesses": {"ops": 0_i64, "since": crate::handshake::process_started()},
+                "accesses": {
+                    "ops": ops,
+                    "since": since.unwrap_or_else(crate::handshake::process_started),
+                },
                 "spec": spec,
             }
         })
@@ -3144,7 +3281,7 @@ fn apply_out(
 }
 
 /// Resolve `$out`'s target. Accepts `"coll"` or `{db, coll}`.
-fn out_target(spec: Option<&Bson>, db: &str) -> Result<(String, String), CommandError> {
+pub(crate) fn out_target(spec: Option<&Bson>, db: &str) -> Result<(String, String), CommandError> {
     match spec {
         // An EMPTY collection name is not a namespace. It used to be accepted
         // and the stage wrote to a nameless collection, reporting success --
@@ -3482,7 +3619,7 @@ fn apply_merge(
         if bypass_validation {
             command.insert("bypassDocumentValidation", true);
         }
-        let reply = match crate::crud::update_in(&command, &merge.db, storage) {
+        let reply = match crate::crud::update_in(&command, &merge.db, storage, false, None) {
             Ok(reply) => reply,
             Err(e) => return Err(during(e)),
         };

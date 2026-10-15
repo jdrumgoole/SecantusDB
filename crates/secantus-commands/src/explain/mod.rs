@@ -80,7 +80,7 @@ fn validate(
     inner: &Document,
     ctx: &mut CommandContext,
 ) -> Result<(), CommandError> {
-    let reply = handler(inner, ctx)?;
+    let reply = order::uncounted(|| handler(inner, ctx))?;
     if let Ok(cursor) = reply.get_document("cursor") {
         if let Some(id) = cursor.get("id").and_then(as_i64).filter(|id| *id != 0) {
             if let Ok(cursors) = ctx.cursors() {
@@ -171,6 +171,107 @@ fn resolve_hint(hint: Option<&Bson>, catalog: &[Rc<IndexInfo>]) -> Result<Hint, 
             "Hint must be a string or an object",
         )),
     }
+}
+
+/// Why `notablescan` refuses a read: the plan mongod would run scans the
+/// collection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TableScan {
+    /// No index serves the query.
+    Unindexed,
+    /// A `{$natural: ±1}` hint forces the scan.
+    Natural,
+}
+
+/// Whether `plan` reads the collection rather than an index.
+fn scans_collection(plan: &Node) -> bool {
+    match plan {
+        Node::CollScan { .. } => true,
+        Node::Fetch { input, .. }
+        | Node::Sort { input, .. }
+        | Node::Skip(_, input)
+        | Node::Limit(_, input)
+        | Node::Projection { input, .. }
+        | Node::ReturnKey(input)
+        | Node::Subplan(input)
+        | Node::Count(input)
+        | Node::Update(input)
+        | Node::Delete { input, .. } => scans_collection(input),
+        Node::Or(inputs) | Node::SortMerge { inputs, .. } => inputs.iter().any(scans_collection),
+        Node::IxScan(_)
+        | Node::Eof(_)
+        | Node::Express { .. }
+        | Node::IdHack(_)
+        | Node::ExpressWrite { .. }
+        | Node::CountScan(_)
+        | Node::FastCount
+        | Node::DistinctScan(..) => false,
+    }
+}
+
+/// What `notablescan` makes of `plan`, planned with `hint`.
+fn table_scan(plan: &Node, hint: &Hint) -> Option<TableScan> {
+    if !scans_collection(plan) {
+        return None;
+    }
+    Some(match hint {
+        Hint::Natural(_) => TableScan::Natural,
+        _ => TableScan::Unindexed,
+    })
+}
+
+/// Whether the plan mongod runs for a read of `coll` -- `filter`, `sort`
+/// (a find's or a findAndModify's; `None` for the rest), `hint` and
+/// `collation` -- scans the collection. The read's own checks have already
+/// passed; a hint the planner does not know is the read's to refuse, so it
+/// is not refused here.
+pub(crate) fn plans_table_scan(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    filter: &Document,
+    sort: Option<&Document>,
+    hint: Option<&Bson>,
+    collation: Option<&Collation>,
+) -> Result<Option<TableScan>, CommandError> {
+    let catalog = catalog(storage, db, coll, None).map_err(command_error)?;
+    let Ok(hint) = resolve_hint(hint, &catalog) else {
+        return Ok(None);
+    };
+    let canonical = parsed::parsed_query(filter);
+    let implies = |partial: &Document| storage.query_implies_partial(filter, partial);
+    let q = Query {
+        canonical: &canonical,
+        sort: sort.filter(|s| order::plain_sort(s)),
+        projection: None,
+        skip: 0,
+        limit: 0,
+        hint: hint.clone(),
+        collation,
+        min_max: false,
+        return_key: false,
+        show_record_id: false,
+        batch_size: false,
+        keys_only: false,
+        wanted: None,
+        implies: &implies,
+        trial: None,
+    };
+    Ok(table_scan(&plan::plan(&q, &catalog), &hint))
+}
+
+/// The filter and sort of the query an aggregate's leading stages make, as
+/// `explain` reports it.
+pub(crate) fn pipeline_query(coll: &str, pipeline: &[Bson]) -> (Document, Option<Document>) {
+    let stages: Vec<Document> = pipeline
+        .iter()
+        .map_while(|s| s.as_document().cloned())
+        .collect();
+    let Ok(mut s) = shape::find(coll, &doc! { "find": coll }) else {
+        return (Document::new(), None);
+    };
+    shape::absorb(&mut s, &stages);
+    (s.filter, s.sort)
 }
 
 /// Everything read from storage to plan one collection.
@@ -491,7 +592,7 @@ fn count_through(
     if let Some(c) = options.get("collation") {
         cmd.insert("collation", c.clone());
     }
-    let Ok(reply) = crate::aggregate::aggregate(&cmd, ctx) else {
+    let Ok(reply) = order::uncounted(|| crate::aggregate::aggregate(&cmd, ctx)) else {
         return 0;
     };
     let Ok(cursor) = reply.get_document("cursor") else {
@@ -533,6 +634,12 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
     let canonical = parsed::parsed_query(&s.filter);
     let t = target(ctx, &s.coll)?;
     let plan = plan_for(s, &canonical, collation.as_ref(), &t, ctx)?;
+    if crate::notablescan::enabled(ctx) {
+        let why = resolve_hint(s.hint.as_ref(), &t.catalog)
+            .ok()
+            .and_then(|hint| table_scan(&plan, &hint));
+        crate::notablescan::refuse_planned(ctx.storage()?, &db, &s.coll, &s.filter, why)?;
+    }
     let planner = query_planner(&ns, s, &canonical, collation.as_ref(), &plan);
     let stats = wanted.then(|| {
         let (multi, upsert, returns) = match &s.kind {

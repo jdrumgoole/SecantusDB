@@ -119,8 +119,9 @@ These are explicit non-goals:
   see [Configuration](configuration.md). The `MONGODB-X509`
   cert-as-username auth mechanism shipped on top of the mTLS
   slice — see [Authentication](authentication.md).
-- **`OP_COMPRESSED`** — compression negotiation. Clients can be told
-  the server doesn't support compression.
+- **`OP_COMPRESSED` on the Python server** — the Python server names no
+  compressor in `hello`, so a driver sends uncompressed. The Rust server
+  speaks it with `snappy`, `zstd` and `zlib`, as mongod does by default.
 - **Text search** (`$text`, `$meta: "textScore"`, text indexes) —
   would need a full-text index implementation.
 - **`$where` / `$function` / `$accumulator` / `mapReduce`** — all

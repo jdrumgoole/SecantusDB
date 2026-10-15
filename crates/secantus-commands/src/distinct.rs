@@ -141,6 +141,27 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // over the collection it is defined on. Reading the view's own (empty)
     // storage answered `[]` for every `distinct` on a view.
     let documents: Vec<Document> = if on_view {
+        if crate::notablescan::enabled(ctx) {
+            // The view's pipeline, then the query: what mongod plans.
+            let tail = if filter.is_empty() {
+                Vec::new()
+            } else {
+                vec![Bson::Document(bson::doc! { "$match": filter.clone() })]
+            };
+            let (base, pipeline) =
+                crate::aggregate::resolve_view(storage, &ctx.db_name, &coll, tail)?;
+            let (query, sort) = crate::explain::pipeline_query(&base, &pipeline);
+            crate::notablescan::check(
+                ctx,
+                &crate::notablescan::Read {
+                    coll: &base,
+                    filter: &query,
+                    sort: sort.as_ref(),
+                    hint: None,
+                    collation: collation.as_ref(),
+                },
+            )?;
+        }
         crate::aggregate::collection_documents(
             storage,
             &ctx.db_name,
@@ -149,21 +170,33 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             collation.as_ref(),
         )?
     } else {
-        let bytes = crate::explain::order::find(
-            storage,
-            &crate::explain::order::Ask {
-                db: &ctx.db_name,
+        crate::notablescan::check(
+            ctx,
+            &crate::notablescan::Read {
                 coll: &coll,
                 filter: &filter,
                 sort: None,
                 hint,
                 collation: collation.as_ref(),
-                vars: &Document::new(),
-                limit: 0,
-                asked: Default::default(),
             },
-        )
-        .map_err(command_error)?;
+        )?;
+        let ask = crate::explain::order::Ask {
+            db: &ctx.db_name,
+            coll: &coll,
+            filter: &filter,
+            sort: None,
+            hint,
+            collation: collation.as_ref(),
+            vars: &Document::new(),
+            limit: 0,
+            asked: Default::default(),
+        };
+        let bytes = crate::explain::order::find(storage, &ask).map_err(command_error)?;
+        crate::explain::order::count_index_use(
+            storage,
+            &ask,
+            crate::explain::order::Uses::Distinct(&key),
+        );
         let mut decoded = Vec::with_capacity(bytes.len());
         for b in bytes {
             decoded.push(

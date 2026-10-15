@@ -167,6 +167,16 @@ pub fn convert_to_capped(doc: &Document, ctx: &mut CommandContext) -> HandlerRes
         "tmp{}.convertToCapped.{coll}",
         &bson::oid::ObjectId::new().to_hex()[18..]
     );
+    // mongod profiles the conversion under the collection it copies into,
+    // and cannot name one for `system.profile` (measured 8.2.11).
+    crate::profiler::note_namespace(format!("{db}.{tmp}"));
+    if coll == crate::profiler::PROFILE_COLLECTION {
+        return Err(CommandError::new(
+            2,
+            "BadValue",
+            format!("Invalid namespace: {db}.{tmp}"),
+        ));
+    }
     if let Err(e) = copy_capped(storage, &db, &coll, &tmp, size) {
         storage.drop_collection(&db, &tmp).map_err(command_error)?;
         return Err(e);

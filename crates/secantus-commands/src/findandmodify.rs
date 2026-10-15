@@ -366,7 +366,38 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     // few seconds of continuous re-picking, mirroring the storage layer's
     // write-conflict retry telemetry, so a livelock shows up in the server
     // log instead of as silent CPU.
+    crate::notablescan::check(
+        ctx,
+        &crate::notablescan::Read {
+            coll: &coll,
+            filter: &query,
+            sort,
+            hint: natural_hint.as_ref().or(argtypes::given_hint(doc)),
+            collation: collation.as_ref(),
+        },
+    )?;
     let repick_started = std::time::Instant::now();
+    // The plan runs once, however many times a lost race re-picks.
+    crate::explain::order::count_index_use(
+        storage,
+        &crate::explain::order::Ask {
+            db: &ctx.db_name,
+            coll: &coll,
+            filter: &query,
+            sort,
+            hint: natural_hint.as_ref().or(argtypes::given_hint(doc)),
+            collation: collation.as_ref(),
+            vars: &let_vars,
+            limit: 1,
+            asked: Default::default(),
+        },
+        crate::explain::order::Uses::Write {
+            delete: is_remove,
+            multi: false,
+            upsert,
+            returns: true,
+        },
+    );
     let mut repick_last_log = repick_started;
     let mut repick_count: u64 = 0;
     loop {
@@ -592,6 +623,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
             repick_count += 1;
             continue;
         }
+        crate::profiler::note_modified(outcome.modified);
         if outcome.modified > 0 {
             crate::transactions::note_statement(0, crate::transactions::StmtRecord::Delete);
         }

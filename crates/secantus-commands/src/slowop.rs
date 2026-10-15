@@ -50,9 +50,10 @@ impl SlowOpSettings {
 
     /// Whether an operation that ran for `worked` is to be logged. `sample` is
     /// a uniform draw from `[0, 1)`, taken by the caller so this stays pure.
+    /// A negative `slowms` makes every operation slow (mongod 8.2.11 logs
+    /// and profiles all of them).
     pub fn should_log(&self, worked: Duration, sample: f64) -> bool {
-        let slow_ms = self.slow_ms();
-        if slow_ms < 0 || worked.as_millis() < slow_ms as u128 {
+        if (worked.as_millis() as i128) < i128::from(self.slow_ms()) {
             return false;
         }
         sample < self.sample_rate()
@@ -155,6 +156,8 @@ mod tests {
         s.set(0, 0.25);
         assert!(s.should_log(Duration::ZERO, 0.2));
         assert!(!s.should_log(Duration::ZERO, 0.3));
+        s.set(-1, 1.0);
+        assert!(s.should_log(Duration::ZERO, 0.5));
     }
 
     #[test]
