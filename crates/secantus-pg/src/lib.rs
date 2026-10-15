@@ -19099,16 +19099,87 @@ impl PgHandler {
         Ok(vec![Response::Query(response)])
     }
 
+    /// `INSERT ... SELECT`: every target column needs an ASSIGNMENT cast from
+    /// the type the source query gives it, or the statement is 42804 before a
+    /// row is read -- an empty source included (`transformAssignedExpr`,
+    /// measured on PostgreSQL 15). An untyped literal or NULL takes the
+    /// column's type instead. The source is described, not run.
+    fn check_insert_select_types(
+        &self,
+        def: &TableDef,
+        ins: &secantus_pgplan::Insert,
+        source: &Statement,
+    ) -> PgWireResult<()> {
+        let Ok(fields) = self.copy_query_fields(source) else {
+            return Ok(());
+        };
+        // Expand a `*` to the columns it stands for.
+        let named = ins.source_targets.iter().filter(|t| !t.star).count();
+        let mut per_column: Vec<Option<&secantus_pgplan::SourceTarget>> = Vec::new();
+        for t in &ins.source_targets {
+            let n = if t.star {
+                fields.len().saturating_sub(named)
+            } else {
+                1
+            };
+            per_column.extend(std::iter::repeat_n(Some(t), n));
+        }
+        for (i, (field, target)) in fields.iter().zip(&ins.targets).enumerate() {
+            let entry = per_column.get(i).copied().flatten();
+            if entry.is_some_and(|t| t.untyped) {
+                continue;
+            }
+            let Some(col) = def.column(target) else {
+                continue;
+            };
+            let Some(target_oid) = secantus_pgplan::pgtypes::oid_of_name(&col.pg_type) else {
+                continue;
+            };
+            let source_oid = i64::from(field.datatype().oid());
+            if casts::assignment_path(source_oid, target_oid)
+                || secantus_pgplan::user_casts::assignment_exists(source_oid, target_oid)
+            {
+                continue;
+            }
+            // `name_of_oid` names the scalars; an array is its element's
+            // name with `[]`, and the one-byte type is `"char"` here.
+            let scalar_name = |oid: i64| {
+                secantus_pgplan::pgtypes::name_of_oid(oid).map(|n| match n {
+                    "char" => secantus_pgplan::QUOTED_CHAR.to_string(),
+                    other => other.to_string(),
+                })
+            };
+            let source_name = scalar_name(source_oid).or_else(|| {
+                secantus_pgplan::pgtypes::BUILTIN_TYPES
+                    .iter()
+                    .find(|(_, _, arr)| *arr == source_oid)
+                    .and_then(|(_, el, _)| scalar_name(*el))
+                    .map(|n| format!("{n}[]"))
+            });
+            let Some(source_name) = source_name else {
+                continue;
+            };
+            return Err(Self::err(&secantus_pgplan::assignment_mismatch(
+                col,
+                &source_name,
+                entry.map_or(-1, |t| t.location),
+            )));
+        }
+        Ok(())
+    }
+
     /// The output columns of a `COPY (query) TO STDOUT`, from the same code
     /// that describes the query anywhere else.
     fn copy_query_fields(&self, inner: &Statement) -> PgWireResult<Vec<FieldInfo>> {
         match inner {
-            // `COPY (SELECT 1) TO STDOUT` -- a query with no FROM at all.
+            // `COPY (SELECT 1) TO STDOUT` -- a query with no FROM at all. A
+            // user type (`row(1, 'x')::pt`) is described by its own oid.
             Statement::SelectConstant(sc) => Ok(sc
                 .columns
                 .iter()
                 .map(|(name, _, ty, _)| {
-                    FieldInfo::new(name.clone(), None, None, wire_type(ty), FieldFormat::Text)
+                    let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
+                    FieldInfo::new(name.clone(), None, None, wire, FieldFormat::Text)
                 })
                 .collect()),
             Statement::ValuesConstant(vc) => Ok(vc
@@ -27256,6 +27327,7 @@ impl PgHandler {
                             on_conflict: None,
                             overriding_system: false,
                             overriding_user: false,
+                            source_targets: Vec::new(),
                         }),
                         max_rows,
                     )?;
@@ -27281,6 +27353,7 @@ impl PgHandler {
                 // `INSERT ... SELECT`: read the query's rows first, then write
                 // them exactly as a VALUES list would be written.
                 if let Some(source) = ins.source.take() {
+                    self.check_insert_select_types(&def, &ins, &source)?;
                     // With user casts installed, the source's column types
                     // decide whether an assignment cast converts a value.
                     let (schema, rows) = if secantus_pgplan::user_casts::any() {

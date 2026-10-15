@@ -321,7 +321,7 @@ def test_order_by_ties_as_postgres_quicksort_leaves_them(pg: Any) -> None:
     assert got == ("ok", [(i,) for i in [7, 10, 3, 4, 5, 9, 1, 8, 6, 2]])
 
 
-@pytest.mark.backlog("RP-029")
+@pytest.mark.backlog_fixed("RP-029")
 @pytest.mark.parametrize(
     ("target", "source", "message"),
     [

@@ -1144,6 +1144,22 @@ pub struct Insert {
     /// `OVERRIDING USER VALUE`: the opposite -- the value the statement gives
     /// is DISCARDED and the sequence supplies one, for either identity kind.
     pub overriding_user: bool,
+    /// `INSERT ... SELECT`: the source query's select-list entries, as the
+    /// executor needs them to check each column's assignment cast once it
+    /// knows the source's column types. Empty for a `VALUES` insert.
+    pub source_targets: Vec<SourceTarget>,
+}
+
+/// One select-list entry of an `INSERT ... SELECT` source (of its leftmost
+/// arm, for a set operation): where PostgreSQL reports a type mismatch for
+/// it (`exprLocation`), whether it is an UNTYPED literal or NULL -- which
+/// takes the target column's type rather than a type of its own -- and
+/// whether it is a `*`, which stands for however many columns it expands to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceTarget {
+    pub location: i32,
+    pub untyped: bool,
+    pub star: bool,
 }
 
 /// The projection a `RETURNING` clause applies to each written row.
@@ -9185,7 +9201,70 @@ fn plan_insert(
             == Ok(OverridingKind::OverridingSystemValue),
         overriding_user: OverridingKind::try_from(i.r#override)
             == Ok(OverridingKind::OverridingUserValue),
+        source_targets: if sel.values_lists.is_empty() {
+            source_targets(sel)
+        } else {
+            Vec::new()
+        },
     }))
+}
+
+/// The select-list entries of an `INSERT ... SELECT` source. A set
+/// operation's output types are its arms' resolved together and are typed
+/// (`'x' UNION 'y'` is text), but the mismatch is reported at the leftmost
+/// arm's expression, as PostgreSQL does.
+fn source_targets(sel: &pg_query::protobuf::SelectStmt) -> Vec<SourceTarget> {
+    let mut leftmost = sel;
+    let set_op = sel.op != pg_query::protobuf::SetOperation::SetopNone as i32;
+    while leftmost.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
+        match leftmost.larg.as_deref() {
+            Some(l) => leftmost = l,
+            None => break,
+        }
+    }
+    leftmost
+        .target_list
+        .iter()
+        .filter_map(|t| match t.node.as_ref() {
+            Some(N::ResTarget(rt)) => rt.val.as_deref(),
+            _ => None,
+        })
+        .map(|e| {
+            let star = matches!(e.node.as_ref(), Some(N::ColumnRef(c))
+                if c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_)))));
+            // A parameter the client sent untyped (oid 0) is `unknown` too.
+            let untyped = !set_op
+                && match e.node.as_ref() {
+                    Some(N::AConst(c)) => {
+                        c.isnull || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_)))
+                    }
+                    Some(N::ParamRef(p)) => usize::try_from(p.number)
+                        .ok()
+                        .and_then(declared_param_type)
+                        .is_none(),
+                    _ => false,
+                };
+            SourceTarget {
+                location: expr_location(e).unwrap_or(-1),
+                untyped,
+                star,
+            }
+        })
+        .collect()
+}
+
+/// PostgreSQL's assignment-coercion failure for one column of an
+/// `INSERT ... SELECT` (`transformAssignedExpr`): 42804, reported at the
+/// source expression, with the hint the mapping adds.
+pub fn assignment_mismatch(column: &Column, source_type: &str, location: i32) -> Error {
+    set_error_location(location);
+    let typmod = (column.typmod >= 0).then_some(column.typmod);
+    Error::DatatypeMismatch(format!(
+        "column \"{}\" is of type {} but expression is of type {}",
+        column.name,
+        scalar::format_type_text(&column.pg_type, typmod),
+        display_type(source_type)
+    ))
 }
 
 /// The type an assigned expression DECLARES, when it declares one: an
@@ -9283,6 +9362,7 @@ fn expr_location(node: &pg_query::protobuf::Node) -> Option<i32> {
         N::RowExpr(r) => r.location,
         N::AArrayExpr(a) => a.location,
         N::SqlvalueFunction(f) => f.location,
+        N::SubLink(s) => s.location,
         _ => return None,
     };
     (loc >= 0).then_some(loc)
@@ -15737,9 +15817,12 @@ fn rewrite_dml_from(
     node: &mut pg_query::protobuf::Node,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Result<()> {
+    // `location`: the expression the subquery stands for, so an error about
+    // the value (a SET's 42804) points where PostgreSQL's does.
     fn sublink(
         kind: SubLinkType,
         select: pg_query::protobuf::SelectStmt,
+        location: i32,
     ) -> pg_query::protobuf::Node {
         pg_query::protobuf::Node {
             node: Some(N::SubLink(Box::new(pg_query::protobuf::SubLink {
@@ -15747,7 +15830,7 @@ fn rewrite_dml_from(
                 subselect: Some(Box::new(pg_query::protobuf::Node {
                     node: Some(N::SelectStmt(Box::new(select))),
                 })),
-                location: -1,
+                location,
                 ..Default::default()
             }))),
         }
@@ -15878,9 +15961,11 @@ fn rewrite_dml_from(
                 }
             }
             let v = rt.val.take().expect("checked");
+            let at = expr_location(&v).unwrap_or(-1);
             rt.val = Some(Box::new(sublink(
                 SubLinkType::ExprSublink,
                 select(*v, from, cond, true),
+                at,
             )));
         }
         Ok(())
@@ -16010,14 +16095,17 @@ fn rewrite_dml_from(
                     rt.val = Some(v);
                     continue;
                 }
+                let at = expr_location(&v).unwrap_or(-1);
                 rt.val = Some(Box::new(sublink(
                     SubLinkType::ExprSublink,
                     select(*v, &from, cond.as_deref(), true),
+                    at,
                 )));
             }
             u.where_clause = Some(Box::new(sublink(
                 SubLinkType::ExistsSublink,
                 select(one(), &from, cond.as_deref(), false),
+                -1,
             )));
         }
         Some(N::DeleteStmt(d)) if !d.using_clause.is_empty() => {
@@ -16039,6 +16127,7 @@ fn rewrite_dml_from(
             d.where_clause = Some(Box::new(sublink(
                 SubLinkType::ExistsSublink,
                 select(one(), &from, cond.as_deref(), false),
+                -1,
             )));
         }
         _ => {}
@@ -17077,7 +17166,7 @@ fn resolve_one_sublink(
                 // subquery column's type: an `int2vector` is an int array
                 // at run time and must still print as `2 3`.
                 Some(value) => {
-                    let node = param_node(params, value);
+                    let node = located(param_node(params, value), sl.location);
                     let ty = sub_plan_def(&plan, lookup)
                         .ok()
                         .and_then(|d| d.columns.first().map(|c| c.pg_type.clone()));
@@ -17147,7 +17236,7 @@ fn resolve_one_sublink(
                         .first()
                         .map(|c| c.pg_type.clone())
                         .unwrap_or_else(|| "text".into());
-                    let null = param_node(params, Bson::Null);
+                    let null = located(param_node(params, Bson::Null), sl.location);
                     Ok(pg_query::protobuf::Node {
                         node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
                             arg: Some(Box::new(null)),
@@ -17544,6 +17633,15 @@ fn bool_const_node(value: bool) -> pg_query::protobuf::Node {
 /// dates, numerics, arrays and NULL included. Building `A_Const` nodes instead
 /// would mean a second, narrower value encoder, and the types it did not cover
 /// would fail in a way that looked like a missing feature.
+/// A parameter standing for a subquery's value, at the subquery's location
+/// (`exprLocation` of the SubLink), so an error about the value points there.
+fn located(mut node: pg_query::protobuf::Node, location: i32) -> pg_query::protobuf::Node {
+    if let Some(N::ParamRef(p)) = node.node.as_mut() {
+        p.location = location;
+    }
+    node
+}
+
 fn param_node(params: &mut Vec<Bson>, value: Bson) -> pg_query::protobuf::Node {
     params.push(value);
     pg_query::protobuf::Node {

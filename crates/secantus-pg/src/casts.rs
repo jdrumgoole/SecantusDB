@@ -122,6 +122,47 @@ const TYPE_LAYOUT: &[(i64, i64, bool, u8)] = &[
     (5080, -1, false, b'd'),
 ];
 
+/// Is there an ASSIGNMENT coercion from built-in type `source` to `target`
+/// (`find_coercion_pathway` under `COERCION_ASSIGNMENT`)? The same type; a
+/// `pg_cast` row of context `a` or `i`; any type into the string category
+/// (text, varchar, bpchar, name) by its output function; an array into an
+/// array whose elements have one. A type this table does not know (a user
+/// type, a domain) is given the benefit of the doubt: that is the caller's
+/// own coercion's to refuse.
+pub(crate) fn assignment_path(source: i64, target: i64) -> bool {
+    const UNKNOWN: i64 = 705;
+    if source == target || source == UNKNOWN || source <= 0 || target <= 0 {
+        return true;
+    }
+    let element = |oid: i64| {
+        secantus_pgplan::pgtypes::BUILTIN_TYPES
+            .iter()
+            .find(|(_, _, arr)| *arr == oid)
+            .map(|(_, el, _)| *el)
+    };
+    let known = |oid: i64| {
+        secantus_pgplan::pgtypes::BUILTIN_TYPES
+            .iter()
+            .any(|(_, el, arr)| *el == oid || *arr == oid)
+    };
+    if !known(source) || !known(target) {
+        return true;
+    }
+    if BUILTIN_CASTS
+        .iter()
+        .any(|(_, s, t, _, c, _)| *s == source && *t == target && matches!(c, b'a' | b'i'))
+    {
+        return true;
+    }
+    if matches!(target, 25 | 1043 | 1042 | 19) {
+        return true;
+    }
+    match (element(source), element(target)) {
+        (Some(s), Some(t)) => assignment_path(s, t),
+        _ => false,
+    }
+}
+
 /// Is there an IMPLICIT built-in cast from type `source` to `target`?
 pub(crate) fn implicit_cast(source: i64, target: i64) -> bool {
     BUILTIN_CASTS
