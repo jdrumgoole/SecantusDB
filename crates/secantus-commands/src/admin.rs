@@ -1799,6 +1799,7 @@ pub(crate) fn listed_indexes(
         ix.remove("collationKeys");
         ix.remove("geoKeys");
         ix.remove("pythonKeys");
+        *ix = listed_spec(std::mem::take(ix));
     }
     // The `_id` index of a collection with a default collation carries it.
     if let Some(default) = crate::util::default_collation(storage, db, coll) {
@@ -2064,6 +2065,9 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     let before = before.saturating_sub(unlisted);
     let mut any_created = false;
     let mut any_existed = false;
+    // The indexes this request has built so far: mongod builds a request's
+    // indexes together, so one that fails leaves none of them.
+    let mut built_here: Vec<Document> = Vec::new();
     for spec in &specs {
         let Bson::Document(s) = spec else { continue };
         if let Some(e) = ts_fields
@@ -2154,52 +2158,6 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
                 format!("Error in specification {spec_text} :: caused by :: {why}"),
             )
             .into_reply());
-        }
-        // A `2dsphere` index is one of three formats.
-        if key
-            .values()
-            .any(|v| matches!(v, Bson::String(p) if p == "2dsphere"))
-        {
-            if let Some(version) = s.get("2dsphereIndexVersion") {
-                let whole = match version {
-                    Bson::Int32(n) => Some(i64::from(*n)),
-                    Bson::Int64(n) => Some(*n),
-                    Bson::Double(d) if d.fract() == 0.0 => Some(*d as i64),
-                    _ => None,
-                };
-                let number = matches!(
-                    version,
-                    Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
-                );
-                if !number {
-                    return Ok(CommandError::new(
-                        14,
-                        "TypeMismatch",
-                        format!(
-                            "Error in specification {spec_text} :: caused by :: The field \
-                             '2dsphereIndexVersion' must be a number, but got {}",
-                            secantus_core::query::bson_type_name(version)
-                        ),
-                    )
-                    .into_reply());
-                }
-                if let Some(n) = whole.filter(|n| !(1..=3).contains(n)) {
-                    // mongod has added the index version to the spec by now.
-                    let with_v = spec_text
-                        .strip_suffix(" }")
-                        .map_or(spec_text.clone(), |open| format!("{open}, v: 2 }}"));
-                    return Ok(CommandError::new(
-                        67,
-                        "CannotCreateIndex",
-                        format!(
-                            "Error in specification {with_v} :: caused by :: unsupported geo \
-                             index version {{ 2dsphereIndexVersion : 2dsphereIndexVersion: {n} }}, \
-                             only versions: [1,2,3] are supported"
-                        ),
-                    )
-                    .into_reply());
-                }
-            }
         }
         let Some(name) = s.get("name").and_then(Bson::as_str).map(str::to_string) else {
             return Ok(CommandError::new(
@@ -2348,9 +2306,32 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             }
         }
         if let Some(e) = index_conflict(&existing, &name, &key, &spec) {
+            undo_request(storage, &ctx.db_name, &coll, created_coll, &built_here)?;
             return Ok(e.into_reply());
         }
-        let created = match storage.create_index(&ctx.db_name, &coll, &name, &key, &spec) {
+        // What only the index BUILD refuses: a spec this request already
+        // asked for, and options the index's own code cannot start from.
+        let refused = request_conflict(&built_here, &spec)
+            .map(|p| (BuildStep::Prepare, p))
+            .or_else(|| index_build_problem(&spec).map(|p| (BuildStep::Init, p)));
+        if let Some((step, problem)) = refused {
+            let e = build_failure(
+                storage,
+                &ctx.db_name,
+                &coll,
+                created_coll,
+                &specs,
+                step,
+                problem,
+            );
+            undo_request(storage, &ctx.db_name, &coll, created_coll, &built_here)?;
+            return Ok(e.into_reply());
+        }
+        let outcome = storage.create_index(&ctx.db_name, &coll, &name, &key, &spec);
+        if outcome.is_err() {
+            undo_request(storage, &ctx.db_name, &coll, created_coll, &built_here)?;
+        }
+        let created = match outcome {
             Ok(c) => c,
             // A unique index over data that already holds duplicates: mongod
             // fails the BUILD, under its own wrapper, and still carries
@@ -2406,6 +2387,9 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             }
             Err(e) => return Err(command_error(e)),
         };
+        if created {
+            built_here.push(spec);
+        }
         any_created |= created;
         any_existed |= !created;
     }
@@ -2581,6 +2565,301 @@ fn partial_filter_problem(filter: &Document) -> Option<PartialProblem> {
     None
 }
 
+/// The fields of an index spec in the order `listIndexes` gives them:
+/// mongod parses each spec it lists into its `NewIndexSpec` and writes that
+/// back, field by field (`list_indexes.idl`, r8.2).
+const LISTED_SPEC_ORDER: &[&str] = &[
+    "v",
+    "key",
+    "name",
+    "ns",
+    "background",
+    "unique",
+    "hidden",
+    "partialFilterExpression",
+    "sparse",
+    "expireAfterSeconds",
+    "storageEngine",
+    "weights",
+    "default_language",
+    "language_override",
+    "textIndexVersion",
+    "2dsphereIndexVersion",
+    "bits",
+    "min",
+    "max",
+    "bucketSize",
+    "collation",
+    "wildcardProjection",
+    "coarsestIndexedLevel",
+    "finestIndexedLevel",
+    "dropDups",
+    "originalSpec",
+    "clustered",
+    "prepareUnique",
+];
+
+/// An index spec as `listIndexes` gives it (measured 8.2.11, 2026-10-15):
+/// in [`LISTED_SPEC_ORDER`], without the options of another kind of index
+/// (`repairIndexSpec`: `bits` on a `2dsphere` index is not listed), `bits`
+/// and `2dsphereIndexVersion` as ints and `min` / `max` as doubles,
+/// whatever number type they were given as.
+fn listed_spec(spec: Document) -> Document {
+    let key = spec.get_document("key").cloned().unwrap_or_default();
+    let plugin = key.values().find_map(Bson::as_str).unwrap_or("");
+    let wildcard = key.keys().any(|k| k == "$**" || k.ends_with(".$**"));
+    let allowed = |field: &str| match field {
+        "bits" | "min" | "max" => plugin == "2d",
+        "2dsphereIndexVersion" => matches!(plugin, "2dsphere" | "2dsphere_bucket"),
+        "coarsestIndexedLevel" | "finestIndexedLevel" => plugin == "2dsphere",
+        "textIndexVersion" | "weights" => plugin == "text",
+        "wildcardProjection" => wildcard,
+        _ => true,
+    };
+    let int = |v: &Bson| match v {
+        Bson::Int32(_) => v.clone(),
+        Bson::Int64(n) => Bson::Int32((*n).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32),
+        Bson::Double(d) => Bson::Int32(*d as i32),
+        Bson::Decimal128(d) => Bson::Int32(d.to_string().parse::<f64>().map_or(0, |d| d as i32)),
+        other => other.clone(),
+    };
+    // A decimal comes out no lower than the smallest positive double: -10
+    // is listed as 2.2250738585072014e-308 (the bound the index USES is -10).
+    let double = |v: &Bson| match v {
+        Bson::Int32(n) => Bson::Double(f64::from(*n)),
+        Bson::Int64(n) => Bson::Double(*n as f64),
+        Bson::Decimal128(d) => Bson::Double(
+            d.to_string()
+                .parse::<f64>()
+                .map_or(0.0, |d| d.clamp(f64::MIN_POSITIVE, f64::MAX)),
+        ),
+        other => other.clone(),
+    };
+    let listed = |field: &str, v: &Bson| match field {
+        "bits" | "2dsphereIndexVersion" => int(v),
+        "min" | "max" => double(v),
+        _ => v.clone(),
+    };
+    let mut out = Document::new();
+    for field in LISTED_SPEC_ORDER {
+        if let Some(v) = spec.get(*field) {
+            if allowed(field) {
+                out.insert(*field, listed(field, v));
+            }
+        }
+    }
+    for (field, v) in &spec {
+        if !LISTED_SPEC_ORDER.contains(&field.as_str()) {
+            out.insert(field.clone(), v.clone());
+        }
+    }
+    out
+}
+
+/// Which part of an index build refused a spec: preparing the request's
+/// specs, or starting the index's own code on one.
+#[derive(Clone, Copy, PartialEq)]
+enum BuildStep {
+    Prepare,
+    Init,
+}
+
+/// Why an index build refused a spec.
+enum BuildProblem {
+    /// The request already asked for this index, by this name.
+    Identical(String),
+    Refused(i32, String),
+}
+
+/// A spec as mongod quotes it from a request: the index version first,
+/// then the spec as given.
+fn requested_spec_text(spec: &Document) -> String {
+    let mut out = Document::new();
+    out.insert("v", 2i32);
+    for (k, v) in spec {
+        if k != "v" && !INDEX_CATALOG_ONLY.contains(&k.as_str()) {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    argtypes::render_stage_value(&Bson::Document(out))
+}
+
+/// A spec that conflicts with one built earlier in the same request
+/// (measured 8.2.11, 2026-10-15): the same index again, the same name for a
+/// different index (86), or the same index under another name (85).
+fn request_conflict(built: &[Document], spec: &Document) -> Option<BuildProblem> {
+    let name = spec.get_str("name").unwrap_or_default();
+    let key = spec.get_document("key").ok()?;
+    let wanted = index_options(spec);
+    for idx in built {
+        let same_name = idx.get_str("name").is_ok_and(|n| n == name);
+        let same_key = idx
+            .get_document("key")
+            .is_ok_and(|k| docs_equal_by_value(k, key));
+        let same_opts = docs_equal_by_value(&index_options(idx), &wanted);
+        if same_name && same_key && same_opts {
+            return Some(BuildProblem::Identical(name.to_string()));
+        }
+        if same_name {
+            return Some(BuildProblem::Refused(
+                86,
+                format!(
+                    "An existing index has the same name as the requested index. When index \
+                     names are not specified, they are auto generated and can cause conflicts. \
+                     Please refer to our documentation. Requested index: {}, existing index: {}",
+                    requested_spec_text(spec),
+                    requested_spec_text(idx),
+                ),
+            ));
+        }
+        if same_key && same_opts {
+            return Some(BuildProblem::Refused(
+                85,
+                format!(
+                    "Index already exists with a different name: {}",
+                    idx.get_str("name").unwrap_or("")
+                ),
+            ));
+        }
+    }
+    None
+}
+
+/// What the index's own code refuses when it starts on a spec (measured
+/// 8.2.11, 2026-10-15): a `2d` key that is not first or is not the only one,
+/// `2d` options its geohash converter cannot be made from, and a
+/// `2dsphereIndexVersion` that is not a whole number.
+fn index_build_problem(spec: &Document) -> Option<BuildProblem> {
+    let key = spec.get_document("key").ok()?;
+    let refused = |code: i32, why: String| Some(BuildProblem::Refused(code, why));
+    if key.values().any(|v| v.as_str() == Some("2d")) {
+        let (mut geo, mut other) = (false, false);
+        for v in key.values() {
+            if v.as_str() == Some("2d") {
+                if geo {
+                    return refused(16800, "can't have 2 geo fields".to_string());
+                }
+                if other {
+                    return refused(16801, "2d has to be first in index".to_string());
+                }
+                geo = true;
+            } else {
+                other = true;
+            }
+        }
+        if let Err((code, why)) = secantus_core::geoshape::flat_index(spec) {
+            return refused(code, why);
+        }
+    }
+    if key.values().any(|v| v.as_str() == Some("2dsphere")) {
+        if let Some(version) = spec.get("2dsphereIndexVersion") {
+            let whole = match version {
+                Bson::Int32(_) | Bson::Int64(_) => true,
+                Bson::Double(d) => d.fract() == 0.0,
+                Bson::Decimal128(d) => d.to_string().parse::<f64>().is_ok_and(|d| d.fract() == 0.0),
+                _ => true,
+            };
+            if !whole {
+                return refused(
+                    2,
+                    format!(
+                        "Expected field \"2dsphereIndexVersion\" to have a value exactly \
+                         representable as a 64-bit integer, but found 2dsphereIndexVersion: {}",
+                        argtypes::render_stage_value(version)
+                    ),
+                );
+            }
+        }
+    }
+    None
+}
+
+/// mongod's reply to an index build that refused a spec. A collection this
+/// request created answers with the reason alone; an existing one names the
+/// build, and says more when it is empty or when the index's code refused
+/// it (measured 8.2.11, 2026-10-15). An identical spec is 68 where mongod
+/// builds one index after another (a new or empty collection) and 96 where
+/// it builds them together.
+fn build_failure(
+    storage: &dyn crate::Storage,
+    db: &str,
+    coll: &str,
+    created_coll: bool,
+    specs: &[Bson],
+    step: BuildStep,
+    problem: BuildProblem,
+) -> CommandError {
+    let empty = created_coll
+        || storage
+            .count_collated(db, coll, &Document::new(), None)
+            .is_ok_and(|n| n == 0);
+    let (code, why) = match problem {
+        BuildProblem::Identical(name) if empty => {
+            (68, format!("Identical index already exists: {name}"))
+        }
+        BuildProblem::Identical(_) => (
+            96,
+            "Cannot build two identical indexes. Try again without duplicate indexes.".to_string(),
+        ),
+        BuildProblem::Refused(code, why) => (code, why),
+    };
+    let name = crate::util::error_code_name(code);
+    if created_coll {
+        return CommandError::new(code, name, why);
+    }
+    let ns = format!("{db}.{coll}");
+    let coll_uuid = storage
+        .collection_uuid(db, coll)
+        .ok()
+        .and_then(|b| uuid_text(&b))
+        .unwrap_or_default();
+    let build = uuid_text(&bson::uuid::Uuid::new().bytes()).unwrap_or_default();
+    let why = if empty {
+        format!("index build on empty collection failed: {build} :: caused by :: {why}")
+    } else if step == BuildStep::Init {
+        let first = match specs.first() {
+            Some(Bson::Document(d)) => requested_spec_text(d),
+            _ => "{}".to_string(),
+        };
+        format!(
+            "Caught exception during index builder ({build}) initialization on namespace {ns} \
+             ({coll_uuid}). {} index specs provided. First index spec: {first} :: caused by :: \
+             {why}",
+            specs.len()
+        )
+    } else {
+        why
+    };
+    CommandError::new(
+        code,
+        name,
+        format!(
+            "Index build failed: {build}: Collection {ns} ( {coll_uuid} ) :: caused by :: {why}"
+        ),
+    )
+}
+
+/// Take back what a failed `createIndexes` built: its indexes, and the
+/// collection when the request created it.
+fn undo_request(
+    storage: &dyn crate::Storage,
+    db: &str,
+    coll: &str,
+    created_coll: bool,
+    built: &[Document],
+) -> Result<(), CommandError> {
+    if created_coll {
+        storage.drop_collection(db, coll).map_err(command_error)?;
+        return Ok(());
+    }
+    for spec in built {
+        if let Ok(name) = spec.get_str("name") {
+            storage.drop_index(db, coll, name).map_err(command_error)?;
+        }
+    }
+    Ok(())
+}
+
 /// Why mongod refuses an index spec before building anything, or `None`.
 /// Each message is what 8.2.11 answered (2026-10-10); all of these specs
 /// used to be accepted and an index built from them.
@@ -2633,6 +2912,12 @@ fn index_spec_problem(spec: &Document) -> Option<CommandError> {
             }
             _ => {}
         }
+    }
+    let plugins: Vec<&str> = key.values().filter_map(Bson::as_str).collect();
+    if plugins.iter().any(|p| *p != plugins[0]) {
+        return Some(cannot(
+            "Can't use more than one index plugin for a single index.",
+        ));
     }
     if key.len() > 32 {
         return Some(CommandError::new(
@@ -2702,6 +2987,80 @@ fn index_spec_problem(spec: &Document) -> Option<CommandError> {
                  {text}"
             ),
         ));
+    }
+    // A `2dsphere` index is one of three formats.
+    if key
+        .values()
+        .any(|v| matches!(v, Bson::String(p) if p == "2dsphere"))
+    {
+        if let Some(version) = spec.get("2dsphereIndexVersion") {
+            // Read as a 64-bit integer, a fraction truncated (8.2.11,
+            // 2026-10-15: 3.5 passes here, 4.5 is unsupported); a double
+            // that is not finite is an invalid value. Whether a fraction is
+            // allowed at all is the index builder's question.
+            let read = match version {
+                Bson::Int32(n) => Some(Some(i64::from(*n))),
+                Bson::Int64(n) => Some(Some(*n)),
+                Bson::Double(d) if !d.is_finite() => Some(None),
+                Bson::Double(d) => Some(Some(d.trunc() as i64)),
+                Bson::Decimal128(d) => Some(Some(
+                    d.to_string().parse::<f64>().map_or(0, |d| d.trunc() as i64),
+                )),
+                _ => None,
+            };
+            let Some(read) = read else {
+                return Some(CommandError::new(
+                    14,
+                    "TypeMismatch",
+                    format!(
+                        "Error in specification {text} :: caused by :: The field \
+                             '2dsphereIndexVersion' must be a number, but got {}",
+                        secantus_core::query::bson_type_name(version)
+                    ),
+                ));
+            };
+            let why = match read {
+                None => Some("Invalid value for"),
+                Some(n) if !(1..=3).contains(&n) => Some("unsupported"),
+                Some(_) => None,
+            };
+            if let Some(why) = why {
+                // mongod has added the index version to the spec by now.
+                let with_v = text
+                    .strip_suffix(" }")
+                    .map_or(text.clone(), |open| format!("{open}, v: 2 }}"));
+                return Some(CommandError::new(
+                    67,
+                    "CannotCreateIndex",
+                    format!(
+                        "Error in specification {with_v} :: caused by :: {why} geo index \
+                             version {{ 2dsphereIndexVersion : 2dsphereIndexVersion: {} }}, \
+                             only versions: [1,2,3] are supported",
+                        argtypes::render_stage_value(version)
+                    ),
+                ));
+            }
+        }
+    }
+    // A `2d` index's options are numbers whatever the index (measured
+    // 8.2.11, 2026-10-15: `bits: "x"` on `{q: 1}` is refused as well).
+    for option in ["bits", "min", "max"] {
+        if let Some(v) = spec.get(option) {
+            if !matches!(
+                v,
+                Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+            ) {
+                return Some(in_spec(
+                    14,
+                    "TypeMismatch",
+                    &text,
+                    &format!(
+                        "The field '{option}' must be a number, but got {}",
+                        secantus_core::query::bson_type_name(v)
+                    ),
+                ));
+            }
+        }
     }
     if spec.contains_key("partialFilterExpression")
         && matches!(spec.get("sparse"), Some(Bson::Boolean(true)))

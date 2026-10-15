@@ -14,6 +14,7 @@
 
 mod bounds;
 mod exec;
+pub(crate) mod geo;
 mod node;
 pub(crate) mod order;
 mod parsed;

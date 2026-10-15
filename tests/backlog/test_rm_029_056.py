@@ -396,7 +396,7 @@ def test_every_cluster_parameter(rust_mongo: Any) -> None:
 POINTS = [(10, 10), (-50, 20), (100, -30), (0.5, 0.5), (-120, 45), (30, -60), (170, 5)]
 
 
-@pytest.mark.backlog("RM-041")
+@pytest.mark.backlog_fixed("RM-041")
 def test_geo_within_in_2dsphere_scan_order(rust_mongo: Any, mongod: Any) -> None:
     """mongod returns a `$geoWithin` over a `2dsphere` index in S2 cell
     order."""
@@ -411,7 +411,7 @@ def test_geo_within_in_2dsphere_scan_order(rust_mongo: Any, mongod: Any) -> None
     assert run(rust_mongo) == run(mongod)
 
 
-@pytest.mark.backlog("RM-041")
+@pytest.mark.backlog_fixed("RM-041")
 def test_geo_within_in_2d_scan_order(rust_mongo: Any, mongod: Any) -> None:
     """mongod returns a `$geoWithin` over a `2d` index in geohash order."""
     docs = [{"_id": i, "loc": list(p)} for i, p in enumerate(POINTS)]
@@ -423,7 +423,7 @@ def test_geo_within_in_2d_scan_order(rust_mongo: Any, mongod: Any) -> None:
     assert run(rust_mongo) == run(mongod)
 
 
-@pytest.mark.backlog("RM-041")
+@pytest.mark.backlog_fixed("RM-041")
 def test_near_ties_in_scan_order(rust_mongo: Any, mongod: Any) -> None:
     """Four points at one distance from a `$near`: mongod returns them in its
     scan's order."""
@@ -437,7 +437,7 @@ def test_near_ties_in_scan_order(rust_mongo: Any, mongod: Any) -> None:
     assert run(rust_mongo) == run(mongod)
 
 
-@pytest.mark.backlog("RM-042")
+@pytest.mark.backlog_fixed("RM-042")
 def test_2d_index_options_refused(rust_mongo: Any) -> None:
     """mongod 8.2.11 refuses `bits` over 32 and `min` not below `max` (72)."""
     db = _fresh(rust_mongo, "rm042")
@@ -455,7 +455,7 @@ def test_2d_index_options_refused(rust_mongo: Any) -> None:
     ]
 
 
-@pytest.mark.backlog("RM-042")
+@pytest.mark.backlog_fixed("RM-042")
 def test_2d_index_options_listed(rust_mongo: Any) -> None:
     """mongod 8.2.11 lists `bits` as an int and `min` / `max` as doubles,
     whatever type they were given as."""
@@ -466,7 +466,7 @@ def test_2d_index_options_listed(rust_mongo: Any) -> None:
     assert got == {"bits": (20, "int"), "min": (-10.0, "float"), "max": (10.0, "float")}
 
 
-@pytest.mark.backlog("RM-043")
+@pytest.mark.backlog_fixed("RM-043")
 def test_near_centre_outside_2d_range(rust_mongo: Any) -> None:
     """mongod 8.2.11: a `$near` centre outside the index's range is 16433."""
     docs = [{"_id": 0, "loc": [1, 1]}, {"_id": 1, "loc": [5, 5]}, {"_id": 2, "loc": [10, 10]}]
@@ -487,14 +487,14 @@ def _hinted_geo(client: Any) -> Any:
     )
 
 
-@pytest.mark.backlog("RM-044")
+@pytest.mark.backlog_fixed("RM-044")
 def test_hinted_2dsphere_index_order(rust_mongo: Any, mongod: Any) -> None:
     """mongod returns what a hinted `2dsphere` index holds, in its order."""
     command = {"find": "c", "filter": {}, "hint": "g"}
     assert _ids(_hinted_geo(rust_mongo), command) == _ids(_hinted_geo(mongod), command)
 
 
-@pytest.mark.backlog("RM-044")
+@pytest.mark.backlog_fixed("RM-044")
 def test_near_hinted_to_another_index(rust_mongo: Any) -> None:
     """mongod 8.2.11 refuses a `$near` hinted to a non-geo index (291)."""
     near = {"loc": {"$near": {"$geometry": {"type": "Point", "coordinates": [0, 0]}}}}
@@ -502,7 +502,7 @@ def test_near_hinted_to_another_index(rust_mongo: Any) -> None:
     assert got[:2] == ("err", 291)
 
 
-@pytest.mark.backlog("RM-045")
+@pytest.mark.backlog_fixed("RM-045")
 def test_2dsphere_index_version_not_an_integer(rust_mongo: Any) -> None:
     """mongod 8.2.11 refuses `2dsphereIndexVersion: 2.5` (2)."""
     db = _fresh(rust_mongo, "rm045")
@@ -517,7 +517,7 @@ def test_2dsphere_index_version_not_an_integer(rust_mongo: Any) -> None:
     )
 
 
-@pytest.mark.backlog("RM-045")
+@pytest.mark.backlog_fixed("RM-045")
 def test_two_indexes_one_key_in_one_create_indexes(rust_mongo: Any) -> None:
     """mongod 8.2.11: two specs with one key in one `createIndexes` is 85."""
     db = _fresh(rust_mongo, "rm045b")
@@ -529,7 +529,7 @@ def test_two_indexes_one_key_in_one_create_indexes(rust_mongo: Any) -> None:
     assert got == ("err", 85, "Index already exists with a different name: one")
 
 
-@pytest.mark.backlog("RM-045")
+@pytest.mark.backlog_fixed("RM-045")
 def test_geo_near_in_lookup_wrapper(rust_mongo: Any) -> None:
     """mongod 8.2.11 wraps the `$geoNear` refusal inside `$lookup` and
     `$unionWith` with the executor's prefix."""
@@ -588,7 +588,7 @@ def test_center_sphere_over_pi_with_2dsphere_index(rust_mongo: Any) -> None:
     assert (ok, sorted(ids)) == ("ok", [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 17])
 
 
-@pytest.mark.backlog("RM-047")
+@pytest.mark.backlog_fixed("RM-047")
 def test_center_sphere_and_a_line_bulging_out(rust_mongo: Any) -> None:
     """mongod 8.2.11: a line with both ends inside a `$centerSphere` and its
     great-circle arc outside it is not within it."""
@@ -603,7 +603,7 @@ def test_center_sphere_and_a_line_bulging_out(rust_mongo: Any) -> None:
     assert _ids(db, command) == ("ok", [2])
 
 
-@pytest.mark.backlog("RM-047")
+@pytest.mark.backlog_fixed("RM-047")
 def test_strictwinding_crs(rust_mongo: Any) -> None:
     """mongod 8.2.11: under the `strictwinding` crs a clockwise ring is the
     big polygon outside it."""

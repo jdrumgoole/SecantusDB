@@ -432,7 +432,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                 asked: Default::default(),
             },
         )
-        .map_err(command_error)?;
+        .map_err(|e| crate::util::command_error_during(e, "findAndModify"))?;
         let matched = candidates.into_iter().next();
 
         // No match.

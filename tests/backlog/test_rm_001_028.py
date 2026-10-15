@@ -124,7 +124,7 @@ def test_where_runs_javascript(rust_mongo: Any, mongod: Any) -> None:
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-010")
+@pytest.mark.backlog_fixed("RM-010")
 def test_geo_intersects_unsorted_order(rust_mongo: Any, mongod: Any) -> None:
     """The Java `GeoJsonFilters` fixture over a 2dsphere index, no sort:
     mongod 8.2.11 returns `[1, 2, 4, 3]`."""

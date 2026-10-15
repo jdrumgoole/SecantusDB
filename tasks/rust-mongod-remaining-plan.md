@@ -190,12 +190,24 @@ Size: two batches.
 
 ## Phase 3 -- geo (7.081, 137 rows)
 
-- [ ] Results in index-scan order under a geo index: S2 cell order for
+- [x] Results in index-scan order under a geo index: S2 cell order for
       `2dsphere`, geohash order for `2d` (about 100).
-- [ ] `2d` index options and range (18), hinted geo indexes (10).
-- [ ] `$centerSphere` over pi, the bounded `$geoNear` full read,
+- [x] `2d` index options and range (18), hinted geo indexes (10).
+- [x] `$centerSphere` over pi, the bounded `$geoNear` full read,
       `2dsphereIndexVersion: 2.5`, two indexes on one key in one
       `createIndexes`, `$geoNear` inside `$lookup` / `$unionWith`.
+
+  **Done 2026-10-15** in one batch (`rust-geo-phase3`, two agents): the
+  geo probe went from 137 differing replies to none. The order is mongod's
+  own S2 and geohash code, transcribed, with the near stage's libc++ heap
+  and the arm64 reference build's fused multiply-adds. Found on the way
+  and fixed: a `2dsphere` `$geoWithin` through the index missed documents
+  beyond the flat box of the polygon's vertices; `delete` / `update` with a
+  `$near` that could not run changed documents. Left, with gap tests:
+  RM-148 (a point exactly on an edge), RM-149 (`coarsestIndexedLevel` /
+  `finestIndexedLevel`), RM-150 (a refused spec leaves its collection),
+  RM-151 (geo order under `$or` and a trailing range). A Linux x86-64
+  mongod's tie order was not measured.
 
 Size: one or two batches; scan order is the hard part.
 

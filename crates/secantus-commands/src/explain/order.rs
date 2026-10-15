@@ -28,6 +28,7 @@
 //! order the rows come in.
 
 use super::exec::{self, Env};
+use super::geo;
 use super::node::Node;
 use super::plan::{self, Query};
 use super::{catalog, parsed, resolve_hint};
@@ -285,6 +286,17 @@ fn placed(rows: Rows, order: Vec<usize>) -> Rows {
         .collect()
 }
 
+/// `rows` as a blocking sort leaves them: sorted by `ask.sort` when there
+/// is one, documents that compare equal in the order they came.
+fn sorted_over(storage: &dyn Storage, rows: Rows, ask: &Ask) -> Result<Rows, StorageError> {
+    let Some(sort) = ask.sort else {
+        return Ok(rows);
+    };
+    let blobs: Vec<&[u8]> = rows.iter().map(|(_, b)| b.as_slice()).collect();
+    let (order, _) = storage.sort_permutation(&blobs, sort, ask.collation)?;
+    Ok(placed(rows, order))
+}
+
 /// Whether a sort is one the planner reads: every key a field, every value
 /// exactly 1 or -1. mongod takes `-1.5` for a descending sort and then does
 /// not read it from an index.
@@ -311,14 +323,30 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
         }
     }
     let near = crate::near::find_near(ask.filter)?;
+    let mut near_index = None;
     if let Some(near) = &near {
+        near_index = geo::check_near_hint(storage, ask.db, ask.coll, ask.hint, near, |why| {
+            near.unplannable(ask.db, ask.coll, ask.asked, why)
+        })?;
         near.check_index(storage, ask.db, ask.coll, ask.asked)?;
     }
+    // A hint to a geo index: the store reads such an index its own way, so
+    // the matched set is asked for unhinted and ordered (and, for a scan of
+    // the whole index, chosen) here.
+    let hinted_geo = match &near {
+        Some(_) => None,
+        None => geo::hinted_geo(storage, ask.db, ask.coll, ask.hint)?,
+    };
+    let store_hint = if near_index.is_some() || hinted_geo.is_some() {
+        None
+    } else {
+        ask.hint
+    };
     let Some(matched) = storage.matching_rows(
         ask.db,
         ask.coll,
         ask.filter,
-        ask.hint,
+        store_hint,
         ask.collation,
         ask.vars,
     )?
@@ -326,15 +354,35 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
         return Ok(None);
     };
     let (mut rows, mut via) = (matched.rows, matched.via);
-    // A `$near` is the order: nearest first, unless a sort says otherwise.
+    // A `$near` is the order: mongod's ring search, nearest first, and a
+    // sort over what it returns.
     if let Some(near) = &near {
         if via.take().is_some() {
             rows.sort_unstable_by_key(|(recordid, _)| *recordid);
         }
-        rows = near.nearest_first(rows);
-        if ask.sort.is_none() {
-            return Ok(Some(rows));
+        let index = match near_index {
+            Some(ix) => Some(ix),
+            None => geo::near_index(storage, ask.db, ask.coll, &near.field, &near.near)?,
+        };
+        rows = match index {
+            Some(ix) => {
+                match geo::near_rows(storage, ask.db, ask.coll, ask.filter, &ix, near, rows)? {
+                    Ok(rows) => rows,
+                    Err(rows) => near.nearest_first(rows),
+                }
+            }
+            None => near.nearest_first(rows),
+        };
+        return Ok(Some(sorted_over(storage, rows, ask)?));
+    }
+    if let Some(index) = hinted_geo {
+        rows.sort_unstable_by_key(|(recordid, _)| *recordid);
+        let scan = geo::scan(storage, ask.db, ask.coll, ask.filter, Some(index), true)?;
+        if let Some(ordered) = scan.and_then(|scan| scan.order(rows.clone())) {
+            return Ok(Some(sorted_over(storage, ordered, ask)?));
         }
+        // Not a scan this reads: as the store reads it.
+        return Ok(None);
     }
     if rows.len() < 2 {
         return Ok(Some(rows));
@@ -381,6 +429,19 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
         trial,
     };
     let mut plan = plan::plan(&query(None), &catalog);
+
+    // A geo predicate no other index serves, and no hint: a scan of the
+    // geo index.
+    let elsewhere = !matches!(access(&plan), Node::CollScan { .. })
+        || ask
+            .hint
+            .is_some_and(|h| !matches!(h, Bson::Document(d) if d.is_empty()));
+    if let Some(scan) = geo::scan(storage, ask.db, ask.coll, ask.filter, None, elsewhere)? {
+        rows.sort_unstable_by_key(|(recordid, _)| *recordid);
+        if let Some(ordered) = scan.order(rows.clone()) {
+            return Ok(Some(sorted_over(storage, ordered, ask)?));
+        }
+    }
 
     if let Some(via) = &via {
         if already_in_order(&plan, via) {

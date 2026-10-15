@@ -1493,24 +1493,34 @@ fn parse_geo_2d(key_spec: &Document, opts: &Document) -> Option<Geo2d> {
     // field; compound geo+scalar specs are accepted as geo-only (trailing scalar
     // fields ignored at index time). Mirrors storage._geo_type_of.
     let (field, _) = key_spec.iter().find(|(_, v)| v.as_str() == Some("2d"))?;
-    let numf = |k: &str, default: f64| -> f64 {
-        match opts.get(k) {
-            Some(Bson::Double(x)) => *x,
-            Some(Bson::Int32(x)) => f64::from(*x),
-            Some(Bson::Int64(x)) => *x as f64,
-            _ => default,
+    // The options read as mongod's converter reads them. `createIndexes`
+    // refuses a spec they do not make a converter for; a store written
+    // before it did may still hold one, read as it was then.
+    let params = secantus_core::geoshape::flat_index(opts).unwrap_or_else(|_| {
+        let numf = |k: &str, default: f64| -> f64 {
+            match opts.get(k) {
+                Some(Bson::Double(x)) => *x,
+                Some(Bson::Int32(x)) => f64::from(*x),
+                Some(Bson::Int64(x)) => *x as f64,
+                _ => default,
+            }
+        };
+        let bits = match opts.get("bits") {
+            Some(Bson::Int32(b)) => (*b).clamp(1, 32) as u32,
+            Some(Bson::Int64(b)) => (*b).clamp(1, 32) as u32,
+            _ => 26,
+        };
+        secantus_core::geoshape::FlatIndex {
+            bits,
+            min: numf("min", -180.0),
+            max: numf("max", 180.0),
         }
-    };
-    let bits = match opts.get("bits") {
-        Some(Bson::Int32(b)) => (*b).clamp(1, 32) as u32,
-        Some(Bson::Int64(b)) => (*b).clamp(1, 32) as u32,
-        _ => 26,
-    };
+    });
     Some(Geo2d {
         field: field.clone(),
-        bits,
-        lo: numf("min", -180.0),
-        hi: numf("max", 180.0),
+        bits: params.bits,
+        lo: params.min,
+        hi: params.max,
     })
 }
 
@@ -2411,9 +2421,13 @@ const COLLATION_KEYS: &str = "collationKeys";
 /// through an index built then misses those documents. An index without the
 /// marker is rebuilt when the store opens (`rebuild_outdated_indexes`). Not a
 /// user option: `listIndexes` strips it.
+///
+/// Format 2 (2026-10-15) is a `2d` index whose `bits` was given as a double
+/// or a decimal: mongod truncates it (`bits: 20.0` is 20 bits), where format
+/// 1 read it as the default 26. A `2dsphere` index of format 1 is current.
 const GEO_KEYS: &str = "geoKeys";
 /// The value of [`GEO_KEYS`] this build writes.
-const GEO_KEY_FORMAT: i32 = 1;
+const GEO_KEY_FORMAT: i32 = 2;
 
 /// Options only this server's catalog carries, which a rebuild leaves out of
 /// the options it builds from: `create_index_in_txn` stamps them again.
@@ -2428,8 +2442,11 @@ const BUILD_STAMPS: &[&str] = &[
 /// Whether an index's entries were written by rules this build does not
 /// read them by (see `rebuild_outdated_indexes`).
 fn index_entries_outdated(key: &Document, opts: &Document) -> bool {
-    if parse_geo_2d(key, opts).is_some() || parse_geo_sphere(key).is_some() {
+    if parse_geo_2d(key, opts).is_some() {
         return opts.get_i32(GEO_KEYS).ok() != Some(GEO_KEY_FORMAT);
+    }
+    if parse_geo_sphere(key).is_some() {
+        return !matches!(opts.get_i32(GEO_KEYS), Ok(1) | Ok(GEO_KEY_FORMAT));
     }
     let collated = opts
         .get_document("collation")
@@ -17319,7 +17336,13 @@ impl Storage {
             Some(x) => x,
             None => return Ok(None),
         };
-        let (min_x, min_y, max_x, max_y) = match secantus_core::geo::query_within_bbox(within) {
+        // On the sphere the box is the shape's own: an edge can bow past its
+        // ends towards a pole, a cap can hold one, and a big polygon can be
+        // most of the sphere. A box around the vertices missed what was
+        // beyond them.
+        let bound = secantus_core::geoshape::sphere_within_bound(within)
+            .or_else(|| secantus_core::geo::query_within_bbox(within));
+        let (min_x, min_y, max_x, max_y) = match bound {
             Some(b) => b,
             None => return Ok(None),
         };
@@ -19493,7 +19516,10 @@ mod tests {
             for (coll, kind) in [("g", "2d"), ("h", "2dsphere")] {
                 st.create_index("app", coll, "geo", &doc! {"loc": kind}, &Document::new())
                     .unwrap();
-                assert_eq!(index_options(&st, coll, "geo").get_i32(GEO_KEYS), Ok(1));
+                assert_eq!(
+                    index_options(&st, coll, "geo").get_i32(GEO_KEYS),
+                    Ok(GEO_KEY_FORMAT)
+                );
             }
         }
         for coll in ["g", "h"] {
@@ -19523,6 +19549,116 @@ mod tests {
             )
             .unwrap();
         assert_eq!(found.len(), 3);
+    }
+
+    /// A `2d` index of geo-key format 1 whose `bits` was given as a double
+    /// holds 26-bit cells, the default format 1 read it as; mongod reads
+    /// `bits: 20.0` as 20 bits. Opening the store rebuilds it at format 2. A
+    /// `2dsphere` index of format 1 is current and is left as it is.
+    #[test]
+    fn open_rebuilds_a_format_1_2d_index_and_keeps_a_format_1_2dsphere_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        let docs = [
+            doc! {"_id": 1i32, "loc": [1.0, 1.0]},
+            doc! {"_id": 2i32, "loc": [7.5, -3.25]},
+            doc! {"_id": 3i32, "loc": [-9.0, 9.0]},
+            doc! {"_id": 4i32, "loc": [40.0, 40.0]},
+        ];
+        let options = doc! {"bits": 20.0, "min": -50.0, "max": 50.0};
+        // What format 1 wrote for each document: its cell at 26 bits.
+        let mut stale: Vec<Vec<u8>> = Vec::new();
+        let sphere_entries;
+        {
+            let st = Storage::open(home).unwrap();
+            for coll in ["g", "h"] {
+                st.insert(
+                    "app",
+                    coll,
+                    docs.iter().map(|d| encode_doc(d).unwrap()).collect(),
+                    true,
+                )
+                .unwrap();
+            }
+            st.create_index("app", "g", "geo", &doc! {"loc": "2d"}, &options)
+                .unwrap();
+            st.create_index(
+                "app",
+                "h",
+                "geo",
+                &doc! {"loc": "2dsphere"},
+                &Document::new(),
+            )
+            .unwrap();
+            let read_as = |bits: u32| Geo2d {
+                field: "loc".to_string(),
+                bits,
+                lo: -50.0,
+                hi: 50.0,
+            };
+            let session = st.conn.open_session().unwrap();
+            for (rid, _, blob) in st.scan_docs(&session, "app", "g").unwrap() {
+                let loc = decode_doc(&blob).unwrap().get("loc").cloned().unwrap();
+                let (old, new) = (read_as(26).cell_kbs(&loc), read_as(20).cell_kbs(&loc));
+                // Otherwise the test would not tell the formats apart.
+                assert_ne!(old, new);
+                stale.extend(old.iter().map(|kb| pack_entry(kb, rid)));
+            }
+            sphere_entries = st.check_collection("app", "h").unwrap();
+        }
+        // The 2d index as format 1 left it: the marker, and 26-bit entries.
+        age_index(home, "g", "geo", |o| {
+            o.insert(GEO_KEYS, 1i32);
+        });
+        {
+            let conn = Connection::open(home, DEFAULT_CONFIG).unwrap();
+            let sess = conn.open_session().unwrap();
+            let c = sess.open_cursor(IDX_ENTRIES_TABLE, None).unwrap();
+            for packed in &stale {
+                c.set_key_sssu("app", "g", "geo", packed);
+                c.set_value_u(b"");
+                c.insert().unwrap();
+                c.reset().unwrap();
+            }
+            // The 2dsphere index marked format 1, its entries untouched.
+            let ix = sess.open_cursor(IDX_TABLE, None).unwrap();
+            ix.set_key_sss("app", "h", "geo");
+            ix.search().unwrap();
+            let mut d = decode_doc(&ix.get_value_u().unwrap()).unwrap();
+            let mut opts = d.get_document("options").cloned().unwrap();
+            opts.insert(GEO_KEYS, 1i32);
+            d.insert("options", Bson::Document(opts));
+            ix.reset().unwrap();
+            ix.set_key_sss("app", "h", "geo");
+            ix.set_value_u(&encode_doc(&d).unwrap());
+            ix.update().unwrap();
+        }
+        let st = Storage::open(home).unwrap();
+        let check = st.check_collection("app", "g").unwrap();
+        let (entries, missing, extra) = index_check(&check, "geo");
+        assert_eq!((entries, missing, extra), (4, 0, 0), "{check}");
+        assert_eq!(
+            index_options(&st, "g", "geo").get_i32(GEO_KEYS),
+            Ok(GEO_KEY_FORMAT)
+        );
+        let found: Vec<i32> = st
+            .find_matching(
+                "app",
+                "g",
+                &doc! {"loc": {"$geoWithin": {"$box": [[-10.0, -10.0], [10.0, 10.0]]}}},
+            )
+            .unwrap()
+            .iter()
+            .map(|b| decode_doc(b).unwrap().get_i32("_id").unwrap())
+            .collect();
+        let mut found = found;
+        found.sort();
+        assert_eq!(found, [1, 2, 3]);
+        // Not rebuilt: still format 1, and the same entries.
+        assert_eq!(index_options(&st, "h", "geo").get_i32(GEO_KEYS), Ok(1));
+        assert_eq!(st.check_collection("app", "h").unwrap(), sphere_entries);
+        let (_, missing, extra) = index_check(&sphere_entries, "geo");
+        assert_eq!((missing, extra), (0, 0));
     }
 
     /// A collated index without `collationKeys` (this server before

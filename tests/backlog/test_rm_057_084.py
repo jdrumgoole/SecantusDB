@@ -269,7 +269,7 @@ def _unique_conversion_keys(client: Any) -> list:
     return list(ix.keys())
 
 
-@pytest.mark.backlog("RM-067")
+@pytest.mark.backlog_fixed("RM-067")
 def test_list_indexes_key_order_after_conversion_to_unique(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 lists `unique` before `expireAfterSeconds`."""
     assert _unique_conversion_keys(rust_mongo) == _unique_conversion_keys(mongod)
