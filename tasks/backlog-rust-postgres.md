@@ -317,8 +317,6 @@ one beside it.
       translation, 2026-10-15), so they share that engine's distance from
       PostgreSQL's advanced regular expressions; `@file` inclusion in
       `pg_ident.conf` is refused.
-    - **SIGHUP reloads only on a server started with TLS**; without TLS it
-      still stops the server (`ctrlc`'s termination handler).
   - **Direct TLS (`sslnegotiation=direct`) is accepted**, which is
     PostgreSQL 17's behaviour; 15.19 answers "SSL error: unexpected eof".
   - The key must have no passphrase.

@@ -39,3 +39,7 @@ More of the Rust PostgreSQL server's backlog, measured against PostgreSQL
   a delta list read as a full one. Such a list was refused at startup.
   Part of RP-013, pinned by five new groups in
   `tools/probes/pg_login_tls_files.py` (`tests/test_rust_pg_login_differential.py`).
+- SIGHUP never stops `secantusd-pg`: a server with no TLS or `pg_hba.conf`
+  to re-read takes the signal and carries on, as a postmaster does. It
+  stopped. Part of RP-013
+  (`crates/secantus-pg/tests/signals.rs::sighup_does_not_stop_a_server_with_nothing_to_reload`).

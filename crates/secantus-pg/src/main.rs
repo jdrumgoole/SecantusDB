@@ -70,13 +70,12 @@ extern "C" fn request_reload(_: libc::c_int) {
 
 /// Re-read the login files on SIGHUP, as PostgreSQL does on `pg_ctl reload`.
 /// Only a server started with TLS or a `pg_hba.conf` has anything to
-/// re-read; one without keeps SIGHUP as a request to stop. Windows has no SIGHUP, and
+/// re-read; one without takes the signal and carries on, as a postmaster
+/// does -- SIGHUP never stops PostgreSQL. Windows has no SIGHUP, and
 /// `select pg_reload_conf()` is the way there.
 #[cfg(unix)]
 fn watch_for_reload(reloader: Reloader) {
-    if !reloader.has_files() {
-        return;
-    }
+    let has_files = reloader.has_files();
     // SAFETY: `signal` with a valid signal number and a handler that only
     // stores to an atomic, which is async-signal-safe. This replaces the
     // stop handler `ctrlc` installed for SIGHUP and leaves its others.
@@ -91,6 +90,10 @@ fn watch_for_reload(reloader: Reloader) {
         .spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
             if RELOAD_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                if !has_files {
+                    eprintln!("secantusd-pg: received SIGHUP; there are no files to reload");
+                    continue;
+                }
                 match reloader.reload() {
                     Ok(()) => eprintln!("secantusd-pg: configuration reloaded"),
                     Err(e) => eprintln!("secantusd-pg: configuration was not reloaded: {e}"),
