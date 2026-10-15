@@ -157,6 +157,11 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
   RP-015.
 - `tsquery @> tsquery` / `<@` (and `tsq_mcontains` / `tsq_mcontained`).
   Part of RP-015.
+- `VARIADIC` calls: an `ARRAY[...]` is spread into the variadic parameter
+  (`concat(VARIADIC ARRAY['a', 'b'])`, `format('%s-%s', VARIADIC ...)`),
+  and `json[b]_extract_path[_text]` / `jsonb_delete` take any array
+  (`VARIADIC null::text[]` too). `jsonb_delete(j, k)` by name. Part of
+  RP-015.
 - `pg_sequences`.
 - `pg_relation_is_updatable`, `pg_column_is_updatable`,
   `pg_is_other_temp_schema` and `pg_settings_get_flags` (PostgreSQL
@@ -174,4 +179,4 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
 - Corpora `multi_assign_update`, `returning_star`, `icu_collations`,
   `to_reg_functions`, `typed_value_residue`, `ts_catalogs`, `typmods`, `sequence_types`, `polymorphic_literals`, `acl_functions`, `relation_updatable`, `order_ties`,
   `string_syntax_settings`, `record_fields_using`, `fetch_ties_settings`
-  `series_order_exprs`, `multibyte_encodings`, `geometric_ops_2` and `tsquery_containment`.
+  `series_order_exprs`, `multibyte_encodings`, `geometric_ops_2`, `tsquery_containment` and `variadic_calls`.

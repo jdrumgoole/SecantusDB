@@ -317,6 +317,81 @@ pub(crate) fn rewrite(node: &mut N) {
     }
 }
 
+/// `f(a, VARIADIC ARRAY[x, y])` is `f(a, x, y)`: VARIADIC hands the array
+/// to the variadic parameter, which is what spreading its elements does
+/// (`jsonb_extract_path(j, VARIADIC ARRAY['a', 'b'])`, `concat(VARIADIC
+/// ARRAY['a', 'b'])`). Only an array CONSTRUCTOR with elements is spread; any
+/// other array value keeps the VARIADIC form.
+pub(crate) fn spread_variadic(node: &mut N) {
+    // The json path functions and `jsonb_delete` are their operators over
+    // the whole array (any array, not only a constructor): renamed to the
+    // template `builtin_alias` rewrites them by.
+    const AS_OPERATOR: [&str; 5] = [
+        "jsonb_delete",
+        "jsonb_extract_path",
+        "jsonb_extract_path_text",
+        "json_extract_path",
+        "json_extract_path_text",
+    ];
+    let operator_form = |f: &pg_query::protobuf::FuncCall| {
+        f.func_variadic
+            && f.args.len() == 2
+            && func_name(f).is_some_and(|n| AS_OPERATOR.contains(&n.as_str()))
+    };
+    let spreadable = |f: &pg_query::protobuf::FuncCall| {
+        operator_form(f)
+            || f.func_variadic
+                && matches!(
+                    f.args.last().and_then(|a| a.node.as_ref()),
+                    Some(N::AArrayExpr(a)) if !a.elements.is_empty()
+                )
+    };
+    if !node
+        .nodes()
+        .iter()
+        .any(|(n, _, _, _)| matches!(n, pg_query::NodeRef::FuncCall(f) if spreadable(f)))
+    {
+        return;
+    }
+    for _ in 0..10_000 {
+        let mut changed = false;
+        // SAFETY: as in `rewrite`, each pointer is used only until the first
+        // change, after which the walk restarts over a fresh list.
+        unsafe {
+            for (n, _, _) in node.nodes_mut() {
+                let pg_query::NodeMut::FuncCall(f) = n else {
+                    continue;
+                };
+                let f = &mut *f;
+                if !spreadable(f) {
+                    continue;
+                }
+                if operator_form(f) {
+                    let name = func_name(f).unwrap_or_default();
+                    f.funcname = vec![pg_query::protobuf::Node {
+                        node: Some(N::String(pg_query::protobuf::String {
+                            sval: format!("\u{1f}variadic_{name}"),
+                        })),
+                    }];
+                    f.func_variadic = false;
+                    changed = true;
+                    break;
+                }
+                let Some(N::AArrayExpr(a)) = f.args.pop().and_then(|a| a.node) else {
+                    continue;
+                };
+                f.args.extend(a.elements);
+                f.func_variadic = false;
+                changed = true;
+                break;
+            }
+        }
+        if !changed {
+            return;
+        }
+    }
+}
+
 /// What parse analysis refuses because it cannot type a value: `$1 IS NULL`
 /// over a parameter the client left untyped is 42P18, and `to_json` /
 /// `to_jsonb` / `array_to_json` of an untyped literal or parameter is 42804

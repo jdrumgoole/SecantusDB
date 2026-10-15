@@ -31,6 +31,31 @@ const OPERATORS: &str = include_str!("pg_operator_functions.tsv");
 /// The functions that are a call or an expression over their arguments:
 /// `(name, argument count, the expression, the type each `$n` is cast to)`.
 const TEMPLATES: &[(&str, usize, &str)] = &[
+    // `jsonb_delete(j, k)` is `j - k`, for a text key, an index, or the
+    // VARIADIC array (`func_cast::spread_variadic` names that form).
+    ("jsonb_delete", 2, "$1::jsonb - $2"),
+    ("\u{1f}variadic_jsonb_delete", 2, "$1::jsonb - $2::text[]"),
+    // `jsonb_extract_path(j, VARIADIC path)` is `j #> path`.
+    (
+        "\u{1f}variadic_jsonb_extract_path",
+        2,
+        "$1::jsonb #> $2::text[]",
+    ),
+    (
+        "\u{1f}variadic_jsonb_extract_path_text",
+        2,
+        "$1::jsonb #>> $2::text[]",
+    ),
+    (
+        "\u{1f}variadic_json_extract_path",
+        2,
+        "$1::json #> $2::text[]",
+    ),
+    (
+        "\u{1f}variadic_json_extract_path_text",
+        2,
+        "$1::json #>> $2::text[]",
+    ),
     ("textlen", 1, "length($1::text)"),
     ("dexp", 1, "exp($1::float8)"),
     ("dlog1", 1, "ln($1::float8)"),
