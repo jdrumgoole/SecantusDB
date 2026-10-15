@@ -369,6 +369,88 @@ fn select_candidates<'a>(name: &str, args: &[String]) -> Option<Vec<&'a Sig>> {
 /// category if any candidate offers it there, else the one category every
 /// candidate agrees on, keeping a preferred type where one is offered.
 /// `None` unless exactly one non-variadic, non-polymorphic overload is left.
+/// The concrete parameter types of the one polymorphic overload a call of
+/// constants reaches, the polymorphic ones fixed by its typed arguments
+/// (`enforce_generic_type_consistency`): `array_append('{1}', 2)` reads its
+/// literal as `int4[]`. With no typed argument, the `anycompatible` family
+/// reads every literal as `text` (`array_cat('{1}', '{2}')` is `text[]`).
+/// Only the element / array / non-array families; `None` when typed
+/// arguments disagree, which needs PostgreSQL's common-type rules.
+pub(crate) fn polymorphic_args(name: &str, args: &[String]) -> Option<Vec<String>> {
+    if crate::scalar::is_catalog_reader(name) || name.starts_with("pg_") || args.is_empty() {
+        return None;
+    }
+    let cats = categories();
+    if args
+        .iter()
+        .any(|a| a != "unknown" && !cats.contains_key(a.as_str()))
+    {
+        return None;
+    }
+    let overloads = sigs().get(name)?;
+    let cands: Vec<&Sig> = overloads
+        .iter()
+        .filter(|s| !s.variadic && s.args.len() == args.len() && sig_accepts(s, args))
+        .collect();
+    let [only] = cands.as_slice() else {
+        return None;
+    };
+    let scalar = |p: &str| {
+        matches!(
+            p,
+            "anyelement" | "anynonarray" | "anycompatible" | "anycompatiblenonarray"
+        )
+    };
+    let array = |p: &str| matches!(p, "anyarray" | "anycompatiblearray");
+    if only
+        .args
+        .iter()
+        .any(|p| p.starts_with("any") && p != "any" && !scalar(p) && !array(p))
+    {
+        return None;
+    }
+    let mut element: Option<String> = None;
+    for (p, a) in only.args.iter().zip(args) {
+        if a == "unknown" {
+            continue;
+        }
+        let e = if array(p) {
+            a.strip_suffix("[]")?.to_string()
+        } else if scalar(p) {
+            a.clone()
+        } else {
+            continue;
+        };
+        match &element {
+            Some(have) if *have != e => return None,
+            _ => element = Some(e),
+        }
+    }
+    let compatible = only.args.iter().any(|p| p.starts_with("anycompatible"));
+    let element = match element {
+        Some(e) => e,
+        None if compatible => "text".to_string(),
+        None => return None,
+    };
+    if !only.args.iter().any(|p| scalar(p) || array(p)) {
+        return None;
+    }
+    Some(
+        only.args
+            .iter()
+            .map(|p| {
+                if array(p) {
+                    format!("{element}[]")
+                } else if scalar(p) {
+                    element.clone()
+                } else {
+                    p.clone()
+                }
+            })
+            .collect(),
+    )
+}
+
 pub(crate) fn resolved_args(name: &str, args: &[String]) -> Option<Vec<String>> {
     resolved_sig(name, args).map(|s| s.args.clone())
 }
@@ -392,6 +474,48 @@ fn resolved_sig(name: &str, args: &[String]) -> Option<&'static Sig> {
 /// A call with untyped arguments that `func_select_candidate` cannot
 /// settle: several overloads remain, or the unknown positions' categories
 /// conflict. PostgreSQL's 42725 `function f(unknown) is not unique`.
+/// PostgreSQL's 42804 `could not determine polymorphic type because input
+/// has type unknown`: the one overload a call of constants can reach takes a
+/// polymorphic parameter (`anyarray`, `anyelement`, ..., not the
+/// `anycompatible` family) and every argument
+/// in such a position is an untyped literal, so nothing fixes the type
+/// (`array_length('{1,2,3}', 1)`, measured on 15.19).
+pub(crate) fn unknown_polymorphic(name: &str, args: &[String]) -> bool {
+    if crate::scalar::is_catalog_reader(name) || name.starts_with("pg_") || args.is_empty() {
+        return false;
+    }
+    let cats = categories();
+    if args
+        .iter()
+        .any(|a| a != "unknown" && !cats.contains_key(a.as_str()))
+    {
+        return false;
+    }
+    let Some(overloads) = sigs().get(name) else {
+        return false;
+    };
+    let cands: Vec<&Sig> = overloads
+        .iter()
+        .filter(|s| !s.variadic && s.args.len() == args.len() && sig_accepts(s, args))
+        .collect();
+    let [only] = cands.as_slice() else {
+        return false;
+    };
+    // The `anycompatible` family reads an untyped literal as `text`
+    // instead (`array_cat('{1}', '{2}')` is `{1,2}`); `any` is no
+    // polymorphic type at all.
+    let polymorphic =
+        |p: &str| p.starts_with("any") && p != "any" && !p.starts_with("anycompatible");
+    let positions: Vec<usize> = only
+        .args
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| polymorphic(p))
+        .map(|(i, _)| i)
+        .collect();
+    !positions.is_empty() && positions.iter().all(|&i| args[i] == "unknown")
+}
+
 pub(crate) fn unknown_ambiguous(name: &str, args: &[String]) -> bool {
     matches!(unknown_resolution(name, args), Some(Err(())))
 }

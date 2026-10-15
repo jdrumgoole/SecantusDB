@@ -513,11 +513,12 @@ one beside it.
         **`pg_settings_get_flags`** need catalog or GUC state the planner
         does not see; `table_to_xml` and the other XML exports, and the
         `fmgr_*` / `postgresql_fdw_validator` validators, are not written.
-      - **An untyped literal beside a typed argument** is not resolved by
-        `func_select_candidate`'s rules (only an all-constant call is,
-        `unknown_args.rs`); `abs(NULL)`'s column is described as text (its
-        `pg_typeof` is right); `array_length('{1,2,3}', 1)` is not
-        PostgreSQL's 42804 polymorphic error.
+      - **An untyped literal beside a typed argument** is resolved only
+        for a polymorphic overload that is the one candidate (`unknown_args`,
+        `funcsig::polymorphic_args`); `func_select_candidate`'s other steps
+        are not followed (only an all-constant call is). `unnest('{1,2}')`
+        is not PostgreSQL's 42725 (three overloads), and a bad literal read
+        through `array_append('{1.5}', 2)` has no position.
       - **Smaller**: only `line <-> point` measures with `pg_hypot`; a
         `"char"` with the high bit set orders by its `\ooo` text; an alias
         call with a COLUMN of the wrong type still runs

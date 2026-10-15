@@ -76,6 +76,11 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
   exist is `password authentication failed`, not `database ... does not
   exist`. Part of RP-013
   (tests/backlog/test_rust_postgres_gaps.py::test_wrong_password_checked_before_the_database).
+- An untyped literal at a polymorphic parameter takes the type the call's
+  typed argument fixes (`array_append('{1}', 2)` had been refused); the
+  `anycompatible` family reads an all-untyped call as `text`
+  (`array_cat('{1}', '{2}')`); and one that nothing fixes is PostgreSQL's
+  42804 (`array_length('{1,2,3}', 1)`). Part of RP-015.
 - Inside a correlated subquery, an outer column has its own type:
   `(select t.c = 'x' from s limit 1)` over a `char(3)` had compared an
   integer and answered false, and `pg_typeof` said `integer`.
@@ -116,4 +121,4 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
   `to_regprocedure`; a dotted schema or role name is 42602 `invalid name
   syntax`. `regcollation` columns are described with their own type oid.
 - Corpora `multi_assign_update`, `returning_star`, `icu_collations`,
-  `to_reg_functions`, `typed_value_residue`, `ts_catalogs`, `typmods` and `sequence_types`.
+  `to_reg_functions`, `typed_value_residue`, `ts_catalogs`, `typmods`, `sequence_types` and `polymorphic_literals`.

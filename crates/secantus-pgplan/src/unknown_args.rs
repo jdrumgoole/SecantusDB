@@ -73,7 +73,7 @@ fn unknown_call(f: &pg_query::protobuf::FuncCall) -> Option<(String, Vec<String>
 /// The parameter types for `f`'s untyped literals, when they are to be cast.
 fn resolved(f: &pg_query::protobuf::FuncCall) -> Option<Vec<String>> {
     let (name, types) = unknown_call(f)?;
-    funcsig::resolved_args(&name, &types)
+    funcsig::resolved_args(&name, &types).or_else(|| funcsig::polymorphic_args(&name, &types))
 }
 
 /// PostgreSQL's 42725 for a constant call its unknown-argument rules leave
@@ -89,6 +89,12 @@ pub(crate) fn check_ambiguous(node: &N) -> Result<()> {
         // Only a call of untyped arguments alone: beside a typed one the
         // rules here do not yet follow every step of PostgreSQL's (a `date`
         // reaching `overlaps(timestamptz, ...)` through its implicit cast).
+        if funcsig::unknown_polymorphic(&name, &types) {
+            return Err(Error::Sqlstate(
+                "42804",
+                "could not determine polymorphic type because input has type unknown".into(),
+            ));
+        }
         if types.iter().all(|t| t == "unknown") && funcsig::unknown_ambiguous(&name, &types) {
             set_error_location(f.location);
             return Err(Error::Sqlstate(

@@ -323,9 +323,18 @@ pub(crate) fn check_clauses(stmt: &N) -> Result<()> {
             }
         })
     };
+    // Over a column the type comes first (`int_col COLLATE "x"` is 42804
+    // `collations are not supported by type integer`), which only the
+    // planner can tell; it checks those itself.
+    let over_column = |cc: &pg_query::protobuf::CollateClause| {
+        matches!(
+            cc.arg.as_deref().and_then(|a| a.node.as_ref()),
+            Some(N::ColumnRef(_))
+        )
+    };
     for (n, _, _, _) in stmt.nodes() {
         match n {
-            pg_query::NodeRef::CollateClause(cc) => check(cc)?,
+            pg_query::NodeRef::CollateClause(cc) if !over_column(cc) => check(cc)?,
             // The node walk does not enter an aggregate's own ORDER BY.
             pg_query::NodeRef::FuncCall(f) => {
                 for o in &f.agg_order {

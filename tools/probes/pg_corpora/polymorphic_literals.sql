@@ -1,0 +1,15 @@
+# reference-version: 15
+# An untyped literal at a polymorphic parameter: fixed by the call's typed argument (array_append('{1}', 2)), read as text by the anycompatible family, and 42804 when nothing fixes an anyarray / anyelement (RP-015).
+SELECT array_length('{1,2,3}', 1)
+SELECT array_length('{1,2,3}'::int[], 1), array_upper('{1,2}'::int[], 1)
+SELECT array_upper('{1,2}', 1)
+SELECT cardinality('{1,2}')
+SELECT array_to_string('{a,b}', ',')
+SELECT array_append('{1}', 2), array_cat('{1}', '{2}')
+SELECT coalesce('a', 'b'), greatest('1', '2'), nullif('a', 'b')
+SELECT to_json('x'), array_position('{1,2}', 2)
+SELECT num_nulls('a', null), concat('a', 1)
+SELECT array_prepend(0, '{1}'), array_remove('{1,2,1}', 1), array_replace('{1,2}', 2, 3)
+SELECT pg_typeof(array_cat('{1}', '{2}')), array_cat('{1}', '{2}'::int[])
+SELECT array_position('{a,b}', 'b'), array_positions('{1,2,1}', 1)
+SELECT pg_typeof(array_append('{x}', 'y'))
