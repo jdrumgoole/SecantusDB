@@ -108,6 +108,9 @@ pub struct ConnectionAuth {
     /// The effective privileges last computed for `authenticated`, kept
     /// until a user or role changes (`rbac::effective`).
     pub(crate) privileges: Option<crate::rbac::CachedAuthz>,
+    /// The mechanism and start of an authentication still in conversation,
+    /// for `serverStatus.security` (`crate::status`).
+    pub(crate) auth_started: Option<(String, std::time::Instant)>,
 }
 
 impl ConnectionAuth {
@@ -124,6 +127,7 @@ impl ConnectionAuth {
             client_uuid: rand::random(),
             peer_loopback: false,
             privileges: None,
+            auth_started: None,
         }
     }
 

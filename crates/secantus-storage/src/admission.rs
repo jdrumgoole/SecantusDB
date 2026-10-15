@@ -22,6 +22,7 @@
 //! behaves exactly as before — the acquire path is a single comparison.
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
 thread_local! {
@@ -43,6 +44,9 @@ pub struct Tickets {
     limit: usize,
     in_flight: Mutex<usize>,
     space: Condvar,
+    /// Writes blocked in [`Tickets::acquire`] for a free permit: what
+    /// `serverStatus.globalLock.currentQueue.writers` reports.
+    waiting: AtomicUsize,
 }
 
 /// A held permit. Releases on drop, including while unwinding from a panic:
@@ -59,6 +63,7 @@ impl Tickets {
             limit,
             in_flight: Mutex::new(0),
             space: Condvar::new(),
+            waiting: AtomicUsize::new(0),
         }
     }
 
@@ -76,6 +81,11 @@ impl Tickets {
         *self.in_flight.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Writes waiting for a permit right now.
+    pub fn waiting(&self) -> usize {
+        self.waiting.load(Ordering::Relaxed)
+    }
+
     /// Block until a permit is free, then take it.
     ///
     /// Returns a no-op ticket when admission control is off, or when this
@@ -85,8 +95,12 @@ impl Tickets {
             return Ticket { pool: None };
         }
         let mut n = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-        while *n >= self.limit {
-            n = self.space.wait(n).unwrap_or_else(|e| e.into_inner());
+        if *n >= self.limit {
+            self.waiting.fetch_add(1, Ordering::Relaxed);
+            while *n >= self.limit {
+                n = self.space.wait(n).unwrap_or_else(|e| e.into_inner());
+            }
+            self.waiting.fetch_sub(1, Ordering::Relaxed);
         }
         *n += 1;
         HOLDING.with(|h| h.set(true));
@@ -161,6 +175,23 @@ mod tests {
             peak.load(Ordering::SeqCst)
         );
         assert_eq!(tickets.in_flight(), 0);
+    }
+
+    #[test]
+    fn a_blocked_writer_is_counted_as_waiting() {
+        let tickets = Arc::new(Tickets::new(1));
+        let held = tickets.acquire();
+        let t2 = tickets.clone();
+        let waiter = std::thread::spawn(move || {
+            let _t = t2.acquire();
+        });
+        while tickets.waiting() == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(tickets.waiting(), 1);
+        drop(held);
+        waiter.join().unwrap();
+        assert_eq!(tickets.waiting(), 0);
     }
 
     #[test]

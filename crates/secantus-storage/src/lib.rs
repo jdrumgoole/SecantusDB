@@ -1788,10 +1788,14 @@ enum ResolvedHint {
 /// pressure lever; Findings 6/13). This matches the daemon's and the Python
 /// `RustServer` handle's 4G-cap default, closing the gap where an embedded
 /// library user hit eviction pressure the daemon never would.
+///
+/// `statistics=(fast)` is mongod's own setting: the engine keeps the cheap
+/// counters that `serverStatus.wiredTiger` reports ([`Storage::wt_statistics`]).
 const DEFAULT_CONFIG: &str = "create,session_max=1000,cache_size=4G,\
                               eviction=(threads_min=4,threads_max=4),\
                               log=(enabled=true,file_max=128MB,prealloc=false),\
-                              transaction_sync=(enabled=false,method=fsync)";
+                              transaction_sync=(enabled=false,method=fsync),\
+                              statistics=(fast)";
 
 /// Build the WiredTiger connection config string from the tunable knobs the
 /// `secantusdb` daemon exposes (`--cache-size`, `--session-max`,
@@ -1805,7 +1809,7 @@ pub fn wt_config(
     log_file_max: &str,
 ) -> String {
     let mut cfg = format!(
-        "create,session_max={session_max},cache_size={cache_size},eviction=(threads_min=4,threads_max=4),log=(enabled=true,file_max={log_file_max},prealloc=false),transaction_sync=(enabled={},method=fsync)",
+        "create,session_max={session_max},cache_size={cache_size},eviction=(threads_min=4,threads_max=4),log=(enabled=true,file_max={log_file_max},prealloc=false),transaction_sync=(enabled={},method=fsync),statistics=(fast)",
         if sync_on_commit { "true" } else { "false" }
     );
     // `SECANTUS_WT_CONFIG_EXTRA` appends raw WiredTiger connection config — a
@@ -7747,6 +7751,25 @@ impl Storage {
     /// Writes currently admitted, and the cap. Diagnostics / tests.
     pub fn write_admission(&self) -> (usize, usize) {
         (self.write_tickets.in_flight(), self.write_tickets.limit())
+    }
+
+    /// Writes waiting for an admission ticket right now (0 while admission
+    /// control is off: nothing waits).
+    pub fn writes_waiting(&self) -> usize {
+        self.write_tickets.waiting()
+    }
+
+    /// The engine's version string, and the connection's statistics as
+    /// WiredTiger's `statistics:` cursor lists them: each one's description
+    /// (`"cache: bytes currently in the cache"`) and value, in its order.
+    pub fn wt_statistics(&self) -> Result<(String, Vec<(String, i64)>)> {
+        let session = self.conn.open_session()?;
+        let cursor = session.open_cursor("statistics:", None)?;
+        let mut stats = Vec::new();
+        while cursor.next()? {
+            stats.push(cursor.get_value_stat()?);
+        }
+        Ok((secantus_wt::version_string(), stats))
     }
 
     /// Open a dedicated WT session for a new multi-document transaction. The WT

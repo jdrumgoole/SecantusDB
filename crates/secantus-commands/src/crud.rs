@@ -1157,6 +1157,7 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             }
             continue;
         }
+        let statement_started = std::time::Instant::now();
         // A delete of ONE document removes the first its query matches in
         // the order mongod reads them.
         let first = if limit == 1 {
@@ -1214,6 +1215,11 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         match deleted {
             Ok(deleted) => {
                 n += deleted as i32;
+                if let (0, Some(stats)) = (limit, &ctx.top_stats) {
+                    stats
+                        .status
+                        .many_statement(false, deleted as u64, statement_started.elapsed());
+                }
                 if deleted > 0 {
                     crate::transactions::note_statement(
                         index,
@@ -1599,19 +1605,27 @@ fn update_command_problem(doc: &Document) -> Option<CommandError> {
 
 pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let notablescan = crate::notablescan::enabled(ctx);
-    update_in(doc, &ctx.db_name, ctx.storage()?, notablescan)
+    update_in(
+        doc,
+        &ctx.db_name,
+        ctx.storage()?,
+        notablescan,
+        ctx.top_stats.as_deref(),
+    )
 }
 
 /// [`update`] against a named database: `$merge` writes its documents with
 /// it, as mongod writes them with the update command. `notablescan`: the
 /// server parameter is set, so a statement mongod would answer with a
 /// collection scan is refused (`$merge` passes false: its `on` fields have
-/// a unique index, so it never plans one).
+/// a unique index, so it never plans one). `status_counters` is the
+/// server's, when the statements are an `update` command's own.
 pub(crate) fn update_in(
     doc: &Document,
     db_name: &str,
     storage: &dyn crate::Storage,
     notablescan: bool,
+    status_counters: Option<&crate::topstats::TopStats>,
 ) -> HandlerResult {
     argtypes::require_object(doc, "let", "update.let")?;
     argtypes::require_bool_field(doc, "ordered", "update.ordered")?;
@@ -1947,6 +1961,7 @@ pub(crate) fn update_in(
         // The statement is still read first: a malformed one is refused.
         let absent = !upsert && !storage.collection_exists(db_name, &coll).unwrap_or(true);
 
+        let statement_started = std::time::Instant::now();
         // Pipeline-form `u` (`[...]`) vs operator/replacement-form (`{...}`).
         // An update of ONE document changes the first its query matches in
         // the order mongod reads them.
@@ -2147,6 +2162,13 @@ pub(crate) fn update_in(
             Ok(outcome) => {
                 n += outcome.matched as i32;
                 n_modified += outcome.modified as i32;
+                if let (true, Some(stats)) = (multi, status_counters) {
+                    stats.status.many_statement(
+                        true,
+                        outcome.matched as u64,
+                        statement_started.elapsed(),
+                    );
+                }
                 if outcome.modified > 0 {
                     crate::transactions::note_statement(
                         index,

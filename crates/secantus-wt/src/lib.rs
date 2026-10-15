@@ -507,6 +507,18 @@ impl Cursor {
         Ok(v)
     }
 
+    /// A `statistics:` cursor's row (`value_format=SSq`): the statistic's
+    /// description and its value. The printable form is not kept.
+    pub fn get_value_stat(&self) -> Result<(String, i64)> {
+        let mut desc: *const c_char = ptr::null();
+        let mut printable: *const c_char = ptr::null();
+        let mut value: i64 = 0;
+        check(unsafe {
+            cur_fn!(self, get_value)(self.ptr, &mut desc, &mut printable, &mut value as *mut i64)
+        })?;
+        Ok((owned(desc), value))
+    }
+
     /// `value_format=S` — a single NUL-terminated string. Used by the `metadata:`
     /// cursor, whose value is each object's schema/config string (so a caller can
     /// read an on-disk table's `key_format`).
@@ -567,6 +579,19 @@ impl Drop for Cursor {
 
 fn cstr(s: &str) -> CString {
     CString::new(s).expect("string has interior NUL")
+}
+
+extern "C" {
+    // Declared here rather than in the generated bindings, which list only
+    // what the storage layer has needed so far.
+    fn wiredtiger_version(major: *mut c_int, minor: *mut c_int, patch: *mut c_int)
+        -> *const c_char;
+}
+
+/// The linked WiredTiger's version string, as `wiredtiger_version` gives it
+/// (`"WiredTiger 11.2.0: (...)"`).
+pub fn version_string() -> String {
+    owned(unsafe { wiredtiger_version(ptr::null_mut(), ptr::null_mut(), ptr::null_mut()) })
 }
 
 fn owned(p: *const c_char) -> String {

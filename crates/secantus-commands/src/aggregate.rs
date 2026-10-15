@@ -3619,7 +3619,7 @@ fn apply_merge(
         if bypass_validation {
             command.insert("bypassDocumentValidation", true);
         }
-        let reply = match crate::crud::update_in(&command, &merge.db, storage, false) {
+        let reply = match crate::crud::update_in(&command, &merge.db, storage, false, None) {
             Ok(reply) => reply,
             Err(e) => return Err(during(e)),
         };

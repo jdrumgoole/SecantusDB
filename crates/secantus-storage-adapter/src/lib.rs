@@ -942,6 +942,14 @@ impl CmdStorage for StorageAdapter {
         Some((m.sleep_secs, m.enabled, m.passes, m.deleted))
     }
 
+    fn engine_statistics(&self) -> Option<Result<(String, Vec<(String, i64)>), StorageError>> {
+        Some(self.inner.wt_statistics().map_err(map_err))
+    }
+
+    fn writes_waiting(&self) -> usize {
+        self.inner.writes_waiting()
+    }
+
     fn set_ttl_monitor(&self, sleep_secs: Option<i64>, enabled: Option<bool>) {
         self.inner.set_ttl_monitor(sleep_secs, enabled);
     }

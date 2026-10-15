@@ -791,6 +791,20 @@ pub trait Storage: Send + Sync {
     /// a setting alone. Default: nothing to set.
     fn set_ttl_monitor(&self, _sleep_secs: Option<i64>, _enabled: Option<bool>) {}
 
+    /// The storage engine's own statistics, `(description, value)` in its
+    /// order, and its version string: what `serverStatus.wiredTiger` reports.
+    /// Default: `None`, a backend that is not WiredTiger.
+    #[allow(clippy::type_complexity)]
+    fn engine_statistics(&self) -> Option<Result<(String, Vec<(String, i64)>), StorageError>> {
+        None
+    }
+
+    /// Writes queued for an admission ticket right now. Default: 0, a backend
+    /// with no admission control, where no write ever waits for one.
+    fn writes_waiting(&self) -> usize {
+        0
+    }
+
     /// Run TTL pruning across every collection, returning the number of docs
     /// deleted. Backs `secantusAdmin.pruneTtl` — an immediate pass (the WT
     /// backend also sweeps on a background cadence). Default: unsupported; the

@@ -3417,11 +3417,15 @@ pub(crate) fn time_series_stats(coll: &str, ctx: &CommandContext) -> HandlerResu
     })
 }
 
-/// `serverStatus` — a minimal subset (host / version / process / uptime), plus a
-/// live `metrics.cursor.open.total` so drivers can track cursor lifecycle
-/// (mongo-php-driver `cursor-destruct-001` opens a batched cursor and asserts the
-/// count rises by one, then returns to baseline after `killCursors`).
-pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+/// `serverStatus` — the sections this server has true numbers for, in
+/// mongod's order (`crate::status` has the counting rules). A section of
+/// mongod's that needs a mechanism this server does not have (`locks`, a lock
+/// manager's acquisitions; `repl`; the plan cache) is absent rather than
+/// reported as zeros. `metrics.cursor.open.total` is live so drivers can track
+/// cursor lifecycle (mongo-php-driver `cursor-destruct-001` opens a batched
+/// cursor and asserts the count rises by one, then returns to baseline after
+/// `killCursors`).
+pub fn server_status(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // `CursorRegistry::len` prunes idle cursors then counts the live ones — the
     // count rises while a batched cursor is open and drops on killCursors.
     let open_cursors = ctx.cursors().map(|c| c.len()).unwrap_or(0) as i64;
@@ -3430,11 +3434,23 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     // Defaults to persistent when there is no storage (unit-test contexts),
     // matching the Python server's fallback rather than erroring the command.
     let persistent = ctx.storage().map(|s| !s.in_memory()).unwrap_or(true);
-    let mut metrics = doc! {
-        "cursor": {
+    let status = ctx.top_stats.as_ref().map(|s| &s.status);
+    let txns = ctx.transactions.as_ref().map(|t| t.counts());
+    let mut metrics = Document::new();
+    if let Some(status) = status {
+        metrics.insert("commands", status.commands());
+    }
+    metrics.insert(
+        "cursor",
+        doc! {
             "open": { "total": open_cursors, "pinned": 0i64, "noTimeout": 0i64 },
         },
-    };
+    );
+    if let Some(status) = status {
+        metrics.insert("document", status.document());
+        metrics.insert("operation", status.operation());
+        metrics.insert("query", status.query());
+    }
     // The TTL monitor's counters. Drivers' and users' tests wait on `passes`
     // to know a sweep has happened instead of sleeping for one.
     if let Some((_, _, passes, deleted)) = ctx.storage().ok().and_then(|s| s.ttl_monitor()) {
@@ -3473,7 +3489,8 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         .as_ref()
         .map(|s| s.network())
         .unwrap_or_default();
-    Ok(doc! {
+    // mongod's order: the sections by name, then `mem` and `metrics`.
+    let mut reply = doc! {
         "host": host,
         "version": crate::SERVER_VERSION,
         "process": "mongod",
@@ -3482,38 +3499,66 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         "uptimeMillis": Bson::Int64(up_millis),
         "uptimeEstimate": Bson::Int64(up_millis / 1000),
         "localTime": now,
-        "metrics": metrics,
-        // mongo-c-driver's `/Client/exhaust_cursor/{single,pool}` read
-        // `connections.totalCreated` off serverStatus to check the connection
-        // pool wasn't cleared. Omitting the section made those fail with
-        // "'connections.totalCreated' field not found" — a serverStatus gap
-        // that looked like an exhaust-cursor bug. Mirrors the Python server's
-        // zeroed block; SecantusDB keeps no pool counters.
-        // Int32, not Int64: libmongoc reads these with `bson_lookup_int32`,
-        // which type-checks rather than coercing ("'connections.totalCreated'
-        // is not a int32"). The Python server emits plain ints, which encode
-        // as Int32, so it never hit this.
-        "connections": {
+    };
+    if let Some(status) = status {
+        reply.insert("asserts", status.asserts());
+    }
+    // mongo-c-driver's `/Client/exhaust_cursor/{single,pool}` read
+    // `connections.totalCreated` off serverStatus to check the connection
+    // pool wasn't cleared. Omitting the section made those fail with
+    // "'connections.totalCreated' field not found" — a serverStatus gap
+    // that looked like an exhaust-cursor bug. Mirrors the Python server's
+    // zeroed block; SecantusDB keeps no pool counters.
+    // Int32, not Int64: libmongoc reads these with `bson_lookup_int32`,
+    // which type-checks rather than coercing ("'connections.totalCreated'
+    // is not a int32"). The Python server emits plain ints, which encode
+    // as Int32, so it never hit this.
+    reply.insert(
+        "connections",
+        doc! {
             "current": conns.current as i32,
             "available": 0i32,
             "totalCreated": conns.total_created as i32,
         },
-        "opcounters": opcounters,
-        // What the server has read and written, counted off the sockets.
-        "network": {
+    );
+    if let Some(extra) = crate::procstats::extra_info() {
+        reply.insert("extra_info", extra);
+    }
+    if let Some(status) = status {
+        reply.insert("globalLock", global_lock(status, up_millis, ctx));
+    }
+    reply.insert(
+        "logicalSessionRecordCache",
+        logical_session_record_cache(ctx),
+    );
+    // What the server has read and written, counted off the sockets.
+    reply.insert(
+        "network",
+        doc! {
             "bytesIn": Bson::Int64(network[1]),
             "bytesOut": Bson::Int64(network[2]),
             "numRequests": Bson::Int64(network[0]),
         },
-        // Storage-engine identity. Drivers gate real behaviour on this:
-        // mongo-php-library's `skipIfTransactionsNotSupported` reads
-        // `storageEngine.name` and throws "Could not determine server storage
-        // engine" when the key is absent, turning ~27 transaction tests into
-        // ERRORs instead of the clean skip the helper intends. Reporting
-        // "wiredTiger" is honest — SecantusDB is WiredTiger-backed, the same
-        // engine mongod uses. Kept byte-identical to the Python server's
-        // `_storage_engine_section`.
-        "storageEngine": {
+    );
+    if let Some(status) = status {
+        let txn_latency = txns.map(|t| (t.latency_micros, t.total_committed + t.total_aborted));
+        reply.insert("opLatencies", status.op_latencies(txn_latency));
+    }
+    reply.insert("opcounters", opcounters);
+    if let Some(status) = status {
+        reply.insert("security", status.security());
+    }
+    // Storage-engine identity. Drivers gate real behaviour on this:
+    // mongo-php-library's `skipIfTransactionsNotSupported` reads
+    // `storageEngine.name` and throws "Could not determine server storage
+    // engine" when the key is absent, turning ~27 transaction tests into
+    // ERRORs instead of the clean skip the helper intends. Reporting
+    // "wiredTiger" is honest — SecantusDB is WiredTiger-backed, the same
+    // engine mongod uses. Kept byte-identical to the Python server's
+    // `_storage_engine_section`.
+    reply.insert(
+        "storageEngine",
+        doc! {
             "name": "wiredTiger",
             "supportsCommittedReads": true,
             "supportsPendingDrops": true,
@@ -3522,14 +3567,125 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             "persistent": persistent,
             "backupCursorOpen": false,
         },
-        // Categorical self-identification: real mongod never has this key.
-        // Tooling (the conformance-gauge tripwire, ad-hoc smoke scripts)
-        // checks it to prove it's talking to SecantusDB rather than an
-        // accidental real MongoDB on the same address. The Python server
-        // reports `server: "python"`.
-        "secantus": { "server": "rust", "version": env!("CARGO_PKG_VERSION") },
-        "ok": 1.0,
-    })
+    );
+    if let Some(t) = txns {
+        let (retried_commands, retried_statements) =
+            status.map(|s| s.retried()).unwrap_or_default();
+        reply.insert(
+            "transactions",
+            doc! {
+                "retriedCommandsCount": Bson::Int64(retried_commands),
+                "retriedStatementsCount": Bson::Int64(retried_statements),
+                "currentActive": Bson::Int64(t.current_active),
+                "currentInactive": Bson::Int64(t.current_inactive),
+                "currentOpen": Bson::Int64(t.current_active + t.current_inactive),
+                "totalAborted": Bson::Int64(t.total_aborted),
+                "totalCommitted": Bson::Int64(t.total_committed),
+                "totalStarted": Bson::Int64(t.total_started),
+            },
+        );
+    }
+    let engine_statistics = if section_wanted(doc, "wiredTiger") {
+        ctx.storage().ok().and_then(|s| s.engine_statistics())
+    } else {
+        None
+    };
+    if let Some(stats) = engine_statistics {
+        let (version, stats) = stats.map_err(crate::util::command_error)?;
+        reply.insert("wiredTiger", wired_tiger_section(&version, stats));
+    }
+    if let Some(mem) = crate::procstats::mem() {
+        reply.insert("mem", mem);
+    }
+    reply.insert("metrics", metrics);
+    // Categorical self-identification: real mongod never has this key.
+    // Tooling (the conformance-gauge tripwire, ad-hoc smoke scripts)
+    // checks it to prove it's talking to SecantusDB rather than an
+    // accidental real MongoDB on the same address. The Python server
+    // reports `server: "python"`.
+    reply.insert(
+        "secantus",
+        doc! { "server": "rust", "version": env!("CARGO_PKG_VERSION") },
+    );
+    // A section asked for as `name: 0` (or `false`) is left out, as mongod
+    // leaves it out; the process's own fields always stay.
+    for (key, _) in doc.iter().skip(1) {
+        if !section_wanted(doc, key) && reply.get_document(key).is_ok() && key != "secantus" {
+            reply.remove(key);
+        }
+    }
+    reply.insert("ok", 1.0);
+    Ok(reply)
+}
+
+/// Whether `serverStatus` reports `section`: unless the command turns it off
+/// with a false value.
+fn section_wanted(doc: &Document, section: &str) -> bool {
+    !matches!(
+        doc.get(section),
+        Some(Bson::Boolean(false) | Bson::Int32(0) | Bson::Int64(0))
+    ) && !matches!(doc.get(section), Some(Bson::Double(d)) if *d == 0.0)
+}
+
+/// `globalLock`: how long the server has run, the reads and writes running,
+/// and the ones queued. This server has no global lock; what queues an
+/// operation here is the storage engine's write admission (off unless
+/// configured), which is where mongod queues one too -- its tickets are
+/// taken with the global lock. A read never queues here.
+fn global_lock(
+    status: &crate::status::StatusCounters,
+    up_millis: i64,
+    ctx: &CommandContext,
+) -> Document {
+    let (readers, writers) = status.active_clients();
+    let queued = ctx
+        .storage()
+        .map(|s| s.writes_waiting() as i32)
+        .unwrap_or(0);
+    doc! {
+        "totalTime": Bson::Int64(up_millis.saturating_mul(1000)),
+        "currentQueue": { "total": queued, "readers": 0i32, "writers": queued },
+        "activeClients": {
+            "total": (readers + writers) as i32,
+            "readers": readers as i32,
+            "writers": writers as i32,
+        },
+    }
+}
+
+/// `logicalSessionRecordCache`: the sessions in use (what
+/// `$listLocalSessions` lists) and the sessions holding transaction or
+/// retryable-write state. mongod's other fields time its periodic refresh of
+/// `config.system.sessions`, which this server does not run.
+fn logical_session_record_cache(ctx: &CommandContext) -> Document {
+    let active = ctx.server_params.as_ref().map_or(0, |p| p.sessions().len());
+    let catalog = ctx.transactions.as_ref().map_or(0, |t| t.session_count());
+    doc! {
+        "activeSessionsCount": active as i32,
+        "sessionCatalogSize": catalog as i32,
+    }
+}
+
+/// `serverStatus.wiredTiger`, as mongod builds it from the same cursor: the
+/// statistics grouped by the category their description begins with
+/// (`"cache: bytes currently in the cache"`), in the engine's order.
+fn wired_tiger_section(version: &str, stats: Vec<(String, i64)>) -> Document {
+    let mut out = doc! { "uri": "statistics:", "version": version };
+    for (description, value) in stats {
+        let (category, name) = description
+            .split_once(": ")
+            .unwrap_or(("", description.as_str()));
+        let value = i32::try_from(value).map_or(Bson::Int64(value), Bson::Int32);
+        match out.get_mut(category) {
+            Some(Bson::Document(group)) => {
+                group.insert(name, value);
+            }
+            _ => {
+                out.insert(category, doc! { name: value });
+            }
+        }
+    }
+    out
 }
 
 /// `currentOp` — mongod's in-flight-operation introspection. SecantusDB runs

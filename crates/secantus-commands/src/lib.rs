@@ -69,6 +69,7 @@ mod notablescan;
 pub mod params;
 mod privileges;
 pub mod profiler;
+mod procstats;
 pub mod rbac;
 mod replset_admin;
 pub mod roles;
@@ -77,6 +78,7 @@ pub mod serverinfo;
 mod session;
 pub mod slowop;
 mod stats_admin;
+pub mod status;
 pub mod stepdown;
 pub mod storage;
 mod timeseries;
@@ -683,10 +685,15 @@ fn configure_fail_point(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
 /// are shaped into `ok: 0`), so the connection survives any single command.
 pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     handshake::process_started();
-    if let Some(stats) = &ctx.top_stats {
+    let started = std::time::Instant::now();
+    let stats = ctx.top_stats.clone();
+    if let Some(stats) = &stats {
         stats.count_op(doc);
     }
     let name = command_name(doc);
+    let _active = stats
+        .as_ref()
+        .map(|s| s.status.activate(status::OpKind::of(name)));
     // The write concern a write with none of its own is held to: the stored
     // default, read BEFORE the command runs, so `setDefaultRWConcern`'s own
     // write answers for the default it replaces (mongod's order).
@@ -720,6 +727,13 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
             p.forget(&ctx.db_name);
         }
     }
+    // Counted before a `w: 0` write's reply is emptied: mongod counts what
+    // the write did, not what it told the client.
+    if let Some(stats) = &stats {
+        let pending = ctx.pending_batch.as_ref().map_or(0, |b| b.batch.len());
+        stats.status.record(doc, &reply, pending, started.elapsed());
+        status_authentication(&stats.status, name, doc, &reply, ctx, started);
+    }
     // A user or role may have changed: every connection's effective
     // privileges are recomputed on its next command (`rbac::effective`).
     if umc::is_user_or_role_command(name) || name == "secantusAdmin.restoreArchive" {
@@ -746,6 +760,50 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     order_write_reply(doc, &mut reply);
     profiler::finish(name, doc, inner_n, &reply, ctx);
     reply
+}
+
+/// Count an authentication for `serverStatus.security` (measured 8.2.11): a
+/// `saslStart` or `authenticate` is one received; it succeeds when the
+/// conversation ends `done`, and its time runs from the first command to the
+/// last.
+fn status_authentication(
+    counters: &status::StatusCounters,
+    name: &str,
+    doc: &Document,
+    reply: &Document,
+    ctx: &CommandContext,
+    started: std::time::Instant,
+) {
+    if matches!(name, "hello" | "isMaster" | "ismaster") {
+        if doc.contains_key("saslSupportedMechs") {
+            counters.sasl_supported_mechs_received();
+        }
+        return;
+    }
+    if !matches!(name, "saslStart" | "saslContinue" | "authenticate") {
+        return;
+    }
+    let ok = reply.get_f64("ok").unwrap_or(0.0) == 1.0;
+    let done = !ok || name == "authenticate" || reply.get_bool("done").unwrap_or(false);
+    let Some(auth) = ctx.conn_auth.as_ref() else {
+        return;
+    };
+    let mut auth = auth.lock().unwrap_or_else(|e| e.into_inner());
+    let begun = if name == "saslContinue" {
+        auth.auth_started.take()
+    } else {
+        let mechanism = doc.get_str("mechanism").unwrap_or("").to_string();
+        counters.authentication_received(&mechanism);
+        Some((mechanism, started))
+    };
+    let Some((mechanism, since)) = begun else {
+        return;
+    };
+    if done {
+        counters.authentication_ended(&mechanism, ok, since.elapsed());
+    } else {
+        auth.auth_started = Some((mechanism, since));
+    }
 }
 
 /// A write sent with `w: 0` asked not to be told what happened, and mongod

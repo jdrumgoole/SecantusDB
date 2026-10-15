@@ -123,7 +123,7 @@ def test_server_status_sections(rust_mongo: Any) -> None:
     assert want - got == set()
 
 
-@pytest.mark.backlog("RM-034")
+@pytest.mark.backlog_fixed("RM-034")
 def test_server_status_metrics(rust_mongo: Any) -> None:
     """mongod 8.2.11's `metrics` holds `document`, `operation`, `query`,
     `commands` beside `cursor` and `ttl`."""

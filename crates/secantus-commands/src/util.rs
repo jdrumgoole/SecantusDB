@@ -475,6 +475,16 @@ pub(crate) fn read_exec_error(err: StorageError, command: &str, ns: &str) -> Com
 /// commands like `count` / `find`). Read commands never carry an
 /// execution-time update error, so this drops the flag; `findAndModify`, which
 /// does, goes through [`command_error_during`].
+/// Whether `reply` refuses a command that did not parse: mongod never ran
+/// it, so it is no statement of a transaction and no run of the command.
+pub(crate) fn did_not_parse(reply: &Document) -> bool {
+    reply.get_f64("ok").unwrap_or(0.0) != 1.0
+        && (matches!(reply.get_i32("code").unwrap_or(0), 16 | 40414 | 40415)
+            || reply
+                .get_str("errmsg")
+                .is_ok_and(|m| m.starts_with("BSON field '") || m.starts_with("Expected field ")))
+}
+
 pub(crate) fn command_error(err: StorageError) -> CommandError {
     command_error_during(err, "")
 }
