@@ -8,18 +8,24 @@
 //! command. It is a description of the plan mongod runs for the query. This
 //! server's own storage layer may read the same documents another way.
 //!
-//! Not reproduced: the rejected plans, the plan cache, and the choice
-//! mongod makes by trial when several indexes could serve one query (a
-//! fixed order of preference stands in for it, see `plan.rs`).
+//! Not reproduced: the plan cache. The choice mongod makes by trial when
+//! several plans could serve one query is counted over the collection
+//! (`trial.rs`), and the plans it tried are listed as `rejectedPlans` and
+//! `allPlansExecution`; between plans the trial scores alike a fixed order
+//! of preference decides (`plan.rs`). A multikey index with two predicates
+//! on one field is tried once here, where mongod tries a plan per predicate.
 
 mod bounds;
+mod deps;
 mod exec;
 pub(crate) mod geo;
+pub(crate) mod hoist;
 mod node;
 pub(crate) mod order;
 mod parsed;
 mod plan;
 mod shape;
+mod trial;
 
 use crate::util::{as_i64, command_error, decode_docs};
 use crate::{CommandContext, CommandError, HandlerResult, SERVER_VERSION};
@@ -198,7 +204,9 @@ fn scans_collection(plan: &Node) -> bool {
         | Node::Count(input)
         | Node::Update(input)
         | Node::Delete { input, .. } => scans_collection(input),
-        Node::Or(inputs) | Node::SortMerge { inputs, .. } => inputs.iter().any(scans_collection),
+        Node::Or(inputs) | Node::AndSorted(inputs) | Node::SortMerge { inputs, .. } => {
+            inputs.iter().any(scans_collection)
+        }
         Node::IxScan(_)
         | Node::Eof(_)
         | Node::Express { .. }
@@ -255,6 +263,7 @@ pub(crate) fn plans_table_scan(
         batch_size: false,
         keys_only: false,
         wanted: None,
+        pipeline: false,
         implies: &implies,
         trial: None,
     };
@@ -407,14 +416,17 @@ fn plan_for(
     collation: Option<&Collation>,
     t: &Target,
     ctx: &CommandContext,
-) -> Result<Node, CommandError> {
+) -> Result<(Node, Vec<plan::Ranked>), CommandError> {
     let ns = format!("{}.{}", ctx.db_name, s.coll);
     if !t.exists {
         let eof = Node::Eof("nonExistentNamespace");
-        return Ok(match s.kind {
-            Kind::Count => Node::Count(Box::new(eof)),
-            _ => eof,
-        });
+        return Ok((
+            match s.kind {
+                Kind::Count => Node::Count(Box::new(eof)),
+                _ => eof,
+            },
+            Vec::new(),
+        ));
     }
     let storage = ctx.storage()?;
     let implies = |partial: &Document| storage.query_implies_partial(&s.filter, partial);
@@ -453,9 +465,10 @@ fn plan_for(
         collation,
     };
     let trial = plan::Trial {
-        total: t.docs.len(),
+        total: Some(t.docs.len()),
         matched: None,
         whole: &whole,
+        ranked: Default::default(),
     };
     let q = Query {
         canonical,
@@ -471,10 +484,11 @@ fn plan_for(
         batch_size: s.batch_size,
         keys_only: false,
         wanted: None,
+        pipeline: s.pipeline,
         implies: &implies,
         trial: Some(&trial),
     };
-    Ok(match &s.kind {
+    let node = match &s.kind {
         Kind::Find => plan::plan(&q, &t.catalog),
         Kind::Count => plan::count(&q, &t.catalog),
         Kind::Distinct(key) => plan::distinct(&q, &t.catalog, key),
@@ -484,7 +498,9 @@ fn plan_for(
         Kind::Delete { multi, returns } => {
             plan::write(&q, &t.catalog, true, *multi, false, *returns)
         }
-    })
+    };
+    let ranked = std::mem::take(&mut *trial.ranked.borrow_mut());
+    Ok((node, ranked))
 }
 
 fn query_planner(
@@ -527,7 +543,173 @@ fn query_planner(
     out
 }
 
-fn execution_stats(plan: &Node, stats: &Stats, verbosity: Verbosity) -> Document {
+/// A `$group` mongod answers from a DISTINCT_SCAN (`$groupByDistinctScan`,
+/// measured 8.2.11): its `_id` one field path (or a document of one), its
+/// accumulators `$first` / `$last` of field paths, after no sort or a sort
+/// on that field alone, over an index that serves `distinct` on the field.
+/// The scan fetches the documents when an accumulator reads another field.
+/// `None`: not such a `$group`, or no index serves it.
+fn distinct_group(
+    s: &Shape,
+    canonical: &Document,
+    collation: Option<&Collation>,
+    t: &Target,
+    ctx: &CommandContext,
+) -> Result<Option<(Shape, Node, Vec<plan::Ranked>)>, CommandError> {
+    let path = |v: &Bson| match v {
+        Bson::String(p) if p.starts_with('$') && !p.starts_with("$$") => Some(p[1..].to_string()),
+        _ => None,
+    };
+    if s.kind != Kind::Find || !s.pipeline || s.skip != 0 || s.limit != 0 {
+        return Ok(None);
+    }
+    let Some(Ok(spec)) = s.rest.first().map(|st| st.get_document("$group")) else {
+        return Ok(None);
+    };
+    let Some(id) = spec.get("_id") else {
+        return Ok(None);
+    };
+    let field = match id {
+        Bson::Document(d) if d.len() == 1 => d.values().next().and_then(path),
+        other => path(other),
+    };
+    let Some(field) = field else {
+        return Ok(None);
+    };
+    let mut root = doc! { "_id": id.clone() };
+    let mut fetching = false;
+    for (name, acc) in spec.iter().filter(|(k, _)| *k != "_id") {
+        let Some((op, arg)) = acc.as_document().and_then(|d| d.iter().next()) else {
+            return Ok(None);
+        };
+        let Some(read) = path(arg).filter(|_| op == "$first" || op == "$last") else {
+            return Ok(None);
+        };
+        fetching |= read != field;
+        root.insert(name.clone(), arg.clone());
+    }
+    let backward = match &s.sort {
+        None => false,
+        Some(sort) => match (sort.len(), sort.get(&field).and_then(as_i64)) {
+            (1, Some(dir)) => dir < 0,
+            _ => return Ok(None),
+        },
+    };
+    let mut asked = s.clone();
+    asked.kind = Kind::Distinct(field.clone());
+    asked.sort = None;
+    asked.projection = None;
+    let (node, ranked) = plan_for(&asked, canonical, collation, t, ctx)?;
+    let Node::Projection { input, .. } = node else {
+        return Ok(None);
+    };
+    let Node::DistinctScan(mut ix, width, _) = *input else {
+        return Ok(None);
+    };
+    ix.backward = backward;
+    let scan = Node::DistinctScan(ix, width, fetching);
+    let plan = if fetching {
+        scan
+    } else {
+        Node::Projection {
+            name: if field.contains('.') {
+                "PROJECTION_DEFAULT"
+            } else {
+                "PROJECTION_COVERED"
+            },
+            spec: doc! { field.clone(): 1_i32, "_id": 0_i32 },
+            input: Box::new(scan),
+        }
+    };
+    // The other plans tried read through the projection of the fields the
+    // `$group` needs.
+    let ranked: Vec<plan::Ranked> = ranked
+        .into_iter()
+        .map(|mut r| {
+            if !matches!(r.plan, Node::Projection { .. }) {
+                if let Some(p) = &s.projection {
+                    r.plan = Node::Projection {
+                        name: "PROJECTION_SIMPLE",
+                        spec: p.clone(),
+                        input: Box::new(r.plan),
+                    };
+                    r.stats = Stats {
+                        n_returned: r.stats.n_returned,
+                        children: vec![r.stats],
+                        ..Stats::default()
+                    };
+                }
+            }
+            r
+        })
+        .collect();
+    let mut ranked: Vec<plan::Ranked> = ranked;
+    if let Some(winner) = ranked.first_mut() {
+        winner.plan = plan.clone();
+        if fetching {
+            if let Some(scan) = winner.stats.children.first().cloned() {
+                winner.stats = scan;
+            }
+        }
+    }
+    let mut shape = s.clone();
+    shape.sort = None;
+    shape.projection = None;
+    shape.rest[0] = doc! { "$groupByDistinctScan": { "newRoot": root } };
+    Ok(Some((shape, plan, ranked)))
+}
+
+/// Raise each counter of `run` to what `trial` counted in the same stage.
+fn at_least(run: &mut Stats, trial: &Stats) {
+    run.n_returned = run.n_returned.max(trial.n_returned);
+    run.keys = run.keys.max(trial.keys);
+    run.docs = run.docs.max(trial.docs);
+    if run.children.len() == trial.children.len() {
+        for (r, t) in run.children.iter_mut().zip(&trial.children) {
+            at_least(r, t);
+        }
+    }
+}
+
+/// The plans mongod tried, as `explain` lists them (the winner first): each
+/// under the stage the command puts on top, with its score and what its
+/// stages counted during the trial.
+fn tried_plans(s: &Shape, ranked: &[plan::Ranked]) -> Vec<(Node, f64, Stats)> {
+    ranked
+        .iter()
+        .map(|r| {
+            let on_top = |node: Node, extra: Document| {
+                let stats = Stats {
+                    extra,
+                    children: vec![r.stats.clone()],
+                    ..Stats::default()
+                };
+                (node, r.score, stats)
+            };
+            match &s.kind {
+                Kind::Update { .. } => on_top(
+                    Node::Update(Box::new(r.plan.clone())),
+                    doc! { "nMatched": 0_i32, "nWouldModify": 0_i32, "nWouldUpsert": 0_i32 },
+                ),
+                Kind::Delete { multi, .. } => on_top(
+                    Node::Delete {
+                        batched: *multi,
+                        input: Box::new(r.plan.clone()),
+                    },
+                    doc! { "nWouldDelete": 0_i32 },
+                ),
+                _ => (r.plan.clone(), r.score, r.stats.clone()),
+            }
+        })
+        .collect()
+}
+
+fn execution_stats(
+    plan: &Node,
+    stats: &Stats,
+    verbosity: Verbosity,
+    tried: &[(Node, f64, Stats)],
+) -> Document {
     let (keys, docs) = stats.totals();
     let mut stages = doc! { "isCached": false };
     stages.extend(plan.to_doc(Some(stats)));
@@ -540,7 +722,32 @@ fn execution_stats(plan: &Node, stats: &Stats, verbosity: Verbosity) -> Document
         "executionStages": stages,
     };
     if verbosity == Verbosity::AllPlans {
-        out.insert("allPlansExecution", Bson::Array(vec![]));
+        let entries: Vec<Bson> = tried
+            .iter()
+            .enumerate()
+            .map(|(at, (node, score, st))| {
+                // mongod's write stage is one object, shared by every plan:
+                // the plans it rejected show the counts of the run that
+                // followed, the winner the counts it had during the trial.
+                let mut st = st.clone();
+                if at > 0 && matches!(node, Node::Update(_) | Node::Delete { .. }) {
+                    st.extra = stats.extra.clone();
+                    st.n_returned = stats.n_returned;
+                }
+                let (keys, docs) = st.totals();
+                let mut stages = doc! { "isCached": false };
+                stages.extend(node.to_doc(Some(&st)));
+                Bson::Document(doc! {
+                    "nReturned": num(st.n_returned),
+                    "executionTimeMillisEstimate": 0_i32,
+                    "totalKeysExamined": num(keys),
+                    "totalDocsExamined": num(docs),
+                    "score": *score,
+                    "executionStages": stages,
+                })
+            })
+            .collect();
+        out.insert("allPlansExecution", entries);
     }
     out
 }
@@ -607,6 +814,91 @@ fn count_through(
     cursor.get_array("firstBatch").map_or(0, |b| b.len() as i64)
 }
 
+/// Whether a stage hands each document on as it reads it.
+fn streams(stage: &Document) -> bool {
+    matches!(
+        stage.keys().next().map(String::as_str),
+        Some(
+            "$match"
+                | "$unwind"
+                | "$project"
+                | "$addFields"
+                | "$set"
+                | "$unset"
+                | "$replaceRoot"
+                | "$replaceWith"
+        )
+    )
+}
+
+/// mongod's per-stage counts in front of a `$limit` (measured 8.2.11): a
+/// stage that streams hands over only what the stage after it pulled, so
+/// `[$match, $unwind: "$t", $limit: 3]` returns 2 documents from the
+/// cursor and 3 from the `$unwind`. Rewrites `counts` (the stages after the
+/// cursor) and returns what the cursor handed over, when it streams into
+/// the limit.
+fn pulled_counts(
+    ctx: &mut CommandContext,
+    coll: &str,
+    pipeline: &[Document],
+    taken: usize,
+    options: &Document,
+    counts: &mut [i64],
+) -> Option<i64> {
+    let rest = &pipeline[taken..];
+    let at = rest.iter().position(|st| st.contains_key("$limit"))?;
+    let limit = rest[at].get("$limit").and_then(as_i64)?;
+    // The run of streaming stages that feeds the limit, after the last that
+    // does not stream (or after the cursor).
+    let from = rest[..at]
+        .iter()
+        .rposition(|st| !streams(st))
+        .map_or(0, |b| b + 1);
+    let full_before = |ctx: &mut CommandContext, j: usize, counts: &[i64]| -> i64 {
+        if j == 0 {
+            count_through(ctx, coll, &pipeline[..taken], options)
+        } else {
+            counts[j - 1]
+        }
+    };
+    let mut demand = limit;
+    for j in (from..at).rev() {
+        let before = full_before(ctx, j, counts);
+        // Asked for no fewer than it has: it reads everything, to the end.
+        if demand >= counts[j] {
+            demand = before;
+            continue;
+        }
+        counts[j] = demand;
+        let wanted = demand;
+        // The fewest documents stage `j` reads to hand over `wanted`.
+        let (mut lo, mut hi) = (0_i64, before);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let mut probe: Vec<Document> = pipeline[..taken + j].to_vec();
+            probe.push(doc! { "$limit": Bson::Int64(mid.max(1)) });
+            probe.push(rest[j].clone());
+            let got = if mid == 0 {
+                0
+            } else {
+                count_through(ctx, coll, &probe, options)
+            };
+            if got >= wanted {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        demand = lo;
+    }
+    if from == 0 {
+        Some(demand)
+    } else {
+        counts[from - 1] = counts[from - 1].min(demand);
+        None
+    }
+}
+
 /// One explained command, ready to plan.
 struct Request {
     shape: Shape,
@@ -623,25 +915,59 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
     let wanted = verbosity != Verbosity::QueryPlanner;
     // What each stage after the cursor returns: the pipeline run that far.
     let taken = r.pipeline.len() - s.rest.len();
-    let stage_counts: Vec<i64> = if wanted {
+    let mut stage_counts: Vec<i64> = if wanted {
         (0..s.rest.len())
             .map(|i| count_through(ctx, &s.coll, &r.pipeline[..taken + i + 1], &s.options))
             .collect()
     } else {
         vec![]
     };
+    // Under a `$limit`, the stages that stream into it hand over only what
+    // it pulls; `None`: the cursor's own count stands.
+    let cursor_pulled = if wanted {
+        pulled_counts(
+            ctx,
+            &s.coll,
+            &r.pipeline,
+            taken,
+            &s.options,
+            &mut stage_counts,
+        )
+    } else {
+        None
+    };
     let storage = ctx.storage()?;
     let collation = crate::util::effective_collation(storage, &db, &s.coll, &s.options)?;
     let canonical = parsed::parsed_query(&s.filter);
     let t = target(ctx, &s.coll)?;
-    let plan = plan_for(s, &canonical, collation.as_ref(), &t, ctx)?;
+    let grouped = distinct_group(s, &canonical, collation.as_ref(), &t, ctx)?;
+    let regrouped;
+    let (s, (plan, ranked)) = match grouped {
+        Some((shape, plan, ranked)) => {
+            regrouped = shape;
+            (&regrouped, (plan, ranked))
+        }
+        None => (s, plan_for(s, &canonical, collation.as_ref(), &t, ctx)?),
+    };
     if crate::notablescan::enabled(ctx) {
         let why = resolve_hint(s.hint.as_ref(), &t.catalog)
             .ok()
             .and_then(|hint| table_scan(&plan, &hint));
         crate::notablescan::refuse_planned(ctx.storage()?, &db, &s.coll, &s.filter, why)?;
     }
-    let planner = query_planner(&ns, s, &canonical, collation.as_ref(), &plan);
+    let tried = tried_plans(s, &ranked);
+    let mut planner = query_planner(&ns, s, &canonical, collation.as_ref(), &plan);
+    if tried.len() > 1 {
+        let rejected: Vec<Bson> = tried[1..]
+            .iter()
+            .map(|(node, _, _)| {
+                let mut d = doc! { "isCached": false };
+                d.extend(node.to_doc(None));
+                Bson::Document(d)
+            })
+            .collect();
+        planner.insert("rejectedPlans", rejected);
+    }
     let stats = wanted.then(|| {
         let (multi, upsert, returns) = match &s.kind {
             Kind::Update {
@@ -662,13 +988,23 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             returns,
             known: None,
         };
-        exec::run(&plan, &env)
+        let mut run = exec::run(&plan, &env);
+        // The winner's stages are the ones the trial worked: what they
+        // counted then stands where the run read less (a delete of one
+        // document after a trial that read them all).
+        if let Some((_, _, trial)) = tried.first() {
+            at_least(&mut run, trial);
+        }
+        run
     });
     let mut reply = doc! { "explainVersion": "1" };
     if s.rest.is_empty() {
         reply.insert("queryPlanner", planner);
         if let Some(st) = &stats {
-            reply.insert("executionStats", execution_stats(&plan, st, verbosity));
+            reply.insert(
+                "executionStats",
+                execution_stats(&plan, st, verbosity, &tried),
+            );
         }
         reply.insert("command", r.echo.clone());
         reply.insert("serverInfo", server_info(ctx));
@@ -676,7 +1012,10 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
     } else {
         let mut cursor = doc! { "queryPlanner": planner };
         if let Some(st) = &stats {
-            cursor.insert("executionStats", execution_stats(&plan, st, verbosity));
+            cursor.insert(
+                "executionStats",
+                execution_stats(&plan, st, verbosity, &tried),
+            );
         }
         let counted = |stage: &mut Document, n: i64| {
             stage.insert("nReturned", Bson::Int64(n));
@@ -684,15 +1023,16 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
         };
         let mut first = doc! { "$cursor": cursor };
         if let Some(st) = &stats {
-            counted(&mut first, st.n_returned);
+            counted(&mut first, cursor_pulled.unwrap_or(st.n_returned));
         }
         let mut stages = vec![Bson::Document(first)];
         for (i, stage) in s.rest.iter().enumerate() {
-            let mut listed = shape::listed_stage(stage, &db);
-            if let Some(n) = stage_counts.get(i) {
-                counted(&mut listed, *n);
+            for mut listed in shape::listed_stage(stage, &db) {
+                if let Some(n) = stage_counts.get(i) {
+                    counted(&mut listed, *n);
+                }
+                stages.push(Bson::Document(listed));
             }
-            stages.push(Bson::Document(listed));
         }
         reply.insert("stages", stages);
         reply.insert("serverInfo", server_info(ctx));
@@ -757,8 +1097,15 @@ fn through_view(
     let mut shape = shape::find(&base, &doc! { "find": base.clone() })?;
     shape.hint = s.hint.clone();
     shape.options = s.options.clone();
-    shape::absorb(&mut shape, &pipeline);
     let stages: Vec<Bson> = pipeline.iter().cloned().map(Bson::Document).collect();
+    let pipeline: Vec<Document> = hoist::hoist_matches(&stages)
+        .into_iter()
+        .filter_map(|b| match b {
+            Bson::Document(d) => Some(d),
+            _ => None,
+        })
+        .collect();
+    shape::absorb(&mut shape, &pipeline);
     let mut echo = doc! {
         "aggregate": base,
         "pipeline": stages,
@@ -1028,7 +1375,8 @@ fn aggregate(
         // No collection is read through a query: the stages, as mongod lists them.
         let stages: Vec<Bson> = pipeline
             .iter()
-            .map(|s| Bson::Document(shape::listed_stage(s, &db)))
+            .flat_map(|s| shape::listed_stage(s, &db))
+            .map(Bson::Document)
             .collect();
         let mut reply = doc! { "explainVersion": "1", "stages": stages };
         reply.insert("serverInfo", server_info(ctx));
@@ -1046,6 +1394,16 @@ fn aggregate(
     let request = if crate::views::is_view(storage, &db, &coll) {
         through_view(&s, pipeline, false, ctx)?
     } else {
+        // The pipeline as mongod reorders it, which the per-stage counts
+        // run a prefix of.
+        let staged: Vec<Bson> = pipeline.into_iter().map(Bson::Document).collect();
+        let pipeline: Vec<Document> = hoist::hoist_matches(&staged)
+            .into_iter()
+            .filter_map(|b| match b {
+                Bson::Document(d) => Some(d),
+                _ => None,
+            })
+            .collect();
         shape::absorb(&mut s, &pipeline);
         Request {
             shape: s,

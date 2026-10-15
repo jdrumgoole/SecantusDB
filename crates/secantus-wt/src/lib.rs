@@ -494,6 +494,38 @@ impl Cursor {
         Ok((owned(a), owned(b), owned(c), unsafe { item_bytes(&it) }))
     }
 
+    /// [`Self::get_key_sssu`] without copying: `f` sees the four columns
+    /// (the strings without their NUL) where they sit in the cursor's
+    /// buffer, which holds them only until the cursor next moves. For a
+    /// scan of many entries, where the copies are most of the cost.
+    pub fn with_key_sssu<T>(&self, f: impl FnOnce(&[u8], &[u8], &[u8], &[u8]) -> T) -> Result<T> {
+        let (mut a, mut b, mut c): (*const c_char, *const c_char, *const c_char) =
+            (ptr::null(), ptr::null(), ptr::null());
+        let mut it: sys::WT_ITEM = unsafe { std::mem::zeroed() };
+        check(unsafe {
+            cur_fn!(self, get_key)(
+                self.ptr,
+                &mut a,
+                &mut b,
+                &mut c,
+                &mut it as *mut sys::WT_ITEM,
+            )
+        })?;
+        let text = |p: *const c_char| -> &[u8] {
+            if p.is_null() {
+                &[]
+            } else {
+                unsafe { CStr::from_ptr(p) }.to_bytes()
+            }
+        };
+        let packed: &[u8] = if it.data.is_null() || it.size == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(it.data as *const u8, it.size) }
+        };
+        Ok(f(text(a), text(b), text(c), packed))
+    }
+
     pub fn get_value_u(&self) -> Result<Vec<u8>> {
         let mut it: sys::WT_ITEM = unsafe { std::mem::zeroed() };
         check(unsafe { cur_fn!(self, get_value)(self.ptr, &mut it as *mut sys::WT_ITEM) })?;
