@@ -138,11 +138,6 @@ def test_wrong_password_checked_before_the_database(pg: Any, rust_pg: Any) -> No
 
 # RP-015: what `pg_builtin_coverage.py` still reports. Each is compared with
 # the live PostgreSQL 15 reference, under the same session time zone.
-_RP015 = {
-    # Under the database's collation, through `strcoll`: the platform's
-    # locale data says the magnitude.
-    "strcoll-compare": "select bttextcmp('b', 'a'), bpcharcmp('b', 'a'), jsonb_cmp('\"a\"', '\"c\"')",
-}
 
 # What the 2026-10-15 batch fixed, kept as regression tests.
 _RP015_FIXED = {
@@ -292,8 +287,19 @@ def _same_as_reference(pg: Any, pg15: Any, sql: str) -> None:
 
 
 @pytest.mark.backlog("RP-015")
-@pytest.mark.parametrize("sql", list(_RP015.values()), ids=list(_RP015))
-def test_builtin_coverage_residue(pg: Any, pg15: Any, sql: str) -> None:
+def test_strcoll_compares_answer_the_sign(pg: Any, pg15: Any) -> None:
+    """PostgreSQL 15.19: `bttextcmp` / `bpcharcmp` / `jsonb_cmp` and
+    `tsvector_cmp` / `tsquery_cmp` order as below. Only the SIGN is compared
+    (Joe, 2026-10-16): the magnitude of a `strcoll` result is the platform's
+    locale data, and PostgreSQL promises only the sign. The inputs order the
+    same under `C` and `en_US.UTF-8`."""
+    sql = (
+        "select sign(bttextcmp('b', 'a')), sign(bttextcmp('a', 'b')), sign(bttextcmp('a', 'a')),"
+        " sign(bpcharcmp('b', 'a')), sign(bpcharcmp('a ', 'a')),"
+        " sign(jsonb_cmp('\"a\"', '\"c\"')), sign(jsonb_cmp('[1]', '{}')),"
+        " sign(tsvector_cmp('a b', 'a')), sign(tsvector_cmp('a', 'b')),"
+        " sign(tsquery_cmp('a', 'a & b')), sign(tsquery_cmp('b', 'a'))"
+    )
     _same_as_reference(pg, pg15, sql)
 
 
@@ -1016,7 +1022,7 @@ def test_enum_outside_public_is_a_column_type(pg: Any) -> None:
     assert (attnames, described, udt) == ([("id",), ("m",)], enum_oid, [("rp042_q", "e")])
 
 
-@pytest.mark.backlog("RP-043")
+@pytest.mark.backlog("RP-028")
 def test_join_cursor_ordered_by_its_key_cannot_scroll(pg: Any) -> None:
     """PostgreSQL 15.19: a cursor declared without SCROLL over
     `select * from t join u on t.a = u.a order by t.a` (a merge join in key

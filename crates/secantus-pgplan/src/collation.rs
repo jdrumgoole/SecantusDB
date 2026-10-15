@@ -212,8 +212,34 @@ fn keyword<'a>(locale: &'a str, key: &str) -> Option<&'a str> {
     rest.get(i + 1).copied().filter(|v| v.len() > 2)
 }
 
+/// Language and script pairs that PostgreSQL's ICU orders as the language
+/// alone. ICU4C has no tailoring for them, and its fallback drops the
+/// script (`az-Cyrl` -> `az`). ICU4X falls back to the root instead. Each
+/// pair was measured against PostgreSQL 15.19 (`az-Cyrl-x-icu` orders as
+/// `az-x-icu`, not as `und-x-icu`).
+const SCRIPT_ORDERS_AS_LANGUAGE: [(&str, &str); 5] = [
+    ("az", "Cyrl"),
+    ("hi", "Latn"),
+    ("pa", "Arab"),
+    ("uz", "Arab"),
+    ("uz", "Cyrl"),
+];
+
 fn build(locale: &str) -> Option<CollatorBorrowed<'static>> {
-    let parsed: icu_locale::Locale = locale.parse().ok()?;
+    let mut parsed: icu_locale::Locale = locale.parse().ok()?;
+    if let Some(script) = parsed.id.script {
+        let language = parsed.id.language;
+        if SCRIPT_ORDERS_AS_LANGUAGE
+            .iter()
+            .any(|(l, s)| language.as_str() == *l && script.as_str() == *s)
+        {
+            // ICU4C ends at the language (`pa-Arab-PK` -> `pa-Arab` -> `pa`),
+            // so the region goes too: ICU4X would read `pa-PK` as
+            // `pa-Arab-PK` and fall back to the root again.
+            parsed.id.script = None;
+            parsed.id.region = None;
+        }
+    }
     let prefs = CollatorPreferences::from(&parsed);
     let mut options = CollatorOptions::default();
     options.strength = match keyword(locale, "ks")
@@ -538,4 +564,43 @@ pub(crate) fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
         cascade: pg_query::protobuf::DropBehavior::try_from(d.behavior)
             == Ok(pg_query::protobuf::DropBehavior::DropCascade),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ordered(locale: &str, words: &[&str]) -> String {
+        let mut keyed: Vec<(Vec<u8>, &str)> = words
+            .iter()
+            .map(|w| (icu_key(locale, w).unwrap(), *w))
+            .collect();
+        keyed.sort();
+        keyed.iter().map(|(_, w)| *w).collect::<Vec<_>>().join(",")
+    }
+
+    /// PostgreSQL 15.19 orders these script variants as their language
+    /// (`ORDER BY w COLLATE "az-Cyrl-x-icu"` and so on), not as the root.
+    #[test]
+    fn script_variants_order_as_their_language() {
+        let words = ["i", "ı", "h", "x", "q", "k", "ch", "c", "ç", "d"];
+        let root = "c,ç,ch,d,h,i,ı,k,q,x";
+        assert_eq!(ordered("und", &words), root);
+        for az in ["az-Cyrl", "az-Cyrl-AZ"] {
+            assert_eq!(ordered(az, &words), "c,ch,ç,d,h,x,ı,i,k,q", "{az}");
+        }
+        for uz in ["uz-Cyrl", "uz-Arab"] {
+            assert_eq!(ordered(uz, &words), "c,ç,d,h,i,ı,k,q,x,ch", "{uz}");
+        }
+        for name in [
+            "az-Cyrl-x-icu",
+            "az-Cyrl-AZ-x-icu",
+            "hi-Latn-IN-x-icu",
+            "pa-Arab-PK-x-icu",
+            "uz-Arab-AF-x-icu",
+            "uz-Cyrl-UZ-x-icu",
+        ] {
+            assert!(icu_builtin(name).is_some(), "{name}");
+        }
+    }
 }

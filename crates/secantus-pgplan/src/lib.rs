@@ -27955,7 +27955,18 @@ fn text_type_oid(name: &str) -> Option<i64> {
         _ => parts.join("."),
     };
     let key = if array { format!("{base}[]") } else { base };
-    user_type_or_array_oid(&key)
+    user_type_or_array_oid(&key).or_else(|| {
+        // A table named after a built-in type (`create table uuid`) has its
+        // row type only under the qualified name: `public.uuid` is the row
+        // type, a bare `uuid` the built-in.
+        let qualified = parts.join(".");
+        (parts.len() == 2 && qualified != key).then_some(())?;
+        user_type_or_array_oid(&if array {
+            format!("{qualified}[]")
+        } else {
+            qualified
+        })
+    })
 }
 
 fn user_type_or_array_oid(name: &str) -> Option<i64> {
@@ -31034,8 +31045,115 @@ fn infer_param_types_uncached(sql: &str, declared: &[Option<String>]) -> Vec<Opt
             }
         }
     }
+    values_params_as_text(&parsed, &mut inferred);
     PLAN_PARAM_TYPES.with(|t| *t.borrow_mut() = previous_types);
     inferred
+}
+
+/// A VALUES column whose items are all of unknown type -- undeclared
+/// parameters, string literals, NULL -- resolves to `text`
+/// (`select_common_type`), and so do its parameters. Without this a
+/// parameter's text was SNIFFED: `(values ($1), ($2))` with `'1'` and `'a'`
+/// held an integer beside a string, which `string_agg` dropped, `array_agg`
+/// made NULL and `ORDER BY` did not sort. An `INSERT`'s own VALUES list is
+/// left alone: there each item takes its target column's type.
+fn values_params_as_text(
+    parsed: &pg_query::protobuf::ParseResult,
+    inferred: &mut [Option<String>],
+) {
+    use pg_query::protobuf::a_const::Val;
+    let nodes = parsed.nodes();
+    let insert_sources: Vec<*const pg_query::protobuf::SelectStmt> = nodes
+        .iter()
+        .filter_map(|(n, _, _, _)| match n {
+            pg_query::NodeRef::InsertStmt(i) => {
+                match i.select_stmt.as_deref().and_then(|s| s.node.as_ref()) {
+                    Some(N::SelectStmt(s)) => Some(&**s as *const _),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect();
+    for (node, _, _, _) in &nodes {
+        let pg_query::NodeRef::SelectStmt(s) = node else {
+            continue;
+        };
+        if s.values_lists.is_empty() || insert_sources.contains(&(*s as *const _)) {
+            continue;
+        }
+        let rows: Vec<&[pg_query::protobuf::Node]> = s
+            .values_lists
+            .iter()
+            .filter_map(|r| match r.node.as_ref() {
+                Some(N::List(l)) => Some(l.items.as_slice()),
+                _ => None,
+            })
+            .collect();
+        let width = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        for col in 0..width {
+            let mut params = Vec::new();
+            let all_unknown = rows
+                .iter()
+                .all(|r| match r.get(col).and_then(|n| n.node.as_ref()) {
+                    Some(N::ParamRef(p)) => {
+                        match usize::try_from(p.number)
+                            .ok()
+                            .and_then(|n| n.checked_sub(1))
+                        {
+                            Some(i) if inferred.get(i).is_some_and(Option::is_none) => {
+                                params.push(i);
+                                true
+                            }
+                            _ => false,
+                        }
+                    }
+                    Some(N::AConst(c)) => c.isnull || matches!(c.val, Some(Val::Sval(_))),
+                    _ => false,
+                });
+            if all_unknown {
+                for i in params {
+                    inferred[i] = Some("text".to_string());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod values_param_tests {
+    use super::infer_param_types;
+
+    fn text() -> Option<String> {
+        Some("text".to_string())
+    }
+
+    #[test]
+    fn a_values_column_of_unknowns_is_text() {
+        let sql = "select string_agg(w, ' ' order by w) from (values ($1), ($2), ('b')) v(w)";
+        assert_eq!(infer_param_types(sql, &[None, None]), [text(), text()]);
+        assert_eq!(
+            infer_param_types("values ($1, 1), (null, $2)", &[None, None]),
+            [text(), None],
+        );
+        // A declared type is the client's, and a typed item settles the column.
+        assert_eq!(
+            infer_param_types("values ($1), ($2)", &[Some("int4".into()), None]),
+            [Some("int4".to_string()), None],
+        );
+    }
+
+    #[test]
+    fn an_insert_values_list_takes_the_target_columns() {
+        assert_eq!(
+            infer_param_types("insert into t values ($1), ($2)", &[None, None]),
+            [None, None],
+        );
+        assert_eq!(
+            infer_param_types("insert into t select * from (values ($1)) v", &[None]),
+            [text()],
+        );
+    }
 }
 
 /// The text-family type an UNDECLARED parameter takes from the operand it is

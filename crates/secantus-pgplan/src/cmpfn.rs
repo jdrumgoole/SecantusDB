@@ -61,7 +61,7 @@ fn bit_cmp(a: &str, b: &str) -> i32 {
 fn bitncmp(l: &[u8], r: &[u8], n: usize) -> i32 {
     let whole = n / 8;
     let x = memcmp(&l[..whole.min(l.len())], &r[..whole.min(r.len())]);
-    if x != 0 || n % 8 == 0 {
+    if x != 0 || n.is_multiple_of(8) {
         return x;
     }
     let (mut lb, mut rb) = (

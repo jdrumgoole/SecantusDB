@@ -5,6 +5,22 @@ More of the Rust PostgreSQL server's backlog, measured against PostgreSQL
 
 #### Fixed
 
+- **An untyped parameter in a `VALUES` list is `text`**, as PostgreSQL
+  resolves it. psycopg sends a `str` untyped, and the server read `'1'` as
+  an integer: beside `'a'` and `'b'`, `string_agg` dropped it, `array_agg`
+  made it NULL and `ORDER BY` did not sort. An `INSERT`'s own `VALUES`
+  still takes the target column's type
+  (tests/test_rust_pgserver_slice.py::test_an_untyped_values_parameter_is_text).
+- **Twelve ICU collations that sorted differently from PostgreSQL are now
+  refused** (42704) rather than giving a wrong order: `mr`, `as`, `ln` and
+  `kok`, with their regional and script forms (`kok-Deva`). A probe of 278 strings
+  across 25 scripts found them; the 97-string probe the list was built
+  from had missed the conjunct rules (`क्ष` after `ह`). Part of RP-005
+  (tests/backlog/test_rp_triage.py::test_marathi_icu_collation_orders_as_postgres).
+- **`az-Cyrl`, `hi-Latn`, `pa-Arab`, `uz-Arab` and `uz-Cyrl` ICU
+  collations work**, with their regional forms, ordering as their language
+  the way ICU4C does. Part of RP-005
+  (tests/backlog/test_rp_triage.py::test_script_form_icu_collation_orders_as_its_language).
 - A type name keeps its case from the parse to the lookup: a domain or type
   created as `"Dom"` / `"MyType"` is reached by `"Dom"` / `"MyType"` and
   not by `dom` / `mytype`, and a type named in TEXT (`'MyType'::regtype`,

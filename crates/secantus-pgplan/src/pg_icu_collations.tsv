@@ -1,7 +1,8 @@
 # PostgreSQL 15.19's ICU collations (pg_collation, collprovider 'i'): oid, name, ICU locale, collversion.
-# Only those whose ORDER BY matched PostgreSQL on a 97-string probe across scripts (880 of 907, 2026-10-15);
-# the 27 left out (az-Cyrl, haw, hi-Latn, kl, kok-Latn, lkt, pa-Arab, se, smn, uz-Arab, uz-Cyrl, yi and
-# en-US-u-va-posix, with their regions) are tailored differently by ICU4X's CLDR data and are refused.
+# Only those whose ORDER BY matched PostgreSQL on a probe of 278 strings across 25 scripts (878 of 907,
+# 2026-10-16). Left out, because ICU4X's compiled CLDR data tailors them differently: as, haw, kl, kok,
+# lkt, ln, mr, se, smn, yi and en-US-u-va-posix, with their script and region forms. az-Cyrl, hi-Latn,
+# pa-Arab, uz-Arab and uz-Cyrl order as their language (collation.rs, SCRIPT_ORDERS_AS_LANGUAGE).
 12713	und-x-icu	und	153.136
 12714	af-x-icu	af	153.136.48
 12715	af-NA-x-icu	af-NA	153.136.48
@@ -41,13 +42,13 @@
 12749	ar-TD-x-icu	ar-TD	153.136.48
 12750	ar-TN-x-icu	ar-TN	153.136.48
 12751	ar-YE-x-icu	ar-YE	153.136.48
-12752	as-x-icu	as	153.136.48
-12753	as-IN-x-icu	as-IN	153.136.48
 12754	asa-x-icu	asa	153.136
 12755	asa-TZ-x-icu	asa-TZ	153.136
 12756	ast-x-icu	ast	153.136
 12757	ast-ES-x-icu	ast-ES	153.136
 12758	az-x-icu	az	153.136.48
+12759	az-Cyrl-x-icu	az-Cyrl	153.136.48
+12760	az-Cyrl-AZ-x-icu	az-Cyrl-AZ	153.136.48
 12761	az-Latn-x-icu	az-Latn	153.136.48
 12762	az-Latn-AZ-x-icu	az-Latn-AZ	153.136.48
 12763	ba-x-icu	ba	153.136
@@ -424,6 +425,8 @@
 13137	he-IL-x-icu	he-IL	153.136.48
 13138	hi-x-icu	hi	153.136.48
 13139	hi-IN-x-icu	hi-IN	153.136.48
+13140	hi-Latn-x-icu	hi-Latn	153.136.48
+13141	hi-Latn-IN-x-icu	hi-Latn-IN	153.136.48
 13142	hr-x-icu	hr	153.136.48
 13143	hr-BA-x-icu	hr-BA	153.136.48
 13144	hr-HR-x-icu	hr-HR	153.136.48
@@ -492,9 +495,6 @@
 13209	ko-CN-x-icu	ko-CN	153.136.48
 13210	ko-KP-x-icu	ko-KP	153.136.48
 13211	ko-KR-x-icu	ko-KR	153.136.48
-13212	kok-x-icu	kok	153.136.48
-13213	kok-Deva-x-icu	kok-Deva	153.136.48
-13214	kok-Deva-IN-x-icu	kok-Deva-IN	153.136.48
 13217	ks-x-icu	ks	153.136
 13218	ks-Arab-x-icu	ks-Arab	153.136
 13219	ks-Arab-IN-x-icu	ks-Arab-IN	153.136
@@ -535,11 +535,6 @@
 13254	lij-IT-x-icu	lij-IT	153.136
 13257	lmo-x-icu	lmo	153.136
 13258	lmo-IT-x-icu	lmo-IT	153.136
-13259	ln-x-icu	ln	153.136.48
-13260	ln-AO-x-icu	ln-AO	153.136.48
-13261	ln-CD-x-icu	ln-CD	153.136.48
-13262	ln-CF-x-icu	ln-CF	153.136.48
-13263	ln-CG-x-icu	ln-CG	153.136.48
 13264	lo-x-icu	lo	153.136.48
 13265	lo-LA-x-icu	lo-LA	153.136.48
 13266	lrc-x-icu	lrc	153.136
@@ -581,8 +576,6 @@
 13302	mni-x-icu	mni	153.136
 13303	mni-Beng-x-icu	mni-Beng	153.136
 13304	mni-Beng-IN-x-icu	mni-Beng-IN	153.136
-13305	mr-x-icu	mr	153.136.48
-13306	mr-IN-x-icu	mr-IN	153.136.48
 13307	ms-x-icu	ms	153.136
 13308	ms-BN-x-icu	ms-BN	153.136
 13309	ms-ID-x-icu	ms-ID	153.136
@@ -644,6 +637,8 @@
 13365	os-GE-x-icu	os-GE	153.136
 13366	os-RU-x-icu	os-RU	153.136
 13367	pa-x-icu	pa	153.136.48
+13368	pa-Arab-x-icu	pa-Arab	153.136.48
+13369	pa-Arab-PK-x-icu	pa-Arab-PK	153.136.48
 13370	pa-Guru-x-icu	pa-Guru	153.136.48
 13371	pa-Guru-IN-x-icu	pa-Guru-IN	153.136.48
 13372	pcm-x-icu	pcm	153.136
@@ -823,6 +818,10 @@
 13552	ur-IN-x-icu	ur-IN	153.136.48
 13553	ur-PK-x-icu	ur-PK	153.136.48
 13554	uz-x-icu	uz	153.136.48
+13555	uz-Arab-x-icu	uz-Arab	153.136.48
+13556	uz-Arab-AF-x-icu	uz-Arab-AF	153.136.48
+13557	uz-Cyrl-x-icu	uz-Cyrl	153.136.48
+13558	uz-Cyrl-UZ-x-icu	uz-Cyrl-UZ	153.136.48
 13559	uz-Latn-x-icu	uz-Latn	153.136.48
 13560	uz-Latn-UZ-x-icu	uz-Latn-UZ	153.136.48
 13561	vai-x-icu	vai	153.136

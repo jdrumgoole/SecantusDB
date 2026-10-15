@@ -61,8 +61,8 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
   (`("ab ",1)`), in `row_to_json` and in `array_agg`, and still compares it
   without the padding. Part of RP-032, for whole-row values
   (tests/backlog/test_rust_postgres_gaps.py::test_record_text_keeps_char_padding).
-- `pg_collation` lists 880 of PostgreSQL 15.19's 907 ICU collations, each
-  checked to sort as PostgreSQL does. A `<tag>-x-icu` name that is not one
+- `pg_collation` lists 878 of PostgreSQL 15.19's 907 ICU collations, each
+  checked to sort as PostgreSQL does (the count batch 7 left). A `<tag>-x-icu` name that is not one
   of them is 42704, as on PostgreSQL. Fixes most of RP-005
   (tests/backlog/test_rp_triage.py::test_pg_collation_lists_locale_icu_collations).
 - A table named after a built-in type (`create table tid (...)`) no
