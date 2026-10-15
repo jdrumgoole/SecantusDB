@@ -287,6 +287,23 @@ pub(crate) fn resolved_result_type(name: &str, args: &[String]) -> Option<String
 }
 
 fn resolved_sig(name: &str, args: &[String]) -> Option<&'static Sig> {
+    unknown_resolution(name, args)?.ok()
+}
+
+/// A call with untyped arguments that `func_select_candidate` cannot
+/// settle: several overloads remain, or the unknown positions' categories
+/// conflict. PostgreSQL's 42725 `function f(unknown) is not unique`.
+pub(crate) fn unknown_ambiguous(name: &str, args: &[String]) -> bool {
+    matches!(unknown_resolution(name, args), Some(Err(())))
+}
+
+/// `resolved_sig`'s work: `Some(Ok)` one overload, `Some(Err)` ambiguous,
+/// `None` when the rules here do not decide (no candidate, a polymorphic or
+/// internal parameter, a type with no category).
+fn unknown_resolution(
+    name: &str,
+    args: &[String],
+) -> Option<std::result::Result<&'static Sig, ()>> {
     if crate::scalar::is_catalog_reader(name) || name.starts_with("pg_") || args.is_empty() {
         return None;
     }
@@ -349,7 +366,7 @@ fn resolved_sig(name: &str, args: &[String]) -> Option<&'static Sig> {
             }
         }
         if conflict {
-            return None;
+            return Some(Err(()));
         }
         let chosen = chosen?;
         cands.retain(|s| at(s).is_some_and(|(c, _)| c == chosen));
@@ -358,8 +375,9 @@ fn resolved_sig(name: &str, args: &[String]) -> Option<&'static Sig> {
         }
     }
     match cands.as_slice() {
-        [s] => Some(*s),
-        _ => None,
+        [s] => Some(Ok(*s)),
+        [] => None,
+        _ => Some(Err(())),
     }
 }
 
@@ -453,6 +471,14 @@ pub(crate) fn selected_args(name: &str, args: &[String]) -> Option<Vec<String>> 
         (Some(s), None) if !s.variadic => Some(s.args.clone()),
         _ => None,
     }
+}
+
+/// Does every overload of the built-in `name` return a set
+/// (`generate_series`, `unnest`, `json_each`)?
+pub(crate) fn always_returns_set(name: &str) -> bool {
+    sigs()
+        .get(name)
+        .is_some_and(|o| !o.is_empty() && o.iter().all(|s| s.retset))
 }
 
 /// Is `name` a PostgreSQL built-in function (any overload)?

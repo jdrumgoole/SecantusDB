@@ -28,6 +28,8 @@ mod builtins;
 mod builtins_regex;
 mod builtins_text;
 mod sbcs;
+mod srf_place;
+mod unknown_args;
 
 /// The upper half of a single-byte encoding as PostgreSQL 15 converts it to
 /// Unicode (entry `i` is byte `0x80 + i`, 0 where it has none), for the
@@ -3765,6 +3767,9 @@ fn parse_one(sql: &str) -> Result<N> {
         .ok_or_else(|| Error::Parse("empty statement".into()))?;
     func_cast::rewrite(&mut node);
     pattern_ops(&mut node);
+    unknown_args::check_ambiguous(&node)?;
+    unknown_args::rewrite(&mut node);
+    srf_place::check(&node)?;
     schemas::qualify(&mut node)?;
     Ok(node)
 }
@@ -28406,6 +28411,31 @@ pub(crate) fn render_value_text(v: &Bson) -> String {
     }
 }
 
+/// `float8in` / `float4in`'s reading of a number's text: what `strtod`
+/// takes, with PostgreSQL's 22003 for a value that overflows to infinity
+/// or underflows to zero from nonzero digits (`'1e400'`, `'1e-400'`), and
+/// 22P02 for text that is no number. `Infinity` and `NaN` are words of
+/// their own, in any case and with a sign.
+fn float_in(text: &str, type_name: &str) -> Result<f64> {
+    let t = text.trim();
+    let invalid = || {
+        Error::InvalidText(format!(
+            "invalid input syntax for type {type_name}: \"{text}\""
+        ))
+    };
+    let v = t.parse::<f64>().map_err(|_| invalid())?;
+    let word = t.trim_start_matches(['+', '-']).to_ascii_lowercase();
+    let mantissa = word.split(['e', 'E']).next().unwrap_or("");
+    let out_of_range = (v.is_infinite() && word != "inf" && word != "infinity")
+        || (v == 0.0 && mantissa.bytes().any(|b| (b'1'..=b'9').contains(&b)));
+    if out_of_range {
+        return Err(Error::NumericOutOfRange(format!(
+            "\"{text}\" is out of range for type {type_name}"
+        )));
+    }
+    Ok(v)
+}
+
 pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
     // A domain: the base type's cast, then the domain's constraints.
     if let Some(d) = domains::user_domain(target) {
@@ -28934,7 +28964,15 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
         "float4" | "real" => {
             // numeric -> float4 goes through float4in on the numeric's text,
             // so its range error quotes that text; float8 -> float4 does not.
-            let source_text = is_numeric(&value).then(|| numeric_text(&value)).flatten();
+            let source_text = match &value {
+                // `float4in`: the text, read as a double and refused by the
+                // name of this type if it is out of range for either.
+                Bson::String(t) => {
+                    float_in(t, "real")?;
+                    Some(t.clone())
+                }
+                v => is_numeric(v).then(|| numeric_text(v)).flatten(),
+            };
             let range = |which: &str| match &source_text {
                 Some(t) => {
                     Error::NumericOutOfRange(format!("\"{t}\" is out of range for type real"))
@@ -28966,11 +29004,7 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
                 .and_then(|t| numeric::numeric_text_to_f64(&t))
                 .map(Bson::Double)
                 .ok_or_else(|| bad("double precision", &value)),
-            Bson::String(s) => s
-                .trim()
-                .parse::<f64>()
-                .map(Bson::Double)
-                .map_err(|_| bad("double precision", &value)),
+            Bson::String(s) => float_in(s, "double precision").map(Bson::Double),
             _ => Err(bad("double precision", &value)),
         },
         "bool" | "boolean" => match &value {

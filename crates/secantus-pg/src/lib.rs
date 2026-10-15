@@ -16196,6 +16196,24 @@ impl PgHandler {
         out
     }
 
+    /// `positioned`, for an error found while describing a prepared
+    /// statement: PostgreSQL positions it as it does from a simple query
+    /// (a syntax error, an unknown column or relation, a grouping error), but
+    /// not an `operator does not exist` over a bound parameter (`arr @> $1`,
+    /// measured on 15.19), which it finds only once the parameter is typed.
+    fn syntax_positioned(e: PgWireError, sql: &str) -> PgWireError {
+        match &e {
+            PgWireError::UserError(info)
+                if info.code == "42883"
+                    && info.message.starts_with("operator does not exist")
+                    && sql.contains('$') =>
+            {
+                e
+            }
+            _ => Self::positioned(e, sql),
+        }
+    }
+
     /// An error raised while RUNNING `sql` (not planning it), given the
     /// position PostgreSQL would point at when the statement names it.
     fn positioned(mut e: PgWireError, sql: &str) -> PgWireError {
@@ -38075,11 +38093,10 @@ impl ExtendedQueryHandler for PgHandler {
         self.install_user_types();
         let declared = &target.parameter_types;
         let param_types = self.param_type_names(target);
-        // Positioned as the same error is from a simple query: a syntax
-        // error points at its token (RP-012).
+        // Positioned as from a simple query (RP-012).
         let fields = self
             .describe_fields(&target.statement.sql, param_types.len(), &param_types)
-            .map_err(|e| Self::positioned(e, &target.statement.sql))?;
+            .map_err(|e| Self::syntax_positioned(e, &target.statement.sql))?;
         if let Some(fields) = &fields {
             check_field_names(self.client_encoding(), fields)?;
         }
@@ -38301,7 +38318,7 @@ impl ExtendedQueryHandler for PgHandler {
                 param_types.len(),
                 &param_types,
             )
-            .map_err(|e| Self::positioned(e, &target.statement.statement.sql))?;
+            .map_err(|e| Self::syntax_positioned(e, &target.statement.statement.sql))?;
         if let Some(fields) = &fields {
             check_field_names(self.client_encoding(), fields)?;
         }
