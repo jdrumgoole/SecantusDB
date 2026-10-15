@@ -146,7 +146,7 @@ def test_set_parameter_at_runtime(rust_mongo: Any) -> None:
     assert (a, b) == (("ok", 600000), ("ok", 60))
 
 
-@pytest.mark.backlog("RM-035")
+@pytest.mark.backlog_fixed("RM-035")
 def test_notablescan_parameter(rust_mongo: Any) -> None:
     """mongod 8.2.11 has `notablescan` (false by default)."""
     got = mongo_answer(

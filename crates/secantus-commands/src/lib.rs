@@ -65,6 +65,7 @@ pub mod mapreduce;
 pub mod mongod_codes;
 mod mongod_commands;
 mod near;
+mod notablescan;
 pub mod params;
 mod privileges;
 pub mod profiler;

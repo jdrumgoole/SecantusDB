@@ -473,6 +473,19 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 let entries = crate::list_catalog::entries(storage, &ctx.db_name, Some(c))?;
                 (ns, entries, pipeline[1..].to_vec())
             } else {
+                if crate::notablescan::enabled(ctx) {
+                    let (filter, sort) = crate::explain::pipeline_query(c, &pipeline);
+                    crate::notablescan::check(
+                        ctx,
+                        &crate::notablescan::Read {
+                            coll: c,
+                            filter: &filter,
+                            sort: sort.as_ref(),
+                            hint,
+                            collation: collation.as_ref(),
+                        },
+                    )?;
+                }
                 // Lift a leading $match into the fetch filter (dropping it from
                 // the pipeline). A leading bounded $geoNear instead rides its geo
                 // index via a conservative $geoWithin candidate fetch — the stage
@@ -583,6 +596,8 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         ),
     };
 
+    // A stage that reads another collection is held to `notablescan` too.
+    let _notablescan = crate::notablescan::aggregate(ctx, &ns);
     // The connection's handshake `client` doc, for `$currentOp`'s appName /
     // clientMetadata (read before the borrow of `ctx` below).
     let client_metadata: Option<Document> = ctx
@@ -1750,6 +1765,25 @@ fn apply_lookup(
         }
     }
 
+    // The pipeline form runs its pipeline's query on the foreign collection
+    // for each outer document (the simple form's join is not checked:
+    // whether mongod plans it depends on which engine runs it).
+    if let (Some(sub), None, None, false) =
+        (sub_pipeline, local_field, foreign_field, docs.is_empty())
+    {
+        let (filter, sort) = crate::explain::pipeline_query(from, sub);
+        crate::notablescan::check_foreign(
+            storage,
+            db,
+            &crate::notablescan::Read {
+                coll: from,
+                filter: &filter,
+                sort: sort.as_ref(),
+                hint: None,
+                collation,
+            },
+        )?;
+    }
     // Materialise the foreign collection once (the whole join's candidate pool).
     let foreign: Vec<Document> =
         collection_documents(storage, db, from, &Document::new(), collation)?;
@@ -1899,6 +1933,31 @@ fn apply_graph_lookup(
         .get("restrictSearchWithMatch")
         .and_then(Bson::as_document);
 
+    // Each walk queries the foreign collection for `connectToField` equal to
+    // the values it chases, within `restrictSearchWithMatch`.
+    if let Some(first) = docs.first() {
+        if let Ok(seed) = secantus_core::expressions::evaluate(first, start_with, vars) {
+            let wanted = match seed {
+                Bson::Array(values) => doc! { connect_to: { "$in": values } },
+                value => doc! { connect_to: value },
+            };
+            let filter = match restrict.filter(|r| !r.is_empty()) {
+                Some(r) => doc! { "$and": [wanted, r.clone()] },
+                None => wanted,
+            };
+            crate::notablescan::check_foreign(
+                storage,
+                db,
+                &crate::notablescan::Read {
+                    coll: from,
+                    filter: &filter,
+                    sort: None,
+                    hint: None,
+                    collation: None,
+                },
+            )?;
+        }
+    }
     let foreign: Vec<Document> = collection_documents(storage, db, from, &Document::new(), None)?;
 
     let mut out = Vec::with_capacity(docs.len());
@@ -2072,6 +2131,20 @@ fn apply_union_with(
             ))
         }
     };
+    if let Some(sub) = sub_pipeline {
+        let (filter, sort) = crate::explain::pipeline_query(from, sub);
+        crate::notablescan::check_foreign(
+            storage,
+            db,
+            &crate::notablescan::Read {
+                coll: from,
+                filter: &filter,
+                sort: sort.as_ref(),
+                hint: None,
+                collation,
+            },
+        )?;
+    }
     let mut foreign: Vec<Document> =
         collection_documents(storage, db, from, &Document::new(), collation)?;
     if let Some(sub) = sub_pipeline {
@@ -3546,7 +3619,7 @@ fn apply_merge(
         if bypass_validation {
             command.insert("bypassDocumentValidation", true);
         }
-        let reply = match crate::crud::update_in(&command, &merge.db, storage) {
+        let reply = match crate::crud::update_in(&command, &merge.db, storage, false) {
             Ok(reply) => reply,
             Err(e) => return Err(during(e)),
         };

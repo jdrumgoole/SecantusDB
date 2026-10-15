@@ -539,6 +539,9 @@ fn parameters(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
         ),
         ("localLogicalSessionTimeoutMinutes", true, Bson::Int32(30)),
         ("logLevel", true, Bson::Int32(0)),
+        // Honoured: a query the planner would answer with a collection scan
+        // is refused (`crate::notablescan`).
+        ("notablescan", true, Bson::Boolean(false)),
         ("quiet", true, Bson::Boolean(false)),
         ("scramIterationCount", true, Bson::Int32(10_000)),
         (

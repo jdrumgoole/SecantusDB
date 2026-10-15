@@ -101,6 +101,10 @@ pub enum ParamKind {
 /// `(name, kind)` for every runtime-settable parameter.
 const SETTABLE: &[(&str, ParamKind)] = &[
     ("logLevel", ParamKind::LogLevel),
+    // Refuse a query the planner would answer with a collection scan
+    // (`crate::notablescan`); read on every query, so it is also kept in an
+    // atomic beside the stored value.
+    ("notablescan", ParamKind::Bool),
     ("quiet", ParamKind::Bool),
     // The TTL monitor, which these reach in the storage layer as well as
     // being stored here: a test sets the sleep to 1 to see a document expire
@@ -143,6 +147,9 @@ pub struct ServerParams {
     /// and kept so a write need not look it up (`crate::rwconcern`). The
     /// outer `None` is "not read yet"; the inner one is "no document".
     rw_defaults: Mutex<Option<Option<Document>>>,
+    /// `notablescan`, read by every query: kept here as well as in `values`
+    /// so the read takes no lock.
+    notablescan: std::sync::atomic::AtomicBool,
 }
 
 impl ServerParams {
@@ -160,6 +167,12 @@ impl ServerParams {
     pub fn user_cache_generation(&self) -> u64 {
         self.user_cache_generation
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether a query the planner would answer with a collection scan is
+    /// refused (the `notablescan` parameter).
+    pub fn notablescan(&self) -> bool {
+        self.notablescan.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Record that a user exists (see `users_seen`).
@@ -486,6 +499,12 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
                         transactions.set_lifetime_seconds(f64::from(*secs));
                     }
                 }
+                ("notablescan", Bson::Boolean(on)) => {
+                    if let Some(s) = store.as_ref() {
+                        s.notablescan
+                            .store(*on, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 _ => {}
             }
             if let Some(s) = store.as_ref() {
@@ -748,6 +767,19 @@ mod tests {
         .unwrap_err();
         assert_eq!(e.code, 72);
         assert_eq!(c.server_params.as_ref().unwrap().get("logLevel"), None);
+    }
+
+    #[test]
+    fn notablescan_is_read_without_the_lock() {
+        let mut c = ctx();
+        let params = c.server_params.clone().unwrap();
+        assert!(!params.notablescan());
+        let r = set_parameter(&doc! {"setParameter": 1, "notablescan": "yes"}, &mut c).unwrap();
+        assert!(!r.get_bool("was").unwrap());
+        assert!(params.notablescan());
+        assert_eq!(params.get("notablescan"), Some(Bson::Boolean(true)));
+        set_parameter(&doc! {"setParameter": 1, "notablescan": Bson::Null}, &mut c).unwrap();
+        assert!(!params.notablescan());
     }
 
     #[test]

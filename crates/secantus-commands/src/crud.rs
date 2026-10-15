@@ -1137,6 +1137,26 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // runs (`write_command_problem`).
         let limit = delete_limit(spec.get("limit"))?;
         statements.delete(&ctx.db_name, &coll, spec, n, write_errors.len());
+        if let Err(e) = crate::notablescan::check(
+            ctx,
+            &crate::notablescan::Read {
+                coll: &coll,
+                filter: &filter,
+                sort: None,
+                hint: argtypes::given_hint(spec),
+                collation: collation.as_ref(),
+            },
+        ) {
+            write_errors.push(Bson::Document(doc! {
+                "index": index as i32,
+                "code": e.code,
+                "errmsg": e.errmsg,
+            }));
+            if ordered {
+                break;
+            }
+            continue;
+        }
         // A delete of ONE document removes the first its query matches in
         // the order mongod reads them.
         let first = if limit == 1 {
@@ -1353,6 +1373,16 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .and_then(|d| d.get("n").and_then(as_i64))
             .unwrap_or(0)
     } else if let Some(hint) = argtypes::given_hint(doc) {
+        crate::notablescan::check(
+            ctx,
+            &crate::notablescan::Read {
+                coll: &coll,
+                filter: &filter,
+                sort: None,
+                hint: Some(hint),
+                collation: collation.as_ref(),
+            },
+        )?;
         // A `hint` forces a specific index; for an empty filter this still walks
         // that index, so hinting a sparse index counts only the docs present in
         // it (php-lib Count `testHintOption`). Count via the hinted find, which
@@ -1375,6 +1405,16 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             near.check_index(storage, &ctx.db_name, &coll, Default::default())
                 .map_err(command_error)?;
         }
+        crate::notablescan::check(
+            ctx,
+            &crate::notablescan::Read {
+                coll: &coll,
+                filter: &filter,
+                sort: None,
+                hint: None,
+                collation: collation.as_ref(),
+            },
+        )?;
         storage
             .count_collated(&ctx.db_name, &coll, &filter, collation.as_ref())
             .map_err(command_error)? as i64
@@ -1558,15 +1598,20 @@ fn update_command_problem(doc: &Document) -> Option<CommandError> {
 }
 
 pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    update_in(doc, &ctx.db_name, ctx.storage()?)
+    let notablescan = crate::notablescan::enabled(ctx);
+    update_in(doc, &ctx.db_name, ctx.storage()?, notablescan)
 }
 
 /// [`update`] against a named database: `$merge` writes its documents with
-/// it, as mongod writes them with the update command.
+/// it, as mongod writes them with the update command. `notablescan`: the
+/// server parameter is set, so a statement mongod would answer with a
+/// collection scan is refused (`$merge` passes false: its `on` fields have
+/// a unique index, so it never plans one).
 pub(crate) fn update_in(
     doc: &Document,
     db_name: &str,
     storage: &dyn crate::Storage,
+    notablescan: bool,
 ) -> HandlerResult {
     argtypes::require_object(doc, "let", "update.let")?;
     argtypes::require_bool_field(doc, "ordered", "update.ordered")?;
@@ -1774,6 +1819,29 @@ pub(crate) fn update_in(
         };
         let _active = secantus_core::collation::activate(collation.as_ref());
         let mut q = doc_field(spec, "q");
+        if notablescan {
+            if let Err(e) = crate::notablescan::check_in(
+                storage,
+                db_name,
+                &crate::notablescan::Read {
+                    coll: &coll,
+                    filter: &q,
+                    sort: sort_spec.as_ref(),
+                    hint: argtypes::given_hint(spec),
+                    collation: collation.as_ref(),
+                },
+            ) {
+                write_errors.push(Bson::Document(doc! {
+                    "index": index as i32,
+                    "code": e.code,
+                    "errmsg": e.errmsg,
+                }));
+                if ordered {
+                    break;
+                }
+                continue;
+            }
+        }
         if let Some(sort) = &sort_spec {
             // Resolve WHICH document sorts first, then pin the update to it.
             // Nothing matched -> leave the filter alone, so an upsert still

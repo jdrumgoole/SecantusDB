@@ -642,6 +642,17 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .into_reply());
     }
 
+    crate::notablescan::check(
+        ctx,
+        &crate::notablescan::Read {
+            coll: &coll,
+            filter: &filter,
+            sort,
+            hint,
+            collation: collation.as_ref(),
+        },
+    )?;
+
     // `min` and `max` cut the hinted index's scan at a key and fix its
     // direction: that read keeps the order the store gives it. So does a
     // sort by a value that is not 1 or -1 (`-1.5`): mongod sorts by it and
