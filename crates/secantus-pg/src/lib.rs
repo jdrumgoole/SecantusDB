@@ -13133,8 +13133,8 @@ impl PgHandler {
                 "pg_type",
                 vec![
                     secantus_pgcatalog::Column::new("typname", "name", false),
-                    secantus_pgcatalog::Column::new("oid", "int8", false),
-                    secantus_pgcatalog::Column::new("typarray", "int8", false),
+                    secantus_pgcatalog::Column::new("oid", "oid", false),
+                    secantus_pgcatalog::Column::new("typarray", "oid", false),
                     secantus_pgcatalog::Column::new(
                         "typdelim",
                         secantus_pgplan::QUOTED_CHAR,

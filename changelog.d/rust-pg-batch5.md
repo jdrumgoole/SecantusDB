@@ -66,6 +66,11 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   Part of RP-041
   (`tests/backlog/test_rust_postgres_gaps.py::test_domain_over_enum_is_described_as_the_enum`).
 
+- `pg_type.oid` and `pg_type.typarray` are described as `oid` (26), as on
+  PostgreSQL, where they went out as int8 (20): the divergence every full
+  corpus sweep had reported, in `b38_misc` and `b40_types`, which no
+  backlog item recorded. Those two corpora pin it.
+
 #### Added
 
 - The language validators `fmgr_internal_validator`, `fmgr_c_validator`,
