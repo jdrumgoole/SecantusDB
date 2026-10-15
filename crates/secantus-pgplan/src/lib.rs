@@ -34,6 +34,8 @@ mod builtin_alias;
 mod builtins;
 mod builtins_regex;
 mod builtins_text;
+mod mbcs;
+mod mbcs_maps;
 mod sbcs;
 mod srf_place;
 mod unknown_args;
@@ -43,6 +45,30 @@ mod unknown_args;
 /// encodings other than LATIN1 that have one.
 pub fn single_byte_table(canonical: &str) -> Option<&'static [u16; 128]> {
     sbcs::table(canonical)
+}
+
+/// Is `canonical` one of the multi-byte encodings this server converts by
+/// PostgreSQL 15's own maps (EUC_JP, SJIS, BIG5, GB18030, ...)?
+pub fn multi_byte_encoding(canonical: &str) -> bool {
+    mbcs::by_name(canonical).is_some()
+}
+
+/// A client's bytes in a multi-byte encoding as text, as PostgreSQL converts
+/// them: character by character, the first that is not one (22021) or has no
+/// mapping (22P05) the error, with the SQLSTATE and message PostgreSQL gives.
+pub fn decode_multi_byte(
+    canonical: &str,
+    bytes: &[u8],
+) -> std::result::Result<String, (&'static str, String)> {
+    let mb = mbcs::by_name(canonical).expect("a multi-byte encoding");
+    mb.decode_stream(bytes)
+}
+
+/// Text as bytes of a multi-byte encoding, or the first character it has no
+/// bytes for.
+pub fn encode_multi_byte(canonical: &str, text: &str) -> std::result::Result<Vec<u8>, char> {
+    let mb = mbcs::by_name(canonical).expect("a multi-byte encoding");
+    mb.encode(text)
 }
 pub mod bytea;
 pub mod catalog_stmts;
