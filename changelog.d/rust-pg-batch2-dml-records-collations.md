@@ -32,6 +32,10 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
   choice of words. `width_bucket` over an array takes any element type.
   Part of RP-015 (`::test_builtin_coverage_fixed[ts-headline-untyped]`,
   `[ts-headline-options]`, `[unnest-untyped]`, `[width-bucket-dates]`).
+- `LIMIT` / `OFFSET` take an untyped literal as int8 input (`limit 'x'`
+  is 22P02 at the literal, `limit '2'` limits), and `mode()` /
+  `percentile_disc` sorting by an untyped literal are 42804. Part of
+  RP-038 (`tests/backlog/test_rust_postgres_gaps.py::test_batch_residue_fixed`).
 - `pg_client_encoding()` answers the session's encoding, and `SHOW
   is_superuser` / `SHOW session_authorization` answer from the roles.
 

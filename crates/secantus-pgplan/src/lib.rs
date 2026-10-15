@@ -22778,7 +22778,8 @@ fn limit_offset(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> Result<(
             Bson::Null => None,
             Bson::Int32(v) => Some(i64::from(v)),
             Bson::Int64(v) => Some(v),
-            v @ (Bson::Double(_) | Bson::Decimal128(_) | Bson::Document(_)) => {
+            // An untyped literal is int8's input (`limit 'x'` is 22P02).
+            v @ (Bson::Double(_) | Bson::Decimal128(_) | Bson::Document(_) | Bson::String(_)) => {
                 match cast_value(v, "int8")? {
                     Bson::Int64(i) => Some(i),
                     Bson::Int32(i) => Some(i64::from(i)),

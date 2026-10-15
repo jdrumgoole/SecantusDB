@@ -375,10 +375,6 @@ one beside it.
 
 - [ ] **RUST pgserver: what the 2026-10-15 batch saw beside its items.**
   Each measured on PostgreSQL 15.19:
-  - `limit 'x'` is 0A000 "this LIMIT is not supported yet" in every
-    query path; PostgreSQL is 22P02 at the literal.
-  - `mode() within group (order by NULL)` answers; PostgreSQL is 42804
-    (no polymorphic type from `unknown`).
   - `xmlagg(null::xml)` is 0A000 (over a column it works).
   - `pg_typeof` of a column of a domain type prints the base type, not
     the domain's name (`pg_typeof(1::d)` is right).

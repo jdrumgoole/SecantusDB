@@ -93,6 +93,21 @@ pub(crate) fn check_ambiguous(node: &N) -> Result<()> {
         let pg_query::NodeRef::FuncCall(f) = n else {
             continue;
         };
+        // An ordered-set aggregate over `anyelement` (`mode`,
+        // `percentile_disc`) sorting by an untyped literal has no type to
+        // resolve to.
+        if f.agg_within_group
+            && func_name(f).is_some_and(|n| n == "mode" || n == "percentile_disc")
+            && f.agg_order.iter().any(|o| match o.node.as_ref() {
+                Some(N::SortBy(sb)) => sb.node.as_deref().and_then(untyped_string).is_some(),
+                _ => false,
+            })
+        {
+            return Err(Error::Sqlstate(
+                "42804",
+                "could not determine polymorphic type because input has type unknown".into(),
+            ));
+        }
         let Some((name, types)) = unknown_call(f, true) else {
             continue;
         };

@@ -607,10 +607,20 @@ def test_untyped_record_array_compare(pg: Any, pg15: Any) -> None:
 
 # RP-038: divergences the 2026-10-15 batch saw beside its items.
 _RP038 = {
-    "limit-text": "select 1 limit 'x'",
-    "mode-unknown": "select mode() within group (order by NULL)",
     "xmlagg": "select xmlagg(null::xml)",
 }
+
+
+_RP038_FIXED = {
+    "limit-text": "select 1 limit 'x'",
+    "mode-unknown": "select mode() within group (order by NULL)",
+}
+
+
+@pytest.mark.backlog_fixed("RP-038")
+@pytest.mark.parametrize("sql", list(_RP038_FIXED.values()), ids=list(_RP038_FIXED))
+def test_batch_residue_fixed(pg: Any, pg15: Any, sql: str) -> None:
+    _same_as_reference(pg, pg15, sql)
 
 
 @pytest.mark.backlog("RP-038")

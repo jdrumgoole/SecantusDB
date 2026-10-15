@@ -12,3 +12,12 @@ SELECT int4pl(k, 2), int4mi(k, 1), textcat(c::text, 'x') from (values (1, 'a'::"
 SELECT int4pl(k, 2) from (values (1::int8)) v(k)
 SELECT int8pl(k, 2) from (values (1)) v(k)
 SELECT int4pl(1, 2), int4pl(1, 2::int2)
+select 1 limit 'x'
+select 1 limit '2'
+select x from (values (1),(2),(3)) v(x) limit '2'
+select x from (values (1),(2),(3)) v(x) offset 'y'
+select mode() within group (order by NULL)
+select mode() within group (order by 'a')
+select percentile_disc(0.5) within group (order by NULL)
+select percentile_cont(0.5) within group (order by NULL)
+select mode() within group (order by x) from (values (1),(1),(2)) v(x)

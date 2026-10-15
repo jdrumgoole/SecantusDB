@@ -393,6 +393,41 @@ pub fn cast_xid8(value: &Bson) -> Bson {
     }
 }
 
+/// `macaddr_and` / `macaddr_or` / `macaddr_not` (and the `macaddr8` ones):
+/// the bytes of the canonical text combined bit by bit. `a` is `None` for
+/// the prefix `~`.
+pub fn mac_bitop(op: &str, a: Option<&str>, b: &str) -> Result<String> {
+    let bytes = |t: &str| -> Result<Vec<u8>> {
+        t.split(':')
+            .map(|h| u8::from_str_radix(h, 16))
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|_| {
+                Error::InvalidText(format!("invalid input syntax for type macaddr: \"{t}\""))
+            })
+    };
+    let rb = bytes(b)?;
+    let out: Vec<u8> = match (op, a) {
+        ("~", None) => rb.iter().map(|x| !x).collect(),
+        ("&" | "|", Some(a)) => {
+            let lb = bytes(a)?;
+            lb.iter()
+                .zip(&rb)
+                .map(|(x, y)| if op == "&" { x & y } else { x | y })
+                .collect()
+        }
+        _ => {
+            return Err(Error::UndefinedFunction(format!(
+                "operator does not exist: macaddr {op} macaddr"
+            )))
+        }
+    };
+    Ok(out
+        .iter()
+        .map(|x| format!("{x:02x}"))
+        .collect::<Vec<_>>()
+        .join(":"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,39 +486,4 @@ mod tests {
         assert_eq!(strtoul(" 0x10"), 16);
         assert_eq!(strtoul("abc"), 0);
     }
-}
-
-/// `macaddr_and` / `macaddr_or` / `macaddr_not` (and the `macaddr8` ones):
-/// the bytes of the canonical text combined bit by bit. `a` is `None` for
-/// the prefix `~`.
-pub fn mac_bitop(op: &str, a: Option<&str>, b: &str) -> Result<String> {
-    let bytes = |t: &str| -> Result<Vec<u8>> {
-        t.split(':')
-            .map(|h| u8::from_str_radix(h, 16))
-            .collect::<std::result::Result<_, _>>()
-            .map_err(|_| {
-                Error::InvalidText(format!("invalid input syntax for type macaddr: \"{t}\""))
-            })
-    };
-    let rb = bytes(b)?;
-    let out: Vec<u8> = match (op, a) {
-        ("~", None) => rb.iter().map(|x| !x).collect(),
-        ("&" | "|", Some(a)) => {
-            let lb = bytes(a)?;
-            lb.iter()
-                .zip(&rb)
-                .map(|(x, y)| if op == "&" { x & y } else { x | y })
-                .collect()
-        }
-        _ => {
-            return Err(Error::UndefinedFunction(format!(
-                "operator does not exist: macaddr {op} macaddr"
-            )))
-        }
-    };
-    Ok(out
-        .iter()
-        .map(|x| format!("{x:02x}"))
-        .collect::<Vec<_>>()
-        .join(":"))
 }
