@@ -271,3 +271,15 @@ def test_case_over_a_scalar_subquery_keeps_its_type(pg: Any) -> None:
         "ok",
         [("integer",)],
     )
+
+
+@pytest.mark.backlog("RP-024")
+def test_window_rows_come_out_in_window_sort_order(pg: Any) -> None:
+    """PostgreSQL 15.19: with no ORDER BY of its own, a query with a window
+    returns its rows in the window's sort order (the WindowAgg's input is
+    sorted), which clients see and some rely on."""
+    pg.execute("drop table if exists rp024_t")
+    pg.execute("create table rp024_t (a int)")
+    pg.execute("insert into rp024_t values (1), (2), (3)")
+    sql = "select a, row_number() over (order by a desc) from rp024_t"
+    assert pg_answer(pg, sql) == ("ok", [(3, 1), (2, 2), (1, 3)])

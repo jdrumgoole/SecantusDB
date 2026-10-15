@@ -367,6 +367,18 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **RUST pgserver: a query with a window function and no ORDER BY
+  returns its rows in input order, not the window's sort order.**
+  `select a, row_number() over (order by a desc) from t` over rows 1, 2, 3
+  is `(1,3),(2,2),(3,1)` here and `(3,1),(2,2),(1,3)` on PostgreSQL 15.19,
+  whose WindowAgg reads a sorted input (with PARTITION BY, sorted by the
+  partition keys then the window ORDER BY: `(2,2),(3,3),(1,4)` for
+  `partition by a % 2 order by a desc`). SQL leaves the order unspecified,
+  but a client sees it. Found 2026-10-15 by the set-returning-function
+  slice of RP-015.
+  Backlog-ID: RP-024
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_window_rows_come_out_in_window_sort_order
+
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
       psycopg's suite against the Rust PostgreSQL server until
