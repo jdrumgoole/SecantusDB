@@ -3590,9 +3590,26 @@ pub fn server_status(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     } else {
         None
     };
-    if let Some(stats) = engine_statistics {
-        let (version, stats) = stats.map_err(crate::util::command_error)?;
-        reply.insert("wiredTiger", wired_tiger_section(&version, stats));
+    // Statistics the engine cannot give (a store opened with
+    // `statistics=(none)`) degrade the section, not the command: mongod
+    // 8.2.11 answers `ok: 1` with this error triple in their place.
+    match engine_statistics {
+        Some(Ok((version, stats))) => {
+            reply.insert("wiredTiger", wired_tiger_section(&version, stats));
+        }
+        Some(Err(e)) => {
+            let errmsg = crate::util::command_error(e).errmsg;
+            let reason = wired_tiger_reason(&errmsg);
+            reply.insert(
+                "wiredTiger",
+                doc! {
+                    "error": "unable to retrieve statistics",
+                    "code": 43_i32,
+                    "reason": format!("unable to open cursor at URI statistics:. reason: {reason}"),
+                },
+            );
+        }
+        None => {}
     }
     if let Some(mem) = crate::procstats::mem() {
         reply.insert("mem", mem);
@@ -3669,6 +3686,15 @@ fn logical_session_record_cache(ctx: &CommandContext) -> Document {
 /// `serverStatus.wiredTiger`, as mongod builds it from the same cursor: the
 /// statistics grouped by the category their description begins with
 /// (`"cache: bytes currently in the cache"`), in the engine's order.
+/// WiredTiger's own words for a failure, out of this server's rendering
+/// of it (`WtError { code: 22, message: "Invalid argument" }`).
+fn wired_tiger_reason(errmsg: &str) -> &str {
+    errmsg
+        .split_once("message: \"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map_or(errmsg, |(message, _)| message)
+}
+
 fn wired_tiger_section(version: &str, stats: Vec<(String, i64)>) -> Document {
     let mut out = doc! { "uri": "statistics:", "version": version };
     for (description, value) in stats {

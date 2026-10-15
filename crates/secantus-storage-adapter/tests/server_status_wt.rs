@@ -405,3 +405,49 @@ fn a_retried_write_counts_its_statements() {
         );
     });
 }
+
+/// A store opened without statistics (`statistics=(none)`) degrades
+/// `serverStatus.wiredTiger` to mongod's error triple; the command still
+/// answers `ok: 1` (measured 8.2.11, started with
+/// `--wiredTigerEngineConfigString "statistics=(none)"`). This server failed
+/// the whole command.
+#[test]
+fn server_status_without_engine_statistics() {
+    use secantus_commands::{CursorRegistry, Storage as CmdStorage};
+    use secantus_storage::{Storage as WtStorage, StorageOptions};
+    use secantus_storage_adapter::StorageAdapter;
+
+    let dir = std::env::temp_dir().join(format!("secantus-nostats-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let wt = WtStorage::open_with_options(
+        dir.to_str().unwrap(),
+        &StorageOptions {
+            wt_config: Some(
+                "create,session_max=100,cache_size=64M,log=(enabled=true),statistics=(none)"
+                    .to_string(),
+            ),
+            ..StorageOptions::default()
+        },
+    )
+    .unwrap();
+    let adapter: Arc<dyn CmdStorage> = Arc::new(StorageAdapter::new(Arc::new(wt)));
+    let mut c = CommandContext::new(1)
+        .with_storage(adapter)
+        .with_cursors(Arc::new(CursorRegistry::new()));
+    c.db_name = "admin".into();
+    let reply = dispatch_full(&doc! {"serverStatus": 1}, &mut c);
+    assert_eq!(reply.get_f64("ok"), Ok(1.0), "{reply}");
+    let section = reply.get_document("wiredTiger").unwrap();
+    assert_eq!(
+        section.get_str("error"),
+        Ok("unable to retrieve statistics")
+    );
+    assert_eq!(section.get_i32("code"), Ok(43));
+    assert!(section
+        .get_str("reason")
+        .unwrap()
+        .starts_with("unable to open cursor at URI statistics:. reason: "));
+    drop(c);
+    let _ = std::fs::remove_dir_all(&dir);
+}
