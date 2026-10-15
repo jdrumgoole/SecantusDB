@@ -356,17 +356,6 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **RUST pgserver: a `char(n)` field too long for a row type has no
-  error position.** `'(abcd,x)'::t` over `t (c char(3), v text)` is the right
-  22001 `value too long for type character(3)`, with no position;
-  PostgreSQL 15.19 places it at the literal (8). The width check runs in
-  `composite_value`, which does not know where the literal is. (The padding
-  itself, and a row type that follows `ALTER TABLE`, were fixed 2026-10-15; a
-  table created before then has no `widths` in its row type until its next
-  ALTER.)
-  Backlog-ID: RP-032
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_row_type_char_overflow_has_a_position
-
 - [ ] **RUST pgserver: what the 2026-10-15 batch saw beside its items.**
   Each measured on PostgreSQL 15.19:
   - `create type int` / `create type integer` (and their quoted forms) are

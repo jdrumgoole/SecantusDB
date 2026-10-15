@@ -25825,10 +25825,27 @@ fn composite_value(value: Bson, target: &str, fields: &[(String, String)]) -> Re
     for (i, (v, (_, ty))) in raw.into_iter().zip(fields.iter()).enumerate() {
         let width = widths.get(i).copied().flatten();
         let v = if let (true, Some(n)) = (ty == "bpchar", width) {
-            // The column's typmod applies as on input: excess blanks are cut,
-            // anything else is 22001.
-            let n32 = i32::try_from(n).unwrap_or(i32::MAX - 4);
-            pad_bpchar(fit_length(cast_value_inner(v, ty)?, ty, n32 + 4)?, width)
+            let v = cast_value_inner(v, ty)?;
+            let v = if literal.is_some() {
+                // A text literal is INPUT: excess blanks are cut, anything
+                // else is 22001.
+                let n32 = i32::try_from(n).unwrap_or(i32::MAX - 4);
+                fit_length(v, ty, n32 + 4)?
+            } else {
+                // A record cast is an explicit cast, which truncates
+                // (`row('abcd', 'x')::t` is `(abc,x)`, 15.19).
+                match v {
+                    Bson::String(t) => Bson::String(
+                        t.chars()
+                            .take(n)
+                            .collect::<String>()
+                            .trim_end_matches(' ')
+                            .to_string(),
+                    ),
+                    other => other,
+                }
+            };
+            pad_bpchar(v, width)
         } else {
             v
         };

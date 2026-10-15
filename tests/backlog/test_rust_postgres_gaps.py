@@ -477,7 +477,7 @@ def test_row_type_follows_alter_table(pg: Any) -> None:
     assert got == ("ok", [("(1,x)",)])
 
 
-@pytest.mark.backlog("RP-032")
+@pytest.mark.backlog_fixed("RP-032")
 def test_row_type_char_overflow_has_a_position(pg: Any) -> None:
     """PostgreSQL 15.19: `'(abcd,x)'::t` over `t (c char(3), v text)` is
     22001 `value too long for type character(3)` at the literal (position
