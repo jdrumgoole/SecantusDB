@@ -85,6 +85,7 @@ pub mod formatting;
 pub mod fts;
 mod func_cast;
 mod funcsig;
+pub mod timezones;
 mod ts_debug;
 mod ts_rewrite;
 pub mod wparser;
@@ -18295,6 +18296,57 @@ fn rewrite_xmlagg(
     Ok(changed.then_some(out))
 }
 
+/// `FROM pg_timezone_names()` / `pg_timezone_abbrevs()`: the functions the
+/// views of those names select from, read as the views (an alias kept; with
+/// none, PostgreSQL names the relation after the function, which is the
+/// view's name too). `None` when the FROM list holds neither.
+fn timezone_functions_as_views(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Option<pg_query::protobuf::SelectStmt> {
+    let view = |n: &pg_query::protobuf::Node| -> Option<pg_query::protobuf::Node> {
+        let Some(N::RangeFunction(rf)) = n.node.as_ref() else {
+            return None;
+        };
+        if rf.ordinality || rf.is_rowsfrom || !rf.coldeflist.is_empty() || rf.functions.len() != 1 {
+            return None;
+        }
+        let Some(N::List(l)) = rf.functions[0].node.as_ref() else {
+            return None;
+        };
+        let Some(N::FuncCall(f)) = l.items.first().and_then(|i| i.node.as_ref()) else {
+            return None;
+        };
+        let name = func_name(f)?;
+        if !f.args.is_empty()
+            || !matches!(name.as_str(), "pg_timezone_names" | "pg_timezone_abbrevs")
+            || correlated::user_function_named(&name)
+        {
+            return None;
+        }
+        Some(pg_query::protobuf::Node {
+            node: Some(N::RangeVar(pg_query::protobuf::RangeVar {
+                schemaname: "pg_catalog".into(),
+                relname: name,
+                inh: true,
+                relpersistence: "p".into(),
+                alias: rf.alias.clone(),
+                location: f.location,
+                ..Default::default()
+            })),
+        })
+    };
+    if !s.from_clause.iter().any(|n| view(n).is_some()) {
+        return None;
+    }
+    let mut out = s.clone();
+    for n in &mut out.from_clause {
+        if let Some(v) = view(n) {
+            *n = v;
+        }
+    }
+    Some(out)
+}
+
 /// `pg_typeof(c)` over a column of a domain type names the DOMAIN, though
 /// the column is stored (and sent) as its base type: the argument is cast
 /// to the domain, which its value already satisfies. Over the one table of
@@ -19212,6 +19264,9 @@ fn plan_select(
         return plan_select(&values_as_subquery(s), lookup, params);
     }
     if let Some(rewritten) = ungrouped_having(s)? {
+        return plan_select(&rewritten, lookup, params);
+    }
+    if let Some(rewritten) = timezone_functions_as_views(s) {
         return plan_select(&rewritten, lookup, params);
     }
     if let Some(rewritten) = rewrite_domain_typeof(s, lookup)? {

@@ -13253,6 +13253,26 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("pending_restart", "bool", false),
                 ],
             )),
+            // `pg_timezone_names` / `pg_timezone_abbrevs`: the zones and the
+            // abbreviations a timestamp's input accepts
+            // (`secantus_pgplan::timezones`).
+            "pg_timezone_names" => Some(TableDef::new(
+                "pg_timezone_names",
+                vec![
+                    secantus_pgcatalog::Column::new("name", "text", false),
+                    secantus_pgcatalog::Column::new("abbrev", "text", false),
+                    secantus_pgcatalog::Column::new("utc_offset", "interval", false),
+                    secantus_pgcatalog::Column::new("is_dst", "bool", false),
+                ],
+            )),
+            "pg_timezone_abbrevs" => Some(TableDef::new(
+                "pg_timezone_abbrevs",
+                vec![
+                    secantus_pgcatalog::Column::new("abbrev", "text", false),
+                    secantus_pgcatalog::Column::new("utc_offset", "interval", false),
+                    secantus_pgcatalog::Column::new("is_dst", "bool", false),
+                ],
+            )),
             "pg_cursors" => Some(TableDef::new(
                 "pg_cursors",
                 vec![
@@ -15756,6 +15776,33 @@ impl PgHandler {
                     .collect()
             }
             "pg_settings" => self.pg_settings_rows(&def),
+            "pg_timezone_names" => {
+                let field = |c: &str| def.field_of(c).expect("column");
+                secantus_pgplan::timezones::names_rows()
+                    .into_iter()
+                    .map(|(name, abbrev, offset, dst)| {
+                        let mut d = Document::new();
+                        d.insert(field("name"), name);
+                        d.insert(field("abbrev"), abbrev);
+                        d.insert(field("utc_offset"), offset);
+                        d.insert(field("is_dst"), dst);
+                        d
+                    })
+                    .collect()
+            }
+            "pg_timezone_abbrevs" => {
+                let field = |c: &str| def.field_of(c).expect("column");
+                secantus_pgplan::timezones::abbrevs_rows()
+                    .into_iter()
+                    .map(|(abbrev, offset, dst)| {
+                        let mut d = Document::new();
+                        d.insert(field("abbrev"), abbrev);
+                        d.insert(field("utc_offset"), offset);
+                        d.insert(field("is_dst"), dst);
+                        d
+                    })
+                    .collect()
+            }
             "pg_largeobject_metadata" => self.lo_metadata_rows(&def),
             "pg_cursors" => {
                 let portals = self.wire_portal_rows(&def);
