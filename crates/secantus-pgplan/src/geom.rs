@@ -14,13 +14,13 @@ use crate::{Error, Result};
 
 const EPSILON: f64 = 1.0e-06;
 
-fn fp_eq(a: f64, b: f64) -> bool {
+pub(crate) fn fp_eq(a: f64, b: f64) -> bool {
     a == b || (a - b).abs() <= EPSILON
 }
 fn fp_lt(a: f64, b: f64) -> bool {
     a + EPSILON < b
 }
-fn fp_le(a: f64, b: f64) -> bool {
+pub(crate) fn fp_le(a: f64, b: f64) -> bool {
     a <= b + EPSILON
 }
 fn fp_gt(a: f64, b: f64) -> bool {
@@ -838,10 +838,41 @@ fn d(v: f64) -> Bson {
 
 /// A binary operator between two values of which at least one is geometric;
 /// `None` when this pair has no such operator here.
+/// `a ## b`: the point on `b` closest to `a` (`close_ps`, `close_pb`,
+/// `close_pl`, `close_sb`, `close_lseg`, `close_ls`); `None` for a pair
+/// PostgreSQL has no `##` for.
+fn closest(a: &Geo, b: &Geo) -> Option<P> {
+    use super::geom_closest as c;
+    use Geo::*;
+    Some(match (a, b) {
+        (Point(p), Lseg(s0, s1)) => c::lseg_closept_point(*s0, *s1, *p).0,
+        (Point(p), Box(h, l)) => c::box_closept_point(*h, *l, *p).0,
+        (Point(p), Line(la, lb, lc)) => c::line_closept_point((*la, *lb, *lc), *p).0,
+        (Lseg(s0, s1), Box(h, l)) => c::box_closept_lseg(*h, *l, (*s0, *s1)).0,
+        // `close_lseg` answers NULL for parallel segments (equal slopes).
+        (Lseg(a0, a1), Lseg(b0, b1)) if point_sl(*a0, *a1) == point_sl(*b0, *b1) => return None,
+        (Lseg(a0, a1), Lseg(b0, b1)) => c::lseg_closept_lseg((*b0, *b1), (*a0, *a1)).0,
+        (Line(la, lb, lc), Lseg(s0, s1)) => c::lseg_closept_line(*s0, *s1, (*la, *lb, *lc)).0,
+        _ => return None,
+    })
+}
+
 pub fn operator(op: &str, lhs: &Geo, rhs: &Geo) -> Option<Result<Bson>> {
     use Geo::*;
     let r = |g: Result<Geo>| Some(g.map(|g| to_bson(&g)));
     match (op, lhs, rhs) {
+        // The closest-point operators and the distances geo_ops.c defines
+        // through them (`geom_closest`).
+        ("##", Lseg(..), Lseg(..)) => Some(Ok(
+            closest(lhs, rhs).map_or(Bson::Null, |p| to_bson(&Point(p)))
+        )),
+        ("##", _, _) => closest(lhs, rhs).map(|p| Ok(to_bson(&Point(p)))),
+        ("<->", Line(a, bb, c), Lseg(p0, p1)) | ("<->", Lseg(p0, p1), Line(a, bb, c)) => Some(Ok(
+            d(super::geom_closest::lseg_closept_line(*p0, *p1, (*a, *bb, *c)).1),
+        )),
+        ("<->", Box(h, l), Lseg(p0, p1)) | ("<->", Lseg(p0, p1), Box(h, l)) => Some(Ok(d(
+            super::geom_closest::box_closept_lseg(*h, *l, (*p0, *p1)).1,
+        ))),
         ("<->", Line(a, bb, c), Point(p)) | ("<->", Point(p), Line(a, bb, c)) => {
             Some(Ok(d(line_closept_dist((*a, *bb, *c), *p))))
         }
@@ -1085,7 +1116,7 @@ fn pg_hypot(x: f64, y: f64) -> f64 {
 }
 
 /// `point_dt`.
-fn point_dt(a: P, b: P) -> f64 {
+pub(crate) fn point_dt(a: P, b: P) -> f64 {
     pg_hypot(a.x - b.x, a.y - b.y)
 }
 
@@ -1109,7 +1140,7 @@ fn point_sl(a: P, b: P) -> f64 {
 }
 
 /// `line_construct`: the line through `pt` with slope `m`, as `(A, B, C)`.
-fn line_construct(pt: P, m: f64) -> (f64, f64, f64) {
+pub(crate) fn line_construct(pt: P, m: f64) -> (f64, f64, f64) {
     if m.is_infinite() {
         (-1.0, 0.0, pt.x)
     } else if m == 0.0 {
@@ -1121,7 +1152,7 @@ fn line_construct(pt: P, m: f64) -> (f64, f64, f64) {
 }
 
 /// `line_invsl`.
-fn line_invsl((a, b, _): (f64, f64, f64)) -> f64 {
+pub(crate) fn line_invsl((a, b, _): (f64, f64, f64)) -> f64 {
     if a.abs() <= EPSILON {
         return f64::INFINITY;
     }
@@ -1133,7 +1164,7 @@ fn line_invsl((a, b, _): (f64, f64, f64)) -> f64 {
 
 /// `line_interpt_line`: `None` for parallel lines (and for two lines that
 /// are the same line).
-fn line_interpt_line(l1: (f64, f64, f64), l2: (f64, f64, f64)) -> Option<P> {
+pub(crate) fn line_interpt_line(l1: (f64, f64, f64), l2: (f64, f64, f64)) -> Option<P> {
     let ((a1, b1, c1), (a2, b2, c2)) = (l1, l2);
     let (x, y);
     if b1.abs() > EPSILON {
@@ -1163,7 +1194,7 @@ fn lseg_contain_point(p0: P, p1: P, pt: P) -> bool {
 }
 
 /// `lseg_interpt_line`, with its snap to a matching endpoint.
-fn lseg_interpt_line(p0: P, p1: P, line: (f64, f64, f64)) -> Option<P> {
+pub(crate) fn lseg_interpt_line(p0: P, p1: P, line: (f64, f64, f64)) -> Option<P> {
     let pt = line_interpt_line(line_construct(p0, point_sl(p0, p1)), line)?;
     if !lseg_contain_point(p0, p1, pt) {
         return None;
@@ -1178,7 +1209,7 @@ fn lseg_interpt_line(p0: P, p1: P, line: (f64, f64, f64)) -> Option<P> {
 }
 
 /// `lseg_interpt_lseg`: the point two segments meet at, if they do.
-fn lseg_interpt_lseg(a0: P, a1: P, b0: P, b1: P) -> Option<P> {
+pub(crate) fn lseg_interpt_lseg(a0: P, a1: P, b0: P, b1: P) -> Option<P> {
     let pt = lseg_interpt_line(a0, a1, line_construct(b0, point_sl(b0, b1)))?;
     lseg_contain_point(b0, b1, pt).then_some(pt)
 }
@@ -1480,6 +1511,7 @@ pub fn operator_type(op: &str, lt: &str, rt: &str) -> Option<&'static str> {
     }
     Some(match op {
         "<->" => "float8",
+        "##" => "point",
         "+" | "-" | "*" | "/" if geo_t(lt) => match lt {
             "point" => "point",
             "box" => "box",

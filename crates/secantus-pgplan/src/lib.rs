@@ -98,6 +98,7 @@ pub mod alter_routine;
 pub mod collation;
 pub mod geo;
 pub mod geom;
+mod geom_closest;
 pub mod geometry;
 pub mod hashpart;
 pub mod hstore;
