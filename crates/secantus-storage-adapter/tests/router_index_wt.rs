@@ -505,3 +505,88 @@ fn a_narrow_field_is_read_before_a_wide_one() {
         RouterAccess::Collection
     );
 }
+
+/// The `_id`s of `find_matching_with` -- the store's own sort walk.
+fn walked(s: &Store, coll: &str, sort: Option<Document>, hint: Option<&str>) -> Vec<i32> {
+    let hint = hint.map(|h| secantus_storage::Hint::Name(h.into()));
+    s.wt()
+        .find_matching_with(
+            "t",
+            coll,
+            &Document::new(),
+            sort.as_ref(),
+            hint.as_ref(),
+            None,
+            &Document::new(),
+        )
+        .unwrap()
+        .iter()
+        .map(|blob| {
+            secantus_commands::bsondoc::from_bytes(blob)
+                .unwrap()
+                .get_i32("_id")
+                .unwrap()
+        })
+        .collect()
+}
+
+#[test]
+fn a_walk_of_a_descending_index_orders_strings_by_value() {
+    // A walk of `{b: -1}` (a sort served by the index, or a hint) came back
+    // in the inverted bytes' order, where "" sorts first and "s" before "sa".
+    // mongod 8.2.11 on a clustered collection, which reads through this walk:
+    // sort {b: -1} -> [3, 2, 1, 0, 4, 6, 5], and {c: 1, b: -1} -> [2, 0, 4, 6, 3, 1, 5].
+    let s = store();
+    let docs: Vec<Document> = ["s", "sa", "sab", "t", "r", "", "a"]
+        .iter()
+        .enumerate()
+        .map(|(i, v)| doc! {"_id": i as i32, "b": *v, "c": (i % 2) as i32})
+        .collect();
+    load(&s, "ix", &docs);
+    index(&s, "ix", "b_desc", doc! {"b": -1}, doc! {});
+    index(&s, "ix", "c_b", doc! {"c": 1, "b": -1}, doc! {});
+    let desc = [3, 2, 1, 0, 4, 6, 5];
+    assert_eq!(walked(&s, "ix", Some(doc! {"b": -1}), None), desc);
+    assert_eq!(walked(&s, "ix", None, Some("b_desc")), desc);
+    assert_eq!(walked(&s, "ix", Some(doc! {"b": -1}), Some("b_desc")), desc);
+    assert_eq!(
+        walked(&s, "ix", Some(doc! {"b": 1}), None),
+        [5, 6, 4, 0, 1, 2, 3]
+    );
+    let compound = [2, 0, 4, 6, 3, 1, 5];
+    assert_eq!(
+        walked(&s, "ix", Some(doc! {"c": 1, "b": -1}), None),
+        compound
+    );
+    assert_eq!(walked(&s, "ix", None, Some("c_b")), compound);
+}
+
+#[test]
+fn no_index_order_is_claimed_across_collapsed_numbers() {
+    // 1e-300 and 2e-300 share one key, so their entries come in insertion
+    // order, not by value. An `$in` of the two is read without claiming the
+    // index's order. (Where they then go is the number encoding's own
+    // problem, RM-152, the same with the index or without.)
+    let s = store();
+    let docs = vec![
+        doc! {"_id": 0, "a": 2e-300},
+        doc! {"_id": 1, "a": 1e-300},
+        doc! {"_id": 2, "a": 5},
+    ];
+    twin(&s, &docs, doc! {"a": 1}, doc! {});
+    assert_eq!(same(&s, doc! {"a": {"$in": [1e-300, 2e-300]}}), [0, 1]);
+    assert_eq!(
+        access(&s, "ix", doc! {"a": {"$in": [1e-300, 2e-300]}}),
+        unordered("the_index")
+    );
+    assert_eq!(
+        access(&s, "ix", doc! {"a": {"$in": [5, 6]}}),
+        ordered("the_index")
+    );
+    // A sort served by the index walk orders them as the sort with no index
+    // does: the walk adds no order of its own.
+    assert_eq!(
+        walked(&s, "ix", Some(doc! {"a": 1}), None),
+        walked(&s, "plain", Some(doc! {"a": 1}), None)
+    );
+}

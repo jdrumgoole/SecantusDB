@@ -219,6 +219,11 @@ pub(crate) fn collapsed_keys() -> [Vec<u8>; 2] {
     ]
 }
 
+/// Whether `v` is a number keyed by one of the collapsed keys.
+pub(crate) fn is_collapsed(v: &Bson) -> bool {
+    key(v).is_some_and(|k| collapsed_keys().contains(&k))
+}
+
 /// The ranks whose keys have no terminator (see the module notes).
 pub(crate) fn open_ended_rank(r: u8) -> bool {
     r == rank_string() || r == rank_js() || r == rank_regex()
