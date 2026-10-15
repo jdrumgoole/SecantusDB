@@ -5,7 +5,7 @@ Revocation lists (current, empty, expired, dated in the future, from another
 CA, forged, with and without extensions, through an intermediate CA), user
 name maps by exact name and by pattern, ``clientname=DN``, server
 certificates whose signature is RSA-PSS or Ed25519, and what a reload picks
-up. 480 scenarios. Arguments after the binary name the groups to run; with
+up. 510 scenarios. Arguments after the binary name the groups to run; with
 none, all of them.
 
 Every scenario is one login, made against a throwaway PostgreSQL cluster this
@@ -99,8 +99,9 @@ class Authority:
             .sign(self.key, **self._sign_args())
         )
 
-    def issue(self, stem, subject, san=None):
-        """`subject` is [(oid, value)] in the order the certificate holds it."""
+    def issue(self, stem, subject, san=None, crldp=None):
+        """`subject` is [(oid, value)] in the order the certificate holds it;
+        `crldp` a URI for a CRL distribution points extension."""
         key = rsa.generate_private_key(65537, 2048)
         b = (
             x509.CertificateBuilder()
@@ -108,6 +109,17 @@ class Authority:
             .issuer_name(self.name)
             .public_key(key.public_key())
         )
+        if crldp:
+            b = b.add_extension(
+                x509.CRLDistributionPoints(
+                    [
+                        x509.DistributionPoint(
+                            [x509.UniformResourceIdentifier(crldp)], None, None, None
+                        )
+                    ]
+                ),
+                critical=False,
+            )
         if san:
             b = b.add_extension(
                 x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False
@@ -133,7 +145,16 @@ class Authority:
         open(path, "wb").write(self.cert.public_bytes(serialization.Encoding.PEM))
         return path
 
-    def crl(self, path, revoked=(), next_update=None, last_update=None, v1=False, serials=()):
+    def crl(
+        self,
+        path,
+        revoked=(),
+        next_update=None,
+        last_update=None,
+        v1=False,
+        serials=(),
+        extensions=(),
+    ):
         b = (
             x509.CertificateRevocationListBuilder()
             .issuer_name(self.name)
@@ -145,6 +166,8 @@ class Authority:
                 x509.AuthorityKeyIdentifier.from_issuer_public_key(self.key.public_key()),
                 critical=False,
             )
+        for extension, critical in extensions:
+            b = b.add_extension(extension, critical=critical)
         for stem in revoked:
             b = b.add_revoked_certificate(
                 x509.RevokedCertificateBuilder()
@@ -238,6 +261,42 @@ CRL_FUTURE = ca.crl(
 CRL_EXPIRED_AND_CURRENT = bundle(f"{d}/crl_two.pem", CRL_EXPIRED, CRL_EMPTY)
 CRL_CURRENT_AND_EXPIRED = bundle(f"{d}/crl_two_b.pem", CRL, f"{d}/crl_expired.pem")
 CRL_FORGED_AND_REAL = bundle(f"{d}/crl_forged_real.pem", CRL_FORGED, CRL_EMPTY)
+
+# Lists scoped by an issuing distribution point (critical, as RFC 5280
+# requires), a delta list, and certificates naming a distribution point.
+DP_A, DP_B = "http://crl.example/a.crl", "http://crl.example/b.crl"
+DP_GOOD = ca.issue("dp_good", cn("postgres"), crldp=DP_A)
+DP_REVOKED = ca.issue("dp_revoked", cn("postgres"), crldp=DP_A)
+DP_OTHER = ca.issue("dp_other", cn("postgres"), crldp=DP_B)
+
+
+def idp(full_name=None, user=False, ca_only=False, reasons=None):
+    return (
+        x509.IssuingDistributionPoint(
+            full_name=[x509.UniformResourceIdentifier(full_name)] if full_name else None,
+            relative_name=None,
+            only_contains_user_certs=user,
+            only_contains_ca_certs=ca_only,
+            only_some_reasons=reasons,
+            indirect_crl=False,
+            only_contains_attribute_certs=False,
+        ),
+        True,
+    )
+
+
+SCOPED = ("revoked", "dp_revoked")
+CRL_IDP_DP = ca.crl(f"{d}/crl_idp_dp.pem", revoked=SCOPED, extensions=(idp(DP_A),))
+CRL_IDP_USER = ca.crl(f"{d}/crl_idp_user.pem", revoked=SCOPED, extensions=(idp(user=True),))
+CRL_IDP_CA = ca.crl(f"{d}/crl_idp_ca.pem", revoked=SCOPED, extensions=(idp(ca_only=True),))
+CRL_IDP_REASONS = ca.crl(
+    f"{d}/crl_idp_reasons.pem",
+    revoked=SCOPED,
+    extensions=(idp(reasons=frozenset({x509.ReasonFlags.key_compromise})),),
+)
+CRL_DELTA = ca.crl(
+    f"{d}/crl_delta.pem", revoked=SCOPED, extensions=((x509.DeltaCRLIndicator(1), True),)
+)
 
 # Server certificates whose SIGNATURE is RSA-PSS or Ed25519.
 pss256, pss384, ed = (
@@ -435,6 +494,17 @@ def crl_scenarios(port):
     }
 
 
+def scope_scenarios(port):
+    return {
+        "no distribution point, good": attempt(port, **PGCERT),
+        "no distribution point, revoked": attempt(port, **REVOKED),
+        "distribution point a, good": attempt(port, **DP_GOOD),
+        "distribution point a, revoked": attempt(port, **DP_REVOKED),
+        "distribution point b": attempt(port, **DP_OTHER),
+        "revoked, first answer": raw_first(port, "postgres", cert=REVOKED),
+    }
+
+
 def chain_scenarios(port):
     out = crl_scenarios(port)
     out["intermediate's good cert"] = attempt(port, **INTER_GOOD)
@@ -572,6 +642,22 @@ GROUPS = {
             ("none", None),
         )
         if path
+    },
+    **{
+        f"crl scope {label}": (
+            f"ssl_crl_file = '{path}'",
+            OPEN,
+            ["--tls-crl-file", path],
+            scope_scenarios,
+            "s",
+        )
+        for label, path in (
+            ("distribution point", CRL_IDP_DP),
+            ("user certs only", CRL_IDP_USER),
+            ("CA certs only", CRL_IDP_CA),
+            ("some reasons", CRL_IDP_REASONS),
+            ("delta", CRL_DELTA),
+        )
     },
     "no crl, chain": ("", OPEN, [], chain_scenarios, "s"),
     "crl-cert": (

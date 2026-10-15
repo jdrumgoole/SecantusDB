@@ -172,8 +172,10 @@ With a revocation list, every certificate in a client's chain needs a list
 from its issuer that is in date, as OpenSSL requires of PostgreSQL: a
 certificate whose CA has no list in the file, or only an expired one, is
 refused. A list with no extensions, which `openssl ca -gencrl` writes by
-default, is read. A list with a critical extension (one scoped by a
-distribution point, a delta list) stops the server from starting.
+default, is read. A list scoped by an issuing distribution point applies
+only to the certificates it covers, and a delta list is read as a full one,
+as OpenSSL applies them for PostgreSQL. A list with any other critical
+extension stops the server from starting.
 
 The subject under `--tls-client-name DN` is written as RFC 2253 has it, the
 last attribute first: `CN=alice,O=Example`. That is seldom a user name, so

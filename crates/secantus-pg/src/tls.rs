@@ -378,6 +378,13 @@ impl ClientCertVerifier for ClientVerifier {
                 Refused::NoList => CertificateError::UnknownIssuer,
                 Refused::BadSignature => CertificateError::BadSignature,
                 Refused::Unreadable => CertificateError::BadEncoding,
+                // OpenSSL's "different CRL scope", which a client sees as
+                // "certificate unknown".
+                Refused::DifferentScope => CertificateError::Other(
+                    tokio_rustls::rustls::OtherError(std::sync::Arc::new(std::io::Error::other(
+                        "the revocation list does not cover this certificate",
+                    ))),
+                ),
             })),
         }
     }

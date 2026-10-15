@@ -23,11 +23,21 @@
 //! certificate whose subject is the list's issuer: a CA from the CA file, or
 //! an intermediate the client sent (which rustls has by then verified).
 //!
-//! Not here: a list scoped by an issuing distribution point, a delta list,
-//! and an indirect list (one that names certificates of another issuer).
-//! Each of those says so in a CRITICAL extension, and a list with a critical
-//! extension is refused when the file is read, as OpenSSL refuses a critical
-//! extension it does not handle.
+//! A list's issuing distribution point (`2.5.29.28`) scopes it as OpenSSL
+//! scopes it (`crl_crldp_check`), PostgreSQL setting no
+//! `X509_V_FLAG_EXTENDED_CRL_SUPPORT`, measured on 15.19:
+//!
+//! - a list for some revocation reasons only, or an indirect one, is never
+//!   used: the certificate's issuer has no list ("unknown ca");
+//! - `onlyContainsUserCerts` / `onlyContainsCACerts` keep a list to the
+//!   one kind of certificate, and a distribution point name keeps it to a
+//!   certificate whose CRL distribution points name the same point; a
+//!   certificate the chosen list does not cover fails, "certificate
+//!   unknown" (`X509_V_ERR_DIFFERENT_CRL_SCOPE`);
+//! - a delta list (`2.5.29.27`) is read as a full one.
+//!
+//! Any other critical extension is refused when the file is read, as
+//! OpenSSL refuses a critical extension it does not handle.
 
 use std::collections::HashSet;
 
@@ -57,6 +67,115 @@ pub(crate) struct RevocationList {
     next_update: Option<i64>,
     /// The serial numbers it names: each an INTEGER's contents.
     revoked: HashSet<Vec<u8>>,
+    /// What its issuing distribution point keeps it to.
+    scope: Scope,
+}
+
+/// An issuing distribution point's scope.
+#[derive(Debug, Default)]
+struct Scope {
+    /// A list for some reasons only, or an indirect one: never used.
+    unusable: bool,
+    only_user: bool,
+    only_ca: bool,
+    only_attribute: bool,
+    /// The distribution point's full name: each GeneralName, whole.
+    points: Option<Vec<Vec<u8>>>,
+}
+
+const IDP: &[u8] = &[0x55, 0x1d, 0x1c];
+const DELTA_CRL_INDICATOR: &[u8] = &[0x55, 0x1d, 0x1b];
+const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+const CRL_DISTRIBUTION_POINTS: &[u8] = &[0x55, 0x1d, 0x1f];
+
+/// A DistributionPointName's full name, as its GeneralNames, whole; `None`
+/// for a name relative to the issuer, which is not read here.
+fn full_name(point: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let (name, _) = expect(point, 0xa0)?;
+    let mut names = Vec::new();
+    let mut rest = name.body;
+    while let Some((general, after)) = read(rest) {
+        names.push(general.raw.to_vec());
+        rest = after;
+    }
+    Some(names)
+}
+
+fn idp_scope(value: &[u8]) -> Result<Scope, String> {
+    let bad = || "its issuing distribution point is not well-formed".to_string();
+    let (idp, _) = expect(value, SEQUENCE).ok_or_else(bad)?;
+    let mut scope = Scope::default();
+    let mut rest = idp.body;
+    while let Some((field, after)) = read(rest) {
+        rest = after;
+        let flag = field.body != [0];
+        match field.tag {
+            0xa0 => {
+                scope.points = Some(full_name(field.body).ok_or_else(|| {
+                    "its issuing distribution point is named relative to its issuer, \
+                     which is not supported"
+                        .to_string()
+                })?)
+            }
+            0x81 => scope.only_user = flag,
+            0x82 => scope.only_ca = flag,
+            0x83 => scope.unusable = true,
+            0x84 => scope.unusable |= flag,
+            0x85 => scope.only_attribute = flag,
+            _ => return Err(bad()),
+        }
+    }
+    Ok(scope)
+}
+
+impl Scope {
+    /// Does a list of this scope cover the certificate with these
+    /// extensions (`crl_crldp_check`)?
+    fn covers(&self, extensions: &[u8]) -> bool {
+        if self.only_attribute {
+            return false;
+        }
+        let is_ca = x509::extension(extensions, BASIC_CONSTRAINTS)
+            .and_then(|(_, v)| expect(v, SEQUENCE))
+            .and_then(|(seq, _)| expect(seq.body, 0x01))
+            .is_some_and(|(flag, _)| flag.body != [0]);
+        if (is_ca && self.only_user) || (!is_ca && self.only_ca) {
+            return false;
+        }
+        // A distribution point of the certificate's with no CRL issuer of
+        // its own, and a name the list's point shares (or no names).
+        if let Some((_, value)) = x509::extension(extensions, CRL_DISTRIBUTION_POINTS) {
+            if let Some((points, _)) = expect(value, SEQUENCE) {
+                let mut rest = points.body;
+                while let Some((point, after)) = expect(rest, SEQUENCE) {
+                    rest = after;
+                    let mut name = None;
+                    let mut crl_issuer = false;
+                    let mut fields = point.body;
+                    while let Some((field, more)) = read(fields) {
+                        fields = more;
+                        match field.tag {
+                            0xa0 => name = Some(full_name(field.body)),
+                            0xa2 => crl_issuer = true,
+                            _ => {}
+                        }
+                    }
+                    if crl_issuer {
+                        continue;
+                    }
+                    let shares = match (&self.points, name) {
+                        (None, _) | (_, None) => true,
+                        (Some(ours), Some(Some(theirs))) => theirs.iter().any(|n| ours.contains(n)),
+                        (Some(_), Some(None)) => false,
+                    };
+                    if shares {
+                        return true;
+                    }
+                }
+            }
+        }
+        self.points.is_none()
+    }
 }
 
 /// Why a certificate did not pass.
@@ -74,6 +193,9 @@ pub(crate) enum Refused {
     BadSignature,
     /// The certificate could not be read.
     Unreadable,
+    /// The list chosen for its issuer does not cover it
+    /// (`X509_V_ERR_DIFFERENT_CRL_SCOPE`).
+    DifferentScope,
 }
 
 impl RevocationList {
@@ -113,14 +235,18 @@ impl RevocationList {
                 let (serial, after) = expect(entry.body, INTEGER).ok_or_else(malformed)?;
                 let (_, after) = time(after).ok_or_else(malformed)?;
                 if let Some((extensions, _)) = expect(after, SEQUENCE) {
-                    refuse_critical(extensions.body, "an entry")?;
+                    refuse_critical(extensions.body, "an entry", &[])?;
                 }
                 revoked.insert(serial.body.to_vec());
             }
         }
+        let mut scope = Scope::default();
         if let Some((extensions, _)) = expect(fields, LIST_EXTENSIONS) {
             let (extensions, _) = expect(extensions.body, SEQUENCE).ok_or_else(malformed)?;
-            refuse_critical(extensions.body, "it")?;
+            if let Some((_, value)) = x509::extension(extensions.body, IDP) {
+                scope = idp_scope(value)?;
+            }
+            refuse_critical(extensions.body, "it", &[IDP, DELTA_CRL_INDICATOR])?;
         }
         Ok(RevocationList {
             issuer: issuer.body.to_vec(),
@@ -130,6 +256,7 @@ impl RevocationList {
             this_update,
             next_update,
             revoked,
+            scope,
         })
     }
 
@@ -163,12 +290,15 @@ impl RevocationList {
 
 /// A critical extension is one a reader must understand or refuse the whole
 /// object. None is understood here.
-fn refuse_critical(mut extensions: &[u8], whose: &str) -> Result<(), String> {
+fn refuse_critical(mut extensions: &[u8], whose: &str, handled: &[&[u8]]) -> Result<(), String> {
     while !extensions.is_empty() {
         let malformed = || "it is not a well-formed revocation list".to_string();
         let (extension, rest) = expect(extensions, SEQUENCE).ok_or_else(malformed)?;
         extensions = rest;
         let (oid, after) = expect(extension.body, OID).ok_or_else(malformed)?;
+        if handled.contains(&oid.body) {
+            continue;
+        }
         if let Some((critical, _)) = expect(after, BOOLEAN) {
             if critical.body != [0] {
                 return Err(format!(
@@ -269,7 +399,7 @@ impl Revocation {
                 .filter(issued_by)
                 .chain(above.iter().copied())
                 .collect();
-            self.check_one(certificate.serial, certificate.issuer, &issuers, now)?;
+            self.check_one(&certificate, &issuers, now)?;
             match above.first() {
                 Some(next) => current = next,
                 None => return Ok(()),
@@ -280,15 +410,17 @@ impl Revocation {
 
     fn check_one(
         &self,
-        serial: &[u8],
-        issuer: &[u8],
+        certificate: &x509::Certificate<'_>,
         issuers: &[&[u8]],
         now: i64,
     ) -> Result<(), Refused> {
+        let (serial, issuer) = (certificate.serial, certificate.issuer);
+        // A list for some reasons only, or an indirect one, is never a
+        // candidate.
         let from_issuer: Vec<&RevocationList> = self
             .lists
             .iter()
-            .filter(|list| list.issuer == issuer)
+            .filter(|list| list.issuer == issuer && !list.scope.unusable)
             .collect();
         if from_issuer.is_empty() {
             return Err(Refused::NoList);
@@ -297,14 +429,22 @@ impl Revocation {
         // to it: a list that is in date over one that is not, then the
         // newer, then the first in the file. So a second list never rescues
         // a certificate from the one that was chosen.
+        // A list that covers the certificate is preferred to one that does
+        // not (`CRL_SCORE_SCOPE` outranks `CRL_SCORE_TIME`).
+        let covers = |list: &RevocationList| list.scope.covers(certificate.extensions);
         let mut chosen = from_issuer[0];
         for list in &from_issuer[1..] {
-            if (list.current(now), list.this_update) > (chosen.current(now), chosen.this_update) {
+            if (covers(list), list.current(now), list.this_update)
+                > (covers(chosen), chosen.current(now), chosen.this_update)
+            {
                 chosen = list;
             }
         }
-        // Its dates, then its signature, then what it names: OpenSSL's
-        // order, and so which failure a client is told about.
+        // Its scope, its dates, then its signature, then what it names:
+        // OpenSSL's order, and so which failure a client is told about.
+        if !covers(chosen) {
+            return Err(Refused::DifferentScope);
+        }
         if chosen.this_update > now {
             return Err(Refused::ListNotYetValid);
         }
@@ -421,7 +561,7 @@ mod tests {
     #[test]
     fn a_critical_extension_is_refused_and_another_is_not() {
         let extension = |critical: Option<u8>| {
-            let mut body = tlv(OID, &[0x55, 0x1d, 0x1c]);
+            let mut body = tlv(OID, &[0x2a, 0x03, 0x04]);
             if let Some(flag) = critical {
                 body.extend(tlv(BOOLEAN, &[flag]));
             }
@@ -432,7 +572,7 @@ mod tests {
         assert!(RevocationList::parse(&list(true, &[], Some(&extension(Some(0))), None)).is_ok());
         let err = RevocationList::parse(&list(true, &[], Some(&extension(Some(0xff))), None))
             .expect_err("critical");
-        assert!(err.contains("critical extension 2.5.29.28"), "{err}");
+        assert!(err.contains("critical extension 1.2.3.4"), "{err}");
     }
 
     #[test]

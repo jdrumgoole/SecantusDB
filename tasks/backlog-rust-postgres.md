@@ -308,9 +308,10 @@ one beside it.
       where the path without a file fails at once. PostgreSQL does the
       first; not probed here.
   - **TLS files:**
-    - **A revocation list with a critical extension is refused at
-      startup** (`crl.rs`): one scoped by an issuing distribution point, a
-      delta list, an indirect list. OpenSSL handles the first.
+    - **A revocation list's issuing distribution point named relative to
+      its issuer is refused at startup** (`crl.rs`); one with a full name,
+      a delta list and a reasons-only or indirect list answer as
+      PostgreSQL 15.19 does.
     - **A user name map's patterns are read as the SQL `~` operator reads
       them** (the `regex` crate, through `pg_regex_source`'s POSIX-class
       translation, 2026-10-15), so they share that engine's distance from

@@ -18,3 +18,10 @@ More of the Rust PostgreSQL server's backlog, measured against PostgreSQL
   POSIX classes and all (`[[:alpha:]]` counts `é`), so a map and a query
   agree on what a pattern matches (`ident.rs`,
   `a_pattern_reads_posix_classes_as_sql_does`).
+- A revocation list scoped by an issuing distribution point is read and
+  applied as OpenSSL applies it for PostgreSQL 15.19: user-only or CA-only,
+  a distribution point the certificate must name (else "certificate
+  unknown"), a reasons-only or indirect list never used ("unknown ca"), and
+  a delta list read as a full one. Such a list was refused at startup.
+  Part of RP-013, pinned by five new groups in
+  `tools/probes/pg_login_tls_files.py` (`tests/test_rust_pg_login_differential.py`).
