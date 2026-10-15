@@ -17597,6 +17597,22 @@ fn wire_type(pg_type: &str) -> Type {
         "macaddr8[]" => Type::MACADDR8_ARRAY,
         "pg_lsn[]" => Type::PG_LSN_ARRAY,
         "tid[]" => Type::TID_ARRAY,
+        "money[]" => Type::MONEY_ARRAY,
+        "xid[]" => Type::XID_ARRAY,
+        "xid8[]" => Type::XID8_ARRAY,
+        "cid[]" => Type::CID_ARRAY,
+        "regproc[]" => Type::REGPROC_ARRAY,
+        "regprocedure[]" => Type::REGPROCEDURE_ARRAY,
+        "regnamespace[]" => Type::REGNAMESPACE_ARRAY,
+        "regrole[]" => Type::REGROLE_ARRAY,
+        "regconfig[]" => Type::REGCONFIG_ARRAY,
+        "bit[]" => Type::BIT_ARRAY,
+        "varbit[]" | "bit varying[]" => Type::VARBIT_ARRAY,
+        "tsvector[]" => Type::TS_VECTOR_ARRAY,
+        "tsquery[]" => Type::TSQUERY_ARRAY,
+        "jsonpath[]" => Type::JSONPATH_ARRAY,
+        "int2vector[]" => Type::INT2_VECTOR_ARRAY,
+        "oidvector[]" => Type::OID_VECTOR_ARRAY,
         "txid_snapshot[]" => Type::TXID_SNAPSHOT_ARRAY,
         "pg_snapshot[]" => Type::PG_SNAPSHOT_ARRAY,
         "aclitem[]" => Type::ACLITEM_ARRAY,
@@ -25846,6 +25862,40 @@ impl PgHandler {
         }
     }
 
+    /// Which of a set-operation side's columns are a bare UNTYPED string
+    /// literal (`select '0/17'`). Like an untyped NULL it is `unknown` and
+    /// takes the other side's type: `select '0/16'::pg_lsn union select
+    /// '0/17'` is a pg_lsn column on PostgreSQL 15, read by pg_lsn's input
+    /// function, where typing the literal text refused every non-text type
+    /// (`UNION types pg_lsn and text cannot be matched`).
+    fn untyped_string_columns(stmt: &Statement) -> Vec<bool> {
+        match stmt {
+            Statement::SelectConstant(sc) => sc
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, (_, col, ..))| {
+                    matches!(col, secantus_pgplan::ConstCol::Value(Bson::String(_)))
+                        && sc.untyped.get(i).copied().unwrap_or(false)
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The planner's name for a built-in wire type (`pg_lsn`, `int4[]`), or
+    /// `None` for a user type.
+    fn planner_type_name(ty: &Type) -> Option<String> {
+        let oid = i64::from(ty.oid());
+        if let Some(t) = secantus_pgplan::pgtypes::name_of_oid(oid) {
+            return Some(t.to_string());
+        }
+        secantus_pgplan::pgtypes::BUILTIN_TYPES
+            .iter()
+            .find(|(_, _, arr)| *arr == oid)
+            .map(|(t, _, _)| format!("{t}[]"))
+    }
+
     /// The result type of one set-operation column, or 42804.
     ///
     /// PostgreSQL unifies the two sides within a type CATEGORY and refuses
@@ -26119,16 +26169,46 @@ impl PgHandler {
         // unified, which is also where mismatched types are refused.
         let left_nulls = Self::null_constant_columns(&set.left);
         let right_nulls = Self::null_constant_columns(&set.right);
+        let left_strs = Self::untyped_string_columns(&set.left);
+        let right_strs = Self::untyped_string_columns(&set.right);
+        let flag = |v: &[bool], i: usize| v.get(i).copied().unwrap_or(false);
         let mut schema = Vec::with_capacity(left_schema.len());
+        // The columns whose untyped literal side is read as the other side's
+        // type: (column, the side holding the literal is the left, type name).
+        let mut retype: Vec<(usize, bool, String)> = Vec::new();
         for (i, (l, r)) in left_schema.iter().zip(&right_schema).enumerate() {
-            let ty = if right_nulls.get(i).copied().unwrap_or(false) {
+            let ty = if flag(&right_nulls, i) {
                 l.datatype().clone()
-            } else if left_nulls.get(i).copied().unwrap_or(false) {
+            } else if flag(&left_nulls, i) {
+                r.datatype().clone()
+            } else if flag(&right_strs, i) && !flag(&left_strs, i) {
+                if let Some(name) = Self::planner_type_name(l.datatype()) {
+                    retype.push((i, false, name));
+                }
+                l.datatype().clone()
+            } else if flag(&left_strs, i) && !flag(&right_strs, i) {
+                if let Some(name) = Self::planner_type_name(r.datatype()) {
+                    retype.push((i, true, name));
+                }
                 r.datatype().clone()
             } else {
                 Self::unify_set_op_type(op, l.datatype(), r.datatype())?
             };
             schema.push(self.field(l.name().to_string(), ty));
+        }
+        let (mut left, mut right) = (left, right);
+        if !retype.is_empty() {
+            let tz = self.session_timezone();
+            for (i, on_left, name) in &retype {
+                let rows = if *on_left { &mut left } else { &mut right };
+                for row in rows.iter_mut() {
+                    if let Some(Some(Bson::String(text))) = row.get(*i) {
+                        let v = secantus_pgplan::cast_text_to(text, name, &tz)
+                            .map_err(|e| Self::err(&e))?;
+                        row[*i] = Some(v);
+                    }
+                }
+            }
         }
         let jsonb_cols: Vec<bool> = schema
             .iter()
@@ -26894,9 +26974,11 @@ impl PgHandler {
                     ))));
                 }
                 // The table's name is also its ROW TYPE's, so it must be free
-                // as a type. Measured on 16: over a composite (which is a
-                // relation too) it is 42P07; over an enum, a range or a
-                // builtin it is 42710 with the hint.
+                // as a type IN ITS SCHEMA. Measured on 16: over a composite
+                // (which is a relation too) it is 42P07; over an enum or a
+                // range it is 42710 with the hint. A built-in type is in
+                // `pg_catalog`, so `create table int4 (...)` or `tid` is a
+                // new type in `public` and succeeds (15.19).
                 if self.composites()?.iter().any(|(n, _, _)| *n == def.name) {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -26906,7 +26988,6 @@ impl PgHandler {
                 }
                 if self.enums()?.iter().any(|(n, _, _)| *n == def.name)
                     || self.ranges()?.iter().any(|(n, _, _)| *n == def.name)
-                    || secantus_pgplan::pgtypes::oid_of_name(&def.name).is_some()
                 {
                     let mut info = ErrorInfo::new(
                         "ERROR".into(),
@@ -33849,6 +33930,30 @@ fn encode_field_value_inner(
             return enc.encode_field(&Some(out));
         }
     }
+    // An array of a type carried in another form than its text -- a money's
+    // numeric, a float4's f64 -- is `array_out` over that type's output
+    // function: `{$1.50}`, `{1.1}`, not `{1.50}` / `{1.100000023841858}`.
+    if let (Some(arr @ Bson::Array(_)), postgres_types::Kind::Array(inner)) =
+        (v, field.datatype().kind())
+    {
+        if let Some(elem @ ("money" | "float4" | "int2vector" | "oidvector")) =
+            secantus_pgplan::pgtypes::name_of_oid(i64::from(inner.oid()))
+        {
+            let ty = format!("{elem}[]");
+            if let Some(rendered) = secantus_pgplan::typeout::array_elements(arr, &ty) {
+                return enc.encode_field(&rendered);
+            }
+            // A multidimensional one is its whole text, as plain TEXT.
+            let text = secantus_pgplan::typeout::output_text(arr, &ty);
+            let options = field.format_options().clone();
+            return enc.encode_field_with_type_and_format(
+                &Some(text),
+                &Type::TEXT,
+                field.format(),
+                options.as_ref(),
+            );
+        }
+    }
     // A COMPOSITE / anonymous-RECORD ARRAY in TEXT format: render each element
     // as its composite `(...)` text and let the text-array encoder escape it
     // once. The element oid is a user oid `element_of_array_oid` does not know,
@@ -38570,11 +38675,6 @@ fn copy_field(
     {
         return secantus_pgplan::cast_text_to(raw, pg_type, tz).map_err(|e| PgHandler::err(&e));
     }
-    // A tid is stored as a number (`tidin`): kept as its text it sorted
-    // after every stored tid and compared equal to none.
-    if pg_type == "tid" {
-        return secantus_pgplan::cast_text_to(raw, pg_type, tz).map_err(|e| PgHandler::err(&e));
-    }
     // `raw` has already been backslash-unescaped by `copy_parse_text` /
     // `unescape_copy_text`. Unescaping again halved a literal `\\` a second time
     // and dropped the backslash from `\<letter>` values -- so the field is used
@@ -38605,7 +38705,17 @@ fn copy_field(
             "f" | "false" | "n" | "no" | "off" | "0" => Bson::Boolean(false),
             _ => return Err(bad("boolean")),
         },
-        _ => Bson::String(text),
+        // The string types are stored as their text.
+        "text" | "varchar" | "character varying" | "bpchar" | "char" | "character" | "name"
+        | "citext" | "\"char\"" => Bson::String(text),
+        // Every other type is read by its INPUT function, as PostgreSQL's
+        // COPY reads it -- the same cast a literal goes through. Kept as raw
+        // text, a pg_lsn / money / xid / oid / reg* / geometric / tid value
+        // was a string where the column holds its carried form: it compared
+        // equal to nothing a literal or an INSERT stored (a self-join of a
+        // COPY'd row matched only itself), and a macaddr / tsvector / jsonpath
+        // kept its input spelling.
+        _ => secantus_pgplan::cast_text_to(&text, pg_type, tz).map_err(|e| PgHandler::err(&e))?,
     })
 }
 

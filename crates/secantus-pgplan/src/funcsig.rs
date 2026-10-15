@@ -16,6 +16,10 @@ const CASTS: &str = include_str!("pg_implicit_casts.tsv");
 /// `(type, typcategory, typispreferred)` of every `pg_catalog` type, arrays
 /// spelled `elem[]`, read from PostgreSQL 15.19.
 const CATEGORIES: &str = include_str!("pg_type_category.tsv");
+/// PostgreSQL 15.19's binary operators (`pg_operator`, `oprkind = 'b'`,
+/// oids below 16384): name, left type, right type, result type, arrays
+/// spelled `elem[]`.
+const OPERATORS: &str = include_str!("pg_binary_operators.tsv");
 
 struct Sig {
     args: Vec<String>,
@@ -177,6 +181,44 @@ fn categories() -> &'static HashMap<String, (char, bool)> {
             })
             .collect()
     })
+}
+
+fn binary_operators() -> &'static HashMap<String, Vec<(String, String)>> {
+    static O: OnceLock<HashMap<String, Vec<(String, String)>>> = OnceLock::new();
+    O.get_or_init(|| {
+        let mut m: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for l in OPERATORS.lines() {
+            let mut it = l.split('\t');
+            let (Some(name), Some(left), Some(right)) = (it.next(), it.next(), it.next()) else {
+                continue;
+            };
+            m.entry(name.to_string())
+                .or_default()
+                .push((planner_type(left), planner_type(right)));
+        }
+        m
+    })
+}
+
+/// `Some(false)` when no built-in binary operator `op` takes a left operand
+/// of type `l` and a right one of type `r` -- exactly, through an implicit
+/// cast or through a polymorphic parameter -- which is PostgreSQL's 42883
+/// `operator does not exist`. `None` when either type is not a built-in
+/// this table knows (a domain, an enum, an extension type, `unknown`) or
+/// `op` is not a built-in operator: those are not judged.
+pub(crate) fn operator_resolves(op: &str, l: &str, r: &str) -> Option<bool> {
+    let cats = categories();
+    if l == "unknown" || r == "unknown" || !cats.contains_key(l) || !cats.contains_key(r) {
+        return None;
+    }
+    let cands = binary_operators().get(op)?;
+    Some(cands.iter().any(|(a, b)| accepts(a, l) && accepts(b, r)))
+}
+
+/// `pg_type.typcategory` of a built-in type, by oid.
+pub(crate) fn category_of_oid(oid: i64) -> Option<char> {
+    let name = crate::pgtypes::name_of_oid(oid)?;
+    categories().get(&planner_type(name)).map(|c| c.0)
 }
 
 /// The declared type of argument `i` under overload `s` (a variadic's

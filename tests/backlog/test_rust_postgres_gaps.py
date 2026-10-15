@@ -342,3 +342,25 @@ def test_insert_select_checks_assignment_types(
     pg.execute("create table rp029_t (b bool, n int)")
     got = pg_answer(pg, f"insert into rp029_t ({target}) select {source} from rp029_s")
     assert got == ("err", "42804", message)
+
+
+@pytest.mark.backlog("RP-030")
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("select '(0,1)'::tid::text", ("ok", [("(0,1)",)])),
+        ("select row_to_json(x)::text from tid x", ("ok", [('{"d":"2020-01-01"}',)])),
+    ],
+    ids=["builtin-still-wins", "whole-row"],
+)
+def test_table_named_after_a_builtin_type(pg: Any, sql: str, expected: Any) -> None:
+    """PostgreSQL 15.19: a table may be named `tid` (its row type is
+    `public.tid`); a bare `tid` in a cast is still `pg_catalog.tid`, searched
+    first, and the table's whole-row value is its own row type."""
+    pg.execute("drop table if exists tid")
+    pg.execute("create table tid (d date)")
+    pg.execute("insert into tid values ('2020-01-01')")
+    try:
+        assert pg_answer(pg, sql) == expected
+    finally:
+        pg.execute("drop table if exists tid")

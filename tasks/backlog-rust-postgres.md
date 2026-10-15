@@ -367,6 +367,18 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **RUST pgserver: a table named after a built-in type shadows it.**
+  `create table tid (d date)` now succeeds, as on PostgreSQL 15.19 (it
+  was 42710), but then a bare `tid` in a cast resolves to the table's row
+  type (`'(0,1)'::tid` is a malformed record literal) and the table's
+  whole-row value is typed as the built-in (`row_to_json(x)` over it is
+  42883). PostgreSQL searches `pg_catalog` first, so a bare name is the
+  built-in, while the row type is `public.tid`. Composite types are found
+  by name here (`user_composite`), so this needs them told apart by schema.
+  Found 2026-10-15 merging the `tid` type.
+  Backlog-ID: RP-030
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_table_named_after_a_builtin_type
+
 - [ ] **RUST pgserver: INSERT ... SELECT does not check the selected
   types against the target columns.** `insert into t (b) select i from s`
   (an int into a bool column) STORES the rows here; PostgreSQL 15.19 says

@@ -355,6 +355,16 @@ fn operand_type(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
     match n.node.as_ref()? {
         N::AConst(c) if !c.isnull => match c.val.as_ref()? {
             Val::Ival(_) => Some("int4".into()),
+            // An integer literal past int4 is a bigint (`5000000000`), one
+            // past int8 a numeric -- pg_query hands both over as a float.
+            Val::Fval(f) if f.fval.bytes().all(|b| b.is_ascii_digit()) => Some(
+                if f.fval.parse::<i64>().is_ok() {
+                    "int8"
+                } else {
+                    "numeric"
+                }
+                .into(),
+            ),
             Val::Fval(_) => Some("numeric".into()),
             Val::Boolval(_) => Some("bool".into()),
             _ => None,
@@ -665,6 +675,50 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
                 let op = if op == "!=" { "<>" } else { op.as_str() };
                 return Err(mismatch(op, &l, &r, e.location));
             }
+        }
+    }
+    // Any binary operator over two KNOWN built-in types is resolved against
+    // `pg_operator`, as parse analysis resolves it: no candidate that takes
+    // the two types (exactly, by an implicit cast, or polymorphically) is
+    // 42883 at the operator, where lowering it compared the carried values
+    // (`int2 = xid` answered true, `numeric = oid` false) or failed at run
+    // time with a 0A000 "comparing ... is not supported yet".
+    if kind == Some(K::AexprOp) && e.lexpr.is_some() {
+        let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
+        if let (Some(l), Some(r)) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref())) {
+            let name = if op == "!=" { "<>" } else { op.as_str() };
+            if crate::funcsig::operator_resolves(name, &l, &r) == Some(false) {
+                return Err(mismatch(name, &l, &r, e.location));
+            }
+        }
+    }
+    // NULLIF and IS [NOT] DISTINCT FROM resolve `a = b` the same way; an
+    // untyped literal side is read as the other side's type, but named
+    // `unknown` when there is no `=` for it (`nullif(point, '(1,2)')`).
+    if matches!(
+        kind,
+        Some(K::AexprNullif | K::AexprDistinct | K::AexprNotDistinct)
+    ) {
+        let untyped = |n: Option<&pg_query::protobuf::Node>| {
+            matches!(n.and_then(|n| n.node.as_ref()), Some(N::AConst(c))
+                if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))))
+        };
+        let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
+        let (ln, rn) = (e.lexpr.as_deref(), e.rexpr.as_deref());
+        let (l, r) = (side(ln), side(rn));
+        let refused = match (&l, &r) {
+            (Some(l), Some(r)) => crate::funcsig::operator_resolves("=", l, r) == Some(false),
+            (Some(t), None) if untyped(rn) => {
+                crate::funcsig::operator_resolves("=", t, t) == Some(false)
+            }
+            (None, Some(t)) if untyped(ln) => {
+                crate::funcsig::operator_resolves("=", t, t) == Some(false)
+            }
+            _ => false,
+        };
+        if refused {
+            let name = |t: &Option<String>| t.clone().unwrap_or_else(|| "unknown".into());
+            return Err(mismatch("=", &name(&l), &name(&r), e.location));
         }
     }
     // `oid` has comparison operators and nothing arithmetic: `oid + integer`,
@@ -1035,11 +1089,26 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                     set_error_location(tc.location);
                     return Err(e);
                 }
-                // Only the cast an operand is cast from: the rest of a cast's
-                // operand was never checked here, and is not now.
-                if matches!(arg.node, Some(N::TypeCast(_))) {
-                    walk(arg, scope, cx)?;
+                // Any other explicit cast between built-in types PostgreSQL
+                // has no pathway for is refused too, NULL or not:
+                // `pg_lsn::int8` is 42846 at the `::`, where it used to
+                // answer the number the pg_lsn is carried as. A
+                // function-style cast (location -1) is a function call on
+                // PostgreSQL, resolved with implicit coercion of its
+                // argument, and is left to that.
+                if tc.location >= 0 {
+                    if let Some(source) = operand_type(arg, scope) {
+                        if crate::pg_casts::refused(&source, &target) {
+                            set_error_location(tc.location);
+                            return Err(Error::CannotCoerce(format!(
+                                "cannot cast type {} to {}",
+                                display_type(&source),
+                                display_type(&target)
+                            )));
+                        }
+                    }
                 }
+                walk(arg, scope, cx)?;
             }
         }
         N::ResTarget(r) => {
