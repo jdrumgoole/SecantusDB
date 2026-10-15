@@ -1727,7 +1727,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "secantus-auth"
-version = "0.5.3-beta.195"
+version = "0.5.3-beta.196"
 dependencies = [
  "base64",
  "hmac 0.12.1",
@@ -1742,7 +1742,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-bench"
-version = "0.5.3-beta.195"
+version = "0.5.3-beta.196"
 dependencies = [
  "bson",
  "rand 0.9.4",
@@ -1753,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-commands"
-version = "0.5.3-beta.195"
+version = "0.5.3-beta.196"
 dependencies = [
  "base64",
  "bson",
@@ -1770,7 +1770,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-core"
-version = "0.5.3-beta.195"
+version = "0.5.3-beta.196"
 dependencies = [
  "bson",
  "chrono",
@@ -1790,7 +1790,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-core-py"
-version = "0.5.3-beta.195"
+version = "0.5.3-beta.196"
 dependencies = [
  "bson",
  "pyo3",
@@ -1839,7 +1839,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-server"
-version = "0.5.3-beta.195"
+version = "0.5.3-beta.196"
 dependencies = [
  "bson",
  "log",
@@ -1855,7 +1855,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wire"
-version = "0.5.3-beta.195"
+version = "0.5.3-beta.196"
 dependencies = [
  "bson",
  "flate2",
