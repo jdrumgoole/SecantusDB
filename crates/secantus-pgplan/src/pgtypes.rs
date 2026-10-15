@@ -56,6 +56,7 @@ pub const BUILTIN_TYPES: &[(&str, i64, i64)] = &[
     ("macaddr", 829, 1040),
     ("macaddr8", 774, 775),
     ("pg_lsn", 3220, 3221),
+    ("tid", 27, 1010),
     ("txid_snapshot", 2970, 2949),
     ("pg_snapshot", 5038, 5039),
     ("xid", 28, 1011),

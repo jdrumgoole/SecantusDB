@@ -65,6 +65,7 @@ pub fn to_json_value(v: &Bson, ty: &str) -> Json {
             }
             None => Json::Str(crate::value_text(v)),
         },
+        "tid" => Json::Str(crate::tid::render_tid_value(v)),
         "text" | "varchar" | "bpchar" | "name" | "char" | "unknown" | "date" | "time" | "uuid" => {
             Json::Str(crate::value_text(v))
         }
