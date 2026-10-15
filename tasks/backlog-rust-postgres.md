@@ -318,8 +318,6 @@ one beside it.
       `pg_ident.conf` is refused.
     - **SIGHUP reloads only on a server started with TLS**; without TLS it
       still stops the server (`ctrlc`'s termination handler).
-  - **`pg_stat_ssl` prints `UNDEF` for an attribute type outside
-    `x509::short_name`'s table**, where OpenSSL knows more names.
   - **Direct TLS (`sslnegotiation=direct`) is accepted**, which is
     PostgreSQL 17's behaviour; 15.19 answers "SSL error: unexpected eof".
   - The key must have no passphrase.

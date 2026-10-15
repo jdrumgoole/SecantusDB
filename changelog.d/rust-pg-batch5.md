@@ -80,6 +80,14 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   `pg_reload_conf()` judged by the login role and ignored a GRANT. Part of
   RP-013 (`tests/backlog/test_rust_postgres_gaps.py::test_restricted_builtin_needs_a_grant`).
 
+- `pg_stat_ssl` and `ssl_client_dn` name a certificate's attributes by
+  OpenSSL's own short names, as PostgreSQL (linked against OpenSSL) prints
+  them: all 1,341 objects OpenSSL 3.6.3 knows (`businessCategory`,
+  `organizationIdentifier`, `jurisdictionL`, ...), dumped from
+  `OBJ_nid2sn` into `x509_short_names.tsv`, where 18 were listed and the
+  rest printed `UNDEF`. Part of RP-013 (the `short_names_are_openssls`
+  unit test in `crates/secantus-pg/src/x509.rs`).
+
 #### Added
 
 - The language validators `fmgr_internal_validator`, `fmgr_c_validator`,
