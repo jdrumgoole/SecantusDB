@@ -605,10 +605,6 @@ may run a command.
       version.
       Backlog-ID: RM-025
       Verify: tests/backlog/test_rm_001_028.py::test_fcv_80_refuses_a_feature_82_added
-- [ ] **`dbHash` leaves out a time-series collection** and hashes none of
-      its buckets; mongod hashes `system.buckets.<name>`. Not measured.
-      Backlog-ID: RM-026
-      Verify: tests/backlog/test_rm_001_028.py::test_dbhash_includes_timeseries_buckets
 - [ ] **`mapReduce` with `out`** (18) answers an error here (9, "only
       supports {out: {inline: 1}}") where mongod runs it; the users allowed
       are the same. Without a JavaScript engine only the one shape the
