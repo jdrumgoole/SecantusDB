@@ -64,7 +64,7 @@ def _ping_after(sock: socket.socket, request_id: int) -> tuple:
     return ("ok", opcode, response_to, bson.decode(body[5:])["ok"])
 
 
-@pytest.mark.backlog("RM-144")
+@pytest.mark.backlog_fixed("RM-144")
 @pytest.mark.parametrize("opcode", [9999, OP_REPLY])
 def test_unknown_opcode_is_ignored_and_the_connection_kept(rust_mongo: Any, opcode: int) -> None:
     """mongod 8.2.11 ignores a frame with an opcode it does not serve (9999,
@@ -81,7 +81,7 @@ def test_unknown_opcode_is_ignored_and_the_connection_kept(rust_mongo: Any, opco
     assert got == ("ok", OP_MSG, 8, 1.0)
 
 
-@pytest.mark.backlog("RM-145")
+@pytest.mark.backlog_fixed("RM-145")
 def test_legacy_op_get_more_is_refused_with_an_op_reply(rust_mongo: Any) -> None:
     """mongod 8.2.11 answers a legacy OP_GET_MORE with an OP_REPLY:
     responseFlags 2 (QueryFailure), cursorId 0, startingFrom 0, one document
@@ -130,7 +130,7 @@ def test_legacy_op_get_more_is_refused_with_an_op_reply(rust_mongo: Any) -> None
     assert after[0] == "ok"
 
 
-@pytest.mark.backlog("RM-146")
+@pytest.mark.backlog_fixed("RM-146")
 def test_exhaust_get_more_ends_with_the_short_batch(rust_mongo: Any) -> None:
     """mongod 8.2.11, 10 documents, `find` batchSize 3, then a getMore with
     `exhaustAllowed`: three frames -- [3,4,5] and [6,7,8] with moreToCome and
@@ -181,7 +181,7 @@ def test_exhaust_get_more_ends_with_the_short_batch(rust_mongo: Any) -> None:
     ]
 
 
-@pytest.mark.backlog("RM-147")
+@pytest.mark.backlog_fixed("RM-147")
 def test_server_status_reports_compression_counters(rust_mongo: Any) -> None:
     """mongod 8.2.11 reports `network.compression` with all three compressors,
     each `{compressor: {bytesIn, bytesOut}, decompressor: {bytesIn, bytesOut}}`

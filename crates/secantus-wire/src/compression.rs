@@ -37,7 +37,7 @@ pub enum Compressor {
 
 /// Length of the `OP_COMPRESSED` prefix: original opcode, uncompressed size,
 /// compressor id.
-const PREFIX_LEN: usize = 4 + 4 + 1;
+pub const PREFIX_LEN: usize = 4 + 4 + 1;
 
 impl Compressor {
     /// The wire id. `0` is `noop`, which is not enabled.

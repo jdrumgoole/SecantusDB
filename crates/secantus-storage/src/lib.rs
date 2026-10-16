@@ -2447,6 +2447,22 @@ const GEO_KEY_FORMAT: i32 = 2;
 /// `listIndexes` strips it.
 const NUMBER_KEYS: &str = "numberKeys";
 
+/// The order an index was built in, among its collection's (RM-081): mongod
+/// lists indexes, and tries their plans, in build order. One more than the
+/// collection's highest; an index built before this was recorded has none
+/// and counts as 0, so a store's existing indexes keep name order, ahead of
+/// any built later. Not a user option: `listIndexes` strips it. A rebuild
+/// keeps it (it is not a `BUILD_STAMPS` entry).
+const BUILD_SEQ: &str = "buildSeq";
+
+fn build_seq(opts: &Document) -> i64 {
+    match opts.get(BUILD_SEQ) {
+        Some(Bson::Int64(n)) => *n,
+        Some(Bson::Int32(n)) => i64::from(*n),
+        _ => 0,
+    }
+}
+
 /// Options only this server's catalog carries, which a rebuild leaves out of
 /// the options it builds from: `create_index_in_txn` stamps them again.
 const BUILD_STAMPS: &[&str] = &[
@@ -11575,6 +11591,15 @@ impl Storage {
         // enumerated user-facing options, so it never provokes a false conflict.
         stored_options.insert("entryFormat", ENTRY_FORMAT);
         stored_options.insert(NUMBER_KEYS, sortkey::NUMBER_KEY_FORMAT);
+        if !stored_options.contains_key(BUILD_SEQ) {
+            let last = self
+                .iter_indexes(session, db, coll)?
+                .iter()
+                .map(|(_, _, o)| build_seq(o))
+                .max()
+                .unwrap_or(0);
+            stored_options.insert(BUILD_SEQ, last + 1);
+        }
         // An index with a collation keys its entries by collation sort keys,
         // and says so in the catalog (see `COLLATION_KEYS`).
         let key_coll: Option<Collation> = if geo.is_none() && geo_sphere.is_none() {
@@ -11805,10 +11830,16 @@ impl Storage {
             }
             out.push(e);
         }
+        // `_id_` first, then build order (RM-081), then name.
         out.sort_by(|a, b| {
-            a.get_str("name")
-                .unwrap_or("")
-                .cmp(b.get_str("name").unwrap_or(""))
+            let key = |d: &Document| {
+                (
+                    d.get_str("name") != Ok(ID_INDEX_NAME),
+                    build_seq(d),
+                    d.get_str("name").unwrap_or("").to_string(),
+                )
+            };
+            key(a).cmp(&key(b))
         });
         Ok(out)
     }
@@ -12172,6 +12203,10 @@ impl Storage {
             out.push((name, key_spec, opts));
             more = cur.next()?;
         }
+        // In build order, as mongod keeps them (RM-081): it is the order it
+        // lists them, checks them for a duplicate key and tries their plans
+        // in. The catalog table's own order is by name, which breaks ties.
+        out.sort_by_key(|(name, _, opts)| (build_seq(opts), name.clone()));
         Ok(out)
     }
 
@@ -19304,6 +19339,7 @@ fn index_event_spec(payload: &Document, name: &str) -> Document {
                     | "numberKeys"
                     | "geoKeys"
                     | "pythonKeys"
+                    | "buildSeq"
             ) {
                 spec.insert(k.clone(), v.clone());
             }

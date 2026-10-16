@@ -99,9 +99,17 @@ pub struct TopStats {
     ops: [std::sync::atomic::AtomicI64; 6],
     /// `serverStatus.network`: requests read, bytes read, bytes written.
     net: [std::sync::atomic::AtomicI64; 3],
+    /// `serverStatus.network.compression`, per compressor in
+    /// [`COMPRESSORS`] order: compressor bytesIn / bytesOut, then
+    /// decompressor bytesIn / bytesOut.
+    compression: [[std::sync::atomic::AtomicI64; 4]; 3],
     /// The rest of `serverStatus`'s counters.
     pub status: crate::status::StatusCounters,
 }
+
+/// The compressors `serverStatus.network.compression` reports, in mongod
+/// 8.2.11's order (its default `networkMessageCompressors`).
+pub const COMPRESSORS: [&str; 3] = ["snappy", "zstd", "zlib"];
 
 /// The names of `serverStatus.opcounters`, in mongod's order.
 pub const OPCOUNTERS: [&str; 6] = ["insert", "query", "update", "delete", "getmore", "command"];
@@ -152,6 +160,49 @@ impl TopStats {
         std::array::from_fn(|i| self.net[i].load(std::sync::atomic::Ordering::Relaxed))
     }
 
+    /// One message body compressed by `compressor` (a [`COMPRESSORS`] name):
+    /// `bytes_in` uncompressed bytes became `bytes_out` compressed ones. As
+    /// mongod 8.2.11 counts them, neither includes the message header or the
+    /// `OP_COMPRESSED` prefix. An unknown name is not counted.
+    pub fn count_compressed(&self, compressor: &str, bytes_in: usize, bytes_out: usize) {
+        self.count_compression(compressor, 0, bytes_in, bytes_out);
+    }
+
+    /// One message body decompressed by `compressor`: `bytes_in` compressed
+    /// bytes became `bytes_out` uncompressed ones.
+    pub fn count_decompressed(&self, compressor: &str, bytes_in: usize, bytes_out: usize) {
+        self.count_compression(compressor, 2, bytes_in, bytes_out);
+    }
+
+    fn count_compression(&self, compressor: &str, side: usize, bytes_in: usize, bytes_out: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(i) = COMPRESSORS.iter().position(|c| *c == compressor) else {
+            return;
+        };
+        self.compression[i][side].fetch_add(bytes_in as i64, Relaxed);
+        self.compression[i][side + 1].fetch_add(bytes_out as i64, Relaxed);
+    }
+
+    /// `serverStatus.network.compression`: for each compressor, in mongod's
+    /// order, `{compressor: {bytesIn, bytesOut}, decompressor: {bytesIn,
+    /// bytesOut}}` as int64 -- present at zero before any compressed traffic,
+    /// as on mongod 8.2.11.
+    pub fn compression(&self) -> bson::Document {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut out = bson::Document::new();
+        for (name, counts) in COMPRESSORS.iter().zip(&self.compression) {
+            let n: [i64; 4] = std::array::from_fn(|k| counts[k].load(Relaxed));
+            out.insert(
+                *name,
+                bson::doc! {
+                    "compressor": {"bytesIn": n[0], "bytesOut": n[1]},
+                    "decompressor": {"bytesIn": n[2], "bytesOut": n[3]},
+                },
+            );
+        }
+        out
+    }
+
     /// The six counters, in `OPCOUNTERS` order.
     pub fn opcounters(&self) -> [i64; 6] {
         std::array::from_fn(|i| self.ops[i].load(std::sync::atomic::Ordering::Relaxed))
@@ -195,6 +246,36 @@ impl TopStats {
 mod tests {
     use super::*;
     use bson::doc;
+
+    #[test]
+    fn compression_counters_have_mongods_shape() {
+        let stats = TopStats::new();
+        let zero = doc! {
+            "compressor": {"bytesIn": 0_i64, "bytesOut": 0_i64},
+            "decompressor": {"bytesIn": 0_i64, "bytesOut": 0_i64},
+        };
+        // Every compressor, at zero, before any compressed traffic.
+        assert_eq!(
+            stats.compression(),
+            doc! {"snappy": zero.clone(), "zstd": zero.clone(), "zlib": zero.clone()}
+        );
+        // The deltas mongod 8.2.11 showed for one zlib-compressed ping: 37
+        // compressed bytes in became the 35-byte body; the 22-byte reply
+        // body went out as 22 compressed bytes.
+        stats.count_decompressed("zlib", 37, 35);
+        stats.count_compressed("zlib", 22, 22);
+        stats.count_compressed("lz4", 1, 1); // not one of mongod's: ignored
+        let got = stats.compression();
+        assert_eq!(
+            got.get_document("zlib").unwrap(),
+            &doc! {
+                "compressor": {"bytesIn": 22_i64, "bytesOut": 22_i64},
+                "decompressor": {"bytesIn": 37_i64, "bytesOut": 35_i64},
+            }
+        );
+        assert_eq!(got.get_document("snappy").unwrap(), &zero);
+        assert_eq!(got.get_document("zstd").unwrap(), &zero);
+    }
 
     #[test]
     fn sections_match_the_mongod_probe() {

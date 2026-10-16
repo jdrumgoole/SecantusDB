@@ -754,35 +754,6 @@ Still different:
       is a feature to build, not a reply to change.
       Backlog-ID: RM-143
       Verify: tests/backlog/test_rm_029_056.py::test_features_reports_the_script_engine,tests/backlog/test_rm_029_056.py::test_features_oid_reset,tests/backlog/test_rm_029_056.py::test_plan_cache_set_filter,tests/backlog/test_rm_029_056.py::test_resize_oplog_min_retention_hours,tests/backlog/test_rm_029_056.py::test_every_cluster_parameter
-- [ ] **A frame with an opcode the server does not serve closes the
-      connection.** mongod 8.2.11 sends nothing back for opcode 9999, or 1
-      (`OP_REPLY`) sent as a request, and answers the next request on the
-      same socket; this server resets the connection, losing anything else
-      in flight on it. Found 2026-10-15.
-      Backlog-ID: RM-144
-      Verify: tests/backlog/test_rm_found_2026_10_15.py::test_unknown_opcode_is_ignored_and_the_connection_kept
-- [ ] **A legacy `OP_GET_MORE` closes the connection.** mongod 8.2.11
-      answers an `OP_REPLY` (flags 2, cursor 0) holding `{$err: "OP_GET_MORE
-      is no longer supported. ...", code: 5739101, ok: 0}` and keeps the
-      connection. Found 2026-10-15.
-      Backlog-ID: RM-145
-      Verify: tests/backlog/test_rm_found_2026_10_15.py::test_legacy_op_get_more_is_refused_with_an_op_reply
-- [ ] **An exhaust `getMore` whose last batch is short sends one frame too
-      many.** With 10 documents and `batchSize: 3`, mongod 8.2.11 sends
-      `[3,4,5]` and `[6,7,8]` with `moreToCome`, then `[9]` without it and
-      cursor id 0; this server sends `[9]` with `moreToCome` and the live
-      id, then an empty final frame. Found 2026-10-15.
-      Backlog-ID: RM-146
-      Verify: tests/backlog/test_rm_found_2026_10_15.py::test_exhaust_get_more_ends_with_the_short_batch
-- [ ] **`serverStatus` has no `network.compression`.** mongod 8.2.11
-      reports `bytesIn` / `bytesOut` for each compressor and decompressor
-      (snappy, zstd, zlib; int64, zero on a fresh server). This server
-      speaks all three since 2026-10-15 and counts none of them.
-      **Decided 2026-10-16 (Joe):** in scope. `OP_COMPRESSED` with snappy,
-      zstd and zlib already works (2026-10-15); only these counters are
-      missing.
-      Backlog-ID: RM-147
-      Verify: tests/backlog/test_rm_found_2026_10_15.py::test_server_status_reports_compression_counters
 - **Scope decision — `buildInfo.secantusVersion` and `serverStatus.secantus`
   stay** (Joe, 2026-10-15). Each names this build beside mongod's own
   fields. They are additive, documented (`CLAUDE.md`, `docs/compatibility.md`,
@@ -1251,19 +1222,6 @@ differs on 5 scenarios. What is left:
       result. One scenario.
       Backlog-ID: RM-080
       Verify: tests/backlog/test_rm_057_084.py::test_get_more_sees_writes_made_since_the_find
-- [ ] **RUST MongoDB server: `listIndexes` answers in name order.** mongod
-      answers in the order the indexes were built (`_id_` first on both).
-      The catalog keeps no build order, so this needs a field on disk, which
-      the Python server would then have to carry too. One scenario. The
-      same order is the order `explain` lists rejected plans in, which here
-      follows the catalog's name order.
-      **Decided 2026-10-16 (Joe):** record the build order: a sequence in
-      each index's catalog options, stripped from `listIndexes` like
-      `entryFormat`, used for `listIndexes`, the duplicate-key index and
-      `rejectedPlans`. A store's existing indexes take name order on open.
-      Folds in RM-107, the same item.
-      Backlog-ID: RM-081
-      Verify: tests/backlog/test_rm_057_084.py::test_list_indexes_in_build_order,tests/backlog/test_rm_085_112.py::test_list_indexes_in_creation_order
 - [ ] **RUST MongoDB server: an `aggregate` cursor outlives the index it
       reads.** A `find` cursor is killed when its index is dropped (175,
       since 2026-10-14); an `aggregate` whose `$match` reads one is not.
@@ -1460,19 +1418,21 @@ What is left, there and beside it:
       five types come from its data.
       Backlog-ID: RM-095
       Verify: tests/backlog/test_rm_085_112.py::test_five_collation_types_are_accepted
-- [ ] **RUST MongoDB server: smaller collation differences.** `Did you
-      mean` is missing or different for a three-letter code (`eng`, `en_USA`)
-      and for `zh@collation=stroke` (mongod: `zh_Hant`); a duplicate-key
-      error quotes ICU4X's sort key, whose bytes are not ICU 57's (`2b0105`
-      for mongod's `290105`), and for a string inside a document it quotes
-      the string where mongod quotes the key; `$lookup` from a view whose
-      collation differs from the pipeline's answers (mongod: 167); `$merge`
-      onto a collated unique index does not raise the duplicate key mongod
-      does; `hashed` and `text` indexes with a collation are refused as all
-      such indexes are; a validator on an `update` reads the statement's
-      collation, not the collection's.
+- [ ] **RUST MongoDB server: smaller collation differences.** A validator
+      on an `update` reads the statement's collation, not the collection's:
+      under a collection collation of `en` strength 2, `{k: "A"}` accepts
+      `k: "a"` on mongod 8.2.11 whatever collation the statement names, and
+      this server refuses it (121) for `simple` or `fr`. A duplicate-key
+      error quoting a collated key is RM-095's, which shares its cause: the
+      key bytes are ICU4X's (`2b0105`) where mongod's are ICU 57's
+      (`290105`), and for a string inside a document this server quotes the
+      string where mongod quotes the key. (`Did you mean` for three-letter
+      codes, `$lookup` from a view with another collation, and the `$merge`
+      duplicate key now match; `zh@collation=stroke` was measured accepted
+      by both; a collated `hashed` / `text` index is refused because those
+      index types are out of scope.)
       Backlog-ID: RM-096
-      Verify: tests/backlog/test_rm_085_112.py::test_did_you_mean_for_a_three_letter_code,tests/backlog/test_rm_085_112.py::test_lookup_from_a_view_with_another_collation
+      Verify: tests/backlog/test_rm_085_112.py::test_validator_reads_the_collections_collation
 - [ ] **RUST MongoDB server: a duplicate `_id` spelled exactly the same in a
       collection with a default collation** is reported from the plain `_id`
       index (`index: _id_ dup key: { _id: "a" }`); mongod reports it under

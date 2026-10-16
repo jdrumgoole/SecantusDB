@@ -407,7 +407,7 @@ def test_five_collation_types_are_accepted(rust_mongo: Any, mongod: Any) -> None
     assert got == ref
 
 
-@pytest.mark.backlog("RM-096")
+@pytest.mark.backlog_fixed("RM-096")
 def test_did_you_mean_for_a_three_letter_code(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11: the error for locale `eng` (its wording, with `Did you
     mean`)."""
@@ -421,7 +421,7 @@ def test_did_you_mean_for_a_three_letter_code(rust_mongo: Any, mongod: Any) -> N
     assert got == ref
 
 
-@pytest.mark.backlog("RM-096")
+@pytest.mark.backlog_fixed("RM-096")
 def test_lookup_from_a_view_with_another_collation(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11: `$lookup` from a view whose collation differs from the
     pipeline's answers 167."""
@@ -649,7 +649,7 @@ def test_bulk_write_ns_info_not_an_array(rust_mongo: Any, mongod: Any) -> None:
 # ------------------------------------------------- 7.067 index management --
 
 
-@pytest.mark.backlog("RM-081")
+@pytest.mark.backlog_fixed("RM-081")
 def test_list_indexes_in_creation_order(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 lists indexes in creation order."""
 
@@ -763,4 +763,73 @@ def test_coll_mod_capped_size_event_names_fields_as_sent(rust_mongo: Any, mongod
         return ev["operationType"], sorted(ev.get("operationDescription", {}))
 
     got, ref = _both(rust_mongo, mongod_rs, probe)
+    assert got == ref
+
+
+@pytest.mark.backlog("RM-096")
+def test_validator_reads_the_collections_collation(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 checks a collation-sensitive validator under the
+    COLLECTION's collation, whatever collation the update statement names:
+    `{k: "A"}` under `en` strength 2 accepts `k: "a"` for a statement with
+    the simple collation too. The Rust server used the statement's (121)."""
+
+    def probe(client: Any) -> list:
+        db = client[_name("rm096v")]
+        db.create_collection("v", collation={"locale": "en", "strength": 2}, validator={"k": "A"})
+        db.v.insert_one({"_id": 1, "k": "A"})
+        out = []
+        for coll in (None, {"locale": "simple"}, {"locale": "fr", "strength": 3}):
+            out.append(
+                mongo_answer(
+                    lambda c=coll: (
+                        db.v.update_one(
+                            {"_id": 1}, {"$set": {"k": "a"}}, collation=c
+                        ).modified_count
+                    )
+                )[:2]
+            )
+            db.v.update_one({"_id": 1}, {"$set": {"k": "A"}}, bypass_document_validation=True)
+        return out
+
+    got, ref = _both(rust_mongo, mongod, probe)
+    assert got == ref
+
+
+@pytest.mark.backlog_fixed("RM-179")
+def test_union_with_documents_needs_no_collection(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 runs `$unionWith: {pipeline: [{$documents: [...]}]}`
+    with no `coll`; the Rust server refused any `$unionWith` without one (9)."""
+
+    def probe(client: Any) -> Any:
+        db = client[_name("rm179")]
+        db.c.insert_one({"_id": 1})
+        stage = {"$unionWith": {"pipeline": [{"$documents": [{"x": 1}]}]}}
+        return mongo_answer(lambda: list(db.c.aggregate([stage, {"$project": {"_id": 0}}])))[:2]
+
+    got, ref = _both(rust_mongo, mongod, probe)
+    assert got == ref
+
+
+@pytest.mark.backlog_fixed("RM-180")
+def test_lookup_from_a_db_and_coll_document(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 refuses `$lookup` with `from: {db, coll}` naming an
+    ordinary collection with 9 ("$lookup with syntax {from: {db:<>,
+    coll:<>},..} is not supported for db: ..."); the Rust server answered 2
+    ("$lookup requires 'from' (string)")."""
+
+    def probe(client: Any) -> Any:
+        db = client[_name("rm180")]
+        db.c.insert_one({"_id": 1})
+        stage = {
+            "$lookup": {
+                "from": {"db": db.name, "coll": "c"},
+                "localField": "_id",
+                "foreignField": "_id",
+                "as": "j",
+            }
+        }
+        got = mongo_answer(lambda: list(db.c.aggregate([stage])))
+        return got[:2] + (str(got[2]).replace(db.name, "@db"),) if got[0] == "err" else got
+
+    got, ref = _both(rust_mongo, mongod, probe)
     assert got == ref
