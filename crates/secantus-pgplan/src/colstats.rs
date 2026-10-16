@@ -15,6 +15,9 @@ use crate::hashagg::{ColumnStats, Sampled};
 pub const DEFAULT_INEQ_SEL: f64 = 0.333_333_333_333_333_3;
 /// `DEFAULT_RANGE_INEQ_SEL`, a range bounded on both sides.
 const DEFAULT_RANGE_INEQ_SEL: f64 = 0.005;
+/// `DEFAULT_UNK_SEL`, `IS NULL` with no statistics (`IS NOT NULL` is its
+/// complement, `DEFAULT_NOT_UNK_SEL`).
+const DEFAULT_UNK_SEL: f64 = 0.005;
 
 /// An integer's key: big-endian with the sign bit flipped, so the bytes
 /// sort as the numbers do.
@@ -337,6 +340,37 @@ impl Column<'_> {
         Some(hist_selec)
     }
 
+    /// `scalararraysel` for `col = ANY (keys)` (an `IN` list of constants):
+    /// each element's `var_eq_const`, summed as disjoint when the sum is a
+    /// probability, else combined as independent (`s1 + s2 - s1 * s2`).
+    pub fn in_sel(&self, keys: &[Vec<u8>]) -> Option<f64> {
+        let (mut s1, mut disjoint) = (0.0f64, 0.0f64);
+        for key in keys {
+            let s2 = self.eq_sel(key, false)?;
+            s1 = s1 + s2 - s1 * s2;
+            disjoint += s2;
+        }
+        Some(if (0.0..=1.0).contains(&disjoint) {
+            disjoint
+        } else {
+            s1
+        })
+    }
+
+    /// `nulltestsel`: the null fraction for `IS NULL`, its complement for
+    /// `IS NOT NULL`; `DEFAULT_UNK_SEL` with no statistics.
+    pub fn null_sel(&self, is_null: bool) -> f64 {
+        let freq_null = match self.stats {
+            Some((s, _)) => f64::from(s.null_frac),
+            None => DEFAULT_UNK_SEL,
+        };
+        if is_null {
+            freq_null
+        } else {
+            1.0 - freq_null
+        }
+    }
+
     /// One clause's selectivity (`clause_selectivity`).
     pub fn clause_sel(&self, op: Op, key: &[u8]) -> Option<f64> {
         match op {
@@ -350,6 +384,12 @@ impl Column<'_> {
     }
 }
 
+/// `clauselist_selectivity_or`: the arms' selectivities combined as
+/// independent events, `s1 + s2 - s1 * s2`.
+pub fn or_sel(arms: &[f64]) -> f64 {
+    arms.iter().fold(0.0, |s1, s2| s1 + s2 - s1 * s2)
+}
+
 /// `clauselist_selectivity` over a conjunction of `(column, op, key)`
 /// clauses: each clause's selectivity multiplied in, except that a column's
 /// lower and upper bounds pair into `hi + lo - 1` (plus its null fraction,
@@ -358,10 +398,19 @@ impl Column<'_> {
 /// `DEFAULT_RANGE_INEQ_SEL`; of two bounds on one side the smaller counts.
 /// `None` when a clause's selectivity is not modelled.
 pub fn clauselist(clauses: &[(&Column, Op, Vec<u8>)]) -> Option<f64> {
-    if let [(col, op, key)] = clauses {
-        return col.clause_sel(*op, key);
+    clauselist_with(clauses, &[])
+}
+
+/// `clauselist`, with `others` -- the selectivities of clauses that are not
+/// comparisons with a constant (an `IN` list, a null test, an `OR`) --
+/// multiplied in as they are.
+pub fn clauselist_with(clauses: &[(&Column, Op, Vec<u8>)], others: &[f64]) -> Option<f64> {
+    match (clauses, others) {
+        ([(col, op, key)], []) => return col.clause_sel(*op, key),
+        ([], [only]) => return Some(*only),
+        _ => {}
     }
-    let mut s1 = 1.0;
+    let mut s1: f64 = others.iter().product();
     // (column, lobound, hibound), newest first as `addRangeClause` links
     // them.
     let mut ranges: Vec<(&Column, Option<f64>, Option<f64>)> = Vec::new();
@@ -509,5 +558,43 @@ mod tests {
             rows(g.clause_sel(Op::Eq, &int_key(3)).unwrap(), 300.0),
             28.0
         );
+    }
+
+    /// PostgreSQL 15.19's row estimates over 300 analysed rows: `g in (1, 2,
+    /// 3)` with g = (i * 7) % 11 keeps 82 (the three MCV frequencies summed);
+    /// over (g a fifth NULL, else (i * 3) % 7; h = i % 4), `g = 3 or h = 1`
+    /// keeps 101, `g is null` 60 and `g is not null` 240.
+    #[test]
+    fn in_or_and_null_tests_match_postgres() {
+        let column = |values: Vec<Sampled>| {
+            let stats = crate::hashagg::analyze_column(&values, 4);
+            (stats, scalar_slots(&values, 100))
+        };
+        fn model((stats, slots): &(ColumnStats, Slots)) -> Column<'_> {
+            Column {
+                stats: Some((*stats, slots)),
+                unique: false,
+                boolean: false,
+                numeric: true,
+                actual: None,
+                tuples: 300.0,
+            }
+        }
+        let rows = |sel: f64| crate::costsize::clamp_row_est(sel * 300.0);
+        let g = column(ints((1..=300).map(|i| (i * 7) % 11)));
+        let keys: Vec<Vec<u8>> = [1, 2, 3].iter().map(|&n| int_key(n)).collect();
+        assert_eq!(rows(model(&g).in_sel(&keys).unwrap()), 82.0);
+        let gn: Vec<Sampled> = (1..=300)
+            .map(|i| (i % 5 != 0).then(|| (int_key((i * 3) % 7), 0)))
+            .collect();
+        let gn = column(gn);
+        let h = column(ints((1..=300).map(|i| i % 4)));
+        let arms = [
+            model(&gn).clause_sel(Op::Eq, &int_key(3)).unwrap(),
+            model(&h).clause_sel(Op::Eq, &int_key(1)).unwrap(),
+        ];
+        assert_eq!(rows(or_sel(&arms)), 101.0);
+        assert_eq!(rows(model(&gn).null_sel(true)), 60.0);
+        assert_eq!(rows(model(&gn).null_sel(false)), 240.0);
     }
 }

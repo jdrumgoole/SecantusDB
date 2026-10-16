@@ -41,6 +41,9 @@ pub enum Qual {
     Range(bool),
     /// `col IN (...)` of this many non-NULL values (a `ScalarArrayOpExpr`).
     In(usize),
+    /// A clause no index serves here (an `OR`, a null test), costing this
+    /// many operators a row.
+    Filter(f64),
 }
 
 /// A WHERE's conjuncts as `(stored field, qual)`, in no particular order.
@@ -99,6 +102,7 @@ fn qual_cost<'a>(quals: impl Iterator<Item = &'a Qual>) -> f64 {
     quals
         .map(|q| match q {
             Qual::In(n) => CPU_OPERATOR_COST * *n as f64 * 0.5,
+            Qual::Filter(ops) => CPU_OPERATOR_COST * ops,
             _ => CPU_OPERATOR_COST,
         })
         .sum()
@@ -114,6 +118,7 @@ fn column_selectivity<'a>(quals: impl Iterator<Item = &'a Qual>, ndistinct: f64)
         match q {
             Qual::Eq => sel *= eq,
             Qual::Ne => sel *= 1.0 - eq,
+            Qual::Filter(_) => {}
             Qual::In(n) => sel *= (eq * *n as f64).min(1.0),
             Qual::Range(true) => lower = true,
             Qual::Range(false) => upper = true,
@@ -221,7 +226,7 @@ fn index_cost(
 ) -> Option<(f64, f64, f64)> {
     let iq: Vec<&Qual> = quals
         .iter()
-        .filter(|(f, q)| f == &index.field && !matches!(q, Qual::Ne))
+        .filter(|(f, q)| f == &index.field && !matches!(q, Qual::Ne | Qual::Filter(_)))
         .map(|(_, q)| q)
         .collect();
     if iq.is_empty() && !full {
@@ -279,6 +284,13 @@ fn bitmap_heap_cost(
 ) -> Option<(f64, f64)> {
     let (_, index_total, sel) = index_cost(rel, index, quals, colsel, false)?;
     let startup = index_total + 0.1 * CPU_OPERATOR_COST * rows;
+    Some(bitmap_heap_from(rel, startup, sel, quals))
+}
+
+/// `cost_bitmap_heap_scan` over a bitmap costing `startup` that selects
+/// `sel` of the rows: the heap pages fetched, nearer sequential the more
+/// of them, and every qual rechecked on each row.
+fn bitmap_heap_from(rel: &Rel, startup: f64, sel: f64, quals: &[(String, Qual)]) -> (f64, f64) {
     let tuples_fetched = clamp_row_est(sel * rel.tuples);
     let t = if rel.pages > 1.0 { rel.pages } else { 1.0 };
     let pages = index_pages_fetched(tuples_fetched, rel.pages);
@@ -288,7 +300,32 @@ fn bitmap_heap_cost(
         RANDOM_PAGE_COST
     };
     let cpu = (CPU_TUPLE_COST + qual_cost(quals.iter().map(|(_, q)| q))) * tuples_fetched;
-    Some((startup, startup + pages * per_page + cpu))
+    (startup, startup + pages * per_page + cpu)
+}
+
+/// One arm of a BitmapOr: its index, its quals on it, and how they are
+/// estimated.
+pub type BitmapArm<'a> = (&'a Index, Vec<(String, Qual)>, ColSel);
+
+/// A BitmapOr (`cost_bitmap_or_node`) under a bitmap heap scan: each arm a
+/// bitmap index scan on `index` over the arm's quals on it (estimated by
+/// its `ColSel`), charged a tenth of an operator for each of the `rows` the
+/// relation yields (`cost_bitmap_tree_node`); their costs add and their
+/// selectivities add, to at most 1. `quals` are the WHERE's, each rechecked
+/// on the heap. `None` when an arm has no index qual.
+pub fn bitmap_or_scan(
+    rel: &Rel,
+    arms: &[BitmapArm<'_>],
+    quals: &[(String, Qual)],
+    rows: f64,
+) -> Option<(f64, f64)> {
+    let (mut total, mut selec) = (0.0, 0.0);
+    for (index, arm, colsel) in arms {
+        let (_, index_total, sel) = index_cost(rel, index, arm, *colsel, false)?;
+        total += index_total + 0.1 * CPU_OPERATOR_COST * rows;
+        selec += sel;
+    }
+    Some(bitmap_heap_from(rel, total, f64::min(selec, 1.0), quals))
 }
 
 /// `cost_index` for a plain index scan: `(startup, total)`.
@@ -348,7 +385,7 @@ fn index_scan(
     let other = qual_cost(
         quals
             .iter()
-            .filter(|(f, q)| f != &index.field || matches!(q, Qual::Ne))
+            .filter(|(f, q)| f != &index.field || matches!(q, Qual::Ne | Qual::Filter(_)))
             .map(|(_, q)| q),
     );
     Some((

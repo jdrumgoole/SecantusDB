@@ -26,8 +26,13 @@ pub struct JoinSide {
     /// The cheapest scan to start, a sequential scan: `(startup, total)`.
     /// Kept beside `scan` under a LIMIT (`consider_startup`).
     pub startup_scan: (f64, f64),
-    /// An index scan in the join key's order, if an index leads with it.
+    /// An index scan in the join key's order, if an index leads with it
+    /// (for a join's output, its cheapest path already in that order).
     pub ordered: Option<(f64, f64)>,
+    /// The cheapest scan (`scan`) is itself in the key's order: a join's
+    /// output whose cheapest path is a merge join on that key, which a
+    /// merge join above reads without a Sort.
+    pub scan_ordered: bool,
     /// The join key is unique (a one-column primary key or unique index).
     pub unique: bool,
     /// The join key's distinct count (`get_variable_numdistinct`), and
@@ -529,8 +534,11 @@ impl JoinRel {
                     }
                 }
             };
-            if let Some(cost) = merge_join(outer, inner, false, false).filter(|_| clause) {
-                consider(cost, true, merge(false, false));
+            // `sort_inner_and_outer` sorts each side's cheapest path, unless
+            // it is in the key's order already.
+            let (os, is) = (outer.scan_ordered, inner.scan_ordered);
+            if let Some(cost) = merge_join(outer, inner, os, is).filter(|_| clause) {
+                consider(cost, true, merge(os, is));
             }
             let nest = if b_outer {
                 JoinMethod::NestOuterB
@@ -582,6 +590,26 @@ impl JoinRel {
                 consider(hash_join(o, inner), false, hash);
             }
         }
+    }
+
+    /// The cheapest path in the join key's order (a merge join's), which a
+    /// merge join above on the same key reads unsorted
+    /// (`get_cheapest_path_for_pathkeys`).
+    pub fn cheapest_keyed(&self) -> Option<JoinChoice> {
+        self.paths
+            .iter()
+            .filter(|p| p.keyed)
+            .min_by(|p, q| {
+                p.total
+                    .total_cmp(&q.total)
+                    .then(p.startup.total_cmp(&q.startup))
+            })
+            .map(|p| JoinChoice {
+                combo: p.combo,
+                method: p.method,
+                startup: p.startup,
+                total: p.total,
+            })
     }
 
     /// `set_cheapest`: the cheapest in total, a tie to the cheaper startup;
@@ -636,6 +664,7 @@ mod tests {
             scan: (0.0, 32.60),
             startup_scan: (0.0, 32.60),
             ordered: Some((0.155, 82.055)),
+            scan_ordered: false,
             unique: true,
             ndistinct: 2260.0,
             default_ndistinct: false,
@@ -782,6 +811,40 @@ mod tests {
         };
         let (s, t) = merge_join(&joined, &plain(), false, false).unwrap();
         assert!(close(s, 383.81) && close(t, 778.18), "{s} {t}");
+    }
+
+    #[test]
+    fn a_merge_join_reads_a_pair_merged_on_its_key_unsorted() {
+        // jp join jq on b = c join jn on jp.b = jn.d: one equivalence class.
+        // jp-jq merge (317.01..711.38, 25,538 rows, in key order), then a
+        // Merge Join with jn sorted outer and that pair, materialised,
+        // inner (475.52..5209.87).
+        let mut rel = JoinRel::new(false);
+        rel.add_paths(0, &plain(), &plain(), false, true);
+        let pair = rel.cheapest(None, 25538.0).unwrap();
+        assert_eq!(Some(pair), rel.cheapest_keyed());
+        let joined = JoinSide {
+            rows: 25538.0,
+            scan: (pair.startup, pair.total),
+            startup_scan: (pair.startup, pair.total),
+            ordered: Some((pair.startup, pair.total)),
+            scan_ordered: true,
+            ..plain()
+        };
+        let mut top = JoinRel::new(false);
+        top.add_paths(0, &joined, &plain(), false, true);
+        let best = top.cheapest(None, 288579.0).unwrap();
+        assert!(
+            close(best.startup, 475.52) && close(best.total, 5209.87),
+            "{best:?}"
+        );
+        assert_eq!(
+            best.method,
+            JoinMethod::MergeOuterB {
+                a_by_index: true,
+                b_by_index: false
+            }
+        );
     }
 
     #[test]

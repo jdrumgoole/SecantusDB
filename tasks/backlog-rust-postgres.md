@@ -386,7 +386,15 @@ one beside it.
   scan in the keys' order is weighed with or without a LIMIT, and the
   groups reach the hash table in the heap's order. 120 of 120 such shapes
   match 15.19 at 20 to 10,000 rows, 168 of 168 and 84 of 84 with rows
-  inserted after the ANALYZE. Not yet:
+  inserted after the ANALYZE. So do `IN` lists (`scalararraysel`), `OR`s
+  (`clauselist_selectivity_or`, with a BitmapOr path priced where each
+  arm's index quals are on one column leading one index:
+  `cost_bitmap_or_node`), `IS [NOT] NULL` (`nulltestsel`) and a measured
+  WHERE under a LIMIT, and a non-unique integer index whose duplicates
+  deduplication merges onto one leaf is sized so (`_bt_dedup_pass`):
+  144 of 144 such shapes, 72 of 72 with rows inserted after the ANALYZE,
+  and 28 of 28 deduplicated-index shapes at 300 to 3,000 rows. Not
+  yet:
   - An `OR` in the WHERE (a BitmapOr path), which keeps the HashAggregate
     unpriced (and is declined under a LIMIT); a DISTINCT with an ORDER BY,
     whose sort is not weighed; an ORDER BY with a LIMIT.
@@ -400,19 +408,24 @@ one beside it.
     another order). The size CREATE INDEX records and what ANALYZE
     stores are modelled (`__sql_relstats__`), but not REINDEX's,
     CLUSTER's or an ALTER TABLE that builds an index, nor across RENAME.
-    Declined over an analysed table, keeping the old order: a WHERE with
-    an `IN`, an `OR`, `IS NULL`, a range over a column that is not an
-    integer (a text histogram is in the reference's locale: `select g
-    from t3 where t > 'x2' group by g`), or equality on a text column
-    whose repeated values overflow the MCV list; a WHERE under a LIMIT
-    (`select g from t3 where k > 5 group by g limit 3`); a LIMIT when an
-    index leads with a group key (`select distinct g from ti limit 3`, an
-    Index Only Scan at 3,000 rows, whose cost under a LIMIT is not
-    priced); a plain index scan whose index order is not the heap's; a
+    Declined over an analysed table, keeping the old order: a range over
+    a column that is not an integer (a text histogram is in the
+    reference's locale: `select g from t3 where t > 'x2' group by g`), or
+    equality on a text column whose repeated values overflow the MCV
+    list; `NOT IN`; an `IN` list of nine or more (a hashed
+    ScalarArrayOpExpr, costed otherwise) or with a repeated value; an
+    `OR` nested in an `OR`, or whose arms share a clause or repeat
+    (`find_duplicate_ors`); a BitmapOr arm whose index quals span two
+    columns (a BitmapAnd: `select t from ti where (g = 1 and k < 100) or
+    k > 9000 group by t`) or a column that several indexes hold; a null
+    test on an indexed column (an index qual); a plain index scan whose
+    index order is not the heap's; a
     join on its columns (`eqjoinsel` over its most common
     values); a key of a type whose statistics are not modelled (dates,
     numeric, arrays); extended statistics (`CREATE STATISTICS`); a table
     of more rows than ANALYZE samples (30,000), whose sample is random.
+    A deduplicated non-unique index past one leaf keeps
+    `btree_size`'s undeduplicated estimate, as without statistics.
     VACUUM (`relallvisible`, the visibility map) is declined entirely;
     it cannot run in a transaction block, so it was not measured. A
     ROLLBACK undoes ANALYZE's `relpages` / `reltuples` here, which
@@ -445,19 +458,27 @@ one beside it.
     clause joins, then each with the third, in one `add_path` list, in the
     orders the outer joins allow; a LEFT join's hash right join returns
     the rows nothing matched in its hash table's order, two tables or
-    three (84 of 89 shapes at 20, 300 and 3,000 rows; the five left are a
-    key two clauses share and a merge right join). Not yet: two classes spanning both sides
-    (two join keys); an expression in a class; a LEFT join's class
-    through the general path; three tables with a key two clauses share
-    (one equivalence class), a WHERE over two of them, a LIMIT, or a
-    merge right join; more than three tables; an expression key with a
-    function call or a cast that costs; parameterized nested loops (an
-    index scan inner); a LIMIT with an ORDER BY, or with a WHERE over the
-    general path; a join of more than 200,000 rows a side, which streams
-    in scan order.
+    three. An inner chain whose clauses share a key is one equivalence
+    class over the three tables: every pair joins on its derived clause,
+    and a merge join reads a pair already merged on the class unsorted,
+    materialised (integer keys only). 83 of 86 shapes at 20, 300 and
+    3,000 rows; the three left are a merge right join. A chain of four
+    stored tables joined INNER, each on one column equality to a table
+    before it with no column in two clauses, runs the same search over
+    four relations (`secantus-pg/src/join_order.rs`), bushy pairs
+    included (32 of 32 shapes at 20, 300 and 3,000 rows). Not yet: two
+    classes spanning both sides (two join keys); an expression in a
+    class; a LEFT join's class through the general path; a class over
+    three tables of text or other non-integer keys; three tables with a
+    WHERE over two of them, a LIMIT, or a merge right join; four tables
+    with a LEFT join, a key two clauses share, a WHERE over two of them
+    or a LIMIT; more than four tables; an expression key with a function
+    call or a cast that costs; parameterized nested loops (an index scan inner); a LIMIT with
+    an ORDER BY, or with a WHERE over the general path; a join of more
+    than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_three_tables_on_one_equivalence_class
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_four_table_left_join_chain_joins_in_the_searched_order
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
