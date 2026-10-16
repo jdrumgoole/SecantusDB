@@ -342,10 +342,11 @@ impl<'a> Stage<'a> {
             (_, Some(scan)) => scan.keys(),
             _ => 0,
         };
+        let docs = super::exec::fetched(self.node, self.returned, &mut extra).unwrap_or(self.docs);
         Stats {
             n_returned: self.returned,
             keys,
-            docs: self.docs,
+            docs,
             extra,
             children: self.inputs.iter().map(Stage::stats).collect(),
         }

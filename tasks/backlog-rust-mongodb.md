@@ -650,18 +650,6 @@ and the unit tests of `auth.rs` and `roles.rs`. The built-in roles and the
 
 What is open:
 
-- [ ] **`rolesInfo: 1` lists stored roles by name** (2): mongod lists them
-      in the order they were created. The role table is keyed by database
-      and name and holds no sequence. **Needs a decision (2026-10-16):**
-      `table:secantus_roles` is the Python server's too, so a sequence is an
-      on-disk change it reads: a field in the record shows in its
-      `rolesInfo`, and a side table it does not write goes stale when it
-      drops and recreates a role. About two hours once decided.
-      **Decided 2026-10-16 (Joe):** a side table only the Rust server
-      writes, holding each role's creation sequence. Compatibility with the
-      Python server is no longer a constraint (`CLAUDE.md`).
-      Backlog-ID: RM-029
-      Verify: tests/backlog/test_rm_029_056.py::test_roles_info_lists_roles_in_creation_order
 - [ ] **The order of a set of roles** (5): a user's `roles` after
       `grantRolesToUser`, a role's `roles` after `grantRolesToRole`, and
       the built-in roles under `showBuiltinRoles`. mongod keeps each in a
@@ -838,16 +826,6 @@ What the probe does not reach, each found beside it:
       clipping (they agreed with mongod on everything probed).
       Backlog-ID: RM-148
       Verify: tests/backlog/test_rm_geo_residuals.py::test_line_ending_exactly_on_another_line
-- [ ] **`coarsestIndexedLevel` / `finestIndexedLevel` are refused** (197)
-      on a `2dsphere` index; mongod accepts and lists them after
-      `2dsphereIndexVersion`.
-      Backlog-ID: RM-149
-      Verify: tests/backlog/test_rm_geo_residuals.py::test_2dsphere_cell_levels_accepted_and_listed
-- [ ] **A refused index spec leaves the collection the request created.**
-      `createIndexes` on a new collection with a spec missing `name` answers
-      mongod's 9, but the collection stays; mongod leaves none.
-      Backlog-ID: RM-150
-      Verify: tests/backlog/test_rm_geo_residuals.py::test_refused_spec_leaves_no_created_collection
 
 ### 7.080 The order `find` returns documents in -- 2026-10-13
 
@@ -1053,22 +1031,19 @@ A `readConcern` with an `atClusterTime` older than the oldest timestamp is
       `fromPlanCache` (which the explain module's plan and executionStats
       could supply), and work and time counters (`cpuNanos: -1`,
       `numInterruptChecks`, `workingTimeMillis`, ...) that no plan derives.
+      Measured 2026-10-16: mongod's `metrics` has 14 fields (keysExamined,
+      docsExamined, bytesRead, readingTimeMicros, workingTimeMillis,
+      hasSortStage, usedDisk, fromMultiPlanner, fromPlanCache, cpuNanos,
+      three delinquency counters, numInterruptChecks), per batch, on find,
+      aggregate, distinct, count and getMore. This server could compute the
+      key and document counts, `hasSortStage`, the working time and
+      `cpuNanos`, but not `fromPlanCache` (no plan cache), `bytesRead` /
+      `readingTimeMicros` (no WiredTiger read statistics plumbed) or
+      `numInterruptChecks` (a different mechanism).
+      **Decided 2026-10-16 (Joe):** leave it open; no stand-in values. Build
+      it when those mechanisms exist.
       Backlog-ID: RM-170
       Verify: tests/backlog/test_rm_found_2026_10_16.py::test_include_query_stats_metrics_adds_a_metrics_document
-- [ ] **RUST MongoDB server: `distinct` over a multikey index answers from
-      the documents.** mongod answers a `distinct` its planner gives a
-      DISTINCT_SCAN (the explain module already says when) from the index
-      keys, each array key unwound once, so `[8, [9]]` gives `9` where a
-      collection scan gives `[9]`.
-      Backlog-ID: RM-171
-      Verify: tests/backlog/test_rm_found_2026_10_16.py::test_distinct_over_a_multikey_index
-- [ ] **RUST MongoDB server: `distinct` through a collated index keeps
-      `null`.** Under a collation the DISTINCT_SCAN cannot read values back
-      from the keys, so mongod fetches one document per index key, the first
-      in index order: a null key whose first document lacks the field leaves
-      `null` out. The same mechanism as RM-171.
-      Backlog-ID: RM-172
-      Verify: tests/backlog/test_rm_found_2026_10_16.py::test_distinct_through_a_collated_index_leaves_out_null
 
 ### 7.077 `update` and `findAndModify` -- 2026-10-12
 
@@ -1343,17 +1318,23 @@ is left follows from that:
       writes, the `collStats` counters and the whole-collection read above.
       Backlog-ID: RM-088
       Verify: tests/backlog/test_rm_085_112.py::test_bucket_collection_can_be_deleted_from
-- [ ] **RUST MongoDB server: smaller time-series differences.** A
-      measurement inserted with no `_id` is given one (mongod stores none;
-      storing one without would change the documents the Python server
-      reads, so it waits on that decision); a `hashed` index is refused as
-      on any collection (mongod builds it); a hint of `{_id: 1}` is refused
-      with this server's wording for an
-      unknown hint. `listCollections` puts each bucket namespace after its
-      collection and `system.views` last; mongod's order is not stable
-      between two runs of the same commands.
+- [ ] **RUST MongoDB server: a hint naming no index on a time-series
+      collection** is refused with this server's wording; mongod 8.2.11
+      refuses it from its planner, quoting the bucket namespace and its
+      rendering of the query tree (`error processing query:
+      ns=<db>.system.buckets.<coll>Tree: $and\nSort: {}\nProj: {}\nCollation:
+      { locale: "simple" }\n planner returned error :: caused by :: hint
+      provided does not correspond to an existing index`), which changes
+      with the filter. (A measurement inserted with no `_id` is now stored
+      without one, as on mongod.)
       Backlog-ID: RM-089
-      Verify: tests/backlog/test_rm_085_112.py::test_measurement_without_id_is_stored_without_one
+      Verify: tests/backlog/test_rm_085_112.py::test_an_unknown_hint_on_a_time_series_collection
+- **Scope decision — a `hashed` index on a time-series collection** is
+  refused as on any collection: hashed indexes are out of scope.
+- **Scope decision — `listCollections` order around time-series buckets.**
+  This server puts each bucket namespace after its collection and
+  `system.views` last; mongod's order is not stable between two runs of the
+  same commands, so there is none to match.
 
 ### 7.070 Collation -- 2026-10-10
 
@@ -1416,43 +1397,14 @@ What is left, there and beside it:
       data. Either way a build-time data pipeline: a decision for Joe.
       **Decided 2026-10-16 (Joe):** as RM-091: with ICU 57.1 linked, all
       five types come from its data.
+      The same ICU 57 work also settles a duplicate-key error over a
+      collated key: its key bytes are ICU4X's (`2b0105`) where mongod's are
+      ICU 57's (`290105`), and for a string inside a document this server
+      quotes the string where mongod quotes the key (this was RM-096's last
+      residual).
       Backlog-ID: RM-095
       Verify: tests/backlog/test_rm_085_112.py::test_five_collation_types_are_accepted
-- [ ] **RUST MongoDB server: smaller collation differences.** A validator
-      on an `update` reads the statement's collation, not the collection's:
-      under a collection collation of `en` strength 2, `{k: "A"}` accepts
-      `k: "a"` on mongod 8.2.11 whatever collation the statement names, and
-      this server refuses it (121) for `simple` or `fr`. A duplicate-key
-      error quoting a collated key is RM-095's, which shares its cause: the
-      key bytes are ICU4X's (`2b0105`) where mongod's are ICU 57's
-      (`290105`), and for a string inside a document this server quotes the
-      string where mongod quotes the key. (`Did you mean` for three-letter
-      codes, `$lookup` from a view with another collation, and the `$merge`
-      duplicate key now match; `zh@collation=stroke` was measured accepted
-      by both; a collated `hashed` / `text` index is refused because those
-      index types are out of scope.)
-      Backlog-ID: RM-096
-      Verify: tests/backlog/test_rm_085_112.py::test_validator_reads_the_collections_collation
-- [ ] **RUST MongoDB server: a duplicate `_id` spelled exactly the same in a
-      collection with a default collation** is reported from the plain `_id`
-      index (`index: _id_ dup key: { _id: "a" }`); mongod reports it under
-      the collation (`index: _id_ collation: { ... } dup key: ...`), as it
-      does for a second spelling. Message text only (found 2026-10-14).
-      Backlog-ID: RM-142
-      Verify: tests/backlog/test_rm_found_2026_10_14.py::test_exact_duplicate_id_under_a_default_collation_names_the_collation
 
-- [ ] **RUST MongoDB server: `$densify` with `partitionByFields` and
-      `bounds: "partition"` or explicit bounds emits partitions in the order
-      first seen.** mongod 8.2.11 sorts by the partition fields and then the
-      field, so they come out in key order (the documents and fillers are the
-      same). With explicit bounds mongod also fills each partition's tail
-      after the last document, in its partition table's hash order, which
-      varies between runs. `bounds: "full"` is transcribed from mongod's
-      `DocumentSourceInternalDensify` (`densify.rs::full_partitioned`); the
-      other two modes could run through the same state machine. Found
-      2026-10-16.
-      Backlog-ID: RM-157
-      Verify: tests/backlog/test_rm_085_112.py::test_densify_partition_bounds_emit_in_partition_order
 
 ### 7.069 A WiredTiger panic opening a store, in CI on macOS -- 2026-10-10
 
@@ -1735,15 +1687,6 @@ race on demand, which is worth having if this area changes again.
   the storage router reads it.
   Backlog-ID: RM-119
   Verify: none -- performance (router COLLSCAN); results correct and explain reports mongod's plan
-- [ ] **Regex patterns over 1000 characters are capped on both servers** (from
-  the removed "Query `$regex`" record). `crates/secantus-core/src/regexutil.rs`
-  `MAX_REGEX_PATTERN_LEN = 1000` (mirroring `secantus.query._MAX_REGEX_PATTERN_LEN`,
-  a ReDoS mitigation for Python's `re`) makes a longer pattern fail to compile
-  (`Err(())`, which defers, i.e. an error on the Rust server). mongod's own
-  limit has not been measured against it. Reproduce:
-  `find({x: {$regex: "a" * 1001}})` on each server and on mongod 8.2.11.
-  Backlog-ID: RM-120
-  Verify: tests/backlog/test_rm_113_138.py::test_regex_over_1000_characters
 - [ ] **One-time: configure a PyPI Trusted Publisher for `secantus-core`.**
   On PyPI, add a Trusted Publisher for the (new) `secantus-core` project pointing
   at `.github/workflows/rust-wheels.yml` (environment `pypi`), mirroring the
@@ -1783,22 +1726,24 @@ Rust-only driver-gauge failures that are deliberately not chased:
 
 ### 7.5 Remaining Rust-server feature gaps (defer audit, 2026-06-26)
 
-- [ ] **`$toHashedIndexKey` and the `$bitAnd` / `$bitOr` / `$bitXor` `$group`
-  ACCUMULATORS are absent on both servers.** (The bitwise *expression* forms
-  exist.) Not implementable blind: the mongod builds probed (7.0.12, and the
-  builds available when this was last checked) reject the accumulator form with
-  `15952 unknown group operator`, so there is nothing to probe against.
-  Implement only once a mongod that accepts them is installed — check
-  8.2.11 first.
-  Backlog-ID: RM-124
-  Verify: tests/backlog/test_rm_113_138.py::test_to_hashed_index_key
-- [ ] **A DBPointer operand to the `$min` / `$max` UPDATE operators
-  defers on the Rust server** (so it is an error there; mongod treats it as
-  a no-op). A DBPointer nested in a range operand already matches.
-  (`order.rs`, `bson_lt`.) DBPointer is a deprecated BSON type no supported driver
-  emits; low priority.
+- **Scope decision — `$densify` with explicit bounds fills each
+  partition's tail in first-seen order.** mongod 8.2.11 fills the tails at
+  the end in its hash table's order, which varied between runs (2026-10-16),
+  so there is no order to match; everything before the tails follows
+  mongod's `$_internalDensify` (RM-157).
+- **Scope decision — the `$bitAnd` / `$bitOr` / `$bitXor` `$group`
+  accumulators** are refused, as mongod 8.2.11 refuses them (`15952 unknown
+  group operator`, measured 2026-10-16). (`$toHashedIndexKey`, the rest of
+  what was RM-124, now hashes as mongod does.)
+- [ ] **A DBPointer `$min` / `$max` operand against a stored DBPointer
+  defers on the Rust server** (an error there; mongod compares the two by
+  namespace, then id). Against any other type a DBPointer now ranks as
+  mongod ranks it (between Regex and JavaScript). The `bson` crate keeps a
+  DBPointer's namespace and id private, so comparing two needs its raw
+  bytes. DBPointer is a deprecated BSON type no supported driver emits;
+  low priority.
   Backlog-ID: RM-127
-  Verify: tests/backlog/test_rm_113_138.py::test_dbpointer_min_update_operand
+  Verify: tests/backlog/test_rm_113_138.py::test_dbpointer_min_against_a_dbpointer
 - **Out of scope — `$group` accumulator error RE-CODING is not reproduced.**
   mongod substitutes its own code for an error raised inside a `$group`
   accumulator (`4848401` for a division by zero, `7157706` for `$ln`), where

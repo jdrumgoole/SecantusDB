@@ -34,7 +34,7 @@ def _dbpointer_doc(key: str) -> RawBSONDocument:
     return RawBSONDocument(struct.pack("<i", 4 + len(elem) + 1) + elem + b"\x00")
 
 
-@pytest.mark.backlog("RM-120")
+@pytest.mark.backlog_fixed("RM-120")
 def test_regex_over_1000_characters(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 compiles a 1001-character pattern and matches it."""
     s = "a" * 1001
@@ -62,7 +62,7 @@ def test_push_sort_over_non_sortable_elements(rust_mongo: Any, mongod: Any) -> N
     assert answers[0] == answers[1]
 
 
-@pytest.mark.backlog("RM-124")
+@pytest.mark.backlog_fixed("RM-124")
 def test_to_hashed_index_key(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 evaluates `$toHashedIndexKey`. (Its `$group` `$bitAnd` /
     `$bitOr` / `$bitXor` accumulators are still `15952 unknown group operator`
@@ -123,7 +123,29 @@ def test_dbpointer_in_range_operand(rust_mongo: Any, mongod: Any) -> None:
     assert answers[0] == answers[1]
 
 
+def _dbpointer_ns_doc(key: str, ns: str, with_id: bool = False) -> RawBSONDocument:
+    """`{[_id: 1,] key: DBPointer(ns, <oid>)}` for a namespace of the caller's
+    choice."""
+    raw_ns = ns.encode() + b"\x00"
+    oid = ObjectId("5f0000000000000000000001").binary
+    elems = (b"\x10_id\x00" + struct.pack("<i", 1)) if with_id else b""
+    elems += b"\x0c" + key.encode() + b"\x00" + struct.pack("<i", len(raw_ns)) + raw_ns + oid
+    return RawBSONDocument(struct.pack("<i", 4 + len(elems) + 1) + elems + b"\x00")
+
+
 @pytest.mark.backlog("RM-127")
+def test_dbpointer_min_against_a_dbpointer(rust_mongo: Any, mongod: Any) -> None:
+    """`$min` of one DBPointer over another: mongod compares them (by
+    namespace, then id) and writes the smaller."""
+    answers = []
+    for c in _both(rust_mongo, mongod, "rm127c"):
+        c.insert_one(_dbpointer_ns_doc("a", "db.z", with_id=True))
+        upd = {"$min": _dbpointer_ns_doc("a", "db.b")}
+        answers.append(mongo_answer(lambda c=c, u=upd: c.update_one({"_id": 1}, u).modified_count))
+    assert answers[0] == answers[1]
+
+
+@pytest.mark.backlog_fixed("RM-127")
 def test_dbpointer_min_update_operand(rust_mongo: Any, mongod: Any) -> None:
     """`$min` with a DBPointer operand: mongod compares it and updates."""
     answers = []

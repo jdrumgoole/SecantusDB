@@ -48,6 +48,7 @@ mod explain;
 pub mod expr_rewrite;
 mod fill;
 mod group;
+mod hashed;
 mod numeric;
 pub mod order;
 mod paths;

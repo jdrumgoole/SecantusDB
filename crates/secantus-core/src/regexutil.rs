@@ -15,13 +15,27 @@
 use bson::Bson;
 use regex::{Regex as LinearRegex, RegexBuilder};
 
-/// Hard cap on user-supplied regex pattern length, mirroring
-/// `secantus.query._MAX_REGEX_PATTERN_LEN` / the `$regex*` expression cap.
-pub(crate) const MAX_REGEX_PATTERN_LEN: usize = 1000;
+/// The longest pattern mongod compiles, in UTF-8 BYTES: mongod 8.2.11 sets
+/// PCRE2's maximum pattern length, so 32,764 bytes compile and 32,765 are
+/// `51091 Regular expression is invalid: pattern string is longer than the
+/// limit set by the application` (measured 2026-10-16, with ASCII and with
+/// two-byte characters, and with every `$options` flag). The 1,000 that stood
+/// here was a ReDoS cap for Python's backtracking `re`, not mongod's limit.
+pub(crate) const MAX_REGEX_PATTERN_LEN: usize = 32_764;
+
+/// PCRE2's message for a pattern over [`MAX_REGEX_PATTERN_LEN`].
+pub(crate) const PATTERN_TOO_LONG: &str =
+    "pattern string is longer than the limit set by the application";
 
 /// A compiled regex from whichever engine could build it. Both run unanchored
 /// (`re.search`) semantics.
 pub(crate) enum CompiledRegex {
+    /// A pattern with no metacharacters, searched as a substring. The linear
+    /// engine's lazy DFA gives up on a long pattern and its PikeVM fallback
+    /// is O(pattern x subject): a 32,764-character literal over a 40,000-
+    /// character string took 70 s in a debug build. A substring search is
+    /// linear, and a literal matches the same text either way.
+    Literal(String),
     Linear(LinearRegex),
     Fancy(fancy_regex::Regex),
 }
@@ -38,6 +52,7 @@ pub(crate) struct RegexMatch {
 impl CompiledRegex {
     pub(crate) fn is_match(&self, s: &str) -> bool {
         match self {
+            CompiledRegex::Literal(lit) => s.contains(lit.as_str()),
             CompiledRegex::Linear(re) => re.is_match(s),
             // fancy-regex's is_match is fallible (e.g. backtrack-limit hit); a
             // failure is treated as no-match to stay sound (never over-match).
@@ -49,6 +64,9 @@ impl CompiledRegex {
     /// backtrack-limit error from the fancy engine).
     pub(crate) fn find_first(&self, s: &str) -> Result<Option<RegexMatch>, ()> {
         match self {
+            CompiledRegex::Literal(lit) => {
+                Ok(s.find(lit.as_str()).map(|at| literal_match(s, lit, at)))
+            }
             CompiledRegex::Linear(re) => Ok(re.captures(s).map(|c| to_match(s, &c))),
             CompiledRegex::Fancy(re) => match re.captures(s) {
                 Ok(Some(c)) => Ok(Some(to_match_fancy(s, &c))),
@@ -62,6 +80,10 @@ impl CompiledRegex {
     /// → defer (a backtrack-limit error from the fancy engine).
     pub(crate) fn find_all(&self, s: &str) -> Result<Vec<RegexMatch>, ()> {
         match self {
+            CompiledRegex::Literal(lit) => Ok(s
+                .match_indices(lit.as_str())
+                .map(|(at, _)| literal_match(s, lit, at))
+                .collect()),
             CompiledRegex::Linear(re) => Ok(re.captures_iter(s).map(|c| to_match(s, &c)).collect()),
             CompiledRegex::Fancy(re) => {
                 let mut out = Vec::new();
@@ -72,6 +94,21 @@ impl CompiledRegex {
             }
         }
     }
+}
+
+/// A [`CompiledRegex::Literal`] hit at byte offset `at`: no capture groups.
+fn literal_match(s: &str, lit: &str, at: usize) -> RegexMatch {
+    RegexMatch {
+        text: lit.to_string(),
+        codepoint_idx: s[..at].chars().count(),
+        captures: Vec::new(),
+    }
+}
+
+/// Whether `pat`, under no flag that changes how a literal matches, is a plain
+/// string: non-empty and free of every character PCRE gives a meaning to.
+fn plain_literal(pat: &str, ci: bool, ext: bool) -> bool {
+    !ci && !ext && !pat.is_empty() && !pat.chars().any(|c| "\\.+*?()|[]{}^$".contains(c))
 }
 
 /// Build one `RegexMatch` from a linear-engine capture set. Group 0 is the whole
@@ -134,6 +171,9 @@ pub(crate) fn compile(pattern: &Bson, options: Option<&Bson>) -> Result<Compiled
     // PCRE's end anchors assert "end, or before a final newline"; the linear
     // engine has no lookahead to say that, so a pattern using them goes to the
     // backtracking engine with the anchor spelled out.
+    if plain_literal(pat, ci, ext) {
+        return Ok(CompiledRegex::Literal(pat.to_string()));
+    }
     let rewritten = pcre_end_anchors(pat, ml);
     let pat: &str = rewritten.as_deref().unwrap_or(pat);
     // Fast path: the linear engine handles almost every pattern -- but not a
@@ -172,6 +212,10 @@ pub(crate) fn compile(pattern: &Bson, options: Option<&Bson>) -> Result<Compiled
 /// expression is invalid: <message>`. Scans left to right as PCRE does, so the
 /// first fault wins. `None` when none of these applies.
 pub(crate) fn pcre_compile_error(pat: &str) -> Option<String> {
+    // PCRE2 checks the length before it parses anything.
+    if pat.len() > MAX_REGEX_PATTERN_LEN {
+        return Some(PATTERN_TOO_LONG.to_string());
+    }
     let chars: Vec<char> = pat.chars().collect();
     let mut depth = 0usize;
     let mut names: Vec<String> = Vec::new();
@@ -586,5 +630,43 @@ mod pcre_error_tests {
         ] {
             assert_eq!(pcre_compile_error(ok), None, "{ok}");
         }
+    }
+}
+
+#[cfg(test)]
+mod length_and_literal_tests {
+    use super::*;
+
+    /// mongod 8.2.11: 32,764 bytes compile, 32,765 do not -- counted in
+    /// UTF-8 bytes, not characters.
+    #[test]
+    fn the_length_limit_is_mongods() {
+        let ok = Bson::String("a".repeat(32_764));
+        assert!(compile(&ok, None).is_ok());
+        let long = "a".repeat(32_765);
+        assert!(compile(&Bson::String(long.clone()), None).is_err());
+        assert_eq!(pcre_compile_error(&long).as_deref(), Some(PATTERN_TOO_LONG));
+        let wide = "\u{e9}".repeat(16_383); // 32,766 bytes
+        assert_eq!(pcre_compile_error(&wide).as_deref(), Some(PATTERN_TOO_LONG));
+        assert_eq!(pcre_compile_error(&"\u{e9}".repeat(16_382)), None);
+    }
+
+    #[test]
+    fn a_long_literal_is_a_substring_search() {
+        let re = compile(&Bson::String("a".repeat(32_764)), None).unwrap();
+        assert!(matches!(re, CompiledRegex::Literal(_)));
+        assert!(re.is_match(&"a".repeat(40_000)));
+        assert!(!re.is_match(&"a".repeat(32_763)));
+        let ab = compile(&Bson::String("ab".into()), None).unwrap();
+        let all = ab.find_all("xabab\u{e9}ab").unwrap();
+        let idx: Vec<usize> = all.iter().map(|m| m.codepoint_idx).collect();
+        assert_eq!(idx, vec![1, 3, 6]);
+        // A flag or a metacharacter keeps the regex engine.
+        let ci = compile(&Bson::String("ab".into()), Some(&Bson::String("i".into()))).unwrap();
+        assert!(ci.is_match("AB"));
+        assert!(!matches!(
+            compile(&Bson::String("a.b".into()), None).unwrap(),
+            CompiledRegex::Literal(_)
+        ));
     }
 }

@@ -289,6 +289,26 @@ def test_a_field_changing_type_rolls_the_bucket_over(rust_mongo: Any, mongod: An
 
 
 @pytest.mark.backlog("RM-089")
+def test_an_unknown_hint_on_a_time_series_collection(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 refuses a hint naming no index on a time-series
+    collection (even `{_id: 1}`, which the buckets do not have) from its
+    planner, quoting the bucket namespace and the query tree: `error
+    processing query: ns=<db>.system.buckets.<coll>Tree: $and ... planner
+    returned error :: caused by :: hint provided does not correspond to an
+    existing index`."""
+
+    def probe(client: Any) -> Any:
+        db = client[_name("rm089h")]
+        db.create_collection("ts", timeseries={"timeField": "t"})
+        db.ts.insert_one({"t": bson.datetime.datetime(2024, 1, 1), "v": 1})
+        got = mongo_answer(lambda: list(db.ts.find({}).hint({"_id": 1})))
+        return got[:2] + (str(got[2]).replace(db.name, "@db"),) if got[0] == "err" else got
+
+    got, ref = _both(rust_mongo, mongod, probe)
+    assert got == ref
+
+
+@pytest.mark.backlog_fixed("RM-089")
 def test_measurement_without_id_is_stored_without_one(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11: a measurement inserted with no `_id` reads back with none."""
 
@@ -463,7 +483,7 @@ def test_densify_full_partitions_fill_the_whole_range(rust_mongo: Any, mongod: A
     assert got == ref
 
 
-@pytest.mark.backlog("RM-157")
+@pytest.mark.backlog_fixed("RM-157")
 def test_densify_partition_bounds_emit_in_partition_order(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 (2026-10-16): `$densify` with `bounds: "partition"`
     sorts by the partition fields and then the field, so the partitions come
@@ -766,7 +786,7 @@ def test_coll_mod_capped_size_event_names_fields_as_sent(rust_mongo: Any, mongod
     assert got == ref
 
 
-@pytest.mark.backlog("RM-096")
+@pytest.mark.backlog_fixed("RM-096")
 def test_validator_reads_the_collections_collation(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 checks a collation-sensitive validator under the
     COLLECTION's collation, whatever collation the update statement names:

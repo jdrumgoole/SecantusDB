@@ -17,6 +17,7 @@
 
 mod bounds;
 mod deps;
+pub(crate) mod distinct;
 mod exec;
 pub(crate) mod geo;
 pub(crate) mod hoist;
@@ -492,7 +493,7 @@ fn plan_for(
     let node = match &s.kind {
         Kind::Find => plan::plan(&q, &t.catalog),
         Kind::Count => plan::count(&q, &t.catalog),
-        Kind::Distinct(key) => plan::distinct(&q, &t.catalog, key),
+        Kind::Distinct(key) => plan::distinct(&q, &t.catalog, key, !s.filter.is_empty()),
         Kind::Update {
             upsert, returns, ..
         } => plan::write(&q, &t.catalog, false, false, *upsert, *returns),
@@ -601,12 +602,25 @@ fn distinct_group(
     asked.sort = None;
     asked.projection = None;
     let (node, ranked) = plan_for(&asked, canonical, collation, t, ctx)?;
-    let Node::Projection { input, .. } = node else {
+    // A scan through a collated index fetches (`plan::distinct`).
+    let scan = match node {
+        Node::Projection { input, .. } => *input,
+        other => other,
+    };
+    let Node::DistinctScan(mut ix, width, scan_fetches) = scan else {
         return Ok(None);
     };
-    let Node::DistinctScan(mut ix, width, _) = *input else {
+    // Its keys are an array's elements, where `$group` wants the arrays
+    // (measured 8.2.11, 2026-10-16: a multikey field is grouped without one).
+    if ix
+        .index
+        .multikey_paths
+        .get(width - 1)
+        .is_some_and(|p| !p.is_empty())
+    {
         return Ok(None);
-    };
+    }
+    fetching |= scan_fetches;
     ix.backward = backward;
     let scan = Node::DistinctScan(ix, width, fetching);
     let plan = if fetching {

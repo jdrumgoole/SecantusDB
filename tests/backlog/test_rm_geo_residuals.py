@@ -39,7 +39,7 @@ def test_line_ending_exactly_on_another_line(rust_mongo: Any) -> None:
     assert got == ("ok", [])
 
 
-@pytest.mark.backlog("RM-149")
+@pytest.mark.backlog_fixed("RM-149")
 def test_2dsphere_cell_levels_accepted_and_listed(rust_mongo: Any) -> None:
     """mongod 8.2.11 builds a `2dsphere` index with `coarsestIndexedLevel`
     and `finestIndexedLevel`, and lists both after the index version."""
@@ -66,7 +66,7 @@ def test_2dsphere_cell_levels_accepted_and_listed(rust_mongo: Any) -> None:
     ]
 
 
-@pytest.mark.backlog("RM-150")
+@pytest.mark.backlog_fixed("RM-150")
 def test_refused_spec_leaves_no_created_collection(rust_mongo: Any) -> None:
     """mongod 8.2.11: a `createIndexes` refused because a spec has no name
     creates nothing, neither the collection it would have created nor the
@@ -81,3 +81,34 @@ def test_refused_spec_leaves_no_created_collection(rust_mongo: Any) -> None:
         "required property of an index specification",
     )
     assert "n" not in db.list_collection_names()
+
+
+def _level_answers(client: Any) -> list:
+    db = _fresh(client, "rmgeo_v")
+    out = []
+    for i, extra in enumerate(
+        [
+            {"finestIndexedLevel": 31},
+            {"coarsestIndexedLevel": -1},
+            {"coarsestIndexedLevel": 5, "finestIndexedLevel": 3},
+            {"finestIndexedLevel": "x"},
+            {"finestIndexedLevel": 5.5},
+            {"finestIndexedLevel": 1},
+            {"finestIndexedLevel": 2},
+        ]
+    ):
+        spec = {"key": {"loc": "2dsphere"}, "name": f"s{i}", **extra}
+        out.append(
+            mongo_answer(
+                lambda s=spec, i=i: db.command("createIndexes", f"c{i}", indexes=[s])["ok"]
+            )
+        )
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-149")
+def test_2dsphere_cell_levels_are_checked(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 refuses a finest level over 30 (16748), a coarsest
+    below 0 (16747), finest below coarsest (16749, the default coarsest being
+    2), a non-number (14) and a fraction (2)."""
+    assert _level_answers(rust_mongo) == _level_answers(mongod)

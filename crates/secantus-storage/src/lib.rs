@@ -1336,6 +1336,12 @@ const OPLOG_META_TABLE: &str = "table:secantus_oplog_meta";
 // their shape), stored / returned verbatim across the byte seam.
 const USERS_TABLE: &str = "table:secantus_users";
 const ROLES_TABLE: &str = "table:secantus_roles";
+/// `(db, role) -> creation sequence`, written only by the Rust server
+/// (RM-029, as Joe decided on 2026-10-16): mongod's `rolesInfo` lists roles
+/// in the order they were created, and the role table, which the Python
+/// server shares, is keyed by name. A role with no row (created before this,
+/// or by the Python server) counts as 0 and keeps name order.
+const ROLE_SEQ_TABLE: &str = "table:secantus_role_seq";
 const PROFILE_TABLE: &str = "table:secantus_profile_settings";
 
 /// The synthetic `_id` index name. The `_id_` index is virtual — never stored
@@ -1909,6 +1915,7 @@ const BOOTSTRAP: &[(&str, &str)] = &[
     ("table:secantus_oplog_meta", "key_format=S,value_format=u"),
     ("table:secantus_users", "key_format=SS,value_format=u"),
     ("table:secantus_roles", "key_format=SS,value_format=u"),
+    (ROLE_SEQ_TABLE, "key_format=SS,value_format=q"),
     (
         "table:secantus_profile_settings",
         "key_format=S,value_format=u",
@@ -9624,8 +9631,10 @@ impl Storage {
                     }
                     // A profile entry is stored as written, with no `_id`:
                     // mongod's `system.profile` has no `_id` index. The id
-                    // minted above only keys the row.
-                    let unkeyed = assigned_id && coll == PROFILE_COLLECTION;
+                    // minted above only keys the row. So is a time-series
+                    // measurement inserted with none: mongod stores it
+                    // without one (RM-089, measured 8.2.11).
+                    let unkeyed = assigned_id && (coll == PROFILE_COLLECTION || timeseries);
                     let id = doc.get("_id").expect("_id present").clone();
                     let mut key = id_key(&id)?;
                     // Timeseries: suffix the doc-table key so duplicate `_id`s coexist.
@@ -9721,11 +9730,52 @@ impl Storage {
                                 errmsg = errmsg.replacen(" index: _id_ ", " ", 1);
                                 errmsg.push_str(" found value: {}");
                             }
+                            // Under a default collation mongod reports even an
+                            // exact duplicate from the collated `_id` claim, as
+                            // it does a second spelling: the same message,
+                            // `keyValue` and extra fields (RM-142, measured 8.2.11).
+                            let mut id_conflict: Option<UniqueConflict> = None;
+                            if let Some(claim) = self.id_claim_desc(&session, db, coll)? {
+                                let kb = index_key_variants_c(
+                                    &doc,
+                                    &claim.key_spec,
+                                    false,
+                                    claim.collation.as_ref(),
+                                )?
+                                .into_iter()
+                                .next();
+                                if let Some(kb) = kb {
+                                    let conflict = UniqueConflict::new(
+                                        ns.clone(),
+                                        &claim.name,
+                                        &claim.key_spec,
+                                        &doc,
+                                        &kb,
+                                        claim.collation.as_ref(),
+                                    )
+                                    .on_clustered(claim.clustered);
+                                    errmsg = conflict.errmsg();
+                                    id_conflict = Some(conflict);
+                                }
+                            }
                             ed.insert("errmsg", errmsg);
                             ed.insert("keyPattern", Bson::Document(key_pattern));
-                            ed.insert("keyValue", Bson::Document(key_value));
-                            if clustered {
-                                ed.insert("foundValue", Document::new());
+                            match id_conflict {
+                                Some(conflict) => {
+                                    ed.insert(
+                                        "keyValue",
+                                        Bson::Document(conflict.key_value.clone()),
+                                    );
+                                    if let Some(extra) = conflict.extra() {
+                                        ed.extend(extra);
+                                    }
+                                }
+                                None => {
+                                    ed.insert("keyValue", Bson::Document(key_value));
+                                    if clustered {
+                                        ed.insert("foundValue", Document::new());
+                                    }
+                                }
                             }
                             errors.push(ed);
                             if ordered {
@@ -11262,7 +11312,30 @@ impl Storage {
     /// Persist a custom-role record (opaque BSON blob). Mirrors
     /// `storage.add_role`.
     pub fn add_role(&self, db: &str, name: &str, record: &[u8], replace: bool) -> Result<bool> {
-        self.put_ss_record(ROLES_TABLE, db, name, record, replace)
+        let existed = self.get_ss_record(ROLES_TABLE, db, name)?.is_some();
+        let written = self.put_ss_record(ROLES_TABLE, db, name, record, replace)?;
+        if written && !existed {
+            self.stamp_role_seq(db, name)?;
+        }
+        Ok(written)
+    }
+
+    /// Give a newly created role the next creation sequence.
+    fn stamp_role_seq(&self, db: &str, name: &str) -> Result<()> {
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(ROLE_SEQ_TABLE, None)?;
+        let mut last = 0i64;
+        let mut more = cur.next()?;
+        while more {
+            last = last.max(cur.get_value_q()?);
+            more = cur.next()?;
+        }
+        let put = session.open_cursor(ROLE_SEQ_TABLE, None)?;
+        put.set_key_ss(db, name);
+        put.set_value_q(last + 1);
+        put.insert()?;
+        Ok(())
     }
 
     /// Fetch a custom-role record (BSON blob) or `None`. Mirrors
@@ -11274,13 +11347,53 @@ impl Storage {
     /// Delete a custom role. Returns `false` if absent. Mirrors
     /// `storage.drop_role`.
     pub fn drop_role(&self, db: &str, name: &str) -> Result<bool> {
+        self.drop_ss_record(ROLE_SEQ_TABLE, db, name)?;
         self.drop_ss_record(ROLES_TABLE, db, name)
     }
 
     /// Paginated custom-role listing (`db = None` spans every database).
     /// Mirrors `storage.list_roles`.
+    ///
+    /// In creation order (RM-029), then database and name.
     pub fn list_roles(&self, db: Option<&str>, skip: usize, limit: usize) -> Result<Vec<Vec<u8>>> {
-        self.list_ss_records(ROLES_TABLE, db, skip, limit)
+        let limit = if limit == 0 || limit > 1000 {
+            1000
+        } else {
+            limit
+        };
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let session = self.conn.open_session()?;
+        let mut seqs: HashMap<(String, String), i64> = HashMap::new();
+        let sc = session.open_cursor(ROLE_SEQ_TABLE, None)?;
+        let mut more = sc.next()?;
+        while more {
+            seqs.insert(sc.get_key_ss()?, sc.get_value_q()?);
+            more = sc.next()?;
+        }
+        let cur = session.open_cursor(ROLES_TABLE, None)?;
+        let mut rows: Vec<(i64, String, String, Vec<u8>)> = Vec::new();
+        let mut more = cur.next()?;
+        while more {
+            let (row_db, row_name) = cur.get_key_ss()?;
+            if db.is_none() || db == Some(row_db.as_str()) {
+                let blob = cur.get_value_u()?;
+                if !blob.is_empty() {
+                    let seq = seqs
+                        .get(&(row_db.clone(), row_name.clone()))
+                        .copied()
+                        .unwrap_or(0);
+                    rows.push((seq, row_db, row_name, blob));
+                }
+            }
+            more = cur.next()?;
+        }
+        rows.sort_by(|a, b| (a.0, &a.1, &a.2).cmp(&(b.0, &b.1, &b.2)));
+        Ok(rows
+            .into_iter()
+            .skip(skip)
+            .take(limit)
+            .map(|r| r.3)
+            .collect())
     }
 
     /// The active profile settings for `db` (`{level, slowms, sampleRate}`),
@@ -16455,12 +16568,12 @@ impl Storage {
                 continue;
             }
             if let Some(v) = validator {
-                let new_ok = query_matches(&new, v, &Document::new(), None).unwrap_or(true);
+                let new_ok = validator_holds(session, db, coll, &new, v)?;
                 // `moderate` exempts a doc that ALREADY failed the validator
                 // before this update; one that currently satisfies it is still
                 // held to it, so an update cannot break a valid doc.
-                let was_already_invalid = validator_moderate
-                    && !query_matches(&doc, v, &Document::new(), None).unwrap_or(true);
+                let was_already_invalid =
+                    validator_moderate && !validator_holds(session, db, coll, &doc, v)?;
                 if !new_ok && !was_already_invalid {
                     stopped = Some(StorageError::DocumentValidationFailure(Box::new(new)));
                     break;
@@ -16620,11 +16733,10 @@ impl Storage {
                         // validator the query engine can't evaluate is treated as
                         // passing (lenient), matching the insert path.
                         if let Some(v) = validator {
-                            let new_ok =
-                                query_matches(&new, v, &Document::new(), None).unwrap_or(true);
+                            let new_ok = validator_holds(&session, db, coll, &new, v)?;
                             // `moderate`: see the sibling update site above.
                             let was_already_invalid = validator_moderate
-                                && !query_matches(&doc, v, &Document::new(), None).unwrap_or(true);
+                                && !validator_holds(&session, db, coll, &doc, v)?;
                             if !new_ok && !was_already_invalid {
                                 return Err(StorageError::DocumentValidationFailure(Box::new(new)));
                             }
@@ -16827,7 +16939,7 @@ impl Storage {
                     }
                     // Validator on an upsert-inserted document, too.
                     if let Some(v) = validator {
-                        if !query_matches(&new, v, &Document::new(), None).unwrap_or(true) {
+                        if !validator_holds(&session, db, coll, &new, v)? {
                             return Err(StorageError::DocumentValidationFailure(Box::new(new)));
                         }
                     }
@@ -19422,6 +19534,23 @@ fn ensure_collection(
 /// The collection's default collation, when it has one that is not `simple`.
 /// Read on every write, so the options are only decoded when the stored bytes
 /// name a collation at all.
+/// Whether `doc` satisfies the collection `validator`, compared under the
+/// COLLECTION's default collation whatever collation the statement names
+/// (RM-096, measured 8.2.11: under `en` strength 2, `{k: "A"}` accepts
+/// `k: "a"` for an update that names `simple`). A validator the query engine
+/// cannot evaluate passes, as on the insert path.
+fn validator_holds(
+    session: &Session,
+    db: &str,
+    coll: &str,
+    doc: &Document,
+    validator: &Document,
+) -> Result<bool> {
+    let own = default_collation(session, db, coll)?.map(|(c, _)| c);
+    let _active = secantus_core::collation::activate(own.as_ref());
+    Ok(query_matches(doc, validator, &Document::new(), None).unwrap_or(true))
+}
+
 fn default_collation(session: &Session, db: &str, coll: &str) -> Result<Option<(Collation, bool)>> {
     let Some(blob) = coll_options_raw(session, db, coll)? else {
         return Ok(None);

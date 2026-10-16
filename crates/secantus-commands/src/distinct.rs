@@ -140,7 +140,7 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // A view has no rows of its own: its documents are its pipeline's output
     // over the collection it is defined on. Reading the view's own (empty)
     // storage answered `[]` for every `distinct` on a view.
-    let documents: Vec<Document> = if on_view {
+    let mut values: Vec<Bson> = if on_view {
         crate::views::check_hint(storage, &ctx.db_name, &coll, hint)?;
         if crate::notablescan::enabled(ctx) {
             // The view's pipeline, then the query: what mongod plans.
@@ -163,13 +163,16 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 },
             )?;
         }
-        crate::aggregate::collection_documents(
-            storage,
-            &ctx.db_name,
-            &coll,
-            &filter,
-            collation.as_ref(),
-        )?
+        document_values(
+            &crate::aggregate::collection_documents(
+                storage,
+                &ctx.db_name,
+                &coll,
+                &filter,
+                collation.as_ref(),
+            )?,
+            &key,
+        )
     } else {
         crate::notablescan::check(
             ctx,
@@ -192,36 +195,32 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             limit: 0,
             asked: Default::default(),
         };
-        let bytes = crate::explain::order::find(storage, &ask).map_err(|e| {
+        let read_error = |e| {
             crate::util::read_error_on_namespace(e, "distinct", &format!("{}.{coll}", ctx.db_name))
-        })?;
+        };
+        // A plan that is a DISTINCT_SCAN answers from the index's keys.
+        let scanned =
+            crate::explain::distinct::scan_values(storage, &ask, &key).map_err(read_error)?;
+        let values = match scanned {
+            Some(values) => values,
+            None => {
+                let bytes = crate::explain::order::find(storage, &ask).map_err(read_error)?;
+                let mut decoded = Vec::with_capacity(bytes.len());
+                for b in bytes {
+                    decoded.push(secantus_core::bsondoc::from_bytes(b.as_slice()).map_err(
+                        |e| CommandError::new(1, "InternalError", format!("decode: {e}")),
+                    )?);
+                }
+                document_values(&decoded, &key)
+            }
+        };
         crate::explain::order::count_index_use(
             storage,
             &ask,
             crate::explain::order::Uses::Distinct(&key),
         );
-        let mut decoded = Vec::with_capacity(bytes.len());
-        for b in bytes {
-            decoded.push(
-                secantus_core::bsondoc::from_bytes(b.as_slice())
-                    .map_err(|e| CommandError::new(1, "InternalError", format!("decode: {e}")))?,
-            );
-        }
-        decoded
+        values
     };
-
-    // Every value the key reaches, through arrays of documents on the way and
-    // one level into an array at the end.
-    let mut values: Vec<Bson> = Vec::new();
-    for d in &documents {
-        let (found, _) = secantus_core::get_path_values(d, &key);
-        for v in found {
-            match v {
-                Bson::Array(arr) => values.extend(arr.iter().cloned()),
-                other => values.push(other.clone()),
-            }
-        }
-    }
     // mongod answers the distinct values in BSON sort order, and "distinct"
     // is BSON equality: 1, 1.0 and a Decimal128 1.0 are one value, as are 0
     // and -0.0, and two strings the collation holds equal. The first one met
@@ -237,4 +236,20 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         return Ok(doc! { "values": values, "ok": 1_i32 });
     }
     Ok(doc! { "values": values, "ok": 1.0 })
+}
+
+/// Every value `key` reaches in `documents`, through arrays of documents on
+/// the way and one level into an array at the end.
+fn document_values(documents: &[Document], key: &str) -> Vec<Bson> {
+    let mut values: Vec<Bson> = Vec::new();
+    for d in documents {
+        let (found, _) = secantus_core::get_path_values(d, key);
+        for v in found {
+            match v {
+                Bson::Array(arr) => values.extend(arr.iter().cloned()),
+                other => values.push(other.clone()),
+            }
+        }
+    }
+    values
 }

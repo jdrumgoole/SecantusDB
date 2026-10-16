@@ -47,7 +47,7 @@ def _distinct_multikey(client: Any) -> Any:
     return mongo_answer(lambda: db.command("distinct", "m", key="a")["values"])
 
 
-@pytest.mark.backlog("RM-171")
+@pytest.mark.backlog_fixed("RM-171")
 def test_distinct_over_a_multikey_index(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 answers a `distinct` with no query over a multikey index
     from a DISTINCT_SCAN of the index keys, so a value nested as `[8, [9]]`
@@ -74,7 +74,7 @@ def _distinct_collated(client: Any) -> Any:
     return mongo_answer(lambda: db.command("distinct", "c", key="s", collation=collation)["values"])
 
 
-@pytest.mark.backlog("RM-172")
+@pytest.mark.backlog_fixed("RM-172")
 def test_distinct_through_a_collated_index_leaves_out_null(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 answers a `distinct` under the collation of an index on
     the key from a fetching DISTINCT_SCAN: one document per index key, the
