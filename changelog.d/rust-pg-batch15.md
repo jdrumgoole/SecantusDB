@@ -18,3 +18,25 @@ More of the Rust PostgreSQL server's backlog, measured against PostgreSQL
   with them in their key's place (`ExecMergeJoin`'s inner fill), which
   three-table plans use too. Part of RP-028
   (tests/backlog/test_rust_postgres_gaps.py::test_four_table_left_join_chain_joins_in_the_searched_order).
+
+- **More WHERE clauses over an ANALYZEd table, and VACUUM, follow
+  PostgreSQL's plan.**
+  - `NOT IN` (`scalararraysel` over `<> ALL`) and an `IN` list of nine or
+    more values, which PostgreSQL hashes and costs differently, now
+    estimate and cost as PostgreSQL does. So does a list with a repeated
+    value.
+  - An `OR` is canonicalized as PostgreSQL does (`pull_ors`,
+    `process_duplicate_ors`).
+  - A null test on an indexed column is an index qual.
+  - Every bitmap path, BitmapOrs included, goes to one
+    `choose_bitmap_and`, so a BitmapAnd is chosen where PostgreSQL chooses
+    one.
+  - A plain index scan hands the HashAggregate its rows in the index's
+    order.
+  - VACUUM now records `relpages`, `reltuples` and `relallvisible`, and a
+    later ANALYZE or CREATE INDEX records the visibility map's count. An
+    index scan that reads only the index's columns is then costed
+    index-only, skipping the all-visible pages.
+
+  Part of RP-028
+  (tests/backlog/test_rust_postgres_gaps.py::test_vacuum_makes_a_distinct_read_the_index_only).

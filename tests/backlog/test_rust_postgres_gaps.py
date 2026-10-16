@@ -1500,6 +1500,144 @@ def test_bitmap_or_over_an_analyzed_table_is_priced(pg: Any) -> None:
 
 
 @pytest.mark.backlog_fixed("RP-028")
+def test_not_in_over_an_analyzed_table_excludes_each_value(pg: Any) -> None:
+    """PostgreSQL 15.19: `g not in (1, 2, 3)` over 300 analysed rows is
+    `<> ALL`, each value's exclusion summed (`scalararraysel`), 218 rows;
+    the 6 groups of t come out x2 x0 x3 x5 x4 x1."""
+    got = _analyzed(
+        pg,
+        "rp028_ci",
+        [
+            "create table rp028_ci (k int primary key, g int, t text)",
+            "insert into rp028_ci select i, (i * 7) % 11, 'x' || (i % 6)"
+            " from generate_series(1, 300) i",
+            "analyze rp028_ci",
+        ],
+        "select t from rp028_ci where g not in (1, 2, 3) group by t",
+    )
+    assert got == ("ok", [(t,) for t in ["x2", "x0", "x3", "x5", "x4", "x1"]])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_hashed_in_list_over_an_analyzed_table(pg: Any) -> None:
+    """PostgreSQL 15.19: an `IN` list of nine values is a hashed
+    ScalarArrayOpExpr, with a startup of one hash a value; 245 rows, and
+    the groups of t come out x2 x0 x3 x5 x4 x1."""
+    got = _analyzed(
+        pg,
+        "rp028_ci",
+        [
+            "create table rp028_ci (k int primary key, g int, t text)",
+            "insert into rp028_ci select i, (i * 7) % 11, 'x' || (i % 6)"
+            " from generate_series(1, 300) i",
+            "analyze rp028_ci",
+        ],
+        "select t from rp028_ci where g in (0, 1, 2, 3, 4, 5, 6, 7, 8) group by t",
+    )
+    assert got == ("ok", [(t,) for t in ["x2", "x0", "x3", "x5", "x4", "x1"]])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_in_list_with_a_repeated_value_counts_it_twice(pg: Any) -> None:
+    """PostgreSQL 15.19: `g in (1, 1, 2)` sums all three elements' selectivities,
+    81 rows; the groups of t come out x2 x0 x3 x5 x1 x4."""
+    got = _analyzed(
+        pg,
+        "rp028_ci",
+        [
+            "create table rp028_ci (k int primary key, g int, t text)",
+            "insert into rp028_ci select i, (i * 7) % 11, 'x' || (i % 6)"
+            " from generate_series(1, 300) i",
+            "analyze rp028_ci",
+        ],
+        "select t from rp028_ci where g in (1, 1, 2) group by t",
+    )
+    assert got == ("ok", [(t,) for t in ["x2", "x0", "x3", "x5", "x1", "x4"]])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_or_with_a_repeated_arm_keeps_it(pg: Any) -> None:
+    """PostgreSQL 15.19: `g = 1 or g = 1 or g = 2` keeps the repeated arm
+    (`process_duplicate_ors` finds no clause every arm shares), 74 rows; the
+    groups of t come out x2 x0 x3 x5 x1 x4."""
+    got = _analyzed(
+        pg,
+        "rp028_ci",
+        [
+            "create table rp028_ci (k int primary key, g int, t text)",
+            "insert into rp028_ci select i, (i * 7) % 11, 'x' || (i % 6)"
+            " from generate_series(1, 300) i",
+            "analyze rp028_ci",
+        ],
+        "select t from rp028_ci where g = 1 or g = 1 or g = 2 group by t",
+    )
+    assert got == ("ok", [(t,) for t in ["x2", "x0", "x3", "x5", "x1", "x4"]])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_null_test_on_an_indexed_column_reads_the_index(pg: Any) -> None:
+    """PostgreSQL 15.19: `g is null` over 3,000 analysed rows with an index on
+    g is a bitmap index scan on the null test, 600 rows; the 4 groups of h
+    come out 0 1 3 2."""
+    got = _analyzed(
+        pg,
+        "rp028_cn",
+        [
+            "create table rp028_cn (k int primary key, g int, h int)",
+            "create index rp028_cn_g on rp028_cn (g)",
+            "insert into rp028_cn select i, case when i % 5 = 0 then null"
+            " else (i * 3) % 7 end, i % 4 from generate_series(1, 3000) i",
+            "analyze rp028_cn",
+        ],
+        "select h from rp028_cn where g is null group by h",
+    )
+    assert got == ("ok", [(h,) for h in [0, 1, 3, 2]])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_bitmap_or_arm_on_two_columns_is_a_bitmap_and(pg: Any) -> None:
+    """PostgreSQL 15.19: `(g = 1 and k < 100) or k > 9000` over 10,000 analysed
+    rows reads a BitmapOr whose first arm is a BitmapAnd of both indexes
+    (`choose_bitmap_and`), 1,008 rows; the groups of t come out x2 x0 x3
+    x5 x4 x1."""
+    got = _analyzed(
+        pg,
+        "rp028_cb",
+        [
+            "create table rp028_cb (k int primary key, g int, t text)",
+            "create index rp028_cb_g on rp028_cb (g)",
+            "insert into rp028_cb select i, (i * 7) % 11, 'x' || (i % 6)"
+            " from generate_series(1, 10000) i",
+            "analyze rp028_cb",
+        ],
+        "select t from rp028_cb where (g = 1 and k < 100) or k > 9000 group by t",
+    )
+    assert got == ("ok", [(t,) for t in ["x2", "x0", "x3", "x5", "x4", "x1"]])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_vacuum_makes_a_distinct_read_the_index_only(pg: Any) -> None:
+    """PostgreSQL 15.19 (a private cluster: VACUUM cannot run in a
+    transaction block): after VACUUM every page is all-visible
+    (`relallvisible`), so `select distinct g ... limit 3` over 300 rows is
+    a Unique over an Index Only Scan that fetches no heap page, and returns
+    0 1 2."""
+    pg.execute("drop table if exists rp028_cv")
+    try:
+        pg.execute("create table rp028_cv (k int primary key, g int, t text)")
+        pg.execute("create index rp028_cv_g on rp028_cv (g)")
+        pg.execute(
+            "insert into rp028_cv select i, (i * 7) % 11, 'x' || (i % 6)"
+            " from generate_series(1, 300) i"
+        )
+        pg.execute("vacuum rp028_cv")
+        got = pg_answer(pg, "select distinct g from rp028_cv limit 3")
+    finally:
+        pg.execute("drop table if exists rp028_cv")
+    assert got == ("ok", [(0,), (1,), (2,)])
+
+
+@pytest.mark.backlog_fixed("RP-028")
 def test_many_to_many_merge_join_leaves_ties_as_its_sorts_do(pg: Any) -> None:
     """PostgreSQL 15.19: `on l.b = r.c` over two fresh keyed tables is a
     Merge Join over two Sorts, so equal keys come out as PostgreSQL's
