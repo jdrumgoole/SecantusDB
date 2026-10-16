@@ -237,26 +237,41 @@ Size: one or two batches; scan order is the hard part.
 - [x] Capped eviction rescans the collection on every insert (7.065).
       This is a performance item: keep a running size and count.
       **2026-10-16:** kept in memory, recounted after any other write.
-- [ ] Views (7.066): a `hint` on a view is ignored (mongod: 2);
+- [x] Views (7.066): a `hint` on a view is ignored (mongod: 2);
       `$indexStats` on a view answers (40602); the wording of 48 for an
       existing view; `distinct` on a view returns values in scan order.
-- [ ] TTL and clustered collections (7.068): a clustered collection
+      **2026-10-16:** hints, `$natural: -1` and `$indexStats` (40602 only
+      for a view with a pipeline) match; 48 already did. `distinct` on a
+      view answers in mongod's hash-table order, which needs its `Value`
+      hash (RM-108).
+- [x] TTL and clustered collections (7.068): a clustered collection
       reports an `_id` index (`numIndexesBefore: 1`, mongod 0);
       `ttlMonitorSleepSecs` reads 60 whatever the startup cadence; which
       side of the TTL cutoff an exact match falls on is not measured; a
       pipeline upsert yielding an array `_id` answers 53 (mongod 54).
+      **2026-10-16:** the three measured ones match (RM-100, RM-101,
+      RM-103); the cutoff millisecond stays unmeasurable (RM-104).
 - [ ] Cursors and unknown fields (7.072, 7.073): `$meta: "recordId"` /
       `"indexKey"` add nothing; `find` accepts `$hint` and other fields it
-      does not know (mongod: 40415).
-- [ ] 7.074: a `delete` with `limit: 0` after a `multi` update deletes in
+      does not know (mongod: 40415). **2026-10-16:** 40415 was already
+      closed. `recordId` needs a decision: mongod numbers records per
+      collection, this store has one counter; `showRecordId` gives reply
+      positions (RM-083). `indexKey` is about half a day.
+- [x] 7.074: a `delete` with `limit: 0` after a `multi` update deletes in
       natural order; mongod deleted in reverse. Re-measure since 7.080.
-- [ ] 7.065: a `collMod` of `cappedSize` / `cappedMax` is written to the
-      oplog as `size` / `max`.
+      **2026-10-16:** mongod deletes in batches of ten, each last-read
+      first, update or not; matched (RM-077).
+- [x] 7.065: a `collMod` of `cappedSize` / `cappedMax` is written to the
+      oplog as `size` / `max`. **2026-10-16:** recorded as sent (RM-110).
 - [ ] 7.083: `rolesInfo: 1` lists stored roles by name; mongod lists them
       in creation order (2). Unlike the role-set order, this one is
       reproducible, but it needs a sequence in the role table.
+      **2026-10-16:** stopped: the role table is shared with the Python
+      server, so a sequence is an on-disk decision (RM-029, ~2 h after).
 - [ ] 7.084: `mapReduce` with `out` (18) answers an error where mongod
-      runs it.
+      runs it. **2026-10-16:** needs JavaScript; not built. A map/reduce
+      the server does not recognise now answers mongod's scriptless 31264
+      instead of `ok` with no results (RM-027).
 
 - [ ] Time series (7.071): sort a batch before placing it; close a bucket on
       size; the `_id` / index differences. **2026-10-16:** batches sorted,
@@ -273,10 +288,12 @@ Size: one or two batches; scan order is the hard part.
       **2026-10-16:** decode errors transcribed; `startAfter` /
       `resumeAfter` of every token around a `dropDatabase` matched mongod
       already. A well-formed mongod token is still 40647 (RM-075).
-- [ ] `update` (7.077): 27 for `$text`, `$$CLUSTER_TIME`, the `$replaceWith`
-      message. The upserted field order has no known rule.
-- [ ] 7.078: `includeQueryStatsMetrics`, `distinct` over a multikey index and
-      with a collation, 239 for an old `atClusterTime`.
+- [x] `update` (7.077): 27 for `$text`, `$$CLUSTER_TIME`, the `$replaceWith`
+      message. The upserted field order has no known rule. **2026-10-16:**
+      all three match (RM-061..063); the field order stays (RM-059).
+- [x] 7.078: `includeQueryStatsMetrics`, `distinct` over a multikey index and
+      with a collation, 239 for an old `atClusterTime`. **2026-10-16:** 239
+      already matched; the other three filed with gap tests (RM-170..172).
 - [ ] The `Slow query` line (7.07): `planSummary`, `keysExamined`,
       `docsExamined`, `nreturned`, `reslen`, the storage wait times.
       **2026-10-16:** command document, `planSummary`, `nreturned`,
@@ -309,7 +326,8 @@ Size: one or two batches.
       Re-measured 2026-10-15: `compact` (and `setParameter notablescan`)
       match mongod 8.2.11, `reIndex` refuses as on a replica-set primary;
       RM-027 now holds only `mapReduce` with `out`. The unknown-hint wording
-      (RM-051) waits on the decision below; 7.078 no longer says otherwise.
+      (RM-051) waits on the decision below; 7.05 and 7.078 both record it as
+      undecided (corrected 2026-10-16: an earlier note here said 7.078 did not).
 - [ ] Watch item (7.07): one writer made no progress for over 10 s in a
       droplet sweep. Not reproduced. The harness now keeps the server's log
       and store when a row fails; read them if it happens again.
