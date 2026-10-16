@@ -1243,12 +1243,13 @@ def test_group_by_over_an_analyzed_table_comes_out_in_hash_order(pg: Any) -> Non
     ANALYZE counted rather than its default 200, so the HashAggregate's
     table is 16 buckets and the 300 rows' groups come out
     8 9 10 7 1 5 4 2 0 6 3."""
+    pg.execute("drop table if exists rp028_as")
     pg.execute("begin")
     try:
-        pg.execute("create table rp028_s (k int primary key, g int)")
-        pg.execute("insert into rp028_s select i, (i * 7) % 11 from generate_series(1, 300) i")
-        pg.execute("analyze rp028_s")
-        got = pg_answer(pg, "select g from rp028_s group by g")
+        pg.execute("create table rp028_as (k int primary key, g int)")
+        pg.execute("insert into rp028_as select i, (i * 7) % 11 from generate_series(1, 300) i")
+        pg.execute("analyze rp028_as")
+        got = pg_answer(pg, "select g from rp028_as group by g")
     finally:
         pg.execute("rollback")
     assert got == ("ok", [(g,) for g in [8, 9, 10, 7, 1, 5, 4, 2, 0, 6, 3]])
@@ -1261,15 +1262,16 @@ def test_distinct_over_an_analyzed_column_with_nulls_comes_out_in_hash_order(
     """PostgreSQL 15.19: a text column a quarter NULL, 9 values, analysed
     over 300 rows: `select distinct t` estimates 9 groups and returns NULL
     n4 n5 n8 n6 n2 n3 n1 n0 n7."""
+    pg.execute("drop table if exists rp028_an")
     pg.execute("begin")
     try:
-        pg.execute("create table rp028_n (k int, t text)")
+        pg.execute("create table rp028_an (k int, t text)")
         pg.execute(
-            "insert into rp028_n select i, case when i % 4 = 0 then null"
+            "insert into rp028_an select i, case when i % 4 = 0 then null"
             " else 'n' || (i % 9) end from generate_series(1, 300) i"
         )
-        pg.execute("analyze rp028_n")
-        got = pg_answer(pg, "select distinct t from rp028_n")
+        pg.execute("analyze rp028_an")
+        got = pg_answer(pg, "select distinct t from rp028_an")
     finally:
         pg.execute("rollback")
     want = [None, "n4", "n5", "n8", "n6", "n2", "n3", "n1", "n0", "n7"]
@@ -1282,13 +1284,14 @@ def test_rows_inserted_after_analyze_keep_its_estimate(pg: Any) -> None:
     it measured b's 3 values (-0.15 of the rows); 10 more rows on the same
     page leave the estimate at 20 rows and 3 groups, so the fourth group
     lands in a 4-bucket table and the groups come out 0 1 3 2."""
+    pg.execute("drop table if exists rp028_ap")
     pg.execute("begin")
     try:
-        pg.execute("create table rp028_p (a int, b int)")
-        pg.execute("insert into rp028_p select i, i / 10 from generate_series(1, 20) i")
-        pg.execute("analyze rp028_p")
-        pg.execute("insert into rp028_p select i, i / 10 from generate_series(21, 30) i")
-        got = pg_answer(pg, "select b, count(*) from rp028_p group by b")
+        pg.execute("create table rp028_ap (a int, b int)")
+        pg.execute("insert into rp028_ap select i, i / 10 from generate_series(1, 20) i")
+        pg.execute("analyze rp028_ap")
+        pg.execute("insert into rp028_ap select i, i / 10 from generate_series(21, 30) i")
+        got = pg_answer(pg, "select b, count(*) from rp028_ap group by b")
     finally:
         pg.execute("rollback")
     assert got == ("ok", [(0, 9), (1, 10), (3, 1), (2, 10)])
@@ -1300,15 +1303,104 @@ def test_rows_after_the_last_group_grow_the_hash_table(pg: Any) -> None:
     grows at 7 members; the rows after the seventh group's first look it
     up and grow it (`SH_INSERT` checks the fill on every lookup), so 300
     analysed rows of `i % 7` come out 1 5 4 2 0 6 3."""
+    pg.execute("drop table if exists rp028_aq")
     pg.execute("begin")
     try:
-        pg.execute("create table rp028_q (k int, g int)")
-        pg.execute("insert into rp028_q select i, i % 7 from generate_series(1, 300) i")
-        pg.execute("analyze rp028_q")
-        got = pg_answer(pg, "select g from rp028_q group by g")
+        pg.execute("create table rp028_aq (k int, g int)")
+        pg.execute("insert into rp028_aq select i, i % 7 from generate_series(1, 300) i")
+        pg.execute("analyze rp028_aq")
+        got = pg_answer(pg, "select g from rp028_aq group by g")
     finally:
         pg.execute("rollback")
     assert got == ("ok", [(g,) for g in [1, 5, 4, 2, 0, 6, 3]])
+
+
+def _analyzed(pg: Any, table: str, setup: list[str], sql: str) -> Any:
+    pg.execute(f"drop table if exists {table}")
+    pg.execute("begin")
+    try:
+        for statement in setup:
+            pg.execute(statement)
+        return pg_answer(pg, sql)
+    finally:
+        pg.execute("rollback")
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_where_over_an_analyzed_table_estimates_from_its_histogram(pg: Any) -> None:
+    """PostgreSQL 15.19: over 300 analysed rows `k > 5` keeps 295 by the
+    histogram of k (`scalarineqsel`, its end read from the index), the 11
+    groups of g fill an estimate of 11, and the HashAggregate returns
+    8 10 7 9 1 5 2 4 6 0 3."""
+    got = _analyzed(
+        pg,
+        "rp028_aw",
+        [
+            "create table rp028_aw (k int primary key, g int, t text)",
+            "insert into rp028_aw select i, (i * 7) % 11, 'x' || (i % 6)"
+            " from generate_series(1, 300) i",
+            "analyze rp028_aw",
+        ],
+        "select g from rp028_aw where k > 5 group by g",
+    )
+    assert got == ("ok", [(g,) for g in [8, 10, 7, 9, 1, 5, 2, 4, 6, 0, 3]])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_where_over_an_analyzed_table_reads_a_correlated_index(pg: Any) -> None:
+    """PostgreSQL 15.19: over 3,000 analysed rows `k < 10` is 9 rows by the
+    histogram, read by an Index Scan its correlation of 1 makes cheapest;
+    6 groups are estimated, and the 9 come out 8 9 10 7 1 5 2 6 3."""
+    got = _analyzed(
+        pg,
+        "rp028_ax",
+        [
+            "create table rp028_ax (k int primary key, g int)",
+            "insert into rp028_ax select i, (i * 7) % 11 from generate_series(1, 3000) i",
+            "analyze rp028_ax",
+        ],
+        "select g from rp028_ax where k < 10 group by g",
+    )
+    assert got == ("ok", [(g,) for g in [8, 9, 10, 7, 1, 5, 2, 6, 3]])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_group_over_a_correlated_index_scan_comes_out_sorted(pg: Any) -> None:
+    """PostgreSQL 15.19: over 3,000 analysed rows `where k < 50 group by k`
+    is a Group over an Index Only Scan in k's order, cheaper than hashing
+    once the index is correlated, so the groups come out 1 to 49."""
+    got = _analyzed(
+        pg,
+        "rp028_ax",
+        [
+            "create table rp028_ax (k int primary key, g int)",
+            "insert into rp028_ax select i, (i * 7) % 11 from generate_series(1, 3000) i",
+            "analyze rp028_ax",
+        ],
+        "select k from rp028_ax where k < 50 group by k",
+    )
+    assert got == ("ok", [(k,) for k in range(1, 50)])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_where_on_a_composite_key_column_estimates_from_its_mcvs(pg: Any) -> None:
+    """PostgreSQL 15.19: `a = 3` over 300 analysed rows of a table keyed
+    (a, b) is 30 rows by a's most common values; 14 groups of v are
+    estimated, and the HashAggregate returns 4 0 14 3 7 13 9 10 1 5 2 15
+    16 6 12 11 8."""
+    got = _analyzed(
+        pg,
+        "rp028_ac",
+        [
+            "create table rp028_ac (a int, b int, v int, primary key (a, b))",
+            "insert into rp028_ac select i % 10, i / 10, (i * 13) % 17"
+            " from generate_series(1, 300) i",
+            "analyze rp028_ac",
+        ],
+        "select v from rp028_ac where a = 3 group by v",
+    )
+    want = [4, 0, 14, 3, 7, 13, 9, 10, 1, 5, 2, 15, 16, 6, 12, 11, 8]
+    assert got == ("ok", [(v,) for v in want])
 
 
 @pytest.mark.backlog_fixed("RP-028")

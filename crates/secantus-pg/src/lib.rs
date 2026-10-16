@@ -570,7 +570,24 @@ struct PlannerTable {
     /// What ANALYZE stored, by stored field: a column's `pg_statistic` row,
     /// or `None` for one whose statistics are not modelled. `None` for a
     /// table with no column statistics.
-    analyzed: Option<HashMap<String, Option<secantus_pgplan::hashagg::ColumnStats>>>,
+    analyzed: Option<HashMap<String, Option<AnalyzedColumn>>>,
+}
+
+/// A column's `pg_statistic` row: its scalars, and its most common values,
+/// histogram and correlation where they were recorded.
+struct AnalyzedColumn {
+    stats: secantus_pgplan::hashagg::ColumnStats,
+    slots: Option<secantus_pgplan::colstats::Slots>,
+}
+
+/// A WHERE over a table ANALYZE measured, as the planner estimates it
+/// (`clauselist_selectivity`).
+struct MeasuredWhere {
+    /// The whole WHERE's selectivity.
+    selectivity: f64,
+    /// By stored field: the selectivity of its index quals (its clauses but
+    /// `<>`), which `btcostestimate` reads for an index leading with it.
+    index_selectivity: HashMap<String, f64>,
 }
 
 /// What a grouping asks of the planner beyond its keys, for the choice
@@ -5682,21 +5699,28 @@ impl PgHandler {
             tuples,
             analyzed,
         } = self.planner_table(table, table_count)?;
-        // Over a table ANALYZE measured, a WHERE's selectivity comes from its
-        // most common values and histogram, and an index scan's cost from
-        // the column's correlation, neither of which is modelled -- so a
-        // LIMIT, under which a Group over an index scan in the keys' order
-        // competes, is declined when an index leads with a group key.
+        // Over a table ANALYZE measured, a LIMIT is declined when a Group
+        // over an index scan in the keys' order competes (an index leads
+        // with a group key) or under a WHERE: those paths are not priced
+        // from the statistics.
         if analyzed.is_some()
+            && shape.limit.is_some()
             && (!filter.is_empty()
-                || shape.limit.is_some()
-                    && self
-                        .cost_indexes(table, &def, table_count as u64)
-                        .iter()
-                        .any(|ix| key_cols.iter().any(|(k, _)| k == &ix.field)))
+                || self
+                    .cost_indexes(table, &def, table_count as u64)
+                    .iter()
+                    .any(|ix| key_cols.iter().any(|(k, _)| k == &ix.field)))
         {
             return None;
         }
+        // A WHERE over it is estimated from its statistics, or declined.
+        let measured_where = match &analyzed {
+            Some(stats) if !filter.is_empty() => {
+                let indexes = self.cost_indexes(table, &def, table_count as u64);
+                Some(self.analyzed_where(table, &def, &unique, stats, tuples, filter, &indexes)?)
+            }
+            _ => None,
+        };
         let pk: Vec<&secantus_pgcatalog::Column> = def.columns.iter().filter(|c| c.pk).collect();
         // `remove_useless_groupby_columns`: a GROUP BY holding the whole
         // primary key groups by that key alone.
@@ -5722,7 +5746,7 @@ impl PgHandler {
                     hashagg::KeyStat::Bool
                 } else if let Some(stats) = measured {
                     hashagg::KeyStat::Analyzed {
-                        stats: (*stats)?,
+                        stats: stats.as_ref()?.stats,
                         unique: unique.contains(field),
                     }
                 } else if unique.contains(field) {
@@ -5734,6 +5758,8 @@ impl PgHandler {
             .collect::<Option<_>>()?;
         let read = if filter.is_empty() {
             tuples
+        } else if let Some(w) = &measured_where {
+            costsize::clamp_row_est(tuples * w.selectivity)
         } else {
             let ndistinct = |field: &str| {
                 if unique.iter().any(|u| u == field) {
@@ -5809,19 +5835,85 @@ impl PgHandler {
                         tuples.min(200.0)
                     }
                 };
+                // The indexes whose leading columns are the group keys in
+                // order give a Group its input already sorted.
+                let presorts = |ix: &costsize::Index| {
+                    ix.columns.len() >= sort_keys.len()
+                        && sort_keys
+                            .iter()
+                            .zip(&ix.columns)
+                            .all(|(k, c)| k.1 && &key_cols[k.0].0 == c)
+                };
+                if let Some(stats) = &analyzed {
+                    // Over a measured table each index's quals are what the
+                    // statistics give them, and its scan's cost reads the
+                    // leading column's correlation.
+                    let correlations = Self::stats_correlations(&def, stats);
+                    let index_sel = |f: &str| {
+                        measured_where
+                            .as_ref()
+                            .and_then(|w| w.index_selectivity.get(f).copied())
+                    };
+                    let mut measured = indexes.clone();
+                    for ix in &mut measured {
+                        let c = match correlations.get(&ix.field) {
+                            Some(Some(c)) => *c,
+                            Some(None) if index_sel(&ix.field).is_some() || presorts(ix) => {
+                                return None
+                            }
+                            _ => 0.0,
+                        };
+                        ix.correlation = if ix.columns.len() > 1 { c * 0.75 } else { c };
+                    }
+                    let colsel = |f: &str| costsize::ColSel::Given(index_sel(f).unwrap_or(1.0));
+                    let ((_, input), ordered_by) =
+                        costsize::scan_path(&rel, &measured, &quals, &colsel, read);
+                    // A plain index scan returns the rows in the index's
+                    // order: modelled only where that is the heap's.
+                    if let Some(ix) = ordered_by {
+                        if !self.heap_in_order_of(table, &ix.field) {
+                            return None;
+                        }
+                    }
+                    let presorted: Vec<(f64, f64, f64)> = measured
+                        .iter()
+                        .filter(|ix| presorts(ix))
+                        .map(|ix| {
+                            let (s, t) = costsize::ordered_index_scan_with(
+                                &rel,
+                                ix,
+                                &quals,
+                                colsel(&ix.field),
+                            );
+                            (s, t, read)
+                        })
+                        .collect();
+                    if let Some(limit) = shape.limit {
+                        return Some(costsize::limited_grouping_sorted(
+                            input,
+                            read,
+                            groups as f64,
+                            kept.len(),
+                            shape.aggs,
+                            limit,
+                            &presorted,
+                        ));
+                    }
+                    return Some(costsize::sorted_grouping_wins_over(
+                        input,
+                        read,
+                        groups as f64,
+                        kept.len(),
+                        shape.aggs,
+                        ordered,
+                        &presorted,
+                    ));
+                }
                 let input = costsize::cheapest_scan(&rel, &indexes, &quals, &ndistinct, read);
                 if let Some(limit) = shape.limit {
-                    // The indexes whose leading columns are the group keys
-                    // in order give the Group its input already sorted.
                     let presorted: Vec<(f64, f64, f64)> = indexes
                         .iter()
-                        .filter(|ix| {
-                            ix.columns.len() >= sort_keys.len()
-                                && sort_keys
-                                    .iter()
-                                    .zip(&ix.columns)
-                                    .all(|(k, c)| k.1 && &key_cols[k.0].0 == c)
-                        })
+                        .filter(|ix| presorts(ix))
                         .map(|ix| {
                             let (s, t) = costsize::ordered_index_scan(
                                 &rel,
@@ -5852,11 +5944,16 @@ impl PgHandler {
                 ))
             }
         };
+        // Where no costs are weighed, the scan the rows arrive from is not
+        // known to be in the heap's order.
+        if measured_where.is_some() && (sort_keys.is_empty() || !shape.can_hash) {
+            return None;
+        }
         let sorted = !sort_keys.is_empty()
             && (!shape.can_hash
                 || match priced() {
                     Some(sorted) => sorted,
-                    None if shape.limit.is_some() => return None,
+                    None if shape.limit.is_some() || measured_where.is_some() => return None,
                     None => false,
                 });
         if sorted {
@@ -5890,6 +5987,16 @@ impl PgHandler {
             .iter()
             .map(|k| hashed.iter().map(|&i| k[i].clone()).collect())
             .collect();
+        // The groups reach the hash table in the order of the scan, which
+        // for a WHERE over a measured table is the heap's (a sequential or
+        // bitmap scan, or an index scan in the heap's order).
+        if measured_where.is_some() {
+            let (arrival, trailing) = self.heap_arrival(table, filter, key_cols, keys)?;
+            let reordered: Vec<Vec<Option<Bson>>> =
+                arrival.iter().map(|&g| kept_keys[g].clone()).collect();
+            let order = hashagg::hash_agg_order(&reordered, &types, groups, trailing)?;
+            return Some(order.into_iter().map(|i| arrival[i]).collect());
+        }
         hashagg::hash_agg_order(&kept_keys, &types, groups, trailing_rows)
     }
 
@@ -5967,10 +6074,13 @@ impl PgHandler {
                         });
                         let stats = (same && !entry.get_bool("unmodelled").unwrap_or(false))
                             .then(|| {
-                                Some(hashagg::ColumnStats {
-                                    null_frac: entry.get_f64("null_frac").ok()? as f32,
-                                    distinct: entry.get_f64("distinct").ok()? as f32,
-                                    width: entry.get_i32("width").ok()?,
+                                Some(AnalyzedColumn {
+                                    stats: hashagg::ColumnStats {
+                                        null_frac: entry.get_f64("null_frac").ok()? as f32,
+                                        distinct: entry.get_f64("distinct").ok()? as f32,
+                                        width: entry.get_i32("width").ok()?,
+                                    },
+                                    slots: Self::stored_slots(entry),
                                 })
                             })
                             .flatten();
@@ -5993,7 +6103,7 @@ impl PgHandler {
                 let stawidth = analyzed
                     .as_ref()
                     .and_then(|stats| stats.get(&c.field())?.as_ref())
-                    .map_or(0, |s| s.width);
+                    .map_or(0, |a| a.stats.width);
                 if stawidth > 0 {
                     return i64::from(stawidth);
                 }
@@ -6126,6 +6236,247 @@ impl PgHandler {
         ))
     }
 
+    /// A WHERE over `table`, which ANALYZE measured (`stats`), estimated as
+    /// PostgreSQL 15's planner estimates it: each clause a comparison of a
+    /// column with a constant (`colstats::Column::clause_sel`), combined by
+    /// `clauselist_selectivity` (`colstats::clauselist`). `None` for any
+    /// other clause (OR, IN, IS NULL, a pattern, an expression), a constant
+    /// not of the column's type, or a column whose statistics are not
+    /// modelled.
+    #[allow(clippy::too_many_arguments)]
+    fn analyzed_where(
+        &self,
+        table: &str,
+        def: &secantus_pgcatalog::TableDef,
+        unique: &[String],
+        stats: &HashMap<String, Option<AnalyzedColumn>>,
+        tuples: f64,
+        filter: &Document,
+        indexes: &[secantus_pgplan::costsize::Index],
+    ) -> Option<MeasuredWhere> {
+        use secantus_pgplan::colstats::{self, Op};
+        fn flatten(doc: &Document, out: &mut Vec<(String, Op, Bson)>) -> Option<()> {
+            for (key, value) in doc {
+                match (key.as_str(), value) {
+                    ("$and", Bson::Array(items)) => {
+                        for item in items {
+                            flatten(item.as_document()?, out)?;
+                        }
+                    }
+                    (k, _) if k.starts_with('$') => return None,
+                    (_, Bson::Null) => return None,
+                    (field, Bson::Document(ops)) if ops.keys().any(|k| k.starts_with('$')) => {
+                        for (op, operand) in ops {
+                            // `<> x` is lowered with `$ne: null` beside it.
+                            if op == "$ne" && operand == &Bson::Null {
+                                continue;
+                            }
+                            let op = match op.as_str() {
+                                "$eq" => Op::Eq,
+                                "$ne" => Op::Ne,
+                                "$lt" => Op::Lt,
+                                "$lte" => Op::Le,
+                                "$gt" => Op::Gt,
+                                "$gte" => Op::Ge,
+                                _ => return None,
+                            };
+                            out.push((field.to_string(), op, operand.clone()));
+                        }
+                    }
+                    (_, Bson::Document(_) | Bson::Array(_)) => return None,
+                    (field, v) => out.push((field.to_string(), Op::Eq, v.clone())),
+                }
+            }
+            Some(())
+        }
+        let mut clauses = Vec::new();
+        flatten(filter, &mut clauses)?;
+        let docs = self.table_docs(table).ok()?;
+        let mut fields: Vec<String> = Vec::new();
+        for (f, _, _) in &clauses {
+            if !fields.contains(f) {
+                fields.push(f.clone());
+            }
+        }
+        let mut columns = Vec::with_capacity(fields.len());
+        for f in &fields {
+            let c = def.columns.iter().find(|c| &c.field() == f)?;
+            let base = c.pg_type.trim_start_matches("pg_catalog.");
+            let numeric = matches!(base, "int2" | "int4" | "int8");
+            let measured = match stats.get(f) {
+                Some(Some(a)) => Some((a.stats, a.slots.as_ref()?)),
+                Some(None) => return None,
+                None => None,
+            };
+            // `get_actual_variable_range`: the current extremes, read from a
+            // B-tree index that leads with the column.
+            let actual = (numeric && indexes.iter().any(|ix| &ix.field == f))
+                .then(|| {
+                    let mut keys: Vec<Vec<u8>> = docs
+                        .iter()
+                        .filter_map(|d| Self::stats_key(base, d.get(f)?))
+                        .collect();
+                    keys.sort();
+                    Some((keys.first()?.clone(), keys.last()?.clone()))
+                })
+                .flatten();
+            columns.push(colstats::Column {
+                stats: measured,
+                unique: unique.contains(f),
+                boolean: base == "bool",
+                numeric,
+                actual,
+                tuples,
+            });
+        }
+        let mut keyed: Vec<(usize, Op, Vec<u8>)> = Vec::with_capacity(clauses.len());
+        for (f, op, v) in &clauses {
+            let i = fields.iter().position(|x| x == f)?;
+            let c = def.columns.iter().find(|c| &c.field() == f)?;
+            let key = Self::stats_key(c.pg_type.trim_start_matches("pg_catalog."), v)?;
+            keyed.push((i, *op, key));
+        }
+        let list = |pick: &dyn Fn(usize, Op) -> bool| {
+            let chosen: Vec<(&colstats::Column, Op, Vec<u8>)> = keyed
+                .iter()
+                .filter(|(i, op, _)| pick(*i, *op))
+                .map(|(i, op, k)| (&columns[*i], *op, k.clone()))
+                .collect();
+            colstats::clauselist(&chosen)
+        };
+        let selectivity = list(&|_, _| true)?;
+        let mut index_selectivity = HashMap::new();
+        for (i, f) in fields.iter().enumerate() {
+            if keyed.iter().any(|(j, op, _)| *j == i && *op != Op::Ne) {
+                index_selectivity.insert(f.clone(), list(&|j, op| j == i && op != Op::Ne)?);
+            }
+        }
+        Some(MeasuredWhere {
+            selectivity,
+            index_selectivity,
+        })
+    }
+
+    /// Each measured column's ANALYZE correlation (`btcostestimate` reads
+    /// the leading column's), by stored field: 0 where none was stored (one
+    /// value), `None` where it was measured in an order not modelled (text,
+    /// in the reference's locale; a column whose statistics are not).
+    fn stats_correlations(
+        def: &secantus_pgcatalog::TableDef,
+        stats: &HashMap<String, Option<AnalyzedColumn>>,
+    ) -> HashMap<String, Option<f64>> {
+        stats
+            .iter()
+            .map(|(f, a)| {
+                let ordered = def.columns.iter().any(|c| {
+                    &c.field() == f
+                        && matches!(
+                            c.pg_type.trim_start_matches("pg_catalog."),
+                            "int2" | "int4" | "int8" | "bool"
+                        )
+                });
+                let c = match a.as_ref().map(|a| a.slots.as_ref().map(|s| s.correlation)) {
+                    Some(Some(Some(c))) if ordered => Some(f64::from(c)),
+                    Some(Some(None)) => Some(0.0),
+                    _ => None,
+                };
+                (f.clone(), c)
+            })
+            .collect()
+    }
+
+    /// A constant's key for the statistics of a column of type `base`
+    /// (`colstats`): an integer's `int_key`, a string's bytes, a bool's
+    /// byte. `None` for another type or a value not of it.
+    fn stats_key(base: &str, v: &Bson) -> Option<Vec<u8>> {
+        match (base, v) {
+            ("int2" | "int4" | "int8", Bson::Int32(n)) => {
+                Some(secantus_pgplan::colstats::int_key(i64::from(*n)))
+            }
+            ("int2" | "int4" | "int8", Bson::Int64(n)) => {
+                Some(secantus_pgplan::colstats::int_key(*n))
+            }
+            ("text" | "varchar" | "character varying", Bson::String(s)) => {
+                Some(s.as_bytes().to_vec())
+            }
+            ("bool", Bson::Boolean(b)) => Some(vec![u8::from(*b)]),
+            _ => None,
+        }
+    }
+
+    /// The order `table`'s rows through `filter`, read in heap order, first
+    /// reach each of `keys`' groups (one key value per `key_cols` column),
+    /// and whether a row of an earlier group follows the last group's first
+    /// (`hashagg::hash_agg_order`). `None` when a row's key is not one of
+    /// `keys`.
+    fn heap_arrival(
+        &self,
+        table: &str,
+        filter: &Document,
+        key_cols: &[(String, String)],
+        keys: &[Vec<Option<Bson>>],
+    ) -> Option<(Vec<usize>, bool)> {
+        let index: HashMap<String, usize> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (format!("{k:?}"), i))
+            .collect();
+        if index.len() != keys.len() {
+            return None;
+        }
+        // The rows the WHERE keeps, as the server's own scan finds them,
+        // counted by content; read back in the heap's order.
+        let mut kept: HashMap<String, usize> = HashMap::new();
+        for raw in self.scan_table(table, filter, true).ok()? {
+            *kept
+                .entry(format!("{:?}", decode_doc(&raw).ok()?))
+                .or_insert(0) += 1;
+        }
+        let mut seen = vec![false; keys.len()];
+        let (mut arrival, mut trailing) = (Vec::with_capacity(keys.len()), false);
+        for d in self.table_docs(table).ok()? {
+            match kept.get_mut(&format!("{d:?}")) {
+                Some(n) if *n > 0 => *n -= 1,
+                _ => continue,
+            }
+            let key: Vec<Option<Bson>> = key_cols
+                .iter()
+                .map(|(f, _)| match d.get(f) {
+                    None | Some(Bson::Null) => None,
+                    Some(v) => Some(v.clone()),
+                })
+                .collect();
+            let g = *index.get(&format!("{key:?}"))?;
+            trailing = seen[g];
+            if !seen[g] {
+                seen[g] = true;
+                arrival.push(g);
+            }
+        }
+        (arrival.len() == keys.len()).then_some((arrival, trailing))
+    }
+
+    /// Whether `table`'s rows, in heap order, are in `field`'s order with no
+    /// NULLs -- so that an index scan on it returns them as the heap does.
+    fn heap_in_order_of(&self, table: &str, field: &str) -> bool {
+        let Ok(docs) = self.table_docs(table) else {
+            return false;
+        };
+        let mut prev: Option<&Bson> = None;
+        for d in &docs {
+            match d.get(field) {
+                None | Some(Bson::Null) => return false,
+                Some(v) => {
+                    if prev.is_some_and(|p| compare_values(p, v) == Ordering::Greater) {
+                        return false;
+                    }
+                    prev = Some(v);
+                }
+            }
+        }
+        true
+    }
+
     /// The pages PostgreSQL's heap would hold `table`'s rows in, freshly
     /// inserted (`hashagg::heap_pages`); `None` when a column's type is one
     /// whose stored size is not modelled (numeric, arrays, json).
@@ -6234,6 +6585,7 @@ impl PgHandler {
                 pages,
                 height,
                 columns: fields.clone(),
+                correlation: 0.0,
             });
         };
         let pk: Vec<String> = def
@@ -11899,7 +12251,9 @@ impl PgHandler {
     /// ANALYZE of `table` (`do_analyze_rel`), or of the `columns` named:
     /// `pg_class`'s `relpages` and `reltuples` as the table stands, and for
     /// each column analysed its `pg_statistic` row
-    /// (`hashagg::analyze_column`), kept under `columns` by stored field
+    /// (`hashagg::analyze_column`, and its most common values, histogram and
+    /// correlation: `colstats::scalar_slots`, as byte keys in the type's
+    /// order), kept under `columns` by stored field
     /// with the column's name and type -- a snapshot, which rows inserted
     /// later do not change. A column whose type's statistics are not
     /// modelled is recorded as such (`unmodelled`), and a table with more
@@ -11957,6 +12311,26 @@ impl PgHandler {
                         entry.insert("null_frac", f64::from(s.null_frac));
                         entry.insert("distinct", f64::from(s.distinct));
                         entry.insert("width", s.width);
+                        let slots =
+                            secantus_pgplan::colstats::scalar_slots(&values, target as usize);
+                        let bin = |k: &[u8]| {
+                            Bson::Binary(bson::Binary {
+                                subtype: bson::spec::BinarySubtype::Generic,
+                                bytes: k.to_vec(),
+                            })
+                        };
+                        let mcv: Vec<Bson> = slots
+                            .mcv
+                            .iter()
+                            .map(|(k, f)| Bson::Array(vec![bin(k), Bson::Double(f64::from(*f))]))
+                            .collect();
+                        entry.insert("mcv", mcv);
+                        entry.insert("mcv_complete", slots.mcv_complete);
+                        let hist: Vec<Bson> = slots.histogram.iter().map(|k| bin(k)).collect();
+                        entry.insert("histogram", hist);
+                        if let Some(c) = slots.correlation {
+                            entry.insert("correlation", f64::from(c));
+                        }
                     }
                     None => {
                         entry.insert("unmodelled", true);
@@ -11978,9 +12352,40 @@ impl PgHandler {
         self.put_comment_doc(Self::RELSTATS_COLLECTION, table, Some(doc))
     }
 
+    /// The most common values, histogram and correlation `record_analyze`
+    /// kept in a column's entry; `None` for an entry without them.
+    fn stored_slots(entry: &Document) -> Option<secantus_pgplan::colstats::Slots> {
+        let key = |b: &Bson| match b {
+            Bson::Binary(b) => Some(b.bytes.clone()),
+            _ => None,
+        };
+        let mcv = entry
+            .get_array("mcv")
+            .ok()?
+            .iter()
+            .map(|m| {
+                let pair = m.as_array()?;
+                Some((key(pair.first()?)?, pair.get(1)?.as_f64()? as f32))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let histogram = entry
+            .get_array("histogram")
+            .ok()?
+            .iter()
+            .map(key)
+            .collect::<Option<Vec<_>>>()?;
+        Some(secantus_pgplan::colstats::Slots {
+            mcv,
+            histogram,
+            correlation: entry.get_f64("correlation").ok().map(|c| c as f32),
+            mcv_complete: entry.get_bool("mcv_complete").ok()?,
+        })
+    }
+
     /// One row's value of `c` as ANALYZE samples it: `Some(None)` for a
     /// NULL, otherwise its key under the type's equality (`=` of its
-    /// default B-tree opclass) and its stored size (`VARSIZE_ANY`: a 1-byte
+    /// default B-tree opclass; an integer's sorts as the number,
+    /// `colstats::int_key`) and its stored size (`VARSIZE_ANY`: a 1-byte
     /// header up to 126 bytes, else 4; the type's width when fixed). `None`
     /// when the type's equality is not modelled, or the value is wider than
     /// ANALYZE compares (`WIDTH_THRESHOLD`, 1,024 bytes).
@@ -11998,9 +12403,11 @@ impl PgHandler {
         };
         match (c.pg_type.trim_start_matches("pg_catalog."), v) {
             ("int2" | "int4" | "int8", Bson::Int32(n)) => {
-                Some(Some((i64::from(*n).to_be_bytes().to_vec(), 0)))
+                Some(Some((secantus_pgplan::colstats::int_key(i64::from(*n)), 0)))
             }
-            ("int2" | "int4" | "int8", Bson::Int64(n)) => Some(Some((n.to_be_bytes().to_vec(), 0))),
+            ("int2" | "int4" | "int8", Bson::Int64(n)) => {
+                Some(Some((secantus_pgplan::colstats::int_key(*n), 0)))
+            }
             ("bool", Bson::Boolean(b)) => Some(Some((vec![u8::from(*b)], 0))),
             // `float8eq`: -0 equals 0, and NaN equals NaN.
             ("float4" | "float8", Bson::Double(x)) => {

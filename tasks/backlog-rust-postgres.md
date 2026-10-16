@@ -374,6 +374,18 @@ one beside it.
   every row's lookup). 212 of 212 shapes over analysed int, text, bool,
   float8, char(n), varchar and NULL-bearing columns match 15.19 at 20 to
   10,000 rows, and again with half as many rows, and four times as many,
+  inserted after the ANALYZE. A WHERE over an analysed table is
+  estimated too (2026-10-16, `secantus-pgplan/src/colstats.rs`): ANALYZE
+  keeps each column's most common values, histogram and correlation as
+  `compute_scalar_stats` builds them, and a WHERE of comparisons with
+  constants (`=`, `<>`, `<`, `<=`, `>`, `>=`, AND) gets `var_eq_const`'s
+  and `scalarineqsel`'s selectivities (the MCV and histogram split, the
+  histogram's ends read from an index as `get_actual_variable_range`
+  does, `clauselist_selectivity`'s range pairs); an index scan's cost
+  reads the column's correlation (`cost_index`), a Group over an index
+  scan in the keys' order is weighed with or without a LIMIT, and the
+  groups reach the hash table in the heap's order. 120 of 120 such shapes
+  match 15.19 at 20 to 10,000 rows, 168 of 168 and 84 of 84 with rows
   inserted after the ANALYZE. Not yet:
   - An `OR` in the WHERE (a BitmapOr path), which keeps the HashAggregate
     unpriced (and is declined under a LIMIT); a DISTINCT with an ORDER BY,
@@ -388,12 +400,16 @@ one beside it.
     another order). The size CREATE INDEX records and what ANALYZE
     stores are modelled (`__sql_relstats__`), but not REINDEX's,
     CLUSTER's or an ALTER TABLE that builds an index, nor across RENAME.
-    Declined over an analysed table, keeping the old order: a WHERE (its
-    selectivity is the most common values' and histogram's: `select g
-    from t3 where k > 5 group by g`); a LIMIT when an index leads with a
-    group key (an index scan's cost reads the column's correlation:
-    `select distinct g from ti limit 3`, an Index Only Scan at 3,000
-    rows); a join on its columns (`eqjoinsel` over its most common
+    Declined over an analysed table, keeping the old order: a WHERE with
+    an `IN`, an `OR`, `IS NULL`, a range over a column that is not an
+    integer (a text histogram is in the reference's locale: `select g
+    from t3 where t > 'x2' group by g`), or equality on a text column
+    whose repeated values overflow the MCV list; a WHERE under a LIMIT
+    (`select g from t3 where k > 5 group by g limit 3`); a LIMIT when an
+    index leads with a group key (`select distinct g from ti limit 3`, an
+    Index Only Scan at 3,000 rows, whose cost under a LIMIT is not
+    priced); a plain index scan whose index order is not the heap's; a
+    join on its columns (`eqjoinsel` over its most common
     values); a key of a type whose statistics are not modelled (dates,
     numeric, arrays); extended statistics (`CREATE STATISTICS`); a table
     of more rows than ANALYZE samples (30,000), whose sample is random.
