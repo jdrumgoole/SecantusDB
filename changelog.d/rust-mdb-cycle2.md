@@ -19,12 +19,17 @@ two.
   side table only the Rust server writes (as decided); a role it has no
   record of (one created by an older build or the Python server) keeps name
   order, ahead of the rest. It listed them by name.
+- **A DBPointer operand to `$min` / `$max`** is compared by mongod's
+  type order against any other type, so `{$min: {a: DBPointer}}` over
+  `a: 5` changes nothing, as on mongod; it was refused as "not supported".
+  Two DBPointers still defer (RM-127 stays open for that).
 - **A `createIndexes` refused for a spec with no `name` creates
   nothing.** The collection it would have created was left behind.
 
 Fixes RM-096 (tests/backlog/test_rm_085_112.py::test_validator_reads_the_collections_collation),
 RM-149 (tests/backlog/test_rm_geo_residuals.py::test_2dsphere_cell_levels_accepted_and_listed,
 ::test_2dsphere_cell_levels_are_checked), RM-150
-(::test_refused_spec_leaves_no_created_collection) and RM-029
+(::test_refused_spec_leaves_no_created_collection), RM-127 in part
+(tests/backlog/test_rm_113_138.py::test_dbpointer_min_update_operand) and RM-029
 (tests/backlog/test_rm_029_056.py::test_roles_info_lists_roles_in_creation_order,
 ::test_a_recreated_role_goes_last_and_an_update_keeps_its_place).

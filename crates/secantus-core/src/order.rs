@@ -309,8 +309,17 @@ fn lt_text(v: &Bson) -> Option<&str> {
 /// decoded exotic text types. `None` defers (DBPointer's type-name tiebreak;
 /// a Decimal128 that fails to classify).
 pub fn bson_lt(a: &Bson, b: &Bson) -> Option<bool> {
-    if matches!(a, Bson::DbPointer(_)) || matches!(b, Bson::DbPointer(_)) {
-        return None;
+    // A DBPointer ranks between Regex and JavaScript in mongod's canonical
+    // type order, so against any other type the rank decides (RM-127,
+    // measured 8.2.11: `{$min: {a: DBPointer}}` over `a: 5` is a no-op).
+    // Two DBPointers compare by namespace and id, which the `bson` crate
+    // does not expose: that pair still defers.
+    const DB_POINTER_RANK: u8 = 122;
+    match (a, b) {
+        (Bson::DbPointer(_), Bson::DbPointer(_)) => return None,
+        (Bson::DbPointer(_), other) => return Some(DB_POINTER_RANK < lt_rank(other)),
+        (other, Bson::DbPointer(_)) => return Some(lt_rank(other) < DB_POINTER_RANK),
+        _ => {}
     }
     let (ra, rb) = (lt_rank(a), lt_rank(b));
     if ra != rb {
