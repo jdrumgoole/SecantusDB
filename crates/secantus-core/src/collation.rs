@@ -26,6 +26,8 @@
 //!   `{$eq: ["a", "A"]}` sees the collation without every expression operator
 //!   taking a parameter.
 
+mod iso3;
+
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -506,31 +508,47 @@ fn locale_is_valid(locale: &str) -> bool {
     }
 }
 
-/// The valid locale nearest an invalid one, for `Did you mean`: the string in
-/// ICU's casing, then with the keyword, variant, region and script dropped in
-/// turn. `mongod` asks ICU for the functional equivalent, which also maps
-/// three-letter codes (`eng`, `USA`) and knows `zh@collation=stroke` belongs
-/// to `zh_Hant`; those it suggests and this does not.
+/// The valid locale nearest an invalid one, for `Did you mean`: the string as
+/// ICU parses it, then with the keyword, variant, region and script dropped in
+/// turn. ICU's parse cases each part and reads a three-letter language or
+/// region as its two-letter code (`eng_USA` is `en_US`), and after such a
+/// region it loses the variant (`en_USA_POSIX` is `en_US`, measured on
+/// `mongod` 8.2.11: `ulocimp_getCountry` steps past the two letters it wrote,
+/// not the three it read).
 fn nearest_locale(locale: &str) -> Option<String> {
     let (base, keyword) = match locale.split_once('@') {
         Some((b, k)) => (b, Some(k)),
         None => (locale, None),
     };
     let mut parts: Vec<String> = Vec::new();
+    // Where the region may stand: after the language, or after a script.
+    let mut region_at = 1;
     for (i, p) in base.split(['_', '-']).enumerate() {
         if p.is_empty() {
             break;
         }
         let alpha = p.chars().all(|c| c.is_ascii_alphabetic());
-        parts.push(if i == 0 {
-            p.to_ascii_lowercase()
-        } else if p.len() == 4 && alpha {
+        if i == 0 {
+            let lower = p.to_ascii_lowercase();
+            let two = (lower.len() == 3)
+                .then(|| iso3::two_letter(iso3::LANGUAGES_3, &lower))
+                .flatten();
+            parts.push(two.map_or(lower, str::to_string));
+        } else if i == 1 && p.len() == 4 && alpha {
             let mut s = p.to_ascii_lowercase();
             s[..1].make_ascii_uppercase();
-            s
+            parts.push(s);
+            region_at = 2;
         } else {
-            p.to_ascii_uppercase()
-        });
+            let upper = p.to_ascii_uppercase();
+            if i == region_at && upper.len() == 3 {
+                if let Some(two) = iso3::two_letter(iso3::COUNTRIES_3, &upper) {
+                    parts.push(two.to_string());
+                    break;
+                }
+            }
+            parts.push(upper);
+        }
     }
     if let Some(k) = keyword {
         let whole = format!("{}@{k}", parts.join("_"));
@@ -970,6 +988,37 @@ mod tests {
             Ok(true)
         );
         assert_eq!(refusal(doc! {"locale": "simple", "strength": 9}).0, 2);
+    }
+
+    /// `mongod` 8.2.11's suggestions (2026-10-16): ICU reads a three-letter
+    /// language or region as its two-letter code, and drops the variant after
+    /// such a region. Bibliographic and deprecated codes are not mapped.
+    #[test]
+    fn did_you_mean_reads_three_letter_codes_as_icu_does() {
+        let cases = [
+            ("eng", Some("en")),
+            ("ENG_usa", Some("en_US")),
+            ("eng_US", Some("en_US")),
+            ("en_USA", Some("en_US")),
+            ("en_USA_POSIX", Some("en_US")),
+            ("en_US_posix", Some("en_US_POSIX")),
+            ("en_GBR", Some("en")),
+            (
+                "de_AUT@collation=phonebook",
+                Some("de_AT@collation=phonebook"),
+            ),
+            ("deu@collation=phonebook", Some("de@collation=phonebook")),
+            ("zho_Hant", Some("zh_Hant")),
+            ("srp_Latn", Some("sr_Latn")),
+            ("fra_CAN", Some("fr_CA")),
+            ("spa_ES", Some("es")),
+            ("ger", None),
+            ("iw", None),
+            ("und", None),
+        ];
+        for (locale, want) in cases {
+            assert_eq!(nearest_locale(locale).as_deref(), want, "{locale}");
+        }
     }
 
     #[test]

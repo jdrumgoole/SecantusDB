@@ -3930,13 +3930,21 @@ pub fn server_status(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
         "logicalSessionRecordCache",
         logical_session_record_cache(ctx),
     );
-    // What the server has read and written, counted off the sockets.
+    // What the server has read and written, counted off the sockets, and
+    // what each compressor took in and gave out (`compression` follows
+    // `numRequests`, as on mongod 8.2.11).
+    let compression = ctx
+        .top_stats
+        .as_ref()
+        .map(|s| s.compression())
+        .unwrap_or_else(|| crate::topstats::TopStats::new().compression());
     reply.insert(
         "network",
         doc! {
             "bytesIn": Bson::Int64(network[1]),
             "bytesOut": Bson::Int64(network[2]),
             "numRequests": Bson::Int64(network[0]),
+            "compression": compression,
         },
     );
     if let Some(status) = status {

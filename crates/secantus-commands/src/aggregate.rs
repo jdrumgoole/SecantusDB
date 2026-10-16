@@ -61,6 +61,37 @@ use crate::util::{
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
 use secantus_core::collation::Collation;
 
+/// Refuse a pipeline that reads or writes a view whose collation is not the
+/// one the command runs under (`crate::views::involved_view_collation_problem`).
+/// A malformed collation, or one the command's own view refuses, is left to
+/// the check that reports it later, so its error keeps its place.
+pub(crate) fn involved_view_collation(
+    doc: &Document,
+    ctx: &CommandContext,
+    coll: Option<&str>,
+    pipeline: &[Bson],
+) -> Result<(), CommandError> {
+    let Ok(storage) = ctx.storage() else {
+        return Ok(());
+    };
+    let collation = match coll {
+        Some(c) => crate::util::effective_collation(storage, &ctx.db_name, c, doc),
+        None => crate::util::requested_collation(doc).map(|r| r.named().flatten()),
+    };
+    let Ok(collation) = collation else {
+        return Ok(());
+    };
+    match crate::views::involved_view_collation_problem(
+        storage,
+        &ctx.db_name,
+        pipeline,
+        collation.as_ref(),
+    ) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 /// `aggregate` — run a pipeline and return a cursor over the results.
 pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // `cursor` means "missing or an object" literally: an explicit `cursor: null`
@@ -284,6 +315,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // the explain handler before any write stage runs; default verbosity is
     // `queryPlanner`. Mirrors `commands.py::_aggregate`.
     if doc.get("explain") == Some(&Bson::Boolean(true)) {
+        involved_view_collation(doc, ctx, coll.as_deref(), &pipeline)?;
         let verbosity = doc
             .get_str("verbosity")
             .unwrap_or("queryPlanner")
@@ -327,6 +359,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if let Some(problem) = nested_write_stage(&pipeline) {
         return Ok(problem.into_reply());
     }
+    involved_view_collation(doc, ctx, coll.as_deref(), &pipeline)?;
 
     // `$out` / `$merge` are incompatible with readConcern level "linearizable"
     // (the only level mongod rejects here — local / available / majority all
@@ -1849,6 +1882,34 @@ fn apply_lookup(
     let spec = spec
         .and_then(Bson::as_document)
         .ok_or_else(|| bad_value("$lookup requires a document spec"))?;
+    // `from: {db, coll}` is a syntax mongod parses and refuses for an
+    // ordinary collection (RM-180, measured 8.2.11): 14 for a part that is
+    // not a string, else 9 naming both parts.
+    if let Some(Bson::Document(target)) = spec.get("from") {
+        let part = |key: &str| -> Result<String, CommandError> {
+            match target.get(key) {
+                None => Ok(String::new()),
+                Some(Bson::String(v)) => Ok(v.clone()),
+                Some(other) => Err(CommandError::new(
+                    14,
+                    "TypeMismatch",
+                    format!(
+                        "BSON field 'from.{key}' is the wrong type '{}', expected type 'string'",
+                        secantus_core::query::bson_type_name(other)
+                    ),
+                )),
+            }
+        };
+        let (on_db, on_coll) = (part("db")?, part("coll")?);
+        return Err(CommandError::new(
+            9,
+            "FailedToParse",
+            format!(
+                "$lookup with syntax {{from: {{db:<>, coll:<>}},..}} is not supported for db: \
+                 {on_db} and coll: {on_coll}"
+            ),
+        ));
+    }
     let from = spec
         .get_str("from")
         .map_err(|_| bad_value("$lookup requires 'from' (string)"))?;
@@ -2223,7 +2284,7 @@ fn apply_union_with(
     storage: &dyn crate::storage::Storage,
     collation: Option<&Collation>,
 ) -> Result<Vec<Document>, CommandError> {
-    let (from, sub_pipeline): (&str, Option<&Vec<Bson>>) = match spec {
+    let (from, sub_pipeline): (Option<&str>, Option<&Vec<Bson>>) = match spec {
         // An EMPTY collection name is not a namespace. This used to return the
         // outer documents unchanged -- a wrong ANSWER. mongod renders the
         // namespace with the collection half empty, so the database name runs
@@ -2235,11 +2296,17 @@ fn apply_union_with(
                 format!("Namespace {db}is not a valid collection name"),
             ));
         }
-        Some(Bson::String(s)) => (s.as_str(), None),
+        Some(Bson::String(s)) => (Some(s.as_str()), None),
         Some(Bson::Document(d)) => {
-            let from = d
-                .get_str("coll")
-                .map_err(|_| bad_value("$unionWith requires 'coll' (string)"))?;
+            // No `coll` when the pipeline makes its own documents (RM-179,
+            // measured 8.2.11): `argtypes` refuses any other shape.
+            let from = match d.get("coll") {
+                None => None,
+                Some(_) => Some(
+                    d.get_str("coll")
+                        .map_err(|_| bad_value("$unionWith requires 'coll' (string)"))?,
+                ),
+            };
             let sub = match d.get("pipeline") {
                 None => None,
                 Some(Bson::Array(a)) if !a.is_empty() => Some(a),
@@ -2253,6 +2320,23 @@ fn apply_union_with(
                 "$unionWith requires a collection name or {coll, pipeline} doc",
             ))
         }
+    };
+    let Some(from) = from else {
+        let sub = sub_pipeline.ok_or_else(|| bad_value("$unionWith requires 'coll' (string)"))?;
+        let _sub = InSubPipeline::enter(SubPipeline::UnionWith);
+        let mut made = run_segmented(
+            Vec::new(),
+            sub,
+            db,
+            None,
+            &Document::new(),
+            storage,
+            collation,
+            &Document::new(),
+            None,
+        )?;
+        docs.append(&mut made);
+        return Ok(docs);
     };
     if let Some(sub) = sub_pipeline {
         let (filter, sort) = crate::explain::pipeline_query(from, sub);

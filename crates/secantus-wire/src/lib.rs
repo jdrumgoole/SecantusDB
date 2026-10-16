@@ -35,10 +35,19 @@
 
 /// `OP_REPLY` — legacy reply opcode, used only for the `OP_QUERY` handshake.
 pub const OP_REPLY: i32 = 1;
+/// `OP_UPDATE` — removed legacy write opcode; mongod drops the connection.
+pub const OP_UPDATE: i32 = 2001;
+/// `OP_INSERT` — removed legacy write opcode; mongod drops the connection.
+pub const OP_INSERT: i32 = 2002;
 /// `OP_QUERY` — legacy query opcode; pymongo emits exactly one (the handshake).
 pub const OP_QUERY: i32 = 2004;
-/// `OP_GET_MORE` — legacy getMore opcode (not parsed; pymongo uses `OP_MSG`).
+/// `OP_GET_MORE` — removed legacy getMore opcode. mongod refuses it with an
+/// `OP_REPLY` and keeps the connection (see [`Op::LegacyGetMore`]).
 pub const OP_GET_MORE: i32 = 2005;
+/// `OP_DELETE` — removed legacy write opcode; mongod drops the connection.
+pub const OP_DELETE: i32 = 2006;
+/// `OP_KILL_CURSORS` — removed legacy opcode; mongod drops the connection.
+pub const OP_KILL_CURSORS: i32 = 2007;
 /// `OP_COMPRESSED` — the compressed-message wrapper (see [`compression`]).
 pub const OP_COMPRESSED: i32 = 2012;
 /// `OP_MSG` — the modern opcode; everything after the handshake.
@@ -62,7 +71,10 @@ pub const MAX_BSON_OBJECT_SIZE: i32 = 16 * 1024 * 1024;
 const MIN_BSON_DOC_LEN: i32 = 5;
 
 pub mod compression;
-pub use compression::{compress_frame, parse_op_compressed, Compressor, OpCompressed};
+pub use compression::{
+    compress_frame, parse_op_compressed, Compressor, OpCompressed,
+    PREFIX_LEN as OP_COMPRESSED_PREFIX_LEN,
+};
 
 /// A wire-protocol parse failure, split into recoverable and fatal (see the
 /// module docs). `Display` text is internal; the connection loop shapes the
@@ -189,18 +201,58 @@ pub struct OpQuery<'a> {
 pub enum Op<'a> {
     Msg(OpMsg<'a>),
     Query(OpQuery<'a>),
+    /// A legacy `OP_GET_MORE` with a readable namespace. mongod 8.2.11 answers
+    /// it with an `OP_REPLY` refusing the opcode (code 5739101) and keeps the
+    /// connection; nothing after the namespace is read.
+    LegacyGetMore,
+    /// A frame with an opcode the server does not serve (an unknown number,
+    /// `OP_REPLY` sent as a request, the removed `OP_COMMAND`). mongod 8.2.11
+    /// sends nothing back and keeps the connection.
+    Ignored(i32),
 }
 
-/// Parse a message body by `op_code`, the Rust equivalent of `read_message`'s
-/// dispatch (the caller has already read the header and the body bytes). An
-/// unsupported op_code is fatal, matching `wire.py`.
+/// Parse a message body by `op_code` (the caller has already read the header
+/// and the body bytes). What each opcode gets was measured against mongod
+/// 8.2.11 on a raw socket:
+///
+/// * `OP_MSG` / `OP_QUERY` are parsed.
+/// * `OP_GET_MORE` is [`Op::LegacyGetMore`] when it has its flags word and a
+///   NUL-terminated namespace; without them the frame is unusable (fatal).
+/// * `OP_INSERT` / `OP_UPDATE` / `OP_DELETE` / `OP_KILL_CURSORS` are fatal:
+///   mongod drops the connection. So is an `OP_COMPRESSED` inside another.
+/// * Every other opcode is [`Op::Ignored`] -- unless the body is shorter than
+///   4 bytes, which mongod treats as an unusable frame (fatal).
 pub fn parse_body(op_code: i32, body: &[u8]) -> Result<Op<'_>, WireError> {
     match op_code {
         OP_MSG => Ok(Op::Msg(parse_op_msg(body)?)),
         OP_QUERY => Ok(Op::Query(parse_op_query(body)?)),
-        other => Err(WireError::Protocol(format!("unsupported op_code {other}"))),
+        OP_GET_MORE => {
+            if body.len() < 4 || memchr0(body, 4, body.len()).is_none() {
+                return Err(WireError::Protocol(
+                    "OP_GET_MORE has no NUL-terminated namespace".into(),
+                ));
+            }
+            Ok(Op::LegacyGetMore)
+        }
+        OP_UPDATE | OP_INSERT | OP_DELETE | OP_KILL_CURSORS | OP_COMPRESSED => Err(
+            WireError::Protocol(format!("unsupported op_code {op_code}")),
+        ),
+        other if body.len() < 4 => Err(WireError::Protocol(format!(
+            "op_code {other} with a {}-byte body",
+            body.len()
+        ))),
+        other => Ok(Op::Ignored(other)),
     }
 }
+
+/// The `$err` text mongod 8.2.11 answers a legacy `OP_GET_MORE` with.
+pub const OP_GET_MORE_REMOVED_ERRMSG: &str = "OP_GET_MORE is no longer supported. The client \
+driver may require an upgrade. For more details see \
+https://dochub.mongodb.org/core/legacy-opcode-removal";
+/// The error code that accompanies [`OP_GET_MORE_REMOVED_ERRMSG`].
+pub const OP_GET_MORE_REMOVED_CODE: i32 = 5739101;
+/// `OP_REPLY` response flag: the query failed (`QueryFailure`).
+pub const OP_REPLY_FLAG_QUERY_FAILURE: u32 = 1 << 1;
 
 /// Parse an `OP_MSG` body (everything after the header): a u32 flags word
 /// followed by kind-0 / kind-1 sections, optionally trailed by a CRC32C when
@@ -832,6 +884,45 @@ mod tests {
     fn parse_body_unsupported_opcode_is_fatal() {
         let err = parse_body(OP_COMPRESSED, &[]).unwrap_err();
         assert!(!err.is_recoverable());
+        // The removed legacy write opcodes drop the connection on mongod
+        // 8.2.11, whatever the body holds.
+        for op in [OP_UPDATE, OP_INSERT, OP_DELETE, OP_KILL_CURSORS] {
+            let err = parse_body(op, &[0u8; 24]).unwrap_err();
+            assert!(!err.is_recoverable(), "op {op}");
+        }
+    }
+
+    #[test]
+    fn parse_body_unknown_opcode_is_ignored() {
+        // mongod 8.2.11 ignores an opcode it does not serve -- OP_REPLY sent
+        // as a request and the removed OP_COMMAND (2010) among them...
+        for op in [9999, OP_REPLY, 0, -5, 2003, 2010, 2011, i32::MAX] {
+            assert_eq!(parse_body(op, &[0u8; 20]), Ok(Op::Ignored(op)), "op {op}");
+        }
+        assert_eq!(parse_body(9999, &[0u8; 4]), Ok(Op::Ignored(9999)));
+        // ...but drops the connection when the body is shorter than 4 bytes.
+        for n in 0..4 {
+            assert!(parse_body(9999, &vec![0u8; n]).is_err(), "{n} bytes");
+        }
+    }
+
+    #[test]
+    fn parse_body_legacy_get_more_needs_a_namespace() {
+        let mut body = 0i32.to_le_bytes().to_vec();
+        body.extend_from_slice(b"db.c\x00");
+        body.extend_from_slice(&0i32.to_le_bytes());
+        body.extend_from_slice(&12345i64.to_le_bytes());
+        assert_eq!(parse_body(OP_GET_MORE, &body), Ok(Op::LegacyGetMore));
+        // Nothing past the namespace is read (mongod 8.2.11).
+        assert_eq!(
+            parse_body(OP_GET_MORE, &[0, 0, 0, 0, 0]),
+            Ok(Op::LegacyGetMore)
+        );
+        // No flags word, or no NUL after it: an unusable frame.
+        for bad in [&[][..], &[0u8; 4][..], &[0xffu8; 12][..], b"\0\0\0\0db.c"] {
+            let err = parse_body(OP_GET_MORE, bad).unwrap_err();
+            assert!(!err.is_recoverable());
+        }
     }
 
     #[test]

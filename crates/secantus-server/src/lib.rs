@@ -39,7 +39,7 @@ use secantus_commands::{
 };
 use secantus_wire::{
     build_op_msg_reply, build_op_reply, compress_frame, parse_op_compressed, Compressor, Header,
-    Op, OpMsg, WireError, HEADER_SIZE, MAX_MESSAGE_SIZE, OP_COMPRESSED,
+    Op, OpMsg, WireError, HEADER_SIZE, MAX_MESSAGE_SIZE, OP_COMPRESSED, OP_COMPRESSED_PREFIX_LEN,
     OP_MSG_FLAG_EXHAUST_ALLOWED, OP_MSG_FLAG_MORE_TO_COME,
 };
 
@@ -639,6 +639,11 @@ fn serve<S: Read + Write>(
                 Ok(d) => d,
                 Err(_) => return Ok(()),
             };
+            shared.top_stats.count_decompressed(
+                compressor.name(),
+                wrapped.data.len(),
+                inflated.len(),
+            );
             req.compressor = Some(compressor);
             (wrapped.original_header(&header), inflated)
         } else {
@@ -795,6 +800,25 @@ fn serve<S: Read + Write>(
                 }
                 write_op_reply(stream, &req, shared, &reply)?;
             }
+            Ok(Op::LegacyGetMore) => {
+                // mongod 8.2.11 refuses the removed opcode with an OP_REPLY
+                // (QueryFailure, cursor 0) and keeps the connection.
+                let refusal = doc! {
+                    "$err": secantus_wire::OP_GET_MORE_REMOVED_ERRMSG,
+                    "code": secantus_wire::OP_GET_MORE_REMOVED_CODE,
+                    "ok": 0.0,
+                };
+                write_op_reply_flags(
+                    stream,
+                    &req,
+                    shared,
+                    &refusal,
+                    secantus_wire::OP_REPLY_FLAG_QUERY_FAILURE,
+                )?;
+            }
+            // An opcode the server does not serve: mongod 8.2.11 sends nothing
+            // back and reads the next message on the same connection.
+            Ok(Op::Ignored(_)) => {}
             Err(e) if e.is_recoverable() => {
                 send_bad_value(stream, &req, shared, &e)?;
             }
@@ -1114,6 +1138,15 @@ fn send_frame<S: Write>(
         Some(compressor) => {
             let wrapped = compress_frame(frame, compressor)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            // mongod counts the message body in and the compressed bytes out,
+            // neither header nor the OP_COMPRESSED prefix.
+            shared.top_stats.count_compressed(
+                compressor.name(),
+                frame.len().saturating_sub(HEADER_SIZE),
+                wrapped
+                    .len()
+                    .saturating_sub(HEADER_SIZE + OP_COMPRESSED_PREFIX_LEN),
+            );
             shared.top_stats.count_reply(wrapped.len());
             stream.write_all(&wrapped)
         }
@@ -1175,11 +1208,11 @@ fn write_op_msg_flags<S: Write>(
 /// Stream the rest of an exhaust cursor over one socket. Called when a getMore
 /// arrives with the OP_MSG `exhaustAllowed` flag set: `first_reply` (the getMore
 /// handler's reply) and every subsequent batch are sent with `moreToCome` set,
-/// pulling further batches with synthetic getMores, until the cursor drains —
-/// then a final `id: 0` reply with `moreToCome` clear closes the stream. mongod
-/// keeps the cursor alive until a getMore returns an empty batch, so a cursor
-/// that drains on a non-empty batch still gets a trailing empty reply. Mirrors
-/// `server.py::_stream_exhaust_getmore`. `Ok(true)` = stream written (connection
+/// pulling further batches with synthetic getMores, until the cursor drains.
+/// The getMore reply that closes the cursor (`id: 0`) is sent as it is, with
+/// `moreToCome` clear, and ends the stream: measured on mongod 8.2.11, a short
+/// last batch is that final frame, and an empty final frame appears only when
+/// the cursor drained on a full batch. `Ok(true)` = stream written (connection
 /// survives); `Ok(false)` = a write failed mid-stream (drop the connection).
 #[allow(clippy::too_many_arguments)]
 fn stream_exhaust_getmore<S: Write>(
@@ -1199,23 +1232,22 @@ fn stream_exhaust_getmore<S: Write>(
     };
     let coll = request.get_str("collection").unwrap_or("").to_string();
     let db = request.get_str("$db").unwrap_or("admin").to_string();
-    let ns = first_reply
-        .get_document("cursor")
-        .ok()
-        .and_then(|c| c.get_str("ns").ok())
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{db}.{coll}"));
 
     // `pending` batches splice onto the wire undecoded (`cursor_or_plain_body`),
-    // exactly like the non-exhaust reply path.
-    let send = |stream: &mut S,
-                doc: &Document,
-                pending: Option<&PendingBatch>,
-                more: bool|
+    // exactly like the non-exhaust reply path. The first frame answers the
+    // client's getMore; each later one answers the frame before it -- its
+    // `responseTo` is the previous frame's `requestID`, as mongod 8.2.11 sends.
+    let mut response_to = req.request_id;
+    let mut send = |stream: &mut S,
+                    doc: &Document,
+                    pending: Option<&PendingBatch>,
+                    more: bool|
      -> io::Result<bool> {
         let flags = if more { OP_MSG_FLAG_MORE_TO_COME } else { 0 };
         let body = cursor_or_plain_body(doc, pending)?;
-        let frame = build_op_msg_reply(req.request_id, next_reply_id(shared), &body, flags);
+        let reply_id = next_reply_id(shared);
+        let frame = build_op_msg_reply(response_to, reply_id, &body, flags);
+        response_to = reply_id;
         match send_frame(stream, req, shared, &frame) {
             Ok(()) => Ok(true),
             Err(_) => Ok(false),
@@ -1242,46 +1274,11 @@ fn stream_exhaust_getmore<S: Write>(
             _ => return send(stream, &doc, None, false),
         };
         if drained {
-            if !batch_empty {
-                // Re-advertise the ORIGINAL cursor id with this final batch
-                // (the exhaust protocol closes with a separate empty frame).
-                let sent = match pending.take() {
-                    Some(p) => send(
-                        stream,
-                        &doc! {"cursor": {"id": target_id.clone(), "ns": &ns}, "ok": 1.0},
-                        Some(&p),
-                        true,
-                    )?,
-                    None => {
-                        let batch: Vec<Bson> = doc
-                            .get_document("cursor")
-                            .ok()
-                            .and_then(|c| {
-                                c.get_array("nextBatch")
-                                    .or_else(|_| c.get_array("firstBatch"))
-                                    .ok()
-                            })
-                            .cloned()
-                            .unwrap_or_default();
-                        send(
-                            stream,
-                            &doc! {"cursor": {"nextBatch": batch, "id": target_id.clone(), "ns": &ns}, "ok": 1.0},
-                            None,
-                            true,
-                        )?
-                    }
-                };
-                if !sent {
-                    return Ok(false);
-                }
-            }
-            let empty: Vec<Bson> = Vec::new();
-            return send(
-                stream,
-                &doc! {"cursor": {"nextBatch": empty, "id": 0i64, "ns": &ns}, "ok": 1.0},
-                None,
-                false,
-            );
+            // The reply that closes the cursor ends the stream, batch and all:
+            // mongod 8.2.11 sends a short last batch with id 0 and no
+            // `moreToCome`, and only a cursor that drained on a full batch
+            // ends with an empty frame -- which is the getMore reply itself.
+            return send(stream, &doc, pending.as_ref(), false);
         }
         if batch_empty {
             // A live cursor that yielded nothing (tailable/awaitData wait expired):
@@ -1467,6 +1464,17 @@ fn write_op_reply<S: Write>(
     shared: &Arc<Shared>,
     reply: &Document,
 ) -> io::Result<()> {
+    write_op_reply_flags(stream, req, shared, reply, 0)
+}
+
+/// Write one OP_REPLY holding `reply`, with the given response flags.
+fn write_op_reply_flags<S: Write>(
+    stream: &mut S,
+    req: &Inbound,
+    shared: &Arc<Shared>,
+    reply: &Document,
+    response_flags: u32,
+) -> io::Result<()> {
     let mut body_bytes = Vec::with_capacity(256);
     reply
         .to_writer(&mut body_bytes)
@@ -1477,7 +1485,7 @@ fn write_op_reply<S: Write>(
         &[&body_bytes],
         0,
         0,
-        0,
+        response_flags,
     );
     send_frame(stream, req, shared, &frame)
 }

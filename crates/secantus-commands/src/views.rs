@@ -162,8 +162,18 @@ pub(crate) fn refusal(name: &str, doc: &Document, ctx: &CommandContext) -> Optio
             }
             let (target_db, target_coll) =
                 write_target(pipeline.last().and_then(Bson::as_document)?, db)?;
-            is_view(storage.as_ref(), &target_db, &target_coll)
-                .then(|| executor(not_a_collection(&format!("{target_db}.{target_coll}"))))
+            if !is_view(storage.as_ref(), &target_db, &target_coll) {
+                return None;
+            }
+            // A view of another collation is refused for that first (167).
+            if let Err(e) =
+                crate::aggregate::involved_view_collation(doc, ctx, Some(coll), pipeline)
+            {
+                return Some(e.into_reply());
+            }
+            Some(executor(not_a_collection(&format!(
+                "{target_db}.{target_coll}"
+            ))))
         }
         _ => None,
     }
@@ -252,3 +262,112 @@ pub(crate) fn definition_problem(
 
 /// mongod's limit on a chain of views.
 pub(crate) const MAX_VIEW_DEPTH: usize = 20;
+
+/// Every namespace a pipeline reads or writes besides its own, in pipeline
+/// order: `$lookup` / `$graphLookup` / `$unionWith` sources (a `$lookup`'s
+/// `from` only as a string -- the `{db, coll}` form is refused elsewhere),
+/// `$out` / `$merge` targets, and those of every sub-pipeline (`$lookup`,
+/// `$unionWith`, `$facet`).
+fn involved_namespaces(pipeline: &[Bson], db: &str, out: &mut Vec<(String, String)>) {
+    for stage in pipeline.iter().filter_map(Bson::as_document) {
+        let Some((name, spec)) = stage.iter().next() else {
+            continue;
+        };
+        match (name.as_str(), spec) {
+            ("$lookup", Bson::Document(d)) => {
+                if let Ok(from) = d.get_str("from") {
+                    out.push((db.to_string(), from.to_string()));
+                }
+                if let Ok(sub) = d.get_array("pipeline") {
+                    involved_namespaces(sub, db, out);
+                }
+            }
+            ("$graphLookup", Bson::Document(d)) => {
+                if let Ok(from) = d.get_str("from") {
+                    out.push((db.to_string(), from.to_string()));
+                }
+            }
+            ("$unionWith", Bson::String(coll)) => out.push((db.to_string(), coll.clone())),
+            ("$unionWith", Bson::Document(d)) => {
+                if let Ok(coll) = d.get_str("coll") {
+                    out.push((db.to_string(), coll.to_string()));
+                }
+                if let Ok(sub) = d.get_array("pipeline") {
+                    involved_namespaces(sub, db, out);
+                }
+            }
+            ("$facet", Bson::Document(d)) => {
+                for sub in d.values() {
+                    if let Bson::Array(sub) = sub {
+                        involved_namespaces(sub, db, out);
+                    }
+                }
+            }
+            ("$out" | "$merge", _) => out.extend(write_target(stage, db)),
+            _ => {}
+        }
+    }
+}
+
+/// A view an aggregate reads or writes besides its own namespace must have
+/// the collation the aggregate runs under -- the one it names, else its own
+/// namespace's default, else none -- or mongod refuses the command before it
+/// runs (167, measured 8.2.11 2026-10-16: on an empty or missing collection,
+/// under `$facet` and in nested pipelines, and for `$out` / `$merge` into a
+/// view). The namespace follows the message with no separator, as mongod
+/// prints it.
+pub(crate) fn involved_view_collation_problem(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    pipeline: &[Bson],
+    collation: Option<&secantus_core::collation::Collation>,
+) -> Option<CommandError> {
+    let mut involved = Vec::new();
+    involved_namespaces(pipeline, db, &mut involved);
+    for (db, coll) in involved {
+        let Ok(options) = storage.get_collection_options(&db, &coll) else {
+            continue;
+        };
+        if !options.contains_key("viewOn") {
+            continue;
+        }
+        let own = options
+            .get_document("collation")
+            .ok()
+            .and_then(secantus_core::collation::parse);
+        let same = match (collation, &own) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.same(b),
+            _ => false,
+        };
+        if !same {
+            return Some(CommandError::new(
+                167,
+                "OptionNotSupportedOnView",
+                format!("Cannot override a view's default collation{db}.{coll}"),
+            ));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn involved_namespaces_walks_every_sub_pipeline() {
+        let pipeline = vec![
+            Bson::Document(doc! {"$lookup": {"from": "a", "pipeline": [
+                {"$unionWith": {"coll": "b", "pipeline": [{"$graphLookup": {"from": "c"}}]}}
+            ]}}),
+            Bson::Document(doc! {"$facet": {"x": [{"$unionWith": "d"}], "y": []}}),
+            Bson::Document(doc! {"$lookup": {"from": {"db": "db", "coll": "skipped"}}}),
+            Bson::Document(doc! {"$merge": {"into": {"db": "other", "coll": "e"}}}),
+        ];
+        let mut out = Vec::new();
+        involved_namespaces(&pipeline, "db", &mut out);
+        let names: Vec<String> = out.iter().map(|(d, c)| format!("{d}.{c}")).collect();
+        assert_eq!(names, ["db.a", "db.b", "db.c", "db.d", "other.e"]);
+    }
+}

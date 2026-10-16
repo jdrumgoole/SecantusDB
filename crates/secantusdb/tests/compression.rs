@@ -88,6 +88,8 @@ struct Raw {
 struct Frame {
     /// The compressor id, when the reply was `OP_COMPRESSED`.
     compressor: Option<u8>,
+    request_id: i32,
+    response_to: i32,
     flags: u32,
     doc: Document,
 }
@@ -137,6 +139,8 @@ impl Raw {
         let msg = parse_op_msg(&body).unwrap();
         Some(Frame {
             compressor,
+            request_id: header.request_id,
+            response_to: header.response_to,
             flags: msg.flags,
             doc: secantus_commands::bsondoc::from_bytes(msg.body).unwrap(),
         })
@@ -337,4 +341,77 @@ fn a_compressed_frame_that_does_not_add_up_closes_the_connection() {
             .unwrap(),
         1.0
     );
+}
+
+/// An exhaust getMore streams each getMore reply as it is, and the reply that
+/// closes the cursor ends the stream (RM-146). Measured on mongod 8.2.11 with
+/// `find` batchSize 3: over 10 documents the frames are [3,4,5] and [6,7,8]
+/// with `moreToCome` and the live id, then [9] without it and id 0; over 9
+/// the last frame is an empty batch with id 0. Each frame after the first
+/// answers the frame before it: its `responseTo` is that frame's requestID.
+#[test]
+fn an_exhaust_stream_ends_on_the_reply_that_closes_the_cursor() {
+    let server = Server::start().expect("start");
+    for compressor in [None, Some(Compressor::Zlib)] {
+        for (n, last) in [(10, vec![9]), (9, vec![])] {
+            let mut raw = Raw::connect(&server);
+            let db = format!("exhaust_end_{n}");
+            let docs: Vec<Document> = (0..n).map(|i| doc! {"_id": i}).collect();
+            raw.command(doc! {"insert": "c", "documents": docs, "$db": &db}, None);
+            let find = raw.command(
+                doc! {"find": "c", "batchSize": 3, "sort": {"_id": 1}, "$db": &db},
+                None,
+            );
+            let id = find
+                .doc
+                .get_document("cursor")
+                .unwrap()
+                .get_i64("id")
+                .unwrap();
+            assert_ne!(id, 0);
+            raw.send(
+                &doc! {"getMore": id, "collection": "c", "batchSize": 3, "$db": &db},
+                compressor,
+                OP_MSG_FLAG_EXHAUST_ALLOWED,
+            );
+            let mut answers = raw.next_id;
+            let mut frames = Vec::new();
+            while frames.len() < 6 {
+                let frame = raw.recv().expect("an exhaust frame");
+                assert_eq!(frame.compressor, compressor.map(Compressor::id));
+                assert_eq!(
+                    frame.response_to,
+                    answers,
+                    "{n} docs, frame {}",
+                    frames.len()
+                );
+                answers = frame.request_id;
+                let cursor = frame.doc.get_document("cursor").unwrap();
+                let ids: Vec<i32> = cursor
+                    .get_array("nextBatch")
+                    .unwrap()
+                    .iter()
+                    .map(|d| d.as_document().unwrap().get_i32("_id").unwrap())
+                    .collect();
+                let more = frame.flags & OP_MSG_FLAG_MORE_TO_COME != 0;
+                frames.push((more, cursor.get_i64("id").unwrap() != 0, ids));
+                if !more {
+                    break;
+                }
+            }
+            assert_eq!(
+                frames,
+                vec![
+                    (true, true, vec![3, 4, 5]),
+                    (true, true, vec![6, 7, 8]),
+                    (false, false, last),
+                ],
+                "{n} docs, {compressor:?}"
+            );
+            // The connection is still in step: the next reply is the ping's.
+            let ping = raw.command(doc! {"ping": 1, "$db": "admin"}, None);
+            assert_eq!(ping.response_to, raw.next_id);
+            raw.command(doc! {"dropDatabase": 1, "$db": &db}, None);
+        }
+    }
 }

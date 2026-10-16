@@ -3628,7 +3628,14 @@ fn stage_field_problem(name: &str, spec: &Bson) -> Option<(i32, String)> {
             ),
         });
     }
-    if name == "$unionWith" && !d.contains_key("coll") {
+    let makes_documents = matches!(
+        d.get("pipeline"),
+        Some(Bson::Array(stages)) if stages
+            .first()
+            .and_then(Bson::as_document)
+            .is_some_and(|first| first.contains_key("$documents"))
+    );
+    if name == "$unionWith" && !d.contains_key("coll") && !makes_documents {
         // A spec with no `coll` is legal only when the pipeline supplies its own
         // documents; mongod says so rather than "requires 'coll'". Checked here
         // rather than in a separate match arm because Rust arms do not fall

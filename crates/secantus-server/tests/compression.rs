@@ -2,7 +2,9 @@
 //! storage that holds nothing: what mongod 8.2.11 does with a compressed
 //! request (measured 2026-10-15), checked without WiredTiger so it runs in
 //! the `rust` CI job. The driver-level and cursor tests over real WiredTiger
-//! are in `crates/secantusdb/tests/compression.rs`.
+//! are in `crates/secantusdb/tests/compression.rs`. Also here, on the same
+//! raw-socket harness: the compression counters `serverStatus` reports, and
+//! what the loop does with an opcode it does not serve.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -119,7 +121,7 @@ fn reply(sock: &mut TcpStream) -> Option<(Option<u8>, Document)> {
             compressor,
             secantus_commands::bsondoc::from_bytes(msg.body).unwrap(),
         )),
-        Op::Query(_) => panic!("expected OP_MSG"),
+        _ => panic!("expected OP_MSG"),
     }
 }
 
@@ -193,5 +195,135 @@ fn a_frame_whose_declared_size_is_wrong_closes_the_connection() {
         sock.write_all(&payload).unwrap();
         assert!(reply(&mut sock).is_none(), "id {id}, declared {declared}");
     }
+    server.stop();
+}
+
+/// `serverStatus.network.compression` counts, per compressor, the message
+/// bodies it compressed and decompressed: header and `OP_COMPRESSED` prefix
+/// excluded, as mongod 8.2.11 counts them (RM-147).
+#[test]
+fn server_status_counts_what_each_compressor_handled() {
+    let mut server = start();
+    let mut sock = connect(server.address());
+    let counts = |sock: &mut TcpStream| {
+        let (_, status) = command(sock, doc! {"serverStatus": 1, "$db": "admin"}, None);
+        status
+            .get_document("network")
+            .unwrap()
+            .get_document("compression")
+            .unwrap()
+            .clone()
+    };
+    let before = counts(&mut sock);
+    let zero = doc! {
+        "compressor": {"bytesIn": 0_i64, "bytesOut": 0_i64},
+        "decompressor": {"bytesIn": 0_i64, "bytesOut": 0_i64},
+    };
+    assert_eq!(
+        before,
+        doc! {"snappy": zero.clone(), "zstd": zero.clone(), "zlib": zero.clone()}
+    );
+
+    // One zlib ping, its sizes worked out the way mongod counts them.
+    let frame = request(&doc! {"ping": 1, "$db": "admin"});
+    let body_len = (frame.len() - HEADER_SIZE) as i64;
+    let wrapped = compress_frame(&frame, Compressor::Zlib).unwrap();
+    let compressed_len = (wrapped.len() - HEADER_SIZE - 9) as i64;
+    sock.write_all(&wrapped).unwrap();
+    let mut head = [0u8; HEADER_SIZE];
+    sock.read_exact(&mut head).unwrap();
+    let header = Header::unpack(&head).unwrap();
+    assert_eq!(header.op_code, OP_COMPRESSED);
+    let mut reply_body = vec![0u8; header.body_len().unwrap()];
+    sock.read_exact(&mut reply_body).unwrap();
+    let reply = parse_op_compressed(&reply_body).unwrap();
+
+    let after = counts(&mut sock);
+    assert_eq!(
+        after.get_document("zlib").unwrap(),
+        &doc! {
+            "compressor": {
+                "bytesIn": i64::from(reply.uncompressed_size),
+                "bytesOut": reply.data.len() as i64,
+            },
+            "decompressor": {"bytesIn": compressed_len, "bytesOut": body_len},
+        }
+    );
+    assert_eq!(after.get_document("snappy").unwrap(), &zero);
+    assert_eq!(after.get_document("zstd").unwrap(), &zero);
+    server.stop();
+}
+
+fn raw_frame(op_code: i32, request_id: i32, body: &[u8]) -> Vec<u8> {
+    let header = Header {
+        message_length: (HEADER_SIZE + body.len()) as i32,
+        request_id,
+        response_to: 0,
+        op_code,
+    };
+    let mut out = header.pack().to_vec();
+    out.extend_from_slice(body);
+    out
+}
+
+/// mongod 8.2.11 sends nothing back for a frame whose opcode it does not
+/// serve and answers the next request on the same connection -- compressed
+/// or not (RM-144).
+#[test]
+fn an_unserved_opcode_is_ignored_and_the_connection_kept() {
+    let mut server = start();
+    let mut sock = connect(server.address());
+    for op in [9999, 1, 2010] {
+        sock.write_all(&raw_frame(op, 7, &[0u8; 20])).unwrap();
+        let (_, ping) = command(&mut sock, doc! {"ping": 1, "$db": "admin"}, None);
+        assert_eq!(ping.get_f64("ok").unwrap(), 1.0, "op {op}");
+    }
+    let wrapped = compress_frame(&raw_frame(9999, 8, &[0u8; 20]), Compressor::Zlib).unwrap();
+    sock.write_all(&wrapped).unwrap();
+    let (_, ping) = command(&mut sock, doc! {"ping": 1, "$db": "admin"}, None);
+    assert_eq!(ping.get_f64("ok").unwrap(), 1.0);
+    // A body too short to hold anything is an unusable frame: closed.
+    let mut short = connect(server.address());
+    short.write_all(&raw_frame(9999, 9, &[0u8; 3])).unwrap();
+    assert!(reply(&mut short).is_none());
+    server.stop();
+}
+
+/// mongod 8.2.11 refuses a legacy OP_GET_MORE with an OP_REPLY --
+/// QueryFailure, cursor 0, one `{$err, code: 5739101, ok: 0}` document --
+/// and keeps the connection (RM-145).
+#[test]
+fn a_legacy_get_more_is_refused_with_an_op_reply() {
+    let mut server = start();
+    let mut sock = connect(server.address());
+    let mut body = 0i32.to_le_bytes().to_vec();
+    body.extend_from_slice(b"db.c\x00");
+    body.extend_from_slice(&0i32.to_le_bytes());
+    body.extend_from_slice(&12345i64.to_le_bytes());
+    sock.write_all(&raw_frame(2005, 11, &body)).unwrap();
+    let mut head = [0u8; HEADER_SIZE];
+    sock.read_exact(&mut head).unwrap();
+    let header = Header::unpack(&head).unwrap();
+    assert_eq!((header.op_code, header.response_to), (1, 11));
+    let mut reply_body = vec![0u8; header.body_len().unwrap()];
+    sock.read_exact(&mut reply_body).unwrap();
+    let flags = u32::from_le_bytes(reply_body[0..4].try_into().unwrap());
+    let cursor_id = i64::from_le_bytes(reply_body[4..12].try_into().unwrap());
+    let starting_from = i32::from_le_bytes(reply_body[12..16].try_into().unwrap());
+    let returned = i32::from_le_bytes(reply_body[16..20].try_into().unwrap());
+    assert_eq!((flags, cursor_id, starting_from, returned), (2, 0, 0, 1));
+    let refusal = secantus_commands::bsondoc::from_bytes(&reply_body[20..]).unwrap();
+    assert_eq!(
+        refusal,
+        doc! {
+            "$err": "OP_GET_MORE is no longer supported. The client driver may require an \
+                     upgrade. For more details see \
+                     https://dochub.mongodb.org/core/legacy-opcode-removal",
+            "code": 5739101,
+            "ok": 0.0,
+        }
+    );
+    let (_, ping) = command(&mut sock, doc! {"ping": 1, "$db": "admin"}, None);
+    assert_eq!(ping.get_f64("ok").unwrap(), 1.0);
     server.stop();
 }
