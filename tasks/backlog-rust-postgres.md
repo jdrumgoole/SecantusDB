@@ -364,7 +364,17 @@ one beside it.
   an aggregate with DISTINCT or its own ORDER BY is never hashed; and
   under a LIMIT with no ORDER BY a Group over an index scan in the keys'
   order is weighed too, by the cost of the first rows the LIMIT takes.
-  186 of 186 shapes match 15.19 at 40, 300 and 3,000 rows. Not yet:
+  186 of 186 shapes match 15.19 at 40, 300 and 3,000 rows. A table
+  ANALYZE measured is modelled too (2026-10-16): ANALYZE records each
+  column's `pg_statistic` row as `compute_scalar_stats` computes it from a
+  sample of the whole table (`stanullfrac`, `stadistinct`, `stawidth`;
+  `hashagg::analyze_column`) and `relpages` / `reltuples`, as a snapshot,
+  and the group estimate reads them (`get_variable_numdistinct`); the
+  hash table's growth is simplehash's (an integer threshold, checked on
+  every row's lookup). 212 of 212 shapes over analysed int, text, bool,
+  float8, char(n), varchar and NULL-bearing columns match 15.19 at 20 to
+  10,000 rows, and again with half as many rows, and four times as many,
+  inserted after the ANALYZE. Not yet:
   - An `OR` in the WHERE (a BitmapOr path), which keeps the HashAggregate
     unpriced (and is declined under a LIMIT); a DISTINCT with an ORDER BY,
     whose sort is not weighed; an ORDER BY with a LIMIT.
@@ -375,24 +385,50 @@ one beside it.
     json): its heap pages are taken at the estimated density.
   - DISTINCT ON, and a citext DISTINCT, which PostgreSQL sorts.
   - The heap's order after UPDATE or DELETE (rows the hash table reads in
-    another order). A table VACUUM or ANALYZE measured (its statistics,
-    `relallvisible`) is declined, keeping the old order; the size CREATE
-    INDEX records is modelled (`__sql_relstats__`), but not REINDEX's,
+    another order). The size CREATE INDEX records and what ANALYZE
+    stores are modelled (`__sql_relstats__`), but not REINDEX's,
     CLUSTER's or an ALTER TABLE that builds an index, nor across RENAME.
+    Declined over an analysed table, keeping the old order: a WHERE (its
+    selectivity is the most common values' and histogram's: `select g
+    from t3 where k > 5 group by g`); a LIMIT when an index leads with a
+    group key (an index scan's cost reads the column's correlation:
+    `select distinct g from ti limit 3`, an Index Only Scan at 3,000
+    rows); a join on its columns (`eqjoinsel` over its most common
+    values); a key of a type whose statistics are not modelled (dates,
+    numeric, arrays); extended statistics (`CREATE STATISTICS`); a table
+    of more rows than ANALYZE samples (30,000), whose sample is random.
+    VACUUM (`relallvisible`, the visibility map) is declined entirely;
+    it cannot run in a transaction block, so it was not measured. A
+    ROLLBACK undoes ANALYZE's `relpages` / `reltuples` here, which
+    PostgreSQL writes in place.
   - Joins: the join method (`secantus-pgplan/src/joincost.rs`: hash and
     merge joins priced as PostgreSQL does) decides whether a cursor over
     `a [LEFT] JOIN b ON a.x = b.y ORDER BY a.x` scrolls (at a cursor's
     tenth of the rows; 96 of 96 shapes match 15.19; this was RP-043), and
     the order a join of two tables on one equality emits its rows: a
     merge join's sides in key order, ties as each side's quicksort leaves
-    them; a hash join's matches in its bucket's order (33 of 33). Not yet:
-    a WHERE, which is applied over the joined rows rather than to a side
-    before its sort; an expression or several join keys; nested loops;
-    more than two tables; a join of more than 200,000 rows a side, which
-    streams in scan order.
+    them; a hash join's matches in its bucket's order (33 of 33). Under a
+    WHERE each side is filtered by its own conjuncts before it is put in
+    order, the plan is priced with them (either side outer, `add_path`'s
+    startup costs, and under a LIMIT the fractional cost, where a nested
+    loop over a materialised inner usually wins), and a WHERE no
+    NULL-extended row passes makes a LEFT join inner (159 of 159 shapes
+    at 20, 300 and 3,000 rows). A join on one expression equality
+    (`on a.x = b.y + 3`, either side or both) is sorted or hashed by each
+    side's value, priced with no statistics for the expression and its
+    operators in the clause's cost; a LIMIT straight over a general join
+    is priced for its rows (57 of 57). Not yet: several join keys (a WHERE
+    comparing the two sides is a second key, and with the first an
+    equivalence class: PostgreSQL filters one side by it); an equality on
+    a join key, which the equivalence class turns into a filter on both
+    sides; an expression key with a function call or a cast that costs;
+    parameterized nested loops (an index scan inner); a LIMIT with an
+    ORDER BY, or with a WHERE over the general path; more than two
+    tables; a join of more than 200,000 rows a side, which streams in
+    scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_merge_join_under_a_where_sorts_the_rows_it_keeps
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_join_with_a_second_equality_between_its_sides
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

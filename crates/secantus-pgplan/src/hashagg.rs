@@ -45,10 +45,11 @@ const GROW_MAX_MOVE: u32 = 150;
 const GROW_MIN_FILLFACTOR: f64 = 0.1;
 
 /// simplehash's table: each bucket holds a group's index and hash.
+/// `grow_threshold` is a `uint32`, so the fill factor's product truncates.
 struct Table {
     data: Vec<Option<(usize, u32)>>,
     members: usize,
-    grow_threshold: f64,
+    grow_threshold: usize,
 }
 
 impl Table {
@@ -64,7 +65,7 @@ impl Table {
         Table {
             data: vec![None; size],
             members: 0,
-            grow_threshold: size as f64 * FILLFACTOR,
+            grow_threshold: (size as f64 * FILLFACTOR) as usize,
         }
     }
 
@@ -123,7 +124,7 @@ impl Table {
     /// is inserted once, at its first row).
     fn insert(&mut self, group: usize, hash: u32) {
         'restart: loop {
-            if self.members as f64 >= self.grow_threshold {
+            if self.members >= self.grow_threshold {
                 self.grow(self.data.len() as u64 * 2);
             }
             let mask = self.mask();
@@ -154,7 +155,7 @@ impl Table {
                                     && (self.members as f64 / self.data.len() as f64)
                                         >= GROW_MIN_FILLFACTOR
                                 {
-                                    self.grow_threshold = 0.0;
+                                    self.grow_threshold = 0;
                                     continue 'restart;
                                 }
                             }
@@ -175,7 +176,7 @@ impl Table {
                 if insertdist > GROW_MAX_DIB
                     && (self.members as f64 / self.data.len() as f64) >= GROW_MIN_FILLFACTOR
                 {
-                    self.grow_threshold = 0.0;
+                    self.grow_threshold = 0;
                     continue 'restart;
                 }
             }
@@ -207,31 +208,164 @@ impl Table {
 /// The order PostgreSQL's HashAggregate emits `groups` in: each group's key
 /// values (one per grouping column, of `types`), in the order the groups'
 /// first rows arrive; `nbuckets` is the planner's group estimate (at least
-/// 1). The answer is the groups' indexes, in emitted order. `None` when a
-/// key's type is not one this module hashes as PostgreSQL does.
+/// 1). `trailing_rows` when a row of an existing group follows the last
+/// group's first row: every row's lookup checks the fill (`SH_INSERT` grows
+/// "even if the key is actually present"), so such a row grows a table the
+/// last group filled. The answer is the groups' indexes, in emitted order.
+/// `None` when a key's type is not one this module hashes as PostgreSQL
+/// does.
 pub fn hash_agg_order(
     groups: &[Vec<Option<Bson>>],
     types: &[String],
     nbuckets: u64,
+    trailing_rows: bool,
 ) -> Option<Vec<usize>> {
     let mut table = Table::new(nbuckets.max(1));
     for (i, key) in groups.iter().enumerate() {
         table.insert(i, group_hash(key, types)?);
     }
+    if trailing_rows && table.members >= table.grow_threshold {
+        table.grow(table.data.len() as u64 * 2);
+    }
     Some(table.order())
 }
 
-/// What the planner knows of one grouping column of a table with no
-/// statistics (`get_variable_numdistinct`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What the planner knows of one grouping column (`get_variable_numdistinct`).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum KeyStat {
-    /// A boolean: 2 distinct values.
+    /// A boolean: 2 distinct values (`estimate_num_groups` short-circuits a
+    /// boolean expression, statistics or not).
     Bool,
     /// The column alone is a primary key or carries a unique index: as many
     /// distinct values as rows.
     Unique,
-    /// Anything else: `DEFAULT_NUM_DISTINCT`, 200, or the rows if fewer.
+    /// Anything else with no statistics: `DEFAULT_NUM_DISTINCT`, 200, or the
+    /// rows if fewer.
     Unknown,
+    /// A column ANALYZE measured: its `pg_statistic` row, and whether a
+    /// unique index covers it, which overrides the distinct count but not
+    /// the null fraction.
+    Analyzed { stats: ColumnStats, unique: bool },
+}
+
+/// What ANALYZE stores of one column in `pg_statistic` that the group
+/// estimate reads: `stanullfrac`, `stadistinct` (a count when positive, a
+/// fraction of the rows when negative, unknown at 0) and `stawidth`, each
+/// as the catalog holds it (`float4`, `float4`, `int4`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ColumnStats {
+    pub null_frac: f32,
+    pub distinct: f32,
+    pub width: i32,
+}
+
+/// One sampled row's value of a column: `None` for a NULL, else its key
+/// under the type's equality and its stored size (`analyze_column`).
+pub type Sampled = Option<(Vec<u8>, usize)>;
+
+/// ANALYZE's statistics for one column (`compute_scalar_stats` /
+/// `compute_distinct_stats`), from a sample that holds every row of the
+/// table -- which it does while the table has no more rows than the sample
+/// size (300 x `default_statistics_target`), so `samplerows` and
+/// `totalrows` are one number. `values` is each row's value: `None` for a
+/// NULL, else its key under the type's equality and, for a varlena, its
+/// stored size (`VARSIZE_ANY`, header included); `typlen` is the type's
+/// fixed width, or -1. A value too wide to compare (`WIDTH_THRESHOLD`) is
+/// the caller's to decline.
+///
+/// The distinct count is the sample's (`Duj1` reduces to it when the sample
+/// is the table), or the unique estimate `-(1 - stanullfrac)` when no value
+/// repeats; above a tenth of the rows it is stored as a negative fraction,
+/// so that it scales with the table.
+pub fn analyze_column(values: &[Sampled], typlen: i64) -> ColumnStats {
+    let samplerows = values.len() as f64;
+    let totalrows = samplerows;
+    let mut counts: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::new();
+    let mut null_cnt = 0usize;
+    let mut total_width = 0f64;
+    for v in values {
+        match v {
+            None => null_cnt += 1,
+            Some((key, width)) => {
+                total_width += *width as f64;
+                *counts.entry(key.as_slice()).or_insert(0) += 1;
+            }
+        }
+    }
+    let nonnull_cnt = values.len() - null_cnt;
+    let width = |w: f64| {
+        if typlen > 0 {
+            typlen as i32
+        } else {
+            w as i32
+        }
+    };
+    if nonnull_cnt == 0 {
+        // "We found only nulls; assume the column is entirely null".
+        return ColumnStats {
+            null_frac: if null_cnt > 0 { 1.0 } else { 0.0 },
+            distinct: 0.0,
+            width: if typlen > 0 { typlen as i32 } else { 0 },
+        };
+    }
+    let null_frac = (null_cnt as f64 / samplerows) as f32;
+    let ndistinct = counts.len();
+    let nmultiple = counts.values().filter(|&&c| c > 1).count();
+    let mut distinct: f32 = if nmultiple == 0 {
+        (-(1.0 - f64::from(null_frac))) as f32
+    } else if nmultiple == ndistinct {
+        ndistinct as f32
+    } else {
+        // Duj1: n * d / ((n - f1) + f1 * n / N), clamped to [d, N].
+        let f1 = (ndistinct - nmultiple) as f64;
+        let d = f1 + nmultiple as f64;
+        let n = samplerows - null_cnt as f64;
+        let big_n = totalrows * (1.0 - f64::from(null_frac));
+        let mut x = if big_n > 0.0 {
+            (n * d) / ((n - f1) + f1 * n / big_n)
+        } else {
+            0.0
+        };
+        if x < d {
+            x = d;
+        }
+        if x > big_n {
+            x = big_n;
+        }
+        (x + 0.5).floor() as f32
+    };
+    if f64::from(distinct) > 0.1 * totalrows {
+        distinct = -(f64::from(distinct) / totalrows) as f32;
+    }
+    ColumnStats {
+        null_frac,
+        distinct,
+        width: width(total_width / nonnull_cnt as f64),
+    }
+}
+
+/// `get_variable_numdistinct` for a column with statistics in a table the
+/// planner sizes at `tuples` rows.
+fn analyzed_numdistinct(stats: &ColumnStats, unique: bool, tuples: f64) -> f64 {
+    let clamp_row_est = |n: f64| if n <= 1.0 { 1.0 } else { n.round() };
+    let mut stadistinct = f64::from(stats.distinct);
+    if unique {
+        stadistinct = -(1.0 - f64::from(stats.null_frac));
+    }
+    if stadistinct > 0.0 {
+        return clamp_row_est(stadistinct);
+    }
+    if tuples <= 0.0 {
+        return 200.0;
+    }
+    if stadistinct < 0.0 {
+        return clamp_row_est(-stadistinct * tuples);
+    }
+    if tuples < 200.0 {
+        clamp_row_est(tuples)
+    } else {
+        200.0
+    }
 }
 
 /// `get_typavgwidth`: a fixed-width type's length; for a declared maximum
@@ -357,8 +491,9 @@ pub fn heap_pages(spaces: impl Iterator<Item = usize>) -> u64 {
     pages
 }
 
-/// `estimate_num_groups` over one table with no statistics, of which the
-/// statement reads `rows` (the table's `tuples` with no WHERE). A boolean
+/// `estimate_num_groups` over one table, of which the statement reads
+/// `rows` (the table's `tuples` with no WHERE), with no extended statistics
+/// (`estimate_multivariate_ndistinct` finds none). A boolean
 /// key short-circuits: its 2 multiplies the result and takes no part in the
 /// clamp. The other columns' distinct counts multiply, clamped by the rows
 /// for one column and by a tenth of the rows (but not below the largest
@@ -380,6 +515,7 @@ pub fn estimate_groups(keys: &[KeyStat], tuples: f64, rows: f64) -> u64 {
             KeyStat::Unique => clamp_row_est(tuples),
             KeyStat::Unknown if tuples < 200.0 => clamp_row_est(tuples),
             KeyStat::Unknown => 200.0,
+            KeyStat::Analyzed { stats, unique } => analyzed_numdistinct(stats, *unique, tuples),
         };
         product *= n;
         max_single = max_single.max(n);
@@ -499,7 +635,7 @@ mod tests {
             .iter()
             .map(|g| vec![Some(Bson::Int32(*g))])
             .collect();
-        let order = hash_agg_order(&groups, &["int4".to_string()], 200).unwrap();
+        let order = hash_agg_order(&groups, &["int4".to_string()], 200, true).unwrap();
         let out: Vec<i32> = order.iter().map(|&i| arrival[i]).collect();
         assert_eq!(out, [9, 3, 5, 4, 0, 10, 6, 2, 7, 1, 8]);
     }
@@ -526,7 +662,7 @@ mod tests {
             .iter()
             .map(|t| vec![Some(Bson::String(t.clone()))])
             .collect();
-        let order = hash_agg_order(&groups, &["text".to_string()], 200).unwrap();
+        let order = hash_agg_order(&groups, &["text".to_string()], 200, true).unwrap();
         let out: Vec<&str> = order.iter().map(|&i| texts[i].as_str()).collect();
         assert_eq!(out, ["x1", "x3", "x4", "x5", "x0", "x2"]);
 
@@ -535,7 +671,7 @@ mod tests {
             .map(|(g, t)| vec![Some(Bson::Int32(*g)), Some(Bson::String(t.clone()))])
             .collect();
         let types = ["int4".to_string(), "text".to_string()];
-        let order = hash_agg_order(&groups, &types, 200).unwrap();
+        let order = hash_agg_order(&groups, &types, 200, true).unwrap();
         let out: Vec<String> = order[..6]
             .iter()
             .map(|&i| format!("{}|{}", pairs[i].0, pairs[i].1))
@@ -604,5 +740,114 @@ mod tests {
         assert_eq!(rows(&two), 2.0);
         assert_eq!(estimate_groups(&[KeyStat::Unique], 1200.0, rows(&g3)), 6);
         assert_eq!(filter_selectivity(&doc! {"t": {"$regex": "^x"}}, &nd), None);
+    }
+
+    /// PostgreSQL 15.19, `analyze` over fresh tables, then `pg_stats`:
+    /// 300 rows of `case when i % 7 = 0 then null else i end` (null_frac
+    /// 0.14, n_distinct -0.86), `'y' || (i % 50)` (-0.16666667, width 3),
+    /// 20 rows of `case when i % 2 = 0 then null else 's' || (i % 9) end`
+    /// (0.5, -0.45, width 3), an all-NULL int (1, 0, width 4), and 200 rows
+    /// of `case when i < 5 then i else 100 end` (5) and `repeat('z', i)`
+    /// (-1, width 102).
+    #[test]
+    fn analyze_column_stores_what_postgres_stores() {
+        let int = |v: Option<i64>| v.map(|n| (n.to_be_bytes().to_vec(), 0usize));
+        let text = |t: String| Some((t.clone().into_bytes(), t.len() + 1));
+        let q: Vec<_> = (1..=300).map(|i| int((i % 7 != 0).then_some(i))).collect();
+        let s = analyze_column(&q, 4);
+        assert_eq!((s.null_frac, s.distinct, s.width), (0.14, -0.86, 4));
+        let w: Vec<_> = (1..=300).map(|i| text(format!("y{}", i % 50))).collect();
+        let s = analyze_column(&w, -1);
+        assert_eq!((s.null_frac, s.distinct, s.width), (0.0, -0.166_666_67, 3));
+        let z: Vec<_> = (1..=20)
+            .map(|i| (i % 2 != 0).then(|| text(format!("s{}", i % 9))).flatten())
+            .collect();
+        let s = analyze_column(&z, -1);
+        assert_eq!((s.null_frac, s.distinct, s.width), (0.5, -0.45, 3));
+        let s = analyze_column(&vec![None; 20], 4);
+        assert_eq!((s.null_frac, s.distinct, s.width), (1.0, 0.0, 4));
+        let m: Vec<_> = (1..=200)
+            .map(|i| int(Some(if i < 5 { i } else { 100 })))
+            .collect();
+        assert_eq!(analyze_column(&m, 4).distinct, 5.0);
+        let b: Vec<_> = (1..=200usize)
+            .map(|i| {
+                let t = "z".repeat(i);
+                let size = if i < 127 { i + 1 } else { i + 4 };
+                Some((t.into_bytes(), size))
+            })
+            .collect();
+        let s = analyze_column(&b, -1);
+        assert_eq!((s.distinct, s.width), (-1.0, 102));
+    }
+
+    /// PostgreSQL 15.19's group estimates over those analysed tables
+    /// (`EXPLAIN`): 258 groups of the unique column with NULLs, 50 of
+    /// `group by g, t` (g = i % 3, 3 distinct, t 50) over 300 rows, and 3
+    /// of a column whose 3 values were measured over 20 rows (-0.15) after
+    /// 10 more rows on the same page.
+    #[test]
+    fn estimates_over_analyzed_tables_match_postgres() {
+        let analyzed = |null_frac: f32, distinct: f32, unique: bool| KeyStat::Analyzed {
+            stats: ColumnStats {
+                null_frac,
+                distinct,
+                width: 4,
+            },
+            unique,
+        };
+        assert_eq!(
+            estimate_groups(&[analyzed(0.14, -0.86, true)], 300.0, 300.0),
+            258
+        );
+        assert_eq!(
+            estimate_groups(
+                &[
+                    analyzed(0.0, 3.0, false),
+                    analyzed(0.0, -0.166_666_67, false)
+                ],
+                300.0,
+                300.0
+            ),
+            50
+        );
+        assert_eq!(
+            estimate_groups(&[analyzed(0.0, -0.15, false)], 20.0, 20.0),
+            3
+        );
+        assert_eq!(
+            estimate_groups(&[analyzed(1.0, 0.0, false)], 300.0, 300.0),
+            200
+        );
+    }
+
+    /// PostgreSQL 15.19, 300 rows analysed, 7 groups estimated (an 8-bucket
+    /// table, which grows at 7 members): `g = i % 7` emits 1 5 4 2 0 6 3,
+    /// because the rows after the seventh group's first grow the table;
+    /// with the seventh group arriving on the last row (`99`), nothing grows
+    /// it and the order is 0 1 99 3 5 4 2. And `h = i % 4` over 20 rows (4
+    /// estimated, a 4-bucket table growing at 3) emits 0 1 3 2.
+    #[test]
+    fn the_table_grows_as_postgres_grows_it() {
+        let ints = |vals: &[i32]| -> Vec<Vec<Option<Bson>>> {
+            vals.iter().map(|v| vec![Some(Bson::Int32(*v))]).collect()
+        };
+        let int4 = ["int4".to_string()];
+        let emitted = |vals: &[i32], nbuckets: u64, trailing: bool| -> Vec<i32> {
+            hash_agg_order(&ints(vals), &int4, nbuckets, trailing)
+                .unwrap()
+                .iter()
+                .map(|&i| vals[i])
+                .collect()
+        };
+        assert_eq!(
+            emitted(&[1, 2, 3, 4, 5, 6, 0], 7, true),
+            [1, 5, 4, 2, 0, 6, 3]
+        );
+        assert_eq!(
+            emitted(&[1, 2, 3, 4, 5, 0, 99], 7, false),
+            [0, 1, 99, 3, 5, 4, 2]
+        );
+        assert_eq!(emitted(&[1, 2, 3, 0], 4, true), [0, 1, 3, 2]);
     }
 }

@@ -1238,6 +1238,80 @@ def test_prepared_fetch_follows_the_cursors_columns(pg: Any) -> None:
 
 
 @pytest.mark.backlog_fixed("RP-028")
+def test_group_by_over_an_analyzed_table_comes_out_in_hash_order(pg: Any) -> None:
+    """PostgreSQL 15.19: after ANALYZE the planner estimates the 11 groups
+    ANALYZE counted rather than its default 200, so the HashAggregate's
+    table is 16 buckets and the 300 rows' groups come out
+    8 9 10 7 1 5 4 2 0 6 3."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp028_s (k int primary key, g int)")
+        pg.execute("insert into rp028_s select i, (i * 7) % 11 from generate_series(1, 300) i")
+        pg.execute("analyze rp028_s")
+        got = pg_answer(pg, "select g from rp028_s group by g")
+    finally:
+        pg.execute("rollback")
+    assert got == ("ok", [(g,) for g in [8, 9, 10, 7, 1, 5, 4, 2, 0, 6, 3]])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_distinct_over_an_analyzed_column_with_nulls_comes_out_in_hash_order(
+    pg: Any,
+) -> None:
+    """PostgreSQL 15.19: a text column a quarter NULL, 9 values, analysed
+    over 300 rows: `select distinct t` estimates 9 groups and returns NULL
+    n4 n5 n8 n6 n2 n3 n1 n0 n7."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp028_n (k int, t text)")
+        pg.execute(
+            "insert into rp028_n select i, case when i % 4 = 0 then null"
+            " else 'n' || (i % 9) end from generate_series(1, 300) i"
+        )
+        pg.execute("analyze rp028_n")
+        got = pg_answer(pg, "select distinct t from rp028_n")
+    finally:
+        pg.execute("rollback")
+    want = [None, "n4", "n5", "n8", "n6", "n2", "n3", "n1", "n0", "n7"]
+    assert got == ("ok", [(t,) for t in want])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_rows_inserted_after_analyze_keep_its_estimate(pg: Any) -> None:
+    """PostgreSQL 15.19: ANALYZE's statistics are a snapshot. Over 20 rows
+    it measured b's 3 values (-0.15 of the rows); 10 more rows on the same
+    page leave the estimate at 20 rows and 3 groups, so the fourth group
+    lands in a 4-bucket table and the groups come out 0 1 3 2."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp028_p (a int, b int)")
+        pg.execute("insert into rp028_p select i, i / 10 from generate_series(1, 20) i")
+        pg.execute("analyze rp028_p")
+        pg.execute("insert into rp028_p select i, i / 10 from generate_series(21, 30) i")
+        got = pg_answer(pg, "select b, count(*) from rp028_p group by b")
+    finally:
+        pg.execute("rollback")
+    assert got == ("ok", [(0, 9), (1, 10), (3, 1), (2, 10)])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_rows_after_the_last_group_grow_the_hash_table(pg: Any) -> None:
+    """PostgreSQL 15.19: 7 groups estimated make an 8-bucket table that
+    grows at 7 members; the rows after the seventh group's first look it
+    up and grow it (`SH_INSERT` checks the fill on every lookup), so 300
+    analysed rows of `i % 7` come out 1 5 4 2 0 6 3."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp028_q (k int, g int)")
+        pg.execute("insert into rp028_q select i, i % 7 from generate_series(1, 300) i")
+        pg.execute("analyze rp028_q")
+        got = pg_answer(pg, "select g from rp028_q group by g")
+    finally:
+        pg.execute("rollback")
+    assert got == ("ok", [(g,) for g in [1, 5, 4, 2, 0, 6, 3]])
+
+
+@pytest.mark.backlog_fixed("RP-028")
 def test_many_to_many_merge_join_leaves_ties_as_its_sorts_do(pg: Any) -> None:
     """PostgreSQL 15.19: `on l.b = r.c` over two fresh keyed tables is a
     Merge Join over two Sorts, so equal keys come out as PostgreSQL's
@@ -1260,12 +1334,11 @@ def test_many_to_many_merge_join_leaves_ties_as_its_sorts_do(pg: Any) -> None:
     assert " ".join(f"{a}:{b}" for a, b in got[1][:12]) == want
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_merge_join_under_a_where_sorts_the_rows_it_keeps(pg: Any) -> None:
     """PostgreSQL 15.19: with `where l.a < 10` the merge join sorts only the
     left rows the WHERE keeps (a bitmap heap scan's), so their ties come out
-    7 8 1 9 2 3 4; here the WHERE is applied over the joined rows, after a
-    sort of the whole left side."""
+    7 8 1 9 2 3 4."""
     pg.execute("begin")
     try:
         pg.execute("create table rp028_jl (a int primary key, b int)")
@@ -1282,3 +1355,52 @@ def test_merge_join_under_a_where_sorts_the_rows_it_keeps(pg: Any) -> None:
     want = "7:5 7:20 7:15 7:10 8:11 8:6 8:1 8:16 1:11 1:6 1:1 1:16"
     assert got[0] == "ok"
     assert " ".join(f"{a}:{b}" for a, b in got[1][:12]) == want
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_merge_join_on_an_expression_sorts_by_its_value(pg: Any) -> None:
+    """PostgreSQL 15.19: `on l.b = r.c + 3` is a Merge Join over two Sorts,
+    the right one by `c + 3`, so the rows come out in key order, each key's
+    right rows as PostgreSQL's quicksort leaves them (5 20 15 10)."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp028_jl (a int primary key, b int)")
+        pg.execute("insert into rp028_jl select i, i % 7 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jr (a int primary key, c int)")
+        pg.execute("insert into rp028_jr select i, i % 5 from generate_series(1, 20) i")
+        got = pg_answer(
+            pg,
+            "select rp028_jl.a, rp028_jr.a from rp028_jl join rp028_jr"
+            " on rp028_jl.b = rp028_jr.c + 3",
+        )
+    finally:
+        pg.execute("rollback")
+    want = "3:5 3:20 3:15 3:10 10:5 10:20 10:15 10:10"
+    assert got[0] == "ok"
+    assert " ".join(f"{a}:{b}" for a, b in got[1][:8]) == want
+
+
+@pytest.mark.backlog("RP-028")
+def test_join_with_a_second_equality_between_its_sides(pg: Any) -> None:
+    """PostgreSQL 15.19: `on l.b = r.c where r.c = l.a` puts all three
+    columns in one equivalence class, so `l.a = l.b` becomes a filter on
+    the left side and the join a Hash Join with the left side hashed: the
+    rows come out in the right side's scan order (1:1 2:2 3:3 4:4 1:6 ...);
+    here the second equality is evaluated over the joined rows of a join
+    on the first."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp028_jl (a int primary key, b int)")
+        pg.execute("insert into rp028_jl select i, i % 7 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jr (a int primary key, c int)")
+        pg.execute("insert into rp028_jr select i, i % 5 from generate_series(1, 20) i")
+        got = pg_answer(
+            pg,
+            "select rp028_jl.a, rp028_jr.a from rp028_jl join rp028_jr"
+            " on rp028_jl.b = rp028_jr.c where rp028_jr.c = rp028_jl.a",
+        )
+    finally:
+        pg.execute("rollback")
+    want = "1:1 2:2 3:3 4:4 1:6 2:7 3:8 4:9"
+    assert got[0] == "ok"
+    assert " ".join(f"{a}:{b}" for a, b in got[1][:8]) == want
