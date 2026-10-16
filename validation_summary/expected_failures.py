@@ -38,6 +38,13 @@ _JS_MAP_REDUCE = (
     "Accepted by Joe 2026-10-16 (RM-027)."
 )
 
+_WHERE_JS = (
+    "Holds a connection with `$where: sleep(...)`, which needs server-side "
+    "JavaScript. The Rust server refuses `$where` as `mongod --noscripting` "
+    "8.2.11 does (6108304); no JavaScript engine is planned, MongoDB "
+    "deprecated `$where` in 8.0. Scope decision by Joe 2026-10-16."
+)
+
 
 JAVA: list[ExpectedFailure] = [
     ExpectedFailure(
@@ -161,6 +168,17 @@ GO: list[ExpectedFailure] = [
     ExpectedFailure(
         pattern="TestIndexView",
         rationale="Rollup of the `drop_one` / `drop_all` / `create_many` subtests above.",
+    ),
+    # Leaves only, not their TestSDAMErrorHandling rollups: another child
+    # failing there must still count. TestConnectionPoolBackpressure is left
+    # out too, because it also needs the ingress rate limiter (RM-008).
+    ExpectedFailure(
+        pattern="pool_not_cleared_on_timeout_network_error",
+        rationale=_WHERE_JS,
+    ),
+    ExpectedFailure(
+        pattern="pool_not_cleared_on_context_cancellation",
+        rationale=_WHERE_JS,
     ),
 ]
 

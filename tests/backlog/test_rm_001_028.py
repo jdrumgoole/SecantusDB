@@ -112,18 +112,6 @@ def test_ingress_connection_rate_limiter_parameters(rust_mongo: Any, mongod: Any
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-009")
-def test_where_runs_javascript(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 (scripting enabled, its default) evaluates `$where`."""
-    answers = {}
-    for name, db in _both(rust_mongo, mongod, "rm009"):
-        db.c.insert_many([{"_id": i, "c": i} for i in range(5)])
-        answers[name] = mongo_answer(
-            lambda db=db: list(db.c.find({"$where": "this.c == 3 || this.c == 1"}).sort("_id", 1))
-        )
-    assert answers["rust"] == answers["mongod"]
-
-
 @pytest.mark.backlog_fixed("RM-010")
 def test_geo_intersects_unsorted_order(rust_mongo: Any, mongod: Any) -> None:
     """The Java `GeoJsonFilters` fixture over a 2dsphere index, no sort:
