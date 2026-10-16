@@ -793,10 +793,9 @@ Still different:
       and each index's own table, and here collections share a documents
       shard table and every index one entries table, so no per-collection
       statistics exist; the shard table's own would count other
-      collections too); `latencyStats` is zeros; `listDatabases` lists no
-      `config` (mongod writes its sessions to `config.system.sessions`;
-      here they are kept in memory), so `dbHash` on `config` differs, as on
-      `admin` does (`admin.system.keys` holds random signing keys there, a
+      collections too); `latencyStats` is zeros; `config.system.sessions`
+      exists but holds no sessions (mongod writes them there; here they are
+      kept in memory), so `dbHash` on `config` differs, as on `admin` does (`admin.system.keys` holds random signing keys there, a
       digest no server could match); `connectionStatus` lists no
       privileges for a user who has some; `hostInfo.extra` is empty on
       Linux. `$indexStats` counts the plan the `explain` planner picks:
@@ -808,7 +807,7 @@ Still different:
       than creation order, gives an index `spec` in `listIndexes`' key
       order, and reads a geo index's `multikey` from the documents now.
       Backlog-ID: RM-040
-      Verify: tests/backlog/test_rm_029_056.py::test_coll_stats_wiredtiger_and_index_details,tests/backlog/test_rm_029_056.py::test_list_databases_lists_admin_and_config
+      Verify: tests/backlog/test_rm_029_056.py::test_coll_stats_wiredtiger_and_index_details
 - [ ] **RUST MongoDB server: `$listLocalSessions` / `$listSessions` do not
       know whose session is whose.** With `--auth`, mongod 8.2.11 lists
       only the caller's sessions for `$listLocalSessions: {}`, each `_id.uid`

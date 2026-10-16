@@ -302,7 +302,7 @@ def test_db_stats_counts_view_definitions(rust_mongo: Any, mongod: Any) -> None:
     assert run(rust_mongo) == run(mongod)
 
 
-@pytest.mark.backlog("RM-040")
+@pytest.mark.backlog_fixed("RM-040")
 def test_list_databases_lists_admin_and_config(rust_mongo: Any) -> None:
     """mongod 8.2.11 lists `admin`, `config` and `local`."""
     names = {d["name"] for d in rust_mongo.admin.command("listDatabases")["databases"]}
