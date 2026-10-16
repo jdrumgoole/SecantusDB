@@ -340,6 +340,33 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **RUST pgserver: the lock manager shows less than PostgreSQL's, and
+  some statements take the wrong relation lock.** What works, measured
+  against PostgreSQL 15.19 with two sessions (2026-10-16): the eight table
+  lock modes and their conflicts, deadlock detection (40P01) over table and
+  row locks, `lock_timeout` / `statement_timeout` on a lock wait, `NOWAIT`
+  and `SKIP LOCKED`, the four row-lock strengths' conflicts, DDL waiting on
+  a reader and CREATE INDEX on a writer, and advisory locks. What differs:
+  - The relation lock a row-locking or writing statement takes: `SELECT
+    ... FOR UPDATE` / `FOR SHARE` show `AccessShareLock` where PostgreSQL
+    takes `RowShareLock`; `UPDATE` and `DELETE` show an extra
+    `AccessShareLock` beside their `RowExclusiveLock`; `TRUNCATE` shows no
+    `ShareLock` beside its `AccessExclusiveLock`.
+  - `pg_locks` has no `transactionid` or `virtualxid` locks: PostgreSQL
+    shows each transaction's own `ExclusiveLock` on both, and a session
+    waiting for a row as a `ShareLock` it has not been granted on the
+    holder's transaction id (`XactLockTableWait`), which is how row waits
+    reach the deadlock detector there.
+  - A session blocked on a lock is not visible as one: PostgreSQL shows it
+    in `pg_stat_activity` with `wait_event_type = 'Lock'` and
+    `pg_blocking_pids()` returns the holder; here neither.
+  Not measured yet: `deadlock_timeout`'s delay, the order queued waiters
+  are granted in, `pg_locks`' other columns (`virtualtransaction`,
+  `fastpath`, `waitstart`), and predicate locks (`SIReadLock`) under
+  SERIALIZABLE.
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_row_locking_statements_take_postgres_relation_lock_modes, tests/backlog/test_rust_postgres_gaps.py::test_pg_locks_shows_transaction_id_locks, tests/backlog/test_rust_postgres_gaps.py::test_a_row_lock_waiter_waits_on_the_holders_transaction_id, tests/backlog/test_rust_postgres_gaps.py::test_a_lock_waiter_is_visible_with_its_blocker
+  Backlog-ID: RP-047
+
 - [ ] **RUST pgserver: the planner's choices that decide row order are only
   partly modelled.** **Decided (Joe, 2026-10-16): build a cost model** --
   enough of PostgreSQL's planner to make its choices, since the order rows

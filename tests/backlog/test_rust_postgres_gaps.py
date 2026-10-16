@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import contextlib
+import threading
+import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -1732,3 +1735,138 @@ def test_four_tables_with_a_shared_key_join_on_its_class(pg: Any) -> None:
     want = "7:5:5:5 14:5:5:5 7:20:20:20 14:20:20:20 7:15:15:15 14:15:15:15"
     assert got[0] == "ok"
     assert " ".join(f"{a}:{b}:{c}:{d}" for a, b, c, d in got[1][:6]) == want
+
+
+# RP-047: the lock manager. Each test needs two sessions on one server, so
+# it opens its own connections to the module's `rust_pg`; the expected
+# values were measured on PostgreSQL 15.19 with two sessions on a private
+# cluster.
+
+
+def _rp047_table(rust_pg: Any, name: str) -> None:
+    with rust_pg.connect() as c:
+        c.execute(f"drop table if exists {name}")
+        c.execute(f"create table {name} (id int primary key, v int)")
+        c.execute(f"insert into {name} values (1, 0), (2, 0)")
+
+
+def _relation_modes(rust_pg: Any, table: str, statement: str) -> list[str]:
+    with rust_pg.connect(autocommit=False) as a, rust_pg.connect() as c:
+        a.execute(statement)
+        pid = a.execute("select pg_backend_pid()").fetchone()[0]
+        rows = c.execute(
+            "select mode from pg_locks where locktype = 'relation'"
+            f" and relation = '{table}'::regclass and pid = %s order by mode",
+            (pid,),
+        ).fetchall()
+        a.rollback()
+    return [r[0] for r in rows]
+
+
+@pytest.mark.backlog("RP-047")
+def test_row_locking_statements_take_postgres_relation_lock_modes(rust_pg: Any) -> None:
+    """PostgreSQL 15.19: `FOR UPDATE` and `FOR SHARE` take RowShareLock on
+    the table, `DELETE` RowExclusiveLock alone, `TRUNCATE`
+    AccessExclusiveLock and ShareLock; here FOR UPDATE / FOR SHARE show
+    AccessShareLock, DELETE an extra AccessShareLock, TRUNCATE no
+    ShareLock."""
+    _rp047_table(rust_pg, "rp047_m")
+    got = {
+        "for update": _relation_modes(rust_pg, "rp047_m", "select * from rp047_m for update"),
+        "for share": _relation_modes(rust_pg, "rp047_m", "select * from rp047_m for share"),
+        "delete": _relation_modes(rust_pg, "rp047_m", "delete from rp047_m where id = 2"),
+        "truncate": _relation_modes(rust_pg, "rp047_m", "truncate rp047_m"),
+    }
+    assert got == {
+        "for update": ["RowShareLock"],
+        "for share": ["RowShareLock"],
+        "delete": ["RowExclusiveLock"],
+        "truncate": ["AccessExclusiveLock", "ShareLock"],
+    }
+
+
+@pytest.mark.backlog("RP-047")
+def test_pg_locks_shows_transaction_id_locks(rust_pg: Any) -> None:
+    """PostgreSQL 15.19: a transaction that has written holds an
+    ExclusiveLock on its own transaction id and on its virtual one, both
+    shown in `pg_locks`; here neither is."""
+    _rp047_table(rust_pg, "rp047_x")
+    with rust_pg.connect(autocommit=False) as a, rust_pg.connect() as c:
+        a.execute("update rp047_x set v = 5 where id = 1")
+        pid = a.execute("select pg_backend_pid()").fetchone()[0]
+        got = c.execute(
+            "select locktype, mode, granted from pg_locks"
+            " where locktype in ('transactionid', 'virtualxid') and pid = %s order by locktype",
+            (pid,),
+        ).fetchall()
+        a.rollback()
+    assert got == [("transactionid", "ExclusiveLock", True), ("virtualxid", "ExclusiveLock", True)]
+
+
+def _with_a_waiter(rust_pg: Any, hold: str, wait: str, look: Callable[[Any, int], Any]) -> Any:
+    """Session A runs `hold` in a transaction; session B runs `wait`, which
+    blocks on it, in a thread; `look(observer, a_pid)` reads the catalogs
+    while B waits. A then rolls back, releasing B."""
+    a = rust_pg.connect(autocommit=False)
+    b = rust_pg.connect(autocommit=False)
+    c = rust_pg.connect()
+    try:
+        b.execute("set lock_timeout = '10s'")
+        a.execute(hold)
+        a_pid = a.execute("select pg_backend_pid()").fetchone()[0]
+
+        def blocked() -> None:
+            with contextlib.suppress(psycopg.Error):
+                b.execute(wait)
+
+        t = threading.Thread(target=blocked, daemon=True)
+        t.start()
+        time.sleep(0.5)
+        got = look(c, a_pid)
+        a.rollback()
+        t.join(10)
+        return got
+    finally:
+        for conn in (a, b, c):
+            with contextlib.suppress(psycopg.Error):
+                conn.rollback()
+            conn.close()
+
+
+@pytest.mark.backlog("RP-047")
+def test_a_row_lock_waiter_waits_on_the_holders_transaction_id(rust_pg: Any) -> None:
+    """PostgreSQL 15.19: a session waiting for a row another transaction
+    updated shows in `pg_locks` as an ungranted ShareLock on that
+    transaction's id (`XactLockTableWait`); here no lock is ungranted."""
+    _rp047_table(rust_pg, "rp047_r")
+    got = _with_a_waiter(
+        rust_pg,
+        "update rp047_r set v = 5 where id = 1",
+        "update rp047_r set v = v + 10 where id = 1",
+        lambda c, _pid: c.execute(
+            "select locktype, mode, granted from pg_locks where not granted"
+        ).fetchall(),
+    )
+    assert got == [("transactionid", "ShareLock", False)]
+
+
+@pytest.mark.backlog("RP-047")
+def test_a_lock_waiter_is_visible_with_its_blocker(rust_pg: Any) -> None:
+    """PostgreSQL 15.19: a session blocked on a table lock shows in
+    `pg_stat_activity` with `wait_event_type = 'Lock'`, and
+    `pg_blocking_pids()` gives the holder; here neither."""
+    _rp047_table(rust_pg, "rp047_w")
+
+    def look(c: Any, a_pid: int) -> Any:
+        rows = c.execute(
+            "select pg_blocking_pids(pid) from pg_stat_activity where wait_event_type = 'Lock'"
+        ).fetchall()
+        return [list(r[0]) == [a_pid] for r in rows]
+
+    got = _with_a_waiter(
+        rust_pg,
+        "lock table rp047_w in access exclusive mode",
+        "select * from rp047_w",
+        look,
+    )
+    assert got == [True]
