@@ -170,6 +170,8 @@ pub struct Index {
     pub unique: bool,
     pub pages: f64,
     pub height: u32,
+    /// Its key columns, in order (the first is `field`).
+    pub columns: Vec<String>,
 }
 
 /// `index_pages_fetched` (Mackert and Lohman) for one table that fits
@@ -186,19 +188,21 @@ fn index_pages_fetched(tuples_fetched: f64, pages: f64) -> f64 {
 
 /// An index path's cost before the heap: `(startup, total, selectivity)`
 /// (`btcostestimate` over `genericcostestimate`), or `None` when no qual
-/// can be an index qual.
+/// can be an index qual -- unless `full`, a scan of the whole index for its
+/// order.
 fn index_cost(
     rel: &Rel,
     index: &Index,
     quals: &[(String, Qual)],
     ndistinct: f64,
+    full: bool,
 ) -> Option<(f64, f64, f64)> {
     let iq: Vec<&Qual> = quals
         .iter()
         .filter(|(f, q)| f == &index.field && !matches!(q, Qual::Ne))
         .map(|(_, q)| q)
         .collect();
-    if iq.is_empty() {
+    if iq.is_empty() && !full {
         return None;
     }
     let sel = column_selectivity(iq.iter().copied(), ndistinct);
@@ -251,7 +255,7 @@ fn bitmap_heap_cost(
     ndistinct: f64,
     rows: f64,
 ) -> Option<(f64, f64)> {
-    let (_, index_total, sel) = index_cost(rel, index, quals, ndistinct)?;
+    let (_, index_total, sel) = index_cost(rel, index, quals, ndistinct, false)?;
     let startup = index_total + 0.1 * CPU_OPERATOR_COST * rows;
     let tuples_fetched = clamp_row_est(sel * rel.tuples);
     let t = if rel.pages > 1.0 { rel.pages } else { 1.0 };
@@ -273,7 +277,29 @@ fn index_scan_cost(
     quals: &[(String, Qual)],
     ndistinct: f64,
 ) -> Option<(f64, f64)> {
-    let (startup, index_total, sel) = index_cost(rel, index, quals, ndistinct)?;
+    index_scan(rel, index, quals, ndistinct, false)
+}
+
+/// An index scan read for its order (`build_index_paths` keeps one whose
+/// pathkeys are useful): over its index quals, or the whole index when no
+/// qual restricts its leading column. `(startup, total)`.
+pub fn ordered_index_scan(
+    rel: &Rel,
+    index: &Index,
+    quals: &[(String, Qual)],
+    ndistinct: f64,
+) -> (f64, f64) {
+    index_scan(rel, index, quals, ndistinct, true).unwrap_or((0.0, f64::INFINITY))
+}
+
+fn index_scan(
+    rel: &Rel,
+    index: &Index,
+    quals: &[(String, Qual)],
+    ndistinct: f64,
+    full: bool,
+) -> Option<(f64, f64)> {
+    let (startup, index_total, sel) = index_cost(rel, index, quals, ndistinct, full)?;
     let tuples_fetched = clamp_row_est(sel * rel.tuples);
     let io = index_pages_fetched(tuples_fetched, rel.pages) * RANDOM_PAGE_COST;
     let other = qual_cost(
@@ -352,22 +378,7 @@ pub fn sorted_grouping_wins(
     aggs: Option<AggCosts>,
     ordered: bool,
 ) -> bool {
-    let a = aggs.unwrap_or_default();
-    let cols = CPU_OPERATOR_COST * ncols as f64 * rows;
-    let hash_startup = input_total + a.trans_per_tuple * rows + cols;
-    let hash_total = hash_startup + a.final_per_group * groups + CPU_TUPLE_COST * groups;
-    let n = rows.max(2.0);
-    let sort_startup = input_total + 2.0 * CPU_OPERATOR_COST * n * n.log2();
-    let sort_total = sort_startup + CPU_OPERATOR_COST * rows;
-    let group_total = sort_total
-        + cols
-        + match aggs {
-            Some(a) => {
-                a.trans_per_tuple * rows + a.final_per_group * groups + CPU_TUPLE_COST * groups
-            }
-            None => 0.0,
-        };
-    let (h, s) = ((hash_startup, hash_total), (sort_startup, group_total));
+    let (h, s) = grouping_costs(input_total, rows, groups, ncols, aggs);
     // compare_path_costs_fuzzily(hash, sorted); the sorted path has the
     // better pathkeys.
     let f = STD_FUZZ_FACTOR;
@@ -406,6 +417,70 @@ pub fn sorted_grouping_wins(
     }
 }
 
+/// Whether a grouping under a LIMIT of `limit` rows (OFFSET included) is
+/// read sorted: the planner keeps, besides the HashAggregate and the Sort +
+/// Group over the cheapest scan, a Group over each scan already in the
+/// group keys' order (`presorted`, `(startup, total)`), and the LIMIT takes
+/// the one cheapest to its first rows -- `startup + (total - startup) *
+/// limit / groups` (`create_limit_path`, `get_cheapest_fractional_path`).
+pub fn limited_grouping_sorted(
+    input_total: f64,
+    rows: f64,
+    groups: f64,
+    ncols: usize,
+    aggs: Option<AggCosts>,
+    limit: f64,
+    presorted: &[(f64, f64, f64)],
+) -> bool {
+    let (h, s) = grouping_costs(input_total, rows, groups, ncols, aggs);
+    let fraction = (limit / groups.max(1.0)).min(1.0);
+    let first = |(startup, total): (f64, f64)| startup + (total - startup) * fraction;
+    let hash = first(h);
+    let mut best_sorted = first(s);
+    for &(startup, total, input_rows) in presorted {
+        let a = aggs.unwrap_or_default();
+        let cols = CPU_OPERATOR_COST * ncols as f64 * input_rows;
+        let total = total
+            + cols
+            + match aggs {
+                Some(_) => {
+                    a.trans_per_tuple * input_rows
+                        + a.final_per_group * groups
+                        + CPU_TUPLE_COST * groups
+                }
+                None => 0.0,
+            };
+        best_sorted = best_sorted.min(first((startup, total)));
+    }
+    best_sorted < hash
+}
+
+/// The HashAggregate's and the Sort + Group's `(startup, total)`.
+fn grouping_costs(
+    input_total: f64,
+    rows: f64,
+    groups: f64,
+    ncols: usize,
+    aggs: Option<AggCosts>,
+) -> ((f64, f64), (f64, f64)) {
+    let a = aggs.unwrap_or_default();
+    let cols = CPU_OPERATOR_COST * ncols as f64 * rows;
+    let hash_startup = input_total + a.trans_per_tuple * rows + cols;
+    let hash_total = hash_startup + a.final_per_group * groups + CPU_TUPLE_COST * groups;
+    let n = rows.max(2.0);
+    let sort_startup = input_total + 2.0 * CPU_OPERATOR_COST * n * n.log2();
+    let sort_total = sort_startup + CPU_OPERATOR_COST * rows;
+    let group_total = sort_total
+        + cols
+        + match aggs {
+            Some(a) => {
+                a.trans_per_tuple * rows + a.final_per_group * groups + CPU_TUPLE_COST * groups
+            }
+            None => 0.0,
+        };
+    ((hash_startup, hash_total), (sort_startup, group_total))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,6 +510,7 @@ mod tests {
             unique: true,
             pages: 2.0,
             height: 0,
+            columns: vec!["k".into()],
         }
     }
     fn q(filter: Document) -> Vec<(String, Qual)> {
@@ -446,7 +522,7 @@ mod tests {
         let range = q(bson::doc! {"k": {"$gt": 5, "$lt": 30}});
         // Bitmap Index Scan (0.00..4.21 rows=6), Bitmap Heap Scan
         // (4.21..13.70 rows=6) over t3.
-        let (_, it, _) = index_cost(&t3(), &pkey(), &range, 1200.0).unwrap();
+        let (_, it, _) = index_cost(&t3(), &pkey(), &range, 1200.0, false).unwrap();
         assert!(close(it, 4.21), "{it}");
         let (s, t) = bitmap_heap_cost(&t3(), &pkey(), &range, 1200.0, 6.0).unwrap();
         assert!(close(s, 4.21) && close(t, 13.70), "{s} {t}");
@@ -495,6 +571,61 @@ mod tests {
         assert!(!sorted_grouping_wins(32.60, 2260.0, 200.0, 1, None, false));
         // tb `group by g, b` over 11 rows into 11 groups: Sort + Group.
         assert!(sorted_grouping_wins(14.97, 11.0, 11.0, 2, None, false));
+    }
+
+    #[test]
+    fn a_limit_reads_an_index_in_its_order() {
+        let nd = |_: &str| 2260.0;
+        // `select k from t2 group by k limit 5`: Index Only Scan
+        // (0.15..82.06), Group (0.15..87.71), Limit (0.15..0.35).
+        let (s, t) = ordered_index_scan(&t2(), &pkey(), &[], nd("k"));
+        assert!(close(s, 0.15) && close(t, 82.06), "{s} {t}");
+        assert!(limited_grouping_sorted(
+            32.60,
+            2260.0,
+            2260.0,
+            1,
+            None,
+            5.0,
+            &[(s, t, 2260.0)]
+        ));
+        // `where k > 5 and k < 30 ... limit 5` over 40 rows: HashAggregate
+        // over the bitmap heap scan (Limit 14.99..15.04).
+        let range = q(bson::doc! {"k": {"$gt": 5, "$lt": 30}});
+        let (s, t) = ordered_index_scan(&t2(), &pkey(), &range, nd("k"));
+        assert!(!limited_grouping_sorted(
+            14.97,
+            11.0,
+            11.0,
+            1,
+            None,
+            5.0,
+            &[(s, t, 11.0)]
+        ));
+        // Over 3,000 rows (14 pages, 3,164 tuples, an 11-page index of
+        // height 1): Group over the Index Only Scan (0.28..48.60).
+        let rel = Rel {
+            pages: 14.0,
+            tuples: 3164.0,
+        };
+        let ix = Index {
+            pages: 11.0,
+            height: 1,
+            ..pkey()
+        };
+        let (s, t) = ordered_index_scan(&rel, &ix, &range, nd("k"));
+        assert!(close(s, 0.28) && close(t, 48.60), "{s} {t}");
+        let input = cheapest_scan(&rel, &[ix], &range, &nd, 16.0);
+        assert!(close(input, 19.43), "{input}");
+        assert!(limited_grouping_sorted(
+            input,
+            16.0,
+            16.0,
+            1,
+            None,
+            5.0,
+            &[(s, t, 16.0)]
+        ));
     }
 
     #[test]

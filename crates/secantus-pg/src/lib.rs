@@ -556,8 +556,8 @@ type EnumWithSchema = (String, String, i64, Vec<String>);
 /// What a grouping asks of the planner beyond its keys, for the choice
 /// between a HashAggregate and a Sort + Group (RP-028).
 struct GroupingShape {
-    /// A LIMIT with no ORDER BY.
-    limited: bool,
+    /// A LIMIT with no ORDER BY: the rows it takes, OFFSET included.
+    limit: Option<f64>,
     /// A GROUP BY, whose other columns a whole primary key makes redundant;
     /// not a DISTINCT.
     group_by: bool,
@@ -5542,7 +5542,10 @@ impl PgHandler {
             .iter()
             .map(|k| (k.field.clone(), k.pg_type.clone()))
             .collect();
-        let limited = agg.limit.is_some() && agg.order.is_empty();
+        let limit = agg
+            .limit
+            .filter(|_| agg.order.is_empty())
+            .map(|l| (l.max(0) + agg.offset.max(0)) as f64);
         use secantus_pgplan::AggFunc;
         let finals = agg
             .items
@@ -5559,7 +5562,7 @@ impl PgHandler {
             })
             .count();
         let shape = GroupingShape {
-            limited,
+            limit,
             group_by: true,
             aggs: (!agg.items.is_empty())
                 .then(|| secantus_pgplan::costsize::AggCosts::simple(agg.items.len(), finals)),
@@ -5585,10 +5588,10 @@ impl PgHandler {
     /// hashed as PostgreSQL hashes it, or the estimate is past PostgreSQL's
     /// hash memory.
     ///
-    /// A LIMIT with no ORDER BY over a key an index leads is declined until
-    /// the planner's path comparison is modelled (RP-028): PostgreSQL reads
-    /// the index there (a Group over the index scan, which the LIMIT makes
-    /// cheap) rather than hashing.
+    /// Under a LIMIT with no ORDER BY the planner also weighs a Group over
+    /// an index scan in the keys' order, which the LIMIT makes cheap
+    /// (`costsize::limited_grouping_sorted`); a LIMIT over a WHERE the model
+    /// cannot price is declined.
     fn hash_agg_order_over(
         &self,
         table: &str,
@@ -5599,23 +5602,6 @@ impl PgHandler {
         shape: &GroupingShape,
     ) -> Option<Vec<usize>> {
         use secantus_pgplan::{costsize, hashagg};
-        if shape.limited {
-            let indexes = self
-                .storage
-                .list_indexes(self.db(), table)
-                .unwrap_or_default();
-            let leads = |field: &str| {
-                indexes.iter().any(|ix| {
-                    ix.get_document("key")
-                        .ok()
-                        .and_then(|k| k.keys().next().cloned())
-                        .is_some_and(|first| first == field)
-                })
-            };
-            if key_cols.iter().any(|(field, _)| leads(field)) {
-                return None;
-            }
-        }
         let def = self
             .all_table_defs()
             .ok()?
@@ -5783,6 +5769,38 @@ impl PgHandler {
                     }
                 };
                 let input = costsize::cheapest_scan(&rel, &indexes, &quals, &ndistinct, read);
+                if let Some(limit) = shape.limit {
+                    // The indexes whose leading columns are the group keys
+                    // in order give the Group its input already sorted.
+                    let presorted: Vec<(f64, f64, f64)> = indexes
+                        .iter()
+                        .filter(|ix| {
+                            ix.columns.len() >= sort_keys.len()
+                                && sort_keys
+                                    .iter()
+                                    .zip(&ix.columns)
+                                    .all(|(k, c)| k.1 && &key_cols[k.0].0 == c)
+                        })
+                        .map(|ix| {
+                            let (s, t) = costsize::ordered_index_scan(
+                                &rel,
+                                ix,
+                                &quals,
+                                ndistinct(&ix.field),
+                            );
+                            (s, t, read)
+                        })
+                        .collect();
+                    return Some(costsize::limited_grouping_sorted(
+                        input,
+                        read,
+                        groups as f64,
+                        kept.len(),
+                        shape.aggs,
+                        limit,
+                        &presorted,
+                    ));
+                }
                 Some(costsize::sorted_grouping_wins(
                     input,
                     read,
@@ -5793,7 +5811,13 @@ impl PgHandler {
                 ))
             }
         };
-        let sorted = !sort_keys.is_empty() && (!shape.can_hash || priced().unwrap_or(false));
+        let sorted = !sort_keys.is_empty()
+            && (!shape.can_hash
+                || match priced() {
+                    Some(sorted) => sorted,
+                    None if shape.limit.is_some() => return None,
+                    None => false,
+                });
         if sorted {
             let mut order: Vec<usize> = (0..keys.len()).collect();
             order.sort_by(|&a, &b| {
@@ -5935,6 +5959,7 @@ impl PgHandler {
                 unique: unique && fields.len() == 1,
                 pages,
                 height,
+                columns: fields.clone(),
             });
         };
         let pk: Vec<String> = def
@@ -27073,11 +27098,14 @@ impl PgHandler {
                 None
             };
             if let Some(order) = key_cols.and_then(|cols| {
-                let limited = sel.limit.is_some() && sel.order.is_empty();
+                let limit = sel
+                    .limit
+                    .filter(|_| sel.order.is_empty())
+                    .map(|l| (l.max(0) + sel.offset.max(0)) as f64);
                 // With an ORDER BY the DISTINCT's own sort follows it, which
                 // is not modelled: the hash order is kept there.
                 let shape = GroupingShape {
-                    limited,
+                    limit,
                     group_by: false,
                     aggs: None,
                     can_hash: true,

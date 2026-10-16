@@ -16,6 +16,11 @@ More of the Rust PostgreSQL server's backlog, measured against PostgreSQL
   comparison. An aggregate with DISTINCT or its own ORDER BY, which
   PostgreSQL never hashes, comes out sorted too. Part of RP-028
   (tests/backlog/test_rust_postgres_gaps.py::test_few_estimated_rows_group_by_sorting).
+- **A GROUP BY or DISTINCT under a LIMIT reads an index when PostgreSQL
+  does**: the planner takes the plan cheapest to the rows the LIMIT keeps,
+  which over a whole table is a Group over an index in the keys' order, so
+  the first keys come back in order. Part of RP-028
+  (tests/backlog/test_rust_postgres_gaps.py::test_limit_reads_the_index_in_key_order).
 - **A GROUP BY holding a table's whole primary key groups by the key
   alone**, as PostgreSQL does, so its HashAggregate order is the key's.
   Part of RP-028

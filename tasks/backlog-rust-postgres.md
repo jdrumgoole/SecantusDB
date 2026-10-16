@@ -361,14 +361,13 @@ one beside it.
   `cost_group`, `cost_agg`, and `add_path`'s 1% fuzz, under which the
   sorted path's order wins a tie; a GROUP BY holding the whole primary key
   groups by it alone; an ORDER BY over the group keys moves them first;
-  an aggregate with DISTINCT or its own ORDER BY is never hashed. 124 of
-  124 shapes match 15.19 at 40, 300, 500 and 3,000 rows. Not yet:
-  - A LIMIT with no ORDER BY over a key an index leads: PostgreSQL reads
-    the index (a Group over the index scan, which the LIMIT makes cheap);
-    that shape is declined here, keeping the old order. It needs the
-    fractional costs a LIMIT compares.
+  an aggregate with DISTINCT or its own ORDER BY is never hashed; and
+  under a LIMIT with no ORDER BY a Group over an index scan in the keys'
+  order is weighed too, by the cost of the first rows the LIMIT takes.
+  186 of 186 shapes match 15.19 at 40, 300 and 3,000 rows. Not yet:
   - An `OR` in the WHERE (a BitmapOr path), which keeps the HashAggregate
-    unpriced; a DISTINCT with an ORDER BY, whose sort is not weighed.
+    unpriced (and is declined under a LIMIT); a DISTINCT with an ORDER BY,
+    whose sort is not weighed; an ORDER BY with a LIMIT.
   - A WHERE with a pattern, `IS NULL` or an expression (declined).
   - GROUP BY an expression, over a join or a subquery, and past about
     50,000 estimated groups, where the HashAggregate's spilling is priced.

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -114,14 +115,17 @@ def _connect_error(port: int, conninfo: str) -> str:
 
 
 @pytest.mark.backlog_fixed("RP-013")
-def test_unknown_user_is_asked_for_a_password(rust_pg: Any) -> None:
+def test_unknown_user_is_asked_for_a_password(tmp_path: Path) -> None:
     """PostgreSQL 15.19 (a scram-sha-256 cluster): a role nobody created is
     asked for a password and fails `password authentication failed for user
     "rp013_nobody"`. The server's default since Joe's decision of 2026-10-16
-    (`--trust-unknown-users` is the opt-out)."""
-    assert _connect_error(rust_pg.port, "user=rp013_nobody password=x dbname=postgres") == (
-        'password authentication failed for user "rp013_nobody"'
-    )
+    (`--trust-unknown-users` is the opt-out). Its own server: the module's
+    `rust_pg` trusts unknown users, so the other tests can connect."""
+    from tests.test_rust_pgserver_slice import _Server
+
+    with _Server(tmp_path, args=("--refuse-unknown-users",)) as server:
+        got = _connect_error(server.port, "user=rp013_nobody password=x dbname=postgres")
+    assert got == 'password authentication failed for user "rp013_nobody"'
 
 
 @pytest.mark.backlog_fixed("RP-013")
@@ -522,6 +526,25 @@ def test_order_by_moves_its_group_keys_first(pg: Any) -> None:
         "x5": [9, 5, 7, 2, 0, 3],
     }
     assert got == ("ok", [(g, t) for t, gs in want.items() for g in gs])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_limit_reads_the_index_in_key_order(pg: Any) -> None:
+    """PostgreSQL 15.19: under a LIMIT the planner takes the plan cheapest
+    to its first rows -- a Group over the primary key's index scan for a
+    whole table (Limit 0.15..0.35), so the first keys in order; but over
+    the 11 rows a range keeps, the HashAggregate over a bitmap heap scan
+    (Limit 14.99..15.04), in the hash's order. A DISTINCT of a column no
+    index leads is hashed."""
+    pg.execute("drop table if exists rp028_l")
+    pg.execute("create table rp028_l (k int primary key, g int)")
+    pg.execute("insert into rp028_l select i, (i * 7) % 11 from generate_series(1, 40) i")
+    got = pg_answer(pg, "select k, g from rp028_l group by k, g limit 5")
+    assert got == ("ok", [(k, (k * 7) % 11) for k in [1, 2, 3, 4, 5]])
+    got = pg_answer(pg, "select k from rp028_l where k > 5 and k < 30 group by k limit 5")
+    assert got == ("ok", [(k,) for k in [18, 16, 15, 6, 26]])
+    got = pg_answer(pg, "select distinct g from rp028_l limit 4")
+    assert got == ("ok", [(g,) for g in [9, 3, 5, 4]])
 
 
 @pytest.mark.backlog_fixed("RP-028")
