@@ -354,27 +354,36 @@ one beside it.
   Verify: tests/backlog/test_rust_postgres_gaps.py::test_each_empty_tsquery_raises_its_own_notice
   Backlog-ID: RP-044
 
-- [ ] **RUST pgserver: grouped and DISTINCT ON rows that tie under ORDER BY
-  come out in another order from PostgreSQL's.** A plain ORDER BY (and an
-  aggregate's, and a LIMIT's bounded heap) now sorts with PostgreSQL's
-  quicksort (`tuplesort.rs`, fixed 2026-10-15). A grouped query's groups
-  and DISTINCT ON's rows still reach the sort in this server's order, not
-  the HashAggregate's or scan's PostgreSQL feeds it, so they keep a stable
-  sort: `select g, count(*) ... group by g order by count(*)` gives `(1,6),
-  (0,6)` where PostgreSQL 15.19 gives `(0,6), (1,6)`. DISTINCT ON needs a
-  planner flag (a citext DISTINCT is planned as one). Sorts that spill to
-  disk runs are not PostgreSQL's merge. The same choice decides whether a
-  cursor declared without SCROLL scans backward over a join under ORDER BY
-  (`ExecSupportsBackwardScan`; `cursor_scroll.rs` reads every other shape
-  from the statement): `select * from t join u on t.a = u.a order by t.a`
-  merge-joins in key order and cannot scroll, `select * from t, u order by
-  u.c` sorts on top and can. Here both scroll. (This was RP-043.)
-  **Decided (Joe, 2026-10-16): build a cost model.** Both answers are the
-  PLANNER's -- which join or aggregation method PostgreSQL's cost model
-  picks and, for a hash aggregate, the table size it sizes from its row
-  estimates -- so the fix is enough of that model to make the same choices.
+- [ ] **RUST pgserver: the planner's choices that decide row order are only
+  partly modelled.** **Decided (Joe, 2026-10-16): build a cost model** --
+  enough of PostgreSQL's planner to make its choices, since the order rows
+  come out in (and ties under ORDER BY) is the order of the plan it picks.
+  Built so far (`secantus-pgplan/src/hashagg.rs`, 2026-10-16): a GROUP BY
+  of bare columns over one table, with no WHERE and no grouping sets, comes
+  out in PostgreSQL's HashAggregate order -- its estimate of the groups over
+  a table with no statistics (`estimate_rel_size`'s 10-page minimum,
+  `estimate_num_groups`' defaults), its tuple hash, and simplehash's
+  placement and iteration -- and an ORDER BY over it sorts with
+  PostgreSQL's quicksort. 12 shapes match 15.19 exactly. Not yet:
+  - `SELECT DISTINCT` (a HashAggregate too) keeps first-appearance order.
+  - A WHERE: the group estimate then scales by the clause's selectivity,
+    which needs PostgreSQL's default selectivities.
+  - GROUP BY an expression, over a join or a subquery, and past about
+    50,000 estimated groups, where the planner weighs a sort instead.
+  - DISTINCT ON, and a citext DISTINCT, which PostgreSQL sorts.
+  - The heap's order after UPDATE or DELETE (rows the hash table reads in
+    another order); a table someone ran ANALYZE on (statistics).
+  - Joins: whether a cursor declared without SCROLL scans backward over a
+    join under ORDER BY (`ExecSupportsBackwardScan`; `cursor_scroll.rs`
+    reads every other shape from the statement): `select * from t join u on
+    t.a = u.a order by t.a` merge-joins in key order and cannot scroll,
+    `select * from t, u order by u.c` sorts on top and can. Here both
+    scroll. (This was RP-043.) On fresh tables PostgreSQL merge-joins over
+    two primary keys and hash-joins otherwise; the choice is its join
+    costing.
+  - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_grouped_output_ties_as_postgres_leaves_them, tests/backlog/test_rust_postgres_gaps.py::test_join_cursor_ordered_by_its_key_cannot_scroll
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_distinct_rows_come_out_in_hash_aggregate_order, tests/backlog/test_rust_postgres_gaps.py::test_join_cursor_ordered_by_its_key_cannot_scroll
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

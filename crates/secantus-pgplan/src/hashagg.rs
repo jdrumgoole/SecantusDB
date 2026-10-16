@@ -221,6 +221,101 @@ pub fn hash_agg_order(
     Some(table.order())
 }
 
+/// What the planner knows of one grouping column of a table with no
+/// statistics (`get_variable_numdistinct`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyStat {
+    /// A boolean: 2 distinct values.
+    Bool,
+    /// The column alone is a primary key or carries a unique index: as many
+    /// distinct values as rows.
+    Unique,
+    /// Anything else: `DEFAULT_NUM_DISTINCT`, 200, or the rows if fewer.
+    Unknown,
+}
+
+/// `get_typavgwidth`: a fixed-width type's length; for a declared maximum
+/// (`varchar(n)`, `char(n)`: `typmod` is `n` + 4, at 4 bytes a character
+/// in UTF-8) the whole of it up to 32 bytes, then 32 plus half the rest, at
+/// most 516 -- `char(n)` always the whole; otherwise 32.
+pub fn type_avg_width(pg_type: &str, typmod: i32, typlen: i64) -> i64 {
+    if typlen > 0 {
+        return typlen;
+    }
+    let base = pg_type.trim_start_matches("pg_catalog.");
+    let bounded = matches!(
+        base,
+        "varchar" | "bpchar" | "character varying" | "character"
+    );
+    if bounded && typmod >= 4 {
+        let maxwidth = i64::from(typmod - 4) * 4 + 4;
+        if matches!(base, "bpchar" | "character") || maxwidth <= 32 {
+            return maxwidth;
+        }
+        if maxwidth < 1000 {
+            return 32 + (maxwidth - 32) / 2;
+        }
+        return 32 + (1000 - 32) / 2;
+    }
+    32
+}
+
+/// The rows the planner assumes a never-analysed table holds
+/// (`table_block_relation_estimate_size`): `(8192 - 24) / (data width + 28)`
+/// to a page, over the table's pages -- at least 10 while it has never been
+/// vacuumed or analysed. `data_width` is the sum of the columns'
+/// `get_typavgwidth`; `rows` is what the table holds now.
+///
+/// The page count is PostgreSQL's real heap size, which this server does
+/// not keep; it is taken as the rows at the same density, which is exact for
+/// fixed-width rows without NULLs and close otherwise. Only past ten pages
+/// does it matter at all.
+pub fn table_rows(data_width: i64, rows: u64) -> f64 {
+    let density = (8192 - 24) / (data_width.max(0) + 28) as u64;
+    let density = density.max(1);
+    let pages = rows.div_ceil(density).max(10);
+    (density * pages) as f64
+}
+
+/// `estimate_num_groups` over one table with no statistics and no WHERE.
+/// A boolean key short-circuits: its 2 multiplies the result and takes no
+/// part in the clamp. The other columns' distinct counts multiply, clamped
+/// by the rows for one column and by a tenth of the rows (but not below the
+/// largest column's count) for several; the whole is clamped to the rows,
+/// at least 1.
+pub fn estimate_groups(keys: &[KeyStat], tuples: f64) -> u64 {
+    let clamp_row_est = |n: f64| if n <= 1.0 { 1.0 } else { n.round() };
+    let mut numdistinct = 1.0f64;
+    let mut product = 1.0f64;
+    let mut max_single = 0.0f64;
+    let mut vars = 0usize;
+    for key in keys {
+        let n = match key {
+            KeyStat::Bool => {
+                numdistinct *= 2.0;
+                continue;
+            }
+            KeyStat::Unique => clamp_row_est(tuples),
+            KeyStat::Unknown if tuples < 200.0 => clamp_row_est(tuples),
+            KeyStat::Unknown => 200.0,
+        };
+        product *= n;
+        max_single = max_single.max(n);
+        vars += 1;
+    }
+    if vars > 0 {
+        let mut clamp = tuples;
+        if vars > 1 {
+            clamp *= 0.1;
+            if clamp < max_single {
+                clamp = max_single.min(tuples);
+            }
+        }
+        numdistinct *= clamp_row_est(product.min(clamp));
+    }
+    numdistinct.ceil().min(tuples).max(1.0) as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,5 +379,38 @@ mod tests {
             .map(|&i| format!("{}|{}", pairs[i].0, pairs[i].1))
             .collect();
         assert_eq!(out, ["0|x4", "2|x2", "10|x0", "5|x1", "5|x4", "3|x5"]);
+    }
+
+    /// PostgreSQL 15.19's estimates on fresh tables (`EXPLAIN`): 2260 rows
+    /// for (int, int), 2550 for (int), 200 groups for one int key.
+    #[test]
+    fn estimates_match_postgres() {
+        assert_eq!(table_rows(8, 12), 2260.0);
+        assert_eq!(table_rows(4, 20), 2550.0);
+        // (int, varchar(10), char(3), numeric, date): 4 + 38 + 16 + 32 + 4,
+        // which PostgreSQL plans as 660 rows.
+        let width = type_avg_width("int4", -1, 4)
+            + type_avg_width("varchar", 14, -1)
+            + type_avg_width("bpchar", 7, -1)
+            + type_avg_width("numeric", -1, -1)
+            + type_avg_width("date", -1, 4);
+        assert_eq!(width, 94);
+        assert_eq!(table_rows(width, 0), 660.0);
+        assert_eq!(estimate_groups(&[KeyStat::Unknown], 2260.0), 200);
+        assert_eq!(estimate_groups(&[KeyStat::Unique], 2550.0), 2550);
+        assert_eq!(
+            estimate_groups(&[KeyStat::Unknown, KeyStat::Unknown], 1200.0),
+            200
+        );
+        assert_eq!(
+            estimate_groups(&[KeyStat::Unknown, KeyStat::Unknown], 2260.0),
+            226
+        );
+        assert_eq!(estimate_groups(&[KeyStat::Bool], 2260.0), 2);
+        // `group by g, b` over (int primary key, int, bool): 200 * 2.
+        assert_eq!(
+            estimate_groups(&[KeyStat::Unknown, KeyStat::Bool], 2200.0),
+            400
+        );
     }
 }
