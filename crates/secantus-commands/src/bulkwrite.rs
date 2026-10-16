@@ -179,7 +179,15 @@ fn op_error(
 ) -> Document {
     let mut out = doc! { "ok": 0.0, "idx": idx as i32, "code": code, "errmsg": errmsg };
     if let Some(src) = extra {
-        for key in ["keyPattern", "keyValue", "errInfo"] {
+        for key in [
+            "keyPattern",
+            "keyValue",
+            "errInfo",
+            "db",
+            "collectionUUID",
+            "expectedCollection",
+            "actualCollection",
+        ] {
             if let Some(v) = src.get(key) {
                 out.insert(key, v.clone());
             }
@@ -190,6 +198,39 @@ fn op_error(
         out.insert("nModified", 0i32);
     }
     out
+}
+
+/// `None` when `expected` is the UUID of `db.coll`; otherwise the collection
+/// of `db` that does carry it, if any (mongod's `actualCollection`). A view
+/// or a missing collection has no UUID, so it never matches.
+fn uuid_mismatch(
+    storage: &dyn crate::Storage,
+    db: &str,
+    coll: &str,
+    expected: &[u8],
+) -> Option<Option<String>> {
+    // Asking for the UUID of a collection that is not there would register it,
+    // so existence (and not being a view) is checked first.
+    let uuid_of = |name: &str| -> Option<Vec<u8>> {
+        if !storage.collection_exists(db, name).unwrap_or(false)
+            || crate::views::is_view(storage, db, name)
+        {
+            return None;
+        }
+        storage
+            .collection_uuid(db, name)
+            .ok()
+            .filter(|u| u.len() == 16)
+    };
+    if uuid_of(coll).as_deref() == Some(expected) {
+        return None;
+    }
+    let actual = storage
+        .list_collections(db)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|name| uuid_of(name).as_deref() == Some(expected));
+    Some(actual)
 }
 
 /// Render an op for an error message, mongod-style.
@@ -420,6 +461,30 @@ fn ns_info_problem(entry: &Document) -> Result<(), CommandError> {
             "collectionUUID" if !matches!(value, Bson::Binary(_)) => {
                 return Err(wrong_type(&path, value, "type 'binData'"))
             }
+            // Measured 8.2.11: another binData subtype is 14 in the parser's
+            // words, and a UUID that is not 16 bytes is 207.
+            "collectionUUID" => {
+                let Bson::Binary(bin) = value else {
+                    unreachable!("checked above")
+                };
+                if bin.subtype != bson::spec::BinarySubtype::Uuid {
+                    return Err(CommandError::new(
+                        14,
+                        "TypeMismatch",
+                        format!(
+                            "BSON field '{path}' is the wrong binData type '{}', expected type 'UUID'",
+                            crate::session::binary_subtype_name(bin.subtype)
+                        ),
+                    ));
+                }
+                if bin.bytes.len() != 16 {
+                    return Err(CommandError::new(
+                        207,
+                        "InvalidUUID",
+                        "uuid must be a 16-byte binary field with UUID (4) subtype",
+                    ));
+                }
+            }
             "encryptionInformation" if !matches!(value, Bson::Document(_)) => {
                 return Err(wrong_type(&path, value, "type 'object'"))
             }
@@ -427,7 +492,6 @@ fn ns_info_problem(entry: &Document) -> Result<(), CommandError> {
                 return Err(wrong_type(&path, value, "type 'bool'"))
             }
             "ns"
-            | "collectionUUID"
             | "encryptionInformation"
             | "isTimeseriesNamespace"
             | "shardVersion"
@@ -585,6 +649,38 @@ pub fn bulk_write(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     72,
                     "Cannot use retryable writes with multi=true",
                     None,
+                    is_update,
+                ));
+                n_errors += 1;
+                if ordered {
+                    break;
+                }
+                continue;
+            }
+        }
+
+        // An `nsInfo` entry's `collectionUUID` must name the collection the op
+        // writes to; otherwise the op fails with 361 before it runs (a view,
+        // which has no UUID, or a missing collection fails the same way).
+        if let Some(Bson::Binary(expected)) = ns_info[targets[idx]]
+            .as_document()
+            .and_then(|d| d.get("collectionUUID"))
+        {
+            let storage = ctx.storage()?;
+            if let Some(actual) = uuid_mismatch(storage, &db_name, &coll, &expected.bytes) {
+                // mongod's order: ok, idx, code, errmsg, the error's own
+                // fields, then the op's counters (measured 8.2.11).
+                let info = doc! {
+                    "db": &db_name,
+                    "collectionUUID": Bson::Binary(expected.clone()),
+                    "expectedCollection": &coll,
+                    "actualCollection": actual.map(Bson::String).unwrap_or(Bson::Null),
+                };
+                results.push(op_error(
+                    idx,
+                    361,
+                    "Collection UUID does not match that specified",
+                    Some(&info),
                     is_update,
                 ));
                 n_errors += 1;

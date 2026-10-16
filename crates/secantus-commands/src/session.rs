@@ -62,7 +62,7 @@ fn not_in_transaction(message: impl Into<String>) -> CommandError {
     CommandError::new(263, "OperationNotSupportedInTransaction", message)
 }
 
-fn binary_subtype_name(subtype: bson::spec::BinarySubtype) -> &'static str {
+pub(crate) fn binary_subtype_name(subtype: bson::spec::BinarySubtype) -> &'static str {
     use bson::spec::BinarySubtype as B;
     match subtype {
         B::Generic => "general",

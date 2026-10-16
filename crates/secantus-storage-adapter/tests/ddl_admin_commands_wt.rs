@@ -541,6 +541,19 @@ fn stats_have_mongods_shape() {
         assert_eq!(db.get_i64("views"), Ok(1));
         assert_eq!(db.get_i64("objects"), Ok(3));
         assert_eq!(db.get_i64("indexes"), Ok(3));
+        // The filesystem holding the store, as mongod 8.2.11 reports it for
+        // a database that exists; scaled like the other sizes.
+        let used = db.get_f64("fsUsedSize").unwrap();
+        let total = db.get_f64("fsTotalSize").unwrap();
+        assert!(total > 0.0 && used > 0.0 && used <= total, "{db}");
+        let kb = dispatch_full(&doc! { "dbStats": 1, "scale": 1024 }, c);
+        assert_eq!(kb.get_f64("fsTotalSize").unwrap(), total / 1024.0);
+        // ... and zeros for one that does not.
+        c.db_name = "rm068_absent".to_string();
+        let absent = dispatch_full(&doc! { "dbStats": 1 }, c);
+        assert_eq!(absent.get_f64("fsUsedSize"), Ok(0.0));
+        assert_eq!(absent.get_f64("fsTotalSize"), Ok(0.0));
+        c.db_name = db.get_str("db").unwrap().to_string();
         assert_eq!(
             refusal(&dispatch_full(&doc! { "dbStats": 1, "scale": 0 }, c)),
             (
@@ -643,6 +656,65 @@ fn stats_have_mongods_shape() {
             ))
             .0,
             14
+        );
+    });
+}
+
+/// A fresh mongod 8.2.11 lists `config` because it sets up
+/// `config.system.sessions` (with `lsidTTLIndex`) as it starts; the server
+/// does the same at `bind`, and a second call leaves the collection be.
+#[test]
+fn sessions_collection_makes_config_a_database() {
+    with_wt(|c| {
+        let listed = |c: &mut CommandContext| -> Vec<String> {
+            let reply = dispatch_admin(&doc! { "listDatabases": 1, "nameOnly": true }, c);
+            reply
+                .get_array("databases")
+                .unwrap()
+                .iter()
+                .map(|d| {
+                    d.as_document()
+                        .unwrap()
+                        .get_str("name")
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        };
+        assert!(!listed(c).contains(&"config".to_string()));
+        for _ in 0..2 {
+            secantus_commands::cluster_admin::record_sessions_collection(c.storage().unwrap())
+                .unwrap();
+        }
+        assert!(listed(c).contains(&"config".to_string()));
+        let full = dispatch_admin(&doc! { "listDatabases": 1 }, c);
+        let config = full
+            .get_array("databases")
+            .unwrap()
+            .iter()
+            .map(|d| d.as_document().unwrap())
+            .find(|d| d.get_str("name") == Ok("config"))
+            .unwrap()
+            .clone();
+        assert_eq!(config.get_bool("empty"), Ok(false));
+        c.db_name = "config".to_string();
+        assert_eq!(names(c), ["system.sessions"]);
+        let ix = dispatch_full(&doc! { "listIndexes": "system.sessions" }, c);
+        let batch = ix
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap()
+            .clone();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(
+            batch[1].as_document().unwrap(),
+            &doc! {
+                "v": 2,
+                "key": { "lastUse": 1 },
+                "name": "lsidTTLIndex",
+                "expireAfterSeconds": 1800,
+            }
         );
     });
 }

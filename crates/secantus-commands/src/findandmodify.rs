@@ -513,6 +513,16 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
             }
             // `updatedExisting` belongs to an UPDATE; a remove that matched
             // nothing reports `n` alone.
+            // No document reached the engine, so mongod's parse-time checks
+            // of the update's operands have not run here (RM-065).
+            if let Some(Bson::Document(u)) = update.filter(|_| !is_remove) {
+                if let Some((code, errmsg)) =
+                    secantus_core::update::update_parse_error(u, &array_filters)
+                {
+                    let name = crate::mongod_codes::code_name(code).unwrap_or("BadValue");
+                    return Ok(CommandError::new(code, name, errmsg).into_reply());
+                }
+            }
             let last_error = if is_remove {
                 doc! { "n": 0 }
             } else {

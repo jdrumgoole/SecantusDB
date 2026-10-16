@@ -37,7 +37,7 @@ def test_profile_accepts_a_negative_slowms(rust_mongo: Any) -> None:
     assert (got, back) == (("ok", 1.0), ("ok", -1))
 
 
-@pytest.mark.backlog("RM-141")
+@pytest.mark.backlog_fixed("RM-141")
 def test_sasl_start_for_an_unknown_user_fails(rust_mongo: Any) -> None:
     """mongod 8.2.11 fails `saslStart` for a user that does not exist at the
     first step: 18 `Authentication failed.`; the Rust server answered ok and

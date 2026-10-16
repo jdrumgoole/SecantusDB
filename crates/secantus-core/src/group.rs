@@ -1604,10 +1604,48 @@ fn round_down_pow2(v: f64) -> f64 {
     2.0_f64.powf(v.log2().ceil() - 1.0)
 }
 
-/// Coerce a groupBy value to the double mongod's rounder works on, or `Err(Fallback::Defer)`
-/// (defer) for a value mongod would reject (non-numeric / NaN / negative) or a
-/// Decimal128 (the standing precision deferral). The Python engine raises the
-/// exact 40258 / 40259 / 40260; on the Rust server a defer surfaces as BadValue.
+/// mongod's refusal of a groupBy value (`None` = missing) that a `$bucketAuto`
+/// `granularity` cannot place: 40258 for a non-number, 40259 for a NaN and
+/// 40260 for a negative number, in mongod's words (measured 8.2.11,
+/// 2026-10-16; `-0.0` is accepted). `None` when the value is fine.
+pub fn granularity_value_error(v: Option<&Bson>) -> Option<Fallback> {
+    const PREFIX: &str = "$bucketAuto can specify a 'granularity' with";
+    let (nan, negative) = match v {
+        Some(Bson::Int32(n)) => (false, *n < 0),
+        Some(Bson::Int64(n)) => (false, *n < 0),
+        Some(Bson::Double(d)) => (d.is_nan(), *d < 0.0),
+        Some(d @ Bson::Decimal128(_)) => match decimal::from_bson(d) {
+            Some(decimal::Dec::Nan) => (true, false),
+            None => (false, false),
+            Some(decimal::Dec::Inf(sign)) => (false, sign < 0),
+            Some(x @ decimal::Dec::Fin { sign, .. }) => (false, sign < 0 && !x.is_zero()),
+        },
+        other => {
+            let name = other.map(crate::query::bson_type_name).unwrap_or("missing");
+            return Some(Fallback::mongo(
+                40258,
+                format!("{PREFIX} numeric boundaries only, but found a value with type: {name}"),
+            ));
+        }
+    };
+    if nan {
+        return Some(Fallback::mongo(
+            40259,
+            format!("{PREFIX} numeric boundaries only, but found a NaN"),
+        ));
+    }
+    if negative {
+        return Some(Fallback::mongo(
+            40260,
+            format!("{PREFIX} non-negative numbers only, but found a negative number"),
+        ));
+    }
+    None
+}
+
+/// Coerce a groupBy value to the double mongod's rounder works on, or
+/// `Err(Fallback::Defer)` for a value [`granularity_value_error`] has already
+/// refused (it runs before any rounding, so this is not reached with one).
 fn granularity_coerce(v: &Bson) -> R<f64> {
     let f = match v {
         Bson::Int32(n) => *n as f64,
@@ -1659,6 +1697,13 @@ fn granularity_round(v: &Bson, granularity: &str, series: &[f64], up: bool) -> R
         }
     }
     let x = granularity_coerce(v)?;
+    // Rounding a zero DOWN gives it back unchanged, in its own type, for
+    // every series: `{x: 0}` under R5 is a bucket `min: 0`, not `0.0`
+    // (measured 8.2.11, 2026-10-16). Rounding it up still answers the
+    // series' first value (`max: 0.63`).
+    if x == 0.0 && !up {
+        return Ok(v.clone());
+    }
     if granularity == "POWERSOF2" && x != 0.0 && x.is_finite() {
         // The double branch also ends in `$pow(2, <int exponent>)`, so a
         // non-negative exponent answers an INT (`1024.0` rounds up to `2048`,
@@ -1710,6 +1755,10 @@ fn pow2_of_exponent(exp: i64) -> Bson {
 fn is_numeric_zero(v: &Bson) -> bool {
     match v {
         Bson::Double(d) => *d == 0.0,
+        // POWERSOF2 rounds an integer zero to itself, an int: it is a zero
+        // boundary too (`[0, 1]` buckets to `max: 0.5`, measured 8.2.11).
+        Bson::Int32(n) => *n == 0,
+        Bson::Int64(n) => *n == 0,
         Bson::Decimal128(_) => decimal::from_bson(v).is_some_and(|d| d.is_zero()),
         _ => false,
     }
@@ -1784,9 +1833,14 @@ fn bucket_auto_granular(
             None
         };
         let boundary = rup(&cur_max)?;
-        // Absorb values that now fall below the rounded boundary (boundary fixed).
+        // Absorb values that now fall below the rounded boundary (boundary
+        // fixed), and values equal to the bucket's largest, which never
+        // straddle two buckets: `[0, 0, 0, 3]` in 2 buckets is 3 / 1 even
+        // though a zero rounds up to zero (measured 8.2.11, 2026-10-16).
         while let Some(ni) = next_i {
-            if crate::order::cmp(&boundary, &values[ni]) == Ordering::Greater {
+            if crate::order::cmp(&boundary, &values[ni]) == Ordering::Greater
+                || crate::order::cmp(&cur_max, &values[ni]) == Ordering::Equal
+            {
                 chunk.push(ni);
                 next_i = if idx < n {
                     let c = idx;
@@ -1849,7 +1903,18 @@ pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<V
     // defers the whole stage to Python.
     let mut pairs: Vec<(Bson, &Document)> = Vec::with_capacity(docs.len());
     for d in docs {
-        pairs.push((eval(group_by, d, vars)?, d));
+        if granularity.is_some() {
+            // mongod checks each value as it reads it, so the first bad one
+            // in INPUT order is the one reported (measured 8.2.11: `["s", -1]`
+            // answers 40258 and `[-1, "s"]` 40260).
+            let v = eval_or_missing(group_by, d, vars)?;
+            if let Some(e) = granularity_value_error(v.as_ref()) {
+                return Err(e);
+            }
+            pairs.push((v.unwrap_or(Bson::Null), d));
+        } else {
+            pairs.push((eval(group_by, d, vars)?, d));
+        }
     }
     let mut keyed: Vec<(Vec<u8>, Bson, &Document)> = Vec::with_capacity(pairs.len());
     for (v, d) in pairs {
@@ -2362,6 +2427,99 @@ mod bucket_auto_granularity_type_tests {
                 1
             ),
             vec![(Bson::Double(0.25), Bson::Int32(2048))]
+        );
+    }
+
+    fn refusal(values: Vec<Bson>) -> Option<(i32, String)> {
+        let docs: Vec<Document> = values.into_iter().map(|v| doc! {"x": v}).collect();
+        let spec = bson!({"groupBy": "$x", "buckets": 2, "granularity": "R5"});
+        bucket_auto_stage(&spec, &docs, &Document::new())
+            .err()
+            .and_then(|e| e.as_mongo().map(|(c, m)| (c, m.to_string())))
+    }
+
+    /// mongod 8.2.11 (2026-10-16): 40258 / 40259 / 40260, for the first bad
+    /// value in INPUT order.
+    #[test]
+    fn a_value_granularity_cannot_place_is_refused_in_mongods_words() {
+        let p = "$bucketAuto can specify a 'granularity' with";
+        let typed = |t: &str| {
+            Some((
+                40258,
+                format!("{p} numeric boundaries only, but found a value with type: {t}"),
+            ))
+        };
+        let nan = Some((
+            40259,
+            format!("{p} numeric boundaries only, but found a NaN"),
+        ));
+        let neg = Some((
+            40260,
+            format!("{p} non-negative numbers only, but found a negative number"),
+        ));
+        assert_eq!(
+            refusal(vec![Bson::String("s".into()), Bson::Int32(1)]),
+            typed("string")
+        );
+        assert_eq!(refusal(vec![Bson::Null, Bson::Int32(1)]), typed("null"));
+        assert_eq!(refusal(vec![Bson::Boolean(true)]), typed("bool"));
+        assert_eq!(refusal(vec![Bson::Double(f64::NAN)]), nan);
+        assert_eq!(refusal(vec![dec("NaN")]), nan);
+        assert_eq!(refusal(vec![Bson::Int32(-1)]), neg);
+        assert_eq!(refusal(vec![dec("-2")]), neg);
+        assert_eq!(refusal(vec![Bson::Double(f64::NEG_INFINITY)]), neg);
+        // Input order, not sort order.
+        assert_eq!(
+            refusal(vec![Bson::String("s".into()), Bson::Int32(-1)]),
+            typed("string")
+        );
+        assert_eq!(
+            refusal(vec![Bson::Int32(-1), Bson::String("s".into())]),
+            neg
+        );
+        // A missing field is named as such.
+        let docs = vec![doc! {"y": 1}, doc! {"x": 1}];
+        let spec = bson!({"groupBy": "$x", "buckets": 2, "granularity": "R5"});
+        let err = bucket_auto_stage(&spec, &docs, &Document::new()).unwrap_err();
+        assert_eq!(
+            err.as_mongo().map(|(c, m)| (c, m.to_string())),
+            typed("missing")
+        );
+        // A negative zero is not negative.
+        assert_eq!(refusal(vec![Bson::Double(-0.0), Bson::Int32(1)]), None);
+    }
+
+    /// mongod 8.2.11 (2026-10-16): a zero rounds down to itself in its own
+    /// type, an integer zero is a zero boundary, and equal values stay in one
+    /// bucket even when they round up to zero.
+    #[test]
+    fn zeros_bucket_as_on_mongod() {
+        assert_eq!(
+            bounds(vec![Bson::Int32(0), Bson::Int32(1)], "R5", 2),
+            vec![
+                (Bson::Int32(0), Bson::Double(0.63)),
+                (Bson::Double(0.63), Bson::Double(1.6)),
+            ]
+        );
+        assert_eq!(
+            bounds(vec![Bson::Int32(0), Bson::Int32(1)], "POWERSOF2", 2),
+            vec![
+                (Bson::Int32(0), Bson::Double(0.5)),
+                (Bson::Double(0.5), Bson::Int32(2)),
+            ]
+        );
+        let zeros = vec![
+            Bson::Int32(0),
+            Bson::Int32(0),
+            Bson::Int32(0),
+            Bson::Int32(3),
+        ];
+        assert_eq!(
+            bounds(zeros, "R5", 2),
+            vec![
+                (Bson::Int32(0), Bson::Double(2.5)),
+                (Bson::Double(2.5), Bson::Double(4.0)),
+            ]
         );
     }
 }

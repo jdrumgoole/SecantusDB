@@ -171,9 +171,18 @@ pub fn db_stats(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         out.insert("totalFreeStorageSize", 0.0);
     }
     out.insert("scaleFactor", Bson::Int64(scale));
-    // The filesystem's own numbers are not this server's to report.
-    out.insert("fsUsedSize", 0.0);
-    out.insert("fsTotalSize", 0.0);
+    // The filesystem holding the store, scaled like the rest. mongod reports
+    // it only for a database that exists, and zeros for one that does not
+    // (measured 8.2.11, 2026-10-16).
+    let exists = t.collections + t.views > 0;
+    let (fs_used, fs_total) = ctx
+        .storage()?
+        .data_path()
+        .filter(|_| exists)
+        .and_then(|path| crate::procstats::fs_space(&path))
+        .unwrap_or((0, 0));
+    out.insert("fsUsedSize", fs_used as f64 / scale as f64);
+    out.insert("fsTotalSize", fs_total as f64 / scale as f64);
     out.insert("ok", 1.0);
     Ok(out)
 }

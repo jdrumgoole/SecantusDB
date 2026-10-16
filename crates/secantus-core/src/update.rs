@@ -2160,6 +2160,91 @@ pub fn update_spec_error(update: &Document) -> Option<(i32, String)> {
     }
 }
 
+/// mongod's parse-time check of `$currentDate`'s operands: a boolean, or a
+/// document holding only `$type: "date" | "timestamp"` (probed 8.2.11). An
+/// unrecognised key is reported before the `$type` value is looked at.
+pub fn current_date_operand_error(update: &Document) -> Option<(i32, String)> {
+    let Some(Bson::Document(cd)) = update.get("$currentDate") else {
+        return None;
+    };
+    for (_, opts) in cd {
+        match opts {
+            Bson::Boolean(_) => {}
+            Bson::Document(o) => {
+                if let Some(bad) = o.keys().find(|k| k.as_str() != "$type") {
+                    return Some((2, format!("Unrecognized $currentDate option: {bad}")));
+                }
+                if !matches!(o.get("$type"), Some(Bson::String(t)) if t == "date" || t == "timestamp")
+                {
+                    return Some((
+                        2,
+                        "The '$type' string field is required to be 'date' or 'timestamp': \
+                         {$currentDate: {field : {$type: 'date'}}}"
+                            .to_string(),
+                    ));
+                }
+            }
+            other => {
+                return Some((
+                    2,
+                    format!(
+                        "{} is not valid type for $currentDate. Please use a boolean \
+                         ('true') or a $type expression ({{$type: 'timestamp/date'}}).",
+                        crate::query::bson_type_name(other)
+                    ),
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Every error mongod raises while PARSING an update, before it reads a
+/// document: so it reports them when the query matches nothing, or the
+/// collection does not exist (probed 8.2.11, 2026-10-16, 39 shapes: the same
+/// answer for a missing collection, an empty one and one whose documents do
+/// not match). Beyond [`update_spec_error`]'s walk these are the operands --
+/// `$inc` of a string, `$rename` to a number, a `$bit` with no operation,
+/// `$pop: 2` -- which the engine checks as it applies them, so it is asked to
+/// apply the update to an empty document and only a fault it does not mark
+/// as an EXECUTION error is kept.
+///
+/// For a statement that matched nothing: an update that matched a document
+/// has been through the engine already.
+pub fn update_parse_error(update: &Document, array_filters: &[Document]) -> Option<(i32, String)> {
+    if let Some(e) = update_spec_error(update) {
+        return Some(e);
+    }
+    if !is_operator_form(update) {
+        return None;
+    }
+    if let Some(e) = current_date_operand_error(update) {
+        return Some(e);
+    }
+    let mut probe = update.clone();
+    probe.remove("$currentDate");
+    if probe.is_empty() {
+        return None;
+    }
+    match apply_update_with(
+        &Document::new(),
+        &probe,
+        false,
+        array_filters,
+        &Document::new(),
+    ) {
+        Err(fault) if !fault.is_exec() => match fault.as_mongo() {
+            Some((c, m)) => Some((c, m.to_string())),
+            // The engine leaves a non-numeric `$inc` / `$mul` operand to
+            // this narrower check, as the storage layer's update path does.
+            None => arith_type_error(&Document::new(), &probe)
+                .filter(|(_, exec)| !exec)
+                .map(|(m, _)| (14, m)),
+        },
+        _ => None,
+    }
+}
+
 /// The FIRST thing wrong with an update's operator paths, in document order.
 ///
 /// The empty-path and conflict checks share one walk because mongod interleaves
@@ -3099,6 +3184,41 @@ mod tests {
                 false
             )
         );
+    }
+
+    #[test]
+    fn update_parse_error_needs_no_document() {
+        // mongod 8.2.11's answers for a statement that matches nothing
+        // (probed 2026-10-16, RM-065).
+        let cases: &[(Document, i32, &str)] = &[
+            (doc! {"$inc": {"a": "x"}}, 14, "Cannot increment with non-numeric argument: {a: \"x\"}"),
+            (doc! {"$rename": {"a": 1}}, 2, "The 'to' field for $rename must be a string: a: 1"),
+            (doc! {"$rename": {"a.$": "b"}}, 2, "The source field for $rename may not be dynamic: a.$"),
+            (doc! {"$pop": {"a": 2}}, 9, "$pop expects 1 or -1, found: 2"),
+            (doc! {"$currentDate": {"a": {"x": 1}}}, 2, "Unrecognized $currentDate option: x"),
+            (
+                doc! {"$bit": {"a": {}}},
+                2,
+                "You must pass in at least one bitwise operation. The format is: {$bit: {field: {and/or/xor: #}}",
+            ),
+        ];
+        for (u, code, msg) in cases {
+            assert_eq!(
+                update_parse_error(u, &[]),
+                Some((*code, msg.to_string())),
+                "{u}"
+            );
+        }
+        // Well-formed updates, and ones whose faults need a document, pass.
+        for u in [
+            doc! {"$set": {"_id": 5}},
+            doc! {"$inc": {"a": 1}},
+            doc! {"$currentDate": {"a": true}},
+            doc! {"$pop": {"a": 1}},
+            doc! {"a": 1},
+        ] {
+            assert_eq!(update_parse_error(&u, &[]), None, "{u}");
+        }
     }
 
     #[test]

@@ -237,7 +237,7 @@ def _current_date_missing_coll(client: Any) -> tuple:
     return code_of(mongo_answer(lambda: c.update_one({}, {"$currentDate": {"a": "bad"}})))
 
 
-@pytest.mark.backlog("RM-065")
+@pytest.mark.backlog_fixed("RM-065")
 def test_current_date_parse_error_on_a_missing_collection(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 reports the `$currentDate` parse error even when the
     collection does not exist."""
@@ -246,10 +246,53 @@ def test_current_date_parse_error_on_a_missing_collection(rust_mongo: Any, mongo
     assert _current_date_missing_coll(rust_mongo) == expected
 
 
+_UNMATCHED_UPDATES = [
+    {"$inc": {"a": "x"}},
+    {"$mul": {"a": [1]}},
+    {"$rename": {"a": 1}},
+    {"$rename": {"a.$": "b"}},
+    {"$currentDate": {"a": {"x": 1}}},
+    {"$bit": {"a": {"nand": 1}}},
+    {"$pop": {"a": 2}},
+    {"$addToSet": {"a": {"$each": 1}}},
+    {"$push": {"a": {"$each": [1], "$sort": 2}}},
+    {"$min": {"a": 1}, "$max": {"a": 2}},
+    {"$set": {"_id": 5}},
+]
+
+
+def _unmatched_update_errors(client: Any, seed: bool) -> list:
+    db = client["rm065"]
+    name = _name()
+    if seed:
+        db[name].insert_one({"z": 1})
+    out = []
+    for u in _UNMATCHED_UPDATES:
+        r = db.command("update", name, updates=[{"q": {"nomatch": 1}, "u": u}], check=False)
+        f = db.command("findAndModify", name, query={"nomatch": 1}, update=u, check=False)
+        out.append(
+            (
+                [(e["code"], e["errmsg"]) for e in r.get("writeErrors", [])],
+                (f.get("ok"), f.get("code"), f.get("errmsg")),
+            )
+        )
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-065")
+@pytest.mark.parametrize("seed", [False, True], ids=["missing-collection", "no-match"])
+def test_update_parse_errors_without_a_match(rust_mongo: Any, mongod: Any, seed: bool) -> None:
+    """mongod 8.2.11 reports an update's parse-time operand errors -- `$inc`
+    of a string, `$rename` to a number, `$pop: 2`, ... -- whether or not a
+    document matches, on `update` and `findAndModify` alike. The Rust server
+    reported them only once a document reached the engine."""
+    assert _unmatched_update_errors(rust_mongo, seed) == _unmatched_update_errors(mongod, seed)
+
+
 # ------------------------------------------------------- 7.076 DDL/admin --
 
 
-@pytest.mark.backlog("RM-066")
+@pytest.mark.backlog_fixed("RM-066")
 def test_list_databases_always_has_admin_and_config(tmp_path: Any, mongod: Any) -> None:
     """A fresh mongod 8.2.11 lists `admin`, `config` and `local`."""
     assert {"admin", "config", "local"} <= set(mongod.list_database_names())
@@ -275,7 +318,7 @@ def test_list_indexes_key_order_after_conversion_to_unique(rust_mongo: Any, mong
     assert _unique_conversion_keys(rust_mongo) == _unique_conversion_keys(mongod)
 
 
-@pytest.mark.backlog("RM-068")
+@pytest.mark.backlog_fixed("RM-068")
 def test_db_stats_reports_the_filesystem(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 reports the filesystem's used and total bytes, both > 0."""
     for client in (mongod, rust_mongo):

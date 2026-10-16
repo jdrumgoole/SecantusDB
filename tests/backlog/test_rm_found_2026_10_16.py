@@ -197,3 +197,35 @@ def test_date_from_parts_errors_and_their_order(rust_mongo: Any, mongod: Any, sp
         mongo_answer(lambda c=c: list(c["rm126"].aggregate(pipeline))) for c in (rust_mongo, mongod)
     ]
     assert answers[0] == answers[1]
+
+
+def _sasl_start_nonces(client: Any) -> list:
+    from bson.binary import Binary
+
+    admin = client["admin"]
+    admin.command("createUser", "rm174", pwd="pw", roles=[])
+    try:
+        out = []
+        for nonce in ["abc", "a,b", "a=b", "abcd"]:
+            r = admin.command(
+                "saslStart",
+                1,
+                mechanism="SCRAM-SHA-256",
+                payload=Binary(f"n,,n=rm174,r={nonce}".encode()),
+                autoAuthorize=1,
+                check=False,
+            )
+            out.append((nonce, r.get("ok"), r.get("code"), r.get("errmsg")))
+        return out
+    finally:
+        admin.command("dropUser", "rm174")
+
+
+@pytest.mark.backlog_fixed("RM-174")
+def test_sasl_start_refuses_a_client_nonce_under_four_characters(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """mongod 8.2.11 fails `saslStart` with 18 `Authentication failed.` when
+    the client nonce is shorter than four characters (`a,b` is the nonce
+    `a`); the Rust server started the conversation."""
+    assert _sasl_start_nonces(rust_mongo) == _sasl_start_nonces(mongod)

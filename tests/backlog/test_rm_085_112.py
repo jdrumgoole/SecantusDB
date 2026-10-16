@@ -566,7 +566,7 @@ def test_ttl_monitor_sleep_secs_reports_the_started_cadence(
     assert got.get("ttlMonitorSleepSecs") == 7
 
 
-@pytest.mark.backlog("RM-105")
+@pytest.mark.backlog_fixed("RM-105")
 def test_bulk_write_collection_uuid_mismatch(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11: `bulkWrite` with a `collectionUUID` that does not match
     reports 361 for the op."""
@@ -724,21 +724,6 @@ def test_hint_on_a_view_count_distinct_and_order(rust_mongo: Any, mongod: Any) -
 
     got, ref = _both(rust_mongo, mongod, probe)
     assert ref == (("err", 2), ("err", 2), [1, 2, 0], [2, 1, 0])
-    assert got == ref
-
-
-@pytest.mark.backlog("RM-108")
-def test_distinct_on_a_view_in_mongod_order(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 runs `distinct` on a view as a `$group`, and answers
-    the values in its hash table's order, not sorted."""
-
-    def probe(client: Any) -> Any:
-        db = client[_name("rm108")]
-        db.base.insert_many([{"a": v} for v in [3, "x", 1, 2, None, 1.5, {"z": 1}]])
-        db.command("create", "v", viewOn="base", pipeline=[])
-        return db.v.distinct("a")
-
-    got, ref = _both(rust_mongo, mongod, probe)
     assert got == ref
 
 

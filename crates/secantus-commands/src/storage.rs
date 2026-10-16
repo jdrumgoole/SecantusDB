@@ -172,6 +172,14 @@ pub trait Storage: Send + Sync {
         false
     }
 
+    /// The directory the store lives in (mongod's `dbpath`), whose
+    /// filesystem `dbStats` reports as `fsUsedSize` / `fsTotalSize`.
+    /// Default `None` (test fakes keep no files); the WiredTiger-backed
+    /// adapter forwards the WiredTiger home.
+    fn data_path(&self) -> Option<String> {
+        None
+    }
+
     /// The current cluster time WITHOUT advancing it — for reply gossip
     /// (`$clusterTime` / `operationTime` attached to every reply). The default
     /// returns a zero timestamp (test fakes don't track cluster time); the

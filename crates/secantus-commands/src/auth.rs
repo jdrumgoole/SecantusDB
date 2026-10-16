@@ -229,10 +229,11 @@ fn conn_auth(ctx: &CommandContext) -> Result<Arc<Mutex<ConnectionAuth>>, Command
 
 /// Look up a user's credentials for `mechanism`, decoding the stored record.
 ///
-/// `Ok(None)` when the user does not exist -- `begin_scram_with` then
-/// fabricates credentials and the conversation fails at the proof step, as on
-/// mongod. A user who EXISTS without credentials for this mechanism is refused
-/// up front with mongod's 334 (measured 8.2.11, 2026-09-30).
+/// `Ok(None)` when the user does not exist (or its stored credentials cannot
+/// be decoded) -- `sasl_start` then fails at once with 18, as mongod does
+/// (measured 8.2.11, 2026-10-16). A user who EXISTS without credentials for
+/// this mechanism is refused up front with mongod's 334 (measured 8.2.11,
+/// 2026-09-30).
 fn lookup_creds(
     ctx: &CommandContext,
     db: &str,
@@ -312,6 +313,20 @@ fn required_field(
 }
 
 /// `saslStart` — begin a SCRAM-SHA-1 / SCRAM-SHA-256 conversation.
+/// The shortest client nonce mongod accepts in a SCRAM client-first message.
+const MIN_CLIENT_NONCE_CHARS: usize = 4;
+
+/// The `r=` attribute of a SCRAM client-first message, read the way
+/// `secantus_auth` reads it: past the GS2 header, split at `,`, and the
+/// value is everything after the first `=`.
+fn client_nonce(payload: &[u8]) -> Option<String> {
+    let rest = payload.strip_prefix(b"n,")?;
+    let bare = &rest[rest.iter().position(|&b| b == b',')? + 1..];
+    bare.split(|&b| b == b',')
+        .find_map(|chunk| chunk.strip_prefix(b"r="))
+        .map(|v| String::from_utf8_lossy(v).into_owned())
+}
+
 pub fn sasl_start(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     required_field(doc, "saslStart", "mechanism", "string", |v| {
         matches!(v, Bson::String(_))
@@ -334,15 +349,30 @@ pub fn sasl_start(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         ctx.db_name.clone()
     };
     let username = peek_username(&payload).unwrap_or_default();
-    let creds = lookup_creds(ctx, &db_name, &username, mech)?;
+    let creds = lookup_creds(ctx, &db_name, &username, mech);
 
     let auth = conn_auth(ctx)?;
     let mut auth = auth
         .lock()
         .map_err(|_| CommandError::new(1, "InternalError", "connection auth state corrupted"))?;
+    // A new `saslStart` replaces whatever conversation was in progress, and
+    // one that fails leaves none: a `saslContinue` after it is mongod's
+    // 17 `No SASL session state found` (measured 8.2.11, 2026-10-16).
+    auth.scram = None;
+    // mongod looks the user up in its FIRST step and fails there when there
+    // is no such user (or its credentials cannot be read): 18
+    // `Authentication failed.` (measured 8.2.11, 2026-10-16). It does not
+    // carry on with made-up credentials to fail at the proof.
+    let creds = creds?.ok_or_else(|| auth_failure(AUTHENTICATION_FAILED_MSG))?;
+    // And it refuses a client nonce shorter than four characters, with the
+    // same 18 (measured 8.2.11, 2026-10-16: `abc` fails, `abcd` does not).
+    if client_nonce(&payload).is_none_or(|n| n.chars().count() < MIN_CLIENT_NONCE_CHARS) {
+        return Err(auth_failure(AUTHENTICATION_FAILED_MSG));
+    }
     let conversation_id = auth.new_conversation_id();
-    let (server_first, state) = begin_scram_with(conversation_id, &db_name, &payload, creds, mech)
-        .map_err(|_| auth_failure(AUTHENTICATION_FAILED_MSG))?;
+    let (server_first, state) =
+        begin_scram_with(conversation_id, &db_name, &payload, Some(creds), mech)
+            .map_err(|_| auth_failure(AUTHENTICATION_FAILED_MSG))?;
     auth.scram = Some(state);
 
     Ok(doc! {
@@ -1743,22 +1773,81 @@ mod tests {
     }
 
     #[test]
-    fn unknown_user_fails_at_proof() {
+    fn unknown_user_fails_at_start_and_leaves_no_conversation() {
+        // mongod 8.2.11: 18 `Authentication failed.` at the first step, and
+        // a `saslContinue` after it finds no conversation (17).
         let (mut ctx, _auth) = ctx_with_store();
-        let (first, bare) = scram_client_first("ghost", "nonceGhost");
+        let (first, _bare) = scram_client_first("ghost", "nonceGhost");
+        let start = dispatch(
+            &doc! {"saslStart": 1, "mechanism": SCRAM_SHA_256, "payload": payload_binary(first), "$db": "admin"},
+            &mut ctx,
+        );
+        assert_eq!(start.get_i32("code").unwrap(), AUTHENTICATION_FAILED);
+        assert_eq!(start.get_str("errmsg").unwrap(), "Authentication failed.");
+        let cont = dispatch(
+            &doc! {"saslContinue": 1, "conversationId": 1, "payload": payload_binary(b"c=biws,r=x,p=AAAA".to_vec()), "$db": "admin"},
+            &mut ctx,
+        );
+        assert_eq!(cont.get_i32("code").unwrap(), 17);
+        assert_eq!(
+            cont.get_str("errmsg").unwrap(),
+            "No SASL session state found"
+        );
+    }
+
+    #[test]
+    fn failed_start_ends_the_conversation_in_progress() {
+        // A conversation begun for a real user is replaced by the next
+        // `saslStart`; when that one fails, nothing is left to continue.
+        let (mut ctx, _auth) = ctx_with_store();
+        dispatch(
+            &doc! {"createUser": "alice", "pwd": "secret", "roles": [], "$db": "admin"},
+            &mut ctx,
+        );
+        let (first, _) = scram_client_first("alice", "nonceAliceAliceAlice");
         let start = dispatch(
             &doc! {"saslStart": 1, "mechanism": SCRAM_SHA_256, "payload": payload_binary(first), "$db": "admin"},
             &mut ctx,
         );
         assert_eq!(start.get_f64("ok").unwrap(), 1.0);
         let cid = start.get_i32("conversationId").unwrap();
-        let server_first = payload_bytes(start.get("payload"));
-        let cf = client_final("anything", &server_first, &bare);
-        let cont = dispatch(
-            &doc! {"saslContinue": 1, "conversationId": cid, "payload": payload_binary(cf), "$db": "admin"},
+        let (ghost, _) = scram_client_first("ghost", "nonceGhost");
+        let failed = dispatch(
+            &doc! {"saslStart": 1, "mechanism": SCRAM_SHA_256, "payload": payload_binary(ghost), "$db": "admin"},
             &mut ctx,
         );
-        assert_eq!(cont.get_i32("code").unwrap(), AUTHENTICATION_FAILED);
+        assert_eq!(failed.get_i32("code").unwrap(), AUTHENTICATION_FAILED);
+        let cont = dispatch(
+            &doc! {"saslContinue": 1, "conversationId": cid, "payload": payload_binary(b"c=biws,r=x,p=AAAA".to_vec()), "$db": "admin"},
+            &mut ctx,
+        );
+        assert_eq!(cont.get_i32("code").unwrap(), 17);
+    }
+
+    #[test]
+    fn a_client_nonce_under_four_characters_fails_at_start() {
+        // mongod 8.2.11: `abc` (and `a,b`, whose nonce is `a`) is 18;
+        // `abcd` starts the conversation (measured 2026-10-16).
+        let (mut ctx, _auth) = ctx_with_store();
+        dispatch(
+            &doc! {"createUser": "alice", "pwd": "secret", "roles": [], "$db": "admin"},
+            &mut ctx,
+        );
+        for (nonce, ok) in [
+            ("abc", false),
+            ("a,b", false),
+            ("a=b", false),
+            ("abcd", true),
+        ] {
+            let (first, _) = scram_client_first("alice", nonce);
+            let start = dispatch(
+                &doc! {"saslStart": 1, "mechanism": SCRAM_SHA_256, "payload": payload_binary(first), "$db": "admin"},
+                &mut ctx,
+            );
+            assert_eq!(start.get_f64("ok").unwrap() == 1.0, ok, "{nonce}");
+        }
+        assert_eq!(client_nonce(b"n,,n=u,r=a=b"), Some("a=b".to_string()));
+        assert_eq!(client_nonce(b"n,,n=u"), None);
     }
 
     #[test]
