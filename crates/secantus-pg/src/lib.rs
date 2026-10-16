@@ -5510,7 +5510,6 @@ impl PgHandler {
         keys: &[Vec<Option<Bson>>],
         rows: usize,
     ) -> Option<Vec<usize>> {
-        use secantus_pgplan::hashagg;
         if agg.series.is_some()
             || agg.sub.is_some()
             || agg.join.is_some()
@@ -5521,11 +5520,33 @@ impl PgHandler {
         {
             return None;
         }
+        let key_cols: Vec<(String, String)> = agg
+            .group_by
+            .iter()
+            .map(|k| (k.field.clone(), k.pg_type.clone()))
+            .collect();
+        self.hash_agg_order_over(&agg.table, &key_cols, keys, rows)
+    }
+
+    /// PostgreSQL 15's HashAggregate order over `groups` (one key value per
+    /// column of `key_cols`, `(stored field, type)`) of `table`, which holds
+    /// `rows` rows and is read whole: the planner's group estimate for a
+    /// table with no statistics, then `hashagg::hash_agg_order`. `None` when
+    /// the table is not a user table, a key type is not hashed as PostgreSQL
+    /// hashes it, or the estimate is past PostgreSQL's hash memory.
+    fn hash_agg_order_over(
+        &self,
+        table: &str,
+        key_cols: &[(String, String)],
+        keys: &[Vec<Option<Bson>>],
+        rows: usize,
+    ) -> Option<Vec<usize>> {
+        use secantus_pgplan::hashagg;
         let def = self
             .all_table_defs()
             .ok()?
             .into_iter()
-            .find(|d| d.name == agg.table)?;
+            .find(|d| d.name == table)?;
         let width: i64 = def
             .columns
             .iter()
@@ -5557,7 +5578,7 @@ impl PgHandler {
         }
         for ix in self
             .storage
-            .list_indexes(self.db(), &agg.table)
+            .list_indexes(self.db(), table)
             .unwrap_or_default()
         {
             let is_unique = ix
@@ -5572,13 +5593,12 @@ impl PgHandler {
                 }
             }
         }
-        let stats: Vec<hashagg::KeyStat> = agg
-            .group_by
+        let stats: Vec<hashagg::KeyStat> = key_cols
             .iter()
-            .map(|k| {
-                if k.pg_type == "bool" {
+            .map(|(field, pg_type)| {
+                if pg_type == "bool" {
                     hashagg::KeyStat::Bool
-                } else if unique.contains(&k.field) {
+                } else if unique.contains(field) {
                     hashagg::KeyStat::Unique
                 } else {
                     hashagg::KeyStat::Unknown
@@ -5593,7 +5613,7 @@ impl PgHandler {
         if groups > 50_000 {
             return None;
         }
-        let types: Vec<String> = agg.group_by.iter().map(|k| k.pg_type.clone()).collect();
+        let types: Vec<String> = key_cols.iter().map(|(_, t)| t.clone()).collect();
         hashagg::hash_agg_order(keys, &types, groups)
     }
 
@@ -26657,8 +26677,11 @@ impl PgHandler {
             let tz = self.session_timezone();
             let mut seen = distinct_set::DistinctSet::<Vec<Option<Bson>>>::new();
             let mut kept = Vec::with_capacity(docs.len());
+            let mut kept_keys: Vec<Vec<Option<Bson>>> = Vec::new();
+            let rows = docs.len();
             for d in docs {
                 let mut ident = Vec::with_capacity(sel.columns.len());
+                let mut values = Vec::with_capacity(sel.columns.len());
                 for (i, (_, field)) in sel.columns.iter().enumerate() {
                     let v = resolve_cell(
                         &d,
@@ -26668,10 +26691,40 @@ impl PgHandler {
                         &tz,
                     )?;
                     ident.push(typed_ident(&v, *schema[i].datatype() == Type::JSONB));
+                    values.push(v);
                 }
                 if seen.insert(ident) {
                     kept.push(d);
+                    kept_keys.push(values);
                 }
+            }
+            // PostgreSQL plans a DISTINCT as a HashAggregate over the select
+            // list and returns its rows in that table's order (RP-028): here
+            // for bare columns of one table read whole.
+            let plain = sel.sub.is_none()
+                && sel.series.is_none()
+                && sel.join.is_none()
+                && sel.filter.is_empty()
+                && sel.windows.is_empty()
+                && sel.casts.iter().all(Option::is_none);
+            let key_cols: Option<Vec<(String, String)>> = if plain {
+                sel.columns
+                    .iter()
+                    .map(|(_, field)| {
+                        def.columns
+                            .iter()
+                            .find(|c| &c.field() == field)
+                            .map(|c| (field.clone(), c.pg_type.clone()))
+                    })
+                    .collect()
+            } else {
+                None
+            };
+            if let Some(order) = key_cols
+                .and_then(|cols| self.hash_agg_order_over(&sel.table, &cols, &kept_keys, rows))
+            {
+                let mut slots: Vec<Option<Document>> = kept.into_iter().map(Some).collect();
+                kept = order.into_iter().filter_map(|i| slots[i].take()).collect();
             }
             docs = kept;
         }

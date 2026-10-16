@@ -350,8 +350,9 @@ one beside it.
   a table with no statistics (`estimate_rel_size`'s 10-page minimum,
   `estimate_num_groups`' defaults), its tuple hash, and simplehash's
   placement and iteration -- and an ORDER BY over it sorts with
-  PostgreSQL's quicksort. 12 shapes match 15.19 exactly. Not yet:
-  - `SELECT DISTINCT` (a HashAggregate too) keeps first-appearance order.
+  PostgreSQL's quicksort. So does a `SELECT DISTINCT` of bare columns
+  (a HashAggregate over the select list). 19 shapes match 15.19 exactly.
+  Not yet:
   - A WHERE: the group estimate then scales by the clause's selectivity,
     which needs PostgreSQL's default selectivities.
   - GROUP BY an expression, over a join or a subquery, and past about
@@ -369,7 +370,7 @@ one beside it.
     costing.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_distinct_rows_come_out_in_hash_aggregate_order, tests/backlog/test_rust_postgres_gaps.py::test_join_cursor_ordered_by_its_key_cannot_scroll
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_join_cursor_ordered_by_its_key_cannot_scroll
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

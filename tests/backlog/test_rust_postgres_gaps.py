@@ -459,11 +459,11 @@ def test_group_by_rows_come_out_in_hash_aggregate_order(pg: Any) -> None:
     assert got == ("ok", [(g,) for g in [9, 3, 5, 4, 0, 10, 6, 2, 7, 1, 8]])
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_distinct_rows_come_out_in_hash_aggregate_order(pg: Any) -> None:
     """PostgreSQL 15.19: `SELECT DISTINCT` is a HashAggregate too, and
-    returns 9 3 5 4 0 10 6 2 7 1 8 for the table above; here DISTINCT keeps
-    the order the values first appear."""
+    returns 9 3 5 4 0 10 6 2 7 1 8 for the table above (it kept the order
+    the values first appear, until the hash table was modelled)."""
     pg.execute("drop table if exists rp028_d")
     pg.execute("create table rp028_d (k int, g int)")
     pg.execute("insert into rp028_d select i, (i * 7) % 11 from generate_series(1, 40) i")
