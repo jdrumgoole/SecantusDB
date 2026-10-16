@@ -340,20 +340,6 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **RUST pgserver: a statement's text-search NOTICEs are deduplicated.**
-  PostgreSQL 15.19 raises `text-search query doesn't contain lexemes: ""`
-  once per empty tsquery it evaluates, so `select ''::tsquery,
-  ''::tsquery` sends two and a cast over three VALUES rows with two empty
-  strings sends two. Here each sends one: `flush_notices` runs `dedup()` over
-  the planner's notices, because a statement is planned for its Describe as
-  well as its Execute and would otherwise report the same notice twice. The
-  fix is to drop the notices of a plan that does not execute
-  (`planning_to_execute` marks the one that does) rather than deduplicate,
-  and to check that no other planning pass inside Execute repeats one.
-  Found 2026-10-16 by the tsquery_cmp matrix.
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_each_empty_tsquery_raises_its_own_notice
-  Backlog-ID: RP-044
-
 - [ ] **RUST pgserver: the planner's choices that decide row order are only
   partly modelled.** **Decided (Joe, 2026-10-16): build a cost model** --
   enough of PostgreSQL's planner to make its choices, since the order rows
@@ -364,10 +350,19 @@ one beside it.
   a table with no statistics (`estimate_rel_size`'s 10-page minimum,
   `estimate_num_groups`' defaults), its tuple hash, and simplehash's
   placement and iteration -- and an ORDER BY over it sorts with
-  PostgreSQL's quicksort. 12 shapes match 15.19 exactly. Not yet:
-  - `SELECT DISTINCT` (a HashAggregate too) keeps first-appearance order.
-  - A WHERE: the group estimate then scales by the clause's selectivity,
-    which needs PostgreSQL's default selectivities.
+  PostgreSQL's quicksort. So does a `SELECT DISTINCT` of bare columns
+  (a HashAggregate over the select list), and both under a WHERE, whose
+  rows and groups are estimated with the planner's default selectivities
+  (`filter_selectivity`: equality, `<>`, ranges, `IN`, AND, OR). 27 of 28
+  shapes match 15.19 exactly. Not yet:
+  - The planner's path comparison. With few rows estimated (6, from a
+    two-sided range on a primary key) a Sort + Group costs within the 1%
+    fuzz of a HashAggregate and wins on startup cost, so PostgreSQL's
+    groups come out sorted; and a LIMIT with no ORDER BY over a key an
+    index leads reads the index (that shape is declined here, keeping the
+    old order). Both need `cost_agg` / `cost_sort` / `cost_group`, the
+    scans' costs and `add_path`'s fuzzy comparison.
+  - A WHERE with a pattern, `IS NULL` or an expression (declined).
   - GROUP BY an expression, over a join or a subquery, and past about
     50,000 estimated groups, where the planner weighs a sort instead.
   - DISTINCT ON, and a citext DISTINCT, which PostgreSQL sorts.
@@ -383,7 +378,7 @@ one beside it.
     costing.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_distinct_rows_come_out_in_hash_aggregate_order, tests/backlog/test_rust_postgres_gaps.py::test_join_cursor_ordered_by_its_key_cannot_scroll
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_few_estimated_rows_group_by_sorting, tests/backlog/test_rust_postgres_gaps.py::test_join_cursor_ordered_by_its_key_cannot_scroll
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

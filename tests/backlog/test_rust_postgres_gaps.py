@@ -459,16 +459,30 @@ def test_group_by_rows_come_out_in_hash_aggregate_order(pg: Any) -> None:
     assert got == ("ok", [(g,) for g in [9, 3, 5, 4, 0, 10, 6, 2, 7, 1, 8]])
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_distinct_rows_come_out_in_hash_aggregate_order(pg: Any) -> None:
     """PostgreSQL 15.19: `SELECT DISTINCT` is a HashAggregate too, and
-    returns 9 3 5 4 0 10 6 2 7 1 8 for the table above; here DISTINCT keeps
-    the order the values first appear."""
+    returns 9 3 5 4 0 10 6 2 7 1 8 for the table above (it kept the order
+    the values first appear, until the hash table was modelled)."""
     pg.execute("drop table if exists rp028_d")
     pg.execute("create table rp028_d (k int, g int)")
     pg.execute("insert into rp028_d select i, (i * 7) % 11 from generate_series(1, 40) i")
     got = pg_answer(pg, "select distinct g from rp028_d")
     assert got == ("ok", [(g,) for g in [9, 3, 5, 4, 0, 10, 6, 2, 7, 1, 8]])
+
+
+@pytest.mark.backlog("RP-028")
+def test_few_estimated_rows_group_by_sorting(pg: Any) -> None:
+    """PostgreSQL 15.19: `where k > 5 and k < 30` over a fresh table with
+    primary key k is estimated at 6 rows, and there a Sort + Group costs
+    within the planner's 1% fuzz of a HashAggregate and wins on startup
+    cost, so the groups come out sorted by k. Here they come out in the
+    HashAggregate's order: the path comparison is not modelled yet."""
+    pg.execute("drop table if exists rp028_s")
+    pg.execute("create table rp028_s (k int primary key, g int)")
+    pg.execute("insert into rp028_s select i, (i * 7) % 11 from generate_series(1, 40) i")
+    got = pg_answer(pg, "select k, g from rp028_s where k > 5 and k < 30 group by k, g")
+    assert got == ("ok", [(k, (k * 7) % 11) for k in range(6, 30)])
 
 
 @pytest.mark.backlog_fixed("RP-028")
@@ -1087,7 +1101,7 @@ def test_mixed_case_type_is_found_only_as_written(pg: Any) -> None:
     assert reached == ("ok", [(5,)]) and folded[:2] == ("err", "42704")
 
 
-@pytest.mark.backlog("RP-044")
+@pytest.mark.backlog_fixed("RP-044")
 def test_each_empty_tsquery_raises_its_own_notice(pg: Any) -> None:
     """PostgreSQL 15.19: every empty tsquery evaluated raises its own
     `text-search query doesn't contain lexemes: ""` NOTICE, so a statement
