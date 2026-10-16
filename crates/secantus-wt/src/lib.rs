@@ -162,7 +162,10 @@ impl Connection {
         let open = unsafe { (*self.ptr).open_session }.unwrap();
         let mut sptr: *mut sys::WT_SESSION = ptr::null_mut();
         check(unsafe { open(self.ptr, ptr::null_mut(), ptr::null(), &mut sptr) })?;
-        Ok(Session { ptr: sptr })
+        Ok(Session {
+            ptr: sptr,
+            cursor_config: None,
+        })
     }
 }
 
@@ -185,6 +188,9 @@ impl Drop for Connection {
 /// Sessions are not `Sync` — keep one per thread.
 pub struct Session {
     ptr: *mut sys::WT_SESSION,
+    /// Configuration added to every cursor this session opens (see
+    /// [`Session::read_checkpoint`]).
+    cursor_config: Option<String>,
 }
 
 // A `Session` can be **moved** between threads (it owns its `WT_SESSION`), but
@@ -205,10 +211,24 @@ impl Session {
         check(unsafe { create(self.ptr, name_c.as_ptr(), cfg_c.as_ptr()) })
     }
 
+    /// Make every cursor this session opens from now on read the named
+    /// checkpoint (`"WiredTigerCheckpoint"` is the most recent one) instead of
+    /// the live tables. Such cursors are read-only, and opening one on a table
+    /// the checkpoint does not hold fails with `ENOENT`
+    /// ([`WtError::is_missing_table`]).
+    pub fn read_checkpoint(&mut self, name: &str) {
+        self.cursor_config = Some(format!("checkpoint={name}"));
+    }
+
     /// Open a cursor over `uri` (e.g. `"table:secantus_documents"`).
     pub fn open_cursor(&self, uri: &str, config: Option<&str>) -> Result<Cursor> {
         let uri_c = CString::new(uri).map_err(nul_err)?;
-        let cfg_c = match config {
+        let joined = match (config, self.cursor_config.as_deref()) {
+            (Some(c), Some(d)) => Some(format!("{c},{d}")),
+            (Some(c), None) => Some(c.to_string()),
+            (None, d) => d.map(str::to_string),
+        };
+        let cfg_c = match joined {
             Some(c) => Some(CString::new(c).map_err(nul_err)?),
             None => None,
         };

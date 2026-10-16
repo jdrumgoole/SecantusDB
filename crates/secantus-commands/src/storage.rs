@@ -922,6 +922,18 @@ pub trait Storage: Send + Sync {
         Ok(None)
     }
 
+    /// The RecordId of each of `docs` (documents of the collection, found by
+    /// `_id`), `None` for one the store does not hold under it; `None` when
+    /// the store cannot say. `showRecordId` / `{$meta: "recordId"}`.
+    fn record_ids_of(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _docs: &[&[u8]],
+    ) -> Result<Option<Vec<Option<i64>>>, StorageError> {
+        Ok(None)
+    }
+
     /// Total size in bytes of the collection's documents.
     fn collection_data_size(&self, _db: &str, _coll: &str) -> Result<i64, StorageError> {
         Ok(0)
@@ -932,6 +944,27 @@ pub trait Storage: Send + Sync {
     /// `None` from a store that cannot check itself.
     fn check_collection(&self, _db: &str, _coll: &str) -> Result<Option<Document>, StorageError> {
         Ok(None)
+    }
+
+    /// [`Self::check_collection`] as of the last checkpoint, for a
+    /// `validate` with `background: true`. The check also carries `listed`
+    /// (the checkpoint's indexes in `listIndexes`' shape, `_id_` left out),
+    /// `options` (its catalog options) and, when known, `readTimestamp`.
+    /// `Some(None)` when the checkpoint does not hold the collection; `None`
+    /// from a store that keeps no checkpoints (one held in memory, a test
+    /// double).
+    fn check_collection_at_checkpoint(
+        &self,
+        _db: &str,
+        _coll: &str,
+    ) -> Result<Option<Option<Document>>, StorageError> {
+        Ok(None)
+    }
+
+    /// Take a checkpoint now, as `fsync` does. `false` from a store that
+    /// keeps no checkpoints.
+    fn checkpoint_now(&self) -> Result<bool, StorageError> {
+        Ok(false)
     }
 
     /// Per-index sizes in bytes (`{index_name: size}`), for `collStats` /
