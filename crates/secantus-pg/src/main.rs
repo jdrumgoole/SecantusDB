@@ -404,6 +404,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut server = bind_with(&addr, storage, databases, &options).map_err(|e| e.to_string())?;
 
+    // SIGHUP's reload handler goes in BEFORE the readiness line, for the
+    // reason the stop handler does: until it is installed SIGHUP is still
+    // `ctrlc`'s (its `termination` feature takes SIGHUP too), so a SIGHUP
+    // sent the moment a harness saw the line stopped the server (CI's
+    // `sighup_does_not_stop_a_server_with_nothing_to_reload`, on Linux).
+    watch_for_reload(server.reloader());
+
     // One line, flushed, so a harness can wait for readiness. It reports the
     // address the listener actually BOUND, not the one requested, so that
     // `127.0.0.1:0` is usable: the kernel names the port and this line is how
@@ -422,7 +429,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // while the client had been told the writes succeeded. `stop` drains the
     // connections and drops the last `Arc<Storage>`, which is where the
     // close-checkpoint runs. The handler was installed above, before startup.
-    watch_for_reload(server.reloader());
     let _ = rx.recv();
 
     server.stop();
