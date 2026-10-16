@@ -1061,3 +1061,16 @@ def test_mixed_case_type_is_found_only_as_written(pg: Any) -> None:
     finally:
         pg.execute("rollback")
     assert reached == ("ok", [(5,)]) and folded[:2] == ("err", "42704")
+
+
+@pytest.mark.backlog("RP-044")
+def test_each_empty_tsquery_raises_its_own_notice(pg: Any) -> None:
+    """PostgreSQL 15.19: every empty tsquery evaluated raises its own
+    `text-search query doesn't contain lexemes: ""` NOTICE, so a statement
+    casting two of them gets two. Here a statement's planner notices are
+    deduplicated (it is planned for Describe and for Execute), and it gets
+    one."""
+    got: list[str] = []
+    pg.add_notice_handler(lambda d: got.append(d.message_primary))
+    pg.execute("select ''::tsquery, ''::tsquery").fetchall()
+    assert got == ['text-search query doesn\'t contain lexemes: ""'] * 2

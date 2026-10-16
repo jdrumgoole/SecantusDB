@@ -340,6 +340,20 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **RUST pgserver: a statement's text-search NOTICEs are deduplicated.**
+  PostgreSQL 15.19 raises `text-search query doesn't contain lexemes: ""`
+  once per empty tsquery it evaluates, so `select ''::tsquery,
+  ''::tsquery` sends two and a cast over three VALUES rows with two empty
+  strings sends two. Here each sends one: `flush_notices` runs `dedup()` over
+  the planner's notices, because a statement is planned for its Describe as
+  well as its Execute and would otherwise report the same notice twice. The
+  fix is to drop the notices of a plan that does not execute
+  (`planning_to_execute` marks the one that does) rather than deduplicate,
+  and to check that no other planning pass inside Execute repeats one.
+  Found 2026-10-16 by the tsquery_cmp matrix.
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_each_empty_tsquery_raises_its_own_notice
+  Backlog-ID: RP-044
+
 - [ ] **RUST pgserver: grouped and DISTINCT ON rows that tie under ORDER BY
   come out in another order from PostgreSQL's.** A plain ORDER BY (and an
   aggregate's, and a LIMIT's bounded heap) now sorts with PostgreSQL's
