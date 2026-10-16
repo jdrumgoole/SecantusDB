@@ -1380,14 +1380,12 @@ def test_merge_join_on_an_expression_sorts_by_its_value(pg: Any) -> None:
     assert " ".join(f"{a}:{b}" for a, b in got[1][:8]) == want
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_join_with_a_second_equality_between_its_sides(pg: Any) -> None:
     """PostgreSQL 15.19: `on l.b = r.c where r.c = l.a` puts all three
     columns in one equivalence class, so `l.a = l.b` becomes a filter on
     the left side and the join a Hash Join with the left side hashed: the
-    rows come out in the right side's scan order (1:1 2:2 3:3 4:4 1:6 ...);
-    here the second equality is evaluated over the joined rows of a join
-    on the first."""
+    rows come out in the right side's scan order (1:1 2:2 3:3 4:4 1:6 ...)."""
     pg.execute("begin")
     try:
         pg.execute("create table rp028_jl (a int primary key, b int)")
@@ -1404,3 +1402,58 @@ def test_join_with_a_second_equality_between_its_sides(pg: Any) -> None:
     want = "1:1 2:2 3:3 4:4 1:6 2:7 3:8 4:9"
     assert got[0] == "ok"
     assert " ".join(f"{a}:{b}" for a, b in got[1][:8]) == want
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_three_table_left_join_chain_merges_in_key_order(pg: Any) -> None:
+    """PostgreSQL 15.19: `l LEFT JOIN r ON l.b = r.c LEFT JOIN m ON r.a =
+    m.a` joins r and m first (a Hash Right Join), sorts that by `r.c` and
+    merges it with l sorted by `b`, so the rows come out in key order (7
+    then 14 on the left, 5 20 15 10 on the right)."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp028_jl (a int primary key, b int)")
+        pg.execute("insert into rp028_jl select i, i % 7 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jr (a int primary key, c int)")
+        pg.execute("insert into rp028_jr select i, i % 5 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jm (a int, d int)")
+        pg.execute("insert into rp028_jm select i, i % 3 from generate_series(1, 20) i")
+        got = pg_answer(
+            pg,
+            "select rp028_jl.a, rp028_jr.a, rp028_jm.a from rp028_jl"
+            " left join rp028_jr on rp028_jl.b = rp028_jr.c"
+            " left join rp028_jm on rp028_jr.a = rp028_jm.a",
+        )
+    finally:
+        pg.execute("rollback")
+    want = "7:5:5 7:20:20 7:15:15 7:10:10 14:5:5 14:20:20 14:15:15 14:10:10"
+    assert got[0] == "ok"
+    assert " ".join(f"{a}:{b}:{c}" for a, b, c in got[1][:8]) == want
+
+
+@pytest.mark.backlog("RP-028")
+def test_three_tables_on_one_equivalence_class(pg: Any) -> None:
+    """PostgreSQL 15.19: `l JOIN r ON l.b = r.c JOIN m ON l.b = m.d` puts the
+    three keys in one equivalence class, so any two tables can join first;
+    the plan merges l and r, materialises that, and merges it with m sorted
+    by `d` as the outer side (7:5:15 7:20:15 ...); here a key two clauses
+    share keeps the join as written."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp028_jl (a int primary key, b int)")
+        pg.execute("insert into rp028_jl select i, i % 7 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jr (a int primary key, c int)")
+        pg.execute("insert into rp028_jr select i, i % 5 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jm (a int, d int)")
+        pg.execute("insert into rp028_jm select i, i % 3 from generate_series(1, 20) i")
+        got = pg_answer(
+            pg,
+            "select rp028_jl.a, rp028_jr.a, rp028_jm.a from rp028_jl"
+            " join rp028_jr on rp028_jl.b = rp028_jr.c"
+            " join rp028_jm on rp028_jl.b = rp028_jm.d",
+        )
+    finally:
+        pg.execute("rollback")
+    want = "7:5:15 7:20:15 7:15:15 7:10:15 14:5:15 14:20:15 14:15:15"
+    assert got[0] == "ok"
+    assert " ".join(f"{a}:{b}:{c}" for a, b, c in got[1][:7]) == want

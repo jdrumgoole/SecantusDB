@@ -417,18 +417,31 @@ one beside it.
     (`on a.x = b.y + 3`, either side or both) is sorted or hashed by each
     side's value, priced with no statistics for the expression and its
     operators in the clause's cost; a LIMIT straight over a general join
-    is priced for its rows (57 of 57). Not yet: several join keys (a WHERE
-    comparing the two sides is a second key, and with the first an
-    equivalence class: PostgreSQL filters one side by it); an equality on
-    a join key, which the equivalence class turns into a filter on both
-    sides; an expression key with a function call or a cast that costs;
-    parameterized nested loops (an index scan inner); a LIMIT with an
-    ORDER BY, or with a WHERE over the general path; more than two
-    tables; a join of more than 200,000 rows a side, which streams in
-    scan order.
+    is priced for its rows (57 of 57). The ON's and WHERE's equalities
+    form PostgreSQL's equivalence classes: one with a constant filters
+    every member's side by it and leaves an inner join no join clause (a
+    nested loop over every pair; a LEFT join's outer constant filters the
+    inner side and its ON then selects every pair), one without filters
+    each side by the equalities among its own members and joins on its
+    first member each side (102 of 102). A chain of three stored tables
+    on two column equalities, inner or LEFT, is planned by PostgreSQL's
+    join order search (`secantus-pg/src/join_search.rs`): each pair a
+    clause joins, then each with the third, in one `add_path` list, in the
+    orders the outer joins allow; a LEFT join's hash right join returns
+    the rows nothing matched in its hash table's order, two tables or
+    three (84 of 89 shapes at 20, 300 and 3,000 rows; the five left are a
+    key two clauses share and a merge right join). Not yet: two classes spanning both sides
+    (two join keys); an expression in a class; a LEFT join's class
+    through the general path; three tables with a key two clauses share
+    (one equivalence class), a WHERE over two of them, a LIMIT, or a
+    merge right join; more than three tables; an expression key with a
+    function call or a cast that costs; parameterized nested loops (an
+    index scan inner); a LIMIT with an ORDER BY, or with a WHERE over the
+    general path; a join of more than 200,000 rows a side, which streams
+    in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_join_with_a_second_equality_between_its_sides
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_three_tables_on_one_equivalence_class
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

@@ -774,19 +774,31 @@ impl PgHandler {
             return Ok(None);
         }
         // A join whose plan reorders its sides (RP-028) is read whole, where
-        // the materialised path puts them in that plan's order.
+        // the materialised path puts them in that plan's order; so is a
+        // chain of three tables whose join order is searched.
+        if crate::join_search::with_join_where(join, || self.three_table_plan(&join.tree)).is_some()
+        {
+            return Ok(None);
+        }
         if let secantus_pgplan::joins::JoinNode::Join {
             kind,
             left,
             right,
             equi,
             expr_keys,
+            ec,
             ..
         } = &join.tree
         {
             if self
-                .general_join_method(*kind, left, right, equi, expr_keys, None)
-                .is_some_and(|m| m != secantus_pgplan::joincost::JoinMethod::Other)
+                .general_join_method(*kind, left, right, equi, expr_keys, ec.as_ref(), None)
+                .is_some_and(|(m, _, _, _)| {
+                    !matches!(
+                        m,
+                        secantus_pgplan::joincost::JoinMethod::Other
+                            | secantus_pgplan::joincost::JoinMethod::Unmodelled
+                    )
+                })
             {
                 return Ok(None);
             }
@@ -810,7 +822,13 @@ impl PgHandler {
             // A join whose plan reorders its sides is read whole (RP-028).
             || self
                 .narrow_join_method(join, None)
-                .is_some_and(|(m, _, _)| m != secantus_pgplan::joincost::JoinMethod::Other)
+                .is_some_and(|(m, _, _, _)| {
+                    !matches!(
+                        m,
+                        secantus_pgplan::joincost::JoinMethod::Other
+                            | secantus_pgplan::joincost::JoinMethod::Unmodelled
+                    )
+                })
             || !table_or_sub(&join.left_sub, &join.left.0)
             || !table_or_sub(&join.right_sub, &join.right.0)
         {
