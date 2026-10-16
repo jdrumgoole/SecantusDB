@@ -22,6 +22,15 @@ on rust servers only").
   test retired with a written reason), not ignored. When a Rust change makes
   an engine parity test fail, update the parity test's expectation for that
   case rather than changing the Python engine.
+- **Compatibility with them is no longer a constraint, on-disk format
+  included** (Joe, 2026-10-16: "We no longer need to worry about python
+  server compatibility, we are focussed on the rust servers"). A Rust change
+  may store something the Python servers cannot read, or that they would
+  overwrite. Do not shape a Rust design around the Python servers, and do
+  not add Python-side code to carry it. A Python test that such a change
+  breaks (a cross-server store test, say) is retired with a written reason
+  naming the decision, not worked around. The two RUST servers still share
+  one store, and that half of the contract stands.
 - **Removing them is a separate decision for Joe**: the PyPI package still
   ships them, so do not delete code, packages or docs on your own.
 - `tasks/backlog-python-*.md` stay as a record; their items are not worked.
@@ -36,8 +45,11 @@ on rust servers only").
 **Reach for Rust.** The marketing site already leads with the two Rust servers;
 do not "restore" a Python-first framing in docs or on the site.
 
-All four share **one on-disk format**, and that contract is a compatibility
-promise rather than an accident — breaking it is silent data loss. Be precise
+All four share **one on-disk format** today. Between the two Rust servers that
+is a compatibility promise rather than an accident — breaking it is silent data
+loss. Toward the Python servers it no longer binds (2026-10-16, above): the
+cross-language bullets below record what holds now, not what must keep holding.
+Be precise
 about which half of it is actually pinned by a test, because they are different
 claims and it is easy to cite one as evidence for the other:
 

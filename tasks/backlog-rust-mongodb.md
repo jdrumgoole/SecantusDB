@@ -223,13 +223,13 @@ These are explicit non-goals. Don't add them without a reason.
 - **Real replica sets / sharding** — depend on cluster topology and cross-node consistency. SecantusDB advertises `setName: "secantus"` to satisfy pymongo's change-stream topology check, but the topology is fictional — there are no other members, no elections, no cross-node oplog. Change streams are still in scope (single-node, oplog-backed); see `## 3. Deferred work / Change-stream limitations`.
 
     **Reading from a secondary is part of that non-goal** (decided 2026-09-27). There is no secondary to read from, so anything whose behaviour is defined by one is out of scope, not deferred. Three driver-gauge tests fail permanently on this and are accepted rather than tracked: `test_transactions_unified.py::TestUnifiedReadPref::test_secondary_readPreference` and the two `TestUnifiedRunCommand` read-preference cases (`test_run_command_fails_with_explicit_secondary_read_preference`, `test_run_command_fails_with_secondary_read_preference`). A permanently-red gauge test with a reason written down beats one quietly deselected — the pymongo pass rate carries the cost honestly.
-- **`OP_COMPRESSED`** — compression negotiation. Clients can be told the server doesn't support compression; nothing to do.
+- **`OP_COMPRESSED`** — no longer out of scope: the Rust server negotiates snappy, zstd and zlib since 2026-10-15; its `serverStatus` counters are RM-147.
 - **Text search** (`$text`, `$meta: "textScore"`, text indexes) — would need a full-text index implementation.
 - **Geo: exact mongod error-string matching** — chase work without a clear payoff unless a driver test pins exact wording.
-- **`$where`** — runs JavaScript. We don't ship a JS runtime.
+- **`$where`** — runs JavaScript. We don't ship a JS runtime (confirmed by Joe 2026-10-16; MongoDB deprecated it in 8.0).
 - **`$function`, `$accumulator`** (aggregation expressions) — same reason: both evaluate user-supplied JavaScript and need an embedded JS engine + sandbox + BSON↔JS shim layer. Would also require a `--javascriptEnabled` gate (mongod gates JS behind this; many prod deployments disable it). Adding the runtime would let us implement these three operators + `mapReduce` together for ~600–1000 LOC + a heavyweight binary dep (PythonMonkey / QuickJS / V8 — each with maintenance trade-offs). Most pipelines that reach for `$function` can be expressed in the existing aggregation expression library. **`lang: "python"` as a SecantusDB extension was considered and rejected (May 2026)**: would break the conformance contract (pipelines that work locally would explode in production with `Unrecognized lang value: 'python'`), and CPython's sandboxing story is worse than embedded JS engines. If a real user need ever surfaces, the right escape hatch is a server-side trusted-plugin registry — `{$secantusFunction: {name: "<pre-registered>", args: [...]}}` — not user code at query time.
 - **`mapReduce`** — same JS-runtime dependency as `$where` / `$function` / `$accumulator`, and deprecated by MongoDB (removed from the Stable API in 5.0). **WILL NOT BUILD** (decided 2026-09-27). The canonical `emit(this.<field>, 1)` + `values.length` "count by field" pattern is translated to an equivalent `$group` aggregation; non-canonical map / reduce bodies return `{results: [], ok: 1}`, and `out: "<coll>"` (non-inline) is rejected with FailedToParse 9 (`mapReduce on this server only supports {out: {inline: 1}}`). mongo-java-driver's `testMapReduceWithGenerics` writes to a NAMED output collection and so fails permanently; that failure is accepted rather than tracked.
-- **Profiling: `planSummary` / `keysExamined` / `docsExamined` / `execStats` in `system.profile` entries** — out of scope today: the profiler (2026-10-15) writes each entry from what the command did, and these are per-batch execution statistics this server does not keep (`explain` derives totals for the whole query). Also absent for the same reason: `locks`, `flowControl`, `storage`, the query hashes, `cpuNanos`, and a `getmore` entry's `originatingCommand` (a cursor does not keep its command). A `$jsonSchema` profile filter reads back as given, where mongod expands it.
+- **Profiling: execution statistics in `system.profile` entries** — no longer out of scope: decided in scope 2026-10-16 (Joe), counted during execution. Tracked as RM-023. A `$jsonSchema` profile filter still reads back as given, where mongod expands it.
 
 ## 5. Known bugs and edge cases to watch
 
@@ -292,23 +292,16 @@ These are explicit non-goals. Don't add them without a reason.
       Backlog-ID: RM-008
       Verify: tests/backlog/test_rm_001_028.py::test_ingress_connection_rate_limiter_parameters
 
-- [ ] **OPEN — `$where` / server-side JavaScript is not implemented; the
-      refusal is faithful (2026-09-29).** SecantusDB embeds no script engine
-      and there is no plan to. Both servers answer as `mongod --noscripting`
-      8.2.11 does: 6108304 / `Location6108304` / "no globalScriptEngine in
-      $where parsing" in a query, and code 2 `$where is not allowed in this
-      context` in an aggregation `$match` (checked at aggregate parse time,
-      ahead of the leading-`$match` lift). Pinned by
-      `tests/test_mongod_differential.py::test_where_refusal_matches_a_scriptless_mongod`
-      / `::test_where_in_aggregate_match_is_a_context_error` and
-      `tests/test_rust_server_smoke.py` for the Rust server.
-
-      What stays open: the Go tests above that need the JavaScript to actually
-      run. Implementing `$where` means embedding a JS engine — a large
-      dependency for one operator, and worth a deliberate decision rather than
-      drifting into.
-      Backlog-ID: RM-009
-      Verify: tests/backlog/test_rm_001_028.py::test_where_runs_javascript
+- **Scope decision — no server-side JavaScript** (Joe, 2026-10-16,
+  formerly RM-009). `$where`, `$function`, `$accumulator` and `mapReduce`
+  are refused as `mongod --noscripting` 8.2.11 refuses them (6108304 in a
+  query, 2 in an aggregation `$match`, 31264 for mapReduce); MongoDB
+  deprecated all four in 8.0. Pinned by
+  `tests/test_mongod_differential.py::test_where_refusal_matches_a_scriptless_mongod`
+  / `::test_where_in_aggregate_match_is_a_context_error`. The two Go
+  `TestSDAMErrorHandling` leaves that need a `$where` to run are expected
+  failures; `TestConnectionPoolBackpressure` is not, because it also needs
+  the ingress rate limiter (RM-008).
 
 - **Not a defect: the C gauge's two `/Client/ipv6/single` failures.** The
       test hard-codes `[::1]:27017` (documented as inherent); they are the gauge's only failures (790 / 2 / 46 of 838 with both
@@ -597,6 +590,11 @@ These are explicit non-goals. Don't add them without a reason.
       it on every batch) and `cursorExhausted: true` on the last one.
       (The command document, `planSummary` on the opening command,
       per-batch `nreturned` and `reslen` are on the line since 2026-10-16.)
+      **Decided 2026-10-16 (Joe):** count keys and documents examined during
+      execution (with the streaming cursors), and keep the originating
+      command on a cursor, so the `Slow query` line and `system.profile`
+      entries carry the real counts. Derived counts from `explain`'s walk
+      are not to be used.
       Backlog-ID: RM-023
       Verify: tests/backlog/test_rm_001_028.py::test_slow_query_line_says_where_the_time_went
 
@@ -649,15 +647,18 @@ may run a command.
       `reIndex` refuses as mongod does on a replica-set primary, which this
       server reports itself as; compared against a standalone mongod it looks
       like a difference and is not.
+      **Decided 2026-10-16 (Joe):** the 31264 refusal stands. The Java and
+      Kotlin gauges' "MapReduce omits default write concern" is recorded in
+      `validation_summary/expected_failures.py`. A JavaScript engine is not
+      being built for this.
       Backlog-ID: RM-027
       Verify: tests/backlog/test_rm_001_028.py::test_commands_mongod_runs
-- [ ] **The server's own commands have no mongod rule.**
-      `secantusAdmin.backupArchive` and `archiveBaseSnapshot` need cluster
-      `readBackupFile` (the `backup` role), `restoreArchive` cluster
-      `applyOps` (`restore`), `pruneOplog` cluster `replSetResizeOplog`, and
-      `pruneTtl` cluster `compact`. These were chosen, not measured.
-      Backlog-ID: RM-028
-      Verify: none -- privilege rules for SecantusDB-only commands have no mongod reference
+- **Scope decision — the privileges of this server's own commands**
+  (Joe, 2026-10-16, formerly RM-028). `secantusAdmin.backupArchive` and
+  `archiveBaseSnapshot` need cluster `readBackupFile` (the `backup` role),
+  `restoreArchive` cluster `applyOps` (`restore`), `pruneOplog` cluster
+  `replSetResizeOplog`, and `pruneTtl` cluster `compact`: each the action
+  that guards mongod's nearest real operation (`secantus-commands/src/authz.rs`).
 
 ### 7.083 User and role commands -- 2026-10-14
 
@@ -679,6 +680,9 @@ What is open:
       on-disk change it reads: a field in the record shows in its
       `rolesInfo`, and a side table it does not write goes stale when it
       drops and recreates a role. About two hours once decided.
+      **Decided 2026-10-16 (Joe):** a side table only the Rust server
+      writes, holding each role's creation sequence. Compatibility with the
+      Python server is no longer a constraint (`CLAUDE.md`).
       Backlog-ID: RM-029
       Verify: tests/backlog/test_rm_029_056.py::test_roles_info_lists_roles_in_creation_order
 - [ ] **The order of a set of roles** (5): a user's `roles` after
@@ -797,6 +801,9 @@ Still different:
       reports `bytesIn` / `bytesOut` for each compressor and decompressor
       (snappy, zstd, zlib; int64, zero on a fresh server). This server
       speaks all three since 2026-10-15 and counts none of them.
+      **Decided 2026-10-16 (Joe):** in scope. `OP_COMPRESSED` with snappy,
+      zstd and zlib already works (2026-10-15); only these counters are
+      missing.
       Backlog-ID: RM-147
       Verify: tests/backlog/test_rm_found_2026_10_15.py::test_server_status_reports_compression_counters
 - **Scope decision — `buildInfo.secantusVersion` and `serverStatus.secantus`
@@ -952,11 +959,18 @@ Still different, all 77:
       `{a: 5}, sort {a: -1}, skip 1, limit 2`). This server keeps them in
       the order they arrived. A Linux mongod is built on another library
       and was not measured.
+      **Decided 2026-10-16 (Joe):** measure the cases against mongod 8.2.11
+      on Linux (libstdc++) first. If Linux agrees with macOS, reproduce
+      libc++'s heap; if not, mongod has no single answer and the divergence
+      is accepted.
       Backlog-ID: RM-049
       Verify: tests/backlog/test_rm_029_056.py::test_ties_under_a_sort_with_a_limit,tests/backlog/test_rm_029_056.py::test_ties_under_an_aggregate_sort_with_a_limit
-- [ ] **An unknown hint's wording** on `aggregate` (15), as under 7.075.
-  Backlog-ID: RM-051
-  Verify: tests/backlog/test_rm_029_056.py::test_unknown_hint_on_aggregate
+- **Scope decision — an unknown hint's wording** (Joe, 2026-10-16). The
+  code matches mongod (2); the message is this server's own, because mongod
+  prints its query tree there. The probes' replies that differ only in this
+  text are accepted. Pinned by
+  `tests/backlog/test_rm_029_056.py::test_unknown_hint_on_aggregate`
+  (formerly RM-051).
 - [ ] **The order of an unsorted `find` for six predicate shapes the
       plan derives differently from mongod.** Found by p4-router's
       824-case shapes harness (2026-10-15), mongod 8.2.11: 22 replies, the
@@ -1034,7 +1048,8 @@ pipeline update with `c: {new: doc}`, `fail` an insert.
 Still different, all 4:
 
 - `cursor: {batchSize: 0}` (2): mongod does not run the stage until the
-  first `getMore`. The lazy-cursor decision.
+  first `getMore`. Decided 2026-10-16 (Joe): cursors stream as mongod's
+  do, a suspended plan pulled a batch at a time.
 - A `$merge` whose first write fails to parse its query (1): mongod has
   already created the target.
 - The collation key in a duplicate-key message under a collation (1):
@@ -1121,6 +1136,9 @@ What is left, on the RUST MongoDB server:
 - [ ] **`secantus-core-py`, the parity binding, still decodes through
       serde** (36 calls). The PostgreSQL crates' five were replaced on
       2026-10-14 (see the Rust PG server's built-in functions entry).
+      **Decided 2026-10-16 (Joe):** replace the 36 serde decodes with
+      `secantus_core::bsondoc::from_bytes`, then let
+      `tests/test_rust_literal_bson_decode.py` cover every crate.
       Backlog-ID: RM-058
       Verify: none -- the serde decode is in the secantus-core-py parity binding, a test vehicle with no wire behaviour to compare against mongod
 - [ ] **The field order of a document upserted from two or more
@@ -1194,6 +1212,10 @@ What is left, all on the RUST MongoDB server:
       `$limit`). Also open in listings: mongod constant-folds (`{$abs: -1}`
       is `{$const: 1}`) and orders the fields of object-form operators its
       own way (`$dateToString`).
+      **Decided 2026-10-16 (Joe):** reproduce SBE faithfully: transcribe
+      mongod 8.2.11's SBE stage builders for these shapes and EXECUTE the
+      slot programs, so `queryPlan`, `slotBasedPlan` and the SBE execution
+      stats all come from running the plan. Not a printed stand-in.
       Backlog-ID: RM-071
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_a_group_pushed_into_the_query
 - [ ] **`count` on a view** is explained by mongod 8.2.11 as an SBE plan
@@ -1201,6 +1223,7 @@ What is left, all on the RUST MongoDB server:
       scan); this server reports the classic cursor and the `$count`
       stage. The same decision as RM-071. `distinct` and `aggregate` on a
       view match mongod. `explain_commands.py`: `a view` 4 and 5.
+      **Decided 2026-10-16 (Joe):** as RM-071, transcribe and execute.
       Backlog-ID: RM-072
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view
 - [ ] **Smaller:** `$expr` is not rewritten (`{$expr: false}` is not an
@@ -1269,8 +1292,13 @@ differs on 5 scenarios. What is left:
       the Python server would then have to carry too. One scenario. The
       same order is the order `explain` lists rejected plans in, which here
       follows the catalog's name order.
+      **Decided 2026-10-16 (Joe):** record the build order: a sequence in
+      each index's catalog options, stripped from `listIndexes` like
+      `entryFormat`, used for `listIndexes`, the duplicate-key index and
+      `rejectedPlans`. A store's existing indexes take name order on open.
+      Folds in RM-107, the same item.
       Backlog-ID: RM-081
-      Verify: tests/backlog/test_rm_057_084.py::test_list_indexes_in_build_order
+      Verify: tests/backlog/test_rm_057_084.py::test_list_indexes_in_build_order,tests/backlog/test_rm_085_112.py::test_list_indexes_in_creation_order
 - [ ] **RUST MongoDB server: an `aggregate` cursor outlives the index it
       reads.** A `find` cursor is killed when its index is dropped (175,
       since 2026-10-14); an `aggregate` whose `$match` reads one is not.
@@ -1296,6 +1324,10 @@ differs on 5 scenarios. What is left:
       a decision already made (`tests/test_rust_hint_error_message.py`).
       Not probed: `oplogReplay`, `$meta: "textScore"` sorts, an
       `explain: true` aggregate.
+      **Decided 2026-10-16 (Joe):** per-collection record ids, on disk:
+      number each collection's records from 1 and store the counter, as
+      mongod does, so `showRecordId` and `$meta: "recordId"` give mongod's
+      numbers. The Python server need not read the result (`CLAUDE.md`).
       Backlog-ID: RM-083
       Verify: tests/backlog/test_rm_057_084.py::test_meta_record_id_and_index_key_projections, tests/backlog/test_rm_found_2026_10_16.py::test_show_record_id_is_the_record_id
 
@@ -1318,6 +1350,10 @@ retryable writes). The Rust server differs on 11 scenarios. What is left:
       sees or commits has not been measured, and is the data-integrity
       question. `tools/probes/transactions.py`, "a collection dropped under
       a transaction ...".
+      **Decided 2026-10-16 (Joe):** model mongod's collection locks: an open
+      transaction holds each collection it touches; `drop`, `createIndexes`,
+      `renameCollection` and `collMod` wait on it and answer 50 at their
+      `maxTimeMS`; commit or abort releases it.
       Backlog-ID: RM-084
       Verify: tests/backlog/test_rm_057_084.py::test_drop_waits_for_a_transaction_that_read,tests/backlog/test_rm_057_084.py::test_drop_under_a_transaction_that_wrote_honours_max_time
 - [ ] **RUST MongoDB server: smaller differences.** A `count` with no query
@@ -1373,6 +1409,15 @@ is left follows from that:
         Its sizes are of the derived buckets, not of compressed ones.
       - **An unsorted read of a time-series collection reads the whole
         collection** to place the measurements, whatever its filter.
+      **Decided 2026-10-16 (Joe):** model mongod's server-wide bucket
+      catalog, memory accounting across every collection included
+      (`getCacheDerivedBucketMaxSize`), so buckets close for size as on
+      mongod.
+      **Decided 2026-10-16 (Joe):** store real buckets in mongod's
+      compressed column format (BSONColumn), kept by the server-wide
+      catalog, in place of measurements kept as documents. Existing stores
+      are converted on open. This also closes the `data` bytes, the bucket
+      writes, the `collStats` counters and the whole-collection read above.
       Backlog-ID: RM-088
       Verify: tests/backlog/test_rm_085_112.py::test_bucket_collection_can_be_deleted_from
 - [ ] **RUST MongoDB server: smaller time-series differences.** A
@@ -1410,6 +1455,9 @@ What is left, there and beside it:
       `CollatorOptions` documents it as always on, no BCP47 `kk`), so this
       needs ICU itself or a collator of our own: a decision, not a fix
       (checked 2026-10-16, icu_collator 2.3.1).
+      **Decided 2026-10-16 (Joe):** link the C ICU 57.1 that mongod links,
+      in place of ICU4X, so `normalization: false` and the `alternate:
+      "shifted"` cases match.
       Backlog-ID: RM-091
       Verify: tests/backlog/test_rm_085_112.py::test_canonically_equivalent_strings_differ_without_normalization
 - [ ] **RUST MongoDB server: collated `_id` uniqueness, what is left.**
@@ -1429,6 +1477,9 @@ What is left, there and beside it:
       planner passes it over: a query with a collation scans. Correct, slow
       on a large collection. A hint naming such an index is accepted and
       scans.
+      **Decided 2026-10-16 (Joe):** `explain` reports mongod's plan, as it
+      does; where the router reads differently, as here, the router is
+      brought to the plan. Each such place is a performance bug.
       Backlog-ID: RM-094
       Verify: none -- explain already reports IXSCAN (derived from mongod's rules); the gap is the router scanning, a cost no reply shows
 - [ ] **RUST MongoDB server: five collation types are refused.** `search`,
@@ -1440,6 +1491,8 @@ What is left, there and beside it:
       a baked data module) could carry those three; `big5han` and
       `gb2312han` are no longer in CLDR at all and exist only in ICU 57's
       data. Either way a build-time data pipeline: a decision for Joe.
+      **Decided 2026-10-16 (Joe):** as RM-091: with ICU 57.1 linked, all
+      five types come from its data.
       Backlog-ID: RM-095
       Verify: tests/backlog/test_rm_085_112.py::test_five_collation_types_are_accepted
 - [ ] **RUST MongoDB server: smaller collation differences.** `Did you
@@ -1563,11 +1616,7 @@ wording filed under 7.067) and 2 TTL results
 of 90: `text` and `hashed` are not built (out of scope) and so cannot be
 dropped (four), and `listIndexes` lists by name.
 
-- [ ] **RUST MongoDB server: `listIndexes` is in name order after `_id_`.**
-      `mongod` lists in creation order. The storage layer keeps no creation
-      order for indexes.
-      Backlog-ID: RM-107
-      Verify: tests/backlog/test_rm_085_112.py::test_list_indexes_in_creation_order
+`listIndexes` order is RM-081 (RM-107 was the same item, folded in 2026-10-16).
 
 ### 7.066 Views and `$count` -- 2026-10-09
 
@@ -1603,7 +1652,7 @@ dropped (four), and `listIndexes` lists by name.
 - **The multikey `$sort` plan artifact**: accepted -- mongod contradicting its
   own `_id` tie-break.
 - **Decimal128 transcendental last digit**: authorised (correctly rounded).
-- **Make Rust the recommended default**: a product decision for Joe.
+- **Make Rust the recommended default**: decided 2026-10-16 (Joe): Rust first everywhere — README (the PyPI page) and docs lead with the Rust servers, the Python servers move to a marked-deprecated section, and the `secantusdb` alias names `secantusd-rs`. Removing the Python servers stays a separate decision.
 - **PyPI trusted publisher for `secantus-core` / lockstep publishing**: needs
   Joe's PyPI account.
 - **CI Python matrix (3.10 only on push)** and **vendored WiredTiger rebuilt per

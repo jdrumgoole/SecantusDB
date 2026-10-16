@@ -797,6 +797,7 @@ _EXPECTED_FAILURES_BY_GAUGE: dict[str, list[ef_module.ExpectedFailure]] = {
     # duplicate that could drift.
     "pymongo (async)": ef_module.PYMONGO,
     "mongo-java-driver": ef_module.JAVA,
+    "mongo-kotlin-driver": ef_module.KOTLIN,
     "mongo-go-driver": ef_module.GO,
     "mongo-node-driver": ef_module.NODE,
     "mongo-ruby-driver": ef_module.RUBY,

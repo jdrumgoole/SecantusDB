@@ -336,23 +336,38 @@ Size: one or two batches.
 
 Each unblocks rows that otherwise stay open.
 
-| Decision | What it holds |
+**Decided 2026-10-16** (the detail is on each backlog item):
+
+| Decision | Outcome |
 | --- | --- |
-| Unknown-hint wording (mongod prints its query tree). Already decided: not reproduced (7.05, `tests/test_rust_hint_error_message.py`). Confirm, then mark the rows accepted in each probe | about 50 replies over six probes |
-| Lazy cursors (`getMore` sees later writes; `batchSize: 0` runs nothing) | 3 replies, and memory on large results |
-| Ties under a sort with a limit. mongod's order comes from its C++ library's heap, and a Linux mongod (libstdc++) was not measured. Measure it first; if it differs from macOS (libc++), accept the divergence instead of copying either | 62 |
-| Index build order on disk (a catalog field the Python server must carry) | `listIndexes` order, duplicate-key index |
-| A schema change waits on an open transaction (after the Phase 1b measurement) | 2 |
-| The privileges for this server's own `secantusAdmin` commands, which were chosen, not measured (7.084) | |
-| `explain`: mongod's plan or this server's access path | |
-| Stored time-series buckets instead of derived | |
-| The profiler `filter`; `system.profile` | 6 |
-| Wire compression (`OP_COMPRESSED`) | 2 |
-| Server-side JavaScript (`$where`) | 3 Go leaves, several probe rows |
-| Gate `configureFailPoint` / `enableTestCommands` | security |
-| Python-server parity for the Rust-side changes (the on-disk half is not optional: Phase 1a) | |
-| The PostgreSQL crates' serde BSON decodes (7.077) | |
-| Rust as the recommended default | product |
+| mapReduce refusal (RM-027) | accepted; the Java and Kotlin gauge test is an expected failure |
+| Record ids (RM-083) | per-collection counters on disk, mongod's numbers |
+| Role order (RM-029) | a side table the Rust server alone writes |
+| Time-series size closing (RM-088) | model mongod's server-wide bucket catalog |
+| Collation (RM-091, RM-095) | link C ICU 57.1 in place of ICU4X |
+| SBE explain (RM-071, RM-072) | transcribe mongod's stage builders and execute the slot programs |
+| Python-server compatibility | no longer a constraint, on-disk format included (`CLAUDE.md`) |
+| Unknown-hint wording (RM-051) | not reproduced; scope decision. Still to do: mark the rows accepted in each probe |
+| Ties under a sort with a limit (RM-049) | measure a Linux mongod first; reproduce libc++'s heap if it agrees, accept if not |
+| Lazy cursors | stream as mongod does: a suspended plan pulled a batch at a time |
+| Index build order (RM-081, RM-107 folded in) | record it in the catalog |
+| A schema change under an open transaction (RM-084) | model mongod's collection locks; DDL waits and answers 50 at `maxTimeMS` |
+| Privileges of the `secantusAdmin` commands | keep the mapping; scope decision (formerly RM-028) |
+| `explain` | mongod's plan; where the router reads differently, bring the router to the plan (RM-094) |
+| Stored time-series buckets (RM-088) | store real BSONColumn buckets, with the catalog above |
+| Profiler and `Slow query` execution statistics (RM-023) | count them during execution, with the streaming cursors |
+| Wire compression | already speaks snappy, zstd and zlib (2026-10-15); add the `serverStatus` counters (RM-147) |
+| Server-side JavaScript | keep refusing; scope decision (formerly RM-009); the two Go `$where` leaves are expected failures |
+| `configureFailPoint` / `enableTestCommands` | off everywhere, the embedded handles included; a test that needs one asks for it |
+| serde BSON decodes (RM-058) | replace the 36 in `secantus-core-py` |
+| Rust as the recommended default | Rust first everywhere: README, docs, the `secantusdb` alias |
+
+Nothing is open. Work these decisions create, smallest first: the probe
+rows for the hint wording, RM-058, RM-147, RM-081, role order (RM-029),
+test commands off everywhere, Rust first in the README and docs, the Linux
+heap measurement (RM-049), RM-084, streaming cursors with execution counts
+(RM-023), per-collection record ids (RM-083), ICU 57.1 (RM-091, RM-095),
+stored buckets with the catalog (RM-088), SBE (RM-071, RM-072).
 
 ## Out of scope or accepted
 
