@@ -309,6 +309,24 @@ fn hash_numeric(v: &Bson, h: H) -> Result<u64> {
     })
 }
 
+/// The 32-bit hash PostgreSQL's hash opclass for `ty` gives `v` -- what a
+/// HashAggregate's table hashes a grouping key by (`hashagg`). `None` for a
+/// type this module does not hash.
+pub(crate) fn plain_hash(v: &Bson, ty: &str) -> Option<u32> {
+    let base = ty.trim_start_matches("pg_catalog.");
+    let hash = if let Some(element) = base.strip_suffix("[]") {
+        hash_array(v, element, H::Plain)
+    } else {
+        match base {
+            "jsonb" => jsonb_hash(&value_text(v), H::Plain),
+            // `hashchar` over the bool's byte.
+            "bool" => Ok(H::Plain.uint32(u32::from(matches!(v, Bson::Boolean(true))))),
+            _ => hash_value(v, base, H::Plain),
+        }
+    };
+    hash.ok().map(|h| h as u32)
+}
+
 /// The hash of one value of `ty`.
 fn hash_value(v: &Bson, ty: &str, h: H) -> Result<u64> {
     let base = ty.trim_start_matches("pg_catalog.");

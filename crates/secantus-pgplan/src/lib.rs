@@ -19,6 +19,7 @@ mod agg_support;
 mod cmpfn;
 mod expr_where;
 mod filter_sublink;
+pub mod hashagg;
 mod hashfn;
 mod like_match;
 mod multi_assign;
