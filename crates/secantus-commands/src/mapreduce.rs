@@ -12,11 +12,9 @@
 //! ```
 //!
 //! That shape is recognised and translated to a `$group` count, which the
-//! aggregation engine already does correctly. Anything else returns an empty
-//! result set with `ok: 1` — enough for the wire-shape probes drivers run
-//! (mongo-java-driver's `default-write-concern-3.4` asserts the reply shape and
-//! never looks at the values), while a caller who needs real JS evaluation was
-//! always going to need a real `mongod`.
+//! aggregation engine already does correctly. Anything else is refused as a
+//! mongod started with `--noscripting` refuses it (31264, measured 8.2.11).
+//! It used to answer `ok: 1` with no results, a silent wrong answer.
 //!
 //! Port of `commands.py::_map_reduce`, semantics matched case for case: the
 //! `{out: {inline: 1}}` gate, the pattern match, and the double-typed `value`.
@@ -91,9 +89,18 @@ pub fn map_reduce(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
     let Some(field) = emitted_count_field(&map_fn).filter(|_| reduces_by_counting(&reduce_fn))
     else {
-        // Not the shape we can evaluate — the honest empty result (see the
-        // module docs).
-        return Ok(doc! { "results": Bson::Array(Vec::new()), "ok": 1.0 });
+        // Not the shape we can evaluate: what a mongod with no JavaScript
+        // engine answers (`--noscripting`, measured 8.2.11).
+        return Ok(CommandError::new(
+            31264,
+            "Location31264",
+            format!(
+                "Executor error during MapReduce command on namespace: {}.{coll} :: caused by \
+                 :: Cannot run server-side javascript without the javascript engine enabled",
+                ctx.db_name
+            ),
+        )
+        .into_reply());
     };
 
     let storage = ctx.storage()?;
@@ -278,9 +285,9 @@ mod tests {
     }
 
     #[test]
-    fn an_unevaluatable_body_returns_an_empty_result_not_an_error() {
-        // The wire-shape probe drivers run (java's default-write-concern-3.4)
-        // asserts ok:1 and never inspects the values.
+    fn an_unevaluatable_body_is_refused_as_without_javascript() {
+        // An empty `ok: 1` was a silent wrong answer; a mongod started with
+        // `--noscripting` answers 31264 (8.2.11).
         let reply = run(
             doc! {
                 "mapReduce": "c",
@@ -290,8 +297,12 @@ mod tests {
             },
             vec![doc! {"a": 1, "b": 2}],
         );
-        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
-        assert!(reply.get_array("results").unwrap().is_empty());
+        assert_eq!(reply.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(reply.get_i32("code").unwrap(), 31264);
+        assert!(reply
+            .get_str("errmsg")
+            .unwrap()
+            .ends_with("Cannot run server-side javascript without the javascript engine enabled"));
     }
 
     #[test]

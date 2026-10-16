@@ -231,6 +231,10 @@ fn unknown_expr_operator_in_filter(filter: &Document) -> Option<String> {
 /// filter / sort / skip / limit / projection become pipeline stages (in that
 /// order), over the view namespace, carrying the collation / let / batchSize.
 fn build_view_find_aggregate(doc: &Document, coll: &str, natural_hint: Option<&Bson>) -> Document {
+    // Any other hint names an index of the collection beneath the view, and
+    // the aggregate reads that collection through it: mongod refuses one
+    // that names no index (2) and returns documents in its order.
+    let hint = natural_hint.or_else(|| argtypes::given_hint(doc));
     let mut pipeline: Vec<Bson> = Vec::new();
     if let Some(Bson::Document(f)) = doc.get("filter") {
         if !f.is_empty() {
@@ -275,7 +279,7 @@ fn build_view_find_aggregate(doc: &Document, coll: &str, natural_hint: Option<&B
     if let Some(l) = doc.get("let") {
         agg.insert("let", l.clone());
     }
-    if let Some(h) = natural_hint {
+    if let Some(h) = hint {
         agg.insert("hint", h.clone());
     }
     agg
@@ -528,6 +532,15 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // an empty collection — the per-doc path would silently ignore it.
     if let Some((code, name, msg)) = json_schema_error_in_filter(&filter) {
         return Ok(CommandError::new(code, name, msg).into_reply());
+    }
+    // `$text` needs a text index, which this server cannot search: mongod's
+    // 27 (measured 8.2.11).
+    if let Some((code, errmsg)) =
+        crate::crud::text_query_problem(ctx.storage()?, &ctx.db_name, &coll, &filter)
+    {
+        return Ok(
+            CommandError::new(code, crate::util::error_code_name(code), errmsg).into_reply(),
+        );
     }
     let skip = doc.get("skip").and_then(as_i64).unwrap_or(0).max(0) as usize;
     let limit = doc.get("limit").and_then(as_i64).unwrap_or(0).max(0) as usize; // 0 ⇒ no limit

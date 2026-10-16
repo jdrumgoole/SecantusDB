@@ -576,6 +576,13 @@ pub trait Storage: Send + Sync {
         f()
     }
 
+    /// Run `f` with an unbounded delete outside a transaction removing its
+    /// matches in batches of `batch`, each in reverse, as mongod's batched
+    /// multi-delete does. Default: in the order they were read.
+    fn with_reversed_delete_batches(&self, _batch: usize, f: &mut dyn FnMut()) {
+        f()
+    }
+
     /// Whether every document `query` matches also matches `partial`, as far
     /// as the index router can prove it (it answers `false` when unsure).
     fn query_implies_partial(&self, _query: &Document, _partial: &Document) -> bool {

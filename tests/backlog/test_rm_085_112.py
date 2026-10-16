@@ -442,7 +442,7 @@ def test_set_window_fields_partition_order(rust_mongo: Any, mongod: Any) -> None
 # ------------------------------------------------- 7.068 bulkWrite / TTL --
 
 
-@pytest.mark.backlog("RM-100")
+@pytest.mark.backlog_fixed("RM-100")
 def test_clustered_collection_has_no_separate_id_index(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11: `createIndexes` on a clustered collection answers
     `numIndexesBefore: 0`."""
@@ -458,7 +458,7 @@ def test_clustered_collection_has_no_separate_id_index(rust_mongo: Any, mongod: 
     assert got == ref
 
 
-@pytest.mark.backlog("RM-101")
+@pytest.mark.backlog_fixed("RM-101")
 def test_pipeline_upsert_with_array_id(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11: a pipeline upsert whose result has an array `_id`
     answers 54."""
@@ -474,7 +474,7 @@ def test_pipeline_upsert_with_array_id(rust_mongo: Any, mongod: Any) -> None:
     assert got == ref
 
 
-@pytest.mark.backlog("RM-103")
+@pytest.mark.backlog_fixed("RM-103")
 def test_ttl_monitor_sleep_secs_reports_the_started_cadence(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -592,7 +592,7 @@ def test_list_indexes_in_creation_order(rust_mongo: Any, mongod: Any) -> None:
 # ------------------------------------------------------------ 7.066 views --
 
 
-@pytest.mark.backlog("RM-108")
+@pytest.mark.backlog_fixed("RM-108")
 def test_hint_on_a_view_is_refused(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11: a hint naming no index, on a view, answers 2."""
 
@@ -607,18 +607,62 @@ def test_hint_on_a_view_is_refused(rust_mongo: Any, mongod: Any) -> None:
     assert got == ref
 
 
-@pytest.mark.backlog("RM-108")
+@pytest.mark.backlog_fixed("RM-108")
 def test_index_stats_on_a_view_is_refused(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11: `$indexStats` on a view answers 40602."""
+    """mongod 8.2.11: `$indexStats` on a view WITH a pipeline answers 40602
+    (the view's stages go first, so it is no longer the first stage). On a
+    view with an empty pipeline it reports the base collection's indexes."""
 
     def probe(client: Any) -> Any:
         db = client[_name("rm108")]
         db.base.insert_one({"a": 1})
-        db.command("create", "v", viewOn="base", pipeline=[])
-        return mongo_answer(lambda: list(db.v.aggregate([{"$indexStats": {}}])))[:2]
+        db.base.create_index("a")
+        db.command("create", "v", viewOn="base", pipeline=[{"$match": {}}])
+        db.command("create", "v0", viewOn="base", pipeline=[])
+        refused = mongo_answer(lambda: list(db.v.aggregate([{"$indexStats": {}}])))[:2]
+        names = sorted(d["name"] for d in db.v0.aggregate([{"$indexStats": {}}]))
+        return refused, names
 
     got, ref = _both(rust_mongo, mongod, probe)
-    assert ref == ("err", 40602)
+    assert ref == (("err", 40602), ["_id_", "a_1"])
+    assert got == ref
+
+
+@pytest.mark.backlog_fixed("RM-108")
+def test_hint_on_a_view_count_distinct_and_order(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11: `count` and `distinct` on a view refuse a hint naming no
+    index (2), and a `find` on a view returns documents in the hinted
+    index's order, `$natural: -1` reversed."""
+
+    def probe(client: Any) -> Any:
+        db = client[_name("rm108")]
+        db.base.insert_many([{"_id": i, "a": v} for i, v in enumerate([3, 1, 2])])
+        db.base.create_index("a")
+        db.command("create", "v", viewOn="base", pipeline=[])
+        return (
+            mongo_answer(lambda: db.command("count", "v", hint="nope_1"))[:2],
+            mongo_answer(lambda: db.command("distinct", "v", key="a", hint="nope_1"))[:2],
+            [d["_id"] for d in db.v.find({}).hint("a_1")],
+            [d["_id"] for d in db.v.find({}).hint([("$natural", -1)])],
+        )
+
+    got, ref = _both(rust_mongo, mongod, probe)
+    assert ref == (("err", 2), ("err", 2), [1, 2, 0], [2, 1, 0])
+    assert got == ref
+
+
+@pytest.mark.backlog("RM-108")
+def test_distinct_on_a_view_in_mongod_order(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 runs `distinct` on a view as a `$group`, and answers
+    the values in its hash table's order, not sorted."""
+
+    def probe(client: Any) -> Any:
+        db = client[_name("rm108")]
+        db.base.insert_many([{"a": v} for v in [3, "x", 1, 2, None, 1.5, {"z": 1}]])
+        db.command("create", "v", viewOn="base", pipeline=[])
+        return db.v.distinct("a")
+
+    got, ref = _both(rust_mongo, mongod, probe)
     assert got == ref
 
 
@@ -644,7 +688,7 @@ def test_create_existing_view_with_another_pipeline_wording(rust_mongo: Any, mon
 # --------------------------------------------------------- 7.065 capped --
 
 
-@pytest.mark.backlog("RM-110")
+@pytest.mark.backlog_fixed("RM-110")
 def test_coll_mod_capped_size_event_names_fields_as_sent(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11: a `showExpandedEvents` change stream sees a `collMod` of
     `cappedSize` with the field named as sent."""

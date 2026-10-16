@@ -467,9 +467,8 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     let store = ctx.server_params.clone();
     let mut out = Document::new();
     for (i, (name, value)) in requested.iter().enumerate() {
-        let previous = store
-            .as_ref()
-            .and_then(|s| s.get(name))
+        let previous = crate::serverinfo::ttl_monitor_param(ctx, name)
+            .or_else(|| store.as_ref().and_then(|s| s.get(name)))
             .or_else(|| defaults.get(name.as_str()).cloned())
             .unwrap_or(Bson::Null);
         // Store what mongod would store, not what the client sent, so

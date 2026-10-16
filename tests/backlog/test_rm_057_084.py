@@ -194,7 +194,7 @@ def _text_update(client: Any) -> tuple:
     return mongo_answer(lambda: c.update_one({"$text": {"$search": "hello"}}, {"$set": {"b": 1}}))
 
 
-@pytest.mark.backlog("RM-061")
+@pytest.mark.backlog_fixed("RM-061")
 def test_text_in_an_update_query_without_a_text_index(rust_mongo: Any) -> None:
     """mongod 8.2.11: `27 IndexNotFound`, `text index required for $text query`."""
     assert _text_update(rust_mongo) == ("err", 27, "text index required for $text query")
@@ -211,7 +211,7 @@ def _cluster_time_update(client: Any) -> tuple:
     return (ans, type(c.find_one({"_id": 1}).get("t")).__name__)
 
 
-@pytest.mark.backlog("RM-062")
+@pytest.mark.backlog_fixed("RM-062")
 def test_cluster_time_in_a_pipeline_update(rust_mongo: Any, mongod_rs: Any) -> None:
     """On a replica set mongod 8.2.11 sets the field to the operation's
     cluster time, a Timestamp."""
@@ -226,7 +226,7 @@ def _replace_with_scalar(client: Any) -> tuple:
     return mongo_answer(lambda: c.update_one({"_id": 1}, [{"$replaceWith": "$a"}]))
 
 
-@pytest.mark.backlog("RM-063")
+@pytest.mark.backlog_fixed("RM-063")
 def test_replace_with_a_non_document_in_an_update(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 prints the whole input document in the 40228 message."""
     assert _replace_with_scalar(rust_mongo) == _replace_with_scalar(mongod)
@@ -400,7 +400,7 @@ def _delete_order(client: Any) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-077")
+@pytest.mark.backlog_fixed("RM-077")
 def test_delete_order_after_a_multi_update(rust_mongo: Any, mongod_rs: Any) -> None:
     """The order a `delete` with `limit: 0` deletes in after a `multi`
     update, as seen in the change stream (mongod 8.2.11 reversed it)."""

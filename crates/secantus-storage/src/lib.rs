@@ -2946,6 +2946,27 @@ thread_local! {
     /// The rows a write on this thread tests, in the order it tests them
     /// (`with_candidate_order`). `None`: the router's own candidates.
     static CANDIDATE_ORDER: RefCell<Option<Vec<i64>>> = const { RefCell::new(None) };
+    /// The batch size a multi-document delete on this thread removes its
+    /// documents in, each batch in reverse (`with_reversed_delete_batches`).
+    /// 0: in the order they were read.
+    static DELETE_BATCH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Run `f` with an unbounded delete outside a transaction removing its
+/// matches in batches of `batch`, each batch in reverse: mongod's batched
+/// multi-delete. It reads the documents in its plan's order, collects ten at
+/// a time and writes each batch as one `applyOps` holding them last-read
+/// first, so its oplog and change streams see `3, 2, 1` for a delete that
+/// read `1, 2, 3` (measured 8.2.11, RM-077). Restored on return.
+pub fn with_reversed_delete_batches<T>(batch: usize, f: impl FnOnce() -> T) -> T {
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DELETE_BATCH.with(|b| b.set(self.0));
+        }
+    }
+    let _r = Restore(DELETE_BATCH.with(|b| b.replace(batch)));
+    f()
 }
 
 /// Run `f` with the next write's candidates fixed to the rows `order` names,
@@ -3796,6 +3817,9 @@ type CollLocks = HashMap<(String, String), Arc<Mutex<()>>>;
 struct TtlMonitor {
     /// `ttlMonitorSleepSecs` as a client set it; 0 until one does.
     sleep_secs: AtomicI64,
+    /// The cadence the server was started with, in whole seconds, as
+    /// `getParameter` reports it until a client sets one; 0 when unknown.
+    started_secs: AtomicI64,
     enabled: AtomicBool,
     passes: AtomicU64,
     deleted: AtomicU64,
@@ -3806,6 +3830,7 @@ impl Default for TtlMonitor {
     fn default() -> Self {
         Self {
             sleep_secs: AtomicI64::new(0),
+            started_secs: AtomicI64::new(0),
             enabled: AtomicBool::new(true),
             passes: AtomicU64::new(0),
             deleted: AtomicU64::new(0),
@@ -3817,7 +3842,8 @@ impl Default for TtlMonitor {
 /// A snapshot of [`Storage::ttl_monitor`].
 #[derive(Clone, Copy, Debug)]
 pub struct TtlMonitorState {
-    /// 0 when no client has set it (the server's configured cadence applies).
+    /// The cadence in force: what a client set, else what the server was
+    /// started with ([`Storage::set_ttl_started_period`]); 0 when neither.
     pub sleep_secs: i64,
     pub enabled: bool,
     pub passes: u64,
@@ -10001,7 +10027,10 @@ impl Storage {
     /// `getParameter` report them.
     pub fn ttl_monitor(&self) -> TtlMonitorState {
         TtlMonitorState {
-            sleep_secs: self.ttl.sleep_secs.load(Ordering::Relaxed),
+            sleep_secs: match self.ttl.sleep_secs.load(Ordering::Relaxed) {
+                secs if secs > 0 => secs,
+                _ => self.ttl.started_secs.load(Ordering::Relaxed),
+            },
             enabled: self.ttl.enabled.load(Ordering::Relaxed),
             passes: self.ttl.passes.load(Ordering::Relaxed),
             deleted: self.ttl.deleted.load(Ordering::Relaxed),
@@ -10017,6 +10046,15 @@ impl Storage {
         if let Some(on) = enabled {
             self.ttl.enabled.store(on, Ordering::Relaxed);
         }
+    }
+
+    /// Record the cadence the server's monitor was started with, so
+    /// `getParameter ttlMonitorSleepSecs` reports it as mongod reports the
+    /// value it was started with. A cadence under a second reads as 1, the
+    /// smallest the parameter holds.
+    pub fn set_ttl_started_period(&self, period: Duration) {
+        let secs = (period.as_secs_f64().round() as i64).max(1);
+        self.ttl.started_secs.store(secs, Ordering::Relaxed);
     }
 
     /// One tick of the background monitor: run a pass when the monitor is
@@ -15881,16 +15919,18 @@ impl Storage {
             validator,
             validator_moderate,
             want_post_image,
-            &|doc, _up| {
+            &|doc, upserting| {
                 // The pipeline was checked before any document was read, so
                 // what fails here failed while running, and mongod reports
                 // it under the executor's wrapper.
-                let out = secantus_core::aggregate::apply_pipeline(
-                    vec![doc.clone()],
-                    pipeline,
-                    let_vars,
-                    None,
-                )
+                let out = secantus_core::aggregate::with_whole_input_documents(|| {
+                    secantus_core::aggregate::apply_pipeline(
+                        vec![doc.clone()],
+                        pipeline,
+                        let_vars,
+                        None,
+                    )
+                })
                 .map_err(|fault| match query_fault(fault) {
                     StorageError::QueryError { code, errmsg, .. } => StorageError::QueryError {
                         code,
@@ -15908,6 +15948,17 @@ impl Storage {
                 // the stored doc keeps its `_id` (which is immutable). Re-add it if
                 // a stage removed it. (`encode_doc` then restores `_id`-first order.)
                 if let Some(id) = doc.get("_id") {
+                    // An `_id` mongod cannot store fails its storage check,
+                    // which runs before the immutability check (measured
+                    // 8.2.11: a pipeline that makes a stored `_id` an array
+                    // answers 53, not 66). An upsert's document is checked
+                    // where it is inserted, which answers 54 for an array.
+                    if let Some(problem) = unstorable_pipeline_id(new.get("_id")) {
+                        if upserting {
+                            return Ok(new);
+                        }
+                        return Err(problem);
+                    }
                     match new.get("_id") {
                         None => {
                             new.insert("_id", id.clone());
@@ -16527,11 +16578,10 @@ impl Storage {
                     }
                     // An `_id` mongod cannot hold. Measured 8.2.11, 2026-10-10:
                     // an array is 53 from an operator update and 54 from a
-                    // replacement; a regex is 53 from both. (A pipeline update
-                    // answers 54 for an array too; this path cannot tell it
-                    // from an operator update and answers 53.)
+                    // replacement or a pipeline (the update with no operator
+                    // spec); a regex is 53 from all three.
                     match new.get("_id") {
-                        Some(Bson::Array(_)) if is_replacement => {
+                        Some(Bson::Array(_)) if is_replacement || update_spec.is_none() => {
                             return Err(StorageError::QueryError {
                                 code: 54,
                                 errmsg: "After applying the update to the document, the \
@@ -16808,6 +16858,10 @@ impl Storage {
                 {
                     rids.push(recordid);
                 }
+            }
+            match DELETE_BATCH.with(Cell::get) {
+                0 => {}
+                batch => rids.chunks_mut(batch).for_each(<[i64]>::reverse),
             }
             rids
         };
@@ -19826,6 +19880,33 @@ fn implied_equality(value: &Bson) -> Option<Bson> {
         }
     }
     None
+}
+
+/// The storage check mongod runs on the `_id` a pipeline update leaves on a
+/// stored document, ahead of its immutability check: an array or a regex is
+/// 53, a `$`-prefixed field inside a document `_id` is 52 (measured 8.2.11).
+fn unstorable_pipeline_id(id: Option<&Bson>) -> Option<StorageError> {
+    let (code, errmsg) = match id? {
+        Bson::Array(_) => (53, "The '_id' value cannot be of type array".to_string()),
+        Bson::RegularExpression(_) => (53, "The '_id' value cannot be of type regex".to_string()),
+        id @ Bson::Document(_) => {
+            let (field, path) = dollar_field_in(id, "_id")?;
+            (
+                52,
+                format!(
+                    "The dollar ($) prefixed field '{field}' in '{path}' is not allowed in the \
+                     context of an update's replacement document. Consider using an \
+                     aggregation pipeline with $replaceWith."
+                ),
+            )
+        }
+        _ => return None,
+    };
+    Some(StorageError::QueryError {
+        code,
+        errmsg,
+        exec: true,
+    })
 }
 
 /// The first `$`-prefixed field name inside `value`, at any depth, with its

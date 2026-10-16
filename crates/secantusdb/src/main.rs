@@ -267,24 +267,30 @@ fn run(cli: CliArgs) -> Result<(), String> {
     }
 
     // TTL sweeper: prune expired docs across all collections every N seconds
-    // (mongod's default is 60s). 0 disables it. Mirrors the Python daemon.
+    // (mongod's default is 60s). 0 starts it switched off (below).
     // The monitor is TICKED twice a second and decides for itself whether a
     // pass is due, so `setParameter ttlMonitorSleepSecs` takes effect without a
     // restart.
-    if cli.ttl_sweep_seconds > 0.0 {
-        let period = Duration::from_secs_f64(cli.ttl_sweep_seconds);
-        workers.push(spawn_interval(
-            cli.ttl_sweep_seconds.min(0.5),
-            shutdown.clone(),
-            {
-                let storage = storage.clone();
-                move || {
-                    if let Err(e) = storage.ttl_monitor_tick(period) {
-                        log::warn!("TTL sweep failed: {e:?}");
-                    }
+    //
+    // A server started with the sweep off has a monitor that is switched off,
+    // as mongod's is with `ttlMonitorEnabled=false`, so `setParameter
+    // ttlMonitorEnabled: true` can turn it on (at mongod's 60-second cadence).
+    {
+        let swept = cli.ttl_sweep_seconds > 0.0;
+        let seconds = if swept { cli.ttl_sweep_seconds } else { 60.0 };
+        let period = Duration::from_secs_f64(seconds);
+        storage.set_ttl_started_period(period);
+        if !swept {
+            storage.set_ttl_monitor(None, Some(false));
+        }
+        workers.push(spawn_interval(seconds.min(0.5), shutdown.clone(), {
+            let storage = storage.clone();
+            move || {
+                if let Err(e) = storage.ttl_monitor_tick(period) {
+                    log::warn!("TTL sweep failed: {e:?}");
                 }
-            },
-        ));
+            }
+        }));
     }
 
     // The smoke test (and any wrapping launcher) reads this line to learn the

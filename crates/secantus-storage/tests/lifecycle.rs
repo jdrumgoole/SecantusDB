@@ -325,3 +325,51 @@ fn stable_checkpoint_marker_roundtrips() {
       // over a removed directory is a guaranteed WT panic.
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// RM-110: a `collMod` of `cappedSize` / `cappedMax` is recorded as the
+/// command named it, and a replay of that entry sets `size` / `max`.
+#[test]
+fn capped_coll_mod_replays_from_the_names_it_records() {
+    with_db(|src| {
+        src.create_collection_with_options(
+            "d",
+            "c",
+            &doc! { "capped": true, "size": 4096_i32, "max": 10_i32 },
+        )
+        .unwrap();
+        src.flush_oplog();
+        let floor = src
+            .read_oplog(0, 100_000)
+            .unwrap()
+            .last()
+            .map_or(0, |(s, _)| *s);
+        src.coll_mod_recording(
+            "d",
+            "c",
+            &doc! { "size": 8192_i32, "max": 2147483647_i32 },
+            &doc! { "cappedSize": 8192_i64, "cappedMax": 0_i64 },
+        )
+        .unwrap();
+        let entry = cmd_entries(src, floor)
+            .into_iter()
+            .find(|e| e.get_document("o").is_ok_and(|o| o.contains_key("collMod")))
+            .unwrap();
+        let o = entry.get_document("o").unwrap();
+        assert_eq!(
+            o.keys().collect::<Vec<_>>(),
+            ["collMod", "cappedSize", "cappedMax"]
+        );
+        with_db(|dst| {
+            dst.create_collection_with_options(
+                "d",
+                "c",
+                &doc! { "capped": true, "size": 4096_i32, "max": 10_i32 },
+            )
+            .unwrap();
+            secantus_storage::replay::apply_entry(dst, &entry).unwrap();
+            let opts = dst.get_collection_options("d", "c").unwrap();
+            assert_eq!(opts.get("size"), Some(&Bson::Int32(8192)));
+            assert_eq!(opts.get("max"), Some(&Bson::Int32(2147483647)));
+        });
+    });
+}

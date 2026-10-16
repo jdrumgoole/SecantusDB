@@ -555,6 +555,21 @@ fn parameters(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
     ]
 }
 
+/// A TTL monitor setting, read from the monitor itself: the cadence and the
+/// switch the server was started with until a client sets them, as mongod
+/// reports a `--setParameter` startup value. `None` for any other parameter,
+/// or a backend with no monitor.
+pub(crate) fn ttl_monitor_param(ctx: &CommandContext, name: &str) -> Option<Bson> {
+    let (secs, enabled, _, _) = ctx.storage().ok()?.ttl_monitor()?;
+    match name {
+        "ttlMonitorSleepSecs" if secs > 0 => {
+            Some(Bson::Int32(i32::try_from(secs).unwrap_or(i32::MAX)))
+        }
+        "ttlMonitorEnabled" => Some(Bson::Boolean(enabled)),
+        _ => None,
+    }
+}
+
 /// The parameters and their defaults, as one document (`setParameter` reads
 /// the previous value from it).
 pub(crate) fn known_params(test_commands: bool) -> Document {
@@ -630,12 +645,13 @@ pub fn get_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
             .as_ref()
             .and_then(|s| s.get(name))
             .unwrap_or(default);
+        let value = ttl_monitor_param(ctx, name).unwrap_or_else(|| value.clone());
         // The FCV is what `setFeatureCompatibilityVersion` recorded, when
         // it recorded one.
         let value = if name == "featureCompatibilityVersion" {
             Bson::Document(doc! {"version": crate::cluster_admin::current_fcv(ctx)})
         } else {
-            value.clone()
+            value
         };
         if details {
             out.insert(

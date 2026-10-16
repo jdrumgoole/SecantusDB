@@ -917,6 +917,51 @@ pub(crate) fn pinned<T>(
     }
 }
 
+/// How many documents mongod's batched multi-delete collects before it
+/// writes them, last-read first, as one `applyOps` (measured 8.2.11).
+pub(crate) const DELETE_BATCH: usize = 10;
+
+/// Run `f`, an unbounded delete through `storage`, removing its matches in
+/// mongod's batches: [`DELETE_BATCH`] at a time, each in reverse.
+pub(crate) fn in_delete_batches<T>(storage: &dyn Storage, f: impl FnOnce() -> T) -> T {
+    let mut f = Some(f);
+    let mut out = None;
+    storage.with_reversed_delete_batches(DELETE_BATCH, &mut || {
+        if let Some(run) = f.take() {
+            out = Some(run());
+        }
+    });
+    match out {
+        Some(v) => v,
+        None => (f.take().expect("the delete ran or it did not"))(),
+    }
+}
+
+/// Every RecordId `ask` matches, in mongod's order, for a delete that
+/// removes them all: the order its batches are formed in. `None`: the
+/// store's own order is the plan's (a whole collection read in storage
+/// order, or the one index both read), or nothing matched.
+pub(crate) fn delete_order(
+    storage: &dyn Storage,
+    ask: &Ask,
+) -> Result<Option<Vec<i64>>, StorageError> {
+    if ask.filter.is_empty() && ask.hint.is_none() {
+        return Ok(None);
+    }
+    if store_order_is_the_plans(storage, ask)? {
+        return Ok(None);
+    }
+    let Some(rows) = ordered_rows(storage, ask)? else {
+        return Ok(None);
+    };
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        rows.into_iter().map(|(recordid, _)| recordid).collect(),
+    ))
+}
+
 /// Whether the store, left to pick, already takes the document mongod's
 /// plan reads first, so the matches need not be read twice (RM-056).
 ///
