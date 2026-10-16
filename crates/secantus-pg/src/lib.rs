@@ -5514,7 +5514,6 @@ impl PgHandler {
             || agg.sub.is_some()
             || agg.join.is_some()
             || agg.grouping_sets.is_some()
-            || !agg.filter.is_empty()
             || agg.group_by.is_empty()
             || agg.group_by.iter().any(|k| k.expr.is_some())
         {
@@ -5525,23 +5524,50 @@ impl PgHandler {
             .iter()
             .map(|k| (k.field.clone(), k.pg_type.clone()))
             .collect();
-        self.hash_agg_order_over(&agg.table, &key_cols, keys, rows)
+        let limited = agg.limit.is_some() && agg.order.is_empty();
+        self.hash_agg_order_over(&agg.table, &agg.filter, limited, &key_cols, keys, rows)
     }
 
     /// PostgreSQL 15's HashAggregate order over `groups` (one key value per
-    /// column of `key_cols`, `(stored field, type)`) of `table`, which holds
-    /// `rows` rows and is read whole: the planner's group estimate for a
-    /// table with no statistics, then `hashagg::hash_agg_order`. `None` when
-    /// the table is not a user table, a key type is not hashed as PostgreSQL
-    /// hashes it, or the estimate is past PostgreSQL's hash memory.
+    /// column of `key_cols`, `(stored field, type)`) of `table`, read through
+    /// `filter` (`rows` rows passed it): the planner's estimate of the rows
+    /// and groups for a table with no statistics, then
+    /// `hashagg::hash_agg_order`. `None` when the table is not a user table,
+    /// the WHERE has a clause `hashagg::filter_selectivity` does not model, a
+    /// key type is not hashed as PostgreSQL hashes it, or the estimate is
+    /// past PostgreSQL's hash memory.
+    ///
+    /// A LIMIT with no ORDER BY over a key an index leads is declined until
+    /// the planner's path comparison is modelled (RP-028): PostgreSQL reads
+    /// the index there (a Group over the index scan, which the LIMIT makes
+    /// cheap) rather than hashing.
     fn hash_agg_order_over(
         &self,
         table: &str,
+        filter: &Document,
+        limited: bool,
         key_cols: &[(String, String)],
         keys: &[Vec<Option<Bson>>],
         rows: usize,
     ) -> Option<Vec<usize>> {
         use secantus_pgplan::hashagg;
+        if limited {
+            let indexes = self
+                .storage
+                .list_indexes(self.db(), table)
+                .unwrap_or_default();
+            let leads = |field: &str| {
+                indexes.iter().any(|ix| {
+                    ix.get_document("key")
+                        .ok()
+                        .and_then(|k| k.keys().next().cloned())
+                        .is_some_and(|first| first == field)
+                })
+            };
+            if key_cols.iter().any(|(field, _)| leads(field)) {
+                return None;
+            }
+        }
         let def = self
             .all_table_defs()
             .ok()?
@@ -5605,8 +5631,37 @@ impl PgHandler {
                 }
             })
             .collect();
-        let tuples = hashagg::table_rows(width, rows as u64);
-        let groups = hashagg::estimate_groups(&stats, tuples);
+        // The table's size is its whole, which a WHERE does not change.
+        let table_count = if filter.is_empty() {
+            rows
+        } else {
+            self.storage
+                .count_matching(self.db(), table, &Document::new(), None)
+                .ok()?
+        };
+        let tuples = hashagg::table_rows(width, table_count as u64);
+        let read = if filter.is_empty() {
+            tuples
+        } else {
+            let ndistinct = |field: &str| {
+                if unique.iter().any(|u| u == field) {
+                    tuples
+                } else if def
+                    .columns
+                    .iter()
+                    .any(|c| c.field() == field && c.pg_type == "bool")
+                {
+                    2.0
+                } else if tuples < 200.0 {
+                    tuples
+                } else {
+                    200.0
+                }
+            };
+            let sel = hashagg::filter_selectivity(filter, &ndistinct)?;
+            (tuples * sel).round().max(1.0)
+        };
+        let groups = hashagg::estimate_groups(&stats, tuples, read);
         // `hash_mem` (work_mem 4MB x hash_mem_multiplier 2): past about
         // 50,000 groups the hash table would not fit and the planner
         // compares a sort, which is not modelled.
@@ -26704,7 +26759,6 @@ impl PgHandler {
             let plain = sel.sub.is_none()
                 && sel.series.is_none()
                 && sel.join.is_none()
-                && sel.filter.is_empty()
                 && sel.windows.is_empty()
                 && sel.casts.iter().all(Option::is_none);
             let key_cols: Option<Vec<(String, String)>> = if plain {
@@ -26720,9 +26774,10 @@ impl PgHandler {
             } else {
                 None
             };
-            if let Some(order) = key_cols
-                .and_then(|cols| self.hash_agg_order_over(&sel.table, &cols, &kept_keys, rows))
-            {
+            if let Some(order) = key_cols.and_then(|cols| {
+                let limited = sel.limit.is_some() && sel.order.is_empty();
+                self.hash_agg_order_over(&sel.table, &sel.filter, limited, &cols, &kept_keys, rows)
+            }) {
                 let mut slots: Vec<Option<Document>> = kept.into_iter().map(Some).collect();
                 kept = order.into_iter().filter_map(|i| slots[i].take()).collect();
             }

@@ -17,3 +17,9 @@ More of the Rust PostgreSQL server's backlog, measured against PostgreSQL
   PostgreSQL plans the DISTINCT as a HashAggregate over the select list.
   Part of RP-028
   (tests/backlog/test_rust_postgres_gaps.py::test_distinct_rows_come_out_in_hash_aggregate_order).
+- **A GROUP BY or DISTINCT under a WHERE comes out in PostgreSQL's order
+  too**: the planner's estimate of the rows a WHERE keeps (its default
+  selectivities for equality, `<>`, ranges, `IN`, AND and OR) and of the
+  groups among them sizes the hash table as PostgreSQL's does. A LIMIT with
+  no ORDER BY over a key an index leads keeps the order it had, because
+  PostgreSQL reads the index there. Part of RP-028.

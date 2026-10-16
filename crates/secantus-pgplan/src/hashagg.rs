@@ -277,13 +277,15 @@ pub fn table_rows(data_width: i64, rows: u64) -> f64 {
     (density * pages) as f64
 }
 
-/// `estimate_num_groups` over one table with no statistics and no WHERE.
-/// A boolean key short-circuits: its 2 multiplies the result and takes no
-/// part in the clamp. The other columns' distinct counts multiply, clamped
-/// by the rows for one column and by a tenth of the rows (but not below the
-/// largest column's count) for several; the whole is clamped to the rows,
-/// at least 1.
-pub fn estimate_groups(keys: &[KeyStat], tuples: f64) -> u64 {
+/// `estimate_num_groups` over one table with no statistics, of which the
+/// statement reads `rows` (the table's `tuples` with no WHERE). A boolean
+/// key short-circuits: its 2 multiplies the result and takes no part in the
+/// clamp. The other columns' distinct counts multiply, clamped by the rows
+/// for one column and by a tenth of the rows (but not below the largest
+/// column's count) for several; reduced when a WHERE keeps fewer rows than
+/// the table holds (`d * (1 - ((N - n) / N) ^ (N / d))`); and the whole is
+/// clamped to the rows read, at least 1.
+pub fn estimate_groups(keys: &[KeyStat], tuples: f64, rows: f64) -> u64 {
     let clamp_row_est = |n: f64| if n <= 1.0 { 1.0 } else { n.round() };
     let mut numdistinct = 1.0f64;
     let mut product = 1.0f64;
@@ -311,9 +313,89 @@ pub fn estimate_groups(keys: &[KeyStat], tuples: f64) -> u64 {
                 clamp = max_single.min(tuples);
             }
         }
-        numdistinct *= clamp_row_est(product.min(clamp));
+        let mut reldistinct = product.min(clamp);
+        if reldistinct > 0.0 && rows < tuples {
+            reldistinct *= 1.0 - ((tuples - rows) / tuples).powf(tuples / reldistinct);
+        }
+        numdistinct *= clamp_row_est(reldistinct);
     }
-    numdistinct.ceil().min(tuples).max(1.0) as u64
+    numdistinct.ceil().min(clamp_row_est(rows)).max(1.0) as u64
+}
+
+/// The selectivity PostgreSQL's planner gives a WHERE, lowered to this
+/// server's filter document, over a table with no statistics: an equality
+/// `1 / ndistinct` (`var_eq_const`), `<>` one minus that, a one-sided range
+/// a third (`DEFAULT_INEQ_SEL`), a range bounded on both sides 0.005
+/// (`DEFAULT_RANGE_INEQ_SEL`), an equality `IN` the sum over its elements,
+/// `AND` the product and `OR` `s1 + s2 - s1 * s2` (`clauselist_selectivity`).
+/// `ndistinct` gives a stored field's distinct count. `None` for a clause
+/// this does not model (a pattern, `IS NULL`, an expression), so a caller
+/// can leave the order alone rather than guess.
+pub fn filter_selectivity(filter: &Document, ndistinct: &dyn Fn(&str) -> f64) -> Option<f64> {
+    // Each field's bounds are gathered across the whole AND, as
+    // `clauselist_selectivity` pairs a variable's `<` and `>`.
+    let mut ranges: Vec<(String, bool, bool)> = Vec::new();
+    let mut sel = 1.0f64;
+    let mut clauses: Vec<&Document> = vec![filter];
+    let mut flat: Vec<(&str, &Bson)> = Vec::new();
+    while let Some(doc) = clauses.pop() {
+        for (key, value) in doc {
+            match (key.as_str(), value) {
+                ("$and", Bson::Array(items)) => {
+                    for item in items {
+                        clauses.push(item.as_document()?);
+                    }
+                }
+                ("$or", Bson::Array(items)) => {
+                    let mut s = 0.0f64;
+                    for item in items {
+                        let s2 = filter_selectivity(item.as_document()?, ndistinct)?;
+                        s = s + s2 - s * s2;
+                    }
+                    sel *= s;
+                }
+                (k, _) if k.starts_with('$') => return None,
+                (field, v) => flat.push((field, v)),
+            }
+        }
+    }
+    for (field, value) in flat {
+        let eq = 1.0 / ndistinct(field).max(1.0);
+        match value {
+            Bson::Null => return None,
+            Bson::Document(ops) if ops.keys().any(|k| k.starts_with('$')) => {
+                for (op, operand) in ops {
+                    match op.as_str() {
+                        "$eq" if operand != &Bson::Null => sel *= eq,
+                        "$ne" if operand == &Bson::Null => {}
+                        "$ne" => sel *= 1.0 - eq,
+                        "$gt" | "$gte" | "$lt" | "$lte" => {
+                            let lower = matches!(op.as_str(), "$gt" | "$gte");
+                            match ranges.iter_mut().find(|r| r.0 == field) {
+                                Some(r) if lower => r.1 = true,
+                                Some(r) => r.2 = true,
+                                None => ranges.push((field.to_string(), lower, !lower)),
+                            }
+                        }
+                        "$in" => {
+                            let n = operand
+                                .as_array()?
+                                .iter()
+                                .filter(|v| **v != Bson::Null)
+                                .count();
+                            sel *= (eq * n as f64).min(1.0);
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            _ => sel *= eq,
+        }
+    }
+    for (_, lower, upper) in ranges {
+        sel *= if lower && upper { 0.005 } else { 1.0 / 3.0 };
+    }
+    Some(sel)
 }
 
 #[cfg(test)]
@@ -396,21 +478,51 @@ mod tests {
             + type_avg_width("date", -1, 4);
         assert_eq!(width, 94);
         assert_eq!(table_rows(width, 0), 660.0);
-        assert_eq!(estimate_groups(&[KeyStat::Unknown], 2260.0), 200);
-        assert_eq!(estimate_groups(&[KeyStat::Unique], 2550.0), 2550);
+        assert_eq!(estimate_groups(&[KeyStat::Unknown], 2260.0, 2260.0), 200);
+        assert_eq!(estimate_groups(&[KeyStat::Unique], 2550.0, 2550.0), 2550);
         assert_eq!(
-            estimate_groups(&[KeyStat::Unknown, KeyStat::Unknown], 1200.0),
+            estimate_groups(&[KeyStat::Unknown, KeyStat::Unknown], 1200.0, 1200.0),
             200
         );
         assert_eq!(
-            estimate_groups(&[KeyStat::Unknown, KeyStat::Unknown], 2260.0),
+            estimate_groups(&[KeyStat::Unknown, KeyStat::Unknown], 2260.0, 2260.0),
             226
         );
-        assert_eq!(estimate_groups(&[KeyStat::Bool], 2260.0), 2);
+        assert_eq!(estimate_groups(&[KeyStat::Bool], 2260.0, 2260.0), 2);
         // `group by g, b` over (int primary key, int, bool): 200 * 2.
         assert_eq!(
-            estimate_groups(&[KeyStat::Unknown, KeyStat::Bool], 2200.0),
+            estimate_groups(&[KeyStat::Unknown, KeyStat::Bool], 2200.0, 2200.0),
             400
         );
+    }
+
+    /// PostgreSQL 15.19's estimates under a WHERE, on a fresh table
+    /// (k int primary key, g int, t text), 1,200 rows assumed: `k > 5`
+    /// keeps 400 rows and 182 groups of g; `g = 3` 6 and 6; `k > 5 and
+    /// k < 30` 6; `g <> 3` 1,194 and 200; `t = 'x1' and k > 3` 2; and
+    /// `group by k where g = 1` 6.
+    #[test]
+    fn estimates_under_a_where_match_postgres() {
+        use bson::doc;
+        let nd = |field: &str| if field == "_id" { 1200.0 } else { 200.0 };
+        let rows = |f: &Document| (1200.0 * filter_selectivity(f, &nd).unwrap()).round();
+        let gt5 = doc! {"_id": {"$gt": 5}};
+        assert_eq!(rows(&gt5), 400.0);
+        assert_eq!(
+            estimate_groups(&[KeyStat::Unknown], 1200.0, rows(&gt5)),
+            182
+        );
+        let g3 = doc! {"g": 3};
+        assert_eq!(rows(&g3), 6.0);
+        assert_eq!(estimate_groups(&[KeyStat::Unknown], 1200.0, rows(&g3)), 6);
+        let range = doc! {"$and": [{"_id": {"$gt": 5}}, {"_id": {"$lt": 30}}]};
+        assert_eq!(rows(&range), 6.0);
+        let ne = doc! {"$and": [{"g": {"$ne": 3}}, {"g": {"$ne": null}}]};
+        assert_eq!(rows(&ne), 1194.0);
+        assert_eq!(estimate_groups(&[KeyStat::Unknown], 1200.0, rows(&ne)), 200);
+        let two = doc! {"$and": [{"t": "x1"}, {"_id": {"$gt": 3}}]};
+        assert_eq!(rows(&two), 2.0);
+        assert_eq!(estimate_groups(&[KeyStat::Unique], 1200.0, rows(&g3)), 6);
+        assert_eq!(filter_selectivity(&doc! {"t": {"$regex": "^x"}}, &nd), None);
     }
 }
