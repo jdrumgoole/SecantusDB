@@ -418,9 +418,9 @@ fn canonical_children(value: &Bson) -> Vec<Document> {
 /// mongod's normalised form of `filter`, as `parsedQuery` reports it.
 ///
 /// Anything unmeasured passes through unchanged rather than being guessed at.
-/// The known residue against 8.2.11 is `$expr` (which mongod splits into an
-/// `$expr` clause plus an `$_internalExprEq` index-usable twin) and
-/// `$jsonSchema`; both are echoed as sent.
+/// `$expr` is optimised and gains mongod's index-usable twins
+/// (`crate::expr_rewrite`); the known residue against 8.2.11 is
+/// `$jsonSchema`, echoed as sent.
 pub fn canonical_match(filter: &Bson) -> Document {
     let Bson::Document(doc) = filter else {
         return Document::new();
