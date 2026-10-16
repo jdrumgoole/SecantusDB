@@ -548,6 +548,25 @@ def test_limit_reads_the_index_in_key_order(pg: Any) -> None:
 
 
 @pytest.mark.backlog_fixed("RP-028")
+def test_create_index_measures_the_table(pg: Any) -> None:
+    """PostgreSQL 15.19: CREATE INDEX over a table with rows records its
+    size in `pg_class` (relpages 1, reltuples 40), so the planner estimates
+    40 rows, not a never-measured table's 10 pages, and its HashAggregate
+    is sized for 40 groups; a TRUNCATE forgets it again."""
+    pg.execute("drop table if exists rp028_m")
+    pg.execute("create table rp028_m (k int, g int)")
+    pg.execute("insert into rp028_m select i, (i * 7) % 11 from generate_series(1, 40) i")
+    unmeasured = [(g,) for g in [9, 3, 5, 4, 0, 10, 6, 2, 7, 1, 8]]
+    assert pg_answer(pg, "select g from rp028_m group by g") == ("ok", unmeasured)
+    pg.execute("create index on rp028_m (g)")
+    got = pg_answer(pg, "select g from rp028_m group by g")
+    assert got == ("ok", [(g,) for g in [4, 0, 9, 10, 7, 6, 3, 1, 5, 2, 8]])
+    pg.execute("truncate rp028_m")
+    pg.execute("insert into rp028_m select i, (i * 7) % 11 from generate_series(1, 40) i")
+    assert pg_answer(pg, "select g from rp028_m group by g") == ("ok", unmeasured)
+
+
+@pytest.mark.backlog_fixed("RP-028")
 def test_order_by_ties_as_postgres_quicksort_leaves_them(pg: Any) -> None:
     """PostgreSQL 15.19: tied rows land where its quicksort (not stable from
     7 rows up) leaves them -- `7, 10, 3, 4, 5, 9` for the six rows at v = 1;

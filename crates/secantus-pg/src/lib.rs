@@ -5689,8 +5689,26 @@ impl PgHandler {
                 .count_matching(self.db(), table, &Document::new(), None)
                 .ok()?
         };
-        let (pages, tuples) =
-            hashagg::table_size(width, table_count as u64, self.heap_pages(table, &def));
+        // A table VACUUM or ANALYZE measured has statistics (histograms,
+        // distinct counts, the visibility map) this model does not keep.
+        let relstats = self.relstats(table);
+        if relstats
+            .as_ref()
+            .is_some_and(|d| d.get_bool("statistics").unwrap_or(false))
+        {
+            return None;
+        }
+        let measured = relstats.as_ref().and_then(|d| {
+            let pages = d.get_i64("relpages").ok()?;
+            let tuples = d.get_i64("reltuples").ok()?;
+            Some((pages as f64, tuples as f64))
+        });
+        let (pages, tuples) = hashagg::table_size(
+            width,
+            table_count as u64,
+            self.heap_pages(table, &def),
+            measured,
+        );
         let read = if filter.is_empty() {
             tuples
         } else {
@@ -11117,6 +11135,66 @@ impl PgHandler {
     }
 
     /// Replace (or with `None`, remove) one document of a keyed collection.
+    /// What `pg_class` keeps of a table's size once something measured it:
+    /// `relpages` and `reltuples`, which CREATE INDEX writes over a table
+    /// with rows (`index_update_stats`), and `statistics` once VACUUM or
+    /// ANALYZE ran (`vac_update_relstats`, `pg_statistic`). One row a table,
+    /// keyed by its name; no row is a table never measured (`reltuples`
+    /// -1). Not rolled back by a savepoint, as PostgreSQL writes these in
+    /// place.
+    const RELSTATS_COLLECTION: &'static str = "__sql_relstats__";
+
+    /// `table`'s row of `RELSTATS_COLLECTION`.
+    fn relstats(&self, table: &str) -> Option<Document> {
+        self.storage
+            .find_matching(
+                self.db(),
+                Self::RELSTATS_COLLECTION,
+                &bson::doc! {"_id": table},
+            )
+            .ok()?
+            .first()
+            .and_then(|b| decode_doc(b).ok())
+    }
+
+    /// Record `table`'s size now, as CREATE INDEX (`statistics` false) or
+    /// VACUUM / ANALYZE (true) does. CREATE INDEX over an empty table that
+    /// was never measured leaves it so (PostgreSQL 15 keeps `reltuples` -1).
+    fn record_relstats(&self, table: &str, statistics: bool) -> PgWireResult<()> {
+        let Some(def) = self.lookup(table) else {
+            return Ok(());
+        };
+        let rows = self.table_docs(table)?.len();
+        let previous = self.relstats(table);
+        if rows == 0 && !statistics && previous.is_none() {
+            return Ok(());
+        }
+        let statistics = statistics
+            || previous
+                .as_ref()
+                .is_some_and(|d| d.get_bool("statistics").unwrap_or(false));
+        let mut doc = bson::doc! {"_id": table, "reltuples": rows as i64, "statistics": statistics};
+        match self.heap_pages(table, &def) {
+            Some(pages) => {
+                doc.insert("relpages", pages as i64);
+            }
+            // A heap whose size is not modelled is not priced at all.
+            None => {
+                doc.insert("statistics", true);
+            }
+        }
+        self.put_comment_doc(Self::RELSTATS_COLLECTION, table, Some(doc))
+    }
+
+    /// TRUNCATE and DROP: the table is never measured again
+    /// (`RelationSetNewRelfilenumber` resets `reltuples` to -1).
+    pub(crate) fn clear_relstats(&self, table: &str) -> PgWireResult<()> {
+        if self.relstats(table).is_some() {
+            self.put_comment_doc(Self::RELSTATS_COLLECTION, table, None)?;
+        }
+        Ok(())
+    }
+
     fn put_comment_doc(
         &self,
         collection: &'static str,
@@ -30999,7 +31077,12 @@ impl PgHandler {
                 self.drop_trigger(&name, &table, if_exists)?;
                 Ok(vec![Response::Execution(Tag::new("DROP TRIGGER"))])
             }
-            Statement::CreateIndex(ci) => self.create_index(ci),
+            Statement::CreateIndex(ci) => {
+                let table = ci.table.clone();
+                let out = self.create_index(ci)?;
+                self.record_relstats(&table, false)?;
+                Ok(out)
+            }
 
             Statement::DropIndex { names, if_exists } => {
                 for qualified in &names {
@@ -32262,6 +32345,16 @@ impl PgHandler {
                         return Err(Self::relation_missing(index));
                     }
                 }
+                if command == "VACUUM" || command == "ANALYZE" {
+                    let named: Vec<String> = if tables.is_empty() {
+                        self.all_table_defs()?.into_iter().map(|d| d.name).collect()
+                    } else {
+                        tables.iter().map(|(t, _)| t.clone()).collect()
+                    };
+                    for t in &named {
+                        self.record_relstats(t, true)?;
+                    }
+                }
                 let tag = command.split(' ').next().unwrap_or_default().to_string();
                 Ok(vec![Response::Execution(Tag::new(&tag))])
             }
@@ -33350,6 +33443,9 @@ impl PgHandler {
                 }
                 if restart_identity {
                     self.restart_owned_sequences(&tables)?;
+                }
+                for table in &tables {
+                    self.clear_relstats(table)?;
                 }
                 for table in &tables {
                     self.fire_statement_triggers(table, "AFTER", "TRUNCATE")?;

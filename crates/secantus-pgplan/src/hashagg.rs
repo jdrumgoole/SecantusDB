@@ -271,17 +271,32 @@ pub fn type_avg_width(pg_type: &str, typmod: i32, typlen: i64) -> i64 {
 /// fixed-width rows without NULLs and close otherwise. Only past ten pages
 /// does it matter at all.
 pub fn table_rows(data_width: i64, rows: u64) -> f64 {
-    table_size(data_width, rows, None).1
+    table_size(data_width, rows, None, None).1
 }
 
-/// `table_rows` with the pages it assumes: `(pages, tuples)`. `heap_pages`
-/// is the table's real size (`heap_pages`) where it is known; otherwise the
-/// rows are taken at the estimated density.
-pub fn table_size(data_width: i64, rows: u64, heap_pages: Option<u64>) -> (f64, f64) {
-    let density = (8192 - 24) / (data_width.max(0) + 28) as u64;
-    let density = density.max(1);
-    let pages = heap_pages.unwrap_or_else(|| rows.div_ceil(density)).max(10);
-    (pages as f64, (density * pages) as f64)
+/// `table_rows` with the pages it assumes: `(pages, tuples)`
+/// (`table_block_relation_estimate_size`). `heap_pages` is the table's
+/// real size (`heap_pages`) where it is known; otherwise the rows are taken
+/// at the estimated density. `measured` is `pg_class`'s `(relpages,
+/// reltuples)` once something measured the table: then its density is
+/// theirs and the 10-page minimum is gone.
+pub fn table_size(
+    data_width: i64,
+    rows: u64,
+    heap_pages: Option<u64>,
+    measured: Option<(f64, f64)>,
+) -> (f64, f64) {
+    let estimated = ((8192 - 24) / (data_width.max(0) + 28)).max(1) as u64;
+    let mut pages = heap_pages.unwrap_or_else(|| rows.div_ceil(estimated));
+    let density = match measured {
+        Some((relpages, reltuples)) if relpages > 0.0 => reltuples / relpages,
+        Some(_) => estimated as f64,
+        None => {
+            pages = pages.max(10);
+            estimated as f64
+        }
+    };
+    (pages as f64, (density * pages as f64).round())
 }
 
 /// What the heap layout needs of a column's type (`pg_type`).

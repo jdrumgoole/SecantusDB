@@ -375,7 +375,10 @@ one beside it.
     json): its heap pages are taken at the estimated density.
   - DISTINCT ON, and a citext DISTINCT, which PostgreSQL sorts.
   - The heap's order after UPDATE or DELETE (rows the hash table reads in
-    another order); a table someone ran ANALYZE on (statistics).
+    another order). A table VACUUM or ANALYZE measured (its statistics,
+    `relallvisible`) is declined, keeping the old order; the size CREATE
+    INDEX records is modelled (`__sql_relstats__`), but not REINDEX's,
+    CLUSTER's or an ALTER TABLE that builds an index, nor across RENAME.
   - Joins: whether a cursor declared without SCROLL scans backward over a
     join under ORDER BY (`ExecSupportsBackwardScan`; `cursor_scroll.rs`
     reads every other shape from the statement): `select * from t join u on

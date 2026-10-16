@@ -21,6 +21,13 @@ More of the Rust PostgreSQL server's backlog, measured against PostgreSQL
   which over a whole table is a Group over an index in the keys' order, so
   the first keys come back in order. Part of RP-028
   (tests/backlog/test_rust_postgres_gaps.py::test_limit_reads_the_index_in_key_order).
+- **CREATE INDEX over a table with rows measures it**, as PostgreSQL's
+  does in `pg_class`: the planner then estimates the table's real rows
+  rather than a never-measured table's ten pages, which sizes the
+  HashAggregate differently. TRUNCATE and DROP forget it; a table VACUUM or
+  ANALYZE measured keeps the order it had, since its statistics are not
+  modelled. Part of RP-028
+  (tests/backlog/test_rust_postgres_gaps.py::test_create_index_measures_the_table).
 - **A GROUP BY holding a table's whole primary key groups by the key
   alone**, as PostgreSQL does, so its HashAggregate order is the key's.
   Part of RP-028

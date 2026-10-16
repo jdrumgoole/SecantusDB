@@ -172,6 +172,7 @@ impl PgHandler {
     /// membership of any publication.
     pub(crate) fn drop_table_catalog_objects(&self, table: &str) -> PgWireResult<()> {
         self.drop_grants(table)?;
+        self.clear_relstats(table)?;
         for d in self.catalog_docs(STATISTICS_COLLECTION) {
             if d.get_str("table") == Ok(table) {
                 self.delete_type_doc(STATISTICS_COLLECTION, d.get_str("_id").unwrap_or_default())?;
