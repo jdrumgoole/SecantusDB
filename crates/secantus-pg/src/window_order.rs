@@ -104,6 +104,7 @@ pub(crate) fn window_clauses(
                         key: OrderKey {
                             ascending: true,
                             nulls: Nulls::Last,
+                            jsonb: false,
                             ..k.clone()
                         },
                     },

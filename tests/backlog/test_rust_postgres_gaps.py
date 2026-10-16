@@ -286,7 +286,7 @@ def _same_as_reference(pg: Any, pg15: Any, sql: str) -> None:
     assert pg_answer(pg, sql) == pg_answer(pg15, sql)
 
 
-@pytest.mark.backlog("RP-015")
+@pytest.mark.backlog_fixed("RP-015")
 def test_strcoll_compares_answer_the_sign(pg: Any, pg15: Any) -> None:
     """PostgreSQL 15.19: `bttextcmp` / `bpcharcmp` / `jsonb_cmp` and
     `tsvector_cmp` / `tsquery_cmp` order as below. Only the SIGN is compared

@@ -1242,6 +1242,9 @@ pub struct OrderKey {
     pub field: String,
     pub ascending: bool,
     pub nulls: Nulls,
+    /// The key is `jsonb`: it orders as PostgreSQL's jsonb btree order
+    /// (`json::jsonb_compare`), not as its stored text.
+    pub jsonb: bool,
     /// `ORDER BY` over a COMPUTED expression (`order by n * -1`,
     /// `order by upper(a)`). The executor evaluates it per row into `field` —
     /// a synthetic name — just before sorting, so the sort itself stays the
@@ -10172,6 +10175,13 @@ fn plan_window_def(
     Ok((partition_by, order_by, frame))
 }
 
+/// Is `field` a `jsonb` column of `def`? Its sort key then orders as jsonb.
+fn jsonb_field(def: &TableDef, field: &str) -> bool {
+    def.columns
+        .iter()
+        .any(|c| c.pg_type == "jsonb" && c.field() == field)
+}
+
 /// One PARTITION BY or ORDER BY key of a window.
 ///
 /// A PARTITION BY item is a bare expression rather than a `SortBy`, so the two
@@ -10213,6 +10223,7 @@ fn window_sort_key(
                     field: column.field(),
                     ascending,
                     nulls,
+                    jsonb: column.pg_type == "jsonb",
                     expr: None,
                 });
             }
@@ -10240,6 +10251,7 @@ fn window_sort_key(
         field: format!("__wkey{}", *keys - 1),
         ascending,
         nulls,
+        jsonb: false,
         expr: Some(expr),
     })
 }
@@ -12748,6 +12760,7 @@ fn plan_series_select(
             field: series.column.clone(),
             ascending,
             nulls,
+            jsonb: false,
             expr: None,
         });
     }
@@ -14434,6 +14447,7 @@ fn plan_aggregate_item(
             field: field.clone(),
             ascending,
             nulls,
+            jsonb: false,
             expr: None,
         }];
         item.field = Some(field);
@@ -15052,6 +15066,7 @@ fn plan_aggregate_order(
             _ => Nulls::First,
         };
         keys.push(OrderKey {
+            jsonb: jsonb_field(def, &field),
             field,
             ascending,
             nulls,
@@ -20265,6 +20280,7 @@ fn plan_select_rest(
             .and_then(|n| n.parse::<usize>().ok())
             .map(|i| order_exprs[i].clone());
         order.push(OrderKey {
+            jsonb: jsonb_field(&def, &field),
             field,
             ascending,
             nulls,
@@ -23892,6 +23908,7 @@ fn plan_select_srf(
             field: column.clone(),
             ascending,
             nulls,
+            jsonb: false,
             expr: None,
         });
     }
@@ -37422,6 +37439,27 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                         (json::jsonb_value_key(a), json::jsonb_value_key(b))
                     {
                         return Ok(Bson::Boolean((ka == kb) == (op == "=")));
+                    }
+                }
+            }
+        }
+        // And jsonb ORDER is PostgreSQL's btree order, not its text's:
+        // `'[1]' < '[0,0]'` (fewer elements first), `'"a"' < '1'` (a string
+        // below a number), `'[]' < 'null'` (`compareJsonbContainers`).
+        if matches!(op.as_str(), "<" | "<=" | ">" | ">=") {
+            let jb = |n: Option<&pg_query::protobuf::Node>, v: &Bson| {
+                static_json_type(n, v).as_deref() == Some("jsonb")
+            };
+            if jb(e.lexpr.as_deref(), &lhs) || jb(e.rexpr.as_deref(), &rhs) {
+                if let (Bson::String(a), Bson::String(b)) = (&lhs, &rhs) {
+                    if let Some(order) = json::jsonb_compare(a, b) {
+                        use std::cmp::Ordering::{Greater, Less};
+                        return Ok(Bson::Boolean(match op.as_str() {
+                            "<" => order == Less,
+                            "<=" => order != Greater,
+                            ">" => order == Greater,
+                            _ => order != Less,
+                        }));
                     }
                 }
             }

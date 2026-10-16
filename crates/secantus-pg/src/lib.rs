@@ -26652,6 +26652,7 @@ impl PgHandler {
                         } else {
                             Nulls::First
                         },
+                        jsonb: false,
                         expr: None,
                     }]
                 }
@@ -37249,7 +37250,14 @@ fn compare_rows(a: &Document, b: &Document, order: &[OrderKey]) -> Ordering {
             },
             (false, false) => {
                 let (l, r) = (l.unwrap(), r.unwrap());
-                let mut cmp = compare_values(l, r);
+                let mut cmp = match (key.jsonb, l, r) {
+                    // jsonb is stored as its text, which orders differently.
+                    (true, Bson::String(a), Bson::String(b)) => {
+                        secantus_pgplan::json::jsonb_compare(a, b)
+                            .unwrap_or_else(|| compare_values(l, r))
+                    }
+                    _ => compare_values(l, r),
+                };
                 // A stored timestamp is a millisecond date plus its hidden
                 // sub-millisecond companion: equal dates are ordered by it
                 // (a missing one is 0). Sorting on the date alone put
@@ -41388,6 +41396,7 @@ impl PgHandler {
                 },
                 ascending: true,
                 nulls: Nulls::Last,
+                jsonb: false,
                 expr: None,
             })
             .collect();

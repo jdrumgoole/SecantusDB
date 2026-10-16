@@ -758,3 +758,193 @@ pub fn equal(a: &Json, b: &Json) -> bool {
         _ => a == b,
     }
 }
+
+/// Two `jsonb` values in PostgreSQL's btree order (`compareJsonbContainers`,
+/// `jsonb_util.c`), or `None` when either text is not JSON.
+///
+/// The order walks both values token by token. At a scalar or at the start
+/// of a container whose types differ, the type decides: null < string <
+/// number < boolean < array < object. Two arrays compare their element
+/// counts first and two objects their pair counts, then their contents in
+/// stored order -- an object's keys sorted by length and then bytes, a
+/// duplicate key keeping its last value. A top-level scalar is stored as a
+/// one-element "raw scalar" array, which is why an empty array sorts below
+/// every scalar: it is an array with fewer elements than the scalar's.
+/// Strings compare under the database's collation (`C` here: by bytes) and
+/// numbers as `numeric`s.
+pub fn jsonb_compare(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    let (a, b) = (parse(a).ok()?, parse(b).ok()?);
+    let (mut ta, mut tb) = (Vec::new(), Vec::new());
+    jsonb_tokens(&a, true, &mut ta);
+    jsonb_tokens(&b, true, &mut tb);
+    for (x, y) in ta.iter().zip(&tb) {
+        let order = token_compare(x, y);
+        if order != std::cmp::Ordering::Equal {
+            return Some(order);
+        }
+    }
+    // Equal throughout: the counts compared at each container start make the
+    // token lists the same length.
+    Some(ta.len().cmp(&tb.len()))
+}
+
+/// One step of `JsonbIteratorNext` (without the container ends, which
+/// compare equal and are skipped).
+enum Token<'a> {
+    Array {
+        elements: usize,
+        raw_scalar: bool,
+    },
+    Object {
+        pairs: usize,
+    },
+    /// An object's key: a string.
+    Key(&'a String),
+    Scalar(&'a Json),
+}
+
+/// `JsonbValue.type`'s order: null, string, numeric, bool, array, object.
+fn token_type(t: &Token<'_>) -> u8 {
+    match t {
+        Token::Scalar(Json::Null) => 0,
+        Token::Key(_) | Token::Scalar(Json::Str(_)) => 1,
+        Token::Scalar(Json::Number(_)) => 2,
+        Token::Scalar(Json::Bool(_)) => 3,
+        Token::Array { .. } | Token::Scalar(Json::Array(_)) => 0x10,
+        Token::Object { .. } | Token::Scalar(Json::Object(_)) => 0x11,
+    }
+}
+
+fn token_compare(x: &Token<'_>, y: &Token<'_>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (tx, ty) = (token_type(x), token_type(y));
+    if tx != ty {
+        return tx.cmp(&ty);
+    }
+    match (x, y) {
+        (
+            Token::Array {
+                elements: ea,
+                raw_scalar: ra,
+            },
+            Token::Array {
+                elements: eb,
+                raw_scalar: rb,
+            },
+        ) => {
+            // Both checks run, the second overriding the first, as in
+            // `compareJsonbContainers`: a raw scalar sorts below an array of
+            // as many elements, and fewer elements sort first.
+            let mut order = Ordering::Equal;
+            if ra != rb {
+                order = if *ra {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                };
+            }
+            if ea != eb {
+                order = ea.cmp(eb);
+            }
+            order
+        }
+        (Token::Object { pairs: pa }, Token::Object { pairs: pb }) => pa.cmp(pb),
+        _ => {
+            let text = |t: &Token<'_>| -> Option<String> {
+                match t {
+                    Token::Key(k) => Some((*k).clone()),
+                    Token::Scalar(Json::Str(s)) => Some(s.clone()),
+                    _ => None,
+                }
+            };
+            match (x, y) {
+                (Token::Scalar(Json::Number(a)), Token::Scalar(Json::Number(b))) => {
+                    crate::numeric::compare_decimal_text(&normalise_number(a), &normalise_number(b))
+                        .unwrap_or(Ordering::Equal)
+                }
+                (Token::Scalar(Json::Bool(a)), Token::Scalar(Json::Bool(b))) => a.cmp(b),
+                _ => match (text(x), text(y)) {
+                    (Some(a), Some(b)) => a.as_bytes().cmp(b.as_bytes()),
+                    _ => Ordering::Equal,
+                },
+            }
+        }
+    }
+}
+
+fn jsonb_tokens<'a>(v: &'a Json, top: bool, out: &mut Vec<Token<'a>>) {
+    match v {
+        Json::Array(items) => {
+            out.push(Token::Array {
+                elements: items.len(),
+                raw_scalar: false,
+            });
+            for item in items {
+                jsonb_tokens(item, false, out);
+            }
+        }
+        Json::Object(pairs) => {
+            let mut kept: Vec<(&String, &Json)> = Vec::new();
+            for (k, val) in pairs {
+                match kept.iter_mut().find(|(existing, _)| *existing == k) {
+                    Some(slot) => slot.1 = val,
+                    None => kept.push((k, val)),
+                }
+            }
+            kept.sort_by(|x, y| x.0.len().cmp(&y.0.len()).then_with(|| x.0.cmp(y.0)));
+            out.push(Token::Object { pairs: kept.len() });
+            for (k, val) in kept {
+                out.push(Token::Key(k));
+                jsonb_tokens(val, false, out);
+            }
+        }
+        scalar if top => {
+            out.push(Token::Array {
+                elements: 1,
+                raw_scalar: true,
+            });
+            out.push(Token::Scalar(scalar));
+        }
+        scalar => out.push(Token::Scalar(scalar)),
+    }
+}
+
+#[cfg(test)]
+mod jsonb_order_tests {
+    use super::jsonb_compare;
+
+    /// PostgreSQL 15.19: `ORDER BY j` over these sixteen jsonb values.
+    #[test]
+    fn jsonb_orders_as_postgres() {
+        let pg = [
+            "[]",
+            "null",
+            "\"a\"",
+            "\"b\"",
+            "1",
+            "2.5",
+            "false",
+            "true",
+            "[null]",
+            "[\"a\"]",
+            "[1]",
+            "[0,0]",
+            "{}",
+            "{\"a\":1}",
+            "{\"b\":0}",
+            "{\"a\":1,\"b\":2}",
+        ];
+        let mut ours = pg.to_vec();
+        ours.reverse();
+        ours.sort_by(|a, b| jsonb_compare(a, b).unwrap());
+        assert_eq!(ours, pg);
+        // Numbers compare as numerics, and keys as strings (15.19:
+        // `'{"b":1}' > '{"aa":1}'` is true, though "aa" is STORED after "b").
+        assert_eq!(jsonb_compare("1.0", "1"), Some(std::cmp::Ordering::Equal));
+        assert_eq!(
+            jsonb_compare("{\"b\":1}", "{\"aa\":1}"),
+            Some(std::cmp::Ordering::Greater)
+        );
+        assert_eq!(jsonb_compare("not json", "1"), None);
+    }
+}

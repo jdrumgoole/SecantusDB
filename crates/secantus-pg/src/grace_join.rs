@@ -586,6 +586,7 @@ impl PgHandler {
             field: f.to_string(),
             ascending: true,
             nulls: Nulls::Last,
+            jsonb: false,
             expr: None,
         });
         let mut out = crate::external_sort::RunBuilder::new(&order, None, BATCH);

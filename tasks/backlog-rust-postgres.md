@@ -121,6 +121,12 @@ one beside it.
   has is the host's locale list.
   Backlog-ID: RP-005
   Verify: tests/backlog/test_rp_triage.py::test_marathi_icu_collation_orders_as_postgres
+- **Scope decision — the comparison functions whose magnitude is the
+  platform's answer the SIGN only** (Joe, 2026-10-16): `bttextcmp`,
+  `bpcharcmp` and `jsonb_cmp` compare under the database collation through
+  `strcoll` (`bttextcmp('b', 'a')` is 14 on the macOS reference), and
+  `tsvector_cmp` / `tsquery_cmp` by their storage layouts; each answers
+  -1 / 0 / 1 in PostgreSQL's order, which is all PostgreSQL promises.
 - **Scope decision — pgcrypto Blowfish and CAST5** PGP messages are verified
   against GnuPG, because both reference servers' OpenSSL 3 builds refuse
   those ciphers. Do not "fix" them to agree with a PG error.
@@ -410,33 +416,6 @@ one beside it.
       plain number on Linux.
       Backlog-ID: RP-014
       Verify: none -- CI-runner timing flakes in psycopg's own suite on Linux
-
-- [ ] **OPEN — RUST pgserver: what `pg_builtin_coverage.py` still reports
-      (re-measured 2026-10-15).** The probe calls every immutable or stable
-      function in PostgreSQL 15.19's `pg_proc` on both servers with one
-      sample value for each argument type; 1,505 of 1,934 answered the same
-      on 2026-10-15 before that day's batch (what it fixed -- `tid`,
-      `ts_parse` / `ts_debug` / `ts_rewrite`, the single-byte encodings,
-      SRFs in expressions, untyped literal arguments -- is pinned by
-      `test_builtin_coverage_fixed` and the corpora it added). Re-run it
-      before working an item.
-
-      What is left (re-measured 2026-10-15 against 15.19, 1,890 of 1,934
-      the same; everything else the probe reports is below):
-      - **`bttextcmp`, `bpcharcmp`, `jsonb_cmp`, `tsvector_cmp` and
-        `tsquery_cmp` are not implemented** (refused). **Decided (Joe,
-        2026-10-16): answer the SIGN only, -1 / 0 / 1.** The first three
-        compare under the session database's collation through `strcoll`,
-        whose magnitude is the platform's locale data (`bttextcmp('b', 'a')`
-        is 14 on the macOS reference under `en_US.UTF-8`); PostgreSQL
-        promises only the sign. The last two take the sign of PostgreSQL's
-        comparison of the types' storage layouts (sizes first). The byte comparisons (`byteacmp`, `bitcmp`,
-        `btnamecmp`, `network_cmp`, the `*_pattern_cmp` pair, ...) answer
-        PostgreSQL's numbers since 2026-10-16 (`cmpfn.rs`).
-      - `table_to_xml` / `database_to_xml` over the catalog or the whole
-        database differ only by what each database holds.
-      Backlog-ID: RP-015
-      Verify: tests/backlog/test_rust_postgres_gaps.py::test_strcoll_compares_answer_the_sign
 
 - [ ] **OPEN — a backend-cancel test asserts a fixed 1 s bound on a shared
       runner.** `tests/test_rust_pgserver_slice.py::test_pg_cancel_and_terminate_backend_signal_a_running_statement`
