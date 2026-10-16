@@ -1,6 +1,6 @@
 ---
 name: close-session
-description: Close out a SecantusDB working session — land every outstanding change, record what is left with measurements, tear down branches and worktrees, and reconcile the documentation with what actually changed. Fires on "close the session", "wrap up", "finish up", "we're done", "end of session", or when the user stops directing new work. Sequences the per-slice landing (batch-worktree) and the machine cleanup (session-cleanup) and adds the part neither covers: finding the docs, comments and tests that still describe the behaviour you just changed. Refuses to declare the session closed while any of your own work is still in flight, and gates the close on a final process sweep so the session leaves no server, waiter or detached run behind.
+description: Close out a SecantusDB working session — land every outstanding change, record what is left with measurements, tear down branches and worktrees, and reconcile the documentation with what actually changed. Fires on "close the session", "wrap up", "finish up", "we're done", "end of session", or when the user stops directing new work. Sequences the per-slice landing (batch-worktree) and the machine cleanup (session-cleanup) and adds the part neither covers: finding the docs, comments and tests that still describe the behaviour you just changed. Refuses to declare the session closed while any of your own work is still in flight, and gates the close on a final process sweep so the session leaves no server, waiter, detached run or subagent behind.
 ---
 
 # Closing a session is a task, not a farewell
@@ -10,7 +10,7 @@ true now, and what is left — from the repo alone, without this conversation.
 That takes four passes, in this order, because each depends on the one before,
 and then two gates: **you do not get to close while your own work is still
 moving (§5), and you do not get to close while anything you started is still
-running (§6).** The process gate is last on purpose — waiting in §5 arms waits
+running, subagents included (§6).** The process gate is last on purpose — waiting in §5 arms waits
 and re-runs suites, so a machine that was clean in §4 is not clean any more by
 the time you reach the handover.
 
@@ -228,6 +228,30 @@ for j in .detached-runs/*.json; do [ -f "${j%.json}.exit" ] || echo "ACTIVE: $j"
 
 Every line printed either goes away or gets named in the handover. Nothing may
 be left merely observed.
+
+**E. Subagents — the gate the shell commands cannot see.** An agent spawned
+with the Agent tool is not an OS process of its own, so A–D never list it.
+Run `ListAgents`: every **Teammate** row is an agent this session started,
+and **every one must be stopped before the session closes**, idle or not. An
+idle agent is not finished; it is still registered and can still be
+messaged. On 2026-10-16 a session declared itself closed with fifteen
+teammates still listed, the oldest a day old, across five finished phases.
+
+For each teammate:
+
+- **Working** (not idle): it is in flight. Wait for its report (§5), read
+  it, and only then stop it. Stopping it mid-task throws its work away, and
+  a worktree it writes to must not be removed until it has answered your
+  LAST message (memory `agent-worktree-teardown`).
+- **Idle, report read**: stop it with `TaskStop` and its name
+  (`TaskStop({task_id: "p5-gate"})`). A truncated report counts as unread:
+  ask for the rest first.
+- **Idle, report never read**: read it via `SendMessage` before stopping.
+  An unread report is a result you are about to discard.
+
+Then run `ListAgents` again: the Teammates section must be gone, leaving
+only **Peer sessions**. Those are other sessions, never yours to stop: list
+them in the handover if they matter, and leave them alone.
 
 **Attribution is the session id in the storage path.** Your scratchpad path
 contains this conversation's uuid; a different uuid is a different session,
