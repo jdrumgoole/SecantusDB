@@ -773,6 +773,23 @@ impl PgHandler {
         {
             return Ok(None);
         }
+        // A join whose plan reorders its sides (RP-028) is read whole, where
+        // the materialised path puts them in that plan's order.
+        if let secantus_pgplan::joins::JoinNode::Join {
+            kind,
+            left,
+            right,
+            equi,
+            ..
+        } = &join.tree
+        {
+            if self
+                .general_join_method(*kind, left, right, equi)
+                .is_some_and(|m| m != secantus_pgplan::joincost::JoinMethod::Other)
+            {
+                return Ok(None);
+            }
+        }
         let mut budget = join_inner_bytes();
         self.prepare_join(&join.tree, &mut budget)
     }
@@ -789,6 +806,10 @@ impl PgHandler {
         };
         if join.order.is_some()
             || !self.join_may_stream()
+            // A join whose plan reorders its sides is read whole (RP-028).
+            || self
+                .narrow_join_method(join)
+                .is_some_and(|(m, _, _)| m != secantus_pgplan::joincost::JoinMethod::Other)
             || !table_or_sub(&join.left_sub, &join.left.0)
             || !table_or_sub(&join.right_sub, &join.right.0)
         {

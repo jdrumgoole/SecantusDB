@@ -380,16 +380,19 @@ one beside it.
     INDEX records is modelled (`__sql_relstats__`), but not REINDEX's,
     CLUSTER's or an ALTER TABLE that builds an index, nor across RENAME.
   - Joins: the join method (`secantus-pgplan/src/joincost.rs`: hash and
-    merge joins priced as PostgreSQL does, at a cursor's tenth of the rows)
-    decides only whether a cursor over `a [LEFT] JOIN b ON a.x = b.y ORDER
-    BY a.x` scrolls (96 of 96 shapes match 15.19; this was RP-043). Not
-    yet: the join's ROW order where the method shows -- equal keys of a
-    many-to-many merge join come out as each side's quicksort leaves them,
-    and a hash join's matches in its bucket's order -- nested loops, more
-    than two tables, other join clauses or a WHERE.
+    merge joins priced as PostgreSQL does) decides whether a cursor over
+    `a [LEFT] JOIN b ON a.x = b.y ORDER BY a.x` scrolls (at a cursor's
+    tenth of the rows; 96 of 96 shapes match 15.19; this was RP-043), and
+    the order a join of two tables on one equality emits its rows: a
+    merge join's sides in key order, ties as each side's quicksort leaves
+    them; a hash join's matches in its bucket's order (33 of 33). Not yet:
+    a WHERE, which is applied over the joined rows rather than to a side
+    before its sort; an expression or several join keys; nested loops;
+    more than two tables; a join of more than 200,000 rows a side, which
+    streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_many_to_many_merge_join_leaves_ties_as_its_sorts_do
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_merge_join_under_a_where_sorts_the_rows_it_keeps
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

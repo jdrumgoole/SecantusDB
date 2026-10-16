@@ -1237,12 +1237,12 @@ def test_prepared_fetch_follows_the_cursors_columns(pg: Any) -> None:
     assert answer == ("ok", [(1, 2)])
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_many_to_many_merge_join_leaves_ties_as_its_sorts_do(pg: Any) -> None:
     """PostgreSQL 15.19: `on l.b = r.c` over two fresh keyed tables is a
     Merge Join over two Sorts, so equal keys come out as PostgreSQL's
     quicksort leaves each side (7 then 14 on the left, 5 20 15 10 on the
-    right); here they come out in insertion order."""
+    right)."""
     pg.execute("begin")
     try:
         pg.execute("create table rp028_jl (a int primary key, b int)")
@@ -1256,5 +1256,29 @@ def test_many_to_many_merge_join_leaves_ties_as_its_sorts_do(pg: Any) -> None:
     finally:
         pg.execute("rollback")
     want = "7:5 7:20 7:15 7:10 14:5 14:20 14:15 14:10 15:11 15:6 15:1 15:16"
+    assert got[0] == "ok"
+    assert " ".join(f"{a}:{b}" for a, b in got[1][:12]) == want
+
+
+@pytest.mark.backlog("RP-028")
+def test_merge_join_under_a_where_sorts_the_rows_it_keeps(pg: Any) -> None:
+    """PostgreSQL 15.19: with `where l.a < 10` the merge join sorts only the
+    left rows the WHERE keeps (a bitmap heap scan's), so their ties come out
+    7 8 1 9 2 3 4; here the WHERE is applied over the joined rows, after a
+    sort of the whole left side."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp028_jl (a int primary key, b int)")
+        pg.execute("insert into rp028_jl select i, i % 7 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jr (a int primary key, c int)")
+        pg.execute("insert into rp028_jr select i, i % 5 from generate_series(1, 20) i")
+        got = pg_answer(
+            pg,
+            "select rp028_jl.a, rp028_jr.a from rp028_jl join rp028_jr"
+            " on rp028_jl.b = rp028_jr.c where rp028_jl.a < 10",
+        )
+    finally:
+        pg.execute("rollback")
+    want = "7:5 7:20 7:15 7:10 8:11 8:6 8:1 8:16 1:11 1:6 1:1 1:16"
     assert got[0] == "ok"
     assert " ".join(f"{a}:{b}" for a, b in got[1][:12]) == want

@@ -5928,44 +5928,77 @@ impl PgHandler {
         })
     }
 
+    /// One side of a join on `key` of `table`, as the planner prices it
+    /// (`joincost::JoinSide`); `None` when the table is not one the model
+    /// prices.
+    fn join_side(
+        &self,
+        table: &str,
+        key: &str,
+        filter: &Document,
+    ) -> Option<secantus_pgplan::joincost::JoinSide> {
+        use secantus_pgplan::{costsize, hashagg, joincost};
+        let count = self
+            .storage
+            .count_matching(self.db(), table, &Document::new(), None)
+            .ok()?;
+        let pt = self.planner_table(table, count)?;
+        let field = pt.def.field_of(key)?;
+        let unique = pt.unique.contains(&field);
+        let (ndistinct, default_ndistinct) = joincost::JoinSide::ndistinct_for(unique, pt.tuples);
+        let rel = costsize::Rel {
+            pages: pt.pages,
+            tuples: pt.tuples,
+        };
+        // The side's own WHERE, priced as a scan's quals.
+        let quals = costsize::conjuncts(filter)?;
+        let column_nd = |f: &str| {
+            if pt.unique.iter().any(|u| u == f) {
+                pt.tuples
+            } else if pt
+                .def
+                .columns
+                .iter()
+                .any(|c| c.field() == f && c.pg_type == "bool")
+            {
+                2.0
+            } else {
+                pt.tuples.min(200.0)
+            }
+        };
+        let rows = if filter.is_empty() {
+            pt.tuples
+        } else {
+            (pt.tuples * hashagg::filter_selectivity(filter, &column_nd)?)
+                .round()
+                .max(1.0)
+        };
+        let indexes = self.cost_indexes(table, &pt.def, count as u64);
+        let scan = costsize::cheapest_scan(&rel, &indexes, &quals, &column_nd, rows);
+        let ordered = indexes
+            .iter()
+            .filter(|ix| ix.field == field)
+            .map(|ix| costsize::ordered_index_scan(&rel, ix, &quals, column_nd(&ix.field)))
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        Some(joincost::JoinSide {
+            rows,
+            tuples: pt.tuples,
+            scan: (0.0, scan),
+            ordered,
+            unique,
+            ndistinct,
+            default_ndistinct,
+        })
+    }
+
     /// Whether a cursor over the join `js` can scan backward: not when
     /// PostgreSQL's cheapest plan is a merge join already in the ORDER BY's
     /// order, which is then the plan's top; yes when a Sort goes over the
     /// join (`joincost::ordered_join_on_top`). `None` when a side is not a
     /// table the model prices.
     fn join_cursor_scrolls(&self, js: &secantus_pgplan::cursor_scroll::JoinScroll) -> Option<bool> {
-        use secantus_pgplan::{costsize, joincost};
-        let side = |table: &str, key: &str| -> Option<joincost::JoinSide> {
-            let count = self
-                .storage
-                .count_matching(self.db(), table, &Document::new(), None)
-                .ok()?;
-            let pt = self.planner_table(table, count)?;
-            let field = pt.def.field_of(key)?;
-            let unique = pt.unique.contains(&field);
-            let (ndistinct, default_ndistinct) =
-                joincost::JoinSide::ndistinct_for(unique, pt.tuples);
-            let rel = costsize::Rel {
-                pages: pt.pages,
-                tuples: pt.tuples,
-            };
-            let scan = costsize::cheapest_scan(&rel, &[], &[], &|_| ndistinct, pt.tuples);
-            let ordered = self
-                .cost_indexes(table, &pt.def, count as u64)
-                .iter()
-                .filter(|ix| ix.field == field)
-                .map(|ix| costsize::ordered_index_scan(&rel, ix, &[], ndistinct))
-                .min_by(|a, b| a.1.total_cmp(&b.1));
-            Some(joincost::JoinSide {
-                rows: pt.tuples,
-                tuples: pt.tuples,
-                scan: (0.0, scan),
-                ordered,
-                unique,
-                ndistinct,
-                default_ndistinct,
-            })
-        };
+        use secantus_pgplan::joincost;
+        let side = |table: &str, key: &str| self.join_side(table, key, &Document::new());
         let left = side(&js.left_table, &js.left_key)?;
         let right = side(&js.right_table, &js.right_key)?;
         Some(!joincost::ordered_join_on_top(
@@ -6611,7 +6644,9 @@ impl PgHandler {
                         right_keys,
                     );
                 }
-                let rrows = self.join_rows(right)?;
+                let mut rrows = self.join_rows(right)?;
+                let mut lrows = lrows;
+                self.order_general_join_inputs(*kind, left, right, equi, &mut lrows, &mut rrows);
                 let mut lrows = Some(lrows);
                 let mut out = Vec::new();
                 self.join_rows_core(
@@ -7190,6 +7225,141 @@ impl PgHandler {
         })
     }
 
+    /// `order_join_inputs` for a general join of two plain tables on one
+    /// equality (RP-028).
+    fn order_general_join_inputs(
+        &self,
+        kind: secantus_pgplan::joins::JoinKind,
+        left: &secantus_pgplan::joins::JoinNode,
+        right: &secantus_pgplan::joins::JoinNode,
+        equi: &[(String, String)],
+        lrows: &mut Vec<Document>,
+        rrows: &mut Vec<Document>,
+    ) {
+        if let (Some(method), [(lk, rk)]) =
+            (self.general_join_method(kind, left, right, equi), equi)
+        {
+            reorder_join_inputs(method, lrows, lk, rrows, rk);
+        }
+    }
+
+    /// The plan PostgreSQL picks for a general join of two plain tables on
+    /// one equality, or `None` for any other shape.
+    pub(crate) fn general_join_method(
+        &self,
+        kind: secantus_pgplan::joins::JoinKind,
+        left: &secantus_pgplan::joins::JoinNode,
+        right: &secantus_pgplan::joins::JoinNode,
+        equi: &[(String, String)],
+    ) -> Option<secantus_pgplan::joincost::JoinMethod> {
+        use secantus_pgplan::joins::{JoinKind, JoinNode, SEP};
+        if !matches!(kind, JoinKind::Inner | JoinKind::Left) {
+            return None;
+        }
+        let [(lk, rk)] = equi else {
+            return None;
+        };
+        let table = |n: &JoinNode| match n {
+            JoinNode::Leaf { plan, .. } => match plan.as_ref() {
+                Statement::Select(sel)
+                    if sel.residual.is_none()
+                        && sel.sub.is_none()
+                        && sel.join.is_none()
+                        && sel.series.is_none()
+                        && !sel.table.is_empty() =>
+                {
+                    Some((sel.table.clone(), sel.filter.clone()))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let column = |k: &str| k.split(SEP).nth(1).map(str::to_string);
+        let (Some((lt, lfilter)), Some((rt, rfilter)), Some(lc), Some(rc)) =
+            (table(left), table(right), column(lk), column(rk))
+        else {
+            return None;
+        };
+        if !self.join_small_enough(&lt) || !self.join_small_enough(&rt) {
+            return None;
+        }
+        let (Some(a), Some(b)) = (
+            self.join_side(&lt, &lc, &lfilter),
+            self.join_side(&rt, &rc, &rfilter),
+        ) else {
+            return None;
+        };
+        Some(secantus_pgplan::joincost::cheapest_join(
+            &a,
+            &b,
+            matches!(kind, JoinKind::Left),
+        ))
+    }
+
+    /// Put a join's inputs in the order PostgreSQL's plan reads them
+    /// (RP-028), so the nested loop below emits its rows in that plan's
+    /// order: for a merge join, each side in key order (an index scan's
+    /// keeps equal keys in heap order, a Sort's as PostgreSQL's quicksort
+    /// leaves them); for a hash join with the right side hashed, that side
+    /// backwards, as a bucket's chain returns its last insert first. Only
+    /// for two stored tables on one equality with no other condition; any
+    /// other plan keeps the scan order.
+    fn order_join_inputs(
+        &self,
+        join: &secantus_pgplan::JoinSelect,
+        left: &mut Vec<Document>,
+        right: &mut Vec<Document>,
+    ) {
+        if let Some((method, lf, rf)) = self.narrow_join_method(join) {
+            reorder_join_inputs(method, left, &lf, right, &rf);
+        }
+    }
+
+    /// A table small enough to hold whole for its join's plan order: past
+    /// it the join streams in bounded memory, in scan order (RP-028).
+    fn join_small_enough(&self, table: &str) -> bool {
+        self.storage
+            .count_matching(self.db(), table, &Document::new(), None)
+            .is_ok_and(|n| n <= 200_000)
+    }
+
+    /// The plan PostgreSQL picks for a narrow join of two stored tables on
+    /// one equality with no other condition, and the stored fields it joins
+    /// on; `None` for any other shape.
+    pub(crate) fn narrow_join_method(
+        &self,
+        join: &secantus_pgplan::JoinSelect,
+    ) -> Option<(secantus_pgplan::joincost::JoinMethod, String, String)> {
+        use secantus_pgplan::joincost;
+        if join.left_sub.is_some() || join.right_sub.is_some() || !join.filter.is_empty() {
+            return None;
+        }
+        let ((la, lc), (_, rc)) = join.on.as_ref().map(|(a, b)| {
+            if a.0 == join.left.1 {
+                (a.clone(), b.clone())
+            } else {
+                (b.clone(), a.clone())
+            }
+        })?;
+        let _ = la;
+        if !self.join_small_enough(&join.left.0) || !self.join_small_enough(&join.right.0) {
+            return None;
+        }
+        let (Some(a), Some(b)) = (
+            self.join_side(&join.left.0, &lc, &Document::new()),
+            self.join_side(&join.right.0, &rc, &Document::new()),
+        ) else {
+            return None;
+        };
+        let (Some(lf), Some(rf)) = (
+            self.lookup(&join.left.0).and_then(|d| d.field_of(&lc)),
+            self.lookup(&join.right.0).and_then(|d| d.field_of(&rc)),
+        ) else {
+            return None;
+        };
+        Some((joincost::cheapest_join(&a, &b, join.left_join), lf, rf))
+    }
+
     fn join_docs_with(
         &self,
         join: &secantus_pgplan::JoinSelect,
@@ -7202,10 +7372,13 @@ impl PgHandler {
             Some(r) => r,
             None => self.table_docs(&join.left.0)?,
         });
-        let right_rows = match right_rows {
+        let mut right_rows = match right_rows {
             Some(r) => r,
             None => self.table_docs(&join.right.0)?,
         };
+        if let Some(rows) = left_rows.as_mut() {
+            self.order_join_inputs(join, rows, &mut right_rows);
+        }
         let mut out = Vec::new();
         self.join_docs_core(
             join,
@@ -42381,5 +42554,49 @@ impl PgHandler {
             flush(k, &mut bucket, &mut groups)?;
         }
         Ok(Some(Bounded::Grouped(groups)))
+    }
+}
+
+/// `PgHandler::order_join_inputs`' reordering, given the plan `method`:
+/// `left` and `right` are the two sides' rows, `lf` / `rf` the key each is
+/// joined on.
+fn reorder_join_inputs(
+    method: secantus_pgplan::joincost::JoinMethod,
+    left: &mut Vec<Document>,
+    lf: &str,
+    right: &mut Vec<Document>,
+    rf: &str,
+) {
+    use secantus_pgplan::joincost::JoinMethod;
+    let by_key = |field: &str| {
+        let field = field.to_string();
+        move |x: &Document, y: &Document| match (
+            x.get(&field).filter(|v| **v != Bson::Null),
+            y.get(&field).filter(|v| **v != Bson::Null),
+        ) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(p), Some(q)) => secantus_pgplan::compare_values(p, q).unwrap_or(Ordering::Equal),
+        }
+    };
+    let in_key_order = |rows: &mut Vec<Document>, field: &str, by_index: bool| {
+        let cmp = by_key(field);
+        if by_index {
+            rows.sort_by(&cmp);
+        } else {
+            *rows = tuplesort::sort(std::mem::take(rows), None, &mut |p, q| cmp(p, q));
+        }
+    };
+    match method {
+        JoinMethod::MergeOuterA {
+            a_by_index,
+            b_by_index,
+        } => {
+            in_key_order(left, lf, a_by_index);
+            in_key_order(right, rf, b_by_index);
+        }
+        JoinMethod::HashOuterA => right.reverse(),
+        JoinMethod::Other => {}
     }
 }

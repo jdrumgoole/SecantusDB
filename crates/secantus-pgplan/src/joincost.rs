@@ -205,6 +205,56 @@ pub fn ordered_join_on_top(
     ordered <= price(sort_cost(cheapest.1, rows))
 }
 
+/// The plan PostgreSQL picks for a whole join of `a` (the left table) and
+/// `b` on their keys, with no ORDER BY: the cheapest in total.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum JoinMethod {
+    /// A hash join probing with `a`'s rows in scan order, `b` hashed, and
+    /// `b`'s key repeating (a unique one has one match a probe, in any
+    /// order).
+    HashOuterA,
+    /// A merge join with `a` outer, each side read in key order -- by its
+    /// index (`*_by_index`) or a Sort.
+    MergeOuterA { a_by_index: bool, b_by_index: bool },
+    /// Any other: `b` outer (a hash or merge join the other way round).
+    Other,
+}
+
+/// `JoinMethod` for `a JOIN b` (`left`: a LEFT join, `a` its outer side).
+pub fn cheapest_join(a: &JoinSide, b: &JoinSide, left: bool) -> JoinMethod {
+    let _ = left;
+    let mut best = (f64::INFINITY, JoinMethod::Other);
+    let mut consider = |cost: f64, method: JoinMethod| {
+        if cost < best.0 {
+            best = (cost, method);
+        }
+    };
+    consider(
+        hash_join(a, b).1,
+        if b.unique {
+            JoinMethod::Other
+        } else {
+            JoinMethod::HashOuterA
+        },
+    );
+    consider(hash_join(b, a).1, JoinMethod::Other);
+    for (oi, ii) in [(false, false), (true, false), (true, true)] {
+        if let Some((_, t)) = merge_join(a, b, oi, ii) {
+            consider(
+                t,
+                JoinMethod::MergeOuterA {
+                    a_by_index: oi,
+                    b_by_index: ii,
+                },
+            );
+        }
+        if let Some((_, t)) = merge_join(b, a, oi, ii) {
+            consider(t, JoinMethod::Other);
+        }
+    }
+    best.1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +299,20 @@ mod tests {
         let (s, t) = merge_join(&plain(), &plain(), false, false).unwrap();
         assert!(close(s, 317.01) && close(t, 711.38), "{s} {t}");
         assert_eq!(join_rows(&plain(), &plain(), false), 25538.0);
+    }
+
+    #[test]
+    fn the_method_postgres_picks_for_a_whole_join() {
+        // Two keys: a Hash Join, jp probing (60.85..99.39), one match a row.
+        assert_eq!(cheapest_join(&pk(), &pk(), false), JoinMethod::Other);
+        // Two plain columns, many to many: a Merge Join over two Sorts.
+        assert_eq!(
+            cheapest_join(&plain(), &plain(), false),
+            JoinMethod::MergeOuterA {
+                a_by_index: false,
+                b_by_index: false
+            }
+        );
     }
 
     #[test]
