@@ -8057,8 +8057,26 @@ fn op_trim(arg: &Bson, ctx: &Ctx, side: TrimSide) -> R {
     if is_null(&input) {
         return Ok(Bson::Null);
     }
+    // mongod names the operator and renders the value (probed 8.2.11,
+    // 2026-10-16); these deferred, which on this server read as "$trim is
+    // not supported".
+    let name = match side {
+        TrimSide::Both => "$trim",
+        TrimSide::Left => "$ltrim",
+        TrimSide::Right => "$rtrim",
+    };
+    let refuse = |code: i32, what: &str, v: &Bson| {
+        Fallback::mongo(
+            code,
+            format!(
+                "{name} requires {what} to be a string, got {} (of type {}) instead.",
+                crate::aggregate::render_value_compact(v),
+                type_name(v)
+            ),
+        )
+    };
     let Bson::String(s) = input else {
-        return Err(Fallback::Defer); // non-string input -> Python raises
+        return Err(refuse(50699, "its input", &input));
     };
     // With no `chars`, mongod trims a FIXED table of 20 whitespace code points
     // (TRIM_WHITESPACE) -- not "whatever the language calls whitespace". Probed
@@ -8074,7 +8092,7 @@ fn op_trim(arg: &Bson, ctx: &Ctx, side: TrimSide) -> R {
         return Ok(Bson::Null); // chars: null -> null result (mongod)
     }
     let Bson::String(chars) = chars else {
-        return Err(Fallback::Defer); // non-string chars -> Python raises 50700
+        return Err(refuse(50700, "'chars'", &chars));
     };
     let pat = |c: char| chars.contains(c);
     let trimmed = match side {

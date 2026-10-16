@@ -2034,7 +2034,7 @@ pub(crate) fn query_fault(fault: secantus_core::fallback::Fallback) -> StorageEr
         Some((code, errmsg)) => StorageError::QueryError {
             code,
             errmsg: errmsg.to_string(),
-            exec: fault.is_exec() || fault.folded_verdict() == Some(false),
+            exec: fault.is_exec() || (fault.folded_verdict() == Some(false) && !fault.is_bare()),
         },
         None => StorageError::QueryUnsupported,
     }

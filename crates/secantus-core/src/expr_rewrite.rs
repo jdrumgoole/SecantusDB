@@ -142,7 +142,9 @@ pub fn constant_expr_fault(arg: &Bson) -> Option<crate::fallback::Fallback> {
     if is_constant(arg) {
         return crate::expressions::evaluate(&Document::new(), arg, &Document::new())
             .err()
-            .filter(|f| f.as_mongo().is_some());
+            // A PARSE error (a missing required argument) is reported bare,
+            // and by the command's own checks, not as an optimizer failure.
+            .filter(|f| f.as_mongo().is_some() && !f.is_bare());
     }
     match arg {
         Bson::Array(items) => items.iter().find_map(constant_expr_fault),

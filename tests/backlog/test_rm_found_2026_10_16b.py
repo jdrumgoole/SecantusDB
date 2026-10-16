@@ -103,3 +103,25 @@ def test_abs_of_a_non_number_and_of_the_long_minimum(rust_mongo: Any, mongod: An
     (the Rust server answered "not supported"), and `$abs` of the long
     minimum is 28680 (it answered the double 9.223372036854776e18)."""
     assert _abs_answers(rust_mongo) == _abs_answers(mongod)
+
+
+def _trim_answers(client: Any) -> list:
+    db = _db(client, "rm178")
+    db.c.insert_one({"a": "x", "n": 5, "o": {"q": 1}})
+    out = []
+    for op in ("$trim", "$ltrim", "$rtrim"):
+        for spec in ({"input": "$a", "chars": "$n"}, {"input": "$o"}, {"input": 5}):
+            pipeline = [{"$project": {"_id": 0, "r": {op: spec}}}]
+            out.append(mongo_answer(lambda p=pipeline: list(db.c.aggregate(p))))
+    for f in ({"$expr": {"$trim": {}}}, {"$expr": {"$regexMatch": {"input": "$a"}}}):
+        out.append(mongo_answer(lambda f=f: list(db.c.aggregate([{"$match": f}]))))
+    return [str(a).replace(db.name, "@db") for a in out]
+
+
+@pytest.mark.backlog_fixed("RM-178")
+def test_trim_refuses_a_non_string_by_name(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11: `$trim` / `$ltrim` / `$rtrim` of a non-string input is
+    50699 and of non-string `chars` 50700, each naming the operator and the
+    value; the Rust server answered "not supported". A missing required
+    argument inside a query's `$expr` stays a bare parse error."""
+    assert _trim_answers(rust_mongo) == _trim_answers(mongod)

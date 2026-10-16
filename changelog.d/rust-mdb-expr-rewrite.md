@@ -39,7 +39,14 @@ mongod 8.2.11.
   long minimum is 28680. It used to answer the double
   9.223372036854776e18.
 
-Fixes RM-074 in part (tests/backlog/test_rm_057_084.py::test_expr_is_optimised_and_rewritten_for_the_planner,
+- **`$trim` / `$ltrim` / `$rtrim`** refuse a non-string input (50699) or
+  `chars` (50700) by name, as mongod does; they answered "not supported".
+
+A parse error inside a query's `$expr` (a missing required argument) stays
+bare, as mongod sends it.
+
+Fixes RM-178 (tests/backlog/test_rm_found_2026_10_16b.py::test_trim_refuses_a_non_string_by_name),
+RM-074 in part (tests/backlog/test_rm_057_084.py::test_expr_is_optimised_and_rewritten_for_the_planner,
 ::test_explain_of_expr_false_is_eof), RM-175 (tests/backlog/test_rm_found_2026_10_16b.py::test_a_fetch_rechecks_its_predicates_by_path),
 RM-176 (::test_an_error_inside_a_querys_expr_carries_mongods_wrapper) and
 RM-177 (::test_abs_of_a_non_number_and_of_the_long_minimum).
