@@ -168,6 +168,13 @@ impl PgHandler {
             .collect()
     }
 
+    /// Whether `CREATE STATISTICS` made an object over `table`.
+    pub(crate) fn has_statistics_objects(&self, table: &str) -> bool {
+        self.catalog_docs(STATISTICS_COLLECTION)
+            .iter()
+            .any(|d| d.get_str("table") == Ok(table))
+    }
+
     /// What goes with a dropped table: its statistics objects, and its
     /// membership of any publication.
     pub(crate) fn drop_table_catalog_objects(&self, table: &str) -> PgWireResult<()> {

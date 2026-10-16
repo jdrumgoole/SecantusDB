@@ -956,11 +956,14 @@ pub enum Statement {
     /// storage, but PostgreSQL's validation still applies -- the relations
     /// and columns must exist (`indexes` names ones that must be indexes),
     /// and `outside_block` ones refuse a transaction block (25001).
+    /// `analyze` when the command gathers statistics (`ANALYZE`, or
+    /// `VACUUM (ANALYZE)`).
     Maintenance {
         command: String,
         tables: Vec<(String, Vec<String>)>,
         indexes: Vec<String>,
         outside_block: bool,
+        analyze: bool,
     },
     /// `CLUSTER [table [USING index]]`: the table's rows rewritten in the
     /// index's order, which an unordered scan then shows.
@@ -4661,6 +4664,7 @@ fn plan_node(
                 tables,
                 indexes: Vec::new(),
                 outside_block: v.is_vacuumcmd,
+                analyze,
             })
         }
         N::CheckPointStmt(_) => Ok(Statement::Maintenance {
@@ -4668,6 +4672,7 @@ fn plan_node(
             tables: Vec::new(),
             indexes: Vec::new(),
             outside_block: false,
+            analyze: false,
         }),
         N::ReindexStmt(r) => {
             use pg_query::protobuf::ReindexObjectType as R;
@@ -4691,6 +4696,7 @@ fn plan_node(
                 tables,
                 indexes,
                 outside_block: whole.is_some(),
+                analyze: false,
             })
         }
         N::ClusterStmt(c) => Ok(Statement::Cluster {

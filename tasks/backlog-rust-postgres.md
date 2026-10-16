@@ -364,7 +364,17 @@ one beside it.
   an aggregate with DISTINCT or its own ORDER BY is never hashed; and
   under a LIMIT with no ORDER BY a Group over an index scan in the keys'
   order is weighed too, by the cost of the first rows the LIMIT takes.
-  186 of 186 shapes match 15.19 at 40, 300 and 3,000 rows. Not yet:
+  186 of 186 shapes match 15.19 at 40, 300 and 3,000 rows. A table
+  ANALYZE measured is modelled too (2026-10-16): ANALYZE records each
+  column's `pg_statistic` row as `compute_scalar_stats` computes it from a
+  sample of the whole table (`stanullfrac`, `stadistinct`, `stawidth`;
+  `hashagg::analyze_column`) and `relpages` / `reltuples`, as a snapshot,
+  and the group estimate reads them (`get_variable_numdistinct`); the
+  hash table's growth is simplehash's (an integer threshold, checked on
+  every row's lookup). 212 of 212 shapes over analysed int, text, bool,
+  float8, char(n), varchar and NULL-bearing columns match 15.19 at 20 to
+  10,000 rows, and again with half as many rows, and four times as many,
+  inserted after the ANALYZE. Not yet:
   - An `OR` in the WHERE (a BitmapOr path), which keeps the HashAggregate
     unpriced (and is declined under a LIMIT); a DISTINCT with an ORDER BY,
     whose sort is not weighed; an ORDER BY with a LIMIT.
@@ -375,10 +385,22 @@ one beside it.
     json): its heap pages are taken at the estimated density.
   - DISTINCT ON, and a citext DISTINCT, which PostgreSQL sorts.
   - The heap's order after UPDATE or DELETE (rows the hash table reads in
-    another order). A table VACUUM or ANALYZE measured (its statistics,
-    `relallvisible`) is declined, keeping the old order; the size CREATE
-    INDEX records is modelled (`__sql_relstats__`), but not REINDEX's,
+    another order). The size CREATE INDEX records and what ANALYZE
+    stores are modelled (`__sql_relstats__`), but not REINDEX's,
     CLUSTER's or an ALTER TABLE that builds an index, nor across RENAME.
+    Declined over an analysed table, keeping the old order: a WHERE (its
+    selectivity is the most common values' and histogram's: `select g
+    from t3 where k > 5 group by g`); a LIMIT when an index leads with a
+    group key (an index scan's cost reads the column's correlation:
+    `select distinct g from ti limit 3`, an Index Only Scan at 3,000
+    rows); a join on its columns (`eqjoinsel` over its most common
+    values); a key of a type whose statistics are not modelled (dates,
+    numeric, arrays); extended statistics (`CREATE STATISTICS`); a table
+    of more rows than ANALYZE samples (30,000), whose sample is random.
+    VACUUM (`relallvisible`, the visibility map) is declined entirely;
+    it cannot run in a transaction block, so it was not measured. A
+    ROLLBACK undoes ANALYZE's `relpages` / `reltuples` here, which
+    PostgreSQL writes in place.
   - Joins: the join method (`secantus-pgplan/src/joincost.rs`: hash and
     merge joins priced as PostgreSQL does) decides whether a cursor over
     `a [LEFT] JOIN b ON a.x = b.y ORDER BY a.x` scrolls (at a cursor's

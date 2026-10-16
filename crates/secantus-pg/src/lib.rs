@@ -566,6 +566,10 @@ struct PlannerTable {
     unique: Vec<String>,
     pages: f64,
     tuples: f64,
+    /// What ANALYZE stored, by stored field: a column's `pg_statistic` row,
+    /// or `None` for one whose statistics are not modelled. `None` for a
+    /// table with no column statistics.
+    analyzed: Option<HashMap<String, Option<secantus_pgplan::hashagg::ColumnStats>>>,
 }
 
 /// What a grouping asks of the planner beyond its keys, for the choice
@@ -5410,6 +5414,9 @@ impl PgHandler {
         // even with no ORDER BY.
         let mut keys: Vec<Vec<Option<Bson>>> = Vec::new();
         let mut group_index = distinct_set::IdentIndex::new();
+        // Whether a row of an earlier group follows the last group's first
+        // row (`hashagg::hash_agg_order`).
+        let mut trailing_rows = false;
         let mut buckets: Vec<Vec<Document>> = Vec::new();
         // The grouping set that produced each group, for `GROUPING()`; a plain
         // GROUP BY groups on every key.
@@ -5503,10 +5510,14 @@ impl PgHandler {
                     .map(|(v, k)| typed_ident(v, k.pg_type == "jsonb"))
                     .collect();
                 match group_index.find_or_add(ident) {
-                    Ok(i) => buckets[i].push(d),
+                    Ok(i) => {
+                        buckets[i].push(d);
+                        trailing_rows = true;
+                    }
                     Err(_) => {
                         keys.push(key);
                         buckets.push(vec![d]);
+                        trailing_rows = false;
                     }
                 }
             }
@@ -5547,7 +5558,7 @@ impl PgHandler {
         // and the order an ORDER BY's ties keep.
         let rows: usize = buckets.iter().map(Vec::len).sum();
         let mut groups = groups;
-        let hashed = match self.hash_agg_order(agg, &keys, rows) {
+        let hashed = match self.hash_agg_order(agg, &keys, rows, trailing_rows) {
             Some(order) => {
                 let mut slots: Vec<Option<_>> = groups.into_iter().map(Some).collect();
                 groups = order.into_iter().filter_map(|i| slots[i].take()).collect();
@@ -5570,6 +5581,7 @@ impl PgHandler {
         agg: &secantus_pgplan::Aggregate,
         keys: &[Vec<Option<Bson>>],
         rows: usize,
+        trailing_rows: bool,
     ) -> Option<Vec<usize>> {
         if agg.series.is_some()
             || agg.sub.is_some()
@@ -5617,12 +5629,21 @@ impl PgHandler {
                     .collect(),
             ),
         };
-        self.hash_agg_order_over(&agg.table, &agg.filter, &key_cols, keys, rows, &shape)
+        self.hash_agg_order_over(
+            &agg.table,
+            &agg.filter,
+            &key_cols,
+            keys,
+            (rows, trailing_rows),
+            &shape,
+        )
     }
 
     /// The order PostgreSQL 15 emits `groups` in (one key value per column
     /// of `key_cols`, `(stored field, type)`) of `table`, read through
-    /// `filter` (`rows` rows passed it): the planner's estimate of the rows
+    /// `filter` (`rows` rows passed it, and whether a row of an earlier
+    /// group came after the last group's first: `hashagg::hash_agg_order`):
+    /// the planner's estimate of the rows
     /// and groups for a table with no statistics, then the plan it prices
     /// cheaper (`costsize::sorted_grouping_wins`) -- a HashAggregate's order
     /// (`hashagg::hash_agg_order`), or the keys sorted for a Sort + Group.
@@ -5641,7 +5662,7 @@ impl PgHandler {
         filter: &Document,
         key_cols: &[(String, String)],
         keys: &[Vec<Option<Bson>>],
-        rows: usize,
+        (rows, trailing_rows): (usize, bool),
         shape: &GroupingShape,
     ) -> Option<Vec<usize>> {
         use secantus_pgplan::{costsize, hashagg};
@@ -5658,7 +5679,23 @@ impl PgHandler {
             unique,
             pages,
             tuples,
+            analyzed,
         } = self.planner_table(table, table_count)?;
+        // Over a table ANALYZE measured, a WHERE's selectivity comes from its
+        // most common values and histogram, and an index scan's cost from
+        // the column's correlation, neither of which is modelled -- so a
+        // LIMIT, under which a Group over an index scan in the keys' order
+        // competes, is declined when an index leads with a group key.
+        if analyzed.is_some()
+            && (!filter.is_empty()
+                || shape.limit.is_some()
+                    && self
+                        .cost_indexes(table, &def, table_count as u64)
+                        .iter()
+                        .any(|ix| key_cols.iter().any(|(k, _)| k == &ix.field)))
+        {
+            return None;
+        }
         let pk: Vec<&secantus_pgcatalog::Column> = def.columns.iter().filter(|c| c.pk).collect();
         // `remove_useless_groupby_columns`: a GROUP BY holding the whole
         // primary key groups by that key alone.
@@ -5679,15 +5716,21 @@ impl PgHandler {
             .iter()
             .map(|&i| &key_cols[i])
             .map(|(field, pg_type)| {
-                if pg_type == "bool" {
+                let measured = analyzed.as_ref().and_then(|a| a.get(field));
+                Some(if pg_type == "bool" {
                     hashagg::KeyStat::Bool
+                } else if let Some(stats) = measured {
+                    hashagg::KeyStat::Analyzed {
+                        stats: (*stats)?,
+                        unique: unique.contains(field),
+                    }
                 } else if unique.contains(field) {
                     hashagg::KeyStat::Unique
                 } else {
                     hashagg::KeyStat::Unknown
-                }
+                })
             })
-            .collect();
+            .collect::<Option<_>>()?;
         let read = if filter.is_empty() {
             tuples
         } else {
@@ -5846,7 +5889,7 @@ impl PgHandler {
             .iter()
             .map(|k| hashed.iter().map(|&i| k[i].clone()).collect())
             .collect();
-        hashagg::hash_agg_order(&kept_keys, &types, groups)
+        hashagg::hash_agg_order(&kept_keys, &types, groups, trailing_rows)
     }
 
     /// What the planner knows of `table`, which holds `table_count` rows
@@ -5860,21 +5903,6 @@ impl PgHandler {
             .ok()?
             .into_iter()
             .find(|d| d.name == table)?;
-        let width: i64 = def
-            .columns
-            .iter()
-            .map(|c| {
-                let typlen = secantus_pgplan::pgtypes::oid_of_name(&c.pg_type)
-                    .and_then(|oid| pg_type_facts::builtin(oid, "typlen"))
-                    .and_then(|v| match v {
-                        Bson::Int32(n) => Some(i64::from(n)),
-                        Bson::Int64(n) => Some(n),
-                        _ => None,
-                    })
-                    .unwrap_or(-1);
-                hashagg::type_avg_width(&c.pg_type, c.typmod, typlen)
-            })
-            .sum();
         // The columns that are unique on their own: a one-column primary
         // key, UNIQUE constraint or unique index.
         let mut unique: Vec<String> = Vec::new();
@@ -5906,8 +5934,9 @@ impl PgHandler {
                 }
             }
         }
-        // A table VACUUM or ANALYZE measured has statistics (histograms,
-        // distinct counts, the visibility map) this model does not keep.
+        // A table VACUUM measured, or ANALYZE over a sample that is not the
+        // whole table, has statistics (the visibility map, histograms of a
+        // random sample) this model does not keep.
         let relstats = self.relstats(table);
         if relstats
             .as_ref()
@@ -5920,6 +5949,64 @@ impl PgHandler {
             let tuples = d.get_i64("reltuples").ok()?;
             Some((pages as f64, tuples as f64))
         });
+        // ANALYZE's `pg_statistic` rows, each kept only while its column
+        // still has the name and type it was measured under.
+        let analyzed = relstats
+            .as_ref()
+            .and_then(|d| d.get_document("columns").ok())
+            .filter(|cols| !cols.is_empty())
+            .map(|cols| {
+                cols.iter()
+                    .filter_map(|(field, entry)| {
+                        let entry = entry.as_document()?;
+                        let column = def.columns.iter().find(|c| &c.field() == field);
+                        let same = column.is_some_and(|c| {
+                            entry.get_str("name") == Ok(c.name.as_str())
+                                && entry.get_str("type") == Ok(c.pg_type.as_str())
+                        });
+                        let stats = (same && !entry.get_bool("unmodelled").unwrap_or(false))
+                            .then(|| {
+                                Some(hashagg::ColumnStats {
+                                    null_frac: entry.get_f64("null_frac").ok()? as f32,
+                                    distinct: entry.get_f64("distinct").ok()? as f32,
+                                    width: entry.get_i32("width").ok()?,
+                                })
+                            })
+                            .flatten();
+                        Some((field.clone(), stats))
+                    })
+                    .collect::<HashMap<_, _>>()
+            });
+        // Extended statistics (`CREATE STATISTICS`), which ANALYZE fills,
+        // are not modelled (`estimate_multivariate_ndistinct`).
+        if analyzed.is_some() && self.has_statistics_objects(table) {
+            return None;
+        }
+        // `get_rel_data_width`: each column's `get_typavgwidth`, or its
+        // `stawidth` where ANALYZE stored one (which only the density of a
+        // table measured empty reads).
+        let width: i64 = def
+            .columns
+            .iter()
+            .map(|c| {
+                let stawidth = analyzed
+                    .as_ref()
+                    .and_then(|stats| stats.get(&c.field())?.as_ref())
+                    .map_or(0, |s| s.width);
+                if stawidth > 0 {
+                    return i64::from(stawidth);
+                }
+                let typlen = secantus_pgplan::pgtypes::oid_of_name(&c.pg_type)
+                    .and_then(|oid| pg_type_facts::builtin(oid, "typlen"))
+                    .and_then(|v| match v {
+                        Bson::Int32(n) => Some(i64::from(n)),
+                        Bson::Int64(n) => Some(n),
+                        _ => None,
+                    })
+                    .unwrap_or(-1);
+                hashagg::type_avg_width(&c.pg_type, c.typmod, typlen)
+            })
+            .sum();
         let (pages, tuples) = hashagg::table_size(
             width,
             table_count as u64,
@@ -5931,6 +6018,7 @@ impl PgHandler {
             unique,
             pages,
             tuples,
+            analyzed,
         })
     }
 
@@ -5951,6 +6039,11 @@ impl PgHandler {
             .count_matching(self.db(), table, &Document::new(), None)
             .ok()?;
         let pt = self.planner_table(table, count)?;
+        // A join's selectivity over measured columns (`eqjoinsel` over their
+        // most common values) is not modelled.
+        if pt.analyzed.is_some() {
+            return None;
+        }
         let (field, key_ops) = match key {
             JoinKey::Column(key) => (Some(pt.def.field_of(key)?), 0.0),
             JoinKey::Expr(ops) => (None, f64::from(ops)),
@@ -11600,6 +11693,166 @@ impl PgHandler {
             None => {
                 doc.insert("statistics", true);
             }
+        }
+        // `pg_statistic` is ANALYZE's alone: what it stored stays.
+        if let Some(columns) = previous
+            .as_ref()
+            .and_then(|d| d.get_document("columns").ok())
+        {
+            doc.insert("columns", columns.clone());
+        }
+        self.put_comment_doc(Self::RELSTATS_COLLECTION, table, Some(doc))
+    }
+
+    /// ANALYZE of `table` (`do_analyze_rel`), or of the `columns` named:
+    /// `pg_class`'s `relpages` and `reltuples` as the table stands, and for
+    /// each column analysed its `pg_statistic` row
+    /// (`hashagg::analyze_column`), kept under `columns` by stored field
+    /// with the column's name and type -- a snapshot, which rows inserted
+    /// later do not change. A column whose type's statistics are not
+    /// modelled is recorded as such (`unmodelled`), and a table with more
+    /// rows than ANALYZE samples (300 x `default_statistics_target`), whose
+    /// sample is random, or whose heap is not modelled, is recorded as
+    /// unmodelled entirely (`statistics`). An empty table keeps the
+    /// statistics it had, as ANALYZE computes none from no rows.
+    fn record_analyze(&self, table: &str, columns: &[String]) -> PgWireResult<()> {
+        use secantus_pgplan::hashagg;
+        let Some(def) = self.lookup(table) else {
+            return Ok(());
+        };
+        let docs = self.table_docs(table)?;
+        let target = self
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("default_statistics_target")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(100);
+        let Some(pages) = self.heap_pages(table, &def) else {
+            return self.record_relstats(table, true);
+        };
+        if docs.len() as u64 > 300 * target {
+            return self.record_relstats(table, true);
+        }
+        let previous = self.relstats(table);
+        let mut stats = previous
+            .as_ref()
+            .and_then(|d| d.get_document("columns").ok())
+            .cloned()
+            .unwrap_or_default();
+        if !docs.is_empty() {
+            for c in &def.columns {
+                if !columns.is_empty() && !columns.iter().any(|n| n == &c.name) {
+                    continue;
+                }
+                let typlen = secantus_pgplan::pgtypes::oid_of_name(&c.pg_type)
+                    .and_then(|oid| pg_type_facts::builtin(oid, "typlen"))
+                    .and_then(|v| match v {
+                        Bson::Int32(n) => Some(i64::from(n)),
+                        Bson::Int64(n) => Some(n),
+                        _ => None,
+                    })
+                    .unwrap_or(-1);
+                let field = c.field();
+                let values: Option<Vec<hashagg::Sampled>> = docs
+                    .iter()
+                    .map(|d| Self::analyze_sample(c, d.get(&field)))
+                    .collect();
+                let mut entry = bson::doc! {"name": &c.name, "type": &c.pg_type};
+                match values {
+                    Some(values) => {
+                        let s = hashagg::analyze_column(&values, typlen);
+                        entry.insert("null_frac", f64::from(s.null_frac));
+                        entry.insert("distinct", f64::from(s.distinct));
+                        entry.insert("width", s.width);
+                    }
+                    None => {
+                        entry.insert("unmodelled", true);
+                    }
+                }
+                stats.insert(field, entry);
+            }
+        }
+        let statistics = previous
+            .as_ref()
+            .is_some_and(|d| d.get_bool("statistics").unwrap_or(false));
+        let doc = bson::doc! {
+            "_id": table,
+            "reltuples": docs.len() as i64,
+            "relpages": pages as i64,
+            "statistics": statistics,
+            "columns": stats,
+        };
+        self.put_comment_doc(Self::RELSTATS_COLLECTION, table, Some(doc))
+    }
+
+    /// One row's value of `c` as ANALYZE samples it: `Some(None)` for a
+    /// NULL, otherwise its key under the type's equality (`=` of its
+    /// default B-tree opclass) and its stored size (`VARSIZE_ANY`: a 1-byte
+    /// header up to 126 bytes, else 4; the type's width when fixed). `None`
+    /// when the type's equality is not modelled, or the value is wider than
+    /// ANALYZE compares (`WIDTH_THRESHOLD`, 1,024 bytes).
+    fn analyze_sample(
+        c: &secantus_pgcatalog::Column,
+        v: Option<&Bson>,
+    ) -> Option<secantus_pgplan::hashagg::Sampled> {
+        let v = match v {
+            None | Some(Bson::Null) => return Some(None),
+            Some(v) => v,
+        };
+        let varlena = |bytes: &[u8], len: usize| {
+            let size = if len < 127 { len + 1 } else { len + 4 };
+            (len + 4 <= 1024).then(|| Some((bytes.to_vec(), size)))
+        };
+        match (c.pg_type.trim_start_matches("pg_catalog."), v) {
+            ("int2" | "int4" | "int8", Bson::Int32(n)) => {
+                Some(Some((i64::from(*n).to_be_bytes().to_vec(), 0)))
+            }
+            ("int2" | "int4" | "int8", Bson::Int64(n)) => Some(Some((n.to_be_bytes().to_vec(), 0))),
+            ("bool", Bson::Boolean(b)) => Some(Some((vec![u8::from(*b)], 0))),
+            // `float8eq`: -0 equals 0, and NaN equals NaN.
+            ("float4" | "float8", Bson::Double(x)) => {
+                let x = if *x == 0.0 {
+                    0.0
+                } else if x.is_nan() {
+                    f64::NAN
+                } else {
+                    *x
+                };
+                Some(Some((x.to_bits().to_be_bytes().to_vec(), 0)))
+            }
+            ("text" | "varchar" | "character varying", Bson::String(s)) => {
+                varlena(s.as_bytes(), s.len())
+            }
+            // Stored trimmed, compared trimmed (`bpchareq`), and kept padded
+            // to its declared length.
+            ("bpchar" | "character", Bson::String(s)) => {
+                let trimmed = s.trim_end_matches(' ');
+                let pad = if c.typmod >= 4 {
+                    (c.typmod as usize - 4).saturating_sub(s.chars().count())
+                } else {
+                    0
+                };
+                varlena(trimmed.as_bytes(), s.len() + pad)
+            }
+            _ => None,
+        }
+    }
+
+    /// Drop the `pg_statistic` rows ANALYZE recorded for `fields` of
+    /// `table`.
+    fn forget_column_statistics(&self, table: &str, fields: &[String]) -> PgWireResult<()> {
+        let Some(mut doc) = self.relstats(table) else {
+            return Ok(());
+        };
+        let Ok(columns) = doc.get_document_mut("columns") else {
+            return Ok(());
+        };
+        if !fields.iter().any(|f| columns.contains_key(f)) {
+            return Ok(());
+        }
+        for f in fields {
+            columns.remove(f);
         }
         self.put_comment_doc(Self::RELSTATS_COLLECTION, table, Some(doc))
     }
@@ -27585,6 +27838,7 @@ impl PgHandler {
             let mut kept = Vec::with_capacity(docs.len());
             let mut kept_keys: Vec<Vec<Option<Bson>>> = Vec::new();
             let rows = docs.len();
+            let mut trailing_rows = false;
             for d in docs {
                 let mut ident = Vec::with_capacity(sel.columns.len());
                 let mut values = Vec::with_capacity(sel.columns.len());
@@ -27599,7 +27853,8 @@ impl PgHandler {
                     ident.push(typed_ident(&v, *schema[i].datatype() == Type::JSONB));
                     values.push(v);
                 }
-                if seen.insert(ident) {
+                trailing_rows = !seen.insert(ident);
+                if !trailing_rows {
                     kept.push(d);
                     kept_keys.push(values);
                 }
@@ -27639,7 +27894,14 @@ impl PgHandler {
                     can_hash: true,
                     order: sel.order.is_empty().then(Vec::new),
                 };
-                self.hash_agg_order_over(&sel.table, &sel.filter, &cols, &kept_keys, rows, &shape)
+                self.hash_agg_order_over(
+                    &sel.table,
+                    &sel.filter,
+                    &cols,
+                    &kept_keys,
+                    (rows, trailing_rows),
+                    &shape,
+                )
             }) {
                 let mut slots: Vec<Option<Document>> = kept.into_iter().map(Some).collect();
                 kept = order.into_iter().filter_map(|i| slots[i].take()).collect();
@@ -31198,6 +31460,22 @@ impl PgHandler {
                 for action in &effective {
                     self.apply_alter_rows(&table, &def, action, &before)?;
                 }
+                // A column added, dropped or retyped has no `pg_statistic`
+                // row (`RemoveStatistics`).
+                let restated: Vec<String> = effective
+                    .iter()
+                    .filter_map(|a| match a {
+                        secantus_pgplan::AlterTableAction::AddColumn { column, .. } => {
+                            Some(column.field())
+                        }
+                        secantus_pgplan::AlterTableAction::DropColumn { name, .. }
+                        | secantus_pgplan::AlterTableAction::AlterType { column: name, .. } => {
+                            before.column(name).map(|c| c.field())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                self.forget_column_statistics(&table, &restated)?;
                 // ATTACH / DETACH rewrote catalog rows of their own; the
                 // parent's is re-read so this write does not undo them.
                 if effective.iter().any(|a| {
@@ -32773,6 +33051,7 @@ impl PgHandler {
                 tables,
                 indexes,
                 outside_block,
+                analyze,
             } => {
                 if outside_block {
                     self.refuse_in_transaction_block(&command)?;
@@ -32796,13 +33075,22 @@ impl PgHandler {
                     }
                 }
                 if command == "VACUUM" || command == "ANALYZE" {
-                    let named: Vec<String> = if tables.is_empty() {
-                        self.all_table_defs()?.into_iter().map(|d| d.name).collect()
+                    let named: Vec<(String, Vec<String>)> = if tables.is_empty() {
+                        self.all_table_defs()?
+                            .into_iter()
+                            .map(|d| (d.name, Vec::new()))
+                            .collect()
                     } else {
-                        tables.iter().map(|(t, _)| t.clone()).collect()
+                        tables.clone()
                     };
-                    for t in &named {
-                        self.record_relstats(t, true)?;
+                    for (t, columns) in &named {
+                        // VACUUM's visibility map and its `relallvisible`
+                        // are not modelled; ANALYZE alone is.
+                        if command == "ANALYZE" && analyze {
+                            self.record_analyze(t, columns)?;
+                        } else {
+                            self.record_relstats(t, true)?;
+                        }
                     }
                 }
                 let tag = command.split(' ').next().unwrap_or_default().to_string();
