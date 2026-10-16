@@ -59,7 +59,8 @@ if str(REPO) not in sys.path:
 def connection(tmp_path: Path) -> Iterator[psycopg.Connection]:
     """A connection to a `secantusd-pg` over a store of its own."""
     proc = subprocess.Popen(
-        [str(BINARY), str(tmp_path / "home"), "127.0.0.1:0"],
+        # It connects as `probe`, a role nobody creates.
+        [str(BINARY), str(tmp_path / "home"), "127.0.0.1:0", "--trust-unknown-users"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,

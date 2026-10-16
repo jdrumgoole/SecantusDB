@@ -770,10 +770,12 @@ one request path:
     the TLS and `pg_hba.conf` options since 2026-10-12.
     `tasks/backlog-rust-postgres.md` section 3.1 has what is open.
   - Password verification works since 2026-09-29: a role with a password must
-    pass SCRAM-SHA-256; a role with none, and an unknown user, are still
-    trusted (test fixtures rely on that). `--refuse-unknown-users`
-    (2026-10-11) asks an unknown user for a password, which fails as it
-    does on PostgreSQL; a role with no password is trusted either way.
+    pass SCRAM-SHA-256; a role with none is trusted. **An unknown user is
+    REFUSED by default** (Joe, 2026-10-16), as PostgreSQL refuses a role
+    that does not exist; `--trust-unknown-users` (`trust_unknown_users` on
+    the embedded handles) lets it in. A harness that connects as a role
+    nobody created (`test`, `probe`, the OS user) must pass that flag or
+    connect as `postgres` -- the slice tests' `_Server` adds it.
     **`UNIQUE` IS enforced** — the earlier claim that it was "accepted without
     being enforced" was stale when measured against PostgreSQL 14.24 on
     2026-09-20: a duplicate on a column-level or table-level `UNIQUE` raises

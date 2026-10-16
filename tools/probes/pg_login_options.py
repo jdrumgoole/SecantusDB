@@ -4,9 +4,10 @@
 Five configurations, each a ``pg_hba.conf`` on one side and the options that
 stand for it on the other: any connection allowed, TLS only
 (``--tls-require``), and the three ``--tls-client-cert`` modes. Arguments
-after the binary are passed to every ``secantusd-pg`` it starts; with
-``--refuse-unknown-users`` all 234 scenarios are the same, and without it the
-48 that differ are a user there is no role for being let in.
+after the binary are passed to every ``secantusd-pg`` it starts; with none
+all 234 scenarios are the same (a user there is no role for is refused by
+default, as PostgreSQL refuses it), and with ``--trust-unknown-users`` the
+48 that differ are such a user being let in.
 
 Every scenario is one login, made against a throwaway PostgreSQL cluster this
 script creates and against ``secantusd-pg``, through psycopg and through a
@@ -22,7 +23,7 @@ nothing, which is how to find out what a new scenario should expect.
 Usage::
 
     python tools/probes/pg_login_options.py /opt/homebrew/opt/postgresql@15/bin \\
-        crates/secantus-pg/target/debug/secantusd-pg --refuse-unknown-users
+        crates/secantus-pg/target/debug/secantusd-pg
 """
 
 import base64

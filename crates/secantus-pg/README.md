@@ -84,13 +84,16 @@ connection's type, database, user and address says how it must prove who it
 is, and a connection no line matches is refused. It reads `host`,
 `hostssl` and `hostnossl`; the `trust`, `reject`, `scram-sha-256`, `md5`,
 `password` and `cert` methods; `clientcert=`, `clientname=` and `map=` (with
-`--ident-file`). A line it cannot apply, such as an `ldap` method or a host
-name for the address, stops the server from starting.
+`--ident-file`). A line it cannot apply, such as an `ldap` method, stops
+the server from starting.
 
-A user name there is no role for connects without a password, as a role
-with no password does. `--refuse-unknown-users`
-(`PgBuilder::refuse_unknown_users`, since 0.1.0-beta.11) asks such a user
-for a password, as PostgreSQL does, and none it gives is right.
+A user name there is no role for is refused, as PostgreSQL refuses a role
+that does not exist: it is asked for a password and none it gives is right.
+Connect as `postgres` (a role with no password, so it needs none), create
+the role first, or start the server with `--trust-unknown-users`
+(`PgBuilder::trust_unknown_users`), which lets such a user in without a
+password. Until 0.1.0-beta.17 such users were trusted by default, and
+`--refuse-unknown-users` (now accepted and ignored) refused them.
 
 Prebuilt binaries are on the
 [GitHub releases](https://github.com/jdrumgoole/SecantusDB/releases)

@@ -443,9 +443,10 @@ pub fn bind_tls(
 pub struct ServerOptions {
     /// Offer TLS with this certificate and key; see [`bind_tls`].
     pub tls: Option<TlsConfig>,
-    /// Refuse a user there is no role for. By default such a user is
-    /// trusted, as a role with no password is.
-    pub refuse_unknown_users: bool,
+    /// Trust a user there is no role for, as a role with no password is
+    /// trusted. By default such a user is refused, as PostgreSQL refuses a
+    /// role that does not exist.
+    pub trust_unknown_users: bool,
     /// A `pg_hba.conf`. With one, its lines decide every login and the
     /// options that stand in for such lines may not be given.
     pub hba_file: Option<std::path::PathBuf>,
@@ -459,11 +460,21 @@ impl ServerOptions {
         self
     }
 
-    /// Refuse a user there is no role for. It is asked for a password, as
-    /// PostgreSQL asks one under a `scram-sha-256` line in `pg_hba.conf`,
-    /// and none it gives is right.
+    /// Trust a user there is no role for, as a role with no password is
+    /// trusted: a test that connects as a name nobody created. By default
+    /// such a user is asked for a password, as PostgreSQL asks one under a
+    /// `scram-sha-256` line in `pg_hba.conf`, and none it gives is right.
+    pub fn trust_unknown_users(mut self, trust: bool) -> Self {
+        self.trust_unknown_users = trust;
+        self
+    }
+
+    /// Refuse a user there is no role for: the default since 0.1.0-beta.17,
+    /// so `refuse_unknown_users(true)` changes nothing and `(false)` is
+    /// [`ServerOptions::trust_unknown_users`].
+    #[deprecated(note = "unknown users are refused by default; use trust_unknown_users")]
     pub fn refuse_unknown_users(mut self, refuse: bool) -> Self {
-        self.refuse_unknown_users = refuse;
+        self.trust_unknown_users = !refuse;
         self
     }
 
@@ -471,7 +482,7 @@ impl ServerOptions {
     /// that matches a connection's transport, database, user and address
     /// says how it must prove who it is, and a connection no line matches
     /// is refused. The file takes the place of
-    /// [`ServerOptions::refuse_unknown_users`] and of [`TlsConfig`]'s
+    /// [`ServerOptions::trust_unknown_users`] and of [`TlsConfig`]'s
     /// `require_tls`, `client_cert`, `client_name` and `user_map`, and
     /// giving one of those beside it is an error.
     pub fn hba_file(mut self, path: impl Into<std::path::PathBuf>) -> Self {
@@ -498,7 +509,7 @@ impl ServerOptions {
             return Ok(None);
         };
         let replaced = [
-            (self.refuse_unknown_users, "refusing unknown users"),
+            (self.trust_unknown_users, "trusting unknown users"),
             (
                 self.tls.as_ref().is_some_and(|tls| tls.require_tls),
                 "requiring TLS",
@@ -551,7 +562,7 @@ pub fn bind_with(
             None => None,
         },
     });
-    let refuse_unknown_users = options.refuse_unknown_users;
+    let trust_unknown_users = options.trust_unknown_users;
     // Statements are planned and run on each connection's own thread (see
     // `accept_loop`; the runtime below accepts), and planning recurses once per expression level: tokio's 2 MiB default
     // overflowed on a 24-term `||` chain, which ABORTS the process -- every
@@ -606,7 +617,7 @@ pub fn bind_with(
             databases,
             LoginRules {
                 live: live.clone(),
-                refuse_unknown_users,
+                trust_unknown_users,
             },
             stop_flag,
             active,
@@ -631,7 +642,7 @@ pub fn bind_with(
 struct LoginRules {
     /// Read afresh for each connection, so a reload reaches the next one.
     live: Arc<crate::live::Live>,
-    refuse_unknown_users: bool,
+    trust_unknown_users: bool,
 }
 
 async fn accept_loop(
@@ -658,7 +669,7 @@ async fn accept_loop(
                 .with_tls(policy)
                 .with_hba(login.live.hba.as_ref().map(|hba| hba.current()))
                 .with_reloader(Some(crate::live::Reloader(login.live.clone())))
-                .with_refuse_unknown_users(login.refuse_unknown_users),
+                .with_trust_unknown_users(login.trust_unknown_users),
         );
         let active = active.clone();
         let mut conn_shutdown = shutdown.clone();

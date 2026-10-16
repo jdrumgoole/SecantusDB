@@ -285,20 +285,17 @@ one beside it.
 
 - [ ] **RUST PG server: what the login rules leave.** TLS, SCRAM channel
   binding, client certificates, `--tls-require`, `pg_stat_ssl`,
-  `--refuse-unknown-users`, `--hba-file`, revocation lists, user name maps,
+  refusing unknown users (the default; `--trust-unknown-users` opts out),
+  `--hba-file`, revocation lists, user name maps,
   `--tls-client-name DN` and reload are in (`crates/secantus-pg/src/tls.rs`,
   `scram_binding.rs`, `hba.rs`, `crl.rs`, `ident.rs`, `live.rs`). The three
   login comparisons against PostgreSQL 15 (`tools/probes/pg_login_options.py`,
   `pg_login_tls_files.py`, `pg_login_hba.py`) run in
   `tests/test_rust_pg_login_differential.py` (CI's `pg-oracle` lane; locally
   only with `SECANTUS_PG15_BIN` set). Open:
-  - **A user this server has never heard of is trusted BY DEFAULT**;
-    PostgreSQL asks it for a password. **Decided (Joe, 2026-10-16): refuse
-    by default**, as `--refuse-unknown-users` does now, with a
-    `--trust-unknown-users` opt-out; the test fixtures, embedded handles and
-    gauges that connect as roles nobody created create them or opt out. Without a `pg_hba.conf` a role with no
-    password is trusted, flag or not; with one a `scram-sha-256` line
-    refuses it.
+  - **Without a `pg_hba.conf` a role with no password is trusted** (with
+    one, a `scram-sha-256` line refuses it). A user there is no role for is
+    refused, as on PostgreSQL, unless `--trust-unknown-users` is given.
   - **With `--hba-file`:**
     - **Refused at startup, by line number**: the methods that need an
       outside service (`peer`, `ident`, `gss`, `sspi`, `ldap`, `radius`,
@@ -333,7 +330,7 @@ one beside it.
     `psycopg-tls.yml` lane, which is the plain gauge's number and has no
     Linux lane that gates it.
   Backlog-ID: RP-013
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_unknown_user_is_asked_for_a_password
+  Verify: none -- what is left needs an outside service (peer, ident, gss, sspi, ldap, radius, pam, bsd), or is the regex engine, a relative-name distribution point, or probe tooling; the login comparison (tests/test_rust_pg_login_differential.py) pins the rest
 
 ## 5. Known bugs and edge cases to watch
 

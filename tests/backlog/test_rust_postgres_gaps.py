@@ -113,12 +113,12 @@ def _connect_error(port: int, conninfo: str) -> str:
     return "connected"
 
 
-@pytest.mark.backlog("RP-013")
+@pytest.mark.backlog_fixed("RP-013")
 def test_unknown_user_is_asked_for_a_password(rust_pg: Any) -> None:
     """PostgreSQL 15.19 (a scram-sha-256 cluster): a role nobody created is
     asked for a password and fails `password authentication failed for user
-    "rp013_nobody"`. Here it is trusted by default (the item calls that a
-    decision; `--refuse-unknown-users` is the PostgreSQL answer)."""
+    "rp013_nobody"`. The server's default since Joe's decision of 2026-10-16
+    (`--trust-unknown-users` is the opt-out)."""
     assert _connect_error(rust_pg.port, "user=rp013_nobody password=x dbname=postgres") == (
         'password authentication failed for user "rp013_nobody"'
     )

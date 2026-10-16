@@ -3024,9 +3024,10 @@ pub struct PgHandler {
     /// The database a login asked for is not there: said once the login
     /// has been proved, on a server with a `pg_hba.conf`.
     database_error: Mutex<Option<ErrorInfo>>,
-    /// Ask a user this server has no role for to prove a password, which it
-    /// cannot, where the default is to trust it.
-    refuse_unknown_users: bool,
+    /// Trust a user this server has no role for, as a role with no password
+    /// is trusted. By default such a user is asked for a password, which it
+    /// cannot prove, as PostgreSQL refuses a role that does not exist.
+    trust_unknown_users: bool,
     /// The database the startup packet named, once it has been checked
     /// against the registry; the registry's default until then.
     db: OnceLock<String>,
@@ -3571,7 +3572,7 @@ impl PgHandler {
             hba_rule: std::sync::OnceLock::new(),
             cleartext_auth: Mutex::new(None),
             database_error: Mutex::new(None),
-            refuse_unknown_users: false,
+            trust_unknown_users: false,
             db: OnceLock::new(),
             databases,
             txn: Arc::new(Mutex::new(None)),
@@ -3676,8 +3677,8 @@ impl PgHandler {
 
     /// A handler for a server that does, or does not, trust a user it has
     /// no role for.
-    pub(crate) fn with_refuse_unknown_users(mut self, refuse: bool) -> Self {
-        self.refuse_unknown_users = refuse;
+    pub(crate) fn with_trust_unknown_users(mut self, trust: bool) -> Self {
+        self.trust_unknown_users = trust;
         self
     }
 
@@ -18279,15 +18280,17 @@ impl StartupHandler for PgHandler {
 
         // A role that HAS a password must prove it -- SCRAM-SHA-256, as
         // PostgreSQL's default `password_encryption` stores it. A role with
-        // none, or a user this server has never heard of, is trusted, which is
-        // what keeps every fixture connecting as a password-less `postgres`
-        // working (PostgreSQL's `trust` for those).
+        // none is trusted, which is what keeps every fixture connecting as
+        // the password-less `postgres` working (PostgreSQL's `trust` for
+        // it). A user this server has never heard of is refused, as
+        // PostgreSQL refuses a role that does not exist, unless the server
+        // was told to trust such users (Joe, 2026-10-16).
         let user = client.metadata().get("user").cloned().unwrap_or_default();
         let role = self.role(&user)?;
         if self.hba.is_some() {
             return self.hba_login(client, user, role).await;
         }
-        if role.is_none() && self.refuse_unknown_users {
+        if role.is_none() && !self.trust_unknown_users {
             return self.refuse_unknown_user(client, user).await;
         }
         if let Some(role) = role {

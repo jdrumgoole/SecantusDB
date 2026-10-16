@@ -192,7 +192,7 @@ pub struct PgBuilder {
     databases: Vec<String>,
     cache_size: String,
     tls: Option<TlsConfig>,
-    refuse_unknown_users: bool,
+    trust_unknown_users: bool,
     hba_file: Option<PathBuf>,
     ident_file: Option<PathBuf>,
 }
@@ -206,7 +206,7 @@ impl Default for PgBuilder {
             databases: Vec::new(),
             cache_size: DEFAULT_CACHE_SIZE.to_string(),
             tls: None,
-            refuse_unknown_users: false,
+            trust_unknown_users: false,
             hba_file: None,
             ident_file: None,
         }
@@ -268,20 +268,29 @@ impl PgBuilder {
         self
     }
 
-    /// Refuse a user there is no role for. By default such a user connects
-    /// without a password, as a role with no password does. With this it is
-    /// asked for one, as PostgreSQL asks, and none it gives is right. A role
-    /// with no password still connects without one; give `postgres` a
-    /// password and every login needs one.
+    /// Trust a user there is no role for: it connects without a password,
+    /// as a role with no password does. By default such a user is asked for
+    /// one, as PostgreSQL asks, and none it gives is right; connect as
+    /// `postgres` (a role with no password, so it needs none), create the
+    /// role first, or set this.
+    pub fn trust_unknown_users(mut self, trust: bool) -> Self {
+        self.trust_unknown_users = trust;
+        self
+    }
+
+    /// Refuse a user there is no role for: the default since 0.1.0-beta.17,
+    /// so `refuse_unknown_users(true)` changes nothing and `(false)` is
+    /// [`PgBuilder::trust_unknown_users`].
+    #[deprecated(note = "unknown users are refused by default; use trust_unknown_users")]
     pub fn refuse_unknown_users(mut self, refuse: bool) -> Self {
-        self.refuse_unknown_users = refuse;
+        self.trust_unknown_users = !refuse;
         self
     }
 
     /// Decide every login by the `pg_hba.conf` at `path`, as PostgreSQL
     /// does: the first line that matches a connection says how it must
     /// prove who it is, and a connection no line matches is refused. In
-    /// place of [`PgBuilder::refuse_unknown_users`] and of a [`TlsConfig`]'s
+    /// place of [`PgBuilder::trust_unknown_users`] and of a [`TlsConfig`]'s
     /// `require_tls`, `client_cert`, `client_name` and `user_map`.
     pub fn hba_file(mut self, path: impl Into<PathBuf>) -> Self {
         self.hba_file = Some(path.into());
@@ -331,7 +340,7 @@ impl PgBuilder {
         let addr = format!("{}:{}", self.host, self.port);
         let options = ServerOptions::default()
             .tls(self.tls.clone())
-            .refuse_unknown_users(self.refuse_unknown_users);
+            .trust_unknown_users(self.trust_unknown_users);
         let options = match &self.hba_file {
             Some(path) => options.hba_file(path),
             None => options,

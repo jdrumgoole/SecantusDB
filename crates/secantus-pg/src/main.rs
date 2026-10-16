@@ -136,7 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tls_client_name: Option<ClientName> = None;
     let mut hba_file: Option<String> = None;
     let mut ident_file: Option<String> = None;
-    let mut refuse_unknown_users = false;
+    let mut trust_unknown_users = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         // `--version` / `--help` BEFORE the positional fallthrough. Without
@@ -165,7 +165,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                  [--tls-ca-file PATH [--tls-client-cert MODE] [--tls-crl-file PATH]\n                  \
                  [--tls-client-name CN|DN]\n                  \
                  [--tls-ident-file PATH --tls-user-map NAME]]]\n                \
-                 [--refuse-unknown-users]\n                \
+                 [--trust-unknown-users]\n                \
                  [--hba-file PATH [--ident-file PATH]]\n\
                  \n\
                  ARGS:\n    \
@@ -210,11 +210,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                  and address says how it must prove who it is, and a\n                     \
                  connection no line matches is refused. In place of\n                     \
                  --tls-require, --tls-client-cert, --tls-client-name,\n                     \
-                 --tls-user-map and --refuse-unknown-users.\n    \
+                 --tls-user-map and --trust-unknown-users.\n    \
                  --ident-file PATH  The pg_ident.conf for a map= in the pg_hba.conf.\n    \
-                 --refuse-unknown-users  Ask a user there is no role for to give a\n                     \
-                 password, which fails. By default such a user\n                     \
-                 connects without one.\n    \
+                 --trust-unknown-users  Let a user there is no role for connect\n                     \
+                 without a password, as a role with no password does.\n                     \
+                 By default such a user is asked for one, which\n                     \
+                 fails, as PostgreSQL refuses a role that does not\n                     \
+                 exist. (--refuse-unknown-users, the old opt-in, is\n                     \
+                 accepted and changes nothing.)\n    \
                  -V, --version    Print version and exit\n    \
                  -h, --help       Print this help and exit",
                 env!("CARGO_PKG_VERSION")
@@ -288,8 +291,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ident_file = Some(path.to_string());
         } else if arg == "--tls-require" {
             tls_require = true;
+        } else if arg == "--trust-unknown-users" {
+            trust_unknown_users = true;
         } else if arg == "--refuse-unknown-users" {
-            refuse_unknown_users = true;
+            // The default since 0.1.0-beta.17; accepted so a script that
+            // asked for it still starts.
         } else if arg.starts_with("--") {
             // Never a storage path: an unknown or misspelt option fell through
             // to `home` and the server came up over a directory named after
@@ -387,7 +393,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // to go wrong here, and the `Debug` form buries which file it was.
     let options = ServerOptions::default()
         .tls(tls)
-        .refuse_unknown_users(refuse_unknown_users);
+        .trust_unknown_users(trust_unknown_users);
     let options = match hba_file {
         Some(path) => options.hba_file(path),
         None => options,
