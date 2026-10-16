@@ -43992,13 +43992,12 @@ fn reorder_join_inputs(
         }
         JoinMethod::HashOuterA => right.reverse(),
         JoinMethod::HashOuterB => left.reverse(),
-        // A hash right join's order is its hash table's (`hash_table_order`),
-        // which its caller puts its rows in; a merge right join's is not
-        // modelled.
+        // A right join's order is put in place by the caller that runs it
+        // (`hash_table_order`, `join_search::run_step`).
         JoinMethod::NestOuterB
         | JoinMethod::Other
         | JoinMethod::HashRightB
-        | JoinMethod::Unmodelled => {}
+        | JoinMethod::MergeRightB { .. } => {}
     }
 }
 

@@ -1673,13 +1673,12 @@ def test_four_table_chain_joins_in_the_searched_order(pg: Any) -> None:
     assert " ".join(f"{a}:{b}:{c}:{d}" for a, b, c, d in got[1][:6]) == want
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_four_table_left_join_chain_joins_in_the_searched_order(pg: Any) -> None:
     """PostgreSQL 15.19: the same four tables as LEFT joins, `l LEFT JOIN r
     ... LEFT JOIN m ... LEFT JOIN k`, plan as two LEFT merge joins, m-k and
     l-r, joined by a Hash Right Join with l-r hashed (14:15:15:12
-    7:15:15:12 ...); here a LEFT chain of four keeps each side in scan
-    order."""
+    7:15:15:12 ...)."""
     pg.execute("begin")
     try:
         pg.execute("create table rp028_jl (a int primary key, b int)")
@@ -1700,5 +1699,36 @@ def test_four_table_left_join_chain_joins_in_the_searched_order(pg: Any) -> None
     finally:
         pg.execute("rollback")
     want = "14:15:15:12 7:15:15:12 14:15:15:8 7:15:15:8 14:15:15:16 7:15:15:16"
+    assert got[0] == "ok"
+    assert " ".join(f"{a}:{b}:{c}:{d}" for a, b, c, d in got[1][:6]) == want
+
+
+@pytest.mark.backlog("RP-028")
+def test_four_tables_with_a_shared_key_join_on_its_class(pg: Any) -> None:
+    """PostgreSQL 15.19: `l JOIN r ON l.b = r.c JOIN m ON r.a = m.a JOIN k
+    ON m.a = k.a` puts r.a, m.a and k.a in one equivalence class, so r, m
+    and k hash join first (k probing r-m) and that, sorted by r.c, merges
+    with l (7:5:5:5 14:5:5:5 7:20:20:20 ...); here four tables whose
+    clauses share a key keep the join as written."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp028_jl (a int primary key, b int)")
+        pg.execute("insert into rp028_jl select i, i % 7 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jr (a int primary key, c int)")
+        pg.execute("insert into rp028_jr select i, i % 5 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jm (a int, d int)")
+        pg.execute("insert into rp028_jm select i, i % 3 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jk (a int, e int)")
+        pg.execute("insert into rp028_jk select i, i % 4 from generate_series(1, 20) i")
+        got = pg_answer(
+            pg,
+            "select rp028_jl.a, rp028_jr.a, rp028_jm.a, rp028_jk.a from rp028_jl"
+            " join rp028_jr on rp028_jl.b = rp028_jr.c"
+            " join rp028_jm on rp028_jr.a = rp028_jm.a"
+            " join rp028_jk on rp028_jm.a = rp028_jk.a",
+        )
+    finally:
+        pg.execute("rollback")
+    want = "7:5:5:5 14:5:5:5 7:20:20:20 14:20:20:20 7:15:15:15 14:15:15:15"
     assert got[0] == "ok"
     assert " ".join(f"{a}:{b}:{c}:{d}" for a, b, c, d in got[1][:6]) == want

@@ -3,8 +3,9 @@
 //! `join_search` plans three tables; four are planned here by the same
 //! dynamic programming PostgreSQL runs (`standard_join_search`), for the
 //! subset whose search has one shape: a chain of four stored tables, each
-//! joined INNER to one table before it on one column equality, no column
-//! in two clauses. The join graph is then a tree, every join relation the
+//! joined INNER or LEFT to one table before it on one column equality, no
+//! column in two clauses. A LEFT join constrains the orders as PostgreSQL's
+//! `join_is_legal` does, over its `SpecialJoinInfo` (`Search::outer`). The join graph is then a tree, every join relation the
 //! search builds holds connected tables, any two of them that can join do
 //! so on exactly one clause, and no relation's sorted output serves a join
 //! above it -- so each relation's cheapest path is the only one the next
@@ -41,6 +42,8 @@ struct Built {
     a: usize,
     b: usize,
     edge: usize,
+    /// A LEFT join, `a` its preserved side.
+    left: bool,
 }
 
 /// A relation of the search: its tables (a bit each), its rows, its paths
@@ -59,6 +62,11 @@ struct Search {
     tables: Vec<(String, Document)>,
     edges: Vec<Edge>,
     rels: Vec<Rel>,
+    /// The LEFT joins' `SpecialJoinInfo`s: `(min_lefthand, min_righthand)`.
+    /// A chain's ON is a strict equality, so a LEFT join above commutes
+    /// with one below whose nullable side it reads (`make_outerjoininfo`
+    /// adds nothing to its min_lefthand), and each is its two tables.
+    outer: Vec<(u8, u8)>,
 }
 
 /// A chain of four tables: its leaves, in FROM order, and its joins' ONs.
@@ -68,6 +76,47 @@ struct Chain<'a> {
 }
 
 impl Search {
+    /// `join_is_legal` for joining relations `a` and `b`: `None` when the
+    /// join would break an outer join; else whether it performs one, and
+    /// if so whether `b` holds its preserved side (`reversed`).
+    fn join_is_legal(&self, a: u8, b: u8) -> Option<Option<bool>> {
+        let joined = a | b;
+        let mut matched: Option<bool> = None;
+        let mut must_be_left = false;
+        for &(lhs, rhs) in &self.outer {
+            let sub = |x: u8, y: u8| x & !y == 0;
+            if rhs & joined == 0 || sub(joined, rhs) {
+                continue;
+            }
+            if (sub(lhs, a) && sub(rhs, a)) || (sub(lhs, b) && sub(rhs, b)) {
+                continue;
+            }
+            if sub(lhs, a) && sub(rhs, b) {
+                if matched.is_some() {
+                    return None;
+                }
+                matched = Some(false);
+            } else if sub(lhs, b) && sub(rhs, a) {
+                if matched.is_some() {
+                    return None;
+                }
+                matched = Some(true);
+            } else {
+                if a & rhs != 0 && b & rhs != 0 {
+                    continue;
+                }
+                if joined & lhs != 0 {
+                    return None;
+                }
+                must_be_left = true;
+            }
+        }
+        if must_be_left && matched.is_none() {
+            return None;
+        }
+        Some(matched)
+    }
+
     fn edge_between(&self, a: u8, b: u8) -> Option<usize> {
         let mut found = None;
         for (i, e) in self.edges.iter().enumerate() {
@@ -84,8 +133,8 @@ impl Search {
 }
 
 impl PgHandler {
-    /// `node` as a chain of four stored tables joined INNER, each on one
-    /// column equality to a table before it, no column in two clauses.
+    /// `node` as a chain of four stored tables joined INNER or LEFT, each on
+    /// one column equality to a table before it, no column in two clauses.
     fn four_table_chain<'a>(&self, node: &'a JoinNode) -> Option<(Chain<'a>, Search)> {
         let mut joins = Vec::new();
         let mut cur = node;
@@ -101,6 +150,7 @@ impl PgHandler {
         let mut ons = Vec::new();
         let mut tables = Vec::new();
         let mut edges = Vec::new();
+        let mut kinds = Vec::new();
         let leaf_alias = |n: &JoinNode| match n {
             JoinNode::Leaf { columns, .. } => columns.first().map(|(k, _)| alias_of(k).to_string()),
             _ => None,
@@ -120,7 +170,7 @@ impl PgHandler {
             else {
                 return None;
             };
-            if *kind != JoinKind::Inner
+            if !matches!(kind, JoinKind::Inner | JoinKind::Left)
                 || !merged.is_empty()
                 || !expr_keys.is_empty()
                 || ec.is_some()
@@ -152,7 +202,27 @@ impl PgHandler {
                 v_key: rk.clone(),
                 on: i,
             });
+            kinds.push(*kind);
         }
+        // `reduce_outer_joins`, top down: an inner join's strict clause
+        // makes the tables it reads non-null below it, and a LEFT join
+        // whose nullable table is so is an inner join.
+        let mut nonnull = 0u8;
+        for i in (0..edges.len()).rev() {
+            let e = &edges[i];
+            if kinds[i] == JoinKind::Left && nonnull & (1 << e.v) != 0 {
+                kinds[i] = JoinKind::Inner;
+            }
+            if kinds[i] == JoinKind::Inner {
+                nonnull |= (1 << e.u) | (1 << e.v);
+            }
+        }
+        let outer = edges
+            .iter()
+            .zip(&kinds)
+            .filter(|(_, k)| **k == JoinKind::Left)
+            .map(|(e, _)| (1u8 << e.u, 1u8 << e.v))
+            .collect();
         // No column in two clauses: an equivalence class of three or more,
         // whose derived clauses this search does not weigh.
         let mut keys: Vec<&String> = edges.iter().flat_map(|e| [&e.u_key, &e.v_key]).collect();
@@ -185,6 +255,7 @@ impl PgHandler {
                 tables,
                 edges,
                 rels: Vec::new(),
+                outer,
             },
         ))
     }
@@ -209,8 +280,16 @@ impl PgHandler {
 
     /// `make_join_rel`: the relation of `a` and `b`'s tables, built (or
     /// found) and given their join's paths.
+    /// A join the outer joins do not allow is not built.
     fn make_join_rel(&self, search: &mut Search, a: usize, b: usize) -> Option<()> {
         use secantus_pgplan::joincost::join_rows;
+        let Some(outer) = search.join_is_legal(search.rels[a].set, search.rels[b].set) else {
+            return Some(());
+        };
+        // A LEFT join's preserved side first (`make_join_rel` swaps a
+        // reversed pair).
+        let (a, b) = if outer == Some(true) { (b, a) } else { (a, b) };
+        let left = outer.is_some();
         let (sa, sb) = (search.rels[a].set, search.rels[b].set);
         let edge = search.edge_between(sa, sb)?;
         let e = &search.edges[edge];
@@ -227,7 +306,7 @@ impl PgHandler {
             None => {
                 search.rels.push(Rel {
                     set,
-                    rows: join_rows(&side_a, &side_b, false),
+                    rows: join_rows(&side_a, &side_b, left),
                     paths: JoinRel::new(false),
                     built: Vec::new(),
                     best: None,
@@ -237,8 +316,8 @@ impl PgHandler {
         };
         let rel = &mut search.rels[idx];
         let combo = rel.built.len();
-        rel.built.push(Built { a, b, edge });
-        rel.paths.add_paths(combo, &side_a, &side_b, false, true);
+        rel.built.push(Built { a, b, edge, left });
+        rel.paths.add_paths(combo, &side_a, &side_b, left, true);
         Some(())
     }
 
@@ -342,7 +421,7 @@ impl PgHandler {
         };
         let step = Step {
             method: best.method,
-            left: false,
+            left: built.left,
             a_key,
             b_key,
             a_rows,
