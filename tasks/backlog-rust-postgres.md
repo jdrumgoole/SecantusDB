@@ -314,6 +314,13 @@ one beside it.
       its issuer is refused at startup** (`crl.rs`); one with a full name,
       a delta list and a reasons-only or indirect list answer as
       PostgreSQL 15.19 does.
+    - **A self-signed root is never checked against the revocation lists**,
+      as OpenSSL 3.6 has it (`check_cert_crl` skips it). PostgreSQL linked
+      against an older OpenSSL (3.0.13 on Ubuntu 24.04) checks the root as
+      well, so a list scoped to user certificates or to a distribution point,
+      issued by the root, refuses every chain there and none here. The login
+      probe issues its scoped lists from an intermediate, where the two
+      versions agree.
     - **A user name map's patterns are read as the SQL `~` operator reads
       them** (the `regex` crate, through `pg_regex_source`'s POSIX-class
       translation, 2026-10-15), so they share that engine's distance from

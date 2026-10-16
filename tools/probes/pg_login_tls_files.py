@@ -284,10 +284,22 @@ CRL_FORGED_AND_REAL = bundle(f"{d}/crl_forged_real.pem", CRL_FORGED, CRL_EMPTY)
 
 # Lists scoped by an issuing distribution point (critical, as RFC 5280
 # requires), a delta list, and certificates naming a distribution point.
+#
+# Issued by the INTERMEDIATE, with the root's own unscoped list beside each:
+# OpenSSL before 3.6 checks the self-signed root against the lists too
+# (`check_cert`), and 3.6 skips it (`check_cert_crl`: "skip if cert is
+# apparently self-signed"). A list scoped to user certificates, or to a
+# distribution point, does not cover a root, so a root-issued scoped list
+# made the whole chain fail on 3.0 and pass on 3.6 -- the reference's answer
+# was its OpenSSL's. With the scoped list on the intermediate, only the leaf
+# is in its scope question on either version (measured 2026-10-16 with
+# `openssl verify -crl_check_all`, 3.0.13 and 3.6.3).
 DP_A, DP_B = "http://crl.example/a.crl", "http://crl.example/b.crl"
-DP_GOOD = ca.issue("dp_good", cn("postgres"), crldp=DP_A)
-DP_REVOKED = ca.issue("dp_revoked", cn("postgres"), crldp=DP_A)
-DP_OTHER = ca.issue("dp_other", cn("postgres"), crldp=DP_B)
+SC_GOOD = inter.issue("sc_good", cn("postgres"))
+SC_REVOKED = inter.issue("sc_revoked", cn("postgres"))
+DP_GOOD = inter.issue("dp_good", cn("postgres"), crldp=DP_A)
+DP_REVOKED = inter.issue("dp_revoked", cn("postgres"), crldp=DP_A)
+DP_OTHER = inter.issue("dp_other", cn("postgres"), crldp=DP_B)
 
 
 def idp(full_name=None, user=False, ca_only=False, reasons=None):
@@ -305,18 +317,25 @@ def idp(full_name=None, user=False, ca_only=False, reasons=None):
     )
 
 
-SCOPED = ("revoked", "dp_revoked")
-CRL_IDP_DP = ca.crl(f"{d}/crl_idp_dp.pem", revoked=SCOPED, extensions=(idp(DP_A),))
-CRL_IDP_USER = ca.crl(f"{d}/crl_idp_user.pem", revoked=SCOPED, extensions=(idp(user=True),))
-CRL_IDP_CA = ca.crl(f"{d}/crl_idp_ca.pem", revoked=SCOPED, extensions=(idp(ca_only=True),))
-CRL_IDP_REASONS = ca.crl(
-    f"{d}/crl_idp_reasons.pem",
-    revoked=SCOPED,
-    extensions=(idp(reasons=frozenset({x509.ReasonFlags.key_compromise})),),
+SCOPED = ("sc_revoked", "dp_revoked")
+
+
+def scoped(stem, *extensions):
+    """An intermediate's list with `extensions`, beside the root's empty one."""
+    return bundle(
+        f"{d}/{stem}.pem",
+        inter.crl(f"{d}/{stem}_inter.pem", revoked=SCOPED, extensions=extensions),
+        CRL_EMPTY,
+    )
+
+
+CRL_IDP_DP = scoped("crl_idp_dp", idp(DP_A))
+CRL_IDP_USER = scoped("crl_idp_user", idp(user=True))
+CRL_IDP_CA = scoped("crl_idp_ca", idp(ca_only=True))
+CRL_IDP_REASONS = scoped(
+    "crl_idp_reasons", idp(reasons=frozenset({x509.ReasonFlags.key_compromise}))
 )
-CRL_DELTA = ca.crl(
-    f"{d}/crl_delta.pem", revoked=SCOPED, extensions=((x509.DeltaCRLIndicator(1), True),)
-)
+CRL_DELTA = scoped("crl_delta", (x509.DeltaCRLIndicator(1), True))
 
 # Server certificates whose SIGNATURE is RSA-PSS or Ed25519.
 pss256, pss384, ed = (
@@ -516,12 +535,12 @@ def crl_scenarios(port):
 
 def scope_scenarios(port):
     return {
-        "no distribution point, good": attempt(port, **PGCERT),
-        "no distribution point, revoked": attempt(port, **REVOKED),
+        "no distribution point, good": attempt(port, **SC_GOOD),
+        "no distribution point, revoked": attempt(port, **SC_REVOKED),
         "distribution point a, good": attempt(port, **DP_GOOD),
         "distribution point a, revoked": attempt(port, **DP_REVOKED),
         "distribution point b": attempt(port, **DP_OTHER),
-        "revoked, first answer": raw_first(port, "postgres", cert=REVOKED),
+        "revoked, first answer": raw_first(port, "postgres", cert=SC_REVOKED),
     }
 
 
