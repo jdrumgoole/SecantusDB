@@ -271,10 +271,75 @@ pub fn type_avg_width(pg_type: &str, typmod: i32, typlen: i64) -> i64 {
 /// fixed-width rows without NULLs and close otherwise. Only past ten pages
 /// does it matter at all.
 pub fn table_rows(data_width: i64, rows: u64) -> f64 {
+    table_size(data_width, rows, None).1
+}
+
+/// `table_rows` with the pages it assumes: `(pages, tuples)`. `heap_pages`
+/// is the table's real size (`heap_pages`) where it is known; otherwise the
+/// rows are taken at the estimated density.
+pub fn table_size(data_width: i64, rows: u64, heap_pages: Option<u64>) -> (f64, f64) {
     let density = (8192 - 24) / (data_width.max(0) + 28) as u64;
     let density = density.max(1);
-    let pages = rows.div_ceil(density).max(10);
-    (density * pages) as f64
+    let pages = heap_pages.unwrap_or_else(|| rows.div_ceil(density)).max(10);
+    (pages as f64, (density * pages) as f64)
+}
+
+/// What the heap layout needs of a column's type (`pg_type`).
+#[derive(Debug, Clone, Copy)]
+pub struct ColumnLayout {
+    /// `typlen`: a fixed width, or -1 for a varlena.
+    pub typlen: i64,
+    /// `typalign` in bytes: 1, 2, 4 or 8.
+    pub align: usize,
+    /// A varlena whose storage allows the 1-byte header (`typstorage` not
+    /// `p`).
+    pub can_short: bool,
+}
+
+/// The space one row takes on a heap page (`heap_form_tuple`): the
+/// 23-byte header with a null bitmap when a value is NULL, MAXALIGNed;
+/// each value at its alignment, a varlena of up to 126 bytes with a 1-byte
+/// header and no alignment, longer with 4; the whole MAXALIGNed, plus its
+/// 4-byte line pointer. `values` holds `None` for a NULL, otherwise a
+/// varlena's payload length (ignored for a fixed width).
+pub fn heap_tuple_space(columns: &[ColumnLayout], values: &[Option<usize>]) -> usize {
+    let maxalign = |n: usize| n.div_ceil(8) * 8;
+    let any_null = values.iter().any(Option::is_none);
+    let hoff = maxalign(
+        23 + if any_null {
+            columns.len().div_ceil(8)
+        } else {
+            0
+        },
+    );
+    let mut off = 0usize;
+    for (col, value) in columns.iter().zip(values) {
+        let Some(len) = value else { continue };
+        if col.typlen > 0 {
+            off = off.div_ceil(col.align) * col.align + col.typlen as usize;
+        } else if col.can_short && *len < 127 {
+            off += len + 1;
+        } else {
+            off = off.div_ceil(col.align.max(4)) * col.align.max(4) + len + 4;
+        }
+    }
+    maxalign(hoff + off) + 4
+}
+
+/// The pages a heap of rows taking `spaces` fills, inserted in order: 8,168
+/// bytes a page after its header, at most 291 rows (`MaxHeapTuplesPerPage`).
+pub fn heap_pages(spaces: impl Iterator<Item = usize>) -> u64 {
+    let (mut pages, mut used, mut count) = (0u64, 8168usize, 0usize);
+    for space in spaces {
+        if used + space > 8168 || count == 291 {
+            pages += 1;
+            used = 0;
+            count = 0;
+        }
+        used += space;
+        count += 1;
+    }
+    pages
 }
 
 /// `estimate_num_groups` over one table with no statistics, of which the

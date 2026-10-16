@@ -553,6 +553,24 @@ type CompositeFields = Vec<(String, String)>;
 /// One enum as `(schema, bare_name, oid, labels)`.
 type EnumWithSchema = (String, String, i64, Vec<String>);
 
+/// What a grouping asks of the planner beyond its keys, for the choice
+/// between a HashAggregate and a Sort + Group (RP-028).
+struct GroupingShape {
+    /// A LIMIT with no ORDER BY.
+    limited: bool,
+    /// A GROUP BY, whose other columns a whole primary key makes redundant;
+    /// not a DISTINCT.
+    group_by: bool,
+    /// The aggregates' costs; `None` for a plain GROUP BY or a DISTINCT.
+    aggs: Option<secantus_pgplan::costsize::AggCosts>,
+    /// No aggregate has a DISTINCT or an ORDER BY of its own, which the
+    /// planner cannot hash.
+    can_hash: bool,
+    /// The ORDER BY over the group keys, `(group index, ascending, nulls
+    /// first)`; `None` when the sorted plan is not weighed at all.
+    order: Option<Vec<(usize, bool, bool)>>,
+}
+
 /// The session settings a row encoder needs, captured once per statement:
 /// pgwire may encode DataRows lazily on another worker thread, where the
 /// session state is not visible.
@@ -5525,17 +5543,47 @@ impl PgHandler {
             .map(|k| (k.field.clone(), k.pg_type.clone()))
             .collect();
         let limited = agg.limit.is_some() && agg.order.is_empty();
-        self.hash_agg_order_over(&agg.table, &agg.filter, limited, &key_cols, keys, rows)
+        use secantus_pgplan::AggFunc;
+        let finals = agg
+            .items
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i.func,
+                    AggFunc::Avg
+                        | AggFunc::VarSamp
+                        | AggFunc::VarPop
+                        | AggFunc::StddevSamp
+                        | AggFunc::StddevPop
+                )
+            })
+            .count();
+        let shape = GroupingShape {
+            limited,
+            group_by: true,
+            aggs: (!agg.items.is_empty())
+                .then(|| secantus_pgplan::costsize::AggCosts::simple(agg.items.len(), finals)),
+            can_hash: !agg.items.iter().any(|i| i.distinct || !i.order.is_empty()),
+            order: Some(
+                agg.order
+                    .iter()
+                    .map(|o| (o.group_index, o.ascending, matches!(o.nulls, Nulls::First)))
+                    .collect(),
+            ),
+        };
+        self.hash_agg_order_over(&agg.table, &agg.filter, &key_cols, keys, rows, &shape)
     }
 
-    /// PostgreSQL 15's HashAggregate order over `groups` (one key value per
-    /// column of `key_cols`, `(stored field, type)`) of `table`, read through
+    /// The order PostgreSQL 15 emits `groups` in (one key value per column
+    /// of `key_cols`, `(stored field, type)`) of `table`, read through
     /// `filter` (`rows` rows passed it): the planner's estimate of the rows
-    /// and groups for a table with no statistics, then
-    /// `hashagg::hash_agg_order`. `None` when the table is not a user table,
-    /// the WHERE has a clause `hashagg::filter_selectivity` does not model, a
-    /// key type is not hashed as PostgreSQL hashes it, or the estimate is
-    /// past PostgreSQL's hash memory.
+    /// and groups for a table with no statistics, then the plan it prices
+    /// cheaper (`costsize::sorted_grouping_wins`) -- a HashAggregate's order
+    /// (`hashagg::hash_agg_order`), or the keys sorted for a Sort + Group.
+    /// `None` when the table is not a user table, the WHERE has a clause
+    /// `hashagg::filter_selectivity` does not model, a key type is not
+    /// hashed as PostgreSQL hashes it, or the estimate is past PostgreSQL's
+    /// hash memory.
     ///
     /// A LIMIT with no ORDER BY over a key an index leads is declined until
     /// the planner's path comparison is modelled (RP-028): PostgreSQL reads
@@ -5545,13 +5593,13 @@ impl PgHandler {
         &self,
         table: &str,
         filter: &Document,
-        limited: bool,
         key_cols: &[(String, String)],
         keys: &[Vec<Option<Bson>>],
         rows: usize,
+        shape: &GroupingShape,
     ) -> Option<Vec<usize>> {
-        use secantus_pgplan::hashagg;
-        if limited {
+        use secantus_pgplan::{costsize, hashagg};
+        if shape.limited {
             let indexes = self
                 .storage
                 .list_indexes(self.db(), table)
@@ -5619,8 +5667,24 @@ impl PgHandler {
                 }
             }
         }
-        let stats: Vec<hashagg::KeyStat> = key_cols
+        // `remove_useless_groupby_columns`: a GROUP BY holding the whole
+        // primary key groups by that key alone.
+        let pk_fields: Vec<String> = pk.iter().map(|c| c.field()).collect();
+        let kept: Vec<usize> = if shape.group_by
+            && !pk_fields.is_empty()
+            && pk_fields
+                .iter()
+                .all(|f| key_cols.iter().any(|(k, _)| k == f))
+        {
+            (0..key_cols.len())
+                .filter(|&i| pk_fields.contains(&key_cols[i].0))
+                .collect()
+        } else {
+            (0..key_cols.len()).collect()
+        };
+        let stats: Vec<hashagg::KeyStat> = kept
             .iter()
+            .map(|&i| &key_cols[i])
             .map(|(field, pg_type)| {
                 if pg_type == "bool" {
                     hashagg::KeyStat::Bool
@@ -5639,7 +5703,8 @@ impl PgHandler {
                 .count_matching(self.db(), table, &Document::new(), None)
                 .ok()?
         };
-        let tuples = hashagg::table_rows(width, table_count as u64);
+        let (pages, tuples) =
+            hashagg::table_size(width, table_count as u64, self.heap_pages(table, &def));
         let read = if filter.is_empty() {
             tuples
         } else {
@@ -5664,12 +5729,245 @@ impl PgHandler {
         let groups = hashagg::estimate_groups(&stats, tuples, read);
         // `hash_mem` (work_mem 4MB x hash_mem_multiplier 2): past about
         // 50,000 groups the hash table would not fit and the planner
-        // compares a sort, which is not modelled.
+        // prices its spilling, which is not modelled.
         if groups > 50_000 {
             return None;
         }
-        let types: Vec<String> = key_cols.iter().map(|(_, t)| t.clone()).collect();
-        hashagg::hash_agg_order(keys, &types, groups)
+        // The group keys in the order the planner keeps them, which is the
+        // order a Sort + Group sorts by and a HashAggregate hashes in: an
+        // ORDER BY that is a prefix of them, or that they are a prefix of,
+        // moves its keys first in its directions (`preprocess_groupclause`);
+        // otherwise the GROUP BY's own order, ascending. `ordered` when the
+        // sorted plan's order then satisfies the whole ORDER BY.
+        let mut sort_keys: Vec<(usize, bool, bool)> = Vec::new();
+        let mut ordered = false;
+        if let Some(order) = shape.order.as_ref() {
+            let mut full = !order.is_empty();
+            for &(i, asc, nulls_first) in order {
+                if !kept.contains(&i) || sort_keys.iter().any(|k| k.0 == i) {
+                    full = false;
+                    break;
+                }
+                sort_keys.push((i, asc, nulls_first));
+            }
+            let rest: Vec<usize> = kept
+                .iter()
+                .copied()
+                .filter(|i| !sort_keys.iter().any(|k| k.0 == *i))
+                .collect();
+            if !full && !rest.is_empty() {
+                sort_keys.clear();
+                sort_keys.extend(kept.iter().map(|&i| (i, true, false)));
+            } else {
+                sort_keys.extend(rest.iter().map(|&i| (i, true, false)));
+            }
+            ordered = full;
+        }
+        // A WHERE the model cannot price keeps the hash.
+        let priced = || -> Option<bool> {
+            {
+                let quals = costsize::conjuncts(filter)?;
+                let rel = costsize::Rel { pages, tuples };
+                let indexes = self.cost_indexes(table, &def, table_count as u64);
+                let ndistinct = |field: &str| {
+                    if unique.iter().any(|u| u == field) {
+                        tuples
+                    } else if def
+                        .columns
+                        .iter()
+                        .any(|c| c.field() == field && c.pg_type == "bool")
+                    {
+                        2.0
+                    } else {
+                        tuples.min(200.0)
+                    }
+                };
+                let input = costsize::cheapest_scan(&rel, &indexes, &quals, &ndistinct, read);
+                Some(costsize::sorted_grouping_wins(
+                    input,
+                    read,
+                    groups as f64,
+                    kept.len(),
+                    shape.aggs,
+                    ordered,
+                ))
+            }
+        };
+        let sorted = !sort_keys.is_empty() && (!shape.can_hash || priced().unwrap_or(false));
+        if sorted {
+            let mut order: Vec<usize> = (0..keys.len()).collect();
+            order.sort_by(|&a, &b| {
+                for &(i, asc, nulls_first) in &sort_keys {
+                    let ord = match (&keys[a][i], &keys[b][i]) {
+                        (None, None) => Ordering::Equal,
+                        (None, Some(_)) if nulls_first => Ordering::Less,
+                        (None, Some(_)) => Ordering::Greater,
+                        (Some(_), None) if nulls_first => Ordering::Greater,
+                        (Some(_), None) => Ordering::Less,
+                        (Some(x), Some(y)) if asc => compare_values(x, y),
+                        (Some(x), Some(y)) => compare_values(x, y).reverse(),
+                    };
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                }
+                Ordering::Equal
+            });
+            return Some(order);
+        }
+        let hashed: Vec<usize> = if sort_keys.is_empty() {
+            kept.clone()
+        } else {
+            sort_keys.iter().map(|k| k.0).collect()
+        };
+        let types: Vec<String> = hashed.iter().map(|&i| key_cols[i].1.clone()).collect();
+        let kept_keys: Vec<Vec<Option<Bson>>> = keys
+            .iter()
+            .map(|k| hashed.iter().map(|&i| k[i].clone()).collect())
+            .collect();
+        hashagg::hash_agg_order(&kept_keys, &types, groups)
+    }
+
+    /// The pages PostgreSQL's heap would hold `table`'s rows in, freshly
+    /// inserted (`hashagg::heap_pages`); `None` when a column's type is one
+    /// whose stored size is not modelled (numeric, arrays, json).
+    fn heap_pages(&self, table: &str, def: &secantus_pgcatalog::TableDef) -> Option<u64> {
+        use secantus_pgplan::hashagg::{self, ColumnLayout};
+        let fact = |c: &secantus_pgcatalog::Column, name: &str| {
+            secantus_pgplan::pgtypes::oid_of_name(&c.pg_type)
+                .and_then(|oid| pg_type_facts::builtin(oid, name))
+        };
+        let layouts: Vec<ColumnLayout> = def
+            .columns
+            .iter()
+            .map(|c| {
+                let typlen = match fact(c, "typlen")? {
+                    Bson::Int32(n) => i64::from(n),
+                    Bson::Int64(n) => n,
+                    _ => return None,
+                };
+                let align = match fact(c, "typalign")?.as_str()? {
+                    "c" => 1,
+                    "s" => 2,
+                    "i" => 4,
+                    _ => 8,
+                };
+                let base = c.pg_type.trim_start_matches("pg_catalog.");
+                let sized = typlen > 0
+                    || matches!(
+                        base,
+                        "text" | "varchar" | "character varying" | "bpchar" | "character" | "bytea"
+                    );
+                sized.then(|| ColumnLayout {
+                    typlen,
+                    align,
+                    can_short: fact(c, "typstorage").and_then(|v| v.as_str().map(|s| s != "p"))
+                        == Some(true),
+                })
+            })
+            .collect::<Option<_>>()?;
+        let docs = self.table_docs(table).ok()?;
+        let mut spaces = Vec::with_capacity(docs.len());
+        for d in &docs {
+            let mut values = Vec::with_capacity(def.columns.len());
+            for c in &def.columns {
+                let v = match d.get(c.field()) {
+                    None | Some(Bson::Null) => None,
+                    Some(Bson::String(s)) => {
+                        let padded = matches!(
+                            c.pg_type.trim_start_matches("pg_catalog."),
+                            "bpchar" | "character"
+                        ) && c.typmod >= 4;
+                        let chars = s.chars().count();
+                        let pad = if padded {
+                            (c.typmod as usize - 4).saturating_sub(chars)
+                        } else {
+                            0
+                        };
+                        Some(s.len() + pad)
+                    }
+                    Some(Bson::Binary(b)) => Some(b.bytes.len()),
+                    Some(_) => Some(0),
+                };
+                values.push(v);
+            }
+            spaces.push(hashagg::heap_tuple_space(&layouts, &values));
+        }
+        Some(hashagg::heap_pages(spaces.into_iter()))
+    }
+
+    /// The B-tree indexes PostgreSQL would have on `table`, for the cost
+    /// model: the primary key, each UNIQUE constraint and each index, by
+    /// leading column, sized for `entries` rows (`costsize::btree_size`).
+    fn cost_indexes(
+        &self,
+        table: &str,
+        def: &secantus_pgcatalog::TableDef,
+        entries: u64,
+    ) -> Vec<secantus_pgplan::costsize::Index> {
+        use secantus_pgplan::costsize;
+        let width = |field: &str| {
+            def.columns
+                .iter()
+                .find(|c| c.field() == field)
+                .map(|c| {
+                    let typlen = secantus_pgplan::pgtypes::oid_of_name(&c.pg_type)
+                        .and_then(|oid| pg_type_facts::builtin(oid, "typlen"))
+                        .and_then(|v| match v {
+                            Bson::Int32(n) => Some(i64::from(n)),
+                            Bson::Int64(n) => Some(n),
+                            _ => None,
+                        })
+                        .unwrap_or(-1);
+                    secantus_pgplan::hashagg::type_avg_width(&c.pg_type, c.typmod, typlen)
+                })
+                .unwrap_or(32)
+        };
+        let mut out: Vec<costsize::Index> = Vec::new();
+        let mut add = |fields: Vec<String>, unique: bool| {
+            let Some(first) = fields.first().cloned() else {
+                return;
+            };
+            let key_width: i64 = fields.iter().map(|f| width(f)).sum();
+            let (pages, height) = costsize::btree_size(entries, key_width);
+            out.push(costsize::Index {
+                field: first,
+                unique: unique && fields.len() == 1,
+                pages,
+                height,
+            });
+        };
+        let pk: Vec<String> = def
+            .columns
+            .iter()
+            .filter(|c| c.pk)
+            .map(|c| c.field())
+            .collect();
+        add(pk, true);
+        for u in &def.unique_constraints {
+            let fields: Vec<String> = u
+                .columns
+                .iter()
+                .filter_map(|n| def.column(n).map(|c| c.field()))
+                .collect();
+            add(fields, true);
+        }
+        for ix in self
+            .storage
+            .list_indexes(self.db(), table)
+            .unwrap_or_default()
+        {
+            let unique = ix
+                .get_document("options")
+                .ok()
+                .and_then(|o| o.get_bool("unique").ok())
+                .or_else(|| ix.get_bool("unique").ok())
+                .unwrap_or(false);
+            if let Ok(key) = ix.get_document("key") {
+                add(key.keys().cloned().collect(), unique);
+            }
+        }
+        out
     }
 
     /// The grouped rows' ORDER BY, HAVING, DISTINCT, OFFSET and LIMIT.
@@ -26776,7 +27074,16 @@ impl PgHandler {
             };
             if let Some(order) = key_cols.and_then(|cols| {
                 let limited = sel.limit.is_some() && sel.order.is_empty();
-                self.hash_agg_order_over(&sel.table, &sel.filter, limited, &cols, &kept_keys, rows)
+                // With an ORDER BY the DISTINCT's own sort follows it, which
+                // is not modelled: the hash order is kept there.
+                let shape = GroupingShape {
+                    limited,
+                    group_by: false,
+                    aggs: None,
+                    can_hash: true,
+                    order: sel.order.is_empty().then(Vec::new),
+                };
+                self.hash_agg_order_over(&sel.table, &sel.filter, &cols, &kept_keys, rows, &shape)
             }) {
                 let mut slots: Vec<Option<Document>> = kept.into_iter().map(Some).collect();
                 kept = order.into_iter().filter_map(|i| slots[i].take()).collect();

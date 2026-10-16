@@ -17,6 +17,7 @@ pub mod acl;
 mod agg_hoist;
 mod agg_support;
 mod cmpfn;
+pub mod costsize;
 mod expr_where;
 mod filter_sublink;
 pub mod hashagg;
