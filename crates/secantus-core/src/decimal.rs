@@ -2796,7 +2796,7 @@ fn is_sign_negative(d: &Dec) -> bool {
 }
 
 /// Whether a finite decimal is a whole number (`2.0`, `2E+3`, `-0`).
-fn is_integral(d: &Dec) -> bool {
+pub(crate) fn is_integral(d: &Dec) -> bool {
     let Dec::Fin { coeff, exp, .. } = d else {
         return false;
     };

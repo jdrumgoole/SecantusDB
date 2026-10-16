@@ -233,13 +233,6 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **`$dateFromParts` accepts an out-of-range `month` and answers a
-  wrong date.** `{$dateFromParts: {year: 2017, month: 40000}}` returns
-  5350-04-01 here; mongod 8.2.11 refuses it with 31034 (`'month' must
-  evaluate to a value in the range [-32768, 32767]`). The other fields'
-  ranges have not been checked. Found 2026-10-14.
-  Backlog-ID: RM-139
-  Verify: tests/backlog/test_rm_found_2026_10_14.py::test_date_from_parts_month_out_of_range_is_refused
 - [ ] **`saslStart` for a user that does not exist continues the
   conversation.** mongod 8.2.11 fails the first step with 18
   `Authentication failed.`; this server answers `ok: 1, done: false` and
@@ -1872,18 +1865,6 @@ Rust-only driver-gauge failures that are deliberately not chased:
   8.2.11 first.
   Backlog-ID: RM-124
   Verify: tests/backlog/test_rm_113_138.py::test_to_hashed_index_key
-- [ ] **A deferred error path answers a generic `BadValue` (2) instead of
-  mongod's code on the Rust server.** Where the Rust core returns
-  `Fallback::Defer` on an error path, there is no Python behind it on the Rust
-  server, so the client gets code 2 where the Python server raises mongod's
-  Location code. Remaining examples: `$dateFromParts` component errors in
-  `crates/secantus-core/src/expressions.rs` (`dfp_comp` and neighbours — the
-  comments name Python's 40515 / 40516 / 40523). The worked template for closing
-  a family is a standalone validator beside the operator
-  (`update::arith_type_error`, `query::json_schema_keyword_error`) plus one arm
-  in the adapter's code table, rather than widening `Fallback`.
-  Backlog-ID: RM-126
-  Verify: tests/backlog/test_rm_113_138.py::test_date_from_parts_error_codes
 - [ ] **A DBPointer operand to the `$min` / `$max` UPDATE operators
   defers on the Rust server** (so it is an error there; mongod treats it as
   a no-op). A DBPointer nested in a range operand already matches.

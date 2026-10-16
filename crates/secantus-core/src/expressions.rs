@@ -4231,6 +4231,7 @@ fn date_operand_millis(arg: &Bson, ctx: &Ctx) -> Result<Option<i64>, Fallback> {
     if let Bson::Document(d) = arg {
         let is_operator = d.len() == 1 && d.keys().next().is_some_and(|k| k.starts_with('$'));
         if let (Some(date_expr), false) = (d.get("date"), is_operator) {
+            precheck_constant_timezone(d, ctx, None)?;
             let value = eval(date_expr, ctx)?;
             if matches!(value, Bson::Null) {
                 return Ok(None); // null / missing -> null
@@ -4239,7 +4240,11 @@ fn date_operand_millis(arg: &Bson, ctx: &Ctx) -> Result<Option<i64>, Fallback> {
             let Some(millis) = timestamp_bearing_millis(&value) else {
                 return Err(date_convert_error(date_expr, &value, ctx));
             };
-            let offset_ms = timezone_offset_ms(d.get("timezone"), millis)?;
+            let tz = eval_timezone(d.get("timezone"), ctx, None)?;
+            if matches!(tz, TzArg::Null) {
+                return Ok(None); // a null zone -> null
+            }
+            let offset_ms = timezone_offset_ms(tz.as_spec(), millis)?;
             return Ok(Some(millis + offset_ms));
         }
     }
@@ -4591,6 +4596,7 @@ fn timelib_zone_adjustment(zone: chrono_tz::Tz, sse: i64, dst: bool) -> i64 {
 fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
     // ExpressionDateFromString::evaluate, in mongod's order.
     let spec = arg.as_document().ok_or(Fallback::Defer)?;
+    precheck_constant_timezone(spec, ctx, None)?;
     let date_string = match spec.get("dateString") {
         Some(e) => eval(e, ctx)?,
         None => Bson::Null,
@@ -4620,26 +4626,13 @@ fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
     }
     // The zone is resolved next: an unknown one is an error even for a
     // nullish dateString, and onError does not catch it.
-    let tz_value = match spec.get("timezone") {
-        None => None,
-        Some(e) => Some(eval(e, ctx)?),
-    };
-    let tz = match &tz_value {
-        None => Some(MongoTz::Utc),
-        Some(Bson::Null | Bson::Undefined) => None,
-        Some(t @ Bson::String(_)) => Some(mongo_tz(Some(t)).map_err(|e| match e {
+    let tz = match eval_timezone(spec.get("timezone"), ctx, None)? {
+        TzArg::Absent => Some(MongoTz::Utc),
+        TzArg::Null => None,
+        TzArg::Zone(t) => Some(mongo_tz(Some(&t)).map_err(|e| match e {
             FreeFormError::Other(f) => f,
             FreeFormError::Conversion(m) => Fallback::mongo(241, m),
         })?),
-        Some(other) => {
-            return Err(Fallback::mongo(
-                40517,
-                format!(
-                    "timezone must evaluate to a string, found {}",
-                    type_name(other)
-                ),
-            ))
-        }
     };
     if matches!(date_string, Bson::Null | Bson::Undefined) {
         return match spec.get("onNull") {
@@ -4693,6 +4686,7 @@ fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
 /// `%Y` padding differs), or a non-string `format`.
 fn op_date_to_string(arg: &Bson, ctx: &Ctx) -> R {
     let spec = arg.as_document().ok_or(Fallback::Defer)?;
+    precheck_constant_timezone(spec, ctx, None)?;
     let millis = match eval(spec.get("date").ok_or(Fallback::Defer)?, ctx)? {
         Bson::DateTime(dt) => dt.timestamp_millis(),
         Bson::Null => return Ok(Bson::Null), // null date -> null
@@ -4701,9 +4695,17 @@ fn op_date_to_string(arg: &Bson, ctx: &Ctx) -> R {
     // A `timezone` shifts the wall clock before rendering (naive input is UTC,
     // matching BSON Date semantics); see `timezone_offset_ms` for the fixed-offset
     // vs named-zone resolution.
-    let tz_offset = timezone_offset_ms(spec.get("timezone"), millis)?;
+    let tz = eval_timezone(spec.get("timezone"), ctx, None)?;
+    if matches!(tz, TzArg::Null) {
+        return Ok(Bson::Null);
+    }
+    let tz_offset = timezone_offset_ms(tz.as_spec(), millis)?;
     let fmt = match spec.get("format") {
-        None => "%Y-%m-%dT%H:%M:%S.%LZ",
+        // The default format ends in `Z` only for UTC itself -- no zone,
+        // `UTC` or a zero offset. `GMT` and every named zone print without
+        // it, whatever their offset (probed 8.2.11, 2026-10-16).
+        None if matches!(mongo_tz(tz.as_spec()), Ok(MongoTz::Utc)) => "%Y-%m-%dT%H:%M:%S.%LZ",
+        None => "%Y-%m-%dT%H:%M:%S.%L",
         Some(Bson::String(s)) => s.as_str(),
         Some(_) => return Err(Fallback::Defer), // Python raises "format must be a string"
     };
@@ -4840,22 +4842,18 @@ fn render_date_at(millis: i64, fmt: &str, offset_ms: i64) -> Result<String, Fall
 fn resolve_tz_offset(name: &str) -> Option<i64> {
     match name {
         "UTC" | "GMT" | "Etc/UTC" | "Etc/GMT" => Some(0),
+        // One parser for a fixed offset, `$dateFromString`'s: mongod takes
+        // `+HH`, `+HHMM` and `+HH:MM` with no range check, so `+05`, `+24:00`
+        // and `+05:60` are all zones (probed 8.2.11, 2026-10-16). This used to
+        // take only four digits up to 23:59, and refused the rest as unknown.
         _ if name.starts_with(['+', '-']) => {
-            let sign = if name.starts_with('-') { -1 } else { 1 };
-            let digits: String = name[1..].chars().filter(|c| *c != ':').collect();
-            if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
-                return None; // malformed -> defer (Python raises)
+            match mongo_tz(Some(&Bson::String(name.to_string()))) {
+                Ok(MongoTz::Utc) => Some(0),
+                Ok(MongoTz::Offset(secs)) => Some(secs / 60),
+                _ => None,
             }
-            let hh: i64 = digits[..2].parse().ok()?;
-            let mm: i64 = digits[2..].parse().ok()?;
-            // Python's datetime.timezone rejects a magnitude >= 24h; defer those
-            // (and any out-of-range minute) so the oracle decides.
-            if hh > 23 || mm > 59 {
-                return None;
-            }
-            Some(sign * (hh * 60 + mm))
         }
-        _ => None, // named zone -> defer
+        _ => None, // a named zone
     }
 }
 
@@ -4880,11 +4878,12 @@ fn resolve_tz_offset(name: &str) -> Option<i64> {
 /// argument to a supported one.
 fn tz_error(name: &str, operator: Option<&str>) -> Fallback {
     let base = format!("unrecognized time zone identifier: \"{name}\"");
-    // Folded, always: mongod parses a LITERAL `timezone` while optimizing the
-    // pipeline, whether or not the rest of the expression is constant. So
-    // `{$hour: {date: "$d", timezone: "Not/AZone"}}` -- which reads the
-    // document and therefore does not fold -- still reports under the
-    // optimizer's prefix (probed 8.2.11).
+    // Folded by default: mongod parses a CONSTANT `timezone` while
+    // optimizing the pipeline, whether or not the rest of the expression is
+    // constant. So `{$hour: {date: "$d", timezone: "Not/AZone"}}` -- which
+    // reads the document and therefore does not fold -- still reports under
+    // the optimizer's prefix (probed 8.2.11). `eval_timezone` restamps the
+    // verdict for a zone computed from the document.
     match operator {
         None => Fallback::mongo(40485, base),
         Some(op) => Fallback::mongo(
@@ -4895,19 +4894,89 @@ fn tz_error(name: &str, operator: Option<&str>) -> Fallback {
     .with_folded(true)
 }
 
-/// Reject an unusable `timezone` before doing any work, so the message names
-/// the operator that was parsing it.
-fn validate_timezone(tz: Option<&Bson>, operator: Option<&str>) -> Result<(), Fallback> {
-    match tz {
-        None | Some(Bson::Null) => Ok(()),
-        Some(Bson::String(s)) => {
-            if resolve_tz_offset(s).is_some() || s.parse::<chrono_tz::Tz>().is_ok() {
-                Ok(())
+/// A date operator's `timezone` argument, evaluated.
+///
+/// The argument is an EXPRESSION, like every other operand: `{timezone:
+/// "$tz"}` reads the zone from the document. It used to be read as the
+/// literal text, so `"$tz"` was an unknown zone and every such query failed
+/// (found 2026-10-16, all ten date operators).
+enum TzArg {
+    /// No `timezone`: UTC.
+    Absent,
+    /// It evaluated to null or missing: the operator answers null.
+    Null,
+    /// A zone mongod recognises, as a `Bson::String`.
+    Zone(Bson),
+}
+
+impl TzArg {
+    fn as_spec(&self) -> Option<&Bson> {
+        match self {
+            TzArg::Zone(z) => Some(z),
+            _ => None,
+        }
+    }
+}
+
+/// Whether `timezone` is a constant expression. mongod parses a constant
+/// zone while optimizing the pipeline, so its errors carry the optimizer's
+/// wrapper and win over anything the document would raise (probed 8.2.11:
+/// `{$hour: {date: "$n", timezone: 5}}` fails for a null `n`, while
+/// `{$hour: {date: "$n", timezone: "$tz"}}` answers null).
+fn timezone_is_constant(expr: &Bson, ctx: &Ctx) -> bool {
+    crate::aggregate::is_constant_expression(expr, &ctx.vars.keys().cloned().collect::<Vec<_>>())
+}
+
+/// Evaluate and check a `timezone` argument: mongod's `makeTimeZone`. A
+/// nullish value is `Null`; a non-string is 40517 and an unknown zone 40485,
+/// each under `operator`'s "parameter 'timezone' value parsing failed"
+/// prefix for `$dateTrunc` / `$dateDiff` (probed 8.2.11, 2026-10-16).
+fn eval_timezone(
+    expr: Option<&Bson>,
+    ctx: &Ctx,
+    operator: Option<&str>,
+) -> Result<TzArg, Fallback> {
+    let Some(expr) = expr else {
+        return Ok(TzArg::Absent);
+    };
+    let folded = timezone_is_constant(expr, ctx);
+    match eval(expr, ctx)? {
+        Bson::Null | Bson::Undefined => Ok(TzArg::Null),
+        Bson::String(s) => {
+            if resolve_tz_offset(&s).is_some() || s.parse::<chrono_tz::Tz>().is_ok() {
+                Ok(TzArg::Zone(Bson::String(s)))
             } else {
-                Err(tz_error(s, operator))
+                Err(tz_error(&s, operator).with_folded(folded))
             }
         }
-        Some(_) => Err(Fallback::Defer), // Python raises 40517 "must evaluate to a string"
+        other => {
+            let base = format!(
+                "timezone must evaluate to a string, found {}",
+                type_name(&other)
+            );
+            let message = match operator {
+                None => base,
+                Some(op) => {
+                    format!("{op} parameter 'timezone' value parsing failed :: caused by :: {base}")
+                }
+            };
+            Err(Fallback::mongo(40517, message).with_folded(folded))
+        }
+    }
+}
+
+/// Check a CONSTANT `timezone` before the operator reads anything else, as
+/// mongod does at parse time; a computed one is left for [`eval_timezone`].
+fn precheck_constant_timezone(
+    d: &Document,
+    ctx: &Ctx,
+    operator: Option<&str>,
+) -> Result<(), Fallback> {
+    match d.get("timezone") {
+        Some(e) if timezone_is_constant(e, ctx) => {
+            eval_timezone(Some(e), ctx, operator).map(|_| ())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -4929,9 +4998,8 @@ fn named_tz_offset_ms(name: &str, utc_millis: i64) -> Option<i64> {
 /// (`$dateToString`, the `{date, timezone}` extractors, `$dateToParts`). Absent /
 /// `null` timezone → 0 (UTC), matching Python's `_resolve_timezone(None)`; a
 /// fixed-offset (`±HH:MM` / `UTC` / `GMT`) is constant; a named IANA zone resolves
-/// its DST-correct offset at the instant via `chrono-tz`. An unknown zone name or a
-/// non-string timezone → `Fallback` (defer to the Python oracle, which resolves it
-/// or raises). This is *not* used by `$dateFromString`, whose named-zone
+/// its DST-correct offset at the instant via `chrono-tz`. The callers pass a zone
+/// [`eval_timezone`] has already evaluated and checked. This is *not* used by `$dateFromString`, whose named-zone
 /// (local→instant) direction is DST-ambiguous and deliberately defers.
 fn timezone_offset_ms(tz: Option<&Bson>, utc_millis: i64) -> Result<i64, Fallback> {
     match tz {
@@ -4997,6 +5065,7 @@ fn op_date_add(arg: &Bson, ctx: &Ctx, sign: i128) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback::Defer);
     };
+    precheck_constant_timezone(d, ctx, None)?;
     let start = eval_opt(d.get("startDate"), ctx)?;
     let amount_v = eval_opt(d.get("amount"), ctx)?;
     if is_null(&start) || is_null(&amount_v) {
@@ -5015,10 +5084,13 @@ fn op_date_add(arg: &Bson, ctx: &Ctx, sign: i128) -> R {
     // noon Eastern, which is 23 real hours across a spring-forward. The
     // timezone was ignored outright, so every such shift was an hour out.
     // Sub-day units are absolute, which is why +24 `hour` differs from +1 `day`.
-    let tz = d.get("timezone");
     // `None`: only `$dateTrunc` and `$dateDiff` name the parameter in the
     // failure message; `$dateAdd` / `$dateSubtract` report it bare.
-    validate_timezone(tz, None)?;
+    let tz = eval_timezone(d.get("timezone"), ctx, None)?;
+    if matches!(tz, TzArg::Null) {
+        return Ok(Bson::Null);
+    }
+    let tz = tz.as_spec();
     let millis = start_dt.timestamp_millis();
     if tz.is_none() || matches!(tz, Some(Bson::Null)) || subday_unit_ms(&unit).is_some() {
         return shift_date(millis, &unit, sign * amount);
@@ -5037,6 +5109,7 @@ fn op_date_diff(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback::Defer);
     };
+    precheck_constant_timezone(d, ctx, Some("$dateDiff"))?;
     // A missing required *parameter* (key absent) is a mongod parse error
     // (Location5166303/4/5) -> Python raises; a present-but-null one yields null.
     for param in ["startDate", "endDate", "unit"] {
@@ -5060,8 +5133,11 @@ fn op_date_diff(arg: &Bson, ctx: &Ctx) -> R {
     // implementation of the calendar. The timezone used to be ignored entirely
     // and the calendar units computed "whole units elapsed": 02:00Z to 23:00Z
     // answered 0 days where New York answers 1.
-    let tz = d.get("timezone");
-    validate_timezone(tz, Some("$dateDiff"))?;
+    let tz = eval_timezone(d.get("timezone"), ctx, Some("$dateDiff"))?;
+    if matches!(tz, TzArg::Null) {
+        return Ok(Bson::Null);
+    }
+    let tz = tz.as_spec();
     let start_of_week = match start_of_week_arg("$dateDiff", d, ctx)? {
         StartOfWeek::Null => return Ok(Bson::Null),
         StartOfWeek::Absent => None,
@@ -5251,6 +5327,7 @@ fn op_date_trunc(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback::Defer);
     };
+    precheck_constant_timezone(d, ctx, Some("$dateTrunc"))?;
     let date = eval_opt(d.get("date"), ctx)?;
     if is_null(&date) {
         return Ok(Bson::Null);
@@ -5269,8 +5346,11 @@ fn op_date_trunc(arg: &Bson, ctx: &Ctx) -> R {
         },
         None => 1,
     };
-    let tz = d.get("timezone");
-    validate_timezone(tz, Some("$dateTrunc"))?;
+    let tz = eval_timezone(d.get("timezone"), ctx, Some("$dateTrunc"))?;
+    if matches!(tz, TzArg::Null) {
+        return Ok(Bson::Null);
+    }
+    let tz = tz.as_spec();
     let start_of_week = match start_of_week_arg("$dateTrunc", d, ctx)? {
         StartOfWeek::Null => return Ok(Bson::Null),
         StartOfWeek::Absent => None,
@@ -7247,13 +7327,18 @@ fn op_date_to_parts(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback::Defer);
     };
+    precheck_constant_timezone(d, ctx, None)?;
     match eval_opt(d.get("date"), ctx)? {
         Bson::Null => Ok(Bson::Null),
         Bson::DateTime(dt) => {
             // A `timezone` shifts the instant into that zone before the parts are
             // read (instant→wall-clock, unambiguous); absent/UTC leaves it in UTC.
             let base = dt.timestamp_millis();
-            let millis = base + timezone_offset_ms(d.get("timezone"), base)?;
+            let tz = eval_timezone(d.get("timezone"), ctx, None)?;
+            if matches!(tz, TzArg::Null) {
+                return Ok(Bson::Null);
+            }
+            let millis = base + timezone_offset_ms(tz.as_spec(), base)?;
             let days = millis.div_euclid(86_400_000);
             let ms = millis.rem_euclid(86_400_000);
             let (y, m, dy) = civil_from_days(days);
@@ -7289,37 +7374,67 @@ fn op_date_to_parts(arg: &Bson, ctx: &Ctx) -> R {
     }
 }
 
-/// A `$dateFromParts` component as an `i64`, or `None` (defer — Python raises
-/// `Location40515`) for a non-integral / non-numeric value. Integral doubles are
-/// accepted; bool is not.
+/// A `$dateFromParts` component as an `i64`: an integral int, long, double or
+/// decimal that fits 64 bits, as mongod's `integral64Bit()` reads it. `None`
+/// for anything else (bool, a fractional or non-finite number, a string...).
 fn dfp_int(v: &Bson) -> Option<i64> {
     match v {
         Bson::Int32(x) => Some(*x as i64),
         Bson::Int64(x) => Some(*x),
-        Bson::Double(x) if x.is_finite() && x.fract() == 0.0 => Some(*x as i64),
+        Bson::Double(x) if x.is_finite() && x.fract() == 0.0 && x.abs() < 9.2e18 => Some(*x as i64),
+        Bson::Decimal128(_) => {
+            let d = crate::decimal::from_bson(v)?;
+            if crate::decimal::is_integral(&d) {
+                crate::decimal::trunc_to_i64(&d)
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
 
-/// `$dateFromParts`: build a date from calendar components with mongod's rollover
-/// (month 13 → next January, day 0 → last of previous month, …). Components default
-/// to month/day = 1 and time = 0; any null component → null. `year` is required and
-/// in 1-9999. A fixed-offset `timezone` interprets the components as local time
-/// (local→instant, `utc = local - offset`). Everything Python raises on — a missing
-/// / out-of-range `year`, a non-integral component, the ISO-week form — and a
-/// *named* `timezone` (DST-ambiguous local→instant) defers to Python. Mirrors the
-/// pure `_op_date_from_parts`.
-/// Read a `$dateFromParts` component: absent → `default`; null → `Ok(None)` (the
-/// caller returns null); non-integral → `Fallback` (Python raises 40515). Integral
-/// doubles accepted.
-fn dfp_comp(d: &Document, name: &str, default: i64, ctx: &Ctx) -> Result<Option<i64>, Fallback> {
-    match d.get(name) {
-        None => Ok(Some(default)),
-        Some(e) => match eval(e, ctx)? {
-            Bson::Null => Ok(None),
-            v => Ok(Some(dfp_int(&v).ok_or(Fallback::Defer)?)),
-        },
+/// Read one `$dateFromParts` component, as mongod's
+/// `evaluateNumberWithDefault[AndBounds]`: absent -> `default`; nullish ->
+/// `Ok(None)` (the operator answers null); not an integer -> 40515; and, for a
+/// `bounded` component, outside a 16-bit range -> 31034 (probed 8.2.11,
+/// 2026-10-16: month, day, hour, minute, isoWeek and isoDayOfWeek are
+/// bounded; year and isoWeekYear have their own range check, and second and
+/// millisecond none at all).
+fn dfp_comp(
+    d: &Document,
+    name: &str,
+    default: i64,
+    bounded: bool,
+    ctx: &Ctx,
+) -> Result<Option<i64>, Fallback> {
+    let Some(e) = d.get(name) else {
+        return Ok(Some(default));
+    };
+    let v = eval(e, ctx)?;
+    if matches!(v, Bson::Null | Bson::Undefined) {
+        return Ok(None);
     }
+    let Some(n) = dfp_int(&v) else {
+        return Err(Fallback::mongo(
+            40515,
+            format!(
+                "'{name}' must evaluate to an integer, found {} with value {}",
+                type_name(&v),
+                crate::aggregate::render_value_compact(&v)
+            ),
+        ));
+    };
+    if bounded && !(-32768..=32767).contains(&n) {
+        return Err(Fallback::mongo(
+            31034,
+            format!(
+                "'{name}' must evaluate to a value in the range [-32768, 32767]; \
+                 value {n} is not in range"
+            ),
+        ));
+    }
+    Ok(Some(n))
 }
 
 /// Days since 1970-01-01 of the Monday of ISO week 1 of `iso_year`, via `chrono`.
@@ -7337,59 +7452,76 @@ fn op_date_from_parts(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback::Defer);
     };
-    // Shared time components (any null -> null).
+    precheck_constant_timezone(d, ctx, None)?;
+    // mongod's `ExpressionDateFromParts::evaluate`, in its order (probed
+    // 8.2.11, 2026-10-16): the time of day, then the zone, then the date --
+    // and a null anywhere answers null, short-circuiting what follows it, so
+    // `{year: null, month: "x"}` is null while `{month: null, hour: "x"}` is
+    // the hour's error.
     macro_rules! comp {
-        ($name:literal, $default:literal) => {
-            match dfp_comp(d, $name, $default, ctx)? {
+        ($name:literal, $default:literal, $bounded:literal) => {
+            match dfp_comp(d, $name, $default, $bounded, ctx)? {
                 Some(v) => v,
                 None => return Ok(Bson::Null),
             }
         };
     }
-    let hour = comp!("hour", 0);
-    let minute = comp!("minute", 0);
-    let second = comp!("second", 0);
-    let ms = comp!("millisecond", 0);
-    let is_iso = d.contains_key("isoWeekYear")
-        || d.contains_key("isoWeek")
-        || d.contains_key("isoDayOfWeek");
-    let total_days = if is_iso {
-        if !d.contains_key("isoWeekYear") {
-            return Err(Fallback::Defer); // Python raises 40516
+    let hour = comp!("hour", 0, true);
+    let minute = comp!("minute", 0, true);
+    let second = comp!("second", 0, false);
+    let ms = comp!("millisecond", 0, false);
+    let tz = match eval_timezone(d.get("timezone"), ctx, None)? {
+        TzArg::Null => return Ok(Bson::Null),
+        tz => tz,
+    };
+    let total_days = if d.contains_key("year") {
+        let year = comp!("year", 1970, false);
+        let month = comp!("month", 1, true);
+        let day = comp!("day", 1, true);
+        if !(1..=9999).contains(&year) {
+            return Err(Fallback::mongo(
+                40523,
+                format!("'year' must evaluate to an integer in the range 1 to 9999, found {year}"),
+            ));
         }
-        let iso_year = comp!("isoWeekYear", 0);
-        let iso_week = comp!("isoWeek", 1);
-        let iso_dow = comp!("isoDayOfWeek", 1);
+        // Rollover is mongod's: month 13 is the next January, day 0 the last
+        // of the month before, and the result may leave 1..9999 (`{year:
+        // 9999, month: 13}` is a date in 10000).
+        let total_months = year * 12 + (month - 1);
+        days_from_civil(
+            total_months.div_euclid(12),
+            total_months.rem_euclid(12) + 1,
+            1,
+        ) + (day - 1)
+    } else if d.contains_key("isoWeekYear") {
+        let iso_year = comp!("isoWeekYear", 1970, false);
+        let iso_week = comp!("isoWeek", 1, true);
+        let iso_dow = comp!("isoDayOfWeek", 1, true);
         if !(1..=9999).contains(&iso_year) {
-            return Err(Fallback::Defer);
+            return Err(Fallback::mongo(
+                31095,
+                format!(
+                    "'isoWeekYear' must evaluate to an integer in the range 1 to 9999, found {iso_year}"
+                ),
+            ));
         }
         iso_week1_monday_days(iso_year).ok_or(Fallback::Defer)? + (iso_week - 1) * 7 + (iso_dow - 1)
     } else {
-        if !d.contains_key("year") {
-            return Err(Fallback::Defer); // Python raises 40516
-        }
-        let year = comp!("year", 0);
-        let month = comp!("month", 1);
-        let day = comp!("day", 1);
-        if !(1..=9999).contains(&year) {
-            return Err(Fallback::Defer); // Python raises 40523
-        }
-        let total_months = year * 12 + (month - 1);
-        let base_year = total_months.div_euclid(12);
-        let base_month = total_months.rem_euclid(12) + 1;
-        if !(1..=9999).contains(&base_year) {
-            return Err(Fallback::Defer); // rollover pushed the year out of range -> Python
-        }
-        days_from_civil(base_year, base_month, 1) + (day - 1)
+        // A parse error mongod raises before evaluation (40516); the command
+        // layer's argument check reports it, so this is unreachable there.
+        return Err(Fallback::Defer);
     };
-    let mut millis =
-        total_days * 86_400_000 + hour * 3_600_000 + minute * 60_000 + second * 1_000 + ms;
+    let local = (|| {
+        total_days
+            .checked_mul(86_400_000)?
+            .checked_add(hour * 3_600_000 + minute * 60_000)?
+            .checked_add(second.checked_mul(1_000)?)?
+            .checked_add(ms)
+    })()
+    .ok_or(Fallback::Defer)?;
     // The parts ARE a local wall clock, so this is the wall-clock -> instant
-    // direction. A named IANA zone used to defer here, which on the standalone
-    // server is an error -- `chrono-tz` was already a dependency and already
-    // bundled the database, but only the instant -> wall-clock direction had
-    // been wired up.
-    millis = tz_instant_from_local_ms(d.get("timezone"), millis)?;
+    // direction.
+    let millis = tz_instant_from_local_ms(tz.as_spec(), local)?;
     Ok(Bson::DateTime(bson::DateTime::from_millis(millis)))
 }
 
@@ -8548,7 +8680,7 @@ mod tests {
             .unwrap(),
             Bson::DateTime(bson::DateTime::from_millis(1_672_549_200_000))
         );
-        // Non-integral, missing year, out-of-range year -> defer.
+        // Non-integral, missing year, out-of-range year -> an error.
         for bad in [
             bson::bson!({"$dateFromParts": {"year": 2023, "month": 6.5}}),
             bson::bson!({"$dateFromParts": {"month": 6}}),
@@ -8556,6 +8688,175 @@ mod tests {
         ] {
             assert!(evaluate(&doc! {}, &bad, &Document::new()).is_err());
         }
+    }
+
+    /// The code and message `spec` fails with; mongod 8.2.11's are in the
+    /// callers (probed 2026-10-16, RM-139 / RM-126).
+    fn dfp_error(d: Document, spec: Bson) -> (i32, String) {
+        let e = evaluate(&d, &bson::bson!({"$dateFromParts": spec}), &Document::new()).unwrap_err();
+        let (code, msg) = e.as_mongo().expect("a mongod error, not a defer");
+        (code, msg.to_string())
+    }
+
+    #[test]
+    fn date_from_parts_errors_are_mongods() {
+        let (c, m) = dfp_error(doc! {}, bson::bson!({"year": 2017, "month": 40000}));
+        assert_eq!(c, 31034);
+        assert_eq!(
+            m,
+            "'month' must evaluate to a value in the range [-32768, 32767]; value 40000 is not in range"
+        );
+        for part in ["day", "hour", "minute"] {
+            let mut spec = doc! {"year": 2017};
+            spec.insert(part, -32769);
+            assert_eq!(dfp_error(doc! {}, Bson::Document(spec)).0, 31034, "{part}");
+        }
+        let (c, m) = dfp_error(doc! {}, bson::bson!({"year": 1, "month": "x"}));
+        assert_eq!(
+            (c, m.as_str()),
+            (
+                40515,
+                "'month' must evaluate to an integer, found string with value \"x\""
+            )
+        );
+        assert_eq!(dfp_error(doc! {}, bson::bson!({"year": true})).0, 40515);
+        let (c, m) = dfp_error(doc! {}, bson::bson!({"year": 0}));
+        assert_eq!(
+            (c, m.as_str()),
+            (
+                40523,
+                "'year' must evaluate to an integer in the range 1 to 9999, found 0"
+            )
+        );
+        assert_eq!(
+            dfp_error(doc! {}, bson::bson!({"isoWeekYear": 10000})).0,
+            31095
+        );
+        assert_eq!(
+            dfp_error(
+                doc! {},
+                bson::bson!({"isoWeekYear": 2017, "isoWeek": 40000})
+            )
+            .0,
+            31034
+        );
+        let (c, m) = dfp_error(doc! {}, bson::bson!({"year": 1, "timezone": 5}));
+        assert_eq!(
+            (c, m.as_str()),
+            (40517, "timezone must evaluate to a string, found int")
+        );
+    }
+
+    #[test]
+    fn date_from_parts_follows_mongods_evaluation_order() {
+        let ev = |spec: Bson| {
+            evaluate(
+                &doc! {"n": Bson::Null},
+                &bson::bson!({"$dateFromParts": spec}),
+                &Document::new(),
+            )
+        };
+        // A null year short-circuits the month's type error ...
+        assert_eq!(
+            ev(bson::bson!({"year": "$n", "month": "x"})).unwrap(),
+            Bson::Null
+        );
+        // ... but the time of day is read first, so the hour's error wins
+        // over a null month.
+        assert_eq!(
+            dfp_error(
+                doc! {"n": Bson::Null},
+                bson::bson!({"year": 2000, "month": "$n", "hour": "x"})
+            )
+            .0,
+            40515
+        );
+        // The zone is read before the date.
+        assert_eq!(
+            dfp_error(
+                doc! {},
+                bson::bson!({"year": 2000, "month": "x", "timezone": "Bad/Zone"})
+            )
+            .0,
+            40485
+        );
+        // A month type error beats the year's range check.
+        assert_eq!(
+            dfp_error(doc! {}, bson::bson!({"year": 0, "month": "x"})).0,
+            40515
+        );
+        // second and millisecond are unbounded; a decimal is an integer.
+        assert!(ev(bson::bson!({"year": 2017, "second": 40000, "millisecond": 40000})).is_ok());
+        assert_eq!(
+            ev(bson::bson!({"year": Bson::Decimal128("6".parse().unwrap())})).unwrap(),
+            Bson::DateTime(bson::DateTime::from_millis(
+                days_from_civil(6, 1, 1) * 86_400_000
+            ))
+        );
+    }
+
+    #[test]
+    fn a_date_operators_timezone_is_an_expression() {
+        let d = doc! {"d": bson::DateTime::from_millis(1_710_052_200_000), "tz": "+05:00", "n": Bson::Null};
+        let ev = |e: Bson| evaluate(&d, &e, &Document::new()).unwrap();
+        assert_eq!(
+            ev(bson::bson!({"$hour": {"date": "$d", "timezone": "$tz"}})),
+            Bson::Int32(11)
+        );
+        assert_eq!(
+            ev(bson::bson!({"$hour": {"date": "$d", "timezone": "$n"}})),
+            Bson::Null
+        );
+        assert_eq!(
+            ev(bson::bson!({"$hour": {"date": "$d", "timezone": Bson::Null}})),
+            Bson::Null
+        );
+        assert_eq!(
+            ev(bson::bson!({"$dateToString": {"date": "$d", "timezone": "$tz"}})),
+            Bson::String("2024-03-10T11:30:00.000".into())
+        );
+        assert_eq!(
+            ev(bson::bson!({"$dateTrunc": {"date": "$d", "unit": "day", "timezone": "$n"}})),
+            Bson::Null
+        );
+        // A computed zone is checked per document; a constant one at parse time.
+        let e = evaluate(
+            &d,
+            &bson::bson!({"$hour": {"date": "$d", "timezone": {"$concat": ["$tz", "x"]}}}),
+            &Document::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            e,
+            Fallback::Mongo {
+                code: 40485,
+                folded: Some(false),
+                ..
+            }
+        ));
+        let e = evaluate(
+            &d,
+            &bson::bson!({"$hour": {"date": "$n", "timezone": 5}}),
+            &Document::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            e,
+            Fallback::Mongo {
+                code: 40517,
+                folded: Some(true),
+                ..
+            }
+        ));
+        // mongod's fixed offsets: `+HH` and out-of-range minutes are zones.
+        assert_eq!(
+            ev(bson::bson!({"$hour": {"date": "$d", "timezone": "+05"}})),
+            Bson::Int32(11)
+        );
+        assert_eq!(
+            ev(bson::bson!({"$hour": {"date": "$d", "timezone": "+05:60"}})),
+            Bson::Int32(12)
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ def _code(answer: tuple) -> tuple:
     return answer[:2] if answer[0] == "err" else answer
 
 
-@pytest.mark.backlog("RM-139")
+@pytest.mark.backlog_fixed("RM-139")
 def test_date_from_parts_month_out_of_range_is_refused(rust_mongo: Any) -> None:
     """mongod 8.2.11 refuses a `month` outside [-32768, 32767] with 31034;
     the Rust server answered a date in the year 5350."""

@@ -2552,6 +2552,27 @@ pub(crate) fn expression_shape_problem_in(spec: &Bson, stage: &str) -> Option<(i
                                     .to_string(),
                             ));
                         }
+                        // Two codes, by which side `year` is on (probed 8.2.11,
+                        // 2026-10-16).
+                        let has = |keys: &[&str]| keys.iter().any(|k| spec.contains_key(k));
+                        if spec.contains_key("year")
+                            && has(&["isoWeekYear", "isoWeek", "isoDayOfWeek"])
+                        {
+                            return Some((
+                                40489,
+                                "$dateFromParts does not allow mixing natural dates with ISO \
+                                 dates"
+                                    .to_string(),
+                            ));
+                        }
+                        if spec.contains_key("isoWeekYear") && has(&["month", "day"]) {
+                            return Some((
+                                40525,
+                                "$dateFromParts does not allow mixing ISO dates with natural \
+                                 dates"
+                                    .to_string(),
+                            ));
+                        }
                     }
                 }
                 if let Some(found) = expression_shape_problem_in(value, stage) {
@@ -4416,6 +4437,16 @@ mod parse_time_required_keys {
                 bson!({"$dateFromParts": {"month": 1}}),
                 40516,
                 "$dateFromParts requires either 'year' or 'isoWeekYear' to be present",
+            ),
+            (
+                bson!({"$dateFromParts": {"year": 2017, "isoWeek": 3}}),
+                40489,
+                "$dateFromParts does not allow mixing natural dates with ISO dates",
+            ),
+            (
+                bson!({"$dateFromParts": {"isoWeekYear": 2017, "month": 3}}),
+                40525,
+                "$dateFromParts does not allow mixing ISO dates with natural dates",
             ),
         ] {
             let got = probe(expr.clone());
