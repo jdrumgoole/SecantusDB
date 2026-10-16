@@ -5611,6 +5611,7 @@ impl PgHandler {
     /// `finish_groups`, told whether the groups arrive in PostgreSQL's
     /// HashAggregate order: then the ORDER BY sorts them with PostgreSQL's
     /// quicksort, so ties land where PostgreSQL's do.
+    #[allow(clippy::type_complexity)]
     fn finish_groups_from(
         &self,
         agg: &secantus_pgplan::Aggregate,
