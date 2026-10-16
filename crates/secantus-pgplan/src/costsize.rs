@@ -172,6 +172,28 @@ pub struct Index {
     pub height: u32,
     /// Its key columns, in order (the first is `field`).
     pub columns: Vec<String>,
+    /// `btcostestimate`'s `indexCorrelation`: the leading column's ANALYZE
+    /// correlation (three quarters of it for an index of several columns);
+    /// 0 with no statistics.
+    pub correlation: f64,
+}
+
+/// How the quals on an index's leading column are estimated: with no
+/// statistics, from its distinct count (`column_selectivity`); or the
+/// selectivity statistics gave them (`clauselist_selectivity` over them).
+#[derive(Debug, Clone, Copy)]
+pub enum ColSel {
+    Ndistinct(f64),
+    Given(f64),
+}
+
+impl ColSel {
+    fn of(self, quals: &[&Qual]) -> f64 {
+        match self {
+            ColSel::Ndistinct(nd) => column_selectivity(quals.iter().copied(), nd),
+            ColSel::Given(sel) => sel,
+        }
+    }
 }
 
 /// `index_pages_fetched` (Mackert and Lohman) for one table that fits
@@ -194,7 +216,7 @@ fn index_cost(
     rel: &Rel,
     index: &Index,
     quals: &[(String, Qual)],
-    ndistinct: f64,
+    colsel: ColSel,
     full: bool,
 ) -> Option<(f64, f64, f64)> {
     let iq: Vec<&Qual> = quals
@@ -205,7 +227,7 @@ fn index_cost(
     if iq.is_empty() && !full {
         return None;
     }
-    let sel = column_selectivity(iq.iter().copied(), ndistinct);
+    let sel = colsel.of(&iq);
     let mut num_sa = 1.0;
     for q in &iq {
         if let Qual::In(n) = q {
@@ -252,10 +274,10 @@ fn bitmap_heap_cost(
     rel: &Rel,
     index: &Index,
     quals: &[(String, Qual)],
-    ndistinct: f64,
+    colsel: ColSel,
     rows: f64,
 ) -> Option<(f64, f64)> {
-    let (_, index_total, sel) = index_cost(rel, index, quals, ndistinct, false)?;
+    let (_, index_total, sel) = index_cost(rel, index, quals, colsel, false)?;
     let startup = index_total + 0.1 * CPU_OPERATOR_COST * rows;
     let tuples_fetched = clamp_row_est(sel * rel.tuples);
     let t = if rel.pages > 1.0 { rel.pages } else { 1.0 };
@@ -269,15 +291,14 @@ fn bitmap_heap_cost(
     Some((startup, startup + pages * per_page + cpu))
 }
 
-/// `cost_index` for a plain index scan, uncorrelated (a table with no
-/// statistics has correlation 0): `(startup, total)`.
+/// `cost_index` for a plain index scan: `(startup, total)`.
 fn index_scan_cost(
     rel: &Rel,
     index: &Index,
     quals: &[(String, Qual)],
-    ndistinct: f64,
+    colsel: ColSel,
 ) -> Option<(f64, f64)> {
-    index_scan(rel, index, quals, ndistinct, false)
+    index_scan(rel, index, quals, colsel, false)
 }
 
 /// An index scan read for its order (`build_index_paths` keeps one whose
@@ -289,19 +310,41 @@ pub fn ordered_index_scan(
     quals: &[(String, Qual)],
     ndistinct: f64,
 ) -> (f64, f64) {
-    index_scan(rel, index, quals, ndistinct, true).unwrap_or((0.0, f64::INFINITY))
+    ordered_index_scan_with(rel, index, quals, ColSel::Ndistinct(ndistinct))
 }
 
+/// `ordered_index_scan` with its quals estimated by `colsel`.
+pub fn ordered_index_scan_with(
+    rel: &Rel,
+    index: &Index,
+    quals: &[(String, Qual)],
+    colsel: ColSel,
+) -> (f64, f64) {
+    index_scan(rel, index, quals, colsel, true).unwrap_or((0.0, f64::INFINITY))
+}
+
+/// `cost_index`'s heap I/O lies between the uncorrelated case (each page
+/// fetched at random, Mackert-Lohman) and the correlated one (the
+/// selectivity's share of the pages, read in order), by the square of the
+/// index's correlation.
 fn index_scan(
     rel: &Rel,
     index: &Index,
     quals: &[(String, Qual)],
-    ndistinct: f64,
+    colsel: ColSel,
     full: bool,
 ) -> Option<(f64, f64)> {
-    let (startup, index_total, sel) = index_cost(rel, index, quals, ndistinct, full)?;
+    let (startup, index_total, sel) = index_cost(rel, index, quals, colsel, full)?;
     let tuples_fetched = clamp_row_est(sel * rel.tuples);
-    let io = index_pages_fetched(tuples_fetched, rel.pages) * RANDOM_PAGE_COST;
+    let max_io = index_pages_fetched(tuples_fetched, rel.pages) * RANDOM_PAGE_COST;
+    let min_pages = (sel * rel.pages).ceil();
+    let min_io = if min_pages > 0.0 {
+        RANDOM_PAGE_COST + (min_pages - 1.0).max(0.0) * SEQ_PAGE_COST
+    } else {
+        0.0
+    };
+    let csquared = index.correlation * index.correlation;
+    let io = max_io + csquared * (min_io - max_io);
     let other = qual_cost(
         quals
             .iter()
@@ -344,18 +387,36 @@ pub fn cheapest_scan_path(
     ndistinct: &dyn Fn(&str) -> f64,
     rows: f64,
 ) -> (f64, f64) {
-    let mut best = (0.0, seq_scan(rel, quals));
+    scan_path(
+        rel,
+        indexes,
+        quals,
+        &|f| ColSel::Ndistinct(ndistinct(f)),
+        rows,
+    )
+    .0
+}
+
+/// `cheapest_scan_path` with each index's quals estimated by `colsel`, and
+/// the index whose plain index scan it is, when it is one -- which returns
+/// the rows in that index's order, where the others return the heap's.
+pub fn scan_path<'a>(
+    rel: &Rel,
+    indexes: &'a [Index],
+    quals: &[(String, Qual)],
+    colsel: &dyn Fn(&str) -> ColSel,
+    rows: f64,
+) -> ((f64, f64), Option<&'a Index>) {
+    let mut best = ((0.0, seq_scan(rel, quals)), None);
     for index in indexes {
-        let nd = ndistinct(&index.field);
-        for cost in [
-            bitmap_heap_cost(rel, index, quals, nd, rows),
-            index_scan_cost(rel, index, quals, nd),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if cost.1 < best.1 || (cost.1 == best.1 && cost.0 < best.0) {
-                best = cost;
+        let cs = colsel(&index.field);
+        for (cost, ordered) in [
+            (bitmap_heap_cost(rel, index, quals, cs, rows), None),
+            (index_scan_cost(rel, index, quals, cs), Some(index)),
+        ] {
+            let Some(cost) = cost else { continue };
+            if cost.1 < best.0 .1 || (cost.1 == best.0 .1 && cost.0 < best.0 .0) {
+                best = (cost, ordered);
             }
         }
     }
@@ -397,7 +458,31 @@ pub fn sorted_grouping_wins(
     aggs: Option<AggCosts>,
     ordered: bool,
 ) -> bool {
-    let (h, s) = grouping_costs(input_total, rows, groups, ncols, aggs);
+    sorted_grouping_wins_over(input_total, rows, groups, ncols, aggs, ordered, &[])
+}
+
+/// `sorted_grouping_wins` with, besides the Sort + Group over the cheapest
+/// scan, a Group over each scan already in the group keys' order
+/// (`presorted`, `(startup, total, rows)`, as `limited_grouping_sorted`
+/// takes them): the cheapest of the sorted paths in total, a tie within the
+/// fuzz going to the cheaper startup, competes with the HashAggregate.
+pub fn sorted_grouping_wins_over(
+    input_total: f64,
+    rows: f64,
+    groups: f64,
+    ncols: usize,
+    aggs: Option<AggCosts>,
+    ordered: bool,
+    presorted: &[(f64, f64, f64)],
+) -> bool {
+    let (h, mut s) = grouping_costs(input_total, rows, groups, ncols, aggs);
+    for &(startup, total, input_rows) in presorted {
+        let g = presorted_group(startup, total, input_rows, groups, ncols, aggs);
+        let f = STD_FUZZ_FACTOR;
+        if g.1 * f < s.1 || (g.1 <= s.1 * f && s.1 <= g.1 * f && g.0 * f < s.0) {
+            s = g;
+        }
+    }
     // compare_path_costs_fuzzily(hash, sorted); the sorted path has the
     // better pathkeys.
     let f = STD_FUZZ_FACTOR;
@@ -457,21 +542,35 @@ pub fn limited_grouping_sorted(
     let hash = first(h);
     let mut best_sorted = first(s);
     for &(startup, total, input_rows) in presorted {
-        let a = aggs.unwrap_or_default();
-        let cols = CPU_OPERATOR_COST * ncols as f64 * input_rows;
-        let total = total
-            + cols
-            + match aggs {
-                Some(_) => {
-                    a.trans_per_tuple * input_rows
-                        + a.final_per_group * groups
-                        + CPU_TUPLE_COST * groups
-                }
-                None => 0.0,
-            };
-        best_sorted = best_sorted.min(first((startup, total)));
+        let g = presorted_group(startup, total, input_rows, groups, ncols, aggs);
+        best_sorted = best_sorted.min(first(g));
     }
     best_sorted < hash
+}
+
+/// A Group (a GroupAggregate when `aggs` is `Some`) over an input already
+/// in the keys' order: `(startup, total)` (`cost_group`, `cost_agg`).
+fn presorted_group(
+    startup: f64,
+    total: f64,
+    input_rows: f64,
+    groups: f64,
+    ncols: usize,
+    aggs: Option<AggCosts>,
+) -> (f64, f64) {
+    let a = aggs.unwrap_or_default();
+    let cols = CPU_OPERATOR_COST * ncols as f64 * input_rows;
+    let total = total
+        + cols
+        + match aggs {
+            Some(_) => {
+                a.trans_per_tuple * input_rows
+                    + a.final_per_group * groups
+                    + CPU_TUPLE_COST * groups
+            }
+            None => 0.0,
+        };
+    (startup, total)
 }
 
 /// The HashAggregate's and the Sort + Group's `(startup, total)`.
@@ -530,6 +629,7 @@ mod tests {
             pages: 2.0,
             height: 0,
             columns: vec!["k".into()],
+            correlation: 0.0,
         }
     }
     fn q(filter: Document) -> Vec<(String, Qual)> {
@@ -541,28 +641,34 @@ mod tests {
         let range = q(bson::doc! {"k": {"$gt": 5, "$lt": 30}});
         // Bitmap Index Scan (0.00..4.21 rows=6), Bitmap Heap Scan
         // (4.21..13.70 rows=6) over t3.
-        let (_, it, _) = index_cost(&t3(), &pkey(), &range, 1200.0, false).unwrap();
+        let (_, it, _) =
+            index_cost(&t3(), &pkey(), &range, ColSel::Ndistinct(1200.0), false).unwrap();
         assert!(close(it, 4.21), "{it}");
-        let (s, t) = bitmap_heap_cost(&t3(), &pkey(), &range, 1200.0, 6.0).unwrap();
+        let (s, t) =
+            bitmap_heap_cost(&t3(), &pkey(), &range, ColSel::Ndistinct(1200.0), 6.0).unwrap();
         assert!(close(s, 4.21) && close(t, 13.70), "{s} {t}");
         // t2: Bitmap Heap Scan (4.27..14.97 rows=11).
-        let (s, t) = bitmap_heap_cost(&t2(), &pkey(), &range, 2260.0, 11.0).unwrap();
+        let (s, t) =
+            bitmap_heap_cost(&t2(), &pkey(), &range, ColSel::Ndistinct(2260.0), 11.0).unwrap();
         assert!(close(s, 4.27) && close(t, 14.97), "{s} {t}");
         // `k > 5`: Bitmap Index Scan 9.80, Heap (9.99..29.40 rows=753).
         let gt = q(bson::doc! {"k": {"$gt": 5}});
-        let (s, t) = bitmap_heap_cost(&t2(), &pkey(), &gt, 2260.0, 753.0).unwrap();
+        let (s, t) =
+            bitmap_heap_cost(&t2(), &pkey(), &gt, ColSel::Ndistinct(2260.0), 753.0).unwrap();
         assert!(close(s, 9.99) && close(t, 29.40), "{s} {t}");
         // `k = 3`: Index Scan (0.15..8.17 rows=1).
         let eq = q(bson::doc! {"k": 3});
-        let (s, t) = index_scan_cost(&t2(), &pkey(), &eq, 2260.0).unwrap();
+        let (s, t) = index_scan_cost(&t2(), &pkey(), &eq, ColSel::Ndistinct(2260.0)).unwrap();
         assert!(close(s, 0.15) && close(t, 8.17), "{s} {t}");
         // `k in (3, 5, 7)`: Bitmap Index Scan 8.49, Heap (8.49..15.60).
         let saop = q(bson::doc! {"k": {"$in": [3, 5, 7]}});
-        let (s, t) = bitmap_heap_cost(&t2(), &pkey(), &saop, 2260.0, 3.0).unwrap();
+        let (s, t) =
+            bitmap_heap_cost(&t2(), &pkey(), &saop, ColSel::Ndistinct(2260.0), 3.0).unwrap();
         assert!(close(s, 8.49) && close(t, 15.60), "{s} {t}");
         // A `<>` beside them is rechecked on the heap: (4.27..14.99).
         let ne = q(bson::doc! {"k": {"$gt": 5, "$lt": 30}, "g": {"$ne": 2}});
-        let (_, t) = bitmap_heap_cost(&t2(), &pkey(), &ne, 2260.0, 11.0).unwrap();
+        let (_, t) =
+            bitmap_heap_cost(&t2(), &pkey(), &ne, ColSel::Ndistinct(2260.0), 11.0).unwrap();
         assert!(close(t, 14.99), "{t}");
         // Seq Scan with `g = 1` (0.00..38.25), without a qual 32.60.
         let nd = |_: &str| 200.0;

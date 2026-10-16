@@ -37,6 +37,10 @@ pub struct JoinSide {
     /// The operators its side of the join clause evaluates: 0 for a column,
     /// 1 for `c + 3`.
     pub key_ops: f64,
+    /// The rows of the table the key's column is in, which a hash bucket's
+    /// size scales its distinct count by (`estimate_hash_bucket_stats`):
+    /// `rows` for a table, the base table's for a join's output.
+    pub rel_rows: f64,
 }
 
 impl JoinSide {
@@ -80,6 +84,26 @@ pub fn join_rows(outer: &JoinSide, inner: &JoinSide, left: bool) -> f64 {
     clamp_row_est(if left { n.max(outer.rows) } else { n })
 }
 
+/// `ExecChooseHashTableSize`'s buckets for a hashed side estimated at
+/// `rows`: a power of two at least the rows, at least 1,024.
+pub fn hash_buckets(rows: f64) -> usize {
+    (rows.max(1.0).ceil() as usize)
+        .max(1024)
+        .next_power_of_two()
+}
+
+/// The bucket of a hash join's table a key `v` of type `ty` lands in
+/// (`ExecHashGetHashValue`, `ExecHashGetBucketAndBatch`): the type's hash
+/// function's value, masked; a NULL a right join keeps hashes as 0. `None`
+/// for a type whose hash is not modelled.
+pub fn hash_bucket(v: &bson::Bson, ty: &str, nbuckets: usize) -> Option<usize> {
+    let hash = match v {
+        bson::Bson::Null => 0,
+        v => crate::hashfn::plain_hash(v, ty)?,
+    };
+    Some(hash as usize & (nbuckets - 1))
+}
+
 /// A hash join with `inner` hashed: `(startup, total)`.
 pub fn hash_join(outer: &JoinSide, inner: &JoinSide) -> (f64, f64) {
     let mut startup = outer.scan.0 + inner.scan.1;
@@ -97,7 +121,7 @@ pub fn hash_join(outer: &JoinSide, inner: &JoinSide) -> (f64, f64) {
     } else {
         let mut nd = inner.ndistinct;
         if inner.tuples > 0.0 {
-            nd = clamp_row_est(nd * inner.rows / inner.tuples);
+            nd = clamp_row_est(nd * inner.rel_rows / inner.tuples);
         }
         let f = if nd > buckets {
             1.0 / buckets
@@ -137,6 +161,13 @@ pub fn hash_join(outer: &JoinSide, inner: &JoinSide) -> (f64, f64) {
 /// `final_cost_nestloop`: the join clause is evaluated for every pair.
 /// `(startup, total)`.
 pub fn nest_loop(outer: &JoinSide, inner: &JoinSide, materialized: bool) -> (f64, f64) {
+    nest_loop_with(outer, inner, materialized, clause_cost(outer, inner))
+}
+
+/// `nest_loop` evaluating join quals costing `qual` a pair: none for a
+/// join whose only clause an equivalence class with a constant replaced
+/// (`generate_base_implied_equalities_const`).
+fn nest_loop_with(outer: &JoinSide, inner: &JoinSide, materialized: bool, qual: f64) -> (f64, f64) {
     let (inner_startup, inner_total, rescan) = if materialized {
         let total = inner.scan.1 + 2.0 * CPU_OPERATOR_COST * inner.rows;
         (inner.scan.0, total, CPU_OPERATOR_COST * inner.rows)
@@ -149,7 +180,7 @@ pub fn nest_loop(outer: &JoinSide, inner: &JoinSide, materialized: bool) -> (f64
     if outer.rows > 1.0 {
         run += (outer.rows - 1.0) * rescan;
     }
-    run += (CPU_TUPLE_COST + clause_cost(outer, inner)) * outer.rows * inner.rows;
+    run += (CPU_TUPLE_COST + qual) * outer.rows * inner.rows;
     (startup, startup + run)
 }
 
@@ -264,20 +295,26 @@ pub enum JoinMethod {
     /// An inner join with `b` outer: a nested loop, both sides in scan
     /// order.
     NestOuterB,
-    /// Any other: a LEFT join with `b` outer (a hash or merge right join),
-    /// or a plan whose rows come in both sides' scan order, `a` outer: a
+    /// A LEFT join with `b` outer: a hash right join probing with `b`'s
+    /// rows in scan order, `a` hashed, and the `a` rows nothing matched
+    /// last, in the hash table's order (`ExecScanHashTableForUnmatched`).
+    HashRightB,
+    /// A LEFT join with `b` outer by a merge right join: not modelled.
+    Unmodelled,
+    /// A plan whose rows come in both sides' scan order, `a` outer: a
     /// nested loop, or a hash join on a unique `b`.
     Other,
 }
 
 /// One path `add_path` weighs: its `(startup, total)`, whether it comes
 /// out in the join key's order (a merge join's pathkeys), and its plan.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct JoinPath {
     startup: f64,
     total: f64,
     keyed: bool,
     method: JoinMethod,
+    combo: usize,
 }
 
 /// `compare_path_costs_fuzzily`: which of `p1` and `p2` is cheaper in
@@ -362,121 +399,223 @@ fn add_path(paths: &mut Vec<JoinPath>, new: JoinPath, startup_counts: bool) {
 /// cheapest for that fraction of the join's rows
 /// (`get_cheapest_fractional_path`); `None` for the whole result.
 pub fn cheapest_join(a: &JoinSide, b: &JoinSide, left: bool, limit: Option<f64>) -> JoinMethod {
+    choose_join(a, b, left, limit, true)
+}
+
+/// `cheapest_join` for an inner join left with no join clause, every
+/// equality of its ON and WHERE in an equivalence class with a constant:
+/// a nested loop over every pair of the two sides' rows, either side
+/// outer.
+pub fn cheapest_cross_join(a: &JoinSide, b: &JoinSide, limit: Option<f64>) -> JoinMethod {
+    choose_join(a, b, false, limit, false)
+}
+
+/// `cheapest_join` for a LEFT join whose outer key a constant fixes: the
+/// inner side gets the constant too (`reconsider_outer_join_clauses`), and
+/// the ON's equality is implied by the two sides' quals, so it selects
+/// every pair; a hash bucket's size stays the default's.
+pub fn cheapest_implied_join(
+    a: &JoinSide,
+    b: &JoinSide,
+    left: bool,
+    limit: Option<f64>,
+) -> JoinMethod {
+    let implied = |s: &JoinSide| JoinSide {
+        ndistinct: 1.0,
+        default_ndistinct: true,
+        unique: false,
+        ..*s
+    };
+    choose_join(&implied(a), &implied(b), left, limit, true)
+}
+
+fn choose_join(
+    a: &JoinSide,
+    b: &JoinSide,
+    left: bool,
+    limit: Option<f64>,
+    clause: bool,
+) -> JoinMethod {
     // A join rel weighs startup costs only under a LIMIT
     // (`consider_startup`: a positive `tuple_fraction`).
-    let startup_counts = limit.is_some();
-    let mut paths: Vec<JoinPath> = Vec::new();
-    let mut consider = |(startup, total): (f64, f64), keyed: bool, method: JoinMethod| {
-        add_path(
-            &mut paths,
-            JoinPath {
-                startup,
-                total,
-                keyed,
-                method,
-            },
-            startup_counts,
-        );
+    let mut rel = JoinRel::new(limit.is_some());
+    rel.add_paths(0, a, b, left, clause);
+    let rows = if clause {
+        join_rows(a, b, left)
+    } else {
+        clamp_row_est(a.rows * b.rows)
     };
-    // `populate_joinrel_with_paths` builds `a` outer first, then `b`; each
-    // `add_paths_to_joinrel` in turn tries merge joins over two Sorts
-    // (`sort_inner_and_outer`), then nested loops and merge joins over an
-    // outer already in order (`match_unsorted_outer`), then hash joins.
-    // A LEFT join with `b` outer is a right join, whose unmatched `a` rows
-    // come last, in the hash table's order: not modelled. A nested loop
-    // with `a` outer emits its rows in both sides' scan order.
-    for b_outer in [false, true] {
-        let (outer, inner) = if b_outer { (b, a) } else { (a, b) };
-        let pick = |m: JoinMethod| {
-            if b_outer && left {
+    rel.cheapest(limit, rows).expect("a join has paths").method
+}
+
+/// The path a join relation's planning picked (`JoinRel::cheapest`): which
+/// pair of inputs it joins (the `combo` it was added under), how, and its
+/// cost.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JoinChoice {
+    pub combo: usize,
+    pub method: JoinMethod,
+    pub startup: f64,
+    pub total: f64,
+}
+
+/// One join relation's paths (`RelOptInfo::pathlist`), as `add_path` keeps
+/// them across every pair of inputs it can be built from.
+#[derive(Debug, Clone)]
+pub struct JoinRel {
+    paths: Vec<JoinPath>,
+    startup_counts: bool,
+}
+
+impl JoinRel {
+    /// `startup_counts`: the query has a LIMIT (`consider_startup`).
+    pub fn new(startup_counts: bool) -> JoinRel {
+        JoinRel {
+            paths: Vec::new(),
+            startup_counts,
+        }
+    }
+
+    /// `add_paths_to_joinrel` for `a` joined to `b` (`left`: a LEFT join,
+    /// `a` its preserved side), each side outer in turn
+    /// (`populate_joinrel_with_paths`), under `combo`. `clause`: the join
+    /// has an equality to hash or merge on.
+    pub fn add_paths(
+        &mut self,
+        combo: usize,
+        a: &JoinSide,
+        b: &JoinSide,
+        left: bool,
+        clause: bool,
+    ) {
+        let startup_counts = self.startup_counts;
+        let paths = &mut self.paths;
+        let mut consider = |(startup, total): (f64, f64), keyed: bool, method: JoinMethod| {
+            add_path(
+                paths,
+                JoinPath {
+                    startup,
+                    total,
+                    keyed,
+                    method,
+                    combo,
+                },
+                startup_counts,
+            );
+        };
+        // `populate_joinrel_with_paths` builds `a` outer first, then `b`;
+        // each `add_paths_to_joinrel` in turn tries merge joins over two
+        // Sorts (`sort_inner_and_outer`), then nested loops and merge joins
+        // over an outer already in order (`match_unsorted_outer`), then hash
+        // joins. A LEFT join with `b` outer is a right join: a hash right
+        // join returns the unmatched `a` rows last, in its hash table's
+        // order; a merge right join is not modelled. A nested loop with `a`
+        // outer emits its rows in both sides' scan order.
+        for b_outer in [false, true] {
+            let (outer, inner) = if b_outer { (b, a) } else { (a, b) };
+            let right = b_outer && left;
+            let merge = |oi: bool, ii: bool| {
+                if right {
+                    JoinMethod::Unmodelled
+                } else if b_outer {
+                    JoinMethod::MergeOuterB {
+                        a_by_index: ii,
+                        b_by_index: oi,
+                    }
+                } else {
+                    JoinMethod::MergeOuterA {
+                        a_by_index: oi,
+                        b_by_index: ii,
+                    }
+                }
+            };
+            if let Some(cost) = merge_join(outer, inner, false, false).filter(|_| clause) {
+                consider(cost, true, merge(false, false));
+            }
+            let nest = if b_outer {
+                JoinMethod::NestOuterB
+            } else {
+                JoinMethod::Other
+            };
+            // Under a LIMIT the outer's cheapest scan to start is a path of
+            // its own, which nested loops and hash joins read too
+            // (`match_unsorted_outer`, `hash_inner_and_outer`).
+            let startup_outer =
+                (startup_counts && outer.startup_scan != outer.scan).then_some(JoinSide {
+                    scan: outer.startup_scan,
+                    ..*outer
+                });
+            let outers: Vec<&JoinSide> = std::iter::once(outer)
+                .chain(startup_outer.as_ref())
+                .collect();
+            // A right join cannot be a nested loop.
+            if !right {
+                let qual = if clause {
+                    clause_cost(outer, inner)
+                } else {
+                    0.0
+                };
+                for o in &outers {
+                    consider(nest_loop_with(o, inner, false, qual), false, nest);
+                    consider(nest_loop_with(o, inner, true, qual), false, nest);
+                }
+            }
+            // Merge and hash joins need a join clause to join on.
+            if !clause {
+                continue;
+            }
+            for (oi, ii) in [(true, false), (true, true)] {
+                if let Some(cost) = merge_join(outer, inner, oi, ii) {
+                    consider(cost, true, merge(oi, ii));
+                }
+            }
+            let hash = if right {
+                JoinMethod::HashRightB
+            } else if b_outer {
+                JoinMethod::HashOuterB
+            } else if b.unique {
                 JoinMethod::Other
             } else {
-                m
-            }
-        };
-        let merge = |oi: bool, ii: bool| {
-            if b_outer {
-                JoinMethod::MergeOuterB {
-                    a_by_index: ii,
-                    b_by_index: oi,
-                }
-            } else {
-                JoinMethod::MergeOuterA {
-                    a_by_index: oi,
-                    b_by_index: ii,
-                }
-            }
-        };
-        if let Some(cost) = merge_join(outer, inner, false, false) {
-            consider(cost, true, pick(merge(false, false)));
-        }
-        let nest = if b_outer {
-            JoinMethod::NestOuterB
-        } else {
-            JoinMethod::Other
-        };
-        // Under a LIMIT the outer's cheapest scan to start is a path of its
-        // own, which nested loops and hash joins read too
-        // (`match_unsorted_outer`, `hash_inner_and_outer`).
-        let startup_outer =
-            (startup_counts && outer.startup_scan != outer.scan).then_some(JoinSide {
-                scan: outer.startup_scan,
-                ..*outer
-            });
-        let outers: Vec<&JoinSide> = std::iter::once(outer)
-            .chain(startup_outer.as_ref())
-            .collect();
-        // A right join cannot be a nested loop.
-        if !(b_outer && left) {
+                JoinMethod::HashOuterA
+            };
             for o in &outers {
-                consider(nest_loop(o, inner, false), false, nest);
-                consider(nest_loop(o, inner, true), false, nest);
+                consider(hash_join(o, inner), false, hash);
             }
-        }
-        for (oi, ii) in [(true, false), (true, true)] {
-            if let Some(cost) = merge_join(outer, inner, oi, ii) {
-                consider(cost, true, pick(merge(oi, ii)));
-            }
-        }
-        let hash = if b_outer {
-            JoinMethod::HashOuterB
-        } else if b.unique {
-            JoinMethod::Other
-        } else {
-            JoinMethod::HashOuterA
-        };
-        for o in &outers {
-            consider(hash_join(o, inner), false, pick(hash));
         }
     }
-    // `set_cheapest`: the cheapest in total, a tie to the cheaper startup;
-    // under a LIMIT, any other path cheaper for its fraction of the rows.
-    let total_cmp = |p: &JoinPath, q: &JoinPath| {
-        p.total
-            .total_cmp(&q.total)
-            .then(p.startup.total_cmp(&q.startup))
-    };
-    let mut best = *paths
-        .iter()
-        .min_by(|p, q| total_cmp(p, q))
-        .expect("a join has paths");
-    if let Some(limit) = limit {
-        let rows = join_rows(a, b, left);
-        let fraction = if limit >= 1.0 && rows > 0.0 {
-            limit / rows
-        } else {
-            limit
+
+    /// `set_cheapest`: the cheapest in total, a tie to the cheaper startup;
+    /// under a LIMIT of `limit` of the join's `rows`, any other path cheaper
+    /// for that fraction (`get_cheapest_fractional_path`).
+    pub fn cheapest(&self, limit: Option<f64>, rows: f64) -> Option<JoinChoice> {
+        let total_cmp = |p: &JoinPath, q: &JoinPath| {
+            p.total
+                .total_cmp(&q.total)
+                .then(p.startup.total_cmp(&q.startup))
         };
-        if fraction > 0.0 && fraction < 1.0 {
-            let price = |p: &JoinPath| p.startup + fraction * (p.total - p.startup);
-            for p in &paths {
-                if price(p) < price(&best) {
-                    best = *p;
+        let mut best = *self.paths.iter().min_by(|p, q| total_cmp(p, q))?;
+        if let Some(limit) = limit {
+            let fraction = if limit >= 1.0 && rows > 0.0 {
+                limit / rows
+            } else {
+                limit
+            };
+            if fraction > 0.0 && fraction < 1.0 {
+                let price = |p: &JoinPath| p.startup + fraction * (p.total - p.startup);
+                for p in &self.paths {
+                    if price(p) < price(&best) {
+                        best = *p;
+                    }
                 }
             }
         }
+        Some(JoinChoice {
+            combo: best.combo,
+            method: best.method,
+            startup: best.startup,
+            total: best.total,
+        })
     }
-    best.method
 }
 
 #[cfg(test)]
@@ -501,6 +640,7 @@ mod tests {
             ndistinct: 2260.0,
             default_ndistinct: false,
             key_ops: 0.0,
+            rel_rows: 2260.0,
         }
     }
     fn plain() -> JoinSide {
@@ -565,12 +705,14 @@ mod tests {
         // (38.82..177.89), so `add_path` keeps it.
         let jp = JoinSide {
             rows: 753.0,
+            rel_rows: 753.0,
             scan: (9.99, 29.40),
             startup_scan: (0.0, 38.25),
             ..plain()
         };
         let jq = JoinSide {
             rows: 753.0,
+            rel_rows: 753.0,
             scan: (0.0, 38.25),
             startup_scan: (0.0, 38.25),
             ..plain()
@@ -592,6 +734,54 @@ mod tests {
             cheapest_join(&plain(), &plain(), false, Some(3000.0)),
             JoinMethod::HashOuterA
         );
+    }
+
+    #[test]
+    fn the_plans_postgres_picks_for_an_equivalence_class_with_a_constant() {
+        // `where jp.b = 2`: both sides filtered to 11 rows (38.25).
+        let side = JoinSide {
+            rows: 11.0,
+            rel_rows: 11.0,
+            scan: (0.0, 38.25),
+            startup_scan: (0.0, 38.25),
+            ..plain()
+        };
+        // An inner join has no join clause left: a Nested Loop over a
+        // Materialize (0.00..78.04).
+        let (s, t) = nest_loop_with(&side, &side, true, 0.0);
+        assert!(close(s, 0.0) && close(t, 78.04), "{s} {t}");
+        assert_eq!(cheapest_cross_join(&side, &side, None), JoinMethod::Other);
+        // A LEFT join keeps the ON, selecting every pair: the Hash Left
+        // Join (38.39..77.89) is fuzzily as cheap as the Nested Loop Left
+        // Join (0.00..78.34), which starts sooner.
+        let (s, t) = nest_loop(&side, &side, true);
+        assert!(close(s, 0.0) && close(t, 78.34), "{s} {t}");
+        assert_eq!(
+            cheapest_implied_join(&side, &side, true, None),
+            JoinMethod::Other
+        );
+    }
+
+    #[test]
+    fn a_join_of_a_join_costs_as_postgres_does() {
+        // jp join jq on b = c join jn on jq.a = jn.a: jq and jn first, a
+        // Hash Join (60.85..99.39, 2,260 rows), then a Merge Join of its
+        // output sorted by jq.c with jp sorted by b (383.81..778.18).
+        let mut rel = JoinRel::new(false);
+        rel.add_paths(0, &plain(), &pk(), false, true);
+        let first = rel.cheapest(None, 2260.0).unwrap();
+        assert!(
+            close(first.startup, 60.85) && close(first.total, 99.39),
+            "{first:?}"
+        );
+        let joined = JoinSide {
+            scan: (first.startup, first.total),
+            startup_scan: (first.startup, first.total),
+            ordered: None,
+            ..plain()
+        };
+        let (s, t) = merge_join(&joined, &plain(), false, false).unwrap();
+        assert!(close(s, 383.81) && close(t, 778.18), "{s} {t}");
     }
 
     #[test]

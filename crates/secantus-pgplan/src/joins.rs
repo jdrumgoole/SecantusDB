@@ -64,6 +64,8 @@ pub enum JoinNode {
         right: Box<JoinNode>,
         /// The ON predicate over the combined row; `None` is a cross join.
         on: Option<ColumnExpr>,
+        /// The table aliases the ON reads, in no particular order.
+        on_aliases: Vec<String>,
         /// `(left key, right key)` column equalities that are conjuncts of
         /// the ON: candidates are found by hashing on them, and `on` still
         /// decides each pair.
@@ -74,6 +76,10 @@ pub enum JoinNode {
         /// the other (`a.x = b.y + 3`), which are a merge or hash join's
         /// keys as `equi`'s columns are; `on` still decides each pair.
         expr_keys: Vec<ExprEquality>,
+        /// What PostgreSQL's equivalence classes make of the ON's and the
+        /// WHERE's equalities, for a join of two tables (`JoinEc`); `None`
+        /// when they were not derived.
+        ec: Option<JoinEc>,
         /// Every key each side produces, so an outer join can NULL-extend.
         left_keys: Vec<String>,
         right_keys: Vec<String>,
@@ -96,12 +102,78 @@ pub struct ExprEquality {
     pub right_column: Option<String>,
 }
 
+/// The equalities of a two-table join's ON and WHERE as PostgreSQL's
+/// equivalence classes leave them (`generate_base_implied_equalities`,
+/// `generate_join_implied_equalities`), as joined-row keys. A class with a
+/// constant becomes `column = constant` on every member, pushed into each
+/// side's scan, and joins nothing; one without becomes a chain of
+/// equalities between each side's own members, and one join clause, its
+/// first member on each side.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct JoinEc {
+    /// Equalities between two columns of one side.
+    pub left_restrict: Vec<(String, String)>,
+    pub right_restrict: Vec<(String, String)>,
+    /// The join clauses kept, `(left key, right key)`: none when every
+    /// class has a constant, and the join is a nested loop over all pairs.
+    pub join_keys: Vec<(String, String)>,
+}
+
+/// `JoinEc` before the join is built: by table alias and column.
+#[derive(Debug, Clone, Default)]
+struct EcPlan {
+    aliases: Vec<String>,
+    restrict: Vec<(String, String, String)>,
+    join_keys: Vec<((String, String), (String, String))>,
+}
+
+impl EcPlan {
+    /// The `JoinEc` for a join of `left` (its keys) and `right`, when they
+    /// are this plan's two tables.
+    fn for_join(&self, left: &[String], right: &[String]) -> Option<JoinEc> {
+        let side_of = |alias: &str| -> Option<bool> {
+            let probe = |keys: &[String]| keys.iter().any(|k| k.split(SEP).next() == Some(alias));
+            match (probe(left), probe(right)) {
+                (true, false) => Some(true),
+                (false, true) => Some(false),
+                _ => None,
+            }
+        };
+        let mut sides = Vec::new();
+        for a in &self.aliases {
+            sides.push(side_of(a)?);
+        }
+        if sides.iter().all(|s| *s) || sides.iter().all(|s| !*s) {
+            return None;
+        }
+        let mut ec = JoinEc::default();
+        for (alias, a, b) in &self.restrict {
+            let pair = (join_key(alias, a), join_key(alias, b));
+            if side_of(alias)? {
+                ec.left_restrict.push(pair);
+            } else {
+                ec.right_restrict.push(pair);
+            }
+        }
+        for ((xa, xc), (ya, yc)) in &self.join_keys {
+            let (x, y) = (join_key(xa, xc), join_key(ya, yc));
+            ec.join_keys
+                .push(if side_of(xa)? { (x, y) } else { (y, x) });
+        }
+        Some(ec)
+    }
+}
+
 /// A join as a statement the executor materialises: its tree and the def of
 /// the rows it produces.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JoinRows {
     pub tree: JoinNode,
     pub def: TableDef,
+    /// The query's WHERE has a conjunct over more than one table (or one
+    /// it could not attribute), which PostgreSQL would attach to a join
+    /// and plan the join order with; the executor does not model that.
+    pub where_spans: bool,
 }
 
 /// One column visible in a join's scope.
@@ -191,6 +263,9 @@ thread_local! {
     /// inner join (`reduce_outer_joins`).
     static NONNULLABLE: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The equivalence classes of the two-table join being built (see
+    /// `equivalence_classes`).
+    static EC_PLAN: std::cell::RefCell<Option<EcPlan>> = const { std::cell::RefCell::new(None) };
     /// Join sources planned for the statement in flight, by placeholder name.
     static PLANNED_JOINS: std::cell::RefCell<Vec<(String, SubSource)>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -226,12 +301,14 @@ pub(crate) fn plan_join_source(
     params: &[Bson],
 ) -> Result<pg_query::protobuf::SelectStmt> {
     // A nested join (one inside a FROM subquery) plans with its own.
-    let (pushdown, nonnullable) = pushdown_filters(s, lookup);
+    let (pushdown, nonnullable, ec) = pushdown_filters(s, lookup);
     let outer_pushdown = PUSHDOWN.with(|p| p.replace(pushdown));
     let outer_nonnullable = NONNULLABLE.with(|p| p.replace(nonnullable));
+    let outer_ec = EC_PLAN.with(|p| p.replace(ec));
     let built = build_tree(s, lookup, params);
     PUSHDOWN.with(|p| *p.borrow_mut() = outer_pushdown);
     NONNULLABLE.with(|p| *p.borrow_mut() = outer_nonnullable);
+    EC_PLAN.with(|p| *p.borrow_mut() = outer_ec);
     let (tree, scope) = built?;
     finish_join_source(s, tree, scope)
 }
@@ -291,12 +368,18 @@ fn build_tree(
         tree = Some(match tree {
             None => node,
             Some(left) => JoinNode::Join {
+                ec: EC_PLAN.with(|p| {
+                    p.borrow()
+                        .as_ref()
+                        .and_then(|plan| plan.for_join(&keys_of(&left), &keys_of(&node)))
+                }),
                 kind: JoinKind::Inner,
                 left_keys: keys_of(&left),
                 right_keys: keys_of(&node),
                 left: Box::new(left),
                 right: Box::new(node),
                 on: None,
+                on_aliases: Vec::new(),
                 // The WHERE still decides every row; these only narrow the
                 // candidates a left row is paired with.
                 equi: crate::join_order::pairs_between(&equalities, &joined, i),
@@ -315,6 +398,13 @@ fn finish_join_source(
     tree: JoinNode,
     scope: Scope,
 ) -> Result<pg_query::protobuf::SelectStmt> {
+    let where_spans = s.where_clause.as_deref().is_some_and(|w| {
+        let mut conjuncts = Vec::new();
+        split_and(w, &mut conjuncts);
+        conjuncts
+            .iter()
+            .any(|c| single_alias(c, &|_| None).is_none())
+    });
     let def = TableDef::new(
         "",
         scope
@@ -333,6 +423,7 @@ fn finish_join_source(
                 plan: Box::new(Statement::JoinRows(JoinRows {
                     tree,
                     def: def.clone(),
+                    where_spans,
                 })),
                 def,
             },
@@ -398,6 +489,11 @@ pub(crate) fn unmangle(e: Error) -> Error {
         return e;
     }
     Error::Sqlstate(e.sqlstate(), text.replace(SEP, "."))
+}
+
+/// Every joined-row key `node`'s rows carry.
+pub fn node_keys(node: &JoinNode) -> Vec<String> {
+    keys_of(node)
 }
 
 fn keys_of(node: &JoinNode) -> Vec<String> {
@@ -1030,6 +1126,7 @@ fn build_join(
         .map(|(_, l, r)| (l.clone(), r.clone()))
         .collect();
     let mut expr_keys = Vec::new();
+    let mut on_aliases = Vec::new();
     let on = match j.quals.as_deref() {
         None if merged.is_empty() => None,
         None => {
@@ -1062,6 +1159,7 @@ fn build_join(
                 aliases: scope.aliases.clone(),
             };
             rewrite_expr(&mut q, &side_scope, &[])?;
+            on_aliases = key_aliases(&q);
             equi.extend(equalities(&q, &left_keys, &right_keys));
             expr_keys = expr_equalities(&q, &left_keys, &right_keys)
                 .into_iter()
@@ -1085,14 +1183,45 @@ fn build_join(
             left: Box::new(left),
             right: Box::new(right),
             on,
+            ec: (kind == JoinKind::Inner && merged.is_empty())
+                .then(|| {
+                    EC_PLAN.with(|p| {
+                        p.borrow()
+                            .as_ref()
+                            .and_then(|plan| plan.for_join(&left_keys, &right_keys))
+                    })
+                })
+                .flatten(),
             equi,
             merged,
             expr_keys,
+            on_aliases,
             left_keys,
             right_keys,
         },
         scope,
     ))
+}
+
+/// The table aliases of the joined-row keys `n` reads.
+fn key_aliases(n: &pg_query::protobuf::Node) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut n = n.clone();
+    let _ = walk_expr(&mut n, &mut |x| {
+        if let Some(N::ColumnRef(c)) = x.node.as_ref() {
+            if let Some(alias) = column_ref_name(c)
+                .as_deref()
+                .and_then(|k| k.split_once(SEP))
+                .map(|(a, _)| a.to_string())
+            {
+                if !out.contains(&alias) {
+                    out.push(alias);
+                }
+            }
+        }
+        Ok(())
+    });
+    out
 }
 
 /// The ON predicate as a row expression over the joined keys.
@@ -1444,10 +1573,13 @@ pub(crate) const SELECT_LIST_SRFS: &[&str] = &[
 fn pushdown_filters(
     s: &pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
-) -> (Vec<(String, pg_query::protobuf::Node)>, Vec<String>) {
-    let Some(w) = s.where_clause.as_deref() else {
-        return (Vec::new(), Vec::new());
-    };
+) -> (
+    Vec<(String, pg_query::protobuf::Node)>,
+    Vec<String>,
+    Option<EcPlan>,
+) {
+    let empty = pg_query::protobuf::Node::default();
+    let w = s.where_clause.as_deref();
     // An unqualified column belongs to the one table in the FROM that has
     // it (`colNameToVar`); one two tables have is PostgreSQL's 42702, left
     // to the planner of the rewritten query. Known only when every item is
@@ -1469,7 +1601,10 @@ fn pushdown_filters(
         owners.next().is_none().then(|| alias.clone())
     };
     let mut conjuncts = Vec::new();
-    split_and(w, &mut conjuncts);
+    split_and(w.unwrap_or(&empty), &mut conjuncts);
+    if w.is_none() {
+        conjuncts.clear();
+    }
     let nonnullable: Vec<String> = conjuncts
         .iter()
         .flat_map(|c| strict_aliases(c, &owner))
@@ -1478,18 +1613,275 @@ fn pushdown_filters(
     for item in &s.from_clause {
         preserved_aliases(item, false, &nonnullable, &mut preserved);
     }
-    let pushed = conjuncts
-        .into_iter()
-        .filter_map(|c| {
+    let ec = if bare_known {
+        equivalence_classes(s, &tables, &conjuncts, &nonnullable, &owner)
+    } else {
+        None
+    };
+    let mut pushed: Vec<(String, pg_query::protobuf::Node)> = conjuncts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| {
+            ec.as_ref()
+                .is_none_or(|(_, absorbed, _)| !absorbed.contains(i))
+        })
+        .filter_map(|(_, c)| {
             let alias = single_alias(c, &owner)?;
             preserved.contains(&alias).then(|| {
-                let mut c = c.clone();
+                let mut c = (*c).clone();
                 strip_qualifier(&mut c);
                 (alias, c)
             })
         })
         .collect();
-    (pushed, nonnullable)
+    let ec = ec.map(|(plan, _, consts)| {
+        pushed.extend(consts);
+        plan
+    });
+    (pushed, nonnullable, ec)
+}
+
+/// One side of an equality atom: a table's column, or a constant.
+enum EcMember<'a> {
+    Column(String, String),
+    Const(&'a pg_query::protobuf::Node),
+}
+
+/// The equivalence classes of a join of two stored tables
+/// (`process_equivalence`, `generate_base_implied_equalities`): the ON's
+/// equalities (an inner join's, or a LEFT join's the WHERE makes inner)
+/// and then the WHERE's, each `column = column` or `column = constant`,
+/// merged where they share a column. Returns the plan, the WHERE
+/// conjuncts the classes absorbed (their implied equalities replace
+/// them), and the `column = constant` filters to push into each side.
+/// `None` for any other FROM, or when a class mixes column types, holds
+/// two constants or a NULL.
+#[allow(clippy::type_complexity)]
+fn equivalence_classes(
+    s: &pg_query::protobuf::SelectStmt,
+    tables: &[(String, TableDef)],
+    conjuncts: &[&pg_query::protobuf::Node],
+    nonnullable: &[String],
+    owner: &dyn Fn(&str) -> Option<String>,
+) -> Option<(EcPlan, Vec<usize>, Vec<(String, pg_query::protobuf::Node)>)> {
+    use pg_query::protobuf::JoinType;
+    let [(a1, _), (a2, _)] = tables else {
+        return None;
+    };
+    if a1 == a2 {
+        return None;
+    }
+    // The ON's conjuncts, ahead of the WHERE's (`deconstruct_jointree`).
+    let mut on = Vec::new();
+    match s.from_clause.as_slice() {
+        [one] => {
+            let Some(N::JoinExpr(j)) = one.node.as_ref() else {
+                return None;
+            };
+            if j.is_natural || !j.using_clause.is_empty() || j.alias.is_some() {
+                return None;
+            }
+            let inner = match JoinType::try_from(j.jointype) {
+                Ok(JoinType::JoinInner) => true,
+                Ok(JoinType::JoinLeft) => {
+                    let mut right = Vec::new();
+                    if let Some(r) = j.rarg.as_deref() {
+                        table_aliases(r, &mut right);
+                    }
+                    right.iter().any(|a| nonnullable.contains(a))
+                }
+                _ => false,
+            };
+            if !inner {
+                return None;
+            }
+            if let Some(q) = j.quals.as_deref() {
+                split_and(q, &mut on);
+            }
+        }
+        [_, _] => {}
+        _ => return None,
+    }
+    let column = |n: &pg_query::protobuf::Node| -> Option<(String, String)> {
+        let Some(N::ColumnRef(c)) = n.node.as_ref() else {
+            return None;
+        };
+        let parts = names_of(c)?;
+        match parts.as_slice() {
+            [q, col] => Some((q.clone(), col.clone())),
+            [col] => Some((owner(col)?, col.clone())),
+            _ => None,
+        }
+    };
+    fn member<'a>(
+        n: &'a pg_query::protobuf::Node,
+        column: &dyn Fn(&pg_query::protobuf::Node) -> Option<(String, String)>,
+    ) -> Option<EcMember<'a>> {
+        if let Some((alias, col)) = column(n) {
+            return Some(EcMember::Column(alias, col));
+        }
+        let is_const = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+            Some(N::AConst(c)) => !c.isnull,
+            Some(N::ParamRef(_)) => true,
+            _ => false,
+        };
+        match n.node.as_ref() {
+            Some(N::TypeCast(t)) if t.arg.as_deref().is_some_and(is_const) => {
+                Some(EcMember::Const(n))
+            }
+            _ if is_const(n) => Some(EcMember::Const(n)),
+            _ => None,
+        }
+    }
+    fn atom<'a>(
+        n: &'a pg_query::protobuf::Node,
+        column: &dyn Fn(&pg_query::protobuf::Node) -> Option<(String, String)>,
+    ) -> Option<(EcMember<'a>, EcMember<'a>)> {
+        let Some(N::AExpr(e)) = n.node.as_ref() else {
+            return None;
+        };
+        if e.kind != pg_query::protobuf::AExprKind::AexprOp as i32 || operator_name(e) != Ok("=") {
+            return None;
+        }
+        let (l, r) = (
+            member(e.lexpr.as_deref()?, column)?,
+            member(e.rexpr.as_deref()?, column)?,
+        );
+        match (&l, &r) {
+            (EcMember::Const(_), EcMember::Const(_)) => None,
+            _ => Some((l, r)),
+        }
+    }
+    let type_of = |alias: &str, col: &str| -> Option<String> {
+        let (_, def) = tables.iter().find(|(a, _)| a == alias)?;
+        Some(def.column(col)?.pg_type.clone())
+    };
+    // Classes: their column members in order, and their constant.
+    struct Class<'a> {
+        members: Vec<(String, String)>,
+        constant: Option<&'a pg_query::protobuf::Node>,
+    }
+    let mut classes: Vec<Class<'_>> = Vec::new();
+    let mut absorbed = Vec::new();
+    let atoms = on
+        .iter()
+        .map(|n| (None, *n))
+        .chain(conjuncts.iter().enumerate().map(|(i, n)| (Some(i), *n)));
+    for (where_index, n) in atoms {
+        let Some((l, r)) = atom(n, &column) else {
+            continue;
+        };
+        let find = |classes: &Vec<Class<'_>>, m: &(String, String)| {
+            classes.iter().position(|c| c.members.contains(m))
+        };
+        match (l, r) {
+            (EcMember::Column(xa, xc), EcMember::Column(ya, yc)) => {
+                let (x, y) = ((xa, xc), (ya, yc));
+                if type_of(&x.0, &x.1)? != type_of(&y.0, &y.1)? {
+                    return None;
+                }
+                match (find(&classes, &x), find(&classes, &y)) {
+                    (Some(i), Some(j)) if i == j => {}
+                    (Some(i), Some(j)) => {
+                        let (lo, hi) = (i.min(j), i.max(j));
+                        let merged = classes.remove(hi);
+                        if merged.constant.is_some() && classes[lo].constant.is_some() {
+                            return None;
+                        }
+                        classes[lo].constant = classes[lo].constant.or(merged.constant);
+                        for m in merged.members {
+                            if !classes[lo].members.contains(&m) {
+                                classes[lo].members.push(m);
+                            }
+                        }
+                    }
+                    (Some(i), None) => classes[i].members.push(y),
+                    (None, Some(j)) => classes[j].members.push(x),
+                    (None, None) => classes.push(Class {
+                        members: vec![x, y],
+                        constant: None,
+                    }),
+                }
+            }
+            (EcMember::Column(xa, xc), EcMember::Const(k))
+            | (EcMember::Const(k), EcMember::Column(xa, xc)) => {
+                let x = (xa, xc);
+                type_of(&x.0, &x.1)?;
+                match find(&classes, &x) {
+                    Some(i) if classes[i].constant.is_some() => return None,
+                    Some(i) => classes[i].constant = Some(k),
+                    None => classes.push(Class {
+                        members: vec![x],
+                        constant: Some(k),
+                    }),
+                }
+            }
+            _ => continue,
+        }
+        if let Some(i) = where_index {
+            absorbed.push(i);
+        }
+    }
+    if classes.is_empty() {
+        return None;
+    }
+    if classes.iter().any(|c| {
+        let t: Vec<Option<String>> = c.members.iter().map(|(a, col)| type_of(a, col)).collect();
+        t.windows(2).any(|w| w[0] != w[1])
+    }) {
+        return None;
+    }
+    let mut plan = EcPlan {
+        aliases: vec![a1.clone(), a2.clone()],
+        ..EcPlan::default()
+    };
+    let mut consts = Vec::new();
+    for class in &classes {
+        if let Some(k) = class.constant {
+            for (alias, col) in &class.members {
+                let mut eq = pg_query::protobuf::AExpr {
+                    kind: pg_query::protobuf::AExprKind::AexprOp as i32,
+                    name: vec![pg_query::protobuf::Node {
+                        node: Some(N::String(pg_query::protobuf::String { sval: "=".into() })),
+                    }],
+                    lexpr: Some(Box::new(pg_query::protobuf::Node {
+                        node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                            fields: vec![pg_query::protobuf::Node {
+                                node: Some(N::String(pg_query::protobuf::String {
+                                    sval: col.clone(),
+                                })),
+                            }],
+                            location: -1,
+                        })),
+                    })),
+                    rexpr: Some(Box::new(k.clone())),
+                    location: -1,
+                };
+                eq.location = -1;
+                consts.push((
+                    alias.clone(),
+                    pg_query::protobuf::Node {
+                        node: Some(N::AExpr(Box::new(eq))),
+                    },
+                ));
+            }
+            continue;
+        }
+        // Each side's own members, chained; the first on each side join.
+        for alias in [a1, a2] {
+            let mine: Vec<&(String, String)> =
+                class.members.iter().filter(|(a, _)| a == alias).collect();
+            for w in mine.windows(2) {
+                plan.restrict
+                    .push((alias.clone(), w[0].1.clone(), w[1].1.clone()));
+            }
+        }
+        let first = |alias: &str| class.members.iter().find(|(a, _)| a == alias).cloned();
+        if let (Some(x), Some(y)) = (first(a1), first(a2)) {
+            plan.join_keys.push((x, y));
+        }
+    }
+    Some((plan, absorbed, consts))
 }
 
 /// The aliases a WHERE conjunct is false or NULL for when their columns are

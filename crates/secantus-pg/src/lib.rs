@@ -53,6 +53,7 @@ mod grace_join;
 mod hba;
 mod ident;
 mod info_columns;
+mod join_search;
 mod largeobjects;
 mod live;
 mod live_notices;
@@ -569,7 +570,24 @@ struct PlannerTable {
     /// What ANALYZE stored, by stored field: a column's `pg_statistic` row,
     /// or `None` for one whose statistics are not modelled. `None` for a
     /// table with no column statistics.
-    analyzed: Option<HashMap<String, Option<secantus_pgplan::hashagg::ColumnStats>>>,
+    analyzed: Option<HashMap<String, Option<AnalyzedColumn>>>,
+}
+
+/// A column's `pg_statistic` row: its scalars, and its most common values,
+/// histogram and correlation where they were recorded.
+struct AnalyzedColumn {
+    stats: secantus_pgplan::hashagg::ColumnStats,
+    slots: Option<secantus_pgplan::colstats::Slots>,
+}
+
+/// A WHERE over a table ANALYZE measured, as the planner estimates it
+/// (`clauselist_selectivity`).
+struct MeasuredWhere {
+    /// The whole WHERE's selectivity.
+    selectivity: f64,
+    /// By stored field: the selectivity of its index quals (its clauses but
+    /// `<>`), which `btcostestimate` reads for an index leading with it.
+    index_selectivity: HashMap<String, f64>,
 }
 
 /// What a grouping asks of the planner beyond its keys, for the choice
@@ -5681,21 +5699,28 @@ impl PgHandler {
             tuples,
             analyzed,
         } = self.planner_table(table, table_count)?;
-        // Over a table ANALYZE measured, a WHERE's selectivity comes from its
-        // most common values and histogram, and an index scan's cost from
-        // the column's correlation, neither of which is modelled -- so a
-        // LIMIT, under which a Group over an index scan in the keys' order
-        // competes, is declined when an index leads with a group key.
+        // Over a table ANALYZE measured, a LIMIT is declined when a Group
+        // over an index scan in the keys' order competes (an index leads
+        // with a group key) or under a WHERE: those paths are not priced
+        // from the statistics.
         if analyzed.is_some()
+            && shape.limit.is_some()
             && (!filter.is_empty()
-                || shape.limit.is_some()
-                    && self
-                        .cost_indexes(table, &def, table_count as u64)
-                        .iter()
-                        .any(|ix| key_cols.iter().any(|(k, _)| k == &ix.field)))
+                || self
+                    .cost_indexes(table, &def, table_count as u64)
+                    .iter()
+                    .any(|ix| key_cols.iter().any(|(k, _)| k == &ix.field)))
         {
             return None;
         }
+        // A WHERE over it is estimated from its statistics, or declined.
+        let measured_where = match &analyzed {
+            Some(stats) if !filter.is_empty() => {
+                let indexes = self.cost_indexes(table, &def, table_count as u64);
+                Some(self.analyzed_where(table, &def, &unique, stats, tuples, filter, &indexes)?)
+            }
+            _ => None,
+        };
         let pk: Vec<&secantus_pgcatalog::Column> = def.columns.iter().filter(|c| c.pk).collect();
         // `remove_useless_groupby_columns`: a GROUP BY holding the whole
         // primary key groups by that key alone.
@@ -5721,7 +5746,7 @@ impl PgHandler {
                     hashagg::KeyStat::Bool
                 } else if let Some(stats) = measured {
                     hashagg::KeyStat::Analyzed {
-                        stats: (*stats)?,
+                        stats: stats.as_ref()?.stats,
                         unique: unique.contains(field),
                     }
                 } else if unique.contains(field) {
@@ -5733,6 +5758,8 @@ impl PgHandler {
             .collect::<Option<_>>()?;
         let read = if filter.is_empty() {
             tuples
+        } else if let Some(w) = &measured_where {
+            costsize::clamp_row_est(tuples * w.selectivity)
         } else {
             let ndistinct = |field: &str| {
                 if unique.iter().any(|u| u == field) {
@@ -5808,19 +5835,85 @@ impl PgHandler {
                         tuples.min(200.0)
                     }
                 };
+                // The indexes whose leading columns are the group keys in
+                // order give a Group its input already sorted.
+                let presorts = |ix: &costsize::Index| {
+                    ix.columns.len() >= sort_keys.len()
+                        && sort_keys
+                            .iter()
+                            .zip(&ix.columns)
+                            .all(|(k, c)| k.1 && &key_cols[k.0].0 == c)
+                };
+                if let Some(stats) = &analyzed {
+                    // Over a measured table each index's quals are what the
+                    // statistics give them, and its scan's cost reads the
+                    // leading column's correlation.
+                    let correlations = Self::stats_correlations(&def, stats);
+                    let index_sel = |f: &str| {
+                        measured_where
+                            .as_ref()
+                            .and_then(|w| w.index_selectivity.get(f).copied())
+                    };
+                    let mut measured = indexes.clone();
+                    for ix in &mut measured {
+                        let c = match correlations.get(&ix.field) {
+                            Some(Some(c)) => *c,
+                            Some(None) if index_sel(&ix.field).is_some() || presorts(ix) => {
+                                return None
+                            }
+                            _ => 0.0,
+                        };
+                        ix.correlation = if ix.columns.len() > 1 { c * 0.75 } else { c };
+                    }
+                    let colsel = |f: &str| costsize::ColSel::Given(index_sel(f).unwrap_or(1.0));
+                    let ((_, input), ordered_by) =
+                        costsize::scan_path(&rel, &measured, &quals, &colsel, read);
+                    // A plain index scan returns the rows in the index's
+                    // order: modelled only where that is the heap's.
+                    if let Some(ix) = ordered_by {
+                        if !self.heap_in_order_of(table, &ix.field) {
+                            return None;
+                        }
+                    }
+                    let presorted: Vec<(f64, f64, f64)> = measured
+                        .iter()
+                        .filter(|ix| presorts(ix))
+                        .map(|ix| {
+                            let (s, t) = costsize::ordered_index_scan_with(
+                                &rel,
+                                ix,
+                                &quals,
+                                colsel(&ix.field),
+                            );
+                            (s, t, read)
+                        })
+                        .collect();
+                    if let Some(limit) = shape.limit {
+                        return Some(costsize::limited_grouping_sorted(
+                            input,
+                            read,
+                            groups as f64,
+                            kept.len(),
+                            shape.aggs,
+                            limit,
+                            &presorted,
+                        ));
+                    }
+                    return Some(costsize::sorted_grouping_wins_over(
+                        input,
+                        read,
+                        groups as f64,
+                        kept.len(),
+                        shape.aggs,
+                        ordered,
+                        &presorted,
+                    ));
+                }
                 let input = costsize::cheapest_scan(&rel, &indexes, &quals, &ndistinct, read);
                 if let Some(limit) = shape.limit {
-                    // The indexes whose leading columns are the group keys
-                    // in order give the Group its input already sorted.
                     let presorted: Vec<(f64, f64, f64)> = indexes
                         .iter()
-                        .filter(|ix| {
-                            ix.columns.len() >= sort_keys.len()
-                                && sort_keys
-                                    .iter()
-                                    .zip(&ix.columns)
-                                    .all(|(k, c)| k.1 && &key_cols[k.0].0 == c)
-                        })
+                        .filter(|ix| presorts(ix))
                         .map(|ix| {
                             let (s, t) = costsize::ordered_index_scan(
                                 &rel,
@@ -5851,11 +5944,16 @@ impl PgHandler {
                 ))
             }
         };
+        // Where no costs are weighed, the scan the rows arrive from is not
+        // known to be in the heap's order.
+        if measured_where.is_some() && (sort_keys.is_empty() || !shape.can_hash) {
+            return None;
+        }
         let sorted = !sort_keys.is_empty()
             && (!shape.can_hash
                 || match priced() {
                     Some(sorted) => sorted,
-                    None if shape.limit.is_some() => return None,
+                    None if shape.limit.is_some() || measured_where.is_some() => return None,
                     None => false,
                 });
         if sorted {
@@ -5889,6 +5987,16 @@ impl PgHandler {
             .iter()
             .map(|k| hashed.iter().map(|&i| k[i].clone()).collect())
             .collect();
+        // The groups reach the hash table in the order of the scan, which
+        // for a WHERE over a measured table is the heap's (a sequential or
+        // bitmap scan, or an index scan in the heap's order).
+        if measured_where.is_some() {
+            let (arrival, trailing) = self.heap_arrival(table, filter, key_cols, keys)?;
+            let reordered: Vec<Vec<Option<Bson>>> =
+                arrival.iter().map(|&g| kept_keys[g].clone()).collect();
+            let order = hashagg::hash_agg_order(&reordered, &types, groups, trailing)?;
+            return Some(order.into_iter().map(|i| arrival[i]).collect());
+        }
         hashagg::hash_agg_order(&kept_keys, &types, groups, trailing_rows)
     }
 
@@ -5966,10 +6074,13 @@ impl PgHandler {
                         });
                         let stats = (same && !entry.get_bool("unmodelled").unwrap_or(false))
                             .then(|| {
-                                Some(hashagg::ColumnStats {
-                                    null_frac: entry.get_f64("null_frac").ok()? as f32,
-                                    distinct: entry.get_f64("distinct").ok()? as f32,
-                                    width: entry.get_i32("width").ok()?,
+                                Some(AnalyzedColumn {
+                                    stats: hashagg::ColumnStats {
+                                        null_frac: entry.get_f64("null_frac").ok()? as f32,
+                                        distinct: entry.get_f64("distinct").ok()? as f32,
+                                        width: entry.get_i32("width").ok()?,
+                                    },
+                                    slots: Self::stored_slots(entry),
                                 })
                             })
                             .flatten();
@@ -5992,7 +6103,7 @@ impl PgHandler {
                 let stawidth = analyzed
                     .as_ref()
                     .and_then(|stats| stats.get(&c.field())?.as_ref())
-                    .map_or(0, |s| s.width);
+                    .map_or(0, |a| a.stats.width);
                 if stawidth > 0 {
                     return i64::from(stawidth);
                 }
@@ -6032,6 +6143,7 @@ impl PgHandler {
         table: &str,
         key: JoinKey<'_>,
         filter: &Document,
+        column_equalities: usize,
     ) -> Option<secantus_pgplan::joincost::JoinSide> {
         use secantus_pgplan::{costsize, hashagg, joincost};
         let count = self
@@ -6055,7 +6167,11 @@ impl PgHandler {
             tuples: pt.tuples,
         };
         // The side's own WHERE, priced as a scan's quals.
-        let quals = costsize::conjuncts(filter)?;
+        let mut quals = costsize::conjuncts(filter)?;
+        // Equalities between two of its columns an equivalence class
+        // implies: each an operator, `DEFAULT_EQ_SEL` of the rows (`eqsel`
+        // finds no constant), and on no index's column.
+        quals.extend((0..column_equalities).map(|_| (String::new(), costsize::Qual::Eq)));
         let column_nd = |f: &str| {
             if pt.unique.iter().any(|u| u == f) {
                 pt.tuples
@@ -6070,12 +6186,12 @@ impl PgHandler {
                 pt.tuples.min(200.0)
             }
         };
-        let rows = if filter.is_empty() {
+        let rows = if filter.is_empty() && column_equalities == 0 {
             pt.tuples
         } else {
-            (pt.tuples * hashagg::filter_selectivity(filter, &column_nd)?)
-                .round()
-                .max(1.0)
+            let sel = hashagg::filter_selectivity(filter, &column_nd)?
+                * 0.005f64.powi(column_equalities as i32);
+            (pt.tuples * sel).round().max(1.0)
         };
         let indexes = self.cost_indexes(table, &pt.def, count as u64);
         let scan = costsize::cheapest_scan_path(&rel, &indexes, &quals, &column_nd, rows);
@@ -6086,6 +6202,7 @@ impl PgHandler {
             .min_by(|a, b| a.1.total_cmp(&b.1));
         Some(joincost::JoinSide {
             rows,
+            rel_rows: rows,
             tuples: pt.tuples,
             scan,
             startup_scan: (0.0, costsize::seq_scan(&rel, &quals)),
@@ -6104,8 +6221,9 @@ impl PgHandler {
     /// table the model prices.
     fn join_cursor_scrolls(&self, js: &secantus_pgplan::cursor_scroll::JoinScroll) -> Option<bool> {
         use secantus_pgplan::joincost;
-        let side =
-            |table: &str, key: &str| self.join_side(table, JoinKey::Column(key), &Document::new());
+        let side = |table: &str, key: &str| {
+            self.join_side(table, JoinKey::Column(key), &Document::new(), 0)
+        };
         let left = side(&js.left_table, &js.left_key)?;
         let right = side(&js.right_table, &js.right_key)?;
         Some(!joincost::ordered_join_on_top(
@@ -6116,6 +6234,247 @@ impl PgHandler {
             // `cursor_tuple_fraction`'s default.
             0.1,
         ))
+    }
+
+    /// A WHERE over `table`, which ANALYZE measured (`stats`), estimated as
+    /// PostgreSQL 15's planner estimates it: each clause a comparison of a
+    /// column with a constant (`colstats::Column::clause_sel`), combined by
+    /// `clauselist_selectivity` (`colstats::clauselist`). `None` for any
+    /// other clause (OR, IN, IS NULL, a pattern, an expression), a constant
+    /// not of the column's type, or a column whose statistics are not
+    /// modelled.
+    #[allow(clippy::too_many_arguments)]
+    fn analyzed_where(
+        &self,
+        table: &str,
+        def: &secantus_pgcatalog::TableDef,
+        unique: &[String],
+        stats: &HashMap<String, Option<AnalyzedColumn>>,
+        tuples: f64,
+        filter: &Document,
+        indexes: &[secantus_pgplan::costsize::Index],
+    ) -> Option<MeasuredWhere> {
+        use secantus_pgplan::colstats::{self, Op};
+        fn flatten(doc: &Document, out: &mut Vec<(String, Op, Bson)>) -> Option<()> {
+            for (key, value) in doc {
+                match (key.as_str(), value) {
+                    ("$and", Bson::Array(items)) => {
+                        for item in items {
+                            flatten(item.as_document()?, out)?;
+                        }
+                    }
+                    (k, _) if k.starts_with('$') => return None,
+                    (_, Bson::Null) => return None,
+                    (field, Bson::Document(ops)) if ops.keys().any(|k| k.starts_with('$')) => {
+                        for (op, operand) in ops {
+                            // `<> x` is lowered with `$ne: null` beside it.
+                            if op == "$ne" && operand == &Bson::Null {
+                                continue;
+                            }
+                            let op = match op.as_str() {
+                                "$eq" => Op::Eq,
+                                "$ne" => Op::Ne,
+                                "$lt" => Op::Lt,
+                                "$lte" => Op::Le,
+                                "$gt" => Op::Gt,
+                                "$gte" => Op::Ge,
+                                _ => return None,
+                            };
+                            out.push((field.to_string(), op, operand.clone()));
+                        }
+                    }
+                    (_, Bson::Document(_) | Bson::Array(_)) => return None,
+                    (field, v) => out.push((field.to_string(), Op::Eq, v.clone())),
+                }
+            }
+            Some(())
+        }
+        let mut clauses = Vec::new();
+        flatten(filter, &mut clauses)?;
+        let docs = self.table_docs(table).ok()?;
+        let mut fields: Vec<String> = Vec::new();
+        for (f, _, _) in &clauses {
+            if !fields.contains(f) {
+                fields.push(f.clone());
+            }
+        }
+        let mut columns = Vec::with_capacity(fields.len());
+        for f in &fields {
+            let c = def.columns.iter().find(|c| &c.field() == f)?;
+            let base = c.pg_type.trim_start_matches("pg_catalog.");
+            let numeric = matches!(base, "int2" | "int4" | "int8");
+            let measured = match stats.get(f) {
+                Some(Some(a)) => Some((a.stats, a.slots.as_ref()?)),
+                Some(None) => return None,
+                None => None,
+            };
+            // `get_actual_variable_range`: the current extremes, read from a
+            // B-tree index that leads with the column.
+            let actual = (numeric && indexes.iter().any(|ix| &ix.field == f))
+                .then(|| {
+                    let mut keys: Vec<Vec<u8>> = docs
+                        .iter()
+                        .filter_map(|d| Self::stats_key(base, d.get(f)?))
+                        .collect();
+                    keys.sort();
+                    Some((keys.first()?.clone(), keys.last()?.clone()))
+                })
+                .flatten();
+            columns.push(colstats::Column {
+                stats: measured,
+                unique: unique.contains(f),
+                boolean: base == "bool",
+                numeric,
+                actual,
+                tuples,
+            });
+        }
+        let mut keyed: Vec<(usize, Op, Vec<u8>)> = Vec::with_capacity(clauses.len());
+        for (f, op, v) in &clauses {
+            let i = fields.iter().position(|x| x == f)?;
+            let c = def.columns.iter().find(|c| &c.field() == f)?;
+            let key = Self::stats_key(c.pg_type.trim_start_matches("pg_catalog."), v)?;
+            keyed.push((i, *op, key));
+        }
+        let list = |pick: &dyn Fn(usize, Op) -> bool| {
+            let chosen: Vec<(&colstats::Column, Op, Vec<u8>)> = keyed
+                .iter()
+                .filter(|(i, op, _)| pick(*i, *op))
+                .map(|(i, op, k)| (&columns[*i], *op, k.clone()))
+                .collect();
+            colstats::clauselist(&chosen)
+        };
+        let selectivity = list(&|_, _| true)?;
+        let mut index_selectivity = HashMap::new();
+        for (i, f) in fields.iter().enumerate() {
+            if keyed.iter().any(|(j, op, _)| *j == i && *op != Op::Ne) {
+                index_selectivity.insert(f.clone(), list(&|j, op| j == i && op != Op::Ne)?);
+            }
+        }
+        Some(MeasuredWhere {
+            selectivity,
+            index_selectivity,
+        })
+    }
+
+    /// Each measured column's ANALYZE correlation (`btcostestimate` reads
+    /// the leading column's), by stored field: 0 where none was stored (one
+    /// value), `None` where it was measured in an order not modelled (text,
+    /// in the reference's locale; a column whose statistics are not).
+    fn stats_correlations(
+        def: &secantus_pgcatalog::TableDef,
+        stats: &HashMap<String, Option<AnalyzedColumn>>,
+    ) -> HashMap<String, Option<f64>> {
+        stats
+            .iter()
+            .map(|(f, a)| {
+                let ordered = def.columns.iter().any(|c| {
+                    &c.field() == f
+                        && matches!(
+                            c.pg_type.trim_start_matches("pg_catalog."),
+                            "int2" | "int4" | "int8" | "bool"
+                        )
+                });
+                let c = match a.as_ref().map(|a| a.slots.as_ref().map(|s| s.correlation)) {
+                    Some(Some(Some(c))) if ordered => Some(f64::from(c)),
+                    Some(Some(None)) => Some(0.0),
+                    _ => None,
+                };
+                (f.clone(), c)
+            })
+            .collect()
+    }
+
+    /// A constant's key for the statistics of a column of type `base`
+    /// (`colstats`): an integer's `int_key`, a string's bytes, a bool's
+    /// byte. `None` for another type or a value not of it.
+    fn stats_key(base: &str, v: &Bson) -> Option<Vec<u8>> {
+        match (base, v) {
+            ("int2" | "int4" | "int8", Bson::Int32(n)) => {
+                Some(secantus_pgplan::colstats::int_key(i64::from(*n)))
+            }
+            ("int2" | "int4" | "int8", Bson::Int64(n)) => {
+                Some(secantus_pgplan::colstats::int_key(*n))
+            }
+            ("text" | "varchar" | "character varying", Bson::String(s)) => {
+                Some(s.as_bytes().to_vec())
+            }
+            ("bool", Bson::Boolean(b)) => Some(vec![u8::from(*b)]),
+            _ => None,
+        }
+    }
+
+    /// The order `table`'s rows through `filter`, read in heap order, first
+    /// reach each of `keys`' groups (one key value per `key_cols` column),
+    /// and whether a row of an earlier group follows the last group's first
+    /// (`hashagg::hash_agg_order`). `None` when a row's key is not one of
+    /// `keys`.
+    fn heap_arrival(
+        &self,
+        table: &str,
+        filter: &Document,
+        key_cols: &[(String, String)],
+        keys: &[Vec<Option<Bson>>],
+    ) -> Option<(Vec<usize>, bool)> {
+        let index: HashMap<String, usize> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (format!("{k:?}"), i))
+            .collect();
+        if index.len() != keys.len() {
+            return None;
+        }
+        // The rows the WHERE keeps, as the server's own scan finds them,
+        // counted by content; read back in the heap's order.
+        let mut kept: HashMap<String, usize> = HashMap::new();
+        for raw in self.scan_table(table, filter, true).ok()? {
+            *kept
+                .entry(format!("{:?}", decode_doc(&raw).ok()?))
+                .or_insert(0) += 1;
+        }
+        let mut seen = vec![false; keys.len()];
+        let (mut arrival, mut trailing) = (Vec::with_capacity(keys.len()), false);
+        for d in self.table_docs(table).ok()? {
+            match kept.get_mut(&format!("{d:?}")) {
+                Some(n) if *n > 0 => *n -= 1,
+                _ => continue,
+            }
+            let key: Vec<Option<Bson>> = key_cols
+                .iter()
+                .map(|(f, _)| match d.get(f) {
+                    None | Some(Bson::Null) => None,
+                    Some(v) => Some(v.clone()),
+                })
+                .collect();
+            let g = *index.get(&format!("{key:?}"))?;
+            trailing = seen[g];
+            if !seen[g] {
+                seen[g] = true;
+                arrival.push(g);
+            }
+        }
+        (arrival.len() == keys.len()).then_some((arrival, trailing))
+    }
+
+    /// Whether `table`'s rows, in heap order, are in `field`'s order with no
+    /// NULLs -- so that an index scan on it returns them as the heap does.
+    fn heap_in_order_of(&self, table: &str, field: &str) -> bool {
+        let Ok(docs) = self.table_docs(table) else {
+            return false;
+        };
+        let mut prev: Option<&Bson> = None;
+        for d in &docs {
+            match d.get(field) {
+                None | Some(Bson::Null) => return false,
+                Some(v) => {
+                    if prev.is_some_and(|p| compare_values(p, v) == Ordering::Greater) {
+                        return false;
+                    }
+                    prev = Some(v);
+                }
+            }
+        }
+        true
     }
 
     /// The pages PostgreSQL's heap would hold `table`'s rows in, freshly
@@ -6226,6 +6585,7 @@ impl PgHandler {
                 pages,
                 height,
                 columns: fields.clone(),
+                correlation: 0.0,
             });
         };
         let pk: Vec<String> = def
@@ -6637,7 +6997,7 @@ impl PgHandler {
 
     fn materialise_sub(&self, stmt: &Statement, def: &TableDef) -> PgWireResult<Vec<Document>> {
         if let Statement::JoinRows(join) = stmt {
-            return self.join_rows(&join.tree);
+            return join_search::with_join_where(join, || self.join_rows(&join.tree));
         }
         let (_, rows) = self.rows_with_schema(stmt)?;
         Ok(rows
@@ -6728,9 +7088,15 @@ impl PgHandler {
                 equi,
                 merged,
                 expr_keys,
+                ec,
                 left_keys,
                 right_keys,
+                ..
             } => {
+                // Three tables: PostgreSQL's join order search.
+                if let Some(rows) = self.three_table_join(node, limit)? {
+                    return Ok(rows);
+                }
                 let lrows = self.join_rows(left)?;
                 if let JoinNode::Lateral {
                     sql,
@@ -6755,6 +7121,14 @@ impl PgHandler {
                 }
                 let mut rrows = self.join_rows(right)?;
                 let mut lrows = lrows;
+                // The equalities between one side's own columns its
+                // equivalence classes imply: quals of that side's scan, so
+                // applied before its rows are put in the plan's order. The
+                // WHERE they come from still decides every joined row.
+                if let Some(ec) = ec {
+                    retain_equal_columns(&mut lrows, &ec.left_restrict);
+                    retain_equal_columns(&mut rrows, &ec.right_restrict);
+                }
                 // A join on one expression equality (`a.x = b.y + 3`) is
                 // keyed by each side's value of its expression, as the
                 // Sort or Hash under PostgreSQL's join is: evaluated into
@@ -6772,11 +7146,29 @@ impl PgHandler {
                     _ => equi,
                 };
                 // A plan with the right side outer runs with the sides
-                // swapped, so the loop below walks the outer side's rows.
-                let swap = merged.is_empty()
-                    && self.order_general_join_inputs(
-                        *kind, left, right, equi, expr_keys, limit, &mut lrows, &mut rrows,
-                    );
+                // swapped, so the loop below walks the outer side's rows; a
+                // hash right join keeps the (now right) rows nothing
+                // matched, as a RIGHT join does.
+                let order = if merged.is_empty() {
+                    self.order_general_join_inputs(
+                        *kind,
+                        left,
+                        right,
+                        equi,
+                        expr_keys,
+                        ec.as_ref(),
+                        limit,
+                        &mut lrows,
+                        &mut rrows,
+                    )
+                } else {
+                    GeneralOrder::Keep
+                };
+                let (kind, swap) = match order {
+                    GeneralOrder::Keep => (*kind, false),
+                    GeneralOrder::Swap => (*kind, true),
+                    GeneralOrder::SwapRight => (secantus_pgplan::joins::JoinKind::Right, true),
+                };
                 let swapped_equi: Vec<(String, String)>;
                 let (equi, left_keys, right_keys) = if swap {
                     std::mem::swap(&mut lrows, &mut rrows);
@@ -6788,7 +7180,7 @@ impl PgHandler {
                 let mut lrows = Some(lrows);
                 let mut out = Vec::new();
                 self.join_rows_core(
-                    *kind,
+                    kind,
                     on.as_ref(),
                     equi,
                     merged,
@@ -7400,26 +7792,45 @@ impl PgHandler {
         right: &secantus_pgplan::joins::JoinNode,
         equi: &[(String, String)],
         expr_keys: &[secantus_pgplan::joins::ExprEquality],
+        ec: Option<&secantus_pgplan::joins::JoinEc>,
         limit: Option<usize>,
         lrows: &mut Vec<Document>,
         rrows: &mut Vec<Document>,
-    ) -> bool {
-        let (column_equi, expr_keys) = match equi {
-            [(k, _)] if k == EXPR_JOIN_KEY => (&[][..], expr_keys),
-            _ => (equi, &[][..]),
+    ) -> GeneralOrder {
+        let expr = matches!(equi, [(k, _)] if k == EXPR_JOIN_KEY);
+        let (column_equi, expr_keys) = if expr {
+            (&[][..], expr_keys)
+        } else {
+            (equi, &[][..])
         };
-        if let (Some(method), [(lk, rk)]) = (
-            self.general_join_method(kind, left, right, column_equi, expr_keys, limit),
-            equi,
-        ) {
-            reorder_join_inputs(method, lrows, lk, rrows, rk);
-            return joincost_outer_is_b(method);
+        use secantus_pgplan::joincost::JoinMethod;
+        if let Some((method, lk, rk, a_rows)) =
+            self.general_join_method(kind, left, right, column_equi, expr_keys, ec, limit)
+        {
+            if method == JoinMethod::HashRightB {
+                // The left rows nothing matches come last, in the hash
+                // table's order: known only for a key type hashed here.
+                return match leaf_key_type(left, &lk) {
+                    Some(ty) if hash_table_order(lrows, &lk, &ty, a_rows) => {
+                        GeneralOrder::SwapRight
+                    }
+                    _ => GeneralOrder::Keep,
+                };
+            }
+            reorder_join_inputs(method, lrows, &lk, rrows, &rk);
+            if joincost_outer_is_b(method) {
+                return GeneralOrder::Swap;
+            }
         }
-        false
+        GeneralOrder::Keep
     }
 
     /// The plan PostgreSQL picks for a general join of two plain tables on
-    /// one equality, or `None` for any other shape.
+    /// one equality (a column's, an expression's, or the one join clause
+    /// its equivalence classes leave), or on none (a nested loop over every
+    /// pair), and the keys each side's rows are put in that plan's order
+    /// by; `None` for any other shape.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn general_join_method(
         &self,
         kind: secantus_pgplan::joins::JoinKind,
@@ -7427,42 +7838,47 @@ impl PgHandler {
         right: &secantus_pgplan::joins::JoinNode,
         equi: &[(String, String)],
         expr_keys: &[secantus_pgplan::joins::ExprEquality],
+        ec: Option<&secantus_pgplan::joins::JoinEc>,
         limit: Option<usize>,
-    ) -> Option<secantus_pgplan::joincost::JoinMethod> {
-        use secantus_pgplan::joins::{JoinKind, JoinNode, SEP};
+    ) -> Option<(secantus_pgplan::joincost::JoinMethod, String, String, f64)> {
+        use secantus_pgplan::joins::{JoinKind, SEP};
         if !matches!(kind, JoinKind::Inner | JoinKind::Left) {
             return None;
         }
-        // One join key: a column equality, or one over an expression.
+        // One join key: a column equality, or one over an expression; or,
+        // under equivalence classes, the one join clause they leave or none.
         let column = |k: &str| k.split(SEP).nth(1).map(str::to_string);
         let side_key = |col: &Option<String>, ops: u32| match col {
             Some(k) => column(k).map(Ok),
             None => Some(Err(ops)),
         };
-        let (lkey, rkey) = match (equi, expr_keys) {
-            ([(lk, rk)], []) => (column(lk).map(Ok)?, column(rk).map(Ok)?),
-            ([], [e]) => (
+        let mut restrict = (0, 0);
+        let (lkey, rkey, order) = match (ec, equi, expr_keys) {
+            (Some(ec), _, []) => {
+                restrict = (ec.left_restrict.len(), ec.right_restrict.len());
+                match ec.join_keys.as_slice() {
+                    [] => (Err(0), Err(0), None),
+                    [(lk, rk)] => (column(lk).map(Ok)?, column(rk).map(Ok)?, Some((lk, rk))),
+                    _ => return None,
+                }
+            }
+            (None, [(lk, rk)], []) => (column(lk).map(Ok)?, column(rk).map(Ok)?, Some((lk, rk))),
+            (None, [], [e]) => (
                 side_key(&e.left_column, e.left_ops)?,
                 side_key(&e.right_column, e.right_ops)?,
+                None,
             ),
             _ => return None,
         };
-        let table = |n: &JoinNode| match n {
-            JoinNode::Leaf { plan, .. } => match plan.as_ref() {
-                Statement::Select(sel)
-                    if sel.residual.is_none()
-                        && sel.sub.is_none()
-                        && sel.join.is_none()
-                        && sel.series.is_none()
-                        && !sel.table.is_empty() =>
-                {
-                    Some((sel.table.clone(), sel.filter.clone()))
-                }
-                _ => None,
-            },
-            _ => None,
+        let order = match (order, expr_keys) {
+            (Some((lk, rk)), _) => (lk.clone(), rk.clone()),
+            (None, [_]) => (EXPR_JOIN_KEY.to_string(), EXPR_JOIN_KEY.to_string()),
+            (None, _) => (String::new(), String::new()),
         };
-        let (Some((lt, lfilter)), Some((rt, rfilter))) = (table(left), table(right)) else {
+        let cross = ec.is_some_and(|ec| ec.join_keys.is_empty());
+        let (Some((lt, lfilter)), Some((rt, rfilter))) =
+            (plain_leaf_table(left), plain_leaf_table(right))
+        else {
             return None;
         };
         if !self.join_small_enough(&lt) || !self.join_small_enough(&rt) {
@@ -7475,17 +7891,18 @@ impl PgHandler {
             }
         }
         let (Some(a), Some(b)) = (
-            self.join_side(&lt, key(&lkey), &lfilter),
-            self.join_side(&rt, key(&rkey), &rfilter),
+            self.join_side(&lt, key(&lkey), &lfilter, restrict.0),
+            self.join_side(&rt, key(&rkey), &rfilter, restrict.1),
         ) else {
             return None;
         };
-        Some(secantus_pgplan::joincost::cheapest_join(
-            &a,
-            &b,
-            matches!(kind, JoinKind::Left),
-            limit.map(|n| n as f64),
-        ))
+        let limit = limit.map(|n| n as f64);
+        let method = if cross {
+            secantus_pgplan::joincost::cheapest_cross_join(&a, &b, limit)
+        } else {
+            secantus_pgplan::joincost::cheapest_join(&a, &b, matches!(kind, JoinKind::Left), limit)
+        };
+        Some((method, order.0, order.1, a.rows))
     }
 
     /// A table small enough to hold whole for its join's plan order: past
@@ -7505,7 +7922,7 @@ impl PgHandler {
         &self,
         join: &secantus_pgplan::JoinSelect,
         limit: Option<usize>,
-    ) -> Option<(secantus_pgplan::joincost::JoinMethod, String, String)> {
+    ) -> Option<(secantus_pgplan::joincost::JoinMethod, String, String, f64)> {
         use secantus_pgplan::{joincost, JoinOp};
         if join.left_sub.is_some() || join.right_sub.is_some() {
             return None;
@@ -7526,19 +7943,20 @@ impl PgHandler {
         ) else {
             return None;
         };
-        // Each side's WHERE as the filter its scan is priced under. An
-        // equality on a join key is not modelled: the planner's equivalence
-        // class (`generate_base_implied_equalities`) turns it into an
-        // equality on both sides and drops the join clause.
+        // An equality of a join key to a constant puts the constant in the
+        // key's equivalence class: each side is then filtered by it, and an
+        // inner join is left with no join clause.
+        let (implied, implied_by) = self.narrow_with_implied(join)?;
+        let join = implied.as_ref();
+        // Each side's WHERE as the filter its scan is priced under.
         let mut filters = [Vec::new(), Vec::new()];
         for pred in &join.filter {
-            let (side, table, key) = if pred.alias == join.left.1 {
-                (0, &join.left.0, &lc)
+            let (side, table) = if pred.alias == join.left.1 {
+                (0, &join.left.0)
             } else {
-                (1, &join.right.0, &rc)
+                (1, &join.right.0)
             };
             let op = match pred.op {
-                JoinOp::Eq if pred.col == *key => return None,
                 JoinOp::Eq => "$eq",
                 JoinOp::Gt => "$gt",
                 JoinOp::Ge => "$gte",
@@ -7559,16 +7977,87 @@ impl PgHandler {
             }
         });
         let (Some(a), Some(b)) = (
-            self.join_side(&join.left.0, JoinKey::Column(&lc), &lfilter),
-            self.join_side(&join.right.0, JoinKey::Column(&rc), &rfilter),
+            self.join_side(&join.left.0, JoinKey::Column(&lc), &lfilter, 0),
+            self.join_side(&join.right.0, JoinKey::Column(&rc), &rfilter, 0),
         ) else {
             return None;
         };
-        Some((
-            joincost::cheapest_join(&a, &b, join.left_join, limit.map(|n| n as f64)),
-            lf,
-            rf,
-        ))
+        let limit = limit.map(|n| n as f64);
+        let method = match implied_by {
+            NarrowImplied::Nothing => joincost::cheapest_join(&a, &b, join.left_join, limit),
+            NarrowImplied::NoJoinClause => joincost::cheapest_cross_join(&a, &b, limit),
+            NarrowImplied::InnerKey => {
+                joincost::cheapest_implied_join(&a, &b, join.left_join, limit)
+            }
+        };
+        Some((method, lf, rf, a.rows))
+    }
+
+    /// A narrow join with the equalities its WHERE implies through the ON
+    /// (`generate_base_implied_equalities_const`): a join key equal to a
+    /// constant makes the other side's key equal to it too. For a LEFT
+    /// join only the outer key's constant carries to the inner side
+    /// (`reconsider_outer_join_clauses`), and the ON stays its join clause.
+    /// With it, what the constant leaves of the join clause; `None` when
+    /// the class is not one modelled (two constants, keys of two types).
+    fn narrow_with_implied<'a>(
+        &self,
+        join: &'a secantus_pgplan::JoinSelect,
+    ) -> Option<(
+        std::borrow::Cow<'a, secantus_pgplan::JoinSelect>,
+        NarrowImplied,
+    )> {
+        use secantus_pgplan::{JoinOp, JoinPred};
+        let ((la, lc), (ra, rc)) = join.on.as_ref().map(|(a, b)| {
+            if a.0 == join.left.1 {
+                (a.clone(), b.clone())
+            } else {
+                (b.clone(), a.clone())
+            }
+        })?;
+        let on_key = |p: &JoinPred| {
+            p.op == JoinOp::Eq && ((p.alias == la && p.col == lc) || (p.alias == ra && p.col == rc))
+        };
+        let consts: Vec<&JoinPred> = join.filter.iter().filter(|p| on_key(p)).collect();
+        let Some(first) = consts.first() else {
+            return Some((std::borrow::Cow::Borrowed(join), NarrowImplied::Nothing));
+        };
+        if first.value == Bson::Null
+            || consts.iter().any(|p| {
+                secantus_pgplan::compare_values(&p.value, &first.value)
+                    != Some(std::cmp::Ordering::Equal)
+            })
+        {
+            return None;
+        }
+        let ty = |table: &str, col: &str| {
+            self.lookup(table)
+                .and_then(|d| d.column(col).map(|c| c.pg_type.clone()))
+        };
+        if ty(&join.left.0, &lc)? != ty(&join.right.0, &rc)? {
+            return None;
+        }
+        let mut implied = join.clone();
+        for (alias, col, outer) in [(&la, &lc, true), (&ra, &rc, false)] {
+            let has = consts.iter().any(|p| p.alias == *alias);
+            let from_outer = consts.iter().any(|p| p.alias == la);
+            if !has && (!join.left_join || (!outer && from_outer)) {
+                implied.filter.push(JoinPred {
+                    alias: alias.clone(),
+                    col: col.clone(),
+                    op: JoinOp::Eq,
+                    value: first.value.clone(),
+                });
+            }
+        }
+        let by = if !join.left_join {
+            NarrowImplied::NoJoinClause
+        } else if consts.iter().any(|p| p.alias == la) {
+            NarrowImplied::InnerKey
+        } else {
+            NarrowImplied::Nothing
+        };
+        Some((std::borrow::Cow::Owned(implied), by))
     }
 
     fn join_docs_with(
@@ -7590,9 +8079,14 @@ impl PgHandler {
         // A join PostgreSQL plans with `b` outer runs with the sides swapped,
         // so the nested loop below walks the outer side's rows in turn.
         let mut swapped = None;
+        let mut right_join_misses: Option<Vec<Document>> = None;
         let limit = if join.order.is_none() { bound } else { None };
-        if let Some((method, lf, rf)) = self.narrow_join_method(join, limit) {
-            let (keep_left, keep_right) = self.narrow_join_preds(join)?;
+        if let Some((method, lf, rf, a_rows)) = self.narrow_join_method(join, limit) {
+            // The equalities the WHERE implies filter each side too.
+            let (implied, _) = self
+                .narrow_with_implied(join)
+                .expect("narrow_join_method checked it");
+            let (keep_left, keep_right) = self.narrow_join_preds(&implied)?;
             let rows = left_rows.as_mut().expect("set above");
             // The WHERE first: each side is sorted (or hashed) after its
             // scan applies its quals, so its ties come out in the order of
@@ -7600,7 +8094,38 @@ impl PgHandler {
             rows.retain(|d| keep_left.iter().all(|keep| keep(d)));
             right_rows.retain(|d| keep_right.iter().all(|keep| keep(d)));
             reorder_join_inputs(method, rows, &lf, &mut right_rows, &rf);
-            if joincost_outer_is_b(method) {
+            let key_type = || {
+                let (_, col) = join.on.as_ref().map(|(a, b)| {
+                    if a.0 == join.left.1 {
+                        a.clone()
+                    } else {
+                        b.clone()
+                    }
+                })?;
+                self.lookup(&join.left.0)?
+                    .column(&col)
+                    .map(|c| c.pg_type.clone())
+            };
+            if method == secantus_pgplan::joincost::JoinMethod::HashRightB
+                && key_type().is_some_and(|ty| hash_table_order(rows, &lf, &ty, a_rows))
+            {
+                // A hash right join: the right rows probe the left ones,
+                // hashed, in an inner join; the left rows nothing matched
+                // follow, in the hash table's order.
+                let index = crate::stream_join::NarrowIndex::new(&right_rows, &rf);
+                let misses = rows
+                    .iter()
+                    .filter(|l| index.matches(&right_rows, &rf, l.get(&lf)).is_empty())
+                    .cloned()
+                    .collect();
+                right_join_misses = Some(misses);
+                let mut j = join.clone();
+                std::mem::swap(&mut j.left, &mut j.right);
+                std::mem::swap(&mut j.left_sub, &mut j.right_sub);
+                j.left_join = false;
+                std::mem::swap(rows, &mut right_rows);
+                swapped = Some(j);
+            } else if joincost_outer_is_b(method) {
                 let mut j = join.clone();
                 std::mem::swap(&mut j.left, &mut j.right);
                 std::mem::swap(&mut j.left_sub, &mut j.right_sub);
@@ -7608,6 +8133,7 @@ impl PgHandler {
                 swapped = Some(j);
             }
         }
+        let original = join;
         let join = swapped.as_ref().unwrap_or(join);
         let mut out = Vec::new();
         self.join_docs_core(
@@ -7624,6 +8150,24 @@ impl PgHandler {
                 Ok(true)
             },
         )?;
+        if let Some(misses) = right_join_misses {
+            let mut misses = Some(misses);
+            self.join_docs_core(
+                original,
+                &mut |sink| {
+                    if let Some(rows) = misses.take() {
+                        sink(rows)?;
+                    }
+                    Ok(())
+                },
+                Vec::new(),
+                &mut |docs| {
+                    out.extend(docs);
+                    Ok(true)
+                },
+            )?;
+        }
+        let join = original;
         if let Some((_, _, ascending)) = &join.order {
             // PostgreSQL sorts NULLS LAST ascending / FIRST descending, which
             // the LEFT-JOIN misses rely on.
@@ -11707,7 +12251,9 @@ impl PgHandler {
     /// ANALYZE of `table` (`do_analyze_rel`), or of the `columns` named:
     /// `pg_class`'s `relpages` and `reltuples` as the table stands, and for
     /// each column analysed its `pg_statistic` row
-    /// (`hashagg::analyze_column`), kept under `columns` by stored field
+    /// (`hashagg::analyze_column`, and its most common values, histogram and
+    /// correlation: `colstats::scalar_slots`, as byte keys in the type's
+    /// order), kept under `columns` by stored field
     /// with the column's name and type -- a snapshot, which rows inserted
     /// later do not change. A column whose type's statistics are not
     /// modelled is recorded as such (`unmodelled`), and a table with more
@@ -11765,6 +12311,26 @@ impl PgHandler {
                         entry.insert("null_frac", f64::from(s.null_frac));
                         entry.insert("distinct", f64::from(s.distinct));
                         entry.insert("width", s.width);
+                        let slots =
+                            secantus_pgplan::colstats::scalar_slots(&values, target as usize);
+                        let bin = |k: &[u8]| {
+                            Bson::Binary(bson::Binary {
+                                subtype: bson::spec::BinarySubtype::Generic,
+                                bytes: k.to_vec(),
+                            })
+                        };
+                        let mcv: Vec<Bson> = slots
+                            .mcv
+                            .iter()
+                            .map(|(k, f)| Bson::Array(vec![bin(k), Bson::Double(f64::from(*f))]))
+                            .collect();
+                        entry.insert("mcv", mcv);
+                        entry.insert("mcv_complete", slots.mcv_complete);
+                        let hist: Vec<Bson> = slots.histogram.iter().map(|k| bin(k)).collect();
+                        entry.insert("histogram", hist);
+                        if let Some(c) = slots.correlation {
+                            entry.insert("correlation", f64::from(c));
+                        }
                     }
                     None => {
                         entry.insert("unmodelled", true);
@@ -11786,9 +12352,40 @@ impl PgHandler {
         self.put_comment_doc(Self::RELSTATS_COLLECTION, table, Some(doc))
     }
 
+    /// The most common values, histogram and correlation `record_analyze`
+    /// kept in a column's entry; `None` for an entry without them.
+    fn stored_slots(entry: &Document) -> Option<secantus_pgplan::colstats::Slots> {
+        let key = |b: &Bson| match b {
+            Bson::Binary(b) => Some(b.bytes.clone()),
+            _ => None,
+        };
+        let mcv = entry
+            .get_array("mcv")
+            .ok()?
+            .iter()
+            .map(|m| {
+                let pair = m.as_array()?;
+                Some((key(pair.first()?)?, pair.get(1)?.as_f64()? as f32))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let histogram = entry
+            .get_array("histogram")
+            .ok()?
+            .iter()
+            .map(key)
+            .collect::<Option<Vec<_>>>()?;
+        Some(secantus_pgplan::colstats::Slots {
+            mcv,
+            histogram,
+            correlation: entry.get_f64("correlation").ok().map(|c| c as f32),
+            mcv_complete: entry.get_bool("mcv_complete").ok()?,
+        })
+    }
+
     /// One row's value of `c` as ANALYZE samples it: `Some(None)` for a
     /// NULL, otherwise its key under the type's equality (`=` of its
-    /// default B-tree opclass) and its stored size (`VARSIZE_ANY`: a 1-byte
+    /// default B-tree opclass; an integer's sorts as the number,
+    /// `colstats::int_key`) and its stored size (`VARSIZE_ANY`: a 1-byte
     /// header up to 126 bytes, else 4; the type's width when fixed). `None`
     /// when the type's equality is not modelled, or the value is wider than
     /// ANALYZE compares (`WIDTH_THRESHOLD`, 1,024 bytes).
@@ -11806,9 +12403,11 @@ impl PgHandler {
         };
         match (c.pg_type.trim_start_matches("pg_catalog."), v) {
             ("int2" | "int4" | "int8", Bson::Int32(n)) => {
-                Some(Some((i64::from(*n).to_be_bytes().to_vec(), 0)))
+                Some(Some((secantus_pgplan::colstats::int_key(i64::from(*n)), 0)))
             }
-            ("int2" | "int4" | "int8", Bson::Int64(n)) => Some(Some((n.to_be_bytes().to_vec(), 0))),
+            ("int2" | "int4" | "int8", Bson::Int64(n)) => {
+                Some(Some((secantus_pgplan::colstats::int_key(*n), 0)))
+            }
             ("bool", Bson::Boolean(b)) => Some(Some((vec![u8::from(*b)], 0))),
             // `float8eq`: -0 equals 0, and NaN equals NaN.
             ("float4" | "float8", Bson::Double(x)) => {
@@ -42993,6 +43592,20 @@ impl PgHandler {
     }
 }
 
+/// What a narrow join's constant equivalence class leaves of its join
+/// clause (`PgHandler::narrow_with_implied`).
+#[derive(Clone, Copy)]
+enum NarrowImplied {
+    /// No join key is equal to a constant.
+    Nothing,
+    /// An inner join: the class replaces the clause, and the join is a
+    /// nested loop over every pair.
+    NoJoinClause,
+    /// A LEFT join whose outer key is fixed: the inner key is filtered by
+    /// the constant too, and the ON stays, selecting every pair.
+    InnerKey,
+}
+
 /// What one side of a join is joined on, for `PgHandler::join_side`: a
 /// column, or an expression evaluating this many operators.
 #[derive(Clone, Copy)]
@@ -43055,7 +43668,13 @@ fn reorder_join_inputs(
         }
         JoinMethod::HashOuterA => right.reverse(),
         JoinMethod::HashOuterB => left.reverse(),
-        JoinMethod::NestOuterB | JoinMethod::Other => {}
+        // A hash right join's order is its hash table's (`hash_table_order`),
+        // which its caller puts its rows in; a merge right join's is not
+        // modelled.
+        JoinMethod::NestOuterB
+        | JoinMethod::Other
+        | JoinMethod::HashRightB
+        | JoinMethod::Unmodelled => {}
     }
 }
 
@@ -43078,6 +43697,96 @@ fn expr_key_values(rows: &mut [Document], expr: &secantus_pgplan::ColumnExpr) ->
     for (row, v) in rows.iter_mut().zip(values) {
         row.insert(EXPR_JOIN_KEY, v);
     }
+    true
+}
+
+/// Keep the rows whose two columns of each pair are equal: neither NULL,
+/// and equal as PostgreSQL's `=` of one type is (`compare_values`).
+fn retain_equal_columns(rows: &mut Vec<Document>, pairs: &[(String, String)]) {
+    if pairs.is_empty() {
+        return;
+    }
+    rows.retain(|d| {
+        pairs.iter().all(|(a, b)| {
+            match (
+                d.get(a).filter(|v| **v != Bson::Null),
+                d.get(b).filter(|v| **v != Bson::Null),
+            ) {
+                (Some(x), Some(y)) => {
+                    secantus_pgplan::compare_values(x, y) == Some(Ordering::Equal)
+                }
+                _ => false,
+            }
+        })
+    });
+}
+
+/// How a general join's inputs run after `order_general_join_inputs`.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum GeneralOrder {
+    /// As they are, the left side outer.
+    Keep,
+    /// The right side outer.
+    Swap,
+    /// The right side outer of a RIGHT join: a LEFT join's hash right join.
+    SwapRight,
+}
+
+/// A general join leaf that is a plain stored table: its name and filter.
+pub(crate) fn plain_leaf_table(n: &secantus_pgplan::joins::JoinNode) -> Option<(String, Document)> {
+    match n {
+        secantus_pgplan::joins::JoinNode::Leaf { plan, .. } => match plan.as_ref() {
+            Statement::Select(sel)
+                if sel.residual.is_none()
+                    && sel.sub.is_none()
+                    && sel.join.is_none()
+                    && sel.series.is_none()
+                    && !sel.table.is_empty() =>
+            {
+                Some((sel.table.clone(), sel.filter.clone()))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The type of the column a leaf's joined-row `key` holds.
+pub(crate) fn leaf_key_type(n: &secantus_pgplan::joins::JoinNode, key: &str) -> Option<String> {
+    let secantus_pgplan::joins::JoinNode::Leaf { def, columns, .. } = n else {
+        return None;
+    };
+    let (_, field) = columns.iter().find(|(k, _)| k == key)?;
+    def.columns
+        .iter()
+        .find(|c| c.field() == *field)
+        .map(|c| c.pg_type.clone())
+}
+
+/// Put a hash join's hashed rows in its table's order: bucket by bucket,
+/// each bucket's chain last insert first (`ExecHashTableInsert` pushes at
+/// the head; `ExecScanHashTableForUnmatched` walks the buckets in order).
+/// A probe's matches keep that order, and a RIGHT join's rows nothing
+/// matched come out in it. `rows_estimate` sizes the table; `false`, and
+/// the rows untouched, when a key's type is not hashed here or the rows
+/// outgrow the buckets (the table would grow and rebuild its chains).
+fn hash_table_order(rows: &mut Vec<Document>, key: &str, ty: &str, rows_estimate: f64) -> bool {
+    let nbuckets = secantus_pgplan::joincost::hash_buckets(rows_estimate);
+    if rows.len() > nbuckets {
+        return false;
+    }
+    let mut buckets = Vec::with_capacity(rows.len());
+    for row in rows.iter() {
+        let v = row.get(key).cloned().unwrap_or(Bson::Null);
+        match secantus_pgplan::joincost::hash_bucket(&v, ty, nbuckets) {
+            Some(b) => buckets.push(b),
+            None => return false,
+        }
+    }
+    let mut tagged: Vec<(usize, Document)> = buckets.into_iter().zip(rows.drain(..)).collect();
+    tagged.reverse();
+    tagged.sort_by_key(|(b, _)| *b);
+    rows.extend(tagged.into_iter().map(|(_, d)| d));
     true
 }
 

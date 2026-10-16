@@ -346,7 +346,7 @@ pub fn analyze_column(values: &[Sampled], typlen: i64) -> ColumnStats {
 
 /// `get_variable_numdistinct` for a column with statistics in a table the
 /// planner sizes at `tuples` rows.
-fn analyzed_numdistinct(stats: &ColumnStats, unique: bool, tuples: f64) -> f64 {
+pub(crate) fn analyzed_numdistinct(stats: &ColumnStats, unique: bool, tuples: f64) -> f64 {
     let clamp_row_est = |n: f64| if n <= 1.0 { 1.0 } else { n.round() };
     let mut stadistinct = f64::from(stats.distinct);
     if unique {
