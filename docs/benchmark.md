@@ -218,52 +218,52 @@ client droplets, real NICs between them — and runs **SecantusDB and a real
 drift lands on both equally.
 
 <!-- head-to-head:begin -->
-Measured 2026-10-08 on DigitalOcean `lon1`: a `c-4 (4 vCPU, 8192 MB)` server and 2 x c-2, 16 workers each, 8 KiB **incompressible**
+Measured 2026-10-16 on DigitalOcean `lon1`: a `c-4 (4 vCPU, 8192 MB)` server and 2 x c-2, 16 workers each, 8 KiB **incompressible**
 documents, a 70/20/10 insert/find/update mix, a 4G WiredTiger cache for
 both engines, and 3 interleaved passes:
 
 | engine | version | ops/s (median) | spread | p50 | p99 | p99.9 | server CPU |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| SecantusDB | f162a408cf25ec2a69d57db5b4e3ba29741f5789 | **11,703** | 8.6% | 2.02 ms | 14.02 ms | **29.19 ms** | 78.7% |
-| mongod | 8.0.32 | **15,365** | 3.3% | 1.64 ms | 9.92 ms | **17.41 ms** | 80.1% |
+| SecantusDB | 7a89080d0434a980a4a6e9f4a3109bf4632cc0ff | **10,900** | 0.8% | 2.34 ms | 13.12 ms | **26.62 ms** | 78.9% |
+| mongod | 8.0.34 | **16,886** | 0.9% | 1.57 ms | 8.90 ms | **16.26 ms** | 80.3% |
 
-**SecantusDB reaches 0.76x of MongoDB's throughput on this workload, with p50
-latency within 1.23x and p99.9 within 1.68x.** Both engines saturated the same
+**SecantusDB reaches 0.65x of MongoDB's throughput on this workload, with p50
+latency within 1.49x and p99.9 within 1.64x.** Both engines saturated the same
 server while the clients sat idle, so both figures are server-bound and the
-comparison is fair. Run-to-run spread was about 8.6%.
+comparison is fair. Run-to-run spread was about 0.8%.
 <!-- head-to-head:end -->
 
-This workload was measured three times on the same build — once on
-2026-10-07 and twice on 2026-10-08, on freshly provisioned droplets each
-time. The table above is the newest; all three:
+The table is 0.5.3-beta.196 against `mongod` 8.0.34. The ratio fell from the
+0.72×–0.76× published before, and that fall is `mongod`'s, not ours. On
+2026-10-16 we ran the previous release, 0.5.3-beta.195, against the same
+`mongod` 8.0.34 on a fresh set of droplets, as a control:
 
-| run | SecantusDB ops/s | mongod ops/s | throughput | p50 | p99 | p99.9 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2026-10-07 | 10,175 | 13,928 | 0.73× | 1.25× | 1.49× | 1.77× |
-| 2026-10-08 (a) | 9,064 | 12,635 | 0.72× | 1.32× | 1.39× | 1.26× |
-| 2026-10-08 (b) | 11,703 | 15,365 | 0.76× | 1.23× | 1.41× | 1.68× |
+| run | build | mongod | SecantusDB ops/s | mongod ops/s | throughput | p50 | p99 | p99.9 |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-10-07 | beta.173 | 8.0.32 | 10,175 | 13,928 | 0.73× | 1.25× | 1.49× | 1.77× |
+| 2026-10-08 (a) | beta.173 | 8.0.32 | 9,064 | 12,635 | 0.72× | 1.32× | 1.39× | 1.26× |
+| 2026-10-08 (b) | beta.173 | 8.0.32 | 11,703 | 15,365 | 0.76× | 1.23× | 1.41× | 1.68× |
+| 2026-10-16 (control) | beta.195 | 8.0.34 | 7,236 | 12,122 | 0.60× | 1.61× | 1.28× | 2.86× |
+| 2026-10-16 | beta.196 | 8.0.34 | 10,900 | 16,886 | 0.65× | 1.49× | 1.47× | 1.64× |
 
-The throughput ratio is the stable figure: 0.72×–0.76× while the absolute
-rate of both engines moved by 20%–30% between droplets. p50 and p99 hold
-to 1.2×–1.3× and 1.4×–1.5×. In the newest run SecantusDB's three passes
-spread 8.6%, wider than the 5% this page normally asks of a published
-figure, so read its 11,703 as 10,900–11,900.
+Against the same `mongod`, beta.196 measured 0.65× and beta.195 0.60×, so the
+planner and exact-number work in beta.196 cost nothing measurable here. Our own
+rate stayed inside the 9,000–11,700 ops/s it has held since 2026-10-07, while
+`mongod` 8.0.34 ran faster than 8.0.32 did on every earlier set of droplets.
+The absolute rate of both engines still moves by 30% or more from one set of
+droplets to the next (the control ran on slower ones), so compare the ratios,
+and only across runs against the same `mongod`.
 
-**The p99.9 ratio is not stable, and an earlier version of this page read
-too much into it.** It credited a rise from 1.18× to 1.77× to `mongod`
-getting faster between 8.0.31 and 8.0.32. The three runs above are all
-8.0.32, and `mongod`'s p99.9 was 18.6 ms, 31.8 ms and 17.4 ms across them;
-ours was 32.8 ms, 40.0 ms and 29.2 ms. That is a droplet-to-droplet swing
-as large as the one attributed to the version change, so this benchmark
-does not support that explanation. What it does support: our p99.9 is
-1.3×–1.8× of `mongod`'s, and has stayed between 29 ms and 40 ms since
-0.5.3-beta.163 (37.3 ms).
+**The p99.9 ratio is not stable.** It was 1.26×–1.77× across the 8.0.32 runs,
+and 1.64× and 2.86× in the two 8.0.34 runs; the control's 215 ms was one
+droplet set's tail, and the beta.196 run's was 26.6 ms. Our p99.9 has otherwise
+stayed between 26 ms and 40 ms since 0.5.3-beta.163 (37.3 ms).
 
 Before the block compressor changed, that ratio was **72×** — profiling found
 65% of server CPU inside zlib's `deflate`, and switching the default to lz4 cut
 p99.9 from 1,303 ms to 37 ms in one step. What remains is a real throughput gap
-(0.72×–0.76× of mongod across the three runs above, 0.76× on 2026-09-20), no
-longer dominated by any single cause.
+(0.65× of `mongod` 8.0.34, 0.72×–0.76× of 8.0.32), no longer dominated by any
+single cause.
 
 Caveats, in both directions:
 
@@ -273,7 +273,7 @@ Caveats, in both directions:
 - **This is one workload shape.** Write-heavy, small documents, single-node, no
   secondary indexes beyond `_id` and the benchmark's own. It is a useful
   comparison, not a general claim.
-- **Tail latency is still the weaker axis.** p50 is close; p99.9 is 1.3×–1.8×. If your
+- **Tail latency is still the weaker axis.** p50 is within 1.5×; p99.9 is 1.3×–1.8× in most runs. If your
   workload is write-heavy and latency-sensitive at the tail, measure with your
   own data before switching.
 
