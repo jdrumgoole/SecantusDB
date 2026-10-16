@@ -35,7 +35,8 @@ use std::collections::HashMap;
 use bson::{Bson, Document};
 
 use crate::fallback::Fallback;
-use crate::{expressions, group, order, paths};
+use crate::summation::DoubleDoubleSum;
+use crate::{decimal, expressions, group, order, paths};
 
 /// Carries `Fallback` rather than `()` so an error the expression engine NAMED
 /// survives to the client instead of being flattened into the generic
@@ -47,6 +48,10 @@ const RANK_FUNCS: [&str; 3] = ["$rank", "$denseRank", "$documentNumber"];
 /// Ops whose output is a per-slot vector precomputed once over the sorted
 /// partition (prefix accumulation / gap-fill), rather than a window accumulator.
 const PREFIX_OPS: [&str; 3] = ["$expMovingAvg", "$locf", "$linearFill"];
+
+/// The window functions mongod runs as removable state over a window that
+/// drops documents.
+const REMOVABLE_OPS: [&str; 4] = ["$sum", "$avg", "$stdDevPop", "$stdDevSamp"];
 
 fn field_value(doc: &Document, field: &str) -> Bson {
     paths::get_path(doc, field).cloned().unwrap_or(Bson::Null)
@@ -259,6 +264,27 @@ pub fn set_window_fields_stage(
                 None
             });
         }
+        // `$sum` / `$avg` / `$stdDevPop` / `$stdDevSamp` over a window that
+        // drops documents run mongod's removable state along the partition; a
+        // whole-partition or `unbounded`-lower window takes the accumulator
+        // path below, as on mongod.
+        let mut std_dev_vecs: Vec<Option<Vec<Bson>>> = Vec::with_capacity(compiled.len());
+        for c in &compiled {
+            std_dev_vecs.push(
+                if REMOVABLE_OPS.contains(&c.op) && window_removes(c.window) {
+                    Some(removable_window(
+                        c,
+                        &slots,
+                        &docs,
+                        range_vals.as_deref(),
+                        range_dates.as_deref(),
+                        vars,
+                    )?)
+                } else {
+                    None
+                },
+            );
+        }
         for (pos, &orig_i) in slots.iter().enumerate() {
             for (ci, c) in compiled.iter().enumerate() {
                 let value = if RANK_FUNCS.contains(&c.op) {
@@ -270,6 +296,8 @@ pub fn set_window_fields_stage(
                     })
                 } else if PREFIX_OPS.contains(&c.op) {
                     prefix_vecs[ci].as_ref().unwrap()[pos].clone()
+                } else if let Some(v) = &std_dev_vecs[ci] {
+                    v[pos].clone()
                 } else if c.op == "$shift" {
                     shift_value(
                         c.arg.as_document().ok_or(Fallback::Defer)?,
@@ -429,6 +457,376 @@ fn compute_ranks(slots: &[usize], docs: &[Document], sort_by: Option<&Document>)
 /// `slot`, integer `b` → `slot + b`; anything else (incl. bool) → defer.
 /// `high < low` signals an empty window (caller uses the empty value). Range
 /// windows are routed to [`range_window_bounds`] before this is reached.
+/// Whether mongod runs this window through a removable executor: a
+/// `documents` or `range` window whose lower bound is not `unbounded`.
+fn window_removes(window: Option<&Document>) -> bool {
+    let Some(w) = window else {
+        return false;
+    };
+    match w.get("documents").or_else(|| w.get("range")) {
+        Some(Bson::Array(b)) if b.len() == 2 => {
+            !matches!(&b[0], Bson::String(s) if s == "unbounded")
+        }
+        _ => false,
+    }
+}
+
+/// A removable window function per position, moving one state along the
+/// partition as mongod's removable executors do
+/// (`window_function_exec_removable_{document,range}.cpp`, 8.2): the window
+/// is an index interval that never moves back; the documents past its old
+/// upper end are added, in order, then as many values as its lower end
+/// moved are dropped from the front of the queue. A window that skips ahead
+/// adds the documents it skipped and drops them again, as mongod does, and
+/// an empty window drops everything.
+fn removable_window(
+    c: &OutField,
+    slots: &[usize],
+    docs: &[Document],
+    range_vals: Option<&[f64]>,
+    range_dates: Option<&[f64]>,
+    vars: &Document,
+) -> R<Vec<Bson>> {
+    let n = slots.len();
+    let mut values: Vec<Bson> = Vec::with_capacity(n);
+    for &s in slots {
+        values.push(expressions::evaluate(&docs[s], c.arg, vars)?);
+    }
+    let mut state = match c.op {
+        "$sum" => Removable::Sum(RemovableSum::new()),
+        "$avg" => Removable::Avg(RemovableSum::new(), 0),
+        _ => Removable::StdDev(RemovableStdDev::new(c.op == "$stdDevSamp")),
+    };
+    let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    let mut last: Option<(i64, i64)> = None;
+    let mut out = Vec::with_capacity(n);
+    for pos in 0..n {
+        let (lo, hi) = if c.window.is_some_and(|w| w.contains_key("range")) {
+            range_window_bounds(pos, n, c.window.unwrap(), range_vals, range_dates)?
+        } else {
+            window_bounds(pos, n, c.window)?
+        };
+        let current = (hi >= lo).then_some((lo, hi));
+        let (add, remove) = match (last, current) {
+            (None, None) => (None, 0),
+            (None, Some(w)) => (Some(w), 0),
+            (Some((ol, ou)), None) => (None, ou - ol + 1),
+            (Some((ol, ou)), Some((l, u))) => ((ou < u).then_some((ou + 1, u)), (l - ol).max(0)),
+        };
+        if let Some((a, b)) = add {
+            for i in a..=b {
+                state.update(&values[i as usize], 1)?;
+                queue.push_back(i as usize);
+            }
+        }
+        for _ in 0..remove {
+            if let Some(i) = queue.pop_front() {
+                state.update(&values[i], -1)?;
+            }
+        }
+        last = current;
+        out.push(state.value()?);
+    }
+    Ok(out)
+}
+
+enum Removable {
+    StdDev(RemovableStdDev),
+    Sum(RemovableSum),
+    /// `WindowFunctionAvg`: the sum and a count of the numeric values.
+    Avg(RemovableSum, i64),
+}
+
+impl Removable {
+    fn update(&mut self, v: &Bson, q: i64) -> R<()> {
+        match self {
+            Removable::StdDev(s) => s.update(v, q),
+            Removable::Sum(s) => s.update(v, q),
+            Removable::Avg(s, count) => {
+                if is_numeric(v) {
+                    s.update(v, q)?;
+                    *count += q;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn value(&mut self) -> R<Bson> {
+        match self {
+            Removable::StdDev(s) => Ok(s.value()),
+            Removable::Sum(s) => s.value(),
+            Removable::Avg(s, count) => {
+                if *count == 0 {
+                    return Ok(Bson::Null);
+                }
+                let n = *count;
+                Ok(match s.value()? {
+                    Bson::Int32(i) => Bson::Double(f64::from(i) / n as f64),
+                    Bson::Int64(i) => Bson::Double(i as f64 / n as f64),
+                    Bson::Double(d) if d.is_finite() => Bson::Double(d / n as f64),
+                    Bson::Decimal128(d) => {
+                        let x = decimal::from_bson(&Bson::Decimal128(d)).ok_or(Fallback::Defer)?;
+                        if matches!(x, decimal::Dec::Fin { .. }) {
+                            decimal::to_bson(&decimal::div_int(&x, n).ok_or(Fallback::Defer)?)
+                                .ok_or(Fallback::Defer)?
+                        } else {
+                            Bson::Decimal128(d)
+                        }
+                    }
+                    other => other,
+                })
+            }
+        }
+    }
+}
+
+fn is_numeric(v: &Bson) -> bool {
+    matches!(
+        v,
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+    )
+}
+
+/// mongod's `RemovableSum` (`window_function_sum.{h,cpp}`, 8.2): an
+/// `AccumulatorSum` that a removed value is added to negated, with NaN and
+/// the infinities counted apart, and the answer narrowed back to the types
+/// still in the window (the sum's own type only ever widens).
+struct RemovableSum {
+    sum: group::Num,
+    pos_inf: i64,
+    neg_inf: i64,
+    nan: i64,
+    doubles: i64,
+    decimals: i64,
+}
+
+impl RemovableSum {
+    fn new() -> Self {
+        RemovableSum {
+            sum: group::Num::zero(),
+            pos_inf: 0,
+            neg_inf: 0,
+            nan: 0,
+            doubles: 0,
+            decimals: 0,
+        }
+    }
+
+    fn process(&mut self, v: &Bson) -> R<()> {
+        self.sum = std::mem::replace(&mut self.sum, group::Num::zero()).add(v)?;
+        Ok(())
+    }
+
+    fn update(&mut self, v: &Bson, q: i64) -> R<()> {
+        match v {
+            Bson::Int32(i) => {
+                if *i == i32::MIN && q == -1 {
+                    self.process(&Bson::Int32(i32::MAX))?;
+                    self.process(&Bson::Int32(1))
+                } else {
+                    self.process(&Bson::Int32(i * q as i32))
+                }
+            }
+            Bson::Int64(i) => {
+                if *i == i64::MIN && q == -1 {
+                    self.process(&Bson::Int64(i64::MAX))?;
+                    self.process(&Bson::Int32(1))
+                } else {
+                    self.process(&Bson::Int64(i * q))
+                }
+            }
+            Bson::Double(d) => {
+                self.doubles += q;
+                if d.is_nan() {
+                    self.nan += q;
+                } else if *d == f64::INFINITY {
+                    self.pos_inf += q;
+                } else if *d == f64::NEG_INFINITY {
+                    self.neg_inf += q;
+                } else {
+                    self.process(&Bson::Double(d * q as f64))?;
+                }
+                Ok(())
+            }
+            Bson::Decimal128(_) => {
+                self.decimals += q;
+                match decimal::from_bson(v).ok_or(Fallback::Defer)? {
+                    decimal::Dec::Nan => self.nan += q,
+                    decimal::Dec::Inf(sign) if sign > 0 => self.pos_inf += q,
+                    decimal::Dec::Inf(_) => self.neg_inf += q,
+                    d => {
+                        let d = if q == -1 { decimal::neg(&d) } else { d };
+                        self.process(&decimal::to_bson(&d).ok_or(Fallback::Defer)?)?;
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn value(&self) -> R<Bson> {
+        let special = |dec: &str, dbl: f64| -> R<Bson> {
+            Ok(if self.decimals > 0 {
+                decimal::to_bson(&decimal::parse(dec).ok_or(Fallback::Defer)?)
+                    .ok_or(Fallback::Defer)?
+            } else {
+                Bson::Double(dbl)
+            })
+        };
+        if self.nan > 0 || (self.pos_inf > 0 && self.neg_inf > 0) {
+            return special("NaN", f64::NAN);
+        }
+        if self.pos_inf > 0 {
+            return special("Infinity", f64::INFINITY);
+        }
+        if self.neg_inf > 0 {
+            return special("-Infinity", f64::NEG_INFINITY);
+        }
+        let int_or_long = |v: i64| i32::try_from(v).map_or(Bson::Int64(v), Bson::Int32);
+        Ok(match self.sum.clone().into_bson()? {
+            Bson::Decimal128(d) if self.decimals == 0 => {
+                let x = decimal::from_bson(&Bson::Decimal128(d)).ok_or(Fallback::Defer)?;
+                let as_double = || -> R<Bson> {
+                    Ok(Bson::Double(
+                        d.to_string().parse::<f64>().map_err(|_| Fallback::Defer)?,
+                    ))
+                };
+                if self.doubles > 0 {
+                    as_double()?
+                } else if let Some(v) = integral_i64(&x) {
+                    int_or_long(v)
+                } else {
+                    as_double()?
+                }
+            }
+            Bson::Double(d) if self.doubles == 0 && d >= i64::MIN as f64 && d < i64::MAX as f64 => {
+                int_or_long(d.round() as i64)
+            }
+            Bson::Int64(v) => int_or_long(v),
+            other => other,
+        })
+    }
+}
+
+/// `Decimal128::toLong` without a signalling flag: an integral decimal in
+/// `i64`'s range, `i64::MIN` included.
+fn integral_i64(d: &decimal::Dec) -> Option<i64> {
+    let decimal::Dec::Fin { sign, coeff, exp } = d else {
+        return None;
+    };
+    if !decimal::is_integral(d) {
+        return None;
+    }
+    let mut acc: i128 = 0;
+    let digits = coeff.len() as i64 + i64::from(*exp);
+    if digits > 20 {
+        return coeff.iter().all(|&c| c == 0).then_some(0);
+    }
+    for (i, &c) in coeff.iter().enumerate() {
+        // Digits a negative exponent drops are zeros (the value is integral).
+        if (i as i64) < coeff.len() as i64 + i64::from((*exp).min(0)) {
+            acc = acc * 10 + i128::from(c);
+        }
+    }
+    for _ in 0..(*exp).max(0) {
+        acc *= 10;
+    }
+    i64::try_from(acc * i128::from(*sign)).ok()
+}
+
+/// mongod's `WindowFunctionStdDev` (`window_function_stddev.h`, 8.2): a
+/// running sum and `m2`, both compensated sums, updated by Welford's step
+/// in the count-scaled form. On arm64 mongod's `count * x - sum` is a fused
+/// multiply-add, and so is this one.
+struct RemovableStdDev {
+    sum: group::Num,
+    m2: DoubleDoubleSum,
+    count: i64,
+    nonfinite: i64,
+    samp: bool,
+}
+
+impl RemovableStdDev {
+    fn new(samp: bool) -> Self {
+        RemovableStdDev {
+            sum: group::Num::zero(),
+            m2: DoubleDoubleSum::default(),
+            count: 0,
+            nonfinite: 0,
+            samp,
+        }
+    }
+
+    fn update(&mut self, v: &Bson, q: i64) -> R<()> {
+        let x = match v {
+            Bson::Int32(i) => f64::from(*i),
+            Bson::Int64(i) => *i as f64,
+            Bson::Double(d) => *d,
+            // `coerceToDouble`: the nearest double.
+            Bson::Decimal128(d) => d.to_string().parse::<f64>().map_err(|_| Fallback::Defer)?,
+            _ => return Ok(()),
+        };
+        if !x.is_finite() {
+            self.nonfinite += q;
+            return Ok(());
+        }
+        if self.count == 0 {
+            self.count = 1;
+            self.sum = std::mem::replace(&mut self.sum, group::Num::zero()).add(v)?;
+            return Ok(());
+        }
+        if self.count + q == 0 {
+            // mongod's `reset()`, which also forgets the non-finite values
+            // still in the window: their later removals take the count
+            // below zero, and the window answers a number again.
+            self.sum = group::Num::zero();
+            self.m2 = DoubleDoubleSum::default();
+            self.count = 0;
+            self.nonfinite = 0;
+            return Ok(());
+        }
+        let sum = match self.sum.clone().into_bson()? {
+            Bson::Int32(i) => f64::from(i),
+            Bson::Int64(i) => i as f64,
+            Bson::Double(d) => d,
+            Bson::Decimal128(d) => d.to_string().parse::<f64>().map_err(|_| Fallback::Defer)?,
+            _ => return Err(Fallback::Defer),
+        };
+        let delta = (self.count as f64).mul_add(x, -sum);
+        self.count += q;
+        let qf = q as f64;
+        self.sum =
+            std::mem::replace(&mut self.sum, group::Num::zero()).add(&Bson::Double(x * qf))?;
+        self.m2
+            .add_double(delta * delta * qf / (self.count * (self.count - q)) as f64);
+        Ok(())
+    }
+
+    fn value(&mut self) -> Bson {
+        // A window holding a NaN or an infinity has no deviation.
+        if self.nonfinite > 0 {
+            return Bson::Null;
+        }
+        let adjusted = if self.samp {
+            self.count - 1
+        } else {
+            self.count
+        };
+        if adjusted <= 0 {
+            return Bson::Null;
+        }
+        let m2 = self.m2.get_double();
+        if m2 < 0.0 || (!self.samp && self.count == 1) {
+            // mongod resets a negative `m2` (rounding) and answers int 0.
+            self.m2 = DoubleDoubleSum::default();
+            return Bson::Int32(0);
+        }
+        Bson::Double((m2 / adjusted as f64).sqrt())
+    }
+}
+
 fn window_bounds(slot: usize, n: usize, window: Option<&Document>) -> R<(i64, i64)> {
     let last = n as i64 - 1;
     let bounds = match window.and_then(|w| w.get("documents")) {

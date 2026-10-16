@@ -1735,33 +1735,18 @@ Rust-only driver-gauge failures that are deliberately not chased:
   `$match` / `$sort` keep the original 2 / 28766. There is no rule derivable
   short of probing every accumulator. The other 11 of 12 aggregation
   runtime-error wrapper shapes match mongod 8.2.11.
-- [ ] **`$stdDevPop` / `$stdDevSamp` over a sliding window differ in the
-  last digit.** mongod 8.2.11 updates the deviation incrementally as
-  documents enter and leave a `$setWindowFields` window (`documents: [-2,
-  0]`); this server recomputes each window from scratch, which agrees for
-  a window that only grows and differs in the last ULP once one drops
-  documents. A reversed-Welford removal with a fused multiply-add matched
-  227 of 332 values, so mongod's removal step is something else; it needs
-  reading from mongod's window-function source. Found 2026-10-16 while
-  fixing RM-128 (the accumulator and expression forms now match mongod bit
-  for bit: Welford's algorithm with the `m2` step a fused multiply-add).
-  Backlog-ID: RM-181
-  Verify: tests/backlog/test_rm_found_2026_10_16c.py::test_std_dev_over_a_sliding_window
-- **Out of scope — `$meta` inside an AGGREGATION stage.** 21 shapes probed
-  on 8.2.11: mongod's behaviour there is its metadata dependency analysis
-  (`DepsTracker`) leaking through (`$project` returns `recordId` but
-  `$addFields` omits it; `recordId` survives `$match` but not `$limit` /
-  `$skip` / `$group`; `sortKey` without `$sort` errors in `$project` and
-  returns `[]` in `$addFields`). Our aggregate `$meta` answers
-  `168 Unrecognized expression '$meta'`; revisit only with the dependency
-  analysis, not operator by operator. (Find-projection `$meta` is done.)
-- **Deliberate divergence — `$meta: "recordId"` values are store-wide.** Our
-  RecordId is a store-wide insertion counter and mongod's restarts per
-  collection, so a second collection in the same store starts at 3 where mongod
-  starts at 1. Matching it means a per-collection counter, and that counter IS
-  the document table's key — a storage-format change shared byte-for-byte by
-  both servers. Uniqueness and insertion-order ascent hold
-  (`tests/test_meta_projection.py`).
+- **Scope decision — `$meta` inside an AGGREGATION stage follows where
+  mongod's query layer hands the document over, not an operator table.**
+  Since 2026-10-16 `recordId` and `indexKey` are given there
+  (`secantus-commands/src/agg_meta.rs`, measured 8.2.11): the record id
+  only in a `$project` the query layer takes, the index key through the
+  stages that keep a document's metadata. What is still different is
+  RM-083's three shapes. (Find-projection `$meta` is done.)
+- **Decided 2026-10-16 (Joe) — record ids are numbered per collection
+  from 1**, as on mongod, so `$meta: "recordId"` and `showRecordId` give
+  mongod's numbers. This replaced the earlier deliberate divergence (one
+  store-wide counter). The counter is rebuilt from the collection's
+  largest record id, not stored: mongod does the same.
 
 ### 7.7 Rust storage: no close-time checkpoint / no `durable` mode
 
