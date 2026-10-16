@@ -142,6 +142,42 @@ pub fn record_initial_fcv(
     Ok(())
 }
 
+/// The collection mongod keeps logical sessions in, and its TTL index.
+const SESSIONS_DB: &str = "config";
+const SESSIONS_COLL: &str = "system.sessions";
+const SESSIONS_TTL_INDEX: &str = "lsidTTLIndex";
+/// mongod's `localLogicalSessionTimeoutMinutes` default (30), in seconds.
+const SESSIONS_TTL_SECONDS: i32 = 1800;
+
+/// Create `config.system.sessions` as mongod does shortly after it starts
+/// (its logical session cache sets the collection up on its first
+/// refresh): the collection, plus `lsidTTLIndex` `{lastUse: 1}` with
+/// `expireAfterSeconds: 1800`. That collection is why a fresh mongod always
+/// lists the `config` database (measured 8.2.11, 2026-10-16:
+/// `listDatabases` on a new store names `admin`, `config` and `local`, and
+/// `config` holds `system.sessions` alone). A collection that is already
+/// there is left as it is.
+///
+/// What this does NOT do is mongod's periodic refresh: mongod recreates the
+/// collection within five minutes when it is dropped; here it comes back at
+/// the next start.
+pub fn record_sessions_collection(
+    storage: &dyn crate::storage::Storage,
+) -> Result<(), crate::storage::StorageError> {
+    if storage.collection_exists(SESSIONS_DB, SESSIONS_COLL)? {
+        return Ok(());
+    }
+    storage.create_collection(SESSIONS_DB, SESSIONS_COLL)?;
+    let key = doc! {"lastUse": 1_i32};
+    let spec = doc! {
+        "key": key.clone(),
+        "name": SESSIONS_TTL_INDEX,
+        "expireAfterSeconds": SESSIONS_TTL_SECONDS,
+    };
+    storage.create_index(SESSIONS_DB, SESSIONS_COLL, SESSIONS_TTL_INDEX, &key, &spec)?;
+    Ok(())
+}
+
 /// The FCV in force: the stored one, else this server's own version. What
 /// `getParameter` reports as `featureCompatibilityVersion.version`.
 pub(crate) fn current_fcv(ctx: &CommandContext) -> String {

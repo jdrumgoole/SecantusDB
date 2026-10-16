@@ -91,7 +91,7 @@ def test_missing_sort_key_versus_explicit_null(rust_mongo: Any, mongod: Any) -> 
     assert answers[0] == answers[1]
 
 
-@pytest.mark.backlog("RM-126")
+@pytest.mark.backlog_fixed("RM-126")
 @pytest.mark.parametrize(
     "spec",
     [

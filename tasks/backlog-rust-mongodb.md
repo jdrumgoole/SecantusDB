@@ -52,15 +52,6 @@ one beside it.
 
 These work end-to-end but cut corners.
 
-- [ ] **`$bucketAuto` `granularity` value validation surfaces as BadValue on the
-  Rust server.** `secantus-core` `group::granularity_coerce` returns
-  `Fallback::Defer` for a non-numeric, NaN or negative groupBy value, which on
-  the Rust server is BadValue (2); mongod answers 40258 / 40259 / 40260 (the
-  Python server reproduces them). One instance of the standing class: a
-  construct the Rust engine refuses surfaces as generic BadValue rather than
-  mongod's typed code (`update::arith_type_error` is the worked template).
-  Backlog-ID: RM-002
-  Verify: tests/backlog/test_rm_001_028.py::test_bucket_auto_granularity_value_errors
 - **Scope decision — `top` classifies `collMod` as a write.** mongod bumps
   `total` for `collMod` but neither `readLock` nor `writeLock`; this server
   counts it under `writeLock`. The shape matters to mongotop and this
@@ -233,20 +224,6 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **`$dateFromParts` accepts an out-of-range `month` and answers a
-  wrong date.** `{$dateFromParts: {year: 2017, month: 40000}}` returns
-  5350-04-01 here; mongod 8.2.11 refuses it with 31034 (`'month' must
-  evaluate to a value in the range [-32768, 32767]`). The other fields'
-  ranges have not been checked. Found 2026-10-14.
-  Backlog-ID: RM-139
-  Verify: tests/backlog/test_rm_found_2026_10_14.py::test_date_from_parts_month_out_of_range_is_refused
-- [ ] **`saslStart` for a user that does not exist continues the
-  conversation.** mongod 8.2.11 fails the first step with 18
-  `Authentication failed.`; this server answers `ok: 1, done: false` and
-  fails later. Whether the later failure is complete was not checked.
-  Found 2026-10-14.
-  Backlog-ID: RM-141
-  Verify: tests/backlog/test_rm_found_2026_10_14.py::test_sasl_start_for_an_unknown_user_fails
 
 - [ ] **OPEN — the Go gauge's remaining failures, triaged (2026-09-29; 6
       leaves as of the 2026-10-15 run).** The gauge completes 659 of 659 and
@@ -816,10 +793,9 @@ Still different:
       and each index's own table, and here collections share a documents
       shard table and every index one entries table, so no per-collection
       statistics exist; the shard table's own would count other
-      collections too); `latencyStats` is zeros; `listDatabases` lists no
-      `config` (mongod writes its sessions to `config.system.sessions`;
-      here they are kept in memory), so `dbHash` on `config` differs, as on
-      `admin` does (`admin.system.keys` holds random signing keys there, a
+      collections too); `latencyStats` is zeros; `config.system.sessions`
+      exists but holds no sessions (mongod writes them there; here they are
+      kept in memory), so `dbHash` on `config` differs, as on `admin` does (`admin.system.keys` holds random signing keys there, a
       digest no server could match); `connectionStatus` lists no
       privileges for a user who has some; `hostInfo.extra` is empty on
       Linux. `$indexStats` counts the plan the `explain` planner picks:
@@ -831,7 +807,7 @@ Still different:
       than creation order, gives an index `spec` in `listIndexes`' key
       order, and reads a geo index's `multikey` from the documents now.
       Backlog-ID: RM-040
-      Verify: tests/backlog/test_rm_029_056.py::test_coll_stats_wiredtiger_and_index_details,tests/backlog/test_rm_029_056.py::test_list_databases_lists_admin_and_config
+      Verify: tests/backlog/test_rm_029_056.py::test_coll_stats_wiredtiger_and_index_details
 - [ ] **RUST MongoDB server: `$listLocalSessions` / `$listSessions` do not
       know whose session is whose.** With `--auth`, mongod 8.2.11 lists
       only the caller's sessions for `$listLocalSessions: {}`, each `_id.uid`
@@ -1150,10 +1126,6 @@ What is left, on the RUST MongoDB server:
 - [ ] **`$where` in an update's query** is refused (no JavaScript).
   Backlog-ID: RM-060
   Verify: tests/backlog/test_rm_057_084.py::test_where_in_an_update_query
-- [ ] **A parse error in `$currentDate` against a collection that does not
-      exist** is no longer reported, since the statement is skipped.
-      Backlog-ID: RM-065
-      Verify: tests/backlog/test_rm_057_084.py::test_current_date_parse_error_on_a_missing_collection
 
 ### 7.076 DDL and admin commands -- 2026-10-12
 
@@ -1162,20 +1134,10 @@ replies over a raw connection (`create` and every option it takes,
 `listCollections`, `collMod`, `renameCollection`, `drop`, `dropDatabase`,
 `dbStats`, `collStats`, `dataSize`, `listDatabases`, and invalid database
 names across thirteen commands). Byte counts are compared by type only. The
-Rust server differs on 2 of 809. Pinned by
+Rust server differed on 2 of 809, `listDatabases` without `config` and
+`dbStats` without the filesystem's sizes; both were fixed on 2026-10-16
+(the probe was not re-run then). Pinned by
 `crates/secantus-storage-adapter/tests/ddl_admin_commands_wt.rs`.
-
-What is left, on the RUST MongoDB server:
-
-- [ ] **`listDatabases` lists `admin` and `config` only once something is
-      written to them.** mongod always has them. (`local` is listed, as
-      empty; mongod's holds the oplog.)
-      Backlog-ID: RM-066
-      Verify: tests/backlog/test_rm_057_084.py::test_list_databases_always_has_admin_and_config
-- [ ] **`dbStats` reports `fsUsedSize` and `fsTotalSize` as 0.** The
-      filesystem's numbers are not read.
-      Backlog-ID: RM-068
-      Verify: tests/backlog/test_rm_057_084.py::test_db_stats_reports_the_filesystem
 
 ### 7.075 `explain`, command by command -- 2026-10-12
 
@@ -1604,11 +1566,6 @@ wording filed under 7.067) and 2 TTL results
       `mongod` puts that one millisecond on was not measured.
       Backlog-ID: RM-104
       Verify: none -- the boundary millisecond depends on when a TTL pass runs; not observable deterministically
-- [ ] **RUST MongoDB server: `bulkWrite` ignores a `collectionUUID`
-      mismatch.** It inserts where mongod 8.2.11 refuses with 361. Not
-      probed: `maxTimeMS`, and the command inside a transaction.
-      Backlog-ID: RM-105
-      Verify: tests/backlog/test_rm_085_112.py::test_bulk_write_collection_uuid_mismatch
 
 ### 7.067 Index management -- 2026-10-10
 
@@ -1623,12 +1580,12 @@ dropped (four), and `listIndexes` lists by name.
 `tools/probes/views.py`, mongod 8.2.11: the Rust server is at 0 of 70
 (`tasks/rust-mongod-remaining-plan.md`, 2026-10-14). What is left beside it:
 
-- [ ] **RUST MongoDB server: `distinct` on a view returns values sorted.**
-      `mongod` runs it as a `$group` and answers in its hash table's order
-      (stable per build: `[3, {z: 1}, 2, 1, "x", null, 1.5]` for those
-      values on 8.2.11). Reproducing it means mongod's `Value` hash.
-      Backlog-ID: RM-108
-      Verify: tests/backlog/test_rm_085_112.py::test_distinct_on_a_view_in_mongod_order
+- **Scope decision — `distinct` on a view may answer in any order.**
+  mongod 8.2.11 answers it in a hash table's order that changes from call
+  to call: 18 calls over six identical databases gave 13 orders
+  (2026-10-16). No order is mongod's, so the sorted one this server gives is
+  as faithful as any. (This was RM-108, which said the order was stable per
+  build; it is not.)
 - [ ] **`mongod` 8.2.11 itself crashes on `{collMod: <a view>, cappedSize:
       100}`** (the connection closes and the server is gone). Not ours; the
       Rust server answers 72 `Collection must be capped.` Do not put that
@@ -1872,18 +1829,6 @@ Rust-only driver-gauge failures that are deliberately not chased:
   8.2.11 first.
   Backlog-ID: RM-124
   Verify: tests/backlog/test_rm_113_138.py::test_to_hashed_index_key
-- [ ] **A deferred error path answers a generic `BadValue` (2) instead of
-  mongod's code on the Rust server.** Where the Rust core returns
-  `Fallback::Defer` on an error path, there is no Python behind it on the Rust
-  server, so the client gets code 2 where the Python server raises mongod's
-  Location code. Remaining examples: `$dateFromParts` component errors in
-  `crates/secantus-core/src/expressions.rs` (`dfp_comp` and neighbours — the
-  comments name Python's 40515 / 40516 / 40523). The worked template for closing
-  a family is a standalone validator beside the operator
-  (`update::arith_type_error`, `query::json_schema_keyword_error`) plus one arm
-  in the adapter's code table, rather than widening `Fallback`.
-  Backlog-ID: RM-126
-  Verify: tests/backlog/test_rm_113_138.py::test_date_from_parts_error_codes
 - [ ] **A DBPointer operand to the `$min` / `$max` UPDATE operators
   defers on the Rust server** (so it is an error there; mongod treats it as
   a no-op). A DBPointer nested in a range operand already matches.

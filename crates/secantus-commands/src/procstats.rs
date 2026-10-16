@@ -100,6 +100,31 @@ pub fn extra_info() -> Option<Document> {
     None
 }
 
+/// The filesystem holding `path`, as mongod's `dbStats` reads it through
+/// `boost::filesystem::space`: `(used, total)` in bytes, where `total` is
+/// the capacity (`f_blocks * f_frsize`) and `used` is the capacity less
+/// what an unprivileged writer may still use (`f_bavail * f_frsize`) --
+/// so blocks reserved for root count as used, as they do on mongod.
+#[cfg(unix)]
+pub fn fs_space(path: &str) -> Option<(u64, u64)> {
+    let c_path = std::ffi::CString::new(path).ok()?;
+    // SAFETY: `statvfs` fills the zeroed structure it is given, and
+    // `c_path` is a valid NUL-terminated string for the call's duration.
+    let st = unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        (libc::statvfs(c_path.as_ptr(), &mut st) == 0).then_some(st)
+    }?;
+    let frsize = st.f_frsize as u64;
+    let total = (st.f_blocks as u64).saturating_mul(frsize);
+    let avail = (st.f_bavail as u64).saturating_mul(frsize);
+    Some((total.saturating_sub(avail), total))
+}
+
+#[cfg(not(unix))]
+pub fn fs_space(_path: &str) -> Option<(u64, u64)> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +144,15 @@ mod tests {
         let e = extra_info().expect("extra_info");
         assert_eq!(e.get_str("note").unwrap(), "fields vary by platform");
         assert!(e.contains_key("page_faults"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fs_space_reads_the_filesystem() {
+        let dir = std::env::temp_dir();
+        let (used, total) = fs_space(dir.to_str().unwrap()).expect("statvfs");
+        assert!(total > 0);
+        assert!(used > 0 && used <= total, "used {used} total {total}");
+        assert_eq!(fs_space("/no/such/directory/secantus-rm068"), None);
     }
 }

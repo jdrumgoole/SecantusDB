@@ -351,6 +351,9 @@ pub fn bind(
     // new store, so `admin` is always there.
     secantus_commands::cluster_admin::record_initial_fcv(storage.as_ref())
         .map_err(|e| io::Error::other(format!("recording the FCV: {e:?}")))?;
+    // ... and sets up `config.system.sessions`, so `config` is there too.
+    secantus_commands::cluster_admin::record_sessions_collection(storage.as_ref())
+        .map_err(|e| io::Error::other(format!("creating config.system.sessions: {e:?}")))?;
     // A set member keeps its configuration in `local.system.replset`, as
     // mongod does, so its `replicaSetId` outlives the process.
     if let Some(set_name) = &config.replica_set_name {

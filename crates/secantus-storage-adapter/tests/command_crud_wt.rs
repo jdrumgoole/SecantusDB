@@ -804,6 +804,94 @@ fn bulk_write_accepts_bypass_empty_ts_replacement() {
     });
 }
 
+/// `bulkWrite` checks an `nsInfo` entry's `collectionUUID` per op: a mismatch
+/// fails the op with 361 and mongod's extra fields, and nothing is written
+/// (mongod 8.2.11, 2026-10-16). `actualCollection` names the collection of the
+/// database that does have that UUID, or is null.
+#[test]
+fn bulk_write_refuses_a_collection_uuid_mismatch() {
+    with_wt(|c| {
+        c.db_name = "t".into();
+        dispatch(&doc! {"insert": "c", "documents": [{"a": 1}]}, c);
+        dispatch(&doc! {"insert": "d", "documents": [{"a": 1}]}, c);
+        let listed = dispatch(&doc! {"listCollections": 1, "filter": {"name": "d"}}, c);
+        let d_uuid = fb(&listed, c)[0]
+            .as_document()
+            .unwrap()
+            .get_document("info")
+            .unwrap()
+            .get("uuid")
+            .unwrap()
+            .clone();
+        let bad = Bson::Binary(bson::Binary {
+            subtype: bson::spec::BinarySubtype::Uuid,
+            bytes: vec![0; 16],
+        });
+        c.db_name = "admin".into();
+        for (uuid, actual) in [
+            (bad.clone(), Bson::Null),
+            (d_uuid, Bson::String("d".into())),
+        ] {
+            let reply = dispatch(
+                &doc! {
+                    "bulkWrite": 1,
+                    "nsInfo": [{"ns": "t.c", "collectionUUID": uuid.clone()}],
+                    "ops": [
+                        {"insert": 0, "document": {"b": 1}},
+                        {"update": 0, "filter": {}, "updateMods": {"$set": {"q": 1}}},
+                    ],
+                    "ordered": false,
+                },
+                c,
+            );
+            assert_eq!(reply.get_i32("nErrors").unwrap(), 2, "{reply:?}");
+            assert_eq!(reply.get_i32("nInserted").unwrap(), 0, "{reply:?}");
+            let batch = reply
+                .get_document("cursor")
+                .unwrap()
+                .get_array("firstBatch")
+                .unwrap();
+            let expected = |idx: i32| {
+                let mut d = doc! {
+                    "ok": 0.0, "idx": idx, "code": 361,
+                    "errmsg": "Collection UUID does not match that specified",
+                    "db": "t", "collectionUUID": uuid.clone(),
+                    "expectedCollection": "c", "actualCollection": actual.clone(),
+                    "n": 0,
+                };
+                if idx == 1 {
+                    d.insert("nModified", 0);
+                }
+                Bson::Document(d)
+            };
+            assert_eq!(batch, &vec![expected(0), expected(1)]);
+        }
+        // The wrong binData subtype, and a UUID of the wrong length.
+        let reply = dispatch(
+            &doc! {
+                "bulkWrite": 1,
+                "nsInfo": [{"ns": "t.c", "collectionUUID": bson::Binary {
+                    subtype: bson::spec::BinarySubtype::Generic, bytes: vec![0; 16] }}],
+                "ops": [{"insert": 0, "document": {}}],
+            },
+            c,
+        );
+        assert_eq!(reply.get_i32("code").unwrap(), 14, "{reply:?}");
+        let reply = dispatch(
+            &doc! {
+                "bulkWrite": 1,
+                "nsInfo": [{"ns": "t.c", "collectionUUID": bson::Binary {
+                    subtype: bson::spec::BinarySubtype::Uuid, bytes: vec![0; 3] }}],
+                "ops": [{"insert": 0, "document": {}}],
+            },
+            c,
+        );
+        assert_eq!(reply.get_i32("code").unwrap(), 207, "{reply:?}");
+        c.db_name = "t".into();
+        assert_eq!(count(c), 1);
+    });
+}
+
 /// A cursor id is an int64 on the wire, and the TYPE is the whole assertion.
 ///
 /// The Python server sent a bare `0` here, which BSON encodes as a 32-bit

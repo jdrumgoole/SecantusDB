@@ -77,7 +77,7 @@ def test_or_branch_index_choice_matches_mongod(rust_mongo: Any, mongod: Any) -> 
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-002")
+@pytest.mark.backlog_fixed("RM-002")
 @pytest.mark.parametrize("value", ["s", float("nan"), -1], ids=["string", "nan", "negative"])
 def test_bucket_auto_granularity_value_errors(rust_mongo: Any, mongod: Any, value: Any) -> None:
     """mongod 8.2.11 answers 40258 (non-numeric), 40259 (NaN) and 40260

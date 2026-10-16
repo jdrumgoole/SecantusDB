@@ -5720,6 +5720,12 @@ impl Storage {
         self.in_memory
     }
 
+    /// The WiredTiger home directory the store was opened at (mongod's
+    /// `dbpath`). `dbStats` reports the filesystem holding it.
+    pub fn home(&self) -> &str {
+        &self.home
+    }
+
     /// Open (creating if needed) an on-disk database at `home` with the default
     /// SecantusDB WiredTiger config, bootstrapping the table schema.
     pub fn open(home: &str) -> Result<Storage> {

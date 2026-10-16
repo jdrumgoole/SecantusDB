@@ -117,6 +117,10 @@ impl CmdStorage for StorageAdapter {
         self.inner.in_memory()
     }
 
+    fn data_path(&self) -> Option<String> {
+        Some(self.inner.home().to_string())
+    }
+
     fn peek_cluster_time(&self) -> bson::Timestamp {
         // Gossip must never fail a command — fall back to a zero timestamp
         // if the (read-only, mints-once-on-virgin) peek somehow errors.

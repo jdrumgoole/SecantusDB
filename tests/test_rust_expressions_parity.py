@@ -654,9 +654,20 @@ CURATED = [
     ),
     ({"$dateFromParts": {"year": 2023, "timezone": "-08:00"}}, {}),
     ({"$dateFromParts": {"year": None, "month": 6}}, {}),  # null -> null
-    ({"$dateFromParts": {"year": 2023, "month": 6.5}}, {}),  # non-integral -> defer
+    # REMOVED 2026-10-16, a scope decision, not a skip: the Rust engine now
+    # answers this as mongod 8.2.11 does and the deprecated Python engine does
+    # not (RM-126 / RM-173). mongod says "found double with value 6.5", Python "found 6.5".
+    # Parity would pin the Rust server to the Python answer, away from mongod.
+    # What is lost: a drift check on this shape. mongod-vs-Rust coverage is
+    # tests/backlog/test_rm_found_2026_10_16.py.
     ({"$dateFromParts": {"month": 6}}, {}),  # missing year -> defer
-    ({"$dateFromParts": {"year": 10000}}, {}),  # year range -> defer
+    # REMOVED 2026-10-16, a scope decision, not a skip: the Rust engine now
+    # answers this as mongod 8.2.11 does and the deprecated Python engine does
+    # not (RM-126 / RM-173). mongod says "must evaluate to an integer in the
+    # range", Python "must be in the range".
+    # Parity would pin the Rust server to the Python answer, away from mongod.
+    # What is lost: a drift check on this shape. mongod-vs-Rust coverage is
+    # tests/backlog/test_rm_found_2026_10_16.py.
     ({"$dateFromParts": {"isoWeekYear": 2023}}, {}),  # iso form -> defer
     ({"$dateFromParts": {"year": 2023, "timezone": "America/New_York"}}, {}),  # named tz -> defer
     # $dateFromParts ISO-week form — Monday of ISO week 1 + (week-1)/(day-1) rollover.
@@ -795,7 +806,12 @@ CURATED = [
     # chrono-tz (instant->wall-clock is unambiguous, so it matches Python zoneinfo).
     # Curated to post-2007 dates in decade-stable major zones to stay clear of tzdb
     # release skew between chrono-tz's bundled db and CI's Python tzdata.
-    ({"$dateToString": {"date": "$d", "timezone": "America/New_York"}}, {"d": _DT}),  # summer EDT
+    # REMOVED 2026-10-16, a scope decision, not a skip: the Rust engine now
+    # answers this as mongod 8.2.11 does and the deprecated Python engine does
+    # not (RM-126 / RM-173). mongod's default format drops the `Z` outside UTC; Python keeps it.
+    # Parity would pin the Rust server to the Python answer, away from mongod.
+    # What is lost: a drift check on this shape. mongod-vs-Rust coverage is
+    # tests/backlog/test_rm_found_2026_10_16.py.
     (
         {
             "$dateToString": {
@@ -816,7 +832,12 @@ CURATED = [
     ),
     ({"$dateToString": {"date": "$d", "timezone": "Not/AZone"}}, {"d": _DT}),  # unknown -> defer
     # Fixed-offset timezone shifts the wall clock before rendering.
-    ({"$dateToString": {"date": "$d", "timezone": "+05:30"}}, {"d": _DT}),
+    # REMOVED 2026-10-16, a scope decision, not a skip: the Rust engine now
+    # answers this as mongod 8.2.11 does and the deprecated Python engine does
+    # not (RM-126 / RM-173). mongod's default format drops the `Z` outside UTC; Python keeps it.
+    # Parity would pin the Rust server to the Python answer, away from mongod.
+    # What is lost: a drift check on this shape. mongod-vs-Rust coverage is
+    # tests/backlog/test_rm_found_2026_10_16.py.
     (
         {"$dateToString": {"date": "$d", "timezone": "-0800", "format": "%Y-%m-%d %H:%M"}},
         {"d": _DT},

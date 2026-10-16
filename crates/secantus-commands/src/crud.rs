@@ -1552,6 +1552,21 @@ fn update_spec_error(u: &Document) -> Option<(i32, String)> {
     secantus_core::update::update_spec_error(u)
 }
 
+/// The parse error mongod reports for a statement that matched no document:
+/// an operand it checks before reading any (RM-065). An operator-form `u`
+/// only; a pipeline is checked up front.
+fn unmatched_parse_error(spec: &Document) -> Option<(i32, String)> {
+    let Some(Bson::Document(u)) = spec.get("u") else {
+        return None;
+    };
+    let filters: Vec<Document> = spec
+        .get("arrayFilters")
+        .and_then(Bson::as_array)
+        .map(|a| a.iter().filter_map(|b| b.as_document().cloned()).collect())
+        .unwrap_or_default();
+    secantus_core::update::update_parse_error(u, &filters)
+}
+
 /// `update` — batch update, one entry per `{q, u, multi?, upsert?}` spec. Ports
 /// `commands.py::_update`. Document-, replacement-, and pipeline-form `u` all
 /// apply (pipeline via `Storage::update_matching_pipeline`, diff-style oplog so
@@ -2227,6 +2242,15 @@ pub(crate) fn update_in(
                 write_errors.len(),
             );
             if absent {
+                // Nothing to read, but mongod still parses the statement.
+                if let Some((code, errmsg)) = unmatched_parse_error(spec) {
+                    write_errors.push(Bson::Document(doc! {
+                        "index": index as i32, "code": code, "errmsg": errmsg,
+                    }));
+                    if ordered {
+                        break;
+                    }
+                }
                 continue;
             }
             crate::explain::order::pinned(storage, first, || {
@@ -2271,6 +2295,21 @@ pub(crate) fn update_in(
             );
         }
         match outcome {
+            Ok(outcome)
+                if outcome.matched == 0
+                    && outcome.upserted_id.is_none()
+                    && unmatched_parse_error(spec).is_some() =>
+            {
+                // No document reached the engine, so its parse-time checks
+                // did not run; mongod's do regardless (RM-065).
+                let (code, errmsg) = unmatched_parse_error(spec).unwrap_or_default();
+                write_errors.push(Bson::Document(doc! {
+                    "index": index as i32, "code": code, "errmsg": errmsg,
+                }));
+                if ordered {
+                    break;
+                }
+            }
             Ok(outcome) => {
                 n += outcome.matched as i32;
                 n_modified += outcome.modified as i32;
