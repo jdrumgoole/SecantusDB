@@ -53,6 +53,7 @@ mod grace_join;
 mod hba;
 mod ident;
 mod info_columns;
+mod join_order;
 mod join_search;
 mod largeobjects;
 mod live;
@@ -588,6 +589,105 @@ struct MeasuredWhere {
     /// By stored field: the selectivity of its index quals (its clauses but
     /// `<>`), which `btcostestimate` reads for an index leading with it.
     index_selectivity: HashMap<String, f64>,
+    /// The WHERE's top-level clauses as the cost model prices them.
+    quals: Vec<(String, secantus_pgplan::costsize::Qual)>,
+    /// Each `OR` that is also a BitmapOr path: per arm, the column its
+    /// index leads with, the arm's quals on it and their selectivity.
+    bitmap_ors: Vec<Vec<BitmapArm>>,
+}
+
+/// One arm of a BitmapOr: `(column, its quals, their selectivity)`.
+type BitmapArm = (String, Vec<(String, secantus_pgplan::costsize::Qual)>, f64);
+
+/// One clause of a lowered WHERE over a measured table (`where_clauses`).
+#[derive(Debug, Clone, PartialEq)]
+enum WhereClause {
+    /// A column compared with a constant.
+    Cmp(String, secantus_pgplan::colstats::Op, Bson),
+    /// `col IN (...)` of these constants (NULLs already dropped).
+    In(String, Vec<Bson>),
+    /// `col IS NULL` (`true`) or `col IS NOT NULL`.
+    Null(String, bool),
+    /// An `OR` of conjunctions.
+    Or(Vec<Vec<WhereClause>>),
+}
+
+/// The conjunction a lowered WHERE holds (`lower_where`): `$and` arrays
+/// flattened, `$or` arms kept as conjunctions of their own. A `$ne: null`
+/// guard sits beside each `<>`; one more than a column's `<>` clauses is an
+/// `IS NOT NULL`. `None` for any other operator or shape.
+fn where_clauses(filter: &Document) -> Option<Vec<WhereClause>> {
+    use secantus_pgplan::colstats::Op;
+    fn flatten(doc: &Document, out: &mut Vec<WhereClause>, guards: &mut Vec<String>) -> Option<()> {
+        for (key, value) in doc {
+            match (key.as_str(), value) {
+                ("$and", Bson::Array(items)) => {
+                    for item in items {
+                        flatten(item.as_document()?, out, guards)?;
+                    }
+                }
+                ("$or", Bson::Array(items)) if items.len() > 1 => {
+                    let arms = items
+                        .iter()
+                        .map(|i| where_clauses(i.as_document()?))
+                        .collect::<Option<Vec<_>>>()?;
+                    out.push(WhereClause::Or(arms));
+                }
+                (k, _) if k.starts_with('$') => return None,
+                (field, Bson::Null) => out.push(WhereClause::Null(field.to_string(), true)),
+                (field, Bson::Document(ops)) if ops.keys().any(|k| k.starts_with('$')) => {
+                    for (op, operand) in ops {
+                        if op == "$ne" && operand == &Bson::Null {
+                            guards.push(field.to_string());
+                            continue;
+                        }
+                        if operand == &Bson::Null {
+                            return None;
+                        }
+                        let op = match op.as_str() {
+                            "$eq" => Op::Eq,
+                            "$ne" => Op::Ne,
+                            "$lt" => Op::Lt,
+                            "$lte" => Op::Le,
+                            "$gt" => Op::Gt,
+                            "$gte" => Op::Ge,
+                            "$in" => {
+                                out.push(WhereClause::In(
+                                    field.to_string(),
+                                    operand.as_array()?.clone(),
+                                ));
+                                continue;
+                            }
+                            _ => return None,
+                        };
+                        out.push(WhereClause::Cmp(field.to_string(), op, operand.clone()));
+                    }
+                }
+                (_, Bson::Document(_) | Bson::Array(_)) => return None,
+                (field, v) => out.push(WhereClause::Cmp(field.to_string(), Op::Eq, v.clone())),
+            }
+        }
+        Some(())
+    }
+    let (mut out, mut guards) = (Vec::new(), Vec::new());
+    flatten(filter, &mut out, &mut guards)?;
+    let mut fields: Vec<&String> = guards.iter().collect();
+    fields.sort();
+    fields.dedup();
+    let mut extra = Vec::new();
+    for f in fields {
+        let given = guards.iter().filter(|g| *g == f).count();
+        let ne = out
+            .iter()
+            .filter(|c| matches!(c, WhereClause::Cmp(g, Op::Ne, _) if g == f))
+            .count();
+        extra.extend(std::iter::repeat_n(
+            WhereClause::Null(f.clone(), false),
+            given.saturating_sub(ne),
+        ));
+    }
+    out.extend(extra);
+    Some(out)
 }
 
 /// What a grouping asks of the planner beyond its keys, for the choice
@@ -5699,20 +5799,6 @@ impl PgHandler {
             tuples,
             analyzed,
         } = self.planner_table(table, table_count)?;
-        // Over a table ANALYZE measured, a LIMIT is declined when a Group
-        // over an index scan in the keys' order competes (an index leads
-        // with a group key) or under a WHERE: those paths are not priced
-        // from the statistics.
-        if analyzed.is_some()
-            && shape.limit.is_some()
-            && (!filter.is_empty()
-                || self
-                    .cost_indexes(table, &def, table_count as u64)
-                    .iter()
-                    .any(|ix| key_cols.iter().any(|(k, _)| k == &ix.field)))
-        {
-            return None;
-        }
         // A WHERE over it is estimated from its statistics, or declined.
         let measured_where = match &analyzed {
             Some(stats) if !filter.is_empty() => {
@@ -5819,7 +5905,10 @@ impl PgHandler {
         // A WHERE the model cannot price keeps the hash.
         let priced = || -> Option<bool> {
             {
-                let quals = costsize::conjuncts(filter)?;
+                let quals = match &measured_where {
+                    Some(w) => w.quals.clone(),
+                    None => costsize::conjuncts(filter)?,
+                };
                 let rel = costsize::Rel { pages, tuples };
                 let indexes = self.cost_indexes(table, &def, table_count as u64);
                 let ndistinct = |field: &str| {
@@ -5864,10 +5953,33 @@ impl PgHandler {
                             _ => 0.0,
                         };
                         ix.correlation = if ix.columns.len() > 1 { c * 0.75 } else { c };
+                        // A non-unique index a path would read is sized with
+                        // its duplicates deduplicated.
+                        if index_sel(&ix.field).is_some() || presorts(ix) {
+                            if let Some((pages, height)) = self.dedup_index_size(table, ix) {
+                                ix.pages = pages;
+                                ix.height = height;
+                            }
+                        }
                     }
                     let colsel = |f: &str| costsize::ColSel::Given(index_sel(f).unwrap_or(1.0));
-                    let ((_, input), ordered_by) =
+                    let ((mut startup, mut input), mut ordered_by) =
                         costsize::scan_path(&rel, &measured, &quals, &colsel, read);
+                    // A BitmapOr reads the heap in its order.
+                    for or in measured_where.iter().flat_map(|w| &w.bitmap_ors) {
+                        let arms = or
+                            .iter()
+                            .map(|(f, arm, sel)| {
+                                let ix = measured.iter().find(|ix| &ix.field == f)?;
+                                Some((ix, arm.clone(), costsize::ColSel::Given(*sel)))
+                            })
+                            .collect::<Option<Vec<_>>>()?;
+                        let cost = costsize::bitmap_or_scan(&rel, &arms, &quals, read)?;
+                        if cost.1 < input || (cost.1 == input && cost.0 < startup) {
+                            (startup, input) = cost;
+                            ordered_by = None;
+                        }
+                    }
                     // A plain index scan returns the rows in the index's
                     // order: modelled only where that is the heap's.
                     if let Some(ix) = ordered_by {
@@ -6206,6 +6318,7 @@ impl PgHandler {
             tuples: pt.tuples,
             scan,
             startup_scan: (0.0, costsize::seq_scan(&rel, &quals)),
+            scan_ordered: false,
             ordered,
             unique,
             ndistinct,
@@ -6237,12 +6350,16 @@ impl PgHandler {
     }
 
     /// A WHERE over `table`, which ANALYZE measured (`stats`), estimated as
-    /// PostgreSQL 15's planner estimates it: each clause a comparison of a
-    /// column with a constant (`colstats::Column::clause_sel`), combined by
-    /// `clauselist_selectivity` (`colstats::clauselist`). `None` for any
-    /// other clause (OR, IN, IS NULL, a pattern, an expression), a constant
-    /// not of the column's type, or a column whose statistics are not
-    /// modelled.
+    /// PostgreSQL 15's planner estimates it (`where_clauses` reads the
+    /// lowered filter): a comparison of a column with a constant
+    /// (`colstats::Column::clause_sel`), an `IN` list (`in_sel`), a null test
+    /// (`null_sel`) and an `OR` of such conjunctions (`or_sel`), combined by
+    /// `clauselist_selectivity` (`colstats::clauselist_with`). `None` for any
+    /// other clause (a pattern, an expression, `NOT IN`), a constant not of
+    /// the column's type, a column whose statistics are not modelled, or a
+    /// path not priced: a null test on an indexed column (an index qual), an
+    /// `OR` whose every arm an index could serve (a BitmapOr), an `IN` list
+    /// of nine or more (hashed, costed otherwise).
     #[allow(clippy::too_many_arguments)]
     fn analyzed_where(
         &self,
@@ -6255,66 +6372,44 @@ impl PgHandler {
         indexes: &[secantus_pgplan::costsize::Index],
     ) -> Option<MeasuredWhere> {
         use secantus_pgplan::colstats::{self, Op};
-        fn flatten(doc: &Document, out: &mut Vec<(String, Op, Bson)>) -> Option<()> {
-            for (key, value) in doc {
-                match (key.as_str(), value) {
-                    ("$and", Bson::Array(items)) => {
-                        for item in items {
-                            flatten(item.as_document()?, out)?;
+        use secantus_pgplan::costsize::Qual;
+        let clauses = where_clauses(filter)?;
+        // Every column a clause names, at any depth.
+        fn fields_of<'a>(items: &'a [WhereClause], out: &mut Vec<&'a str>) {
+            for item in items {
+                match item {
+                    WhereClause::Cmp(f, ..) | WhereClause::In(f, _) | WhereClause::Null(f, _) => {
+                        if !out.contains(&f.as_str()) {
+                            out.push(f);
                         }
                     }
-                    (k, _) if k.starts_with('$') => return None,
-                    (_, Bson::Null) => return None,
-                    (field, Bson::Document(ops)) if ops.keys().any(|k| k.starts_with('$')) => {
-                        for (op, operand) in ops {
-                            // `<> x` is lowered with `$ne: null` beside it.
-                            if op == "$ne" && operand == &Bson::Null {
-                                continue;
-                            }
-                            let op = match op.as_str() {
-                                "$eq" => Op::Eq,
-                                "$ne" => Op::Ne,
-                                "$lt" => Op::Lt,
-                                "$lte" => Op::Le,
-                                "$gt" => Op::Gt,
-                                "$gte" => Op::Ge,
-                                _ => return None,
-                            };
-                            out.push((field.to_string(), op, operand.clone()));
-                        }
-                    }
-                    (_, Bson::Document(_) | Bson::Array(_)) => return None,
-                    (field, v) => out.push((field.to_string(), Op::Eq, v.clone())),
+                    WhereClause::Or(arms) => arms.iter().for_each(|a| fields_of(a, out)),
                 }
             }
-            Some(())
         }
-        let mut clauses = Vec::new();
-        flatten(filter, &mut clauses)?;
+        let mut fields: Vec<&str> = Vec::new();
+        fields_of(&clauses, &mut fields);
+        // A column any index holds, which an index path could read.
+        let indexed = |f: &str| indexes.iter().any(|ix| ix.columns.iter().any(|c| c == f));
         let docs = self.table_docs(table).ok()?;
-        let mut fields: Vec<String> = Vec::new();
-        for (f, _, _) in &clauses {
-            if !fields.contains(f) {
-                fields.push(f.clone());
-            }
-        }
         let mut columns = Vec::with_capacity(fields.len());
+        let mut bases = Vec::with_capacity(fields.len());
         for f in &fields {
-            let c = def.columns.iter().find(|c| &c.field() == f)?;
+            let c = def.columns.iter().find(|c| c.field() == *f)?;
             let base = c.pg_type.trim_start_matches("pg_catalog.");
             let numeric = matches!(base, "int2" | "int4" | "int8");
-            let measured = match stats.get(f) {
+            let measured = match stats.get(*f) {
                 Some(Some(a)) => Some((a.stats, a.slots.as_ref()?)),
                 Some(None) => return None,
                 None => None,
             };
             // `get_actual_variable_range`: the current extremes, read from a
             // B-tree index that leads with the column.
-            let actual = (numeric && indexes.iter().any(|ix| &ix.field == f))
+            let actual = (numeric && indexes.iter().any(|ix| ix.field == *f))
                 .then(|| {
                     let mut keys: Vec<Vec<u8>> = docs
                         .iter()
-                        .filter_map(|d| Self::stats_key(base, d.get(f)?))
+                        .filter_map(|d| Self::stats_key(base, d.get(*f)?))
                         .collect();
                     keys.sort();
                     Some((keys.first()?.clone(), keys.last()?.clone()))
@@ -6322,38 +6417,204 @@ impl PgHandler {
                 .flatten();
             columns.push(colstats::Column {
                 stats: measured,
-                unique: unique.contains(f),
+                unique: unique.iter().any(|u| u == f),
                 boolean: base == "bool",
                 numeric,
                 actual,
                 tuples,
             });
+            bases.push(base);
         }
-        let mut keyed: Vec<(usize, Op, Vec<u8>)> = Vec::with_capacity(clauses.len());
-        for (f, op, v) in &clauses {
-            let i = fields.iter().position(|x| x == f)?;
-            let c = def.columns.iter().find(|c| &c.field() == f)?;
-            let key = Self::stats_key(c.pg_type.trim_start_matches("pg_catalog."), v)?;
-            keyed.push((i, *op, key));
+        let at = |f: &str| fields.iter().position(|x| *x == f);
+        let key = |i: usize, v: &Bson| Self::stats_key(bases[i], v);
+        // A conjunction's selectivity, and (at the top) its index quals' per
+        // column.
+        fn conjunction(
+            items: &[WhereClause],
+            columns: &[colstats::Column],
+            at: &dyn Fn(&str) -> Option<usize>,
+            key: &dyn Fn(usize, &Bson) -> Option<Vec<u8>>,
+            indexed: &dyn Fn(&str) -> bool,
+            only: Option<usize>,
+        ) -> Option<f64> {
+            let mut cmps: Vec<(&colstats::Column, Op, Vec<u8>)> = Vec::new();
+            let mut others: Vec<f64> = Vec::new();
+            for item in items {
+                match item {
+                    WhereClause::Cmp(f, op, v) => {
+                        let i = at(f)?;
+                        if only.is_some_and(|o| o != i || *op == Op::Ne) {
+                            continue;
+                        }
+                        cmps.push((&columns[i], *op, key(i, v)?));
+                    }
+                    WhereClause::In(f, values) => {
+                        let i = at(f)?;
+                        if only.is_some_and(|o| o != i) {
+                            continue;
+                        }
+                        let keys: Vec<Vec<u8>> =
+                            values.iter().map(|v| key(i, v)).collect::<Option<_>>()?;
+                        let mut distinct = keys.clone();
+                        distinct.sort();
+                        distinct.dedup();
+                        if keys.is_empty() || keys.len() >= 9 || distinct.len() != keys.len() {
+                            return None;
+                        }
+                        others.push(columns[i].in_sel(&keys)?);
+                    }
+                    WhereClause::Null(f, is_null) => {
+                        if indexed(f) {
+                            return None;
+                        }
+                        if only.is_none() {
+                            others.push(columns[at(f)?].null_sel(*is_null));
+                        }
+                    }
+                    WhereClause::Or(arms) => {
+                        // `find_duplicate_ors` would factor out a clause every
+                        // arm shares, and drop a repeated arm.
+                        let shared = arms[0]
+                            .iter()
+                            .any(|c| arms[1..].iter().all(|a| a.contains(c)));
+                        let repeated = arms.iter().enumerate().any(|(i, a)| arms[..i].contains(a));
+                        let nested = arms
+                            .iter()
+                            .any(|a| a.iter().any(|c| matches!(c, WhereClause::Or(_))));
+                        if shared || repeated || nested {
+                            return None;
+                        }
+                        if only.is_none() {
+                            let sels: Vec<f64> = arms
+                                .iter()
+                                .map(|a| conjunction(a, columns, at, key, indexed, None))
+                                .collect::<Option<_>>()?;
+                            others.push(colstats::or_sel(&sels));
+                        }
+                    }
+                }
+            }
+            if cmps.is_empty() && others.is_empty() {
+                return Some(1.0);
+            }
+            colstats::clauselist_with(&cmps, &others)
         }
-        let list = |pick: &dyn Fn(usize, Op) -> bool| {
-            let chosen: Vec<(&colstats::Column, Op, Vec<u8>)> = keyed
-                .iter()
-                .filter(|(i, op, _)| pick(*i, *op))
-                .map(|(i, op, k)| (&columns[*i], *op, k.clone()))
-                .collect();
-            colstats::clauselist(&chosen)
-        };
-        let selectivity = list(&|_, _| true)?;
+        let selectivity = conjunction(&clauses, &columns, &at, &key, &indexed, None)?;
         let mut index_selectivity = HashMap::new();
         for (i, f) in fields.iter().enumerate() {
-            if keyed.iter().any(|(j, op, _)| *j == i && *op != Op::Ne) {
-                index_selectivity.insert(f.clone(), list(&|j, op| j == i && op != Op::Ne)?);
+            let serves = clauses.iter().any(|c| match c {
+                WhereClause::Cmp(g, op, _) => g == f && *op != Op::Ne,
+                WhereClause::In(g, _) => g == f,
+                _ => false,
+            });
+            if serves {
+                let sel = conjunction(&clauses, &columns, &at, &key, &indexed, Some(i))?;
+                index_selectivity.insert(f.to_string(), sel);
             }
         }
+        // The quals as the cost model sees them: an `OR` and a null test are
+        // filters no index serves here; a null test costs nothing
+        // (`cost_qual_eval` charges no NullTest).
+        fn ops(items: &[WhereClause]) -> f64 {
+            items
+                .iter()
+                .map(|c| match c {
+                    WhereClause::Cmp(..) => 1.0,
+                    WhereClause::In(_, v) => v.len() as f64 * 0.5,
+                    WhereClause::Null(..) => 0.0,
+                    WhereClause::Or(arms) => arms.iter().map(|a| ops(a)).sum(),
+                })
+                .sum()
+        }
+        // An `OR` each of whose arms an index could serve is also a
+        // BitmapOr path (`generate_bitmap_or_paths`): modelled where each
+        // arm's index quals are on one column that leads exactly one index,
+        // declined where an arm could use another index or several.
+        let mut bitmap_ors = Vec::new();
+        for c in &clauses {
+            let WhereClause::Or(arms) = c else { continue };
+            let mut paths = Vec::new();
+            for arm in arms {
+                let mut served: Vec<&str> = Vec::new();
+                for c in arm {
+                    let f = match c {
+                        WhereClause::Cmp(f, op, _) if *op != Op::Ne => f,
+                        WhereClause::In(f, _) => f,
+                        _ => continue,
+                    };
+                    if indexed(f) && !served.contains(&f.as_str()) {
+                        served.push(f);
+                    }
+                }
+                paths.push(served);
+            }
+            if paths.iter().any(Vec::is_empty) {
+                continue;
+            }
+            let mut or = Vec::new();
+            for (arm, served) in arms.iter().zip(&paths) {
+                let [f] = served.as_slice() else { return None };
+                // The same columns listed twice (a primary key and the
+                // store's `_id` index) are one index.
+                let mut leading: Vec<&Vec<String>> = indexes
+                    .iter()
+                    .filter(|ix| ix.field == *f)
+                    .map(|ix| &ix.columns)
+                    .collect();
+                leading.dedup();
+                if leading.len() != 1
+                    || indexes
+                        .iter()
+                        .any(|ix| ix.field != *f && ix.columns.iter().any(|c| c == f))
+                {
+                    return None;
+                }
+                let i = at(f)?;
+                let sel = conjunction(arm, &columns, &at, &key, &indexed, Some(i))?;
+                let arm_quals: Vec<(String, Qual)> = arm
+                    .iter()
+                    .filter_map(|c| match c {
+                        WhereClause::Cmp(g, op, _) if g == f && *op != Op::Ne => Some((
+                            g.clone(),
+                            match op {
+                                Op::Gt | Op::Ge => Qual::Range(true),
+                                Op::Lt | Op::Le => Qual::Range(false),
+                                _ => Qual::Eq,
+                            },
+                        )),
+                        WhereClause::In(g, v) if g == f => Some((g.clone(), Qual::In(v.len()))),
+                        _ => None,
+                    })
+                    .collect();
+                or.push((f.to_string(), arm_quals, sel));
+            }
+            bitmap_ors.push(or);
+        }
+        let quals: Vec<(String, Qual)> = clauses
+            .iter()
+            .map(|c| match c {
+                WhereClause::Cmp(f, op, _) => (
+                    f.clone(),
+                    match op {
+                        Op::Eq => Qual::Eq,
+                        Op::Ne => Qual::Ne,
+                        Op::Gt | Op::Ge => Qual::Range(true),
+                        Op::Lt | Op::Le => Qual::Range(false),
+                    },
+                ),
+                WhereClause::In(f, v) => (f.clone(), Qual::In(v.len())),
+                WhereClause::Null(f, _) => (f.clone(), Qual::Filter(0.0)),
+                WhereClause::Or(arms) => (
+                    String::new(),
+                    Qual::Filter(arms.iter().map(|a| ops(a)).sum()),
+                ),
+            })
+            .collect();
         Some(MeasuredWhere {
             selectivity,
             index_selectivity,
+            quals,
+            bitmap_ors,
         })
     }
 
@@ -6454,6 +6715,66 @@ impl PgHandler {
             }
         }
         (arrival.len() == keys.len()).then_some((arrival, trailing))
+    }
+
+    /// The size of `ix` once B-tree deduplication has merged its repeated
+    /// keys into posting lists (`_bt_dedup_pass`, `_bt_form_posting`: a
+    /// repeated key's tuple is `MAXALIGN(MAXALIGN(8 + key) + 6 x TIDs)`, at
+    /// most `BTMaxItemSize / 2`), where that is known: the metapage and one
+    /// leaf, for an index of one integer column without NULLs whose rows
+    /// overflow a leaf undeduplicated, fit it deduplicated, and hold two
+    /// values or more. `None` leaves `btree_size`'s undeduplicated build,
+    /// exact where the keys are distinct or fit a leaf as they are.
+    fn dedup_index_size(
+        &self,
+        table: &str,
+        ix: &secantus_pgplan::costsize::Index,
+    ) -> Option<(f64, u32)> {
+        const LEAF: usize = 8192 - 24 - 16;
+        const MAX_POSTING: usize = 1352;
+        let maxalign = |n: usize| n.div_ceil(8) * 8;
+        let [column] = ix.columns.as_slice() else {
+            return None;
+        };
+        let def = self.lookup(table)?;
+        let width = match def
+            .columns
+            .iter()
+            .find(|c| &c.field() == column)?
+            .pg_type
+            .trim_start_matches("pg_catalog.")
+        {
+            "int2" => 2,
+            "int4" => 4,
+            "int8" => 8,
+            _ => return None,
+        };
+        let docs = self.table_docs(table).ok()?;
+        let item = maxalign(8 + width);
+        if docs.len() * (item + 4) <= LEAF {
+            return None;
+        }
+        let mut counts: HashMap<i64, usize> = HashMap::new();
+        for d in &docs {
+            let n = match d.get(column) {
+                Some(Bson::Int32(n)) => i64::from(*n),
+                Some(Bson::Int64(n)) => *n,
+                _ => return None,
+            };
+            *counts.entry(n).or_insert(0) += 1;
+        }
+        if counts.len() < 2 || counts.len() == docs.len() {
+            return None;
+        }
+        let mut size = 0;
+        for &c in counts.values() {
+            let tuple = if c == 1 { item } else { maxalign(item + 6 * c) };
+            if tuple > MAX_POSTING {
+                return None;
+            }
+            size += tuple + 4;
+        }
+        (size <= LEAF).then_some((2.0, 0))
     }
 
     /// Whether `table`'s rows, in heap order, are in `field`'s order with no
@@ -7093,8 +7414,11 @@ impl PgHandler {
                 right_keys,
                 ..
             } => {
-                // Three tables: PostgreSQL's join order search.
+                // Three or four tables: PostgreSQL's join order search.
                 if let Some(rows) = self.three_table_join(node, limit)? {
+                    return Ok(rows);
+                }
+                if let Some(rows) = self.four_table_join(node, limit)? {
                     return Ok(rows);
                 }
                 let lrows = self.join_rows(left)?;

@@ -32,6 +32,12 @@ thread_local! {
     static WHERE_SPANS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Whether the join source being read has a WHERE over more than one
+/// table (`with_join_where`).
+pub(crate) fn where_spans() -> bool {
+    WHERE_SPANS.with(|c| c.get())
+}
+
 /// Run `f` with the join source `join`'s WHERE recorded for the search.
 pub(crate) fn with_join_where<T>(
     join: &secantus_pgplan::joins::JoinRows,
@@ -44,7 +50,7 @@ pub(crate) fn with_join_where<T>(
 }
 
 /// One table of the three.
-struct Base {
+pub(crate) struct Base {
     alias: String,
     table: String,
     filter: Document,
@@ -52,15 +58,19 @@ struct Base {
 
 /// One join of the plan: how, which side is preserved, and what it joins
 /// on.
-struct Step {
-    method: JoinMethod,
-    left: bool,
-    a_key: String,
-    b_key: String,
+pub(crate) struct Step {
+    pub(crate) method: JoinMethod,
+    pub(crate) left: bool,
+    pub(crate) a_key: String,
+    pub(crate) b_key: String,
     /// The estimated rows of `a`, which a hash right join's table is sized
     /// by.
-    a_rows: f64,
-    on: usize,
+    pub(crate) a_rows: f64,
+    /// The ON (1 or 2) the join evaluates, if one reads only its inputs,
+    /// and the ONs it checks its rows against after (an equivalence
+    /// class's derived clause stood in for them below).
+    pub(crate) on: Option<usize>,
+    pub(crate) filters: Vec<usize>,
 }
 
 /// The search's answer: which two tables join first (by index into the
@@ -74,23 +84,23 @@ pub(crate) struct ThreePlan {
 }
 
 /// A planned join's input: its rows and the joined-row keys they carry.
-struct Input {
-    rows: Vec<Document>,
-    keys: Vec<String>,
+pub(crate) struct Input {
+    pub(crate) rows: Vec<Document>,
+    pub(crate) keys: Vec<String>,
 }
 
-fn alias_of(key: &str) -> &str {
+pub(crate) fn alias_of(key: &str) -> &str {
     key.split(SEP).next().unwrap_or("")
 }
 
-fn column_of(key: &str) -> Option<&str> {
+pub(crate) fn column_of(key: &str) -> Option<&str> {
     key.split(SEP).nth(1)
 }
 
 /// Whether a filter document holds an equality of `field` to a constant
 /// anywhere (its bare value, or `$eq`): an equivalence class with a
 /// constant, which this search does not model.
-fn filter_fixes(filter: &Document, field: &str) -> bool {
+pub(crate) fn filter_fixes(filter: &Document, field: &str) -> bool {
     filter.iter().any(|(k, v)| match v {
         Bson::Document(d) if k == field => {
             d.contains_key("$eq") || !d.keys().any(|k| k.starts_with('$'))
@@ -106,18 +116,57 @@ fn filter_fixes(filter: &Document, field: &str) -> bool {
 
 /// A join relation's output as the next join's input
 /// (`joincost::JoinSide`): its estimated rows and the cost of its cheapest
-/// path, the key's statistics its base table's, never unique, in no
-/// useful order.
-fn joinrel_side(rows: f64, choice: &JoinChoice, base: &JoinSide) -> JoinSide {
+/// path, the key's statistics its base table's, never unique. `keyed`,
+/// when the key is one its merge join's output is ordered by: its cheapest
+/// path in that order, and whether that is its cheapest path overall.
+pub(crate) fn joinrel_side(
+    rows: f64,
+    choice: &JoinChoice,
+    keyed: Option<&JoinChoice>,
+    base: &JoinSide,
+) -> JoinSide {
     JoinSide {
         rows,
         scan: (choice.startup, choice.total),
         startup_scan: (choice.startup, choice.total),
-        ordered: None,
+        ordered: keyed.map(|k| (k.startup, k.total)),
+        scan_ordered: keyed.is_some_and(|k| k == choice),
         unique: false,
         key_ops: 0.0,
         ..*base
     }
+}
+
+/// One join of two tables the search weighs (`join_search_one_level`'s
+/// level 2): the tables by index, `a` first, their keys, whether it is a
+/// LEFT join (`a` preserved), and the ON it evaluates.
+struct Pair {
+    a: usize,
+    b: usize,
+    a_key: String,
+    b_key: String,
+    left: bool,
+    on: Option<usize>,
+}
+
+/// A pair's planning: its rows, its cheapest path, and its cheapest path
+/// in key order.
+struct PairRel {
+    rows: f64,
+    total: JoinChoice,
+    keyed: Option<JoinChoice>,
+}
+
+/// One way to build the three-table relation (level 3): a pair with the
+/// third table, on the pair's key `pair_key` and the table's `base_key`;
+/// `pair_first`: the pair is `a`.
+struct Combo {
+    pair: usize,
+    base: usize,
+    pair_key: String,
+    base_key: String,
+    left: bool,
+    pair_first: bool,
 }
 
 impl PgHandler {
@@ -190,8 +239,7 @@ impl PgHandler {
         }
         let [x, y, z] = [&bases[0], &bases[1], &bases[2]];
         // The two clauses: x-y, and w-z with w one of x and y; each ON
-        // reads only its two tables; no column in both (an equivalence
-        // class of three, which PostgreSQL would join every way round).
+        // reads only its two tables.
         if alias_of(xk) != x.alias || alias_of(yk) != y.alias || alias_of(zk) != z.alias {
             return None;
         }
@@ -205,7 +253,6 @@ impl PgHandler {
         let w_alias = &bases[w].alias;
         if on1.iter().any(|a| *a != x.alias && *a != y.alias)
             || on2.iter().any(|a| a != w_alias && *a != z.alias)
-            || [xk, yk].iter().any(|k| *k == wk || *k == zk)
         {
             return None;
         }
@@ -234,87 +281,213 @@ impl PgHandler {
         };
         let left1 = k1 == JoinKind::Left;
         let left2 = k2 == JoinKind::Left;
-        let side = |b: &Base, key: &str| {
+        let shared = wk == xk || wk == yk;
+        let side = |i: usize, key: &str| {
+            let b = &bases[i];
             self.join_side(&b.table, JoinKey::Column(column_of(key)?), &b.filter, 0)
         };
-        let (sx, sy) = (side(x, xk)?, side(y, yk)?);
-        let (sw, sz) = (side(&bases[w], wk)?, side(z, zk)?);
-        // Level 2, in `join_search_one_level`'s order: x-y, then w-z.
-        let level2 = |a: &JoinSide, b: &JoinSide, left: bool| -> Option<(f64, JoinChoice)> {
-            let mut rel = JoinRel::new(false);
-            rel.add_paths(0, a, b, left, true);
-            let rows = join_rows(a, b, left);
-            Some((rows, rel.cheapest(None, rows)?))
-        };
-        let (xy_rows, xy) = level2(&sx, &sy, left1)?;
-        let (wz_rows, wz) = level2(&sw, &sz, left2)?;
-        // Level 3: x-y with z, then w-z with the other table v. A LEFT
-        // join's preserved side is `a` (`make_join_rel` swaps it first).
-        let v = 1 - w;
-        let mut top = JoinRel::new(false);
-        let a0 = joinrel_side(xy_rows, &xy, &sw);
-        top.add_paths(0, &a0, &sz, left2, true);
-        let rows = join_rows(&a0, &sz, left2);
-        // The v join is the x-y join: v's key and the w-z rel's key into it.
-        let (v_key, wz_key) = if v == 0 { (xk, yk) } else { (yk, xk) };
-        let (v_side, wz_base) = if v == 0 { (&sx, &sy) } else { (&sy, &sx) };
-        let wz_side = joinrel_side(wz_rows, &wz, wz_base);
-        // With x-y LEFT, x is preserved: v = x is `a`, else the w-z rel
-        // (holding x) is.
-        let v_first = left1 && v == 0;
-        if v_first {
-            top.add_paths(1, v_side, &wz_side, true, true);
+        let leaves = [x_node.as_ref(), y_node.as_ref(), z_node.as_ref()];
+        // An inner chain whose clauses share a key: one equivalence class
+        // over three tables, which joins any two of them on its derived
+        // clause (`generate_join_implied_equalities`: its first member on
+        // each side, in the order the clauses gave them). Its derived
+        // clauses are matched by their keys' hash alone, so only for
+        // integer keys, where that is equality; the ONs still decide every
+        // row at the top.
+        let ec = shared && !left1 && !left2;
+        let (pairs, combos) = if ec {
+            let types: Vec<Option<String>> = [(0, xk), (1, yk), (2, zk)]
+                .iter()
+                .map(|(i, k)| leaf_key_type(leaves[*i], k))
+                .collect();
+            let int = |t: &Option<String>| matches!(t.as_deref(), Some("int2" | "int4" | "int8"));
+            if !types.iter().all(int) || types.windows(2).any(|t| t[0] != t[1]) {
+                return None;
+            }
+            let on_of = |a: usize, b: usize| {
+                let pair = [&bases[a].alias, &bases[b].alias];
+                if on1.iter().all(|x| pair.contains(&x)) {
+                    Some(1)
+                } else if on2.iter().all(|x| pair.contains(&x)) {
+                    Some(2)
+                } else {
+                    None
+                }
+            };
+            let pair = |a: usize, b: usize, ak: &String, bk: &String| Pair {
+                a,
+                b,
+                a_key: ak.clone(),
+                b_key: bk.clone(),
+                left: false,
+                on: on_of(a, b),
+            };
+            let pairs = vec![pair(0, 1, xk, yk), pair(0, 2, xk, zk), pair(1, 2, yk, zk)];
+            let combo = |pair: usize, base: usize, pk: &String, bk: &String| Combo {
+                pair,
+                base,
+                pair_key: pk.clone(),
+                base_key: bk.clone(),
+                left: false,
+                pair_first: true,
+            };
+            let combos = vec![
+                combo(0, 2, xk, zk),
+                combo(1, 1, xk, yk),
+                combo(2, 0, yk, xk),
+            ];
+            (pairs, combos)
         } else {
-            top.add_paths(1, &wz_side, v_side, left1, true);
-        }
-        let choice = top.cheapest(None, rows)?;
-        let plan = if choice.combo == 0 {
-            ThreePlan {
-                first: (0, 1),
-                first_step: Step {
-                    method: xy.method,
-                    left: left1,
+            // The chain: x-y, then w-z; each ON its own join's.
+            let pairs = vec![
+                Pair {
+                    a: 0,
+                    b: 1,
                     a_key: xk.clone(),
                     b_key: yk.clone(),
-                    a_rows: sx.rows,
-                    on: 1,
-                },
-                joinrel_first: true,
-                second_step: Step {
-                    method: choice.method,
-                    left: left2,
-                    a_key: wk.clone(),
-                    b_key: zk.clone(),
-                    a_rows: xy_rows,
-                    on: 2,
-                },
-            }
-        } else {
-            let (a_key, b_key, a_rows) = if v_first {
-                (v_key.clone(), wz_key.clone(), v_side.rows)
-            } else {
-                (wz_key.clone(), v_key.clone(), wz_rows)
-            };
-            ThreePlan {
-                first: (w, 2),
-                first_step: Step {
-                    method: wz.method,
-                    left: left2,
-                    a_key: wk.clone(),
-                    b_key: zk.clone(),
-                    a_rows: sw.rows,
-                    on: 2,
-                },
-                joinrel_first: !v_first,
-                second_step: Step {
-                    method: choice.method,
                     left: left1,
-                    a_key,
-                    b_key,
-                    a_rows,
-                    on: 1,
+                    on: Some(1),
                 },
+                Pair {
+                    a: w,
+                    b: 2,
+                    a_key: wk.clone(),
+                    b_key: zk.clone(),
+                    left: left2,
+                    on: Some(2),
+                },
+            ];
+            // Level 3: x-y with z, then w-z with the other table v. A LEFT
+            // join's preserved side is `a` (`make_join_rel` swaps it first):
+            // with x-y LEFT, x is, so v = x is `a`, else the w-z rel (holding
+            // x) is.
+            let v = 1 - w;
+            let (v_key, wz_key) = if v == 0 { (xk, yk) } else { (yk, xk) };
+            let combos = vec![
+                Combo {
+                    pair: 0,
+                    base: 2,
+                    pair_key: wk.clone(),
+                    base_key: zk.clone(),
+                    left: left2,
+                    pair_first: true,
+                },
+                Combo {
+                    pair: 1,
+                    base: v,
+                    pair_key: wz_key.clone(),
+                    base_key: v_key.clone(),
+                    left: left1,
+                    pair_first: !(left1 && v == 0),
+                },
+            ];
+            (pairs, combos)
+        };
+        // Level 2, in `join_search_one_level`'s order.
+        let mut rels = Vec::new();
+        for p in &pairs {
+            let (a, b) = (side(p.a, &p.a_key)?, side(p.b, &p.b_key)?);
+            let mut rel = JoinRel::new(false);
+            rel.add_paths(0, &a, &b, p.left, true);
+            let rows = join_rows(&a, &b, p.left);
+            rels.push(PairRel {
+                rows,
+                total: rel.cheapest(None, rows)?,
+                keyed: rel.cheapest_keyed(),
+            });
+        }
+        // Level 3: every combo's paths in one relation.
+        let mut top = JoinRel::new(false);
+        let mut rows3 = None;
+        let mut sides = Vec::new();
+        for (i, c) in combos.iter().enumerate() {
+            let p = &pairs[c.pair];
+            let rel = &rels[c.pair];
+            // The pair's merge output is in its key's order: either key for
+            // an inner join, the preserved side's for a LEFT one.
+            let in_order = c.pair_key == p.a_key || (!p.left && c.pair_key == p.b_key);
+            let key_rel = if alias_of(&c.pair_key) == bases[p.a].alias {
+                p.a
+            } else {
+                p.b
+            };
+            let pair_side = joinrel_side(
+                rel.rows,
+                &rel.total,
+                rel.keyed.as_ref().filter(|_| in_order),
+                &side(key_rel, &c.pair_key)?,
+            );
+            let base_side = side(c.base, &c.base_key)?;
+            let (a, b) = if c.pair_first {
+                (pair_side, base_side)
+            } else {
+                (base_side, pair_side)
+            };
+            top.add_paths(i, &a, &b, c.left, true);
+            rows3.get_or_insert(join_rows(&a, &b, c.left));
+            sides.push((a, b));
+        }
+        let choice = top.cheapest(None, rows3?)?;
+        let c = &combos[choice.combo];
+        let p = &pairs[c.pair];
+        let rel = &rels[c.pair];
+        // The pair runs in its key order when the top merge join reads it
+        // unsorted.
+        let pair_unsorted = match choice.method {
+            JoinMethod::MergeOuterA {
+                a_by_index,
+                b_by_index,
             }
+            | JoinMethod::MergeOuterB {
+                a_by_index,
+                b_by_index,
+            } => {
+                if c.pair_first {
+                    a_by_index
+                } else {
+                    b_by_index
+                }
+            }
+            _ => false,
+        };
+        let first = if pair_unsorted {
+            rel.keyed.as_ref()?
+        } else {
+            &rel.total
+        };
+        let (a, _) = &sides[choice.combo];
+        let applied: Vec<usize> = p.on.into_iter().collect();
+        let mut rest: Vec<usize> = [1, 2]
+            .into_iter()
+            .filter(|o| !applied.contains(o))
+            .collect();
+        let top_on = (!rest.is_empty()).then(|| rest.remove(0));
+        let (a_key, b_key) = if c.pair_first {
+            (c.pair_key.clone(), c.base_key.clone())
+        } else {
+            (c.base_key.clone(), c.pair_key.clone())
+        };
+        let plan = ThreePlan {
+            first: (p.a, p.b),
+            first_step: Step {
+                method: first.method,
+                left: p.left,
+                a_key: p.a_key.clone(),
+                b_key: p.b_key.clone(),
+                a_rows: side(p.a, &p.a_key)?.rows,
+                on: p.on,
+                filters: Vec::new(),
+            },
+            joinrel_first: c.pair_first,
+            second_step: Step {
+                method: choice.method,
+                left: c.left,
+                a_key,
+                b_key,
+                a_rows: a.rows,
+                on: top_on,
+                filters: rest,
+            },
         };
         if [plan.first_step.method, plan.second_step.method].contains(&JoinMethod::Unmodelled) {
             return None;
@@ -361,7 +534,11 @@ impl PgHandler {
                 keys: secantus_pgplan::joins::node_keys(n),
             }));
         }
-        let on = |i: usize| if i == 1 { on1.as_ref() } else { on2.as_ref() };
+        let on = |i: Option<usize>| match i {
+            Some(1) => on1.as_ref(),
+            Some(_) => on2.as_ref(),
+            None => None,
+        };
         let (fa, fb) = plan.first;
         let a = inputs[fa].take().expect("each table read once");
         let b = inputs[fb].take().expect("each table read once");
@@ -390,15 +567,35 @@ impl PgHandler {
                 leaf_key_type(third_node, &plan.second_step.a_key),
             )
         };
-        Ok(self
-            .run_step(&plan.second_step, a, b, a_type, on(plan.second_step.on))?
-            .map(|i| i.rows))
+        let Some(joined) =
+            self.run_step(&plan.second_step, a, b, a_type, on(plan.second_step.on))?
+        else {
+            return Ok(None);
+        };
+        // The ONs a derived clause stood in for decide every row.
+        let mut rows = joined.rows;
+        for f in &plan.second_step.filters {
+            if let Some(expr) = on(Some(*f)) {
+                let mut kept = Vec::with_capacity(rows.len());
+                for d in rows {
+                    let keep = matches!(
+                        secantus_pgplan::apply_row_expr(expr, &d).map_err(|e| Self::err(&e))?,
+                        Bson::Boolean(true)
+                    );
+                    if keep {
+                        kept.push(d);
+                    }
+                }
+                rows = kept;
+            }
+        }
+        Ok(Some(rows))
     }
 
     /// One join of a planned order: `a` and `b` put in the order `step`'s
     /// method reads them, then joined with its outer side first. `None`
     /// when a hash right join's table order is not reproducible.
-    fn run_step(
+    pub(crate) fn run_step(
         &self,
         step: &Step,
         mut a: Input,

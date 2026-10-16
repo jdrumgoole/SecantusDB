@@ -1404,6 +1404,99 @@ def test_where_on_a_composite_key_column_estimates_from_its_mcvs(pg: Any) -> Non
 
 
 @pytest.mark.backlog_fixed("RP-028")
+def test_in_list_over_an_analyzed_table_sums_its_elements(pg: Any) -> None:
+    """PostgreSQL 15.19: `g in (1, 2, 3)` over 300 analysed rows sums the three
+    values' MCV frequencies (`scalararraysel`), 82 rows, and the 6 groups of t
+    come out x2 x0 x3 x5 x4 x1."""
+    got = _analyzed(
+        pg,
+        "rp028_bi",
+        [
+            "create table rp028_bi (k int primary key, g int, t text)",
+            "insert into rp028_bi select i, (i * 7) % 11, 'x' || (i % 6)"
+            " from generate_series(1, 300) i",
+            "analyze rp028_bi",
+        ],
+        "select t from rp028_bi where g in (1, 2, 3) group by t",
+    )
+    assert got == ("ok", [(t,) for t in ["x2", "x0", "x3", "x5", "x4", "x1"]])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_or_over_an_analyzed_table_combines_its_arms(pg: Any) -> None:
+    """PostgreSQL 15.19: `g = 3 or h = 1` over 300 analysed rows is
+    `s1 + s2 - s1 * s2` of the arms (101 rows); the 4 groups of h come out
+    0 1 3 2."""
+    got = _analyzed(
+        pg,
+        "rp028_bn",
+        [
+            "create table rp028_bn (k int primary key, g int, h int)",
+            "insert into rp028_bn select i, case when i % 5 = 0 then null"
+            " else (i * 3) % 7 end, i % 4 from generate_series(1, 300) i",
+            "analyze rp028_bn",
+        ],
+        "select h from rp028_bn where g = 3 or h = 1 group by h",
+    )
+    assert got == ("ok", [(h,) for h in [0, 1, 3, 2]])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_is_null_over_an_analyzed_table_reads_its_null_fraction(pg: Any) -> None:
+    """PostgreSQL 15.19: `g is null` over 300 analysed rows is g's null
+    fraction, 60 rows (`nulltestsel`); the 4 groups of h come out 0 1 3 2."""
+    got = _analyzed(
+        pg,
+        "rp028_bn",
+        [
+            "create table rp028_bn (k int primary key, g int, h int)",
+            "insert into rp028_bn select i, case when i % 5 = 0 then null"
+            " else (i * 3) % 7 end, i % 4 from generate_series(1, 300) i",
+            "analyze rp028_bn",
+        ],
+        "select h from rp028_bn where g is null group by h",
+    )
+    assert got == ("ok", [(h,) for h in [0, 1, 3, 2]])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_where_under_a_limit_over_an_analyzed_table(pg: Any) -> None:
+    """PostgreSQL 15.19: `where k > 5 group by g limit 3` over 300 analysed
+    rows takes the first three groups of the HashAggregate it prices for
+    the LIMIT: 8 10 7."""
+    got = _analyzed(
+        pg,
+        "rp028_bi",
+        [
+            "create table rp028_bi (k int primary key, g int, t text)",
+            "insert into rp028_bi select i, (i * 7) % 11, 'x' || (i % 6)"
+            " from generate_series(1, 300) i",
+            "analyze rp028_bi",
+        ],
+        "select g from rp028_bi where k > 5 group by g limit 3",
+    )
+    assert got == ("ok", [(g,) for g in [8, 10, 7]])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_bitmap_or_over_an_analyzed_table_is_priced(pg: Any) -> None:
+    """PostgreSQL 15.19: `k < 5 or k > 2995` over 3,000 analysed rows reads a
+    BitmapOr of two index scans on the key, and its 9 rows sort for a
+    Group: 1 2 3 5 6 7 9 10."""
+    got = _analyzed(
+        pg,
+        "rp028_bo",
+        [
+            "create table rp028_bo (k int primary key, g int)",
+            "insert into rp028_bo select i, (i * 7) % 11 from generate_series(1, 3000) i",
+            "analyze rp028_bo",
+        ],
+        "select g from rp028_bo where k < 5 or k > 2995 group by g",
+    )
+    assert got == ("ok", [(g,) for g in [1, 2, 3, 5, 6, 7, 9, 10]])
+
+
+@pytest.mark.backlog_fixed("RP-028")
 def test_many_to_many_merge_join_leaves_ties_as_its_sorts_do(pg: Any) -> None:
     """PostgreSQL 15.19: `on l.b = r.c` over two fresh keyed tables is a
     Merge Join over two Sorts, so equal keys come out as PostgreSQL's
@@ -1523,13 +1616,12 @@ def test_three_table_left_join_chain_merges_in_key_order(pg: Any) -> None:
     assert " ".join(f"{a}:{b}:{c}" for a, b, c in got[1][:8]) == want
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_three_tables_on_one_equivalence_class(pg: Any) -> None:
     """PostgreSQL 15.19: `l JOIN r ON l.b = r.c JOIN m ON l.b = m.d` puts the
     three keys in one equivalence class, so any two tables can join first;
     the plan merges l and r, materialises that, and merges it with m sorted
-    by `d` as the outer side (7:5:15 7:20:15 ...); here a key two clauses
-    share keeps the join as written."""
+    by `d` as the outer side (7:5:15 7:20:15 ...)."""
     pg.execute("begin")
     try:
         pg.execute("create table rp028_jl (a int primary key, b int)")
@@ -1549,3 +1641,64 @@ def test_three_tables_on_one_equivalence_class(pg: Any) -> None:
     want = "7:5:15 7:20:15 7:15:15 7:10:15 14:5:15 14:20:15 14:15:15"
     assert got[0] == "ok"
     assert " ".join(f"{a}:{b}:{c}" for a, b, c in got[1][:7]) == want
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_four_table_chain_joins_in_the_searched_order(pg: Any) -> None:
+    """PostgreSQL 15.19: a chain of four tables, `l JOIN r ON l.b = r.c JOIN
+    m ON r.a = m.a JOIN k ON m.d = k.e`, is planned by the join order search
+    over four relations: m and k merge first, l and r merge, and the two
+    hash join with l-r hashed (14:15:15:12 7:15:15:12 ...)."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp028_jl (a int primary key, b int)")
+        pg.execute("insert into rp028_jl select i, i % 7 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jr (a int primary key, c int)")
+        pg.execute("insert into rp028_jr select i, i % 5 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jm (a int, d int)")
+        pg.execute("insert into rp028_jm select i, i % 3 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jk (a int, e int)")
+        pg.execute("insert into rp028_jk select i, i % 4 from generate_series(1, 20) i")
+        got = pg_answer(
+            pg,
+            "select rp028_jl.a, rp028_jr.a, rp028_jm.a, rp028_jk.a from rp028_jl"
+            " join rp028_jr on rp028_jl.b = rp028_jr.c"
+            " join rp028_jm on rp028_jr.a = rp028_jm.a"
+            " join rp028_jk on rp028_jm.d = rp028_jk.e",
+        )
+    finally:
+        pg.execute("rollback")
+    want = "14:15:15:12 7:15:15:12 14:15:15:8 7:15:15:8 14:15:15:16 7:15:15:16"
+    assert got[0] == "ok"
+    assert " ".join(f"{a}:{b}:{c}:{d}" for a, b, c, d in got[1][:6]) == want
+
+
+@pytest.mark.backlog("RP-028")
+def test_four_table_left_join_chain_joins_in_the_searched_order(pg: Any) -> None:
+    """PostgreSQL 15.19: the same four tables as LEFT joins, `l LEFT JOIN r
+    ... LEFT JOIN m ... LEFT JOIN k`, plan as two LEFT merge joins, m-k and
+    l-r, joined by a Hash Right Join with l-r hashed (14:15:15:12
+    7:15:15:12 ...); here a LEFT chain of four keeps each side in scan
+    order."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp028_jl (a int primary key, b int)")
+        pg.execute("insert into rp028_jl select i, i % 7 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jr (a int primary key, c int)")
+        pg.execute("insert into rp028_jr select i, i % 5 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jm (a int, d int)")
+        pg.execute("insert into rp028_jm select i, i % 3 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jk (a int, e int)")
+        pg.execute("insert into rp028_jk select i, i % 4 from generate_series(1, 20) i")
+        got = pg_answer(
+            pg,
+            "select rp028_jl.a, rp028_jr.a, rp028_jm.a, rp028_jk.a from rp028_jl"
+            " left join rp028_jr on rp028_jl.b = rp028_jr.c"
+            " left join rp028_jm on rp028_jr.a = rp028_jm.a"
+            " left join rp028_jk on rp028_jm.d = rp028_jk.e",
+        )
+    finally:
+        pg.execute("rollback")
+    want = "14:15:15:12 7:15:15:12 14:15:15:8 7:15:15:8 14:15:15:16 7:15:15:16"
+    assert got[0] == "ok"
+    assert " ".join(f"{a}:{b}:{c}:{d}" for a, b, c, d in got[1][:6]) == want

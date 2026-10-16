@@ -776,8 +776,9 @@ impl PgHandler {
         // A join whose plan reorders its sides (RP-028) is read whole, where
         // the materialised path puts them in that plan's order; so is a
         // chain of three tables whose join order is searched.
-        if crate::join_search::with_join_where(join, || self.three_table_plan(&join.tree)).is_some()
-        {
+        if crate::join_search::with_join_where(join, || {
+            self.three_table_plan(&join.tree).is_some() || self.four_table_plan_applies(&join.tree)
+        }) {
             return Ok(None);
         }
         if let secantus_pgplan::joins::JoinNode::Join {
