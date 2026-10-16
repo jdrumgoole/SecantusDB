@@ -517,6 +517,37 @@ pub(crate) fn read_exec_error(err: StorageError, command: &str, ns: &str) -> Com
     }
 }
 
+/// [`read_exec_error`] for the read commands whose wrapper names the
+/// namespace with "on namespace" -- `count`, `distinct` and `aggregate`
+/// (measured 8.2.11, 2026-10-16, for an error inside a query's `$expr`).
+/// `aggregate` also puts a constant's optimizer failure under its own
+/// `Failed to optimize pipeline` wrapper.
+pub(crate) fn read_error_on_namespace(err: StorageError, command: &str, ns: &str) -> CommandError {
+    match err {
+        StorageError::WriteError {
+            code,
+            errmsg,
+            exec: true,
+        } => CommandError::new(
+            code,
+            error_code_name(code),
+            format!("Executor error during {command} command on namespace: {ns} :: caused by :: {errmsg}"),
+        ),
+        StorageError::WriteError {
+            code,
+            errmsg,
+            exec: false,
+        } if command == "aggregate" && errmsg.starts_with("Failed to optimize expression") => {
+            CommandError::new(
+                code,
+                error_code_name(code),
+                format!("Failed to optimize pipeline :: caused by :: {errmsg}"),
+            )
+        }
+        other => command_error(other),
+    }
+}
+
 /// Map a storage error to a command-level `CommandError` (for non-batch
 /// commands like `count` / `find`). Read commands never carry an
 /// execution-time update error, so this drops the flag; `findAndModify`, which

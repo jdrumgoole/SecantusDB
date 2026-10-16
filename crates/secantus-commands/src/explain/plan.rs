@@ -123,11 +123,42 @@ pub(crate) fn clauses(canonical: &Document) -> Vec<Document> {
 }
 
 /// One clause, or an `$and` of several, as mongod prints a filter.
+///
+/// A twin `$expr` derived (`$_internalExprEq` ...) is never printed: the
+/// `$expr` beside it rechecks it. But mongod drops it from the `$and` after
+/// building it, so a filter left with ONE clause that way is still printed
+/// as an `$and` (measured 8.2.11, 2026-10-16). A twin the bounds decided
+/// never reaches here, and leaves no `$and` behind.
 pub(crate) fn assemble(parts: Vec<Document>) -> Option<Document> {
+    let before = parts.len();
+    let parts: Vec<Document> = parts.into_iter().filter(|c| !is_expr_twin(c)).collect();
     match parts.len() {
         0 => None,
-        1 => parts.into_iter().next(),
+        1 if parts.len() == before => parts.into_iter().next(),
         _ => Some(doc! { "$and": parts.into_iter().map(Bson::Document).collect::<Vec<_>>() }),
+    }
+}
+
+/// A predicate `$expr` derived for the planner: `{path: {$_internalExprEq:
+/// v}}` and its range siblings, or an `$or` of them.
+pub(crate) fn is_expr_twin(clause: &Document) -> bool {
+    let Some((key, value)) = clause.iter().next().filter(|_| clause.len() == 1) else {
+        return false;
+    };
+    match (key.as_str(), value) {
+        ("$or", Bson::Array(branches)) => branches.iter().all(|b| match b {
+            Bson::Document(d) => match d.get("$and") {
+                Some(Bson::Array(parts)) => parts
+                    .iter()
+                    .all(|p| p.as_document().is_some_and(is_expr_twin)),
+                _ => is_expr_twin(d),
+            },
+            _ => false,
+        }),
+        (path, Bson::Document(pred)) if !path.starts_with('$') => {
+            pred.len() == 1 && pred.keys().all(|k| k.starts_with("$_internalExpr"))
+        }
+        _ => false,
     }
 }
 
@@ -331,15 +362,17 @@ fn scan_of(u: &IndexUse, parts: &[Document], backward: bool) -> IxScan {
     }
 }
 
+/// What the FETCH over one index rechecks, in mongod's order for it: by
+/// path, not the canonical order (`secantus_core::residual_key`).
 fn residual(u: &IndexUse, parts: &[Document]) -> Option<Document> {
-    assemble(
-        parts
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !u.covered.contains(i) && !u.on_key.contains(i))
-            .map(|(_, c)| c.clone())
-            .collect(),
-    )
+    let mut rest: Vec<Document> = parts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !u.covered.contains(i) && !u.on_key.contains(i))
+        .map(|(_, c)| c.clone())
+        .collect();
+    rest.sort_by_key(secantus_core::residual_key);
+    assemble(rest)
 }
 
 /// When the leading fields are a few points and the sort follows them, mongod
@@ -627,7 +660,12 @@ fn or_access(
 
 fn access(q: &Query, catalog: &[Rc<IndexInfo>]) -> Access {
     let always = q.canonical.len() == 1 && q.canonical.contains_key("$alwaysTrue");
-    let whole = || (!q.canonical.is_empty() && !always).then(|| q.canonical.clone());
+    // Through `assemble`, which leaves out the twins `$expr` derives.
+    let whole = || {
+        (!q.canonical.is_empty() && !always)
+            .then(|| assemble(clauses(q.canonical)))
+            .flatten()
+    };
     let collscan = |subplan: bool, backward: bool| Access {
         scan: Node::CollScan {
             filter: whole(),

@@ -1460,7 +1460,9 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 collation.as_ref(),
                 &Document::new(),
             )
-            .map_err(command_error)?
+            .map_err(|e| {
+                crate::util::read_error_on_namespace(e, "count", &format!("{}.{coll}", ctx.db_name))
+            })?
             .len() as i64
     } else {
         // A `$near` needs its index whether or not the order matters.
@@ -1495,7 +1497,9 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         )?;
         storage
             .count_collated(&ctx.db_name, &coll, &filter, collation.as_ref())
-            .map_err(command_error)? as i64
+            .map_err(|e| {
+                crate::util::read_error_on_namespace(e, "count", &format!("{}.{coll}", ctx.db_name))
+            })? as i64
     };
     if view_on.is_none() {
         crate::explain::order::count_index_use(

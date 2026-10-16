@@ -1188,13 +1188,16 @@ What is left, all on the RUST MongoDB server:
       **Decided 2026-10-16 (Joe):** as RM-071, transcribe and execute.
       Backlog-ID: RM-072
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view
-- [ ] **Smaller:** `$expr` is not rewritten (`{$expr: false}` is not an
-      `EOF`, an equality inside `$expr` adds no `$_internalExprEq`); a
-      comparison to an ARRAY bounds nothing; `$where` is refused by `find`
-      itself; `explain` of `mapReduce` and `bulkWrite` is refused;
-      `local.oplog.rs` and `system.views` report `EOF`.
+- [ ] **Smaller:** a comparison to an ARRAY bounds nothing (mongod
+      8.2.11 bounds `{a: {$lt: [5]}}` over a multikey `a_1` as `[MinKey, [
+      5 ]]`; this server scans the collection); `$where` is refused by
+      `find` itself (6108304); `explain` of `mapReduce` is refused (20).
+      (`$expr` is now optimised and rewritten as mongod does it, and
+      `explain` of `bulkWrite` and of `system.views` were measured to
+      match: mongod refuses the first too. `local.oplog.rs` was not
+      re-measured.)
       Backlog-ID: RM-074
-      Verify: tests/backlog/test_rm_057_084.py::test_explain_of_expr_false_is_eof
+      Verify: tests/backlog/test_rm_057_084.py::test_explain_leftovers
 
 ### 7.074 Change streams, command by command -- 2026-10-11
 

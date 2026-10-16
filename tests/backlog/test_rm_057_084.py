@@ -382,10 +382,101 @@ def _expr_false_stage(client: Any) -> Any:
     return c.find({"$expr": False}).explain()["queryPlanner"]["winningPlan"].get("stage")
 
 
+def _explain_leftovers(client: Any) -> list:
+    db = client[f"rm074_{_name()}"]
+    db.c.insert_many([{"a": [1, 2]}, {"a": 3}])
+    db.c.create_index("a")
+
+    def bounds() -> Any:
+        plan = db.command("explain", {"find": "c", "filter": {"a": {"$lt": [5]}}})
+        stage = plan["queryPlanner"]["winningPlan"]
+        return stage.get("inputStage", stage).get("indexBounds")
+
+    mr = {
+        "mapReduce": "c",
+        "map": "function(){emit(1,1)}",
+        "reduce": "function(k,v){return 1}",
+        "out": {"inline": 1},
+    }
+    return [
+        mongo_answer(bounds),
+        mongo_answer(lambda: sorted(str(d["a"]) for d in db.c.find({"$where": "this.a == 3"}))),
+        mongo_answer(lambda: db.command("explain", mr)["ok"])[:2],
+    ]
+
+
 @pytest.mark.backlog("RM-074")
+def test_explain_leftovers(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 bounds a comparison to an array (`[MinKey, [ 5 ]]`),
+    runs `$where` in `find`, and explains `mapReduce`."""
+    assert _explain_leftovers(rust_mongo) == _explain_leftovers(mongod)
+
+
+@pytest.mark.backlog_fixed("RM-074")
 def test_explain_of_expr_false_is_eof(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 folds `{$expr: false}` and explains it as `EOF`."""
     assert _expr_false_stage(rust_mongo) == _expr_false_stage(mongod) == "EOF"
+
+
+_EXPR_FILTERS = [
+    {"$expr": True},
+    {"$expr": 0},
+    {"$expr": {"$and": [True, {"$eq": ["$a", 1]}]}},
+    {"$expr": {"$or": [False, {"$eq": ["$a", 1]}]}},
+    {"$expr": {"$eq": ["$a", 1]}},
+    {"$expr": {"$gt": [1, "$a"]}},
+    {"$expr": {"$gte": ["$a", None]}},
+    {"$expr": {"$lte": ["$a", {"$add": [1, 1]}]}},
+    {"$expr": {"$eq": ["$$CURRENT.a", 1]}},
+    {"$expr": {"$and": [{"$eq": ["$a", 1]}, {"$lt": ["$b", 4]}]}},
+    {"$expr": {"$or": [{"$eq": ["$a", 1]}, {"$eq": ["$a", 2]}]}},
+    {"$expr": {"$in": ["$a", [1, 2]]}},
+    {"$expr": {"$in": ["$a", [1, None]]}},
+    {"$expr": {"$in": ["$a", []]}},
+    {"$expr": {"$eq": ["$a", [1]]}},
+    {"$expr": {"$eq": ["$a", "$b"]}},
+    {"$expr": {"$abs": "$b"}},
+    {"b": 2, "$expr": {"$eq": ["$a", 2]}},
+    {"b": 2, "$and": [{"$expr": {"$eq": ["$a", 2]}}, {"$expr": "$q"}]},
+]
+
+
+def _expr_plans(client: Any) -> list:
+    """`parsedQuery`, the winning plan's stages and filters, and the order of
+    `find`, for each filter, over three collections: no index, an index on
+    `a`, and a multikey index on `a`."""
+    db = client[f"rm074_{_name()}"]
+    docs = [{"_id": i, "a": i % 3, "b": i} for i in range(6)]
+    db.plain.insert_many(docs)
+    db.indexed.insert_many(docs)
+    db.indexed.create_index("a")
+    db.multikey.insert_many(docs + [{"_id": 9, "a": [1, 2]}])
+    db.multikey.create_index("a")
+
+    def shape(node: dict) -> dict:
+        out = {k: node[k] for k in ("stage", "filter", "indexBounds") if k in node}
+        if "inputStage" in node:
+            out["inputStage"] = shape(node["inputStage"])
+        return out
+
+    out = []
+    for coll in (db.plain, db.indexed, db.multikey):
+        for f in _EXPR_FILTERS:
+            plan = coll.find(f).explain()["queryPlanner"]
+            order = [d["_id"] for d in coll.find(f)]
+            out.append((coll.name, f, plan["parsedQuery"], shape(plan["winningPlan"]), order))
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-074")
+def test_expr_is_optimised_and_rewritten_for_the_planner(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 optimises `$expr` (a constant folds to `$alwaysFalse` or
+    drops out, constants print as `$const`) and derives index-usable twins
+    from it (`{a: {$_internalExprEq: 1}}`), which choose the plan and so the
+    order `find` returns. The Rust server explained `$expr` as written and
+    always scanned the collection."""
+    for got, want in zip(_expr_plans(rust_mongo), _expr_plans(mongod), strict=True):
+        assert got == want
 
 
 # --------------------------------------------------- 7.074 change streams --

@@ -265,6 +265,16 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     msg,
                 ));
             }
+            // So is a constant `$expr` sub-expression that fails (RM-176).
+            if let Some((code, msg)) =
+                secantus_core::expr_rewrite::constant_expr_error_in_filter(filter)
+            {
+                return Err(CommandError::new(
+                    code,
+                    crate::util::error_code_name(code),
+                    format!("Failed to optimize pipeline :: caused by :: {msg}"),
+                ));
+            }
         }
     }
 
@@ -599,7 +609,13 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     Some(sort) => read(Some(sort), lead.limit).or_else(|_| read(None, 0)),
                     None => read(None, 0),
                 }
-                .map_err(command_error)?;
+                .map_err(|e| {
+                    crate::util::read_error_on_namespace(
+                        e,
+                        "aggregate",
+                        &format!("{}.{c}", ctx.db_name),
+                    )
+                })?;
                 // The plan the pipeline's first read runs uses its indexes
                 // once (a `$lookup`'s reads count none: measured 8.2.11).
                 crate::explain::order::count_index_use(

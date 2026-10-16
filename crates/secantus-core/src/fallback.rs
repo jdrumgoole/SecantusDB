@@ -103,6 +103,17 @@ impl Fallback {
         matches!(self, Fallback::Mongo { exec: true, .. })
     }
 
+    /// Which pipeline wrapper the evaluator stamped: `Some(true)` for an
+    /// error mongod raises while optimizing (a constant sub-expression),
+    /// `Some(false)` for one it raises per document, `None` for an error the
+    /// expression evaluator did not raise.
+    pub fn folded_verdict(&self) -> Option<bool> {
+        match self {
+            Fallback::Mongo { folded, .. } => *folded,
+            Fallback::Defer => None,
+        }
+    }
+
     /// Stamp which pipeline wrapper this error belongs under.
     pub fn with_folded(mut self, is_folded: bool) -> Self {
         if let Fallback::Mongo { folded, .. } = &mut self {

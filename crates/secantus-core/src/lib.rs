@@ -45,6 +45,7 @@ pub mod update;
 mod decimal;
 mod densify;
 mod explain;
+pub mod expr_rewrite;
 mod fill;
 mod group;
 mod numeric;
@@ -65,7 +66,7 @@ pub use paths::{
 // mongod's two double renderings, needed by the command layer's stage
 // echo as well as by this crate's value messages. The module stays
 // private; only the two formatters are public.
-pub use explain::{build_stage_tree, canonical_match};
+pub use explain::{build_stage_tree, canonical_match, residual_key};
 pub use numeric::{format_double_g, format_double_spec};
 
 // Re-export the `$group` field-reference pushdown (only) so the command layer

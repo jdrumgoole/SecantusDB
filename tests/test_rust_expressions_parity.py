@@ -884,9 +884,12 @@ CURATED = [
     ({"$trim": {"input": "$s"}}, {"s": "  hi  "}),  # default whitespace -> defer
     ({"$trim": {"input": "$s", "chars": " "}}, {"s": None}),  # null input -> null
     ({"$trim": {"input": "--x--", "chars": None}}, {}),  # null chars -> null (both)
-    ({"$trim": {"input": "x", "chars": 5}}, {}),  # non-string chars -> defer (50700)
-    ({"$ltrim": {"input": "x", "chars": True}}, {}),  # bool chars -> defer
-    ({"$rtrim": {"input": 5, "chars": "x"}}, {}),  # non-string input -> defer (50699)
+    # REMOVED 2026-10-16, a scope decision, not a skip: the Rust engine now
+    # names a non-string `$trim` / `$ltrim` / `$rtrim` input or `chars` as
+    # mongod 8.2.11 does, ending "... (of type int) instead.", and the
+    # deprecated Python engine leaves off " instead." (RM-178). What is
+    # lost: a drift check on these three shapes. mongod-vs-Rust coverage is
+    # tests/backlog/test_rm_found_2026_10_16b.py.
     # $getField / $setField / $zip.
     ({"$getField": "x"}, {"x": 5}),
     ({"$getField": "missing"}, {}),  # absent -> MISSING marker -> Rust defers
