@@ -22206,11 +22206,10 @@ impl PgHandler {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()),
         );
-        // The planner's own notices (a stop-word-only text-search query).
-        // A statement is planned for Describe as well as Execute, so the
-        // same one is reported once.
-        let mut planner: Vec<String> = secantus_pgplan::fts::take_notices();
-        planner.dedup();
+        // The planner's own notices (a stop-word-only text-search query), one
+        // per evaluation as PostgreSQL raises them; a Describe's plan has
+        // already dropped its own (`on_describe`).
+        let planner: Vec<String> = secantus_pgplan::fts::take_notices();
         for msg in planner {
             notices.push(ErrorInfo::new("NOTICE".into(), "00000".into(), msg));
         }
@@ -40073,7 +40072,14 @@ impl ExtendedQueryHandler for PgHandler {
                 }
             }
         }
-        self._on_describe(client, message).await
+        // A Describe plans the statement without running it: what that plan
+        // raised (a text-search NOTICE) is not the statement's, which the
+        // Execute's plan raises again. Dropped here rather than deduplicated
+        // later, because two notices of one statement are two (RP-044).
+        let mark = secantus_pgplan::fts::notices_len();
+        let out = self._on_describe(client, message).await;
+        secantus_pgplan::fts::truncate_notices(mark);
+        out
     }
 
     async fn do_describe_portal<C>(
