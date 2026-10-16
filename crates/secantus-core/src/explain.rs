@@ -45,7 +45,13 @@ fn match_type_rank(op: &str) -> i32 {
         "$not" => 19,
         "$type" => 20,
         "$expr" => 21,
+        // mongod's enum order for the twins `$expr` derives (8.2.11): only
+        // `$_internalExprEq` beside `$_internalExprLt` was measured.
         "$_internalExprEq" => 22,
+        "$_internalExprGt" => 23,
+        "$_internalExprGte" => 24,
+        "$_internalExprLt" => 25,
+        "$_internalExprLte" => 26,
         // Anything unmeasured sorts AFTER everything measured, rather than
         // colliding at rank 0 with `$and`.
         _ => 99,
@@ -174,18 +180,40 @@ fn wrap(op: &str, value: Bson) -> Bson {
 }
 
 /// Sort key for one `$and` child: (match-type ordinal, path).
-fn rank(clause: &Document) -> (i32, String) {
+fn rank(clause: &Document) -> (i32, String, u8) {
     let Some((key, value)) = clause.iter().next() else {
-        return (match_type_rank(""), String::new());
+        return (match_type_rank(""), String::new(), 0);
     };
     if key.starts_with('$') {
-        return (match_type_rank(key), String::new());
+        // Two `$expr`s: one whose argument is not a document (`"$q"`) sorts
+        // before one whose argument is, whatever order they were written in
+        // (measured 8.2.11, 2026-10-16).
+        let doc_arg = u8::from(key == "$expr" && matches!(value, Bson::Document(_)));
+        return (match_type_rank(key), String::new(), doc_arg);
     }
     let op = match value {
         Bson::Document(d) => d.keys().next().cloned().unwrap_or_default(),
         _ => String::new(),
     };
-    (match_type_rank(&op), key.clone())
+    (match_type_rank(&op), key.clone(), 0)
+}
+
+/// The order mongod gives the clauses a FETCH stage rechecks: by path, the
+/// operators that have none (`$or`, `$expr`, ...) first, and then by match
+/// type -- not the canonical order, which puts the type first (measured
+/// 8.2.11, 2026-10-16: `{z: 1, a: {$gt: 1}, b: 2}` over an index on `z`
+/// rechecks `a` before `b`). A stable sort on this keeps ties in canonical
+/// order.
+pub fn residual_key(clause: &Document) -> (String, i32) {
+    let (rank, path, _) = rank(clause);
+    // A `$not` is a tree node of its own, with no path: `{c: {$not: ...}}`
+    // sorts with `$or` and `$expr`, ahead of every field (measured).
+    let negated = clause
+        .values()
+        .next()
+        .and_then(Bson::as_document)
+        .is_some_and(|p| p.contains_key("$not"));
+    (if negated { String::new() } else { path }, rank)
 }
 
 /// The clause list one `field: <value>` entry expands to.
@@ -350,6 +378,26 @@ fn clauses(filter: &Document) -> Vec<Document> {
                     ));
                 }
             }
+            // mongod optimises the expression and derives index-usable twins
+            // from it (`crate::expr_rewrite`).
+            "$expr" => match crate::expr_rewrite::expr_clauses(value) {
+                crate::expr_rewrite::ExprClauses::Constant(true) => {}
+                crate::expr_rewrite::ExprClauses::Constant(false) => {
+                    out.push(one("$alwaysFalse", Bson::Int32(1)))
+                }
+                crate::expr_rewrite::ExprClauses::Rewritten { expr, derived } => {
+                    out.push(one("$expr", expr));
+                    for twin in derived {
+                        match twin.iter().next() {
+                            // An `$in` twin is an ordinary `$in` clause.
+                            Some((path, Bson::Document(p))) if p.contains_key("$in") => {
+                                out.extend(field_clauses(path, &Bson::Document(p.clone())))
+                            }
+                            _ => out.push(twin),
+                        }
+                    }
+                }
+            },
             other if other.starts_with('$') => out.push(one(other, value.clone())),
             other => out.extend(field_clauses(other, value)),
         }

@@ -433,8 +433,57 @@ fn type_bounds(v: &Bson, ctx: Ctx) -> Option<(Vec<Interval>, Tight)> {
 
 /// The bounds one canonical predicate (`{$op: operand}`) puts on a field.
 /// `None` when the predicate cannot use an index at all.
+/// The bounds of a twin `$expr` derives (`$_internalExprEq` and its range
+/// siblings). `$expr` compares across types with no bracketing, so a range
+/// runs to MinKey or MaxKey; an index key of null also stands for a missing
+/// field, which `$expr` orders BELOW null, so the shapes that would take a
+/// missing field in or out are rechecked (measured 8.2.11, 2026-10-16). Not
+/// over a multikey field, where `$expr` does not look inside an array.
+fn internal_expr_bounds(op: &str, v: &Bson, ctx: Ctx) -> Option<(Vec<Interval>, Tight)> {
+    if ctx.multikey
+        || matches!(v, Bson::Array(_))
+        || (has_string(v) && (ctx.collated || !ctx.plain_strings))
+    {
+        return None;
+    }
+    let null = matches!(v, Bson::Null);
+    let tight = |inexact: bool| {
+        if inexact {
+            Tight::FetchFilter
+        } else {
+            Tight::Exact
+        }
+    };
+    let (list, inexact) = match op {
+        "$_internalExprEq" => (vec![Interval::point(v.clone())], null),
+        "$_internalExprLt" if matches!(v, Bson::MinKey) => (vec![], false),
+        "$_internalExprLt" => (
+            vec![Interval::new(Bson::MinKey, true, v.clone(), null)],
+            null,
+        ),
+        "$_internalExprLte" => (
+            vec![Interval::new(Bson::MinKey, true, v.clone(), true)],
+            false,
+        ),
+        "$_internalExprGt" if matches!(v, Bson::MaxKey) => (vec![], false),
+        "$_internalExprGt" => (
+            vec![Interval::new(v.clone(), false, Bson::MaxKey, true)],
+            false,
+        ),
+        "$_internalExprGte" => (
+            vec![Interval::new(v.clone(), true, Bson::MaxKey, true)],
+            null,
+        ),
+        _ => return None,
+    };
+    Some((list, tight(inexact)))
+}
+
 pub(crate) fn leaf_bounds(pred: &Document, ctx: Ctx) -> Option<(Vec<Interval>, Tight)> {
     let (op, v) = pred.iter().next()?;
+    if op.starts_with("$_internalExpr") {
+        return internal_expr_bounds(op, v, ctx);
+    }
     match op.as_str() {
         "$eq" => eq_bounds(v, ctx),
         "$gt" | "$gte" | "$lt" | "$lte" => {

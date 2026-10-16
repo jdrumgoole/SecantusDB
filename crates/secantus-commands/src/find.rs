@@ -719,9 +719,26 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // never runs, so an invalid filter would otherwise return an empty cursor
     // instead of the error. Re-run the matcher once against an empty document
     // (operator recognition is doc-independent) to surface the same `BadValue`.
+    //
+    // Except an error the expression evaluator raises per document, which
+    // the empty document provokes and no stored one did; a constant one is
+    // mongod's optimizer failure (measured 8.2.11, 2026-10-16).
     if docs.is_empty() && !filter.is_empty() {
-        secantus_core::query::matches(&Document::new(), &filter, &let_vars, collation.as_ref())
-            .map_err(|_| query_filter_error(&filter))?;
+        if let Err(fault) =
+            secantus_core::query::matches(&Document::new(), &filter, &let_vars, collation.as_ref())
+        {
+            match (fault.folded_verdict(), fault.as_mongo()) {
+                (Some(false), _) => {}
+                (Some(true), Some((code, errmsg))) => {
+                    return Err(CommandError::new(
+                        code,
+                        crate::util::error_code_name(code),
+                        format!("Failed to optimize expression :: caused by :: {errmsg}"),
+                    ))
+                }
+                _ => return Err(query_filter_error(&filter)),
+            }
+        }
     }
 
     // Cursor `min` / `max` index bounds (inclusive lower / exclusive upper),

@@ -6590,8 +6590,11 @@ fn math_operand_named(v: &Bson, message: &str, code: i32) -> Result<f64, Fallbac
 
 fn op_abs(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
-        Bson::Null => Ok(Bson::Null),
+        Bson::Null | Bson::Undefined => Ok(Bson::Null),
         Bson::Int32(n) => Ok(int_result((n as i128).abs(), false)),
+        // mongod refuses rather than widening to a double (probed 8.2.11,
+        // 2026-10-16); this answered 9.223372036854776e18.
+        Bson::Int64(i64::MIN) => Err(Fallback::mongo(28680, "can't take $abs of long long min")),
         Bson::Int64(n) => Ok(int_result((n as i128).abs(), true)),
         Bson::Double(d) => Ok(Bson::Double(d.abs())),
         // A decimal's absolute value is its own rendering with the sign
@@ -6604,8 +6607,16 @@ fn op_abs(arg: &Bson, ctx: &Ctx) -> R {
             Some(out) => Ok(out),
             None => Err(Fallback::Defer),
         },
-        // bool / non-numeric: Python raises 28765 -> defer.
-        _ => Err(Fallback::Defer),
+        // Named here, not deferred: a defer reached `find`'s `$expr` as "not
+        // supported" (probed 8.2.11: 28765 for bool, string, array, object
+        // and date alike).
+        other => Err(Fallback::mongo(
+            28765,
+            format!(
+                "$abs only supports numeric types, not {}",
+                crate::query::bson_type_name(&other)
+            ),
+        )),
     }
 }
 

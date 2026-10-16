@@ -1746,6 +1746,16 @@ pub fn expression_problem_in_filter(filter: &Document, bound: &[String]) -> Opti
                 if let Some(found) = expression_problem(value, bound) {
                     return Some(found);
                 }
+                // A constant sub-expression that fails, failing while mongod
+                // optimizes the query -- before it reads a document, so on
+                // an empty collection too (RM-176).
+                let mut alone = Document::new();
+                alone.insert("$expr", value.clone());
+                if let Some(found) =
+                    secantus_core::expr_rewrite::constant_expr_error_in_filter(&alone)
+                {
+                    return Some(found);
+                }
             }
             "$and" | "$or" | "$nor" => {
                 if let Bson::Array(subs) = value {

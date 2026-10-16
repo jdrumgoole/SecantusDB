@@ -9,7 +9,7 @@
 use bson::{doc, Bson, Document};
 
 use crate::argtypes;
-use crate::util::{coll_arg, command_error, doc_field};
+use crate::util::{coll_arg, doc_field};
 use crate::{CommandContext, CommandError, HandlerResult};
 
 /// `distinct` — return the distinct values of `key` over docs matching `query`.
@@ -192,7 +192,9 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             limit: 0,
             asked: Default::default(),
         };
-        let bytes = crate::explain::order::find(storage, &ask).map_err(command_error)?;
+        let bytes = crate::explain::order::find(storage, &ask).map_err(|e| {
+            crate::util::read_error_on_namespace(e, "distinct", &format!("{}.{coll}", ctx.db_name))
+        })?;
         crate::explain::order::count_index_use(
             storage,
             &ask,
