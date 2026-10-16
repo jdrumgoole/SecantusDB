@@ -9631,8 +9631,10 @@ impl Storage {
                     }
                     // A profile entry is stored as written, with no `_id`:
                     // mongod's `system.profile` has no `_id` index. The id
-                    // minted above only keys the row.
-                    let unkeyed = assigned_id && coll == PROFILE_COLLECTION;
+                    // minted above only keys the row. So is a time-series
+                    // measurement inserted with none: mongod stores it
+                    // without one (RM-089, measured 8.2.11).
+                    let unkeyed = assigned_id && (coll == PROFILE_COLLECTION || timeseries);
                     let id = doc.get("_id").expect("_id present").clone();
                     let mut key = id_key(&id)?;
                     // Timeseries: suffix the doc-table key so duplicate `_id`s coexist.

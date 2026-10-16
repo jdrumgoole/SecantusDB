@@ -27,6 +27,8 @@ two.
   is reported as mongod reports it, from the collated `_id`: the same
   message, `keyValue`, `hexEncoded` and `collation` as a second spelling.
   It was reported from the plain `_id` index.
+- **A time-series measurement inserted with no `_id` is stored without
+  one**, as on mongod. It was given an ObjectId.
 - **A `createIndexes` refused for a spec with no `name` creates
   nothing.** The collection it would have created was left behind.
 
@@ -36,6 +38,8 @@ RM-149 (tests/backlog/test_rm_geo_residuals.py::test_2dsphere_cell_levels_accept
 (::test_refused_spec_leaves_no_created_collection), RM-127 in part
 (tests/backlog/test_rm_113_138.py::test_dbpointer_min_update_operand), RM-142
 (tests/backlog/test_rm_found_2026_10_14.py::test_exact_duplicate_id_under_a_default_collation_names_the_collation)
+RM-089 in part
+(tests/backlog/test_rm_085_112.py::test_measurement_without_id_is_stored_without_one)
 and RM-029
 (tests/backlog/test_rm_029_056.py::test_roles_info_lists_roles_in_creation_order,
 ::test_a_recreated_role_goes_last_and_an_update_keeps_its_place).

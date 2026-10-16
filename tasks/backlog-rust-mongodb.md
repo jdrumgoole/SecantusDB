@@ -1321,17 +1321,23 @@ is left follows from that:
       writes, the `collStats` counters and the whole-collection read above.
       Backlog-ID: RM-088
       Verify: tests/backlog/test_rm_085_112.py::test_bucket_collection_can_be_deleted_from
-- [ ] **RUST MongoDB server: smaller time-series differences.** A
-      measurement inserted with no `_id` is given one (mongod stores none;
-      storing one without would change the documents the Python server
-      reads, so it waits on that decision); a `hashed` index is refused as
-      on any collection (mongod builds it); a hint of `{_id: 1}` is refused
-      with this server's wording for an
-      unknown hint. `listCollections` puts each bucket namespace after its
-      collection and `system.views` last; mongod's order is not stable
-      between two runs of the same commands.
+- [ ] **RUST MongoDB server: a hint naming no index on a time-series
+      collection** is refused with this server's wording; mongod 8.2.11
+      refuses it from its planner, quoting the bucket namespace and its
+      rendering of the query tree (`error processing query:
+      ns=<db>.system.buckets.<coll>Tree: $and\nSort: {}\nProj: {}\nCollation:
+      { locale: "simple" }\n planner returned error :: caused by :: hint
+      provided does not correspond to an existing index`), which changes
+      with the filter. (A measurement inserted with no `_id` is now stored
+      without one, as on mongod.)
       Backlog-ID: RM-089
-      Verify: tests/backlog/test_rm_085_112.py::test_measurement_without_id_is_stored_without_one
+      Verify: tests/backlog/test_rm_085_112.py::test_an_unknown_hint_on_a_time_series_collection
+- **Scope decision — a `hashed` index on a time-series collection** is
+  refused as on any collection: hashed indexes are out of scope.
+- **Scope decision — `listCollections` order around time-series buckets.**
+  This server puts each bucket namespace after its collection and
+  `system.views` last; mongod's order is not stable between two runs of the
+  same commands, so there is none to match.
 
 ### 7.070 Collation -- 2026-10-10
 
