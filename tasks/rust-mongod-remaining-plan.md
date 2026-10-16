@@ -282,8 +282,11 @@ Size: one or two batches.
       driver panels; the `-rust-server` reports are stale (7.05). Done
       2026-10-15 on main f301d636 (validate.yml run 38816458149): no gauge
       lost a test; mongo-rust-driver 105/105, Go the same six leaves (RM-008).
-- [ ] Re-measure throughput against mongod on the droplets: the 0.27x write
-      figure (§3) is from 0.5.3-beta.160. Against the beta.196 release.
+- [x] Re-measure throughput against mongod on the droplets (the published
+      figure was 0.72x-0.76x of mongod 8.0.32, beta.173; "0.27x" here was
+      older still). Done 2026-10-16: beta.196 0.65x of mongod 8.0.34, and a
+      beta.195 control against the same mongod 0.60x, so the release cost
+      nothing and the reference got faster (`docs/benchmark.md`).
 - [x] Backlog entries that read as stale, to verify and close: 7.065's
       "`convertToCapped` is not implemented" (7.071 says it landed
       2026-10-11), the Go SDAM heartbeat item, the `featureCompatibilityVersion:
