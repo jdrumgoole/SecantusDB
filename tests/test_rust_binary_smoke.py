@@ -207,7 +207,7 @@ def test_slow_operations_are_logged_and_the_threshold_is_server_wide(
             assert stream.try_next() is None
         # Only the getMore lines: on a loaded machine the insert above can
         # honestly take 100 ms and be logged.
-        waited = [line for line in slow_lines() if '"command":"getMore"' in line]
+        waited = [line for line in slow_lines() if '"command":{"getMore":' in line]
         assert waited == [], "an idle awaitData getMore was logged as slow"
 
         was = client.smoke.command("profile", 0, slowms=0)
@@ -220,9 +220,10 @@ def test_slow_operations_are_logged_and_the_threshold_is_server_wide(
         client.smoke.command("profile", 0, slowms=100)
         lines = slow_lines()
         assert any(
-            '"ns":"smoke.things","command":"insert"' in x and '"ninserted":5' in x for x in lines
+            '"ns":"smoke.things","command":{"insert":"things"' in x and '"ninserted":5' in x
+            for x in lines
         ), lines
-        assert any('"command":"find"' in x and '"errCode":2' in x for x in lines), lines
+        assert any('"command":{"find":"things"' in x and '"errCode":2' in x for x in lines), lines
 
         # Above the threshold nothing is logged, however slow the machine.
         client.smoke.command("profile", 0, slowms=3_600_000)
@@ -237,7 +238,9 @@ def test_slow_operations_are_logged_and_the_threshold_is_server_wide(
     assert daemon.wait(timeout=15) == 0
     assert daemon.stderr is not None
     stderr = daemon.stderr.read()
-    assert 'Slow query {"type":"command","ns":"smoke.things","command":"insert"' in stderr, stderr
+    assert (
+        'Slow query {"type":"command","ns":"smoke.things","command":{"insert":"things"' in stderr
+    ), stderr
 
 
 def test_standalone_flag_drops_replica_set(tmp_path: pathlib.Path) -> None:
