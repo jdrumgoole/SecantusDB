@@ -29,10 +29,10 @@ def _sliding_std_dev(client: Any) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-181")
+@pytest.mark.backlog_fixed("RM-181")
 def test_std_dev_over_a_sliding_window(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 computes `$stdDevSamp` over a window that drops
     documents (`documents: [-2, 0]`) incrementally, and its last digit
-    differs from a fresh computation over each window, which is what this
-    server does. A window that only grows matches."""
+    differs from a fresh computation over each window. A window that only
+    grows matches either way."""
     assert _sliding_std_dev(rust_mongo) == _sliding_std_dev(mongod)

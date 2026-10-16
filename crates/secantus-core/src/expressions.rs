@@ -2503,7 +2503,7 @@ fn op_expr_std_dev(arg: &Bson, ctx: &Ctx, pop: bool) -> R {
 fn op_expr_sum(arg: &Bson, ctx: &Ctx) -> R {
     // Reuses the group-accumulator `Num` width logic (int32 < int64 < double <
     // decimal); non-numeric elements are ignored.
-    let mut running = crate::group::Num::Int { v: 0, wide: false };
+    let mut running = crate::group::Num::zero();
     for v in expr_acc_values(arg, ctx)? {
         match v {
             Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
@@ -2516,7 +2516,7 @@ fn op_expr_sum(arg: &Bson, ctx: &Ctx) -> R {
 }
 
 fn op_expr_avg(arg: &Bson, ctx: &Ctx) -> R {
-    let mut total = crate::group::Num::Int { v: 0, wide: false };
+    let mut total = crate::group::Num::zero();
     let mut count: i64 = 0;
     for v in expr_acc_values(arg, ctx)? {
         match v {
@@ -2530,30 +2530,9 @@ fn op_expr_avg(arg: &Bson, ctx: &Ctx) -> R {
     if count == 0 {
         return Ok(Bson::Null);
     }
-    let tf = match total {
-        // mongod converts the integer TOTAL to a double and THEN divides -- it
-        // does not do an exact integer division, so `v as f64` is not a
-        // precision compromise, it is the behaviour.
-        //
-        // This used to defer above 2^53 with the comment "defer to Python
-        // int/int divide". That deferred to a WRONG answer: Python's `int /
-        // int` is correctly rounded over the exact quotient, which differs from
-        // mongod once the total passes 2^53 --
-        // `$avg: [2**53+1, 2**53+3, 2**53+5]` is `9007199254740994.0` on
-        // mongod and `…996.0` exactly. Both engines are fixed; measured
-        // 8.2.11, 2026-09-07.
-        crate::group::Num::Int { v, .. } => v as f64,
-        crate::group::Num::Float(f) => f,
-        // Stay in the decimal domain — an f64 divide would narrow the type and
-        // drop digits.
-        crate::group::Num::Dec(d) => {
-            return crate::decimal::to_bson(
-                &crate::decimal::div_int(&d, count).ok_or(Fallback::Defer)?,
-            )
-            .ok_or(Fallback::Defer);
-        }
-    };
-    Ok(Bson::Double(tf / count as f64))
+    // `AccumulatorAvg::getValue`: the double total over the count, or the
+    // decimal one when a decimal was seen.
+    total.average(count)
 }
 
 fn op_expr_extreme(arg: &Bson, ctx: &Ctx, want_max: bool) -> R {
