@@ -113,6 +113,7 @@ mod geom_closest;
 pub mod geometry;
 pub mod hashpart;
 pub mod hstore;
+mod icu_data;
 pub mod inherit;
 pub mod instead_of;
 mod join_order;

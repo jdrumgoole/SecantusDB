@@ -1819,7 +1819,11 @@ dependencies = [
  "getrandom 0.2.17",
  "hmac 0.12.1",
  "icu_collator",
+ "icu_collections",
  "icu_locale",
+ "icu_locale_fallback",
+ "icu_normalizer",
+ "icu_provider",
  "md-5 0.10.6",
  "num-bigint",
  "num-traits",
@@ -1835,6 +1839,7 @@ dependencies = [
  "sxd-document",
  "sxd-xpath",
  "unicode-normalization",
+ "zerovec",
 ]
 
 [[package]]

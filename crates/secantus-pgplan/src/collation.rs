@@ -39,7 +39,7 @@ pub struct UserCollation {
 thread_local! {
     static USER_COLLATIONS: std::cell::RefCell<Vec<UserCollation>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    static COLLATORS: std::cell::RefCell<std::collections::HashMap<String, CollatorBorrowed<'static>>> =
+    static COLLATORS: std::cell::RefCell<std::collections::HashMap<String, Built>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
@@ -225,7 +225,23 @@ const SCRIPT_ORDERS_AS_LANGUAGE: [(&str, &str); 5] = [
     ("uz", "Cyrl"),
 ];
 
-fn build(locale: &str) -> Option<CollatorBorrowed<'static>> {
+/// A collator over ICU4X's compiled data, or over the generated data of a
+/// locale that data does not tailor (`icu_data`).
+enum Built {
+    Compiled(CollatorBorrowed<'static>),
+    Generated(Box<Collator>),
+}
+
+impl Built {
+    fn write_sort_key_to(&self, text: &str, key: &mut Vec<u8>) {
+        let _ = match self {
+            Built::Compiled(c) => c.write_sort_key_to(text, key),
+            Built::Generated(c) => c.as_borrowed().write_sort_key_to(text, key),
+        };
+    }
+}
+
+fn build(locale: &str) -> Option<Built> {
     let mut parsed: icu_locale::Locale = locale.parse().ok()?;
     if let Some(script) = parsed.id.script {
         let language = parsed.id.language;
@@ -256,7 +272,10 @@ fn build(locale: &str) -> Option<CollatorBorrowed<'static>> {
     if keyword(locale, "ka").is_some_and(|v| v.eq_ignore_ascii_case("shifted")) {
         options.alternate_handling = Some(AlternateHandling::Shifted);
     }
-    Collator::try_new(prefs, options).ok()
+    if crate::icu_data::covers(parsed.id.language.as_str()) {
+        return crate::icu_data::collator(prefs, options).map(|c| Built::Generated(Box::new(c)));
+    }
+    Collator::try_new(prefs, options).ok().map(Built::Compiled)
 }
 
 /// The sort key of `text` under ICU `locale`, as bytes.
@@ -270,7 +289,7 @@ fn icu_key(locale: &str, text: &str) -> Result<Vec<u8>> {
             cache.insert(locale.to_string(), collator);
         }
         let mut key = Vec::new();
-        let _ = cache[locale].write_sort_key_to(text, &mut key);
+        cache[locale].write_sort_key_to(text, &mut key);
         Ok(key)
     })
 }
@@ -577,6 +596,17 @@ mod tests {
             .collect();
         keyed.sort();
         keyed.iter().map(|(_, w)| *w).collect::<Vec<_>>().join(",")
+    }
+
+    /// PostgreSQL 15.19 (`ORDER BY w COLLATE "haw-x-icu"` and
+    /// `"ln-CD-x-icu"`): tailorings ICU4X's compiled data lacks, from the
+    /// generated data (`icu_data`).
+    #[test]
+    fn generated_tailorings_order_as_postgres() {
+        assert_eq!(ordered("haw", &["a", "e", "b", "o"]), "a,e,o,b");
+        assert_eq!(ordered("haw-US", &["a", "e", "b", "o"]), "a,e,o,b");
+        assert_eq!(ordered("ln-CD", &["ə", "ɛ", "f"]), "ɛ,ə,f");
+        assert_eq!(ordered("und", &["ə", "ɛ", "f"]), "ə,ɛ,f");
     }
 
     /// PostgreSQL 15.19 orders these script variants as their language
