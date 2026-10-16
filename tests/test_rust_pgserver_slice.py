@@ -20934,7 +20934,6 @@ def test_a_pg_hba_conf_the_server_cannot_apply_stops_it_starting(
             ("--hba-file", hba("# fine\nhost all all 127.0.0.1/32 peer\n")),
             "line 2: authentication method",
         ),
-        (("--hba-file", hba("host all all db.example.com trust\n")), "host name"),
         (
             ("--hba-file", hba("host all all 127.0.0.1/32\n")),
             "end-of-line before authentication method",
@@ -21044,3 +21043,33 @@ def test_transaction_ids_run_on_across_a_restart_as_on_postgresql(home: Path) ->
         cur.execute("select age(datfrozenxid) from pg_database where datname = current_database()")
         (age,) = cur.fetchone()
         assert age == after + 1 - 722
+
+
+def test_an_untyped_values_parameter_is_text(home: Path) -> None:
+    """PostgreSQL 15.19: a VALUES column of untyped parameters is `text`.
+
+    psycopg sends a `str` with oid 0. The server used to sniff `'1'` into an
+    integer, so beside `'a'` and `'b'` the column held mixed types:
+    `string_agg` dropped the number, `array_agg` made it NULL and `ORDER BY`
+    left the rows unsorted. An INSERT's own VALUES still takes the target
+    column's type.
+    """
+    words = ("a", "1", "b")
+    values = "(values (%s), (%s), (%s)) v(w)"
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(f"select string_agg(w, ' ' order by w) from {values}", words)
+        assert cur.fetchone()[0] == "1 a b"
+        cur.execute(f"select string_agg(w, ' ') from {values}", words)
+        assert cur.fetchone()[0] == "a 1 b"
+        cur.execute(f"select array_agg(w order by w) from {values}", words)
+        assert cur.fetchone()[0] == ["1", "a", "b"]
+        cur.execute(f"select w from {values} order by w", words)
+        assert [r[0] for r in cur.fetchall()] == ["1", "a", "b"]
+        cur.execute(f"select string_agg(w, ' ' order by w) from {values}", ("a", "1.5", "b"))
+        assert cur.fetchone()[0] == "1.5 a b"
+
+        cur.execute("create table vt (i int, n numeric, t text)")
+        cur.execute("insert into vt values (%s, %s, %s)", ("1", "1.5", "1"))
+        cur.execute("select i, n, t, pg_typeof(i)::text from vt")
+        assert cur.fetchone() == (1, Decimal("1.5"), "1", "integer")

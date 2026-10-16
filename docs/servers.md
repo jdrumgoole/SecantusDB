@@ -119,8 +119,7 @@ the `secantusd-pg-v*` tags on
 secantusd-pg ./secantus-pg-data 127.0.0.1:5432
 ```
 
-To offer TLS, give it a PEM certificate chain and its private key (no
-passphrase):
+To offer TLS, give it a PEM certificate chain and its private key:
 
 ```bash
 secantusd-pg ./secantus-pg-data 127.0.0.1:5432 \
@@ -131,6 +130,13 @@ A client that asks for TLS then gets it (`sslmode=require`, `verify-ca`,
 `verify-full`); one that does not ask is still served in the clear. Without
 the pair the server answers a TLS request with "not supported", as PostgreSQL
 does with `ssl = off`. These two options are in 0.1.0-beta.9 and later.
+
+An encrypted key -- PKCS#8 (`-----BEGIN ENCRYPTED PRIVATE KEY-----`), or
+OpenSSL's legacy form (`Proc-Type: 4,ENCRYPTED`, AES or DES-EDE3 in CBC
+mode) -- needs `--tls-key-passphrase-command CMD`, PostgreSQL's
+`ssl_passphrase_command`: the first line the shell command prints is the
+passphrase, `%p` in it is the prompt and `%%` a `%`. It runs again on each
+reload.
 
 A password login over TLS is offered SCRAM channel binding
 (`SCRAM-SHA-256-PLUS`), so a client with `channel_binding=require` connects.
@@ -172,8 +178,10 @@ With a revocation list, every certificate in a client's chain needs a list
 from its issuer that is in date, as OpenSSL requires of PostgreSQL: a
 certificate whose CA has no list in the file, or only an expired one, is
 refused. A list with no extensions, which `openssl ca -gencrl` writes by
-default, is read. A list with a critical extension (one scoped by a
-distribution point, a delta list) stops the server from starting.
+default, is read. A list scoped by an issuing distribution point applies
+only to the certificates it covers, and a delta list is read as a full one,
+as OpenSSL applies them for PostgreSQL. A list with any other critical
+extension stops the server from starting.
 
 The subject under `--tls-client-name DN` is written as RFC 2253 has it, the
 last attribute first: `CN=alice,O=Example`. That is seldom a user name, so
@@ -244,7 +252,11 @@ read leaves the old one in force.
 A line this server cannot apply stops it from starting, with the line's
 number, so that no rule is silently skipped: a method that needs a service
 outside the server (`peer`, `ident`, `gss`, `sspi`, `ldap`, `radius`, `pam`,
-`bsd`), a host name for the address, `samenet`, and `@file` inclusion.
+`bsd`). A host name for the address is matched by a reverse lookup of the
+client's address confirmed forward, as PostgreSQL's is. `@file` inclusion reads a file of
+names beside the `pg_hba.conf`, as PostgreSQL 15 does. `samehost`
+and `samenet` match by this host's interface addresses and their networks,
+as PostgreSQL's do.
 `--hba-file` cannot be given with `--tls-require`, `--tls-client-cert`,
 `--tls-client-name`, `--tls-user-map` or `--refuse-unknown-users`: the file
 says what those say.

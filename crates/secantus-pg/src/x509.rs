@@ -64,6 +64,27 @@ pub(crate) fn expect(input: &[u8], tag: u8) -> Option<(Tlv<'_>, &[u8])> {
     (tlv.tag == tag).then_some((tlv, rest))
 }
 
+/// The value (the OCTET STRING's contents) of the extension `oid` (its
+/// encoded contents) in an Extensions SEQUENCE's contents, and whether it is
+/// marked critical.
+pub(crate) fn extension<'a>(mut extensions: &'a [u8], oid: &[u8]) -> Option<(bool, &'a [u8])> {
+    while let Some((extension, rest)) = expect(extensions, SEQUENCE) {
+        extensions = rest;
+        let Some((id, after)) = expect(extension.body, OID) else {
+            continue;
+        };
+        if id.body != oid {
+            continue;
+        }
+        let (critical, after) = match expect(after, 0x01) {
+            Some((flag, rest)) => (flag.body != [0], rest),
+            None => (false, after),
+        };
+        return expect(after, 0x04).map(|(value, _)| (critical, value.body));
+    }
+    None
+}
+
 /// An OBJECT IDENTIFIER's contents as dotted decimal.
 pub(crate) fn oid_text(body: &[u8]) -> Option<String> {
     let mut arcs: Vec<u64> = Vec::new();
@@ -102,6 +123,8 @@ pub(crate) struct Certificate<'a> {
     /// The SubjectPublicKeyInfo's contents: an AlgorithmIdentifier and the
     /// key in a BIT STRING.
     pub public_key_info: &'a [u8],
+    /// The Extensions SEQUENCE's contents, empty when there is none.
+    pub extensions: &'a [u8],
     signature_algorithm: String,
     /// What follows the OID in the signature's AlgorithmIdentifier.
     signature_parameters: &'a [u8],
@@ -122,12 +145,22 @@ pub(crate) fn certificate(der: &[u8]) -> Option<Certificate<'_>> {
     let (issuer, fields) = expect(fields, SEQUENCE)?;
     let (_, fields) = expect(fields, SEQUENCE)?; // validity
     let (subject, fields) = expect(fields, SEQUENCE)?;
-    let (public_key_info, _) = expect(fields, SEQUENCE)?;
+    let (public_key_info, mut fields) = expect(fields, SEQUENCE)?;
+    // `[1] issuerUniqueID`, `[2] subjectUniqueID`, then `[3] EXPLICIT
+    // Extensions`.
+    let mut extensions: &[u8] = &[];
+    while let Some((field, rest)) = read(fields) {
+        if field.tag == 0xa3 {
+            extensions = expect(field.body, SEQUENCE).map_or(&[], |(e, _)| e.body);
+        }
+        fields = rest;
+    }
     Some(Certificate {
         serial: serial.body,
         issuer: issuer.body,
         subject: subject.body,
         public_key_info: public_key_info.body,
+        extensions,
         signature_algorithm: oid_text(algorithm_oid.body)?,
         signature_parameters,
     })

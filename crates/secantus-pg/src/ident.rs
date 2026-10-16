@@ -80,7 +80,7 @@ pub(crate) fn read(path: &Path, map: &str) -> io::Result<UserMap> {
             format!("user name map file {}: {e}", path.display()),
         )
     })?;
-    parse(&text, map).map_err(|(line, message)| {
+    parse_in(&text, map, path.parent()).map_err(|(line, message)| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -91,10 +91,17 @@ pub(crate) fn read(path: &Path, map: &str) -> io::Result<UserMap> {
     })
 }
 
+#[cfg(test)]
 fn parse(text: &str, map: &str) -> Result<UserMap, (usize, String)> {
+    parse_in(text, map, None)
+}
+
+/// The map `map` of a `pg_ident.conf`'s text, an `@file` read relative to
+/// `dir` (the file's own directory).
+fn parse_in(text: &str, map: &str, dir: Option<&Path>) -> Result<UserMap, (usize, String)> {
     let mut entries = Vec::new();
     for (number, line) in logical_lines(text) {
-        let fields = fields(&line).map_err(|message| (number, message))?;
+        let fields = fields(&line, dir, 0).map_err(|message| (number, message))?;
         if fields.is_empty() {
             continue;
         }
@@ -109,12 +116,16 @@ fn parse(text: &str, map: &str) -> Result<UserMap, (usize, String)> {
             ));
         };
         let system = match system.strip_prefix('/') {
-            Some(pattern) => SystemName::Pattern(Regex::new(pattern).map_err(|e| {
-                (
-                    number,
-                    format!("invalid regular expression \"{pattern}\": {e}"),
-                )
-            })?),
+            // Read as the SQL `~` operator reads a pattern, POSIX classes
+            // and all, so a map and a query agree on what one matches.
+            Some(pattern) => SystemName::Pattern(
+                Regex::new(&secantus_pgplan::scalar::pg_regex_source(pattern)).map_err(|e| {
+                    (
+                        number,
+                        format!("invalid regular expression \"{pattern}\": {e}"),
+                    )
+                })?,
+            ),
             None => SystemName::Exact(system.clone()),
         };
         if let SystemName::Pattern(pattern) = &system {
@@ -165,7 +176,7 @@ fn logical_lines(text: &str) -> Vec<(usize, String)> {
 /// a `#` outside quotes starts a comment, and double quotes keep blanks,
 /// commas and `#` in a token (`""` inside them is one quote). An unquoted
 /// comma makes a list, which no field of this file may be.
-fn fields(line: &str) -> Result<Vec<String>, String> {
+fn fields(line: &str, dir: Option<&Path>, depth: usize) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut chars = line.chars().peekable();
     loop {
@@ -204,11 +215,42 @@ fn fields(line: &str) -> Result<Vec<String>, String> {
         if quoted {
             return Err("unterminated quoted string".into());
         }
-        if !was_quoted && token.starts_with('@') {
-            return Err(format!("file inclusion ({token}) is not supported"));
+        // `@file` (unquoted): the field is the one value that file holds
+        // (`parse_ident_line` refuses more than one).
+        if !was_quoted && token.len() > 1 && token.starts_with('@') {
+            let mut values = included(&token[1..], dir, depth)?;
+            if values.len() != 1 {
+                return Err("multiple values in ident field".into());
+            }
+            out.push(values.remove(0));
+            continue;
         }
         out.push(token);
     }
+}
+
+/// Every value in an `@file`, comments dropped.
+fn included(name: &str, dir: Option<&Path>, depth: usize) -> Result<Vec<String>, String> {
+    if depth >= 10 {
+        return Err(format!(
+            "could not open file \"{name}\": too many levels of inclusion"
+        ));
+    }
+    let path = match dir {
+        Some(dir) if Path::new(name).is_relative() => dir.join(name),
+        _ => Path::new(name).to_path_buf(),
+    };
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "could not open secondary authentication file \"@{name}\" as \"{}\": {e}",
+            path.display()
+        )
+    })?;
+    let mut out = Vec::new();
+    for (_, line) in logical_lines(&text) {
+        out.extend(fields(&line, path.parent(), depth + 1)?);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -227,6 +269,7 @@ exact   \"CN=alice,OU=Eng,O=Ex\\, ample,C=IE\"  alice
 fixed   /^svc-            service
 long    a_very_long_name \\
         mapped
+letters \"/^([[:alpha:]]+)$\"   \\1
 ";
 
     fn map(name: &str) -> UserMap {
@@ -261,11 +304,31 @@ long    a_very_long_name \\
     }
 
     #[test]
+    fn an_at_file_is_the_one_value_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("who"), "laptop  # a comment\n").unwrap();
+        std::fs::write(dir.path().join("two"), "a\nb\n").unwrap();
+        let map = parse_in("m @who alice\n", "m", Some(dir.path())).expect("parses");
+        assert!(map.allows("laptop", "alice"));
+        let err = parse_in("m @two alice\n", "m", Some(dir.path())).expect_err("two values");
+        assert!(err.1.contains("multiple values in ident field"), "{err:?}");
+    }
+
+    #[test]
+    fn a_pattern_reads_posix_classes_as_sql_does() {
+        // `[[:alpha:]]` counts `é` as a letter, as PostgreSQL's does under a
+        // UTF-8 locale and as the SQL `~` operator here does.
+        let letters = map("letters");
+        assert!(letters.allows("émile", "émile"));
+        assert!(!letters.allows("emile2", "emile2"));
+    }
+
+    #[test]
     fn quotes_keep_commas_and_a_backslash_joins_lines() {
         assert!(map("exact").allows("CN=alice,OU=Eng,O=Ex\\, ample,C=IE", "alice"));
         assert!(map("long").allows("a_very_long_name", "mapped"));
         assert_eq!(
-            fields("a \"b \"\"c\"\" d\" e").unwrap(),
+            fields("a \"b \"\"c\"\" d\" e", None, 0).unwrap(),
             ["a", "b \"c\" d", "e"]
         );
     }
@@ -285,7 +348,11 @@ long    a_very_long_name \\
             ("m \"/(\" a\n", 1, "invalid regular expression"),
             ("m /^a$ \\1\n", 1, "no subexpressions"),
             ("m \"a b\n", 1, "unterminated"),
-            ("m @names a\n", 1, "not supported"),
+            (
+                "m @absent-names-file a\n",
+                1,
+                "could not open secondary authentication file",
+            ),
         ] {
             let (at, message) = parse(text, "m").expect_err(text);
             assert_eq!(at, line, "{text}");

@@ -48,11 +48,12 @@ pub fn set_user_domains(mut domains: Vec<Domain>) {
 /// A domain by (case-folded unless quoted) name.
 pub fn user_domain(name: &str) -> Option<Domain> {
     let trimmed = name.trim();
+    // As `user_enum`: a parsed name is compared as it is.
     let target = match trimmed.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
         // `"int"` is the whole key (`pgtypes::user_type_key`).
         Some(_) if crate::pgtypes::is_quoted_grammar_name(trimmed) => trimmed.to_string(),
         Some(inner) => inner.to_string(),
-        None => trimmed.to_ascii_lowercase(),
+        None => trimmed.to_string(),
     };
     let target = match target.strip_prefix("public.") {
         Some(bare) if !crate::pgtypes::shadowed_by_catalog(bare) => bare.to_string(),

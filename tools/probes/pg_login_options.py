@@ -5,7 +5,7 @@ Five configurations, each a ``pg_hba.conf`` on one side and the options that
 stand for it on the other: any connection allowed, TLS only
 (``--tls-require``), and the three ``--tls-client-cert`` modes. Arguments
 after the binary are passed to every ``secantusd-pg`` it starts; with
-``--refuse-unknown-users`` all 219 scenarios are the same, and without it the
+``--refuse-unknown-users`` all 234 scenarios are the same, and without it the
 48 that differ are a user there is no role for being let in.
 
 Every scenario is one login, made against a throwaway PostgreSQL cluster this
@@ -246,6 +246,9 @@ def setup(port):
         c.execute("create role bob login password 'pw'")
         c.execute("drop role if exists carol")
         c.execute("create role carol login")
+        # A password past its VALID UNTIL: refused, after the exchange.
+        c.execute("drop role if exists expired")
+        c.execute("create role expired login password 'pw' valid until '2000-01-01'")
 
 
 def scenarios(port, config):
@@ -289,6 +292,9 @@ def scenarios(port, config):
         port, "SCRAM-SHA-256", "y,,", user="nobody", cert=NOBODY
     )
     out["scram offered: nobody"] = raw_scram(port, None, "", user="nobody", cert=NOBODY)
+    out["plain expired pw"] = attempt(port, "expired", sslmode="disable", **pw)
+    out["first: plain expired"] = raw_first(port, "expired", tls=False)
+    out["scram: expired pw"] = raw_scram(port, "SCRAM-SHA-256", "n,,", user="expired", cert=NOBODY)
     out["tls postgres, cert postgres"] = attempt(port, **tls, **PGCERT)
     out["tls alice pw, stranger cert"] = attempt(port, "alice", **tls, **pw, **STRANGER)
     out["first: plain postgres"] = raw_first(port, "postgres", tls=False)

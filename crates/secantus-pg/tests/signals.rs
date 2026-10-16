@@ -69,3 +69,45 @@ fn stops_on_sigterm_when_the_parent_left_it_ignored() {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
     });
 }
+
+/// SIGHUP is a reload, never a stop, as for a postmaster -- even on a
+/// server with no TLS or `pg_hba.conf` to re-read. It used to stop one.
+#[test]
+fn sighup_does_not_stop_a_server_with_nothing_to_reload() {
+    let home = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_secantusd-pg"))
+        .arg(home.path())
+        .arg("127.0.0.1:0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert!(line.contains("listening on"), "did not start: {line:?}");
+    let address = line
+        .split_whitespace()
+        .find(|w| w.starts_with("127.0.0.1:"))
+        .expect("an address")
+        .to_string();
+    // SAFETY: signalling our own child by pid.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGHUP) };
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "secantusd-pg stopped on SIGHUP"
+    );
+    assert!(
+        std::net::TcpStream::connect(&address).is_ok(),
+        "secantusd-pg no longer listens after SIGHUP"
+    );
+    // SAFETY: as above.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "did not stop on SIGTERM");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

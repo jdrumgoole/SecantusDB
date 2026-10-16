@@ -148,3 +148,31 @@ def test_tailored_icu_collation_orders_as_postgres(pg: Any) -> None:
         "from (values ('a'), ('e'), ('b'), ('o')) v(w)"
     )
     assert pg_answer(pg, sql) == ("ok", [("a,e,o,b",)])
+
+
+@pytest.mark.backlog_fixed("RP-005")
+def test_script_form_icu_collation_orders_as_its_language(pg: Any) -> None:
+    """PostgreSQL 15.19: `az-Cyrl-x-icu` orders as `az` (`x` after `h`,
+    dotless `ı` before `i`), and `uz-Arab-AF-x-icu` as `uz` (`ch` last).
+    ICU4C drops the script and the region; ICU4X fell back to the root."""
+    words = "('i'), ('ı'), ('h'), ('x'), ('q'), ('k'), ('ch'), ('c'), ('ç'), ('d')"
+    answers = []
+    for name in ("az-Cyrl-x-icu", "uz-Arab-AF-x-icu"):
+        sql = f"select string_agg(w, ',' order by w collate \"{name}\") from (values {words}) v(w)"
+        answers.append(pg_answer(pg, sql))
+    assert answers == [
+        ("ok", [("c,ch,ç,d,h,x,ı,i,k,q",)]),
+        ("ok", [("c,ç,d,h,i,ı,k,q,x,ch",)]),
+    ]
+
+
+@pytest.mark.backlog("RP-005")
+def test_marathi_icu_collation_orders_as_postgres(pg: Any) -> None:
+    """PostgreSQL 15.19: `mr-x-icu` (Marathi) sorts the conjunct `क्ष` after
+    `ह`. Here the collation is refused (42704): ICU4X's compiled data has no
+    such rule, so it ordered `क्ष` beside `क` and is not listed."""
+    sql = (
+        "select string_agg(w, ',' order by w collate \"mr-x-icu\") "
+        "from (values ('क'), ('क्ष'), ('ख'), ('ह')) v(w)"
+    )
+    assert pg_answer(pg, sql) == ("ok", [("क,ख,ह,क्ष",)])

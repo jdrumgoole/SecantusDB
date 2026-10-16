@@ -163,6 +163,12 @@ pub trait ClientInfo {
     /// Returns the client's socket address.
     fn socket_addr(&self) -> SocketAddr;
 
+    /// The server's own address for this connection (the socket's local
+    /// address), when it is a TCP one.
+    fn local_addr(&self) -> Option<SocketAddr> {
+        None
+    }
+
     /// Returns whether the connection is secured (TLS).
     fn is_secure(&self) -> bool;
 
@@ -263,11 +269,17 @@ pub struct DefaultClient<S> {
     pub portal_store: store::MemPortalStore<S>,
     /// Per-session typed extension store.
     pub session_extensions: SessionExtensions,
+    /// The server's own address for this connection, when it is TCP.
+    pub local_addr: Option<SocketAddr>,
 }
 
 impl<S> ClientInfo for DefaultClient<S> {
     fn socket_addr(&self) -> SocketAddr {
         self.socket_addr
+    }
+
+    fn local_addr(&self) -> Option<SocketAddr> {
+        self.local_addr
     }
 
     fn is_secure(&self) -> bool {
@@ -344,6 +356,7 @@ impl<S> DefaultClient<S> {
             sni_server_name: None,
             portal_store: store::MemPortalStore::new(),
             session_extensions: SessionExtensions::new(),
+            local_addr: None,
         }
     }
 }

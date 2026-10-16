@@ -159,6 +159,10 @@ impl<T: 'static, S> ClientInfo for Framed<T, PgWireMessageServerCodec<S>> {
         self.codec().client_info.socket_addr
     }
 
+    fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.codec().client_info.local_addr
+    }
+
     fn is_secure(&self) -> bool {
         self.codec().client_info.is_secure
     }
@@ -589,14 +593,31 @@ pub async fn negotiate_tls<S>(
     tls_acceptor: Option<crate::tokio::TlsAcceptor>,
 ) -> io::Result<Option<Framed<MaybeTls, PgWireMessageServerCodec<S>>>> {
     let addr = tcp_socket.peer_addr()?;
+    let local = tcp_socket.local_addr().ok();
     tcp_socket.set_nodelay(true)?;
 
-    let client_info = DefaultClient::new(addr, false);
+    let mut client_info = DefaultClient::new(addr, false);
+    client_info.local_addr = local;
     let mut tcp_socket = Framed::new(tcp_socket, PgWireMessageServerCodec::new(client_info));
 
     // this function will process postgres ssl negotiation and consume the first
     // SslRequest packet if detected.
     let ssl = peek_for_sslrequest(&mut tcp_socket, tls_acceptor.is_some()).await?;
+
+    // SecantusDB answers as PostgreSQL 15, which has no direct TLS: its
+    // ClientHello is a startup packet of no valid length, and the backend
+    // closes the connection (the client sees "unexpected eof").
+    if ssl == SslNegotiationType::Direct {
+        // Read what the client sent before closing, as PostgreSQL has read
+        // it: closing over unread data would reset the connection instead
+        // of ending it.
+        use tokio::io::AsyncReadExt;
+        let mut sink = [0u8; 16 * 1024];
+        let stream = tcp_socket.get_mut();
+        let _ = tokio::time::timeout(Duration::from_millis(200), stream.read(&mut sink)).await;
+        let _ = tokio::io::AsyncWriteExt::shutdown(stream).await;
+        return Ok(None);
+    }
 
     let old_parts = tcp_socket.into_parts();
 
@@ -614,6 +635,7 @@ pub async fn negotiate_tls<S>(
     if let Some(tls_acceptor) = tls_acceptor {
         // mention the use of ssl
         let mut client_info = DefaultClient::new(addr, true);
+        client_info.local_addr = local;
 
         let ssl_socket = Box::new(tls_acceptor.accept(old_parts.io).await?);
 

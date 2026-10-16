@@ -2568,6 +2568,28 @@ impl PgHandler {
     }
 
     /// Is `role` `other`, or a member of it?
+    /// `is_member_of_role_nosuper`: is `role` `other`, or a member of it
+    /// through any chain of grants? A superuser is a member only of what it
+    /// was granted -- what `pg_hba.conf`'s `+role` and `samerole` ask.
+    fn role_is_member_nosuper(&self, role: &str, other: &str) -> bool {
+        if role == other {
+            return true;
+        }
+        let edges = self.role_memberships();
+        let mut reached = vec![role.to_string()];
+        let mut i = 0;
+        while i < reached.len() {
+            let current = reached[i].clone();
+            for (r, m, _) in &edges {
+                if *m == current && !reached.contains(r) {
+                    reached.push(r.clone());
+                }
+            }
+            i += 1;
+        }
+        reached.iter().any(|r| r == other)
+    }
+
     fn role_is_member(&self, role: &str, other: &str) -> bool {
         other == role
             || self
@@ -18286,16 +18308,13 @@ impl StartupHandler for PgHandler {
                 .is_some_and(|policy| policy.client_cert == ClientCert::Cert);
             let verifier = role.password.as_deref().filter(|_| !by_certificate);
             if let Some(verifier) = verifier {
-                // A password past its VALID UNTIL cannot log in; PostgreSQL
-                // says only that authentication failed.
+                // A password past its VALID UNTIL cannot log in, but the
+                // exchange runs first, as for a user with no role:
+                // PostgreSQL's `get_role_password` answers nothing for it and
+                // `CheckPWChallengeAuth` runs a doomed SCRAM exchange
+                // (measured on 15.19). It says only that authentication failed.
                 if Self::password_expired(&role.valid_until) {
-                    return self
-                        .fail_login(
-                            client,
-                            "28P01",
-                            format!("password authentication failed for user \"{user}\""),
-                        )
-                        .await;
+                    return self.refuse_unknown_user(client, user).await;
                 }
                 let Some(creds) = scram_credentials(verifier) else {
                     // An md5 hash: the md5 challenge, as PostgreSQL's `md5`
@@ -18493,11 +18512,11 @@ impl PgHandler {
         // that is not sent.
         let database = client.metadata().get("database").unwrap_or(&user).clone();
         let host = client.socket_addr().ip().to_canonical();
-        let member_of = |user: &str, role: &str| self.role_is_member(user, role);
+        let member_of = |user: &str, role: &str| self.role_is_member_nosuper(user, role);
         let connection = hba::Connection {
             tls,
             address: host,
-            local: None,
+            host: hba::host_addresses(),
             user: &user,
             database: &database,
         };
@@ -18978,6 +18997,7 @@ impl PgHandler {
         self.backend_pid
             .store(pid, std::sync::atomic::Ordering::Relaxed);
         secantus_pgplan::scalar::set_backend_pid(pid);
+        secantus_pgplan::scalar::set_connection_addrs(_c.socket_addr(), _c.local_addr());
         let _ = self.backend.secret.set(secret.to_bytes());
         {
             let mut activity = self

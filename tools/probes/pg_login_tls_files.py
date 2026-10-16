@@ -5,7 +5,7 @@ Revocation lists (current, empty, expired, dated in the future, from another
 CA, forged, with and without extensions, through an intermediate CA), user
 name maps by exact name and by pattern, ``clientname=DN``, server
 certificates whose signature is RSA-PSS or Ed25519, and what a reload picks
-up. 480 scenarios. Arguments after the binary name the groups to run; with
+up. 547 scenarios. Arguments after the binary name the groups to run; with
 none, all of them.
 
 Every scenario is one login, made against a throwaway PostgreSQL cluster this
@@ -99,8 +99,9 @@ class Authority:
             .sign(self.key, **self._sign_args())
         )
 
-    def issue(self, stem, subject, san=None):
-        """`subject` is [(oid, value)] in the order the certificate holds it."""
+    def issue(self, stem, subject, san=None, crldp=None):
+        """`subject` is [(oid, value)] in the order the certificate holds it;
+        `crldp` a URI for a CRL distribution points extension."""
         key = rsa.generate_private_key(65537, 2048)
         b = (
             x509.CertificateBuilder()
@@ -108,6 +109,17 @@ class Authority:
             .issuer_name(self.name)
             .public_key(key.public_key())
         )
+        if crldp:
+            b = b.add_extension(
+                x509.CRLDistributionPoints(
+                    [
+                        x509.DistributionPoint(
+                            [x509.UniformResourceIdentifier(crldp)], None, None, None
+                        )
+                    ]
+                ),
+                critical=False,
+            )
         if san:
             b = b.add_extension(
                 x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False
@@ -133,7 +145,16 @@ class Authority:
         open(path, "wb").write(self.cert.public_bytes(serialization.Encoding.PEM))
         return path
 
-    def crl(self, path, revoked=(), next_update=None, last_update=None, v1=False, serials=()):
+    def crl(
+        self,
+        path,
+        revoked=(),
+        next_update=None,
+        last_update=None,
+        v1=False,
+        serials=(),
+        extensions=(),
+    ):
         b = (
             x509.CertificateRevocationListBuilder()
             .issuer_name(self.name)
@@ -145,6 +166,8 @@ class Authority:
                 x509.AuthorityKeyIdentifier.from_issuer_public_key(self.key.public_key()),
                 critical=False,
             )
+        for extension, critical in extensions:
+            b = b.add_extension(extension, critical=critical)
         for stem in revoked:
             b = b.add_revoked_certificate(
                 x509.RevokedCertificateBuilder()
@@ -174,6 +197,26 @@ other_ca = Authority("another CA")
 capem = ca.pem(f"{d}/ca.pem")
 SERVER = ca.issue("s", cn("localhost"), san=True)
 SERVER2 = ca.issue("s2", cn("localhost"), san=True)
+# The server's key again, as an encrypted PKCS#8 file (passphrase `pw`).
+shutil.copy(f"{d}/s.crt", f"{d}/senc.crt")
+open(f"{d}/senc.key", "wb").write(
+    serialization.load_pem_private_key(open(f"{d}/s.key", "rb").read(), None).private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.BestAvailableEncryption(b"pw"),
+    )
+)
+os.chmod(f"{d}/senc.key", 0o600)
+# And in OpenSSL's legacy encrypted PEM form (`Proc-Type: 4,ENCRYPTED`).
+shutil.copy(f"{d}/s.crt", f"{d}/sleg.crt")
+open(f"{d}/sleg.key", "wb").write(
+    serialization.load_pem_private_key(open(f"{d}/s.key", "rb").read(), None).private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.BestAvailableEncryption(b"pw"),
+    )
+)
+os.chmod(f"{d}/sleg.key", 0o600)
 PGCERT = ca.issue("pguser", cn("postgres"))
 ALICE = ca.issue("alice", cn("alice"))
 REVOKED = ca.issue("revoked", cn("postgres"))
@@ -238,6 +281,61 @@ CRL_FUTURE = ca.crl(
 CRL_EXPIRED_AND_CURRENT = bundle(f"{d}/crl_two.pem", CRL_EXPIRED, CRL_EMPTY)
 CRL_CURRENT_AND_EXPIRED = bundle(f"{d}/crl_two_b.pem", CRL, f"{d}/crl_expired.pem")
 CRL_FORGED_AND_REAL = bundle(f"{d}/crl_forged_real.pem", CRL_FORGED, CRL_EMPTY)
+
+# Lists scoped by an issuing distribution point (critical, as RFC 5280
+# requires), a delta list, and certificates naming a distribution point.
+#
+# Issued by the INTERMEDIATE, with the root's own unscoped list beside each:
+# OpenSSL before 3.6 checks the self-signed root against the lists too
+# (`check_cert`), and 3.6 skips it (`check_cert_crl`: "skip if cert is
+# apparently self-signed"). A list scoped to user certificates, or to a
+# distribution point, does not cover a root, so a root-issued scoped list
+# made the whole chain fail on 3.0 and pass on 3.6 -- the reference's answer
+# was its OpenSSL's. With the scoped list on the intermediate, only the leaf
+# is in its scope question on either version (measured 2026-10-16 with
+# `openssl verify -crl_check_all`, 3.0.13 and 3.6.3).
+DP_A, DP_B = "http://crl.example/a.crl", "http://crl.example/b.crl"
+SC_GOOD = inter.issue("sc_good", cn("postgres"))
+SC_REVOKED = inter.issue("sc_revoked", cn("postgres"))
+DP_GOOD = inter.issue("dp_good", cn("postgres"), crldp=DP_A)
+DP_REVOKED = inter.issue("dp_revoked", cn("postgres"), crldp=DP_A)
+DP_OTHER = inter.issue("dp_other", cn("postgres"), crldp=DP_B)
+
+
+def idp(full_name=None, user=False, ca_only=False, reasons=None):
+    return (
+        x509.IssuingDistributionPoint(
+            full_name=[x509.UniformResourceIdentifier(full_name)] if full_name else None,
+            relative_name=None,
+            only_contains_user_certs=user,
+            only_contains_ca_certs=ca_only,
+            only_some_reasons=reasons,
+            indirect_crl=False,
+            only_contains_attribute_certs=False,
+        ),
+        True,
+    )
+
+
+SCOPED = ("sc_revoked", "dp_revoked")
+
+
+def scoped(stem, *extensions):
+    """An intermediate's list with `extensions`, beside the root's empty one."""
+    return bundle(
+        f"{d}/{stem}.pem",
+        inter.crl(f"{d}/{stem}_inter.pem", revoked=SCOPED, extensions=extensions),
+        CRL_EMPTY,
+    )
+
+
+CRL_IDP_DP = scoped("crl_idp_dp", idp(DP_A))
+CRL_IDP_USER = scoped("crl_idp_user", idp(user=True))
+CRL_IDP_CA = scoped("crl_idp_ca", idp(ca_only=True))
+CRL_IDP_REASONS = scoped(
+    "crl_idp_reasons", idp(reasons=frozenset({x509.ReasonFlags.key_compromise}))
+)
+CRL_DELTA = scoped("crl_delta", (x509.DeltaCRLIndicator(1), True))
 
 # Server certificates whose SIGNATURE is RSA-PSS or Ed25519.
 pss256, pss384, ed = (
@@ -435,6 +533,36 @@ def crl_scenarios(port):
     }
 
 
+def scope_scenarios(port):
+    return {
+        "no distribution point, good": attempt(port, **SC_GOOD),
+        "no distribution point, revoked": attempt(port, **SC_REVOKED),
+        "distribution point a, good": attempt(port, **DP_GOOD),
+        "distribution point a, revoked": attempt(port, **DP_REVOKED),
+        "distribution point b": attempt(port, **DP_OTHER),
+        "revoked, first answer": raw_first(port, "postgres", cert=SC_REVOKED),
+    }
+
+
+def passphrase_scenarios(port):
+    """An encrypted key, its passphrase from `ssl_passphrase_command`."""
+    return {
+        "good cert": attempt(port, **PGCERT),
+        "no cert": attempt(port),
+        "verify-full": attempt(port, sslmode="verify-full"),
+    }
+
+
+def direct_scenarios(port):
+    """`sslnegotiation=direct` is PostgreSQL 17's; 15 has no direct TLS and
+    closes the connection. The usual negotiation still works beside it."""
+    return {
+        "direct, require": attempt(port, sslnegotiation="direct"),
+        "direct, verify-full": attempt(port, sslnegotiation="direct", sslmode="verify-full"),
+        "postgres negotiation": attempt(port, sslnegotiation="postgres"),
+    }
+
+
 def chain_scenarios(port):
     out = crl_scenarios(port)
     out["intermediate's good cert"] = attempt(port, **INTER_GOOD)
@@ -454,6 +582,7 @@ def cert_scenarios(port):
         ("postgres", PGCERT),
         ("O=Example,CN=alice", ALICE_DN),
         ("C,O,OU,CN=alice", ALICE_DN3),
+        ("inc_cert (mapped through @incname)", INC_CERT),
         ("none", {}),
     ):
         for user in ("alice", "postgres", "carol", "nobody"):
@@ -509,7 +638,9 @@ OPEN = (
     "hostssl all postgres 127.0.0.1/32 trust\nhostssl all carol 127.0.0.1/32 trust\n"
     "hostssl all all 127.0.0.1/32 scram-sha-256\n"
 )
+INC_CERT = ca.issue("inc_cert", cn("inc_cert"))
 IDENT = (
+    "m @incname alice\n"
     "m alice_cert alice\n"
     "m shared alice\n"
     "m shared postgres\n"
@@ -519,6 +650,8 @@ IDENT = (
     'dn3 "CN=alice,OU=Eng,O=Ex\\, ample,C=IE" alice\n'
 )
 open(f"{d}/ident.conf", "w").write(IDENT)
+# `@incname`: a file of one value, read beside the ident file.
+open(f"{d}/incname", "w").write("inc_cert  # one value\n")
 
 # group -> (pg: conf lines, hba, ident; ours: flags; scenarios; server cert stem)
 GROUPS = {
@@ -573,6 +706,37 @@ GROUPS = {
         )
         if path
     },
+    **{
+        f"crl scope {label}": (
+            f"ssl_crl_file = '{path}'",
+            OPEN,
+            ["--tls-crl-file", path],
+            scope_scenarios,
+            "s",
+        )
+        for label, path in (
+            ("distribution point", CRL_IDP_DP),
+            ("user certs only", CRL_IDP_USER),
+            ("CA certs only", CRL_IDP_CA),
+            ("some reasons", CRL_IDP_REASONS),
+            ("delta", CRL_DELTA),
+        )
+    },
+    "direct tls": ("", OPEN, [], direct_scenarios, "s"),
+    "passphrase": (
+        "ssl_passphrase_command = 'echo pw'",
+        OPEN,
+        ["--tls-key-passphrase-command", "echo pw"],
+        passphrase_scenarios,
+        "senc",
+    ),
+    "passphrase, legacy PEM": (
+        "ssl_passphrase_command = 'echo pw'",
+        OPEN,
+        ["--tls-key-passphrase-command", "echo pw"],
+        passphrase_scenarios,
+        "sleg",
+    ),
     "no crl, chain": ("", OPEN, [], chain_scenarios, "s"),
     "crl-cert": (
         "ssl_crl_file = '{d}/crl.pem'",
@@ -718,6 +882,7 @@ BASECONF = open(f"{pgd}/postgresql.conf").read() + (
     "unix_socket_directories = ''\npassword_encryption = 'scram-sha-256'\n"
 )
 shutil.copy(f"{d}/ident.conf", f"{pgd}/pg_ident.conf")
+shutil.copy(f"{d}/incname", f"{pgd}/incname")
 
 
 def pg(action):

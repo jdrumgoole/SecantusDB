@@ -104,18 +104,26 @@ one beside it.
   table refuses reads and writes with PostgreSQL's own `55000` for a
   handler-less wrapper; `postgres_fdw` / `file_fdw` are contrib modules this
   server does not ship.
-- [ ] **RUST pgserver: 27 of PostgreSQL 15.19's 907 ICU collations are
-  refused.** `pg_collation` lists the other 880 (`pg_icu_collations.tsv`),
-  each checked to ORDER BY as PostgreSQL does over a 97-string probe across
-  scripts. Left out, because ICU4X's CLDR data tailors them differently
-  (most order as the root locale): `az-Cyrl`, `haw`, `hi-Latn`, `kl`,
-  `kok-Latn`, `lkt`, `pa-Arab`, `se`, `smn`, `uz-Arab`, `uz-Cyrl`, `yi`,
-  `en-US-u-va-posix` and their regional forms; each is 42704. Related, not
-  tested: none of PostgreSQL's libc collations beyond `C` / `POSIX` exists
-  here (`COLLATE "en_US"` is 42704), and which ones a server has is the
-  host's locale list.
+- [ ] **RUST pgserver: 29 of PostgreSQL 15.19's 907 ICU collations are
+  refused.** `pg_collation` lists the other 878 (`pg_icu_collations.tsv`),
+  each checked to ORDER BY as PostgreSQL does over a 278-string probe across
+  25 scripts (2026-10-16). Left out, because ICU4X's compiled CLDR data has
+  no tailoring for them, or a different one: `as`, `haw`, `kl`, `kok`
+  (with `kok-Deva` and `kok-Latn`), `lkt`, `ln`, `mr`, `se`, `smn`, `yi`,
+  `en-US-u-va-posix` and their regional forms; each is 42704. `mr` and
+  `kok` lack PostgreSQL's `&ह<क्ष`, `as` its `ক্ষ` rule, `ln` orders `ɛ`
+  after `ə`. Related, not tested: none of PostgreSQL's libc collations
+  beyond `C` / `POSIX` exists here (`COLLATE "en_US"` is 42704), and which
+  ones a server has is the host's locale list.
+  **Decided (Joe, 2026-10-16): generate the data, the full set.**
+  `icu4x-datagen` builds these locales' collation data from ICU's
+  `icuexport` release (the tailorings ICU4C has); commit its baked Rust
+  output, `und-Han` orderings included (~1.9 MB of generated source for
+  `haw`, `kl`, `lkt`, `se`, `smn`, `yi`, measured), with the script that
+  regenerates it. Each locale is listed only once it orders as PostgreSQL
+  does; whether the data fixes `mr`, `kok`, `as` and `ln` is measured then.
   Backlog-ID: RP-005
-  Verify: tests/backlog/test_rp_triage.py::test_tailored_icu_collation_orders_as_postgres
+  Verify: tests/backlog/test_rp_triage.py::test_tailored_icu_collation_orders_as_postgres, tests/backlog/test_rp_triage.py::test_marathi_icu_collation_orders_as_postgres
 - **Scope decision — pgcrypto Blowfish and CAST5** PGP messages are verified
   against GnuPG, because both reference servers' OpenSSL 3 builds refuse
   those ciphers. Do not "fix" them to agree with a PG error.
@@ -288,39 +296,35 @@ one beside it.
   `tests/test_rust_pg_login_differential.py` (CI's `pg-oracle` lane; locally
   only with `SECANTUS_PG15_BIN` set). Open:
   - **A user this server has never heard of is trusted BY DEFAULT**;
-    PostgreSQL asks it for a password. Test fixtures connect as roles
-    nobody created, so the default is a decision; `--refuse-unknown-users`
-    answers as PostgreSQL does. Without a `pg_hba.conf` a role with no
+    PostgreSQL asks it for a password. **Decided (Joe, 2026-10-16): refuse
+    by default**, as `--refuse-unknown-users` does now, with a
+    `--trust-unknown-users` opt-out; the test fixtures, embedded handles and
+    gauges that connect as roles nobody created create them or opt out. Without a `pg_hba.conf` a role with no
     password is trusted, flag or not; with one a `scram-sha-256` line
     refuses it.
   - **With `--hba-file`:**
     - **Refused at startup, by line number**: the methods that need an
       outside service (`peer`, `ident`, `gss`, `sspi`, `ldap`, `radius`,
-      `pam`, `bsd`), a host NAME for the address, `samenet`, `@file`
-      inclusion, and `include` directives (PostgreSQL 16's).
-    - **`samehost` matches loopback only**: the handler is not told the
-      address a connection arrived on.
-    - **`+role` and `samerole` go through `pg_has_role`'s membership**,
-      where PostgreSQL uses the form that does not count a superuser as a
-      member of everything. Not probed with a superuser that has no line.
+      `pam`, `bsd`) and `include` directives (PostgreSQL 16's).
     - **A `map=` on a method other than `cert` is refused**; PostgreSQL
       takes it for `ident`, `peer`, `gss` and `sspi` too, none of which is
       read here.
-    - A password past its `VALID UNTIL` runs the exchange and fails it,
-      where the path without a file fails at once. PostgreSQL does the
-      first; not probed here.
   - **TLS files:**
-    - **A revocation list with a critical extension is refused at
-      startup** (`crl.rs`): one scoped by an issuing distribution point, a
-      delta list, an indirect list. OpenSSL handles the first.
-    - **A user name map's patterns are the `regex` crate's**, not
-      PostgreSQL's advanced regular expressions; `@file` inclusion in
-      `pg_ident.conf` is refused.
-    - **SIGHUP reloads only on a server started with TLS**; without TLS it
-      still stops the server (`ctrlc`'s termination handler).
-  - **Direct TLS (`sslnegotiation=direct`) is accepted**, which is
-    PostgreSQL 17's behaviour; 15.19 answers "SSL error: unexpected eof".
-  - The key must have no passphrase.
+    - **A revocation list's issuing distribution point named relative to
+      its issuer is refused at startup** (`crl.rs`); one with a full name,
+      a delta list and a reasons-only or indirect list answer as
+      PostgreSQL 15.19 does.
+    - **A self-signed root is never checked against the revocation lists**,
+      as OpenSSL 3.6 has it (`check_cert_crl` skips it). PostgreSQL linked
+      against an older OpenSSL (3.0.13 on Ubuntu 24.04) checks the root as
+      well, so a list scoped to user certificates or to a distribution point,
+      issued by the root, refuses every chain there and none here. The login
+      probe issues its scoped lists from an intermediate, where the two
+      versions agree.
+    - **A user name map's patterns are read as the SQL `~` operator reads
+      them** (the `regex` crate, through `pg_regex_source`'s POSIX-class
+      translation, 2026-10-15), so they share that engine's distance from
+      PostgreSQL's advanced regular expressions.
   - **The libpq scenarios (`attempt`) in the login probes do not retry**
     when the answer is the close; `raw_first` does (up to four times), after
     `pg_login_tls_files.py` once failed 479 of 480 in CI when the client
@@ -336,30 +340,6 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **RUST pgserver: whether a cursor declared without SCROLL scans
-  backward over a join with an ORDER BY is guessed.** PostgreSQL adds
-  `CURSOR_OPT_SCROLL` when the plan supports a backward scan
-  (`ExecSupportsBackwardScan`); `cursor_scroll.rs` reads that from the
-  statement's shape, which settles every shape measured on 15.19 except a
-  join (or IN / EXISTS semi-join) under an ORDER BY. That one depends on
-  where the planner puts the sort: `select * from t join u on t.a = u.a
-  order by t.a` merge-joins in key order and cannot scroll, `select * from
-  t, u order by u.c` sorts on top and can. Here both scroll.
-  Backlog-ID: RP-043
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_join_cursor_ordered_by_its_key_cannot_scroll
-
-- [ ] **RUST pgserver: a quoted mixed-case type name is folded where it is
-  looked up.** The planner hands a type name on as a plain string, so a
-  quoted `"Dom"` and an unquoted `dom` arrive the same, and the user-type
-  lookups (`user_domain`, `user_enum`, `user_composite_widths`, ...) fold
-  both sides to match them. On PostgreSQL 15.19 a domain `"Dom"` is reached
-  by `5::"Dom"` (here 42704) and an enum `"MyType"` is NOT reached by
-  `'y'::"mytype"` (here it is). Names have to keep their case from the
-  parse to the lookup, with only a type name read from TEXT folded (as
-  `'MyDom'::regtype` is); a built-in already refuses a capital (2026-10-15).
-  Backlog-ID: RP-041
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_mixed_case_type_is_found_only_as_written
-
 - [ ] **RUST pgserver: grouped and DISTINCT ON rows that tie under ORDER BY
   come out in another order from PostgreSQL's.** A plain ORDER BY (and an
   aggregate's, and a LIMIT's bounded heap) now sorts with PostgreSQL's
@@ -369,9 +349,18 @@ one beside it.
   sort: `select g, count(*) ... group by g order by count(*)` gives `(1,6),
   (0,6)` where PostgreSQL 15.19 gives `(0,6), (1,6)`. DISTINCT ON needs a
   planner flag (a citext DISTINCT is planned as one). Sorts that spill to
-  disk runs are not PostgreSQL's merge.
+  disk runs are not PostgreSQL's merge. The same choice decides whether a
+  cursor declared without SCROLL scans backward over a join under ORDER BY
+  (`ExecSupportsBackwardScan`; `cursor_scroll.rs` reads every other shape
+  from the statement): `select * from t join u on t.a = u.a order by t.a`
+  merge-joins in key order and cannot scroll, `select * from t, u order by
+  u.c` sorts on top and can. Here both scroll. (This was RP-043.)
+  **Decided (Joe, 2026-10-16): build a cost model.** Both answers are the
+  PLANNER's -- which join or aggregation method PostgreSQL's cost model
+  picks and, for a hash aggregate, the table size it sizes from its row
+  estimates -- so the fix is enough of that model to make the same choices.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_grouped_output_ties_as_postgres_leaves_them
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_grouped_output_ties_as_postgres_leaves_them, tests/backlog/test_rust_postgres_gaps.py::test_join_cursor_ordered_by_its_key_cannot_scroll
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
@@ -440,20 +429,20 @@ one beside it.
 
       What is left (re-measured 2026-10-15 against 15.19, 1,890 of 1,934
       the same; everything else the probe reports is below):
-      - **Decision needed -- the comparisons that answer a `memcmp`
-        difference** (16): `bttextcmp`, `bpcharcmp`, `byteacmp`, `bitcmp`,
-        `varbitcmp`, `btnamecmp` and its text forms, the `*_pattern_cmp`
-        pair, `network_cmp`, `jsonb_cmp`, `tsvector_cmp`, `tsquery_cmp`,
-        `gin_cmp_tslexeme`, `gin_compare_jsonb`. Each returns what the C
-        library's `memcmp` / `strcoll` does on the reference machine
-        (`bttextcmp('b', 'a')` is 14 on the macOS reference,
-        `bitcmp(B'101', B'100')` 32), and only the sign is promised.
-        Answering the reference's magnitude is one rule; answering -1 / 1 is
-        another. Which one is Joe's call, so none is answered yet.
+      - **`bttextcmp`, `bpcharcmp`, `jsonb_cmp`, `tsvector_cmp` and
+        `tsquery_cmp` are not implemented** (refused). **Decided (Joe,
+        2026-10-16): answer the SIGN only, -1 / 0 / 1.** The first three
+        compare under the session database's collation through `strcoll`,
+        whose magnitude is the platform's locale data (`bttextcmp('b', 'a')`
+        is 14 on the macOS reference under `en_US.UTF-8`); PostgreSQL
+        promises only the sign. The last two take the sign of PostgreSQL's
+        comparison of the types' storage layouts (sizes first). The byte comparisons (`byteacmp`, `bitcmp`,
+        `btnamecmp`, `network_cmp`, the `*_pattern_cmp` pair, ...) answer
+        PostgreSQL's numbers since 2026-10-16 (`cmpfn.rs`).
       - `table_to_xml` / `database_to_xml` over the catalog or the whole
         database differ only by what each database holds.
       Backlog-ID: RP-015
-      Verify: tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_residue
+      Verify: tests/backlog/test_rust_postgres_gaps.py::test_strcoll_compares_answer_the_sign
 
 - [ ] **OPEN — a backend-cancel test asserts a fixed 1 s bound on a shared
       runner.** `tests/test_rust_pgserver_slice.py::test_pg_cancel_and_terminate_backend_signal_a_running_statement`

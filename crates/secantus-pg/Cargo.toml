@@ -46,7 +46,7 @@ path = "src/lib.rs"
 default = ["bin", "mimalloc"]
 # Builds the `secantusd-pg` binary (signal handling). Off, the crate is the
 # library alone -- what a dev-dependency or the Python handle wants.
-bin = ["dep:ctrlc", "dep:libc"]
+bin = ["dep:ctrlc"]
 # Only for the instrumented stage of the release build
 # (`scripts/build_pg_release.sh`): the binary writes its own profile to
 # `SECANTUS_PGO_OUT` as it stops. It links only under `-Cprofile-generate`.
@@ -69,6 +69,15 @@ pgwire = { package = "secantus-pgwire", version = "=0.1.0-beta.16", path = "../s
 # `rustls-pki-types`' own, so the unmaintained `rustls-pemfile` stays out.
 tokio-rustls = { version = "0.26.2", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-pki-types = { version = "1.10", features = ["std"] }
+# An encrypted PKCS#8 key, decrypted with what `--tls-key-passphrase-command`
+# prints (PostgreSQL's `ssl_passphrase_command`).
+pkcs8 = { version = "0.10", features = ["encryption", "pem", "std"] }
+# A key encrypted in OpenSSL's legacy PEM form (`Proc-Type: 4,ENCRYPTED`):
+# `EVP_BytesToKey` over MD5, then AES or DES-EDE3 in CBC mode.
+md-5 = "0.10"
+aes = "0.8"
+des = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
 # The hash of the server certificate a SCRAM channel binding carries
 # (src/x509.rs), and the base64 it travels in (src/scram_binding.rs). Both
 # are the versions `secantus-auth` already builds.
@@ -115,7 +124,7 @@ stacker = "0.1"
 # startup: a blocked mask and an ignored disposition both survive exec, and a
 # server started under either could not be stopped by its supervisor.
 [target.'cfg(unix)'.dependencies]
-libc = { version = "0.2", optional = true }
+libc = { version = "0.2" }
 
 [dev-dependencies]
 # A real PostgreSQL client for the embedded-server tests: the durability test

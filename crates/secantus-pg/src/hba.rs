@@ -21,8 +21,9 @@
 //! What is refused when the file is read, by name, so that a rule this
 //! server cannot apply is never silently skipped: a method that needs a
 //! service outside the server (`peer`, `ident`, `gss`, `sspi`, `ldap`,
-//! `radius`, `pam`, `bsd`), a host NAME for the address (PostgreSQL resolves
-//! it; this server does not), `samenet`, and `@file` inclusion. `local`
+//! `radius`, `pam`, `bsd`). A host name for the address is matched as
+//! PostgreSQL's `check_hostname` matches it. `@file` inclusion is read as PostgreSQL 15
+//! reads it. `local`
 //! lines are for Unix-domain sockets, which this server does not listen on:
 //! they are read and never match, as are the GSSAPI types.
 
@@ -73,7 +74,11 @@ enum Address {
     All,
     /// Any of the server's own addresses.
     SameHost,
+    /// `samenet`: the network of one of this host's interfaces.
+    SameNet,
     Network(IpAddr, u8),
+    /// A host name, or a `.suffix` of one (`check_hostname`).
+    Host(String),
 }
 
 /// How a connection a line matches must prove who it is.
@@ -123,8 +128,9 @@ pub(crate) struct Rule {
 pub(crate) struct Connection<'a> {
     pub tls: bool,
     pub address: IpAddr,
-    /// The address the connection arrived on, for `samehost`.
-    pub local: Option<IpAddr>,
+    /// This host's interfaces, as `(address, netmask)`, for `samehost` and
+    /// `samenet`.
+    pub host: Vec<(IpAddr, Option<IpAddr>)>,
     pub user: &'a str,
     pub database: &'a str,
 }
@@ -140,7 +146,7 @@ impl Hba {
     pub(crate) fn read(path: &Path) -> io::Result<Hba> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
-        Hba::parse(&text).map_err(|(line, message)| {
+        Hba::parse_in(&text, path.parent()).map_err(|(line, message)| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("{}, line {line}: {message}", path.display()),
@@ -148,10 +154,16 @@ impl Hba {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn parse(text: &str) -> Result<Hba, (usize, String)> {
+        Hba::parse_in(text, None)
+    }
+
+    /// [`Hba::parse`], an `@file` read relative to `dir` (the hba file's).
+    pub(crate) fn parse_in(text: &str, dir: Option<&Path>) -> Result<Hba, (usize, String)> {
         let mut rules = Vec::new();
         for (number, line) in logical_lines(text) {
-            let fields = fields(&line).map_err(|message| (number, message))?;
+            let fields = fields(&line, dir, 0).map_err(|message| (number, message))?;
             if fields.is_empty() {
                 continue;
             }
@@ -213,10 +225,33 @@ impl Address {
         let client = connection.address.to_canonical();
         match self {
             Address::All => true,
+            // `check_same_host_or_net`: any address of any of this host's
+            // interfaces, the loopback ones among them.
             Address::SameHost => {
                 client.is_loopback()
-                    || connection.local.map(|local| local.to_canonical()) == Some(client)
+                    || connection
+                        .host
+                        .iter()
+                        .any(|(a, _)| a.to_canonical() == client)
             }
+            // The client on the network of one of this host's interfaces.
+            Address::SameNet => connection.host.iter().any(|(a, mask)| {
+                let Some(mask) = mask else { return false };
+                match (a.to_canonical(), mask, client) {
+                    (IpAddr::V4(a), IpAddr::V4(m), IpAddr::V4(c)) => {
+                        u32::from(a) & u32::from(*m) == u32::from(c) & u32::from(*m)
+                    }
+                    (IpAddr::V6(a), IpAddr::V6(m), IpAddr::V6(c)) => {
+                        u128::from(a) & u128::from(*m) == u128::from(c) & u128::from(*m)
+                    }
+                    _ => false,
+                }
+            }),
+            // `check_hostname`: the client's address reverse-resolved, the
+            // name matched, and the match confirmed by resolving the name
+            // forward to the client's address.
+            Address::Host(pattern) => client_host_name(client)
+                .is_some_and(|name| hostname_match(pattern, &name) && resolves_to(&name, client)),
             Address::Network(network, prefix) => match (network, client) {
                 (IpAddr::V4(network), IpAddr::V4(client)) => {
                     let mask = u32::MAX.checked_shl(32 - u32::from(*prefix)).unwrap_or(0);
@@ -352,7 +387,7 @@ fn logical_lines(text: &str) -> Vec<(usize, String)> {
 /// One line's fields, each a comma-separated list of tokens. Blanks separate
 /// fields, a `#` outside quotes starts a comment, and double quotes keep
 /// blanks, commas and `#` in a token (`""` inside them is one quote).
-fn fields(line: &str) -> Result<Vec<Vec<Token>>, String> {
+fn fields(line: &str, dir: Option<&Path>, depth: usize) -> Result<Vec<Vec<Token>>, String> {
     let mut out: Vec<Vec<Token>> = Vec::new();
     let mut chars = line.chars().peekable();
     loop {
@@ -393,8 +428,14 @@ fn fields(line: &str) -> Result<Vec<Vec<Token>>, String> {
             if quoted {
                 return Err("unterminated quoted string".into());
             }
-            if !was_quoted && text.starts_with('@') {
-                return Err(format!("file inclusion ({text}) is not supported"));
+            // `@file` (unquoted): the tokens that file holds, in its place
+            // (`tokenize_inc_file`), relative to the hba file's directory.
+            if !was_quoted && text.len() > 1 && text.starts_with('@') {
+                field.extend(included(&text[1..], dir, depth)?);
+                if !more {
+                    break;
+                }
+                continue;
             }
             if !text.is_empty() || was_quoted {
                 field.push(Token {
@@ -410,6 +451,32 @@ fn fields(line: &str) -> Result<Vec<Vec<Token>>, String> {
             out.push(field);
         }
     }
+}
+
+/// The tokens of an `@file`: every token of every line, comments dropped.
+fn included(name: &str, dir: Option<&Path>, depth: usize) -> Result<Vec<Token>, String> {
+    if depth >= 10 {
+        return Err(format!(
+            "could not open file \"{name}\": too many levels of inclusion"
+        ));
+    }
+    let path = match dir {
+        Some(dir) if Path::new(name).is_relative() => dir.join(name),
+        _ => Path::new(name).to_path_buf(),
+    };
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "could not open secondary authentication file \"@{name}\" as \"{}\": {e}",
+            path.display()
+        )
+    })?;
+    let mut out = Vec::new();
+    for (_, line) in logical_lines(&text) {
+        for field in fields(&line, path.parent(), depth + 1)? {
+            out.extend(field);
+        }
+    }
+    Ok(out)
 }
 
 /// A field that must be one token.
@@ -477,7 +544,7 @@ fn rule(fields: &[Vec<Token>], line: usize) -> Result<Rule, String> {
         } else if token.keyword("samehost") {
             Address::SameHost
         } else if token.keyword("samenet") {
-            return Err("samenet is not supported; give the network as an address".into());
+            Address::SameNet
         } else if let Some((ip, prefix)) = token.text.split_once('/') {
             let ip: IpAddr = ip
                 .parse()
@@ -504,10 +571,7 @@ fn rule(fields: &[Vec<Token>], line: usize) -> Result<Rule, String> {
             .ok_or_else(|| format!("invalid IP mask \"{mask}\": not a run of leading ones"))?;
             Address::Network(ip, prefix)
         } else {
-            return Err(format!(
-                "host name \"{}\" is not supported for the address; give an IP address",
-                token.text
-            ));
+            Address::Host(token.text.clone())
         }
     };
     let method_token = single(fields.get(next), "authentication method")?;
@@ -611,6 +675,135 @@ fn contiguous(mask: u128, bits: u32) -> Option<u8> {
     (mask == expected).then_some(ones as u8)
 }
 
+/// `hostname_match`: a pattern starting with `.` matches a name ending in
+/// it, any other the name itself; case is not significant.
+fn hostname_match(pattern: &str, name: &str) -> bool {
+    if pattern.starts_with('.') {
+        name.len() > pattern.len()
+            && name[name.len() - pattern.len()..].eq_ignore_ascii_case(pattern)
+    } else {
+        name.eq_ignore_ascii_case(pattern)
+    }
+}
+
+/// Does `name` resolve (forward) to `client`?
+fn resolves_to(name: &str, client: IpAddr) -> bool {
+    use std::net::ToSocketAddrs;
+    (name, 0)
+        .to_socket_addrs()
+        .is_ok_and(|mut addrs| addrs.any(|a| a.ip().to_canonical() == client))
+}
+
+/// The client address's host name, from a reverse lookup that must find
+/// one (`getnameinfo` with `NI_NAMEREQD`).
+#[cfg(unix)]
+fn client_host_name(client: IpAddr) -> Option<String> {
+    let mut host = [0 as libc::c_char; 1025];
+    // SAFETY: `getnameinfo` reads the sockaddr built here and writes a
+    // NUL-terminated name into `host`, within its length.
+    let rc = unsafe {
+        match client {
+            IpAddr::V4(v4) => {
+                let mut sa: libc::sockaddr_in = std::mem::zeroed();
+                sa.sin_family = libc::AF_INET as libc::sa_family_t;
+                sa.sin_addr.s_addr = u32::from(v4).to_be();
+                #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+                {
+                    sa.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+                }
+                libc::getnameinfo(
+                    std::ptr::addr_of!(sa).cast(),
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    host.as_mut_ptr(),
+                    host.len() as libc::socklen_t,
+                    std::ptr::null_mut(),
+                    0,
+                    libc::NI_NAMEREQD,
+                )
+            }
+            IpAddr::V6(v6) => {
+                let mut sa: libc::sockaddr_in6 = std::mem::zeroed();
+                sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                sa.sin6_addr.s6_addr = v6.octets();
+                #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+                {
+                    sa.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+                }
+                libc::getnameinfo(
+                    std::ptr::addr_of!(sa).cast(),
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                    host.as_mut_ptr(),
+                    host.len() as libc::socklen_t,
+                    std::ptr::null_mut(),
+                    0,
+                    libc::NI_NAMEREQD,
+                )
+            }
+        }
+    };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: `getnameinfo` NUL-terminated it.
+    let name = unsafe { std::ffi::CStr::from_ptr(host.as_ptr()) };
+    name.to_str().ok().map(str::to_string)
+}
+
+#[cfg(not(unix))]
+fn client_host_name(_client: IpAddr) -> Option<String> {
+    None
+}
+
+/// This host's interfaces as `(address, netmask)`, as `pg_foreach_ifaddr`
+/// lists them (`getifaddrs`).
+#[cfg(unix)]
+pub(crate) fn host_addresses() -> Vec<(IpAddr, Option<IpAddr>)> {
+    // SAFETY (both): `sa` is null or a sockaddr whose family says its type.
+    unsafe fn ip(sa: *const libc::sockaddr) -> Option<IpAddr> {
+        if sa.is_null() {
+            return None;
+        }
+        match i32::from((*sa).sa_family) {
+            libc::AF_INET => {
+                let sin = sa.cast::<libc::sockaddr_in>();
+                Some(IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(
+                    (*sin).sin_addr.s_addr,
+                ))))
+            }
+            libc::AF_INET6 => {
+                let sin6 = sa.cast::<libc::sockaddr_in6>();
+                Some(IpAddr::V6(std::net::Ipv6Addr::from(
+                    (*sin6).sin6_addr.s6_addr,
+                )))
+            }
+            _ => None,
+        }
+    }
+    let mut out = Vec::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` fills `head` with a list this function walks and
+    // frees.
+    unsafe {
+        if libc::getifaddrs(&mut head) != 0 {
+            return out;
+        }
+        let mut cur = head;
+        while !cur.is_null() {
+            if let Some(addr) = ip((*cur).ifa_addr) {
+                out.push((addr, ip((*cur).ifa_netmask)));
+            }
+            cur = (*cur).ifa_next;
+        }
+        libc::freeifaddrs(head);
+    }
+    out
+}
+
+#[cfg(not(unix))]
+pub(crate) fn host_addresses() -> Vec<(IpAddr, Option<IpAddr>)> {
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,7 +843,7 @@ hostssl     all        mapped      all            cert  map=m clientname=DN
             &Connection {
                 tls,
                 address: address.parse().unwrap(),
-                local: None,
+                host: Vec::new(),
                 user,
                 database,
             },
@@ -725,6 +918,86 @@ hostssl     all        mapped      all            cert  map=m clientname=DN
         assert!(hit("d", "::ffff:10.0.0.1") && hit("d", "10.0.0.1"));
         assert!(!hit("d", "::1"), "an IPv4 line does not match IPv6");
         assert!(hit("e", "127.0.0.1") && hit("e", "::1") && !hit("e", "10.0.0.1"));
+        // `samehost` is any of this host's interface addresses, not only the
+        // loopback ones.
+        let on = |address: &str, host: &[&str]| {
+            hba.decide(
+                &Connection {
+                    tls: false,
+                    address: address.parse().unwrap(),
+                    host: host.iter().map(|a| (a.parse().unwrap(), None)).collect(),
+                    user: "e",
+                    database: "x",
+                },
+                &|_, _| false,
+            )
+            .is_some()
+        };
+        assert!(on("192.0.2.7", &["10.0.0.1", "192.0.2.7"]));
+        assert!(!on("192.0.2.8", &["10.0.0.1", "192.0.2.7"]));
+        assert!(on("::ffff:192.0.2.7", &["192.0.2.7"]));
+        // `samenet`: the client on an interface's network.
+        let hba = Hba::parse("host all all samenet trust\n").expect("samenet parses");
+        let net = |address: &str| {
+            hba.decide(
+                &Connection {
+                    tls: false,
+                    address: address.parse().unwrap(),
+                    host: vec![(
+                        "192.0.2.7".parse().unwrap(),
+                        Some("255.255.255.0".parse().unwrap()),
+                    )],
+                    user: "u",
+                    database: "x",
+                },
+                &|_, _| false,
+            )
+            .is_some()
+        };
+        assert!(net("192.0.2.200") && !net("192.0.3.1") && !net("::1"));
+    }
+
+    #[test]
+    fn a_host_name_matches_whole_or_by_its_suffix() {
+        assert!(hostname_match("localhost", "LocalHost"));
+        assert!(!hostname_match("localhost", "localhost.example"));
+        assert!(hostname_match(".example.com", "db.Example.com"));
+        assert!(!hostname_match(".example.com", "example.com"));
+        assert!(!hostname_match(".example.com", "db.example.org"));
+    }
+
+    #[test]
+    fn an_at_file_holds_more_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("admins"),
+            "alice  # a comment\nbob,carol\n@more\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("more"), "dave\n").unwrap();
+        let hba = Hba::parse_in("host all @admins all trust\n", Some(dir.path()))
+            .expect("the file parses");
+        for user in ["alice", "bob", "carol", "dave"] {
+            assert!(
+                decide_from(&hba, false, user, "x", "127.0.0.1").is_some(),
+                "{user}"
+            );
+        }
+        assert!(decide_from(&hba, false, "erin", "x", "127.0.0.1").is_none());
+        // Quoted, `@admins` is a user called @admins.
+        let quoted =
+            Hba::parse_in("host all \"@admins\" all trust\n", Some(dir.path())).expect("parses");
+        assert!(decide_from(&quoted, false, "@admins", "x", "127.0.0.1").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn this_hosts_addresses_are_listed() {
+        let addresses = host_addresses();
+        assert!(
+            addresses.iter().any(|(a, _)| a.is_loopback()),
+            "getifaddrs lists the loopback interface: {addresses:?}"
+        );
     }
 
     #[test]
@@ -742,8 +1015,6 @@ hostssl     all        mapped      all            cert  map=m clientname=DN
                 "host all all 127.0.0.1/32 trusted\n",
                 "invalid authentication method",
             ),
-            ("host all all db.example.com trust\n", "host name"),
-            ("host all all samenet trust\n", "samenet"),
             ("host all all 127.0.0.1/33 trust\n", "invalid CIDR mask"),
             (
                 "host all all 127.0.0.1 255.0.255.0 trust\n",
@@ -775,7 +1046,10 @@ hostssl     all        mapped      all            cert  map=m clientname=DN
                 "host all all all trust colour=blue\n",
                 "unrecognized authentication option",
             ),
-            ("host all @users all trust\n", "file inclusion"),
+            (
+                "host all @absent-users-file all trust\n",
+                "could not open secondary authentication file",
+            ),
             ("host all \"alice all trust\n", "unterminated"),
             (
                 "host all all 127.0.0.1/32,10.0.0.0/8 trust\n",
