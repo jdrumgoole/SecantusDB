@@ -1817,6 +1817,7 @@ pub(crate) fn listed_indexes(
         ix.remove("geoKeys");
         ix.remove("numberKeys");
         ix.remove("pythonKeys");
+        ix.remove("buildSeq");
         *ix = listed_spec(std::mem::take(ix));
     }
     // The `_id` index of a collection with a default collation carries it.
@@ -3316,6 +3317,7 @@ pub(crate) const INDEX_CATALOG_ONLY: &[&str] = &[
     "geoKeys",
     "numberKeys",
     "pythonKeys",
+    "buildSeq",
 ];
 
 fn index_options(spec: &Document) -> Document {

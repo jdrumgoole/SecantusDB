@@ -649,7 +649,7 @@ def test_bulk_write_ns_info_not_an_array(rust_mongo: Any, mongod: Any) -> None:
 # ------------------------------------------------- 7.067 index management --
 
 
-@pytest.mark.backlog("RM-081")
+@pytest.mark.backlog_fixed("RM-081")
 def test_list_indexes_in_creation_order(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 lists indexes in creation order."""
 

@@ -1251,19 +1251,6 @@ differs on 5 scenarios. What is left:
       result. One scenario.
       Backlog-ID: RM-080
       Verify: tests/backlog/test_rm_057_084.py::test_get_more_sees_writes_made_since_the_find
-- [ ] **RUST MongoDB server: `listIndexes` answers in name order.** mongod
-      answers in the order the indexes were built (`_id_` first on both).
-      The catalog keeps no build order, so this needs a field on disk, which
-      the Python server would then have to carry too. One scenario. The
-      same order is the order `explain` lists rejected plans in, which here
-      follows the catalog's name order.
-      **Decided 2026-10-16 (Joe):** record the build order: a sequence in
-      each index's catalog options, stripped from `listIndexes` like
-      `entryFormat`, used for `listIndexes`, the duplicate-key index and
-      `rejectedPlans`. A store's existing indexes take name order on open.
-      Folds in RM-107, the same item.
-      Backlog-ID: RM-081
-      Verify: tests/backlog/test_rm_057_084.py::test_list_indexes_in_build_order,tests/backlog/test_rm_085_112.py::test_list_indexes_in_creation_order
 - [ ] **RUST MongoDB server: an `aggregate` cursor outlives the index it
       reads.** A `find` cursor is killed when its index is dropped (175,
       since 2026-10-14); an `aggregate` whose `$match` reads one is not.

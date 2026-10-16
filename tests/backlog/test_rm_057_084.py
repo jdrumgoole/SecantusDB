@@ -881,10 +881,28 @@ def _index_order(client: Any) -> list:
     return [i["name"] for i in c.list_indexes()]
 
 
-@pytest.mark.backlog("RM-081")
+@pytest.mark.backlog_fixed("RM-081")
 def test_list_indexes_in_build_order(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 lists indexes in the order they were built."""
     assert _index_order(rust_mongo) == _index_order(mongod) == ["_id_", "z_1", "a_1", "m_1"]
+
+
+def _duplicate_key_index(client: Any) -> Any:
+    c = client["rm081"][_name()]
+    c.insert_one({"_id": 1, "z": 1, "a": 1})
+    c.create_index("z", unique=True)
+    c.create_index("a", unique=True)
+    got = mongo_answer(lambda: c.insert_one({"_id": 2, "z": 1, "a": 1}))
+    return re.findall(r"index: (\S+)", str(got))
+
+
+@pytest.mark.backlog_fixed("RM-081")
+def test_duplicate_key_names_the_first_built_unique_index(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 checks unique indexes in build order: a document
+    duplicating `z_1` (built first) and `a_1` is refused by `z_1`, not by
+    the first in name order."""
+    got, want = _duplicate_key_index(rust_mongo), _duplicate_key_index(mongod)
+    assert got == want
 
 
 def _aggregate_after_index_drop(client: Any) -> tuple:
