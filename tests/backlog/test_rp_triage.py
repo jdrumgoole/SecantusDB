@@ -138,11 +138,11 @@ def test_pg_collation_lists_locale_icu_collations(pg: Any) -> None:
     )
 
 
-@pytest.mark.backlog("RP-005")
+@pytest.mark.backlog_fixed("RP-005")
 def test_tailored_icu_collation_orders_as_postgres(pg: Any) -> None:
     """PostgreSQL 15.19: `haw-x-icu` (Hawaiian) sorts the vowels before the
-    consonants, `a,e,o,b`. Here the collation is refused (42704): ICU4X's
-    CLDR data orders it as the root locale, so it is not listed."""
+    consonants, `a,e,o,b`. ICU4X's compiled data has no Hawaiian tailoring;
+    it comes from the generated data (`secantus-pgplan/src/icu_data.rs`)."""
     sql = (
         "select string_agg(w, ',' order by w collate \"haw-x-icu\") "
         "from (values ('a'), ('e'), ('b'), ('o')) v(w)"

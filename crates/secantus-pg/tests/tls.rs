@@ -356,21 +356,21 @@ async fn first_answer(server: &PgServer, user: &str) -> (u8, u32) {
 }
 
 #[tokio::test]
-async fn a_user_there_is_no_role_for_is_trusted_unless_the_server_is_told_otherwise() {
+async fn a_user_there_is_no_role_for_is_refused_unless_the_server_is_told_to_trust_it() {
     // AuthenticationOk is request 0; AuthenticationSASL, the start of a
     // password exchange, is 10.
-    let trusting = PgServer::builder().start().expect("start");
-    assert_eq!(first_answer(&trusting, "nobody").await, (b'R', 0));
-
-    let refusing = PgServer::builder()
-        .refuse_unknown_users(true)
-        .start()
-        .expect("start");
+    let refusing = PgServer::builder().start().expect("start");
     // Asked for a password, as PostgreSQL asks: it does not say there is no
     // such role.
     assert_eq!(first_answer(&refusing, "nobody").await, (b'R', 10));
     // A role with no password is still trusted, `postgres` among them.
     assert_eq!(first_answer(&refusing, "postgres").await, (b'R', 0));
+
+    let trusting = PgServer::builder()
+        .trust_unknown_users(true)
+        .start()
+        .expect("start");
+    assert_eq!(first_answer(&trusting, "nobody").await, (b'R', 0));
 }
 
 #[test]

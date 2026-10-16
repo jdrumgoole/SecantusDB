@@ -320,19 +320,26 @@ def test_hba_file_and_the_options_it_replaces_do_not_mix(tmp_path: Path) -> None
     hba.write_text("host all all 127.0.0.1/32 trust\n")
     with pytest.raises(RuntimeError, match="pg_hba.conf"):
         _secantus_server.PgServer(
-            str(tmp_path / "home"), hba_file=str(hba), refuse_unknown_users=True
+            str(tmp_path / "home"), hba_file=str(hba), trust_unknown_users=True
         )
 
 
-def test_refuse_unknown_users(tmp_path: Path) -> None:
-    with _server(tmp_path / "home", refuse_unknown_users=True) as server:
+def test_unknown_users_are_refused_unless_trusted(tmp_path: Path) -> None:
+    """A user there is no role for is refused by default, as PostgreSQL
+    refuses a role that does not exist; `trust_unknown_users=True` lets it
+    in without a password. A role with no password connects either way."""
+    with _server(tmp_path / "home") as server:
         with _connect(server) as conn:
             conn.execute("CREATE ROLE known LOGIN")
         base = f"host=127.0.0.1 port={server.port} dbname=postgres"
         with psycopg.connect(f"{base} user=known", connect_timeout=10) as conn:
             assert conn.execute("SELECT current_user").fetchone() == ("known",)
-        with pytest.raises(psycopg.OperationalError):
+        with pytest.raises(psycopg.OperationalError, match="password authentication failed"):
             psycopg.connect(f"{base} user=nobody password=x", connect_timeout=10).close()
+    with _server(tmp_path / "home", trust_unknown_users=True) as server:
+        base = f"host=127.0.0.1 port={server.port} dbname=postgres"
+        with psycopg.connect(f"{base} user=nobody", connect_timeout=10) as conn:
+            assert conn.execute("SELECT current_user").fetchone() == ("nobody",)
 
 
 def test_a_user_name_map_names_the_role_a_certificate_logs_in_as(tmp_path: Path) -> None:
@@ -361,6 +368,8 @@ def test_a_user_name_map_names_the_role_a_certificate_logs_in_as(tmp_path: Path)
         tls_client_cert="cert",
         tls_ident_file=str(ident),
         tls_user_map="m",
+        # `alice` is a role nobody created; this test is about the map.
+        trust_unknown_users=True,
     ) as server:
 
         def login(user: str) -> psycopg.Connection:

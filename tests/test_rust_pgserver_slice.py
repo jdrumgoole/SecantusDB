@@ -66,7 +66,13 @@ _STOP_SIGNAL = signal.CTRL_BREAK_EVENT if _WINDOWS else signal.SIGTERM
 
 
 class _Server:
-    """A `secantusd-pg` subprocess over one storage home."""
+    """A `secantusd-pg` subprocess over one storage home.
+
+    The tests connect as `test`, a role nobody creates, so the server is
+    started with `--trust-unknown-users` -- unless a test gives a
+    `pg_hba.conf` (which decides that itself) or `--refuse-unknown-users`
+    (the server's default, named to say the test wants it).
+    """
 
     def __init__(
         self,
@@ -102,6 +108,7 @@ class _Server:
                 "127.0.0.1:0",
                 *(f"--database={name}" for name in self.databases),
                 *self.args,
+                *self._trust_args(),
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -119,6 +126,12 @@ class _Server:
             raise RuntimeError(f"secantusd-pg did not start: {line!r}{rest!r}")
         self.port = int(match.group(1))
         return self
+
+    def _trust_args(self) -> tuple[str, ...]:
+        decided = ("--hba-file", "--refuse-unknown-users")
+        if any(a == d or a.startswith(d + "=") for a in self.args for d in decided):
+            return ()
+        return ("--trust-unknown-users",)
 
     def _readline(self, *, timeout: float) -> str:
         """The child's first stdout line, or "" if it dies or stalls."""
@@ -20046,7 +20059,9 @@ def test_client_certificates(home: Path, tmp_path: Path, mode: str) -> None:
 
 
 def test_a_server_can_refuse_a_user_it_has_no_role_for(home: Path, tmp_path: Path) -> None:
-    """`--refuse-unknown-users`: a user there is no role for is not trusted.
+    """A user there is no role for is not trusted: the server's default
+    (`--refuse-unknown-users` here only tells `_Server` not to add
+    `--trust-unknown-users`).
 
     PostgreSQL never says a role is missing under a `scram-sha-256` line: it
     asks for a password and fails the login as a wrong one, so a client with
@@ -20068,7 +20083,8 @@ def test_a_server_can_refuse_a_user_it_has_no_role_for(home: Path, tmp_path: Pat
             return str(exc).strip().splitlines()[-1].split("failed: ")[-1]
 
     with _Server(home) as server:
-        # The default: `test` and `nobody` are roles nobody created.
+        # With --trust-unknown-users (what `_Server` adds): `test` and
+        # `nobody` are roles nobody created.
         assert attempt(server, "nobody") == "ok"
         with _tls_connect(server) as conn:
             conn.execute("create role alice login password 'pw'")
@@ -20947,7 +20963,7 @@ def test_a_pg_hba_conf_the_server_cannot_apply_stops_it_starting(
             "map= needs a user name map file",
         ),
         (("--ident-file", str(certs.ca)), "is for a pg_hba.conf"),
-        (("--hba-file", good, "--refuse-unknown-users"), "cannot be given beside one"),
+        (("--hba-file", good, "--trust-unknown-users"), "cannot be given beside one"),
         ((*certs.args, "--tls-require", "--hba-file", good), "cannot be given beside one"),
         (
             (*certs.ca_args, "--tls-client-cert", "verify-ca", "--hba-file", good),

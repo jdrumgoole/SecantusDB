@@ -6,12 +6,22 @@
 //! function's own for equal prefixes (`varlena.c`, `varbit.c`, `name.c`,
 //! `network.c`, `tsvector_op.c`, `jsonb_gin.c`).
 //!
-//! Not here: `bttextcmp`, `bpcharcmp` and `jsonb_cmp`, which compare under
-//! the database's collation through `strcoll`, whose magnitude is the
-//! platform's locale data; and `tsvector_cmp` / `tsquery_cmp`, which compare
-//! their types' internal storage layouts.
+//! `bttextcmp`, `bpcharcmp` and `jsonb_cmp` compare under the database's
+//! collation through `strcoll`, whose magnitude is the platform's locale
+//! data; they answer only its SIGN, -1 / 0 / 1 (Joe, 2026-10-16), which is
+//! all PostgreSQL promises. The database collation here is `C`, so the
+//! sign is the bytes'.
+//!
+//! `tsvector_cmp` / `tsquery_cmp` compare their types' storage layouts
+//! (`fts::vector_cmp` / `fts::query_cmp`, transcribed from PostgreSQL 15),
+//! and answer the sign too.
 
 use super::*;
+
+/// -1, 0 or 1: the sign of a comparison whose magnitude is not promised.
+fn sign(order: i32) -> i32 {
+    order.signum()
+}
 
 /// `memcmp`: the difference of the first differing bytes, else 0.
 fn memcmp(a: &[u8], b: &[u8]) -> i32 {
@@ -113,6 +123,11 @@ pub(crate) fn result_type(name: &str, nargs: usize) -> Option<&'static str> {
                 | "network_cmp"
                 | "gin_cmp_tslexeme"
                 | "gin_compare_jsonb"
+                | "bttextcmp"
+                | "bpcharcmp"
+                | "jsonb_cmp"
+                | "tsvector_cmp"
+                | "tsquery_cmp"
         ))
     .then_some("int4")
 }
@@ -144,6 +159,30 @@ pub(crate) fn call(name: &str, args: &[Bson]) -> Option<Result<Bson>> {
                 | "gin_compare_jsonb" => {
                     memcmp_then_length(text(&args[0]).as_bytes(), text(&args[1]).as_bytes())
                 }
+                "bttextcmp" => sign(memcmp_then_length(
+                    text(&args[0]).as_bytes(),
+                    text(&args[1]).as_bytes(),
+                )),
+                // A `char(n)` compares without its trailing blanks.
+                "bpcharcmp" => sign(memcmp_then_length(
+                    text(&args[0]).trim_end_matches(' ').as_bytes(),
+                    text(&args[1]).trim_end_matches(' ').as_bytes(),
+                )),
+                "jsonb_cmp" => {
+                    let order =
+                        json::jsonb_compare(&text(&args[0]), &text(&args[1])).ok_or_else(|| {
+                            Error::InvalidText("invalid input syntax for type json".into())
+                        })?;
+                    order as i32
+                }
+                "tsvector_cmp" => crate::fts::vector_cmp(
+                    &crate::fts::parse_vector(&text(&args[0]))?,
+                    &crate::fts::parse_vector(&text(&args[1]))?,
+                ),
+                "tsquery_cmp" => crate::fts::query_cmp(
+                    &crate::fts::parse_query(&text(&args[0]))?,
+                    &crate::fts::parse_query(&text(&args[1]))?,
+                ),
                 "btbpchar_pattern_cmp" => memcmp_then_length(
                     text(&args[0]).trim_end_matches(' ').as_bytes(),
                     text(&args[1]).trim_end_matches(' ').as_bytes(),

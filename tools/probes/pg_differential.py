@@ -279,7 +279,8 @@ class _RustServer:
         require_fresh_pgserver(binary)
         self.store_dir = tempfile.mkdtemp(prefix=f"secantus-probe-{os.getpid()}-pg-rust-")
         self.proc = subprocess.Popen(
-            [str(binary), self.store_dir, "127.0.0.1:0"],
+            # The probes connect as roles nobody creates (`probe`, the OS user).
+            [str(binary), self.store_dir, "127.0.0.1:0", "--trust-unknown-users"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

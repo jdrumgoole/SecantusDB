@@ -3024,9 +3024,10 @@ pub struct PgHandler {
     /// The database a login asked for is not there: said once the login
     /// has been proved, on a server with a `pg_hba.conf`.
     database_error: Mutex<Option<ErrorInfo>>,
-    /// Ask a user this server has no role for to prove a password, which it
-    /// cannot, where the default is to trust it.
-    refuse_unknown_users: bool,
+    /// Trust a user this server has no role for, as a role with no password
+    /// is trusted. By default such a user is asked for a password, which it
+    /// cannot prove, as PostgreSQL refuses a role that does not exist.
+    trust_unknown_users: bool,
     /// The database the startup packet named, once it has been checked
     /// against the registry; the registry's default until then.
     db: OnceLock<String>,
@@ -3571,7 +3572,7 @@ impl PgHandler {
             hba_rule: std::sync::OnceLock::new(),
             cleartext_auth: Mutex::new(None),
             database_error: Mutex::new(None),
-            refuse_unknown_users: false,
+            trust_unknown_users: false,
             db: OnceLock::new(),
             databases,
             txn: Arc::new(Mutex::new(None)),
@@ -3676,8 +3677,8 @@ impl PgHandler {
 
     /// A handler for a server that does, or does not, trust a user it has
     /// no role for.
-    pub(crate) fn with_refuse_unknown_users(mut self, refuse: bool) -> Self {
-        self.refuse_unknown_users = refuse;
+    pub(crate) fn with_trust_unknown_users(mut self, trust: bool) -> Self {
+        self.trust_unknown_users = trust;
         self
     }
 
@@ -5480,7 +5481,120 @@ impl PgHandler {
             })
             .collect::<PgWireResult<_>>()?;
 
-        self.finish_groups(agg, groups, max_rows)
+        // In the order PostgreSQL's HashAggregate emits them, when it would
+        // plan one (`hash_agg_order`): that is the order with no ORDER BY,
+        // and the order an ORDER BY's ties keep.
+        let rows: usize = buckets.iter().map(Vec::len).sum();
+        let mut groups = groups;
+        let hashed = match self.hash_agg_order(agg, &keys, rows) {
+            Some(order) => {
+                let mut slots: Vec<Option<_>> = groups.into_iter().map(Some).collect();
+                groups = order.into_iter().filter_map(|i| slots[i].take()).collect();
+                true
+            }
+            None => false,
+        };
+        self.finish_groups_from(agg, groups, max_rows, hashed)
+    }
+
+    /// The order PostgreSQL 15's HashAggregate would emit these groups in,
+    /// or `None` where this server does not yet model the plan: a GROUP BY
+    /// of bare columns over one table, no WHERE, no grouping sets, keys of a
+    /// type `hashfn` hashes, and a table that fits PostgreSQL's hash memory
+    /// (beyond it the planner weighs a sort, which is not modelled). The
+    /// table has no statistics, as PostgreSQL's has none until ANALYZE or
+    /// autovacuum: its rows and groups are the planner's defaults (`hashagg`).
+    fn hash_agg_order(
+        &self,
+        agg: &secantus_pgplan::Aggregate,
+        keys: &[Vec<Option<Bson>>],
+        rows: usize,
+    ) -> Option<Vec<usize>> {
+        use secantus_pgplan::hashagg;
+        if agg.series.is_some()
+            || agg.sub.is_some()
+            || agg.join.is_some()
+            || agg.grouping_sets.is_some()
+            || !agg.filter.is_empty()
+            || agg.group_by.is_empty()
+            || agg.group_by.iter().any(|k| k.expr.is_some())
+        {
+            return None;
+        }
+        let def = self
+            .all_table_defs()
+            .ok()?
+            .into_iter()
+            .find(|d| d.name == agg.table)?;
+        let width: i64 = def
+            .columns
+            .iter()
+            .map(|c| {
+                let typlen = secantus_pgplan::pgtypes::oid_of_name(&c.pg_type)
+                    .and_then(|oid| pg_type_facts::builtin(oid, "typlen"))
+                    .and_then(|v| match v {
+                        Bson::Int32(n) => Some(i64::from(n)),
+                        Bson::Int64(n) => Some(n),
+                        _ => None,
+                    })
+                    .unwrap_or(-1);
+                hashagg::type_avg_width(&c.pg_type, c.typmod, typlen)
+            })
+            .sum();
+        // The columns that are unique on their own: a one-column primary
+        // key, UNIQUE constraint or unique index.
+        let mut unique: Vec<String> = Vec::new();
+        let pk: Vec<&secantus_pgcatalog::Column> = def.columns.iter().filter(|c| c.pk).collect();
+        if pk.len() == 1 {
+            unique.push(pk[0].field());
+        }
+        for u in &def.unique_constraints {
+            if let [only] = u.columns.as_slice() {
+                if let Some(c) = def.column(only) {
+                    unique.push(c.field());
+                }
+            }
+        }
+        for ix in self
+            .storage
+            .list_indexes(self.db(), &agg.table)
+            .unwrap_or_default()
+        {
+            let is_unique = ix
+                .get_document("options")
+                .ok()
+                .and_then(|o| o.get_bool("unique").ok())
+                .or_else(|| ix.get_bool("unique").ok())
+                .unwrap_or(false);
+            if let (true, Ok(key)) = (is_unique, ix.get_document("key")) {
+                if key.len() == 1 {
+                    unique.extend(key.keys().cloned());
+                }
+            }
+        }
+        let stats: Vec<hashagg::KeyStat> = agg
+            .group_by
+            .iter()
+            .map(|k| {
+                if k.pg_type == "bool" {
+                    hashagg::KeyStat::Bool
+                } else if unique.contains(&k.field) {
+                    hashagg::KeyStat::Unique
+                } else {
+                    hashagg::KeyStat::Unknown
+                }
+            })
+            .collect();
+        let tuples = hashagg::table_rows(width, rows as u64);
+        let groups = hashagg::estimate_groups(&stats, tuples);
+        // `hash_mem` (work_mem 4MB x hash_mem_multiplier 2): past about
+        // 50,000 groups the hash table would not fit and the planner
+        // compares a sort, which is not modelled.
+        if groups > 50_000 {
+            return None;
+        }
+        let types: Vec<String> = agg.group_by.iter().map(|k| k.pg_type.clone()).collect();
+        hashagg::hash_agg_order(keys, &types, groups)
     }
 
     /// The grouped rows' ORDER BY, HAVING, DISTINCT, OFFSET and LIMIT.
@@ -5488,8 +5602,22 @@ impl PgHandler {
     fn finish_groups(
         &self,
         agg: &secantus_pgplan::Aggregate,
+        groups: Vec<(Vec<Option<Bson>>, Vec<Bson>)>,
+        max_rows: usize,
+    ) -> PgWireResult<Vec<(Vec<Option<Bson>>, Vec<Bson>)>> {
+        self.finish_groups_from(agg, groups, max_rows, false)
+    }
+
+    /// `finish_groups`, told whether the groups arrive in PostgreSQL's
+    /// HashAggregate order: then the ORDER BY sorts them with PostgreSQL's
+    /// quicksort, so ties land where PostgreSQL's do.
+    #[allow(clippy::type_complexity)]
+    fn finish_groups_from(
+        &self,
+        agg: &secantus_pgplan::Aggregate,
         mut groups: Vec<(Vec<Option<Bson>>, Vec<Bson>)>,
         max_rows: usize,
+        hashed: bool,
     ) -> PgWireResult<Vec<(Vec<Option<Bson>>, Vec<Bson>)>> {
         // Sort on the GROUP KEY, by index -- so `GROUP BY s ORDER BY s`
         // works even when `s` is not projected.
@@ -5528,7 +5656,11 @@ impl PgHandler {
             Ordering::Equal
         };
         if !agg.order.is_empty() {
-            groups.sort_by(order_cmp);
+            if hashed {
+                window_order::pg_qsort(&mut groups, &mut |a, b| order_cmp(a, b));
+            } else {
+                groups.sort_by(order_cmp);
+            }
         }
         // HAVING filters the GROUPS, before DISTINCT, ORDER BY and LIMIT see
         // them -- and after the aggregates are computed, which is the whole
@@ -18279,15 +18411,17 @@ impl StartupHandler for PgHandler {
 
         // A role that HAS a password must prove it -- SCRAM-SHA-256, as
         // PostgreSQL's default `password_encryption` stores it. A role with
-        // none, or a user this server has never heard of, is trusted, which is
-        // what keeps every fixture connecting as a password-less `postgres`
-        // working (PostgreSQL's `trust` for those).
+        // none is trusted, which is what keeps every fixture connecting as
+        // the password-less `postgres` working (PostgreSQL's `trust` for
+        // it). A user this server has never heard of is refused, as
+        // PostgreSQL refuses a role that does not exist, unless the server
+        // was told to trust such users (Joe, 2026-10-16).
         let user = client.metadata().get("user").cloned().unwrap_or_default();
         let role = self.role(&user)?;
         if self.hba.is_some() {
             return self.hba_login(client, user, role).await;
         }
-        if role.is_none() && self.refuse_unknown_users {
+        if role.is_none() && !self.trust_unknown_users {
             return self.refuse_unknown_user(client, user).await;
         }
         if let Some(role) = role {
@@ -26649,6 +26783,7 @@ impl PgHandler {
                         } else {
                             Nulls::First
                         },
+                        jsonb: false,
                         expr: None,
                     }]
                 }
@@ -37246,7 +37381,14 @@ fn compare_rows(a: &Document, b: &Document, order: &[OrderKey]) -> Ordering {
             },
             (false, false) => {
                 let (l, r) = (l.unwrap(), r.unwrap());
-                let mut cmp = compare_values(l, r);
+                let mut cmp = match (key.jsonb, l, r) {
+                    // jsonb is stored as its text, which orders differently.
+                    (true, Bson::String(a), Bson::String(b)) => {
+                        secantus_pgplan::json::jsonb_compare(a, b)
+                            .unwrap_or_else(|| compare_values(l, r))
+                    }
+                    _ => compare_values(l, r),
+                };
                 // A stored timestamp is a millisecond date plus its hidden
                 // sub-millisecond companion: equal dates are ordered by it
                 // (a missing one is 0). Sorting on the date alone put
@@ -41385,6 +41527,7 @@ impl PgHandler {
                 },
                 ascending: true,
                 nulls: Nulls::Last,
+                jsonb: false,
                 expr: None,
             })
             .collect();

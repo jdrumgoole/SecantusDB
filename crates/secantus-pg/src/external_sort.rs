@@ -360,6 +360,7 @@ mod tests {
             field: "k".into(),
             ascending: false,
             nulls: Nulls::First,
+            jsonb: false,
             expr: None,
         }];
         let data = rows(n);
@@ -426,6 +427,7 @@ mod tests {
             field: "k".into(),
             ascending: true,
             nulls: Nulls::Last,
+            jsonb: false,
             expr: None,
         }];
         // 120,000 rows over 101 keys: spilled runs, duplicates across them.

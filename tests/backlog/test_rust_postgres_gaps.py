@@ -113,12 +113,12 @@ def _connect_error(port: int, conninfo: str) -> str:
     return "connected"
 
 
-@pytest.mark.backlog("RP-013")
+@pytest.mark.backlog_fixed("RP-013")
 def test_unknown_user_is_asked_for_a_password(rust_pg: Any) -> None:
     """PostgreSQL 15.19 (a scram-sha-256 cluster): a role nobody created is
     asked for a password and fails `password authentication failed for user
-    "rp013_nobody"`. Here it is trusted by default (the item calls that a
-    decision; `--refuse-unknown-users` is the PostgreSQL answer)."""
+    "rp013_nobody"`. The server's default since Joe's decision of 2026-10-16
+    (`--trust-unknown-users` is the opt-out)."""
     assert _connect_error(rust_pg.port, "user=rp013_nobody password=x dbname=postgres") == (
         'password authentication failed for user "rp013_nobody"'
     )
@@ -286,7 +286,7 @@ def _same_as_reference(pg: Any, pg15: Any, sql: str) -> None:
     assert pg_answer(pg, sql) == pg_answer(pg15, sql)
 
 
-@pytest.mark.backlog("RP-015")
+@pytest.mark.backlog_fixed("RP-015")
 def test_strcoll_compares_answer_the_sign(pg: Any, pg15: Any) -> None:
     """PostgreSQL 15.19: `bttextcmp` / `bpcharcmp` / `jsonb_cmp` and
     `tsvector_cmp` / `tsquery_cmp` order as below. Only the SIGN is compared
@@ -435,7 +435,7 @@ def test_window_rows_come_out_in_window_sort_order(pg: Any) -> None:
     assert pg_answer(pg, sql) == ("ok", [(3, 1), (2, 2), (1, 3)])
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_grouped_output_ties_as_postgres_leaves_them(pg: Any) -> None:
     """PostgreSQL 15.19: groups tied under ORDER BY come out in the order its
     HashAggregate produced them -- `(0, 6), (1, 6)` here; this server's
@@ -445,6 +445,30 @@ def test_grouped_output_ties_as_postgres_leaves_them(pg: Any) -> None:
     pg.execute("insert into rp028_g select i, i % 2 from generate_series(1, 12) i")
     got = pg_answer(pg, "select g, count(*) from rp028_g group by g order by count(*)")
     assert got == ("ok", [(0, 6), (1, 6)])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_group_by_rows_come_out_in_hash_aggregate_order(pg: Any) -> None:
+    """PostgreSQL 15.19: with no ORDER BY, a GROUP BY it plans as a
+    HashAggregate returns the groups in its hash table's order --
+    9 3 5 4 0 10 6 2 7 1 8 here, not the order the groups first appear."""
+    pg.execute("drop table if exists rp028_h")
+    pg.execute("create table rp028_h (k int, g int)")
+    pg.execute("insert into rp028_h select i, (i * 7) % 11 from generate_series(1, 40) i")
+    got = pg_answer(pg, "select g from rp028_h group by g")
+    assert got == ("ok", [(g,) for g in [9, 3, 5, 4, 0, 10, 6, 2, 7, 1, 8]])
+
+
+@pytest.mark.backlog("RP-028")
+def test_distinct_rows_come_out_in_hash_aggregate_order(pg: Any) -> None:
+    """PostgreSQL 15.19: `SELECT DISTINCT` is a HashAggregate too, and
+    returns 9 3 5 4 0 10 6 2 7 1 8 for the table above; here DISTINCT keeps
+    the order the values first appear."""
+    pg.execute("drop table if exists rp028_d")
+    pg.execute("create table rp028_d (k int, g int)")
+    pg.execute("insert into rp028_d select i, (i * 7) % 11 from generate_series(1, 40) i")
+    got = pg_answer(pg, "select distinct g from rp028_d")
+    assert got == ("ok", [(g,) for g in [9, 3, 5, 4, 0, 10, 6, 2, 7, 1, 8]])
 
 
 @pytest.mark.backlog_fixed("RP-028")
@@ -1061,3 +1085,16 @@ def test_mixed_case_type_is_found_only_as_written(pg: Any) -> None:
     finally:
         pg.execute("rollback")
     assert reached == ("ok", [(5,)]) and folded[:2] == ("err", "42704")
+
+
+@pytest.mark.backlog("RP-044")
+def test_each_empty_tsquery_raises_its_own_notice(pg: Any) -> None:
+    """PostgreSQL 15.19: every empty tsquery evaluated raises its own
+    `text-search query doesn't contain lexemes: ""` NOTICE, so a statement
+    casting two of them gets two. Here a statement's planner notices are
+    deduplicated (it is planned for Describe and for Execute), and it gets
+    one."""
+    got: list[str] = []
+    pg.add_notice_handler(lambda d: got.append(d.message_primary))
+    pg.execute("select ''::tsquery, ''::tsquery").fetchall()
+    assert got == ['text-search query doesn\'t contain lexemes: ""'] * 2

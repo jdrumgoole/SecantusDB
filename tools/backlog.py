@@ -125,6 +125,19 @@ def parse(name: str) -> list[Item]:
     return items
 
 
+def retired_ids(prefix: str) -> list[int]:
+    """The numbers of every `prefix` ID the tests and changelogs mention."""
+    root = TASKS.parent
+    pattern = re.compile(rf"\b{re.escape(prefix)}-(\d+)\b")
+    paths = [*sorted((root / "tests").rglob("*.py")), *sorted((root / "changelog.d").glob("*.md"))]
+    paths.append(root / "docs" / "changelog.md")
+    found: list[int] = []
+    for path in paths:
+        if path.is_file():
+            found += [int(n) for n in pattern.findall(path.read_text(encoding="utf-8"))]
+    return found
+
+
 def assign_ids() -> int:
     """Give every open item without a Backlog-ID the next free one."""
     added = 0
@@ -132,6 +145,10 @@ def assign_ids() -> int:
         path = TASKS / name
         items = parse(name)
         used = [int(it.id.split("-")[1]) for it in items if it.id]
+        # An ID is permanent and never reused, and a closed item's lives on
+        # only in its regression test's marker and the changelogs: counting
+        # the open items alone handed RP-029 out a second time.
+        used += retired_ids(prefix)
         nxt = max(used, default=0) + 1
         lines = path.read_text(encoding="utf-8").splitlines()
         # Number top-down; insert bottom-up so earlier line numbers hold.

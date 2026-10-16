@@ -134,7 +134,7 @@ def test_binary_reports_its_version() -> None:
 def test_binary_serves_psycopg_and_exits_cleanly(daemon: subprocess.Popen[str]) -> None:
     host, port = _bound_address(daemon)
     conn = psycopg.connect(
-        f"host={host} port={port} dbname=postgres user=smoke",
+        f"host={host} port={port} dbname=postgres user=postgres",
         autocommit=True,
         connect_timeout=30,
     )
@@ -204,7 +204,7 @@ def test_binary_serves_tls(tmp_path: pathlib.Path) -> None:
             host=host,
             port=port,
             dbname="postgres",
-            user="smoke",
+            user="postgres",
             # The strictest mode: the chain is verified against the CA and
             # the certificate's name against the host.
             sslmode="verify-full",
@@ -245,7 +245,7 @@ def test_data_survives_a_restart(tmp_path: pathlib.Path) -> None:
         try:
             host, port = _bound_address(proc)
             with psycopg.connect(
-                f"host={host} port={port} dbname=postgres user=smoke",
+                f"host={host} port={port} dbname=postgres user=postgres",
                 autocommit=True,
                 connect_timeout=30,
             ) as conn:

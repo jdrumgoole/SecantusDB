@@ -1,6 +1,6 @@
 ---
 name: backlog
-description: The SecantusDB backlog protocol — how an item is filed, verified, worked and closed, and how the whole backlog is checked against the running servers. Fires when adding to or editing `tasks/backlog-*.md`, when you stub something, defer a slice or find a limitation, when you start or finish a backlog item, on "verify the backlog", "is this item still open", "check the backlog", and before quoting a backlog item as fact.
+description: The SecantusDB backlog protocol — how an item is filed, verified, worked and closed, and how the whole backlog is checked against the running servers. Fires when adding to or editing `tasks/backlog-*.md`, when you stub something, defer a slice or find a limitation, when you start or finish a backlog item, when an item needs a decision or one has been made, when you fold, retire or file an item found in passing, on "verify the backlog", "is this item still open", "check the backlog", and before quoting a backlog item as fact.
 ---
 
 # The backlog is a set of failing tests with prose attached
@@ -99,6 +99,83 @@ the helpers (`mongo_answer`, `pg_answer`) that turn an error into a value.
    re-mark the passing tests `backlog_fixed`, and leave only the failing
    ones on its `Verify:` line.
 
+## Other ways an item ends
+
+- **Folded into another**: when two items have one cause and one fix
+  (RP-043's cursor scroll and RP-028's tie order were both the planner's
+  cost model), move the prose into the surviving item with `(This was
+  RP-043.)`, move its tests onto the survivor's `Verify:` line, re-mark
+  them with the survivor's ID, and delete the folded item. Its ID stays
+  retired.
+- **Nothing left that is a divergence**: when what remains is not a wrong
+  answer (RP-015's last bullet was XML output that differed only because the
+  two databases hold different objects), delete the item, keep its
+  regression tests, and write any rule the work settled as a `Scope
+  decision` bullet.
+- **A remainder no test can check**: point `Verify:` at `none -- <what is
+  left>`, never at a test that now passes -- a passing gap test on the line
+  reads as `FIXED?` and hides the remainder.
+
+## Decisions
+
+Most items are work; some are a choice that belongs to Joe. It is a
+decision when the fix would:
+
+- stand in for the real product's mechanism rather than reproduce it
+  (CLAUDE.md: "We always choose the Postgres model"), or answer only part
+  of what the real product answers (a sign where PostgreSQL gives a
+  platform-dependent magnitude);
+- commit a generated artifact (baked data, a profile, a vendored blob);
+- change a default that tests, fixtures or users rely on (trusting unknown
+  users);
+- pick between two answers the real product itself gives (two OpenSSL
+  versions, two platforms).
+
+Then:
+
+1. **Size it from a probe first** -- what it would cost, what it would fix,
+   what it would not -- and write that into the item under `**Decision
+   needed (date):**`, with the options. A decision asked without the
+   measurement gets the wrong answer.
+2. **Ask Joe one decision at a time** (`AskUserQuestion`, two to four
+   options, a recommendation first and why), not as a list in prose.
+3. **Record the answer in the item**: replace the paragraph with
+   `**Decided (Joe, date): …**` saying what to build. The item is then
+   ordinary work. If the decision changes what "correct" means (sign
+   only), restate the gap test to assert exactly that, against the real
+   product -- that is the decision applied, not the test weakened.
+4. **Measure before building what was decided.** A decision made on an
+   estimate can still be cheaper or dearer than it looked: RP-005's
+   generated data fixed seven languages and not the three that turned out
+   to be ICU4X's collator, not its data.
+
+## Found while working
+
+A divergence found in passing -- by a probe, a matrix, a corpus -- is filed
+the moment it is confirmed, with its gap test, even if it is fixed in the
+same batch: the gap test is the proof, and an unfiled bug fixed silently
+leaves no trail. Fix it in the batch when it is a silent wrong answer and
+small (jsonb `ORDER BY`, found while building `jsonb_cmp`); otherwise file
+it and move on (RP-044, notice deduplication).
+
+## Measuring against the reference
+
+- **Never change the shared reference servers.** A gap test or probe that
+  needs objects creates them inside a rolled-back transaction; a corpus
+  that needs none uses `VALUES` lists and a `.setup.sql` of `SELECT 1`.
+- **Prove a new corpus or matrix is not vacuous**: run it against a build
+  WITHOUT the fix and see it diverge (`jsonb_order.sql`: 9 of 9 diverging
+  before, 0 after). Two sides failing alike reads as agreement.
+- **The reference's answer can depend on how it was built.** CI's
+  PostgreSQL 15.19 links OpenSSL 3.0.13 and the macOS one 3.6.3, and a
+  root-issued scoped CRL is refused by one and accepted by the other. Find
+  the cause (`openssl verify` with each version reproduced it), make the
+  probe use a shape both builds agree on, and record in the item which
+  behaviour this server follows.
+- **Do not edit the backlog or `tests/backlog/` while a verifier or suite
+  run is going** -- it reads them -- and do not commit under a run that
+  checks provenance: the binary goes stale and every probe aborts.
+
 ## Verifying the backlog
 
 ```bash
@@ -130,5 +207,12 @@ is how the same thing gets built twice.
 - **Never tick, never keep a finished record.** History lives in git and
   `changelog.d/`.
 - **Correct a superseded item; do not add a newer one beside it.**
+- **An ID is never reused.** A closed item's ID lives on in its regression
+  test's marker and the changelogs; `tools/backlog.py ids` counts those
+  (it once took the highest OPEN ID and handed out a closed RP-029 again).
+  Check `git log -S'RP-nnn'` when in doubt.
+- **Edit the backlog by anchored spans and read the removed lines**
+  (`git diff … | grep '^-'`) before committing: slicing between two
+  markers has silently deleted neighbouring items.
 - The Python servers' files are deprecated: no new items, no IDs, not
   verified.

@@ -3015,6 +3015,198 @@ pub fn rank_cd(weights: Option<[f32; 4]>, v: &TsVector, q: &Option<Query>, metho
     wdoc as f32
 }
 
+// ------------------------------------------------------------------------
+// tsvector_cmp / tsquery_cmp: the types' storage layouts compared
+// ------------------------------------------------------------------------
+
+/// `tsCompareString`'s order: the bytes over the shorter length, then the
+/// shorter first.
+fn ts_compare_string(a: &str, b: &str) -> std::cmp::Ordering {
+    a.as_bytes().cmp(b.as_bytes())
+}
+
+/// A tsvector's `VARSIZE` (`CALCDATASIZE` over `uniqueentry`'s string
+/// space): an 8-byte header, a 4-byte entry per lexeme, then each lexeme's
+/// bytes and -- when it has positions -- a short-aligned count and its
+/// 2-byte positions.
+fn vector_size(v: &TsVector) -> usize {
+    let mut buflen = 0usize;
+    for (lexeme, positions) in &v.0 {
+        buflen += lexeme.len();
+        if !positions.is_empty() {
+            buflen = (buflen + 1) & !1;
+            buflen += positions.len() * 2 + 2;
+        }
+    }
+    8 + v.0.len() * 4 + buflen
+}
+
+/// `tsvector_cmp` (`silly_cmp_tsvector`, `tsvector_op.c`), as its sign: the
+/// stored size, then the lexeme count, then lexeme by lexeme -- one with
+/// positions BEFORE one without, the strings, more positions first, and
+/// each position and weight with the GREATER first.
+pub fn vector_cmp(a: &TsVector, b: &TsVector) -> i32 {
+    use std::cmp::Ordering::*;
+    let order = vector_size(a)
+        .cmp(&vector_size(b))
+        .then(a.0.len().cmp(&b.0.len()));
+    if order != Equal {
+        return order as i32;
+    }
+    for ((la, pa), (lb, pb)) in a.0.iter().zip(&b.0) {
+        let (ha, hb) = (!pa.is_empty(), !pb.is_empty());
+        if ha != hb {
+            return if ha { -1 } else { 1 };
+        }
+        let order = ts_compare_string(la, lb);
+        if order != Equal {
+            return order as i32;
+        }
+        if pa.len() != pb.len() {
+            return if pa.len() > pb.len() { -1 } else { 1 };
+        }
+        for (&(xa, wa), &(xb, wb)) in pa.iter().zip(pb) {
+            if xa != xb {
+                return if xa > xb { -1 } else { 1 };
+            }
+            if wa != wb {
+                return if wa > wb { -1 } else { 1 };
+            }
+        }
+    }
+    0
+}
+
+/// PostgreSQL's "legacy" CRC-32 (`COMP_LEGACY_CRC32`): the reflected
+/// table driven by the left-shifting code, which is not any standard CRC.
+/// It is the operand checksum a tsquery stores (`valcrc`).
+fn legacy_crc32(bytes: &[u8]) -> u32 {
+    fn table() -> &'static [u32; 256] {
+        static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+        TABLE.get_or_init(|| {
+            let mut t = [0u32; 256];
+            for (i, slot) in t.iter_mut().enumerate() {
+                let mut c = i as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 {
+                        0xEDB8_8320 ^ (c >> 1)
+                    } else {
+                        c >> 1
+                    };
+                }
+                *slot = c;
+            }
+            t
+        })
+    }
+    let t = table();
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in bytes {
+        let index = (((crc >> 24) as u8) ^ byte) as usize;
+        crc = t[index] ^ (crc << 8);
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+/// A tsquery's items and operand bytes: `size` and the operand string space
+/// (each lexeme and its terminating NUL).
+fn query_counts(q: &Query) -> (usize, usize) {
+    match q {
+        Query::Val { lex, .. } => (1, lex.len() + 1),
+        Query::Stop => (1, 0),
+        Query::Not(x) => {
+            let (n, s) = query_counts(x);
+            (n + 1, s)
+        }
+        Query::And(l, r) | Query::Or(l, r) | Query::Phrase(l, r, _) => {
+            let (nl, sl) = query_counts(l);
+            let (nr, sr) = query_counts(r);
+            (nl + nr + 1, sl + sr)
+        }
+    }
+}
+
+/// `QTNodeCompare` (`tsquery_util.c`): an operator before an operand, then
+/// by operator code with the HIGHER first (NOT 1, AND 2, OR 3, PHRASE 4),
+/// the children -- the stored RIGHT argument first, as `findoprnd` lays it
+/// out -- and a phrase's distance with the greater first; an operand by its
+/// checksum (as a signed 32-bit number, greater first) and then its bytes.
+fn node_cmp(a: &Query, b: &Query) -> i32 {
+    fn code(q: &Query) -> (u8, u8) {
+        match q {
+            Query::Val { .. } | Query::Stop => (1, 0),
+            Query::Not(_) => (2, 1),
+            Query::And(..) => (2, 2),
+            Query::Or(..) => (2, 3),
+            Query::Phrase(..) => (2, 4),
+        }
+    }
+    fn children(q: &Query) -> Vec<&Query> {
+        match q {
+            Query::Not(x) => vec![x],
+            Query::And(l, r) | Query::Or(l, r) | Query::Phrase(l, r, _) => vec![r, l],
+            _ => Vec::new(),
+        }
+    }
+    let ((ta, oa), (tb, ob)) = (code(a), code(b));
+    if ta != tb {
+        return if ta > tb { -1 } else { 1 };
+    }
+    if ta == 2 {
+        if oa != ob {
+            return if oa > ob { -1 } else { 1 };
+        }
+        let (ca, cb) = (children(a), children(b));
+        if ca.len() != cb.len() {
+            return if ca.len() > cb.len() { -1 } else { 1 };
+        }
+        for (x, y) in ca.iter().zip(&cb) {
+            let order = node_cmp(x, y);
+            if order != 0 {
+                return order;
+            }
+        }
+        if let (Query::Phrase(_, _, da), Query::Phrase(_, _, db)) = (a, b) {
+            if da != db {
+                return if da > db { -1 } else { 1 };
+            }
+        }
+        return 0;
+    }
+    let lexeme = |q: &Query| match q {
+        Query::Val { lex, .. } => lex.clone(),
+        _ => String::new(),
+    };
+    let (la, lb) = (lexeme(a), lexeme(b));
+    let (ca, cb) = (
+        legacy_crc32(la.as_bytes()) as i32,
+        legacy_crc32(lb.as_bytes()) as i32,
+    );
+    if ca != cb {
+        return if ca > cb { -1 } else { 1 };
+    }
+    ts_compare_string(&la, &lb) as i32
+}
+
+/// `tsquery_cmp` (`CompareTSQ`, `tsquery_op.c`), as its sign: the item
+/// count, then the stored size (an 8-byte header, 12 bytes an item, the
+/// operand bytes), then the trees.
+pub fn query_cmp(a: &Option<Query>, b: &Option<Query>) -> i32 {
+    let counts = |q: &Option<Query>| q.as_ref().map_or((0, 0), query_counts);
+    let ((na, sa), (nb, sb)) = (counts(a), counts(b));
+    if na != nb {
+        return if na < nb { -1 } else { 1 };
+    }
+    let (va, vb) = (8 + na * 12 + sa, 8 + nb * 12 + sb);
+    if va != vb {
+        return if va < vb { -1 } else { 1 };
+    }
+    match (a, b) {
+        (Some(x), Some(y)) => node_cmp(x, y),
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

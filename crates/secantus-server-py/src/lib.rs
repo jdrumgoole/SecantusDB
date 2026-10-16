@@ -267,7 +267,12 @@ impl PgServer {
     ///   `tls_client_cert` what a client must send: `"verify-ca"`,
     ///   `"verify-full"` or `"cert"`.
     /// * `tls_require` -- refuse a connection that is not TLS.
-    /// * `refuse_unknown_users` -- refuse a user there is no role for.
+    /// * `trust_unknown_users` -- let a user there is no role for connect
+    ///   without a password, as a role with no password does. By default
+    ///   such a user is refused, as PostgreSQL refuses a role that does not
+    ///   exist: connect as `postgres`, create the role, or set this.
+    /// * `refuse_unknown_users` -- the old opt-in for that default; accepted
+    ///   and changes nothing.
     /// * `tls_crl_file` -- PEM revocation lists a client certificate is
     ///   checked against (`ssl_crl_file`).
     /// * `tls_client_name` -- `"CN"` (default) or `"DN"`: what of a client
@@ -278,7 +283,7 @@ impl PgServer {
     /// * `hba_file` / `ident_file` -- a `pg_hba.conf`, whose lines then decide
     ///   every login, and the `pg_ident.conf` its `map=` options name. The
     ///   file takes the place of `tls_require`, `tls_client_cert` and
-    ///   `refuse_unknown_users`; giving one beside it is an error.
+    ///   `trust_unknown_users`; giving one beside it is an error.
     #[new]
     #[pyo3(signature = (
         storage_path,
@@ -297,6 +302,7 @@ impl PgServer {
         tls_client_name = None,
         tls_ident_file = None,
         tls_user_map = None,
+        trust_unknown_users = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -316,6 +322,7 @@ impl PgServer {
         tls_client_name: Option<String>,
         tls_ident_file: Option<String>,
         tls_user_map: Option<String>,
+        trust_unknown_users: bool,
     ) -> PyResult<Self> {
         // The options are checked before the store is opened, so a mistake in
         // them costs no WiredTiger open and leaves no directory behind.
@@ -377,7 +384,10 @@ impl PgServer {
         };
         let mut options = ServerOptions::default()
             .tls(tls)
-            .refuse_unknown_users(refuse_unknown_users);
+            .trust_unknown_users(trust_unknown_users);
+        // The default since 0.1.0-beta.17: accepted so a caller that asked
+        // for it still starts.
+        let _ = refuse_unknown_users;
         if let Some(path) = hba_file {
             options = options.hba_file(path);
         }

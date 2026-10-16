@@ -258,19 +258,24 @@ names beside the `pg_hba.conf`, as PostgreSQL 15 does. `samehost`
 and `samenet` match by this host's interface addresses and their networks,
 as PostgreSQL's do.
 `--hba-file` cannot be given with `--tls-require`, `--tls-client-cert`,
-`--tls-client-name`, `--tls-user-map` or `--refuse-unknown-users`: the file
+`--tls-client-name`, `--tls-user-map` or `--trust-unknown-users`: the file
 says what those say.
 
 A password file (`~/.pgpass`, or libpq's `passfile`) works as it does with
 PostgreSQL. It is read by the client library, which sends the password it
 finds there; the server sees an ordinary password login.
 
-A user name there is no role for connects without a password, as a role
-with no password does. `--refuse-unknown-users` (since 0.1.0-beta.11) stops
-that: such a user is asked for a password, as PostgreSQL asks one under a
-`scram-sha-256` line, and none it gives is right. A role with no password
-still connects without one, so give `postgres` a password
+A user name there is no role for is refused, as PostgreSQL refuses a role
+that does not exist: it is asked for a password, as PostgreSQL asks one
+under a `scram-sha-256` line, and none it gives is right. Connect as
+`postgres`, create the role first, or start the server with
+`--trust-unknown-users` (`trust_unknown_users=True` on the embedded
+handles), which lets such a user in without a password. A role with no
+password connects without one, so give `postgres` a password
 (`ALTER ROLE postgres PASSWORD '...'`) and every login then needs one.
+Until 0.1.0-beta.17 unknown users were trusted by default and
+`--refuse-unknown-users` refused them; that flag is still accepted, and
+changes nothing.
 
 The Python one needs the `sql` extra (`pip install "SecantusDB[sql]"`) and
 runs as `secantusd-py-pg`:
