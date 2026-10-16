@@ -385,14 +385,22 @@ one beside it.
     tenth of the rows; 96 of 96 shapes match 15.19; this was RP-043), and
     the order a join of two tables on one equality emits its rows: a
     merge join's sides in key order, ties as each side's quicksort leaves
-    them; a hash join's matches in its bucket's order (33 of 33). Not yet:
-    a WHERE, which is applied over the joined rows rather than to a side
-    before its sort; an expression or several join keys; nested loops;
-    more than two tables; a join of more than 200,000 rows a side, which
-    streams in scan order.
+    them; a hash join's matches in its bucket's order (33 of 33). Under a
+    WHERE each side is filtered by its own conjuncts before it is put in
+    order, the plan is priced with them (either side outer, `add_path`'s
+    startup costs, and under a LIMIT the fractional cost, where a nested
+    loop over a materialised inner usually wins), and a WHERE no
+    NULL-extended row passes makes a LEFT join inner (159 of 159 shapes
+    at 20, 300 and 3,000 rows). Not yet: an expression or several join keys
+    (a WHERE comparing the two sides is a second key); an equality on a
+    join key, which PostgreSQL's equivalence class turns into a filter on
+    both sides; parameterized nested loops (an index scan inner); a LIMIT
+    over the general join path, or with an ORDER BY; more than two
+    tables; a join of more than 200,000 rows a side, which streams in
+    scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_merge_join_under_a_where_sorts_the_rows_it_keeps
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_merge_join_on_an_expression_sorts_by_its_value
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

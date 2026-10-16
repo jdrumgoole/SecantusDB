@@ -166,6 +166,11 @@ thread_local! {
     /// its join is built (see `pushdown_filters`).
     static PUSHDOWN: std::cell::RefCell<Vec<(String, pg_query::protobuf::Node)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The aliases the WHERE of the join being built proves non-NULL (see
+    /// `pushdown_filters`): a LEFT join whose nullable side holds one is an
+    /// inner join (`reduce_outer_joins`).
+    static NONNULLABLE: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Join sources planned for the statement in flight, by placeholder name.
     static PLANNED_JOINS: std::cell::RefCell<Vec<(String, SubSource)>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -201,9 +206,12 @@ pub(crate) fn plan_join_source(
     params: &[Bson],
 ) -> Result<pg_query::protobuf::SelectStmt> {
     // A nested join (one inside a FROM subquery) plans with its own.
-    let outer_pushdown = PUSHDOWN.with(|p| p.replace(pushdown_filters(s)));
+    let (pushdown, nonnullable) = pushdown_filters(s, lookup);
+    let outer_pushdown = PUSHDOWN.with(|p| p.replace(pushdown));
+    let outer_nonnullable = NONNULLABLE.with(|p| p.replace(nonnullable));
     let built = build_tree(s, lookup, params);
     PUSHDOWN.with(|p| *p.borrow_mut() = outer_pushdown);
+    NONNULLABLE.with(|p| *p.borrow_mut() = outer_nonnullable);
     let (tree, scope) = built?;
     finish_join_source(s, tree, scope)
 }
@@ -895,6 +903,17 @@ fn build_join(
     visible.cols.extend(lscope.cols.iter().cloned());
     visible.aliases.extend(lscope.aliases.iter().cloned());
     let (right, rscope) = build(rarg, lookup, params, aliases, Some(&visible))?;
+    // `reduce_outer_joins`: a WHERE that cannot hold for a NULL-extended row
+    // makes a LEFT join an inner one, which PostgreSQL then plans as such.
+    let kind = if kind == JoinKind::Left
+        && NONNULLABLE.with(|n| {
+            let n = n.borrow();
+            rscope.cols.iter().any(|c| n.contains(&c.alias))
+        }) {
+        JoinKind::Inner
+    } else {
+        kind
+    };
     if matches!(right, JoinNode::Lateral { .. }) && matches!(kind, JoinKind::Right | JoinKind::Full)
     {
         return Err(Error::Sqlstate(
@@ -1298,31 +1317,187 @@ pub(crate) const SELECT_LIST_SRFS: &[&str] = &[
 /// PostgreSQL's WHERE drops. The conjunct also stays in the outer WHERE, so
 /// the answer is the same whether or not the leaf applied it -- the leaf
 /// just reads fewer rows, and can reach an index.
-fn pushdown_filters(s: &pg_query::protobuf::SelectStmt) -> Vec<(String, pg_query::protobuf::Node)> {
+#[allow(clippy::type_complexity)]
+fn pushdown_filters(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> (Vec<(String, pg_query::protobuf::Node)>, Vec<String>) {
     let Some(w) = s.where_clause.as_deref() else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
-    let mut preserved = Vec::new();
-    for item in &s.from_clause {
-        preserved_aliases(item, false, &mut preserved);
-    }
+    // An unqualified column belongs to the one table in the FROM that has
+    // it (`colNameToVar`); one two tables have is PostgreSQL's 42702, left
+    // to the planner of the rewritten query. Known only when every item is
+    // a stored table: a subquery's or a function's columns, or a CTE that
+    // shadows a table's name, are not looked up here.
+    let mut tables = Vec::new();
+    let bare_known = s.with_clause.is_none()
+        && s.from_clause
+            .iter()
+            .all(|item| stored_tables(item, lookup, &mut tables));
+    let owner = |col: &str| -> Option<String> {
+        if !bare_known {
+            return None;
+        }
+        let mut owners = tables
+            .iter()
+            .filter(|(_, def): &&(String, TableDef)| def.column(col).is_some());
+        let (alias, _) = owners.next()?;
+        owners.next().is_none().then(|| alias.clone())
+    };
     let mut conjuncts = Vec::new();
     split_and(w, &mut conjuncts);
-    conjuncts
+    let nonnullable: Vec<String> = conjuncts
+        .iter()
+        .flat_map(|c| strict_aliases(c, &owner))
+        .collect();
+    let mut preserved = Vec::new();
+    for item in &s.from_clause {
+        preserved_aliases(item, false, &nonnullable, &mut preserved);
+    }
+    let pushed = conjuncts
         .into_iter()
         .filter_map(|c| {
-            let alias = single_alias(c)?;
+            let alias = single_alias(c, &owner)?;
             preserved.contains(&alias).then(|| {
                 let mut c = c.clone();
                 strip_qualifier(&mut c);
                 (alias, c)
             })
         })
-        .collect()
+        .collect();
+    (pushed, nonnullable)
+}
+
+/// The aliases a WHERE conjunct is false or NULL for when their columns are
+/// NULL (`find_nonnullable_rels`): a comparison's columns, under a cast or
+/// not, and an `IS NOT NULL`'s. Anything else proves nothing here.
+fn strict_aliases(
+    n: &pg_query::protobuf::Node,
+    owner: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    use pg_query::protobuf::{AExprKind, NullTestType};
+    fn column(
+        n: &pg_query::protobuf::Node,
+        owner: &dyn Fn(&str) -> Option<String>,
+        out: &mut Vec<String>,
+    ) -> bool {
+        match n.node.as_ref() {
+            Some(N::ColumnRef(c)) => {
+                let parts: Option<Vec<&str>> = c
+                    .fields
+                    .iter()
+                    .map(|f| match f.node.as_ref() {
+                        Some(N::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let alias = match parts.as_deref() {
+                    Some([q, _]) => Some(q.to_string()),
+                    Some([name]) => owner(name),
+                    _ => None,
+                };
+                if let Some(a) = alias {
+                    out.push(a);
+                }
+                true
+            }
+            Some(N::AConst(_)) | Some(N::ParamRef(_)) => true,
+            Some(N::TypeCast(t)) => t.arg.as_deref().is_some_and(|a| column(a, owner, out)),
+            _ => false,
+        }
+    }
+    let mut out = Vec::new();
+    let strict = match n.node.as_ref() {
+        Some(N::AExpr(e))
+            if e.kind == AExprKind::AexprOp as i32
+                && matches!(
+                    crate::operator_name(e),
+                    Ok("=" | "<>" | "<" | "<=" | ">" | ">=")
+                ) =>
+        {
+            match (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+                (Some(l), Some(r)) => column(l, owner, &mut out) && column(r, owner, &mut out),
+                _ => false,
+            }
+        }
+        Some(N::NullTest(t)) if t.nulltesttype == NullTestType::IsNotNull as i32 => {
+            t.arg.as_deref().is_some_and(|a| column(a, owner, &mut out))
+        }
+        _ => false,
+    };
+    if strict {
+        out
+    } else {
+        Vec::new()
+    }
+}
+
+/// Each stored table below `item`, by alias, with its definition; `false`
+/// when anything else is there.
+fn stored_tables(
+    item: &pg_query::protobuf::Node,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    out: &mut Vec<(String, TableDef)>,
+) -> bool {
+    match item.node.as_ref() {
+        // Column aliases (`t AS x(a, b)`) rename the table's columns.
+        Some(N::RangeVar(r))
+            if r.schemaname.is_empty()
+                && r.alias.as_ref().is_none_or(|a| a.colnames.is_empty()) =>
+        {
+            let Some(def) = lookup(&r.relname) else {
+                return false;
+            };
+            let alias = r
+                .alias
+                .as_ref()
+                .map(|a| a.aliasname.clone())
+                .filter(|a| !a.is_empty())
+                .unwrap_or_else(|| r.relname.clone());
+            out.push((alias, def));
+            true
+        }
+        Some(N::JoinExpr(j)) => {
+            j.larg
+                .as_deref()
+                .is_some_and(|l| stored_tables(l, lookup, out))
+                && j.rarg
+                    .as_deref()
+                    .is_some_and(|r| stored_tables(r, lookup, out))
+        }
+        _ => false,
+    }
 }
 
 /// The table aliases below `item` that no outer join makes nullable.
-fn preserved_aliases(item: &pg_query::protobuf::Node, nullable: bool, out: &mut Vec<String>) {
+/// Every table alias below `item`.
+fn table_aliases(item: &pg_query::protobuf::Node, out: &mut Vec<String>) {
+    match item.node.as_ref() {
+        Some(N::RangeVar(r)) => out.push(
+            r.alias
+                .as_ref()
+                .map(|a| a.aliasname.clone())
+                .filter(|a| !a.is_empty())
+                .unwrap_or_else(|| r.relname.clone()),
+        ),
+        Some(N::JoinExpr(j)) => {
+            for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                table_aliases(side, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A LEFT join whose nullable side holds a `nonnullable` alias counts as
+/// an inner one (`reduce_outer_joins`).
+fn preserved_aliases(
+    item: &pg_query::protobuf::Node,
+    nullable: bool,
+    nonnullable: &[String],
+    out: &mut Vec<String>,
+) {
     use pg_query::protobuf::JoinType;
     match item.node.as_ref() {
         Some(N::RangeVar(r)) if !nullable => out.push(
@@ -1335,15 +1510,21 @@ fn preserved_aliases(item: &pg_query::protobuf::Node, nullable: bool, out: &mut 
         Some(N::JoinExpr(j)) => {
             let (l, r) = match JoinType::try_from(j.jointype) {
                 Ok(JoinType::JoinInner) => (false, false),
-                Ok(JoinType::JoinLeft) => (false, true),
+                Ok(JoinType::JoinLeft) => {
+                    let mut below = Vec::new();
+                    if let Some(rarg) = j.rarg.as_deref() {
+                        table_aliases(rarg, &mut below);
+                    }
+                    (false, !below.iter().any(|a| nonnullable.contains(a)))
+                }
                 Ok(JoinType::JoinRight) => (true, false),
                 _ => (true, true),
             };
             if let Some(larg) = j.larg.as_deref() {
-                preserved_aliases(larg, nullable || l, out);
+                preserved_aliases(larg, nullable || l, nonnullable, out);
             }
             if let Some(rarg) = j.rarg.as_deref() {
-                preserved_aliases(rarg, nullable || r, out);
+                preserved_aliases(rarg, nullable || r, nonnullable, out);
             }
         }
         _ => {}
@@ -1361,10 +1542,18 @@ fn split_and<'a>(n: &'a pg_query::protobuf::Node, out: &mut Vec<&'a pg_query::pr
     }
 }
 
-/// The one alias every column of `n` is qualified by, when `n` is a shape
-/// that may be pushed.
-fn single_alias(n: &pg_query::protobuf::Node) -> Option<String> {
-    fn walk(n: &pg_query::protobuf::Node, alias: &mut Option<String>) -> bool {
+/// The one alias every column of `n` is qualified by, or belongs to
+/// (`owner`, for an unqualified one), when `n` is a shape that may be
+/// pushed.
+fn single_alias(
+    n: &pg_query::protobuf::Node,
+    owner: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    fn walk(
+        n: &pg_query::protobuf::Node,
+        alias: &mut Option<String>,
+        owner: &dyn Fn(&str) -> Option<String>,
+    ) -> bool {
         match n.node.as_ref() {
             Some(N::ColumnRef(c)) => {
                 let parts: Option<Vec<&str>> = c
@@ -1375,11 +1564,16 @@ fn single_alias(n: &pg_query::protobuf::Node) -> Option<String> {
                         _ => None,
                     })
                     .collect();
-                match parts.as_deref() {
-                    Some([q, _]) => match alias {
-                        Some(a) => a == q,
+                let qualifier = match parts.as_deref() {
+                    Some([q, _]) => Some(q.to_string()),
+                    Some([name]) => owner(name),
+                    _ => None,
+                };
+                match qualifier {
+                    Some(q) => match alias {
+                        Some(a) => *a == q,
                         None => {
-                            *alias = Some(q.to_string());
+                            *alias = Some(q);
                             true
                         }
                     },
@@ -1387,21 +1581,21 @@ fn single_alias(n: &pg_query::protobuf::Node) -> Option<String> {
                 }
             }
             Some(N::AConst(_)) | Some(N::ParamRef(_)) => true,
-            Some(N::TypeCast(t)) => t.arg.as_deref().is_some_and(|a| walk(a, alias)),
+            Some(N::TypeCast(t)) => t.arg.as_deref().is_some_and(|a| walk(a, alias, owner)),
             Some(N::AExpr(e)) => {
-                e.lexpr.as_deref().is_none_or(|x| walk(x, alias))
-                    && e.rexpr.as_deref().is_none_or(|x| walk(x, alias))
+                e.lexpr.as_deref().is_none_or(|x| walk(x, alias, owner))
+                    && e.rexpr.as_deref().is_none_or(|x| walk(x, alias, owner))
             }
-            Some(N::BoolExpr(b)) => b.args.iter().all(|a| walk(a, alias)),
-            Some(N::NullTest(t)) => t.arg.as_deref().is_some_and(|a| walk(a, alias)),
-            Some(N::BooleanTest(t)) => t.arg.as_deref().is_some_and(|a| walk(a, alias)),
-            Some(N::List(l)) => l.items.iter().all(|a| walk(a, alias)),
-            Some(N::AArrayExpr(a)) => a.elements.iter().all(|x| walk(x, alias)),
+            Some(N::BoolExpr(b)) => b.args.iter().all(|a| walk(a, alias, owner)),
+            Some(N::NullTest(t)) => t.arg.as_deref().is_some_and(|a| walk(a, alias, owner)),
+            Some(N::BooleanTest(t)) => t.arg.as_deref().is_some_and(|a| walk(a, alias, owner)),
+            Some(N::List(l)) => l.items.iter().all(|a| walk(a, alias, owner)),
+            Some(N::AArrayExpr(a)) => a.elements.iter().all(|x| walk(x, alias, owner)),
             _ => false,
         }
     }
     let mut alias = None;
-    (walk(n, &mut alias)).then_some(alias).flatten()
+    (walk(n, &mut alias, owner)).then_some(alias).flatten()
 }
 
 /// `a.x` -> `x`, for a conjunct moved into `a`'s own `SELECT * FROM t`.

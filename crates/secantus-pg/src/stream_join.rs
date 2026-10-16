@@ -808,7 +808,7 @@ impl PgHandler {
             || !self.join_may_stream()
             // A join whose plan reorders its sides is read whole (RP-028).
             || self
-                .narrow_join_method(join)
+                .narrow_join_method(join, None)
                 .is_some_and(|(m, _, _)| m != secantus_pgplan::joincost::JoinMethod::Other)
             || !table_or_sub(&join.left_sub, &join.left.0)
             || !table_or_sub(&join.right_sub, &join.right.0)

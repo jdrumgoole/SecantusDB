@@ -5974,7 +5974,7 @@ impl PgHandler {
                 .max(1.0)
         };
         let indexes = self.cost_indexes(table, &pt.def, count as u64);
-        let scan = costsize::cheapest_scan(&rel, &indexes, &quals, &column_nd, rows);
+        let scan = costsize::cheapest_scan_path(&rel, &indexes, &quals, &column_nd, rows);
         let ordered = indexes
             .iter()
             .filter(|ix| ix.field == field)
@@ -5983,7 +5983,8 @@ impl PgHandler {
         Some(joincost::JoinSide {
             rows,
             tuples: pt.tuples,
-            scan: (0.0, scan),
+            scan,
+            startup_scan: (0.0, costsize::seq_scan(&rel, &quals)),
             ordered,
             unique,
             ndistinct,
@@ -6646,7 +6647,20 @@ impl PgHandler {
                 }
                 let mut rrows = self.join_rows(right)?;
                 let mut lrows = lrows;
-                self.order_general_join_inputs(*kind, left, right, equi, &mut lrows, &mut rrows);
+                // A plan with the right side outer runs with the sides
+                // swapped, so the loop below walks the outer side's rows.
+                let swap = merged.is_empty()
+                    && self.order_general_join_inputs(
+                        *kind, left, right, equi, &mut lrows, &mut rrows,
+                    );
+                let swapped_equi: Vec<(String, String)>;
+                let (equi, left_keys, right_keys) = if swap {
+                    std::mem::swap(&mut lrows, &mut rrows);
+                    swapped_equi = equi.iter().map(|(l, r)| (r.clone(), l.clone())).collect();
+                    (&swapped_equi[..], right_keys, left_keys)
+                } else {
+                    (&equi[..], left_keys, right_keys)
+                };
                 let mut lrows = Some(lrows);
                 let mut out = Vec::new();
                 self.join_rows_core(
@@ -6987,6 +7001,74 @@ impl PgHandler {
         self.join_docs_with(join, None, None, None, false)
     }
 
+    /// A narrow join's WHERE predicates, as a filter for each side's rows.
+    ///
+    /// WHERE predicates bind to whichever side each alias names; applying
+    /// them before the join is correct and keeps the nested loop trivial. A
+    /// left-side predicate filters the left rows; a right-side one filters
+    /// the right rows -- safe under an INNER join, and under a LEFT join for
+    /// the left side (the planner sends a WHERE on the nullable side to the
+    /// general join path). Ops beyond `=` (`>`/`>=`/`<`/`<=`) compare
+    /// numerically; `NotTrue` keeps rows whose boolean column is not true.
+    #[allow(clippy::type_complexity)]
+    fn narrow_join_preds(
+        &self,
+        join: &secantus_pgplan::JoinSelect,
+    ) -> PgWireResult<(
+        Vec<Box<dyn Fn(&Document) -> bool>>,
+        Vec<Box<dyn Fn(&Document) -> bool>>,
+    )> {
+        use secantus_pgplan::JoinOp;
+        let eq = crate::stream_join::narrow_eq;
+        let field = |sub: &Option<Box<Statement>>, table: &str, col: &str| {
+            if sub.is_some() {
+                Ok(col.to_string())
+            } else {
+                self.lookup(table)
+                    .and_then(|def| def.field_of(col))
+                    .ok_or_else(|| Self::err(&PlanError::UndefinedColumn(col.to_string())))
+            }
+        };
+        let mut left_preds: Vec<Box<dyn Fn(&Document) -> bool>> = Vec::new();
+        let mut right_preds: Vec<Box<dyn Fn(&Document) -> bool>> = Vec::new();
+        for pred in &join.filter {
+            let on_left = pred.alias == join.left.1;
+            let field = if on_left {
+                field(&join.left_sub, &join.left.0, &pred.col)?
+            } else {
+                field(&join.right_sub, &join.right.0, &pred.col)?
+            };
+            let value = pred.value.clone();
+            let op = pred.op.clone();
+            let keep = move |d: &Document| -> bool {
+                let cell = d.get(&field);
+                match op {
+                    JoinOp::NotTrue => !matches!(cell, Some(Bson::Boolean(true))),
+                    JoinOp::Eq => cell.map(|v| eq(v, &value)).unwrap_or(false),
+                    _ => {
+                        let ord = cell.and_then(|v| secantus_pgplan::compare_values(v, &value));
+                        match ord {
+                            None => false,
+                            Some(o) => match op {
+                                JoinOp::Gt => o == std::cmp::Ordering::Greater,
+                                JoinOp::Ge => o != std::cmp::Ordering::Less,
+                                JoinOp::Lt => o == std::cmp::Ordering::Less,
+                                JoinOp::Le => o != std::cmp::Ordering::Greater,
+                                _ => false,
+                            },
+                        }
+                    }
+                }
+            };
+            if on_left {
+                left_preds.push(Box::new(keep));
+            } else {
+                right_preds.push(Box::new(keep));
+            }
+        }
+        Ok((left_preds, right_preds))
+    }
+
     /// `join_docs` with optional pre-materialised rows for a side that is a
     /// SUBQUERY (`... JOIN (SELECT ...) a`) rather than a table -- those rows
     /// are keyed by the sub-plan's OUTPUT names, so the side's "field" is the
@@ -7009,7 +7091,6 @@ impl PgHandler {
         mut right_rows: Vec<Document>,
         emit: &mut dyn FnMut(Vec<Document>) -> PgWireResult<bool>,
     ) -> PgWireResult<()> {
-        let eq = crate::stream_join::narrow_eq;
         let field_of = |table: &str, col: &str| -> PgWireResult<String> {
             self.lookup(table)
                 .and_then(|def| def.field_of(col))
@@ -7047,52 +7128,8 @@ impl PgHandler {
                 field_of(&join.right.0, col)
             }
         };
-        let mut left_preds: Vec<Box<dyn Fn(&Document) -> bool>> = Vec::new();
-
-        // WHERE predicates bind to whichever side each alias names; applying
-        // them before the join is correct and keeps the nested loop trivial. A
-        // left-side predicate filters the left rows; a right-side one filters
-        // the right rows -- safe under an INNER join, and under a LEFT join too
-        // for these catalog queries (an unmatched left row still surfaces as a
-        // NULL-extended miss, which is what a LEFT JOIN means). Ops beyond `=`
-        // (`>`/`>=`/`<`/`<=`) compare numerically; `NotTrue` keeps rows whose
-        // boolean column is not true.
-        use secantus_pgplan::JoinOp;
-        for pred in &join.filter {
-            let on_left = pred.alias == join.left.1;
-            let field = if on_left {
-                lfield(&pred.col)?
-            } else {
-                rfield(&pred.col)?
-            };
-            let value = pred.value.clone();
-            let op = pred.op.clone();
-            let keep = move |d: &Document| -> bool {
-                let cell = d.get(&field);
-                match op {
-                    JoinOp::NotTrue => !matches!(cell, Some(Bson::Boolean(true))),
-                    JoinOp::Eq => cell.map(|v| eq(v, &value)).unwrap_or(false),
-                    _ => {
-                        let ord = cell.and_then(|v| secantus_pgplan::compare_values(v, &value));
-                        match ord {
-                            None => false,
-                            Some(o) => match op {
-                                JoinOp::Gt => o == std::cmp::Ordering::Greater,
-                                JoinOp::Ge => o != std::cmp::Ordering::Less,
-                                JoinOp::Lt => o == std::cmp::Ordering::Less,
-                                JoinOp::Le => o != std::cmp::Ordering::Greater,
-                                _ => false,
-                            },
-                        }
-                    }
-                }
-            };
-            if on_left {
-                left_preds.push(Box::new(keep));
-            } else {
-                right_rows.retain(keep);
-            }
-        }
+        let (left_preds, right_preds) = self.narrow_join_preds(join)?;
+        right_rows.retain(|d| right_preds.iter().all(|keep| keep(d)));
 
         // The ON columns, resolved to each side's stored field; `None` is a
         // CROSS join (`FROM t1, t2`), where every right row pairs with every
@@ -7225,8 +7262,10 @@ impl PgHandler {
         })
     }
 
-    /// `order_join_inputs` for a general join of two plain tables on one
-    /// equality (RP-028).
+    /// `reorder_join_inputs` for a general join of two plain tables on one
+    /// equality (RP-028); whether the plan reads the right side as its
+    /// outer (`joincost_outer_is_b`). Only for a join with no merged
+    /// (`USING`) columns: the caller cannot swap the sides of one.
     fn order_general_join_inputs(
         &self,
         kind: secantus_pgplan::joins::JoinKind,
@@ -7235,12 +7274,14 @@ impl PgHandler {
         equi: &[(String, String)],
         lrows: &mut Vec<Document>,
         rrows: &mut Vec<Document>,
-    ) {
+    ) -> bool {
         if let (Some(method), [(lk, rk)]) =
             (self.general_join_method(kind, left, right, equi), equi)
         {
             reorder_join_inputs(method, lrows, lk, rrows, rk);
+            return joincost_outer_is_b(method);
         }
+        false
     }
 
     /// The plan PostgreSQL picks for a general join of two plain tables on
@@ -7293,26 +7334,8 @@ impl PgHandler {
             &a,
             &b,
             matches!(kind, JoinKind::Left),
+            None,
         ))
-    }
-
-    /// Put a join's inputs in the order PostgreSQL's plan reads them
-    /// (RP-028), so the nested loop below emits its rows in that plan's
-    /// order: for a merge join, each side in key order (an index scan's
-    /// keeps equal keys in heap order, a Sort's as PostgreSQL's quicksort
-    /// leaves them); for a hash join with the right side hashed, that side
-    /// backwards, as a bucket's chain returns its last insert first. Only
-    /// for two stored tables on one equality with no other condition; any
-    /// other plan keeps the scan order.
-    fn order_join_inputs(
-        &self,
-        join: &secantus_pgplan::JoinSelect,
-        left: &mut Vec<Document>,
-        right: &mut Vec<Document>,
-    ) {
-        if let Some((method, lf, rf)) = self.narrow_join_method(join) {
-            reorder_join_inputs(method, left, &lf, right, &rf);
-        }
     }
 
     /// A table small enough to hold whole for its join's plan order: past
@@ -7324,40 +7347,78 @@ impl PgHandler {
     }
 
     /// The plan PostgreSQL picks for a narrow join of two stored tables on
-    /// one equality with no other condition, and the stored fields it joins
-    /// on; `None` for any other shape.
+    /// one equality, each side priced under its own WHERE predicates, and
+    /// the stored fields it joins on; `None` for any other shape. `limit`
+    /// is the rows a LIMIT (and OFFSET) over the join reads, when it has
+    /// no ORDER BY.
     pub(crate) fn narrow_join_method(
         &self,
         join: &secantus_pgplan::JoinSelect,
+        limit: Option<usize>,
     ) -> Option<(secantus_pgplan::joincost::JoinMethod, String, String)> {
-        use secantus_pgplan::joincost;
-        if join.left_sub.is_some() || join.right_sub.is_some() || !join.filter.is_empty() {
+        use secantus_pgplan::{joincost, JoinOp};
+        if join.left_sub.is_some() || join.right_sub.is_some() {
             return None;
         }
-        let ((la, lc), (_, rc)) = join.on.as_ref().map(|(a, b)| {
+        let ((_, lc), (_, rc)) = join.on.as_ref().map(|(a, b)| {
             if a.0 == join.left.1 {
                 (a.clone(), b.clone())
             } else {
                 (b.clone(), a.clone())
             }
         })?;
-        let _ = la;
         if !self.join_small_enough(&join.left.0) || !self.join_small_enough(&join.right.0) {
             return None;
         }
-        let (Some(a), Some(b)) = (
-            self.join_side(&join.left.0, &lc, &Document::new()),
-            self.join_side(&join.right.0, &rc, &Document::new()),
-        ) else {
-            return None;
-        };
         let (Some(lf), Some(rf)) = (
             self.lookup(&join.left.0).and_then(|d| d.field_of(&lc)),
             self.lookup(&join.right.0).and_then(|d| d.field_of(&rc)),
         ) else {
             return None;
         };
-        Some((joincost::cheapest_join(&a, &b, join.left_join), lf, rf))
+        // Each side's WHERE as the filter its scan is priced under. An
+        // equality on a join key is not modelled: the planner's equivalence
+        // class (`generate_base_implied_equalities`) turns it into an
+        // equality on both sides and drops the join clause.
+        let mut filters = [Vec::new(), Vec::new()];
+        for pred in &join.filter {
+            let (side, table, key) = if pred.alias == join.left.1 {
+                (0, &join.left.0, &lc)
+            } else {
+                (1, &join.right.0, &rc)
+            };
+            let op = match pred.op {
+                JoinOp::Eq if pred.col == *key => return None,
+                JoinOp::Eq => "$eq",
+                JoinOp::Gt => "$gt",
+                JoinOp::Ge => "$gte",
+                JoinOp::Lt => "$lt",
+                JoinOp::Le => "$lte",
+                JoinOp::NotTrue => return None,
+            };
+            let field = self.lookup(table)?.field_of(&pred.col)?;
+            filters[side].push(Bson::Document(
+                bson::doc! { field: { op: pred.value.clone() } },
+            ));
+        }
+        let [lfilter, rfilter] = filters.map(|clauses| {
+            if clauses.is_empty() {
+                Document::new()
+            } else {
+                bson::doc! { "$and": clauses }
+            }
+        });
+        let (Some(a), Some(b)) = (
+            self.join_side(&join.left.0, &lc, &lfilter),
+            self.join_side(&join.right.0, &rc, &rfilter),
+        ) else {
+            return None;
+        };
+        Some((
+            joincost::cheapest_join(&a, &b, join.left_join, limit.map(|n| n as f64)),
+            lf,
+            rf,
+        ))
     }
 
     fn join_docs_with(
@@ -7376,9 +7437,28 @@ impl PgHandler {
             Some(r) => r,
             None => self.table_docs(&join.right.0)?,
         };
-        if let Some(rows) = left_rows.as_mut() {
-            self.order_join_inputs(join, rows, &mut right_rows);
+        // A join PostgreSQL plans with `b` outer runs with the sides swapped,
+        // so the nested loop below walks the outer side's rows in turn.
+        let mut swapped = None;
+        let limit = if join.order.is_none() { bound } else { None };
+        if let Some((method, lf, rf)) = self.narrow_join_method(join, limit) {
+            let (keep_left, keep_right) = self.narrow_join_preds(join)?;
+            let rows = left_rows.as_mut().expect("set above");
+            // The WHERE first: each side is sorted (or hashed) after its
+            // scan applies its quals, so its ties come out in the order of
+            // the rows the scan keeps.
+            rows.retain(|d| keep_left.iter().all(|keep| keep(d)));
+            right_rows.retain(|d| keep_right.iter().all(|keep| keep(d)));
+            reorder_join_inputs(method, rows, &lf, &mut right_rows, &rf);
+            if joincost_outer_is_b(method) {
+                let mut j = join.clone();
+                std::mem::swap(&mut j.left, &mut j.right);
+                std::mem::swap(&mut j.left_sub, &mut j.right_sub);
+                std::mem::swap(rows, &mut right_rows);
+                swapped = Some(j);
+            }
         }
+        let join = swapped.as_ref().unwrap_or(join);
         let mut out = Vec::new();
         self.join_docs_core(
             join,
@@ -42557,9 +42637,15 @@ impl PgHandler {
     }
 }
 
-/// `PgHandler::order_join_inputs`' reordering, given the plan `method`:
-/// `left` and `right` are the two sides' rows, `lf` / `rf` the key each is
-/// joined on.
+/// Put a join's inputs in the order PostgreSQL's plan `method` reads them
+/// (RP-028), so the nested loop over the outer side emits its rows in that
+/// plan's order: for a merge join, each side in key order (an index scan's
+/// keeps equal keys in heap order, a Sort's as PostgreSQL's quicksort
+/// leaves them); for a hash join, the hashed side backwards, as a bucket's
+/// chain returns its last insert first. Any other plan keeps the scan
+/// order. `left` and `right` are the two sides' rows, `lf` / `rf` the key
+/// each is joined on; a plan with `right` outer (`joincost_outer_is_b`) is
+/// then run with the sides swapped.
 fn reorder_join_inputs(
     method: secantus_pgplan::joincost::JoinMethod,
     left: &mut Vec<Document>,
@@ -42596,7 +42682,25 @@ fn reorder_join_inputs(
             in_key_order(left, lf, a_by_index);
             in_key_order(right, rf, b_by_index);
         }
+        JoinMethod::MergeOuterB {
+            a_by_index,
+            b_by_index,
+        } => {
+            in_key_order(left, lf, a_by_index);
+            in_key_order(right, rf, b_by_index);
+        }
         JoinMethod::HashOuterA => right.reverse(),
-        JoinMethod::Other => {}
+        JoinMethod::HashOuterB => left.reverse(),
+        JoinMethod::NestOuterB | JoinMethod::Other => {}
     }
+}
+
+/// Whether the plan `method` reads `b` (the right side) as its outer: the
+/// join then emits each `b` row in turn with its `a` matches.
+fn joincost_outer_is_b(method: secantus_pgplan::joincost::JoinMethod) -> bool {
+    use secantus_pgplan::joincost::JoinMethod;
+    matches!(
+        method,
+        JoinMethod::HashOuterB | JoinMethod::MergeOuterB { .. } | JoinMethod::NestOuterB
+    )
 }

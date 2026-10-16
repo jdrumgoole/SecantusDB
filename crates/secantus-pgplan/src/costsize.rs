@@ -325,19 +325,38 @@ pub fn cheapest_scan(
     ndistinct: &dyn Fn(&str) -> f64,
     rows: f64,
 ) -> f64 {
-    let seq = SEQ_PAGE_COST * rel.pages
-        + (CPU_TUPLE_COST + qual_cost(quals.iter().map(|(_, q)| q))) * rel.tuples;
-    let mut best = seq;
+    cheapest_scan_path(rel, indexes, quals, ndistinct, rows).1
+}
+
+/// `cost_seqscan` through `quals`: its total; it starts at no cost, so it
+/// is the cheapest scan to start.
+pub fn seq_scan(rel: &Rel, quals: &[(String, Qual)]) -> f64 {
+    SEQ_PAGE_COST * rel.pages
+        + (CPU_TUPLE_COST + qual_cost(quals.iter().map(|(_, q)| q))) * rel.tuples
+}
+
+/// `cheapest_scan`'s path as `(startup, total)`: the cheapest in total, a
+/// tie going to the cheaper startup (`set_cheapest`).
+pub fn cheapest_scan_path(
+    rel: &Rel,
+    indexes: &[Index],
+    quals: &[(String, Qual)],
+    ndistinct: &dyn Fn(&str) -> f64,
+    rows: f64,
+) -> (f64, f64) {
+    let mut best = (0.0, seq_scan(rel, quals));
     for index in indexes {
         let nd = ndistinct(&index.field);
         for cost in [
-            bitmap_heap_cost(rel, index, quals, nd, rows).map(|c| c.1),
-            index_scan_cost(rel, index, quals, nd).map(|c| c.1),
+            bitmap_heap_cost(rel, index, quals, nd, rows),
+            index_scan_cost(rel, index, quals, nd),
         ]
         .into_iter()
         .flatten()
         {
-            best = best.min(cost);
+            if cost.1 < best.1 || (cost.1 == best.1 && cost.0 < best.0) {
+                best = cost;
+            }
         }
     }
     best
