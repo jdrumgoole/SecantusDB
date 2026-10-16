@@ -1750,12 +1750,18 @@ Rust-only driver-gauge failures that are deliberately not chased:
   `$match` / `$sort` keep the original 2 / 28766. There is no rule derivable
   short of probing every accumulator. The other 11 of 12 aggregation
   runtime-error wrapper shapes match mongod 8.2.11.
-- [ ] **`$stdDevPop` last-ULP vs mongod** (both servers): both agree with each
-  other but differ from mongod in the final ULP (e.g. `2.357022603955158` vs
-  mongod's `2.3570226039551585`); mongod uses a different summation order.
-  Precision-only; likely a permanent minor divergence. Re-probe on 8.2.11.
-  Backlog-ID: RM-128
-  Verify: tests/backlog/test_rm_113_138.py::test_std_dev_pop_last_ulp
+- [ ] **`$stdDevPop` / `$stdDevSamp` over a sliding window differ in the
+  last digit.** mongod 8.2.11 updates the deviation incrementally as
+  documents enter and leave a `$setWindowFields` window (`documents: [-2,
+  0]`); this server recomputes each window from scratch, which agrees for
+  a window that only grows and differs in the last ULP once one drops
+  documents. A reversed-Welford removal with a fused multiply-add matched
+  227 of 332 values, so mongod's removal step is something else; it needs
+  reading from mongod's window-function source. Found 2026-10-16 while
+  fixing RM-128 (the accumulator and expression forms now match mongod bit
+  for bit: Welford's algorithm with the `m2` step a fused multiply-add).
+  Backlog-ID: RM-181
+  Verify: tests/backlog/test_rm_found_2026_10_16c.py::test_std_dev_over_a_sliding_window
 - **Out of scope — `$meta` inside an AGGREGATION stage.** 21 shapes probed
   on 8.2.11: mongod's behaviour there is its metadata dependency analysis
   (`DepsTracker`) leaking through (`$project` returns `recordId` but
