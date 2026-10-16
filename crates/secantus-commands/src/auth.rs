@@ -1897,7 +1897,7 @@ mod tests {
             .is_none());
         let refused = dispatch(
             &doc! {"saslStart": 1, "mechanism": "SCRAM-SHA-1",
-            "payload": payload_binary(b"n,,n=only256,r=abc".to_vec()), "$db": "admin"},
+            "payload": payload_binary(b"n,,n=only256,r=abcd".to_vec()), "$db": "admin"},
             &mut ctx,
         );
         assert_eq!(refused.get_i32("code").unwrap(), 334);
@@ -1908,7 +1908,7 @@ mod tests {
         );
         let started = dispatch(
             &doc! {"saslStart": 1, "mechanism": "SCRAM-SHA-1",
-            "payload": payload_binary(b"n,,n=both,r=abc".to_vec()), "$db": "admin"},
+            "payload": payload_binary(b"n,,n=both,r=abcd".to_vec()), "$db": "admin"},
             &mut ctx,
         );
         assert_eq!(started.get_f64("ok").unwrap(), 1.0);
