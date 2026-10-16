@@ -290,7 +290,8 @@ impl Builder {
     }
 
     /// How often to delete documents a TTL index has expired, or `None` to
-    /// never sweep. Default [`DEFAULT_TTL_SWEEP`], 60 seconds, as on mongod;
+    /// start the monitor switched off (`setParameter ttlMonitorEnabled: true`
+    /// turns it on). Default [`DEFAULT_TTL_SWEEP`], 60 seconds, as on mongod;
     /// a test that waits for an expiry sets a shorter one.
     pub fn ttl_sweep(mut self, every: Option<Duration>) -> Self {
         self.ttl_sweep = every;
@@ -366,7 +367,15 @@ impl Builder {
         let running = bind(&addr, config, adapter, Arc::new(CursorRegistry::new()))?;
         let stop_sweepers = Arc::new(AtomicBool::new(false));
         let mut sweepers = Vec::new();
-        if let Some(every) = self.ttl_sweep {
+        {
+            // `None` starts the monitor switched off, as mongod's is with
+            // `ttlMonitorEnabled=false`, so `setParameter ttlMonitorEnabled`
+            // can turn it on (at mongod's 60-second cadence).
+            let every = self.ttl_sweep.unwrap_or(DEFAULT_TTL_SWEEP);
+            storage.set_ttl_started_period(every);
+            if self.ttl_sweep.is_none() {
+                storage.set_ttl_monitor(None, Some(false));
+            }
             let storage = storage.clone();
             // Ticked often; the monitor decides whether a pass is due, so
             // `setParameter ttlMonitorSleepSecs` applies to a running server.

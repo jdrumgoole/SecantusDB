@@ -1205,8 +1205,29 @@ fn replace_root_one(doc: &Document, expr: &Bson, vars: &Document, subject: &str)
     }
 }
 
+thread_local! {
+    /// Whether the pipeline running on this thread is an UPDATE's
+    /// (`with_whole_input_documents`).
+    static WHOLE_INPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f`, an update's pipeline: mongod runs no dependency analysis over
+/// an update pipeline, so a `$replaceWith` that fails names the WHOLE input
+/// document (measured 8.2.11), where an `aggregate` names the fields it read.
+pub fn with_whole_input_documents<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WHOLE_INPUT.with(|w| w.set(self.0));
+        }
+    }
+    let _r = Restore(WHOLE_INPUT.with(|w| w.replace(true)));
+    f()
+}
+
 /// The document mongod names in `Input document:` -- the input PRUNED to the
-/// fields the expression actually reads.
+/// fields the expression actually reads (the whole of it in an update's
+/// pipeline, [`with_whole_input_documents`]).
 ///
 /// mongod runs its dependency analysis before the stage, so the message names
 /// the pruned document, not the stored one: `{_id: 1, n: 1}` with
@@ -1214,6 +1235,9 @@ fn replace_root_one(doc: &Document, expr: &Bson, vars: &Document, subject: &str)
 /// absent path is omitted rather than rendered null, and a referenced parent
 /// subsumes a referenced child. Mirrors `aggregate._input_document`.
 fn input_document(doc: &Document, expr: &Bson) -> Document {
+    if WHOLE_INPUT.with(std::cell::Cell::get) {
+        return doc.clone();
+    }
     let mut paths = Vec::new();
     if expression_field_paths(expr, &mut paths).is_none() {
         return doc.clone();

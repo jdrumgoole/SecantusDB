@@ -141,6 +141,7 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // over the collection it is defined on. Reading the view's own (empty)
     // storage answered `[]` for every `distinct` on a view.
     let documents: Vec<Document> = if on_view {
+        crate::views::check_hint(storage, &ctx.db_name, &coll, hint)?;
         if crate::notablescan::enabled(ctx) {
             // The view's pipeline, then the query: what mongod plans.
             let tail = if filter.is_empty() {

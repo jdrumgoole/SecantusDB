@@ -25,6 +25,7 @@ pub(crate) mod order;
 mod parsed;
 mod plan;
 mod shape;
+pub(crate) mod summary;
 mod trial;
 
 use crate::util::{as_i64, command_error, decode_docs};

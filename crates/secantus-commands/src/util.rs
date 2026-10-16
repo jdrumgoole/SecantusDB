@@ -13,8 +13,54 @@ use crate::{CommandError, StorageError};
 /// `$$n` to 3; scalars pass through). Mirrors `commands._resolve_let_vars`. A
 /// value the expression engine can't evaluate is kept raw (best-effort).
 pub(crate) fn resolve_let_vars(let_field: Option<&Bson>) -> Document {
+    resolve_let_vars_at(let_field, None)
+}
+
+/// [`resolve_let_vars`] for a command run by `ctx`: on a replica-set member
+/// `$$CLUSTER_TIME` is the cluster time the operation starts at, as on
+/// mongod (8.2.11 sets a field to a Timestamp through it).
+pub(crate) fn command_let_vars(let_field: Option<&Bson>, ctx: &crate::CommandContext) -> Document {
+    resolve_let_vars_at(let_field, operation_cluster_time(ctx))
+}
+
+/// The cluster time an operation `ctx` runs starts at, on a replica-set
+/// member: what `$$CLUSTER_TIME` reads. `None` on a standalone.
+pub(crate) fn operation_cluster_time(ctx: &crate::CommandContext) -> Option<bson::Timestamp> {
+    ctx.replica_set_name
+        .as_ref()
+        .and_then(|_| ctx.storage().ok())
+        .map(|s| s.peek_cluster_time())
+}
+
+/// mongod's refusal of `$$CLUSTER_TIME` on a standalone, when one of
+/// `values` (a pipeline's stages, an update) reads it.
+pub(crate) fn cluster_time_unavailable(standalone: bool, values: &[Bson]) -> Option<CommandError> {
+    fn reads(v: &Bson) -> bool {
+        match v {
+            Bson::String(s) => s == "$$CLUSTER_TIME" || s.starts_with("$$CLUSTER_TIME."),
+            Bson::Document(d) => d.values().any(reads),
+            Bson::Array(a) => a.iter().any(reads),
+            _ => false,
+        }
+    }
+    (standalone && values.iter().any(reads)).then(|| {
+        CommandError::new(
+            10071200,
+            "Location10071200",
+            "system variable $$CLUSTER_TIME is not available in standalone mode",
+        )
+    })
+}
+
+pub(crate) fn resolve_let_vars_at(
+    let_field: Option<&Bson>,
+    cluster_time: Option<bson::Timestamp>,
+) -> Document {
     let mut vars = Document::new();
     vars.insert("NOW", bson::DateTime::now());
+    if let Some(ts) = cluster_time {
+        vars.insert("CLUSTER_TIME", ts);
+    }
     if let Some(Bson::Document(d)) = let_field {
         for (name, value) in d {
             let resolved = secantus_core::expressions::evaluate(&Document::new(), value, &vars)

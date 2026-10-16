@@ -252,19 +252,19 @@ pub(crate) fn run(
         .unwrap_or_default();
     // A transaction statement's writes name the transaction in the oplog,
     // by the logical session as mongod records it: the id the client sent
-    // and the SHA-256 of the user, which is of the empty string for none.
+    // and the SHA-256 of `user@db`, which is of the empty string for none
+    // (mongod 8.2.11).
     let txn_session = env
         .lsid
         .clone()
         .zip(env.txn_number)
         .filter(|_| env.in_txn)
         .and_then(|(id, txn)| {
-            use sha2::Digest;
             let lsid = doc! {
                 "id": bson::Binary { subtype: bson::spec::BinarySubtype::Uuid, bytes: id },
                 "uid": bson::Binary {
                     subtype: bson::spec::BinarySubtype::Generic,
-                    bytes: sha2::Sha256::digest(b"").to_vec(),
+                    bytes: user_digest(&users),
                 },
             };
             bson::to_vec(&lsid).ok().map(|bytes| (bytes, txn))

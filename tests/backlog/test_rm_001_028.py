@@ -204,7 +204,7 @@ _SLOW_LINE_ATTRS = (
 
 
 def _slow_query_attr(line: str) -> dict | None:
-    """The attributes of a `Slow query` log line: mongod's lines are JSON
+    """The attributes of a `Slow query` line: mongod's lines are JSON
     with an `attr`; the Rust server's are `<ts> I COMMAND Slow query {...}`."""
     if "Slow query" not in line:
         return None
@@ -213,15 +213,14 @@ def _slow_query_attr(line: str) -> dict | None:
     return json.loads(line.split("Slow query ", 1)[1])
 
 
-@pytest.mark.backlog("RM-023")
-def test_slow_query_line_says_where_the_time_went(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11's `Slow query` line for a `find` carries `planSummary`,
-    `keysExamined`, `docsExamined`, `nreturned`, `reslen`, `storage` and the
-    command DOCUMENT; read back through `getLog: "global"`."""
-    answers = {}
+def _find_slow_lines(rust_mongo: Any, mongod: Any) -> dict:
+    """Per server, the attributes of the `Slow query` line for one indexed
+    `find`, read back through `getLog: "global"`."""
+    lines = {}
     for name, db in _both(rust_mongo, mongod, "rm023"):
         client = db.client
         db.s.insert_many([{"x": i} for i in range(5)])
+        db.s.create_index("x")
         # mongod logs every operation at -1; the Rust server refuses a
         # negative slowms and logs every operation at 0.
         slowms = -1 if name == "mongod" else 0
@@ -243,11 +242,38 @@ def test_slow_query_line_says_where_the_time_went(rust_mongo: Any, mongod: Any) 
             )
         ]
         assert attrs, f"{name}: no Slow query line for the find"
-        attr = attrs[-1]
-        answers[name] = (
-            sorted(k for k in _SLOW_LINE_ATTRS if k in attr),
+        lines[name] = attrs[-1]
+    return lines
+
+
+@pytest.mark.backlog_fixed("RM-023")
+def test_slow_query_line_names_the_plan(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11's `Slow query` line for a `find` carries the command
+    DOCUMENT, `planSummary` (here `IXSCAN { x: 1 }`), `nreturned` and
+    `reslen`."""
+    lines = _find_slow_lines(rust_mongo, mongod)
+    answers = {
+        name: (
+            sorted(k for k in ("planSummary", "nreturned", "reslen") if k in attr),
             isinstance(attr.get("command"), dict),
+            attr.get("planSummary"),
+            attr.get("nreturned"),
         )
+        for name, attr in lines.items()
+    }
+    assert answers["mongod"] == (["nreturned", "planSummary", "reslen"], True, "IXSCAN { x: 1 }", 3)
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog("RM-023")
+def test_slow_query_line_says_where_the_time_went(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11's `Slow query` line for a `find` carries
+    `keysExamined`, `docsExamined` and `storage`, as well as what
+    `test_slow_query_line_names_the_plan` checks."""
+    lines = _find_slow_lines(rust_mongo, mongod)
+    answers = {
+        name: sorted(k for k in _SLOW_LINE_ATTRS if k in attr) for name, attr in lines.items()
+    }
     assert answers["rust"] == answers["mongod"]
 
 

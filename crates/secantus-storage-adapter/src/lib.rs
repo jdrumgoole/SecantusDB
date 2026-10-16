@@ -745,6 +745,10 @@ impl CmdStorage for StorageAdapter {
         secantus_storage::with_candidate_order(order, f)
     }
 
+    fn with_reversed_delete_batches(&self, batch: usize, f: &mut dyn FnMut()) {
+        secantus_storage::with_reversed_delete_batches(batch, f)
+    }
+
     fn query_implies_partial(&self, query: &Document, partial: &Document) -> bool {
         secantus_storage::query_implies_partial(query, partial)
     }

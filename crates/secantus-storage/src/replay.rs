@@ -93,10 +93,20 @@ fn apply_command(storage: &Storage, db: &str, o: &Document) -> Result<()> {
                 storage.set_index_expiry(db, coll, name, expiry)?;
             }
         }
+        // `cappedSize` / `cappedMax` are recorded as the command named them;
+        // the options they set are `size` / `max` (a `cappedMax` of 0 or less
+        // is no limit, stored as 2147483647).
         let desc: Document = o
             .iter()
             .filter(|(k, _)| k.as_str() != "collMod" && k.as_str() != "index")
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| match (k.as_str(), v) {
+                ("cappedSize", Bson::Int64(n)) => ("size".to_string(), stored_int(*n)),
+                ("cappedMax", Bson::Int64(n)) => (
+                    "max".to_string(),
+                    stored_int(if *n <= 0 { i64::from(i32::MAX) } else { *n }),
+                ),
+                _ => (k.clone(), v.clone()),
+            })
             .collect();
         if !desc.is_empty() {
             storage.coll_mod(db, coll, &desc)?;
@@ -360,4 +370,10 @@ pub fn restore_to_timestamp(
     }
     target.checkpoint()?;
     Ok(stats)
+}
+
+/// A collection option's integer as `create` / `collMod` store it: an int32
+/// where it fits.
+fn stored_int(n: i64) -> Bson {
+    i32::try_from(n).map_or(Bson::Int64(n), Bson::Int32)
 }

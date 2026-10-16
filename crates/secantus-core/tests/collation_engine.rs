@@ -239,6 +239,48 @@ fn fill_writes_null_and_emits_partitions_in_key_order() {
     assert!(out.iter().all(|d| d.get("q") == Some(&Bson::Null)));
 }
 
+/// mongod 8.2.11 (2026-10-16): `$setWindowFields` emits its partitions in
+/// partition-key order -- null and missing first and together, numbers, then
+/// strings, under the collation -- keeping input order between equals.
+#[test]
+fn set_window_fields_emits_partitions_in_key_order() {
+    let docs = vec![
+        doc! {"_id": 1, "p": "c", "v": 1},
+        doc! {"_id": 2, "p": "a", "v": 2},
+        doc! {"_id": 3, "p": "b", "v": 3},
+        doc! {"_id": 4, "p": "a", "v": 0},
+        doc! {"_id": 5, "p": 2, "v": 9},
+        doc! {"_id": 6, "v": 5},
+        doc! {"_id": 7, "p": Bson::Null, "v": 4},
+        doc! {"_id": 8, "p": "B", "v": 1},
+        doc! {"_id": 9, "p": 1.0, "v": 7},
+        doc! {"_id": 10, "p": "c", "v": 1},
+    ];
+    let order = |sort: Option<Document>, coll: Option<&Collation>| -> Vec<i32> {
+        let mut spec = doc! {"partitionBy": "$p", "output": {"n": {"$count": {}}}};
+        if let Some(s) = sort {
+            spec.insert("sortBy", s);
+        }
+        run(docs.clone(), vec![doc! {"$setWindowFields": spec}], coll)
+            .iter()
+            .map(|d| d.get_i32("_id").unwrap())
+            .collect()
+    };
+    assert_eq!(
+        order(Some(doc! {"v": 1}), None),
+        vec![7, 6, 9, 5, 8, 4, 2, 3, 1, 10]
+    );
+    assert_eq!(
+        order(Some(doc! {"v": 1}), Some(&strength(2))),
+        vec![7, 6, 9, 5, 4, 2, 8, 3, 1, 10]
+    );
+    assert_eq!(order(None, None), vec![6, 7, 9, 5, 8, 2, 4, 3, 1, 10]);
+    assert_eq!(
+        order(None, Some(&strength(2))),
+        vec![6, 7, 9, 5, 2, 4, 3, 8, 1, 10]
+    );
+}
+
 #[test]
 fn an_update_under_a_collation() {
     let s2 = strength(2);

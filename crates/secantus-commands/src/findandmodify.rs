@@ -23,7 +23,7 @@
 use bson::{doc, Bson, Document};
 
 use crate::argtypes;
-use crate::util::{bool_field, command_error, command_error_during, doc_field, resolve_let_vars};
+use crate::util::{bool_field, command_error, command_error_during, doc_field};
 use crate::{CommandContext, CommandError, HandlerResult, StorageError};
 
 /// `findAndModify` / `findandmodify`.
@@ -280,6 +280,24 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     }
 
     let storage = ctx.storage()?;
+    // `$text` needs a text index, which this server cannot search: mongod's
+    // 27 (measured 8.2.11).
+    if let Some((code, errmsg)) =
+        crate::crud::text_query_problem(storage, &ctx.db_name, &coll, &query)
+    {
+        return Ok(
+            CommandError::new(code, crate::util::error_code_name(code), errmsg).into_reply(),
+        );
+    }
+    // A standalone has no cluster time for `$$CLUSTER_TIME` to read.
+    if let Some(e) = update.and_then(|u| {
+        crate::util::cluster_time_unavailable(
+            ctx.replica_set_name.is_none(),
+            std::slice::from_ref(u),
+        )
+    }) {
+        return Ok(e.into_reply());
+    }
     // A replacement is a document given whole: an empty timestamp in it is
     // filled, as on an insert.
     let filled_update = match update {
@@ -301,7 +319,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     crate::util::validate_write_hint(storage, &ctx.db_name, &coll, doc.get("hint"))?;
     // Command `let` (visible to `$expr` in `query`) + `collation` apply to the
     // match. The subsequent update/delete is keyed by the matched doc's `_id`.
-    let let_vars = resolve_let_vars(doc.get("let"));
+    let let_vars = crate::util::command_let_vars(doc.get("let"), ctx);
     let collation = crate::util::effective_collation(storage, &ctx.db_name, &coll, doc)?;
     let _active = secantus_core::collation::activate(collation.as_ref());
     // `arrayFilters` ($[ident] identifiers) for an operator-form update.

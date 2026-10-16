@@ -1109,6 +1109,22 @@ fn coll_mod_inner(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             opts.insert("max", int_bson(max));
         }
     }
+    // The change event and the oplog name them as the command did, first and
+    // as 64-bit integers, the fraction dropped and a `cappedMax` of 0 or less
+    // as sent (measured 8.2.11).
+    let given = {
+        let mut recorded = Document::new();
+        for (field, set) in [
+            ("cappedSize", capped_size_arg.is_some()),
+            ("cappedMax", capped_max_arg.is_some()),
+        ] {
+            if let (true, Some(n)) = (set, doc.get(field)) {
+                recorded.insert(field, Bson::Int64(as_i64(n).unwrap_or(0)));
+            }
+        }
+        recorded.extend(given);
+        recorded
+    };
     // `coll_mod` (not `set_collection_options`) so a `showExpandedEvents` change
     // stream sees the resulting `modify` event.
     storage
@@ -1213,10 +1229,11 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         Ok(ix) => ix.len().max(1),
         Err(_) => 1,
     };
-    // A time-series collection has no `_id` index to count.
+    // A time-series collection has no `_id` index to count, and a clustered
+    // collection does not count its clustered key (measured 8.2.11).
     let n_indexes = if storage
         .get_collection_options(&ctx.db_name, &coll)
-        .is_ok_and(|o| o.contains_key("timeseries"))
+        .is_ok_and(|o| o.contains_key("timeseries") || o.contains_key("clusteredIndex"))
     {
         n_indexes - 1
     } else {
@@ -2062,8 +2079,19 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         .get_collection_options(&ctx.db_name, &coll)
         .ok()
         .and_then(|o| crate::timeseries::Fields::of(&o));
-    let unlisted = usize::from(ts_fields.is_some());
+    // Nor does a clustered collection count its clustered `_id` key among
+    // its indexes, though `listIndexes` shows it (measured 8.2.11:
+    // `numIndexesBefore: 0` on a new clustered collection).
+    let clustered = storage
+        .get_collection_options(&ctx.db_name, &coll)
+        .is_ok_and(|o| o.contains_key("clusteredIndex"));
+    let unlisted = usize::from(ts_fields.is_some() || clustered);
     let before = before.saturating_sub(unlisted);
+    // Nor does an `_id` index it does not list conflict with one asked for.
+    let existing: Vec<Document> = existing
+        .into_iter()
+        .filter(|ix| ts_fields.is_none() || ix.get_str("name") != Ok("_id_"))
+        .collect();
     let mut any_created = false;
     let mut any_existed = false;
     // The indexes this request has built so far: mongod builds a request's
@@ -2088,8 +2116,10 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         // name was invented from the key.
         let spec_text = argtypes::render_stage_value(&Bson::Document(s.clone()));
         // The `_id` index always exists, under its own name: asking for it
-        // again, whatever the request calls it, creates nothing.
-        if key.len() == 1 && key.get("_id").and_then(as_i64) == Some(1) {
+        // again, whatever the request calls it, creates nothing. A
+        // time-series collection has none, and builds one as asked (mongod
+        // 8.2.11 lists it as `_id_1`).
+        if ts_fields.is_none() && key.len() == 1 && key.get("_id").and_then(as_i64) == Some(1) {
             // It has the collection's collation and takes no other.
             let full = |c: Option<secantus_core::collation::Collation>| match c {
                 Some(c) => c.spec().clone(),
@@ -3434,8 +3464,14 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let is_time_series = storage
         .get_collection_options(&ctx.db_name, &coll)
         .is_ok_and(|o| o.contains_key("timeseries"));
-    // A time-series collection lists no `_id` index, so none is counted.
-    let before = listed.len().saturating_sub(usize::from(is_time_series));
+    // A time-series collection lists no `_id` index, so none is counted;
+    // nor is a clustered collection's clustered key (measured 8.2.11).
+    let clustered = storage
+        .get_collection_options(&ctx.db_name, &coll)
+        .is_ok_and(|o| o.contains_key("clusteredIndex"));
+    let before = listed
+        .len()
+        .saturating_sub(usize::from(is_time_series || clustered));
     // The `_id` index is never dropped, by name, by key or in a list. By key
     // it used to be: `{dropIndexes: c, index: {_id: 1}}` removed it.
     let id_index = || {

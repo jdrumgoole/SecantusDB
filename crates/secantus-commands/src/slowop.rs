@@ -7,6 +7,8 @@
 //! are not persisted across a restart.
 
 use bson::Document;
+
+use crate::CommandContext;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -95,13 +97,79 @@ fn outcome(name: &str, reply: &Document, out: &mut Document) {
     }
 }
 
+/// What the line says about a read (RM-023): the `planSummary`, how many
+/// documents went back (`nreturned`) and the size of the reply (`reslen`),
+/// in mongod's order. Measured 8.2.11, 2026-10-16. `keysExamined`,
+/// `docsExamined` and the storage wait times are not given: they count the
+/// plan's own work, which only a read of the collection would reproduce.
+pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContext) -> Document {
+    let name = request.keys().next().map(String::as_str).unwrap_or("");
+    let mut out = Document::new();
+    if reply.get_f64("ok").unwrap_or(1.0) != 1.0 {
+        return out;
+    }
+    if let Some(summary) = crate::explain::summary::plan_summary(request, ctx) {
+        out.insert("planSummary", summary);
+    }
+    let batch = || -> Option<i64> {
+        if let Some(pending) = &ctx.pending_batch {
+            return Some(pending.batch.len() as i64);
+        }
+        let cursor = reply.get_document("cursor").ok()?;
+        cursor
+            .get_array("firstBatch")
+            .or_else(|_| cursor.get_array("nextBatch"))
+            .ok()
+            .map(|b| b.len() as i64)
+    };
+    let returned = match name {
+        "find" | "aggregate" | "getMore" => batch(),
+        "count" => Some(1),
+        "distinct" => reply.get_array("values").ok().map(|v| v.len() as i64),
+        _ => None,
+    };
+    if let Some(n) = returned {
+        out.insert("nreturned", n);
+    }
+    out.insert("reslen", response_length(reply, ctx));
+    out
+}
+
+/// The size of the reply on the wire, its document batch included: the
+/// same count as a profile entry's `responseLength`
+/// (`profiler::record::response_length`).
+fn response_length(reply: &Document, ctx: &CommandContext) -> i64 {
+    let body = bson::to_vec(reply).map_or(0, |b| b.len());
+    let batch = ctx.pending_batch.as_ref().map_or(0, |pending| {
+        let items: usize = pending
+            .batch
+            .iter()
+            .enumerate()
+            .map(|(i, blob)| 2 + i.to_string().len() + blob.len())
+            .sum();
+        2 + pending.batch_field.len() + 4 + items + 1
+    });
+    let frame = if ctx.op_query { 36 } else { 21 };
+    (frame + body + batch) as i64
+}
+
+/// The command as the line shows it: the request, without an `insert`'s
+/// documents (mongod 8.2.11 leaves them out too).
+fn command_shown(request: &Document) -> Document {
+    request
+        .iter()
+        .filter(|(k, _)| k.as_str() != "documents")
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 /// The attributes of one `Slow query` line, as relaxed Extended JSON. `ns` is
 /// `db.collection` for a command that names a collection and `db.$cmd`
-/// otherwise, as mongod has it. The command's own documents are left out: an
-/// `insert` of a thousand documents is not a log line.
+/// otherwise, as mongod has it. `read` is [`read_attributes`]' part.
 pub fn attributes(
     request: &Document,
     reply: &Document,
+    read: Document,
     db: &str,
     conn_id: i64,
     worked: Duration,
@@ -122,9 +190,14 @@ pub fn attributes(
     let mut attr = Document::new();
     attr.insert("type", "command");
     attr.insert("ns", ns);
-    attr.insert("command", name);
+    attr.insert("command", command_shown(request));
     attr.insert("ctx", format!("conn{conn_id}"));
+    let mut read = read;
+    if let Some(summary) = read.remove("planSummary") {
+        attr.insert("planSummary", summary);
+    }
     outcome(name, reply, &mut attr);
+    attr.extend(read);
     attr.insert("workingMillis", worked.as_millis() as i64);
     attr.insert("durationMillis", total.as_millis() as i64);
     bson::Bson::Document(attr)
@@ -165,6 +238,7 @@ mod tests {
         let line = attributes(
             &doc! {"insert": "t", "documents": [{"payload": "x"}], "$db": "a"},
             &doc! {"n": 100_i32, "ok": 1.0},
+            Document::new(),
             "a",
             7,
             Duration::from_millis(4140),
@@ -172,7 +246,7 @@ mod tests {
         );
         assert_eq!(
             line,
-            r#"{"type":"command","ns":"a.t","command":"insert","ctx":"conn7","ninserted":100,"workingMillis":4140,"durationMillis":4140}"#
+            r#"{"type":"command","ns":"a.t","command":{"insert":"t","$db":"a"},"ctx":"conn7","ninserted":100,"workingMillis":4140,"durationMillis":4140}"#
         );
     }
 
@@ -181,15 +255,38 @@ mod tests {
         let line = attributes(
             &doc! {"getMore": 7_i64, "collection": "t", "$db": "a"},
             &doc! {"ok": 1.0},
+            Document::new(),
             "a",
             2,
             Duration::from_millis(120),
             Duration::from_millis(1120),
         );
-        assert!(line.contains(r#""ns":"a.t","command":"getMore""#), "{line}");
+        assert!(
+            line.contains(r#""ns":"a.t","command":{"getMore":7,"collection":"t","$db":"a"}"#),
+            "{line}"
+        );
         assert!(
             line.contains(r#""workingMillis":120,"durationMillis":1120"#),
             "{line}"
+        );
+    }
+
+    /// mongod 8.2.11's order: the plan after the command, the counts
+    /// after the outcome, the times last.
+    #[test]
+    fn a_read_names_its_plan_and_what_it_returned() {
+        let line = attributes(
+            &doc! {"find": "t", "filter": {"x": {"$gt": 1}}, "$db": "a"},
+            &doc! {"ok": 1.0},
+            doc! {"planSummary": "IXSCAN { x: 1 }", "nreturned": 3_i64, "reslen": 195_i64},
+            "a",
+            4,
+            Duration::from_millis(101),
+            Duration::from_millis(101),
+        );
+        assert_eq!(
+            line,
+            r#"{"type":"command","ns":"a.t","command":{"find":"t","filter":{"x":{"$gt":1}},"$db":"a"},"ctx":"conn4","planSummary":"IXSCAN { x: 1 }","nreturned":3,"reslen":195,"workingMillis":101,"durationMillis":101}"#
         );
     }
 
@@ -198,6 +295,7 @@ mod tests {
         let line = attributes(
             &doc! {"ping": 1_i32, "$db": "a"},
             &doc! {"ok": 0.0, "code": 2_i32, "codeName": "BadValue", "errmsg": "x"},
+            Document::new(),
             "a",
             1,
             Duration::from_millis(150),
@@ -205,7 +303,7 @@ mod tests {
         );
         assert_eq!(
             line,
-            r#"{"type":"command","ns":"a.$cmd","command":"ping","ctx":"conn1","ok":0,"errCode":2,"errName":"BadValue","workingMillis":150,"durationMillis":1150}"#
+            r#"{"type":"command","ns":"a.$cmd","command":{"ping":1,"$db":"a"},"ctx":"conn1","ok":0,"errCode":2,"errName":"BadValue","workingMillis":150,"durationMillis":1150}"#
         );
     }
 }

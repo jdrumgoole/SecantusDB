@@ -492,6 +492,40 @@ def test_secantus_admin_prune_commands(tmp_path) -> None:
         srv.stop()
 
 
+def test_ttl_monitor_starts_off_and_can_be_switched_on(tmp_path) -> None:
+    """RM-103: the embedded handle has a TTL monitor. Started without
+    `ttl_sweep_seconds` it is switched off (as mongod's is with
+    `ttlMonitorEnabled=false`) and `setParameter` turns it on; started with
+    one, `getParameter` reports that cadence, as mongod reports the
+    `ttlMonitorSleepSecs` it was started with (8.2.11)."""
+    import datetime
+
+    srv = _server.RustServer(str(tmp_path / "off"), 0)
+    try:
+        client = _client(srv)
+        got = client.admin.command("getParameter", 1, ttlMonitorEnabled=1, ttlMonitorSleepSecs=1)
+        assert (got["ttlMonitorEnabled"], got["ttlMonitorSleepSecs"]) == (False, 60)
+        coll = client["t"]["c"]
+        coll.create_index("d", expireAfterSeconds=0)
+        coll.insert_one({"d": datetime.datetime(2000, 1, 1)})
+        client.admin.command("setParameter", 1, ttlMonitorSleepSecs=1, ttlMonitorEnabled=True)
+        deadline = time.monotonic() + 10
+        while coll.count_documents({}) and time.monotonic() < deadline:
+            time.sleep(0.2)
+        assert coll.count_documents({}) == 0
+    finally:
+        srv.stop()
+
+    srv = _server.RustServer(str(tmp_path / "on"), 0, ttl_sweep_seconds=7.0)
+    try:
+        got = _client(srv).admin.command(
+            "getParameter", 1, ttlMonitorEnabled=1, ttlMonitorSleepSecs=1
+        )
+        assert (got["ttlMonitorEnabled"], got["ttlMonitorSleepSecs"]) == (True, 7)
+    finally:
+        srv.stop()
+
+
 def test_secantus_admin_restore_archive_roundtrips(tmp_path) -> None:
     """backupArchive -> restoreArchive round-trips data through a fresh dir, and
     the restored directory is a startable WT home (issue #163)."""

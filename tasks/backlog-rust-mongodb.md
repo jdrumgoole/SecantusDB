@@ -587,8 +587,16 @@ These are explicit non-goals. Don't add them without a reason.
       lock) and bytes written by the operation; ours has only the duration.
       WiredTiger keeps these per session (`statistics:session`), but the
       storage layer opens a session per operation and exposes none of it.
-      Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
-      `nreturned`, `reslen`, and the command document.
+      Also not on the line: `keysExamined` and `docsExamined`. Those count
+      the plan's own work; `explain` derives them only by reading the whole
+      collection, which a log line must not do, so they need counters from
+      the read itself, and PER BATCH: mongod 8.2.11 counts each `find` /
+      `getMore` batch's own work (2, 2, 2, then 0 for a `batchSize: 2` read
+      of 6 documents), so a whole-query `explain` total would be wrong.
+      A `getMore` line also lacks the cursor's `planSummary` (mongod repeats
+      it on every batch) and `cursorExhausted: true` on the last one.
+      (The command document, `planSummary` on the opening command,
+      per-batch `nreturned` and `reslen` are on the line since 2026-10-16.)
       Backlog-ID: RM-023
       Verify: tests/backlog/test_rm_001_028.py::test_slow_query_line_says_where_the_time_went
 
@@ -628,7 +636,15 @@ may run a command.
       Verify: tests/backlog/test_rm_001_028.py::test_dbhash_includes_timeseries_buckets
 - [ ] **`mapReduce` with `out`** (18) answers an error here (9, "only
       supports {out: {inline: 1}}") where mongod runs it; the users allowed
-      are the same. `compact` and `setParameter notablescan` match mongod
+      are the same. Without a JavaScript engine only the one shape the
+      command already recognises (`emit(this.f, 1)` reduced by
+      `values.length`) could be written to a collection, and the gap test's
+      `Array.sum(v)` is not it: writing `out` for that shape alone is a
+      stand-in, and a JS engine is a decision for Joe (2026-10-16). Any
+      other inline map/reduce is refused as a `--noscripting` mongod refuses
+      it (31264, 2026-10-16); it used to answer `ok` with no results.
+      `compact` and
+      `setParameter notablescan` match mongod
       8.2.11 (re-measured 2026-10-15; the test still asserts all three).
       `reIndex` refuses as mongod does on a replica-set primary, which this
       server reports itself as; compared against a standalone mongod it looks
@@ -658,7 +674,11 @@ What is open:
 
 - [ ] **`rolesInfo: 1` lists stored roles by name** (2): mongod lists them
       in the order they were created. The role table is keyed by database
-      and name and holds no sequence.
+      and name and holds no sequence. **Needs a decision (2026-10-16):**
+      `table:secantus_roles` is the Python server's too, so a sequence is an
+      on-disk change it reads: a field in the record shows in its
+      `rolesInfo`, and a side table it does not write goes stale when it
+      drops and recreates a role. About two hours once decided.
       Backlog-ID: RM-029
       Verify: tests/backlog/test_rm_029_056.py::test_roles_info_lists_roles_in_creation_order
 - [ ] **The order of a set of roles** (5): a user's `roles` after
@@ -805,6 +825,15 @@ Still different:
       order, and reads a geo index's `multikey` from the documents now.
       Backlog-ID: RM-040
       Verify: tests/backlog/test_rm_029_056.py::test_coll_stats_wiredtiger_and_index_details,tests/backlog/test_rm_029_056.py::test_list_databases_lists_admin_and_config
+- [ ] **RUST MongoDB server: `$listLocalSessions` / `$listSessions` do not
+      know whose session is whose.** With `--auth`, mongod 8.2.11 lists
+      only the caller's sessions for `$listLocalSessions: {}`, each `_id.uid`
+      the SHA-256 of `user@db`; this server lists every session it has seen
+      with the empty string's hash as `uid` (`aggregate.rs::known_sessions`
+      -- the session registry keeps no user). Found 2026-10-16 beside the
+      transaction events' `lsid.uid`, which does hash the user now.
+      Backlog-ID: RM-156
+      Verify: tests/backlog/test_rm_057_084.py::test_list_local_sessions_lists_the_callers_by_user_hash
 
 ### 7.081 Geo queries -- 2026-10-13
 
@@ -1036,14 +1065,13 @@ opens the store (`backfill_document_id_claims`, once for a store; a row in
 `UNIQ_TABLE` under an empty namespace records it). Two stored documents
 already equal by value both stay, and the older holds the claim.
 
-Still different, all 32:
+Still different, of those 32 (the other four are the items below):
 
 - **The message for a hint that names no index** (20, with 7.077's 7).
   mongod prints its query tree. Joe's call, not made.
 - `$where` in a query (3): not run here.
 - `$near` with no geo index (2): mongod answers 291; this server finds
   nothing.
-- `includeQueryStatsMetrics` (2): mongod adds a `metrics` document.
 - Which unique index a duplicate of two is reported for (1): mongod
   checks them in the order they were built, which the catalog does not
   record (the same gap as `listIndexes` order).
@@ -1051,14 +1079,34 @@ Still different, all 32:
   (1): ICU's bytes.
 - `$expr` that fails when folded (1): mongod adds `Failed to optimize
   expression :: caused by ::`.
-- `distinct` over a multikey index (1): mongod returns `9` for a value
-  nested as `[8, [9]]`, where its collection scan returns `[9]`.
-- `distinct` with a collation over an index of that collation (1): mongod
-  leaves out `null`.
 
-Not measured: a `readConcern` with `atClusterTime` older than the oldest
-timestamp is `239 SnapshotTooOld` on `find`, `aggregate` and `distinct`;
-this server runs the read.
+A `readConcern` with an `atClusterTime` older than the oldest timestamp is
+`239 SnapshotTooOld` on `find`, `aggregate` and `distinct`, as on mongod
+(measured 2026-10-16).
+
+- [ ] **RUST MongoDB server: `includeQueryStatsMetrics` adds nothing.**
+      mongod 8.2.11 answers `includeQueryStatsMetrics: true` on `find`,
+      `aggregate` and `distinct` with a `metrics` document: `keysExamined`,
+      `docsExamined`, `hasSortStage`, `usedDisk`, `fromMultiPlanner`,
+      `fromPlanCache` (which the explain module's plan and executionStats
+      could supply), and work and time counters (`cpuNanos: -1`,
+      `numInterruptChecks`, `workingTimeMillis`, ...) that no plan derives.
+      Backlog-ID: RM-170
+      Verify: tests/backlog/test_rm_found_2026_10_16.py::test_include_query_stats_metrics_adds_a_metrics_document
+- [ ] **RUST MongoDB server: `distinct` over a multikey index answers from
+      the documents.** mongod answers a `distinct` its planner gives a
+      DISTINCT_SCAN (the explain module already says when) from the index
+      keys, each array key unwound once, so `[8, [9]]` gives `9` where a
+      collection scan gives `[9]`.
+      Backlog-ID: RM-171
+      Verify: tests/backlog/test_rm_found_2026_10_16.py::test_distinct_over_a_multikey_index
+- [ ] **RUST MongoDB server: `distinct` through a collated index keeps
+      `null`.** Under a collation the DISTINCT_SCAN cannot read values back
+      from the keys, so mongod fetches one document per index key, the first
+      in index order: a null key whose first document lacks the field leaves
+      `null` out. The same mechanism as RM-171.
+      Backlog-ID: RM-172
+      Verify: tests/backlog/test_rm_found_2026_10_16.py::test_distinct_through_a_collated_index_leaves_out_null
 
 ### 7.077 `update` and `findAndModify` -- 2026-10-12
 
@@ -1084,18 +1132,6 @@ What is left, on the RUST MongoDB server:
 - [ ] **`$where` in an update's query** is refused (no JavaScript).
   Backlog-ID: RM-060
   Verify: tests/backlog/test_rm_057_084.py::test_where_in_an_update_query
-- [ ] **`$text` in an update's query** answers a generic refusal; mongod
-      answers 27, `text index required for $text query`.
-      Backlog-ID: RM-061
-      Verify: tests/backlog/test_rm_057_084.py::test_text_in_an_update_query_without_a_text_index
-- [ ] **`$$CLUSTER_TIME`** in a pipeline update is refused.
-  Backlog-ID: RM-062
-  Verify: tests/backlog/test_rm_057_084.py::test_cluster_time_in_a_pipeline_update
-- [ ] **`$replaceWith` of a non-document in an update** names only the
-      fields the expression read as the input document; mongod prints the
-      whole document there (and only those fields in `aggregate`).
-      Backlog-ID: RM-063
-      Verify: tests/backlog/test_rm_057_084.py::test_replace_with_a_non_document_in_an_update
 - [ ] **A parse error in `$currentDate` against a collection that does not
       exist** is no longer reported, since the statement is skipped.
       Backlog-ID: RM-065
@@ -1182,40 +1218,27 @@ member: 115 scenarios over a raw connection (what `$changeStream` accepts,
 every event's shape, `getMore`, the invalidating operations, resuming by
 `resumeAfter` / `startAfter` / `startAtOperationTime`, the three scopes,
 pre-images, transactions), each on a database of its own. The Rust server
-differs on 5 results. The harness salts database names per run, because
+differs on 2 results (re-measured 2026-10-16; 5 before). The harness salts database names per run, because
 mongod keeps the oplog of earlier runs and a stream started in the past
 would see them. What is left:
 
-- [ ] **RUST MongoDB server: a resume token mongod cannot decode gets this
-      server's one error.** mongod parses a token as a KeyString and
-      reports where it failed (`Invalid advance (8) past end of buffer`,
-      15; `KeyString format error: Unknown type: 0`, 50811) for `_data`
-      that is valid hex but not a token; this server answers 40647 for all
-      of them. Its tokens are its own encoding (hex of a BSON document),
-      not mongod's, so a token from one cannot be given to the other (3 of
-      the 5).
+- [ ] **RUST MongoDB server: a resume token in mongod's own format gets
+      40647.** This server's tokens are its own encoding (hex of a BSON
+      document), so a token from one cannot be given to the other. A token
+      neither server can read now gets mongod's error (its KeyString decoder
+      is transcribed in `secantus-commands/src/resume_keystring.rs`); what
+      is left: a token that decodes cleanly, which mongod looks for in its
+      oplog (280 `the resume token was not found`), and two shapes the
+      transcription leaves out -- a tiny decimal in `_data`, and a token
+      with `_typeBits` -- which also answer 40647.
       Backlog-ID: RM-075
-      Verify: tests/backlog/test_rm_057_084.py::test_undecodable_resume_token_errors
+      Verify: tests/backlog/test_rm_057_084.py::test_well_formed_mongod_token_is_looked_up
 - [ ] **RUST MongoDB server: `explain` of a `$changeStream` is this
       server's plan.** mongod explains the oplog scan it would run, with
       the full match over `local.oplog.rs`; not reproduced, like the rest
-      of mongod's planner output (1 of the 5).
+      of mongod's planner output (1 of the 2).
       Backlog-ID: RM-076
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_a_change_stream_scans_the_oplog
-- [ ] **RUST MongoDB server: a `delete` with `limit: 0` after a `multi`
-      update deletes in natural order.** mongod 8.2.11 deleted the two
-      documents in the reverse order; why was not measured (1 of the 5).
-      Backlog-ID: RM-077
-      Verify: tests/backlog/test_rm_057_084.py::test_delete_order_after_a_multi_update
-- [ ] **RUST MongoDB server: smaller change-stream differences.** The
-      `lsid` on a transaction's events carries the SHA-256 of the empty
-      string as `uid` whoever is authenticated (mongod hashes the user). A
-      280 error's message shows the whole token; mongod shows 128
-      characters and `...`, and this server's tokens are usually shorter.
-      A token
-      from before 2026-10-11 is lower-case hex and still resumes.
-      Backlog-ID: RM-078
-      Verify: tests/backlog/test_rm_057_084.py::test_resume_token_not_found_message_cuts_the_token
 - [ ] **RUST MongoDB server: an event over 16 MB is split differently.**
       This server's first fragment carries `fullDocument`, mongod 8.2.11's
       carries `updateDescription`. (Sharded-only event types --
@@ -1256,12 +1279,25 @@ differs on 5 scenarios. What is left:
       Verify: tests/backlog/test_rm_057_084.py::test_aggregate_cursor_after_its_index_is_dropped
 - [ ] **RUST MongoDB server: smaller cursor differences.** A projection of
       `{$meta: "recordId"}` or `{$meta: "indexKey"}` adds nothing (mongod:
-      the record id, the index key). An unknown hint is refused with the code and this server's own text,
+      the record id, the index key), and `showRecordId` gives each document
+      its position in the reply, not its RecordId (after the first of four
+      is deleted mongod says 2, 3, 4; this server 1, 2, 3).
+      **The record id needs a decision:** mongod numbers records per
+      collection from 1 and stores the counter; this store's RecordId is
+      one counter for every collection, and no per-collection one is kept.
+      Reporting the store's own would be this server's real record id but
+      not mongod's number. `indexKey` needs no decision: the key the plan's
+      index scan read for the document (a multikey document's first key in
+      bounds), as a document with its fields in name order (`{z: 1, a: -1}`
+      gives `{a: .., z: ..}`), measured 8.2.11; about half a day with the
+      explain module's bounds. In `aggregate`, `$project` takes both, and
+      `$addFields` adds nothing (mongod's oddity, 8.2.11).
+      An unknown hint is refused with the code and this server's own text,
       a decision already made (`tests/test_rust_hint_error_message.py`).
       Not probed: `oplogReplay`, `$meta: "textScore"` sorts, an
       `explain: true` aggregate.
       Backlog-ID: RM-083
-      Verify: tests/backlog/test_rm_057_084.py::test_meta_record_id_and_index_key_projections
+      Verify: tests/backlog/test_rm_057_084.py::test_meta_record_id_and_index_key_projections, tests/backlog/test_rm_found_2026_10_16.py::test_show_record_id_is_the_record_id
 
 ### 7.072 Sessions, transactions and retryable writes -- 2026-10-11
 
@@ -1301,9 +1337,11 @@ retryable writes). The Rust server differs on 11 scenarios. What is left:
 
 ### 7.071 Time-series collections -- 2026-10-11
 
-`tools/probes/time_series.py`, mongod 8.2.11: 187 scenarios on a fresh
-database each (what `create` accepts, inserts, reads, the restricted writes,
-indexes, `collMod`, rename and the rest). The Rust server differs on 6.
+`tools/probes/time_series.py`, mongod 8.2.11: 191 scenarios on a fresh
+database each (what `create` accepts, inserts, reads, where measurements are
+placed, the restricted writes, indexes, `collMod`, rename and the rest). The
+Rust server differs on 5, and on a sixth (`listCollections` order) in the
+runs where mongod's own order comes out the other way (2026-10-16).
 mongod keeps the rows as buckets in `system.buckets.<name>` and presents the
 collection as a view; this server keeps ordinary documents, and most of what
 is left follows from that:
@@ -1314,11 +1352,14 @@ is left follows from that:
       buckets out when asked (`crates/secantus-commands/src/ts_buckets.rs`):
       reads of `system.buckets.<name>` and `system.views`, the listings, the
       scan order, `validate`, `collStats` and `$collStats`. What that leaves:
-      - **Placement can differ for a batch that runs backwards in time.**
-        mongod sorts an insert batch before placing it; the derivation sees
-        only insertion order, so such a batch can make more buckets here.
-        A bucket also never closes for size or a schema change here, only
-        at 1,000 measurements.
+      - **A bucket never closes for size.** (Batches are sorted by time,
+        and a field changing type rolls a bucket over, as on mongod, since
+        2026-10-16.) mongod's size limit depends on its cache size and on
+        how many buckets the whole server has open
+        (`getCacheDerivedBucketMaxSize`), and a bucket of fewer than 10
+        measurements stays open for large ones: modelling that state is a
+        decision for Joe. The reopening query's own size filter is left out
+        for the same reason.
       - **A bucket's `data` columns are valid but not mongod's bytes.** Each
         value is a literal and each gap a skip. mongod 8.2.11 unpacks them to
         the same measurements (checked by inserting one into its
@@ -1335,10 +1376,11 @@ is left follows from that:
       Backlog-ID: RM-088
       Verify: tests/backlog/test_rm_085_112.py::test_bucket_collection_can_be_deleted_from
 - [ ] **RUST MongoDB server: smaller time-series differences.** A
-      measurement inserted with no `_id` is given one (mongod stores none);
-      an index on `{_id: 1}` reports that it already exists (mongod builds
-      one); a `hashed` index is refused as on any collection (mongod builds
-      it); a hint of `{_id: 1}` is refused with this server's wording for an
+      measurement inserted with no `_id` is given one (mongod stores none;
+      storing one without would change the documents the Python server
+      reads, so it waits on that decision); a `hashed` index is refused as
+      on any collection (mongod builds it); a hint of `{_id: 1}` is refused
+      with this server's wording for an
       unknown hint. `listCollections` puts each bucket namespace after its
       collection and `system.views` last; mongod's order is not stable
       between two runs of the same commands.
@@ -1364,7 +1406,10 @@ What is left, there and beside it:
       `"a b"` and `"a​b"` equal to their neighbours and mongod
       does not. mongod links ICU 57.1 and ICU4X carries newer CLDR data, so a
       character or tailoring added since can order differently; none was
-      found in 24 locales.
+      found in 24 locales. ICU4X cannot turn normalization off (its
+      `CollatorOptions` documents it as always on, no BCP47 `kk`), so this
+      needs ICU itself or a collator of our own: a decision, not a fix
+      (checked 2026-10-16, icu_collator 2.3.1).
       Backlog-ID: RM-091
       Verify: tests/backlog/test_rm_085_112.py::test_canonically_equivalent_strings_differ_without_normalization
 - [ ] **RUST MongoDB server: collated `_id` uniqueness, what is left.**
@@ -1389,7 +1434,12 @@ What is left, there and beside it:
 - [ ] **RUST MongoDB server: five collation types are refused.** `search`,
       `searchjl`, `big5han`, `gb2312han` and `phonetic` (as
       `@collation=<type>`) are not in ICU4X's bundled data; the server
-      answers 2 naming the type, mongod accepts them.
+      answers 2 naming the type, mongod accepts them. Sized 2026-10-16:
+      current CLDR still has `search` (root, ko), `searchjl` (ko) and
+      `phonetic` (ln), so ICU4X data generated with them (icu4x-datagen,
+      a baked data module) could carry those three; `big5han` and
+      `gb2312han` are no longer in CLDR at all and exist only in ICU 57's
+      data. Either way a build-time data pipeline: a decision for Joe.
       Backlog-ID: RM-095
       Verify: tests/backlog/test_rm_085_112.py::test_five_collation_types_are_accepted
 - [ ] **RUST MongoDB server: smaller collation differences.** `Did you
@@ -1412,23 +1462,19 @@ What is left, there and beside it:
       does for a second spelling. Message text only (found 2026-10-14).
       Backlog-ID: RM-142
       Verify: tests/backlog/test_rm_found_2026_10_14.py::test_exact_duplicate_id_under_a_default_collation_names_the_collation
-- [ ] **RUST MongoDB server: `$densify` with `bounds: "full"` and
-      `partitionByFields` fills each partition only to its own ends.**
-      mongod fills every partition across the whole collection's range, and
-      its output has a quirk: the second document in sort order, when it
-      starts a new partition, is emitted as it stands and its partition is
-      then filled from the start, repeating that value (`[(a,0), (c,1),
-      (a,2), (b,3)]` gives a generated `(c,1)` beside the stored one). Not
-      reproduced; the rule needs more than the six shapes measured.
-      Backlog-ID: RM-097
-      Verify: tests/backlog/test_rm_085_112.py::test_densify_full_partitions_fill_the_whole_range
-- [ ] **RUST MongoDB server: `$setWindowFields` emits partitions in the
-      order first seen.** `$fill` was measured on 2026-10-10 to emit them in
-      partition-key order and now does; an older note in `windowfields.rs`
-      records first-seen order as measured for `$setWindowFields`, which was
-      not re-measured.
-      Backlog-ID: RM-098
-      Verify: tests/backlog/test_rm_085_112.py::test_set_window_fields_partition_order
+
+- [ ] **RUST MongoDB server: `$densify` with `partitionByFields` and
+      `bounds: "partition"` or explicit bounds emits partitions in the order
+      first seen.** mongod 8.2.11 sorts by the partition fields and then the
+      field, so they come out in key order (the documents and fillers are the
+      same). With explicit bounds mongod also fills each partition's tail
+      after the last document, in its partition table's hash order, which
+      varies between runs. `bounds: "full"` is transcribed from mongod's
+      `DocumentSourceInternalDensify` (`densify.rs::full_partitioned`); the
+      other two modes could run through the same state machine. Found
+      2026-10-16.
+      Backlog-ID: RM-157
+      Verify: tests/backlog/test_rm_085_112.py::test_densify_partition_bounds_emit_in_partition_order
 
 ### 7.069 A WiredTiger panic opening a store, in CI on macOS -- 2026-10-10
 
@@ -1493,18 +1539,6 @@ What is left, there and beside it:
 wording filed under 7.067) and 2 TTL results
 (`tasks/rust-mongod-remaining-plan.md`, 2026-10-14). What is left:
 
-- [ ] **RUST MongoDB server: a clustered collection reports an `_id` index.**
-      `createIndexes` on one answers `numIndexesBefore: 1`; `mongod` answers
-      0, because the clustered key is not a separate index.
-      Backlog-ID: RM-100
-      Verify: tests/backlog/test_rm_085_112.py::test_clustered_collection_has_no_separate_id_index
-- [ ] **RUST MongoDB server: a pipeline upsert that yields an array `_id`
-      answers 53.** `mongod` answers 54 (`... the (immutable) field '_id' was
-      found to be an array or array descendant`), as it does for a
-      replacement, which the Rust server matches. The storage path cannot
-      tell a pipeline from an operator update.
-      Backlog-ID: RM-101
-      Verify: tests/backlog/test_rm_085_112.py::test_pipeline_upsert_with_array_id
 - [ ] **RUST MongoDB server: `upsertSupplied` is two steps.** The update runs
       without the upsert, and when nothing matched `c.new` is inserted: not
       one atomic statement, so a concurrent insert between the two can make
@@ -1512,13 +1546,6 @@ wording filed under 7.067) and 2 TTL results
       the query's, re-measured 2026-10-14.)
       Backlog-ID: RM-102
       Verify: none -- a race between the two steps; no deterministic check
-- [ ] **RUST MongoDB server: `getParameter ttlMonitorSleepSecs` reads 60 until
-      a client sets it**, whatever cadence the server was started with, and a
-      server started with the sweep off (`ttl_sweep_seconds = 0`) has no
-      monitor for `ttlMonitorEnabled` to turn on. The embedded Python
-      `RustServer` handle runs no monitor at all.
-      Backlog-ID: RM-103
-      Verify: tests/backlog/test_rm_085_112.py::test_ttl_monitor_sleep_secs_reports_the_started_cadence
 - [ ] **RUST MongoDB server: the TTL cutoff is exclusive.** A date exactly
       `expireAfterSeconds` old is kept until the next pass. Which side
       `mongod` puts that one millisecond on was not measured.
@@ -1547,13 +1574,12 @@ dropped (four), and `listIndexes` lists by name.
 `tools/probes/views.py`, mongod 8.2.11: the Rust server is at 0 of 70
 (`tasks/rust-mongod-remaining-plan.md`, 2026-10-14). What is left beside it:
 
-- [ ] **RUST MongoDB server: smaller view differences.** A `hint` naming an
-      index on a view is ignored (`mongod`: 2, `hint provided does not
-      correspond to an existing index`); `$indexStats` on a view answers
-      (`mongod`: 40602); `distinct` on a view returns values in scan order,
-      `mongod` in hash order.
+- [ ] **RUST MongoDB server: `distinct` on a view returns values sorted.**
+      `mongod` runs it as a `$group` and answers in its hash table's order
+      (stable per build: `[3, {z: 1}, 2, 1, "x", null, 1.5]` for those
+      values on 8.2.11). Reproducing it means mongod's `Value` hash.
       Backlog-ID: RM-108
-      Verify: tests/backlog/test_rm_085_112.py::test_hint_on_a_view_is_refused, tests/backlog/test_rm_085_112.py::test_index_stats_on_a_view_is_refused
+      Verify: tests/backlog/test_rm_085_112.py::test_distinct_on_a_view_in_mongod_order
 - [ ] **`mongod` 8.2.11 itself crashes on `{collMod: <a view>, cappedSize:
       100}`** (the connection closes and the server is gone). Not ours; the
       Rust server answers 72 `Collection must be capped.` Do not put that
@@ -1563,19 +1589,6 @@ dropped (four), and `listIndexes` lists by name.
 
 ### 7.065 Capped collections -- 2026-10-09
 
-- [ ] **RUST MongoDB server: a `collMod` of `cappedSize` / `cappedMax` is
-      written to the oplog as `size` / `max`.** `mongod` records the command
-      as sent. Replay applies it correctly; a `showExpandedEvents` change
-      stream shows different field names. Not probed.
-      Backlog-ID: RM-110
-      Verify: tests/backlog/test_rm_085_112.py::test_coll_mod_capped_size_event_names_fields_as_sent
-- [ ] **RUST MongoDB server: capped eviction rescans the whole collection on
-      every insert chunk.** `enforce_capped_bounds` calls `scan_docs` and sums
-      every document's size to learn the collection's size and count, so an
-      insert into a capped collection costs time proportional to the
-      collection. Not measured. A running size and count would remove it.
-      Backlog-ID: RM-111
-      Verify: none -- performance (rescan per insert), no answer differs
 
 ### 7.05 MongoDB-server backlog close-out -- 2026-10-07
 

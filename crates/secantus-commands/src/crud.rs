@@ -39,9 +39,7 @@ pub(crate) fn validation_error_info(validator: &Document, doc: &Document) -> Doc
 }
 
 use crate::argtypes;
-use crate::util::{
-    as_i64, bool_field, coll_arg, command_error, doc_field, resolve_let_vars, write_error,
-};
+use crate::util::{as_i64, bool_field, coll_arg, command_error, doc_field, write_error};
 use crate::{CommandContext, CommandError, HandlerResult, StorageError};
 
 /// Build the `insert` reply from storage's outcome: remap storage's
@@ -923,6 +921,8 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mut pre_errors: Vec<Document> = Vec::new();
     let mut surviving: Vec<Vec<u8>> = Vec::new();
     let mut survivor_to_orig: Vec<usize> = Vec::new();
+    // Each surviving measurement's time, for a time-series collection.
+    let mut times: Vec<i64> = Vec::new();
     for (index, entry) in documents.iter().copied().enumerate() {
         let Bson::Document(d) = entry else {
             // Non-document batch entries are malformed input; mongod rejects
@@ -1005,6 +1005,30 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             None => encode_doc(d)?,
         });
         survivor_to_orig.push(index);
+        if let Some(f) = &ts_fields {
+            times.push(match d.get(&f.time) {
+                Some(Bson::DateTime(t)) => t.timestamp_millis(),
+                _ => 0,
+            });
+        }
+    }
+
+    // A time-series batch is placed in time order: mongod 8.2.11 sorts each
+    // meta value's measurements by time before it buckets them, so a batch
+    // that runs backwards in time shares a bucket where one-at-a-time
+    // inserts would not. The buckets here are derived from the order the
+    // measurements are stored in (`ts_buckets`), so the batch is stored
+    // sorted. An ordered batch that stopped at a bad measurement is placed
+    // one measurement at a time, as written (measured).
+    if ts_fields.is_some() && !(ordered && !pre_errors.is_empty()) {
+        let mut by_time: Vec<usize> = (0..surviving.len()).collect();
+        by_time.sort_by_key(|&i| times[i]);
+        let mut docs: Vec<Option<Vec<u8>>> = surviving.into_iter().map(Some).collect();
+        surviving = by_time
+            .iter()
+            .map(|&i| docs[i].take().unwrap_or_default())
+            .collect();
+        survivor_to_orig = by_time.iter().map(|&i| survivor_to_orig[i]).collect();
     }
 
     // An ordered batch stops AT the pre-check failure; the documents before
@@ -1045,7 +1069,7 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mut n = 0_i32;
     let mut write_errors: Vec<Bson> = Vec::new();
     // Command-level `let` → vars visible to `$expr` in each spec's `q` filter.
-    let let_vars = resolve_let_vars(doc.get("let"));
+    let let_vars = crate::util::command_let_vars(doc.get("let"), ctx);
     // A `let` mongod refuses is reported for each statement it reaches.
     let let_problem = match doc.get("let") {
         Some(Bson::Document(vars)) => argtypes::let_problem(vars),
@@ -1183,19 +1207,40 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 },
             )
             .unwrap_or(None)
+        } else if ctx.replica_set_name.is_some() {
+            // Every match, in the order mongod's plan reads them, for the
+            // batches it deletes them in. Only the oplog shows that order, so
+            // a standalone does not pay for the extra read.
+            crate::explain::order::delete_order(
+                storage,
+                &crate::explain::order::Ask {
+                    db: &ctx.db_name,
+                    coll: &coll,
+                    filter: &filter,
+                    sort: None,
+                    hint: argtypes::given_hint(spec),
+                    collation: collation.as_ref(),
+                    vars: &let_vars,
+                    limit: 0,
+                    asked: Default::default(),
+                },
+            )
+            .unwrap_or(None)
         } else {
             None
         };
-        let deleted = crate::explain::order::pinned(storage, first, || {
-            storage.delete_matching_hinted(
-                &ctx.db_name,
-                &coll,
-                &filter,
-                limit,
-                &let_vars,
-                collation.as_ref(),
-                argtypes::given_hint(spec),
-            )
+        let deleted = crate::explain::order::in_delete_batches(storage, || {
+            crate::explain::order::pinned(storage, first, || {
+                storage.delete_matching_hinted(
+                    &ctx.db_name,
+                    &coll,
+                    &filter,
+                    limit,
+                    &let_vars,
+                    collation.as_ref(),
+                    argtypes::given_hint(spec),
+                )
+            })
         });
         if deleted.is_ok() {
             crate::explain::order::count_index_use(
@@ -1370,12 +1415,17 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             Some(c) => c.spec().clone(),
             None => doc! { "locale": "simple" },
         };
-        let agg = doc! {
+        let mut agg = doc! {
             "aggregate": view_on,
             "pipeline": pipeline,
             "cursor": {},
             "collation": view_collation,
         };
+        // A hint names an index of the collection beneath the view (mongod
+        // refuses one that names none, 2).
+        if let Some(hint) = argtypes::given_hint(doc) {
+            agg.insert("hint", hint.clone());
+        }
         let reply = crate::aggregate::aggregate(&agg, ctx)?;
         reply
             .get_document("cursor")
@@ -1627,12 +1677,14 @@ fn update_command_problem(doc: &Document) -> Option<CommandError> {
 
 pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let notablescan = crate::notablescan::enabled(ctx);
+    let cluster_time = crate::util::operation_cluster_time(ctx);
     update_in(
         doc,
         &ctx.db_name,
         ctx.storage()?,
         notablescan,
         ctx.top_stats.as_deref(),
+        cluster_time.ok_or(ctx.replica_set_name.is_none()),
     )
 }
 
@@ -1642,12 +1694,15 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 /// collection scan is refused (`$merge` passes false: its `on` fields have
 /// a unique index, so it never plans one). `status_counters` is the
 /// server's, when the statements are an `update` command's own.
+/// `cluster_time`: what `$$CLUSTER_TIME` reads, on a replica-set member;
+/// else whether the server is a standalone, where reading it is refused.
 pub(crate) fn update_in(
     doc: &Document,
     db_name: &str,
     storage: &dyn crate::Storage,
     notablescan: bool,
     status_counters: Option<&crate::topstats::TopStats>,
+    cluster_time: Result<bson::Timestamp, bool>,
 ) -> HandlerResult {
     argtypes::require_object(doc, "let", "update.let")?;
     argtypes::require_bool_field(doc, "ordered", "update.ordered")?;
@@ -1676,7 +1731,8 @@ pub(crate) fn update_in(
 
     // Command-level `let` → vars visible to `$expr` in each spec's `q` filter
     // (and to pipeline-form `u` expressions). Resolved once for the batch.
-    let let_vars = resolve_let_vars(doc.get("let"));
+    let let_vars = crate::util::resolve_let_vars_at(doc.get("let"), cluster_time.ok());
+    let standalone = cluster_time == Err(true);
 
     // Collection validator on the POST-APPLY document (code 121) unless
     // `bypassDocumentValidation` or `validationAction: warn|off`. The validator
@@ -1982,6 +2038,26 @@ pub(crate) fn update_in(
         // collection was then listed).
         // The statement is still read first: a malformed one is refused.
         let absent = !upsert && !storage.collection_exists(db_name, &coll).unwrap_or(true);
+        // `$text` needs a text index, which this server cannot search:
+        // mongod's 27, missing collection included (measured 8.2.11). And a
+        // standalone has no cluster time for `$$CLUSTER_TIME` to read.
+        if let Some((code, errmsg)) =
+            text_query_problem(storage, db_name, &coll, &doc_field(spec, "q")).or_else(|| {
+                spec.get("u")
+                    .and_then(|u| {
+                        crate::util::cluster_time_unavailable(standalone, std::slice::from_ref(u))
+                    })
+                    .map(|e| (e.code, e.errmsg))
+            })
+        {
+            write_errors.push(Bson::Document(doc! {
+                "index": index as i32, "code": code, "errmsg": errmsg,
+            }));
+            if ordered {
+                break;
+            }
+            continue;
+        }
         if let Some(e) = near_refusal(
             storage,
             db_name,

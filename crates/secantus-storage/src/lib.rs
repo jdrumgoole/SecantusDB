@@ -2946,6 +2946,27 @@ thread_local! {
     /// The rows a write on this thread tests, in the order it tests them
     /// (`with_candidate_order`). `None`: the router's own candidates.
     static CANDIDATE_ORDER: RefCell<Option<Vec<i64>>> = const { RefCell::new(None) };
+    /// The batch size a multi-document delete on this thread removes its
+    /// documents in, each batch in reverse (`with_reversed_delete_batches`).
+    /// 0: in the order they were read.
+    static DELETE_BATCH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Run `f` with an unbounded delete outside a transaction removing its
+/// matches in batches of `batch`, each batch in reverse: mongod's batched
+/// multi-delete. It reads the documents in its plan's order, collects ten at
+/// a time and writes each batch as one `applyOps` holding them last-read
+/// first, so its oplog and change streams see `3, 2, 1` for a delete that
+/// read `1, 2, 3` (measured 8.2.11, RM-077). Restored on return.
+pub fn with_reversed_delete_batches<T>(batch: usize, f: impl FnOnce() -> T) -> T {
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DELETE_BATCH.with(|b| b.set(self.0));
+        }
+    }
+    let _r = Restore(DELETE_BATCH.with(|b| b.replace(batch)));
+    f()
 }
 
 /// Run `f` with the next write's candidates fixed to the rows `order` names,
@@ -3791,11 +3812,38 @@ type EntryOps = Vec<(String, Vec<u8>)>;
 /// The per-collection write-lock registry: `(db, coll) → lock`.
 type CollLocks = HashMap<(String, String), Arc<Mutex<()>>>;
 
+/// A capped collection's size and count, kept from one insert to the next so
+/// that bringing it back within bounds does not read the whole collection
+/// every time (RM-111). Never persisted: after a restart the first insert
+/// counts the collection again, so a crash cannot leave it wrong.
+///
+/// It describes the collection as of a commit, and holds only while nothing
+/// else has written there since: `mark` is [`ns_commit_mark`] taken inside
+/// the counting statement plus that statement's own commit, and it is used
+/// only when the current mark is the same with no commit in flight. Every
+/// write to a collection commits through [`counted_commit`] (one whose
+/// collections are not known counts against all of them), so any update,
+/// delete, `collMod` rewrite or other path that changes the collection
+/// moves the mark and the next insert counts again. A drop, rename or
+/// recreate moves `ddl` or `ui` as well.
+#[derive(Clone)]
+struct CappedTally {
+    ui: Vec<u8>,
+    ddl: u64,
+    mark: u64,
+    bytes: i64,
+    count: i64,
+}
+type CappedTallies = HashMap<(String, String), CappedTally>;
+
 /// The TTL monitor's runtime state, shared by the background sweeper and the
 /// commands that tune and report it.
 struct TtlMonitor {
     /// `ttlMonitorSleepSecs` as a client set it; 0 until one does.
     sleep_secs: AtomicI64,
+    /// The cadence the server was started with, in whole seconds, as
+    /// `getParameter` reports it until a client sets one; 0 when unknown.
+    started_secs: AtomicI64,
     enabled: AtomicBool,
     passes: AtomicU64,
     deleted: AtomicU64,
@@ -3806,6 +3854,7 @@ impl Default for TtlMonitor {
     fn default() -> Self {
         Self {
             sleep_secs: AtomicI64::new(0),
+            started_secs: AtomicI64::new(0),
             enabled: AtomicBool::new(true),
             passes: AtomicU64::new(0),
             deleted: AtomicU64::new(0),
@@ -3817,7 +3866,8 @@ impl Default for TtlMonitor {
 /// A snapshot of [`Storage::ttl_monitor`].
 #[derive(Clone, Copy, Debug)]
 pub struct TtlMonitorState {
-    /// 0 when no client has set it (the server's configured cadence applies).
+    /// The cadence in force: what a client set, else what the server was
+    /// started with ([`Storage::set_ttl_started_period`]); 0 when neither.
     pub sleep_secs: i64,
     pub enabled: bool,
     pub passes: u64,
@@ -3896,6 +3946,9 @@ pub struct Storage {
     /// because every DDL's row writes commit in ONE statement transaction, a
     /// re-run whose generation held still is a consistent point-in-time answer.
     ddl_generation: AtomicU64,
+    /// Per capped collection, its size and count as of its last insert
+    /// ([`CappedTally`]).
+    capped_tallies: Mutex<CappedTallies>,
     /// Per `(db, collection, index)`: which components of each key field hold
     /// an array in some document -- mongod's multikey paths, which its planner
     /// reads to decide how far an index's bounds can be narrowed. Computed by
@@ -4401,6 +4454,7 @@ fn counted_commit<T>(written: Option<&[WrittenNs]>, commit: impl FnOnce() -> T) 
         for (db, coll, changed) in &keys {
             if let Some(e) = map.get_mut(&(db.clone(), coll.clone())) {
                 e.inflight -= 1;
+                e.finished += 1;
                 e.done = e.done.max(done);
                 if *changed {
                     e.inflight_changed -= 1;
@@ -4421,6 +4475,27 @@ struct NsCommit {
     inflight_changed: u32,
     done: u64,
     done_changed: u64,
+    /// How many commits that wrote the collection have finished.
+    finished: u64,
+}
+
+/// How many commits that may have written `(db, coll)` have finished --
+/// those naming it and those whose collections are not known -- or `None`
+/// while one is in flight. Two equal marks with no commit in flight at
+/// either mean nothing wrote the collection in between (see
+/// [`CappedTally`]).
+fn ns_commit_mark(db: &str, coll: &str) -> Option<u64> {
+    let map = NS_COMMITS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut n = 0u64;
+    for key in [(db, row_collection(coll)), ("", "")] {
+        if let Some(e) = map.get(&(key.0.to_string(), key.1.to_string())) {
+            if e.inflight > 0 {
+                return None;
+            }
+            n += e.finished;
+        }
+    }
+    Some(n)
 }
 
 /// Per `(db, collection)`, [`NsCommit`]. The key `("", "")` stands for a
@@ -5829,6 +5904,7 @@ impl Storage {
             coll_locks: Mutex::new(HashMap::new()),
             write_tickets: crate::admission::Tickets::new(opts.write_tickets.unwrap_or(0)),
             ddl_generation: AtomicU64::new(0),
+            capped_tallies: Mutex::new(HashMap::new()),
             multikey_paths: Mutex::new(HashMap::new()),
             planner_cache: std::sync::RwLock::new(HashMap::new()),
             txn_dirty_limit: (parse_cache_bytes(config) as f64 * 0.20 * 0.75) as u64,
@@ -9491,7 +9567,7 @@ impl Storage {
             let lock = self.coll_lock(db, coll);
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
             let session = self.op_session()?;
-            self.with_statement_txn(&session, || {
+            let (inserted, errors, stopped, tally) = self.with_statement_txn(&session, || {
                 self.create_for_write(&session, db, coll)?;
                 let descs = self.index_descs(&session, db, coll)?;
                 let ns = format!("{db}.{coll}");
@@ -9503,6 +9579,7 @@ impl Storage {
                     None
                 };
                 let mut inserted = 0usize;
+                let mut inserted_bytes = 0i64;
                 let mut errors: Vec<Document> = Vec::new();
                 let mut oplog_entries: Vec<OplogEntry> = Vec::new();
                 let mut stopped = false;
@@ -9639,6 +9716,7 @@ impl Storage {
                     self.write_index_entries(&session, db, coll, &doc, &descs, recordid)?;
                     self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
                     inserted += 1;
+                    inserted_bytes += blob.len() as i64;
                     if oplog_on {
                         // `o` splices the stored doc bytes (`blob`) verbatim — no
                         // re-encode of the document body (the oplog hot-path win);
@@ -9657,8 +9735,9 @@ impl Storage {
                 // the collection's `size` / `max` bounds. Inserts have no pre-image, so
                 // the per-insert pre-image slots are all None; eviction appends its own.
                 let mut pre_images: Vec<Option<Vec<u8>>> = vec![None; oplog_entries.len()];
+                let mut tally = None;
                 if inserted > 0 {
-                    self.enforce_capped_bounds(
+                    tally = self.enforce_capped_bounds(
                         &session,
                         db,
                         coll,
@@ -9668,13 +9747,20 @@ impl Storage {
                         ui.as_deref(),
                         &mut oplog_entries,
                         &mut pre_images,
+                        Some((inserted_bytes, inserted as i64)),
                     )?;
                 }
                 if oplog_on && !oplog_entries.is_empty() {
                     self.emit_oplog_entries(&session, oplog_entries, pre_images)?;
                 }
-                Ok((inserted, errors, stopped))
-            })
+                Ok((inserted, errors, stopped, tally))
+            })?;
+            // Committed (a capped collection takes no user transaction, and
+            // inside one no tally is made): keep its size and count.
+            if let Some(tally) = tally {
+                self.keep_capped_tally(db, coll, tally);
+            }
+            Ok((inserted, errors, stopped))
         })
     }
 
@@ -10001,7 +10087,10 @@ impl Storage {
     /// `getParameter` report them.
     pub fn ttl_monitor(&self) -> TtlMonitorState {
         TtlMonitorState {
-            sleep_secs: self.ttl.sleep_secs.load(Ordering::Relaxed),
+            sleep_secs: match self.ttl.sleep_secs.load(Ordering::Relaxed) {
+                secs if secs > 0 => secs,
+                _ => self.ttl.started_secs.load(Ordering::Relaxed),
+            },
             enabled: self.ttl.enabled.load(Ordering::Relaxed),
             passes: self.ttl.passes.load(Ordering::Relaxed),
             deleted: self.ttl.deleted.load(Ordering::Relaxed),
@@ -10017,6 +10106,15 @@ impl Storage {
         if let Some(on) = enabled {
             self.ttl.enabled.store(on, Ordering::Relaxed);
         }
+    }
+
+    /// Record the cadence the server's monitor was started with, so
+    /// `getParameter ttlMonitorSleepSecs` reports it as mongod reports the
+    /// value it was started with. A cadence under a second reads as 1, the
+    /// smallest the parameter holds.
+    pub fn set_ttl_started_period(&self, period: Duration) {
+        let secs = (period.as_secs_f64().round() as i64).max(1);
+        self.ttl.started_secs.store(secs, Ordering::Relaxed);
     }
 
     /// One tick of the background monitor: run a pass when the monitor is
@@ -12404,12 +12502,18 @@ impl Storage {
         Ok(out)
     }
 
-    /// Evict oldest non-fresh docs from a capped collection until within its
-    /// `size` (byte) and `max` (count) bounds. "Oldest" is natural (insertion
-    /// `seq`) order via `scan_docs_natural`, so FIFO holds even for non-monotonic
-    /// custom `_id`s. Appends a `"d"` oplog entry (and pre-image when enabled) per
-    /// eviction to the caller's vectors. No-op when the collection isn't capped or
-    /// has no bounds. Mirrors `storage._enforce_capped_bounds_locked`.
+    /// Evict the oldest docs from a capped collection until within its
+    /// `size` (byte) and `max` (count) bounds. "Oldest" is RecordId
+    /// (insertion) order, so FIFO holds even for non-monotonic custom `_id`s.
+    /// Appends a `"d"` oplog entry (and pre-image when enabled) per eviction
+    /// to the caller's vectors. No-op when the collection isn't capped or has
+    /// no bounds. Mirrors `storage._enforce_capped_bounds_locked`.
+    ///
+    /// `inserted` is `Some((bytes, count))` when the statement's only writes
+    /// to the collection are inserts of that many bytes and documents: the
+    /// size and count before them may then come from [`CappedTally`] rather
+    /// than a read of the whole collection. The tally to keep, should the
+    /// statement commit, is returned for [`Self::keep_capped_tally`].
     #[allow(clippy::too_many_arguments)]
     fn enforce_capped_bounds(
         &self,
@@ -12422,10 +12526,11 @@ impl Storage {
         ui: Option<&[u8]>,
         oplog_entries: &mut Vec<OplogEntry>,
         pre_images: &mut Vec<Option<Vec<u8>>>,
-    ) -> Result<()> {
+        inserted: Option<(i64, i64)>,
+    ) -> Result<Option<CappedTally>> {
         let opts = match coll_options(session, db, coll)? {
             Some(o) if o.get_bool("capped").unwrap_or(false) => o,
-            _ => return Ok(()),
+            _ => return Ok(None),
         };
         let num = |k: &str| -> Option<i64> {
             match opts.get(k) {
@@ -12442,63 +12547,140 @@ impl Storage {
         let size_limit = num("size").filter(|s| *s > 0);
         let max_limit = num("max").filter(|m| *m > 0);
         if size_limit.is_none() && max_limit.is_none() {
-            return Ok(());
+            return Ok(None);
         }
-        // `scan_docs` walks the doc table in RecordId (= insertion) order, so FIFO
-        // eviction holds even for non-monotonic custom `_id`s.
-        let scanned = self.scan_docs(session, db, coll)?;
-        let mut total: i64 = scanned.iter().map(|(_, _, b)| b.len() as i64).sum();
-        let mut count = scanned.len() as i64;
-        let preimages_on = oplog_on && pre_post_images_enabled(session, db, coll)?;
-        let doc_cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-        for (recordid, id_k, blob) in scanned {
-            let over_size = size_limit.is_some_and(|s| total > s);
-            let over_max = max_limit.is_some_and(|m| count > m);
-            if !over_size && !over_max {
-                break;
+        // The mark is read inside the statement, after its snapshot was
+        // taken (the collection's options were read above): with no commit
+        // in flight, every commit this snapshot sees has finished and is
+        // counted in it.
+        let coll_ui = match opts.get("uuid") {
+            Some(Bson::Binary(b)) => b.bytes.clone(),
+            _ => Vec::new(),
+        };
+        let ddl = self.ddl_generation.load(Ordering::Acquire);
+        let mark = if inserted.is_some() && !self.in_user_txn() && ddl.is_multiple_of(2) {
+            ns_commit_mark(db, coll)
+        } else {
+            None
+        };
+        let kept = mark.and_then(|m| {
+            let tallies = self
+                .capped_tallies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            tallies
+                .get(&(db.to_string(), coll.to_string()))
+                .filter(|t| t.mark == m && t.ddl == ddl && t.ui == coll_ui)
+                .map(|t| (t.bytes, t.count))
+        });
+        let (mut total, mut count) = match (kept, inserted) {
+            (Some((bytes, n)), Some((more_bytes, more))) => (bytes + more_bytes, n + more),
+            _ => {
+                // `scan_docs` walks the doc table in RecordId (= insertion)
+                // order, and sees this statement's own inserts.
+                let mut total = 0i64;
+                let mut count = 0i64;
+                for (_, _, blob) in self.scan_docs(session, db, coll)? {
+                    total += blob.len() as i64;
+                    count += 1;
+                }
+                (total, count)
             }
-            // The newest document always stays, even when it alone is larger
-            // than `size`: mongod 8.2.11 keeps `[59]` after sixty 3,000-byte
-            // inserts into a `size: 1000` collection, where evicting to the
-            // bound would leave it empty.
-            if count <= 1 {
-                break;
-            }
-            // The documents of the batch that caused the overflow are evicted
-            // like any other: mongod 8.2.11 leaves a `max: 3` collection with
-            // the LAST three of a five-document `insert_many`. Sparing them
-            // (as this did until 2026-10-09) let one batch take a capped
-            // collection past its bounds without limit.
-            let doc = decode_doc(&blob)?;
-            // Doc row first, entries after — see prune_ttl for the lock-free
-            // reader ordering rationale.
-            doc_cur.reset()?;
-            note_row(db, coll, recordid)?;
-            doc_cur.set_key_ssq(db, coll, recordid);
-            match doc_cur.remove() {
-                Ok(()) => {}
-                Err(e) if e.is_not_found() => {}
-                Err(e) => return Err(e.into()),
-            }
-            self.delete_index_entries(session, db, coll, &doc, descs, recordid)?;
-            self.delete_nat_entry(session, db, coll, &id_k)?;
-            total -= blob.len() as i64;
-            count -= 1;
-            if oplog_on {
-                let id = doc.get("_id").cloned().unwrap_or(Bson::Null);
-                // A delete records `{_id}` in both `o` and `o2` — encode it once.
-                let id_doc = encode_id_doc(&id)?;
-                oplog_entries.push(OplogEntry::Raw(Self::oplog_entry_crud(
-                    "d", ns, ui, &id_doc, &id_doc,
-                )?));
-                pre_images.push(if preimages_on {
-                    Some(encode_doc(&doc)?)
-                } else {
-                    None
-                });
+        };
+        let over = |total: i64, count: i64| {
+            size_limit.is_some_and(|s| total > s) || max_limit.is_some_and(|m| count > m)
+        };
+        if over(total, count) {
+            let preimages_on = oplog_on && pre_post_images_enabled(session, db, coll)?;
+            let doc_cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+            const EVICT_BATCH: usize = 64;
+            let mut after: Option<i64> = None;
+            'evict: loop {
+                let batch = self.scan_docs_batch(session, db, coll, after, EVICT_BATCH)?;
+                if batch.is_empty() {
+                    break;
+                }
+                for (recordid, id_k, blob) in batch {
+                    after = Some(recordid);
+                    // The newest document always stays, even when it alone
+                    // is larger than `size`: mongod 8.2.11 keeps `[59]` after
+                    // sixty 3,000-byte inserts into a `size: 1000`
+                    // collection, where evicting to the bound would leave it
+                    // empty.
+                    if !over(total, count) || count <= 1 {
+                        break 'evict;
+                    }
+                    // The documents of the batch that caused the overflow are
+                    // evicted like any other: mongod 8.2.11 leaves a `max: 3`
+                    // collection with the LAST three of a five-document
+                    // `insert_many`. Sparing them (as this did until
+                    // 2026-10-09) let one batch take a capped collection past
+                    // its bounds without limit.
+                    let doc = decode_doc(&blob)?;
+                    // Doc row first, entries after — see prune_ttl for the
+                    // lock-free reader ordering rationale.
+                    doc_cur.reset()?;
+                    note_row(db, coll, recordid)?;
+                    doc_cur.set_key_ssq(db, coll, recordid);
+                    match doc_cur.remove() {
+                        Ok(()) => {}
+                        Err(e) if e.is_not_found() => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                    self.delete_index_entries(session, db, coll, &doc, descs, recordid)?;
+                    self.delete_nat_entry(session, db, coll, &id_k)?;
+                    total -= blob.len() as i64;
+                    count -= 1;
+                    if oplog_on {
+                        let id = doc.get("_id").cloned().unwrap_or(Bson::Null);
+                        // A delete records `{_id}` in both `o` and `o2` —
+                        // encode it once.
+                        let id_doc = encode_id_doc(&id)?;
+                        oplog_entries.push(OplogEntry::Raw(Self::oplog_entry_crud(
+                            "d", ns, ui, &id_doc, &id_doc,
+                        )?));
+                        pre_images.push(if preimages_on {
+                            Some(encode_doc(&doc)?)
+                        } else {
+                            None
+                        });
+                    }
+                }
             }
         }
-        Ok(())
+        Ok(mark.map(|mark| CappedTally {
+            ui: coll_ui,
+            ddl,
+            mark,
+            bytes: total,
+            count,
+        }))
+    }
+
+    /// Keep `tally` for the next insert into `(db, coll)`, called after the
+    /// statement that made it committed. It is kept only when that commit is
+    /// the one commit since the tally's mark that may have written the
+    /// collection, with none in flight; otherwise any tally is dropped and
+    /// the next insert counts the collection again.
+    fn keep_capped_tally(&self, db: &str, coll: &str, tally: CappedTally) {
+        let key = (db.to_string(), coll.to_string());
+        let mut tallies = self
+            .capped_tallies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mark = ns_commit_mark(db, coll);
+        let ddl = self.ddl_generation.load(Ordering::Acquire);
+        if mark == Some(tally.mark + 1) && ddl == tally.ddl {
+            tallies.insert(
+                key,
+                CappedTally {
+                    mark: tally.mark + 1,
+                    ..tally
+                },
+            );
+        } else {
+            tallies.remove(&key);
+        }
     }
 
     /// Flag every index in `descs` that `doc` makes multikey (an array value
@@ -15881,16 +16063,18 @@ impl Storage {
             validator,
             validator_moderate,
             want_post_image,
-            &|doc, _up| {
+            &|doc, upserting| {
                 // The pipeline was checked before any document was read, so
                 // what fails here failed while running, and mongod reports
                 // it under the executor's wrapper.
-                let out = secantus_core::aggregate::apply_pipeline(
-                    vec![doc.clone()],
-                    pipeline,
-                    let_vars,
-                    None,
-                )
+                let out = secantus_core::aggregate::with_whole_input_documents(|| {
+                    secantus_core::aggregate::apply_pipeline(
+                        vec![doc.clone()],
+                        pipeline,
+                        let_vars,
+                        None,
+                    )
+                })
                 .map_err(|fault| match query_fault(fault) {
                     StorageError::QueryError { code, errmsg, .. } => StorageError::QueryError {
                         code,
@@ -15908,6 +16092,17 @@ impl Storage {
                 // the stored doc keeps its `_id` (which is immutable). Re-add it if
                 // a stage removed it. (`encode_doc` then restores `_id`-first order.)
                 if let Some(id) = doc.get("_id") {
+                    // An `_id` mongod cannot store fails its storage check,
+                    // which runs before the immutability check (measured
+                    // 8.2.11: a pipeline that makes a stored `_id` an array
+                    // answers 53, not 66). An upsert's document is checked
+                    // where it is inserted, which answers 54 for an array.
+                    if let Some(problem) = unstorable_pipeline_id(new.get("_id")) {
+                        if upserting {
+                            return Ok(new);
+                        }
+                        return Err(problem);
+                    }
                     match new.get("_id") {
                         None => {
                             new.insert("_id", id.clone());
@@ -16527,11 +16722,10 @@ impl Storage {
                     }
                     // An `_id` mongod cannot hold. Measured 8.2.11, 2026-10-10:
                     // an array is 53 from an operator update and 54 from a
-                    // replacement; a regex is 53 from both. (A pipeline update
-                    // answers 54 for an array too; this path cannot tell it
-                    // from an operator update and answers 53.)
+                    // replacement or a pipeline (the update with no operator
+                    // spec); a regex is 53 from all three.
                     match new.get("_id") {
-                        Some(Bson::Array(_)) if is_replacement => {
+                        Some(Bson::Array(_)) if is_replacement || update_spec.is_none() => {
                             return Err(StorageError::QueryError {
                                 code: 54,
                                 errmsg: "After applying the update to the document, the \
@@ -16666,6 +16860,7 @@ impl Storage {
                         ui.as_deref(),
                         &mut oplog_entries,
                         &mut pre_images,
+                        None,
                     )?;
                 }
 
@@ -16808,6 +17003,10 @@ impl Storage {
                 {
                     rids.push(recordid);
                 }
+            }
+            match DELETE_BATCH.with(Cell::get) {
+                0 => {}
+                batch => rids.chunks_mut(batch).for_each(<[i64]>::reverse),
             }
             rids
         };
@@ -19826,6 +20025,33 @@ fn implied_equality(value: &Bson) -> Option<Bson> {
         }
     }
     None
+}
+
+/// The storage check mongod runs on the `_id` a pipeline update leaves on a
+/// stored document, ahead of its immutability check: an array or a regex is
+/// 53, a `$`-prefixed field inside a document `_id` is 52 (measured 8.2.11).
+fn unstorable_pipeline_id(id: Option<&Bson>) -> Option<StorageError> {
+    let (code, errmsg) = match id? {
+        Bson::Array(_) => (53, "The '_id' value cannot be of type array".to_string()),
+        Bson::RegularExpression(_) => (53, "The '_id' value cannot be of type regex".to_string()),
+        id @ Bson::Document(_) => {
+            let (field, path) = dollar_field_in(id, "_id")?;
+            (
+                52,
+                format!(
+                    "The dollar ($) prefixed field '{field}' in '{path}' is not allowed in the \
+                     context of an update's replacement document. Consider using an \
+                     aggregation pipeline with $replaceWith."
+                ),
+            )
+        }
+        _ => return None,
+    };
+    Some(StorageError::QueryError {
+        code,
+        errmsg,
+        exec: true,
+    })
 }
 
 /// The first `$`-prefixed field name inside `value`, at any depth, with its

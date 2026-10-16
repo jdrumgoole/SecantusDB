@@ -24,7 +24,10 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -47,6 +50,26 @@ struct RustServer {
     running: Option<RunningServer>,
     host: String,
     port: u16,
+    /// The TTL monitor's ticker: its stop flag and thread. It holds the
+    /// store open, so it is stopped with the server and on drop.
+    ttl_monitor: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
+}
+
+impl RustServer {
+    fn stop_ttl_monitor(&mut self) {
+        if let Some((stop, ticker)) = self.ttl_monitor.take() {
+            stop.store(true, Ordering::Relaxed);
+            if ticker.join().is_err() {
+                eprintln!("_secantus_server: the TTL monitor thread panicked");
+            }
+        }
+    }
+}
+
+impl Drop for RustServer {
+    fn drop(&mut self) {
+        self.stop_ttl_monitor();
+    }
 }
 
 #[pymethods]
@@ -79,6 +102,11 @@ impl RustServer {
     ///   environment for THIS server only. An existing store's recorded
     ///   data-logging mode always wins over `data_nonlogged` (the table
     ///   config is create-time-sticky).
+    /// * `ttl_sweep_seconds` — how often the TTL monitor deletes expired
+    ///   documents. `None` (the default) starts it switched off, as mongod's
+    ///   is with `ttlMonitorEnabled=false`, so a test's documents stay put
+    ///   unless it asks: `setParameter ttlMonitorEnabled: true` turns it on,
+    ///   at mongod's 60-second cadence or `ttlMonitorSleepSecs`.
     #[new]
     #[pyo3(signature = (
         storage_path,
@@ -98,6 +126,7 @@ impl RustServer {
         oplog_nonlogged = None,
         data_nonlogged = None,
         checkpoint_seconds = None,
+        ttl_sweep_seconds = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -118,7 +147,17 @@ impl RustServer {
         oplog_nonlogged: Option<bool>,
         data_nonlogged: Option<bool>,
         checkpoint_seconds: Option<u64>,
+        ttl_sweep_seconds: Option<f64>,
     ) -> PyResult<Self> {
+        let ttl_period = match ttl_sweep_seconds {
+            Some(secs) if !(secs.is_finite() && secs > 0.0) => {
+                return Err(PyValueError::new_err(
+                    "ttl_sweep_seconds must be positive; use None to start the monitor off",
+                ))
+            }
+            Some(secs) => Duration::from_secs_f64(secs),
+            None => Duration::from_secs(60),
+        };
         // WiredTiger requires the home directory to exist; create it so any
         // path "just works" (matching the one-or-two-line ergonomic).
         std::fs::create_dir_all(storage_path).map_err(|e| {
@@ -144,6 +183,11 @@ impl RustServer {
         )
         .map_err(|e| PyRuntimeError::new_err(format!("failed to open storage: {e:?}")))?;
         storage.set_enable_oplog(enable_oplog);
+        storage.set_ttl_started_period(ttl_period);
+        if ttl_sweep_seconds.is_none() {
+            storage.set_ttl_monitor(None, Some(false));
+        }
+        let storage = Arc::new(storage);
 
         // TLS: cert + key both required to enable it (matching server.py).
         let tls = match (tls_cert_file, tls_key_file) {
@@ -161,7 +205,7 @@ impl RustServer {
             }
         };
 
-        let adapter: Arc<dyn CmdStorage> = Arc::new(StorageAdapter::new(Arc::new(storage)));
+        let adapter: Arc<dyn CmdStorage> = Arc::new(StorageAdapter::new(storage.clone()));
         let cursors = Arc::new(CursorRegistry::new());
         let config = ServerConfig {
             replica_set_name,
@@ -179,10 +223,27 @@ impl RustServer {
         let running = bind(&addr, config, adapter, cursors)
             .map_err(|e| PyRuntimeError::new_err(format!("failed to bind {addr}: {e}")))?;
         let bound = running.address();
+        // Ticked often; the monitor decides whether a pass is due (and does
+        // nothing while switched off), so `setParameter` applies at once.
+        let stop_ttl = Arc::new(AtomicBool::new(false));
+        let ticker = {
+            let stop = stop_ttl.clone();
+            let tick = ttl_period.min(Duration::from_millis(500));
+            std::thread::spawn(move || loop {
+                std::thread::sleep(tick);
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Err(e) = storage.ttl_monitor_tick(ttl_period) {
+                    eprintln!("_secantus_server: TTL sweep failed: {e:?}");
+                }
+            })
+        };
         Ok(RustServer {
             running: Some(running),
             host: bound.ip().to_string(),
             port: bound.port(),
+            ttl_monitor: Some((stop_ttl, ticker)),
         })
     }
 
@@ -212,6 +273,7 @@ impl RustServer {
         if let Some(mut running) = self.running.take() {
             py.detach(|| running.stop());
         }
+        py.detach(|| self.stop_ttl_monitor());
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {

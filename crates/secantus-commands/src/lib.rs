@@ -72,6 +72,7 @@ mod procstats;
 pub mod profiler;
 pub mod rbac;
 mod replset_admin;
+mod resume_keystring;
 pub mod roles;
 mod rwconcern;
 pub mod serverinfo;

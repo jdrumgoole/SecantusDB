@@ -18,6 +18,22 @@ pub(crate) fn is_view(storage: &dyn crate::storage::Storage, db: &str, coll: &st
         .unwrap_or(false)
 }
 
+/// A hint on a view names an index of the collection beneath it: mongod
+/// plans the view's pipeline over that collection and refuses a hint that
+/// names none of its indexes (2, measured 8.2.11) rather than ignore it.
+pub(crate) fn check_hint(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    view: &str,
+    hint: Option<&Bson>,
+) -> Result<(), CommandError> {
+    if hint.is_none() {
+        return Ok(());
+    }
+    let (base, _) = crate::aggregate::resolve_view(storage, db, view, Vec::new())?;
+    crate::util::validate_write_hint(storage, db, &base, hint)
+}
+
 fn not_a_collection(ns: &str) -> String {
     format!("Namespace {ns} is a view, not a collection")
 }

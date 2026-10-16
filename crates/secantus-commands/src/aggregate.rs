@@ -57,7 +57,6 @@ use crate::argtypes;
 use crate::find::split_docs_into_cursor_checked;
 use crate::util::{
     as_i64, bool_field, command_error, decode_docs, decode_docs_minimal, encode_docs,
-    resolve_let_vars,
 };
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
 use secantus_core::collation::Collation;
@@ -416,6 +415,29 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let storage = ctx.storage()?;
     let cursors = ctx.cursors()?;
     let hint = doc.get("hint");
+    // A standalone has no cluster time for `$$CLUSTER_TIME` to read.
+    if let Some(e) =
+        crate::util::cluster_time_unavailable(ctx.replica_set_name.is_none(), &pipeline)
+    {
+        return Err(e);
+    }
+    // A leading `$match` on `$text` needs a text index, which this server
+    // cannot search: mongod's 27 (measured 8.2.11).
+    if let (Some(c), Some(Bson::Document(m))) = (
+        &coll,
+        pipeline
+            .first()
+            .and_then(Bson::as_document)
+            .and_then(|d| d.get("$match")),
+    ) {
+        if let Some((code, errmsg)) = crate::crud::text_query_problem(storage, &ctx.db_name, c, m) {
+            return Err(CommandError::new(
+                code,
+                crate::util::error_code_name(code),
+                errmsg,
+            ));
+        }
+    }
     let batch_size = doc
         .get("cursor")
         .and_then(Bson::as_document)
@@ -424,7 +446,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .unwrap_or(DEFAULT_BATCH_SIZE as i64);
     // Command `let` → resolved query vars ($$NOW seeded, values evaluated),
     // visible to `$expr` in `$match` and to pipeline expressions.
-    let vars = resolve_let_vars(doc.get("let"));
+    let vars = crate::util::command_let_vars(doc.get("let"), ctx);
     // The collation the command names, else the default of the namespace it
     // names -- a VIEW's own, never its base collection's.
     let collation = match &coll {
@@ -433,6 +455,9 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     };
     let _active = secantus_core::collation::activate(collation.as_ref());
 
+    // `$indexStats` through a view reports the indexes of the collection
+    // beneath it (measured 8.2.11).
+    let mut index_stats_base: Option<String> = None;
     // Fetch the input documents + decide the remaining pipeline.
     let (ns, input, working_pipeline): (String, Vec<Document>, Vec<Bson>) = match &coll {
         Some(c) => {
@@ -448,12 +473,31 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             let derived = first_stage_has(&pipeline, crate::list_catalog::STAGE)
                 && (c == "system.views"
                     || crate::ts_buckets::bucketed(storage, &ctx.db_name, c).is_some());
+            let asked: &str = c;
             let (base_coll, pipeline) = if derived {
                 (c.clone(), pipeline)
             } else {
                 resolve_view(storage, &ctx.db_name, c, pipeline)?
             };
             let c = base_coll.as_str();
+            // A view's own stages go in front of the caller's, so a
+            // `$indexStats` through a view with a pipeline is no longer the
+            // first stage: mongod answers 40602 (measured 8.2.11).
+            if pipeline
+                .iter()
+                .skip(1)
+                .filter_map(Bson::as_document)
+                .any(|d| d.contains_key("$indexStats"))
+            {
+                return Err(CommandError::new(
+                    40602,
+                    "Location40602",
+                    "$indexStats is only valid as the first stage in a pipeline",
+                ));
+            }
+            if base_coll != asked && first_stage_has(&pipeline, "$indexStats") {
+                index_stats_base = Some(base_coll.clone());
+            }
             // A view's stages go in front of a `$listCatalog`.
             crate::list_catalog::place_problem(&pipeline, &ctx.db_name, Some(c))?;
             // Stages that generate / read their own input start from no docs.
@@ -620,7 +664,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         input,
         &working_pipeline,
         &ctx.db_name,
-        coll.as_deref(),
+        index_stats_base.as_deref().or(coll.as_deref()),
         &vars,
         storage,
         collation.as_ref(),
@@ -3934,10 +3978,11 @@ fn apply_merge(
         if bypass_validation {
             command.insert("bypassDocumentValidation", true);
         }
-        let reply = match crate::crud::update_in(&command, &merge.db, storage, false, None) {
-            Ok(reply) => reply,
-            Err(e) => return Err(during(e)),
-        };
+        let reply =
+            match crate::crud::update_in(&command, &merge.db, storage, false, None, Err(false)) {
+                Ok(reply) => reply,
+                Err(e) => return Err(during(e)),
+            };
         if reply.get_f64("ok").unwrap_or(0.0) != 1.0 {
             return Err(during(write_error_of(&reply)));
         }

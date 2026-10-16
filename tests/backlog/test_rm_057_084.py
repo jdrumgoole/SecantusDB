@@ -194,7 +194,7 @@ def _text_update(client: Any) -> tuple:
     return mongo_answer(lambda: c.update_one({"$text": {"$search": "hello"}}, {"$set": {"b": 1}}))
 
 
-@pytest.mark.backlog("RM-061")
+@pytest.mark.backlog_fixed("RM-061")
 def test_text_in_an_update_query_without_a_text_index(rust_mongo: Any) -> None:
     """mongod 8.2.11: `27 IndexNotFound`, `text index required for $text query`."""
     assert _text_update(rust_mongo) == ("err", 27, "text index required for $text query")
@@ -211,7 +211,7 @@ def _cluster_time_update(client: Any) -> tuple:
     return (ans, type(c.find_one({"_id": 1}).get("t")).__name__)
 
 
-@pytest.mark.backlog("RM-062")
+@pytest.mark.backlog_fixed("RM-062")
 def test_cluster_time_in_a_pipeline_update(rust_mongo: Any, mongod_rs: Any) -> None:
     """On a replica set mongod 8.2.11 sets the field to the operation's
     cluster time, a Timestamp."""
@@ -226,7 +226,7 @@ def _replace_with_scalar(client: Any) -> tuple:
     return mongo_answer(lambda: c.update_one({"_id": 1}, [{"$replaceWith": "$a"}]))
 
 
-@pytest.mark.backlog("RM-063")
+@pytest.mark.backlog_fixed("RM-063")
 def test_replace_with_a_non_document_in_an_update(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 prints the whole input document in the 40228 message."""
     assert _replace_with_scalar(rust_mongo) == _replace_with_scalar(mongod)
@@ -359,12 +359,36 @@ def _bad_token(client: Any, data: str) -> tuple:
     return code_of(mongo_answer(run))
 
 
-@pytest.mark.backlog("RM-075")
+@pytest.mark.backlog_fixed("RM-075")
 def test_undecodable_resume_token_errors(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 parses `_data` as a KeyString and reports where it
     failed (15, 50811) rather than one error for every bad token."""
     for data in ("82", "00", "8200000000"):
         assert _bad_token(rust_mongo, data) == _bad_token(mongod_rs, data), data
+
+
+def _well_formed_foreign_token(client: Any) -> tuple:
+    """Resume a collection stream from a token in mongod's own format that
+    decodes cleanly (a v2 event token from another deployment)."""
+    c = client["rm075"][_name()]
+    c.insert_one({"a": 1})
+    data = "8200000000000000012B042C0100296E5A1004000102030405060708090A0B0C0D0E0F4600"
+
+    def run() -> Any:
+        with c.watch(resume_after={"_data": data}, max_await_time_ms=100) as s:
+            return s.try_next()
+
+    return code_of(mongo_answer(run))
+
+
+@pytest.mark.backlog("RM-075")
+def test_well_formed_mongod_token_is_looked_up(rust_mongo: Any, mongod_rs: Any) -> None:
+    """A token in mongod's format that decodes: mongod 8.2.11 looks for it
+    in its oplog and answers 280 (`the resume token was not found`); this
+    server cannot read the format and answers 40647."""
+    expected = _well_formed_foreign_token(mongod_rs)
+    assert expected == ("err", 280)
+    assert _well_formed_foreign_token(rust_mongo) == expected
 
 
 def _change_stream_explain_ns(client: Any) -> Any:
@@ -400,7 +424,7 @@ def _delete_order(client: Any) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-077")
+@pytest.mark.backlog_fixed("RM-077")
 def test_delete_order_after_a_multi_update(rust_mongo: Any, mongod_rs: Any) -> None:
     """The order a `delete` with `limit: 0` deletes in after a `multi`
     update, as seen in the change stream (mongod 8.2.11 reversed it)."""
@@ -444,37 +468,135 @@ def test_start_after_a_drop_database_token(rust_mongo: Any, mongod_rs: Any) -> N
 
 def _not_found_message(client: Any) -> tuple:
     c = client["rm078"][_name()]
+    tokens = {}
     with c.watch() as s:
         c.insert_one({"_id": "k" * 300})
         c.insert_one({"_id": "other"})
-        token = None
         deadline = time.monotonic() + 10
-        while token is None and time.monotonic() < deadline:
+        while len(tokens) < 2 and time.monotonic() < deadline:
             ev = s.try_next()
             if ev is not None:
-                token = ev["_id"]
-    assert token is not None, "no insert event"
+                tokens[ev["documentKey"]["_id"]] = ev["_id"]["_data"]
+    assert len(tokens) == 2, "no insert events"
 
     def run() -> Any:
-        with c.watch([{"$match": {"documentKey._id": "other"}}], resume_after=token) as s2:
+        with c.watch(
+            [{"$match": {"documentKey._id": "other"}}], resume_after={"_data": tokens["k" * 300]}
+        ) as s2:
             return s2.try_next()
 
     ans = mongo_answer(run)
     if ans[0] != "err":
         return ans
     printed = re.findall(r'_data: "([^"]*)"', ans[2])
-    return (ans[1], "the resume token was not found" in ans[2], [len(t) <= 131 for t in printed])
+    return (ans[1], "the resume token was not found" in ans[2], printed == [tokens["other"]])
 
 
-@pytest.mark.backlog("RM-078")
-def test_resume_token_not_found_message_cuts_the_token(rust_mongo: Any, mongod_rs: Any) -> None:
+@pytest.mark.backlog_fixed("RM-078")
+def test_resume_token_not_found_message_names_the_event_found(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
     """mongod 8.2.11's 280 `cannot resume stream; the resume token was not
-    found. {_data: ...}` never prints more than 128 characters of a token
-    (and `...`). Resuming from the token of a document with a 300-character
-    `_id`, this server prints all 740 characters of it."""
+    found. {_data: ...}` names the token of the event the stream found in
+    the resumed one's place (here the `other` insert its `$match` lets
+    through), not the token it was asked to resume from."""
     expected = _not_found_message(mongod_rs)
-    assert expected == (280, True, [True])
+    assert expected == (280, True, True)
     assert _not_found_message(rust_mongo) == expected
+
+
+@contextlib.contextmanager
+def auth_rust(tmp_path: Any) -> Iterator[tuple]:
+    """A fresh `secantusd-rs --auth` with `root`, `alice@admin` and
+    `bob@p5b` (password `pw`); yields `(host, port)`."""
+    proc = subprocess.Popen(
+        [str(RS_BINARY), "--auth", "--port", "0", "--storage-path", str(tmp_path / "auth")],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        m = _RS_BANNER.search(proc.stdout.readline())
+        assert m, "secantusd-rs did not start"
+        host, port = m.group(1), int(m.group(2))
+        local = pymongo.MongoClient(host=host, port=port, directConnection=True)
+        local.admin.command("createUser", "root", pwd="pw", roles=["root"])
+        root = pymongo.MongoClient(
+            host=host, port=port, directConnection=True, username="root", password="pw"
+        )
+        root.admin.command("createUser", "alice", pwd="pw", roles=["readWriteAnyDatabase"])
+        root.p5b.command("createUser", "bob", pwd="pw", roles=[{"role": "readWrite", "db": "p5b"}])
+        yield host, port
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        shutil.rmtree(tmp_path / "auth", ignore_errors=True)
+
+
+def _login(host: str, port: int, user: str, db: str) -> Any:
+    return pymongo.MongoClient(
+        host=host, port=port, directConnection=True, username=user, password="pw", authSource=db
+    )
+
+
+def _txn_event_uid(tmp_path: Any) -> bytes:
+    """The `lsid.uid` on a transaction's change event, run by `bob@p5b`."""
+    with auth_rust(tmp_path) as (host, port):
+        bob = _login(host, port, "bob", "p5b")
+        c = bob.p5b[_name()]
+        with c.watch() as s:
+            with bob.start_session() as sess, sess.start_transaction():
+                c.insert_one({"_id": 1}, session=sess)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                ev = s.try_next()
+                if ev is not None:
+                    return bytes(ev["lsid"]["uid"])
+        raise AssertionError("no change event")
+
+
+@pytest.mark.backlog_fixed("RM-078")
+def test_transaction_event_uid_hashes_the_user(tmp_path: Any) -> None:
+    """mongod 8.2.11 (an auth-enabled replica set, measured 2026-10-16)
+    stamps a transaction's change events with `lsid.uid` the SHA-256 of
+    `user@db`: `bob@p5b` here, `alice@admin` for an admin user."""
+    import hashlib
+
+    assert _txn_event_uid(tmp_path) == hashlib.sha256(b"bob@p5b").digest()
+
+
+def _local_session_uids(tmp_path: Any) -> list:
+    """`$listLocalSessions: {}` as `alice@admin`, after `bob@p5b` has used a
+    session of his own: whose sessions it lists, by `uid`."""
+    import hashlib
+
+    names = {
+        hashlib.sha256(b"alice@admin").digest(): "alice",
+        hashlib.sha256(b"bob@p5b").digest(): "bob",
+        hashlib.sha256(b"root@admin").digest(): "root",
+        hashlib.sha256(b"").digest(): "nobody",
+    }
+    with auth_rust(tmp_path) as (host, port):
+        bob = _login(host, port, "bob", "p5b")
+        with bob.start_session() as s:
+            bob.p5b.x.find_one({}, session=s)
+        alice = _login(host, port, "alice", "admin")
+        with alice.start_session() as s:
+            alice.p5b.x.find_one({}, session=s)
+            rows = list(alice.admin.aggregate([{"$listLocalSessions": {}}], session=s))
+        return sorted({names.get(bytes(r["_id"]["uid"]), "?") for r in rows})
+
+
+@pytest.mark.backlog("RM-156")
+def test_list_local_sessions_lists_the_callers_by_user_hash(tmp_path: Any) -> None:
+    """mongod 8.2.11 (an auth-enabled replica set, measured 2026-10-16):
+    `$listLocalSessions: {}` lists only the calling user's sessions, each
+    `_id.uid` the SHA-256 of `user@db`."""
+    assert _local_session_uids(tmp_path) == ["alice"]
 
 
 def _pre_image_in_txn(client: Any) -> Any:
