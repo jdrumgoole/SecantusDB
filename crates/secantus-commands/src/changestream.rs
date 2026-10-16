@@ -90,7 +90,8 @@ struct ChangeStreamProducer {
     expect_token: Option<String>,
 }
 
-/// What mongod says when the token's event is not the first one seen.
+/// What mongod says when the token's event is not the first one seen:
+/// `data` is the token of the event seen first.
 fn resume_token_missing(data: &str) -> CommandError {
     CommandError::new(
         280,
@@ -186,10 +187,14 @@ impl CursorProducer for ChangeStreamProducer {
                 };
                 if let Some(expected) = self.expect_token.clone() {
                     if let Some(first) = events.first() {
-                        if token_data(first).as_deref() == Some(expected.as_str()) {
+                        let found = token_data(first);
+                        if found.as_deref() == Some(expected.as_str()) {
                             events.remove(0);
                         } else {
-                            self.fatal_error = Some(resume_token_missing(&expected));
+                            // mongod names the token of the event it found
+                            // in its place (8.2.11), not the one asked for.
+                            let shown = found.unwrap_or(expected);
+                            self.fatal_error = Some(resume_token_missing(&shown));
                             events.clear();
                         }
                         self.expect_token = None;
@@ -372,13 +377,9 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
     // only a position (an empty batch's), or an invalidate, starts after it.
     let mut expect_token = None;
     let position = if let Some(tok) = resume_token {
-        let seq = storage.resume_token_seq(tok).ok_or_else(|| {
-            CommandError::new(
-                40647,
-                "Location40647",
-                "resumeAfter / startAfter resume token is not valid",
-            )
-        })?;
+        let seq = storage
+            .resume_token_seq(tok)
+            .ok_or_else(|| unreadable_token_error(tok, &scope))?;
         if storage.resume_token_is_event(tok) && !storage.resume_token_from_invalidate(tok) {
             expect_token = tok.get_str("_data").ok().map(str::to_string);
             seq - 1
@@ -702,6 +703,36 @@ fn spec_problem(spec: &Document) -> Option<CommandError> {
         }
     }
     None
+}
+
+/// The error for a resume token this server cannot read: mongod's, where
+/// mongod would fail to read it too ([`crate::resume_keystring`]), and
+/// otherwise this server's own 40647.
+fn unreadable_token_error(tok: &Document, scope: &ChangeStreamScope) -> CommandError {
+    use crate::resume_keystring::{mongod_verdict, Verdict};
+    match mongod_verdict(tok) {
+        Verdict::Error(code, name, msg) => {
+            let name = if name == "Location" {
+                format!("Location{code}")
+            } else {
+                name.to_string()
+            };
+            CommandError::new(code, name, msg)
+        }
+        Verdict::Decoded { has_uuid: false } if matches!(scope, ChangeStreamScope::Coll { .. }) => {
+            CommandError::new(
+                260,
+                "InvalidResumeToken",
+                "Attempted to resume a single-collection stream, but the resume token does not \
+                 include a UUID",
+            )
+        }
+        Verdict::Decoded { .. } | Verdict::Unmodelled => CommandError::new(
+            40647,
+            "Location40647",
+            "resumeAfter / startAfter resume token is not valid",
+        ),
+    }
 }
 
 /// Apply the user change-stream pipeline to a batch of projected event bytes:

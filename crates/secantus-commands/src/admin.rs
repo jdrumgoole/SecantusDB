@@ -2087,6 +2087,11 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         .is_ok_and(|o| o.contains_key("clusteredIndex"));
     let unlisted = usize::from(ts_fields.is_some() || clustered);
     let before = before.saturating_sub(unlisted);
+    // Nor does an `_id` index it does not list conflict with one asked for.
+    let existing: Vec<Document> = existing
+        .into_iter()
+        .filter(|ix| ts_fields.is_none() || ix.get_str("name") != Ok("_id_"))
+        .collect();
     let mut any_created = false;
     let mut any_existed = false;
     // The indexes this request has built so far: mongod builds a request's
@@ -2111,8 +2116,10 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         // name was invented from the key.
         let spec_text = argtypes::render_stage_value(&Bson::Document(s.clone()));
         // The `_id` index always exists, under its own name: asking for it
-        // again, whatever the request calls it, creates nothing.
-        if key.len() == 1 && key.get("_id").and_then(as_i64) == Some(1) {
+        // again, whatever the request calls it, creates nothing. A
+        // time-series collection has none, and builds one as asked (mongod
+        // 8.2.11 lists it as `_id_1`).
+        if ts_fields.is_none() && key.len() == 1 && key.get("_id").and_then(as_i64) == Some(1) {
             // It has the collection's collation and takes no other.
             let full = |c: Option<secantus_core::collation::Collation>| match c {
                 Some(c) => c.spec().clone(),

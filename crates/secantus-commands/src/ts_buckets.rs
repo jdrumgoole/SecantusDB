@@ -8,13 +8,13 @@
 //! collection returns its measurements in, the counts `collStats` and
 //! `validate` report.
 //!
-//! The derivation replays the measurements in insertion order through
-//! `mongod`'s placement rule: a measurement joins a bucket of its meta value
-//! whose time window holds it and which has room, and otherwise opens one
-//! whose window starts at its time rounded down. What it cannot know is how
-//! the measurements were batched, and `mongod` places a batch as a whole (it
-//! sorts the batch first), so a batch that runs backwards in time can land in
-//! fewer buckets there than here. Shapes were read from `mongod` 8.2.11.
+//! The derivation replays the measurements in the order they were stored
+//! through `mongod`'s bucket catalog ([`place`]). `mongod` sorts an insert
+//! batch by time before placing it, and so does the insert here before
+//! storing it (`crud::insert`), which is what lets the stored order stand
+//! for the order `mongod` placed them in. A bucket never closes for size
+//! here: `mongod`'s limit depends on its cache size and on how many buckets
+//! the whole server has open. Shapes were read from `mongod` 8.2.11.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -109,15 +109,182 @@ pub(crate) struct Bucket {
     start_ms: i64,
     meta: Option<Bson>,
     pub members: Vec<usize>,
+    /// The types its measurements' fields have had ([`Schema`]).
+    schema: Schema,
 }
 
-/// Place `docs` (the collection's measurements, in insertion order) into
-/// buckets, returned in the order `system.buckets` holds them: by the start
-/// of the window, then by which was opened first.
+/// What a bucket's measurements have held at each path, as `mongod`'s
+/// bucket catalog tracks it (`timeseries::bucket_catalog::Schema`, 8.2): a
+/// scalar by its canonical type (every number is one type, so is every
+/// string), a document by its fields, an array by position. A measurement
+/// that holds another kind at a path the bucket has seen -- an int where a
+/// string was, a scalar where a document was -- closes the bucket for good
+/// (`RolloverReason::kSchemaChange`, a hard close). The meta field is left
+/// out; a path a measurement leaves out changes nothing.
+
+#[derive(Debug, Clone, PartialEq, Default)]
+enum Schema {
+    #[default]
+    Unset,
+    Value(i32),
+    Object(Vec<(String, Schema)>),
+    Array(Vec<Schema>),
+}
+
+/// `canonicalizeBSONType`: the types `mongod` orders as one.
+fn canonical_type(v: &Bson) -> i32 {
+    match v {
+        Bson::MinKey => -1,
+        Bson::Undefined => 0,
+        Bson::Null => 5,
+        Bson::Double(_) | Bson::Int32(_) | Bson::Int64(_) | Bson::Decimal128(_) => 10,
+        Bson::String(_) | Bson::Symbol(_) => 15,
+        Bson::Document(_) => 20,
+        Bson::Array(_) => 25,
+        Bson::Binary(_) => 30,
+        Bson::ObjectId(_) => 35,
+        Bson::Boolean(_) => 40,
+        Bson::DateTime(_) => 45,
+        Bson::Timestamp(_) => 47,
+        Bson::RegularExpression(_) => 50,
+        Bson::DbPointer(_) => 55,
+        Bson::JavaScriptCode(_) => 60,
+        Bson::JavaScriptCodeWithScope(_) => 65,
+        Bson::MaxKey => 127,
+    }
+}
+
+impl Schema {
+    /// Take `v` in; `false` when its kind conflicts with what is held (the
+    /// schema is then part-updated: the caller restores it).
+    fn update(&mut self, v: &Bson) -> bool {
+        match v {
+            Bson::Document(d) => {
+                if matches!(self, Schema::Unset) {
+                    *self = Schema::Object(Vec::new());
+                }
+                let Schema::Object(fields) = self else {
+                    return false;
+                };
+                d.iter().all(|(k, v)| Self::field(fields, k).update(v))
+            }
+            Bson::Array(a) => {
+                if matches!(self, Schema::Unset) {
+                    *self = Schema::Array(Vec::new());
+                }
+                let Schema::Array(items) = self else {
+                    return false;
+                };
+                a.iter().enumerate().all(|(i, v)| {
+                    if items.len() <= i {
+                        items.push(Schema::Unset);
+                    }
+                    items[i].update(v)
+                })
+            }
+            scalar => {
+                let t = canonical_type(scalar);
+                match self {
+                    Schema::Unset => {
+                        *self = Schema::Value(t);
+                        true
+                    }
+                    Schema::Value(held) => *held == t,
+                    _ => false,
+                }
+            }
+        }
+    }
+
+    fn field<'a>(fields: &'a mut Vec<(String, Schema)>, name: &str) -> &'a mut Schema {
+        let at = match fields.iter().position(|(k, _)| k == name) {
+            Some(at) => at,
+            None => {
+                fields.push((name.to_string(), Schema::Unset));
+                fields.len() - 1
+            }
+        };
+        &mut fields[at].1
+    }
+
+    /// Take a measurement in, its meta field left out.
+    fn take(&mut self, doc: &Document, layout: &Layout) -> bool {
+        if matches!(self, Schema::Unset) {
+            *self = Schema::Object(Vec::new());
+        }
+        let Schema::Object(fields) = self else {
+            return false;
+        };
+        doc.iter()
+            .filter(|(k, _)| layout.meta.as_deref() != Some(k.as_str()))
+            .all(|(k, v)| Self::field(fields, k).update(v))
+    }
+}
+
+/// Why a bucket cannot take a measurement (`RolloverReason`, mongod 8.2).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Rollover {
+    /// The measurement is before the bucket's window: the bucket is
+    /// archived, and can be reopened from memory.
+    TimeBackward,
+    /// After the window, full, or of another schema: the bucket leaves
+    /// memory, and nothing may be reopened by query for this measurement.
+    Other,
+}
+
+impl Bucket {
+    fn covers(&self, t: i64, layout: &Layout) -> bool {
+        t >= self.start_ms && t - self.start_ms < layout.span_ms
+    }
+
+    /// `determineRolloverReason`, the size check aside: `None` when the
+    /// bucket takes the measurement (and its schema then holds it).
+    fn rollover(&mut self, doc: &Document, t: i64, layout: &Layout) -> Option<Rollover> {
+        if t < self.start_ms {
+            return Some(Rollover::TimeBackward);
+        }
+        if !self.covers(t, layout) || self.members.len() >= MAX_COUNT {
+            return Some(Rollover::Other);
+        }
+        // A bucket that refuses a measurement keeps the schema it had:
+        // `mongod` rebuilds a reopened bucket's schema from what it holds.
+        let held = self.schema.clone();
+        if !self.schema.take(doc, layout) {
+            self.schema = held;
+            return Some(Rollover::Other);
+        }
+        None
+    }
+}
+
+/// Per meta value, the buckets `mongod` holds in memory.
+#[derive(Default)]
+struct Series {
+    /// The bucket measurements go to.
+    open: Option<usize>,
+    /// Buckets rolled over for a measurement before their window, by start.
+    archived: Vec<usize>,
+    /// Every bucket of the series, as a query of `system.buckets` finds them.
+    all: Vec<usize>,
+}
+
+/// Place `docs` (the collection's measurements, in the order they were
+/// stored) into buckets, returned in the order `system.buckets` holds them:
+/// by the start of the window, then by which was opened first.
+///
+/// Each measurement goes through `mongod`'s bucket catalog (8.2,
+/// `findOpenBucketForMeasurement` / `potentiallyReopenBucket`): into its
+/// series' open bucket when that takes it; otherwise into an archived
+/// bucket whose window holds it (the latest to start), or -- when every
+/// bucket it was turned away from was turned away for time running
+/// backwards -- the earliest-starting stored bucket whose window holds it
+/// and has room (the reopening query); otherwise into a new bucket, whose
+/// window starts at its time rounded down. A bucket that cannot take what
+/// it is offered is rolled over: archived for time running backwards, and
+/// otherwise dropped from memory (a query can still reopen it).
 pub(crate) fn place(docs: &[Document], layout: &Layout) -> Vec<Bucket> {
     let mut buckets: Vec<Bucket> = Vec::new();
-    // Per meta value, the buckets opened for it, oldest first.
-    let mut by_meta: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+    let mut series: HashMap<Vec<u8>, Series> = HashMap::new();
     for (i, doc) in docs.iter().enumerate() {
         let t = layout.time_of(doc);
         let meta = layout.meta_of(doc);
@@ -125,26 +292,65 @@ pub(crate) fn place(docs: &[Document], layout: &Layout) -> Vec<Bucket> {
             Some(m) => bson::to_vec(&doc! {"m": m.clone()}).unwrap_or_default(),
             None => Vec::new(),
         };
-        let opened = by_meta.entry(key).or_default();
-        // The newest bucket that can take it: `mongod` writes to the open
-        // bucket, and reopens an older one for a measurement that fits it.
-        let home = opened.iter().rev().copied().find(|&b| {
-            let bucket = &buckets[b];
-            t >= bucket.start_ms
-                && t - bucket.start_ms < layout.span_ms
-                && bucket.members.len() < MAX_COUNT
-        });
-        match home {
-            Some(b) => buckets[b].members.push(i),
-            None => {
-                opened.push(buckets.len());
-                buckets.push(Bucket {
-                    start_ms: t.div_euclid(layout.rounding_ms) * layout.rounding_ms,
-                    meta,
-                    members: vec![i],
-                });
+        let s = series.entry(key).or_default();
+        let mut query_allowed = true;
+        let mut open_rollover = None;
+        if let Some(o) = s.open {
+            match buckets[o].rollover(doc, t, layout) {
+                None => {
+                    buckets[o].members.push(i);
+                    continue;
+                }
+                Some(reason) => {
+                    query_allowed &= reason == Rollover::TimeBackward;
+                    open_rollover = Some((o, reason));
+                }
             }
         }
+        // The open bucket is rolled over: archived, or out of memory.
+        if let Some((o, reason)) = open_rollover {
+            s.open = None;
+            if reason == Rollover::TimeBackward {
+                s.archived.push(o);
+            }
+        }
+        let archived = s
+            .archived
+            .iter()
+            .copied()
+            .filter(|&b| buckets[b].covers(t, layout))
+            .max_by_key(|&b| buckets[b].start_ms);
+        let candidate = archived.or_else(|| {
+            query_allowed
+                .then(|| {
+                    s.all
+                        .iter()
+                        .copied()
+                        .filter(|&b| {
+                            buckets[b].covers(t, layout) && buckets[b].members.len() < MAX_COUNT
+                        })
+                        .min_by_key(|&b| buckets[b].start_ms)
+                })
+                .flatten()
+        });
+        if let Some(c) = candidate {
+            s.archived.retain(|&b| b != c);
+            if buckets[c].rollover(doc, t, layout).is_none() {
+                buckets[c].members.push(i);
+                s.open = Some(c);
+                continue;
+            }
+        }
+        let mut schema = Schema::Unset;
+        schema.take(doc, layout);
+        s.open = Some(buckets.len());
+        s.all.push(buckets.len());
+        buckets.push(Bucket {
+            start_ms: t.div_euclid(layout.rounding_ms) * layout.rounding_ms,
+            meta,
+            members: vec![i],
+            schema,
+        });
     }
     for bucket in &mut buckets {
         bucket.members.sort_by_key(|&i| layout.time_of(&docs[i]));
@@ -632,6 +838,36 @@ mod tests {
         // "b" again at 02:00.
         assert_eq!(members, vec![vec![0, 2], vec![1, 5], vec![3], vec![4]]);
         assert_eq!(scan_order(&docs, &layout()), vec![0, 2, 1, 5, 3, 4]);
+    }
+
+    /// mongod 8.2.11, one measurement at a time: a field that changes kind
+    /// rolls the bucket over, and a number of another type does not. The
+    /// last measurement runs backwards in time, so the reopening query may
+    /// run, and it reopens the EARLIEST bucket whose window holds it -- the
+    /// one the string turned away -- not the latest.
+    #[test]
+    fn a_schema_change_rolls_the_bucket_over() {
+        let docs = vec![
+            doc! {"_id": 0, "t": at(30), "m": "a", "v": 1},
+            doc! {"_id": 1, "t": at(31), "m": "a", "v": "s"},
+            doc! {"_id": 2, "t": at(32), "m": "a", "v": 3},
+            doc! {"_id": 3, "t": at(33), "m": "a", "v": 4.5},
+            doc! {"_id": 4, "t": at(34), "m": "a", "v": 5_i64, "w": {"x": 1}},
+            doc! {"_id": 5, "t": at(35), "m": "a", "w": {"x": 2, "y": [1]}},
+            doc! {"_id": 6, "t": at(36), "m": "a", "w": {"x": "no"}},
+            doc! {"_id": 7, "t": Bson::DateTime(bson::DateTime::from_millis(
+                1_767_225_600_000 + 31 * 60_000 + 30_000,
+            )), "m": "a"},
+        ];
+        let members: Vec<Vec<usize>> = place(&docs, &layout())
+            .iter()
+            .map(|b| b.members.clone())
+            .collect();
+        assert_eq!(
+            members,
+            vec![vec![0, 7], vec![1], vec![2, 3, 4, 5], vec![6]]
+        );
+        assert_eq!(scan_order(&docs, &layout()), vec![0, 7, 1, 2, 3, 4, 5, 6]);
     }
 
     #[test]

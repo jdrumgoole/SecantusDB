@@ -253,6 +253,20 @@ fn a_resume_token_must_be_found() {
             .get_str("errmsg")
             .unwrap()
             .starts_with("Executor error during aggregate command on namespace: t.c :: caused by :: cannot resume stream; the resume token was not found."));
+        // It names the token of the event found in its place (`_id` 3), as
+        // mongod 8.2.11 does, not the token asked for.
+        let found = after[1]
+            .get_document("_id")
+            .unwrap()
+            .get_str("_data")
+            .unwrap();
+        assert!(
+            filtered
+                .get_str("errmsg")
+                .unwrap()
+                .ends_with(&format!("{{_data: \"{found}\"}}")),
+            "{filtered}"
+        );
         // On another collection the token's event never comes: fatal at getMore.
         let other = dispatch_full(
             &doc! {"aggregate": "d", "pipeline": [{"$changeStream": {"resumeAfter": token}}], "cursor": {}},

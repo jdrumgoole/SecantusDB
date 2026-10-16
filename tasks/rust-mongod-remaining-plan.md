@@ -229,11 +229,14 @@ Size: one or two batches; scan order is the hard part.
 
 ## Phase 5 -- smaller tails
 
-- [ ] Moved here from Phase 1, as reply shape rather than a wrong answer:
+- [x] Moved here from Phase 1, as reply shape rather than a wrong answer:
       transaction change events lack `txnNumber` / `lsid`, and `lsid.uid`
-      is not the user's hash (7.072, 7.074).
-- [ ] Capped eviction rescans the collection on every insert (7.065).
+      is not the user's hash (7.072, 7.074). **2026-10-16:** `txnNumber` /
+      `lsid` were already there; `uid` hashes `user@db` now.
+      `$listLocalSessions` has the same gap (RM-156).
+- [x] Capped eviction rescans the collection on every insert (7.065).
       This is a performance item: keep a running size and count.
+      **2026-10-16:** kept in memory, recounted after any other write.
 - [ ] Views (7.066): a `hint` on a view is ignored (mongod: 2);
       `$indexStats` on a view answers (40602); the wording of 48 for an
       existing view; `distinct` on a view returns values in scan order.
@@ -256,18 +259,28 @@ Size: one or two batches; scan order is the hard part.
       runs it.
 
 - [ ] Time series (7.071): sort a batch before placing it; close a bucket on
-      size; the `_id` / index differences.
+      size; the `_id` / index differences. **2026-10-16:** batches sorted,
+      schema-change rollover and reopening done, `{_id: 1}` index built;
+      size closing needs mongod's server-wide catalog state (a decision),
+      a measurement with no `_id` changes the Python server's documents.
 - [ ] Collation (7.070): `normalization: false` (ICU4X always normalises),
       the five collation types ICU4X lacks, `$densify` `bounds: "full"` across
       partitions, re-measure `$setWindowFields` partition order.
-- [ ] Change streams (7.074): mongod's token-decode errors (15, 50811),
+      **2026-10-16:** `$densify` and `$setWindowFields` done; the other two
+      need ICU (sized in the backlog items).
+- [x] Change streams (7.074): mongod's token-decode errors (15, 50811),
       `startAfter` a `dropDatabase` token, the unprobed items.
+      **2026-10-16:** decode errors transcribed; `startAfter` /
+      `resumeAfter` of every token around a `dropDatabase` matched mongod
+      already. A well-formed mongod token is still 40647 (RM-075).
 - [ ] `update` (7.077): 27 for `$text`, `$$CLUSTER_TIME`, the `$replaceWith`
       message. The upserted field order has no known rule.
 - [ ] 7.078: `includeQueryStatsMetrics`, `distinct` over a multikey index and
       with a collation, 239 for an old `atClusterTime`.
 - [ ] The `Slow query` line (7.07): `planSummary`, `keysExamined`,
       `docsExamined`, `nreturned`, `reslen`, the storage wait times.
+      **2026-10-16:** command document, `planSummary`, `nreturned`,
+      `reslen` done; the examined counts and storage waits remain (RM-023).
 
 Size: one or two batches.
 

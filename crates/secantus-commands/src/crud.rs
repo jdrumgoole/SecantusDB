@@ -921,6 +921,8 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mut pre_errors: Vec<Document> = Vec::new();
     let mut surviving: Vec<Vec<u8>> = Vec::new();
     let mut survivor_to_orig: Vec<usize> = Vec::new();
+    // Each surviving measurement's time, for a time-series collection.
+    let mut times: Vec<i64> = Vec::new();
     for (index, entry) in documents.iter().copied().enumerate() {
         let Bson::Document(d) = entry else {
             // Non-document batch entries are malformed input; mongod rejects
@@ -1003,6 +1005,30 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             None => encode_doc(d)?,
         });
         survivor_to_orig.push(index);
+        if let Some(f) = &ts_fields {
+            times.push(match d.get(&f.time) {
+                Some(Bson::DateTime(t)) => t.timestamp_millis(),
+                _ => 0,
+            });
+        }
+    }
+
+    // A time-series batch is placed in time order: mongod 8.2.11 sorts each
+    // meta value's measurements by time before it buckets them, so a batch
+    // that runs backwards in time shares a bucket where one-at-a-time
+    // inserts would not. The buckets here are derived from the order the
+    // measurements are stored in (`ts_buckets`), so the batch is stored
+    // sorted. An ordered batch that stopped at a bad measurement is placed
+    // one measurement at a time, as written (measured).
+    if ts_fields.is_some() && !(ordered && !pre_errors.is_empty()) {
+        let mut by_time: Vec<usize> = (0..surviving.len()).collect();
+        by_time.sort_by_key(|&i| times[i]);
+        let mut docs: Vec<Option<Vec<u8>>> = surviving.into_iter().map(Some).collect();
+        surviving = by_time
+            .iter()
+            .map(|&i| docs[i].take().unwrap_or_default())
+            .collect();
+        survivor_to_orig = by_time.iter().map(|&i| survivor_to_orig[i]).collect();
     }
 
     // An ordered batch stops AT the pre-check failure; the documents before

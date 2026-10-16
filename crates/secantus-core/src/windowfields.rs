@@ -166,9 +166,10 @@ pub fn set_window_fields_stage(
             || matches!(c.op, "$linearFill" | "$derivative" | "$integral")
     });
 
-    // Partition, preserving partition-discovery order; each partition holds the
-    // *original* indices of its members (in input order).
+    // Partition; each partition holds the *original* indices of its members
+    // (in input order), and the key it was found under.
     let mut partitions: Vec<Vec<usize>> = Vec::new();
+    let mut keys: Vec<Bson> = Vec::new();
     let mut key_index: HashMap<Vec<u8>, usize> = HashMap::new();
     for (i, doc) in docs.iter().enumerate() {
         let key_val = match partition_by {
@@ -183,19 +184,35 @@ pub fn set_window_fields_stage(
             .exec());
         }
         let mut wrap = Document::new();
-        wrap.insert("k", crate::collation::fold_active(key_val));
+        wrap.insert("k", crate::collation::fold_active(key_val.clone()));
         let key = bson::to_vec(&wrap).map_err(|_| Fallback::Defer)?;
         let idx = *key_index.entry(key).or_insert_with(|| {
             partitions.push(Vec::new());
+            keys.push(key_val);
             partitions.len() - 1
         });
         partitions[idx].push(i);
     }
+    // mongod sorts by the partition key first (`$setWindowFields` is a
+    // `$sort` on the key and `sortBy`), so the partitions come out in key
+    // order -- under the collation, null and missing as one -- and stay in
+    // the order they were found when keys compare equal. Measured 8.2.11,
+    // 2026-10-16, on five specs with and without a collation. (An earlier
+    // note here recorded first-seen order; it was not re-measured then.)
+    if keys.iter().all(order::is_comparable) {
+        let mut by_key: Vec<usize> = (0..partitions.len()).collect();
+        by_key.sort_by(|&a, &b| order::cmp(&keys[a], &keys[b]));
+        let mut taken: Vec<Option<Vec<usize>>> = partitions.into_iter().map(Some).collect();
+        partitions = by_key
+            .iter()
+            .map(|&i| taken[i].take().unwrap_or_default())
+            .collect();
+    }
 
     let mut out_docs: Vec<Document> = docs.clone();
-    // mongod emits PARTITION BY PARTITION, in first-seen partition order, and
-    // within each partition in `sortBy` order -- not the input order. Measured
-    // 8.2.11 (2026-09-09) across five specs. Wrong order is wrong RESULTS as
+    // mongod emits PARTITION BY PARTITION, in partition-key order (above),
+    // and within each partition in `sortBy` order -- not the input order.
+    // Wrong order is wrong RESULTS as
     // soon as a `$limit` follows, so this is not cosmetic. `sorted_slots`
     // already yields exactly that sequence, so recording it costs nothing.
     // Mirrors `aggregate._stage_set_window_fields`.

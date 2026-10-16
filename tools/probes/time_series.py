@@ -359,6 +359,49 @@ SCENARIOS = [
             ),
         ],
     ),
+    # Where measurements land: the buckets' sizes in `system.buckets` order,
+    # then the order a scan returns them in.
+    *[
+        (
+            f"place: {label}",
+            [
+                W,
+                *[insert("w", *batch) for batch in batches],
+                agg(
+                    "system.buckets.w",
+                    {"$project": {"_id": 0, "n": "$control.count"}},
+                ),
+                find("w", projection={"_id": 1}),
+            ],
+        )
+        for label, batches in (
+            (
+                "a batch that runs backwards",
+                [[{"_id": 0, "t": at(30), "m": "a"}, {"_id": 1, "t": at(-10), "m": "a"}]],
+            ),
+            (
+                "one at a time backwards",
+                [[{"_id": 0, "t": at(30), "m": "a"}], [{"_id": 1, "t": at(-10), "m": "a"}]],
+            ),
+            (
+                "a field that changes type",
+                [
+                    [{"_id": 0, "t": at(30), "m": "a", "v": 1}],
+                    [{"_id": 1, "t": at(31), "m": "a", "v": "s"}],
+                    [{"_id": 2, "t": at(32), "m": "a", "v": 3.5}],
+                ],
+            ),
+            (
+                "back into a bucket a type change left",
+                [
+                    [{"_id": 0, "t": at(30), "m": "a", "v": 1}],
+                    [{"_id": 1, "t": at(31), "m": "a", "v": "s"}],
+                    [{"_id": 2, "t": at(32), "m": "a", "v": 3}],
+                    [{"_id": 3, "t": at(31, 30), "m": "a"}],
+                ],
+            ),
+        )
+    ],
     ("read: hint _id", [*SEED, find("w", hint={"_id": 1})]),
     ("read: hint $natural", [*SEED, find("w", hint={"$natural": 1}, projection={"_id": 1})]),
     ("read: tailable", [*SEED, find("w", tailable=True)]),

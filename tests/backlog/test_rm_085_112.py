@@ -240,6 +240,54 @@ def test_bucket_collection_can_be_deleted_from(rust_mongo: Any, mongod: Any) -> 
     assert got == ref
 
 
+def _placed(client: Any, batches: list) -> tuple:
+    """Insert `batches` (lists of `(minute, v)`; `v` None for no `v`) into a
+    fresh time-series collection: the buckets' counts and the scan order."""
+    db = client[_name("rm088")]
+    db.create_collection("ts", timeseries={"timeField": "t", "metaField": "m"})
+    start = bson.datetime.datetime(2026, 1, 1)
+    n = 0
+    for batch in batches:
+        docs = []
+        for minute, v in batch:
+            d = {"_id": n, "t": start + bson.datetime.timedelta(minutes=minute), "m": "a"}
+            if v is not None:
+                d["v"] = v
+            docs.append(d)
+            n += 1
+        db.ts.insert_many(docs)
+    counts = [b["control"]["count"] for b in db["system.buckets.ts"].find()]
+    return counts, [d["_id"] for d in db.ts.find({}, {"_id": 1})]
+
+
+@pytest.mark.backlog_fixed("RM-088")
+def test_a_batch_is_placed_in_time_order(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 sorts an insert batch by time before bucketing it: a
+    batch that runs backwards shares one bucket, where the same two
+    measurements inserted one at a time take two."""
+    got, ref = _both(
+        rust_mongo,
+        mongod,
+        lambda c: (_placed(c, [[(30, 1), (-10, 1)]]), _placed(c, [[(30, 1)], [(-10, 1)]])),
+    )
+    assert ref == (([2], [1, 0]), ([1, 1], [1, 0]))
+    assert got == ref
+
+
+@pytest.mark.backlog_fixed("RM-088")
+def test_a_field_changing_type_rolls_the_bucket_over(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 rolls a bucket over when a field changes type (a number
+    to a string and back); a later measurement before the current bucket's
+    window is reopened into the EARLIEST bucket whose window holds it."""
+    got, ref = _both(
+        rust_mongo,
+        mongod,
+        lambda c: _placed(c, [[(30, 1)], [(31, "s")], [(32, 3)], [(31.5, None)]]),
+    )
+    assert ref == ([2, 1, 1], [0, 3, 1, 2])
+    assert got == ref
+
+
 @pytest.mark.backlog("RM-089")
 def test_measurement_without_id_is_stored_without_one(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11: a measurement inserted with no `_id` reads back with none."""
@@ -391,7 +439,7 @@ def test_lookup_from_a_view_with_another_collation(rust_mongo: Any, mongod: Any)
     assert got == ref
 
 
-@pytest.mark.backlog("RM-097")
+@pytest.mark.backlog_fixed("RM-097")
 def test_densify_full_partitions_fill_the_whole_range(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11: `bounds: "full"` with `partitionByFields` fills every
     partition across the collection's range, with mongod's repeat of `(c,1)`."""
@@ -415,7 +463,35 @@ def test_densify_full_partitions_fill_the_whole_range(rust_mongo: Any, mongod: A
     assert got == ref
 
 
-@pytest.mark.backlog("RM-098")
+@pytest.mark.backlog("RM-157")
+def test_densify_partition_bounds_emit_in_partition_order(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 (2026-10-16): `$densify` with `bounds: "partition"`
+    sorts by the partition fields and then the field, so the partitions come
+    out in key order; this server emits them in the order first seen."""
+
+    def probe(client: Any) -> list:
+        db = client[_name("rm157")]
+        db.c.insert_many(
+            [{"p": p, "v": v} for p, v in [("c", 0), ("a", 3), ("c", 2), ("b", 1), ("a", 0)]]
+        )
+        pipe = [
+            {
+                "$densify": {
+                    "field": "v",
+                    "partitionByFields": ["p"],
+                    "range": {"step": 1, "bounds": "partition"},
+                }
+            },
+            {"$project": {"_id": 0}},
+        ]
+        return [(d["p"], d["v"]) for d in db.c.aggregate(pipe)]
+
+    got, ref = _both(rust_mongo, mongod, probe)
+    assert ref == [("a", 0), ("a", 1), ("a", 2), ("a", 3), ("b", 1), ("c", 0), ("c", 1), ("c", 2)]
+    assert got == ref
+
+
+@pytest.mark.backlog_fixed("RM-098")
 def test_set_window_fields_partition_order(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11: `$setWindowFields` emits its partitions in
     partition-key order."""

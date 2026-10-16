@@ -326,6 +326,19 @@ def _densify_spec(rng):
     return {"$densify": spec}
 
 
+def _densify_follows_mongod_not_python(docs, spec):
+    """Shapes where the Rust engine follows mongod 8.2.11 and the (deprecated)
+    Python engine does not, so the two are not compared: a partitioned
+    `bounds: "full"` fills every partition across the collection's range, and
+    a document missing a partition field is a partition of its own whose
+    fillers leave the field out (RM-097, 2026-10-16; pinned against mongod by
+    `tests/backlog/test_rm_085_112.py::test_densify_full_partitions_fill_the_whole_range`
+    and the `densify.rs` unit tests)."""
+    if not spec.get("partitionByFields"):
+        return False
+    return spec["range"].get("bounds") == "full" or any("g" not in d for d in docs)
+
+
 def test_densify_fuzz():
     rng = random.Random(0xDE251F)
     handled = 0
@@ -334,6 +347,8 @@ def test_densify_fuzz():
         pipeline = [_densify_spec(rng)]
         docs = bson.decode(bson.encode({"d": docs}))["d"]
         pipeline = bson.decode(bson.encode({"p": pipeline}))["p"]
+        if _densify_follows_mongod_not_python(docs, pipeline[0]["$densify"]):
+            continue
         rust = _rust_pipeline(docs, pipeline)
         if rust is None:
             continue

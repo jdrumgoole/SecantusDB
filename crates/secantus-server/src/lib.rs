@@ -1025,9 +1025,11 @@ fn run_dispatch(
         }
     };
     if slow {
+        let read = secantus_commands::slowop::read_attributes(request, &reply, &ctx);
         let attr = secantus_commands::slowop::attributes(
             request,
             &reply,
+            read,
             &ctx.db_name,
             conn_id,
             worked,
