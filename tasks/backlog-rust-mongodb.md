@@ -649,6 +649,10 @@ may run a command.
       `reIndex` refuses as mongod does on a replica-set primary, which this
       server reports itself as; compared against a standalone mongod it looks
       like a difference and is not.
+      **Decided 2026-10-16 (Joe):** the 31264 refusal stands. The Java and
+      Kotlin gauges' "MapReduce omits default write concern" is recorded in
+      `validation_summary/expected_failures.py`. A JavaScript engine is not
+      being built for this.
       Backlog-ID: RM-027
       Verify: tests/backlog/test_rm_001_028.py::test_commands_mongod_runs
 - [ ] **The server's own commands have no mongod rule.**
@@ -679,6 +683,9 @@ What is open:
       on-disk change it reads: a field in the record shows in its
       `rolesInfo`, and a side table it does not write goes stale when it
       drops and recreates a role. About two hours once decided.
+      **Decided 2026-10-16 (Joe):** a side table only the Rust server
+      writes, holding each role's creation sequence. Compatibility with the
+      Python server is no longer a constraint (`CLAUDE.md`).
       Backlog-ID: RM-029
       Verify: tests/backlog/test_rm_029_056.py::test_roles_info_lists_roles_in_creation_order
 - [ ] **The order of a set of roles** (5): a user's `roles` after
@@ -952,11 +959,18 @@ Still different, all 77:
       `{a: 5}, sort {a: -1}, skip 1, limit 2`). This server keeps them in
       the order they arrived. A Linux mongod is built on another library
       and was not measured.
+      **Decided 2026-10-16 (Joe):** measure the cases against mongod 8.2.11
+      on Linux (libstdc++) first. If Linux agrees with macOS, reproduce
+      libc++'s heap; if not, mongod has no single answer and the divergence
+      is accepted.
       Backlog-ID: RM-049
       Verify: tests/backlog/test_rm_029_056.py::test_ties_under_a_sort_with_a_limit,tests/backlog/test_rm_029_056.py::test_ties_under_an_aggregate_sort_with_a_limit
-- [ ] **An unknown hint's wording** on `aggregate` (15), as under 7.075.
-  Backlog-ID: RM-051
-  Verify: tests/backlog/test_rm_029_056.py::test_unknown_hint_on_aggregate
+- **Scope decision — an unknown hint's wording** (Joe, 2026-10-16). The
+  code matches mongod (2); the message is this server's own, because mongod
+  prints its query tree there. The probes' replies that differ only in this
+  text are accepted. Pinned by
+  `tests/backlog/test_rm_029_056.py::test_unknown_hint_on_aggregate`
+  (formerly RM-051).
 - [ ] **The order of an unsorted `find` for six predicate shapes the
       plan derives differently from mongod.** Found by p4-router's
       824-case shapes harness (2026-10-15), mongod 8.2.11: 22 replies, the
@@ -1194,6 +1208,10 @@ What is left, all on the RUST MongoDB server:
       `$limit`). Also open in listings: mongod constant-folds (`{$abs: -1}`
       is `{$const: 1}`) and orders the fields of object-form operators its
       own way (`$dateToString`).
+      **Decided 2026-10-16 (Joe):** reproduce SBE faithfully: transcribe
+      mongod 8.2.11's SBE stage builders for these shapes and EXECUTE the
+      slot programs, so `queryPlan`, `slotBasedPlan` and the SBE execution
+      stats all come from running the plan. Not a printed stand-in.
       Backlog-ID: RM-071
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_a_group_pushed_into_the_query
 - [ ] **`count` on a view** is explained by mongod 8.2.11 as an SBE plan
@@ -1201,6 +1219,7 @@ What is left, all on the RUST MongoDB server:
       scan); this server reports the classic cursor and the `$count`
       stage. The same decision as RM-071. `distinct` and `aggregate` on a
       view match mongod. `explain_commands.py`: `a view` 4 and 5.
+      **Decided 2026-10-16 (Joe):** as RM-071, transcribe and execute.
       Backlog-ID: RM-072
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view
 - [ ] **Smaller:** `$expr` is not rewritten (`{$expr: false}` is not an
@@ -1296,6 +1315,10 @@ differs on 5 scenarios. What is left:
       a decision already made (`tests/test_rust_hint_error_message.py`).
       Not probed: `oplogReplay`, `$meta: "textScore"` sorts, an
       `explain: true` aggregate.
+      **Decided 2026-10-16 (Joe):** per-collection record ids, on disk:
+      number each collection's records from 1 and store the counter, as
+      mongod does, so `showRecordId` and `$meta: "recordId"` give mongod's
+      numbers. The Python server need not read the result (`CLAUDE.md`).
       Backlog-ID: RM-083
       Verify: tests/backlog/test_rm_057_084.py::test_meta_record_id_and_index_key_projections, tests/backlog/test_rm_found_2026_10_16.py::test_show_record_id_is_the_record_id
 
@@ -1373,6 +1396,10 @@ is left follows from that:
         Its sizes are of the derived buckets, not of compressed ones.
       - **An unsorted read of a time-series collection reads the whole
         collection** to place the measurements, whatever its filter.
+      **Decided 2026-10-16 (Joe):** model mongod's server-wide bucket
+      catalog, memory accounting across every collection included
+      (`getCacheDerivedBucketMaxSize`), so buckets close for size as on
+      mongod.
       Backlog-ID: RM-088
       Verify: tests/backlog/test_rm_085_112.py::test_bucket_collection_can_be_deleted_from
 - [ ] **RUST MongoDB server: smaller time-series differences.** A
@@ -1410,6 +1437,9 @@ What is left, there and beside it:
       `CollatorOptions` documents it as always on, no BCP47 `kk`), so this
       needs ICU itself or a collator of our own: a decision, not a fix
       (checked 2026-10-16, icu_collator 2.3.1).
+      **Decided 2026-10-16 (Joe):** link the C ICU 57.1 that mongod links,
+      in place of ICU4X, so `normalization: false` and the `alternate:
+      "shifted"` cases match.
       Backlog-ID: RM-091
       Verify: tests/backlog/test_rm_085_112.py::test_canonically_equivalent_strings_differ_without_normalization
 - [ ] **RUST MongoDB server: collated `_id` uniqueness, what is left.**
@@ -1440,6 +1470,8 @@ What is left, there and beside it:
       a baked data module) could carry those three; `big5han` and
       `gb2312han` are no longer in CLDR at all and exist only in ICU 57's
       data. Either way a build-time data pipeline: a decision for Joe.
+      **Decided 2026-10-16 (Joe):** as RM-091: with ICU 57.1 linked, all
+      five types come from its data.
       Backlog-ID: RM-095
       Verify: tests/backlog/test_rm_085_112.py::test_five_collation_types_are_accepted
 - [ ] **RUST MongoDB server: smaller collation differences.** `Did you

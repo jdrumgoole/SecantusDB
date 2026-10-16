@@ -336,11 +336,25 @@ Size: one or two batches.
 
 Each unblocks rows that otherwise stay open.
 
+**Decided 2026-10-16** (the detail is on each backlog item):
+
+| Decision | Outcome |
+| --- | --- |
+| mapReduce refusal (RM-027) | accepted; the Java and Kotlin gauge test is an expected failure |
+| Record ids (RM-083) | per-collection counters on disk, mongod's numbers |
+| Role order (RM-029) | a side table the Rust server alone writes |
+| Time-series size closing (RM-088) | model mongod's server-wide bucket catalog |
+| Collation (RM-091, RM-095) | link C ICU 57.1 in place of ICU4X |
+| SBE explain (RM-071, RM-072) | transcribe mongod's stage builders and execute the slot programs |
+| Python-server compatibility | no longer a constraint, on-disk format included (`CLAUDE.md`) |
+
+Still open:
+
 | Decision | What it holds |
 | --- | --- |
-| Unknown-hint wording (mongod prints its query tree). Already decided: not reproduced (7.05, `tests/test_rust_hint_error_message.py`). Confirm, then mark the rows accepted in each probe | about 50 replies over six probes |
+| ~~Unknown-hint wording~~ **Decided 2026-10-16: not reproduced** (RM-051 closed as a scope decision). Still to do: mark the rows accepted in each probe | about 50 replies over six probes |
 | Lazy cursors (`getMore` sees later writes; `batchSize: 0` runs nothing) | 3 replies, and memory on large results |
-| Ties under a sort with a limit. mongod's order comes from its C++ library's heap, and a Linux mongod (libstdc++) was not measured. Measure it first; if it differs from macOS (libc++), accept the divergence instead of copying either | 62 |
+| Ties under a sort with a limit (RM-049). **Decided 2026-10-16: measure a Linux mongod first**; reproduce libc++'s heap if Linux agrees, accept the divergence if not | 62 |
 | Index build order on disk (a catalog field the Python server must carry) | `listIndexes` order, duplicate-key index |
 | A schema change waits on an open transaction (after the Phase 1b measurement) | 2 |
 | The privileges for this server's own `secantusAdmin` commands, which were chosen, not measured (7.084) | |
@@ -350,7 +364,6 @@ Each unblocks rows that otherwise stay open.
 | Wire compression (`OP_COMPRESSED`) | 2 |
 | Server-side JavaScript (`$where`) | 3 Go leaves, several probe rows |
 | Gate `configureFailPoint` / `enableTestCommands` | security |
-| Python-server parity for the Rust-side changes (the on-disk half is not optional: Phase 1a) | |
 | The PostgreSQL crates' serde BSON decodes (7.077) | |
 | Rust as the recommended default | product |
 

@@ -30,6 +30,15 @@ class ExpectedFailure:
     rationale: str
 
 
+_JS_MAP_REDUCE = (
+    "read-write-concern spec default-write-concern-3.4: its map/reduce is "
+    "JavaScript, and the Rust server has no JavaScript engine. It refuses as "
+    "`mongod --noscripting` 8.2.11 does (31264); before 2026-10-16 it answered "
+    "ok:1 with no results, a silent wrong answer that let this test pass. "
+    "Accepted by Joe 2026-10-16 (RM-027)."
+)
+
+
 JAVA: list[ExpectedFailure] = [
     ExpectedFailure(
         pattern="CRUD Api Version 1 (strict): distinct appends declared API version",
@@ -95,6 +104,19 @@ JAVA: list[ExpectedFailure] = [
             "Out of scope (the sibling 'checkout fails' subtest is already "
             "driver-skipped)."
         ),
+    ),
+    ExpectedFailure(
+        pattern="MapReduce omits default write concern",
+        rationale=_JS_MAP_REDUCE,
+    ),
+]
+
+# The Kotlin sync driver runs the Java driver's spec tests, so it meets the
+# same JavaScript-only mapReduce.
+KOTLIN: list[ExpectedFailure] = [
+    ExpectedFailure(
+        pattern="MapReduce omits default write concern",
+        rationale=_JS_MAP_REDUCE,
     ),
 ]
 
