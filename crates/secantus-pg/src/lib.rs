@@ -553,6 +553,15 @@ type CompositeFields = Vec<(String, String)>;
 /// One enum as `(schema, bare_name, oid, labels)`.
 type EnumWithSchema = (String, String, i64, Vec<String>);
 
+/// A table as the planner estimates it (`PgHandler::planner_table`).
+struct PlannerTable {
+    def: secantus_pgcatalog::TableDef,
+    /// The stored fields unique on their own.
+    unique: Vec<String>,
+    pages: f64,
+    tuples: f64,
+}
+
 /// What a grouping asks of the planner beyond its keys, for the choice
 /// between a HashAggregate and a Sort + Group (RP-028).
 struct GroupingShape {
@@ -3451,6 +3460,17 @@ struct Savepoint {
     /// changed nothing) the block held then (`UserTransactionHandle::
     /// locked_len`): a ROLLBACK TO by move takes only those again.
     lock_pos: Option<usize>,
+    /// `next_cursor_born()` when the savepoint was taken: a ROLLBACK TO
+    /// closes every cursor declared since, as the subtransaction's abort
+    /// drops its portals (`AtSubAbort_Portals`).
+    cursor_mark: u64,
+}
+
+/// A number for a cursor as it is declared, rising: a savepoint records
+/// the next one, and the cursors from it on are the subtransaction's.
+pub(crate) fn next_cursor_born() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A declared cursor's materialised result.
@@ -3461,6 +3481,8 @@ struct Savepoint {
 /// holding the result in memory, which is the trade this server already makes
 /// everywhere else.
 struct CursorState {
+    /// `next_cursor_born()` at its DECLARE.
+    born: u64,
     schema: Arc<Vec<FieldInfo>>,
     rows: Vec<DataRow>,
     /// PostgreSQL's own cursor position: the 1-based row the cursor sits ON,
@@ -5008,6 +5030,21 @@ impl PgHandler {
         &self,
         stmt: &StoredStatement<ParsedStatement>,
     ) -> PgWireResult<()> {
+        // A FETCH (or MOVE) returns its cursor's rows, which are no cached
+        // plan's: PostgreSQL describes the portal's own columns (RP-046).
+        let is_fetch = pg_query::parse(&stmt.statement.sql).is_ok_and(|p| {
+            matches!(
+                p.protobuf
+                    .stmts
+                    .first()
+                    .and_then(|s| s.stmt.as_ref())
+                    .and_then(|n| n.node.as_ref()),
+                Some(pg_query::NodeEnum::FetchStmt(_))
+            )
+        });
+        if is_fetch {
+            return Ok(());
+        }
         let now = catalog_cache()
             .version
             .load(std::sync::atomic::Ordering::SeqCst);
@@ -5602,57 +5639,21 @@ impl PgHandler {
         shape: &GroupingShape,
     ) -> Option<Vec<usize>> {
         use secantus_pgplan::{costsize, hashagg};
-        let def = self
-            .all_table_defs()
-            .ok()?
-            .into_iter()
-            .find(|d| d.name == table)?;
-        let width: i64 = def
-            .columns
-            .iter()
-            .map(|c| {
-                let typlen = secantus_pgplan::pgtypes::oid_of_name(&c.pg_type)
-                    .and_then(|oid| pg_type_facts::builtin(oid, "typlen"))
-                    .and_then(|v| match v {
-                        Bson::Int32(n) => Some(i64::from(n)),
-                        Bson::Int64(n) => Some(n),
-                        _ => None,
-                    })
-                    .unwrap_or(-1);
-                hashagg::type_avg_width(&c.pg_type, c.typmod, typlen)
-            })
-            .sum();
-        // The columns that are unique on their own: a one-column primary
-        // key, UNIQUE constraint or unique index.
-        let mut unique: Vec<String> = Vec::new();
+        // The table's size is its whole, which a WHERE does not change.
+        let table_count = if filter.is_empty() {
+            rows
+        } else {
+            self.storage
+                .count_matching(self.db(), table, &Document::new(), None)
+                .ok()?
+        };
+        let PlannerTable {
+            def,
+            unique,
+            pages,
+            tuples,
+        } = self.planner_table(table, table_count)?;
         let pk: Vec<&secantus_pgcatalog::Column> = def.columns.iter().filter(|c| c.pk).collect();
-        if pk.len() == 1 {
-            unique.push(pk[0].field());
-        }
-        for u in &def.unique_constraints {
-            if let [only] = u.columns.as_slice() {
-                if let Some(c) = def.column(only) {
-                    unique.push(c.field());
-                }
-            }
-        }
-        for ix in self
-            .storage
-            .list_indexes(self.db(), table)
-            .unwrap_or_default()
-        {
-            let is_unique = ix
-                .get_document("options")
-                .ok()
-                .and_then(|o| o.get_bool("unique").ok())
-                .or_else(|| ix.get_bool("unique").ok())
-                .unwrap_or(false);
-            if let (true, Ok(key)) = (is_unique, ix.get_document("key")) {
-                if key.len() == 1 {
-                    unique.extend(key.keys().cloned());
-                }
-            }
-        }
         // `remove_useless_groupby_columns`: a GROUP BY holding the whole
         // primary key groups by that key alone.
         let pk_fields: Vec<String> = pk.iter().map(|c| c.field()).collect();
@@ -5681,34 +5682,6 @@ impl PgHandler {
                 }
             })
             .collect();
-        // The table's size is its whole, which a WHERE does not change.
-        let table_count = if filter.is_empty() {
-            rows
-        } else {
-            self.storage
-                .count_matching(self.db(), table, &Document::new(), None)
-                .ok()?
-        };
-        // A table VACUUM or ANALYZE measured has statistics (histograms,
-        // distinct counts, the visibility map) this model does not keep.
-        let relstats = self.relstats(table);
-        if relstats
-            .as_ref()
-            .is_some_and(|d| d.get_bool("statistics").unwrap_or(false))
-        {
-            return None;
-        }
-        let measured = relstats.as_ref().and_then(|d| {
-            let pages = d.get_i64("relpages").ok()?;
-            let tuples = d.get_i64("reltuples").ok()?;
-            Some((pages as f64, tuples as f64))
-        });
-        let (pages, tuples) = hashagg::table_size(
-            width,
-            table_count as u64,
-            self.heap_pages(table, &def),
-            measured,
-        );
         let read = if filter.is_empty() {
             tuples
         } else {
@@ -5868,6 +5841,141 @@ impl PgHandler {
             .map(|k| hashed.iter().map(|&i| k[i].clone()).collect())
             .collect();
         hashagg::hash_agg_order(&kept_keys, &types, groups)
+    }
+
+    /// What the planner knows of `table`, which holds `table_count` rows
+    /// (`estimate_rel_size` and the unique columns
+    /// `get_variable_numdistinct` reads); `None` when it is not a user table
+    /// or VACUUM / ANALYZE gave it statistics this model does not keep.
+    fn planner_table(&self, table: &str, table_count: usize) -> Option<PlannerTable> {
+        use secantus_pgplan::hashagg;
+        let def = self
+            .all_table_defs()
+            .ok()?
+            .into_iter()
+            .find(|d| d.name == table)?;
+        let width: i64 = def
+            .columns
+            .iter()
+            .map(|c| {
+                let typlen = secantus_pgplan::pgtypes::oid_of_name(&c.pg_type)
+                    .and_then(|oid| pg_type_facts::builtin(oid, "typlen"))
+                    .and_then(|v| match v {
+                        Bson::Int32(n) => Some(i64::from(n)),
+                        Bson::Int64(n) => Some(n),
+                        _ => None,
+                    })
+                    .unwrap_or(-1);
+                hashagg::type_avg_width(&c.pg_type, c.typmod, typlen)
+            })
+            .sum();
+        // The columns that are unique on their own: a one-column primary
+        // key, UNIQUE constraint or unique index.
+        let mut unique: Vec<String> = Vec::new();
+        let pk: Vec<&secantus_pgcatalog::Column> = def.columns.iter().filter(|c| c.pk).collect();
+        if pk.len() == 1 {
+            unique.push(pk[0].field());
+        }
+        for u in &def.unique_constraints {
+            if let [only] = u.columns.as_slice() {
+                if let Some(c) = def.column(only) {
+                    unique.push(c.field());
+                }
+            }
+        }
+        for ix in self
+            .storage
+            .list_indexes(self.db(), table)
+            .unwrap_or_default()
+        {
+            let is_unique = ix
+                .get_document("options")
+                .ok()
+                .and_then(|o| o.get_bool("unique").ok())
+                .or_else(|| ix.get_bool("unique").ok())
+                .unwrap_or(false);
+            if let (true, Ok(key)) = (is_unique, ix.get_document("key")) {
+                if key.len() == 1 {
+                    unique.extend(key.keys().cloned());
+                }
+            }
+        }
+        // A table VACUUM or ANALYZE measured has statistics (histograms,
+        // distinct counts, the visibility map) this model does not keep.
+        let relstats = self.relstats(table);
+        if relstats
+            .as_ref()
+            .is_some_and(|d| d.get_bool("statistics").unwrap_or(false))
+        {
+            return None;
+        }
+        let measured = relstats.as_ref().and_then(|d| {
+            let pages = d.get_i64("relpages").ok()?;
+            let tuples = d.get_i64("reltuples").ok()?;
+            Some((pages as f64, tuples as f64))
+        });
+        let (pages, tuples) = hashagg::table_size(
+            width,
+            table_count as u64,
+            self.heap_pages(table, &def),
+            measured,
+        );
+        Some(PlannerTable {
+            def,
+            unique,
+            pages,
+            tuples,
+        })
+    }
+
+    /// Whether a cursor over the join `js` can scan backward: not when
+    /// PostgreSQL's cheapest plan is a merge join already in the ORDER BY's
+    /// order, which is then the plan's top; yes when a Sort goes over the
+    /// join (`joincost::ordered_join_on_top`). `None` when a side is not a
+    /// table the model prices.
+    fn join_cursor_scrolls(&self, js: &secantus_pgplan::cursor_scroll::JoinScroll) -> Option<bool> {
+        use secantus_pgplan::{costsize, joincost};
+        let side = |table: &str, key: &str| -> Option<joincost::JoinSide> {
+            let count = self
+                .storage
+                .count_matching(self.db(), table, &Document::new(), None)
+                .ok()?;
+            let pt = self.planner_table(table, count)?;
+            let field = pt.def.field_of(key)?;
+            let unique = pt.unique.contains(&field);
+            let (ndistinct, default_ndistinct) =
+                joincost::JoinSide::ndistinct_for(unique, pt.tuples);
+            let rel = costsize::Rel {
+                pages: pt.pages,
+                tuples: pt.tuples,
+            };
+            let scan = costsize::cheapest_scan(&rel, &[], &[], &|_| ndistinct, pt.tuples);
+            let ordered = self
+                .cost_indexes(table, &pt.def, count as u64)
+                .iter()
+                .filter(|ix| ix.field == field)
+                .map(|ix| costsize::ordered_index_scan(&rel, ix, &[], ndistinct))
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            Some(joincost::JoinSide {
+                rows: pt.tuples,
+                tuples: pt.tuples,
+                scan: (0.0, scan),
+                ordered,
+                unique,
+                ndistinct,
+                default_ndistinct,
+            })
+        };
+        let left = side(&js.left_table, &js.left_key)?;
+        let right = side(&js.right_table, &js.right_key)?;
+        Some(!joincost::ordered_join_on_top(
+            &left,
+            &right,
+            js.left_join,
+            js.order_on_left,
+            // `cursor_tuple_fraction`'s default.
+            0.1,
+        ))
     }
 
     /// The pages PostgreSQL's heap would hold `table`'s rows in, freshly
@@ -23570,10 +23678,21 @@ impl PgHandler {
             query,
             statement,
             scrollable,
+            join_scroll,
             holdable,
             binary: is_binary_cursor,
         } = stmt
         {
+            // Over a join, the join method PostgreSQL picks decides it --
+            // read in the open transaction, which may have made its tables.
+            let scrollable = join_scroll
+                .as_ref()
+                .and_then(|js| {
+                    self.in_open_transaction(|| Ok(self.join_cursor_scrolls(js)))
+                        .ok()
+                        .flatten()
+                })
+                .unwrap_or(scrollable);
             // The BLOCK, not the handle: an extended-protocol statement group
             // holds a handle too, and PostgreSQL refuses a cursor there. A
             // WITH HOLD cursor outlives its transaction, so PostgreSQL takes
@@ -23706,6 +23825,7 @@ impl PgHandler {
                 .insert(
                     name,
                     CursorState {
+                        born: next_cursor_born(),
                         schema,
                         rows,
                         pos: 0,
@@ -25923,6 +26043,7 @@ impl PgHandler {
                         write_pos,
                         shared_pos,
                         lock_pos,
+                        cursor_mark: next_cursor_born(),
                     });
                 Ok(vec![Response::Execution(Tag::new("SAVEPOINT"))])
             }
@@ -25957,6 +26078,7 @@ impl PgHandler {
                     write_pos,
                     shared_pos,
                     lock_pos,
+                    cursor_mark,
                 ) = {
                     let mut savepoints = self.savepoints.lock().unwrap_or_else(|e| e.into_inner());
                     let idx = index(&savepoints).ok_or_else(missing)?;
@@ -25965,6 +26087,7 @@ impl PgHandler {
                     let shared_pos = savepoints[idx].shared_pos;
                     let saved_settings = savepoints[idx].settings.clone();
                     let saved_gucs = savepoints[idx].txn_gucs.clone();
+                    let cursor_mark = savepoints[idx].cursor_mark;
                     let uncommitted = savepoints[idx].uncommitted.clone();
                     let uncommitted_types = savepoints[idx].uncommitted_types.clone();
                     let dropped: Vec<Savepoint> = savepoints.split_off(idx + 1);
@@ -25987,6 +26110,7 @@ impl PgHandler {
                         write_pos,
                         shared_pos,
                         lock_pos,
+                        cursor_mark,
                     )
                 };
                 if let Some(pos) = shared_pos {
@@ -26009,6 +26133,11 @@ impl PgHandler {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = uncommitted_types;
                 self.restore_savepoint_settings(saved_settings, saved_gucs);
+                // The cursors declared since the savepoint go with it.
+                self.cursors
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|_, c| c.born < cursor_mark);
                 // Rolling back to a savepoint UN-POISONS the block: PostgreSQL
                 // lets the session carry on from there, which is the whole
                 // point of the nested-block pattern that uses it.

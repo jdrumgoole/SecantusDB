@@ -1029,6 +1029,7 @@ impl PgHandler {
             start.sorted = None;
         }
         Ok(Some(CursorState {
+            born: next_cursor_born(),
             schema: Arc::new(self.row_schema(&def, &sel.columns, &sel.casts)),
             rows: Vec::new(),
             pos: 0,
