@@ -22,6 +22,7 @@ mod expr_where;
 mod filter_sublink;
 pub mod hashagg;
 mod hashfn;
+pub mod joincost;
 mod like_match;
 mod multi_assign;
 mod record_fields;
@@ -921,6 +922,10 @@ pub enum Statement {
         /// `NO SCROLL` reports `is_scrollable = false`; anything else is
         /// scrollable here, since every cursor is materialised.
         scrollable: bool,
+        /// A default-scroll cursor over a two-table join whose scrolling
+        /// the join method decides, for the server to price
+        /// (`cursor_scroll::JoinScroll`).
+        join_scroll: Option<cursor_scroll::JoinScroll>,
         holdable: bool,
         binary: bool,
     },
@@ -4254,6 +4259,14 @@ fn declare_cursor(d: &pg_query::protobuf::DeclareCursorStmt, inner: Statement) -
                 Some(N::SelectStmt(sel)) => cursor_scroll::scrolls_by_default(sel),
                 _ => true,
             }
+        },
+        join_scroll: match inner_node {
+            Some(N::SelectStmt(sel))
+                if d.options & (CURSOR_OPT_SCROLL | CURSOR_OPT_NO_SCROLL) == 0 =>
+            {
+                cursor_scroll::join_scroll_shape(sel)
+            }
+            _ => None,
         },
         holdable: (d.options & CURSOR_OPT_HOLD) != 0,
         binary: (d.options & CURSOR_OPT_BINARY) != 0,

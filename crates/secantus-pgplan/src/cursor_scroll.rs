@@ -204,3 +204,132 @@ impl TargetShape {
         shape
     }
 }
+
+/// A join of two tables on one equality under an ORDER BY of a join key,
+/// whose scrolling the plan's join method decides (RP-028): a merge join in
+/// key order is the plan's top and cannot scan backward, a Sort over a hash
+/// join can. The server prices the two (`joincost::ordered_join_on_top`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinScroll {
+    pub left_table: String,
+    pub right_table: String,
+    /// The join keys' column names, on each side.
+    pub left_key: String,
+    pub right_key: String,
+    pub left_join: bool,
+    /// The ORDER BY names the left side's key (else the right's).
+    pub order_on_left: bool,
+}
+
+/// `sel`'s `JoinScroll` shape: `FROM a [LEFT] JOIN b ON a.x = b.y ORDER BY
+/// <a key>`, nothing else -- no WHERE, grouping, DISTINCT, LIMIT or
+/// computed targets, an ascending sort.
+pub fn join_scroll_shape(sel: &SelectStmt) -> Option<JoinScroll> {
+    if sel.with_clause.is_some()
+        || sel.op != protobuf::SetOperation::SetopNone as i32
+        || !sel.values_lists.is_empty()
+        || !sel.distinct_clause.is_empty()
+        || !sel.group_clause.is_empty()
+        || sel.having_clause.is_some()
+        || sel.where_clause.is_some()
+        || sel.limit_count.is_some()
+        || sel.limit_offset.is_some()
+        || !sel.locking_clause.is_empty()
+        || !sel.window_clause.is_empty()
+    {
+        return None;
+    }
+    let targets = TargetShape::of(sel);
+    if targets.aggregate || targets.window || targets.set_returning {
+        return None;
+    }
+    let [from] = sel.from_clause.as_slice() else {
+        return None;
+    };
+    let Some(N::JoinExpr(j)) = from.node.as_ref() else {
+        return None;
+    };
+    let left_join = match protobuf::JoinType::try_from(j.jointype) {
+        Ok(protobuf::JoinType::JoinInner) => false,
+        Ok(protobuf::JoinType::JoinLeft) => true,
+        _ => return None,
+    };
+    if j.is_natural || !j.using_clause.is_empty() {
+        return None;
+    }
+    let side = |n: &Option<Box<protobuf::Node>>| -> Option<(String, String)> {
+        match n.as_ref()?.node.as_ref()? {
+            N::RangeVar(r) => {
+                let alias = r
+                    .alias
+                    .as_ref()
+                    .map_or_else(|| r.relname.clone(), |a| a.aliasname.clone());
+                Some((r.relname.clone(), alias))
+            }
+            _ => None,
+        }
+    };
+    let (left_table, left_alias) = side(&j.larg)?;
+    let (right_table, right_alias) = side(&j.rarg)?;
+    let column = |n: &protobuf::Node| -> Option<Vec<String>> {
+        let N::ColumnRef(c) = n.node.as_ref()? else {
+            return None;
+        };
+        c.fields
+            .iter()
+            .map(|f| match f.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let Some(N::AExpr(e)) = j.quals.as_ref()?.node.as_ref() else {
+        return None;
+    };
+    let is_eq = e.kind == protobuf::AExprKind::AexprOp as i32
+        && matches!(e.name.as_slice(), [n] if matches!(n.node.as_ref(), Some(N::String(s)) if s.sval == "="));
+    if !is_eq {
+        return None;
+    }
+    let l = column(e.lexpr.as_deref()?)?;
+    let r = column(e.rexpr.as_deref()?)?;
+    // Each key qualified by its side's name.
+    let key_of = |c: &[String], alias: &str| match c {
+        [a, col] if a == alias => Some(col.clone()),
+        _ => None,
+    };
+    let (left_key, right_key) = match (key_of(&l, &left_alias), key_of(&r, &right_alias)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => (key_of(&r, &left_alias)?, key_of(&l, &right_alias)?),
+    };
+    let [sort] = sel.sort_clause.as_slice() else {
+        return None;
+    };
+    let Some(N::SortBy(sort)) = sort.node.as_ref() else {
+        return None;
+    };
+    let asc = matches!(
+        protobuf::SortByDir::try_from(sort.sortby_dir),
+        Ok(protobuf::SortByDir::SortbyDefault | protobuf::SortByDir::SortbyAsc)
+    ) && matches!(
+        protobuf::SortByNulls::try_from(sort.sortby_nulls),
+        Ok(protobuf::SortByNulls::SortbyNullsDefault)
+    );
+    if !asc {
+        return None;
+    }
+    let order = column(sort.node.as_deref()?)?;
+    let order_on_left = match order.as_slice() {
+        [a, col] if *a == left_alias && *col == left_key => true,
+        [a, col] if *a == right_alias && *col == right_key => false,
+        _ => return None,
+    };
+    Some(JoinScroll {
+        left_table,
+        right_table,
+        left_key,
+        right_key,
+        left_join,
+        order_on_left,
+    })
+}

@@ -64,6 +64,7 @@ impl PgHandler {
         cursors.insert(
             name.clone(),
             CursorState {
+                born: next_cursor_born(),
                 schema,
                 rows: text_rows,
                 pos: 0,

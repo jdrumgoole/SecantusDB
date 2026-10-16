@@ -1141,11 +1141,12 @@ def test_enum_outside_public_is_a_column_type(pg: Any) -> None:
     assert (attnames, described, udt) == ([("id",), ("m",)], enum_oid, [("rp042_q", "e")])
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_join_cursor_ordered_by_its_key_cannot_scroll(pg: Any) -> None:
     """PostgreSQL 15.19: a cursor declared without SCROLL over
     `select * from t join u on t.a = u.a order by t.a` (a merge join in key
-    order) refuses FETCH BACKWARD with 55000; here it scrolls."""
+    order, the cheapest plan for a cursor's tenth of the rows) refuses
+    FETCH BACKWARD with 55000."""
     pg.execute("begin")
     try:
         pg.execute("create table rp043_t (a int primary key)")
@@ -1193,3 +1194,91 @@ def test_each_empty_tsquery_raises_its_own_notice(pg: Any) -> None:
     pg.add_notice_handler(lambda d: got.append(d.message_primary))
     pg.execute("select ''::tsquery, ''::tsquery").fetchall()
     assert got == ['text-search query doesn\'t contain lexemes: ""'] * 2
+
+
+@pytest.mark.backlog_fixed("RP-045")
+def test_rollback_to_savepoint_closes_its_cursors(pg: Any) -> None:
+    """PostgreSQL 15.19: a cursor declared after a savepoint is closed by
+    ROLLBACK TO it, so a FETCH from it is 34000; here it still reads."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp045 (a int)")
+        pg.execute("insert into rp045 values (1)")
+        pg.execute("savepoint s")
+        pg.execute("declare k cursor for select a from rp045")
+        pg.execute("rollback to s")
+        answer = pg_answer(pg, "fetch 1 from k")
+    finally:
+        pg.execute("rollback")
+    assert answer[:2] == ("err", "34000")
+
+
+@pytest.mark.backlog_fixed("RP-046")
+def test_prepared_fetch_follows_the_cursors_columns(pg: Any) -> None:
+    """PostgreSQL 15.19: one prepared FETCH over a cursor re-declared with
+    two columns, each after a savepoint, returns the new cursor's rows;
+    here it is 0A000 `cached plan must not change result type`."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp046 (a int, b int)")
+        pg.execute("insert into rp046 values (1, 2)")
+        pg.execute("savepoint s1")
+        pg.execute("declare k cursor for select a from rp046")
+        pg.execute("fetch 1 from k", prepare=True)
+        pg.execute("close k")
+        pg.execute("savepoint s2")
+        pg.execute("declare k cursor for select a, b from rp046")
+        try:
+            answer: tuple = ("ok", pg.execute("fetch 1 from k", prepare=True).fetchall())
+        except psycopg.Error as e:
+            answer = ("err", e.sqlstate)
+    finally:
+        pg.execute("rollback")
+    assert answer == ("ok", [(1, 2)])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_many_to_many_merge_join_leaves_ties_as_its_sorts_do(pg: Any) -> None:
+    """PostgreSQL 15.19: `on l.b = r.c` over two fresh keyed tables is a
+    Merge Join over two Sorts, so equal keys come out as PostgreSQL's
+    quicksort leaves each side (7 then 14 on the left, 5 20 15 10 on the
+    right)."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp028_jl (a int primary key, b int)")
+        pg.execute("insert into rp028_jl select i, i % 7 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jr (a int primary key, c int)")
+        pg.execute("insert into rp028_jr select i, i % 5 from generate_series(1, 20) i")
+        got = pg_answer(
+            pg,
+            "select rp028_jl.a, rp028_jr.a from rp028_jl join rp028_jr on rp028_jl.b = rp028_jr.c",
+        )
+    finally:
+        pg.execute("rollback")
+    want = "7:5 7:20 7:15 7:10 14:5 14:20 14:15 14:10 15:11 15:6 15:1 15:16"
+    assert got[0] == "ok"
+    assert " ".join(f"{a}:{b}" for a, b in got[1][:12]) == want
+
+
+@pytest.mark.backlog("RP-028")
+def test_merge_join_under_a_where_sorts_the_rows_it_keeps(pg: Any) -> None:
+    """PostgreSQL 15.19: with `where l.a < 10` the merge join sorts only the
+    left rows the WHERE keeps (a bitmap heap scan's), so their ties come out
+    7 8 1 9 2 3 4; here the WHERE is applied over the joined rows, after a
+    sort of the whole left side."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp028_jl (a int primary key, b int)")
+        pg.execute("insert into rp028_jl select i, i % 7 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jr (a int primary key, c int)")
+        pg.execute("insert into rp028_jr select i, i % 5 from generate_series(1, 20) i")
+        got = pg_answer(
+            pg,
+            "select rp028_jl.a, rp028_jr.a from rp028_jl join rp028_jr"
+            " on rp028_jl.b = rp028_jr.c where rp028_jl.a < 10",
+        )
+    finally:
+        pg.execute("rollback")
+    want = "7:5 7:20 7:15 7:10 8:11 8:6 8:1 8:16 1:11 1:6 1:1 1:16"
+    assert got[0] == "ok"
+    assert " ".join(f"{a}:{b}" for a, b in got[1][:12]) == want
