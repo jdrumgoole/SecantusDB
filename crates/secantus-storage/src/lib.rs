@@ -16455,12 +16455,12 @@ impl Storage {
                 continue;
             }
             if let Some(v) = validator {
-                let new_ok = query_matches(&new, v, &Document::new(), None).unwrap_or(true);
+                let new_ok = validator_holds(session, db, coll, &new, v)?;
                 // `moderate` exempts a doc that ALREADY failed the validator
                 // before this update; one that currently satisfies it is still
                 // held to it, so an update cannot break a valid doc.
-                let was_already_invalid = validator_moderate
-                    && !query_matches(&doc, v, &Document::new(), None).unwrap_or(true);
+                let was_already_invalid =
+                    validator_moderate && !validator_holds(session, db, coll, &doc, v)?;
                 if !new_ok && !was_already_invalid {
                     stopped = Some(StorageError::DocumentValidationFailure(Box::new(new)));
                     break;
@@ -16620,11 +16620,10 @@ impl Storage {
                         // validator the query engine can't evaluate is treated as
                         // passing (lenient), matching the insert path.
                         if let Some(v) = validator {
-                            let new_ok =
-                                query_matches(&new, v, &Document::new(), None).unwrap_or(true);
+                            let new_ok = validator_holds(&session, db, coll, &new, v)?;
                             // `moderate`: see the sibling update site above.
                             let was_already_invalid = validator_moderate
-                                && !query_matches(&doc, v, &Document::new(), None).unwrap_or(true);
+                                && !validator_holds(&session, db, coll, &doc, v)?;
                             if !new_ok && !was_already_invalid {
                                 return Err(StorageError::DocumentValidationFailure(Box::new(new)));
                             }
@@ -16827,7 +16826,7 @@ impl Storage {
                     }
                     // Validator on an upsert-inserted document, too.
                     if let Some(v) = validator {
-                        if !query_matches(&new, v, &Document::new(), None).unwrap_or(true) {
+                        if !validator_holds(&session, db, coll, &new, v)? {
                             return Err(StorageError::DocumentValidationFailure(Box::new(new)));
                         }
                     }
@@ -19422,6 +19421,23 @@ fn ensure_collection(
 /// The collection's default collation, when it has one that is not `simple`.
 /// Read on every write, so the options are only decoded when the stored bytes
 /// name a collation at all.
+/// Whether `doc` satisfies the collection `validator`, compared under the
+/// COLLECTION's default collation whatever collation the statement names
+/// (RM-096, measured 8.2.11: under `en` strength 2, `{k: "A"}` accepts
+/// `k: "a"` for an update that names `simple`). A validator the query engine
+/// cannot evaluate passes, as on the insert path.
+fn validator_holds(
+    session: &Session,
+    db: &str,
+    coll: &str,
+    doc: &Document,
+    validator: &Document,
+) -> Result<bool> {
+    let own = default_collation(session, db, coll)?.map(|(c, _)| c);
+    let _active = secantus_core::collation::activate(own.as_ref());
+    Ok(query_matches(doc, validator, &Document::new(), None).unwrap_or(true))
+}
+
 fn default_collation(session: &Session, db: &str, coll: &str) -> Result<Option<(Collation, bool)>> {
     let Some(blob) = coll_options_raw(session, db, coll)? else {
         return Ok(None);

@@ -838,16 +838,6 @@ What the probe does not reach, each found beside it:
       clipping (they agreed with mongod on everything probed).
       Backlog-ID: RM-148
       Verify: tests/backlog/test_rm_geo_residuals.py::test_line_ending_exactly_on_another_line
-- [ ] **`coarsestIndexedLevel` / `finestIndexedLevel` are refused** (197)
-      on a `2dsphere` index; mongod accepts and lists them after
-      `2dsphereIndexVersion`.
-      Backlog-ID: RM-149
-      Verify: tests/backlog/test_rm_geo_residuals.py::test_2dsphere_cell_levels_accepted_and_listed
-- [ ] **A refused index spec leaves the collection the request created.**
-      `createIndexes` on a new collection with a spec missing `name` answers
-      mongod's 9, but the collection stays; mongod leaves none.
-      Backlog-ID: RM-150
-      Verify: tests/backlog/test_rm_geo_residuals.py::test_refused_spec_leaves_no_created_collection
 
 ### 7.080 The order `find` returns documents in -- 2026-10-13
 
@@ -1416,23 +1406,13 @@ What is left, there and beside it:
       data. Either way a build-time data pipeline: a decision for Joe.
       **Decided 2026-10-16 (Joe):** as RM-091: with ICU 57.1 linked, all
       five types come from its data.
+      The same ICU 57 work also settles a duplicate-key error over a
+      collated key: its key bytes are ICU4X's (`2b0105`) where mongod's are
+      ICU 57's (`290105`), and for a string inside a document this server
+      quotes the string where mongod quotes the key (this was RM-096's last
+      residual).
       Backlog-ID: RM-095
       Verify: tests/backlog/test_rm_085_112.py::test_five_collation_types_are_accepted
-- [ ] **RUST MongoDB server: smaller collation differences.** A validator
-      on an `update` reads the statement's collation, not the collection's:
-      under a collection collation of `en` strength 2, `{k: "A"}` accepts
-      `k: "a"` on mongod 8.2.11 whatever collation the statement names, and
-      this server refuses it (121) for `simple` or `fr`. A duplicate-key
-      error quoting a collated key is RM-095's, which shares its cause: the
-      key bytes are ICU4X's (`2b0105`) where mongod's are ICU 57's
-      (`290105`), and for a string inside a document this server quotes the
-      string where mongod quotes the key. (`Did you mean` for three-letter
-      codes, `$lookup` from a view with another collation, and the `$merge`
-      duplicate key now match; `zh@collation=stroke` was measured accepted
-      by both; a collated `hashed` / `text` index is refused because those
-      index types are out of scope.)
-      Backlog-ID: RM-096
-      Verify: tests/backlog/test_rm_085_112.py::test_validator_reads_the_collections_collation
 - [ ] **RUST MongoDB server: a duplicate `_id` spelled exactly the same in a
       collection with a default collation** is reported from the plain `_id`
       index (`index: _id_ dup key: { _id: "a" }`); mongod reports it under

@@ -766,7 +766,7 @@ def test_coll_mod_capped_size_event_names_fields_as_sent(rust_mongo: Any, mongod
     assert got == ref
 
 
-@pytest.mark.backlog("RM-096")
+@pytest.mark.backlog_fixed("RM-096")
 def test_validator_reads_the_collections_collation(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 checks a collation-sensitive validator under the
     COLLECTION's collation, whatever collation the update statement names:

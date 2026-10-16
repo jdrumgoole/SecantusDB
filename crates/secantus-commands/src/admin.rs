@@ -2060,6 +2060,20 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             if let Some(problem) = index_spec_problem(s) {
                 return Ok(problem.into_reply());
             }
+            // A spec with no name, too, before the collection is created
+            // (RM-150, measured 8.2.11: mongod leaves no collection behind).
+            if s.contains_key("key") && s.get("name").and_then(Bson::as_str).is_none() {
+                return Ok(CommandError::new(
+                    9,
+                    "FailedToParse",
+                    format!(
+                        "Error in specification {} :: caused by :: The 'name' field is a \
+                         required property of an index specification",
+                        argtypes::render_stage_value(spec)
+                    ),
+                )
+                .into_reply());
+            }
         }
     }
 
@@ -3025,6 +3039,61 @@ fn index_spec_problem(spec: &Document) -> Option<CommandError> {
         .values()
         .any(|v| matches!(v, Bson::String(p) if p == "2dsphere"))
     {
+        // Its covering's levels (RM-149, measured 8.2.11, 2026-10-16): a
+        // number exactly representable as an integer, coarsest at least 0,
+        // finest at most 30 and not below coarsest. The defaults are the
+        // levels of a 2,000 km and a 110 m cell edge (2 and 16), which is why
+        // `{finestIndexedLevel: 1}` alone is refused.
+        let level = |field: &str, default: i64| -> Result<i64, CommandError> {
+            match spec.get(field) {
+                None => Ok(default),
+                Some(Bson::Int32(n)) => Ok(i64::from(*n)),
+                Some(Bson::Int64(n)) => Ok(*n),
+                Some(Bson::Double(d)) if d.is_finite() && d.fract() == 0.0 => Ok(*d as i64),
+                Some(v @ (Bson::Double(_) | Bson::Decimal128(_))) => Err(CommandError::new(
+                    2,
+                    "BadValue",
+                    format!(
+                        "Expected field \"{field}\" to have a value exactly representable as a \
+                         64-bit integer, but found {field}: {}",
+                        argtypes::render_stage_value(v)
+                    ),
+                )),
+                Some(other) => Err(in_spec(
+                    14,
+                    "TypeMismatch",
+                    &text,
+                    &format!(
+                        "The field '{field}' must be a number, but got {}",
+                        secantus_core::query::bson_type_name(other)
+                    ),
+                )),
+            }
+        };
+        let radius = secantus_core::geoshape::EARTH_RADIUS_METERS;
+        let edge = |metres: f64| {
+            i64::from(secantus_core::s2legacy::AVG_EDGE.closest_level(metres / radius))
+        };
+        let coarsest = match level("coarsestIndexedLevel", edge(2_000_000.0)) {
+            Ok(v) => v,
+            Err(e) => return Some(e),
+        };
+        let finest = match level("finestIndexedLevel", edge(110.0)) {
+            Ok(v) => v,
+            Err(e) => return Some(e),
+        };
+        let refused = if coarsest < 0 {
+            Some((16747, "coarsestIndexedLevel must be >= 0"))
+        } else if finest > 30 {
+            Some((16748, "finestIndexedLevel must be <= 30"))
+        } else if finest < coarsest {
+            Some((16749, "finestIndexedLevel must be >= coarsestIndexedLevel"))
+        } else {
+            None
+        };
+        if let Some((code, why)) = refused {
+            return Some(CommandError::new(code, format!("Location{code}"), why));
+        }
         if let Some(version) = spec.get("2dsphereIndexVersion") {
             // Read as a 64-bit integer, a fraction truncated (8.2.11,
             // 2026-10-15: 3.5 passes here, 4.5 is unsupported); a double
@@ -4530,6 +4599,8 @@ pub fn profile(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 const INDEX_SPEC_KNOWN_OPTIONS: &[&str] = &[
     // Geometric / vector indexes.
     "2dsphereIndexVersion",
+    "coarsestIndexedLevel",
+    "finestIndexedLevel",
     "bits",
     "min",
     "max",
