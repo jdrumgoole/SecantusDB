@@ -925,13 +925,6 @@ Still different, all 77:
       (`sortkey::is_format1_number_key`), so a sweep on open would close it.
       Backlog-ID: RM-153
       Verify: none -- needs an older build to write the store
-- [ ] **The multikey paths are not stored.** They are read from the
-      collection the first time a query needs them after the server starts
-      or an index is dropped, and kept current by writes after that
-      (`Storage::index_multikey_paths`). mongod's are in its catalog and
-      never shrink; after a restart these are what the documents hold.
-      Backlog-ID: RM-055
-      Verify: tests/backlog/test_rm_029_056.py::test_multikey_paths_survive_a_restart
 - [ ] **The cost of the plan trial.** Release builds against 43463aa6
       (2026-10-15): a query two indexes could serve costs about 5 times as
       much on 2,000 documents (`{a: 5, b: 3}` over `a_1` and `b_1`), 2

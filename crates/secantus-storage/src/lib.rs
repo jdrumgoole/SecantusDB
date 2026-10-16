@@ -2475,6 +2475,7 @@ fn build_seq(opts: &Document) -> i64 {
 const BUILD_STAMPS: &[&str] = &[
     "entryFormat",
     "multikey",
+    MULTIKEY_PATHS,
     COLLATION_KEYS,
     GEO_KEYS,
     NUMBER_KEYS,
@@ -2863,6 +2864,30 @@ struct MultikeyPaths {
 
 /// Add to `out` the components of `path` at which `doc` holds an array:
 /// `a.b` over `{a: [{b: [1]}]}` gives `a` and `a.b`.
+/// The multikey paths an index's catalog row records (RM-055): per key
+/// field, the array prefixes any document has held there. mongod keeps them
+/// in its catalog and never shrinks them, so a path outlives the array that
+/// put it there, across a restart too. Under `options.multikeyPaths`, a
+/// document of field -> array of paths; stripped from `listIndexes`.
+const MULTIKEY_PATHS: &str = "multikeyPaths";
+
+fn stored_multikey_paths(opts: &Document, key_spec: &Document) -> Vec<Vec<String>> {
+    let stored = opts.get_document(MULTIKEY_PATHS).ok();
+    key_spec
+        .keys()
+        .map(|field| {
+            stored
+                .and_then(|d| d.get_array(field).ok())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
 fn array_components(doc: &Document, path: &str, out: &mut Vec<String>) {
     fn in_doc(d: &Document, parts: &[&str], at: usize, out: &mut Vec<String>) {
         if at == parts.len() {
@@ -12871,11 +12896,30 @@ impl Storage {
             }
             let mut payload = decode_doc(&cur.get_value_u()?)?;
             let mut opts = payload.get_document("options").cloned().unwrap_or_default();
-            if opts.get_bool("multikey").unwrap_or(false) {
-                continue; // already flagged — nothing to do
+            // The paths this document adds to what the catalog records.
+            let mut paths = stored_multikey_paths(&opts, &desc.key_spec);
+            let mut grew = false;
+            for (field, parts) in desc.key_spec.keys().zip(paths.iter_mut()) {
+                let before = parts.len();
+                array_components(doc, field, parts);
+                if parts.len() != before {
+                    parts.sort();
+                    grew = true;
+                }
+            }
+            if opts.get_bool("multikey").unwrap_or(false) && !grew {
+                continue; // already flagged, no new path — nothing to do
             }
             note_planner_write();
             opts.insert("multikey", Bson::Boolean(true));
+            let mut recorded = Document::new();
+            for (field, parts) in desc.key_spec.keys().zip(&paths) {
+                recorded.insert(
+                    field.clone(),
+                    Bson::Array(parts.iter().cloned().map(Bson::String).collect()),
+                );
+            }
+            opts.insert(MULTIKEY_PATHS, recorded);
             payload.insert("options", Bson::Document(opts));
             let blob = encode_doc(&payload)?;
             let wcur = session.open_cursor(IDX_TABLE, None)?;
@@ -15836,7 +15880,14 @@ impl Storage {
                 }
             }
         }
-        let mut found: Vec<Vec<String>> = vec![Vec::new(); key_spec.len()];
+        // What the catalog records, which never shrinks, then what the
+        // documents hold now (a store written before RM-055 records none).
+        let mut found: Vec<Vec<String>> = self
+            .iter_indexes(session, db, coll)?
+            .into_iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, _, opts)| stored_multikey_paths(&opts, key_spec))
+            .unwrap_or_else(|| vec![Vec::new(); key_spec.len()]);
         for (_recordid, _id_k, blob) in self.scan_docs(session, db, coll)? {
             let d = decode_doc(&blob)?;
             for (field, parts) in key_spec.keys().zip(found.iter_mut()) {
@@ -19452,6 +19503,7 @@ fn index_event_spec(payload: &Document, name: &str) -> Document {
                     | "geoKeys"
                     | "pythonKeys"
                     | "buildSeq"
+                    | "multikeyPaths"
             ) {
                 spec.insert(k.clone(), v.clone());
             }

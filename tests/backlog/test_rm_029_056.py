@@ -849,7 +849,7 @@ def _ixscan(plan: dict) -> dict:
     return plan
 
 
-@pytest.mark.backlog("RM-055")
+@pytest.mark.backlog_fixed("RM-055")
 def test_multikey_paths_survive_a_restart(restarted: Any) -> None:
     """mongod 8.2.11: once `a_1` has held an array it stays multikey, with
     `multiKeyPaths: {a: ["a"]}`, though no document holds an array now."""

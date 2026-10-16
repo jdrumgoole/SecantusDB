@@ -366,7 +366,19 @@ fn catalog(
         } else if !storage.index_is_multikey(db, coll, &name) {
             vec![vec![]; key.len()]
         } else if let Some(docs) = docs {
-            exec::multikey_paths(docs, key)
+            // What these documents hold, and what the catalog records: a
+            // path outlives the array that made it (RM-055).
+            let mut paths = exec::multikey_paths(docs, key);
+            let recorded = storage.index_multikey_paths(db, coll, &name)?;
+            for (have, more) in paths.iter_mut().zip(recorded) {
+                for p in more {
+                    if !have.contains(&p) {
+                        have.push(p);
+                    }
+                }
+                have.sort();
+            }
+            paths
         } else {
             let mut paths = storage.index_multikey_paths(db, coll, &name)?;
             paths.resize(key.len(), vec![]);

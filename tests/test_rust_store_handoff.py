@@ -66,12 +66,13 @@ def _index(db: Any, coll: str, name: str) -> dict[str, Any]:
 
 def _python_listed(db: Any, coll: str, name: str) -> set[str]:
     """The option names the deprecated Python server lists for an index,
-    less `buildSeq`: the Rust server's build-order stamp (RM-081), which the
+    less `buildSeq` and `multikeyPaths`: the Rust server's build-order stamp
+    (RM-081) and recorded multikey paths (RM-055), which the
     Python server does not know to hide. Compatibility with the Python
     server no longer binds (CLAUDE.md, 2026-10-16), so this test asserts
     what holds across the hand-off -- each server's answers -- and leaves
     that one key out rather than teaching the Python server about it."""
-    return set(_index(db, coll, name)) - {"buildSeq"}
+    return set(_index(db, coll, name)) - {"buildSeq", "multikeyPaths"}
 
 
 def test_a_unique_collated_index_holds_across_both_servers(tmp_path: Path) -> None:
