@@ -391,16 +391,22 @@ one beside it.
     startup costs, and under a LIMIT the fractional cost, where a nested
     loop over a materialised inner usually wins), and a WHERE no
     NULL-extended row passes makes a LEFT join inner (159 of 159 shapes
-    at 20, 300 and 3,000 rows). Not yet: an expression or several join keys
-    (a WHERE comparing the two sides is a second key); an equality on a
-    join key, which PostgreSQL's equivalence class turns into a filter on
-    both sides; parameterized nested loops (an index scan inner); a LIMIT
-    over the general join path, or with an ORDER BY; more than two
+    at 20, 300 and 3,000 rows). A join on one expression equality
+    (`on a.x = b.y + 3`, either side or both) is sorted or hashed by each
+    side's value, priced with no statistics for the expression and its
+    operators in the clause's cost; a LIMIT straight over a general join
+    is priced for its rows (57 of 57). Not yet: several join keys (a WHERE
+    comparing the two sides is a second key, and with the first an
+    equivalence class: PostgreSQL filters one side by it); an equality on
+    a join key, which the equivalence class turns into a filter on both
+    sides; an expression key with a function call or a cast that costs;
+    parameterized nested loops (an index scan inner); a LIMIT with an
+    ORDER BY, or with a WHERE over the general path; more than two
     tables; a join of more than 200,000 rows a side, which streams in
     scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_merge_join_on_an_expression_sorts_by_its_value
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_join_with_a_second_equality_between_its_sides
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

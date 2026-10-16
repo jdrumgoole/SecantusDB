@@ -295,6 +295,12 @@ thread_local! {
     /// Set while a locking select reads its FROM-subquery (see
     /// `materialise_with_row_ids`).
     static LOCK_ROW_IDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The rows a LIMIT (and OFFSET) reads from the general join a select
+    /// is over, while `select_docs` materialises it: the top join's plan is
+    /// then the cheapest for that many rows (RP-028). Taken by the first
+    /// `join_rows` call, so a nested join never sees it.
+    static GENERAL_JOIN_LIMIT: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Run `f` with FROM-subquery rows carrying their base row ids.
@@ -5930,11 +5936,13 @@ impl PgHandler {
 
     /// One side of a join on `key` of `table`, as the planner prices it
     /// (`joincost::JoinSide`); `None` when the table is not one the model
-    /// prices.
+    /// prices. A key that is an expression (`JoinKey::Expr`) has no
+    /// statistics, no unique index and no index in its order
+    /// (`examine_variable`).
     fn join_side(
         &self,
         table: &str,
-        key: &str,
+        key: JoinKey<'_>,
         filter: &Document,
     ) -> Option<secantus_pgplan::joincost::JoinSide> {
         use secantus_pgplan::{costsize, hashagg, joincost};
@@ -5943,8 +5951,11 @@ impl PgHandler {
             .count_matching(self.db(), table, &Document::new(), None)
             .ok()?;
         let pt = self.planner_table(table, count)?;
-        let field = pt.def.field_of(key)?;
-        let unique = pt.unique.contains(&field);
+        let (field, key_ops) = match key {
+            JoinKey::Column(key) => (Some(pt.def.field_of(key)?), 0.0),
+            JoinKey::Expr(ops) => (None, f64::from(ops)),
+        };
+        let unique = field.as_ref().is_some_and(|f| pt.unique.contains(f));
         let (ndistinct, default_ndistinct) = joincost::JoinSide::ndistinct_for(unique, pt.tuples);
         let rel = costsize::Rel {
             pages: pt.pages,
@@ -5977,7 +5988,7 @@ impl PgHandler {
         let scan = costsize::cheapest_scan_path(&rel, &indexes, &quals, &column_nd, rows);
         let ordered = indexes
             .iter()
-            .filter(|ix| ix.field == field)
+            .filter(|ix| field.as_ref() == Some(&ix.field))
             .map(|ix| costsize::ordered_index_scan(&rel, ix, &quals, column_nd(&ix.field)))
             .min_by(|a, b| a.1.total_cmp(&b.1));
         Some(joincost::JoinSide {
@@ -5989,6 +6000,7 @@ impl PgHandler {
             unique,
             ndistinct,
             default_ndistinct,
+            key_ops,
         })
     }
 
@@ -5999,7 +6011,8 @@ impl PgHandler {
     /// table the model prices.
     fn join_cursor_scrolls(&self, js: &secantus_pgplan::cursor_scroll::JoinScroll) -> Option<bool> {
         use secantus_pgplan::joincost;
-        let side = |table: &str, key: &str| self.join_side(table, key, &Document::new());
+        let side =
+            |table: &str, key: &str| self.join_side(table, JoinKey::Column(key), &Document::new());
         let left = side(&js.left_table, &js.left_key)?;
         let right = side(&js.right_table, &js.right_key)?;
         Some(!joincost::ordered_join_on_top(
@@ -6562,6 +6575,7 @@ impl PgHandler {
         node: &secantus_pgplan::joins::JoinNode,
     ) -> PgWireResult<Vec<Document>> {
         use secantus_pgplan::joins::JoinNode;
+        let limit = GENERAL_JOIN_LIMIT.with(|c| c.take());
         match node {
             // A LATERAL item only ever sits on a join's right; alone, with
             // nothing to its left, it was planned as an ordinary leaf.
@@ -6620,6 +6634,7 @@ impl PgHandler {
                 on,
                 equi,
                 merged,
+                expr_keys,
                 left_keys,
                 right_keys,
             } => {
@@ -6647,11 +6662,27 @@ impl PgHandler {
                 }
                 let mut rrows = self.join_rows(right)?;
                 let mut lrows = lrows;
+                // A join on one expression equality (`a.x = b.y + 3`) is
+                // keyed by each side's value of its expression, as the
+                // Sort or Hash under PostgreSQL's join is: evaluated into
+                // each row under a reserved name, which `equi` then hashes
+                // on and which the joined rows do not carry.
+                let expr_equi: Vec<(String, String)>;
+                let equi: &[(String, String)] = match (&equi[..], &expr_keys[..]) {
+                    ([], [e])
+                        if expr_key_values(&mut lrows, &e.left)
+                            && expr_key_values(&mut rrows, &e.right) =>
+                    {
+                        expr_equi = vec![(EXPR_JOIN_KEY.to_string(), EXPR_JOIN_KEY.to_string())];
+                        &expr_equi
+                    }
+                    _ => equi,
+                };
                 // A plan with the right side outer runs with the sides
                 // swapped, so the loop below walks the outer side's rows.
                 let swap = merged.is_empty()
                     && self.order_general_join_inputs(
-                        *kind, left, right, equi, &mut lrows, &mut rrows,
+                        *kind, left, right, equi, expr_keys, limit, &mut lrows, &mut rrows,
                     );
                 let swapped_equi: Vec<(String, String)>;
                 let (equi, left_keys, right_keys) = if swap {
@@ -6659,7 +6690,7 @@ impl PgHandler {
                     swapped_equi = equi.iter().map(|(l, r)| (r.clone(), l.clone())).collect();
                     (&swapped_equi[..], right_keys, left_keys)
                 } else {
-                    (&equi[..], left_keys, right_keys)
+                    (equi, left_keys, right_keys)
                 };
                 let mut lrows = Some(lrows);
                 let mut out = Vec::new();
@@ -7265,19 +7296,29 @@ impl PgHandler {
     /// `reorder_join_inputs` for a general join of two plain tables on one
     /// equality (RP-028); whether the plan reads the right side as its
     /// outer (`joincost_outer_is_b`). Only for a join with no merged
-    /// (`USING`) columns: the caller cannot swap the sides of one.
+    /// (`USING`) columns: the caller cannot swap the sides of one. `equi`
+    /// is the key the rows are ordered by: the join's column equality, or
+    /// `EXPR_JOIN_KEY` for its one expression equality.
+    #[allow(clippy::too_many_arguments)]
     fn order_general_join_inputs(
         &self,
         kind: secantus_pgplan::joins::JoinKind,
         left: &secantus_pgplan::joins::JoinNode,
         right: &secantus_pgplan::joins::JoinNode,
         equi: &[(String, String)],
+        expr_keys: &[secantus_pgplan::joins::ExprEquality],
+        limit: Option<usize>,
         lrows: &mut Vec<Document>,
         rrows: &mut Vec<Document>,
     ) -> bool {
-        if let (Some(method), [(lk, rk)]) =
-            (self.general_join_method(kind, left, right, equi), equi)
-        {
+        let (column_equi, expr_keys) = match equi {
+            [(k, _)] if k == EXPR_JOIN_KEY => (&[][..], expr_keys),
+            _ => (equi, &[][..]),
+        };
+        if let (Some(method), [(lk, rk)]) = (
+            self.general_join_method(kind, left, right, column_equi, expr_keys, limit),
+            equi,
+        ) {
             reorder_join_inputs(method, lrows, lk, rrows, rk);
             return joincost_outer_is_b(method);
         }
@@ -7292,13 +7333,26 @@ impl PgHandler {
         left: &secantus_pgplan::joins::JoinNode,
         right: &secantus_pgplan::joins::JoinNode,
         equi: &[(String, String)],
+        expr_keys: &[secantus_pgplan::joins::ExprEquality],
+        limit: Option<usize>,
     ) -> Option<secantus_pgplan::joincost::JoinMethod> {
         use secantus_pgplan::joins::{JoinKind, JoinNode, SEP};
         if !matches!(kind, JoinKind::Inner | JoinKind::Left) {
             return None;
         }
-        let [(lk, rk)] = equi else {
-            return None;
+        // One join key: a column equality, or one over an expression.
+        let column = |k: &str| k.split(SEP).nth(1).map(str::to_string);
+        let side_key = |col: &Option<String>, ops: u32| match col {
+            Some(k) => column(k).map(Ok),
+            None => Some(Err(ops)),
+        };
+        let (lkey, rkey) = match (equi, expr_keys) {
+            ([(lk, rk)], []) => (column(lk).map(Ok)?, column(rk).map(Ok)?),
+            ([], [e]) => (
+                side_key(&e.left_column, e.left_ops)?,
+                side_key(&e.right_column, e.right_ops)?,
+            ),
+            _ => return None,
         };
         let table = |n: &JoinNode| match n {
             JoinNode::Leaf { plan, .. } => match plan.as_ref() {
@@ -7315,18 +7369,21 @@ impl PgHandler {
             },
             _ => None,
         };
-        let column = |k: &str| k.split(SEP).nth(1).map(str::to_string);
-        let (Some((lt, lfilter)), Some((rt, rfilter)), Some(lc), Some(rc)) =
-            (table(left), table(right), column(lk), column(rk))
-        else {
+        let (Some((lt, lfilter)), Some((rt, rfilter))) = (table(left), table(right)) else {
             return None;
         };
         if !self.join_small_enough(&lt) || !self.join_small_enough(&rt) {
             return None;
         }
+        fn key(k: &Result<String, u32>) -> JoinKey<'_> {
+            match k {
+                Ok(c) => JoinKey::Column(c),
+                Err(ops) => JoinKey::Expr(*ops),
+            }
+        }
         let (Some(a), Some(b)) = (
-            self.join_side(&lt, &lc, &lfilter),
-            self.join_side(&rt, &rc, &rfilter),
+            self.join_side(&lt, key(&lkey), &lfilter),
+            self.join_side(&rt, key(&rkey), &rfilter),
         ) else {
             return None;
         };
@@ -7334,7 +7391,7 @@ impl PgHandler {
             &a,
             &b,
             matches!(kind, JoinKind::Left),
-            None,
+            limit.map(|n| n as f64),
         ))
     }
 
@@ -7409,8 +7466,8 @@ impl PgHandler {
             }
         });
         let (Some(a), Some(b)) = (
-            self.join_side(&join.left.0, &lc, &lfilter),
-            self.join_side(&join.right.0, &rc, &rfilter),
+            self.join_side(&join.left.0, JoinKey::Column(&lc), &lfilter),
+            self.join_side(&join.right.0, JoinKey::Column(&rc), &rfilter),
         ) else {
             return None;
         };
@@ -27347,12 +27404,23 @@ impl PgHandler {
                 let sub = sel.sub.as_ref().expect("checked");
                 // A locking select reads its subquery's rows with the stored
                 // row id of each base row along (see `LOCK_ROW_ID`).
+                // A LIMIT straight over a join, nothing between them that
+                // reads more rows than it returns.
+                let join_limit = (matches!(sub.plan.as_ref(), Statement::JoinRows(_))
+                    && sel.order.is_empty()
+                    && sel.filter.is_empty()
+                    && sel.residual.is_none()
+                    && sel.windows.is_empty())
+                .then(|| sort_bound(sel))
+                .flatten();
+                GENERAL_JOIN_LIMIT.with(|c| c.set(join_limit));
                 let docs = if !sel.lock_clauses.is_empty() && self.storage.in_user_txn() {
-                    with_lock_row_ids(|| self.sub_source_docs(sub, &sel.filter))?
+                    with_lock_row_ids(|| self.sub_source_docs(sub, &sel.filter))
                 } else {
-                    self.sub_source_docs(sub, &sel.filter)?
+                    self.sub_source_docs(sub, &sel.filter)
                 };
-                (docs, sub.def.clone())
+                GENERAL_JOIN_LIMIT.with(|c| c.set(None));
+                (docs?, sub.def.clone())
             }
             // A top-level JOIN source: materialise it, treat its
             // output columns as the table.
@@ -42637,6 +42705,14 @@ impl PgHandler {
     }
 }
 
+/// What one side of a join is joined on, for `PgHandler::join_side`: a
+/// column, or an expression evaluating this many operators.
+#[derive(Clone, Copy)]
+enum JoinKey<'a> {
+    Column(&'a str),
+    Expr(u32),
+}
+
 /// Put a join's inputs in the order PostgreSQL's plan `method` reads them
 /// (RP-028), so the nested loop over the outer side emits its rows in that
 /// plan's order: for a merge join, each side in key order (an index scan's
@@ -42693,6 +42769,28 @@ fn reorder_join_inputs(
         JoinMethod::HashOuterB => left.reverse(),
         JoinMethod::NestOuterB | JoinMethod::Other => {}
     }
+}
+
+/// The reserved name a join's rows carry their expression key's value
+/// under (`PgHandler::join_rows`); no joined-row key starts with U+0002.
+const EXPR_JOIN_KEY: &str = "\u{2}join key";
+
+/// Evaluate a join key's expression into each of `rows` under
+/// `EXPR_JOIN_KEY`; `false`, and the rows left without it, when it fails on
+/// one -- the join then compares every pair through its ON, which reports
+/// the error as before.
+fn expr_key_values(rows: &mut [Document], expr: &secantus_pgplan::ColumnExpr) -> bool {
+    let mut values = Vec::with_capacity(rows.len());
+    for row in rows.iter() {
+        match secantus_pgplan::apply_row_expr(expr, row) {
+            Ok(v) => values.push(v),
+            Err(_) => return false,
+        }
+    }
+    for (row, v) in rows.iter_mut().zip(values) {
+        row.insert(EXPR_JOIN_KEY, v);
+    }
+    true
 }
 
 /// Whether the plan `method` reads `b` (the right side) as its outer: the

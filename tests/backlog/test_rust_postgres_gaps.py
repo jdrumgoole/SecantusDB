@@ -1283,12 +1283,11 @@ def test_merge_join_under_a_where_sorts_the_rows_it_keeps(pg: Any) -> None:
     assert " ".join(f"{a}:{b}" for a, b in got[1][:12]) == want
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_merge_join_on_an_expression_sorts_by_its_value(pg: Any) -> None:
     """PostgreSQL 15.19: `on l.b = r.c + 3` is a Merge Join over two Sorts,
     the right one by `c + 3`, so the rows come out in key order, each key's
-    right rows as PostgreSQL's quicksort leaves them (5 20 15 10); here a
-    join on an expression keeps both sides in scan order."""
+    right rows as PostgreSQL's quicksort leaves them (5 20 15 10)."""
     pg.execute("begin")
     try:
         pg.execute("create table rp028_jl (a int primary key, b int)")
@@ -1303,5 +1302,31 @@ def test_merge_join_on_an_expression_sorts_by_its_value(pg: Any) -> None:
     finally:
         pg.execute("rollback")
     want = "3:5 3:20 3:15 3:10 10:5 10:20 10:15 10:10"
+    assert got[0] == "ok"
+    assert " ".join(f"{a}:{b}" for a, b in got[1][:8]) == want
+
+
+@pytest.mark.backlog("RP-028")
+def test_join_with_a_second_equality_between_its_sides(pg: Any) -> None:
+    """PostgreSQL 15.19: `on l.b = r.c where r.c = l.a` puts all three
+    columns in one equivalence class, so `l.a = l.b` becomes a filter on
+    the left side and the join a Hash Join with the left side hashed: the
+    rows come out in the right side's scan order (1:1 2:2 3:3 4:4 1:6 ...);
+    here the second equality is evaluated over the joined rows of a join
+    on the first."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp028_jl (a int primary key, b int)")
+        pg.execute("insert into rp028_jl select i, i % 7 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jr (a int primary key, c int)")
+        pg.execute("insert into rp028_jr select i, i % 5 from generate_series(1, 20) i")
+        got = pg_answer(
+            pg,
+            "select rp028_jl.a, rp028_jr.a from rp028_jl join rp028_jr"
+            " on rp028_jl.b = rp028_jr.c where rp028_jr.c = rp028_jl.a",
+        )
+    finally:
+        pg.execute("rollback")
+    want = "1:1 2:2 3:3 4:4 1:6 2:7 3:8 4:9"
     assert got[0] == "ok"
     assert " ".join(f"{a}:{b}" for a, b in got[1][:8]) == want

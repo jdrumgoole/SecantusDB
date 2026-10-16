@@ -20,3 +20,13 @@ More of the Rust PostgreSQL server's backlog, measured against PostgreSQL
   that no NULL-extended row can pass makes a LEFT join an inner one
   (`reduce_outer_joins`). Part of RP-028
   (tests/backlog/test_rust_postgres_gaps.py::test_merge_join_under_a_where_sorts_the_rows_it_keeps).
+- **A join on an expression returns its rows in PostgreSQL's order.**
+  `ON a.x = b.y + 3` is a merge or hash join keyed by each side's value
+  of its expression, which PostgreSQL sorts or hashes by. The server now
+  evaluates each side's key once per row, matches rows through a hash on
+  it rather than testing every pair, and orders both sides as the plan
+  reads them; the plan is priced as PostgreSQL prices an expression with
+  no statistics, its operators added to the join clause's cost
+  (`cost_qual_eval`). A LIMIT straight over such a join, or any general
+  join, picks the plan cheapest for the rows it reads. Part of RP-028
+  (tests/backlog/test_rust_postgres_gaps.py::test_merge_join_on_an_expression_sorts_by_its_value).

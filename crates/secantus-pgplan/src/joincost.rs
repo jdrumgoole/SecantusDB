@@ -34,6 +34,9 @@ pub struct JoinSide {
     /// whether it is the 200 default.
     pub ndistinct: f64,
     pub default_ndistinct: bool,
+    /// The operators its side of the join clause evaluates: 0 for a column,
+    /// 1 for `c + 3`.
+    pub key_ops: f64,
 }
 
 impl JoinSide {
@@ -55,6 +58,12 @@ fn sort_cost(input_total: f64, rows: f64) -> (f64, f64) {
     let n = rows.max(2.0);
     let startup = input_total + 2.0 * CPU_OPERATOR_COST * n * n.log2();
     (startup, startup + CPU_OPERATOR_COST * rows)
+}
+
+/// The join clause's cost a tuple (`cost_qual_eval`): its `=` and each
+/// side's own operators.
+fn clause_cost(outer: &JoinSide, inner: &JoinSide) -> f64 {
+    CPU_OPERATOR_COST * (1.0 + outer.key_ops + inner.key_ops)
 }
 
 /// `eqjoinsel` with no statistics: `1 / max(nd1, nd2)`. A plain or LEFT
@@ -103,13 +112,18 @@ pub fn hash_join(outer: &JoinSide, inner: &JoinSide) -> (f64, f64) {
         let match_count = (sel * inner.rows / sel).max(1.0);
         let matched = (outer.rows * match_frac).round();
         let scan_frac = 2.0 / (match_count + 1.0);
-        run +=
-            CPU_OPERATOR_COST * matched * clamp_row_est(inner.rows * bucketsize * scan_frac) * 0.5;
-        run +=
-            CPU_OPERATOR_COST * (outer.rows - matched) * clamp_row_est(inner.rows / buckets) * 0.05;
+        run += clause_cost(outer, inner)
+            * matched
+            * clamp_row_est(inner.rows * bucketsize * scan_frac)
+            * 0.5;
+        run += clause_cost(outer, inner)
+            * (outer.rows - matched)
+            * clamp_row_est(inner.rows / buckets)
+            * 0.05;
         matched
     } else {
-        run += CPU_OPERATOR_COST * outer.rows * clamp_row_est(inner.rows * bucketsize) * 0.5;
+        run +=
+            clause_cost(outer, inner) * outer.rows * clamp_row_est(inner.rows * bucketsize) * 0.5;
         clamp_row_est(outer.rows * inner.rows * sel)
     };
     run += CPU_TUPLE_COST * tuples;
@@ -135,7 +149,7 @@ pub fn nest_loop(outer: &JoinSide, inner: &JoinSide, materialized: bool) -> (f64
     if outer.rows > 1.0 {
         run += (outer.rows - 1.0) * rescan;
     }
-    run += (CPU_TUPLE_COST + CPU_OPERATOR_COST) * outer.rows * inner.rows;
+    run += (CPU_TUPLE_COST + clause_cost(outer, inner)) * outer.rows * inner.rows;
     (startup, startup + run)
 }
 
@@ -179,7 +193,7 @@ pub fn merge_join(
         bare
     };
     startup += 0.0;
-    run += CPU_OPERATOR_COST * (outer.rows + inner.rows * ratio);
+    run += clause_cost(outer, inner) * (outer.rows + inner.rows * ratio);
     run += CPU_TUPLE_COST * tuples;
     Some((startup, startup + run))
 }
@@ -486,6 +500,7 @@ mod tests {
             unique: true,
             ndistinct: 2260.0,
             default_ndistinct: false,
+            key_ops: 0.0,
         }
     }
     fn plain() -> JoinSide {
@@ -510,6 +525,14 @@ mod tests {
         let (s, t) = merge_join(&plain(), &plain(), false, false).unwrap();
         assert!(close(s, 317.01) && close(t, 711.38), "{s} {t}");
         assert_eq!(join_rows(&plain(), &plain(), false), 25538.0);
+        // jp join jq on jp.b = jq.c + 3: the clause evaluates `+` too, so
+        // the Merge Join over two Sorts costs 317.01..780.88.
+        let expr = JoinSide {
+            key_ops: 1.0,
+            ..plain()
+        };
+        let (s, t) = merge_join(&plain(), &expr, false, false).unwrap();
+        assert!(close(s, 317.01) && close(t, 780.88), "{s} {t}");
     }
 
     #[test]

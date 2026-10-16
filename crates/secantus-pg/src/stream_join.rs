@@ -780,11 +780,12 @@ impl PgHandler {
             left,
             right,
             equi,
+            expr_keys,
             ..
         } = &join.tree
         {
             if self
-                .general_join_method(*kind, left, right, equi)
+                .general_join_method(*kind, left, right, equi, expr_keys, None)
                 .is_some_and(|m| m != secantus_pgplan::joincost::JoinMethod::Other)
             {
                 return Ok(None);

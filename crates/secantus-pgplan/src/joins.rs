@@ -70,10 +70,30 @@ pub enum JoinNode {
         equi: Vec<(String, String)>,
         /// USING / NATURAL columns: `(merged key, left key, right key)`.
         merged: Vec<(String, String, String)>,
+        /// ON conjuncts equating an expression over one side with one over
+        /// the other (`a.x = b.y + 3`), which are a merge or hash join's
+        /// keys as `equi`'s columns are; `on` still decides each pair.
+        expr_keys: Vec<ExprEquality>,
         /// Every key each side produces, so an outer join can NULL-extend.
         left_keys: Vec<String>,
         right_keys: Vec<String>,
     },
+}
+
+/// One `left expression = right expression` conjunct of an ON
+/// (`JoinNode::Join::expr_keys`), at least one side not a bare column.
+/// Each side's expression reads only that side's keys; `*_ops` is how many
+/// operators it evaluates, which the join clause's cost charges
+/// (`cost_qual_eval`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExprEquality {
+    pub left: ColumnExpr,
+    pub right: ColumnExpr,
+    pub left_ops: u32,
+    pub right_ops: u32,
+    /// The joined-row key a side's operand is, when it is a bare column.
+    pub left_column: Option<String>,
+    pub right_column: Option<String>,
 }
 
 /// A join as a statement the executor materialises: its tree and the def of
@@ -281,6 +301,7 @@ fn build_tree(
                 // candidates a left row is paired with.
                 equi: crate::join_order::pairs_between(&equalities, &joined, i),
                 merged: Vec::new(),
+                expr_keys: Vec::new(),
             },
         });
         joined.push(i);
@@ -1008,6 +1029,7 @@ fn build_join(
         .iter()
         .map(|(_, l, r)| (l.clone(), r.clone()))
         .collect();
+    let mut expr_keys = Vec::new();
     let on = match j.quals.as_deref() {
         None if merged.is_empty() => None,
         None => {
@@ -1041,6 +1063,19 @@ fn build_join(
             };
             rewrite_expr(&mut q, &side_scope, &[])?;
             equi.extend(equalities(&q, &left_keys, &right_keys));
+            expr_keys = expr_equalities(&q, &left_keys, &right_keys)
+                .into_iter()
+                .map(|(l, r)| {
+                    Ok(ExprEquality {
+                        left: on_expr(l, &side_scope, params)?,
+                        right: on_expr(r, &side_scope, params)?,
+                        left_ops: expr_ops(l),
+                        right_ops: expr_ops(r),
+                        left_column: bare_key(l),
+                        right_column: bare_key(r),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
             Some(on_expr(&q, &side_scope, params)?)
         }
     };
@@ -1052,6 +1087,7 @@ fn build_join(
             on,
             equi,
             merged,
+            expr_keys,
             left_keys,
             right_keys,
         },
@@ -1099,6 +1135,93 @@ fn equalities(
             }
         }
         _ => Vec::new(),
+    }
+}
+
+/// `left expr = right expr` conjuncts of an ON that `equalities` does not
+/// take (one side or both an expression), each operand reading only one
+/// side's keys, as `(left operand, right operand)`. Only operators, casts,
+/// constants and columns: anything that could be volatile is left to `on`.
+fn expr_equalities<'a>(
+    node: &'a pg_query::protobuf::Node,
+    left: &[String],
+    right: &[String],
+) -> Vec<(&'a pg_query::protobuf::Node, &'a pg_query::protobuf::Node)> {
+    use pg_query::protobuf::BoolExprType;
+    fn refs(n: &pg_query::protobuf::Node, out: &mut Vec<String>) -> bool {
+        match n.node.as_ref() {
+            Some(N::ColumnRef(c)) if c.fields.len() == 1 => match column_ref_name(c) {
+                Some(k) => {
+                    out.push(k);
+                    true
+                }
+                None => false,
+            },
+            Some(N::AConst(_)) | Some(N::ParamRef(_)) => true,
+            Some(N::TypeCast(t)) => t.arg.as_deref().is_some_and(|a| refs(a, out)),
+            Some(N::AExpr(e)) if e.kind == pg_query::protobuf::AExprKind::AexprOp as i32 => {
+                e.lexpr.as_deref().is_none_or(|x| refs(x, out))
+                    && e.rexpr.as_deref().is_none_or(|x| refs(x, out))
+            }
+            _ => false,
+        }
+    }
+    let side = |n: &pg_query::protobuf::Node| -> Option<bool> {
+        let mut keys = Vec::new();
+        if !refs(n, &mut keys) || keys.is_empty() {
+            return None;
+        }
+        if keys.iter().all(|k| left.contains(k)) {
+            Some(true)
+        } else if keys.iter().all(|k| right.contains(k)) {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    let bare = |n: &pg_query::protobuf::Node| matches!(n.node.as_ref(), Some(N::ColumnRef(c)) if c.fields.len() == 1);
+    match node.node.as_ref() {
+        Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr as i32 => b
+            .args
+            .iter()
+            .flat_map(|a| expr_equalities(a, left, right))
+            .collect(),
+        Some(N::AExpr(e))
+            if e.kind == pg_query::protobuf::AExprKind::AexprOp as i32
+                && operator_name(e) == Ok("=") =>
+        {
+            let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
+                return Vec::new();
+            };
+            if bare(l) && bare(r) {
+                return Vec::new();
+            }
+            match (side(l), side(r)) {
+                (Some(true), Some(false)) => vec![(l, r)],
+                (Some(false), Some(true)) => vec![(r, l)],
+                _ => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The joined-row key `n` names, when it is a bare column.
+fn bare_key(n: &pg_query::protobuf::Node) -> Option<String> {
+    match n.node.as_ref() {
+        Some(N::ColumnRef(c)) if c.fields.len() == 1 => column_ref_name(c),
+        _ => None,
+    }
+}
+
+/// The operators an expression evaluates, each a `cpu_operator_cost`.
+fn expr_ops(n: &pg_query::protobuf::Node) -> u32 {
+    match n.node.as_ref() {
+        Some(N::TypeCast(t)) => t.arg.as_deref().map_or(0, expr_ops),
+        Some(N::AExpr(e)) => {
+            1 + e.lexpr.as_deref().map_or(0, expr_ops) + e.rexpr.as_deref().map_or(0, expr_ops)
+        }
+        _ => 0,
     }
 }
 
