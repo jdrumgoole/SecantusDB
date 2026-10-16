@@ -280,3 +280,95 @@ fn tailable_recordid_scan_follows_insertion_order_for_nonmonotonic_ids() {
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// The RecordIds of the documents with these `_id`s.
+fn rids(st: &Storage, db: &str, coll: &str, wanted: &[i32]) -> Vec<Option<i64>> {
+    let docs: Vec<Vec<u8>> = wanted.iter().map(|i| enc(&doc! {"_id": *i})).collect();
+    let refs: Vec<&[u8]> = docs.iter().map(Vec::as_slice).collect();
+    st.record_ids_of(db, coll, &refs).unwrap()
+}
+
+fn insert_ids(st: &Storage, db: &str, coll: &str, ids: std::ops::Range<i32>) {
+    let docs = ids.map(|i| enc(&doc! {"_id": i})).collect();
+    st.insert(db, coll, docs, true).unwrap();
+}
+
+/// mongod numbers each collection's records from 1 (measured 8.2.11,
+/// 2026-10-16); this store's RecordId was one counter for every collection.
+#[test]
+fn record_ids_are_numbered_per_collection_from_one() {
+    let home = temp_home();
+    let st = Storage::open(home.to_str().unwrap()).unwrap();
+    insert_ids(&st, "app", "a", 0..3);
+    insert_ids(&st, "app", "b", 0..2);
+    insert_ids(&st, "other", "a", 0..1);
+    assert_eq!(
+        rids(&st, "app", "a", &[0, 1, 2]),
+        vec![Some(1), Some(2), Some(3)]
+    );
+    assert_eq!(rids(&st, "app", "b", &[0, 1]), vec![Some(1), Some(2)]);
+    assert_eq!(rids(&st, "other", "a", &[0]), vec![Some(1)]);
+    // A deleted record's id is not handed out again while the store is open
+    // (mongod: delete the last of 1, 2, 3 and insert: 4).
+    st.delete_by_id("app", "a", &Bson::Int32(2)).unwrap();
+    insert_ids(&st, "app", "a", 9..10);
+    assert_eq!(
+        rids(&st, "app", "a", &[0, 1, 9, 2]),
+        vec![Some(1), Some(2), Some(4), None]
+    );
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// After a restart mongod goes on from the largest RecordId the collection
+/// holds, so a deleted last record's id is used again (measured 8.2.11).
+#[test]
+fn record_ids_go_on_from_the_largest_after_reopen() {
+    let home = temp_home();
+    {
+        let st = Storage::open(home.to_str().unwrap()).unwrap();
+        insert_ids(&st, "app", "a", 0..4);
+        insert_ids(&st, "app", "b", 0..2);
+        st.delete_by_id("app", "a", &Bson::Int32(3)).unwrap();
+    }
+    let st = Storage::open(home.to_str().unwrap()).unwrap();
+    insert_ids(&st, "app", "a", 9..10);
+    insert_ids(&st, "app", "b", 9..10);
+    assert_eq!(
+        rids(&st, "app", "a", &[0, 1, 2, 9]),
+        vec![Some(1), Some(2), Some(3), Some(4)]
+    );
+    assert_eq!(
+        rids(&st, "app", "b", &[0, 1, 9]),
+        vec![Some(1), Some(2), Some(3)]
+    );
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A dropped collection created again numbers from 1; a renamed one keeps
+/// its records' ids and goes on from them (measured 8.2.11).
+#[test]
+fn record_ids_restart_on_drop_and_survive_a_rename() {
+    let home = temp_home();
+    let st = Storage::open(home.to_str().unwrap()).unwrap();
+    insert_ids(&st, "app", "a", 0..3);
+    st.drop_collection("app", "a").unwrap();
+    insert_ids(&st, "app", "a", 5..6);
+    assert_eq!(rids(&st, "app", "a", &[5]), vec![Some(1)]);
+
+    insert_ids(&st, "app", "r", 0..3);
+    st.delete_by_id("app", "r", &Bson::Int32(0)).unwrap();
+    st.rename_collection("app", "r", "app", "r2", false)
+        .unwrap();
+    insert_ids(&st, "app", "r2", 7..8);
+    assert_eq!(
+        rids(&st, "app", "r2", &[1, 2, 7]),
+        vec![Some(2), Some(3), Some(4)]
+    );
+    // The old name is free and starts again from 1.
+    insert_ids(&st, "app", "r", 0..1);
+    assert_eq!(rids(&st, "app", "r", &[0]), vec![Some(1)]);
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}

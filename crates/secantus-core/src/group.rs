@@ -739,31 +739,27 @@ fn nelem_result(kind: NElemKind, n: usize, vals: Vec<Bson>) -> R<Vec<Bson>> {
     }
 }
 
-/// Population / sample standard deviation, mirroring the pure `_std_dev`: `None`
-/// for an empty set, and additionally for a sample (`pop == false`) with < 2
-/// values (population of a single value is `0.0`). Squares with plain
-/// multiplication (`d * d`) and roots with `sqrt` — both correctly-rounded IEEE
-/// operations that reproduce CPython's `(x - mean) ** 2` / `... ** 0.5` bit-for-bit
-/// (a fuzz seed exposed that `f64::powf(2.0)` can round differently from
-/// multiplication). Sums in document order to match `sum(...)`.
-/// Shared with the EXPRESSION forms in `expressions.rs`, so the two cannot
-/// answer different numbers for the same values.
+/// Population / sample standard deviation as mongod computes it: Welford's
+/// online algorithm in document order, with the `m2` update a fused
+/// multiply-add, which is what mongod's arm64 build compiles it to (RM-128:
+/// matches mongod 8.2.11 bit for bit on 300 random value sets, where a
+/// two-pass mean-then-squares answered 160 and Welford without the fused
+/// step 179). `None` for an empty set, and for a sample (`pop == false`)
+/// with fewer than 2 values. Shared with the EXPRESSION forms in
+/// `expressions.rs`, so the two cannot answer different numbers.
 pub(crate) fn std_dev(values: &[f64], pop: bool) -> Option<f64> {
     let n = values.len();
     if n == 0 || (!pop && n < 2) {
         return None;
     }
-    let mean = values.iter().sum::<f64>() / n as f64;
+    let (mut mean, mut m2) = (0.0f64, 0.0f64);
+    for (i, &x) in values.iter().enumerate() {
+        let delta = x - mean;
+        mean += delta / (i + 1) as f64;
+        m2 = delta.mul_add(x - mean, m2);
+    }
     let denom = if pop { n } else { n - 1 } as f64;
-    let var = values
-        .iter()
-        .map(|x| {
-            let d = x - mean;
-            d * d
-        })
-        .sum::<f64>()
-        / denom;
-    Some(var.sqrt())
+    Some((m2 / denom).sqrt())
 }
 
 /// `$min` / `$max`: ignore null / missing and order every other value by BSON

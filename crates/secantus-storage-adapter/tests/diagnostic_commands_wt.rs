@@ -291,3 +291,157 @@ fn validate_checks_the_collection_and_counts_its_keys() {
         );
     });
 }
+
+/// `fsync` (a checkpoint), which runs against `admin` only.
+fn fsync(c: &mut CommandContext) -> Result<f64, bson::document::ValueAccessError> {
+    let db = std::mem::replace(&mut c.db_name, "admin".into());
+    let reply = dispatch_full(&doc! { "fsync": 1 }, c);
+    c.db_name = db;
+    reply.get_f64("ok")
+}
+
+fn error(reply: &Document) -> (i64, String) {
+    assert_eq!(reply.get_f64("ok"), Ok(0.0), "{reply}");
+    (
+        number(reply, "code"),
+        reply.get_str("errmsg").unwrap_or("").to_string(),
+    )
+}
+
+/// `validate` with `background: true` reads the last checkpoint, as mongod
+/// 8.2.11 does on a one-member replica set: a collection no checkpoint holds
+/// is 26, and after `fsync` (a checkpoint) writes and an index made since are
+/// not seen; `readTimestamp` is the last operation the checkpoint holds and
+/// stays put while the collection changes.
+#[test]
+fn background_validate_reads_the_last_checkpoint() {
+    with_wt(|c| {
+        c.replica_set_name = Some("secantus".into());
+        dispatch_full(&doc! { "drop": "c" }, c);
+        let reply = dispatch_full(&doc! { "insert": "c", "documents": [{ "_id": 1 }] }, c);
+        assert_eq!(reply.get_f64("ok"), Ok(1.0), "{reply}");
+        let background = doc! { "validate": "c", "background": true };
+        assert_eq!(
+            error(&dispatch_full(&background, c)),
+            (
+                26,
+                "Collection 't.c' does not exist to validate.".to_string()
+            )
+        );
+
+        assert_eq!(fsync(c), Ok(1.0));
+        let first = dispatch_full(&background, c);
+        assert_eq!(first.get_bool("valid"), Ok(true), "{first}");
+        assert_eq!(number(&first, "nrecords"), 1);
+        let keys: Vec<&String> = first.keys().take(5).collect();
+        assert_eq!(
+            keys,
+            ["valid", "repaired", "repairMode", "readTimestamp", "ns"]
+        );
+        let read_at = first.get_timestamp("readTimestamp").expect("readTimestamp");
+
+        let more = doc! { "insert": "c", "documents": [{ "_id": 2, "v": 1 }, { "_id": 3 }] };
+        assert_eq!(dispatch_full(&more, c).get_f64("ok"), Ok(1.0));
+        let index =
+            doc! { "createIndexes": "c", "indexes": [{ "key": { "v": 1 }, "name": "v_1" }] };
+        assert_eq!(dispatch_full(&index, c).get_f64("ok"), Ok(1.0));
+        let later = dispatch_full(&background, c);
+        assert_eq!(number(&later, "nrecords"), 1, "{later}");
+        assert_eq!(number(&later, "nIndexes"), 1);
+        assert_eq!(later.get_timestamp("readTimestamp"), Ok(read_at));
+        assert_eq!(first.get("uuid"), later.get("uuid"));
+
+        // Without `background`, the collection as it is now, and no
+        // `readTimestamp`.
+        let now = dispatch_full(&doc! { "validate": "c" }, c);
+        assert_eq!((number(&now, "nrecords"), number(&now, "nIndexes")), (3, 2));
+        assert!(now.get("readTimestamp").is_none(), "{now}");
+
+        // A collection dropped since the checkpoint is still in it.
+        dispatch_full(&doc! { "drop": "c" }, c);
+        let dropped = dispatch_full(&background, c);
+        assert_eq!(number(&dropped, "nrecords"), 1, "{dropped}");
+
+        assert_eq!(fsync(c), Ok(1.0));
+        assert_eq!(error(&dispatch_full(&background, c)).0, 26);
+    });
+}
+
+/// The options are checked before the namespace, in mongod 8.2.11's order;
+/// a standalone server refuses a background validation.
+#[test]
+fn validate_options_are_checked_before_the_namespace() {
+    with_wt(|c| {
+        let standalone = dispatch_full(&doc! { "validate": "nope", "background": 1 }, c);
+        assert_eq!(
+            error(&standalone),
+            (
+                115,
+                "Running the validate command with { background: true } is not supported in \
+                 standalone mode"
+                    .to_string()
+            )
+        );
+        c.replica_set_name = Some("secantus".into());
+        for (request, code, message) in [
+            (
+                doc! { "validate": "nope", "background": true, "full": true },
+                72,
+                "Running the validate command with both { background: true } and { full: true } \
+                 is not supported.",
+            ),
+            (
+                doc! { "validate": "nope", "background": true, "repair": true },
+                72,
+                "Running the validate command with both { background: true } and { repair: true \
+                 } is not supported.",
+            ),
+            (
+                doc! { "validate": "nope", "repair": true },
+                72,
+                "Running the validate command with { repair: true } can only be performed in \
+                 standalone mode.",
+            ),
+            (
+                doc! { "validate": "nope", "background": "x" },
+                26,
+                "Collection 't.nope' does not exist to validate.",
+            ),
+        ] {
+            assert_eq!(
+                error(&dispatch_full(&request, c)),
+                (code, message.to_string()),
+                "{request}"
+            );
+        }
+    });
+}
+
+/// A store held in memory keeps no checkpoints, so it refuses a background
+/// validation rather than answer that nothing exists.
+#[test]
+fn background_validate_refused_without_checkpoints() {
+    let dir = std::env::temp_dir().join(format!("secantus-cmdwt-mem-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    {
+        let wt = std::sync::Arc::new(
+            secantus_storage::Storage::open_with_config(
+                dir.to_str().unwrap(),
+                "create,in_memory=true",
+            )
+            .unwrap(),
+        );
+        let adapter: std::sync::Arc<dyn secantus_commands::Storage> =
+            std::sync::Arc::new(secantus_storage_adapter::StorageAdapter::new(wt));
+        let mut c = CommandContext::new(1).with_storage(adapter);
+        c.db_name = "t".into();
+        c.replica_set_name = Some("secantus".into());
+        let reply = dispatch_full(&doc! { "insert": "c", "documents": [{ "_id": 1 }] }, &mut c);
+        assert_eq!(reply.get_f64("ok"), Ok(1.0), "{reply}");
+        assert_eq!(fsync(&mut c), Ok(1.0));
+        let reply = dispatch_full(&doc! { "validate": "c", "background": true }, &mut c);
+        assert_eq!(error(&reply).0, 115);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

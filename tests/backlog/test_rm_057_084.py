@@ -23,7 +23,7 @@ import pytest
 from bson import Timestamp
 from pymongo.errors import OperationFailure
 
-from tests.backlog.conftest import _RS_BANNER, RS_BINARY, mongo_answer
+from tests.backlog.conftest import _RS_BANNER, RS_BINARY, drain_output, mongo_answer
 
 # ------------------------------------------------------------- fixtures --
 
@@ -73,6 +73,7 @@ def fresh_rust(tmp_path: Any) -> Iterator[Any]:
         assert proc.stdout is not None
         m = _RS_BANNER.search(proc.stdout.readline())
         assert m, "secantusd-rs did not start"
+        drain_output(proc)
         client = pymongo.MongoClient(
             host=m.group(1), port=int(m.group(2)), serverSelectionTimeoutMS=10_000
         )
@@ -653,6 +654,7 @@ def auth_rust(tmp_path: Any) -> Iterator[tuple]:
         assert proc.stdout is not None
         m = _RS_BANNER.search(proc.stdout.readline())
         assert m, "secantusd-rs did not start"
+        drain_output(proc)
         host, port = m.group(1), int(m.group(2))
         local = pymongo.MongoClient(host=host, port=port, directConnection=True)
         local.admin.command("createUser", "root", pwd="pw", roles=["root"])
@@ -916,7 +918,7 @@ def _aggregate_after_index_drop(client: Any) -> tuple:
     return code_of(mongo_answer(lambda: len(list(cur))))
 
 
-@pytest.mark.backlog("RM-082")
+@pytest.mark.backlog_fixed("RM-082")
 def test_aggregate_cursor_after_its_index_is_dropped(rust_mongo: Any, mongod: Any) -> None:
     """What mongod 8.2.11 answers to the `getMore` of an `aggregate` whose
     `$match` reads an index dropped since."""
@@ -932,10 +934,51 @@ def _meta_projection(client: Any) -> list:
     return [sorted(rid), sorted(key)]
 
 
-@pytest.mark.backlog("RM-083")
+@pytest.mark.backlog_fixed("RM-083")
 def test_meta_record_id_and_index_key_projections(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 adds the record id and the index key."""
     assert _meta_projection(rust_mongo) == _meta_projection(mongod)
+
+
+def _meta_pipeline(client: Any, pipeline: list, index: dict | None = None) -> tuple:
+    """The documents, or the error code (messages are this server's own)."""
+    db = client["rm083"]
+    name = _name()
+    if index:
+        db[name].create_index(list(index.items()))
+    db[name].insert_many(
+        [{"_id": i, "a": 3 - i, "loc": {"type": "Point", "coordinates": [i, 0]}} for i in range(3)]
+    )
+    command = {"aggregate": name, "pipeline": pipeline, "cursor": {}}
+    ans = mongo_answer(lambda: db.command(command)["cursor"]["firstBatch"])
+    return ans if ans[0] == "ok" else ans[:2]
+
+
+@pytest.mark.backlog("RM-083")
+@pytest.mark.parametrize("stage", ["$project", "$addFields"])
+def test_meta_sort_key_in_aggregate(rust_mongo: Any, mongod: Any, stage: str) -> None:
+    """mongod 8.2.11: `{$meta: "sortKey"}` after a `$sort` on `a` gives the
+    key as an array (`[3]`), in `$project` and in `$addFields` alike."""
+    pipeline = [{"$sort": {"a": 1}}, {stage: {"k": {"$meta": "sortKey"}}}]
+    assert _meta_pipeline(rust_mongo, pipeline) == _meta_pipeline(mongod, pipeline)
+
+
+@pytest.mark.backlog("RM-083")
+def test_group_keyed_on_meta(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 groups a `$group` keyed on `{$meta: "recordId"}`."""
+    pipeline = [{"$group": {"_id": {"$meta": "recordId"}, "n": {"$sum": 1}}}]
+    assert _meta_pipeline(rust_mongo, pipeline) == _meta_pipeline(mongod, pipeline)
+
+
+@pytest.mark.backlog("RM-083")
+def test_meta_geo_near_distance_after_geo_near(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 gives `{$meta: "geoNearDistance"}` after a `$geoNear`."""
+    pipeline = [
+        {"$geoNear": {"near": {"type": "Point", "coordinates": [0, 0]}, "key": "loc"}},
+        {"$project": {"d": {"$meta": "geoNearDistance"}}},
+    ]
+    index = {"loc": "2dsphere"}
+    assert _meta_pipeline(rust_mongo, pipeline, index) == _meta_pipeline(mongod, pipeline, index)
 
 
 def _dollar_hint_find(client: Any) -> tuple:

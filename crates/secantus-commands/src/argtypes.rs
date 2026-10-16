@@ -2387,6 +2387,24 @@ pub(crate) fn expression_shape_problem_in(spec: &Bson, stage: &str) -> Option<(i
                         }
                     }
                 }
+                // `$meta` takes the name of a kind of metadata mongod keeps:
+                // a non-string is 17307 and an unknown name 17308, both at
+                // parse time (measured 8.2.11, 2026-10-16).
+                if key == "$meta" {
+                    match value {
+                        Bson::String(s)
+                            if secantus_core::projection::META_KEYWORDS.contains(&s.as_str()) => {}
+                        Bson::String(s) => {
+                            return Some((17308, format!("Unsupported $meta field: {s}")))
+                        }
+                        _ => {
+                            return Some((
+                                17307,
+                                "$meta only supports string arguments".to_string(),
+                            ))
+                        }
+                    }
+                }
                 if key == "$getField" {
                     if let Bson::Document(spec) = value {
                         // A single `$`-key document is a nested EXPRESSION, not

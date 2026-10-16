@@ -964,6 +964,7 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         // non-deterministic: a fresh uniform double in [0, 1) (mirrors
         // `expressions._op_rand` / `random.random()`; not byte-pinned to it).
         "$rand" => op_rand(arg),
+        "$meta" => op_meta(arg),
         _ => Err(Fallback::Defer),
     }
 }
@@ -1130,6 +1131,7 @@ pub const KNOWN_EXPR_OPS: &[&str] = &[
     "$strLenBytes",
     "$arrayToObject",
     "$rand",
+    "$meta",
 ];
 
 /// An unknown `$`-operator at the TOP LEVEL of `expr`, without recursing.
@@ -1200,6 +1202,41 @@ pub fn first_unknown_expr_operator(expr: &Bson) -> Option<String> {
             None
         }
         _ => None,
+    }
+}
+
+/// `$meta`: a document's metadata. This engine keeps none with a document,
+/// so a keyword mongod knows evaluates to MISSING -- which is mongod's
+/// answer wherever the metadata is not available (measured 8.2.11:
+/// `{$addFields: {r: {$meta: "recordId"}}}` adds nothing, a `$group` keyed
+/// on it groups under null). The command layer supplies the record id and
+/// the index key where mongod has them, before the pipeline runs. A bad
+/// argument is refused at parse time (17307 / 17308).
+///
+/// The text score and the `$geoNear` distance and point are refused, as
+/// mongod refuses them without a `$text` query or a `$geoNear` stage
+/// (40218). This engine never has them, so it refuses them after a
+/// `$geoNear` too, where mongod would answer. `sortKey` is refused as
+/// unsupported: mongod's answer depends on the stage (an error in
+/// `$project`, `[]` in `$addFields`).
+fn op_meta(arg: &Bson) -> R {
+    let unavailable = |what: &str| {
+        Err(Fallback::mongo(
+            40218,
+            format!("query requires {what} metadata, but it is not available"),
+        )
+        .bare())
+    };
+    match arg {
+        Bson::String(s) => match s.as_str() {
+            "textScore" => unavailable("text score"),
+            "geoNearDistance" => unavailable("$geoNear distance"),
+            "geoNearPoint" => unavailable("$geoNear point"),
+            "sortKey" => Err(Fallback::Defer),
+            known if crate::projection::META_KEYWORDS.contains(&known) => Ok(Bson::Undefined),
+            _ => Err(Fallback::Defer),
+        },
+        _ => Err(Fallback::Defer),
     }
 }
 

@@ -501,6 +501,11 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // `$indexStats` through a view reports the indexes of the collection
     // beneath it (measured 8.2.11).
     let mut index_stats_base: Option<String> = None;
+    // The pipeline's first read of its collection itself (not through a
+    // view): its filter, sort and limit, for the indexes its plan uses.
+    let mut first_read_of_coll: Option<(Document, Option<Document>, i64)> = None;
+    // The stages of the pipeline, a view's in front.
+    let mut read_pipeline: Vec<Bson> = Vec::new();
     // Fetch the input documents + decide the remaining pipeline.
     let (ns, input, working_pipeline): (String, Vec<Document>, Vec<Bson>) = match &coll {
         Some(c) => {
@@ -589,6 +594,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 ) {
                     check_geo_near_hint(spec, hint, &ctx.db_name, c, storage)?;
                 }
+                read_pipeline = pipeline.clone();
                 let geonear_candidate = pipeline
                     .first()
                     .and_then(Bson::as_document)
@@ -651,25 +657,38 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 })?;
                 // The plan the pipeline's first read runs uses its indexes
                 // once (a `$lookup`'s reads count none: measured 8.2.11).
+                let first_read = crate::explain::order::Ask {
+                    db: &ctx.db_name,
+                    coll: c,
+                    filter: lead
+                        .filter
+                        .as_ref()
+                        .filter(|_| lead.sort.is_some())
+                        .unwrap_or(&filter),
+                    sort: lead.sort.as_ref(),
+                    hint,
+                    collation: collation.as_ref(),
+                    vars: &vars,
+                    limit: lead.limit,
+                    asked: Default::default(),
+                };
                 crate::explain::order::count_index_use(
                     storage,
-                    &crate::explain::order::Ask {
-                        db: &ctx.db_name,
-                        coll: c,
-                        filter: lead
-                            .filter
-                            .as_ref()
-                            .filter(|_| lead.sort.is_some())
-                            .unwrap_or(&filter),
-                        sort: lead.sort.as_ref(),
-                        hint,
-                        collation: collation.as_ref(),
-                        vars: &vars,
-                        limit: lead.limit,
-                        asked: Default::default(),
-                    },
+                    &first_read,
                     crate::explain::order::Uses::Find,
                 );
+                // A cursor left open over that read is killed when one of its
+                // indexes is dropped, as a `find` cursor is (mongod 8.2.11:
+                // 175 on the `getMore`). Only when the cursor's namespace is
+                // the collection the index belongs to: through a view the
+                // cursor names the view.
+                if c == asked {
+                    first_read_of_coll = Some((
+                        first_read.filter.clone(),
+                        first_read.sort.cloned(),
+                        first_read.limit,
+                    ));
+                }
                 // A time-series collection scans bucket by bucket.
                 let bytes = crate::ts_buckets::as_read(storage, &ctx.db_name, c, bytes, false)?;
                 // Reduce the leading $skip/$limit/$match prefix over raw BSON so
@@ -677,6 +696,24 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 // decoded (tasks/rust-perf-findings.md).
                 let (reduced, remaining) =
                     reduce_raw_prefix(bytes, &rest, &vars, collation.as_ref());
+                // `{$meta: "recordId"}` / `{$meta: "indexKey"}` where mongod
+                // answers them: read from fields the documents are given here.
+                let mut remaining = remaining;
+                let metas = crate::agg_meta::rewrite(&read_pipeline, &mut remaining);
+                let record_ids = if metas.record_id {
+                    let refs: Vec<&[u8]> = reduced.iter().map(Vec::as_slice).collect();
+                    storage
+                        .record_ids_of(&ctx.db_name, c, &refs)
+                        .map_err(command_error)?
+                } else {
+                    None
+                };
+                let index_keys = if metas.index_key {
+                    let full = decode_docs(reduced.clone())?;
+                    crate::explain::order::index_keys(storage, &first_read, &full)
+                } else {
+                    None
+                };
                 // If the pipeline reaches a `$group` / `$count` through stages
                 // that only pass documents along (`$unwind`, `$sort`, ...),
                 // decode only the top-level fields those stages read from each
@@ -684,10 +721,17 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 // (tasks/rust-phase6-streaming-agg-scoping.md, 6a). Any shape
                 // the collector can't bound falls back to a full decode.
                 let group_fields = secantus_core::pipeline_prefix_fields(&remaining);
-                let input = match group_fields {
+                let mut input = match group_fields {
                     Some(fields) => decode_docs_minimal(reduced, &fields)?,
                     None => decode_docs(reduced)?,
                 };
+                if metas.record_id || metas.index_key {
+                    crate::agg_meta::attach(
+                        &mut input,
+                        record_ids.as_deref(),
+                        index_keys.as_deref(),
+                    );
+                }
                 (ns, input, remaining)
             }
         }
@@ -731,6 +775,32 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // one even over nothing -- a missing collection included.
     if batch_size == 0 && cursor_id == 0 {
         cursor_id = crate::find::open_cursor(cursors, &ns, Vec::new(), false)?;
+    }
+    // A cursor that still holds the executor of the pipeline's first read
+    // ends when an index that read uses is dropped (mongod 8.2.11: 175 on
+    // the `getMore`); one whose executor was read to the end does not.
+    if let (true, Some((filter, sort, limit)), Some(c)) =
+        (cursor_id != 0, first_read_of_coll.as_ref(), coll.as_deref())
+    {
+        let plan_indexes = crate::explain::order::plan_indexes(
+            storage,
+            &crate::explain::order::Ask {
+                db: &ctx.db_name,
+                coll: c,
+                filter,
+                sort: sort.as_ref(),
+                hint,
+                collation: collation.as_ref(),
+                vars: &vars,
+                limit: *limit,
+                asked: Default::default(),
+            },
+        );
+        if !plan_indexes.is_empty()
+            && crate::agg_executor::holds_executor(ctx, doc, c, &read_pipeline)
+        {
+            ctx.cursors()?.set_plan_indexes(cursor_id, plan_indexes);
+        }
     }
     Ok(doc! {
         "cursor": {

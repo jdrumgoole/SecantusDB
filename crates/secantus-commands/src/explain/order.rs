@@ -683,20 +683,17 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
     Ok(Some(placed(rows, order)))
 }
 
-/// The names of the indexes the plan for `ask` reads. A cursor left open
-/// over that plan is killed when one of them is dropped, as mongod's is.
-pub(crate) fn plan_indexes(storage: &dyn Storage, ask: &Ask) -> Vec<String> {
-    let Ok(catalog) = catalog(storage, ask.db, ask.coll, None) else {
-        return Vec::new();
-    };
+/// The plan mongod runs for `ask`, without a trial of the candidates (a
+/// fixed order of preference stands in); `None` for a collection with no
+/// index, or a hint the planner does not know.
+fn untried_plan(storage: &dyn Storage, ask: &Ask) -> Option<Node> {
+    let catalog = catalog(storage, ask.db, ask.coll, None).ok()?;
     if catalog.is_empty() {
-        return Vec::new();
+        return None;
     }
     let canonical = parsed::parsed_query(ask.filter);
     let implied = |partial: &Document| storage.query_implies_partial(ask.filter, partial);
-    let Ok(hint) = resolve_hint(ask.hint, &catalog) else {
-        return Vec::new();
-    };
+    let hint = resolve_hint(ask.hint, &catalog).ok()?;
     let query = Query {
         canonical: &canonical,
         sort: ask.sort,
@@ -715,9 +712,86 @@ pub(crate) fn plan_indexes(storage: &dyn Storage, ask: &Ask) -> Vec<String> {
         implies: &implied,
         trial: None,
     };
+    Some(plan::plan(&query, &catalog))
+}
+
+/// The names of the indexes the plan for `ask` reads. A cursor left open
+/// over that plan is killed when one of them is dropped, as mongod's is.
+pub(crate) fn plan_indexes(storage: &dyn Storage, ask: &Ask) -> Vec<String> {
     let mut names = Vec::new();
-    index_names(&plan::plan(&query, &catalog), &mut names);
+    if let Some(plan) = untried_plan(storage, ask) {
+        index_names(&plan, &mut names);
+    }
     names
+}
+
+/// The one index scan the plan reads its documents through, under the
+/// stages that fetch and sort them; `None` for any other plan.
+fn the_scan(node: &Node) -> Option<&super::node::IxScan> {
+    match access(node) {
+        Node::IxScan(ix) => Some(ix),
+        Node::Fetch { input, .. } | Node::Sort { input, .. } => the_scan(input),
+        _ => None,
+    }
+}
+
+/// mongod's `{$meta: "indexKey"}` for each of `docs`, the documents the
+/// plan for `ask` returns: the key its index scan met the document at, its
+/// fields in the key pattern's order (measured 8.2.11: `{z: 1, a: -1}`
+/// gives `{z: .., a: ..}`). For a document an array gives several keys,
+/// the first in the bounds in the scan's direction (`{t: [2, 12]}` read by
+/// `t >= 3` is `{t: 12}`). `None` when the plan reads no single index scan
+/// -- a collection scan, an `_id` lookup, several scans -- where mongod
+/// adds nothing.
+pub(crate) fn index_keys(
+    storage: &dyn Storage,
+    ask: &Ask,
+    docs: &[Document],
+) -> Option<Vec<Document>> {
+    let plan = untried_plan(storage, ask)?;
+    let ix = the_scan(&plan)?;
+    if !ix.index.plain {
+        return None;
+    }
+    let collation = ix.index.collation.as_ref();
+    let fields = ix.index.fields();
+    let within = |at: usize, v: &Bson| {
+        if ix.no_bounds {
+            return true;
+        }
+        ix.bounds.get(at).is_none_or(|list| {
+            list.iter().any(|i| {
+                let lo = super::bounds::cmp(&i.lo, v);
+                let hi = super::bounds::cmp(v, &i.hi);
+                (lo.is_lt() || (i.lo_incl && lo.is_eq()))
+                    && (hi.is_lt() || (i.hi_incl && hi.is_eq()))
+            })
+        })
+    };
+    Some(
+        docs.iter()
+            .map(|doc| {
+                let mut key = Document::new();
+                for (at, (field, dir)) in fields.iter().enumerate() {
+                    let values = exec::values_at(doc, field).0;
+                    let reversed = (*dir < 0) != ix.backward;
+                    let inside: Vec<&Bson> = values.iter().filter(|v| within(at, v)).collect();
+                    let pool: Vec<&Bson> = if inside.is_empty() {
+                        values.iter().collect()
+                    } else {
+                        inside
+                    };
+                    let first = pool
+                        .into_iter()
+                        .min_by_key(|v| exec::directed(v, reversed, collation))
+                        .cloned()
+                        .unwrap_or(Bson::Null);
+                    key.insert(field.to_string(), first);
+                }
+                key
+            })
+            .collect(),
+    )
 }
 
 /// The indexes a plan's scans read, into `out`.

@@ -20,7 +20,7 @@ from typing import Any
 import pytest
 from bson import Int64
 
-from tests.backlog.conftest import _RS_BANNER, RS_BINARY, mongo_answer
+from tests.backlog.conftest import _RS_BANNER, RS_BINARY, drain_output, mongo_answer
 
 pymongo = pytest.importorskip("pymongo")
 
@@ -113,7 +113,7 @@ def test_validate_system_views(rust_mongo: Any) -> None:
     )
 
 
-@pytest.mark.backlog("RM-033")
+@pytest.mark.backlog_fixed("RM-033")
 def test_background_validate_of_an_uncheckpointed_collection(rust_mongo: Any) -> None:
     """mongod 8.2.11, one-member replica set: a background validation of a
     collection no checkpoint holds yet is 26 NamespaceNotFound."""
@@ -809,6 +809,7 @@ def _start_rust(store: pathlib.Path) -> tuple[subprocess.Popen, Any]:
     assert proc.stdout is not None
     m = _RS_BANNER.search(proc.stdout.readline())
     assert m, "secantusd-rs did not start"
+    drain_output(proc)
     client = pymongo.MongoClient(
         host=m.group(1), port=int(m.group(2)), serverSelectionTimeoutMS=10_000
     )
@@ -849,7 +850,7 @@ def _ixscan(plan: dict) -> dict:
     return plan
 
 
-@pytest.mark.backlog("RM-055")
+@pytest.mark.backlog_fixed("RM-055")
 def test_multikey_paths_survive_a_restart(restarted: Any) -> None:
     """mongod 8.2.11: once `a_1` has held an array it stays multikey, with
     `multiKeyPaths: {a: ["a"]}`, though no document holds an array now."""

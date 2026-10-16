@@ -2475,6 +2475,7 @@ fn build_seq(opts: &Document) -> i64 {
 const BUILD_STAMPS: &[&str] = &[
     "entryFormat",
     "multikey",
+    MULTIKEY_PATHS,
     COLLATION_KEYS,
     GEO_KEYS,
     NUMBER_KEYS,
@@ -2863,6 +2864,30 @@ struct MultikeyPaths {
 
 /// Add to `out` the components of `path` at which `doc` holds an array:
 /// `a.b` over `{a: [{b: [1]}]}` gives `a` and `a.b`.
+/// The multikey paths an index's catalog row records (RM-055): per key
+/// field, the array prefixes any document has held there. mongod keeps them
+/// in its catalog and never shrinks them, so a path outlives the array that
+/// put it there, across a restart too. Under `options.multikeyPaths`, a
+/// document of field -> array of paths; stripped from `listIndexes`.
+const MULTIKEY_PATHS: &str = "multikeyPaths";
+
+fn stored_multikey_paths(opts: &Document, key_spec: &Document) -> Vec<Vec<String>> {
+    let stored = opts.get_document(MULTIKEY_PATHS).ok();
+    key_spec
+        .keys()
+        .map(|field| {
+            stored
+                .and_then(|d| d.get_array(field).ok())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
 fn array_components(doc: &Document, path: &str, out: &mut Vec<String>) {
     fn in_doc(d: &Document, parts: &[&str], at: usize, out: &mut Vec<String>) {
         if at == parts.len() {
@@ -3979,6 +4004,14 @@ pub struct Storage {
     /// Per capped collection, its size and count as of its last insert
     /// ([`CappedTally`]).
     capped_tallies: Mutex<CappedTallies>,
+    /// Per `(db, collection)`: the RecordId its next document gets. mongod
+    /// numbers each collection's records from 1, and on its first insert
+    /// after a start goes on from the largest RecordId the collection holds
+    /// (measured 8.2.11, 2026-10-16: after the last record is deleted and the
+    /// server restarted, the next insert reuses its RecordId). Kept in memory
+    /// only, as mongod keeps it; forgotten when the collection is dropped, so
+    /// a re-created one starts again at 1.
+    record_ids: Mutex<HashMap<(String, String), i64>>,
     /// Per `(db, collection, index)`: which components of each key field hold
     /// an array in some document -- mongod's multikey paths, which its planner
     /// reads to decide how far an index's bounds can be narrowed. Computed by
@@ -4094,6 +4127,12 @@ pub struct Storage {
     /// 250ms tick and clears it.
     checkpoint_requested: Arc<AtomicBool>,
     checkpoint_join: Mutex<Option<JoinHandle<()>>>,
+    /// Held while the periodic thread checkpoints, and while a background
+    /// `validate` opens its checkpoint cursors
+    /// ([`Storage::check_collection_at_checkpoint`]), so the check reads one
+    /// checkpoint throughout. (The other checkpoints hold `lock`, which the
+    /// check holds too.)
+    checkpoint_gate: Arc<Mutex<()>>,
 }
 
 /// Strictly-monotonic oplog bookkeeping: the next int64 seq to mint and the last
@@ -5941,6 +5980,7 @@ impl Storage {
             write_tickets: crate::admission::Tickets::new(opts.write_tickets.unwrap_or(0)),
             ddl_generation: AtomicU64::new(0),
             capped_tallies: Mutex::new(HashMap::new()),
+            record_ids: Mutex::new(HashMap::new()),
             multikey_paths: Mutex::new(HashMap::new()),
             planner_cache: std::sync::RwLock::new(HashMap::new()),
             txn_dirty_limit: (parse_cache_bytes(config) as f64 * 0.20 * 0.75) as u64,
@@ -5967,6 +6007,7 @@ impl Storage {
             checkpoint_stop: Arc::new(AtomicBool::new(false)),
             checkpoint_requested,
             checkpoint_join: Mutex::new(None),
+            checkpoint_gate: Arc::new(Mutex::new(())),
         };
         // Before anything looks a key up: crash recovery below replays writes
         // by `_id`.
@@ -7080,6 +7121,20 @@ impl Storage {
     /// skip on duplicate `_id`, `$v:2` diffs are idempotent transformations,
     /// deletes of absent docs are no-ops). Public so tests and tools can
     /// force an anchor; the periodic thread calls it on the mongod cadence.
+    /// A checkpoint now, as `fsync` asks for one: for a data-nonlogged store
+    /// the stable checkpoint (with its marker), for a logged one the plain
+    /// checkpoint. Nothing for a store held in memory, which has none.
+    pub fn checkpoint_now(&self) -> Result<()> {
+        if self.in_memory {
+            return Ok(());
+        }
+        if self.data_nonlogged {
+            self.stable_checkpoint()
+        } else {
+            self.checkpoint()
+        }
+    }
+
     /// The seq the last stable checkpoint anchored (0 if none yet).
     pub fn stable_checkpoint_seq(&self) -> i64 {
         self.stable_seq.load(Ordering::Acquire)
@@ -7223,6 +7278,7 @@ impl Storage {
         let conn = self.conn.clone();
         let oplog = self.oplog.clone();
         let stable_seq = self.stable_seq.clone();
+        let gate = self.checkpoint_gate.clone();
         let handle = thread::Builder::new()
             .name(
                 if stable {
@@ -7251,7 +7307,10 @@ impl Storage {
                         // A logged store: the checkpoint alone. No stable
                         // marker -- that row records the data-nonlogged
                         // MODE, which a logged store must not acquire.
-                        let done = conn.open_session().and_then(|s| s.checkpoint(None));
+                        let done = {
+                            let _cp = gate.lock().unwrap_or_else(|e| e.into_inner());
+                            conn.open_session().and_then(|s| s.checkpoint(None))
+                        };
                         if let Err(e) = done {
                             eprintln!("secantus-storage: periodic checkpoint failed: {e:?}");
                         }
@@ -7274,7 +7333,10 @@ impl Storage {
                     };
                     let write = (|| -> Result<()> {
                         let session = conn.open_session()?;
-                        session.checkpoint(None)?;
+                        {
+                            let _cp = gate.lock().unwrap_or_else(|e| e.into_inner());
+                            session.checkpoint(None)?;
+                        }
                         let mut d = Document::new();
                         d.insert("stable_seq", stable);
                         d.insert("data_nonlogged", true);
@@ -10461,6 +10523,7 @@ impl Storage {
     fn purge_dropped_collection(&self, db: &str, coll: &str) -> Result<()> {
         // Planner writes made here are released once they are visible.
         let _planner = PlannerScope::new();
+        self.forget_record_ids(db, coll);
         // It writes the index catalog.
         note_planner_write();
         loop {
@@ -10845,9 +10908,10 @@ impl Storage {
             )?;
         }
         // Phase B: copy in bounded batches, resuming by source RecordId.
-        // Fresh RecordIds preserve insertion order (the source walk is
-        // RecordId order and minting is monotonic); index entries + unique
-        // claims are rebuilt per doc.
+        // Each record keeps its RecordId (so insertion order too), and the
+        // destination numbers on from where the source would have; index
+        // entries + unique claims are rebuilt per doc.
+        let src_next = self.next_record_id(src_db, src_coll)?;
         let mut after: Option<i64> = None;
         loop {
             let copied = self.retry_write_conflicts("rename_collection copy", || {
@@ -10865,7 +10929,10 @@ impl Storage {
                     let dcur = session.open_cursor(&doc_table_for(dst_db, dst_coll), None)?;
                     let mut last = after;
                     for (src_rid, id_k, blob) in &batch {
-                        let recordid = self.write_nat_entry(&session, dst_db, dst_coll, id_k)?;
+                        // The record keeps its RecordId, as mongod's renamed
+                        // collection keeps its records (measured 8.2.11).
+                        let recordid =
+                            self.write_nat_entry_kept(&session, dst_db, dst_coll, id_k, *src_rid)?;
                         dcur.reset()?;
                         dcur.set_key_ssq(dst_db, dst_coll, recordid);
                         dcur.set_value_u(&frame_doc_value(id_k, blob));
@@ -10896,6 +10963,7 @@ impl Storage {
                 break;
             }
         }
+        self.set_next_record_id(dst_db, dst_coll, src_next);
         // Phase C — the switch.
         self.retry_write_conflicts("rename_collection switch", || {
             let session = self.op_session()?;
@@ -11012,23 +11080,25 @@ impl Storage {
         let docs = self.scan_docs(session, src_db, src_coll)?;
         let idx_rows = self.collect_idx_rows(session, src_db, src_coll)?;
         let src_id_claim = self.id_claim_desc(session, src_db, src_coll)?;
+        let src_next = self.next_record_id(src_db, src_coll)?;
         self.purge_collection_tables(session, src_db, src_coll)?;
         // Sharded: dst rows go to the dst collection's shard (may differ from the
         // src shard — the src rows were already read into `docs` and purged above).
-        // Re-mint a fresh RecordId per doc in src natural order (preserving
-        // insertion order) and write the dst `_id` index (id_key -> RecordId); the
-        // doc-table value carries the id_key in-band (framed).
+        // Each doc keeps its RecordId in dst (preserving insertion order) and
+        // the dst `_id` index is written (id_key -> RecordId); the doc-table
+        // value carries the id_key in-band (framed).
         // Lazy shards: the rename target's shard may not exist yet — make it.
         session.create(
             &doc_table_for(dst_db, dst_coll),
             &data_table_cfg(DOC_TABLE_CFG, self.data_nonlogged),
         )?;
         let dcur = session.open_cursor(&doc_table_for(dst_db, dst_coll), None)?;
-        // Remember each doc against the RecordId it was RE-MINTED under in the
-        // destination — the source RecordIds do not carry over.
+        // Remember each doc against its RecordId in the destination.
         let mut moved: Vec<(i64, Document)> = Vec::with_capacity(docs.len());
-        for (_src_rid, id_k, blob) in &docs {
-            let recordid = self.write_nat_entry(session, dst_db, dst_coll, id_k)?;
+        for (src_rid, id_k, blob) in &docs {
+            // The record keeps its RecordId, as mongod's renamed collection
+            // keeps its records (measured 8.2.11).
+            let recordid = self.write_nat_entry_kept(session, dst_db, dst_coll, id_k, *src_rid)?;
             dcur.reset()?;
             dcur.set_key_ssq(dst_db, dst_coll, recordid);
             dcur.set_value_u(&frame_doc_value(id_k, blob));
@@ -11043,11 +11113,11 @@ impl Storage {
             icur.insert()?;
         }
         // REBUILD the index entries rather than copying the source's packed rows.
-        // Step-2 entries carry the RecordId, and rename re-mints every RecordId, so
-        // copied entries would point at rows that do not exist in the destination —
-        // silently breaking every index on the renamed collection. (Under step 1
-        // entries carried the `id_key`, which survives a rename, so the copy was
-        // safe then.) The index catalog rows are written above, so `index_descs`
+        // Step-2 entries carry the RecordId; rename used to re-mint every RecordId,
+        // so copied entries pointed at rows that did not exist in the destination.
+        // Records keep their RecordIds now, but rebuilding stays the one path
+        // that cannot drift from the documents. The index catalog rows are
+        // written above, so `index_descs`
         // sees the destination's indexes here.
         let mut dst_descs = self.index_descs(session, dst_db, dst_coll)?;
         if !dst_descs.iter().any(|d| d.id_claim) {
@@ -11056,6 +11126,7 @@ impl Storage {
         for (recordid, doc) in &moved {
             self.write_index_entries(session, dst_db, dst_coll, doc, &dst_descs, *recordid)?;
         }
+        self.set_next_record_id(dst_db, dst_coll, src_next);
         ensure_collection(session, dst_db, dst_coll, self.data_nonlogged)?;
         let rc = session.open_cursor(COLL_TABLE, None)?;
         // The collection keeps its options and its UUID under the new name:
@@ -11273,6 +11344,27 @@ impl Storage {
     /// at setup. This is where mongod positions a tailable cursor (end of the
     /// initial scan), and for a monotonic-`_id` capped collection it equals the
     /// last-returned doc's position, so existing behaviour is unchanged.
+    /// The RecordId of each of `docs` (BSON documents of `(db, coll)`), found
+    /// through the `_id` index by the document's `_id`: `None` for one with
+    /// no `_id` or not stored under it. `showRecordId` and
+    /// `{$meta: "recordId"}` report it.
+    pub fn record_ids_of(&self, db: &str, coll: &str, docs: &[&[u8]]) -> Result<Vec<Option<i64>>> {
+        let session = self.op_session()?;
+        let mut out = Vec::with_capacity(docs.len());
+        for bytes in docs {
+            let id = bson::RawDocument::from_bytes(bytes)
+                .ok()
+                .and_then(|d| d.get("_id").ok().flatten())
+                .and_then(|v| Bson::try_from(v).ok());
+            let Some(id) = id else {
+                out.push(None);
+                continue;
+            };
+            out.push(self.doc_recordid(&session, db, coll, &id_key(&id)?)?);
+        }
+        Ok(out)
+    }
+
     pub fn collection_max_recordid(&self, db: &str, coll: &str) -> Result<Option<i64>> {
         // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
@@ -12417,12 +12509,70 @@ impl Storage {
 
     // --- natural-order (insertion) index maintenance + scan ---
 
-    /// Reserve the next monotonic insertion `seq`. Mirrors `storage._mint_nat_seq`.
-    fn mint_nat_seq(&self) -> i64 {
-        let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
-        let seq = st.next_nat_seq;
-        st.next_nat_seq += 1;
-        seq
+    /// Reserve the next RecordId of `(db, coll)`: one counter per collection,
+    /// from 1, as mongod numbers records (`record_ids`).
+    fn mint_record_id(&self, db: &str, coll: &str) -> Result<i64> {
+        let mut ids = self.record_ids.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (db.to_string(), coll.to_string());
+        let next = match ids.get(&key) {
+            Some(n) => *n,
+            None => self.largest_record_id(db, coll)? + 1,
+        };
+        ids.insert(key, next + 1);
+        Ok(next)
+    }
+
+    /// The RecordId the next document of `(db, coll)` would get, without
+    /// reserving it.
+    fn next_record_id(&self, db: &str, coll: &str) -> Result<i64> {
+        let ids = self.record_ids.lock().unwrap_or_else(|e| e.into_inner());
+        match ids.get(&(db.to_string(), coll.to_string())) {
+            Some(n) => Ok(*n),
+            None => Ok(self.largest_record_id(db, coll)? + 1),
+        }
+    }
+
+    /// Set the RecordId the next document of `(db, coll)` gets (a renamed
+    /// collection keeps its records' ids and goes on from its source's).
+    fn set_next_record_id(&self, db: &str, coll: &str, next: i64) {
+        let mut ids = self.record_ids.lock().unwrap_or_else(|e| e.into_inner());
+        ids.insert((db.to_string(), coll.to_string()), next);
+    }
+
+    /// Forget the counter of a dropped `(db, coll)`: one created again under
+    /// the name numbers its records from 1, as mongod's does.
+    fn forget_record_ids(&self, db: &str, coll: &str) {
+        let mut ids = self.record_ids.lock().unwrap_or_else(|e| e.into_inner());
+        ids.remove(&(db.to_string(), coll.to_string()));
+    }
+
+    /// The largest RecordId `(db, coll)` holds as committed (0 when none):
+    /// the last key of its range in its doc shard.
+    fn largest_record_id(&self, db: &str, coll: &str) -> Result<i64> {
+        let session = self.conn.open_session()?;
+        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+            Ok(c) => c,
+            Err(e) if e.is_missing_table() => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        cur.set_key_ssq(db, coll, i64::MAX);
+        let mut more = match cur.search_near() {
+            Ok(cmp) if cmp > 0 => cur.prev()?,
+            Ok(_) => true,
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        while more {
+            let (d, c, rid) = cur.get_key_ssq()?;
+            if d == db && c == coll {
+                return Ok(rid);
+            }
+            if (d.as_str(), c.as_str()) < (db, coll) {
+                return Ok(0);
+            }
+            more = cur.prev()?;
+        }
+        Ok(0)
     }
 
     /// Record a doc's insertion position: `seq -> id_key` plus the reverse
@@ -12454,9 +12604,35 @@ impl Storage {
         coll: &str,
         id_key: &[u8],
     ) -> Result<i64> {
-        let recordid = self.mint_nat_seq();
+        let recordid = self.mint_record_id(db, coll)?;
         // A wasted RecordId on the dup path is harmless — RecordIds only need to be
         // unique + monotonic; gaps are fine.
+        self.write_nat_entry_at(rev, db, coll, id_key, recordid)
+    }
+
+    /// Write the `_id` index row of a document that keeps RecordId
+    /// `recordid` (a renamed collection's, which keeps its records' ids).
+    fn write_nat_entry_kept(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        id_key: &[u8],
+        recordid: i64,
+    ) -> Result<i64> {
+        let rev = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
+        self.write_nat_entry_at(&rev, db, coll, id_key, recordid)
+    }
+
+    /// The `_id` index row `id_key -> recordid` of `(db, coll)`.
+    fn write_nat_entry_at(
+        &self,
+        rev: &Cursor,
+        db: &str,
+        coll: &str,
+        id_key: &[u8],
+        recordid: i64,
+    ) -> Result<i64> {
         rev.reset()?;
         note_id_key(db, coll, id_key)?;
         rev.set_key_ssu(db, &key_coll(db, coll), id_key);
@@ -12871,11 +13047,30 @@ impl Storage {
             }
             let mut payload = decode_doc(&cur.get_value_u()?)?;
             let mut opts = payload.get_document("options").cloned().unwrap_or_default();
-            if opts.get_bool("multikey").unwrap_or(false) {
-                continue; // already flagged — nothing to do
+            // The paths this document adds to what the catalog records.
+            let mut paths = stored_multikey_paths(&opts, &desc.key_spec);
+            let mut grew = false;
+            for (field, parts) in desc.key_spec.keys().zip(paths.iter_mut()) {
+                let before = parts.len();
+                array_components(doc, field, parts);
+                if parts.len() != before {
+                    parts.sort();
+                    grew = true;
+                }
+            }
+            if opts.get_bool("multikey").unwrap_or(false) && !grew {
+                continue; // already flagged, no new path — nothing to do
             }
             note_planner_write();
             opts.insert("multikey", Bson::Boolean(true));
+            let mut recorded = Document::new();
+            for (field, parts) in desc.key_spec.keys().zip(&paths) {
+                recorded.insert(
+                    field.clone(),
+                    Bson::Array(parts.iter().cloned().map(Bson::String).collect()),
+                );
+            }
+            opts.insert(MULTIKEY_PATHS, recorded);
             payload.insert("options", Bson::Document(opts));
             let blob = encode_doc(&payload)?;
             let wcur = session.open_cursor(IDX_TABLE, None)?;
@@ -14384,6 +14579,7 @@ impl Storage {
     fn purge_collection_tables(&self, session: &Session, db: &str, coll: &str) -> Result<()> {
         // It writes the index catalog.
         note_planner_write();
+        self.forget_record_ids(db, coll);
         // Unique-key claims die with the namespace (see purge_unique_claims):
         // a surviving claim would reject a later insert of the same value
         // against a row that no longer exists.
@@ -14511,8 +14707,93 @@ impl Storage {
         let ns_lock = self.coll_lock(db, coll);
         let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
+        self.check_collection_in(&session, db, coll)
+    }
+
+    /// [`Self::check_collection`] as of the last checkpoint: what a
+    /// `validate` with `background: true` reads.
+    ///
+    /// mongod validates in the background by opening the collection at its
+    /// last checkpoint, so a collection created since then does not exist to
+    /// it, and one written since is checked as it was. This reads the same
+    /// thing: every cursor of the check is a WiredTiger checkpoint cursor
+    /// over the most recent checkpoint, the one the periodic checkpoint
+    /// thread (or a close, or `fsync`) last took. Writers are not held off,
+    /// since nothing they do reaches a checkpoint already taken; a checkpoint
+    /// IS held off while the cursors open, as mongod holds its checkpoint
+    /// lock, so the check reads one checkpoint throughout.
+    ///
+    /// `None` when the checkpoint does not hold the collection (or there is
+    /// no checkpoint yet). Otherwise the check, with what else the
+    /// checkpoint says about the collection: `indexes` beside `listed` (its
+    /// indexes in `listIndexes`' shape), `options` (its catalog options),
+    /// and `readTimestamp`, the time of the last operation the checkpoint
+    /// holds -- left out when the checkpointed oplog is empty.
+    ///
+    /// A store held in memory ([`Self::in_memory`]) has no checkpoints, so
+    /// nothing is ever in one: callers refuse rather than ask.
+    pub fn check_collection_at_checkpoint(&self, db: &str, coll: &str) -> Result<Option<Document>> {
+        if self.in_memory {
+            return Ok(None);
+        }
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _cp = self
+            .checkpoint_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut session = self.conn.open_session()?;
+        session.read_checkpoint("WiredTigerCheckpoint");
+        let options = match coll_options(&session, db, coll) {
+            Ok(Some(options)) => options,
+            Ok(None) => return Ok(None),
+            // No checkpoint holds the catalog yet.
+            Err(StorageError::Wt(e)) if e.is_missing_table() => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut check = self.check_collection_in(&session, db, coll)?;
+        let mut listed = Vec::new();
+        for (name, key_spec, opts) in self.iter_indexes(&session, db, coll)? {
+            let mut e = Document::new();
+            e.insert("v", 2i32);
+            e.insert("key", Bson::Document(key_spec));
+            e.insert("name", name);
+            for (k, v) in &opts {
+                e.insert(k.clone(), v.clone());
+            }
+            listed.push(Bson::Document(e));
+        }
+        check.insert("listed", listed);
+        check.insert("options", options);
+        // The checkpoint's last operation: the highest seq across the oplog
+        // shards (and the legacy unsharded table) it holds.
+        let mut last: Option<(i64, Vec<u8>)> = None;
+        let tables = (0..OPLOG_SHARDS)
+            .map(oplog_shard_name)
+            .chain(std::iter::once(OPLOG_TABLE.to_string()));
+        for table in tables {
+            let cur = match session.open_cursor(&table, None) {
+                Ok(c) => c,
+                Err(e) if e.is_missing_table() => continue,
+                Err(e) => return Err(e.into()),
+            };
+            if cur.prev()? {
+                let seq = cur.get_key_q()?;
+                if last.as_ref().is_none_or(|(s, _)| seq > *s) {
+                    last = Some((seq, cur.get_value_u()?));
+                }
+            }
+        }
+        if let Some((_, blob)) = last {
+            if let Ok(Some(Bson::Timestamp(ts))) = decode_doc(&blob).map(|d| d.get("ts").cloned()) {
+                check.insert("readTimestamp", ts);
+            }
+        }
+        Ok(Some(check))
+    }
+
+    fn check_collection_in(&self, session: &Session, db: &str, coll: &str) -> Result<Document> {
         let descs: Vec<IndexDesc> = self
-            .index_descs(&session, db, coll)?
+            .index_descs(session, db, coll)?
             .into_iter()
             .filter(|d| !d.id_claim && d.name != ID_INDEX_NAME)
             .collect();
@@ -14520,9 +14801,9 @@ impl Storage {
         let mut keys: HashMap<String, i64> = HashMap::new();
         let mut ids: HashSet<Vec<u8>> = HashSet::new();
         let (mut records, mut undecodable, mut id_missing) = (0i64, 0i64, 0i64);
-        for (recordid, id_key, blob) in self.scan_docs(&session, db, coll)? {
+        for (recordid, id_key, blob) in self.scan_docs(session, db, coll)? {
             records += 1;
-            if self.doc_recordid(&session, db, coll, &id_key)? != Some(recordid) {
+            if self.doc_recordid(session, db, coll, &id_key)? != Some(recordid) {
                 id_missing += 1;
             }
             ids.insert(id_key);
@@ -14547,7 +14828,7 @@ impl Storage {
             }
         }
         let mut actual: HashMap<String, HashSet<Vec<u8>>> = HashMap::new();
-        for (name, packed) in self.collect_entry_rows(&session, db, coll)? {
+        for (name, packed) in self.collect_entry_rows(session, db, coll)? {
             actual.entry(name).or_default().insert(packed);
         }
         // The `_id` index: an entry whose document is gone.
@@ -15836,7 +16117,14 @@ impl Storage {
                 }
             }
         }
-        let mut found: Vec<Vec<String>> = vec![Vec::new(); key_spec.len()];
+        // What the catalog records, which never shrinks, then what the
+        // documents hold now (a store written before RM-055 records none).
+        let mut found: Vec<Vec<String>> = self
+            .iter_indexes(session, db, coll)?
+            .into_iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, _, opts)| stored_multikey_paths(&opts, key_spec))
+            .unwrap_or_else(|| vec![Vec::new(); key_spec.len()]);
         for (_recordid, _id_k, blob) in self.scan_docs(session, db, coll)? {
             let d = decode_doc(&blob)?;
             for (field, parts) in key_spec.keys().zip(found.iter_mut()) {
@@ -19452,6 +19740,7 @@ fn index_event_spec(payload: &Document, name: &str) -> Document {
                     | "geoKeys"
                     | "pythonKeys"
                     | "buildSeq"
+                    | "multikeyPaths"
             ) {
                 spec.insert(k.clone(), v.clone());
             }
