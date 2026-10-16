@@ -353,21 +353,32 @@ one beside it.
   PostgreSQL's quicksort. So does a `SELECT DISTINCT` of bare columns
   (a HashAggregate over the select list), and both under a WHERE, whose
   rows and groups are estimated with the planner's default selectivities
-  (`filter_selectivity`: equality, `<>`, ranges, `IN`, AND, OR). 27 of 28
-  shapes match 15.19 exactly. Not yet:
-  - The planner's path comparison. With few rows estimated (6, from a
-    two-sided range on a primary key) a Sort + Group costs within the 1%
-    fuzz of a HashAggregate and wins on startup cost, so PostgreSQL's
-    groups come out sorted; and a LIMIT with no ORDER BY over a key an
-    index leads reads the index (that shape is declined here, keeping the
-    old order). Both need `cost_agg` / `cost_sort` / `cost_group`, the
-    scans' costs and `add_path`'s fuzzy comparison.
+  (`filter_selectivity`: equality, `<>`, ranges, `IN`, AND, OR). And the
+  choice between that HashAggregate and a Sort + Group (or a Unique) is
+  PostgreSQL's (`secantus-pgplan/src/costsize.rs`, 2026-10-16): the
+  cheapest scan priced as a sequential, bitmap heap or index scan (the
+  heap's real pages, `btcostestimate`, Mackert-Lohman), `cost_sort`,
+  `cost_group`, `cost_agg`, and `add_path`'s 1% fuzz, under which the
+  sorted path's order wins a tie; a GROUP BY holding the whole primary key
+  groups by it alone; an ORDER BY over the group keys moves them first;
+  an aggregate with DISTINCT or its own ORDER BY is never hashed; and
+  under a LIMIT with no ORDER BY a Group over an index scan in the keys'
+  order is weighed too, by the cost of the first rows the LIMIT takes.
+  186 of 186 shapes match 15.19 at 40, 300 and 3,000 rows. Not yet:
+  - An `OR` in the WHERE (a BitmapOr path), which keeps the HashAggregate
+    unpriced (and is declined under a LIMIT); a DISTINCT with an ORDER BY,
+    whose sort is not weighed; an ORDER BY with a LIMIT.
   - A WHERE with a pattern, `IS NULL` or an expression (declined).
   - GROUP BY an expression, over a join or a subquery, and past about
-    50,000 estimated groups, where the planner weighs a sort instead.
+    50,000 estimated groups, where the HashAggregate's spilling is priced.
+  - A table whose rows are not text, bytea or fixed width (numeric, arrays,
+    json): its heap pages are taken at the estimated density.
   - DISTINCT ON, and a citext DISTINCT, which PostgreSQL sorts.
   - The heap's order after UPDATE or DELETE (rows the hash table reads in
-    another order); a table someone ran ANALYZE on (statistics).
+    another order). A table VACUUM or ANALYZE measured (its statistics,
+    `relallvisible`) is declined, keeping the old order; the size CREATE
+    INDEX records is modelled (`__sql_relstats__`), but not REINDEX's,
+    CLUSTER's or an ALTER TABLE that builds an index, nor across RENAME.
   - Joins: whether a cursor declared without SCROLL scans backward over a
     join under ORDER BY (`ExecSupportsBackwardScan`; `cursor_scroll.rs`
     reads every other shape from the statement): `select * from t join u on
@@ -378,7 +389,7 @@ one beside it.
     costing.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_few_estimated_rows_group_by_sorting, tests/backlog/test_rust_postgres_gaps.py::test_join_cursor_ordered_by_its_key_cannot_scroll
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_join_cursor_ordered_by_its_key_cannot_scroll
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

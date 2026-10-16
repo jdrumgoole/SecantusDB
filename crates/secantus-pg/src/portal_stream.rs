@@ -101,6 +101,10 @@ fn run_on_reader(job: Job) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The rows past which a DISTINCT with no ORDER BY is streamed (sorted)
+/// rather than held whole for the HashAggregate's order.
+const STREAM_DISTINCT_ROWS: usize = 200_000;
+
 impl PgHandler {
     /// Set by an extended Execute before it runs its statement: may the
     /// SELECT it plans be streamed? (`STREAM_*`; armed after planning, for a
@@ -382,6 +386,20 @@ impl PgHandler {
         };
         match &sel.distinct {
             secantus_pgplan::Distinct::None => Some((sel.order.clone(), None)),
+            // A DISTINCT with no ORDER BY comes out in the HashAggregate's
+            // order, which the materialised path reproduces (RP-028); a
+            // sort would hand back the rows ordered. Streamed only past the
+            // size where holding the rows costs more than the order is
+            // worth.
+            secantus_pgplan::Distinct::All
+                if sel.order.is_empty()
+                    && self
+                        .storage
+                        .count_matching(self.db(), &sel.table, &Document::new(), None)
+                        .is_ok_and(|n| n <= STREAM_DISTINCT_ROWS) =>
+            {
+                None
+            }
             secantus_pgplan::Distinct::All => {
                 // The identity is the stored value, except for a tsvector /
                 // tsquery, whose output the materialised path reassembles
