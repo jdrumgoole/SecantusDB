@@ -1149,8 +1149,19 @@ pub(crate) fn count(q: &Query, catalog: &[Rc<IndexInfo>]) -> Node {
     Node::Count(Box::new(node))
 }
 
-/// The plan for `distinct` on `key`.
-pub(crate) fn distinct(q: &Query, catalog: &[Rc<IndexInfo>], key: &str) -> Node {
+/// The plan for `distinct` on `key`. `asked`: the command gave a query, empty
+/// or not once normalised.
+///
+/// mongod 8.2.11's rules (measured 2026-10-16):
+/// - a query whose normal form is empty (`{$and: [{}]}`) is still a query:
+///   nothing bounds an index, and it scans the collection;
+/// - with a query, an index on which the key is multikey serves no
+///   DISTINCT_SCAN: its keys are the array's elements, where the query
+///   selects documents;
+/// - an index with a collation holds collation keys, which cannot be read
+///   back as values: its DISTINCT_SCAN fetches the first document of each
+///   key, and nothing is projected.
+pub(crate) fn distinct(q: &Query, catalog: &[Rc<IndexInfo>], key: &str, asked: bool) -> Node {
     if never(q) {
         return Node::Eof("predicateEvalsToFalse");
     }
@@ -1166,20 +1177,28 @@ pub(crate) fn distinct(q: &Query, catalog: &[Rc<IndexInfo>], key: &str) -> Node 
     if matches!(express, Node::Express { .. }) || matches!(q.hint, Hint::Natural(_)) {
         return express;
     }
-    let scan_of_key = |ix: IxScan, width: usize| Node::Projection {
-        name: if key.contains('.') {
-            "PROJECTION_DEFAULT"
-        } else {
-            "PROJECTION_COVERED"
-        },
-        spec: if key == "_id" {
-            doc! { "_id": 1 }
-        } else {
-            doc! { "_id": 0, key: 1 }
-        },
-        input: Box::new(Node::DistinctScan(ix, width, false)),
+    let scan_of_key = |ix: IxScan, width: usize| {
+        if ix.index.collation.is_some() {
+            return Node::DistinctScan(ix, width, true);
+        }
+        Node::Projection {
+            name: if key.contains('.') {
+                "PROJECTION_DEFAULT"
+            } else {
+                "PROJECTION_COVERED"
+            },
+            spec: if key == "_id" {
+                doc! { "_id": 1 }
+            } else {
+                doc! { "_id": 0, key: 1 }
+            },
+            input: Box::new(Node::DistinctScan(ix, width, false)),
+        }
     };
     let parts = clauses(q.canonical);
+    if parts.is_empty() && asked {
+        return wrap(access(&bare, catalog), &bare);
+    }
     if parts.is_empty() {
         let hinted = |ix: &&Rc<IndexInfo>| match &q.hint {
             Hint::Index(name) => &ix.name == name,
@@ -1200,7 +1219,9 @@ pub(crate) fn distinct(q: &Query, catalog: &[Rc<IndexInfo>], key: &str) -> Node 
         let position = found.index.as_ref().and_then(|ix| ix.position(key));
         match (&found.scan, position, &found.fetch_filter) {
             (Node::IxScan(ix), Some(pos), None)
-                if ix.filter.is_none() && !collation_differs(&ix.index, q.collation) =>
+                if ix.filter.is_none()
+                    && !collation_differs(&ix.index, q.collation)
+                    && ix.index.multikey_paths.get(pos).is_none_or(Vec::is_empty) =>
             {
                 scan_of_key(ix.clone(), pos + 1)
             }

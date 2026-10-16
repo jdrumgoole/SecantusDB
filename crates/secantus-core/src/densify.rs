@@ -13,12 +13,11 @@
 //! The arithmetic mirrors Python exactly: the cursor is an int while `lo`/`step`
 //! are ints (so `int + int` stays int) and widens to f64 once a float enters,
 //! and `_densify_canon` collapses an integer-valued float filler back to an int.
-//! Partition grouping and the `existing_values` membership reproduce Python's
-//! dict / set semantics (`1 == 1.0 == True` collide) via the shared `group::GKey`
-//! and `numeric::NumVal`.
+//! Partitions are keyed by the shared `group::GKey`. Every bounds mode runs
+//! mongod's own `$_internalDensify` state machine over the input in mongod's
+//! order (`full_partitioned` / `range_partitioned`).
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
 
 use bson::{Bson, Document};
 
@@ -169,84 +168,149 @@ pub fn densify_stage(spec: &Bson, docs: &[Document]) -> R<Vec<Document>> {
         Some(_) => return Err(Fallback::Defer),
     };
 
-    if !partition_fields.is_empty()
-        && matches!(range_spec.get("bounds"), Some(Bson::String(b)) if b == "full")
-    {
+    if matches!(range_spec.get("bounds"), Some(Bson::String(b)) if b == "full") {
         return full_partitioned(field, docs, step, &partition_fields);
     }
 
-    // Partition the docs (insertion-ordered), keyed like Python's dict.
-    let mut order: Vec<Vec<Option<GKey>>> = Vec::new();
-    let mut index: HashMap<Vec<Option<GKey>>, usize> = HashMap::new();
-    let mut groups: Vec<Vec<&Document>> = Vec::new();
-    for d in docs {
-        let key = partition_key(d, &partition_fields)?;
-        let idx = match index.get(&key) {
-            Some(i) => *i,
-            None => {
-                let i = groups.len();
-                index.insert(key.clone(), i);
-                order.push(key);
-                groups.push(Vec::new());
-                i
+    // mongod runs the other two modes as `{$sort: {<partition fields>: 1,
+    // <field>: 1}}` followed by `$_internalDensify` (its explain shows the
+    // SORT, measured 8.2.11, 2026-10-16), so the partitions come out in the
+    // order of their key and each one in the order of its field.
+    let mut sort_spec = Document::new();
+    for f in &partition_fields {
+        sort_spec.insert((*f).to_string(), 1);
+    }
+    sort_spec.insert(field.clone(), 1);
+    let sorted = crate::aggregate::sort_stage(docs.to_vec(), &Bson::Document(sort_spec))?;
+    range_partitioned(field, &sorted, step, bounds_pair, &partition_fields)
+}
+
+/// `bounds: "partition"` or explicit `[lo, hi]` bounds, over documents already
+/// sorted by the partition fields and then the field. A transcription of
+/// mongod 8.2's `DocumentSourceInternalDensify` for those cases
+/// (`src/mongo/db/pipeline/document_source_densify.cpp`): each partition
+/// remembers the last value on its step grid; a document above the next grid
+/// value has the grid values below it generated first; a document with the
+/// field missing or null passes through. With explicit bounds a partition's
+/// first document above `lo` starts the grid at `lo`, nothing is generated at
+/// or above `hi`, and when the input is exhausted every partition is filled on
+/// to `hi` -- in the order the partitions were first seen, where mongod's is a
+/// hash table's and varies between runs. Without partition fields an explicit
+/// range is filled even over no documents.
+fn range_partitioned(
+    field: &str,
+    sorted: &[Document],
+    step: Num,
+    range: Option<(Num, Num)>,
+    partition_fields: &[&str],
+) -> R<Vec<Document>> {
+    let less = |a: Num, b: Num| cmp(a, b) == Some(Ordering::Less);
+    let equal = |a: Num, b: Num| cmp(a, b) == Some(Ordering::Equal);
+    let sub = |a: Num| match (a, step) {
+        (Num::Int(x), Num::Int(y)) => Num::Int(x - y),
+        (x, y) => Num::Float(to_f64(x) - to_f64(y)),
+    };
+    let mut generated = 0usize;
+    let mut filler = |carry: &Document, v: Num| -> R<Document> {
+        generated += 1;
+        if generated > MAX_FILLERS {
+            return Err(Fallback::Defer);
+        }
+        let mut d = carry.clone();
+        d.insert(field.to_string(), canon_to_bson(v)?);
+        Ok(d)
+    };
+    // Per partition, in the order first seen: its key, the partition values
+    // a filler carries, and the last value on its grid.
+    let mut table: Vec<(Vec<Option<GKey>>, Document, Num)> = Vec::new();
+    if let (Some((lo, _)), true) = (range, partition_fields.is_empty()) {
+        table.push((Vec::new(), Document::new(), sub(lo)));
+    }
+    let mut out: Vec<Document> = Vec::new();
+    for d in sorted {
+        let x = match paths::get_path(d, field) {
+            None | Some(Bson::Null) => {
+                out.push(d.clone());
+                continue;
+            }
+            Some(v) => num_of(v).ok_or(Fallback::Defer)?,
+        };
+        let key = partition_key(d, partition_fields)?;
+        let carry = carry_of(d, partition_fields)?;
+        let (at, last) = match table.iter().position(|(k, _, _)| *k == key) {
+            // `checkFirstDocAgainstRangeStart`.
+            None => match range {
+                Some((lo, _)) if less(lo, x) => {
+                    table.push((key, carry.clone(), lo));
+                    (table.len() - 1, sub(lo))
+                }
+                _ => {
+                    table.push((key, carry, x));
+                    out.push(d.clone());
+                    continue;
+                }
+            },
+            Some(at) => {
+                let mut last = table[at].2;
+                if let Some((lo, hi)) = range {
+                    if !less(last, hi) {
+                        out.push(d.clone());
+                        continue;
+                    }
+                    if less(last, lo) {
+                        last = sub(lo);
+                    }
+                }
+                if less(x, last) {
+                    out.push(d.clone());
+                    continue;
+                }
+                (at, last)
             }
         };
-        groups[idx].push(d);
-    }
-
-    // No input docs but explicit bounds: fill the whole range, no partition keys.
-    if docs.is_empty() {
-        return match bounds_pair {
-            Some((lo, hi)) => fill_range(field, lo, hi, step, &Document::new()),
-            None => Ok(Vec::new()),
-        };
-    }
-
-    let mut out: Vec<Document> = Vec::new();
-    for key in &order {
-        let part = &groups[index[key]];
-        // A doc whose densify field is missing or null does NOT participate:
-        // mongod emits it unchanged and it contributes neither a bound nor a
-        // step. Null sorts before every number, so those lead the output.
-        //
-        // This used to defer the whole stage on any such doc, with a comment
-        // saying "Python sort raises" — which it did, with a bare TypeError
-        // that escaped as "internal server error". Both sides are fixed
-        // together; a non-numeric, non-date value still defers so the Python
-        // engine can raise mongod's typed 5733201.
-        let mut keyed: Vec<(Num, &Document)> = Vec::with_capacity(part.len());
-        for d in part {
-            match paths::get_path(d, field) {
-                None | Some(Bson::Null) => out.push((*d).clone()),
-                Some(v) => match num_of(v) {
-                    Some(num) => keyed.push((num, d)),
-                    None => return Err(Fallback::Defer), // non-numeric/date -> Python raises 5733201
-                },
+        // `handleNeedGen`.
+        let mut next = add(last, step);
+        if let Some((lo, _)) = range {
+            if less(next, lo) {
+                next = lo;
             }
         }
-        if keyed.is_empty() {
+        let past_end = range.is_some_and(|(_, hi)| !less(next, hi));
+        if !less(next, x) || past_end {
+            if equal(x, next) {
+                table[at].2 = x;
+            }
+            out.push(d.clone());
             continue;
         }
-        keyed.sort_by(|(a, _), (b, _)| cmp(*a, *b).unwrap_or(Ordering::Equal));
-
-        // A filler past the last document carries that document's partition
-        // values; one before a document carries that document's (see
-        // `densify_partition`).
-        let carry = carry_of(keyed[keyed.len() - 1].1, &partition_fields)?;
-
-        let (lo, hi) = match bounds_pair {
-            Some((l, h)) => (l, h),
-            None => (keyed[0].0, keyed[keyed.len() - 1].0),
+        let max = match range {
+            Some((_, hi)) if !less(x, hi) => hi,
+            _ => x,
         };
-        out.extend(densify_partition(
-            field,
-            &keyed,
-            lo,
-            hi,
-            step,
-            &carry,
-            &partition_fields,
-        )?);
+        let mut v = next;
+        while less(v, max) {
+            out.push(filler(&carry, v)?);
+            table[at].2 = v;
+            v = add(v, step);
+        }
+        if equal(x, add(table[at].2, step)) {
+            table[at].2 = x;
+        }
+        out.push(d.clone());
+    }
+    // `finishDensifyingPartitionedInputHelper`, explicit bounds only: each
+    // partition on to `hi`, exclusive.
+    if let Some((lo, hi)) = range {
+        for (_, carry, last) in &table {
+            let mut v = add(*last, step);
+            if less(*last, lo) {
+                v = lo;
+            }
+            while less(v, hi) {
+                out.push(filler(carry, v)?);
+                v = add(v, step);
+            }
+        }
     }
     Ok(out)
 }
@@ -418,69 +482,6 @@ fn partition_key(doc: &Document, fields: &[&str]) -> R<Vec<Option<GKey>>> {
     Ok(key)
 }
 
-fn fill_range(field: &str, lo: Num, hi: Num, step: Num, carry: &Document) -> R<Vec<Document>> {
-    let mut out = Vec::new();
-    let mut cursor = lo;
-    while cmp(cursor, hi) == Some(Ordering::Less) {
-        if out.len() >= MAX_FILLERS {
-            return Err(Fallback::Defer);
-        }
-        let mut filler = carry.clone();
-        filler.insert(field.to_string(), canon_to_bson(cursor)?);
-        out.push(filler);
-        cursor = add(cursor, step);
-    }
-    Ok(out)
-}
-
-fn densify_partition(
-    field: &str,
-    keyed: &[(Num, &Document)],
-    lo: Num,
-    hi: Num,
-    step: Num,
-    carry: &Document,
-    partition_fields: &[&str],
-) -> R<Vec<Document>> {
-    let existing: HashSet<NumVal> = keyed.iter().map(|(n, _)| numval(*n)).collect();
-    let mut out: Vec<Document> = Vec::new();
-    let mut cursor = lo;
-    let mut iter = keyed.iter();
-    let mut next = iter.next();
-    while cmp(cursor, hi) == Some(Ordering::Less) {
-        if out.len() >= MAX_FILLERS {
-            return Err(Fallback::Defer);
-        }
-        if let Some((nval, ndoc)) = next {
-            if numeric::eq(&numval(*nval), &numval(cursor)) {
-                out.push((*ndoc).clone());
-                next = iter.next();
-                cursor = add(cursor, step);
-                continue;
-            }
-        }
-        if !existing.contains(&numval(cursor)) {
-            // The partition values are those of the document the filler
-            // leads up to. They can differ within one partition under a
-            // collation: between `"a"` and `"A"` mongod writes `"A"`
-            // (measured 8.2.11, 2026-10-10).
-            let mut filler = match next {
-                Some((_, upcoming)) => carry_of(upcoming, partition_fields)?,
-                None => carry.clone(),
-            };
-            filler.insert(field.to_string(), canon_to_bson(cursor)?);
-            out.push(filler);
-        }
-        cursor = add(cursor, step);
-    }
-    // Originals at or beyond `hi` must still appear.
-    while let Some((_, ndoc)) = next {
-        out.push((*ndoc).clone());
-        next = iter.next();
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,6 +611,93 @@ mod tests {
             );
             assert_eq!(out[1], doc! {"a": {"b": 1}, "v": 1}, "{bounds}");
         }
+    }
+
+    fn pv(out: &[Document]) -> Vec<(String, i32)> {
+        out.iter()
+            .map(|d| (d.get_str("p").unwrap().to_string(), d.get_i32("v").unwrap()))
+            .collect()
+    }
+
+    fn pv_docs(rows: &[(&str, i32)]) -> Vec<Document> {
+        rows.iter().map(|(p, v)| doc! {"p": *p, "v": *v}).collect()
+    }
+
+    /// mongod 8.2.11 (2026-10-16): partitions in key order, each by value.
+    #[test]
+    fn partition_bounds_emit_in_partition_order() {
+        let out = run(
+            bson::bson!({"field": "v", "partitionByFields": ["p"],
+                         "range": {"step": 1, "bounds": "partition"}}),
+            pv_docs(&[("c", 0), ("a", 3), ("c", 2), ("b", 1), ("a", 0)]),
+        );
+        let want = [
+            ("a", 0),
+            ("a", 1),
+            ("a", 2),
+            ("a", 3),
+            ("b", 1),
+            ("c", 0),
+            ("c", 1),
+            ("c", 2),
+        ];
+        assert_eq!(
+            pv(&out),
+            want.iter()
+                .map(|(p, v)| (p.to_string(), *v))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// mongod 8.2.11 (2026-10-16), `bounds: [-3, 4]`, step 2: off-grid
+    /// documents keep their place, the grid starts at `lo`, and the tail up
+    /// to `hi` comes after every document (mongod's tail order is a hash
+    /// table's; this one is the partitions' first-seen order).
+    #[test]
+    fn explicit_bounds_follow_mongods_state_machine() {
+        let out = run(
+            bson::bson!({"field": "v", "partitionByFields": ["p"],
+                         "range": {"step": 2, "bounds": [-3, 4]}}),
+            pv_docs(&[("c", 0), ("a", 3), ("c", 2), ("a", 0), ("a", 7)]),
+        );
+        let want = [
+            ("a", -3),
+            ("a", -1),
+            ("a", 0),
+            ("a", 1),
+            ("a", 3),
+            ("a", 7),
+            ("c", -3),
+            ("c", -1),
+            ("c", 0),
+            ("c", 1),
+            ("c", 2),
+            ("c", 3),
+        ];
+        assert_eq!(
+            pv(&out),
+            want.iter()
+                .map(|(p, v)| (p.to_string(), *v))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// No partitions, an off-grid value: it is emitted in its place.
+    #[test]
+    fn an_off_grid_value_keeps_its_place() {
+        let out = run(
+            bson::bson!({"field": "v", "range": {"step": 1, "bounds": "full"}}),
+            vec![doc! {"v": 0}, doc! {"v": 2.5}, doc! {"v": 4}],
+        );
+        let vals: Vec<f64> = out
+            .iter()
+            .map(|d| match d.get("v").unwrap() {
+                Bson::Int32(i) => *i as f64,
+                Bson::Double(f) => *f,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(vals, vec![0.0, 1.0, 2.0, 2.5, 3.0, 4.0]);
     }
 
     #[test]

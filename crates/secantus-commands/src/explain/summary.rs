@@ -105,7 +105,7 @@ pub(crate) fn plan_summary(request: &Document, ctx: &CommandContext) -> Option<S
     let node = match &s.kind {
         Kind::Find => plan::plan(&q, &catalog),
         Kind::Count => plan::count(&q, &catalog),
-        Kind::Distinct(key) => plan::distinct(&q, &catalog, key),
+        Kind::Distinct(key) => plan::distinct(&q, &catalog, key, !s.filter.is_empty()),
         _ => return None,
     };
     let mut out = Vec::new();

@@ -34,7 +34,7 @@ def _dbpointer_doc(key: str) -> RawBSONDocument:
     return RawBSONDocument(struct.pack("<i", 4 + len(elem) + 1) + elem + b"\x00")
 
 
-@pytest.mark.backlog("RM-120")
+@pytest.mark.backlog_fixed("RM-120")
 def test_regex_over_1000_characters(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 compiles a 1001-character pattern and matches it."""
     s = "a" * 1001
@@ -62,7 +62,7 @@ def test_push_sort_over_non_sortable_elements(rust_mongo: Any, mongod: Any) -> N
     assert answers[0] == answers[1]
 
 
-@pytest.mark.backlog("RM-124")
+@pytest.mark.backlog_fixed("RM-124")
 def test_to_hashed_index_key(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 evaluates `$toHashedIndexKey`. (Its `$group` `$bitAnd` /
     `$bitOr` / `$bitXor` accumulators are still `15952 unknown group operator`

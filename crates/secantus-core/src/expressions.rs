@@ -954,6 +954,7 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$type" => op_type(arg, ctx),
         "$isNumber" => op_is_number(arg, ctx),
         "$isArray" => op_is_array(arg, ctx),
+        "$toHashedIndexKey" => op_to_hashed_index_key(arg, ctx),
         "$strcasecmp" => op_strcasecmp(arg, ctx),
         "$replaceOne" => op_replace(arg, ctx, false),
         "$replaceAll" => op_replace(arg, ctx, true),
@@ -1121,6 +1122,7 @@ pub const KNOWN_EXPR_OPS: &[&str] = &[
     "$type",
     "$isNumber",
     "$isArray",
+    "$toHashedIndexKey",
     "$strcasecmp",
     "$replaceOne",
     "$replaceAll",
@@ -6453,7 +6455,15 @@ fn base64_encode(bytes: &[u8]) -> String {
 // neither engine compiles, or a backtrack-limit error, defers.
 
 /// Compile `{regex, options?}` from an already-validated (input-is-string) spec.
-fn compile_regex(spec: &Document, ctx: &Ctx) -> Result<regexutil::CompiledRegex, Fallback> {
+///
+/// A pattern PCRE refuses is mongod's `51111 Invalid Regex in <op>: <PCRE's
+/// message>` (measured 8.2.11, 2026-10-16, for a pattern over the length limit
+/// and for an unclosed group); one the checker does not recognise still defers.
+fn compile_regex(
+    spec: &Document,
+    ctx: &Ctx,
+    op: &str,
+) -> Result<regexutil::CompiledRegex, Fallback> {
     let pattern = match spec.get("regex") {
         Some(e) => eval(e, ctx)?,
         None => return Err(Fallback::Defer), // Python `_resolve_regex` raises
@@ -6462,7 +6472,26 @@ fn compile_regex(spec: &Document, ctx: &Ctx) -> Result<regexutil::CompiledRegex,
         Some(e) => Some(eval(e, ctx)?),
         None => None,
     };
-    regexutil::compile(&pattern, options.as_ref()).map_err(|_| Fallback::Defer)
+    regexutil::compile(&pattern, options.as_ref()).map_err(|_| {
+        let pat = match &pattern {
+            Bson::String(s) => Some(s.as_str()),
+            Bson::RegularExpression(r) => Some(r.pattern.as_str()),
+            _ => None,
+        };
+        // mongod compiles a CONSTANT regex while it optimizes the pipeline,
+        // whatever the input is, so the refusal is reported under "Failed to
+        // optimize pipeline" rather than the executor's wrapper.
+        let vars: Vec<String> = ctx.vars.keys().cloned().collect();
+        let constant = ["regex", "options"].iter().all(|k| {
+            spec.get(*k)
+                .is_none_or(|e| crate::aggregate::is_constant_expression(e, &vars))
+        });
+        match pat.and_then(regexutil::pcre_compile_error) {
+            Some(msg) => Fallback::mongo(51111, format!("Invalid Regex in {op}: {msg}"))
+                .with_folded(constant),
+            None => Fallback::Defer,
+        }
+    })
 }
 
 /// The evaluated `input`, or `None` when it isn't a string (caller returns the
@@ -6500,7 +6529,7 @@ fn op_regex_match(arg: &Bson, ctx: &Ctx) -> R {
     let Some(s) = regex_input(spec, ctx)? else {
         return Ok(Bson::Boolean(false));
     };
-    let re = compile_regex(spec, ctx)?;
+    let re = compile_regex(spec, ctx, "$regexMatch")?;
     Ok(Bson::Boolean(re.is_match(&s)))
 }
 
@@ -6509,7 +6538,7 @@ fn op_regex_find(arg: &Bson, ctx: &Ctx) -> R {
     let Some(s) = regex_input(spec, ctx)? else {
         return Ok(Bson::Null);
     };
-    let re = compile_regex(spec, ctx)?;
+    let re = compile_regex(spec, ctx, "$regexFind")?;
     match re.find_first(&s).map_err(|_| Fallback::Defer)? {
         None => Ok(Bson::Null),
         Some(m) => Ok(regex_match_doc(m)),
@@ -6521,7 +6550,7 @@ fn op_regex_find_all(arg: &Bson, ctx: &Ctx) -> R {
     let Some(s) = regex_input(spec, ctx)? else {
         return Ok(Bson::Array(Vec::new()));
     };
-    let re = compile_regex(spec, ctx)?;
+    let re = compile_regex(spec, ctx, "$regexFindAll")?;
     let matches = re.find_all(&s).map_err(|_| Fallback::Defer)?;
     Ok(Bson::Array(
         matches.into_iter().map(regex_match_doc).collect(),
@@ -7663,6 +7692,15 @@ fn op_is_number(arg: &Bson, ctx: &Ctx) -> R {
         eval(arg, ctx)?,
         Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
     )))
+}
+
+/// `$toHashedIndexKey`: mongod's hashed-index key of the value (see
+/// [`crate::hashed`]). The argument is one expression, an array literal
+/// included: `{$toHashedIndexKey: [1]}` hashes the array `[1]`, and a missing
+/// value hashes as null (mongod 8.2.11).
+fn op_to_hashed_index_key(arg: &Bson, ctx: &Ctx) -> R {
+    let v = eval(arg, ctx)?;
+    Ok(Bson::Int64(crate::hashed::hash64(&v, is_missing(&v))))
 }
 
 /// `$isArray`: true iff the argument is an array.

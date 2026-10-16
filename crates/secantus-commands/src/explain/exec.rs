@@ -240,6 +240,32 @@ pub(crate) fn scan_rows(ix: &IxScan, env: &Env) -> Vec<usize> {
     out
 }
 
+/// What a DISTINCT_SCAN over the leading `width` fields of `ix` returns, in
+/// order: for each new value of those fields, the first entry's document and
+/// the value its key holds in the last of them (null for a document without
+/// the field, undefined for an empty array, an element of an array).
+pub(crate) fn distinct_entries(ix: &IxScan, width: usize, env: &Env) -> Vec<(usize, Bson)> {
+    let fields = ix.index.fields();
+    let Some(&(field, dir)) = width.checked_sub(1).and_then(|at| fields.get(at)) else {
+        return Vec::new();
+    };
+    let reversed = (dir < 0) != ix.backward;
+    let collation = ix.index.collation.as_ref();
+    let mut scan = Scan::new(ix, env);
+    let mut prefixes = BTreeSet::new();
+    let mut out = Vec::new();
+    while let Some(row) = scan.next_distinct(width, &mut prefixes) {
+        let key = &scan.entries[scan.pos - 1].0[width - 1];
+        let value = values_at(&env.docs[row], field)
+            .0
+            .into_iter()
+            .find(|v| directed(v, reversed, collation) == *key)
+            .unwrap_or(Bson::Null);
+        out.push((row, value));
+    }
+    out
+}
+
 /// One field's intervals in scan order: `(low, inclusive, high, inclusive)`.
 type Ranges = Vec<(Vec<u8>, bool, Vec<u8>, bool)>;
 
@@ -944,13 +970,26 @@ impl<'a> Run<'a> {
     fn stats(&self) -> Stats {
         let mut extra = self.extra.clone();
         fixed_extra(self.node, &mut extra);
+        let docs = fetched(self.node, self.returned, &mut extra).unwrap_or(self.docs);
         Stats {
             n_returned: self.returned,
             keys: self.keys,
-            docs: self.docs,
+            docs,
             extra,
             children: self.inputs.iter().map(Run::stats).collect(),
         }
+    }
+}
+
+/// A fetching DISTINCT_SCAN reads the document of each key it returns:
+/// that count, also put in its `docsExamined`. `None`: not such a stage.
+pub(crate) fn fetched(node: &Node, returned: i64, extra: &mut Document) -> Option<i64> {
+    match node {
+        Node::DistinctScan(_, _, true) => {
+            extra.insert("docsExamined", num(returned));
+            Some(returned)
+        }
+        _ => None,
     }
 }
 

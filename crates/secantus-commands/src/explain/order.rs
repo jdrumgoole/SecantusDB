@@ -836,7 +836,7 @@ pub(crate) fn count_index_use(storage: &dyn Storage, ask: &Ask, uses: Uses) {
     let node = match uses {
         Uses::Find => plan::plan(&query, &catalog),
         Uses::Count => plan::count(&query, &catalog),
-        Uses::Distinct(key) => plan::distinct(&query, &catalog, key),
+        Uses::Distinct(key) => plan::distinct(&query, &catalog, key, !ask.filter.is_empty()),
         Uses::Write {
             delete,
             multi,

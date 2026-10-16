@@ -292,7 +292,11 @@ CURATED = [
     ],
     # $densify — numeric (handled) + date-unit (defers)
     [{"$densify": {"field": "a", "range": {"step": 5, "bounds": "full"}}}],
-    [{"$densify": {"field": "a", "range": {"step": 10, "bounds": [0, 50]}}}],
+    # REMOVED 2026-10-16 (RM-157), a scope decision: explicit densify bounds
+    # now follow mongod's `$_internalDensify` in the Rust engine (an off-grid
+    # value in sorted place, `-0.0`'s run here), and the deprecated Python
+    # engine does not. What is lost: a drift check on this shape;
+    # mongod-vs-Rust coverage is the RM-157 regression test.
     [{"$densify": {"field": "a", "range": {"step": 1, "unit": "day", "bounds": "full"}}}],
     # stages that still defer (rust None -> skipped)
     [{"$sample": {"size": 2}}],
@@ -334,6 +338,30 @@ def _densify_follows_mongod_not_python(docs, spec):
     fillers leave the field out (RM-097, 2026-10-16; pinned against mongod by
     `tests/backlog/test_rm_085_112.py::test_densify_full_partitions_fill_the_whole_range`
     and the `densify.rs` unit tests)."""
+    # Since RM-157 (2026-10-16) the Rust engine also runs mongod's own
+    # `$_internalDensify` state machine, which the Python engine does not: a
+    # value off the step grid is emitted in sorted place (mongod `0, 1, 2,
+    # 2.5, 3`, not after the run), and explicit bounds fill each partition's
+    # tail after every document. Neither shape is compared any more; what is
+    # lost is a drift check on them. mongod-vs-Rust coverage is
+    # `tests/backlog/test_rm_085_112.py::test_densify_partition_bounds_emit_in_partition_order`
+    # and the `densify.rs` unit tests.
+    if isinstance(spec["range"].get("bounds"), list):
+        return True
+    step = spec["range"]["step"]
+    values = [
+        d["v"]
+        for d in docs
+        if isinstance(d.get("v"), (int, float)) and not isinstance(d.get("v"), bool)
+    ]
+    if values:
+        base = min(values)
+        if any(((v - base) / step) % 1 for v in values):
+            return True
+        # A repeated value (`2` and `2.0`): mongod emits both before the next
+        # filler, the Python engine a filler between them (measured 8.2.11).
+        if len(set(values)) != len(values):
+            return True
     if not spec.get("partitionByFields"):
         return False
     return spec["range"].get("bounds") == "full" or any("g" not in d for d in docs)
@@ -342,7 +370,8 @@ def _densify_follows_mongod_not_python(docs, spec):
 def test_densify_fuzz():
     rng = random.Random(0xDE251F)
     handled = 0
-    for _ in range(4000):
+    # 6000, not 4000: RM-157 left more shapes outside the comparison.
+    for _ in range(6000):
         docs = _densify_docs(rng)
         pipeline = [_densify_spec(rng)]
         docs = bson.decode(bson.encode({"d": docs}))["d"]

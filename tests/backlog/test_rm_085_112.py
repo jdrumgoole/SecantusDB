@@ -483,7 +483,7 @@ def test_densify_full_partitions_fill_the_whole_range(rust_mongo: Any, mongod: A
     assert got == ref
 
 
-@pytest.mark.backlog("RM-157")
+@pytest.mark.backlog_fixed("RM-157")
 def test_densify_partition_bounds_emit_in_partition_order(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 (2026-10-16): `$densify` with `bounds: "partition"`
     sorts by the partition fields and then the field, so the partitions come

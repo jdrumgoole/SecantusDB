@@ -1031,22 +1031,19 @@ A `readConcern` with an `atClusterTime` older than the oldest timestamp is
       `fromPlanCache` (which the explain module's plan and executionStats
       could supply), and work and time counters (`cpuNanos: -1`,
       `numInterruptChecks`, `workingTimeMillis`, ...) that no plan derives.
+      Measured 2026-10-16: mongod's `metrics` has 14 fields (keysExamined,
+      docsExamined, bytesRead, readingTimeMicros, workingTimeMillis,
+      hasSortStage, usedDisk, fromMultiPlanner, fromPlanCache, cpuNanos,
+      three delinquency counters, numInterruptChecks), per batch, on find,
+      aggregate, distinct, count and getMore. This server could compute the
+      key and document counts, `hasSortStage`, the working time and
+      `cpuNanos`, but not `fromPlanCache` (no plan cache), `bytesRead` /
+      `readingTimeMicros` (no WiredTiger read statistics plumbed) or
+      `numInterruptChecks` (a different mechanism).
+      **Decided 2026-10-16 (Joe):** leave it open; no stand-in values. Build
+      it when those mechanisms exist.
       Backlog-ID: RM-170
       Verify: tests/backlog/test_rm_found_2026_10_16.py::test_include_query_stats_metrics_adds_a_metrics_document
-- [ ] **RUST MongoDB server: `distinct` over a multikey index answers from
-      the documents.** mongod answers a `distinct` its planner gives a
-      DISTINCT_SCAN (the explain module already says when) from the index
-      keys, each array key unwound once, so `[8, [9]]` gives `9` where a
-      collection scan gives `[9]`.
-      Backlog-ID: RM-171
-      Verify: tests/backlog/test_rm_found_2026_10_16.py::test_distinct_over_a_multikey_index
-- [ ] **RUST MongoDB server: `distinct` through a collated index keeps
-      `null`.** Under a collation the DISTINCT_SCAN cannot read values back
-      from the keys, so mongod fetches one document per index key, the first
-      in index order: a null key whose first document lacks the field leaves
-      `null` out. The same mechanism as RM-171.
-      Backlog-ID: RM-172
-      Verify: tests/backlog/test_rm_found_2026_10_16.py::test_distinct_through_a_collated_index_leaves_out_null
 
 ### 7.077 `update` and `findAndModify` -- 2026-10-12
 
@@ -1408,18 +1405,6 @@ What is left, there and beside it:
       Backlog-ID: RM-095
       Verify: tests/backlog/test_rm_085_112.py::test_five_collation_types_are_accepted
 
-- [ ] **RUST MongoDB server: `$densify` with `partitionByFields` and
-      `bounds: "partition"` or explicit bounds emits partitions in the order
-      first seen.** mongod 8.2.11 sorts by the partition fields and then the
-      field, so they come out in key order (the documents and fillers are the
-      same). With explicit bounds mongod also fills each partition's tail
-      after the last document, in its partition table's hash order, which
-      varies between runs. `bounds: "full"` is transcribed from mongod's
-      `DocumentSourceInternalDensify` (`densify.rs::full_partitioned`); the
-      other two modes could run through the same state machine. Found
-      2026-10-16.
-      Backlog-ID: RM-157
-      Verify: tests/backlog/test_rm_085_112.py::test_densify_partition_bounds_emit_in_partition_order
 
 ### 7.069 A WiredTiger panic opening a store, in CI on macOS -- 2026-10-10
 
@@ -1702,15 +1687,6 @@ race on demand, which is worth having if this area changes again.
   the storage router reads it.
   Backlog-ID: RM-119
   Verify: none -- performance (router COLLSCAN); results correct and explain reports mongod's plan
-- [ ] **Regex patterns over 1000 characters are capped on both servers** (from
-  the removed "Query `$regex`" record). `crates/secantus-core/src/regexutil.rs`
-  `MAX_REGEX_PATTERN_LEN = 1000` (mirroring `secantus.query._MAX_REGEX_PATTERN_LEN`,
-  a ReDoS mitigation for Python's `re`) makes a longer pattern fail to compile
-  (`Err(())`, which defers, i.e. an error on the Rust server). mongod's own
-  limit has not been measured against it. Reproduce:
-  `find({x: {$regex: "a" * 1001}})` on each server and on mongod 8.2.11.
-  Backlog-ID: RM-120
-  Verify: tests/backlog/test_rm_113_138.py::test_regex_over_1000_characters
 - [ ] **One-time: configure a PyPI Trusted Publisher for `secantus-core`.**
   On PyPI, add a Trusted Publisher for the (new) `secantus-core` project pointing
   at `.github/workflows/rust-wheels.yml` (environment `pypi`), mirroring the
@@ -1750,15 +1726,15 @@ Rust-only driver-gauge failures that are deliberately not chased:
 
 ### 7.5 Remaining Rust-server feature gaps (defer audit, 2026-06-26)
 
-- [ ] **`$toHashedIndexKey` and the `$bitAnd` / `$bitOr` / `$bitXor` `$group`
-  ACCUMULATORS are absent on both servers.** (The bitwise *expression* forms
-  exist.) Not implementable blind: the mongod builds probed (7.0.12, and the
-  builds available when this was last checked) reject the accumulator form with
-  `15952 unknown group operator`, so there is nothing to probe against.
-  Implement only once a mongod that accepts them is installed — check
-  8.2.11 first.
-  Backlog-ID: RM-124
-  Verify: tests/backlog/test_rm_113_138.py::test_to_hashed_index_key
+- **Scope decision — `$densify` with explicit bounds fills each
+  partition's tail in first-seen order.** mongod 8.2.11 fills the tails at
+  the end in its hash table's order, which varied between runs (2026-10-16),
+  so there is no order to match; everything before the tails follows
+  mongod's `$_internalDensify` (RM-157).
+- **Scope decision — the `$bitAnd` / `$bitOr` / `$bitXor` `$group`
+  accumulators** are refused, as mongod 8.2.11 refuses them (`15952 unknown
+  group operator`, measured 2026-10-16). (`$toHashedIndexKey`, the rest of
+  what was RM-124, now hashes as mongod does.)
 - [ ] **A DBPointer `$min` / `$max` operand against a stored DBPointer
   defers on the Rust server** (an error there; mongod compares the two by
   namespace, then id). Against any other type a DBPointer now ranks as

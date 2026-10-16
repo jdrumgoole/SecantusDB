@@ -29,6 +29,23 @@ two.
   It was reported from the plain `_id` index.
 - **A time-series measurement inserted with no `_id` is stored without
   one**, as on mongod. It was given an ObjectId.
+- **`distinct` over a multikey or collated index answers as mongod's
+  DISTINCT_SCAN does**: from the index keys, each array unwound once, a
+  missing field as `null`, `[]` as `undefined`; through a collated index,
+  from each key's first document. It read the documents, so an array-valued
+  field came back whole and a collated index kept a `null` mongod leaves
+  out. A query over a multikey key field no longer plans a DISTINCT_SCAN.
+- **`$toHashedIndexKey`** hashes as mongod's hashed index does (MD5 of the
+  canonical type and value, numbers squashed to a 64-bit integer), checked
+  bit for bit on 137 values. It was refused.
+- **`$densify` with partitions or explicit bounds** runs mongod's own
+  `$_internalDensify`: the documents sorted by partition and field, an
+  off-grid value in its sorted place, and the tails after them.
+- **A regular expression may be up to 32,764 bytes**, as on mongod. A
+  longer one is 51091 in a query and 51111 in `$regexMatch` and its
+  siblings, which also report other invalid patterns with 51111 now. The
+  cap was 1,000 characters. A long pattern with no metacharacters is a
+  plain substring search.
 - **A `createIndexes` refused for a spec with no `name` creates
   nothing.** The collection it would have created was left behind.
 
@@ -40,6 +57,11 @@ RM-149 (tests/backlog/test_rm_geo_residuals.py::test_2dsphere_cell_levels_accept
 (tests/backlog/test_rm_found_2026_10_14.py::test_exact_duplicate_id_under_a_default_collation_names_the_collation)
 RM-089 in part
 (tests/backlog/test_rm_085_112.py::test_measurement_without_id_is_stored_without_one)
+RM-171 and RM-172 (tests/backlog/test_rm_found_2026_10_16.py::test_distinct_over_a_multikey_index,
+::test_distinct_through_a_collated_index_leaves_out_null), RM-124
+(tests/backlog/test_rm_113_138.py::test_to_hashed_index_key), RM-157
+(tests/backlog/test_rm_085_112.py::test_densify_partition_bounds_emit_in_partition_order),
+RM-120 (tests/backlog/test_rm_113_138.py::test_regex_over_1000_characters)
 and RM-029
 (tests/backlog/test_rm_029_056.py::test_roles_info_lists_roles_in_creation_order,
 ::test_a_recreated_role_goes_last_and_an_update_keeps_its_place).

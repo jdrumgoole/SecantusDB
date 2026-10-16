@@ -887,7 +887,7 @@ fn sort_fields(spec: &Bson) -> R<Vec<(String, bool)>> {
     Ok(out)
 }
 
-fn sort_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
+pub(crate) fn sort_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
     let fields = sort_fields(spec)?;
     // Materialise each doc's sort-key values once (get_path per field), and
     // bail to Python if any key holds a value `order` won't faithfully order
