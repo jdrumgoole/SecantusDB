@@ -23,6 +23,10 @@ two.
   type order against any other type, so `{$min: {a: DBPointer}}` over
   `a: 5` changes nothing, as on mongod; it was refused as "not supported".
   Two DBPointers still defer (RM-127 stays open for that).
+- **An exact duplicate `_id` in a collection with a default collation**
+  is reported as mongod reports it, from the collated `_id`: the same
+  message, `keyValue`, `hexEncoded` and `collation` as a second spelling.
+  It was reported from the plain `_id` index.
 - **A `createIndexes` refused for a spec with no `name` creates
   nothing.** The collection it would have created was left behind.
 
@@ -30,6 +34,8 @@ Fixes RM-096 (tests/backlog/test_rm_085_112.py::test_validator_reads_the_collect
 RM-149 (tests/backlog/test_rm_geo_residuals.py::test_2dsphere_cell_levels_accepted_and_listed,
 ::test_2dsphere_cell_levels_are_checked), RM-150
 (::test_refused_spec_leaves_no_created_collection), RM-127 in part
-(tests/backlog/test_rm_113_138.py::test_dbpointer_min_update_operand) and RM-029
+(tests/backlog/test_rm_113_138.py::test_dbpointer_min_update_operand), RM-142
+(tests/backlog/test_rm_found_2026_10_14.py::test_exact_duplicate_id_under_a_default_collation_names_the_collation)
+and RM-029
 (tests/backlog/test_rm_029_056.py::test_roles_info_lists_roles_in_creation_order,
 ::test_a_recreated_role_goes_last_and_an_update_keeps_its_place).

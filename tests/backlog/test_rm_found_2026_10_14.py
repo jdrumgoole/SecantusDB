@@ -51,7 +51,7 @@ def test_sasl_start_for_an_unknown_user_fails(rust_mongo: Any) -> None:
     assert got == ("err", 18, "Authentication failed.")
 
 
-@pytest.mark.backlog("RM-142")
+@pytest.mark.backlog_fixed("RM-142")
 def test_exact_duplicate_id_under_a_default_collation_names_the_collation(
     rust_mongo: Any,
 ) -> None:

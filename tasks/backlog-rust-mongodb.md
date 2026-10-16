@@ -1401,13 +1401,6 @@ What is left, there and beside it:
       residual).
       Backlog-ID: RM-095
       Verify: tests/backlog/test_rm_085_112.py::test_five_collation_types_are_accepted
-- [ ] **RUST MongoDB server: a duplicate `_id` spelled exactly the same in a
-      collection with a default collation** is reported from the plain `_id`
-      index (`index: _id_ dup key: { _id: "a" }`); mongod reports it under
-      the collation (`index: _id_ collation: { ... } dup key: ...`), as it
-      does for a second spelling. Message text only (found 2026-10-14).
-      Backlog-ID: RM-142
-      Verify: tests/backlog/test_rm_found_2026_10_14.py::test_exact_duplicate_id_under_a_default_collation_names_the_collation
 
 - [ ] **RUST MongoDB server: `$densify` with `partitionByFields` and
       `bounds: "partition"` or explicit bounds emits partitions in the order

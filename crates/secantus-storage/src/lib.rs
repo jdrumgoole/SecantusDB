@@ -9728,11 +9728,52 @@ impl Storage {
                                 errmsg = errmsg.replacen(" index: _id_ ", " ", 1);
                                 errmsg.push_str(" found value: {}");
                             }
+                            // Under a default collation mongod reports even an
+                            // exact duplicate from the collated `_id` claim, as
+                            // it does a second spelling: the same message,
+                            // `keyValue` and extra fields (RM-142, measured 8.2.11).
+                            let mut id_conflict: Option<UniqueConflict> = None;
+                            if let Some(claim) = self.id_claim_desc(&session, db, coll)? {
+                                let kb = index_key_variants_c(
+                                    &doc,
+                                    &claim.key_spec,
+                                    false,
+                                    claim.collation.as_ref(),
+                                )?
+                                .into_iter()
+                                .next();
+                                if let Some(kb) = kb {
+                                    let conflict = UniqueConflict::new(
+                                        ns.clone(),
+                                        &claim.name,
+                                        &claim.key_spec,
+                                        &doc,
+                                        &kb,
+                                        claim.collation.as_ref(),
+                                    )
+                                    .on_clustered(claim.clustered);
+                                    errmsg = conflict.errmsg();
+                                    id_conflict = Some(conflict);
+                                }
+                            }
                             ed.insert("errmsg", errmsg);
                             ed.insert("keyPattern", Bson::Document(key_pattern));
-                            ed.insert("keyValue", Bson::Document(key_value));
-                            if clustered {
-                                ed.insert("foundValue", Document::new());
+                            match id_conflict {
+                                Some(conflict) => {
+                                    ed.insert(
+                                        "keyValue",
+                                        Bson::Document(conflict.key_value.clone()),
+                                    );
+                                    if let Some(extra) = conflict.extra() {
+                                        ed.extend(extra);
+                                    }
+                                }
+                                None => {
+                                    ed.insert("keyValue", Bson::Document(key_value));
+                                    if clustered {
+                                        ed.insert("foundValue", Document::new());
+                                    }
+                                }
                             }
                             errors.push(ed);
                             if ordered {
@@ -11313,7 +11354,11 @@ impl Storage {
     ///
     /// In creation order (RM-029), then database and name.
     pub fn list_roles(&self, db: Option<&str>, skip: usize, limit: usize) -> Result<Vec<Vec<u8>>> {
-        let limit = if limit == 0 || limit > 1000 { 1000 } else { limit };
+        let limit = if limit == 0 || limit > 1000 {
+            1000
+        } else {
+            limit
+        };
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
         let mut seqs: HashMap<(String, String), i64> = HashMap::new();
@@ -11331,14 +11376,22 @@ impl Storage {
             if db.is_none() || db == Some(row_db.as_str()) {
                 let blob = cur.get_value_u()?;
                 if !blob.is_empty() {
-                    let seq = seqs.get(&(row_db.clone(), row_name.clone())).copied().unwrap_or(0);
+                    let seq = seqs
+                        .get(&(row_db.clone(), row_name.clone()))
+                        .copied()
+                        .unwrap_or(0);
                     rows.push((seq, row_db, row_name, blob));
                 }
             }
             more = cur.next()?;
         }
         rows.sort_by(|a, b| (a.0, &a.1, &a.2).cmp(&(b.0, &b.1, &b.2)));
-        Ok(rows.into_iter().skip(skip).take(limit).map(|r| r.3).collect())
+        Ok(rows
+            .into_iter()
+            .skip(skip)
+            .take(limit)
+            .map(|r| r.3)
+            .collect())
     }
 
     /// The active profile settings for `db` (`{level, slowms, sampleRate}`),
