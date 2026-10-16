@@ -2023,20 +2023,17 @@ pub enum StorageError {
 /// Map a query-engine fault to a storage error, keeping mongod's code and
 /// message when the engine named one.
 ///
-/// An error the expression evaluator raised inside a query's `$expr` is one
-/// mongod reports by when it found it (measured 8.2.11, 2026-10-16): a
-/// constant sub-expression fails while the query is optimized, as `Failed to
-/// optimize expression :: caused by :: ...`, and anything else fails per
-/// document, under the command's executor wrapper -- which `exec` asks for.
-/// Both reached the client bare.
+/// An error the expression evaluator raised per document -- inside a
+/// query's `$expr`, or a pipeline update's stage -- is reported under the
+/// command's executor wrapper, which `exec` asks for (measured 8.2.11,
+/// 2026-10-16); it reached the client bare. A constant sub-expression in a
+/// query fails before any document is read, and the command layer reports
+/// that (`argtypes::expression_problem_in_filter`).
 pub(crate) fn query_fault(fault: secantus_core::fallback::Fallback) -> StorageError {
     match fault.as_mongo() {
         Some((code, errmsg)) => StorageError::QueryError {
             code,
-            errmsg: match fault.folded_verdict() {
-                Some(true) => format!("Failed to optimize expression :: caused by :: {errmsg}"),
-                _ => errmsg.to_string(),
-            },
+            errmsg: errmsg.to_string(),
             exec: fault.is_exec() || fault.folded_verdict() == Some(false),
         },
         None => StorageError::QueryUnsupported,
