@@ -650,18 +650,6 @@ and the unit tests of `auth.rs` and `roles.rs`. The built-in roles and the
 
 What is open:
 
-- [ ] **`rolesInfo: 1` lists stored roles by name** (2): mongod lists them
-      in the order they were created. The role table is keyed by database
-      and name and holds no sequence. **Needs a decision (2026-10-16):**
-      `table:secantus_roles` is the Python server's too, so a sequence is an
-      on-disk change it reads: a field in the record shows in its
-      `rolesInfo`, and a side table it does not write goes stale when it
-      drops and recreates a role. About two hours once decided.
-      **Decided 2026-10-16 (Joe):** a side table only the Rust server
-      writes, holding each role's creation sequence. Compatibility with the
-      Python server is no longer a constraint (`CLAUDE.md`).
-      Backlog-ID: RM-029
-      Verify: tests/backlog/test_rm_029_056.py::test_roles_info_lists_roles_in_creation_order
 - [ ] **The order of a set of roles** (5): a user's `roles` after
       `grantRolesToUser`, a role's `roles` after `grantRolesToRole`, and
       the built-in roles under `showBuiltinRoles`. mongod keeps each in a

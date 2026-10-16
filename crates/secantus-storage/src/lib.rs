@@ -1336,6 +1336,12 @@ const OPLOG_META_TABLE: &str = "table:secantus_oplog_meta";
 // their shape), stored / returned verbatim across the byte seam.
 const USERS_TABLE: &str = "table:secantus_users";
 const ROLES_TABLE: &str = "table:secantus_roles";
+/// `(db, role) -> creation sequence`, written only by the Rust server
+/// (RM-029, as Joe decided on 2026-10-16): mongod's `rolesInfo` lists roles
+/// in the order they were created, and the role table, which the Python
+/// server shares, is keyed by name. A role with no row (created before this,
+/// or by the Python server) counts as 0 and keeps name order.
+const ROLE_SEQ_TABLE: &str = "table:secantus_role_seq";
 const PROFILE_TABLE: &str = "table:secantus_profile_settings";
 
 /// The synthetic `_id` index name. The `_id_` index is virtual — never stored
@@ -1909,6 +1915,7 @@ const BOOTSTRAP: &[(&str, &str)] = &[
     ("table:secantus_oplog_meta", "key_format=S,value_format=u"),
     ("table:secantus_users", "key_format=SS,value_format=u"),
     ("table:secantus_roles", "key_format=SS,value_format=u"),
+    (ROLE_SEQ_TABLE, "key_format=SS,value_format=q"),
     (
         "table:secantus_profile_settings",
         "key_format=S,value_format=u",
@@ -11262,7 +11269,30 @@ impl Storage {
     /// Persist a custom-role record (opaque BSON blob). Mirrors
     /// `storage.add_role`.
     pub fn add_role(&self, db: &str, name: &str, record: &[u8], replace: bool) -> Result<bool> {
-        self.put_ss_record(ROLES_TABLE, db, name, record, replace)
+        let existed = self.get_ss_record(ROLES_TABLE, db, name)?.is_some();
+        let written = self.put_ss_record(ROLES_TABLE, db, name, record, replace)?;
+        if written && !existed {
+            self.stamp_role_seq(db, name)?;
+        }
+        Ok(written)
+    }
+
+    /// Give a newly created role the next creation sequence.
+    fn stamp_role_seq(&self, db: &str, name: &str) -> Result<()> {
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(ROLE_SEQ_TABLE, None)?;
+        let mut last = 0i64;
+        let mut more = cur.next()?;
+        while more {
+            last = last.max(cur.get_value_q()?);
+            more = cur.next()?;
+        }
+        let put = session.open_cursor(ROLE_SEQ_TABLE, None)?;
+        put.set_key_ss(db, name);
+        put.set_value_q(last + 1);
+        put.insert()?;
+        Ok(())
     }
 
     /// Fetch a custom-role record (BSON blob) or `None`. Mirrors
@@ -11274,13 +11304,41 @@ impl Storage {
     /// Delete a custom role. Returns `false` if absent. Mirrors
     /// `storage.drop_role`.
     pub fn drop_role(&self, db: &str, name: &str) -> Result<bool> {
+        self.drop_ss_record(ROLE_SEQ_TABLE, db, name)?;
         self.drop_ss_record(ROLES_TABLE, db, name)
     }
 
     /// Paginated custom-role listing (`db = None` spans every database).
     /// Mirrors `storage.list_roles`.
+    ///
+    /// In creation order (RM-029), then database and name.
     pub fn list_roles(&self, db: Option<&str>, skip: usize, limit: usize) -> Result<Vec<Vec<u8>>> {
-        self.list_ss_records(ROLES_TABLE, db, skip, limit)
+        let limit = if limit == 0 || limit > 1000 { 1000 } else { limit };
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let session = self.conn.open_session()?;
+        let mut seqs: HashMap<(String, String), i64> = HashMap::new();
+        let sc = session.open_cursor(ROLE_SEQ_TABLE, None)?;
+        let mut more = sc.next()?;
+        while more {
+            seqs.insert(sc.get_key_ss()?, sc.get_value_q()?);
+            more = sc.next()?;
+        }
+        let cur = session.open_cursor(ROLES_TABLE, None)?;
+        let mut rows: Vec<(i64, String, String, Vec<u8>)> = Vec::new();
+        let mut more = cur.next()?;
+        while more {
+            let (row_db, row_name) = cur.get_key_ss()?;
+            if db.is_none() || db == Some(row_db.as_str()) {
+                let blob = cur.get_value_u()?;
+                if !blob.is_empty() {
+                    let seq = seqs.get(&(row_db.clone(), row_name.clone())).copied().unwrap_or(0);
+                    rows.push((seq, row_db, row_name, blob));
+                }
+            }
+            more = cur.next()?;
+        }
+        rows.sort_by(|a, b| (a.0, &a.1, &a.2).cmp(&(b.0, &b.1, &b.2)));
+        Ok(rows.into_iter().skip(skip).take(limit).map(|r| r.3).collect())
     }
 
     /// The active profile settings for `db` (`{level, slowms, sampleRate}`),

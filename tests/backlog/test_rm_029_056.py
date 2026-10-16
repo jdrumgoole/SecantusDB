@@ -60,7 +60,7 @@ def _index(key: dict, **options: Any) -> dict:
 # ===================================================== 7.083 users and roles
 
 
-@pytest.mark.backlog("RM-029")
+@pytest.mark.backlog_fixed("RM-029")
 def test_roles_info_lists_roles_in_creation_order(rust_mongo: Any) -> None:
     """mongod 8.2.11: `rolesInfo: 1` lists stored roles in the order they
     were created, not by name."""
@@ -70,6 +70,26 @@ def test_roles_info_lists_roles_in_creation_order(rust_mongo: Any) -> None:
         db.command("createRole", name, privileges=[], roles=[])
     got = mongo_answer(lambda: [r["role"] for r in db.command("rolesInfo", 1)["roles"]])
     assert got == ("ok", ["zeta", "alpha", "mid"])
+
+
+def _role_order_after_changes(client: Any) -> Any:
+    db = _fresh(client, "rm029b")
+    db.command("dropAllRolesFromDatabase")
+    for name in ["zeta", "alpha", "mid"]:
+        db.command("createRole", name, privileges=[], roles=[])
+    db.command("dropRole", "alpha")
+    db.command("createRole", "alpha", privileges=[], roles=[])
+    db.command("updateRole", "zeta", roles=[{"role": "read", "db": db.name}])
+    return mongo_answer(lambda: [r["role"] for r in db.command("rolesInfo", 1)["roles"]])
+
+
+@pytest.mark.backlog_fixed("RM-029")
+def test_a_recreated_role_goes_last_and_an_update_keeps_its_place(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """mongod 8.2.11: a role dropped and created again is listed last; an
+    updated one keeps its place."""
+    assert _role_order_after_changes(rust_mongo) == _role_order_after_changes(mongod)
 
 
 # ======================================================== 7.082 diagnostics
