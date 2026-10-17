@@ -20,7 +20,7 @@ import psycopg
 import pytest
 
 
-@pytest.mark.backlog("RP-048")
+@pytest.mark.backlog_fixed("RP-048")
 def test_a_cycle_across_lock_kinds_is_a_deadlock(rust_pg: Any) -> None:
     """PostgreSQL 15.19: the deadlock detector is one wait-for graph over
     every lock kind, so a cycle that runs through a row lock and an advisory

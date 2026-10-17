@@ -11418,6 +11418,16 @@ impl PgHandler {
         }
         let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
         let relations = secantus_pgplan::privileges::sql_relations(sql);
+        // PostgreSQL assigns a transaction its xid at its first write; the
+        // granted transactionid row `pg_locks` shows comes from that
+        // assignment. Re-assignments return the same xid.
+        if relations
+            .iter()
+            .any(|(_, p)| matches!(*p, "INSERT" | "UPDATE" | "DELETE" | "TRUNCATE"))
+        {
+            let _ =
+                secantus_pgplan::snapshots::ask_pid(pid, secantus_pgplan::snapshots::XidOp::Assign);
+        }
         let row_locked = secantus_pgplan::privileges::row_locked_tables(sql);
         let truncates: Vec<String> = relations
             .iter()
@@ -18548,6 +18558,48 @@ impl PgHandler {
                     d.insert(f("objid"), Bson::Int64(value & 0xffff_ffff));
                     d.insert(f("objsubid"), Bson::Int32(if form == 0 { 1 } else { 2 }));
                     rows.push(d);
+                }
+                // A backend with a running transaction shows its virtual xid
+                // lock; one that has written also holds an exclusive lock on
+                // its (assigned-at-first-write) transaction id. A row waiter
+                // appears as the share lock it wants on the HOLDER's
+                // transaction id, ungranted — how the wait reaches the
+                // deadlock detector on PostgreSQL (RP-047).
+                let mut in_xact: Vec<i32> = backend_registry()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .map(|(pid, entry)| {
+                        let a = entry.activity.lock().unwrap_or_else(|e| e.into_inner());
+                        (*pid, a.state)
+                    })
+                    .filter(|(_, state)| !matches!(*state, "idle" | ""))
+                    .map(|(pid, _)| pid)
+                    .collect();
+                in_xact.sort_unstable();
+                let running = xids::running();
+                for pid in in_xact {
+                    rows.push(blank("virtualxid", pid, "ExclusiveLock", true));
+                }
+                for (pid, xid) in &running {
+                    let mut d = blank("transactionid", *pid, "ExclusiveLock", true);
+                    d.insert(f("transactionid"), Bson::Int64(*xid as i64));
+                    rows.push(d);
+                }
+                for (waiter, kind, blockers) in lock_manager::waits() {
+                    if kind != lock_manager::WaitKind::TransactionId {
+                        continue;
+                    }
+                    for blocker in blockers {
+                        let Some(xid) =
+                            running.iter().find(|(p, _)| *p == blocker).map(|(_, x)| *x)
+                        else {
+                            continue;
+                        };
+                        let mut d = blank("transactionid", waiter, "ShareLock", false);
+                        d.insert(f("transactionid"), Bson::Int64(xid as i64));
+                        rows.push(d);
+                    }
                 }
                 rows
             }

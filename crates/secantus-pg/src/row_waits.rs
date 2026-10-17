@@ -154,7 +154,10 @@ pub struct Waiting {
 impl Waiting {
     pub fn new(pid: i32) -> Self {
         Self {
-            guard: crate::lock_manager::WaitGuard::new(pid),
+            guard: crate::lock_manager::WaitGuard::new(
+                pid,
+                crate::lock_manager::WaitKind::TransactionId,
+            ),
         }
     }
 
