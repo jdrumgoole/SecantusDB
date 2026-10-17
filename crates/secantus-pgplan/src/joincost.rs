@@ -304,8 +304,10 @@ pub enum JoinMethod {
     /// rows in scan order, `a` hashed, and the `a` rows nothing matched
     /// last, in the hash table's order (`ExecScanHashTableForUnmatched`).
     HashRightB,
-    /// A LEFT join with `b` outer by a merge right join: not modelled.
-    Unmodelled,
+    /// A LEFT join with `b` outer: a merge right join, each side in key
+    /// order, the `a` rows nothing matched in their key's place
+    /// (`ExecMergeJoin`'s inner fill).
+    MergeRightB { a_by_index: bool, b_by_index: bool },
     /// A plan whose rows come in both sides' scan order, `a` outer: a
     /// nested loop, or a hash join on a unique `b`.
     Other,
@@ -514,14 +516,17 @@ impl JoinRel {
         // over an outer already in order (`match_unsorted_outer`), then hash
         // joins. A LEFT join with `b` outer is a right join: a hash right
         // join returns the unmatched `a` rows last, in its hash table's
-        // order; a merge right join is not modelled. A nested loop with `a`
-        // outer emits its rows in both sides' scan order.
+        // order; a merge right join in their key's place. A nested loop with
+        // `a` outer emits its rows in both sides' scan order.
         for b_outer in [false, true] {
             let (outer, inner) = if b_outer { (b, a) } else { (a, b) };
             let right = b_outer && left;
             let merge = |oi: bool, ii: bool| {
                 if right {
-                    JoinMethod::Unmodelled
+                    JoinMethod::MergeRightB {
+                        a_by_index: ii,
+                        b_by_index: oi,
+                    }
                 } else if b_outer {
                     JoinMethod::MergeOuterB {
                         a_by_index: ii,

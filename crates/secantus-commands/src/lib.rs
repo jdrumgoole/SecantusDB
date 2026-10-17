@@ -35,6 +35,8 @@
 pub use secantus_core::bsondoc;
 
 pub mod admin;
+mod agg_executor;
+mod agg_meta;
 pub mod aggregate;
 pub mod argtypes;
 pub mod auth;

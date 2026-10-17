@@ -39,12 +39,12 @@ pub fn ok_transaction(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResu
     Ok(doc! { "ok": 1.0 })
 }
 
-/// `fsync` — flush data to disk. WiredTiger checkpoints on its own cadence, so
-/// this reports success without forcing one. `lock: true` (which would block
-/// writes until `fsyncUnlock` — needs coordination we don't have) is rejected
-/// rather than silently skipped, so backup tools relying on the lock aren't
-/// misled. Mirrors `commands.py::_fsync`.
-pub fn fsync(doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
+/// `fsync` — flush data to disk: a checkpoint, as mongod takes one, so what a
+/// background `validate` reads afterwards is the store as it is now.
+/// `lock: true` (which would block writes until `fsyncUnlock` — needs
+/// coordination we don't have) is rejected rather than silently skipped, so
+/// backup tools relying on the lock aren't misled.
+pub fn fsync(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if doc.get("lock").and_then(Bson::as_bool) == Some(true) {
         return Ok(crate::CommandError::new(
             9,
@@ -53,6 +53,9 @@ pub fn fsync(doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
         )
         .into_reply());
     }
+    ctx.storage()?
+        .checkpoint_now()
+        .map_err(crate::util::command_error)?;
     Ok(doc! { "numFiles": 1i32, "ok": 1.0 })
 }
 

@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import contextlib
+import threading
+import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -1497,6 +1500,144 @@ def test_bitmap_or_over_an_analyzed_table_is_priced(pg: Any) -> None:
 
 
 @pytest.mark.backlog_fixed("RP-028")
+def test_not_in_over_an_analyzed_table_excludes_each_value(pg: Any) -> None:
+    """PostgreSQL 15.19: `g not in (1, 2, 3)` over 300 analysed rows is
+    `<> ALL`, each value's exclusion summed (`scalararraysel`), 218 rows;
+    the 6 groups of t come out x2 x0 x3 x5 x4 x1."""
+    got = _analyzed(
+        pg,
+        "rp028_ci",
+        [
+            "create table rp028_ci (k int primary key, g int, t text)",
+            "insert into rp028_ci select i, (i * 7) % 11, 'x' || (i % 6)"
+            " from generate_series(1, 300) i",
+            "analyze rp028_ci",
+        ],
+        "select t from rp028_ci where g not in (1, 2, 3) group by t",
+    )
+    assert got == ("ok", [(t,) for t in ["x2", "x0", "x3", "x5", "x4", "x1"]])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_hashed_in_list_over_an_analyzed_table(pg: Any) -> None:
+    """PostgreSQL 15.19: an `IN` list of nine values is a hashed
+    ScalarArrayOpExpr, with a startup of one hash a value; 245 rows, and
+    the groups of t come out x2 x0 x3 x5 x4 x1."""
+    got = _analyzed(
+        pg,
+        "rp028_ci",
+        [
+            "create table rp028_ci (k int primary key, g int, t text)",
+            "insert into rp028_ci select i, (i * 7) % 11, 'x' || (i % 6)"
+            " from generate_series(1, 300) i",
+            "analyze rp028_ci",
+        ],
+        "select t from rp028_ci where g in (0, 1, 2, 3, 4, 5, 6, 7, 8) group by t",
+    )
+    assert got == ("ok", [(t,) for t in ["x2", "x0", "x3", "x5", "x4", "x1"]])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_in_list_with_a_repeated_value_counts_it_twice(pg: Any) -> None:
+    """PostgreSQL 15.19: `g in (1, 1, 2)` sums all three elements' selectivities,
+    81 rows; the groups of t come out x2 x0 x3 x5 x1 x4."""
+    got = _analyzed(
+        pg,
+        "rp028_ci",
+        [
+            "create table rp028_ci (k int primary key, g int, t text)",
+            "insert into rp028_ci select i, (i * 7) % 11, 'x' || (i % 6)"
+            " from generate_series(1, 300) i",
+            "analyze rp028_ci",
+        ],
+        "select t from rp028_ci where g in (1, 1, 2) group by t",
+    )
+    assert got == ("ok", [(t,) for t in ["x2", "x0", "x3", "x5", "x1", "x4"]])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_or_with_a_repeated_arm_keeps_it(pg: Any) -> None:
+    """PostgreSQL 15.19: `g = 1 or g = 1 or g = 2` keeps the repeated arm
+    (`process_duplicate_ors` finds no clause every arm shares), 74 rows; the
+    groups of t come out x2 x0 x3 x5 x1 x4."""
+    got = _analyzed(
+        pg,
+        "rp028_ci",
+        [
+            "create table rp028_ci (k int primary key, g int, t text)",
+            "insert into rp028_ci select i, (i * 7) % 11, 'x' || (i % 6)"
+            " from generate_series(1, 300) i",
+            "analyze rp028_ci",
+        ],
+        "select t from rp028_ci where g = 1 or g = 1 or g = 2 group by t",
+    )
+    assert got == ("ok", [(t,) for t in ["x2", "x0", "x3", "x5", "x1", "x4"]])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_null_test_on_an_indexed_column_reads_the_index(pg: Any) -> None:
+    """PostgreSQL 15.19: `g is null` over 3,000 analysed rows with an index on
+    g is a bitmap index scan on the null test, 600 rows; the 4 groups of h
+    come out 0 1 3 2."""
+    got = _analyzed(
+        pg,
+        "rp028_cn",
+        [
+            "create table rp028_cn (k int primary key, g int, h int)",
+            "create index rp028_cn_g on rp028_cn (g)",
+            "insert into rp028_cn select i, case when i % 5 = 0 then null"
+            " else (i * 3) % 7 end, i % 4 from generate_series(1, 3000) i",
+            "analyze rp028_cn",
+        ],
+        "select h from rp028_cn where g is null group by h",
+    )
+    assert got == ("ok", [(h,) for h in [0, 1, 3, 2]])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_bitmap_or_arm_on_two_columns_is_a_bitmap_and(pg: Any) -> None:
+    """PostgreSQL 15.19: `(g = 1 and k < 100) or k > 9000` over 10,000 analysed
+    rows reads a BitmapOr whose first arm is a BitmapAnd of both indexes
+    (`choose_bitmap_and`), 1,008 rows; the groups of t come out x2 x0 x3
+    x5 x4 x1."""
+    got = _analyzed(
+        pg,
+        "rp028_cb",
+        [
+            "create table rp028_cb (k int primary key, g int, t text)",
+            "create index rp028_cb_g on rp028_cb (g)",
+            "insert into rp028_cb select i, (i * 7) % 11, 'x' || (i % 6)"
+            " from generate_series(1, 10000) i",
+            "analyze rp028_cb",
+        ],
+        "select t from rp028_cb where (g = 1 and k < 100) or k > 9000 group by t",
+    )
+    assert got == ("ok", [(t,) for t in ["x2", "x0", "x3", "x5", "x4", "x1"]])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_vacuum_makes_a_distinct_read_the_index_only(pg: Any) -> None:
+    """PostgreSQL 15.19 (a private cluster: VACUUM cannot run in a
+    transaction block): after VACUUM every page is all-visible
+    (`relallvisible`), so `select distinct g ... limit 3` over 300 rows is
+    a Unique over an Index Only Scan that fetches no heap page, and returns
+    0 1 2."""
+    pg.execute("drop table if exists rp028_cv")
+    try:
+        pg.execute("create table rp028_cv (k int primary key, g int, t text)")
+        pg.execute("create index rp028_cv_g on rp028_cv (g)")
+        pg.execute(
+            "insert into rp028_cv select i, (i * 7) % 11, 'x' || (i % 6)"
+            " from generate_series(1, 300) i"
+        )
+        pg.execute("vacuum rp028_cv")
+        got = pg_answer(pg, "select distinct g from rp028_cv limit 3")
+    finally:
+        pg.execute("drop table if exists rp028_cv")
+    assert got == ("ok", [(0,), (1,), (2,)])
+
+
+@pytest.mark.backlog_fixed("RP-028")
 def test_many_to_many_merge_join_leaves_ties_as_its_sorts_do(pg: Any) -> None:
     """PostgreSQL 15.19: `on l.b = r.c` over two fresh keyed tables is a
     Merge Join over two Sorts, so equal keys come out as PostgreSQL's
@@ -1673,13 +1814,12 @@ def test_four_table_chain_joins_in_the_searched_order(pg: Any) -> None:
     assert " ".join(f"{a}:{b}:{c}:{d}" for a, b, c, d in got[1][:6]) == want
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_four_table_left_join_chain_joins_in_the_searched_order(pg: Any) -> None:
     """PostgreSQL 15.19: the same four tables as LEFT joins, `l LEFT JOIN r
     ... LEFT JOIN m ... LEFT JOIN k`, plan as two LEFT merge joins, m-k and
     l-r, joined by a Hash Right Join with l-r hashed (14:15:15:12
-    7:15:15:12 ...); here a LEFT chain of four keeps each side in scan
-    order."""
+    7:15:15:12 ...)."""
     pg.execute("begin")
     try:
         pg.execute("create table rp028_jl (a int primary key, b int)")
@@ -1702,3 +1842,169 @@ def test_four_table_left_join_chain_joins_in_the_searched_order(pg: Any) -> None
     want = "14:15:15:12 7:15:15:12 14:15:15:8 7:15:15:8 14:15:15:16 7:15:15:16"
     assert got[0] == "ok"
     assert " ".join(f"{a}:{b}:{c}:{d}" for a, b, c, d in got[1][:6]) == want
+
+
+@pytest.mark.backlog("RP-028")
+def test_four_tables_with_a_shared_key_join_on_its_class(pg: Any) -> None:
+    """PostgreSQL 15.19: `l JOIN r ON l.b = r.c JOIN m ON r.a = m.a JOIN k
+    ON m.a = k.a` puts r.a, m.a and k.a in one equivalence class, so r, m
+    and k hash join first (k probing r-m) and that, sorted by r.c, merges
+    with l (7:5:5:5 14:5:5:5 7:20:20:20 ...); here four tables whose
+    clauses share a key keep the join as written."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp028_jl (a int primary key, b int)")
+        pg.execute("insert into rp028_jl select i, i % 7 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jr (a int primary key, c int)")
+        pg.execute("insert into rp028_jr select i, i % 5 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jm (a int, d int)")
+        pg.execute("insert into rp028_jm select i, i % 3 from generate_series(1, 20) i")
+        pg.execute("create table rp028_jk (a int, e int)")
+        pg.execute("insert into rp028_jk select i, i % 4 from generate_series(1, 20) i")
+        got = pg_answer(
+            pg,
+            "select rp028_jl.a, rp028_jr.a, rp028_jm.a, rp028_jk.a from rp028_jl"
+            " join rp028_jr on rp028_jl.b = rp028_jr.c"
+            " join rp028_jm on rp028_jr.a = rp028_jm.a"
+            " join rp028_jk on rp028_jm.a = rp028_jk.a",
+        )
+    finally:
+        pg.execute("rollback")
+    want = "7:5:5:5 14:5:5:5 7:20:20:20 14:20:20:20 7:15:15:15 14:15:15:15"
+    assert got[0] == "ok"
+    assert " ".join(f"{a}:{b}:{c}:{d}" for a, b, c, d in got[1][:6]) == want
+
+
+# RP-047: the lock manager. Each test needs two sessions on one server, so
+# it opens its own connections to the module's `rust_pg`; the expected
+# values were measured on PostgreSQL 15.19 with two sessions on a private
+# cluster.
+
+
+def _rp047_table(rust_pg: Any, name: str) -> None:
+    with rust_pg.connect() as c:
+        c.execute(f"drop table if exists {name}")
+        c.execute(f"create table {name} (id int primary key, v int)")
+        c.execute(f"insert into {name} values (1, 0), (2, 0)")
+
+
+def _relation_modes(rust_pg: Any, table: str, statement: str) -> list[str]:
+    with rust_pg.connect(autocommit=False) as a, rust_pg.connect() as c:
+        a.execute(statement)
+        pid = a.execute("select pg_backend_pid()").fetchone()[0]
+        rows = c.execute(
+            "select mode from pg_locks where locktype = 'relation'"
+            f" and relation = '{table}'::regclass and pid = %s order by mode",
+            (pid,),
+        ).fetchall()
+        a.rollback()
+    return [r[0] for r in rows]
+
+
+@pytest.mark.backlog("RP-047")
+def test_row_locking_statements_take_postgres_relation_lock_modes(rust_pg: Any) -> None:
+    """PostgreSQL 15.19: `FOR UPDATE` and `FOR SHARE` take RowShareLock on
+    the table, `DELETE` RowExclusiveLock alone, `TRUNCATE`
+    AccessExclusiveLock and ShareLock; here FOR UPDATE / FOR SHARE show
+    AccessShareLock, DELETE an extra AccessShareLock, TRUNCATE no
+    ShareLock."""
+    _rp047_table(rust_pg, "rp047_m")
+    got = {
+        "for update": _relation_modes(rust_pg, "rp047_m", "select * from rp047_m for update"),
+        "for share": _relation_modes(rust_pg, "rp047_m", "select * from rp047_m for share"),
+        "delete": _relation_modes(rust_pg, "rp047_m", "delete from rp047_m where id = 2"),
+        "truncate": _relation_modes(rust_pg, "rp047_m", "truncate rp047_m"),
+    }
+    assert got == {
+        "for update": ["RowShareLock"],
+        "for share": ["RowShareLock"],
+        "delete": ["RowExclusiveLock"],
+        "truncate": ["AccessExclusiveLock", "ShareLock"],
+    }
+
+
+@pytest.mark.backlog("RP-047")
+def test_pg_locks_shows_transaction_id_locks(rust_pg: Any) -> None:
+    """PostgreSQL 15.19: a transaction that has written holds an
+    ExclusiveLock on its own transaction id and on its virtual one, both
+    shown in `pg_locks`; here neither is."""
+    _rp047_table(rust_pg, "rp047_x")
+    with rust_pg.connect(autocommit=False) as a, rust_pg.connect() as c:
+        a.execute("update rp047_x set v = 5 where id = 1")
+        pid = a.execute("select pg_backend_pid()").fetchone()[0]
+        got = c.execute(
+            "select locktype, mode, granted from pg_locks"
+            " where locktype in ('transactionid', 'virtualxid') and pid = %s order by locktype",
+            (pid,),
+        ).fetchall()
+        a.rollback()
+    assert got == [("transactionid", "ExclusiveLock", True), ("virtualxid", "ExclusiveLock", True)]
+
+
+def _with_a_waiter(rust_pg: Any, hold: str, wait: str, look: Callable[[Any, int], Any]) -> Any:
+    """Session A runs `hold` in a transaction; session B runs `wait`, which
+    blocks on it, in a thread; `look(observer, a_pid)` reads the catalogs
+    while B waits. A then rolls back, releasing B."""
+    a = rust_pg.connect(autocommit=False)
+    b = rust_pg.connect(autocommit=False)
+    c = rust_pg.connect()
+    try:
+        b.execute("set lock_timeout = '10s'")
+        a.execute(hold)
+        a_pid = a.execute("select pg_backend_pid()").fetchone()[0]
+
+        def blocked() -> None:
+            with contextlib.suppress(psycopg.Error):
+                b.execute(wait)
+
+        t = threading.Thread(target=blocked, daemon=True)
+        t.start()
+        time.sleep(0.5)
+        got = look(c, a_pid)
+        a.rollback()
+        t.join(10)
+        return got
+    finally:
+        for conn in (a, b, c):
+            with contextlib.suppress(psycopg.Error):
+                conn.rollback()
+            conn.close()
+
+
+@pytest.mark.backlog("RP-047")
+def test_a_row_lock_waiter_waits_on_the_holders_transaction_id(rust_pg: Any) -> None:
+    """PostgreSQL 15.19: a session waiting for a row another transaction
+    updated shows in `pg_locks` as an ungranted ShareLock on that
+    transaction's id (`XactLockTableWait`); here no lock is ungranted."""
+    _rp047_table(rust_pg, "rp047_r")
+    got = _with_a_waiter(
+        rust_pg,
+        "update rp047_r set v = 5 where id = 1",
+        "update rp047_r set v = v + 10 where id = 1",
+        lambda c, _pid: c.execute(
+            "select locktype, mode, granted from pg_locks where not granted"
+        ).fetchall(),
+    )
+    assert got == [("transactionid", "ShareLock", False)]
+
+
+@pytest.mark.backlog("RP-047")
+def test_a_lock_waiter_is_visible_with_its_blocker(rust_pg: Any) -> None:
+    """PostgreSQL 15.19: a session blocked on a table lock shows in
+    `pg_stat_activity` with `wait_event_type = 'Lock'`, and
+    `pg_blocking_pids()` gives the holder; here neither."""
+    _rp047_table(rust_pg, "rp047_w")
+
+    def look(c: Any, a_pid: int) -> Any:
+        rows = c.execute(
+            "select pg_blocking_pids(pid) from pg_stat_activity where wait_event_type = 'Lock'"
+        ).fetchall()
+        return [list(r[0]) == [a_pid] for r in rows]
+
+    got = _with_a_waiter(
+        rust_pg,
+        "lock table rp047_w in access exclusive mode",
+        "select * from rp047_w",
+        look,
+    )
+    assert got == [True]

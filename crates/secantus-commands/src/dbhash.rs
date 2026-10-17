@@ -14,6 +14,9 @@
 //! - views, `system.profile` and everything in `local` are left out (what
 //!   mongod does not replicate it does not hash); `system.views` is hashed
 //!   like any collection (here, from the definitions it is derived from);
+//! - a time-series collection is hashed as `system.buckets.<name>`, from
+//!   its bucket documents (here, the ones this server derives; their bytes
+//!   equal mongod's only where the buckets do, RM-088);
 //! - `collections` names the ones to hash: a name that is not a collection
 //!   is ignored, a non-array `collections` is ignored, and an element that
 //!   is not a string is `BadValue`. Any other field is ignored.
@@ -101,8 +104,43 @@ pub fn db_hash(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .map_err(crate::util::command_error)?;
         // A view is a definition in `system.views`, not documents; a
         // time-series collection is one too, over `system.buckets.<name>`,
-        // and its buckets are not hashed here (`tasks/backlog-rust-mongodb.md` 7.084).
-        if options.contains_key("viewOn") || options.contains_key("timeseries") {
+        // whose bucket documents mongod hashes under that name (RM-026,
+        // measured 8.2.11): here, the buckets `find` returns for it, in
+        // `_id` order, under the collection's UUID.
+        if options.contains_key("timeseries") {
+            derived_views = true;
+            let buckets = format!("system.buckets.{name}");
+            if asked(&buckets) {
+                let mut docs = crate::ts_buckets::of_collection(storage, db, name)?;
+                docs.sort_by(|a, b| {
+                    secantus_core::order::cmp(
+                        a.get("_id").unwrap_or(&Bson::Null),
+                        b.get("_id").unwrap_or(&Bson::Null),
+                    )
+                });
+                let mut md5 = Md5::new();
+                for d in &docs {
+                    md5.update(bson::to_vec(d).map_err(|e| {
+                        CommandError::new(8, "UnknownError", format!("dbHash: {e}"))
+                    })?);
+                }
+                hashes.insert(buckets.clone(), hex(&md5.finalize()));
+                let uuid = storage
+                    .collection_uuid(db, name)
+                    .map_err(crate::util::command_error)?;
+                if !uuid.is_empty() {
+                    uuids.insert(
+                        buckets,
+                        Binary {
+                            subtype: BinarySubtype::Uuid,
+                            bytes: uuid,
+                        },
+                    );
+                }
+            }
+            continue;
+        }
+        if options.contains_key("viewOn") {
             derived_views = true;
             continue;
         }

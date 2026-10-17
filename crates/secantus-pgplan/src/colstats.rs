@@ -357,6 +357,23 @@ impl Column<'_> {
         })
     }
 
+    /// `scalararraysel` for `col <> ALL (keys)` (a `NOT IN` list): each
+    /// element's negated `var_eq_const`, taken as disjoint exclusions
+    /// (`1 + sum(s2 - 1)`) when that is a probability, else multiplied.
+    pub fn not_in_sel(&self, keys: &[Vec<u8>]) -> Option<f64> {
+        let (mut s1, mut disjoint) = (1.0f64, 1.0f64);
+        for key in keys {
+            let s2 = self.eq_sel(key, true)?;
+            s1 *= s2;
+            disjoint += s2 - 1.0;
+        }
+        Some(if (0.0..=1.0).contains(&disjoint) {
+            disjoint
+        } else {
+            s1
+        })
+    }
+
     /// `nulltestsel`: the null fraction for `IS NULL`, its complement for
     /// `IS NOT NULL`; `DEFAULT_UNK_SEL` with no statistics.
     pub fn null_sel(&self, is_null: bool) -> f64 {

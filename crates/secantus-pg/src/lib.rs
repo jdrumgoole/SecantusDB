@@ -573,6 +573,9 @@ struct PlannerTable {
     /// or `None` for one whose statistics are not modelled. `None` for a
     /// table with no column statistics.
     analyzed: Option<HashMap<String, Option<AnalyzedColumn>>>,
+    /// The fraction of the heap the planner takes as all-visible
+    /// (`allvisfrac`): `relallvisible` over the pages now, at most 1.
+    allvisfrac: f64,
 }
 
 /// A column's `pg_statistic` row: its scalars, and its most common values,
@@ -592,13 +595,23 @@ struct MeasuredWhere {
     index_selectivity: HashMap<String, f64>,
     /// The WHERE's top-level clauses as the cost model prices them.
     quals: Vec<(String, secantus_pgplan::costsize::Qual)>,
-    /// Each `OR` that is also a BitmapOr path: per arm, the column its
-    /// index leads with, the arm's quals on it and their selectivity.
-    bitmap_ors: Vec<Vec<BitmapArm>>,
+    /// The bitmap index scans the WHERE's top-level index quals make, one
+    /// per column an index leads with.
+    bitmap_scans: Vec<IndexQuals>,
+    /// Each `OR` that is also a BitmapOr path (`generate_bitmap_or_paths`):
+    /// its position among the clauses, and per arm the bitmap index scans
+    /// its index quals make.
+    bitmap_ors: Vec<(usize, Vec<Vec<IndexQuals>>)>,
 }
 
-/// One arm of a BitmapOr: `(column, its quals, their selectivity)`.
-type BitmapArm = (String, Vec<(String, secantus_pgplan::costsize::Qual)>, f64);
+/// A bitmap index scan's quals on one column: the column, its quals, their
+/// selectivity, and the clauses they are (by position in their list).
+struct IndexQuals {
+    field: String,
+    quals: Vec<(String, secantus_pgplan::costsize::Qual)>,
+    selectivity: f64,
+    clauses: Vec<usize>,
+}
 
 /// One clause of a lowered WHERE over a measured table (`where_clauses`).
 #[derive(Debug, Clone, PartialEq)]
@@ -609,15 +622,90 @@ enum WhereClause {
     In(String, Vec<Bson>),
     /// `col IS NULL` (`true`) or `col IS NOT NULL`.
     Null(String, bool),
+    /// `col NOT IN (...)` of these constants.
+    NotIn(String, Vec<Bson>),
     /// An `OR` of conjunctions.
     Or(Vec<Vec<WhereClause>>),
 }
 
 /// The conjunction a lowered WHERE holds (`lower_where`): `$and` arrays
-/// flattened, `$or` arms kept as conjunctions of their own. A `$ne: null`
-/// guard sits beside each `<>`; one more than a column's `<>` clauses is an
-/// `IS NOT NULL`. `None` for any other operator or shape.
+/// flattened, `$or` arms kept as conjunctions of their own, then each `OR`
+/// as `canonicalize_qual` leaves it (`where_or`). A `$ne: null` guard sits
+/// beside each `<>` and each `NOT IN`; one more than those is an `IS NOT
+/// NULL`. `None` for any other operator or shape.
 fn where_clauses(filter: &Document) -> Option<Vec<WhereClause>> {
+    canonical(lowered_clauses(filter)?)
+}
+
+/// A conjunction with each `OR` in it canonicalized (`where_or`), and
+/// flattened (`pull_ands`).
+fn canonical(clauses: Vec<WhereClause>) -> Option<Vec<WhereClause>> {
+    let mut out = Vec::with_capacity(clauses.len());
+    for c in clauses {
+        match c {
+            WhereClause::Or(arms) => out.extend(where_or(arms)?),
+            c => out.push(c),
+        }
+    }
+    Some(out)
+}
+
+/// An `OR` of conjunctions as `canonicalize_qual` leaves it: an arm that is
+/// itself an `OR` spliced in (`pull_ors`), then `process_duplicate_ors` --
+/// the clauses every arm holds (from the shortest arm, a lone clause being
+/// shortest) taken out beside the `OR`, which keeps the rest of each arm,
+/// and goes when an arm has nothing left. The result is the clauses that
+/// replace the `OR` in its conjunction. Each arm is canonicalized first.
+fn where_or(arms: Vec<Vec<WhereClause>>) -> Option<Vec<WhereClause>> {
+    let mut flat: Vec<Vec<WhereClause>> = Vec::new();
+    for arm in arms {
+        let arm = canonical(arm)?;
+        match arm.as_slice() {
+            [WhereClause::Or(inner)] => flat.extend(inner.iter().cloned()),
+            _ => flat.push(arm),
+        }
+    }
+    if flat.len() == 1 {
+        return flat.pop();
+    }
+    let mut reference: &[WhereClause] = &flat[0];
+    for arm in &flat {
+        if arm.len() == 1 {
+            reference = arm;
+            break;
+        }
+        if arm.len() < reference.len() {
+            reference = arm;
+        }
+    }
+    let mut winners: Vec<WhereClause> = Vec::new();
+    for c in reference {
+        if !winners.contains(c) && flat.iter().all(|a| a.contains(c)) {
+            winners.push(c.clone());
+        }
+    }
+    if winners.is_empty() {
+        return Some(vec![WhereClause::Or(flat)]);
+    }
+    let mut rest: Vec<Vec<WhereClause>> = Vec::new();
+    for arm in &flat {
+        let left: Vec<WhereClause> = arm
+            .iter()
+            .filter(|c| !winners.contains(c))
+            .cloned()
+            .collect();
+        match left.as_slice() {
+            [] => return Some(winners),
+            [WhereClause::Or(inner)] => rest.extend(inner.iter().cloned()),
+            _ => rest.push(left),
+        }
+    }
+    winners.push(WhereClause::Or(rest));
+    Some(winners)
+}
+
+/// `where_clauses` before the `OR`s are canonicalized.
+fn lowered_clauses(filter: &Document) -> Option<Vec<WhereClause>> {
     use secantus_pgplan::colstats::Op;
     fn flatten(doc: &Document, out: &mut Vec<WhereClause>, guards: &mut Vec<String>) -> Option<()> {
         for (key, value) in doc {
@@ -630,7 +718,7 @@ fn where_clauses(filter: &Document) -> Option<Vec<WhereClause>> {
                 ("$or", Bson::Array(items)) if items.len() > 1 => {
                     let arms = items
                         .iter()
-                        .map(|i| where_clauses(i.as_document()?))
+                        .map(|i| lowered_clauses(i.as_document()?))
                         .collect::<Option<Vec<_>>>()?;
                     out.push(WhereClause::Or(arms));
                 }
@@ -659,6 +747,13 @@ fn where_clauses(filter: &Document) -> Option<Vec<WhereClause>> {
                                 ));
                                 continue;
                             }
+                            "$nin" => {
+                                out.push(WhereClause::NotIn(
+                                    field.to_string(),
+                                    operand.as_array()?.clone(),
+                                ));
+                                continue;
+                            }
                             _ => return None,
                         };
                         out.push(WhereClause::Cmp(field.to_string(), op, operand.clone()));
@@ -680,7 +775,9 @@ fn where_clauses(filter: &Document) -> Option<Vec<WhereClause>> {
         let given = guards.iter().filter(|g| *g == f).count();
         let ne = out
             .iter()
-            .filter(|c| matches!(c, WhereClause::Cmp(g, Op::Ne, _) if g == f))
+            .filter(|c| {
+                matches!(c, WhereClause::Cmp(g, Op::Ne, _) | WhereClause::NotIn(g, _) if g == f)
+            })
             .count();
         extra.extend(std::iter::repeat_n(
             WhereClause::Null(f.clone(), false),
@@ -707,6 +804,27 @@ struct GroupingShape {
     /// The ORDER BY over the group keys, `(group index, ascending, nulls
     /// first)`; `None` when the sorted plan is not weighed at all.
     order: Option<Vec<(usize, bool, bool)>>,
+    /// Every stored field the statement reads, which decides whether an
+    /// index scan can be index-only (`check_index_only`); `None` when that
+    /// is not known (an expression, a HAVING, an aggregate's FILTER).
+    reads: Option<Vec<String>>,
+}
+
+/// The stored fields a lowered WHERE reads, added to `out`; `None` for an
+/// operator that is not a plain comparison of a field (`$expr` and the like).
+fn filter_fields(filter: &Document, out: &mut Vec<String>) -> Option<()> {
+    for (key, value) in filter {
+        match (key.as_str(), value) {
+            ("$and" | "$or" | "$nor", Bson::Array(items)) => {
+                for item in items {
+                    filter_fields(item.as_document()?, out)?;
+                }
+            }
+            (k, _) if k.starts_with('$') => return None,
+            (field, _) => out.push(field.to_string()),
+        }
+    }
+    Some(())
 }
 
 /// The session settings a row encoder needs, captured once per statement:
@@ -5747,6 +5865,26 @@ impl PgHandler {
                     .map(|o| (o.group_index, o.ascending, matches!(o.nulls, Nulls::First)))
                     .collect(),
             ),
+            reads: (|| {
+                let mut reads: Vec<String> = Vec::new();
+                for k in &agg.group_by {
+                    if k.expr.is_some() {
+                        return None;
+                    }
+                    reads.push(k.field.clone());
+                }
+                for i in &agg.items {
+                    if i.expr.is_some() || i.filter.is_some() || !i.order.is_empty() {
+                        return None;
+                    }
+                    reads.extend(i.field.clone());
+                }
+                if agg.having.is_some() {
+                    return None;
+                }
+                filter_fields(&agg.filter, &mut reads)?;
+                Some(reads)
+            })(),
         };
         self.hash_agg_order_over(
             &agg.table,
@@ -5799,6 +5937,7 @@ impl PgHandler {
             pages,
             tuples,
             analyzed,
+            allvisfrac,
         } = self.planner_table(table, table_count)?;
         // A WHERE over it is estimated from its statistics, or declined.
         let measured_where = match &analyzed {
@@ -5904,6 +6043,9 @@ impl PgHandler {
             ordered = full;
         }
         // A WHERE the model cannot price keeps the hash.
+        // The columns of the index a plain index scan reads the rows by,
+        // when that is the input the pricing chose.
+        let scan_order: std::cell::RefCell<Option<Vec<String>>> = std::cell::RefCell::new(None);
         let priced = || -> Option<bool> {
             {
                 let quals = match &measured_where {
@@ -5954,39 +6096,82 @@ impl PgHandler {
                             _ => 0.0,
                         };
                         ix.correlation = if ix.columns.len() > 1 { c * 0.75 } else { c };
+                        // An index holding every column read is scanned
+                        // index-only, skipping the pages all-visible.
+                        if allvisfrac > 0.0 {
+                            let reads = shape.reads.as_ref()?;
+                            if reads.iter().all(|f| ix.columns.contains(f)) {
+                                ix.visible = allvisfrac;
+                            }
+                        }
                         // A non-unique index a path would read is sized with
                         // its duplicates deduplicated.
                         if index_sel(&ix.field).is_some() || presorts(ix) {
-                            if let Some((pages, height)) = self.dedup_index_size(table, ix) {
-                                ix.pages = pages;
-                                ix.height = height;
+                            match self.dedup_index_size(table, ix) {
+                                Some(Some((pages, height))) => {
+                                    ix.pages = pages;
+                                    ix.height = height;
+                                }
+                                Some(None) => {}
+                                // An index-only scan of an all-visible heap
+                                // costs mostly its index's pages, which are
+                                // then not known.
+                                None if ix.visible > 0.0 => return None,
+                                None => {}
                             }
                         }
                     }
                     let colsel = |f: &str| costsize::ColSel::Given(index_sel(f).unwrap_or(1.0));
-                    let ((mut startup, mut input), mut ordered_by) =
-                        costsize::scan_path(&rel, &measured, &quals, &colsel, read);
-                    // A BitmapOr reads the heap in its order.
-                    for or in measured_where.iter().flat_map(|w| &w.bitmap_ors) {
-                        let arms = or
+                    // `create_index_paths`' one bitmap heap scan: the bitmap
+                    // index scans and BitmapOrs, combined by
+                    // `choose_bitmap_and`; it reads the heap in its order.
+                    let scan_paths = |scans: &[IndexQuals]| -> Vec<costsize::BitmapPath> {
+                        scans
                             .iter()
-                            .map(|(f, arm, sel)| {
-                                let ix = measured.iter().find(|ix| &ix.field == f)?;
-                                Some((ix, arm.clone(), costsize::ColSel::Given(*sel)))
+                            .flat_map(|s| {
+                                measured
+                                    .iter()
+                                    .filter(|ix| ix.field == s.field)
+                                    .filter_map(|ix| {
+                                        costsize::bitmap_index_path(
+                                            &rel,
+                                            ix,
+                                            &s.quals,
+                                            costsize::ColSel::Given(s.selectivity),
+                                            read,
+                                            s.clauses.clone(),
+                                        )
+                                    })
                             })
-                            .collect::<Option<Vec<_>>>()?;
-                        let cost = costsize::bitmap_or_scan(&rel, &arms, &quals, read)?;
-                        if cost.1 < input || (cost.1 == input && cost.0 < startup) {
-                            (startup, input) = cost;
-                            ordered_by = None;
+                            .collect()
+                    };
+                    let mut bitmaps: Vec<costsize::BitmapPath> = Vec::new();
+                    if let Some(w) = &measured_where {
+                        bitmaps = scan_paths(&w.bitmap_scans);
+                        for (pos, arms) in &w.bitmap_ors {
+                            let chosen = arms
+                                .iter()
+                                .map(|a| costsize::choose_bitmap_and(&rel, &scan_paths(a), &quals))
+                                .collect::<Option<Vec<_>>>()?;
+                            bitmaps.push(costsize::bitmap_or_path(&chosen, *pos));
                         }
                     }
+                    let bitmap = if bitmaps.is_empty() {
+                        None
+                    } else {
+                        Some(costsize::choose_bitmap_and(&rel, &bitmaps, &quals)?)
+                    };
+                    let ((_, input), ordered_by) = costsize::measured_scan_path(
+                        &rel,
+                        &measured,
+                        &quals,
+                        &colsel,
+                        bitmap.as_ref(),
+                    );
                     // A plain index scan returns the rows in the index's
                     // order: modelled only where that is the heap's.
                     if let Some(ix) = ordered_by {
-                        if !self.heap_in_order_of(table, &ix.field) {
-                            return None;
-                        }
+                        *scan_order.borrow_mut() = Some(ix.columns.clone());
                     }
                     let presorted: Vec<(f64, f64, f64)> = measured
                         .iter()
@@ -6066,7 +6251,7 @@ impl PgHandler {
             && (!shape.can_hash
                 || match priced() {
                     Some(sorted) => sorted,
-                    None if shape.limit.is_some() || measured_where.is_some() => return None,
+                    None if shape.limit.is_some() || analyzed.is_some() => return None,
                     None => false,
                 });
         if sorted {
@@ -6102,9 +6287,11 @@ impl PgHandler {
             .collect();
         // The groups reach the hash table in the order of the scan, which
         // for a WHERE over a measured table is the heap's (a sequential or
-        // bitmap scan, or an index scan in the heap's order).
+        // bitmap scan) or an index's (a plain index scan).
         if measured_where.is_some() {
-            let (arrival, trailing) = self.heap_arrival(table, filter, key_cols, keys)?;
+            let order = scan_order.borrow().clone();
+            let (arrival, trailing) =
+                self.heap_arrival(table, filter, key_cols, keys, order.as_deref())?;
             let reordered: Vec<Vec<Option<Bson>>> =
                 arrival.iter().map(|&g| kept_keys[g].clone()).collect();
             let order = hashagg::hash_agg_order(&reordered, &types, groups, trailing)?;
@@ -6237,12 +6424,29 @@ impl PgHandler {
             self.heap_pages(table, &def),
             measured,
         );
+        // `table_block_relation_estimate_size`: `relallvisible` as it is,
+        // over the pages now.
+        let relallvisible = relstats
+            .as_ref()
+            .and_then(|d| d.get_i64("relallvisible").ok())
+            .unwrap_or(0) as f64;
+        let allvisfrac = if relallvisible <= 0.0 || pages <= 0.0 {
+            0.0
+        } else if relallvisible >= pages {
+            1.0
+        } else {
+            relallvisible / pages
+        };
+        // A vacuumed table is priced from what was measured, defaults
+        // standing in for statistics it has none of.
+        let analyzed = analyzed.or_else(|| (allvisfrac > 0.0).then(HashMap::new));
         Some(PlannerTable {
             def,
             unique,
             pages,
             tuples,
             analyzed,
+            allvisfrac,
         })
     }
 
@@ -6379,7 +6583,10 @@ impl PgHandler {
         fn fields_of<'a>(items: &'a [WhereClause], out: &mut Vec<&'a str>) {
             for item in items {
                 match item {
-                    WhereClause::Cmp(f, ..) | WhereClause::In(f, _) | WhereClause::Null(f, _) => {
+                    WhereClause::Cmp(f, ..)
+                    | WhereClause::In(f, _)
+                    | WhereClause::NotIn(f, _)
+                    | WhereClause::Null(f, _) => {
                         if !out.contains(&f.as_str()) {
                             out.push(f);
                         }
@@ -6430,68 +6637,69 @@ impl PgHandler {
         let key = |i: usize, v: &Bson| Self::stats_key(bases[i], v);
         // A conjunction's selectivity, and (at the top) its index quals' per
         // column.
+        // A clause an index on its column could take as an index qual
+        // (`match_clause_to_indexcol`): a comparison but `<>`, an `IN`, a
+        // null test.
+        fn index_qual(c: &WhereClause) -> Option<(&str, Qual)> {
+            match c {
+                WhereClause::Cmp(f, op, _) if *op != Op::Ne => Some((
+                    f,
+                    match op {
+                        Op::Gt | Op::Ge => Qual::Range(true),
+                        Op::Lt | Op::Le => Qual::Range(false),
+                        _ => Qual::Eq,
+                    },
+                )),
+                WhereClause::In(f, v) => Some((f, Qual::In(v.len()))),
+                WhereClause::Null(f, is_null) => Some((f, Qual::IsNull(*is_null))),
+                _ => None,
+            }
+        }
+        // A conjunction's selectivity, or with `only` its index quals' on
+        // that column.
         fn conjunction(
             items: &[WhereClause],
             columns: &[colstats::Column],
             at: &dyn Fn(&str) -> Option<usize>,
             key: &dyn Fn(usize, &Bson) -> Option<Vec<u8>>,
-            indexed: &dyn Fn(&str) -> bool,
             only: Option<usize>,
         ) -> Option<f64> {
             let mut cmps: Vec<(&colstats::Column, Op, Vec<u8>)> = Vec::new();
             let mut others: Vec<f64> = Vec::new();
             for item in items {
+                if let Some(o) = only {
+                    match index_qual(item) {
+                        Some((f, _)) if at(f) == Some(o) => {}
+                        _ => continue,
+                    }
+                }
                 match item {
                     WhereClause::Cmp(f, op, v) => {
                         let i = at(f)?;
-                        if only.is_some_and(|o| o != i || *op == Op::Ne) {
-                            continue;
-                        }
                         cmps.push((&columns[i], *op, key(i, v)?));
                     }
-                    WhereClause::In(f, values) => {
+                    WhereClause::In(f, values) | WhereClause::NotIn(f, values) => {
                         let i = at(f)?;
-                        if only.is_some_and(|o| o != i) {
-                            continue;
-                        }
                         let keys: Vec<Vec<u8>> =
                             values.iter().map(|v| key(i, v)).collect::<Option<_>>()?;
-                        let mut distinct = keys.clone();
-                        distinct.sort();
-                        distinct.dedup();
-                        if keys.is_empty() || keys.len() >= 9 || distinct.len() != keys.len() {
+                        if keys.is_empty() {
                             return None;
                         }
-                        others.push(columns[i].in_sel(&keys)?);
+                        others.push(if matches!(item, WhereClause::In(..)) {
+                            columns[i].in_sel(&keys)?
+                        } else {
+                            columns[i].not_in_sel(&keys)?
+                        });
                     }
                     WhereClause::Null(f, is_null) => {
-                        if indexed(f) {
-                            return None;
-                        }
-                        if only.is_none() {
-                            others.push(columns[at(f)?].null_sel(*is_null));
-                        }
+                        others.push(columns[at(f)?].null_sel(*is_null));
                     }
                     WhereClause::Or(arms) => {
-                        // `find_duplicate_ors` would factor out a clause every
-                        // arm shares, and drop a repeated arm.
-                        let shared = arms[0]
+                        let sels: Vec<f64> = arms
                             .iter()
-                            .any(|c| arms[1..].iter().all(|a| a.contains(c)));
-                        let repeated = arms.iter().enumerate().any(|(i, a)| arms[..i].contains(a));
-                        let nested = arms
-                            .iter()
-                            .any(|a| a.iter().any(|c| matches!(c, WhereClause::Or(_))));
-                        if shared || repeated || nested {
-                            return None;
-                        }
-                        if only.is_none() {
-                            let sels: Vec<f64> = arms
-                                .iter()
-                                .map(|a| conjunction(a, columns, at, key, indexed, None))
-                                .collect::<Option<_>>()?;
-                            others.push(colstats::or_sel(&sels));
-                        }
+                            .map(|a| conjunction(a, columns, at, key, None))
+                            .collect::<Option<_>>()?;
+                        others.push(colstats::or_sel(&sels));
                     }
                 }
             }
@@ -6500,121 +6708,124 @@ impl PgHandler {
             }
             colstats::clauselist_with(&cmps, &others)
         }
-        let selectivity = conjunction(&clauses, &columns, &at, &key, &indexed, None)?;
+        let selectivity = conjunction(&clauses, &columns, &at, &key, None)?;
         let mut index_selectivity = HashMap::new();
         for (i, f) in fields.iter().enumerate() {
-            let serves = clauses.iter().any(|c| match c {
-                WhereClause::Cmp(g, op, _) => g == f && *op != Op::Ne,
-                WhereClause::In(g, _) => g == f,
-                _ => false,
-            });
-            if serves {
-                let sel = conjunction(&clauses, &columns, &at, &key, &indexed, Some(i))?;
+            if clauses
+                .iter()
+                .any(|c| index_qual(c).is_some_and(|(g, _)| g == *f))
+            {
+                let sel = conjunction(&clauses, &columns, &at, &key, Some(i))?;
                 index_selectivity.insert(f.to_string(), sel);
             }
         }
-        // The quals as the cost model sees them: an `OR` and a null test are
-        // filters no index serves here; a null test costs nothing
-        // (`cost_qual_eval` charges no NullTest).
-        fn ops(items: &[WhereClause]) -> f64 {
+        // A column an index leads with (several listings of the same columns,
+        // a primary key and the store's `_id` index, being one index), and a
+        // column some index holds but none leads with.
+        let leads = |f: &str| indexes.iter().any(|ix| ix.field == f);
+        let trailing_only = |f: &str| indexed(f) && !leads(f);
+        // The bitmap index scans a conjunction's index quals make: one per
+        // column an index leads with, over its index quals there.
+        let scans = |items: &[WhereClause]| -> Option<Vec<IndexQuals>> {
+            let mut out: Vec<IndexQuals> = Vec::new();
+            for (pos, c) in items.iter().enumerate() {
+                let Some((f, q)) = index_qual(c) else {
+                    continue;
+                };
+                if trailing_only(f) {
+                    return None;
+                }
+                if !leads(f) {
+                    continue;
+                }
+                match out.iter_mut().find(|s| s.field == f) {
+                    Some(s) => {
+                        s.quals.push((f.to_string(), q));
+                        s.clauses.push(pos);
+                    }
+                    None => out.push(IndexQuals {
+                        field: f.to_string(),
+                        quals: vec![(f.to_string(), q)],
+                        selectivity: 0.0,
+                        clauses: vec![pos],
+                    }),
+                }
+            }
+            for s in &mut out {
+                s.selectivity = conjunction(items, &columns, &at, &key, Some(at(&s.field)?))?;
+            }
+            Some(out)
+        };
+        let bitmap_scans = scans(&clauses)?;
+        // An `OR` each of whose arms has an index qual is also a BitmapOr
+        // (`generate_bitmap_or_paths`); an arm's scans are chosen among by
+        // `choose_bitmap_and`. Declined where the WHERE's other clauses would
+        // join an arm's index quals (`build_paths_for_OR`'s other clauses),
+        // or an arm holds an `OR` of its own.
+        let mut bitmap_ors = Vec::new();
+        for (pos, c) in clauses.iter().enumerate() {
+            let WhereClause::Or(arms) = c else { continue };
+            if !arms.iter().all(|a| {
+                a.iter()
+                    .any(|c| index_qual(c).is_some_and(|(f, _)| indexed(f)))
+            }) {
+                continue;
+            }
+            let mut per_arm = Vec::with_capacity(arms.len());
+            for arm in arms {
+                if arm.iter().any(|c| matches!(c, WhereClause::Or(_))) {
+                    return None;
+                }
+                let arm_scans = scans(arm)?;
+                let joined = arm_scans.iter().any(|s| {
+                    clauses.iter().enumerate().any(|(other, c)| {
+                        other != pos && index_qual(c).is_some_and(|(g, _)| g == s.field)
+                    })
+                });
+                if joined {
+                    return None;
+                }
+                per_arm.push(arm_scans);
+            }
+            bitmap_ors.push((pos, per_arm));
+        }
+        // The quals as the cost model sees them: an `OR` is a filter no index
+        // serves here, costing its comparisons (a hashed list inside one is
+        // declined: its startup is not modelled there).
+        fn ops(items: &[WhereClause]) -> Option<f64> {
             items
                 .iter()
                 .map(|c| match c {
-                    WhereClause::Cmp(..) => 1.0,
-                    WhereClause::In(_, v) => v.len() as f64 * 0.5,
-                    WhereClause::Null(..) => 0.0,
+                    WhereClause::Cmp(..) => Some(1.0),
+                    WhereClause::In(_, v) | WhereClause::NotIn(_, v) if v.len() >= 9 => None,
+                    WhereClause::In(_, v) | WhereClause::NotIn(_, v) => Some(v.len() as f64 * 0.5),
+                    WhereClause::Null(..) => Some(0.0),
                     WhereClause::Or(arms) => arms.iter().map(|a| ops(a)).sum(),
                 })
                 .sum()
         }
-        // An `OR` each of whose arms an index could serve is also a
-        // BitmapOr path (`generate_bitmap_or_paths`): modelled where each
-        // arm's index quals are on one column that leads exactly one index,
-        // declined where an arm could use another index or several.
-        let mut bitmap_ors = Vec::new();
-        for c in &clauses {
-            let WhereClause::Or(arms) = c else { continue };
-            let mut paths = Vec::new();
-            for arm in arms {
-                let mut served: Vec<&str> = Vec::new();
-                for c in arm {
-                    let f = match c {
-                        WhereClause::Cmp(f, op, _) if *op != Op::Ne => f,
-                        WhereClause::In(f, _) => f,
-                        _ => continue,
-                    };
-                    if indexed(f) && !served.contains(&f.as_str()) {
-                        served.push(f);
-                    }
-                }
-                paths.push(served);
-            }
-            if paths.iter().any(Vec::is_empty) {
-                continue;
-            }
-            let mut or = Vec::new();
-            for (arm, served) in arms.iter().zip(&paths) {
-                let [f] = served.as_slice() else { return None };
-                // The same columns listed twice (a primary key and the
-                // store's `_id` index) are one index.
-                let mut leading: Vec<&Vec<String>> = indexes
-                    .iter()
-                    .filter(|ix| ix.field == *f)
-                    .map(|ix| &ix.columns)
-                    .collect();
-                leading.dedup();
-                if leading.len() != 1
-                    || indexes
-                        .iter()
-                        .any(|ix| ix.field != *f && ix.columns.iter().any(|c| c == f))
-                {
-                    return None;
-                }
-                let i = at(f)?;
-                let sel = conjunction(arm, &columns, &at, &key, &indexed, Some(i))?;
-                let arm_quals: Vec<(String, Qual)> = arm
-                    .iter()
-                    .filter_map(|c| match c {
-                        WhereClause::Cmp(g, op, _) if g == f && *op != Op::Ne => Some((
-                            g.clone(),
-                            match op {
-                                Op::Gt | Op::Ge => Qual::Range(true),
-                                Op::Lt | Op::Le => Qual::Range(false),
-                                _ => Qual::Eq,
-                            },
-                        )),
-                        WhereClause::In(g, v) if g == f => Some((g.clone(), Qual::In(v.len()))),
-                        _ => None,
-                    })
-                    .collect();
-                or.push((f.to_string(), arm_quals, sel));
-            }
-            bitmap_ors.push(or);
-        }
         let quals: Vec<(String, Qual)> = clauses
             .iter()
-            .map(|c| match c {
-                WhereClause::Cmp(f, op, _) => (
-                    f.clone(),
-                    match op {
-                        Op::Eq => Qual::Eq,
-                        Op::Ne => Qual::Ne,
-                        Op::Gt | Op::Ge => Qual::Range(true),
-                        Op::Lt | Op::Le => Qual::Range(false),
-                    },
-                ),
-                WhereClause::In(f, v) => (f.clone(), Qual::In(v.len())),
-                WhereClause::Null(f, _) => (f.clone(), Qual::Filter(0.0)),
-                WhereClause::Or(arms) => (
-                    String::new(),
-                    Qual::Filter(arms.iter().map(|a| ops(a)).sum()),
-                ),
+            .map(|c| {
+                Some(match c {
+                    WhereClause::Cmp(f, Op::Ne, _) => (f.clone(), Qual::Ne),
+                    WhereClause::NotIn(f, v) => (f.clone(), Qual::NotIn(v.len())),
+                    WhereClause::Or(arms) => (
+                        String::new(),
+                        Qual::Filter(arms.iter().map(|a| ops(a)).sum::<Option<f64>>()?),
+                    ),
+                    c => {
+                        let (f, q) = index_qual(c)?;
+                        (f.to_string(), q)
+                    }
+                })
             })
-            .collect();
+            .collect::<Option<_>>()?;
         Some(MeasuredWhere {
             selectivity,
             index_selectivity,
             quals,
+            bitmap_scans,
             bitmap_ors,
         })
     }
@@ -6666,17 +6877,20 @@ impl PgHandler {
         }
     }
 
-    /// The order `table`'s rows through `filter`, read in heap order, first
-    /// reach each of `keys`' groups (one key value per `key_cols` column),
-    /// and whether a row of an earlier group follows the last group's first
-    /// (`hashagg::hash_agg_order`). `None` when a row's key is not one of
-    /// `keys`.
+    /// The order `table`'s rows through `filter` first reach each of
+    /// `keys`' groups (one key value per `key_cols` column), read in heap
+    /// order or, by an index scan, in the order of the index's `columns`
+    /// (ascending, NULLs last, ties in heap order as a B-tree keeps them by
+    /// TID), and whether a row of an earlier group follows the last group's
+    /// first (`hashagg::hash_agg_order`). `None` when a row's key is not one
+    /// of `keys`.
     fn heap_arrival(
         &self,
         table: &str,
         filter: &Document,
         key_cols: &[(String, String)],
         keys: &[Vec<Option<Bson>>],
+        by_index: Option<&[String]>,
     ) -> Option<(Vec<usize>, bool)> {
         let index: HashMap<String, usize> = keys
             .iter()
@@ -6694,13 +6908,33 @@ impl PgHandler {
                 .entry(format!("{:?}", decode_doc(&raw).ok()?))
                 .or_insert(0) += 1;
         }
-        let mut seen = vec![false; keys.len()];
-        let (mut arrival, mut trailing) = (Vec::with_capacity(keys.len()), false);
+        let mut rows: Vec<Document> = Vec::new();
         for d in self.table_docs(table).ok()? {
             match kept.get_mut(&format!("{d:?}")) {
                 Some(n) if *n > 0 => *n -= 1,
                 _ => continue,
             }
+            rows.push(d);
+        }
+        if let Some(columns) = by_index {
+            rows.sort_by(|a, b| {
+                for c in columns {
+                    let ord = match (a.get(c), b.get(c)) {
+                        (None | Some(Bson::Null), None | Some(Bson::Null)) => Ordering::Equal,
+                        (None | Some(Bson::Null), _) => Ordering::Greater,
+                        (_, None | Some(Bson::Null)) => Ordering::Less,
+                        (Some(x), Some(y)) => compare_values(x, y),
+                    };
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                }
+                Ordering::Equal
+            });
+        }
+        let mut seen = vec![false; keys.len()];
+        let (mut arrival, mut trailing) = (Vec::with_capacity(keys.len()), false);
+        for d in rows {
             let key: Vec<Option<Bson>> = key_cols
                 .iter()
                 .map(|(f, _)| match d.get(f) {
@@ -6721,19 +6955,29 @@ impl PgHandler {
     /// The size of `ix` once B-tree deduplication has merged its repeated
     /// keys into posting lists (`_bt_dedup_pass`, `_bt_form_posting`: a
     /// repeated key's tuple is `MAXALIGN(MAXALIGN(8 + key) + 6 x TIDs)`, at
-    /// most `BTMaxItemSize / 2`), where that is known: the metapage and one
-    /// leaf, for an index of one integer column without NULLs whose rows
+    /// most `BTMaxItemSize / 2`). `Some(Some(..))`, the metapage and one
+    /// leaf, for an index of one integer column whose rows
     /// overflow a leaf undeduplicated, fit it deduplicated, and hold two
-    /// values or more. `None` leaves `btree_size`'s undeduplicated build,
-    /// exact where the keys are distinct or fit a leaf as they are.
+    /// values or more; `Some(None)` where deduplication changes nothing
+    /// (the keys are distinct, or fit a leaf as they are), so `btree_size`
+    /// is exact; `None` where it shrinks the index by an amount not modelled.
     fn dedup_index_size(
         &self,
         table: &str,
         ix: &secantus_pgplan::costsize::Index,
-    ) -> Option<(f64, u32)> {
+    ) -> Option<Option<(f64, u32)>> {
         const LEAF: usize = 8192 - 24 - 16;
         const MAX_POSTING: usize = 1352;
         let maxalign = |n: usize| n.div_ceil(8) * 8;
+        let docs = self.table_docs(table).ok()?;
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for d in &docs {
+            let key: Vec<Option<&Bson>> = ix.columns.iter().map(|c| d.get(c)).collect();
+            *counts.entry(format!("{key:?}")).or_insert(0) += 1;
+        }
+        if counts.len() == docs.len() {
+            return Some(None);
+        }
         let [column] = ix.columns.as_slice() else {
             return None;
         };
@@ -6750,21 +6994,20 @@ impl PgHandler {
             "int8" => 8,
             _ => return None,
         };
-        let docs = self.table_docs(table).ok()?;
         let item = maxalign(8 + width);
         if docs.len() * (item + 4) <= LEAF {
-            return None;
+            return Some(None);
         }
-        let mut counts: HashMap<i64, usize> = HashMap::new();
-        for d in &docs {
-            let n = match d.get(column) {
-                Some(Bson::Int32(n)) => i64::from(*n),
-                Some(Bson::Int64(n)) => *n,
-                _ => return None,
-            };
-            *counts.entry(n).or_insert(0) += 1;
-        }
-        if counts.len() < 2 || counts.len() == docs.len() {
+        // A NULL's tuple is the header and its null bitmap, as wide as an
+        // integer key's once MAXALIGNed: one more value.
+        if counts.len() < 2
+            || docs.iter().any(|d| {
+                !matches!(
+                    d.get(column),
+                    None | Some(Bson::Null | Bson::Int32(_) | Bson::Int64(_))
+                )
+            })
+        {
             return None;
         }
         let mut size = 0;
@@ -6775,34 +7018,20 @@ impl PgHandler {
             }
             size += tuple + 4;
         }
-        (size <= LEAF).then_some((2.0, 0))
-    }
-
-    /// Whether `table`'s rows, in heap order, are in `field`'s order with no
-    /// NULLs -- so that an index scan on it returns them as the heap does.
-    fn heap_in_order_of(&self, table: &str, field: &str) -> bool {
-        let Ok(docs) = self.table_docs(table) else {
-            return false;
-        };
-        let mut prev: Option<&Bson> = None;
-        for d in &docs {
-            match d.get(field) {
-                None | Some(Bson::Null) => return false,
-                Some(v) => {
-                    if prev.is_some_and(|p| compare_values(p, v) == Ordering::Greater) {
-                        return false;
-                    }
-                    prev = Some(v);
-                }
-            }
-        }
-        true
+        (size <= LEAF).then_some(Some((2.0, 0)))
     }
 
     /// The pages PostgreSQL's heap would hold `table`'s rows in, freshly
     /// inserted (`hashagg::heap_pages`); `None` when a column's type is one
     /// whose stored size is not modelled (numeric, arrays, json).
     fn heap_pages(&self, table: &str, def: &secantus_pgcatalog::TableDef) -> Option<u64> {
+        let spaces = self.heap_spaces(table, def)?;
+        Some(secantus_pgplan::hashagg::heap_pages(spaces.into_iter()))
+    }
+
+    /// The space each of `table`'s rows takes on a heap page, in heap order
+    /// (`hashagg::heap_tuple_space`); `None` as for `heap_pages`.
+    fn heap_spaces(&self, table: &str, def: &secantus_pgcatalog::TableDef) -> Option<Vec<usize>> {
         use secantus_pgplan::hashagg::{self, ColumnLayout};
         let fact = |c: &secantus_pgcatalog::Column, name: &str| {
             secantus_pgplan::pgtypes::oid_of_name(&c.pg_type)
@@ -6864,7 +7093,109 @@ impl PgHandler {
             }
             spaces.push(hashagg::heap_tuple_space(&layouts, &values));
         }
-        Some(hashagg::heap_pages(spaces.into_iter()))
+        Some(spaces)
+    }
+
+    /// The visibility map's count of all-visible pages of `table` now
+    /// (`visibilitymap_count`), which ANALYZE and CREATE INDEX store as
+    /// `relallvisible`: VACUUM (`previous`'s `vacuum_rows` / `vacuum_pages`)
+    /// marked every page, and a row inserted since clears its page's bit --
+    /// the last vacuumed page's when the first such row fits on it, and the
+    /// pages after it were never marked. 0 for a table never vacuumed;
+    /// `None` for one holding fewer rows than VACUUM saw, whose heap is not
+    /// modelled.
+    fn visible_pages(
+        &self,
+        table: &str,
+        def: &secantus_pgcatalog::TableDef,
+        previous: Option<&Document>,
+        rows: usize,
+    ) -> Option<i64> {
+        let Some((vrows, vpages)) = previous.and_then(|d| {
+            Some((
+                d.get_i64("vacuum_rows").ok()?,
+                d.get_i64("vacuum_pages").ok()?,
+            ))
+        }) else {
+            return Some(0);
+        };
+        let vrows = vrows as usize;
+        if rows < vrows {
+            return None;
+        }
+        if rows == vrows {
+            return Some(vpages);
+        }
+        let spaces = self.heap_spaces(table, def)?;
+        let first = secantus_pgplan::hashagg::heap_pages(spaces[..=vrows].iter().copied());
+        Some(if first as i64 == vpages {
+            (vpages - 1).max(0)
+        } else {
+            vpages
+        })
+    }
+
+    /// The vacuum fields of `previous` (`record_vacuum`'s), carried into a
+    /// new row of `RELSTATS_COLLECTION` with the visibility map's count now
+    /// as `relallvisible`; `false` when that count is not modelled.
+    fn carry_visibility(
+        &self,
+        table: &str,
+        def: &secantus_pgcatalog::TableDef,
+        previous: Option<&Document>,
+        rows: usize,
+        doc: &mut Document,
+    ) -> bool {
+        let Some(visible) = self.visible_pages(table, def, previous, rows) else {
+            return false;
+        };
+        doc.insert("relallvisible", visible);
+        for key in ["vacuum_rows", "vacuum_pages"] {
+            if let Some(v) = previous.and_then(|d| d.get(key)) {
+                doc.insert(key, v.clone());
+            }
+        }
+        true
+    }
+
+    /// VACUUM of `table` (not FULL): `pg_class`'s `relpages`, `reltuples` and
+    /// `relallvisible` (`vac_update_relstats`) -- every page all-visible,
+    /// as nothing else is running -- and what it saw, for the visibility
+    /// map's count later (`visible_pages`); ANALYZE's statistics stay. A heap
+    /// not modelled, or one holding fewer rows than a previous VACUUM saw
+    /// (rows removed, which is not modelled), is recorded as unmodelled.
+    fn record_vacuum(&self, table: &str) -> PgWireResult<()> {
+        let Some(def) = self.lookup(table) else {
+            return Ok(());
+        };
+        let rows = self.table_docs(table)?.len();
+        let previous = self.relstats(table);
+        let shrunk = previous
+            .as_ref()
+            .and_then(|d| d.get_i64("vacuum_rows").ok())
+            .is_some_and(|v| (rows as i64) < v);
+        let Some(pages) = self.heap_pages(table, &def).filter(|_| !shrunk) else {
+            return self.record_relstats(table, true);
+        };
+        let statistics = previous
+            .as_ref()
+            .is_some_and(|d| d.get_bool("statistics").unwrap_or(false));
+        let mut doc = bson::doc! {
+            "_id": table,
+            "reltuples": rows as i64,
+            "relpages": pages as i64,
+            "relallvisible": pages as i64,
+            "vacuum_rows": rows as i64,
+            "vacuum_pages": pages as i64,
+            "statistics": statistics,
+        };
+        if let Some(columns) = previous
+            .as_ref()
+            .and_then(|d| d.get_document("columns").ok())
+        {
+            doc.insert("columns", columns.clone());
+        }
+        self.put_comment_doc(Self::RELSTATS_COLLECTION, table, Some(doc))
     }
 
     /// The B-tree indexes PostgreSQL would have on `table`, for the cost
@@ -6908,6 +7239,7 @@ impl PgHandler {
                 height,
                 columns: fields.clone(),
                 correlation: 0.0,
+                visible: 0.0,
             });
         };
         let pk: Vec<String> = def
@@ -12570,6 +12902,11 @@ impl PgHandler {
         {
             doc.insert("columns", columns.clone());
         }
+        // CREATE INDEX stores the visibility map's count too
+        // (`index_update_stats`).
+        if !self.carry_visibility(table, &def, previous.as_ref(), rows, &mut doc) {
+            doc.insert("statistics", true);
+        }
         self.put_comment_doc(Self::RELSTATS_COLLECTION, table, Some(doc))
     }
 
@@ -12667,13 +13004,16 @@ impl PgHandler {
         let statistics = previous
             .as_ref()
             .is_some_and(|d| d.get_bool("statistics").unwrap_or(false));
-        let doc = bson::doc! {
+        let mut doc = bson::doc! {
             "_id": table,
             "reltuples": docs.len() as i64,
             "relpages": pages as i64,
             "statistics": statistics,
             "columns": stats,
         };
+        if !self.carry_visibility(table, &def, previous.as_ref(), docs.len(), &mut doc) {
+            doc.insert("statistics", true);
+        }
         self.put_comment_doc(Self::RELSTATS_COLLECTION, table, Some(doc))
     }
 
@@ -28830,6 +29170,10 @@ impl PgHandler {
                     aggs: None,
                     can_hash: true,
                     order: sel.order.is_empty().then(Vec::new),
+                    reads: {
+                        let mut reads: Vec<String> = cols.iter().map(|(f, _)| f.clone()).collect();
+                        filter_fields(&sel.filter, &mut reads).map(|_| reads)
+                    },
                 };
                 self.hash_agg_order_over(
                     &sel.table,
@@ -33989,6 +34333,7 @@ impl PgHandler {
                 indexes,
                 outside_block,
                 analyze,
+                full,
             } => {
                 if outside_block {
                     self.refuse_in_transaction_block(&command)?;
@@ -34021,12 +34366,18 @@ impl PgHandler {
                         tables.clone()
                     };
                     for (t, columns) in &named {
-                        // VACUUM's visibility map and its `relallvisible`
-                        // are not modelled; ANALYZE alone is.
-                        if command == "ANALYZE" && analyze {
-                            self.record_analyze(t, columns)?;
-                        } else {
+                        // VACUUM FULL rewrites the table, which is not
+                        // modelled; `VACUUM (ANALYZE)` vacuums, then
+                        // analyses.
+                        if full {
                             self.record_relstats(t, true)?;
+                            continue;
+                        }
+                        if command == "VACUUM" {
+                            self.record_vacuum(t)?;
+                        }
+                        if analyze {
+                            self.record_analyze(t, columns)?;
                         }
                     }
                 }
@@ -44006,13 +44357,12 @@ fn reorder_join_inputs(
         }
         JoinMethod::HashOuterA => right.reverse(),
         JoinMethod::HashOuterB => left.reverse(),
-        // A hash right join's order is its hash table's (`hash_table_order`),
-        // which its caller puts its rows in; a merge right join's is not
-        // modelled.
+        // A right join's order is put in place by the caller that runs it
+        // (`hash_table_order`, `join_search::run_step`).
         JoinMethod::NestOuterB
         | JoinMethod::Other
         | JoinMethod::HashRightB
-        | JoinMethod::Unmodelled => {}
+        | JoinMethod::MergeRightB { .. } => {}
     }
 }
 

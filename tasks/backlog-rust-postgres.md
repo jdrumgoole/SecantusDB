@@ -340,6 +340,33 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **RUST pgserver: the lock manager shows less than PostgreSQL's, and
+  some statements take the wrong relation lock.** What works, measured
+  against PostgreSQL 15.19 with two sessions (2026-10-16): the eight table
+  lock modes and their conflicts, deadlock detection (40P01) over table and
+  row locks, `lock_timeout` / `statement_timeout` on a lock wait, `NOWAIT`
+  and `SKIP LOCKED`, the four row-lock strengths' conflicts, DDL waiting on
+  a reader and CREATE INDEX on a writer, and advisory locks. What differs:
+  - The relation lock a row-locking or writing statement takes: `SELECT
+    ... FOR UPDATE` / `FOR SHARE` show `AccessShareLock` where PostgreSQL
+    takes `RowShareLock`; `UPDATE` and `DELETE` show an extra
+    `AccessShareLock` beside their `RowExclusiveLock`; `TRUNCATE` shows no
+    `ShareLock` beside its `AccessExclusiveLock`.
+  - `pg_locks` has no `transactionid` or `virtualxid` locks: PostgreSQL
+    shows each transaction's own `ExclusiveLock` on both, and a session
+    waiting for a row as a `ShareLock` it has not been granted on the
+    holder's transaction id (`XactLockTableWait`), which is how row waits
+    reach the deadlock detector there.
+  - A session blocked on a lock is not visible as one: PostgreSQL shows it
+    in `pg_stat_activity` with `wait_event_type = 'Lock'` and
+    `pg_blocking_pids()` returns the holder; here neither.
+  Not measured yet: `deadlock_timeout`'s delay, the order queued waiters
+  are granted in, `pg_locks`' other columns (`virtualtransaction`,
+  `fastpath`, `waitstart`), and predicate locks (`SIReadLock`) under
+  SERIALIZABLE.
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_row_locking_statements_take_postgres_relation_lock_modes, tests/backlog/test_rust_postgres_gaps.py::test_pg_locks_shows_transaction_id_locks, tests/backlog/test_rust_postgres_gaps.py::test_a_row_lock_waiter_waits_on_the_holders_transaction_id, tests/backlog/test_rust_postgres_gaps.py::test_a_lock_waiter_is_visible_with_its_blocker
+  Backlog-ID: RP-047
+
 - [ ] **RUST pgserver: the planner's choices that decide row order are only
   partly modelled.** **Decided (Joe, 2026-10-16): build a cost model** --
   enough of PostgreSQL's planner to make its choices, since the order rows
@@ -393,8 +420,22 @@ one beside it.
   WHERE under a LIMIT, and a non-unique integer index whose duplicates
   deduplication merges onto one leaf is sized so (`_bt_dedup_pass`):
   144 of 144 such shapes, 72 of 72 with rows inserted after the ANALYZE,
-  and 28 of 28 deduplicated-index shapes at 300 to 3,000 rows. Not
-  yet:
+  and 28 of 28 deduplicated-index shapes at 300 to 3,000 rows. Batch 15
+  (2026-10-16) added `NOT IN` (`<> ALL`), `IN` lists of nine or more (a
+  hashed ScalarArrayOpExpr: a startup of a hash a value, a hash and a
+  comparison a row) or with a repeated value, `OR`s as `canonicalize_qual`
+  leaves them (`pull_ors`, `process_duplicate_ors`), null tests as index
+  quals, one bitmap heap scan over `choose_bitmap_and`'s pick of every
+  bitmap path (BitmapAnds inside a BitmapOr arm and beside one), a plain
+  index scan's rows in its index's order, and VACUUM: `relpages`,
+  `reltuples` and `relallvisible`, the visibility map's count stored by a
+  later ANALYZE or CREATE INDEX (a row inserted since clears its page),
+  and index-only scans priced with the all-visible fraction when the index
+  holds every column read. 88 of 88 such shapes; 258 of 300 VACUUM shapes
+  at 20 to 3,000 rows against a private 15.19 cluster (VACUUM cannot run
+  in a transaction block), the other 42 each the deduplicated-index
+  decline below (checked shape by shape), keeping the order they had
+  before. Not yet:
   - An `OR` in the WHERE (a BitmapOr path), which keeps the HashAggregate
     unpriced (and is declined under a LIMIT); a DISTINCT with an ORDER BY,
     whose sort is not weighed; an ORDER BY with a LIMIT.
@@ -412,22 +453,26 @@ one beside it.
     a column that is not an integer (a text histogram is in the
     reference's locale: `select g from t3 where t > 'x2' group by g`), or
     equality on a text column whose repeated values overflow the MCV
-    list; `NOT IN`; an `IN` list of nine or more (a hashed
-    ScalarArrayOpExpr, costed otherwise) or with a repeated value; an
-    `OR` nested in an `OR`, or whose arms share a clause or repeat
-    (`find_duplicate_ors`); a BitmapOr arm whose index quals span two
-    columns (a BitmapAnd: `select t from ti where (g = 1 and k < 100) or
-    k > 9000 group by t`) or a column that several indexes hold; a null
-    test on an indexed column (an index qual); a plain index scan whose
-    index order is not the heap's; a
+    list; a hashed list inside an `OR`; an arm holding an `OR` of its own
+    in a BitmapOr, or one whose index quals the WHERE's other clauses
+    would join (`build_paths_for_OR`); a qual on a column that only a
+    later column of an index holds; two bitmap paths tied in cost and
+    selectivity; a statement whose columns read are not known (an
+    expression, a HAVING, an aggregate's FILTER) over a vacuumed table; an
+    index-only scan of an all-visible heap through a deduplicated index
+    past one leaf, whose size is not modelled (`select distinct g from ti
+    limit 3` at 1,500 rows); a
     join on its columns (`eqjoinsel` over its most common
     values); a key of a type whose statistics are not modelled (dates,
     numeric, arrays); extended statistics (`CREATE STATISTICS`); a table
     of more rows than ANALYZE samples (30,000), whose sample is random.
     A deduplicated non-unique index past one leaf keeps
-    `btree_size`'s undeduplicated estimate, as without statistics.
-    VACUUM (`relallvisible`, the visibility map) is declined entirely;
-    it cannot run in a transaction block, so it was not measured. A
+    `btree_size`'s undeduplicated estimate, as without statistics, where
+    the heap's pages dominate. VACUUM FULL is declined, and so is a
+    vacuumed table that now holds fewer rows; an UPDATE or DELETE after a
+    VACUUM clears visibility-map bits this model does not see. A NULL in
+    an `IN` list is dropped by the lowering, where PostgreSQL still counts
+    it in the list's length (its cost, and the nine for hashing). A
     ROLLBACK undoes ANALYZE's `relpages` / `reltuples` here, which
     PostgreSQL writes in place.
   - Joins: the join method (`secantus-pgplan/src/joincost.rs`: hash and
@@ -466,19 +511,25 @@ one beside it.
     stored tables joined INNER, each on one column equality to a table
     before it with no column in two clauses, runs the same search over
     four relations (`secantus-pg/src/join_order.rs`), bushy pairs
-    included (32 of 32 shapes at 20, 300 and 3,000 rows). Not yet: two
+    included, INNER or LEFT: a LEFT join's `SpecialJoinInfo` limits the
+    orders as `join_is_legal` does, an inner join above makes the LEFT
+    joins below it whose nullable table its clause reads inner, and a
+    LEFT join's right join (hash or merge) runs with its preserved side
+    hashed or merged in (71 of 71 four-table shapes at 20, 300 and 3,000
+    rows). A merge right join returns the rows nothing matched in their
+    key's place, three tables or four. Not yet: two
     classes spanning both sides (two join keys); an expression in a
     class; a LEFT join's class through the general path; a class over
     three tables of text or other non-integer keys; three tables with a
-    WHERE over two of them, a LIMIT, or a merge right join; four tables
-    with a LEFT join, a key two clauses share, a WHERE over two of them
-    or a LIMIT; more than four tables; an expression key with a function
+    WHERE over two of them or a LIMIT; four tables with a key two clauses
+    share, a WHERE over two of them or a LIMIT; a merge right join of two
+    tables; more than four tables; an expression key with a function
     call or a cast that costs; parameterized nested loops (an index scan inner); a LIMIT with
     an ORDER BY, or with a WHERE over the general path; a join of more
     than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_four_table_left_join_chain_joins_in_the_searched_order
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_four_tables_with_a_shared_key_join_on_its_class
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

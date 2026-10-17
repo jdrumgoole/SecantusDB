@@ -137,7 +137,7 @@ pub(crate) type Entry = (Vec<Vec<u8>>, usize);
 /// of the other (`"a"` and `"ab"`, `""` and anything), so a reversed key is
 /// first made one no other key starts with: its zero bytes escaped and a
 /// terminator added, as the entries table joins the parts of a compound key.
-fn directed(v: &Bson, reversed: bool, collation: Option<&Collation>) -> Vec<u8> {
+pub(crate) fn directed(v: &Bson, reversed: bool, collation: Option<&Collation>) -> Vec<u8> {
     let bytes = match (v, collation) {
         (Bson::String(_), Some(_)) => {
             secantus_core::sortkey::encode_sort_value(v, collation).unwrap_or_default()

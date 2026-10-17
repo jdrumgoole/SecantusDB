@@ -157,7 +157,7 @@ def test_dbpointer_min_update_operand(rust_mongo: Any, mongod: Any) -> None:
     assert answers[0] == answers[1]
 
 
-@pytest.mark.backlog("RM-128")
+@pytest.mark.backlog_fixed("RM-128")
 def test_std_dev_pop_last_ulp(rust_mongo: Any) -> None:
     """mongod 8.2.11 over [99, -4, 7.338]: `$stdDevPop` 46.11516078495468 and
     `$stdDevSamp` 56.47930666477178 (measured 2026-10-14)."""

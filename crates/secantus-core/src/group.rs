@@ -29,7 +29,8 @@ use bson::{Bson, Document};
 use crate::decimal;
 use crate::expressions;
 use crate::fallback::Fallback;
-use crate::numeric::{self, as_int_like, int_promoted_to_bson, int_to_bson, is_int64, NumVal};
+use crate::numeric::{self, as_int_like, int_to_bson, NumVal};
+use crate::summation::DoubleDoubleSum;
 
 /// This module used to be `Result<T, ()>`, which DISCARDED every error the
 /// expression evaluator named. `$group` therefore answered the generic
@@ -171,94 +172,206 @@ pub fn gkey(v: &Bson) -> R<GKey> {
     }
 }
 
-/// Running numeric value preserving Python's int-vs-float distinction. The
-/// integral variant also tracks whether any operand was int64, so the result
-/// promotes to int64 (MongoDB's numeric widening — `numerics.bson_add`).
+/// A running `$sum` / `$avg` total, as mongod keeps one (`AccumulatorSum`,
+/// `AccumulatorAvg`, 8.2): the widest numeric type seen, every non-decimal
+/// value in one compensated [`DoubleDoubleSum`] (ints and longs exactly),
+/// and decimals in a decimal total of their own, joined only at the end.
+/// `{$sum: <int | long | double literal>}` is mongod's constant sum instead:
+/// a plain sum in the literal's type, widening on overflow.
 // Not `Copy`: the decimal arm owns its coefficient digits.
 #[derive(Clone)]
 // `pub(crate)` only because it is reachable through the `pub(crate) Acc` the
 // `windowfields` module reuses; not part of any real cross-module API.
 pub(crate) enum Num {
-    Int {
-        v: i128,
-        wide: bool,
+    Sum {
+        width: Width,
+        total: DoubleDoubleSum,
+        decimal: Option<decimal::Dec>,
     },
-    Float(f64),
-    /// Decimal dominates the widening order, so a running total switches here
-    /// the moment any decimal value arrives and never switches back.
-    Dec(decimal::Dec),
+    Const(ConstSum),
+}
+
+/// mongod's numeric widening order (`Value::getWidestNumeric`).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Width {
+    Int,
+    Long,
+    Double,
+    Decimal,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ConstSum {
+    Int(i32),
+    Long(i64),
+    Double(f64),
 }
 
 impl Num {
-    /// Move the running total out, leaving a zero behind. `Num` stopped being
-    /// `Copy` when the decimal arm arrived; the accumulator loop still only
-    /// needs a move, so this keeps the hot `$sum` path allocation-free.
-    fn take(&mut self) -> Num {
-        std::mem::replace(self, Num::Int { v: 0, wide: false })
+    pub(crate) fn zero() -> Num {
+        Num::Sum {
+            width: Width::Int,
+            total: DoubleDoubleSum::default(),
+            decimal: None,
+        }
     }
 
-    /// Python `self + v`. `Err(Fallback::Defer)` if `v` isn't numeric (Python `int + str`
-    /// etc. raises -> defer). `pub(crate)` so the expression-form `$sum`/`$avg`
-    /// accumulators (`expressions.rs`) reuse the exact width logic for parity.
+    /// A constant sum, when `arg` is an int / long / double literal (mongod's
+    /// `getConstantArgument`; a decimal literal takes the general path).
+    pub(crate) fn constant_for(arg: &Bson) -> Option<Num> {
+        let lit = match arg {
+            Bson::Document(d) if d.len() == 1 => d.get("$literal")?,
+            other => other,
+        };
+        Some(Num::Const(match lit {
+            Bson::Int32(_) => ConstSum::Int(0),
+            Bson::Int64(_) => ConstSum::Long(0),
+            Bson::Double(_) => ConstSum::Double(0.0),
+            _ => return None,
+        }))
+    }
+
+    /// Move the running total out, leaving a zero behind.
+    fn take(&mut self) -> Num {
+        std::mem::replace(self, Num::zero())
+    }
+
+    /// Add one numeric value. A non-numeric one is `Err(Fallback::Defer)`;
+    /// the callers skip those first, as mongod ignores them.
     pub(crate) fn add(self, v: &Bson) -> R<Num> {
-        if matches!(self, Num::Dec(_)) || matches!(v, Bson::Decimal128(_)) {
-            return self.add_decimal(v);
-        }
-        match v {
-            Bson::Int32(_) | Bson::Int64(_) | Bson::Boolean(_) => {
-                let n = as_int_like(v).unwrap();
-                Ok(match self {
-                    Num::Int { v: a, wide } => Num::Int {
-                        v: a + n,
-                        wide: wide || is_int64(v),
-                    },
-                    Num::Float(f) => Num::Float(f + n as f64),
-                    // Unreachable — a decimal running total took the branch
-                    // above. Deferring (rather than panicking) keeps a wrong
-                    // assumption here a slowdown, not a crash.
-                    Num::Dec(_) => return Err(Fallback::Defer),
+        match self {
+            Num::Const(c) => Ok(Num::Const(const_add(c, v)?)),
+            Num::Sum {
+                width,
+                mut total,
+                decimal: dec,
+            } => {
+                let (w, dec) = match v {
+                    Bson::Int32(i) => {
+                        total.add_int(*i);
+                        (Width::Int, dec)
+                    }
+                    Bson::Int64(i) => {
+                        total.add_long(*i);
+                        (Width::Long, dec)
+                    }
+                    Bson::Double(d) => {
+                        total.add_double(*d);
+                        (Width::Double, dec)
+                    }
+                    Bson::Decimal128(_) => {
+                        let x = decimal::from_bson_accumulator(v).ok_or(Fallback::Defer)?;
+                        let sum = match dec {
+                            // mongod starts the decimal total at Decimal128(0).
+                            None => decimal::add(&decimal_zero()?, &x),
+                            Some(d) => decimal::add(&d, &x),
+                        };
+                        (Width::Decimal, Some(sum.ok_or(Fallback::Defer)?))
+                    }
+                    _ => return Err(Fallback::Defer),
+                };
+                Ok(Num::Sum {
+                    width: width.max(w),
+                    total,
+                    decimal: dec,
                 })
             }
-            Bson::Double(d) => Ok(match self {
-                Num::Int { v: a, .. } => Num::Float(a as f64 + d),
-                Num::Float(f) => Num::Float(f + d),
-                Num::Dec(_) => return Err(Fallback::Defer), // as above
-            }),
-            _ => Err(Fallback::Defer), // string / array / doc / Decimal128 / null -> TypeError
         }
     }
 
-    /// The decimal-domain arm of [`Num::add`]. Bools stay int-like here exactly
-    /// as they are on the integer path, so widening to decimal can't silently
-    /// change which values a `$sum` counts.
-    fn add_decimal(self, v: &Bson) -> R<Num> {
-        let a = match self {
-            Num::Dec(d) => d,
-            Num::Int { v: a, .. } => decimal::parse(&a.to_string()).ok_or(Fallback::Defer)?,
-            Num::Float(f) => {
-                decimal::from_bson_accumulator(&Bson::Double(f)).ok_or(Fallback::Defer)?
-            }
+    /// The decimal total plus the non-decimal one as a decimal.
+    fn decimal_total(total: &DoubleDoubleSum, dec: Option<decimal::Dec>) -> R<decimal::Dec> {
+        let rest = total.get_decimal().ok_or(Fallback::Defer)?;
+        let dec = match dec {
+            Some(d) => d,
+            None => decimal_zero()?,
         };
-        let b = match v {
-            Bson::Boolean(_) => {
-                decimal::from_bson(&Bson::Int32(as_int_like(v).ok_or(Fallback::Defer)? as i32))
-                    .ok_or(Fallback::Defer)?
-            }
-            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
-                decimal::from_bson_accumulator(v).ok_or(Fallback::Defer)?
-            }
-            _ => return Err(Fallback::Defer), // string / array / doc / null -> TypeError
-        };
-        Ok(Num::Dec(decimal::add(&a, &b).ok_or(Fallback::Defer)?))
+        decimal::add(&dec, &rest).ok_or(Fallback::Defer)
     }
 
+    /// `AccumulatorSum::getValue`.
     pub(crate) fn into_bson(self) -> R<Bson> {
         match self {
-            Num::Int { v, wide } => int_promoted_to_bson(v, wide).ok_or(Fallback::Defer),
-            Num::Float(f) => Ok(Bson::Double(f)),
-            Num::Dec(d) => decimal::to_bson(&d).ok_or(Fallback::Defer),
+            Num::Const(ConstSum::Int(i)) => Ok(Bson::Int32(i)),
+            Num::Const(ConstSum::Long(i)) => Ok(Bson::Int64(i)),
+            Num::Const(ConstSum::Double(d)) => Ok(Bson::Double(d)),
+            Num::Sum {
+                width,
+                total,
+                decimal: dec,
+            } => match width {
+                Width::Decimal => {
+                    decimal::to_bson(&Num::decimal_total(&total, dec)?).ok_or(Fallback::Defer)
+                }
+                Width::Int if total.fits_long() => {
+                    let v = total.get_long();
+                    Ok(i32::try_from(v).map_or(Bson::Int64(v), Bson::Int32))
+                }
+                Width::Int | Width::Long if total.fits_long() => Ok(Bson::Int64(total.get_long())),
+                _ => Ok(Bson::Double(total.get_double())),
+            },
         }
     }
+
+    /// `AccumulatorAvg::getValue` over `count` values (`count > 0`).
+    pub(crate) fn average(self, count: i64) -> R<Bson> {
+        match self {
+            Num::Sum {
+                width: Width::Decimal,
+                total,
+                decimal: dec,
+            } => {
+                let sum = Num::decimal_total(&total, dec)?;
+                decimal::to_bson(&decimal::div_int(&sum, count).ok_or(Fallback::Defer)?)
+                    .ok_or(Fallback::Defer)
+            }
+            Num::Sum { total, .. } => Ok(Bson::Double(total.get_double() / count as f64)),
+            // `$avg` never takes the constant path.
+            Num::Const(_) => Err(Fallback::Defer),
+        }
+    }
+}
+
+fn decimal_zero() -> R<decimal::Dec> {
+    decimal::parse("0").ok_or(Fallback::Defer)
+}
+
+/// `AccumulatorSum::_processInternalConstant`: int overflows to long, long to
+/// double; a double is a plain sum.
+fn const_add(c: ConstSum, v: &Bson) -> R<ConstSum> {
+    let as_long = |v: &Bson| -> R<i64> {
+        Ok(match v {
+            Bson::Int32(i) => i64::from(*i),
+            Bson::Int64(i) => *i,
+            // `coerceToLong` of a double truncates.
+            Bson::Double(d) => *d as i64,
+            _ => return Err(Fallback::Defer),
+        })
+    };
+    let as_double = |v: &Bson| -> R<f64> {
+        Ok(match v {
+            Bson::Int32(i) => f64::from(*i),
+            Bson::Int64(i) => *i as f64,
+            Bson::Double(d) => *d,
+            _ => return Err(Fallback::Defer),
+        })
+    };
+    Ok(match c {
+        ConstSum::Int(t) => {
+            let Bson::Int32(i) = v else {
+                return Err(Fallback::Defer);
+            };
+            match t.checked_add(*i) {
+                Some(s) => ConstSum::Int(s),
+                None => const_add(ConstSum::Long(i64::from(t)), v)?,
+            }
+        }
+        ConstSum::Long(t) => match t.checked_add(as_long(v)?) {
+            Some(s) => ConstSum::Long(s),
+            None => ConstSum::Double(t as f64 + as_double(v)?),
+        },
+        ConstSum::Double(t) => ConstSum::Double(t + as_double(v)?),
+    })
 }
 
 /// One accumulator's running state.
@@ -342,7 +455,7 @@ struct Compiled<'a> {
 
 pub(crate) fn new_acc(op: &str) -> R<Acc> {
     Ok(match op {
-        "$sum" => Acc::Sum(Num::Int { v: 0, wide: false }),
+        "$sum" => Acc::Sum(Num::zero()),
         "$count" => Acc::Count(0),
         "$avg" => Acc::Avg(None),
         "$min" => Acc::Min(None),
@@ -467,25 +580,22 @@ fn percentile_finalize(is_median: bool, ps: Option<Vec<f64>>, mut values: Vec<f6
 
 /// `arg == 1 and not isinstance(arg, bool)` in Python — the literal-count
 /// fast path. A bool operand is *not* one here (mongod ignores it in `$sum`).
-fn arg_is_one(arg: &Bson) -> bool {
-    matches!(arg, Bson::Int32(1) | Bson::Int64(1)) || matches!(arg, Bson::Double(d) if *d == 1.0)
-}
-
 pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Document) -> R<()> {
     match acc {
         Acc::Sum(running) => {
+            // A numeric literal is mongod's constant sum; the first document
+            // switches a fresh total over to it (the argument never changes).
+            if matches!(running, Num::Sum { .. }) {
+                if let Some(c) = Num::constant_for(arg) {
+                    *running = c;
+                }
+            }
             // mongod sums only numeric operands (int / long / double / decimal);
             // string / bool / null / missing / array / doc are ignored.
-            if arg_is_one(arg) {
-                *running = running.take().add(&Bson::Int32(1))?;
-            } else {
-                if let v @ (Bson::Int32(_)
-                | Bson::Int64(_)
-                | Bson::Double(_)
-                | Bson::Decimal128(_)) = eval(arg, doc, vars)?
-                {
-                    *running = running.take().add(&v)?;
-                }
+            if let v @ (Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)) =
+                eval(arg, doc, vars)?
+            {
+                *running = running.take().add(&v)?;
             }
         }
         Acc::Count(n) => *n += 1,
@@ -495,7 +605,7 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
             if let v @ (Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)) =
                 eval(arg, doc, vars)?
             {
-                let (total, count) = state.take().unwrap_or((Num::Int { v: 0, wide: false }, 0));
+                let (total, count) = state.take().unwrap_or((Num::zero(), 0));
                 *state = Some((total.add(&v)?, count + 1));
             }
         }
@@ -561,7 +671,15 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
             // bool and NaN excluded) and handles Decimal128, which
             // `numeric_f64` does not — mongod answers a double even for decimal
             // input (probed: $stdDevPop over Decimal128 5 and 7 is 1.0).
-            if let Some(f) = percentile_f64(&v) {
+            // Unlike a percentile, NaN takes part: mongod's Welford step
+            // carries it into the answer (measured 8.2.11: `$stdDevPop` of
+            // NaN and 1, of a decimal NaN and 1, is NaN).
+            let f = percentile_f64(&v).or(match &v {
+                Bson::Double(d) => Some(*d),
+                Bson::Decimal128(_) => Some(f64::NAN),
+                _ => None,
+            });
+            if let Some(f) = f {
                 values.push(f);
             }
         }
@@ -739,31 +857,30 @@ fn nelem_result(kind: NElemKind, n: usize, vals: Vec<Bson>) -> R<Vec<Bson>> {
     }
 }
 
-/// Population / sample standard deviation, mirroring the pure `_std_dev`: `None`
-/// for an empty set, and additionally for a sample (`pop == false`) with < 2
-/// values (population of a single value is `0.0`). Squares with plain
-/// multiplication (`d * d`) and roots with `sqrt` — both correctly-rounded IEEE
-/// operations that reproduce CPython's `(x - mean) ** 2` / `... ** 0.5` bit-for-bit
-/// (a fuzz seed exposed that `f64::powf(2.0)` can round differently from
-/// multiplication). Sums in document order to match `sum(...)`.
-/// Shared with the EXPRESSION forms in `expressions.rs`, so the two cannot
-/// answer different numbers for the same values.
+/// Population / sample standard deviation as mongod computes it: Welford's
+/// online algorithm in document order, with the `m2` update a fused
+/// multiply-add, which is what mongod's arm64 build compiles it to (RM-128:
+/// matches mongod 8.2.11 bit for bit on 300 random value sets, where a
+/// two-pass mean-then-squares answered 160 and Welford without the fused
+/// step 179). `None` for an empty set, and for a sample (`pop == false`)
+/// with fewer than 2 values. Shared with the EXPRESSION forms in
+/// `expressions.rs`, so the two cannot answer different numbers.
 pub(crate) fn std_dev(values: &[f64], pop: bool) -> Option<f64> {
     let n = values.len();
     if n == 0 || (!pop && n < 2) {
         return None;
     }
-    let mean = values.iter().sum::<f64>() / n as f64;
+    let (mut mean, mut m2) = (0.0f64, 0.0f64);
+    for (i, &x) in values.iter().enumerate() {
+        let delta = x - mean;
+        // mongod skips a zero step (`accumulator_std_dev.cpp`).
+        if delta != 0.0 {
+            mean += delta / (i + 1) as f64;
+            m2 = delta.mul_add(x - mean, m2);
+        }
+    }
     let denom = if pop { n } else { n - 1 } as f64;
-    let var = values
-        .iter()
-        .map(|x| {
-            let d = x - mean;
-            d * d
-        })
-        .sum::<f64>()
-        / denom;
-    Some(var.sqrt())
+    Some((m2 / denom).sqrt())
 }
 
 /// `$min` / `$max`: ignore null / missing and order every other value by BSON
@@ -815,21 +932,7 @@ fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
                 // always-created avg state finalising to null.
                 match state {
                     Some((total, count)) => {
-                        let val = match total {
-                            Num::Int { v: a, .. } => {
-                                if a.unsigned_abs() > (1u128 << 53) {
-                                    return Err(Fallback::Defer); // precision: defer to Python int/int divide
-                                }
-                                Bson::Double(a as f64 / count as f64)
-                            }
-                            Num::Float(f) => Bson::Double(f / count as f64),
-                            // Stay in the decimal domain — an f64 divide would
-                            // narrow the type and drop digits.
-                            Num::Dec(d) => decimal::to_bson(
-                                &decimal::div_int(&d, count).ok_or(Fallback::Defer)?,
-                            )
-                            .ok_or(Fallback::Defer)?,
-                        };
+                        let val = total.average(count)?;
                         out.insert(field.to_string(), val);
                     }
                     None => {
@@ -904,26 +1007,7 @@ pub(crate) fn finalize_window_value(acc: Acc) -> R<Bson> {
         Acc::Sum(n) => n.into_bson()?,
         Acc::Count(n) => int_to_bson(n as i128).ok_or(Fallback::Defer)?,
         Acc::Avg(state) => match state {
-            Some((total, count)) => {
-                let tf = match total {
-                    Num::Int { v: a, .. } => {
-                        if a.unsigned_abs() > (1u128 << 53) {
-                            return Err(Fallback::Defer); // precision: defer to Python int/int divide
-                        }
-                        a as f64
-                    }
-                    Num::Float(f) => f,
-                    // A decimal total stays in the decimal domain — dividing
-                    // through f64 would both narrow the type and lose digits.
-                    Num::Dec(d) => {
-                        return decimal::to_bson(
-                            &decimal::div_int(&d, count).ok_or(Fallback::Defer)?,
-                        )
-                        .ok_or(Fallback::Defer);
-                    }
-                };
-                Bson::Double(tf / count as f64)
-            }
+            Some((total, count)) => total.average(count)?,
             None => Bson::Null,
         },
         Acc::Min(v) | Acc::Max(v) => v.unwrap_or(Bson::Null),

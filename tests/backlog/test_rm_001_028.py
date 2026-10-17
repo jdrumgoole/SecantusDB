@@ -291,7 +291,7 @@ def test_fcv_80_refuses_a_feature_82_added(rust_mongo: Any) -> None:
     assert got == expected
 
 
-@pytest.mark.backlog("RM-026")
+@pytest.mark.backlog_fixed("RM-026")
 def test_dbhash_includes_timeseries_buckets(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `dbHash` lists `system.buckets.<name>` for a
     time-series collection."""

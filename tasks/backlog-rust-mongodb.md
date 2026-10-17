@@ -605,10 +605,6 @@ may run a command.
       version.
       Backlog-ID: RM-025
       Verify: tests/backlog/test_rm_001_028.py::test_fcv_80_refuses_a_feature_82_added
-- [ ] **`dbHash` leaves out a time-series collection** and hashes none of
-      its buckets; mongod hashes `system.buckets.<name>`. Not measured.
-      Backlog-ID: RM-026
-      Verify: tests/backlog/test_rm_001_028.py::test_dbhash_includes_timeseries_buckets
 - [ ] **`mapReduce` with `out`** (18) answers an error here (9, "only
       supports {out: {inline: 1}}") where mongod runs it; the users allowed
       are the same. Without a JavaScript engine only the one shape the
@@ -688,18 +684,15 @@ unit tests of `generic.rs`, `serverinfo.rs` and `handshake.rs`.
 
 Still different:
 
-- [ ] **`validate` with `background: true` reads the live collection.**
-      mongod validates the last checkpoint, so a collection created since
-      then is 26 ("does not exist to validate") and one written since is
-      validated as it was. Here it validates what is there now. Modelling
-      it means reading WiredTiger's checkpoint, not the live table.
-      (`validate` itself reads the store: `Storage::check_collection`
-      compares every document with each index's entries, both ways, and
-      with the `_id` index. Its key counts match mongod over seven index
-      shapes. It repairs nothing, and it does not check a time-series
-      collection's buckets or a unique index's claims.)
-      Backlog-ID: RM-033
-      Verify: tests/backlog/test_rm_029_056.py::test_background_validate_of_an_uncheckpointed_collection
+- **Not measured — `validate` with `background: true`** (RM-033's
+      remainder, 2026-10-16). It reads WiredTiger's last checkpoint now, so
+      a collection no checkpoint holds is 26, as on mongod
+      (`test_background_validate_of_an_uncheckpointed_collection`). Still
+      read live, and not yet compared with mongod: a time-series
+      collection's `nrecords` (its buckets), and `system.views`. A store held
+      in memory answers 115 with this server's own text, because mongod's
+      in-memory engine is Enterprise-only and its message could not be
+      measured.
 - [ ] **`serverStatus.locks` is absent**, and with it the gap test's last
       section. mongod counts its lock manager's acquisitions per resource
       and mode, and this server has no such lock manager. The other
@@ -715,6 +708,11 @@ Still different:
       does not parse counts as a run; `$out` / `$merge` writes are not in
       `metrics.document`; a `bulkWrite` multi-update counts its documents
       in `metrics.query`.
+      **Decided 2026-10-16 (Joe): build a real lock manager** -- mongod's
+      resources (`Global`, `Database`, `Collection`, `Mutex`, `oplog`, ...)
+      and modes (`r` / `w` / `R` / `W`), taken by the commands that take
+      them on mongod, with `serverStatus.locks` counted from its
+      acquisitions. Not a table of plausible counts.
       Backlog-ID: RM-034
       Verify: tests/backlog/test_rm_029_056.py::test_server_status_sections
 - [ ] **Server parameters** (about 30). `getParameter` reports the
@@ -929,13 +927,6 @@ Still different, all 77:
       (`sortkey::is_format1_number_key`), so a sweep on open would close it.
       Backlog-ID: RM-153
       Verify: none -- needs an older build to write the store
-- [ ] **The multikey paths are not stored.** They are read from the
-      collection the first time a query needs them after the server starts
-      or an index is dropped, and kept current by writes after that
-      (`Storage::index_multikey_paths`). mongod's are in its catalog and
-      never shrink; after a restart these are what the documents hold.
-      Backlog-ID: RM-055
-      Verify: tests/backlog/test_rm_029_056.py::test_multikey_paths_survive_a_restart
 - [ ] **The cost of the plan trial.** Release builds against 43463aa6
       (2026-10-15): a query two indexes could serve costs about 5 times as
       much on 2,000 documents (`{a: 5, b: 3}` over `a_1` and `b_1`), 2
@@ -1197,37 +1188,31 @@ differs on 5 scenarios. What is left:
       result. One scenario.
       Backlog-ID: RM-080
       Verify: tests/backlog/test_rm_057_084.py::test_get_more_sees_writes_made_since_the_find
-- [ ] **RUST MongoDB server: an `aggregate` cursor outlives the index it
-      reads.** A `find` cursor is killed when its index is dropped (175,
-      since 2026-10-14); an `aggregate` whose `$match` reads one is not.
-      Not measured against mongod.
-      Backlog-ID: RM-082
-      Verify: tests/backlog/test_rm_057_084.py::test_aggregate_cursor_after_its_index_is_dropped
-- [ ] **RUST MongoDB server: smaller cursor differences.** A projection of
-      `{$meta: "recordId"}` or `{$meta: "indexKey"}` adds nothing (mongod:
-      the record id, the index key), and `showRecordId` gives each document
-      its position in the reply, not its RecordId (after the first of four
-      is deleted mongod says 2, 3, 4; this server 1, 2, 3).
-      **The record id needs a decision:** mongod numbers records per
-      collection from 1 and stores the counter; this store's RecordId is
-      one counter for every collection, and no per-collection one is kept.
-      Reporting the store's own would be this server's real record id but
-      not mongod's number. `indexKey` needs no decision: the key the plan's
-      index scan read for the document (a multikey document's first key in
-      bounds), as a document with its fields in name order (`{z: 1, a: -1}`
-      gives `{a: .., z: ..}`), measured 8.2.11; about half a day with the
-      explain module's bounds. In `aggregate`, `$project` takes both, and
-      `$addFields` adds nothing (mongod's oddity, 8.2.11).
-      An unknown hint is refused with the code and this server's own text,
-      a decision already made (`tests/test_rust_hint_error_message.py`).
+- [ ] **RUST MongoDB server: `$meta` in an aggregate pipeline, three
+      shapes.** `{$meta: "recordId"}` / `{$meta: "indexKey"}` projections and
+      `showRecordId` give mongod's values since 2026-10-16 (records are
+      numbered per collection from 1). Still different, measured against
+      8.2.11:
+      - `{$meta: "sortKey"}` after a `$sort` is refused here as unsupported
+        (2); mongod gives the key as an array (`[3]` for `{a: 1}`), in
+        `$project` and `$addFields` alike;
+      - a `$group` keyed on `{$meta: "recordId"}` is refused here (2);
+        mongod groups every document under `null`;
+      - `{$meta: "geoNearDistance"}` after a `$geoNear` is 40218 here, and
+        mongod gives the distance.
       Not probed: `oplogReplay`, `$meta: "textScore"` sorts, an
       `explain: true` aggregate.
-      **Decided 2026-10-16 (Joe):** per-collection record ids, on disk:
-      number each collection's records from 1 and store the counter, as
-      mongod does, so `showRecordId` and `$meta: "recordId"` give mongod's
-      numbers. The Python server need not read the result (`CLAUDE.md`).
+      The record-id counter is NOT stored: mongod rebuilds it from the
+      largest record id when it reopens a collection, and so does this
+      server, which is what the 2026-10-16 decision ("number each
+      collection's records from 1 ... as mongod does") comes to once
+      measured. A store written before then keeps its store-wide record ids
+      on its existing documents, and new inserts carry on from the largest.
+      Not measured: a collection dropped while a transaction still holds
+      uncommitted inserts in it (RM-084's situation) could reuse a record id
+      when recreated.
       Backlog-ID: RM-083
-      Verify: tests/backlog/test_rm_057_084.py::test_meta_record_id_and_index_key_projections, tests/backlog/test_rm_found_2026_10_16.py::test_show_record_id_is_the_record_id
+      Verify: tests/backlog/test_rm_057_084.py::test_meta_sort_key_in_aggregate, tests/backlog/test_rm_057_084.py::test_group_keyed_on_meta, tests/backlog/test_rm_057_084.py::test_meta_geo_near_distance_after_geo_near
 
 ### 7.072 Sessions, transactions and retryable writes -- 2026-10-11
 
@@ -1750,27 +1735,18 @@ Rust-only driver-gauge failures that are deliberately not chased:
   `$match` / `$sort` keep the original 2 / 28766. There is no rule derivable
   short of probing every accumulator. The other 11 of 12 aggregation
   runtime-error wrapper shapes match mongod 8.2.11.
-- [ ] **`$stdDevPop` last-ULP vs mongod** (both servers): both agree with each
-  other but differ from mongod in the final ULP (e.g. `2.357022603955158` vs
-  mongod's `2.3570226039551585`); mongod uses a different summation order.
-  Precision-only; likely a permanent minor divergence. Re-probe on 8.2.11.
-  Backlog-ID: RM-128
-  Verify: tests/backlog/test_rm_113_138.py::test_std_dev_pop_last_ulp
-- **Out of scope — `$meta` inside an AGGREGATION stage.** 21 shapes probed
-  on 8.2.11: mongod's behaviour there is its metadata dependency analysis
-  (`DepsTracker`) leaking through (`$project` returns `recordId` but
-  `$addFields` omits it; `recordId` survives `$match` but not `$limit` /
-  `$skip` / `$group`; `sortKey` without `$sort` errors in `$project` and
-  returns `[]` in `$addFields`). Our aggregate `$meta` answers
-  `168 Unrecognized expression '$meta'`; revisit only with the dependency
-  analysis, not operator by operator. (Find-projection `$meta` is done.)
-- **Deliberate divergence — `$meta: "recordId"` values are store-wide.** Our
-  RecordId is a store-wide insertion counter and mongod's restarts per
-  collection, so a second collection in the same store starts at 3 where mongod
-  starts at 1. Matching it means a per-collection counter, and that counter IS
-  the document table's key — a storage-format change shared byte-for-byte by
-  both servers. Uniqueness and insertion-order ascent hold
-  (`tests/test_meta_projection.py`).
+- **Scope decision — `$meta` inside an AGGREGATION stage follows where
+  mongod's query layer hands the document over, not an operator table.**
+  Since 2026-10-16 `recordId` and `indexKey` are given there
+  (`secantus-commands/src/agg_meta.rs`, measured 8.2.11): the record id
+  only in a `$project` the query layer takes, the index key through the
+  stages that keep a document's metadata. What is still different is
+  RM-083's three shapes. (Find-projection `$meta` is done.)
+- **Decided 2026-10-16 (Joe) — record ids are numbered per collection
+  from 1**, as on mongod, so `$meta: "recordId"` and `showRecordId` give
+  mongod's numbers. This replaced the earlier deliberate divergence (one
+  store-wide counter). The counter is rebuilt from the collection's
+  largest record id, not stored: mongod does the same.
 
 ### 7.7 Rust storage: no close-time checkpoint / no `durable` mode
 

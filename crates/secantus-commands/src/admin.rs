@@ -1818,6 +1818,7 @@ pub(crate) fn listed_indexes(
         ix.remove("numberKeys");
         ix.remove("pythonKeys");
         ix.remove("buildSeq");
+        ix.remove("multikeyPaths");
         *ix = listed_spec(std::mem::take(ix));
     }
     // The `_id` index of a collection with a default collation carries it.
@@ -3387,6 +3388,7 @@ pub(crate) const INDEX_CATALOG_ONLY: &[&str] = &[
     "numberKeys",
     "pythonKeys",
     "buildSeq",
+    "multikeyPaths",
 ];
 
 fn index_options(spec: &Document) -> Document {
@@ -4251,8 +4253,10 @@ pub fn current_op(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 /// counts in `errors`, when a document cannot be read, an entry is missing
 /// or an entry belongs to no document. Until 2026-10-13 this answered
 /// `valid: true` without looking and reported one key per document for
-/// every index. `full` and `background` change how mongod scans and not the
-/// verdict, so they are taken and change nothing here; nothing is repaired.
+/// every index. `full` changes how mongod scans and not the verdict, so it is
+/// taken and changes nothing here; nothing is repaired. `background` reads
+/// the collection as the last checkpoint holds it, as mongod does
+/// (`Storage::check_collection_at_checkpoint`).
 pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = match doc.get("validate") {
         Some(Bson::String(s)) => s.clone(),
@@ -4263,13 +4267,89 @@ pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             )
         }
     };
+    // An option is on for any value but null, false and zero (a string too).
+    let on = |option: &str| match doc.get(option) {
+        None | Some(Bson::Null) | Some(Bson::Boolean(false)) => false,
+        Some(v @ (Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_))) => crate::util::truthy(v),
+        Some(_) => true,
+    };
+    // The options are checked before the namespace, in mongod's order
+    // (measured 8.2.11, standalone and a one-member replica set).
+    if on("metadata")
+        && ["full", "repair", "background", "checkBSONConformance"]
+            .iter()
+            .any(|other| on(other))
+    {
+        return Err(CommandError::new(
+            72,
+            "InvalidOptions",
+            "Running the validate command with { metadata: true } is not supported with any \
+             other options",
+        ));
+    }
+    let background = on("background");
+    for other in ["full", "repair"] {
+        if background && on(other) {
+            return Err(CommandError::new(
+                72,
+                "InvalidOptions",
+                format!(
+                    "Running the validate command with both {{ background: true }} and \
+                     {{ {other}: true }} is not supported."
+                ),
+            ));
+        }
+    }
+    if on("repair") && ctx.replica_set_name.is_some() {
+        return Err(CommandError::new(
+            72,
+            "InvalidOptions",
+            "Running the validate command with { repair: true } can only be performed in \
+             standalone mode.",
+        ));
+    }
+    // A background validation reads the last checkpoint, which mongod keeps
+    // a timestamp for only as a replica-set member.
+    if background && ctx.replica_set_name.is_none() {
+        return Err(CommandError::new(
+            115,
+            "CommandNotSupported",
+            "Running the validate command with { background: true } is not supported in \
+             standalone mode",
+        ));
+    }
     let storage = ctx.storage()?;
+    // A background validation reads the collection as the last checkpoint
+    // holds it (`Storage::check_collection_at_checkpoint`): one created
+    // since does not exist to it, and one written since is checked as it
+    // was. A store with no checkpoints (one held in memory) cannot.
+    let checkpointed = if background {
+        match storage
+            .check_collection_at_checkpoint(&ctx.db_name, &coll)
+            .map_err(command_error)?
+        {
+            Some(found) => Some(found),
+            None => {
+                return Err(CommandError::new(
+                    115,
+                    "CommandNotSupported",
+                    "Running the validate command with { background: true } is not supported \
+                     by a store that keeps no checkpoints",
+                ))
+            }
+        }
+    } else {
+        None
+    };
     // `system.views` is what mongod keeps its view definitions in. Here they
     // are in the catalog, and it is validated as `find` and `listCollections`
     // show it: one record a definition, under its `_id` index.
-    let exists = storage
-        .collection_exists(&ctx.db_name, &coll)
-        .map_err(command_error)?;
+    let exists = match &checkpointed {
+        Some(found) => found.is_some(),
+        None => storage
+            .collection_exists(&ctx.db_name, &coll)
+            .map_err(command_error)?,
+    };
     let view_definitions = if coll == "system.views" && !exists {
         Some(crate::ts_buckets::view_definitions(storage, &ctx.db_name)?)
             .filter(|definitions| !definitions.is_empty())
@@ -4287,42 +4367,7 @@ pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         )
         .into_reply());
     }
-    // An option is on for any value but null, false and zero (a string too).
-    let on = |option: &str| match doc.get(option) {
-        None | Some(Bson::Null) | Some(Bson::Boolean(false)) => false,
-        Some(v @ (Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_))) => crate::util::truthy(v),
-        Some(_) => true,
-    };
-    if on("repair") && ctx.replica_set_name.is_some() {
-        return Err(CommandError::new(
-            72,
-            "InvalidOptions",
-            "Running the validate command with { repair: true } can only be performed in \
-             standalone mode.",
-        ));
-    }
-    if on("metadata")
-        && ["full", "repair", "background", "checkBSONConformance"]
-            .iter()
-            .any(|other| on(other))
-    {
-        return Err(CommandError::new(
-            72,
-            "InvalidOptions",
-            "Running the validate command with { metadata: true } is not supported with any \
-             other options",
-        ));
-    }
-    // mongod rejects full+background together (full needs an exclusive scan).
-    if bool_field(doc, "full", false) && bool_field(doc, "background", false) {
-        return Ok(CommandError::new(
-            72,
-            "InvalidOptions",
-            "Running the validate command with both { background: true } and { full: true } is \
-             not supported.",
-        )
-        .into_reply());
-    }
+    let checkpointed = checkpointed.flatten();
     if let Some(definitions) = view_definitions {
         let n = int_bson(definitions.len() as i64);
         return Ok(doc! {
@@ -4349,22 +4394,33 @@ pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     // A time-series collection is validated as its buckets: mongod counts
     // them, names their namespace and shows each index as it lies on them.
-    let options = storage
-        .get_collection_options(&ctx.db_name, &coll)
-        .map_err(command_error)?;
-    let layout = crate::ts_buckets::Layout::of(&options);
-    let nrecords = match &layout {
-        Some(_) => crate::ts_buckets::of_collection(storage, &ctx.db_name, &coll)?.len() as i64,
+    let options = match &checkpointed {
+        Some(found) => found.get_document("options").cloned().unwrap_or_default(),
         None => storage
+            .get_collection_options(&ctx.db_name, &coll)
+            .map_err(command_error)?,
+    };
+    let layout = crate::ts_buckets::Layout::of(&options);
+    let nrecords = match (&layout, &checkpointed) {
+        // The buckets are derived from the live documents, background or
+        // not (`tasks/backlog-rust-mongodb.md`, RM-033).
+        (Some(_), _) => {
+            crate::ts_buckets::of_collection(storage, &ctx.db_name, &coll)?.len() as i64
+        }
+        (None, Some(found)) => found.get_i64("records").unwrap_or(0),
+        (None, None) => storage
             .count_matching(&ctx.db_name, &coll, &Document::new())
             .map_err(command_error)? as i64,
     };
     // The check itself: every document read, and each index compared with
     // the entries its documents should have. A store that cannot check
     // itself (a test double) reports what it is told.
-    let check = storage
-        .check_collection(&ctx.db_name, &coll)
-        .map_err(command_error)?;
+    let check = match &checkpointed {
+        Some(found) => Some(found.clone()),
+        None => storage
+            .check_collection(&ctx.db_name, &coll)
+            .map_err(command_error)?,
+    };
     let checked: std::collections::HashMap<String, Document> = check
         .as_ref()
         .and_then(|c| c.get_array("indexes").ok())
@@ -4393,9 +4449,27 @@ pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             "Detected {extra} extra index entries."
         )));
     }
-    let indexes = storage
-        .list_indexes(&ctx.db_name, &coll)
-        .map_err(command_error)?;
+    let indexes = match &checkpointed {
+        // The indexes the checkpoint holds: one built since is not there.
+        Some(found) => {
+            let mut listed = Vec::new();
+            if coll != "system.profile" {
+                listed.push(doc! { "v": 2, "key": {"_id": 1}, "name": "_id_" });
+            }
+            listed.extend(
+                found
+                    .get_array("listed")
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Bson::as_document)
+                    .cloned(),
+            );
+            listed
+        }
+        None => storage
+            .list_indexes(&ctx.db_name, &coll)
+            .map_err(command_error)?,
+    };
     let mut keys_per_index = Document::new();
     let mut index_details = Document::new();
     let mut n_indexes = 0i32;
@@ -4450,9 +4524,21 @@ pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         "valid": errors.is_empty(),
         "repaired": false,
         "repairMode": "None",
-        "ns": ns,
     };
-    if let Ok(uuid) = storage.collection_uuid(&ctx.db_name, &coll) {
+    // A background validation names the time it read at: the last
+    // operation the checkpoint holds.
+    if let Some(Bson::Timestamp(ts)) = checkpointed.as_ref().and_then(|c| c.get("readTimestamp")) {
+        reply.insert("readTimestamp", *ts);
+    }
+    reply.insert("ns", ns);
+    // In the background, the checkpoint's own (a collection dropped and made
+    // again since has a new one, and one dropped since has none live).
+    let uuid = match (&checkpointed, options.get("uuid")) {
+        (Some(_), Some(Bson::Binary(b))) => Some(b.bytes.clone()),
+        (Some(_), _) => None,
+        (None, _) => storage.collection_uuid(&ctx.db_name, &coll).ok(),
+    };
+    if let Some(uuid) = uuid {
         if uuid.len() == 16 {
             let uuid = match &layout {
                 Some(_) => crate::ts_buckets::derived_uuid(&uuid, 1),

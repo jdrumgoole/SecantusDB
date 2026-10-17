@@ -41,9 +41,27 @@ pub enum Qual {
     Range(bool),
     /// `col IN (...)` of this many non-NULL values (a `ScalarArrayOpExpr`).
     In(usize),
-    /// A clause no index serves here (an `OR`, a null test), costing this
-    /// many operators a row.
+    /// A clause no index serves here (an `OR`), costing this many operators
+    /// a row.
     Filter(f64),
+    /// `col IS NULL` (`true`) or `col IS NOT NULL`: a B-tree index qual
+    /// (`amsearchnulls`), costing nothing on the heap (`cost_qual_eval`
+    /// charges no NullTest).
+    IsNull(bool),
+    /// `col NOT IN (...)` of this many values (`<> ALL`): never an index
+    /// qual.
+    NotIn(usize),
+}
+
+/// From this many elements a constant `IN` / `NOT IN` list is a hashed
+/// ScalarArrayOpExpr (`MIN_ARRAY_SIZE_FOR_HASHED_SAOP`).
+const HASHED_SAOP: usize = 9;
+
+impl Qual {
+    /// An index qual on its column (`match_clause_to_indexcol`).
+    fn indexable(&self) -> bool {
+        !matches!(self, Qual::Ne | Qual::Filter(_) | Qual::NotIn(_))
+    }
 }
 
 /// A WHERE's conjuncts as `(stored field, qual)`, in no particular order.
@@ -96,14 +114,28 @@ pub fn conjuncts(filter: &Document) -> Option<Vec<(String, Qual)>> {
     Some(out)
 }
 
-/// `cost_qual_eval` per row of these quals: one operator each, and an
-/// `IN` list half its length (`ScalarArrayOpExpr`'s estimate).
+/// `cost_qual_eval` per row of these quals: one operator each, an `IN` /
+/// `NOT IN` list half its length (`ScalarArrayOpExpr`'s estimate) -- or,
+/// hashed, one hash and one comparison -- and a null test nothing.
 fn qual_cost<'a>(quals: impl Iterator<Item = &'a Qual>) -> f64 {
     quals
         .map(|q| match q {
-            Qual::In(n) => CPU_OPERATOR_COST * *n as f64 * 0.5,
+            Qual::In(n) | Qual::NotIn(n) if *n >= HASHED_SAOP => 2.0 * CPU_OPERATOR_COST,
+            Qual::In(n) | Qual::NotIn(n) => CPU_OPERATOR_COST * *n as f64 * 0.5,
             Qual::Filter(ops) => CPU_OPERATOR_COST * ops,
+            Qual::IsNull(_) => 0.0,
             _ => CPU_OPERATOR_COST,
+        })
+        .sum()
+}
+
+/// `cost_qual_eval`'s startup for these quals: a hashed list's table, one
+/// hash an element.
+fn qual_startup<'a>(quals: impl Iterator<Item = &'a Qual>) -> f64 {
+    quals
+        .map(|q| match q {
+            Qual::In(n) | Qual::NotIn(n) if *n >= HASHED_SAOP => CPU_OPERATOR_COST * *n as f64,
+            _ => 0.0,
         })
         .sum()
 }
@@ -118,7 +150,7 @@ fn column_selectivity<'a>(quals: impl Iterator<Item = &'a Qual>, ndistinct: f64)
         match q {
             Qual::Eq => sel *= eq,
             Qual::Ne => sel *= 1.0 - eq,
-            Qual::Filter(_) => {}
+            Qual::Filter(_) | Qual::IsNull(_) | Qual::NotIn(_) => {}
             Qual::In(n) => sel *= (eq * *n as f64).min(1.0),
             Qual::Range(true) => lower = true,
             Qual::Range(false) => upper = true,
@@ -181,6 +213,10 @@ pub struct Index {
     /// correlation (three quarters of it for an index of several columns);
     /// 0 with no statistics.
     pub correlation: f64,
+    /// For a scan that can be index-only (the index holds every column the
+    /// statement reads), the heap's all-visible fraction, whose pages it
+    /// does not fetch (`cost_index`); 0 otherwise.
+    pub visible: f64,
 }
 
 /// How the quals on an index's leading column are estimated: with no
@@ -226,7 +262,7 @@ fn index_cost(
 ) -> Option<(f64, f64, f64)> {
     let iq: Vec<&Qual> = quals
         .iter()
-        .filter(|(f, q)| f == &index.field && !matches!(q, Qual::Ne | Qual::Filter(_)))
+        .filter(|(f, q)| f == &index.field && q.indexable())
         .map(|(_, q)| q)
         .collect();
     if iq.is_empty() && !full {
@@ -291,6 +327,7 @@ fn bitmap_heap_cost(
 /// `sel` of the rows: the heap pages fetched, nearer sequential the more
 /// of them, and every qual rechecked on each row.
 fn bitmap_heap_from(rel: &Rel, startup: f64, sel: f64, quals: &[(String, Qual)]) -> (f64, f64) {
+    let startup = startup + qual_startup(quals.iter().map(|(_, q)| q));
     let tuples_fetched = clamp_row_est(sel * rel.tuples);
     let t = if rel.pages > 1.0 { rel.pages } else { 1.0 };
     let pages = index_pages_fetched(tuples_fetched, rel.pages);
@@ -301,31 +338,6 @@ fn bitmap_heap_from(rel: &Rel, startup: f64, sel: f64, quals: &[(String, Qual)])
     };
     let cpu = (CPU_TUPLE_COST + qual_cost(quals.iter().map(|(_, q)| q))) * tuples_fetched;
     (startup, startup + pages * per_page + cpu)
-}
-
-/// One arm of a BitmapOr: its index, its quals on it, and how they are
-/// estimated.
-pub type BitmapArm<'a> = (&'a Index, Vec<(String, Qual)>, ColSel);
-
-/// A BitmapOr (`cost_bitmap_or_node`) under a bitmap heap scan: each arm a
-/// bitmap index scan on `index` over the arm's quals on it (estimated by
-/// its `ColSel`), charged a tenth of an operator for each of the `rows` the
-/// relation yields (`cost_bitmap_tree_node`); their costs add and their
-/// selectivities add, to at most 1. `quals` are the WHERE's, each rechecked
-/// on the heap. `None` when an arm has no index qual.
-pub fn bitmap_or_scan(
-    rel: &Rel,
-    arms: &[BitmapArm<'_>],
-    quals: &[(String, Qual)],
-    rows: f64,
-) -> Option<(f64, f64)> {
-    let (mut total, mut selec) = (0.0, 0.0);
-    for (index, arm, colsel) in arms {
-        let (_, index_total, sel) = index_cost(rel, index, arm, *colsel, false)?;
-        total += index_total + 0.1 * CPU_OPERATOR_COST * rows;
-        selec += sel;
-    }
-    Some(bitmap_heap_from(rel, total, f64::min(selec, 1.0), quals))
 }
 
 /// `cost_index` for a plain index scan: `(startup, total)`.
@@ -373,8 +385,13 @@ fn index_scan(
 ) -> Option<(f64, f64)> {
     let (startup, index_total, sel) = index_cost(rel, index, quals, colsel, full)?;
     let tuples_fetched = clamp_row_est(sel * rel.tuples);
-    let max_io = index_pages_fetched(tuples_fetched, rel.pages) * RANDOM_PAGE_COST;
-    let min_pages = (sel * rel.pages).ceil();
+    let mut max_pages = index_pages_fetched(tuples_fetched, rel.pages);
+    let mut min_pages = (sel * rel.pages).ceil();
+    if index.visible > 0.0 {
+        max_pages = (max_pages * (1.0 - index.visible)).ceil();
+        min_pages = (min_pages * (1.0 - index.visible)).ceil();
+    }
+    let max_io = max_pages * RANDOM_PAGE_COST;
     let min_io = if min_pages > 0.0 {
         RANDOM_PAGE_COST + (min_pages - 1.0).max(0.0) * SEQ_PAGE_COST
     } else {
@@ -382,15 +399,16 @@ fn index_scan(
     };
     let csquared = index.correlation * index.correlation;
     let io = max_io + csquared * (min_io - max_io);
-    let other = qual_cost(
+    let others = || {
         quals
             .iter()
-            .filter(|(f, q)| f != &index.field || matches!(q, Qual::Ne | Qual::Filter(_)))
-            .map(|(_, q)| q),
-    );
+            .filter(|(f, q)| f != &index.field || !q.indexable())
+            .map(|(_, q)| q)
+    };
+    let qs = qual_startup(others());
     Some((
-        startup,
-        index_total + io + (CPU_TUPLE_COST + other) * tuples_fetched,
+        startup + qs,
+        index_total + qs + io + (CPU_TUPLE_COST + qual_cost(others())) * tuples_fetched,
     ))
 }
 
@@ -411,8 +429,18 @@ pub fn cheapest_scan(
 /// `cost_seqscan` through `quals`: its total; it starts at no cost, so it
 /// is the cheapest scan to start.
 pub fn seq_scan(rel: &Rel, quals: &[(String, Qual)]) -> f64 {
-    SEQ_PAGE_COST * rel.pages
-        + (CPU_TUPLE_COST + qual_cost(quals.iter().map(|(_, q)| q))) * rel.tuples
+    seq_scan_path(rel, quals).1
+}
+
+/// `cost_seqscan`: `(startup, total)`, the quals' startup first.
+fn seq_scan_path(rel: &Rel, quals: &[(String, Qual)]) -> (f64, f64) {
+    let startup = qual_startup(quals.iter().map(|(_, q)| q));
+    (
+        startup,
+        startup
+            + SEQ_PAGE_COST * rel.pages
+            + (CPU_TUPLE_COST + qual_cost(quals.iter().map(|(_, q)| q))) * rel.tuples,
+    )
 }
 
 /// `cheapest_scan`'s path as `(startup, total)`: the cheapest in total, a
@@ -444,7 +472,7 @@ pub fn scan_path<'a>(
     colsel: &dyn Fn(&str) -> ColSel,
     rows: f64,
 ) -> ((f64, f64), Option<&'a Index>) {
-    let mut best = ((0.0, seq_scan(rel, quals)), None);
+    let mut best = (seq_scan_path(rel, quals), None);
     for index in indexes {
         let cs = colsel(&index.field);
         for (cost, ordered) in [
@@ -458,6 +486,179 @@ pub fn scan_path<'a>(
         }
     }
     best
+}
+
+/// The scans of a table with statistics: the sequential scan, each index's
+/// plain index scan, and the one bitmap heap scan `create_index_paths`
+/// makes, over `choose_bitmap_and`'s pick of every bitmap path (`bitmap`).
+/// The cheapest in total, a tie going to the cheaper startup, and the index
+/// whose order a plain index scan returns.
+pub fn measured_scan_path<'a>(
+    rel: &Rel,
+    indexes: &'a [Index],
+    quals: &[(String, Qual)],
+    colsel: &dyn Fn(&str) -> ColSel,
+    bitmap: Option<&BitmapPath>,
+) -> ((f64, f64), Option<&'a Index>) {
+    let mut best = (seq_scan_path(rel, quals), None);
+    let mut consider = |cost: (f64, f64), ordered: Option<&'a Index>| {
+        if cost.1 < best.0 .1 || (cost.1 == best.0 .1 && cost.0 < best.0 .0) {
+            best = (cost, ordered);
+        }
+    };
+    if let Some(b) = bitmap {
+        consider(bitmap_heap(rel, b, quals), None);
+    }
+    for index in indexes {
+        if let Some(cost) = index_scan_cost(rel, index, quals, colsel(&index.field)) {
+            consider(cost, Some(index));
+        }
+    }
+    best
+}
+
+/// A bitmap path (`cost_bitmap_tree_node`'s view of it): its cost, its
+/// selectivity, the clauses it reads (by position, for
+/// `classify_index_clause_usage`), and whether it is a single index scan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BitmapPath {
+    pub cost: f64,
+    pub selectivity: f64,
+    pub clauses: Vec<usize>,
+    pub index: bool,
+}
+
+/// A bitmap index scan of `index` over `quals`' index quals on it: its
+/// index cost plus a tenth of an operator for each of the `rows` the
+/// relation yields (`cost_bitmap_tree_node`). `None` with no index qual.
+pub fn bitmap_index_path(
+    rel: &Rel,
+    index: &Index,
+    quals: &[(String, Qual)],
+    colsel: ColSel,
+    rows: f64,
+    clauses: Vec<usize>,
+) -> Option<BitmapPath> {
+    let (_, total, selectivity) = index_cost(rel, index, quals, colsel, false)?;
+    Some(BitmapPath {
+        cost: total + 0.1 * CPU_OPERATOR_COST * rows,
+        selectivity,
+        clauses,
+        index: true,
+    })
+}
+
+/// `cost_bitmap_and_node`: the paths' costs, 100 operators for each after
+/// the first, and their selectivities' product.
+pub fn bitmap_and_path(paths: &[BitmapPath]) -> BitmapPath {
+    let mut clauses: Vec<usize> = paths.iter().flat_map(|p| p.clauses.clone()).collect();
+    clauses.sort_unstable();
+    clauses.dedup();
+    BitmapPath {
+        cost: paths.iter().map(|p| p.cost).sum::<f64>()
+            + 100.0 * CPU_OPERATOR_COST * paths.len().saturating_sub(1) as f64,
+        selectivity: paths.iter().map(|p| p.selectivity).product(),
+        clauses,
+        index: false,
+    }
+}
+
+/// `cost_bitmap_or_node` over each arm's path: their costs, 100 operators
+/// for each arm after the first that is not a single index scan, and their
+/// selectivities' sum, to at most 1. `clause` is the OR's position.
+pub fn bitmap_or_path(arms: &[BitmapPath], clause: usize) -> BitmapPath {
+    let mut cost = 0.0;
+    for (i, arm) in arms.iter().enumerate() {
+        cost += arm.cost;
+        if i > 0 && !arm.index {
+            cost += 100.0 * CPU_OPERATOR_COST;
+        }
+    }
+    BitmapPath {
+        cost,
+        selectivity: f64::min(arms.iter().map(|a| a.selectivity).sum(), 1.0),
+        clauses: vec![clause],
+        index: false,
+    }
+}
+
+/// `cost_bitmap_heap_scan` over `path`: `(startup, total)`.
+pub fn bitmap_heap(rel: &Rel, path: &BitmapPath, quals: &[(String, Qual)]) -> (f64, f64) {
+    bitmap_heap_from(rel, path.cost, path.selectivity, quals)
+}
+
+/// `choose_bitmap_and`: of paths reading the same clauses the cheaper (the
+/// first on a tie); the rest in order of cost, then selectivity; from each
+/// in turn, each later path that reads no clause already read is ANDed in
+/// when that makes the bitmap heap scan cheaper; the cheapest result, the
+/// first on a tie. `None` for no paths, or two distinct paths tied in both
+/// cost and selectivity (`qsort` would order them unpredictably).
+pub fn choose_bitmap_and(
+    rel: &Rel,
+    paths: &[BitmapPath],
+    quals: &[(String, Qual)],
+) -> Option<BitmapPath> {
+    let mut kept: Vec<BitmapPath> = Vec::new();
+    for p in paths {
+        match kept.iter_mut().find(|k| k.clauses == p.clauses) {
+            Some(k) if p.cost < k.cost => *k = p.clone(),
+            Some(_) => {}
+            None => kept.push(p.clone()),
+        }
+    }
+    match kept.len() {
+        0 => return None,
+        1 => return kept.pop(),
+        _ => {}
+    }
+    kept.sort_by(|a, b| {
+        a.cost
+            .total_cmp(&b.cost)
+            .then(a.selectivity.total_cmp(&b.selectivity))
+    });
+    if kept
+        .windows(2)
+        .any(|w| w[0].cost == w[1].cost && w[0].selectivity == w[1].selectivity)
+    {
+        return None;
+    }
+    let estimate = |ps: &[BitmapPath]| {
+        let path = if ps.len() == 1 {
+            ps[0].clone()
+        } else {
+            bitmap_and_path(ps)
+        };
+        bitmap_heap(rel, &path, quals).1
+    };
+    let mut best: Option<(Vec<BitmapPath>, f64)> = None;
+    for i in 0..kept.len() {
+        let mut chosen = vec![kept[i].clone()];
+        let mut cost = estimate(&chosen);
+        for p in &kept[i + 1..] {
+            if p.clauses
+                .iter()
+                .any(|c| chosen.iter().any(|q| q.clauses.contains(c)))
+            {
+                continue;
+            }
+            chosen.push(p.clone());
+            let newcost = estimate(&chosen);
+            if newcost < cost {
+                cost = newcost;
+            } else {
+                chosen.pop();
+            }
+        }
+        if best.as_ref().is_none_or(|b| cost < b.1) {
+            best = Some((chosen, cost));
+        }
+    }
+    let (chosen, _) = best?;
+    Some(if chosen.len() == 1 {
+        chosen.into_iter().next()?
+    } else {
+        bitmap_and_path(&chosen)
+    })
 }
 
 /// The aggregates' costs, which both plans pay (`get_agg_clause_costs`).
@@ -667,6 +868,7 @@ mod tests {
             height: 0,
             columns: vec!["k".into()],
             correlation: 0.0,
+            visible: 0.0,
         }
     }
     fn q(filter: Document) -> Vec<(String, Qual)> {
@@ -795,5 +997,43 @@ mod tests {
         assert_eq!(btree_size(40, 4), (2.0, 0));
         assert_eq!(btree_size(407, 4), (2.0, 0));
         assert_eq!(btree_size(1000, 4).1, 1);
+    }
+
+    /// PostgreSQL 15.19 over 300 rows (2 pages) of (k, g, t): a sequential
+    /// scan filtering `g in (0, .., 8)`, a hashed list, costs 0.02..6.52 --
+    /// a startup of one hash a value, then a hash and a comparison a row.
+    #[test]
+    fn a_hashed_in_list_costs_as_postgres_does() {
+        let rel = Rel {
+            pages: 2.0,
+            tuples: 300.0,
+        };
+        let (s, t) = seq_scan_path(&rel, &[("g".into(), Qual::In(9))]);
+        assert!(close(s, 0.02) && close(t, 6.52), "{s} {t}");
+    }
+
+    /// PostgreSQL 15.19, 10,000 analysed rows of (k primary key, g, t) with
+    /// an index on g: `(g = 1 and k < 100) or k > 9000` is a BitmapOr
+    /// (40.92) of a BitmapAnd (20.88) of the key's scan (5.03, 0.0099) and
+    /// g's (15.10, 0.0909), and the key's scan for `k > 9000` (19.79,
+    /// 0.1), each charged a tenth of an operator for 1,008 rows.
+    #[test]
+    fn bitmap_and_and_or_cost_as_postgres_does() {
+        let rel = Rel {
+            pages: 55.0,
+            tuples: 10000.0,
+        };
+        let path = |cost: f64, selectivity: f64, clause: usize| BitmapPath {
+            cost: cost + 0.1 * CPU_OPERATOR_COST * 1008.0,
+            selectivity,
+            clauses: vec![clause],
+            index: true,
+        };
+        let arm =
+            choose_bitmap_and(&rel, &[path(15.10, 0.0909, 0), path(5.03, 0.0099, 1)], &[]).unwrap();
+        assert!(!arm.index && close(arm.cost, 20.88), "{arm:?}");
+        let or = bitmap_or_path(&[arm, path(19.79, 0.1, 2)], 0);
+        // Three costs PostgreSQL displays to two places, summed.
+        assert!((or.cost - 40.92).abs() < 0.01, "{or:?}");
     }
 }

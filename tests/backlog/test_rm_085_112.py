@@ -25,7 +25,7 @@ import pymongo
 import pytest
 from bson import SON
 
-from tests.backlog.conftest import RS_BINARY, mongo_answer
+from tests.backlog.conftest import RS_BINARY, drain_output, mongo_answer
 
 _RS_BANNER = re.compile(r"secantusd-rs listening on (\S+):(\d+)")
 
@@ -83,6 +83,7 @@ def _start_rust(store: pathlib.Path, extra: list[str]) -> tuple[subprocess.Popen
     if not m:
         proc.kill()
         raise RuntimeError(f"secantusd-rs did not start: {seen!r}")
+    drain_output(proc)
     client = pymongo.MongoClient(
         host=m.group(1), port=int(m.group(2)), serverSelectionTimeoutMS=10_000
     )

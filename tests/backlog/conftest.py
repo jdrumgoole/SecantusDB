@@ -30,6 +30,7 @@ import os
 import pathlib
 import re
 import subprocess
+import threading
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -106,6 +107,15 @@ def mongo_answer(fn: Callable[[], Any]) -> tuple:
 # -------------------------------------------------------------- servers --
 
 
+def drain_output(proc: subprocess.Popen) -> None:
+    """Keep reading a server's output once its banner is read. Nobody reads
+    the pipe otherwise, and once its 64 KiB buffer fills, every thread that
+    logs blocks on the write: commands hang, and so does shutdown."""
+    out = proc.stdout
+    assert out is not None
+    threading.Thread(target=lambda: [None for _ in out], daemon=True).start()
+
+
 @pytest.fixture(scope="module")
 def rust_mongo(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Any]:
     """A pymongo client to a `secantusd-rs` of this module's own."""
@@ -122,6 +132,7 @@ def rust_mongo(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Any]:
         line = proc.stdout.readline()
         m = _RS_BANNER.search(line)
         assert m, f"secantusd-rs did not start: {line!r}"
+        drain_output(proc)
         client = pymongo.MongoClient(
             host=m.group(1), port=int(m.group(2)), serverSelectionTimeoutMS=10_000
         )

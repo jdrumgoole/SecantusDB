@@ -1054,6 +1054,18 @@ impl CmdStorage for StorageAdapter {
             .map_err(map_err)
     }
 
+    fn record_ids_of(
+        &self,
+        db: &str,
+        coll: &str,
+        docs: &[&[u8]],
+    ) -> Result<Option<Vec<Option<i64>>>, StorageError> {
+        self.inner
+            .record_ids_of(db, coll, docs)
+            .map(Some)
+            .map_err(map_err)
+    }
+
     fn collection_data_size(&self, db: &str, coll: &str) -> Result<i64, StorageError> {
         self.inner.collection_data_size(db, coll).map_err(map_err)
     }
@@ -1102,6 +1114,27 @@ impl CmdStorage for StorageAdapter {
             .check_collection(db, coll)
             .map(Some)
             .map_err(map_err)
+    }
+
+    fn check_collection_at_checkpoint(
+        &self,
+        db: &str,
+        coll: &str,
+    ) -> Result<Option<Option<Document>>, StorageError> {
+        if self.inner.in_memory() {
+            return Ok(None);
+        }
+        self.inner
+            .check_collection_at_checkpoint(db, coll)
+            .map(Some)
+            .map_err(map_err)
+    }
+
+    fn checkpoint_now(&self) -> Result<bool, StorageError> {
+        if self.inner.in_memory() {
+            return Ok(false);
+        }
+        self.inner.checkpoint_now().map(|()| true).map_err(map_err)
     }
 
     fn add_user(

@@ -92,7 +92,7 @@ def _show_record_id(client: Any) -> Any:
     return [d.get("$recordId") for d in db.c.find({}, show_record_id=True)]
 
 
-@pytest.mark.backlog("RM-083")
+@pytest.mark.backlog_fixed("RM-083")
 def test_show_record_id_is_the_record_id(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `showRecordId` is each document's RecordId -- after
     the first of four is deleted, 2, 3, 4 -- not its position in the reply."""

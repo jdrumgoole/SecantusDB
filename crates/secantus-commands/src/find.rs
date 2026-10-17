@@ -848,6 +848,112 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // rewrite the docs here and clear `projection`. Mirrors commands.py.
     let return_key = bool_field(doc, "returnKey", false);
     let show_record_id = bool_field(doc, "showRecordId", false);
+    // `{$meta: "recordId"}` / `{$meta: "indexKey"}` in the projection. A
+    // top-level one is added after the projected fields, where mongod puts
+    // it; one inside an expression is read from a field the documents are
+    // given for the projection (`agg_meta`). A RecordId the store cannot
+    // give, or an index key of a plan that reads no single index scan, is
+    // missing, as mongod's is (measured 8.2.11).
+    let mut nested_spec: Option<Document> = None;
+    let mut metas: Vec<(String, &str)> = Vec::new();
+    if let (Some(spec), false) = (projection, return_key) {
+        let mut rewritten = Document::new();
+        let mut nested = false;
+        for (k, v) in spec {
+            match secantus_core::projection::meta_spec(v) {
+                Some(m @ ("recordId" | "indexKey")) => metas.push((k.clone(), m)),
+                Some(_) => {}
+                None => {
+                    let mut v = v.clone();
+                    nested |=
+                        crate::agg_meta::replace(&mut v, "recordId", crate::agg_meta::RECORD_ID);
+                    nested |=
+                        crate::agg_meta::replace(&mut v, "indexKey", crate::agg_meta::INDEX_KEY);
+                    rewritten.insert(k.clone(), v);
+                    continue;
+                }
+            }
+            rewritten.insert(k.clone(), v.clone());
+        }
+        if nested {
+            nested_spec = Some(rewritten);
+        }
+    }
+    let uses = |kind: &str, field: &str| {
+        metas.iter().any(|(_, m)| *m == kind)
+            || nested_spec
+                .as_ref()
+                .is_some_and(|s| s.values().any(|v| crate::agg_meta::reads(v, field)))
+    };
+    let wants_record_id =
+        (show_record_id && !return_key) || uses("recordId", crate::agg_meta::RECORD_ID);
+    let wants_index_key = uses("indexKey", crate::agg_meta::INDEX_KEY);
+    // Each document's RecordId, as the store numbers its records (per
+    // collection from 1, as mongod does); `None` when the store cannot say.
+    let record_ids: Option<Vec<Option<i64>>> = if wants_record_id {
+        let refs: Vec<&[u8]> = docs.iter().map(Vec::as_slice).collect();
+        storage
+            .record_ids_of(&ctx.db_name, &coll, &refs)
+            .map_err(command_error)?
+    } else {
+        None
+    };
+    if let (Some(spec), true) = (projection, !metas.is_empty() || nested_spec.is_some()) {
+        let mut originals: Vec<Document> = docs
+            .iter()
+            .map(|b| secantus_core::bsondoc::from_bytes(b.as_slice()))
+            .collect::<Result<_, _>>()
+            .map_err(|e| CommandError::new(1, "InternalError", e.to_string()))?;
+        let index_keys = if wants_index_key {
+            crate::explain::order::index_keys(
+                storage,
+                &crate::explain::order::Ask {
+                    db: &ctx.db_name,
+                    coll: &coll,
+                    filter: &filter,
+                    sort,
+                    hint,
+                    collation: collation.as_ref(),
+                    vars: &let_vars,
+                    limit: 0,
+                    asked: Default::default(),
+                },
+                &originals,
+            )
+        } else {
+            None
+        };
+        let mut projected = match &nested_spec {
+            Some(rewritten) => {
+                crate::agg_meta::attach(
+                    &mut originals,
+                    record_ids.as_deref(),
+                    index_keys.as_deref(),
+                );
+                let mut out =
+                    project_to_docs(crate::util::encode_docs(originals)?, rewritten, &filter)?;
+                for d in out.iter_mut() {
+                    d.remove(crate::agg_meta::RECORD_ID);
+                    d.remove(crate::agg_meta::INDEX_KEY);
+                }
+                out
+            }
+            None => project_to_docs(docs, spec, &filter)?,
+        };
+        for (i, out) in projected.iter_mut().enumerate() {
+            for (field, meta) in &metas {
+                let value = match *meta {
+                    "recordId" => record_ids.as_ref().and_then(|r| r[i]).map(Bson::Int64),
+                    _ => index_keys.as_ref().map(|k| Bson::Document(k[i].clone())),
+                };
+                if let Some(v) = value {
+                    out.insert(field.clone(), v);
+                }
+            }
+        }
+        docs = crate::util::encode_docs(projected)?;
+        projection = None;
+    }
     if return_key || show_record_id {
         let mut key_fields: Vec<String> = Vec::new();
         if return_key {
@@ -888,8 +994,16 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 }
                 rewritten.push(o);
             } else {
+                // The document's RecordId (mongod 8.2.11: after the first of
+                // four is deleted, 2, 3, 4 -- not its place in the reply).
                 let mut o = d;
-                o.insert("$recordId", Bson::Int64((i + 1) as i64));
+                let rid = match &record_ids {
+                    Some(ids) => ids[i],
+                    None => Some((i + 1) as i64),
+                };
+                if let Some(rid) = rid {
+                    o.insert("$recordId", Bson::Int64(rid));
+                }
                 rewritten.push(o);
             }
         }
