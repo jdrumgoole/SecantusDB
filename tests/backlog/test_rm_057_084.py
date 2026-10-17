@@ -785,7 +785,7 @@ def _stream_option(client: Any, option: dict) -> Any:
     return [(e["operationType"], e.get("fullDocument")) for e in events]
 
 
-@pytest.mark.backlog("RM-079")
+@pytest.mark.backlog_fixed("RM-079")
 @pytest.mark.parametrize(
     "option",
     [
