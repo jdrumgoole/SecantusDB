@@ -160,6 +160,7 @@ fn apply_stage(
             replace_root_one(&d, spec, vars, "'replacement document'")
         }),
         "$sort" => sort_stage(docs, spec),
+        "$_secantusSortKey" => sort_key_stage(docs, spec),
         "$unwind" => unwind_stage(docs, spec),
         "$group" => group::group_stage(spec, &docs, vars),
         "$sortByCount" => group::sort_by_count_stage(spec, &docs, vars),
@@ -887,62 +888,93 @@ fn sort_fields(spec: &Bson) -> R<Vec<(String, bool)>> {
     Ok(out)
 }
 
+/// The values a `$sort` on `fields` compares for `d`, one per field.
+fn sort_key_values(d: &Document, fields: &[(String, bool)]) -> R<Vec<Bson>> {
+    let mut keys = Vec::with_capacity(fields.len());
+    for (path, rev) in fields {
+        // mongod refuses a sort path whose component names both an array
+        // index and a key of that array's elements -- per document, at
+        // execution time, so it belongs under the executor wrapper.
+        if let Some((part, items)) = paths::ambiguous_sort_path(d, path) {
+            return Err(
+                Fallback::mongo(16746, paths::ambiguous_sort_message(part, items))
+                    .with_folded(false),
+            );
+        }
+        // `sort_path_values` walks THROUGH arrays the way mongod's sort-key
+        // generation does; `get_path` reads a numeric component only as an
+        // index and never descends, which ranked `x: [{y: 1}]` with the
+        // documents that have no `x.y` at all.
+        let resolved = paths::sort_path_values(d, path);
+        let mut best: Option<Bson> = None;
+        for (v, indexed) in resolved {
+            if !order::is_sortable(v) {
+                return Err(Fallback::Defer);
+            }
+            // An array reached by an explicit INDEX is the sort value as it
+            // stands; one reached by a field name is descended a level.
+            let rep = if indexed {
+                v.clone()
+            } else {
+                order::array_sort_value(v.clone(), *rev).ok_or(Fallback::Defer)?
+            };
+            best = Some(match best {
+                None => rep,
+                Some(cur) => {
+                    let c = order::cmp(&rep, &cur);
+                    let take = if *rev {
+                        c == Ordering::Greater
+                    } else {
+                        c == Ordering::Less
+                    };
+                    if take {
+                        rep
+                    } else {
+                        cur
+                    }
+                }
+            });
+        }
+        // A path that resolves nowhere ranks with null, as `get_path` did.
+        keys.push(best.unwrap_or(Bson::Null));
+    }
+    Ok(keys)
+}
+
+/// `{$_secantusSortKey: {into, by}}`: an internal stage the command layer
+/// puts after a `$sort` whose `{$meta: "sortKey"}` a later stage reads. It
+/// writes the sort key mongod keeps as metadata, an array with one value
+/// per sort field, under `into`. A missing value and an empty array show as
+/// null, as mongod shows them (measured 8.2.11).
+fn sort_key_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
+    let spec = spec.as_document().ok_or(Fallback::Defer)?;
+    let Some(Bson::String(into)) = spec.get("into") else {
+        return Err(Fallback::Defer);
+    };
+    let fields = sort_fields(spec.get("by").ok_or(Fallback::Defer)?)?;
+    docs.into_iter()
+        .map(|mut d| {
+            let keys = sort_key_values(&d, &fields)?
+                .into_iter()
+                .map(|k| match k {
+                    Bson::Undefined | Bson::MinKey => Bson::Null,
+                    other => other,
+                })
+                .collect();
+            d.insert(into.clone(), Bson::Array(keys));
+            Ok(d)
+        })
+        .collect()
+}
+
 pub(crate) fn sort_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
     let fields = sort_fields(spec)?;
-    // Materialise each doc's sort-key values once (get_path per field), and
-    // bail to Python if any key holds a value `order` won't faithfully order
-    // (Decimal128 / exotic types) — keeps the comparator total.
+    // Materialise each doc's sort-key values once, and bail if any key holds
+    // a value `order` won't faithfully order (Decimal128 / exotic types) --
+    // keeps the comparator total.
     let mut keyed: Vec<(Vec<Bson>, Document)> = Vec::with_capacity(docs.len());
     for d in docs {
-        let mut keys = Vec::with_capacity(fields.len());
-        for (path, rev) in &fields {
-            // mongod refuses a sort path whose component names both an array
-            // index and a key of that array's elements -- per document, at
-            // execution time, so it belongs under the executor wrapper.
-            if let Some((part, items)) = paths::ambiguous_sort_path(&d, path) {
-                return Err(
-                    Fallback::mongo(16746, paths::ambiguous_sort_message(part, items))
-                        .with_folded(false),
-                );
-            }
-            // `sort_path_values` walks THROUGH arrays the way mongod's sort-key
-            // generation does; `get_path` reads a numeric component only as an
-            // index and never descends, which ranked `x: [{y: 1}]` with the
-            // documents that have no `x.y` at all.
-            let resolved = paths::sort_path_values(&d, path);
-            let mut best: Option<Bson> = None;
-            for (v, indexed) in resolved {
-                if !order::is_sortable(v) {
-                    return Err(Fallback::Defer);
-                }
-                // An array reached by an explicit INDEX is the sort value as it
-                // stands; one reached by a field name is descended a level.
-                let rep = if indexed {
-                    v.clone()
-                } else {
-                    order::array_sort_value(v.clone(), *rev).ok_or(Fallback::Defer)?
-                };
-                best = Some(match best {
-                    None => rep,
-                    Some(cur) => {
-                        let c = order::cmp(&rep, &cur);
-                        let take = if *rev {
-                            c == Ordering::Greater
-                        } else {
-                            c == Ordering::Less
-                        };
-                        if take {
-                            rep
-                        } else {
-                            cur
-                        }
-                    }
-                });
-            }
-            // A path that resolves nowhere ranks with null, as `get_path` did.
-            keys.push(best.unwrap_or(Bson::Null));
-        }
-        keyed.push((keys, d));
+        keyed.push((sort_key_values(&d, &fields)?, d));
     }
     // Stable sort matching Python's Timsort over the tuple of directed keys.
     keyed.sort_by(|(ka, _), (kb, _)| {

@@ -700,6 +700,9 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 // answers them: read from fields the documents are given here.
                 let mut remaining = remaining;
                 let metas = crate::agg_meta::rewrite(&read_pipeline, &mut remaining);
+                // `{$meta: "sortKey"}` and the `$geoNear` metadata, from the
+                // stage that sets them.
+                crate::agg_meta::rewrite_sort_metadata(&mut remaining);
                 let record_ids = if metas.record_id {
                     let refs: Vec<&[u8]> = reduced.iter().map(Vec::as_slice).collect();
                     storage

@@ -1215,10 +1215,10 @@ pub fn first_unknown_expr_operator(expr: &Bson) -> Option<String> {
 ///
 /// The text score and the `$geoNear` distance and point are refused, as
 /// mongod refuses them without a `$text` query or a `$geoNear` stage
-/// (40218). This engine never has them, so it refuses them after a
-/// `$geoNear` too, where mongod would answer. `sortKey` is refused as
-/// unsupported: mongod's answer depends on the stage (an error in
-/// `$project`, `[]` in `$addFields`).
+/// (40218). After a `$geoNear` the command layer rewrites them into reads
+/// of fields the stage writes, and `sortKey` after a `$sort` likewise
+/// (`agg_meta::rewrite_sort_metadata`); with no `$sort` in reach `sortKey`
+/// becomes `[]` in `$addFields` there, and is refused here otherwise.
 fn op_meta(arg: &Bson) -> R {
     let unavailable = |what: &str| {
         Err(Fallback::mongo(

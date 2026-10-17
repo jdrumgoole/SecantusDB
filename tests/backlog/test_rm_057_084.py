@@ -954,7 +954,7 @@ def _meta_pipeline(client: Any, pipeline: list, index: dict | None = None) -> tu
     return ans if ans[0] == "ok" else ans[:2]
 
 
-@pytest.mark.backlog("RM-083")
+@pytest.mark.backlog_fixed("RM-083")
 @pytest.mark.parametrize("stage", ["$project", "$addFields"])
 def test_meta_sort_key_in_aggregate(rust_mongo: Any, mongod: Any, stage: str) -> None:
     """mongod 8.2.11: `{$meta: "sortKey"}` after a `$sort` on `a` gives the
@@ -963,14 +963,14 @@ def test_meta_sort_key_in_aggregate(rust_mongo: Any, mongod: Any, stage: str) ->
     assert _meta_pipeline(rust_mongo, pipeline) == _meta_pipeline(mongod, pipeline)
 
 
-@pytest.mark.backlog("RM-083")
+@pytest.mark.backlog_fixed("RM-083")
 def test_group_keyed_on_meta(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 groups a `$group` keyed on `{$meta: "recordId"}`."""
     pipeline = [{"$group": {"_id": {"$meta": "recordId"}, "n": {"$sum": 1}}}]
     assert _meta_pipeline(rust_mongo, pipeline) == _meta_pipeline(mongod, pipeline)
 
 
-@pytest.mark.backlog("RM-083")
+@pytest.mark.backlog_fixed("RM-083")
 def test_meta_geo_near_distance_after_geo_near(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 gives `{$meta: "geoNearDistance"}` after a `$geoNear`."""
     pipeline = [
