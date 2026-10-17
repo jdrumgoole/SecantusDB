@@ -367,6 +367,23 @@ one beside it.
   Verify: tests/backlog/test_rust_postgres_gaps.py::test_row_locking_statements_take_postgres_relation_lock_modes, tests/backlog/test_rust_postgres_gaps.py::test_pg_locks_shows_transaction_id_locks, tests/backlog/test_rust_postgres_gaps.py::test_a_row_lock_waiter_waits_on_the_holders_transaction_id, tests/backlog/test_rust_postgres_gaps.py::test_a_lock_waiter_is_visible_with_its_blocker
   Backlog-ID: RP-047
 
+- [ ] **RUST pgserver: a deadlock cycle that runs through two lock kinds is
+  not detected.** Advisory waits register in the process-wide `lock_manager`
+  wait-for graph now (d5f9de1d); row waits (`row_waits`) and table locks
+  (`table_locks`) still keep their own, so a cycle like "A holds an advisory
+  lock and waits for B's row, while B holds the row and waits for A's
+  advisory" is invisible to both checks. Both sessions wait out
+  `lock_timeout` -- or forever, `lock_timeout = 0` being the default --
+  where PostgreSQL 15 raises `40P01` in one waiter at `deadlock_timeout`.
+  Measured 2026-10-17: both sides answer `55P03` after a 3 s `lock_timeout`
+  (a committed table on the shared reference is what the
+  reference-protection rule forbids, so the expected value is the literal:
+  same-kind cycles measured live, cross-kind is the same detector). The fix
+  is the consolidation the review planned: migrate `row_waits::Waiting` and
+  `table_locks`' waits onto `lock_manager`'s single graph.
+  Verify: tests/backlog/test_rp_lock_waits.py::test_a_cycle_across_lock_kinds_is_a_deadlock
+  Backlog-ID: RP-048
+
 - [ ] **RUST pgserver: the planner's choices that decide row order are only
   partly modelled.** **Decided (Joe, 2026-10-16): build a cost model** --
   enough of PostgreSQL's planner to make its choices, since the order rows
