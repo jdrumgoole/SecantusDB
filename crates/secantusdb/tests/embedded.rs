@@ -241,7 +241,6 @@ fn a_noop_heartbeat_writes_to_the_oplog_and_stops_with_the_server() {
     assert!(!path.exists(), "{} survived drop", path.display());
 }
 
-
 #[test]
 fn ddl_waits_for_an_open_transaction_and_answers_50_at_max_time() {
     // mongod 8.2.11: a collection a transaction has read or written is held
@@ -278,7 +277,7 @@ fn ddl_waits_for_an_open_transaction_and_answers_50_at_max_time() {
             "createIndexes",
             false,
             doc! {"createIndexes": "held",
-                  "indexes": [{"key": {"x": 1}, "name": "x_1"}], "maxTimeMS": 300},
+            "indexes": [{"key": {"x": 1}, "name": "x_1"}], "maxTimeMS": 300},
         ),
         (
             "collMod",
@@ -311,6 +310,8 @@ fn ddl_waits_for_an_open_transaction_and_answers_50_at_max_time() {
     session.abort_transaction().run().expect("abort");
 
     // The transaction's locks went with it: the same DDL now runs.
-    db.run_command(doc! {"drop": "held"}).run().expect("drop after");
+    db.run_command(doc! {"drop": "held"})
+        .run()
+        .expect("drop after");
     assert!(db.list_collection_names().run().expect("list").is_empty());
 }
