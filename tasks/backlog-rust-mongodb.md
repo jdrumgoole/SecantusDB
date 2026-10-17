@@ -693,28 +693,6 @@ Still different:
       in memory answers 115 with this server's own text, because mongod's
       in-memory engine is Enterprise-only and its message could not be
       measured.
-- [ ] **`serverStatus.locks` is absent**, and with it the gap test's last
-      section. mongod counts its lock manager's acquisitions per resource
-      and mode, and this server has no such lock manager. The other
-      sections are reported from real counters (`asserts`, `mem`,
-      `extra_info`, `globalLock`, `logicalSessionRecordCache`,
-      `opLatencies`, `security`, `transactions`, `wiredTiger`,
-      `metrics.{commands, document, operation, query}`); those that need a
-      mechanism this server lacks stay absent rather than zero: `repl`, the
-      plan-cache and sort metrics, `queues`, `transportSecurity`.
-      Counted differently from mongod: `asserts.user` moves by 1 where
-      mongod raises an error twice internally (an invalid sort, an index
-      build, a duplicate in an unordered insert); an `aggregate` whose stage
-      does not parse counts as a run; `$out` / `$merge` writes are not in
-      `metrics.document`; a `bulkWrite` multi-update counts its documents
-      in `metrics.query`.
-      **Decided 2026-10-16 (Joe): build a real lock manager** -- mongod's
-      resources (`Global`, `Database`, `Collection`, `Mutex`, `oplog`, ...)
-      and modes (`r` / `w` / `R` / `W`), taken by the commands that take
-      them on mongod, with `serverStatus.locks` counted from its
-      acquisitions. Not a table of plausible counts.
-      Backlog-ID: RM-034
-      Verify: tests/backlog/test_rm_029_056.py::test_server_status_sections
 - [ ] **Server parameters** (about 30). `getParameter` reports the
       thirteen parameters that are true of this server
       (`serverinfo::parameters`) and mongod has several hundred.
@@ -1211,23 +1189,6 @@ fields written out (the transaction state rules, what a transaction refuses,
 conflicts, collections made in a transaction, cursors, the session commands,
 retryable writes). The Rust server differs on 11 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: `drop` removes a collection an open
-      transaction holds.** With a transaction holding a collection, mongod
-      8.2.11 makes `drop` (and `createIndexes`) wait until `maxTimeMS`,
-      answers 50, and keeps the collection. Here the drop answers ok within
-      half a second and the collection is gone while the transaction is
-      still open -- after a transaction that only READ, and (re-measured by
-      the gap tests on 2026-10-14) after one that WROTE, where an earlier
-      probe had seen it wait for the commit. What the open transaction then
-      sees or commits has not been measured, and is the data-integrity
-      question. `tools/probes/transactions.py`, "a collection dropped under
-      a transaction ...".
-      **Decided 2026-10-16 (Joe):** model mongod's collection locks: an open
-      transaction holds each collection it touches; `drop`, `createIndexes`,
-      `renameCollection` and `collMod` wait on it and answer 50 at their
-      `maxTimeMS`; commit or abort releases it.
-      Backlog-ID: RM-084
-      Verify: tests/backlog/test_rm_057_084.py::test_drop_waits_for_a_transaction_that_read,tests/backlog/test_rm_057_084.py::test_drop_under_a_transaction_that_wrote_honours_max_time
 - [ ] **RUST MongoDB server: smaller differences.** A `count` with no query
       does not see another session's uncommitted insert (mongod's fast count
       does: it answered 3 for 2 committed documents). A write that waits on a

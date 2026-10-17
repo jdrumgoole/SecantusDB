@@ -4001,6 +4001,36 @@ pub fn server_status(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
         "logicalSessionRecordCache",
         logical_session_record_cache(ctx),
     );
+    // mongod's lock manager, counted from real acquisitions (RM-034):
+    // per resource kind, per mode. Omitted entirely where no lock manager
+    // is wired (unit-test contexts), as the other absent services are.
+    if let Some(locks) = &ctx.locks {
+        let mut section = Document::new();
+        for report in locks.server_status_locks() {
+            let mut d = Document::new();
+            let mut acquire_count = Document::new();
+            for (letter, n) in report.acquire_count {
+                acquire_count.insert(letter, n as i64);
+            }
+            d.insert("acquireCount", acquire_count);
+            if !report.acquire_wait_count.is_empty() {
+                let mut wait_count = Document::new();
+                for (letter, n) in report.acquire_wait_count {
+                    wait_count.insert(letter, n as i64);
+                }
+                d.insert("acquireWaitCount", wait_count);
+            }
+            if !report.time_acquiring_micros.is_empty() {
+                let mut time_micros = Document::new();
+                for (letter, n) in report.time_acquiring_micros {
+                    time_micros.insert(letter, n as i64);
+                }
+                d.insert("timeAcquiringMicros", time_micros);
+            }
+            section.insert(report.kind, d);
+        }
+        reply.insert("locks", section);
+    }
     // What the server has read and written, counted off the sockets, and
     // what each compressor took in and gave out (`compression` follows
     // `numRequests`, as on mongod 8.2.11).

@@ -168,6 +168,9 @@ struct Shared {
     storage: Arc<dyn Storage>,
     cursors: Arc<CursorRegistry>,
     transactions: Arc<secantus_commands::transactions::TransactionRegistry>,
+    /// mongod's lock manager: statement lock chains, transaction-held
+    /// collection locks, and the counts behind `serverStatus.locks`.
+    locks: Arc<secantus_commands::lock_manager::LockManager>,
     /// Server-wide `configureFailPoint` registry, shared across connections.
     /// `None` when `enable_test_commands` is off — its absence is the gate.
     failpoints: Option<Arc<secantus_commands::failpoints::FailPointRegistry>>,
@@ -407,11 +410,14 @@ pub fn bind(
     let failpoints = config
         .enable_test_commands
         .then(|| Arc::new(secantus_commands::failpoints::FailPointRegistry::new()));
+    let locks = Arc::new(secantus_commands::lock_manager::LockManager::new());
+    transactions.set_locks(locks.clone());
     let shared = Arc::new(Shared {
         config,
         storage,
         cursors,
         transactions,
+        locks,
         failpoints,
         server_params: Arc::new(secantus_commands::params::ServerParams::new()),
         step_down: Arc::new(secantus_commands::stepdown::StepDownState::new()),
@@ -1083,6 +1089,7 @@ fn make_context(
         .with_storage(shared.storage.clone())
         .with_cursors(shared.cursors.clone())
         .with_transactions(shared.transactions.clone())
+        .with_locks(shared.locks.clone())
         .with_server_params(shared.server_params.clone())
         .with_step_down(shared.step_down.clone())
         .with_failpoints_opt(shared.failpoints.clone())

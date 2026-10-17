@@ -779,6 +779,27 @@ fn statement(
             }
         }
     }
+    // The transaction takes this statement's locks under its own owner and
+    // keeps the collection intents to its end (RM-084): a concurrent
+    // `drop` / `createIndexes` / `renameCollection` / `collMod` then waits
+    // on it, and its deadline answers 50. `run_handler` skips its own
+    // statement-scoped acquisition while the flag is set, so the statement
+    // is counted once and its collection lock is not released early.
+    if let (Some(lm), Some(owner)) = (
+        ctx.locks.clone(),
+        txn.lock().unwrap_or_else(|e| e.into_inner()).lock_owner,
+    ) {
+        let chain = crate::lock_manager::statement_chain(doc, &ctx.db_name);
+        match crate::lock_manager::acquire_chain(&lm, owner, &chain) {
+            Ok(()) => ctx.txn_locks = true,
+            Err(_) => {
+                let mut reply = CommandError::max_time_expired().into_reply();
+                registry.abort_in_progress(txn);
+                crate::finish_txn_statement(registry, txn, &mut reply);
+                return reply;
+            }
+        }
+    }
     let mut result = {
         let mut t = txn.lock().unwrap_or_else(|e| e.into_inner());
         let handle = t.handle.as_mut().expect("handle created above").as_mut();

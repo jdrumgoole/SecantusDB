@@ -76,6 +76,11 @@ pub struct Transaction {
     /// The collections this transaction created, as `db.coll`, and whether
     /// it has since put a document in each.
     pub created: HashMap<String, bool>,
+    /// The lock manager owner this transaction takes its statement locks
+    /// under, so the collection intent locks it accumulates hold to its
+    /// end (what a concurrent `drop` / `createIndexes` / `renameCollection`
+    /// / `collMod` waits on, RM-084). `None` where no lock manager is wired.
+    pub lock_owner: Option<crate::lock_manager::Owner>,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -98,6 +103,7 @@ impl Transaction {
             last_use: now,
             started_at: now,
             created: HashMap::new(),
+            lock_owner: None,
         }
     }
 }
@@ -395,6 +401,12 @@ pub struct TransactionRegistry {
     inner: Mutex<Inner>,
     commit: CommitFn,
     rollback: TxnFn,
+    /// The lock manager whose owner each transaction takes its statement
+    /// locks under; released when the transaction ends. Set once by the
+    /// server after construction (the registry is built before the shared
+    /// state it lives in is fully populated); unit-test registries run
+    /// without one, and locking is best-effort there.
+    locks: std::sync::OnceLock<Arc<crate::lock_manager::LockManager>>,
     /// Seconds, as `f64` bits: `transactionLifetimeLimitSeconds` changes it
     /// while the server runs.
     lifetime: std::sync::atomic::AtomicU64,
@@ -432,15 +444,33 @@ impl TransactionRegistry {
             }),
             commit,
             rollback,
+            locks: std::sync::OnceLock::new(),
             lifetime: std::sync::atomic::AtomicU64::new(lifetime_seconds.to_bits()),
             clock,
             counts: Default::default(),
         }
     }
 
+    /// Wire the lock manager in (once). The server's `bind` calls this on
+    /// the registry it built; without it transactions run unlocked, which
+    /// is what unit tests want.
+    pub fn set_locks(&self, locks: Arc<crate::lock_manager::LockManager>) -> bool {
+        self.locks.set(locks).is_ok()
+    }
+
+    /// Let go of the collection locks a transaction held to its end.
+    /// Idempotent: every terminal path calls it, and `release` on an owner
+    /// with no holds is a no-op.
+    fn release_locks(&self, t: &Transaction) {
+        if let (Some(lm), Some(owner)) = (self.locks.get(), t.lock_owner) {
+            lm.release(owner);
+        }
+    }
+
     /// A transaction left `InProgress`: count how it ended and how long it ran.
     fn ended(&self, t: &Transaction, committed: bool) {
         use std::sync::atomic::Ordering::Relaxed;
+        self.release_locks(t);
         self.counts[if committed { 1 } else { 2 }].fetch_add(1, Relaxed);
         let micros = (((self.clock)() - t.started_at) * 1e6).max(0.0) as i64;
         self.counts[3].fetch_add(micros, Relaxed);
@@ -529,6 +559,10 @@ impl TransactionRegistry {
                 txn_number,
                 now,
             )));
+            if let Some(lm) = self.locks.get() {
+                txn.lock().unwrap_or_else(|e| e.into_inner()).lock_owner =
+                    Some(lm.transaction_owner());
+            }
             self.counts[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             inner.sessions.insert(
                 lsid_bytes.to_vec(),
@@ -667,6 +701,7 @@ impl TransactionRegistry {
             if t.state == TxnState::InProgress {
                 (self.rollback)(&mut t);
                 t.state = TxnState::Aborted;
+                self.release_locks(&t);
                 // Never started, so never ended either.
                 self.counts[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }

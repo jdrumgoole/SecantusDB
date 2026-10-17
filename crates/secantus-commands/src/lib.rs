@@ -62,6 +62,7 @@ pub mod findandmodify;
 pub mod handshake;
 mod hostinfo;
 mod list_catalog;
+pub mod lock_manager;
 pub mod logbuf;
 pub mod mapreduce;
 pub mod mongod_codes;
@@ -247,6 +248,16 @@ pub struct CommandContext {
     /// other command leave it `None` and take the decoded path. Consumed
     /// (`take()`n) by the insert handler.
     pub raw_insert_documents: Option<Vec<Vec<u8>>>,
+    /// The server-wide lock manager (drives `serverStatus.locks` and the
+    /// transaction-held collection locks DDL waits on). `None` in unit-test
+    /// contexts and before the server wires one in, like the other services.
+    pub locks: Option<Arc<lock_manager::LockManager>>,
+    /// Set by the transaction path once it has taken this statement's locks
+    /// with the transaction's owner (held to commit/abort): `run_handler`
+    /// then skips its own statement-scoped acquisition, so an in-transaction
+    /// statement is counted once and its collection intent lock is not
+    /// released at the statement's end.
+    pub(crate) txn_locks: bool,
 }
 
 /// A cursor reply's document batch as pre-encoded BSON blobs, plus which field
@@ -293,6 +304,8 @@ impl CommandContext {
             awaited: std::cell::Cell::new(std::time::Duration::ZERO),
             pending_batch: None,
             raw_insert_documents: None,
+            locks: None,
+            txn_locks: false,
         }
     }
 
@@ -315,6 +328,13 @@ impl CommandContext {
         transactions: Arc<transactions::TransactionRegistry>,
     ) -> Self {
         self.transactions = Some(transactions);
+        self
+    }
+
+    /// Attach the server-wide lock manager (builder-style). Drives
+    /// `serverStatus.locks` and the collection locks transactions hold.
+    pub fn with_locks(mut self, locks: Arc<lock_manager::LockManager>) -> Self {
+        self.locks = Some(locks);
         self
     }
 
@@ -1745,6 +1765,18 @@ fn abort_transaction(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
 fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Document {
     let budget = max_time_ms_budget(doc);
     let _deadline = deadline::arm((budget > 0).then_some(budget));
+    // The statement's lock chain (mongod's hierarchy). A transaction
+    // statement's chain was already taken with the transaction's owner,
+    // which holds its collection locks to commit/abort — see `session`.
+    let _locks = if ctx.txn_locks {
+        None
+    } else {
+        match lock_manager::Guard::statement(ctx.locks.as_ref(), doc, &ctx.db_name) {
+            Some(Ok(guard)) => Some(guard),
+            Some(Err(e)) => return e.into_reply(),
+            None => None,
+        }
+    };
     match handler(doc, ctx) {
         Ok(reply) => {
             if budget > 0 {

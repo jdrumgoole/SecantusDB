@@ -1044,7 +1044,7 @@ def _drop_under_read_txn(client: Any) -> tuple:
     return (ans, name in db.list_collection_names())
 
 
-@pytest.mark.backlog("RM-084")
+@pytest.mark.backlog_fixed("RM-084")
 def test_drop_waits_for_a_transaction_that_read(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11: a `drop` of a collection a transaction has read waits,
     answers 50 MaxTimeMSExpired at its `maxTimeMS`, and keeps the collection."""
@@ -1076,7 +1076,7 @@ def _drop_under_write_txn(client: Any) -> tuple:
     return (answered_in_time, result, name in db.list_collection_names())
 
 
-@pytest.mark.backlog("RM-084")
+@pytest.mark.backlog_fixed("RM-084")
 def test_drop_under_a_transaction_that_wrote_honours_max_time(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
