@@ -133,10 +133,11 @@ def _dbpointer_ns_doc(key: str, ns: str, with_id: bool = False) -> RawBSONDocume
     return RawBSONDocument(struct.pack("<i", 4 + len(elems) + 1) + elems + b"\x00")
 
 
-@pytest.mark.backlog("RM-127")
+@pytest.mark.backlog_fixed("RM-127")
 def test_dbpointer_min_against_a_dbpointer(rust_mongo: Any, mongod: Any) -> None:
-    """`$min` of one DBPointer over another: mongod compares them (by
-    namespace, then id) and writes the smaller."""
+    """`$min` of one DBPointer over another: mongod 8.2.11 compares them
+    (the size of the value first, so a shorter namespace is smaller, then
+    the namespace, then the id) and writes the smaller."""
     answers = []
     for c in _both(rust_mongo, mongod, "rm127c"):
         c.insert_one(_dbpointer_ns_doc("a", "db.z", with_id=True))

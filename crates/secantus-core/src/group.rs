@@ -58,7 +58,38 @@ fn eval_or_missing(expr: &Bson, doc: &Document, vars: &Document) -> R<Option<Bso
             }
         }
     }
-    eval(expr, doc, vars).map(Some)
+    // An expression can evaluate to MISSING too (`$ifNull` of two missing
+    // fields, a `$meta` with no metadata): the engine's marker for it is
+    // `Undefined`, and `$push` / `$addToSet` skip it as mongod does.
+    expressions::evaluate_or_missing(doc, expr, vars)
+        .map(|v| (!matches!(v, Bson::Undefined)).then_some(v))
+}
+
+/// A missing value where a value must be written (`$first`, `$last`, a
+/// group key) is null.
+fn missing_as_null(v: Bson) -> Bson {
+    match v {
+        Bson::Undefined => Bson::Null,
+        other => other,
+    }
+}
+
+/// The group key for `d`. A missing key is null. So is the missing field
+/// of a ONE-field document `_id` (`{a: "$nope"}` groups under `{a: null}`),
+/// while a document of several fields drops a missing one as any object
+/// expression does (`{a: "$nope", b: "$b"}` groups under `{b: ..}`):
+/// measured 8.2.11.
+fn group_key(id_expr: &Bson, d: &Document, vars: &Document) -> R<Bson> {
+    if let Bson::Document(spec) = id_expr {
+        if spec.len() == 1 {
+            let (k, e) = spec.iter().next().unwrap();
+            if !k.starts_with('$') {
+                let v = expressions::evaluate_or_missing(d, e, vars)?;
+                return Ok(Bson::Document(bson::doc! { k.clone(): missing_as_null(v) }));
+            }
+        }
+    }
+    eval(id_expr, d, vars).map(missing_as_null)
 }
 
 /// Canonical, hashable group-key.
@@ -615,10 +646,16 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
             if slot.is_none() {
                 // `if field not in bucket` — set once (even to null). Wrap so a
                 // null first value is distinguishable from "unset".
-                *slot = Some(eval(arg, doc, vars)?);
+                *slot = Some(missing_as_null(expressions::evaluate_or_missing(
+                    doc, arg, vars,
+                )?));
             }
         }
-        Acc::Last(slot) => *slot = Some(eval(arg, doc, vars)?),
+        Acc::Last(slot) => {
+            *slot = Some(missing_as_null(expressions::evaluate_or_missing(
+                doc, arg, vars,
+            )?))
+        }
         Acc::Push(list) => {
             if let Some(v) = eval_or_missing(arg, doc, vars)? {
                 list.push(v);
@@ -1296,7 +1333,7 @@ fn run_group(
 
     for d in docs {
         crate::deadline::check()?;
-        let key_val = eval(id_expr, d, vars)?;
+        let key_val = group_key(id_expr, d, vars)?;
         let gk = gkey(&key_val)?;
         let idx = match index.get(&gk) {
             Some(i) => *i,

@@ -1188,31 +1188,16 @@ differs on 5 scenarios. What is left:
       result. One scenario.
       Backlog-ID: RM-080
       Verify: tests/backlog/test_rm_057_084.py::test_get_more_sees_writes_made_since_the_find
-- [ ] **RUST MongoDB server: `$meta` in an aggregate pipeline, three
-      shapes.** `{$meta: "recordId"}` / `{$meta: "indexKey"}` projections and
-      `showRecordId` give mongod's values since 2026-10-16 (records are
-      numbered per collection from 1). Still different, measured against
-      8.2.11:
-      - `{$meta: "sortKey"}` after a `$sort` is refused here as unsupported
-        (2); mongod gives the key as an array (`[3]` for `{a: 1}`), in
-        `$project` and `$addFields` alike;
-      - a `$group` keyed on `{$meta: "recordId"}` is refused here (2);
-        mongod groups every document under `null`;
-      - `{$meta: "geoNearDistance"}` after a `$geoNear` is 40218 here, and
-        mongod gives the distance.
-      Not probed: `oplogReplay`, `$meta: "textScore"` sorts, an
-      `explain: true` aggregate.
-      The record-id counter is NOT stored: mongod rebuilds it from the
-      largest record id when it reopens a collection, and so does this
-      server, which is what the 2026-10-16 decision ("number each
-      collection's records from 1 ... as mongod does") comes to once
-      measured. A store written before then keeps its store-wide record ids
-      on its existing documents, and new inserts carry on from the largest.
-      Not measured: a collection dropped while a transaction still holds
-      uncommitted inserts in it (RM-084's situation) could reuse a record id
-      when recreated.
-      Backlog-ID: RM-083
-      Verify: tests/backlog/test_rm_057_084.py::test_meta_sort_key_in_aggregate, tests/backlog/test_rm_057_084.py::test_group_keyed_on_meta, tests/backlog/test_rm_057_084.py::test_meta_geo_near_distance_after_geo_near
+- **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
+  `$meta: "textScore"` sorts, an `explain: true` aggregate. Every
+  `{$meta}` shape measured on 8.2.11 matches since 2026-10-17, except a
+  `$project` of `sortKey` with no `$sort` before it: both refuse it with 2,
+  in different words (mongod's names its planner). The record-id counter is
+  NOT stored: mongod rebuilds it from the largest record id when it reopens
+  a collection, and so does this server. A store written before 2026-10-16
+  keeps its store-wide record ids on existing documents. Not measured: a
+  collection dropped while a transaction still holds uncommitted inserts in
+  it (RM-084's situation) could reuse a record id when recreated.
 
 ### 7.072 Sessions, transactions and retryable writes -- 2026-10-11
 
@@ -1720,15 +1705,6 @@ Rust-only driver-gauge failures that are deliberately not chased:
   accumulators** are refused, as mongod 8.2.11 refuses them (`15952 unknown
   group operator`, measured 2026-10-16). (`$toHashedIndexKey`, the rest of
   what was RM-124, now hashes as mongod does.)
-- [ ] **A DBPointer `$min` / `$max` operand against a stored DBPointer
-  defers on the Rust server** (an error there; mongod compares the two by
-  namespace, then id). Against any other type a DBPointer now ranks as
-  mongod ranks it (between Regex and JavaScript). The `bson` crate keeps a
-  DBPointer's namespace and id private, so comparing two needs its raw
-  bytes. DBPointer is a deprecated BSON type no supported driver emits;
-  low priority.
-  Backlog-ID: RM-127
-  Verify: tests/backlog/test_rm_113_138.py::test_dbpointer_min_against_a_dbpointer
 - **Out of scope — `$group` accumulator error RE-CODING is not reproduced.**
   mongod substitutes its own code for an error raised inside a `$group`
   accumulator (`4848401` for a division by zero, `7157706` for `$ln`), where
@@ -1740,8 +1716,9 @@ Rust-only driver-gauge failures that are deliberately not chased:
   Since 2026-10-16 `recordId` and `indexKey` are given there
   (`secantus-commands/src/agg_meta.rs`, measured 8.2.11): the record id
   only in a `$project` the query layer takes, the index key through the
-  stages that keep a document's metadata. What is still different is
-  RM-083's three shapes. (Find-projection `$meta` is done.)
+  stages that keep a document's metadata; since 2026-10-17 also `sortKey`
+  and the `$geoNear` distance and point, from the stage that sets them
+  (`agg_meta::rewrite_sort_metadata`). (Find-projection `$meta` is done.)
 - **Decided 2026-10-16 (Joe) — record ids are numbered per collection
   from 1**, as on mongod, so `$meta: "recordId"` and `showRecordId` give
   mongod's numbers. This replaced the earlier deliberate divergence (one
