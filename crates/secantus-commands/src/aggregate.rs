@@ -4035,6 +4035,15 @@ fn apply_merge(
         writes.push((q, doc));
     }
 
+    // Writing into a target that is not there creates it: two write rounds
+    // more on mongod 8.2.11, as an insert that creates its collection takes.
+    if !writes.is_empty()
+        && !storage
+            .collection_exists(&merge.db, &merge.coll)
+            .unwrap_or(true)
+    {
+        drop(crate::lock_manager::write_rounds(&merge.db, &merge.coll, 2));
+    }
     let upsert = merge.not_matched == "insert";
     let mut first: Option<CommandError> = None;
     let note = |e: CommandError, first: &mut Option<CommandError>| {
@@ -4069,6 +4078,9 @@ fn apply_merge(
             if encoded.is_empty() {
                 continue;
             }
+            // One round for the batch (mongod 8.2.11, when it inserts
+            // cleanly; its retries after a duplicate are not reproduced).
+            let _round = crate::lock_manager::write_rounds(&merge.db, &merge.coll, 1);
             let (_, errors) = storage
                 .insert(&merge.db, &merge.coll, encoded, false)
                 .map_err(command_error)?;
@@ -4151,6 +4163,8 @@ fn apply_merge(
         if bypass_validation {
             command.insert("bypassDocumentValidation", true);
         }
+        // A write round per document, as mongod takes them.
+        let _rounds = crate::lock_manager::write_rounds(&merge.db, &merge.coll, chunk.len());
         let reply =
             match crate::crud::update_in(&command, &merge.db, storage, false, None, Err(false)) {
                 Ok(reply) => reply,
