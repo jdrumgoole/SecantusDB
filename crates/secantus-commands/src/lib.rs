@@ -1781,6 +1781,7 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
             None => None,
         }
     };
+    let _current = lock_manager::enter(ctx.locks.as_ref());
     match handler(doc, ctx) {
         Ok(reply) => {
             if budget > 0 {

@@ -508,6 +508,17 @@ pub fn statement_rounds(
             if !writes {
                 return read();
             }
+            let merges = matches!(doc.get("pipeline"), Some(bson::Bson::Array(stages))
+                if stages.last().and_then(bson::Bson::as_document)
+                    .is_some_and(|d| d.contains_key("$merge")));
+            if merges {
+                // The global IS twice; the writes take their rounds as they
+                // go (`write_rounds`).
+                return Some(vec![
+                    vec![(Resource::Global, Is)],
+                    vec![(Resource::Global, Is)],
+                ]);
+            }
             out_rounds(doc, db, coll, facts)
         }
         "insert" => {
@@ -609,7 +620,7 @@ pub fn statement_rounds(
 /// checked, the temporary collection and the target in X twice -- three
 /// times when the target exists and is replaced -- and two write rounds.
 /// `$merge` writes a round per document, which is not known before the
-/// pipeline runs: it takes the generic chain.
+/// pipeline runs: it takes them as it writes (`write_rounds`).
 fn out_rounds(
     doc: &bson::Document,
     db: &str,
@@ -648,6 +659,56 @@ fn out_rounds(
     rounds.extend((0..if replaced { 3 } else { 2 }).map(|_| write(X)));
     rounds.extend((0..2).map(|_| write(Ix)));
     Some(rounds)
+}
+
+thread_local! {
+    /// The lock manager of the statement this thread is running, for the
+    /// writes a statement makes partway through (`$merge`'s, a round per
+    /// document), which the rounds taken before it runs cannot know.
+    static CURRENT: std::cell::RefCell<Option<std::sync::Arc<LockManager>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Makes `lm` the running statement's lock manager until dropped.
+pub struct CurrentScope(Option<std::sync::Arc<LockManager>>);
+
+/// Enter a statement: [`write_rounds`] takes its locks from `lm`.
+pub fn enter(lm: Option<&std::sync::Arc<LockManager>>) -> CurrentScope {
+    CurrentScope(CURRENT.with(|c| c.replace(lm.cloned())))
+}
+
+impl Drop for CurrentScope {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        CURRENT.with(|c| *c.borrow_mut() = previous);
+    }
+}
+
+/// `n` write rounds on `db.coll` from the running statement's lock manager,
+/// as mongod takes one per document a `$merge` writes: all but the last
+/// taken and let go, the last held until the returned guard drops. `None`
+/// when `n` is 0 or no statement is running.
+pub fn write_rounds(db: &str, coll: &str, n: usize) -> Option<Guard> {
+    let lm = CURRENT.with(|c| c.borrow().clone())?;
+    if n == 0 {
+        return None;
+    }
+    let round = vec![
+        (Resource::ReplicationStateTransition, Mode::Ix),
+        (Resource::Global, Mode::Ix),
+        (Resource::Database(db.to_string()), Mode::Ix),
+        (Resource::Collection(format!("{db}.{coll}")), Mode::Ix),
+    ];
+    for _ in 1..n {
+        let owner = lm.statement_owner();
+        if acquire_chain(&lm, owner, &round).is_err() {
+            return None;
+        }
+        lm.release(owner);
+    }
+    let owner = lm.statement_owner();
+    acquire_chain(&lm, owner, &round).ok()?;
+    Some(Guard { lm, owner })
 }
 
 /// Take a chain in order; a link that fails (the deadline spent mid-chain)

@@ -693,29 +693,28 @@ Still different:
       in memory answers 115 with this server's own text, because mongod's
       in-memory engine is Enterprise-only and its message could not be
       measured.
-- [ ] **`serverStatus.locks`: `$merge`, the transaction commands, and the
-      commands not measured.** The lock manager (`lock_manager.rs`, RM-034)
-      takes, outside a transaction, the rounds mongod 8.2.11 takes
+- [ ] **`serverStatus.locks`: `$merge`'s retries, the transaction commands,
+      and the commands not measured.** The lock manager (`lock_manager.rs`,
+      RM-034) takes, outside a transaction, the rounds mongod 8.2.11 takes
       (`statement_rounds`, measured per command): reads, the write commands,
-      `findAndModify`, `create` / `drop` / `dropDatabase`, index builds
-      (the collection in X three times and IX five; once each on an empty
-      collection), `dropIndexes`, `$out` and `dbStats` count as mongod's
-      (`test_lock_counts_per_command`, `test_lock_counts_of_index_builds_out_and_db_stats`,
-      `test_lock_counts_of_index_build_and_out_shapes`). An index build's
-      count of the global IS is not fixed on mongod: its build runs on a
-      thread of its own and the command takes the IS each time it looks at
-      it, 1 to 4 times in one shape measured; this server takes the least
-      mongod was seen to, and the tests compare that count as a floor.
-      Still different:
-      `$merge` takes a write round per document it writes on mongod (and two
-      more when it creates its target), which is not known before the
-      pipeline runs, so it takes the generic chain here; the transaction
-      commands were not measured; nor was any other command, which still
-      takes the generic chain. mongod's internal resources (`Metadata`,
-      `oplog`, `Mutex`, `MultiDocumentTransactionsBarrier`) are locked by
-      its background threads only and are absent here.
+      `findAndModify`, `create` / `drop` / `dropDatabase`, index builds,
+      `dropIndexes`, `$out`, `dbStats`, and `$merge`, which takes a write
+      round per document as it writes (`write_rounds`, two more when it
+      creates its target), all count as mongod's (the regression tests in
+      `tests/backlog/test_rm_185_locks.py`). An index build's count of the
+      global IS is not fixed on mongod: its build runs on a thread of its
+      own and the command takes the IS each time it looks at it, 1 to 4
+      times in one shape measured; this server takes the least mongod was
+      seen to, and the tests compare that count as a floor. Still different:
+      `$merge` with `whenMatched: "fail"` that meets a duplicate retries its
+      batch on mongod, taking more rounds (3 for 4 documents with one
+      duplicate, 4 with two) where this server takes the batch's one; the
+      transaction commands were not measured; nor was any other command,
+      which still takes the generic chain. mongod's internal resources
+      (`Metadata`, `oplog`, `Mutex`, `MultiDocumentTransactionsBarrier`) are
+      locked by its background threads only and are absent here.
       Backlog-ID: RM-185
-      Verify: tests/backlog/test_rm_185_locks.py::test_lock_counts_of_merge
+      Verify: tests/backlog/test_rm_185_locks.py::test_lock_counts_of_merge_fail_with_duplicates
 - [ ] **Server parameters** (about 30). `getParameter` reports the
       thirteen parameters that are true of this server
       (`serverinfo::parameters`) and mongod has several hundred.

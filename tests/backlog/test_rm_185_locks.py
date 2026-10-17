@@ -229,8 +229,75 @@ def _merge(client: Any) -> list:
     )
 
 
-@pytest.mark.backlog("RM-185")
+@pytest.mark.backlog_fixed("RM-185")
 def test_lock_counts_of_merge(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `$merge` takes the global IS twice and a write round
     for each document it writes (two more when it creates the target)."""
     assert _merge(rust_mongo) == _reference(_merge, mongod)
+
+
+def _merge_modes(client: Any) -> list:
+    cases = []
+    for n in (0, 1, 3):
+        db = client[_fresh("rm185n")]
+        if n:
+            db.c.insert_many([{"_id": i} for i in range(n)])
+        else:
+            db.create_collection("c")
+        db.t.insert_one({"_id": 0})
+        cases.append(
+            (f"$merge of {n}", lambda db=db: list(db.c.aggregate([{"$merge": {"into": "t"}}])))
+        )
+    for matched, not_matched in [
+        ("replace", "insert"),
+        ("keepExisting", "insert"),
+        ("merge", "discard"),
+        ([{"$set": {"z": 1}}], "insert"),
+    ]:
+        db = client[_fresh("rm185w")]
+        db.c.insert_many([{"_id": i} for i in range(4)])
+        db.t.insert_one({"_id": 0})
+        spec = {"into": "t", "whenMatched": matched, "whenNotMatched": not_matched}
+        cases.append(
+            (
+                f"$merge {matched} / {not_matched}",
+                lambda db=db, spec=spec: list(db.c.aggregate([{"$merge": spec}])),
+            )
+        )
+    db = client[_fresh("rm185f")]
+    db.c.insert_many([{"_id": i} for i in range(4)])
+    db.t.insert_one({"_id": 99})
+    cases.append(
+        (
+            "$merge fail with no duplicate",
+            lambda: list(db.c.aggregate([{"$merge": {"into": "t", "whenMatched": "fail"}}])),
+        )
+    )
+    return _deltas(client, cases)
+
+
+@pytest.mark.backlog_fixed("RM-185")
+def test_lock_counts_of_merge_modes(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11's `$merge`: the global IS twice and a write round per
+    document, whatever `whenMatched` / `whenNotMatched` say; `whenMatched:
+    "fail"` one round for a batch that inserts cleanly."""
+    assert _merge_modes(rust_mongo) == _reference(_merge_modes, mongod)
+
+
+def _merge_fail_duplicates(client: Any) -> list:
+    db = client[_fresh("rm185d2")]
+    db.c.insert_many([{"_id": i} for i in range(4)])
+    db.t.insert_many([{"_id": 0}, {"_id": 2}])
+    spec = {"into": "t", "whenMatched": "fail"}
+    return _deltas(
+        client,
+        [("$merge fail with two duplicates", lambda: list(db.c.aggregate([{"$merge": spec}])))],
+    )
+
+
+@pytest.mark.backlog("RM-185")
+def test_lock_counts_of_merge_fail_with_duplicates(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11's `whenMatched: "fail"` retries a batch that met a
+    duplicate, taking more write rounds (4 for 4 documents with two
+    duplicates, 3 with one); this server takes the batch's one."""
+    assert _merge_fail_duplicates(rust_mongo) == _reference(_merge_fail_duplicates, mongod)
