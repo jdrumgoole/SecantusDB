@@ -78,6 +78,10 @@ const CATALOG_NAMES: &[&str] = &[
     "current_catalog",
     "current_setting",
     "pg_backend_pid",
+    // Not `pg_blocking_pids`: it rides the executor hook like the advisory
+    // locks (`correlated::SEQUENCE_FUNCTIONS`), and listing it here too
+    // routes select lists through the const-col path, which cannot take a
+    // column argument.
     "inet_client_addr",
     "inet_client_port",
     "inet_server_addr",

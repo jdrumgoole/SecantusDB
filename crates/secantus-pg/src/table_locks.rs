@@ -15,7 +15,9 @@ use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 pub const ACCESS_SHARE: i32 = 1;
+pub const ROW_SHARE: i32 = 2;
 pub const ROW_EXCLUSIVE: i32 = 3;
+pub const SHARE: i32 = 5;
 pub const ACCESS_EXCLUSIVE: i32 = 8;
 
 struct Hold {
@@ -161,7 +163,8 @@ pub fn acquire<E>(
             // The wait's edges register in the shared wait-for graph
             // (`lock_manager`), so a cycle is seen whatever lock kinds it
             // runs through; only real holder edges are ever registered.
-            let guard = crate::lock_manager::WaitGuard::new(pid);
+            let guard =
+                crate::lock_manager::WaitGuard::new(pid, crate::lock_manager::WaitKind::Relation);
             let mut holds = t.holds.lock().unwrap_or_else(|e| e.into_inner());
             let mut polls = 0u32;
             while conflicts(&holds, table_name, pid, mode) {

@@ -2949,6 +2949,10 @@ pub enum ConstCol {
     /// `pg_backend_pid()` -- the connection's own backend PID, which only the
     /// server knows (pgwire assigns it during startup).
     BackendPid,
+    /// `pg_blocking_pids(pid)` -- who blocks whom is the executor's live
+    /// wait-for graph, so a constant call resolves at execution like
+    /// `nextval`, never folded at plan time.
+    BlockingPids(Box<ConstCol>),
     /// `nextval(seq)` -- draws and CONSUMES a value, so it is resolved at
     /// execution and never at DESCRIBE: a describe that advanced the sequence
     /// would hand the next caller a number PostgreSQL never skipped.
@@ -22372,6 +22376,12 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("set_limit") => {
             return "float4".to_string();
         }
+        // `pg_blocking_pids(int4)` answers `int4[]`; the hook's value (an
+        // array, often empty) would otherwise infer the column's type from
+        // the value alone.
+        Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("pg_blocking_pids") => {
+            return "int4[]".to_string();
+        }
         Some(N::AExpr(e)) if extension_installed("pg_trgm") => {
             let op = e.name.last().and_then(|n| match n.node.as_ref() {
                 Some(N::String(s)) => Some(s.sval.as_str()),
@@ -24695,6 +24705,24 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     };
                     let value = correlated::call_sequence("lastval", &[])?;
                     columns.push((out, ConstCol::Value(value), "int8".to_string(), -1));
+                    continue;
+                }
+                if name == "pg_blocking_pids" {
+                    let out = if rt.name.is_empty() {
+                        name.clone()
+                    } else {
+                        rt.name.clone()
+                    };
+                    let arg = match f.args.first() {
+                        None => ConstCol::Value(Bson::Null),
+                        Some(node) => ConstCol::Value(const_value(node, params)?),
+                    };
+                    columns.push((
+                        out,
+                        ConstCol::BlockingPids(Box::new(arg)),
+                        "int4[]".to_string(),
+                        -1,
+                    ));
                     continue;
                 }
                 if matches!(name.as_str(), "nextval" | "currval" | "setval")

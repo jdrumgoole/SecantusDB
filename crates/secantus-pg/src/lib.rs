@@ -11417,20 +11417,50 @@ impl PgHandler {
             return Ok(());
         }
         let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
-        let dml = secantus_pgplan::privileges::sql_relations(sql)
-            .into_iter()
-            .map(|(table, privilege)| {
-                let mode = match privilege {
-                    "SELECT" => table_locks::ACCESS_SHARE,
-                    "TRUNCATE" => table_locks::ACCESS_EXCLUSIVE,
-                    _ => table_locks::ROW_EXCLUSIVE,
-                };
-                (table, mode)
-            });
+        let relations = secantus_pgplan::privileges::sql_relations(sql);
+        let row_locked = secantus_pgplan::privileges::row_locked_tables(sql);
+        let truncates: Vec<String> = relations
+            .iter()
+            .filter(|(_, p)| *p == "TRUNCATE")
+            .map(|(t, _)| t.clone())
+            .collect();
+        // One hold per table, at its strongest mode: a write privilege
+        // subsumes the statement's SELECT entry (DELETE takes
+        // RowExclusiveLock alone, as PostgreSQL), and a row-locking clause
+        // upgrades the table's AccessShare to RowShare.
+        let mut dml: Vec<(String, i32)> = Vec::new();
+        for (table, privilege) in relations {
+            let mode = match privilege {
+                "SELECT" => {
+                    if row_locked.iter().any(|t| *t == table) {
+                        table_locks::ROW_SHARE
+                    } else {
+                        table_locks::ACCESS_SHARE
+                    }
+                }
+                "TRUNCATE" => table_locks::ACCESS_EXCLUSIVE,
+                _ => table_locks::ROW_EXCLUSIVE,
+            };
+            if mode == table_locks::ACCESS_SHARE
+                && dml
+                    .iter()
+                    .any(|(t, m)| *t == table && *m == table_locks::ROW_EXCLUSIVE)
+            {
+                // The write hold already covers the read.
+                continue;
+            }
+            if mode == table_locks::ROW_EXCLUSIVE {
+                dml.retain(|(t, m)| !(*t == table && *m == table_locks::ACCESS_SHARE));
+            }
+            match dml.iter_mut().find(|(t, _)| *t == table) {
+                Some((_, m)) => *m = (*m).max(mode),
+                None => dml.push((table, mode)),
+            }
+        }
         // DDL waits for readers too: ALTER / DROP / rename / CLUSTER take
         // ACCESS EXCLUSIVE, CREATE INDEX takes SHARE.
         let ddl = secantus_pgplan::privileges::ddl_locks(sql);
-        for (table, mode) in dml.chain(ddl) {
+        for (table, mode) in dml.into_iter().chain(ddl) {
             table_locks::acquire(
                 &table,
                 pid,
@@ -11440,6 +11470,19 @@ impl PgHandler {
                 self.lock_wait_poll(),
                 Self::deadlock_error,
             )?;
+            // PostgreSQL's TRUNCATE holds ShareLock on the table beside its
+            // AccessExclusiveLock (RP-047's measured shape).
+            if mode == table_locks::ACCESS_EXCLUSIVE && truncates.iter().any(|t| t == &table) {
+                table_locks::acquire(
+                    &table,
+                    pid,
+                    table_locks::SHARE,
+                    in_block,
+                    false,
+                    self.lock_wait_poll(),
+                    Self::deadlock_error,
+                )?;
+            }
         }
         Ok(())
     }
@@ -18572,8 +18615,19 @@ impl PgHandler {
                         d.insert(field("xact_start"), Bson::Null);
                         d.insert(field("query_start"), opt_time(a.query_start));
                         d.insert(field("state_change"), opt_time(a.state_change));
-                        d.insert(field("wait_event_type"), Bson::Null);
-                        d.insert(field("wait_event"), Bson::Null);
+                        // A backend in a lock wait reports it, as
+                        // PostgreSQL's `pg_stat_activity` does: type `Lock`,
+                        // the wait's kind (RP-047).
+                        match lock_manager::wait_kind(pid) {
+                            Some(kind) => {
+                                d.insert(field("wait_event_type"), "Lock");
+                                d.insert(field("wait_event"), kind.wait_event());
+                            }
+                            None => {
+                                d.insert(field("wait_event_type"), Bson::Null);
+                                d.insert(field("wait_event"), Bson::Null);
+                            }
+                        }
                         d.insert(field("state"), a.state);
                         d.insert(field("backend_xid"), Bson::Null);
                         d.insert(field("backend_xmin"), Bson::Null);
@@ -24335,6 +24389,25 @@ impl PgHandler {
         if name == "pg_has_role" {
             return self.has_role_call(args);
         }
+        if name == "pg_blocking_pids" {
+            // PostgreSQL 15: the int4[] of sessions holding what the given
+            // backend waits on — empty for an idle one. Read off the shared
+            // wait-for graph (RP-047).
+            let pid = match args.first() {
+                Some(Bson::Int32(p)) => Some(*p),
+                Some(Bson::Int64(p)) => Some(*p as i32),
+                _ => None,
+            };
+            let Some(pid) = pid else {
+                return Ok(Bson::Null);
+            };
+            return Ok(Bson::Array(
+                lock_manager::blockers_of(pid)
+                    .into_iter()
+                    .map(Bson::Int32)
+                    .collect(),
+            ));
+        }
         if name == "has_table_privilege" {
             return self.within_block(|| self.has_table_privilege_call(args));
         }
@@ -26471,6 +26544,25 @@ impl PgHandler {
                     Ok(Bson::Int64(self.currval(&name)?))
                 }
             },
+            ConstCol::BlockingPids(pid) => {
+                // PostgreSQL 15: NULL in answers NULL; an unknown backend
+                // answers an empty array.
+                let pid = self.resolve_const_col(pid)?;
+                let pid = match pid {
+                    Bson::Int32(p) => Some(p),
+                    Bson::Int64(p) => Some(p as i32),
+                    _ => None,
+                };
+                let Some(pid) = pid else {
+                    return Ok(Bson::Null);
+                };
+                Ok(Bson::Array(
+                    lock_manager::blockers_of(pid)
+                        .into_iter()
+                        .map(Bson::Int32)
+                        .collect(),
+                ))
+            }
             ConstCol::SetVal {
                 sequence,
                 value,
