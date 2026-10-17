@@ -46,6 +46,9 @@ pub struct ResumeTokenData {
     /// True for the token of an `invalidate` event. `resumeAfter` on such a token
     /// is rejected (the stream it came from is over); `startAfter` is required.
     pub from_invalidate: bool,
+    /// For one fragment of a split event, its number from 0 (mongod's
+    /// `fragmentNum`): resuming from it skips the fragments up to it.
+    pub fragment: Option<i32>,
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -75,6 +78,9 @@ pub fn make_resume_token(data: &ResumeTokenData) -> Result<Document> {
     inner.insert("k", Bson::Document(data.document_key.clone()));
     if data.from_invalidate {
         inner.insert("i", true);
+    }
+    if let Some(f) = data.fragment {
+        inner.insert("f", f);
     }
     let bytes = encode_doc(&inner)?;
     let mut out = Document::new();
@@ -107,6 +113,7 @@ pub fn parse_resume_token(token: &Document) -> Result<ResumeTokenData> {
         ns: inner.get_str("n").unwrap_or("").to_string(),
         document_key: inner.get_document("k").cloned().unwrap_or_default(),
         from_invalidate: inner.get_bool("i").unwrap_or(false),
+        fragment: inner.get_i32("f").ok(),
     })
 }
 
@@ -428,6 +435,7 @@ fn project_unordered(
             ns: ns.clone(),
             document_key: document_key.clone(),
             from_invalidate: false,
+            fragment: None,
         })?;
         let mut event = Document::new();
         // A write made in a transaction names it, ahead of the token (mongod
@@ -527,6 +535,7 @@ fn project_command(
             ns: affected_ns.to_string(),
             document_key: Document::new(),
             from_invalidate: false,
+            fragment: None,
         })?;
         let mut event = Document::new();
         event.insert("_id", Bson::Document(token));
@@ -786,6 +795,7 @@ pub fn invalidate_event(seq: i64, oplog_entry: &Document) -> Result<Document> {
         ns: affected_ns,
         document_key: Document::new(),
         from_invalidate: true,
+        fragment: None,
     })?;
     let mut event = Document::new();
     event.insert("_id", Bson::Document(token));
@@ -797,54 +807,78 @@ pub fn invalidate_event(seq: i64, oplog_entry: &Document) -> Result<Document> {
     Ok(event)
 }
 
+/// `kBSONObjMaxChangeEventSize`: an event (with its resume token) larger
+/// than this is split.
 const SPLIT_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
-const HEAVY_FIELD_BYTES: usize = 1024 * 1024;
 
-/// Split `event` into 16 MB-bounded fragments when over the BSON limit, tagging
-/// each with `splitEvent: {fragment, of}`. An event under the limit is returned
-/// as it is: mongod 8.2.11 adds no `splitEvent` to an event it did not split
-/// (measured 2026-10-11). The Python server stamps `{fragment: 1, of: 1}`.
-pub fn stamp_split_event(mut event: Document) -> Result<Vec<Document>> {
-    let encoded_size = encode_doc(&event)?.len();
-    let split_one = |mut e: Document| -> Document {
-        let mut se = Document::new();
-        se.insert("fragment", 1i32);
-        se.insert("of", 1i32);
-        e.insert("splitEvent", Bson::Document(se));
-        e
+/// mongod's `splitChangeEvent` (`change_stream_split_event_helpers.cpp`,
+/// 8.2): an event that with its resume token is over 16 MB becomes
+/// fragments. Every field but `_id` goes into exactly one, taken in order of
+/// (the field's BSON size, its name) and packed into a fragment until the
+/// next would take it past 16 MB less the token. Each fragment leads with
+/// its own `_id` -- the event's token with the fragment's number from 0 --
+/// and `splitEvent: {fragment, of}`, numbered from 1. An event under the
+/// limit is returned as it is: mongod 8.2.11 adds no `splitEvent` to an
+/// event it did not split (measured 2026-10-11).
+pub fn stamp_split_event(event: Document) -> Result<Vec<Document>> {
+    let token = match event.get("_id") {
+        Some(Bson::Document(t)) => t.clone(),
+        _ => return Ok(vec![event]),
     };
-    if encoded_size <= SPLIT_THRESHOLD_BYTES {
+    let token_size = encode_doc(&token)?.len();
+    if encode_doc(&event)?.len() + token_size <= SPLIT_THRESHOLD_BYTES {
         return Ok(vec![event]);
     }
-    // Classify each top-level field by its own BSON size.
-    let mut heavy: Vec<String> = Vec::new();
-    let mut light: Vec<String> = Vec::new();
-    for (k, v) in &event {
+    let max_fragment = SPLIT_THRESHOLD_BYTES - token_size;
+    // (element size, name) -> value, as mongod's `std::map` orders them.
+    let mut fields: Vec<(usize, String, Bson)> = Vec::new();
+    for (k, v) in event {
+        if k == "_id" {
+            continue;
+        }
         let mut one = Document::new();
         one.insert(k.clone(), v.clone());
-        if encode_doc(&one)?.len() > HEAVY_FIELD_BYTES {
-            heavy.push(k.clone());
-        } else {
-            light.push(k.clone());
-        }
+        // An element is the document's bytes less its length and terminator.
+        let size = encode_doc(&one)?.len() - 5;
+        fields.push((size, k, v));
     }
-    if heavy.is_empty() {
-        return Ok(vec![split_one(event)]);
-    }
-    let mut light_meta = Document::new();
-    for k in &light {
-        light_meta.insert(k.clone(), event.remove(k).unwrap());
-    }
-    let total = heavy.len() as i32;
-    let mut fragments = Vec::with_capacity(heavy.len());
-    for (i, hf) in heavy.iter().enumerate() {
-        let mut frag = light_meta.clone();
-        frag.insert(hf.clone(), event.remove(hf).unwrap());
+    fields.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    let data = parse_resume_token(&token)?;
+    let mut fragments: Vec<Document> = Vec::new();
+    let mut it = fields.into_iter().peekable();
+    while it.peek().is_some() {
+        let mut frag_token = data.clone();
+        frag_token.fragment = Some(fragments.len() as i32);
+        let mut frag = Document::new();
+        frag.insert("_id", Bson::Document(make_resume_token(&frag_token)?));
         let mut se = Document::new();
-        se.insert("fragment", (i as i32) + 1);
-        se.insert("of", total);
+        se.insert("fragment", (fragments.len() as i32) + 1);
+        se.insert("of", 0i32);
         frag.insert("splitEvent", Bson::Document(se));
+        // mongod measures the fragment with its metadata, the token again.
+        let mut size = encode_doc(&frag)?.len() + token_size;
+        loop {
+            let (field_size, name, value) = it.next().expect("peeked");
+            frag.insert(name, value);
+            size += field_size;
+            match it.peek() {
+                Some((next, _, _)) if size + next <= max_fragment => {}
+                _ => break,
+            }
+        }
+        if size > max_fragment {
+            return Err(StorageError::Bson(format!(
+                "Splitting change event failed: fragment size {size} is greater than maximum \
+                 allowed fragment size {max_fragment}"
+            )));
+        }
         fragments.push(frag);
+    }
+    let total = fragments.len() as i32;
+    for frag in &mut fragments {
+        if let Some(Bson::Document(se)) = frag.get_mut("splitEvent") {
+            se.insert("of", total);
+        }
     }
     Ok(fragments)
 }

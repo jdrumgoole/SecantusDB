@@ -844,7 +844,40 @@ def _split_events(client: Any) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-079")
+def _resume_from_a_fragment(client: Any) -> list:
+    c = client["rm079"][_name()]
+    c.insert_one({"_id": 1, "a": "x" * (7 << 20)})
+    pipeline = [{"$changeStreamSplitLargeEvent": {}}]
+    first = None
+    with c.watch(pipeline, full_document="updateLookup") as s:
+        c.update_one({"_id": 1}, {"$set": {"b": "y" * (7 << 20)}})
+        c.insert_one({"_id": 2})
+        deadline = time.monotonic() + 20
+        while first is None and time.monotonic() < deadline:
+            first = s.try_next()
+    assert first is not None and first.get("splitEvent", {}).get("fragment") == 1
+    out: list = []
+    with c.watch(pipeline, full_document="updateLookup", resume_after=first["_id"]) as s:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            ev = s.try_next()
+            if ev is not None:
+                out.append((ev.get("splitEvent"), sorted(k for k in ev if k != "splitEvent")))
+                if ev.get("documentKey", {}).get("_id") == 2:
+                    break
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-079")
+def test_resume_from_a_fragment(rust_mongo: Any, mongod_rs: Any) -> None:
+    """Resuming from the first fragment's token gives the fragments after
+    it, then the next event, as mongod 8.2.11 does."""
+    expected = _resume_from_a_fragment(mongod_rs)
+    assert len(expected) > 1
+    assert _resume_from_a_fragment(rust_mongo) == expected
+
+
+@pytest.mark.backlog_fixed("RM-079")
 def test_an_event_over_16mb_is_split(rust_mongo: Any, mongod_rs: Any) -> None:
     """An update event over the BSON limit (a 7 MB document, a 7 MB `$set`,
     `fullDocument: updateLookup`) under `$changeStreamSplitLargeEvent`: the
