@@ -157,6 +157,13 @@ run the **full** suite once before the batch's commit.
   CI fails on unformatted Rust.
 - Never bump a version. Both version lines are assigned at release.
 - Add a `changelog.d/<slug>.md` fragment; do not edit `docs/changelog.md`.
+- `rust-gate` does not fmt/clippy every excluded crate: `secantusdb` (and
+  `secantus-server-py`) are only gated by CI's `rust-storage` lane, so an
+  edit under `crates/secantusdb` must be checked by hand before committing —
+  `cd crates/secantusdb && cargo fmt --check && cargo clippy --all-targets --
+  -D warnings` (learned 2026-10-17: CI failed on the new embedded test's
+  formatting, green locally). `--test-threads` aside, `rust-binary-test`
+  covers the crate's tests.
 
 ## Landing
 
