@@ -56,13 +56,16 @@ impl Mode {
         }
     }
 
-    /// mongod's conflict table: a request of `self` cannot be granted while
-    /// a holder has `held`. Everything self-compatible but X.
+    /// mongod's conflict table (`lock_manager_defs.h`): a request of
+    /// `self` cannot be granted while a holder has `held`. It is
+    /// symmetric: IS goes with all but X, IX with IS and IX, S with IS and
+    /// S, X with nothing. A read outside a transaction takes only the
+    /// global IS (`statement_rounds`), so it never meets a collection's X.
     pub fn conflicts_with(self, held: Mode) -> bool {
         use Mode::*;
         matches!(
             (self, held),
-            (S, Ix) | (S, X) | (X, Is) | (X, Ix) | (X, S) | (X, X) | (Ix, S) | (Ix, X)
+            (Is, X) | (S, Ix) | (S, X) | (X, Is) | (X, Ix) | (X, S) | (X, X) | (Ix, S) | (Ix, X)
         )
     }
 }
@@ -244,14 +247,21 @@ impl LockManager {
     /// counts. Modes with no acquisitions are omitted, and
     /// `acquireWaitCount` / `timeAcquiringMicros` appear only for modes
     /// that waited — mongod's rendering.
-    /// The `serverStatus.locks` document: per resource kind, its per-mode
-    /// counts. Modes with no acquisitions are omitted, and
-    /// `acquireWaitCount` / `timeAcquiringMicros` appear only for modes
-    /// that waited — mongod's rendering.
     pub fn server_status_locks(&self) -> Vec<ResourceReport> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // mongod's `ResourceType` order, which `serverStatus.locks` keeps.
+        const ORDER: [&str; 8] = [
+            "MultiDocumentTransactionsBarrier",
+            "ReplicationStateTransition",
+            "Global",
+            "Database",
+            "Collection",
+            "Metadata",
+            "Mutex",
+            "oplog",
+        ];
         let mut kinds: Vec<&'static str> = inner.stats.keys().copied().collect();
-        kinds.sort();
+        kinds.sort_by_key(|k| ORDER.iter().position(|o| o == k).unwrap_or(ORDER.len()));
         kinds
             .into_iter()
             .map(|kind| {
@@ -393,6 +403,115 @@ pub fn statement_chain(doc: &bson::Document, db: &str) -> Vec<(Resource, Mode)> 
     chain
 }
 
+/// The rounds a statement OUTSIDE a transaction takes, where mongod 8.2.11
+/// was measured (2026-10-17, `serverStatus.locks` around one run of each);
+/// `None` for a command not measured, which takes [`statement_chain`].
+/// mongod lets a round go before it takes the next, and holds the last
+/// while the statement runs:
+///
+/// - a read (`find`, `getMore`, `aggregate` without `$out` / `$merge`,
+///   `count`, `distinct`, `listCollections`, `listIndexes`,
+///   `listDatabases`, `collStats`) takes the global IS alone -- reads are
+///   lock-free below it;
+/// - `insert` a round of IX on the state transition, global, database and
+///   collection locks, three when it creates the collection; `update` and
+///   `delete` a round per statement; `findAndModify` a round without the
+///   collection, then a full one;
+/// - `create` a write round, and a round that reads the collection when it
+///   exists already; `drop` / `dropIndexes` a write round and then one with
+///   the collection in X, or the database round alone when there is no
+///   collection; `dropDatabase` the database in X;
+/// - `hello`, `ping`, `serverStatus` and `killCursors` take nothing.
+pub fn statement_rounds(
+    doc: &bson::Document,
+    db: &str,
+    exists: &dyn Fn(&str) -> bool,
+) -> Option<Vec<Vec<(Resource, Mode)>>> {
+    use Mode::*;
+    let name = doc.keys().next().map(String::as_str)?;
+    let coll = doc.get_str(name).ok().filter(|s| !s.is_empty());
+    let write_round = |coll: Option<&str>| {
+        let mut r = vec![
+            (Resource::ReplicationStateTransition, Ix),
+            (Resource::Global, Ix),
+            (Resource::Database(db.to_string()), Ix),
+        ];
+        if let Some(c) = coll {
+            r.push((Resource::Collection(format!("{db}.{c}")), Ix));
+        }
+        r
+    };
+    let statements = |key: &str| match doc.get(key) {
+        Some(bson::Bson::Array(items)) => items.len().max(1),
+        _ => 1,
+    };
+    let read = || Some(vec![vec![(Resource::Global, Is)]]);
+    match name {
+        "hello" | "isMaster" | "ismaster" | "ping" | "serverStatus" | "killCursors" => {
+            Some(Vec::new())
+        }
+        "find" | "getMore" | "count" | "distinct" | "listCollections" | "listIndexes"
+        | "listDatabases" | "collStats" => read(),
+        "aggregate" => {
+            let writes = matches!(doc.get("pipeline"), Some(bson::Bson::Array(stages))
+            if stages.iter().any(|s| s.as_document().is_some_and(|d| {
+                d.contains_key("$out") || d.contains_key("$merge")
+            })));
+            if writes {
+                None
+            } else {
+                read()
+            }
+        }
+        "insert" => {
+            let c = coll?;
+            let n = if exists(c) { 1 } else { 3 };
+            Some((0..n).map(|_| write_round(Some(c))).collect())
+        }
+        "update" | "delete" => {
+            let c = coll?;
+            let key = if name == "update" {
+                "updates"
+            } else {
+                "deletes"
+            };
+            Some((0..statements(key)).map(|_| write_round(Some(c))).collect())
+        }
+        "findAndModify" | "findandmodify" => {
+            let c = coll?;
+            Some(vec![write_round(None), write_round(Some(c))])
+        }
+        "create" => {
+            let c = coll?;
+            let mut r = vec![write_round(Some(c))];
+            if exists(c) {
+                r.push(vec![
+                    (Resource::ReplicationStateTransition, Ix),
+                    (Resource::Global, Is),
+                    (Resource::Database(db.to_string()), Is),
+                    (Resource::Collection(format!("{db}.{c}")), Is),
+                ]);
+            }
+            Some(r)
+        }
+        "drop" | "dropIndexes" | "deleteIndexes" => {
+            let c = coll?;
+            if !exists(c) {
+                return Some(vec![write_round(None)]);
+            }
+            let mut exclusive = write_round(None);
+            exclusive.push((Resource::Collection(format!("{db}.{c}")), X));
+            Some(vec![write_round(Some(c)), exclusive])
+        }
+        "dropDatabase" => Some(vec![vec![
+            (Resource::ReplicationStateTransition, Ix),
+            (Resource::Global, Ix),
+            (Resource::Database(db.to_string()), X),
+        ]]),
+        _ => None,
+    }
+}
+
 /// Take a chain in order; a link that fails (the deadline spent mid-chain)
 /// releases what the chain took, leaving no stray holds.
 pub fn acquire_chain(
@@ -424,9 +543,20 @@ impl Guard {
         lm: Option<&std::sync::Arc<LockManager>>,
         doc: &bson::Document,
         db: &str,
+        exists: &dyn Fn(&str) -> bool,
     ) -> Option<Result<Self, crate::CommandError>> {
         let lm = lm?;
-        let chain = statement_chain(doc, db);
+        let mut rounds =
+            statement_rounds(doc, db, exists).unwrap_or_else(|| vec![statement_chain(doc, db)]);
+        let chain = rounds.pop().unwrap_or_default();
+        // The rounds before the last are taken and let go, as mongod does.
+        for round in &rounds {
+            let owner = lm.statement_owner();
+            if acquire_chain(lm, owner, round).is_err() {
+                return Some(Err(crate::CommandError::max_time_expired()));
+            }
+            lm.release(owner);
+        }
         let owner = lm.statement_owner();
         match acquire_chain(lm, owner, &chain) {
             Ok(()) => Some(Ok(Self {
@@ -452,10 +582,11 @@ mod tests {
     #[test]
     fn the_conflict_table_is_mongod_s() {
         use Mode::*;
-        // IS is compatible with everything, including X.
-        for m in [Is, Ix, S, X] {
+        // IS is compatible with all but X.
+        for m in [Is, Ix, S] {
             assert!(!Is.conflicts_with(m), "IS vs {m:?}");
         }
+        assert!(Is.conflicts_with(X));
         assert!(Ix.conflicts_with(S));
         assert!(Ix.conflicts_with(X));
         assert!(!Ix.conflicts_with(Ix));
