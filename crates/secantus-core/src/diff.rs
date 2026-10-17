@@ -72,6 +72,15 @@ fn eq(a: &Bson, b: &Bson) -> R<bool> {
 /// been the tempting one-line fix and would have broken `$eq` and query
 /// matching -- one predicate cannot serve both questions.
 fn same_stored_value(a: &Bson, b: &Bson) -> R<bool> {
+    // The same encoding is the same stored value, whatever `eq` would say
+    // about the type: a DBPointer, which equality cannot compare, made every
+    // update of a document holding one fail (RM-127, 2026-10-17).
+    if same_encoding(a, b) {
+        return Ok(true);
+    }
+    if matches!(a, Bson::DbPointer(_)) || matches!(b, Bson::DbPointer(_)) {
+        return Ok(false);
+    }
     if !eq(a, b)? {
         return Ok(false);
     }

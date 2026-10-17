@@ -1705,15 +1705,6 @@ Rust-only driver-gauge failures that are deliberately not chased:
   accumulators** are refused, as mongod 8.2.11 refuses them (`15952 unknown
   group operator`, measured 2026-10-16). (`$toHashedIndexKey`, the rest of
   what was RM-124, now hashes as mongod does.)
-- [ ] **A DBPointer `$min` / `$max` operand against a stored DBPointer
-  defers on the Rust server** (an error there; mongod compares the two by
-  namespace, then id). Against any other type a DBPointer now ranks as
-  mongod ranks it (between Regex and JavaScript). The `bson` crate keeps a
-  DBPointer's namespace and id private, so comparing two needs its raw
-  bytes. DBPointer is a deprecated BSON type no supported driver emits;
-  low priority.
-  Backlog-ID: RM-127
-  Verify: tests/backlog/test_rm_113_138.py::test_dbpointer_min_against_a_dbpointer
 - **Out of scope — `$group` accumulator error RE-CODING is not reproduced.**
   mongod substitutes its own code for an error raised inside a `$group`
   accumulator (`4848401` for a division by zero, `7157706` for `$ln`), where

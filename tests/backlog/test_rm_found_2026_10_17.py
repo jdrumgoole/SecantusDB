@@ -134,3 +134,47 @@ def test_sort_key_and_geo_near_metadata_through_stages(rust_mongo: Any, mongod: 
     point, through `$match`, `$limit`, `$project`, `$addFields`, `$unwind`
     and into a `$group`; with no `$sort`, `$addFields` gives `[]`."""
     assert _meta_shapes(rust_mongo) == _meta_shapes(mongod)
+
+
+def _dbpointer_doc(key: str, ns: str, with_id: bool = False) -> Any:
+    import struct
+
+    from bson.raw_bson import RawBSONDocument
+
+    raw_ns = ns.encode() + b"\x00"
+    elems = (b"\x10_id\x00" + struct.pack("<i", 1)) if with_id else b""
+    elems += b"\x0c" + key.encode() + b"\x00" + struct.pack("<i", len(raw_ns)) + raw_ns
+    elems += bytes(12)
+    return RawBSONDocument(struct.pack("<i", 4 + len(elems) + 1) + elems + b"\x00")
+
+
+def _updates_over_a_dbpointer(client: Any) -> list:
+    coll = client["rm127d"]["c"]
+    out = []
+    for upd in [
+        {"$set": {"b": 1}},
+        {"$min": {"a": 5}},
+        {"$max": {"a": 5}},
+        {"$min": _dbpointer_doc("a", "db.b")},
+        {"$max": _dbpointer_doc("a", "db.b")},
+        {"$min": _dbpointer_doc("a", "db.aa")},
+        {"$set": _dbpointer_doc("a", "db.q")},
+        {"$set": {"a": "s"}},
+    ]:
+        coll.drop()
+        coll.insert_one(_dbpointer_doc("a", "db.z", with_id=True))
+        out.append(
+            mongo_answer(
+                lambda u=upd: (coll.update_one({"_id": 1}, u).modified_count, str(coll.find_one()))
+            )
+        )
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-127")
+def test_updating_a_document_that_holds_a_dbpointer(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 updates a document holding a DBPointer like any other,
+    and compares two DBPointers by the size of the value, then its bytes
+    (a shorter namespace first, then the namespace, then the id). Every
+    such update used to be refused here, `$set` of another field included."""
+    assert _updates_over_a_dbpointer(rust_mongo) == _updates_over_a_dbpointer(mongod)

@@ -300,23 +300,42 @@ fn lt_text(v: &Bson) -> Option<&str> {
     }
 }
 
+/// A DBPointer's value as BSON stores it: the namespace's length, the
+/// namespace with its terminator, and the 12 bytes of the id. The `bson`
+/// crate keeps the two parts private, so they are read back from an
+/// encoding of `{v: <pointer>}`.
+fn db_pointer_value(v: &Bson) -> Option<Vec<u8>> {
+    let mut doc = bson::Document::new();
+    doc.insert("v", v.clone());
+    let mut buf = Vec::new();
+    doc.to_writer(&mut buf).ok()?;
+    // 4 bytes of length, the type byte, `v` and its terminator, then the
+    // value up to the document's own terminator.
+    buf.get(7..buf.len().checked_sub(1)?).map(<[u8]>::to_vec)
+}
+
 /// Python's `ordering._bson_lt(a, b)` — BSON-order strict-less as a single
 /// relation. Unlike [`cmp`], this needs no transitivity (it backs `$min` /
 /// `$max`, one comparison per write, not a sort), so it covers the types
 /// [`is_sortable`] must bar: bool (own rank, `False < True`), Decimal128
 /// (unified numeric), NaN (`<` is False both ways), Binary (bytes), Timestamp,
 /// Regex (Python `TypeError` → equal type names → False), Min/MaxKey, and the
-/// decoded exotic text types. `None` defers (DBPointer's type-name tiebreak;
-/// a Decimal128 that fails to classify).
+/// decoded exotic text types. `None` defers (a Decimal128 that fails to
+/// classify).
 pub fn bson_lt(a: &Bson, b: &Bson) -> Option<bool> {
     // A DBPointer ranks between Regex and JavaScript in mongod's canonical
     // type order, so against any other type the rank decides (RM-127,
     // measured 8.2.11: `{$min: {a: DBPointer}}` over `a: 5` is a no-op).
-    // Two DBPointers compare by namespace and id, which the `bson` crate
-    // does not expose: that pair still defers.
+    // Two DBPointers compare as mongod's `compareElementValues` does: the
+    // size of the value first, then its bytes -- so a shorter namespace is
+    // smaller, then the namespace, then the id (measured 8.2.11: `$min` of
+    // `db.b` replaces `db.aa`, and `db.a`/id 1 stays under `db.b`/id 0).
     const DB_POINTER_RANK: u8 = 122;
     match (a, b) {
-        (Bson::DbPointer(_), Bson::DbPointer(_)) => return None,
+        (Bson::DbPointer(_), Bson::DbPointer(_)) => {
+            let (x, y) = (db_pointer_value(a)?, db_pointer_value(b)?);
+            return Some((x.len(), &x) < (y.len(), &y));
+        }
         (Bson::DbPointer(_), other) => return Some(DB_POINTER_RANK < lt_rank(other)),
         (other, Bson::DbPointer(_)) => return Some(lt_rank(other) < DB_POINTER_RANK),
         _ => {}
