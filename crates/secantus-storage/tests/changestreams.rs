@@ -399,6 +399,7 @@ fn resume_token_round_trips() {
         ns: "app.c".into(),
         document_key: doc! {"_id": 7},
         from_invalidate: false,
+        fragment: None,
     };
     let token = changestreams::make_resume_token(&data).unwrap();
     let parsed = changestreams::parse_resume_token(&token).unwrap();
@@ -414,13 +415,27 @@ fn small_event_is_not_split() {
 }
 
 #[test]
-fn over_16mb_event_splits_by_heavy_field() {
-    // An update with a ~10MB pre-image and a ~10MB updated value exceeds 16MB and
-    // has two heavy (>1MB) fields, so it splits into 2 fragments — one heavy field
-    // each, light metadata copied into both (mirrors pymongo test_split_large_change).
+fn over_16mb_event_splits_as_mongod_splits_it() {
+    // An update with a ~10MB pre-image and a ~10MB updated value exceeds 16MB.
+    // mongod's `splitChangeEvent` takes the fields smallest first and packs
+    // them: the small ones and one 10MB field, then the other on its own --
+    // two fragments, as pymongo's `test_split_large_change` expects. Each
+    // field is in one fragment only, and each fragment has its own token.
     let big = "q".repeat(10 * 1024 * 1024);
+    let token = changestreams::make_resume_token(&changestreams::ResumeTokenData {
+        seq: 7,
+        ts: bson::Timestamp {
+            time: 1,
+            increment: 1,
+        },
+        ns: "d.c".to_string(),
+        document_key: doc! {"_id": 1},
+        from_invalidate: false,
+        fragment: None,
+    })
+    .unwrap();
     let event = doc! {
-        "_id": doc! {"_data": "tok"},
+        "_id": token,
         "operationType": "update",
         "ns": doc! {"db": "d", "coll": "c"},
         "fullDocumentBeforeChange": big.clone(),
@@ -428,23 +443,24 @@ fn over_16mb_event_splits_by_heavy_field() {
     };
     let frags = changestreams::stamp_split_event(event).unwrap();
     assert_eq!(frags.len(), 2);
-    assert_eq!(
-        frags[0].get_document("splitEvent").unwrap(),
-        &doc! {"fragment": 1, "of": 2}
-    );
-    assert_eq!(
-        frags[1].get_document("splitEvent").unwrap(),
-        &doc! {"fragment": 2, "of": 2}
-    );
-    // Light metadata is copied verbatim into every fragment.
-    for f in &frags {
-        assert_eq!(f.get_str("operationType").unwrap(), "update");
-        assert!(f.get_document("ns").is_ok());
+    for (i, f) in frags.iter().enumerate() {
+        assert_eq!(
+            f.get_document("splitEvent").unwrap(),
+            &doc! {"fragment": i as i32 + 1, "of": 2}
+        );
+        let data = changestreams::parse_resume_token(f.get_document("_id").unwrap()).unwrap();
+        assert_eq!((data.seq, data.fragment), (7, Some(i as i32)));
+        // `_id` and `splitEvent` lead every fragment.
+        let keys: Vec<&str> = f.keys().map(String::as_str).collect();
+        assert_eq!(&keys[..2], &["_id", "splitEvent"]);
     }
-    // Each heavy field lands in exactly one fragment.
-    let has_pre: Vec<bool> = frags
-        .iter()
-        .map(|f| f.contains_key("fullDocumentBeforeChange"))
-        .collect();
-    assert_eq!(has_pre.iter().filter(|b| **b).count(), 1);
+    // The small fields go into the first fragment only.
+    assert_eq!(frags[0].get_str("operationType").unwrap(), "update");
+    assert!(!frags[1].contains_key("operationType"));
+    for big_field in ["fullDocumentBeforeChange", "updateDescription"] {
+        assert_eq!(
+            frags.iter().filter(|f| f.contains_key(big_field)).count(),
+            1
+        );
+    }
 }

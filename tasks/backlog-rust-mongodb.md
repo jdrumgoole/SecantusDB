@@ -1057,7 +1057,18 @@ What is left, on the RUST MongoDB server:
 - [ ] **The field order of a document upserted from two or more
       equalities.** mongod: `{a: 1, b: 2, c: 3, d: 4}` gives `c, a, b, d`;
       `{d: 1, c: 2, b: 3, a: 4}` gives `d, b, a, c`; an explicit `$and`
-      keeps the order written. This server sorts them. No rule was found.
+      keeps the order written. This server sorts them.
+      **Decision needed (2026-10-17):** there is no rule to find. mongod
+      collects the equalities in an `EqualityMatches`, a `StringDataMap`
+      (an `absl::flat_hash_map`), and builds the document in its iteration
+      order (`update_driver.cpp` / `path_support.cpp`, 8.2), and absl seeds
+      its hash per process. Measured on three mongod 8.2.11 processes at
+      once: `{a, b, c, d}` gave `c, a, b, d` / `c, a, b, d` / `b, a, c, d`,
+      and one process ordered `{a, b, c, d}` and `{d, c, b, a}` differently.
+      Options: (1) a hash order of this server's own, seeded per process --
+      the mechanism, but never the same order as a given mongod; (2) keep
+      the sorted order and record the difference as a scope decision, since
+      no fixed order can match a server that has none.
       Backlog-ID: RM-059
       Verify: tests/backlog/test_rm_057_084.py::test_upsert_field_order_from_several_equalities
 - [ ] **`$where` in an update's query** is refused (no JavaScript).
@@ -1164,13 +1175,6 @@ would see them. What is left:
       of mongod's planner output (1 of the 2).
       Backlog-ID: RM-076
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_a_change_stream_scans_the_oplog
-- [ ] **RUST MongoDB server: an event over 16 MB is split differently.**
-      This server's first fragment carries `fullDocument`, mongod 8.2.11's
-      carries `updateDescription`. (Sharded-only event types --
-      `shardCollection`, `reshardCollection` -- cannot be probed on one
-      node.)
-      Backlog-ID: RM-079
-      Verify: tests/backlog/test_rm_057_084.py::test_an_event_over_16mb_is_split
 
 ### 7.073 The cursor commands -- 2026-10-11
 

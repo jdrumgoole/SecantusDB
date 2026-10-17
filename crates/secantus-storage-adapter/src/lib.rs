@@ -330,6 +330,7 @@ impl CmdStorage for StorageAdapter {
             ns: String::new(),
             document_key: Document::new(),
             from_invalidate: false,
+            fragment: None,
         };
         match changestreams::make_resume_token(&data) {
             Ok(doc) => {

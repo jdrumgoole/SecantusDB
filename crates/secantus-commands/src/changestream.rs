@@ -104,6 +104,22 @@ fn resume_token_missing(data: &str) -> CommandError {
     .with_extra(doc! { "errorLabels": ["NonResumableChangeStreamError"] })
 }
 
+/// How many events, from this one, are fragments of one split event: its
+/// `splitEvent.of` less those before it, or 1 for an event not split.
+fn fragments_of(event: &[u8]) -> usize {
+    let Ok(doc) = crate::bsondoc::from_bytes(event) else {
+        return 1;
+    };
+    match doc.get_document("splitEvent") {
+        Ok(se) => {
+            let of = se.get_i32("of").unwrap_or(1);
+            let at = se.get_i32("fragment").unwrap_or(1);
+            usize::try_from(of - at + 1).unwrap_or(1).max(1)
+        }
+        Err(_) => 1,
+    }
+}
+
 /// The `_data` of an encoded event's resume token.
 fn token_data(event: &[u8]) -> Option<String> {
     let raw = bson::RawDocument::from_bytes(event).ok()?;
@@ -188,8 +204,15 @@ impl CursorProducer for ChangeStreamProducer {
                 if let Some(expected) = self.expect_token.clone() {
                     if let Some(first) = events.first() {
                         let found = token_data(first);
-                        if found.as_deref() == Some(expected.as_str()) {
-                            events.remove(0);
+                        // A fragment's token names its place among the
+                        // event's fragments: the stream resumes after it,
+                        // so the fragments up to it go too (mongod 8.2).
+                        let at = events
+                            .iter()
+                            .take(fragments_of(first))
+                            .position(|e| token_data(e).as_deref() == Some(expected.as_str()));
+                        if let Some(at) = at {
+                            events.drain(..=at);
                         } else {
                             // mongod names the token of the event it found
                             // in its place (8.2.11), not the one asked for.
