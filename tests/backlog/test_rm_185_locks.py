@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
+import uuid
 from collections.abc import Callable
 from typing import Any
 
@@ -52,9 +53,51 @@ def _deltas(client: Any, cases: list) -> list:
     return out
 
 
+def _fresh(prefix: str) -> str:
+    """A database name never used before: mongod takes an extra global IS
+    building an index on a namespace a drop has just freed, so a reused
+    name measures that, not the build."""
+    return f"{prefix}_{uuid.uuid4().hex[:8]}"
+
+
+# mongod's index build runs on a thread of its own, and the command takes
+# the global IS each time it looks at the build: more the longer the build
+# takes (measured 1 to 4 on mongod 8.2.11 for one shape). Every other count
+# of a build is fixed, so the global IS is compared as a floor: mongod takes
+# at least as many as this server.
+_BUILD_POLLS = ("Global", "r")
+
+
+def _same_counts(got: list, want: list) -> None:
+    assert [label for label, _ in got] == [label for label, _ in want]
+    for (label, ours), (_, theirs) in zip(got, want, strict=True):
+        ours, theirs = dict(ours), dict(theirs)
+        if label.startswith("createIndex"):
+            assert ours.get(_BUILD_POLLS, 0) >= 1, label
+            assert theirs.get(_BUILD_POLLS, 0) >= ours.get(_BUILD_POLLS, 0), label
+            ours.pop(_BUILD_POLLS, None)
+            theirs.pop(_BUILD_POLLS, None)
+        assert (label, ours) == (label, theirs)
+
+
+def _reference(measure: Callable[[Any], list], client: Any) -> list:
+    """mongod's counts for each case: the least of three runs. Its
+    background threads (the TTL monitor, the session refresh) take the
+    global lock too, and one that fires inside a case's window can only
+    ADD to that case's count."""
+    runs = [measure(client) for _ in range(3)]
+    out = []
+    for cases in zip(*runs, strict=True):
+        label = cases[0][0]
+        counts = [dict(c[1]) for c in cases]
+        keys = set().union(*counts)
+        least = {k: min(c.get(k, 0) for c in counts) for k in keys}
+        out.append((label, sorted((k, n) for k, n in least.items() if n)))
+    return out
+
+
 def _crud(client: Any) -> list:
-    client.drop_database("rm185")
-    db = client.rm185
+    db = client[_fresh("rm185")]
     db.c.insert_many([{"_id": i, "x": i} for i in range(10)])
     n = itertools.count()
     return _deltas(
@@ -97,7 +140,7 @@ def _crud(client: Any) -> list:
             ("drop of one that is not there", lambda: db.command("drop", "k9")),
             ("ping", lambda: db.command("ping")),
             ("killCursors", lambda: db.command("killCursors", "c", cursors=[])),
-            ("dropDatabase", lambda: client.drop_database("rm185b")),
+            ("dropDatabase", lambda: client.drop_database(_fresh("rm185b"))),
         ],
     )
 
@@ -108,12 +151,11 @@ def test_lock_counts_per_command(rust_mongo: Any, mongod: Any) -> None:
     IX on the state transition, global, database and collection locks per
     write statement (three for an insert that creates its collection), and
     the collection in X for a drop."""
-    assert _crud(rust_mongo) == _crud(mongod)
+    assert _crud(rust_mongo) == _reference(_crud, mongod)
 
 
 def _builds(client: Any) -> list:
-    client.drop_database("rm185c")
-    db = client.rm185c
+    db = client[_fresh("rm185c")]
     db.c.insert_many([{"_id": i, "x": i} for i in range(10)])
     return _deltas(
         client,
@@ -131,12 +173,11 @@ def test_lock_counts_of_index_builds_out_and_db_stats(rust_mongo: Any, mongod: A
     """mongod 8.2.11's counts for an index build (its phases take the
     collection in X and IX several times), `dropIndexes`, an `$out` and
     `dbStats` (IS on each collection)."""
-    assert _builds(rust_mongo) == _builds(mongod)
+    _same_counts(_builds(rust_mongo), _reference(_builds, mongod))
 
 
 def _variations(client: Any) -> list:
-    client.drop_database("rm185d")
-    db = client.rm185d
+    db = client[_fresh("rm185d")]
     db.c.insert_many([{"x": i, "y": i} for i in range(5)])
     db.e.insert_one({})
     db.e.delete_many({})
@@ -157,12 +198,11 @@ def _variations(client: Any) -> list:
         ("$out again", lambda: list(db.c.aggregate([{"$out": "o1"}]))),
     ]
     for n in (1, 3):
-        name = f"rm185s{n}"
-        client.drop_database(name)
+        name = _fresh(f"rm185s{n}")
         for i in range(n):
             client[name][f"c{i}"].insert_one({})
         cases.append((f"dbStats over {n}", lambda name=name: client[name].command("dbStats")))
-    cases.append(("dbStats of no database", lambda: client.rm185none.command("dbStats")))
+    cases.append(("dbStats of no database", lambda: client[_fresh("rm185none")].command("dbStats")))
     return _deltas(client, cases)
 
 
@@ -173,12 +213,11 @@ def test_lock_counts_of_index_build_and_out_shapes(rust_mongo: Any, mongod: Any)
     index is there already, two when it creates the collection); `$out`
     replaces an existing target with one more X round; `dbStats` takes IS
     on each collection."""
-    assert _variations(rust_mongo) == _variations(mongod)
+    _same_counts(_variations(rust_mongo), _reference(_variations, mongod))
 
 
 def _merge(client: Any) -> list:
-    client.drop_database("rm185m")
-    db = client.rm185m
+    db = client[_fresh("rm185m")]
     db.c.insert_many([{"_id": i} for i in range(5)])
     pipeline = [{"$merge": {"into": "m"}}]
     return _deltas(
@@ -194,4 +233,4 @@ def _merge(client: Any) -> list:
 def test_lock_counts_of_merge(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `$merge` takes the global IS twice and a write round
     for each document it writes (two more when it creates the target)."""
-    assert _merge(rust_mongo) == _merge(mongod)
+    assert _merge(rust_mongo) == _reference(_merge, mongod)

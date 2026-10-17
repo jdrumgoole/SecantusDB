@@ -701,7 +701,12 @@ Still different:
       (the collection in X three times and IX five; once each on an empty
       collection), `dropIndexes`, `$out` and `dbStats` count as mongod's
       (`test_lock_counts_per_command`, `test_lock_counts_of_index_builds_out_and_db_stats`,
-      `test_lock_counts_of_index_build_and_out_shapes`). Still different:
+      `test_lock_counts_of_index_build_and_out_shapes`). An index build's
+      count of the global IS is not fixed on mongod: its build runs on a
+      thread of its own and the command takes the IS each time it looks at
+      it, 1 to 4 times in one shape measured; this server takes the least
+      mongod was seen to, and the tests compare that count as a floor.
+      Still different:
       `$merge` takes a write round per document it writes on mongod (and two
       more when it creates its target), which is not known before the
       pipeline runs, so it takes the generic chain here; the transaction
