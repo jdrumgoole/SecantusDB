@@ -403,6 +403,53 @@ pub fn statement_chain(doc: &bson::Document, db: &str) -> Vec<(Resource, Mode)> 
     chain
 }
 
+/// What the rounds of a statement depend on, read from the store before
+/// it runs.
+pub trait Facts {
+    /// The collection exists (a view counts).
+    fn exists(&self, coll: &str) -> bool;
+    /// The collection holds no document.
+    fn is_empty(&self, coll: &str) -> bool;
+    /// The key patterns of the collection's indexes.
+    fn index_keys(&self, coll: &str) -> Vec<bson::Document>;
+    /// The names of the database's collections and views.
+    fn collections(&self) -> Vec<String>;
+}
+
+/// [`Facts`] off a server's storage; with none (unit tests), every
+/// collection exists and is empty.
+pub struct StorageFacts<'a> {
+    pub storage: Option<&'a std::sync::Arc<dyn crate::storage::Storage>>,
+    pub db: &'a str,
+}
+
+impl Facts for StorageFacts<'_> {
+    fn exists(&self, coll: &str) -> bool {
+        self.storage
+            .is_none_or(|s| s.collection_exists(self.db, coll).unwrap_or(true))
+    }
+
+    fn is_empty(&self, coll: &str) -> bool {
+        self.storage
+            .is_none_or(|s| matches!(s.collection_count_at_most(self.db, coll, 0), Ok(Some(0))))
+    }
+
+    fn index_keys(&self, coll: &str) -> Vec<bson::Document> {
+        self.storage
+            .and_then(|s| s.list_indexes(self.db, coll).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|ix| ix.get_document("key").ok().cloned())
+            .collect()
+    }
+
+    fn collections(&self) -> Vec<String> {
+        self.storage
+            .and_then(|s| s.list_collections(self.db).ok())
+            .unwrap_or_default()
+    }
+}
+
 /// The rounds a statement OUTSIDE a transaction takes, where mongod 8.2.11
 /// was measured (2026-10-17, `serverStatus.locks` around one run of each);
 /// `None` for a command not measured, which takes [`statement_chain`].
@@ -425,8 +472,9 @@ pub fn statement_chain(doc: &bson::Document, db: &str) -> Vec<(Resource, Mode)> 
 pub fn statement_rounds(
     doc: &bson::Document,
     db: &str,
-    exists: &dyn Fn(&str) -> bool,
+    facts: &dyn Facts,
 ) -> Option<Vec<Vec<(Resource, Mode)>>> {
+    let exists = |c: &str| facts.exists(c);
     use Mode::*;
     let name = doc.keys().next().map(String::as_str)?;
     let coll = doc.get_str(name).ok().filter(|s| !s.is_empty());
@@ -457,11 +505,10 @@ pub fn statement_rounds(
             if stages.iter().any(|s| s.as_document().is_some_and(|d| {
                 d.contains_key("$out") || d.contains_key("$merge")
             })));
-            if writes {
-                None
-            } else {
-                read()
+            if !writes {
+                return read();
             }
+            out_rounds(doc, db, coll, facts)
         }
         "insert" => {
             let c = coll?;
@@ -508,8 +555,99 @@ pub fn statement_rounds(
             (Resource::Global, Ix),
             (Resource::Database(db.to_string()), X),
         ]]),
+        "createIndexes" => {
+            let c = coll?;
+            let global = || vec![(Resource::Global, Is)];
+            if !exists(c) {
+                // It creates the collection: two write rounds.
+                return Some(vec![global(), write_round(Some(c)), write_round(Some(c))]);
+            }
+            let have = facts.index_keys(c);
+            let asked: Vec<bson::Document> = match doc.get("indexes") {
+                Some(bson::Bson::Array(specs)) => specs
+                    .iter()
+                    .filter_map(|s| s.as_document()?.get_document("key").ok().cloned())
+                    .collect(),
+                _ => Vec::new(),
+            };
+            if !asked.is_empty() && asked.iter().all(|k| have.contains(k)) {
+                // Every index is there already: nothing is built.
+                return Some(vec![global(), write_round(Some(c))]);
+            }
+            // A build: the collection in X while it is set up and committed,
+            // IX while it runs; an empty collection builds in one step.
+            let (exclusive, intent) = if facts.is_empty(c) { (1, 1) } else { (3, 5) };
+            let mut x = write_round(None);
+            x.push((Resource::Collection(format!("{db}.{c}")), X));
+            let mut rounds = vec![global(), global()];
+            rounds.extend((0..2).map(|_| vec![(Resource::ReplicationStateTransition, Ix)]));
+            rounds.extend((0..exclusive).map(|_| x.clone()));
+            rounds.extend((0..intent).map(|_| write_round(Some(c))));
+            Some(rounds)
+        }
+        "dbStats" => {
+            let mut round = vec![
+                (Resource::ReplicationStateTransition, Ix),
+                (Resource::Global, Is),
+                (Resource::Database(db.to_string()), Is),
+            ];
+            // IS on each collection and view.
+            round.extend(
+                facts
+                    .collections()
+                    .into_iter()
+                    .map(|c| (Resource::Collection(format!("{db}.{c}")), Is)),
+            );
+            Some(vec![round])
+        }
         _ => None,
     }
+}
+
+/// An `aggregate` that ends in `$out` (mongod 8.2.11): a round that reads
+/// the source, seven of the global IS while the pipeline and its target are
+/// checked, the temporary collection and the target in X twice -- three
+/// times when the target exists and is replaced -- and two write rounds.
+/// `$merge` writes a round per document, which is not known before the
+/// pipeline runs: it takes the generic chain.
+fn out_rounds(
+    doc: &bson::Document,
+    db: &str,
+    source: Option<&str>,
+    facts: &dyn Facts,
+) -> Option<Vec<Vec<(Resource, Mode)>>> {
+    use Mode::*;
+    let stages = doc.get_array("pipeline").ok()?;
+    let last = stages.last()?.as_document()?;
+    let (out_db, target) = match last.get("$out")? {
+        bson::Bson::String(t) => (db.to_string(), t.clone()),
+        bson::Bson::Document(d) => (
+            d.get_str("db").unwrap_or(db).to_string(),
+            d.get_str("coll").ok()?.to_string(),
+        ),
+        _ => return None,
+    };
+    let src = source?;
+    let target_res = Resource::Collection(format!("{out_db}.{target}"));
+    let write = |mode: Mode| {
+        vec![
+            (Resource::ReplicationStateTransition, Ix),
+            (Resource::Global, Ix),
+            (Resource::Database(out_db.clone()), Ix),
+            (target_res.clone(), mode),
+        ]
+    };
+    let mut rounds = vec![vec![
+        (Resource::ReplicationStateTransition, Ix),
+        (Resource::Global, Is),
+        (Resource::Database(db.to_string()), Is),
+        (Resource::Collection(format!("{db}.{src}")), Is),
+    ]];
+    rounds.extend((0..7).map(|_| vec![(Resource::Global, Is)]));
+    let replaced = out_db == db && facts.exists(&target);
+    rounds.extend((0..if replaced { 3 } else { 2 }).map(|_| write(X)));
+    rounds.extend((0..2).map(|_| write(Ix)));
+    Some(rounds)
 }
 
 /// Take a chain in order; a link that fails (the deadline spent mid-chain)
@@ -543,11 +681,11 @@ impl Guard {
         lm: Option<&std::sync::Arc<LockManager>>,
         doc: &bson::Document,
         db: &str,
-        exists: &dyn Fn(&str) -> bool,
+        facts: &dyn Facts,
     ) -> Option<Result<Self, crate::CommandError>> {
         let lm = lm?;
         let mut rounds =
-            statement_rounds(doc, db, exists).unwrap_or_else(|| vec![statement_chain(doc, db)]);
+            statement_rounds(doc, db, facts).unwrap_or_else(|| vec![statement_chain(doc, db)]);
         let chain = rounds.pop().unwrap_or_default();
         // The rounds before the last are taken and let go, as mongod does.
         for round in &rounds {

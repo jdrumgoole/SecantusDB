@@ -9,6 +9,7 @@ import itertools
 from collections.abc import Callable
 from typing import Any
 
+import pymongo
 import pytest
 
 # Internal resources mongod's background threads lock; this server has none.
@@ -125,9 +126,72 @@ def _builds(client: Any) -> list:
     )
 
 
-@pytest.mark.backlog("RM-185")
+@pytest.mark.backlog_fixed("RM-185")
 def test_lock_counts_of_index_builds_out_and_db_stats(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's counts for an index build (its phases take the
     collection in X and IX several times), `dropIndexes`, an `$out` and
     `dbStats` (IS on each collection)."""
     assert _builds(rust_mongo) == _builds(mongod)
+
+
+def _variations(client: Any) -> list:
+    client.drop_database("rm185d")
+    db = client.rm185d
+    db.c.insert_many([{"x": i, "y": i} for i in range(5)])
+    db.e.insert_one({})
+    db.e.delete_many({})
+    cases = [
+        ("createIndex", lambda: db.c.create_index("x")),
+        ("createIndex of one that exists", lambda: db.c.create_index("x")),
+        ("createIndex on an empty collection", lambda: db.e.create_index("x")),
+        (
+            "createIndexes of two",
+            lambda: db.c.create_indexes(
+                [pymongo.IndexModel("y"), pymongo.IndexModel([("x", 1), ("y", 1)])]
+            ),
+        ),
+        ("createIndex creating the collection", lambda: db.newc.create_index("x")),
+        ("dropIndexes of all", lambda: db.c.drop_indexes()),
+        ("dropIndex of one that is not there", lambda: db.c.drop_index("nope_1")),
+        ("$out replacing its target", lambda: list(db.c.aggregate([{"$out": "o1"}]))),
+        ("$out again", lambda: list(db.c.aggregate([{"$out": "o1"}]))),
+    ]
+    for n in (1, 3):
+        name = f"rm185s{n}"
+        client.drop_database(name)
+        for i in range(n):
+            client[name][f"c{i}"].insert_one({})
+        cases.append((f"dbStats over {n}", lambda name=name: client[name].command("dbStats")))
+    cases.append(("dbStats of no database", lambda: client.rm185none.command("dbStats")))
+    return _deltas(client, cases)
+
+
+@pytest.mark.backlog_fixed("RM-185")
+def test_lock_counts_of_index_build_and_out_shapes(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11: an index build takes the collection in X three times
+    and IX five (once each on an empty collection, a write round when every
+    index is there already, two when it creates the collection); `$out`
+    replaces an existing target with one more X round; `dbStats` takes IS
+    on each collection."""
+    assert _variations(rust_mongo) == _variations(mongod)
+
+
+def _merge(client: Any) -> list:
+    client.drop_database("rm185m")
+    db = client.rm185m
+    db.c.insert_many([{"_id": i} for i in range(5)])
+    pipeline = [{"$merge": {"into": "m"}}]
+    return _deltas(
+        client,
+        [
+            ("$merge creating its target", lambda: list(db.c.aggregate(pipeline))),
+            ("$merge into it again", lambda: list(db.c.aggregate(pipeline))),
+        ],
+    )
+
+
+@pytest.mark.backlog("RM-185")
+def test_lock_counts_of_merge(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11's `$merge` takes the global IS twice and a write round
+    for each document it writes (two more when it creates the target)."""
+    assert _merge(rust_mongo) == _merge(mongod)
