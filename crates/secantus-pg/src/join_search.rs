@@ -489,9 +489,6 @@ impl PgHandler {
                 filters: rest,
             },
         };
-        if [plan.first_step.method, plan.second_step.method].contains(&JoinMethod::Unmodelled) {
-            return None;
-        }
         Some(plan)
     }
 
@@ -606,7 +603,22 @@ impl PgHandler {
         let a_first = (step.a_key.clone(), step.b_key.clone());
         let b_first = (step.b_key.clone(), step.a_key.clone());
         let (outer, inner, kind, (outer_key, inner_key)) = match step.method {
-            JoinMethod::Unmodelled => return Ok(None),
+            JoinMethod::MergeRightB {
+                a_by_index,
+                b_by_index,
+            } => {
+                reorder_join_inputs(
+                    JoinMethod::MergeOuterB {
+                        a_by_index,
+                        b_by_index,
+                    },
+                    &mut a.rows,
+                    &step.a_key,
+                    &mut b.rows,
+                    &step.b_key,
+                );
+                (b, a, JoinKind::Right, b_first)
+            }
             JoinMethod::HashRightB => {
                 let ordered = a_type
                     .is_some_and(|ty| hash_table_order(&mut a.rows, &step.a_key, &ty, step.a_rows));
@@ -652,7 +664,45 @@ impl PgHandler {
                 Ok(true)
             },
         )?;
+        if matches!(step.method, JoinMethod::MergeRightB { .. }) {
+            out = merge_right_fill(out, &step.b_key, &step.a_key);
+        }
         let keys = outer.keys.into_iter().chain(inner.keys).collect();
         Ok(Some(Input { rows: out, keys }))
     }
+}
+
+/// A merge right join's rows: `rows` as the RIGHT join built them (the
+/// matched rows in key order, then the preserved rows nothing matched, in
+/// key order too), with each unmatched row moved to its key's place, after
+/// the matched rows of an equal key -- where the merge passes it
+/// (`ExecMergeJoin` fills an inner tuple once the outer has moved past
+/// it). A row is unmatched when its outer key is NULL, which a matched
+/// row's never is.
+fn merge_right_fill(rows: Vec<Document>, outer_key: &str, inner_key: &str) -> Vec<Document> {
+    let is_null = |d: &Document, k: &str| matches!(d.get(k), None | Some(Bson::Null));
+    let (matched, unmatched): (Vec<Document>, Vec<Document>) =
+        rows.into_iter().partition(|d| !is_null(d, outer_key));
+    let key_cmp = |x: &Document, y: &Document| match (
+        x.get(inner_key).filter(|v| **v != Bson::Null),
+        y.get(inner_key).filter(|v| **v != Bson::Null),
+    ) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(p), Some(q)) => secantus_pgplan::compare_values(p, q).unwrap_or(Ordering::Equal),
+    };
+    let mut out = Vec::with_capacity(matched.len() + unmatched.len());
+    let mut m = matched.into_iter().peekable();
+    for u in unmatched {
+        while m
+            .peek()
+            .is_some_and(|d| key_cmp(d, &u) != Ordering::Greater)
+        {
+            out.push(m.next().expect("peeked"));
+        }
+        out.push(u);
+    }
+    out.extend(m);
+    out
 }

@@ -797,7 +797,7 @@ impl PgHandler {
                     !matches!(
                         m,
                         secantus_pgplan::joincost::JoinMethod::Other
-                            | secantus_pgplan::joincost::JoinMethod::Unmodelled
+                            | secantus_pgplan::joincost::JoinMethod::MergeRightB { .. }
                     )
                 })
             {
@@ -827,7 +827,7 @@ impl PgHandler {
                     !matches!(
                         m,
                         secantus_pgplan::joincost::JoinMethod::Other
-                            | secantus_pgplan::joincost::JoinMethod::Unmodelled
+                            | secantus_pgplan::joincost::JoinMethod::MergeRightB { .. }
                     )
                 })
             || !table_or_sub(&join.left_sub, &join.left.0)

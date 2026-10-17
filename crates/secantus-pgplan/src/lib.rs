@@ -958,13 +958,15 @@ pub enum Statement {
     /// and columns must exist (`indexes` names ones that must be indexes),
     /// and `outside_block` ones refuse a transaction block (25001).
     /// `analyze` when the command gathers statistics (`ANALYZE`, or
-    /// `VACUUM (ANALYZE)`).
+    /// `VACUUM (ANALYZE)`); `full` for `VACUUM FULL`, which rewrites the
+    /// table.
     Maintenance {
         command: String,
         tables: Vec<(String, Vec<String>)>,
         indexes: Vec<String>,
         outside_block: bool,
         analyze: bool,
+        full: bool,
     },
     /// `CLUSTER [table [USING index]]`: the table's rows rewritten in the
     /// index's order, which an unordered scan then shows.
@@ -4631,10 +4633,13 @@ fn plan_node(
         N::MergeStmt(m) => merge::plan(&m, lookup, params),
         N::VacuumStmt(v) => {
             let command = if v.is_vacuumcmd { "VACUUM" } else { "ANALYZE" };
-            let analyze = !v.is_vacuumcmd
-                || v.options.iter().any(
-                    |o| matches!(o.node.as_ref(), Some(N::DefElem(d)) if d.defname == "analyze"),
-                );
+            let option = |name: &str| {
+                v.options
+                    .iter()
+                    .any(|o| matches!(o.node.as_ref(), Some(N::DefElem(d)) if d.defname == name))
+            };
+            let analyze = !v.is_vacuumcmd || option("analyze");
+            let full = v.is_vacuumcmd && option("full");
             let mut tables = Vec::new();
             for r in &v.rels {
                 let Some(N::VacuumRelation(vr)) = r.node.as_ref() else {
@@ -4666,6 +4671,7 @@ fn plan_node(
                 indexes: Vec::new(),
                 outside_block: v.is_vacuumcmd,
                 analyze,
+                full,
             })
         }
         N::CheckPointStmt(_) => Ok(Statement::Maintenance {
@@ -4674,6 +4680,7 @@ fn plan_node(
             indexes: Vec::new(),
             outside_block: false,
             analyze: false,
+            full: false,
         }),
         N::ReindexStmt(r) => {
             use pg_query::protobuf::ReindexObjectType as R;
@@ -4698,6 +4705,7 @@ fn plan_node(
                 indexes,
                 outside_block: whole.is_some(),
                 analyze: false,
+                full: false,
             })
         }
         N::ClusterStmt(c) => Ok(Statement::Cluster {
