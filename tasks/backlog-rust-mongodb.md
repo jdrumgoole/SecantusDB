@@ -709,8 +709,14 @@ Still different:
       `$merge` with `whenMatched: "fail"` that meets a duplicate retries its
       batch on mongod, taking more rounds (3 for 4 documents with one
       duplicate, 4 with two) where this server takes the batch's one; the
-      transaction commands were not measured; nor was any other command,
-      which still takes the generic chain. mongod's internal resources
+      transaction commands, which need a replica set, were measured on a
+      one-member mongod 8.2.11 set (2026-10-17) cannot be pinned the same
+      way: its replication threads take the global IS about twice in any
+      window, and its writes take rounds for the oplog and the session table
+      too (a plain insert three where a standalone takes one; a one-insert
+      transaction with its commit 3 collection IX, 2 global IX and 8 on the
+      state transition lock), machinery this server does not run; and no
+      other command was measured, so each still takes the generic chain. mongod's internal resources
       (`Metadata`, `oplog`, `Mutex`, `MultiDocumentTransactionsBarrier`) are
       locked by its background threads only and are absent here.
       Backlog-ID: RM-185
