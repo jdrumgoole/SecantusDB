@@ -240,3 +240,77 @@ fn a_noop_heartbeat_writes_to_the_oplog_and_stops_with_the_server() {
     drop(server);
     assert!(!path.exists(), "{} survived drop", path.display());
 }
+
+
+#[test]
+fn ddl_waits_for_an_open_transaction_and_answers_50_at_max_time() {
+    // mongod 8.2.11: a collection a transaction has read or written is held
+    // by it, so `drop` / `createIndexes` / `renameCollection` / `collMod`
+    // wait on the open transaction and answer 50 (MaxTimeMSExpired) at
+    // their `maxTimeMS`, and the operation does not run. Once the
+    // transaction ends its locks go and the same commands succeed.
+    let server = Server::start().expect("start");
+    let client = client(&server);
+    let db = client.database("t");
+    let admin = client.database("admin");
+
+    let mut session = client.start_session().run().expect("session");
+    db.collection::<Document>("held")
+        .insert_one(doc! {"_id": 0})
+        .run()
+        .expect("seed outside the txn");
+    session.start_transaction().run().expect("txn");
+    db.collection::<Document>("held")
+        .insert_one(doc! {"_id": 1})
+        .session(&mut session)
+        .run()
+        .expect("write in txn");
+
+    fn code_of(err: &mongodb::error::Error) -> i32 {
+        match err.kind.as_ref() {
+            mongodb::error::ErrorKind::Command(e) => e.code,
+            other => panic!("expected a command error, got {other:?}"),
+        }
+    }
+    for (label, on_admin, cmd) in [
+        ("drop", false, doc! {"drop": "held", "maxTimeMS": 300}),
+        (
+            "createIndexes",
+            false,
+            doc! {"createIndexes": "held",
+                  "indexes": [{"key": {"x": 1}, "name": "x_1"}], "maxTimeMS": 300},
+        ),
+        (
+            "collMod",
+            false,
+            doc! {"collMod": "held", "validationLevel": "off", "maxTimeMS": 300},
+        ),
+        (
+            "renameCollection",
+            true,
+            doc! {"renameCollection": "t.held", "to": "t.renamed", "maxTimeMS": 300},
+        ),
+    ] {
+        let target = if on_admin { &admin } else { &db };
+        let err = match target.run_command(cmd).run() {
+            Ok(d) => panic!("{label}: expected an error, got {d:?}"),
+            Err(e) => e,
+        };
+        assert_eq!(code_of(&err), 50, "{label}: {err}");
+    }
+    // Nothing ran: the collection is still there, unrenamed, no new index.
+    let names = db.list_collection_names().run().expect("list");
+    assert_eq!(names, vec!["held".to_string()]);
+    let indexes = db
+        .collection::<Document>("held")
+        .list_index_names()
+        .run()
+        .expect("indexes");
+    assert_eq!(indexes, vec!["_id_".to_string()]);
+
+    session.abort_transaction().run().expect("abort");
+
+    // The transaction's locks went with it: the same DDL now runs.
+    db.run_command(doc! {"drop": "held"}).run().expect("drop after");
+    assert!(db.list_collection_names().run().expect("list").is_empty());
+}

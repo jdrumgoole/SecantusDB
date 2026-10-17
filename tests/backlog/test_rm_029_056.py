@@ -124,7 +124,7 @@ def test_background_validate_of_an_uncheckpointed_collection(rust_mongo: Any) ->
     assert got == ("err", 26, "Collection 'rm033b.c' does not exist to validate.")
 
 
-@pytest.mark.backlog("RM-034")
+@pytest.mark.backlog_fixed("RM-034")
 def test_server_status_sections(rust_mongo: Any) -> None:
     """mongod 8.2.11 (standalone and replica set) reports these sections."""
     want = {

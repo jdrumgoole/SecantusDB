@@ -39,8 +39,9 @@
 //! documents in `updateDeleteManyDocumentsTotalCount` here and not there.
 //!
 //! The section a counter of mongod's would need a mechanism this server does
-//! not have (a lock manager, a plan cache, query settings that reject) is
-//! not reported: a zero standing in for something not counted is a lie.
+//! not have (a plan cache, query settings that reject) is not reported: a
+//! zero standing in for something not counted is a lie. (`locks` joined the
+//! reported sections when the lock manager landed — RM-034, 2026-10-17.)
 
 use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
 use std::time::Duration;
