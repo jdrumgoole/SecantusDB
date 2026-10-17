@@ -536,14 +536,12 @@ fn row_locked_tables_uncached(sql: &str) -> Vec<String> {
             .locking_clause
             .iter()
             .filter_map(|n| match n.node.as_ref() {
-                Some(N::LockingClause(l)) => Some(
-                    l.locked_rels
-                        .iter()
-                        .filter_map(|r| match r.node.as_ref() {
-                            Some(N::RangeVar(rv)) => Some(rv),
-                            _ => None,
-                        }),
-                ),
+                Some(N::LockingClause(l)) => {
+                    Some(l.locked_rels.iter().filter_map(|r| match r.node.as_ref() {
+                        Some(N::RangeVar(rv)) => Some(rv),
+                        _ => None,
+                    }))
+                }
                 _ => None,
             })
             .flatten()
