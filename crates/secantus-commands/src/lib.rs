@@ -1771,14 +1771,11 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
     let _locks = if ctx.txn_locks {
         None
     } else {
-        let storage = ctx.storage.clone();
-        let db = ctx.db_name.clone();
-        let exists = |coll: &str| {
-            storage
-                .as_ref()
-                .is_none_or(|s| s.collection_exists(&db, coll).unwrap_or(true))
+        let facts = lock_manager::StorageFacts {
+            storage: ctx.storage.as_ref(),
+            db: &ctx.db_name,
         };
-        match lock_manager::Guard::statement(ctx.locks.as_ref(), doc, &ctx.db_name, &exists) {
+        match lock_manager::Guard::statement(ctx.locks.as_ref(), doc, &ctx.db_name, &facts) {
             Some(Ok(guard)) => Some(guard),
             Some(Err(e)) => return e.into_reply(),
             None => None,
