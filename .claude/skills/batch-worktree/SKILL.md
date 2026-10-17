@@ -1,6 +1,6 @@
 ---
 name: batch-worktree
-description: Set up an isolated worktree for a SecantusDB change batch and land it cleanly. Fires when starting a feature/fix batch, creating a worktree, provisioning a worktree venv, running a gauge from a worktree, or preparing to commit/PR/merge. Holds the venv recipe that avoids silently skipping 1700 tests, how to run and baseline a gauge from a worktree, the claim protocol for parallel sessions, and the landing sequence including the traps that make teardown fail — notably that a worktree which ran a gauge cannot be removed by `git worktree remove` at all.
+description: Set up an isolated worktree for a SecantusDB change batch and land it cleanly. Fires when starting a feature/fix batch, creating a worktree, provisioning a worktree venv, running a gauge from a worktree, or preparing to commit/PR/merge. Holds the venv recipe that avoids silently skipping 1700 tests, how to run and baseline a gauge from a worktree, the claim protocol for parallel sessions, the invoke-first Rust task list (`rust-pgserver-test` / `rust-pgserver-build` / `rust-test-one` / `rust-gate`) with the provenance gates that abort pytest on a stale binary or venv, the relative-path trap that edits the main checkout instead of the worktree, and the landing sequence including the traps that make teardown fail — notably that a worktree which ran a gauge cannot be removed by `git worktree remove` at all.
 ---
 
 # Set up a batch worktree, and land it without leaving debris
@@ -8,6 +8,14 @@ description: Set up an isolated worktree for a SecantusDB change batch and land 
 Several sessions run in parallel against this repo. **Never work in the main
 checkout** — another session usually has it on their branch, and a
 `git reset --hard` from a release session will clobber uncommitted work.
+
+**File-tool paths are resolved against the session's launch cwd, not your
+worktree.** A session launched from the main checkout that edits
+`tasks/backlog-rust-postgres.md` by relative path writes into the MAIN
+checkout (found and reverted three times in one 2026-10-17 session — each
+mistake looked like a successful edit because the file did exist there).
+Use absolute paths for every edit inside a worktree, or verify with
+`grep -n <anchor> <worktree-path>` before moving on.
 
 ## Claim before you start
 
@@ -61,6 +69,37 @@ lock, and an unpinned `sqlglot` fails ~5 SQL tests as a pure venv artifact.
 
 Run with `PYTHONPATH=src .venv-test/bin/python -m pytest ...`.
 
+**For Rust-server work, a full `uv sync` is the simpler provisioning.** The
+recipe above suits engine-parity and gauge runs; a change to the Rust servers
+usually needs the repo's own suite, and `./inv sync` (i.e.
+`uv sync --all-extras --reinstall-package secantus-core`) builds
+`_secantus_core` properly from the worktree's sources and installs every
+extra the suites import. It needs the WiredTiger submodule first:
+
+```bash
+git config submodule.vendor/wiredtiger.url <main-repo>/vendor/wiredtiger
+git -c protocol.file.allow=always submodule update --init vendor/wiredtiger
+```
+
+(the local URL avoids a full network clone; git's file-transport guard
+otherwise refuses with `transport 'file' not allowed`).
+
+**Do NOT shortcut the venv by symlinking or copying the main checkout's
+`.venv`.** The pytest collection hook (`tools/provenance.py`) compares the
+installed `_secantus_core`'s stamped source tree against the checkout and
+ABORTS the whole run when they differ — a stale extension can no longer
+silently produce phantom failures, it now produces no run at all. The same
+abort fires for the `secantusd-pg`/`secantusd-rs` binaries
+("built from different sources than this checkout"); rebuild with
+`./inv rust-pgserver-build` / `./inv rust-binary-build` rather than bypassing
+it. `SECANTUS_ALLOW_STALE_ARTIFACT=1` exists for deliberately measuring an
+old build; it is not a way out of a forgotten rebuild.
+
+**Provenance stamps move when the tree moves.** After committing, or after
+merging `origin/main` into the branch, the previously-built artifacts are
+stale against the new tree state — rebuild the binary and re-sync before any
+pytest run, or every test file aborts at collection.
+
 **Gauges need the same venv, and `./inv validate-*` will not use it.** The
 invoke tasks run under the worktree's own `uv` environment, which has no
 WiredTiger — so the gauge's daemon cannot start and you get
@@ -101,11 +140,21 @@ run the **full** suite once before the batch's commit.
 
 - `./inv fmt` then `./inv lint` (ruff check **and** format --check). Run `fmt`
   before `lint`, and never while a pytest run is in flight.
-- Rust edits: `cargo fmt` (CI fails on unformatted Rust and `./inv rust-gate`
-  misses it), `cargo clippy --all-targets -- -D warnings`, `cargo test`. The
-  WT-linked crates are excluded from the clean workspace — gate them from their
-  own directory with `SECANTUS_WT_INCLUDE` / `SECANTUS_WT_LIB` pointed at a
-  built WT and `LIBCLANG_PATH` at Xcode's.
+- Rust edits: run the build and test activity through **invoke**, not bare
+  cargo — `./inv rust-pgserver-test` (the PG crate's `fmt --check` + clippy
+  `-D warnings` + `cargo test`), `./inv rust-pgserver-build` (the debug binary
+  the slice tests need), `./inv rust-test-one --crate <c> --test <t> --name
+  <n>` (one test, fast loop), and `./inv rust-gate` for the full pre-commit
+  gate. The invoke tasks fill `SECANTUS_WT_INCLUDE` / `SECANTUS_WT_LIB`
+  themselves (`_rust_env()` finds any built WiredTiger, e.g. the main
+  checkout's `build/rust-wt`), which is what makes them work inside a
+  worktree; only a hand-run `cargo` needs those set, plus `LIBCLANG_PATH` for
+  bindgen. Set `CARGO_BUILD_JOBS=3` (CLAUDE.md's machine budget — invoke does
+  not set it for you) and capture the task's real exit code (`> log; echo $?`)
+  rather than piping through grep, which masks a failure. The WT-linked crates
+  are excluded from the clean workspace, so `rust-gate`'s clean-workspace step
+  never formats or lints them — the per-crate task is the only fmt gate, and
+  CI fails on unformatted Rust.
 - Never bump a version. Both version lines are assigned at release.
 - Add a `changelog.d/<slug>.md` fragment; do not edit `docs/changelog.md`.
 
