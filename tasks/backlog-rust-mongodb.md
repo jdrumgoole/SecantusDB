@@ -693,6 +693,25 @@ Still different:
       in memory answers 115 with this server's own text, because mongod's
       in-memory engine is Enterprise-only and its message could not be
       measured.
+- [ ] **`serverStatus.locks`: the commands whose locks are not yet
+      measured.** The lock manager (`lock_manager.rs`, RM-034) counted
+      locks no command takes on mongod until 2026-10-17: every read took
+      the database and collection intents, every write lacked the state
+      transition lock, each statement of a batch shared one round, and
+      `ping` / `serverStatus` took the global IX -- 0 of 21 measured
+      commands counted as mongod 8.2.11's. They now take mongod's rounds
+      (`statement_rounds`), and 21 of 21 count as mongod's
+      (`test_lock_counts_per_command`). Still to measure and take:
+      `createIndexes` (on mongod the collection in X three times and IX
+      five, as its build moves through its phases), `dropIndexes` beyond the
+      `drop` shape it shares, `$out` / `$merge`, `dbStats` (IS on each
+      collection), the transaction commands, and every command not
+      measured, which still takes the generic chain. mongod's internal
+      resources (`Metadata`, `oplog`, `Mutex`,
+      `MultiDocumentTransactionsBarrier`) are locked by its background
+      threads only and are absent here.
+      Backlog-ID: RM-185
+      Verify: tests/backlog/test_rm_185_locks.py::test_lock_counts_of_index_builds_out_and_db_stats
 - [ ] **Server parameters** (about 30). `getParameter` reports the
       thirteen parameters that are true of this server
       (`serverinfo::parameters`) and mongod has several hundred.
