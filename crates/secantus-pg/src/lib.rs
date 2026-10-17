@@ -58,6 +58,7 @@ mod join_search;
 mod largeobjects;
 mod live;
 mod live_notices;
+mod lock_manager;
 mod merge;
 mod object_acl;
 mod partition;
@@ -15050,9 +15051,22 @@ impl PgHandler {
             return Ok(Bson::Boolean(released));
         }
         if xact && !in_block {
-            advisory::wait_free(key, pid, shared, self.lock_wait_poll())?;
+            advisory::wait_free(
+                key,
+                pid,
+                shared,
+                self.lock_wait_poll(),
+                Self::deadlock_error,
+            )?;
         } else {
-            advisory::lock(key, pid, shared, xact, self.lock_wait_poll())?;
+            advisory::lock(
+                key,
+                pid,
+                shared,
+                xact,
+                self.lock_wait_poll(),
+                Self::deadlock_error,
+            )?;
         }
         Ok(Bson::String(String::new()))
     }

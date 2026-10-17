@@ -2960,27 +2960,32 @@ aborted block rolls back.
 
 ### Isolation levels — read this before relying on `SERIALIZABLE`
 
-Every explicit transaction runs on the storage engine's **snapshot isolation**,
+Explicit transactions run on the storage engine's **snapshot isolation**,
 which is what PostgreSQL calls `REPEATABLE READ`. `BEGIN ISOLATION LEVEL x` is
-accepted and echoed back for all three levels, but the level you *get* is always
-snapshot isolation. Measured against PostgreSQL 14:
+accepted and echoed back for all three levels; `READ COMMITTED` is honored —
+each statement re-checks against the latest committed rows — while `REPEATABLE
+READ` and `SERIALIZABLE` give snapshot isolation. Measured against PostgreSQL
+14:
 
 | what you write | PostgreSQL | SecantusDB |
 |---|---|---|
 | autocommit statements | second writer blocks, both writes land | **same** |
 | `BEGIN ISOLATION LEVEL REPEATABLE READ` | second writer gets `40001` | **same** |
-| `BEGIN ISOLATION LEVEL READ COMMITTED` | second writer blocks, both writes land | second writer gets `40001` |
+| `BEGIN ISOLATION LEVEL READ COMMITTED` | second writer blocks, both writes land | **same** |
 | `BEGIN ISOLATION LEVEL SERIALIZABLE` | one transaction aborts with `40001` | **both commit** |
 
 Two consequences are worth stating plainly.
 
-**`READ COMMITTED` inside an explicit transaction is stricter here than in
-PostgreSQL.** A write-write race that PostgreSQL would complete returns
-`40001 serialization_failure` instead, so a client that does not retry loses
-that write. Retrying on `40001` — what most drivers and ORMs already do — is
-enough. Statements *outside* an explicit transaction are unaffected: each is its
-own transaction, the second writer waits for the first and re-reads the
-committed value, exactly as PostgreSQL does.
+**`READ COMMITTED` waits and re-evaluates, as PostgreSQL does.** A block that
+has already written and then hits another session's uncommitted row waits for
+it, then applies its statement against the row the holder committed (the
+block's transaction is moved onto a fresh snapshot with its earlier writes
+replayed, WiredTiger being unable to refresh a writer's snapshot) — where the
+statement cannot be carried over, `40001` stands as the honest answer.
+Statements *outside* an explicit transaction run each in a transaction of
+their own, so the second writer waits for the first and re-reads the committed
+value, exactly as PostgreSQL does. (The deprecated Python server still returns
+`40001` for the in-block case; the Rust server is the reference.)
 
 **`SERIALIZABLE` does not prevent write skew.** Snapshot isolation allows two
 transactions to each read what the other is about to change and both commit:
@@ -3019,8 +3024,10 @@ stating the limitation plainly — here, in the capability matrix, and in the
 `test_known_divergence_*` pins — keeps working clients working and puts the
 risk where someone relying on it will read it.
 
-All four rows of the table above are pinned by
-`tests/test_sql_isolation_level.py`, with the two divergent ones named
+All four rows of the table above are pinned: the Rust server by
+`tests/test_rust_pgserver_slice.py` (`test_read_committed_block_waits_for_a_row_then_rechecks`
+and its deadlock and `lock_timeout` neighbours), the deprecated Python server
+by `tests/test_sql_isolation_level.py` with the two divergent rows named
 `test_known_divergence_*`.
 
 ### Savepoints
@@ -3088,16 +3095,19 @@ closed cursor errors with `34000`. The query is materialized once at `DECLARE`,
 so a cursor is a snapshot — later writes in the same transaction aren't visible
 through it.
 
-`SET TRANSACTION ISOLATION LEVEL …` / `… READ ONLY` / `… READ WRITE`,
-`SET SESSION CHARACTERISTICS AS TRANSACTION …`, and `BEGIN ISOLATION LEVEL …`
-are accepted but are no-ops: SecantusDB is single-node, so isolation level and
-read-only mode don't change behaviour.
+`SET TRANSACTION ISOLATION LEVEL …` / `BEGIN ISOLATION LEVEL …` are honored —
+the level changes how a write-write conflict is answered, as the [isolation
+levels](#isolation-levels--read-this-before-relying-on-serializable) section
+above describes. `SET TRANSACTION READ ONLY` refuses writes with `25006`;
+`READ WRITE` is the default. `SET SESSION CHARACTERISTICS AS TRANSACTION …`
+sets the level later blocks start at.
 
 ### Row-locking clauses (`FOR UPDATE` / `FOR SHARE`)
 
 `SELECT … FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` / `FOR KEY SHARE` — with
-the `NOWAIT`, `SKIP LOCKED`, and `OF <table>` modifiers — are accepted so ORM
-locking (SQLAlchemy's `with_for_update()`) works:
+the `NOWAIT`, `SKIP LOCKED`, and `OF <table>` modifiers — take **real row
+locks**, so ORM locking (SQLAlchemy's `with_for_update()`) behaves as it does
+against PostgreSQL:
 
 ```sql
 SELECT * FROM accounts WHERE id = 1 FOR UPDATE;
@@ -3105,11 +3115,16 @@ SELECT * FROM jobs WHERE done = false FOR UPDATE SKIP LOCKED;
 SELECT a.* FROM accounts a JOIN owners o ON o.id = a.owner FOR SHARE OF a NOWAIT;
 ```
 
-SecantusDB is single-node, so the lock itself is a **no-op** — the statement
-just returns its rows (a connection already serializes against the shared
-storage). One real check is applied: an `OF <table>` target that isn't a relation
-in the query's `FROM` errors with SQLSTATE `42P01`, exactly as Postgres reports
-it (and, as in Postgres, a table's alias masks its real name in `OF`).
+A row a session's transaction has locked is its own until the block ends:
+another session's write to that row waits (and, under `READ COMMITTED`,
+re-evaluates against what the holder commits); `NOWAIT` turns the wait into
+`55P03`; `SKIP LOCKED` leaves the held rows out of the result; `OF <table>`
+targets a join, view, or subquery leaf, and a target that isn't a relation in
+the query's `FROM` errors with SQLSTATE `42P01`, exactly as Postgres reports it
+(and, as in Postgres, a table's alias masks its real name in `OF`). A cycle of
+row waits is a deadlock: one session gets `40P01`, checked once
+`deadlock_timeout` (1 s) into the wait. (The deprecated Python server accepts
+the clauses as no-ops; the Rust server is the reference.)
 
 ### Index / constraint reflection for `\d`
 
@@ -3227,7 +3242,8 @@ PostgreSQL:
 - exclusive and shared modes with PostgreSQL's grant rules — two sessions can
   share a `_shared` hold, an exclusive hold blocks everyone else;
 - `pg_advisory_lock*` **block** until the lock is granted, with deadlock
-  detection (a cycle raises `40P01 deadlock detected` in one of the waiters);
+  detection (a cycle raises `40P01 deadlock detected` in one of the waiters,
+  checked once `deadlock_timeout` — 1 s — of waiting has passed);
 - `pg_try_advisory_lock*` return `true` / `false` truthfully;
 - `pg_advisory_unlock*` return `true` only if a matching session-level lock was
   held (and `false` otherwise, as Postgres does);
@@ -3247,8 +3263,8 @@ FROM pg_locks WHERE locktype = 'advisory';
 
 A single `bigint` key splits into `(classid, objid)` signed 32-bit halves with
 `objsubid = 1`; a two-`int4` key maps straight through with `objsubid = 2` —
-matching Postgres. Non-advisory lock types (relation / tuple rows) aren't
-modelled in `pg_locks`.
+matching Postgres. `pg_locks` also lists table-level `relation` locks (held
+and awaited); row (tuple) locks are not modelled there.
 
 ### Two-phase commit (`PREPARE TRANSACTION`)
 

@@ -9179,6 +9179,67 @@ def test_a_cycle_through_a_cascaded_delete_is_a_deadlock(home: Path) -> None:
             assert a.execute("select n from fk_o").fetchone() == (1,)
 
 
+def test_advisory_lock_waits_for_a_session_hold(home: Path) -> None:
+    """`pg_advisory_lock` blocks while another session holds the key (the
+    try_ form answers false), and proceeds once it is released -- as
+    PostgreSQL 15's leader-election lock behaves."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("select pg_advisory_lock(11)")
+        assert b.execute("select pg_try_advisory_lock(11)").fetchone() == (False,)
+        outcome: dict[str, str] = {}
+
+        def take() -> None:
+            outcome["b"] = _sqlstate(b, "select pg_advisory_lock(11)") or "ok"
+
+        t = threading.Thread(target=take)
+        t.start()
+        time.sleep(0.4)
+        assert t.is_alive(), "B should be waiting for A's hold"
+        a.execute("select pg_advisory_unlock(11)")
+        t.join(10)
+        assert not t.is_alive()
+        assert outcome["b"] == "ok"
+        assert b.execute("select pg_advisory_unlock(11)").fetchone() == (True,)
+
+
+def test_a_cycle_of_advisory_waits_is_a_deadlock(home: Path) -> None:
+    """A holds advisory(21) and waits for advisory(22), held by B, which
+    wants advisory(21): the cycle is found by the waiter whose deadlock
+    check fires first (A, waiting first), which gets 40P01; its session hold
+    survives the failed statement, as in PostgreSQL, so A lets go and B's
+    wait then completes."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("select pg_advisory_lock(21)")
+        b.execute("select pg_advisory_lock(22)")
+        outcome: dict[str, str] = {}
+
+        def a_side() -> None:
+            outcome["a"] = _sqlstate(a, "select pg_advisory_lock(22)") or "ok"
+            # The victim's session hold outlives its failed statement, as in
+            # PostgreSQL; let it go so the survivor's wait can end.
+            a.execute("select pg_advisory_unlock(21)")
+
+        t = threading.Thread(target=a_side)
+        t.start()
+        time.sleep(0.3)
+        outcome["b"] = _sqlstate(b, "select pg_advisory_lock(21)") or "ok"
+        t.join(10)
+        assert not t.is_alive()
+        assert outcome["a"] == "40P01", outcome
+        assert outcome["b"] == "ok", outcome
+
+
+def test_an_advisory_lock_wait_ends_on_lock_timeout(home: Path) -> None:
+    """The wait is a lock wait: `lock_timeout` ends it with 55P03."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("select pg_advisory_lock(31)")
+        b.execute("set lock_timeout = '300ms'")
+        try:
+            assert _sqlstate(b, "select pg_advisory_lock(31)") == "55P03"
+        finally:
+            a.execute("select pg_advisory_unlock(31)")
+
+
 _PG15_CATALOG_COLUMNS = {
     "pg_class": "oid,relname,relnamespace,reltype,reloftype,relowner,relam,relfilenode,"
     "reltablespace,relpages,reltuples,relallvisible,reltoastrelid,relhasindex,relisshared,"

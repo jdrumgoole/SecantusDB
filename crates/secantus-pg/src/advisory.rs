@@ -7,9 +7,16 @@
 //! transaction-scoped hold is released when its transaction ends and cannot
 //! be unlocked explicitly. Every hold a session has is released when it
 //! disconnects.
+//!
+//! A wait registers in the shared wait-for graph (`lock_manager`), so a
+//! cycle that closes -- whatever lock kinds it runs through -- is
+//! PostgreSQL's 40P01, checked as the others do once `deadlock_timeout`
+//! (1s) of waiting has passed, and again each second after.
 
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
+
+use crate::lock_manager;
 
 /// A lock key: the argument form (0 bigint, 1 two int4s) and its value.
 pub type Key = (u8, i64);
@@ -51,20 +58,35 @@ pub fn snapshot() -> Vec<(Key, i32, bool)> {
     out
 }
 
-fn conflicts(holds: &[Hold], key: Key, pid: i32, shared: bool) -> bool {
-    holds
+/// The holders of `key` (other than `pid`) a lock of `shared` conflicts
+/// with: every exclusive holder, and -- when the want is exclusive -- the
+/// shared ones too.
+fn blockers(holds: &[Hold], key: Key, pid: i32, shared: bool) -> Vec<i32> {
+    let mut out: Vec<i32> = holds
         .iter()
-        .any(|h| h.key == key && h.pid != pid && (!shared || !h.shared))
+        .filter(|h| h.key == key && h.pid != pid && (!shared || !h.shared))
+        .map(|h| h.pid)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn conflicts(holds: &[Hold], key: Key, pid: i32, shared: bool) -> bool {
+    !blockers(holds, key, pid, shared).is_empty()
 }
 
 /// Take a hold, waiting while another session's hold conflicts. `cancelled`
-/// is polled while waiting; its error ends the wait.
+/// is polled while waiting; its error ends the wait. A wait that closes a
+/// cycle of sessions waiting on each other -- through any lock kind -- ends
+/// with `deadlock()`, PostgreSQL's 40P01.
 pub fn lock<E>(
     key: Key,
     pid: i32,
     shared: bool,
     xact: bool,
     cancelled: impl FnMut() -> Result<(), E>,
+    deadlock: impl Fn() -> E,
 ) -> Result<(), E> {
     // Waiting blocks this thread. On a shared runtime worker its queued
     // tasks go to the others first (`blocking_wait`), or a connection
@@ -75,10 +97,12 @@ pub fn lock<E>(
         let holds = t.holds.lock().unwrap_or_else(|e| e.into_inner());
         if conflicts(&holds, key, pid, shared) {
             drop(holds);
-            return crate::blocking_wait(|| wait_and_take(key, pid, shared, xact, cancelled));
+            return crate::blocking_wait(|| {
+                wait_and_take(key, pid, shared, xact, cancelled, deadlock)
+            });
         }
     }
-    wait_and_take(key, pid, shared, xact, cancelled)
+    wait_and_take(key, pid, shared, xact, cancelled, deadlock)
 }
 
 fn wait_and_take<E>(
@@ -87,10 +111,26 @@ fn wait_and_take<E>(
     shared: bool,
     xact: bool,
     mut cancelled: impl FnMut() -> Result<(), E>,
+    deadlock: impl Fn() -> E,
 ) -> Result<(), E> {
     let t = table();
+    let waiting = lock_manager::WaitGuard::new(pid);
+    let began = std::time::Instant::now();
+    let mut next_check = Duration::from_secs(1);
     let mut holds = t.holds.lock().unwrap_or_else(|e| e.into_inner());
     while conflicts(&holds, key, pid, shared) {
+        // Only real holder edges enter the graph (see `lock_manager`), so a
+        // `true` here is a real cycle. The check runs once
+        // `deadlock_timeout` (1s) of waiting has passed, as the other lock
+        // waits do, and again each second after so a cycle that forms later
+        // is caught too.
+        waiting.set(blockers(&holds, key, pid, shared));
+        if began.elapsed() >= next_check {
+            if waiting.deadlocked() {
+                return Err(deadlock());
+            }
+            next_check += Duration::from_secs(1);
+        }
         let (guard, _) = t
             .released
             .wait_timeout(holds, Duration::from_millis(50))
@@ -131,8 +171,9 @@ pub fn wait_free<E>(
     pid: i32,
     shared: bool,
     cancelled: impl FnMut() -> Result<(), E>,
+    deadlock: impl Fn() -> E,
 ) -> Result<(), E> {
-    lock(key, pid, shared, true, cancelled)?;
+    lock(key, pid, shared, true, cancelled, deadlock)?;
     release_xact(pid);
     Ok(())
 }
