@@ -47,11 +47,19 @@ def test_a_cycle_across_lock_kinds_is_a_deadlock(rust_pg: Any) -> None:
                 outcome[name] = e.sqlstate
                 conn.execute("rollback")  # let the survivor's wait clear
 
-        ta = threading.Thread(target=side, args=("a", a, "update rp048_t set n = 3 where id = 1"))
-        ta.start()
-        time.sleep(0.3)
+        # The advisory waiter waits FIRST. The victim is always the session
+        # whose check fires first (hard edges, as PostgreSQL's
+        # DeadLockCheck), and the survivor only proceeds when the victim's
+        # abort releases what it waits on — B's rollback lets go of the row
+        # A waits for. (The other order — the row waiter first — would have
+        # the victim keep its session-scoped advisory hold, and the survivor
+        # would wait out its lock_timeout: PostgreSQL answers 55P03 there
+        # too, so the test shapes the case the pinned row-wait tests shape.)
         tb = threading.Thread(target=side, args=("b", b, "select pg_advisory_lock(717171)"))
         tb.start()
+        time.sleep(0.3)
+        ta = threading.Thread(target=side, args=("a", a, "update rp048_t set n = 3 where id = 1"))
+        ta.start()
         ta.join(15)
         tb.join(15)
         assert sorted(outcome.values()) == ["40P01", "granted"], outcome
