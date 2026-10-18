@@ -1,9 +1,10 @@
 # PostgreSQL 15.19's ICU collations (pg_collation, collprovider 'i'): oid, name, ICU locale, collversion.
-# Only those whose ORDER BY matched PostgreSQL on a probe of 278 strings across 25 scripts (897 of 907,
-# 2026-10-16). Left out: as, kok and mr, whose conjunct rule (`&ह<क्ष`) ICU4X does not apply, and
-# en-US-u-va-posix, with their script and region forms. haw, kl, lkt, ln, se, smn and yi order from the
-# generated data (icu_data.rs); az-Cyrl, hi-Latn, pa-Arab, uz-Arab and uz-Cyrl as their language
-# (collation.rs, SCRIPT_ORDERS_AS_LANGUAGE).
+# All 907, 2026-10-18. as, kok, kok-Deva and mr's conjunct rule (`&ह<क्ष`, `&হ<ক্ষ`), which ICU4X
+# does not apply, is applied on top of its collator by a rewrite before sort-keying
+# (collation.rs, CONJUNCT_TAILORINGS); kok-Latn orders as the root (measured on PostgreSQL 15.19);
+# en-US-u-va-posix is codepoint order (its variant), served as byte order. haw, kl, lkt, ln, se,
+# smn and yi order from the generated data (icu_data.rs); az-Cyrl, hi-Latn, pa-Arab, uz-Arab and
+# uz-Cyrl as their language (collation.rs, SCRIPT_ORDERS_AS_LANGUAGE).
 12713	und-x-icu	und	153.136
 12714	af-x-icu	af	153.136.48
 12715	af-NA-x-icu	af-NA	153.136.48
@@ -43,6 +44,8 @@
 12749	ar-TD-x-icu	ar-TD	153.136.48
 12750	ar-TN-x-icu	ar-TN	153.136.48
 12751	ar-YE-x-icu	ar-YE	153.136.48
+12752	as-x-icu	as	153.136.48
+12753	as-IN-x-icu	as-IN	153.136.48
 12754	asa-x-icu	asa	153.136
 12755	asa-TZ-x-icu	asa-TZ	153.136
 12756	ast-x-icu	ast	153.136
@@ -266,6 +269,7 @@
 12974	en-UG-x-icu	en-UG	153.136
 12975	en-UM-x-icu	en-UM	153.136
 12976	en-US-x-icu	en-US	153.136
+12977	en-US-u-va-posix-x-icu	en-US-u-va-posix	153.136.48
 12978	en-VC-x-icu	en-VC	153.136
 12979	en-VG-x-icu	en-VG	153.136
 12980	en-VI-x-icu	en-VI	153.136
@@ -500,6 +504,11 @@
 13209	ko-CN-x-icu	ko-CN	153.136.48
 13210	ko-KP-x-icu	ko-KP	153.136.48
 13211	ko-KR-x-icu	ko-KR	153.136.48
+13212	kok-x-icu	kok	153.136.48
+13213	kok-Deva-x-icu	kok-Deva	153.136.48
+13214	kok-Deva-IN-x-icu	kok-Deva-IN	153.136.48
+13215	kok-Latn-x-icu	kok-Latn	153.136.48
+13216	kok-Latn-IN-x-icu	kok-Latn-IN	153.136.48
 13217	ks-x-icu	ks	153.136
 13218	ks-Arab-x-icu	ks-Arab	153.136
 13219	ks-Arab-IN-x-icu	ks-Arab-IN	153.136
@@ -588,6 +597,8 @@
 13302	mni-x-icu	mni	153.136
 13303	mni-Beng-x-icu	mni-Beng	153.136
 13304	mni-Beng-IN-x-icu	mni-Beng-IN	153.136
+13305	mr-x-icu	mr	153.136.48
+13306	mr-IN-x-icu	mr-IN	153.136.48
 13307	ms-x-icu	ms	153.136
 13308	ms-BN-x-icu	ms-BN	153.136
 13309	ms-ID-x-icu	ms-ID	153.136

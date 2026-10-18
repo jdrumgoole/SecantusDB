@@ -104,23 +104,11 @@ one beside it.
   table refuses reads and writes with PostgreSQL's own `55000` for a
   handler-less wrapper; `postgres_fdw` / `file_fdw` are contrib modules this
   server does not ship.
-- [ ] **RUST pgserver: 10 of PostgreSQL 15.19's 907 ICU collations are
-  refused.** `pg_collation` lists the other 897 (`pg_icu_collations.tsv`),
-  each checked to ORDER BY as PostgreSQL does over a 278-string probe across
-  25 scripts (2026-10-16). Left out, each 42704:
-  - `mr`, `as` and `kok` (with `kok-Deva` and `kok-Latn`) and their
-    regional forms: ICU4X's collator does not apply their conjunct rule
-    (`&ह<क्ष`, `ক্ষ` likewise) -- not with its compiled data, and not with
-    data generated from ICU's own release (measured 2026-10-16, both
-    `compare` and the sort key). The fix is in ICU4X, or a rule applied
-    here on top of it.
-  - `en-US-u-va-posix`: ICU4X does not select the POSIX variant from the
-    `-u-va-posix` keyword.
-  Related, not tested: none of PostgreSQL's libc collations beyond `C` /
-  `POSIX` exists here (`COLLATE "en_US"` is 42704), and which ones a server
-  has is the host's locale list.
-  Backlog-ID: RP-005
-  Verify: tests/backlog/test_rp_triage.py::test_marathi_icu_collation_orders_as_postgres
+- **Scope decision — libc collations**: only `C` / `POSIX` exist here
+  (`COLLATE "en_US"` is 42704); which libc locales a server offers is the
+  host's locale list, and a single-node surrogate does not reproduce the
+  host's. ICU collations cover the locale-ordering need: all 907 of
+  PostgreSQL 15.19's are served (RP-005, 2026-10-18).
 - **Scope decision — the comparison functions whose magnitude is the
   platform's answer the SIGN only** (Joe, 2026-10-16): `bttextcmp`,
   `bpcharcmp` and `jsonb_cmp` compare under the database collation through

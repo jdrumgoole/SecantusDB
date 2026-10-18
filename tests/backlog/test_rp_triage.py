@@ -166,7 +166,7 @@ def test_script_form_icu_collation_orders_as_its_language(pg: Any) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-005")
+@pytest.mark.backlog_fixed("RP-005")
 def test_marathi_icu_collation_orders_as_postgres(pg: Any) -> None:
     """PostgreSQL 15.19: `mr-x-icu` (Marathi) sorts the conjunct `क्ष` after
     `ह`. Here the collation is refused (42704): ICU4X's compiled data has no

@@ -127,6 +127,15 @@ impl Resolved {
     }
 }
 
+/// Is `locale` the POSIX variant (`en-US-u-va-posix`)? ICU4C builds a
+/// codepoint-order collator for it; PostgreSQL's `en-US-u-va-posix-x-icu`
+/// orders that way too (measured 2026-10-18: ` `<`!`<`0`<`9`<`Z`<`a`,
+/// `a0`<`aa`, `~` last), and codepoint order is what `Resolved::Bytes`
+/// compares by.
+fn posix_variant(locale: &str) -> bool {
+    keyword(locale, "va").is_some_and(|v| v.eq_ignore_ascii_case("posix"))
+}
+
 fn does_not_exist(name: &str) -> Error {
     Error::Sqlstate(
         "42704",
@@ -157,13 +166,21 @@ pub fn resolve(name: &str) -> Result<Resolved> {
                 locale: libc_to_icu(&u.locale),
                 deterministic: u.deterministic,
             },
-            _ => Resolved::Icu {
-                locale: u.locale.clone(),
-                deterministic: u.deterministic,
-            },
+            _ => {
+                if posix_variant(&u.locale) {
+                    return Ok(Resolved::Bytes);
+                }
+                Resolved::Icu {
+                    locale: u.locale.clone(),
+                    deterministic: u.deterministic,
+                }
+            }
         });
     }
     if let Some(locale) = icu_builtin(name) {
+        if posix_variant(locale) {
+            return Ok(Resolved::Bytes);
+        }
         return Ok(Resolved::Icu {
             locale: locale.to_string(),
             deterministic: true,
@@ -230,19 +247,70 @@ const SCRIPT_ORDERS_AS_LANGUAGE: [(&str, &str); 5] = [
 enum Built {
     Compiled(CollatorBorrowed<'static>),
     Generated(Box<Collator>),
+    /// A collator with a literal rewrite applied before keying: the conjunct
+    /// tailoring CLDR has for mr / kok / as (`&ह<क्ष`, `&হ<ক্ষ`) that ICU4X
+    /// does not apply (RP-005). Each rule rewrites a conjunct to the anchor
+    /// letter plus one U+FFFD per rule position: U+FFFD is a symbol, whose
+    /// primary sorts above every script letter, so the conjunct lands
+    /// immediately after the anchor yet still above anything the anchor
+    /// prefixes (क्षा after हा, which a zero-width joiner would not give),
+    /// and successive rules list their conjuncts in order.
+    Rewritten(Box<Built>, &'static [(&'static str, &'static str)]),
 }
+
+/// The Devanagari conjuncts and where CLDR's mr/kok tailoring puts them:
+/// `क्ष` after ह, then `ज्ञ` (measured on PostgreSQL 15.19, 2026-10-18).
+const DEVANAGARI_CONJUNCTS: &[(&str, &str)] = &[("क्ष", "ह\u{fffd}"), ("ज्ञ", "ह\u{fffd}\u{fffd}")];
+/// Bengali's single tailored conjunct (Assamese, `as`): `ক্ষ` after হ.
+const BENGALI_CONJUNCTS: &[(&str, &str)] = &[("ক্ষ", "হ\u{fffd}")];
 
 impl Built {
     fn write_sort_key_to(&self, text: &str, key: &mut Vec<u8>) {
-        let _ = match self {
-            Built::Compiled(c) => c.write_sort_key_to(text, key),
-            Built::Generated(c) => c.as_borrowed().write_sort_key_to(text, key),
-        };
+        match self {
+            Built::Compiled(c) => {
+                let _ = c.write_sort_key_to(text, key);
+            }
+            Built::Generated(c) => {
+                let _ = c.as_borrowed().write_sort_key_to(text, key);
+            }
+            Built::Rewritten(inner, rules) => {
+                // The common string has no conjunct: no copy, no rewrite.
+                if rules.iter().any(|(from, _)| text.contains(from)) {
+                    let rewritten: String = rules
+                        .iter()
+                        .fold(text.to_string(), |s, (from, to)| s.replace(from, to));
+                    inner.write_sort_key_to(&rewritten, key);
+                } else {
+                    inner.write_sort_key_to(text, key);
+                }
+            }
+        }
+    }
+}
+
+/// The conjunct tailoring for `parsed`'s locale, if CLDR has one that ICU4X
+/// does not apply: mr and kok in Devanagari, as in Bengali.
+fn conjunct_tailoring(
+    parsed: &icu_locale::Locale,
+) -> Option<&'static [(&'static str, &'static str)]> {
+    let language = parsed.id.language.as_str().to_string();
+    let script = parsed.id.script.map(|s| s.as_str().to_string());
+    match (language.as_str(), script.as_deref()) {
+        ("mr" | "kok", None | Some("Deva")) => Some(DEVANAGARI_CONJUNCTS),
+        ("as", None | Some("Beng")) => Some(BENGALI_CONJUNCTS),
+        _ => None,
     }
 }
 
 fn build(locale: &str) -> Option<Built> {
     let mut parsed: icu_locale::Locale = locale.parse().ok()?;
+    // `kok-Latn` orders as the root on PostgreSQL (measured 2026-10-18);
+    // ICU4X would build kok's Devanagari collation for the Latn script.
+    if parsed.id.language.as_str() == "kok"
+        && parsed.id.script.is_some_and(|s| s.as_str() == "Latn")
+    {
+        parsed = "und".parse().ok()?;
+    }
     if let Some(script) = parsed.id.script {
         let language = parsed.id.language;
         if SCRIPT_ORDERS_AS_LANGUAGE
@@ -272,10 +340,17 @@ fn build(locale: &str) -> Option<Built> {
     if keyword(locale, "ka").is_some_and(|v| v.eq_ignore_ascii_case("shifted")) {
         options.alternate_handling = Some(AlternateHandling::Shifted);
     }
-    if crate::icu_data::covers(parsed.id.language.as_str()) {
-        return crate::icu_data::collator(prefs, options).map(|c| Built::Generated(Box::new(c)));
-    }
-    Collator::try_new(prefs, options).ok().map(Built::Compiled)
+    let built = if crate::icu_data::covers(parsed.id.language.as_str()) {
+        Built::Generated(Box::new(crate::icu_data::collator(prefs, options)?))
+    } else {
+        Built::Compiled(Collator::try_new(prefs, options).ok()?)
+    };
+    // The conjunct rule is a property of the LOCALE, so it applies however
+    // the collator was built.
+    Some(match conjunct_tailoring(&parsed) {
+        Some(rules) => Built::Rewritten(Box::new(built), rules),
+        None => built,
+    })
 }
 
 /// The sort key of `text` under ICU `locale`, as bytes.
@@ -632,5 +707,37 @@ mod tests {
         ] {
             assert!(icu_builtin(name).is_some(), "{name}");
         }
+    }
+
+    /// RP-005: the conjunct tailoring CLDR has for mr / kok / as that ICU4X
+    /// does not apply, measured on PostgreSQL 15.19 (2026-10-18): `क्ष` and
+    /// `ज्ञ` sort after `ह` (`क्ष` first); Assamese `ক্ষ` after `হ`.
+    #[test]
+    fn conjunct_tailorings_order_as_postgres() {
+        assert_eq!(ordered("mr", &["क", "क्ष", "ख", "ह"]), "क,ख,ह,क्ष");
+        assert_eq!(ordered("mr-IN", &["क", "ज्ञ", "क्ष", "ह"]), "क,ह,क्ष,ज्ञ");
+        assert_eq!(ordered("kok", &["क", "क्ष", "ख", "ह"]), "क,ख,ह,क्ष");
+        assert_eq!(ordered("kok-Deva-IN", &["क", "क्ष", "ख", "ह"]), "क,ख,ह,क्ष");
+        assert_eq!(ordered("as", &["ক", "ক্ষ", "খ", "হ"]), "ক,খ,হ,ক্ষ");
+        assert_eq!(ordered("as-IN", &["ক", "ক্ষ", "খ", "হ"]), "ক,খ,হ,ক্ষ");
+        // The conjunct keeps its place above anything the anchor prefixes:
+        // क्षा sorts after हा.
+        assert_eq!(ordered("mr", &["क्षा", "हा"]), "हा,क्षा");
+    }
+
+    /// RP-005: `kok-Latn` orders as the root (measured on PostgreSQL 15.19),
+    /// and `en-US-u-va-posix` — its `va` variant — by codepoints
+    /// (` `<`!`<`0`<`9`<`Z`<`a`, `a0`<`aa`, `~` last), which is what
+    /// `Resolved::Bytes` compares by.
+    #[test]
+    fn kok_latn_orders_as_root_and_posix_as_bytes() {
+        let words = &["a", "A", "b", "z", "á", "ä", "1", " "];
+        assert_eq!(ordered("kok-Latn", words), ordered("und", words));
+        assert_eq!(ordered("kok-Latn-IN", words), ordered("und", words));
+        let key = |t: &str| sort_key("en-US-u-va-posix-x-icu", t).unwrap();
+        assert!(key("a0") < key("aa"), "'0' sorts before 'a'");
+        assert!(key("Z") < key("a"), "uppercase before lowercase");
+        assert!(key(" ") < key("!"), "space first");
+        assert!(key("~") > key("z"), "'~' (0x7E) sorts after letters");
     }
 }
