@@ -11442,7 +11442,7 @@ impl PgHandler {
         for (table, privilege) in relations {
             let mode = match privilege {
                 "SELECT" => {
-                    if row_locked.iter().any(|t| *t == table) {
+                    if row_locked.contains(&table) {
                         table_locks::ROW_SHARE
                     } else {
                         table_locks::ACCESS_SHARE

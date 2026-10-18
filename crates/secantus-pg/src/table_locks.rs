@@ -171,12 +171,10 @@ pub fn acquire<E>(
                 guard.set(blockers(&holds, table_name, pid, mode));
                 // PostgreSQL looks for a deadlock after `deadlock_timeout`
                 // (1s) of waiting.
-                if polls == 20 {
-                    if guard.deadlocked() {
-                        drop(holds);
-                        unwait();
-                        return Err(deadlock());
-                    }
+                if polls == 20 && guard.deadlocked() {
+                    drop(holds);
+                    unwait();
+                    return Err(deadlock());
                 }
                 polls += 1;
                 let (guard_holds, _) = t
