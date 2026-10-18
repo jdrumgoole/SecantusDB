@@ -19,9 +19,34 @@
 
 use std::sync::Mutex;
 
+/// What kind of lock a wait is for, as `pg_stat_activity.wait_event`
+/// names it (`Lock` wait event type).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WaitKind {
+    /// A table lock wait.
+    Relation,
+    /// A row wait: PostgreSQL reports it as waiting on the holder's
+    /// transaction (`transactionid`).
+    TransactionId,
+    /// An advisory-lock wait.
+    Advisory,
+}
+
+impl WaitKind {
+    /// `pg_stat_activity.wait_event`'s value.
+    pub fn wait_event(self) -> &'static str {
+        match self {
+            WaitKind::Relation => "relation",
+            WaitKind::TransactionId => "transactionid",
+            WaitKind::Advisory => "advisory",
+        }
+    }
+}
+
 /// One session's wait: `pid` is blocked on every pid in `blockers`.
 struct Wait {
     pid: i32,
+    kind: WaitKind,
     blockers: Vec<i32>,
 }
 
@@ -66,11 +91,12 @@ fn deadlocked(waits: &[Wait], pid: i32) -> bool {
 /// it waits on commit and roll back.
 pub struct WaitGuard {
     pid: i32,
+    kind: WaitKind,
 }
 
 impl WaitGuard {
-    pub fn new(pid: i32) -> Self {
-        Self { pid }
+    pub fn new(pid: i32, kind: WaitKind) -> Self {
+        Self { pid, kind }
     }
 
     /// Record whom `pid` now waits on. An empty `blockers` clears the wait.
@@ -87,6 +113,7 @@ impl WaitGuard {
         if !blockers.is_empty() {
             waits.push(Wait {
                 pid: self.pid,
+                kind: self.kind,
                 blockers,
             });
         }
@@ -110,6 +137,39 @@ impl Drop for WaitGuard {
     }
 }
 
+/// The sessions `pid` is currently known to wait on, for
+/// `pg_blocking_pids(pid)`.
+pub fn blockers_of(pid: i32) -> Vec<i32> {
+    let waits = graph().waits.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<i32> = waits
+        .iter()
+        .filter(|w| w.pid == pid)
+        .flat_map(|w| w.blockers.iter().copied())
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// What `pid` waits on right now, for `pg_stat_activity.wait_event`
+/// (`wait_event_type` is `Lock` whenever this is `Some`).
+pub fn wait_kind(pid: i32) -> Option<WaitKind> {
+    let waits = graph().waits.lock().unwrap_or_else(|e| e.into_inner());
+    waits.iter().find(|w| w.pid == pid).map(|w| w.kind)
+}
+
+/// Every wait in flight: `(waiting session, its kind, the sessions it
+/// waits on)`, for `pg_locks`' ungranted rows.
+pub fn waits() -> Vec<(i32, WaitKind, Vec<i32>)> {
+    graph()
+        .waits
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|w| (w.pid, w.kind, w.blockers.clone()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +177,7 @@ mod tests {
     fn wait(pid: i32, blockers: &[i32]) -> Wait {
         Wait {
             pid,
+            kind: WaitKind::Relation,
             blockers: blockers.to_vec(),
         }
     }
@@ -151,7 +212,7 @@ mod tests {
     fn a_session_never_waits_on_itself() {
         // A self-edge is dropped on registration: alone it is no wait at all,
         // and mixed with a real blocker it does not read as a cycle.
-        let guard = WaitGuard::new(9_003_001);
+        let guard = WaitGuard::new(9_003_001, WaitKind::Relation);
         guard.set(vec![9_003_001]);
         assert!(!guard.deadlocked());
         guard.set(vec![9_003_001, 9_003_002]);
@@ -161,9 +222,9 @@ mod tests {
 
     #[test]
     fn guard_edges_are_replaced_and_dropped() {
-        let a = WaitGuard::new(9_004_001);
-        let b = WaitGuard::new(9_004_002);
-        let c = WaitGuard::new(9_004_003);
+        let a = WaitGuard::new(9_004_001, WaitKind::Relation);
+        let b = WaitGuard::new(9_004_002, WaitKind::Relation);
+        let c = WaitGuard::new(9_004_003, WaitKind::Relation);
         // A waits on B; B waits on C: a chain, no cycle.
         a.set(vec![9_004_002]);
         b.set(vec![9_004_003]);
@@ -183,8 +244,8 @@ mod tests {
 
     #[test]
     fn a_registered_cycle_deadlocks() {
-        let a = WaitGuard::new(9_002_001);
-        let b = WaitGuard::new(9_002_002);
+        let a = WaitGuard::new(9_002_001, WaitKind::Relation);
+        let b = WaitGuard::new(9_002_002, WaitKind::Relation);
         a.set(vec![9_002_002]);
         b.set(vec![9_002_001]);
         assert!(a.deadlocked());

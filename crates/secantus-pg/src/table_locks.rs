@@ -15,7 +15,9 @@ use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 pub const ACCESS_SHARE: i32 = 1;
+pub const ROW_SHARE: i32 = 2;
 pub const ROW_EXCLUSIVE: i32 = 3;
+pub const SHARE: i32 = 5;
 pub const ACCESS_EXCLUSIVE: i32 = 8;
 
 struct Hold {
@@ -69,34 +71,17 @@ fn conflicts(holds: &[Hold], table: &str, pid: i32, mode: i32) -> bool {
         .any(|h| h.table == table && h.pid != pid && modes_conflict(mode, h.mode))
 }
 
-/// Does waiting for `mode` on `table` close a cycle -- a session this one
-/// waits on waiting, directly or not, on this one?
-fn deadlocked(holds: &[Hold], waiting: &[(i32, String, i32)], pid: i32) -> bool {
-    let blockers = |p: i32| -> Vec<i32> {
-        waiting
-            .iter()
-            .filter(|(w, _, _)| *w == p)
-            .flat_map(|(_, t, m)| {
-                holds
-                    .iter()
-                    .filter(|h| &h.table == t && h.pid != p && modes_conflict(*m, h.mode))
-                    .map(|h| h.pid)
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    };
-    let mut seen = vec![pid];
-    let mut stack = blockers(pid);
-    while let Some(p) = stack.pop() {
-        if p == pid {
-            return true;
-        }
-        if !seen.contains(&p) {
-            seen.push(p);
-            stack.extend(blockers(p));
-        }
-    }
-    false
+/// The holders of `table` (other than `pid`) that a lock of `mode` on it
+/// conflicts with — whom a waiter for that lock really waits on.
+fn blockers(holds: &[Hold], table: &str, pid: i32, mode: i32) -> Vec<i32> {
+    let mut out: Vec<i32> = holds
+        .iter()
+        .filter(|h| h.table == table && h.pid != pid && modes_conflict(mode, h.mode))
+        .map(|h| h.pid)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// Every hold: `(table, pid, mode)`, for `pg_locks`.
@@ -175,26 +160,28 @@ pub fn acquire<E>(
                 table_name.to_string(),
                 mode,
             ));
+            // The wait's edges register in the shared wait-for graph
+            // (`lock_manager`), so a cycle is seen whatever lock kinds it
+            // runs through; only real holder edges are ever registered.
+            let guard =
+                crate::lock_manager::WaitGuard::new(pid, crate::lock_manager::WaitKind::Relation);
             let mut holds = t.holds.lock().unwrap_or_else(|e| e.into_inner());
             let mut polls = 0u32;
             while conflicts(&holds, table_name, pid, mode) {
+                guard.set(blockers(&holds, table_name, pid, mode));
                 // PostgreSQL looks for a deadlock after `deadlock_timeout`
                 // (1s) of waiting.
-                if polls == 20 {
-                    let waiting = t.waiting.lock().unwrap_or_else(|e| e.into_inner());
-                    if deadlocked(&holds, &waiting, pid) {
-                        drop(waiting);
-                        drop(holds);
-                        unwait();
-                        return Err(deadlock());
-                    }
+                if polls == 20 && guard.deadlocked() {
+                    drop(holds);
+                    unwait();
+                    return Err(deadlock());
                 }
                 polls += 1;
-                let (guard, _) = t
+                let (guard_holds, _) = t
                     .released
                     .wait_timeout(holds, Duration::from_millis(50))
                     .unwrap_or_else(|e| e.into_inner());
-                drop(guard);
+                drop(guard_holds);
                 if let Err(e) = cancelled() {
                     unwait();
                     return Err(e);

@@ -200,3 +200,16 @@ pub fn end(storage: &Arc<Storage>, pid: i32) {
         }
     }
 }
+
+/// Every backend with a running (assigned, not completed) xid on this
+/// store's cluster: `(pid, xid)`, sorted by pid — `pg_locks`' granted
+/// transactionid rows.
+pub fn running() -> Vec<(i32, u64)> {
+    let all = clusters().lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<(i32, u64)> = all
+        .get(&CURRENT.with(Cell::get))
+        .map(|c| c.running.iter().map(|(p, x)| (*p, *x)).collect())
+        .unwrap_or_default();
+    out.sort_unstable();
+    out
+}

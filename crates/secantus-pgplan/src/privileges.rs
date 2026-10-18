@@ -497,6 +497,78 @@ fn ddl_locks_uncached(sql: &str) -> Vec<(String, i32)> {
     out
 }
 
+/// The tables a statement's row-locking clause (`FOR UPDATE` / `FOR SHARE`
+/// / …) locks: those take PostgreSQL's `RowShareLock` on the table instead
+/// of `AccessShareLock`. `OF rels` narrows the set to the named tables;
+/// without it every table in the FROM list is locked. What the implicit
+/// statement table locks use (`RP-047`).
+pub fn row_locked_tables(sql: &str) -> Vec<String> {
+    thread_local! {
+        static MEMO: std::cell::RefCell<std::collections::HashMap<String, Vec<String>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let raw = memoised(&MEMO, sql, row_locked_tables_uncached);
+    let mut out: Vec<String> = Vec::new();
+    for r in raw {
+        let (schema, name) = r.split_once('\u{1f}').unwrap_or(("", r.as_str()));
+        let key = key_parts(schema, name);
+        if !out.contains(&key) {
+            out.push(key);
+        }
+    }
+    out
+}
+
+fn row_locked_tables_uncached(sql: &str) -> Vec<String> {
+    let Ok(parsed) = parse_tree(sql) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for raw in &parsed.stmts {
+        let Some(N::SelectStmt(s)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+            continue;
+        };
+        if s.locking_clause.is_empty() {
+            continue;
+        }
+        // `OF t` locks only the named tables; no OF locks the whole FROM.
+        let named: Vec<&pg_query::protobuf::RangeVar> = s
+            .locking_clause
+            .iter()
+            .filter_map(|n| match n.node.as_ref() {
+                Some(N::LockingClause(l)) => {
+                    Some(l.locked_rels.iter().filter_map(|r| match r.node.as_ref() {
+                        Some(N::RangeVar(rv)) => Some(rv),
+                        _ => None,
+                    }))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let from: Vec<&pg_query::protobuf::RangeVar> = s
+            .from_clause
+            .iter()
+            .filter_map(|n| match n.node.as_ref() {
+                Some(N::RangeVar(r)) => Some(r),
+                _ => None,
+            })
+            .collect();
+        let locked: Vec<&&pg_query::protobuf::RangeVar> = if named.is_empty() {
+            from.iter().collect()
+        } else {
+            named.iter().collect()
+        };
+        for r in locked {
+            let key = raw_key(r);
+            if !out.contains(&key) {
+                out.push(key);
+            }
+        }
+    }
+    out
+}
+
 /// The schema each object a `CREATE` statement in `sql` makes lands in --
 /// the one it names, else the first usable schema on the search path -- for
 /// the schema `CREATE` privilege PostgreSQL checks there. A temporary

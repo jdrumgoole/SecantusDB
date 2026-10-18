@@ -132,14 +132,6 @@ pub fn holders_in_mode(row: &WrittenRow, pid: i32, want: Strength) -> Vec<i32> {
     out
 }
 
-/// `(waiting session, the sessions it waits on)`.
-type Waits = Mutex<Vec<(i32, Vec<i32>)>>;
-
-fn registry() -> &'static Waits {
-    static WAITS: std::sync::OnceLock<Waits> = std::sync::OnceLock::new();
-    WAITS.get_or_init(|| Mutex::new(Vec::new()))
-}
-
 /// The sessions other than `pid` holding a write lock on some table.
 pub fn writers_other_than(pid: i32) -> Vec<i32> {
     let mut out: Vec<i32> = crate::table_locks::snapshot()
@@ -152,53 +144,31 @@ pub fn writers_other_than(pid: i32) -> Vec<i32> {
     out
 }
 
-/// A registered wait; dropping it ends the wait.
-pub struct Waiting(i32);
+/// A registered wait; dropping it ends the wait. The edges live in the
+/// shared wait-for graph (`lock_manager`), so a cycle is seen whatever
+/// lock kinds it runs through.
+pub struct Waiting {
+    guard: crate::lock_manager::WaitGuard,
+}
 
 impl Waiting {
     pub fn new(pid: i32) -> Self {
-        Self(pid)
+        Self {
+            guard: crate::lock_manager::WaitGuard::new(
+                pid,
+                crate::lock_manager::WaitKind::TransactionId,
+            ),
+        }
     }
 
     /// Record whom `pid` now waits on.
     pub fn set(&self, blockers: Vec<i32>) {
-        let mut waits = registry().lock().unwrap_or_else(|e| e.into_inner());
-        waits.retain(|(p, _)| *p != self.0);
-        waits.push((self.0, blockers));
+        self.guard.set(blockers);
     }
 
     /// Does this wait close a cycle: a session it waits on waiting, directly
     /// or not, on it?
     pub fn deadlocked(&self) -> bool {
-        let waits = registry().lock().unwrap_or_else(|e| e.into_inner());
-        let blockers = |p: i32| -> Vec<i32> {
-            waits
-                .iter()
-                .filter(|(w, _)| *w == p)
-                .flat_map(|(_, b)| b.iter().copied())
-                .collect()
-        };
-        let mut seen = vec![self.0];
-        let mut frontier = blockers(self.0);
-        while let Some(p) = frontier.pop() {
-            if p == self.0 {
-                return true;
-            }
-            if seen.contains(&p) {
-                continue;
-            }
-            seen.push(p);
-            frontier.extend(blockers(p));
-        }
-        false
-    }
-}
-
-impl Drop for Waiting {
-    fn drop(&mut self) {
-        registry()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|(p, _)| *p != self.0);
+        self.guard.deadlocked()
     }
 }

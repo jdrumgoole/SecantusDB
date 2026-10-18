@@ -114,7 +114,7 @@ fn wait_and_take<E>(
     deadlock: impl Fn() -> E,
 ) -> Result<(), E> {
     let t = table();
-    let waiting = lock_manager::WaitGuard::new(pid);
+    let waiting = lock_manager::WaitGuard::new(pid, lock_manager::WaitKind::Advisory);
     let began = std::time::Instant::now();
     let mut next_check = Duration::from_secs(1);
     let mut holds = t.holds.lock().unwrap_or_else(|e| e.into_inner());

@@ -884,6 +884,8 @@ pub(crate) const SEQUENCE_FUNCTIONS: &[&str] = &[
     "pg_advisory_xact_lock_shared",
     "pg_try_advisory_xact_lock",
     "pg_try_advisory_xact_lock_shared",
+    // Who blocks whom lives in the executor's wait-for graph.
+    "pg_blocking_pids",
     // The role graph lives in the executor's catalog.
     "pg_has_role",
     // Large objects live in the store.

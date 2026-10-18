@@ -1901,7 +1901,7 @@ def _relation_modes(rust_pg: Any, table: str, statement: str) -> list[str]:
     return [r[0] for r in rows]
 
 
-@pytest.mark.backlog("RP-047")
+@pytest.mark.backlog_fixed("RP-047")
 def test_row_locking_statements_take_postgres_relation_lock_modes(rust_pg: Any) -> None:
     """PostgreSQL 15.19: `FOR UPDATE` and `FOR SHARE` take RowShareLock on
     the table, `DELETE` RowExclusiveLock alone, `TRUNCATE`
@@ -1923,7 +1923,7 @@ def test_row_locking_statements_take_postgres_relation_lock_modes(rust_pg: Any) 
     }
 
 
-@pytest.mark.backlog("RP-047")
+@pytest.mark.backlog_fixed("RP-047")
 def test_pg_locks_shows_transaction_id_locks(rust_pg: Any) -> None:
     """PostgreSQL 15.19: a transaction that has written holds an
     ExclusiveLock on its own transaction id and on its virtual one, both
@@ -1971,7 +1971,7 @@ def _with_a_waiter(rust_pg: Any, hold: str, wait: str, look: Callable[[Any, int]
             conn.close()
 
 
-@pytest.mark.backlog("RP-047")
+@pytest.mark.backlog_fixed("RP-047")
 def test_a_row_lock_waiter_waits_on_the_holders_transaction_id(rust_pg: Any) -> None:
     """PostgreSQL 15.19: a session waiting for a row another transaction
     updated shows in `pg_locks` as an ungranted ShareLock on that
@@ -1988,7 +1988,7 @@ def test_a_row_lock_waiter_waits_on_the_holders_transaction_id(rust_pg: Any) -> 
     assert got == [("transactionid", "ShareLock", False)]
 
 
-@pytest.mark.backlog("RP-047")
+@pytest.mark.backlog_fixed("RP-047")
 def test_a_lock_waiter_is_visible_with_its_blocker(rust_pg: Any) -> None:
     """PostgreSQL 15.19: a session blocked on a table lock shows in
     `pg_stat_activity` with `wait_event_type = 'Lock'`, and

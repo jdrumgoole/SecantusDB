@@ -68,8 +68,15 @@ pub fn set_session_pid(pid: i32) {
 }
 
 fn ask(op: XidOp) -> Option<String> {
+    ask_pid(SESSION_PID.with(std::cell::Cell::get), op)
+}
+
+/// Ask the server's transaction-id source about `pid` specifically — the
+/// wait-for-observability catalogs read OTHER backends' xids
+/// (`pg_locks`' transactionid rows).
+pub fn ask_pid(pid: i32, op: XidOp) -> Option<String> {
     let hook = XID_HOOK.get()?;
-    hook(SESSION_PID.with(std::cell::Cell::get), op)
+    hook(pid, op)
 }
 
 /// `xid_age`: how many transactions before the current one `xid` is, by
