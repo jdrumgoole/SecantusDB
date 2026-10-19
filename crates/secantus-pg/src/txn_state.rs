@@ -9,6 +9,7 @@
 //! (RP-050). Grouping the state is what lets one `clear` serve every path.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use bson::Document;
@@ -59,5 +60,79 @@ impl PendingCatalog {
         self.tables().clear();
         self.types().clear();
         self.sequences().clear();
+    }
+}
+
+/// What the open transaction did that makes this session's catalog reads
+/// bypass the caches every connection shares. Each mark lasts exactly as
+/// long as the transaction: left set after it ends, every later statement
+/// re-reads what the cache already holds, and every later COMMIT
+/// invalidates every other connection's catalog cache -- one committed
+/// `CREATE TABLE` block made each later `begin; select 1; commit` on the
+/// connection 200 times slower.
+#[derive(Default)]
+pub(crate) struct TxnMarks {
+    /// A statement of the transaction changed the catalog.
+    catalog_changed: AtomicBool,
+    /// The transaction wrote a role, so its role reads see its own view,
+    /// not the shared committed cache.
+    roles_written: AtomicBool,
+}
+
+impl TxnMarks {
+    pub(crate) fn note_catalog_changed(&self) {
+        self.catalog_changed.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_roles_written(&self) {
+        self.roles_written.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn catalog_changed(&self) -> bool {
+        self.catalog_changed.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn roles_written(&self) -> bool {
+        self.roles_written.load(Ordering::Relaxed)
+    }
+
+    /// The transaction ended, committed or not: clears every mark, and
+    /// says whether it changed the catalog (a commit publishes that by
+    /// bumping the catalog version).
+    pub(crate) fn end(&self) -> bool {
+        self.roles_written.store(false, Ordering::Relaxed);
+        self.catalog_changed.swap(false, Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn end_clears_every_mark_and_reports_a_catalog_change() {
+        let marks = TxnMarks::default();
+        marks.note_catalog_changed();
+        marks.note_roles_written();
+        assert!(marks.end());
+        assert!(!marks.catalog_changed());
+        assert!(!marks.roles_written());
+        // A transaction that only wrote a role still ends its mark, and has
+        // no catalog change to publish.
+        marks.note_roles_written();
+        assert!(!marks.end());
+        assert!(!marks.roles_written());
+    }
+
+    #[test]
+    fn clear_empties_every_pending_kind() {
+        let pending = PendingCatalog::default();
+        pending.tables().insert("t".into(), None);
+        pending.types().insert(("c", "x".into()), None);
+        pending.sequences().insert("s".into());
+        pending.clear();
+        assert!(pending.tables().is_empty());
+        assert!(pending.types().is_empty());
+        assert!(pending.sequences().is_empty());
     }
 }
