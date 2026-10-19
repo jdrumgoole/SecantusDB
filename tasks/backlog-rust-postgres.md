@@ -587,6 +587,39 @@ one beside it.
       Backlog-ID: RP-019
       Verify: none -- predicate pushdown/index use only; answers identical, EXPLAIN costs are a scope decision
 
+## Code structure (2026-10-19)
+
+- [ ] **Rust PG server: `PgHandler` holds every piece of session state in
+      one flat struct, and one function runs most statement types.** Found
+      by a graphify knowledge graph of the repository: `PgHandler` ranks
+      second by edge count (660, all read from the code) and is the largest
+      bridge in the graph, linking 24 communities. Measured on origin/main
+      at 2026-10-19:
+      - the struct (`crates/secantus-pg/src/lib.rs`) has 77 fields: login,
+        TLS and hba state, transaction state (savepoints, deferred FKs and
+        triggers, transaction-local GUCs), portals and cursors, plan and
+        Describe caches, LISTEN/NOTIFY queues, temp tables and large-object
+        descriptors;
+      - `lib.rs` is 44,633 lines with about 650 functions, and 44
+        `impl PgHandler` blocks across 29 files add roughly 300 more;
+      - `execute_inner_keys` is a single 4,743-line `match` with 106
+        `Statement` arms, and `virtual_rows` (the catalog views) is 2,848
+        lines.
+      The hub is not avoidable: pgwire wants one per-connection type
+      implementing `StartupHandler`, `SimpleQueryHandler`,
+      `ExtendedQueryHandler` and `CopyHandler`. Splitting the methods into
+      separate files is already done. What is missing is ownership of the
+      state, because any method can read or write any field. The likely
+      shape: sub-structs that each own their own rules (transaction,
+      portals and cursors, connection security, notifications), and
+      `execute_inner_keys` split into one function per statement family.
+      Neither touches pgwire, the wire protocol or the on-disk format. No
+      client sees a different answer, so this is not a divergence. It is
+      here because a change to transaction or savepoint state currently has
+      to be checked against the whole file.
+      Backlog-ID: RP-049
+      Verify: none -- internal code structure; no answer differs from PostgreSQL
+
 ## Warning-class RUSTSEC advisories (surfaced by cargo-audit, not gated) (2026-07-20)
 
 The `cargo-audit` CI gate (`.github/workflows/cargo-audit.yml`) fails only on
