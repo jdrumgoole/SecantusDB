@@ -1911,8 +1911,10 @@ reachable exploit; clear them opportunistically when the owning dep is next
 touched:
 
 - **RUSTSEC-2025-0134** — `rustls-pemfile` 2.2.0 unmaintained. Its API folded
-  into `rustls-pki-types`. Still a direct dependency of `secantus-server` (and
-  of the PostgreSQL crates).
+  into `rustls-pki-types`. Still a direct dependency of `secantus-server`
+  (`src/lib.rs`'s cert / key loading and `tests/tls.rs`). The PostgreSQL
+  crates no longer use it (`secantus-pgwire`'s examples moved to
+  `rustls_pki_types::pem::PemObject`, 2026-10-19).
 - **RUSTSEC-2026-0196 / -0197** — `cgmath` 0.18.0 unmaintained + `swap_columns`
   UB. Pulled in transitively via the geo/spatial stack (`s2`). No fixed release;
   revisit if the geo dependency is ever swapped.

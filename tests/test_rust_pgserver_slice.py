@@ -8323,9 +8323,8 @@ def test_listen_notify_delivers_to_every_listener_at_commit(home: Path) -> None:
 def test_pg_cancel_and_terminate_backend_signal_a_running_statement(home: Path) -> None:
     """`pg_cancel_backend(pid)` interrupts the victim's statement with
     `57014` and leaves the session usable; `pg_terminate_backend(pid)`
-    ends it with FATAL `57P01` and closes the socket -- both within a few
-    milliseconds of the signal, even while the victim is inside
-    `pg_sleep`, and also while the victim is idle (a terminated idle
+    ends it with FATAL `57P01` and closes the socket -- both while the
+    victim is inside `pg_sleep`, and also while the victim is idle (a terminated idle
     session fails on its next statement). Both answer `true` for a known
     pid, `false` plus a `01000` WARNING for an unknown one, and NULL for
     NULL. PostgreSQL 16.
@@ -8341,13 +8340,18 @@ def test_pg_cancel_and_terminate_backend_signal_a_running_statement(home: Path) 
             time.sleep(delay)
             assert other.execute(f"select {fn}(%s)", (pid,)).fetchone() == (True,)
 
+        # What is asserted is that the signal INTERRUPTED the sleep: the
+        # sleep is far longer than any stall a shared CI runner shows, and
+        # the bound only separates "interrupted" from "ran to completion".
+        # A fixed sub-second bound (RP-016) measured the runner, not the
+        # server: it failed once at 1.06 s on a PR that never touched it.
         t = threading.Thread(target=signal, args=("pg_cancel_backend", 0.2))
         t0 = time.monotonic()
         t.start()
         with pytest.raises(psycopg.errors.QueryCanceled) as info:
-            conn.execute("select pg_sleep(5)")
+            conn.execute("select pg_sleep(30)")
         t.join()
-        assert time.monotonic() - t0 < 1.0
+        assert time.monotonic() - t0 < 15.0
         assert info.value.sqlstate == "57014"
         assert conn.info.transaction_status == TransactionStatus.IDLE
         assert conn.execute("select 1").fetchone() == (1,)
@@ -8370,9 +8374,9 @@ def test_pg_cancel_and_terminate_backend_signal_a_running_statement(home: Path) 
         t0 = time.monotonic()
         t.start()
         with pytest.raises(psycopg.errors.AdminShutdown) as info:
-            conn.execute("select pg_sleep(5)")
+            conn.execute("select pg_sleep(30)")
         t.join()
-        assert time.monotonic() - t0 < 1.0
+        assert time.monotonic() - t0 < 15.0
         assert info.value.sqlstate == "57P01"
         assert info.value.diag.severity == "FATAL"
         assert conn.closed

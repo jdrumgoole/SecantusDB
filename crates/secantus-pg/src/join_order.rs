@@ -1,15 +1,30 @@
-//! The join order PostgreSQL picks for four tables (RP-028).
+//! The join order PostgreSQL picks for four to eight tables (RP-028).
 //!
-//! `join_search` plans three tables; four are planned here by the same
-//! dynamic programming PostgreSQL runs (`standard_join_search`), for the
-//! subset whose search has one shape: a chain of four stored tables, each
-//! joined INNER or LEFT to one table before it on one column equality, no
-//! column in two clauses. A LEFT join constrains the orders as PostgreSQL's
-//! `join_is_legal` does, over its `SpecialJoinInfo` (`Search::outer`). The join graph is then a tree, every join relation the
-//! search builds holds connected tables, any two of them that can join do
-//! so on exactly one clause, and no relation's sorted output serves a join
-//! above it -- so each relation's cheapest path is the only one the next
-//! level reads.
+//! `join_search` plans three tables; four to eight are planned here by the
+//! same dynamic programming PostgreSQL runs (`standard_join_search`), for
+//! the subset whose search has one shape: a chain of stored tables, each
+//! joined INNER or LEFT to one table before it on one column equality. A
+//! LEFT join constrains the orders as PostgreSQL's `join_is_legal` does,
+//! over its `SpecialJoinInfo` (`Search::outer`). With no column in two
+//! clauses the join graph is a tree, every join relation the search builds
+//! holds connected tables, any two of them that can join do so on exactly
+//! one clause, and no relation's sorted output serves a join above it -- so
+//! each relation's cheapest path is the only one the next level reads.
+//!
+//! Eight is `join_collapse_limit`'s default: a longer chain of explicit
+//! JOINs is not flattened into one search, and is declined here.
+//!
+//! An INNER chain whose clauses share a column is one equivalence class
+//! over three or more tables (`Search::class`): its members in the order
+//! `process_equivalence` adds them (each ON's left column, then its right,
+//! as written), any two relations holding members joined on its derived
+//! clause, the first member each side
+//! (`generate_join_implied_equalities_normal`). A merge join on the class
+//! leaves its rows in the class's order, which a merge join above on it
+//! reads unsorted (`Rel::keyed`), and paths of one relation in two classes'
+//! orders are both kept (`JoinRel::add_paths_on`). Integer keys only, as in
+//! `join_search`: a derived clause is matched by its keys' values, and the
+//! ONs it stands in for are checked on every row at the end.
 //!
 //! `join_search_one_level` builds each level in PostgreSQL's order: every
 //! relation of the level below joined to each base table a clause
@@ -19,11 +34,11 @@
 //! it (`build_join_rel`), and every pair's paths go into its one
 //! `add_path` list (`joincost::JoinRel`), both sides outer in turn
 //! (`populate_joinrel_with_paths`). The rows are then built in the plan the
-//! four-table relation picks, each join by `join_search`'s `run_step`.
+//! relation of every table picks, each join by `join_search`'s `run_step`.
 
 use super::*;
 use crate::join_search::{alias_of, column_of, filter_fixes, joinrel_side, Input, Step};
-use secantus_pgplan::joincost::{JoinChoice, JoinRel, JoinSide};
+use secantus_pgplan::joincost::{JoinChoice, JoinMethod, JoinRel, JoinSide};
 use secantus_pgplan::joins::{JoinKind, JoinNode};
 
 /// One clause of the chain: the base tables it joins (by index), their
@@ -36,12 +51,30 @@ struct Edge {
     on: usize,
 }
 
+/// The one clause joining two relations: `a_key` of base table `a_table`
+/// in the first, `b_key` of `b_table` in the second, and the ON it is
+/// (`None` for the class's derived clause).
+#[derive(Clone)]
+struct Clause {
+    a_key: String,
+    a_table: usize,
+    b_key: String,
+    b_table: usize,
+    on: Option<usize>,
+    /// The class's derived clause rather than an edge.
+    class: bool,
+    /// The equivalence class it is in, for `JoinRel::add_paths_on`: 0 for
+    /// every clause when the chain has no class (as before there was
+    /// one), else 1 for the class and 2 + its index for an edge.
+    key_class: usize,
+}
+
 /// One way a join relation was built: its two input relations, `a` first,
 /// and the clause between them.
 struct Built {
     a: usize,
     b: usize,
-    edge: usize,
+    clause: Clause,
     /// A LEFT join, `a` its preserved side.
     left: bool,
 }
@@ -55,6 +88,8 @@ struct Rel {
     paths: JoinRel,
     built: Vec<Built>,
     best: Option<JoinChoice>,
+    /// Its cheapest path in the class's order (a merge join on it).
+    keyed: Option<JoinChoice>,
 }
 
 /// The search's tables, clauses and relations.
@@ -67,9 +102,15 @@ struct Search {
     /// with one below whose nullable side it reads (`make_outerjoininfo`
     /// adds nothing to its min_lefthand), and each is its two tables.
     outer: Vec<(u8, u8)>,
+    /// The equivalence class the clauses sharing a column make: its members
+    /// `(table, key)` in `ec_members` order. Its clauses are not `edges`.
+    class: Vec<(usize, String)>,
+    /// The ONs the class stands in for, checked on every row at the end.
+    class_ons: Vec<usize>,
 }
 
-/// A chain of four tables: its leaves, in FROM order, and its joins' ONs.
+/// A chain of four to eight tables: its leaves, in FROM order, and its
+/// joins' ONs.
 struct Chain<'a> {
     leaves: Vec<&'a JoinNode>,
     ons: Vec<Option<&'a secantus_pgplan::ColumnExpr>>,
@@ -117,24 +158,58 @@ impl Search {
         Some(matched)
     }
 
-    fn edge_between(&self, a: u8, b: u8) -> Option<usize> {
+    /// The one clause between relations `a` and `b`; `None` when there is
+    /// none, or more than one (which the search does not model).
+    fn clause_between(&self, a: u8, b: u8) -> Option<Clause> {
+        let classed = !self.class.is_empty();
         let mut found = None;
         for (i, e) in self.edges.iter().enumerate() {
             let (u, v) = (1u8 << e.u, 1u8 << e.v);
-            if (a & u != 0 && b & v != 0) || (a & v != 0 && b & u != 0) {
-                if found.is_some() {
-                    return None;
-                }
-                found = Some(i);
+            let clause = if a & u != 0 && b & v != 0 {
+                (e.u_key.clone(), e.u, e.v_key.clone(), e.v)
+            } else if a & v != 0 && b & u != 0 {
+                (e.v_key.clone(), e.v, e.u_key.clone(), e.u)
+            } else {
+                continue;
+            };
+            if found.is_some() {
+                return None;
             }
+            let (a_key, a_table, b_key, b_table) = clause;
+            found = Some(Clause {
+                a_key,
+                a_table,
+                b_key,
+                b_table,
+                on: Some(e.on),
+                class: false,
+                key_class: if classed { 2 + i } else { 0 },
+            });
+        }
+        // The class: its first member each side.
+        let first = |set: u8| self.class.iter().find(|(t, _)| set & (1 << t) != 0);
+        if let (Some((at, ak)), Some((bt, bk))) = (first(a), first(b)) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(Clause {
+                a_key: ak.clone(),
+                a_table: *at,
+                b_key: bk.clone(),
+                b_table: *bt,
+                on: None,
+                class: true,
+                key_class: 1,
+            });
         }
         found
     }
 }
 
 impl PgHandler {
-    /// `node` as a chain of four stored tables joined INNER or LEFT, each on
-    /// one column equality to a table before it, no column in two clauses.
+    /// `node` as a chain of four to eight stored tables joined INNER or
+    /// LEFT, each on one column equality to a table before it; the
+    /// clauses sharing a column make at most one equivalence class.
     fn four_table_chain<'a>(&self, node: &'a JoinNode) -> Option<(Chain<'a>, Search)> {
         let mut joins = Vec::new();
         let mut cur = node;
@@ -143,13 +218,15 @@ impl PgHandler {
             cur = left;
         }
         joins.reverse();
-        if joins.len() != 3 {
+        // Four tables to `join_collapse_limit`'s eight.
+        if !(3..=7).contains(&joins.len()) {
             return None;
         }
         let mut leaves = vec![cur];
         let mut ons = Vec::new();
         let mut tables = Vec::new();
         let mut edges = Vec::new();
+        let mut reversed = Vec::new();
         let mut kinds = Vec::new();
         let leaf_alias = |n: &JoinNode| match n {
             JoinNode::Leaf { columns, .. } => columns.first().map(|(k, _)| alias_of(k).to_string()),
@@ -161,6 +238,7 @@ impl PgHandler {
                 right,
                 on,
                 equi,
+                equi_reversed,
                 merged,
                 expr_keys,
                 ec,
@@ -202,6 +280,7 @@ impl PgHandler {
                 v_key: rk.clone(),
                 on: i,
             });
+            reversed.push(equi_reversed.first().copied().unwrap_or(false));
             kinds.push(*kind);
         }
         // `reduce_outer_joins`, top down: an inner join's strict clause
@@ -223,11 +302,9 @@ impl PgHandler {
             .filter(|(_, k)| **k == JoinKind::Left)
             .map(|(e, _)| (1u8 << e.u, 1u8 << e.v))
             .collect();
-        // No column in two clauses: an equivalence class of three or more,
-        // whose derived clauses this search does not weigh.
-        let mut keys: Vec<&String> = edges.iter().flat_map(|e| [&e.u_key, &e.v_key]).collect();
-        keys.sort();
-        if keys.windows(2).any(|w| w[0] == w[1]) {
+        // A column in two clauses: the equivalence class they make.
+        let (class, class_ons) = Self::chain_class(&mut edges, &reversed)?;
+        if !class.is_empty() && kinds.iter().any(|k| *k != JoinKind::Inner) {
             return None;
         }
         for leaf in &leaves {
@@ -237,17 +314,31 @@ impl PgHandler {
             }
             let def = self.lookup(&table)?;
             let alias = leaf_alias(leaf)?;
-            for e in &edges {
-                for key in [&e.u_key, &e.v_key] {
-                    if alias_of(key) == alias {
-                        let field = def.field_of(column_of(key)?)?;
-                        if filter_fixes(&filter, &field) {
-                            return None;
-                        }
+            let keys = edges
+                .iter()
+                .flat_map(|e| [&e.u_key, &e.v_key])
+                .chain(class.iter().map(|(_, k)| k));
+            for key in keys {
+                if alias_of(key) == alias {
+                    let field = def.field_of(column_of(key)?)?;
+                    if filter_fixes(&filter, &field) {
+                        return None;
                     }
                 }
             }
             tables.push((table, filter));
+        }
+        // The class's derived clauses are matched by value: integers of
+        // one type only.
+        if !class.is_empty() {
+            let types: Vec<Option<String>> = class
+                .iter()
+                .map(|(t, k)| leaf_key_type(leaves[*t], k))
+                .collect();
+            let int = |t: &Option<String>| matches!(t.as_deref(), Some("int2" | "int4" | "int8"));
+            if !types.iter().all(int) || types.windows(2).any(|t| t[0] != t[1]) {
+                return None;
+            }
         }
         Some((
             Chain { leaves, ons },
@@ -256,8 +347,85 @@ impl PgHandler {
                 edges,
                 rels: Vec::new(),
                 outer,
+                class,
+                class_ons,
             },
         ))
+    }
+
+    /// `process_equivalence` over the chain's clauses, in ON order: each
+    /// clause's written left column, then its right, joins the class of
+    /// either, two classes merging the second's members after the first's.
+    /// A class of three or more members is returned with the ONs it
+    /// absorbed, and those edges are taken out of `edges`; empty when no
+    /// column is in two clauses. `None` for two such classes, or a class
+    /// with two members in one table.
+    #[allow(clippy::type_complexity)]
+    fn chain_class(
+        edges: &mut Vec<Edge>,
+        reversed: &[bool],
+    ) -> Option<(Vec<(usize, String)>, Vec<usize>)> {
+        let mut classes: Vec<Vec<(usize, String)>> = Vec::new();
+        let mut class_of_edge = Vec::new();
+        for (e, rev) in edges.iter().zip(reversed) {
+            let (l, r) = ((e.u, e.u_key.clone()), (e.v, e.v_key.clone()));
+            let (item1, item2) = if *rev { (r, l) } else { (l, r) };
+            let find = |c: &Vec<Vec<(usize, String)>>, m: &(usize, String)| {
+                c.iter().position(|members| members.contains(m))
+            };
+            let at = match (find(&classes, &item1), find(&classes, &item2)) {
+                (Some(i), Some(j)) if i == j => i,
+                (Some(i), Some(j)) => {
+                    let moved = classes.remove(j);
+                    let i = if j < i { i - 1 } else { i };
+                    for c in class_of_edge.iter_mut() {
+                        if *c == j {
+                            *c = i;
+                        } else if *c > j {
+                            *c -= 1;
+                        }
+                    }
+                    classes[i].extend(moved);
+                    i
+                }
+                (Some(i), None) => {
+                    classes[i].push(item2);
+                    i
+                }
+                (None, Some(j)) => {
+                    classes[j].push(item1);
+                    j
+                }
+                (None, None) => {
+                    classes.push(vec![item1, item2]);
+                    classes.len() - 1
+                }
+            };
+            class_of_edge.push(at);
+        }
+        let big: Vec<usize> = (0..classes.len())
+            .filter(|&i| classes[i].len() > 2)
+            .collect();
+        let [class_at] = big.as_slice() else {
+            return big.is_empty().then(|| (Vec::new(), Vec::new()));
+        };
+        let class = classes[*class_at].clone();
+        let mut tables: Vec<usize> = class.iter().map(|(t, _)| *t).collect();
+        tables.sort_unstable();
+        if tables.windows(2).any(|w| w[0] == w[1]) {
+            return None;
+        }
+        let mut class_ons = Vec::new();
+        let mut kept = Vec::new();
+        for (e, c) in std::mem::take(edges).into_iter().zip(class_of_edge) {
+            if c == *class_at {
+                class_ons.push(e.on);
+            } else {
+                kept.push(e);
+            }
+        }
+        *edges = kept;
+        Some((class, class_ons))
     }
 
     /// The side of a join a relation is, joined on `key` of base table
@@ -268,6 +436,7 @@ impl PgHandler {
         rel: usize,
         key: &str,
         key_table: usize,
+        class: bool,
     ) -> Option<JoinSide> {
         let (table, filter) = &search.tables[key_table];
         let base = self.join_side(table, JoinKey::Column(column_of(key)?), filter, 0)?;
@@ -275,7 +444,9 @@ impl PgHandler {
         if r.set.count_ones() == 1 {
             return Some(base);
         }
-        Some(joinrel_side(r.rows, r.best.as_ref()?, None, &base))
+        // Joined on the class, a relation merged on it is in its order.
+        let keyed = r.keyed.as_ref().filter(|_| class);
+        Some(joinrel_side(r.rows, r.best.as_ref()?, keyed, &base))
     }
 
     /// `make_join_rel`: the relation of `a` and `b`'s tables, built (or
@@ -291,15 +462,9 @@ impl PgHandler {
         let (a, b) = if outer == Some(true) { (b, a) } else { (a, b) };
         let left = outer.is_some();
         let (sa, sb) = (search.rels[a].set, search.rels[b].set);
-        let edge = search.edge_between(sa, sb)?;
-        let e = &search.edges[edge];
-        let ((a_key, a_table), (b_key, b_table)) = if sa & (1 << e.u) != 0 {
-            ((e.u_key.clone(), e.u), (e.v_key.clone(), e.v))
-        } else {
-            ((e.v_key.clone(), e.v), (e.u_key.clone(), e.u))
-        };
-        let side_a = self.search_side(search, a, &a_key, a_table)?;
-        let side_b = self.search_side(search, b, &b_key, b_table)?;
+        let clause = search.clause_between(sa, sb)?;
+        let side_a = self.search_side(search, a, &clause.a_key, clause.a_table, clause.class)?;
+        let side_b = self.search_side(search, b, &clause.b_key, clause.b_table, clause.class)?;
         let set = sa | sb;
         let idx = match search.rels.iter().position(|r| r.set == set) {
             Some(i) => i,
@@ -310,19 +475,22 @@ impl PgHandler {
                     paths: JoinRel::new(false),
                     built: Vec::new(),
                     best: None,
+                    keyed: None,
                 });
                 search.rels.len() - 1
             }
         };
         let rel = &mut search.rels[idx];
         let combo = rel.built.len();
-        rel.built.push(Built { a, b, edge, left });
-        rel.paths.add_paths(combo, &side_a, &side_b, left, true);
+        let key_class = clause.key_class;
+        rel.built.push(Built { a, b, clause, left });
+        rel.paths
+            .add_paths_on(combo, key_class, &side_a, &side_b, left, true);
         Some(())
     }
 
-    /// `standard_join_search` over the chain's four tables; the index of the
-    /// four-table relation.
+    /// `standard_join_search` over the chain's tables; the index of the
+    /// relation of all of them.
     fn search_four(&self, search: &mut Search) -> Option<usize> {
         let n = search.tables.len();
         for i in 0..n {
@@ -332,12 +500,13 @@ impl PgHandler {
                 paths: JoinRel::new(false),
                 built: Vec::new(),
                 best: None,
+                keyed: None,
             });
         }
         let mut levels: Vec<Vec<usize>> = vec![Vec::new(), (0..n).collect()];
         let connected = |s: &Search, a: usize, b: usize| {
             let (sa, sb) = (s.rels[a].set, s.rels[b].set);
-            sa & sb == 0 && s.edge_between(sa, sb).is_some()
+            sa & sb == 0 && s.clause_between(sa, sb).is_some()
         };
         for level in 2..=n {
             let before = search.rels.len();
@@ -370,21 +539,28 @@ impl PgHandler {
                 }
             }
             let built: Vec<usize> = (before..search.rels.len()).collect();
+            let classed = !search.class.is_empty();
             for &i in &built {
                 let rel = &mut search.rels[i];
                 rel.best = Some(rel.paths.cheapest(None, rel.rows)?);
+                if classed {
+                    rel.keyed = rel.paths.cheapest_keyed_on(1);
+                }
             }
             levels.push(built);
         }
         levels[n].first().copied()
     }
 
-    /// The rows of relation `rel` in the plan its cheapest path is.
+    /// The rows of relation `rel` in the plan its cheapest path is, or its
+    /// cheapest path in the class's order (`keyed`: a merge join above
+    /// reads it unsorted).
     fn run_searched(
         &self,
         search: &Search,
         chain: &Chain<'_>,
         rel: usize,
+        keyed: bool,
     ) -> PgWireResult<Option<Input>> {
         let r = &search.rels[rel];
         if r.set.count_ones() == 1 {
@@ -394,20 +570,38 @@ impl PgHandler {
                 keys: secantus_pgplan::joins::node_keys(leaf),
             }));
         }
-        let Some(best) = r.best.as_ref() else {
+        let choice = if keyed {
+            r.keyed.as_ref()
+        } else {
+            r.best.as_ref()
+        };
+        let Some(best) = choice else {
             return Ok(None);
         };
         let built = &r.built[best.combo];
-        let e = &search.edges[built.edge];
+        let clause = &built.clause;
         let sa = search.rels[built.a].set;
-        let (a_key, a_table, b_key) = if sa & (1 << e.u) != 0 {
-            (e.u_key.clone(), e.u, e.v_key.clone())
-        } else {
-            (e.v_key.clone(), e.v, e.u_key.clone())
+        let (a_key, a_table, b_key) = (clause.a_key.clone(), clause.a_table, clause.b_key.clone());
+        // A merge join reads a side "by index" when it is in the key's
+        // order already: for a join relation, its path in the class's.
+        let (a_sorted, b_sorted) = match best.method {
+            JoinMethod::MergeOuterA {
+                a_by_index,
+                b_by_index,
+            }
+            | JoinMethod::MergeOuterB {
+                a_by_index,
+                b_by_index,
+            }
+            | JoinMethod::MergeRightB {
+                a_by_index,
+                b_by_index,
+            } => (a_by_index, b_by_index),
+            _ => (false, false),
         };
         let (Some(a), Some(b)) = (
-            self.run_searched(search, chain, built.a)?,
-            self.run_searched(search, chain, built.b)?,
+            self.run_searched(search, chain, built.a, clause.class && a_sorted)?,
+            self.run_searched(search, chain, built.b, clause.class && b_sorted)?,
         ) else {
             return Ok(None);
         };
@@ -432,10 +626,12 @@ impl PgHandler {
             .leaves
             .iter()
             .find_map(|n| leaf_key_type(n, &step.a_key));
-        self.run_step(&step, a, b, a_type, chain.ons[e.on])
+        let on = clause.on.and_then(|i| chain.ons[i]);
+        self.run_step(&step, a, b, a_type, on)
     }
 
-    /// Whether `node` is a chain of four tables whose join order is searched.
+    /// Whether `node` is a chain of four to eight tables whose join order is
+    /// searched.
     pub(crate) fn four_table_plan_applies(&self, node: &JoinNode) -> bool {
         if crate::join_search::where_spans() || LOCK_ROW_IDS.with(|c| c.get()) {
             return false;
@@ -447,7 +643,7 @@ impl PgHandler {
     }
 
     /// `node`'s rows in the plan PostgreSQL's join order search picks for
-    /// four tables, or `None` for any other join.
+    /// four to eight tables, or `None` for any other join.
     pub(crate) fn four_table_join(
         &self,
         node: &JoinNode,
@@ -462,6 +658,26 @@ impl PgHandler {
         let Some(top) = self.search_four(&mut search) else {
             return Ok(None);
         };
-        Ok(self.run_searched(&search, &chain, top)?.map(|i| i.rows))
+        let Some(joined) = self.run_searched(&search, &chain, top, false)? else {
+            return Ok(None);
+        };
+        // The ONs the class's derived clauses stood in for decide every row.
+        let mut rows = joined.rows;
+        for &i in &search.class_ons {
+            if let Some(expr) = chain.ons[i] {
+                let mut kept = Vec::with_capacity(rows.len());
+                for d in rows {
+                    let keep = matches!(
+                        secantus_pgplan::apply_row_expr(expr, &d).map_err(|e| Self::err(&e))?,
+                        Bson::Boolean(true)
+                    );
+                    if keep {
+                        kept.push(d);
+                    }
+                }
+                rows = kept;
+            }
+        }
+        Ok(Some(rows))
     }
 }

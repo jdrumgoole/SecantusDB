@@ -1844,13 +1844,13 @@ def test_four_table_left_join_chain_joins_in_the_searched_order(pg: Any) -> None
     assert " ".join(f"{a}:{b}:{c}:{d}" for a, b, c, d in got[1][:6]) == want
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_four_tables_with_a_shared_key_join_on_its_class(pg: Any) -> None:
     """PostgreSQL 15.19: `l JOIN r ON l.b = r.c JOIN m ON r.a = m.a JOIN k
     ON m.a = k.a` puts r.a, m.a and k.a in one equivalence class, so r, m
     and k hash join first (k probing r-m) and that, sorted by r.c, merges
-    with l (7:5:5:5 14:5:5:5 7:20:20:20 ...); here four tables whose
-    clauses share a key keep the join as written."""
+    with l (7:5:5:5 14:5:5:5 7:20:20:20 ...). Fixed 2026-10-19: the
+    four-table search plans the class's derived clauses."""
     pg.execute("begin")
     try:
         pg.execute("create table rp028_jl (a int primary key, b int)")
@@ -1873,6 +1873,38 @@ def test_four_tables_with_a_shared_key_join_on_its_class(pg: Any) -> None:
     want = "7:5:5:5 14:5:5:5 7:20:20:20 14:20:20:20 7:15:15:15 14:15:15:15"
     assert got[0] == "ok"
     assert " ".join(f"{a}:{b}:{c}:{d}" for a, b, c, d in got[1][:6]) == want
+
+
+@pytest.mark.backlog("RP-028")
+def test_five_tables_read_a_classes_sorted_join_under_a_sorted_outer(pg: Any) -> None:
+    """PostgreSQL 15.19: five tables, `k1.a`, `k2.a` and `k3.a` one
+    equivalence class, no primary keys, 20 rows each. The top join merges
+    k0-k1, explicitly sorted by k1.a, with k2-k3-k4 READ PRESORTED in the
+    class's order (`Materialize` over its merge on k2.a = k3.a), although
+    that path ties another of k2-k3-k4's as its cheapest. Here the search
+    takes the mirror image, k3-k4 sorted under k0-k1-k2, at the same cost,
+    and the rows tied on the class come out the other way round."""
+    pg.execute("begin")
+    try:
+        mods = [(7, 5), (5, 3), (3, 4), (4, 7), (6, 5)]
+        for t, (mb, mc) in enumerate(mods):
+            pg.execute(f"create table rp028_k{t} (a int, b int, c int)")
+            pg.execute(
+                f"insert into rp028_k{t} select i, i % {mb}, i % {mc} from generate_series(1, 20) i"
+            )
+        got = pg_answer(
+            pg,
+            "select rp028_k0.a, rp028_k1.a, rp028_k2.a, rp028_k3.a, rp028_k4.a"
+            " from rp028_k0 join rp028_k1 on rp028_k0.b = rp028_k1.c"
+            " join rp028_k2 on rp028_k1.a = rp028_k2.a"
+            " join rp028_k3 on rp028_k2.a = rp028_k3.a"
+            " join rp028_k4 on rp028_k3.b = rp028_k4.c",
+        )
+    finally:
+        pg.execute("rollback")
+    want = "15:1:1:1:11 15:1:1:1:16 15:1:1:1:1 15:1:1:1:6 8:1:1:1:11 8:1:1:1:16"
+    assert got[0] == "ok"
+    assert " ".join(":".join(str(v) for v in r) for r in got[1][:6]) == want
 
 
 # RP-047: the lock manager. Each test needs two sessions on one server, so

@@ -3543,6 +3543,11 @@ pub struct PgHandler {
     /// A statement of the open transaction changed the catalog: its commit
     /// bumps the catalog version again (see `commit_implicit`).
     catalog_changed_in_txn: AtomicBool,
+    /// How many catalog-changing statements are running on this session
+    /// (nested ones count): their writes are committed before the catalog
+    /// version moves (`bump_catalog_version` follows the statement), so
+    /// while one runs the shared committed copies are stale for it.
+    catalog_statements: std::sync::atomic::AtomicUsize,
     /// This connection's open transaction wrote a role: its role reads see
     /// that transaction's own view, not the shared committed cache.
     roles_written_in_txn: AtomicBool,
@@ -3914,6 +3919,7 @@ impl PgHandler {
             pending_listens: Mutex::new(Vec::new()),
             touched_temp: AtomicBool::new(false),
             catalog_changed_in_txn: AtomicBool::new(false),
+            catalog_statements: std::sync::atomic::AtomicUsize::new(0),
             roles_written_in_txn: AtomicBool::new(false),
             nested_statements: std::sync::atomic::AtomicUsize::new(0),
             batch_partial: Mutex::new(Vec::new()),
@@ -7747,7 +7753,7 @@ impl PgHandler {
                 right_keys,
                 ..
             } => {
-                // Three or four tables: PostgreSQL's join order search.
+                // Three to eight tables: PostgreSQL's join order search.
                 if let Some(rows) = self.three_table_join(node, limit)? {
                     return Ok(rows);
                 }
@@ -8955,11 +8961,37 @@ impl PgHandler {
     /// the session had ever created -- each one leaves a row type here --
     /// until a plain `select 1` ran twice as slowly on a used store.
     fn type_catalog_docs(&self, collection: &'static str) -> PgWireResult<Arc<Vec<Document>>> {
-        let mut docs = self.type_catalog_docs_raw(collection)?;
+        let docs = self.type_catalog_docs_raw(collection)?;
+        if collection != Self::FUNCTION_COLLECTION {
+            return Ok(docs);
+        }
+        type Memo = (Arc<Vec<Document>>, String, Arc<Vec<Document>>);
+        thread_local! {
+            /// The function catalog as this session reads it, for the raw
+            /// documents it was made from: filtering and normalising every
+            /// function on every call made each statement's cost grow with
+            /// the number of functions (RP-014: an INSERT 14x slower with
+            /// 125 of them). Holding the raw documents keeps their address
+            /// unique while the memo stands.
+            static MEMO: std::cell::RefCell<Option<Memo>> = const { std::cell::RefCell::new(None) };
+        }
+        let temp = self.temp_schema_name();
+        if let Some(hit) = MEMO.with(|m| {
+            m.borrow().as_ref().and_then(|(raw, t, out)| {
+                (Arc::ptr_eq(raw, &docs) && *t == temp).then(|| Arc::clone(out))
+            })
+        }) {
+            return Ok(hit);
+        }
+        let out = self.function_docs_for_session(Arc::clone(&docs));
+        MEMO.with(|m| *m.borrow_mut() = Some((docs, temp, Arc::clone(&out))));
+        Ok(out)
+    }
+
+    /// The function catalog `docs` as this session reads it.
+    fn function_docs_for_session(&self, mut docs: Arc<Vec<Document>>) -> Arc<Vec<Document>> {
         // Another session's `pg_temp` function is invisible here.
-        if collection == Self::FUNCTION_COLLECTION
-            && docs.iter().any(|d| Self::foreign_temp_function(d, self))
-        {
+        if docs.iter().any(|d| Self::foreign_temp_function(d, self)) {
             docs = Arc::new(
                 docs.iter()
                     .filter(|d| !Self::foreign_temp_function(d, self))
@@ -8970,12 +9002,10 @@ impl PgHandler {
         // Functions are stored in the Python server's shape -- every
         // parameter positionally, with `param_modes` -- and read here as
         // inputs (`params` / `param_types`) plus OUT columns.
-        if collection == Self::FUNCTION_COLLECTION
-            && docs.iter().any(|d| d.contains_key("param_modes"))
-        {
-            return Ok(Arc::new(docs.iter().map(normalize_function_doc).collect()));
+        if docs.iter().any(|d| d.contains_key("param_modes")) {
+            return Arc::new(docs.iter().map(normalize_function_doc).collect());
         }
-        Ok(docs)
+        docs
     }
 
     /// Is `d` a function in ANOTHER session's temp schema?
@@ -8987,11 +9017,27 @@ impl PgHandler {
     /// Does the function catalog hold any session's `pg_temp` function?
     /// While one does, what a session sees of the catalog is its own.
     fn any_temp_function(&self) -> bool {
-        self.type_catalog_docs_raw(Self::FUNCTION_COLLECTION)
-            .is_ok_and(|docs| {
-                docs.iter()
-                    .any(|d| d.get_str("schema").is_ok_and(|s| s.starts_with("pg_temp_")))
-            })
+        thread_local! {
+            /// The answer, for the documents it was read from: every
+            /// statement asks (RP-014).
+            static MEMO: std::cell::RefCell<Option<(Arc<Vec<Document>>, bool)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let Ok(docs) = self.type_catalog_docs_raw(Self::FUNCTION_COLLECTION) else {
+            return false;
+        };
+        if let Some(hit) = MEMO.with(|m| {
+            m.borrow()
+                .as_ref()
+                .and_then(|(d, has)| Arc::ptr_eq(d, &docs).then_some(*has))
+        }) {
+            return hit;
+        }
+        let has = docs
+            .iter()
+            .any(|d| d.get_str("schema").is_ok_and(|s| s.starts_with("pg_temp_")));
+        MEMO.with(|m| *m.borrow_mut() = Some((docs, has)));
+        has
     }
 
     /// Drop this session's `pg_temp` functions, as PostgreSQL does when the
@@ -9284,26 +9330,69 @@ impl PgHandler {
     /// it is what `'t'::regclass::oid` and the RowDescription's `ftable`
     /// report. A table created before row types were recorded has none.
     fn relation_oid(&self, name: &str) -> Option<i64> {
-        self.type_catalog_docs(Self::COMPOSITE_COLLECTION)
-            .ok()?
-            .iter()
-            .find(|d| {
-                d.get_str("_id").unwrap_or_default() == name
-                    && d.get_bool("relation").unwrap_or(false)
+        type Memo = (
+            Arc<Vec<Document>>,
+            Arc<Vec<Document>>,
+            Arc<HashMap<String, i64>>,
+        );
+        thread_local! {
+            /// Every relation's oid, by name, for the catalog documents it
+            /// was built from: callers ask once per relation, and a scan
+            /// per call (a view's falling through to every view) made a
+            /// new connection's first statement quadratic in the catalog
+            /// (RP-014). Holding the documents keeps their addresses
+            /// unique while the memo stands.
+            static MEMO: std::cell::RefCell<Option<Memo>> = const { std::cell::RefCell::new(None) };
+        }
+        let comps = self.type_catalog_docs(Self::COMPOSITE_COLLECTION).ok()?;
+        let views = self.type_catalog_docs(Self::VIEW_COLLECTION).ok()?;
+        let cached = MEMO.with(|m| {
+            m.borrow().as_ref().and_then(|(c, v, map)| {
+                (Arc::ptr_eq(c, &comps) && Arc::ptr_eq(v, &views)).then(|| Arc::clone(map))
             })
-            .and_then(|d| {
-                d.get_i64("oid")
-                    .or_else(|_| d.get_i32("oid").map(i64::from))
-                    .ok()
-            })
-            // A view has no stored row type; its oid is derived.
-            .or_else(|| {
-                self.views()
-                    .ok()?
-                    .iter()
-                    .any(|(n, _)| n == name)
-                    .then(|| Self::view_oid(name))
-            })
+        });
+        let map = match cached {
+            Some(map) => map,
+            None => {
+                let mut map: HashMap<String, i64> = HashMap::new();
+                for d in comps.iter() {
+                    if !d.get_bool("relation").unwrap_or(false) {
+                        continue;
+                    }
+                    let Ok(id) = d.get_str("_id") else {
+                        continue;
+                    };
+                    let oid = d
+                        .get_i64("oid")
+                        .or_else(|_| d.get_i32("oid").map(i64::from))
+                        .ok();
+                    // The first document of a name decides, found or not.
+                    if !map.contains_key(id) {
+                        if let Some(oid) = oid {
+                            map.insert(id.to_string(), oid);
+                        } else {
+                            map.insert(id.to_string(), i64::MIN);
+                        }
+                    }
+                }
+                // A view has no stored row type; its oid is derived.
+                for d in views.iter() {
+                    let Ok(n) = d.get_str("view").or_else(|_| d.get_str("_id")) else {
+                        continue;
+                    };
+                    if d.get_str("definition").is_ok() {
+                        let entry = map.entry(n.to_string()).or_insert(i64::MIN);
+                        if *entry == i64::MIN {
+                            *entry = Self::view_oid(n);
+                        }
+                    }
+                }
+                let map = Arc::new(map);
+                MEMO.with(|m| *m.borrow_mut() = Some((comps, views, Arc::clone(&map))));
+                map
+            }
+        };
+        map.get(name).copied().filter(|oid| *oid != i64::MIN)
     }
 
     /// Every table with a relation oid, as `(stored name, oid, temp)`, for
@@ -11778,7 +11867,7 @@ impl PgHandler {
         let role = self.current_role_name();
         self.check_schema_create(&role, sql)?;
         self.check_builtin_execute(&role, sql)?;
-        let views = self.views()?;
+        let views = self.views_shared()?;
         // A superuser needs no check of its own -- but what a view reads is
         // checked as the view's OWNER even then, so views still expand.
         if self.is_superuser(&role) && views.is_empty() {
@@ -11835,22 +11924,20 @@ impl PgHandler {
         else {
             return Vec::new();
         };
-        let by_name: Vec<(String, String)> = rows
-            .iter()
-            .filter_map(|r| {
-                Some((
-                    r.get_str(&name_f).ok()?.to_string(),
-                    r.get_str(&def_f).ok()?.to_string(),
-                ))
-            })
-            .collect();
+        // By name, the first row of a name deciding: a scan of the rows per
+        // index was quadratic in the indexes, on every new connection.
+        let mut by_name: HashMap<&str, &str> = HashMap::new();
+        for r in &rows {
+            if let (Ok(n), Ok(d)) = (r.get_str(&name_f), r.get_str(&def_f)) {
+                by_name.entry(n).or_insert(d);
+            }
+        }
         self.index_relations()
             .into_iter()
             .filter_map(|ix| {
                 by_name
-                    .iter()
-                    .find(|(n, _)| *n == ix.name)
-                    .map(|(_, d)| (ix.oid, d.clone()))
+                    .get(ix.name.as_str())
+                    .map(|d| (ix.oid, d.to_string()))
             })
             .chain(
                 catalog_meta::system_indexes()
@@ -11904,8 +11991,27 @@ impl PgHandler {
     }
 
     fn views(&self) -> PgWireResult<Vec<(String, String)>> {
-        let mut out: Vec<(String, String)> = self
-            .type_catalog_docs(Self::VIEW_COLLECTION)?
+        Ok(self.views_shared()?.as_ref().clone())
+    }
+
+    /// `views`, shared: built once for the catalog documents it reads. The
+    /// privilege check asks on every statement, and sorting a copy of every
+    /// view's definition each time grew each statement's cost with the
+    /// number of views (RP-014).
+    fn views_shared(&self) -> PgWireResult<Arc<Vec<(String, String)>>> {
+        type Memo = (Arc<Vec<Document>>, Arc<Vec<(String, String)>>);
+        thread_local! {
+            static MEMO: std::cell::RefCell<Option<Memo>> = const { std::cell::RefCell::new(None) };
+        }
+        let docs = self.type_catalog_docs(Self::VIEW_COLLECTION)?;
+        if let Some(hit) = MEMO.with(|m| {
+            m.borrow()
+                .as_ref()
+                .and_then(|(d, out)| Arc::ptr_eq(d, &docs).then(|| Arc::clone(out)))
+        }) {
+            return Ok(hit);
+        }
+        let mut out: Vec<(String, String)> = docs
             .iter()
             .filter_map(|d| {
                 let name = d
@@ -11918,6 +12024,8 @@ impl PgHandler {
             })
             .collect();
         out.sort();
+        let out = Arc::new(out);
+        MEMO.with(|m| *m.borrow_mut() = Some((docs, Arc::clone(&out))));
         Ok(out)
     }
 
@@ -27403,17 +27511,67 @@ impl PgHandler {
     /// name appears in it (a false "yes" costs only the planning-time
     /// isolation decision).
     fn may_call_user_function(&self, sql: &str) -> bool {
-        let Ok(docs) = self.user_function_docs() else {
+        /// The user functions' names, lowercased: those that are plain
+        /// identifiers, looked up per identifier of the statement, and any
+        /// other, searched for in its text.
+        struct Names {
+            idents: std::collections::HashSet<String>,
+            others: Vec<String>,
+        }
+        fn ident_byte(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+        }
+        type Memo = (Arc<Vec<Document>>, Arc<Names>);
+        thread_local! {
+            /// For the catalog documents they were read from: every
+            /// statement asks, and reading, lowercasing and searching for
+            /// each name each time grew its cost with the number of
+            /// functions (RP-014).
+            static MEMO: std::cell::RefCell<Option<Memo>> = const { std::cell::RefCell::new(None) };
+        }
+        let Ok(docs) = self.type_catalog_docs(Self::FUNCTION_COLLECTION) else {
             return false;
         };
-        if docs.is_empty() {
+        let names = MEMO.with(|m| {
+            m.borrow()
+                .as_ref()
+                .and_then(|(d, names)| Arc::ptr_eq(d, &docs).then(|| Arc::clone(names)))
+        });
+        let names = names.unwrap_or_else(|| {
+            let mut names = Names {
+                idents: std::collections::HashSet::new(),
+                others: Vec::new(),
+            };
+            // `user_function_docs`' functions.
+            for d in docs.iter().filter(|d| {
+                matches!(d.get_str("language"), Ok("sql" | "plpgsql"))
+                    || d.get_str("call_sql").is_ok()
+            }) {
+                let Ok(name) = d.get_str("name") else {
+                    continue;
+                };
+                let name = name.to_ascii_lowercase();
+                if !name.is_empty() && name.bytes().all(ident_byte) {
+                    names.idents.insert(name);
+                } else {
+                    names.others.push(name);
+                }
+            }
+            let names = Arc::new(names);
+            MEMO.with(|m| *m.borrow_mut() = Some((Arc::clone(&docs), Arc::clone(&names))));
+            names
+        });
+        if names.idents.is_empty() && names.others.is_empty() {
             return false;
         }
         let text = sql.to_ascii_lowercase();
-        docs.iter().any(|d| {
-            d.get_str("name")
-                .is_ok_and(|n| text.contains(&n.to_ascii_lowercase()))
-        })
+        // A call names its function as a whole identifier, never inside a
+        // longer one.
+        !names.idents.is_empty()
+            && text
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || !c.is_ascii()))
+                .any(|word| names.idents.contains(word))
+            || names.others.iter().any(|n| text.contains(n.as_str()))
     }
 
     /// Roll back a planning transaction nothing took (the statement failed,
@@ -30783,7 +30941,22 @@ impl PgHandler {
             } => Some(table.clone()),
             _ => None,
         };
-        let mut out = self.with_event_triggers(stmt, |stmt| self.execute_inner(stmt, max_rows));
+        let mut out = {
+            struct Running<'a>(Option<&'a std::sync::atomic::AtomicUsize>);
+            impl Drop for Running<'_> {
+                fn drop(&mut self) {
+                    if let Some(n) = self.0 {
+                        n.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+            let _running = Running(may_change_catalog.then(|| {
+                self.catalog_statements
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                &self.catalog_statements
+            }));
+            self.with_event_triggers(stmt, |stmt| self.execute_inner(stmt, max_rows))
+        };
         if let (Some(table), Ok(_)) = (&written, &out) {
             if let Err(e) = self.check_deferrable_uniques(table) {
                 out = Err(e);
@@ -36349,6 +36522,26 @@ impl PgHandler {
     /// Every user table this session can see: the committed catalog with
     /// what this transaction created or dropped overlaid on it.
     fn all_table_defs(&self) -> PgWireResult<Vec<TableDef>> {
+        // Outside a transaction block, with no catalog change of this
+        // session's pending, the read below sees the latest committed
+        // catalog, which `committed_table_defs` keeps decoded once per
+        // catalog version for every thread. A new connection's first
+        // statement asks about ten times (`publish_user_types`, the
+        // namespaces, the relations, the comments...), and each read and
+        // decode of the whole catalog made that statement's cost grow with
+        // the catalog: 620 ms at 250 tables in a debug build (RP-014).
+        // Not while a catalog-changing statement runs: what it wrote is
+        // committed but the version has not moved yet.
+        if !self.storage.in_user_txn()
+            && self
+                .catalog_statements
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
+        {
+            if let Some(defs) = self.committed_table_defs() {
+                return Ok(defs.as_ref().clone());
+            }
+        }
         let raw = self
             .storage
             .find_matching(self.db(), CATALOG_COLLECTION, &Document::new())

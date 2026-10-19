@@ -1,5 +1,4 @@
-use std::fs::File;
-use std::io::{BufReader, Error as IOError};
+use std::io::{Error as IOError, ErrorKind};
 use std::sync::Arc;
 
 use pgwire::api::client::ClientInfo;
@@ -7,14 +6,17 @@ use pgwire::api::client::auth::DefaultStartupHandler;
 use pgwire::api::client::query::DefaultSimpleQueryHandler;
 use pgwire::tokio::client::PgWireClient;
 use rustls_pki_types::CertificateDer;
+use rustls_pki_types::pem::PemObject;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
 fn setup_tls() -> Result<Arc<ClientConfig>, IOError> {
     let mut roots = RootCertStore::empty();
 
-    let cert = rustls_pemfile::certs(&mut BufReader::new(File::open("examples/ssl/server.crt")?))
-        .collect::<Result<Vec<CertificateDer>, _>>()?;
+    let cert = CertificateDer::pem_file_iter("examples/ssl/server.crt")
+        .map_err(|e| IOError::new(ErrorKind::InvalidData, e))?
+        .collect::<Result<Vec<CertificateDer>, _>>()
+        .map_err(|e| IOError::new(ErrorKind::InvalidData, e))?;
 
     roots.add_parsable_certificates(cert);
 
