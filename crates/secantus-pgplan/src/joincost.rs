@@ -320,6 +320,10 @@ struct JoinPath {
     startup: f64,
     total: f64,
     keyed: bool,
+    /// The equivalence class a keyed path is in the order of
+    /// (`add_paths_on`); paths keyed on two classes have different
+    /// pathkeys, which `add_path` never compares.
+    class: usize,
     method: JoinMethod,
     combo: usize,
 }
@@ -371,10 +375,12 @@ fn add_path(paths: &mut Vec<JoinPath>, new: JoinPath, startup_counts: bool) {
         if costs == Ordering3::Different {
             return true;
         }
-        // Pathkeys: a keyed path's are better than none.
+        // Pathkeys: a keyed path's are better than none, and two keyed on
+        // different classes are `PATHKEYS_DIFFERENT`: both stay.
         let keys = match (new.keyed, old.keyed) {
             (true, false) => Ordering3::Better1,
             (false, true) => Ordering3::Better2,
+            (true, true) if new.class != old.class => return true,
             _ => Ordering3::Equal,
         };
         let mut remove_old = false;
@@ -495,6 +501,21 @@ impl JoinRel {
         left: bool,
         clause: bool,
     ) {
+        self.add_paths_on(combo, 0, a, b, left, clause);
+    }
+
+    /// `add_paths`, the join's clause in equivalence class `class`: its
+    /// merge joins' output is in that class's order (`cheapest_keyed_on`).
+    /// A relation built on clauses of several classes gives each its own.
+    pub fn add_paths_on(
+        &mut self,
+        combo: usize,
+        class: usize,
+        a: &JoinSide,
+        b: &JoinSide,
+        left: bool,
+        clause: bool,
+    ) {
         let startup_counts = self.startup_counts;
         let paths = &mut self.paths;
         let mut consider = |(startup, total): (f64, f64), keyed: bool, method: JoinMethod| {
@@ -504,6 +525,7 @@ impl JoinRel {
                     startup,
                     total,
                     keyed,
+                    class,
                     method,
                     combo,
                 },
@@ -601,9 +623,15 @@ impl JoinRel {
     /// merge join above on the same key reads unsorted
     /// (`get_cheapest_path_for_pathkeys`).
     pub fn cheapest_keyed(&self) -> Option<JoinChoice> {
+        self.cheapest_keyed_on(0)
+    }
+
+    /// `cheapest_keyed` among the paths in equivalence class `class`'s
+    /// order (`add_paths_on`).
+    pub fn cheapest_keyed_on(&self, class: usize) -> Option<JoinChoice> {
         self.paths
             .iter()
-            .filter(|p| p.keyed)
+            .filter(|p| p.keyed && p.class == class)
             .min_by(|p, q| {
                 p.total
                     .total_cmp(&q.total)

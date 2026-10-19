@@ -102,12 +102,26 @@ fn names_temp_schema(schema: &str) -> Option<String> {
 
 /// Does the session have a temporary relation?
 fn session_has_temp() -> bool {
-    let Some(t) = temp_schema() else {
-        return false;
-    };
-    let prefix = format!("{t}.");
-    RELATION_KEYS.with(|k| k.borrow().iter().any(|n| n.starts_with(&prefix)))
-        || PLAN_USER_RELATIONS.with(|r| r.borrow().iter().any(|(n, _, _)| n.starts_with(&prefix)))
+    thread_local! {
+        /// The answer, for the resolve epoch it was computed at: every
+        /// input bumps the epoch, and a scan of every relation's key per
+        /// call grew each statement's cost with the catalog (RP-014).
+        static MEMO: std::cell::Cell<Option<(u64, bool)>> = const { std::cell::Cell::new(None) };
+    }
+    let epoch = resolve_epoch();
+    if let Some((e, has)) = MEMO.with(std::cell::Cell::get) {
+        if e == epoch {
+            return has;
+        }
+    }
+    let has = temp_schema().is_some_and(|t| {
+        let prefix = format!("{t}.");
+        RELATION_KEYS.with(|k| k.borrow().iter().any(|n| n.starts_with(&prefix)))
+            || PLAN_USER_RELATIONS
+                .with(|r| r.borrow().iter().any(|(n, _, _)| n.starts_with(&prefix)))
+    });
+    MEMO.with(|m| m.set(Some((epoch, has))));
+    has
 }
 
 /// Install every relation's catalog key for the statements that follow.

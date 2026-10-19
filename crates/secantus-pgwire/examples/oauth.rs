@@ -2,8 +2,7 @@
 /// To connect with psql:
 /// 1. Install libpq-oauth: sudo apt-get install libpq-oauth
 /// 2. Execute: psql "postgres://postgres@localhost:5432/db?oauth_issuer=https://auth.example.com&oauth_client_id=my-app-client-id"
-use std::fs::File;
-use std::io::{BufReader, Error as IOError, ErrorKind};
+use std::io::{Error as IOError, ErrorKind};
 use std::sync::Arc;
 
 use pgwire::api::PgWireServerHandlers;
@@ -12,7 +11,7 @@ use pgwire::api::auth::sasl::oauth::Oauth;
 use pgwire::api::auth::simple_oidc_validator::SimpleOidcValidator;
 use pgwire::api::auth::{DefaultServerParameterProvider, StartupHandler};
 use pgwire::tokio::process_socket;
-use rustls_pemfile::{certs, pkcs8_private_keys};
+use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -20,13 +19,13 @@ use tokio_rustls::rustls::ServerConfig;
 
 /// configure TlsAcceptor and get server cert for SCRAM channel binding
 fn setup_tls() -> Result<TlsAcceptor, IOError> {
-    let cert = certs(&mut BufReader::new(File::open("examples/ssl/server.crt")?))
-        .collect::<Result<Vec<CertificateDer>, IOError>>()?;
+    let cert = CertificateDer::pem_file_iter("examples/ssl/server.crt")
+        .map_err(|e| IOError::new(ErrorKind::InvalidData, e))?
+        .collect::<Result<Vec<CertificateDer>, _>>()
+        .map_err(|e| IOError::new(ErrorKind::InvalidData, e))?;
 
-    let key = pkcs8_private_keys(&mut BufReader::new(File::open("examples/ssl/server.key")?))
-        .map(|key| key.map(PrivateKeyDer::from))
-        .collect::<Result<Vec<PrivateKeyDer>, IOError>>()?
-        .remove(0);
+    let key = PrivateKeyDer::from_pem_file("examples/ssl/server.key")
+        .map_err(|e| IOError::new(ErrorKind::InvalidData, e))?;
 
     let config = ServerConfig::builder()
         .with_no_client_auth()

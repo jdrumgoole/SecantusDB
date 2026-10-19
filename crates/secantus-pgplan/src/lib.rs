@@ -27464,6 +27464,11 @@ thread_local! {
     /// catalog is not, so the catalog comes TO the planner.
     static PLAN_USER_TYPES: std::cell::RefCell<Vec<(String, i64, Vec<String>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// `PLAN_USER_TYPES`' position of each name's first entry: a lookup
+    /// runs per value cast or assigned, and a scan grew it with the number
+    /// of types (RP-014).
+    static PLAN_USER_TYPES_BY_NAME: std::cell::RefCell<std::collections::HashMap<String, usize>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
     static PLAN_TIMEZONE: std::cell::RefCell<TimeZoneSetting> =
         const { std::cell::RefCell::new(TimeZoneSetting::Utc) };
 }
@@ -27652,7 +27657,20 @@ pub fn take_warnings() -> Vec<(String, String)> {
 /// Install the user-defined types for the statements that follow on this
 /// thread. The wire layer reads them from the shared store per statement.
 pub fn set_user_types(types: Vec<(String, i64, Vec<String>)>) {
+    PLAN_USER_TYPES_BY_NAME.with(|ix| *ix.borrow_mut() = first_positions(&types, |t| &t.0));
     PLAN_USER_TYPES.with(|t| *t.borrow_mut() = types);
+}
+
+/// Each name's first position in `items`.
+fn first_positions<T>(
+    items: &[T],
+    name: impl Fn(&T) -> &String,
+) -> std::collections::HashMap<String, usize> {
+    let mut out = std::collections::HashMap::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        out.entry(name(item).clone()).or_insert(i);
+    }
+    out
 }
 
 thread_local! {
@@ -27677,6 +27695,10 @@ thread_local! {
     /// otherwise route a composite cast into the enum arm).
     static PLAN_USER_COMPOSITES: std::cell::RefCell<Vec<CompositeType>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// `PLAN_USER_COMPOSITES`' position of each name's first entry (see
+    /// `PLAN_USER_TYPES_BY_NAME`): every table's row type is one.
+    static PLAN_USER_COMPOSITES_BY_NAME: std::cell::RefCell<std::collections::HashMap<String, usize>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 
     /// Custom MULTIRANGE types: `(resolution name -> multirange oid)`. The
     /// companion multirange PostgreSQL auto-creates for every `CREATE TYPE ...
@@ -27696,6 +27718,8 @@ pub type CompositeType = (String, i64, CompositeFields);
 
 /// Composite types: `(resolution name, oid, [(field name, field type)])`.
 pub fn set_user_composites(composites: Vec<CompositeType>) {
+    PLAN_USER_COMPOSITES_BY_NAME
+        .with(|ix| *ix.borrow_mut() = first_positions(&composites, |c| &c.0));
     PLAN_USER_COMPOSITES.with(|t| *t.borrow_mut() = composites);
 }
 
@@ -27726,10 +27750,10 @@ fn user_composite_widths(name: &str) -> Option<Vec<Option<usize>>> {
 /// compares it.
 fn user_composite(name: &str) -> Option<(i64, CompositeFields)> {
     let target = canonical_type_ref(name);
+    let at = PLAN_USER_COMPOSITES_BY_NAME.with(|ix| ix.borrow().get(&target).copied())?;
     PLAN_USER_COMPOSITES.with(|t| {
         t.borrow()
-            .iter()
-            .find(|(n, _, _)| *n == target)
+            .get(at)
             .map(|(_, oid, fields)| (*oid, fields.clone()))
     })
 }
@@ -28111,10 +28135,10 @@ fn user_enum(name: &str) -> Option<(i64, Vec<String>)> {
         Some(inner) => inner.to_string(),
         None => trimmed.to_string(),
     };
+    let at = PLAN_USER_TYPES_BY_NAME.with(|ix| ix.borrow().get(&target).copied())?;
     PLAN_USER_TYPES.with(|t| {
         t.borrow()
-            .iter()
-            .find(|(n, _, _)| *n == target)
+            .get(at)
             .map(|(_, oid, labels)| (*oid, labels.clone()))
     })
 }

@@ -478,19 +478,36 @@ one beside it.
     LEFT join's right join (hash or merge) runs with its preserved side
     hashed or merged in (71 of 71 four-table shapes at 20, 300 and 3,000
     rows). A merge right join returns the rows nothing matched in their
-    key's place, three tables or four. Not yet: two
-    classes spanning both sides (two join keys); an expression in a
-    class; a LEFT join's class through the general path; a class over
-    three tables of text or other non-integer keys; three tables with a
-    WHERE over two of them or a LIMIT; four tables with a key two clauses
-    share, a WHERE over two of them or a LIMIT; a merge right join of two
-    tables; more than four tables; an expression key with a function
+    key's place, three tables or four. An INNER chain of four whose
+    clauses share a key is one equivalence class over three or four of
+    them (2026-10-19): its members in `process_equivalence`'s order (each
+    ON as written, `JoinNode::Join::equi_reversed`), any two relations
+    holding members joined on its derived clause, and a merge join on it
+    read unsorted by a merge join above on it, its paths kept apart from
+    paths in another class's order (`JoinRel::add_paths_on`); 135 of 135
+    shapes at 20, 300 and 3,000 rows, the 108 tree shapes unchanged. The
+    same search runs chains of five to eight tables (2026-10-19; eight is
+    `join_collapse_limit`, past which PostgreSQL does not flatten the
+    JOINs and the search declines): 144 of 144 tree shapes of five, six
+    and eight tables at 20 and 300 rows. A class over a chain of five
+    matches 8 of 18: where a join relation's path in the class's order
+    TIES its cheapest path, PostgreSQL reads that path presorted under an
+    explicitly sorted outer (k0-k1 sorted, Materialize over k2-k3-k4's
+    merge), a combination `JoinRel::add_paths` does not generate (it reads
+    a side presorted only when that is its cheapest path), so the search
+    takes the mirror plan at the same cost and ties come out the other way
+    round. Not yet: two classes spanning both sides (two join keys); an
+    expression in a class; a LEFT join's class through the general path;
+    a class of text or other non-integer keys, or with a LEFT join; three
+    tables with a WHERE over two of them or a LIMIT; four or more tables
+    with a WHERE over two of them or a LIMIT; a merge right join of two
+    tables; more than eight tables; an expression key with a function
     call or a cast that costs; parameterized nested loops (an index scan inner); a LIMIT with
     an ORDER BY, or with a WHERE over the general path; a join of more
     than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_four_tables_with_a_shared_key_join_on_its_class
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_five_tables_read_a_classes_sorted_join_under_a_sorted_outer
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
@@ -533,6 +550,35 @@ one beside it.
         timer, which fires every 0.25 s and can land while the interpreter
         is shutting down; nothing the server answered.
 
+      - **Measured 2026-10-19: both steady failures track the SIZE OF THE
+        CATALOG, which the gauge grows as it runs.** The 2026-10-18
+        scheduled run still failed the same eight (NOTIFY 0.36 to 0.38 s,
+        so ~120 ms late, steady, not noise; `test_notify_query_notify`'s
+        third notification missing, which is two connects in series
+        running past the listener's window; `test_type_error_shadow` at
+        20 s). On the development Mac, debug build: a new connection's
+        first statement took 1.4 ms on an empty catalog and **620 ms with
+        250 tables** (plus 63 each of types, functions and views), and an
+        INSERT ran at 250 rows/s against 3,500 -- `test_type_error_shadow`'s
+        script took 159 s against PostgreSQL's 8. Causes, each fixed:
+        every reader of the table catalog decoding the whole of it on a
+        new thread (`all_table_defs` now reads `committed_table_defs`'s
+        shared copy outside a transaction block); `relation_oid` scanning
+        the catalog per relation, a view's miss falling through to every
+        view (quadratic); the function catalog re-normalised and copied
+        per statement (`type_catalog_docs`, `may_call_user_function`);
+        `views()` sorting a copy of every definition per statement for the
+        privilege check; `any_temp_function`, `session_has_temp` and the
+        user type / composite lookups scanning per call. After: first
+        statement 45 ms at 250 objects and 90 ms at 500 (linear: the
+        per-connection install of the planner's catalog tables, debug
+        build), INSERT 3,131 rows/s at 500 objects against 3,331 empty,
+        the shadow script 18 s against 16 s empty. **Not yet measured on
+        Linux**: the next run of this lane says whether the NOTIFY tests
+        and `test_type_error_shadow` pass; the latter is 150,000 inserts
+        and still close to psycopg's 20 s budget in a debug build even on
+        an empty catalog.
+
       What the lane gates, given that: a run that stopped short, and a
       test that fails over TLS, passes in the clear, **and fails over TLS
       again when run again by itself**. `::test_notify*`,
@@ -547,23 +593,6 @@ one beside it.
       Backlog-ID: RP-014
       Verify: none -- CI-runner timing flakes in psycopg's own suite on Linux
 
-- [ ] **OPEN — a backend-cancel test asserts a fixed 1 s bound on a shared
-      runner.** `tests/test_rust_pgserver_slice.py::test_pg_cancel_and_terminate_backend_signal_a_running_statement`
-      asserts `time.monotonic() - t0 < 1.0` for a cancelled / terminated
-      `pg_sleep(5)`. On 2026-10-10 the cancel half measured 1.06 s in the
-      `pg-oracle` lane, on a PR that changed only the MongoDB server (#1850 or
-      #1851; which was not written down), and passed on the re-run. Same shape
-      as the reap race that test used to have (fixed: the idle-session reap
-      now polls `pg_stat_activity` with a 10 s deadline): a fixed bound
-      standing in for "the cancel arrived".
-
-      Practical note: `gh run rerun --failed` is NOT available on this
-      workflow (it answers "run ... cannot be rerun; its workflow file may be
-      broken"), so a single-lane re-run is not a diagnostic you can reach
-      for. Re-triggering means a push, and therefore a full matrix.
-      Backlog-ID: RP-016
-      Verify: none -- a flaky fixed-time bound in a repo test on a shared CI runner
-
 ## Open from the 2026-09-30 batch
 
 - [ ] **Rust PG server: a SAVEPOINT captures whole tables, so its cost is
@@ -577,13 +606,19 @@ one beside it.
       Backlog-ID: RP-018
       Verify: none -- savepoint memory cost design; no answer differs
 - [ ] **Rust PG server: what the general JOIN planner does not push into
-      its table leaves.** A WHERE conjunct that reads ONE alias's columns
-      (qualified), built of operators, casts, constants and parameters, is
-      applied inside that leaf (only on the PRESERVED side of every outer
-      join above it); corpus `join_pushdown`. Not pushed: a conjunct with an
-      unqualified column, a function call (it may be volatile), a subquery,
-      or one over two aliases. Each such conjunct is filtered only after the
-      join, so the leaf cannot use an index for it.
+      its table leaves: a subquery.** A WHERE conjunct that reads ONE
+      alias's columns (qualified, or unqualified and in only one table),
+      built of operators, casts, constants, parameters and calls of
+      IMMUTABLE built-ins, is applied inside that leaf (only on the
+      PRESERVED side of every outer join above it); corpus `join_pushdown`,
+      unit tests `joins::tests` (immutable calls since 2026-10-19). Not
+      pushed: a conjunct holding a subquery, which PostgreSQL runs once as
+      an InitPlan beside the scan. The pushed copy also stays in the outer
+      WHERE, so pushing one here would run the subquery twice, and a
+      volatile one would answer differently; it needs the conjunct moved
+      rather than copied. A volatile or stable call, or a user function,
+      stays out for the same reason. (A conjunct over two aliases is a join
+      clause in PostgreSQL too, not a leaf filter.)
       Backlog-ID: RP-019
       Verify: none -- predicate pushdown/index use only; answers identical, EXPLAIN costs are a scope decision
 
@@ -627,14 +662,3 @@ one beside it.
       to be checked against the whole file.
       Backlog-ID: RP-049
       Verify: none -- internal code structure; no answer differs from PostgreSQL
-
-## Warning-class RUSTSEC advisories (surfaced by cargo-audit, not gated) (2026-07-20)
-
-The `cargo-audit` CI gate (`.github/workflows/cargo-audit.yml`) fails only on
-*vulnerability*-class advisories; this warning-class one is printed in the
-gate log every run but does not block. Not a reachable exploit; clear it when
-the TLS dependency chain is next touched:
-
-- **RUSTSEC-2025-0134** — `rustls-pemfile` 2.2.0 unmaintained. Its API folded
-  into `rustls-pki-types`. A direct dependency of `secantus-pg` and
-  `secantus-pgwire`.

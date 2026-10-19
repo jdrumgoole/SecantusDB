@@ -119,6 +119,23 @@ pub(crate) fn order(n: usize, equalities: &[Equality]) -> Vec<usize> {
     out
 }
 
+/// For each of `pairs_between`'s pairs, whether its WHERE conjunct wrote
+/// the right item's key first.
+pub(crate) fn pairs_reversed(equalities: &[Equality], joined: &[usize], right: usize) -> Vec<bool> {
+    equalities
+        .iter()
+        .filter_map(|(a, _, b, _)| {
+            if *b == right && joined.contains(a) {
+                Some(false)
+            } else if *a == right && joined.contains(b) {
+                Some(true)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// The `(left key, right key)` pairs for joining item `right` onto the
 /// items in `joined`.
 pub(crate) fn pairs_between(

@@ -70,6 +70,11 @@ pub enum JoinNode {
         /// the ON: candidates are found by hashing on them, and `on` still
         /// decides each pair.
         equi: Vec<(String, String)>,
+        /// For each `equi` pair, whether the ON wrote it right key first
+        /// (`r.x = l.y`): the order PostgreSQL's `process_equivalence` adds
+        /// the two columns to an equivalence class, which decides the
+        /// members a derived join clause takes.
+        equi_reversed: Vec<bool>,
         /// USING / NATURAL columns: `(merged key, left key, right key)`.
         merged: Vec<(String, String, String)>,
         /// ON conjuncts equating an expression over one side with one over
@@ -383,6 +388,7 @@ fn build_tree(
                 // The WHERE still decides every row; these only narrow the
                 // candidates a left row is paired with.
                 equi: crate::join_order::pairs_between(&equalities, &joined, i),
+                equi_reversed: crate::join_order::pairs_reversed(&equalities, &joined, i),
                 merged: Vec::new(),
                 expr_keys: Vec::new(),
             },
@@ -1125,6 +1131,7 @@ fn build_join(
         .iter()
         .map(|(_, l, r)| (l.clone(), r.clone()))
         .collect();
+    let mut equi_reversed = vec![false; equi.len()];
     let mut expr_keys = Vec::new();
     let mut on_aliases = Vec::new();
     let on = match j.quals.as_deref() {
@@ -1160,7 +1167,10 @@ fn build_join(
             };
             rewrite_expr(&mut q, &side_scope, &[])?;
             on_aliases = key_aliases(&q);
-            equi.extend(equalities(&q, &left_keys, &right_keys));
+            for (l, r, reversed) in equalities(&q, &left_keys, &right_keys) {
+                equi.push((l, r));
+                equi_reversed.push(reversed);
+            }
             expr_keys = expr_equalities(&q, &left_keys, &right_keys)
                 .into_iter()
                 .map(|(l, r)| {
@@ -1193,6 +1203,7 @@ fn build_join(
                 })
                 .flatten(),
             equi,
+            equi_reversed,
             merged,
             expr_keys,
             on_aliases,
@@ -1234,12 +1245,13 @@ fn on_expr(node: &pg_query::protobuf::Node, scope: &Scope, params: &[Bson]) -> R
     row_column_expr(node, &fields, params, &sample)
 }
 
-/// `left.x = right.y` conjuncts of an ON, as `(left key, right key)`.
+/// `left.x = right.y` conjuncts of an ON, as `(left key, right key,
+/// written right key first)`.
 fn equalities(
     node: &pg_query::protobuf::Node,
     left: &[String],
     right: &[String],
-) -> Vec<(String, String)> {
+) -> Vec<(String, String, bool)> {
     use pg_query::protobuf::BoolExprType;
     match node.node.as_ref() {
         Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr as i32 => b
@@ -1258,8 +1270,10 @@ fn equalities(
                 }
             };
             match (key(e.lexpr.as_deref()), key(e.rexpr.as_deref())) {
-                (Some(a), Some(b)) if left.contains(&a) && right.contains(&b) => vec![(a, b)],
-                (Some(a), Some(b)) if left.contains(&b) && right.contains(&a) => vec![(b, a)],
+                (Some(a), Some(b)) if left.contains(&a) && right.contains(&b) => {
+                    vec![(a, b, false)]
+                }
+                (Some(a), Some(b)) if left.contains(&b) && right.contains(&a) => vec![(b, a, true)],
                 _ => Vec::new(),
             }
         }
@@ -1561,9 +1575,11 @@ pub(crate) const SELECT_LIST_SRFS: &[&str] = &[
 
 /// The WHERE conjuncts a table leaf can apply to its own rows, by alias.
 ///
-/// A conjunct qualifies when every column it reads is qualified by ONE
-/// alias, and it is built only of operators, casts, constants and parameters
-/// (no function call, which may be volatile, and no subquery). Its leaf must
+/// A conjunct qualifies when every column it reads belongs to ONE alias
+/// (qualified, or unqualified and in only one table), and it is built only
+/// of operators, casts, constants, parameters and calls of IMMUTABLE
+/// built-ins (no other function call, which may be volatile and would run
+/// twice, and no subquery). Its leaf must
 /// be on the PRESERVED side of every outer join above it: filtering the
 /// nullable side before the join would keep the NULL-extended rows
 /// PostgreSQL's WHERE drops. The conjunct also stays in the outer WHERE, so
@@ -2106,6 +2122,23 @@ fn single_alias(
             Some(N::BooleanTest(t)) => t.arg.as_deref().is_some_and(|a| walk(a, alias, owner)),
             Some(N::List(l)) => l.items.iter().all(|a| walk(a, alias, owner)),
             Some(N::AArrayExpr(a)) => a.elements.iter().all(|x| walk(x, alias, owner)),
+            // An IMMUTABLE built-in: the pushed copy and the one left in the
+            // outer WHERE give the same answer, so evaluating it twice is
+            // harmless. A volatile or stable one, a user function (which
+            // may shadow the built-in), and an aggregate or window call stay
+            // in the outer WHERE only.
+            Some(N::FuncCall(f)) => {
+                f.over.is_none()
+                    && f.agg_filter.is_none()
+                    && f.agg_order.is_empty()
+                    && !f.agg_star
+                    && !f.agg_distinct
+                    && func_name(f).is_some_and(|name| {
+                        crate::correlated::immutable_builtin(&name, f.args.len())
+                            && crate::correlated::user_function_for(&name, &f.args).is_none()
+                    })
+                    && f.args.iter().all(|a| walk(a, alias, owner))
+            }
             _ => false,
         }
     }
@@ -2145,5 +2178,82 @@ fn pushed_filter(alias: &str) -> Option<pg_query::protobuf::Node> {
                 ..Default::default()
             }))),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The aliases each WHERE conjunct of `sql` is pushed to.
+    fn pushed_to(sql: &str) -> Vec<String> {
+        let parsed = pg_query::parse(sql).unwrap();
+        let stmt = parsed.protobuf.stmts[0].stmt.as_ref().unwrap();
+        let Some(N::SelectStmt(s)) = stmt.node.as_ref() else {
+            panic!("not a SELECT: {sql}");
+        };
+        let lookup = |name: &str| -> Option<TableDef> {
+            let cols = match name {
+                "a" => vec![
+                    Column::new("id", "int4", true),
+                    Column::new("v", "int4", false),
+                ],
+                "b" => vec![
+                    Column::new("id", "int4", false),
+                    Column::new("a_id", "int4", false),
+                    Column::new("w", "text", false),
+                ],
+                _ => return None,
+            };
+            Some(TableDef::new(name, cols))
+        };
+        let (pushed, _, _) = pushdown_filters(s, &lookup);
+        pushed.into_iter().map(|(alias, _)| alias).collect()
+    }
+
+    #[test]
+    fn an_immutable_builtin_call_is_pushed_to_its_leaf() {
+        // RP-019: a conjunct calling an IMMUTABLE built-in reads one alias,
+        // so its leaf applies it (and can reach an index for it).
+        assert_eq!(
+            pushed_to("select 1 from a join b on b.a_id = a.id where lower(b.w) = 'w1'"),
+            vec!["b"]
+        );
+        assert_eq!(
+            pushed_to("select 1 from a join b on b.a_id = a.id where abs(a.v - 3) = 1"),
+            vec!["a"]
+        );
+        // Unqualified, but only `b` has `w`.
+        assert_eq!(
+            pushed_to("select 1 from a join b on b.a_id = a.id where upper(w) like 'W1%'"),
+            vec!["b"]
+        );
+    }
+
+    #[test]
+    fn a_call_that_may_not_be_immutable_is_not_pushed() {
+        // Volatile: the pushed copy and the outer WHERE's would differ.
+        assert!(
+            pushed_to("select 1 from a join b on b.a_id = a.id where random() < a.v").is_empty()
+        );
+        // Stable, not immutable.
+        assert!(pushed_to(
+            "select 1 from a join b on b.a_id = a.id where a.v < extract(day from now())"
+        )
+        .is_empty());
+        // An aggregate cannot appear in a WHERE, and is never pushed.
+        assert!(
+            pushed_to("select 1 from a join b on b.a_id = a.id where a.v = count(*)").is_empty()
+        );
+        // A call over two aliases is a join clause, not a leaf filter.
+        assert!(
+            pushed_to("select 1 from a join b on b.a_id = a.id where abs(a.v - b.id) = 1")
+                .is_empty()
+        );
+        // The nullable side of a LEFT join keeps its filter above the join.
+        assert!(
+            pushed_to("select 1 from a left join b on b.a_id = a.id where lower(b.w) is null")
+                .is_empty()
+        );
     }
 }
