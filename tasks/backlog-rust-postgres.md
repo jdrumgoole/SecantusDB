@@ -573,11 +573,21 @@ one beside it.
         statement 45 ms at 250 objects and 90 ms at 500 (linear: the
         per-connection install of the planner's catalog tables, debug
         build), INSERT 3,131 rows/s at 500 objects against 3,331 empty,
-        the shadow script 18 s against 16 s empty. **Not yet measured on
-        Linux**: the next run of this lane says whether the NOTIFY tests
-        and `test_type_error_shadow` pass; the latter is 150,000 inserts
-        and still close to psycopg's 20 s budget in a debug build even on
-        an empty catalog.
+        the shadow script 18 s against 16 s empty. **On Linux (run
+        39321598460, PR #2030's tree) every NOTIFY test passed in the
+        clear and over TLS**, where the 2026-10-18 run of main failed
+        seven; only `test_type_error_shadow` still hit 20 s.
+      - **`test_type_error_shadow` is throughput**: 150,000 prepared
+        UUID-keyed INSERTs from three connections (8 s on PostgreSQL here).
+        Profiled 2026-10-19, debug build: every Describe and Execute
+        parsed the statement again to ask whether it was a FETCH (a
+        quarter of the time; now only once the catalog has moved), the
+        plan cache refused a `uuid` parameter so every row was planned
+        again (a third; `plan_cache` now templates one, since Bind has
+        made it canonical), and the type lookups canonicalised the same
+        names per value. The script went from 18.7 s to 11.6 s; the
+        storage insert is now 43% of a statement. **Not yet measured on
+        Linux.**
 
       What the lane gates, given that: a run that stopped short, and a
       test that fails over TLS, passes in the clear, **and fails over TLS

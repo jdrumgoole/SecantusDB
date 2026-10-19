@@ -27917,6 +27917,9 @@ fn shell_type_named(name: &str) -> Option<String> {
 
 /// The custom RANGE a custom multirange is built from, by resolution name.
 pub fn user_multirange_member(name: &str) -> Option<String> {
+    if PLAN_USER_MULTIRANGES.with(|t| t.borrow().is_empty()) {
+        return None;
+    }
     let n = canonical_type_ref(name);
     PLAN_USER_MULTIRANGES.with(|t| {
         t.borrow()
@@ -27950,6 +27953,9 @@ fn user_multirange_name(oid: i64) -> Option<String> {
 
 /// The subtype element of a custom range type by name, if one is registered.
 pub fn user_range_subtype(name: &str) -> Option<String> {
+    if PLAN_USER_RANGES.with(|t| t.borrow().is_empty()) {
+        return None;
+    }
     // Canonicalise so a schema-qualified `testschema.testrange` (and its quoted
     // `"testschema"."testrange"` form) resolves to its own registered entry,
     // distinct from a bare `testrange`.
@@ -27991,6 +27997,27 @@ fn normalize_ident_part(part: &str) -> String {
 /// Handles quoted parts (`"testschema"."testcomp"`, from `sql.Identifier`) and
 /// splits on a dot only outside quotes.
 fn canonical_type_ref(name: &str) -> String {
+    thread_local! {
+        /// Answers by name: the type lookups canonicalise the same few names
+        /// on every value an INSERT assigns (RP-014). Pure, so never stale.
+        static MEMO: std::cell::RefCell<std::collections::HashMap<String, String>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    if let Some(hit) = MEMO.with(|m| m.borrow().get(name).cloned()) {
+        return hit;
+    }
+    let out = canonical_type_ref_uncached(name);
+    MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() >= 4096 {
+            m.clear();
+        }
+        m.insert(name.to_string(), out.clone());
+    });
+    out
+}
+
+fn canonical_type_ref_uncached(name: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut in_quotes = false;

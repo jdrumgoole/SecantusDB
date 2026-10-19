@@ -22,6 +22,11 @@
 //!   stand-ins are distinct in every way the planner might branch on: both
 //!   in range of the smallest integer type, strings carrying leading and
 //!   trailing blanks and mixed case (so a trim, pad or case fold shows);
+//!   a string the client declared `uuid` stands in as two canonical UUIDs,
+//!   because the Bind already turned every `uuid` parameter into its
+//!   canonical text (`decode_parameter`, refusing one that is not a UUID),
+//!   and the plan-cache key holds the declared types, so a template learned
+//!   that way only ever substitutes such a value;
 //! - an execution whose values have the stand-ins' BSON types and no NULL
 //!   (NULL changes a plan's meaning: `= NULL` is never true);
 //! - only where the substituted values can land:
@@ -34,7 +39,9 @@
 //!     (`stores_verbatim`). The planner checks a stored value against its
 //!     column -- a varchar length, an integer range, a domain -- and a
 //!     stand-in passing that check says nothing about the next value, so a
-//!     column with any such check is never templated. One conversion is
+//!     column with any such check is never templated. A `uuid` column takes
+//!     a string as it is: only a canonical UUID can reach it from a
+//!     template (above), and any other string fails to plan as a stand-in. One conversion is
 //!     carried: an int32 bound for an `int8` column is stored as the same
 //!     number in 64 bits (`widened`), which every int32 fits and nothing
 //!     checks. It is what a driver sends for a small integer.
@@ -415,8 +422,13 @@ pub(crate) fn as_kinds_of(values: &[Bson], like: &[Bson]) -> Option<Vec<Bson>> {
 }
 
 /// The two stand-in sets for `params`, or `None` when one of them cannot be
-/// stood in for (a NULL, or a type outside the handled four).
-pub(crate) fn sentinels(params: &[Bson]) -> Option<(Vec<Bson>, Vec<Bson>)> {
+/// stood in for (a NULL, or a type outside the handled four). `types` are
+/// the parameters' declared types where the client gave them (none for a
+/// literal family): a string declared `uuid` stands in as a UUID.
+pub(crate) fn sentinels(
+    params: &[Bson],
+    types: &[Option<String>],
+) -> Option<(Vec<Bson>, Vec<Bson>)> {
     let mut a = Vec::with_capacity(params.len());
     let mut b = Vec::with_capacity(params.len());
     for (i, p) in params.iter().enumerate() {
@@ -435,6 +447,10 @@ pub(crate) fn sentinels(params: &[Bson]) -> Option<(Vec<Bson>, Vec<Bson>)> {
             Bson::Double(_) => (
                 Bson::Double(23_011.25 + f64::from(i32_)),
                 Bson::Double(23_511.75 + f64::from(i32_)),
+            ),
+            Bson::String(_) if types.get(i).and_then(|t| t.as_deref()) == Some("uuid") => (
+                Bson::String(format!("5a1e0000-0000-4000-8000-{:012x}", 2 * i + 1)),
+                Bson::String(format!("5a1e0000-0000-4000-8000-{:012x}", 2 * i + 2)),
             ),
             Bson::String(_) => (
                 Bson::String(format!(" Sx{i}a ")),
@@ -505,7 +521,8 @@ fn stored_form(s: &Bson, v: &Bson) -> bool {
 /// is, with nothing to check? True for the four pairings where the column's
 /// type holds the whole range of the value's and declares no width, domain,
 /// enum or generation: `int4` <- int32, `int8` <- int64, `float8` <- double,
-/// `text` <- string. (`v` is the value in the PLAN, so an int32 the planner
+/// `text` <- string; and `uuid` <- string, which only a canonical UUID
+/// reaches (see the module docs). (`v` is the value in the PLAN, so an int32 the planner
 /// widened for an `int8` column arrives here as an int64.)
 pub(crate) fn stores_verbatim(v: &Bson, column: &Column) -> bool {
     column.typmod == -1
@@ -517,6 +534,7 @@ pub(crate) fn stores_verbatim(v: &Bson, column: &Column) -> bool {
                 | (Bson::Int64(_), "int8")
                 | (Bson::Double(_), "float8")
                 | (Bson::String(_), "text")
+                | (Bson::String(_), "uuid")
         )
 }
 
@@ -865,12 +883,32 @@ mod tests {
 
     #[test]
     fn sentinels_refuse_null_and_bool() {
-        assert!(sentinels(&[Bson::Null]).is_none());
-        assert!(sentinels(&[Bson::Boolean(true)]).is_none());
-        let (a, b) = sentinels(&[Bson::Int32(5), Bson::String("x".into())]).expect("ok");
+        assert!(sentinels(&[Bson::Null], &[]).is_none());
+        assert!(sentinels(&[Bson::Boolean(true)], &[]).is_none());
+        let (a, b) = sentinels(&[Bson::Int32(5), Bson::String("x".into())], &[]).expect("ok");
         assert_ne!(a, b);
         assert!(fits(&[Bson::Int32(9), Bson::String("y".into())], &a));
         assert!(!fits(&[Bson::Int64(9), Bson::String("y".into())], &a));
+    }
+
+    #[test]
+    fn a_string_declared_uuid_stands_in_as_canonical_uuids() {
+        let types = [Some("uuid".to_string()), None];
+        let x = || Bson::String("x".into());
+        let (a, b) = sentinels(&[x(), x()], &types).expect("ok");
+        for v in [&a[0], &b[0]] {
+            let Bson::String(s) = v else { panic!("{v:?}") };
+            let canonical = secantus_pgplan::cast_text_to(
+                s,
+                "uuid",
+                &secantus_pgplan::TimeZoneSetting::default(),
+            )
+            .expect("a valid uuid");
+            assert_eq!(&canonical, v);
+        }
+        assert_ne!(a[0], b[0]);
+        // Undeclared, the ordinary string stand-ins.
+        assert_eq!(a[1], Bson::String(" Sx1a ".into()));
     }
 
     #[test]
@@ -881,6 +919,7 @@ mod tests {
         assert!(stores_verbatim(&Bson::Int64(1), &col("int8")));
         assert!(stores_verbatim(&Bson::Double(1.0), &col("float8")));
         assert!(stores_verbatim(&text(), &col("text")));
+        assert!(stores_verbatim(&text(), &col("uuid")));
         // A narrower range, a conversion, a parse.
         assert!(!stores_verbatim(&Bson::Int32(1), &col("int2")));
         assert!(!stores_verbatim(&Bson::Int32(1), &col("int8")));
