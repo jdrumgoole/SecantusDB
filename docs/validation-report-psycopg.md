@@ -2,7 +2,7 @@
 
 - SecantusDB (Python server) 0.7.0b3
 - psycopg suite: vendor/psycopg @ unknown
-- generated: 2026-10-15 22:38 UTC
+- generated: 2026-10-19 06:48 UTC
 
 | category | passed | failed | expected | skipped | total | pass rate | adjusted |
 |---|---|---|---|---|---|---|---|
