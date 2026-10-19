@@ -472,6 +472,10 @@ pub struct JoinChoice {
     pub total: f64,
 }
 
+/// `JoinRel::add_paths_on`'s class for a join whose key order nothing above
+/// it can use: no join clause still to come and no ORDER BY reads it.
+pub const USELESS_KEYS: usize = usize::MAX;
+
 /// One join relation's paths (`RelOptInfo::pathlist`), as `add_path` keeps
 /// them across every pair of inputs it can be built from.
 #[derive(Debug, Clone)]
@@ -507,6 +511,8 @@ impl JoinRel {
     /// `add_paths`, the join's clause in equivalence class `class`: its
     /// merge joins' output is in that class's order (`cheapest_keyed_on`).
     /// A relation built on clauses of several classes gives each its own.
+    /// `USELESS_KEYS`: the order is of no use above this relation, and
+    /// `truncate_useless_pathkeys` leaves its merge joins unordered.
     pub fn add_paths_on(
         &mut self,
         combo: usize,
@@ -518,13 +524,14 @@ impl JoinRel {
     ) {
         let startup_counts = self.startup_counts;
         let paths = &mut self.paths;
+        let useful = class != USELESS_KEYS;
         let mut consider = |(startup, total): (f64, f64), keyed: bool, method: JoinMethod| {
             add_path(
                 paths,
                 JoinPath {
                     startup,
                     total,
-                    keyed,
+                    keyed: keyed && useful,
                     class,
                     method,
                     combo,
@@ -877,6 +884,22 @@ mod tests {
                 a_by_index: true,
                 b_by_index: false
             }
+        );
+    }
+
+    #[test]
+    fn an_order_nothing_above_uses_is_no_order() {
+        // `truncate_useless_pathkeys`: the same merge join, its order kept
+        // for a clause still to come and dropped when none is.
+        let mut kept = JoinRel::new(false);
+        kept.add_paths_on(0, 1, &plain(), &plain(), false, true);
+        assert!(kept.cheapest_keyed_on(1).is_some());
+        let mut dropped = JoinRel::new(false);
+        dropped.add_paths_on(0, USELESS_KEYS, &plain(), &plain(), false, true);
+        assert!(dropped.paths.iter().all(|p| !p.keyed));
+        assert_eq!(
+            dropped.cheapest(None, 20808.0).map(|c| c.total),
+            kept.cheapest(None, 20808.0).map(|c| c.total)
         );
     }
 

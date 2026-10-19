@@ -489,14 +489,23 @@ one beside it.
     same search runs chains of five to eight tables (2026-10-19; eight is
     `join_collapse_limit`, past which PostgreSQL does not flatten the
     JOINs and the search declines): 144 of 144 tree shapes of five, six
-    and eight tables at 20 and 300 rows. A class over a chain of five
-    matches 8 of 18: where a join relation's path in the class's order
-    TIES its cheapest path, PostgreSQL reads that path presorted under an
-    explicitly sorted outer (k0-k1 sorted, Materialize over k2-k3-k4's
-    merge), a combination `JoinRel::add_paths` does not generate (it reads
-    a side presorted only when that is its cheapest path), so the search
-    takes the mirror plan at the same cost and ties come out the other way
-    round. Not yet: two classes spanning both sides (two join keys); an
+    and eight tables at 20 and 300 rows. A join's order counts only while
+    something above can use it (`truncate_useless_pathkeys`, 2026-10-20):
+    an edge's once its clause is inside the relation, the class's once
+    every member is, so a path merged on an edge no longer stands beside
+    an equally cheap one in the class's order and decides a tie; a class
+    over a chain of five went from 12 to 21 of 27 shapes at 20, 300 and
+    3,000 rows, every other shape unchanged. The six left are a HASH JOIN
+    TOO BIG FOR `work_mem`: with `t1.a` a primary key and the class's ON
+    written `t2.a = t1.a`, PostgreSQL hashes 212,242 estimated rows of
+    width 16, more than `work_mem` x `hash_mem_multiplier` (4 MB x 2)
+    holds, so `ExecChooseHashTableSize` gives it several batches. Batches
+    cost page I/O (`final_cost_hashjoin`) and return their rows batch by
+    batch, an outer row hashing to a later batch joined after every row of
+    batch 0 (`ExecHashGetBucketAndBatch`: the hash rotated right by
+    log2(nbuckets), masked by nbatch - 1). Neither is modelled: the cost is
+    one batch's, the rows come out in scan order, and no join relation
+    carries the row WIDTH that sizes the table. Not yet: two classes spanning both sides (two join keys); an
     expression in a class; a LEFT join's class through the general path;
     a class of text or other non-integer keys, or with a LEFT join; three
     tables with a WHERE over two of them or a LIMIT; four or more tables
@@ -507,7 +516,7 @@ one beside it.
     than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_five_tables_read_a_classes_sorted_join_under_a_sorted_outer
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_hash_join_too_big_for_work_mem_returns_rows_batch_by_batch
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
