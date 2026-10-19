@@ -5246,21 +5246,6 @@ impl PgHandler {
         &self,
         stmt: &StoredStatement<ParsedStatement>,
     ) -> PgWireResult<()> {
-        // A FETCH (or MOVE) returns its cursor's rows, which are no cached
-        // plan's: PostgreSQL describes the portal's own columns (RP-046).
-        let is_fetch = pg_query::parse(&stmt.statement.sql).is_ok_and(|p| {
-            matches!(
-                p.protobuf
-                    .stmts
-                    .first()
-                    .and_then(|s| s.stmt.as_ref())
-                    .and_then(|n| n.node.as_ref()),
-                Some(pg_query::NodeEnum::FetchStmt(_))
-            )
-        });
-        if is_fetch {
-            return Ok(());
-        }
         let now = catalog_cache()
             .version
             .load(std::sync::atomic::Ordering::SeqCst);
@@ -5275,6 +5260,24 @@ impl PgHandler {
             return Ok(());
         };
         if version == now {
+            return Ok(());
+        }
+        // Parsed only once the catalog has moved: this runs on every
+        // Describe and Execute, and the parse was a quarter of an INSERT's
+        // cost in an `executemany` (RP-014).
+        // A FETCH (or MOVE) returns its cursor's rows, which are no cached
+        // plan's: PostgreSQL describes the portal's own columns (RP-046).
+        let is_fetch = pg_query::parse(&stmt.statement.sql).is_ok_and(|p| {
+            matches!(
+                p.protobuf
+                    .stmts
+                    .first()
+                    .and_then(|s| s.stmt.as_ref())
+                    .and_then(|n| n.node.as_ref()),
+                Some(pg_query::NodeEnum::FetchStmt(_))
+            )
+        });
+        if is_fetch {
             return Ok(());
         }
         let current = self.prepared_record(stmt);
@@ -42151,10 +42154,10 @@ impl PgHandler {
                     return None;
                 }
             }
-            let (a, b) = plan_cache::sentinels(match family {
-                Some((_, f)) => &f.values,
-                None => params,
-            })?;
+            let (a, b) = match family {
+                Some((_, f)) => plan_cache::sentinels(&f.values, &[]),
+                None => plan_cache::sentinels(params, param_types),
+            }?;
             let ran_subquery = std::cell::Cell::new(false);
             let touched_temp = std::cell::Cell::new(false);
             let run = |stmt: &Statement| -> std::result::Result<Vec<Vec<Bson>>, PlanError> {

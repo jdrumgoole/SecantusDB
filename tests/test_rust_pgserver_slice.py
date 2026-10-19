@@ -10084,6 +10084,79 @@ def test_a_lone_commands_syntax_error_counts_from_what_was_sent(home: Path) -> N
         assert c.execute("  select 4 ;  ").fetchall() == [(4,)]
 
 
+def test_a_reused_plan_over_a_uuid_parameter_stores_it_canonical(home: Path) -> None:
+    """A parameter declared `uuid` is templated too (`plan_cache`, RP-014):
+    an `executemany` of UUID-keyed rows no longer plans every row. Bind has
+    made each value canonical by then, so whatever spelling the client sends
+    (braces, upper case, the 32-digit form) is stored, matched and rendered as
+    PostgreSQL 15.19 does, and one that is not a UUID is still 22P02. Measured
+    on 15.19 with the same statements."""
+    import uuid
+
+    from psycopg.adapt import Dumper
+
+    class Spelled(str):
+        """A string the client declares to be a `uuid`."""
+
+    class SpelledDumper(Dumper):
+        oid = 2950
+
+        def dump(self, obj: Spelled) -> bytes:
+            return obj.encode()
+
+    with _Server(home) as server, server.connect() as c:
+        c.adapters.register_dumper(Spelled, SpelledDumper)
+
+        def state(sql: str, *args: object) -> str | None:
+            try:
+                c.execute(sql, args, prepare=True)
+            except psycopg.Error as e:
+                return e.sqlstate
+            return None
+
+        c.execute("create table pu_t (id uuid primary key, n int)")
+        ins = "insert into pu_t (id, n) values (%s, %s)"
+        spellings = [
+            "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+            "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A12",
+            "{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a13}",
+            "a0eebc999c0b4ef8bb6d6bb9bd380a14",
+            "{A0EEBC99-9C0B4EF8-BB6D6BB9-BD380A15}",
+        ]
+        assert [state(ins, Spelled(s), i) for i, s in enumerate(spellings)] == [None] * 5
+        assert [state(ins, Spelled(s), 9) for s in ("not-a-uuid", "a0eebc99")] == ["22P02"] * 2
+        # The key is still checked on a reused plan, whatever the spelling.
+        assert state(ins, Spelled("A0EEBC999C0B4EF8BB6D6BB9BD380A11"), 9) == "23505"
+        # psycopg's own uuid.UUID values, text and binary.
+        u = [uuid.UUID(int=k) for k in (1, 2, 3, 4)]
+        c.cursor().executemany(ins, [(x, 10) for x in u[:2]])
+        c.cursor().executemany("insert into pu_t (id, n) values (%b, %b)", [(x, 11) for x in u[2:]])
+        assert c.execute("select id::text, n from pu_t order by n, id").fetchall() == [
+            ("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", 0),
+            ("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12", 1),
+            ("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a13", 2),
+            ("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a14", 3),
+            ("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a15", 4),
+            ("00000000-0000-0000-0000-000000000001", 10),
+            ("00000000-0000-0000-0000-000000000002", 10),
+            ("00000000-0000-0000-0000-000000000003", 11),
+            ("00000000-0000-0000-0000-000000000004", 11),
+        ]
+        # A lookup by any spelling finds its row, after a run that templated it.
+        sel = "select n from pu_t where id = %s"
+        found = [
+            c.execute(sel, (Spelled(s),), prepare=True).fetchall()
+            for s in (
+                "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A13",
+                "{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}",
+                "a0eebc999c0b4ef8bb6d6bb9bd380a15",
+                "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a99",
+            )
+        ]
+        assert found == [[(2,)], [(0,)], [(4,)], []]
+        assert state(sel, Spelled("zz")) == "22P02"
+
+
 def test_a_reused_write_plan_stores_each_value_and_keeps_every_check(home: Path) -> None:
     """An INSERT's row and an UPDATE's SET are reused plans too (`plan_cache`),
     where the column takes any value of the parameter's kind: each execution

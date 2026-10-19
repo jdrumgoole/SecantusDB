@@ -74,7 +74,10 @@ def test_child_survives_a_kill_of_the_launching_group(tmp_path: Path) -> None:
         "--",
         "/bin/sh",
         "-c",
-        f"sleep 3; echo done > {marker}",
+        # Renamed into place, so the file exists only once it holds the
+        # word: `> marker` creates it empty first, and a poll that lands
+        # between the two read '' (seen on a loaded machine).
+        f"sleep 3; echo done > {marker}.tmp && mv {marker}.tmp {marker}",
     )
     assert out.returncode == 0, out.stderr
     pid = json.loads((state / "survivor.json").read_text())["pid"]
