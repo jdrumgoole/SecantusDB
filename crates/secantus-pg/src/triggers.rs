@@ -823,15 +823,12 @@ impl PgHandler {
                 trg.get_bool("initially_deferred").unwrap_or(false),
             )
         {
-            self.deferred_triggers
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(DeferredTrigger {
-                    trg: trg.clone(),
-                    op: op.to_string(),
-                    new,
-                    old,
-                });
+            self.deferred.triggers().push(DeferredTrigger {
+                trg: trg.clone(),
+                op: op.to_string(),
+                new,
+                old,
+            });
             return Ok(());
         }
         self.run_trigger(trg, op, new, old).map(|_| ())
@@ -892,10 +889,7 @@ impl PgHandler {
             }
         }
         {
-            let mut modes = self
-                .constraint_modes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut modes = self.deferred.modes();
             if names.is_empty() {
                 modes.0 = Some(deferred);
                 modes.1.clear();

@@ -658,15 +658,17 @@ one beside it.
       shape: sub-structs that each own their own rules (transaction,
       portals and cursors, connection security, notifications), and
       `execute_inner_keys` split into one function per statement family.
-      Two groups are done, both in `txn_state.rs`. The open transaction's
+      Three groups are done, all in `txn_state.rs`. The open transaction's
       uncommitted tables, types and sequences are `PendingCatalog`, with
       one `clear`. Its cache-bypass marks (catalog changed, role written)
-      are `TxnMarks`, with one `end`. Every transaction-end path calls
-      both. Those paths had each kept their own list, and the lists had
-      drifted apart twice (RP-050, RP-051). The other transaction flags
-      (`savepoints`, `txn_failed`, `in_transaction`, the deferred checks)
-      are still reset path by path, and some of those differences are
-      deliberate, so read each path's comments before merging them.
+      are `TxnMarks`, with one `end`. Its deferred constraint checks and
+      `SET CONSTRAINTS` modes are `DeferredChecks`, with one `clear`.
+      Every transaction-end path calls all three. Those paths had each
+      kept their own list, and the lists had drifted apart three times
+      (RP-050, RP-051, RP-052). `savepoints`, `txn_failed` and
+      `in_transaction` are still reset path by path, and some of those
+      differences are deliberate, so read each path's comments before
+      merging them.
       Neither touches pgwire, the wire protocol or the on-disk format. No
       client sees a different answer, so this is not a divergence. It is
       here because a change to transaction or savepoint state currently has

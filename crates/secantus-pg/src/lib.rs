@@ -3479,17 +3479,12 @@ pub struct PgHandler {
     /// backend's `pg_terminate_backend`, a `CancelRequest`, and every
     /// `pg_stat_activity` read see of it.
     backend: Arc<BackendEntry>,
-    /// `(table, constraint name)` of every INITIALLY DEFERRED foreign key a
-    /// write in the open transaction touched; re-checked at COMMIT.
-    deferred_fks: Mutex<Vec<(String, String)>>,
-    /// INITIALLY DEFERRED constraint-trigger events queued for COMMIT.
-    deferred_triggers: Mutex<Vec<triggers::DeferredTrigger>>,
+    /// The open transaction's deferred constraint checks and its
+    /// `SET CONSTRAINTS` modes, cleared when it ends on every path.
+    deferred: txn_state::DeferredChecks,
     /// The rows the statement in flight wrote to each table, `(new, old)`,
     /// for its triggers' `REFERENCING` transition tables.
     transition_rows: Mutex<HashMap<String, TransitionRows>>,
-    /// `SET CONSTRAINTS` for the open transaction: ALL's mode, then each
-    /// named constraint's (`true` = deferred).
-    constraint_modes: Mutex<(Option<bool>, HashMap<String, bool>)>,
     /// Set when a COMMIT failed its deferred checks and rolled back: the
     /// error goes out, and the `ReadyForQuery` after it must say IDLE (the
     /// transaction is over), where pgwire's error path would say failed.
@@ -3876,10 +3871,8 @@ impl PgHandler {
             backend_pid: AtomicI32::new(0),
             session_user: Mutex::new(String::new()),
             backend: Arc::new(BackendEntry::new("")),
-            deferred_fks: Mutex::new(Vec::new()),
-            deferred_triggers: Mutex::new(Vec::new()),
+            deferred: txn_state::DeferredChecks::default(),
             transition_rows: Mutex::new(HashMap::new()),
-            constraint_modes: Mutex::new((None, HashMap::new())),
             commit_failed: AtomicBool::new(false),
             implicit_extended: AtomicBool::new(false),
             cycle_open: Arc::new(AtomicBool::new(false)),
@@ -25048,6 +25041,15 @@ impl PgHandler {
     }
 
     fn commit_implicit(&self) -> PgWireResult<()> {
+        // The deferred checks ran inside the commit; whichever way it ended,
+        // the transaction's deferred state and `SET CONSTRAINTS` modes end
+        // with it.
+        let out = self.commit_implicit_inner();
+        self.clear_deferred();
+        out
+    }
+
+    fn commit_implicit_inner(&self) -> PgWireResult<()> {
         // `set_config(x, v, true)` / `SET LOCAL` end with the implicit
         // transaction too, not only with a block.
         self.end_txn_gucs(true);
@@ -25602,6 +25604,8 @@ impl PgHandler {
                         row_waits::forget(pid);
                         xids::end(&self.storage, pid);
                         self.marks.end();
+                        // After the COMMIT's checks ran, or the ROLLBACK.
+                        self.clear_deferred();
                     }
                     out
                 }
@@ -36279,32 +36283,18 @@ impl PgHandler {
         if !deferrable {
             return false;
         }
-        let modes = self
-            .constraint_modes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let modes = self.deferred.modes();
         modes.1.get(name).copied().or(modes.0).unwrap_or(initially)
     }
 
     /// Forget every deferred check and `SET CONSTRAINTS` mode: the block is
     /// over.
     fn clear_deferred(&self) {
-        self.deferred_fks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.deferred_triggers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        *self
-            .constraint_modes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = (None, HashMap::new());
+        self.deferred.clear();
     }
 
     fn defer_fk(&self, table: &str, name: &str) {
-        let mut q = self.deferred_fks.lock().unwrap_or_else(|e| e.into_inner());
+        let mut q = self.deferred.fks();
         let key = (table.to_string(), name.to_string());
         if !q.contains(&key) {
             q.push(key);
@@ -36714,16 +36704,13 @@ impl PgHandler {
     fn run_deferred(&self, only: Option<&[String]>) -> PgWireResult<()> {
         let wanted = |name: &str| only.is_none_or(|n| n.iter().any(|x| x == name));
         let queued: Vec<(String, String)> = {
-            let mut q = self.deferred_fks.lock().unwrap_or_else(|e| e.into_inner());
+            let mut q = self.deferred.fks();
             let (run, keep): (Vec<_>, Vec<_>) = q.drain(..).partition(|(_, n)| wanted(n));
             *q = keep;
             run
         };
         let events: Vec<triggers::DeferredTrigger> = {
-            let mut q = self
-                .deferred_triggers
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut q = self.deferred.triggers();
             let (run, keep): (Vec<_>, Vec<_>) = q
                 .drain(..)
                 .partition(|t| wanted(t.trg.get_str("name").unwrap_or_default()));

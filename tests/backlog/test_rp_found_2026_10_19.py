@@ -30,3 +30,21 @@ def test_nextval_is_not_rolled_back_after_a_committed_block(pg: Any) -> None:
     assert pg_answer(pg, "select nextval('rp050_s')") == ("ok", [(1,)])
     pg.execute("rollback")
     assert pg_answer(pg, "select nextval('rp050_s')") == ("ok", [(2,)])
+
+
+@pytest.mark.backlog_fixed("RP-052")
+def test_set_constraints_ends_with_its_transaction(pg: Any) -> None:
+    """PostgreSQL 15.19: `SET CONSTRAINTS` lasts only for the current
+    transaction, so after `begin; set constraints all deferred; commit;` a
+    later block's insert that breaks a DEFERRABLE INITIALLY IMMEDIATE
+    foreign key fails at once (23503). Before the fix the insert was
+    accepted: the mode outlived the COMMIT, and only a ROLLBACK reset it."""
+    pg.execute("create table rp052_p (id int primary key)")
+    pg.execute("create table rp052_c (pid int references rp052_p deferrable initially immediate)")
+    pg.execute("begin")
+    pg.execute("set constraints all deferred")
+    pg.execute("commit")
+    pg.execute("begin")
+    answer = pg_answer(pg, "insert into rp052_c values (42)")
+    pg.execute("rollback")
+    assert answer[:2] == ("err", "23503")
