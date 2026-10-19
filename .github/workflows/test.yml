@@ -2220,7 +2220,7 @@ jobs:
           export SECANTUS_WT_INCLUDE="$WT/include" SECANTUS_WT_LIB="$WT"
           # bindgen needs libclang; find it wherever the runner's LLVM put it
           # (Ubuntu noble ships LLVM 18, not a fixed version -- do not hardcode).
-          lc="$(find /usr/lib /usr/lib64 -name 'libclang*.so*' 2>/dev/null | head -1)"
+          lc="$(find /usr/lib /usr/lib64 \( -name 'libclang.so*' -o -name 'libclang-[0-9]*.so*' \) 2>/dev/null | sort | head -1)"
           test -n "$lc" || { echo "libclang not found" >&2; exit 1; }
           export LIBCLANG_PATH="$(dirname "$lc")"
           echo "LIBCLANG_PATH=$LIBCLANG_PATH"
@@ -2256,7 +2256,7 @@ jobs:
         run: |
           WT="$PWD/$(ls -d build/*/wt-build | head -1)"
           export SECANTUS_WT_INCLUDE="$WT/include" SECANTUS_WT_LIB="$WT"
-          lc="$(find /usr/lib /usr/lib64 -name 'libclang*.so*' 2>/dev/null | head -1)"
+          lc="$(find /usr/lib /usr/lib64 \( -name 'libclang.so*' -o -name 'libclang-[0-9]*.so*' \) 2>/dev/null | sort | head -1)"
           test -n "$lc" || { echo "libclang not found" >&2; exit 1; }
           export LIBCLANG_PATH="$(dirname "$lc")"
           (cd crates/secantus-pg && cargo test --test embedded --test signals --test pg_server)
