@@ -2493,7 +2493,7 @@ impl PgHandler {
     /// recorded ones by oid.
     /// Every role. Read through a process-wide cache keyed on the catalog
     /// version, which every role-changing statement moves -- after its
-    /// commit too (`catalog_changed_in_txn`). A miss reads the COMMITTED
+    /// commit too (`TxnMarks`). A miss reads the COMMITTED
     /// roles on a fresh session, as PostgreSQL resolves a role against the
     /// latest catalog snapshot. A connection whose open transaction changed
     /// a role reads its own transaction's view, uncached, until it ends.
@@ -2505,10 +2505,7 @@ impl PgHandler {
     /// looks one role up, and copying every role for it was ~0.7 us of a
     /// primary-key read (batch 58's `sample`).
     fn roles_shared(&self) -> PgWireResult<Arc<Vec<RoleInfo>>> {
-        if self
-            .roles_written_in_txn
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.marks.roles_written() {
             return self.read_roles().map(Arc::new);
         }
         type RoleCache = Mutex<HashMap<usize, (u64, Arc<Vec<RoleInfo>>)>>;
@@ -2571,8 +2568,7 @@ impl PgHandler {
     /// Records a role, new or changed. A new one gets the next oid past every
     /// role and database, as PostgreSQL mints from one counter.
     fn write_role(&self, info: &RoleInfo, new: bool) -> PgWireResult<()> {
-        self.roles_written_in_txn
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.marks.note_roles_written();
         let ns = DatabaseRegistry::NAMESPACE;
         let exists = self
             .storage
@@ -2615,8 +2611,7 @@ impl PgHandler {
     }
 
     fn delete_role(&self, name: &str) -> PgWireResult<()> {
-        self.roles_written_in_txn
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.marks.note_roles_written();
         self.storage
             .delete_matching(
                 DatabaseRegistry::NAMESPACE,
@@ -3523,17 +3518,15 @@ pub struct PgHandler {
     /// The open block touched a temporary table (any access, a SELECT
     /// included): PostgreSQL refuses to PREPARE such a transaction.
     touched_temp: AtomicBool,
-    /// A statement of the open transaction changed the catalog: its commit
-    /// bumps the catalog version again (see `commit_implicit`).
-    catalog_changed_in_txn: AtomicBool,
+    /// What the open transaction did that bypasses the shared catalog
+    /// caches: changed the catalog, wrote a role. Ended with it on every
+    /// path (`TxnMarks::end`).
+    marks: txn_state::TxnMarks,
     /// How many catalog-changing statements are running on this session
     /// (nested ones count): their writes are committed before the catalog
     /// version moves (`bump_catalog_version` follows the statement), so
     /// while one runs the shared committed copies are stale for it.
     catalog_statements: std::sync::atomic::AtomicUsize,
-    /// This connection's open transaction wrote a role: its role reads see
-    /// that transaction's own view, not the shared committed cache.
-    roles_written_in_txn: AtomicBool,
     /// How many PL/pgSQL statements are running nested in this session's
     /// statement: `LOCK TABLE` needs a transaction block only at top level.
     nested_statements: std::sync::atomic::AtomicUsize,
@@ -3894,9 +3887,8 @@ impl PgHandler {
             pending_notifies: Mutex::new(Vec::new()),
             pending_listens: Mutex::new(Vec::new()),
             touched_temp: AtomicBool::new(false),
-            catalog_changed_in_txn: AtomicBool::new(false),
+            marks: txn_state::TxnMarks::default(),
             catalog_statements: std::sync::atomic::AtomicUsize::new(0),
-            roles_written_in_txn: AtomicBool::new(false),
             nested_statements: std::sync::atomic::AtomicUsize::new(0),
             batch_partial: Mutex::new(Vec::new()),
             wire_dealloc: Mutex::new(Vec::new()),
@@ -4382,9 +4374,7 @@ impl PgHandler {
         // the reads may differ (and then the record is cleared, so the next
         // statement installs afresh). They were a sixth of a `select 1`.
         let shareable = !self.storage.in_user_txn()
-            && !self
-                .catalog_changed_in_txn
-                .load(std::sync::atomic::Ordering::Relaxed)
+            && !self.marks.catalog_changed()
             && self.pending.tables().is_empty()
             && self.pending.types().is_empty();
         let storage_ptr = Arc::as_ptr(&self.storage) as usize;
@@ -25047,6 +25037,7 @@ impl PgHandler {
         // transaction survives a failed statement in PostgreSQL. The group
         // itself declared none -- `DECLARE` is refused outside a block.
         self.pending.clear();
+        self.marks.end();
         self.clear_deferred();
         if let Some(mut handle) = self.txn.lock().unwrap_or_else(|e| e.into_inner()).take() {
             self.storage
@@ -25101,14 +25092,9 @@ impl PgHandler {
         // own new relation unresolvable on that worker thread -- pgx's
         // parallel `create temp table t; insert ...` then `update t` (42P01).
         // Move it again now that the change is committed.
-        if self
-            .catalog_changed_in_txn
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.marks.end() {
             bump_catalog_version();
         }
-        self.roles_written_in_txn
-            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.settle_notifies(true);
         Ok(())
     }
@@ -25130,8 +25116,8 @@ impl PgHandler {
         self.pending.clear();
         self.in_transaction
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.roles_written_in_txn
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // Nothing to publish: the transaction's catalog changes are gone.
+        self.marks.end();
         self.clear_deferred();
         if let Some(mut handle) = self.txn.lock().unwrap_or_else(|e| e.into_inner()).take() {
             self.storage
@@ -25575,13 +25561,9 @@ impl PgHandler {
         // RECOVERS from the error that poisoned the block.
         if let Statement::Transaction(control) = &stmt {
             // Whether the block touched the catalog, read BEFORE the control
-            // statement (a COMMIT clears the flag as it publishes).
-            let catalog_touched = self
-                .catalog_changed_in_txn
-                .load(std::sync::atomic::Ordering::Relaxed)
-                || self
-                    .roles_written_in_txn
-                    .load(std::sync::atomic::Ordering::Relaxed)
+            // statement: one that ends the block ends its marks.
+            let catalog_touched = self.marks.catalog_changed()
+                || self.marks.roles_written()
                 || !self.pending.types()
                     .is_empty()
                 // A prepared transaction's DDL is published by whichever
@@ -25605,7 +25587,9 @@ impl PgHandler {
                 }
                 other => {
                     let out = self.transaction_control(other.clone());
-                    // The block's transaction-scoped advisory locks end with it.
+                    // The block's transaction-scoped advisory locks end with
+                    // it, and so do its marks (`catalog_touched` above has
+                    // what the bump below needs).
                     if matches!(
                         other,
                         TransactionControl::Commit { .. }
@@ -25617,6 +25601,7 @@ impl PgHandler {
                         table_locks::release(pid);
                         row_waits::forget(pid);
                         xids::end(&self.storage, pid);
+                        self.marks.end();
                     }
                     out
                 }
@@ -25633,11 +25618,6 @@ impl PgHandler {
             // at seconds a statement (psycopg's `test_commit_concurrency`).
             if catalog_touched {
                 bump_catalog_version();
-                // The block is over: what it changed is published or gone.
-                if matches!(control, TransactionControl::Rollback { .. }) {
-                    self.catalog_changed_in_txn
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
-                }
             }
             return out;
         }
@@ -30847,8 +30827,7 @@ impl PgHandler {
         }
         if may_change_catalog {
             bump_catalog_version();
-            self.catalog_changed_in_txn
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.marks.note_catalog_changed();
         }
         if let (Some(name), Ok(_)) = (temp_created, &out) {
             secantus_pgplan::schemas::note_relation_key(&name);
