@@ -84,6 +84,7 @@ mod triggers;
 mod ts_catalogs;
 mod tuplesort;
 mod txn_gucs;
+mod txn_state;
 mod window_order;
 mod wire_portals;
 mod x509;
@@ -371,7 +372,7 @@ thread_local! {
     /// can be at the same catalog version with different overlays.
     ///
     /// An overlay view is safe to record against a catalog version because
-    /// every mutation of `uncommitted_types` happens in a statement that
+    /// every mutation of `pending.types` happens in a statement that
     /// bumps the version: a DDL statement (`may_change_catalog`), a
     /// transaction-control statement, or a rollback to a savepoint. The
     /// version therefore moves whenever the overlay does. Recording it
@@ -3107,16 +3108,8 @@ impl PgHandler {
             HashMap<(usize, String, &'static str), (u64, Arc<dyn std::any::Any + Send + Sync>)>;
         static CACHE: OnceLock<Mutex<Slots>> = OnceLock::new();
         let shareable = !self.storage.in_user_txn()
-            && self
-                .uncommitted
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty()
-            && self
-                .uncommitted_types
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty();
+            && self.pending.tables().is_empty()
+            && self.pending.types().is_empty();
         if !shareable {
             return read();
         }
@@ -3351,9 +3344,10 @@ pub struct PgHandler {
     /// own statement store is not consulted because it also holds the
     /// unnamed statement, which PostgreSQL never lists.
     prepared: Mutex<Vec<PreparedRecord>>,
-    /// Tables created (`Some`) or dropped (`None`) in the open transaction and
-    /// not yet committed. Cleared when the transaction ends, whichever way.
-    uncommitted: Mutex<HashMap<String, Option<TableDef>>>,
+    /// What the open transaction wrote to the catalog and has not committed:
+    /// tables, types and sequences. Cleared when the transaction ends,
+    /// whichever way.
+    pending: txn_state::PendingCatalog,
     /// What this SESSION last drew from each sequence, for `currval`.
     /// PostgreSQL keys it per session rather than per sequence, so a
     /// `currval` before any `nextval` in this session is 55000 even when
@@ -3398,17 +3392,6 @@ pub struct PgHandler {
     /// An md5 password login in progress: the role, its stored
     /// `md5<hex>` hash, and the salt sent to the client.
     md5_auth: Mutex<Option<(String, String, [u8; 4])>>,
-    /// User TYPES created or dropped in the open transaction but not yet
-    /// committed -- the type analogue of `uncommitted`. Planning reads the
-    /// type catalog (`to_regtype`, a column's declared type), and an
-    /// uncommitted `CREATE TYPE` is invisible to a plain read, so
-    /// `CREATE TYPE t ...; SELECT 't'::regtype` in one transaction failed.
-    /// Wrapping the catalog read in `with_user_transaction` deadlocks COPY
-    /// (see `plan_with_session_types`), so this mirrors tables: an overlay
-    /// consulted on top of the committed catalog, cleared when the
-    /// transaction ends and snapshotted by savepoints. Keyed by the catalog
-    /// collection and the doc's `_id`; a `None` value is a drop tombstone.
-    uncommitted_types: Mutex<UncommittedTypes>,
     /// Whether a transaction is open, as a LOCK-FREE flag.
     ///
     /// `txn` cannot answer this from inside `execute`: `run` holds that mutex
@@ -3558,9 +3541,6 @@ pub struct PgHandler {
     wire_dealloc: Mutex<Vec<String>>,
     /// The temporary tables this session created, dropped when it ends.
     temp_tables: Mutex<Vec<String>>,
-    /// The sequences whose stored row the open transaction wrote (created,
-    /// altered, dropped, reset): `nextval` advances those inside it.
-    txn_sequences: Mutex<std::collections::HashSet<String>>,
     /// The open block declared a `WITH HOLD` cursor: another thing
     /// PostgreSQL refuses to PREPARE.
     holdable_declared: AtomicBool,
@@ -3603,10 +3583,7 @@ pub struct PgHandler {
     subtxn_seq: std::sync::atomic::AtomicU64,
 }
 
-/// A user type created (`Some(doc)`) or dropped (`None`) in the open
-/// transaction, overlaid on the committed catalog. Keyed by
-/// `(catalog collection, doc _id)`.
-type UncommittedTypes = HashMap<(&'static str, String), Option<Document>>;
+use txn_state::UncommittedTypes;
 
 /// A materialised result as resolved per-column values: one inner `Vec` per
 /// row, one `Option<Bson>` per output column (`None` is SQL NULL). Kept by a
@@ -3872,7 +3849,7 @@ impl PgHandler {
             copy_in: Mutex::new(None),
             cursors: Mutex::new(HashMap::new()),
             prepared: Mutex::new(Vec::new()),
-            uncommitted: Mutex::new(HashMap::new()),
+            pending: txn_state::PendingCatalog::default(),
             session_currval: Mutex::new(HashMap::new()),
             session_lastval: Mutex::new(None),
             session_lastval_seq: Mutex::new(None),
@@ -3886,7 +3863,6 @@ impl PgHandler {
             running_apart: AtomicBool::new(false),
             auth: Mutex::new(None),
             md5_auth: Mutex::new(None),
-            uncommitted_types: Mutex::new(HashMap::new()),
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             binary_results: std::sync::atomic::AtomicBool::new(false),
             mixed_formats: Mutex::new(None),
@@ -3919,7 +3895,6 @@ impl PgHandler {
             batch_partial: Mutex::new(Vec::new()),
             wire_dealloc: Mutex::new(Vec::new()),
             temp_tables: Mutex::new(Vec::new()),
-            txn_sequences: Mutex::new(std::collections::HashSet::new()),
             holdable_declared: AtomicBool::new(false),
             txn_gucs: Mutex::new(HashMap::new()),
             statement_gucs: Mutex::new(HashMap::new()),
@@ -4404,16 +4379,8 @@ impl PgHandler {
             && !self
                 .catalog_changed_in_txn
                 .load(std::sync::atomic::Ordering::Relaxed)
-            && self
-                .uncommitted
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty()
-            && self
-                .uncommitted_types
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty();
+            && self.pending.tables().is_empty()
+            && self.pending.types().is_empty();
         let storage_ptr = Arc::as_ptr(&self.storage) as usize;
         let catalog_version = catalog_cache()
             .version
@@ -4491,11 +4458,7 @@ impl PgHandler {
                 INSTALLED_SETTINGS.with(|g| g.set(settings.generation()));
             }
         }
-        let overlay_empty = self
-            .uncommitted_types
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty();
+        let overlay_empty = self.pending.types().is_empty();
         let version = catalog_cache()
             .version
             .load(std::sync::atomic::Ordering::SeqCst);
@@ -9028,10 +8991,7 @@ impl PgHandler {
 
     fn type_catalog_docs_raw(&self, collection: &'static str) -> PgWireResult<Arc<Vec<Document>>> {
         let committed = self.committed_type_catalog_docs(collection)?;
-        let overlay = self
-            .uncommitted_types
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let overlay = self.pending.types();
         if overlay.is_empty() {
             return Ok(committed);
         }
@@ -9170,7 +9130,7 @@ impl PgHandler {
         // TRIGGER` followed by any read published the trigger to the
         // process-wide cache, and ANOTHER connection's `CREATE TABLE` then
         // FIRED it. Types escaped only because their DDL keeps the rows in
-        // the per-connection `uncommitted_types` overlay rather than in the
+        // the per-connection `pending.types` overlay rather than in the
         // transaction. Pinned by
         // `test_an_open_blocks_uncommitted_event_trigger_fires_for_no_one_else`.
         !self.storage.in_user_txn()
@@ -9184,10 +9144,7 @@ impl PgHandler {
     /// Record that the open transaction wrote sequence `name`'s row.
     pub(crate) fn note_txn_sequence(&self, name: &str) {
         if self.transaction_handle_open() {
-            self.txn_sequences
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(name.to_string());
+            self.pending.sequences().insert(name.to_string());
         }
     }
 
@@ -9195,9 +9152,8 @@ impl PgHandler {
         if !self.transaction_handle_open() {
             return;
         }
-        self.uncommitted_types
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.pending
+            .types()
             .insert((collection, id.to_string()), doc);
     }
 
@@ -9370,12 +9326,7 @@ impl PgHandler {
             .iter()
             .filter_map(|d| d.get_str("_id").ok().map(str::to_string))
             .collect();
-        for ((coll, id), doc) in self
-            .uncommitted_types
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-        {
+        for ((coll, id), doc) in self.pending.types().iter() {
             if *coll != SEQUENCE_COLLECTION {
                 continue;
             }
@@ -19138,12 +19089,7 @@ impl PgHandler {
         // committed. A `None` here is a tombstone: the table was dropped in
         // this transaction and must not be found even though its catalog row
         // is still there.
-        if let Some(pending) = self
-            .uncommitted
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(name)
-        {
+        if let Some(pending) = self.pending.tables().get(name) {
             return pending.clone();
         }
         let cache = catalog_cache();
@@ -23940,11 +23886,7 @@ impl PgHandler {
             && !self
                 .storage
                 .active_txn_wrote(self.db(), SEQUENCE_COLLECTION)
-            && self
-                .txn_sequences
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty()
+            && self.pending.sequences().is_empty()
         {
             self.storage.outside_user_transaction(f)
         } else {
@@ -24698,10 +24640,7 @@ impl PgHandler {
         if !self.transaction_handle_open() {
             return;
         }
-        self.uncommitted
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(name.to_string(), def);
+        self.pending.tables().insert(name.to_string(), def);
     }
 
     /// Queue a `ParameterStatus` report if this GUC is one PostgreSQL reports
@@ -24996,18 +24935,7 @@ impl PgHandler {
         // included, and a `WITH HOLD` cursor from an earlier, committed
         // transaction survives a failed statement in PostgreSQL. The group
         // itself declared none -- `DECLARE` is refused outside a block.
-        self.uncommitted
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.uncommitted_types
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.txn_sequences
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        self.pending.clear();
         self.clear_deferred();
         if let Some(mut handle) = self.txn.lock().unwrap_or_else(|e| e.into_inner()).take() {
             self.storage
@@ -25035,18 +24963,7 @@ impl PgHandler {
         // this connection, forever.
         self.txn_failed
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.uncommitted
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.uncommitted_types
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.txn_sequences
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        self.pending.clear();
         self.in_transaction
             .store(false, std::sync::atomic::Ordering::Relaxed);
         if let Some(mut handle) = self.txn.lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -25099,18 +25016,7 @@ impl PgHandler {
         // this connection, forever.
         self.txn_failed
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.uncommitted
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.uncommitted_types
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.txn_sequences
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        self.pending.clear();
         self.in_transaction
             .store(false, std::sync::atomic::Ordering::Relaxed);
         self.roles_written_in_txn
@@ -25565,10 +25471,7 @@ impl PgHandler {
                 || self
                     .roles_written_in_txn
                     .load(std::sync::atomic::Ordering::Relaxed)
-                || !self
-                    .uncommitted_types
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                || !self.pending.types()
                     .is_empty()
                 // A prepared transaction's DDL is published by whichever
                 // session finishes it, which never ran that DDL itself.
@@ -27994,16 +27897,8 @@ impl PgHandler {
                 let write_pos = self.block_write_pos();
                 let lock_pos = self.block_lock_pos();
                 let shared_pos = self.shared_lock_mark();
-                let uncommitted = self
-                    .uncommitted
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
-                let uncommitted_types = self
-                    .uncommitted_types
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
+                let uncommitted = self.pending.tables().clone();
+                let uncommitted_types = self.pending.types().clone();
                 self.savepoints
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -28111,11 +28006,8 @@ impl PgHandler {
                         Ok(())
                     })?;
                 }
-                *self.uncommitted.lock().unwrap_or_else(|e| e.into_inner()) = uncommitted;
-                *self
-                    .uncommitted_types
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = uncommitted_types;
+                *self.pending.tables() = uncommitted;
+                *self.pending.types() = uncommitted_types;
                 self.restore_savepoint_settings(saved_settings, saved_gucs);
                 // The cursors declared since the savepoint go with it.
                 self.cursors
@@ -28218,14 +28110,7 @@ impl PgHandler {
         // Whatever the transaction did to the catalog is either committed or
         // discarded once it ends, so the pending map stops being the truth.
         if !opens {
-            self.uncommitted
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clear();
-            self.uncommitted_types
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clear();
+            self.pending.clear();
         }
         // Every savepoint belongs to the block that is starting or ending.
         self.savepoints
@@ -28593,12 +28478,7 @@ impl PgHandler {
         // block had already rewritten: a write conflict with this session's
         // own transaction, retried forever (pgjdbc's BatchExecuteTest hung
         // on it). The block's row is the only one this session may advance.
-        if self
-            .txn_sequences
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(name)
-        {
+        if self.pending.sequences().contains(name) {
             return self.nextval_in_scope(name, count);
         }
         match self
@@ -36359,7 +36239,7 @@ impl PgHandler {
             .filter_map(|d| TableDef::from_document(&d))
             .collect();
         {
-            let pending = self.uncommitted.lock().unwrap_or_else(|e| e.into_inner());
+            let pending = self.pending.tables();
             defs.retain(|d| !pending.contains_key(&d.name));
             defs.extend(pending.values().filter_map(|d| d.clone()));
         }
@@ -36392,15 +36272,8 @@ impl PgHandler {
     /// is what the transaction would read.
     fn catalog_untouched(&self) -> bool {
         let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
-        self.uncommitted
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
-            && self
-                .uncommitted_types
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty()
+        self.pending.tables().is_empty()
+            && self.pending.types().is_empty()
             && !row_waits::wrote_collection(pid, |_, coll| coll.starts_with("__"))
     }
 
@@ -41950,17 +41823,7 @@ impl PgHandler {
         params: &[Bson],
         param_types: &[Option<String>],
     ) -> Option<PlanKey> {
-        if !self
-            .uncommitted
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
-            || !self
-                .uncommitted_types
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty()
-        {
+        if !self.pending.tables().is_empty() || !self.pending.types().is_empty() {
             return None;
         }
         let tags = params.iter().map(|p| p.element_type() as u8).collect();

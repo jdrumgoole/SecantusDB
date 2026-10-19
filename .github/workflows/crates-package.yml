@@ -57,8 +57,12 @@ jobs:
         # pg_query (the PostgreSQL crates' parser) runs bindgen in its build
         # script, whatever we do, so building secantus-pgplan / secantus-pg from
         # their tarballs needs libclang. Found wherever the runner's LLVM put it.
+        # The name is matched exactly: `libclang*.so*` also matches compiler-rt's
+        # `libclang_rt.*.so`, and the ubuntu-24.04 image of 2026-10-18 listed
+        # one of those first, so bindgen was pointed at a directory with no
+        # libclang in it.
         run: |
-          lc="$(find /usr/lib /usr/lib64 -name 'libclang*.so*' 2>/dev/null | head -1)"
+          lc="$(find /usr/lib /usr/lib64 \( -name 'libclang.so*' -o -name 'libclang-[0-9]*.so*' \) 2>/dev/null | sort | head -1)"
           test -n "$lc" || { echo "libclang not found" >&2; exit 1; }
           echo "LIBCLANG_PATH=$(dirname "$lc")" >> "$GITHUB_ENV"
       - name: Package and verify every crate
