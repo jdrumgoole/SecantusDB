@@ -1134,7 +1134,15 @@ fn retryable_write(
     registry.set_owner(lsid, user_digest(&authenticated(ctx)));
     // A retryable insert, update or delete names its session and statements
     // in its oplog entries, as mongod's do (RM-224).
-    let stamped = matches!(name, "insert" | "update" | "delete");
+    let fam = matches!(name, "findAndModify" | "findandmodify");
+    let stamped = fam || matches!(name, "insert" | "update" | "delete");
+    let session = doc! {
+        "id": bson::Binary { subtype: bson::spec::BinarySubtype::Uuid, bytes: lsid.to_vec() },
+        "uid": bson::Binary {
+            subtype: bson::spec::BinarySubtype::Generic,
+            bytes: user_digest(&authenticated(ctx)),
+        },
+    };
     if stamped {
         let session = doc! {
             "id": bson::Binary { subtype: bson::spec::BinarySubtype::Uuid, bytes: lsid.to_vec() },
@@ -1146,9 +1154,16 @@ fn retryable_write(
         if let (Some(s), Ok(bytes)) = (ctx.storage.as_ref(), bson::to_vec(&session)) {
             s.set_statement_position(None);
             s.set_retryable_session(Some((bytes, txn_number, ids.clone())));
+            if fam {
+                // A `findAndModify` is one statement, and names the image a
+                // retry of it returns.
+                s.set_statement_position(Some(0));
+                s.set_retry_image(Some(doc.get("new").is_some_and(crate::util::truthy)));
+                s.take_last_retryable_ts();
+            }
         }
     }
-    let (reply, records) = match name {
+    let (mut reply, records) = match name {
         "insert" => retry_insert(handler, doc, ctx, &ids, &done),
         "update" | "delete" => retry_batch(name, handler, doc, ctx, &ids, &done),
         "findAndModify" | "findandmodify" => retry_find_and_modify(handler, doc, ctx, &ids, &done),
@@ -1162,10 +1177,68 @@ fn retryable_write(
             s.set_retryable_session(None);
             s.set_statement_position(None);
             s.set_insert_positions(None);
+            s.set_retry_image(None);
+            if fam {
+                if let Err(e) = keep_retry_image(s.as_ref(), doc, &reply, session, txn_number) {
+                    reply = e.into_reply();
+                }
+            }
         }
     }
     registry.record_statements(lsid, txn_number, records);
     reply
+}
+
+/// Keep a retryable `findAndModify`'s image where mongod 8.2.11 keeps it:
+/// one document per session in `config.image_collection` (`{_id: lsid,
+/// txnNum, ts, imageKind, image, invalidated}`), written without an oplog
+/// entry, the image being the document the command returned. An upsert that
+/// inserted keeps none.
+fn keep_retry_image(
+    storage: &dyn crate::Storage,
+    doc: &Document,
+    reply: &Document,
+    lsid: Document,
+    txn_number: i64,
+) -> Result<(), CommandError> {
+    if !ok(reply) {
+        return Ok(());
+    }
+    let upserted = reply
+        .get_document("lastErrorObject")
+        .is_ok_and(|l| l.contains_key("upserted"));
+    let Some(Bson::Document(image)) = reply.get("value") else {
+        return Ok(());
+    };
+    let Some(ts) = storage.take_last_retryable_ts() else {
+        return Ok(());
+    };
+    if upserted {
+        return Ok(());
+    }
+    let remove = doc.get("remove").is_some_and(crate::util::truthy);
+    let post = !remove && doc.get("new").is_some_and(crate::util::truthy);
+    let row = doc! {
+        "_id": lsid.clone(),
+        "txnNum": txn_number,
+        "ts": ts,
+        "imageKind": if post { "postImage" } else { "preImage" },
+        "image": image.clone(),
+        "invalidated": false,
+    };
+    // mongod writes the image in the command's own unit of work, so a
+    // failure to keep it fails the command.
+    storage
+        .update_matching(
+            "config",
+            "image_collection",
+            &doc! {"_id": lsid},
+            &row,
+            false,
+            true,
+        )
+        .map_err(crate::util::command_error)?;
+    Ok(())
 }
 
 type Ran = (Document, Vec<(i32, StmtRecord)>);

@@ -306,6 +306,15 @@ pub trait Storage: Send + Sync {
     /// The statement position of each document the next insert is handed.
     fn set_insert_positions(&self, _positions: Option<Vec<usize>>) {}
 
+    /// Mark this thread's retryable write as a `findAndModify` returning the
+    /// post-image (`Some(true)`) or the pre-image; `None` clears.
+    fn set_retry_image(&self, _post: Option<bool>) {}
+
+    /// The `ts` of the last retryable write's oplog entry this thread wrote.
+    fn take_last_retryable_ts(&self) -> Option<bson::Timestamp> {
+        None
+    }
+
     /// A high-water-mark resume token at oplog `seq` and the current cluster
     /// time, encoded as `bson::encode({_data: "<hex>"})`. Returned as the
     /// `postBatchResumeToken` of an empty change-stream batch so the client can

@@ -798,6 +798,9 @@ fn with_retryable_session(
     let mut out = bson::doc! {"lsid": lsid.clone(), "txnNumber": txn};
     for (k, v) in entry {
         if k == "ts" && !group {
+            if let Some(kind) = rw.get("img") {
+                out.insert("needsRetryImage", kind.clone());
+            }
             if let Some(id) = rw.get("stmtId") {
                 out.insert("stmtId", id.clone());
             }
@@ -1025,6 +1028,11 @@ fn oplog_entry_is_local(e: &OplogEntry) -> bool {
         return true;
     }
     if ns.ends_with(".system.profile") {
+        return true;
+    }
+    // mongod writes a retryable `findAndModify`'s image without an oplog
+    // entry (measured 8.2.11).
+    if ns == "config.image_collection" {
         return true;
     }
     ns.ends_with(".$cmd") && target == Some(PROFILE_COLLECTION)
@@ -7196,7 +7204,11 @@ impl Storage {
         // cursor inserts autocommit, so the range deregisters inline below.
         let deferred =
             IN_SYNC_STMT.with(|f| f.get()) || !ACTIVE_TXN_SESSION.with(|c| c.get()).is_null();
+        let rw_at = entries.iter().rposition(has_retryable_stamp);
         let (start, ts) = self.mint_seq_and_ts(entries.len(), true);
+        if let Some(i) = rw_at {
+            LAST_RETRYABLE_TS.with(|t| t.set(Some(ts[i])));
+        }
         if deferred {
             PENDING_MINTED.with(|p| p.borrow_mut().push((start, start + n)));
         }
@@ -7324,7 +7336,11 @@ impl Storage {
         let n = pending.len();
         // No in-flight tracking: this mint happens AFTER the data commit and
         // its visibility is governed by the drainer's `written_seq` watermark.
+        let rw_at = pending.iter().rposition(|(e, _)| has_retryable_stamp(e));
         let (start, ts) = self.mint_seq_and_ts(n, false);
+        if let Some(i) = rw_at {
+            LAST_RETRYABLE_TS.with(|t| t.set(Some(ts[i])));
+        }
         let wall_millis = now_millis();
         let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(n);
         let mut preimages: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
@@ -21272,6 +21288,29 @@ thread_local! {
     /// The statement position of each document an insert on this thread was
     /// handed, in the order it was handed them.
     static INSERT_POSITIONS: RefCell<Option<Vec<usize>>> = const { RefCell::new(None) };
+    /// A retryable `findAndModify` on this thread: whether it returns the
+    /// post-image (its update's `needsRetryImage`; a remove's is the pre-image).
+    static RETRY_IMAGE_POST: Cell<Option<bool>> = const { Cell::new(None) };
+    /// The `ts` of the last retryable write's entry minted on this thread.
+    static LAST_RETRYABLE_TS: Cell<Option<bson::Timestamp>> = const { Cell::new(None) };
+}
+
+/// Mark this thread's retryable write as a `findAndModify` that returns the
+/// post-image (`Some(true)`) or the pre-image (`Some(false)`); `None` clears.
+pub fn set_retry_image(post: Option<bool>) {
+    RETRY_IMAGE_POST.with(|p| p.set(post));
+}
+
+/// The `ts` of the last retryable write's entry minted on this thread, once.
+pub fn take_last_retryable_ts() -> Option<bson::Timestamp> {
+    LAST_RETRYABLE_TS.with(|t| t.take())
+}
+
+fn has_retryable_stamp(e: &OplogEntry) -> bool {
+    match e {
+        OplogEntry::Raw(buf) => buf.get("rw").ok().flatten().is_some(),
+        OplogEntry::Doc(d) => d.contains_key("rw"),
+    }
 }
 
 /// Mark this thread's writes as a retryable write's: `lsid`, `txnNumber`,
@@ -21325,6 +21364,7 @@ fn stamp_retryable(entries: Vec<OplogEntry>) -> Vec<OplogEntry> {
     let Some(stamp) = retryable_stamp(position) else {
         return entries;
     };
+    let image = RETRY_IMAGE_POST.with(Cell::get);
     entries
         .into_iter()
         .map(|e| match e {
@@ -21334,7 +21374,18 @@ fn stamp_retryable(entries: Vec<OplogEntry>) -> Vec<OplogEntry> {
                         .get_str("op")
                         .is_ok_and(|op| matches!(op, "i" | "u" | "d")) =>
             {
-                buf.append("rw", stamp.clone());
+                // A `findAndModify` that changed a stored document names the
+                // image a retry returns; an upsert's insert names none.
+                let kind = match (buf.get_str("op").unwrap_or(""), image) {
+                    ("u", Some(true)) => Some("postImage"),
+                    ("u" | "d", Some(_)) => Some("preImage"),
+                    _ => None,
+                };
+                let mut stamp = stamp.clone();
+                if let Some(kind) = kind {
+                    stamp.append("img", kind);
+                }
+                buf.append("rw", stamp);
                 OplogEntry::Raw(buf)
             }
             OplogEntry::Doc(mut d)

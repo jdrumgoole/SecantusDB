@@ -641,12 +641,13 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       `createIndexes` and a `dropIndexes` read as mongod 8.2.11 writes them,
       with its `t` and `v`, and a retryable insert, update or delete with
       its session (`lsid`, `txnNumber`, `stmtId`, `prevOpTime`). Open:
-      - a retryable `findAndModify` (and a `bulkWrite` command's
-        writes) carry no session: mongod stamps a `findAndModify` with
-        `lsid` / `txnNumber` / `stmtId` / `prevOpTime` and
-        `needsRetryImage`, and keeps the image in `config.image_collection`
-        (retryable `insert` / `update` / `delete` carry theirs since
-        2026-10-20);
+      - a `bulkWrite` command's writes carry no session (retryable
+        `insert` / `update` / `delete` / `findAndModify` carry theirs, a
+        `findAndModify` its `needsRetryImage` and its image in
+        `config.image_collection`, since 2026-10-20); and an image is never
+        deleted, where mongod deletes a session's image (an oplogged delete)
+        when its logical-session reaper expires the session, which this
+        server does not run;
       - an index build over documents is one `createIndexes`, where mongod
         writes, for the whole command's new indexes as ONE build (measured
         8.2.11): an insert into `config.system.indexBuilds` (`{_id: build
