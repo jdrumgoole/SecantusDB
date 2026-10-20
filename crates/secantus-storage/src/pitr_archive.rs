@@ -92,9 +92,18 @@ pub fn write_segment(
 }
 
 /// Sync a directory, so a file created or renamed in it keeps its name
-/// through a power loss.
+/// through a power loss. A Unix notion: Windows will not open a directory
+/// as a file ("Access is denied"), and NTFS journals the rename itself.
 pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::File::open(dir)?.sync_all()
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 fn read_segment_file(path: &Path) -> Result<Vec<(i64, Document, Option<Document>)>> {
