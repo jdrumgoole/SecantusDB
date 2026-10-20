@@ -573,19 +573,25 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       also lacks.
       Backlog-ID: RM-215
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_diagnostic_stages
-- [ ] **No registry of running operations, so `currentOp`, `$currentOp`
-      and `killOp` cannot see or stop work.**
-      - `currentOp` does not list another client's waiting getMore; mongod
-        lists it (op `getmore`), and `killOp` on its opid ends it with
-        11601.
-      - `$currentOp` emits one synthetic row (`aggregate.rs`, "keeps no
-        per-op registry"), and `idleCursors: true` lists none of another
-        client's open cursors (mongod: 1).
-      - `killOp` takes a connection id. Measured: given the opid of the
-        caller's own `currentOp` row, it closed the caller's connection.
-      - A long query or index build cannot be found or interrupted.
+- [ ] **`killOp` interrupts only a waiting `getMore`, and the operation
+      rows lack mongod's detail.** Since 2026-10-20 a registry of running
+      operations stands behind `currentOp`, `$currentOp` (with
+      `idleCursors`) and `killOp`, which ends a waiting tailable `getMore`
+      with 11601. Open:
+      - a long query, aggregation or index build is listed but not
+        interrupted: `killOp` sets the flag, and only the getMore await
+        reads it. mongod checks for interrupts as it works (the deadline
+        polls here are where to read it);
+      - a row has no `currentOpTime`, `lsid`, `planSummary`,
+        `queryFramework`, `numYields`, `locks`, `queues` or `waitingForLock`;
+        a getMore's `cursor` block has only its id; an idle cursor's has no
+        `createdDate`, `lastAccessDate`, `nDocsReturned`, `nBatchesReturned`
+        or `originatingCommand` (the cursor registry does not keep them; its
+        clock is monotonic);
+      - `$currentOp`'s `allUsers`, `idleConnections` and `idleSessions`
+        options are not applied.
       Backlog-ID: RM-216
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_current_op_lists_idle_cursors,tests/backlog/test_rm_found_2026_10_20b.py::test_current_op_sees_a_running_operation
+      Verify: none -- interrupting a long scan needs one that outlasts a test's timing; the registry's own tests are backlog_fixed
 - [ ] **Ten commands mongod runs are 59 CommandNotFound here.**
       mongod 8.2.11 (one-member replica set) answers each with success or
       an error of its own:

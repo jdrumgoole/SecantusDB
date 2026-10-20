@@ -460,8 +460,13 @@ pub fn kill_op(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("invalid op : {op_id}. Op ID cannot be represented with 32 bits"),
         ));
     }
-    if let Some(killer) = &ctx.conn_killer {
-        killer.kill(op_id);
+    // The operation `op_id` names, in the registry of running operations,
+    // is marked killed; its next interrupt check ends it with 11601. An
+    // opid that names nothing running gets the same answer from mongod.
+    // (This used to close the CONNECTION whose id matched, so the opid of
+    // the caller's own `currentOp` row closed the caller's connection.)
+    if let Some(ops) = &ctx.ops {
+        ops.kill(op_id);
     }
     Ok(doc! { "info": "attempting to kill op", "ok": 1.0 })
 }

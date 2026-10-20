@@ -427,7 +427,7 @@ def _idle_cursors(client: Any) -> tuple:
         other.close()
 
 
-@pytest.mark.backlog("RM-216")
+@pytest.mark.backlog_fixed("RM-216")
 def test_current_op_lists_idle_cursors(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 lists another client's open cursor under
     `$currentOp: {idleCursors: true}` (1 entry)."""
@@ -464,7 +464,7 @@ def _running_op(client: Any) -> tuple:
         other.close()
 
 
-@pytest.mark.backlog("RM-216")
+@pytest.mark.backlog_fixed("RM-216")
 def test_current_op_sees_a_running_operation(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `currentOp` lists another client's getMore waiting on
     a tailable awaitData cursor (1 entry, op "getmore"), and `killOp` on its

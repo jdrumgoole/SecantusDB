@@ -72,6 +72,7 @@ pub mod mongod_codes;
 mod mongod_commands;
 mod near;
 mod notablescan;
+pub mod ops;
 pub mod params;
 mod privileges;
 mod procstats;
@@ -204,6 +205,9 @@ pub struct CommandContext {
     /// by its `conn_id`. `None` until the server wires one in (and in unit-test
     /// contexts).
     pub conn_killer: Option<Arc<dyn ConnectionKiller>>,
+    /// The server's running operations (`currentOp`, `killOp`). `None` in
+    /// unit-test contexts.
+    pub ops: Option<Arc<ops::OpRegistry>>,
     /// The server's in-memory log ring buffer, read by `getLog`. `None` until the
     /// server wires one in (and in unit-test contexts) — `getLog` then reports an
     /// empty log.
@@ -296,6 +300,7 @@ impl CommandContext {
             failpoints: None,
             close_connection: false,
             conn_killer: None,
+            ops: None,
             logs: None,
             conn_stats: None,
             top_stats: None,
@@ -352,6 +357,12 @@ impl CommandContext {
     /// uses it to close a connection by its `conn_id`.
     pub fn with_conn_killer(mut self, conn_killer: Arc<dyn ConnectionKiller>) -> Self {
         self.conn_killer = Some(conn_killer);
+        self
+    }
+
+    /// Attach the server's registry of running operations (builder-style).
+    pub fn with_ops(mut self, ops: Arc<ops::OpRegistry>) -> Self {
+        self.ops = Some(ops);
         self
     }
 
@@ -730,6 +741,11 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     let _active = stats
         .as_ref()
         .map(|s| s.status.activate(status::OpKind::of(name)));
+    // Listed by `currentOp` and killable by `killOp` while it runs (RM-216).
+    let _op = ctx
+        .ops
+        .clone()
+        .map(|registry| ops::begin(&registry, doc, ctx));
     // The write concern a write with none of its own is held to: the stored
     // default, read BEFORE the command runs, so `setDefaultRWConcern`'s own
     // write answers for the default it replaces (mongod's order).

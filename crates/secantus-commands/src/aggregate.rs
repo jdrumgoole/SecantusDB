@@ -1652,7 +1652,15 @@ fn run_segmented(
                 buffer.clear();
             }
             docs = if name == "$currentOp" {
-                apply_source_stage(name, db, coll, cmd_doc, client_metadata)
+                // The registry's operations, and its idle cursors when asked
+                // (RM-216); the synthetic row only off-server.
+                let idle = stage
+                    .as_document()
+                    .and_then(|d| d.get_document(name).ok())
+                    .and_then(|spec| spec.get_bool("idleCursors").ok())
+                    .unwrap_or(false);
+                crate::ops::current_op_rows(idle)
+                    .unwrap_or_else(|| apply_source_stage(name, db, coll, cmd_doc, client_metadata))
             } else {
                 known_sessions(stage.as_document().and_then(|d| d.get(name)))
             };
