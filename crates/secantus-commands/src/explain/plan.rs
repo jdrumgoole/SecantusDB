@@ -588,7 +588,25 @@ fn or_access(
     for branch in branches {
         let doc = branch.as_document()?;
         let parts = clauses(doc);
-        let access = index_access(&parts, &plain, catalog)?;
+        // mongod plans each branch on its own, with its multi-planner when
+        // several plans could answer it (the subplanner, 8.2.11): the
+        // branch's own trial, which `explain` does not list.
+        let alone = Query {
+            canonical: doc,
+            limit: 0,
+            skip: 0,
+            ..plain.clone()
+        };
+        let tried_alone = plain.trial.and_then(|trial| {
+            let kept = trial.ranked.replace(Vec::new());
+            let found = tried(&parts, &alone, catalog, trial, assemble(parts.clone()));
+            *trial.ranked.borrow_mut() = kept;
+            found
+        });
+        let access = match tried_alone {
+            Some(found) => found,
+            None => index_access(&parts, &plain, catalog)?,
+        };
         let at = access
             .index
             .as_ref()
@@ -608,13 +626,20 @@ fn or_access(
                     None => shared.push((at, vec![(ix, exact, doc.clone())])),
                 }
             }
-            (scan, _) => own.push(match access.fetch_filter {
-                Some(f) => Node::fetch(Some(f), scan),
-                None => scan,
-            }),
+            (scan, at) => own.push((
+                at.unwrap_or(usize::MAX),
+                match access.fetch_filter {
+                    Some(f) => Node::fetch(Some(f), scan),
+                    None => scan,
+                },
+            )),
         }
     }
     shared.sort_by_key(|(at, _)| *at);
+    // A branch with a scan of its own comes in the order of the index it
+    // reads too (measured 8.2.11), not the order it was written in.
+    own.sort_by_key(|(at, _)| *at);
+    let own: Vec<Node> = own.into_iter().map(|(_, node)| node).collect();
     let mut scans: Vec<(Node, Option<Document>)> = shared
         .into_iter()
         .map(|(_, list)| {
@@ -937,8 +962,21 @@ fn candidates(
 pub(crate) fn contested(q: &Query, catalog: &[Rc<IndexInfo>]) -> bool {
     let parts = clauses(q.canonical);
     if let [only] = parts.as_slice() {
-        if only.contains_key("$or") {
-            return false;
+        // An `$or` is planned branch by branch, each with its own trial
+        // where several plans could answer it (`or_access`).
+        if let Ok(branches) = only.get_array("$or") {
+            return branches.iter().filter_map(Bson::as_document).any(|b| {
+                let alone = Query {
+                    canonical: b,
+                    sort: None,
+                    projection: None,
+                    limit: 0,
+                    skip: 0,
+                    hint: Hint::None,
+                    ..q.clone()
+                };
+                candidates(&clauses(b), &alone, catalog, None).len() > 1
+            });
         }
     }
     candidates(&parts, q, catalog, None).len() > 1

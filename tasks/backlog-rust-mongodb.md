@@ -39,12 +39,22 @@ one beside it.
 
 ## Open from the 2026-08-26 triage
 
-- [ ] **Rust MongoDB `explain`: the index shown for each `$or` branch** is
-  mongod's cost-model choice and is not reproduced when a branch has several
-  usable indexes (noted 2026-10-02, batch 45). Reproduce: two indexes that can
-  both serve one `$or` branch, then compare `explain` against mongod 8.2.11.
-  Backlog-ID: RM-001
-  Verify: tests/backlog/test_rm_001_028.py::test_or_branch_index_choice_matches_mongod
+- [ ] **An `$or` beside another clause reads one index where mongod reads
+  the branches'.** Since 2026-10-20 an `$or` that is the whole query is
+  planned branch by branch, each branch with its own trial of the plans
+  that could answer it (mongod's subplanner; RM-001, fixed). An `$or`
+  BESIDE another clause is different: mongod also enumerates the plan
+  that reads each branch's index and rechecks the rest, and tries it
+  against the plans of one index for the whole query (measured on a fresh
+  collection, 8.2.11: `{$or: [{a: 3, b: 2}, {c: 5}, {d: 1, b: 3}], d:
+  {$ne: 5}}` reads `a_1_b_1`, `d_1_b_1` and `c_1`). This server never
+  offers the branches' plan to the trial when an index serves the whole
+  query, so it reads `d_1_b_1` alone, and the documents come back in that
+  index's order. Results are right either way. mongod's choice also
+  follows its plan cache (RM-154): a probe that ran other shapes first
+  saw different branch indexes than a fresh collection does.
+  Backlog-ID: RM-199
+  Verify: tests/backlog/test_rm_001_028.py::test_or_beside_other_clauses_is_a_candidate_plan
 - **Scope decision — `$where` and `$function`** need a JavaScript engine.
   Neither server has one, and none is planned (WONTFIX).
 
@@ -283,18 +293,6 @@ These are explicit non-goals. Don't add them without a reason.
       Backlog-ID: RM-011
       Verify: none -- .NET gauge teardown stall (tooling)
 
-- [ ] **OPEN — the Go cross-driver smoke tests download modules at test time.**
-      `tests/test_cross_driver_features.py`'s `go run ./cluster_roles`,
-      `./sessions` and `./batchsize-zero` fetch their modules from
-      proxy.golang.org inside the test, and no CI job caches or pre-downloads
-      them. On 2026-10-06 one `test-durable` lane failed all three with
-      `stream error: stream ID 23; INTERNAL_ERROR` from the proxy before any
-      program reached the server. The rerun passed, but the failure measured
-      the network, not the server. Fix: `go mod download` in a setup step,
-      with `actions/setup-go`'s module cache, so the test itself never goes to
-      the network.
-      Backlog-ID: RM-012
-      Verify: none -- CI module download/caching
 
 - [ ] **OPEN — `test_stop_ends_a_running_command` on Windows: the fix is not
       yet observed under the original race, and `test_opsboard.py`'s half was
@@ -486,14 +484,6 @@ These are explicit non-goals. Don't add them without a reason.
   divergence. Pinning it down means bisecting a ~10-minute full-gauge run.
   Backlog-ID: RM-020
   Verify: none -- C gauge failure only inside full gauge run
-- [ ] **A wrong comment in `.github/workflows/test.yml`'s "Rust-server
-  concurrency invariants" step.** It says the `[python]` params are skipped
-  because they "need the SWIG `wiredtiger` binding this storage-flavoured
-  wheel doesn't ship". The wheel does ship it (`CMakeLists.txt` builds it
-  with `ENABLE_PYTHON=ON`), and the other gated files import and run there.
-  Correct the comment, and decide whether `-k rust` is still needed.
-  Backlog-ID: RM-021
-  Verify: none -- wrong comment in a CI workflow
 
 ## 7. Python → Rust rewrite (in progress)
 
@@ -1145,14 +1135,6 @@ differs on 17 of 1,295. Pinned by
 
 What is left, on the RUST MongoDB server:
 
-- [ ] **`secantus-core-py`, the parity binding, still decodes through
-      serde** (36 calls). The PostgreSQL crates' five were replaced on
-      2026-10-14 (see the Rust PG server's built-in functions entry).
-      **Decided 2026-10-16 (Joe):** replace the 36 serde decodes with
-      `secantus_core::bsondoc::from_bytes`, then let
-      `tests/test_rust_literal_bson_decode.py` cover every crate.
-      Backlog-ID: RM-058
-      Verify: none -- the serde decode is in the secantus-core-py parity binding, a test vehicle with no wire behaviour to compare against mongod
 - [ ] **The field order of a document upserted from two or more
       equalities.** mongod: `{a: 1, b: 2, c: 3, d: 4}` gives `c, a, b, d`;
       `{d: 1, c: 2, b: 3, a: 4}` gives `d, b, a, c`; an explicit `$and`

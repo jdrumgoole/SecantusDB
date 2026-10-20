@@ -18,14 +18,22 @@ from pathlib import Path
 
 CRATES = Path(__file__).resolve().parent.parent / "crates"
 
-#: The crates a request or a stored document passes through.
+#: Every crate of the MongoDB side: the ones a request or a stored document
+#: passes through, the auth and wire crates, and the Python bindings,
+#: `secantus-core-py` (the parity binding) and `secantus-server-py`
+#: (decided 2026-10-16, RM-058). The PostgreSQL crates have a check of
+#: their own.
 SERVER_CRATES = (
+    "secantus-auth",
     "secantus-core",
+    "secantus-core-py",
     "secantus-commands",
     "secantus-storage",
     "secantus-storage-adapter",
     "secantus-storage-py",
     "secantus-server",
+    "secantus-server-py",
+    "secantus-wire",
     "secantusdb",
 )
 

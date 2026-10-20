@@ -610,7 +610,6 @@ fn rd_u32(buf: &[u8], at: usize) -> u32 {
 mod tests {
     use super::*;
     use bson::doc;
-    use std::io::Cursor;
 
     fn enc(d: &bson::Document) -> Vec<u8> {
         let mut v = Vec::new();
@@ -743,7 +742,7 @@ mod tests {
         assert!(msg.document_sequences.is_empty());
         // The borrowed body re-decodes to the original document.
         assert_eq!(
-            bson::Document::from_reader(&mut Cursor::new(msg.body)).unwrap(),
+            bson::Document::try_from(bson::RawDocument::from_bytes(msg.body).unwrap()).unwrap(),
             doc! {"ping": 1, "$db": "admin"}
         );
     }
