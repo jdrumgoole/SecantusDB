@@ -4,12 +4,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import re
 from typing import Any
 
+import pymongo
 import pytest
 from bson import Binary, Timestamp
+from pymongo.errors import PyMongoError
 
 from tests.backlog.test_rm_057_084 import mongod_rs  # noqa: F401 - fixture
 
@@ -242,26 +245,67 @@ def test_oplog_update_entries_are_mongods_diff(rust_mongo: Any, mongod_rs: Any) 
     assert _update_entries(rust_mongo) == _update_entries(mongod_rs)
 
 
-def _batched_insert_entries(client: Any) -> list:
+def _insert_groups(client: Any) -> list:
+    """How batches of inserts are logged, outside a retryable write: one
+    `applyOps` per group, or plain inserts."""
+    host, port = client.address
+    plain = pymongo.MongoClient(host, port, directConnection=True, retryWrites=False)
+    db = plain.rm224
+    out = []
+    for docs, ordered in [
+        ([{"_id": 1}], True),
+        ([{"_id": i} for i in range(3)], True),
+        ([{"_id": i} for i in range(501)], True),
+        ([{"_id": i, "s": "x" * 100_000} for i in range(6)], True),
+        ([{"_id": i, "s": "x" * 300_000} for i in range(3)], True),
+        ([{"_id": 1}, {"_id": "pre"}, {"_id": 2}, {"_id": 3}], False),
+        ([{"_id": 1}, {"_id": "pre"}, {"_id": 2}], True),
+    ]:
+        plain.drop_database("rm224")
+        db.c.insert_one({"_id": "pre"})
+        start = plain.local["oplog.rs"].find_one(sort=[("$natural", -1)])["ts"]
+        # A batch with a duplicate fails; what it logged is the point.
+        with contextlib.suppress(PyMongoError):
+            db.c.insert_many(docs, ordered=ordered)
+        out.append(
+            [
+                (e["op"], len(e["o"]["applyOps"]) if e["op"] == "c" else 1)
+                for e in plain.local["oplog.rs"].find({"ts": {"$gt": start}, "op": {"$ne": "n"}})
+                if e["ns"] in ("rm224.c", "admin.$cmd")
+            ]
+        )
+    plain.drop_database("rm224")
+    plain.close()
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-224")
+def test_oplog_insert_batches_are_mongods_apply_ops(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """mongod 8.2.11 logs a batch of inserts as `applyOps` entries of up to
+    500 documents or 256 KiB, one document as a plain insert, and a batch
+    with a failed document as single inserts."""
+    assert _insert_groups(rust_mongo) == _insert_groups(mongod_rs)
+
+
+def _retryable_insert_fields(client: Any) -> list:
     db = client.rm224
     client.drop_database("rm224")
     db.create_collection("c")
     start = client.local["oplog.rs"].find_one(sort=[("$natural", -1)])["ts"]
-    db.c.insert_many([{"_id": 1}, {"_id": 2}])
-    entries = [
-        {k: e[k] for k in ("op", "ns") if k in e}
-        for e in client.local["oplog.rs"].find({"ts": {"$gt": start}, "op": {"$ne": "n"}})
-        if e["ns"] in ("rm224.c", "admin.$cmd")
+    db.c.insert_one({"_id": 1})
+    fields = [
+        sorted(e.keys())
+        for e in client.local["oplog.rs"].find({"ts": {"$gt": start}, "ns": "rm224.c"})
     ]
     client.drop_database("rm224")
-    return entries
+    return fields
 
 
 @pytest.mark.backlog("RM-224")
 def test_oplog_entries_have_mongods_shape(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
-    """mongod 8.2.11 logs a batch of inserts as one `applyOps` entry; this
-    server logs one entry per document."""
-    assert _batched_insert_entries(rust_mongo) == _batched_insert_entries(mongod_rs)
+    """mongod 8.2.11 stamps a retryable write's entries with its session:
+    `lsid`, `txnNumber`, `stmtId` and `prevOpTime`."""
+    assert _retryable_insert_fields(rust_mongo) == _retryable_insert_fields(mongod_rs)
 
 
 def _ddl_entries(client: Any) -> list:

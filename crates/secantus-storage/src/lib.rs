@@ -711,6 +711,90 @@ fn update_oplog_o(desc: Document, pre: &Document, post: &Document, pipeline: boo
     o
 }
 
+/// The `local.oplog.rs` view of the stored entries, in order: each entry in
+/// mongod's shape ([`oplog_view_shape`]), the inserts of one group
+/// (`bg.g`, see `mark_insert_groups`) as the one `applyOps` entry mongod
+/// writes for them, and every entry carrying mongod's `t` (the term, 1 here)
+/// and `v` (2) after its `ts`.
+fn oplog_view_entries(entries: Vec<Document>) -> Vec<Document> {
+    let mut out = Vec::with_capacity(entries.len());
+    let mut iter = entries.into_iter().peekable();
+    while let Some(entry) = iter.next() {
+        let group = entry
+            .get_document("bg")
+            .ok()
+            .and_then(|bg| bg.get_i64("g").ok());
+        let shaped = match group {
+            Some(g) => {
+                let mut run = vec![entry];
+                while let Some(next) = iter.peek() {
+                    let same = next
+                        .get_document("bg")
+                        .ok()
+                        .and_then(|bg| bg.get_i64("g").ok())
+                        == Some(g);
+                    if !same {
+                        break;
+                    }
+                    run.push(iter.next().expect("peeked"));
+                }
+                apply_ops_view(run)
+            }
+            None => oplog_view_shape(&entry).unwrap_or(entry),
+        };
+        out.push(with_term_and_version(shaped));
+    }
+    out
+}
+
+/// One `applyOps` entry for a group of inserts, as mongod writes it outside a
+/// retryable write: the inserts under the first one's time.
+fn apply_ops_view(run: Vec<Document>) -> Document {
+    let first = run[0].clone();
+    let ops: Vec<Bson> = run
+        .into_iter()
+        .map(|e| {
+            let mut op = Document::new();
+            for k in ["op", "ns", "ui", "o", "o2"] {
+                if let Some(v) = e.get(k) {
+                    op.insert(k, v.clone());
+                }
+            }
+            // mongod adds each insert's `stmtId` only for a retryable write,
+            // whose session fields no entry here carries yet (RM-224).
+            Bson::Document(op)
+        })
+        .collect();
+    let mut out = bson::doc! {
+        "op": "c",
+        "ns": "admin.$cmd",
+        "o": {"applyOps": ops},
+    };
+    for k in ["ts", "wall"] {
+        if let Some(v) = first.get(k) {
+            out.insert(k, v.clone());
+        }
+    }
+    out
+}
+
+/// `entry` with mongod's `t` and `v` after its `ts`, where it has neither.
+fn with_term_and_version(entry: Document) -> Document {
+    if entry.contains_key("t") || !entry.contains_key("ts") {
+        return entry;
+    }
+    let mut out = Document::new();
+    for (k, v) in entry {
+        let is_ts = k == "ts";
+        out.insert(k, v);
+        if is_ts {
+            out.insert("t", 1_i64);
+            out.insert("v", 2_i64);
+        }
+    }
+    out
+}
+
 /// An entry as mongod 8.2.11 writes it, where the stored form differs in a
 /// way the entry alone settles (RM-224): a delete has no `o2`; a rename says
 /// `stayTemp: false`; a one-index `createIndexes` is that index's spec; a
@@ -4395,6 +4479,9 @@ pub struct Storage {
     /// `None`. Persisted in `config.user_writes_critical_sections` and read
     /// back at open.
     user_write_block: std::sync::RwLock<Option<String>>,
+    /// Ids for the groups of inserts mongod logs as one `applyOps`
+    /// (`local.oplog.rs` presents each group as that one entry).
+    insert_groups: AtomicI64,
 }
 
 /// Strictly-monotonic oplog bookkeeping: the next int64 seq to mint and the last
@@ -6351,6 +6438,7 @@ impl Storage {
             closed: AtomicBool::new(false),
             checkpoint_gate: Arc::new(Mutex::new(())),
             user_write_block: std::sync::RwLock::new(None),
+            insert_groups: AtomicI64::new(0),
         };
         // Before anything looks a key up: crash recovery below replays writes
         // by `_id`.
@@ -7440,15 +7528,12 @@ impl Storage {
         }
         let rows = self.read_oplog(0, usize::MAX)?;
         let mut out: Vec<(Document, Vec<u8>)> = Vec::with_capacity(rows.len());
+        let mut decoded = Vec::with_capacity(rows.len());
         for (_seq, blob) in rows {
-            let d = decode_doc(&blob)?;
-            let (d, blob) = match oplog_view_shape(&d) {
-                Some(shaped) => {
-                    let bytes = encode_doc(&shaped)?;
-                    (shaped, bytes)
-                }
-                None => (d, blob),
-            };
+            decoded.push(decode_doc(&blob)?);
+        }
+        for d in oplog_view_entries(decoded) {
+            let blob = encode_doc(&d)?;
             if filter.is_empty()
                 || query_matches(&d, filter, vars, coll_opt).map_err(query_fault)?
             {
@@ -8511,6 +8596,45 @@ impl Storage {
         entry.insert("ns", "");
         entry.insert("o", Bson::Document(data));
         self.emit_oplog(&session, vec![entry], vec![None])
+    }
+
+    /// Mark the entries of an insert batch that mongod logs together as one
+    /// `applyOps`: documents in groups that close at 500 documents or once
+    /// they hold 256 KiB, a group of one being a plain insert, and a group
+    /// in which any document failed being single inserts (mongod retries it
+    /// one document at a time). Measured on mongod 8.2.11. Each marked entry
+    /// carries `bg: {g, s}`, its group and its statement index, which only
+    /// the `local.oplog.rs` view reads.
+    fn mark_insert_groups(
+        &self,
+        outcomes: &[(usize, Option<usize>)],
+        base_index: usize,
+        entries: &mut [OplogEntry],
+    ) {
+        const MAX_DOCS: usize = 500;
+        const MAX_BYTES: usize = 256 * 1024;
+        let mut start = 0;
+        while start < outcomes.len() {
+            let mut end = start;
+            let mut bytes = 0;
+            while end < outcomes.len() && end - start < MAX_DOCS && bytes < MAX_BYTES {
+                bytes += outcomes[end].0;
+                end += 1;
+            }
+            let group = &outcomes[start..end];
+            if group.len() > 1 && group.iter().all(|(_, pos)| pos.is_some()) {
+                let id = self.insert_groups.fetch_add(1, Ordering::Relaxed);
+                for (k, (_, pos)) in group.iter().enumerate() {
+                    if let Some(OplogEntry::Raw(buf)) = pos.and_then(|p| entries.get_mut(p)) {
+                        let mut bg = bson::RawDocumentBuf::new();
+                        bg.append("g", id);
+                        bg.append("s", (base_index + start + k) as i32);
+                        buf.append("bg", bg);
+                    }
+                }
+            }
+            start = end;
+        }
     }
 
     /// Append a command entry `{op: "c", ns, o}` that changes no data, as
@@ -10262,11 +10386,15 @@ impl Storage {
                 let mut errors: Vec<Document> = Vec::new();
                 let mut oplog_entries: Vec<OplogEntry> = Vec::new();
                 let mut stopped = false;
+                // Each document's outcome, for mongod's insert groups: its
+                // size, and its entry's position when it was written.
+                let mut outcomes: Vec<(usize, Option<usize>)> = Vec::with_capacity(docs.len());
                 let doc_cur =
                     session.open_cursor(&doc_table_for(db, coll), Some("overwrite=false"))?;
                 let nat_cur = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
                 for (offset, doc_bytes) in docs.iter().enumerate() {
                     let index = base_index + offset;
+                    outcomes.push((doc_bytes.len(), None));
                     let mut doc = decode_doc(doc_bytes)?;
                     let assigned_id = !doc.contains_key("_id");
                     if assigned_id {
@@ -10444,6 +10572,9 @@ impl Storage {
                         // re-encode of the document body (the oplog hot-path win);
                         // `o2` is the tiny `{_id}`. `doc` is not used afterward.
                         let o2 = encode_id_doc(&id)?;
+                        if let Some(last) = outcomes.last_mut() {
+                            last.1 = Some(oplog_entries.len());
+                        }
                         oplog_entries.push(OplogEntry::Raw(Self::oplog_entry_crud(
                             "i",
                             &ns,
@@ -10452,6 +10583,9 @@ impl Storage {
                             &o2,
                         )?));
                     }
+                }
+                if oplog_on {
+                    self.mark_insert_groups(&outcomes, base_index, &mut oplog_entries);
                 }
                 // Capped-collection eviction: drop oldest non-fresh docs until within
                 // the collection's `size` / `max` bounds. Inserts have no pre-image, so
