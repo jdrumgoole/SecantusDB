@@ -38,6 +38,7 @@ pub mod admin;
 mod agg_executor;
 mod agg_meta;
 pub mod aggregate;
+mod apply_ops;
 pub mod argtypes;
 pub mod auth;
 mod authz;
@@ -691,6 +692,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "replSetMaintenance" => misc_admin::repl_set_maintenance,
         "dropConnections" => misc_admin::drop_connections,
         "setUserWriteBlockMode" => misc_admin::set_user_write_block_mode,
+        "applyOps" => apply_ops::apply_ops,
         "releaseMemory" => misc_admin::release_memory,
         "filemd5" => misc_admin::filemd5,
         "planCacheClear" => replset_admin::plan_cache_clear,

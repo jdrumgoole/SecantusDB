@@ -590,25 +590,28 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
         options are not applied.
       Backlog-ID: RM-216
       Verify: none -- the missing fields are mongod's internal accounting; the registry's own tests are backlog_fixed
-- [ ] **Eight commands mongod runs are 59 CommandNotFound here.**
+- [ ] **Seven commands mongod runs are 59 CommandNotFound here.**
       mongod 8.2.11 (one-member replica set) answers each with success or
       an error of its own:
-      - data: `applyOps` (which `mongorestore --oplogReplay` needs);
       - diagnostics: `getDiagnosticData`, `dbCheck`, `validateDBMetadata`;
       - settings: `setQuerySettings` / `removeQuerySettings`, `autoCompact`
         (needs background compaction, which RM-192 lacks);
       - `rotateCertificates` (TLS has landed; it would re-read the files).
 
       `filemd5` with `partialOk` is refused by name (115): its `md5state` is
-      mongod's own MD5 implementation's state. Nine of the original
-      seventeen landed 2026-10-20 (`invalidateUserCache`, `replSetGetRBID`,
+      mongod's own MD5 implementation's state. Ten of the original
+      seventeen landed 2026-10-20 (`applyOps`, `invalidateUserCache`, `replSetGetRBID`,
       `replSetFreeze`, `replSetMaintenance`, `dropConnections`,
       `releaseMemory`, `filemd5`, `setUserWriteBlockMode`,
       `setClusterParameter`, whose
       `defaultMaxTimeMS` limits reads; the other parameters govern sharding,
       queryable encryption, search and serverless change streams, and are
       kept and reported only). Each left is its own slice, and query
-      settings and `applyOps` are real features rather than replies.
+      settings are a real feature rather than a reply. `applyOps` still
+      refuses a document over 16 MB (mongod applies one a little larger,
+      as oplog application allows) and `importCollection`,
+      `createDatabaseMetadata` and `modifyCollectionShardingIndexCatalog`
+      entries (115).
       Backlog-ID: RM-219
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_commands_mongod_runs_are_commands_here
 - [ ] **A string that is not valid UTF-8 is refused.** An insert whose
@@ -619,6 +622,25 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       would keep them.
       Backlog-ID: RM-222
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_insert_string_with_invalid_utf8
+- [ ] **`local.oplog.rs` entries are not mongod's shape.** The oplog
+      stores an update as the change-stream description it serves
+      (`{updatedFields, removedFields, truncatedArrays}` with dotted paths)
+      and `local.oplog.rs` shows it so, where mongod 8.2.11 logs its `$v: 2`
+      diff (`u` for a changed field, `i` for a new one, `s<field>` for a
+      sub-document, `{a: true, u<i>}` for an array). Also different: a
+      delete carries `o2: {_id}` (mongod: none); a drop has no
+      `o2: {numRecords}`; `createIndexes` is logged with an `indexes` array
+      (mongod: one entry per index, `{createIndexes, v, key, name}`);
+      `dropIndexes` puts the spec in `o.key` / `o.spec` (mongod: `o2`);
+      `renameCollection` has no `stayTemp: false`. A tool that reads the
+      oplog (`mongodump --oplog`, then `mongorestore --oplogReplay`, which
+      `applyOps` now takes) gets entries mongod would not write. The diff
+      cannot be rebuilt from the stored description, which says neither
+      which fields are new nor which path parts are array indexes: the fix
+      writes mongod's diff at write time, from the pre- and post-image, and
+      derives the change stream's description from it as mongod does.
+      Backlog-ID: RM-224
+      Verify: tests/backlog/test_rm_219_apply_ops.py::test_oplog_entries_have_mongods_shape
 
 ### 7.085 The shared Rust storage, audited -- 2026-10-20
 

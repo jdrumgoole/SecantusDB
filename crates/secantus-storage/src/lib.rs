@@ -16159,7 +16159,13 @@ impl Storage {
         vars: &Document,
     ) -> Result<Vec<Vec<u8>>> {
         if self.is_oplog_rs(db, coll) {
-            return self.find_oplog_rs(filter, sort, coll_opt, vars);
+            // A `$natural` hint is the oplog's order, as a `$natural` sort
+            // is: the command layer sends `sort({$natural: -1})` as the hint.
+            let natural = match (sort, hint) {
+                (None, Some(Hint::KeySpec(h))) if h.contains_key("$natural") => Some(h.clone()),
+                _ => None,
+            };
+            return self.find_oplog_rs(filter, sort.or(natural.as_ref()), coll_opt, vars);
         }
         self.with_ddl_generation_check(|| {
             self.find_matching_with_inner(db, coll, filter, sort, hint, coll_opt, vars)

@@ -403,6 +403,13 @@ pub(crate) fn plain_sort(sort: &Document) -> bool {
 /// `None`: the store does not offer the matched set for this collection, or
 /// the sort is one this does not read; the caller reads as it did before.
 pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Rows>, StorageError> {
+    // `local.oplog.rs` is read in the oplog's own order, which its read path
+    // gives, `$natural: -1` reversed: no plan stands behind it, and ordering
+    // its entries here lost the reversal (`find().sort({$natural: -1})`
+    // answered the oldest entry, where mongod answers the newest).
+    if ask.db == "local" && ask.coll == "oplog.rs" {
+        return Ok(None);
+    }
     if let Some(sort) = ask.sort {
         if !plain_sort(sort) {
             return Ok(None);
