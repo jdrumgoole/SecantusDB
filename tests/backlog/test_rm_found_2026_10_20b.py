@@ -400,6 +400,35 @@ def test_diagnostic_stages(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F8
     assert _stages(rust_mongo) == _stages(mongod_rs)
 
 
+def _list_sampled_queries(client: Any) -> list:
+    out = []
+    for db, target, spec in [
+        ("admin", 1, {}),
+        ("admin", 1, {"namespace": "rm215.c", "other": 1}),
+        ("admin", 1, {"namespace": 5}),
+        ("admin", 1, {"namespace": "bad"}),
+        ("admin", 1, 5),
+        ("rm215", 1, {}),
+        ("admin", "c", {}),
+    ]:
+        out.append(
+            answer(
+                lambda db=db, target=target, spec=spec: client[db].command(
+                    "aggregate", target, pipeline=[{"$listSampledQueries": spec}], cursor={}
+                )["cursor"]["firstBatch"]
+            )
+        )
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-215")
+def test_list_sampled_queries_as_mongod(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """mongod 8.2.11 lists no sampled queries on a set that never configured
+    a query analyzer -- this server has none -- and checks the stage's
+    argument and placement (6876000, 14, 73)."""
+    assert _list_sampled_queries(rust_mongo) == _list_sampled_queries(mongod_rs)
+
+
 # ------------------------------------------------ RM-216 operation registry --
 
 

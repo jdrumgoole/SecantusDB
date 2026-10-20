@@ -141,6 +141,7 @@ pub(crate) fn walk(
                     need(needs, Resource::Cluster, &["inprog"]);
                 }
             }
+            "$listSampledQueries" => need(needs, Resource::Cluster, &["listSampledQueries"]),
             "$listLocalSessions" | "$listSessions" => {
                 let all = spec.as_document().and_then(|d| d.get("allUsers"));
                 if truthy(all) {
