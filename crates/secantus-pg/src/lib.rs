@@ -22169,8 +22169,12 @@ impl PgHandler {
                         std::mem::take(&mut out);
                     if implicit {
                         // Roll back whatever this batch opened. A failure to
-                        // roll back must not mask the error that caused it.
-                        let _ = self.rollback_implicit();
+                        // roll back must not mask the error that caused it,
+                        // so the client gets that error and the rollback's
+                        // goes to the server log -- never nowhere.
+                        if let Err(re) = self.rollback_implicit() {
+                            eprintln!("secantusd-pg: rolling back a failed batch: {re}");
+                        }
                         self.release_xact_locks();
                     }
                     if let PgWireError::UserError(info) = &mut e {
