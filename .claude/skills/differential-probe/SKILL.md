@@ -98,22 +98,35 @@ finds something belongs there, or the next session re-finds it.
 
 ## On the SQL side: drive BOTH servers through the same psycopg client
 
-The Mongo-side rule above ("compare the RAW reply, not the driver wrapper")
-inverts here. The conformance surface is the **wire**, so probe
-`SecantusPGServer` over TCP with the same `psycopg` connection you use for
-PostgreSQL — one `run(cur, sql)` helper, two cursors:
+The server under test is the Rust `secantusd-pg`; the reference is PostgreSQL
+(15.19 on port 5415, or the 14 default cluster). The deprecated Python PG
+server is never the reference and is not where SQL work goes.
 
-```python
-sec = psycopg.connect(host=host, port=port, dbname="db", user="joe", autocommit=True)
-pg  = psycopg.connect("host=127.0.0.1 port=5432 dbname=postgres user=jdrumgoole", autocommit=True)
+The Mongo-side rule above ("compare the RAW reply, not the driver wrapper")
+inverts here. The conformance surface is the **wire**, so probe `secantusd-pg`
+over TCP with the same `psycopg` connection class you use for PostgreSQL --
+one `run(cur, sql)` helper, two cursors. `tools/probes/pg_differential.py`
+is that harness for a corpus file, and **it defaults to the deprecated Python
+server: pass `--rust`** (`tools/probes/pg_corpora_sweep.py` does). Run by
+hand without it, a corpus silently measures the wrong server.
+
+```bash
+uv run --no-sync python tools/probes/pg_differential.py \
+    tools/probes/pg_corpora/windows.setup.sql tools/probes/pg_corpora/windows.sql \
+    --types --rust
 ```
+
+For an ad-hoc probe, start the binary yourself (`secantusd-pg <store>
+127.0.0.1:0 --trust-unknown-users` prints its address) and connect as
+`postgres`.
 
 Client-side type mapping is then identical on both sides, so any difference is
 the server's. Capture `cur.description` too — a wrong **oid** under a right
 value is invisible to a row comparison, and several real bugs here were exactly
 that (`#>` and `LIKE ... ESCAPE` both sent booleans/jsonb under oid 25).
 
-**Calling `run_sql()` directly instead manufactures false positives.** The
+**Probing below the wire manufactures false positives.** The Python server's
+`run_sql()` taught this, and it holds for any in-process entry point: the
 embedded API returns the engine's internal values, which the wire layer
 converts on the way out: a `numeric(p,s)` cast surfaces as a raw
 `Decimal128(...)` and `'2020-01-01'::date` as a `str`. Probed directly, both
@@ -124,8 +137,9 @@ the wire.
 **Check `SHOW lc_ctype` before calling a case-mapping difference a bug.** This
 box's PostgreSQL runs the **C** locale, which treats a non-ASCII letter as a
 word SEPARATOR: `initcap('ÉCOLE')` is `ÉCole` there and `École` on a UTF-8
-PostgreSQL. Same class as the Swedish-collation note in CLAUDE.md — locale
-data, not engine behaviour.
+PostgreSQL. Locale data, not engine behaviour. A corpus that measures case or character
+classes declares `# reference-locale: C.UTF-8` and the harness runs it in a
+reference database of that locale.
 
 ## Normalisation: what you must strip, or you get false positives
 
@@ -243,24 +257,31 @@ mongod truncates the message with an ellipsis *inside* the quotes, so a
 comparison. Re-run the same probe against the old server; a difference in the
 *count* between versions is worth suspecting before it is worth reporting.
 
-## The PYTHON version is a reference server too
+## The Python INTERPRETER version is a variable too
 
-The matrix is 3.10-3.13 and a local run is one of them, so a stdlib behaviour
-that changed between versions is invisible until CI runs — **and on a PR, "CI
-runs" means 3.10 and nothing else.** `test.yml:100` selects
-`["3.10","3.11","3.12","3.13"]` only for `schedule` and `workflow_dispatch`;
-a push or pull_request gets `["3.10"]`. So a defect that needs 3.11+ cannot
-fail a PR at all, and surfaces in the weekly cron that notifies nobody.
-Measured 2026-09-28, when a `cbrt` assertion hardcoded to a Windows/macOS float
-sat red in the cron while every PR went green; it was found only because a
-`workflow_dispatch` was used as a stand-in for a dropped `pull_request` event
-and silently upgraded that run to the full sweep. To check a version-sensitive
-change before merging, dispatch `test.yml` on your branch rather than trusting
-the PR's green. That is not a
-theoretical hazard: `datetime.fromisoformat` accepted **only** 3 or 6
-fractional digits before 3.11, so `TIMESTAMP '2020-01-15 10:30:45.5'` -- an
-ordinary Postgres literal -- parsed on 3.12 and raised on 3.10 (found 2026-09-03
-by this project's own new test, on the 3.10 shards).
+This is about CPython, not the Python servers. **The Python servers are
+deprecated and are never the reference** for what a server should answer:
+that is `mongod` or PostgreSQL. But Python still runs the probes, the gauges,
+the test harness and the deprecated servers' own tests, which must stay green,
+and the stdlib changes between versions.
+
+The supported matrix is 3.10-3.13 and a local run is one of them, so a stdlib
+behaviour that changed between versions is invisible until CI runs it -- **and
+a PR barely runs it.** `test.yml`'s `python-version` matrix is the full
+`["3.10","3.11","3.12","3.13"]` only for `schedule` and `workflow_dispatch`; a
+push or pull_request gets `["3.10"]`, plus macOS on 3.12 through an `include`.
+So a defect that needs 3.11 or 3.13 cannot fail a PR, and surfaces in the
+weekly cron that notifies nobody. Measured 2026-09-28, when a `cbrt`
+assertion hardcoded to a Windows/macOS float sat red in the cron while every
+PR went green; it was found only because a `workflow_dispatch` silently
+upgraded a run to the full sweep. **To check a version-sensitive change
+before merging, dispatch `test.yml` on your branch** rather than trusting the
+PR's green.
+
+The hazard is real: `datetime.fromisoformat` accepted only 3 or 6 fractional
+digits before 3.11, so `TIMESTAMP '2020-01-15 10:30:45.5'` -- an ordinary
+PostgreSQL literal -- parsed on 3.12 and raised on 3.10 in the (now
+deprecated) Python SQL server (found 2026-09-03 on the 3.10 shards).
 
 **Two rules, both learned there:**
 
@@ -280,6 +301,8 @@ by this project's own new test, on the 3.10 shards).
   width but TRUNCATES past six digits, where Postgres ROUNDS. The failing test
   cannot see that half -- you only find it by asking what the *other* version
   answers, and then asking the reference server which of them is right.
+  (On the deprecated servers today, keep the test green -- fix or retire it
+  with a written reason -- rather than extending them; CLAUDE.md, "Project".)
 
 ## Size the work from a probe, never from the source
 
