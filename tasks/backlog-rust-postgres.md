@@ -506,18 +506,24 @@ one beside it.
     batch joined after every row of batch 0 (`ExecHashGetBucketAndBatch`);
     the class over five tables 27 of 27. A hash RIGHT join split into
     batches returns each batch's unmatched rows after its probes, which is
-    not modelled: the search declines it. Not yet: two classes spanning both sides (two join keys); an
+    not modelled: the search declines it. A RIGHT join is planned as the
+    LEFT join of its sides swapped (`reduce_outer_joins` flips
+    `JOIN_RIGHT`, 2026-10-20), and a WHERE that makes its LEFT side
+    non-null makes it inner and is pushed to that side's scan; of 33
+    RIGHT-join probes at 20 and 300 rows, 24 match (8 before). The nine
+    left are a RIGHT join over a join -- flipped, its nullable side is a
+    join, which the three- and four-table searches do not take (their
+    nullable sides are single tables) -- and FULL joins. Not yet: two classes spanning both sides (two join keys); an
     expression in a class; a LEFT join's class through the general path;
     a class of text or other non-integer keys, or with a LEFT join; three
     tables with a WHERE over two of them or a LIMIT; four or more tables
-    with a WHERE over two of them or a LIMIT; a merge right join of two
-    tables; more than eight tables; an expression key with a function
+    with a WHERE over two of them or a LIMIT; more than eight tables; an expression key with a function
     call or a cast that costs; parameterized nested loops (an index scan inner); a LIMIT with
     an ORDER BY, or with a WHERE over the general path; a join of more
     than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_right_join_of_two_tables_is_planned_as_postgresql_plans_it
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_right_join_over_a_join_is_searched_as_its_left_join
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

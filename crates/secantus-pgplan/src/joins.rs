@@ -1053,14 +1053,17 @@ fn build_join(
     let (right, rscope) = build(rarg, lookup, params, aliases, Some(&visible))?;
     // `reduce_outer_joins`: a WHERE that cannot hold for a NULL-extended row
     // makes a LEFT join an inner one, which PostgreSQL then plans as such.
-    let kind = if kind == JoinKind::Left
-        && NONNULLABLE.with(|n| {
+    // A RIGHT join likewise, by its left side.
+    let nonnullable = |scope: &Scope| {
+        NONNULLABLE.with(|n| {
             let n = n.borrow();
-            rscope.cols.iter().any(|c| n.contains(&c.alias))
-        }) {
-        JoinKind::Inner
-    } else {
-        kind
+            scope.cols.iter().any(|c| n.contains(&c.alias))
+        })
+    };
+    let kind = match kind {
+        JoinKind::Left if nonnullable(&rscope) => JoinKind::Inner,
+        JoinKind::Right if nonnullable(&lscope) => JoinKind::Inner,
+        kind => kind,
     };
     if matches!(right, JoinNode::Lateral { .. }) && matches!(kind, JoinKind::Right | JoinKind::Full)
     {
@@ -1211,6 +1214,29 @@ fn build_join(
                 .collect::<Result<Vec<_>>>()?;
             Some(on_expr(&q, &side_scope, params)?)
         }
+    };
+    // `reduce_outer_joins` flips a RIGHT join into the LEFT join of its
+    // sides swapped, which is what PostgreSQL then plans: every planner
+    // routine after it sees only LEFT. The columns keep their written order
+    // (the scope); a USING column still takes the preserved side's value.
+    let (kind, left, right, left_keys, right_keys) = if kind == JoinKind::Right {
+        equi = equi.into_iter().map(|(l, r)| (r, l)).collect();
+        equi_reversed = equi_reversed.into_iter().map(|r| !r).collect();
+        merged = merged.into_iter().map(|(k, l, r)| (k, r, l)).collect();
+        expr_keys = expr_keys
+            .into_iter()
+            .map(|e| ExprEquality {
+                left: e.right,
+                right: e.left,
+                left_ops: e.right_ops,
+                right_ops: e.left_ops,
+                left_column: e.right_column,
+                right_column: e.left_column,
+            })
+            .collect();
+        (JoinKind::Left, right, left, right_keys, left_keys)
+    } else {
+        (kind, left, right, left_keys, right_keys)
     };
     Ok((
         JoinNode::Join {
@@ -1731,6 +1757,13 @@ fn equivalence_classes(
                     }
                     right.iter().any(|a| nonnullable.contains(a))
                 }
+                Ok(JoinType::JoinRight) => {
+                    let mut left = Vec::new();
+                    if let Some(l) = j.larg.as_deref() {
+                        table_aliases(l, &mut left);
+                    }
+                    left.iter().any(|a| nonnullable.contains(a))
+                }
                 _ => false,
             };
             if !inner {
@@ -2073,7 +2106,15 @@ fn preserved_aliases(
                     }
                     (false, !below.iter().any(|a| nonnullable.contains(a)))
                 }
-                Ok(JoinType::JoinRight) => (true, false),
+                // A RIGHT join's nullable side is its left, which the WHERE
+                // can make non-null as it does a LEFT join's right.
+                Ok(JoinType::JoinRight) => {
+                    let mut below = Vec::new();
+                    if let Some(larg) = j.larg.as_deref() {
+                        table_aliases(larg, &mut below);
+                    }
+                    (!below.iter().any(|a| nonnullable.contains(a)), false)
+                }
                 _ => (true, true),
             };
             if let Some(larg) = j.larg.as_deref() {
@@ -2252,6 +2293,24 @@ mod tests {
         assert_eq!(
             pushed_to("select 1 from a join b on b.a_id = a.id where upper(w) like 'W1%'"),
             vec!["b"]
+        );
+    }
+
+    #[test]
+    fn a_right_joins_left_side_is_nullable_until_the_where_says_otherwise() {
+        // `reduce_outer_joins`: a strict condition on a RIGHT join's left
+        // side makes the join inner, and that side's scan applies it; the
+        // preserved side's conjuncts are pushed either way.
+        assert_eq!(
+            pushed_to("select 1 from a right join b on b.a_id = a.id where a.v > 3"),
+            vec!["a"]
+        );
+        assert_eq!(
+            pushed_to("select 1 from a right join b on b.a_id = a.id where b.w = 'x'"),
+            vec!["b"]
+        );
+        assert!(
+            pushed_to("select 1 from a right join b on b.a_id = a.id where a.v is null").is_empty()
         );
     }
 

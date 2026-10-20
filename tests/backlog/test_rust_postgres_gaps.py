@@ -1945,7 +1945,7 @@ def test_a_hash_join_too_big_for_work_mem_returns_rows_batch_by_batch(pg: Any) -
     assert " ".join(":".join(str(v) for v in r) for r in got[1][:18]) == want
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_right_join_of_two_tables_is_planned_as_postgresql_plans_it(pg: Any) -> None:
     """PostgreSQL 15.19, two 20-row tables never analysed: `r0 RIGHT JOIN
     r1 on r0.b = r1.c` is a Merge Left Join with r1 outer, each side sorted
@@ -1970,6 +1970,38 @@ def test_a_right_join_of_two_tables_is_planned_as_postgresql_plans_it(pg: Any) -
     assert got[0] == "ok"
     assert len(got[1]) == 54
     assert " ".join(":".join(str(v) for v in r) for r in got[1][:16]) == want
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_right_join_over_a_join_is_searched_as_its_left_join(pg: Any) -> None:
+    """PostgreSQL 15.19, three 20-row tables never analysed: `s0 JOIN s1
+    RIGHT JOIN s2` is flipped to `s2 LEFT JOIN (s0 JOIN s1)`
+    (`reduce_outer_joins`) and searched like any other three tables -- a
+    Merge Left Join of s2 sorted on b with s0-s1's merge sorted on s1.a. The
+    LEFT join's nullable side is then a join, not a table, which the
+    three-table search does not take, so the rows come out in the general
+    path's order."""
+    pg.execute("begin")
+    try:
+        for t, (mb, mc) in enumerate([(7, 5), (5, 3), (3, 4)]):
+            pg.execute(f"create table rp028_s{t} (a int, b int, c int)")
+            pg.execute(
+                f"insert into rp028_s{t} select i, i % {mb}, i % {mc} from generate_series(1, 20) i"
+            )
+        got = pg_answer(
+            pg,
+            "select rp028_s0.a, rp028_s1.a, rp028_s2.a from rp028_s0 join rp028_s1"
+            " on rp028_s0.b = rp028_s1.c right join rp028_s2 on rp028_s1.a = rp028_s2.b",
+        )
+    finally:
+        pg.execute("rollback")
+    want = (
+        "None:None:15 None:None:9 None:None:18 None:None:3 None:None:12 None:None:6"
+        " 15:1:10 8:1:10 1:1:10 15:1:13 8:1:13 1:1:13"
+    )
+    assert got[0] == "ok"
+    assert len(got[1]) == 48
+    assert " ".join(":".join(str(v) for v in r) for r in got[1][:12]) == want
 
 
 # RP-047: the lock manager. Each test needs two sessions on one server, so
