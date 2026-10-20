@@ -569,8 +569,16 @@ fn access_of(chosen: IndexUse, parts: &[Document], q: &Query) -> Access {
 /// bounds joined; a branch of several predicates keeps a scan of its own.
 /// The scans come out index by index, except that the last index's shared
 /// scan follows every branch that has its own.
+/// The scans of an `$or`, one per branch (or one per index the
+/// single-predicate branches share), and what the documents they return are
+/// rechecked against. `outer` holds the clauses beside the `$or`, which
+/// mongod pushes down into each branch (measured 8.2.11: `{$or: [{a: 3},
+/// {c: 5}], b: 2}` reads `a_1_b_1` with `b` bounded for the first branch);
+/// a branch reads only an index on a field the branch itself names, and
+/// the outer clauses are rechecked above the `OR`, not in a branch.
 fn or_access(
     branches: &[Bson],
+    outer: &[Document],
     q: &Query,
     catalog: &[Rc<IndexInfo>],
 ) -> Option<(Node, Option<Document>)> {
@@ -587,33 +595,65 @@ fn or_access(
     let mut own = Vec::new();
     for branch in branches {
         let doc = branch.as_document()?;
-        let parts = clauses(doc);
+        let mut parts = clauses(doc);
+        let own_parts = parts.len();
+        let named: BTreeSet<String> = parts
+            .iter()
+            .flat_map(|p| p.keys().filter(|k| !k.starts_with('$')).cloned())
+            .collect();
+        parts.extend(outer.iter().cloned());
+        let combined = if outer.is_empty() {
+            doc.clone()
+        } else {
+            assemble(parts.clone())?
+        };
+        let usable: Vec<Rc<IndexInfo>> = if outer.is_empty() {
+            catalog.to_vec()
+        } else {
+            catalog
+                .iter()
+                .filter(|ix| ix.fields().iter().any(|(f, _)| named.contains(*f)))
+                .cloned()
+                .collect()
+        };
         // mongod plans each branch on its own, with its multi-planner when
         // several plans could answer it (the subplanner, 8.2.11): the
         // branch's own trial, which `explain` does not list.
         let alone = Query {
-            canonical: doc,
+            canonical: &combined,
             limit: 0,
             skip: 0,
             ..plain.clone()
         };
         let tried_alone = plain.trial.and_then(|trial| {
             let kept = trial.ranked.replace(Vec::new());
-            let found = tried(&parts, &alone, catalog, trial, assemble(parts.clone()));
+            let found = tried(&parts, &alone, &usable, trial, assemble(parts.clone()));
             *trial.ranked.borrow_mut() = kept;
             found
         });
-        let access = match tried_alone {
+        let mut access = match tried_alone {
             Some(found) => found,
-            None => index_access(&parts, &plain, catalog)?,
+            None => index_access(&parts, &plain, &usable)?,
         };
+        // The outer clauses are rechecked above the `OR`.
+        if !outer.is_empty() {
+            access.fetch_filter = access.fetch_filter.and_then(|f| {
+                assemble(
+                    clauses(&f)
+                        .into_iter()
+                        .filter(|c| !outer.contains(c))
+                        .collect(),
+                )
+            });
+        }
         let at = access
             .index
             .as_ref()
             .and_then(|ix| catalog.iter().position(|c| Rc::ptr_eq(c, ix)));
         match (access.scan, at) {
             (Node::IxScan(ix), Some(at))
-                if parts.len() == 1
+                if own_parts == 1
+                    && named.contains(ix.index.fields()[0].0)
                     && ix
                         .bounds
                         .iter()
@@ -711,7 +751,7 @@ fn access(q: &Query, catalog: &[Rc<IndexInfo>]) -> Access {
     if let [only] = parts.as_slice() {
         if let Ok(parsed) = only.get_array("$or") {
             if q.hint == Hint::None {
-                if let Some((scan, fetch_filter)) = or_access(parsed, q, catalog) {
+                if let Some((scan, fetch_filter)) = or_access(parsed, &[], q, catalog) {
                     return Access {
                         scan,
                         fetch_filter,
@@ -740,13 +780,13 @@ fn access(q: &Query, catalog: &[Rc<IndexInfo>]) -> Access {
         let Ok(branches) = clause.get_array("$or") else {
             continue;
         };
-        if let Some((scan, recheck)) = or_access(branches, q, catalog) {
-            let mut rest: Vec<Document> = parts
-                .iter()
-                .enumerate()
-                .filter(|(j, _)| *j != i)
-                .map(|(_, c)| c.clone())
-                .collect();
+        let mut rest: Vec<Document> = parts
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, c)| c.clone())
+            .collect();
+        if let Some((scan, recheck)) = or_access(branches, &rest, q, catalog) {
             rest.extend(recheck);
             return Access {
                 scan,
@@ -945,6 +985,39 @@ fn candidates(
                 },
                 None,
             ));
+        }
+    }
+    // An `$or` beside other clauses is also read branch by branch, the
+    // other clauses pushed down into each branch and rechecked above the
+    // `OR`, and mongod tries that plan against the others (measured 8.2.11:
+    // `{$or: [{a: 3, b: 2}, {c: 5}, {d: 1, b: 3}], d: {$ne: 5}}` keeps the
+    // branches' `a_1_b_1`, `d_1_b_1` and `c_1` over `d_1_b_1` alone).
+    // mongod offers every combination of the branches' indexes; this offers
+    // the one each branch's own trial picks.
+    if parts.len() > 1 {
+        if let Some(at) = parts.iter().position(|p| p.contains_key("$or")) {
+            if let Ok(branches) = parts[at].get_array("$or") {
+                let mut rest: Vec<Document> = parts
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != at)
+                    .map(|(_, c)| c.clone())
+                    .collect();
+                if let Some((scan, recheck)) = or_access(branches, &rest, q, catalog) {
+                    rest.extend(recheck);
+                    out.push((
+                        Access {
+                            scan,
+                            fetch_filter: assemble(rest),
+                            indexed: true,
+                            index: None,
+                            sorted: false,
+                            subplan: false,
+                        },
+                        None,
+                    ));
+                }
+            }
         }
     }
     if sort_of(q).is_some() && !out.iter().any(|(a, _)| a.sorted) {
