@@ -614,9 +614,18 @@ one beside it.
         writes the oplog entry, so the three connections insert one at a
         time (the lock's wait rose from 7% to 12% of a statement as the
         server's own work shrank), where PostgreSQL inserts them in
-        parallel. Shortening that critical section -- the collection
-        metadata cached against DDL -- is the next lever, and a change to
-        the storage the MongoDB server shares.
+        parallel. **Decided (Joe, 2026-10-20): shorten that critical
+        section by caching the collection's metadata in storage**, not by
+        building the CI lane in release. Done the same day: a write reads
+        its collection's registry row and index descriptors once per
+        catalog generation (`index_descs_cached`, `coll_options_cached`,
+        and `list_indexes`, which the PostgreSQL server asks on every row
+        for expression indexes), under the rule the planner's cache already
+        relies on -- a transaction uses an entry only while the generation
+        its snapshot was taken under is still the settled one, and any
+        catalog write in flight, its own included, settles nothing. The
+        shadow script went from 9.8 s to 8.4 s (PostgreSQL 15.19: 8.0 s).
+        Not yet measured on Linux.
 
       What the lane gates, given that: a run that stopped short, and a
       test that fails over TLS, passes in the clear, **and fails over TLS
