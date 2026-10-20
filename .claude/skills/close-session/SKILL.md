@@ -1,6 +1,6 @@
 ---
 name: close-session
-description: Close out a SecantusDB working session — land every outstanding change, record what is left with measurements, tear down branches and worktrees, and reconcile the documentation with what actually changed. Fires on "close the session", "wrap up", "finish up", "we're done", "end of session", or when the user stops directing new work. Sequences the per-slice landing (batch-worktree) and the machine cleanup (session-cleanup) and adds the part neither covers: finding the docs, comments and tests that still describe the behaviour you just changed. Refuses to declare the session closed while any of your own work is still in flight, and gates the close on a final process sweep so the session leaves no server, waiter, detached run or subagent behind.
+description: Close out a SecantusDB working session — land every outstanding change, record what is left with measurements, tear down branches and worktrees, and reconcile the documentation with what actually changed. Fires on "close the session", "wrap up", "finish up", "we're done", "end of session", or when the user stops directing new work. Sequences the per-slice landing (batch-worktree) and the machine cleanup (session-cleanup) and adds the part neither covers: finding the docs, comments and tests that still describe the behaviour you just changed. Refuses to declare the session closed while any of your own work is still in flight, and gates the close on a final process sweep so the session leaves no server, waiter, detached run, subagent, wakeup, cron job or unacknowledged /goal behind.
 ---
 
 # Closing a session is a task, not a farewell
@@ -253,6 +253,23 @@ Then run `ListAgents` again: the Teammates section must be gone, leaving
 only **Peer sessions**. Those are other sessions, never yours to stop: list
 them in the handover if they matter, and leave them alone.
 
+**F. Goals, loops and schedules — anything that starts work again after you
+stop.** None of these is a process, so A–E miss them all:
+
+- **A `/goal`.** Its Stop hook runs at every stop and sends you back to work
+  until the goal is met, so a session closed with a goal still set never
+  stays closed. **You cannot clear a goal yourself; only the user can, with
+  `/goal stop`.** If a goal is still set (a goal check-in reminder, or Stop
+  hook feedback naming a goal, says so), the handover's last line before
+  "the session is closed" asks the user to run `/goal stop`, and names the
+  goal and what of it is unfinished. When the hook fires after the user
+  asked you to close, do not go back to work: the close request is the later
+  instruction. Answer in one line that the session stays closed and the goal
+  needs `/goal stop`. On 2026-10-21 a session closed with its goal unmet and
+  answered about twenty hook-driven turns before the user cleared it.
+- **A `/loop` wakeup.** Cancel it with `ScheduleWakeup({stop: true})`.
+- **Cron jobs.** `CronList`, then `CronDelete` each job this session created.
+
 **Attribution is the session id in the storage path.** Your scratchpad path
 contains this conversation's uuid; a different uuid is a different session,
 whose processes you report and do not touch. Before calling any of them
@@ -287,6 +304,8 @@ Close with what the repo now says, each line backed by a command you just ran:
   **Write the version you measured, not the one you expected** — the `mongod`
   line in `CLAUDE.md` was wrong for a day because a session recorded the
   intended version rather than `mongod --version`'s answer.
+- a `/goal` still set: name it and what of it is unfinished, and ask the user
+  to run `/goal stop` (§6 F). Only they can clear it.
 
 And state corrections plainly. If a number you reported earlier was measured
 against your own bug rather than a baseline, say so — a pass rate that "improved
