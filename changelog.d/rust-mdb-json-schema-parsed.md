@@ -51,3 +51,9 @@ type (unless the schema declares that one type), a nested object as
   `update_path_conflicts`, `findandmodify_shapes`, 155 shapes) find none on
   the Rust server against mongod 8.2.11 (2026-10-20), so the two never named
   are gone.
+- **TTL expiry bounds are mongod's** (fixes RM-104): a date exactly
+  `expireAfterSeconds` old now expires (mongod's index scan includes both
+  keys), the seconds are whole seconds, and a clustered collection expires
+  only `_id` dates from the epoch on, so an `_id` dated 1960 stays, as on
+  mongod 8.2.11 (`crates/secantus-storage/tests/ttl.rs::boundary_is_inclusive`,
+  `::a_clustered_collection_expires_from_the_epoch`).

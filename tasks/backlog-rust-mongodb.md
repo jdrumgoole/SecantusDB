@@ -1507,11 +1507,6 @@ wording filed under 7.067) and 2 TTL results
       the query's, re-measured 2026-10-14.)
       Backlog-ID: RM-102
       Verify: none -- a race between the two steps; no deterministic check
-- [ ] **RUST MongoDB server: the TTL cutoff is exclusive.** A date exactly
-      `expireAfterSeconds` old is kept until the next pass. Which side
-      `mongod` puts that one millisecond on was not measured.
-      Backlog-ID: RM-104
-      Verify: none -- the boundary millisecond depends on when a TTL pass runs; not observable deterministically
 
 ### 7.067 Index management -- 2026-10-10
 

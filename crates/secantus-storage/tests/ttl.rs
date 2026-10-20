@@ -89,7 +89,11 @@ fn prunes_only_expired_docs() {
 }
 
 #[test]
-fn boundary_is_exclusive() {
+fn boundary_is_inclusive() {
+    // mongod scans the index up to the cutoff with both keys included
+    // (`_deleteExpiredWithIndex`, 8.2): a date exactly the TTL old goes and
+    // one a millisecond younger stays. The scan starts at the dawn of time,
+    // so a date before 1970 goes too.
     with_db(|st| {
         st.create_index(
             "app",
@@ -99,17 +103,61 @@ fn boundary_is_exclusive() {
             &doc! {"expireAfterSeconds": 100},
         )
         .unwrap();
-        // age == ttl -> kept; age just over -> pruned.
         st.insert_one("app", "c", &enc(&doc! {"_id": 1, "t": secs_ago(100)}))
             .unwrap();
         st.insert_one(
             "app",
             "c",
-            &enc(&doc! {"_id": 2, "t": DateTime::from_millis(BASE_MS - 100_001)}),
+            &enc(&doc! {"_id": 2, "t": DateTime::from_millis(BASE_MS - 99_999)}),
         )
         .unwrap();
-        assert_eq!(st.prune_ttl("app", "c", now()).unwrap(), 1);
-        assert_eq!(live_ids(st), vec![1]);
+        st.insert_one(
+            "app",
+            "c",
+            &enc(&doc! {"_id": 3, "t": DateTime::from_millis(-315_619_200_000)}),
+        )
+        .unwrap();
+        assert_eq!(st.prune_ttl("app", "c", now()).unwrap(), 2);
+        assert_eq!(live_ids(st), vec![2]);
+    });
+}
+
+#[test]
+fn a_clustered_collection_expires_from_the_epoch() {
+    // mongod's clustered TTL scan starts at the epoch
+    // (`_deleteExpiredWithCollscan`, 8.2): an `_id` dated 1960 stays, one at
+    // the epoch or exactly the TTL old goes (measured 8.2.11, 2026-10-20).
+    with_db(|st| {
+        st.create_collection_with_options(
+            "app",
+            "c",
+            &doc! {"clusteredIndex": {"key": {"_id": 1}, "unique": true}, "expireAfterSeconds": 100},
+        )
+        .unwrap();
+        let dates = [
+            DateTime::from_millis(-315_619_200_000),
+            DateTime::from_millis(0),
+            secs_ago(100),
+            DateTime::from_millis(BASE_MS - 99_999),
+        ];
+        for d in dates {
+            st.insert_one("app", "c", &enc(&doc! {"_id": d})).unwrap();
+        }
+        assert_eq!(st.prune_ttl("app", "c", now()).unwrap(), 2);
+        let mut left: Vec<i64> = st
+            .scan_collection("app", "c")
+            .unwrap()
+            .iter()
+            .map(|b| {
+                Document::from_reader(&mut std::io::Cursor::new(b.as_slice()))
+                    .unwrap()
+                    .get_datetime("_id")
+                    .unwrap()
+                    .timestamp_millis()
+            })
+            .collect();
+        left.sort();
+        assert_eq!(left, vec![-315_619_200_000, BASE_MS - 99_999]);
     });
 }
 

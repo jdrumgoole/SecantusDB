@@ -10143,7 +10143,7 @@ impl Storage {
     /// value never expires. The clock is injected (`now`) so tests can
     /// drive expiry.
     ///
-    /// Each index is one ordinary delete, `{field: {$lt: <cutoff>}}` plus
+    /// Each index is one ordinary delete, `{field: {$lte: <cutoff>}}` plus
     /// the index's partial filter, because that is exactly mongod's rule and
     /// an ordinary delete does everything a delete must: the oplog entry a
     /// change stream and recovery read, the pre-image, the index entries.
@@ -10156,7 +10156,7 @@ impl Storage {
         let cutoff_of = |secs: f64| {
             bson::DateTime::from_millis(
                 now.timestamp_millis()
-                    .saturating_sub((secs * 1000.0) as i64),
+                    .saturating_sub((secs.trunc() * 1000.0) as i64),
             )
         };
         {
@@ -10174,8 +10174,15 @@ impl Storage {
                         Some(Bson::Double(d)) => Some(*d),
                         _ => None,
                     };
+                    // mongod scans the record ids from the epoch to the
+                    // cutoff, both included (`_deleteExpiredWithCollscan`,
+                    // 8.2), so an `_id` dated before 1970 never expires
+                    // (measured 8.2.11, 2026-10-20: 1960 and 1969 stayed).
                     if let Some(secs) = secs.filter(|s| !s.is_nan() && *s >= 0.0) {
-                        filters.push(bson::doc! {"_id": {"$lt": cutoff_of(secs)}});
+                        filters.push(bson::doc! {"_id": {
+                            "$gte": bson::DateTime::from_millis(0),
+                            "$lte": cutoff_of(secs),
+                        }});
                     }
                 }
             }
@@ -10197,8 +10204,11 @@ impl Storage {
                 if field == "_id" || direction_of(direction).is_none() {
                     continue;
                 }
+                // The index scan runs from the dawn of time to the cutoff,
+                // both keys included (`_deleteExpiredWithIndex`, 8.2): a date
+                // exactly `expireAfterSeconds` old goes.
                 let mut expired = Document::new();
-                expired.insert("$lt", cutoff_of(secs));
+                expired.insert("$lte", cutoff_of(secs));
                 let mut filter = Document::new();
                 filter.insert(field.clone(), Bson::Document(expired));
                 if let Ok(partial) = opts.get_document("partialFilterExpression") {
