@@ -10,3 +10,7 @@
   which keep one entry per document.
 
 RM-224 part (`tests/backlog/test_rm_219_apply_ops.py::test_oplog_insert_batches_are_mongods_apply_ops`).
+
+A committed transaction is one `applyOps` entry under its `lsid` /
+`txnNumber`, with `prevOpTime`, as mongod logs it
+(`::test_oplog_transaction_is_one_apply_ops`).

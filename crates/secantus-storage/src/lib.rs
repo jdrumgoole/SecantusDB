@@ -720,6 +720,16 @@ fn oplog_view_entries(entries: Vec<Document>) -> Vec<Document> {
     let mut out = Vec::with_capacity(entries.len());
     let mut iter = entries.into_iter().peekable();
     while let Some(entry) = iter.next() {
+        // A transaction's writes, minted together at its commit, are the one
+        // `applyOps` entry mongod writes for it.
+        if let Some(txn) = txn_of(&entry) {
+            let mut run = vec![entry];
+            while iter.peek().and_then(txn_of) == Some(txn.clone()) {
+                run.push(iter.next().expect("peeked"));
+            }
+            out.push(transaction_view(run, txn));
+            continue;
+        }
         let group = entry
             .get_document("bg")
             .ok()
@@ -744,6 +754,57 @@ fn oplog_view_entries(entries: Vec<Document>) -> Vec<Document> {
         };
         out.push(with_term_and_version(shaped));
     }
+    out
+}
+
+/// The session and transaction number a transaction's write carries.
+fn txn_of(entry: &Document) -> Option<(Document, i64)> {
+    if !matches!(entry.get_str("op"), Ok("i" | "u" | "d")) {
+        return None;
+    }
+    Some((
+        entry.get_document("lsid").ok()?.clone(),
+        entry.get_i64("txnNumber").ok()?,
+    ))
+}
+
+/// A committed transaction as mongod 8.2.11 logs it: one `applyOps` entry
+/// holding its writes, under its session, with the start of its
+/// `prevOpTime` chain.
+fn transaction_view(run: Vec<Document>, (lsid, txn): (Document, i64)) -> Document {
+    let first = run[0].clone();
+    let ops: Vec<Bson> = run
+        .into_iter()
+        .map(|e| {
+            let e = oplog_view_shape(&e).unwrap_or(e);
+            let mut op = Document::new();
+            for k in ["op", "ns", "ui", "o", "o2"] {
+                if let Some(v) = e.get(k) {
+                    op.insert(k, v.clone());
+                }
+            }
+            Bson::Document(op)
+        })
+        .collect();
+    let mut out = bson::doc! {
+        "lsid": lsid,
+        "txnNumber": txn,
+        "op": "c",
+        "ns": "admin.$cmd",
+        "o": {"applyOps": ops},
+    };
+    if let Some(ts) = first.get("ts") {
+        out.insert("ts", ts.clone());
+        out.insert("t", 1_i64);
+        out.insert("v", 2_i64);
+    }
+    if let Some(wall) = first.get("wall") {
+        out.insert("wall", wall.clone());
+    }
+    out.insert(
+        "prevOpTime",
+        bson::doc! {"ts": bson::Timestamp { time: 0, increment: 0 }, "t": -1_i64},
+    );
     out
 }
 

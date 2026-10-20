@@ -634,7 +634,8 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
 - [ ] **`local.oplog.rs` entries are not mongod's shape.** Since
       2026-10-20 an update (mongod's `$v: 2` diff, stored beside the
       change-stream description as `o.md`), a batch of inserts (one
-      `applyOps` per group of 500 documents or 256 KiB), a delete, a drop
+      `applyOps` per group of 500 documents or 256 KiB), a committed
+      transaction (one `applyOps` under its session), a delete, a drop
       (`o2: {numRecords}`), a rename (`stayTemp`), a one-index
       `createIndexes` and a `dropIndexes` read as mongod 8.2.11 writes them,
       with its `t` and `v`. Open:

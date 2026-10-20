@@ -340,3 +340,33 @@ def test_oplog_ddl_and_delete_entries_have_mongods_shape(rust_mongo: Any, mongod
     the spec (`v`, `unique`, `hidden` first); `dropIndexes` keeps the spec in
     `o2`; a rename says `stayTemp: false`; a drop has `o2: {numRecords}`."""
     assert _ddl_entries(rust_mongo) == _ddl_entries(mongod_rs)
+
+
+def _transaction_entries(client: Any) -> list:
+    db = client.rm224
+    client.drop_database("rm224")
+    db.create_collection("c")
+    start = client.local["oplog.rs"].find_one(sort=[("$natural", -1)])["ts"]
+    with client.start_session() as s, s.start_transaction():
+        db.c.insert_one({"_id": 1}, session=s)
+        db.c.update_one({"_id": 1}, {"$set": {"x": 1}}, session=s)
+        db.c.delete_one({"_id": 1}, session=s)
+    entries = [
+        (
+            e["op"],
+            e["ns"],
+            sorted(e.keys()),
+            [(o["op"], o["o"]) for o in e["o"].get("applyOps", [])],
+        )
+        for e in client.local["oplog.rs"].find({"ts": {"$gt": start}, "op": {"$ne": "n"}})
+        if e["ns"] in ("rm224.c", "admin.$cmd")
+    ]
+    client.drop_database("rm224")
+    return entries
+
+
+@pytest.mark.backlog_fixed("RM-224")
+def test_oplog_transaction_is_one_apply_ops(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """mongod 8.2.11 logs a committed transaction as one `applyOps` entry
+    under its `lsid` / `txnNumber`, with `prevOpTime`."""
+    assert _transaction_entries(rust_mongo) == _transaction_entries(mongod_rs)
