@@ -80,7 +80,7 @@ either line.
 | --- | --- | --- |
 | `tools/probes/pg_corpora/` (320 corpora, each with its `.setup.sql`) | statements someone thought to write | `tools/probes/pg_corpora_sweep.py`, **serial**: run in parallel, an event trigger in one corpus fires on another's DDL and shared schemas get dropped under each other (39 "divergences" where there were 13) |
 | `tools/probes/pg_builtin_coverage.py` | every immutable/stable function in PG 15's `pg_proc`, one sample per argument type | finds what no corpus asked; `pg_corpora/builtin_coverage.sql` pins fixes, `tests/test_rust_pg_builtin_coverage.py` runs them in CI without PostgreSQL |
-| psycopg 3's suite | protocol and type system | `./inv validate-psycopg-rust` (~20 min debug; writes `.validation/psycopg-raw-rust.json` and checks every started test reported). **Not** `invoke validate-psycopg`, which runs the Python server and overwrites its report. `--tls` adds the TLS run |
+| psycopg 3's suite | protocol and type system | `./inv validate-psycopg-rust` (~20 min debug; writes `.validation/psycopg-raw-rust.json` and checks every started test reported). **Not** `invoke validate-psycopg`, which runs the Python server and overwrites its report. `--tls` adds the TLS run; `.github/workflows/psycopg-tls.yml` runs it weekly on Linux and on PRs touching TLS, re-running a TLS-only failure before counting it (`psycopg_validation/check_run.py`) |
 | `tests/backlog/` | the open `RP-nnn` items | `python tools/backlog.py verify --file backlog-rust-postgres.md` (see the `backlog` skill) |
 
 A clean corpus sweep is silent about what no corpus covers, and the psycopg
@@ -113,6 +113,13 @@ produced. Before naming a new corpus, `git ls-files tools/probes/pg_corpora`
 | triggers | `secantus-pg/src/triggers.rs` |
 | TLS, `pg_hba.conf`, CRLs, ident maps, reload | `tls.rs`, `hba.rs`, `crl.rs`, `ident.rs`, `live.rs` in `secantus-pg/src` |
 | xid counter / `age()` | `secantus-pg/src/xids.rs` |
+
+**A clause parsed and then ignored is the worst outcome.** `ON CONFLICT` and
+`GROUPING SETS` were each parsed and dropped, so the client got a confident
+wrong answer (a `23505` where PostgreSQL succeeds, a `42803` blaming the
+user's query) instead of an honest `0A000`. When a parse-tree field is not
+implemented, refuse it by name; grep the `pg_query` node you match for fields
+the lowering never reads.
 
 **Prefer a rewrite to a new plan node.** UPDATE ... FROM, DELETE ... USING,
 views, aggregate ORDER BY and an aggregate over a residual WHERE are all AST
