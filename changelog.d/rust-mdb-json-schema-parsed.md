@@ -57,3 +57,10 @@ type (unless the schema declares that one type), a nested object as
   only `_id` dates from the epoch on, so an `_id` dated 1960 stays, as on
   mongod 8.2.11 (`crates/secantus-storage/tests/ttl.rs::boundary_is_inclusive`,
   `::a_clustered_collection_expires_from_the_epoch`).
+- **`upsertSupplied` is one statement** (fixes RM-102): the supplied document
+  is inserted by the same storage statement as the match, where it used to
+  be a second insert after it, so a concurrent insert between the two could
+  turn it into a duplicate-key error. It also takes the `_id` a dotted
+  equality builds (`{"_id.x": 1}` upserts `_id: {x: 1}`, as mongod 8.2.11
+  does; it minted an ObjectId)
+  (`crates/secantus-storage-adapter/tests/command_crud_wt.rs::update_constants_and_upsert_supplied`).

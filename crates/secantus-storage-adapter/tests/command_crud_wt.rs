@@ -1120,6 +1120,25 @@ fn update_constants_and_upsert_supplied() {
                 Bson::Document(doc! {"_id": 60, "z": 1}),
             ]
         );
+
+        // The supplied document keeps the order it was written in, and takes
+        // the `_id` a dotted equality builds (measured 8.2.11, 2026-10-20).
+        // It is inserted by the same storage statement as the match.
+        let reply = dispatch(
+            &doc! {"update": "c", "updates": [{
+                "q": {"_id.x": 61}, "u": [{"$set": {"a": 1}}], "upsert": true,
+                "upsertSupplied": true, "c": {"new": {"z": 1, "b": 2, "a": 9}},
+            }]},
+            c,
+        );
+        assert_eq!(reply.get_i32("n").unwrap(), 1, "{reply}");
+        let found = dispatch_full(&doc! {"find": "c", "filter": {"_id.x": 61}}, c);
+        assert_eq!(
+            fb(&found, c),
+            vec![Bson::Document(
+                doc! {"_id": {"x": 61}, "z": 1, "b": 2, "a": 9}
+            )]
+        );
     });
 }
 

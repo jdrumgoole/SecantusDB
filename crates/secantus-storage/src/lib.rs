@@ -16676,7 +16676,46 @@ impl Storage {
         validator_moderate: bool,
         want_post_image: bool,
     ) -> Result<UpdateOutcome> {
+        self.update_matching_pipeline_supplied(
+            db,
+            coll,
+            filter,
+            pipeline,
+            multi,
+            upsert,
+            None,
+            let_vars,
+            coll_opt,
+            validator,
+            validator_moderate,
+            want_post_image,
+        )
+    }
+
+    /// [`Storage::update_matching_pipeline`] with `upsertSupplied`: when
+    /// nothing matches and `supplied` is given, the upsert inserts that
+    /// document as it stands, in the same statement as the match, rather
+    /// than the pipeline run over the query's fields. Its `_id` is the
+    /// query's when the query names one, and may not be another (66,
+    /// measured 8.2.11, 2026-10-14).
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_matching_pipeline_supplied(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        pipeline: &[Bson],
+        multi: bool,
+        upsert: bool,
+        supplied: Option<&Document>,
+        let_vars: &Document,
+        coll_opt: Option<&Collation>,
+        validator: Option<&Document>,
+        validator_moderate: bool,
+        want_post_image: bool,
+    ) -> Result<UpdateOutcome> {
         let _admit = self.admit_write();
+        let _supplied = SuppliedUpsert::enter(supplied.is_some());
         self.update_matching_core(
             db,
             coll,
@@ -16691,6 +16730,9 @@ impl Storage {
             validator_moderate,
             want_post_image,
             &|doc, upserting| {
+                if let (true, Some(given)) = (upserting, supplied) {
+                    return supplied_upsert_doc(doc, given);
+                }
                 // The pipeline was checked before any document was read, so
                 // what fails here failed while running, and mongod reports
                 // it under the executor's wrapper.
@@ -17400,7 +17442,7 @@ impl Storage {
                     // `order_upserted_doc`. Only an OPERATOR upsert gets it; a
                     // REPLACEMENT upsert inserts the document the client sent,
                     // in the client's own order.
-                    if !is_replacement {
+                    if !is_replacement && !SuppliedUpsert::active() {
                         new = order_upserted_doc(new, &seeded);
                     }
                     // Validator on an upsert-inserted document, too.
@@ -20787,6 +20829,56 @@ fn collect_upsert_seed(
         into.push((key.clone(), seed_value));
     }
     Ok(())
+}
+
+thread_local! {
+    static SUPPLIED_UPSERT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the statement on this thread as an `upsertSupplied` one, whose
+/// upserted document is inserted in the order the client wrote it rather than
+/// mongod's order for a document built from the query.
+struct SuppliedUpsert(bool);
+
+impl SuppliedUpsert {
+    fn enter(on: bool) -> Self {
+        SuppliedUpsert(SUPPLIED_UPSERT.with(|c| c.replace(on)))
+    }
+
+    fn active() -> bool {
+        SUPPLIED_UPSERT.with(std::cell::Cell::get)
+    }
+}
+
+impl Drop for SuppliedUpsert {
+    fn drop(&mut self) {
+        SUPPLIED_UPSERT.with(|c| c.set(self.0));
+    }
+}
+
+/// The document an `upsertSupplied` upsert inserts: the supplied one, with
+/// the `_id` the query names (`seed` is the document built from the query's
+/// equalities) when it gives none, and an error when it gives another.
+fn supplied_upsert_doc(seed: &Document, supplied: &Document) -> Result<Document> {
+    let mut new = supplied.clone();
+    match (new.get("_id"), seed.get("_id")) {
+        (None, Some(id)) => {
+            new.insert("_id", id.clone());
+        }
+        (Some(given), Some(id)) if !secantus_core::update::same_id_value(given, id) => {
+            return Err(StorageError::QueryError {
+                code: 66,
+                errmsg: format!(
+                    "After applying the update, the (immutable) field '_id' was found to have \
+                     been altered to _id: {}",
+                    shell_value(given)
+                ),
+                exec: true,
+            });
+        }
+        _ => {}
+    }
+    Ok(new)
 }
 
 fn order_upserted_doc(new: Document, seeded: &[String]) -> Document {

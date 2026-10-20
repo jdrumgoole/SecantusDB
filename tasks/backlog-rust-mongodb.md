@@ -1500,13 +1500,6 @@ What is left, there and beside it:
 wording filed under 7.067) and 2 TTL results
 (`tasks/rust-mongod-remaining-plan.md`, 2026-10-14). What is left:
 
-- [ ] **RUST MongoDB server: `upsertSupplied` is two steps.** The update runs
-      without the upsert, and when nothing matched `c.new` is inserted: not
-      one atomic statement, so a concurrent insert between the two can make
-      it a duplicate-key error. (The validator is applied, and the `_id` is
-      the query's, re-measured 2026-10-14.)
-      Backlog-ID: RM-102
-      Verify: none -- a race between the two steps; no deterministic check
 
 ### 7.067 Index management -- 2026-10-10
 

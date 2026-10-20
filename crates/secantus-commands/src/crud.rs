@@ -2218,13 +2218,14 @@ pub(crate) fn update_in(
                 continue;
             }
             crate::explain::order::pinned(storage, first, || {
-                storage.update_matching_pipeline(
+                storage.update_matching_pipeline_supplied(
                     db_name,
                     &coll,
                     &q,
                     stages,
                     multi,
-                    upsert && supplied.is_none(),
+                    upsert,
+                    supplied.as_ref(),
                     &stmt_vars,
                     collation.as_ref(),
                     validator.as_ref(),
@@ -2359,73 +2360,7 @@ pub(crate) fn update_in(
                         crate::transactions::StmtRecord::Update { upserted: None },
                     );
                 }
-                let mut upserted_id = outcome.upserted_id;
-                if let (0, Some(mut new)) = (outcome.matched, supplied) {
-                    // The `_id` is the query's, when it names one by equality,
-                    // and `c.new` may not give another (measured 8.2.11,
-                    // 2026-10-14: `{_id: 1}` with `new: {v: 5}` stores
-                    // `{_id: 1, v: 5}`; with `new: {_id: 7}` it is 66).
-                    let queried = query_id_equality(&q);
-                    match (new.get("_id"), &queried) {
-                        (None, Some(id)) => {
-                            new.insert("_id", id.clone());
-                        }
-                        (None, None) => {
-                            new.insert("_id", secantus_core::oid::new());
-                        }
-                        (Some(given), Some(id))
-                            if !secantus_core::update::same_id_value(given, id) =>
-                        {
-                            write_errors.push(Bson::Document(doc! {
-                                "index": index as i32,
-                                "code": 66,
-                                "errmsg": format!(
-                                    "Plan executor error during update :: caused by :: After \
-                                     applying the update, the (immutable) field '_id' was found \
-                                     to have been altered to _id: {}",
-                                    secantus_core::update::render_shell(given)
-                                ),
-                            }));
-                            if ordered {
-                                break;
-                            }
-                            continue;
-                        }
-                        (Some(_), _) => {}
-                    }
-                    let id = new.get("_id").cloned().unwrap_or(Bson::Null);
-                    // The supplied document is inserted as it stands, and is
-                    // held to the validator like any other. It was not.
-                    let refused = validator.as_ref().filter(|v| {
-                        !secantus_core::query::matches(&new, v, &Document::new(), None)
-                            .unwrap_or(true)
-                    });
-                    if let Some(v) = refused {
-                        write_errors.push(Bson::Document(doc! {
-                            "index": index as i32,
-                            "code": 121,
-                            "errmsg": "Plan executor error during update :: caused by :: \
-                                       Document failed validation",
-                            "errInfo": validation_error_info(v, &new),
-                        }));
-                        if ordered {
-                            break;
-                        }
-                        continue;
-                    }
-                    let (_, mut errors) = storage
-                        .insert(db_name, &coll, vec![encode_doc(&new)?], true)
-                        .map_err(command_error)?;
-                    if let Some(mut err) = errors.pop() {
-                        err.insert("index", index as i32);
-                        write_errors.push(Bson::Document(err));
-                        if ordered {
-                            break;
-                        }
-                        continue;
-                    }
-                    upserted_id = Some(id);
-                }
+                let upserted_id = outcome.upserted_id;
                 if let Some(id) = upserted_id {
                     crate::transactions::note_statement(
                         index,
@@ -2497,20 +2432,6 @@ fn encode_doc(d: &Document) -> Result<Vec<u8>, CommandError> {
 
 fn bson_array(docs: Vec<Document>) -> Vec<Bson> {
     docs.into_iter().map(Bson::Document).collect()
-}
-
-/// The `_id` a query names by equality: `{_id: v}` or `{_id: {$eq: v}}`.
-fn query_id_equality(q: &Document) -> Option<Bson> {
-    match q.get("_id")? {
-        Bson::Document(d) if d.keys().next().is_some_and(|k| k.starts_with('$')) => {
-            if d.len() == 1 {
-                d.get("$eq").cloned()
-            } else {
-                None
-            }
-        }
-        v => Some(v.clone()),
-    }
 }
 
 /// A write statement whose `$near` cannot run, as its `writeErrors` entry:
