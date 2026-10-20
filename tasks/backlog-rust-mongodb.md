@@ -576,6 +576,165 @@ These are explicit non-goals. Don't add them without a reason.
       Backlog-ID: RM-023
       Verify: tests/backlog/test_rm_001_028.py::test_slow_query_line_says_where_the_time_went
 
+### 7.086 The Rust MongoDB server, audited -- 2026-10-20
+
+An audit of the command, expression and wire layers, each finding reproduced
+against mongod 8.2.11 (standalone, or a one-member replica set where it
+needs sessions) with a `secantusd-rs` built from tree `af2629ec`. The gap
+tests are in `tests/backlog/test_rm_found_2026_10_20b.py` and ask mongod
+live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
+`j: true` durability (RM-186), `storageSize` (RM-040).
+
+- [ ] **A snapshot read at a point in time reads the latest data.**
+      `readConcern: {level: "snapshot", atClusterTime: T}` outside a
+      transaction is only checked for being too old (239, §7.078);
+      `T` never chooses what is read (`secantus-commands/src/lib.rs`, the
+      read-concern check). Measured: insert `n: 0`, take the `ping`
+      `operationTime` T, set `n: 9`, then find at T: mongod answers 0, this
+      server 9. A `start_session(snapshot=True)` session is the same: it
+      reads (0, 7) across another client's write, where mongod reads (0, 0).
+      A silent wrong answer. WiredTiger can read at a timestamp
+      (`read_timestamp`), which is mongod's own mechanism.
+      Backlog-ID: RM-210
+      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_snapshot_read_at_cluster_time,tests/backlog/test_rm_found_2026_10_20b.py::test_snapshot_session_keeps_its_snapshot
+- [ ] **Aggregation has no memory limits and nothing spills.** Over 110
+      one-megabyte documents mongod 8.2.11 refuses: `$group` with
+      `allowDiskUse: false` (292 QueryExceededMemoryLimitNoDiskUseAllowed),
+      an array past 100 MB from `$push` or `$addToSet` (146
+      ExceededMemoryLimit), `$setWindowFields` (5643011), a `$lookup`
+      result (4568) and `$facet` (4031700). This server runs every one,
+      holding it all in memory; `allowDiskUse` is only type-checked
+      (`aggregate.rs`). A blocking `$sort` already agrees. mongod's
+      mechanism is per-stage memory accounting with spilling to disk when
+      `allowDiskUse` permits it.
+      Backlog-ID: RM-211
+      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_aggregation_memory_limits
+- [ ] **`$add` and `$subtract` with a Date are refused.** Date minus a
+      number or a date, date plus numbers, `{$add: ["$d"]}` and
+      `{$add: []}` (0 on mongod) all answer 2 "not supported by the Rust
+      server", in aggregation, in `$expr` in a find and in a pipeline
+      update. The cause is `Err(Fallback::Defer)` in
+      `secantus-core/src/expressions.rs` (`// datetime subtraction ->
+      Python`) and the single-date and empty-list defers in `arith_nary`, a
+      Python fallback that does not exist on this server.
+      Backlog-ID: RM-212
+      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_date_arithmetic
+- [ ] **Expression operators missing, refused, or answering wrongly.**
+      `$unsetField` and `$toUUID` are 31325 unknown expression. These are
+      refused with a generic 2:
+      - `$convert` to binData (`format: "base64"`, or `to: {type:
+        "binData"}`);
+      - `$dateToString` of a Timestamp.
+
+      These are refused with a generic 2 where mongod has its own code:
+      - `$substrCP` with a non-numeric index (34450);
+      - `$setField` on a non-object (4161105);
+      - `$zip` over a non-array (34468);
+      - `$map` over a non-array (16883).
+
+      Silently wrong:
+      - `$getField` on a non-object gives `v: null` where mongod leaves
+        `v` missing;
+      - `{$slice: [arr, "x"]}` gives null where mongod errors 28725;
+      - `$let` accepts the variable name `X` (mongod: 9);
+      - `$arrayToObject` accepts mixed `{k, v}` and pair elements (mongod:
+        40391).
+      Backlog-ID: RM-213
+      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_expression_operators
+- [ ] **Window functions missing or imprecise.**
+      - `$covariancePop` and `$covarianceSamp` always answer 2.
+      - `$topN` and `$bottomN` as window functions are 168 (`$top` works).
+      - `$linearFill` refuses (2) when `sortBy` is a date.
+      - `$derivative` and `$integral` with a `unit` drift from about the
+        11th significant digit (9.882352941193389 here, 9.882352941176471
+        on mongod). That looks like the unit conversion done in a different
+        order; transcribe mongod's.
+      Backlog-ID: RM-214
+      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_window_functions
+- [ ] **`$planCacheStats`, `$queryStats` and `$listSampledQueries` are
+      unknown stages** (40324). mongod 8.2.11 runs each on a one-member
+      replica set (an empty result on a fresh one). `$planCacheStats` needs
+      a plan cache, which this server does not keep (§7.075); `$queryStats`
+      needs query-shape statistics, which RM-170 (`includeQueryStatsMetrics`)
+      also lacks.
+      Backlog-ID: RM-215
+      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_diagnostic_stages
+- [ ] **No registry of running operations, so `currentOp`, `$currentOp`
+      and `killOp` cannot see or stop work.**
+      - `currentOp` does not list another client's waiting getMore; mongod
+        lists it (op `getmore`), and `killOp` on its opid ends it with
+        11601.
+      - `$currentOp` emits one synthetic row (`aggregate.rs`, "keeps no
+        per-op registry"), and `idleCursors: true` lists none of another
+        client's open cursors (mongod: 1).
+      - `killOp` takes a connection id. Measured: given the opid of the
+        caller's own `currentOp` row, it closed the caller's connection.
+      - A long query or index build cannot be found or interrupted.
+      Backlog-ID: RM-216
+      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_current_op_lists_idle_cursors,tests/backlog/test_rm_found_2026_10_20b.py::test_current_op_sees_a_running_operation
+- [ ] **`killAllSessionsByPattern` ignores its pattern, and the kill
+      commands leave cursors open.** The patterns are parsed and then
+      `abort_all()` runs (`secantus-commands/src/lib.rs`). A pattern naming
+      only s1's lsid aborted s2's transaction too; mongod 8.2.11 lets s2
+      commit. After `killAllSessions: []` or `killAllSessionsByPattern:
+      []` a session's open cursor still answers getMore here; on mongod it
+      is gone (43 CursorNotFound).
+      Backlog-ID: RM-217
+      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_kill_sessions_by_pattern_kills_only_the_match,tests/backlog/test_rm_found_2026_10_20b.py::test_kill_all_sessions_closes_cursors
+- [ ] **The 64-index limit is not enforced.** mongod 8.2.11 allows 64
+      indexes on a collection, `_id_` included, and refuses the next with 67
+      CannotCreateIndex; this server created a 65th. No limit exists in
+      `secantus-commands` or `secantus-storage`.
+      Backlog-ID: RM-218
+      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_index_count_limit
+- [ ] **Seventeen commands mongod runs are 59 CommandNotFound here.**
+      mongod 8.2.11 (one-member replica set) answers each with success or
+      an error of its own:
+      - data: `applyOps` (which `mongorestore --oplogReplay` needs),
+        `filemd5`, `releaseMemory`;
+      - diagnostics: `getDiagnosticData`, `dbCheck`, `validateDBMetadata`;
+      - settings: `setUserWriteBlockMode`, `setQuerySettings` /
+        `removeQuerySettings`, `setClusterParameter`, `autoCompact`;
+      - connections and auth: `dropConnections`, `invalidateUserCache`,
+        `rotateCertificates` (TLS has landed);
+      - replication: `replSetGetRBID`, `replSetFreeze`,
+        `replSetMaintenance`.
+
+      RM-143 covers only `planCacheSetFilter` and `replSetReconfig`. Each
+      is its own slice, and some (query settings, write blocking) are real
+      features rather than replies.
+      Backlog-ID: RM-219
+      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_commands_mongod_runs_are_commands_here
+- [ ] **`fsync` with `lock: true` is refused** (9, "not supported by
+      SecantusDB", `diagnostics.rs`) while `fsyncUnlock` exists. mongod
+      8.2.11 takes the lock (`lockCount: 1`), blocking writes until
+      `fsyncUnlock`; backup tools use the pair.
+      Backlog-ID: RM-220
+      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_fsync_lock
+- [ ] **OP_MSG checksums are not verified, and unknown required flag bits
+      are accepted.** `secantus-wire` trims the CRC-32C trailer without
+      checking it. A `ping` with a wrong checksum, or with required flag
+      bit 3 set, gets a normal reply here; mongod 8.2.11 closes the
+      connection for both. Wire fidelity: a corrupted message is answered
+      as though it were sound.
+      Backlog-ID: RM-221
+      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_op_msg_bad_checksum_is_refused,tests/backlog/test_rm_found_2026_10_20b.py::test_op_msg_unknown_required_flag_is_refused
+- [ ] **A string that is not valid UTF-8 is refused.** An insert whose
+      string holds the bytes `0xff 0xfe` answers 1 "BSON error: utf-8
+      encoding error"; mongod 8.2.11 stores it (n: 1). Data mongod keeps is
+      refused, and data read back from a mongod dump could not be
+      restored. Reading strings as raw bytes where they are not inspected
+      would keep them.
+      Backlog-ID: RM-222
+      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_insert_string_with_invalid_utf8
+- [ ] **An update that grows a document past 16 MB has the wrong message.**
+      Same code (10334), but this server says "object to insert too large.
+      size in bytes: …, max size: 16777216" where mongod 8.2.11 says "Plan
+      executor error during update :: caused by :: Resulting document
+      after update is larger than 16777216".
+      Backlog-ID: RM-223
+      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_update_past_16mb_message
+
 ### 7.085 The shared Rust storage, audited -- 2026-10-20
 
 A read-only audit of `secantus-storage` / `secantus-wt`, the layer both
