@@ -846,8 +846,9 @@ may run a command.
       (`sortKey: {score: -1, _id: 1}`) and `$replaceRoot`; `$score` is
       `$setMetadata` and, normalised, `$_internalSetWindowFields` with
       `$minMaxScaler`. Also not reproduced: either fusion stage as the first
-      stage of a `$lookup` or `$facet` sub-pipeline, which mongod accepts
-      (and inside `$facet` returns the documents in collection order).
+      stage of a `$facet` sub-pipeline, which mongod accepts and answers
+      with the documents in collection order (in a `$lookup` or
+      `$unionWith` sub-pipeline both run, as on mongod).
       Backlog-ID: RM-200
       Verify: tests/backlog/test_rm_added_in_82.py::test_explain_of_rank_fusion_is_its_desugaring
 - **Scope decision — `mapReduce` with a named `out`** (Joe, 2026-10-16,

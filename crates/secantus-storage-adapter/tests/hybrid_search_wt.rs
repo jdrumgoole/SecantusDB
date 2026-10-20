@@ -147,3 +147,45 @@ fn hybrid_stages_are_refused_as_mongod_refuses_them() {
         }
     });
 }
+
+#[test]
+fn hybrid_stages_run_in_lookup_and_union_sub_pipelines() {
+    with_wt(|c| {
+        seed(c);
+        // mongod 8.2.11: the `$lookup`'s own `$rankFusion` ranks 5 then 4.
+        let reply = dispatch_full(
+            &doc! {"aggregate": "s", "cursor": {}, "pipeline": [
+                {"$limit": 1},
+                {"$lookup": {"from": "s", "as": "q", "pipeline": [
+                    {"$rankFusion": {"input": {"pipelines": {"a": [{"$sort": {"x": -1}}]}}}},
+                    {"$limit": 2},
+                    {"$project": {"s": {"$meta": "score"}}},
+                ]}},
+            ]},
+            c,
+        );
+        let q = reply
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap()[0]
+            .as_document()
+            .unwrap()
+            .get_array("q")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            q,
+            vec![
+                Bson::Document(doc! {"_id": 5, "s": 0.01639344262295082}),
+                Bson::Document(doc! {"_id": 4, "s": 0.016129032258064516}),
+            ]
+        );
+        // A `$score` inside a `$facet` is 40218, as on mongod.
+        let (code, _) = error(
+            c,
+            vec![doc! {"$facet": {"f": [{"$score": {"score": "$x"}}]}}],
+        );
+        assert_eq!(code, 40218);
+    });
+}

@@ -28,5 +28,6 @@ difference.
 #### Not yet
 
 - `explain` shows the stage as written rather than mongod's desugaring, and
-  a fusion stage at the head of a `$lookup` or `$facet` sub-pipeline is
-  refused (RM-200).
+  a fusion stage at the head of a `$facet` sub-pipeline is refused
+  (RM-200). In a `$lookup` or `$unionWith` sub-pipeline all three run, and
+  inside a `$facet` `$score` is refused with 40218, as on mongod.

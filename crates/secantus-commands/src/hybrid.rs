@@ -558,11 +558,18 @@ fn fusion(name: &str, spec: &Bson, coll: &str) -> Result<Vec<Bson>, CommandError
 /// Whether `pipeline` has a stage this module desugars, or reads the score
 /// metadata they set.
 pub(crate) fn mentions_hybrid(pipeline: &[Bson]) -> bool {
-    pipeline.iter().any(|s| {
-        matches!(stage_name(s), "$score" | "$rankFusion" | "$scoreFusion")
-            || mentions(s, "score")
-            || mentions(s, "scoreDetails")
-    })
+    fn names_stage(v: &Bson) -> bool {
+        match v {
+            Bson::Document(d) => d.iter().any(|(k, v)| {
+                matches!(k.as_str(), "$score" | "$rankFusion" | "$scoreFusion") || names_stage(v)
+            }),
+            Bson::Array(items) => items.iter().any(names_stage),
+            _ => false,
+        }
+    }
+    pipeline
+        .iter()
+        .any(|s| names_stage(s) || mentions(s, "score") || mentions(s, "scoreDetails"))
 }
 
 /// Parse and desugar the hybrid stages of `pipeline`, an `aggregate` on
@@ -589,11 +596,66 @@ pub(crate) fn prepare(pipeline: Vec<Bson>, coll: Option<&str>) -> Result<Vec<Bso
                 }
                 out.push(score_stage(&spec.unwrap_or(Bson::Null))?);
             }
-            _ => out.push(stage),
+            _ => out.push(sub_pipelines(stage)?),
         }
     }
     rewrite_metadata(&mut out)?;
     Ok(out)
+}
+
+/// `stage` with the hybrid stages of its sub-pipelines desugared, each over
+/// the collection it reads: a `$unionWith`'s `coll` and a `$lookup`'s
+/// `from`. A `$facet` sub-pipeline reads no collection of its own. Each has
+/// its own score metadata, out of the outer pipeline's reach.
+fn sub_pipelines(mut stage: Bson) -> Result<Bson, CommandError> {
+    let name = stage_name(&stage).to_string();
+    let Some(Bson::Document(spec)) = stage.as_document_mut().and_then(|d| d.get_mut(&name)) else {
+        return Ok(stage);
+    };
+    let prepared = |p: &Bson, coll: Option<&str>| -> Result<Option<Bson>, CommandError> {
+        match p {
+            Bson::Array(stages) if mentions_hybrid(stages) => {
+                Ok(Some(Bson::Array(prepare(stages.clone(), coll)?)))
+            }
+            _ => Ok(None),
+        }
+    };
+    match name.as_str() {
+        "$unionWith" | "$lookup" => {
+            let coll = spec
+                .get_str(if name == "$lookup" { "from" } else { "coll" })
+                .ok()
+                .map(str::to_string);
+            if let Some(p) = spec.get("pipeline") {
+                if let Some(done) = prepared(p, coll.as_deref())? {
+                    spec.insert("pipeline", done);
+                }
+            }
+        }
+        "$facet" => {
+            // mongod 8.2.11 has no score metadata inside a `$facet`: a
+            // `$score` there, or a read of the score, is 40218 (measured).
+            let names: Vec<String> = spec.keys().cloned().collect();
+            for facet in names {
+                if let Bson::Array(stages) = &spec[facet.as_str()] {
+                    if stages
+                        .iter()
+                        .any(|s| stage_name(s) == "$score" || mentions(s, "score"))
+                    {
+                        return Err(unavailable("score"));
+                    }
+                    if stages.iter().any(|s| mentions(s, "scoreDetails")) {
+                        return Err(unavailable("scoreDetails"));
+                    }
+                }
+                if let Some(done) = prepared(&spec[facet.as_str()], None)? {
+                    spec.insert(facet, done);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(stage)
 }
 
 /// The stages that end the score metadata: they make documents of their
