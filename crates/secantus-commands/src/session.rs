@@ -1145,7 +1145,25 @@ fn retry_insert(
         .copied()
         .filter(|id| done.contains(*id))
         .collect();
+    // The documents of a driver's insert arrive as a document sequence the
+    // handler consumes, so their `_id`s are read before it runs.
+    let sequence_ids: Option<Vec<Option<Bson>>> = ctx.raw_insert_documents.as_ref().map(|docs| {
+        docs.iter()
+            .map(|bytes| {
+                bson::RawDocument::from_bytes(bytes)
+                    .ok()?
+                    .get("_id")
+                    .ok()??
+                    .to_raw_bson()
+                    .try_into()
+                    .ok()
+            })
+            .collect()
+    });
     let id_of = |index: usize| -> Option<Bson> {
+        if let Some(ids) = &sequence_ids {
+            return ids.get(index).cloned().flatten();
+        }
         doc.get_array("documents")
             .ok()?
             .get(index)?
@@ -1335,6 +1353,8 @@ fn retry_find_and_modify(
 ) -> Ran {
     let id = ids.first().copied().unwrap_or(0);
     let remove = doc.get("remove").is_some_and(crate::util::truthy);
+    let new = doc.get("new").is_some_and(crate::util::truthy);
+    let upsert = doc.get("upsert").is_some_and(crate::util::truthy);
     if let Some(record) = done.get(id) {
         let refuse = |code: i32, message: &str| {
             (
@@ -1348,30 +1368,129 @@ fn retry_find_and_modify(
                  transaction of type: {kind}"
             )
         };
+        let no_after = "findAndModify retry request wants the document after update returned, \
+                        but only before update document is stored";
+        let no_before = "findAndModify retry request wants the document before update \
+                         returned, but only after update document is stored";
+        let answer = |last_error: Document, value: Bson| {
+            (
+                doc! {
+                    "lastErrorObject": last_error,
+                    "value": value,
+                    "retriedStmtId": id,
+                    "ok": 1.0,
+                },
+                Vec::new(),
+            )
+        };
+        // The document an upsert inserted, for a retry that asks for it.
+        let inserted = |upserted: &Bson, first: Option<&Bson>| -> Bson {
+            if let Some(Bson::Document(d)) = first {
+                return Bson::Document(d.clone());
+            }
+            let coll = doc
+                .get_str("findAndModify")
+                .or_else(|_| doc.get_str("findandmodify"));
+            ctx.storage
+                .as_ref()
+                .zip(coll.ok())
+                .and_then(|(st, coll)| {
+                    st.find(
+                        &ctx.db_name,
+                        coll,
+                        &doc! {"_id": upserted.clone()},
+                        None,
+                        None,
+                    )
+                    .ok()
+                })
+                .and_then(|rows| rows.into_iter().next())
+                .and_then(|b| secantus_core::bsondoc::from_bytes(&b).ok())
+                .map_or(Bson::Null, Bson::Document)
+        };
+        // What mongod's `validateFindAndModifyRetryability` decides from the
+        // write the statement made and the image it kept (mongod 8.2.11): a
+        // delete answers only a remove, an insert only an upsert, and an
+        // update the document it kept, before or after (40606 / 40608 /
+        // 40611 / 40612; 40607 for a delete with no document kept).
         return match record {
-            // The reply first given, whatever this request asks to see.
             StmtRecord::FindAndModify {
                 reply,
                 remove: was_remove,
-            } if !was_remove || remove => {
-                let mut again = reply.clone();
-                let ok = again.remove("ok");
-                again.insert("retriedStmtId", id);
-                again.insert("ok", ok.unwrap_or(Bson::Double(1.0)));
-                (again, Vec::new())
+                new: was_new,
+            } => {
+                let last = reply
+                    .get_document("lastErrorObject")
+                    .cloned()
+                    .unwrap_or_default();
+                let value = reply.get("value").cloned().unwrap_or(Bson::Null);
+                if was_remove {
+                    if !remove {
+                        return refuse(40606, &incompatible("d"));
+                    }
+                    answer(doc! {"n": 1}, value)
+                } else if let Some(upserted) = last.get("upserted") {
+                    if !upsert {
+                        return refuse(40608, &incompatible("i"));
+                    }
+                    let value = if new {
+                        inserted(upserted, was_new.then_some(&value))
+                    } else {
+                        Bson::Null
+                    };
+                    answer(
+                        doc! {"n": 1, "updatedExisting": false, "upserted": upserted.clone()},
+                        value,
+                    )
+                } else {
+                    // mongod keeps a findAndModify's document in its image
+                    // collection, and a retry gets that one, before or after
+                    // the update as the first request asked, whatever this
+                    // one asks (measured 8.2.11).
+                    answer(doc! {"n": 1, "updatedExisting": true}, value)
+                }
             }
-            StmtRecord::FindAndModify { .. } => refuse(40606, &incompatible("d")),
-            StmtRecord::Insert { .. } => refuse(40608, &incompatible("i")),
+            StmtRecord::Insert { id: inserted_id } => {
+                if !upsert {
+                    return refuse(40608, &incompatible("i"));
+                }
+                let upserted = inserted_id.clone().unwrap_or(Bson::Null);
+                let value = if new {
+                    inserted(&upserted, None)
+                } else {
+                    Bson::Null
+                };
+                answer(
+                    doc! {"n": 1, "updatedExisting": false, "upserted": upserted},
+                    value,
+                )
+            }
+            StmtRecord::Update {
+                upserted: Some(upserted),
+            } => {
+                if !upsert {
+                    return refuse(40608, &incompatible("i"));
+                }
+                let value = if new {
+                    inserted(&upserted, None)
+                } else {
+                    Bson::Null
+                };
+                answer(
+                    doc! {"n": 1, "updatedExisting": false, "upserted": upserted},
+                    value,
+                )
+            }
+            // An update statement keeps no image of the document.
+            StmtRecord::Update { upserted: None } => refuse(
+                if new { 40611 } else { 40612 },
+                if new { no_after } else { no_before },
+            ),
             StmtRecord::Delete if remove => refuse(
                 40607,
                 "No pre-image available for findAndModify retry request",
             ),
             StmtRecord::Delete => refuse(40606, &incompatible("d")),
-            StmtRecord::Update { .. } => refuse(
-                40612,
-                "findAndModify retry request wants the document before update returned, but \
-                 only after update document is stored",
-            ),
         };
     }
     let (reply, noted) = transactions::collect_statements(|| crate::run_handler(handler, doc, ctx));
@@ -1381,6 +1500,7 @@ fn retry_find_and_modify(
             StmtRecord::FindAndModify {
                 reply: reply.clone(),
                 remove,
+                new,
             },
         )]
     } else {

@@ -20,7 +20,7 @@ from typing import Any
 
 import pymongo
 import pytest
-from bson import Binary, Timestamp
+from bson import Binary, Int64, Timestamp
 from pymongo.errors import OperationFailure
 
 from tests.backlog.conftest import _RS_BANNER, RS_BINARY, drain_output, mongo_answer
@@ -1193,3 +1193,75 @@ def test_a_collection_made_in_two_transactions(rust_mongo: Any, mongod_rs: Any) 
     got, want = answers
     assert want == ("ok", True)
     assert got == want
+
+
+_FAM = {"findAndModify": "c", "query": {"_id": 1}, "update": {"$inc": {"v": 1}}}
+_FAM_RETRIES = {
+    "update then new": (_FAM, {**_FAM, "new": True}),
+    "new then old": ({**_FAM, "new": True}, _FAM),
+    "update then remove": (_FAM, {"findAndModify": "c", "query": {"_id": 1}, "remove": True}),
+    "remove then update": ({"findAndModify": "c", "query": {"_id": 2}, "remove": True}, _FAM),
+    "upsert then upsert": (
+        {"findAndModify": "c", "query": {"_id": 7}, "update": {"$set": {"v": 1}}, "upsert": True},
+        {
+            "findAndModify": "c",
+            "query": {"_id": 8},
+            "update": {"$set": {"v": 1}},
+            "upsert": True,
+            "new": True,
+        },
+    ),
+    "insert then upsert": (
+        {"insert": "c", "documents": [{"_id": 9, "w": 1}]},
+        {
+            "findAndModify": "c",
+            "query": {"_id": 9},
+            "update": {"$set": {"v": 1}},
+            "upsert": True,
+            "new": True,
+        },
+    ),
+    "update statement then findAndModify": (
+        {"update": "c", "updates": [{"q": {"_id": 1}, "u": {"$inc": {"v": 1}}}]},
+        _FAM,
+    ),
+    "delete statement then remove": (
+        {"delete": "c", "deletes": [{"q": {"_id": 2}, "limit": 1}]},
+        {"findAndModify": "c", "query": {"_id": 2}, "remove": True},
+    ),
+}
+
+
+_FAM_TXN = iter(range(1_000_000, 2_000_000))
+
+
+def _fam_retry(client: Any, first: dict, second: dict) -> Any:
+    # Writes of its own without transaction numbers, and numbers that only
+    # rise: the session a client starts may be one an earlier write used.
+    host, port = client.address
+    client = pymongo.MongoClient(host, port, retryWrites=False, directConnection=True)
+    db = client["rm203"]
+    db.drop_collection("c")
+    db.c.insert_many([{"_id": 1, "v": 1}, {"_id": 2, "v": 2}])
+    number = Int64(next(_FAM_TXN))
+    with client.start_session() as s:
+        db.command({**first, "txnNumber": number}, session=s)
+        answer = mongo_answer(lambda: db.command({**second, "txnNumber": number}, session=s))
+    client.close()
+    if answer[0] == "err":
+        return answer[:2]
+    reply = answer[1]
+    return (reply.get("lastErrorObject"), reply.get("value"), reply.get("retriedStmtId"))
+
+
+@pytest.mark.backlog_fixed("RM-203")
+def test_a_retried_find_and_modify_answers_from_what_the_first_wrote(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11 decides a retried findAndModify from the write the
+    first execution made (`validateFindAndModifyRetryability`): an insert
+    answers an upsert, an update answers with the document it kept whatever
+    `new` asks, an update statement kept none (40611 / 40612), a delete
+    answers only a remove."""
+    for label, (first, second) in _FAM_RETRIES.items():
+        assert _fam_retry(rust_mongo, first, second) == _fam_retry(mongod_rs, first, second), label

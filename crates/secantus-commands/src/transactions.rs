@@ -272,10 +272,12 @@ pub enum StmtRecord {
         upserted: Option<Bson>,
     },
     Delete,
-    /// A `findAndModify` and the reply it gave.
+    /// A `findAndModify` and the reply it gave, whether it removed, and
+    /// whether it returned the document after the update (`new`).
     FindAndModify {
         reply: Document,
         remove: bool,
+        new: bool,
     },
 }
 

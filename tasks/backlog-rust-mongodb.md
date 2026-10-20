@@ -1433,16 +1433,16 @@ retryable writes). The Rust server differs on 11 scenarios. What is left:
 
 - [ ] **RUST MongoDB server: smaller differences.** A `count` with no query
       does not see another session's uncommitted insert (mongod's fast count
-      does: it answered 3 for 2 committed documents). A write that waits on a
-      transaction's document past `maxTimeMS` answers a plain 50 (mongod adds
-      a `writeConcernError` and words it `Plan executor error during
-      update`). `$where` has no JavaScript to run, in or out of a
-      transaction (2 scenarios). An error that names the request or mongod's
-      oplog entry (40606 / 40607 / 40608 / 40612 on a mismatched
-      `findAndModify` retry; the two statement-id errors) has the code and a
-      shorter text. A write conflict on an insert has an empty cause where
-      mongod names its index table. The other session errors are worded for
-      a session with no user.
+      does: it answered 3 for 2 committed documents). An error that names
+      the request or mongod's oplog entry has the code and a shorter text:
+      40606 / 40607 / 40608 / 40611 / 40612 on an incompatible
+      `findAndModify` retry (which cases refuse is mongod's since
+      2026-10-20, RM-203), and the two statement-id errors. A write conflict
+      on an insert has an empty cause where mongod names its index table.
+      The other session errors are worded for a session with no user.
+      (A write that waits on a transaction's document past `maxTimeMS`
+      answers a plain 50, which is what mongod 8.2.11 answered in 12 runs
+      of 12; the `writeConcernError` one probe run saw did not recur.)
       Backlog-ID: RM-087
       Verify: tests/backlog/test_rm_085_112.py::test_fast_count_sees_another_sessions_uncommitted_insert
 - [ ] **RUST MongoDB server: a collection made in a transaction is locked
