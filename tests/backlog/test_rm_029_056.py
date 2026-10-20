@@ -729,10 +729,9 @@ def test_ties_between_merged_scans(rust_mongo: Any, mongod: Any) -> None:
 
 @pytest.mark.backlog_fixed("RM-051")
 def test_unknown_hint_on_aggregate(rust_mongo: Any, mongod: Any) -> None:
-    """An `aggregate` hinted to an index that does not exist is refused with
-    mongod's code. The message is this server's own: mongod prints its query
-    tree there, and not reproducing it is a scope decision (Joe, 2026-10-16;
-    `tests/test_rust_hint_error_message.py`)."""
+    """An `aggregate` hinted to an index that does not exist is refused as
+    mongod 8.2.11 refuses it, from its planner, with the query tree it made
+    (reproduced since 2026-10-20; it had been an accepted difference)."""
     command = {"aggregate": "c", "pipeline": [{"$match": {"a": 5}}], "cursor": {}, "hint": "a_1"}
     answers = []
     for client in (rust_mongo, mongod):
@@ -741,7 +740,8 @@ def test_unknown_hint_on_aggregate(rust_mongo: Any, mongod: Any) -> None:
         db.c.insert_one({"a": 5})  # on a missing collection mongod ignores the hint
         answers.append(mongo_answer(lambda db=db: db.command(command)))
     got, want = answers
-    assert got[:2] == want[:2] == ("err", 2)
+    assert got == want
+    assert want[:2] == ("err", 2)
 
 
 THREE = [_index({"a": 1}), _index({"b": 1}), _index({"a": 1, "b": 1})]

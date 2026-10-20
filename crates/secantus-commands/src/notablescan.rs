@@ -20,9 +20,9 @@
 //!
 //! The message: mongod prints its parse of the query between the namespace
 //! and the reason (`ns=db.cTree: b $eq 1\nSort: {}\nProj: {}\n planner
-//! returned error ...`). That text is not reproduced (decided 2026-10-15);
-//! the code, the namespace and mongod's closing words are, verbatim, the
-//! ` 2` at the end of the first reason included.
+//! returned error ...`), reproduced by `explain::debug_string` (2026-10-20,
+//! RM-035): what each command shows of its paging, projection and collation
+//! is the read's [`Shown`].
 //!
 //! Not refused here, though mongod refuses them: a `$match` mongod moves to
 //! the front of a pipeline from behind another stage (`$project`, `$unwind`,
@@ -47,6 +47,54 @@ pub(crate) struct Read<'a> {
     pub sort: Option<&'a Document>,
     pub hint: Option<&'a Bson>,
     pub collation: Option<&'a Collation>,
+    /// What the refusal prints of the read besides its filter and sort.
+    pub shown: Shown<'a>,
+}
+
+/// What mongod's refusal prints of a read besides its filter and sort,
+/// measured per command (8.2.11, 2026-10-20): a `find`'s projection, skip,
+/// limit and collation as given; `findAndModify`'s `limit=1` when it
+/// updates; an aggregate's resolved collation, `simple` when it names none.
+/// `count`, `distinct`, `update` and `delete` print none of it.
+#[derive(Default, Clone)]
+pub(crate) struct Shown<'a> {
+    pub projection: Option<&'a Document>,
+    pub skip: Option<i64>,
+    pub limit: Option<i64>,
+    pub collation: Option<Document>,
+}
+
+impl Read<'_> {
+    /// The query mongod's planner says it was asked, for a refusal of this
+    /// read of `db`.
+    pub(crate) fn canonical(&self, db: &str) -> crate::explain::CanonicalQuery<'_> {
+        crate::explain::CanonicalQuery {
+            ns: format!("{db}.{}", self.coll),
+            filter: self.filter,
+            sort: self.sort,
+            projection: self.shown.projection,
+            skip: self.shown.skip,
+            limit: self.shown.limit,
+            collation: self.shown.collation.as_ref(),
+        }
+    }
+
+    /// Refuse a hint naming no index, in mongod's planner's words.
+    pub(crate) fn check_hint(&self, storage: &dyn Storage, db: &str) -> Result<(), CommandError> {
+        crate::util::validate_hint(storage, db, self.coll, self.hint, &self.canonical(db))
+    }
+}
+
+impl<'a> Shown<'a> {
+    /// An aggregate's: the collation it runs under, resolved.
+    pub(crate) fn aggregate(collation: Option<&Collation>) -> Shown<'a> {
+        Shown {
+            collation: Some(
+                collation.map_or_else(|| bson::doc! {"locale": "simple"}, |c| c.spec().clone()),
+            ),
+            ..Shown::default()
+        }
+    }
 }
 
 /// Whether the parameter is set on this server.
@@ -60,8 +108,15 @@ fn exempt(db: &str, coll: &str, filter: &Document) -> bool {
     filter.is_empty() || matches!(db, "admin" | "local" | "config") || coll.starts_with("system.")
 }
 
-/// mongod's refusal of a read of `db.coll`.
-pub(crate) fn refusal(db: &str, coll: &str, why: TableScan) -> CommandError {
+/// mongod's refusal of a read of `db.coll` with `filter`.
+pub(crate) fn refusal(
+    db: &str,
+    coll: &str,
+    filter: &Document,
+    sort: Option<&Document>,
+    shown: &Shown,
+    why: TableScan,
+) -> CommandError {
     let reason = match why {
         TableScan::Unindexed => "No indexed plans available, and running with 'notablescan' 2",
         TableScan::Natural => {
@@ -69,11 +124,16 @@ pub(crate) fn refusal(db: &str, coll: &str, why: TableScan) -> CommandError {
              to output a collection scan because 'notablescan' is enabled"
         }
     };
-    CommandError::new(
-        291,
-        "NoQueryExecutionPlans",
-        format!("error processing query: ns={db}.{coll} planner returned error :: caused by :: {reason}"),
-    )
+    let query = crate::explain::CanonicalQuery {
+        ns: format!("{db}.{coll}"),
+        filter,
+        sort,
+        projection: shown.projection,
+        skip: shown.skip,
+        limit: shown.limit,
+        collation: shown.collation.as_ref(),
+    };
+    CommandError::new(291, "NoQueryExecutionPlans", query.planner_error(reason))
 }
 
 /// The fields `filter` tests, at any depth of `$and` / `$or` / `$nor`, and
@@ -264,18 +324,18 @@ pub(crate) fn check_in(storage: &dyn Storage, db: &str, read: &Read) -> Result<(
         read.hint,
         read.collation,
     )?;
-    refuse_planned(storage, db, read.coll, read.filter, why)
+    refuse_planned(storage, db, read, why)
 }
 
-/// The refusal of a read of `db.coll` with `filter` whose plan is `why`
-/// (`None`: it reads an index).
+/// The refusal of `read` of `db` whose plan is `why` (`None`: it reads an
+/// index).
 pub(crate) fn refuse_planned(
     storage: &dyn Storage,
     db: &str,
-    coll: &str,
-    filter: &Document,
+    read: &Read,
     why: Option<TableScan>,
 ) -> Result<(), CommandError> {
+    let (coll, filter) = (read.coll, read.filter);
     let Some(why) = why else {
         return Ok(());
     };
@@ -296,7 +356,7 @@ pub(crate) fn refuse_planned(
     if why == TableScan::Unindexed && beyond_the_planner(storage, db, coll, filter)? {
         return Ok(());
     }
-    Err(refusal(db, coll, why))
+    Err(refusal(db, coll, filter, read.sort, &read.shown, why))
 }
 
 #[cfg(test)]
@@ -318,15 +378,30 @@ mod tests {
 
     #[test]
     fn the_words_are_mongods_closing_words() {
-        let e = refusal("d", "c", TableScan::Unindexed);
+        let e = refusal(
+            "d",
+            "c",
+            &doc! {"b": 1},
+            None,
+            &Shown::default(),
+            TableScan::Unindexed,
+        );
         assert_eq!(e.code, 291);
         assert_eq!(e.code_name, "NoQueryExecutionPlans");
         assert_eq!(
             e.errmsg,
-            "error processing query: ns=d.c planner returned error :: caused by :: No indexed \
-             plans available, and running with 'notablescan' 2"
+            "error processing query: ns=d.cTree: b $eq 1\nSort: {}\nProj: {}\n planner \
+             returned error :: caused by :: No indexed plans available, and running with \
+             'notablescan' 2"
         );
-        let e = refusal("d", "c", TableScan::Natural);
+        let e = refusal(
+            "d",
+            "c",
+            &doc! {"b": 1},
+            None,
+            &Shown::default(),
+            TableScan::Natural,
+        );
         assert!(e.errmsg.ends_with(
             "could not force a collection scan with a $natural hint :: caused by :: not allowed \
              to output a collection scan because 'notablescan' is enabled"

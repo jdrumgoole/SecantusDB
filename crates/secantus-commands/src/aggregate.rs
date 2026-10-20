@@ -225,7 +225,8 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .as_ref()
         .map(|p| p.sessions())
         .unwrap_or_default();
-    SESSIONS.with(|sessions| *sessions.borrow_mut() = seen);
+    let caller = crate::session::user_digest(&crate::session::authenticated(ctx));
+    SESSIONS.with(|sessions| *sessions.borrow_mut() = (seen, caller));
     // `$where` in a `$match` is refused with the aggregation-context code on
     // every mongod, script engine or not -- and it must be refused before the
     // leading-`$match` lift hands the filter to the query matcher.
@@ -497,6 +498,10 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         None => crate::util::requested_collation(doc)?.named().flatten(),
     };
     let _active = secantus_core::collation::activate(collation.as_ref());
+    if let Some(c) = &coll {
+        let filter = crate::explain::pipeline_canonical(c, &pipeline).filter;
+        crate::timeseries::check_hint(storage, &ctx.db_name, c, &filter, hint)?;
+    }
 
     // `$indexStats` through a view reports the indexes of the collection
     // beneath it (measured 8.2.11).
@@ -565,18 +570,23 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 let entries = crate::list_catalog::entries(storage, &ctx.db_name, Some(c))?;
                 (ns, entries, pipeline[1..].to_vec())
             } else {
-                if crate::notablescan::enabled(ctx) {
-                    let (filter, sort) = crate::explain::pipeline_query(c, &pipeline);
-                    crate::notablescan::check(
-                        ctx,
-                        &crate::notablescan::Read {
-                            coll: c,
-                            filter: &filter,
-                            sort: sort.as_ref(),
-                            hint,
-                            collation: collation.as_ref(),
+                if hint.is_some() || crate::notablescan::enabled(ctx) {
+                    let q = crate::explain::pipeline_canonical(c, &pipeline);
+                    let read = crate::notablescan::Read {
+                        coll: c,
+                        filter: &q.filter,
+                        sort: q.sort.as_ref(),
+                        hint,
+                        collation: collation.as_ref(),
+                        shown: crate::notablescan::Shown {
+                            projection: q.projection.as_ref(),
+                            skip: Some(q.skip),
+                            limit: Some(q.limit),
+                            ..crate::notablescan::Shown::aggregate(collation.as_ref())
                         },
-                    )?;
+                    };
+                    read.check_hint(storage, &ctx.db_name)?;
+                    crate::notablescan::check(ctx, &read)?;
                 }
                 // Lift a leading $match into the fetch filter (dropping it from
                 // the pipeline). A leading bounded $geoNear instead rides its geo
@@ -956,23 +966,43 @@ fn source_stage_problem(
     Ok(())
 }
 
+/// The sessions the server has seen (id, last use, whose), and the
+/// calling user's digest.
+type SeenSessions = (Vec<(Vec<u8>, bson::DateTime, Vec<u8>)>, Vec<u8>);
+
 thread_local! {
     /// The sessions the server has seen, for the pipeline this thread runs.
-    static SESSIONS: std::cell::RefCell<Vec<(Vec<u8>, bson::DateTime)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static SESSIONS: std::cell::RefCell<SeenSessions> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
 /// What the session stages list: the sessions commands have come in and
 /// that have not timed out, as mongod shows one
-/// (`{_id: {id, uid}, lastUse}`). (An operation's row once stood in for
-/// this.)
-fn known_sessions() -> Vec<Document> {
-    use sha2::Digest;
-    SESSIONS.with(|sessions| {
-        sessions
-            .borrow()
+/// (`{_id: {id, uid}, lastUse}`), each `uid` the SHA-256 of the `user@db`
+/// that used it. As on mongod 8.2.11 (an auth-enabled replica set,
+/// measured 2026-10-16), `{}` lists the caller's own sessions,
+/// `{allUsers: true}` everyone's and `{users: [{user, db}, ...]}` those
+/// users'. Without authentication every session is the empty user's.
+fn known_sessions(spec: Option<&Bson>) -> Vec<Document> {
+    let spec = spec.and_then(Bson::as_document);
+    let all = spec.is_some_and(|s| crate::util::truthy(s.get("allUsers").unwrap_or(&Bson::Null)));
+    let named: Option<Vec<Vec<u8>>> = spec.and_then(|s| s.get_array("users").ok()).map(|users| {
+        users
             .iter()
-            .map(|(id, used)| {
+            .filter_map(Bson::as_document)
+            .filter_map(|u| Some((u.get_str("db").ok()?, u.get_str("user").ok()?)))
+            .map(|(db, user)| crate::session::user_digest(&[(db.to_string(), user.to_string())]))
+            .collect()
+    });
+    SESSIONS.with(|sessions| {
+        let (seen, caller) = &*sessions.borrow();
+        seen.iter()
+            .filter(|(_, _, uid)| {
+                all || named
+                    .as_ref()
+                    .map_or(uid == caller, |users| users.contains(uid))
+            })
+            .map(|(id, used, uid)| {
                 doc! {
                     "_id": {
                         "id": bson::Binary {
@@ -981,7 +1011,7 @@ fn known_sessions() -> Vec<Document> {
                         },
                         "uid": bson::Binary {
                             subtype: bson::spec::BinarySubtype::Generic,
-                            bytes: sha2::Sha256::digest(b"").to_vec(),
+                            bytes: uid.clone(),
                         },
                     },
                     "lastUse": *used,
@@ -1612,7 +1642,7 @@ fn run_segmented(
             docs = if name == "$currentOp" {
                 apply_source_stage(name, db, coll, cmd_doc, client_metadata)
             } else {
-                known_sessions()
+                known_sessions(stage.as_document().and_then(|d| d.get(name)))
             };
         } else if is_storage_backed(name) {
             if !buffer.is_empty() {
@@ -2037,6 +2067,7 @@ fn apply_lookup(
                 sort: sort.as_ref(),
                 hint: None,
                 collation,
+                shown: Default::default(),
             },
         )?;
     }
@@ -2211,6 +2242,7 @@ fn apply_graph_lookup(
                     sort: None,
                     hint: None,
                     collation: None,
+                    shown: Default::default(),
                 },
             )?;
         }
@@ -2422,6 +2454,7 @@ fn apply_union_with(
                 sort: sort.as_ref(),
                 hint: None,
                 collation,
+                shown: Default::default(),
             },
         )?;
     }

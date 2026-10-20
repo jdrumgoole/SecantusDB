@@ -132,6 +132,7 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let storage = ctx.storage()?;
     // A time-series collection is a view over its buckets on mongod, and
     // answers as one.
+    crate::timeseries::check_hint(storage, &ctx.db_name, &coll, &filter, hint)?;
     let on_view = crate::views::is_view(storage, &ctx.db_name, &coll);
     let as_view = on_view
         || storage
@@ -141,7 +142,7 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // over the collection it is defined on. Reading the view's own (empty)
     // storage answered `[]` for every `distinct` on a view.
     let mut values: Vec<Bson> = if on_view {
-        crate::views::check_hint(storage, &ctx.db_name, &coll, hint)?;
+        crate::views::check_hint(storage, &ctx.db_name, &coll, hint, &filter)?;
         if crate::notablescan::enabled(ctx) {
             // The view's pipeline, then the query: what mongod plans.
             let tail = if filter.is_empty() {
@@ -160,6 +161,7 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     sort: sort.as_ref(),
                     hint: None,
                     collation: collation.as_ref(),
+                    shown: Default::default(),
                 },
             )?;
         }
@@ -174,16 +176,19 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             &key,
         )
     } else {
-        crate::notablescan::check(
-            ctx,
-            &crate::notablescan::Read {
-                coll: &coll,
-                filter: &filter,
-                sort: None,
-                hint,
-                collation: collation.as_ref(),
+        let read = crate::notablescan::Read {
+            coll: &coll,
+            filter: &filter,
+            sort: None,
+            hint,
+            collation: collation.as_ref(),
+            shown: crate::notablescan::Shown {
+                collation: doc.get_document("collation").ok().cloned(),
+                ..Default::default()
             },
-        )?;
+        };
+        read.check_hint(storage, &ctx.db_name)?;
+        crate::notablescan::check(ctx, &read)?;
         let ask = crate::explain::order::Ask {
             db: &ctx.db_name,
             coll: &coll,

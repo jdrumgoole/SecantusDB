@@ -297,6 +297,22 @@ pub(crate) fn absorb(shape: &mut Shape, pipeline: &[Document]) {
             _ => None,
         })
         .collect();
+    // A `$skip` or `$limit` behind a `$project` / `$unset` moves ahead of it:
+    // a projection does not change how many documents there are (mongod
+    // 8.2.11, 2026-10-20).
+    let mut hoisted = hoisted;
+    let mut i = 1;
+    while i < hoisted.len() {
+        let paging = hoisted[i].contains_key("$skip") || hoisted[i].contains_key("$limit");
+        let projects =
+            hoisted[i - 1].contains_key("$project") || hoisted[i - 1].contains_key("$unset");
+        if paging && projects {
+            hoisted.swap(i - 1, i);
+            i = i.saturating_sub(1).max(1);
+        } else {
+            i += 1;
+        }
+    }
     let pipeline = hoisted.as_slice();
     let mut filters: Vec<Document> = Vec::new();
     if !shape.filter.is_empty() {
@@ -327,10 +343,11 @@ pub(crate) fn absorb(shape: &mut Shape, pipeline: &[Document]) {
                 let Some(n) = as_i64(n) else { break };
                 limit = Some(limit.map_or(n, |l| l.min(n)));
             }
-            // The last stage's projection, as mongod prints it. One that
-            // computes or reaches into a document is left to the pipeline
-            // behind a sort (measured 8.2.11).
-            ("$project" | "$unset", _) if i + 1 == pipeline.len() => {
+            // A projection, as mongod prints it, ends what the query takes:
+            // the stages after it stay in the pipeline. One that computes or
+            // reaches into a document is left to the pipeline behind a sort
+            // (measured 8.2.11).
+            ("$project" | "$unset", _) => {
                 let listed = listed_stage(stage, "");
                 let Some(p) = listed
                     .first()
@@ -346,6 +363,8 @@ pub(crate) fn absorb(shape: &mut Shape, pipeline: &[Document]) {
                     break;
                 }
                 shape.projection = Some(p.clone());
+                taken = i + 1;
+                break;
             }
             _ => break,
         }

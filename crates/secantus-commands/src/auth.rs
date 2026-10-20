@@ -604,13 +604,21 @@ fn roles_must_exist(
 /// mongod's order and with mongod's refusals (8.2.11): an unknown mechanism,
 /// SCRAM-SHA-256 with a password the client digested, and an empty password
 /// (which mongod's SASLprep refuses with its UTF-8 preflight error).
-/// `requested` is the `mechanisms` field; absent means both SCRAMs.
+/// `requested` is the `mechanisms` field; absent means both SCRAMs. Each
+/// credential takes the iteration count `setParameter` last set for its
+/// mechanism (`scramIterationCount` / `scramSHA256IterationCount`), as
+/// mongod's do.
 fn scram_credentials(
+    ctx: &CommandContext,
     username: &str,
     pwd: &str,
     requested: Option<&[String]>,
     digest_password: bool,
 ) -> Result<Document, CommandError> {
+    let (sha1_iterations, sha256_iterations) = ctx
+        .server_params
+        .as_ref()
+        .map_or((None, None), |p| p.scram_iterations());
     let both = [SCRAM_SHA_1.to_string(), SCRAM_SHA_256.to_string()];
     let requested = requested.unwrap_or(&both);
     if let Some(unknown) = requested.iter().find(|m| Mechanism::from_name(m).is_none()) {
@@ -635,11 +643,14 @@ fn scram_credentials(
             continue;
         }
         let creds = match (mech, digest_password) {
-            (Mechanism::Sha1, true) => derive_credentials_sha1(username, pwd, None, None),
-            (Mechanism::Sha1, false) => derive_credentials_sha1_digested(pwd, None, None),
-            (Mechanism::Sha256, _) => {
-                derive_credentials(pwd, None, None).map_err(|e| bad_value(e.to_string()))?
+            (Mechanism::Sha1, true) => {
+                derive_credentials_sha1(username, pwd, sha1_iterations, None)
             }
+            (Mechanism::Sha1, false) => {
+                derive_credentials_sha1_digested(pwd, sha1_iterations, None)
+            }
+            (Mechanism::Sha256, _) => derive_credentials(pwd, sha256_iterations, None)
+                .map_err(|e| bad_value(e.to_string()))?,
         };
         out.insert(
             mech.name(),
@@ -727,7 +738,7 @@ pub fn create_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let digest = umc::given(doc, "digestPassword")
             .and_then(crate::util::truthy_number_or_bool)
             .unwrap_or(true);
-        scram_credentials(&username, pwd, mechanisms.as_deref(), digest)?
+        scram_credentials(ctx, &username, pwd, mechanisms.as_deref(), digest)?
     };
     if username.is_empty() {
         return Err(bad_value(
@@ -891,6 +902,7 @@ pub fn update_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .and_then(crate::util::truthy_number_or_bool)
             .unwrap_or(true);
         new_credentials = Some(scram_credentials(
+            ctx,
             &username,
             pwd,
             mechanisms.as_deref(),
@@ -1695,6 +1707,36 @@ mod tests {
             .get_array("users")
             .unwrap()
             .is_empty());
+    }
+
+    /// `scramIterationCount` / `scramSHA256IterationCount` govern the
+    /// credentials built after they are set (mongod 8.2.11, 2026-10-20: set
+    /// to 6000 and 7000, `createUser` stored those counts).
+    #[test]
+    fn credentials_take_the_iteration_counts_set_at_runtime() {
+        let mut ctx = CommandContext::new(1);
+        ctx.db_name = "admin".to_string();
+        let counts = |ctx: &CommandContext| {
+            let creds = scram_credentials(ctx, "u", "pw", None, true).unwrap();
+            (
+                creds
+                    .get_document(SCRAM_SHA_1)
+                    .unwrap()
+                    .get_i32("iterationCount"),
+                creds
+                    .get_document(SCRAM_SHA_256)
+                    .unwrap()
+                    .get_i32("iterationCount"),
+            )
+        };
+        assert_eq!(counts(&ctx), (Ok(10_000), Ok(15_000)));
+        ctx.server_params = Some(Arc::new(crate::params::ServerParams::new()));
+        crate::params::set_parameter(
+            &doc! {"setParameter": 1, "scramIterationCount": 6000, "scramSHA256IterationCount": 7000},
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(counts(&ctx), (Ok(6000), Ok(7000)));
     }
 
     #[test]

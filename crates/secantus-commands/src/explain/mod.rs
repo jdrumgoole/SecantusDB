@@ -16,6 +16,7 @@
 //! on one field is tried once here, where mongod tries a plan per predicate.
 
 mod bounds;
+pub(crate) mod debug_string;
 mod deps;
 pub(crate) mod distinct;
 mod exec;
@@ -32,6 +33,7 @@ mod trial;
 use crate::util::{as_i64, command_error, decode_docs};
 use crate::{CommandContext, CommandError, HandlerResult, SERVER_VERSION};
 use bson::{doc, Bson, Document};
+pub(crate) use debug_string::CanonicalQuery;
 use node::{num, IndexInfo, Node, Stats};
 use plan::{Hint, Query};
 use secantus_core::collation::Collation;
@@ -155,6 +157,32 @@ fn same_key(a: &Document, b: &Document) -> bool {
         })
 }
 
+/// A hint naming no index, refused in mongod's planner's words for the
+/// query `s` makes of `ns`: an aggregate's under its collation (`simple`
+/// when it names none), a find's with its paging and projection.
+fn hint_refusal(ns: &str, s: &Shape) -> CommandError {
+    let simple = doc! {"locale": "simple"};
+    let named = s.options.get_document("collation").ok();
+    let query = CanonicalQuery {
+        ns: ns.to_string(),
+        filter: &s.filter,
+        sort: s.sort.as_ref(),
+        projection: s.projection.as_ref(),
+        skip: Some(s.skip),
+        limit: Some(s.limit),
+        collation: if s.pipeline {
+            named.or(Some(&simple))
+        } else {
+            named
+        },
+    };
+    err(
+        2,
+        "BadValue",
+        query.planner_error("hint provided does not correspond to an existing index"),
+    )
+}
+
 fn resolve_hint(hint: Option<&Bson>, catalog: &[Rc<IndexInfo>]) -> Result<Hint, CommandError> {
     match hint {
         None | Some(Bson::Null) => Ok(Hint::None),
@@ -275,15 +303,43 @@ pub(crate) fn plans_table_scan(
 /// The filter and sort of the query an aggregate's leading stages make, as
 /// `explain` reports it.
 pub(crate) fn pipeline_query(coll: &str, pipeline: &[Bson]) -> (Document, Option<Document>) {
+    let q = pipeline_canonical(coll, pipeline);
+    (q.filter, q.sort)
+}
+
+/// The query an aggregate's leading stages make, as mongod's planner holds
+/// it: the filter and sort it took in, the projection it adds for the
+/// stages it did not, and the paging.
+pub(crate) struct PipelineQuery {
+    pub filter: Document,
+    pub sort: Option<Document>,
+    pub projection: Option<Document>,
+    pub skip: i64,
+    pub limit: i64,
+}
+
+pub(crate) fn pipeline_canonical(coll: &str, pipeline: &[Bson]) -> PipelineQuery {
     let stages: Vec<Document> = pipeline
         .iter()
         .map_while(|s| s.as_document().cloned())
         .collect();
     let Ok(mut s) = shape::find(coll, &doc! { "find": coll }) else {
-        return (Document::new(), None);
+        return PipelineQuery {
+            filter: Document::new(),
+            sort: None,
+            projection: None,
+            skip: 0,
+            limit: 0,
+        };
     };
     shape::absorb(&mut s, &stages);
-    (s.filter, s.sort)
+    PipelineQuery {
+        filter: s.filter,
+        sort: s.sort,
+        projection: s.projection,
+        skip: s.skip,
+        limit: s.limit,
+    }
 }
 
 /// Everything read from storage to plan one collection.
@@ -444,7 +500,13 @@ fn plan_for(
     }
     let storage = ctx.storage()?;
     let implies = |partial: &Document| storage.query_implies_partial(&s.filter, partial);
-    let hint = resolve_hint(s.hint.as_ref(), &t.catalog)?;
+    let hint = resolve_hint(s.hint.as_ref(), &t.catalog).map_err(|e| {
+        if e.code == 2 {
+            hint_refusal(&ns, s)
+        } else {
+            e
+        }
+    })?;
     if let Some(which) = s.min_max {
         let Hint::Index(name) = &hint else {
             return Err(err(
@@ -980,7 +1042,15 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
         let why = resolve_hint(s.hint.as_ref(), &t.catalog)
             .ok()
             .and_then(|hint| table_scan(&plan, &hint));
-        crate::notablescan::refuse_planned(ctx.storage()?, &db, &s.coll, &s.filter, why)?;
+        let read = crate::notablescan::Read {
+            coll: &s.coll,
+            filter: &s.filter,
+            sort: s.sort.as_ref(),
+            hint: s.hint.as_ref(),
+            collation: collation.as_ref(),
+            shown: Default::default(),
+        };
+        crate::notablescan::refuse_planned(ctx.storage()?, &db, &read, why)?;
     }
     let tried = tried_plans(s, &ranked);
     let mut planner = query_planner(&ns, s, &canonical, collation.as_ref(), &plan);
@@ -1291,6 +1361,21 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 "IllegalOperation",
                 "Explain cannot explain itself.",
             ))
+        }
+        // mongod explains a map/reduce by running its JavaScript; with no
+        // engine it refuses as it refuses the command (`--noscripting`
+        // 8.2.11, 2026-10-20).
+        _ if lowered == "mapreduce" => {
+            let coll = collection(&inner, &name, &db)?;
+            return Err(err(
+                31264,
+                "Location31264",
+                format!(
+                    "Executor error during MapReduce command on namespace: {db}.{coll} :: \
+                     caused by :: Cannot run server-side javascript without the javascript \
+                     engine enabled"
+                ),
+            ));
         }
         _ if known_command(&name) => {
             return Err(err(

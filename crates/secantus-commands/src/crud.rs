@@ -1126,9 +1126,13 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
         // An unresolvable `hint` fails THIS statement, not the batch (see the
         // note above the loop).
-        if let Err(e) =
-            crate::util::validate_write_hint(storage, &ctx.db_name, &coll, spec.get("hint"))
-        {
+        if let Err(e) = crate::util::validate_hint(
+            storage,
+            &ctx.db_name,
+            &coll,
+            spec.get("hint"),
+            &crate::explain::CanonicalQuery::plain(&ctx.db_name, &coll, &doc_field(spec, "q")),
+        ) {
             write_errors.push(Bson::Document(doc! {
                 "index": index as i32,
                 "code": e.code,
@@ -1169,6 +1173,7 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 sort: None,
                 hint: argtypes::given_hint(spec),
                 collation: collation.as_ref(),
+                shown: Default::default(),
             },
         ) {
             write_errors.push(Bson::Document(doc! {
@@ -1391,6 +1396,13 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let collation = crate::util::effective_collation(storage, &ctx.db_name, &coll, doc)?;
     let _active = secantus_core::collation::activate(collation.as_ref());
 
+    crate::timeseries::check_hint(
+        storage,
+        &ctx.db_name,
+        &coll,
+        &filter,
+        argtypes::given_hint(doc),
+    )?;
     // View support: a collection created with `viewOn` is a read-only view; its
     // count runs the view's pipeline (plus the count's query as a trailing
     // `$match`) through the aggregation engine. estimatedDocumentCount (the
@@ -1436,16 +1448,20 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .and_then(|d| d.get("n").and_then(as_i64))
             .unwrap_or(0)
     } else if let Some(hint) = argtypes::given_hint(doc) {
-        crate::notablescan::check(
-            ctx,
-            &crate::notablescan::Read {
-                coll: &coll,
-                filter: &filter,
-                sort: None,
-                hint: Some(hint),
-                collation: collation.as_ref(),
+        // `count` prints its collation as given, never its paging.
+        let read = crate::notablescan::Read {
+            coll: &coll,
+            filter: &filter,
+            sort: None,
+            hint: Some(hint),
+            collation: collation.as_ref(),
+            shown: crate::notablescan::Shown {
+                collation: doc.get_document("collation").ok().cloned(),
+                ..Default::default()
             },
-        )?;
+        };
+        read.check_hint(storage, &ctx.db_name)?;
+        crate::notablescan::check(ctx, &read)?;
         // A `hint` forces a specific index; for an empty filter this still walks
         // that index, so hinting a sparse index counts only the docs present in
         // it (php-lib Count `testHintOption`). Count via the hinted find, which
@@ -1493,6 +1509,10 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 sort: None,
                 hint: None,
                 collation: collation.as_ref(),
+                shown: crate::notablescan::Shown {
+                    collation: doc.get_document("collation").ok().cloned(),
+                    ..Default::default()
+                },
             },
         )?;
         storage
@@ -1836,7 +1856,15 @@ pub(crate) fn update_in(
         }
         // An unresolvable `hint` fails THIS statement, not the batch (see the
         // note above the loop).
-        if let Err(e) = crate::util::validate_write_hint(storage, db_name, &coll, spec.get("hint"))
+        // An update with a sort reads one document (mongod 8.2.11 prints
+        // `limit=1` and the sort).
+        let q_spec = doc_field(spec, "q");
+        let sort_given = spec.get_document("sort").ok().filter(|s| !s.is_empty());
+        let mut query = crate::explain::CanonicalQuery::plain(db_name, &coll, &q_spec);
+        query.sort = sort_given;
+        query.limit = sort_given.map(|_| 1);
+        if let Err(e) =
+            crate::util::validate_hint(storage, db_name, &coll, spec.get("hint"), &query)
         {
             write_errors.push(Bson::Document(doc! {
                 "index": index as i32,
@@ -1940,6 +1968,7 @@ pub(crate) fn update_in(
                     sort: sort_spec.as_ref(),
                     hint: argtypes::given_hint(spec),
                     collation: collation.as_ref(),
+                    shown: Default::default(),
                 },
             ) {
                 write_errors.push(Bson::Document(doc! {

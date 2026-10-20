@@ -1,18 +1,15 @@
-"""The Rust server's bad-hint error must not leak a RUST type name.
+"""The Rust server's bad-hint error is mongod's planner diagnostic.
 
-mongod's own message here is a multi-line planner diagnostic, and this project
-deliberately does not reproduce it — the CODE matches and the text names the
-hint instead (`tasks/backlog.md`; the wording moved between 6.0.16 and 8.2.11,
-so the gate asserts the rejection rather than the text).
+mongod 8.2.11 refuses a hint that names no index from its query planner, and
+prints the query it was planning: `error processing query: ns=<ns>Tree:
+<query tree>\nSort: ...\nProj: ...\n planner returned error :: caused by ::
+hint provided does not correspond to an existing index`. The Rust server
+reproduces it (`explain::debug_string`, 2026-10-20); the cases here are the
+replies mongod gave for these commands, measured that day.
 
-What was not deliberate: three of the five commands formatted the hint with
-Rust's `Debug` on a `Bson`, so a client got
-
-    hint String("x") does not correspond to an existing index
-
-`String(…)` is a Rust type name and means nothing to a MongoDB client. The
-Python server says `'x'` for the same input, and `find` / `count` already said
-`"x"` — only the write commands leaked it.
+This file began as a guard against a RUST type name leaking into the message
+(`hint String("x") does not correspond...`, Rust's `Debug` on a `Bson`). The
+message no longer quotes the hint at all, and the guard stays.
 
 Gated on the `_secantus_server` extension, like `test_rust_server_smoke.py`.
 """
@@ -72,15 +69,22 @@ def _message(db, cmd: dict) -> str:
     return str(errors[0].get("errmsg", ""))
 
 
+# What mongod 8.2.11 answered for each command over an empty filter.
+MONGOD_SAYS = (
+    "error processing query: ns=hinterr.cTree: $and\nSort: {}\nProj: {}\n planner "
+    "returned error :: caused by :: hint provided does not correspond to an existing index"
+)
+
+
 @pytest.mark.parametrize("name", sorted(COMMANDS), ids=sorted(COMMANDS))
-def test_the_hint_error_names_the_value_not_the_rust_type(db, name: str) -> None:
+def test_the_hint_error_is_mongods_planner_diagnostic(db, name: str) -> None:
     message = _message(db, COMMANDS[name])
-    assert message == 'hint "x" does not correspond to an existing index'
+    assert message == MONGOD_SAYS
     assert "String(" not in message, "Rust's Debug format leaked to the client"
 
 
-def test_a_key_spec_hint_is_rendered_as_a_document(db) -> None:
+def test_a_key_spec_hint_is_refused_in_the_same_words(db) -> None:
     message = _message(db, {"find": "c", "hint": {"nope": 1}})
-    assert "does not correspond to an existing index" in message
+    assert message == MONGOD_SAYS
     for leak in ("Int32(", "Document(", "String("):
         assert leak not in message, f"Rust's Debug format leaked: {leak}"

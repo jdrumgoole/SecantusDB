@@ -273,6 +273,22 @@ fn range_bounds(op: &str, v: &Bson, ctx: Ctx) -> Option<(Vec<Interval>, Tight)> 
             Interval::new(Bson::MinKey, true, v.clone(), incl)
         }),
         Bson::Double(d) if d.is_nan() => one(Interval::new(v.clone(), incl, v.clone(), incl)),
+        // A comparison to an array (mongod 8.2.11, 2026-10-20, multikey or
+        // not): from the first element up for `$gt` / `$gte`, from MinKey to
+        // the array itself for `$lt` / `$lte`, both ends closed and the
+        // predicate rechecked; an empty array has no first element and
+        // bounds nothing from below.
+        Bson::Array(items) => {
+            let interval = if lower {
+                match items.first() {
+                    Some(first) => Interval::new(first.clone(), true, Bson::MaxKey, true),
+                    None => Interval::all(),
+                }
+            } else {
+                Interval::new(Bson::MinKey, true, v.clone(), true)
+            };
+            Some((vec![interval], Tight::FetchFilter))
+        }
         _ => {
             let (lo, lo_incl, hi, hi_incl) = bracket(v)?;
             one(if lower {
@@ -485,13 +501,13 @@ pub(crate) fn leaf_bounds(pred: &Document, ctx: Ctx) -> Option<(Vec<Interval>, T
         return internal_expr_bounds(op, v, ctx);
     }
     match op.as_str() {
-        "$eq" => eq_bounds(v, ctx),
-        "$gt" | "$gte" | "$lt" | "$lte" => {
-            if matches!(v, Bson::Array(_)) {
-                return None;
-            }
-            range_bounds(op, v, ctx)
+        // `$eq` of a regex is an equality to the regex value: one point
+        // (an `$in`'s regex is a pattern; mongod 8.2.11, 2026-10-20).
+        "$eq" if matches!(v, Bson::RegularExpression(_)) => {
+            Some((vec![Interval::point(v.clone())], Tight::Exact))
         }
+        "$eq" => eq_bounds(v, ctx),
+        "$gt" | "$gte" | "$lt" | "$lte" => range_bounds(op, v, ctx),
         "$in" => {
             let items = v.as_array()?;
             let mut list = Vec::new();

@@ -316,7 +316,13 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
             return Ok(CommandError::new(72, "InvalidOptions", problem).into_reply());
         }
     }
-    crate::util::validate_write_hint(storage, &ctx.db_name, &coll, doc.get("hint"))?;
+    // A sort reads one document, which mongod prints as `limit=1` beside
+    // the sort (8.2.11, 2026-10-20), for an update and a remove alike.
+    let given_sort = doc.get_document("sort").ok().filter(|s| !s.is_empty());
+    let mut shown = crate::explain::CanonicalQuery::plain(&ctx.db_name, &coll, &query);
+    shown.sort = given_sort;
+    shown.limit = given_sort.map(|_| 1);
+    crate::util::validate_hint(storage, &ctx.db_name, &coll, doc.get("hint"), &shown)?;
     // Command `let` (visible to `$expr` in `query`) + `collation` apply to the
     // match. The subsequent update/delete is keyed by the matched doc's `_id`.
     let let_vars = crate::util::command_let_vars(doc.get("let"), ctx);
@@ -392,6 +398,15 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
             sort,
             hint: natural_hint.as_ref().or(argtypes::given_hint(doc)),
             collation: collation.as_ref(),
+            // A sort reads one document: mongod prints `limit=1`.
+            shown: crate::notablescan::Shown {
+                limit: doc
+                    .get_document("sort")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(|_| 1),
+                ..Default::default()
+            },
         },
     )?;
     let repick_started = std::time::Instant::now();

@@ -180,6 +180,10 @@ fn wrap(op: &str, value: Bson) -> Bson {
 }
 
 /// Sort key for one `$and` child: (match-type ordinal, path).
+pub fn clause_rank(clause: &Document) -> (i32, String, u8) {
+    rank(clause)
+}
+
 fn rank(clause: &Document) -> (i32, String, u8) {
     let Some((key, value)) = clause.iter().next() else {
         return (match_type_rank(""), String::new(), 0);
@@ -216,12 +220,28 @@ pub fn residual_key(clause: &Document) -> (String, i32) {
     (if negated { String::new() } else { path }, rank)
 }
 
+/// `path` equal to `value`, where a regex given as a value (bare, in an
+/// `$in` of one, or in an `$all`) is a pattern match, `{$regex: ...}`. A
+/// regex given to `$eq` itself stays an equality to that regex, which is how
+/// mongod 8.2.11 parses each (measured 2026-10-20).
+fn equal_to(path: &str, value: &Bson) -> Document {
+    if let Bson::RegularExpression(re) = value {
+        let mut clause = Document::new();
+        clause.insert("$regex", re.pattern.clone());
+        if !re.options.is_empty() {
+            clause.insert("$options", re.options.clone());
+        }
+        return one(path, Bson::Document(clause));
+    }
+    one(path, wrap("$eq", value.clone()))
+}
+
 /// The clause list one `field: <value>` entry expands to.
 fn field_clauses(path: &str, value: &Bson) -> Vec<Document> {
     if !is_operator_doc(value) {
         // A bare value -- including a whole sub-document, which is an equality
         // against that document and NOT a nested query.
-        return vec![one(path, wrap("$eq", value.clone()))];
+        return vec![equal_to(path, value)];
     }
     let Bson::Document(spec) = value else {
         return vec![one(path, wrap("$eq", value.clone()))];
@@ -235,9 +255,7 @@ fn field_clauses(path: &str, value: &Bson) -> Vec<Document> {
                 Bson::Array(items) if items.is_empty() => {
                     out.push(one("$alwaysFalse", Bson::Int32(1)))
                 }
-                Bson::Array(items) if items.len() == 1 => {
-                    out.push(one(path, wrap("$eq", items[0].clone())))
-                }
+                Bson::Array(items) if items.len() == 1 => out.push(equal_to(path, &items[0])),
                 _ => out.push(one(path, wrap("$in", arg.clone()))),
             },
             "$all" => {
@@ -259,7 +277,7 @@ fn field_clauses(path: &str, value: &Bson) -> Vec<Document> {
                                 wrap("$elemMatch", Bson::Document(canonical_match(&inner))),
                             ));
                         }
-                        other => out.push(one(path, wrap("$eq", other.clone()))),
+                        other => out.push(equal_to(path, other)),
                     }
                 }
             }

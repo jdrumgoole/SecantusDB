@@ -26,12 +26,30 @@ pub(crate) fn check_hint(
     db: &str,
     view: &str,
     hint: Option<&Bson>,
+    filter: &bson::Document,
 ) -> Result<(), CommandError> {
     if hint.is_none() {
         return Ok(());
     }
-    let (base, _) = crate::aggregate::resolve_view(storage, db, view, Vec::new())?;
-    crate::util::validate_write_hint(storage, db, &base, hint)
+    // The view's pipeline, then the command's query: what mongod plans.
+    let tail = if filter.is_empty() {
+        Vec::new()
+    } else {
+        vec![Bson::Document(bson::doc! { "$match": filter.clone() })]
+    };
+    let (base, pipeline) = crate::aggregate::resolve_view(storage, db, view, tail)?;
+    let q = crate::explain::pipeline_canonical(&base, &pipeline);
+    let simple = bson::doc! {"locale": "simple"};
+    let query = crate::explain::CanonicalQuery {
+        ns: format!("{db}.{base}"),
+        filter: &q.filter,
+        sort: q.sort.as_ref(),
+        projection: q.projection.as_ref(),
+        skip: Some(q.skip),
+        limit: Some(q.limit),
+        collation: Some(&simple),
+    };
+    crate::util::validate_hint(storage, db, &base, hint, &query)
 }
 
 fn not_a_collection(ns: &str) -> String {
