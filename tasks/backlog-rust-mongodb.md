@@ -590,17 +590,17 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
         options are not applied.
       Backlog-ID: RM-216
       Verify: none -- the missing fields are mongod's internal accounting; the registry's own tests are backlog_fixed
-- [ ] **Seven commands mongod runs are 59 CommandNotFound here.**
+- [ ] **Six commands mongod runs are 59 CommandNotFound here.**
       mongod 8.2.11 (one-member replica set) answers each with success or
       an error of its own:
       - diagnostics: `getDiagnosticData`, `dbCheck`, `validateDBMetadata`;
       - settings: `setQuerySettings` / `removeQuerySettings`, `autoCompact`
-        (needs background compaction, which RM-192 lacks);
-      - `rotateCertificates` (TLS has landed; it would re-read the files).
+        (needs background compaction, which RM-192 lacks).
 
       `filemd5` with `partialOk` is refused by name (115): its `md5state` is
-      mongod's own MD5 implementation's state. Ten of the original
-      seventeen landed 2026-10-20 (`applyOps`, `invalidateUserCache`, `replSetGetRBID`,
+      mongod's own MD5 implementation's state. Eleven of the original
+      seventeen landed 2026-10-20 (`applyOps`, `rotateCertificates`,
+      `invalidateUserCache`, `replSetGetRBID`,
       `replSetFreeze`, `replSetMaintenance`, `dropConnections`,
       `releaseMemory`, `filemd5`, `setUserWriteBlockMode`,
       `setClusterParameter`, whose

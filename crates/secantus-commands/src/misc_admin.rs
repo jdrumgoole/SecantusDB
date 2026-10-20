@@ -335,3 +335,33 @@ pub(crate) fn write_block_bypass(ctx: &CommandContext) -> Option<Box<dyn std::an
     .then(|| storage.bypass_user_write_block())
     .flatten()
 }
+
+/// `rotateCertificates`: re-read the TLS certificate, key and CA files and
+/// use them for new connections. With TLS off there is nothing to rotate and
+/// mongod 8.2.11 answers `ok`; a file that does not load is 140
+/// InvalidSSLConfiguration and the certificate in use stays.
+pub fn rotate_certificates(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    for (k, v) in doc.iter().skip(1) {
+        match k.as_str() {
+            "message" => {
+                if !matches!(v, Bson::String(_)) {
+                    return Err(wrong_type("rotateCertificates.message", v, "string"));
+                }
+            }
+            k if crate::params::is_generic_arg(k) => {}
+            k => {
+                return Err(CommandError::new(
+                    40415,
+                    "IDLUnknownField",
+                    format!("BSON field 'rotateCertificates.{k}' is an unknown field."),
+                ))
+            }
+        }
+    }
+    if let Some(rotator) = &ctx.cert_rotator {
+        rotator
+            .rotate()
+            .map_err(|why| CommandError::new(140, "InvalidSSLConfiguration", why))?;
+    }
+    Ok(doc! {"ok": 1.0})
+}

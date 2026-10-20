@@ -149,6 +149,14 @@ pub trait ConnectionKiller: Send + Sync {
     fn kill(&self, conn_id: i64) -> bool;
 }
 
+/// Lets `rotateCertificates` reload the server's TLS certificate and key
+/// from their files. Implemented by the server when TLS is on.
+pub trait CertificateRotator: Send + Sync {
+    /// Re-read the files and use them for new connections; on failure keep
+    /// the certificate in use and say why, as mongod's 140 message does.
+    fn rotate(&self) -> Result<(), String>;
+}
+
 /// The per-request state a handler reads. Handshake- and CRUD-scoped for this
 /// slice; it grows (auth, sessions, cursors, metrics, …) as command families
 /// land. The fields mirror the subset of `commands.py::CommandContext` the
@@ -207,6 +215,8 @@ pub struct CommandContext {
     /// by its `conn_id`. `None` until the server wires one in (and in unit-test
     /// contexts).
     pub conn_killer: Option<Arc<dyn ConnectionKiller>>,
+    /// The server's TLS certificate reloader; `None` when TLS is off.
+    pub cert_rotator: Option<Arc<dyn CertificateRotator>>,
     /// The server's running operations (`currentOp`, `killOp`). `None` in
     /// unit-test contexts.
     pub ops: Option<Arc<ops::OpRegistry>>,
@@ -302,6 +312,7 @@ impl CommandContext {
             failpoints: None,
             close_connection: false,
             conn_killer: None,
+            cert_rotator: None,
             ops: None,
             logs: None,
             conn_stats: None,
@@ -359,6 +370,12 @@ impl CommandContext {
     /// uses it to close a connection by its `conn_id`.
     pub fn with_conn_killer(mut self, conn_killer: Arc<dyn ConnectionKiller>) -> Self {
         self.conn_killer = Some(conn_killer);
+        self
+    }
+
+    /// Attach the server's TLS certificate reloader (builder-style).
+    pub fn with_cert_rotator(mut self, rotator: Option<Arc<dyn CertificateRotator>>) -> Self {
+        self.cert_rotator = rotator;
         self
     }
 
@@ -693,6 +710,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "dropConnections" => misc_admin::drop_connections,
         "setUserWriteBlockMode" => misc_admin::set_user_write_block_mode,
         "applyOps" => apply_ops::apply_ops,
+        "rotateCertificates" => misc_admin::rotate_certificates,
         "releaseMemory" => misc_admin::release_memory,
         "filemd5" => misc_admin::filemd5,
         "planCacheClear" => replset_admin::plan_cache_clear,

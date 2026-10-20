@@ -357,6 +357,7 @@ pub(crate) fn check(
         "setClusterParameter" => c.cluster("setClusterParameter"),
         "setUserWriteBlockMode" => c.cluster("setUserWriteBlockMode"),
         "applyOps" => c.cluster("applyOps"),
+        "rotateCertificates" => c.cluster("rotateCertificates"),
         "invalidateUserCache" => c.cluster("invalidateUserCache"),
         "replSetGetRBID" => c.cluster("internal"),
         "replSetFreeze" | "replSetMaintenance" => c.cluster("replSetStateChange"),
