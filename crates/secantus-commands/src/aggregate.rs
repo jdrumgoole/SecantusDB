@@ -880,8 +880,14 @@ fn source_stage_problem(
                 ))
             }
             Some(
-                "$currentOp" | "$listLocalSessions" | "$documents" | "$changeStream"
-                | "$listCatalog" | "$queryStats" | "$querySettings",
+                "$currentOp"
+                | "$listLocalSessions"
+                | "$documents"
+                | "$changeStream"
+                | "$listCatalog"
+                | "$queryStats"
+                | "$querySettings"
+                | "$listSampledQueries",
             ) => {}
             Some(other) => {
                 return Err(namespace(format!(
@@ -894,6 +900,10 @@ fn source_stage_problem(
         let Some((name, spec)) = stage.as_document().and_then(|d| d.iter().next()) else {
             continue;
         };
+        if name == "$listSampledQueries" {
+            list_sampled_queries_problem(spec, db, coll, i)?;
+            continue;
+        }
         let known: &[&str] = match name.as_str() {
             "$currentOp" => &[
                 "allUsers",
@@ -1035,7 +1045,68 @@ fn known_sessions(spec: Option<&Bson>) -> Vec<Document> {
 /// `$listSessions`). They need the command/db/coll context, so they're handled
 /// at this layer rather than in the storage-free core engine.
 fn is_source_stage(name: &str) -> bool {
-    matches!(name, "$currentOp" | "$listLocalSessions" | "$listSessions")
+    matches!(
+        name,
+        "$currentOp" | "$listLocalSessions" | "$listSessions" | "$listSampledQueries"
+    )
+}
+
+/// `$listSampledQueries`'s argument and placement, checked as mongod 8.2.11
+/// checks them (measured 2026-10-20): `admin` with `{aggregate: 1}`, a
+/// document, a string `namespace` naming a valid namespace; any other field
+/// is ignored.
+fn list_sampled_queries_problem(
+    spec: &Bson,
+    db: &str,
+    coll: Option<&str>,
+    at: usize,
+) -> Result<(), CommandError> {
+    let invalid = |m: &str| CommandError::new(73, "InvalidNamespace", m);
+    let Bson::Document(options) = spec else {
+        return Err(CommandError::new(
+            6876000,
+            "Location6876000",
+            format!(
+                "$listSampledQueries must take a nested object but found: $listSampledQueries: {}",
+                crate::argtypes::render_stage_value(spec)
+            ),
+        ));
+    };
+    if db != "admin" || coll.is_some() {
+        return Err(invalid(
+            "$listSampledQueries must be run against the 'admin' database with {aggregate: 1}",
+        ));
+    }
+    match options.get("namespace") {
+        None => {}
+        Some(Bson::String(ns)) => {
+            let valid = ns
+                .split_once('.')
+                .is_some_and(|(d, c)| !d.is_empty() && !c.is_empty());
+            if !valid {
+                return Err(invalid("The namespace is invalid"));
+            }
+        }
+        Some(other) => {
+            return Err(CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "BSON field '$listSampledQueries.namespace' is the wrong type '{}', expected \
+                     type 'string'",
+                    secantus_core::query::bson_type_name(other)
+                ),
+            ))
+        }
+    }
+    if at > 0 {
+        return Err(CommandError::new(
+            40602,
+            "Location40602",
+            "$listSampledQueries is only valid as the first stage in a pipeline",
+        ));
+    }
+    Ok(())
 }
 
 /// `$currentOp` / `$listLocalSessions` / `$listSessions` — emit one synthetic
@@ -1148,6 +1219,7 @@ pub(crate) fn recognized_stage(name: &str) -> bool {
             | "$limit"
             | "$listCatalog"
             | "$listLocalSessions"
+            | "$listSampledQueries"
             | "$listSessions"
             | "$lookup"
             | "$match"
@@ -1651,7 +1723,13 @@ fn run_segmented(
                 let _ = core_run(docs, &buffer, vars, collation, Some(&ns))?;
                 buffer.clear();
             }
-            docs = if name == "$currentOp" {
+            docs = if name == "$listSampledQueries" {
+                // The queries `configureQueryAnalyzer` sampled. This server
+                // has no query analyzer (the command is 59 here), so it has
+                // sampled none: the list is empty, as mongod's is on a set
+                // that never configured one (RM-215).
+                Vec::new()
+            } else if name == "$currentOp" {
                 // The registry's operations, and its idle cursors when asked
                 // (RM-216); the synthetic row only off-server.
                 let idle = stage

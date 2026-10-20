@@ -44,6 +44,7 @@ const CHANGE_STREAM_PIPELINE_STAGES: &[&str] = &[
 /// Stages mongod knows that are outside API version 1.
 const KNOWN_STAGES: &[&str] = &[
     "$currentOp",
+    "$listSampledQueries",
     "$indexStats",
     "$listLocalSessions",
     "$listSessions",

@@ -565,12 +565,14 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
   every subtype-2 value. mongod 8.2.11 writes the bytes alone, which is not
   a valid subtype-2 value: pymongo refuses to decode the reply. Out of
   scope; nothing reads the old subtype as mongod emits it.
-- [ ] **`$planCacheStats`, `$queryStats` and `$listSampledQueries` are
-      unknown stages** (40324). mongod 8.2.11 runs each on a one-member
-      replica set (an empty result on a fresh one). `$planCacheStats` needs
-      a plan cache, which this server does not keep (§7.075); `$queryStats`
-      needs query-shape statistics, which RM-170 (`includeQueryStatsMetrics`)
-      also lacks.
+- [ ] **`$planCacheStats` and `$queryStats` are unknown stages** (40324).
+      mongod 8.2.11 runs each on a one-member replica set (an empty result
+      on a fresh one, filling as queries run, so an empty answer here would
+      be a stand-in). `$planCacheStats` needs a plan cache, which this server
+      does not keep (§7.075); `$queryStats` needs query-shape statistics,
+      which RM-170 (`includeQueryStatsMetrics`) also lacks.
+      (`$listSampledQueries` landed 2026-10-20: it lists none, truthfully,
+      as no query analyzer exists here.)
       Backlog-ID: RM-215
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_diagnostic_stages
 - [ ] **The operation rows `currentOp` lists lack mongod's detail.** Since
