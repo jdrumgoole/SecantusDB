@@ -565,16 +565,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
   every subtype-2 value. mongod 8.2.11 writes the bytes alone, which is not
   a valid subtype-2 value: pymongo refuses to decode the reply. Out of
   scope; nothing reads the old subtype as mongod emits it.
-- [ ] **Window functions missing or imprecise.**
-      - `$covariancePop` and `$covarianceSamp` always answer 2.
-      - `$topN` and `$bottomN` as window functions are 168 (`$top` works).
-      - `$linearFill` refuses (2) when `sortBy` is a date.
-      - `$derivative` and `$integral` with a `unit` drift from about the
-        11th significant digit (9.882352941193389 here, 9.882352941176471
-        on mongod). That looks like the unit conversion done in a different
-        order; transcribe mongod's.
-      Backlog-ID: RM-214
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_window_functions
 - [ ] **`$planCacheStats`, `$queryStats` and `$listSampledQueries` are
       unknown stages** (40324). mongod 8.2.11 runs each on a one-member
       replica set (an empty result on a fresh one). `$planCacheStats` needs

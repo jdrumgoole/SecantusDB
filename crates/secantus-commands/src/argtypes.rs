@@ -2551,8 +2551,11 @@ pub(crate) fn expression_shape_problem_in(spec: &Bson, stage: &str) -> Option<(i
                     }
                 }
                 // `$topN` / `$bottomN` are ACCUMULATOR-only: reached as an
-                // expression, mongod does not recognise the name at all.
-                if ACCUMULATOR_ONLY.contains(&key.as_str()) && stage != "$group" {
+                // expression, mongod does not recognise the name at all. A
+                // `$setWindowFields` output runs them as window functions.
+                if ACCUMULATOR_ONLY.contains(&key.as_str())
+                    && !matches!(stage, "$group" | "$setWindowFields")
+                {
                     return Some((168, format!("Unrecognized expression '{key}'")));
                 }
                 if let Some((_, code)) = OBJECT_SPEC_EXPRESSIONS.iter().find(|(op, _)| *op == key) {

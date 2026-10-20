@@ -905,10 +905,11 @@ CURATED = [
     ({"$setField": {"field": "f", "input": "$o", "value": "$$REMOVE"}}, {"o": {"f": 1}}),  # defer
     ({"$zip": {"inputs": [[1, 2], [3, 4]]}}, {}),
     ({"$zip": {"inputs": [[1, 2, 3], [4, 5]]}}, {}),  # min length
-    ({"$zip": {"inputs": "$xs"}}, {"xs": [["a", "b"], ["c", "d"]]}),
+    # `inputs` is a LIST of expressions (mongod 8.2.11: a bare path is 34461).
+    ({"$zip": {"inputs": ["$a", "$b"]}}, {"a": ["a", "b"], "b": ["c", "d"]}),
     ({"$zip": {"inputs": [[1, 2, 3], [4]], "useLongestLength": True}}, {}),
     ({"$zip": {"inputs": [[1, 2, 3], [4]], "useLongestLength": True, "defaults": [0, 0]}}, {}),
-    ({"$zip": {"inputs": "$x"}}, {}),  # missing -> null inputs -> null
+    ({"$zip": {"inputs": ["$x", [1]]}}, {}),  # a missing input -> null
     # New date-component extractors ($dayOfYear/$week/$isoWeek/$isoDayOfWeek/
     # $isoWeekYear/$millisecond) — bare-date and {date, timezone} forms.
     ({"$dayOfYear": "$d"}, {"d": _DT}),

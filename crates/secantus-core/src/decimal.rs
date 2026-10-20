@@ -2539,7 +2539,17 @@ pub fn div(a: &Dec, b: &Dec) -> Option<Dec> {
         });
     }
     let q = hp_div(a, b, 80);
-    let rounded = hp_round_34(&q, 80)?;
+    // `hp_round_34` refuses a quotient that reads as a tie, because a SERIES
+    // cannot say which side of it the true value lies. Long division can:
+    // its digits are exact, truncated rather than approximated, so a quotient
+    // reading `…5000…` is a true tie when the division is exact and lies past
+    // the tie otherwise, and one reading `…4999…` lies below it. Refusing
+    // made `-222.2918400000001378633333333333333 / 2` answer "can't $divide
+    // by zero" (found 2026-10-20 through `$covarianceSamp`).
+    let rounded = match hp_round_34(&q, 80) {
+        Some(r) => r,
+        None => round_exact_quotient(&q, c1, *e1, c2, *e2)?,
+    };
     let Fin {
         coeff: qc, exp: qe, ..
     } = &rounded
@@ -2569,6 +2579,33 @@ pub fn div(a: &Dec, b: &Dec) -> Option<Dec> {
         }
     }
     Some(Fin { sign, coeff, exp })
+}
+
+/// Round an exact, truncated long-division quotient to 34 digits. A tail
+/// that reads as a tie is one only when the truncated quotient times the
+/// divisor gives back the dividend; otherwise the true value lies past it
+/// and rounds up.
+fn round_exact_quotient(q: &Dec, c1: &[u8], e1: i32, c2: &[u8], e2: i32) -> Option<Dec> {
+    let Dec::Fin { sign, coeff, exp } = q else {
+        return Some(q.clone());
+    };
+    let mag = strip_leading(coeff);
+    let back = mul_mag(mag, c2);
+    let lhs_exp = exp + e2;
+    let target = lhs_exp.min(e1);
+    let exact = cmp_mag(&scale_to(&back, lhs_exp, target), &scale_to(c1, e1, target))
+        == std::cmp::Ordering::Equal;
+    let mut digits = mag.to_vec();
+    if !exact && mag.get(MAX_DIGITS) == Some(&5) {
+        digits.push(1); // just past the tie
+    }
+    let (kept, bump) = round_half_even(&digits, MAX_DIGITS);
+    let extra = (digits.len() - mag.len()) as i32;
+    Some(Dec::Fin {
+        sign: *sign,
+        coeff: kept,
+        exp: exp + bump - extra,
+    })
 }
 
 /// `a % b`, with mongod's sign and quantum rules.

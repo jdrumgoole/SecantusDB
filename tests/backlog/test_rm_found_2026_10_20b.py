@@ -366,7 +366,7 @@ def _windows(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-214")
+@pytest.mark.backlog_fixed("RM-214")
 def test_window_functions(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 runs `$covariancePop` / `$covarianceSamp` and the
     `$topN` / `$bottomN` window accumulators, `$linearFill` over a date

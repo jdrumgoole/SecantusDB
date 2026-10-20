@@ -49,6 +49,9 @@ const RANK_FUNCS: [&str; 3] = ["$rank", "$denseRank", "$documentNumber"];
 /// partition (prefix accumulation / gap-fill), rather than a window accumulator.
 const PREFIX_OPS: [&str; 3] = ["$expMovingAvg", "$locf", "$linearFill"];
 
+/// The covariances, which run their own removable state whatever the window.
+const COVARIANCE_OPS: [&str; 2] = ["$covariancePop", "$covarianceSamp"];
+
 /// The window functions mongod runs as removable state over a window that
 /// drops documents.
 const REMOVABLE_OPS: [&str; 4] = ["$sum", "$avg", "$stdDevPop", "$stdDevSamp"];
@@ -148,6 +151,15 @@ pub fn set_window_fields_stage(
             if sort_by.is_none() || !spec.contains_key("input") {
                 return Err(Fallback::Defer);
             }
+            // Measured 8.2.11, 2026-10-20: this answered over the whole
+            // partition.
+            if op == "$derivative" && window.is_none() {
+                return Err(
+                    Fallback::mongo(9, "$derivative requires explicit window bounds").bare(),
+                );
+            }
+        } else if COVARIANCE_OPS.contains(&op) {
+            // `[x, y]`, evaluated per document; any window.
         } else if op == "$mergeObjects" {
             // $mergeObjects is a $group-only accumulator; mongod rejects it as a
             // window function (FailedToParse) — defer so Python raises the code.
@@ -249,17 +261,14 @@ pub fn set_window_fields_stage(
         };
         // $expMovingAvg / $locf / $linearFill each produce a per-slot vector —
         // precompute once per partition per output field (parallel to `compiled`).
+        let sort_field = sort_by
+            .filter(|sb| sb.len() == 1)
+            .and_then(|sb| sb.keys().next())
+            .map(String::as_str);
         let mut prefix_vecs: Vec<Option<Vec<Bson>>> = Vec::with_capacity(compiled.len());
         for c in &compiled {
             prefix_vecs.push(if PREFIX_OPS.contains(&c.op) {
-                Some(window_vector(
-                    c.op,
-                    &slots,
-                    &docs,
-                    c.arg,
-                    range_vals.as_deref(),
-                    vars,
-                )?)
+                Some(window_vector(c.op, &slots, &docs, c.arg, sort_field, vars)?)
             } else {
                 None
             });
@@ -271,13 +280,17 @@ pub fn set_window_fields_stage(
         let mut std_dev_vecs: Vec<Option<Vec<Bson>>> = Vec::with_capacity(compiled.len());
         for c in &compiled {
             std_dev_vecs.push(
-                if REMOVABLE_OPS.contains(&c.op) && window_removes(c.window) {
+                if COVARIANCE_OPS.contains(&c.op)
+                    || c.op == "$integral"
+                    || (REMOVABLE_OPS.contains(&c.op) && window_removes(c.window))
+                {
                     Some(removable_window(
                         c,
                         &slots,
                         &docs,
                         range_vals.as_deref(),
                         range_dates.as_deref(),
+                        sort_field,
                         vars,
                     )?)
                 } else {
@@ -306,7 +319,7 @@ pub fn set_window_fields_stage(
                         &docs,
                         vars,
                     )?
-                } else if c.op == "$derivative" || c.op == "$integral" {
+                } else if c.op == "$derivative" {
                     let (low, high) = if c.window.is_some_and(|w| w.contains_key("range")) {
                         range_window_bounds(
                             pos,
@@ -318,15 +331,13 @@ pub fn set_window_fields_stage(
                     } else {
                         window_bounds(pos, n, c.window)?
                     };
-                    ts_window_value(
-                        c.op,
+                    derivative_value(
                         c.arg.as_document().ok_or(Fallback::Defer)?,
                         low,
                         high,
                         &slots,
                         &docs,
-                        range_vals.as_deref(),
-                        range_dates.as_deref(),
+                        sort_field.ok_or(Fallback::Defer)?,
                         vars,
                     )?
                 } else {
@@ -485,16 +496,33 @@ fn removable_window(
     docs: &[Document],
     range_vals: Option<&[f64]>,
     range_dates: Option<&[f64]>,
+    sort_field: Option<&str>,
     vars: &Document,
 ) -> R<Vec<Bson>> {
     let n = slots.len();
     let mut values: Vec<Bson> = Vec::with_capacity(n);
     for &s in slots {
-        values.push(expressions::evaluate(&docs[s], c.arg, vars)?);
+        values.push(if c.op == "$integral" {
+            // `[sortBy value, input]`, the point mongod's `$integral` adds.
+            let spec = c.arg.as_document().ok_or(Fallback::Defer)?;
+            let input = spec.get("input").ok_or(Fallback::Defer)?;
+            Bson::Array(vec![
+                field_value(&docs[s], sort_field.ok_or(Fallback::Defer)?),
+                expressions::evaluate(&docs[s], input, vars)?,
+            ])
+        } else {
+            expressions::evaluate(&docs[s], c.arg, vars)?
+        });
     }
     let mut state = match c.op {
         "$sum" => Removable::Sum(RemovableSum::new()),
         "$avg" => Removable::Avg(RemovableSum::new(), 0),
+        "$covariancePop" | "$covarianceSamp" => {
+            Removable::Covariance(Box::new(Covariance::new(c.op == "$covarianceSamp")))
+        }
+        "$integral" => Removable::Integral(Box::new(Integral::new(
+            c.arg.as_document().ok_or(Fallback::Defer)?,
+        )?)),
         _ => Removable::StdDev(RemovableStdDev::new(c.op == "$stdDevSamp")),
     };
     let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
@@ -532,6 +560,8 @@ fn removable_window(
 
 enum Removable {
     StdDev(RemovableStdDev),
+    Covariance(Box<Covariance>),
+    Integral(Box<Integral>),
     Sum(RemovableSum),
     /// `WindowFunctionAvg`: the sum and a count of the numeric values.
     Avg(RemovableSum, i64),
@@ -541,6 +571,10 @@ impl Removable {
     fn update(&mut self, v: &Bson, q: i64) -> R<()> {
         match self {
             Removable::StdDev(s) => s.update(v, q),
+            Removable::Covariance(s) if q > 0 => s.add(v),
+            Removable::Covariance(s) => s.remove(v),
+            Removable::Integral(s) if q > 0 => s.add(v),
+            Removable::Integral(s) => s.remove(v),
             Removable::Sum(s) => s.update(v, q),
             Removable::Avg(s, count) => {
                 if is_numeric(v) {
@@ -555,6 +589,8 @@ impl Removable {
     fn value(&mut self) -> R<Bson> {
         match self {
             Removable::StdDev(s) => Ok(s.value()),
+            Removable::Covariance(s) => s.value(),
+            Removable::Integral(s) => s.value(),
             Removable::Sum(s) => s.value(),
             Removable::Avg(s, count) => {
                 if *count == 0 {
@@ -579,6 +615,354 @@ impl Removable {
             }
         }
     }
+}
+
+/// mongod's `WindowFunctionCovariance` (`window_function_covariance.cpp`,
+/// r8.2.1), transcribed: Welford's online update over two windowed means
+/// and a removable sum of co-moments, with mongod's own value arithmetic.
+/// A value that is not a two-number array is ignored, and NaN and the
+/// infinities go straight to the co-moment sum.
+struct Covariance {
+    samp: bool,
+    count: i64,
+    mean_x: Removable,
+    mean_y: Removable,
+    cxy: RemovableSum,
+}
+
+impl Covariance {
+    fn new(samp: bool) -> Self {
+        Covariance {
+            samp,
+            count: 0,
+            mean_x: Removable::Avg(RemovableSum::new(), 0),
+            mean_y: Removable::Avg(RemovableSum::new(), 0),
+            cxy: RemovableSum::new(),
+        }
+    }
+
+    fn pair(v: &Bson) -> Option<(&Bson, &Bson)> {
+        match v {
+            Bson::Array(a) if a.len() == 2 && is_numeric(&a[0]) && is_numeric(&a[1]) => {
+                Some((&a[0], &a[1]))
+            }
+            _ => None,
+        }
+    }
+
+    fn arith(op: &str, a: &Bson, b: &Bson) -> R<Bson> {
+        value_arith(op, a, b)
+    }
+
+    fn add(&mut self, v: &Bson) -> R<()> {
+        let Some((x, y)) = Self::pair(v) else {
+            return Ok(());
+        };
+        if let Some(special) = non_finite_pair(x, y) {
+            return self.cxy.update(&special, 1);
+        }
+        self.count += 1;
+        let delta_x = Self::arith("$subtract", x, &self.mean_x.value()?)?;
+        self.mean_x.update(x, 1)?;
+        self.mean_y.update(y, 1)?;
+        let delta_y = Self::arith("$subtract", y, &self.mean_y.value()?)?;
+        self.cxy
+            .update(&Self::arith("$multiply", &delta_x, &delta_y)?, 1)
+    }
+
+    fn remove(&mut self, v: &Bson) -> R<()> {
+        let Some((x, y)) = Self::pair(v) else {
+            return Ok(());
+        };
+        if let Some(special) = non_finite_pair(x, y) {
+            return self.cxy.update(&special, -1);
+        }
+        self.count -= 1;
+        if self.count == 0 {
+            *self = Covariance::new(self.samp);
+            return Ok(());
+        }
+        self.mean_x.update(x, -1)?;
+        let delta_x = Self::arith("$subtract", x, &self.mean_x.value()?)?;
+        let delta_y = Self::arith("$subtract", y, &self.mean_y.value()?)?;
+        self.cxy
+            .update(&Self::arith("$multiply", &delta_x, &delta_y)?, -1)?;
+        self.mean_y.update(y, -1)
+    }
+
+    fn value(&mut self) -> R<Bson> {
+        if self.count == 1 && !self.samp {
+            return Ok(Bson::Double(0.0));
+        }
+        let adjusted = if self.samp {
+            self.count - 1
+        } else {
+            self.count
+        };
+        if adjusted <= 0 {
+            return Ok(Bson::Null);
+        }
+        Ok(match self.cxy.value()? {
+            Bson::Decimal128(d) => Self::arith(
+                "$divide",
+                &Bson::Decimal128(d),
+                &Bson::Double(adjusted as f64),
+            )?,
+            Bson::Int32(n) => Bson::Double(f64::from(n) / adjusted as f64),
+            Bson::Int64(n) => Bson::Double(n as f64 / adjusted as f64),
+            Bson::Double(d) => Bson::Double(d / adjusted as f64),
+            other => other,
+        })
+    }
+}
+
+/// `exec::expression::evaluate<op>` on two values: the engine's own
+/// arithmetic, so the types (a date difference, a decimal, a null) behave as
+/// mongod's do in the window functions that call it.
+fn value_arith(op: &str, a: &Bson, b: &Bson) -> R<Bson> {
+    let mut args = Document::new();
+    args.insert(
+        op,
+        vec![
+            Bson::Document(bson::doc! {"$literal": a.clone()}),
+            Bson::Document(bson::doc! {"$literal": b.clone()}),
+        ],
+    );
+    // Every window function runs per document; nothing here is folded.
+    expressions::evaluate(&Document::new(), &Bson::Document(args), &Document::new())
+        .map_err(|f| f.with_folded(false))
+}
+
+fn is_nan_value(v: &Bson) -> bool {
+    crate::query::is_nan_bson(v)
+}
+
+/// mongod's `WindowFunctionIntegral` (`window_function_integral.cpp`,
+/// r8.2.1), transcribed: a removable sum of trapezoids between consecutive
+/// `[x, y]` points, divided by the unit's milliseconds at the end.
+struct Integral {
+    values: std::collections::VecDeque<Bson>,
+    sum: RemovableSum,
+    nan: i64,
+    unit_ms: Option<i64>,
+}
+
+impl Integral {
+    fn new(spec: &Document) -> R<Self> {
+        let unit_ms = match spec.get("unit") {
+            None => None,
+            Some(Bson::String(u)) => Some(window_unit_ms(u).ok_or(Fallback::Defer)?),
+            Some(_) => return Err(Fallback::Defer),
+        };
+        Ok(Integral {
+            values: std::collections::VecDeque::new(),
+            sum: RemovableSum::new(),
+            nan: 0,
+            unit_ms,
+        })
+    }
+
+    fn point(v: &Bson) -> (&Bson, &Bson) {
+        match v {
+            Bson::Array(a) if a.len() == 2 => (&a[0], &a[1]),
+            _ => (&Bson::Null, &Bson::Null),
+        }
+    }
+
+    fn check(&self, v: &Bson) -> R<()> {
+        let (x, y) = Self::point(v);
+        if !(is_numeric(y) && (is_numeric(x) || matches!(x, Bson::DateTime(_)))) {
+            return Err(Fallback::mongo(
+                5423900,
+                "The input value of $integral window function must be a vector of 2 value, the \
+                 first value must be numeric or date type and the second must be numeric.",
+            ));
+        }
+        match self.unit_ms {
+            Some(_) if !matches!(x, Bson::DateTime(_)) => Err(Fallback::mongo(
+                5423901,
+                "$integral with 'unit' expects the sortBy field to be a Date",
+            )),
+            None if !is_numeric(x) => Err(Fallback::mongo(
+                5423902,
+                "$integral (with no 'unit') expects the sortBy field to be numeric",
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// `integralOfTwoPointsByTrapezoidalRule`.
+    fn trapezoid(pre: &Bson, new: &Bson) -> R<Bson> {
+        let (px, py) = Self::point(pre);
+        let (nx, ny) = Self::point(new);
+        if [px, py, nx, ny].into_iter().any(is_nan_value) {
+            return Ok(Bson::Int32(0));
+        }
+        let both_dates = matches!(px, Bson::DateTime(_)) && matches!(nx, Bson::DateTime(_));
+        if !(both_dates || (is_numeric(px) && is_numeric(nx))) {
+            return Ok(Bson::Int32(0));
+        }
+        let delta = value_arith("$subtract", nx, px)?;
+        let sum_y = value_arith("$add", ny, py)?;
+        let area = value_arith("$multiply", &sum_y, &delta)?;
+        value_arith("$divide", &area, &Bson::Double(2.0))
+    }
+
+    fn add(&mut self, v: &Bson) -> R<()> {
+        self.check(v)?;
+        let (x, y) = Self::point(v);
+        if is_nan_value(x) || is_nan_value(y) {
+            self.nan += 1;
+        }
+        if let Some(back) = self.values.back() {
+            let piece = Self::trapezoid(back, v)?;
+            self.sum.update(&piece, 1)?;
+        }
+        self.values.push_back(v.clone());
+        Ok(())
+    }
+
+    fn remove(&mut self, v: &Bson) -> R<()> {
+        self.check(v)?;
+        let (x, y) = Self::point(v);
+        if is_nan_value(x) || is_nan_value(y) {
+            self.nan -= 1;
+        }
+        self.values.pop_front();
+        if let Some(front) = self.values.front() {
+            let piece = Self::trapezoid(v, front)?;
+            self.sum.update(&piece, -1)?;
+        }
+        Ok(())
+    }
+
+    fn value(&mut self) -> R<Bson> {
+        if self.values.is_empty() {
+            return Ok(Bson::Null);
+        }
+        if self.nan > 0 {
+            return Ok(Bson::Double(f64::NAN));
+        }
+        let total = self.sum.value()?;
+        match self.unit_ms {
+            Some(ms) => value_arith("$divide", &total, &Bson::Int64(ms)),
+            None => Ok(total),
+        }
+    }
+}
+
+/// `$derivative` (`window_function_exec_derivative.cpp`, r8.2.1): rise over
+/// run between the window's two ends, in mongod's value arithmetic, so a
+/// date run is in milliseconds and the unit scales the quotient afterwards.
+/// A zero run is null.
+fn derivative_value(
+    spec: &Document,
+    low: i64,
+    high: i64,
+    slots: &[usize],
+    docs: &[Document],
+    sort_field: &str,
+    vars: &Document,
+) -> R<Bson> {
+    if high < low {
+        return Ok(Bson::Null);
+    }
+    let unit_ms = match spec.get("unit") {
+        None => None,
+        Some(Bson::String(u)) => Some(window_unit_ms(u).ok_or(Fallback::Defer)?),
+        Some(_) => return Err(Fallback::Defer),
+    };
+    let input = spec.get("input").ok_or(Fallback::Defer)?;
+    let (left, right) = (&docs[slots[low as usize]], &docs[slots[high as usize]]);
+    let (left_time, right_time) = (
+        field_value(left, sort_field),
+        field_value(right, sort_field),
+    );
+    let dates = matches!(left_time, Bson::DateTime(_)) && matches!(right_time, Bson::DateTime(_));
+    if unit_ms.is_some() && !dates {
+        return Err(Fallback::mongo(
+            5624900,
+            "$derivative with 'unit' expects the sortBy field to be a Date",
+        ));
+    }
+    if unit_ms.is_none() {
+        if matches!(left_time, Bson::DateTime(_)) || matches!(right_time, Bson::DateTime(_)) {
+            return Err(Fallback::mongo(
+                5624901,
+                "$derivative where the sortBy is a Date requires an 'unit'",
+            ));
+        }
+        if !(is_numeric(&left_time) && is_numeric(&right_time)) {
+            return Err(Fallback::mongo(
+                5624902,
+                "$derivative (with no 'unit') expects the sortBy field to be numeric",
+            ));
+        }
+    }
+    let run = value_arith("$subtract", &right_time, &left_time)?;
+    let rise = value_arith(
+        "$subtract",
+        &expressions::evaluate(right, input, vars)?,
+        &expressions::evaluate(left, input, vars)?,
+    )?;
+    if matches!(rise, Bson::Null | Bson::Undefined) {
+        return Err(Fallback::mongo(
+            5624903,
+            "$derivative input must not be null or missing",
+        ));
+    }
+    let result = match value_arith("$divide", &rise, &run) {
+        Ok(v) => v,
+        // A zero run is no error: a `[-1, 0]` window at a partition's start.
+        Err(f) if f.as_mongo().is_some_and(|(code, _)| code == 2) => return Ok(Bson::Null),
+        Err(f) => return Err(f),
+    };
+    match unit_ms {
+        Some(ms) => value_arith("$multiply", &result, &Bson::Int64(ms)),
+        None => Ok(result),
+    }
+}
+
+/// `convertNonFiniteInputValue`: the one value a pair holding NaN or an
+/// infinity adds to the co-moment sum. `None` for a finite pair.
+fn non_finite_pair(x: &Bson, y: &Bson) -> Option<Bson> {
+    let (mut pos, mut neg, mut nan, mut decimal) = (0, 0, 0, false);
+    for v in [x, y] {
+        match v {
+            Bson::Double(d) if d.is_nan() => nan += 1,
+            Bson::Double(d) if *d == f64::INFINITY => pos += 1,
+            Bson::Double(d) if *d == f64::NEG_INFINITY => neg += 1,
+            Bson::Decimal128(_) => {
+                decimal = true;
+                match decimal::from_bson(v) {
+                    Some(decimal::Dec::Nan) => nan += 1,
+                    Some(decimal::Dec::Inf(sign)) if sign < 0 => neg += 1,
+                    Some(decimal::Dec::Inf(_)) => pos += 1,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    if nan + pos + neg == 0 {
+        return None;
+    }
+    let special = if nan > 0 || pos * neg > 0 {
+        decimal::Dec::Nan
+    } else if pos > 0 {
+        decimal::Dec::Inf(1)
+    } else {
+        decimal::Dec::Inf(-1)
+    };
+    Some(if decimal {
+        decimal::to_bson(&special).unwrap_or(Bson::Double(f64::NAN))
+    } else {
+        Bson::Double(match special {
+            decimal::Dec::Inf(1) => f64::INFINITY,
+            decimal::Dec::Inf(_) => f64::NEG_INFINITY,
+            _ => f64::NAN,
+        })
+    })
 }
 
 fn is_numeric(v: &Bson) -> bool {
@@ -874,67 +1258,6 @@ fn shift_value(
     }
 }
 
-/// `$derivative` / `$integral` over the window `[low, high]`, using the sortBy
-/// value (x) and `input` (y). `$derivative` is the slope between the first and
-/// last window points (null if fewer than two, or the x's coincide); `$integral`
-/// is the trapezoidal area. Without a `unit` the x-axis is the numeric
-/// `range_vals`; with a fixed-duration `unit` it is the date sortBy's epoch
-/// millis (`range_dates`) divided by the unit span, so the rate is *per unit*.
-/// `unit` requires a date sortBy; a variable-length unit defers. Mirrors
-/// `_ts_window_value`.
-#[allow(clippy::too_many_arguments)]
-fn ts_window_value(
-    op: &str,
-    spec: &Document,
-    low: i64,
-    high: i64,
-    slots: &[usize],
-    docs: &[Document],
-    range_vals: Option<&[f64]>,
-    range_dates: Option<&[f64]>,
-    vars: &Document,
-) -> R<Bson> {
-    let scaled: Vec<f64>;
-    let xs: &[f64] = match spec.get("unit") {
-        Some(Bson::String(u)) => {
-            // `unit` requires a date sortBy; scale its millis into the unit.
-            let unit_ms = window_unit_ms(u).ok_or(Fallback::Defer)? as f64;
-            let dates = range_dates.ok_or(Fallback::Defer)?;
-            scaled = dates.iter().map(|ms| ms / unit_ms).collect();
-            &scaled
-        }
-        Some(_) => return Err(Fallback::Defer), // non-string unit → defer
-        None => range_vals.ok_or(Fallback::Defer)?,
-    };
-    let input = spec.get("input").ok_or(Fallback::Defer)?;
-    let mut pts: Vec<(f64, f64)> = Vec::new();
-    for s in low..=high {
-        let s = s as usize;
-        let y = as_number(&expressions::evaluate(&docs[slots[s]], input, vars)?)
-            .ok_or(Fallback::Defer)?;
-        pts.push((xs[s], y));
-    }
-    if op == "$derivative" {
-        if pts.len() < 2 {
-            return Ok(Bson::Null);
-        }
-        let (x0, y0) = pts[0];
-        let (x1, y1) = pts[pts.len() - 1];
-        Ok(if x1 == x0 {
-            Bson::Null
-        } else {
-            Bson::Double((y1 - y0) / (x1 - x0))
-        })
-    } else {
-        let mut total = 0.0; // $integral — trapezoidal sum
-        for w in pts.windows(2) {
-            let ((xa, ya), (xb, yb)) = (w[0], w[1]);
-            total += (xb - xa) * (ya + yb) / 2.0;
-        }
-        Ok(Bson::Double(total))
-    }
-}
-
 /// `$expMovingAvg` smoothing factor: `2/(N+1)` from a positive-int `N`, or a
 /// given `alpha` in (0, 1). Exactly one must be present, else `Err(Fallback::Defer)` (defer).
 fn ema_alpha(spec: &Document) -> R<f64> {
@@ -987,7 +1310,7 @@ fn window_vector(
     slots: &[usize],
     docs: &[Document],
     arg: &Bson,
-    range_vals: Option<&[f64]>,
+    sort_field: Option<&str>,
     vars: &Document,
 ) -> R<Vec<Bson>> {
     match op {
@@ -1000,7 +1323,9 @@ fn window_vector(
             )
         }
         "$locf" => locf_values(slots, docs, arg, vars),
-        "$linearFill" => linear_fill_values(slots, docs, arg, range_vals, vars),
+        "$linearFill" => {
+            linear_fill_values(slots, docs, arg, sort_field.ok_or(Fallback::Defer)?, vars)
+        }
         _ => Err(Fallback::Defer),
     }
 }
@@ -1022,39 +1347,93 @@ fn locf_values(slots: &[usize], docs: &[Document], expr: &Bson, vars: &Document)
     Ok(out)
 }
 
-/// `$linearFill` — interpolate `expr`'s nulls between non-null anchors along the
-/// (single ascending numeric) sortBy x-axis. Leading / trailing nulls stay null.
-/// Same IEEE-double math as `_compute_linear_fill`. Non-numeric sort / anchor,
-/// coincident x, or a missing x-axis (`range_vals` is `None`) → defer.
+/// `$linearFill` (`window_function_exec_linear_fill.cpp`, r8.2.1): each
+/// null between two known points is `y1 + (x - x1) * ((y2 - y1) / (x2 - x1))`
+/// in mongod's value arithmetic, so a date sortBy interpolates by its
+/// millisecond differences. Leading and trailing nulls stay null.
 fn linear_fill_values(
     slots: &[usize],
     docs: &[Document],
     expr: &Bson,
-    range_vals: Option<&[f64]>,
+    sort_field: &str,
     vars: &Document,
 ) -> R<Vec<Bson>> {
-    let xs = range_vals.ok_or(Fallback::Defer)?;
-    let vals: Vec<Bson> = slots
-        .iter()
-        .map(|&i| expressions::evaluate(&docs[i], expr, vars))
-        .collect::<R<Vec<_>>>()?;
-    let mut out = vals.clone();
-    let anchors: Vec<usize> = vals
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| !matches!(v, Bson::Null))
-        .map(|(i, _)| i)
-        .collect();
-    for w in anchors.windows(2) {
-        let (a, b) = (w[0], w[1]);
-        let (x0, x1) = (xs[a], xs[b]);
-        let y0 = as_number(&vals[a]).ok_or(Fallback::Defer)?;
-        let y1 = as_number(&vals[b]).ok_or(Fallback::Defer)?;
-        if x1 == x0 {
-            return Err(Fallback::Defer);
+    let mut ys: Vec<Bson> = Vec::with_capacity(slots.len());
+    let mut xs: Vec<Bson> = Vec::with_capacity(slots.len());
+    let mut last: Option<Bson> = None;
+    let datelike = |v: &Bson| {
+        matches!(
+            v,
+            Bson::DateTime(_) | Bson::Timestamp(_) | Bson::ObjectId(_)
+        )
+    };
+    for &i in slots {
+        let y = expressions::evaluate(&docs[i], expr, vars)?;
+        if !(is_numeric(&y) || matches!(y, Bson::Null | Bson::Undefined)) {
+            return Err(Fallback::mongo(
+                14,
+                format!(
+                    "Value to be filled must be numeric or nullish, but found {}",
+                    crate::query::bson_type_name(&y)
+                ),
+            ));
         }
+        let x = field_value(&docs[i], sort_field);
+        if !(is_numeric(&x) || datelike(&x)) {
+            return Err(Fallback::mongo(
+                14,
+                format!(
+                    "Value of the sortBy field must be numeric or a date, but found {}",
+                    crate::query::bson_type_name(&x)
+                ),
+            ));
+        }
+        if let Some(prev) = &last {
+            if order::cmp(prev, &x) == Ordering::Equal {
+                return Err(Fallback::mongo(
+                    6050106,
+                    "There can be no repeated values in the sort field in the same partition",
+                ));
+            }
+            if !((datelike(prev) && datelike(&x)) || (is_numeric(prev) && is_numeric(&x))) {
+                return Err(Fallback::mongo(
+                    14,
+                    format!(
+                        "Conflicting sort value types, previously received type {}, but found {}",
+                        crate::query::bson_type_name(prev),
+                        crate::query::bson_type_name(&x)
+                    ),
+                ));
+            }
+        }
+        last = Some(x.clone());
+        xs.push(x);
+        ys.push(y);
+    }
+    let known: Vec<usize> = (0..ys.len())
+        .filter(|&i| !matches!(ys[i], Bson::Null | Bson::Undefined))
+        .collect();
+    let mut out = ys.clone();
+    for w in known.windows(2) {
+        let (a, b) = (w[0], w[1]);
         for i in (a + 1)..b {
-            out[i] = Bson::Double(y0 + (y1 - y0) * ((xs[i] - x0) / (x1 - x0)));
+            let slope = value_arith(
+                "$divide",
+                &value_arith("$subtract", &ys[b], &ys[a])?,
+                &value_arith("$subtract", &xs[b], &xs[a])?,
+            )?;
+            let offset = value_arith(
+                "$multiply",
+                &value_arith("$subtract", &xs[i], &xs[a])?,
+                &slope,
+            )?;
+            out[i] = value_arith("$add", &ys[a], &offset)?;
+        }
+    }
+    // A null that no known point bounds stays null, a missing one included.
+    for v in out.iter_mut() {
+        if matches!(v, Bson::Undefined) {
+            *v = Bson::Null;
         }
     }
     Ok(out)
