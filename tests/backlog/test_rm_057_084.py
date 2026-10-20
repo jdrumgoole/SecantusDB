@@ -20,7 +20,7 @@ from typing import Any
 
 import pymongo
 import pytest
-from bson import Timestamp
+from bson import Binary, Timestamp
 from pymongo.errors import OperationFailure
 
 from tests.backlog.conftest import _RS_BANNER, RS_BINARY, drain_output, mongo_answer
@@ -543,14 +543,44 @@ def _well_formed_foreign_token(client: Any) -> tuple:
     return code_of(mongo_answer(run))
 
 
-@pytest.mark.backlog("RM-075")
+@pytest.mark.backlog_fixed("RM-075")
 def test_well_formed_mongod_token_is_looked_up(rust_mongo: Any, mongod_rs: Any) -> None:
     """A token in mongod's format that decodes: mongod 8.2.11 looks for it
-    in its oplog and answers 280 (`the resume token was not found`); this
-    server cannot read the format and answers 40647."""
+    in its oplog from the token's time and answers 280 (`the resume token was
+    not found`) at the first event it finds instead."""
     expected = _well_formed_foreign_token(mongod_rs)
     assert expected == ("err", 280)
     assert _well_formed_foreign_token(rust_mongo) == expected
+
+
+def _type_bits_token(client: Any, bits: Any) -> tuple:
+    c = client["rm075"][_name()]
+    c.insert_one({"a": 1})
+    data = "8200000000000000012B042C0100296E5A1004000102030405060708090A0B0C0D0E0F4600"
+
+    def run() -> Any:
+        with c.watch(resume_after={"_data": data, "_typeBits": bits}, max_await_time_ms=100) as s:
+            return s.try_next()
+
+    return code_of(mongo_answer(run))
+
+
+@pytest.mark.backlog_fixed("RM-075")
+def test_type_bits_of_wrong_type_or_all_zero(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 refuses a `_typeBits` that is not BinData (40648), and
+    reads a token whose type bits are all zero as it reads one without."""
+    for bits in ("x", Binary(b"\x00", 0), Binary(b"", 0)):
+        assert _type_bits_token(rust_mongo, bits) == _type_bits_token(mongod_rs, bits), bits
+
+
+@pytest.mark.backlog("RM-075")
+def test_type_bits_that_change_a_number(rust_mongo: Any, mongod_rs: Any) -> None:
+    """Type bits `0x01` make the token's version a double: mongod 8.2.11
+    answers 50854 (`wrong type for version`); this server does not read the
+    bits and answers 40647."""
+    expected = _type_bits_token(mongod_rs, Binary(b"\x01", 0))
+    assert expected == ("err", 50854)
+    assert _type_bits_token(rust_mongo, Binary(b"\x01", 0)) == expected
 
 
 def _change_stream_explain_ns(client: Any) -> Any:

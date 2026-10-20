@@ -15,7 +15,7 @@
 //! that decodes cleanly -- mongod goes on to look for it in its oplog. A token
 //! carrying `_typeBits` is not read here at all.
 
-use bson::Document;
+use bson::{Bson, Document};
 
 /// mongod's answer for a token's `_data`.
 #[derive(Debug, PartialEq)]
@@ -383,8 +383,24 @@ fn check_fields(elems: &[Elem]) -> Verdict {
 /// mongod's answer for the resume token `tok`, which this server could not
 /// read. `tok` has a `_data` string of hex digits (checked before).
 pub fn mongod_verdict(tok: &Document) -> Verdict {
-    if tok.contains_key("_typeBits") {
-        return Verdict::Unmodelled;
+    // `_typeBits` tells a KeyString decoder which numeric type each number
+    // was. None, or bits that are all zero, leave every number an int32 as
+    // decoded below; other bits are not transcribed. Anything but BinData is
+    // refused before the token is read (mongod 8.2.11, 2026-10-20).
+    match tok.get("_typeBits") {
+        None => {}
+        Some(Bson::Binary(bits)) if bits.bytes.iter().all(|b| *b == 0) => {}
+        Some(Bson::Binary(_)) => return Verdict::Unmodelled,
+        Some(_) => {
+            return Verdict::Error(
+                40648,
+                "Location",
+                format!(
+                    "Bad resume token: _typeBits of wrong type {}",
+                    secantus_core::aggregate::render_value_compact(&Bson::Document(tok.clone()))
+                ),
+            )
+        }
     }
     let Ok(hex) = tok.get_str("_data") else {
         return Verdict::Unmodelled;
@@ -404,6 +420,32 @@ pub fn mongod_verdict(tok: &Document) -> Verdict {
         Err(Stop::Error(code, name, msg)) => Verdict::Error(code, name, msg),
         Err(Stop::Unmodelled) => Verdict::Unmodelled,
     }
+}
+
+/// The cluster time a resume token in mongod's format starts with: its
+/// first KeyString element, a Timestamp (type 130, then the seconds and the
+/// increment, big-endian).
+pub fn cluster_time(tok: &Document) -> Option<bson::Timestamp> {
+    let hex = tok.get_str("_data").ok()?;
+    let byte = |i: usize| {
+        hex.get(2 * i..2 * i + 2)
+            .and_then(|h| u8::from_str_radix(h, 16).ok())
+    };
+    if byte(0)? != 0x82 {
+        return None;
+    }
+    let word = |at: usize| -> Option<u32> {
+        Some(u32::from_be_bytes([
+            byte(at)?,
+            byte(at + 1)?,
+            byte(at + 2)?,
+            byte(at + 3)?,
+        ]))
+    };
+    Some(bson::Timestamp {
+        time: word(1)?,
+        increment: word(5)?,
+    })
 }
 
 #[cfg(test)]

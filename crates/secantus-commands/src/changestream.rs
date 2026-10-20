@@ -400,14 +400,38 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
     // only a position (an empty batch's), or an invalidate, starts after it.
     let mut expect_token = None;
     let position = if let Some(tok) = resume_token {
-        let seq = storage
-            .resume_token_seq(tok)
-            .ok_or_else(|| unreadable_token_error(tok, &scope))?;
-        if storage.resume_token_is_event(tok) && !storage.resume_token_from_invalidate(tok) {
-            expect_token = tok.get_str("_data").ok().map(str::to_string);
-            seq - 1
-        } else {
-            seq
+        match storage.resume_token_seq(tok) {
+            None => {
+                // A token in mongod's own format that decodes: mongod reads
+                // its oplog from the token's time and requires the token's
+                // event to be the first it finds (8.2.11). None of this
+                // server's events is that event, so the first found fails the
+                // resume with 280, as on mongod; with none yet, the stream
+                // waits for one.
+                let foreign = match crate::resume_keystring::mongod_verdict(tok) {
+                    crate::resume_keystring::Verdict::Decoded { has_uuid } => {
+                        has_uuid || !matches!(scope, ChangeStreamScope::Coll { .. })
+                    }
+                    _ => false,
+                };
+                let at = crate::resume_keystring::cluster_time(tok).filter(|_| foreign);
+                let Some(at) = at else {
+                    return Err(unreadable_token_error(tok, &scope));
+                };
+                expect_token = tok.get_str("_data").ok().map(str::to_string);
+                match storage.seq_for_timestamp(at) {
+                    0 => storage.oplog_tail_seq(),
+                    seq => seq - 1,
+                }
+            }
+            Some(seq)
+                if storage.resume_token_is_event(tok)
+                    && !storage.resume_token_from_invalidate(tok) =>
+            {
+                expect_token = tok.get_str("_data").ok().map(str::to_string);
+                seq - 1
+            }
+            Some(seq) => seq,
         }
     } else if let Some(Bson::Timestamp(ts)) = cs_spec.get("startAtOperationTime") {
         // The first entry at or after the time, or the tail when there is

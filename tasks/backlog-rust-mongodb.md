@@ -1271,21 +1271,34 @@ differs on 2 results (re-measured 2026-10-16; 5 before). The harness salts datab
 mongod keeps the oplog of earlier runs and a stream started in the past
 would see them. What is left:
 
-- [ ] **RUST MongoDB server: a resume token in mongod's own format gets
-      40647.** This server's tokens are its own encoding (hex of a BSON
-      document), so a token from one cannot be given to the other. A token
-      neither server can read now gets mongod's error (its KeyString decoder
-      is transcribed in `secantus-commands/src/resume_keystring.rs`); what
-      is left: a token that decodes cleanly, which mongod looks for in its
-      oplog (280 `the resume token was not found`), and two shapes the
-      transcription leaves out -- a tiny decimal in `_data`, and a token
-      with `_typeBits` -- which also answer 40647.
+- [ ] **RUST MongoDB server: a resume token in mongod's own format with
+      type bits that matter, or a tiny decimal, gets 40647.** This
+      server's tokens are its own encoding (hex of a BSON document). A token
+      in mongod's format is read by a transcription of mongod's KeyString
+      decoder (`secantus-commands/src/resume_keystring.rs`): one that fails
+      gets mongod's error, and one that decodes is looked up from its
+      cluster time and answers 280 when its event is not the first found,
+      as on mongod (2026-10-20). A `_typeBits` that is not BinData is 40648,
+      and all-zero bits are no bits. What is left: type bits that change a
+      number's type (`0x01` makes the version a double: mongod answers
+      50854), which need mongod's TypeBits reader, and a tiny decimal in
+      `_data`; both answer 40647.
       Backlog-ID: RM-075
-      Verify: tests/backlog/test_rm_057_084.py::test_well_formed_mongod_token_is_looked_up
+      Verify: tests/backlog/test_rm_057_084.py::test_type_bits_that_change_a_number
 - [ ] **RUST MongoDB server: `explain` of a `$changeStream` is this
       server's plan.** mongod explains the oplog scan it would run, with
       the full match over `local.oplog.rs`; not reproduced, like the rest
-      of mongod's planner output (1 of the 2).
+      of mongod's planner output (1 of the 2). Sized 2026-10-20: mongod's
+      reply is a `$cursor` over `local.oplog.rs` whose `parsedQuery` (about
+      2,100 characters for a collection stream, 2,400 for the cluster) is the
+      oplog filter mongod's change-stream filter builders make from the
+      scope and options, a `PROJECTION_SIMPLE` of the oplog fields, then four
+      internal `$changeStream` stages (`internalUnwindTransaction` with the
+      same filter, `internalTransform` with the options,
+      `$_internalChangeStreamCheckInvalidate`,
+      `$_internalChangeStreamCheckResumability`) and a `$match` on
+      `operationType`. Reproducing it means transcribing those builders per
+      scope and option, not printing the namespace alone.
       Backlog-ID: RM-076
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_a_change_stream_scans_the_oplog
 

@@ -26,7 +26,15 @@ expressions with mongod's 224, as mongod does.
   (tests/backlog/test_rm_001_028.py::test_fcv_80_refuses_a_feature_82_added,
   tests/backlog/test_rm_added_in_82.py::test_fcv_80_refuses_every_expression_82_added).
 
+- A resume token in mongod's own format that decodes is looked up from its
+  cluster time and answers 280 (`the resume token was not found`) at the
+  first event found, as on mongod; a `_typeBits` that is not BinData is 40648
+  and all-zero type bits are no bits. RM-075 part
+  (tests/backlog/test_rm_057_084.py::test_well_formed_mongod_token_is_looked_up,
+  ::test_type_bits_of_wrong_type_or_all_zero).
+
 #### Known gaps
 
 - The hybrid-search stages 8.2 added (`$rankFusion`, `$score`,
   `$scoreFusion`) are still missing (RM-198).
+- Type bits that change a number's type in a mongod-format token (RM-075).
