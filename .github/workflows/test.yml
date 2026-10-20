@@ -3,11 +3,11 @@ name: Tests
 on:
   push:
     branches: [main]
-    # Skip the matrix when a commit only touches docs / license / markdown /
+    # Skip the run when a commit only touches docs / license / markdown /
     # the marketing site (website/** — excluded from sdist/wheel, no runtime code).
     # GitHub considers paths-ignore satisfied (and skips the run) when EVERY
     # changed file matches one of these patterns. Anything else here — code,
-    # tests, pyproject.toml, the workflows themselves — runs the full matrix.
+    # tests, pyproject.toml, the workflows themselves — runs the workflow.
     paths-ignore:
       - '**.md'
       - 'LICENSE*'
@@ -20,26 +20,11 @@ on:
       - 'LICENSE*'
       - 'docs/**'
       - 'website/**'
-  # Weekly full-matrix run: every Monday 06:00 UTC, exercises all
-  # supported CPython versions (3.10–3.13) across Linux/Windows, PLUS macOS.
-  # Push/PR runs only test 3.10 on each OS to keep latency tight; this
-  # cron catches version-specific regressions before they accumulate.
-  #
-  # macOS is CRON-ONLY, never push/PR. Its runners build vendored WiredTiger
-  # from source on a slow, contended pool (10–40+ min, occasionally hanging),
-  # which is too costly to gate every push/PR on — it would be the critical
-  # path several times over. Note that is a BUILD-cost problem, not a test
-  # problem: 9e16e49 removed macOS for runner cost, not for any macOS test
-  # failure. Weekly is nearly free and covers what daily macOS development does
-  # NOT: the durable/checkpoint path (local dev runs under
-  # SECANTUS_TEST_FAST_STORAGE=1) and the mongosh / node / java CLI-tool tests
-  # (which skip wherever the toolchain is absent, including a normal Mac).
-  # macOS wheels are additionally built and validated at release (publish.yml).
+  # Weekly run, every Monday 06:00 UTC, so a week without merges still gets
+  # a result against the current runner images and dependencies.
   schedule:
     - cron: '0 6 * * 1'
-  # Manual full-matrix trigger from the Actions tab. Same effect as the
-  # cron firing — useful when you want to revalidate against all
-  # versions on demand without waiting for Monday.
+  # Manual trigger from the Actions tab.
   workflow_dispatch:
 
 # Per-ref lane: a newer push to the same ref cancels that ref's stale run, but
@@ -63,331 +48,72 @@ permissions:
 
 jobs:
   test:
-    # The Linux + macOS lane on push / PR (macOS re-enabled 2026-07-19, see the
-    # ``os`` matrix entry). Windows runs as the sharded ``test-windows`` job below.
-    runs-on: ${{ matrix.os }}
-    # The whole suite runs in ~4 min locally; 30 min is generous for CI. Without
-    # this, a hung run (a daemon/thread not reaped — historically a rust-server
-    # stop() / change-stream-tail wedge, see the faulthandler watchdog in
-    # tests/conftest.py) blocks the runner until GitHub's 6-hour kill with no
-    # diagnostics. The cap also protects the release-time macOS run.
-    # Make EVERY uv invocation in the job (sync + each `uv run`) resolve the
-    # MATRIX interpreter. UV_PYTHON outranks the repo's `.python-version` pin
-    # (3.12); without it, a bare `uv run` after the sync re-resolves against
-    # the pin, REMOVES the matrix-python venv, and re-creates a 3.12 one
-    # without the dev extras (first symptom: `Failed to spawn: ruff`) — the
-    # same mechanism that made every matrix cell silently test 3.12 before.
+    # Lint, format, and the tests that are not Python-server tests.
+    #
+    # The Python servers are FULLY DEPRECATED (Joe, 2026-10-20) and CI no
+    # longer tests them. This job replaced three: ``test`` (4 Linux + 4 macOS
+    # groups), ``test-windows`` (4 groups) and ``test-durable`` (up to 8
+    # groups), all of which ran the whole pytest suite, which is mostly the
+    # Python servers. ``tools/ci_test_selection.py`` picks the files that run
+    # here, by a rule (a file importing the ``secantus`` package is a
+    # Python-server test), so a new file lands on the right side without a list
+    # to keep. The Rust-server tests that need a built server skip here and run
+    # in ``storage-engine`` and ``pg-oracle`` below.
+    #
+    # What is lost, by decision: every Python-server test, the macOS and
+    # Windows runs of them, the SECANTUS_FORCE_DURABLE lane (which governed the
+    # Python ``Storage``) and the CPython 3.10-3.13 sweep. Ubuntu, 3.12 only.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
-      UV_PYTHON: ${{ matrix.python-version }}
+      UV_PYTHON: "3.12"
       # Where the crash faulthandler (tests/conftest.py) writes a per-worker
-      # stack on a fatal signal. Uploaded below on failure so a hard worker
-      # crash ("node down: Not properly terminated") finally names its thread
-      # instead of dying with its stderr — the ws-changes crash has been
-      # anonymous ≥4× for want of this (tasks/backlog.md).
+      # stack on a fatal signal; uploaded below on failure.
       SECANTUS_FAULTHANDLER_DIR: ${{ github.workspace }}/faulthandler-dumps
       # CI keeps the 25-min hang deadline (job cap is 30 min); the local
       # conftest default is 90 min so shared-box runs don't self-destruct.
       SECANTUS_HANG_SECONDS: "1500"
-    # 30 min suffices for Linux, but a macOS cell builds vendored WiredTiger
-    # from source on a contended pool (10-40+ min per 9e16e49) BEFORE it runs a
-    # test, so the cron cells need a much larger cap.
-    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 90 || 30 }}
-    strategy:
-      fail-fast: false
-      matrix:
-        # Push / PR: 3.10 only (fast feedback). Schedule / workflow_dispatch:
-        # full version sweep.
-        python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.10","3.11","3.12","3.13"]' || '["3.10"]') }}
-        # macOS runs on the WEEKLY CRON ONLY, never on push / PR. It was dropped
-        # from continuous CI in 9e16e49 because its runners build vendored
-        # WiredTiger from source on a scarce, contended pool — routinely 10-40+
-        # min and occasionally hanging. That is a BUILD-cost problem, not a test
-        # problem: no macOS test failure motivated the removal. Gating every PR
-        # on a 10-40 min build is still not worth it (it would be the critical
-        # path several times over), but running it weekly is nearly free and
-        # closes two gaps that "we develop on macOS" does NOT cover:
-        #
-        #   * durability — local dev runs under SECANTUS_TEST_FAST_STORAGE=1, so
-        #     the checkpoint path is never exercised on macOS by anyone.
-        #   * toolchain-dependent tests — the mongosh / node / java smokes skip
-        #     wherever the toolchain is absent, which includes a normal Mac.
-        #
-        # Release-time wheel builds don't cover either: they build and smoke the
-        # wheel, they don't run the durable suite.
-        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest","macos-14"]' || '["ubuntu-latest"]') }}
-        # Duration-balanced split (pytest-split) against the per-platform files
-        # in ci/durations/, recorded by .github/workflows/record-durations.yml.
-        # REPLACES the sql/core path split, which was badly imbalanced and in
-        # OPPOSITE directions per platform (Linux ran sql 5m11 vs core 11m11;
-        # Windows ran sql 13m39 vs core 8m20), so #486 bought only 4m18 of a
-        # modelled 7-8 min. Balancing by recorded time packs the groups evenly
-        # and makes completeness STRUCTURAL: pytest-split partitions the
-        # collected set, so no test can fall through a gap between globs.
-        group: [1, 2, 3, 4]
-        exclude:
-          # macOS runs on ONE interpreter, not the full sweep. The gap macOS
-          # closes is OS-specific (durability, filesystem semantics, CLI-tool
-          # toolchain) — none of it interacts with the CPython version, so the
-          # other three cells would pay a 10-40 min source build each to re-prove
-          # the same thing. Dropping them takes the cron from 16 macOS cells to 4,
-          # which also keeps it inside the free tier's macOS concurrency cap.
-          #
-          # 3.12 rather than the lane's usual 3.10: it is the repo's pinned dev
-          # interpreter (.python-version), so a macOS cron failure reproduces
-          # directly on a developer's Mac with no version juggling.
-          # No-ops on push / PR, where macos-14 is not in the matrix at all.
-          - os: macos-14
-            python-version: "3.10"
-          - os: macos-14
-            python-version: "3.11"
-          - os: macos-14
-            python-version: "3.13"
-        include:
-          # macOS re-enabled on push / PR (2026-07-19) on the dev interpreter
-          # (3.12): the "6-hour hang" it was dropped for was root-caused to an
-          # fd/memory leak from unclosed `Storage` test fixtures (#563), and the
-          # run is now bounded regardless by the 30-min cap + the conftest
-          # crash/stall watchdog (#555). These (os, python, group) cells already
-          # exist on the schedule/dispatch cron (cross-product), so `include`
-          # MERGES there (no extra cron cells); on push / PR, where os is
-          # ubuntu-only, it ADDS the four macOS groups.
-          - os: macos-14
-            python-version: "3.12"
-            group: 1
-          - os: macos-14
-            python-version: "3.12"
-            group: 2
-          - os: macos-14
-            python-version: "3.12"
-            group: 3
-          - os: macos-14
-            python-version: "3.12"
-            group: 4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Move the host time zone off UTC
         # Every hosted runner is UTC, which hides any code that wrongly uses
-        # the host's local time. See .github/actions/non-utc-host for why
-        # Newfoundland, and why the host zone rather than TZ.
+        # the host's local time. See .github/actions/non-utc-host.
         uses: ./.github/actions/non-utc-host
       - name: Checkout the WiredTiger submodule
-        # Only vendor/wiredtiger feeds the build. ``submodules: recursive``
-        # cloned all 12 vendored submodules — 11 of them driver-gauge repos
-        # (mongo-java-driver, mongo-c-driver, ...) whose gigabytes of history
-        # only the weekly validate workflow reads. Shallow-init just WT; fall
-        # back to a full fetch if the shallow probe is refused.
+        # The ``secantus`` package build still compiles WiredTiger, and the
+        # dev sync needs it. Shallow-init just WT.
         shell: bash
         run: >-
           git submodule update --init --depth 1 vendor/wiredtiger ||
           git submodule update --init vendor/wiredtiger
 
-      - name: Start disk reclaim (background)
-        # Linux-only: the paths below are the GitHub ubuntu image's preinstalled
-        # toolchains, and the macOS runner has neither them nor the same disk
-        # pressure. Gating matters — the paired barrier step below waits on this
-        # step's sentinel, so leaving it ungated would make every macOS cell
-        # block for the full 180s timeout and then fail.
-        if: runner.os == 'Linux'
-        # The durable-storage lane (ubuntu only) keeps thousands of on-disk
-        # WiredTiger homes for the whole session — tmp_path_retention_policy is
-        # pinned to "all" because deleting a passed test's WT home mid-session
-        # races WT's background threads → WT_PANIC (see tests/conftest.py). Each
-        # instance is already minimised (~10 MB via log=(prealloc=false)), but
-        # thousands of them approach the runner's ~21 GB free and tipped over
-        # with "No space left on device". Reclaim ~15-20 GB of preinstalled
-        # toolchains this build never uses (kept: the hostedtoolcache that
-        # setup-python reads). See tasks/backlog.md.
-        #
-        # Run it in the BACKGROUND: the ``rm -rf`` walks hundreds of thousands
-        # of files and cost ~87s of blocking critical path, but nothing needs
-        # the space until the pytest step. Detaching it overlaps the reclaim
-        # with the apt / uv / sync steps that follow. Each ``run:`` is its own
-        # shell, so ``wait`` can't reach it from a later step — the paired
-        # "Wait for disk reclaim" step below polls a sentinel file instead.
-        run: |
-          sudo rm -f /tmp/disk-reclaim.done
-          nohup sudo bash -c '
-            rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-              /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
-            df -h /
-            touch /tmp/disk-reclaim.done
-          ' > /tmp/disk-reclaim.log 2>&1 &
-          echo "reclaim detached as pid $!"
-
-      - name: Register the MongoDB apt repository (Linux)
-        # Registering the repo BEFORE the install step means one ``apt-get
-        # update`` covers both it and the Ubuntu indexes — the second update we
-        # used to run re-fetched every index for no new information.
-        #
-        # 8.2, not 8.0, because this repo installs a SERVER from it and
-        # `tests/test_mongod_differential.py` took every expectation from
-        # 8.2.1 / 8.2.11. The gate compares only the MAJOR, so 8.0 would run —
-        # but this file has already been bitten by a PATCH-level difference (an
-        # expected-type list whose ORDER changed between 8.2.1 and 8.2.11,
-        # which needed `_sort_type_lists`), so a series the expectations were
-        # never measured against would manufacture exactly the false failures
-        # its design exists to avoid. 8.2.11 and 8.2.12 are both in this repo.
-        #
-        # The KEY is still `server-8.0.asc`: there is no `server-8.2.asc` (404
-        # at both mongodb.org and pgp.mongodb.com). MongoDB signs both series
-        # with one packaging key — verified by fingerprint, 8.2's `InRelease`
-        # is signed by 4B0752C1BCA238C0B4EE14DC41DE058A4E7DCA05, which IS the
-        # key this URL serves. Do not "fix" this to a 8.2 URL that does not
-        # exist; the filename below says `-server` rather than a version so the
-        # two do not have to agree.
-        if: runner.os == 'Linux'
-        run: |
-          curl -fsSL --retry 3 --retry-all-errors --max-time 60 \
-            https://www.mongodb.org/static/pgp/server-8.0.asc \
-            | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server.gpg
-          echo "deb [signed-by=/usr/share/keyrings/mongodb-server.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.2 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.2.list
-
-      - name: Install toolchain and MongoDB CLI tools (Linux)
-        # swig (for the vendored WT build) plus mongosh + Database Tools so the
-        # CLI-tool conformance tests (tests/test_mongosh.py,
-        # test_mongodump_restore.py, test_mongoimport_export.py,
-        # test_mongofiles.py, test_mongostat_mongotop.py) run instead of
-        # skipping — they skipif the binaries are absent. Windows is
-        # intentionally omitted: the mongosh tests skip on win32 by design
-        # (PowerShell --eval quoting), leaving only marginal coverage for a
-        # slow, flake-prone choco install.
-        #
-        # `mongodb-org-server` is what makes `tests/test_mongod_differential.py`
-        # RUN rather than skip: it gates on `shutil.which("mongod")`, so without
-        # a server the one gate that compares us against the real thing was
-        # dead in CI and lived only on a dev box. It needs no extra step — the
-        # suite's `addopts` excludes `perf`/`online`/`slow` but not
-        # `differential`, and the file's mongod fixture is module-scoped, so it
-        # spawns exactly one server for the whole file.
-        if: runner.os == 'Linux'
+      - name: Install toolchain
         uses: ./.github/actions/apt-install
         with:
-          packages: swig liblz4-dev mongodb-mongosh mongodb-database-tools mongodb-org-server
-
-      - name: Install toolchain and MongoDB CLI tools (macOS)
-        # The macOS half of the step above. Installing mongosh + Database Tools
-        # here is the POINT of the cron macOS cell, not incidental: those CLI
-        # conformance tests skip on a bare Mac, so they are exactly the coverage
-        # a developer's local run does not provide.
-        #
-        # clang comes from the Xcode command line tools already on the runner;
-        # swig is what the vendored WT build needs on top.
-        if: runner.os == 'macOS'
-        run: |
-          brew install swig lz4
-          brew tap mongodb/brew
-          # Homebrew now refuses to load formulae from an untrusted third-party
-          # tap ("Refusing to load formula mongodb/brew/mongodb-database-tools
-          # from untrusted tap"), which fails the step outright. Trust the two
-          # formulae we actually use, NOT the whole tap: `brew trust mongodb/brew`
-          # would also bless every future formula the tap ever ships. The
-          # HOMEBREW_NO_REQUIRE_TAP_TRUST=1 escape hatch is wider still and brew
-          # itself flags it as not recommended.
-          brew trust --formula mongodb/brew/mongosh
-          brew trust --formula mongodb/brew/mongodb-database-tools
-          brew install mongosh mongodb-database-tools
+          packages: swig liblz4-dev
 
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
         with:
           enable-cache: true
-          # Two settings, both needed, that fix a cache that has never worked.
-          #
-          # THE KEY. setup-uv derives its key from the interpreter present at
-          # ITS step — the runner default (3.12.x) — not from UV_PYTHON, which
-          # this workflow sets later per matrix cell. So every job on an OS
-          # shared ONE key while installing for different interpreters. Python
-          # wheels are ABI-specific (numpy-cp310 != numpy-cp312), so whichever
-          # job saved first won the key and the rest restored a cache full of
-          # wheels they could not use: a "hit" that still re-downloads
-          # everything. Verified from CI logs — the 3.10 and 3.12 lanes printed
-          # byte-identical keys. cache-suffix splits them per interpreter.
-          #
-          # THE CONTENT. setup-uv also runs `uv cache prune --ci` before saving,
-          # which drops pre-built wheels on the theory they are cheap to
-          # re-fetch; that left ~2 MB cached and the whole dependency set
-          # re-downloaded each run. Measured locally, a full cache is worth it:
-          # a deps-only sync goes 23s cold -> 1.9s warm, and 0.36s from a cache
-          # that was tarred and restored (so it survives the round trip GitHub
-          # Actions puts it through).
-          #
-          # cache-python is deliberately NOT set: restoring uv's managed
-          # python-dir fails on NTFS (os error 267, see #524), and Windows takes
-          # its interpreter from the runner tool cache instead.
+          # setup-uv keys its cache on the interpreter at ITS step, not on
+          # UV_PYTHON, and prunes pre-built wheels before saving by default;
+          # both made the cache useless (see the ``rust`` job).
           prune-cache: false
-          cache-suffix: py${{ matrix.python-version }}
-          # Default ``cache-dependency-glob`` is ``**/uv.lock``; on
-          # Windows the recursive walk trips over deep paths under
-          # vendor/mongo-ruby-driver (EPERM at .evergreen/atlas).
-          # We only have one lock file at the repo root, so the
-          # narrower glob both fixes Windows and avoids the wasted
-          # filesystem traversal on every runner.
+          cache-suffix: py3.12
           cache-dependency-glob: uv.lock
 
-      # Windows uses actions/setup-python (the runner tool cache) rather than a
-      # uv-managed interpreter, so it does not re-download a 28 MB interpreter
-      # per job. Introduced in #524 to unbreak Windows after an earlier attempt
-      # to cache uv's managed python: restoring uv's python-dir on NTFS fails in
-      # "Set up Python" with `Failed to create Python minor version link
-      # directory ... (os error 267)` — the junction does not round-trip through
-      # the GitHub cache. That setting is gone now (see the setup-uv block
-      # above), but the tool cache is kept: it is the cheaper source of an
-      # interpreter on Windows either way. UV_PYTHON is repointed from the
-      # matrix version string at that interpreter's path so every subsequent
-      # `uv` command uses it. Non-Windows keeps uv-managed.
-      - name: Set up Python ${{ matrix.python-version }}
-        if: runner.os != 'Windows'
-        run: uv python install ${{ matrix.python-version }}
-      - name: Set up Python ${{ matrix.python-version }} (Windows tool cache)
-        if: runner.os == 'Windows'
-        id: setup-python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
-        with:
-          python-version: ${{ matrix.python-version }}
-      - name: Point uv at the tool-cached interpreter (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Add-Content -Path $env:GITHUB_ENV -Value "UV_PYTHON=${{ steps.setup-python.outputs.python-path }}"
+      - name: Set up Python 3.12
+        run: uv python install 3.12
 
       # --- WiredTiger build cache -------------------------------------
-      # The vendored WiredTiger C build is ~100s in EVERY job. It is cacheable
-      # now (and was not before) because #516 moved patching out of the source
-      # tree: patch state lives in build/ beside the ExternalProject stamps
-      # that describe it, so a restored dir can no longer pair "already
-      # patched" stamps with an unpatched checkout — which would have compiled
-      # unpatched source (musl off64_t, strict -Werror, the Windows .pyd
-      # suffix) into a subtly wrong artifact rather than a red build.
-      #
-      # Measured prerequisite: ExternalProject re-runs a step when its RECORDED
-      # command text changes, so a restore only helps if that text is identical
-      # across jobs. Probed on both platforms with two independent jobs each —
-      # fingerprints matched exactly (Linux b1aa5e9d…, Windows ef1fda60…), with
-      # the interpreter resolving deterministically under RUNNER_TEMP.
+      # Restored by exact key or not at all; see the ``rust`` job for
+      # why the build interpreter is pinned and what goes into the key.
       - name: Pin the build interpreter so the cache can actually be reused
-        # Without this the WiredTiger build cache restores and is then thrown
-        # away. scikit-build-core writes Python3_EXECUTABLE into the top-level
-        # CMakeCache, and under PEP 517 that is the isolated build env — a
-        # FRESH temp directory every build. A changed cache variable forces a
-        # reconfigure which takes the WiredTiger ExternalProject with it: every
-        # stamp regenerates, including `mkdir`, so the prefix is recreated and
-        # WiredTiger recompiles from scratch on a cache HIT.
-        #
-        # Reproduced locally: a second `uv sync` rebuilt WT in 37.9s under 3.10
-        # and skipped it in 1.3s under 3.12 — uv reuses a cached build env for
-        # the pinned .python-version (3.12) but mints fresh ones for 3.10.
-        # That is exactly why the 3.10 test lanes rebuilt (73.6s build phase)
-        # while the 3.12 rust lanes did not (4.0s), both on a cache hit.
-        #
-        # It has to be set HERE rather than inside CMakeLists.txt: scikit-build
-        # passes -DPython3_EXECUTABLE on the command line, so CMake has already
-        # seen the changed value by the time project code could override it.
-        # Substituting the interpreter is ABI-safe — verified by building a
-        # wheel with and without the pin and diffing: same name, same 170
-        # entries, same tag (cp310-cp310-...).
         id: pybuild
         shell: bash
         run: |
-          p=$(uv python find ${{ matrix.python-version }} 2>/dev/null || uv python find)
+          p=$(uv python find 3.12 2>/dev/null || uv python find)
           echo "SKBUILD_CMAKE_DEFINE=Python3_EXECUTABLE=$p" >> "$GITHUB_ENV"
           echo "path=$p" >> "$GITHUB_OUTPUT"
           echo "pinned build interpreter: $p"
@@ -397,834 +123,56 @@ jobs:
         shell: bash
         run: |
           echo "wt=$(git rev-parse HEAD:vendor/wiredtiger)" >> "$GITHUB_OUTPUT"
-          # The pinned interpreter is part of the build's identity: if it moves,
-          # the cached tree would reconfigure anyway, so take a cold key instead
-          # of restoring something that cannot be reused.
-          if command -v sha256sum >/dev/null; then PH="sha256sum"; else PH="shasum -a 256"; fi
-          echo "py=$(printf %s '${{ steps.pybuild.outputs.path }}' | $PH | cut -c1-12)" >> "$GITHUB_OUTPUT"
-          # Everything that shapes the build. Any change here must produce a
-          # cold rebuild rather than reuse objects built under other settings.
-          if command -v sha256sum >/dev/null; then H="sha256sum"; else H="shasum -a 256"; fi
-          cfg=$(cat CMakeLists.txt cmake/*.py cmake/*.cmake pyproject.toml | $H | cut -c1-16)
+          echo "py=$(printf %s '${{ steps.pybuild.outputs.path }}' | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+          cfg=$(cat CMakeLists.txt cmake/*.py cmake/*.cmake pyproject.toml | sha256sum | cut -c1-16)
           echo "cfg=$cfg" >> "$GITHUB_OUTPUT"
-          # ImageVersion is an AMBIENT runner variable. The `env` context only
-          # carries workflow-declared vars, so an `env.ImageVersion` reference
-          # in a key expands to the empty string — the first cut of this shipped keys
-          # like "wtbuild-Linux--py3.10-...", silently dropping the
-          # toolchain-drift guard. Read it here, where the shell can see it.
           echo "img=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
 
       - name: Restore the WiredTiger build
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: build
-          # NO restore-keys, deliberately. A partial hit is fine for the cargo
-          # cache (it seeds dependency crates) but here a near-miss is exactly
-          # the stale state to forbid: exact key or cold build. ImageVersion is
-          # in the key so a runner-image toolchain bump cannot reuse objects
-          # built by a different compiler.
-          key: wtbuild-${{ runner.os }}-${{ steps.wtkey.outputs.img }}-py${{ matrix.python-version }}-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}-py${{ steps.wtkey.outputs.py }}
+          # NO restore-keys, deliberately: exact key or cold build.
+          key: wtbuild-${{ runner.os }}-${{ steps.wtkey.outputs.img }}-py3.12-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}-py${{ steps.wtkey.outputs.py }}
 
       - name: Sync dependencies
-        # ``--extra admin`` brings in httpx / fastapi / uvicorn used by
-        # tests/test_admin_*.py; without it those tests error at import
-        # time. ``website`` is intentionally excluded — pelican / boto3
-        # aren't exercised by pytest and would just slow CI down.
+        # ``--extra admin`` brings in httpx / fastapi / uvicorn, which the ops
+        # board tests import.
         run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
 
-      - name: Verify the WiredTiger build is real
-        # Fail closed on a bad cache hit. tests/conftest.py installs a STUB
-        # wiredtiger module when the extension is missing, so a bare
-        # `import wiredtiger` would pass against a broken build — assert the
-        # real extension's symbols and version instead.
-        shell: bash
-        run: |
-          uv run python -c "
-          import wiredtiger
-          v = wiredtiger.wiredtiger_version()
-          assert hasattr(wiredtiger, 'wiredtiger_open'), 'stub module, not the real extension'
-          assert 'WiredTiger' in v[0], v
-          print('WiredTiger OK:', v[0])
-          "
-
-      # Lint / format are platform- AND shard-independent: pin them to the
-      # ``core`` shard on Linux so neither sharding nor the cron's extra OS /
-      # python cells re-run them.
-      # `.`, not a path list. The scope was `src tests` until 2026-09-28, which
-      # left `tools/`, `bench/`, all 19 gauge runners, the invoke tasks and
-      # `website/` unlinted -- and a helper added to `tools/` that day used
-      # `sys` without importing it, which no gate would have caught. A NAMED
-      # list was the first fix and was itself wrong: enumerating the paths
-      # reproduces the same hole the moment somebody adds a directory, and the
-      # test that checked the list found 27 locations missing from it. `.` has
-      # no such failure mode. ruff already skips gitignored trees and the
-      # vendored submodules, so this reaches our Python and nothing else.
-      # The whole repo was clean bar 45 trivial findings -- one of which was a
-      # dict key written twice, silently discarding a session's findings.
+      # `.`, not a path list: a named list misses the next directory someone
+      # adds. ruff already skips gitignored trees and the vendored submodules.
       - name: Lint
-        if: matrix.group == 1 && runner.os == 'Linux'
         run: uv run ruff check .
 
       - name: Format check
-        if: matrix.group == 1 && runner.os == 'Linux'
         run: uv run ruff format --check .
 
-      - name: Wait for disk reclaim
-        # Barrier for the backgrounded reclaim above — the pytest step is the
-        # first thing that actually needs the space, so this is where we pay
-        # whatever is left of it (usually nothing; the apt/uv/sync steps have
-        # already covered the ~87s). Fail loudly rather than starting a suite
-        # that would die with "No space left on device" halfway through.
-        #
-        # Must carry the SAME Linux gate as the step that arms the sentinel;
-        # otherwise a macOS cell waits the full 180s for a file that is never
-        # written and then fails the job.
-        if: runner.os == 'Linux'
-        run: |
-          # Wait on the RECLAIM ITSELF, not on a fixed deadline. The old
-          # version polled 180s and failed the whole workflow when the runner
-          # was merely slow -- which happened on 2026-08-26, taking out two
-          # shards of an otherwise green run. The rm walks hundreds of
-          # thousands of files; how long that takes is the runner's I/O, not
-          # anything this repo controls.
-          #
-          # Keep waiting while the reclaim is alive, fail FAST if it died
-          # without arming the sentinel (a real failure worth surfacing), and
-          # keep a generous absolute ceiling as a backstop.
-          deadline=$(( SECONDS + 600 ))
-          while [ ! -f /tmp/disk-reclaim.done ]; do
-            if ! pgrep -f 'rm -rf /usr/local/lib/android' >/dev/null 2>&1; then
-              sleep 2   # let a just-finished rm write the sentinel
-              [ -f /tmp/disk-reclaim.done ] && break
-              cat /tmp/disk-reclaim.log || true
-              echo "::error::disk reclaim exited without completing"
-              exit 1
-            fi
-            if [ "$SECONDS" -ge "$deadline" ]; then
-              cat /tmp/disk-reclaim.log || true
-              echo "::error::disk reclaim still running after 600s"
-              exit 1
-            fi
-            sleep 2
-          done
-          cat /tmp/disk-reclaim.log || true
-          df -h /
-
-      - name: Set up Go, with the smoke tests' modules cached
-        # The cross-driver Go smokes (`tests/test_cross_driver_features.py`)
-        # `go run` programs whose modules were fetched from proxy.golang.org
-        # inside the test, so a proxy error failed the test for the
-        # network's sake (RM-012). Fetched here, from setup-go's module
-        # cache when it has them, so the test itself never goes out.
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
-        with:
-          go-version: "1.25"
-          cache-dependency-path: tests/cross_driver/go/go.sum
-
-      - name: Download the Go smoke tests' modules
-        working-directory: tests/cross_driver/go
-        run: go mod download
-
-      - name: Tests (group ${{ matrix.group }}/4)
-        # ``--timeout=120 --timeout-method=thread`` catches deadline-
-        # exceeded hangs (test body busy-loops or blocks on a stuck
-        # producer) — independently of worker restarts.
-        #
-        # ``--max-worker-restart=3``: a few subprocess/threading-heavy tests
-        # (admin websocket change-streams, cross-driver smokes) intermittently
-        # crash their xdist worker on a teardown race (native "node down: not
-        # properly terminated"). With ``=0`` that fatally fails the whole run
-        # ~half the time, blocking every PR on an unrelated flake. A bounded
-        # restart budget lets xdist restart the dead worker and re-run the
-        # crashed test, so a *transient* crash retries to green; a
-        # *deterministic* crash re-crashes on retry and exhausts the budget,
-        # still failing loudly with the test's name. The original ``=0`` was
-        # set to avoid a silent "hang at 97%" where the parent waited forever
-        # on a dead worker — but that hang mode is now caught by the
-        # ``--timeout`` above regardless, so the restart budget is safe.
-        #
-        # The ``sql`` shard is the SQL engine + PG-wire suites; ``core`` is
-        # everything else — the same split ``test-windows`` uses, so a new test
-        # file always lands in exactly one shard.
-        # ``--randomly-seed=${{ github.run_id }}`` is REQUIRED, not cosmetic.
-        # pytest-randomly is in the dev extra and active by default, so every
-        # run collects in a DIFFERENT order; pytest-split partitions the ORDERED
-        # collected list, so groups computed from different orderings neither
-        # cover nor partition the suite. Measured with unpinned seeds: 783 tests
-        # ran TWICE and 1042 ran NOWHERE — with CI still green, so the loss is
-        # silent. Pinning to the run id gives every group in a run one identical
-        # ordering while still varying run-to-run, so cross-test-leakage
-        # detection survives. Verified pinned: groups are disjoint and their
-        # union is exactly the collected suite (2155 + 2512 = 4667, overlap 0).
-        #
-        # macOS (weekly cron only) rides the Linux durations: it has no file of
-        # its own, and the split stays CORRECT regardless — a wrong durations
-        # file mis-balances the groups but can never drop or duplicate a test.
-        # Cron latency is not worth a second recording job.
-        # ``shell: bash`` is required: windows-latest defaults to PowerShell,
-        # where the backslash line-continuations below are a ParserError. The
-        # sql/core body this replaced carried it for glob expansion; dropping it
-        # broke all three Windows groups while Linux (bash by default) passed.
+      - name: Select the tests
         shell: bash
         run: |
-          uv run python -m pytest \
-            --splits 4 --group ${{ matrix.group }} \
-            --durations-path=ci/durations/linux.json \
-            --randomly-seed=${{ github.run_id }} \
+          uv run python tools/ci_test_selection.py > selected-tests.txt
+          wc -l selected-tests.txt
+
+      - name: Tests
+        # ``--timeout`` catches a hang inside a test; ``--max-worker-restart=3``
+        # lets a transient xdist worker crash retry while a deterministic one
+        # still fails with the test's name.
+        shell: bash
+        run: |
+          uv run python -m pytest $(cat selected-tests.txt) \
             --timeout=120 --timeout-method=thread --max-worker-restart=3
-
-      - name: Prune empty faulthandler dumps
-        # A clean worker leaves a 0-byte file (nothing crashed). Drop those so
-        # the artifact below materialises ONLY when a worker actually crashed —
-        # a non-crash assertion failure produces no artifact at all.
-        if: failure()
-        shell: bash
-        run: find "${{ github.workspace }}/faulthandler-dumps" -type f -empty -delete 2>/dev/null || true
-
-      - name: Upload faulthandler crash dumps
-        if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        with:
-          name: faulthandler-${{ matrix.os }}-py${{ matrix.python-version }}-g${{ matrix.group }}
-          path: ${{ github.workspace }}/faulthandler-dumps/*.log
-          if-no-files-found: ignore
-          retention-days: 14
-
-
-  # The Windows lane, split from the ``test`` job and sharded two ways so the
-  # slowest platform stops being the workflow's critical path (~20 min in one
-  # job on a 4-vCPU runner). The split is complete by construction: the ``sql``
-  # shard runs exactly the files the ``core`` shard ``--ignore-glob``s, so a new
-  # test file always lands in exactly one shard. Lint runs on Linux only — it is
-  # platform-independent.
-  test-windows:
-    runs-on: windows-latest
-    # Make EVERY uv invocation in the job (sync + each `uv run`) resolve the
-    # MATRIX interpreter. UV_PYTHON outranks the repo's `.python-version` pin
-    # (3.12); without it, a bare `uv run` after the sync re-resolves against
-    # the pin, REMOVES the matrix-python venv, and re-creates a 3.12 one
-    # without the dev extras (first symptom: `Failed to spawn: ruff`) — the
-    # same mechanism that made every matrix cell silently test 3.12 before.
-    env:
-      UV_PYTHON: ${{ matrix.python-version }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        # Push / PR: 3.10 only. Schedule / workflow_dispatch: full sweep.
-        python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.10","3.11","3.12","3.13"]' || '["3.10"]') }}
-        # Same 3-way duration split as the ``test`` job. Windows was the
-        # workflow's pole after #486 (sql 13m39), so balancing HERE is what
-        # actually moves the critical path.
-        group: [1, 2, 3, 4]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - name: Move the host time zone off UTC
-        # Every hosted runner is UTC, which hides any code that wrongly uses
-        # the host's local time. See .github/actions/non-utc-host for why
-        # Newfoundland, and why the host zone rather than TZ.
-        uses: ./.github/actions/non-utc-host
-      - name: Checkout the WiredTiger submodule
-        # See the ``test`` job's twin step for why this replaces
-        # ``submodules: recursive``.
-        shell: bash
-        run: >-
-          git submodule update --init --depth 1 vendor/wiredtiger ||
-          git submodule update --init vendor/wiredtiger
-
-      - name: Disable Defender real-time scanning
-        # Every test opens its own on-disk WiredTiger home under tmp_path —
-        # thousands of short-lived small files per run. Defender's real-time
-        # engine scans each one synchronously on create/write/close, which
-        # taxes exactly this workload; the runner VM is ephemeral and builds
-        # only this checkout, so scanning it buys nothing. Best-effort: if the
-        # image ever locks the preference, fall through rather than fail.
-        shell: pwsh
-        run: |
-          try { Set-MpPreference -DisableRealtimeMonitoring $true }
-          catch { Write-Warning "could not disable Defender real-time scanning: $_" }
-
-      - name: Put temp files on the runner work disk
-        # pytest's tmp_path (→ every WT home) follows TMP/TEMP, which points at
-        # the small OS-disk profile temp dir; RUNNER_TEMP lives on the runner's
-        # work disk, provisioned for build I/O and wiped between jobs anyway.
-        shell: pwsh
-        run: |
-          "TMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "TEMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: Install swig
-        # SWIG ships preinstalled on windows-2022 runners, but choco
-        # re-installs idempotently to defend against runner image
-        # refreshes that drop it. Same line cibuildwheel uses for
-        # publish-time wheel builds.
-        run: choco install -y swig
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
-        with:
-          enable-cache: true
-          # Two settings, both needed, that fix a cache that has never worked.
-          #
-          # THE KEY. setup-uv derives its key from the interpreter present at
-          # ITS step — the runner default (3.12.x) — not from UV_PYTHON, which
-          # this workflow sets later per matrix cell. So every job on an OS
-          # shared ONE key while installing for different interpreters. Python
-          # wheels are ABI-specific (numpy-cp310 != numpy-cp312), so whichever
-          # job saved first won the key and the rest restored a cache full of
-          # wheels they could not use: a "hit" that still re-downloads
-          # everything. Verified from CI logs — the 3.10 and 3.12 lanes printed
-          # byte-identical keys. cache-suffix splits them per interpreter.
-          #
-          # THE CONTENT. setup-uv also runs `uv cache prune --ci` before saving,
-          # which drops pre-built wheels on the theory they are cheap to
-          # re-fetch; that left ~2 MB cached and the whole dependency set
-          # re-downloaded each run. Measured locally, a full cache is worth it:
-          # a deps-only sync goes 23s cold -> 1.9s warm, and 0.36s from a cache
-          # that was tarred and restored (so it survives the round trip GitHub
-          # Actions puts it through).
-          #
-          # cache-python is deliberately NOT set: restoring uv's managed
-          # python-dir fails on NTFS (os error 267, see #524), and Windows takes
-          # its interpreter from the runner tool cache instead.
-          prune-cache: false
-          cache-suffix: py${{ matrix.python-version }}
-          # Same narrow glob as the ``test`` job: one lock file at the repo
-          # root, and the default recursive walk trips on deep vendor paths.
-          cache-dependency-glob: uv.lock
-
-      # Windows uses actions/setup-python (the runner tool cache) rather than a
-      # uv-managed interpreter, so it does not re-download a 28 MB interpreter
-      # per job. Introduced in #524 to unbreak Windows after an earlier attempt
-      # to cache uv's managed python: restoring uv's python-dir on NTFS fails in
-      # "Set up Python" with `Failed to create Python minor version link
-      # directory ... (os error 267)` — the junction does not round-trip through
-      # the GitHub cache. That setting is gone now (see the setup-uv block
-      # above), but the tool cache is kept: it is the cheaper source of an
-      # interpreter on Windows either way. UV_PYTHON is repointed from the
-      # matrix version string at that interpreter's path so every subsequent
-      # `uv` command uses it. Non-Windows keeps uv-managed.
-      - name: Set up Python ${{ matrix.python-version }}
-        if: runner.os != 'Windows'
-        run: uv python install ${{ matrix.python-version }}
-      - name: Set up Python ${{ matrix.python-version }} (Windows tool cache)
-        if: runner.os == 'Windows'
-        id: setup-python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
-        with:
-          python-version: ${{ matrix.python-version }}
-      - name: Point uv at the tool-cached interpreter (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Add-Content -Path $env:GITHUB_ENV -Value "UV_PYTHON=${{ steps.setup-python.outputs.python-path }}"
-
-      # --- WiredTiger build cache -------------------------------------
-      # The vendored WiredTiger C build is ~100s in EVERY job. It is cacheable
-      # now (and was not before) because #516 moved patching out of the source
-      # tree: patch state lives in build/ beside the ExternalProject stamps
-      # that describe it, so a restored dir can no longer pair "already
-      # patched" stamps with an unpatched checkout — which would have compiled
-      # unpatched source (musl off64_t, strict -Werror, the Windows .pyd
-      # suffix) into a subtly wrong artifact rather than a red build.
-      #
-      # Measured prerequisite: ExternalProject re-runs a step when its RECORDED
-      # command text changes, so a restore only helps if that text is identical
-      # across jobs. Probed on both platforms with two independent jobs each —
-      # fingerprints matched exactly (Linux b1aa5e9d…, Windows ef1fda60…), with
-      # the interpreter resolving deterministically under RUNNER_TEMP.
-      - name: Pin the build interpreter so the cache can actually be reused
-        # Without this the WiredTiger build cache restores and is then thrown
-        # away. scikit-build-core writes Python3_EXECUTABLE into the top-level
-        # CMakeCache, and under PEP 517 that is the isolated build env — a
-        # FRESH temp directory every build. A changed cache variable forces a
-        # reconfigure which takes the WiredTiger ExternalProject with it: every
-        # stamp regenerates, including `mkdir`, so the prefix is recreated and
-        # WiredTiger recompiles from scratch on a cache HIT.
-        #
-        # Reproduced locally: a second `uv sync` rebuilt WT in 37.9s under 3.10
-        # and skipped it in 1.3s under 3.12 — uv reuses a cached build env for
-        # the pinned .python-version (3.12) but mints fresh ones for 3.10.
-        # That is exactly why the 3.10 test lanes rebuilt (73.6s build phase)
-        # while the 3.12 rust lanes did not (4.0s), both on a cache hit.
-        #
-        # It has to be set HERE rather than inside CMakeLists.txt: scikit-build
-        # passes -DPython3_EXECUTABLE on the command line, so CMake has already
-        # seen the changed value by the time project code could override it.
-        # Substituting the interpreter is ABI-safe — verified by building a
-        # wheel with and without the pin and diffing: same name, same 170
-        # entries, same tag (cp310-cp310-...).
-        id: pybuild
-        shell: bash
-        run: |
-          p=$(uv python find ${{ matrix.python-version }} 2>/dev/null || uv python find)
-          echo "SKBUILD_CMAKE_DEFINE=Python3_EXECUTABLE=$p" >> "$GITHUB_ENV"
-          echo "path=$p" >> "$GITHUB_OUTPUT"
-          echo "pinned build interpreter: $p"
-
-      - name: Compute WiredTiger build-cache key
-        id: wtkey
-        shell: bash
-        run: |
-          echo "wt=$(git rev-parse HEAD:vendor/wiredtiger)" >> "$GITHUB_OUTPUT"
-          # The pinned interpreter is part of the build's identity: if it moves,
-          # the cached tree would reconfigure anyway, so take a cold key instead
-          # of restoring something that cannot be reused.
-          if command -v sha256sum >/dev/null; then PH="sha256sum"; else PH="shasum -a 256"; fi
-          echo "py=$(printf %s '${{ steps.pybuild.outputs.path }}' | $PH | cut -c1-12)" >> "$GITHUB_OUTPUT"
-          # Everything that shapes the build. Any change here must produce a
-          # cold rebuild rather than reuse objects built under other settings.
-          if command -v sha256sum >/dev/null; then H="sha256sum"; else H="shasum -a 256"; fi
-          cfg=$(cat CMakeLists.txt cmake/*.py cmake/*.cmake pyproject.toml | $H | cut -c1-16)
-          echo "cfg=$cfg" >> "$GITHUB_OUTPUT"
-          # ImageVersion is an AMBIENT runner variable. The `env` context only
-          # carries workflow-declared vars, so an `env.ImageVersion` reference
-          # in a key expands to the empty string — the first cut of this shipped keys
-          # like "wtbuild-Linux--py3.10-...", silently dropping the
-          # toolchain-drift guard. Read it here, where the shell can see it.
-          echo "img=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
-
-      - name: Restore the WiredTiger build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
-        with:
-          path: build
-          # NO restore-keys, deliberately. A partial hit is fine for the cargo
-          # cache (it seeds dependency crates) but here a near-miss is exactly
-          # the stale state to forbid: exact key or cold build. ImageVersion is
-          # in the key so a runner-image toolchain bump cannot reuse objects
-          # built by a different compiler.
-          key: wtbuild-${{ runner.os }}-${{ steps.wtkey.outputs.img }}-py${{ matrix.python-version }}-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}-py${{ steps.wtkey.outputs.py }}
-
-      - name: Sync dependencies
-        run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
-
-      - name: Verify the WiredTiger build is real
-        # Fail closed on a bad cache hit. tests/conftest.py installs a STUB
-        # wiredtiger module when the extension is missing, so a bare
-        # `import wiredtiger` would pass against a broken build — assert the
-        # real extension's symbols and version instead.
-        shell: bash
-        run: |
-          uv run python -c "
-          import wiredtiger
-          v = wiredtiger.wiredtiger_version()
-          assert hasattr(wiredtiger, 'wiredtiger_open'), 'stub module, not the real extension'
-          assert 'WiredTiger' in v[0], v
-          print('WiredTiger OK:', v[0])
-          "
-
-      - name: Install tzdata
-        # Windows ships no IANA timezone database; Python's
-        # ``zoneinfo`` returns nothing for ``ZoneInfo("Europe/Dublin")``
-        # without it. ``tzdata`` is a tiny pure-Python package that
-        # bundles the IANA data.
-        run: uv pip install tzdata
-
-      - name: Tests (group ${{ matrix.group }}/4)
-        # Same pytest flags as the ``test`` job (see the comments there). The
-        # ``sql`` shard is the SQL engine + PG-wire suites; ``core`` is
-        # everything else. git-bash expands the globs.
-        # See the ``test`` job for why the seed is pinned.
-        # ``shell: bash`` is required: windows-latest defaults to PowerShell,
-        # where the backslash line-continuations below are a ParserError. The
-        # sql/core body this replaced carried it for glob expansion; dropping it
-        # broke all three Windows groups while Linux (bash by default) passed.
-        shell: bash
-        run: |
-          uv run python -m pytest \
-            --splits 4 --group ${{ matrix.group }} \
-            --durations-path=ci/durations/windows.json \
-            --randomly-seed=${{ github.run_id }} \
-            --timeout=120 --timeout-method=thread --max-worker-restart=3
-
-  # The slow + durable lanes, split out of the ``test`` matrix job so they run
-  # in PARALLEL with the fast suite instead of serially after it: the durable
-  # pass re-runs the whole suite and roughly doubled the Linux lane's wall
-  # time (~708s fast + ~618s durable + ~59s slow serial in one job). Same
-  # commands, same coverage, same python-version sweep on schedule — only the
-  # job boundary moved. Setup cost (~3 min) is paid once more in exchange for
-  # taking ~11 min off the workflow's critical path.
-  test-durable:
-    runs-on: ${{ matrix.os }}
-    # Make EVERY uv invocation in the job (sync + each `uv run`) resolve the
-    # MATRIX interpreter. UV_PYTHON outranks the repo's `.python-version` pin
-    # (3.12); without it, a bare `uv run` after the sync re-resolves against
-    # the pin, REMOVES the matrix-python venv, and re-creates a 3.12 one
-    # without the dev extras (first symptom: `Failed to spawn: ruff`) — the
-    # same mechanism that made every matrix cell silently test 3.12 before.
-    env:
-      UV_PYTHON: ${{ matrix.python-version }}
-      # Crash faulthandler dumps (see the ``test`` job's env + the conftest
-      # helper). The durable lane re-runs the whole suite under real checkpoint
-      # durability, so it exercises the same ws-changes / WT crash surface.
-      SECANTUS_FAULTHANDLER_DIR: ${{ github.workspace }}/faulthandler-dumps
-      # CI keeps the 25-min hang deadline (job cap is 30 min); the local
-      # conftest default is 90 min so shared-box runs don't self-destruct.
-      SECANTUS_HANG_SECONDS: "1500"
-    # See the ``test`` job: the cron's macOS cells pay a 10-40 min source build
-    # of vendored WiredTiger before the first test runs.
-    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 90 || 30 }}
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.10","3.11","3.12","3.13"]' || '["3.10"]') }}
-        # macOS on the weekly cron only — see the ``test`` job's ``os`` entry for
-        # the full rationale. THIS lane is the one that matters most for the
-        # macOS gap: it is the only place the checkpoint-durability path runs at
-        # all (local dev is SECANTUS_TEST_FAST_STORAGE=1), so without it macOS
-        # durability behaviour is exercised by nobody, anywhere.
-        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest","macos-14"]' || '["ubuntu-latest"]') }}
-        # Duration-balanced split (pytest-split) against the per-platform files
-        # in ci/durations/, recorded by .github/workflows/record-durations.yml.
-        # REPLACES the sql/core path split, which was badly imbalanced and in
-        # OPPOSITE directions per platform (Linux ran sql 5m11 vs core 11m11;
-        # Windows ran sql 13m39 vs core 8m20), so #486 bought only 4m18 of a
-        # modelled 7-8 min. Balancing by recorded time packs the groups evenly
-        # and makes completeness STRUCTURAL: pytest-split partitions the
-        # collected set, so no test can fall through a gap between globs.
-        group: [1, 2, 3, 4]
-        exclude:
-          # macOS on one interpreter only — see the ``test`` job's twin block.
-          - os: macos-14
-            python-version: "3.10"
-          - os: macos-14
-            python-version: "3.11"
-          - os: macos-14
-            python-version: "3.13"
-        include:
-          # macOS re-enabled on push / PR (2026-07-19) on the dev interpreter
-          # (3.12): the "6-hour hang" it was dropped for was root-caused to an
-          # fd/memory leak from unclosed `Storage` test fixtures (#563), and the
-          # run is now bounded regardless by the 30-min cap + the conftest
-          # crash/stall watchdog (#555). These (os, python, group) cells already
-          # exist on the schedule/dispatch cron (cross-product), so `include`
-          # MERGES there (no extra cron cells); on push / PR, where os is
-          # ubuntu-only, it ADDS the four macOS groups.
-          - os: macos-14
-            python-version: "3.12"
-            group: 1
-          - os: macos-14
-            python-version: "3.12"
-            group: 2
-          - os: macos-14
-            python-version: "3.12"
-            group: 3
-          - os: macos-14
-            python-version: "3.12"
-            group: 4
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - name: Move the host time zone off UTC
-        # Every hosted runner is UTC, which hides any code that wrongly uses
-        # the host's local time. See .github/actions/non-utc-host for why
-        # Newfoundland, and why the host zone rather than TZ.
-        uses: ./.github/actions/non-utc-host
-      - name: Checkout the WiredTiger submodule
-        # See the ``test`` job's twin step for why this replaces
-        # ``submodules: recursive``.
-        shell: bash
-        run: >-
-          git submodule update --init --depth 1 vendor/wiredtiger ||
-          git submodule update --init vendor/wiredtiger
-
-      - name: Start disk reclaim (background)
-        # Linux-only — see the ``test`` job's twin step for why the gate is
-        # load-bearing (the barrier below waits on this step's sentinel).
-        if: runner.os == 'Linux'
-        # The durable lane keeps thousands of on-disk WiredTiger homes for the
-        # whole session (tmp_path_retention_policy is pinned to "all" — see the
-        # ``test`` job's twin step and tests/conftest.py) and tipped over the
-        # runner's ~21 GB free without this. Backgrounded and barriered before
-        # pytest exactly as in the ``test`` job — same rationale, same sentinel.
-        run: |
-          sudo rm -f /tmp/disk-reclaim.done
-          nohup sudo bash -c '
-            rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-              /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
-            df -h /
-            touch /tmp/disk-reclaim.done
-          ' > /tmp/disk-reclaim.log 2>&1 &
-          echo "reclaim detached as pid $!"
-
-      - name: Register the MongoDB apt repository (Linux)
-        # Registered before the install so one ``apt-get update`` covers it and
-        # the Ubuntu indexes — see the ``test`` job's twin.
-        if: runner.os == 'Linux'
-        run: |
-          curl -fsSL --retry 3 --retry-all-errors --max-time 60 \
-            https://www.mongodb.org/static/pgp/server-8.0.asc \
-            | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server.gpg
-          echo "deb [signed-by=/usr/share/keyrings/mongodb-server.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.2 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.2.list
-
-      - name: Install toolchain and MongoDB CLI tools (Linux)
-        # Same rationale as the ``test`` job: without mongosh + Database Tools
-        # the CLI-tool conformance tests skip, and the durable pass must cover
-        # exactly what the fast pass covers.
-        if: runner.os == 'Linux'
-        uses: ./.github/actions/apt-install
-        with:
-          packages: swig liblz4-dev mongodb-mongosh mongodb-database-tools mongodb-org-server
-
-      - name: Install toolchain and MongoDB CLI tools (macOS)
-        # macOS half — see the ``test`` job's twin.
-        if: runner.os == 'macOS'
-        run: |
-          brew install swig lz4
-          brew tap mongodb/brew
-          # Homebrew now refuses to load formulae from an untrusted third-party
-          # tap ("Refusing to load formula mongodb/brew/mongodb-database-tools
-          # from untrusted tap"), which fails the step outright. Trust the two
-          # formulae we actually use, NOT the whole tap: `brew trust mongodb/brew`
-          # would also bless every future formula the tap ever ships. The
-          # HOMEBREW_NO_REQUIRE_TAP_TRUST=1 escape hatch is wider still and brew
-          # itself flags it as not recommended.
-          brew trust --formula mongodb/brew/mongosh
-          brew trust --formula mongodb/brew/mongodb-database-tools
-          brew install mongosh mongodb-database-tools
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
-        with:
-          enable-cache: true
-          # Two settings, both needed, that fix a cache that has never worked.
-          #
-          # THE KEY. setup-uv derives its key from the interpreter present at
-          # ITS step — the runner default (3.12.x) — not from UV_PYTHON, which
-          # this workflow sets later per matrix cell. So every job on an OS
-          # shared ONE key while installing for different interpreters. Python
-          # wheels are ABI-specific (numpy-cp310 != numpy-cp312), so whichever
-          # job saved first won the key and the rest restored a cache full of
-          # wheels they could not use: a "hit" that still re-downloads
-          # everything. Verified from CI logs — the 3.10 and 3.12 lanes printed
-          # byte-identical keys. cache-suffix splits them per interpreter.
-          #
-          # THE CONTENT. setup-uv also runs `uv cache prune --ci` before saving,
-          # which drops pre-built wheels on the theory they are cheap to
-          # re-fetch; that left ~2 MB cached and the whole dependency set
-          # re-downloaded each run. Measured locally, a full cache is worth it:
-          # a deps-only sync goes 23s cold -> 1.9s warm, and 0.36s from a cache
-          # that was tarred and restored (so it survives the round trip GitHub
-          # Actions puts it through).
-          #
-          # cache-python is deliberately NOT set: restoring uv's managed
-          # python-dir fails on NTFS (os error 267, see #524), and Windows takes
-          # its interpreter from the runner tool cache instead.
-          prune-cache: false
-          cache-suffix: py${{ matrix.python-version }}
-          cache-dependency-glob: uv.lock
-
-      # Windows uses actions/setup-python (the runner tool cache) rather than a
-      # uv-managed interpreter, so it does not re-download a 28 MB interpreter
-      # per job. Introduced in #524 to unbreak Windows after an earlier attempt
-      # to cache uv's managed python: restoring uv's python-dir on NTFS fails in
-      # "Set up Python" with `Failed to create Python minor version link
-      # directory ... (os error 267)` — the junction does not round-trip through
-      # the GitHub cache. That setting is gone now (see the setup-uv block
-      # above), but the tool cache is kept: it is the cheaper source of an
-      # interpreter on Windows either way. UV_PYTHON is repointed from the
-      # matrix version string at that interpreter's path so every subsequent
-      # `uv` command uses it. Non-Windows keeps uv-managed.
-      - name: Set up Python ${{ matrix.python-version }}
-        if: runner.os != 'Windows'
-        run: uv python install ${{ matrix.python-version }}
-      - name: Set up Python ${{ matrix.python-version }} (Windows tool cache)
-        if: runner.os == 'Windows'
-        id: setup-python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
-        with:
-          python-version: ${{ matrix.python-version }}
-      - name: Point uv at the tool-cached interpreter (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Add-Content -Path $env:GITHUB_ENV -Value "UV_PYTHON=${{ steps.setup-python.outputs.python-path }}"
-
-      # --- WiredTiger build cache -------------------------------------
-      # The vendored WiredTiger C build is ~100s in EVERY job. It is cacheable
-      # now (and was not before) because #516 moved patching out of the source
-      # tree: patch state lives in build/ beside the ExternalProject stamps
-      # that describe it, so a restored dir can no longer pair "already
-      # patched" stamps with an unpatched checkout — which would have compiled
-      # unpatched source (musl off64_t, strict -Werror, the Windows .pyd
-      # suffix) into a subtly wrong artifact rather than a red build.
-      #
-      # Measured prerequisite: ExternalProject re-runs a step when its RECORDED
-      # command text changes, so a restore only helps if that text is identical
-      # across jobs. Probed on both platforms with two independent jobs each —
-      # fingerprints matched exactly (Linux b1aa5e9d…, Windows ef1fda60…), with
-      # the interpreter resolving deterministically under RUNNER_TEMP.
-      - name: Pin the build interpreter so the cache can actually be reused
-        # Without this the WiredTiger build cache restores and is then thrown
-        # away. scikit-build-core writes Python3_EXECUTABLE into the top-level
-        # CMakeCache, and under PEP 517 that is the isolated build env — a
-        # FRESH temp directory every build. A changed cache variable forces a
-        # reconfigure which takes the WiredTiger ExternalProject with it: every
-        # stamp regenerates, including `mkdir`, so the prefix is recreated and
-        # WiredTiger recompiles from scratch on a cache HIT.
-        #
-        # Reproduced locally: a second `uv sync` rebuilt WT in 37.9s under 3.10
-        # and skipped it in 1.3s under 3.12 — uv reuses a cached build env for
-        # the pinned .python-version (3.12) but mints fresh ones for 3.10.
-        # That is exactly why the 3.10 test lanes rebuilt (73.6s build phase)
-        # while the 3.12 rust lanes did not (4.0s), both on a cache hit.
-        #
-        # It has to be set HERE rather than inside CMakeLists.txt: scikit-build
-        # passes -DPython3_EXECUTABLE on the command line, so CMake has already
-        # seen the changed value by the time project code could override it.
-        # Substituting the interpreter is ABI-safe — verified by building a
-        # wheel with and without the pin and diffing: same name, same 170
-        # entries, same tag (cp310-cp310-...).
-        id: pybuild
-        shell: bash
-        run: |
-          p=$(uv python find ${{ matrix.python-version }} 2>/dev/null || uv python find)
-          echo "SKBUILD_CMAKE_DEFINE=Python3_EXECUTABLE=$p" >> "$GITHUB_ENV"
-          echo "path=$p" >> "$GITHUB_OUTPUT"
-          echo "pinned build interpreter: $p"
-
-      - name: Compute WiredTiger build-cache key
-        id: wtkey
-        shell: bash
-        run: |
-          echo "wt=$(git rev-parse HEAD:vendor/wiredtiger)" >> "$GITHUB_OUTPUT"
-          # The pinned interpreter is part of the build's identity: if it moves,
-          # the cached tree would reconfigure anyway, so take a cold key instead
-          # of restoring something that cannot be reused.
-          if command -v sha256sum >/dev/null; then PH="sha256sum"; else PH="shasum -a 256"; fi
-          echo "py=$(printf %s '${{ steps.pybuild.outputs.path }}' | $PH | cut -c1-12)" >> "$GITHUB_OUTPUT"
-          # Everything that shapes the build. Any change here must produce a
-          # cold rebuild rather than reuse objects built under other settings.
-          if command -v sha256sum >/dev/null; then H="sha256sum"; else H="shasum -a 256"; fi
-          cfg=$(cat CMakeLists.txt cmake/*.py cmake/*.cmake pyproject.toml | $H | cut -c1-16)
-          echo "cfg=$cfg" >> "$GITHUB_OUTPUT"
-          # ImageVersion is an AMBIENT runner variable. The `env` context only
-          # carries workflow-declared vars, so an `env.ImageVersion` reference
-          # in a key expands to the empty string — the first cut of this shipped keys
-          # like "wtbuild-Linux--py3.10-...", silently dropping the
-          # toolchain-drift guard. Read it here, where the shell can see it.
-          echo "img=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
-
-      - name: Restore the WiredTiger build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
-        with:
-          path: build
-          # NO restore-keys, deliberately. A partial hit is fine for the cargo
-          # cache (it seeds dependency crates) but here a near-miss is exactly
-          # the stale state to forbid: exact key or cold build. ImageVersion is
-          # in the key so a runner-image toolchain bump cannot reuse objects
-          # built by a different compiler.
-          key: wtbuild-${{ runner.os }}-${{ steps.wtkey.outputs.img }}-py${{ matrix.python-version }}-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}-py${{ steps.wtkey.outputs.py }}
-
-      - name: Sync dependencies
-        run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
-
-      - name: Verify the WiredTiger build is real
-        # Fail closed on a bad cache hit. tests/conftest.py installs a STUB
-        # wiredtiger module when the extension is missing, so a bare
-        # `import wiredtiger` would pass against a broken build — assert the
-        # real extension's symbols and version instead.
-        shell: bash
-        run: |
-          uv run python -c "
-          import wiredtiger
-          v = wiredtiger.wiredtiger_version()
-          assert hasattr(wiredtiger, 'wiredtiger_open'), 'stub module, not the real extension'
-          assert 'WiredTiger' in v[0], v
-          print('WiredTiger OK:', v[0])
-          "
 
       - name: Slow tests
-        # Long-running stress / scaling tests carry ``@pytest.mark.slow`` and are
-        # excluded from the default suite (addopts ``-m 'not ... slow'``) to keep
-        # the inner loop fast. Run them here — once per OS in the matrix, so
-        # Linux on every push and macOS additionally on the weekly cron — so the
-        # races they guard (the xdist-worker-crash
-        # teardown drain in test_server_shutdown; the WT concurrency-ceiling
-        # benchmark in test_concurrency) stay covered instead of running nowhere.
-        # A command-line ``-m slow`` overrides the addopts marker filter while
-        # ``-n auto``/``--dist=loadgroup`` from addopts are retained.
-        #
-        # Pinned to the ``core`` shard: this selects by MARKER across the whole
-        # tree, not by path, so it is not shardable by the sql/core file split —
-        # running it in both shards would just duplicate it.
-        if: matrix.group == 1
-        run: uv run python -m pytest -m slow --timeout=120 --timeout-method=thread --max-worker-restart=3
-
-      - name: Wait for disk reclaim
-        # Barrier for the backgrounded reclaim — see the ``test`` job's twin,
-        # including why this carries the same Linux gate as the arming step.
-        if: runner.os == 'Linux'
-        run: |
-          # Wait on the RECLAIM ITSELF, not on a fixed deadline. The old
-          # version polled 180s and failed the whole workflow when the runner
-          # was merely slow -- which happened on 2026-08-26, taking out two
-          # shards of an otherwise green run. The rm walks hundreds of
-          # thousands of files; how long that takes is the runner's I/O, not
-          # anything this repo controls.
-          #
-          # Keep waiting while the reclaim is alive, fail FAST if it died
-          # without arming the sentinel (a real failure worth surfacing), and
-          # keep a generous absolute ceiling as a backstop.
-          deadline=$(( SECONDS + 600 ))
-          while [ ! -f /tmp/disk-reclaim.done ]; do
-            if ! pgrep -f 'rm -rf /usr/local/lib/android' >/dev/null 2>&1; then
-              sleep 2   # let a just-finished rm write the sentinel
-              [ -f /tmp/disk-reclaim.done ] && break
-              cat /tmp/disk-reclaim.log || true
-              echo "::error::disk reclaim exited without completing"
-              exit 1
-            fi
-            if [ "$SECONDS" -ge "$deadline" ]; then
-              cat /tmp/disk-reclaim.log || true
-              echo "::error::disk reclaim still running after 600s"
-              exit 1
-            fi
-            sleep 2
-          done
-          cat /tmp/disk-reclaim.log || true
-          df -h /
-
-      - name: Set up Go, with the smoke tests' modules cached
-        # The cross-driver Go smokes (`tests/test_cross_driver_features.py`)
-        # `go run` programs whose modules were fetched from proxy.golang.org
-        # inside the test, so a proxy error failed the test for the
-        # network's sake (RM-012). Fetched here, from setup-go's module
-        # cache when it has them, so the test itself never goes out.
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
-        with:
-          go-version: "1.25"
-          cache-dependency-path: tests/cross_driver/go/go.sum
-
-      - name: Download the Go smoke tests' modules
-        working-directory: tests/cross_driver/go
-        run: go mod download
-
-      - name: Durable-storage tests (group ${{ matrix.group }}/4)
-        # The default suite above runs FAST (the test conftest sets
-        # ``SECANTUS_TEST_FAST_STORAGE=1``: journal on, close-checkpoint skipped),
-        # so it does NOT exercise the checkpoint-durability path. Re-run the whole
-        # suite here with ``SECANTUS_FORCE_DURABLE=1`` — which overrides the fast
-        # default inside ``Storage`` — so the real journal + close-checkpoint
-        # durability behaviour (schema, persistence, close-and-reopen, PITR /
-        # backup) is exercised on every push. Once, on Linux. This is the
-        # "real durable disk testing" path.
-        #
-        # Sharded on the same sql/core file split as everywhere else, so the
-        # union of the two shards is still the whole suite.
-        env:
-          SECANTUS_FORCE_DURABLE: "1"
-        # See the ``test`` job for why the seed is pinned.
-        # ``shell: bash`` is required: windows-latest defaults to PowerShell,
-        # where the backslash line-continuations below are a ParserError. The
-        # sql/core body this replaced carried it for glob expansion; dropping it
-        # broke all three Windows groups while Linux (bash by default) passed.
+        # ``addopts`` excludes ``slow``; run the selected files' slow tests too.
         shell: bash
         run: |
-          uv run python -m pytest \
-            --splits 4 --group ${{ matrix.group }} \
-            --durations-path=ci/durations/linux.json \
-            --randomly-seed=${{ github.run_id }} \
+          uv run python -m pytest -m slow $(cat selected-tests.txt) \
             --timeout=120 --timeout-method=thread --max-worker-restart=3
 
       - name: Prune empty faulthandler dumps
+        # A clean worker leaves a 0-byte file; drop those so the artifact below
+        # materialises only when a worker actually crashed.
         if: failure()
         shell: bash
         run: find "${{ github.workspace }}/faulthandler-dumps" -type f -empty -delete 2>/dev/null || true
@@ -1233,20 +181,16 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: faulthandler-durable-${{ matrix.os }}-py${{ matrix.python-version }}-g${{ matrix.group }}
+          name: faulthandler-test
           path: ${{ github.workspace }}/faulthandler-dumps/*.log
           if-no-files-found: ignore
           retention-days: 14
 
-  # The matrix above runs the pure-Python server. This job builds the Rust core
-  # (``_secantus_core``) and pins each Rust engine byte-for-byte against its
-  # pure-Python counterpart via the engine-parity suites (the operator oracle).
-  # NOTE: the old ``SECANTUS_ENGINE=rust`` full-suite step was removed when the
-  # in-process engine selection was retired (two-server model) — with no Python
-  # module delegating to ``_secantus_core`` any more, running the full suite
-  # under that env var was a no-op re-run of the ``test`` job and a flake source.
-  # The Rust engines are now exercised only as the separate Rust server and via
-  # these parity suites.
+  # The Rust workspace: fmt, clippy and the crates' own tests. It used to also
+  # build ``_secantus_core`` and run the engine-parity suites (Rust engines vs
+  # the pure-Python ones); those stopped with the Python servers' full
+  # deprecation (2026-10-20), since a drift detector against a deprecated engine
+  # no longer tells anyone anything they act on.
   rust:
     runs-on: ubuntu-latest
     steps:
@@ -1441,20 +385,6 @@ jobs:
           cargo fmt --check
           cargo clippy --all-targets -- -D warnings
           cargo test
-
-      - name: Build & install the Rust core
-        run: |
-          uvx maturin build --release \
-            --manifest-path crates/secantus-core-py/Cargo.toml --out dist-rust
-          uv pip install dist-rust/secantus_core-*.whl
-
-      - name: Engine-parity suites (pure-Python vs Rust)
-        run: >-
-          uv run python -m pytest
-          tests/test_rust_sortkey_parity.py tests/test_rust_query_parity.py
-          tests/test_rust_update_parity.py tests/test_rust_expressions_parity.py
-          tests/test_rust_projection_parity.py tests/test_rust_diff_parity.py
-          tests/test_rust_aggregate_parity.py
 
   # The WiredTiger-linking Rust storage crate (`secantus-storage`, Phase 4) — the
   # secondary-index + CRUD storage layer. It's excluded from the `crates/`
@@ -1956,10 +886,9 @@ jobs:
       - name: Point cargo at a cacheable target dir
         # The path is OS-specific ON PURPOSE. Under git-bash on Windows $HOME
         # is a POSIX path (/c/Users/runneradmin), which CMake does not accept;
-        # pyproject.toml's cibuildwheel config uses a native 'C:/cargo-target'
-        # for the same reason, and notes that a backslash form (C:\...) gets
-        # eaten as an escape when the path flows through CMake. Forward slashes
-        # are accepted by CMake, cargo and clang-sys alike.
+        # a backslash form (C:\...) gets eaten as an escape when the path flows
+        # through CMake. Forward slashes are accepted by CMake, cargo and
+        # clang-sys alike.
         id: cargodir
         shell: bash
         run: |
@@ -2154,9 +1083,8 @@ jobs:
     # switched off exactly where regressions get caught.
     #
     # Linux-only, deliberately: GitHub service containers run on Linux runners
-    # only, so this cannot be folded into the mixed-OS ``test`` job (its weekly
-    # macOS cells would break). A separate job also keeps the main matrix's
-    # timings untouched.
+    # only. It is a separate job because it builds the Rust PostgreSQL server,
+    # which the ``test`` job does not.
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -2308,22 +1236,20 @@ jobs:
           "
 
       - name: Run the PostgreSQL-oracle suites
-        # Enumerated by GREP, not by a hand-maintained list: every suite that
-        # imports ``pg_oracle`` is one of these by construction, so a new
-        # oracle suite is picked up without touching this workflow (the last
-        # hand-maintained list of these drifted).
+        # The Rust PostgreSQL server's suites, named one by one. This lane used
+        # to start from every file importing ``pg_oracle``, but all of those
+        # test the Python PostgreSQL server, which CI no longer tests (fully
+        # deprecated, 2026-10-20).
         shell: bash
         run: |
-          files=$(grep -rl '^import pg_oracle' tests/ | sort | tr '\n' ' ')
-          # Add the Rust pgserver SLICE suite explicitly (it does not import
-          # pg_oracle, so grep misses it). It needs only the binary, runs in a
+          # The Rust pgserver SLICE suite. It needs only the binary, runs in a
           # few minutes, and is deterministic -- and it is the suite that has
           # pre-existing tests a shared-code change can silently break (that is
           # exactly how #1363 left `main` red under green CI). The DIFFERENTIAL
           # suite (~800 tests doing DDL against one shared postgres) is too slow
           # to fit this lane's budget and is already run locally against a real
           # PostgreSQL before every pgserver change lands, so it stays local.
-          files="$files tests/test_rust_pgserver_slice.py"
+          files="tests/test_rust_pgserver_slice.py"
           # ...but single differential tests whose only other home is a dev box
           # with a local PostgreSQL may be named here: one node costs seconds,
           # not the suite's minutes. This one pins a Rust numeric-bracket fix

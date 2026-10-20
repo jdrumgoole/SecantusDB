@@ -2,14 +2,11 @@ from __future__ import annotations
 
 import json
 import pathlib
-import re
 import shlex
 import shutil
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 
 from invoke.context import Context
 from invoke.tasks import task
@@ -2343,9 +2340,6 @@ def validate_readme(c: Context) -> None:
     )
 
 
-_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)([ab]\d+|rc\d+)?$")
-
-
 @task(name="changelog-collate")
 def changelog_collate(c: Context) -> None:
     """Fold ``changelog.d/*.md`` fragments into ``docs/changelog.md``.
@@ -2353,8 +2347,7 @@ def changelog_collate(c: Context) -> None:
     Each PR adds a fragment under ``changelog.d/`` instead of editing the shared
     ``docs/changelog.md`` (see ``changelog.d/README.md``). This folds every
     fragment into the ``## [Unreleased]`` section, in filename order, and deletes
-    the fragment files. ``release-prepare`` runs this automatically; run it by
-    hand to preview the collated changelog before a release.
+    the fragment files. Run it by hand before a release.
     """
     from changelog.fragments import collate
 
@@ -2366,382 +2359,27 @@ def changelog_collate(c: Context) -> None:
         print(f"    folded {p}")
 
 
+_PYPI_STOPPED = (
+    "SecantusDB no longer publishes to PyPI (Joe, 2026-10-20): the Python servers "
+    "are fully deprecated, and the Rust servers ship as crates and tagged GitHub "
+    "binaries. Cut a Rust release with a `secantusdb-v*` or `secantusd-pg-v*` tag "
+    "(see the secantusdb-release skill)."
+)
+
+
 @task
 def release(c: Context, version: str) -> None:
-    """Cut a release: prepare + finalize, end-to-end.
-
-    The canonical one-shot release workflow (see `## Releases` in
-    CLAUDE.md). Internally calls ``release-prepare`` (fast,
-    foreground-friendly) followed by ``release-finalize`` (long
-    polling). When invoked from a sub-agent, prefer running the two
-    phases separately so the polling phase can use
-    ``run_in_background=true`` and escape the per-Bash 10-minute cap.
-    """
-    release_prepare(c, version)
-    release_finalize(c, version)
+    """Retired: the PyPI release. Refuses; see ``_PYPI_STOPPED``."""
+    raise SystemExit(_PYPI_STOPPED)
 
 
 @task(name="release-prepare")
 def release_prepare(c: Context, version: str) -> None:
-    """Phase 1 of the release.
-
-    Pre-flight → tests → perf → bump → commit → tag → push → GitHub
-    Release. Fits comfortably in 5–7 min on a quiet machine. Sub-agents can run
-    this in the foreground with the harness's default Bash timeout.
-    Pushing the tag triggers the `Publish to PyPI` workflow
-    asynchronously — wait for it via ``release-finalize``. Docs are
-    self-hosted at https://secantusdb.com/docs/ and deploy with the
-    post-release website publish (see the secantusdb-release skill).
-
-    Pre-flight requirements (all enforced):
-      - On `main` branch.
-      - Working tree clean (vendored-submodule drift in either
-        lowercase ` m vendor/...` or capital ` M vendor/...` form is
-        tolerated; everything else rejects).
-      - HEAD == origin/main (no unpushed commits).
-      - Tag `vX.Y.Z` not already on origin.
-
-    Pipeline:
-      1. Full default test suite (`pytest` parallel, perf-excluded).
-      2. Perf regression gates (serial).
-      3. Bump pyproject.toml + src/secantus/__init__.py + uv.lock.
-      4. Commit and annotate-tag, then push `main` FIRST and the tag only
-         once `main` carries the release commit. If `main` moved while
-         the tests ran, merge it in and retry (see `_push_release`).
-      5. Create a GitHub Release for `vX.Y.Z` with auto-generated
-         notes (marked pre-release for `aN`/`bN`/`rcN` versions).
-    """
-    if not _VERSION_RE.match(version):
-        raise SystemExit(f"version {version!r} doesn't match X.Y.Z[aN|bN|rcN]")
-    _ensure_main_branch_clean()
-    _ensure_in_sync_with_origin()
-    _ensure_tag_unused(version)
-
-    print("==> [1/6] Full default test suite")
-    c.run("uv run python -m pytest", pty=PTY)
-    print("==> [2/6] Perf regression gates")
-    c.run(
-        "uv run python -m pytest -p no:xdist -o addopts= -m perf tests/test_perf_regression.py",
-        pty=PTY,
-    )
-
-    print("==> [3/6] Collating changelog fragments")
-    from changelog.fragments import collate
-
-    folded = collate()
-    for p in folded:
-        print(f"    folded {p}")
-
-    print(f"==> [4/6] Bumping version files to {version}")
-    _bump_version_files(version)
-    c.run("uv lock", pty=PTY)
-
-    print(f"==> [5/6] Committing + tagging v{version}")
-    c.run(
-        "git add pyproject.toml src/secantus/__init__.py uv.lock docs/changelog.md changelog.d",
-        pty=PTY,
-    )
-    # If the version is already at ``version`` on HEAD (e.g. because a
-    # parallel-session merge bumped it), the ``git add`` stages nothing
-    # and ``git commit`` would abort with "nothing to commit". Detect
-    # that case and skip the commit — the tag still goes on HEAD which
-    # already carries the right version.
-    staged = c.run("git diff --cached --quiet", warn=True, hide=True)
-    if staged.return_code == 0:
-        print(f"    version already at {version} on HEAD; skipping release commit")
-    else:
-        c.run(f'git commit -m "Release v{version}"', pty=PTY)
-    c.run(f'git tag -a v{version} -m "Release v{version}"', pty=PTY)
-    _push_release(version)
-
-    print(f"==> [6/6] Creating GitHub Release v{version}")
-    # Pre-release if the version has an `aN` / `bN` / `rcN` suffix.
-    is_prerelease = bool(re.search(r"[abc]\d+$|rc\d+$", version))
-    cmd = (
-        f"gh release create v{version} "
-        f"--title 'v{version}' "
-        f"--generate-notes "
-        # The tag, not HEAD: after a merge in `_push_release`, HEAD is the
-        # merge commit and the release commit is the tag's.
-        f"--verify-tag"
-    )
-    if is_prerelease:
-        cmd += " --prerelease"
-    c.run(cmd, pty=PTY)
-
-    print(
-        f"\nv{version} prepared, tag pushed, GitHub Release created.\n"
-        f"Run `invoke release-finalize {version}` next to wait for the\n"
-        f"publish workflow + PyPI propagation."
-    )
+    """Retired: phase 1 of the PyPI release. Refuses; see ``_PYPI_STOPPED``."""
+    raise SystemExit(_PYPI_STOPPED)
 
 
 @task(name="release-finalize")
 def release_finalize(c: Context, version: str) -> None:
-    """Phase 2 of the release.
-
-    Poll publish workflow → PyPI.
-
-    Polling can run for 15–25 min in the worst case (the publish
-    workflow builds wheels for cp310-cp313 across 4 platforms).
-    Sub-agents must call this with ``run_in_background=true`` on the
-    Bash invocation to escape the harness's 10-min per-call cap;
-    foreground in a developer's shell is fine. Docs are self-hosted
-    at https://secantusdb.com/docs/ and ship via the post-release
-    website publish, not here.
-
-    Idempotent: every step short-circuits if the desired state is
-    already true (publish workflow already concluded, PyPI already
-    lists the version). Safe to re-run after any timeout or
-    interruption.
-
-    Pre-flight requirements:
-      - Tag `vX.Y.Z` exists on origin (the prepare phase pushed it).
-
-    Pipeline:
-      7. Wait for GitHub `Publish to PyPI` workflow to succeed.
-      8. Wait for PyPI to list the new version.
-    """
-    if not _VERSION_RE.match(version):
-        raise SystemExit(f"version {version!r} doesn't match X.Y.Z[aN|bN|rcN]")
-    commit = _resolve_tag_commit(version)
-
-    print(f"==> [7/8] Waiting for GitHub `Publish to PyPI` workflow (commit {commit[:7]})")
-    _wait_for_publish_workflow(commit)
-    print(f"==> [8/8] Waiting for PyPI to list {version}")
-    _wait_for_pypi_version(version)
-
-    print(f"\nv{version} released; GitHub Release and PyPI up to date.")
-
-
-def _resolve_tag_commit(version: str) -> str:
-    """Resolve the commit SHA for ``vX.Y.Z`` on origin.
-
-    Used by ``release-finalize`` to find the release commit when re-run
-    later (after any ``main`` HEAD drift). The annotated tag's target
-    is the release commit itself, regardless of what's on ``main`` now.
-    """
-    out = subprocess.run(
-        ["git", "rev-parse", f"v{version}^{{commit}}"],
-        capture_output=True,
-        text=True,
-    )
-    if out.returncode != 0:
-        # Fall back to the remote ref so finalize works even if the
-        # local tag was pruned.
-        out = subprocess.run(
-            ["git", "ls-remote", "origin", f"refs/tags/v{version}^{{}}"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        line = out.stdout.strip().split("\n", 1)[0]
-        if not line:
-            raise SystemExit(
-                f"tag v{version} not found on origin — "
-                f"run `invoke release-prepare {version}` first."
-            )
-        return line.split()[0]
-    return out.stdout.strip()
-
-
-def _ensure_main_branch_clean() -> None:
-    branch = subprocess.run(
-        ["git", "branch", "--show-current"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    if branch != "main":
-        raise SystemExit(f"release must run on main; on {branch!r}")
-    status = subprocess.run(
-        ["git", "status", "--porcelain"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    # Vendored-submodule drift comes in two flavours, both tolerated:
-    #   " m vendor/foo" — modified content inside the submodule (build-time
-    #     WiredTiger patching, etc.).
-    #   " M vendor/foo" — submodule HEAD shifted because a parallel worktree
-    #     pulled or updated the submodule SHA.
-    # Neither goes into the release commit (the task only `git add`s
-    # pyproject.toml + __init__.py + uv.lock), so they're safe to ignore.
-    # Anything else is uncommitted work the release would either include
-    # or shadow — reject it.
-    bad = [
-        line
-        for line in status.splitlines()
-        if line and not (line.startswith((" m ", " M ")) and "vendor/" in line)
-    ]
-    if bad:
-        raise SystemExit("working tree has uncommitted changes:\n" + "\n".join(bad))
-
-
-def _ensure_in_sync_with_origin() -> None:
-    subprocess.run(["git", "fetch", "origin"], check=True, capture_output=True)
-    head = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    origin = subprocess.run(
-        ["git", "rev-parse", "origin/main"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    if head != origin:
-        raise SystemExit(
-            f"local main ({head[:7]}) is not in sync with origin/main "
-            f"({origin[:7]}) — push or pull first."
-        )
-
-
-def _push_release(version: str, *, cwd: str | None = None, attempts: int = 5) -> None:
-    """Push the release commit to ``main``, then the tag -- in that order.
-
-    The two used to go in one ``git push origin main vX.Y.Z``, which is not
-    atomic: when another PR merged during the ~30 minute test run, the tag was
-    accepted and ``main`` was rejected. That left a published, protected tag on
-    a commit ``main`` did not have, and the version bump had to be landed by
-    hand. It happened on two releases running (0.7.0b1 and 0.7.0b2).
-
-    So ``main`` goes first. If it is rejected because ``main`` moved, merge
-    ``origin/main`` into the release commit and try again; the tag stays on the
-    release commit, which is the tree the tests ran against, and that commit is
-    then in ``main``'s history. The tag -- the thing that triggers the publish
-    workflow -- is pushed only once ``main`` has it.
-
-    Anything this cannot resolve (a conflicting merge, a push refused for some
-    other reason) stops BEFORE the tag is pushed, so nothing is published.
-    """
-    tag = f"v{version}"
-
-    def git(*args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
-
-    def give_up(why: str) -> None:
-        git("tag", "-d", tag)  # never pushed; a re-run recreates it
-        raise SystemExit(
-            f"{why}\nNothing was published: {tag} was not pushed. Local main "
-            f"still holds the unpushed release commit; discard it with "
-            f"`git reset --hard origin/main` before re-running."
-        )
-
-    for attempt in range(1, attempts + 1):
-        push = git("push", "origin", "main")
-        if push.returncode == 0:
-            break
-        git("fetch", "origin")
-        if git("merge-base", "--is-ancestor", "origin/main", "HEAD").returncode == 0:
-            # Not behind, so this is not the race: surface git's own reason.
-            give_up(f"`git push origin main` failed:\n{push.stderr.strip()}")
-        print(f"    main moved during the release run; merging it in (attempt {attempt})")
-        merge = git("merge", "--no-edit", "origin/main")
-        if merge.returncode != 0:
-            git("merge", "--abort")
-            give_up(f"origin/main conflicts with the release commit:\n{merge.stdout.strip()}")
-    else:
-        give_up(f"main was still moving after {attempts} attempts to push the release commit.")
-
-    tag_push = git("push", "origin", tag)
-    if tag_push.returncode != 0:
-        raise SystemExit(
-            f"main carries the release commit but pushing {tag} failed:\n"
-            f"{tag_push.stderr.strip()}\nPush it with `git push origin {tag}`."
-        )
-
-
-def _ensure_tag_unused(version: str) -> None:
-    out = subprocess.run(
-        ["git", "ls-remote", "--tags", "origin", f"v{version}"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    if out:
-        raise SystemExit(f"tag v{version} already exists on origin — pick a new version.")
-
-
-def _bump_version_files(version: str) -> None:
-    py = pathlib.Path("pyproject.toml")
-    init = pathlib.Path("src/secantus/__init__.py")
-    py.write_text(
-        re.sub(
-            r'^version = "[^"]+"',
-            f'version = "{version}"',
-            py.read_text(),
-            count=1,
-            flags=re.MULTILINE,
-        )
-    )
-    init.write_text(
-        re.sub(
-            r'^__version__ = "[^"]+"',
-            f'__version__ = "{version}"',
-            init.read_text(),
-            count=1,
-            flags=re.MULTILINE,
-        )
-    )
-
-
-def _wait_for_publish_workflow(commit: str, *, timeout_s: int = 1200) -> None:
-    deadline = time.monotonic() + timeout_s
-    last = ""
-    while time.monotonic() < deadline:
-        out = subprocess.run(
-            [
-                "gh",
-                "run",
-                "list",
-                "--workflow=publish.yml",
-                f"--commit={commit}",
-                "--json=status,conclusion,databaseId",
-                "--limit=1",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
-        runs = json.loads(out or "[]")
-        if not runs:
-            line = "    no publish run for this commit yet; waiting"
-        else:
-            r = runs[0]
-            conc = r.get("conclusion") or ""
-            line = f"    run {r['databaseId']}: status={r['status']} conclusion={conc}"
-            if r["status"] == "completed":
-                if r.get("conclusion") == "success":
-                    print(line)
-                    return
-                raise SystemExit(
-                    f"publish workflow {r['databaseId']} concluded {r.get('conclusion')!r}"
-                )
-        if line != last:
-            print(line)
-            last = line
-        time.sleep(20)
-    raise SystemExit(f"timed out after {timeout_s}s waiting for publish workflow")
-
-
-def _wait_for_pypi_version(version: str, *, timeout_s: int = 600) -> None:
-    url = "https://pypi.org/pypi/SecantusDB/json"
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=15) as resp:
-                data = json.load(resp)
-        except Exception as e:
-            print(f"    PyPI API error: {e}; retrying")
-            time.sleep(20)
-            continue
-        latest = data["info"]["version"]
-        if version in data.get("releases", {}):
-            print(f"    PyPI lists {version} (info.version={latest})")
-            return
-        print(f"    PyPI does not list {version} yet (info.version={latest}); waiting")
-        time.sleep(20)
-    raise SystemExit(f"timed out after {timeout_s}s waiting for PyPI to list {version}")
+    """Retired: phase 2 of the PyPI release. Refuses; see ``_PYPI_STOPPED``."""
+    raise SystemExit(_PYPI_STOPPED)

@@ -7,40 +7,58 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 SecantusDB is a **surrogate single-node database**. It speaks real wire protocols on a real TCP socket over the same **WiredTiger** storage engine MongoDB ships, so an application's tests can run against it instead of standing up a real `mongod` or `postgres`. "Surrogate" rather than "fake" — these really are database servers, just intentionally scoped to single-node operation.
 
 **Four servers, two wire protocols, one storage format.** The Rust pair is the
-product. **The Python pair is DEPRECATED** (Joe, 2026-10-14: "We are focussed
-on rust servers only").
+product. **The Python pair is FULLY DEPRECATED** (Joe, 2026-10-14: "We are
+focussed on rust servers only"; 2026-10-20: stop publishing to PyPI, and take
+the Python servers out of CI and the release process).
 
-**What deprecated means here:**
+**What fully deprecated means here:**
 - **All new work goes to the Rust servers.** Do not add features, operators,
   SQL surface or performance work to the Python servers, and do not port a
   Rust fix back to Python to keep them level.
 - **The Python servers are not the reference for anything.** The exemplar
   was always the real product (`mongod`, PostgreSQL; see "Design
   constraints"); the Python code remains readable prior art, nothing more.
-- **Keep what exists green, do not extend it.** Their tests still run in CI
-  and still have to pass; a change elsewhere that breaks one is fixed (or the
-  test retired with a written reason), not ignored. When a Rust change makes
-  an engine parity test fail, update the parity test's expectation for that
-  case rather than changing the Python engine.
+- **Nothing publishes them.** No PyPI release since 2026-10-20: the
+  `release-prepare` / `release-finalize` tasks refuse, and the PyPI
+  workflows (`publish.yml`, `wheels.yml`, and `rust-wheels.yml` for the
+  `secantus-core` wheel) are gone. Releases already on PyPI stay up; do not
+  yank them without Joe. The only releases are the Rust ones: the
+  `secantusdb-v*` and `secantusd-pg-v*` tags (binaries) and the crates.
+- **CI does not test them.** The `test` job runs lint plus the files
+  `tools/ci_test_selection.py` picks: every test file that does NOT import
+  the `secantus` package (the ops board's tooling excepted). The Python
+  servers' suites, the durable-storage and Windows lanes built for them, the
+  Python-vs-Rust engine parity step, and the Python gauge lanes in
+  `validate.yml` no longer run. A Python-server test that a change breaks
+  is not your problem to fix; do not spend a session on it.
+- **pytest stays the test runner** (Joe, 2026-10-20), for the Rust servers
+  too: their Python test files (`tests/test_rust_*.py`, the PG slice and login
+  differentials, `tests/backlog/`) run in the `storage-engine` and
+  `pg-oracle` jobs, which build the Rust servers.
+- **The `secantus` package is still load-bearing, so do not delete it.**
+  Every Rust job builds WiredTiger through the package's CMake build
+  (`uv build --wheel` / `uv sync`), and several Rust tests import its
+  `Storage` or SQL layer (`test_rust_pgserver_slice.py`,
+  `test_rust_store_handoff.py`, `test_rust_pitr_cross_server.py`). Removing
+  the code is a later decision for Joe, and needs a standalone WiredTiger
+  build first.
 - **Compatibility with them is no longer a constraint, on-disk format
   included** (Joe, 2026-10-16: "We no longer need to worry about python
   server compatibility, we are focussed on the rust servers"). A Rust change
   may store something the Python servers cannot read, or that they would
   overwrite. Do not shape a Rust design around the Python servers, and do
-  not add Python-side code to carry it. A Python test that such a change
-  breaks (a cross-server store test, say) is retired with a written reason
-  naming the decision, not worked around. The two RUST servers still share
-  one store, and that half of the contract stands.
-- **Removing them is a separate decision for Joe**: the PyPI package still
-  ships them, so do not delete code, packages or docs on your own.
+  not add Python-side code to carry it. A Rust test that only checks a
+  Python-server hand-off and that such a change breaks is retired with a
+  written reason naming the decision, not worked around. The two RUST
+  servers still share one store, and that half of the contract stands.
 - `tasks/backlog-python-*.md` stay as a record; their items are not worked.
 
 | server | binary / entry point | wire | role |
 | --- | --- | --- | --- |
-| **Rust MongoDB server** | `secantusd-rs` (`crates/secantusdb`) | MongoDB | **the flagship.** Ships as the `secantus-mdb` crate (crates.io) and prebuilt binaries per platform; NOT in the PyPI wheel since 2026-10-07 |
-| **Rust PostgreSQL server** | `secantusd-pg` (`crates/secantus-pg`) | PostgreSQL | **the newest.** Ships as the `secantus-pg` crate (on crates.io since `0.1.0-beta.3`, 2026-10-07) and standalone binaries on the `secantusd-pg-v*` releases (Linux x86_64, macOS arm64); NOT in the PyPI wheel since 2026-10-07; builds from its own directory |
-| Python MongoDB server | `SecantusDBServer` / `secantusd-py` | MongoDB | **deprecated** (2026-10-14); formerly the reference, still in the PyPI wheel |
-| Python PostgreSQL server | `secantusd-py-pg` (`secantus.sql.pgserver`) | PostgreSQL | **deprecated** (2026-10-14); formerly the SQL reference, still in the PyPI wheel |
+| **Rust MongoDB server** | `secantusd-rs` (`crates/secantusdb`) | MongoDB | **the flagship.** Ships as the `secantus-mdb` crate (crates.io) and prebuilt binaries per platform |
+| **Rust PostgreSQL server** | `secantusd-pg` (`crates/secantus-pg`) | PostgreSQL | **the newest.** Ships as the `secantus-pg` crate (on crates.io since `0.1.0-beta.3`, 2026-10-07) and standalone binaries on the `secantusd-pg-v*` releases (Linux x86_64, macOS arm64); builds from its own directory |
+| Python MongoDB server | `SecantusDBServer` / `secantusd-py` | MongoDB | **fully deprecated** (2026-10-20): not tested in CI, not published |
+| Python PostgreSQL server | `secantusd-py-pg` (`secantus.sql.pgserver`) | PostgreSQL | **fully deprecated** (2026-10-20): not tested in CI, not published |
 
 **Reach for Rust.** The marketing site already leads with the two Rust servers;
 do not "restore" a Python-first framing in docs or on the site.
@@ -78,16 +96,16 @@ claims and it is easy to cite one as evidence for the other:
 
 The import package is `secantus`; the public Python class is `SecantusDBServer`.
 
-**Distribution (decided 2026-10-07): the PyPI wheel carries ONLY the Python
-servers; the Rust servers ship as crates.** `publish.yml` / `wheels.yml` build
-with `SECANTUS_BUILD_STORAGE_ENGINE` OFF, so no `_secantus_server` /
-`_secantus_storage` / `secantusd-rs` in the published wheel. The Rust MongoDB
-server is the `secantus-mdb` crate (`cargo install secantus-mdb` gives
-`secantusd-rs`; `secantus_mdb::Server` embeds it in a Rust test), plus the
-tagged GitHub binaries. The embedded Python `RustServer` / `PgServer` handles
-remain a SOURCE-BUILD tool for this repo's own tests and gauges -- do not
-document them to users as something `pip install` provides. Why: the bundled
-Rust pushed the project past PyPI's 10 GB quota (10.72 GB at the time).
+**Distribution: crates and tagged binaries only; nothing goes to PyPI**
+(2026-10-20). The Rust MongoDB server is the `secantus-mdb` crate (`cargo
+install secantus-mdb` gives `secantusd-rs`; `secantus_mdb::Server` embeds it in
+a Rust test), plus the `secantusdb-v*` GitHub binaries; the Rust PostgreSQL
+server is the `secantus-pg` crate plus the `secantusd-pg-v*` binaries. The
+embedded Python `RustServer` / `PgServer` handles are a SOURCE-BUILD tool for
+this repo's own tests and gauges -- never document them to users as something
+`pip install` provides. History: from 2026-10-07 the PyPI wheel carried only
+the Python servers, because bundling the Rust ones had pushed the project past
+PyPI's 10 GB quota; on 2026-10-20 PyPI publishing stopped altogether.
 
 The name was chosen to dodge brand-clash risk: an early prototype was called "fongo", a follow-on was called "fongodb", and the current name avoids both the existing "Fongo" brand and any confusion with MongoDB itself. Internal references to `fongo` or `fongodb` are stale — flag and rename to `secantus` (or `SecantusDB` for the brand form).
 
@@ -120,17 +138,13 @@ throughput / concurrency work to `crates/`.
   6.0-compatibility branches, and do not "fix" a difference that only appears
   on 6.0.
 
-  `tests/test_mongod_differential.py` is the gate: it runs every supported
-  operation against a real `mongod` and asserts an *exact* match. It gates on
-  the **major** (`PROBED_MONGOD_MAJOR`), so any 8.x runs it and only a different
-  major skips — a loud failure beats a silent skip. **The Linux CI lanes install
-  `mongodb-org-server` from the 8.2 apt repo, so the gate RUNS in CI** (it used
-  to skip everywhere but a dev box, which meant a green CI was no evidence at
-  all for an error-surface change). It needs no separate step: the suite's
-  `addopts` excludes `perf` / `online` / `slow` but not `differential`. Still
-  run it locally before changing an error message — CI is the backstop, not the
-  first thing you should hear it from. macOS and Windows have no server and
-  still skip.
+  `tests/test_mongod_differential.py` runs every supported operation against a
+  real `mongod` and asserts an *exact* match, and gates on the **major**
+  (`PROBED_MONGOD_MAJOR`). **It targets the PYTHON server** (its
+  `secantus_uri` fixture starts `SecantusDBServer`), so since 2026-10-20 it
+  does not run in CI and is no evidence about the Rust server. For the Rust
+  MongoDB server the evidence is a probe against `mongod` (the
+  `differential-probe` skill) and the sweeps under `tools/probes/`.
 
   **"Stable within a major" is a good default and not a guarantee** — two
   measured counterexamples, so probe rather than assume when a difference looks
@@ -286,7 +300,8 @@ one request path:
 #### Versioning: three independent version lines
 
 - **The Python package**: `pyproject.toml` `version` + `src/secantus/__init__.py`
-  `__version__` (`0.5.2bN`, PEP 440), set by `invoke release-prepare`.
+  `__version__` (PEP 440). Frozen at the last PyPI release: nothing publishes
+  it any more, so nothing bumps it.
 - **The Rust MongoDB server**: the `version` of the thirteen MongoDB-side
   `crates/*/Cargo.toml`, in **lockstep** (`0.MAJOR.PATCH-beta.N`). Bumping the
   patch (or minor/major) resets the beta label to 0 (`0.5.2-beta.20` →
@@ -299,9 +314,8 @@ Bump a Rust line with `./inv rust-version-bump --to <version> [--line pg]`,
 never a blanket substitution across `crates/`, which would fold the PG crates
 into the MongoDB line. Release mechanics: the `secantusdb-release` skill.
 
-**No version bumps in feature PRs — either server.** Both the Python and the Rust
-version are assigned at release time, so a feature PR touches neither `version`
-line. This is the whole point: an in-flight PR that bumped a version picked a
+**No version bumps in feature PRs.** The Rust versions are assigned at release
+time, so a feature PR touches no `version` line. This is the whole point: an in-flight PR that bumped a version picked a
 number that was stale by merge time, so any two concurrent PRs collided on that
 one line (Python) or on the thirteen `Cargo.toml` (Rust). Leaving both to the
 release makes concurrent feature PRs — Python-only, Rust-only, or dual-server —
@@ -320,14 +334,13 @@ engines + geo + aggregation, **no PyO3**), `secantus-storage` (the full WT-backe
 exactly what lets the Rust server / standalone `secantusd-rs` binary reuse the
 engines.
 
-- **Parity suites are a DRIFT detector, not a reference.** Each pure Rust
-  engine is pinned to its Python counterpart (`tests/test_rust_*_parity.py`).
-  A failure says the engines moved apart, never which is right: probe
-  `mongod`, and when the Rust change was correct, update the parity
-  EXPECTATION for that case; never change the Python engine to match. The
-  suites do not cover the storage layer. The transitional in-process engine
-  selection (`src/secantus/engine.py`) and the rest of this history are in the
-  `python-servers` skill.
+- **The parity suites (`tests/test_rust_*_parity.py`) no longer run in CI**
+  (2026-10-20). They pinned each pure Rust engine to its Python counterpart,
+  which was only ever a drift detector, and with the Python engine fully
+  deprecated there is nothing to drift from. A parity failure you meet
+  locally is not a bug report: the reference is `mongod`. The transitional
+  in-process engine selection (`src/secantus/engine.py`) and the rest of this
+  history are in the `python-servers` skill.
 
 ## Tooling
 
@@ -338,14 +351,17 @@ engines.
 - `pytest` with `pytest-xdist` parallel by default (`addopts = "-n auto"`).
   Tests must use `port=0` and a unique `storage_path` per test (`tmp_path`).
   The default suite runs real on-disk WiredTiger in **fast test-storage mode**
-  (`SECANTUS_TEST_FAST_STORAGE=1`: no close-time checkpoint), so **checkpoint
-  durability is NOT covered locally**; CI's `SECANTUS_FORCE_DURABLE=1` lane
-  covers it, and so does running that variable locally. Details:
-  `build-and-test`.
+  (`SECANTUS_TEST_FAST_STORAGE=1`: no close-time checkpoint). That mode and
+  `SECANTUS_FORCE_DURABLE=1` govern the PYTHON `Storage`; the CI lane that ran
+  the suite durable was a Python-server lane and is gone (2026-10-20). The
+  Rust servers' durability is covered by their own cargo and pytest tests.
+  Details: `build-and-test`.
 - **Never use a mock storage — always the real `Storage`.** The legacy `FakeStorage` mock (`tests/sqlfake.py`) has been **removed**: every SQL / PG-server test now drives the real WiredTiger-backed `Storage`, and no new mock should be reintroduced. A mock lets a test pass while diverging from what WiredTiger actually does (row/type round-trips, transactions, cross-session visibility, persistence) — the migration off it surfaced several real bugs the mock had masked (a swallowed tz-aware/naive datetime comparison, a `bytea` equality mismatch, a Describe/Execute uncommitted-DDL protocol crash, timestamptz text-render). Build a real `Storage(str(tmp_path))` (close it in the fixture teardown — `try: yield s finally: s.close()`), seed it via `run_sql` with an unrestricted `Session`, and drive the SQL/PG-server code against that. This is a database — tests prove behaviour against the real engine or they prove nothing.
 - **Driver-conformance gauges** -- thirteen MongoDB-driver gauges and three SQL
   ones run **unmodified** upstream test suites against SecantusDB (invocation,
-  toolchains and quirks: `/conformance-gauges`). **Keep `invoke validate-all
+  toolchains and quirks: `/conformance-gauges`). The weekly `validate.yml`
+  runs only the thirteen `*-rust-server` lanes; no SQL gauge runs weekly
+  against the Rust PostgreSQL server yet. **Keep `invoke validate-all
   --jobs` at 4 or fewer** (1 for a committable number): beyond that CPU
   contention flakes timing-sensitive tests. The C++ gauge binds port 27017.
 - **Run full gauges in a sub-agent**, not the main session, and use `invoke
@@ -368,8 +384,12 @@ engines.
   extra uncollects ~1,700 parity tests while still exiting 0 (`batch-worktree`).
 - To run a single test serially: `uv run python -m pytest -n0 tests/path::test_name`. The `-p no:xdist` form fails because `addopts` still injects `-n auto`.
 - Sphinx docs in `docs/` (Markdown via `myst-parser`, furo theme). Built with `-W` (warnings-as-errors). `invoke docs` to build, `invoke docs-serve` to preview.
-- PyPI publishing is OIDC-only via `.github/workflows/publish.yml` on `vX.Y.Z` tags. The workflow refuses to publish if the tag doesn't match `pyproject.toml`'s version. Never run `uv publish` / `twine upload` manually.
-- The on-disk repo path is `/Users/jdrumgoole/GIT/SecantusDB`. The **import package** is `secantus` (`src/secantus/`, `import secantus`); the **distribution / PyPI name** is `SecantusDB` (`pip install SecantusDB`, normalized by PyPI to `secantusdb`). These are deliberately different — `pip install secantus` is a 404. The release tooling uses the distribution name (`tasks.py` polls `pypi.org/pypi/SecantusDB/json`; `publish.yml`'s trusted-publisher environment binds `pypi.org/p/secantusdb`).
+- **Nothing publishes to PyPI** (2026-10-20). Never run `uv publish` /
+  `twine upload`, and do not push a `vX.Y.Z` tag: it no longer triggers
+  anything, and the tag ruleset protects it once pushed. The PyPI project
+  `SecantusDB` (trusted publisher bound to the deleted `publish.yml`) keeps
+  its existing releases.
+- The on-disk repo path is `/Users/jdrumgoole/GIT/SecantusDB`. The **import package** is `secantus` (`src/secantus/`, `import secantus`); the distribution name in `pyproject.toml` is `SecantusDB`.
 
 ## Releases and website
 
@@ -378,7 +398,10 @@ Both procedures are managed by skills — they auto-fire on the relevant trigger
 - **Release-time benchmark refresh**: `invoke release-benchmark`, after the
   version bump lands on `main`, so `docs/benchmark.md` measures the released
   build (`secantusdb-release`, `bench/DO_CLUSTER.md`).
-- **`secantusdb-release`** — the two-phase pipeline (`release-prepare` once in foreground, `release-finalize` in a foreground retry loop), the sub-agent contract, foreground-only constraints, the 8-step pipeline (pre-flight → pytest → perf gates → changelog collation → bump → tag/push → GitHub Release → PyPI workflow + listing), and the hard prohibitions against manual `git tag`/`uv publish`. Docs are **self-hosted at secantusdb.com/docs/** (main tree) and **/docs/rust/** (Rust server) — they deploy with the post-release website publish, not the release pipeline; the readthedocs.io copies are legacy, kept alive with a moved banner.
+- **`secantusdb-release`** — the Rust release tracks: a `secantusdb-v*` tag
+  (Rust MongoDB server binaries) or a `secantusd-pg-v*` tag (Rust PostgreSQL
+  server binaries), and the crates. The PyPI pipeline it used to describe
+  (`release-prepare` / `release-finalize`) is retired and the tasks refuse. Docs are **self-hosted at secantusdb.com/docs/** (main tree) and **/docs/rust/** (Rust server) — they deploy with the post-release website publish, not the release pipeline; the readthedocs.io copies are legacy, kept alive with a moved banner.
 - **A Rust server release ends at the live site, not at the GitHub Release**:
   bump the pinned tag in `website/pelicanconf.py`, re-read the server's page,
   write the blog post by hand, deploy. Steps: `secantusdb-release`.
@@ -421,9 +444,11 @@ citing the other engine, Python `==`/`hash()` for a BSON semantic, serde BSON
 decodes in the Rust servers, missing conflated with null). Cite the exact
 `mongod --version` you measured: a patch bump has changed an error message.
 
-The standing gate is `tests/test_mongod_differential.py` (`pytest -m
-differential`): a probe that finds something belongs there, or the next
-session re-finds it.
+A probe that finds something belongs in a test, or the next session re-finds
+it. For the Rust servers that is a regression test beside their own tests (or
+a `tests/backlog/` gap test while it is open), not
+`tests/test_mongod_differential.py`, which targets the deprecated Python
+server.
 
 **Parity is not correctness.** The parity suites pin the two engines to each
 other, so they are equally satisfied by both being wrong (`$bucket`,
@@ -524,7 +549,7 @@ The same arithmetic is why `invoke validate-all --jobs` stays at 4 or fewer
   (`git worktree add --detach ../SecantusDB-measure "$(git rev-parse
   origin/main)"`): parallel sessions move `main` mid-run. The `measuring`
   skill has the rest of what makes a number trustworthy.
-- **Land via branch push + PR, not `git push HEAD:main`.** Push the feature branch (`git push -u origin <branch>`) and open a PR (`gh pr create --base main`); let CI run on the PR, then merge when green. **Do not push straight to `main` from a session** — every session pushing the same ref (`refs/heads/main`) lands them in the same CI concurrency group, so a newer push cancels the older session's in-flight run (and forces constant rebases). One feature branch per session = one CI lane per session; distinct refs never cancel each other. After merge, tear the branch down — see the next bullet. (`test.yml` / `wheels.yml` / `rust-wheels.yml` are keyed `concurrency: ${{ github.workflow }}-${{ github.ref }}`, `cancel-in-progress: true` — per-ref, so the cancel only bites within a single branch, which is what you want.)
+- **Land via branch push + PR, not `git push HEAD:main`.** Push the feature branch (`git push -u origin <branch>`) and open a PR (`gh pr create --base main`); let CI run on the PR, then merge when green. **Do not push straight to `main` from a session** — every session pushing the same ref (`refs/heads/main`) lands them in the same CI concurrency group, so a newer push cancels the older session's in-flight run (and forces constant rebases). One feature branch per session = one CI lane per session; distinct refs never cancel each other. After merge, tear the branch down — see the next bullet. (`test.yml` is keyed `concurrency: ${{ github.workflow }}-${{ github.ref }}`, `cancel-in-progress: true` — per-ref, so the cancel only bites within a single branch, which is what you want.)
 - **Cleaning up is part of finishing the work.** Tear down the branch and
   worktree in the SAME session that merges (worktree before branch; `-D` only
   after `gh pr view <N> --json state` says `MERGED`), and never remove a
@@ -532,7 +557,7 @@ The same arithmetic is why `invoke validate-all --jobs` stays at 4 or fewer
   sequence and its traps: `batch-worktree`. Everything else a session leaves
   running: `session-cleanup`; closing a whole session: `close-session`;
   opening one: `start-session`.
-- **Record the changelog with a fragment, not by editing `docs/changelog.md`.** A feature PR adds one file `changelog.d/<short-slug>.md` holding a single entry (a `###` headline + prose lede + `#### Added` / `#### Fixed` / … sections, no version number or `##` header) — see `changelog.d/README.md`. **Do not edit `docs/changelog.md` directly in a feature PR** and **do not bump the Python `version`** (see the Versioning section): those two shared lines are what made every pair of concurrent PRs conflict. New fragment files never collide, so concurrent sessions stay independent. At release, `invoke changelog-collate` (run automatically by `release-prepare`) folds the fragments into `## [Unreleased]` and deletes them; the normal promote-to-a-dated-section step is unchanged.
+- **Record the changelog with a fragment, not by editing `docs/changelog.md`.** A feature PR adds one file `changelog.d/<short-slug>.md` holding a single entry (a `###` headline + prose lede + `#### Added` / `#### Fixed` / … sections, no version number or `##` header) — see `changelog.d/README.md`. **Do not edit `docs/changelog.md` directly in a feature PR** and **do not bump the Python `version`** (see the Versioning section): those two shared lines are what made every pair of concurrent PRs conflict. New fragment files never collide, so concurrent sessions stay independent. At release, `invoke changelog-collate` folds the fragments into `## [Unreleased]` and deletes them; the normal promote-to-a-dated-section step is unchanged.
 - New CRUD operators or aggregation stages should land with both a unit test (in `tests/test_query.py` / `tests/test_update.py` / `tests/test_aggregate.py` / `tests/test_expressions.py`) and a `pymongo`-driven integration test in `tests/test_crud.py`. The integration test is the conformance proof; the unit test pins the semantics.
 - Layer boundaries to defend: the wire layer never knows about commands; the command layer never knows about SQL; pure operator engines (`query`, `update`, `expressions`, `aggregate`, `projection`) take only docs in and out, no I/O.
 - Errors raised inside command handlers are caught by `dispatch` and turned into `{ok: 0, errmsg, code, codeName}`. Don't leak Python tracebacks to the wire.
