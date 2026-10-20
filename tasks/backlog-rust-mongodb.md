@@ -590,22 +590,24 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
         options are not applied.
       Backlog-ID: RM-216
       Verify: none -- the missing fields are mongod's internal accounting; the registry's own tests are backlog_fixed
-- [ ] **Ten commands mongod runs are 59 CommandNotFound here.**
+- [ ] **Nine commands mongod runs are 59 CommandNotFound here.**
       mongod 8.2.11 (one-member replica set) answers each with success or
       an error of its own:
       - data: `applyOps` (which `mongorestore --oplogReplay` needs);
       - diagnostics: `getDiagnosticData`, `dbCheck`, `validateDBMetadata`;
       - settings: `setUserWriteBlockMode`, `setQuerySettings` /
-        `removeQuerySettings`, `setClusterParameter` (mongod keeps the
-        values in `config.clusterParameters`), `autoCompact` (needs
-        background compaction, which RM-192 lacks);
+        `removeQuerySettings`, `autoCompact` (needs background compaction,
+        which RM-192 lacks);
       - `rotateCertificates` (TLS has landed; it would re-read the files).
 
       `filemd5` with `partialOk` is refused by name (115): its `md5state` is
-      mongod's own MD5 implementation's state. Seven of the original
+      mongod's own MD5 implementation's state. Eight of the original
       seventeen landed 2026-10-20 (`invalidateUserCache`, `replSetGetRBID`,
       `replSetFreeze`, `replSetMaintenance`, `dropConnections`,
-      `releaseMemory`, `filemd5`). Each left is its own slice, and some
+      `releaseMemory`, `filemd5`, `setClusterParameter`, whose
+      `defaultMaxTimeMS` limits reads; the other parameters govern sharding,
+      queryable encryption, search and serverless change streams, and are
+      kept and reported only). Each left is its own slice, and some
       (query settings, write blocking) are real features rather than
       replies.
       Backlog-ID: RM-219

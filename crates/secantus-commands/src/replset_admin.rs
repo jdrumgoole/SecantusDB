@@ -1,15 +1,13 @@
-//! The replica-set, lock, feature, cluster-parameter and plan-cache
+//! The replica-set, lock, feature and plan-cache
 //! commands a tool sends a one-member set: `replSetInitiate`,
-//! `appendOplogNote`, `replSetResizeOplog`, `lockInfo`, `features`,
-//! `getClusterParameter` and `planCacheClear`.
+//! `appendOplogNote`, `replSetResizeOplog`, `lockInfo`, `features` and
+//! `planCacheClear`. The cluster parameters are `cluster_params`.
 //!
 //! Every reply and message is what mongod 8.2.11 answered (2026-10-15), as
 //! a replica-set member and, for a server run without a set name, as a
 //! standalone. Each command says only what is true of this server:
 //!
 //! - `features` has no `js` block, because there is no script engine.
-//! - `getClusterParameter` reports mongod's fifteen cluster parameters at
-//!   their defaults; `setClusterParameter` is not a command here.
 //! - There is no plan cache here, so clearing it is true. Index filters are
 //!   `index_filters`.
 //! - `replSetResizeOplog` changes the oplog's cap, and `minRetentionHours`
@@ -476,124 +474,6 @@ pub fn features(doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
         });
     }
     Ok(doc! {"oidMachine": oid_machine(), "ok": 1.0})
-}
-
-/// mongod 8.2.11's fifteen cluster parameters, in its name order, each at
-/// its default: `setClusterParameter` is not a command here, so none can
-/// hold anything else (measured on a one-member replica set, 2026-10-20).
-fn cluster_parameters() -> Vec<Document> {
-    vec![
-        doc! {"_id": "addOrRemoveShardInProgress", "inProgress": false},
-        doc! {"_id": "changeStreamOptions", "preAndPostImages": {"expireAfterSeconds": "off"}},
-        doc! {"_id": "changeStreams", "expireAfterSeconds": 3600_i64},
-        doc! {"_id": "configServerReadPreferenceForCatalogQueries", "mustAlwaysUseNearest": false},
-        doc! {"_id": "ddlLockOptimisticRecoveryWaitTimeout", "timeInMs": 100_i64},
-        doc! {"_id": "defaultMaxTimeMS", "readOperations": 0_i64},
-        doc! {"_id": "fleAllowTotalTagOverheadToExceedBSONLimit", "shouldOverride": false},
-        doc! {
-            "_id": "fleCompactionOptions",
-            "maxCompactionSize": 268_435_456_i32,
-            "maxAnchorCompactionSize": 268_435_456_i32,
-            "maxESCEntriesPerCompactionDelete": 350_000_i32,
-        },
-        doc! {"_id": "fleDisableSubstringPreviewParameterLimits", "shouldOverride": false},
-        doc! {"_id": "internalQueryCutoffForSampleFromRandomCursor", "sampleCutoff": 0.05},
-        doc! {
-            "_id": "internalSearchOptions",
-            "oversubscriptionFactor": 1.064,
-            "batchSizeGrowthFactor": 1.5,
-        },
-        doc! {"_id": "internalVectorSearchStoredSource", "enabled": true},
-        doc! {"_id": "onlyTargetDataOwningShardsForMultiWrites", "enabled": false},
-        doc! {"_id": "pauseMigrationsDuringMultiUpdates", "enabled": false},
-        doc! {"_id": "shardedClusterCardinalityForDirectConns", "hasTwoOrMoreShards": false},
-    ]
-}
-
-/// The names `getClusterParameter` asks for: `"*"` for every one.
-fn requested_names(doc: &Document) -> Result<Option<Vec<String>>, CommandError> {
-    let wrong = |v: &Bson| {
-        CommandError::new(
-            14,
-            "TypeMismatch",
-            format!(
-                "BSON field 'getClusterParameter.getClusterParameter' is the wrong type '{}', \
-                 expected types '[string]'",
-                type_name(v)
-            ),
-        )
-    };
-    match doc.get("getClusterParameter") {
-        Some(Bson::String(s)) if s == "*" => Ok(None),
-        Some(Bson::String(s)) => Ok(Some(vec![s.clone()])),
-        Some(Bson::Array(names)) => {
-            if names.is_empty() {
-                return Err(CommandError::new(
-                    2,
-                    "BadValue",
-                    "Must supply at least one cluster server parameter name to \
-                     getClusterParameter",
-                ));
-            }
-            names
-                .iter()
-                .map(|n| match n {
-                    Bson::String(s) => Ok(s.clone()),
-                    other => Err(wrong(other)),
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map(Some)
-        }
-        Some(other) => Err(wrong(other)),
-        None => Err(wrong(&Bson::Null)),
-    }
-}
-
-/// `getClusterParameter`. Its argument is read before the database is: a
-/// wrong type is 14 from any database, and only then is a database other
-/// than `admin` refused.
-pub fn get_cluster_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let names = requested_names(doc)?;
-    if ctx.db_name != "admin" {
-        return Err(CommandError::new(
-            13,
-            "Unauthorized",
-            "getClusterParameter may only be run against the admin database.",
-        ));
-    }
-    let all = cluster_parameters();
-    let set_member = ctx.replica_set_name.is_some();
-    let stamp = |mut p: Document| {
-        // A set member stamps each parameter with the time it was last set;
-        // none has been, so it is the null timestamp. A standalone has no
-        // such time and leaves it out.
-        if set_member {
-            let id = p.remove("_id").unwrap_or(Bson::Null);
-            let mut out = doc! {"_id": id, "clusterParameterTime": Bson::Timestamp(bson::Timestamp { time: 0, increment: 0 })};
-            out.extend(p);
-            out
-        } else {
-            p
-        }
-    };
-    let chosen: Vec<Bson> = match names {
-        None => all.into_iter().map(|p| Bson::Document(stamp(p))).collect(),
-        Some(names) => {
-            let mut out = Vec::new();
-            for name in names {
-                let Some(p) = all.iter().find(|p| p.get_str("_id") == Ok(name.as_str())) else {
-                    return Err(CommandError::new(
-                        4,
-                        "NoSuchKey",
-                        format!("Unknown server parameter: {name}"),
-                    ));
-                };
-                out.push(Bson::Document(stamp(p.clone())));
-            }
-            out
-        }
-    };
-    Ok(doc! {"clusterParameters": chosen, "ok": 1.0})
 }
 
 /// The collection a plan-cache command names, checked as mongod checks it:

@@ -47,6 +47,7 @@ mod bulkwrite;
 mod capped_admin;
 pub mod changestream;
 pub mod cluster_admin;
+pub mod cluster_params;
 pub mod crud;
 pub mod cursors;
 mod dbhash;
@@ -682,7 +683,8 @@ fn lookup(name: &str) -> Option<Handler> {
         "replSetResizeOplog" => replset_admin::repl_set_resize_oplog,
         "lockInfo" => replset_admin::lock_info,
         "features" => replset_admin::features,
-        "getClusterParameter" => replset_admin::get_cluster_parameter,
+        "getClusterParameter" => cluster_params::get_cluster_parameter,
+        "setClusterParameter" => cluster_params::set_cluster_parameter,
         "invalidateUserCache" => misc_admin::invalidate_user_cache,
         "replSetGetRBID" => misc_admin::repl_set_get_rbid,
         "replSetFreeze" => misc_admin::repl_set_freeze,
@@ -1955,7 +1957,10 @@ fn abort_transaction(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
 /// it and then never checked — a `createIndexes` over 100,000 documents with
 /// `maxTimeMS: 1` answered `ok` where mongod answers code 50.
 fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Document {
-    let budget = max_time_ms_budget(doc);
+    let budget = match max_time_ms_budget(doc) {
+        0 => cluster_params::default_read_budget(doc, ctx),
+        b => b,
+    };
     let _deadline = deadline::arm((budget > 0).then_some(budget));
     // Expressions are parsed under the feature compatibility version.
     let _fcv = secantus_core::expressions::gate_fcv(
@@ -2763,6 +2768,8 @@ const NO_WRITE_CONCERN: &[&str] = &[
     "dbHash",
     "dbhash",
     "getDefaultRWConcern",
+    // Measured 2026-10-20.
+    "setClusterParameter",
 ];
 
 fn refuse_write_concern(doc: &Document, name: &str) -> Result<(), CommandError> {

@@ -777,6 +777,34 @@ pub fn trunc_to_i64(d: &Dec) -> Option<i64> {
     Some(acc * *sign as i64)
 }
 
+/// mongod's `safeNumberLong` of a Decimal128: rounded half to even and
+/// saturated at the int64 range, NaN as 0. `None` for a non-decimal.
+pub fn decimal_to_i64_saturating(b: &Bson) -> Option<i64> {
+    let saturate = |sign: i8| if sign < 0 { i64::MIN } else { i64::MAX };
+    Some(match from_bson(b)? {
+        Dec::Nan => 0,
+        Dec::Inf(sign) => saturate(sign),
+        d if d.is_zero() => 0,
+        d @ Dec::Fin { sign, .. } => round_to_exp(&d, 0, RoundMode::HalfEven)
+            .as_ref()
+            .and_then(trunc_to_i64)
+            .unwrap_or_else(|| saturate(sign)),
+    })
+}
+
+/// A Decimal128 that is a whole number in the int64 range, as that integer;
+/// `None` for anything else.
+pub fn decimal_to_i64_exact(b: &Bson) -> Option<i64> {
+    let d = from_bson(b)?;
+    if d.is_zero() {
+        return Some(0);
+    }
+    if !matches!(d, Dec::Fin { .. }) || !is_integral(&d) {
+        return None;
+    }
+    trunc_to_i64(&d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
