@@ -540,13 +540,30 @@ def _index_limit(client: Any) -> tuple:
     got: tuple = ("ok", None)
     for i in range(64):
         got = answer(lambda i=i: db.c.create_index(f"f{i}"))
-    return got if got[0] != "ok" else ("ok", len(db.c.index_information()))
+    single = got if got[0] != "ok" else ("ok", len(db.c.index_information()))
+    # An index that already exists is no new one, even on a full collection.
+    again = answer(lambda: db.c.create_index("f0"))
+    # A request that fills the collection itself fails as a whole, and one
+    # that creates the collection takes it back.
+    specs = [{"key": {f"g{i}": 1}, "name": f"g{i}"} for i in range(64)]
+    db.create_collection("d")
+    batch = answer(lambda: db.command("createIndexes", "d", indexes=specs))
+    new = answer(lambda: db.command("createIndexes", "e", indexes=specs))
+    return (
+        single,
+        again,
+        batch,
+        len(db.d.index_information()),
+        new,
+        "e" in db.list_collection_names(),
+    )
 
 
-@pytest.mark.backlog("RM-218")
+@pytest.mark.backlog_fixed("RM-218")
 def test_index_count_limit(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 allows 64 indexes on a collection, `_id_` included:
-    the 64th `createIndex` beside `_id_` fails with 67 CannotCreateIndex."""
+    the 64th `createIndex` beside `_id_` fails with 67 CannotCreateIndex,
+    and a request that would cross the limit builds none of its indexes."""
     assert _index_limit(rust_mongo) == _index_limit(mongod)
 
 

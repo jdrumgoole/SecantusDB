@@ -2356,11 +2356,38 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             undo_request(storage, &ctx.db_name, &coll, created_coll, &built_here)?;
             return Ok(e.into_reply());
         }
+        // A collection holds at most 64 indexes, `_id_` included. One that
+        // is already full refuses the spec before any build starts; one the
+        // request itself fills refuses it in the build, which names the build
+        // (measured 8.2.11, 2026-10-20 -- no limit was kept).
+        let too_many = || {
+            format!(
+                "add index fails, too many indexes for {}.{coll} key:{}",
+                ctx.db_name,
+                argtypes::render_stage_value(&Bson::Document(key.clone()))
+            )
+        };
+        // An index that already exists is no new index. Past
+        // `index_conflict`, one existing under this name is this index.
+        let exists = existing
+            .iter()
+            .any(|ix| ix.get_str("name") == Ok(name.as_str()));
+        // A collection this request created already holds `_id_`.
+        let held = existing.len();
+        if !exists && held >= MAX_INDEXES {
+            undo_request(storage, &ctx.db_name, &coll, created_coll, &built_here)?;
+            return Ok(CommandError::new(67, "CannotCreateIndex", too_many()).into_reply());
+        }
         // What only the index BUILD refuses: a spec this request already
-        // asked for, and options the index's own code cannot start from.
+        // asked for, options the index's own code cannot start from, and one
+        // index past the limit.
         let refused = request_conflict(&built_here, &spec)
             .map(|p| (BuildStep::Prepare, p))
-            .or_else(|| index_build_problem(&spec).map(|p| (BuildStep::Init, p)));
+            .or_else(|| index_build_problem(&spec).map(|p| (BuildStep::Init, p)))
+            .or_else(|| {
+                (!exists && held + built_here.len() >= MAX_INDEXES)
+                    .then(|| (BuildStep::Prepare, BuildProblem::Refused(67, too_many())))
+            });
         if let Some((step, problem)) = refused {
             let e = build_failure(
                 storage,
@@ -2712,6 +2739,9 @@ enum BuildStep {
 }
 
 /// Why an index build refused a spec.
+/// mongod's limit on a collection's indexes, `_id_` included.
+const MAX_INDEXES: usize = 64;
+
 enum BuildProblem {
     /// The request already asked for this index, by this name.
     Identical(String),

@@ -605,12 +605,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       is gone (43 CursorNotFound).
       Backlog-ID: RM-217
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_kill_sessions_by_pattern_kills_only_the_match,tests/backlog/test_rm_found_2026_10_20b.py::test_kill_all_sessions_closes_cursors
-- [ ] **The 64-index limit is not enforced.** mongod 8.2.11 allows 64
-      indexes on a collection, `_id_` included, and refuses the next with 67
-      CannotCreateIndex; this server created a 65th. No limit exists in
-      `secantus-commands` or `secantus-storage`.
-      Backlog-ID: RM-218
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_index_count_limit
 - [ ] **Seventeen commands mongod runs are 59 CommandNotFound here.**
       mongod 8.2.11 (one-member replica set) answers each with success or
       an error of its own:
