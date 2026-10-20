@@ -2371,7 +2371,7 @@ pub(crate) fn update_in(
                             new.insert("_id", id.clone());
                         }
                         (None, None) => {
-                            new.insert("_id", bson::oid::ObjectId::new());
+                            new.insert("_id", secantus_core::oid::new());
                         }
                         (Some(given), Some(id))
                             if !secantus_core::update::same_id_value(given, id) =>

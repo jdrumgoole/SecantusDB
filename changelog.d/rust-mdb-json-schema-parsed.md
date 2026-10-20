@@ -16,3 +16,10 @@ type (unless the schema declares that one type), a nested object as
   two children of one type and path by their own children. Fixes RM-196
   (tests/backlog/test_rm_planner_text.py::test_json_schema_is_parsed_as_mongod_parses_it).
 - The planner's tree text for `$where` (`$where` / `code: ...`).
+- `features` with `oidReset` replaces the ObjectId process value and
+  reports the old machine value beside the new one, as mongod 8.2.11 does;
+  the ObjectIds the server mints come from one generator that carries it
+  (`secantus_core::oid`; the storage crate's `_id` minting uses it too).
+  `features` has no `js` block, as a `mongod --noscripting` answers. RM-143
+  part (tests/backlog/test_rm_029_056.py::test_features_oid_reset,
+  ::test_features_reports_the_script_engine).

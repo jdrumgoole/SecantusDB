@@ -222,24 +222,24 @@ pub fn lock_info(doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
 }
 
 /// The `oidMachine` mongod reports: the first four bytes of the process's
-/// ObjectId value, read little-endian (an ObjectId mongod mints carries the
-/// same five bytes; measured 8.2.11).
+/// ObjectId value, read little-endian (an ObjectId the server mints carries
+/// the same five bytes; measured 8.2.11).
 fn oid_machine() -> i64 {
-    let bytes = bson::oid::ObjectId::new().bytes();
-    i64::from(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]))
+    i64::from(secantus_core::oid::machine())
 }
 
-/// `features`: no `js` block, since there is no script engine, and the
-/// ObjectId machine value. `oidReset` would mint a new process value, which
-/// the BSON library this server uses does not allow, so it is refused.
+/// `features`: no `js` block, as a `mongod --noscripting` answers (there is
+/// no script engine), and the ObjectId machine value. `oidReset` replaces
+/// the process value and reports the old one too (mongod 8.2.11).
 pub fn features(doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
     only_fields(doc, "features", &["oidReset"])?;
     if doc.get("oidReset").is_some_and(crate::util::truthy) {
-        return Err(CommandError::new(
-            2,
-            "BadValue",
-            "oidReset is not supported by this server",
-        ));
+        let (old, now) = secantus_core::oid::reset();
+        return Ok(doc! {
+            "oidMachineOld": i64::from(old),
+            "oidMachine": i64::from(now),
+            "ok": 1.0,
+        });
     }
     Ok(doc! {"oidMachine": oid_machine(), "ok": 1.0})
 }
@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     fn oid_machine_is_the_process_value() {
-        let bytes = bson::oid::ObjectId::new().bytes();
+        let bytes = secantus_core::oid::new().bytes();
         let want = i64::from(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]));
         assert_eq!(oid_machine(), want);
     }

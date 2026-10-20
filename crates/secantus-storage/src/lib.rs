@@ -9533,7 +9533,7 @@ impl Storage {
             let mut doc = decode_doc(doc_bytes)?;
             let assigned_id = !doc.contains_key("_id");
             if assigned_id {
-                doc.insert("_id", Bson::ObjectId(ObjectId::new()));
+                doc.insert("_id", Bson::ObjectId(secantus_core::oid::new()));
             }
             let id = doc.get("_id").expect("_id present").clone();
             let mut key = id_key(&id)?;
@@ -9722,7 +9722,7 @@ impl Storage {
                     let mut doc = decode_doc(doc_bytes)?;
                     let assigned_id = !doc.contains_key("_id");
                     if assigned_id {
-                        doc.insert("_id", Bson::ObjectId(ObjectId::new()));
+                        doc.insert("_id", Bson::ObjectId(secantus_core::oid::new()));
                     }
                     // A profile entry is stored as written, with no `_id`:
                     // mongod's `system.profile` has no `_id` index. The id
@@ -17334,7 +17334,7 @@ impl Storage {
                     let seeded: Vec<String> = seed.keys().cloned().collect();
                     let mut new = transform(&seed, true)?;
                     if !new.contains_key("_id") {
-                        new.insert("_id", Bson::ObjectId(ObjectId::new()));
+                        new.insert("_id", Bson::ObjectId(secantus_core::oid::new()));
                     }
                     // An `_id` mongod cannot hold. Measured 8.2.11, 2026-10-10:
                     // an array is 53 from an operator update and 54 from a

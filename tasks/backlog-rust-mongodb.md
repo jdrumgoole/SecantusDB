@@ -830,17 +830,19 @@ Still different:
       Backlog-ID: RM-185
       Verify: tests/backlog/test_rm_185_locks.py::test_lock_counts_of_merge_fail_with_duplicates
 - [ ] **Commands answered only as far as this server honours them.**
-      `features` has no `js` block (there is no script engine) and refuses
-      `oidReset`; `getClusterParameter` has six of mongod's fifteen
-      parameters, the ones whose default is a fact here (no shards, no
-      default `maxTimeMS`, pre-images that go with the oplog), and answers 4
-      for the rest; `planCacheSetFilter` is not a command, because no filter
-      would be applied; `replSetResizeOplog` refuses a `minRetentionHours`
-      above 0, because this oplog drops an entry older than its retention
-      window whatever its size; `replSetReconfig` is not a command. Each
-      is a feature to build, not a reply to change.
+      `getClusterParameter` has six of mongod's fifteen parameters, the ones
+      whose default is a fact here (no shards, no default `maxTimeMS`,
+      pre-images that go with the oplog), and answers 4 for the rest;
+      `planCacheSetFilter` is not a command, because no filter would be
+      applied; `replSetResizeOplog` refuses a `minRetentionHours` above 0,
+      because this oplog drops an entry older than its retention window
+      whatever its size (honouring it means a floor in the shared storage
+      crate's oplog prune); `replSetReconfig` is not a command. Each is a
+      feature to build, not a reply to change. (`features` has no `js`
+      block, as a `mongod --noscripting` answers, and `oidReset` replaces
+      the ObjectId process value since 2026-10-20.)
       Backlog-ID: RM-143
-      Verify: tests/backlog/test_rm_029_056.py::test_features_reports_the_script_engine,tests/backlog/test_rm_029_056.py::test_features_oid_reset,tests/backlog/test_rm_029_056.py::test_plan_cache_set_filter,tests/backlog/test_rm_029_056.py::test_resize_oplog_min_retention_hours,tests/backlog/test_rm_029_056.py::test_every_cluster_parameter
+      Verify: tests/backlog/test_rm_029_056.py::test_plan_cache_set_filter,tests/backlog/test_rm_029_056.py::test_resize_oplog_min_retention_hours,tests/backlog/test_rm_029_056.py::test_every_cluster_parameter
 - **Scope decision — `buildInfo.secantusVersion` and `serverStatus.secantus`
   stay** (Joe, 2026-10-15). Each names this build beside mongod's own
   fields. They are additive, documented (`CLAUDE.md`, `docs/compatibility.md`,
