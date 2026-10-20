@@ -880,26 +880,13 @@ and the unit tests of `auth.rs` and `roles.rs`. The built-in roles and the
 
 What is open:
 
-- [ ] **The order of a set of roles** (5): a user's `roles` after
-      `grantRolesToUser`, a role's `roles` after `grantRolesToRole`, and
-      the built-in roles under `showBuiltinRoles`. mongod keeps each in a
-      hash set, and the order differs between two databases of one
-      process. This server keeps the order they were given in.
-      Backlog-ID: RM-030
-      Verify: none -- mongod's order is a hash set's: three different orders for one grant in one process, so no answer to assert
-- [ ] **A user record written before this change has no `userId`**, and
-      `usersInfo` lists none for it. Nothing rewrites the record. Such a
-      store otherwise reads and authenticates: users and a role created by
-      the released 0.5.3-beta.192 binary were read, and logged in over
-      both SCRAM mechanisms, by this build (2026-10-14).
-      Backlog-ID: RM-031
-      Verify: none -- needs a store written by an older release (0.5.3-beta.192); mongod has no such state to compare
-- [ ] **PYTHON server parity.** The user record's field order changed
-      (`userId` added, `customData` and `authenticationRestrictions`
-      stored, `credentials: {external: true}` for a `$external` user).
-      The Python server reading such a store was not measured.
-      Backlog-ID: RM-032
-      Verify: none -- parity with the deprecated Python server, not with mongod
+- **Scope decision — the order of a set of roles** (this was RM-030,
+  2026-10-20). A user's `roles` after `grantRolesToUser`, a role's `roles`
+  after `grantRolesToRole`, and the built-in roles under
+  `showBuiltinRoles`: mongod keeps each in a hash set, and gave three
+  different orders for one grant in one process, so no fixed order is
+  mongod's. This server keeps the order they were given in, as with the
+  order of `distinct` on a view.
 
 ### 7.082 Handshake, diagnostic and session commands -- 2026-10-13
 

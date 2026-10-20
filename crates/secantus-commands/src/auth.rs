@@ -1204,6 +1204,44 @@ const USERS_INFO_FIELDS: &[(&str, Field, bool)] = &[
     ("filter", Field::Obj, false),
 ];
 
+/// Give every stored user that has no `userId` one, where mongod keeps it
+/// (after `_id`). A store written before users carried one (RM-031) lists
+/// none in `usersInfo` until then; mongod mints the id when it creates the
+/// user, so it is minted once here and kept. Called as the server starts.
+pub fn backfill_user_ids(
+    storage: &dyn crate::storage::Storage,
+) -> Result<usize, crate::storage::StorageError> {
+    let mut minted = 0;
+    for bytes in storage.list_users(None, 0, usize::MAX)? {
+        let Ok(record) = secantus_core::bsondoc::from_bytes(&bytes) else {
+            continue;
+        };
+        if record.contains_key("userId") {
+            continue;
+        }
+        let (Ok(db), Ok(user)) = (record.get_str("db"), record.get_str("user")) else {
+            continue;
+        };
+        let mut with_id = Document::new();
+        for (k, v) in &record {
+            with_id.insert(k.clone(), v.clone());
+            if k == "_id" {
+                with_id.insert("userId", new_user_id());
+            }
+        }
+        if !with_id.contains_key("userId") {
+            with_id.insert("userId", new_user_id());
+        }
+        let mut out = Vec::new();
+        if with_id.to_writer(&mut out).is_err() {
+            continue;
+        }
+        storage.add_user(db, user, &out, true)?;
+        minted += 1;
+    }
+    Ok(minted)
+}
+
 /// `usersInfo` (8.2.11). Without privilege details it is a query: the
 /// users asked for, filtered by `filter`, sorted by user then database,
 /// each in its stored field order with `mechanisms` last. With
