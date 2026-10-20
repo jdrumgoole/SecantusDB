@@ -691,6 +691,26 @@ fn oplog_entry_is_user_write(e: &OplogEntry) -> bool {
     !matches!(db, "" | "admin" | "config" | "local")
 }
 
+/// The `o` of an update's oplog entry: `{$v: 2, diff, md}`. `diff` is the
+/// change-stream description change streams and replay read; `md` is
+/// mongod's own `$v: 2` diff of the same update, which `local.oplog.rs`
+/// shows in `diff`'s place (RM-224). A pipeline update's is mongod's
+/// document comparison; an operator update's is read back from the
+/// description over the pre-image.
+fn update_oplog_o(desc: Document, pre: &Document, post: &Document, pipeline: bool) -> Document {
+    let md = if pipeline {
+        secantus_core::diff::pipeline_oplog_diff(pre, post)
+    } else {
+        None
+    }
+    .unwrap_or_else(|| secantus_core::diff::oplog_diff(&desc, pre));
+    let mut o = Document::new();
+    o.insert("$v", 2i32);
+    o.insert("diff", Bson::Document(desc));
+    o.insert("md", Bson::Document(md));
+    o
+}
+
 /// An entry as mongod 8.2.11 writes it, where the stored form differs in a
 /// way the entry alone settles (RM-224): a delete has no `o2`; a rename says
 /// `stayTemp: false`; a one-index `createIndexes` is that index's spec; a
@@ -698,6 +718,13 @@ fn oplog_entry_is_user_write(e: &OplogEntry) -> bool {
 /// stored form stays, as change streams and replay read it.
 fn oplog_view_shape(entry: &Document) -> Option<Document> {
     let op = entry.get_str("op").ok()?;
+    if op == "u" {
+        let o = entry.get_document("o").ok()?;
+        let md = o.get_document("md").ok()?;
+        let mut out = entry.clone();
+        out.insert("o", bson::doc! {"$v": 2, "diff": md.clone()});
+        return Some(out);
+    }
     if op == "d" && entry.contains_key("o2") {
         let mut out = entry.clone();
         out.remove("o2");
@@ -17962,9 +17989,7 @@ impl Storage {
                 let o_bytes: &[u8] = match delta {
                     None => &new_blob,
                     Some(diff) => {
-                        let mut o = Document::new();
-                        o.insert("$v", 2i32);
-                        o.insert("diff", Bson::Document(diff));
+                        let o = update_oplog_o(diff, &doc, &new, update_spec.is_none());
                         o_owned = encode_doc(&o)?;
                         &o_owned
                     }
@@ -18137,9 +18162,7 @@ impl Storage {
                             let o_bytes: &[u8] = match delta {
                                 None => &new_blob,
                                 Some(diff) => {
-                                    let mut o = Document::new();
-                                    o.insert("$v", 2i32);
-                                    o.insert("diff", Bson::Document(diff));
+                                    let o = update_oplog_o(diff, &doc, &new, update_spec.is_none());
                                     o_owned = encode_doc(&o)?;
                                     &o_owned
                                 }

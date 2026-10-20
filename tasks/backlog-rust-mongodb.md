@@ -632,31 +632,11 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Backlog-ID: RM-222
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_insert_string_with_invalid_utf8
 - [ ] **`local.oplog.rs` entries are not mongod's shape.** Since
-      2026-10-20 a delete, a drop (`o2: {numRecords}`), a rename
-      (`stayTemp`), a one-index `createIndexes` and a `dropIndexes` read as
-      mongod 8.2.11 writes them (the view reshapes the stored entry; the
-      count is written at the drop). Open:
-      - an update is the change-stream description it serves
-        (`{updatedFields, removedFields, truncatedArrays}`, dotted paths)
-        where mongod logs its `$v: 2` diff (`u` / `i` / `s<field>`, arrays
-        as `{a: true, u<i>}`), which mongod derives from the operators it
-        applied (a `$pop` is the whole array under `u`). It cannot be
-        rebuilt from the stored description, which says neither which fields
-        are new nor which path parts are array indexes: the fix writes
-        mongod's diff at write time and derives the change stream's
-        description from it, as mongod does. Measured rules (8.2.11, 40 operator
-        updates): each modified path is logged where the operator targets
-        it, `s<field>` stepping into a document or (with `a: true`) an
-        array, then `u` if the field existed, `i` if new, `d` if removed; a
-        missing parent is one `i` of the built sub-document; an unchanged
-        value logs nothing; `$push` / `$addToSet` appending log `u<i>` per
-        new element; `$pop`, `$pull`, `$pullAll`, `$push` with `$position`,
-        `$[]` and a whole-field `$set` log `u` of the whole array; `$rename`
-        is `d` plus `i`; sections come in the order `d`, `u`, `i`, then the
-        sub-diffs. A pre/post comparison gets several of these wrong (it
-        would log `$pop` as `l`, a whole-array `$set` as `u<i>`), so the
-        update engine has to log what each operator touched, as mongod's
-        v2 log builder does;
+      2026-10-20 an update (mongod's `$v: 2` diff, stored beside the
+      change-stream description as `o.md`), a delete, a drop
+      (`o2: {numRecords}`), a rename (`stayTemp`), a one-index
+      `createIndexes` and a `dropIndexes` read as mongod 8.2.11 writes them.
+      Open:
       - a batch of inserts is one entry per document, where mongod groups
         them into one `applyOps` entry with `stmtId`s;
       - an index build over documents is one `createIndexes`, where mongod
