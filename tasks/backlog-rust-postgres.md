@@ -670,6 +670,196 @@ one beside it.
       Backlog-ID: RP-019
       Verify: none -- predicate pushdown/index use only; answers identical, EXPLAIN costs are a scope decision
 
+## Found by the 2026-10-20 audit
+
+A review of the PG crates, each finding reproduced against a `secantusd-pg`
+built from tree `83e845e5`. The gap tests are in
+`tests/backlog/test_rp_found_2026_10_20.py`. Their expected answers are
+literals measured on a PRIVATE PostgreSQL 15.19 cluster (`initdb --locale=C
+-E UTF8`), because most scenarios create databases, roles or committed
+tables, which the shared reference must not be given. Each literal was
+re-proved on a fresh cluster before filing.
+
+Not filed:
+- `vacuumdb` exits 0 now, although the audit named it.
+- The EXPLAIN ANALYZE option and replication-login findings are scope
+  questions.
+- The slow 1M-row block cursor needs a release-build measurement first.
+
+- [ ] **`infinity` / `-infinity` dates and timestamps are stored as strings,
+      and comparisons drop rows.** `secantus-pg` writes them as
+      `Bson::String("infinity")` beside BSON dates. Rows `infinity`,
+      `2021-01-01` and `-infinity` give the following:
+      - `where t > '2020-01-01'` returns {2} where PostgreSQL 15.19
+        returns {1, 2}.
+      - With an index on `t`, `t between '-infinity' and 'infinity'`
+        returns {1, 3} and drops the FINITE row; PostgreSQL returns all
+        three.
+      - `t + interval '1 day'` and `d + 1` are 42883 on an infinite
+        value; PostgreSQL answers `infinity` / `-infinity`.
+
+      A silent wrong answer. PostgreSQL stores them as the extreme values
+      of the type (`DT_NOBEGIN` / `DT_NOEND`), which sort below and above
+      every finite value.
+      Backlog-ID: RP-060
+      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_infinite_timestamps
+- [ ] **SERIALIZABLE is snapshot isolation: write skew commits.** Two
+      SERIALIZABLE transactions each read both on-call rows and set their
+      own to false; both commit here, leaving nobody on call. PostgreSQL
+      15.19 fails one with 40001. `secantus-pg` treats SERIALIZABLE as
+      REPEATABLE READ. PostgreSQL's mechanism is SSI: predicate (SIREAD)
+      locks and rw-conflict tracking. The REPEATABLE READ scope decision
+      above is a different question.
+      Backlog-ID: RP-061
+      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_serializable_write_skew
+- [ ] **Recursive CTE `SEARCH` and `CYCLE` clauses are parsed and
+      dropped.** `secantus-pgplan` never reads the parse tree's
+      `search_clause` or `cycle_clause`:
+      - `SEARCH DEPTH FIRST BY n SET ord` leaves no `ord` column (42703
+        when selected).
+      - `CYCLE n SET is_cycle USING path` does not stop the recursion; it
+        runs until `statement_timeout` (57014) or the row cap, where
+        PostgreSQL 15.19 returns 3 rows.
+
+      Until they are implemented, both must be refused by name (0A000)
+      rather than ignored.
+      Backlog-ID: RP-062
+      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_recursive_search_and_cycle
+- [ ] **A recursive CTE is run to completion before anything above it.**
+      `with recursive t(n) as (select 1 union all select n + 1 from t)
+      select n from t limit 3` never returns here (57014 at a 5 s timeout);
+      PostgreSQL 15.19 answers at once, because a CTE scan pulls only the
+      rows asked for. Related, and not covered by the test:
+      - `RECURSIVE_CTE_ROW_LIMIT` (1,000,000) is an invented 54000 that
+        PostgreSQL does not have.
+      - `UNION` deduplication is a quadratic `Vec::contains`: a
+        20,000-step UNION recursion took 10.6 s against PostgreSQL's
+        0.04 s (debug build).
+      Backlog-ID: RP-063
+      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_recursive_cte_under_limit
+- [ ] **`CREATE DATABASE` drops every option.**
+      `Statement::CreateDatabase { name }` keeps only the name:
+      - `TEMPLATE tsrc` gives an EMPTY database (its table is 42P01).
+        Cloning a template is a common way to isolate tests.
+      - `ENCODING 'LATIN1'` is recorded as UTF8.
+      - `CONNECTION LIMIT 3` as -1, and OWNER is dropped.
+
+      `ALTER DATABASE` is refused outright.
+      Backlog-ID: RP-064
+      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_create_database_options
+- [ ] **Temporary tables ignore `ON COMMIT`.** A row in an `ON COMMIT
+      DELETE ROWS` table is still there after COMMIT (count 1; PostgreSQL
+      15.19: 0), and an `ON COMMIT DROP` table outlives its transaction.
+      `oncommit` is read nowhere in the PG crates.
+      Backlog-ID: RP-065
+      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_temp_table_on_commit
+- [ ] **float8 overflow and underflow return Infinity or 0.**
+      PostgreSQL 15.19 raises 22003 for:
+      - `'1e308'::float8 * 10` and `+`;
+      - `col * 10` over a stored 1e308;
+      - `'1e-300'::float8 * '1e-300'::float8`;
+      - `1e400::numeric::float8` and `1e-400::numeric::float8`.
+
+      Every one succeeds here. `sum()` already raises 22003; the scalar
+      operators and the cast lack PostgreSQL's `float_overflow_error` /
+      `float_underflow_error` checks.
+      Backlog-ID: RP-066
+      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_float8_out_of_range
+- [ ] **`ALTER DEFAULT PRIVILEGES` does nothing, and a role's `CONNECTION
+      LIMIT` is not enforced.** `secantus-pgplan` accepts the statement
+      as a no-op ("single-user test server"), but GRANT and row-level
+      security are enforced now, so a table created afterwards lacks the
+      grant: `has_table_privilege` is false where PostgreSQL 15.19 says
+      true. The connection limit is stored and never checked: a role with
+      `CONNECTION LIMIT 0` logs in, where PostgreSQL refuses (53300).
+      Both are permission answers that are silently wrong.
+      Backlog-ID: RP-067
+      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_default_privileges_and_connection_limit
+- [ ] **Output settings are accepted and ignored.** PostgreSQL 15.19 and
+      this server answer differently:
+
+      | setting | PostgreSQL 15.19 | here |
+      | --- | --- | --- |
+      | `IntervalStyle = iso_8601` | `P1DT2H` | `1 day 02:00:00` |
+      | `bytea_output = escape` | `A\377` | `\x41ff` |
+      | `extra_float_digits = 0` | `0.3` | `0.30000000000000004` |
+      | `application_name` in `pg_stat_activity` | the set name | empty |
+      Backlog-ID: RP-068
+      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_output_settings
+- [ ] **System columns are missing.** `ctid`, `xmin`, `xmax`, `cmin` and
+      `cmax` are 42703 (`tableoid` works). That breaks EF Core / Npgsql's
+      `xmin` concurrency token, the `delete ... where ctid = ...`
+      de-duplication idiom, and catalog queries that read them. `xmin`
+      has a model to build on (`xids.rs`).
+      Backlog-ID: RP-069
+      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_system_columns
+- [ ] **127 of PostgreSQL 15's 203 `pg_catalog` / `information_schema`
+      tables and views cannot be queried** (42P01). The full list is
+      `tests/backlog/rp070_catalog_relations.txt`, generated from PostgreSQL
+      15.19's `pg_class`. Missing examples:
+      - `information_schema.schemata`, `routines`, `check_constraints`,
+        `referential_constraints`, `triggers`, `parameters`;
+      - `pg_stat_user_tables` and the rest of `pg_stat_*` / `pg_statio_*`;
+      - `pg_stats` / `pg_statistic` (ANALYZE models statistics);
+      - `pg_aggregate`, `pg_default_acl`, `pg_shseclabel`,
+        `pg_db_role_setting`.
+
+      This is why the client tools in RP-071 fail.
+      Backlog-ID: RP-070
+      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_catalog_relations_are_queryable
+- [ ] **PostgreSQL's own client tools fail.** With the PostgreSQL 15 binaries,
+      each of these exits 0 against PostgreSQL 15.19 and non-zero here:
+      - `pg_dump --schema-only` stops at `pg_is_in_recovery()` (0A000);
+      - `pg_dumpall --globals-only` stops on `pg_shseclabel`;
+      - `pgbench -i` stops at `COPY ... FREEZE` (0A000);
+      - psql's `\l+`, `\dd`, `\dc`, `\dL`, `\dy` and `\db`.
+
+      Also unsupported: `pg_current_wal_lsn`, `pg_postmaster_start_time`,
+      `pg_relation_filepath`, `pg_tablespace_location`. The test needs
+      the PostgreSQL 15 tools (`SECANTUS_PG15_BIN`, or Homebrew's
+      `postgresql@15`).
+      Backlog-ID: RP-071
+      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_client_tools
+- [ ] **Statements still refused with 0A000** (`... is not supported yet`),
+      each of which PostgreSQL 15.19 runs:
+      - `ALTER SYSTEM` (set and reset), `ALTER ROLE ... SET`;
+      - `REASSIGN OWNED`, `DROP OWNED`;
+      - `ALTER TYPE ... ADD ATTRIBUTE`, `CREATE TEXT SEARCH CONFIGURATION`;
+      - `ALTER TABLE ... SET LOGGED / UNLOGGED / (fillfactor) / STORAGE /
+        STATISTICS`;
+      - `WHERE CURRENT OF`.
+
+      Several appear in `pg_dump` output. Not checked by the test:
+      `ALTER EXTENSION`, `ALTER OPERATOR`, `ALTER COLLATION`, `CREATE
+      CONVERSION / ACCESS METHOD / OPERATOR CLASS / OPERATOR FAMILY /
+      TRANSFORM / LANGUAGE`, `CREATE TEXT SEARCH DICTIONARY`, and
+      subscriptions. CLAUDE.md's old claim that "no statement the earlier
+      surveys listed" is refused no longer held.
+      Backlog-ID: RP-072
+      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_statements_not_refused
+- [ ] **COPY refuses `FORCE_QUOTE`, `FORCE_NOT_NULL`, `FORCE_NULL` and
+      `FREEZE`** (0A000, `secantus-pgplan`). PostgreSQL 15.19 takes all
+      four, and `pgbench -i` uses `FREEZE`.
+      Backlog-ID: RP-073
+      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_copy_options
+- [ ] **Smaller wrong answers.**
+      - Named arguments to a built-in fail: `make_interval(days => 1)` is
+        42883.
+      - Result column names: an inet `>>` is named `__net_op`, an internal
+        name leaking, where PostgreSQL says `?column?`; a `CASE` is
+        `?column?` where it says `case`; `xmlagg` is named `string_agg`.
+      - `pg_column_size` answers 4, 6, 8, 4 for text, a row, an int array
+        and a numeric, where PostgreSQL 15.19 answers 7, 32, 36, 10.
+      - `REFRESH MATERIALIZED VIEW CONCURRENTLY` on a view with no unique
+        index is accepted; PostgreSQL refuses it (55000).
+
+      Not in the test:
+      - the 63-byte identifier-truncation NOTICE is missing;
+      - an unavailable extension's error DETAIL cites a `/postgresql/16/`
+        path on a server that reports 15.0.
+      Backlog-ID: RP-074
+      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_smaller_answers
+
 ## Code structure (2026-10-19)
 
 - [ ] **Rust PG server: `PgHandler` holds every piece of session state in
