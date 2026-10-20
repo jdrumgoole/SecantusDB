@@ -230,7 +230,11 @@ def _ddl_entries(client: Any) -> list:
     db.d.drop()
     entries = [
         {k: e[k] for k in ("op", "ns", "o", "o2") if k in e}
-        for e in client.local["oplog.rs"].find({"ts": {"$gt": start}, "op": {"$ne": "n"}})
+        # mongod writes entries of its own (config collections it creates
+        # lazily), so only this test's namespace is read.
+        for e in client.local["oplog.rs"].find(
+            {"ts": {"$gt": start}, "ns": {"$regex": "^rm224\\."}}
+        )
     ]
     client.drop_database("rm224")
     return entries
