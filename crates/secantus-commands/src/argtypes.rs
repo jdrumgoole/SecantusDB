@@ -1538,6 +1538,11 @@ const OBJECT_ARG: &[(&str, i32, &str)] = &[
         "$setField only supports an object as its argument",
     ),
     (
+        "$unsetField",
+        4161100,
+        "$unsetField only supports an object as its argument",
+    ),
+    (
         "$sortArray",
         2942500,
         "$sortArray requires an object as an argument, found: {}",
@@ -1981,6 +1986,7 @@ const SINGLE_ARG_CONVERSIONS: &[&str] = &[
     "$toLong",
     "$toObjectId",
     "$toString",
+    "$toUUID",
 ];
 
 /// The date extractors, which take a bare expression OR a one-element array.
@@ -2076,6 +2082,7 @@ const UNKNOWN_ARGUMENT: &[(&str, i32, bool, &[&str])] = &[
         &["input", "find", "replacement"],
     ),
     ("$setField", 4161101, false, &["field", "input", "value"]),
+    ("$unsetField", 4161101, false, &["field", "input"]),
     ("$sortArray", 2942501, false, &["input", "sortBy"]),
     ("$switch", 40067, false, &["branches", "default"]),
     (

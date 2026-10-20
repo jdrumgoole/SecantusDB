@@ -210,7 +210,7 @@ def _date_arithmetic(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-212")
+@pytest.mark.backlog_fixed("RM-212")
 def test_date_arithmetic(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 computes `$add` / `$subtract` with a Date (a date
     minus a number or a date, a date plus numbers, `$add: []` is 0) in
@@ -241,11 +241,64 @@ EXPRESSION_CASES = {
 }
 
 
+def _convert(**spec: Any) -> dict:
+    return {"$convert": spec}
+
+
+UUID = "123e4567-e89b-12d3-a456-426614174000"
+
+# Measured against mongod 8.2.11 on 2026-10-20 while fixing RM-213: each
+# format both ways, the subtype rules, `byteOrder`, and the refusals.
+MORE_EXPRESSION_CASES = {
+    "binData to string, hex": _convert(input="$b", to="string", format="hex"),
+    "binData to string, utf8": _convert(input="$b", to="string", format="utf8"),
+    "binData to string, base64url": _convert(
+        input={"$literal": Binary(b"\xfb\xff", 0)}, to="string", format="base64url"
+    ),
+    "binData to string, no format": _convert(input="$b", to="string"),
+    "binData to string, bad utf8": _convert(
+        input={"$literal": Binary(b"\xff", 0)}, to="string", format="utf8"
+    ),
+    "$toString of a UUID": {"$toString": {"$toUUID": UUID}},
+    "string to binData, hex": _convert(input="6869", to="binData", format="hex"),
+    "string to binData, odd hex": _convert(input="686", to="binData", format="hex"),
+    "string to binData, base64url": _convert(input="aGk", to="binData", format="base64url"),
+    "string to binData, no format": _convert(input="aGk=", to="binData"),
+    "string to binData, uuid at subtype 0": _convert(input=UUID, to="binData", format="uuid"),
+    "bad base64, onError": _convert(input="!!", to="binData", format="base64", onError="E"),
+    "bad subtype": _convert(input="aGk=", to={"type": "binData", "subtype": 300}, format="base64"),
+    "int to binData, big-endian": _convert(input=258, to="binData", byteOrder="big"),
+    "binData to int, signed": _convert(input={"$literal": Binary(b"\xff", 0)}, to="int"),
+    "binData between subtypes": _convert(input={"$literal": Binary(b"hi", 5)}, to="binData"),
+    "bad byteOrder": _convert(input=1, to="binData", byteOrder="Big"),
+    "$toUUID of a bad string": {"$toUUID": "nope"},
+    "$unsetField on a string": {"$unsetField": {"field": "x", "input": "abc"}},
+    "$unsetField with a computed field": {
+        "$unsetField": {"field": {"$concat": ["x"]}, "input": {"x": 1}}
+    },
+    "a dotted key in an object literal": {"$concatArrays": [[{"a.b": 1}]]},
+    "$substrBytes, string index": {"$substrBytes": ["abc", "x", 1]},
+    "$substrBytes, negative start": {"$substrBytes": ["abc", -1, 1]},
+    "$substrBytes, mid-character": {"$substrBytes": ["éa", 0, 1]},
+    "$zip over a string input": {"$zip": {"inputs": ["$o", [1]]}},
+    "$zip with non-list inputs": {"$zip": {"inputs": "$arr"}},
+    "$filter over an object": {"$filter": {"input": "$o", "cond": True}},
+    "$map as an invalid name": {"$map": {"input": [1], "as": "X", "in": 1}},
+    "$let with a dotted name": {"$let": {"vars": {"a.b": 1}, "in": 1}},
+    "$arrayToObject, a short pair": {"$arrayToObject": [[["a"]]]},
+    "$arrayToObject, no v": {"$arrayToObject": [[{"k": "a"}]]},
+    "$slice with a string position": {"$slice": ["$arr", "x", 1]},
+    "$dateToString, a numeric format": {
+        "$dateToString": {"date": Timestamp(1700000000, 1), "format": 1}
+    },
+}
+
+
 def _expressions(client: Any) -> dict:
     db = _db(client, "rm213")
     db.c.insert_one({"_id": 0, "arr": [1, 2, 3], "o": {"x": 1, "y": 2}, "b": Binary(b"hi", 0)})
     out = {}
-    for name, e in EXPRESSION_CASES.items():
+    for name, e in {**EXPRESSION_CASES, **MORE_EXPRESSION_CASES}.items():
         got = answer(lambda e=e: list(db.c.aggregate([{"$project": {"_id": 0, "v": e}}])))
         # An error is compared by code; a value by the document it produced
         # (an absent `v` and `v: null` differ, which is the `$getField` case).
@@ -253,7 +306,7 @@ def _expressions(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-213")
+@pytest.mark.backlog_fixed("RM-213")
 def test_expression_operators(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 computes `$unsetField`, `$toUUID` and the binData
     `$convert` forms, gives each malformed shape its own error code, and

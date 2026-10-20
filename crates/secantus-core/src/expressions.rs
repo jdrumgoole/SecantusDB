@@ -398,6 +398,21 @@ pub fn validate_expression_args(expr: &Bson) -> Result<(), Fallback> {
             for (key, val) in d {
                 if key.starts_with('$') {
                     check_required_fields(key, val)?;
+                    // Arguments holding field PATHS, not expression objects:
+                    // a sort spec, or `$elemMatch`'s query in a projection.
+                    if !matches!(
+                        key.as_str(),
+                        "$literal"
+                            | "$const"
+                            | "$sortArray"
+                            | "$elemMatch"
+                            | "$top"
+                            | "$bottom"
+                            | "$topN"
+                            | "$bottomN"
+                    ) {
+                        object_literal_keys_parse(val)?;
+                    }
                 }
                 validate_expression_args(val)?;
             }
@@ -408,6 +423,33 @@ pub fn validate_expression_args(expr: &Bson) -> Result<(), Fallback> {
                 validate_expression_args(e)?;
             }
             Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// An object literal inside an operator's argument is an expression object,
+/// whose keys are field NAMES: one with a `.` is mongod's 16412. A key
+/// starting with `$` makes the object an operator instead, walked on its own
+/// turn. The caller leaves out the operators whose arguments hold field
+/// paths. Measured 8.2.11, 2026-10-20 -- these were accepted.
+fn object_literal_keys_parse(arg: &Bson) -> Result<(), Fallback> {
+    match arg {
+        Bson::Array(items) => items.iter().try_for_each(object_literal_keys_parse),
+        Bson::Document(d) if d.keys().any(|k| k.starts_with('$')) => Ok(()),
+        Bson::Document(d) => {
+            if let Some(dotted) = d.keys().find(|k| k.contains('.')) {
+                return Err(Fallback::mongo(
+                    16412,
+                    format!(
+                        "Consider using $getField or $setField for a field path with '.' or '$'. \
+                         :: caused by :: FieldPath field names may not contain '.', given \
+                         '{dotted}'."
+                    ),
+                )
+                .bare());
+            }
+            d.values().try_for_each(object_literal_keys_parse)
         }
         _ => Ok(()),
     }
@@ -440,6 +482,7 @@ const ALLOWED_FIELDS: &[(&str, &[&str])] = &[
     ("$replaceAll", &["input", "find", "replacement"]),
     ("$replaceOne", &["input", "find", "replacement"]),
     ("$setField", &["field", "input", "value"]),
+    ("$unsetField", &["field", "input"]),
     ("$sortArray", &["input", "sortBy"]),
     ("$dateToString", &["date", "format", "timezone", "onNull"]),
     ("$cond", &["if", "then", "else"]),
@@ -607,6 +650,21 @@ const REQUIRED_FIELDS: &[(&str, &[RequiredField])] = &[
         ],
     ),
     (
+        "$unsetField",
+        &[
+            (
+                "field",
+                4161102,
+                "$unsetField requires 'field' to be specified",
+            ),
+            (
+                "input",
+                4161109,
+                "$unsetField requires 'input' to be specified",
+            ),
+        ],
+    ),
+    (
         "$sortArray",
         &[
             (
@@ -760,6 +818,41 @@ pub fn check_required_fields(op: &str, arg: &Bson) -> Result<(), Fallback> {
             }
         }
     }
+    if matches!(op, "$setField" | "$unsetField") {
+        set_field_name_parse(d)?;
+    }
+    match op {
+        "$let" => {
+            if let Some(Bson::Document(vars)) = d.get("vars") {
+                for name in vars.keys() {
+                    if name != "CURRENT" {
+                        user_var_name_parse(name)?;
+                    }
+                }
+            }
+        }
+        "$map" | "$filter" => {
+            if let Some(Bson::String(name)) = d.get("as") {
+                user_var_name_parse(name)?;
+            }
+        }
+        // `inputs` is a LIST of expressions, each its own array, and not an
+        // expression that makes a list. Measured 8.2.11, 2026-10-20.
+        "$zip" => match d.get("inputs") {
+            Some(Bson::Array(_)) | None => {}
+            Some(other) => {
+                return Err(Fallback::mongo(
+                    34461,
+                    format!(
+                        "inputs must be an array of expressions, found {}",
+                        type_name(other)
+                    ),
+                )
+                .bare())
+            }
+        },
+        _ => {}
+    }
     if let Some((_, field, code, message)) =
         REQUIRED_NON_EMPTY.iter().find(|(name, ..)| *name == op)
     {
@@ -873,6 +966,7 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$objectToArray" => op_object_to_array(arg, ctx),
         "$getField" => op_get_field(arg, ctx),
         "$setField" => op_set_field(arg, ctx),
+        "$unsetField" => op_unset_field(arg, ctx),
         "$zip" => op_zip(arg, ctx),
         // scope-introducing
         "$let" => op_let(arg, ctx, eval),
@@ -920,6 +1014,7 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$toDecimal" => op_to_shorthand(arg, ctx, 19),
         "$toDate" => op_to_shorthand(arg, ctx, 9),
         "$toObjectId" => op_to_shorthand(arg, ctx, 7),
+        "$toUUID" => op_to_uuid(arg, ctx),
         "$convert" => op_convert(arg, ctx),
         "$toBool" => op_to_shorthand(arg, ctx, 8),
         "$toString" => op_to_shorthand(arg, ctx, 2),
@@ -1060,6 +1155,7 @@ pub const KNOWN_EXPR_OPS: &[&str] = &[
     "$objectToArray",
     "$getField",
     "$setField",
+    "$unsetField",
     "$zip",
     "$let",
     "$map",
@@ -1100,6 +1196,7 @@ pub const KNOWN_EXPR_OPS: &[&str] = &[
     "$toDecimal",
     "$toDate",
     "$toObjectId",
+    "$toUUID",
     "$convert",
     "$toBool",
     "$toString",
@@ -1608,10 +1705,65 @@ fn op_switch(arg: &Bson, ctx: &Ctx, ret: Ret) -> R {
 
 // --- arithmetic ---------------------------------------------------------
 
+/// A number added to or taken from a date, in whole milliseconds, as mongod
+/// 8.2.11 takes it: a double rounded half away from zero (`llround`), a
+/// decimal half to even, and NaN, an infinity or anything past a long is
+/// 15 "date overflow" (measured 2026-10-20).
+fn date_millis(v: &Bson) -> Result<i64, Fallback> {
+    let overflow = || Fallback::mongo(15, "date overflow");
+    match v {
+        Bson::Int32(i) => Ok(i64::from(*i)),
+        Bson::Int64(i) => Ok(*i),
+        Bson::Double(d) => {
+            let r = d.round();
+            if !r.is_finite() || r < i64::MIN as f64 || r >= i64::MAX as f64 {
+                return Err(overflow());
+            }
+            Ok(r as i64)
+        }
+        Bson::Decimal128(_) => {
+            let d = crate::decimal::from_bson(v).ok_or_else(overflow)?;
+            let whole = crate::decimal::quantize_integral(&d, crate::decimal::RoundMode::HalfEven)
+                .ok_or_else(overflow)?;
+            crate::decimal::trunc_to_i64(&whole).ok_or_else(overflow)
+        }
+        _ => Err(Fallback::Defer),
+    }
+}
+
+/// `$add` with a date among its operands: the date moved by every other
+/// operand, each rounded to milliseconds on its own (measured 8.2.11:
+/// `date + 1.5 + 1.5` is four milliseconds on), and only one date.
+fn add_to_date(vals: &[Bson]) -> R {
+    let mut date: Option<i64> = None;
+    let mut moved: i64 = 0;
+    for v in vals {
+        if let Bson::DateTime(d) = v {
+            if date.is_some() {
+                return Err(Fallback::mongo(
+                    16612,
+                    "only one date allowed in an $add expression",
+                ));
+            }
+            date = Some(d.timestamp_millis());
+        } else {
+            moved = moved
+                .checked_add(date_millis(v)?)
+                .ok_or_else(|| Fallback::mongo(15, "date overflow"))?;
+        }
+    }
+    let ms = date
+        .unwrap_or(0)
+        .checked_add(moved)
+        .ok_or_else(|| Fallback::mongo(15, "date overflow"))?;
+    Ok(Bson::DateTime(bson::DateTime::from_millis(ms)))
+}
+
 fn arith_nary(arg: &Bson, ctx: &Ctx, mul: bool) -> R {
     let vals = eval_args(arg, ctx)?;
+    // `$add` of nothing is the int 0 it folds from (measured 8.2.11).
     if !mul && vals.is_empty() {
-        return Err(Fallback::Defer); // Python $add of [] indexes values[0] -> IndexError
+        return Ok(Bson::Int32(0));
     }
     if vals.iter().any(is_null) {
         return Ok(Bson::Null);
@@ -1631,6 +1783,9 @@ fn arith_nary(arg: &Bson, ctx: &Ctx, mul: bool) -> R {
         if let Some(fault) = arith_type_error(op, &Bson::Int32(0), bad) {
             return Err(fault);
         }
+    }
+    if !mul && vals.iter().any(|v| matches!(v, Bson::DateTime(_))) {
+        return add_to_date(&vals);
     }
     if !mul && vals.len() == 1 && as_float_like(&vals[0]).is_none() {
         // A single non-numeric operand (a date) is not something `fold_arith`
@@ -1819,6 +1974,33 @@ fn op_subtract(arg: &Bson, ctx: &Ctx) -> R {
     if let (Some(a), Some(b)) = (as_float_like(&vals[0]), as_float_like(&vals[1])) {
         return Ok(Bson::Double(a - b));
     }
+    // A date: another date gives the milliseconds between them as a long;
+    // a number moves it (rounded as `$add` rounds); a number minus a date
+    // is refused (measured 8.2.11).
+    match (&vals[0], &vals[1]) {
+        (Bson::DateTime(a), Bson::DateTime(b)) => {
+            return Ok(Bson::Int64(
+                a.timestamp_millis().wrapping_sub(b.timestamp_millis()),
+            ))
+        }
+        (Bson::DateTime(a), other) => {
+            let ms = a
+                .timestamp_millis()
+                .checked_sub(date_millis(other)?)
+                .ok_or_else(|| Fallback::mongo(15, "date overflow"))?;
+            return Ok(Bson::DateTime(bson::DateTime::from_millis(ms)));
+        }
+        (other, Bson::DateTime(_)) => {
+            return Err(Fallback::mongo(
+                14,
+                format!(
+                    "can't $subtract date from {}",
+                    crate::query::bson_type_name(other)
+                ),
+            ))
+        }
+        _ => {}
+    }
     // `a - b` is `a + (-b)`, which is mongod's own identity and needs no
     // separate subtraction routine.
     if vals.iter().any(|v| matches!(v, Bson::Decimal128(_))) {
@@ -1827,7 +2009,7 @@ fn op_subtract(arg: &Bson, ctx: &Ctx) -> R {
         let sum = crate::decimal::add(&a, &b).ok_or(Fallback::Defer)?;
         return crate::decimal::to_bson(&sum).ok_or(Fallback::Defer);
     }
-    Err(Fallback::Defer) // datetime subtraction -> Python
+    Err(Fallback::Defer)
 }
 
 fn op_divide(arg: &Bson, ctx: &Ctx) -> R {
@@ -2303,19 +2485,6 @@ fn norm_index(i: i64, len: i64) -> i64 {
     }
 }
 
-/// Coerce a numeric arg to i64, truncating a finite double toward zero -- the
-/// `$substrBytes` semantics (mongod accepts any double there, unlike `$substrCP`
-/// which rejects a fractional one). `None` for a non-finite double / non-number
-/// (the caller defers to the Python oracle).
-fn trunc_index(b: &Bson) -> Option<i64> {
-    match b {
-        Bson::Int32(n) => Some(*n as i64),
-        Bson::Int64(n) => Some(*n),
-        Bson::Double(d) if d.is_finite() => Some(d.trunc() as i64),
-        _ => None,
-    }
-}
-
 /// Outcome of coercing a numeric aggregation index argument to `i64`, the way
 /// mongod does: an int (or a whole-number double) is the index; a double with a
 /// fractional part is rejected (Python raises the op's per-arg code, so the Rust
@@ -2371,6 +2540,28 @@ fn num_as_double_g(v: &Bson) -> String {
 const SLICE_SECOND_BOOL: &str =
     "Second argument to $slice must be a numeric value, but is of type: bool";
 
+const SLICE_SECOND_TYPE: (i32, &str) = (
+    28725,
+    "Second argument to $slice must be a numeric value, but is of type: ",
+);
+const SLICE_THIRD_TYPE: (i32, &str) = (
+    28727,
+    "Third argument to $slice must be numeric, but is of type: ",
+);
+
+/// A `$slice` position or count that is not a number: null (or missing) makes
+/// the result null, any other type is refused by name. Measured 8.2.11,
+/// 2026-10-20 -- a string answered null.
+fn slice_not_numeric(v: &Bson, (code, message): (i32, &str)) -> R {
+    match v {
+        Bson::Null | Bson::Undefined => Ok(Bson::Null),
+        other => Err(Fallback::mongo(
+            code,
+            format!("{message}{}", type_name(other)),
+        )),
+    }
+}
+
 fn slice_second_not_32bit(v: &Bson) -> Fallback {
     Fallback::mongo(
         28726,
@@ -2420,7 +2611,7 @@ fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
         let n = match coerce_index(&n_v) {
             IdxCoerce::Int(n) if fits_i32(n) => n,
             IdxCoerce::Int(_) | IdxCoerce::Fractional => return Err(slice_second_not_32bit(&n_v)),
-            IdxCoerce::NotNumber => return Ok(Bson::Null),
+            IdxCoerce::NotNumber => return slice_not_numeric(&n_v, SLICE_SECOND_TYPE),
         };
         if n >= 0 {
             (0, n)
@@ -2444,12 +2635,12 @@ fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
             IdxCoerce::Int(_) | IdxCoerce::Fractional => {
                 return Err(slice_second_not_32bit(&pos_v))
             }
-            IdxCoerce::NotNumber => return Ok(Bson::Null),
+            IdxCoerce::NotNumber => return slice_not_numeric(&pos_v, SLICE_SECOND_TYPE),
         };
         let n = match coerce_index(&n_v) {
             IdxCoerce::Int(n) if fits_i32(n) => n,
             IdxCoerce::Int(_) | IdxCoerce::Fractional => return Err(slice_third_not_32bit(&n_v)),
-            IdxCoerce::NotNumber => return Ok(Bson::Null),
+            IdxCoerce::NotNumber => return slice_not_numeric(&n_v, SLICE_THIRD_TYPE),
         };
         // The COUNT must be positive: `[..., 0, 0]` and `[..., 0, -1]` are
         // refused, where this answered `[]` and `[1, 2]`.
@@ -3118,7 +3309,15 @@ fn op_substr_cp(arg: &Bson, ctx: &Ctx) -> R {
                 ),
             ));
         }
-        IdxCoerce::NotNumber => return Err(Fallback::Defer),
+        IdxCoerce::NotNumber => {
+            return Err(wrong_type(
+                34450,
+                "$substrCP: starting index must be a numeric type (is BSON type {})",
+                &a[1],
+                &start_v,
+                ctx,
+            ))
+        }
     };
     let length = match coerce_index(&length_v) {
         IdxCoerce::Int(n) if fits_i32(n) => n,
@@ -3132,7 +3331,15 @@ fn op_substr_cp(arg: &Bson, ctx: &Ctx) -> R {
                 ),
             ));
         }
-        IdxCoerce::NotNumber => return Err(Fallback::Defer),
+        IdxCoerce::NotNumber => {
+            return Err(wrong_type(
+                34452,
+                "$substrCP: length must be a numeric type (is BSON type {})",
+                &a[2],
+                &length_v,
+                ctx,
+            ))
+        }
     };
     if start < 0 {
         return Err(Fallback::mongo(
@@ -3358,8 +3565,106 @@ fn op_get_field(arg: &Bson, ctx: &Ctx) -> R {
             Some(v) => Ok(v.clone()),
             None => Ok(Bson::Undefined),
         },
-        _ => Ok(Bson::Null), // null / non-document input -> None
+        // A null input is null; any other non-document is MISSING, as an
+        // absent field is. Measured 8.2.11, 2026-10-20 -- this answered null.
+        Bson::Null => Ok(Bson::Null),
+        _ => Ok(Bson::Undefined),
     }
+}
+
+/// mongod's rule for a variable a user binds (`validateNameForUserWrite`): a
+/// lower-case ASCII letter or any non-ASCII character first, then letters,
+/// digits, `_` or non-ASCII. `$let` may also rebind `CURRENT`. Measured
+/// 8.2.11, 2026-10-20 -- these bound anything.
+fn user_var_name_parse(name: &str) -> Result<(), Fallback> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(Fallback::mongo(9, "empty variable names are not allowed").bare());
+    };
+    if !(first.is_ascii_lowercase() || !first.is_ascii()) {
+        return Err(Fallback::mongo(
+            9,
+            format!("'{name}' starts with an invalid character for a user variable name"),
+        )
+        .bare());
+    }
+    if let Some(bad) = chars.find(|c| c.is_ascii() && !(c.is_ascii_alphanumeric() || *c == '_')) {
+        return Err(Fallback::mongo(
+            9,
+            format!("'{name}' contains an invalid character for a variable name: '{bad}'"),
+        )
+        .bare());
+    }
+    Ok(())
+}
+
+/// `$setField` / `$unsetField`'s `field` must be a CONSTANT string, checked
+/// at parse time and always worded as `$setField` (`$unsetField` is parsed as
+/// a `$setField` with `$$REMOVE`). A literal or `{$literal: ...}` is a
+/// constant; any other expression, even one that folds to a string, is
+/// 4161106. Measured 8.2.11, 2026-10-20.
+fn set_field_name_parse(d: &Document) -> Result<(), Fallback> {
+    let Some(field) = d.get("field") else {
+        return Ok(());
+    };
+    let constant = match field {
+        Bson::String(s) if s.starts_with('$') => return Ok(()), // a path: its own parse
+        Bson::Document(inner) if inner.len() == 1 && inner.contains_key("$literal") => {
+            inner.get("$literal").cloned().unwrap_or(Bson::Null)
+        }
+        Bson::Document(_) | Bson::Array(_) => {
+            return Err(Fallback::mongo(
+                4161106,
+                "$setField requires 'field' to evaluate to a constant, but got a non-constant \
+                 argument",
+            )
+            .bare())
+        }
+        other => other.clone(),
+    };
+    match constant {
+        Bson::String(_) => Ok(()),
+        other => Err(Fallback::mongo(
+            4161107,
+            format!(
+                "$setField requires 'field' to evaluate to type String, but got {}",
+                type_name(&other)
+            ),
+        )
+        .bare()),
+    }
+}
+
+/// `$unsetField`: `$setField` with `value: "$$REMOVE"`, input checks and all
+/// (the non-object error names `$setField`). Measured 8.2.11, 2026-10-20.
+fn op_unset_field(arg: &Bson, ctx: &Ctx) -> R {
+    let Bson::Document(d) = arg else {
+        return Err(Fallback::Defer);
+    };
+    let (Some(fe), Some(ie)) = (d.get("field"), d.get("input")) else {
+        return Err(Fallback::Defer);
+    };
+    let Bson::String(field) = eval(fe, ctx)? else {
+        return Err(Fallback::Defer);
+    };
+    match eval(ie, ctx)? {
+        Bson::Null | Bson::Undefined => Ok(Bson::Null),
+        Bson::Document(mut doc) => {
+            doc.remove(&field);
+            Ok(Bson::Document(doc))
+        }
+        _ => Err(set_field_input_error()),
+    }
+}
+
+fn set_field_input_error() -> Fallback {
+    // mongod never folds `$setField`, so even a literal input fails per
+    // document (measured 8.2.11, 2026-10-20).
+    Fallback::mongo(
+        4161105,
+        "$setField requires 'input' to evaluate to type Object",
+    )
+    .with_folded(false)
 }
 
 fn op_set_field(arg: &Bson, ctx: &Ctx) -> R {
@@ -3373,11 +3678,11 @@ fn op_set_field(arg: &Bson, ctx: &Ctx) -> R {
         return Err(Fallback::Defer);
     };
     let input = eval(ie, ctx)?;
-    if is_null(&input) {
+    if matches!(input, Bson::Null | Bson::Undefined) {
         return Ok(Bson::Null);
     }
     let Bson::Document(mut doc) = input else {
-        return Err(Fallback::Defer); // non-document input -> Python raises
+        return Err(set_field_input_error());
     };
     // FIELD-VALUE position: mongod REMOVES the field for `$$REMOVE` and for an
     // absent path (`value: "$nosuch"` -- probed 8.2.11), while an explicit null
@@ -3399,20 +3704,30 @@ fn op_zip(arg: &Bson, ctx: &Ctx) -> R {
     let Some(inputs_expr) = d.get("inputs") else {
         return Err(Fallback::Defer);
     };
-    let inputs_val = eval(inputs_expr, ctx)?;
-    if is_null(&inputs_val) {
-        return Ok(Bson::Null);
-    }
-    let Bson::Array(inputs) = inputs_val else {
+    let Bson::Array(input_exprs) = inputs_expr else {
         return Err(Fallback::Defer);
     };
-    let mut arrs: Vec<&Vec<Bson>> = Vec::with_capacity(inputs.len());
-    for a in &inputs {
-        match a {
-            Bson::Array(v) => arrs.push(v),
-            _ => return Err(Fallback::Defer), // inputs must be an array of arrays
+    // Each input is evaluated on its own: a null or missing one makes the
+    // whole result null, and anything else that is not an array is refused,
+    // rendered. Measured 8.2.11, 2026-10-20.
+    let mut inputs: Vec<Vec<Bson>> = Vec::with_capacity(input_exprs.len());
+    for e in input_exprs {
+        match eval_field_value(e, ctx)? {
+            Bson::Array(v) => inputs.push(v),
+            Bson::Null | Bson::Undefined => return Ok(Bson::Null),
+            other => {
+                return Err(Fallback::mongo(
+                    34468,
+                    format!(
+                        "$zip found a non-array expression in input: {}",
+                        crate::aggregate::render_value_compact(&other)
+                    ),
+                )
+                .with_folded(false))
+            }
         }
     }
+    let arrs: Vec<&Vec<Bson>> = inputs.iter().collect();
     let n_inputs = arrs.len();
     // useLongestLength / defaults are read as *literals* (Python doesn't eval).
     let use_longest = py_bool_literal(d.get("useLongestLength"));
@@ -3534,7 +3849,14 @@ fn op_map(arg: &Bson, ctx: &Ctx) -> R {
     let arr = match eval_opt(d.get("input"), ctx)? {
         Bson::Array(a) => a,
         Bson::Null => return Ok(Bson::Null),
-        _ => return Err(Fallback::Defer), // non-array input -> Python raises 16883
+        Bson::Undefined => return Ok(Bson::Null),
+        other => {
+            return Err(Fallback::mongo(
+                16883,
+                format!("input to $map must be an array not {}", type_name(&other)),
+            )
+            .with_folded(false))
+        }
     };
     let var = as_var_name(d.get("as"))?;
     let null = Bson::Null;
@@ -3553,7 +3875,17 @@ fn op_filter(arg: &Bson, ctx: &Ctx) -> R {
     let arr = match eval_opt(d.get("input"), ctx)? {
         Bson::Array(a) => a,
         Bson::Null => return Ok(Bson::Null),
-        _ => return Err(Fallback::Defer), // non-array input -> Python raises 28651
+        Bson::Undefined => return Ok(Bson::Null),
+        other => {
+            return Err(Fallback::mongo(
+                28651,
+                format!(
+                    "input to $filter must be an array not {}",
+                    type_name(&other)
+                ),
+            )
+            .with_folded(false))
+        }
     };
     let var = as_var_name(d.get("as"))?;
     let null = Bson::Null;
@@ -4736,10 +5068,15 @@ fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
 fn op_date_to_string(arg: &Bson, ctx: &Ctx) -> R {
     let spec = arg.as_document().ok_or(Fallback::Defer)?;
     precheck_constant_timezone(spec, ctx, None)?;
-    let millis = match eval(spec.get("date").ok_or(Fallback::Defer)?, ctx)? {
-        Bson::DateTime(dt) => dt.timestamp_millis(),
-        Bson::Null => return Ok(Bson::Null), // null date -> null
-        _ => return Err(Fallback::Defer),    // non-date -> Python raises Location16006
+    let date_expr = spec.get("date").ok_or(Fallback::Defer)?;
+    let date = eval(date_expr, ctx)?;
+    if matches!(date, Bson::Null | Bson::Undefined) {
+        return Ok(Bson::Null);
+    }
+    // Any type that carries an instant: a Timestamp's seconds and an
+    // ObjectId's generation time render too (measured 8.2.11, 2026-10-20).
+    let Some(millis) = timestamp_bearing_millis(&date) else {
+        return Err(date_convert_error(date_expr, &date, ctx));
     };
     // A `timezone` shifts the wall clock before rendering (naive input is UTC,
     // matching BSON Date semantics); see `timezone_offset_ms` for the fixed-offset
@@ -4756,7 +5093,16 @@ fn op_date_to_string(arg: &Bson, ctx: &Ctx) -> R {
         None if matches!(mongo_tz(tz.as_spec()), Ok(MongoTz::Utc)) => "%Y-%m-%dT%H:%M:%S.%LZ",
         None => "%Y-%m-%dT%H:%M:%S.%L",
         Some(Bson::String(s)) => s.as_str(),
-        Some(_) => return Err(Fallback::Defer), // Python raises "format must be a string"
+        Some(other) => {
+            return Err(Fallback::mongo(
+                18533,
+                format!(
+                    "$dateToString requires that 'format' be a string, found: {} with value {}",
+                    type_name(other),
+                    crate::aggregate::render_value_compact(other)
+                ),
+            ))
+        }
     };
     Ok(Bson::String(render_date_at(
         millis + tz_offset,
@@ -5492,7 +5838,7 @@ fn op_to_shorthand(arg: &Bson, ctx: &Ctx, code: i32) -> R {
     if matches!(v, Bson::Null | Bson::Undefined) {
         return Ok(Bson::Null);
     }
-    match convert_value(&v, code) {
+    match convert_with(&v, code, &PLAIN_CONVERSION) {
         Conv::Ok(out) => Ok(out),
         // With no `onError` to catch it, a named failure IS the answer.
         Conv::Named(fault) => Err(fault),
@@ -5514,8 +5860,22 @@ fn op_convert(arg: &Bson, ctx: &Ctx) -> R {
             None => Ok(Bson::Null),
         };
     }
-    let code = convert_target_code(&target).ok_or(Fallback::Defer)?;
-    match convert_value(&value, code) {
+    let (code, subtype) = convert_target(&target)?;
+    let format = convert_format(spec, ctx)?;
+    let big_endian = convert_byte_order(spec, ctx)?;
+    // A string to binData, or binData to a string, has no default format:
+    // mongod refuses the pair outright, and `onError` does not catch it.
+    match (&value, code, format) {
+        (Bson::String(_), 5, None) => return Err(missing_format("string", "binData")),
+        (Bson::Binary(_), 2, None) => return Err(missing_format("binData", "string")),
+        _ => {}
+    }
+    let opts = ConvOpts {
+        format,
+        big_endian,
+        subtype,
+    };
+    match convert_with(&value, code, &opts) {
         Conv::Ok(v) => Ok(v),
         Conv::Failed => match spec.get("onError") {
             Some(on) => eval(on, ctx),
@@ -5537,6 +5897,390 @@ fn op_convert(arg: &Bson, ctx: &Ctx) -> R {
     }
 }
 
+/// `$toUUID`: `$convert` to binData subtype 4 in the `uuid` format, with no
+/// `onError`. Measured 8.2.11, 2026-10-20: a UUID string, a subtype-4
+/// binData (itself) and a number (its bytes, under subtype 4) all convert.
+fn op_to_uuid(arg: &Bson, ctx: &Ctx) -> R {
+    let arg = match arg {
+        Bson::Array(a) if a.len() == 1 => &a[0],
+        other => other,
+    };
+    let v = eval(arg, ctx)?;
+    if matches!(v, Bson::Null | Bson::Undefined) {
+        return Ok(Bson::Null);
+    }
+    let opts = ConvOpts {
+        format: Some(BinFormat::Uuid),
+        big_endian: false,
+        subtype: 4,
+    };
+    match convert_with(&v, 5, &opts) {
+        Conv::Ok(out) => Ok(out),
+        Conv::Named(fault) => Err(fault),
+        Conv::Unsupported => Err(unsupported_conversion(&v, 5)),
+        Conv::Failed => Err(Fallback::Defer),
+    }
+}
+
+/// `$convert`'s `format`: how a string and a binData map to each other.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BinFormat {
+    Auto,
+    Base64,
+    Base64Url,
+    Hex,
+    Utf8,
+    Uuid,
+}
+
+/// The options `$convert` takes beyond `input` and `to`.
+struct ConvOpts {
+    format: Option<BinFormat>,
+    big_endian: bool,
+    /// The binData subtype `to` names (0 unless it says otherwise).
+    subtype: u8,
+}
+
+const PLAIN_CONVERSION: ConvOpts = ConvOpts {
+    format: Some(BinFormat::Auto),
+    big_endian: false,
+    subtype: 0,
+};
+
+fn missing_format(from: &str, to: &str) -> Fallback {
+    Fallback::mongo(
+        4341115,
+        format!("Format must be speficied when converting from '{from}' to '{to}'"),
+    )
+}
+
+/// `format`, evaluated: null or absent is none at all. Measured 8.2.11.
+fn convert_format(spec: &Document, ctx: &Ctx) -> Result<Option<BinFormat>, Fallback> {
+    let Some(e) = spec.get("format") else {
+        return Ok(None);
+    };
+    match eval(e, ctx)? {
+        Bson::Null | Bson::Undefined => Ok(None),
+        Bson::String(f) => Ok(Some(match f.as_str() {
+            "auto" => BinFormat::Auto,
+            "base64" => BinFormat::Base64,
+            "base64url" => BinFormat::Base64Url,
+            "hex" => BinFormat::Hex,
+            "utf8" => BinFormat::Utf8,
+            "uuid" => BinFormat::Uuid,
+            _ => {
+                return Err(Fallback::mongo(
+                    4341125,
+                    format!("Invalid 'format' argument for $convert: {f}"),
+                ))
+            }
+        })),
+        other => Err(Fallback::mongo(
+            4341114,
+            format!(
+                "$convert requires that 'format' be a string, found: {} with value {}",
+                type_name(&other),
+                crate::aggregate::render_value_compact(&other)
+            ),
+        )),
+    }
+}
+
+/// `byteOrder`, evaluated: `true` for "big". Null or absent is little.
+fn convert_byte_order(spec: &Document, ctx: &Ctx) -> Result<bool, Fallback> {
+    let Some(e) = spec.get("byteOrder") else {
+        return Ok(false);
+    };
+    match eval(e, ctx)? {
+        Bson::Null | Bson::Undefined => Ok(false),
+        Bson::String(o) if o == "little" => Ok(false),
+        Bson::String(o) if o == "big" => Ok(true),
+        Bson::String(o) => Err(Fallback::mongo(
+            9130002,
+            format!("Invalid 'byteOrder' argument for $convert: {o}"),
+        )),
+        other => Err(Fallback::mongo(
+            9130001,
+            format!(
+                "$convert requires that 'byteOrder' be a string, found: {} with value {}",
+                type_name(&other),
+                crate::aggregate::render_value_compact(&other)
+            ),
+        )),
+    }
+}
+
+/// `to`: a type name or code, or `{type, subtype}`. The subtype matters only
+/// to binData and is checked only there; other keys are ignored.
+fn convert_target(target: &Bson) -> Result<(i32, u8), Fallback> {
+    let Bson::Document(d) = target else {
+        return Ok((convert_target_code(target).ok_or(Fallback::Defer)?, 0));
+    };
+    let Some(t) = d.get("type") else {
+        return Err(Fallback::mongo(
+            9,
+            "$convert's 'to' argument must be a string or number, but is missing",
+        ));
+    };
+    let code = convert_target_code(t).ok_or(Fallback::Defer)?;
+    let subtype = match d.get("subtype") {
+        Some(s) if code == 5 => bindata_subtype(s)?,
+        _ => 0,
+    };
+    Ok((code, subtype))
+}
+
+/// A binData subtype number: an integral number naming one of BSON's
+/// subtypes (0 to 9, or a user-defined 128 to 255). Measured 8.2.11.
+fn bindata_subtype(s: &Bson) -> Result<u8, Fallback> {
+    let n: f64 = match s {
+        Bson::Int32(n) => f64::from(*n),
+        Bson::Int64(n) => *n as f64,
+        Bson::Double(d) => *d,
+        Bson::Decimal128(_) => decimal_as_f64(s).unwrap_or(f64::NAN),
+        other => {
+            return Err(Fallback::mongo(
+                4341108,
+                format!(
+                    "For BinData, $convert's 'subtype' argument must be a number, but is {}",
+                    type_name(other)
+                ),
+            ))
+        }
+    };
+    if n.fract() != 0.0 || !n.is_finite() {
+        return Err(Fallback::mongo(
+            4341106,
+            "In $convert, numeric 'subtype' argument is not an integer",
+        ));
+    }
+    if (0.0..=9.0).contains(&n) || (128.0..=255.0).contains(&n) {
+        return Ok(n as u8);
+    }
+    Err(Fallback::mongo(
+        4341107,
+        format!(
+            "In $convert, numeric value for 'subtype' does not correspond to a BinData type: {}",
+            n as i64
+        ),
+    ))
+}
+
+/// One conversion with `$convert`'s options: the binData pairs here, and
+/// everything else through [`convert_value`].
+fn convert_with(value: &Bson, code: i32, opts: &ConvOpts) -> Conv {
+    match (value, code) {
+        (Bson::Binary(b), 5) => {
+            if u8::from(b.subtype) == opts.subtype {
+                Conv::Ok(value.clone())
+            } else {
+                Conv::Named(Fallback::mongo(
+                    241,
+                    "Conversions between different BinData subtypes are not supported",
+                ))
+            }
+        }
+        (Bson::String(text), 5) => {
+            let format = opts.format.unwrap_or(BinFormat::Auto);
+            let decoded = if (format == BinFormat::Uuid) != (opts.subtype == 4) {
+                Err("Only the 'uuid' format is allowed with the UUID subtype".to_string())
+            } else {
+                decode_bindata_string(text, format)
+            };
+            match decoded {
+                Ok(bytes) => Conv::Ok(make_binary(opts.subtype, bytes)),
+                Err(reason) => Conv::Named(Fallback::mongo(
+                    241,
+                    format!(
+                        "Failed to parse BinData '{text}' in $convert with no onError value: \
+                         {reason}"
+                    ),
+                )),
+            }
+        }
+        (Bson::Int32(n), 5) => Conv::Ok(make_binary(
+            opts.subtype,
+            ordered(n.to_le_bytes().to_vec(), opts.big_endian),
+        )),
+        (Bson::Int64(n), 5) => Conv::Ok(make_binary(
+            opts.subtype,
+            ordered(n.to_le_bytes().to_vec(), opts.big_endian),
+        )),
+        (Bson::Double(d), 5) => Conv::Ok(make_binary(
+            opts.subtype,
+            ordered(d.to_le_bytes().to_vec(), opts.big_endian),
+        )),
+        (_, 5) => Conv::Unsupported,
+        (Bson::Binary(b), 2) => {
+            let sub = u8::from(b.subtype);
+            match encode_bindata_string(sub, &b.bytes, opts.format.unwrap_or(BinFormat::Auto)) {
+                Ok(text) => Conv::Ok(Bson::String(text)),
+                Err(reason) => {
+                    let hex: String = b.bytes.iter().map(|c| format!("{c:02X}")).collect();
+                    Conv::Named(Fallback::mongo(
+                        241,
+                        format!(
+                            "Failed to convert 'BinData({sub}, \"{hex}\")' to string in \
+                             $convert with no onError value: {reason}"
+                        ),
+                    ))
+                }
+            }
+        }
+        // binData read as a number: `byteOrder` says which end is first. A
+        // length no number has is left alone, so the error shows the bytes as
+        // given.
+        (Bson::Binary(b), 1 | 16 | 18)
+            if opts.big_endian && matches!(b.bytes.len(), 1 | 2 | 4 | 8) =>
+        {
+            let mut reversed = b.clone();
+            reversed.bytes.reverse();
+            convert_value(&Bson::Binary(reversed), code)
+        }
+        _ => convert_value(value, code),
+    }
+}
+
+fn ordered(mut bytes: Vec<u8>, big_endian: bool) -> Vec<u8> {
+    if big_endian {
+        bytes.reverse();
+    }
+    bytes
+}
+
+fn make_binary(subtype: u8, bytes: Vec<u8>) -> Bson {
+    Bson::Binary(bson::Binary {
+        subtype: bson::spec::BinarySubtype::from(subtype),
+        bytes,
+    })
+}
+
+/// A string read as binData bytes in `format`, with mongod's reasons for a
+/// string that does not parse. Measured 8.2.11, 2026-10-20.
+fn decode_bindata_string(text: &str, format: BinFormat) -> Result<Vec<u8>, String> {
+    match format {
+        BinFormat::Auto => Err("Invalid format 'auto'".to_string()),
+        BinFormat::Utf8 => Ok(text.as_bytes().to_vec()),
+        BinFormat::Base64 => base64_decode(text, false),
+        BinFormat::Base64Url => base64_decode(text, true),
+        BinFormat::Hex => {
+            let b = text.as_bytes();
+            if b.len() % 2 == 1 {
+                return Err("Hex blob with odd digit count".to_string());
+            }
+            b.chunks(2)
+                .map(|pair| {
+                    let digit = |c: u8| {
+                        (c as char).to_digit(16).ok_or_else(|| {
+                            format!("The character \\x{c:02x} failed to parse from hex.")
+                        })
+                    };
+                    Ok((digit(pair[0])? * 16 + digit(pair[1])?) as u8)
+                })
+                .collect()
+        }
+        BinFormat::Uuid => parse_uuid(text).ok_or_else(|| format!("Invalid UUID string: {text}")),
+    }
+}
+
+/// The canonical 8-4-4-4-12 hex form, either case; nothing else.
+fn parse_uuid(text: &str) -> Option<Vec<u8>> {
+    let b = text.as_bytes();
+    if b.len() != 36 || [8, 13, 18, 23].iter().any(|&i| b[i] != b'-') {
+        return None;
+    }
+    let digits: Vec<u8> = b.iter().copied().filter(|c| *c != b'-').collect();
+    if digits.len() != 32 {
+        return None;
+    }
+    digits
+        .chunks(2)
+        .map(|p| {
+            let hi = (p[0] as char).to_digit(16)?;
+            let lo = (p[1] as char).to_digit(16)?;
+            Some((hi * 16 + lo) as u8)
+        })
+        .collect()
+}
+
+/// mongod's base64 reader. Standard base64 must come in whole quartets
+/// ("invalid base64"); base64url may drop its padding, but a lone trailing
+/// character is still "invalid base64". Padding only at the end, and only
+/// as much as a quartet's tail allows.
+fn base64_decode(text: &str, url: bool) -> Result<Vec<u8>, String> {
+    let b = text.as_bytes();
+    if (!url && !b.len().is_multiple_of(4)) || (url && b.len() % 4 == 1) {
+        return Err("invalid base64".to_string());
+    }
+    let bad = || "Invalid base64 character".to_string();
+    let value = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => u32::from(c - b'A'),
+            b'a'..=b'z' => u32::from(c - b'a') + 26,
+            b'0'..=b'9' => u32::from(c - b'0') + 52,
+            b'+' if !url => 62,
+            b'/' if !url => 63,
+            b'-' if url => 62,
+            b'_' if url => 63,
+            _ => return None,
+        })
+    };
+    let mut out = Vec::with_capacity(b.len() / 4 * 3);
+    let quartets = b.len().div_ceil(4);
+    for (qi, quad) in b.chunks(4).enumerate() {
+        let last = qi + 1 == quartets;
+        let pad = quad.iter().rev().take_while(|c| **c == b'=').count();
+        if pad > 2 || (pad > 0 && !last) {
+            return Err(bad());
+        }
+        let data = &quad[..quad.len() - pad];
+        if data.len() < 2 {
+            return Err(bad());
+        }
+        let mut n = 0u32;
+        for (i, c) in data.iter().enumerate() {
+            n |= value(*c).ok_or_else(bad)? << (18 - 6 * i);
+        }
+        let take = data.len() - 1;
+        for i in 0..take {
+            out.push((n >> (16 - 8 * i)) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// binData bytes as a string in `format`. `auto` is the UUID form for a
+/// 16-byte subtype 4 and base64 for everything else. Measured 8.2.11.
+fn encode_bindata_string(subtype: u8, bytes: &[u8], format: BinFormat) -> Result<String, String> {
+    let uuid = || {
+        if subtype != 4 || bytes.len() != 16 {
+            return Err("BinData does not represent a valid UUID".to_string());
+        }
+        let hex: String = bytes.iter().map(|c| format!("{c:02x}")).collect();
+        Ok(format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        ))
+    };
+    match format {
+        BinFormat::Auto if subtype == 4 && bytes.len() == 16 => uuid(),
+        BinFormat::Auto | BinFormat::Base64 => Ok(base64_encode(bytes)),
+        BinFormat::Base64Url => Ok(base64_encode(bytes)
+            .trim_end_matches('=')
+            .replace('+', "-")
+            .replace('/', "_")),
+        BinFormat::Hex => Ok(bytes.iter().map(|c| format!("{c:02X}")).collect()),
+        BinFormat::Utf8 => std::str::from_utf8(bytes)
+            .map(str::to_string)
+            .map_err(|_| "BinData does not represent a valid UTF-8 string".to_string()),
+        BinFormat::Uuid => uuid(),
+    }
+}
+
 /// mongod's `$convert` target codes (`expressions._CONVERT_TARGETS`): the string
 /// alias or the numeric code. A double / unknown target -> `None` (Python raises).
 fn convert_target_code(target: &Bson) -> Option<i32> {
@@ -5544,6 +6288,7 @@ fn convert_target_code(target: &Bson) -> Option<i32> {
         Bson::String(s) => match s.as_str() {
             "double" => 1,
             "string" => 2,
+            "binData" => 5,
             "objectId" => 7,
             "bool" => 8,
             "date" => 9,
@@ -5556,7 +6301,7 @@ fn convert_target_code(target: &Bson) -> Option<i32> {
         Bson::Int64(n) => *n as i32,
         _ => return None,
     };
-    matches!(code, 1 | 2 | 7 | 8 | 9 | 16 | 18 | 19).then_some(code)
+    matches!(code, 1 | 2 | 5 | 7 | 8 | 9 | 16 | 18 | 19).then_some(code)
 }
 
 /// mongod's numeric-string syntax, which is C's `strtod` and NOT the host
@@ -5898,6 +6643,7 @@ fn conversion_target_name(code: i32) -> &'static str {
     match code {
         1 => "double",
         2 => "string",
+        5 => "binData",
         7 => "objectId",
         8 => "bool",
         9 => "date",
@@ -5924,7 +6670,7 @@ fn bindata_length_error(sub_type: u8, bytes: &[u8]) -> Fallback {
     )
 }
 
-/// A `binData`'s bytes as a LITTLE-ENDIAN unsigned integer.
+/// A `binData`'s bytes as a LITTLE-ENDIAN two's-complement integer: `BinData(0, "FF")` is -1 (measured 8.2.11, 2026-10-20).
 ///
 /// Only 1, 2, 4 and 8 bytes are accepted, and the target narrows it further:
 /// `$toInt` takes 1 / 2 / 4 and `$toLong` 1 / 2 / 4 / 8. Little-endian is
@@ -5932,9 +6678,9 @@ fn bindata_length_error(sub_type: u8, bytes: &[u8]) -> Fallback {
 /// (`0x04030201`), not `16909060`.
 fn bindata_as_int(bytes: &[u8]) -> Option<i128> {
     match bytes.len() {
-        1 => Some(i128::from(bytes[0])),
-        2 => Some(i128::from(u16::from_le_bytes([bytes[0], bytes[1]]))),
-        4 => Some(i128::from(u32::from_le_bytes([
+        1 => Some(i128::from(bytes[0] as i8)),
+        2 => Some(i128::from(i16::from_le_bytes([bytes[0], bytes[1]]))),
+        4 => Some(i128::from(i32::from_le_bytes([
             bytes[0], bytes[1], bytes[2], bytes[3],
         ]))),
         8 => Some(i128::from(u64::from_le_bytes([
@@ -6459,10 +7205,11 @@ fn to_string_value(v: &Bson) -> Option<String> {
         Bson::ObjectId(oid) => oid.to_hex(),
         Bson::DateTime(dt) => render_date(dt.timestamp_millis(), "%Y-%m-%dT%H:%M:%S.%LZ").ok()?,
         Bson::String(s) => s.clone(),
-        // binData stringifies as BASE64 of its bytes, at any length and
-        // whatever the subtype -- `BinData(0, "7A")` is `"eg=="`. Measured
-        // 8.2.11, 2026-09-08; this used to refuse outright.
-        Bson::Binary(b) => base64_encode(&b.bytes),
+        // binData stringifies in the `auto` format: base64, except the UUID
+        // form for a 16-byte subtype 4. Measured 8.2.11, 2026-10-20.
+        Bson::Binary(b) => {
+            encode_bindata_string(u8::from(b.subtype), &b.bytes, BinFormat::Auto).ok()?
+        }
         _ => return None,
     })
 }
@@ -8261,6 +9008,43 @@ fn op_index_of(arg: &Bson, ctx: &Ctx, bytes: bool) -> R {
     Ok(Bson::Int32(idx))
 }
 
+/// A `$substrBytes` index, coerced to a long the way mongod coerces it: a
+/// double truncates, a decimal rounds half to even (`1.5` is 2), and a value
+/// no long holds is 31109. Anything else is not a number. Measured 8.2.11,
+/// 2026-10-20.
+fn substr_bytes_index(
+    v: &Bson,
+    code: i32,
+    label: &str,
+    arg: &Bson,
+    ctx: &Ctx,
+) -> Result<i64, Fallback> {
+    let out_of_range = |shown: String| {
+        Fallback::mongo(
+            31109,
+            format!("Can't coerce out of range value {shown} to long"),
+        )
+    };
+    let in_range = |d: f64| (-9.223_372_036_854_776e18..9.223_372_036_854_776e18).contains(&d);
+    match v {
+        Bson::Int32(n) => Ok(i64::from(*n)),
+        Bson::Int64(n) => Ok(*n),
+        Bson::Double(d) if in_range(*d) => Ok(d.trunc() as i64),
+        Bson::Double(d) => Err(out_of_range(format_double_g(*d))),
+        Bson::Decimal128(d) => match decimal_as_f64(v) {
+            Some(f) if in_range(f) => Ok(f.round_ties_even() as i64),
+            _ => Err(out_of_range(d.to_string())),
+        },
+        other => Err(wrong_type(
+            code,
+            &format!("$substrBytes:  {label} must be a numeric type (is BSON type {{}})"),
+            arg,
+            other,
+            ctx,
+        )),
+    }
+}
+
 fn op_substr_bytes(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::Array(a) = arg else {
         return Err(Fallback::Defer);
@@ -8285,26 +9069,28 @@ fn op_substr_bytes(arg: &Bson, ctx: &Ctx) -> R {
     let s = coerce_to_string(&s)?;
     let start_v = eval(&a[1], ctx)?;
     let length_v = eval(&a[2], ctx)?;
-    if matches!(start_v, Bson::Boolean(_)) || matches!(length_v, Bson::Boolean(_)) {
-        return Err(Fallback::Defer); // Python raises 16034 / 16035
-    }
-    // $substrBytes truncates a double toward zero (not reject-fractional).
-    let (Some(start), Some(length)) = (trunc_index(&start_v), trunc_index(&length_v)) else {
-        return Err(Fallback::Defer);
-    };
+    let start = substr_bytes_index(&start_v, 16034, "starting index", &a[1], ctx)?;
+    let length = substr_bytes_index(&length_v, 16035, "length", &a[2], ctx)?;
     let bytes = s.as_bytes();
     let blen = bytes.len() as i64;
-    // mongod rejects a negative start (Python raises 50752); a negative length
-    // is fine (means "to the end").
+    // A negative start is refused; a negative length means "to the end".
+    // These four refusals deferred; mongod's texts, double space and all,
+    // measured 8.2.11, 2026-10-20.
     if start < 0 {
-        return Err(Fallback::Defer);
+        return Err(Fallback::mongo(
+            50752,
+            format!("$substrBytes:  starting index must be non-negative (got: {start})"),
+        ));
     }
     // mongod rejects a byte range whose start is a UTF-8 continuation byte, or
     // whose end splits a character -- even for an empty (length 0) range, which
     // the from_utf8 check below would miss. Python raises 28656 / 28657 here;
     // the core defers.
     if start < blen && (bytes[start as usize] & 0xC0) == 0x80 {
-        return Err(Fallback::Defer); // Python raises 28656
+        return Err(Fallback::mongo(
+            28656,
+            "$substrBytes:  Invalid range, starting index is a UTF-8 continuation byte.",
+        ));
     }
     let end = if length < 0 {
         blen
@@ -8312,7 +9098,10 @@ fn op_substr_bytes(arg: &Bson, ctx: &Ctx) -> R {
         start.saturating_add(length)
     };
     if (0..blen).contains(&end) && (bytes[end as usize] & 0xC0) == 0x80 {
-        return Err(Fallback::Defer); // Python raises 28657
+        return Err(Fallback::mongo(
+            28657,
+            "$substrBytes:  Invalid range, ending index is in the middle of a UTF-8 character.",
+        ));
     }
     let stop = if length < 0 {
         blen
@@ -8421,23 +9210,95 @@ fn op_array_to_object(arg: &Bson, ctx: &Ctx) -> R {
             ))
         }
     };
+    // The FIRST element sets the form, and every later one must share it.
+    // Each refusal is mongod's own, measured 8.2.11, 2026-10-20 (these all
+    // deferred, and a mixed list answered an object).
+    let consistent = |code: i32, seen: &str, found: &Bson| {
+        Fallback::mongo(
+            code,
+            format!(
+                "$arrayToObject requires a consistent input format. Elements mustall be arrays \
+                 or all be objects. {seen} was detected, now found: {}",
+                type_name(found)
+            ),
+        )
+    };
+    let objects = matches!(entries.first(), Some(Bson::Document(_)));
     let mut out = Document::new();
-    for e in entries {
+    for (i, e) in entries.into_iter().enumerate() {
         match e {
-            Bson::Document(d) => {
-                let (Some(Bson::String(k)), Some(v)) = (d.get("k"), d.get("v")) else {
-                    return Err(Fallback::Defer); // missing k/v or non-string key -> Python
+            Bson::Document(d) if objects => {
+                if d.len() != 2 {
+                    return Err(Fallback::mongo(
+                        40392,
+                        format!(
+                            "$arrayToObject requires an object keys of 'k' and 'v'. Found \
+                             incorrect number of keys:{}",
+                            d.len()
+                        ),
+                    ));
+                }
+                let (Some(k), Some(v)) = (d.get("k"), d.get("v")) else {
+                    return Err(Fallback::mongo(
+                        40393,
+                        format!(
+                            "$arrayToObject requires an object with keys 'k' and 'v'. Missing \
+                             either or both keys from: {}",
+                            crate::aggregate::render_value_compact(&Bson::Document(d.clone()))
+                        ),
+                    ));
                 };
+                let Bson::String(k) = k else {
+                    return Err(Fallback::mongo(
+                        40394,
+                        format!(
+                            "$arrayToObject requires an object with keys 'k' and 'v', where the \
+                             value of 'k' must be of type string. Found type: {}",
+                            type_name(k)
+                        ),
+                    ));
+                };
+                if k.contains('\0') {
+                    return Err(Fallback::mongo(
+                        4940401,
+                        "Key field cannot contain an embedded null byte",
+                    ));
+                }
                 out.insert(k.clone(), v.clone());
             }
-            Bson::Array(pair) if pair.len() == 2 => {
+            Bson::Array(pair) if !objects => {
+                if pair.len() != 2 {
+                    return Err(Fallback::mongo(
+                        40397,
+                        format!(
+                            "$arrayToObject requires an array of size 2 arrays,found array of \
+                             size: {}",
+                            pair.len()
+                        ),
+                    ));
+                }
                 let Bson::String(k) = &pair[0] else {
-                    return Err(Fallback::Defer);
+                    return Err(Fallback::mongo(
+                        40395,
+                        format!(
+                            "$arrayToObject requires an array of key-value pairs, where the key \
+                             must be of type string. Found key type: {}",
+                            type_name(&pair[0])
+                        ),
+                    ));
                 };
+                if k.contains('\0') {
+                    return Err(Fallback::mongo(
+                        4940400,
+                        "Key field cannot contain an embedded null byte",
+                    ));
+                }
                 out.insert(k.clone(), pair[1].clone());
             }
-            // A element that is neither a `{k, v}` document nor a two-element
-            // pair is named by TYPE -- probed 8.2.11 (2026-09-03).
+            // A first element that is neither a `{k, v}` document nor a pair
+            // is named by TYPE -- probed 8.2.11 (2026-09-03).
+            other if i > 0 && objects => return Err(consistent(40391, "Object", &other)),
+            other if i > 0 => return Err(consistent(40396, "Array", &other)),
             other => {
                 return Err(Fallback::mongo(
                     40398,
@@ -8583,6 +9444,55 @@ pub fn py_eq(a: &Bson, b: &Bson) -> Result<bool, Fallback> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn date_arithmetic_rounds_as_mongod_does() {
+        // Measured on mongod 8.2.11, 2026-10-20 (RM-212).
+        let base = bson::DateTime::from_millis(1_577_836_800_000);
+        let d = doc! {"d": base, "e": bson::DateTime::from_millis(1_577_923_200_000)};
+        let ms = |v: Bson| match v {
+            Bson::DateTime(t) => t.timestamp_millis() - base.timestamp_millis(),
+            other => panic!("not a date: {other:?}"),
+        };
+        let eval = |e: Bson| evaluate(&d, &e, &Document::new());
+        assert_eq!(
+            ms(eval(bson::bson!({"$add": ["$d", 1.5, 1.5]})).unwrap()),
+            4
+        );
+        assert_eq!(ms(eval(bson::bson!({"$add": ["$d", -0.5]})).unwrap()), -1);
+        let half = "2.5".parse::<bson::Decimal128>().unwrap();
+        assert_eq!(ms(eval(bson::bson!({"$add": ["$d", half]})).unwrap()), 2);
+        assert_eq!(
+            ms(eval(bson::bson!({"$subtract": ["$d", 2.5]})).unwrap()),
+            -3
+        );
+        assert_eq!(
+            eval(bson::bson!({"$subtract": ["$e", "$d"]})).unwrap(),
+            Bson::Int64(86_400_000)
+        );
+        assert_eq!(eval(bson::bson!({"$add": []})).unwrap(), Bson::Int32(0));
+        assert_eq!(
+            eval(bson::bson!({"$add": ["$d", "$e"]}))
+                .unwrap_err()
+                .as_mongo()
+                .map(|e| e.0),
+            Some(16612)
+        );
+        assert_eq!(
+            eval(bson::bson!({"$subtract": ["$d", f64::NAN]}))
+                .unwrap_err()
+                .as_mongo()
+                .map(|e| e.0),
+            Some(15)
+        );
+        assert_eq!(
+            eval(bson::bson!({"$subtract": [5, "$d"]}))
+                .unwrap_err()
+                .as_mongo()
+                .map(|e| e.1.to_string()),
+            Some("can't $subtract date from int".to_string())
+        );
+    }
+
     use super::*;
     use bson::doc;
 

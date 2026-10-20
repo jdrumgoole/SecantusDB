@@ -560,38 +560,11 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       `allowDiskUse` permits it.
       Backlog-ID: RM-211
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_aggregation_memory_limits
-- [ ] **`$add` and `$subtract` with a Date are refused.** Date minus a
-      number or a date, date plus numbers, `{$add: ["$d"]}` and
-      `{$add: []}` (0 on mongod) all answer 2 "not supported by the Rust
-      server", in aggregation, in `$expr` in a find and in a pipeline
-      update. The cause is `Err(Fallback::Defer)` in
-      `secantus-core/src/expressions.rs` (`// datetime subtraction ->
-      Python`) and the single-date and empty-list defers in `arith_nary`, a
-      Python fallback that does not exist on this server.
-      Backlog-ID: RM-212
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_date_arithmetic
-- [ ] **Expression operators missing, refused, or answering wrongly.**
-      `$unsetField` and `$toUUID` are 31325 unknown expression. These are
-      refused with a generic 2:
-      - `$convert` to binData (`format: "base64"`, or `to: {type:
-        "binData"}`);
-      - `$dateToString` of a Timestamp.
-
-      These are refused with a generic 2 where mongod has its own code:
-      - `$substrCP` with a non-numeric index (34450);
-      - `$setField` on a non-object (4161105);
-      - `$zip` over a non-array (34468);
-      - `$map` over a non-array (16883).
-
-      Silently wrong:
-      - `$getField` on a non-object gives `v: null` where mongod leaves
-        `v` missing;
-      - `{$slice: [arr, "x"]}` gives null where mongod errors 28725;
-      - `$let` accepts the variable name `X` (mongod: 9);
-      - `$arrayToObject` accepts mixed `{k, v}` and pair elements (mongod:
-        40391).
-      Backlog-ID: RM-213
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_expression_operators
+- `$convert` to binData subtype 2 (the deprecated "old binary") is
+  written with the old format's inner length, as the bson crate writes
+  every subtype-2 value. mongod 8.2.11 writes the bytes alone, which is not
+  a valid subtype-2 value: pymongo refuses to decode the reply. Out of
+  scope; nothing reads the old subtype as mongod emits it.
 - [ ] **Window functions missing or imprecise.**
       - `$covariancePop` and `$covarianceSamp` always answer 2.
       - `$topN` and `$bottomN` as window functions are 168 (`$top` works).
