@@ -4833,6 +4833,9 @@ struct PruneCtx {
     /// `oplog_archive_dir`.
     retention_seconds: AtomicI64,
     max_entries: AtomicUsize,
+    /// `replSetResizeOplog`'s `minRetentionHours`, in seconds: no entry
+    /// younger than this is pruned, whatever the entry cap (0: no floor).
+    min_retention_seconds: AtomicI64,
     archive_dir: Mutex<Option<String>>,
     /// Phase A' pieces: the sweep clamp below the stable checkpoint marker and
     /// the demand-checkpoint signal when the clamp blocks a cap excess.
@@ -5958,6 +5961,7 @@ impl Storage {
             prune_lock: Mutex::new(()),
             retention_seconds: AtomicI64::new(3600),
             max_entries: AtomicUsize::new(100_000),
+            min_retention_seconds: AtomicI64::new(0),
             archive_dir: Mutex::new(None),
             data_nonlogged,
             stable_seq: stable_seq.clone(),
@@ -6074,6 +6078,15 @@ impl Storage {
         self.prune_ctx
             .retention_seconds
             .store(secs, Ordering::Relaxed);
+    }
+
+    /// Keep every oplog entry younger than `secs`, whatever the entry cap
+    /// and the retention window: `replSetResizeOplog`'s `minRetentionHours`
+    /// (0 removes the floor). The next sweep applies it.
+    pub fn set_oplog_min_retention_seconds(&self, secs: i64) {
+        self.prune_ctx
+            .min_retention_seconds
+            .store(secs.max(0), Ordering::Relaxed);
     }
 
     /// Set the oplog hard entry cap (default 100_000). Mirrors
@@ -7807,6 +7820,40 @@ impl Storage {
 /// half-pruned range (`read_oplog`, resume) tolerate missing rows. A free
 /// function over the shared context so the async drainer pool can run the
 /// sweep without a `Storage` borrow.
+/// Cut `doomed`, a seq-ordered prefix of the oplog, at its first row dated
+/// at or after `floor` (seconds): the rows `minRetentionHours` keeps. The
+/// oplog's timestamps rise with its seqs, so the rows past that one are
+/// younger too.
+fn keep_younger_than(
+    session: &Session,
+    existing: u32,
+    doomed: &mut Vec<(i64, usize)>,
+    floor: i64,
+) -> Result<()> {
+    let tables = oplog_all_tables();
+    let mut curs: Vec<Option<Cursor>> = tables.iter().map(|_| None).collect();
+    for (at, (seq, tbl)) in doomed.iter().enumerate() {
+        if oplog_table_absent(existing, *tbl) {
+            continue;
+        }
+        if curs[*tbl].is_none() {
+            curs[*tbl] = Some(session.open_cursor(&tables[*tbl], None)?);
+        }
+        let cur = curs[*tbl].as_ref().expect("opened above");
+        cur.reset()?;
+        cur.set_key_q(*seq);
+        if cur.search().is_err() {
+            continue;
+        }
+        let blob = cur.get_value_u()?;
+        if matches!(peek_entry_ts(&blob), Some(ts) if i64::from(ts.time) >= floor) {
+            doomed.truncate(at);
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Oplog rows removed per prune transaction (see the phase-2 comment).
 const PRUNE_DELETE_BATCH: usize = 1024;
 
@@ -7883,6 +7930,11 @@ fn prune_oplog_sweep(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
         // this, a sustained writer outruns the periodic cadence and the
         // oplog grows without bound.
         ctx.checkpoint_requested.store(true, Ordering::Release);
+    }
+    let mut doomed = doomed;
+    let floor = ctx.min_retention_seconds.load(Ordering::Relaxed);
+    if floor > 0 {
+        keep_younger_than(&session, existing, &mut doomed, when - floor)?;
     }
     if doomed.is_empty() {
         return Ok(0);
@@ -23047,6 +23099,27 @@ mod tests {
         .unwrap();
         let f = Storage::open(fresh.to_str().unwrap()).unwrap();
         assert!(f.read_oplog(1, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn min_retention_keeps_young_entries_past_the_cap() {
+        // `replSetResizeOplog`'s `minRetentionHours`: no entry younger than
+        // the floor is pruned, whatever the entry cap.
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path().to_str().unwrap()).unwrap();
+        let enc = |id: i32| encode_doc(&doc! {"_id": id}).unwrap();
+        s.set_oplog_max_entries(2);
+        for id in 0..6 {
+            s.insert("app", "c", vec![enc(id)], true).unwrap();
+        }
+        s.set_oplog_min_retention_seconds(3600);
+        assert_eq!(s.prune_oplog(None).unwrap(), 0);
+        assert!(s.read_oplog(1, 100).unwrap().len() >= 6);
+        // An hour and more later, the cap applies again.
+        s.set_oplog_min_retention_seconds(3600);
+        let later = now_secs() + 7200;
+        assert!(s.prune_oplog(Some(later)).unwrap() > 0);
+        s.set_oplog_min_retention_seconds(0);
     }
 
     #[test]

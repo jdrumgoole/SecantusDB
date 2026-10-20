@@ -836,6 +836,14 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Keep every oplog entry younger than `secs` (`replSetResizeOplog`'s
+    /// `minRetentionHours`). Default: unsupported, a backend with no oplog.
+    fn set_oplog_min_retention_seconds(&self, _secs: i64) -> Result<(), StorageError> {
+        Err(StorageError::Internal(
+            "replSetResizeOplog: this storage backend has no oplog".into(),
+        ))
+    }
+
     /// The TTL monitor as `(ttlMonitorSleepSecs, enabled, passes, deleted)`;
     /// the sleep is 0 until a client sets it. Default: `None`, a backend with
     /// no monitor.

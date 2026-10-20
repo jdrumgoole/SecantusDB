@@ -35,7 +35,9 @@ use crate::util::{as_i64, command_error, decode_docs};
 use crate::{CommandContext, CommandError, HandlerResult, SERVER_VERSION};
 use bson::{doc, Bson, Document};
 pub(crate) use debug_string::CanonicalQuery;
-use node::{num, IndexInfo, Node, Stats};
+pub(crate) use node::IndexInfo;
+use node::{num, Node, Stats};
+pub(crate) use parsed::parsed_query;
 use plan::{Hint, Query};
 use secantus_core::collation::Collation;
 use secantus_core::query::bson_type_name;
@@ -275,6 +277,8 @@ pub(crate) fn plans_table_scan(
     collation: Option<&Collation>,
 ) -> Result<Option<TableScan>, CommandError> {
     let catalog = catalog(storage, db, coll, None).map_err(command_error)?;
+    let (catalog, _) =
+        crate::index_filters::apply(storage, db, coll, filter, sort, None, collation, catalog);
     let Ok(hint) = resolve_hint(hint, &catalog) else {
         return Ok(None);
     };
@@ -1029,7 +1033,19 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
     let storage = ctx.storage()?;
     let collation = crate::util::effective_collation(storage, &db, &s.coll, &s.options)?;
     let canonical = parsed::parsed_query(&s.filter);
-    let t = target(ctx, &s.coll)?;
+    let mut t = target(ctx, &s.coll)?;
+    // An index filter set for this shape leaves the planner its indexes.
+    let (catalog, filtered) = crate::index_filters::apply(
+        storage,
+        &db,
+        &s.coll,
+        &s.filter,
+        s.sort.as_ref(),
+        s.projection.as_ref(),
+        collation.as_ref(),
+        std::mem::take(&mut t.catalog),
+    );
+    t.catalog = catalog;
     let grouped = distinct_group(s, &canonical, collation.as_ref(), &t, ctx)?;
     let regrouped;
     let (s, (plan, ranked)) = match grouped {
@@ -1055,6 +1071,9 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
     }
     let tried = tried_plans(s, &ranked);
     let mut planner = query_planner(&ns, s, &canonical, collation.as_ref(), &plan);
+    if filtered && planner.contains_key("indexFilterSet") {
+        planner.insert("indexFilterSet", true);
+    }
     if tried.len() > 1 {
         let rejected: Vec<Bson> = tried[1..]
             .iter()

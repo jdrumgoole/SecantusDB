@@ -955,20 +955,18 @@ Still different:
       locked by its background threads only and are absent here.
       Backlog-ID: RM-185
       Verify: tests/backlog/test_rm_185_locks.py::test_lock_counts_of_merge_fail_with_duplicates
-- [ ] **Commands answered only as far as this server honours them.**
-      `getClusterParameter` has six of mongod's fifteen parameters, the ones
-      whose default is a fact here (no shards, no default `maxTimeMS`,
-      pre-images that go with the oplog), and answers 4 for the rest;
-      `planCacheSetFilter` is not a command, because no filter would be
-      applied; `replSetResizeOplog` refuses a `minRetentionHours` above 0,
-      because this oplog drops an entry older than its retention window
-      whatever its size (honouring it means a floor in the shared storage
-      crate's oplog prune); `replSetReconfig` is not a command. Each is a
-      feature to build, not a reply to change. (`features` has no `js`
-      block, as a `mongod --noscripting` answers, and `oidReset` replaces
-      the ObjectId process value since 2026-10-20.)
-      Backlog-ID: RM-143
-      Verify: tests/backlog/test_rm_029_056.py::test_plan_cache_set_filter,tests/backlog/test_rm_029_056.py::test_resize_oplog_min_retention_hours,tests/backlog/test_rm_029_056.py::test_every_cluster_parameter
+- **Scope decision — `replSetReconfig` takes one member, this server**
+  (2026-10-20, under "Explicitly out of scope: real replica sets"). mongod
+  8.2.11 accepts a configuration that adds a member it cannot reach and
+  goes on to replicate to it; this single-node set refuses any
+  configuration of more than one member (103). Every other check and
+  setting is mongod's (17 scenarios, no difference), and the configuration
+  is kept in `local.system.replset` across restarts.
+- **Scope decision — the order of `planCacheListFilters`.** mongod lists
+  index filters, and the indexes of each, in its hash set's order (setting
+  `["a_1", "zz"]` lists `["zz", "a_1"]`); no fixed order can match it, so
+  they are listed in the order they were set (since 2026-10-20, when index
+  filters landed; formerly part of RM-143).
 - **Scope decision — `buildInfo.secantusVersion` and `serverStatus.secantus`
   stay** (Joe, 2026-10-15). Each names this build beside mongod's own
   fields. They are additive, documented (`CLAUDE.md`, `docs/compatibility.md`,

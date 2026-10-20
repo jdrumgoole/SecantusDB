@@ -343,6 +343,26 @@ impl plan::Whole for Lazy<'_> {
     }
 }
 
+/// The indexes `ask` may be planned over: the collection's, or the ones an
+/// index filter set for its shape leaves.
+pub(crate) fn ask_catalog(
+    storage: &dyn Storage,
+    ask: &Ask,
+) -> Result<Vec<std::rc::Rc<super::IndexInfo>>, StorageError> {
+    let catalog = catalog(storage, ask.db, ask.coll, None)?;
+    Ok(crate::index_filters::apply(
+        storage,
+        ask.db,
+        ask.coll,
+        ask.filter,
+        ask.sort,
+        ask.asked.projection,
+        ask.collation,
+        catalog,
+    )
+    .0)
+}
+
 /// `rows` in the order `order` names them.
 fn placed(rows: Rows, order: Vec<usize>) -> Rows {
     let mut slots: Vec<Option<(i64, Vec<u8>)>> = rows.into_iter().map(Some).collect();
@@ -468,7 +488,7 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
         sorted = Some((order, tied));
     }
 
-    let catalog = catalog(storage, ask.db, ask.coll, None)?;
+    let catalog = ask_catalog(storage, ask)?;
     let canonical = parsed::parsed_query(ask.filter);
     let implied = |partial: &Document| storage.query_implies_partial(ask.filter, partial);
     let hint = match resolve_hint(ask.hint, &catalog) {
@@ -687,7 +707,7 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
 /// fixed order of preference stands in); `None` for a collection with no
 /// index, or a hint the planner does not know.
 fn untried_plan(storage: &dyn Storage, ask: &Ask) -> Option<Node> {
-    let catalog = catalog(storage, ask.db, ask.coll, None).ok()?;
+    let catalog = ask_catalog(storage, ask).ok()?;
     if catalog.is_empty() {
         return None;
     }
@@ -857,7 +877,7 @@ pub(crate) fn count_index_use(storage: &dyn Storage, ask: &Ask, uses: Uses) {
     {
         return;
     }
-    let Ok(catalog) = catalog(storage, ask.db, ask.coll, None) else {
+    let Ok(catalog) = ask_catalog(storage, ask) else {
         return;
     };
     if catalog.is_empty() {
@@ -1080,7 +1100,7 @@ fn store_order_is_the_plans(storage: &dyn Storage, ask: &Ask) -> Result<bool, St
     if !simple {
         return Ok(false);
     }
-    let catalog = catalog(storage, ask.db, ask.coll, None)?;
+    let catalog = ask_catalog(storage, ask)?;
     let mut leading = catalog.iter().filter(|ix| ix.position(field) == Some(0));
     let (Some(index), None) = (leading.next(), leading.next()) else {
         return Ok(false);

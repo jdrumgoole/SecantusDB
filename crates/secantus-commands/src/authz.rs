@@ -342,6 +342,7 @@ pub(crate) fn check(
         "fsyncUnlock" => c.cluster("unlock"),
         "replSetGetStatus" => c.cluster("replSetGetStatus"),
         "replSetGetConfig" => c.cluster("replSetGetConfig"),
+        "replSetReconfig" => c.cluster("replSetConfigure"),
         "replSetStepDown" => c.cluster("replSetStateChange"),
         "getDefaultRWConcern" => c.cluster("getDefaultRWConcern"),
         "setDefaultRWConcern" => c.cluster("setDefaultRWConcern"),
@@ -353,8 +354,9 @@ pub(crate) fn check(
         "appendOplogNote" => c.cluster("appendOplogNote"),
         "lockInfo" => c.cluster("serverStatus"),
         "getClusterParameter" => c.cluster("getClusterParameter"),
-        "planCacheClear" | "planCacheClearFilters" => {
-            c.on_collection(doc, name, &["planCacheWrite"])
+        "planCacheClear" => c.on_collection(doc, name, &["planCacheWrite"]),
+        "planCacheClearFilters" | "planCacheSetFilter" => {
+            c.on_collection(doc, name, &["planCacheIndexFilter"])
         }
         "planCacheListFilters" => c.on_collection(doc, name, &["planCacheRead"]),
         "dbHash" | "dbhash" => c.on_database(&["dbHash"]),
