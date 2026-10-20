@@ -292,6 +292,20 @@ pub trait Storage: Send + Sync {
     /// oplog entries carry the session, or `None` for none. Default: nothing.
     fn set_oplog_session(&self, _session: Option<(Vec<u8>, i64)>) {}
 
+    /// Mark the writes on this thread as a retryable write's (encoded
+    /// `lsid`, `txnNumber`, the statement id of each statement position),
+    /// so its oplog entries carry the session; `None` clears.
+    fn set_retryable_session(&self, _session: Option<(Vec<u8>, i64, Vec<i32>)>) {}
+
+    /// Replace the statement ids of this thread's retryable write.
+    fn remap_retryable_statements(&self, _ids: Vec<i32>) {}
+
+    /// The statement position the next update or delete runs.
+    fn set_statement_position(&self, _position: Option<usize>) {}
+
+    /// The statement position of each document the next insert is handed.
+    fn set_insert_positions(&self, _positions: Option<Vec<usize>>) {}
+
     /// A high-water-mark resume token at oplog `seq` and the current cluster
     /// time, encoded as `bson::encode({_data: "<hex>"})`. Returned as the
     /// `postBatchResumeToken` of an empty change-stream batch so the client can

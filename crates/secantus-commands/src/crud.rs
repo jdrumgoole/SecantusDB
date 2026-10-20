@@ -622,9 +622,11 @@ fn insert_raw_path(
     if surviving.is_empty() {
         return Ok(doc! { "n": 0_i32, "ok": 1.0, "writeErrors": bson_array(pre_errors) });
     }
-    let (inserted, errors) = storage
-        .insert(db, coll, surviving, ordered)
-        .map_err(command_error)?;
+    // A retryable write's inserts name their statements (RM-224).
+    storage.set_insert_positions(Some(survivor_to_orig.clone()));
+    let inserted = storage.insert(db, coll, surviving, ordered);
+    storage.set_insert_positions(None);
+    let (inserted, errors) = inserted.map_err(command_error)?;
     insert_reply(inserted, errors, pre_errors, &survivor_to_orig, ordered)
 }
 
@@ -1037,9 +1039,11 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         return Ok(doc! { "n": 0_i32, "ok": 1.0, "writeErrors": bson_array(pre_errors) });
     }
 
-    let (inserted, errors) = storage
-        .insert(&db, &coll, surviving, ordered)
-        .map_err(command_error)?;
+    // A retryable write's inserts name their statements (RM-224).
+    storage.set_insert_positions(Some(survivor_to_orig.clone()));
+    let inserted = storage.insert(&db, &coll, surviving, ordered);
+    storage.set_insert_positions(None);
+    let (inserted, errors) = inserted.map_err(command_error)?;
     insert_reply(inserted, errors, pre_errors, &survivor_to_orig, ordered)
 }
 
@@ -1194,6 +1198,8 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             continue;
         }
         let statement_started = std::time::Instant::now();
+        // A retryable write's entries name this statement (RM-224).
+        storage.set_statement_position(Some(index));
         // A delete of ONE document removes the first its query matches in
         // the order mongod reads them.
         let first = if limit == 1 {
@@ -2122,6 +2128,8 @@ pub(crate) fn update_in(
         }
 
         let statement_started = std::time::Instant::now();
+        // A retryable write's entries name this statement (RM-224).
+        storage.set_statement_position(Some(index));
         // Pipeline-form `u` (`[...]`) vs operator/replacement-form (`{...}`).
         // An update of ONE document changes the first its query matches in
         // the order mongod reads them.
