@@ -995,6 +995,13 @@ impl CmdStorage for StorageAdapter {
         self.inner.prune_oplog(None).map_err(map_err)
     }
 
+    fn append_command_entry(&self, ns: &str, o: bson::Document) -> Result<(), StorageError> {
+        self.inner
+            .append_command_entry(ns, o)
+            .map(|_| ())
+            .map_err(map_err)
+    }
+
     fn append_oplog_note(&self, data: bson::Document) -> Result<(), StorageError> {
         self.inner
             .append_oplog_note(data)

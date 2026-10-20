@@ -590,17 +590,17 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
         options are not applied.
       Backlog-ID: RM-216
       Verify: none -- the missing fields are mongod's internal accounting; the registry's own tests are backlog_fixed
-- [ ] **Five commands mongod runs are 59 CommandNotFound here.**
+- [ ] **Four commands mongod runs are 59 CommandNotFound here.**
       mongod 8.2.11 (one-member replica set) answers each with success or
       an error of its own:
-      - diagnostics: `getDiagnosticData`, `dbCheck`;
+      - diagnostics: `getDiagnosticData` (mongod's FTDC sample);
       - settings: `setQuerySettings` / `removeQuerySettings`, `autoCompact`
         (needs background compaction, which RM-192 lacks).
 
       `filemd5` with `partialOk` is refused by name (115): its `md5state` is
-      mongod's own MD5 implementation's state. Twelve of the original
+      mongod's own MD5 implementation's state. Thirteen of the original
       seventeen landed 2026-10-20 (`applyOps`, `rotateCertificates`,
-      `validateDBMetadata`,
+      `validateDBMetadata`, `dbCheck`,
       `invalidateUserCache`, `replSetGetRBID`,
       `replSetFreeze`, `replSetMaintenance`, `dropConnections`,
       `releaseMemory`, `filemd5`, `setUserWriteBlockMode`,
@@ -612,7 +612,11 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       refuses a document over 16 MB (mongod applies one a little larger,
       as oplog application allows) and `importCollection`,
       `createDatabaseMetadata` and `modifyCollectionShardingIndexCatalog`
-      entries (115).
+      entries (115). `dbCheck` runs before it answers (mongod runs it in the
+      background), walks a whole database's collections in name order
+      (mongod's is its catalog's internal order), does not apply
+      `maxBytesPerBatch` / `maxBatchTimeMillis` / `maxCountPerSecond`, and
+      refuses `validateMode: "extraIndexKeysCheck"` (115).
       Backlog-ID: RM-219
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_commands_mongod_runs_are_commands_here
 - [ ] **A string that is not valid UTF-8 is refused.** An insert whose

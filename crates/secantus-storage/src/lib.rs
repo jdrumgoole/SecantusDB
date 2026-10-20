@@ -8403,6 +8403,18 @@ impl Storage {
         self.emit_oplog(&session, vec![entry], vec![None])
     }
 
+    /// Append a command entry `{op: "c", ns, o}` that changes no data, as
+    /// `dbCheck` writes for a secondary to check against, and return its seq.
+    pub fn append_command_entry(&self, ns: &str, o: Document) -> Result<i64> {
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let session = self.conn.open_session()?;
+        let mut entry = Document::new();
+        entry.insert("op", "c");
+        entry.insert("ns", ns);
+        entry.insert("o", Bson::Document(o));
+        self.emit_oplog(&session, vec![entry], vec![None])
+    }
+
     /// The smallest seq whose entry `ts >= target` (tail + 1 if none qualify) —
     /// used to resolve `startAtOperationTime`. Mirrors `storage.find_seq_for_ts`.
     pub fn find_seq_for_ts(&self, ts: bson::Timestamp) -> Result<i64> {

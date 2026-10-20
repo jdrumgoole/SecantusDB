@@ -51,6 +51,7 @@ pub mod cluster_admin;
 pub mod cluster_params;
 pub mod crud;
 pub mod cursors;
+mod db_check;
 mod dbhash;
 mod ddl_checks;
 pub mod diagnostics;
@@ -712,6 +713,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "applyOps" => apply_ops::apply_ops,
         "rotateCertificates" => misc_admin::rotate_certificates,
         "validateDBMetadata" => misc_admin::validate_db_metadata,
+        "dbCheck" => db_check::db_check,
         "releaseMemory" => misc_admin::release_memory,
         "filemd5" => misc_admin::filemd5,
         "planCacheClear" => replset_admin::plan_cache_clear,
