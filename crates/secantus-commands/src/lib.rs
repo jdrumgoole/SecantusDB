@@ -55,6 +55,8 @@ pub mod diagnostics;
 pub mod distinct;
 mod explain;
 mod generic;
+mod hybrid;
+mod index_filters;
 pub use generic::db_field_problem;
 pub mod failpoints;
 pub mod find;
@@ -656,6 +658,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "setFeatureCompatibilityVersion" => cluster_admin::set_feature_compatibility_version,
         "dbHash" | "dbhash" => dbhash::db_hash,
         "replSetGetConfig" => serverinfo::repl_set_get_config,
+        "replSetReconfig" => replset_admin::repl_set_reconfig,
         "shardingState" => serverinfo::sharding_state,
         "fsyncUnlock" => serverinfo::fsync_unlock,
         "fsync" => diagnostics::fsync,
@@ -668,8 +671,10 @@ fn lookup(name: &str) -> Option<Handler> {
         "lockInfo" => replset_admin::lock_info,
         "features" => replset_admin::features,
         "getClusterParameter" => replset_admin::get_cluster_parameter,
-        "planCacheClear" | "planCacheClearFilters" => replset_admin::plan_cache_clear,
-        "planCacheListFilters" => replset_admin::plan_cache_list_filters,
+        "planCacheClear" => replset_admin::plan_cache_clear,
+        "planCacheClearFilters" => index_filters::clear_filters,
+        "planCacheListFilters" => index_filters::list_filters,
+        "planCacheSetFilter" => index_filters::set_filter,
         "configureFailPoint" => configure_fail_point,
         _ => return None,
     })

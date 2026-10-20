@@ -1044,14 +1044,6 @@ pub(crate) mod sphere {
         to_arc(p, a, b) <= NEAR
     }
 
-    /// Whether two arcs have a point in common.
-    pub fn arcs_touch(a: V, b: V, c: V, d: V) -> bool {
-        if on_arc(a, c, d) || on_arc(b, c, d) || on_arc(c, a, b) || on_arc(d, a, b) {
-            return true;
-        }
-        arcs_cross(a, b, c, d)
-    }
-
     /// Whether two arcs cross away from their ends.
     pub fn arcs_cross(a: V, b: V, c: V, d: V) -> bool {
         let (n1, n2) = (cross(a, b), cross(c, d));
@@ -1451,14 +1443,6 @@ pub(crate) mod sphere {
         }
     }
 
-    fn covers(part: &Part, p: V) -> bool {
-        match part {
-            Part::Point(q) => angle(p, *q) <= NEAR,
-            Part::Line(l) => edges(l, false).iter().any(|(a, b)| on_arc(p, *a, *b)),
-            Part::Polygon(rings) => in_polygon(p, rings),
-        }
-    }
-
     fn parts_meet(x: &Part, y: &Part) -> bool {
         match (x, y) {
             // A point is its leaf cell (`GeometryContainer::intersects`).
@@ -1473,17 +1457,26 @@ pub(crate) mod sphere {
                 line_meets_polygon(l, rings)
             }
             (Part::Polygon(x), Part::Polygon(y)) => polygons_meet(x, y),
-            _ => {
-                if part_points(x).iter().any(|p| covers(y, *p))
-                    || part_points(y).iter().any(|p| covers(x, *p))
-                {
-                    return true;
-                }
-                let (ex, ey) = (part_edges(x), part_edges(y));
-                ex.iter()
-                    .any(|(a, b)| ey.iter().any(|(c, d)| arcs_touch(*a, *b, *c, *d)))
-            }
+            // `S2Polyline::Intersects`: an edge of one crosses an edge of
+            // the other, or they share a vertex (`RobustCrossing >= 0`),
+            // settled by S2's exact predicates. A line ending exactly on
+            // another's edge does not meet it (measured 8.2.11).
+            (Part::Line(x), Part::Line(y)) => lines_meet(x, y),
         }
+    }
+
+    fn lines_meet(x: &[V], y: &[V]) -> bool {
+        use crate::s2legacy::edge::EdgeCrosser;
+        use crate::s2legacy::point::Point;
+        if x.is_empty() || y.is_empty() {
+            return false;
+        }
+        x.windows(2).any(|e| {
+            let mut crosser = EdgeCrosser::new(Point(e[0]), Point(e[1]), Point(y[0]));
+            y[1..]
+                .iter()
+                .any(|d| crosser.robust_crossing(Point(*d)) >= 0)
+        })
     }
 
     /// Strictly inside the polygon: in it, and not on its boundary.

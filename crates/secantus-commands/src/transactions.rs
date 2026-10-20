@@ -272,10 +272,12 @@ pub enum StmtRecord {
         upserted: Option<Bson>,
     },
     Delete,
-    /// A `findAndModify` and the reply it gave.
+    /// A `findAndModify` and the reply it gave, whether it removed, and
+    /// whether it returned the document after the update (`new`).
     FindAndModify {
         reply: Document,
         remove: bool,
+        new: bool,
     },
 }
 
@@ -547,13 +549,16 @@ impl TransactionRegistry {
             if txn_number == active {
                 return Err(cannot_restart());
             }
-            if let Some(Session {
-                kind: Kind::Txn(old),
-                ..
-            }) = inner.sessions.get(lsid_bytes)
-            {
-                self.abort_locked(old);
-            }
+            // The transaction this one replaces is aborted once the registry
+            // is released: it may be running a statement, and waiting for it
+            // here would stall every session's command, and the accept loop.
+            let replaced = match inner.sessions.get(lsid_bytes) {
+                Some(Session {
+                    kind: Kind::Txn(old),
+                    ..
+                }) => Some(old.clone()),
+                _ => None,
+            };
             let txn = Arc::new(Mutex::new(Transaction::new(
                 lsid_bytes.to_vec(),
                 txn_number,
@@ -572,28 +577,35 @@ impl TransactionRegistry {
                     last_use: now,
                 },
             );
+            drop(inner);
+            if let Some(old) = replaced {
+                self.abort_locked(&old);
+            }
             return Ok(txn);
         }
-        // Continuation statement (no startTransaction flag).
-        match inner.sessions.get_mut(lsid_bytes) {
+        // Continuation statement (no startTransaction flag). The transaction
+        // is locked only after the registry is released: a statement of its
+        // own may hold it while it waits for a lock.
+        let c = match inner.sessions.get_mut(lsid_bytes) {
             Some(session) if session.active == txn_number => {
                 session.last_use = now;
                 let Kind::Txn(c) = &session.kind else {
                     return Err(no_such_transaction_reply(lsid_bytes, txn_number, active));
                 };
-                let c = c.clone();
-                let mut t = c.lock().unwrap_or_else(|e| e.into_inner());
-                match t.state {
-                    TxnState::Committed => Err(transaction_committed(txn_number)),
-                    TxnState::Aborted => Err(transaction_aborted(txn_number)),
-                    TxnState::InProgress => {
-                        t.last_use = now;
-                        drop(t);
-                        Ok(c)
-                    }
-                }
+                c.clone()
             }
-            _ => Err(no_such_transaction_reply(lsid_bytes, txn_number, active)),
+            _ => return Err(no_such_transaction_reply(lsid_bytes, txn_number, active)),
+        };
+        drop(inner);
+        let mut t = c.lock().unwrap_or_else(|e| e.into_inner());
+        match t.state {
+            TxnState::Committed => Err(transaction_committed(txn_number)),
+            TxnState::Aborted => Err(transaction_aborted(txn_number)),
+            TxnState::InProgress => {
+                t.last_use = now;
+                drop(t);
+                Ok(c)
+            }
         }
     }
 
@@ -721,6 +733,7 @@ impl TransactionRegistry {
     /// aborts the session's open transaction and starts with none.
     pub fn begin_retryable(&self, lsid_bytes: &[u8], txn_number: i64) -> Result<Applied, Document> {
         let (mut inner, now) = self.locked();
+        let mut replaced = None;
         if let Some(session) = inner.sessions.get_mut(lsid_bytes) {
             let retryable = matches!(session.kind, Kind::Retryable(_));
             if txn_number < session.active {
@@ -739,7 +752,7 @@ impl TransactionRegistry {
                 };
             }
             if let Kind::Txn(old) = &session.kind {
-                self.abort_locked(old);
+                replaced = Some(old.clone());
             }
         }
         inner.sessions.insert(
@@ -750,6 +763,11 @@ impl TransactionRegistry {
                 last_use: now,
             },
         );
+        // A transaction is locked only once the registry is released.
+        drop(inner);
+        if let Some(old) = replaced {
+            self.abort_locked(&old);
+        }
         Ok(Applied::default())
     }
 
@@ -779,23 +797,44 @@ impl TransactionRegistry {
 
     /// `killSessions`: abort the session's in-progress transaction.
     pub fn abort_for_session(&self, lsid_bytes: &[u8]) {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(Session {
-            kind: Kind::Txn(c), ..
-        }) = inner.sessions.get(lsid_bytes)
+        let txn = match self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sessions
+            .get(lsid_bytes)
         {
-            self.abort_locked(c);
+            Some(Session {
+                kind: Kind::Txn(c), ..
+            }) => Some(c.clone()),
+            _ => None,
+        };
+        if let Some(c) = txn {
+            self.abort_locked(&c);
         }
     }
 
     /// `killAllSessions` / shutdown: abort everything.
     pub fn abort_all(&self) {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        for session in inner.sessions.values() {
-            if let Kind::Txn(c) = &session.kind {
-                self.abort_locked(c);
-            }
+        for c in self.open_transactions() {
+            self.abort_locked(&c);
         }
+    }
+
+    /// Every session's transaction, taken from the registry so that each is
+    /// locked with the registry released: the order every path keeps is a
+    /// transaction first, the registry second, never the other way round.
+    fn open_transactions(&self) -> Vec<Arc<Mutex<Transaction>>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sessions
+            .values()
+            .filter_map(|s| match &s.kind {
+                Kind::Txn(c) => Some(c.clone()),
+                Kind::Retryable(_) => None,
+            })
+            .collect()
     }
 
     /// Sessions holding transaction or retryable-write state: mongod's
@@ -810,17 +849,9 @@ impl TransactionRegistry {
 
     /// Count of in-progress transactions (test/introspection helper).
     pub fn in_progress_count(&self) -> usize {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .sessions
-            .values()
-            .filter(|s| match &s.kind {
-                Kind::Txn(c) => {
-                    c.lock().unwrap_or_else(|e| e.into_inner()).state == TxnState::InProgress
-                }
-                Kind::Retryable(_) => false,
-            })
+        self.open_transactions()
+            .iter()
+            .filter(|c| c.lock().unwrap_or_else(|e| e.into_inner()).state == TxnState::InProgress)
             .count()
     }
 

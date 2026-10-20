@@ -46,6 +46,16 @@ pub enum Mode {
 }
 
 impl Mode {
+    /// mongod's name for the mode in a lock error (`IX`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::Is => "IS",
+            Mode::Ix => "IX",
+            Mode::S => "S",
+            Mode::X => "X",
+        }
+    }
+
     /// mongod's one-letter name, as `serverStatus.locks` shows it.
     pub fn letter(self) -> &'static str {
         match self {
@@ -86,6 +96,16 @@ pub enum Resource {
 }
 
 impl Resource {
+    /// The resource as mongod names it in a lock error: `{Collection :
+    /// db.c}` (measured 8.2.11).
+    pub fn described(&self) -> String {
+        match self {
+            Resource::Collection(ns) => format!("{{Collection : {ns}}}"),
+            Resource::Database(db) => format!("{{Database : {db}}}"),
+            other => format!("{{{} : {}}}", other.kind(), other.kind()),
+        }
+    }
+
     /// The resource kind, as `serverStatus.locks` keys it.
     pub fn kind(&self) -> &'static str {
         match self {

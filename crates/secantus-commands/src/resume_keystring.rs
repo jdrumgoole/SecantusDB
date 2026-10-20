@@ -5,15 +5,15 @@
 //! and reports where that failed, so the error a client sees depends on the
 //! bytes. This is a transcription of the part of mongod 8.2's decoder that
 //! such a token can reach -- `key_string::toBsonSafe` with all-ascending
-//! ordering and no `_typeBits` (`src/mongo/db/storage/key_string/
+//! ordering (`src/mongo/db/storage/key_string/
 //! key_string.cpp`) -- followed by `ResumeToken::getData`'s checks of the
 //! fields it decoded (`src/mongo/db/pipeline/resume_token.cpp`). Each error
 //! was measured against mongod 8.2.11.
 //!
-//! Two shapes are not reproduced and answer [`Verdict::Unmodelled`]: a tiny
+//! `_typeBits` is read as mongod reads it, so a number decodes as the type
+//! its bits name. What is not reproduced answers [`Verdict::Unmodelled`]: a
 //! decimal (whose exponent adjustment is Decimal128 arithmetic), and a token
-//! that decodes cleanly -- mongod goes on to look for it in its oplog. A token
-//! carrying `_typeBits` is not read here at all.
+//! that decodes cleanly -- mongod goes on to look for it in its oplog.
 
 use bson::{Bson, Document};
 
@@ -61,6 +61,86 @@ fn format_error(code: i32, msg: impl std::fmt::Display) -> Stop {
 }
 
 const MAX_DEPTH: u32 = 200;
+
+/// mongod's `TypeBits` reader: which numeric type each number was, and
+/// whether each string was a symbol, read a bit at a time in decode order
+/// (`TypeBits::Reader`, `key_string.cpp`).
+struct Bits {
+    data: Vec<u8>,
+    at: usize,
+}
+
+const K_INT: u8 = 0;
+const K_LONG: u8 = 1;
+const K_DOUBLE: u8 = 2;
+const K_DECIMAL: u8 = 3;
+
+impl Bits {
+    /// `TypeBits::fromBuffer` over a `_typeBits` BinData: one byte under
+    /// 0x80 is the bits themselves; `0x80 | n` is followed by `n` bytes;
+    /// `0x80` by a four-byte little-endian size; nothing or 0 is all zeros.
+    fn from_buffer(bytes: &[u8]) -> Result<Bits, Stop> {
+        let data = match bytes.first() {
+            None | Some(0) => Vec::new(),
+            Some(&b) if b < 0x80 => vec![b],
+            Some(0x80) => {
+                let size = bytes
+                    .get(1..5)
+                    .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize)
+                    .ok_or_else(|| overflow(4, bytes.len() - 1))?;
+                if size <= 127 {
+                    return Err(format_error(50910, "Invalid overlong encoding."));
+                }
+                bytes
+                    .get(5..5 + size)
+                    .ok_or_else(|| overflow(size, bytes.len() - 5))?
+                    .to_vec()
+            }
+            Some(&b) => {
+                let size = usize::from(b & 0x7f);
+                bytes
+                    .get(1..1 + size)
+                    .ok_or_else(|| overflow(size, bytes.len() - 1))?
+                    .to_vec()
+            }
+        };
+        Ok(Bits { data, at: 0 })
+    }
+
+    fn all_zeros(&self) -> bool {
+        self.data.iter().all(|b| *b == 0)
+    }
+
+    fn bit(&mut self) -> Result<u8, Stop> {
+        if self.all_zeros() {
+            return Ok(0);
+        }
+        let byte = self.at / 8;
+        let offset = self.at % 8;
+        self.at += 1;
+        let Some(b) = self.data.get(byte) else {
+            return Err(format_error(50615, "Invalid size byte(s)."));
+        };
+        Ok((b >> offset) & 1)
+    }
+
+    fn numeric(&mut self) -> Result<u8, Stop> {
+        let high = self.bit()?;
+        Ok((high << 1) | self.bit()?)
+    }
+
+    /// `readZero`: a numeric type, or for the special prefix three more
+    /// bits naming a negative or decimal zero.
+    fn zero(&mut self) -> Result<u8, Stop> {
+        let mut res = self.numeric()?;
+        if res == 3 {
+            for _ in 0..3 {
+                res = (res << 1) | self.bit()?;
+            }
+        }
+        Ok(res)
+    }
+}
 
 struct Reader<'a> {
     buf: &'a [u8],
@@ -119,17 +199,17 @@ impl Reader<'_> {
 }
 
 /// `toBson`: an object's fields until a zero type byte.
-fn object(r: &mut Reader<'_>, depth: u32) -> Result<(), Stop> {
+fn object(r: &mut Reader<'_>, bits: &mut Bits, depth: u32) -> Result<(), Stop> {
     while r.u8()? != 0 {
         r.cstring()?;
         let ctype = r.u8()?;
-        value(ctype, r, depth)?;
+        value(ctype, r, bits, depth)?;
     }
     Ok(())
 }
 
-/// `toBsonValue` with no type bits: every numeric reads as an int.
-fn value(ctype: u8, r: &mut Reader<'_>, depth: u32) -> Result<Elem, Stop> {
+/// `toBsonValue`, the type bits saying what each number was.
+fn value(ctype: u8, r: &mut Reader<'_>, bits: &mut Bits, depth: u32) -> Result<Elem, Stop> {
     if depth > MAX_DEPTH {
         return Err(Stop::Error(
             15,
@@ -152,13 +232,18 @@ fn value(ctype: u8, r: &mut Reader<'_>, depth: u32) -> Result<Elem, Stop> {
             r.skip(12)?;
             Elem::Other
         }
-        60 | 160 => {
+        60 => {
+            bits.bit()?;
+            r.cstring_with_nuls()?;
+            Elem::Other
+        }
+        160 => {
             r.cstring_with_nuls()?;
             Elem::Other
         }
         170 => {
             r.cstring_with_nuls()?;
-            object(r, depth + 2)?;
+            object(r, bits, depth + 2)?;
             Elem::Other
         }
         90 => {
@@ -189,7 +274,7 @@ fn value(ctype: u8, r: &mut Reader<'_>, depth: u32) -> Result<Elem, Stop> {
             Elem::Other
         }
         70 => {
-            object(r, depth + 1)?;
+            object(r, bits, depth + 1)?;
             Elem::Object
         }
         80 => {
@@ -198,24 +283,65 @@ fn value(ctype: u8, r: &mut Reader<'_>, depth: u32) -> Result<Elem, Stop> {
                 if t == 0 {
                     break;
                 }
-                value(t, r, depth + 1)?;
+                value(t, r, bits, depth + 1)?;
             }
             Elem::Other
         }
-        // kNumericNaN: an int is not a NaN.
-        30 => return Err(format_error(50819, "Invalid type bits for numeric NaN")),
+        // kNumericNaN: only a double (or a decimal) is a NaN.
+        30 => match bits.numeric()? {
+            K_DOUBLE | K_DECIMAL => Elem::Other,
+            _ => return Err(format_error(50819, "Invalid type bits for numeric NaN")),
+        },
         // kNumericZero.
-        41 => Elem::Int(0),
-        // Large magnitudes: only a double or a decimal can be one.
+        41 => match bits.zero()? {
+            K_INT => Elem::Int(0),
+            K_LONG | K_DOUBLE | 3 | 0x18 => Elem::Other,
+            zero => {
+                // The twelve bits of a decimal zero's exponent are read
+                // first, the unused encoding included (it then fails).
+                for _ in 0..12 {
+                    bits.bit()?;
+                }
+                if zero == 0x19 {
+                    return Err(format_error(50846, "Invalid numeric zero decimal."));
+                }
+                Elem::Other
+            }
+        },
+        // Large magnitudes.
         31 | 51 => {
+            let original = bits.numeric()?;
             let encoded = r.be(8, ctype == 31)?;
             if encoded & (1 << 63) != 0 && encoded != u64::MAX {
-                return Err(format_error(50818, "Invalid type bits for decimal number."));
+                if original != K_DECIMAL {
+                    return Err(format_error(50818, "Invalid type bits for decimal number."));
+                }
+                return Err(Stop::Unmodelled);
             }
-            return Err(format_error(50826, "Unexpected type of large number."));
+            match original {
+                K_DOUBLE => Elem::Other,
+                K_LONG => {
+                    // Only the most negative long is this large.
+                    let mut bin = if encoded == u64::MAX {
+                        f64::INFINITY
+                    } else {
+                        f64::from_bits((encoded >> 1) | (1 << 62))
+                    };
+                    if ctype == 31 {
+                        bin = -bin;
+                    }
+                    if bin != i64::MIN as f64 {
+                        return Err(format_error(50821, "Unexpected value for large number."));
+                    }
+                    Elem::Other
+                }
+                K_DECIMAL => return Err(Stop::Unmodelled),
+                _ => return Err(format_error(50826, "Unexpected type of large number.")),
+            }
         }
-        // Small magnitudes: a fraction, which an int is not.
+        // Small magnitudes: a fraction.
         40 | 42 => {
+            let original = bits.numeric()?;
             let encoded = r.be(8, ctype == 40)?;
             match encoded >> 62 {
                 0 => {
@@ -224,18 +350,39 @@ fn value(ctype: u8, r: &mut Reader<'_>, depth: u32) -> Result<Elem, Stop> {
                     if coeff == 0 || coeff >= 10u128.pow(34) {
                         return Err(format_error(50829, "Expected non-zero number for decimal."));
                     }
-                    return Err(Stop::Unmodelled);
+                    // A teeny tiny decimal: the high word is Decimal128's
+                    // own, its exponent in the 14 bits above the coefficient.
+                    decimal_exponent(coeff, ((encoded >> 49) & 0x3fff) as u32, bits)?;
+                    Elem::Other
                 }
-                1 | 2 => return Err(format_error(50823, "Expected decimal continuation.")),
-                _ => {
-                    return Err(format_error(
-                        50825,
-                        "Unexpected type for small number, expected decimal.",
-                    ))
+                1 | 2 => {
+                    let continued = encoded & 1 != 0;
+                    if original == K_DOUBLE {
+                        if continued {
+                            return Err(format_error(50822, "Unexpected decimal continuation."));
+                        }
+                        Elem::Other
+                    } else if original == K_DECIMAL && continued {
+                        return Err(Stop::Unmodelled);
+                    } else {
+                        return Err(format_error(50823, "Expected decimal continuation."));
+                    }
                 }
+                _ => match original {
+                    K_DOUBLE if encoded & 3 == 0 => Elem::Other,
+                    K_DOUBLE => return Err(format_error(50824, "Decimal contuation mismatch.")),
+                    K_DECIMAL => return Err(Stop::Unmodelled),
+                    _ => {
+                        return Err(format_error(
+                            50825,
+                            "Unexpected type for small number, expected decimal.",
+                        ))
+                    }
+                },
             }
         }
         32..=39 | 43..=50 => {
+            let original = bits.numeric()?;
             let negative = ctype <= 39;
             let n = if negative {
                 usize::from(39 - ctype + 1)
@@ -246,20 +393,93 @@ fn value(ctype: u8, r: &mut Reader<'_>, depth: u32) -> Result<Elem, Stop> {
             if encoded & 1 != 0 {
                 // A fractional part, read to a full eight bytes first.
                 r.be(8 - n, negative)?;
-                return Err(format_error(50810, "Expected type Decimal."));
+                return match original {
+                    K_DOUBLE => Ok(Elem::Other),
+                    K_DECIMAL => Err(Stop::Unmodelled),
+                    _ => Err(format_error(50810, "Expected type Decimal.")),
+                };
             }
-            let mut v = (encoded >> 1) as i64;
-            if negative {
-                v = -v;
+            match original {
+                K_INT => {
+                    let mut v = (encoded >> 1) as i64;
+                    if negative {
+                        v = -v;
+                    }
+                    Elem::Int(v as i32)
+                }
+                K_DECIMAL => {
+                    integral_decimal_exponent(u128::from(encoded >> 1), bits)?;
+                    Elem::Other
+                }
+                _ => Elem::Other,
             }
-            Elem::Int(v as i32)
         }
         other => return Err(format_error(50811, format!("Unknown type: {other}"))),
     })
 }
 
+/// `adjustDecimalExponent` for a decimal made from a whole number (exponent
+/// 0, biased 6176).
+fn integral_decimal_exponent(coefficient: u128, bits: &mut Bits) -> Result<(), Stop> {
+    decimal_exponent(coefficient, 6176, bits)
+}
+
+/// `adjustDecimalExponent`: the stored low six bits of the exponent the
+/// decimal was written with, and whether mongod can rescale a coefficient
+/// at `biased` (an exponent with Decimal128's bias) to it exactly.
+fn decimal_exponent(coefficient: u128, biased: u32, bits: &mut Bits) -> Result<(), Stop> {
+    const MAX_BIASED: u32 = 12287;
+    let mut stored = 0u32;
+    for _ in 0..6 {
+        stored = (stored << 1) | u32::from(bits.bit()?);
+    }
+    let mut high = (biased & !63) | stored;
+    if high < biased {
+        high += 64;
+    }
+    if high == biased {
+        return Ok(());
+    }
+    let wide = coefficient >> 64 != 0;
+    if high <= biased + 33 && (wide || high <= biased + 19) {
+        if high > MAX_BIASED {
+            return Err(format_error(
+                50845,
+                "Unexpected exponent values after adjusting Decimal.",
+            ));
+        }
+        // Quantize up: exact only when the coefficient has the zeros.
+        if !coefficient.is_multiple_of(10u128.pow(high - biased)) {
+            return Err(format_error(
+                50813,
+                "Unexpected signaling flag for Decimal quantization.",
+            ));
+        }
+        return Ok(());
+    }
+    // mongod's own unsigned 32-bit arithmetic: below 33 the bound wraps,
+    // and below 64 so does `low`, and either refuses the decimal.
+    let low = high.wrapping_sub(64);
+    if low < biased.wrapping_sub(33) || low > MAX_BIASED {
+        return Err(format_error(
+            50814,
+            "Unexpected exponent values after adjusting Decimal.",
+        ));
+    }
+    // Scaling down: the coefficient grows by the same power of ten, and must
+    // stay within 34 digits or the sum rounds to another exponent.
+    let digits = coefficient.checked_ilog10().map_or(1, |d| d + 1);
+    if digits + (biased - low) > 34 {
+        return Err(format_error(
+            50830,
+            "Unexpected biased exponent in decimal.",
+        ));
+    }
+    Ok(())
+}
+
 /// `toBsonSafe`: the top-level elements, until the end marker.
-fn decode(bytes: &[u8]) -> Result<Vec<Elem>, Stop> {
+fn decode(bytes: &[u8], bits: &mut Bits) -> Result<Vec<Elem>, Stop> {
     let mut r = Reader { buf: bytes, pos: 0 };
     let mut out = Vec::new();
     while r.remaining() > 0 {
@@ -270,7 +490,7 @@ fn decode(bytes: &[u8]) -> Result<Vec<Elem>, Stop> {
         if ctype == 4 {
             break;
         }
-        out.push(value(ctype, &mut r, 1)?);
+        out.push(value(ctype, &mut r, bits, 1)?);
     }
     Ok(out)
 }
@@ -387,10 +607,16 @@ pub fn mongod_verdict(tok: &Document) -> Verdict {
     // was. None, or bits that are all zero, leave every number an int32 as
     // decoded below; other bits are not transcribed. Anything but BinData is
     // refused before the token is read (mongod 8.2.11, 2026-10-20).
-    match tok.get("_typeBits") {
-        None => {}
-        Some(Bson::Binary(bits)) if bits.bytes.iter().all(|b| *b == 0) => {}
-        Some(Bson::Binary(_)) => return Verdict::Unmodelled,
+    let mut bits = match tok.get("_typeBits") {
+        None => Bits {
+            data: Vec::new(),
+            at: 0,
+        },
+        Some(Bson::Binary(b)) => match Bits::from_buffer(&b.bytes) {
+            Ok(bits) => bits,
+            Err(Stop::Error(code, name, msg)) => return Verdict::Error(code, name, msg),
+            Err(Stop::Unmodelled) => return Verdict::Unmodelled,
+        },
         Some(_) => {
             return Verdict::Error(
                 40648,
@@ -401,7 +627,7 @@ pub fn mongod_verdict(tok: &Document) -> Verdict {
                 ),
             )
         }
-    }
+    };
     let Ok(hex) = tok.get_str("_data") else {
         return Verdict::Unmodelled;
     };
@@ -415,7 +641,7 @@ pub fn mongod_verdict(tok: &Document) -> Verdict {
     else {
         return Verdict::Unmodelled;
     };
-    match decode(&bytes) {
+    match decode(&bytes, &mut bits) {
         Ok(elems) => check_fields(&elems),
         Err(Stop::Error(code, name, msg)) => Verdict::Error(code, name, msg),
         Err(Stop::Unmodelled) => Verdict::Unmodelled,

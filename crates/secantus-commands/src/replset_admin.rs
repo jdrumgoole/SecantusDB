@@ -1,24 +1,19 @@
 //! The replica-set, lock, feature, cluster-parameter and plan-cache
 //! commands a tool sends a one-member set: `replSetInitiate`,
 //! `appendOplogNote`, `replSetResizeOplog`, `lockInfo`, `features`,
-//! `getClusterParameter`, `planCacheClear`, `planCacheClearFilters` and
-//! `planCacheListFilters`.
+//! `getClusterParameter` and `planCacheClear`.
 //!
 //! Every reply and message is what mongod 8.2.11 answered (2026-10-15), as
 //! a replica-set member and, for a server run without a set name, as a
 //! standalone. Each command says only what is true of this server:
 //!
 //! - `features` has no `js` block, because there is no script engine.
-//! - `getClusterParameter` reports the cluster parameters whose default is a
-//!   fact about this server (no shards, no default `maxTimeMS`, pre-images
-//!   that go with the oplog). It does not have the rest, so it answers 4 for
-//!   them, as mongod does for a name it does not have.
-//! - There is no plan cache and no index filter here, so clearing either
-//!   is true and the filter list is empty. `planCacheSetFilter` is not a
-//!   command: a filter would be accepted and never applied.
-//! - `replSetResizeOplog` changes the oplog's cap. `minRetentionHours` above
-//!   zero is refused, because this oplog drops an entry older than its
-//!   retention window whatever its size.
+//! - `getClusterParameter` reports mongod's fifteen cluster parameters at
+//!   their defaults; `setClusterParameter` is not a command here.
+//! - There is no plan cache here, so clearing it is true. Index filters are
+//!   `index_filters`.
+//! - `replSetResizeOplog` changes the oplog's cap, and `minRetentionHours`
+//!   keeps every entry younger than it whatever the cap.
 
 use bson::{doc, Bson, Document};
 
@@ -196,14 +191,6 @@ pub fn repl_set_resize_oplog(doc: &Document, ctx: &mut CommandContext) -> Handle
         if h < 0.0 {
             return Err(out_of_range("minRetentionHours", ">=", 0.0, h));
         }
-        if h > 0.0 {
-            return Err(CommandError::new(
-                2,
-                "BadValue",
-                "minRetentionHours is not supported by this server: its oplog drops an entry \
-                 older than its retention window whatever the oplog's size",
-            ));
-        }
     }
     if let Some(mb) = size {
         let entries = (mb * ENTRIES_PER_MB).round().min(usize::MAX as f64) as usize;
@@ -211,6 +198,253 @@ pub fn repl_set_resize_oplog(doc: &Document, ctx: &mut CommandContext) -> Handle
             .set_oplog_max_entries(entries)
             .map_err(storage_error)?;
     }
+    // No entry younger than this goes, whatever the size (mongod 8.2.11).
+    if let Some(h) = hours {
+        ctx.storage()?
+            .set_oplog_min_retention_seconds((h * 3600.0).round() as i64)
+            .map_err(storage_error)?;
+    }
+    Ok(doc! {"ok": 1.0})
+}
+
+fn config_error(code: i32, msg: impl Into<String>) -> CommandError {
+    CommandError::new(code, crate::util::error_code_name(code), msg)
+}
+
+/// `replSetReconfig`: a new configuration for the one-member set, kept in
+/// `local.system.replset` where `replSetGetConfig` reads it. Each check and
+/// message is mongod 8.2.11's (measured 2026-10-20). A configuration with
+/// more members than this server is refused: SecantusDB is a single-node
+/// set, and mongod would go on to replicate to them.
+pub fn repl_set_reconfig(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let (Some(set_name), Some((host, port))) =
+        (ctx.replica_set_name.clone(), ctx.server_address.clone())
+    else {
+        return Err(config_error(76, "not running with --replSet"));
+    };
+    let Some(Bson::Document(new)) = doc.get("replSetReconfig") else {
+        return Err(config_error(2, "no configuration specified"));
+    };
+    let force = doc.get("force").is_some_and(crate::util::truthy);
+    const FIELDS: &[&str] = &[
+        "_id",
+        "version",
+        "term",
+        "members",
+        "protocolVersion",
+        "writeConcernMajorityJournalDefault",
+        "settings",
+        "configsvr",
+    ];
+    for key in new.keys() {
+        if !FIELDS.contains(&key.as_str()) {
+            return Err(config_error(
+                93,
+                format!("BSON field 'ReplSetConfig.{key}' is an unknown field."),
+            ));
+        }
+    }
+    for required in ["_id", "version", "members"] {
+        if !new.contains_key(required) {
+            return Err(config_error(
+                93,
+                format!("BSON field 'ReplSetConfig.{required}' is missing but a required field"),
+            ));
+        }
+    }
+    let name = new.get_str("_id").unwrap_or_default();
+    if name != set_name {
+        return Err(config_error(
+            93,
+            format!(
+                "Rejecting reconfig where new config set name differs from command line set \
+                 name, new config set name: {name}, old config set name: {set_name}"
+            ),
+        ));
+    }
+    let storage = ctx.storage()?;
+    let host_port = format!("{host}:{port}");
+    let old = crate::serverinfo::stored_replset_config(storage, &set_name).unwrap_or_else(|| {
+        crate::serverinfo::replset_config(
+            &set_name,
+            &host_port,
+            crate::handshake::hello_process_id(),
+        )
+    });
+    let members = new
+        .get_array("members")
+        .map_err(|_| config_error(93, "BSON field 'ReplSetConfig.members' is the wrong type"))?;
+    if members.is_empty() || members.len() > 50 {
+        return Err(config_error(
+            103,
+            format!(
+                "Replica set configuration contains {} members, but must have at least 1 and no \
+                 more than  50",
+                members.len()
+            ),
+        ));
+    }
+    if members.len() > 1 {
+        return Err(config_error(
+            103,
+            "SecantusDB is a single-node replica set: a configuration names exactly one member, \
+             this server",
+        ));
+    }
+    let Bson::Document(given) = &members[0] else {
+        return Err(config_error(
+            93,
+            "BSON field 'ReplSetConfig.members' is the wrong type",
+        ));
+    };
+    let mut member = doc! {
+        "_id": 0_i32,
+        "host": "",
+        "arbiterOnly": false,
+        "buildIndexes": true,
+        "hidden": false,
+        "priority": 1.0,
+        "tags": {},
+        "secondaryDelaySecs": 0_i64,
+        "votes": 1_i32,
+    };
+    for (k, v) in given {
+        member.insert(k.clone(), v.clone());
+    }
+    let number = |v: Option<&Bson>| {
+        v.and_then(|b| match b {
+            Bson::Int32(i) => Some(f64::from(*i)),
+            Bson::Int64(i) => Some(*i as f64),
+            Bson::Double(d) => Some(*d),
+            _ => None,
+        })
+    };
+    let old_id = old
+        .get_array("members")
+        .ok()
+        .and_then(|m| m.first())
+        .and_then(Bson::as_document)
+        .and_then(|m| m.get("_id"))
+        .cloned()
+        .unwrap_or(Bson::Int32(0));
+    // A member under another `_id` is a new member, and a new member has
+    // no vote until it has caught up: the set would have none.
+    // A member without a vote may not be electable (measured).
+    if number(member.get("votes")) == Some(0.0) && number(member.get("priority")) != Some(0.0) {
+        return Err(config_error(
+            93,
+            format!(
+                "member: {} :: caused by :: priority must be 0 when non-voting (votes:0)",
+                secantus_core::update::render_shell(&Bson::Document(member.clone()))
+            ),
+        ));
+    }
+    if number(member.get("_id")) != number(Some(&old_id))
+        || number(member.get("votes")) == Some(0.0)
+    {
+        return Err(config_error(
+            103,
+            "Replica set configuration contains 0 voting members, but must be at least 1 and no \
+             more than 7",
+        ));
+    }
+    if number(member.get("priority")) == Some(0.0) || member.get_bool("arbiterOnly") == Ok(true) {
+        return Err(config_error(
+            103,
+            "Replica set configuration must contain at least one non-arbiter member with \
+             priority > 0",
+        ));
+    }
+    let member_host = member.get_str("host").unwrap_or_default().to_string();
+    let mine = [
+        host_port.clone(),
+        format!("localhost:{port}"),
+        format!("127.0.0.1:{port}"),
+    ];
+    let version = number(new.get("version")).unwrap_or(0.0) as i64;
+    let old_version = old
+        .get_i32("version")
+        .map(i64::from)
+        .or_else(|_| old.get_i64("version"))
+        .unwrap_or(1);
+    let term = old
+        .get_i32("term")
+        .map(i64::from)
+        .or_else(|_| old.get_i64("term"))
+        .unwrap_or(1);
+    if !mine.contains(&member_host) {
+        return Err(config_error(
+            74,
+            format!(
+                "No host described in new configuration with {{version: {version}, term: \
+                 {term}}} for replica set {set_name} maps to this node"
+            ),
+        ));
+    }
+    if !force && version <= old_version {
+        return Err(config_error(
+            103,
+            format!(
+                "New replica set configuration version and term must be greater than old, but \
+                 {{version: {version}, term: {term}}} is not greater than {{version: \
+                 {old_version}, term: {term}}} for replica set {set_name}"
+            ),
+        ));
+    }
+    // The settings start from their defaults, not from the old ones: a
+    // configuration without `settings` puts each back (measured).
+    let old_set_id = old
+        .get_document("settings")
+        .ok()
+        .and_then(|s| s.get_object_id("replicaSetId").ok());
+    let mut settings = crate::serverinfo::replset_config(
+        &set_name,
+        &host_port,
+        old_set_id.unwrap_or_else(crate::handshake::hello_process_id),
+    )
+    .get_document("settings")
+    .cloned()
+    .unwrap_or_default();
+    if let Ok(given) = new.get_document("settings") {
+        if let (Ok(newer), Some(older)) = (given.get_object_id("replicaSetId"), old_set_id) {
+            if newer != older {
+                return Err(config_error(
+                    103,
+                    format!(
+                        "New and old configurations differ in replica set ID; old was {older}, \
+                         and new is {newer}"
+                    ),
+                ));
+            }
+        }
+        // The settings mongod knows; others are not kept (measured).
+        for (k, v) in given {
+            if settings.contains_key(k) && k != "replicaSetId" {
+                settings.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    let config = doc! {
+        "_id": set_name.clone(),
+        "version": version as i32,
+        "term": term as i32,
+        "members": [member],
+        "protocolVersion": 1_i64,
+        "writeConcernMajorityJournalDefault": new
+            .get_bool("writeConcernMajorityJournalDefault")
+            .unwrap_or(true),
+        "settings": settings,
+    };
+    storage
+        .update_matching(
+            "local",
+            "system.replset",
+            &doc! {"_id": set_name},
+            &config,
+            false,
+            true,
+        )
+        .map_err(storage_error)?;
     Ok(doc! {"ok": 1.0})
 }
 
@@ -244,13 +478,32 @@ pub fn features(doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! {"oidMachine": oid_machine(), "ok": 1.0})
 }
 
-/// The cluster parameters this server has: each default is a fact about
-/// it, in mongod's name order.
+/// mongod 8.2.11's fifteen cluster parameters, in its name order, each at
+/// its default: `setClusterParameter` is not a command here, so none can
+/// hold anything else (measured on a one-member replica set, 2026-10-20).
 fn cluster_parameters() -> Vec<Document> {
     vec![
         doc! {"_id": "addOrRemoveShardInProgress", "inProgress": false},
         doc! {"_id": "changeStreamOptions", "preAndPostImages": {"expireAfterSeconds": "off"}},
+        doc! {"_id": "changeStreams", "expireAfterSeconds": 3600_i64},
+        doc! {"_id": "configServerReadPreferenceForCatalogQueries", "mustAlwaysUseNearest": false},
+        doc! {"_id": "ddlLockOptimisticRecoveryWaitTimeout", "timeInMs": 100_i64},
         doc! {"_id": "defaultMaxTimeMS", "readOperations": 0_i64},
+        doc! {"_id": "fleAllowTotalTagOverheadToExceedBSONLimit", "shouldOverride": false},
+        doc! {
+            "_id": "fleCompactionOptions",
+            "maxCompactionSize": 268_435_456_i32,
+            "maxAnchorCompactionSize": 268_435_456_i32,
+            "maxESCEntriesPerCompactionDelete": 350_000_i32,
+        },
+        doc! {"_id": "fleDisableSubstringPreviewParameterLimits", "shouldOverride": false},
+        doc! {"_id": "internalQueryCutoffForSampleFromRandomCursor", "sampleCutoff": 0.05},
+        doc! {
+            "_id": "internalSearchOptions",
+            "oversubscriptionFactor": 1.064,
+            "batchSizeGrowthFactor": 1.5,
+        },
+        doc! {"_id": "internalVectorSearchStoredSource", "enabled": true},
         doc! {"_id": "onlyTargetDataOwningShardsForMultiWrites", "enabled": false},
         doc! {"_id": "pauseMigrationsDuringMultiUpdates", "enabled": false},
         doc! {"_id": "shardedClusterCardinalityForDirectConns", "hasTwoOrMoreShards": false},
@@ -373,17 +626,11 @@ fn plan_cache_target(
     Ok(())
 }
 
-/// `planCacheClear` / `planCacheClearFilters`: nothing to clear.
+/// `planCacheClear`: there is no plan cache to clear.
 pub fn plan_cache_clear(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let command = doc.keys().next().cloned().unwrap_or_default();
     plan_cache_target(doc, &command, ctx)?;
     Ok(doc! {"ok": 1.0})
-}
-
-/// `planCacheListFilters`: no filter can be set, so there is none.
-pub fn plan_cache_list_filters(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    plan_cache_target(doc, "planCacheListFilters", ctx)?;
-    Ok(doc! {"filters": [], "ok": 1.0})
 }
 
 #[cfg(test)]

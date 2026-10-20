@@ -162,7 +162,7 @@ pub fn logout(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
 /// The one-member set's configuration, in mongod's shape for a
 /// configuration nobody has changed.
-fn replset_config(
+pub(crate) fn replset_config(
     set_name: &str,
     host_port: &str,
     replica_set_id: bson::oid::ObjectId,
@@ -199,7 +199,7 @@ fn replset_config(
 }
 
 /// The configuration stored in `local.system.replset` for `set_name`.
-fn stored_replset_config(
+pub(crate) fn stored_replset_config(
     storage: &dyn crate::storage::Storage,
     set_name: &str,
 ) -> Option<Document> {
@@ -254,12 +254,22 @@ pub fn record_replset_config(
     let host_port = format!("{host}:{port}");
     match stored_replset_config(storage, set_name) {
         Some(stored) => {
-            let id = stored
-                .get_document("settings")
-                .ok()
-                .and_then(|s| s.get_object_id("replicaSetId").ok())
-                .unwrap_or_else(bson::oid::ObjectId::new);
-            let config = replset_config(set_name, &host_port, id);
+            // What `replSetReconfig` changed stays; only the member's address
+            // follows the port this run bound.
+            let mut config = stored.clone();
+            if config.get_document("settings").is_err() || config.get_array("members").is_err() {
+                let id = stored
+                    .get_document("settings")
+                    .ok()
+                    .and_then(|s| s.get_object_id("replicaSetId").ok())
+                    .unwrap_or_else(bson::oid::ObjectId::new);
+                config = replset_config(set_name, &host_port, id);
+            }
+            if let Ok(members) = config.get_array_mut("members") {
+                if let Some(Bson::Document(m)) = members.first_mut() {
+                    m.insert("host", host_port.clone());
+                }
+            }
             if stored != config {
                 storage.update_matching(
                     "local",
@@ -561,6 +571,11 @@ fn parameters(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
         ),
         ("localLogicalSessionTimeoutMinutes", true, Bson::Int32(30)),
         ("logLevel", true, Bson::Int32(0)),
+        (
+            "maxTransactionLockRequestTimeoutMillis",
+            true,
+            Bson::Int32(5),
+        ),
         // Honoured: a query the planner would answer with a collection scan
         // is refused (`crate::notablescan`).
         ("notablescan", true, Bson::Boolean(false)),

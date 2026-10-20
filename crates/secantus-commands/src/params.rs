@@ -127,6 +127,13 @@ const SETTABLE: &[(&str, ParamKind)] = &[
     // credentials they build from then on (`auth::scram_credentials`); a
     // credential already stored keeps its own count. mongod 8.2.11 takes
     // either at 5000 or more (measured 2026-10-20).
+    // How long a transaction's statement waits for a lock before it fails
+    // with LockTimeout (`session::statement`); -1 is no limit. mongod
+    // 8.2.11 takes any whole number, a fraction truncated.
+    (
+        "maxTransactionLockRequestTimeoutMillis",
+        ParamKind::Int32AtLeast(i32::MIN),
+    ),
     ("scramIterationCount", ParamKind::Int32AtLeast(5000)),
     ("scramSHA256IterationCount", ParamKind::Int32AtLeast(5000)),
     // mongod's connection-establishment rate limiter, honoured by

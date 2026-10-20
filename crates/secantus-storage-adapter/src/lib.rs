@@ -987,6 +987,11 @@ impl CmdStorage for StorageAdapter {
         Ok(())
     }
 
+    fn set_oplog_min_retention_seconds(&self, secs: i64) -> Result<(), StorageError> {
+        self.inner.set_oplog_min_retention_seconds(secs);
+        Ok(())
+    }
+
     fn ttl_monitor(&self) -> Option<(i64, bool, u64, u64)> {
         let m = self.inner.ttl_monitor();
         Some((m.sleep_secs, m.enabled, m.passes, m.deleted))

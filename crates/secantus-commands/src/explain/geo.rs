@@ -155,6 +155,14 @@ fn trailing_bounds(index: &GeoIndex, filter: &Document) -> Option<Vec<FieldBound
             .collect();
         let bound = match preds.as_slice() {
             [] => FieldBounds::Full,
+            // A range on the field bounds it too (measured 8.2.11:
+            // `{loc: "2dsphere", k: 1}` with `k: {$gte: "a"}` scans
+            // `["a", {})`).
+            [Bson::Document(d)]
+                if d.keys().any(|k| k.starts_with('$')) && !d.contains_key("$eq") =>
+            {
+                range_bounds(d)?
+            }
             [v] => {
                 let value = match v {
                     Bson::Document(d) if d.keys().any(|k| k.starts_with('$')) => {
@@ -179,6 +187,39 @@ fn trailing_bounds(index: &GeoIndex, filter: &Document) -> Option<Vec<FieldBound
         out.push(bound);
     }
     Some(out)
+}
+
+/// The bounds a trailing field's operators make, each operator's
+/// intervals intersected: `None` for one the bounds do not cover.
+fn range_bounds(pred: &Document) -> Option<FieldBounds> {
+    let ctx = super::bounds::Ctx {
+        multikey: false,
+        sparse: false,
+        collated: false,
+        plain_strings: true,
+        keys_only: false,
+    };
+    let mut list: Option<Vec<super::bounds::Interval>> = None;
+    for (op, arg) in pred {
+        let (part, _) = super::bounds::leaf_bounds(&bson::doc! { op.clone(): arg.clone() }, ctx)?;
+        list = Some(match list {
+            None => part,
+            Some(have) => super::bounds::intersect(&have, &part),
+        });
+    }
+    Some(FieldBounds::Ranges(
+        list?
+            .into_iter()
+            .map(|i| {
+                (
+                    super::bounds::sort_key(&i.lo),
+                    i.lo_incl,
+                    super::bounds::sort_key(&i.hi),
+                    i.hi_incl,
+                )
+            })
+            .collect(),
+    ))
 }
 
 /// The geo predicate the filter puts on the index's field, as the bounds
@@ -271,6 +312,11 @@ fn decode(blob: &[u8]) -> Option<Document> {
 }
 
 impl Scan {
+    /// The name of the geo index the scan reads.
+    pub(crate) fn index_name(&self) -> &str {
+        &self.index.name
+    }
+
     /// `rows` (in insertion order) in the scan's order. A document the scan
     /// does not reach comes after the rest, unless the scan is of the whole
     /// index, which does not hold it.

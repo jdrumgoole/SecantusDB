@@ -390,7 +390,7 @@ def test_features_oid_reset(rust_mongo: Any) -> None:
     assert int.from_bytes(minted[4:8], "little") == reply["oidMachine"]
 
 
-@pytest.mark.backlog("RM-143")
+@pytest.mark.backlog_fixed("RM-143")
 def test_plan_cache_set_filter(rust_mongo: Any) -> None:
     """mongod 8.2.11 sets an index filter and lists it."""
     db = _fresh(rust_mongo, "rm_pcsf")
@@ -404,7 +404,7 @@ def test_plan_cache_set_filter(rust_mongo: Any) -> None:
     assert mongo_answer(run) == ("ok", 1)
 
 
-@pytest.mark.backlog("RM-143")
+@pytest.mark.backlog_fixed("RM-143")
 def test_resize_oplog_min_retention_hours(rust_mongo: Any) -> None:
     """mongod 8.2.11 (one-member replica set) takes a `minRetentionHours`."""
     got = mongo_answer(
@@ -413,7 +413,7 @@ def test_resize_oplog_min_retention_hours(rust_mongo: Any) -> None:
     assert got == ("ok", 1.0)
 
 
-@pytest.mark.backlog("RM-143")
+@pytest.mark.backlog_fixed("RM-143")
 def test_every_cluster_parameter(rust_mongo: Any) -> None:
     """mongod 8.2.11 (one-member replica set) has fifteen cluster
     parameters, `fleCompactionOptions` and `internalSearchOptions` among
@@ -422,6 +422,25 @@ def test_every_cluster_parameter(rust_mongo: Any) -> None:
         lambda: len(rust_mongo.admin.command("getClusterParameter", "*")["clusterParameters"])
     )
     assert got == ("ok", 15)
+
+
+@pytest.mark.backlog_fixed("RM-143")
+def test_repl_set_reconfig_keeps_the_new_configuration(rust_mongo: Any) -> None:
+    """mongod 8.2.11 (one-member replica set) takes a new configuration with
+    a higher version, refuses one that is not, and resets a setting the new
+    configuration leaves out."""
+    admin = rust_mongo.admin
+    config = admin.command("replSetGetConfig")["config"]
+    config["version"] += 1
+    config["settings"]["heartbeatTimeoutSecs"] = 12
+    assert admin.command("replSetReconfig", config)["ok"] == 1.0
+    assert admin.command("replSetGetConfig")["config"]["settings"]["heartbeatTimeoutSecs"] == 12
+    stale = mongo_answer(lambda: admin.command("replSetReconfig", config))
+    assert stale[:2] == ("err", 103)
+    config["version"] += 1
+    del config["settings"]
+    admin.command("replSetReconfig", config)
+    assert admin.command("replSetGetConfig")["config"]["settings"]["heartbeatTimeoutSecs"] == 10
 
 
 # ================================================================= 7.081 geo

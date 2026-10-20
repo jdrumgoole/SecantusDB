@@ -20,7 +20,7 @@ from typing import Any
 
 import pymongo
 import pytest
-from bson import Binary, Timestamp
+from bson import Binary, Int64, Timestamp
 from pymongo.errors import OperationFailure
 
 from tests.backlog.conftest import _RS_BANNER, RS_BINARY, drain_output, mongo_answer
@@ -573,14 +573,38 @@ def test_type_bits_of_wrong_type_or_all_zero(rust_mongo: Any, mongod_rs: Any) ->
         assert _type_bits_token(rust_mongo, bits) == _type_bits_token(mongod_rs, bits), bits
 
 
-@pytest.mark.backlog("RM-075")
+@pytest.mark.backlog_fixed("RM-075")
 def test_type_bits_that_change_a_number(rust_mongo: Any, mongod_rs: Any) -> None:
     """Type bits `0x01` make the token's version a double: mongod 8.2.11
-    answers 50854 (`wrong type for version`); this server does not read the
-    bits and answers 40647."""
+    answers 50854 (`wrong type for version`)."""
     expected = _type_bits_token(mongod_rs, Binary(b"\x01", 0))
     assert expected == ("err", 50854)
     assert _type_bits_token(rust_mongo, Binary(b"\x01", 0)) == expected
+
+
+@pytest.mark.backlog("RM-075")
+def test_a_decimal_from_a_double_in_a_token(rust_mongo: Any, mongod_rs: Any) -> None:
+    """A small-magnitude number whose type bits say decimal: mongod 8.2.11
+    rebuilds the decimal from the double and its continuation, and rescales
+    its exponent, which fails here with 50830."""
+
+    def answer(client: Any) -> Any:
+        c = client["rm075d"][_name()]
+        c.insert_one({"a": 1})
+        token = {
+            "_data": "8200000000000000012A5FFE0000000000056BC75E2D6310000004",
+            "_typeBits": Binary(b"\x03", 0),
+        }
+
+        def run() -> Any:
+            with c.watch(resume_after=token, max_await_time_ms=100) as s:
+                return s.try_next()
+
+        return code_of(mongo_answer(run))
+
+    expected = answer(mongod_rs)
+    assert expected == ("err", 50830)
+    assert answer(rust_mongo) == expected
 
 
 def _change_stream_explain_ns(client: Any) -> Any:
@@ -1142,3 +1166,102 @@ def test_drop_under_a_transaction_that_wrote_honours_max_time(
     expected = _drop_under_write_txn(mongod_rs)
     assert expected == (True, [("err", 50)], True)
     assert _drop_under_write_txn(rust_mongo) == expected
+
+
+@pytest.mark.backlog("RM-202")
+def test_a_collection_made_in_two_transactions(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 lets a second transaction write to a collection a first
+    one created and has not committed; the conflict, if any, comes at commit.
+    This server holds the creating transaction's exclusive lock to its end,
+    so the second transaction's insert times out (24)."""
+    answers = []
+    for client in (rust_mongo, mongod_rs):
+        db = client["rm202"]
+        db.drop_collection("q")
+        first = client.start_session()
+        second = client.start_session()
+        first.start_transaction()
+        second.start_transaction()
+        db.create_collection("q", session=first)
+        answers.append(
+            mongo_answer(
+                lambda db=db, second=second: db.q.insert_one({"x": 1}, session=second).acknowledged
+            )
+        )
+        for s in (first, second):
+            mongo_answer(s.abort_transaction)
+    got, want = answers
+    assert want == ("ok", True)
+    assert got == want
+
+
+_FAM = {"findAndModify": "c", "query": {"_id": 1}, "update": {"$inc": {"v": 1}}}
+_FAM_RETRIES = {
+    "update then new": (_FAM, {**_FAM, "new": True}),
+    "new then old": ({**_FAM, "new": True}, _FAM),
+    "update then remove": (_FAM, {"findAndModify": "c", "query": {"_id": 1}, "remove": True}),
+    "remove then update": ({"findAndModify": "c", "query": {"_id": 2}, "remove": True}, _FAM),
+    "upsert then upsert": (
+        {"findAndModify": "c", "query": {"_id": 7}, "update": {"$set": {"v": 1}}, "upsert": True},
+        {
+            "findAndModify": "c",
+            "query": {"_id": 8},
+            "update": {"$set": {"v": 1}},
+            "upsert": True,
+            "new": True,
+        },
+    ),
+    "insert then upsert": (
+        {"insert": "c", "documents": [{"_id": 9, "w": 1}]},
+        {
+            "findAndModify": "c",
+            "query": {"_id": 9},
+            "update": {"$set": {"v": 1}},
+            "upsert": True,
+            "new": True,
+        },
+    ),
+    "update statement then findAndModify": (
+        {"update": "c", "updates": [{"q": {"_id": 1}, "u": {"$inc": {"v": 1}}}]},
+        _FAM,
+    ),
+    "delete statement then remove": (
+        {"delete": "c", "deletes": [{"q": {"_id": 2}, "limit": 1}]},
+        {"findAndModify": "c", "query": {"_id": 2}, "remove": True},
+    ),
+}
+
+
+_FAM_TXN = iter(range(1_000_000, 2_000_000))
+
+
+def _fam_retry(client: Any, first: dict, second: dict) -> Any:
+    # Writes of its own without transaction numbers, and numbers that only
+    # rise: the session a client starts may be one an earlier write used.
+    host, port = client.address
+    client = pymongo.MongoClient(host, port, retryWrites=False, directConnection=True)
+    db = client["rm203"]
+    db.drop_collection("c")
+    db.c.insert_many([{"_id": 1, "v": 1}, {"_id": 2, "v": 2}])
+    number = Int64(next(_FAM_TXN))
+    with client.start_session() as s:
+        db.command({**first, "txnNumber": number}, session=s)
+        answer = mongo_answer(lambda: db.command({**second, "txnNumber": number}, session=s))
+    client.close()
+    if answer[0] == "err":
+        return answer[:2]
+    reply = answer[1]
+    return (reply.get("lastErrorObject"), reply.get("value"), reply.get("retriedStmtId"))
+
+
+@pytest.mark.backlog_fixed("RM-203")
+def test_a_retried_find_and_modify_answers_from_what_the_first_wrote(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11 decides a retried findAndModify from the write the
+    first execution made (`validateFindAndModifyRetryability`): an insert
+    answers an upsert, an update answers with the document it kept whatever
+    `new` asks, an update statement kept none (40611 / 40612), a delete
+    answers only a remove."""
+    for label, (first, second) in _FAM_RETRIES.items():
+        assert _fam_retry(rust_mongo, first, second) == _fam_retry(mongod_rs, first, second), label

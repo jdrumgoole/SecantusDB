@@ -157,8 +157,31 @@ def _stages(client: Any) -> list:
     return [mongo_answer(lambda p=p: list(db.s.aggregate(p))) for p in pipelines]
 
 
-@pytest.mark.backlog("RM-198")
+@pytest.mark.backlog_fixed("RM-198")
 def test_hybrid_search_stages_82_added(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 runs `$rankFusion` (reciprocal rank fusion), `$score`
     and `$scoreFusion`, and exposes the result as `{$meta: "score"}`."""
     assert _stages(rust_mongo) == _stages(mongod)
+
+
+@pytest.mark.backlog("RM-200")
+def test_explain_of_rank_fusion_is_its_desugaring(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 explains `$rankFusion` as the stages it desugars into."""
+    answers = []
+    for client in (rust_mongo, mongod):
+        db = client["rm200"]
+        db.drop_collection("s")
+        db.s.insert_many([{"_id": i, "x": i, "y": (i * 7) % 5} for i in range(6)])
+        pipeline = [
+            {
+                "$rankFusion": {
+                    "input": {
+                        "pipelines": {"a": [{"$sort": {"x": 1}}], "b": [{"$sort": {"y": -1}}]}
+                    }
+                }
+            }
+        ]
+        reply = db.command("explain", {"aggregate": "s", "pipeline": pipeline, "cursor": {}})
+        answers.append([next(iter(stage)) for stage in reply.get("stages", [])])
+    got, want = answers
+    assert got == want

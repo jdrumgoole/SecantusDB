@@ -789,15 +789,53 @@ fn statement(
     // on it, and its deadline answers 50. `run_handler` skips its own
     // statement-scoped acquisition while the flag is set, so the statement
     // is counted once and its collection lock is not released early.
-    if let (Some(lm), Some(owner)) = (
-        ctx.locks.clone(),
-        txn.lock().unwrap_or_else(|e| e.into_inner()).lock_owner,
-    ) {
+    // The transaction's guard is let go before the wait: held across it,
+    // a second command on this session waits for it under the registry,
+    // and every session's command then waits too.
+    let owner = txn.lock().unwrap_or_else(|e| e.into_inner()).lock_owner;
+    if let (Some(lm), Some(owner)) = (ctx.locks.clone(), owner) {
         let chain = crate::lock_manager::statement_chain(doc, &ctx.db_name);
-        match crate::lock_manager::acquire_chain(&lm, owner, &chain) {
-            Ok(()) => ctx.txn_locks = true,
-            Err(_) => {
-                let mut reply = CommandError::max_time_expired().into_reply();
+        // Each lock request of a transaction gives up after
+        // `maxTransactionLockRequestTimeoutMillis` (mongod's 5 ms): a
+        // transaction waiting on another's lock fails, transiently, rather
+        // than waiting for it to end (mongod 8.2.11: 24 LockTimeout).
+        let limit = ctx
+            .server_params
+            .as_ref()
+            .and_then(|p| p.get("maxTransactionLockRequestTimeoutMillis"))
+            .and_then(|v| v.as_i32())
+            .unwrap_or(5);
+        let mut failed = None;
+        for (res, mode) in &chain {
+            let budget_left = secantus_core::deadline::remaining_ms();
+            let bounded = limit >= 0 && budget_left.is_none_or(|left| left > f64::from(limit));
+            let _lock_budget =
+                bounded.then(|| secantus_core::deadline::arm(Some(i64::from(limit.max(1)))));
+            if lm.acquire(owner, res, *mode).is_err() {
+                failed = Some((res.clone(), *mode, bounded));
+                break;
+            }
+        }
+        match failed {
+            None => ctx.txn_locks = true,
+            Some((res, mode, bounded)) => {
+                lm.release(owner);
+                let mut reply = if bounded {
+                    let conn = ctx.connection_id;
+                    CommandError::new(
+                        24,
+                        "LockTimeout",
+                        format!(
+                            "Unable to acquire {} lock on '{}' within {limit}ms. opId: {conn}, op: \
+                             conn{conn}, connId: {conn}.",
+                            mode.name(),
+                            res.described()
+                        ),
+                    )
+                    .into_reply()
+                } else {
+                    CommandError::max_time_expired().into_reply()
+                };
                 registry.abort_in_progress(txn);
                 crate::finish_txn_statement(registry, txn, &mut reply);
                 return reply;
@@ -1107,7 +1145,25 @@ fn retry_insert(
         .copied()
         .filter(|id| done.contains(*id))
         .collect();
+    // The documents of a driver's insert arrive as a document sequence the
+    // handler consumes, so their `_id`s are read before it runs.
+    let sequence_ids: Option<Vec<Option<Bson>>> = ctx.raw_insert_documents.as_ref().map(|docs| {
+        docs.iter()
+            .map(|bytes| {
+                bson::RawDocument::from_bytes(bytes)
+                    .ok()?
+                    .get("_id")
+                    .ok()??
+                    .to_raw_bson()
+                    .try_into()
+                    .ok()
+            })
+            .collect()
+    });
     let id_of = |index: usize| -> Option<Bson> {
+        if let Some(ids) = &sequence_ids {
+            return ids.get(index).cloned().flatten();
+        }
         doc.get_array("documents")
             .ok()?
             .get(index)?
@@ -1297,6 +1353,8 @@ fn retry_find_and_modify(
 ) -> Ran {
     let id = ids.first().copied().unwrap_or(0);
     let remove = doc.get("remove").is_some_and(crate::util::truthy);
+    let new = doc.get("new").is_some_and(crate::util::truthy);
+    let upsert = doc.get("upsert").is_some_and(crate::util::truthy);
     if let Some(record) = done.get(id) {
         let refuse = |code: i32, message: &str| {
             (
@@ -1310,30 +1368,129 @@ fn retry_find_and_modify(
                  transaction of type: {kind}"
             )
         };
+        let no_after = "findAndModify retry request wants the document after update returned, \
+                        but only before update document is stored";
+        let no_before = "findAndModify retry request wants the document before update \
+                         returned, but only after update document is stored";
+        let answer = |last_error: Document, value: Bson| {
+            (
+                doc! {
+                    "lastErrorObject": last_error,
+                    "value": value,
+                    "retriedStmtId": id,
+                    "ok": 1.0,
+                },
+                Vec::new(),
+            )
+        };
+        // The document an upsert inserted, for a retry that asks for it.
+        let inserted = |upserted: &Bson, first: Option<&Bson>| -> Bson {
+            if let Some(Bson::Document(d)) = first {
+                return Bson::Document(d.clone());
+            }
+            let coll = doc
+                .get_str("findAndModify")
+                .or_else(|_| doc.get_str("findandmodify"));
+            ctx.storage
+                .as_ref()
+                .zip(coll.ok())
+                .and_then(|(st, coll)| {
+                    st.find(
+                        &ctx.db_name,
+                        coll,
+                        &doc! {"_id": upserted.clone()},
+                        None,
+                        None,
+                    )
+                    .ok()
+                })
+                .and_then(|rows| rows.into_iter().next())
+                .and_then(|b| secantus_core::bsondoc::from_bytes(&b).ok())
+                .map_or(Bson::Null, Bson::Document)
+        };
+        // What mongod's `validateFindAndModifyRetryability` decides from the
+        // write the statement made and the image it kept (mongod 8.2.11): a
+        // delete answers only a remove, an insert only an upsert, and an
+        // update the document it kept, before or after (40606 / 40608 /
+        // 40611 / 40612; 40607 for a delete with no document kept).
         return match record {
-            // The reply first given, whatever this request asks to see.
             StmtRecord::FindAndModify {
                 reply,
                 remove: was_remove,
-            } if !was_remove || remove => {
-                let mut again = reply.clone();
-                let ok = again.remove("ok");
-                again.insert("retriedStmtId", id);
-                again.insert("ok", ok.unwrap_or(Bson::Double(1.0)));
-                (again, Vec::new())
+                new: was_new,
+            } => {
+                let last = reply
+                    .get_document("lastErrorObject")
+                    .cloned()
+                    .unwrap_or_default();
+                let value = reply.get("value").cloned().unwrap_or(Bson::Null);
+                if was_remove {
+                    if !remove {
+                        return refuse(40606, &incompatible("d"));
+                    }
+                    answer(doc! {"n": 1}, value)
+                } else if let Some(upserted) = last.get("upserted") {
+                    if !upsert {
+                        return refuse(40608, &incompatible("i"));
+                    }
+                    let value = if new {
+                        inserted(upserted, was_new.then_some(&value))
+                    } else {
+                        Bson::Null
+                    };
+                    answer(
+                        doc! {"n": 1, "updatedExisting": false, "upserted": upserted.clone()},
+                        value,
+                    )
+                } else {
+                    // mongod keeps a findAndModify's document in its image
+                    // collection, and a retry gets that one, before or after
+                    // the update as the first request asked, whatever this
+                    // one asks (measured 8.2.11).
+                    answer(doc! {"n": 1, "updatedExisting": true}, value)
+                }
             }
-            StmtRecord::FindAndModify { .. } => refuse(40606, &incompatible("d")),
-            StmtRecord::Insert { .. } => refuse(40608, &incompatible("i")),
+            StmtRecord::Insert { id: inserted_id } => {
+                if !upsert {
+                    return refuse(40608, &incompatible("i"));
+                }
+                let upserted = inserted_id.clone().unwrap_or(Bson::Null);
+                let value = if new {
+                    inserted(&upserted, None)
+                } else {
+                    Bson::Null
+                };
+                answer(
+                    doc! {"n": 1, "updatedExisting": false, "upserted": upserted},
+                    value,
+                )
+            }
+            StmtRecord::Update {
+                upserted: Some(upserted),
+            } => {
+                if !upsert {
+                    return refuse(40608, &incompatible("i"));
+                }
+                let value = if new {
+                    inserted(&upserted, None)
+                } else {
+                    Bson::Null
+                };
+                answer(
+                    doc! {"n": 1, "updatedExisting": false, "upserted": upserted},
+                    value,
+                )
+            }
+            // An update statement keeps no image of the document.
+            StmtRecord::Update { upserted: None } => refuse(
+                if new { 40611 } else { 40612 },
+                if new { no_after } else { no_before },
+            ),
             StmtRecord::Delete if remove => refuse(
                 40607,
                 "No pre-image available for findAndModify retry request",
             ),
             StmtRecord::Delete => refuse(40606, &incompatible("d")),
-            StmtRecord::Update { .. } => refuse(
-                40612,
-                "findAndModify retry request wants the document before update returned, but \
-                 only after update document is stored",
-            ),
         };
     }
     let (reply, noted) = transactions::collect_statements(|| crate::run_handler(handler, doc, ctx));
@@ -1343,6 +1500,7 @@ fn retry_find_and_modify(
             StmtRecord::FindAndModify {
                 reply: reply.clone(),
                 remove,
+                new,
             },
         )]
     } else {

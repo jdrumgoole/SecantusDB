@@ -79,8 +79,17 @@ pub(crate) fn plan_summary(request: &Document, ctx: &CommandContext) -> Option<S
     if !storage.collection_exists(db, &s.coll).unwrap_or(false) {
         return Some("EOF".to_string());
     }
-    let catalog = catalog(storage, db, &s.coll, None).ok()?;
     let collation = crate::util::effective_collation(storage, db, &s.coll, &s.options).ok()?;
+    let (catalog, _) = crate::index_filters::apply(
+        storage,
+        db,
+        &s.coll,
+        &s.filter,
+        s.sort.as_ref(),
+        s.projection.as_ref(),
+        collation.as_ref(),
+        catalog(storage, db, &s.coll, None).ok()?,
+    );
     let hint = resolve_hint(s.hint.as_ref(), &catalog).ok()?;
     let canonical = parsed::parsed_query(&s.filter);
     let implies = |partial: &Document| storage.query_implies_partial(&s.filter, partial);

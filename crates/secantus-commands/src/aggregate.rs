@@ -210,6 +210,15 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if let Err(e) = validate_stage_names(&pipeline) {
         return Ok(e.into_reply());
     }
+    // `$score`, `$rankFusion` and `$scoreFusion`, as the stages that run them.
+    let pipeline = if crate::hybrid::mentions_hybrid(&pipeline) {
+        match crate::hybrid::prepare(pipeline, coll.as_deref()) {
+            Ok(p) => p,
+            Err(e) => return Ok(e.into_reply()),
+        }
+    } else {
+        pipeline
+    };
     if let Err(e) = crate::list_catalog::spec_problem(&pipeline) {
         return Ok(e.into_reply());
     }
@@ -1118,6 +1127,9 @@ pub(crate) fn recognized_stage(name: &str) -> bool {
     matches!(
         name,
         "$addFields"
+            | "$rankFusion"
+            | "$score"
+            | "$scoreFusion"
             | "$bucket"
             | "$bucketAuto"
             | "$changeStream"

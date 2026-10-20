@@ -343,6 +343,26 @@ impl plan::Whole for Lazy<'_> {
     }
 }
 
+/// The indexes `ask` may be planned over: the collection's, or the ones an
+/// index filter set for its shape leaves.
+pub(crate) fn ask_catalog(
+    storage: &dyn Storage,
+    ask: &Ask,
+) -> Result<Vec<std::rc::Rc<super::IndexInfo>>, StorageError> {
+    let catalog = catalog(storage, ask.db, ask.coll, None)?;
+    Ok(crate::index_filters::apply(
+        storage,
+        ask.db,
+        ask.coll,
+        ask.filter,
+        ask.sort,
+        ask.asked.projection,
+        ask.collation,
+        catalog,
+    )
+    .0)
+}
+
 /// `rows` in the order `order` names them.
 fn placed(rows: Rows, order: Vec<usize>) -> Rows {
     let mut slots: Vec<Option<(i64, Vec<u8>)>> = rows.into_iter().map(Some).collect();
@@ -468,7 +488,7 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
         sorted = Some((order, tied));
     }
 
-    let catalog = catalog(storage, ask.db, ask.coll, None)?;
+    let catalog = ask_catalog(storage, ask)?;
     let canonical = parsed::parsed_query(ask.filter);
     let implied = |partial: &Document| storage.query_implies_partial(ask.filter, partial);
     let hint = match resolve_hint(ask.hint, &catalog) {
@@ -503,6 +523,13 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
         || ask
             .hint
             .is_some_and(|h| !matches!(h, Bson::Document(d) if d.is_empty()));
+    if ask.hint.is_none() && ask.filter.contains_key("$or") {
+        let mut inserted = rows.clone();
+        inserted.sort_unstable_by_key(|(recordid, _)| *recordid);
+        if let Some(ordered) = geo_or_rows(storage, ask, &inserted)? {
+            return Ok(Some(sorted_over(storage, ordered, ask)?));
+        }
+    }
     if let Some(scan) = geo::scan(storage, ask.db, ask.coll, ask.filter, None, elsewhere)? {
         rows.sort_unstable_by_key(|(recordid, _)| *recordid);
         if let Some(ordered) = scan.order(rows.clone()) {
@@ -683,11 +710,107 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
     Ok(Some(placed(rows, order)))
 }
 
+/// An `$or` whose branches each read an index, a geo predicate among them:
+/// mongod scans each branch's index and merges the scans in the catalog
+/// order of the indexes they read, each document once (measured 8.2.11: an
+/// `_id` branch comes before a geo branch, and two geo branches on one
+/// index come in the order written). `None` for any other read, or a
+/// branch no index serves (then the whole `$or` is a collection scan).
+fn geo_or_rows(
+    storage: &dyn Storage,
+    ask: &Ask,
+    rows: &Rows,
+) -> Result<Option<Rows>, StorageError> {
+    let branches = match ask.filter.get_array("$or") {
+        Ok(b) if ask.filter.len() == 1 => b,
+        _ => return Ok(None),
+    };
+    let names: Vec<String> = storage
+        .list_indexes(ask.db, ask.coll)?
+        .iter()
+        .filter_map(|spec| spec.get_str("name").ok().map(str::to_string))
+        .collect();
+    let position = |name: &str| names.iter().position(|n| n == name);
+    let decoded: Vec<Option<Document>> = rows
+        .iter()
+        .map(|(_, blob)| secantus_core::bsondoc::from_bytes(blob).ok())
+        .collect();
+    let mut any_geo = false;
+    let mut scans: Vec<(usize, Rows)> = Vec::new();
+    for branch in branches {
+        let Some(b) = branch.as_document() else {
+            return Ok(None);
+        };
+        let matching: Rows = rows
+            .iter()
+            .zip(&decoded)
+            .filter(|(_, d)| {
+                d.as_ref().is_some_and(|d| {
+                    secantus_core::query::matches(d, b, ask.vars, ask.collation).unwrap_or(false)
+                })
+            })
+            .map(|(row, _)| row.clone())
+            .collect();
+        if let Some(scan) = geo::scan(storage, ask.db, ask.coll, b, None, false)? {
+            let (Some(at), Some(ordered)) = (position(scan.index_name()), scan.order(matching))
+            else {
+                return Ok(None);
+            };
+            any_geo = true;
+            scans.push((at, ordered));
+            continue;
+        }
+        let sub = Ask {
+            db: ask.db,
+            coll: ask.coll,
+            filter: b,
+            sort: None,
+            hint: None,
+            collation: ask.collation,
+            vars: ask.vars,
+            limit: 0,
+            asked: Default::default(),
+        };
+        let Some(at) = plan_indexes(storage, &sub)
+            .first()
+            .and_then(|n| position(n))
+        else {
+            return Ok(None);
+        };
+        let Some(ordered) = ordered_rows(storage, &sub)? else {
+            return Ok(None);
+        };
+        let keep: BTreeSet<i64> = matching.iter().map(|(r, _)| *r).collect();
+        scans.push((
+            at,
+            ordered
+                .into_iter()
+                .filter(|(r, _)| keep.contains(r))
+                .collect(),
+        ));
+    }
+    if !any_geo {
+        return Ok(None);
+    }
+    scans.sort_by_key(|(at, _)| *at);
+    let mut seen = BTreeSet::new();
+    let mut out: Rows = Vec::with_capacity(rows.len());
+    for (_, list) in scans {
+        for row in list {
+            if seen.insert(row.0) {
+                out.push(row);
+            }
+        }
+    }
+    out.extend(rows.iter().filter(|(r, _)| !seen.contains(r)).cloned());
+    Ok(Some(out))
+}
+
 /// The plan mongod runs for `ask`, without a trial of the candidates (a
 /// fixed order of preference stands in); `None` for a collection with no
 /// index, or a hint the planner does not know.
 fn untried_plan(storage: &dyn Storage, ask: &Ask) -> Option<Node> {
-    let catalog = catalog(storage, ask.db, ask.coll, None).ok()?;
+    let catalog = ask_catalog(storage, ask).ok()?;
     if catalog.is_empty() {
         return None;
     }
@@ -857,7 +980,7 @@ pub(crate) fn count_index_use(storage: &dyn Storage, ask: &Ask, uses: Uses) {
     {
         return;
     }
-    let Ok(catalog) = catalog(storage, ask.db, ask.coll, None) else {
+    let Ok(catalog) = ask_catalog(storage, ask) else {
         return;
     };
     if catalog.is_empty() {
@@ -1080,7 +1203,7 @@ fn store_order_is_the_plans(storage: &dyn Storage, ask: &Ask) -> Result<bool, St
     if !simple {
         return Ok(false);
     }
-    let catalog = catalog(storage, ask.db, ask.coll, None)?;
+    let catalog = ask_catalog(storage, ask)?;
     let mut leading = catalog.iter().filter(|ix| ix.position(field) == Some(0));
     let (Some(index), None) = (leading.next(), leading.next()) else {
         return Ok(false);

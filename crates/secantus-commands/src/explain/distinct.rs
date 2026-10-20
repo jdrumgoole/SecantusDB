@@ -21,7 +21,7 @@ use super::exec::{self, Env};
 use super::node::Node;
 use super::order::Ask;
 use super::plan::{self, Query};
-use super::{catalog, parsed, resolve_hint};
+use super::{parsed, resolve_hint};
 use crate::storage::{Storage, StorageError};
 use bson::{Bson, Document};
 
@@ -33,7 +33,7 @@ pub(crate) fn scan_values(
     ask: &Ask,
     key: &str,
 ) -> Result<Option<Vec<Bson>>, StorageError> {
-    let catalog = catalog(storage, ask.db, ask.coll, None)?;
+    let catalog = super::order::ask_catalog(storage, ask)?;
     if catalog.is_empty() {
         return Ok(None);
     }

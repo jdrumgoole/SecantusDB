@@ -1001,9 +1001,21 @@ COMMANDS = [
 def start(kind: str, home: str):
     port = PORTS[kind]
     if kind == "mongod":
+        # A one-member replica set, as the Rust server reports itself: a
+        # standalone answers `$changeStream`, `replSetGetStatus` and the
+        # default read/write concern commands differently whoever runs
+        # them (RM-024). Access control on a set needs a key file.
+        key_file = os.path.join(home, "probe-key")
+        with open(key_file, "w") as f:
+            f.write("secantusprobekey" * 4)
+        os.chmod(key_file, 0o600)
         argv = [
             MONGOD_BIN,
             "--auth",
+            "--replSet",
+            "rs0",
+            "--keyFile",
+            key_file,
             "--port",
             str(port),
             "--dbpath",
@@ -1012,6 +1024,9 @@ def start(kind: str, home: str):
             "127.0.0.1",
             "--setParameter",
             "enableTestCommands=1",
+            # This server has no JavaScript engine and refuses what needs one
+            # as a `--noscripting` mongod does (Joe, 2026-10-16).
+            "--noscripting",
         ]
     else:
         argv = [
@@ -1060,6 +1075,18 @@ def outcome(fn, pick=None):
 
 def setup(kind: str):
     anon = client(kind)
+    if kind == "mongod":
+        # Initiated through the localhost exception, before the first user.
+        anon.admin.command(
+            "replSetInitiate",
+            {"_id": "rs0", "members": [{"_id": 0, "host": f"127.0.0.1:{PORTS[kind]}"}]},
+        )
+        for _ in range(600):
+            if anon.admin.command("hello").get("isWritablePrimary"):
+                break
+            time.sleep(0.1)
+        else:
+            raise SystemExit("mongod's replica set elected no primary")
     anon.admin.command("createUser", ROOT[0], pwd=ROOT[1], roles=["root"])
     root = client(kind, *ROOT)
     reset(root)

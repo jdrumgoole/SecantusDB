@@ -179,6 +179,36 @@ fn predicate(path: &str, ops: &Document, level: usize, out: &mut String) {
         ));
         return;
     }
+    // `GeoNearMatchExpression`: the field, `$maxDistance` (the largest
+    // double when none), and whether it is a legacy-coordinate
+    // `$nearSphere` (a `$geometry` point is not, even there; measured 8.2.11).
+    if let Some((op, arg)) = ops
+        .iter()
+        .find(|(k, _)| matches!(k.as_str(), "$near" | "$nearSphere"))
+    {
+        let geometry = matches!(arg, Bson::Document(d) if d.contains_key("$geometry"));
+        let distance = |v: Option<&Bson>| match v {
+            Some(Bson::Int32(n)) => Some(f64::from(*n)),
+            Some(Bson::Int64(n)) => Some(*n as f64),
+            Some(Bson::Double(d)) => Some(*d),
+            _ => None,
+        };
+        let inside = match arg {
+            Bson::Document(d) if geometry => distance(d.get("$maxDistance")),
+            _ => None,
+        };
+        let max = inside
+            .or_else(|| distance(ops.get("$maxDistance")))
+            .unwrap_or(f64::MAX);
+        let sphere = op == "$nearSphere" && !geometry;
+        indent(level, out);
+        out.push_str(&format!(
+            "GEONEAR  field={path} maxdist={} isNearSphere={}\n",
+            g(max, 6),
+            u8::from(sphere)
+        ));
+        return;
+    }
     if ops
         .keys()
         .any(|k| matches!(k.as_str(), "$geoWithin" | "$geoIntersects" | "$within"))
@@ -599,6 +629,14 @@ mod tests {
             (
                 doc! {"a": {"$geoWithin": {"$box": [[0, 0], [1, 1]]}}},
                 "GEO raw = { a: { $geoWithin: { $box: [ [ 0, 0 ], [ 1, 1 ] ] } } }\n",
+            ),
+            (
+                doc! {"loc": {"$nearSphere": [0, 0], "$maxDistance": 0.25}},
+                "GEONEAR  field=loc maxdist=0.25 isNearSphere=1\n",
+            ),
+            (
+                doc! {"loc": {"$near": {"$geometry": {"type": "Point", "coordinates": [0, 0]}}}},
+                "GEONEAR  field=loc maxdist=1.79769e+308 isNearSphere=0\n",
             ),
         ];
         for (filter, want) in cases {

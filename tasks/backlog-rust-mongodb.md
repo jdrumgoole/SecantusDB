@@ -836,28 +836,21 @@ may run a command.
       the localhost exception is used.
       Backlog-ID: RM-024
       Verify: none -- the probe's mongod topology (standalone vs replica set), not a server behaviour
-- [ ] **The hybrid-search stages 8.2 added are missing: `$rankFusion`,
-      `$score` and `$scoreFusion`** (40324 here). mongod 8.2.11 runs all
-      three on a community build: `$rankFusion` merges ranked
-      sub-pipelines by reciprocal rank (`weight / (60 + rank)` summed per
-      document, `combination.weights`, `scoreDetails`), `$score` sets a
-      document's score from an expression (`normalization: none | sigmoid
-      | minMaxScaler`, `weight` at most 1), `$scoreFusion` combines scored
-      sub-pipelines (`normalization`, `combination.method: avg |
-      expression`), and each exposes the result as `{$meta: "score"}` /
-      `{$meta: "scoreDetails"}`. A sub-pipeline of `$rankFusion` must be
-      ranked (9191100 otherwise), and one with no pipelines is 2. At FCV
-      8.0 mongod refuses each with 224, in three different texts
-      (`'featureFlagRankFusionBasic' must be enabled to use rankFusion`,
-      `$scoreFusion is not allowed in the current feature compatibility
-      version. See ...`, `$score is not allowed in the current
-      configuration. You may need to enable the corresponding feature
-      flag...`), which go with the stages when they land (the expressions'
-      gate is in `secantus_core::expressions::ADDED_IN_82`). `explain` of
-      each is mongod's own desugaring and was not measured. Found
-      2026-10-20 with the expressions 8.2 added (RM-197, fixed).
-      Backlog-ID: RM-198
-      Verify: tests/backlog/test_rm_added_in_82.py::test_hybrid_search_stages_82_added
+- [ ] **`explain` of `$score`, `$rankFusion` and `$scoreFusion` lists the
+      stage as written.** The stages run since 2026-10-20 (RM-198, fixed),
+      desugared as mongod desugars them, but `explain` shows the stage
+      itself where mongod 8.2.11 shows its desugaring: for `$rankFusion` of
+      two pipelines, `$cursor`, `$replaceRoot`, `$_internalSetWindowFields`
+      (`$rank`), `$addFields`, a `$unionWith` holding the same for the
+      second pipeline, `$group`, two `$addFields`, `$setMetadata`, `$sort`
+      (`sortKey: {score: -1, _id: 1}`) and `$replaceRoot`; `$score` is
+      `$setMetadata` and, normalised, `$_internalSetWindowFields` with
+      `$minMaxScaler`. Also not reproduced: either fusion stage as the first
+      stage of a `$facet` sub-pipeline, which mongod accepts and answers
+      with the documents in collection order (in a `$lookup` or
+      `$unionWith` sub-pipeline both run, as on mongod).
+      Backlog-ID: RM-200
+      Verify: tests/backlog/test_rm_added_in_82.py::test_explain_of_rank_fusion_is_its_desugaring
 - **Scope decision — `mapReduce` with a named `out`** (Joe, 2026-10-16,
   formerly RM-027). Refused as a `--noscripting` mongod 8.2.11 refuses it
   (31264, since 2026-10-20; it answered 9 before), like every map/reduce
@@ -887,26 +880,13 @@ and the unit tests of `auth.rs` and `roles.rs`. The built-in roles and the
 
 What is open:
 
-- [ ] **The order of a set of roles** (5): a user's `roles` after
-      `grantRolesToUser`, a role's `roles` after `grantRolesToRole`, and
-      the built-in roles under `showBuiltinRoles`. mongod keeps each in a
-      hash set, and the order differs between two databases of one
-      process. This server keeps the order they were given in.
-      Backlog-ID: RM-030
-      Verify: none -- mongod's order is a hash set's: three different orders for one grant in one process, so no answer to assert
-- [ ] **A user record written before this change has no `userId`**, and
-      `usersInfo` lists none for it. Nothing rewrites the record. Such a
-      store otherwise reads and authenticates: users and a role created by
-      the released 0.5.3-beta.192 binary were read, and logged in over
-      both SCRAM mechanisms, by this build (2026-10-14).
-      Backlog-ID: RM-031
-      Verify: none -- needs a store written by an older release (0.5.3-beta.192); mongod has no such state to compare
-- [ ] **PYTHON server parity.** The user record's field order changed
-      (`userId` added, `customData` and `authenticationRestrictions`
-      stored, `credentials: {external: true}` for a `$external` user).
-      The Python server reading such a store was not measured.
-      Backlog-ID: RM-032
-      Verify: none -- parity with the deprecated Python server, not with mongod
+- **Scope decision — the order of a set of roles** (this was RM-030,
+  2026-10-20). A user's `roles` after `grantRolesToUser`, a role's `roles`
+  after `grantRolesToRole`, and the built-in roles under
+  `showBuiltinRoles`: mongod keeps each in a hash set, and gave three
+  different orders for one grant in one process, so no fixed order is
+  mongod's. This server keeps the order they were given in, as with the
+  order of `distinct` on a view.
 
 ### 7.082 Handshake, diagnostic and session commands -- 2026-10-13
 
@@ -962,20 +942,18 @@ Still different:
       locked by its background threads only and are absent here.
       Backlog-ID: RM-185
       Verify: tests/backlog/test_rm_185_locks.py::test_lock_counts_of_merge_fail_with_duplicates
-- [ ] **Commands answered only as far as this server honours them.**
-      `getClusterParameter` has six of mongod's fifteen parameters, the ones
-      whose default is a fact here (no shards, no default `maxTimeMS`,
-      pre-images that go with the oplog), and answers 4 for the rest;
-      `planCacheSetFilter` is not a command, because no filter would be
-      applied; `replSetResizeOplog` refuses a `minRetentionHours` above 0,
-      because this oplog drops an entry older than its retention window
-      whatever its size (honouring it means a floor in the shared storage
-      crate's oplog prune); `replSetReconfig` is not a command. Each is a
-      feature to build, not a reply to change. (`features` has no `js`
-      block, as a `mongod --noscripting` answers, and `oidReset` replaces
-      the ObjectId process value since 2026-10-20.)
-      Backlog-ID: RM-143
-      Verify: tests/backlog/test_rm_029_056.py::test_plan_cache_set_filter,tests/backlog/test_rm_029_056.py::test_resize_oplog_min_retention_hours,tests/backlog/test_rm_029_056.py::test_every_cluster_parameter
+- **Scope decision — `replSetReconfig` takes one member, this server**
+  (2026-10-20, under "Explicitly out of scope: real replica sets"). mongod
+  8.2.11 accepts a configuration that adds a member it cannot reach and
+  goes on to replicate to it; this single-node set refuses any
+  configuration of more than one member (103). Every other check and
+  setting is mongod's (17 scenarios, no difference), and the configuration
+  is kept in `local.system.replset` across restarts.
+- **Scope decision — the order of `planCacheListFilters`.** mongod lists
+  index filters, and the indexes of each, in its hash set's order (setting
+  `["a_1", "zz"]` lists `["zz", "a_1"]`); no fixed order can match it, so
+  they are listed in the order they were set (since 2026-10-20, when index
+  filters landed; formerly part of RM-143).
 - **Scope decision — `buildInfo.secantusVersion` and `serverStatus.secantus`
   stay** (Joe, 2026-10-15). Each names this build beside mongod's own
   fields. They are additive, documented (`CLAUDE.md`, `docs/compatibility.md`,
@@ -1031,28 +1009,25 @@ priority queue) and `secantus-commands/src/explain/geo.rs`.
 
 What the probe does not reach, each found beside it:
 
-- [ ] **Geo order outside the replayed shapes.** The order of a geo read
-      is mongod's index scan only where one geo index serves the query
-      alone. A geo predicate in an `$or` branch (mongod scans the branches
-      and merges), and a compound `2dsphere` index with a non-equality
-      predicate on its trailing field, still come back in storage order.
-      Also left as before, not measured as different: a `$near` replay past
-      2,000 documents (nearest first), and `2dsphere` index versions 1 and 2.
-      The geo order is the macOS arm64 reference's (libc++ heap, FMA); a
-      Linux x86-64 mongod was not measured.
-      Backlog-ID: RM-151
-      Verify: tests/backlog/test_rm_geo_order_residuals.py::test_geo_predicates_in_or_branches,tests/backlog/test_rm_geo_order_residuals.py::test_geo_predicate_or_id,tests/backlog/test_rm_geo_order_residuals.py::test_compound_geo_index_with_a_range_on_its_trailing_field
-- [ ] **A point exactly on an edge's great circle.** S2 settles a point
-      or vertex exactly on another edge's great circle with exact
-      predicates and symbolic perturbation; here it is floats. A line
-      ending exactly on another line's edge: `$geoIntersects` of
-      `[[1,5],[11,5]]` against `[[1,1],[11,1],[11,11]]` matches here and
-      not in mongod. Collinear vertices on lng 180 differ the same way.
-      Line within polygon, polygon within polygon and line against line
-      are still vertex and crossing tests with a 1.5e-9 tolerance, not S2's
-      clipping (they agreed with mongod on everything probed).
+- **Not measured — geo order past the replayed shapes** (RM-151's
+  remainder; the `$or` branches and a range on a compound `2dsphere`
+  index's trailing field replay mongod's scans since 2026-10-20): a `$near`
+  replay past 2,000 documents (nearest first), `2dsphere` index versions 1
+  and 2, and a Linux x86-64 mongod (the geo order is the macOS arm64
+  reference's: libc++ heap, FMA).
+- [ ] **A line along a polygon's edge on the antimeridian.** A line along
+      lng 180 against a polygon whose edge lies on that meridian meets it on
+      mongod 8.2.11 (`polygonLineIntersection` clips the line to the
+      polygon) and does not here. Line against line is S2's own
+      `S2Polyline::Intersects` since 2026-10-20, exact predicates and
+      symbolic perturbation included (a line ending exactly on another
+      line's edge, and collinear lines, answer as on mongod). Line within
+      polygon, polygon within polygon and line against polygon are still
+      vertex and crossing tests with a 1.5e-9 tolerance, not S2's clipping;
+      they agreed with mongod on everything else probed (`geo_queries.py`,
+      1,278 replies, none differ).
       Backlog-ID: RM-148
-      Verify: tests/backlog/test_rm_geo_residuals.py::test_line_ending_exactly_on_another_line
+      Verify: tests/backlog/test_rm_geo_residuals.py::test_line_along_a_polygon_edge_on_the_antimeridian
 
 ### 7.080 The order `find` returns documents in -- 2026-10-13
 
@@ -1374,20 +1349,20 @@ differs on 2 results (re-measured 2026-10-16; 5 before). The harness salts datab
 mongod keeps the oplog of earlier runs and a stream started in the past
 would see them. What is left:
 
-- [ ] **RUST MongoDB server: a resume token in mongod's own format with
-      type bits that matter, or a tiny decimal, gets 40647.** This
-      server's tokens are its own encoding (hex of a BSON document). A token
-      in mongod's format is read by a transcription of mongod's KeyString
-      decoder (`secantus-commands/src/resume_keystring.rs`): one that fails
-      gets mongod's error, and one that decodes is looked up from its
-      cluster time and answers 280 when its event is not the first found,
-      as on mongod (2026-10-20). A `_typeBits` that is not BinData is 40648,
-      and all-zero bits are no bits. What is left: type bits that change a
-      number's type (`0x01` makes the version a double: mongod answers
-      50854), which need mongod's TypeBits reader, and a tiny decimal in
-      `_data`; both answer 40647.
+- [ ] **RUST MongoDB server: a resume token in mongod's own format whose
+      number is a decimal built from a double gets 40647.** A token in
+      mongod's format is read by a transcription of mongod's KeyString
+      decoder (`secantus-commands/src/resume_keystring.rs`). Since
+      2026-10-20 that includes `_typeBits`, read as mongod's `TypeBits`
+      reader reads them, and a decimal that is a whole number or a teeny
+      decimal, whose exponent `adjustDecimalExponent` rescales (695 + 1,384
+      tokens, no difference). What is left is a decimal mongod rebuilds from
+      a double plus a continuation: a small or large magnitude, or a
+      fraction, whose type bits say decimal. That needs Decimal128's rounding
+      from a double; such a token answers 40647, where mongod answers the
+      decoder's own error (50830, for example) or reads it.
       Backlog-ID: RM-075
-      Verify: tests/backlog/test_rm_057_084.py::test_type_bits_that_change_a_number
+      Verify: tests/backlog/test_rm_057_084.py::test_a_decimal_from_a_double_in_a_token
 - [ ] **RUST MongoDB server: `explain` of a `$changeStream` is this
       server's plan.** mongod explains the oplog scan it would run, with
       the full match over `local.oplog.rs`; not reproduced, like the rest
@@ -1442,18 +1417,34 @@ retryable writes). The Rust server differs on 11 scenarios. What is left:
 
 - [ ] **RUST MongoDB server: smaller differences.** A `count` with no query
       does not see another session's uncommitted insert (mongod's fast count
-      does: it answered 3 for 2 committed documents). A write that waits on a
-      transaction's document past `maxTimeMS` answers a plain 50 (mongod adds
-      a `writeConcernError` and words it `Plan executor error during
-      update`). `$where` has no JavaScript to run, in or out of a
-      transaction (2 scenarios). An error that names the request or mongod's
-      oplog entry (40606 / 40607 / 40608 / 40612 on a mismatched
-      `findAndModify` retry; the two statement-id errors) has the code and a
-      shorter text. A write conflict on an insert has an empty cause where
-      mongod names its index table. The other session errors are worded for
-      a session with no user.
+      does: it answered 3 for 2 committed documents). An error that names
+      the request or mongod's oplog entry has the code and a shorter text:
+      40606 / 40607 / 40608 / 40611 / 40612 on an incompatible
+      `findAndModify` retry (which cases refuse is mongod's since
+      2026-10-20, RM-203), and the two statement-id errors. A write conflict
+      on an insert has an empty cause where mongod names its index table.
+      The other session errors are worded for a session with no user.
+      (A write that waits on a transaction's document past `maxTimeMS`
+      answers a plain 50, which is what mongod 8.2.11 answered in 12 runs
+      of 12; the `writeConcernError` one probe run saw did not recur.)
       Backlog-ID: RM-087
       Verify: tests/backlog/test_rm_085_112.py::test_fast_count_sees_another_sessions_uncommitted_insert
+- [ ] **RUST MongoDB server: a collection made in a transaction is locked
+      to that transaction's end.** mongod 8.2.11 lets a second transaction
+      create, or insert into, a collection a first one created and has not
+      committed, and reports the conflict when one commits (112 WriteConflict,
+      "Collection namespace ... is already in use"). This server takes an
+      exclusive lock on the new collection for the creating transaction's
+      whole life (RM-084), so the second transaction's statement fails with 24
+      LockTimeout after `maxTransactionLockRequestTimeoutMillis` (since
+      2026-10-20; before that it waited for the first transaction to end, and
+      could stop the server answering: RM-201, fixed). Also from the lock
+      manager: a queued exclusive request does not hold back a later intent
+      request, where mongod's queue does (a transaction's insert behind a
+      waiting `drop` times out on mongod and goes ahead here; see RM-138).
+      Measured with `tools/probes/transactions.py`: 2 of 267 scenarios.
+      Backlog-ID: RM-202
+      Verify: tests/backlog/test_rm_057_084.py::test_a_collection_made_in_two_transactions
 
 ### 7.071 Time-series collections -- 2026-10-11
 
