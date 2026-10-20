@@ -279,6 +279,11 @@ pub struct UserTransactionHandle {
     /// while it is still current, the registry this snapshot sees is the
     /// one every other session sees too (see `is_timeseries`).
     registry_gen: u64,
+    /// [`planner_settled`] just before the transaction's snapshot was taken,
+    /// `None` when a write of the catalog was in flight: while it is still
+    /// the settled value, the catalog this snapshot sees is the committed one
+    /// every session sees (see `planner_shared_gen`).
+    planner_gen: Option<u64>,
 }
 
 impl UserTransactionHandle {
@@ -4023,6 +4028,12 @@ pub struct Storage {
     /// `planner_indexes` answers by `(db, collection)`, each with the
     /// [`PLANNER_FINISHED`] value it was read under.
     planner_cache: std::sync::RwLock<PlannerCache>,
+    /// A registered collection's index descriptors and registry options,
+    /// as a write reads them, each with the [`PLANNER_FINISHED`] value it was
+    /// read under (`index_descs_cached`, `coll_options_cached`).
+    desc_cache: std::sync::RwLock<CatalogCache<Vec<IndexDesc>>>,
+    options_cache: std::sync::RwLock<CatalogCache<Document>>,
+    list_cache: std::sync::RwLock<CatalogCache<Vec<Document>>>,
     /// Dirty budget for one multi-document transaction: ~15% of the cache
     /// (0.75 x WT's ~20% dirty-eviction trigger, the shape of mongod's
     /// `TransactionTooLargeForCache` threshold). A transaction's dirty
@@ -5983,6 +5994,9 @@ impl Storage {
             record_ids: Mutex::new(HashMap::new()),
             multikey_paths: Mutex::new(HashMap::new()),
             planner_cache: std::sync::RwLock::new(HashMap::new()),
+            desc_cache: std::sync::RwLock::new(HashMap::new()),
+            options_cache: std::sync::RwLock::new(HashMap::new()),
+            list_cache: std::sync::RwLock::new(HashMap::new()),
             txn_dirty_limit: (parse_cache_bytes(config) as f64 * 0.20 * 0.75) as u64,
             oplog_shards_created,
             ttl: TtlMonitor::default(),
@@ -8149,6 +8163,7 @@ impl Storage {
             written_ns: Vec::new(),
             unattributed: false,
             registry_gen: 0,
+            planner_gen: None,
             opened_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_micros() as i64),
@@ -8242,10 +8257,12 @@ impl Storage {
         };
         let epoch = COMMITS_DONE.load(Ordering::SeqCst);
         let registry_gen = COLL_TABLE_GEN.load(Ordering::SeqCst);
+        let planner_gen = planner_settled();
         match session.reset_snapshot() {
             Ok(()) => {
                 handle.epoch = Some(epoch);
                 handle.registry_gen = registry_gen;
+                handle.planner_gen = planner_gen;
                 Ok(true)
             }
             // The transaction wrote without an oplog entry: WiredTiger's
@@ -8275,6 +8292,7 @@ impl Storage {
         if !handle.began {
             handle.epoch = Some(COMMITS_DONE.load(Ordering::SeqCst));
             handle.registry_gen = COLL_TABLE_GEN.load(Ordering::SeqCst);
+            handle.planner_gen = planner_settled();
             session.begin_transaction(None)?;
             handle.began = true;
         }
@@ -8723,6 +8741,7 @@ impl Storage {
                 .ok_or_else(|| StorageError::Internal("transaction already closed".into()))?;
             fresh.epoch = Some(COMMITS_DONE.load(Ordering::SeqCst));
             fresh.registry_gen = COLL_TABLE_GEN.load(Ordering::SeqCst);
+            fresh.planner_gen = planner_settled();
             session.begin_transaction(None)?;
             fresh.began = true;
             // Any read takes the snapshot; the collection registry always
@@ -8788,6 +8807,7 @@ impl Storage {
                     })?;
                     fresh.epoch = Some(COMMITS_DONE.load(Ordering::SeqCst));
                     fresh.registry_gen = COLL_TABLE_GEN.load(Ordering::SeqCst);
+                    fresh.planner_gen = planner_settled();
                     session.begin_transaction(None)?;
                     fresh.began = true;
                     // REPEATABLE READ may move only onto a snapshot that sees
@@ -9666,13 +9686,26 @@ impl Storage {
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
             let session = self.op_session()?;
             let (inserted, errors, stopped, tally) = self.with_statement_txn(&session, || {
-                self.create_for_write(&session, db, coll)?;
-                let descs = self.index_descs(&session, db, coll)?;
+                // The collection's registry row and index descriptors, read
+                // once per catalog generation (`coll_options_cached`): every
+                // insert re-read them under this collection's lock.
+                let registered = self.coll_options_cached(&session, db, coll)?;
+                if registered.is_none() {
+                    self.create_for_write(&session, db, coll)?;
+                }
+                let descs = self.index_descs_cached(&session, db, coll)?;
                 let ns = format!("{db}.{coll}");
                 let oplog_on = self.enable_oplog;
                 let timeseries = self.is_timeseries(&session, db, coll)?;
+                let minted = registered.as_ref().and_then(|o| match o.get("uuid") {
+                    Some(Bson::Binary(b)) if b.bytes.len() == 16 => Some(b.bytes.clone()),
+                    _ => None,
+                });
                 let ui = if oplog_on {
-                    Some(collection_uuid(&session, db, coll)?)
+                    Some(match minted {
+                        Some(uuid) => uuid,
+                        None => collection_uuid(&session, db, coll)?,
+                    })
                 } else {
                     None
                 };
@@ -12010,7 +12043,39 @@ impl Storage {
         // Lock-free read outside a transaction; inside one, the transaction's own
         // session, so a DROP / CREATE earlier in it is seen (see `op_session`).
         let session = self.op_session()?;
-        if !collection_registered(&session, db, coll)? {
+        // Read once per catalog generation, as `index_descs_cached` is: the
+        // PostgreSQL server asks on every row it writes.
+        let Some(gen) = self.planner_shared_gen(&session) else {
+            return self.read_list_indexes(&session, db, coll);
+        };
+        let key = (db.to_string(), coll.to_string());
+        if let Some((g, list)) = self
+            .list_cache
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            if *g == gen {
+                return Ok(list.as_ref().clone());
+            }
+        }
+        let list = self.read_list_indexes(&session, db, coll)?;
+        if planner_settled() == Some(gen)
+            && deferred_row(&session, db, coll).is_none()
+            && collection_registered(&session, db, coll)?
+        {
+            let mut cache = self.list_cache.write().unwrap_or_else(|e| e.into_inner());
+            if cache.values().any(|(g, _)| *g != gen) {
+                cache.clear();
+            }
+            cache.insert(key, (gen, Arc::new(list.clone())));
+        }
+        Ok(list)
+    }
+
+    /// [`Self::list_indexes`], read from the catalog.
+    fn read_list_indexes(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<Document>> {
+        if !collection_registered(session, db, coll)? {
             return Ok(Vec::new());
         }
         let mut id_key_spec = Document::new();
@@ -12025,7 +12090,7 @@ impl Storage {
         } else {
             vec![id_idx]
         };
-        for (name, key_spec, opts) in self.iter_indexes(&session, db, coll)? {
+        for (name, key_spec, opts) in self.iter_indexes(session, db, coll)? {
             let mut e = Document::new();
             e.insert("v", 2i32);
             e.insert("key", Bson::Document(key_spec));
@@ -12865,7 +12930,7 @@ impl Storage {
         pre_images: &mut Vec<Option<Vec<u8>>>,
         inserted: Option<(i64, i64)>,
     ) -> Result<Option<CappedTally>> {
-        let opts = match coll_options(session, db, coll)? {
+        let opts = match self.coll_options_cached(session, db, coll)? {
             Some(o) if o.get_bool("capped").unwrap_or(false) => o,
             _ => return Ok(None),
         };
@@ -13473,6 +13538,109 @@ impl Storage {
             .collect();
         descs.extend(self.id_claim_desc(session, db, coll)?);
         Ok(descs)
+    }
+
+    /// The catalog generation under which a read of the catalog through
+    /// `session` sees exactly what every session sees -- the COMMITTED
+    /// registry and index catalog, which a cache may stand in for -- or
+    /// `None`. Outside a user transaction: the settled generation (the read
+    /// takes its snapshot after it is loaded). Inside one: the generation its
+    /// snapshot was taken under, while that is still the settled one. A
+    /// catalog write in flight, the transaction's own included, settles
+    /// nothing, so none of them is ever read from a cache.
+    fn planner_shared_gen(&self, session: &Session) -> Option<u64> {
+        if std::ptr::eq(session, ACTIVE_TXN_SESSION.with(|c| c.get())) {
+            let hp = Self::active_handle()?;
+            // SAFETY: see `active_handle`; a shared read.
+            let snapshot = unsafe { &*hp }.planner_gen?;
+            return (planner_settled() == Some(snapshot)).then_some(snapshot);
+        }
+        if self.in_user_txn() {
+            return None;
+        }
+        planner_settled()
+    }
+
+    /// [`Self::index_descs`] for a write, read once per catalog generation
+    /// while the collection is registered (`planner_shared_gen`). Every
+    /// write of the index catalog or the registry moves the generation
+    /// (`note_planner_write`), so an entry is only ever the catalog as it
+    /// stands; a collection not registered is read afresh, since a deferred
+    /// create's commit registers it without a planner write.
+    fn index_descs_cached(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+    ) -> Result<Arc<Vec<IndexDesc>>> {
+        let Some(gen) = self.planner_shared_gen(session) else {
+            return Ok(Arc::new(self.index_descs(session, db, coll)?));
+        };
+        let key = (db.to_string(), coll.to_string());
+        if let Some((g, descs)) = self
+            .desc_cache
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            if *g == gen {
+                return Ok(Arc::clone(descs));
+            }
+        }
+        let descs = Arc::new(self.index_descs(session, db, coll)?);
+        // Only the committed registry row: a transaction's deferred create
+        // is its own (`deferred_row`), and moves no generation.
+        if planner_settled() == Some(gen)
+            && deferred_row(session, db, coll).is_none()
+            && collection_registered(session, db, coll)?
+        {
+            let mut cache = self.desc_cache.write().unwrap_or_else(|e| e.into_inner());
+            // One generation's answers at a time.
+            if cache.values().any(|(g, _)| *g != gen) {
+                cache.clear();
+            }
+            cache.insert(key, (gen, Arc::clone(&descs)));
+        }
+        Ok(descs)
+    }
+
+    /// A registered collection's registry options, cached as
+    /// [`Self::index_descs_cached`] caches its indexes; `None` when it is
+    /// not registered (never cached).
+    fn coll_options_cached(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+    ) -> Result<Option<Arc<Document>>> {
+        let Some(gen) = self.planner_shared_gen(session) else {
+            return Ok(coll_options(session, db, coll)?.map(Arc::new));
+        };
+        let key = (db.to_string(), coll.to_string());
+        if let Some((g, opts)) = self
+            .options_cache
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            if *g == gen {
+                return Ok(Some(Arc::clone(opts)));
+            }
+        }
+        let Some(opts) = coll_options(session, db, coll)?.map(Arc::new) else {
+            return Ok(None);
+        };
+        if planner_settled() == Some(gen) && deferred_row(session, db, coll).is_none() {
+            let mut cache = self
+                .options_cache
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            if cache.values().any(|(g, _)| *g != gen) {
+                cache.clear();
+            }
+            cache.insert(key, (gen, Arc::clone(&opts)));
+        }
+        Ok(Some(opts))
     }
 
     /// The claim a document-valued `_id` takes, beside its row in the `_id` index.
@@ -19941,6 +20109,10 @@ static COLL_TABLE_GEN: AtomicU64 = AtomicU64::new(1);
 /// One index as the planner reads it: its `listIndexes` spec, and per key
 /// field the path components that hold an array.
 pub type PlannerIndex = (Document, Vec<Vec<String>>);
+
+/// A collection's catalog facts by `(db, collection)`, each with the
+/// generation it was read under (`index_descs_cached` and its siblings).
+type CatalogCache<T> = HashMap<(String, String), (u64, Arc<T>)>;
 
 /// `planner_indexes` answers by `(db, collection)`, each with the generation
 /// it was read under.
