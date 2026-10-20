@@ -107,10 +107,9 @@ The audience is developers who want fast, ephemeral, single-node MongoDB or
 PostgreSQL behaviour — in a test, in CI, in a container — without running the
 real thing. Not a production-grade emulator.
 
-**Performance work belongs to the Rust servers.** The Python pair is a
-correctness and readability target, not a throughput one; a benchmark that shows
-it slow is reporting the design, not a regression. Route latency / throughput /
-concurrency work to `crates/`.
+**Performance work belongs to the Rust servers.** A benchmark that shows a
+Python server slow is reporting the design, not a regression. Route latency /
+throughput / concurrency work to `crates/`.
 
 ## Design constraints
 
@@ -281,8 +280,8 @@ one request path:
   `server` / `wire` / `commands` / `Storage` / operator engines). No Rust in the
   request path.
 - **The Python PostgreSQL server** (`secantus.sql.pgserver`) — the PostgreSQL wire
-  over the same Python `Storage`. The older and **more complete** SQL surface of
-  the two; the Rust one is its port, not its replacement.
+  over the same Python `Storage`. Deprecated: the Rust PostgreSQL server is its
+  replacement and now the more complete SQL surface.
 
 #### Versioning: three independent version lines
 
@@ -321,46 +320,14 @@ engines + geo + aggregation, **no PyO3**), `secantus-storage` (the full WT-backe
 exactly what lets the Rust server / standalone `secantusd-rs` binary reuse the
 engines.
 
-- **Current code vs direction.** Today the code still contains the transitional
-  in-process selection (`src/secantus/engine.py`: `selected()` / `enabled()` and
-  the `query`/`update`/`expressions`/`projection`/`diff`/`sortkey`/`aggregate`
-  shims that delegate to `_secantus_core` when enabled; `SECANTUS_ENGINE=python|
-  rust|auto`). **This is being retired** in favour of the two-server model: the
-  Python server reverts to pure-Python, and `_secantus_core` is kept **only as the
-  parity-test vehicle**. Don't build new in-process selection surface; build the
-  Rust server (`tasks/rust-server-plan.md` §4, R1–R8).
-- **Parity suites stay (a DRIFT detector, not an oracle).** Each Rust engine is
-  pinned byte-for-byte to its pure-Python counterpart by a
-  `tests/test_rust_*_parity.py` suite (curated corpus + randomised fuzz); the
-  Rust side returns a "defer to Python" signal for constructs it can't reproduce
-  exactly (regex → Python `re`, collation, Decimal128 edges, non-ASCII case,
-  etc.). When porting/widening a Rust engine, **extend the parity suite first**;
-  never let the two engines drift.
-
-  **But the Python engine is NOT the Rust server's exemplar** — `mongod` is (see
-  "Design constraints" above). These suites say the two engines moved apart;
-  they never say which one to move. A parity failure is a prompt to probe
-  `mongod`, not a licence to make Rust agree with Python.
-- **The parity suites do NOT cover the STORAGE layer** — they pin `query` /
-  `update` / `expressions` / `projection` / `sortkey` / `diff` / `aggregate`,
-  the pure engines. `secantus-storage` has its own port of the index helpers
-  (`op_implies_bound`, `index_key_variants`, the pickers), and on 2026-09-01 it
-  still carried four index defects — three of them silent data loss — for as long
-  as it took someone to grep for them after the Python side was fixed. **When a
-  fix lands in `src/secantus/storage.py`, grep `crates/secantus-storage/` for the
-  same helper**: nothing else will tell you. `tools/probes/index_result_sets.py`
-  is the standing cover for the index half — it compares a server against ITSELF,
-  with and without the index, so it isolates the index from the sort engine and
-  needs no oracle to say which side is wrong.
-- **Implication for changes:** a change to an operator's semantics lands in the
-  Rust port; the Python module is deprecated and is not changed to match. Keep
-  the parity suite green by updating its expectation for the case the Rust
-  change moved (never by changing the Python engine). The Rust server's pymongo +
-  driver gauges must not regress. Plan / phase status / per-engine
-  fallback lists: `tasks/rust-server-plan.md` (north star), `tasks/rust-rewrite-
-  plan.md`, `tasks/rust-rewrite-phase4-scoping.md`, `tasks/rust-rewrite-spike-
-  findings.md`, `tasks/backlog-rust-mongodb.md` §7. Tooling: `invoke rust-test` / `rust-build`
-  / `rust-parity`.
+- **Parity suites are a DRIFT detector, not a reference.** Each pure Rust
+  engine is pinned to its Python counterpart (`tests/test_rust_*_parity.py`).
+  A failure says the engines moved apart, never which is right: probe
+  `mongod`, and when the Rust change was correct, update the parity
+  EXPECTATION for that case; never change the Python engine to match. The
+  suites do not cover the storage layer. The transitional in-process engine
+  selection (`src/secantus/engine.py`) and the rest of this history are in the
+  `python-servers` skill.
 
 ## Tooling
 
@@ -408,54 +375,20 @@ engines.
 
 Both procedures are managed by skills — they auto-fire on the relevant trigger phrases. To inspect or invoke manually: `/secantusdb-release` and `/secantusdb-website`. The skill files are under `~/.claude/skills/`; treat them as the source of truth and edit them there, not here.
 
-- **Release-time benchmark refresh** — `invoke release-benchmark` re-measures
-  SecantusDB against a real `mongod` on three DigitalOcean droplets (three
-  interleaved passes, incompressible payloads) and prints the table for
-  `docs/benchmark.md`. **Run it after the version bump lands on `main`**, so the
-  measured build is the released one. `docs/benchmark.md` is prose with numbers
-  in it and goes stale silently — nothing fails when the engine gets faster.
-  Details in `bench/DO_CLUSTER.md` "At release time".
+- **Release-time benchmark refresh**: `invoke release-benchmark`, after the
+  version bump lands on `main`, so `docs/benchmark.md` measures the released
+  build (`secantusdb-release`, `bench/DO_CLUSTER.md`).
 - **`secantusdb-release`** — the two-phase pipeline (`release-prepare` once in foreground, `release-finalize` in a foreground retry loop), the sub-agent contract, foreground-only constraints, the 8-step pipeline (pre-flight → pytest → perf gates → changelog collation → bump → tag/push → GitHub Release → PyPI workflow + listing), and the hard prohibitions against manual `git tag`/`uv publish`. Docs are **self-hosted at secantusdb.com/docs/** (main tree) and **/docs/rust/** (Rust server) — they deploy with the post-release website publish, not the release pipeline; the readthedocs.io copies are legacy, kept alive with a moved banner.
-- **A Rust server release ends at the live site, not at the GitHub Release**
-  (rule added 2026-10-08). After a `secantusdb-v*` or `secantusd-pg-v*` tag has
-  published its binaries and crates: bump the pinned tag in
-  `website/pelicanconf.py` (`SECANTUS_RUST_BINARY_TAG` / `SECANTUS_PG_BINARY_TAG`),
-  re-read the server's page template against what shipped, write a blog post by
-  hand under `website/content/blog/` (`changelog.blog` only knows PyPI
-  versions), land it via PR and deploy. Every `secantusd-pg-v*` release gets a
-  post; a `secantusdb-v*` release gets one when a user would notice the
-  change, and only the tag bump when it was cut so a benchmark or PyPI release
-  measures the current build. The `secantusdb-release` skill has the steps.
+- **A Rust server release ends at the live site, not at the GitHub Release**:
+  bump the pinned tag in `website/pelicanconf.py`, re-read the server's page,
+  write the blog post by hand, deploy. Steps: `secantusdb-release`.
 - **`secantusdb-website`** — **website content lives on `main`** (the retired `SecantusDB-website` / `website-dev` worktree pattern is gone; Pelican builds the live site from `main`). Edit `website/` on a short feature branch and land via PR (website-only commits skip the full pytest run — only `website/`, this `CLAUDE.md`, and `.gitignore` qualify), then `invoke deploy` from `main` to build + `aws s3 sync` + invalidate CloudFront. Also covers the driver-panel regeneration and the per-release blog-post template (descriptive title + prose body + link bar — never a stub linking out to GitHub).
 
-  **The site leads with the two Rust servers** (nav: Home / Rust MongoDB / Rust
-  PostgreSQL / Performance / Blog). `rust-db.html`, `rust-pg.html` and
-  `python-db.html` are template-only pages — the content is in
-  `website/themes/secantus/templates/`, not in the near-empty `content/pages/*.md`
-  that select them. Two traps when editing:
-  - **Performance prose goes stale silently and independently of its own table.**
-    Three published claims were wrong in 2026-09 — one contradicted the data table
-    directly below it. The measured source of truth is `docs/benchmark.md`
-    (generated, gated by `tests/test_benchmark_table_fresh.py`); the concurrency
-    chart blocks are generated too, between `<!-- concurrency-viz/-table -->`
-    markers, and `tests/test_concurrency_chart.py` fails if you hand-edit them.
-    When you touch a number on the site, re-derive it from those files.
-  - **The driver panels show BOTH servers, and they are generated — never hand-
-    edited.** `drivers_grid.html` comes from `validation_summary/driver_panels.py`
-    (`--server python|rust|both`, `render_both()`); each collector takes an
-    artifact suffix (`""` for the Python server, `-rust-server` for the Rust one)
-    so one code path reads either set. Regenerate rather than editing, and diff a
-    fresh regeneration against the committed partial when a number looks wrong —
-    they must be byte-identical.
-
-    The generator now REFUSES rather than publishing a comforting number: an
-    empty panel, a truncated gauge run (its rate renders as an em-dash, not a
-    percentage), and artifacts whose dates spread too far apart all abort unless
-    you pass `--allow-stale`. If a panel reads blank on the live site, a gauge
-    did not finish — fix the gauge, do not paper over the panel.
-
-    A `validation_summary/` change is **not** website-only, so it does not get
-    the pytest skip; `tests/test_driver_panels_freshness.py` covers this surface.
+  **The site leads with the two Rust servers.** Its pages are templates,
+  its performance numbers and driver panels are generated (never hand-edit
+  them; a blank panel means a gauge did not finish), and a
+  `validation_summary/` change is not website-only. The traps are in the
+  `secantusdb-website` skill.
 
 ## Backlog of stubs and stopgaps
 
@@ -564,28 +497,11 @@ The same arithmetic is why `invoke validate-all --jobs` stays at 4 or fewer
   goes to a session working that side. A change the item needs in the shared
   storage crates is fine -- say in its PR that the other server links it.
 - **Claim a backlog item before working it — the claim is a PUSHED branch.**
-  This repo runs several parallel sessions against the same backlog files, and
-  the same item repeatedly got picked up twice: `set` and `timetz` in the pgtest
-  campaign, plus `tuple` and `procedure`, were each built independently by two
-  sessions and one copy thrown away. Before starting an item:
-  1. `git fetch origin --prune`, then `git ls-remote --heads origin` and
-     `gh pr list --state open`. A branch or open PR matching the item means
-     another session holds it — pick something else.
-  2. **Re-verify the item is still open by reproducing it** — run the corpus
-     file, the failing test, the query. The backlog lags reality: several
-     "open" items here had already been fixed by a parallel session, and two
-     others *understated* the bug (`octet_length` was filed as a `char(n)`
-     padding nit when it was wrong for every string input). Never implement
-     from the backlog text alone.
-  3. Claim it by creating the branch and **pushing it immediately, before the
-     first real commit** — `git push -u origin <branch>` on an empty branch, or
-     open a draft PR. An unpushed local branch is invisible to every other
-     session and claims nothing. The repo already uses one branch per slice;
-     the only change is that the push moves to the start.
-  4. Release by merging and deleting the branch (see the teardown bullet
-     below), or by deleting your own branch if you abandon the item.
-  5. **Never delete or force-push another session's claim branch**, however
-     stale it looks. Report it and let Joe decide.
+  The same item has been built twice by parallel sessions. Check
+  `git ls-remote --heads origin` and `gh pr list --state open` first,
+  **reproduce the item** (the backlog lags reality in both directions), then
+  create the branch and push it before the first commit. Never delete or
+  force-push another session's claim branch. Details: `batch-worktree`.
 - **Batch several slices into ONE branch and PR — do not run the full suite per
   small feature.** The suite is ~6,000 tests and 12–13 minutes; running it after
   every one-file change makes the ceremony cost dwarf the work. Nine
@@ -609,21 +525,13 @@ The same arithmetic is why `invoke validate-all --jobs` stays at 4 or fewer
   origin/main)"`): parallel sessions move `main` mid-run. The `measuring`
   skill has the rest of what makes a number trustworthy.
 - **Land via branch push + PR, not `git push HEAD:main`.** Push the feature branch (`git push -u origin <branch>`) and open a PR (`gh pr create --base main`); let CI run on the PR, then merge when green. **Do not push straight to `main` from a session** — every session pushing the same ref (`refs/heads/main`) lands them in the same CI concurrency group, so a newer push cancels the older session's in-flight run (and forces constant rebases). One feature branch per session = one CI lane per session; distinct refs never cancel each other. After merge, tear the branch down — see the next bullet. (`test.yml` / `wheels.yml` / `rust-wheels.yml` are keyed `concurrency: ${{ github.workflow }}-${{ github.ref }}`, `cancel-in-progress: true` — per-ref, so the cancel only bites within a single branch, which is what you want.)
-- **Cleaning up is part of finishing the work, not a separate chore.** (Branch and worktree teardown is below; for the rest of what a session leaves behind — daemons still bound to ports, WiredTiger temp stores, the `pytest-of-<user>` backlog that slows every later suite, wedged background waiters — see the `session-cleanup` skill. To close out a whole session — land everything outstanding, record what is left, and reconcile the docs with what changed — see `close-session`; its mirror `start-session` holds the opening checks that stop a session working from a stale picture.) A merged PR whose branch and worktree are still lying around is unfinished. Do it in the *same session that merges*, because nobody else can safely do it later: a parallel session can't tell your abandoned branch from live work, so anything you leave behind survives indefinitely. Left alone this compounds badly — one audit found **235 remote branches and 11 worktrees**, nearly all of them merged months earlier, hiding the handful that mattered. Tear down in this order:
-
-  ```bash
-  gh pr merge <N> --squash                       # merge first
-  git worktree remove ../SecantusDB-<branch>     # worktree BEFORE branch
-  git branch -D <branch>                         # see the -d/-D note below
-  git push origin --delete <branch>              # if it still exists
-  ```
-
-  Three traps, all hit for real:
-  - **Remove the worktree before deleting the branch.** `gh pr merge --delete-branch` aborts with "cannot delete branch ... used by worktree" — and having failed, it skips deleting the *remote* branch too, so you end up thinking it cleaned up when it deleted nothing.
-  - **`git branch -d` refuses branches that did land.** Squash-merged commits are never ancestors of `main`, so `-d`'s safety check fails on perfectly merged work. Confirm with `gh pr view <N> --json state` (`MERGED`) and then use `-D`. Don't reach for `-D` without that confirmation.
-  - **Never remove a worktree or branch you didn't create in this conversation** (global rule), *unless* the user explicitly asks you to reconcile it. Then verify before destroying: clean tree, no unique commits, and — for anything symlinked in (`.venv`, `website/infra/aws-state.json`) — that you're deleting the link and not the target.
-
-  **Auditing branches after the fact is much harder than not creating the mess.** `git merge-base --is-ancestor`, `git cherry`, and `git merge-tree` each gave a confidently wrong answer during that audit (squash merges defeat the first two; the third reports conflict markers as though they were content). The signal that actually held up was the PR's merge state, cross-checked against whether `main` already contains the branch's distinctive files. And before reviving any long-lived unmerged branch, check whether `main` has since *rejected* it — one such branch looked like a valuable unmerged CI fix, but `tests/conftest.py` carries a deliberate tripwire against exactly that change because it was tried and caused a `WT_PANIC` cascade.
+- **Cleaning up is part of finishing the work.** Tear down the branch and
+  worktree in the SAME session that merges (worktree before branch; `-D` only
+  after `gh pr view <N> --json state` says `MERGED`), and never remove a
+  worktree, branch or stash you did not create in this conversation. The
+  sequence and its traps: `batch-worktree`. Everything else a session leaves
+  running: `session-cleanup`; closing a whole session: `close-session`;
+  opening one: `start-session`.
 - **Record the changelog with a fragment, not by editing `docs/changelog.md`.** A feature PR adds one file `changelog.d/<short-slug>.md` holding a single entry (a `###` headline + prose lede + `#### Added` / `#### Fixed` / … sections, no version number or `##` header) — see `changelog.d/README.md`. **Do not edit `docs/changelog.md` directly in a feature PR** and **do not bump the Python `version`** (see the Versioning section): those two shared lines are what made every pair of concurrent PRs conflict. New fragment files never collide, so concurrent sessions stay independent. At release, `invoke changelog-collate` (run automatically by `release-prepare`) folds the fragments into `## [Unreleased]` and deletes them; the normal promote-to-a-dated-section step is unchanged.
 - New CRUD operators or aggregation stages should land with both a unit test (in `tests/test_query.py` / `tests/test_update.py` / `tests/test_aggregate.py` / `tests/test_expressions.py`) and a `pymongo`-driven integration test in `tests/test_crud.py`. The integration test is the conformance proof; the unit test pins the semantics.
 - Layer boundaries to defend: the wire layer never knows about commands; the command layer never knows about SQL; pure operator engines (`query`, `update`, `expressions`, `aggregate`, `projection`) take only docs in and out, no I/O.

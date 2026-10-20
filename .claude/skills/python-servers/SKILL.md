@@ -113,3 +113,51 @@ Cluster time: `Storage.current_cluster_time()` returns the next monotonic `Times
 Tailable cursors live in `CursorRegistry`: change-stream cursor IDs are int64-random (`> 2**32`) to dodge driver assumptions; the entry carries a `producer` closure (reads oplog → projects events), `position_seq`, `await_data`, and an `invalidated` flag. `_get_more` blocks on `Storage._oplog_cv` (a separate `Lock`-backed `Condition`, **not** the storage `RLock`) until a writer notifies via `_emit_oplog` or until the per-call timeout expires. PyMongo doesn't always send `maxTimeMS` on change-stream getMore; the server uses 1s as the default tailable wait so the connection thread can be reaped on shutdown.
 
 Event projection lives in `secantus/changestreams.py`: `project(seq, oplog_entry, *, storage, full_document_mode, full_document_before_change_mode, scope) -> (event, invalidates)`. Resume tokens are `{"_data": "<hex>"}` where the hex is `bson.encode({"s": seq, "t": ts, "n": ns, "k": documentKey._id})` — opaque to pymongo but enough state for resume / `startAtOperationTime` / invalidation. Drops on a watched coll, dropDatabase on a watched db, and rename of a watched coll all surface a final `invalidate` event and end the cursor on the next getMore.
+
+## The in-process engines and the parity suites
+
+Moved from CLAUDE.md's "Engines" section (2026-10-20). Read with the
+deprecation in mind: a Rust change that breaks a parity case updates the
+parity EXPECTATION for that case; the Python engine is never changed to
+match, and a Rust fix is never ported back.
+
+- **Current code vs direction.** Today the code still contains the transitional
+  in-process selection (`src/secantus/engine.py`: `selected()` / `enabled()` and
+  the `query`/`update`/`expressions`/`projection`/`diff`/`sortkey`/`aggregate`
+  shims that delegate to `_secantus_core` when enabled; `SECANTUS_ENGINE=python|
+  rust|auto`). **This is being retired** in favour of the two-server model: the
+  Python server reverts to pure-Python, and `_secantus_core` is kept **only as the
+  parity-test vehicle**. Don't build new in-process selection surface; build the
+  Rust server (`tasks/rust-server-plan.md` §4, R1–R8).
+- **Parity suites stay (a DRIFT detector, not an oracle).** Each Rust engine is
+  pinned byte-for-byte to its pure-Python counterpart by a
+  `tests/test_rust_*_parity.py` suite (curated corpus + randomised fuzz); the
+  Rust side returns a "defer to Python" signal for constructs it can't reproduce
+  exactly (regex → Python `re`, collation, Decimal128 edges, non-ASCII case,
+  etc.). When porting/widening a Rust engine, **extend the parity suite first**;
+  never let the two engines drift.
+
+  **But the Python engine is NOT the Rust server's exemplar** — `mongod` is (see
+  "Design constraints" above). These suites say the two engines moved apart;
+  they never say which one to move. A parity failure is a prompt to probe
+  `mongod`, not a licence to make Rust agree with Python.
+- **The parity suites do NOT cover the STORAGE layer** — they pin `query` /
+  `update` / `expressions` / `projection` / `sortkey` / `diff` / `aggregate`,
+  the pure engines. `secantus-storage` has its own port of the index helpers
+  (`op_implies_bound`, `index_key_variants`, the pickers), and on 2026-09-01 it
+  still carried four index defects — three of them silent data loss — for as long
+  as it took someone to grep for them after the Python side was fixed. **When a
+  fix lands in `src/secantus/storage.py`, grep `crates/secantus-storage/` for the
+  same helper**: nothing else will tell you. `tools/probes/index_result_sets.py`
+  is the standing cover for the index half — it compares a server against ITSELF,
+  with and without the index, so it isolates the index from the sort engine and
+  needs no oracle to say which side is wrong.
+- **Implication for changes:** a change to an operator's semantics lands in the
+  Rust port; the Python module is deprecated and is not changed to match. Keep
+  the parity suite green by updating its expectation for the case the Rust
+  change moved (never by changing the Python engine). The Rust server's pymongo +
+  driver gauges must not regress. Plan / phase status / per-engine
+  fallback lists: `tasks/rust-server-plan.md` (north star), `tasks/rust-rewrite-
+  plan.md`, `tasks/rust-rewrite-phase4-scoping.md`, `tasks/rust-rewrite-spike-
+  findings.md`, `tasks/backlog-rust-mongodb.md` §7. Tooling: `invoke rust-test` / `rust-build`
+  / `rust-parity`.
