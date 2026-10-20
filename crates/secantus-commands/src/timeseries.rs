@@ -523,6 +523,258 @@ pub(crate) fn is_a_view(ns: &str) -> CommandError {
     )
 }
 
+/// The bucket-level predicates mongod derives from a query on a time-series
+/// collection, as its planner holds them over `system.buckets.<name>`
+/// (measured 8.2.11, 2026-10-20): a measurement's comparison bounds the
+/// bucket's `control.min` / `control.max`, the time field's also bounds the
+/// bucket `_id` (an ObjectId whose time is the bucket's), offset by the
+/// bucket span; a predicate on the meta field is kept, renamed `meta`. A
+/// predicate it can derive nothing from (null, an array or a document, a
+/// `$ne`, another type on the time field) bounds nothing and is left out.
+pub(crate) fn bucket_filter(
+    filter: &Document,
+    time: &str,
+    meta: Option<&str>,
+    span_secs: i64,
+) -> Document {
+    let fields = BucketFields {
+        time,
+        meta,
+        span_ms: span_secs * 1000,
+    };
+    and_of(fields.clauses(filter))
+}
+
+struct BucketFields<'a> {
+    time: &'a str,
+    meta: Option<&'a str>,
+    span_ms: i64,
+}
+
+fn and_of(clauses: Vec<Document>) -> Document {
+    match clauses.len() {
+        0 => Document::new(),
+        1 => clauses.into_iter().next().expect("one"),
+        _ => doc! { "$and": clauses.into_iter().map(Bson::Document).collect::<Vec<_>>() },
+    }
+}
+
+/// `{path: {op: value}}`.
+fn pred(path: &str, op: &str, value: Bson) -> Document {
+    let mut inner = Document::new();
+    inner.insert(op, value);
+    let mut out = Document::new();
+    out.insert(path, inner);
+    out
+}
+
+impl BucketFields<'_> {
+    fn clauses(&self, filter: &Document) -> Vec<Document> {
+        let mut out = Vec::new();
+        for (key, value) in filter {
+            match (key.as_str(), value) {
+                ("$and", Bson::Array(items)) => {
+                    for item in items.iter().filter_map(Bson::as_document) {
+                        out.extend(self.clauses(item));
+                    }
+                }
+                ("$or", Bson::Array(items)) => {
+                    let branches: Vec<Document> = items
+                        .iter()
+                        .filter_map(Bson::as_document)
+                        .map(|b| and_of(self.clauses(b)))
+                        .collect();
+                    // A branch that bounds nothing leaves the `$or` bounding
+                    // nothing.
+                    if !branches.is_empty() && branches.iter().all(|b| !b.is_empty()) {
+                        let list: Vec<Bson> = branches.into_iter().map(Bson::Document).collect();
+                        out.push(doc! { "$or": list });
+                    }
+                }
+                (k, _) if k.starts_with('$') => {}
+                (path, value) => out.extend(self.field(path, value)),
+            }
+        }
+        out
+    }
+
+    fn field(&self, path: &str, value: &Bson) -> Vec<Document> {
+        if let Some(meta) = self.meta {
+            if let Some(rest) = path
+                .strip_prefix(meta)
+                .filter(|r| r.is_empty() || r.starts_with('.'))
+            {
+                let mut out = Document::new();
+                out.insert(format!("meta{rest}"), value.clone());
+                return vec![out];
+            }
+        }
+        match value {
+            Bson::Document(ops) if ops.keys().next().is_some_and(|k| k.starts_with('$')) => ops
+                .iter()
+                .flat_map(|(op, arg)| self.operator(path, op, arg))
+                .collect(),
+            other => self.operator(path, "$eq", other),
+        }
+    }
+
+    fn operator(&self, path: &str, op: &str, arg: &Bson) -> Vec<Document> {
+        match op {
+            "$eq" | "$gt" | "$gte" | "$lt" | "$lte" => self.comparison(path, op, arg),
+            "$in" => {
+                let Some(items) = arg.as_array() else {
+                    return Vec::new();
+                };
+                let branches: Vec<Document> = items
+                    .iter()
+                    .map(|v| and_of(self.comparison(path, "$eq", v)))
+                    .collect();
+                if branches.is_empty() || branches.iter().any(Document::is_empty) {
+                    return Vec::new();
+                }
+                if branches.len() == 1 {
+                    return branches;
+                }
+                let list: Vec<Bson> = branches.into_iter().map(Bson::Document).collect();
+                vec![doc! { "$or": list }]
+            }
+            "$exists" if crate::util::truthy(arg) => vec![
+                pred(
+                    &format!("control.max.{path}"),
+                    "$exists",
+                    Bson::Boolean(true),
+                ),
+                pred(
+                    &format!("control.min.{path}"),
+                    "$exists",
+                    Bson::Boolean(true),
+                ),
+            ],
+            _ => Vec::new(),
+        }
+    }
+
+    fn comparison(&self, path: &str, op: &str, arg: &Bson) -> Vec<Document> {
+        if matches!(
+            arg,
+            Bson::Null
+                | Bson::Undefined
+                | Bson::Array(_)
+                | Bson::Document(_)
+                | Bson::RegularExpression(_)
+                | Bson::MinKey
+                | Bson::MaxKey
+        ) {
+            return Vec::new();
+        }
+        let max = format!("control.max.{path}");
+        let min = format!("control.min.{path}");
+        if path == self.time {
+            let Bson::DateTime(at) = arg else {
+                return Vec::new();
+            };
+            return self.time_bounds(op, at.timestamp_millis(), &max, &min);
+        }
+        let v = || arg.clone();
+        match op {
+            "$gt" => vec![pred(&max, "$_internalExprGt", v())],
+            "$gte" => vec![pred(&max, "$_internalExprGte", v())],
+            "$lt" => vec![pred(&min, "$_internalExprLt", v())],
+            "$lte" => vec![pred(&min, "$_internalExprLte", v())],
+            _ => vec![
+                pred(&max, "$_internalExprGte", v()),
+                pred(&min, "$_internalExprLte", v()),
+            ],
+        }
+    }
+
+    /// The time field's: the bucket's own bounds, which lie within one span
+    /// of the measurement's, and its `_id`, whose ObjectId carries the time
+    /// the bucket starts at.
+    fn time_bounds(&self, op: &str, at: i64, max: &str, min: &str) -> Vec<Document> {
+        let date = |ms: i64| Bson::DateTime(bson::DateTime::from_millis(ms));
+        let id = |ms: i64, fill: u8| {
+            let mut bytes = [fill; 12];
+            let secs = ms.div_euclid(1000) as u32;
+            bytes[..4].copy_from_slice(&secs.to_be_bytes());
+            Bson::ObjectId(bson::oid::ObjectId::from_bytes(bytes))
+        };
+        let (at_low, at_high) = (at - self.span_ms, at + self.span_ms);
+        match op {
+            "$gt" => vec![
+                pred("_id", "$gt", id(at_low, 0xff)),
+                pred(max, "$_internalExprGt", date(at)),
+                pred(min, "$_internalExprGt", date(at_low)),
+            ],
+            "$gte" => vec![
+                pred("_id", "$gte", id(at_low, 0)),
+                pred(max, "$_internalExprGte", date(at)),
+                pred(min, "$_internalExprGte", date(at_low)),
+            ],
+            "$lt" => vec![
+                pred("_id", "$lt", id(at, 0)),
+                pred(max, "$_internalExprLt", date(at_high)),
+                pred(min, "$_internalExprLt", date(at)),
+            ],
+            "$lte" => vec![
+                pred("_id", "$lte", id(at, 0xff)),
+                pred(max, "$_internalExprLte", date(at_high)),
+                pred(min, "$_internalExprLte", date(at)),
+            ],
+            _ => vec![
+                pred("_id", "$lte", id(at, 0xff)),
+                pred("_id", "$gte", id(at_low, 0)),
+                pred(max, "$_internalExprGte", date(at)),
+                pred(min, "$_internalExprGte", date(at_low)),
+                pred(max, "$_internalExprLte", date(at_high)),
+                pred(min, "$_internalExprLte", date(at)),
+            ],
+        }
+    }
+}
+
+/// A hint on a read of the time-series collection `db.coll` that names
+/// none of its indexes: refused as mongod's planner refuses it over the
+/// buckets, with the bucket-level query it planned and the simple
+/// collation, whatever the read's sort, projection or paging (mongod
+/// 8.2.11, 2026-10-20). The buckets are clustered, so `{_id: 1}` names no
+/// index (the name `_id_` does).
+pub(crate) fn check_hint(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    filter: &Document,
+    hint: Option<&Bson>,
+) -> Result<(), CommandError> {
+    let Ok(options) = storage.get_collection_options(db, coll) else {
+        return Ok(());
+    };
+    let Ok(ts) = options.get_document("timeseries") else {
+        return Ok(());
+    };
+    let id_spec = matches!(hint, Some(Bson::Document(d)) if d.len() == 1 && d.contains_key("_id"));
+    if !id_spec && crate::util::hint_is_known(storage, db, coll, hint) {
+        return Ok(());
+    }
+    let buckets = bucket_filter(
+        filter,
+        ts.get_str("timeField").unwrap_or_default(),
+        ts.get_str("metaField").ok(),
+        crate::util::as_i64(ts.get("bucketMaxSpanSeconds").unwrap_or(&Bson::Int32(3600)))
+            .unwrap_or(3600),
+    );
+    let simple = doc! {"locale": "simple"};
+    let query = crate::explain::CanonicalQuery {
+        collation: Some(&simple),
+        ..crate::explain::CanonicalQuery::plain(db, &format!("system.buckets.{coll}"), &buckets)
+    };
+    Err(CommandError::new(
+        2,
+        "BadValue",
+        query.planner_error("hint provided does not correspond to an existing index"),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,5 +966,73 @@ mod tests {
         .unwrap()
         .contains("non-time fields"));
         assert_eq!(fields.default_index().unwrap().0, "m_1_t_1");
+    }
+
+    /// What mongod 8.2.11 printed over the buckets (2026-10-20).
+    #[test]
+    fn bucket_filters_print_as_mongod_planned_them() {
+        use crate::explain::debug_string::debug_string;
+        let at = bson::DateTime::from_millis(1672531200000);
+        let tree = |f: Document, span: i64| debug_string(&bucket_filter(&f, "t", Some("m"), span));
+        assert_eq!(tree(doc! {}, 3600), "$and\n");
+        assert_eq!(
+            tree(doc! {"t": {"$gt": at}}, 3600),
+            "$and\n    _id $gt ObjectId('63b0bef0ffffffffffffffff')\n    \
+             control.max.t $_internalExprGt new Date(1672531200000)\n    \
+             control.min.t $_internalExprGt new Date(1672527600000)\n"
+        );
+        assert_eq!(
+            tree(doc! {"t": at}, 3600),
+            "$and\n    _id $lte ObjectId('63b0cd00ffffffffffffffff')\n    \
+             _id $gte ObjectId('63b0bef00000000000000000')\n    \
+             control.max.t $_internalExprGte new Date(1672531200000)\n    \
+             control.min.t $_internalExprGte new Date(1672527600000)\n    \
+             control.max.t $_internalExprLte new Date(1672534800000)\n    \
+             control.min.t $_internalExprLte new Date(1672531200000)\n"
+        );
+        assert_eq!(
+            tree(doc! {"t": {"$lt": at}}, 2592000),
+            "$and\n    _id $lt ObjectId('63b0cd000000000000000000')\n    \
+             control.max.t $_internalExprLt new Date(1675123200000)\n    \
+             control.min.t $_internalExprLt new Date(1672531200000)\n"
+        );
+        assert_eq!(
+            tree(doc! {"v": {"$gt": 1}}, 3600),
+            "control.max.v $_internalExprGt 1\n"
+        );
+        assert_eq!(
+            tree(doc! {"v": 1}, 3600),
+            "$and\n    control.max.v $_internalExprGte 1\n    control.min.v $_internalExprLte 1\n"
+        );
+        for nothing in [
+            doc! {"v": Bson::Null},
+            doc! {"v": {"$ne": 1}},
+            doc! {"v": [1]},
+            doc! {"t": {"$gt": "x"}},
+        ] {
+            assert_eq!(tree(nothing, 3600), "$and\n");
+        }
+        assert_eq!(
+            tree(doc! {"v": {"$in": [1, 2]}}, 3600),
+            "$or\n    $and\n        control.max.v $_internalExprGte 1\n        \
+             control.min.v $_internalExprLte 1\n    $and\n        \
+             control.max.v $_internalExprGte 2\n        control.min.v $_internalExprLte 2\n"
+        );
+        assert_eq!(
+            tree(doc! {"v": {"$exists": true}}, 3600),
+            "$and\n    control.max.v exists\n    control.min.v exists\n"
+        );
+        assert_eq!(tree(doc! {"m.k": {"$gt": 1}}, 3600), "meta.k $gt 1\n");
+        assert_eq!(tree(doc! {"m": {"$in": [1, 2]}}, 3600), "meta $in [ 1 2]\n");
+        assert_eq!(
+            tree(doc! {"$or": [{"v": 1}, {"m.k": 2}]}, 3600),
+            "$or\n    $and\n        control.max.v $_internalExprGte 1\n        \
+             control.min.v $_internalExprLte 1\n    meta.k $eq 2\n"
+        );
+        assert_eq!(
+            tree(doc! {"m.k": 1, "v": 2}, 3600),
+            "$and\n    meta.k $eq 1\n    control.max.v $_internalExprGte 2\n    \
+             control.min.v $_internalExprLte 2\n"
+        );
     }
 }

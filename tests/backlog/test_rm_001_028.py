@@ -303,12 +303,24 @@ def test_dbhash_includes_timeseries_buckets(rust_mongo: Any, mongod: Any) -> Non
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-027")
+# A `--noscripting` mongod 8.2.11's answer to `mapReduce` with a named `out`
+# (measured 2026-10-20): the refusal this server gives by Joe's decision.
+NO_SCRIPTING_MAP_REDUCE = (
+    "err",
+    31264,
+    "Executor error during MapReduce command on namespace: rm027.k :: caused by :: "
+    "Cannot run server-side javascript without the javascript engine enabled",
+)
+
+
+@pytest.mark.backlog_fixed("RM-027")
 def test_commands_mongod_runs(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 runs `compact` (with `force: true`, which a replica-set
-    primary needs too), `setParameter notablescan` and `mapReduce` with a
-    named `out`. (`reIndex` is left out: mongod refuses it on a replica-set
-    member, which is what the Rust server reports itself as.)"""
+    primary needs too) and `setParameter notablescan`. `mapReduce` with a
+    named `out` is refused as a mongod with no JavaScript engine refuses it
+    (Joe, 2026-10-16: no JavaScript engine). (`reIndex` is left out: mongod
+    refuses it on a replica-set member, which is what the Rust server
+    reports itself as.)"""
     answers = {}
     for name, db in _both(rust_mongo, mongod, "rm027"):
         db.k.insert_one({"x": 1})
@@ -318,16 +330,16 @@ def test_commands_mongod_runs(rust_mongo: Any, mongod: Any) -> None:
             mongo_answer(
                 lambda c=client: _strip(c.admin.command("setParameter", 1, notablescan=False))
             ),
-            mongo_answer(
-                lambda db=db: _strip(
-                    db.command(
-                        "mapReduce",
-                        "k",
-                        map="function() { emit(this.x, 1); }",
-                        reduce="function(k, v) { return Array.sum(v); }",
-                        out="mrout",
-                    )
-                )
-            ),
         ]
     assert answers["rust"] == answers["mongod"]
+    db = rust_mongo["rm027"]
+    got = mongo_answer(
+        lambda: db.command(
+            "mapReduce",
+            "k",
+            map="function() { emit(this.x, 1); }",
+            reduce="function(k, v) { return Array.sum(v); }",
+            out="mrout",
+        )
+    )
+    assert got == NO_SCRIPTING_MAP_REDUCE

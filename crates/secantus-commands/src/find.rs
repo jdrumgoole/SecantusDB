@@ -495,22 +495,17 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         if let Some(message) = refused {
             return Ok(CommandError::new(168, "InvalidPipelineOperator", message).into_reply());
         }
-        // The buckets are clustered: there is no `{_id: 1}` index to hint.
-        // (mongod does take the NAME `_id_`.)
-        if let Some(Bson::Document(spec)) = argtypes::given_hint(doc) {
-            if spec.len() == 1 && spec.contains_key("_id") {
-                return Ok(CommandError::new(
-                    2,
-                    "BadValue",
-                    format!(
-                        "hint {} does not correspond to an existing index",
-                        secantus_core::aggregate::render_value_compact(&Bson::Document(
-                            spec.clone()
-                        ))
-                    ),
-                )
-                .into_reply());
-            }
+        // A hint naming no index is refused over the buckets
+        // (`timeseries::check_hint`; the buckets are clustered, so
+        // `{_id: 1}` names none).
+        if let Err(e) = crate::timeseries::check_hint(
+            storage,
+            &ctx.db_name,
+            &coll,
+            &doc_field(doc, "filter"),
+            argtypes::given_hint(doc),
+        ) {
+            return Ok(e.into_reply());
         }
     }
 
@@ -655,16 +650,21 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .into_reply());
     }
 
-    crate::notablescan::check(
-        ctx,
-        &crate::notablescan::Read {
-            coll: &coll,
-            filter: &filter,
-            sort,
-            hint,
-            collation: collation.as_ref(),
+    let read = crate::notablescan::Read {
+        coll: &coll,
+        filter: &filter,
+        sort,
+        hint,
+        collation: collation.as_ref(),
+        shown: crate::notablescan::Shown {
+            projection: doc.get_document("projection").ok(),
+            skip: doc.get("skip").and_then(as_i64),
+            limit: doc.get("limit").and_then(as_i64),
+            collation: doc.get_document("collation").ok().cloned(),
         },
-    )?;
+    };
+    read.check_hint(storage, &ctx.db_name)?;
+    crate::notablescan::check(ctx, &read)?;
 
     // `min` and `max` cut the hinted index's scan at a key and fix its
     // direction: that read keeps the order the store gives it. So does a

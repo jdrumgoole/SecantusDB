@@ -289,7 +289,7 @@ def test_a_field_changing_type_rolls_the_bucket_over(rust_mongo: Any, mongod: An
     assert got == ref
 
 
-@pytest.mark.backlog("RM-089")
+@pytest.mark.backlog_fixed("RM-089")
 def test_an_unknown_hint_on_a_time_series_collection(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 refuses a hint naming no index on a time-series
     collection (even `{_id: 1}`, which the buckets do not have) from its

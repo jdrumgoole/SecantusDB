@@ -93,9 +93,9 @@ pub enum ParamKind {
     /// Any 64-bit whole number (`cursorTimeoutMillis`): a bool or a number,
     /// truncated toward zero.
     Int64,
-    /// A 32-bit whole number of at least 1
-    /// (`transactionLifetimeLimitSeconds`).
-    Int32AtLeastOne,
+    /// A 32-bit whole number of at least the given value
+    /// (`transactionLifetimeLimitSeconds` 1, the SCRAM iteration counts 5000).
+    Int32AtLeast(i32),
 }
 
 /// `(name, kind)` for every runtime-settable parameter.
@@ -117,12 +117,22 @@ const SETTABLE: &[(&str, ParamKind)] = &[
     ("cursorTimeoutMillis", ParamKind::Int64),
     (
         "transactionLifetimeLimitSeconds",
-        ParamKind::Int32AtLeastOne,
+        ParamKind::Int32AtLeast(1),
     ),
+    // The iteration counts `createUser` / `updateUser` write into the
+    // credentials they build from then on (`auth::scram_credentials`); a
+    // credential already stored keeps its own count. mongod 8.2.11 takes
+    // either at 5000 or more (measured 2026-10-20).
+    ("scramIterationCount", ParamKind::Int32AtLeast(5000)),
+    ("scramSHA256IterationCount", ParamKind::Int32AtLeast(5000)),
 ];
 
 /// mongod's highest log level; `setParameter` clamps rather than refusing.
 const MAX_LOG_LEVEL: i32 = 5;
+
+/// When a session was last used, and whose it is (the SHA-256 of
+/// `user@db`).
+type SessionUse = (bson::DateTime, Vec<u8>);
 
 /// Server-wide store for the settable parameters' current values.
 ///
@@ -139,10 +149,11 @@ pub struct ServerParams {
     /// Bumped by every user and role command, so that a connection's cached
     /// effective privileges (`rbac::effective`) are recomputed after one.
     user_cache_generation: std::sync::atomic::AtomicU64,
-    /// The sessions commands have come in, each with when it was last used:
+    /// The sessions commands have come in, each with when it was last used
+    /// and whose it is (the SHA-256 of `user@db`, `session::user_digest`):
     /// what `$listLocalSessions` lists. One unused for the session timeout
     /// (30 minutes) is forgotten.
-    sessions: Mutex<BTreeMap<Vec<u8>, bson::DateTime>>,
+    sessions: Mutex<BTreeMap<Vec<u8>, SessionUse>>,
     /// The `config.settings` read/write-concern defaults document, read once
     /// and kept so a write need not look it up (`crate::rwconcern`). The
     /// outer `None` is "not read yet"; the inner one is "no document".
@@ -181,26 +192,28 @@ impl ServerParams {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// A command came in the session `id`.
-    pub fn note_session(&self, id: &[u8]) {
+    /// A command came in the session `id`, run by the user whose digest is
+    /// `uid`.
+    pub fn note_session(&self, id: &[u8], uid: Vec<u8>) {
         if let Ok(mut sessions) = self.sessions.lock() {
             let now = bson::DateTime::now();
             let oldest = now.timestamp_millis() - 30 * 60 * 1000;
-            sessions.retain(|_, used| used.timestamp_millis() >= oldest);
-            sessions.insert(id.to_vec(), now);
+            sessions.retain(|_, (used, _)| used.timestamp_millis() >= oldest);
+            sessions.insert(id.to_vec(), (now, uid));
         }
     }
 
-    /// The sessions seen and not timed out, with when each was last used.
-    pub fn sessions(&self) -> Vec<(Vec<u8>, bson::DateTime)> {
+    /// The sessions seen and not timed out: the id, when each was last
+    /// used, and whose it is.
+    pub fn sessions(&self) -> Vec<(Vec<u8>, bson::DateTime, Vec<u8>)> {
         let oldest = bson::DateTime::now().timestamp_millis() - 30 * 60 * 1000;
         self.sessions.lock().map_or_else(
             |_| Vec::new(),
             |sessions| {
                 sessions
                     .iter()
-                    .filter(|(_, used)| used.timestamp_millis() >= oldest)
-                    .map(|(id, used)| (id.clone(), *used))
+                    .filter(|(_, (used, _))| used.timestamp_millis() >= oldest)
+                    .map(|(id, (used, uid))| (id.clone(), *used, uid.clone()))
                     .collect()
             },
         )
@@ -232,6 +245,19 @@ impl ServerParams {
     /// The current value, or `None` when it has never been set.
     pub fn get(&self, name: &str) -> Option<Bson> {
         self.values.lock().ok()?.get(name).cloned()
+    }
+
+    /// The SCRAM-SHA-1 and SCRAM-SHA-256 iteration counts `setParameter`
+    /// set, each `None` while it holds its default.
+    pub fn scram_iterations(&self) -> (Option<u32>, Option<u32>) {
+        let count = |name| match self.get(name) {
+            Some(Bson::Int32(n)) => u32::try_from(n).ok(),
+            _ => None,
+        };
+        (
+            count("scramIterationCount"),
+            count("scramSHA256IterationCount"),
+        )
     }
 
     /// Store `value`, returning nothing — the caller already holds the previous
@@ -289,8 +315,8 @@ fn coerce(kind: ParamKind, value: &Bson) -> Option<Bson> {
             ))
         }
         ParamKind::Int64 => integral(value, false).ok().map(Bson::Int64),
-        ParamKind::Int32AtLeastOne => match integral(value, true) {
-            Ok(n) if n >= 1 => Some(Bson::Int32(n as i32)),
+        ParamKind::Int32AtLeast(min) => match integral(value, true) {
+            Ok(n) if n >= i64::from(min) => Some(Bson::Int32(n as i32)),
             _ => None,
         },
         ParamKind::PositiveInt => match whole(value) {
@@ -352,12 +378,18 @@ fn integral(value: &Bson, int32: bool) -> Result<i64, &'static str> {
 
 /// mongod's words for a value `coerce` refused (measured 8.2.11).
 fn refusal(kind: ParamKind, name: &str, value: &Bson) -> String {
-    if matches!(kind, ParamKind::Int64 | ParamKind::Int32AtLeastOne) {
-        return match integral(value, kind == ParamKind::Int32AtLeastOne) {
+    let min = match kind {
+        ParamKind::Int64 => Some(None),
+        ParamKind::Int32AtLeast(min) => Some(Some(min)),
+        _ => None,
+    };
+    if let Some(min) = min {
+        return match integral(value, min.is_some()) {
             Err(why) => format!("Failed validating {name}: {why}"),
-            Ok(n) => {
-                format!("Invalid value for parameter {name}: {n} is not greater than or equal to 1")
-            }
+            Ok(n) => format!(
+                "Invalid value for parameter {name}: {n} is not greater than or equal to {}",
+                min.unwrap_or(1)
+            ),
         };
     }
     match (kind, whole(value)) {
@@ -541,6 +573,42 @@ mod tests {
         // and it sticks
         let r2 = set_parameter(&doc! {"setParameter": 1, "logLevel": 5_i32}, &mut c).unwrap();
         assert_eq!(r2.get_i32("was").unwrap(), 3);
+    }
+
+    /// The SCRAM iteration counts (mongod 8.2.11, 2026-10-20): settable at
+    /// runtime, an int32 of at least 5000, a double truncated.
+    #[test]
+    fn the_scram_iteration_counts_are_settable_from_5000() {
+        let mut c = ctx();
+        for name in ["scramIterationCount", "scramSHA256IterationCount"] {
+            assert!(settable(name));
+            let r = set_parameter(&doc! {"setParameter": 1, name: 12000.7}, &mut c).unwrap();
+            assert!(r.contains_key("was"));
+            assert_eq!(
+                c.server_params.as_ref().unwrap().get(name),
+                Some(Bson::Int32(12000))
+            );
+            let e = set_parameter(&doc! {"setParameter": 1, name: 4999}, &mut c).unwrap_err();
+            assert_eq!(
+                (e.code, e.errmsg),
+                (
+                    2,
+                    format!(
+                        "Invalid value for parameter {name}: 4999 is not greater than or equal to 5000"
+                    )
+                )
+            );
+            let e =
+                set_parameter(&doc! {"setParameter": 1, name: 1_i64 << 31}, &mut c).unwrap_err();
+            assert_eq!(
+                e.errmsg,
+                format!("Failed validating {name}: Out of bounds coercing to integral value")
+            );
+        }
+        assert_eq!(
+            c.server_params.as_ref().unwrap().scram_iterations(),
+            (Some(12000), Some(12000))
+        );
     }
 
     /// The TTL monitor's two parameters (mongod 8.2.11, 2026-10-10). Both

@@ -203,24 +203,44 @@ pub(crate) fn coll_arg(doc: &Document, cmd: &str) -> Result<String, CommandError
 
 /// A document-valued field, or an empty document when absent / wrong type
 /// (mirrors Python's `spec.get("q", {})` / `doc.get("query") or {}`).
-/// A `hint` on a WRITE command must name an index that exists.
+/// A `hint` must name an index that exists: refused, when it does not, in
+/// mongod's planner's words, which print the query the command made
+/// (`query`, measured per command against mongod 8.2.11, 2026-10-20).
 ///
-/// `find` / `count` / `aggregate` route their hint through the storage layer,
-/// which rejects an unknown one; `update` / `delete` / `findAndModify` never
-/// passed theirs anywhere, so `hint: "nosuch"` was accepted and the write ran
-/// unhinted while mongod fails the command. Validating without planning off it
-/// is result-equivalent: a VALID hint selects an index, never a different set
-/// of documents.
-pub(crate) fn validate_write_hint(
+/// `find` / `count` / `aggregate` also route their hint through the storage
+/// layer, which rejects an unknown one; `update` / `delete` /
+/// `findAndModify` never passed theirs anywhere, so `hint: "nosuch"` was
+/// accepted and the write ran unhinted while mongod fails the command.
+/// Validating without planning off it is result-equivalent: a VALID hint
+/// selects an index, never a different set of documents.
+pub(crate) fn validate_hint(
     storage: &dyn crate::Storage,
     db: &str,
     coll: &str,
     hint: Option<&Bson>,
+    query: &crate::explain::CanonicalQuery,
 ) -> Result<(), CommandError> {
+    if hint_is_known(storage, db, coll, hint) {
+        return Ok(());
+    }
+    Err(CommandError::new(
+        2,
+        "BadValue",
+        query.planner_error("hint provided does not correspond to an existing index"),
+    ))
+}
+
+/// Whether `hint` names an index of `db.coll` (or is no hint at all).
+pub(crate) fn hint_is_known(
+    storage: &dyn crate::Storage,
+    db: &str,
+    coll: &str,
+    hint: Option<&Bson>,
+) -> bool {
     let hint = match hint {
-        None | Some(Bson::Null) => return Ok(()),
+        None | Some(Bson::Null) => return true,
         // An empty document is no hint (measured 8.2.11, 2026-10-12).
-        Some(Bson::Document(d)) if d.is_empty() => return Ok(()),
+        Some(Bson::Document(d)) if d.is_empty() => return true,
         Some(h) => h,
     };
     // A hint is validated during query PLANNING, and there is nothing to plan
@@ -228,10 +248,9 @@ pub(crate) fn validate_write_hint(
     // there. Measured 8.2.11 (2026-09-28) across all seven commands that take
     // a hint: `ok` on a missing namespace, BadValue the moment the collection
     // exists, empty or not. The storage layer's `resolve_hint` has the same
-    // guard; the write commands validate HERE instead, which is why fixing one
-    // left `findAndModify` / `update` / `delete` still diverging.
+    // guard.
     if !storage.collection_exists(db, coll).unwrap_or(true) {
-        return Ok(());
+        return true;
     }
     // A hidden index is no index to a hint, on a write as on a read.
     let indexes: Vec<Document> = storage
@@ -240,7 +259,7 @@ pub(crate) fn validate_write_hint(
         .into_iter()
         .filter(|i| i.get_bool("hidden") != Ok(true))
         .collect();
-    let known = match hint {
+    match hint {
         Bson::String(s) => {
             // `"$natural"` is deliberately absent: mongod takes only the
             // document form and rejects the string (probed 8.2.11,
@@ -257,29 +276,9 @@ pub(crate) fn validate_write_hint(
                     .iter()
                     .any(|i| i.get_document("key").map(|k| k == spec).unwrap_or(false))
         }
-        _ => return Ok(()), // the type error is raised by `argtypes::require_hint`
-    };
-    if known {
-        return Ok(());
+        // The type error is raised by `argtypes::require_hint`.
+        _ => true,
     }
-    // mongod renders its whole query plan here; we name the hint. The CODE
-    // matches, the text does not — a deliberate difference, see
-    // `tasks/backlog-rust-mongodb.md` (8.2.11 returns a planner diagnostic, and the project
-    // asserts the rejection rather than the text).
-    //
-    // `{hint:?}` was Rust's `Debug` on a `Bson`, which leaked the RUST TYPE
-    // NAME to the client: a bad string hint came back as
-    // `hint String("x") does not correspond…`. `String(…)` means nothing to a
-    // MongoDB client, and the Python server says `'x'` for the same input.
-    let rendered = match hint {
-        Bson::String(s) => format!("\"{s}\""),
-        other => secantus_core::aggregate::render_value_compact(other),
-    };
-    Err(CommandError::new(
-        2,
-        "BadValue",
-        format!("hint {rendered} does not correspond to an existing index"),
-    ))
 }
 
 pub(crate) fn doc_field(doc: &Document, key: &str) -> Document {

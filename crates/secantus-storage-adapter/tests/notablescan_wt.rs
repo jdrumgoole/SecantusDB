@@ -48,13 +48,34 @@ fn ok(reply: &Document) -> bool {
     reply.get_f64("ok") == Ok(1.0)
 }
 
-/// The refusal's code and closing words, with the namespace it names.
+/// The refusal's code and closing words, with the namespace it names and
+/// mongod's query tree between them (the tree itself is compared with
+/// mongod's in `tests/backlog/test_rm_planner_text.py`).
 fn refused(reply: &Document, ns: &str, words: &str) {
     assert_eq!(reply.get_i32("code"), Ok(291), "{reply}");
     assert_eq!(reply.get_str("codeName"), Ok("NoQueryExecutionPlans"));
-    assert_eq!(
+    planner_words(
         reply.get_str("errmsg").unwrap(),
-        format!("error processing query: ns={ns} planner returned error :: caused by :: {words}")
+        &format!("error processing query: ns={ns}"),
+        words,
+    );
+}
+
+/// `<prefix>[ limit=n][ skip=n]Tree: ...Sort: ...Proj: ... planner returned
+/// error :: caused by :: <words>`.
+fn planner_words(errmsg: &str, prefix: &str, words: &str) {
+    let rest = errmsg
+        .strip_prefix(prefix)
+        .unwrap_or_else(|| panic!("{errmsg:?} does not start {prefix:?}"));
+    assert!(
+        rest.contains("Tree: ") && rest.contains("\nSort: "),
+        "{errmsg:?}"
+    );
+    assert!(
+        rest.ends_with(&format!(
+            "\n planner returned error :: caused by :: {words}"
+        )),
+        "{errmsg:?}"
     );
 }
 
@@ -336,13 +357,11 @@ fn a_stage_that_reads_another_collection() {
         );
         let executor = |reply: &Document| {
             assert_eq!(reply.get_i32("code"), Ok(291), "{reply}");
-            assert_eq!(
+            planner_words(
                 reply.get_str("errmsg").unwrap(),
-                format!(
-                    "Executor error during aggregate command on namespace: t.c :: caused by :: \
-                     error processing query: ns=t.f planner returned error :: caused by :: \
-                     {UNINDEXED}"
-                )
+                "Executor error during aggregate command on namespace: t.c :: caused by :: \
+                 error processing query: ns=t.f",
+                UNINDEXED,
             );
         };
         let lead = doc! {"$match": {"_id": 1}};
@@ -393,8 +412,10 @@ fn a_stage_that_reads_another_collection() {
 fn a_write_statement_is_refused_in_its_write_errors() {
     with_wt(|c| {
         seeded(c);
+        // mongod 8.2.11's words for `{b: 1}` (2026-10-20).
         let words = format!(
-            "error processing query: ns=t.c planner returned error :: caused by :: {UNINDEXED}"
+            "error processing query: ns=t.cTree: b $eq 1\nSort: {{}}\nProj: {{}}\n planner \
+             returned error :: caused by :: {UNINDEXED}"
         );
         let reply = on(
             "t",

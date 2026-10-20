@@ -221,7 +221,7 @@ def test_server_status_reports_compression_counters(rust_mongo: Any) -> None:
     assert compression["zlib"]["compressor"]["bytesOut"] > 0
 
 
-@pytest.mark.backlog("RM-035")
+@pytest.mark.backlog_fixed("RM-035")
 def test_scram_iteration_count_is_settable_at_runtime(rust_mongo: Any) -> None:
     """mongod 8.2.11 reports `scramIterationCount` as settableAtRuntime and
     sets it: `setParameter {scramIterationCount: 12000}` answers

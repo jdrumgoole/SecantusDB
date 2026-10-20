@@ -16,8 +16,9 @@
 //! mongod started with `--noscripting` refuses it (31264, measured 8.2.11).
 //! It used to answer `ok: 1` with no results, a silent wrong answer.
 //!
-//! Port of `commands.py::_map_reduce`, semantics matched case for case: the
-//! `{out: {inline: 1}}` gate, the pattern match, and the double-typed `value`.
+//! Ported from `commands.py::_map_reduce`: the pattern match and the
+//! double-typed `value`. A named `out` is refused with 31264, as a
+//! `--noscripting` mongod refuses it (the Python server answers 9).
 
 use bson::{doc, Bson, Document};
 
@@ -71,26 +72,19 @@ pub fn map_reduce(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     };
 
-    // Only inline output is supported: writing the result into a collection
-    // would need the real map/reduce semantics we do not implement, and
-    // silently producing a wrong collection is worse than refusing.
+    // Only inline output of the one recognised shape runs. Writing a result
+    // into a collection would need the real map/reduce semantics, and the
+    // count shape written there alone would be a stand-in (Joe,
+    // 2026-10-16): anything else is what a mongod with no JavaScript engine
+    // answers (`--noscripting`, measured 8.2.11, a named `out` included,
+    // 2026-10-20).
     let inline = matches!(doc.get("out"), Some(Bson::Document(d)) if d.contains_key("inline"));
-    if !inline {
-        return Ok(CommandError::new(
-            9,
-            "FailedToParse",
-            "mapReduce on this server only supports {out: {inline: 1}}",
-        )
-        .into_reply());
-    }
-
     let map_fn = js_body(doc.get("map"));
     let reduce_fn = js_body(doc.get("reduce"));
 
-    let Some(field) = emitted_count_field(&map_fn).filter(|_| reduces_by_counting(&reduce_fn))
+    let Some(field) =
+        emitted_count_field(&map_fn).filter(|_| inline && reduces_by_counting(&reduce_fn))
     else {
-        // Not the shape we can evaluate: what a mongod with no JavaScript
-        // engine answers (`--noscripting`, measured 8.2.11).
         return Ok(CommandError::new(
             31264,
             "Location31264",
@@ -279,9 +273,9 @@ mod tests {
             doc! {"mapReduce": "c", "map": MAP, "reduce": REDUCE, "out": "results_coll"},
             vec![doc! {"tag": "a"}],
         );
+        // As a mongod with no JavaScript engine refuses it (8.2.11).
         assert_eq!(reply.get_f64("ok").unwrap(), 0.0);
-        assert_eq!(reply.get_i32("code").unwrap(), 9);
-        assert_eq!(reply.get_str("codeName").unwrap(), "FailedToParse");
+        assert_eq!(reply.get_i32("code").unwrap(), 31264);
     }
 
     #[test]

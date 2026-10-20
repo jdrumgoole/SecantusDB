@@ -226,7 +226,7 @@ pub(crate) fn run(
     let env = match parse(name, doc) {
         Ok(env) => {
             if let (Some(id), Some(server)) = (&env.lsid, &ctx.server_params) {
-                server.note_session(id);
+                server.note_session(id, user_digest(&authenticated(ctx)));
             }
             Ok(env)
         }
@@ -240,16 +240,7 @@ pub(crate) fn run(
         lsid,
         txn_number: env.txn_number.filter(|_| env.in_txn),
     });
-    let users = ctx
-        .conn_auth
-        .as_ref()
-        .map(|a| {
-            a.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .authenticated
-                .clone()
-        })
-        .unwrap_or_default();
+    let users = authenticated(ctx);
     // A transaction statement's writes name the transaction in the oplog,
     // by the logical session as mongod records it: the id the client sent
     // and the SHA-256 of `user@db`, which is of the empty string for none
@@ -509,6 +500,19 @@ fn statement_refusal(
         }
     }
     None
+}
+
+/// The users the connection has authenticated, as `(db, user)`.
+pub(crate) fn authenticated(ctx: &CommandContext) -> Vec<(String, String)> {
+    ctx.conn_auth
+        .as_ref()
+        .map(|a| {
+            a.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .authenticated
+                .clone()
+        })
+        .unwrap_or_default()
 }
 
 /// The `uid` of a logical session as mongod stamps it: the SHA-256 of

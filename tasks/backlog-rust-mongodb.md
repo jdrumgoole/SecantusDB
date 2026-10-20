@@ -220,7 +220,7 @@ These are explicit non-goals. Don't add them without a reason.
 - **Geo: exact mongod error-string matching** — chase work without a clear payoff unless a driver test pins exact wording.
 - **`$where`** — runs JavaScript. We don't ship a JS runtime (confirmed by Joe 2026-10-16; MongoDB deprecated it in 8.0).
 - **`$function`, `$accumulator`** (aggregation expressions) — same reason: both evaluate user-supplied JavaScript and need an embedded JS engine + sandbox + BSON↔JS shim layer. Would also require a `--javascriptEnabled` gate (mongod gates JS behind this; many prod deployments disable it). Adding the runtime would let us implement these three operators + `mapReduce` together for ~600–1000 LOC + a heavyweight binary dep (PythonMonkey / QuickJS / V8 — each with maintenance trade-offs). Most pipelines that reach for `$function` can be expressed in the existing aggregation expression library. **`lang: "python"` as a SecantusDB extension was considered and rejected (May 2026)**: would break the conformance contract (pipelines that work locally would explode in production with `Unrecognized lang value: 'python'`), and CPython's sandboxing story is worse than embedded JS engines. If a real user need ever surfaces, the right escape hatch is a server-side trusted-plugin registry — `{$secantusFunction: {name: "<pre-registered>", args: [...]}}` — not user code at query time.
-- **`mapReduce`** — same JS-runtime dependency as `$where` / `$function` / `$accumulator`, and deprecated by MongoDB (removed from the Stable API in 5.0). **WILL NOT BUILD** (decided 2026-09-27). The canonical `emit(this.<field>, 1)` + `values.length` "count by field" pattern is translated to an equivalent `$group` aggregation; non-canonical map / reduce bodies return `{results: [], ok: 1}`, and `out: "<coll>"` (non-inline) is rejected with FailedToParse 9 (`mapReduce on this server only supports {out: {inline: 1}}`). mongo-java-driver's `testMapReduceWithGenerics` writes to a NAMED output collection and so fails permanently; that failure is accepted rather than tracked.
+- **`mapReduce`** — same JS-runtime dependency as `$where` / `$function` / `$accumulator`, and deprecated by MongoDB (removed from the Stable API in 5.0). **WILL NOT BUILD** (decided 2026-09-27). The canonical `emit(this.<field>, 1)` + `values.length` "count by field" pattern is translated to an equivalent `$group` aggregation; anything else, a named `out: "<coll>"` included, is refused as a `--noscripting` mongod 8.2.11 refuses it (31264, re-measured 2026-10-20). mongo-java-driver's `testMapReduceWithGenerics` writes to a NAMED output collection and so fails permanently; that failure is accepted rather than tracked.
 - **Profiling: execution statistics in `system.profile` entries** — no longer out of scope: decided in scope 2026-10-16 (Joe), counted during execution. Tracked as RM-023. A `$jsonSchema` profile filter still reads back as given, where mongod expands it.
 
 ## 5. Known bugs and edge cases to watch
@@ -414,14 +414,6 @@ These are explicit non-goals. Don't add them without a reason.
   so it matches on the common path. A one-version observation about BSON key
   order is not enough to act on: two version splits on key order were found
   in the same campaign.
-- **DECIDED, not scheduled: a hint that names no index answers a shorter
-  message than mongod's.** Code (2) and `codeName` match and the causal
-  sentence is the same; mongod's multi-line planner dump prefix
-  (`error processing query: ns=<db>.<coll>Tree: _id $eq 1\nSort: {}\nProj:
-  {}\nCollation: ...`) is absent. Reproducing it means porting
-  `MatchExpression::debugString`, a different rendering from the
-  `parsedQuery` normaliser, and a half-right renderer would look
-  authoritative while wrong on anything nested. Message-only.
 - **DECIDED, not scheduled: a `$`-prefixed unknown command field is accepted
   where mongod rejects it** (`Location40415`). `$`-keys are the wire envelope
   (`$db`, `$clusterTime`, `$readPreference`, `$audit`, ...) and an allowlist
@@ -732,27 +724,15 @@ may run a command.
       version.
       Backlog-ID: RM-025
       Verify: tests/backlog/test_rm_001_028.py::test_fcv_80_refuses_a_feature_82_added
-- [ ] **`mapReduce` with `out`** (18) answers an error here (9, "only
-      supports {out: {inline: 1}}") where mongod runs it; the users allowed
-      are the same. Without a JavaScript engine only the one shape the
-      command already recognises (`emit(this.f, 1)` reduced by
-      `values.length`) could be written to a collection, and the gap test's
-      `Array.sum(v)` is not it: writing `out` for that shape alone is a
-      stand-in, and a JS engine is a decision for Joe (2026-10-16). Any
-      other inline map/reduce is refused as a `--noscripting` mongod refuses
-      it (31264, 2026-10-16); it used to answer `ok` with no results.
-      `compact` and
-      `setParameter notablescan` match mongod
-      8.2.11 (re-measured 2026-10-15; the test still asserts all three).
-      `reIndex` refuses as mongod does on a replica-set primary, which this
-      server reports itself as; compared against a standalone mongod it looks
-      like a difference and is not.
-      **Decided 2026-10-16 (Joe):** the 31264 refusal stands. The Java and
-      Kotlin gauges' "MapReduce omits default write concern" is recorded in
-      `validation_summary/expected_failures.py`. A JavaScript engine is not
-      being built for this.
-      Backlog-ID: RM-027
-      Verify: tests/backlog/test_rm_001_028.py::test_commands_mongod_runs
+- **Scope decision — `mapReduce` with a named `out`** (Joe, 2026-10-16,
+  formerly RM-027). Refused as a `--noscripting` mongod 8.2.11 refuses it
+  (31264, since 2026-10-20; it answered 9 before), like every map/reduce
+  but the one inline count shape. A JavaScript engine is not being built.
+  The Java and Kotlin gauges' "MapReduce omits default write concern" is
+  recorded in `validation_summary/expected_failures.py`. `compact` and
+  `setParameter notablescan` match mongod; `reIndex` refuses as mongod does
+  on a replica-set primary, which this server reports itself as. Pinned by
+  `tests/backlog/test_rm_001_028.py::test_commands_mongod_runs`.
 - **Scope decision — the privileges of this server's own commands**
   (Joe, 2026-10-16, formerly RM-028). `secantusAdmin.backupArchive` and
   `archiveBaseSnapshot` need cluster `readBackupFile` (the `backup` role),
@@ -848,19 +828,6 @@ Still different:
       locked by its background threads only and are absent here.
       Backlog-ID: RM-185
       Verify: tests/backlog/test_rm_185_locks.py::test_lock_counts_of_merge_fail_with_duplicates
-- [ ] **Server parameters** (about 30). `getParameter` reports the
-      thirteen parameters that are true of this server
-      (`serverinfo::parameters`) and mongod has several hundred.
-      `setParameter` changes six (`cursorTimeoutMillis` and
-      `transactionLifetimeLimitSeconds` among them, each applied to its
-      registry, and `notablescan`); the others mongod changes at runtime are
-      20 here: of those this server reports, `scramIterationCount` and
-      `scramSHA256IterationCount` (mongod sets both at runtime; a fix must
-      make the value govern the credentials `createUser` / `updateUser`
-      write afterwards, not just store it). `notablescan`'s refusal has mongod's code and closing words
-      (`... running with 'notablescan' 2`) but not its query-tree text.
-      Backlog-ID: RM-035
-      Verify: tests/backlog/test_rm_found_2026_10_15.py::test_scram_iteration_count_is_settable_at_runtime
 - [ ] **Commands answered only as far as this server honours them.**
       `features` has no `js` block (there is no script engine) and refuses
       `oidReset`; `getClusterParameter` has six of mongod's fifteen
@@ -900,15 +867,6 @@ Still different:
       order, and reads a geo index's `multikey` from the documents now.
       Backlog-ID: RM-040
       Verify: tests/backlog/test_rm_029_056.py::test_coll_stats_wiredtiger_and_index_details
-- [ ] **RUST MongoDB server: `$listLocalSessions` / `$listSessions` do not
-      know whose session is whose.** With `--auth`, mongod 8.2.11 lists
-      only the caller's sessions for `$listLocalSessions: {}`, each `_id.uid`
-      the SHA-256 of `user@db`; this server lists every session it has seen
-      with the empty string's hash as `uid` (`aggregate.rs::known_sessions`
-      -- the session registry keeps no user). Found 2026-10-16 beside the
-      transaction events' `lsid.uid`, which does hash the user now.
-      Backlog-ID: RM-156
-      Verify: tests/backlog/test_rm_057_084.py::test_list_local_sessions_lists_the_callers_by_user_hash
 
 ### 7.081 Geo queries -- 2026-10-13
 
@@ -1023,12 +981,15 @@ Still different, all 77:
       is accepted.
       Backlog-ID: RM-049
       Verify: tests/backlog/test_rm_029_056.py::test_ties_under_a_sort_with_a_limit,tests/backlog/test_rm_029_056.py::test_ties_under_an_aggregate_sort_with_a_limit
-- **Scope decision — an unknown hint's wording** (Joe, 2026-10-16). The
-  code matches mongod (2); the message is this server's own, because mongod
-  prints its query tree there. The probes' replies that differ only in this
-  text are accepted. Pinned by
-  `tests/backlog/test_rm_029_056.py::test_unknown_hint_on_aggregate`
-  (formerly RM-051).
+- **An unknown hint's wording is mongod's since 2026-10-20** (it was an
+  accepted difference, Joe 2026-10-16, formerly RM-051). The planner's text,
+  `error processing query: ns=<ns>Tree: <query tree>\nSort: ...`, is
+  rendered by `explain::debug_string` from the parsed query, and what each
+  command adds to it (paging, projection, collation) was measured per
+  command. Pinned by `tests/backlog/test_rm_029_056.py::test_unknown_hint_on_aggregate`
+  and `tests/backlog/test_rm_planner_text.py`. Not rendered as mongod
+  renders them: `$jsonSchema` (RM-196), `$where`, and `$near` (whose
+  refusal is a different error).
 - [ ] **The order of an unsorted `find` for six predicate shapes the
       plan derives differently from mongod.** Found by p4-router's
       824-case shapes harness (2026-10-15), mongod 8.2.11: 22 replies, the
@@ -1133,8 +1094,8 @@ already equal by value both stay, and the older holds the claim.
 
 Still different, of those 32 (the other four are the items below):
 
-- **The message for a hint that names no index** (20, with 7.077's 7).
-  mongod prints its query tree. Joe's call, not made.
+- **The message for a hint that names no index** (20, with 7.077's 7):
+  mongod's since 2026-10-20 (see 7.080); the probe was not re-run then.
 - `$where` in a query (3): not run here.
 - `$near` with no geo index (2): mongod answers 291; this server finds
   nothing.
@@ -1206,9 +1167,10 @@ What is left, on the RUST MongoDB server:
       no fixed order can match a server that has none.
       Backlog-ID: RM-059
       Verify: tests/backlog/test_rm_057_084.py::test_upsert_field_order_from_several_equalities
-- [ ] **`$where` in an update's query** is refused (no JavaScript).
-  Backlog-ID: RM-060
-  Verify: tests/backlog/test_rm_057_084.py::test_where_in_an_update_query
+- **`$where` in an update's query** is refused as a `--noscripting`
+  mongod refuses it (the no-server-side-JavaScript scope decision, formerly
+  RM-060): the statement's `writeErrors` entry, 6108304. Pinned by
+  `tests/backlog/test_rm_057_084.py::test_where_in_an_update_query`.
 
 ### 7.076 DDL and admin commands -- 2026-10-12
 
@@ -1271,16 +1233,16 @@ What is left, all on the RUST MongoDB server:
       **Decided 2026-10-16 (Joe):** as RM-071, transcribe and execute.
       Backlog-ID: RM-072
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view
-- [ ] **Smaller:** a comparison to an ARRAY bounds nothing (mongod
-      8.2.11 bounds `{a: {$lt: [5]}}` over a multikey `a_1` as `[MinKey, [
-      5 ]]`; this server scans the collection); `$where` is refused by
-      `find` itself (6108304); `explain` of `mapReduce` is refused (20).
-      (`$expr` is now optimised and rewritten as mongod does it, and
-      `explain` of `bulkWrite` and of `system.views` were measured to
-      match: mongod refuses the first too. `local.oplog.rs` was not
-      re-measured.)
-      Backlog-ID: RM-074
-      Verify: tests/backlog/test_rm_057_084.py::test_explain_leftovers
+- [ ] **`$jsonSchema` is echoed, not parsed.** mongod 8.2.11 translates a
+      `$jsonSchema` into the match expressions it stands for, and prints
+      those in `parsedQuery` and in its planner's query tree:
+      `{$jsonSchema: {required: ["a"]}}` parses as `{a: {$exists: true}}`;
+      richer schemas become mongod's internal `$_internalSchema*`
+      operators. This server echoes the schema in both places. The query's
+      answer is not affected (the schema is evaluated as written). Found
+      2026-10-20 while reproducing the query tree.
+      Backlog-ID: RM-196
+      Verify: tests/backlog/test_rm_planner_text.py::test_json_schema_is_parsed_as_mongod_parses_it
 
 ### 7.074 Change streams, command by command -- 2026-10-11
 
@@ -1410,17 +1372,6 @@ is left follows from that:
       writes, the `collStats` counters and the whole-collection read above.
       Backlog-ID: RM-088
       Verify: tests/backlog/test_rm_085_112.py::test_bucket_collection_can_be_deleted_from
-- [ ] **RUST MongoDB server: a hint naming no index on a time-series
-      collection** is refused with this server's wording; mongod 8.2.11
-      refuses it from its planner, quoting the bucket namespace and its
-      rendering of the query tree (`error processing query:
-      ns=<db>.system.buckets.<coll>Tree: $and\nSort: {}\nProj: {}\nCollation:
-      { locale: "simple" }\n planner returned error :: caused by :: hint
-      provided does not correspond to an existing index`), which changes
-      with the filter. (A measurement inserted with no `_id` is now stored
-      without one, as on mongod.)
-      Backlog-ID: RM-089
-      Verify: tests/backlog/test_rm_085_112.py::test_an_unknown_hint_on_a_time_series_collection
 - **Scope decision — a `hashed` index on a time-series collection** is
   refused as on any collection: hashed indexes are out of scope.
 - **Scope decision — `listCollections` order around time-series buckets.**
@@ -1607,8 +1558,8 @@ dropped (four), and `listIndexes` lists by name.
 
 **Left open on purpose, each with its reason** (the entry itself has the detail):
 
-- **Unknown-index `hint` plan dump** (both servers, 6 message-only cases): needs
-  mongod's planner `debugString` renderer for text on an already-correct code.
+- **Unknown-index `hint` plan dump**: reproduced by the Rust server since
+  2026-10-20; the Python server still names the hint.
 - **`$where` / server-side JavaScript**: a scope decision; it also accounts for
   three of the Go gauge's remaining failures.
 - **A `w` tag set with more than one key**: accepted divergence (mongod's
@@ -1678,16 +1629,10 @@ dropped (four), and `listIndexes` lists by name.
       Backlog-ID: RM-117
       Verify: none -- probe re-run campaign to find two unnamed divergences
 
-- **Scope decision: the six message-only bad-hint divergences in
-  `tools/probes/arg_types_messages.py` are DELIBERATE, and BOTH servers have
-  them.** mongod answers a bad hint with a multi-line planner diagnostic
-  (`error processing query: ns=<db>.c / Tree: $and / Sort: {} / Proj: {} /
-  planner returned error :: caused by :: hint provided does not correspond to an
-  existing index`) where both servers name the hint. The CODE matches.
-  Reproducing it would mean rendering mongod's `MatchExpression` DEBUG string, a
-  third rendering vocabulary distinct from `parsedQuery`'s JSON and from the
-  value form, for an error whose code is already right. Recorded so it is not
-  re-investigated.
+- **The six message-only bad-hint divergences in
+  `tools/probes/arg_types_messages.py`** are gone from the Rust server
+  (2026-10-20: it renders mongod's planner diagnostic); the Python server,
+  deprecated, still names the hint.
 
 - **Scope decision (Joe, 2026-10-06): keep CORRECT ROUNDING for the Decimal128
   transcendentals.** The last digit of a Decimal128 transcendental (`$ln`,

@@ -171,22 +171,20 @@ def test_upsert_field_order_from_several_equalities(rust_mongo: Any, mongod: Any
         assert tuple(_upsert_order(rust_mongo, q)) in seen, (q, seen)
 
 
-def _where_update(client: Any) -> tuple:
-    c = client["rm060"][_name()]
-    c.insert_many([{"_id": 1, "a": 1}, {"_id": 2, "a": 2}])
-
-    def run() -> tuple:
-        r = c.update_many({"$where": "this.a == 1"}, {"$set": {"b": 1}})
-        return (r.matched_count, r.modified_count, list(c.find({}, {"_id": 1, "b": 1})))
-
-    return mongo_answer(run)
-
-
-@pytest.mark.backlog("RM-060")
-def test_where_in_an_update_query(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 (with its default JavaScript engine) runs `$where` in an
-    update's query and updates the matching document."""
-    assert _where_update(rust_mongo) == _where_update(mongod)
+@pytest.mark.backlog_fixed("RM-060")
+def test_where_in_an_update_query(rust_mongo: Any) -> None:
+    """`$where` in an update's query is refused as a `--noscripting` mongod
+    8.2.11 refuses it (measured 2026-10-20): the statement's write error,
+    6108304. No JavaScript engine is built (scope decision, Joe 2026-10-16)."""
+    c = rust_mongo["rm060"][_name()]
+    c.insert_one({"_id": 1, "a": 1})
+    reply = c.database.command(
+        "update", c.name, updates=[{"q": {"$where": "this.a == 1"}, "u": {"$set": {"b": 1}}}]
+    )
+    assert reply["n"] == 0
+    assert [(e["code"], e["errmsg"]) for e in reply["writeErrors"]] == [
+        (6108304, "no globalScriptEngine in $where parsing")
+    ]
 
 
 def _text_update(client: Any) -> tuple:
@@ -388,11 +386,25 @@ def _explain_leftovers(client: Any) -> list:
     db.c.insert_many([{"a": [1, 2]}, {"a": 3}])
     db.c.create_index("a")
 
-    def bounds() -> Any:
-        plan = db.command("explain", {"find": "c", "filter": {"a": {"$lt": [5]}}})
+    def bounds(f: dict) -> Any:
+        plan = db.command("explain", {"find": "c", "filter": f})
         stage = plan["queryPlanner"]["winningPlan"]
         return stage.get("inputStage", stage).get("indexBounds")
 
+    filters = [
+        {"a": {"$lt": [5]}},
+        {"a": {"$gt": [5, 1]}},
+        {"a": {"$gte": []}},
+        {"a": {"$lt": []}},
+        {"a": {"$lte": [[1]]}},
+    ]
+    return [mongo_answer(lambda f=f: bounds(f)) for f in filters]
+
+
+def _no_scripting(client: Any) -> list:
+    db = client["rm074s"]
+    db.drop_collection("c")
+    db.c.insert_one({"a": 3})
     mr = {
         "mapReduce": "c",
         "map": "function(){emit(1,1)}",
@@ -400,17 +412,32 @@ def _explain_leftovers(client: Any) -> list:
         "out": {"inline": 1},
     }
     return [
-        mongo_answer(bounds),
-        mongo_answer(lambda: sorted(str(d["a"]) for d in db.c.find({"$where": "this.a == 3"}))),
-        mongo_answer(lambda: db.command("explain", mr)["ok"])[:2],
+        mongo_answer(lambda: list(db.c.find({"$where": "this.a == 3"}))),
+        mongo_answer(lambda: db.command("explain", mr)),
     ]
 
 
-@pytest.mark.backlog("RM-074")
+@pytest.mark.backlog_fixed("RM-074")
 def test_explain_leftovers(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 bounds a comparison to an array (`[MinKey, [ 5 ]]`),
-    runs `$where` in `find`, and explains `mapReduce`."""
+    """mongod 8.2.11 bounds a comparison to an array: `[MinKey, [ 5 ]]` for
+    `$lt`, `[5, MaxKey]` (the first element) for `$gt`."""
     assert _explain_leftovers(rust_mongo) == _explain_leftovers(mongod)
+
+
+@pytest.mark.backlog_fixed("RM-074")
+def test_where_and_map_reduce_explain_without_javascript(rust_mongo: Any) -> None:
+    """`$where` in `find` and `explain` of `mapReduce` are refused as a
+    `--noscripting` mongod 8.2.11 refuses them (measured 2026-10-20; no
+    JavaScript engine is built, scope decision, Joe 2026-10-16)."""
+    assert _no_scripting(rust_mongo) == [
+        ("err", 6108304, "no globalScriptEngine in $where parsing"),
+        (
+            "err",
+            31264,
+            "Executor error during MapReduce command on namespace: rm074s.c :: caused by :: "
+            "Cannot run server-side javascript without the javascript engine enabled",
+        ),
+    ]
 
 
 @pytest.mark.backlog_fixed("RM-074")
@@ -727,7 +754,7 @@ def _local_session_uids(tmp_path: Any) -> list:
         return sorted({names.get(bytes(r["_id"]["uid"]), "?") for r in rows})
 
 
-@pytest.mark.backlog("RM-156")
+@pytest.mark.backlog_fixed("RM-156")
 def test_list_local_sessions_lists_the_callers_by_user_hash(tmp_path: Any) -> None:
     """mongod 8.2.11 (an auth-enabled replica set, measured 2026-10-16):
     `$listLocalSessions: {}` lists only the calling user's sessions, each
