@@ -594,8 +594,12 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       mongod 8.2.11 (one-member replica set) answers each with success or
       an error of its own:
       - diagnostics: `getDiagnosticData` (mongod's FTDC sample);
-      - settings: `setQuerySettings` / `removeQuerySettings`, `autoCompact`
-        (needs background compaction, which RM-192 lacks).
+      - settings: `setQuerySettings` / `removeQuerySettings` (each setting
+        is keyed by mongod's `queryShapeHash`, which is not a plain SHA-256
+        of the shape's BSON -- the debug shape, representative literals and
+        likely extra fields were tried, 2026-10-20 -- so the hash needs
+        mongod's own shape serialization first), `autoCompact` (needs
+        background compaction, which RM-192 lacks).
 
       `filemd5` with `partialOk` is refused by name (115): its `md5state` is
       mongod's own MD5 implementation's state. Thirteen of the original
@@ -627,23 +631,27 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       would keep them.
       Backlog-ID: RM-222
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_insert_string_with_invalid_utf8
-- [ ] **`local.oplog.rs` entries are not mongod's shape.** The oplog
-      stores an update as the change-stream description it serves
-      (`{updatedFields, removedFields, truncatedArrays}` with dotted paths)
-      and `local.oplog.rs` shows it so, where mongod 8.2.11 logs its `$v: 2`
-      diff (`u` for a changed field, `i` for a new one, `s<field>` for a
-      sub-document, `{a: true, u<i>}` for an array). Also different: a
-      delete carries `o2: {_id}` (mongod: none); a drop has no
-      `o2: {numRecords}`; `createIndexes` is logged with an `indexes` array
-      (mongod: one entry per index, `{createIndexes, v, key, name}`);
-      `dropIndexes` puts the spec in `o.key` / `o.spec` (mongod: `o2`);
-      `renameCollection` has no `stayTemp: false`. A tool that reads the
-      oplog (`mongodump --oplog`, then `mongorestore --oplogReplay`, which
-      `applyOps` now takes) gets entries mongod would not write. The diff
-      cannot be rebuilt from the stored description, which says neither
-      which fields are new nor which path parts are array indexes: the fix
-      writes mongod's diff at write time, from the pre- and post-image, and
-      derives the change stream's description from it as mongod does.
+- [ ] **`local.oplog.rs` entries are not mongod's shape.** Since
+      2026-10-20 a delete, a drop (`o2: {numRecords}`), a rename
+      (`stayTemp`), a one-index `createIndexes` and a `dropIndexes` read as
+      mongod 8.2.11 writes them (the view reshapes the stored entry; the
+      count is written at the drop). Open:
+      - an update is the change-stream description it serves
+        (`{updatedFields, removedFields, truncatedArrays}`, dotted paths)
+        where mongod logs its `$v: 2` diff (`u` / `i` / `s<field>`, arrays
+        as `{a: true, u<i>}`), which mongod derives from the operators it
+        applied (a `$pop` is the whole array under `u`). It cannot be
+        rebuilt from the stored description, which says neither which fields
+        are new nor which path parts are array indexes: the fix writes
+        mongod's diff at write time and derives the change stream's
+        description from it, as mongod does;
+      - a batch of inserts is one entry per document, where mongod groups
+        them into one `applyOps` entry with `stmtId`s;
+      - an index build over documents is one `createIndexes`, where mongod
+        writes `startIndexBuild` / `commitIndexBuild` and rows in
+        `config.system.indexBuilds`.
+      A tool that reads the oplog (`mongodump --oplog`, then
+      `mongorestore --oplogReplay`) gets entries mongod would not write.
       Backlog-ID: RM-224
       Verify: tests/backlog/test_rm_219_apply_ops.py::test_oplog_entries_have_mongods_shape
 
