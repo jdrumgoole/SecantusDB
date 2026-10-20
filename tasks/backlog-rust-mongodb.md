@@ -626,13 +626,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       would keep them.
       Backlog-ID: RM-222
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_insert_string_with_invalid_utf8
-- [ ] **An update that grows a document past 16 MB has the wrong message.**
-      Same code (10334), but this server says "object to insert too large.
-      size in bytes: …, max size: 16777216" where mongod 8.2.11 says "Plan
-      executor error during update :: caused by :: Resulting document
-      after update is larger than 16777216".
-      Backlog-ID: RM-223
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_update_past_16mb_message
 
 ### 7.085 The shared Rust storage, audited -- 2026-10-20
 

@@ -473,6 +473,38 @@ impl PreparedXact {
 /// `storage.py`'s `MAX_BSON_OBJECT_SIZE`.
 const MAX_BSON_OBJECT_SIZE: usize = 16 * 1024 * 1024;
 
+/// The size past which mongod's document serializer refuses a document it
+/// builds, a pipeline update's result among them: 16 MiB plus 16 KiB.
+const MAX_BUILT_DOCUMENT_SIZE: usize = MAX_BSON_OBJECT_SIZE + 16 * 1024;
+
+/// mongod's error for an update whose result is past the BSON limit, under
+/// its "Plan executor error during <command>" wrapper (measured 8.2.11,
+/// 2026-10-20). An operator update says "Resulting document after update is
+/// larger than 16777216", as 10334 for one document and 17419 for a multi
+/// update; a pipeline's result fails the serializer first, above its own
+/// limit. This answered the insert path's "object to insert too large".
+fn update_too_large(size: usize, multi: bool, pipeline: bool) -> StorageError {
+    let (code, errmsg) = if pipeline && size > MAX_BUILT_DOCUMENT_SIZE {
+        (
+            10334,
+            format!(
+                "Serializing Document failed :: caused by :: Size {size} exceeds maximum \
+                 {MAX_BUILT_DOCUMENT_SIZE}"
+            ),
+        )
+    } else {
+        (
+            if multi { 17419 } else { 10334 },
+            format!("Resulting document after update is larger than {MAX_BSON_OBJECT_SIZE}"),
+        )
+    };
+    StorageError::QueryError {
+        code,
+        errmsg,
+        exec: true,
+    }
+}
+
 /// The mongod-shaped per-op write error for an over-limit document (10334).
 fn too_large_write_error(index: usize, size: usize) -> Document {
     bson::doc! {
@@ -17277,7 +17309,11 @@ impl Storage {
             }
             let new_blob = encode_doc(&new)?;
             if new_blob.len() > MAX_BSON_OBJECT_SIZE {
-                stopped = Some(StorageError::DocumentTooLarge(new_blob.len()));
+                stopped = Some(update_too_large(
+                    new_blob.len(),
+                    true,
+                    update_spec.is_none() && !is_replacement,
+                ));
                 break;
             }
             modified += 1;
@@ -17438,7 +17474,11 @@ impl Storage {
                         }
                         let new_blob = encode_doc(&new)?;
                         if new_blob.len() > MAX_BSON_OBJECT_SIZE {
-                            return Err(StorageError::DocumentTooLarge(new_blob.len()));
+                            return Err(update_too_large(
+                                new_blob.len(),
+                                multi,
+                                update_spec.is_none() && !is_replacement,
+                            ));
                         }
                         modified += 1;
                         // The doc stays at its existing key (`id_k`, suffixed for
@@ -17644,7 +17684,13 @@ impl Storage {
                     }
                     let new_blob = encode_doc(&new)?;
                     if new_blob.len() > MAX_BSON_OBJECT_SIZE {
-                        return Err(StorageError::DocumentTooLarge(new_blob.len()));
+                        return Err(StorageError::QueryError {
+                            code: 17420,
+                            errmsg: format!(
+                                "Document to upsert is larger than {MAX_BSON_OBJECT_SIZE}"
+                            ),
+                            exec: true,
+                        });
                     }
                     // Mint the RecordId + write the `_id` index first, then key the
                     // doc row by that RecordId (framed value carries the id_key).

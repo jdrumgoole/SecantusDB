@@ -723,7 +723,7 @@ def _grow_past_limit(client: Any) -> tuple:
         return (e.code, (e.details or {}).get("errmsg"))
 
 
-@pytest.mark.backlog("RM-223")
+@pytest.mark.backlog_fixed("RM-223")
 def test_update_past_16mb_message(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 refuses an update that grows a document past 16 MB
     with 10334 (as here) and the message "Plan executor error during update :: caused by ::
