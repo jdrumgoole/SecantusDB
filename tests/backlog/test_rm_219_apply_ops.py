@@ -168,8 +168,11 @@ def test_apply_ops_as_mongod(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: 
 
 
 def _newest_entry_is_the_last_write(client: Any) -> bool:
+    # mongod writes entries of its own (periodic no-ops, session upkeep), so
+    # the read is narrowed to this test's namespace.
+    client.rm219a.n.insert_one({"_id": "older"})
     client.rm219a.n.insert_one({"_id": "newest"})
-    newest = client.local["oplog.rs"].find_one(sort=[("$natural", -1)])
+    newest = client.local["oplog.rs"].find_one({"ns": "rm219a.n"}, sort=[("$natural", -1)])
     client.drop_database("rm219a")
     return newest["o"] == {"_id": "newest"}
 
