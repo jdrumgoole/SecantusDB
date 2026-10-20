@@ -340,6 +340,14 @@ impl CmdStorage for StorageAdapter {
         secantus_storage::set_insert_positions(positions);
     }
 
+    fn set_retry_image(&self, post: Option<bool>) {
+        secantus_storage::set_retry_image(post);
+    }
+
+    fn take_last_retryable_ts(&self) -> Option<bson::Timestamp> {
+        secantus_storage::take_last_retryable_ts()
+    }
+
     fn high_water_mark_token(&self, seq: i64) -> Vec<u8> {
         let ts = self.inner.peek_cluster_time().unwrap_or(bson::Timestamp {
             time: 0,

@@ -445,3 +445,58 @@ def test_oplog_batched_delete_is_apply_ops(rust_mongo: Any, mongod_rs: Any) -> N
     one `applyOps` holding its deletes last-read first, a batch of one as a
     plain delete."""
     assert _delete_batches(rust_mongo) == _delete_batches(mongod_rs)
+
+
+def _find_and_modify_retry(client: Any) -> list:
+    """A retryable `findAndModify`'s entries and the image mongod keeps for
+    it in `config.image_collection`."""
+    from pymongo import ReturnDocument
+
+    db = client.rm224
+    client.drop_database("rm224")
+    db.c.insert_many([{"_id": i, "x": i} for i in range(3)])
+    out = []
+    with client.start_session() as s:
+        lid = s.session_id["id"]
+        for write in [
+            lambda: db.c.find_one_and_update({"_id": 1}, {"$set": {"y": 1}}, session=s),
+            lambda: db.c.find_one_and_update(
+                {"_id": 1}, {"$set": {"y": 2}}, return_document=ReturnDocument.AFTER, session=s
+            ),
+            lambda: db.c.find_one_and_delete({"_id": 2}, session=s),
+            lambda: db.c.find_one_and_update(
+                {"_id": 9}, {"$set": {"y": 1}}, upsert=True, session=s
+            ),
+        ]:
+            start = client.local["oplog.rs"].find_one(sort=[("$natural", -1)])["ts"]
+            write()
+            entries = [
+                (list(e.keys()), e.get("needsRetryImage"), e.get("stmtId"))
+                for e in client.local["oplog.rs"].find({"ts": {"$gt": start}, "ns": "rm224.c"})
+            ]
+            image = client.config.image_collection.find_one({"_id.id": lid})
+            out.append(
+                (
+                    entries,
+                    image
+                    and (
+                        list(image.keys()),
+                        type(image["txnNum"]).__name__,
+                        image["imageKind"],
+                        image["image"],
+                    ),
+                    client.local["oplog.rs"].count_documents(
+                        {"ts": {"$gt": start}, "ns": "config.image_collection"}
+                    ),
+                )
+            )
+    client.drop_database("rm224")
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-224")
+def test_retryable_find_and_modify_names_its_image(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """mongod 8.2.11 stamps a retryable `findAndModify` with its session and
+    `needsRetryImage` (none for an upsert's insert), and keeps the image it
+    returned in `config.image_collection`, outside the oplog."""
+    assert _find_and_modify_retry(rust_mongo) == _find_and_modify_retry(mongod_rs)
