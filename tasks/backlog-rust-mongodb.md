@@ -660,15 +660,6 @@ inject (a panic, a power loss, a failing checkpoint).
       recognises `WT_TRY_SALVAGE` and has nothing to offer.
       Backlog-ID: RM-192
       Verify: none -- reclaiming disk space; no small shape where mongod reports bytesFreed > 0 was found
-- [ ] **The opt-in async oplog (`--oplog-async`) can drop or blank an
-      entry.** The drainer's final shutdown retry discards a failing batch
-      with `let _ =` (so `docs/concurrency.md`'s "a clean shutdown flushes
-      the drainer" does not hold when a write fails), `Drop` ignores each
-      drainer's `join` result, and an entry that fails to encode is stored
-      as an empty document in its place rather than surfaced. Each is a
-      storage error turned into silence.
-      Backlog-ID: RM-193
-      Verify: none -- needs a failing WiredTiger write or BSON encode injected into the drainer
 
 ### 7.084 What an authenticated user may run -- 2026-10-14
 

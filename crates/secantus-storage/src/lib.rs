@@ -4922,6 +4922,17 @@ struct AsyncOplog {
     txs: Vec<mpsc::Sender<DrainMsg>>,
     backpressure: Arc<Backpressure>,
     joins: Mutex<Vec<JoinHandle<()>>>,
+    /// Committed entries the async oplog failed to keep, each a sentence:
+    /// written by the drainers and the mint path, reported by
+    /// [`Storage::close`] (RM-193). Each was a storage error turned into
+    /// silence.
+    faults: Arc<Mutex<Vec<String>>>,
+}
+
+/// Record an async oplog fault: logged now, and reported by `close`.
+fn async_oplog_fault(faults: &Mutex<Vec<String>>, what: String) {
+    eprintln!("secantus-storage: async oplog: {what}");
+    faults.lock().unwrap_or_else(|e| e.into_inner()).push(what);
 }
 
 /// Everything a prune sweep needs, shared between `Storage` (explicit
@@ -5026,6 +5037,8 @@ struct DrainerShared {
     /// The opportunistic-prune context: the drainer that crosses the
     /// persisted-rows cadence boundary runs the sweep (best-effort).
     prune: Arc<PruneCtx>,
+    /// Shared with `AsyncOplog::faults`.
+    faults: Arc<Mutex<Vec<String>>>,
 }
 
 /// Spawn the background oplog drainer pool and return the handle committed writes
@@ -5058,6 +5071,7 @@ fn spawn_oplog_drainer(
         available: Condvar::new(),
         cap,
     });
+    let faults = Arc::new(Mutex::new(Vec::new()));
     let shared = DrainerShared {
         conn,
         oplog,
@@ -5066,6 +5080,7 @@ fn spawn_oplog_drainer(
         shards_created,
         oplog_nonlogged,
         prune,
+        faults: faults.clone(),
     };
     let mut txs = Vec::with_capacity(num_drainers);
     let mut joins = Vec::with_capacity(num_drainers);
@@ -5079,6 +5094,7 @@ fn spawn_oplog_drainer(
         txs,
         backpressure,
         joins: Mutex::new(joins),
+        faults,
     })
 }
 
@@ -5299,7 +5315,12 @@ fn drainer_loop(shared: DrainerShared, rx: mpsc::Receiver<DrainMsg>) {
     let session = match shared.conn.open_session() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("secantus-storage: async oplog drainer failed to open session: {e:?}");
+            async_oplog_fault(
+                &shared.faults,
+                format!(
+                    "a drainer could not open a session, so its entries are not written: {e:?}"
+                ),
+            );
             return;
         }
     };
@@ -5351,10 +5372,16 @@ fn drainer_loop(shared: DrainerShared, rx: mpsc::Receiver<DrainMsg>) {
             None => break,
         }
     }
-    // Final flush: retry anything still failing (best-effort — a persistent failure
-    // is a storage fault, surfaced by write_drain_batch's log).
+    // Final flush: retry anything still failing. What still fails is lost,
+    // and that is reported, not dropped (RM-193).
     for b in std::mem::take(&mut retry) {
-        let _ = persist_and_record(&session, &shared, b);
+        let (start, n) = (b.start_seq, b.blobs.len());
+        if persist_and_record(&session, &shared, b).is_some() {
+            async_oplog_fault(
+                &shared.faults,
+                format!("{n} committed entries from seq {start} could not be written at shutdown"),
+            );
+        }
     }
 }
 
@@ -5887,7 +5914,17 @@ impl Storage {
             let handles =
                 std::mem::take(&mut *async_h.joins.lock().unwrap_or_else(|e| e.into_inner()));
             for handle in handles {
-                let _ = handle.join();
+                if handle.join().is_err() {
+                    fail(
+                        "joining an async oplog drainer",
+                        StorageError::Internal("the drainer panicked".to_string()),
+                    );
+                }
+            }
+            let faults =
+                std::mem::take(&mut *async_h.faults.lock().unwrap_or_else(|e| e.into_inner()));
+            for what in faults {
+                fail("the async oplog", StorageError::Internal(what));
             }
         }
         let meta = {
@@ -6921,7 +6958,14 @@ impl Storage {
                     // filled with a valid empty document so the drainer's
                     // contiguity (and thus every later entry) is never stalled.
                     encode_doc(&d).unwrap_or_else(|e| {
-                        eprintln!("secantus-storage: async oplog encode failed: {e:?}");
+                        async_oplog_fault(
+                            &async_h.faults,
+                            format!(
+                                "the entry at seq {} could not be encoded and is stored \
+                                 empty: {e:?}",
+                                start + i as i64
+                            ),
+                        );
                         vec![5, 0, 0, 0, 0]
                     })
                 }
@@ -6971,8 +7015,9 @@ impl Storage {
             // Drainer gone (shutdown race): release the reservation we just took
             // so the budget doesn't leak, and report the dropped entries loudly.
             async_h.backpressure.release(bytes);
-            eprintln!(
-                "secantus-storage: async oplog drainer gone; {n} committed entries not persisted"
+            async_oplog_fault(
+                &async_h.faults,
+                format!("the drainer is gone; {n} committed entries were not written"),
             );
         }
         start + n as i64 - 1
@@ -22237,6 +22282,32 @@ mod tests {
             Err(other) => panic!("expected Internal fatal, got: {other:?}"),
             Ok(_) => panic!("expected open to be refused for an SSu doc shard"),
         }
+    }
+
+    /// A fault the async oplog recorded -- an entry it could not keep -- is
+    /// what `close` answers, not a line on stderr (RM-193).
+    #[test]
+    fn close_reports_an_async_oplog_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StorageOptions {
+            durable: Some(true),
+            oplog_async: Some(true),
+            ..StorageOptions::default()
+        };
+        let st = Storage::open_with_options(dir.path().to_str().unwrap(), &opts).unwrap();
+        st.insert(
+            "app",
+            "c",
+            vec![encode_doc(&doc! {"_id": 1i32}).unwrap()],
+            true,
+        )
+        .unwrap();
+        let faults = st.async_oplog.as_ref().unwrap().faults.clone();
+        async_oplog_fault(&faults, "an injected fault".to_string());
+        let err = st.close().unwrap_err();
+        assert!(format!("{err}").contains("an injected fault"), "{err}");
+        // Reported once: the store is closed.
+        st.close().unwrap();
     }
 
     /// `close` answers once and is then a no-op (the `Drop` after it does
