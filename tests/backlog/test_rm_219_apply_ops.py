@@ -287,25 +287,69 @@ def test_oplog_insert_batches_are_mongods_apply_ops(rust_mongo: Any, mongod_rs: 
     assert _insert_groups(rust_mongo) == _insert_groups(mongod_rs)
 
 
-def _retryable_insert_fields(client: Any) -> list:
+def _retryable_writes(client: Any) -> list:
+    """The field names, statement ids and `prevOpTime` terms of a few
+    retryable writes' entries."""
     db = client.rm224
     client.drop_database("rm224")
-    db.create_collection("c")
-    start = client.local["oplog.rs"].find_one(sort=[("$natural", -1)])["ts"]
+    db.c.insert_many([{"_id": i} for i in range(3)])
+    out = []
+    for write in [
+        lambda: db.c.insert_one({"_id": 10}),
+        lambda: db.c.insert_many([{"_id": 11}, {"_id": 12}]),
+        lambda: db.c.update_one({"_id": 1}, {"$set": {"y": 1}}),
+        lambda: db.c.update_one({"_id": 77}, {"$set": {"y": 1}}, upsert=True),
+        lambda: db.c.delete_one({"_id": 2}),
+        lambda: db.c.update_many({}, {"$set": {"z": 1}}),
+    ]:
+        start = client.local["oplog.rs"].find_one(sort=[("$natural", -1)])["ts"]
+        write()
+        out.append(
+            [
+                (
+                    list(e.keys()),
+                    e.get("stmtId"),
+                    e.get("prevOpTime", {}).get("t"),
+                    [o.get("stmtId") for o in e["o"].get("applyOps", [])],
+                )
+                for e in client.local["oplog.rs"].find({"ts": {"$gt": start}, "op": {"$ne": "n"}})
+                if e["ns"] in ("rm224.c", "admin.$cmd")
+            ]
+        )
+    client.drop_database("rm224")
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-224")
+def test_oplog_retryable_writes_carry_their_session(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """mongod 8.2.11 stamps a retryable insert, update or delete with its
+    `lsid`, `txnNumber`, `stmtId` and `prevOpTime` (an insert group with
+    `multiOpType: 1` and a `stmtId` per insert); a multi-document update
+    carries none."""
+    assert _retryable_writes(rust_mongo) == _retryable_writes(mongod_rs)
+
+
+def _index_build_entries(client: Any) -> list:
+    db = client.rm224
+    client.drop_database("rm224")
     db.c.insert_one({"_id": 1})
-    fields = [
-        sorted(e.keys())
-        for e in client.local["oplog.rs"].find({"ts": {"$gt": start}, "ns": "rm224.c"})
+    start = client.local["oplog.rs"].find_one(sort=[("$natural", -1)])["ts"]
+    db.c.create_index("x")
+    entries = [
+        (e["op"], e["ns"], next(iter(e["o"])))
+        for e in client.local["oplog.rs"].find({"ts": {"$gt": start}, "op": {"$ne": "n"}})
+        if e["ns"].startswith(("rm224.", "config.system.indexBuilds"))
     ]
     client.drop_database("rm224")
-    return fields
+    return entries
 
 
 @pytest.mark.backlog("RM-224")
 def test_oplog_entries_have_mongods_shape(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
-    """mongod 8.2.11 stamps a retryable write's entries with its session:
-    `lsid`, `txnNumber`, `stmtId` and `prevOpTime`."""
-    assert _retryable_insert_fields(rust_mongo) == _retryable_insert_fields(mongod_rs)
+    """mongod 8.2.11 logs an index build over documents in two phases:
+    `config.system.indexBuilds` rows around `startIndexBuild` and
+    `commitIndexBuild`, where this server logs one `createIndexes`."""
+    assert _index_build_entries(rust_mongo) == _index_build_entries(mongod_rs)
 
 
 def _ddl_entries(client: Any) -> list:

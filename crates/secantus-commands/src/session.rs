@@ -1132,6 +1132,22 @@ fn retryable_write(
         Err(reply) => return reply,
     };
     registry.set_owner(lsid, user_digest(&authenticated(ctx)));
+    // A retryable insert, update or delete names its session and statements
+    // in its oplog entries, as mongod's do (RM-224).
+    let stamped = matches!(name, "insert" | "update" | "delete");
+    if stamped {
+        let session = doc! {
+            "id": bson::Binary { subtype: bson::spec::BinarySubtype::Uuid, bytes: lsid.to_vec() },
+            "uid": bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: user_digest(&authenticated(ctx)),
+            },
+        };
+        if let (Some(s), Ok(bytes)) = (ctx.storage.as_ref(), bson::to_vec(&session)) {
+            s.set_statement_position(None);
+            s.set_retryable_session(Some((bytes, txn_number, ids.clone())));
+        }
+    }
     let (reply, records) = match name {
         "insert" => retry_insert(handler, doc, ctx, &ids, &done),
         "update" | "delete" => retry_batch(name, handler, doc, ctx, &ids, &done),
@@ -1141,6 +1157,13 @@ fn retryable_write(
         }
         _ => (crate::run_handler(handler, doc, ctx), Vec::new()),
     };
+    if stamped {
+        if let Some(s) = ctx.storage.as_ref() {
+            s.set_retryable_session(None);
+            s.set_statement_position(None);
+            s.set_insert_positions(None);
+        }
+    }
     registry.record_statements(lsid, txn_number, records);
     reply
 }
@@ -1213,6 +1236,9 @@ fn retry_insert(
         }
         reduced.remove("stmtIds");
         reduced.remove("stmtId");
+        if let Some(s) = ctx.storage.as_ref() {
+            s.remap_retryable_statements(fresh.iter().map(|i| ids[*i]).collect());
+        }
         crate::run_handler(handler, &reduced, ctx)
     };
     if !ok(&reply) {
@@ -1305,6 +1331,9 @@ fn retry_batch(
             );
             reduced.remove("stmtIds");
             reduced.remove("stmtId");
+            if let Some(s) = ctx.storage.as_ref() {
+                s.remap_retryable_statements(fresh.iter().map(|i| ids[*i]).collect());
+            }
             crate::run_handler(handler, &reduced, ctx)
         }
     });

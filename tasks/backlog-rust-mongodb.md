@@ -639,14 +639,14 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       delete (`applyOps` batches of ten), a delete, a drop
       (`o2: {numRecords}`), a rename (`stayTemp`), a one-index
       `createIndexes` and a `dropIndexes` read as mongod 8.2.11 writes them,
-      with its `t` and `v`. Open:
-      - a retryable write's entries carry no session: mongod stamps them
-        with `lsid`, `txnNumber`, `stmtId` and a `prevOpTime` chain
-        (`multiOpType: 1` on an insert group, each insert its `stmtId`), and
-        a `findAndModify` with `needsRetryImage` (measured 8.2.11: a
-        multi-document update or delete carries none). The statement ids
-        have to reach storage through the retry paths in `session.rs`,
-        which re-run only a batch's fresh statements;
+      with its `t` and `v`, and a retryable insert, update or delete with
+      its session (`lsid`, `txnNumber`, `stmtId`, `prevOpTime`). Open:
+      - a retryable `findAndModify` (and a `bulkWrite` command's
+        writes) carry no session: mongod stamps a `findAndModify` with
+        `lsid` / `txnNumber` / `stmtId` / `prevOpTime` and
+        `needsRetryImage`, and keeps the image in `config.image_collection`
+        (retryable `insert` / `update` / `delete` carry theirs since
+        2026-10-20);
       - an index build over documents is one `createIndexes`, where mongod
         writes, for the whole command's new indexes as ONE build (measured
         8.2.11): an insert into `config.system.indexBuilds` (`{_id: build

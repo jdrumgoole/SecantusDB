@@ -718,8 +718,12 @@ fn update_oplog_o(desc: Document, pre: &Document, post: &Document, pipeline: boo
 /// and `v` (2) after its `ts`.
 fn oplog_view_entries(entries: Vec<Document>) -> Vec<Document> {
     let mut out = Vec::with_capacity(entries.len());
+    // The last entry of each retryable write's session and transaction
+    // number, for its `prevOpTime` chain.
+    let mut chains: HashMap<(Vec<u8>, i64), Bson> = HashMap::new();
     let mut iter = entries.into_iter().peekable();
     while let Some(entry) = iter.next() {
+        let rw = entry.get_document("rw").ok().cloned();
         // A transaction's writes, minted together at its commit, are the one
         // `applyOps` entry mongod writes for it.
         if let Some(txn) = txn_of(&entry) {
@@ -752,7 +756,57 @@ fn oplog_view_entries(entries: Vec<Document>) -> Vec<Document> {
             }
             None => oplog_view_shape(&entry).unwrap_or(entry),
         };
-        out.push(with_term_and_version(shaped));
+        let shaped = with_term_and_version(shaped);
+        let shaped = match rw {
+            Some(rw) => with_retryable_session(shaped, &rw, group.is_some(), &mut chains),
+            None => shaped,
+        };
+        out.push(shaped);
+    }
+    out
+}
+
+/// A retryable write's entry as mongod 8.2.11 writes it: its `lsid` and
+/// `txnNumber` first, the statement's `stmtId` after `o2` (an insert group's
+/// are on each insert instead, with `multiOpType: 1`), and `prevOpTime`
+/// naming the session's previous entry for the same transaction number.
+fn with_retryable_session(
+    entry: Document,
+    rw: &Document,
+    group: bool,
+    chains: &mut HashMap<(Vec<u8>, i64), Bson>,
+) -> Document {
+    let (Ok(lsid), Ok(txn)) = (rw.get_document("lsid"), rw.get_i64("txnNumber")) else {
+        return entry;
+    };
+    let key = (bson::to_vec(lsid).unwrap_or_default(), txn);
+    let prev = chains
+        .get(&key)
+        .cloned()
+        .unwrap_or(Bson::Timestamp(bson::Timestamp {
+            time: 0,
+            increment: 0,
+        }));
+    let prev_t: i64 = if matches!(prev, Bson::Timestamp(t) if t.time == 0 && t.increment == 0) {
+        -1
+    } else {
+        1
+    };
+    if let Some(ts) = entry.get("ts") {
+        chains.insert(key, ts.clone());
+    }
+    let mut out = bson::doc! {"lsid": lsid.clone(), "txnNumber": txn};
+    for (k, v) in entry {
+        if k == "ts" && !group {
+            if let Some(id) = rw.get("stmtId") {
+                out.insert("stmtId", id.clone());
+            }
+        }
+        out.insert(k, v);
+    }
+    out.insert("prevOpTime", bson::doc! {"ts": prev, "t": prev_t});
+    if group {
+        out.insert("multiOpType", 1_i32);
     }
     out
 }
@@ -823,8 +877,10 @@ fn apply_ops_view(run: Vec<Document>) -> Document {
                     op.insert(k, v.clone());
                 }
             }
-            // mongod adds each insert's `stmtId` only for a retryable write,
-            // whose session fields no entry here carries yet (RM-224).
+            // mongod adds each insert's `stmtId` only for a retryable write.
+            if let Some(id) = e.get_document("rw").ok().and_then(|rw| rw.get("stmtId")) {
+                op.insert("stmtId", id.clone());
+            }
             Bson::Document(op)
         })
         .collect();
@@ -842,7 +898,10 @@ fn apply_ops_view(run: Vec<Document>) -> Document {
 }
 
 /// `entry` with mongod's `t` and `v` after its `ts`, where it has neither.
-fn with_term_and_version(entry: Document) -> Document {
+fn with_term_and_version(mut entry: Document) -> Document {
+    // The view's own markers are not mongod's.
+    entry.remove("rw");
+    entry.remove("bg");
     if entry.contains_key("t") || !entry.contains_key("ts") {
         return entry;
     }
@@ -7085,7 +7144,7 @@ impl Storage {
                 .into_iter()
                 .map(|entry| stamp_oplog_session(entry, &lsid, txn))
                 .collect::<Result<Vec<_>>>()?,
-            None => entries,
+            None => stamp_retryable(entries),
         };
         // User-transaction dirty accounting — BEFORE the async-oplog branch,
         // which early-returns after buffering (in async mode the guard never
@@ -10641,13 +10700,23 @@ impl Storage {
                         if let Some(last) = outcomes.last_mut() {
                             last.1 = Some(oplog_entries.len());
                         }
-                        oplog_entries.push(OplogEntry::Raw(Self::oplog_entry_crud(
+                        let mut entry = Self::oplog_entry_crud(
                             "i",
                             &ns,
                             Some(ui.as_ref().unwrap()),
                             blob,
                             &o2,
-                        )?));
+                        )?;
+                        // A retryable write's insert names its statement:
+                        // the position its document had in the command.
+                        let position = INSERT_POSITIONS
+                            .with(|p| p.borrow().as_ref().map(|p| p.get(index).copied()));
+                        if let Some(Some(position)) = position {
+                            if let Some(stamp) = retryable_stamp(position) {
+                                entry.append("rw", stamp);
+                            }
+                        }
+                        oplog_entries.push(OplogEntry::Raw(entry));
                     }
                 }
                 if oplog_on {
@@ -21190,6 +21259,95 @@ thread_local! {
 /// none. The command layer sets it around a transaction statement.
 pub fn set_oplog_session(session: Option<(Document, i64)>) {
     OPLOG_SESSION.with(|s| *s.borrow_mut() = session);
+}
+
+thread_local! {
+    /// A retryable write's session on this thread: its logical session, its
+    /// transaction number, and the statement id of each statement position
+    /// the running command holds.
+    static RETRYABLE_SESSION: RefCell<Option<(Document, i64, Vec<i32>)>> =
+        const { RefCell::new(None) };
+    /// The statement position an update or delete on this thread is running.
+    static STMT_POSITION: Cell<Option<usize>> = const { Cell::new(None) };
+    /// The statement position of each document an insert on this thread was
+    /// handed, in the order it was handed them.
+    static INSERT_POSITIONS: RefCell<Option<Vec<usize>>> = const { RefCell::new(None) };
+}
+
+/// Mark this thread's writes as a retryable write's: `lsid`, `txnNumber`,
+/// and the statement id of each statement position (RM-224). `None` clears.
+pub fn set_retryable_session(session: Option<(Document, i64, Vec<i32>)>) {
+    RETRYABLE_SESSION.with(|s| *s.borrow_mut() = session);
+}
+
+/// Replace the statement ids of this thread's retryable write, for a
+/// command re-run with only some of its statements.
+pub fn remap_retryable_statements(ids: Vec<i32>) {
+    RETRYABLE_SESSION.with(|s| {
+        if let Some(session) = s.borrow_mut().as_mut() {
+            session.2 = ids;
+        }
+    });
+}
+
+/// The statement position the next update or delete on this thread runs.
+pub fn set_statement_position(position: Option<usize>) {
+    STMT_POSITION.with(|p| p.set(position));
+}
+
+/// The statement position of each document the next insert is handed.
+pub fn set_insert_positions(positions: Option<Vec<usize>>) {
+    INSERT_POSITIONS.with(|p| *p.borrow_mut() = positions);
+}
+
+/// The `rw` stamp a retryable write's entry for statement `position`
+/// carries (`{lsid, txnNumber, stmtId}`), which only the `local.oplog.rs`
+/// view reads; `None` outside a retryable write.
+fn retryable_stamp(position: usize) -> Option<bson::RawDocumentBuf> {
+    RETRYABLE_SESSION.with(|s| {
+        let s = s.borrow();
+        let (lsid, txn, ids) = s.as_ref()?;
+        let id = *ids.get(position)?;
+        let mut rw = bson::RawDocumentBuf::new();
+        rw.append("lsid", bson::RawDocumentBuf::from_document(lsid).ok()?);
+        rw.append("txnNumber", *txn);
+        rw.append("stmtId", id);
+        Some(rw)
+    })
+}
+
+/// Stamp the CRUD entries of an update or delete statement of a retryable
+/// write (an insert's are stamped where they are made).
+fn stamp_retryable(entries: Vec<OplogEntry>) -> Vec<OplogEntry> {
+    let Some(position) = STMT_POSITION.with(Cell::get) else {
+        return entries;
+    };
+    let Some(stamp) = retryable_stamp(position) else {
+        return entries;
+    };
+    entries
+        .into_iter()
+        .map(|e| match e {
+            OplogEntry::Raw(mut buf)
+                if buf.get("rw").ok().flatten().is_none()
+                    && buf
+                        .get_str("op")
+                        .is_ok_and(|op| matches!(op, "i" | "u" | "d")) =>
+            {
+                buf.append("rw", stamp.clone());
+                OplogEntry::Raw(buf)
+            }
+            OplogEntry::Doc(mut d)
+                if !d.contains_key("rw") && matches!(d.get_str("op"), Ok("i" | "u" | "d")) =>
+            {
+                if let Ok(doc) = stamp.to_document() {
+                    d.insert("rw", doc);
+                }
+                OplogEntry::Doc(d)
+            }
+            other => other,
+        })
+        .collect()
 }
 
 /// `entry` with the session and transaction number added, when it records a

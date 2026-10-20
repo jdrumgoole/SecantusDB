@@ -319,6 +319,27 @@ impl CmdStorage for StorageAdapter {
         secantus_storage::set_oplog_session(decoded);
     }
 
+    fn set_retryable_session(&self, session: Option<(Vec<u8>, i64, Vec<i32>)>) {
+        let decoded = session.and_then(|(lsid, txn, ids)| {
+            secantus_commands::bsondoc::from_bytes(lsid.as_slice())
+                .ok()
+                .map(|d| (d, txn, ids))
+        });
+        secantus_storage::set_retryable_session(decoded);
+    }
+
+    fn remap_retryable_statements(&self, ids: Vec<i32>) {
+        secantus_storage::remap_retryable_statements(ids);
+    }
+
+    fn set_statement_position(&self, position: Option<usize>) {
+        secantus_storage::set_statement_position(position);
+    }
+
+    fn set_insert_positions(&self, positions: Option<Vec<usize>>) {
+        secantus_storage::set_insert_positions(positions);
+    }
+
     fn high_water_mark_token(&self, seq: i64) -> Vec<u8> {
         let ts = self.inner.peek_cluster_time().unwrap_or(bson::Timestamp {
             time: 0,
