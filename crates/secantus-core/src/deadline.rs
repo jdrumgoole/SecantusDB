@@ -66,6 +66,41 @@ struct Armed {
 
 thread_local! {
     static CURRENT: Cell<Option<Armed>> = const { Cell::new(None) };
+    /// The running operation's kill flag (`killOp`), read by [`check`] even
+    /// with no budget armed: a kill surfaces as the same error as a spent
+    /// budget, and the command layer, which knows the operation was killed,
+    /// reports it as mongod's 11601.
+    static INTERRUPT: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
+    static INTERRUPT_TICKS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Restores the previous kill flag when dropped.
+#[must_use = "the kill flag is uninstalled when this guard drops"]
+pub struct InterruptGuard {
+    previous: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        INTERRUPT.with(|c| *c.borrow_mut() = previous);
+    }
+}
+
+/// Install the running operation's kill flag on this thread.
+pub fn watch_interrupt(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> InterruptGuard {
+    let previous = INTERRUPT.with(|c| c.borrow_mut().replace(flag));
+    InterruptGuard { previous }
+}
+
+/// Whether the running operation has been killed.
+pub fn interrupted() -> bool {
+    INTERRUPT.with(|c| {
+        c.borrow()
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Acquire))
+    })
 }
 
 /// Restores the previous budget when dropped, so a handler that dispatches an
@@ -126,6 +161,15 @@ pub fn remaining_ms() -> Option<f64> {
 /// [`POLL_EVERY`] invocations, and returns on a single thread-local read when
 /// no deadline is armed at all.
 pub fn check() -> Result<(), MaxTimeMsExpired> {
+    // The kill flag, every POLL_EVERY calls whether or not a budget is armed.
+    let tick = INTERRUPT_TICKS.with(|t| {
+        let n = t.get().wrapping_add(1);
+        t.set(n);
+        n
+    });
+    if tick.is_multiple_of(POLL_EVERY) && interrupted() {
+        return Err(MaxTimeMsExpired);
+    }
     CURRENT.with(|c| {
         let Some(mut a) = c.get() else { return Ok(()) };
         a.ticks = a.ticks.wrapping_add(1);
@@ -144,7 +188,7 @@ pub fn check() -> Result<(), MaxTimeMsExpired> {
 /// handful of times and skipping 63 of every 64 would mean skipping the check
 /// entirely.
 pub fn check_now() -> Result<(), MaxTimeMsExpired> {
-    if expired() {
+    if expired() || interrupted() {
         return Err(MaxTimeMsExpired);
     }
     Ok(())

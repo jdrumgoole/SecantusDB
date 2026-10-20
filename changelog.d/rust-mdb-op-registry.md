@@ -11,14 +11,16 @@
 
 #### Fixed
 
-- `killOp` marks the operation its opid names. A waiting tailable getMore
-  then ends with 11601 "operation was interrupted" under the getMore
-  executor's wrapper, as on mongod 8.2.11. Before, `killOp` treated the
+- `killOp` marks the operation its opid names, and the operation ends with
+  11601 "operation was interrupted" at its next check, under mongod 8.2.11's
+  executor wrapper. A waiting tailable getMore checks; so does any scan's
+  deadline poll, so a long find, aggregation or index build is interrupted
+  mid-scan. Before, `killOp` treated the
   opid as a connection id and closed that connection, so the opid of the
   caller's own `currentOp` row closed the caller's connection.
 
 RM-216 part
 (`tests/backlog/test_rm_found_2026_10_20b.py::test_current_op_lists_idle_cursors`,
 `tests/backlog/test_rm_found_2026_10_20b.py::test_current_op_sees_a_running_operation`).
-Still open: `killOp` does not interrupt a long scan, and the rows lack some
-of mongod's fields.
+`test_kill_op_interrupts_a_long_find` covers the mid-scan kill. Still open:
+the rows lack some of mongod's fields.
