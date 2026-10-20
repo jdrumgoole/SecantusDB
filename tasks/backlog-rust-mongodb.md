@@ -648,8 +648,19 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
         have to reach storage through the retry paths in `session.rs`,
         which re-run only a batch's fresh statements;
       - an index build over documents is one `createIndexes`, where mongod
-        writes `startIndexBuild` / `commitIndexBuild` and rows in
-        `config.system.indexBuilds`.
+        writes, for the whole command's new indexes as ONE build (measured
+        8.2.11): an insert into `config.system.indexBuilds` (`{_id: build
+        uuid, collectionUUID, commitQuorum: "votingMembers", indexNames}`),
+        `startIndexBuild` (`{startIndexBuild: coll, indexBuildUUID,
+        indexes}`, with `ui`), an update adding `commitReadyMembers:
+        ["<host:port>"]`, then `commitIndexBuild` -- or, when the build
+        fails, `abortIndexBuild` with a `cause` (the error document, `ok:
+        false` first) -- and the row's delete. An empty collection, or one
+        the command creates, gets the single `createIndexes`. The commit has
+        to stay atomic with the catalog write (`commit_index`), the
+        handler's per-spec undo has to become one build's abort, and the
+        change-stream projector and replay have to read `commitIndexBuild`
+        as they read `createIndexes` now.
       A tool that reads the oplog (`mongodump --oplog`, then
       `mongorestore --oplogReplay`) gets entries mongod would not write.
       Backlog-ID: RM-224
