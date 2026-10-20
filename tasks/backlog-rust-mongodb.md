@@ -610,14 +610,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       `fsyncUnlock`; backup tools use the pair.
       Backlog-ID: RM-220
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_fsync_lock
-- [ ] **OP_MSG checksums are not verified, and unknown required flag bits
-      are accepted.** `secantus-wire` trims the CRC-32C trailer without
-      checking it. A `ping` with a wrong checksum, or with required flag
-      bit 3 set, gets a normal reply here; mongod 8.2.11 closes the
-      connection for both. Wire fidelity: a corrupted message is answered
-      as though it were sound.
-      Backlog-ID: RM-221
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_op_msg_bad_checksum_is_refused,tests/backlog/test_rm_found_2026_10_20b.py::test_op_msg_unknown_required_flag_is_refused
 - [ ] **A string that is not valid UTF-8 is refused.** An insert whose
       string holds the bytes `0xff 0xfe` answers 1 "BSON error: utf-8
       encoding error"; mongod 8.2.11 stores it (n: 1). Data mongod keeps is

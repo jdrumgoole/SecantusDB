@@ -658,7 +658,7 @@ def _raw_op_msg(client: Any, flags: int, trailer: bytes = b"") -> str:
         return "replied" if head else "closed"
 
 
-@pytest.mark.backlog("RM-221")
+@pytest.mark.backlog_fixed("RM-221")
 def test_op_msg_bad_checksum_is_refused(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 closes the connection on an OP_MSG whose CRC-32C
     checksum (flag bit 0) is wrong."""
@@ -666,7 +666,7 @@ def test_op_msg_bad_checksum_is_refused(rust_mongo: Any, mongod: Any) -> None:
     assert _raw_op_msg(rust_mongo, 1, trailer) == _raw_op_msg(mongod, 1, trailer)
 
 
-@pytest.mark.backlog("RM-221")
+@pytest.mark.backlog_fixed("RM-221")
 def test_op_msg_unknown_required_flag_is_refused(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 closes the connection on an OP_MSG with an unknown
     REQUIRED flag bit (bits 0-15; bit 3 here)."""
