@@ -624,6 +624,62 @@ def test_commands_mongod_runs_are_commands_here(rust_mongo: Any, mongod_rs: Any)
     assert _not_found(rust_mongo) == _not_found(mongod_rs)
 
 
+def _short_admin_replies(client: Any) -> dict:
+    db = client["rm219b"]
+    client.drop_database("rm219b")
+    db.r.insert_many([{"_id": i} for i in range(10)])
+    cursor = db.command("find", "r", batchSize=2)["cursor"]["id"]
+    db.fs.chunks.create_index([("files_id", 1), ("n", 1)], unique=True)
+    db.fs.chunks.insert_many(
+        [
+            {"files_id": 1, "n": 1, "data": Binary(b"def")},
+            {"files_id": 1, "n": 0, "data": Binary(b"abc")},
+            {"files_id": 3, "n": 1, "data": Binary(b"x")},
+        ]
+    )
+    db.gx.chunks.insert_one({"files_id": "a", "n": 0, "data": Binary(b"q")})
+
+    def reply(fn: Callable[[], Any]) -> Any:
+        got = answer(fn)
+        if got[0] != "ok":
+            return got
+        return {k: v for k, v in got[1].items() if k not in ("$clusterTime", "operationTime")}
+
+    released = reply(lambda: db.command({"releaseMemory": [cursor]}))
+    return {
+        "invalidateUserCache": reply(lambda: client.admin.command("invalidateUserCache")),
+        "replSetGetRBID": reply(lambda: client.admin.command("replSetGetRBID")),
+        "replSetFreeze": reply(lambda: client.admin.command({"replSetFreeze": 0})),
+        "replSetMaintenance": reply(lambda: client.admin.command({"replSetMaintenance": True})),
+        "dropConnections": reply(
+            lambda: client.admin.command({"dropConnections": 1, "hostAndPort": ["h:1"]})
+        ),
+        "dropConnections, no hosts": reply(lambda: client.admin.command("dropConnections")),
+        "releaseMemory": (
+            released["cursorsReleased"] == [cursor] if isinstance(released, dict) else released
+        ),
+        "releaseMemory, unknown": reply(lambda: db.command({"releaseMemory": [Int64(12345)]})),
+        "releaseMemory, int": reply(lambda: db.command({"releaseMemory": [5]})),
+        "getMore after releaseMemory": answer(
+            lambda: len(db.command("getMore", cursor, collection="r")["cursor"]["nextBatch"])
+        ),
+        "filemd5": reply(lambda: db.command("filemd5", 1)),
+        "filemd5, no file": reply(lambda: db.command("filemd5", 2)),
+        "filemd5, out of order": reply(lambda: db.command("filemd5", 3)),
+        "filemd5, no index": reply(lambda: db.command("filemd5", "a", root="gx")),
+        "filemd5, bad root": reply(lambda: db.command("filemd5", 1, root=5)),
+    }
+
+
+@pytest.mark.backlog_fixed("RM-219")
+def test_short_admin_commands_answer_as_mongod(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """The RM-219 commands with a short answer on one node, against mongod
+    8.2.11: a primary refuses `replSetFreeze` / `replSetMaintenance` (95),
+    `releaseMemory` lists the cursors it let go (which still answer
+    `getMore`), and `filemd5` hashes the chunks in order through an index."""
+    assert _short_admin_replies(rust_mongo) == _short_admin_replies(mongod_rs)
+
+
 # ------------------------------------------------------ RM-220 fsync lock --
 
 

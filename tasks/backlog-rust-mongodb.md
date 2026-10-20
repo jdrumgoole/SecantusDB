@@ -586,22 +586,24 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       - A long query or index build cannot be found or interrupted.
       Backlog-ID: RM-216
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_current_op_lists_idle_cursors,tests/backlog/test_rm_found_2026_10_20b.py::test_current_op_sees_a_running_operation
-- [ ] **Seventeen commands mongod runs are 59 CommandNotFound here.**
+- [ ] **Ten commands mongod runs are 59 CommandNotFound here.**
       mongod 8.2.11 (one-member replica set) answers each with success or
       an error of its own:
-      - data: `applyOps` (which `mongorestore --oplogReplay` needs),
-        `filemd5`, `releaseMemory`;
+      - data: `applyOps` (which `mongorestore --oplogReplay` needs);
       - diagnostics: `getDiagnosticData`, `dbCheck`, `validateDBMetadata`;
       - settings: `setUserWriteBlockMode`, `setQuerySettings` /
-        `removeQuerySettings`, `setClusterParameter`, `autoCompact`;
-      - connections and auth: `dropConnections`, `invalidateUserCache`,
-        `rotateCertificates` (TLS has landed);
-      - replication: `replSetGetRBID`, `replSetFreeze`,
-        `replSetMaintenance`.
+        `removeQuerySettings`, `setClusterParameter` (mongod keeps the
+        values in `config.clusterParameters`), `autoCompact` (needs
+        background compaction, which RM-192 lacks);
+      - `rotateCertificates` (TLS has landed; it would re-read the files).
 
-      RM-143 covers only `planCacheSetFilter` and `replSetReconfig`. Each
-      is its own slice, and some (query settings, write blocking) are real
-      features rather than replies.
+      `filemd5` with `partialOk` is refused by name (115): its `md5state` is
+      mongod's own MD5 implementation's state. Seven of the original
+      seventeen landed 2026-10-20 (`invalidateUserCache`, `replSetGetRBID`,
+      `replSetFreeze`, `replSetMaintenance`, `dropConnections`,
+      `releaseMemory`, `filemd5`). Each left is its own slice, and some
+      (query settings, write blocking) are real features rather than
+      replies.
       Backlog-ID: RM-219
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_commands_mongod_runs_are_commands_here
 - [ ] **A string that is not valid UTF-8 is refused.** An insert whose
