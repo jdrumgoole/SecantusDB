@@ -24,6 +24,10 @@ Usage::
         tools/probes/pg_corpora/windows.setup.sql \\
         tools/probes/pg_corpora/windows.sql --types
 
+It probes the Rust ``secantusd-pg`` (built by ``./inv rust-pgserver-build``;
+a stale binary is refused). ``--python`` (or ``--server=python``) probes the
+DEPRECATED Python PG server instead; ``--rust`` is accepted and is the default.
+
 A corpus is two files: a ``.setup.sql`` run on both servers first (its failures
 are reported but do not stop the run) and the corpus proper, one statement per
 line, ``#`` for a comment. Statements run IN ORDER against both servers, so a
@@ -82,9 +86,6 @@ from tools.provenance import (  # noqa: E402
     require_fresh_pgserver,
     resolve_binary,
 )
-
-from secantus.sql.pgserver import SecantusPGServer  # noqa: E402
-from secantus.storage import Storage  # noqa: E402
 
 DEFAULT_DSN = "host=127.0.0.1 port=5432 dbname=postgres user=jdrumgoole"
 
@@ -319,6 +320,10 @@ def main(
             host=host, port=port, dbname="postgres", user="probe", autocommit=True
         )
     else:
+        # The deprecated Python PG server, only when asked for by name.
+        from secantus.sql.pgserver import SecantusPGServer
+        from secantus.storage import Storage
+
         store_dir = tempfile.mkdtemp(prefix=f"secantus-probe-{os.getpid()}-pg-")
         store = Storage(store_dir)
         srv = SecantusPGServer(port=0, storage=store)
@@ -438,7 +443,9 @@ if __name__ == "__main__":
     if len(args) != 2:
         print(__doc__)
         sys.exit(2)
-    server = "rust" if "--server=rust" in sys.argv or "--rust" in sys.argv else "python"
+    # The Rust `secantusd-pg` by default: the Python PG server is deprecated,
+    # and a corpus run by hand that silently measured it was a trap.
+    server = "python" if "--server=python" in sys.argv or "--python" in sys.argv else "rust"
     record = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--record=")), None)
     sys.exit(
         main(

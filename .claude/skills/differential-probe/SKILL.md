@@ -106,14 +106,14 @@ The Mongo-side rule above ("compare the RAW reply, not the driver wrapper")
 inverts here. The conformance surface is the **wire**, so probe `secantusd-pg`
 over TCP with the same `psycopg` connection class you use for PostgreSQL --
 one `run(cur, sql)` helper, two cursors. `tools/probes/pg_differential.py`
-is that harness for a corpus file, and **it defaults to the deprecated Python
-server: pass `--rust`** (`tools/probes/pg_corpora_sweep.py` does). Run by
-hand without it, a corpus silently measures the wrong server.
+is that harness for a corpus file; it probes `secantusd-pg` by default
+(`--python` selects the deprecated Python server, which it defaulted to until
+2026-10-20 -- a hand-run corpus silently measured the wrong server).
 
 ```bash
 uv run --no-sync python tools/probes/pg_differential.py \
     tools/probes/pg_corpora/windows.setup.sql tools/probes/pg_corpora/windows.sql \
-    --types --rust
+    --types
 ```
 
 For an ad-hoc probe, start the binary yourself (`secantusd-pg <store>
