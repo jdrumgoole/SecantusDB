@@ -1287,19 +1287,6 @@ retryable writes). The Rust server differs on 11 scenarios. What is left:
       of 12; the `writeConcernError` one probe run saw did not recur.)
       Backlog-ID: RM-087
       Verify: tests/backlog/test_rm_085_112.py::test_fast_count_sees_another_sessions_uncommitted_insert
-- [ ] **RUST MongoDB server: a collection made in a transaction is locked
-      to that transaction's end.** mongod 8.2.11 lets a second transaction
-      create, or insert into, a collection a first one created and has not
-      committed, and reports the conflict when one commits (112 WriteConflict,
-      "Collection namespace ... is already in use"). This server takes an
-      exclusive lock on the new collection for the creating transaction's
-      whole life (RM-084), so the second transaction's statement fails with 24
-      LockTimeout after `maxTransactionLockRequestTimeoutMillis` (since
-      2026-10-20; before that it waited for the first transaction to end, and
-      could stop the server answering: RM-201, fixed). Measured with
-      `tools/probes/transactions.py`: 2 of 267 scenarios.
-      Backlog-ID: RM-202
-      Verify: tests/backlog/test_rm_057_084.py::test_a_collection_made_in_two_transactions
 
 ### 7.071 Time-series collections -- 2026-10-11
 

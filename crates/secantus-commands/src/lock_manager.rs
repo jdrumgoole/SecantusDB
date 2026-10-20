@@ -102,6 +102,9 @@ impl Resource {
         match self {
             Resource::Collection(ns) => format!("{{Collection : {ns}}}"),
             Resource::Database(db) => format!("{{Database : {db}}}"),
+            // mongod names the global lock by its id: "Unable to acquire IX
+            // lock on '{Global : 0}'" (measured 8.2.11, 2026-10-20).
+            Resource::Global => "{Global : 0}".to_string(),
             other => format!("{{{} : {}}}", other.kind(), other.kind()),
         }
     }

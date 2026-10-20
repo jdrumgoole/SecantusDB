@@ -1168,7 +1168,7 @@ def test_drop_under_a_transaction_that_wrote_honours_max_time(
     assert _drop_under_write_txn(rust_mongo) == expected
 
 
-@pytest.mark.backlog("RM-202")
+@pytest.mark.backlog_fixed("RM-202")
 def test_a_collection_made_in_two_transactions(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 lets a second transaction write to a collection a first
     one created and has not committed; the conflict, if any, comes at commit.
