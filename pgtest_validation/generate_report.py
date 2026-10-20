@@ -17,6 +17,8 @@ import json
 import re
 from pathlib import Path
 
+import pg_gauge_server
+
 from . import CRDB_COMMIT
 from .include_paths import EXPECTED_DIVERGENCES
 
@@ -58,7 +60,7 @@ def main() -> None:
     lines = [
         "# pgtest wire-protocol conformance report",
         "",
-        f"- SecantusDB (Python server) {_secantus_version()}",
+        f"- {pg_gauge_server.server_line(args.output_md, _secantus_version())}",
         f"- corpus + runner: cockroachdb/cockroach @ `{CRDB_COMMIT[:12]}` "
         "(`pkg/sql/pgwire/testdata/pgtest`, run by `pkg/testutils/pgtest` verbatim)",
         f"- generated: {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",

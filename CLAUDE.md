@@ -357,11 +357,12 @@ engines.
   Rust servers' durability is covered by their own cargo and pytest tests.
   Details: `build-and-test`.
 - **Never use a mock storage — always the real `Storage`.** The legacy `FakeStorage` mock (`tests/sqlfake.py`) has been **removed**: every SQL / PG-server test now drives the real WiredTiger-backed `Storage`, and no new mock should be reintroduced. A mock lets a test pass while diverging from what WiredTiger actually does (row/type round-trips, transactions, cross-session visibility, persistence) — the migration off it surfaced several real bugs the mock had masked (a swallowed tz-aware/naive datetime comparison, a `bytea` equality mismatch, a Describe/Execute uncommitted-DDL protocol crash, timestamptz text-render). Build a real `Storage(str(tmp_path))` (close it in the fixture teardown — `try: yield s finally: s.close()`), seed it via `run_sql` with an unrestricted `Session`, and drive the SQL/PG-server code against that. This is a database — tests prove behaviour against the real engine or they prove nothing.
-- **Driver-conformance gauges** -- thirteen MongoDB-driver gauges and three SQL
+- **Driver-conformance gauges** -- thirteen MongoDB-driver gauges and seven SQL
   ones run **unmodified** upstream test suites against SecantusDB (invocation,
   toolchains and quirks: `/conformance-gauges`). The weekly `validate.yml`
-  runs only the thirteen `*-rust-server` lanes; no SQL gauge runs weekly
-  against the Rust PostgreSQL server yet. **Keep `invoke validate-all
+  runs every gauge against a Rust server, as a `*-rust-server` lane: the
+  MongoDB drivers against `secantusd-rs`, the SQL gauges (`--server rust`)
+  against `secantusd-pg`. **Keep `invoke validate-all
   --jobs` at 4 or fewer** (1 for a committable number): beyond that CPU
   contention flakes timing-sensitive tests. The C++ gauge binds port 27017.
 - **Run full gauges in a sub-agent**, not the main session, and use `invoke

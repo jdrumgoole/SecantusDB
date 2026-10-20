@@ -1,7 +1,9 @@
-"""Run the pgbench + psql smoke against a fresh SecantusPGServer daemon.
+"""Run the pgbench + psql smoke against a fresh SecantusDB PostgreSQL daemon.
 
-Writes ``.validation/sqlstress-raw.json`` (per-lane tps / status) which
-``generate_report.py`` renders into ``docs/validation-report-sqlstress.md``.
+``SECANTUS_GAUGE_SERVER`` picks the server (``pg_gauge_server``). Writes the
+per-lane tps / status to ``.validation/sqlstress-raw.json``
+(``sqlstress-raw-rust-server.json`` for the Rust server), which
+``generate_report.py`` renders into ``docs/validation-report-sqlstress*.md``.
 Exit 0 only when every lane runs error-free.
 """
 
@@ -18,7 +20,11 @@ import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-RAW_OUT = REPO_ROOT / ".validation" / "sqlstress-raw.json"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+import pg_gauge_server  # noqa: E402
+
+RAW_OUT = pg_gauge_server.raw_out(REPO_ROOT / ".validation" / "sqlstress-raw.json")
 
 LANE_TIMEOUT_SECONDS = 600.0
 
@@ -77,17 +83,7 @@ def main() -> int:
     conn_args = ["-h", host, "-p", str(port), "-U", "postgres", "-d", "postgres"]
 
     daemon = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "secantus.sql.pgserver",
-            "--host",
-            host,
-            "--port",
-            str(port),
-            "--storage-path",
-            storage_dir,
-        ],
+        pg_gauge_server.daemon_argv(host, port, storage_dir),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

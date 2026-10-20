@@ -138,7 +138,7 @@ def test_empty_artifact_counts_as_no_results(tmp_path: Path) -> None:
 
 
 def test_the_server_selector_is_only_set_when_a_server_is_given(tmp_path: Path) -> None:
-    """The SQL gauges (psycopg, slt) have no python/rust split."""
+    """``server=None`` leaves the runner on its own default; a server sets it."""
     raw = tmp_path / "raw.json"
 
     c = _FakeContext(on_run=lambda: raw.write_text("{}"))
