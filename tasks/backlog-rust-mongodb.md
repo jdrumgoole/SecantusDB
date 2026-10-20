@@ -644,18 +644,16 @@ inject (a panic, a power loss, a failing checkpoint).
       it die. §7.069 covers a panic while OPENING a store, in CI.
       Backlog-ID: RM-188
       Verify: none -- needs a WiredTiger panic injected into a running server
-- [ ] **`count({})`, `collStats`, `dataSize` and `dbStats` read the whole
-      collection into memory.** `scan_docs` returns a `Vec` of every
-      document's bytes; `count_matching` with an empty filter is
-      `scan_docs(...).len()`, `collection_data_size` and `index_sizes` each
-      scan again, `dbStats` runs all three for every collection, and
-      `collection_min_id_key` loads everything to find a minimum. mongod
-      answers all of these from its size-and-count metadata, so on a large
-      collection they are cheap there and can exhaust memory here. RM-080
+- [ ] **`count({})`, `collStats`, `dataSize` and `dbStats` walk every
+      row.** They stream now, in constant memory (fixed 2026-10-20: each
+      read the whole collection into a `Vec`, and `dbStats` did that three
+      times per collection). But each still takes time proportional to the
+      collection, where mongod answers all of them from its size-and-count
+      metadata (the size storer), kept up to date by every write. RM-080
       covers `find` / `aggregate` cursors; RM-087 covers fast-count
       visibility, not its cost.
       Backlog-ID: RM-191
-      Verify: none -- a memory and time budget, not an answer
+      Verify: none -- a time budget, not an answer
 - [ ] **Disk space is never given back, and there is no repair path.**
       `compact` answers `bytesFreed: 0` without doing anything
       (`secantus-commands/src/capped_admin.rs`, "There is never anything to

@@ -11557,9 +11557,10 @@ impl Storage {
         // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         let mut total = 0i64;
-        for (_rid, _id_k, blob) in self.scan_docs(&session, db, coll)? {
+        self.visit_docs(&session, db, coll, |_, _, blob| {
             total += blob.len() as i64;
-        }
+            Ok(())
+        })?;
         Ok(total)
     }
 
@@ -11571,16 +11572,18 @@ impl Storage {
         let session = self.conn.open_session()?;
         let mut out = Document::new();
         let mut id_size = 0i64;
-        for (_rid, id_k, _blob) in self.scan_docs(&session, db, coll)? {
+        self.visit_docs(&session, db, coll, |_, id_k, _| {
             id_size += id_k.len() as i64;
-        }
+            Ok(())
+        })?;
         if id_size > 0 {
             out.insert(ID_INDEX_NAME, id_size);
         }
-        for (name, packed) in self.collect_entry_rows(&session, db, coll)? {
-            let prev = out.get_i64(&name).unwrap_or(0);
+        self.visit_entry_rows(&session, db, coll, |name, packed| {
+            let prev = out.get_i64(name).unwrap_or(0);
             out.insert(name, prev + packed.len() as i64);
-        }
+            Ok(())
+        })?;
         Ok(out)
     }
 
@@ -11614,8 +11617,14 @@ impl Storage {
     pub fn collection_min_id_key(&self, db: &str, coll: &str) -> Result<Option<Vec<u8>>> {
         // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
-        let rows = self.scan_docs(&session, db, coll)?;
-        Ok(rows.into_iter().map(|(_rid, k, _)| k).min())
+        let mut least: Option<Vec<u8>> = None;
+        self.visit_docs(&session, db, coll, |_, k, _| {
+            if least.as_deref().is_none_or(|l| k < l) {
+                least = Some(k.to_vec());
+            }
+            Ok(())
+        })?;
+        Ok(least)
     }
 
     /// Doc blobs whose **RecordId** is greater than `after` (or all, `after=None`),
@@ -12901,13 +12910,30 @@ impl Storage {
     /// unframing each value (see `frame_doc_value`) — no `_id` decode needed, and
     /// it recovers a timeseries doc's non-derivable suffixed id_key too.
     fn scan_docs(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<ScannedDoc>> {
+        let mut out = Vec::new();
+        self.visit_docs(session, db, coll, |recordid, idk, blob| {
+            out.push((recordid, idk.to_vec(), blob.to_vec()));
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Walk every document in `(db, coll)` in natural order, handing `f`
+    /// each `(RecordId, id_key, doc_bytes)` without keeping any: what a
+    /// count or a size needs, in constant memory (RM-191).
+    fn visit_docs(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        mut f: impl FnMut(i64, &[u8], &[u8]) -> Result<()>,
+    ) -> Result<()> {
         // Lazy shards: an absent shard (empty / never-created collection) is empty.
         let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
             Ok(c) => c,
-            Err(e) if e.is_missing_table() => return Ok(Vec::new()),
+            Err(e) if e.is_missing_table() => return Ok(()),
             Err(e) => return Err(e.into()),
         };
-        let mut out = Vec::new();
         cur.set_key_ssq(db, coll, i64::MIN);
         let mut more = match cur.search_near() {
             Ok(cmp) => {
@@ -12934,10 +12960,10 @@ impl Storage {
             }
             let value = cur.get_value_u()?;
             let (idk, blob) = unframe_doc_value(&value)?;
-            out.push((recordid, idk.to_vec(), blob.to_vec()));
+            f(recordid, idk, blob)?;
             more = cur.next()?;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Up to `limit` doc rows with the `(db, coll)` prefix whose RecordId is
@@ -15257,8 +15283,24 @@ impl Storage {
         db: &str,
         coll: &str,
     ) -> Result<Vec<(String, Vec<u8>)>> {
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         let mut out = Vec::new();
+        self.visit_entry_rows(session, db, coll, |name, packed| {
+            out.push((name.to_string(), packed.to_vec()));
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Walk every index entry row of `(db, coll)`, handing `f` each
+    /// `(index name, packed key)` without keeping any.
+    fn visit_entry_rows(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        mut f: impl FnMut(&str, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         cur.set_key_sssu(db, coll, "", b"");
         let mut more = match cur.search_near() {
             Ok(cmp) => {
@@ -15276,10 +15318,10 @@ impl Storage {
             if d != db || c != coll {
                 break;
             }
-            out.push((name, packed));
+            f(&name, &packed)?;
             more = cur.next()?;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Check a collection against its indexes: what `validate` reports.
@@ -16816,7 +16858,12 @@ impl Storage {
             // Lock-free read (see the `lock` field's invariants).
             let session = self.op_session()?;
             if filter.is_empty() {
-                return Ok(self.scan_docs(&session, db, coll)?.len());
+                let mut n = 0usize;
+                self.visit_docs(&session, db, coll, |_, _, _| {
+                    n += 1;
+                    Ok(())
+                })?;
+                return Ok(n);
             }
             let vars = Document::new();
             let mut n = 0usize;
