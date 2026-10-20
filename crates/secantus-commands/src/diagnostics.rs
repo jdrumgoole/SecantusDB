@@ -371,28 +371,33 @@ mod tests {
         assert_eq!(reply.get_str("info").unwrap(), "attempting to kill op");
     }
 
+    /// `killOp` marks the operation its opid names killed, and closes no
+    /// connection: it used to close the connection whose id matched the
+    /// opid (RM-216).
     #[test]
-    fn kill_op_kills_a_known_connection() {
+    fn kill_op_marks_a_running_operation_and_closes_no_connection() {
         let killer = std::sync::Arc::new(FakeKiller {
             found: true,
             killed: Default::default(),
         });
-        let mut c = ctx().with_conn_killer(killer.clone());
-        let reply = dispatch(&doc! {"killOp": 1, "op": 42_i64}, &mut c);
+        let ops = std::sync::Arc::new(crate::ops::OpRegistry::new());
+        let mut c = ctx().with_conn_killer(killer.clone()).with_ops(ops.clone());
+        let running = crate::ops::begin(&ops, &doc! {"getMore": 5_i64, "collection": "c"}, &ctx());
+        let opid = ops.snapshot()[0].opid;
+        let reply = dispatch(&doc! {"killOp": 1, "op": opid}, &mut c);
         assert_eq!(reply.get_str("info").unwrap(), "attempting to kill op");
-        assert_eq!(
-            *killer.killed.lock().unwrap_or_else(|e| e.into_inner()),
-            vec![42]
-        );
-    }
-
-    #[test]
-    fn kill_op_unknown_opid_reports_no_operation() {
-        let killer = std::sync::Arc::new(FakeKiller {
-            found: false,
-            killed: Default::default(),
-        });
-        let mut c = ctx().with_conn_killer(killer);
+        assert!(ops
+            .snapshot()
+            .iter()
+            .any(|op| op.opid == opid && op.killed()));
+        assert!(killer
+            .killed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
+        drop(running);
+        assert!(ops.snapshot().is_empty());
+        // An opid that names nothing running gets the same answer.
         let reply = dispatch(&doc! {"killOp": 1, "op": 99_i32}, &mut c);
         assert_eq!(reply.get_str("info").unwrap(), "attempting to kill op");
     }

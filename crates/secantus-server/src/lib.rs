@@ -204,6 +204,8 @@ struct Shared {
     /// The `ConnectionKiller` handed to each request's `CommandContext` so the
     /// `killOp` handler can reach `conns` without depending on server internals.
     conn_killer: Arc<dyn ConnectionKiller>,
+    /// The running operations, for `currentOp` and `killOp`.
+    ops: Arc<secantus_commands::ops::OpRegistry>,
     /// In-memory log ring buffer surfaced by `getLog`; the server appends
     /// connection-lifecycle lines and hands it to each request's context.
     logs: Arc<LogBuffer>,
@@ -436,6 +438,7 @@ pub fn bind(
         alloc_budget: AllocBudget::new(MAX_INFLIGHT_BYTES),
         conns,
         conn_killer,
+        ops: Arc::new(secantus_commands::ops::OpRegistry::new()),
         logs,
     });
 
@@ -1130,6 +1133,7 @@ fn make_context(
         .with_failpoints_opt(shared.failpoints.clone())
         .with_conn_auth(conn_auth.clone())
         .with_conn_killer(shared.conn_killer.clone())
+        .with_ops(shared.ops.clone())
         .with_logs(shared.logs.clone())
         .with_top_stats(shared.top_stats.clone())
         .with_slow_ops(shared.slow_ops.clone())
