@@ -107,6 +107,10 @@ impl RustServer {
     ///   is with `ttlMonitorEnabled=false`, so a test's documents stay put
     ///   unless it asks: `setParameter ttlMonitorEnabled: true` turns it on,
     ///   at mongod's 60-second cadence or `ttlMonitorSleepSecs`.
+    /// * `noop_heartbeat_seconds` — how often a noop entry is written to the
+    ///   oplog, which keeps a quiet change stream's resume token inside the
+    ///   oplog's window and prunes the oplog to its bounds, as the daemon's
+    ///   `--noop-heartbeat-seconds` does. `None` (the default) writes none.
     #[new]
     #[pyo3(signature = (
         storage_path,
@@ -127,6 +131,7 @@ impl RustServer {
         data_nonlogged = None,
         checkpoint_seconds = None,
         ttl_sweep_seconds = None,
+        noop_heartbeat_seconds = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -148,7 +153,16 @@ impl RustServer {
         data_nonlogged: Option<bool>,
         checkpoint_seconds: Option<u64>,
         ttl_sweep_seconds: Option<f64>,
+        noop_heartbeat_seconds: Option<f64>,
     ) -> PyResult<Self> {
+        let heartbeat = match noop_heartbeat_seconds {
+            Some(secs) if !(secs.is_finite() && secs > 0.0) => {
+                return Err(PyValueError::new_err(
+                    "noop_heartbeat_seconds must be positive; use None to write none",
+                ))
+            }
+            other => other.map(Duration::from_secs_f64),
+        };
         let ttl_period = match ttl_sweep_seconds {
             Some(secs) if !(secs.is_finite() && secs > 0.0) => {
                 return Err(PyValueError::new_err(
@@ -226,9 +240,13 @@ impl RustServer {
         // Ticked often; the monitor decides whether a pass is due (and does
         // nothing while switched off), so `setParameter` applies at once.
         let stop_ttl = Arc::new(AtomicBool::new(false));
+        // The same thread writes the noop heartbeat when one is due.
         let ticker = {
             let stop = stop_ttl.clone();
-            let tick = ttl_period.min(Duration::from_millis(500));
+            let tick = ttl_period
+                .min(heartbeat.unwrap_or(Duration::MAX))
+                .min(Duration::from_millis(500));
+            let mut beat = std::time::Instant::now();
             std::thread::spawn(move || loop {
                 std::thread::sleep(tick);
                 if stop.load(Ordering::Relaxed) {
@@ -236,6 +254,15 @@ impl RustServer {
                 }
                 if let Err(e) = storage.ttl_monitor_tick(ttl_period) {
                     eprintln!("_secantus_server: TTL sweep failed: {e:?}");
+                }
+                if heartbeat.is_some_and(|every| beat.elapsed() >= every) {
+                    beat = std::time::Instant::now();
+                    if let Err(e) = storage.emit_noop_heartbeat() {
+                        eprintln!("_secantus_server: noop heartbeat failed: {e:?}");
+                    }
+                    if let Err(e) = storage.prune_oplog(None) {
+                        eprintln!("_secantus_server: oplog prune failed: {e:?}");
+                    }
                 }
             })
         };

@@ -510,6 +510,21 @@ jobs:
           cat /tmp/disk-reclaim.log || true
           df -h /
 
+      - name: Set up Go, with the smoke tests' modules cached
+        # The cross-driver Go smokes (`tests/test_cross_driver_features.py`)
+        # `go run` programs whose modules were fetched from proxy.golang.org
+        # inside the test, so a proxy error failed the test for the
+        # network's sake (RM-012). Fetched here, from setup-go's module
+        # cache when it has them, so the test itself never goes out.
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: "1.25"
+          cache-dependency-path: tests/cross_driver/go/go.sum
+
+      - name: Download the Go smoke tests' modules
+        working-directory: tests/cross_driver/go
+        run: go mod download
+
       - name: Tests (group ${{ matrix.group }}/4)
         # ``--timeout=120 --timeout-method=thread`` catches deadline-
         # exceeded hangs (test body busy-loops or blocks on a stuck
@@ -1166,6 +1181,21 @@ jobs:
           done
           cat /tmp/disk-reclaim.log || true
           df -h /
+
+      - name: Set up Go, with the smoke tests' modules cached
+        # The cross-driver Go smokes (`tests/test_cross_driver_features.py`)
+        # `go run` programs whose modules were fetched from proxy.golang.org
+        # inside the test, so a proxy error failed the test for the
+        # network's sake (RM-012). Fetched here, from setup-go's module
+        # cache when it has them, so the test itself never goes out.
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: "1.25"
+          cache-dependency-path: tests/cross_driver/go/go.sum
+
+      - name: Download the Go smoke tests' modules
+        working-directory: tests/cross_driver/go
+        run: go mod download
 
       - name: Durable-storage tests (group ${{ matrix.group }}/4)
         # The default suite above runs FAST (the test conftest sets
@@ -2070,9 +2100,11 @@ jobs:
         # scaling. They importorskip in every other test lane because no other
         # job builds `_secantus_server`; this is the only lane that does, so
         # it's where these invariants get continuously enforced. `-k rust`
-        # selects only the `[rust]` parametrization — the `[python]` params
-        # need the SWIG `wiredtiger` binding this storage-flavoured wheel
-        # doesn't ship, and are already covered by the main test lanes.
+        # selects only the `[rust]` parametrization: the `[python]` params
+        # run in the main test lanes already, so running them here would
+        # only repeat them. (The wheel does ship the SWIG `wiredtiger`
+        # binding -- `CMakeLists.txt` builds it with ENABLE_PYTHON=ON -- so
+        # that is not the reason.)
         shell: bash
         run: >-
           uv run --no-project --with pymongo --with pytest

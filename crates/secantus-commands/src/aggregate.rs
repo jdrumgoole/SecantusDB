@@ -4046,7 +4046,7 @@ fn apply_merge(
     let mut writes: Vec<(Document, Document)> = Vec::with_capacity(docs.len());
     for mut doc in docs {
         if merge.on.iter().any(|f| f == "_id") && !doc.contains_key("_id") {
-            let mut with_id = doc! { "_id": bson::oid::ObjectId::new() };
+            let mut with_id = doc! { "_id": secantus_core::oid::new() };
             with_id.extend(doc);
             doc = with_id;
         }

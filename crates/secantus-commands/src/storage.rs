@@ -382,6 +382,47 @@ pub trait Storage: Send + Sync {
         })
     }
 
+    /// [`Self::update_matching_pipeline`] with `upsertSupplied`: an upsert
+    /// that matches nothing inserts `supplied` as it stands, in the same
+    /// statement as the match. The default rejects it like a pipeline update.
+    #[allow(clippy::too_many_arguments)]
+    fn update_matching_pipeline_supplied(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        pipeline: &[Bson],
+        multi: bool,
+        upsert: bool,
+        supplied: Option<&Document>,
+        let_vars: &Document,
+        collation: Option<&Collation>,
+        validator: Option<&Document>,
+        validator_moderate: bool,
+        want_post_image: bool,
+    ) -> Result<UpdateOutcome, StorageError> {
+        if supplied.is_some() {
+            return Err(StorageError::WriteError {
+                code: 2,
+                errmsg: "upsertSupplied is not supported by this storage backend".into(),
+                exec: false,
+            });
+        }
+        self.update_matching_pipeline(
+            db,
+            coll,
+            filter,
+            pipeline,
+            multi,
+            upsert,
+            let_vars,
+            collation,
+            validator,
+            validator_moderate,
+            want_post_image,
+        )
+    }
+
     /// Delete up to `limit` documents matching `filter` (`0` ⇒ all).
     fn delete_matching(
         &self,

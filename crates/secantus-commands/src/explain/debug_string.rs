@@ -110,7 +110,7 @@ fn node(d: &Document, level: usize, out: &mut String) {
     }
     let (key, val) = d.iter().next().expect("one key");
     match key.as_str() {
-        "$and" | "$or" | "$nor" => {
+        "$and" | "$or" | "$nor" | "$_internalSchemaXor" => {
             let children: Vec<&Document> = val
                 .as_array()
                 .map(|a| a.iter().filter_map(Bson::as_document).collect())
@@ -132,9 +132,31 @@ fn node(d: &Document, level: usize, out: &mut String) {
             indent(level, out);
             out.push_str(&format!("{key}: 1\n"));
         }
+        // What `$jsonSchema` parses into prints as the BSON it serialises
+        // to; `$_internalSchemaCond` with no line end (mongod 8.2.11).
+        "$_internalSchemaMinProperties"
+        | "$_internalSchemaMaxProperties"
+        | "$_internalSchemaAllowedProperties"
+        | "$_internalSchemaCond" => {
+            indent(level, out);
+            out.push_str(&value(&Bson::Document(d.clone())));
+            if key != "$_internalSchemaCond" {
+                out.push('\n');
+            }
+        }
         "$expr" => {
             indent(level, out);
             out.push_str(&format!("$expr {}\n", expression(val)));
+        }
+        "$where" => {
+            indent(level, out);
+            out.push_str("$where\n");
+            indent(level + 1, out);
+            let code = match val {
+                Bson::String(s) => s.clone(),
+                other => value(other),
+            };
+            out.push_str(&format!("code: {code}\n"));
         }
         path => match val {
             Bson::Document(ops) if ops.keys().next().is_some_and(|k| k.starts_with('$')) => {
@@ -208,7 +230,42 @@ fn predicate(path: &str, ops: &Document, level: usize, out: &mut String) {
             indent(level, out);
             out.push_str(&format!("{path} $size : {}\n", value(arg)));
         }
-        "$type" => {
+        "$_internalSchemaFmod" => {
+            let parts = arg.as_array().cloned().unwrap_or_default();
+            let n = |i: usize| parts.get(i).map(value).unwrap_or_default();
+            indent(level, out);
+            out.push_str(&format!(
+                "{path} fmod: divisor: {} remainder: {}\n",
+                n(0),
+                n(1)
+            ));
+        }
+        "$_internalSchemaUniqueItems" | "$_internalSchemaMatchArrayIndex" => {
+            let mut whole = Document::new();
+            whole.insert(path, Bson::Document(ops.clone()));
+            indent(level, out);
+            out.push_str(&format!("{}\n", value(&Bson::Document(whole))));
+        }
+        "$_internalSchemaAllElemMatchFromIndex" => {
+            let parts = arg.as_array().cloned().unwrap_or_default();
+            indent(level, out);
+            out.push_str("$_internalSchemaAllElemMatchFromIndex\n");
+            out.push_str(&format!(
+                " index: {}, query:\n",
+                parts.first().map(value).unwrap_or_default()
+            ));
+            if let Some(Bson::Document(query)) = parts.get(1) {
+                node(query, level + 1, out);
+            }
+        }
+        "$_internalSchemaObjectMatch" => {
+            indent(level, out);
+            out.push_str("$_internalSchemaObjectMatch\n");
+            if let Bson::Document(inner) = arg {
+                node(inner, level + 1, out);
+            }
+        }
+        "$type" | "$_internalSchemaType" => {
             let codes = match arg {
                 Bson::Array(a) => a.clone(),
                 other => vec![other.clone()],
@@ -219,7 +276,7 @@ fn predicate(path: &str, ops: &Document, level: usize, out: &mut String) {
                 .map(|(i, c)| format!("{i}: {}", value(c)))
                 .collect();
             indent(level, out);
-            out.push_str(&format!("{path} $type: {{ {} }}\n", listed.join(", ")));
+            out.push_str(&format!("{path} {op}: {{ {} }}\n", listed.join(", ")));
         }
         "$mod" => {
             let parts = arg.as_array().cloned().unwrap_or_default();

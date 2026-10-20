@@ -9533,7 +9533,7 @@ impl Storage {
             let mut doc = decode_doc(doc_bytes)?;
             let assigned_id = !doc.contains_key("_id");
             if assigned_id {
-                doc.insert("_id", Bson::ObjectId(ObjectId::new()));
+                doc.insert("_id", Bson::ObjectId(secantus_core::oid::new()));
             }
             let id = doc.get("_id").expect("_id present").clone();
             let mut key = id_key(&id)?;
@@ -9722,7 +9722,7 @@ impl Storage {
                     let mut doc = decode_doc(doc_bytes)?;
                     let assigned_id = !doc.contains_key("_id");
                     if assigned_id {
-                        doc.insert("_id", Bson::ObjectId(ObjectId::new()));
+                        doc.insert("_id", Bson::ObjectId(secantus_core::oid::new()));
                     }
                     // A profile entry is stored as written, with no `_id`:
                     // mongod's `system.profile` has no `_id` index. The id
@@ -10143,7 +10143,7 @@ impl Storage {
     /// value never expires. The clock is injected (`now`) so tests can
     /// drive expiry.
     ///
-    /// Each index is one ordinary delete, `{field: {$lt: <cutoff>}}` plus
+    /// Each index is one ordinary delete, `{field: {$lte: <cutoff>}}` plus
     /// the index's partial filter, because that is exactly mongod's rule and
     /// an ordinary delete does everything a delete must: the oplog entry a
     /// change stream and recovery read, the pre-image, the index entries.
@@ -10156,7 +10156,7 @@ impl Storage {
         let cutoff_of = |secs: f64| {
             bson::DateTime::from_millis(
                 now.timestamp_millis()
-                    .saturating_sub((secs * 1000.0) as i64),
+                    .saturating_sub((secs.trunc() * 1000.0) as i64),
             )
         };
         {
@@ -10174,8 +10174,15 @@ impl Storage {
                         Some(Bson::Double(d)) => Some(*d),
                         _ => None,
                     };
+                    // mongod scans the record ids from the epoch to the
+                    // cutoff, both included (`_deleteExpiredWithCollscan`,
+                    // 8.2), so an `_id` dated before 1970 never expires
+                    // (measured 8.2.11, 2026-10-20: 1960 and 1969 stayed).
                     if let Some(secs) = secs.filter(|s| !s.is_nan() && *s >= 0.0) {
-                        filters.push(bson::doc! {"_id": {"$lt": cutoff_of(secs)}});
+                        filters.push(bson::doc! {"_id": {
+                            "$gte": bson::DateTime::from_millis(0),
+                            "$lte": cutoff_of(secs),
+                        }});
                     }
                 }
             }
@@ -10197,8 +10204,11 @@ impl Storage {
                 if field == "_id" || direction_of(direction).is_none() {
                     continue;
                 }
+                // The index scan runs from the dawn of time to the cutoff,
+                // both keys included (`_deleteExpiredWithIndex`, 8.2): a date
+                // exactly `expireAfterSeconds` old goes.
                 let mut expired = Document::new();
-                expired.insert("$lt", cutoff_of(secs));
+                expired.insert("$lte", cutoff_of(secs));
                 let mut filter = Document::new();
                 filter.insert(field.clone(), Bson::Document(expired));
                 if let Ok(partial) = opts.get_document("partialFilterExpression") {
@@ -16666,7 +16676,46 @@ impl Storage {
         validator_moderate: bool,
         want_post_image: bool,
     ) -> Result<UpdateOutcome> {
+        self.update_matching_pipeline_supplied(
+            db,
+            coll,
+            filter,
+            pipeline,
+            multi,
+            upsert,
+            None,
+            let_vars,
+            coll_opt,
+            validator,
+            validator_moderate,
+            want_post_image,
+        )
+    }
+
+    /// [`Storage::update_matching_pipeline`] with `upsertSupplied`: when
+    /// nothing matches and `supplied` is given, the upsert inserts that
+    /// document as it stands, in the same statement as the match, rather
+    /// than the pipeline run over the query's fields. Its `_id` is the
+    /// query's when the query names one, and may not be another (66,
+    /// measured 8.2.11, 2026-10-14).
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_matching_pipeline_supplied(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        pipeline: &[Bson],
+        multi: bool,
+        upsert: bool,
+        supplied: Option<&Document>,
+        let_vars: &Document,
+        coll_opt: Option<&Collation>,
+        validator: Option<&Document>,
+        validator_moderate: bool,
+        want_post_image: bool,
+    ) -> Result<UpdateOutcome> {
         let _admit = self.admit_write();
+        let _supplied = SuppliedUpsert::enter(supplied.is_some());
         self.update_matching_core(
             db,
             coll,
@@ -16681,6 +16730,9 @@ impl Storage {
             validator_moderate,
             want_post_image,
             &|doc, upserting| {
+                if let (true, Some(given)) = (upserting, supplied) {
+                    return supplied_upsert_doc(doc, given);
+                }
                 // The pipeline was checked before any document was read, so
                 // what fails here failed while running, and mongod reports
                 // it under the executor's wrapper.
@@ -17334,7 +17386,7 @@ impl Storage {
                     let seeded: Vec<String> = seed.keys().cloned().collect();
                     let mut new = transform(&seed, true)?;
                     if !new.contains_key("_id") {
-                        new.insert("_id", Bson::ObjectId(ObjectId::new()));
+                        new.insert("_id", Bson::ObjectId(secantus_core::oid::new()));
                     }
                     // An `_id` mongod cannot hold. Measured 8.2.11, 2026-10-10:
                     // an array is 53 from an operator update and 54 from a
@@ -17390,7 +17442,7 @@ impl Storage {
                     // `order_upserted_doc`. Only an OPERATOR upsert gets it; a
                     // REPLACEMENT upsert inserts the document the client sent,
                     // in the client's own order.
-                    if !is_replacement {
+                    if !is_replacement && !SuppliedUpsert::active() {
                         new = order_upserted_doc(new, &seeded);
                     }
                     // Validator on an upsert-inserted document, too.
@@ -20777,6 +20829,56 @@ fn collect_upsert_seed(
         into.push((key.clone(), seed_value));
     }
     Ok(())
+}
+
+thread_local! {
+    static SUPPLIED_UPSERT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the statement on this thread as an `upsertSupplied` one, whose
+/// upserted document is inserted in the order the client wrote it rather than
+/// mongod's order for a document built from the query.
+struct SuppliedUpsert(bool);
+
+impl SuppliedUpsert {
+    fn enter(on: bool) -> Self {
+        SuppliedUpsert(SUPPLIED_UPSERT.with(|c| c.replace(on)))
+    }
+
+    fn active() -> bool {
+        SUPPLIED_UPSERT.with(std::cell::Cell::get)
+    }
+}
+
+impl Drop for SuppliedUpsert {
+    fn drop(&mut self) {
+        SUPPLIED_UPSERT.with(|c| c.set(self.0));
+    }
+}
+
+/// The document an `upsertSupplied` upsert inserts: the supplied one, with
+/// the `_id` the query names (`seed` is the document built from the query's
+/// equalities) when it gives none, and an error when it gives another.
+fn supplied_upsert_doc(seed: &Document, supplied: &Document) -> Result<Document> {
+    let mut new = supplied.clone();
+    match (new.get("_id"), seed.get("_id")) {
+        (None, Some(id)) => {
+            new.insert("_id", id.clone());
+        }
+        (Some(given), Some(id)) if !secantus_core::update::same_id_value(given, id) => {
+            return Err(StorageError::QueryError {
+                code: 66,
+                errmsg: format!(
+                    "After applying the update, the (immutable) field '_id' was found to have \
+                     been altered to _id: {}",
+                    shell_value(given)
+                ),
+                exec: true,
+            });
+        }
+        _ => {}
+    }
+    Ok(new)
 }
 
 fn order_upserted_doc(new: Document, seeded: &[String]) -> Document {

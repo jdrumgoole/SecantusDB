@@ -469,6 +469,47 @@ impl CmdStorage for StorageAdapter {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn update_matching_pipeline_supplied(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        pipeline: &[Bson],
+        multi: bool,
+        upsert: bool,
+        supplied: Option<&Document>,
+        let_vars: &Document,
+        collation: Option<&Collation>,
+        validator: Option<&Document>,
+        validator_moderate: bool,
+        want_post_image: bool,
+    ) -> Result<UpdateOutcome, StorageError> {
+        let o = self
+            .inner
+            .update_matching_pipeline_supplied(
+                db,
+                coll,
+                filter,
+                pipeline,
+                multi,
+                upsert,
+                supplied,
+                let_vars,
+                collation,
+                validator,
+                validator_moderate,
+                want_post_image,
+            )
+            .map_err(map_err)?;
+        Ok(UpdateOutcome {
+            matched: o.matched,
+            modified: o.modified,
+            upserted_id: o.upserted_id,
+            post_image: o.post_image,
+        })
+    }
+
     fn delete_matching(
         &self,
         db: &str,

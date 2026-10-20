@@ -40,7 +40,7 @@ use secantus_core::{aggregate, collation, diff, expressions, projection, query, 
 
 /// Decode the one-key wrapper document and hand back the wrapped value.
 fn unwrap_value(doc_bytes: &[u8]) -> PyResult<bson::Bson> {
-    let doc: Document = bson::from_slice(doc_bytes)
+    let doc: Document = secantus_core::bsondoc::from_bytes(doc_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid BSON wrapper: {e}")))?;
     doc.get("v")
         .cloned()
@@ -100,7 +100,7 @@ fn sortkey_encode_value_directed(
 }
 
 fn parse_collation(bytes: &[u8]) -> PyResult<Option<collation::Collation>> {
-    let doc: Document = bson::from_slice(bytes)
+    let doc: Document = secantus_core::bsondoc::from_bytes(bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid collation BSON: {e}")))?;
     Ok(collation::parse(&doc))
 }
@@ -116,11 +116,11 @@ fn query_matches(
     vars_bytes: &[u8],
     collation_bytes: &[u8],
 ) -> PyResult<Option<bool>> {
-    let doc: Document = bson::from_slice(doc_bytes)
+    let doc: Document = secantus_core::bsondoc::from_bytes(doc_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
-    let query: Document = bson::from_slice(query_bytes)
+    let query: Document = secantus_core::bsondoc::from_bytes(query_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid query BSON: {e}")))?;
-    let vars: Document = bson::from_slice(vars_bytes)
+    let vars: Document = secantus_core::bsondoc::from_bytes(vars_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid vars BSON: {e}")))?;
     let coll = parse_collation(collation_bytes)?;
     // Ok(b) -> Some(b) (a real result); Err(Fallback) -> None (defer to Python).
@@ -142,9 +142,9 @@ fn query_matches_raw(
     vars_bytes: &[u8],
     collation_bytes: &[u8],
 ) -> PyResult<Option<bool>> {
-    let query: Document = bson::from_slice(query_bytes)
+    let query: Document = secantus_core::bsondoc::from_bytes(query_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid query BSON: {e}")))?;
-    let vars: Document = bson::from_slice(vars_bytes)
+    let vars: Document = secantus_core::bsondoc::from_bytes(vars_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid vars BSON: {e}")))?;
     let coll = parse_collation(collation_bytes)?;
     let raw = bson::RawDocument::from_bytes(doc_bytes)
@@ -168,11 +168,11 @@ fn query_matches_batch(
     vars_bytes: &[u8],
     collation_bytes: &[u8],
 ) -> PyResult<Option<Py<PyBytes>>> {
-    let docs_wrap: Document = bson::from_slice(docs_bytes)
+    let docs_wrap: Document = secantus_core::bsondoc::from_bytes(docs_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid docs BSON: {e}")))?;
-    let query: Document = bson::from_slice(query_bytes)
+    let query: Document = secantus_core::bsondoc::from_bytes(query_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid query BSON: {e}")))?;
-    let vars: Document = bson::from_slice(vars_bytes)
+    let vars: Document = secantus_core::bsondoc::from_bytes(vars_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid vars BSON: {e}")))?;
     let coll = parse_collation(collation_bytes)?;
     let Some(Bson::Array(arr)) = docs_wrap.get("d") else {
@@ -213,11 +213,11 @@ fn evaluate(
     expr_bytes: &[u8],
     vars_bytes: &[u8],
 ) -> PyResult<Option<Py<PyBytes>>> {
-    let doc: Document = bson::from_slice(doc_bytes)
+    let doc: Document = secantus_core::bsondoc::from_bytes(doc_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
-    let expr_wrap: Document = bson::from_slice(expr_bytes)
+    let expr_wrap: Document = secantus_core::bsondoc::from_bytes(expr_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid expr BSON: {e}")))?;
-    let vars: Document = bson::from_slice(vars_bytes)
+    let vars: Document = secantus_core::bsondoc::from_bytes(vars_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid vars BSON: {e}")))?;
     let expr = expr_wrap
         .get("e")
@@ -263,9 +263,9 @@ fn apply_update(
     update_bytes: &[u8],
     is_upsert: bool,
 ) -> PyResult<Option<Py<PyBytes>>> {
-    let doc: Document = bson::from_slice(doc_bytes)
+    let doc: Document = secantus_core::bsondoc::from_bytes(doc_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
-    let update: Document = bson::from_slice(update_bytes)
+    let update: Document = secantus_core::bsondoc::from_bytes(update_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid update BSON: {e}")))?;
     let out = py
         .detach(|| match update::apply_update(&doc, &update, is_upsert) {
@@ -290,17 +290,17 @@ fn apply_update_with(
     array_filters_bytes: &[u8],
     positional_matches_bytes: &[u8],
 ) -> PyResult<Option<Py<PyBytes>>> {
-    let doc: Document = bson::from_slice(doc_bytes)
+    let doc: Document = secantus_core::bsondoc::from_bytes(doc_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
-    let update: Document = bson::from_slice(update_bytes)
+    let update: Document = secantus_core::bsondoc::from_bytes(update_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid update BSON: {e}")))?;
-    let af_wrap: Document = bson::from_slice(array_filters_bytes)
+    let af_wrap: Document = secantus_core::bsondoc::from_bytes(array_filters_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid arrayFilters BSON: {e}")))?;
     let array_filters: Vec<Document> = match af_wrap.get("f") {
         Some(bson::Bson::Array(a)) => a.iter().filter_map(|b| b.as_document().cloned()).collect(),
         _ => Vec::new(),
     };
-    let pos: Document = bson::from_slice(positional_matches_bytes)
+    let pos: Document = secantus_core::bsondoc::from_bytes(positional_matches_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid positionalMatches BSON: {e}")))?;
     let out = py
         .detach(|| {
@@ -324,9 +324,9 @@ fn apply_update_batch(
     update_bytes: &[u8],
     is_upsert: bool,
 ) -> PyResult<Option<Py<PyBytes>>> {
-    let docs_wrap: Document = bson::from_slice(docs_bytes)
+    let docs_wrap: Document = secantus_core::bsondoc::from_bytes(docs_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid docs BSON: {e}")))?;
-    let update: Document = bson::from_slice(update_bytes)
+    let update: Document = secantus_core::bsondoc::from_bytes(update_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid update BSON: {e}")))?;
     let Some(Bson::Array(arr)) = docs_wrap.get("d") else {
         return Err(PyValueError::new_err("docs wrapper missing array 'd'"));
@@ -365,9 +365,9 @@ fn apply_projection(
     spec_bytes: &[u8],
     query_bytes: Option<&[u8]>,
 ) -> PyResult<Option<Py<PyBytes>>> {
-    let doc: Document = bson::from_slice(doc_bytes)
+    let doc: Document = secantus_core::bsondoc::from_bytes(doc_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
-    let spec: Document = bson::from_slice(spec_bytes)
+    let spec: Document = secantus_core::bsondoc::from_bytes(spec_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid spec BSON: {e}")))?;
     let query = decode_optional_query(query_bytes)?;
     let out = py
@@ -394,7 +394,7 @@ fn apply_projection_raw(
     doc_bytes: &[u8],
     spec_bytes: &[u8],
 ) -> PyResult<Option<Py<PyBytes>>> {
-    let spec: Document = bson::from_slice(spec_bytes)
+    let spec: Document = secantus_core::bsondoc::from_bytes(spec_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid spec BSON: {e}")))?;
     let raw = bson::RawDocument::from_bytes(doc_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
@@ -415,7 +415,7 @@ fn apply_projection_raw(
 /// `$group` output.
 #[pyfunction]
 fn group_referenced_fields(spec_bytes: &[u8]) -> PyResult<Option<Vec<String>>> {
-    let spec: Document = bson::from_slice(spec_bytes)
+    let spec: Document = secantus_core::bsondoc::from_bytes(spec_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid spec BSON: {e}")))?;
     Ok(
         secantus_core::referenced_top_level_fields(&Bson::Document(spec))
@@ -427,7 +427,7 @@ fn group_referenced_fields(spec_bytes: &[u8]) -> PyResult<Option<Vec<String>>> {
 /// projection bindings to resolve a positional `arr.$` projection.
 fn decode_optional_query(query_bytes: Option<&[u8]>) -> PyResult<Option<Document>> {
     match query_bytes {
-        Some(qb) if !qb.is_empty() => bson::from_slice(qb)
+        Some(qb) if !qb.is_empty() => secantus_core::bsondoc::from_bytes(qb)
             .map(Some)
             .map_err(|e| PyValueError::new_err(format!("invalid query BSON: {e}"))),
         _ => Ok(None),
@@ -445,9 +445,9 @@ fn apply_projection_batch(
     spec_bytes: &[u8],
     query_bytes: Option<&[u8]>,
 ) -> PyResult<Option<Py<PyBytes>>> {
-    let docs_wrap: Document = bson::from_slice(docs_bytes)
+    let docs_wrap: Document = secantus_core::bsondoc::from_bytes(docs_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid docs BSON: {e}")))?;
-    let spec: Document = bson::from_slice(spec_bytes)
+    let spec: Document = secantus_core::bsondoc::from_bytes(spec_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid spec BSON: {e}")))?;
     let query = decode_optional_query(query_bytes)?;
     let Some(Bson::Array(arr)) = docs_wrap.get("d") else {
@@ -491,13 +491,13 @@ fn compute_update_description(
     // diffs by value -- see `secantus_core::diff`.
     update_bytes: Option<&[u8]>,
 ) -> PyResult<Option<Py<PyBytes>>> {
-    let pre: Document = bson::from_slice(pre_bytes)
+    let pre: Document = secantus_core::bsondoc::from_bytes(pre_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid pre BSON: {e}")))?;
-    let post: Document = bson::from_slice(post_bytes)
+    let post: Document = secantus_core::bsondoc::from_bytes(post_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid post BSON: {e}")))?;
     let update: Option<Document> = match update_bytes {
         Some(b) => Some(
-            bson::from_slice(b)
+            secantus_core::bsondoc::from_bytes(b)
                 .map_err(|e| PyValueError::new_err(format!("invalid update BSON: {e}")))?,
         ),
         None => None,
@@ -523,9 +523,9 @@ fn apply_update_description(
     doc_bytes: &[u8],
     diff_bytes: &[u8],
 ) -> PyResult<Option<Py<PyBytes>>> {
-    let doc: Document = bson::from_slice(doc_bytes)
+    let doc: Document = secantus_core::bsondoc::from_bytes(doc_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
-    let diff: Document = bson::from_slice(diff_bytes)
+    let diff: Document = secantus_core::bsondoc::from_bytes(diff_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid diff BSON: {e}")))?;
     let out = py
         .detach(|| match diff::apply_update_description(doc, &diff) {
@@ -549,11 +549,11 @@ fn apply_pipeline(
     vars_bytes: &[u8],
     collation_bytes: &[u8],
 ) -> PyResult<Option<Py<PyBytes>>> {
-    let docs_wrap: Document = bson::from_slice(docs_bytes)
+    let docs_wrap: Document = secantus_core::bsondoc::from_bytes(docs_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid docs BSON: {e}")))?;
-    let pipe_wrap: Document = bson::from_slice(pipeline_bytes)
+    let pipe_wrap: Document = secantus_core::bsondoc::from_bytes(pipeline_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid pipeline BSON: {e}")))?;
-    let vars: Document = bson::from_slice(vars_bytes)
+    let vars: Document = secantus_core::bsondoc::from_bytes(vars_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid vars BSON: {e}")))?;
     let coll = parse_collation(collation_bytes)?;
 

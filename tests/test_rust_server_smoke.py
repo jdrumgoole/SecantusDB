@@ -526,6 +526,34 @@ def test_ttl_monitor_starts_off_and_can_be_switched_on(tmp_path) -> None:
         srv.stop()
 
 
+def test_noop_heartbeat_is_written_only_when_asked(tmp_path) -> None:
+    """RM-114: the embedded handle writes the oplog's noop heartbeat, as the
+    daemon's `--noop-heartbeat-seconds` does, when it is given a period,
+    and none without one."""
+
+    def noops(srv) -> int:
+        return _client(srv)["local"]["oplog.rs"].count_documents({"op": "n"})
+
+    srv = _server.RustServer(str(tmp_path / "beat"), 0, noop_heartbeat_seconds=0.2)
+    try:
+        deadline = time.monotonic() + 10
+        while noops(srv) < 2 and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert noops(srv) >= 2
+    finally:
+        srv.stop()
+
+    srv = _server.RustServer(str(tmp_path / "quiet"), 0)
+    try:
+        time.sleep(1.0)
+        assert noops(srv) == 0
+    finally:
+        srv.stop()
+
+    with pytest.raises(ValueError, match="noop_heartbeat_seconds must be positive"):
+        _server.RustServer(str(tmp_path / "bad"), 0, noop_heartbeat_seconds=0.0)
+
+
 def test_secantus_admin_restore_archive_roundtrips(tmp_path) -> None:
     """backupArchive -> restoreArchive round-trips data through a fresh dir, and
     the restored directory is a startable WT home (issue #163)."""

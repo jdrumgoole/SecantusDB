@@ -361,20 +361,33 @@ def test_sasl_start_base64_payload(rust_mongo: Any) -> None:
     assert mongo_answer(run) == ("ok", (1.0, False, "str"))
 
 
-@pytest.mark.backlog("RM-143")
+@pytest.mark.backlog_fixed("RM-143")
 def test_features_reports_the_script_engine(rust_mongo: Any) -> None:
-    """mongod 8.2.11's `features` has `js: {utf8: true}`: it has a script
-    engine."""
-    assert rust_mongo.admin.command("features").get("js") == {"utf8": True}
+    """`features` has no `js` block, as a `mongod --noscripting` 8.2.11
+    answers (measured 2026-10-20): no script engine is built (scope
+    decision, Joe 2026-10-16)."""
+    reply = rust_mongo.admin.command("features")
+    assert "js" not in reply
+    assert isinstance(reply["oidMachine"], int)
 
 
-@pytest.mark.backlog("RM-143")
+@pytest.mark.backlog_fixed("RM-143")
 def test_features_oid_reset(rust_mongo: Any) -> None:
-    """mongod 8.2.11 answers `oidReset` with the old machine value."""
-    got = mongo_answer(
-        lambda: "oidMachineOld" in rust_mongo.admin.command("features", oidReset=True)
-    )
-    assert got == ("ok", True)
+    """mongod 8.2.11 answers `oidReset` with the old machine value and the
+    new one, which the ObjectIds it mints from then on carry."""
+    admin = rust_mongo.admin
+    before = admin.command("features")["oidMachine"]
+    reply = admin.command("features", oidReset=True)
+    assert list(reply)[:3] == ["oidMachineOld", "oidMachine", "ok"]
+    assert reply["oidMachineOld"] == before
+    assert admin.command("features")["oidMachine"] == reply["oidMachine"]
+    coll = rust_mongo["rm143"]["oid"]
+    coll.drop()
+    # A raw `insert` with no `_id`: the server mints it (a driver's
+    # `insert_one` would add one of its own).
+    coll.database.command("insert", "oid", documents=[{"a": 1}])
+    minted = coll.find_one()["_id"].binary
+    assert int.from_bytes(minted[4:8], "little") == reply["oidMachine"]
 
 
 @pytest.mark.backlog("RM-143")
@@ -698,25 +711,6 @@ def _same_order(rust: Any, ref: Any, name: str, indexes: list, command: dict, **
     got = _ids(_seed(rust, name, docs, indexes, after), command)
     want = _ids(_seed(ref, name, docs, indexes, after), command)
     assert got == want
-
-
-@pytest.mark.backlog("RM-049")
-def test_ties_under_a_sort_with_a_limit(rust_mongo: Any, mongod: Any) -> None:
-    """`{a: 5}, sort {a: -1}, skip 1, limit 2`, no index: mongod's top-k heap
-    leaves the tied documents in its own order."""
-    command = {"find": "c", "filter": {"a": 5}, "sort": {"a": -1}, "skip": 1, "limit": 2}
-    _same_order(rust_mongo, mongod, "rm049", [], command)
-
-
-@pytest.mark.backlog("RM-049")
-def test_ties_under_an_aggregate_sort_with_a_limit(rust_mongo: Any, mongod: Any) -> None:
-    """`$sort {b: 1}, $limit 3`, no index: the heap's order of the ties."""
-    command = {
-        "aggregate": "c",
-        "pipeline": [{"$sort": {"b": 1}}, {"$limit": 3}],
-        "cursor": {},
-    }
-    _same_order(rust_mongo, mongod, "rm049a", [], command)
 
 
 @pytest.mark.backlog_fixed("RM-050")

@@ -148,10 +148,12 @@ fn tidy(value: Bson, sorted_in: bool) -> Bson {
 }
 
 /// `$alwaysTrue` matches everything: mongod drops it from an `$and`, and an
-/// `$and` left with one child is that child.
-fn drop_always_true(filter: Document) -> Document {
+/// `$and` left with one child is that child. A query that is nothing but
+/// `$alwaysTrue` (or an `$or` of it alone) keeps it (measured 8.2.11,
+/// 2026-10-20); `lone` says the query was no `$and`.
+fn drop_always_true(filter: Document, lone: bool) -> Document {
     let Some(Bson::Array(children)) = filter.get("$and").filter(|_| filter.len() == 1) else {
-        return if filter.len() == 1 && filter.contains_key("$alwaysTrue") {
+        return if filter.len() == 1 && filter.contains_key("$alwaysTrue") && !lone {
             Document::new()
         } else {
             filter
@@ -185,9 +187,11 @@ pub(crate) fn parsed_query_as_written(filter: &Document) -> Document {
 }
 
 fn parsed(filter: &Document, sorted_in: bool) -> Document {
-    let canonical = drop_always_true(secantus_core::canonical_match(&Bson::Document(
-        filter.clone(),
-    )));
+    let lone = filter.len() == 1 && !filter.contains_key("$and");
+    let canonical = drop_always_true(
+        secantus_core::canonical_match(&Bson::Document(with_schemas_parsed(filter))),
+        lone,
+    );
     // `{a: {$nin: []}}` excludes nothing, and mongod says so its own way.
     if let [(_, Bson::Document(pred))] = canonical.iter().collect::<Vec<_>>()[..] {
         let empty_nin = pred
@@ -242,8 +246,94 @@ fn optimize(node: Document, sorted_in: bool) -> Document {
         let only = kept.pop().expect("one");
         return if kind == "$or" { single_in(only) } else { only };
     }
-    kept.sort_by_key(secantus_core::clause_rank);
+    kept.sort_by(compare_clauses);
     doc! { kind: kept.into_iter().map(Bson::Document).collect::<Vec<_>>() }
+}
+
+/// `filter` with each `$jsonSchema` replaced by what mongod parses it into
+/// (`json_schema`), where the transcription covers the schema.
+fn with_schemas_parsed(filter: &Document) -> Document {
+    let mut kept = Document::new();
+    let mut parsed = Vec::new();
+    for (key, value) in filter {
+        match (key.as_str(), value) {
+            ("$jsonSchema", Bson::Document(schema)) => {
+                match super::json_schema::translate(schema) {
+                    Some(t) => parsed.push(Bson::Document(t)),
+                    None => {
+                        kept.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            ("$and" | "$or" | "$nor", Bson::Array(items)) => {
+                let items: Vec<Bson> = items
+                    .iter()
+                    .map(|i| match i {
+                        Bson::Document(d) => Bson::Document(with_schemas_parsed(d)),
+                        other => other.clone(),
+                    })
+                    .collect();
+                kept.insert(key.clone(), items);
+            }
+            _ => {
+                kept.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    if parsed.is_empty() {
+        return kept;
+    }
+    if !kept.is_empty() {
+        parsed.insert(0, Bson::Document(kept));
+    }
+    doc! { "$and": parsed }
+}
+
+/// mongod's order for the children of an `$and` / `$or`: by match type and
+/// path (`clause_rank`), and between two of one type on one path by their
+/// own children, recursively (`MatchExpression::sortTree`): `$not` of an
+/// `$exists` comes before `$not` of a type test, and of two `$or`s the one
+/// whose first differing child sorts first.
+fn compare_clauses(a: &Document, b: &Document) -> std::cmp::Ordering {
+    let order = secantus_core::clause_rank(a).cmp(&secantus_core::clause_rank(b));
+    if order != std::cmp::Ordering::Equal {
+        return order;
+    }
+    let children = |d: &Document| -> Option<Vec<Document>> {
+        let [(key, value)] = d.iter().collect::<Vec<_>>()[..] else {
+            return None;
+        };
+        match value {
+            Bson::Array(items) if key.starts_with('$') => Some(
+                items
+                    .iter()
+                    .filter_map(Bson::as_document)
+                    .cloned()
+                    .collect(),
+            ),
+            Bson::Document(pred) if !key.starts_with('$') => {
+                match (pred.get("$not"), pred.get("$_internalSchemaObjectMatch")) {
+                    (Some(Bson::Document(inner)), _) => {
+                        let mut one = Document::new();
+                        one.insert(key.clone(), inner.clone());
+                        Some(vec![one])
+                    }
+                    (_, Some(Bson::Document(inner))) => Some(vec![inner.clone()]),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    };
+    match (children(a), children(b)) {
+        (Some(x), Some(y)) => x
+            .iter()
+            .zip(&y)
+            .map(|(p, q)| compare_clauses(p, q))
+            .find(|o| *o != std::cmp::Ordering::Equal)
+            .unwrap_or_else(|| x.len().cmp(&y.len())),
+        _ => std::cmp::Ordering::Equal,
+    }
 }
 
 /// The value an `$or` branch tests its path for equality with, if it is
@@ -359,6 +449,20 @@ fn same_clause(a: &Document, b: &Document) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn always_true_stays_only_alone() {
+        // Measured 8.2.11, 2026-10-20.
+        let cases = [
+            (doc! {"$alwaysTrue": 1}, doc! {"$alwaysTrue": 1}),
+            (doc! {"$or": [{"$alwaysTrue": 1}]}, doc! {"$alwaysTrue": 1}),
+            (doc! {"$and": [{"$alwaysTrue": 1}]}, doc! {}),
+            (doc! {"a": 1, "$alwaysTrue": 1}, doc! {"a": {"$eq": 1}}),
+        ];
+        for (filter, want) in cases {
+            assert_eq!(parsed_query(&filter), want, "{filter}");
+        }
+    }
 
     #[test]
     fn rewrites_follow_mongod() {

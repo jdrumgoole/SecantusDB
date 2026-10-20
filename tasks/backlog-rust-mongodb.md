@@ -39,12 +39,6 @@ one beside it.
 
 ## Open from the 2026-08-26 triage
 
-- [ ] **Rust MongoDB `explain`: the index shown for each `$or` branch** is
-  mongod's cost-model choice and is not reproduced when a branch has several
-  usable indexes (noted 2026-10-02, batch 45). Reproduce: two indexes that can
-  both serve one `$or` branch, then compare `explain` against mongod 8.2.11.
-  Backlog-ID: RM-001
-  Verify: tests/backlog/test_rm_001_028.py::test_or_branch_index_choice_matches_mongod
 - **Scope decision — `$where` and `$function`** need a JavaScript engine.
   Neither server has one, and none is planned (WONTFIX).
 
@@ -283,18 +277,6 @@ These are explicit non-goals. Don't add them without a reason.
       Backlog-ID: RM-011
       Verify: none -- .NET gauge teardown stall (tooling)
 
-- [ ] **OPEN — the Go cross-driver smoke tests download modules at test time.**
-      `tests/test_cross_driver_features.py`'s `go run ./cluster_roles`,
-      `./sessions` and `./batchsize-zero` fetch their modules from
-      proxy.golang.org inside the test, and no CI job caches or pre-downloads
-      them. On 2026-10-06 one `test-durable` lane failed all three with
-      `stream error: stream ID 23; INTERNAL_ERROR` from the proxy before any
-      program reached the server. The rerun passed, but the failure measured
-      the network, not the server. Fix: `go mod download` in a setup step,
-      with `actions/setup-go`'s module cache, so the test itself never goes to
-      the network.
-      Backlog-ID: RM-012
-      Verify: none -- CI module download/caching
 
 - [ ] **OPEN — `test_stop_ends_a_running_command` on Windows: the fix is not
       yet observed under the original race, and `test_opsboard.py`'s half was
@@ -486,14 +468,6 @@ These are explicit non-goals. Don't add them without a reason.
   divergence. Pinning it down means bisecting a ~10-minute full-gauge run.
   Backlog-ID: RM-020
   Verify: none -- C gauge failure only inside full gauge run
-- [ ] **A wrong comment in `.github/workflows/test.yml`'s "Rust-server
-  concurrency invariants" step.** It says the `[python]` params are skipped
-  because they "need the SWIG `wiredtiger` binding this storage-flavoured
-  wheel doesn't ship". The wheel does ship it (`CMakeLists.txt` builds it
-  with `ENABLE_PYTHON=ON`), and the other gated files import and run there.
-  Correct the comment, and decide whether `-k rust` is still needed.
-  Backlog-ID: RM-021
-  Verify: none -- wrong comment in a CI workflow
 
 ## 7. Python → Rust rewrite (in progress)
 
@@ -989,17 +963,19 @@ Still different:
       Backlog-ID: RM-185
       Verify: tests/backlog/test_rm_185_locks.py::test_lock_counts_of_merge_fail_with_duplicates
 - [ ] **Commands answered only as far as this server honours them.**
-      `features` has no `js` block (there is no script engine) and refuses
-      `oidReset`; `getClusterParameter` has six of mongod's fifteen
-      parameters, the ones whose default is a fact here (no shards, no
-      default `maxTimeMS`, pre-images that go with the oplog), and answers 4
-      for the rest; `planCacheSetFilter` is not a command, because no filter
-      would be applied; `replSetResizeOplog` refuses a `minRetentionHours`
-      above 0, because this oplog drops an entry older than its retention
-      window whatever its size; `replSetReconfig` is not a command. Each
-      is a feature to build, not a reply to change.
+      `getClusterParameter` has six of mongod's fifteen parameters, the ones
+      whose default is a fact here (no shards, no default `maxTimeMS`,
+      pre-images that go with the oplog), and answers 4 for the rest;
+      `planCacheSetFilter` is not a command, because no filter would be
+      applied; `replSetResizeOplog` refuses a `minRetentionHours` above 0,
+      because this oplog drops an entry older than its retention window
+      whatever its size (honouring it means a floor in the shared storage
+      crate's oplog prune); `replSetReconfig` is not a command. Each is a
+      feature to build, not a reply to change. (`features` has no `js`
+      block, as a `mongod --noscripting` answers, and `oidReset` replaces
+      the ObjectId process value since 2026-10-20.)
       Backlog-ID: RM-143
-      Verify: tests/backlog/test_rm_029_056.py::test_features_reports_the_script_engine,tests/backlog/test_rm_029_056.py::test_features_oid_reset,tests/backlog/test_rm_029_056.py::test_plan_cache_set_filter,tests/backlog/test_rm_029_056.py::test_resize_oplog_min_retention_hours,tests/backlog/test_rm_029_056.py::test_every_cluster_parameter
+      Verify: tests/backlog/test_rm_029_056.py::test_plan_cache_set_filter,tests/backlog/test_rm_029_056.py::test_resize_oplog_min_retention_hours,tests/backlog/test_rm_029_056.py::test_every_cluster_parameter
 - **Scope decision — `buildInfo.secantusVersion` and `serverStatus.secantus`
   stay** (Joe, 2026-10-15). Each names this build beside mongod's own
   fields. They are additive, documented (`CLAUDE.md`, `docs/compatibility.md`,
@@ -1128,28 +1104,29 @@ What the order follows, each measured:
 
 Still different, all 77:
 
-- [ ] **Ties under a sort with a limit** (62). mongod keeps the first
-      `limit` documents of a blocking sort in a heap, and the order the heap
-      leaves equal documents in is its standard library's (`make_heap` and
-      `pop_heap`; working libc++'s by hand gives mongod's answer for
-      `{a: 5}, sort {a: -1}, skip 1, limit 2`). This server keeps them in
-      the order they arrived. A Linux mongod is built on another library
-      and was not measured.
-      **Decided 2026-10-16 (Joe):** measure the cases against mongod 8.2.11
-      on Linux (libstdc++) first. If Linux agrees with macOS, reproduce
-      libc++'s heap; if not, mongod has no single answer and the divergence
-      is accepted.
-      Backlog-ID: RM-049
-      Verify: tests/backlog/test_rm_029_056.py::test_ties_under_a_sort_with_a_limit,tests/backlog/test_rm_029_056.py::test_ties_under_an_aggregate_sort_with_a_limit
+- **Scope decision — ties under a sort with a limit keep their arrival
+  order** (this was RM-049; decided by Joe 2026-10-16, measured
+  2026-10-20). mongod keeps the first `skip + limit` documents of a
+  blocking sort in a heap (`TopKSorter`: `make_heap`, then `pop_heap` /
+  `push_heap` per better document, `sort_heap` at the end), and the order
+  equal documents come out in is the C++ library's. The decision was to
+  reproduce libc++'s heap if a Linux (libstdc++) mongod agreed with the
+  macOS one, and otherwise to accept the divergence. It does not: over 540
+  cases of 3 to 40 documents with ties (`find` and `aggregate`, limits 2 to
+  11, skips 0 to 2), mongod 8.2.12 on Ubuntu 24.04 and mongod 8.2.11 on
+  macOS returned different orders in 309. No order is mongod's, so this
+  server's (equal documents in the order the plan reads them) stands. The
+  two gap tests were retired with the item: they asserted the macOS
+  answer, which a Linux mongod would fail too.
 - **An unknown hint's wording is mongod's since 2026-10-20** (it was an
   accepted difference, Joe 2026-10-16, formerly RM-051). The planner's text,
   `error processing query: ns=<ns>Tree: <query tree>\nSort: ...`, is
   rendered by `explain::debug_string` from the parsed query, and what each
   command adds to it (paging, projection, collation) was measured per
   command. Pinned by `tests/backlog/test_rm_029_056.py::test_unknown_hint_on_aggregate`
-  and `tests/backlog/test_rm_planner_text.py`. Not rendered as mongod
-  renders them: `$jsonSchema` (RM-196), `$where`, and `$near` (whose
-  refusal is a different error).
+  and `tests/backlog/test_rm_planner_text.py`. `$jsonSchema` prints as the
+  predicates it parses into (since 2026-10-20); `$near` is refused in
+  words of its own before any plan.
 - [ ] **The order of an unsorted `find` for six predicate shapes the
       plan derives differently from mongod.** Found by p4-router's
       824-case shapes harness (2026-10-15), mongod 8.2.11: 22 replies, the
@@ -1302,14 +1279,6 @@ differs on 17 of 1,295. Pinned by
 
 What is left, on the RUST MongoDB server:
 
-- [ ] **`secantus-core-py`, the parity binding, still decodes through
-      serde** (36 calls). The PostgreSQL crates' five were replaced on
-      2026-10-14 (see the Rust PG server's built-in functions entry).
-      **Decided 2026-10-16 (Joe):** replace the 36 serde decodes with
-      `secantus_core::bsondoc::from_bytes`, then let
-      `tests/test_rust_literal_bson_decode.py` cover every crate.
-      Backlog-ID: RM-058
-      Verify: none -- the serde decode is in the secantus-core-py parity binding, a test vehicle with no wire behaviour to compare against mongod
 - [ ] **The field order of a document upserted from two or more
       equalities.** mongod: `{a: 1, b: 2, c: 3, d: 4}` gives `c, a, b, d`;
       `{d: 1, c: 2, b: 3, a: 4}` gives `d, b, a, c`; an explicit `$and`
@@ -1393,16 +1362,6 @@ What is left, all on the RUST MongoDB server:
       **Decided 2026-10-16 (Joe):** as RM-071, transcribe and execute.
       Backlog-ID: RM-072
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view
-- [ ] **`$jsonSchema` is echoed, not parsed.** mongod 8.2.11 translates a
-      `$jsonSchema` into the match expressions it stands for, and prints
-      those in `parsedQuery` and in its planner's query tree:
-      `{$jsonSchema: {required: ["a"]}}` parses as `{a: {$exists: true}}`;
-      richer schemas become mongod's internal `$_internalSchema*`
-      operators. This server echoes the schema in both places. The query's
-      answer is not affected (the schema is evaluated as written). Found
-      2026-10-20 while reproducing the query tree.
-      Backlog-ID: RM-196
-      Verify: tests/backlog/test_rm_planner_text.py::test_json_schema_is_parsed_as_mongod_parses_it
 
 ### 7.074 Change streams, command by command -- 2026-10-11
 
@@ -1685,18 +1644,6 @@ What is left, there and beside it:
 wording filed under 7.067) and 2 TTL results
 (`tasks/rust-mongod-remaining-plan.md`, 2026-10-14). What is left:
 
-- [ ] **RUST MongoDB server: `upsertSupplied` is two steps.** The update runs
-      without the upsert, and when nothing matched `c.new` is inserted: not
-      one atomic statement, so a concurrent insert between the two can make
-      it a duplicate-key error. (The validator is applied, and the `_id` is
-      the query's, re-measured 2026-10-14.)
-      Backlog-ID: RM-102
-      Verify: none -- a race between the two steps; no deterministic check
-- [ ] **RUST MongoDB server: the TTL cutoff is exclusive.** A date exactly
-      `expireAfterSeconds` old is kept until the next pass. Which side
-      `mongod` puts that one millisecond on was not measured.
-      Backlog-ID: RM-104
-      Verify: none -- the boundary millisecond depends on when a TTL pass runs; not observable deterministically
 
 ### 7.067 Index management -- 2026-10-10
 
@@ -1757,14 +1704,6 @@ dropped (four), and `listIndexes` lists by name.
 
 ### 7.03 Rust packages (crates.io) -- open items, 2026-10-01
 
-- [ ] **The embedded Python `RustServer` handle runs no sweepers.**
-      `secantus_mdb::Server` (and the daemon) expire TTL-indexed documents
-      every 60 seconds (`Builder::ttl_sweep`) and can run the noop heartbeat
-      that also prunes the oplog (`Builder::noop_heartbeat`); the Python
-      embedded handle runs neither. Check: `git grep -i "ttl_sweep\|noop_heartbeat"
-      crates/secantus-server-py/` finds nothing (2026-10-14).
-      Backlog-ID: RM-114
-      Verify: none -- embedded Python RustServer handle lifecycle; needs the PyO3 extension and a 60s sweep
 
 ### 7.01 Rust MongoDB server driver-gauge sweep — 2026-09-30
 
@@ -1791,16 +1730,6 @@ dropped (four), and `listIndexes` lists by name.
 
 ### 7.00 Rust MongoDB server batch — 2026-09-30, measured against mongod 8.2.11
 
-- [ ] **Two of the 21 write-command divergences found on 2026-09-02 were
-      never identified as fixed.** Instrumenting `update_operators`,
-      `arg_types_documents`, `update_path_conflicts` and
-      `findandmodify_shapes` with a Rust column (`tools/probes/_servers.py`,
-      `probe_targets()`) found 21 Rust-vs-mongod divergences; 19 were fixed
-      and the record said the other 2 "are recorded below", but no later
-      entry names them. Re-run those four probes against `secantusd-rs` and
-      mongod 8.2.11 and file whatever still differs.
-      Backlog-ID: RM-117
-      Verify: none -- probe re-run campaign to find two unnamed divergences
 
 - **The six message-only bad-hint divergences in
   `tools/probes/arg_types_messages.py`** are gone from the Rust server

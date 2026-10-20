@@ -45,7 +45,7 @@ def _ixscan_names(plan: Any, out: list[str]) -> list[str]:
     return out
 
 
-@pytest.mark.backlog("RM-001")
+@pytest.mark.backlog_fixed("RM-001")
 def test_or_branch_index_choice_matches_mongod(rust_mongo: Any, mongod: Any) -> None:
     """Each `$or` branch below has two or more usable indexes; the IXSCAN
     index names in the winning plan must be the ones mongod 8.2.11 picks."""
@@ -74,6 +74,42 @@ def test_or_branch_index_choice_matches_mongod(rust_mongo: Any, mongod: Any) -> 
             )
             got.append(_ixscan_names(ex["queryPlanner"]["winningPlan"], []))
         answers[name] = got
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-199")
+def test_or_beside_other_clauses_is_a_candidate_plan(rust_mongo: Any, mongod: Any) -> None:
+    """An `$or` beside another clause (measured on a fresh collection,
+    mongod 8.2.11): mongod tries the plan that reads each branch's index,
+    the other clauses pushed down into the branches, against the plans of
+    one index for the whole query, and keeps the branches' plan here."""
+    shapes = [
+        {"$or": [{"a": 3, "b": 2}, {"c": 5}, {"d": 1, "b": 3}], "d": {"$ne": 5}},
+        {"$or": [{"a": 3}, {"b": 4}, {"c": {"$gt": 290}}], "d": {"$ne": 5}},
+    ]
+    answers: dict[str, list] = {}
+    for name, db in _both(rust_mongo, mongod, "rm199"):
+        db.c.insert_many(
+            [{"_id": i, "a": i % 10, "b": i % 7, "c": i, "d": i % 3} for i in range(300)]
+        )
+        for spec in (
+            [("a", 1)],
+            [("a", 1), ("b", 1)],
+            [("b", 1)],
+            [("c", 1)],
+            [("c", 1), ("a", 1)],
+            [("d", 1), ("b", 1)],
+        ):
+            db.c.create_index(spec)
+        answers[name] = [
+            _ixscan_names(
+                db.command("explain", {"find": "c", "filter": f}, verbosity="queryPlanner")[
+                    "queryPlanner"
+                ]["winningPlan"],
+                [],
+            )
+            for f in shapes
+        ]
     assert answers["rust"] == answers["mongod"]
 
 
