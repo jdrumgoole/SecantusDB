@@ -137,12 +137,55 @@ unsafe fn item_bytes(it: &sys::WT_ITEM) -> Vec<u8> {
 /// A WiredTiger database connection. One per process (sessions are per-thread).
 pub struct Connection {
     ptr: *mut sys::WT_CONNECTION,
+    /// The event handler WiredTiger was given. It writes its defaults into
+    /// the callbacks left null, so the handler is the connection's own and
+    /// outlives it: `Drop` closes the connection before this field drops.
+    _handler: Box<sys::WT_EVENT_HANDLER>,
 }
 
 // The connection handle is safe to share across threads; WiredTiger's own MVCC
 // and per-session affinity provide the actual thread-safety.
 unsafe impl Send for Connection {}
 unsafe impl Sync for Connection {}
+
+/// WiredTiger's error callback. A panic ends the process, as mongod's
+/// handler does (`fassert` on `WT_PANIC`): after one every storage call
+/// fails while `hello` still answers, and a supervisor watching for the
+/// process to die never sees it (RM-188). Any other error returns non-zero,
+/// which leaves WiredTiger to print it as it would with no handler.
+unsafe extern "C" fn handle_error(
+    _handler: *mut sys::WT_EVENT_HANDLER,
+    _session: *mut sys::WT_SESSION,
+    error: std::os::raw::c_int,
+    message: *const std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    if error == sys::WT_PANIC {
+        let text = if message.is_null() {
+            String::from("(no message)")
+        } else {
+            // SAFETY: WiredTiger passes a NUL-terminated message.
+            unsafe { std::ffi::CStr::from_ptr(message) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        eprintln!("secantus-wt: WiredTiger panic, aborting: {text}");
+        std::process::abort();
+    }
+    1
+}
+
+/// The event handler a connection is opened with: only the error callback
+/// is ours, and WiredTiger fills in its defaults for the rest -- writing
+/// them into the struct, which is why it cannot be a `static`.
+fn event_handler() -> Box<sys::WT_EVENT_HANDLER> {
+    Box::new(sys::WT_EVENT_HANDLER {
+        handle_error: Some(handle_error),
+        handle_message: None,
+        handle_progress: None,
+        handle_close: None,
+        handle_general: None,
+    })
+}
 
 impl Connection {
     /// Open (creating if needed) a WiredTiger database rooted at `home` with the
@@ -151,10 +194,14 @@ impl Connection {
         let home_c = CString::new(home).map_err(nul_err)?;
         let cfg_c = CString::new(config).map_err(nul_err)?;
         let mut ptr: *mut sys::WT_CONNECTION = ptr::null_mut();
+        let mut handler = event_handler();
         check(unsafe {
-            sys::wiredtiger_open(home_c.as_ptr(), ptr::null_mut(), cfg_c.as_ptr(), &mut ptr)
+            sys::wiredtiger_open(home_c.as_ptr(), &mut *handler, cfg_c.as_ptr(), &mut ptr)
         })?;
-        Ok(Connection { ptr })
+        Ok(Connection {
+            ptr,
+            _handler: handler,
+        })
     }
 
     /// Open a new session (thread-affine — open one per thread).
@@ -688,5 +735,59 @@ fn step(code: c_int) -> Result<bool> {
         Ok(false)
     } else {
         Err(WtError::from_code(code))
+    }
+}
+
+#[cfg(test)]
+mod panic_handler_tests {
+    use super::*;
+
+    /// A `WT_PANIC` ends the process. Run in a child copy of this test
+    /// binary, which calls the handler as WiredTiger would; the parent sees
+    /// it abort, with the message on stderr. Another error code returns.
+    #[test]
+    fn a_wiredtiger_panic_aborts_the_process() {
+        const CHILD: &str = "SECANTUS_WT_PANIC_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let msg = CString::new("injected").unwrap();
+            let rc = unsafe { handle_error(ptr::null_mut(), ptr::null_mut(), -1, msg.as_ptr()) };
+            assert_eq!(rc, 1);
+            unsafe {
+                handle_error(
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    sys::WT_PANIC,
+                    msg.as_ptr(),
+                )
+            };
+            unreachable!("handle_error returned from a panic");
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                // The harness captures a test's stderr and prints it only
+                // when the test ends, which an abort never reaches.
+                "--nocapture",
+                "panic_handler_tests::a_wiredtiger_panic_aborts_the_process",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                out.status.signal(),
+                Some(6),
+                "not SIGABRT: {:?}",
+                out.status
+            );
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("WiredTiger panic, aborting: injected"),
+            "stderr: {stderr}"
+        );
     }
 }

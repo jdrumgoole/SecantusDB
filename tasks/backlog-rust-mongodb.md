@@ -636,16 +636,6 @@ inject (a panic, a power loss, a failing checkpoint).
       would also stop holding all its entries in memory at once.
       Backlog-ID: RM-187
       Verify: none -- a concurrency budget (writes during a long build), not an answer
-- [ ] **A WiredTiger panic while the server is running goes unnoticed.**
-      `secantus-wt`'s `Connection::open` passes a null event handler to
-      `wiredtiger_open`, and nothing checks for `WT_PANIC` (-31804). After a
-      panic every storage call fails, each reaching the client as an ordinary
-      error, while `hello` and `ping` still succeed, and `Drop` then tries to
-      checkpoint the panicked connection. mongod installs an event handler
-      that terminates the process on a panic (`fassert`), so a supervisor sees
-      it die. §7.069 covers a panic while OPENING a store, in CI.
-      Backlog-ID: RM-188
-      Verify: none -- needs a WiredTiger panic injected into a running server
 - [ ] **`count({})`, `collStats`, `dataSize` and `dbStats` walk every
       row.** They stream now, in constant memory (fixed 2026-10-20: each
       read the whole collection into a `Vec`, and `dbStats` did that three
