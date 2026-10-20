@@ -98,7 +98,7 @@ _INGRESS_PARAMS = (
 )
 
 
-@pytest.mark.backlog("RM-008")
+@pytest.mark.backlog_fixed("RM-008")
 def test_ingress_connection_rate_limiter_parameters(rust_mongo: Any, mongod: Any) -> None:
     """`TestConnectionPoolBackpressure` sets mongod's ingress connection rate
     limiter; mongod 8.2.11 reports all four parameters through `getParameter`."""
@@ -110,6 +110,78 @@ def test_ingress_connection_rate_limiter_parameters(rust_mongo: Any, mongod: Any
             )
         )
     assert answers["rust"] == answers["mongod"]
+
+
+def _admitted(client: Any, queue: int) -> list:
+    """Six connections opened at once with the limiter at one connection a
+    second, a burst of one and `queue` allowed to wait: which were answered,
+    and roughly how long each waited."""
+    import socket
+    import struct
+    import threading
+    import time
+
+    import bson
+
+    host, port = client.address
+    admin = client.admin
+
+    def hello() -> Any:
+        s = socket.create_connection((host, port), timeout=10)
+        body = bson.encode({"hello": 1, "$db": "admin"})
+        s.sendall(
+            struct.pack("<iiii", 21 + len(body), 1, 0, 2013) + struct.pack("<I", 0) + b"\x00" + body
+        )
+        started = time.monotonic()
+        try:
+            header = s.recv(16)
+            return (
+                ("answered", round(time.monotonic() - started))
+                if len(header) == 16
+                else ("closed", 0)
+            )
+        except OSError:
+            return ("closed", 0)
+        finally:
+            s.close()
+
+    admin.command(
+        "setParameter",
+        1,
+        ingressConnectionEstablishmentRatePerSec=1,
+        ingressConnectionEstablishmentBurstCapacitySecs=1,
+        ingressConnectionEstablishmentMaxQueueDepth=queue,
+    )
+    admin.command("setParameter", 1, ingressConnectionEstablishmentRateLimiterEnabled=True)
+    try:
+        time.sleep(1.2)  # a full bucket
+        results: list = [None] * 6
+        threads = [
+            threading.Thread(target=lambda i=i: results.__setitem__(i, hello())) for i in range(6)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return sorted(results)
+    finally:
+        admin.command("setParameter", 1, ingressConnectionEstablishmentRateLimiterEnabled=False)
+        admin.command(
+            "setParameter",
+            1,
+            ingressConnectionEstablishmentRatePerSec=2147483647,
+            ingressConnectionEstablishmentBurstCapacitySecs=1.7976931348623157e308,
+            ingressConnectionEstablishmentMaxQueueDepth=0,
+        )
+
+
+@pytest.mark.backlog_fixed("RM-008")
+def test_ingress_rate_limiter_admits_queues_and_closes(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11's limiter at one a second: the token in the bucket
+    admits one connection, up to `maxQueueDepth` more wait a second each,
+    and the rest are closed unanswered."""
+    for queue in (0, 2):
+        assert _admitted(rust_mongo, queue) == _admitted(mongod, queue), queue
 
 
 @pytest.mark.backlog_fixed("RM-010")

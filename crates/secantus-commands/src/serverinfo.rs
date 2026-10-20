@@ -537,6 +537,28 @@ fn parameters(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
             false,
             Bson::Document(doc! {"version": format!("{}.{}", version[0], version[1])}),
         ),
+        // The connection-establishment rate limiter (`params::IngressBucket`),
+        // with mongod 8.2.11's defaults: off, and no limit when on.
+        (
+            "ingressConnectionEstablishmentBurstCapacitySecs",
+            true,
+            Bson::Double(f64::MAX),
+        ),
+        (
+            "ingressConnectionEstablishmentMaxQueueDepth",
+            true,
+            Bson::Int32(0),
+        ),
+        (
+            "ingressConnectionEstablishmentRateLimiterEnabled",
+            true,
+            Bson::Boolean(false),
+        ),
+        (
+            "ingressConnectionEstablishmentRatePerSec",
+            true,
+            Bson::Int32(i32::MAX),
+        ),
         ("localLogicalSessionTimeoutMinutes", true, Bson::Int32(30)),
         ("logLevel", true, Bson::Int32(0)),
         // Honoured: a query the planner would answer with a collection scan

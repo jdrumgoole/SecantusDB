@@ -475,6 +475,15 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                 // count, not a JoinHandle.
                 thread::spawn(move || {
                     let guard = ConnGuard::new(active);
+                    // mongod's connection-establishment rate limiter: a
+                    // connection over the rate waits its turn or is closed
+                    // unanswered (`ServerParams::admit_connection`).
+                    if !conn_shared.server_params.admit_connection() {
+                        refuse_unanswered(stream);
+                        drop(conn_shared);
+                        drop(guard);
+                        return;
+                    }
                     let _ = handle_connection(stream, conn_shared);
                     // `conn_shared` (and every per-request storage clone) is now
                     // dropped; only then decrement, so a zero count guarantees no
@@ -488,6 +497,20 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
             Err(_) => break,
         }
     }
+}
+
+/// Close a connection the rate limiter refused, as mongod does: with no
+/// reply, and a FIN rather than a reset. What the client already sent is
+/// read and discarded first, because closing a socket with unread data in
+/// it resets the connection.
+fn refuse_unanswered(stream: TcpStream) {
+    use std::io::Read;
+    let mut stream = stream;
+    if stream.set_nonblocking(true).is_ok() {
+        let mut sink = [0u8; 4096];
+        while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+    }
+    let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
 /// Per-connection setup: read-timeout (for shutdown polling), then either the

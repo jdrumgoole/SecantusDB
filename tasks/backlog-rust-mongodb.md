@@ -226,49 +226,34 @@ These are explicit non-goals. Don't add them without a reason.
 ## 5. Known bugs and edge cases to watch
 
 
-- [ ] **OPEN — the Go gauge's remaining failures, triaged (2026-09-29; 6
-      leaves as of the 2026-10-15 run).** The gauge completes 659 of 659 and
-      reads 598 / 12 / 49 = 98.0% (`docs/validation-report-go-rust-server.md`,
-      measured 2026-10-15, the same six leaves as 2026-10-09;
-      `TestSDAMProse/heartbeats_processed_more_frequently` passes). The 12
-      fail events are 6 distinct leaves:
+- [ ] **OPEN — the Go gauge's two mongocryptd leaves: confirm how session
+      support is advertised.** The gauge completes 659 of 659 and read 598 /
+      12 / 49 = 98.0% on 2026-10-15 (`docs/validation-report-go-rust-server.md`).
+      Its six failing leaves, as of 2026-10-20:
 
       | leaf | needs |
       | --- | --- |
-      | `TestConnectionPoolBackpressure` | an ingress rate limiter AND `$where` |
+      | `TestConnectionPoolBackpressure` | `$where` (the ingress rate limiter it sets is honoured since 2026-10-20) |
       | `TestSDAMErrorHandling/.../pool_not_cleared_on_timeout_network_error` | `$where` |
       | `TestSDAMErrorHandling/.../pool_not_cleared_on_context_cancellation` | `$where` |
       | `TestRetryableReadsProse/.../overload_errors_retried_on_a_different_replicaset_server` | a second replica-set member (non-goal) |
       | `TestSessionsMongocryptdProse/18.` | a `mongocryptd` binary on PATH |
       | `TestSessionsMongocryptdProse/19.` | a `mongocryptd` binary on PATH |
 
-      * **`TestConnectionPoolBackpressure`** sets four
-        `ingressConnectionEstablishment*` parameters — a real mongod
-        connection rate limiter we have no equivalent of — then fires 100
-        concurrent finds with `$where: sleep(2000)` and asserts ≥10 checkout
-        FAILURES. It needs (a) that rate limiter and (b) server-side
-        JavaScript. `setParameter` refuses those parameters deliberately
-        rather than accepting names we do not honour.
-      * **The two `TestSDAMErrorHandling` cases are not pool-clearing bugs.**
-        Both issue a `find` with
-        `{$where: "function() { sleep(1000); return false; }"}` and abandon it
-        client-side after 100ms; the pool assertion is never reached. A real
-        `mongod --noscripting` fails them with byte-identical messages. They
-        stay red and un-skipped deliberately: excluding them would hide the
-        `$where` gap, and they will pass by themselves if a script engine
-        ever lands. The sibling `pool_cleared_on_non-timeout_network_error`
-        passes.
-      * **The two mongocryptd cases** need a server that reports NO
-        `logicalSessionTimeoutMinutes` (the mongocryptd shape). Likely out of
-        scope with CSFLE, but the mechanism — how we advertise session
-        support — is ours, so confirm rather than assume.
-
-      Reproduce any of them directly rather than through the gauge:
-      `cd vendor/mongo-go-driver && MONGODB_URI=mongodb://127.0.0.1:<port> go test
-      ./internal/integration/ -run '<TestName>' -timeout 60s -count=1 -v`
-      against a daemon WITHOUT `--standalone` (several are replica-set-gated).
+      The three `$where` leaves fail on a `mongod --noscripting` 8.2.11 the
+      same way (measured 2026-10-20 for the backpressure test: 1 checkout
+      failure of the 10 it wants) and are recorded as expected failures
+      (`validation_summary/expected_failures.py`); no JavaScript engine is
+      built (scope decision, Joe 2026-10-16). What is left: the two
+      mongocryptd cases need a server that reports NO
+      `logicalSessionTimeoutMinutes` (the mongocryptd shape). Likely out of
+      scope with CSFLE, but how this server advertises session support is
+      its own, so confirm it with a mongocryptd binary rather than assume.
+      Reproduce: `cd vendor/mongo-go-driver && MONGODB_URI=mongodb://127.0.0.1:<port>
+      go test ./internal/integration/ -run '<TestName>' -timeout 60s -count=1 -v`
+      against a daemon WITHOUT `--standalone`.
       Backlog-ID: RM-008
-      Verify: tests/backlog/test_rm_001_028.py::test_ingress_connection_rate_limiter_parameters
+      Verify: none -- needs a mongocryptd binary (MongoDB Enterprise) to compare with
 
 - **Scope decision — no server-side JavaScript** (Joe, 2026-10-16,
   formerly RM-009). `$where`, `$function`, `$accumulator` and `mapReduce`
@@ -276,10 +261,10 @@ These are explicit non-goals. Don't add them without a reason.
   query, 2 in an aggregation `$match`, 31264 for mapReduce); MongoDB
   deprecated all four in 8.0. Pinned by
   `tests/test_mongod_differential.py::test_where_refusal_matches_a_scriptless_mongod`
-  / `::test_where_in_aggregate_match_is_a_context_error`. The two Go
-  `TestSDAMErrorHandling` leaves that need a `$where` to run are expected
-  failures; `TestConnectionPoolBackpressure` is not, because it also needs
-  the ingress rate limiter (RM-008).
+  / `::test_where_in_aggregate_match_is_a_context_error`. The three Go
+  leaves that need a `$where` to run (the two `TestSDAMErrorHandling` cases
+  and `TestConnectionPoolBackpressure`, whose rate limiter is honoured since
+  2026-10-20) are expected failures.
 
 - **Not a defect: the C gauge's two `/Client/ipv6/single` failures.** The
       test hard-codes `[::1]:27017` (documented as inherent); they are the gauge's only failures (790 / 2 / 46 of 838 with both

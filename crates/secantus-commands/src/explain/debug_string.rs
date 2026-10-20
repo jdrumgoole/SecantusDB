@@ -327,19 +327,30 @@ fn double(d: f64) -> String {
 
 /// C's `%.16g`.
 fn g16(d: f64) -> String {
-    const P: i32 = 16;
+    g(d, 16)
+}
+
+/// C's `%.<precision>g` (C++'s default stream format at precision 6).
+pub(crate) fn g(d: f64, precision: i32) -> String {
+    if d.is_nan() {
+        return "nan".to_string();
+    }
+    if d.is_infinite() {
+        return if d > 0.0 { "inf" } else { "-inf" }.to_string();
+    }
+    let p = precision;
     if d == 0.0 {
         return if d.is_sign_negative() { "-0" } else { "0" }.to_string();
     }
-    let sci = format!("{:.*e}", (P - 1) as usize, d);
+    let sci = format!("{:.*e}", (p - 1) as usize, d);
     let (mantissa, exp) = sci.split_once('e').expect("exponent");
     let exp: i32 = exp.parse().expect("exponent digits");
-    if !(-4..P).contains(&exp) {
+    if !(-4..p).contains(&exp) {
         let mantissa = trim_zeros(mantissa);
         let sign = if exp < 0 { '-' } else { '+' };
         format!("{mantissa}e{sign}{:02}", exp.abs())
     } else {
-        let decimals = (P - 1 - exp).max(0) as usize;
+        let decimals = (p - 1 - exp).max(0) as usize;
         trim_zeros(&format!("{d:.decimals$}")).to_string()
     }
 }

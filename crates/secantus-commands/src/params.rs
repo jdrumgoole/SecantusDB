@@ -96,6 +96,10 @@ pub enum ParamKind {
     /// A 32-bit whole number of at least the given value
     /// (`transactionLifetimeLimitSeconds` 1, the SCRAM iteration counts 5000).
     Int32AtLeast(i32),
+    /// A number greater than zero, stored as a double
+    /// (`ingressConnectionEstablishmentBurstCapacitySecs`). Any number type is
+    /// taken; a bool, a string or null is not (mongod 8.2.11).
+    DoubleAboveZero,
 }
 
 /// `(name, kind)` for every runtime-settable parameter.
@@ -125,6 +129,24 @@ const SETTABLE: &[(&str, ParamKind)] = &[
     // either at 5000 or more (measured 2026-10-20).
     ("scramIterationCount", ParamKind::Int32AtLeast(5000)),
     ("scramSHA256IterationCount", ParamKind::Int32AtLeast(5000)),
+    // mongod's connection-establishment rate limiter, honoured by
+    // `IngressLimiter::admit` for every connection the server accepts.
+    (
+        "ingressConnectionEstablishmentRateLimiterEnabled",
+        ParamKind::Bool,
+    ),
+    (
+        "ingressConnectionEstablishmentRatePerSec",
+        ParamKind::Int32AtLeast(1),
+    ),
+    (
+        "ingressConnectionEstablishmentBurstCapacitySecs",
+        ParamKind::DoubleAboveZero,
+    ),
+    (
+        "ingressConnectionEstablishmentMaxQueueDepth",
+        ParamKind::Int32AtLeast(0),
+    ),
 ];
 
 /// mongod's highest log level; `setParameter` clamps rather than refusing.
@@ -164,6 +186,22 @@ pub struct ServerParams {
     /// The feature compatibility version, once read from
     /// `admin.system.version` (`cluster_admin::current_fcv`) or set.
     fcv: Mutex<Option<String>>,
+    /// The connection-establishment token bucket (`admit_connection`).
+    ingress: Mutex<IngressBucket>,
+}
+
+/// mongod's connection-establishment rate limiter (8.2.11, measured
+/// 2026-10-20): a bucket of `ratePerSec x burstCapacitySecs` tokens, filled
+/// at `ratePerSec`. A connection takes a token; with none it waits its turn,
+/// a token's time each, while no more than `maxQueueDepth` connections are
+/// waiting, and past that it is closed with no reply.
+#[derive(Default)]
+struct IngressBucket {
+    /// Tokens in the bucket, negative while connections are reserved
+    /// against tokens still to come.
+    tokens: f64,
+    filled: Option<std::time::Instant>,
+    waiting: usize,
 }
 
 impl ServerParams {
@@ -220,6 +258,56 @@ impl ServerParams {
                     .collect()
             },
         )
+    }
+
+    /// Whether a connection being established may go ahead, as mongod's
+    /// ingress rate limiter decides: at once, after waiting its turn, or
+    /// not at all (`false`: close it unanswered).
+    pub fn admit_connection(&self) -> bool {
+        let truthy = |name: &str| matches!(self.get(name), Some(Bson::Boolean(true)));
+        if !truthy("ingressConnectionEstablishmentRateLimiterEnabled") {
+            return true;
+        }
+        let number = |name: &str, default: f64| match self.get(name) {
+            Some(Bson::Int32(n)) => f64::from(n),
+            Some(Bson::Double(d)) => d,
+            _ => default,
+        };
+        let rate = number(
+            "ingressConnectionEstablishmentRatePerSec",
+            f64::from(i32::MAX),
+        );
+        let burst = number("ingressConnectionEstablishmentBurstCapacitySecs", f64::MAX);
+        let queue = number("ingressConnectionEstablishmentMaxQueueDepth", 0.0) as usize;
+        let capacity = (rate * burst).min(f64::from(i32::MAX)).max(1.0);
+        let wait = {
+            let Ok(mut bucket) = self.ingress.lock() else {
+                return true;
+            };
+            let now = std::time::Instant::now();
+            bucket.tokens = match bucket.filled {
+                None => capacity,
+                Some(then) => {
+                    (bucket.tokens + now.duration_since(then).as_secs_f64() * rate).min(capacity)
+                }
+            };
+            bucket.filled = Some(now);
+            if bucket.tokens >= 1.0 {
+                bucket.tokens -= 1.0;
+                return true;
+            }
+            if bucket.waiting >= queue {
+                return false;
+            }
+            bucket.tokens -= 1.0;
+            bucket.waiting += 1;
+            std::time::Duration::from_secs_f64((-bucket.tokens) / rate)
+        };
+        std::thread::sleep(wait);
+        if let Ok(mut bucket) = self.ingress.lock() {
+            bucket.waiting -= 1;
+        }
+        true
     }
 
     /// The feature compatibility version, if it has been read or set.
@@ -333,6 +421,10 @@ fn coerce(kind: ParamKind, value: &Bson) -> Option<Bson> {
             Ok(n) if n >= i64::from(min) => Some(Bson::Int32(n as i32)),
             _ => None,
         },
+        ParamKind::DoubleAboveZero => match double(value) {
+            Some(d) if d > 0.0 => Some(Bson::Double(d)),
+            _ => None,
+        },
         ParamKind::PositiveInt => match whole(value) {
             Some(n) if n > 0 => Some(Bson::Int32(n.min(i64::from(i32::MAX)) as i32)),
             _ => None,
@@ -344,6 +436,17 @@ fn coerce(kind: ParamKind, value: &Bson) -> Option<Bson> {
                 Bson::Boolean(false) | Bson::Null | Bson::Int32(0) | Bson::Int64(0)
             ) && *value != Bson::Double(0.0),
         )),
+    }
+}
+
+/// Any number as a double, or `None` for anything else (a bool included).
+fn double(value: &Bson) -> Option<f64> {
+    match value {
+        Bson::Int32(i) => Some(f64::from(*i)),
+        Bson::Int64(i) => Some(*i as f64),
+        Bson::Double(d) => Some(*d),
+        Bson::Decimal128(d) => d.to_string().parse().ok(),
+        _ => None,
     }
 }
 
@@ -404,6 +507,15 @@ fn refusal(kind: ParamKind, name: &str, value: &Bson) -> String {
                 "Invalid value for parameter {name}: {n} is not greater than or equal to {}",
                 min.unwrap_or(1)
             ),
+        };
+    }
+    if kind == ParamKind::DoubleAboveZero {
+        return match double(value) {
+            Some(d) => format!(
+                "Invalid value for parameter {name}: {} is not greater than 0",
+                crate::explain::debug_string::g(d, 6)
+            ),
+            None => format!("Failed validating {name}: Unable to coerce value to correct type"),
         };
     }
     match (kind, whole(value)) {
@@ -512,7 +624,13 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
 
     let store = ctx.server_params.clone();
     let mut out = Document::new();
-    for (i, (name, value)) in requested.iter().enumerate() {
+    // mongod reports a single `was`: the previous value of the parameter
+    // whose NAME sorts first, whatever order they were given in (measured
+    // 8.2.11, 2026-10-20: `{quiet, logLevel}` reports logLevel's, and
+    // `{ttlMonitorSleepSecs, cursorTimeoutMillis, logLevel}`
+    // cursorTimeoutMillis's).
+    let first = requested.iter().map(|(name, _)| name.as_str()).min();
+    for (name, value) in &requested {
         let previous = crate::serverinfo::ttl_monitor_param(ctx, name)
             .or_else(|| store.as_ref().and_then(|s| s.get(name)))
             .or_else(|| defaults.get(name.as_str()).cloned())
@@ -556,10 +674,7 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
                 s.set(name, coerced);
             }
         }
-        // mongod reports a single `was`, the FIRST named parameter's previous
-        // value, even when several are set in one call (measured: setting
-        // `logLevel` and `quiet` together reported `was: 0`, logLevel's).
-        if i == 0 {
+        if Some(name.as_str()) == first {
             out.insert("was", previous);
         }
     }
@@ -623,6 +738,83 @@ mod tests {
             c.server_params.as_ref().unwrap().scram_iterations(),
             (Some(12000), Some(12000))
         );
+    }
+
+    /// The ingress rate limiter's parameters (mongod 8.2.11, 2026-10-20).
+    #[test]
+    fn the_ingress_parameters_coerce_and_refuse_as_mongod_does() {
+        let mut c = ctx();
+        let burst = "ingressConnectionEstablishmentBurstCapacitySecs";
+        set_parameter(&doc! {"setParameter": 1, burst: 5}, &mut c).unwrap();
+        assert_eq!(
+            c.server_params.as_ref().unwrap().get(burst),
+            Some(Bson::Double(5.0))
+        );
+        for (bad, words) in [
+            (
+                Bson::Int32(0),
+                format!("Invalid value for parameter {burst}: 0 is not greater than 0"),
+            ),
+            (
+                Bson::Double(-1.5),
+                format!("Invalid value for parameter {burst}: -1.5 is not greater than 0"),
+            ),
+            (
+                Bson::Double(f64::NAN),
+                format!("Invalid value for parameter {burst}: nan is not greater than 0"),
+            ),
+            (
+                Bson::Boolean(true),
+                format!("Failed validating {burst}: Unable to coerce value to correct type"),
+            ),
+        ] {
+            let e = set_parameter(&doc! {"setParameter": 1, burst: bad}, &mut c).unwrap_err();
+            assert_eq!(e.errmsg, words);
+        }
+        let depth = "ingressConnectionEstablishmentMaxQueueDepth";
+        let e = set_parameter(&doc! {"setParameter": 1, depth: -1}, &mut c).unwrap_err();
+        assert_eq!(
+            e.errmsg,
+            format!("Invalid value for parameter {depth}: -1 is not greater than or equal to 0")
+        );
+        let rate = "ingressConnectionEstablishmentRatePerSec";
+        set_parameter(&doc! {"setParameter": 1, rate: 1.9}, &mut c).unwrap();
+        assert_eq!(
+            c.server_params.as_ref().unwrap().get(rate),
+            Some(Bson::Int32(1))
+        );
+    }
+
+    /// `was` is the previous value of the parameter whose name sorts first.
+    #[test]
+    fn was_reports_the_parameter_whose_name_sorts_first() {
+        let mut c = ctx();
+        set_parameter(&doc! {"setParameter": 1, "logLevel": 2}, &mut c).unwrap();
+        let r = set_parameter(
+            &doc! {"setParameter": 1, "quiet": true, "logLevel": 0},
+            &mut c,
+        )
+        .unwrap();
+        assert_eq!(r.get_i32("was"), Ok(2));
+    }
+
+    /// The bucket: a full one admits one connection a token; with the
+    /// limiter off every connection goes ahead.
+    #[test]
+    fn the_bucket_admits_a_token_at_a_time() {
+        let params = ServerParams::new();
+        assert!(params.admit_connection());
+        params.set(
+            "ingressConnectionEstablishmentRateLimiterEnabled",
+            Bson::Boolean(true),
+        );
+        params.set("ingressConnectionEstablishmentRatePerSec", Bson::Int32(1));
+        params.set(
+            "ingressConnectionEstablishmentBurstCapacitySecs",
+            Bson::Double(1.0),
+        );
+        assert!(params.admit_connection());
+        assert!(!params.admit_connection());
     }
 
     /// The TTL monitor's two parameters (mongod 8.2.11, 2026-10-10). Both
