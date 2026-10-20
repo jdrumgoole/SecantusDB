@@ -2387,6 +2387,16 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             .or_else(|| {
                 (!exists && held + built_here.len() >= MAX_INDEXES)
                     .then(|| (BuildStep::Prepare, BuildProblem::Refused(67, too_many())))
+            })
+            // A user write block refuses a new index as its build starts.
+            .or_else(|| {
+                let reason = (!exists)
+                    .then(|| storage.user_write_block_for(&ctx.db_name))
+                    .flatten()?;
+                Some((
+                    BuildStep::Init,
+                    BuildProblem::Refused(371, format!("User writes blocked, reason: {reason}")),
+                ))
             });
         if let Some((step, problem)) = refused {
             let e = build_failure(
@@ -4267,22 +4277,40 @@ pub fn current_op(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .and_then(|a| a.lock().ok())
         .and_then(|g| g.client_metadata.clone());
 
-    let mut op = doc! {
-        "type": "op",
-        "host": "secantus",
-        "desc": "conn",
-        "connectionId": Bson::Int64(ctx.connection_id),
-        "active": true,
-        "op": "command",
-        "ns": format!("{}.$cmd", ctx.db_name),
-        "command": doc.clone(),
-        "opid": Bson::Int64(ctx.connection_id),
-        "secs_running": Bson::Int64(0),
-        "microsecs_running": Bson::Int64(0),
+    // Every running operation, from the registry (RM-216); with none wired
+    // in (an off-server context), this request alone.
+    let ops: Vec<Document> = match &ctx.ops {
+        Some(registry) => {
+            let host = match &ctx.server_address {
+                Some((h, p)) => format!("{h}:{p}"),
+                None => "secantus".to_string(),
+            };
+            registry
+                .snapshot()
+                .iter()
+                .map(|op| op.describe(&host))
+                .collect()
+        }
+        None => {
+            let mut op = doc! {
+                "type": "op",
+                "host": "secantus",
+                "desc": "conn",
+                "connectionId": Bson::Int64(ctx.connection_id),
+                "active": true,
+                "op": "command",
+                "ns": format!("{}.$cmd", ctx.db_name),
+                "command": doc.clone(),
+                "opid": Bson::Int64(ctx.connection_id),
+                "secs_running": Bson::Int64(0),
+                "microsecs_running": Bson::Int64(0),
+            };
+            if let Some(meta) = client_metadata {
+                op.insert("clientMetadata", meta);
+            }
+            vec![op]
+        }
     };
-    if let Some(meta) = client_metadata {
-        op.insert("clientMetadata", meta);
-    }
 
     // Every field that is not the command's own is a filter over the
     // operations (`{currentOp: 1, op: "query"}`).
@@ -4295,13 +4323,15 @@ pub fn current_op(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    let shown = filter.is_empty()
-        || secantus_core::query::matches(&op, &filter, &Document::new(), None).unwrap_or(false);
-    let inprog: Vec<Bson> = if shown {
-        vec![Bson::Document(op)]
-    } else {
-        Vec::new()
-    };
+    let inprog: Vec<Bson> = ops
+        .into_iter()
+        .filter(|op| {
+            filter.is_empty()
+                || secantus_core::query::matches(op, &filter, &Document::new(), None)
+                    .unwrap_or(false)
+        })
+        .map(Bson::Document)
+        .collect();
     Ok(doc! { "inprog": inprog, "ok": 1.0 })
 }
 

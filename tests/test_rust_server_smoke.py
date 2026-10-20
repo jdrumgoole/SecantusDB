@@ -630,9 +630,10 @@ def test_secantus_grant_revoke_roles_to_user(tmp_path) -> None:
         srv.stop()
 
 
-def test_kill_op_closes_a_connection(tmp_path) -> None:
-    """killOp closes another connection by its conn_id (from hello.connectionId)
-    and reports {info, ok} (issue #163). The reply does not say whether an
+def test_kill_op_acts_on_an_operation_id(tmp_path) -> None:
+    """killOp reports {info, ok} (issue #163) and acts on the OPERATION its
+    opid names, closing no connection (RM-216: it used to close the
+    connection whose id matched). The reply does not say whether an
     operation had that id: mongod 8.2.11 answers "attempting to kill op" to
     an id nobody holds."""
     srv = _server.RustServer(str(tmp_path / "wt"), 0)

@@ -400,7 +400,74 @@ def test_diagnostic_stages(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F8
     assert _stages(rust_mongo) == _stages(mongod_rs)
 
 
+def _list_sampled_queries(client: Any) -> list:
+    out = []
+    for db, target, spec in [
+        ("admin", 1, {}),
+        ("admin", 1, {"namespace": "rm215.c", "other": 1}),
+        ("admin", 1, {"namespace": 5}),
+        ("admin", 1, {"namespace": "bad"}),
+        ("admin", 1, 5),
+        ("rm215", 1, {}),
+        ("admin", "c", {}),
+    ]:
+        out.append(
+            answer(
+                lambda db=db, target=target, spec=spec: client[db].command(
+                    "aggregate", target, pipeline=[{"$listSampledQueries": spec}], cursor={}
+                )["cursor"]["firstBatch"]
+            )
+        )
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-215")
+def test_list_sampled_queries_as_mongod(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """mongod 8.2.11 lists no sampled queries on a set that never configured
+    a query analyzer -- this server has none -- and checks the stage's
+    argument and placement (6876000, 14, 73)."""
+    assert _list_sampled_queries(rust_mongo) == _list_sampled_queries(mongod_rs)
+
+
 # ------------------------------------------------ RM-216 operation registry --
+
+
+@pytest.mark.backlog_fixed("RM-216")
+def test_kill_op_interrupts_a_long_find(rust_mongo: Any) -> None:
+    """mongod 8.2.11 ends a find that `killOp` names, mid-scan, with 11601
+    "Executor error during find command: <ns> :: caused by :: operation was
+    interrupted" (measured 2026-10-20 over 200,000 documents). The scan
+    reads the kill where it reads its deadline."""
+    db = _db(rust_mongo, "rm216k")
+    for start in range(0, 200_000, 20_000):
+        db.big.insert_many([{"_id": i, "s": f"v{i:07d}"} for i in range(start, start + 20_000)])
+    host, port = rust_mongo.address
+    killer = pymongo.MongoClient(host, port, directConnection=True)
+    try:
+        for _ in range(3):
+            got: dict = {}
+            reader = threading.Thread(
+                target=lambda got=got: got.setdefault(
+                    "r", answer(lambda: len(list(db.big.find({"s": {"$regex": "zzz$"}}))))
+                ),
+                daemon=True,
+            )
+            reader.start()
+            killed = False
+            for _ in range(200):
+                time.sleep(0.01)
+                ops = killer.admin.command({"currentOp": 1, "ns": "rm216k.big"})["inprog"]
+                ops = [o for o in ops if o.get("op") == "query"]
+                if ops:
+                    killer.admin.command("killOp", op=ops[0]["opid"])
+                    killed = True
+                    break
+            reader.join(60)
+            if killed and got.get("r", ("ok",))[0] == "err":
+                break
+        assert got.get("r") == ("err", 11601)
+    finally:
+        killer.close()
 
 
 def _idle_cursors(client: Any) -> tuple:
@@ -427,7 +494,7 @@ def _idle_cursors(client: Any) -> tuple:
         other.close()
 
 
-@pytest.mark.backlog("RM-216")
+@pytest.mark.backlog_fixed("RM-216")
 def test_current_op_lists_idle_cursors(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 lists another client's open cursor under
     `$currentOp: {idleCursors: true}` (1 entry)."""
@@ -464,7 +531,7 @@ def _running_op(client: Any) -> tuple:
         other.close()
 
 
-@pytest.mark.backlog("RM-216")
+@pytest.mark.backlog_fixed("RM-216")
 def test_current_op_sees_a_running_operation(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `currentOp` lists another client's getMore waiting on
     a tailable awaitData cursor (1 entry, op "getmore"), and `killOp` on its

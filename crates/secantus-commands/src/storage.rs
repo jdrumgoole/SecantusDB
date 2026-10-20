@@ -790,6 +790,31 @@ pub trait Storage: Send + Sync {
         Ok(())
     }
 
+    /// The reason user writes are blocked (`setUserWriteBlockMode`), or
+    /// `None`. Default: never blocked.
+    fn user_writes_blocked(&self) -> Option<String> {
+        None
+    }
+
+    /// Block user writes for `reason`, or lift the block with `None`.
+    fn set_user_write_block(&self, _reason: Option<&str>) -> Result<(), StorageError> {
+        Err(StorageError::Internal(
+            "setUserWriteBlockMode: this storage backend cannot block writes".into(),
+        ))
+    }
+
+    /// The reason a write to `db` by this thread would be refused now, or
+    /// `None` (not blocked, an internal database, or the thread bypasses).
+    fn user_write_block_for(&self, _db: &str) -> Option<String> {
+        None
+    }
+
+    /// Let this thread's writes pass a user write block while the returned
+    /// guard lives (`bypassWriteBlockingMode`).
+    fn bypass_user_write_block(&self) -> Option<Box<dyn std::any::Any>> {
+        None
+    }
+
     /// Force a checkpoint and write a backup `.tar.gz` of the WiredTiger home to
     /// `output_path`, returning `(path, size_bytes)`. Backs `secantusAdmin.backupArchive`
     /// (PITR). Default: unsupported (test fakes have no on-disk state); the WT

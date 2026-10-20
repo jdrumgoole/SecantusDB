@@ -947,10 +947,21 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             if now >= deadline {
                 break;
             }
+            // `killOp` ends the wait (mongod 8.2.11: 11601 under the getMore
+            // executor's wrapper). Checked at least every 100 ms.
+            if crate::ops::current_killed() {
+                return Ok(CommandError::new(
+                    11601,
+                    "Interrupted",
+                    "Executor error during getMore :: caused by :: operation was interrupted",
+                )
+                .into_reply());
+            }
             // Block on the storage oplog condvar until it advances past
             // `position` or the deadline; then re-poll (the producer reads the
             // newly-appended entries). killCursors wakes this via notify.
-            storage.wait_for_oplog(position, (deadline - now).as_millis() as u64);
+            let slice = (deadline - now).min(Duration::from_millis(100));
+            storage.wait_for_oplog(position, slice.as_millis() as u64);
             awaited += now.elapsed();
         }
         ctx.awaited.set(ctx.awaited.get() + awaited);

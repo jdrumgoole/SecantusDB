@@ -45,6 +45,7 @@ pub mod update;
 // part of the crate's public surface (kept crate-private so their deliberate
 // `Result<_, ()>` "defer" signals stay internal rather than public API).
 mod decimal;
+pub use decimal::{decimal_to_i64_exact, decimal_to_i64_saturating};
 mod densify;
 mod explain;
 pub mod expr_rewrite;

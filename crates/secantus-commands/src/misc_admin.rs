@@ -212,3 +212,126 @@ pub fn filemd5(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let digest: String = md5.finalize().iter().map(|b| format!("{b:02x}")).collect();
     Ok(doc! {"numChunks": count, "md5": digest, "ok": 1.0})
 }
+
+/// The reasons `setUserWriteBlockMode` takes, as mongod 8.2.11 names them.
+const WRITE_BLOCK_REASONS: &[&str] = &[
+    "Unspecified",
+    "ClusterToClusterMigrationInProgress",
+    "DiskUseThresholdExceeded",
+];
+
+/// `setUserWriteBlockMode`: block every write to a database other than
+/// `admin`, `config` and `local` (371 UserWritesBlocked) until it is lifted
+/// with the reason it was set with. The block is refused at the write
+/// itself, so a command that would change nothing still succeeds; it
+/// persists in `config.user_writes_critical_sections`, as mongod's does, and
+/// a user holding `bypassWriteBlockingMode` writes past it. Measured on
+/// mongod 8.2.11 (2026-10-20), which refuses it on a standalone.
+pub fn set_user_write_block_mode(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let mut global = None;
+    let mut reason = "Unspecified".to_string();
+    for (k, v) in doc.iter().skip(1) {
+        match k.as_str() {
+            "global" => match v {
+                Bson::Boolean(b) => global = Some(*b),
+                other => return Err(wrong_type("setUserWriteBlockMode.global", other, "bool")),
+            },
+            "reason" => match v {
+                Bson::String(s) if WRITE_BLOCK_REASONS.contains(&s.as_str()) => reason = s.clone(),
+                Bson::String(s) => {
+                    return Err(CommandError::new(
+                        2,
+                        "BadValue",
+                        format!(
+                            "Enumeration value '{s}' for field 'setUserWriteBlockMode.reason' is \
+                             not a valid value."
+                        ),
+                    ))
+                }
+                other => return Err(wrong_type("setUserWriteBlockMode.reason", other, "string")),
+            },
+            k if crate::params::is_generic_arg(k) => {}
+            k => {
+                return Err(CommandError::new(
+                    40415,
+                    "IDLUnknownField",
+                    format!("BSON field 'setUserWriteBlockMode.{k}' is an unknown field."),
+                ))
+            }
+        }
+    }
+    let Some(global) = global else {
+        return Err(CommandError::new(
+            40414,
+            "IDLFailedToParse",
+            "BSON field 'setUserWriteBlockMode.global' is missing but a required field",
+        ));
+    };
+    if ctx.replica_set_name.is_none() {
+        return Err(CommandError::new(
+            20,
+            "IllegalOperation",
+            "setUserWriteBlockMode cannot be run on standalones",
+        ));
+    }
+    let storage = ctx.storage()?;
+    let current = storage.user_writes_blocked();
+    match (global, current) {
+        (true, Some(current)) if current != reason => Err(CommandError::new(
+            20,
+            "IllegalOperation",
+            format!(
+                "Cannot acquire user writes critical section with different options than the \
+                 already existing one. reason: {reason}, current: {current}"
+            ),
+        )),
+        (true, Some(_)) => Ok(doc! {"ok": 1.0}),
+        (true, None) => {
+            storage
+                .set_user_write_block(Some(&reason))
+                .map_err(crate::util::command_error)?;
+            Ok(doc! {"ok": 1.0})
+        }
+        (false, Some(current)) if current != reason => Err(CommandError::new(
+            20,
+            "IllegalOperation",
+            format!(
+                "Cannot release user writes critical section with different reason than the \
+                 already existing one. reason: {reason}, current: {current}"
+            ),
+        )),
+        (false, Some(_)) => {
+            storage
+                .set_user_write_block(None)
+                .map_err(crate::util::command_error)?;
+            Ok(doc! {"ok": 1.0})
+        }
+        (false, None) => Ok(doc! {"ok": 1.0}),
+    }
+}
+
+/// A guard that lets this command's writes pass a user write block: for an
+/// authenticated user holding `bypassWriteBlockingMode`. With authorization
+/// off no user holds it, and mongod blocks every client (measured 8.2.11).
+pub(crate) fn write_block_bypass(ctx: &CommandContext) -> Option<Box<dyn std::any::Any>> {
+    if !ctx.require_auth {
+        return None;
+    }
+    let storage = ctx.storage.as_ref()?;
+    storage.user_writes_blocked()?;
+    let authenticated = ctx.conn_auth.as_ref().is_some_and(|a| {
+        a.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_authenticated()
+    });
+    if !authenticated {
+        return None;
+    }
+    let az = crate::rbac::effective(ctx).ok()?;
+    az.is_authorized(
+        &crate::privileges::Resource::Cluster,
+        &["bypassWriteBlockingMode"],
+    )
+    .then(|| storage.bypass_user_write_block())
+    .flatten()
+}

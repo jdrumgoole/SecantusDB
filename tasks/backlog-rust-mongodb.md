@@ -565,45 +565,53 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
   every subtype-2 value. mongod 8.2.11 writes the bytes alone, which is not
   a valid subtype-2 value: pymongo refuses to decode the reply. Out of
   scope; nothing reads the old subtype as mongod emits it.
-- [ ] **`$planCacheStats`, `$queryStats` and `$listSampledQueries` are
-      unknown stages** (40324). mongod 8.2.11 runs each on a one-member
-      replica set (an empty result on a fresh one). `$planCacheStats` needs
-      a plan cache, which this server does not keep (§7.075); `$queryStats`
-      needs query-shape statistics, which RM-170 (`includeQueryStatsMetrics`)
-      also lacks.
+- [ ] **`$planCacheStats` and `$queryStats` are unknown stages** (40324).
+      mongod 8.2.11 runs each on a one-member replica set (an empty result
+      on a fresh one, filling as queries run, so an empty answer here would
+      be a stand-in). `$planCacheStats` needs a plan cache, which this server
+      does not keep (§7.075); `$queryStats` needs query-shape statistics,
+      which RM-170 (`includeQueryStatsMetrics`) also lacks.
+      (`$listSampledQueries` landed 2026-10-20: it lists none, truthfully,
+      as no query analyzer exists here.)
       Backlog-ID: RM-215
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_diagnostic_stages
-- [ ] **No registry of running operations, so `currentOp`, `$currentOp`
-      and `killOp` cannot see or stop work.**
-      - `currentOp` does not list another client's waiting getMore; mongod
-        lists it (op `getmore`), and `killOp` on its opid ends it with
-        11601.
-      - `$currentOp` emits one synthetic row (`aggregate.rs`, "keeps no
-        per-op registry"), and `idleCursors: true` lists none of another
-        client's open cursors (mongod: 1).
-      - `killOp` takes a connection id. Measured: given the opid of the
-        caller's own `currentOp` row, it closed the caller's connection.
-      - A long query or index build cannot be found or interrupted.
+- [ ] **The operation rows `currentOp` lists lack mongod's detail.** Since
+      2026-10-20 a registry of running operations stands behind
+      `currentOp`, `$currentOp` (with `idleCursors`) and `killOp`, which
+      ends the operation it names with 11601 wherever it next checks: a
+      waiting getMore, or any scan's deadline poll. Open:
+      - a row has no `currentOpTime`, `lsid`, `planSummary`,
+        `queryFramework`, `numYields`, `locks`, `queues` or `waitingForLock`;
+        a getMore's `cursor` block has only its id; an idle cursor's has no
+        `createdDate`, `lastAccessDate`, `nDocsReturned`, `nBatchesReturned`
+        or `originatingCommand` (the cursor registry does not keep them; its
+        clock is monotonic);
+      - `$currentOp`'s `allUsers`, `idleConnections` and `idleSessions`
+        options are not applied.
       Backlog-ID: RM-216
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_current_op_lists_idle_cursors,tests/backlog/test_rm_found_2026_10_20b.py::test_current_op_sees_a_running_operation
-- [ ] **Ten commands mongod runs are 59 CommandNotFound here.**
+      Verify: none -- the missing fields are mongod's internal accounting; the registry's own tests are backlog_fixed
+- [ ] **Seven commands mongod runs are 59 CommandNotFound here.**
       mongod 8.2.11 (one-member replica set) answers each with success or
       an error of its own:
-      - data: `applyOps` (which `mongorestore --oplogReplay` needs);
       - diagnostics: `getDiagnosticData`, `dbCheck`, `validateDBMetadata`;
-      - settings: `setUserWriteBlockMode`, `setQuerySettings` /
-        `removeQuerySettings`, `setClusterParameter` (mongod keeps the
-        values in `config.clusterParameters`), `autoCompact` (needs
-        background compaction, which RM-192 lacks);
+      - settings: `setQuerySettings` / `removeQuerySettings`, `autoCompact`
+        (needs background compaction, which RM-192 lacks);
       - `rotateCertificates` (TLS has landed; it would re-read the files).
 
       `filemd5` with `partialOk` is refused by name (115): its `md5state` is
-      mongod's own MD5 implementation's state. Seven of the original
-      seventeen landed 2026-10-20 (`invalidateUserCache`, `replSetGetRBID`,
+      mongod's own MD5 implementation's state. Ten of the original
+      seventeen landed 2026-10-20 (`applyOps`, `invalidateUserCache`, `replSetGetRBID`,
       `replSetFreeze`, `replSetMaintenance`, `dropConnections`,
-      `releaseMemory`, `filemd5`). Each left is its own slice, and some
-      (query settings, write blocking) are real features rather than
-      replies.
+      `releaseMemory`, `filemd5`, `setUserWriteBlockMode`,
+      `setClusterParameter`, whose
+      `defaultMaxTimeMS` limits reads; the other parameters govern sharding,
+      queryable encryption, search and serverless change streams, and are
+      kept and reported only). Each left is its own slice, and query
+      settings are a real feature rather than a reply. `applyOps` still
+      refuses a document over 16 MB (mongod applies one a little larger,
+      as oplog application allows) and `importCollection`,
+      `createDatabaseMetadata` and `modifyCollectionShardingIndexCatalog`
+      entries (115).
       Backlog-ID: RM-219
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_commands_mongod_runs_are_commands_here
 - [ ] **A string that is not valid UTF-8 is refused.** An insert whose
@@ -614,6 +622,25 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       would keep them.
       Backlog-ID: RM-222
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_insert_string_with_invalid_utf8
+- [ ] **`local.oplog.rs` entries are not mongod's shape.** The oplog
+      stores an update as the change-stream description it serves
+      (`{updatedFields, removedFields, truncatedArrays}` with dotted paths)
+      and `local.oplog.rs` shows it so, where mongod 8.2.11 logs its `$v: 2`
+      diff (`u` for a changed field, `i` for a new one, `s<field>` for a
+      sub-document, `{a: true, u<i>}` for an array). Also different: a
+      delete carries `o2: {_id}` (mongod: none); a drop has no
+      `o2: {numRecords}`; `createIndexes` is logged with an `indexes` array
+      (mongod: one entry per index, `{createIndexes, v, key, name}`);
+      `dropIndexes` puts the spec in `o.key` / `o.spec` (mongod: `o2`);
+      `renameCollection` has no `stayTemp: false`. A tool that reads the
+      oplog (`mongodump --oplog`, then `mongorestore --oplogReplay`, which
+      `applyOps` now takes) gets entries mongod would not write. The diff
+      cannot be rebuilt from the stored description, which says neither
+      which fields are new nor which path parts are array indexes: the fix
+      writes mongod's diff at write time, from the pre- and post-image, and
+      derives the change stream's description from it as mongod does.
+      Backlog-ID: RM-224
+      Verify: tests/backlog/test_rm_219_apply_ops.py::test_oplog_entries_have_mongods_shape
 
 ### 7.085 The shared Rust storage, audited -- 2026-10-20
 

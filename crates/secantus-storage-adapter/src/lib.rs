@@ -957,6 +957,26 @@ impl CmdStorage for StorageAdapter {
         Ok(())
     }
 
+    fn user_writes_blocked(&self) -> Option<String> {
+        self.inner.user_writes_blocked()
+    }
+
+    fn set_user_write_block(&self, reason: Option<&str>) -> Result<(), StorageError> {
+        match reason {
+            Some(r) => self.inner.block_user_writes(r),
+            None => self.inner.unblock_user_writes(),
+        }
+        .map_err(map_err)
+    }
+
+    fn user_write_block_for(&self, db: &str) -> Option<String> {
+        self.inner.user_write_block_for(db)
+    }
+
+    fn bypass_user_write_block(&self) -> Option<Box<dyn std::any::Any>> {
+        Some(Box::new(secantus_storage::bypass_user_write_block()))
+    }
+
     fn create_archive(&self, output_path: &str) -> Result<(String, u64), StorageError> {
         self.inner
             .create_archive(output_path)

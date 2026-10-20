@@ -38,6 +38,7 @@ pub mod admin;
 mod agg_executor;
 mod agg_meta;
 pub mod aggregate;
+mod apply_ops;
 pub mod argtypes;
 pub mod auth;
 mod authz;
@@ -47,6 +48,7 @@ mod bulkwrite;
 mod capped_admin;
 pub mod changestream;
 pub mod cluster_admin;
+pub mod cluster_params;
 pub mod crud;
 pub mod cursors;
 mod dbhash;
@@ -72,6 +74,7 @@ pub mod mongod_codes;
 mod mongod_commands;
 mod near;
 mod notablescan;
+pub mod ops;
 pub mod params;
 mod privileges;
 mod procstats;
@@ -204,6 +207,9 @@ pub struct CommandContext {
     /// by its `conn_id`. `None` until the server wires one in (and in unit-test
     /// contexts).
     pub conn_killer: Option<Arc<dyn ConnectionKiller>>,
+    /// The server's running operations (`currentOp`, `killOp`). `None` in
+    /// unit-test contexts.
+    pub ops: Option<Arc<ops::OpRegistry>>,
     /// The server's in-memory log ring buffer, read by `getLog`. `None` until the
     /// server wires one in (and in unit-test contexts) — `getLog` then reports an
     /// empty log.
@@ -296,6 +302,7 @@ impl CommandContext {
             failpoints: None,
             close_connection: false,
             conn_killer: None,
+            ops: None,
             logs: None,
             conn_stats: None,
             top_stats: None,
@@ -352,6 +359,12 @@ impl CommandContext {
     /// uses it to close a connection by its `conn_id`.
     pub fn with_conn_killer(mut self, conn_killer: Arc<dyn ConnectionKiller>) -> Self {
         self.conn_killer = Some(conn_killer);
+        self
+    }
+
+    /// Attach the server's registry of running operations (builder-style).
+    pub fn with_ops(mut self, ops: Arc<ops::OpRegistry>) -> Self {
+        self.ops = Some(ops);
         self
     }
 
@@ -671,12 +684,15 @@ fn lookup(name: &str) -> Option<Handler> {
         "replSetResizeOplog" => replset_admin::repl_set_resize_oplog,
         "lockInfo" => replset_admin::lock_info,
         "features" => replset_admin::features,
-        "getClusterParameter" => replset_admin::get_cluster_parameter,
+        "getClusterParameter" => cluster_params::get_cluster_parameter,
+        "setClusterParameter" => cluster_params::set_cluster_parameter,
         "invalidateUserCache" => misc_admin::invalidate_user_cache,
         "replSetGetRBID" => misc_admin::repl_set_get_rbid,
         "replSetFreeze" => misc_admin::repl_set_freeze,
         "replSetMaintenance" => misc_admin::repl_set_maintenance,
         "dropConnections" => misc_admin::drop_connections,
+        "setUserWriteBlockMode" => misc_admin::set_user_write_block_mode,
+        "applyOps" => apply_ops::apply_ops,
         "releaseMemory" => misc_admin::release_memory,
         "filemd5" => misc_admin::filemd5,
         "planCacheClear" => replset_admin::plan_cache_clear,
@@ -730,6 +746,11 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     let _active = stats
         .as_ref()
         .map(|s| s.status.activate(status::OpKind::of(name)));
+    // Listed by `currentOp` and killable by `killOp` while it runs (RM-216).
+    let _op = ctx
+        .ops
+        .clone()
+        .map(|registry| ops::begin(&registry, doc, ctx));
     // The write concern a write with none of its own is held to: the stored
     // default, read BEFORE the command runs, so `setDefaultRWConcern`'s own
     // write answers for the default it replaces (mongod's order).
@@ -749,6 +770,38 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     };
     ctx.profiling = profiler::begin(name, doc, ctx);
     let mut reply = dispatch_inner(doc, ctx);
+    // A killed operation's deadline polls fail as a spent budget would; the
+    // operation was interrupted, which mongod reports as 11601, keeping
+    // whatever wrapper the error carries (RM-216).
+    if ops::current_killed() && reply.get_i32("code") == Ok(50) {
+        let message = reply
+            .get_str("errmsg")
+            .unwrap_or("operation exceeded time limit")
+            .replace("operation exceeded time limit", "operation was interrupted");
+        // A kill that lands before execution (in planning) carries no
+        // executor wrapper; mongod reports it under one wherever it lands
+        // (measured 8.2.11: a killed find is "Executor error during find
+        // command: <ns> :: caused by :: operation was interrupted").
+        let message = if message.contains(" :: caused by :: ") {
+            message
+        } else {
+            let ns = |coll: &str| format!("{}.{coll}", ctx.db_name);
+            match (name, doc.get_str(name)) {
+                ("find", Ok(coll)) => {
+                    format!("Executor error during find command: {} :: caused by :: {message}", ns(coll))
+                }
+                ("aggregate" | "count" | "distinct", Ok(coll)) => format!(
+                    "Executor error during {name} command on namespace: {} :: caused by :: {message}",
+                    ns(coll)
+                ),
+                ("getMore", _) => format!("Executor error during getMore :: caused by :: {message}"),
+                _ => message,
+            }
+        };
+        reply.insert("errmsg", message);
+        reply.insert("code", 11601_i32);
+        reply.insert("codeName", "Interrupted");
+    }
     // A journaled write is acknowledged only once the journal holds it:
     // mongod's `waitUntilDurable`. Before this, `j` was echoed and no sync
     // followed, and a SIGKILL lost writes acknowledged with `j: true`.
@@ -1907,8 +1960,12 @@ fn abort_transaction(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
 /// it and then never checked — a `createIndexes` over 100,000 documents with
 /// `maxTimeMS: 1` answered `ok` where mongod answers code 50.
 fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Document {
-    let budget = max_time_ms_budget(doc);
+    let budget = match max_time_ms_budget(doc) {
+        0 => cluster_params::default_read_budget(doc, ctx),
+        b => b,
+    };
     let _deadline = deadline::arm((budget > 0).then_some(budget));
+    let _write_block_bypass = misc_admin::write_block_bypass(ctx);
     // Expressions are parsed under the feature compatibility version.
     let _fcv = secantus_core::expressions::gate_fcv(
         ctx.server_params.is_some() && cluster_admin::current_fcv(ctx) == "8.0",
@@ -2715,6 +2772,8 @@ const NO_WRITE_CONCERN: &[&str] = &[
     "dbHash",
     "dbhash",
     "getDefaultRWConcern",
+    // Measured 2026-10-20.
+    "setClusterParameter",
 ];
 
 fn refuse_write_concern(doc: &Document, name: &str) -> Result<(), CommandError> {
