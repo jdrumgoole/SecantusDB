@@ -510,10 +510,17 @@ one beside it.
     LEFT join of its sides swapped (`reduce_outer_joins` flips
     `JOIN_RIGHT`, 2026-10-20), and a WHERE that makes its LEFT side
     non-null makes it inner and is pushed to that side's scan; of 33
-    RIGHT-join probes at 20 and 300 rows, 24 match (8 before). The nine
-    left are a RIGHT join over a join -- flipped, its nullable side is a
-    join, which the three- and four-table searches do not take (their
-    nullable sides are single tables) -- and FULL joins. Not yet: two classes spanning both sides (two join keys); an
+    RIGHT-join probes at 20 and 300 rows, 24 match (8 before). The search
+    takes any tree of INNER and LEFT joins, not only a left-deep chain
+    (2026-10-20): a LEFT join whose nullable side is an inner join of
+    tables keeps that side whole (`make_outerjoininfo`'s
+    `min_righthand`), and `reduce_outer_joins` runs top down over the tree
+    (three tables when bushy, four to eight in any shape). Bushy trees of
+    three to five tables: 21 of 24 probes at 20 and 300 rows (none
+    before); RIGHT joins 27 of 33. What is left is a LEFT join whose
+    nullable side holds another LEFT join -- `make_outerjoininfo` widens
+    its sides by the lower join's, which is not modelled, so the search
+    declines it -- and FULL joins. Not yet: two classes spanning both sides (two join keys); an
     expression in a class; a LEFT join's class through the general path;
     a class of text or other non-integer keys, or with a LEFT join; three
     tables with a WHERE over two of them or a LIMIT; four or more tables
@@ -523,7 +530,7 @@ one beside it.
     than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_right_join_over_a_join_is_searched_as_its_left_join
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_left_join_whose_nullable_side_holds_a_left_join_is_searched
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

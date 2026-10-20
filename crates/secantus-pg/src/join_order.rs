@@ -114,7 +114,9 @@ struct Search {
     /// The LEFT joins' `SpecialJoinInfo`s: `(min_lefthand, min_righthand)`.
     /// A chain's ON is a strict equality, so a LEFT join above commutes
     /// with one below whose nullable side it reads (`make_outerjoininfo`
-    /// adds nothing to its min_lefthand), and each is its two tables.
+    /// adds nothing to its min_lefthand): its left is its clause's table,
+    /// and its right is its nullable side -- one table, or the tables an
+    /// inner join under it joins, which `min_righthand` takes whole.
     outer: Vec<(u8, u8)>,
     /// The equivalence class the clauses sharing a column make: its members
     /// `(table, key)` in `ec_members` order. Its clauses are not `edges`.
@@ -133,6 +135,55 @@ struct Search {
 struct Chain<'a> {
     leaves: Vec<&'a JoinNode>,
     ons: Vec<Option<&'a secantus_pgplan::ColumnExpr>>,
+}
+
+/// One join of the tree as `four_table_chain` walks it: the tables (a bit
+/// each) on its two sides, whether its right side is joined by inner joins
+/// only, and the joins (by index) that are its two sides.
+struct Walked<'a> {
+    node: &'a JoinNode,
+    left: u8,
+    right: u8,
+    right_inner: bool,
+    left_join: Option<usize>,
+    right_join: Option<usize>,
+}
+
+/// Walk `n`, pushing its tables left to right and its joins bottom-up;
+/// returns its tables, whether every join in it is inner, and its own
+/// join's index when it is one. `None` for anything but stored tables
+/// joined two at a time, or more than eight tables.
+fn walk_tree<'a>(
+    n: &'a JoinNode,
+    leaves: &mut Vec<&'a JoinNode>,
+    joins: &mut Vec<Walked<'a>>,
+) -> Option<(u8, bool, Option<usize>)> {
+    match n {
+        JoinNode::Leaf { .. } => {
+            if leaves.len() >= 8 {
+                return None;
+            }
+            leaves.push(n);
+            Some((1 << (leaves.len() - 1), true, None))
+        }
+        JoinNode::Join {
+            kind, left, right, ..
+        } => {
+            let (l, l_inner, l_join) = walk_tree(left, leaves, joins)?;
+            let (r, r_inner, r_join) = walk_tree(right, leaves, joins)?;
+            joins.push(Walked {
+                node: n,
+                left: l,
+                right: r,
+                right_inner: r_inner,
+                left_join: l_join,
+                right_join: r_join,
+            });
+            let inner = l_inner && r_inner && *kind == JoinKind::Inner;
+            Some((l | r, inner, Some(joins.len() - 1)))
+        }
+        _ => None,
+    }
 }
 
 impl Search {
@@ -259,18 +310,18 @@ impl PgHandler {
     /// LEFT, each on one column equality to a table before it; the
     /// clauses sharing a column make at most one equivalence class.
     fn four_table_chain<'a>(&self, node: &'a JoinNode) -> Option<(Chain<'a>, Search)> {
-        let mut joins = Vec::new();
-        let mut cur = node;
-        while let JoinNode::Join { left, .. } = cur {
-            joins.push(cur);
-            cur = left;
-        }
-        joins.reverse();
-        // Four tables to `join_collapse_limit`'s eight.
-        if !(3..=7).contains(&joins.len()) {
+        // The tree, as `deconstruct_jointree` reads it: its tables left to
+        // right, and its joins bottom-up, each left side before its right.
+        let mut leaves: Vec<&'a JoinNode> = Vec::new();
+        let mut joins: Vec<Walked<'a>> = Vec::new();
+        walk_tree(node, &mut leaves, &mut joins)?;
+        // Four tables to `join_collapse_limit`'s eight; three only when a
+        // join's right side is a join (a left-deep three is
+        // `three_table_plan`'s).
+        let bushy = joins.iter().any(|j| j.right.count_ones() > 1);
+        if !(4..=8).contains(&leaves.len()) && !(leaves.len() == 3 && bushy) {
             return None;
         }
-        let mut leaves = vec![cur];
         let mut ons = Vec::new();
         let mut tables = Vec::new();
         let mut edges = Vec::new();
@@ -280,10 +331,13 @@ impl PgHandler {
             JoinNode::Leaf { columns, .. } => columns.first().map(|(k, _)| alias_of(k).to_string()),
             _ => None,
         };
-        for (i, j) in joins.iter().enumerate() {
+        let aliases: Vec<String> = leaves
+            .iter()
+            .map(|n| leaf_alias(n))
+            .collect::<Option<_>>()?;
+        for (i, w) in joins.iter().enumerate() {
             let JoinNode::Join {
                 kind,
-                right,
                 on,
                 equi,
                 equi_reversed,
@@ -292,7 +346,7 @@ impl PgHandler {
                 ec,
                 on_aliases,
                 ..
-            } = j
+            } = w.node
             else {
                 return None;
             };
@@ -303,28 +357,30 @@ impl PgHandler {
             {
                 return None;
             }
+            // A LEFT join's nullable side is a table, or a join of tables
+            // by inner joins only (its `min_righthand` is then all of it).
+            if *kind == JoinKind::Left && w.right.count_ones() > 1 && !w.right_inner {
+                return None;
+            }
             let [(lk, rk)] = equi.as_slice() else {
                 return None;
             };
-            leaves.push(right.as_ref());
             ons.push(on.as_ref());
-            let aliases: Vec<String> = leaves
+            let side = |key: &str, set: u8| {
+                (0..leaves.len()).find(|&t| set & (1 << t) != 0 && aliases[t] == alias_of(key))
+            };
+            let u = side(lk, w.left)?;
+            let v = side(rk, w.right)?;
+            if on_aliases
                 .iter()
-                .map(|n| leaf_alias(n))
-                .collect::<Option<_>>()?;
-            let new = i + 1;
-            let u = aliases[..new].iter().position(|a| a == alias_of(lk))?;
-            if alias_of(rk) != aliases[new]
-                || on_aliases
-                    .iter()
-                    .any(|a| *a != aliases[u] && *a != aliases[new])
+                .any(|a| *a != aliases[u] && *a != aliases[v])
             {
                 return None;
             }
             edges.push(Edge {
                 u,
                 u_key: lk.clone(),
-                v: new,
+                v,
                 v_key: rk.clone(),
                 on: i,
             });
@@ -332,23 +388,43 @@ impl PgHandler {
             kinds.push(*kind);
         }
         // `reduce_outer_joins`, top down: an inner join's strict clause
-        // makes the tables it reads non-null below it, and a LEFT join
-        // whose nullable table is so is an inner join.
-        let mut nonnull = 0u8;
-        for i in (0..edges.len()).rev() {
-            let e = &edges[i];
-            if kinds[i] == JoinKind::Left && nonnull & (1 << e.v) != 0 {
+        // makes the tables it reads non-null on both sides below it, a LEFT
+        // join passes what is non-null above it to its left side only, and
+        // a LEFT join whose nullable side holds such a table is inner.
+        fn reduce(
+            i: usize,
+            upper: u8,
+            joins: &[Walked<'_>],
+            edges: &[Edge],
+            kinds: &mut [JoinKind],
+        ) {
+            let w = &joins[i];
+            if kinds[i] == JoinKind::Left && upper & w.right != 0 {
                 kinds[i] = JoinKind::Inner;
             }
-            if kinds[i] == JoinKind::Inner {
-                nonnull |= (1 << e.u) | (1 << e.v);
+            let local = (1u8 << edges[i].u) | (1u8 << edges[i].v);
+            let (to_left, to_right) = if kinds[i] == JoinKind::Inner {
+                (upper | local, upper | local)
+            } else {
+                (upper, 0)
+            };
+            if let Some(l) = w.left_join {
+                reduce(l, to_left, joins, edges, kinds);
+            }
+            if let Some(r) = w.right_join {
+                reduce(r, to_right, joins, edges, kinds);
             }
         }
+        reduce(joins.len() - 1, 0, &joins, &edges, &mut kinds);
+        // Each LEFT join's `SpecialJoinInfo`: its clause's table on the
+        // left, and its whole nullable side (`make_outerjoininfo` adds the
+        // inner-joined tables under it to `min_righthand`).
         let outer = edges
             .iter()
             .zip(&kinds)
-            .filter(|(_, k)| **k == JoinKind::Left)
-            .map(|(e, _)| (1u8 << e.u, 1u8 << e.v))
+            .zip(&joins)
+            .filter(|((_, k), _)| **k == JoinKind::Left)
+            .map(|((e, _), w)| (1u8 << e.u, w.right))
             .collect();
         // A column in two clauses: the equivalence class they make.
         let (class, class_ons) = Self::chain_class(&mut edges, &reversed)?;

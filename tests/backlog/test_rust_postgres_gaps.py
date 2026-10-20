@@ -1972,7 +1972,7 @@ def test_a_right_join_of_two_tables_is_planned_as_postgresql_plans_it(pg: Any) -
     assert " ".join(":".join(str(v) for v in r) for r in got[1][:16]) == want
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_right_join_over_a_join_is_searched_as_its_left_join(pg: Any) -> None:
     """PostgreSQL 15.19, three 20-row tables never analysed: `s0 JOIN s1
     RIGHT JOIN s2` is flipped to `s2 LEFT JOIN (s0 JOIN s1)`
@@ -2001,6 +2001,39 @@ def test_a_right_join_over_a_join_is_searched_as_its_left_join(pg: Any) -> None:
     )
     assert got[0] == "ok"
     assert len(got[1]) == 48
+    assert " ".join(":".join(str(v) for v in r) for r in got[1][:12]) == want
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_left_join_whose_nullable_side_holds_a_left_join_is_searched(pg: Any) -> None:
+    """PostgreSQL 15.19, four 20-row tables never analysed: `l0 LEFT JOIN
+    (l1 LEFT JOIN l2) JOIN l3` is searched like any four tables, under
+    `make_outerjoininfo`'s rules for an outer join inside another's
+    nullable side -- here a Merge Left Join of l0-l3's merge, sorted on
+    l0.b, with l1-l2. The join order search takes a LEFT join's nullable
+    side only when it is a table or an inner join of tables, so the rows
+    come out in the general path's order."""
+    pg.execute("begin")
+    try:
+        for t, (mb, mc) in enumerate([(7, 5), (5, 3), (3, 4), (4, 7)]):
+            pg.execute(f"create table rp028_l{t} (a int, b int, c int)")
+            pg.execute(
+                f"insert into rp028_l{t} select i, i % {mb}, i % {mc} from generate_series(1, 20) i"
+            )
+        got = pg_answer(
+            pg,
+            "select rp028_l0.a, rp028_l1.a, rp028_l2.a, rp028_l3.a from rp028_l0 left join"
+            " (rp028_l1 left join rp028_l2 on rp028_l1.a = rp028_l2.b)"
+            " on rp028_l0.b = rp028_l1.c join rp028_l3 on rp028_l0.a = rp028_l3.b",
+        )
+    finally:
+        pg.execute("rollback")
+    want = (
+        "1:1:4:1 1:19:None:1 1:1:10:1 1:1:13:1 1:4:None:1 1:1:16:1"
+        " 1:1:7:1 1:7:None:1 1:10:None:1 1:1:19:1 1:13:None:1 1:1:1:1"
+    )
+    assert got[0] == "ok"
+    assert len(got[1]) == 135
     assert " ".join(":".join(str(v) for v in r) for r in got[1][:12]) == want
 
 
