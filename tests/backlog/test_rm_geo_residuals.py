@@ -22,12 +22,12 @@ def _fresh(client: Any, name: str) -> Any:
     return client[name]
 
 
-@pytest.mark.backlog("RM-148")
+@pytest.mark.backlog_fixed("RM-148")
 def test_line_ending_exactly_on_another_line(rust_mongo: Any) -> None:
     """mongod 8.2.11: a line whose end lies exactly on another line's edge
     (the meridian at 11) does not intersect it. S2 settles a point exactly
-    on a great circle by exact arithmetic and symbolic perturbation; this
-    server's floating-point test counts it as touching."""
+    on a great circle by exact arithmetic and symbolic perturbation
+    (`S2Polyline::Intersects`), as this server does since 2026-10-20."""
     db = _fresh(rust_mongo, "rmgeo_t")
     db.c.insert_one(
         {"_id": 3, "loc": {"type": "LineString", "coordinates": [[1, 1], [11, 1], [11, 11]]}}
@@ -112,3 +112,18 @@ def test_2dsphere_cell_levels_are_checked(rust_mongo: Any, mongod: Any) -> None:
     below 0 (16747), finest below coarsest (16749, the default coarsest being
     2), a non-number (14) and a fraction (2)."""
     assert _level_answers(rust_mongo) == _level_answers(mongod)
+
+
+@pytest.mark.backlog("RM-148")
+def test_line_along_a_polygon_edge_on_the_antimeridian(rust_mongo: Any) -> None:
+    """mongod 8.2.11: a line along lng 180 meets a polygon whose edge lies
+    on that meridian (its line-polygon test clips the line to the polygon);
+    this server's vertex and crossing test does not count a collinear edge."""
+    db = _fresh(rust_mongo, "rmgeo_am")
+    square = [[170, 0], [180, 0], [180, 10], [170, 10], [170, 0]]
+    db.c.insert_one({"_id": 5, "loc": {"type": "Polygon", "coordinates": [square]}})
+    meridian = {"type": "LineString", "coordinates": [[180, -5], [180, 15]]}
+    got = mongo_answer(
+        lambda: [d["_id"] for d in db.c.find({"loc": {"$geoIntersects": {"$geometry": meridian}}})]
+    )
+    assert got == ("ok", [5])

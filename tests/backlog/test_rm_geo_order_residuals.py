@@ -75,7 +75,7 @@ def _ids(client: Any, name: str, index: dict, filter_: dict) -> tuple:
 GEO = {"key": {"loc": "2dsphere"}, "name": "g"}
 
 
-@pytest.mark.backlog("RM-151")
+@pytest.mark.backlog_fixed("RM-151")
 def test_geo_predicates_in_or_branches(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 answers an `$or` of two geo predicates with one scan of
     the geo index per branch: 11, 1, 6, 4, 20, 13, 14, 2, 18, 19, then 9."""
@@ -88,7 +88,7 @@ def test_geo_predicates_in_or_branches(rust_mongo: Any, mongod: Any) -> None:
     assert _ids(rust_mongo, "rmgeo_or", GEO, filter_) == _ids(mongod, "rmgeo_or", GEO, filter_)
 
 
-@pytest.mark.backlog("RM-151")
+@pytest.mark.backlog_fixed("RM-151")
 def test_geo_predicate_or_id(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11: an `$or` of a geo predicate and an `_id` reads the
     `_id` index and the geo index, and returns 9 first, then the geo scan."""
@@ -96,7 +96,7 @@ def test_geo_predicate_or_id(rust_mongo: Any, mongod: Any) -> None:
     assert _ids(rust_mongo, "rmgeo_orid", GEO, filter_) == _ids(mongod, "rmgeo_orid", GEO, filter_)
 
 
-@pytest.mark.backlog("RM-151")
+@pytest.mark.backlog_fixed("RM-151")
 def test_compound_geo_index_with_a_range_on_its_trailing_field(
     rust_mongo: Any, mongod: Any
 ) -> None:

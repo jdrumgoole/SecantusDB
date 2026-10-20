@@ -50,6 +50,9 @@ pub enum FieldBounds {
     Hashes(Vec<(u64, u64)>),
     /// One value (an equality on a trailing field).
     Point(Vec<u8>),
+    /// Intervals of a trailing field's keys, as byte-sortable keys with
+    /// whether each end is included (a range predicate on it).
+    Ranges(Vec<(Vec<u8>, bool, Vec<u8>, bool)>),
     /// `[MinKey, MaxKey]`.
     Full,
 }
@@ -65,6 +68,12 @@ impl FieldBounds {
                 list.iter().any(|(lo, hi)| lo <= k && k <= hi)
             }
             (FieldBounds::Point(v), KeyPart::Value(k)) => v == k,
+            (FieldBounds::Ranges(list), KeyPart::Value(k)) => {
+                list.iter().any(|(lo, lo_in, hi, hi_in)| {
+                    (if *lo_in { k >= lo } else { k > lo })
+                        && (if *hi_in { k <= hi } else { k < hi })
+                })
+            }
             _ => false,
         }
     }

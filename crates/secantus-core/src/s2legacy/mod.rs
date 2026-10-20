@@ -20,10 +20,10 @@ mod cap;
 mod cell;
 mod cellid;
 mod coverer;
-mod edge;
+pub(crate) mod edge;
 mod interval;
 mod loops;
-mod point;
+pub(crate) mod point;
 mod region;
 
 pub use cap::Cap;

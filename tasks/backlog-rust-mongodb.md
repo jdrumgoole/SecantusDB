@@ -1009,28 +1009,25 @@ priority queue) and `secantus-commands/src/explain/geo.rs`.
 
 What the probe does not reach, each found beside it:
 
-- [ ] **Geo order outside the replayed shapes.** The order of a geo read
-      is mongod's index scan only where one geo index serves the query
-      alone. A geo predicate in an `$or` branch (mongod scans the branches
-      and merges), and a compound `2dsphere` index with a non-equality
-      predicate on its trailing field, still come back in storage order.
-      Also left as before, not measured as different: a `$near` replay past
-      2,000 documents (nearest first), and `2dsphere` index versions 1 and 2.
-      The geo order is the macOS arm64 reference's (libc++ heap, FMA); a
-      Linux x86-64 mongod was not measured.
-      Backlog-ID: RM-151
-      Verify: tests/backlog/test_rm_geo_order_residuals.py::test_geo_predicates_in_or_branches,tests/backlog/test_rm_geo_order_residuals.py::test_geo_predicate_or_id,tests/backlog/test_rm_geo_order_residuals.py::test_compound_geo_index_with_a_range_on_its_trailing_field
-- [ ] **A point exactly on an edge's great circle.** S2 settles a point
-      or vertex exactly on another edge's great circle with exact
-      predicates and symbolic perturbation; here it is floats. A line
-      ending exactly on another line's edge: `$geoIntersects` of
-      `[[1,5],[11,5]]` against `[[1,1],[11,1],[11,11]]` matches here and
-      not in mongod. Collinear vertices on lng 180 differ the same way.
-      Line within polygon, polygon within polygon and line against line
-      are still vertex and crossing tests with a 1.5e-9 tolerance, not S2's
-      clipping (they agreed with mongod on everything probed).
+- **Not measured — geo order past the replayed shapes** (RM-151's
+  remainder; the `$or` branches and a range on a compound `2dsphere`
+  index's trailing field replay mongod's scans since 2026-10-20): a `$near`
+  replay past 2,000 documents (nearest first), `2dsphere` index versions 1
+  and 2, and a Linux x86-64 mongod (the geo order is the macOS arm64
+  reference's: libc++ heap, FMA).
+- [ ] **A line along a polygon's edge on the antimeridian.** A line along
+      lng 180 against a polygon whose edge lies on that meridian meets it on
+      mongod 8.2.11 (`polygonLineIntersection` clips the line to the
+      polygon) and does not here. Line against line is S2's own
+      `S2Polyline::Intersects` since 2026-10-20, exact predicates and
+      symbolic perturbation included (a line ending exactly on another
+      line's edge, and collinear lines, answer as on mongod). Line within
+      polygon, polygon within polygon and line against polygon are still
+      vertex and crossing tests with a 1.5e-9 tolerance, not S2's clipping;
+      they agreed with mongod on everything else probed (`geo_queries.py`,
+      1,278 replies, none differ).
       Backlog-ID: RM-148
-      Verify: tests/backlog/test_rm_geo_residuals.py::test_line_ending_exactly_on_another_line
+      Verify: tests/backlog/test_rm_geo_residuals.py::test_line_along_a_polygon_edge_on_the_antimeridian
 
 ### 7.080 The order `find` returns documents in -- 2026-10-13
 

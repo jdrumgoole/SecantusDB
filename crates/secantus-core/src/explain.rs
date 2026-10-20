@@ -265,6 +265,12 @@ fn field_clauses(path: &str, value: &Bson) -> Vec<Document> {
     let Bson::Document(spec) = value else {
         return vec![one(path, wrap("$eq", value.clone()))];
     };
+    // A `$near` is one node with its `$maxDistance` / `$minDistance`
+    // (measured 8.2.11: `{loc: {$nearSphere: [0, 0], $maxDistance: 0.25}}`
+    // is its own `parsedQuery`), not a clause per operator.
+    if spec.contains_key("$near") || spec.contains_key("$nearSphere") {
+        return vec![one(path, value.clone())];
+    }
     let mut out: Vec<Document> = Vec::new();
     for (op, arg) in spec.iter() {
         match op.as_str() {
