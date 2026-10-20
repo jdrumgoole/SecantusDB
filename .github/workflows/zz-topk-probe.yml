@@ -1,0 +1,17 @@
+# THROWAWAY: measures mongod 8.2 on Linux (libstdc++) for RM-049. Not to merge.
+name: topk-linux-probe
+on: pull_request
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server.gpg
+          echo "deb [signed-by=/usr/share/keyrings/mongodb-server.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.2 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.2.list
+          sudo apt-get update -q && sudo apt-get install -y -q mongodb-org-server
+          mongod --version
+          mkdir -p /tmp/db && mongod --dbpath /tmp/db --port 27999 --fork --logpath /tmp/db/log
+          pip install -q pymongo
+          python scratch_probe/topk_probe.py 27999 > topk_linux.jsonl
+          echo "BEGIN-TOPK"; cat topk_linux.jsonl; echo "END-TOPK"
