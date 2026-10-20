@@ -64,19 +64,23 @@ pub fn db_check(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         if k == "validateMode" {
             match v {
                 Bson::String(s) if VALIDATE_MODES.contains(&s.as_str()) => {}
-                Bson::String(s) => return Err(error(
-                    2,
-                    format!(
+                Bson::String(s) => {
+                    return Err(error(
+                        2,
+                        format!(
                         "Enumeration value '{s}' for field '.validateMode' is not a valid value."
                     ),
-                )),
-                other => return Err(error(
-                    14,
-                    format!(
+                    ))
+                }
+                other => {
+                    return Err(error(
+                        14,
+                        format!(
                         "BSON field '.validateMode' is the wrong type '{}', expected type 'string'",
                         secantus_core::query::bson_type_name(other)
                     ),
-                )),
+                    ))
+                }
             }
         }
     }
