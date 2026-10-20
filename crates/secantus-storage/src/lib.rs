@@ -808,13 +808,15 @@ fn transaction_view(run: Vec<Document>, (lsid, txn): (Document, i64)) -> Documen
     out
 }
 
-/// One `applyOps` entry for a group of inserts, as mongod writes it outside a
-/// retryable write: the inserts under the first one's time.
+/// One `applyOps` entry for a group of inserts or of a batched delete's
+/// deletes, as mongod writes it outside a retryable write: the writes under
+/// the first one's time.
 fn apply_ops_view(run: Vec<Document>) -> Document {
     let first = run[0].clone();
     let ops: Vec<Bson> = run
         .into_iter()
         .map(|e| {
+            let e = oplog_view_shape(&e).unwrap_or(e);
             let mut op = Document::new();
             for k in ["op", "ns", "ui", "o", "o2"] {
                 if let Some(v) = e.get(k) {
@@ -3369,6 +3371,9 @@ thread_local! {
     /// documents in, each batch in reverse (`with_reversed_delete_batches`).
     /// 0: in the order they were read.
     static DELETE_BATCH: Cell<usize> = const { Cell::new(0) };
+    /// The `applyOps` group each document of a batched multi-delete belongs
+    /// to, by RecordId (only batches of two or more), for `local.oplog.rs`.
+    static DELETE_GROUPS: RefCell<HashMap<i64, i64>> = RefCell::new(HashMap::new());
 }
 
 /// Run `f` with an unbounded delete outside a transaction removing its
@@ -18734,6 +18739,25 @@ impl Storage {
             }
             rids
         };
+        // Each batch of two or more is one `applyOps` entry on mongod.
+        struct ClearGroups;
+        impl Drop for ClearGroups {
+            fn drop(&mut self) {
+                DELETE_GROUPS.with(|g| g.borrow_mut().clear());
+            }
+        }
+        let _clear = ClearGroups;
+        if let batch @ 1.. = DELETE_BATCH.with(Cell::get) {
+            DELETE_GROUPS.with(|g| {
+                let mut g = g.borrow_mut();
+                for chunk in rids.chunks(batch).filter(|c| c.len() > 1) {
+                    let id = self.insert_groups.fetch_add(1, Ordering::Relaxed);
+                    for rid in chunk {
+                        g.insert(*rid, id);
+                    }
+                }
+            });
+        }
         let mut deleted = 0usize;
         let mut idx = 0usize;
         while idx < rids.len() {
@@ -18830,13 +18854,13 @@ impl Storage {
             chunk_bytes += blob.len();
             if oplog_on {
                 let id_doc = encode_id_doc(&doc.get("_id").cloned().unwrap_or(Bson::Null))?;
-                oplog_entries.push(OplogEntry::Raw(Self::oplog_entry_crud(
-                    "d",
-                    &ns,
-                    ui.as_deref(),
-                    &id_doc,
-                    &id_doc,
-                )?));
+                let mut entry = Self::oplog_entry_crud("d", &ns, ui.as_deref(), &id_doc, &id_doc)?;
+                if let Some(g) = DELETE_GROUPS.with(|g| g.borrow().get(&recordid).copied()) {
+                    let mut bg = bson::RawDocumentBuf::new();
+                    bg.append("g", g);
+                    entry.append("bg", bg);
+                }
+                oplog_entries.push(OplogEntry::Raw(entry));
                 pre_images.push(if preimages_on {
                     chunk_bytes += blob.len();
                     Some(blob.clone())

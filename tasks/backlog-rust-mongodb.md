@@ -635,7 +635,8 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-10-20 an update (mongod's `$v: 2` diff, stored beside the
       change-stream description as `o.md`), a batch of inserts (one
       `applyOps` per group of 500 documents or 256 KiB), a committed
-      transaction (one `applyOps` under its session), a delete, a drop
+      transaction (one `applyOps` under its session), a multi-document
+      delete (`applyOps` batches of ten), a delete, a drop
       (`o2: {numRecords}`), a rename (`stayTemp`), a one-index
       `createIndexes` and a `dropIndexes` read as mongod 8.2.11 writes them,
       with its `t` and `v`. Open:
@@ -646,8 +647,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
         multi-document update or delete carries none). The statement ids
         have to reach storage through the retry paths in `session.rs`,
         which re-run only a batch's fresh statements;
-      - a multi-document delete is one entry per document, where mongod
-        writes `applyOps` batches of the deletes (no session);
       - an index build over documents is one `createIndexes`, where mongod
         writes `startIndexBuild` / `commitIndexBuild` and rows in
         `config.system.indexBuilds`.

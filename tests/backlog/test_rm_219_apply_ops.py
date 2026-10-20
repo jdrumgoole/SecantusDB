@@ -370,3 +370,34 @@ def test_oplog_transaction_is_one_apply_ops(rust_mongo: Any, mongod_rs: Any) -> 
     """mongod 8.2.11 logs a committed transaction as one `applyOps` entry
     under its `lsid` / `txnNumber`, with `prevOpTime`."""
     assert _transaction_entries(rust_mongo) == _transaction_entries(mongod_rs)
+
+
+def _delete_batches(client: Any) -> list:
+    out = []
+    for n, query in [(1, {}), (2, {}), (11, {}), (25, {"_id": {"$gte": 5}})]:
+        client.drop_database("rm224")
+        client.rm224.c.insert_many([{"_id": i} for i in range(n)])
+        start = client.local["oplog.rs"].find_one(sort=[("$natural", -1)])["ts"]
+        client.rm224.c.delete_many(query)
+        out.append(
+            [
+                (
+                    e["op"],
+                    [o["o"]["_id"] for o in e["o"]["applyOps"]]
+                    if e["op"] == "c"
+                    else e["o"]["_id"],
+                )
+                for e in client.local["oplog.rs"].find({"ts": {"$gt": start}, "op": {"$ne": "n"}})
+                if e["ns"] in ("rm224.c", "admin.$cmd")
+            ]
+        )
+    client.drop_database("rm224")
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-224")
+def test_oplog_batched_delete_is_apply_ops(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """mongod 8.2.11 logs a multi-document delete in batches of ten, each
+    one `applyOps` holding its deletes last-read first, a batch of one as a
+    plain delete."""
+    assert _delete_batches(rust_mongo) == _delete_batches(mongod_rs)
