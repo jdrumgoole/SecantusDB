@@ -789,15 +789,53 @@ fn statement(
     // on it, and its deadline answers 50. `run_handler` skips its own
     // statement-scoped acquisition while the flag is set, so the statement
     // is counted once and its collection lock is not released early.
-    if let (Some(lm), Some(owner)) = (
-        ctx.locks.clone(),
-        txn.lock().unwrap_or_else(|e| e.into_inner()).lock_owner,
-    ) {
+    // The transaction's guard is let go before the wait: held across it,
+    // a second command on this session waits for it under the registry,
+    // and every session's command then waits too.
+    let owner = txn.lock().unwrap_or_else(|e| e.into_inner()).lock_owner;
+    if let (Some(lm), Some(owner)) = (ctx.locks.clone(), owner) {
         let chain = crate::lock_manager::statement_chain(doc, &ctx.db_name);
-        match crate::lock_manager::acquire_chain(&lm, owner, &chain) {
-            Ok(()) => ctx.txn_locks = true,
-            Err(_) => {
-                let mut reply = CommandError::max_time_expired().into_reply();
+        // Each lock request of a transaction gives up after
+        // `maxTransactionLockRequestTimeoutMillis` (mongod's 5 ms): a
+        // transaction waiting on another's lock fails, transiently, rather
+        // than waiting for it to end (mongod 8.2.11: 24 LockTimeout).
+        let limit = ctx
+            .server_params
+            .as_ref()
+            .and_then(|p| p.get("maxTransactionLockRequestTimeoutMillis"))
+            .and_then(|v| v.as_i32())
+            .unwrap_or(5);
+        let mut failed = None;
+        for (res, mode) in &chain {
+            let budget_left = secantus_core::deadline::remaining_ms();
+            let bounded = limit >= 0 && budget_left.is_none_or(|left| left > f64::from(limit));
+            let _lock_budget =
+                bounded.then(|| secantus_core::deadline::arm(Some(i64::from(limit.max(1)))));
+            if lm.acquire(owner, res, *mode).is_err() {
+                failed = Some((res.clone(), *mode, bounded));
+                break;
+            }
+        }
+        match failed {
+            None => ctx.txn_locks = true,
+            Some((res, mode, bounded)) => {
+                lm.release(owner);
+                let mut reply = if bounded {
+                    let conn = ctx.connection_id;
+                    CommandError::new(
+                        24,
+                        "LockTimeout",
+                        format!(
+                            "Unable to acquire {} lock on '{}' within {limit}ms. opId: {conn}, op: \
+                             conn{conn}, connId: {conn}.",
+                            mode.name(),
+                            res.described()
+                        ),
+                    )
+                    .into_reply()
+                } else {
+                    CommandError::max_time_expired().into_reply()
+                };
                 registry.abort_in_progress(txn);
                 crate::finish_txn_statement(registry, txn, &mut reply);
                 return reply;

@@ -573,14 +573,38 @@ def test_type_bits_of_wrong_type_or_all_zero(rust_mongo: Any, mongod_rs: Any) ->
         assert _type_bits_token(rust_mongo, bits) == _type_bits_token(mongod_rs, bits), bits
 
 
-@pytest.mark.backlog("RM-075")
+@pytest.mark.backlog_fixed("RM-075")
 def test_type_bits_that_change_a_number(rust_mongo: Any, mongod_rs: Any) -> None:
     """Type bits `0x01` make the token's version a double: mongod 8.2.11
-    answers 50854 (`wrong type for version`); this server does not read the
-    bits and answers 40647."""
+    answers 50854 (`wrong type for version`)."""
     expected = _type_bits_token(mongod_rs, Binary(b"\x01", 0))
     assert expected == ("err", 50854)
     assert _type_bits_token(rust_mongo, Binary(b"\x01", 0)) == expected
+
+
+@pytest.mark.backlog("RM-075")
+def test_a_decimal_from_a_double_in_a_token(rust_mongo: Any, mongod_rs: Any) -> None:
+    """A small-magnitude number whose type bits say decimal: mongod 8.2.11
+    rebuilds the decimal from the double and its continuation, and rescales
+    its exponent, which fails here with 50830."""
+
+    def answer(client: Any) -> Any:
+        c = client["rm075d"][_name()]
+        c.insert_one({"a": 1})
+        token = {
+            "_data": "8200000000000000012A5FFE0000000000056BC75E2D6310000004",
+            "_typeBits": Binary(b"\x03", 0),
+        }
+
+        def run() -> Any:
+            with c.watch(resume_after=token, max_await_time_ms=100) as s:
+                return s.try_next()
+
+        return code_of(mongo_answer(run))
+
+    expected = answer(mongod_rs)
+    assert expected == ("err", 50830)
+    assert answer(rust_mongo) == expected
 
 
 def _change_stream_explain_ns(client: Any) -> Any:
@@ -1142,3 +1166,30 @@ def test_drop_under_a_transaction_that_wrote_honours_max_time(
     expected = _drop_under_write_txn(mongod_rs)
     assert expected == (True, [("err", 50)], True)
     assert _drop_under_write_txn(rust_mongo) == expected
+
+
+@pytest.mark.backlog("RM-202")
+def test_a_collection_made_in_two_transactions(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 lets a second transaction write to a collection a first
+    one created and has not committed; the conflict, if any, comes at commit.
+    This server holds the creating transaction's exclusive lock to its end,
+    so the second transaction's insert times out (24)."""
+    answers = []
+    for client in (rust_mongo, mongod_rs):
+        db = client["rm202"]
+        db.drop_collection("q")
+        first = client.start_session()
+        second = client.start_session()
+        first.start_transaction()
+        second.start_transaction()
+        db.create_collection("q", session=first)
+        answers.append(
+            mongo_answer(
+                lambda db=db, second=second: db.q.insert_one({"x": 1}, session=second).acknowledged
+            )
+        )
+        for s in (first, second):
+            mongo_answer(s.abort_transaction)
+    got, want = answers
+    assert want == ("ok", True)
+    assert got == want

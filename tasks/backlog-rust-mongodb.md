@@ -1365,20 +1365,20 @@ differs on 2 results (re-measured 2026-10-16; 5 before). The harness salts datab
 mongod keeps the oplog of earlier runs and a stream started in the past
 would see them. What is left:
 
-- [ ] **RUST MongoDB server: a resume token in mongod's own format with
-      type bits that matter, or a tiny decimal, gets 40647.** This
-      server's tokens are its own encoding (hex of a BSON document). A token
-      in mongod's format is read by a transcription of mongod's KeyString
-      decoder (`secantus-commands/src/resume_keystring.rs`): one that fails
-      gets mongod's error, and one that decodes is looked up from its
-      cluster time and answers 280 when its event is not the first found,
-      as on mongod (2026-10-20). A `_typeBits` that is not BinData is 40648,
-      and all-zero bits are no bits. What is left: type bits that change a
-      number's type (`0x01` makes the version a double: mongod answers
-      50854), which need mongod's TypeBits reader, and a tiny decimal in
-      `_data`; both answer 40647.
+- [ ] **RUST MongoDB server: a resume token in mongod's own format whose
+      number is a decimal built from a double gets 40647.** A token in
+      mongod's format is read by a transcription of mongod's KeyString
+      decoder (`secantus-commands/src/resume_keystring.rs`). Since
+      2026-10-20 that includes `_typeBits`, read as mongod's `TypeBits`
+      reader reads them, and a decimal that is a whole number or a teeny
+      decimal, whose exponent `adjustDecimalExponent` rescales (695 + 1,384
+      tokens, no difference). What is left is a decimal mongod rebuilds from
+      a double plus a continuation: a small or large magnitude, or a
+      fraction, whose type bits say decimal. That needs Decimal128's rounding
+      from a double; such a token answers 40647, where mongod answers the
+      decoder's own error (50830, for example) or reads it.
       Backlog-ID: RM-075
-      Verify: tests/backlog/test_rm_057_084.py::test_type_bits_that_change_a_number
+      Verify: tests/backlog/test_rm_057_084.py::test_a_decimal_from_a_double_in_a_token
 - [ ] **RUST MongoDB server: `explain` of a `$changeStream` is this
       server's plan.** mongod explains the oplog scan it would run, with
       the full match over `local.oplog.rs`; not reproduced, like the rest
@@ -1445,6 +1445,22 @@ retryable writes). The Rust server differs on 11 scenarios. What is left:
       a session with no user.
       Backlog-ID: RM-087
       Verify: tests/backlog/test_rm_085_112.py::test_fast_count_sees_another_sessions_uncommitted_insert
+- [ ] **RUST MongoDB server: a collection made in a transaction is locked
+      to that transaction's end.** mongod 8.2.11 lets a second transaction
+      create, or insert into, a collection a first one created and has not
+      committed, and reports the conflict when one commits (112 WriteConflict,
+      "Collection namespace ... is already in use"). This server takes an
+      exclusive lock on the new collection for the creating transaction's
+      whole life (RM-084), so the second transaction's statement fails with 24
+      LockTimeout after `maxTransactionLockRequestTimeoutMillis` (since
+      2026-10-20; before that it waited for the first transaction to end, and
+      could stop the server answering: RM-201, fixed). Also from the lock
+      manager: a queued exclusive request does not hold back a later intent
+      request, where mongod's queue does (a transaction's insert behind a
+      waiting `drop` times out on mongod and goes ahead here; see RM-138).
+      Measured with `tools/probes/transactions.py`: 2 of 267 scenarios.
+      Backlog-ID: RM-202
+      Verify: tests/backlog/test_rm_057_084.py::test_a_collection_made_in_two_transactions
 
 ### 7.071 Time-series collections -- 2026-10-11
 
