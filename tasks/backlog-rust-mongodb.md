@@ -718,12 +718,28 @@ may run a command.
       the localhost exception is used.
       Backlog-ID: RM-024
       Verify: none -- the probe's mongod topology (standalone vs replica set), not a server behaviour
-- [ ] **`setFeatureCompatibilityVersion` records the version and gates
-      nothing.** mongod at FCV 8.0 refuses the features 8.1 and 8.2 added;
-      this server has no such gates. `getParameter` reports the stored
-      version.
-      Backlog-ID: RM-025
-      Verify: tests/backlog/test_rm_001_028.py::test_fcv_80_refuses_a_feature_82_added
+- [ ] **The hybrid-search stages 8.2 added are missing: `$rankFusion`,
+      `$score` and `$scoreFusion`** (40324 here). mongod 8.2.11 runs all
+      three on a community build: `$rankFusion` merges ranked
+      sub-pipelines by reciprocal rank (`weight / (60 + rank)` summed per
+      document, `combination.weights`, `scoreDetails`), `$score` sets a
+      document's score from an expression (`normalization: none | sigmoid
+      | minMaxScaler`, `weight` at most 1), `$scoreFusion` combines scored
+      sub-pipelines (`normalization`, `combination.method: avg |
+      expression`), and each exposes the result as `{$meta: "score"}` /
+      `{$meta: "scoreDetails"}`. A sub-pipeline of `$rankFusion` must be
+      ranked (9191100 otherwise), and one with no pipelines is 2. At FCV
+      8.0 mongod refuses each with 224, in three different texts
+      (`'featureFlagRankFusionBasic' must be enabled to use rankFusion`,
+      `$scoreFusion is not allowed in the current feature compatibility
+      version. See ...`, `$score is not allowed in the current
+      configuration. You may need to enable the corresponding feature
+      flag...`), which go with the stages when they land (the expressions'
+      gate is in `secantus_core::expressions::ADDED_IN_82`). `explain` of
+      each is mongod's own desugaring and was not measured. Found
+      2026-10-20 with the expressions 8.2 added (RM-197, fixed).
+      Backlog-ID: RM-198
+      Verify: tests/backlog/test_rm_added_in_82.py::test_hybrid_search_stages_82_added
 - **Scope decision — `mapReduce` with a named `out`** (Joe, 2026-10-16,
   formerly RM-027). Refused as a `--noscripting` mongod 8.2.11 refuses it
   (31264, since 2026-10-20; it answered 9 before), like every map/reduce

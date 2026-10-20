@@ -181,6 +181,9 @@ pub fn record_sessions_collection(
 /// The FCV in force: the stored one, else this server's own version. What
 /// `getParameter` reports as `featureCompatibilityVersion.version`.
 pub(crate) fn current_fcv(ctx: &CommandContext) -> String {
+    if let Some(known) = ctx.server_params.as_ref().and_then(|p| p.fcv()) {
+        return known;
+    }
     let stored = ctx.storage().ok().and_then(|storage| {
         storage
             .find(FCV_DB, FCV_COLL, &doc! {"_id": FCV_ID}, None, None)
@@ -191,7 +194,11 @@ pub(crate) fn current_fcv(ctx: &CommandContext) -> String {
             .ok()
             .map(str::to_string)
     });
-    stored.unwrap_or_else(|| FCV_LATEST.to_string())
+    let version = stored.unwrap_or_else(|| FCV_LATEST.to_string());
+    if let Some(p) = &ctx.server_params {
+        p.set_fcv(&version);
+    }
+    version
 }
 
 /// `setFeatureCompatibilityVersion`: record the version in
@@ -201,9 +208,9 @@ pub(crate) fn current_fcv(ctx: &CommandContext) -> String {
 /// knows; `dryRun` is refused; a change needs `confirm`; and the last
 /// continuous version cannot be set from either of the other two.
 ///
-/// What this does NOT do is change behaviour: mongod at FCV 8.0 refuses the
-/// features 8.1 and 8.2 added, and this server has no such gates
-/// (`tasks/backlog-rust-mongodb.md` 7.084).
+/// At 8.0 the expressions 8.2 added are refused, as mongod refuses them
+/// (`secantus_core::expressions::ADDED_IN_82`, gated around every command in
+/// `run_handler`).
 pub fn set_feature_compatibility_version(
     doc: &Document,
     ctx: &mut CommandContext,
@@ -293,10 +300,13 @@ pub fn set_feature_compatibility_version(
             FCV_DB,
             FCV_COLL,
             &doc! {"_id": FCV_ID},
-            &doc! {"_id": FCV_ID, "version": target},
+            &doc! {"_id": FCV_ID, "version": target.clone()},
             false,
             true,
         )
         .map_err(crate::util::command_error)?;
+    if let Some(p) = &ctx.server_params {
+        p.set_fcv(&target);
+    }
     Ok(doc! {"ok": 1.0})
 }

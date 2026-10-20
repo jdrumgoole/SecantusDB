@@ -161,6 +161,9 @@ pub struct ServerParams {
     /// `notablescan`, read by every query: kept here as well as in `values`
     /// so the read takes no lock.
     notablescan: std::sync::atomic::AtomicBool,
+    /// The feature compatibility version, once read from
+    /// `admin.system.version` (`cluster_admin::current_fcv`) or set.
+    fcv: Mutex<Option<String>>,
 }
 
 impl ServerParams {
@@ -217,6 +220,17 @@ impl ServerParams {
                     .collect()
             },
         )
+    }
+
+    /// The feature compatibility version, if it has been read or set.
+    pub fn fcv(&self) -> Option<String> {
+        self.fcv.lock().ok()?.clone()
+    }
+
+    pub fn set_fcv(&self, version: &str) {
+        if let Ok(mut guard) = self.fcv.lock() {
+            *guard = Some(version.to_string());
+        }
     }
 
     /// Whether a user has existed since the server started.

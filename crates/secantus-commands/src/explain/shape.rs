@@ -392,6 +392,11 @@ fn constified(v: &Bson) -> Bson {
             Bson::Document(doc! { "$const": d.get("$literal").cloned().unwrap_or(Bson::Null) })
         }
         Bson::String(s) if s.starts_with('$') => v.clone(),
+        // mongod rewrites `$sigmoid` when it parses it, and prints the
+        // rewrite (8.2.11).
+        Bson::Document(d) if d.len() == 1 && d.contains_key("$sigmoid") => constified(
+            &secantus_core::expressions::sigmoid_form(d.get("$sigmoid").unwrap_or(&Bson::Null)),
+        ),
         Bson::Document(d) if d.keys().next().is_some_and(|k| k.starts_with('$')) => Bson::Document(
             d.iter()
                 .map(|(op, arg)| {

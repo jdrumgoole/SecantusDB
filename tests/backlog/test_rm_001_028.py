@@ -265,11 +265,10 @@ def test_slow_query_line_says_where_the_time_went(rust_mongo: Any, mongod: Any) 
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-025")
+@pytest.mark.backlog_fixed("RM-025")
 def test_fcv_80_refuses_a_feature_82_added(rust_mongo: Any) -> None:
     """mongod 8.2.11 at FCV 8.0 refuses `$sigmoid` (added in 8.2) with 224
-    QueryFeatureNotAllowed. (The Rust server has no `$sigmoid` either, so
-    this fails on that too until both land.)"""
+    QueryFeatureNotAllowed."""
     expected = (
         "err",
         224,

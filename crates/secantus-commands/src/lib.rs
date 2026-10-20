@@ -1765,6 +1765,10 @@ fn abort_transaction(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
 fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Document {
     let budget = max_time_ms_budget(doc);
     let _deadline = deadline::arm((budget > 0).then_some(budget));
+    // Expressions are parsed under the feature compatibility version.
+    let _fcv = secantus_core::expressions::gate_fcv(
+        ctx.server_params.is_some() && cluster_admin::current_fcv(ctx) == "8.0",
+    );
     // The statement's lock chain (mongod's hierarchy). A transaction
     // statement's chain was already taken with the transaction's owner,
     // which holds its collection locks to commit/abort — see `session`.
