@@ -621,27 +621,19 @@ mongod 8.2.11 with a `secantusd-rs` built from tree `af2629ec`; the rest
 were confirmed by reading the code path and need a fault no quick test can
 inject (a panic, a power loss, a failing checkpoint).
 
-- [ ] **`createIndexes` on a collection bigger than the WiredTiger cache
-      can afford in one transaction never returns.** The backfill runs in a
-      single `with_statement_txn` (`Storage::create_index`), collecting every
-      entry before inserting any. When WiredTiger rolls that transaction back
-      because its dirty content cannot be evicted, `From<WtError>` asks for
-      the rollback reason only inside a user transaction, so an autocommit
-      build is classified `WriteConflict` and `retry_write_conflicts` retries
-      it with no limit. Measured: at `--cache-size 8M` a build over 5,000
-      300-byte documents logs `create_index retrying on write conflicts` until
-      the client gives up; at 32M so does one over 300,000 (still retrying at
-      120 s). The default 4G cache only moves the threshold. The build also
-      holds the global storage lock and the collection lock throughout, so
-      every DDL and every write to that collection waits on it. mongod 8.2.11
-      built an index over 1,000,000 such documents (345 MB of indexes) at its
-      minimum 0.25 GB cache, in 129 s: its builds sort externally within
-      `maxIndexBuildMemoryUsageMegabytes` and insert in batches while writes
-      continue. `drop_collection` had the same wedge and was fixed by
-      chunking (`tests/drop_chunk.rs`); an index build needs the same, and an
-      engine rollback outside a user transaction must not be retried forever.
+- [ ] **An index build holds every write to its collection off until it
+      finishes.** The build is chunked now (fixed 2026-10-20: it had run as
+      one transaction and never returned under a small cache; at 32 MB it
+      builds over 300,000 300-byte documents in 4 s). But it still holds
+      the global storage lock and the collection lock from its first read
+      to its catalog row, so every DDL, and every write to that collection,
+      waits for the whole build. mongod 8.2.11's build lets writes go on: a
+      side table records the writes made while it scans, and they are
+      applied before the index commits, within
+      `maxIndexBuildMemoryUsageMegabytes`. A build that sorted externally
+      would also stop holding all its entries in memory at once.
       Backlog-ID: RM-187
-      Verify: tests/backlog/test_rm_found_2026_10_20.py::test_index_build_completes_under_a_small_cache
+      Verify: none -- a concurrency budget (writes during a long build), not an answer
 - [ ] **A WiredTiger panic while the server is running goes unnoticed.**
       `secantus-wt`'s `Connection::open` passes a null event handler to
       `wiredtiger_open`, and nothing checks for `WT_PANIC` (-31804). After a

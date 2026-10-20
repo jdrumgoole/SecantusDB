@@ -611,6 +611,45 @@ const WRITE_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// dirty trigger while bounding the number of commits for a large drop.
 const PURGE_CHUNK_MAX_ROWS: usize = 4000;
 
+/// Bounds on one statement transaction of a chunked index build (RM-187).
+/// Entries land on scattered leaf pages, unlike a purge's consecutive keys,
+/// so the bound is in bytes as well: 4,000 entries of a 300-byte key were
+/// more dirty content than an 8 MB cache's eviction could take in one
+/// transaction, and the chunk itself was rolled back and retried forever.
+const INDEX_BUILD_CHUNK_MAX_ENTRIES: usize = 1000;
+const INDEX_BUILD_CHUNK_MAX_BYTES: usize = 512 * 1024;
+
+/// `entries` cut into the chunks of an index build, each within
+/// [`INDEX_BUILD_CHUNK_MAX_ENTRIES`] and [`INDEX_BUILD_CHUNK_MAX_BYTES`].
+fn index_build_chunks(entries: &[(Vec<u8>, i64)]) -> Vec<&[(Vec<u8>, i64)]> {
+    let mut out = Vec::new();
+    let (mut start, mut bytes) = (0usize, 0usize);
+    for (i, (kb, _)) in entries.iter().enumerate() {
+        let size = kb.len() + 8;
+        if i > start
+            && (i - start >= INDEX_BUILD_CHUNK_MAX_ENTRIES
+                || bytes + size > INDEX_BUILD_CHUNK_MAX_BYTES)
+        {
+            out.push(&entries[start..i]);
+            start = i;
+            bytes = 0;
+        }
+        bytes += size;
+    }
+    if start < entries.len() {
+        out.push(&entries[start..]);
+    }
+    out
+}
+
+/// What an index build writes, worked out before anything is written.
+struct IndexPlan {
+    /// The catalog row.
+    payload: Vec<u8>,
+    /// Every entry: the sort key and the document's RecordId.
+    entries: Vec<(Vec<u8>, i64)>,
+}
+
 /// Whether an oplog entry is for something mongod does not replicate, and
 /// so does not log: the `local` database, and a database's
 /// `system.profile` -- its documents, and its creation and drop (measured
@@ -11973,12 +12012,76 @@ impl Storage {
         // behind a missing registry row (the entries-before-registry write
         // order below still guards the lock-free-reader interleaving; the
         // transaction adds crash atomicity).
+        if self.in_user_txn() {
+            return self.retry_write_conflicts("create_index", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    self.create_index_in_txn(&session, db, coll, name, key_spec, options, true)
+                })
+            });
+        }
+        // Outside a transaction the build is chunked, as a drop is: every
+        // entry in one statement transaction is unbounded dirty content, and
+        // a collection bigger than the cache could afford got a cache-pressure
+        // rollback that the write-conflict loop re-ran forever (RM-187: at an
+        // 8 MB cache, 5,000 300-byte documents never finished). The global
+        // and collection locks held above keep every write out until the
+        // catalog row commits, so the build reads and writes one state.
+        let plan = self.retry_write_conflicts("create_index", || {
+            let session = self.op_session()?;
+            self.with_statement_txn(&session, || {
+                self.plan_index(&session, db, coll, name, key_spec, options)
+            })
+        })?;
+        let Some(plan) = plan else {
+            return Ok(false);
+        };
+        // Entries a build that died part-way left under this name.
+        loop {
+            let removed = self.retry_write_conflicts("create_index", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    self.delete_entries_prefix_upto(
+                        &session,
+                        db,
+                        coll,
+                        name,
+                        Some(PURGE_CHUNK_MAX_ROWS),
+                    )
+                })
+            })?;
+            if removed < PURGE_CHUNK_MAX_ROWS {
+                break;
+            }
+        }
+        for chunk in index_build_chunks(&plan.entries) {
+            if deadline::check().is_err() {
+                return Err(StorageError::MaxTimeExpired);
+            }
+            self.retry_write_conflicts("create_index", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    self.insert_built_entries(&session, db, coll, name, chunk)
+                })
+            })?;
+        }
+        // The catalog row is the commit point of a fully-built index.
         self.retry_write_conflicts("create_index", || {
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
-                self.create_index_in_txn(&session, db, coll, name, key_spec, options, true)
+                self.commit_index(
+                    &session,
+                    db,
+                    coll,
+                    name,
+                    key_spec,
+                    options,
+                    &plan.payload,
+                    true,
+                )
             })
-        })
+        })?;
+        Ok(true)
     }
 
     /// The body of [`create_index`], run inside its statement transaction.
@@ -11995,6 +12098,56 @@ impl Storage {
         options: &Document,
         logged: bool,
     ) -> Result<bool> {
+        let Some(plan) = self.plan_index(session, db, coll, name, key_spec, options)? else {
+            return Ok(false);
+        };
+        self.insert_built_entries(session, db, coll, name, &plan.entries)?;
+        self.commit_index(
+            session,
+            db,
+            coll,
+            name,
+            key_spec,
+            options,
+            &plan.payload,
+            logged,
+        )?;
+        Ok(true)
+    }
+
+    /// Write a building index's entry rows.
+    fn insert_built_entries(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+        entries: &[(Vec<u8>, i64)],
+    ) -> Result<()> {
+        let ec = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        for (kb, rid) in entries {
+            let packed = pack_entry(kb, *rid);
+            ec.reset()?;
+            ec.set_key_sssu(db, coll, name, &packed);
+            ec.set_value_u(b"");
+            ec.insert()?;
+        }
+        Ok(())
+    }
+
+    /// Work out what building an index writes -- its catalog row and every
+    /// entry -- reading the collection and writing nothing but the
+    /// collection's own registration. `None` when an identical index exists
+    /// already; a conflicting one is an error.
+    fn plan_index(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+        key_spec: &Document,
+        options: &Document,
+    ) -> Result<Option<IndexPlan>> {
         // It writes the index catalog.
         note_planner_write();
         let geo = parse_geo_2d(key_spec, options);
@@ -12033,7 +12186,7 @@ impl Storage {
                         )));
                     }
                 }
-                return Ok(false);
+                return Ok(None);
             }
             Err(e) if e.is_not_found() => {}
             Err(e) => return Err(e.into()),
@@ -12199,25 +12352,33 @@ impl Storage {
         payload_doc.insert("key", Bson::Document(key_spec.clone()));
         payload_doc.insert("options", Bson::Document(stored_options));
         let payload = encode_doc(&payload_doc)?;
+        Ok(Some(IndexPlan { payload, entries }))
+    }
 
-        // Backfill the entry rows BEFORE the registry row: lock-free readers
-        // route through an index the moment its registry row is visible, so
-        // the registry insert must be the commit point of a fully-built
-        // index — the reverse order let a reader route through a half-backfilled
-        // index and miss matching documents. (`drop_index` is the mirror
-        // image: registry row out first, then the entries.)
-        let ec = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
-        for (kb, rid) in &entries {
-            let packed = pack_entry(kb, *rid);
-            ec.reset()?;
-            ec.set_key_sssu(db, coll, name, &packed);
-            ec.set_value_u(b"");
-            ec.insert()?;
-        }
-
-        c.reset()?;
+    /// Commit a built index: its catalog row, and the `createIndexes` oplog
+    /// entry. The entry rows are written FIRST, by the caller: lock-free
+    /// readers route through an index the moment its registry row is
+    /// visible, so the registry insert must be the commit point of a
+    /// fully-built index -- the reverse order let a reader route through a
+    /// half-backfilled index and miss matching documents. (`drop_index` is
+    /// the mirror image: registry row out first, then the entries.)
+    #[allow(clippy::too_many_arguments)]
+    fn commit_index(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+        key_spec: &Document,
+        options: &Document,
+        payload: &[u8],
+        logged: bool,
+    ) -> Result<()> {
+        // It writes the index catalog.
+        note_planner_write();
+        let c = session.open_cursor(IDX_TABLE, None)?;
         c.set_key_sss(db, coll, name);
-        c.set_value_u(&payload);
+        c.set_value_u(payload);
         c.insert()?;
         // Oplog: a DDL `op: "c"` `createIndexes` entry so a `showExpandedEvents`
         // change stream surfaces a `createIndexes` event (the projector reads
@@ -12250,7 +12411,7 @@ impl Storage {
             entry.insert("o", Bson::Document(o));
             self.emit_oplog(session, vec![entry], vec![None])?;
         }
-        Ok(true)
+        Ok(())
     }
 
     /// All indexes on `(db, coll)` in MongoDB's `listIndexes` shape (the virtual
@@ -14670,6 +14831,19 @@ impl Storage {
         coll: &str,
         name: &str,
     ) -> Result<()> {
+        self.delete_entries_prefix_upto(session, db, coll, name, None)
+            .map(|_| ())
+    }
+
+    /// Remove `name`'s entry rows, at most `max` of them; answers how many.
+    fn delete_entries_prefix_upto(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+        max: Option<usize>,
+    ) -> Result<usize> {
         let scan = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         scan.set_key_sssu(db, coll, name, b"");
         let mut packs: Vec<Vec<u8>> = Vec::new();
@@ -14684,7 +14858,7 @@ impl Storage {
             Err(e) if e.is_not_found() => false,
             Err(e) => return Err(e.into()),
         };
-        while more {
+        while more && max.is_none_or(|m| packs.len() < m) {
             let (d, c, n, packed) = scan.get_key_sssu()?;
             if d != db || c != coll || n != name {
                 break;
@@ -14702,7 +14876,7 @@ impl Storage {
                 Err(e) => return Err(e.into()),
             }
         }
-        Ok(())
+        Ok(packs.len())
     }
 
     /// Collection names registered under `db` (no lock, session-scoped — for

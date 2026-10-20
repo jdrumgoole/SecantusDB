@@ -66,7 +66,7 @@ def test_j_true_write_survives_sigkill(tmp_path: Any) -> None:
     assert kept == 50
 
 
-@pytest.mark.backlog("RM-187")
+@pytest.mark.backlog_fixed("RM-187")
 def test_index_build_completes_under_a_small_cache(tmp_path: Any) -> None:
     """mongod 8.2.11 builds an index over 1,000,000 300-byte documents at
     its minimum 0.25 GB cache. The Rust server, at `--cache-size 8M`, retries
