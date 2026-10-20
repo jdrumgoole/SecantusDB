@@ -393,14 +393,20 @@ jobs:
             vendor/mongo-rust-driver/target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
+      # The steps below run when the gauge step FAILED too (`!cancelled()`).
+      # A gauge whose generator exits non-zero on unexpected failures (slt
+      # does) still wrote its report, and that report is the finding: when
+      # these steps were skipped, a red lane's numbers never reached the
+      # reports PR, so a regression removed its own evidence. The lane stays
+      # red; a lane that wrote nothing fails again here on the missing file.
       - name: Show report summary
-        if: matrix.driver.report != ''
+        if: ${{ !cancelled() && matrix.driver.report != '' }}
         run: head -50 ${{ matrix.driver.report }}
 
       - name: Upload report artifact
         # Shard lanes (a `group` without a `report`) produce only a raw
         # artifact; their group's merge job renders the report.
-        if: matrix.driver.report != ''
+        if: ${{ !cancelled() && matrix.driver.report != '' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: report-${{ matrix.driver.name }}
@@ -412,6 +418,7 @@ jobs:
       # executes exactly one gauge, so its .validation/ holds only that gauge's
       # artifacts.
       - name: Upload raw gauge output
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: raw-${{ matrix.driver.name }}

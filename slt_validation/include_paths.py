@@ -59,8 +59,32 @@ EXPECTED_DIVERGENCES = {
         "SQLSTATE 22012 (~22k records in)"
     ),
     "random/expr/slt_good_0.test": (
-        "corpus expects SQLite's division-by-zero -> NULL; PG (and we) raise "
-        "SQLSTATE 22012 (~75k records in)"
+        "corpus expects SQLite's integer result 0 for NULLIF(int, numeric) / int; "
+        "PostgreSQL 15.19 computes in numeric (58.2...) and stops at line 45345. "
+        "The Rust server gives 0 there (RP-076) and stops later, at 62223"
+    ),
+    # The five below were measured on 2026-10-21: the Rust server and
+    # PostgreSQL 15.19 stop at the same line with the same error, in both
+    # protocols. The rest of each file is measured by neither.
+    "evidence/in2.test": (
+        "corpus expects SQLite's empty `IN ()`; PostgreSQL rejects it as a "
+        "syntax error (42601) at line 81"
+    ),
+    "evidence/slt_lang_update.test": (
+        "corpus expects SQLite to accept `SET x=3, x=4, x=5`; PostgreSQL "
+        "raises 42601 'multiple assignments to same column' at line 88"
+    ),
+    "random/expr/slt_good_10.test": (
+        "corpus expects SQLite's integer arithmetic (-1) where AVG makes the "
+        "expression numeric on PostgreSQL (-1.1886...), at line 4792"
+    ),
+    "random/groupby/slt_good_0.test": (
+        "corpus expects SQLite to accept an ungrouped column inside COALESCE; "
+        "PostgreSQL raises 42803 at line 30126"
+    ),
+    "random/groupby/slt_good_1.test": (
+        "corpus expects SQLite to accept an ungrouped column inside COALESCE; "
+        "PostgreSQL raises 42803 at line 476"
     ),
     "random/select/slt_good_0.test": (
         "the corpus expects the RUNNER to cast REAL results to int per the "
