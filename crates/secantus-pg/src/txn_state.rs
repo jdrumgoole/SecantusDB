@@ -15,6 +15,8 @@ use std::sync::{Mutex, MutexGuard};
 use bson::Document;
 use secantus_pgcatalog::TableDef;
 
+use crate::triggers::DeferredTrigger;
+
 /// A user type created (`Some(doc)`) or dropped (`None`) in the open
 /// transaction, overlaid on the committed catalog. Keyed by
 /// `(catalog collection, doc _id)`.
@@ -105,6 +107,48 @@ impl TxnMarks {
     }
 }
 
+/// `SET CONSTRAINTS` for the open transaction: ALL's mode, then each named
+/// constraint's (`true` = deferred).
+pub(crate) type ConstraintModes = (Option<bool>, HashMap<String, bool>);
+
+/// The open transaction's deferred constraint work: what COMMIT must still
+/// check, and the `SET CONSTRAINTS` modes that decide what is deferred. All
+/// of it belongs to one transaction. Only ROLLBACK used to clear it, so a
+/// `SET CONSTRAINTS ALL DEFERRED` in a committed block went on deferring
+/// the checks of every later block on the connection (RP-052).
+#[derive(Default)]
+pub(crate) struct DeferredChecks {
+    /// `(table, constraint name)` of every INITIALLY DEFERRED foreign key
+    /// (or deferred unique constraint) a write in the open transaction
+    /// touched; re-checked at COMMIT.
+    fks: Mutex<Vec<(String, String)>>,
+    /// INITIALLY DEFERRED constraint-trigger events queued for COMMIT.
+    triggers: Mutex<Vec<DeferredTrigger>>,
+    modes: Mutex<ConstraintModes>,
+}
+
+impl DeferredChecks {
+    pub(crate) fn fks(&self) -> MutexGuard<'_, Vec<(String, String)>> {
+        self.fks.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn triggers(&self) -> MutexGuard<'_, Vec<DeferredTrigger>> {
+        self.triggers.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn modes(&self) -> MutexGuard<'_, ConstraintModes> {
+        self.modes.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The transaction ended, committed or not: forget every queued check
+    /// and every `SET CONSTRAINTS` mode. A COMMIT runs its checks first.
+    pub(crate) fn clear(&self) {
+        self.fks().clear();
+        self.triggers().clear();
+        *self.modes() = (None, HashMap::new());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +166,18 @@ mod tests {
         marks.note_roles_written();
         assert!(!marks.end());
         assert!(!marks.roles_written());
+    }
+
+    #[test]
+    fn deferred_clear_forgets_queued_checks_and_set_constraints_modes() {
+        let deferred = DeferredChecks::default();
+        deferred.fks().push(("t".into(), "t_fk".into()));
+        deferred.modes().0 = Some(true);
+        deferred.modes().1.insert("t_fk".into(), true);
+        deferred.clear();
+        assert!(deferred.fks().is_empty());
+        assert!(deferred.triggers().is_empty());
+        assert_eq!(*deferred.modes(), (None, HashMap::new()));
     }
 
     #[test]
