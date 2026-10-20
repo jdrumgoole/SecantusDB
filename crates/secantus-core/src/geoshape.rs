@@ -1484,36 +1484,25 @@ pub(crate) mod sphere {
         polygon_contains(rings, p) && !rings.iter().any(|ring| ring.on_boundary(p))
     }
 
-    /// Whether some of a line is inside a polygon, as mongod clips the line
-    /// to the polygon (`polygonLineIntersection`): a line along the
-    /// boundary, or touching it from outside, has nothing inside, unless an
-    /// edge of it is an edge of the loop taken the loop's way, whose inside
-    /// is on its left (measured 8.2.11, 2026-10-15).
+    /// Whether some of a line is inside a polygon: mongod's
+    /// `polygonLineIntersection`, which clips the line to the polygon with
+    /// `S2Polygon::IntersectWithPolyline` and asks whether anything is left
+    /// (a line along the boundary meets it only where S2's crossing rules
+    /// put some of it inside; measured 8.2.11).
     fn line_meets_polygon(line: &[V], rings: &[Ring]) -> bool {
-        let boundary: Vec<(V, V)> = rings.iter().flat_map(|r| r.edges()).collect();
-        line.windows(2).any(|e| {
-            let (a, b) = (e[0], e[1]);
-            if boundary.iter().any(|(c, d)| *c == a && *d == b) {
-                return true;
-            }
-            // Cut the edge where it crosses the boundary, and look at the
-            // middle of each piece.
-            let mut cuts: Vec<(f64, V)> = vec![(0.0, a), (angle(a, b), b)];
-            for (c, d) in &boundary {
-                if crosses(a, b, *c, *d) {
-                    let mut x = normalized(cross(robust_cross(a, b), robust_cross(*c, *d)));
-                    if dot(x, sum(a, b)) < 0.0 {
-                        x = neg(x);
-                    }
-                    cuts.push((angle(a, x), x));
-                }
-            }
-            cuts.sort_by(|x, y| x.0.total_cmp(&y.0));
-            cuts.windows(2).any(|w| {
-                let mid = sum(w[0].1, w[1].1);
-                norm(mid) > 0.0 && well_inside(rings, normalized(mid))
+        use crate::s2legacy::loops::{Loop, Polygon};
+        use crate::s2legacy::point::Point;
+        let loops: Vec<Loop> = rings
+            .iter()
+            .map(|ring| {
+                let mut l = Loop::new(ring.v.iter().map(|v| Point(*v)).collect());
+                l.normalize();
+                l
             })
-        })
+            .collect();
+        let polygon = Polygon::new(loops);
+        let points: Vec<Point> = line.iter().map(|v| Point(*v)).collect();
+        polygon.clips_polyline(&points)
     }
 
     /// Whether the insides of two polygons overlap (`S2Polygon::Intersects`):

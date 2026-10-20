@@ -114,11 +114,12 @@ def test_2dsphere_cell_levels_are_checked(rust_mongo: Any, mongod: Any) -> None:
     assert _level_answers(rust_mongo) == _level_answers(mongod)
 
 
-@pytest.mark.backlog("RM-148")
+@pytest.mark.backlog_fixed("RM-148")
 def test_line_along_a_polygon_edge_on_the_antimeridian(rust_mongo: Any) -> None:
     """mongod 8.2.11: a line along lng 180 meets a polygon whose edge lies
-    on that meridian (its line-polygon test clips the line to the polygon);
-    this server's vertex and crossing test does not count a collinear edge."""
+    on that meridian (its line-polygon test clips the line to the polygon,
+    `S2Polygon::IntersectWithPolyline`, as this server does since
+    2026-10-20)."""
     db = _fresh(rust_mongo, "rmgeo_am")
     square = [[170, 0], [180, 0], [180, 10], [170, 10], [170, 0]]
     db.c.insert_one({"_id": 5, "loc": {"type": "Polygon", "coordinates": [square]}})

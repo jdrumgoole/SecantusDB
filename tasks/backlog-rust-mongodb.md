@@ -1013,19 +1013,13 @@ What the probe does not reach, each found beside it:
   replay past 2,000 documents (nearest first), `2dsphere` index versions 1
   and 2, and a Linux x86-64 mongod (the geo order is the macOS arm64
   reference's: libc++ heap, FMA).
-- [ ] **A line along a polygon's edge on the antimeridian.** A line along
-      lng 180 against a polygon whose edge lies on that meridian meets it on
-      mongod 8.2.11 (`polygonLineIntersection` clips the line to the
-      polygon) and does not here. Line against line is S2's own
-      `S2Polyline::Intersects` since 2026-10-20, exact predicates and
-      symbolic perturbation included (a line ending exactly on another
-      line's edge, and collinear lines, answer as on mongod). Line within
-      polygon, polygon within polygon and line against polygon are still
-      vertex and crossing tests with a 1.5e-9 tolerance, not S2's clipping;
-      they agreed with mongod on everything else probed (`geo_queries.py`,
-      1,278 replies, none differ).
-      Backlog-ID: RM-148
-      Verify: tests/backlog/test_rm_geo_residuals.py::test_line_along_a_polygon_edge_on_the_antimeridian
+- **Line against line and line against polygon are S2's own** (RM-148,
+  closed 2026-10-20): `S2Polyline::Intersects` and mongod's
+  `polygonLineIntersection` (`S2Polygon::IntersectWithPolyline`), with S2's
+  exact predicates. Line within polygon and polygon within polygon are
+  still vertex and crossing tests with a 1.5e-9 tolerance, not S2's
+  clipping; they agreed with mongod on everything probed
+  (`geo_queries.py`, 1,278 replies, none differ).
 
 ### 7.080 The order `find` returns documents in -- 2026-10-13
 
@@ -1436,11 +1430,8 @@ retryable writes). The Rust server differs on 11 scenarios. What is left:
       whole life (RM-084), so the second transaction's statement fails with 24
       LockTimeout after `maxTransactionLockRequestTimeoutMillis` (since
       2026-10-20; before that it waited for the first transaction to end, and
-      could stop the server answering: RM-201, fixed). Also from the lock
-      manager: a queued exclusive request does not hold back a later intent
-      request, where mongod's queue does (a transaction's insert behind a
-      waiting `drop` times out on mongod and goes ahead here; see RM-138).
-      Measured with `tools/probes/transactions.py`: 2 of 267 scenarios.
+      could stop the server answering: RM-201, fixed). Measured with
+      `tools/probes/transactions.py`: 2 of 267 scenarios.
       Backlog-ID: RM-202
       Verify: tests/backlog/test_rm_057_084.py::test_a_collection_made_in_two_transactions
 
@@ -2086,14 +2077,6 @@ touched:
 
 ## Weekly validate.yml failures (2026-08-03 triage)
 
-- [ ] **Rust server: a `drop` queued behind live writers starves
-  indefinitely (lock fairness).** Observed during the 2026-08-11
-  concurrency-report refresh. The bench harness now avoids the problem
-  (fresh per-row collection names) rather than the server fixing it.
-  Reproduce: run a multi-writer churn against one collection and issue `drop`
-  on it mid-churn.
-  Backlog-ID: RM-138
-  Verify: none -- seen only under bench-level write load; a light-load test passes and proves nothing
 
 ## The macOS `test` lane wedges for its whole 30-minute cap, rarely (2026-09-18)
 

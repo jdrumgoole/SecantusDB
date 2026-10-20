@@ -19,10 +19,11 @@
 mod cap;
 mod cell;
 mod cellid;
+mod clip;
 mod coverer;
 pub(crate) mod edge;
 mod interval;
-mod loops;
+pub(crate) mod loops;
 pub(crate) mod point;
 mod region;
 
