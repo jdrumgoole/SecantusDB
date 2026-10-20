@@ -684,18 +684,6 @@ inject (a panic, a power loss, a failing checkpoint).
       it, is the fix.
       Backlog-ID: RM-189
       Verify: none -- needs a checkpoint failure injected at shutdown
-- [ ] **Point-in-time-recovery oplog segments and backup archives are never
-      synced to disk.** `pitr_archive::write_segment` writes a `.part` file
-      and renames it with no `sync_all` on the file or the directory (there
-      is none anywhere in the crate); `prune_oplog` then deletes the archived
-      rows from WiredTiger, and the next checkpoint makes that delete durable
-      while the segment may still be only in the page cache. A power loss can
-      leave a missing or empty segment: a permanent gap in the recovery
-      chain. `create_archive` writes straight to `output_path` with no
-      temporary file, so a failure part-way leaves a truncated archive under
-      the final name.
-      Backlog-ID: RM-190
-      Verify: none -- needs a power loss between the segment write and the checkpoint
 - [ ] **`count({})`, `collStats`, `dataSize` and `dbStats` read the whole
       collection into memory.** `scan_docs` returns a `Vec` of every
       document's bytes; `count_matching` with an empty filter is

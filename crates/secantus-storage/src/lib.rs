@@ -7478,8 +7478,43 @@ impl Storage {
         session.checkpoint(None)?;
         let manifest = self.pitr_manifest()?;
         let cursor = session.open_cursor("backup:", None)?;
-        let file =
-            std::fs::File::create(output_path).map_err(|e| archive_err("create_archive", e))?;
+        // Written under a temporary name and renamed once synced, so a
+        // failure part-way never leaves a truncated archive under the final
+        // name, and a finished one survives a power loss (RM-190).
+        let final_path = std::path::Path::new(output_path);
+        let dir = final_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        let part = dir.join(format!(
+            ".{}.part",
+            final_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+        let written = self.write_archive_file(&cursor, &part, &manifest);
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&part); // the error below is the headline
+            return Err(e);
+        }
+        std::fs::rename(&part, final_path).map_err(|e| archive_err("create_archive", e))?;
+        pitr_archive::sync_dir(dir).map_err(|e| archive_err("create_archive", e))?;
+        let size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+        Ok(ArchiveInfo {
+            path: output_path.to_string(),
+            size_bytes: size,
+        })
+    }
+
+    /// Tar the backup cursor's files and the manifest into `path`, synced.
+    fn write_archive_file(
+        &self,
+        cursor: &Cursor,
+        path: &std::path::Path,
+        manifest: &serde_json::Value,
+    ) -> Result<()> {
+        let file = std::fs::File::create(path).map_err(|e| archive_err("create_archive", e))?;
         let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
         let mut builder = tar::Builder::new(enc);
         while cursor.next()? {
@@ -7490,7 +7525,7 @@ impl Storage {
                 .map_err(|e| archive_err("create_archive", e))?;
         }
         let data =
-            serde_json::to_vec(&manifest).map_err(|e| archive_err("create_archive manifest", e))?;
+            serde_json::to_vec(manifest).map_err(|e| archive_err("create_archive manifest", e))?;
         let mut header = tar::Header::new_gnu();
         header.set_size(data.len() as u64);
         header.set_mode(0o644);
@@ -7502,12 +7537,10 @@ impl Storage {
             .into_inner()
             .map_err(|e| archive_err("create_archive", e))?
             .finish()
+            .map_err(|e| archive_err("create_archive", e))?
+            .sync_all()
             .map_err(|e| archive_err("create_archive", e))?;
-        let size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
-        Ok(ArchiveInfo {
-            path: output_path.to_string(),
-            size_bytes: size,
-        })
+        Ok(())
     }
 
     /// Take a PITR v2 base snapshot into `archive_dir`, named by its oplog head
