@@ -640,8 +640,14 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       `createIndexes` and a `dropIndexes` read as mongod 8.2.11 writes them,
       with its `t` and `v`. Open:
       - a retryable write's entries carry no session: mongod stamps them
-        with `lsid`, `txnNumber`, `stmtId` and a `prevOpTime` chain (and
-        `multiOpType` on a group), which a resharding or tenant tool reads;
+        with `lsid`, `txnNumber`, `stmtId` and a `prevOpTime` chain
+        (`multiOpType: 1` on an insert group, each insert its `stmtId`), and
+        a `findAndModify` with `needsRetryImage` (measured 8.2.11: a
+        multi-document update or delete carries none). The statement ids
+        have to reach storage through the retry paths in `session.rs`,
+        which re-run only a batch's fresh statements;
+      - a multi-document delete is one entry per document, where mongod
+        writes `applyOps` batches of the deletes (no session);
       - an index build over documents is one `createIndexes`, where mongod
         writes `startIndexBuild` / `commitIndexBuild` and rows in
         `config.system.indexBuilds`.
