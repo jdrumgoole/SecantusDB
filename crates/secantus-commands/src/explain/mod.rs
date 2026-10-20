@@ -22,6 +22,7 @@ pub(crate) mod distinct;
 mod exec;
 pub(crate) mod geo;
 pub(crate) mod hoist;
+mod json_schema;
 mod node;
 pub(crate) mod order;
 mod parsed;

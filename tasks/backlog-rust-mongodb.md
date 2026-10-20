@@ -988,9 +988,9 @@ Still different, all 77:
   rendered by `explain::debug_string` from the parsed query, and what each
   command adds to it (paging, projection, collation) was measured per
   command. Pinned by `tests/backlog/test_rm_029_056.py::test_unknown_hint_on_aggregate`
-  and `tests/backlog/test_rm_planner_text.py`. Not rendered as mongod
-  renders them: `$jsonSchema` (RM-196), `$where`, and `$near` (whose
-  refusal is a different error).
+  and `tests/backlog/test_rm_planner_text.py`. `$jsonSchema` prints as the
+  predicates it parses into (since 2026-10-20); `$near` is refused in
+  words of its own before any plan.
 - [ ] **The order of an unsorted `find` for six predicate shapes the
       plan derives differently from mongod.** Found by p4-router's
       824-case shapes harness (2026-10-15), mongod 8.2.11: 22 replies, the
@@ -1234,16 +1234,6 @@ What is left, all on the RUST MongoDB server:
       **Decided 2026-10-16 (Joe):** as RM-071, transcribe and execute.
       Backlog-ID: RM-072
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view
-- [ ] **`$jsonSchema` is echoed, not parsed.** mongod 8.2.11 translates a
-      `$jsonSchema` into the match expressions it stands for, and prints
-      those in `parsedQuery` and in its planner's query tree:
-      `{$jsonSchema: {required: ["a"]}}` parses as `{a: {$exists: true}}`;
-      richer schemas become mongod's internal `$_internalSchema*`
-      operators. This server echoes the schema in both places. The query's
-      answer is not affected (the schema is evaluated as written). Found
-      2026-10-20 while reproducing the query tree.
-      Backlog-ID: RM-196
-      Verify: tests/backlog/test_rm_planner_text.py::test_json_schema_is_parsed_as_mongod_parses_it
 
 ### 7.074 Change streams, command by command -- 2026-10-11
 

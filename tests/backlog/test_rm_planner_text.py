@@ -5,11 +5,12 @@ mongod 8.2.11)."""
 from __future__ import annotations
 
 import datetime
+import json
 from collections.abc import Callable
 from typing import Any
 
 import pytest
-from bson import Binary, Regex
+from bson import Binary, Regex, json_util
 
 from tests.backlog.conftest import mongo_answer
 
@@ -280,17 +281,64 @@ def test_time_series_hint_refusal_prints_the_bucket_query(rust_mongo: Any, mongo
     assert got == ref
 
 
-def _json_schema(client: Any) -> Any:
+SCHEMAS: list[dict] = [
+    {"required": ["a"]},
+    {"required": ["a", "b"]},
+    {"type": "array"},
+    {"properties": {"a": {"type": "number"}}},
+    {"properties": {"a": {"bsonType": ["int", "long"]}}},
+    {"properties": {"a": {"minimum": 2}}},
+    {"properties": {"a": {"maximum": 2, "exclusiveMaximum": True}}},
+    {"properties": {"a": {"enum": [1, "x"]}}},
+    {"properties": {"a": {"minLength": 1, "maxLength": 3}}},
+    {"properties": {"a": {"pattern": "^x"}}},
+    {"properties": {"a": {"multipleOf": 2.5}}},
+    {"properties": {"a": {"uniqueItems": True}}},
+    {"properties": {"a": {"items": {"type": "number"}}}},
+    {"properties": {"a": {"items": [{"type": "number"}], "additionalItems": {"type": "string"}}}},
+    {"properties": {"a": {"properties": {"b": {"type": "number"}}}}},
+    {
+        "properties": {
+            "a": {"bsonType": "object", "required": ["x"], "properties": {"x": {"type": "string"}}}
+        },
+        "required": ["a"],
+    },
+    {"properties": {"a": {"type": "number", "minimum": 1, "maximum": 9}}},
+    {"properties": {"a": {"type": "string", "minimum": 1}}},
+    {"properties": {"a": {"bsonType": ["int", "long"], "minimum": 1}}},
+    {"properties": {"a": {"oneOf": [{"type": "number"}, {"type": "string"}]}}},
+    {"minProperties": 1},
+    {"additionalProperties": False},
+    {"patternProperties": {"^x": {"type": "number"}}},
+    {"not": {"required": ["a"]}},
+    {"anyOf": [{"required": ["a"]}, {"required": ["b"]}]},
+    {"oneOf": [{"required": ["a"]}, {"required": ["b"]}]},
+    {"dependencies": {"a": ["b"]}},
+    {"properties": {"a": {"type": "number"}}, "required": ["a"]},
+]
+
+
+def _json_schema(client: Any) -> list:
     coll = client["rm196"]["c"]
     coll.drop()
     coll.insert_one({"a": 1})
-    return coll.find({"$jsonSchema": {"required": ["a"]}}).explain()["queryPlanner"]["parsedQuery"]
+    out = []
+    for schema in SCHEMAS:
+        parsed = coll.find({"$jsonSchema": schema}).explain()["queryPlanner"]["parsedQuery"]
+        client.admin.command("setParameter", 1, notablescan=True)
+        try:
+            tree = mongo_answer(lambda schema=schema: list(coll.find({"$jsonSchema": schema})))
+        finally:
+            client.admin.command("setParameter", 1, notablescan=False)
+        out.append(json.loads(json_util.dumps((parsed, tree))))
+    return out
 
 
-@pytest.mark.backlog("RM-196")
+@pytest.mark.backlog_fixed("RM-196")
 def test_json_schema_is_parsed_as_mongod_parses_it(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 translates `$jsonSchema` into the predicates it stands
-    for: `{required: ["a"]}` parses as `{a: {$exists: true}}`. This server
-    echoes the schema."""
+    for (`{required: ["a"]}` parses as `{a: {$exists: true}}`, a property's
+    keywords hold only where they apply, ...), and prints them in
+    `parsedQuery` and in its planner's query tree."""
     got, ref = _both(rust_mongo, mongod, _json_schema)
     assert got == ref

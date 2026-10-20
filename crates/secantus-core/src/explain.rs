@@ -52,6 +52,25 @@ fn match_type_rank(op: &str) -> i32 {
         "$_internalExprGte" => 24,
         "$_internalExprLt" => 25,
         "$_internalExprLte" => 26,
+        // What `$jsonSchema` parses into, after every other match type, in
+        // mongod's enum order (the order its tree sort uses).
+        "$_internalSchemaAllElemMatchFromIndex" => 30,
+        "$_internalSchemaAllowedProperties" => 31,
+        "$_internalSchemaCond" => 32,
+        "$_internalSchemaEq" => 33,
+        "$_internalSchemaFmod" => 34,
+        "$_internalSchemaMatchArrayIndex" => 35,
+        "$_internalSchemaMaxItems" => 36,
+        "$_internalSchemaMaxLength" => 37,
+        "$_internalSchemaMaxProperties" => 38,
+        "$_internalSchemaMinItems" => 39,
+        "$_internalSchemaMinLength" => 40,
+        "$_internalSchemaMinProperties" => 41,
+        "$_internalSchemaObjectMatch" => 42,
+        "$_internalSchemaRootDocEq" => 43,
+        "$_internalSchemaType" => 44,
+        "$_internalSchemaUniqueItems" => 45,
+        "$_internalSchemaXor" => 46,
         // Anything unmeasured sorts AFTER everything measured, rather than
         // colliding at rank 0 with `$and`.
         _ => 99,
@@ -437,8 +456,8 @@ fn canonical_children(value: &Bson) -> Vec<Document> {
 ///
 /// Anything unmeasured passes through unchanged rather than being guessed at.
 /// `$expr` is optimised and gains mongod's index-usable twins
-/// (`crate::expr_rewrite`); the known residue against 8.2.11 is
-/// `$jsonSchema`, echoed as sent.
+/// (`crate::expr_rewrite`). `$jsonSchema` is echoed here and translated by
+/// the command layer (`secantus-commands`' `explain::json_schema`).
 pub fn canonical_match(filter: &Bson) -> Document {
     let Bson::Document(doc) = filter else {
         return Document::new();
