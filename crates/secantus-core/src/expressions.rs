@@ -727,6 +727,24 @@ const REQUIRED_NON_EMPTY: &[(&str, &str, i32, &str)] = &[
 /// mongod's own code and message. `Ok(())` when nothing is missing -- including
 /// for every operator not named in the tables, which are unaffected.
 pub fn check_required_fields(op: &str, arg: &Bson) -> Result<(), Fallback> {
+    if FCV_BEFORE_82.with(std::cell::Cell::get) && ADDED_IN_82.contains(&op) {
+        return Err(Fallback::mongo(
+            224,
+            format!(
+                "{op} is not allowed in the current feature compatibility version. See \
+                 https://docs.mongodb.com/master/release-notes/8.0-compatibility/\
+                 #feature-compatibility for more information."
+            ),
+        )
+        .bare());
+    }
+    match op {
+        "$sigmoid" => return sigmoid_parse(arg),
+        "$similarityCosine" | "$similarityDotProduct" | "$similarityEuclidean" => {
+            return similarity_parse(op, arg).map(|_| ())
+        }
+        _ => {}
+    }
     let Bson::Document(d) = arg else {
         return Ok(()); // array / scalar forms are a different parse
     };
@@ -916,6 +934,10 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$ceil" => op_floor_ceil(arg, ctx, true),
         "$sqrt" => op_sqrt(arg, ctx),
         "$exp" => op_exp(arg, ctx),
+        "$sigmoid" => eval(&sigmoid_form(arg), ctx),
+        "$similarityCosine" | "$similarityDotProduct" | "$similarityEuclidean" => {
+            op_similarity(op, arg, ctx)
+        }
         "$ln" => op_ln(arg, ctx),
         "$log" => op_log(arg, ctx),
         "$log10" => op_log10(arg, ctx),
@@ -977,6 +999,11 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
 /// unknown-expression error, so it must stay in step with `apply_op`'s arms
 /// (guarded by a test).
 pub const KNOWN_EXPR_OPS: &[&str] = &[
+    // Added in 8.2 (refused under FCV 8.0 by the command layer).
+    "$sigmoid",
+    "$similarityCosine",
+    "$similarityDotProduct",
+    "$similarityEuclidean",
     "$literal",
     "$const",
     "$eq",
@@ -6865,6 +6892,218 @@ fn op_exp(arg: &Bson, ctx: &Ctx) -> R {
     }
 }
 
+/// The expressions 8.2 added, which mongod 8.2.11 refuses (224) while the
+/// feature compatibility version is 8.0 (measured 2026-10-20).
+pub const ADDED_IN_82: &[&str] = &[
+    "$sigmoid",
+    "$similarityCosine",
+    "$similarityDotProduct",
+    "$similarityEuclidean",
+];
+
+thread_local! {
+    /// Whether the command this thread runs is parsed under FCV 8.0.
+    static FCV_BEFORE_82: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Restores the previous FCV gate when dropped.
+pub struct FcvGuard(bool);
+
+impl Drop for FcvGuard {
+    fn drop(&mut self) {
+        FCV_BEFORE_82.with(|g| g.set(self.0));
+    }
+}
+
+/// Parse this thread's expressions under a feature compatibility version
+/// before 8.2 (`true`) until the guard drops: the features 8.2 added are
+/// refused.
+#[must_use]
+pub fn gate_fcv(before_82: bool) -> FcvGuard {
+    FcvGuard(FCV_BEFORE_82.with(|g| g.replace(before_82)))
+}
+
+/// `$sigmoid` (8.2): what mongod 8.2.11 rewrites it to when it parses it,
+/// `1 / (1 + e^(-x))` written in the operators it already has, so a
+/// non-numeric argument fails in `$multiply` and `explain` prints this form
+/// (measured 2026-10-20).
+pub fn sigmoid_form(arg: &Bson) -> Bson {
+    let minus = bson::doc! { "$multiply": [-1, arg.clone()] };
+    let exp = bson::doc! { "$exp": [minus] };
+    let sum = bson::doc! { "$add": [1, exp] };
+    Bson::Document(bson::doc! { "$divide": [1, sum] })
+}
+
+/// `$sigmoid`'s parse-time check: a literal string or array is refused
+/// before the rewrite (mongod 8.2.11); anything else goes to `$multiply`.
+fn sigmoid_parse(arg: &Bson) -> Result<(), Fallback> {
+    let refused = match arg {
+        Bson::String(s) => !s.starts_with('$'),
+        Bson::Array(_) => true,
+        _ => false,
+    };
+    if refused {
+        return Err(Fallback::mongo(
+            14,
+            format!(
+                "$sigmoid only supports numeric types, not {}",
+                crate::query::bson_type_name(arg)
+            ),
+        )
+        .bare());
+    }
+    Ok(())
+}
+
+/// The two vector expressions and the `score` flag of a `$similarity*`
+/// argument, or mongod 8.2.11's parse error for it (measured 2026-10-20):
+/// `[a, b]`, or `{vectors: [a, b], score: <bool>}`.
+fn similarity_parse(op: &str, arg: &Bson) -> Result<(Bson, Bson, bool), Fallback> {
+    let two = |items: &[Bson]| match items {
+        [a, b] => Ok((a.clone(), b.clone())),
+        _ => Err(Fallback::mongo(10413209, format!("{op} requires exactly two vectors")).bare()),
+    };
+    match arg {
+        Bson::Array(items) => two(items).map(|(a, b)| (a, b, false)),
+        Bson::Document(d) => {
+            if let Some(unknown) = d.keys().find(|k| *k != "vectors" && *k != "score") {
+                return Err(Fallback::mongo(
+                    10413207,
+                    format!("{op} found an unknown argument: {unknown}"),
+                )
+                .bare());
+            }
+            let score = match d.get("score") {
+                None => false,
+                Some(Bson::Boolean(b)) => *b,
+                Some(_) => {
+                    return Err(Fallback::mongo(
+                        10413206,
+                        "score must be a boolean, but found object",
+                    )
+                    .bare())
+                }
+            };
+            match d.get("vectors") {
+                None => two(&[]).map(|(a, b)| (a, b, score)),
+                Some(Bson::Array(items)) => two(items).map(|(a, b)| (a, b, score)),
+                Some(other) => Err(Fallback::mongo(
+                    10413205,
+                    format!(
+                        "vectors must be an array of expressions, but found {}",
+                        crate::query::bson_type_name(other)
+                    ),
+                )
+                .bare()),
+            }
+        }
+        other => Err(Fallback::mongo(
+            10413208,
+            format!(
+                "{op} only supports an object or array as an argument, but found{}",
+                crate::query::bson_type_name(other)
+            ),
+        )
+        .bare()),
+    }
+}
+
+/// `$similarityCosine` / `$similarityDotProduct` / `$similarityEuclidean`
+/// (8.2): a double, computed in binary floating point whatever the
+/// elements' types; null when either vector is null or missing. With
+/// `score: true` it is rescaled to [0, 1] as mongod rescales it: `(1 + x) /
+/// 2` for the cosine and the dot product, `1 / (1 + d)` for the distance.
+/// mongod never folds these, so even literal vectors fail at execution.
+fn op_similarity(op: &str, arg: &Bson, ctx: &Ctx) -> R {
+    let (first, second, score) = similarity_parse(op, arg)?;
+    let a = eval(&first, ctx)?;
+    let b = eval(&second, ctx)?;
+    if matches!(a, Bson::Null | Bson::Undefined) || matches!(b, Bson::Null | Bson::Undefined) {
+        return Ok(Bson::Null);
+    }
+    let vector = |v: &Bson, which: &str, array_code: i32| match v {
+        Bson::Array(items) => Ok(items.clone()),
+        other => Err(Fallback::mongo(
+            array_code,
+            format!(
+                "{which} argument to {op} must be an array, but is of type: {}",
+                crate::query::bson_type_name(other)
+            ),
+        )
+        .with_folded(false)),
+    };
+    let a = vector(&a, "First", 10413200)?;
+    let b = vector(&b, "Second", 10413201)?;
+    if a.len() != b.len() {
+        return Err(Fallback::mongo(
+            10413202,
+            format!(
+                "Array arguments to {op} must be the same size, but the first is of size {} \
+                 and the second is of size {}",
+                a.len(),
+                b.len()
+            ),
+        )
+        .with_folded(false));
+    }
+    let numbers = |items: &[Bson], which: &str, code: i32| {
+        items
+            .iter()
+            .map(|v| match v {
+                Bson::Int32(n) => Ok(f64::from(*n)),
+                Bson::Int64(n) => Ok(*n as f64),
+                Bson::Double(d) => Ok(*d),
+                Bson::Decimal128(d) => d.to_string().parse::<f64>().map_err(|_| Fallback::Defer),
+                _ => Err(Fallback::mongo(
+                    code,
+                    format!("All elements in the {which} argument to {op} must be numeric"),
+                )
+                .with_folded(false)),
+            })
+            .collect::<Result<Vec<f64>, Fallback>>()
+    };
+    let a = numbers(&a, "first", 10413203)?;
+    let b = numbers(&b, "second", 10413204)?;
+    let dot = || a.iter().zip(&b).fold(0.0, |acc, (x, y)| acc + x * y);
+    let value = match op {
+        "$similarityDotProduct" => {
+            let d = dot();
+            if score {
+                (1.0 + d) / 2.0
+            } else {
+                d
+            }
+        }
+        "$similarityEuclidean" => {
+            let d = a
+                .iter()
+                .zip(&b)
+                .fold(0.0, |acc, (x, y)| acc + (x - y) * (x - y))
+                .sqrt();
+            if score {
+                1.0 / (1.0 + d)
+            } else {
+                d
+            }
+        }
+        _ => {
+            let norm = |v: &[f64]| v.iter().fold(0.0, |acc, x| acc + x * x).sqrt();
+            let (na, nb) = (norm(&a), norm(&b));
+            let c = if na == 0.0 || nb == 0.0 {
+                0.0
+            } else {
+                dot() / (na * nb)
+            };
+            if score {
+                (1.0 + c) / 2.0
+            } else {
+                c
+            }
+        }
+    };
+    Ok(Bson::Double(value))
+}
+
 // `$ln`: natural log. A non-positive argument is mongod's Location28766 —
 // defer so Python raises it (NaN passes through as ln(nan) = nan). Mirrors
 // `expressions._op_ln`.
@@ -10084,5 +10323,66 @@ mod log_decimal_tests {
             run(bson!({"$log": [dec("NaN"), dec("10")]})),
             Bson::Double(d) if d.is_nan()
         ));
+    }
+}
+
+#[cfg(test)]
+mod added_in_82_tests {
+    use super::*;
+    use bson::doc;
+
+    fn value(expr: Bson) -> Result<Bson, Option<(i32, String)>> {
+        evaluate(&doc! {"x": 2, "v": [1, 2]}, &expr, &Document::new())
+            .map_err(|e| e.as_mongo().map(|(c, m)| (c, m.to_string())))
+    }
+
+    /// mongod 8.2.11's answers (2026-10-20).
+    #[test]
+    fn sigmoid_and_similarity_answer_as_mongod_does() {
+        let f = |b: Bson| b.as_f64().unwrap();
+        assert_eq!(f(value(Bson::Document(doc! {"$sigmoid": 0})).unwrap()), 0.5);
+        assert_eq!(
+            f(value(Bson::Document(doc! {"$sigmoid": "$x"})).unwrap()),
+            0.8807970779778823
+        );
+        assert_eq!(
+            value(Bson::Document(doc! {"$sigmoid": Bson::Null})),
+            Ok(Bson::Null)
+        );
+        let cos = Bson::Document(doc! {"$similarityCosine": [[1, 2], [1, 2]]});
+        assert_eq!(f(value(cos).unwrap()), 0.9999999999999998);
+        let dot = Bson::Document(
+            doc! {"$similarityDotProduct": {"vectors": [[1, 2], [2, 1]], "score": true}},
+        );
+        assert_eq!(f(value(dot).unwrap()), 2.5);
+        let euclid = Bson::Document(doc! {"$similarityEuclidean": [[1, 2], [4, 6]]});
+        assert_eq!(f(value(euclid).unwrap()), 5.0);
+        let zero = Bson::Document(doc! {"$similarityCosine": [[0, 0], [1, 1]]});
+        assert_eq!(f(value(zero).unwrap()), 0.0);
+        let sizes = Bson::Document(doc! {"$similarityCosine": ["$v", [3]]});
+        assert_eq!(value(sizes).unwrap_err().unwrap().0, 10413202);
+        let text = Bson::Document(doc! {"$similarityCosine": [[1, "a"], [1, 1]]});
+        assert_eq!(value(text).unwrap_err().unwrap().0, 10413203);
+    }
+
+    #[test]
+    fn the_parse_checks_and_the_fcv_gate() {
+        let refused = |op: &str, arg: Bson| check_required_fields(op, &arg).unwrap_err();
+        assert_eq!(
+            refused("$sigmoid", Bson::String("x".into()))
+                .as_mongo()
+                .unwrap()
+                .0,
+            14
+        );
+        assert!(check_required_fields("$sigmoid", &Bson::Boolean(true)).is_ok());
+        let one = Bson::Array(vec![Bson::Array(vec![])]);
+        assert_eq!(
+            refused("$similarityCosine", one).as_mongo().unwrap().0,
+            10413209
+        );
+        let _gate = gate_fcv(true);
+        let gated = refused("$similarityEuclidean", Bson::Array(vec![]));
+        assert_eq!(gated.as_mongo().unwrap().0, 224);
     }
 }

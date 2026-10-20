@@ -561,10 +561,19 @@ pub fn is_constant_expression(expr: &Bson, bound: &[String]) -> bool {
             // variable from the input, so `$map` over a literal still does not
             // fold (probed). `$getField` never folds either -- not even with a
             // wholly literal `input` (`{$getField: {field: 0, input: {a: 1}}}`
-            // is an EXECUTOR error on 8.2.11, probed 2026-09-02).
+            // is an EXECUTOR error on 8.2.11, probed 2026-09-02). Nor do the
+            // `$similarity*` expressions 8.2 added: two literal vectors of
+            // different sizes are an executor error (probed 2026-10-20).
             if matches!(
                 op.as_str(),
-                "$rand" | "$map" | "$filter" | "$reduce" | "$getField"
+                "$rand"
+                    | "$map"
+                    | "$filter"
+                    | "$reduce"
+                    | "$getField"
+                    | "$similarityCosine"
+                    | "$similarityDotProduct"
+                    | "$similarityEuclidean"
             ) {
                 return false;
             }

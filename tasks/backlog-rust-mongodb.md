@@ -226,49 +226,34 @@ These are explicit non-goals. Don't add them without a reason.
 ## 5. Known bugs and edge cases to watch
 
 
-- [ ] **OPEN — the Go gauge's remaining failures, triaged (2026-09-29; 6
-      leaves as of the 2026-10-15 run).** The gauge completes 659 of 659 and
-      reads 598 / 12 / 49 = 98.0% (`docs/validation-report-go-rust-server.md`,
-      measured 2026-10-15, the same six leaves as 2026-10-09;
-      `TestSDAMProse/heartbeats_processed_more_frequently` passes). The 12
-      fail events are 6 distinct leaves:
+- [ ] **OPEN — the Go gauge's two mongocryptd leaves: confirm how session
+      support is advertised.** The gauge completes 659 of 659 and read 598 /
+      12 / 49 = 98.0% on 2026-10-15 (`docs/validation-report-go-rust-server.md`).
+      Its six failing leaves, as of 2026-10-20:
 
       | leaf | needs |
       | --- | --- |
-      | `TestConnectionPoolBackpressure` | an ingress rate limiter AND `$where` |
+      | `TestConnectionPoolBackpressure` | `$where` (the ingress rate limiter it sets is honoured since 2026-10-20) |
       | `TestSDAMErrorHandling/.../pool_not_cleared_on_timeout_network_error` | `$where` |
       | `TestSDAMErrorHandling/.../pool_not_cleared_on_context_cancellation` | `$where` |
       | `TestRetryableReadsProse/.../overload_errors_retried_on_a_different_replicaset_server` | a second replica-set member (non-goal) |
       | `TestSessionsMongocryptdProse/18.` | a `mongocryptd` binary on PATH |
       | `TestSessionsMongocryptdProse/19.` | a `mongocryptd` binary on PATH |
 
-      * **`TestConnectionPoolBackpressure`** sets four
-        `ingressConnectionEstablishment*` parameters — a real mongod
-        connection rate limiter we have no equivalent of — then fires 100
-        concurrent finds with `$where: sleep(2000)` and asserts ≥10 checkout
-        FAILURES. It needs (a) that rate limiter and (b) server-side
-        JavaScript. `setParameter` refuses those parameters deliberately
-        rather than accepting names we do not honour.
-      * **The two `TestSDAMErrorHandling` cases are not pool-clearing bugs.**
-        Both issue a `find` with
-        `{$where: "function() { sleep(1000); return false; }"}` and abandon it
-        client-side after 100ms; the pool assertion is never reached. A real
-        `mongod --noscripting` fails them with byte-identical messages. They
-        stay red and un-skipped deliberately: excluding them would hide the
-        `$where` gap, and they will pass by themselves if a script engine
-        ever lands. The sibling `pool_cleared_on_non-timeout_network_error`
-        passes.
-      * **The two mongocryptd cases** need a server that reports NO
-        `logicalSessionTimeoutMinutes` (the mongocryptd shape). Likely out of
-        scope with CSFLE, but the mechanism — how we advertise session
-        support — is ours, so confirm rather than assume.
-
-      Reproduce any of them directly rather than through the gauge:
-      `cd vendor/mongo-go-driver && MONGODB_URI=mongodb://127.0.0.1:<port> go test
-      ./internal/integration/ -run '<TestName>' -timeout 60s -count=1 -v`
-      against a daemon WITHOUT `--standalone` (several are replica-set-gated).
+      The three `$where` leaves fail on a `mongod --noscripting` 8.2.11 the
+      same way (measured 2026-10-20 for the backpressure test: 1 checkout
+      failure of the 10 it wants) and are recorded as expected failures
+      (`validation_summary/expected_failures.py`); no JavaScript engine is
+      built (scope decision, Joe 2026-10-16). What is left: the two
+      mongocryptd cases need a server that reports NO
+      `logicalSessionTimeoutMinutes` (the mongocryptd shape). Likely out of
+      scope with CSFLE, but how this server advertises session support is
+      its own, so confirm it with a mongocryptd binary rather than assume.
+      Reproduce: `cd vendor/mongo-go-driver && MONGODB_URI=mongodb://127.0.0.1:<port>
+      go test ./internal/integration/ -run '<TestName>' -timeout 60s -count=1 -v`
+      against a daemon WITHOUT `--standalone`.
       Backlog-ID: RM-008
-      Verify: tests/backlog/test_rm_001_028.py::test_ingress_connection_rate_limiter_parameters
+      Verify: none -- needs a mongocryptd binary (MongoDB Enterprise) to compare with
 
 - **Scope decision — no server-side JavaScript** (Joe, 2026-10-16,
   formerly RM-009). `$where`, `$function`, `$accumulator` and `mapReduce`
@@ -276,10 +261,10 @@ These are explicit non-goals. Don't add them without a reason.
   query, 2 in an aggregation `$match`, 31264 for mapReduce); MongoDB
   deprecated all four in 8.0. Pinned by
   `tests/test_mongod_differential.py::test_where_refusal_matches_a_scriptless_mongod`
-  / `::test_where_in_aggregate_match_is_a_context_error`. The two Go
-  `TestSDAMErrorHandling` leaves that need a `$where` to run are expected
-  failures; `TestConnectionPoolBackpressure` is not, because it also needs
-  the ingress rate limiter (RM-008).
+  / `::test_where_in_aggregate_match_is_a_context_error`. The three Go
+  leaves that need a `$where` to run (the two `TestSDAMErrorHandling` cases
+  and `TestConnectionPoolBackpressure`, whose rate limiter is honoured since
+  2026-10-20) are expected failures.
 
 - **Not a defect: the C gauge's two `/Client/ipv6/single` failures.** The
       test hard-codes `[::1]:27017` (documented as inherent); they are the gauge's only failures (790 / 2 / 46 of 838 with both
@@ -718,12 +703,28 @@ may run a command.
       the localhost exception is used.
       Backlog-ID: RM-024
       Verify: none -- the probe's mongod topology (standalone vs replica set), not a server behaviour
-- [ ] **`setFeatureCompatibilityVersion` records the version and gates
-      nothing.** mongod at FCV 8.0 refuses the features 8.1 and 8.2 added;
-      this server has no such gates. `getParameter` reports the stored
-      version.
-      Backlog-ID: RM-025
-      Verify: tests/backlog/test_rm_001_028.py::test_fcv_80_refuses_a_feature_82_added
+- [ ] **The hybrid-search stages 8.2 added are missing: `$rankFusion`,
+      `$score` and `$scoreFusion`** (40324 here). mongod 8.2.11 runs all
+      three on a community build: `$rankFusion` merges ranked
+      sub-pipelines by reciprocal rank (`weight / (60 + rank)` summed per
+      document, `combination.weights`, `scoreDetails`), `$score` sets a
+      document's score from an expression (`normalization: none | sigmoid
+      | minMaxScaler`, `weight` at most 1), `$scoreFusion` combines scored
+      sub-pipelines (`normalization`, `combination.method: avg |
+      expression`), and each exposes the result as `{$meta: "score"}` /
+      `{$meta: "scoreDetails"}`. A sub-pipeline of `$rankFusion` must be
+      ranked (9191100 otherwise), and one with no pipelines is 2. At FCV
+      8.0 mongod refuses each with 224, in three different texts
+      (`'featureFlagRankFusionBasic' must be enabled to use rankFusion`,
+      `$scoreFusion is not allowed in the current feature compatibility
+      version. See ...`, `$score is not allowed in the current
+      configuration. You may need to enable the corresponding feature
+      flag...`), which go with the stages when they land (the expressions'
+      gate is in `secantus_core::expressions::ADDED_IN_82`). `explain` of
+      each is mongod's own desugaring and was not measured. Found
+      2026-10-20 with the expressions 8.2 added (RM-197, fixed).
+      Backlog-ID: RM-198
+      Verify: tests/backlog/test_rm_added_in_82.py::test_hybrid_search_stages_82_added
 - **Scope decision — `mapReduce` with a named `out`** (Joe, 2026-10-16,
   formerly RM-027). Refused as a `--noscripting` mongod 8.2.11 refuses it
   (31264, since 2026-10-20; it answered 9 before), like every map/reduce
@@ -1255,21 +1256,34 @@ differs on 2 results (re-measured 2026-10-16; 5 before). The harness salts datab
 mongod keeps the oplog of earlier runs and a stream started in the past
 would see them. What is left:
 
-- [ ] **RUST MongoDB server: a resume token in mongod's own format gets
-      40647.** This server's tokens are its own encoding (hex of a BSON
-      document), so a token from one cannot be given to the other. A token
-      neither server can read now gets mongod's error (its KeyString decoder
-      is transcribed in `secantus-commands/src/resume_keystring.rs`); what
-      is left: a token that decodes cleanly, which mongod looks for in its
-      oplog (280 `the resume token was not found`), and two shapes the
-      transcription leaves out -- a tiny decimal in `_data`, and a token
-      with `_typeBits` -- which also answer 40647.
+- [ ] **RUST MongoDB server: a resume token in mongod's own format with
+      type bits that matter, or a tiny decimal, gets 40647.** This
+      server's tokens are its own encoding (hex of a BSON document). A token
+      in mongod's format is read by a transcription of mongod's KeyString
+      decoder (`secantus-commands/src/resume_keystring.rs`): one that fails
+      gets mongod's error, and one that decodes is looked up from its
+      cluster time and answers 280 when its event is not the first found,
+      as on mongod (2026-10-20). A `_typeBits` that is not BinData is 40648,
+      and all-zero bits are no bits. What is left: type bits that change a
+      number's type (`0x01` makes the version a double: mongod answers
+      50854), which need mongod's TypeBits reader, and a tiny decimal in
+      `_data`; both answer 40647.
       Backlog-ID: RM-075
-      Verify: tests/backlog/test_rm_057_084.py::test_well_formed_mongod_token_is_looked_up
+      Verify: tests/backlog/test_rm_057_084.py::test_type_bits_that_change_a_number
 - [ ] **RUST MongoDB server: `explain` of a `$changeStream` is this
       server's plan.** mongod explains the oplog scan it would run, with
       the full match over `local.oplog.rs`; not reproduced, like the rest
-      of mongod's planner output (1 of the 2).
+      of mongod's planner output (1 of the 2). Sized 2026-10-20: mongod's
+      reply is a `$cursor` over `local.oplog.rs` whose `parsedQuery` (about
+      2,100 characters for a collection stream, 2,400 for the cluster) is the
+      oplog filter mongod's change-stream filter builders make from the
+      scope and options, a `PROJECTION_SIMPLE` of the oplog fields, then four
+      internal `$changeStream` stages (`internalUnwindTransaction` with the
+      same filter, `internalTransform` with the options,
+      `$_internalChangeStreamCheckInvalidate`,
+      `$_internalChangeStreamCheckResumability`) and a `$match` on
+      `operationType`. Reproducing it means transcribing those builders per
+      scope and option, not printing the namespace alone.
       Backlog-ID: RM-076
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_a_change_stream_scans_the_oplog
 

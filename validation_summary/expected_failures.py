@@ -170,10 +170,17 @@ GO: list[ExpectedFailure] = [
         rationale="Rollup of the `drop_one` / `drop_all` / `create_many` subtests above.",
     ),
     # Leaves only, not their TestSDAMErrorHandling rollups: another child
-    # failing there must still count. TestConnectionPoolBackpressure is left
-    # out too, because it also needs the ingress rate limiter (RM-008).
+    # failing there must still count.
     ExpectedFailure(
         pattern="pool_not_cleared_on_timeout_network_error",
+        rationale=_WHERE_JS,
+    ),
+    # The ingress rate limiter it sets is honoured since 2026-10-20 (RM-008);
+    # what is left is the `$where: sleep(2000)` that keeps each connection
+    # busy. A `mongod --noscripting` 8.2.11 fails it the same way (1 checkout
+    # failure, not the 10 it wants).
+    ExpectedFailure(
+        pattern="TestConnectionPoolBackpressure",
         rationale=_WHERE_JS,
     ),
     ExpectedFailure(
