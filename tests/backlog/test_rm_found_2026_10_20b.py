@@ -633,7 +633,7 @@ def _fsync_lock(client: Any) -> tuple:
     return got
 
 
-@pytest.mark.backlog("RM-220")
+@pytest.mark.backlog_fixed("RM-220")
 def test_fsync_lock(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 takes `fsync: 1, lock: true` (lockCount 1), and
     `fsyncUnlock` releases it."""

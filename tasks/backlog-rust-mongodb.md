@@ -604,12 +604,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       features rather than replies.
       Backlog-ID: RM-219
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_commands_mongod_runs_are_commands_here
-- [ ] **`fsync` with `lock: true` is refused** (9, "not supported by
-      SecantusDB", `diagnostics.rs`) while `fsyncUnlock` exists. mongod
-      8.2.11 takes the lock (`lockCount: 1`), blocking writes until
-      `fsyncUnlock`; backup tools use the pair.
-      Backlog-ID: RM-220
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_fsync_lock
 - [ ] **A string that is not valid UTF-8 is refused.** An insert whose
       string holds the bytes `0xff 0xfe` answers 1 "BSON error: utf-8
       encoding error"; mongod 8.2.11 stores it (n: 1). Data mongod keeps is

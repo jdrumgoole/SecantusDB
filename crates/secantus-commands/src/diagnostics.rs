@@ -41,22 +41,37 @@ pub fn ok_transaction(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResu
 
 /// `fsync` — flush data to disk: a checkpoint, as mongod takes one, so what a
 /// background `validate` reads afterwards is the store as it is now.
-/// `lock: true` (which would block writes until `fsyncUnlock` — needs
-/// coordination we don't have) is rejected rather than silently skipped, so
-/// backup tools relying on the lock aren't misled.
+/// `lock: true` then holds writes off until as many `fsyncUnlock`s
+/// (`LockManager::fsync_lock`): what backup tools pair it with. Measured
+/// 8.2.11, 2026-10-20; this refused the lock.
 pub fn fsync(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    if doc.get("lock").and_then(Bson::as_bool) == Some(true) {
-        return Ok(crate::CommandError::new(
-            9,
-            "FailedToParse",
-            "fsync with lock:true is not supported by SecantusDB",
-        )
-        .into_reply());
-    }
+    let lock = match doc.get("lock") {
+        Some(Bson::Boolean(b)) => *b,
+        Some(Bson::Int32(n)) => *n != 0,
+        Some(Bson::Int64(n)) => *n != 0,
+        Some(Bson::Double(d)) => *d != 0.0,
+        _ => false,
+    };
     ctx.storage()?
         .checkpoint_now()
         .map_err(crate::util::command_error)?;
-    Ok(doc! { "numFiles": 1i32, "ok": 1.0 })
+    if !lock {
+        return Ok(doc! { "numFiles": 1i32, "ok": 1.0 });
+    }
+    let Some(locks) = ctx.locks.clone() else {
+        return Err(crate::CommandError::new(
+            8,
+            "UnknownError",
+            "fsync lock needs the server's lock manager",
+        ));
+    };
+    let count = locks.fsync_lock();
+    Ok(doc! {
+        "info": "now locked against writes, use db.fsyncUnlock() to unlock",
+        "lockCount": count as i32,
+        "seeAlso": "http://dochub.mongodb.org/core/fsynccommand",
+        "ok": 1.0,
+    })
 }
 
 /// `getCmdLineOpts` — parsed command line; drivers read

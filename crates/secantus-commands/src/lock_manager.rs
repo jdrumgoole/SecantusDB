@@ -212,6 +212,9 @@ pub struct LockManager {
     changed: Condvar,
     next_owner: AtomicU64,
     next_ticket: AtomicU64,
+    /// `fsync: {lock: true}`'s hold: how many locks are outstanding, and the
+    /// owner holding the global lock in S while any are.
+    fsync: Mutex<(u32, Option<Owner>)>,
 }
 
 impl Default for LockManager {
@@ -227,7 +230,41 @@ impl LockManager {
             changed: Condvar::new(),
             next_owner: AtomicU64::new(1),
             next_ticket: AtomicU64::new(1),
+            fsync: Mutex::new((0, None)),
         }
+    }
+
+    /// `fsync: {lock: true}`: the first lock takes the global lock in S under
+    /// an owner of its own, waiting out the writers that hold it, so later
+    /// writes (global IX) wait while reads (global IS) go on; each further
+    /// lock only counts. Answers the new count. mongod 8.2.11's mechanism,
+    /// nested locks included.
+    pub fn fsync_lock(&self) -> u32 {
+        let mut held = self.fsync.lock().unwrap_or_else(|e| e.into_inner());
+        if held.0 == 0 {
+            let owner = self.statement_owner();
+            // No deadline: the lock waits as long as the writers it follows.
+            let _ = self.acquire(owner, &Resource::Global, Mode::S);
+            held.1 = Some(owner);
+        }
+        held.0 += 1;
+        held.0
+    }
+
+    /// `fsyncUnlock`: one lock fewer, and the global lock let go with the
+    /// last. `None` when no lock is held.
+    pub fn fsync_unlock(&self) -> Option<u32> {
+        let mut held = self.fsync.lock().unwrap_or_else(|e| e.into_inner());
+        if held.0 == 0 {
+            return None;
+        }
+        held.0 -= 1;
+        if held.0 == 0 {
+            if let Some(owner) = held.1.take() {
+                self.release(owner);
+            }
+        }
+        Some(held.0)
     }
 
     /// A fresh statement owner.
@@ -578,9 +615,9 @@ pub fn statement_rounds(
     };
     let read = || Some(vec![vec![(Resource::Global, Is)]]);
     match name {
-        "hello" | "isMaster" | "ismaster" | "ping" | "serverStatus" | "killCursors" => {
-            Some(Vec::new())
-        }
+        // `fsync` and `fsyncUnlock` manage the global lock themselves.
+        "hello" | "isMaster" | "ismaster" | "ping" | "serverStatus" | "killCursors" | "fsync"
+        | "fsyncUnlock" => Some(Vec::new()),
         "find" | "getMore" | "count" | "distinct" | "listCollections" | "listIndexes"
         | "listDatabases" | "collStats" => read(),
         "aggregate" => {
@@ -858,6 +895,34 @@ impl Drop for Guard {
 
 #[cfg(test)]
 mod tests {
+    /// `fsync: {lock: true}` holds the global lock in S: a read's IS is
+    /// granted, a write's IX waits until the last of the nested locks is
+    /// released, and an unlock with none held is refused.
+    #[test]
+    fn an_fsync_lock_holds_writes_until_the_last_unlock() {
+        let lm = std::sync::Arc::new(LockManager::new());
+        assert_eq!(lm.fsync_unlock(), None);
+        assert_eq!(lm.fsync_lock(), 1);
+        assert_eq!(lm.fsync_lock(), 2);
+        let reader = lm.statement_owner();
+        assert!(lm.acquire(reader, &Resource::Global, Mode::Is).is_ok());
+        lm.release(reader);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer_lm = lm.clone();
+        let writer = std::thread::spawn(move || {
+            let owner = writer_lm.statement_owner();
+            let _ = writer_lm.acquire(owner, &Resource::Global, Mode::Ix);
+            tx.send(()).unwrap();
+            writer_lm.release(owner);
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        assert_eq!(lm.fsync_unlock(), Some(1));
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        assert_eq!(lm.fsync_unlock(), Some(0));
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
+        writer.join().unwrap();
+    }
+
     #[test]
     fn a_waiting_exclusive_request_is_not_overtaken() {
         use std::sync::atomic::AtomicBool;
