@@ -39,22 +39,6 @@ one beside it.
 
 ## Open from the 2026-08-26 triage
 
-- [ ] **An `$or` beside another clause reads one index where mongod reads
-  the branches'.** Since 2026-10-20 an `$or` that is the whole query is
-  planned branch by branch, each branch with its own trial of the plans
-  that could answer it (mongod's subplanner; RM-001, fixed). An `$or`
-  BESIDE another clause is different: mongod also enumerates the plan
-  that reads each branch's index and rechecks the rest, and tries it
-  against the plans of one index for the whole query (measured on a fresh
-  collection, 8.2.11: `{$or: [{a: 3, b: 2}, {c: 5}, {d: 1, b: 3}], d:
-  {$ne: 5}}` reads `a_1_b_1`, `d_1_b_1` and `c_1`). This server never
-  offers the branches' plan to the trial when an index serves the whole
-  query, so it reads `d_1_b_1` alone, and the documents come back in that
-  index's order. Results are right either way. mongod's choice also
-  follows its plan cache (RM-154): a probe that ran other shapes first
-  saw different branch indexes than a fresh collection does.
-  Backlog-ID: RM-199
-  Verify: tests/backlog/test_rm_001_028.py::test_or_beside_other_clauses_is_a_candidate_plan
 - **Scope decision — `$where` and `$function`** need a JavaScript engine.
   Neither server has one, and none is planned (WONTFIX).
 

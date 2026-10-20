@@ -148,10 +148,12 @@ fn tidy(value: Bson, sorted_in: bool) -> Bson {
 }
 
 /// `$alwaysTrue` matches everything: mongod drops it from an `$and`, and an
-/// `$and` left with one child is that child.
-fn drop_always_true(filter: Document) -> Document {
+/// `$and` left with one child is that child. A query that is nothing but
+/// `$alwaysTrue` (or an `$or` of it alone) keeps it (measured 8.2.11,
+/// 2026-10-20); `lone` says the query was no `$and`.
+fn drop_always_true(filter: Document, lone: bool) -> Document {
     let Some(Bson::Array(children)) = filter.get("$and").filter(|_| filter.len() == 1) else {
-        return if filter.len() == 1 && filter.contains_key("$alwaysTrue") {
+        return if filter.len() == 1 && filter.contains_key("$alwaysTrue") && !lone {
             Document::new()
         } else {
             filter
@@ -185,9 +187,11 @@ pub(crate) fn parsed_query_as_written(filter: &Document) -> Document {
 }
 
 fn parsed(filter: &Document, sorted_in: bool) -> Document {
-    let canonical = drop_always_true(secantus_core::canonical_match(&Bson::Document(
-        with_schemas_parsed(filter),
-    )));
+    let lone = filter.len() == 1 && !filter.contains_key("$and");
+    let canonical = drop_always_true(
+        secantus_core::canonical_match(&Bson::Document(with_schemas_parsed(filter))),
+        lone,
+    );
     // `{a: {$nin: []}}` excludes nothing, and mongod says so its own way.
     if let [(_, Bson::Document(pred))] = canonical.iter().collect::<Vec<_>>()[..] {
         let empty_nin = pred
@@ -445,6 +449,20 @@ fn same_clause(a: &Document, b: &Document) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn always_true_stays_only_alone() {
+        // Measured 8.2.11, 2026-10-20.
+        let cases = [
+            (doc! {"$alwaysTrue": 1}, doc! {"$alwaysTrue": 1}),
+            (doc! {"$or": [{"$alwaysTrue": 1}]}, doc! {"$alwaysTrue": 1}),
+            (doc! {"$and": [{"$alwaysTrue": 1}]}, doc! {}),
+            (doc! {"a": 1, "$alwaysTrue": 1}, doc! {"a": {"$eq": 1}}),
+        ];
+        for (filter, want) in cases {
+            assert_eq!(parsed_query(&filter), want, "{filter}");
+        }
+    }
 
     #[test]
     fn rewrites_follow_mongod() {

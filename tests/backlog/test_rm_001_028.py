@@ -77,12 +77,12 @@ def test_or_branch_index_choice_matches_mongod(rust_mongo: Any, mongod: Any) -> 
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-199")
+@pytest.mark.backlog_fixed("RM-199")
 def test_or_beside_other_clauses_is_a_candidate_plan(rust_mongo: Any, mongod: Any) -> None:
     """An `$or` beside another clause (measured on a fresh collection,
-    mongod 8.2.11): mongod tries the plan that reads each branch's index
-    against the plans of one index for the whole query, and keeps the
-    branches' plan here; this server reads one index."""
+    mongod 8.2.11): mongod tries the plan that reads each branch's index,
+    the other clauses pushed down into the branches, against the plans of
+    one index for the whole query, and keeps the branches' plan here."""
     shapes = [
         {"$or": [{"a": 3, "b": 2}, {"c": 5}, {"d": 1, "b": 3}], "d": {"$ne": 5}},
         {"$or": [{"a": 3}, {"b": 4}, {"c": {"$gt": 290}}], "d": {"$ne": 5}},

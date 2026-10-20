@@ -70,3 +70,13 @@ type (unless the schema declares that one type), a nested object as
   540 measured cases, so no order is mongod's (Joe's decision of
   2026-10-16 for that outcome). Its two gap tests, which asserted the macOS
   answer, were retired with it.
+- **An `$or` beside other clauses is a candidate plan** (fixes RM-199): the
+  plan that reads each branch's index, with the clauses beside the `$or`
+  pushed down into each branch and rechecked above the `OR`, is now tried
+  against the plans of one index, as mongod 8.2.11 tries it. The
+  `find_order` probe is at 62 differing replies of 6,531, all of them ties
+  under a sort with a limit (RM-049's scope decision); it was at 77
+  (`tests/backlog/test_rm_001_028.py::test_or_beside_other_clauses_is_a_candidate_plan`).
+- A query that is nothing but `$alwaysTrue` keeps it in `parsedQuery`, as
+  mongod does; an `$and` of it is still `{}`
+  (`explain::parsed::tests::always_true_stays_only_alone`).
