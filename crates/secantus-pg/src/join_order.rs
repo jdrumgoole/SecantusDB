@@ -480,9 +480,19 @@ impl PgHandler {
                 search.rels.len() - 1
             }
         };
+        // `truncate_useless_pathkeys`: the join's order is of use above it
+        // only while a clause still to come is on its key, which for the
+        // class is a member outside the relation; an edge's own clause is
+        // inside it now. (The search runs with no LIMIT, and an ORDER BY is
+        // applied after it, so no query order is there to serve.)
+        let useful = clause.class && search.class.iter().any(|(t, _)| set & (1 << *t) == 0);
+        let key_class = if useful {
+            clause.key_class
+        } else {
+            secantus_pgplan::joincost::USELESS_KEYS
+        };
         let rel = &mut search.rels[idx];
         let combo = rel.built.len();
-        let key_class = clause.key_class;
         rel.built.push(Built { a, b, clause, left });
         rel.paths
             .add_paths_on(combo, key_class, &side_a, &side_b, left, true);

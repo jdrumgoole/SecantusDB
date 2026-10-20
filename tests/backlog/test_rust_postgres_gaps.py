@@ -1875,7 +1875,7 @@ def test_four_tables_with_a_shared_key_join_on_its_class(pg: Any) -> None:
     assert " ".join(f"{a}:{b}:{c}:{d}" for a, b, c, d in got[1][:6]) == want
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_five_tables_read_a_classes_sorted_join_under_a_sorted_outer(pg: Any) -> None:
     """PostgreSQL 15.19: five tables, `k1.a`, `k2.a` and `k3.a` one
     equivalence class, no primary keys, 20 rows each. The top join merges
@@ -1905,6 +1905,44 @@ def test_five_tables_read_a_classes_sorted_join_under_a_sorted_outer(pg: Any) ->
     want = "15:1:1:1:11 15:1:1:1:16 15:1:1:1:1 15:1:1:1:6 8:1:1:1:11 8:1:1:1:16"
     assert got[0] == "ok"
     assert " ".join(":".join(str(v) for v in r) for r in got[1][:6]) == want
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_hash_join_too_big_for_work_mem_returns_rows_batch_by_batch(pg: Any) -> None:
+    """PostgreSQL 15.19: the same five-table chain with `rp028_h1.a` a
+    primary key and the class's first ON written `h2.a = h1.a`. The top join
+    hashes the 212,242 rows estimated for h0-h1-h3-h4 (width 16), more than
+    `work_mem` x `hash_mem_multiplier` holds, so the hash join runs in
+    batches (`ExecChooseHashTableSize`): an outer h2 row whose hash falls in
+    a later batch is joined after every row of batch 0. So after the
+    `h2.a = 1` rows come `h2.a = 3`'s, where a single batch gives `2`."""
+    pg.execute("begin")
+    try:
+        mods = [(7, 5), (5, 3), (3, 4), (4, 7), (6, 5)]
+        for t, (mb, mc) in enumerate(mods):
+            key = " primary key" if t == 1 else ""
+            pg.execute(f"create table rp028_h{t} (a int{key}, b int, c int)")
+            pg.execute(
+                f"insert into rp028_h{t} select i, i % {mb}, i % {mc} from generate_series(1, 20) i"
+            )
+        got = pg_answer(
+            pg,
+            "select rp028_h0.a, rp028_h1.a, rp028_h2.a, rp028_h3.a, rp028_h4.a"
+            " from rp028_h0 join rp028_h1 on rp028_h0.b = rp028_h1.c"
+            " join rp028_h2 on rp028_h2.a = rp028_h1.a"
+            " join rp028_h3 on rp028_h2.a = rp028_h3.a"
+            " join rp028_h4 on rp028_h3.b = rp028_h4.c",
+        )
+    finally:
+        pg.execute("rollback")
+    want = (
+        "15:1:1:1:16 8:1:1:1:16 1:1:1:1:16 15:1:1:1:1 8:1:1:1:1 1:1:1:1:1"
+        " 15:1:1:1:6 8:1:1:1:6 1:1:1:1:6 15:1:1:1:11 8:1:1:1:11 1:1:1:1:11"
+        " 7:3:3:3:18 14:3:3:3:18 7:3:3:3:3 14:3:3:3:3 7:3:3:3:13 14:3:3:3:13"
+    )
+    assert got[0] == "ok"
+    assert len(got[1]) == 216
+    assert " ".join(":".join(str(v) for v in r) for r in got[1][:18]) == want
 
 
 # RP-047: the lock manager. Each test needs two sessions on one server, so
