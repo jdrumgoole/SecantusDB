@@ -632,7 +632,18 @@ one beside it.
         its snapshot was taken under is still the settled one, and any
         catalog write in flight, its own included, settles nothing. The
         shadow script went from 9.8 s to 8.4 s (PostgreSQL 15.19: 8.0 s).
-        Not yet measured on Linux.
+        Linux after that (PR #2040's run): still over 20 s in both
+        transports. **Decided (Joe, 2026-10-20): keep optimising** rather
+        than build the lane in release or stop. Measured then: the
+        collection lock was held about 88% of the run, so only work under
+        it counts -- server-side work outside it (an expression-index
+        lookup per row, a `TableDef` copy per row) cut CPU but not the
+        script's time. Under the lock: each document's decode, minted
+        `_id`, `_id` key and oplog `o2` now happen before the lock is taken,
+        and an insert's oplog entries skip the per-entry `local` check its
+        namespace already answers. The script: 8.2 s to 7.6 s (PostgreSQL
+        15.19: 8.0 s). What is left under the lock is the writes
+        themselves -- the oplog row, the `_id` index row and the document.
 
       What the lane gates, given that: a run that stopped short, and a
       test that fails over TLS, passes in the clear, **and fails over TLS

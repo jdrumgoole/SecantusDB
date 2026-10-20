@@ -6535,6 +6535,21 @@ impl Storage {
         } else {
             (entries, pre_images)
         };
+        self.emit_oplog_entries_logged(session, entries, pre_images)
+    }
+
+    /// [`Self::emit_oplog_entries`] for entries already known to be logged:
+    /// none names the `local` database or a profile collection. An insert
+    /// knows that from its namespace, and spares reading each entry's.
+    fn emit_oplog_entries_logged(
+        &self,
+        session: &Session,
+        entries: Vec<OplogEntry>,
+        pre_images: Vec<Option<Vec<u8>>>,
+    ) -> Result<i64> {
+        if !self.enable_oplog || entries.is_empty() {
+            return Ok(0);
+        }
         // A transaction statement's writes name the transaction, as mongod's
         // do. Stamped here, on the statement's thread, whichever thread later
         // writes the entries.
@@ -9681,6 +9696,25 @@ impl Storage {
         base_index: usize,
         ordered: bool,
     ) -> Result<(usize, Vec<Document>, bool)> {
+        // What depends only on the documents themselves -- decoding them, an
+        // `_id` minted for one with none, its `_id` key and the oplog's `o2`
+        // -- is done BEFORE the collection's write lock: every writer to the
+        // collection waits on that lock, so work done under it is work no
+        // other writer can overlap (RP-014).
+        let prepared: Vec<PreparedDoc> = docs
+            .iter()
+            .map(|doc_bytes| {
+                let mut doc = decode_doc(doc_bytes)?;
+                let assigned_id = !doc.contains_key("_id");
+                if assigned_id {
+                    doc.insert("_id", Bson::ObjectId(secantus_core::oid::new()));
+                }
+                let id = doc.get("_id").expect("_id present").clone();
+                let key = id_key(&id)?;
+                let o2 = encode_id_doc(&id)?;
+                Ok((doc, assigned_id, id, key, o2))
+            })
+            .collect::<Result<_>>()?;
         self.retry_write_conflicts("insert", || {
             let lock = self.coll_lock(db, coll);
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -9719,26 +9753,22 @@ impl Storage {
                 let nat_cur = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
                 for (offset, doc_bytes) in docs.iter().enumerate() {
                     let index = base_index + offset;
-                    let mut doc = decode_doc(doc_bytes)?;
-                    let assigned_id = !doc.contains_key("_id");
-                    if assigned_id {
-                        doc.insert("_id", Bson::ObjectId(secantus_core::oid::new()));
-                    }
+                    let (doc, assigned_id, id, base_key, o2) = &prepared[offset];
+                    let (doc, assigned_id) = (doc, *assigned_id);
                     // A profile entry is stored as written, with no `_id`:
                     // mongod's `system.profile` has no `_id` index. The id
                     // minted above only keys the row. So is a time-series
                     // measurement inserted with none: mongod stores it
                     // without one (RM-089, measured 8.2.11).
                     let unkeyed = assigned_id && (coll == PROFILE_COLLECTION || timeseries);
-                    let id = doc.get("_id").expect("_id present").clone();
-                    let mut key = id_key(&id)?;
+                    let mut key = base_key.clone();
                     // Timeseries: suffix the doc-table key so duplicate `_id`s coexist.
                     if timeseries {
                         key.extend_from_slice(&self.timeseries_doc_suffix());
                     }
                     // A value a geo index cannot hold is that document's
                     // write error, as a duplicate key is.
-                    if let Some((code, errmsg)) = geo_key_problem(&doc, &descs) {
+                    if let Some((code, errmsg)) = geo_key_problem(doc, &descs) {
                         let mut e = Document::new();
                         e.insert("index", index as i32);
                         e.insert("code", code);
@@ -9754,7 +9784,7 @@ impl Storage {
                     // A document that also repeats an `_id` is reported for
                     // the `_id`, as mongod does: the write below finds it.
                     let conflict =
-                        match self.unique_conflict(&session, db, coll, &doc, &descs, None)? {
+                        match self.unique_conflict(&session, db, coll, doc, &descs, None)? {
                             Some(_)
                                 if !timeseries
                                     && self.doc_recordid(&session, db, coll, &key)?.is_some() =>
@@ -9781,7 +9811,7 @@ impl Storage {
                     }
                     // Raw-write fast path: reuse the caller's BSON verbatim when it
                     // is already in mongod's canonical storage form (`_id` first, and
-                    // no `_id` assigned here). encode_doc(&doc) would reproduce these
+                    // no `_id` assigned here). encode_doc(doc) would reproduce these
                     // exact bytes, so re-encoding is dead work; mongod likewise stores
                     // the document as the client sent it. Falls back to encode_doc when
                     // an ObjectId was assigned or `_id` is not the leading field (the
@@ -9791,7 +9821,7 @@ impl Storage {
                     let blob: &[u8] = if unkeyed || (!assigned_id && id_first) {
                         doc_bytes
                     } else {
-                        reencoded = encode_doc(&doc)?;
+                        reencoded = encode_doc(doc)?;
                         &reencoded
                     };
                     if blob.len() > MAX_BSON_OBJECT_SIZE {
@@ -9832,7 +9862,7 @@ impl Storage {
                             let mut id_conflict: Option<UniqueConflict> = None;
                             if let Some(claim) = self.id_claim_desc(&session, db, coll)? {
                                 let kb = index_key_variants_c(
-                                    &doc,
+                                    doc,
                                     &claim.key_spec,
                                     false,
                                     claim.collation.as_ref(),
@@ -9844,7 +9874,7 @@ impl Storage {
                                         ns.clone(),
                                         &claim.name,
                                         &claim.key_spec,
-                                        &doc,
+                                        doc,
                                         &kb,
                                         claim.collation.as_ref(),
                                     )
@@ -9887,21 +9917,20 @@ impl Storage {
                     doc_cur.set_key_ssq(db, coll, recordid);
                     doc_cur.set_value_u(&frame_doc_value(&key, blob));
                     doc_cur.insert()?;
-                    self.write_index_entries(&session, db, coll, &doc, &descs, recordid)?;
-                    self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
+                    self.write_index_entries(&session, db, coll, doc, &descs, recordid)?;
+                    self.maybe_mark_multikey(&session, db, coll, doc, &descs)?;
                     inserted += 1;
                     inserted_bytes += blob.len() as i64;
                     if oplog_on {
                         // `o` splices the stored doc bytes (`blob`) verbatim — no
                         // re-encode of the document body (the oplog hot-path win);
                         // `o2` is the tiny `{_id}`. `doc` is not used afterward.
-                        let o2 = encode_id_doc(&id)?;
                         oplog_entries.push(OplogEntry::Raw(Self::oplog_entry_crud(
                             "i",
                             &ns,
                             Some(ui.as_ref().unwrap()),
                             blob,
-                            &o2,
+                            o2,
                         )?));
                     }
                 }
@@ -9925,7 +9954,18 @@ impl Storage {
                     )?;
                 }
                 if oplog_on && !oplog_entries.is_empty() {
-                    self.emit_oplog_entries(&session, oplog_entries, pre_images)?;
+                    // Every entry here names this collection (its inserts,
+                    // and a capped collection's evictions), so whether they
+                    // are logged is its namespace's answer
+                    // (`oplog_entry_is_local`).
+                    let local = ns == "local"
+                        || ns.starts_with("local.")
+                        || ns.ends_with(".system.profile");
+                    if local {
+                        self.emit_oplog_entries(&session, oplog_entries, pre_images)?;
+                    } else {
+                        self.emit_oplog_entries_logged(&session, oplog_entries, pre_images)?;
+                    }
                 }
                 Ok((inserted, errors, stopped, tally))
             })?;
@@ -20161,6 +20201,11 @@ static COLL_TABLE_GEN: AtomicU64 = AtomicU64::new(1);
 /// One index as the planner reads it: its `listIndexes` spec, and per key
 /// field the path components that hold an array.
 pub type PlannerIndex = (Document, Vec<Vec<String>>);
+
+/// One document of an insert, prepared before the collection's lock: the
+/// decoded document, whether its `_id` was minted here, the `_id`, its
+/// `_id` key and the oplog entry's `{_id}`.
+type PreparedDoc = (Document, bool, Bson, Vec<u8>, Vec<u8>);
 
 /// A collection's catalog facts by `(db, collection)`, each with the
 /// generation it was read under (`index_descs_cached` and its siblings).

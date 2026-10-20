@@ -12163,7 +12163,8 @@ impl PgHandler {
     /// the deferred foreign keys) when it is deferred. It used to be judged
     /// nowhere at all, so `unique (n) deferrable` accepted duplicates.
     fn check_deferrable_uniques(&self, table: &str) -> PgWireResult<()> {
-        let Some(def) = self.lookup(table) else {
+        let shared = self.lookup_shared(table);
+        let Some(def) = shared.as_ref() else {
             return Ok(());
         };
         for u in def
@@ -19176,16 +19177,36 @@ impl PgHandler {
         def
     }
 
+    /// [`Self::lookup`], sharing the cached entry rather than copying it:
+    /// for the paths every row written goes through, where copying the
+    /// table's definition was a twentieth of an INSERT.
+    fn lookup_shared(&self, name: &str) -> Arc<Option<TableDef>> {
+        let def = self.lookup_inner_arc(name);
+        if def.as_ref().as_ref().is_some_and(|d| d.temp)
+            && self
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.touched_temp
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        def
+    }
+
     fn lookup_inner(&self, name: &str) -> Option<TableDef> {
+        (*self.lookup_inner_arc(name)).clone()
+    }
+
+    fn lookup_inner_arc(&self, name: &str) -> Arc<Option<TableDef>> {
         if let Some(def) = Self::virtual_table(name) {
-            return Some(def);
+            return Arc::new(Some(def));
         }
         // What this transaction has created or dropped, before what is
         // committed. A `None` here is a tombstone: the table was dropped in
         // this transaction and must not be found even though its catalog row
         // is still there.
         if let Some(pending) = self.pending.tables().get(name) {
-            return pending.clone();
+            return Arc::new(pending.clone());
         }
         let cache = catalog_cache();
         let version = cache.version.load(std::sync::atomic::Ordering::SeqCst);
@@ -19201,7 +19222,7 @@ impl PgHandler {
                 .map(|e| Arc::clone(&e.4))
         });
         if let Some(def) = front_hit {
-            return (*def).clone();
+            return def;
         }
         // Only an entry the shared cache holds as CURRENT reaches the front,
         // so the front can never serve what the shared cache would not.
@@ -19232,14 +19253,16 @@ impl PgHandler {
             .map(|(_, def)| Arc::clone(def));
         if let Some(def) = shared {
             to_front(&def);
-            return (*def).clone();
+            return def;
         }
         let filter = bson::doc! { "_id": name };
         // A storage error is a transient `None`, not a recorded absence.
-        let rows = self
+        let Ok(rows) = self
             .storage
             .find_matching(self.db(), CATALOG_COLLECTION, &filter)
-            .ok()?;
+        else {
+            return Arc::new(None);
+        };
         let def = rows.first().and_then(|raw| {
             let d: Document = decode_doc(raw).ok()?;
             let def = TableDef::from_document(&d)?;
@@ -19251,11 +19274,11 @@ impl PgHandler {
         // its one row changes on every `nextval`.
         if def.is_none() {
             if let Ok(Some(_)) = self.sequence_doc(name) {
-                return Some(Self::sequence_table_def(name));
+                return Arc::new(Some(Self::sequence_table_def(name)));
             }
         }
+        let entry = Arc::new(def);
         if self.may_fill_catalog_cache(version) {
-            let entry = Arc::new(def.clone());
             cache
                 .tables
                 .lock()
@@ -19263,7 +19286,7 @@ impl PgHandler {
                 .insert(key.clone(), (version, Arc::clone(&entry)));
             to_front(&entry);
         }
-        def
+        entry
     }
 
     fn err(e: &PlanError) -> PgWireError {
@@ -31326,8 +31349,10 @@ impl PgHandler {
                 if self.is_system_catalog(&ins.table)? {
                     return Err(Self::catalog_write_refused(&ins.table));
                 }
-                let def = self
-                    .lookup(&ins.table)
+                let shared = self.lookup_shared(&ins.table);
+                let def: &TableDef = shared
+                    .as_ref()
+                    .as_ref()
                     .ok_or_else(|| Self::err(&PlanError::UndefinedTable(ins.table.clone())))?;
                 // `INSERT ... SELECT`: read the query's rows first, then write
                 // them exactly as a VALUES list would be written.

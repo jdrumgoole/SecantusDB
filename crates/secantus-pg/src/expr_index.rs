@@ -141,6 +141,18 @@ impl PgHandler {
         table: &str,
         rows: Vec<Vec<u8>>,
     ) -> PgWireResult<Vec<Vec<u8>>> {
+        // Most tables have no expression index: ask storage's index list
+        // (cached per catalog generation) before the table's definition is
+        // read and its indexes planned, which every row written paid for.
+        let any = self
+            .storage
+            .list_indexes(self.db(), table)
+            .map_err(|e| Self::storage_err("could not list the indexes", e))?
+            .iter()
+            .any(|ix| Self::index_expressions(ix).is_some());
+        if !any {
+            return Ok(rows);
+        }
         let Some(def) = self.lookup(table) else {
             return Ok(rows);
         };
