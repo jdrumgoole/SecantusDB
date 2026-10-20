@@ -673,17 +673,6 @@ inject (a panic, a power loss, a failing checkpoint).
       it die. §7.069 covers a panic while OPENING a store, in CI.
       Backlog-ID: RM-188
       Verify: none -- needs a WiredTiger panic injected into a running server
-- [ ] **A failure while the store closes cannot reach the caller.** The
-      close-time oplog-meta persist and final checkpoint run inside
-      `impl Drop for Storage` and only `eprintln!` a failure; there is no
-      fallible `close()`. `secantus-wt`'s `Connection`, `Session` and `Cursor`
-      `Drop`s discard the return code of WiredTiger's own `close`. So a
-      daemon whose last checkpoint failed exits 0, against CLAUDE.md's rule
-      that a close-path error is the headline. A `Storage::close() ->
-      Result` the servers call on shutdown, with the exit status following
-      it, is the fix.
-      Backlog-ID: RM-189
-      Verify: none -- needs a checkpoint failure injected at shutdown
 - [ ] **`count({})`, `collStats`, `dataSize` and `dbStats` read the whole
       collection into memory.** `scan_docs` returns a `Vec` of every
       document's bytes; `count_matching` with an empty filter is

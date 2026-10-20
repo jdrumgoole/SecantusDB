@@ -332,6 +332,11 @@ fn run(cli: CliArgs) -> Result<(), String> {
             }
         }
     }
+    // Close the store here rather than in a drop, so that a failed final
+    // checkpoint is the exit status and not a line on stderr (RM-189).
+    storage
+        .close()
+        .map_err(|e| format!("failed to close storage at {}: {e:?}", cli.storage_path))?;
     Ok(())
 }
 

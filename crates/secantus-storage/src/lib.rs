@@ -4145,6 +4145,8 @@ pub struct Storage {
     /// `JOURNAL_COMMIT_INTERVAL`, bounding what a write that did not ask for
     /// the journal can lose. Stopped by `checkpoint_stop`.
     journal_join: Mutex<Option<JoinHandle<()>>>,
+    /// Set once [`Storage::close`] has run.
+    closed: AtomicBool,
     /// Held while the periodic thread checkpoints, and while a background
     /// `validate` opens its checkpoint cursors
     /// ([`Storage::check_collection_at_checkpoint`]), so the check reads one
@@ -5681,13 +5683,37 @@ pub fn extract_backup_archive_ex(
 }
 
 impl Drop for Storage {
-    /// Persist the oplog meta row on teardown — the Rust analogue of
-    /// `storage.close`'s `_persist_oplog_meta`. Recovery clamps against the
-    /// tables anyway (`load_oplog_meta`), so a failure here costs only a
-    /// tail-row scan plus a 1s clock bump on the next open — but it is still
-    /// logged, never silent: in a database a close-time write error is a
-    /// durability signal.
+    /// Close the store if nobody did ([`Storage::close`]). A failure here can
+    /// only be logged; a server closes the store itself on shutdown so the
+    /// failure reaches its exit status.
     fn drop(&mut self) {
+        if let Err(e) = self.close() {
+            eprintln!("secantus-storage: close failed: {e:?}");
+        }
+    }
+}
+
+impl Storage {
+    /// Close the store: stop the background threads, persist the oplog meta
+    /// row and take the final checkpoint. Answers the FIRST failure (each is
+    /// also logged): a close-time write error is a durability signal, and a
+    /// daemon whose last checkpoint failed must not exit 0 (RM-189). Runs
+    /// once; a later call, and the `Drop` after it, do nothing. The store is
+    /// not used after this.
+    ///
+    /// The oplog meta row is the Rust analogue of `storage.close`'s
+    /// `_persist_oplog_meta`. Recovery clamps against the tables anyway
+    /// (`load_oplog_meta`), so losing it costs only a tail-row scan plus a 1s
+    /// clock bump on the next open.
+    pub fn close(&self) -> Result<()> {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let mut first: Option<StorageError> = None;
+        let mut fail = |what: &str, e: StorageError| {
+            eprintln!("secantus-storage: {what} failed during close: {e:?}");
+            first.get_or_insert(e);
+        };
         // Prepared transactions still open in this process roll back here
         // (their sessions must close before the connection does); each keeps
         // its durable row, so the next open resolves it by replay.
@@ -5748,7 +5774,7 @@ impl Drop for Storage {
         }
         if self.data_nonlogged {
             if let Err(e) = self.stable_checkpoint() {
-                eprintln!("secantus-storage: close-time stable checkpoint failed: {e:?}");
+                fail("the stable checkpoint", e);
             }
         }
         // Async oplog: flush the drainer pool BEFORE persisting meta / checkpointing,
@@ -5778,7 +5804,7 @@ impl Drop for Storage {
         match self.conn.open_session() {
             Ok(session) => {
                 if let Err(e) = self.persist_oplog_meta(&session, meta) {
-                    eprintln!("secantus-storage: failed to persist oplog meta during close: {e:?}");
+                    fail("persisting the oplog meta", e);
                 }
                 // Close-time checkpoint (durable mode) — the Rust analogue of
                 // Python `Storage.close`'s final checkpoint. WiredTiger's
@@ -5797,18 +5823,17 @@ impl Drop for Storage {
                 // database a close-time write error is a durability signal.
                 if self.durable && !self.in_memory {
                     if let Err(e) = session.checkpoint(None) {
-                        eprintln!("secantus-storage: final checkpoint failed during close: {e:?}");
+                        fail("the final checkpoint", e.into());
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("secantus-storage: failed to open session during close: {e:?}");
-            }
+            Err(e) => fail("opening a session", e.into()),
+        }
+        match first {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     }
-}
-
-impl Storage {
     /// True when this store is the non-persistent (`in_memory=true`) variant.
     ///
     /// Read by `serverStatus.storageEngine.persistent`, which must not claim
@@ -6041,6 +6066,7 @@ impl Storage {
             checkpoint_requested,
             checkpoint_join: Mutex::new(None),
             journal_join: Mutex::new(None),
+            closed: AtomicBool::new(false),
             checkpoint_gate: Arc::new(Mutex::new(())),
         };
         // Before anything looks a key up: crash recovery below replays writes
@@ -21891,6 +21917,31 @@ mod tests {
             Err(other) => panic!("expected Internal fatal, got: {other:?}"),
             Ok(_) => panic!("expected open to be refused for an SSu doc shard"),
         }
+    }
+
+    /// `close` answers once and is then a no-op (the `Drop` after it does
+    /// nothing), and the store it closed opens again intact.
+    #[test]
+    fn close_is_idempotent_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        let opts = StorageOptions {
+            durable: Some(true),
+            ..StorageOptions::default()
+        };
+        let st = Storage::open_with_options(home, &opts).unwrap();
+        st.insert(
+            "app",
+            "c",
+            vec![encode_doc(&doc! {"_id": 1i32}).unwrap()],
+            true,
+        )
+        .unwrap();
+        st.close().unwrap();
+        st.close().unwrap();
+        drop(st);
+        let st = Storage::open_with_options(home, &opts).unwrap();
+        assert_eq!(st.scan_collection("app", "c").unwrap().len(), 1);
     }
 
     /// `flush_journal` succeeds on every kind of store: a durable one syncs

@@ -173,7 +173,11 @@ impl Drop for Connection {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             if let Some(close) = unsafe { (*self.ptr).close } {
-                unsafe { close(self.ptr, ptr::null()) };
+                // A drop cannot return the error; it must not vanish (RM-189).
+                let rc = unsafe { close(self.ptr, ptr::null()) };
+                if rc != 0 {
+                    eprintln!("secantus-wt: Connection close failed: {:?}", check(rc));
+                }
             }
             self.ptr = ptr::null_mut();
         }
@@ -328,7 +332,11 @@ impl Drop for Session {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             if let Some(close) = unsafe { (*self.ptr).close } {
-                unsafe { close(self.ptr, ptr::null()) };
+                // A drop cannot return the error; it must not vanish (RM-189).
+                let rc = unsafe { close(self.ptr, ptr::null()) };
+                if rc != 0 {
+                    eprintln!("secantus-wt: Session close failed: {:?}", check(rc));
+                }
             }
             self.ptr = ptr::null_mut();
         }
@@ -624,7 +632,11 @@ impl Drop for Cursor {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             if let Some(close) = unsafe { (*self.ptr).close } {
-                unsafe { close(self.ptr) };
+                // A drop cannot return the error; it must not vanish (RM-189).
+                let rc = unsafe { close(self.ptr) };
+                if rc != 0 {
+                    eprintln!("secantus-wt: Cursor close failed: {:?}", check(rc));
+                }
             }
             self.ptr = ptr::null_mut();
         }
