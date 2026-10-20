@@ -193,6 +193,26 @@ fn reads_with(sql: &str, user: &dyn UserReads) -> Option<Vec<String>> {
 /// planner may RUN while planning? A cheap textual test first: no `select`
 /// beyond a SELECT's own keyword, and no `with`, means no subquery.
 pub fn has_subquery(sql: &str) -> bool {
+    thread_local! {
+        /// The last statement asked about and the answer: a prepared
+        /// statement's executions ask about one text again and again.
+        static LAST: std::cell::RefCell<Option<(String, bool)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    if let Some(hit) = LAST.with(|l| {
+        l.borrow()
+            .as_ref()
+            .filter(|(text, _)| text == sql)
+            .map(|(_, answer)| *answer)
+    }) {
+        return hit;
+    }
+    let answer = has_subquery_uncached(sql);
+    LAST.with(|l| *l.borrow_mut() = Some((sql.to_string(), answer)));
+    answer
+}
+
+fn has_subquery_uncached(sql: &str) -> bool {
     // Run on every statement, so no allocation on the way to "no".
     let bytes = sql.as_bytes();
     let count = |word: &[u8]| {

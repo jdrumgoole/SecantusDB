@@ -179,6 +179,11 @@ pub struct JoinRows {
     /// it could not attribute), which PostgreSQL would attach to a join
     /// and plan the join order with; the executor does not model that.
     pub where_spans: bool,
+    /// The joined-row keys the query reads above the join -- its select
+    /// list, GROUP BY, HAVING, ORDER BY and the rest, not its WHERE, whose
+    /// conjuncts each read one table and run at its scan. They make the
+    /// width of the rows a join passes up (`build_joinrel_tlist`).
+    pub needed: Vec<String>,
 }
 
 /// One column visible in a join's scope.
@@ -419,6 +424,27 @@ fn finish_join_source(
             .map(|c| Column::new(&c.key, &c.pg_type, false))
             .collect(),
     );
+    let mut out = s.clone();
+    rewrite_query(&mut out, &scope)?;
+    let needed = {
+        let mut above = out.clone();
+        above.where_clause = None;
+        above.from_clause.clear();
+        let node = N::SelectStmt(Box::new(above));
+        let mut keys: Vec<String> = Vec::new();
+        for (n, _, _, _) in node.nodes() {
+            if let pg_query::NodeRef::ColumnRef(c) = n {
+                if let [f] = c.fields.as_slice() {
+                    if let Some(N::String(k)) = f.node.as_ref() {
+                        if k.sval.contains(SEP) && !keys.contains(&k.sval) {
+                            keys.push(k.sval.clone());
+                        }
+                    }
+                }
+            }
+        }
+        keys
+    };
     let name = PLANNED_JOINS.with(|j| {
         let mut j = j.borrow_mut();
         let name = format!("{SEP}join{SEP}{}", j.len());
@@ -430,14 +456,13 @@ fn finish_join_source(
                     tree,
                     def: def.clone(),
                     where_spans,
+                    needed,
                 })),
                 def,
             },
         ));
         name
     });
-    let mut out = s.clone();
-    rewrite_query(&mut out, &scope)?;
     out.from_clause = vec![pg_query::protobuf::Node {
         node: Some(N::RangeVar(pg_query::protobuf::RangeVar {
             relname: name,

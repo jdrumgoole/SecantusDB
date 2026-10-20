@@ -41,6 +41,20 @@ use crate::join_search::{alias_of, column_of, filter_fixes, joinrel_side, Input,
 use secantus_pgplan::joincost::{JoinChoice, JoinMethod, JoinRel, JoinSide};
 use secantus_pgplan::joins::{JoinKind, JoinNode};
 
+/// A column's width with no statistics (`get_typavgwidth`): its type's
+/// length, else what its declared maximum or 32 makes it.
+fn column_width(c: &secantus_pgcatalog::Column) -> i64 {
+    let typlen = secantus_pgplan::pgtypes::oid_of_name(&c.pg_type)
+        .and_then(|oid| crate::pg_type_facts::builtin(oid, "typlen"))
+        .and_then(|v| match v {
+            Bson::Int32(n) => Some(i64::from(n)),
+            Bson::Int64(n) => Some(n),
+            _ => None,
+        })
+        .unwrap_or(-1);
+    secantus_pgplan::hashagg::type_avg_width(&c.pg_type, c.typmod, typlen)
+}
+
 /// One clause of the chain: the base tables it joins (by index), their
 /// keys, and the ON (by its join's index) it comes from.
 struct Edge {
@@ -107,6 +121,11 @@ struct Search {
     class: Vec<(usize, String)>,
     /// The ONs the class stands in for, checked on every row at the end.
     class_ons: Vec<usize>,
+    /// Each table's columns, by joined-row key, with their widths
+    /// (`get_typavgwidth`), and the keys the query reads above the join;
+    /// `None` when that is not known, and then no width is.
+    widths: Vec<Vec<(String, i64)>>,
+    needed: Option<Vec<String>>,
 }
 
 /// A chain of four to eight tables: its leaves, in FROM order, and its
@@ -117,6 +136,35 @@ struct Chain<'a> {
 }
 
 impl Search {
+    /// The width of relation `set`'s rows (`build_joinrel_tlist`): each of
+    /// its tables' columns still needed above it -- read by the query, a
+    /// key of a clause to a table outside it, or a member of the class
+    /// while a member is outside it (`generate_base_implied_equalities`
+    /// marks every member needed by every table of the class).
+    fn width(&self, set: u8) -> Option<i64> {
+        let needed = self.needed.as_ref()?;
+        let outside = |t: usize| set & (1 << t) == 0;
+        let class_open = self.class.iter().any(|(t, _)| outside(*t));
+        let mut width = 0;
+        for (t, cols) in self.widths.iter().enumerate() {
+            if outside(t) {
+                continue;
+            }
+            for (key, w) in cols {
+                let used = needed.contains(key)
+                    || self.edges.iter().any(|e| {
+                        (e.u == t && e.u_key == *key && outside(e.v))
+                            || (e.v == t && e.v_key == *key && outside(e.u))
+                    })
+                    || (class_open && self.class.iter().any(|(ct, k)| *ct == t && k == key));
+                if used {
+                    width += w;
+                }
+            }
+        }
+        Some(width)
+    }
+
     /// `join_is_legal` for joining relations `a` and `b`: `None` when the
     /// join would break an outer join; else whether it performs one, and
     /// if so whether `b` holds its preserved side (`reversed`).
@@ -340,6 +388,23 @@ impl PgHandler {
                 return None;
             }
         }
+        let widths = leaves
+            .iter()
+            .map(|leaf| match leaf {
+                JoinNode::Leaf { def, columns, .. } => columns
+                    .iter()
+                    .map(|(key, field)| {
+                        let w = def
+                            .columns
+                            .iter()
+                            .find(|c| c.field() == *field)
+                            .map_or(32, column_width);
+                        (key.clone(), w)
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .collect();
         Some((
             Chain { leaves, ons },
             Search {
@@ -349,6 +414,8 @@ impl PgHandler {
                 outer,
                 class,
                 class_ons,
+                widths,
+                needed: crate::join_search::needed_keys(),
             },
         ))
     }
@@ -441,12 +508,16 @@ impl PgHandler {
         let (table, filter) = &search.tables[key_table];
         let base = self.join_side(table, JoinKey::Column(column_of(key)?), filter, 0)?;
         let r = &search.rels[rel];
+        let width = search.width(r.set);
         if r.set.count_ones() == 1 {
-            return Some(base);
+            return Some(JoinSide { width, ..base });
         }
         // Joined on the class, a relation merged on it is in its order.
         let keyed = r.keyed.as_ref().filter(|_| class);
-        Some(joinrel_side(r.rows, r.best.as_ref()?, keyed, &base))
+        Some(JoinSide {
+            width,
+            ..joinrel_side(r.rows, r.best.as_ref()?, keyed, &base)
+        })
     }
 
     /// `make_join_rel`: the relation of `a` and `b`'s tables, built (or
@@ -590,7 +661,6 @@ impl PgHandler {
         };
         let built = &r.built[best.combo];
         let clause = &built.clause;
-        let sa = search.rels[built.a].set;
         let (a_key, a_table, b_key) = (clause.a_key.clone(), clause.a_table, clause.b_key.clone());
         // A merge join reads a side "by index" when it is in the key's
         // order already: for a join relation, its path in the class's.
@@ -615,22 +685,45 @@ impl PgHandler {
         ) else {
             return Ok(None);
         };
-        let a_rows = if sa.count_ones() == 1 {
-            let (table, filter) = &search.tables[a_table];
-            column_of(&a_key)
-                .and_then(|c| self.join_side(table, JoinKey::Column(c), filter, 0))
-                .map_or(0.0, |s| s.rows)
-        } else {
-            search.rels[built.a].rows
+        let rows_of = |rel: usize, table: usize, key: &str| {
+            if search.rels[rel].set.count_ones() == 1 {
+                let (name, filter) = &search.tables[table];
+                column_of(key)
+                    .and_then(|c| self.join_side(name, JoinKey::Column(c), filter, 0))
+                    .map_or(0.0, |s| s.rows)
+            } else {
+                search.rels[rel].rows
+            }
         };
+        let a_rows = rows_of(built.a, a_table, &a_key);
+        // The hashed side's table size, as `ExecHashTableCreate` sizes it
+        // from the plan's estimate, and the outer key whose hash places a
+        // row in its batch.
+        let hashed = match best.method {
+            JoinMethod::HashOuterA => {
+                Some((built.b, rows_of(built.b, clause.b_table, &b_key), &a_key))
+            }
+            JoinMethod::HashOuterB | JoinMethod::HashRightB => Some((built.a, a_rows, &b_key)),
+            _ => None,
+        };
+        let batches = hashed.and_then(|(rel, rows, outer_key)| {
+            let width = search.width(search.rels[rel].set)?;
+            let (nbuckets, nbatch) = secantus_pgplan::joincost::hash_table_size(rows, width);
+            let ty = chain
+                .leaves
+                .iter()
+                .find_map(|n| leaf_key_type(n, outer_key))?;
+            (nbatch > 1).then_some((nbuckets, nbatch, ty))
+        });
         let step = Step {
             method: best.method,
             left: built.left,
-            a_key,
-            b_key,
+            a_key: a_key.clone(),
+            b_key: b_key.clone(),
             a_rows,
             on: None,
             filters: Vec::new(),
+            batches,
         };
         let a_type = chain
             .leaves
