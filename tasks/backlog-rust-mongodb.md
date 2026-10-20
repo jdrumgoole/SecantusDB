@@ -828,14 +828,12 @@ Re-measured 2026-10-14 (`tools/probes/admin_commands.py`, 279 of 281
 replies match mongod): **61 of 12,053 differ**, none of them about who
 may run a command.
 
-- [ ] **The probe's mongod is a standalone** and the Rust server says it is
-      a replica-set member, so `$changeStream`, `replSetGetStatus`,
-      `replSetGetConfig`, `getDefaultRWConcern` and `setDefaultRWConcern`
-      (mongod: 51300) differ for the users both allow (32). Running the
-      probe against a one-member replica set needs the set initiated before
-      the localhost exception is used.
-      Backlog-ID: RM-024
-      Verify: none -- the probe's mongod topology (standalone vs replica set), not a server behaviour
+- **`tools/probes/auth_enforcement.py` runs mongod as a one-member
+  replica set** with `--noscripting` (this was RM-024, 2026-10-20), as the
+  Rust server reports itself and as the JavaScript scope decision has it:
+  a standalone answered `$changeStream`, `replSetGetStatus` and the default
+  read/write concern commands differently whoever ran them. Against it the
+  Rust server differs on none of 12,053 checks (66 users).
 - [ ] **`explain` of `$score`, `$rankFusion` and `$scoreFusion` lists the
       stage as written.** The stages run since 2026-10-20 (RM-198, fixed),
       desugared as mongod desugars them, but `explain` shows the stage
