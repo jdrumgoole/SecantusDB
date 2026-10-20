@@ -134,6 +134,8 @@ pub enum Owner {
 struct Head {
     /// Every hold, to release precisely and to tell whom a waiter blocks on.
     holders: Vec<(Owner, Mode)>,
+    /// The requests waiting, first come first: `(ticket, owner, mode)`.
+    queue: std::collections::VecDeque<(u64, Owner, Mode)>,
 }
 
 impl Head {
@@ -141,6 +143,32 @@ impl Head {
         self.holders
             .iter()
             .any(|(o, m)| *o != owner && mode.conflicts_with(*m))
+    }
+
+    fn holds(&self, owner: Owner) -> bool {
+        self.holders.iter().any(|(o, _)| *o == owner)
+    }
+
+    /// Whether the waiter with `ticket` would be granted now, as mongod's
+    /// lock head grants its conflict queue: in order, each request
+    /// compatible with the holds and with those granted before it, up to
+    /// the first that is not, which every later request waits behind.
+    fn grantable(&self, ticket: u64) -> bool {
+        let mut granted: Vec<(Owner, Mode)> = Vec::new();
+        for (t, owner, mode) in &self.queue {
+            let blocked = self.blocks(*owner, *mode)
+                || granted
+                    .iter()
+                    .any(|(o, m)| o != owner && mode.conflicts_with(*m));
+            if blocked {
+                return false;
+            }
+            if *t == ticket {
+                return true;
+            }
+            granted.push((*owner, *mode));
+        }
+        false
     }
 }
 
@@ -183,6 +211,7 @@ pub struct LockManager {
     /// from if a workload ever needs it.
     changed: Condvar,
     next_owner: AtomicU64,
+    next_ticket: AtomicU64,
 }
 
 impl Default for LockManager {
@@ -197,6 +226,7 @@ impl LockManager {
             inner: Mutex::new(Inner::default()),
             changed: Condvar::new(),
             next_owner: AtomicU64::new(1),
+            next_ticket: AtomicU64::new(1),
         }
     }
 
@@ -223,22 +253,53 @@ impl LockManager {
     ) -> Result<(), MaxTimeMsExpired> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let began = Instant::now();
-        let mut waited = false;
+        // First come first served (RM-138): a request that finds others
+        // waiting queues behind them, so a `drop` waiting on live writers is
+        // not overtaken by every writer that comes after it. An owner that
+        // already holds the resource converts in place, as mongod's do, and
+        // never queues behind a waiter that waits on it.
+        {
+            let head = inner.heads.entry(resource.clone()).or_default();
+            if !head.blocks(owner, mode) && (head.queue.is_empty() || head.holds(owner)) {
+                head.holders.push((owner, mode));
+                drop(inner);
+                self.count(resource, mode, None);
+                return Ok(());
+            }
+        }
+        let converting = inner
+            .heads
+            .get(resource)
+            .is_some_and(|head| head.holds(owner));
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        if !converting {
+            if let Some(head) = inner.heads.get_mut(resource) {
+                head.queue.push_back((ticket, owner, mode));
+            }
+        }
         loop {
             let head = inner.heads.entry(resource.clone()).or_default();
-            if !head.blocks(owner, mode) {
+            let ready = if converting {
+                !head.blocks(owner, mode)
+            } else {
+                head.grantable(ticket)
+            };
+            if ready {
+                head.queue.retain(|(t, _, _)| *t != ticket);
                 head.holders.push((owner, mode));
-                let wait = waited.then(|| began.elapsed());
                 drop(inner);
-                self.count(resource, mode, wait);
+                // Those queued behind may now be grantable beside it.
+                self.changed.notify_all();
+                self.count(resource, mode, Some(began.elapsed()));
                 return Ok(());
             }
             if secantus_core::deadline::expired() {
+                head.queue.retain(|(t, _, _)| *t != ticket);
                 drop(inner);
+                self.changed.notify_all();
                 self.count(resource, mode, Some(began.elapsed()));
                 return Err(MaxTimeMsExpired);
             }
-            waited = true;
             let (guard, _) = self
                 .changed
                 .wait_timeout(inner, Duration::from_millis(5))
@@ -256,7 +317,9 @@ impl LockManager {
             head.holders.retain(|(o, _)| *o != owner);
             any |= head.holders.len() != before;
         }
-        inner.heads.retain(|_, h| !h.holders.is_empty());
+        inner
+            .heads
+            .retain(|_, h| !h.holders.is_empty() || !h.queue.is_empty());
         drop(inner);
         if any {
             self.changed.notify_all();
@@ -795,6 +858,53 @@ impl Drop for Guard {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_waiting_exclusive_request_is_not_overtaken() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let lm = Arc::new(LockManager::new());
+        let coll = Resource::Collection("db.c".into());
+        let writer = lm.statement_owner();
+        lm.acquire(writer, &coll, Mode::Ix).unwrap();
+        // A `drop` waits on the writer.
+        let dropper = lm.statement_owner();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let d = {
+            let (lm, coll, dropped) = (lm.clone(), coll.clone(), dropped.clone());
+            std::thread::spawn(move || {
+                lm.acquire(dropper, &coll, Mode::X).unwrap();
+                dropped.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(50));
+                lm.release(dropper);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        // A later writer queues behind the drop instead of overtaking it.
+        let late = lm.statement_owner();
+        let late_in = Arc::new(AtomicBool::new(false));
+        let w = {
+            let (lm, coll, late_in, dropped) =
+                (lm.clone(), coll.clone(), late_in.clone(), dropped.clone());
+            std::thread::spawn(move || {
+                lm.acquire(late, &coll, Mode::Ix).unwrap();
+                assert!(
+                    dropped.load(Ordering::SeqCst),
+                    "the late writer overtook the drop"
+                );
+                late_in.store(true, Ordering::SeqCst);
+                lm.release(late);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!late_in.load(Ordering::SeqCst));
+        // The writer already holding the collection is not queued behind it.
+        lm.acquire(writer, &coll, Mode::Ix).unwrap();
+        lm.release(writer);
+        d.join().unwrap();
+        w.join().unwrap();
+        assert!(late_in.load(Ordering::SeqCst));
+    }
+
     use super::*;
     use secantus_core::deadline;
 

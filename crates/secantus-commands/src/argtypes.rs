@@ -1538,6 +1538,11 @@ const OBJECT_ARG: &[(&str, i32, &str)] = &[
         "$setField only supports an object as its argument",
     ),
     (
+        "$unsetField",
+        4161100,
+        "$unsetField only supports an object as its argument",
+    ),
+    (
         "$sortArray",
         2942500,
         "$sortArray requires an object as an argument, found: {}",
@@ -1981,6 +1986,7 @@ const SINGLE_ARG_CONVERSIONS: &[&str] = &[
     "$toLong",
     "$toObjectId",
     "$toString",
+    "$toUUID",
 ];
 
 /// The date extractors, which take a bare expression OR a one-element array.
@@ -2076,6 +2082,7 @@ const UNKNOWN_ARGUMENT: &[(&str, i32, bool, &[&str])] = &[
         &["input", "find", "replacement"],
     ),
     ("$setField", 4161101, false, &["field", "input", "value"]),
+    ("$unsetField", 4161101, false, &["field", "input"]),
     ("$sortArray", 2942501, false, &["input", "sortBy"]),
     ("$switch", 40067, false, &["branches", "default"]),
     (
@@ -2544,8 +2551,11 @@ pub(crate) fn expression_shape_problem_in(spec: &Bson, stage: &str) -> Option<(i
                     }
                 }
                 // `$topN` / `$bottomN` are ACCUMULATOR-only: reached as an
-                // expression, mongod does not recognise the name at all.
-                if ACCUMULATOR_ONLY.contains(&key.as_str()) && stage != "$group" {
+                // expression, mongod does not recognise the name at all. A
+                // `$setWindowFields` output runs them as window functions.
+                if ACCUMULATOR_ONLY.contains(&key.as_str())
+                    && !matches!(stage, "$group" | "$setWindowFields")
+                {
                     return Some((168, format!("Unrecognized expression '{key}'")));
                 }
                 if let Some((_, code)) = OBJECT_SPEC_EXPRESSIONS.iter().find(|(op, _)| *op == key) {

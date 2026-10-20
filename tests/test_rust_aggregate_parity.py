@@ -803,7 +803,13 @@ def test_fill_parity(docs, pipeline):
                     "$setWindowFields": {
                         "sortBy": {"t": 1},
                         "output": {
-                            "d": {"$derivative": {"input": "$v"}},
+                            # mongod 8.2.11 refuses `$derivative` without
+                            # explicit bounds (9), so the whole partition is
+                            # spelled out.
+                            "d": {
+                                "$derivative": {"input": "$v"},
+                                "window": {"documents": ["unbounded", "unbounded"]},
+                            },
                             "i": {"$integral": {"input": "$v"}},
                             "rd": {
                                 "$derivative": {"input": "$v"},
@@ -831,7 +837,10 @@ def test_fill_parity(docs, pipeline):
                     "$setWindowFields": {
                         "sortBy": {"t": 1},
                         "output": {
-                            "d": {"$derivative": {"input": "$v", "unit": "hour"}},
+                            "d": {
+                                "$derivative": {"input": "$v", "unit": "hour"},
+                                "window": {"documents": ["unbounded", "unbounded"]},
+                            },
                             "i": {"$integral": {"input": "$v", "unit": "hour"}},
                         },
                     }

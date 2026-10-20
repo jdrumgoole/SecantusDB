@@ -560,48 +560,11 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       `allowDiskUse` permits it.
       Backlog-ID: RM-211
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_aggregation_memory_limits
-- [ ] **`$add` and `$subtract` with a Date are refused.** Date minus a
-      number or a date, date plus numbers, `{$add: ["$d"]}` and
-      `{$add: []}` (0 on mongod) all answer 2 "not supported by the Rust
-      server", in aggregation, in `$expr` in a find and in a pipeline
-      update. The cause is `Err(Fallback::Defer)` in
-      `secantus-core/src/expressions.rs` (`// datetime subtraction ->
-      Python`) and the single-date and empty-list defers in `arith_nary`, a
-      Python fallback that does not exist on this server.
-      Backlog-ID: RM-212
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_date_arithmetic
-- [ ] **Expression operators missing, refused, or answering wrongly.**
-      `$unsetField` and `$toUUID` are 31325 unknown expression. These are
-      refused with a generic 2:
-      - `$convert` to binData (`format: "base64"`, or `to: {type:
-        "binData"}`);
-      - `$dateToString` of a Timestamp.
-
-      These are refused with a generic 2 where mongod has its own code:
-      - `$substrCP` with a non-numeric index (34450);
-      - `$setField` on a non-object (4161105);
-      - `$zip` over a non-array (34468);
-      - `$map` over a non-array (16883).
-
-      Silently wrong:
-      - `$getField` on a non-object gives `v: null` where mongod leaves
-        `v` missing;
-      - `{$slice: [arr, "x"]}` gives null where mongod errors 28725;
-      - `$let` accepts the variable name `X` (mongod: 9);
-      - `$arrayToObject` accepts mixed `{k, v}` and pair elements (mongod:
-        40391).
-      Backlog-ID: RM-213
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_expression_operators
-- [ ] **Window functions missing or imprecise.**
-      - `$covariancePop` and `$covarianceSamp` always answer 2.
-      - `$topN` and `$bottomN` as window functions are 168 (`$top` works).
-      - `$linearFill` refuses (2) when `sortBy` is a date.
-      - `$derivative` and `$integral` with a `unit` drift from about the
-        11th significant digit (9.882352941193389 here, 9.882352941176471
-        on mongod). That looks like the unit conversion done in a different
-        order; transcribe mongod's.
-      Backlog-ID: RM-214
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_window_functions
+- `$convert` to binData subtype 2 (the deprecated "old binary") is
+  written with the old format's inner length, as the bson crate writes
+  every subtype-2 value. mongod 8.2.11 writes the bytes alone, which is not
+  a valid subtype-2 value: pymongo refuses to decode the reply. Out of
+  scope; nothing reads the old subtype as mongod emits it.
 - [ ] **`$planCacheStats`, `$queryStats` and `$listSampledQueries` are
       unknown stages** (40324). mongod 8.2.11 runs each on a one-member
       replica set (an empty result on a fresh one). `$planCacheStats` needs
@@ -623,21 +586,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       - A long query or index build cannot be found or interrupted.
       Backlog-ID: RM-216
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_current_op_lists_idle_cursors,tests/backlog/test_rm_found_2026_10_20b.py::test_current_op_sees_a_running_operation
-- [ ] **`killAllSessionsByPattern` ignores its pattern, and the kill
-      commands leave cursors open.** The patterns are parsed and then
-      `abort_all()` runs (`secantus-commands/src/lib.rs`). A pattern naming
-      only s1's lsid aborted s2's transaction too; mongod 8.2.11 lets s2
-      commit. After `killAllSessions: []` or `killAllSessionsByPattern:
-      []` a session's open cursor still answers getMore here; on mongod it
-      is gone (43 CursorNotFound).
-      Backlog-ID: RM-217
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_kill_sessions_by_pattern_kills_only_the_match,tests/backlog/test_rm_found_2026_10_20b.py::test_kill_all_sessions_closes_cursors
-- [ ] **The 64-index limit is not enforced.** mongod 8.2.11 allows 64
-      indexes on a collection, `_id_` included, and refuses the next with 67
-      CannotCreateIndex; this server created a 65th. No limit exists in
-      `secantus-commands` or `secantus-storage`.
-      Backlog-ID: RM-218
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_index_count_limit
 - [ ] **Seventeen commands mongod runs are 59 CommandNotFound here.**
       mongod 8.2.11 (one-member replica set) answers each with success or
       an error of its own:
@@ -828,14 +776,12 @@ Re-measured 2026-10-14 (`tools/probes/admin_commands.py`, 279 of 281
 replies match mongod): **61 of 12,053 differ**, none of them about who
 may run a command.
 
-- [ ] **The probe's mongod is a standalone** and the Rust server says it is
-      a replica-set member, so `$changeStream`, `replSetGetStatus`,
-      `replSetGetConfig`, `getDefaultRWConcern` and `setDefaultRWConcern`
-      (mongod: 51300) differ for the users both allow (32). Running the
-      probe against a one-member replica set needs the set initiated before
-      the localhost exception is used.
-      Backlog-ID: RM-024
-      Verify: none -- the probe's mongod topology (standalone vs replica set), not a server behaviour
+- **`tools/probes/auth_enforcement.py` runs mongod as a one-member
+  replica set** with `--noscripting` (this was RM-024, 2026-10-20), as the
+  Rust server reports itself and as the JavaScript scope decision has it:
+  a standalone answered `$changeStream`, `replSetGetStatus` and the default
+  read/write concern commands differently whoever ran them. Against it the
+  Rust server differs on none of 12,053 checks (66 users).
 - [ ] **`explain` of `$score`, `$rankFusion` and `$scoreFusion` lists the
       stage as written.** The stages run since 2026-10-20 (RM-198, fixed),
       desugared as mongod desugars them, but `explain` shows the stage
@@ -1015,19 +961,13 @@ What the probe does not reach, each found beside it:
   replay past 2,000 documents (nearest first), `2dsphere` index versions 1
   and 2, and a Linux x86-64 mongod (the geo order is the macOS arm64
   reference's: libc++ heap, FMA).
-- [ ] **A line along a polygon's edge on the antimeridian.** A line along
-      lng 180 against a polygon whose edge lies on that meridian meets it on
-      mongod 8.2.11 (`polygonLineIntersection` clips the line to the
-      polygon) and does not here. Line against line is S2's own
-      `S2Polyline::Intersects` since 2026-10-20, exact predicates and
-      symbolic perturbation included (a line ending exactly on another
-      line's edge, and collinear lines, answer as on mongod). Line within
-      polygon, polygon within polygon and line against polygon are still
-      vertex and crossing tests with a 1.5e-9 tolerance, not S2's clipping;
-      they agreed with mongod on everything else probed (`geo_queries.py`,
-      1,278 replies, none differ).
-      Backlog-ID: RM-148
-      Verify: tests/backlog/test_rm_geo_residuals.py::test_line_along_a_polygon_edge_on_the_antimeridian
+- **Line against line and line against polygon are S2's own** (RM-148,
+  closed 2026-10-20): `S2Polyline::Intersects` and mongod's
+  `polygonLineIntersection` (`S2Polygon::IntersectWithPolyline`), with S2's
+  exact predicates. Line within polygon and polygon within polygon are
+  still vertex and crossing tests with a 1.5e-9 tolerance, not S2's
+  clipping; they agreed with mongod on everything probed
+  (`geo_queries.py`, 1,278 replies, none differ).
 
 ### 7.080 The order `find` returns documents in -- 2026-10-13
 
@@ -1438,11 +1378,8 @@ retryable writes). The Rust server differs on 11 scenarios. What is left:
       whole life (RM-084), so the second transaction's statement fails with 24
       LockTimeout after `maxTransactionLockRequestTimeoutMillis` (since
       2026-10-20; before that it waited for the first transaction to end, and
-      could stop the server answering: RM-201, fixed). Also from the lock
-      manager: a queued exclusive request does not hold back a later intent
-      request, where mongod's queue does (a transaction's insert behind a
-      waiting `drop` times out on mongod and goes ahead here; see RM-138).
-      Measured with `tools/probes/transactions.py`: 2 of 267 scenarios.
+      could stop the server answering: RM-201, fixed). Measured with
+      `tools/probes/transactions.py`: 2 of 267 scenarios.
       Backlog-ID: RM-202
       Verify: tests/backlog/test_rm_057_084.py::test_a_collection_made_in_two_transactions
 
@@ -2088,14 +2025,6 @@ touched:
 
 ## Weekly validate.yml failures (2026-08-03 triage)
 
-- [ ] **Rust server: a `drop` queued behind live writers starves
-  indefinitely (lock fairness).** Observed during the 2026-08-11
-  concurrency-report refresh. The bench harness now avoids the problem
-  (fresh per-row collection names) rather than the server fixing it.
-  Reproduce: run a multi-writer churn against one collection and issue `drop`
-  on it mid-churn.
-  Backlog-ID: RM-138
-  Verify: none -- seen only under bench-level write load; a light-load test passes and proves nothing
 
 ## The macOS `test` lane wedges for its whole 30-minute cap, rarely (2026-09-18)
 

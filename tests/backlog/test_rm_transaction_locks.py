@@ -79,3 +79,32 @@ def test_a_transaction_lock_request_times_out(rust_mongo: Any) -> None:
         ]
         == 5
     )
+
+
+@pytest.mark.backlog_fixed("RM-138")
+def test_a_waiting_drop_is_not_overtaken(rust_mongo: Any) -> None:
+    """Lock requests are granted first come first served, as mongod's lock
+    queue grants them: with a transaction holding a collection and a `drop`
+    waiting on it, a new transaction's insert queues behind the `drop` and
+    times out (mongod 8.2.11: 24 LockTimeout) rather than overtaking it. A
+    `drop` behind a stream of writers used to wait for ever (RM-138)."""
+    db = rust_mongo["rm138"]
+    db.drop_collection("w")
+    db.w.insert_one({"_id": 0})
+    holder = rust_mongo.start_session()
+    holder.start_transaction()
+    db.w.insert_one({"_id": 1}, session=holder)
+    dropping = threading.Thread(
+        target=lambda: mongo_answer(lambda: db.command("drop", "w", maxTimeMS=3000)),
+        daemon=True,
+    )
+    dropping.start()
+    time.sleep(0.3)
+    late = rust_mongo.start_session()
+    late.start_transaction()
+    got = mongo_answer(lambda: db.w.insert_one({"_id": 2}, session=late))
+    assert got[:2] == ("err", 24)
+    mongo_answer(late.abort_transaction)
+    holder.abort_transaction()
+    dropping.join(10)
+    assert not dropping.is_alive()
