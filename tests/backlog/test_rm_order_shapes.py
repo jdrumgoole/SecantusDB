@@ -82,7 +82,7 @@ ALL_BUT_NULL = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 19, 20, 21, 22, 23, 24, 25, 26, 27
                 51, 52, 53, 54]  # fmt: skip
 
 
-@pytest.mark.backlog("RM-155")
+@pytest.mark.backlog_fixed("RM-155")
 def test_ne_null_over_a_multikey_index_scans_the_collection(rust_mongo: Any) -> None:
     """mongod 8.2.11: `$ne: null` / `$nin: [null]` over an index that holds
     arrays is a COLLSCAN, so the documents come in collection order."""
@@ -94,7 +94,7 @@ def test_ne_null_over_a_multikey_index_scans_the_collection(rust_mongo: Any) -> 
     _check(rust_mongo, cases)
 
 
-@pytest.mark.backlog("RM-155")
+@pytest.mark.backlog_fixed("RM-155")
 def test_type_object_reads_the_object_bracket(rust_mongo: Any) -> None:
     """mongod 8.2.11: `$type: "object"` scans the index over `[{}, [])` and
     returns the documents by value."""
@@ -111,7 +111,7 @@ def test_type_object_reads_the_object_bracket(rust_mongo: Any) -> None:
     )
 
 
-@pytest.mark.backlog("RM-155")
+@pytest.mark.backlog_fixed("RM-155")
 def test_elem_match_ne_reads_the_index(rust_mongo: Any) -> None:
     """mongod 8.2.11: `$elemMatch: {$ne: 5}` scans `[MinKey, 5), (5,
     MaxKey]` and rechecks the documents it fetches."""
@@ -127,7 +127,7 @@ def test_elem_match_ne_reads_the_index(rust_mongo: Any) -> None:
     )
 
 
-@pytest.mark.backlog("RM-155")
+@pytest.mark.backlog_fixed("RM-155")
 def test_type_date_reads_a_descending_index_latest_first(rust_mongo: Any) -> None:
     """mongod 8.2.11: `$type: "date"` scans the date bracket of a descending
     index, so the later date comes first."""
@@ -135,7 +135,7 @@ def test_type_date_reads_a_descending_index_latest_first(rust_mongo: Any) -> Non
     _check(rust_mongo, [("a_desc", q, [35, 34]), ("a_desc_c", q, [35, 34])])
 
 
-@pytest.mark.backlog("RM-155")
+@pytest.mark.backlog_fixed("RM-155")
 def test_regex_with_an_alternation_reads_every_string(rust_mongo: Any) -> None:
     """mongod 8.2.11: `^s|t` has no single prefix, so it is bounded by every
     string (`({}, ""]` on a descending index) and `"t"` comes first."""
@@ -144,7 +144,7 @@ def test_regex_with_an_alternation_reads_every_string(rust_mongo: Any) -> None:
     _check(rust_mongo, [("a_desc", q, expected), ("a_desc_c", q, expected)])
 
 
-@pytest.mark.backlog("RM-155")
+@pytest.mark.backlog_fixed("RM-155")
 def test_exists_over_a_partial_index_the_query_implies(rust_mongo: Any) -> None:
     """mongod 8.2.11: the query implies the partial filter `c >= 1`, so
     `$exists: true` reads the partial index whole, in key order."""

@@ -3532,26 +3532,42 @@ fn clause_implies_bounds(qval: &Bson, pbound: &Document) -> bool {
 /// Supports bare-equality partial values and the `$eq`/`$lt`/`$lte`/`$gt`/`$gte`
 /// range operators on both sides. Mirrors `storage._query_implies_partial`.
 pub fn query_implies_partial(query: &Document, partial: &Document) -> bool {
-    for (key, pval) in partial.iter() {
-        let qval = match query.get(key) {
-            Some(v) => v,
-            None => return false,
-        };
-        if is_op_doc(pval) {
-            if !clause_implies_bounds(qval, pval.as_document().unwrap()) {
-                return false;
+    partial.iter().all(|(key, pval)| {
+        // A condition on `key` anywhere the query requires it: at the top,
+        // or in a clause of a top-level `$and` (every matching document
+        // satisfies each clause). `{$and: [{a: {$exists: true}}, {c: {$gte:
+        // 1}}]}` implies a partial filter of `{c: {$gte: 1}}` (measured
+        // mongod 8.2.11, RM-155); only the top level was looked at.
+        let mut conditions = Vec::new();
+        required_conditions(query, key, &mut conditions);
+        conditions.iter().any(|qval| {
+            if is_op_doc(pval) {
+                clause_implies_bounds(qval, pval.as_document().unwrap())
+            } else if is_op_doc(qval) {
+                // bare-value partial, operator-form query: only an exact `$eq`
+                // of the same value implies it.
+                qval.as_document().unwrap().get("$eq") == Some(pval)
+            } else {
+                *qval == pval
             }
-        } else if is_op_doc(qval) {
-            // bare-value partial, operator-form query: only an exact `$eq` of the
-            // same value implies it.
-            if qval.as_document().unwrap().get("$eq") != Some(pval) {
-                return false;
+        })
+    })
+}
+
+/// Every condition `query` places on `key` that a matching document must
+/// meet: the top-level one, and those inside a top-level `$and`, however
+/// deeply nested.
+fn required_conditions<'a>(query: &'a Document, key: &str, out: &mut Vec<&'a Bson>) {
+    if let Some(v) = query.get(key) {
+        out.push(v);
+    }
+    if let Some(Bson::Array(clauses)) = query.get("$and") {
+        for clause in clauses {
+            if let Bson::Document(d) = clause {
+                required_conditions(d, key, out);
             }
-        } else if qval != pval {
-            return false;
         }
     }
-    true
 }
 
 /// `(field, direction)` if `sort` is a single `±1` field (not operator-prefixed),
@@ -22550,6 +22566,25 @@ mod tests {
         assert!(matches!(
             out2.get_document("$set").unwrap().get("x"),
             Some(Bson::DateTime(_))
+        ));
+    }
+
+    #[test]
+    fn query_implies_partial_looks_inside_and() {
+        // A clause of a top-level `$and` binds every matching document.
+        let partial = doc! {"c": {"$gte": 1}};
+        assert!(query_implies_partial(
+            &doc! {"$and": [{"a": {"$exists": true}}, {"c": {"$gte": 1}}]},
+            &partial
+        ));
+        assert!(query_implies_partial(
+            &doc! {"$and": [{"$and": [{"c": {"$gt": 2}}]}]},
+            &partial
+        ));
+        // An `$or` binds nothing.
+        assert!(!query_implies_partial(
+            &doc! {"$or": [{"c": {"$gte": 1}}, {"a": 1}]},
+            &partial
         ));
     }
 
