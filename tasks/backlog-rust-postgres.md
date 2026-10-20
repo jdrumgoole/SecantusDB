@@ -495,17 +495,18 @@ one beside it.
     every member is, so a path merged on an edge no longer stands beside
     an equally cheap one in the class's order and decides a tie; a class
     over a chain of five went from 12 to 21 of 27 shapes at 20, 300 and
-    3,000 rows, every other shape unchanged. The six left are a HASH JOIN
-    TOO BIG FOR `work_mem`: with `t1.a` a primary key and the class's ON
-    written `t2.a = t1.a`, PostgreSQL hashes 212,242 estimated rows of
-    width 16, more than `work_mem` x `hash_mem_multiplier` (4 MB x 2)
-    holds, so `ExecChooseHashTableSize` gives it several batches. Batches
-    cost page I/O (`final_cost_hashjoin`) and return their rows batch by
-    batch, an outer row hashing to a later batch joined after every row of
-    batch 0 (`ExecHashGetBucketAndBatch`: the hash rotated right by
-    log2(nbuckets), masked by nbatch - 1). Neither is modelled: the cost is
-    one batch's, the rows come out in scan order, and no join relation
-    carries the row WIDTH that sizes the table. Not yet: two classes spanning both sides (two join keys); an
+    3,000 rows, every other shape unchanged. A hash join too big for
+    `work_mem` x `hash_mem_multiplier` (4 MB x 2) is split into batches
+    (`ExecChooseHashTableSize`, 2026-10-20): each join relation carries
+    its row WIDTH, the columns still needed above it (the query's, a
+    clause's key to a table outside it, the class's members while one is
+    outside; `JoinRows::needed`), the batches' page I/O is priced
+    (`initial_cost_hashjoin`, virtual buckets in `final_cost_hashjoin`),
+    and the rows come out batch by batch, an outer row hashing to a later
+    batch joined after every row of batch 0 (`ExecHashGetBucketAndBatch`);
+    the class over five tables 27 of 27. A hash RIGHT join split into
+    batches returns each batch's unmatched rows after its probes, which is
+    not modelled: the search declines it. Not yet: two classes spanning both sides (two join keys); an
     expression in a class; a LEFT join's class through the general path;
     a class of text or other non-integer keys, or with a LEFT join; three
     tables with a WHERE over two of them or a LIMIT; four or more tables
@@ -516,7 +517,7 @@ one beside it.
     than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_hash_join_too_big_for_work_mem_returns_rows_batch_by_batch
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_right_join_of_two_tables_is_planned_as_postgresql_plans_it
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
@@ -594,9 +595,22 @@ one beside it.
         plan cache refused a `uuid` parameter so every row was planned
         again (a third; `plan_cache` now templates one, since Bind has
         made it canonical), and the type lookups canonicalised the same
-        names per value. The script went from 18.7 s to 11.6 s; the
-        storage insert is now 43% of a statement. **Not yet measured on
-        Linux.**
+        names per value. The script went from 18.7 s to 11.6 s (PR
+        #2032), and to about 9.5 s once each statement's subquery check
+        and a uuid parameter's decode stopped repeating work (2026-10-20).
+        **Measured on Linux after #2032 (run 39337247272): still over 20 s
+        in both transports** -- that runner takes about 1.6 times as long
+        as the development Mac over the whole gauge. **What bounds it now
+        is storage's per-collection write lock** (`Storage::insert_chunk`'s
+        `coll_lock`): every insert into one table holds it across its
+        statement transaction, which re-reads the collection's index
+        descriptors, options, timeseries flag and UUID from WiredTiger and
+        writes the oplog entry, so the three connections insert one at a
+        time (the lock's wait rose from 7% to 12% of a statement as the
+        server's own work shrank), where PostgreSQL inserts them in
+        parallel. Shortening that critical section -- the collection
+        metadata cached against DDL -- is the next lever, and a change to
+        the storage the MongoDB server shares.
 
       What the lane gates, given that: a run that stopped short, and a
       test that fails over TLS, passes in the clear, **and fails over TLS

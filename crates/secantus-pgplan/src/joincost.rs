@@ -46,6 +46,10 @@ pub struct JoinSide {
     /// size scales its distinct count by (`estimate_hash_bucket_stats`):
     /// `rows` for a table, the base table's for a join's output.
     pub rel_rows: f64,
+    /// The width of its rows (`pathtarget->width`): the columns needed
+    /// above it. `None` where it is not known, which prices a hash join on
+    /// it as one batch, as before widths were modelled.
+    pub width: Option<i64>,
 }
 
 impl JoinSide {
@@ -109,17 +113,109 @@ pub fn hash_bucket(v: &bson::Bson, ty: &str, nbuckets: usize) -> Option<usize> {
     Some(hash as usize & (nbuckets - 1))
 }
 
+/// `work_mem` x `hash_mem_multiplier` (`get_hash_memory_limit`), at
+/// PostgreSQL 15's defaults of 4 MB and 2.0.
+const HASH_MEM_BYTES: u64 = 4096 * 1024 * 2;
+
+fn maxalign(n: u64) -> u64 {
+    (n + 7) & !7
+}
+
+/// `ExecChooseHashTableSize` for a hashed side of `rows` rows `width` bytes
+/// wide, its skew allowance counted (the planner always counts it, and the
+/// executor does for an outer key that is a table's column, which a chain's
+/// always is): `(nbuckets, nbatch)`.
+pub fn hash_table_size(rows: f64, width: i64) -> (u64, u64) {
+    // HJTUPLE_OVERHEAD (16), MAXALIGN(SizeofMinimalTupleHeader) (16).
+    let ntuples = if rows <= 0.0 { 1000.0 } else { rows };
+    let tupsize = 16 + 16 + maxalign(width.max(0) as u64);
+    let inner_rel_bytes = ntuples * tupsize as f64;
+    let mut hash_table_bytes = HASH_MEM_BYTES;
+    // The skew table: 2% of the memory, at a tuple, eight bucket pointers,
+    // an int and a HashSkewBucket (16) per most common value.
+    let bytes_per_mcv = tupsize + 8 * 8 + 4 + 16;
+    let skew_mcvs = (hash_table_bytes / bytes_per_mcv) * 2 / 100;
+    hash_table_bytes -= skew_mcvs * bytes_per_mcv;
+    // A HashJoinTuple pointer a bucket; MaxAllocSize / 8 at most.
+    let max_pointers = prev_power_of_two((hash_table_bytes / 8).min(0x3fff_ffff / 8));
+    let max_pointers = max_pointers.min(i32::MAX as u64 / 2 + 1);
+    let dbuckets = ntuples.ceil().min(max_pointers as f64);
+    let mut nbuckets = (dbuckets as u64).max(1024).next_power_of_two();
+    let mut nbatch = 1;
+    if inner_rel_bytes + (8 * nbuckets) as f64 > hash_table_bytes as f64 {
+        let bucket_size = tupsize + 8;
+        let sbuckets = if hash_table_bytes <= bucket_size {
+            1
+        } else {
+            (hash_table_bytes / bucket_size).next_power_of_two()
+        };
+        nbuckets = sbuckets.min(max_pointers).next_power_of_two();
+        let bucket_bytes = nbuckets * 8;
+        let dbatch = (inner_rel_bytes / (hash_table_bytes - bucket_bytes) as f64)
+            .ceil()
+            .min(max_pointers as f64);
+        nbatch = (dbatch as u64).max(2).next_power_of_two();
+    }
+    (nbuckets, nbatch)
+}
+
+fn prev_power_of_two(n: u64) -> u64 {
+    if n == 0 {
+        0
+    } else {
+        1 << (63 - n.leading_zeros())
+    }
+}
+
+/// A join key's hash (`ExecHashGetHashValue` over one key): the type's hash
+/// function's value; `None` for a type whose hash is not modelled.
+pub fn hash_value(v: &bson::Bson, ty: &str) -> Option<u32> {
+    crate::hashfn::plain_hash(v, ty)
+}
+
+/// The batch a row whose key hashes to `hash` joins in
+/// (`ExecHashGetBucketAndBatch`): its hash rotated right by log2(nbuckets),
+/// masked by nbatch - 1.
+pub fn hash_batch(hash: u32, nbuckets: u64, nbatch: u64) -> u64 {
+    if nbatch <= 1 {
+        return 0;
+    }
+    u64::from(hash.rotate_right(nbuckets.trailing_zeros())) & (nbatch - 1)
+}
+
+/// `page_size`: the 8 kB pages `rows` rows of `width` bytes take, at a
+/// heap tuple header (23, aligned to 24) each.
+fn page_size(rows: f64, width: i64) -> f64 {
+    (rows * (maxalign(width.max(0) as u64) + 24) as f64 / 8192.0).ceil()
+}
+
 /// A hash join with `inner` hashed: `(startup, total)`.
 pub fn hash_join(outer: &JoinSide, inner: &JoinSide) -> (f64, f64) {
     let mut startup = outer.scan.0 + inner.scan.1;
     let mut run = outer.scan.1 - outer.scan.0;
     startup += (CPU_OPERATOR_COST + CPU_TUPLE_COST) * inner.rows;
     run += CPU_OPERATOR_COST * outer.rows;
-    // ExecChooseHashTableSize: a power of two at least the rows, at least
-    // 1,024; one batch for the tables this models.
-    let buckets = (inner.rows.max(1.0).ceil() as u64)
-        .next_power_of_two()
-        .max(1024) as f64;
+    // ExecChooseHashTableSize; a side whose width is not known is priced
+    // as one batch of a power of two at least the rows, at least 1,024.
+    let (nbuckets, nbatch) = match inner.width {
+        Some(w) => hash_table_size(inner.rows, w),
+        None => (
+            (inner.rows.max(1.0).ceil() as u64)
+                .next_power_of_two()
+                .max(1024),
+            1,
+        ),
+    };
+    // Batches write the inner side out once and the outer side out and
+    // back (`initial_cost_hashjoin`).
+    if nbatch > 1 {
+        let innerpages = page_size(inner.rows, inner.width.unwrap_or(0));
+        let outerpages = page_size(outer.rows, outer.width.unwrap_or(0));
+        startup += innerpages;
+        run += innerpages + 2.0 * outerpages;
+    }
+    // `final_cost_hashjoin`'s virtual buckets: every batch's.
+    let buckets = nbuckets as f64 * nbatch as f64;
     // estimate_hash_bucket_stats: 0.1 for a default distinct count.
     let bucketsize = if inner.default_ndistinct {
         0.1
@@ -710,6 +806,7 @@ mod tests {
             default_ndistinct: false,
             key_ops: 0.0,
             rel_rows: 2260.0,
+            width: None,
         }
     }
     fn plain() -> JoinSide {
@@ -720,6 +817,44 @@ mod tests {
             default_ndistinct: true,
             ..pk()
         }
+    }
+
+    #[test]
+    fn a_hash_table_past_work_mem_is_split_into_batches() {
+        // PostgreSQL 15.19, five 20-row tables never analysed (2,040 rows
+        // estimated each), t1.a a primary key: the top Hash Join of
+        // `t0 join t1 on t0.b = t1.c join t2 on t2.a = t1.a join t3 on
+        // t2.a = t3.a join t4 on t3.b = t4.c` hashes t0-t1-t3-t4 (212,242
+        // rows, width 16, 1152.59..3909.45) under a Seq Scan of t2 (width
+        // 4): Hash Join (7599.47..11075.59), two batches.
+        assert_eq!(hash_table_size(212_242.0, 16), (262_144, 2));
+        assert_eq!(hash_table_size(20_808.0, 8).1, 1);
+        let t2 = JoinSide {
+            rows: 2040.0,
+            tuples: 2040.0,
+            rel_rows: 2040.0,
+            scan: (0.0, 30.40),
+            startup_scan: (0.0, 30.40),
+            width: Some(4),
+            ..plain()
+        };
+        let hashed = JoinSide {
+            rows: 212_242.0,
+            tuples: 2040.0,
+            rel_rows: 2040.0,
+            scan: (1152.59, 3909.45),
+            startup_scan: (1152.59, 3909.45),
+            ndistinct: 2040.0,
+            default_ndistinct: false,
+            width: Some(16),
+            ..plain()
+        };
+        let (s, t) = hash_join(&t2, &hashed);
+        assert!(close(s, 7599.47) && close(t, 11075.59), "{s} {t}");
+        // Rotated right by log2(nbuckets), masked by nbatch - 1.
+        assert_eq!(hash_batch(1 << 18, 262_144, 2), 1);
+        assert_eq!(hash_batch((1 << 18) - 1, 262_144, 2), 0);
+        assert_eq!(hash_batch(u32::MAX, 1024, 1), 0);
     }
 
     #[test]

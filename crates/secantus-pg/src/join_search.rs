@@ -30,6 +30,14 @@ thread_local! {
     /// Set while a join source whose query's WHERE spans tables
     /// (`JoinRows::where_spans`) is read: its join order is not searched.
     static WHERE_SPANS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The joined-row keys the query reads above the join source being
+    /// read (`JoinRows::needed`); `None` outside one.
+    static NEEDED: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The keys the query reads above the join source being read, when known.
+pub(crate) fn needed_keys() -> Option<Vec<String>> {
+    NEEDED.with(|n| n.borrow().clone())
 }
 
 /// Whether the join source being read has a WHERE over more than one
@@ -44,8 +52,10 @@ pub(crate) fn with_join_where<T>(
     f: impl FnOnce() -> T,
 ) -> T {
     let outer = WHERE_SPANS.with(|c| c.replace(join.where_spans));
+    let outer_needed = NEEDED.with(|n| n.replace(Some(join.needed.clone())));
     let out = f();
     WHERE_SPANS.with(|c| c.set(outer));
+    NEEDED.with(|n| *n.borrow_mut() = outer_needed);
     out
 }
 
@@ -71,6 +81,10 @@ pub(crate) struct Step {
     /// class's derived clause stood in for them below).
     pub(crate) on: Option<usize>,
     pub(crate) filters: Vec<usize>,
+    /// A hash join whose table is split into batches: its buckets, its
+    /// batches and its OUTER key's type, whose hash places an outer row
+    /// in its batch. `None` for one batch.
+    pub(crate) batches: Option<(u64, u64, String)>,
 }
 
 /// The search's answer: which two tables join first (by index into the
@@ -477,6 +491,7 @@ impl PgHandler {
                 a_rows: side(p.a, &p.a_key)?.rows,
                 on: p.on,
                 filters: Vec::new(),
+                batches: None,
             },
             joinrel_first: c.pair_first,
             second_step: Step {
@@ -487,6 +502,7 @@ impl PgHandler {
                 a_rows: a.rows,
                 on: top_on,
                 filters: rest,
+                batches: None,
             },
         };
         Some(plan)
@@ -643,6 +659,36 @@ impl PgHandler {
                 }
             }
         };
+        // A hash table split into batches joins each outer row in its key's
+        // batch: batch 0's as the outer side is read, every later batch's
+        // after it, in the order they were read (`ExecHashJoinNewBatch`). A
+        // NULL key matches nothing and is not saved (a LEFT join's row comes
+        // out where it is read). A right join's unmatched rows would come
+        // out batch by batch too, which is not modelled.
+        let mut outer = outer;
+        if let Some((nbuckets, nbatch, ty)) = &step.batches {
+            match step.method {
+                JoinMethod::HashOuterA | JoinMethod::HashOuterB => {
+                    let mut tagged = Vec::with_capacity(outer.rows.len());
+                    for d in std::mem::take(&mut outer.rows) {
+                        let batch = match d.get(&outer_key) {
+                            None | Some(Bson::Null) => 0,
+                            Some(v) => {
+                                let Some(h) = secantus_pgplan::joincost::hash_value(v, ty) else {
+                                    return Ok(None);
+                                };
+                                secantus_pgplan::joincost::hash_batch(h, *nbuckets, *nbatch)
+                            }
+                        };
+                        tagged.push((batch, d));
+                    }
+                    tagged.sort_by_key(|(b, _)| *b);
+                    outer.rows = tagged.into_iter().map(|(_, d)| d).collect();
+                }
+                JoinMethod::HashRightB => return Ok(None),
+                _ => {}
+            }
+        }
         let mut outer_rows = Some(outer.rows);
         let mut out = Vec::new();
         self.join_rows_core(

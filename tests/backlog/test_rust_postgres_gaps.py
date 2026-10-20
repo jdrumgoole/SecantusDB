@@ -1907,7 +1907,7 @@ def test_five_tables_read_a_classes_sorted_join_under_a_sorted_outer(pg: Any) ->
     assert " ".join(":".join(str(v) for v in r) for r in got[1][:6]) == want
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_hash_join_too_big_for_work_mem_returns_rows_batch_by_batch(pg: Any) -> None:
     """PostgreSQL 15.19: the same five-table chain with `rp028_h1.a` a
     primary key and the class's first ON written `h2.a = h1.a`. The top join
@@ -1943,6 +1943,33 @@ def test_a_hash_join_too_big_for_work_mem_returns_rows_batch_by_batch(pg: Any) -
     assert got[0] == "ok"
     assert len(got[1]) == 216
     assert " ".join(":".join(str(v) for v in r) for r in got[1][:18]) == want
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_right_join_of_two_tables_is_planned_as_postgresql_plans_it(pg: Any) -> None:
+    """PostgreSQL 15.19, two 20-row tables never analysed: `r0 RIGHT JOIN
+    r1 on r0.b = r1.c` is a Merge Left Join with r1 outer, each side sorted
+    on its key, and the rows come out in that merge's order. The general
+    join path does not plan a two-table RIGHT join, and returns the same
+    54 rows in another order."""
+    pg.execute("begin")
+    try:
+        for t, (mb, mc) in enumerate([(7, 5), (5, 3)]):
+            pg.execute(f"create table rp028_r{t} (a int, b int, c int)")
+            pg.execute(
+                f"insert into rp028_r{t} select i, i % {mb}, i % {mc} from generate_series(1, 20) i"
+            )
+        got = pg_answer(
+            pg,
+            "select rp028_r0.a, rp028_r1.a from rp028_r0 right join rp028_r1"
+            " on rp028_r0.b = rp028_r1.c",
+        )
+    finally:
+        pg.execute("rollback")
+    want = "7:15 14:15 7:9 14:9 7:18 14:18 7:3 14:3 7:12 14:12 7:6 14:6 15:10 8:10 1:10 15:13"
+    assert got[0] == "ok"
+    assert len(got[1]) == 54
+    assert " ".join(":".join(str(v) for v in r) for r in got[1][:16]) == want
 
 
 # RP-047: the lock manager. Each test needs two sessions on one server, so

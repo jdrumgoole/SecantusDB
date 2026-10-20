@@ -30927,15 +30927,18 @@ pub fn uuid_from_wire(bytes: &[u8]) -> Option<String> {
     if bytes.len() != 16 {
         return None;
     }
-    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    Some(format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    ))
+    // Written digit by digit: a `format!` per byte was most of a bound
+    // uuid parameter's decode (RP-014).
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(36);
+    for (i, b) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        out.push(char::from(HEX[usize::from(b >> 4)]));
+        out.push(char::from(HEX[usize::from(b & 15)]));
+    }
+    Some(out)
 }
 
 /// A UUID's 16-byte BINARY wire form (`uuid_send`) from its text, in any
@@ -31244,6 +31247,21 @@ fn values_params_as_text(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod uuid_wire_tests {
+    #[test]
+    fn a_uuid_reads_from_its_sixteen_bytes_in_canonical_form() {
+        let text = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11";
+        let wire = super::uuid_to_wire(text).expect("a uuid");
+        assert_eq!(super::uuid_from_wire(&wire).as_deref(), Some(text));
+        assert_eq!(
+            super::uuid_from_wire(&[0xff; 16]).as_deref(),
+            Some("ffffffff-ffff-ffff-ffff-ffffffffffff")
+        );
+        assert_eq!(super::uuid_from_wire(&[0; 15]), None);
     }
 }
 

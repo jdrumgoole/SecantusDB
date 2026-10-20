@@ -6484,6 +6484,7 @@ impl PgHandler {
             ndistinct,
             default_ndistinct,
             key_ops,
+            width: None,
         })
     }
 
