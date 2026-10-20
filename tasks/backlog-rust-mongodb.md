@@ -586,22 +586,24 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       - A long query or index build cannot be found or interrupted.
       Backlog-ID: RM-216
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_current_op_lists_idle_cursors,tests/backlog/test_rm_found_2026_10_20b.py::test_current_op_sees_a_running_operation
-- [ ] **Seventeen commands mongod runs are 59 CommandNotFound here.**
+- [ ] **Ten commands mongod runs are 59 CommandNotFound here.**
       mongod 8.2.11 (one-member replica set) answers each with success or
       an error of its own:
-      - data: `applyOps` (which `mongorestore --oplogReplay` needs),
-        `filemd5`, `releaseMemory`;
+      - data: `applyOps` (which `mongorestore --oplogReplay` needs);
       - diagnostics: `getDiagnosticData`, `dbCheck`, `validateDBMetadata`;
       - settings: `setUserWriteBlockMode`, `setQuerySettings` /
-        `removeQuerySettings`, `setClusterParameter`, `autoCompact`;
-      - connections and auth: `dropConnections`, `invalidateUserCache`,
-        `rotateCertificates` (TLS has landed);
-      - replication: `replSetGetRBID`, `replSetFreeze`,
-        `replSetMaintenance`.
+        `removeQuerySettings`, `setClusterParameter` (mongod keeps the
+        values in `config.clusterParameters`), `autoCompact` (needs
+        background compaction, which RM-192 lacks);
+      - `rotateCertificates` (TLS has landed; it would re-read the files).
 
-      RM-143 covers only `planCacheSetFilter` and `replSetReconfig`. Each
-      is its own slice, and some (query settings, write blocking) are real
-      features rather than replies.
+      `filemd5` with `partialOk` is refused by name (115): its `md5state` is
+      mongod's own MD5 implementation's state. Seven of the original
+      seventeen landed 2026-10-20 (`invalidateUserCache`, `replSetGetRBID`,
+      `replSetFreeze`, `replSetMaintenance`, `dropConnections`,
+      `releaseMemory`, `filemd5`). Each left is its own slice, and some
+      (query settings, write blocking) are real features rather than
+      replies.
       Backlog-ID: RM-219
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_commands_mongod_runs_are_commands_here
 - [ ] **A string that is not valid UTF-8 is refused.** An insert whose
@@ -621,49 +623,29 @@ mongod 8.2.11 with a `secantusd-rs` built from tree `af2629ec`; the rest
 were confirmed by reading the code path and need a fault no quick test can
 inject (a panic, a power loss, a failing checkpoint).
 
-- [ ] **`createIndexes` on a collection bigger than the WiredTiger cache
-      can afford in one transaction never returns.** The backfill runs in a
-      single `with_statement_txn` (`Storage::create_index`), collecting every
-      entry before inserting any. When WiredTiger rolls that transaction back
-      because its dirty content cannot be evicted, `From<WtError>` asks for
-      the rollback reason only inside a user transaction, so an autocommit
-      build is classified `WriteConflict` and `retry_write_conflicts` retries
-      it with no limit. Measured: at `--cache-size 8M` a build over 5,000
-      300-byte documents logs `create_index retrying on write conflicts` until
-      the client gives up; at 32M so does one over 300,000 (still retrying at
-      120 s). The default 4G cache only moves the threshold. The build also
-      holds the global storage lock and the collection lock throughout, so
-      every DDL and every write to that collection waits on it. mongod 8.2.11
-      built an index over 1,000,000 such documents (345 MB of indexes) at its
-      minimum 0.25 GB cache, in 129 s: its builds sort externally within
-      `maxIndexBuildMemoryUsageMegabytes` and insert in batches while writes
-      continue. `drop_collection` had the same wedge and was fixed by
-      chunking (`tests/drop_chunk.rs`); an index build needs the same, and an
-      engine rollback outside a user transaction must not be retried forever.
+- [ ] **An index build holds every write to its collection off until it
+      finishes.** The build is chunked now (fixed 2026-10-20: it had run as
+      one transaction and never returned under a small cache; at 32 MB it
+      builds over 300,000 300-byte documents in 4 s). But it still holds
+      the global storage lock and the collection lock from its first read
+      to its catalog row, so every DDL, and every write to that collection,
+      waits for the whole build. mongod 8.2.11's build lets writes go on: a
+      side table records the writes made while it scans, and they are
+      applied before the index commits, within
+      `maxIndexBuildMemoryUsageMegabytes`. A build that sorted externally
+      would also stop holding all its entries in memory at once.
       Backlog-ID: RM-187
-      Verify: tests/backlog/test_rm_found_2026_10_20.py::test_index_build_completes_under_a_small_cache
-- [ ] **A WiredTiger panic while the server is running goes unnoticed.**
-      `secantus-wt`'s `Connection::open` passes a null event handler to
-      `wiredtiger_open`, and nothing checks for `WT_PANIC` (-31804). After a
-      panic every storage call fails, each reaching the client as an ordinary
-      error, while `hello` and `ping` still succeed, and `Drop` then tries to
-      checkpoint the panicked connection. mongod installs an event handler
-      that terminates the process on a panic (`fassert`), so a supervisor sees
-      it die. §7.069 covers a panic while OPENING a store, in CI.
-      Backlog-ID: RM-188
-      Verify: none -- needs a WiredTiger panic injected into a running server
-- [ ] **`count({})`, `collStats`, `dataSize` and `dbStats` read the whole
-      collection into memory.** `scan_docs` returns a `Vec` of every
-      document's bytes; `count_matching` with an empty filter is
-      `scan_docs(...).len()`, `collection_data_size` and `index_sizes` each
-      scan again, `dbStats` runs all three for every collection, and
-      `collection_min_id_key` loads everything to find a minimum. mongod
-      answers all of these from its size-and-count metadata, so on a large
-      collection they are cheap there and can exhaust memory here. RM-080
+      Verify: none -- a concurrency budget (writes during a long build), not an answer
+- [ ] **`count({})`, `collStats`, `dataSize` and `dbStats` walk every
+      row.** They stream now, in constant memory (fixed 2026-10-20: each
+      read the whole collection into a `Vec`, and `dbStats` did that three
+      times per collection). But each still takes time proportional to the
+      collection, where mongod answers all of them from its size-and-count
+      metadata (the size storer), kept up to date by every write. RM-080
       covers `find` / `aggregate` cursors; RM-087 covers fast-count
       visibility, not its cost.
       Backlog-ID: RM-191
-      Verify: none -- a memory and time budget, not an answer
+      Verify: none -- a time budget, not an answer
 - [ ] **Disk space is never given back, and there is no repair path.**
       `compact` answers `bytesFreed: 0` without doing anything
       (`secantus-commands/src/capped_admin.rs`, "There is never anything to
@@ -678,22 +660,6 @@ inject (a panic, a power loss, a failing checkpoint).
       recognises `WT_TRY_SALVAGE` and has nothing to offer.
       Backlog-ID: RM-192
       Verify: none -- reclaiming disk space; no small shape where mongod reports bytesFreed > 0 was found
-- [ ] **The opt-in async oplog (`--oplog-async`) can drop or blank an
-      entry.** The drainer's final shutdown retry discards a failing batch
-      with `let _ =` (so `docs/concurrency.md`'s "a clean shutdown flushes
-      the drainer" does not hold when a write fails), `Drop` ignores each
-      drainer's `join` result, and an entry that fails to encode is stored
-      as an empty document in its place rather than surfaced. Each is a
-      storage error turned into silence.
-      Backlog-ID: RM-193
-      Verify: none -- needs a failing WiredTiger write or BSON encode injected into the drainer
-- [ ] **Per-collection write locks are never freed.** `coll_locks` keeps an
-      entry for every namespace ever referenced (deliberately, so a lock's
-      identity survives drop and recreate), so memory grows with the number
-      of collections a long-running server has ever seen. Minor; a test that
-      creates and drops collections by the million is where it shows.
-      Backlog-ID: RM-194
-      Verify: none -- unbounded growth over a server's lifetime, not an answer
 
 ### 7.084 What an authenticated user may run -- 2026-10-14
 
@@ -977,29 +943,6 @@ Still different, all 77:
   and `tests/backlog/test_rm_planner_text.py`. `$jsonSchema` prints as the
   predicates it parses into (since 2026-10-20); `$near` is refused in
   words of its own before any plan.
-- [ ] **The order of an unsorted `find` for six predicate shapes the
-      plan derives differently from mongod.** Found by p4-router's
-      824-case shapes harness (2026-10-15), mongod 8.2.11: 22 replies, the
-      matched set right in every one, only the order different.
-      - `$ne: null` / `$nin: [null]` over an index holding arrays (8):
-        mongod runs a COLLSCAN; this server scans the index over
-        `[MinKey, null), (null, MaxKey]`.
-      - `$type: "object"` (5): mongod scans the object bracket `[{}, [])`
-        and returns the documents by value; this server scans the
-        collection.
-      - `$elemMatch: {$ne: 5}` (4): mongod scans `[MinKey, 5), (5,
-        MaxKey]`; this server scans the collection.
-      - `$type: "date"` over a descending index (2): mongod reads the date
-        bracket, latest first; this server scans the collection.
-      - A regex with an alternation, `^s|t`, over a descending index (2):
-        mongod bounds it by every string; the plan here takes the prefix
-        `s` (`regex_prefix` ignores `|`), so its bounds are wrong, and the
-        result is right only because the router decides membership.
-      - `$exists: true` with `c: {$gte: 1}` over a partial index on `c >=
-        1` (1): mongod sees the query implies the filter and reads the
-        partial index in key order; this server scans the collection.
-      Backlog-ID: RM-155
-      Verify: tests/backlog/test_rm_order_shapes.py::test_ne_null_over_a_multikey_index_scans_the_collection,tests/backlog/test_rm_order_shapes.py::test_type_object_reads_the_object_bracket,tests/backlog/test_rm_order_shapes.py::test_elem_match_ne_reads_the_index,tests/backlog/test_rm_order_shapes.py::test_type_date_reads_a_descending_index_latest_first,tests/backlog/test_rm_order_shapes.py::test_regex_with_an_alternation_reads_every_string,tests/backlog/test_rm_order_shapes.py::test_exists_over_a_partial_index_the_query_implies
 - [ ] **A build before number-key format 2 writing into a store already at
       format 2.** An older build of either server (the PyPI wheel included)
       that inserts a document with a numeric `_id` writes a format-1 `_id`
@@ -1304,19 +1247,6 @@ retryable writes). The Rust server differs on 11 scenarios. What is left:
       of 12; the `writeConcernError` one probe run saw did not recur.)
       Backlog-ID: RM-087
       Verify: tests/backlog/test_rm_085_112.py::test_fast_count_sees_another_sessions_uncommitted_insert
-- [ ] **RUST MongoDB server: a collection made in a transaction is locked
-      to that transaction's end.** mongod 8.2.11 lets a second transaction
-      create, or insert into, a collection a first one created and has not
-      committed, and reports the conflict when one commits (112 WriteConflict,
-      "Collection namespace ... is already in use"). This server takes an
-      exclusive lock on the new collection for the creating transaction's
-      whole life (RM-084), so the second transaction's statement fails with 24
-      LockTimeout after `maxTransactionLockRequestTimeoutMillis` (since
-      2026-10-20; before that it waited for the first transaction to end, and
-      could stop the server answering: RM-201, fixed). Measured with
-      `tools/probes/transactions.py`: 2 of 267 scenarios.
-      Backlog-ID: RM-202
-      Verify: tests/backlog/test_rm_057_084.py::test_a_collection_made_in_two_transactions
 
 ### 7.071 Time-series collections -- 2026-10-11
 

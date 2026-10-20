@@ -795,7 +795,27 @@ fn statement(
     // and every session's command then waits too.
     let owner = txn.lock().unwrap_or_else(|e| e.into_inner()).lock_owner;
     if let (Some(lm), Some(owner)) = (ctx.locks.clone(), owner) {
-        let chain = crate::lock_manager::statement_chain(doc, &ctx.db_name);
+        let mut chain = crate::lock_manager::statement_chain(doc, &ctx.db_name);
+        // A collection a transaction creates is invisible to everyone else
+        // until it commits, and mongod 8.2.11 finds two transactions creating
+        // one name at COMMIT (112 "Collection namespace ... is already in
+        // use", for whichever commits second), not at a lock: a second
+        // transaction may create, insert into or read the name meanwhile. So
+        // the create holds the collection in IX, which still holds off a
+        // concurrent drop's X (RM-084). This took X, and the second
+        // transaction's statement timed out (24; RM-202).
+        if matches!(
+            doc.keys().next().map(String::as_str),
+            Some("create" | "createIndexes")
+        ) {
+            for (res, mode) in chain.iter_mut() {
+                if matches!(res, crate::lock_manager::Resource::Collection(_))
+                    && *mode == crate::lock_manager::Mode::X
+                {
+                    *mode = crate::lock_manager::Mode::Ix;
+                }
+            }
+        }
         // Each lock request of a transaction gives up after
         // `maxTransactionLockRequestTimeoutMillis` (mongod's 5 ms): a
         // transaction waiting on another's lock fails, transiently, rather

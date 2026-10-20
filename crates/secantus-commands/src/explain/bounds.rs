@@ -309,6 +309,13 @@ fn regex_prefix(pattern: &str, options: &str) -> (String, bool) {
     let Some(rest) = pattern.strip_prefix('^') else {
         return (String::new(), false);
     };
+    // An alternation anywhere ends the anchor's reach: `^s|t` also matches
+    // "t". mongod's `simpleRegex` gives up on a prefix whenever the pattern
+    // holds a `|`, escaped or not, and bounds the scan by every string
+    // (measured 8.2.11, RM-155); this took the prefix `s`.
+    if pattern.contains('|') {
+        return (String::new(), false);
+    }
     let chars: Vec<char> = rest.chars().collect();
     let mut prefix = String::new();
     let mut i = 0;
@@ -441,6 +448,28 @@ fn type_bounds(v: &Bson, ctx: Ctx) -> Option<(Vec<Interval>, Tight)> {
                 tight = Tight::FetchFilter;
             }
             4 => return Some((vec![Interval::all()], Tight::FetchFilter)),
+            // An object's bracket runs from the empty object to the empty
+            // array, and a date's across every date: `[{}, [])` and
+            // `[new Date(min), new Date(max)]`, as mongod scans them
+            // (measured 8.2.11, RM-155).
+            3 => {
+                list.push(Interval::new(
+                    Bson::Document(Document::new()),
+                    true,
+                    Bson::Array(Vec::new()),
+                    false,
+                ));
+                tight = tight.max(inexact);
+            }
+            9 => {
+                list.push(Interval::new(
+                    Bson::DateTime(bson::DateTime::from_millis(i64::MIN)),
+                    true,
+                    Bson::DateTime(bson::DateTime::from_millis(i64::MAX)),
+                    true,
+                ));
+                tight = tight.max(inexact);
+            }
             _ => return None,
         }
     }
@@ -528,6 +557,18 @@ pub(crate) fn leaf_bounds(pred: &Document, ctx: Ctx) -> Option<(Vec<Interval>, T
             if inner_op == "$exists" {
                 return Some((vec![Interval::point(Bson::Null)], Tight::FetchFilter));
             }
+            // `$ne: null` / `$nin: [... null ...]` over an index that holds
+            // arrays: mongod's planner does not use the index (an array
+            // holding null keys as null too), so it is a COLLSCAN (measured
+            // 8.2.11, RM-155).
+            let negates_null = match (inner_op, inner.values().next()) {
+                ("$eq", Some(Bson::Null)) => true,
+                ("$in", Some(Bson::Array(items))) => items.iter().any(|x| matches!(x, Bson::Null)),
+                _ => false,
+            };
+            if ctx.multikey && negates_null {
+                return None;
+            }
             if !matches!(inner_op, "$eq" | "$in" | "$gt" | "$gte" | "$lt" | "$lte") {
                 return None;
             }
@@ -594,8 +635,21 @@ pub(crate) fn leaf_bounds(pred: &Document, ctx: Ctx) -> Option<(Vec<Interval>, T
             };
             let mut list: Option<Vec<Interval>> = None;
             for (k, val) in inner {
+                // The value form keeps `$ne` / `$nin` as written; they bound
+                // as the negations they are (`$elemMatch: {$ne: 5}` scans
+                // `[MinKey, 5), (5, MaxKey]`, mongod 8.2.11, RM-155).
                 let mut one = Document::new();
-                one.insert(k.clone(), val.clone());
+                match k.as_str() {
+                    "$ne" => {
+                        one.insert("$not", bson::doc! {"$eq": val.clone()});
+                    }
+                    "$nin" => {
+                        one.insert("$not", bson::doc! {"$in": val.clone()});
+                    }
+                    _ => {
+                        one.insert(k.clone(), val.clone());
+                    }
+                }
                 if let Some((part, _)) = leaf_bounds(&one, plain) {
                     list = Some(match list {
                         Some(have) => intersect(&have, &part),

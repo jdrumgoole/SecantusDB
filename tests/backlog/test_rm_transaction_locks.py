@@ -25,13 +25,25 @@ def test_a_transaction_waiting_on_a_lock_leaves_the_server_answering(rust_mongo:
     try:
         db = rust_mongo["rm201"]
         db.drop_collection("n")
+        db.n.insert_one({"_id": 0})
         first = rust_mongo.start_session()
         second = rust_mongo.start_session()
         first.start_transaction()
-        db.create_collection("n", session=first)
+        db.n.insert_one({"_id": 1}, session=first)
+        # A `drop` queues for the collection behind the first transaction,
+        # and the second transaction's insert queues behind the drop: with
+        # no lock timeout it waits for the first transaction to end.
+        host, port = rust_mongo.address
+        other = pymongo.MongoClient(host, port, directConnection=True)
+        dropper = threading.Thread(
+            target=lambda: mongo_answer(lambda: other.rm201.command("drop", "n")),
+            daemon=True,
+        )
+        dropper.start()
+        time.sleep(0.3)
         second.start_transaction()
         waiting = threading.Thread(
-            target=lambda: mongo_answer(lambda: db.command("create", "n", session=second)),
+            target=lambda: mongo_answer(lambda: db.n.insert_one({"_id": 2}, session=second)),
             daemon=True,
         )
         waiting.start()
@@ -48,9 +60,12 @@ def test_a_transaction_waiting_on_a_lock_leaves_the_server_answering(rust_mongo:
             assert fresh.admin.command("ping")["ok"] == 1.0
         finally:
             fresh.close()
+        assert waiting.is_alive(), "the second transaction's insert did not wait"
         first.abort_transaction()
         waiting.join(10)
         again.join(10)
+        dropper.join(10)
+        other.close()
         assert not waiting.is_alive() and not again.is_alive()
     finally:
         admin.command("setParameter", 1, maxTransactionLockRequestTimeoutMillis=5)
@@ -60,51 +75,39 @@ def test_a_transaction_waiting_on_a_lock_leaves_the_server_answering(rust_mongo:
 def test_a_transaction_lock_request_times_out(rust_mongo: Any) -> None:
     """mongod 8.2.11 gives a transaction's lock request
     `maxTransactionLockRequestTimeoutMillis` (5 ms) and then fails it with
-    24 LockTimeout, labelled TransientTransactionError."""
+    24 LockTimeout, labelled TransientTransactionError: here a second
+    transaction's insert queued behind a `drop` that waits for the first
+    transaction to end (measured 2026-10-20; the `drop` then runs once the
+    first aborts). A second transaction CREATING the same collection is no
+    such case: mongod lets it, and reports the clash at commit (RM-202)."""
     db = rust_mongo["rm201b"]
     db.drop_collection("n")
+    db.n.insert_one({"_id": 0})
     first = rust_mongo.start_session()
     second = rust_mongo.start_session()
     first.start_transaction()
-    db.create_collection("n", session=first)
+    db.n.insert_one({"_id": 1}, session=first)
+    host, port = rust_mongo.address
+    other = pymongo.MongoClient(host, port, directConnection=True)
+    dropped: list = []
+    dropper = threading.Thread(
+        target=lambda: dropped.append(mongo_answer(lambda: other.rm201b.command("drop", "n"))),
+        daemon=True,
+    )
+    dropper.start()
+    time.sleep(0.5)
     second.start_transaction()
     began = time.monotonic()
-    got = mongo_answer(lambda: db.command("create", "n", session=second))
+    got = mongo_answer(lambda: db.n.insert_one({"_id": 2}, session=second))
     assert time.monotonic() - began < 2
     assert got[:2] == ("err", 24)
     first.abort_transaction()
+    dropper.join(10)
+    other.close()
+    assert dropped and dropped[0][0] == "ok"
     assert (
         rust_mongo.admin.command("getParameter", 1, maxTransactionLockRequestTimeoutMillis=1)[
             "maxTransactionLockRequestTimeoutMillis"
         ]
         == 5
     )
-
-
-@pytest.mark.backlog_fixed("RM-138")
-def test_a_waiting_drop_is_not_overtaken(rust_mongo: Any) -> None:
-    """Lock requests are granted first come first served, as mongod's lock
-    queue grants them: with a transaction holding a collection and a `drop`
-    waiting on it, a new transaction's insert queues behind the `drop` and
-    times out (mongod 8.2.11: 24 LockTimeout) rather than overtaking it. A
-    `drop` behind a stream of writers used to wait for ever (RM-138)."""
-    db = rust_mongo["rm138"]
-    db.drop_collection("w")
-    db.w.insert_one({"_id": 0})
-    holder = rust_mongo.start_session()
-    holder.start_transaction()
-    db.w.insert_one({"_id": 1}, session=holder)
-    dropping = threading.Thread(
-        target=lambda: mongo_answer(lambda: db.command("drop", "w", maxTimeMS=3000)),
-        daemon=True,
-    )
-    dropping.start()
-    time.sleep(0.3)
-    late = rust_mongo.start_session()
-    late.start_transaction()
-    got = mongo_answer(lambda: db.w.insert_one({"_id": 2}, session=late))
-    assert got[:2] == ("err", 24)
-    mongo_answer(late.abort_transaction)
-    holder.abort_transaction()
-    dropping.join(10)
-    assert not dropping.is_alive()

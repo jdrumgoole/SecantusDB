@@ -156,8 +156,8 @@ pub(crate) fn check(
         "hello" | "isMaster" | "ismaster" | "ping" | "buildInfo" | "buildinfo" | "saslStart"
         | "saslContinue" | "authenticate" | "logout" | "connectionStatus" | "whatsmyuri"
         | "listCommands" | "startSession" | "endSessions" | "refreshSessions" | "getMore"
-        | "killCursors" | "commitTransaction" | "abortTransaction" | "configureFailPoint"
-        | "listDatabases" | "features" => {}
+        | "killCursors" | "releaseMemory" | "commitTransaction" | "abortTransaction"
+        | "configureFailPoint" | "listDatabases" | "features" => {}
         "killSessions" => {
             // Its own sessions need nothing; another user's need the cluster.
             let own = ctx.conn_auth.as_ref().map(|a| {
@@ -354,6 +354,16 @@ pub(crate) fn check(
         "appendOplogNote" => c.cluster("appendOplogNote"),
         "lockInfo" => c.cluster("serverStatus"),
         "getClusterParameter" => c.cluster("getClusterParameter"),
+        "invalidateUserCache" => c.cluster("invalidateUserCache"),
+        "replSetGetRBID" => c.cluster("internal"),
+        "replSetFreeze" | "replSetMaintenance" => c.cluster("replSetStateChange"),
+        "dropConnections" => c.cluster("dropConnections"),
+        // `filemd5` reads `<root>.chunks`.
+        "filemd5" => {
+            let root = doc.get_str("root").unwrap_or("fs");
+            let chunks = format!("{root}.chunks");
+            c.need(ns(db, &chunks), &["find"]);
+        }
         "planCacheClear" => c.on_collection(doc, name, &["planCacheWrite"]),
         "planCacheClearFilters" | "planCacheSetFilter" => {
             c.on_collection(doc, name, &["planCacheIndexFilter"])

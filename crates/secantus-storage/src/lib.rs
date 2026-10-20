@@ -611,6 +611,45 @@ const WRITE_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// dirty trigger while bounding the number of commits for a large drop.
 const PURGE_CHUNK_MAX_ROWS: usize = 4000;
 
+/// Bounds on one statement transaction of a chunked index build (RM-187).
+/// Entries land on scattered leaf pages, unlike a purge's consecutive keys,
+/// so the bound is in bytes as well: 4,000 entries of a 300-byte key were
+/// more dirty content than an 8 MB cache's eviction could take in one
+/// transaction, and the chunk itself was rolled back and retried forever.
+const INDEX_BUILD_CHUNK_MAX_ENTRIES: usize = 1000;
+const INDEX_BUILD_CHUNK_MAX_BYTES: usize = 512 * 1024;
+
+/// `entries` cut into the chunks of an index build, each within
+/// [`INDEX_BUILD_CHUNK_MAX_ENTRIES`] and [`INDEX_BUILD_CHUNK_MAX_BYTES`].
+fn index_build_chunks(entries: &[(Vec<u8>, i64)]) -> Vec<&[(Vec<u8>, i64)]> {
+    let mut out = Vec::new();
+    let (mut start, mut bytes) = (0usize, 0usize);
+    for (i, (kb, _)) in entries.iter().enumerate() {
+        let size = kb.len() + 8;
+        if i > start
+            && (i - start >= INDEX_BUILD_CHUNK_MAX_ENTRIES
+                || bytes + size > INDEX_BUILD_CHUNK_MAX_BYTES)
+        {
+            out.push(&entries[start..i]);
+            start = i;
+            bytes = 0;
+        }
+        bytes += size;
+    }
+    if start < entries.len() {
+        out.push(&entries[start..]);
+    }
+    out
+}
+
+/// What an index build writes, worked out before anything is written.
+struct IndexPlan {
+    /// The catalog row.
+    payload: Vec<u8>,
+    /// Every entry: the sort key and the document's RecordId.
+    entries: Vec<(Vec<u8>, i64)>,
+}
+
 /// Whether an oplog entry is for something mongod does not replicate, and
 /// so does not log: the `local` database, and a database's
 /// `system.profile` -- its documents, and its creation and drop (measured
@@ -3493,26 +3532,42 @@ fn clause_implies_bounds(qval: &Bson, pbound: &Document) -> bool {
 /// Supports bare-equality partial values and the `$eq`/`$lt`/`$lte`/`$gt`/`$gte`
 /// range operators on both sides. Mirrors `storage._query_implies_partial`.
 pub fn query_implies_partial(query: &Document, partial: &Document) -> bool {
-    for (key, pval) in partial.iter() {
-        let qval = match query.get(key) {
-            Some(v) => v,
-            None => return false,
-        };
-        if is_op_doc(pval) {
-            if !clause_implies_bounds(qval, pval.as_document().unwrap()) {
-                return false;
+    partial.iter().all(|(key, pval)| {
+        // A condition on `key` anywhere the query requires it: at the top,
+        // or in a clause of a top-level `$and` (every matching document
+        // satisfies each clause). `{$and: [{a: {$exists: true}}, {c: {$gte:
+        // 1}}]}` implies a partial filter of `{c: {$gte: 1}}` (measured
+        // mongod 8.2.11, RM-155); only the top level was looked at.
+        let mut conditions = Vec::new();
+        required_conditions(query, key, &mut conditions);
+        conditions.iter().any(|qval| {
+            if is_op_doc(pval) {
+                clause_implies_bounds(qval, pval.as_document().unwrap())
+            } else if is_op_doc(qval) {
+                // bare-value partial, operator-form query: only an exact `$eq`
+                // of the same value implies it.
+                qval.as_document().unwrap().get("$eq") == Some(pval)
+            } else {
+                *qval == pval
             }
-        } else if is_op_doc(qval) {
-            // bare-value partial, operator-form query: only an exact `$eq` of the
-            // same value implies it.
-            if qval.as_document().unwrap().get("$eq") != Some(pval) {
-                return false;
+        })
+    })
+}
+
+/// Every condition `query` places on `key` that a matching document must
+/// meet: the top-level one, and those inside a top-level `$and`, however
+/// deeply nested.
+fn required_conditions<'a>(query: &'a Document, key: &str, out: &mut Vec<&'a Bson>) {
+    if let Some(v) = query.get(key) {
+        out.push(v);
+    }
+    if let Some(Bson::Array(clauses)) = query.get("$and") {
+        for clause in clauses {
+            if let Bson::Document(d) = clause {
+                required_conditions(d, key, out);
             }
-        } else if qval != pval {
-            return false;
         }
     }
-    true
 }
 
 /// `(field, direction)` if `sort` is a single `±1` field (not operator-prefixed),
@@ -3905,7 +3960,15 @@ fn partition_compound_range_filter(filter: &Document) -> Option<(Document, Strin
 type EntryOps = Vec<(String, Vec<u8>)>;
 
 /// The per-collection write-lock registry: `(db, coll) → lock`.
-type CollLocks = HashMap<(String, String), Arc<Mutex<()>>>;
+/// The per-collection write locks, and the size at which the next new
+/// namespace prunes the unused ones.
+struct CollLocks {
+    map: HashMap<(String, String), Arc<Mutex<()>>>,
+    prune_at: usize,
+}
+
+/// The fewest entries at which `coll_lock` prunes.
+const COLL_LOCKS_PRUNE_FLOOR: usize = 1024;
 
 /// A capped collection's size and count, kept from one insert to the next so
 /// that bringing it back within bounds does not read the whole collection
@@ -4026,10 +4089,13 @@ pub struct Storage {
     /// rolls the dead transaction back.
     txn_session_pool: Mutex<Vec<crate::Session>>,
     /// Per-collection write locks: CRUD on `(db, coll)` serialises here so
-    /// writes to different collections run in parallel. Entries are created
-    /// on first reference and never removed — the lock identity for a
-    /// namespace stays stable across drop+recreate so in-flight writers and
-    /// DDL always contend on the same mutex. Mirrors `storage._coll_locks`.
+    /// writes to different collections run in parallel. Created on first
+    /// reference; an entry only the map still holds is pruned once the map
+    /// has grown ([`Storage::coll_lock`]). That keeps the identity rule --
+    /// everyone contending on a namespace contends on one mutex, across a
+    /// drop and recreate -- because a clone is taken only under the map's
+    /// own lock: an entry nobody else holds has nobody to stay identical
+    /// for. Mirrors `storage._coll_locks`.
     coll_locks: Mutex<CollLocks>,
     /// Bounds concurrent engine writes. Disabled unless `write_tickets` is set.
     write_tickets: crate::admission::Tickets,
@@ -4856,6 +4922,17 @@ struct AsyncOplog {
     txs: Vec<mpsc::Sender<DrainMsg>>,
     backpressure: Arc<Backpressure>,
     joins: Mutex<Vec<JoinHandle<()>>>,
+    /// Committed entries the async oplog failed to keep, each a sentence:
+    /// written by the drainers and the mint path, reported by
+    /// [`Storage::close`] (RM-193). Each was a storage error turned into
+    /// silence.
+    faults: Arc<Mutex<Vec<String>>>,
+}
+
+/// Record an async oplog fault: logged now, and reported by `close`.
+fn async_oplog_fault(faults: &Mutex<Vec<String>>, what: String) {
+    eprintln!("secantus-storage: async oplog: {what}");
+    faults.lock().unwrap_or_else(|e| e.into_inner()).push(what);
 }
 
 /// Everything a prune sweep needs, shared between `Storage` (explicit
@@ -4960,6 +5037,8 @@ struct DrainerShared {
     /// The opportunistic-prune context: the drainer that crosses the
     /// persisted-rows cadence boundary runs the sweep (best-effort).
     prune: Arc<PruneCtx>,
+    /// Shared with `AsyncOplog::faults`.
+    faults: Arc<Mutex<Vec<String>>>,
 }
 
 /// Spawn the background oplog drainer pool and return the handle committed writes
@@ -4992,6 +5071,7 @@ fn spawn_oplog_drainer(
         available: Condvar::new(),
         cap,
     });
+    let faults = Arc::new(Mutex::new(Vec::new()));
     let shared = DrainerShared {
         conn,
         oplog,
@@ -5000,6 +5080,7 @@ fn spawn_oplog_drainer(
         shards_created,
         oplog_nonlogged,
         prune,
+        faults: faults.clone(),
     };
     let mut txs = Vec::with_capacity(num_drainers);
     let mut joins = Vec::with_capacity(num_drainers);
@@ -5013,6 +5094,7 @@ fn spawn_oplog_drainer(
         txs,
         backpressure,
         joins: Mutex::new(joins),
+        faults,
     })
 }
 
@@ -5233,7 +5315,12 @@ fn drainer_loop(shared: DrainerShared, rx: mpsc::Receiver<DrainMsg>) {
     let session = match shared.conn.open_session() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("secantus-storage: async oplog drainer failed to open session: {e:?}");
+            async_oplog_fault(
+                &shared.faults,
+                format!(
+                    "a drainer could not open a session, so its entries are not written: {e:?}"
+                ),
+            );
             return;
         }
     };
@@ -5285,10 +5372,16 @@ fn drainer_loop(shared: DrainerShared, rx: mpsc::Receiver<DrainMsg>) {
             None => break,
         }
     }
-    // Final flush: retry anything still failing (best-effort — a persistent failure
-    // is a storage fault, surfaced by write_drain_batch's log).
+    // Final flush: retry anything still failing. What still fails is lost,
+    // and that is reported, not dropped (RM-193).
     for b in std::mem::take(&mut retry) {
-        let _ = persist_and_record(&session, &shared, b);
+        let (start, n) = (b.start_seq, b.blobs.len());
+        if persist_and_record(&session, &shared, b).is_some() {
+            async_oplog_fault(
+                &shared.faults,
+                format!("{n} committed entries from seq {start} could not be written at shutdown"),
+            );
+        }
     }
 }
 
@@ -5821,7 +5914,17 @@ impl Storage {
             let handles =
                 std::mem::take(&mut *async_h.joins.lock().unwrap_or_else(|e| e.into_inner()));
             for handle in handles {
-                let _ = handle.join();
+                if handle.join().is_err() {
+                    fail(
+                        "joining an async oplog drainer",
+                        StorageError::Internal("the drainer panicked".to_string()),
+                    );
+                }
+            }
+            let faults =
+                std::mem::take(&mut *async_h.faults.lock().unwrap_or_else(|e| e.into_inner()));
+            for what in faults {
+                fail("the async oplog", StorageError::Internal(what));
             }
         }
         let meta = {
@@ -6063,7 +6166,10 @@ impl Storage {
             home: home.to_string(),
             lock: Mutex::new(()),
             txn_session_pool: Mutex::new(Vec::new()),
-            coll_locks: Mutex::new(HashMap::new()),
+            coll_locks: Mutex::new(CollLocks {
+                map: HashMap::new(),
+                prune_at: COLL_LOCKS_PRUNE_FLOOR,
+            }),
             write_tickets: crate::admission::Tickets::new(opts.write_tickets.unwrap_or(0)),
             ddl_generation: AtomicU64::new(0),
             capped_tallies: Mutex::new(HashMap::new()),
@@ -6188,9 +6294,32 @@ impl Storage {
     /// `storage._coll_lock`.
     fn coll_lock(&self, db: &str, coll: &str) -> Arc<Mutex<()>> {
         let mut reg = self.coll_locks.lock().unwrap_or_else(|e| e.into_inner());
-        reg.entry((db.to_string(), coll.to_string()))
+        let key = (db.to_string(), coll.to_string());
+        if let Some(lock) = reg.map.get(&key) {
+            return lock.clone();
+        }
+        // A new namespace: past the threshold, first let go of the locks no
+        // one holds, so a server that has seen millions of collections does
+        // not keep a mutex for each (RM-194). The threshold doubles past what
+        // is still held, which keeps the pruning amortised.
+        if reg.map.len() >= reg.prune_at {
+            reg.map.retain(|_, lock| Arc::strong_count(lock) > 1);
+            reg.prune_at = (reg.map.len() * 2).max(COLL_LOCKS_PRUNE_FLOOR);
+        }
+        reg.map
+            .entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    /// How many per-collection locks are kept (for tests).
+    #[doc(hidden)]
+    pub fn coll_lock_count(&self) -> usize {
+        self.coll_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map
+            .len()
     }
 
     /// Whether the calling thread is inside a user (multi-document)
@@ -6829,7 +6958,14 @@ impl Storage {
                     // filled with a valid empty document so the drainer's
                     // contiguity (and thus every later entry) is never stalled.
                     encode_doc(&d).unwrap_or_else(|e| {
-                        eprintln!("secantus-storage: async oplog encode failed: {e:?}");
+                        async_oplog_fault(
+                            &async_h.faults,
+                            format!(
+                                "the entry at seq {} could not be encoded and is stored \
+                                 empty: {e:?}",
+                                start + i as i64
+                            ),
+                        );
                         vec![5, 0, 0, 0, 0]
                     })
                 }
@@ -6879,8 +7015,9 @@ impl Storage {
             // Drainer gone (shutdown race): release the reservation we just took
             // so the budget doesn't leak, and report the dropped entries loudly.
             async_h.backpressure.release(bytes);
-            eprintln!(
-                "secantus-storage: async oplog drainer gone; {n} committed entries not persisted"
+            async_oplog_fault(
+                &async_h.faults,
+                format!("the drainer is gone; {n} committed entries were not written"),
             );
         }
         start + n as i64 - 1
@@ -11481,9 +11618,10 @@ impl Storage {
         // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         let mut total = 0i64;
-        for (_rid, _id_k, blob) in self.scan_docs(&session, db, coll)? {
+        self.visit_docs(&session, db, coll, |_, _, blob| {
             total += blob.len() as i64;
-        }
+            Ok(())
+        })?;
         Ok(total)
     }
 
@@ -11495,16 +11633,18 @@ impl Storage {
         let session = self.conn.open_session()?;
         let mut out = Document::new();
         let mut id_size = 0i64;
-        for (_rid, id_k, _blob) in self.scan_docs(&session, db, coll)? {
+        self.visit_docs(&session, db, coll, |_, id_k, _| {
             id_size += id_k.len() as i64;
-        }
+            Ok(())
+        })?;
         if id_size > 0 {
             out.insert(ID_INDEX_NAME, id_size);
         }
-        for (name, packed) in self.collect_entry_rows(&session, db, coll)? {
-            let prev = out.get_i64(&name).unwrap_or(0);
+        self.visit_entry_rows(&session, db, coll, |name, packed| {
+            let prev = out.get_i64(name).unwrap_or(0);
             out.insert(name, prev + packed.len() as i64);
-        }
+            Ok(())
+        })?;
         Ok(out)
     }
 
@@ -11538,8 +11678,14 @@ impl Storage {
     pub fn collection_min_id_key(&self, db: &str, coll: &str) -> Result<Option<Vec<u8>>> {
         // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
-        let rows = self.scan_docs(&session, db, coll)?;
-        Ok(rows.into_iter().map(|(_rid, k, _)| k).min())
+        let mut least: Option<Vec<u8>> = None;
+        self.visit_docs(&session, db, coll, |_, k, _| {
+            if least.as_deref().is_none_or(|l| k < l) {
+                least = Some(k.to_vec());
+            }
+            Ok(())
+        })?;
+        Ok(least)
     }
 
     /// Doc blobs whose **RecordId** is greater than `after` (or all, `after=None`),
@@ -11973,12 +12119,76 @@ impl Storage {
         // behind a missing registry row (the entries-before-registry write
         // order below still guards the lock-free-reader interleaving; the
         // transaction adds crash atomicity).
+        if self.in_user_txn() {
+            return self.retry_write_conflicts("create_index", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    self.create_index_in_txn(&session, db, coll, name, key_spec, options, true)
+                })
+            });
+        }
+        // Outside a transaction the build is chunked, as a drop is: every
+        // entry in one statement transaction is unbounded dirty content, and
+        // a collection bigger than the cache could afford got a cache-pressure
+        // rollback that the write-conflict loop re-ran forever (RM-187: at an
+        // 8 MB cache, 5,000 300-byte documents never finished). The global
+        // and collection locks held above keep every write out until the
+        // catalog row commits, so the build reads and writes one state.
+        let plan = self.retry_write_conflicts("create_index", || {
+            let session = self.op_session()?;
+            self.with_statement_txn(&session, || {
+                self.plan_index(&session, db, coll, name, key_spec, options)
+            })
+        })?;
+        let Some(plan) = plan else {
+            return Ok(false);
+        };
+        // Entries a build that died part-way left under this name.
+        loop {
+            let removed = self.retry_write_conflicts("create_index", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    self.delete_entries_prefix_upto(
+                        &session,
+                        db,
+                        coll,
+                        name,
+                        Some(PURGE_CHUNK_MAX_ROWS),
+                    )
+                })
+            })?;
+            if removed < PURGE_CHUNK_MAX_ROWS {
+                break;
+            }
+        }
+        for chunk in index_build_chunks(&plan.entries) {
+            if deadline::check().is_err() {
+                return Err(StorageError::MaxTimeExpired);
+            }
+            self.retry_write_conflicts("create_index", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    self.insert_built_entries(&session, db, coll, name, chunk)
+                })
+            })?;
+        }
+        // The catalog row is the commit point of a fully-built index.
         self.retry_write_conflicts("create_index", || {
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
-                self.create_index_in_txn(&session, db, coll, name, key_spec, options, true)
+                self.commit_index(
+                    &session,
+                    db,
+                    coll,
+                    name,
+                    key_spec,
+                    options,
+                    &plan.payload,
+                    true,
+                )
             })
-        })
+        })?;
+        Ok(true)
     }
 
     /// The body of [`create_index`], run inside its statement transaction.
@@ -11995,6 +12205,56 @@ impl Storage {
         options: &Document,
         logged: bool,
     ) -> Result<bool> {
+        let Some(plan) = self.plan_index(session, db, coll, name, key_spec, options)? else {
+            return Ok(false);
+        };
+        self.insert_built_entries(session, db, coll, name, &plan.entries)?;
+        self.commit_index(
+            session,
+            db,
+            coll,
+            name,
+            key_spec,
+            options,
+            &plan.payload,
+            logged,
+        )?;
+        Ok(true)
+    }
+
+    /// Write a building index's entry rows.
+    fn insert_built_entries(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+        entries: &[(Vec<u8>, i64)],
+    ) -> Result<()> {
+        let ec = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        for (kb, rid) in entries {
+            let packed = pack_entry(kb, *rid);
+            ec.reset()?;
+            ec.set_key_sssu(db, coll, name, &packed);
+            ec.set_value_u(b"");
+            ec.insert()?;
+        }
+        Ok(())
+    }
+
+    /// Work out what building an index writes -- its catalog row and every
+    /// entry -- reading the collection and writing nothing but the
+    /// collection's own registration. `None` when an identical index exists
+    /// already; a conflicting one is an error.
+    fn plan_index(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+        key_spec: &Document,
+        options: &Document,
+    ) -> Result<Option<IndexPlan>> {
         // It writes the index catalog.
         note_planner_write();
         let geo = parse_geo_2d(key_spec, options);
@@ -12033,7 +12293,7 @@ impl Storage {
                         )));
                     }
                 }
-                return Ok(false);
+                return Ok(None);
             }
             Err(e) if e.is_not_found() => {}
             Err(e) => return Err(e.into()),
@@ -12199,25 +12459,33 @@ impl Storage {
         payload_doc.insert("key", Bson::Document(key_spec.clone()));
         payload_doc.insert("options", Bson::Document(stored_options));
         let payload = encode_doc(&payload_doc)?;
+        Ok(Some(IndexPlan { payload, entries }))
+    }
 
-        // Backfill the entry rows BEFORE the registry row: lock-free readers
-        // route through an index the moment its registry row is visible, so
-        // the registry insert must be the commit point of a fully-built
-        // index — the reverse order let a reader route through a half-backfilled
-        // index and miss matching documents. (`drop_index` is the mirror
-        // image: registry row out first, then the entries.)
-        let ec = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
-        for (kb, rid) in &entries {
-            let packed = pack_entry(kb, *rid);
-            ec.reset()?;
-            ec.set_key_sssu(db, coll, name, &packed);
-            ec.set_value_u(b"");
-            ec.insert()?;
-        }
-
-        c.reset()?;
+    /// Commit a built index: its catalog row, and the `createIndexes` oplog
+    /// entry. The entry rows are written FIRST, by the caller: lock-free
+    /// readers route through an index the moment its registry row is
+    /// visible, so the registry insert must be the commit point of a
+    /// fully-built index -- the reverse order let a reader route through a
+    /// half-backfilled index and miss matching documents. (`drop_index` is
+    /// the mirror image: registry row out first, then the entries.)
+    #[allow(clippy::too_many_arguments)]
+    fn commit_index(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+        key_spec: &Document,
+        options: &Document,
+        payload: &[u8],
+        logged: bool,
+    ) -> Result<()> {
+        // It writes the index catalog.
+        note_planner_write();
+        let c = session.open_cursor(IDX_TABLE, None)?;
         c.set_key_sss(db, coll, name);
-        c.set_value_u(&payload);
+        c.set_value_u(payload);
         c.insert()?;
         // Oplog: a DDL `op: "c"` `createIndexes` entry so a `showExpandedEvents`
         // change stream surfaces a `createIndexes` event (the projector reads
@@ -12250,7 +12518,7 @@ impl Storage {
             entry.insert("o", Bson::Document(o));
             self.emit_oplog(session, vec![entry], vec![None])?;
         }
-        Ok(true)
+        Ok(())
     }
 
     /// All indexes on `(db, coll)` in MongoDB's `listIndexes` shape (the virtual
@@ -12703,13 +12971,30 @@ impl Storage {
     /// unframing each value (see `frame_doc_value`) — no `_id` decode needed, and
     /// it recovers a timeseries doc's non-derivable suffixed id_key too.
     fn scan_docs(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<ScannedDoc>> {
+        let mut out = Vec::new();
+        self.visit_docs(session, db, coll, |recordid, idk, blob| {
+            out.push((recordid, idk.to_vec(), blob.to_vec()));
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Walk every document in `(db, coll)` in natural order, handing `f`
+    /// each `(RecordId, id_key, doc_bytes)` without keeping any: what a
+    /// count or a size needs, in constant memory (RM-191).
+    fn visit_docs(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        mut f: impl FnMut(i64, &[u8], &[u8]) -> Result<()>,
+    ) -> Result<()> {
         // Lazy shards: an absent shard (empty / never-created collection) is empty.
         let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
             Ok(c) => c,
-            Err(e) if e.is_missing_table() => return Ok(Vec::new()),
+            Err(e) if e.is_missing_table() => return Ok(()),
             Err(e) => return Err(e.into()),
         };
-        let mut out = Vec::new();
         cur.set_key_ssq(db, coll, i64::MIN);
         let mut more = match cur.search_near() {
             Ok(cmp) => {
@@ -12736,10 +13021,10 @@ impl Storage {
             }
             let value = cur.get_value_u()?;
             let (idk, blob) = unframe_doc_value(&value)?;
-            out.push((recordid, idk.to_vec(), blob.to_vec()));
+            f(recordid, idk, blob)?;
             more = cur.next()?;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Up to `limit` doc rows with the `(db, coll)` prefix whose RecordId is
@@ -14670,6 +14955,19 @@ impl Storage {
         coll: &str,
         name: &str,
     ) -> Result<()> {
+        self.delete_entries_prefix_upto(session, db, coll, name, None)
+            .map(|_| ())
+    }
+
+    /// Remove `name`'s entry rows, at most `max` of them; answers how many.
+    fn delete_entries_prefix_upto(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+        max: Option<usize>,
+    ) -> Result<usize> {
         let scan = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         scan.set_key_sssu(db, coll, name, b"");
         let mut packs: Vec<Vec<u8>> = Vec::new();
@@ -14684,7 +14982,7 @@ impl Storage {
             Err(e) if e.is_not_found() => false,
             Err(e) => return Err(e.into()),
         };
-        while more {
+        while more && max.is_none_or(|m| packs.len() < m) {
             let (d, c, n, packed) = scan.get_key_sssu()?;
             if d != db || c != coll || n != name {
                 break;
@@ -14702,7 +15000,7 @@ impl Storage {
                 Err(e) => return Err(e.into()),
             }
         }
-        Ok(())
+        Ok(packs.len())
     }
 
     /// Collection names registered under `db` (no lock, session-scoped — for
@@ -15046,8 +15344,24 @@ impl Storage {
         db: &str,
         coll: &str,
     ) -> Result<Vec<(String, Vec<u8>)>> {
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         let mut out = Vec::new();
+        self.visit_entry_rows(session, db, coll, |name, packed| {
+            out.push((name.to_string(), packed.to_vec()));
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Walk every index entry row of `(db, coll)`, handing `f` each
+    /// `(index name, packed key)` without keeping any.
+    fn visit_entry_rows(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        mut f: impl FnMut(&str, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         cur.set_key_sssu(db, coll, "", b"");
         let mut more = match cur.search_near() {
             Ok(cmp) => {
@@ -15065,10 +15379,10 @@ impl Storage {
             if d != db || c != coll {
                 break;
             }
-            out.push((name, packed));
+            f(&name, &packed)?;
             more = cur.next()?;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Check a collection against its indexes: what `validate` reports.
@@ -16605,7 +16919,12 @@ impl Storage {
             // Lock-free read (see the `lock` field's invariants).
             let session = self.op_session()?;
             if filter.is_empty() {
-                return Ok(self.scan_docs(&session, db, coll)?.len());
+                let mut n = 0usize;
+                self.visit_docs(&session, db, coll, |_, _, _| {
+                    n += 1;
+                    Ok(())
+                })?;
+                return Ok(n);
             }
             let vars = Document::new();
             let mut n = 0usize;
@@ -21965,6 +22284,32 @@ mod tests {
         }
     }
 
+    /// A fault the async oplog recorded -- an entry it could not keep -- is
+    /// what `close` answers, not a line on stderr (RM-193).
+    #[test]
+    fn close_reports_an_async_oplog_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StorageOptions {
+            durable: Some(true),
+            oplog_async: Some(true),
+            ..StorageOptions::default()
+        };
+        let st = Storage::open_with_options(dir.path().to_str().unwrap(), &opts).unwrap();
+        st.insert(
+            "app",
+            "c",
+            vec![encode_doc(&doc! {"_id": 1i32}).unwrap()],
+            true,
+        )
+        .unwrap();
+        let faults = st.async_oplog.as_ref().unwrap().faults.clone();
+        async_oplog_fault(&faults, "an injected fault".to_string());
+        let err = st.close().unwrap_err();
+        assert!(format!("{err}").contains("an injected fault"), "{err}");
+        // Reported once: the store is closed.
+        st.close().unwrap();
+    }
+
     /// `close` answers once and is then a no-op (the `Drop` after it does
     /// nothing), and the store it closed opens again intact.
     #[test]
@@ -22292,6 +22637,25 @@ mod tests {
         assert!(matches!(
             out2.get_document("$set").unwrap().get("x"),
             Some(Bson::DateTime(_))
+        ));
+    }
+
+    #[test]
+    fn query_implies_partial_looks_inside_and() {
+        // A clause of a top-level `$and` binds every matching document.
+        let partial = doc! {"c": {"$gte": 1}};
+        assert!(query_implies_partial(
+            &doc! {"$and": [{"a": {"$exists": true}}, {"c": {"$gte": 1}}]},
+            &partial
+        ));
+        assert!(query_implies_partial(
+            &doc! {"$and": [{"$and": [{"c": {"$gt": 2}}]}]},
+            &partial
+        ));
+        // An `$or` binds nothing.
+        assert!(!query_implies_partial(
+            &doc! {"$or": [{"c": {"$gte": 1}}, {"a": 1}]},
+            &partial
         ));
     }
 

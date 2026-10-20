@@ -67,6 +67,7 @@ mod list_catalog;
 pub mod lock_manager;
 pub mod logbuf;
 pub mod mapreduce;
+mod misc_admin;
 pub mod mongod_codes;
 mod mongod_commands;
 mod near;
@@ -671,6 +672,13 @@ fn lookup(name: &str) -> Option<Handler> {
         "lockInfo" => replset_admin::lock_info,
         "features" => replset_admin::features,
         "getClusterParameter" => replset_admin::get_cluster_parameter,
+        "invalidateUserCache" => misc_admin::invalidate_user_cache,
+        "replSetGetRBID" => misc_admin::repl_set_get_rbid,
+        "replSetFreeze" => misc_admin::repl_set_freeze,
+        "replSetMaintenance" => misc_admin::repl_set_maintenance,
+        "dropConnections" => misc_admin::drop_connections,
+        "releaseMemory" => misc_admin::release_memory,
+        "filemd5" => misc_admin::filemd5,
         "planCacheClear" => replset_admin::plan_cache_clear,
         "planCacheClearFilters" => index_filters::clear_filters,
         "planCacheListFilters" => index_filters::list_filters,
