@@ -1259,6 +1259,10 @@ fn op_meta(arg: &Bson) -> R {
             "textScore" => unavailable("text score"),
             "geoNearDistance" => unavailable("$geoNear distance"),
             "geoNearPoint" => unavailable("$geoNear point"),
+            // Set by `$score`, `$rankFusion` and `$scoreFusion`, after which
+            // the command layer reads it from a field instead (`hybrid`).
+            "score" => unavailable("score"),
+            "scoreDetails" => unavailable("scoreDetails"),
             "sortKey" => Err(Fallback::Defer),
             known if crate::projection::META_KEYWORDS.contains(&known) => Ok(Bson::Undefined),
             _ => Err(Fallback::Defer),
@@ -6913,6 +6917,12 @@ impl Drop for FcvGuard {
     fn drop(&mut self) {
         FCV_BEFORE_82.with(|g| g.set(self.0));
     }
+}
+
+/// Whether this thread's command is parsed under a feature compatibility
+/// version before 8.2.
+pub fn fcv_before_82() -> bool {
+    FCV_BEFORE_82.with(std::cell::Cell::get)
 }
 
 /// Parse this thread's expressions under a feature compatibility version

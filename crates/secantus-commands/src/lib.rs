@@ -55,6 +55,7 @@ pub mod diagnostics;
 pub mod distinct;
 mod explain;
 mod generic;
+mod hybrid;
 pub use generic::db_field_problem;
 pub mod failpoints;
 pub mod find;

@@ -161,6 +161,21 @@ fn apply_stage(
         }),
         "$sort" => sort_stage(docs, spec),
         "$_secantusSortKey" => sort_key_stage(docs, spec),
+        "$_secantusScore" => crate::hybrid::score_stage(docs, spec, vars),
+        // A one-for-one stage that makes new documents (`$replaceRoot`),
+        // run so the score metadata stays with each document.
+        "$_secantusCarry" => {
+            let inner = spec
+                .as_document()
+                .and_then(|d| d.get_document("stage").ok())
+                .ok_or(Fallback::Defer)?;
+            let (inner_name, inner_spec) = inner.iter().next().ok_or(Fallback::Defer)?;
+            let kept = crate::hybrid::take_metadata(&docs);
+            let out = apply_stage(inner_name, inner_spec, docs, vars, coll)?;
+            crate::hybrid::restore_metadata(out, kept)
+        }
+        "$_secantusFusePrep" => crate::hybrid::fuse_prep_stage(docs, spec),
+        "$_secantusFuse" => crate::hybrid::fuse_stage(docs, spec, vars),
         "$unwind" => unwind_stage(docs, spec),
         "$group" => group::group_stage(spec, &docs, vars),
         "$sortByCount" => group::sort_by_count_stage(spec, &docs, vars),
@@ -870,7 +885,7 @@ fn facet_stage(
 /// `(path, reverse)` pairs from a sort spec. Each direction must be `1`/`-1`
 /// (ints or bools coerced as Python's `int(d)`); anything else (textScore meta,
 /// floats, ...) defers.
-fn sort_fields(spec: &Bson) -> R<Vec<(String, bool)>> {
+pub(crate) fn sort_fields(spec: &Bson) -> R<Vec<(String, bool)>> {
     let Bson::Document(d) = spec else {
         return Err(Fallback::Defer);
     };
@@ -898,7 +913,7 @@ fn sort_fields(spec: &Bson) -> R<Vec<(String, bool)>> {
 }
 
 /// The values a `$sort` on `fields` compares for `d`, one per field.
-fn sort_key_values(d: &Document, fields: &[(String, bool)]) -> R<Vec<Bson>> {
+pub(crate) fn sort_key_values(d: &Document, fields: &[(String, bool)]) -> R<Vec<Bson>> {
     let mut keys = Vec::with_capacity(fields.len());
     for (path, rev) in fields {
         // mongod refuses a sort path whose component names both an array

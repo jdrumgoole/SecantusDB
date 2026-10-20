@@ -32,6 +32,7 @@ pub mod geohash2d;
 pub mod geoorder;
 pub mod geoshape;
 pub mod heap;
+pub mod hybrid;
 pub mod oid;
 pub mod projection;
 pub mod query;
