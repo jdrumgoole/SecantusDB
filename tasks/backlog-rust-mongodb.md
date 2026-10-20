@@ -108,11 +108,11 @@ Single-node change streams are implemented and conformant for typical pymongo `w
       ignored: an unsatisfiable `w` (e.g. `w: 2` against the one-member set)
       is rejected as mongod rejects it, `{code: 100, codeName:
       "CannotSatisfyWriteConcern", errmsg: "Not enough data-bearing nodes"}`,
-      on both servers. What remains accept-and-ignore is `j` / `wtimeout` /
-      `w: "majority"` durability semantics. That was recorded as something a
-      single node satisfies trivially; it is not -- a `j: true` write is
-      acknowledged without a journal flush and is lost to a kill (RM-186,
-      §7.085, measured 2026-10-20).
+      on both servers. `j` and `w: "majority"` are honoured as mongod honours
+      them: the Rust MongoDB server syncs the journal before acknowledging
+      such a write (the implicit default included), and a journal flusher
+      syncs every 100 ms for the rest (fixed 2026-10-20). `wtimeout` remains
+      accept-and-ignore: one node has nothing to wait for.
 - **INHERENT (recorded): the C-driver gauge tests a single-node
       surrogate cannot pass.** `/change_stream/live/read_prefs`,
       `/Client/command_secondary`, `/Collection/aggregate/secondary` and the
@@ -642,27 +642,6 @@ mongod 8.2.11 with a `secantusd-rs` built from tree `af2629ec`; the rest
 were confirmed by reading the code path and need a fault no quick test can
 inject (a panic, a power loss, a failing checkpoint).
 
-- [ ] **A write acknowledged with `j: true` is lost when the server is
-      killed.** The Rust MongoDB server opens WiredTiger with
-      `transaction_sync=(enabled=false)` (`secantus-storage/src/lib.rs`
-      `DEFAULT_CONFIG`; `--sync-on-commit` is off by default) and nothing
-      ever calls `WT_SESSION::log_flush`: `j` is parsed and echoed back
-      (`secantus-commands/src/lib.rs`, the write-concern echo) and no flush
-      follows. Only the checkpoint thread syncs, every 60 s. Measured: 50
-      inserts each acknowledged with `{w: 1, j: true}`, then SIGKILL and
-      restart, five times -- 216 of the 250 writes were gone (four runs kept
-      0, 0, 1 and 33 of 50). mongod 8.2.11 kept all 250: `j: true` waits for
-      the journal to be synced before it acknowledges, and its journal
-      flusher bounds the loss for a write without `j` to about 100 ms
-      (`storage.journal.commitIntervalMs`). The Rust PostgreSQL server
-      measured the same loss and syncs every commit for it
-      (`secantus-pg/src/server.rs`). The fix is mongod's mechanism: flush
-      the log before acknowledging a `j: true` (or `w: "majority"`, which
-      implies it on a one-member set) write, and run a periodic journal
-      flush for the rest. (§3.2's "a single node satisfies `j` trivially"
-      was wrong; it now points here.)
-      Backlog-ID: RM-186
-      Verify: tests/backlog/test_rm_found_2026_10_20.py::test_j_true_write_survives_sigkill
 - [ ] **`createIndexes` on a collection bigger than the WiredTiger cache
       can afford in one transaction never returns.** The backfill runs in a
       single `with_statement_txn` (`Storage::create_index`), collecting every

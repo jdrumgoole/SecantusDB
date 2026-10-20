@@ -1010,6 +1010,13 @@ pub trait Storage: Send + Sync {
         Ok(None)
     }
 
+    /// Sync the journal through every commit so far, before a journaled
+    /// write is acknowledged. A store with no durable journal has nothing to
+    /// do.
+    fn flush_journal(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+
     /// Take a checkpoint now, as `fsync` does. `false` from a store that
     /// keeps no checkpoints.
     fn checkpoint_now(&self) -> Result<bool, StorageError> {

@@ -1814,6 +1814,9 @@ enum ResolvedHint {
 ///
 /// `statistics=(fast)` is mongod's own setting: the engine keeps the cheap
 /// counters that `serverStatus.wiredTiger` reports ([`Storage::wt_statistics`]).
+/// mongod's `storage.journal.commitIntervalMs` default.
+const JOURNAL_COMMIT_INTERVAL_MS: u64 = 100;
+
 const DEFAULT_CONFIG: &str = "create,session_max=1000,cache_size=4G,\
                               eviction=(threads_min=4,threads_max=4),\
                               log=(enabled=true,file_max=128MB,prealloc=false),\
@@ -4138,6 +4141,10 @@ pub struct Storage {
     /// 250ms tick and clears it.
     checkpoint_requested: Arc<AtomicBool>,
     checkpoint_join: Mutex<Option<JoinHandle<()>>>,
+    /// The journal flusher (mongod's `JournalFlusher`): syncs the log every
+    /// `JOURNAL_COMMIT_INTERVAL`, bounding what a write that did not ask for
+    /// the journal can lose. Stopped by `checkpoint_stop`.
+    journal_join: Mutex<Option<JoinHandle<()>>>,
     /// Held while the periodic thread checkpoints, and while a background
     /// `validate` opens its checkpoint cursors
     /// ([`Storage::check_collection_at_checkpoint`]), so the check reads one
@@ -5731,6 +5738,14 @@ impl Drop for Storage {
         {
             let _ = h.join();
         }
+        if let Some(h) = self
+            .journal_join
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = h.join();
+        }
         if self.data_nonlogged {
             if let Err(e) = self.stable_checkpoint() {
                 eprintln!("secantus-storage: close-time stable checkpoint failed: {e:?}");
@@ -6025,6 +6040,7 @@ impl Storage {
             checkpoint_stop: Arc::new(AtomicBool::new(false)),
             checkpoint_requested,
             checkpoint_join: Mutex::new(None),
+            journal_join: Mutex::new(None),
             checkpoint_gate: Arc::new(Mutex::new(())),
         };
         // Before anything looks a key up: crash recovery below replays writes
@@ -6042,6 +6058,9 @@ impl Storage {
             // fast test mode (`durable=false`): those stores live for
             // seconds and skip the close checkpoint for the same reason.
             storage.spawn_checkpoint_thread(false);
+        }
+        if storage.durable && !storage.in_memory {
+            storage.spawn_journal_flusher();
         }
         // Finish any chunked drop a crash interrupted (registry row already
         // gone; the leftover rows must not resurface under a re-created name).
@@ -7151,6 +7170,51 @@ impl Storage {
     /// A checkpoint now, as `fsync` asks for one: for a data-nonlogged store
     /// the stable checkpoint (with its marker), for a logged one the plain
     /// checkpoint. Nothing for a store held in memory, which has none.
+    /// Sync the log through every commit made so far, as mongod's
+    /// `waitUntilDurable` does before acknowledging a journaled write
+    /// (`j: true`, or `w: "majority"` on this one-member set). WiredTiger
+    /// groups concurrent flushes into one sync. Fast test mode
+    /// (`durable=false`) gives up only what a power loss takes, so there the
+    /// log buffer is written out without the sync: a killed process still
+    /// keeps the write. An in-memory store has no log.
+    pub fn flush_journal(&self) -> Result<()> {
+        if self.in_memory {
+            return Ok(());
+        }
+        let config = if self.durable { "sync=on" } else { "sync=off" };
+        Ok(self.conn.open_session()?.log_flush(Some(config))?)
+    }
+
+    /// mongod's journal flusher: sync the log every 100 ms
+    /// (`storage.journal.commitIntervalMs`), so a write acknowledged without
+    /// waiting for the journal is lost to a crash for at most that long.
+    fn spawn_journal_flusher(&self) {
+        let stop = self.checkpoint_stop.clone();
+        let conn = self.conn.clone();
+        let handle = thread::Builder::new()
+            .name("secantus-journal".into())
+            .spawn(move || {
+                let interval = std::time::Duration::from_millis(JOURNAL_COMMIT_INTERVAL_MS);
+                while !stop.load(Ordering::Acquire) {
+                    std::thread::sleep(interval);
+                    if let Err(e) = conn
+                        .open_session()
+                        .and_then(|s| s.log_flush(Some("sync=on")))
+                    {
+                        // A failed sync is a durability signal -- loud; the
+                        // next tick tries again.
+                        eprintln!("secantus-storage: periodic journal flush failed: {e:?}");
+                    }
+                }
+            });
+        match handle {
+            Ok(h) => {
+                *self.journal_join.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+            }
+            Err(e) => eprintln!("secantus-storage: could not spawn journal flusher: {e}"),
+        }
+    }
+
     pub fn checkpoint_now(&self) -> Result<()> {
         if self.in_memory {
             return Ok(());
@@ -21794,6 +21858,37 @@ mod tests {
             Err(other) => panic!("expected Internal fatal, got: {other:?}"),
             Ok(_) => panic!("expected open to be refused for an SSu doc shard"),
         }
+    }
+
+    /// `flush_journal` succeeds on every kind of store: a durable one syncs
+    /// the log, a fast-test one writes it out, an in-memory one has none.
+    /// The journal flusher thread stops when the store closes.
+    #[test]
+    fn flush_journal_on_every_kind_of_store() {
+        for durable in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let opts = StorageOptions {
+                durable: Some(durable),
+                ..StorageOptions::default()
+            };
+            let st = Storage::open_with_options(dir.path().to_str().unwrap(), &opts).unwrap();
+            st.insert(
+                "app",
+                "c",
+                vec![encode_doc(&doc! {"_id": 1i32}).unwrap()],
+                true,
+            )
+            .unwrap();
+            st.flush_journal().unwrap();
+            drop(st);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StorageOptions {
+            wt_config: Some("create,in_memory=true".into()),
+            ..StorageOptions::default()
+        };
+        let mem = Storage::open_with_options(dir.path().to_str().unwrap(), &opts).unwrap();
+        mem.flush_journal().unwrap();
     }
 
     /// `sync_on_commit=true` flips `transaction_sync=enabled` to `true`.

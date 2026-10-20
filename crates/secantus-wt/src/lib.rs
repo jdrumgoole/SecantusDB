@@ -274,6 +274,12 @@ impl Session {
         self.txn(unsafe { (*self.ptr).checkpoint }, config)
     }
 
+    /// `WT_SESSION::log_flush`: write the log, and with `sync=on` sync it,
+    /// through every commit made so far, in this session or any other.
+    pub fn log_flush(&self, config: Option<&str>) -> Result<()> {
+        self.txn(unsafe { (*self.ptr).log_flush }, config)
+    }
+
     /// Why WiredTiger rolled this session's transaction back
     /// (`WT_SESSION::get_rollback_reason`), or None when it has no reason to
     /// report.
