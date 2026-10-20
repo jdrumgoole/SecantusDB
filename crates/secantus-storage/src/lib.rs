@@ -691,6 +691,82 @@ fn oplog_entry_is_user_write(e: &OplogEntry) -> bool {
     !matches!(db, "" | "admin" | "config" | "local")
 }
 
+/// An entry as mongod 8.2.11 writes it, where the stored form differs in a
+/// way the entry alone settles (RM-224): a delete has no `o2`; a rename says
+/// `stayTemp: false`; a one-index `createIndexes` is that index's spec; a
+/// `dropIndexes` keeps the spec in `o2`. `None` when nothing changes. The
+/// stored form stays, as change streams and replay read it.
+fn oplog_view_shape(entry: &Document) -> Option<Document> {
+    let op = entry.get_str("op").ok()?;
+    if op == "d" && entry.contains_key("o2") {
+        let mut out = entry.clone();
+        out.remove("o2");
+        return Some(out);
+    }
+    if op != "c" {
+        return None;
+    }
+    let o = entry.get_document("o").ok()?;
+    let reshaped = if o.contains_key("renameCollection") && !o.contains_key("stayTemp") {
+        let mut n = Document::new();
+        for (k, v) in o {
+            n.insert(k.clone(), v.clone());
+            if k == "to" {
+                n.insert("stayTemp", false);
+            }
+        }
+        (n, None)
+    } else if let (Ok(coll), Ok(indexes)) = (o.get_str("createIndexes"), o.get_array("indexes")) {
+        let [Bson::Document(spec)] = indexes.as_slice() else {
+            return None;
+        };
+        let mut n = bson::doc! {"createIndexes": coll};
+        n.extend(oplog_index_spec(spec));
+        (n, None)
+    } else if let (Ok(coll), Ok(spec)) = (o.get_str("dropIndexes"), o.get_document("spec")) {
+        let mut n = bson::doc! {"dropIndexes": coll};
+        if let Some(index) = o.get("index") {
+            n.insert("index", index.clone());
+        }
+        (n, Some(oplog_index_spec(spec)))
+    } else {
+        return None;
+    };
+    let mut out = Document::new();
+    for (k, v) in entry {
+        match k.as_str() {
+            "o" => {
+                out.insert("o", Bson::Document(reshaped.0.clone()));
+                if let Some(o2) = &reshaped.1 {
+                    out.insert("o2", Bson::Document(o2.clone()));
+                }
+            }
+            "o2" if reshaped.1.is_some() => {}
+            _ => {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    Some(out)
+}
+
+/// An index spec in the order mongod's oplog entries give it: `v`, then
+/// `unique` and `hidden`, then the rest (measured 8.2.11).
+fn oplog_index_spec(spec: &Document) -> Document {
+    let mut out = Document::new();
+    for first in ["v", "unique", "hidden"] {
+        if let Some(v) = spec.get(first) {
+            out.insert(first, v.clone());
+        }
+    }
+    for (k, v) in spec {
+        if !matches!(k.as_str(), "v" | "unique" | "hidden") {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    out
+}
+
 fn oplog_entry_is_local(e: &OplogEntry) -> bool {
     let (ns, target) = match e {
         OplogEntry::Doc(d) => (
@@ -7339,6 +7415,13 @@ impl Storage {
         let mut out: Vec<(Document, Vec<u8>)> = Vec::with_capacity(rows.len());
         for (_seq, blob) in rows {
             let d = decode_doc(&blob)?;
+            let (d, blob) = match oplog_view_shape(&d) {
+                Some(shaped) => {
+                    let bytes = encode_doc(&shaped)?;
+                    (shaped, bytes)
+                }
+                None => (d, blob),
+            };
             if filter.is_empty()
                 || query_matches(&d, filter, vars, coll_opt).map_err(query_fault)?
             {
@@ -8400,6 +8483,18 @@ impl Storage {
         entry.insert("op", "n");
         entry.insert("ns", "");
         entry.insert("o", Bson::Document(data));
+        self.emit_oplog(&session, vec![entry], vec![None])
+    }
+
+    /// Append a command entry `{op: "c", ns, o}` that changes no data, as
+    /// `dbCheck` writes for a secondary to check against, and return its seq.
+    pub fn append_command_entry(&self, ns: &str, o: Document) -> Result<i64> {
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let session = self.conn.open_session()?;
+        let mut entry = Document::new();
+        entry.insert("op", "c");
+        entry.insert("ns", ns);
+        entry.insert("o", Bson::Document(o));
         self.emit_oplog(&session, vec![entry], vec![None])
     }
 
@@ -10983,6 +11078,7 @@ impl Storage {
                     } else {
                         None
                     };
+                    let records = self.count_records(&session, db, coll)?;
                     self.purge_collection_tables(&session, db, coll)?;
                     let c = session.open_cursor(COLL_TABLE, None)?;
                     c.set_key_ss(db, coll);
@@ -10995,7 +11091,7 @@ impl Storage {
                         Err(e) => return Err(e.into()),
                     }
                     if let Some(ui) = ui {
-                        self.emit_drop_oplog(&session, db, coll, &ui)?;
+                        self.emit_drop_oplog(&session, db, coll, &ui, records)?;
                     }
                     Ok(existed)
                 })
@@ -11045,7 +11141,8 @@ impl Storage {
                 t.set_value_u(b"");
                 t.insert()?;
                 if let Some(ui) = ui {
-                    self.emit_drop_oplog(&session, db, coll, &ui)?;
+                    let records = self.count_records(&session, db, coll)?;
+                    self.emit_drop_oplog(&session, db, coll, &ui, records)?;
                 }
                 Ok(true)
             })
@@ -11058,7 +11155,14 @@ impl Storage {
     }
 
     /// The `op: "c"` `drop` oplog entry for `(db, coll)`.
-    fn emit_drop_oplog(&self, session: &Session, db: &str, coll: &str, ui: &[u8]) -> Result<()> {
+    fn emit_drop_oplog(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        ui: &[u8],
+        records: i64,
+    ) -> Result<()> {
         let mut o = Document::new();
         o.insert("drop", coll);
         let mut entry = Document::new();
@@ -11066,8 +11170,24 @@ impl Storage {
         entry.insert("ns", format!("{db}.$cmd"));
         entry.insert("ui", uuid_binary(ui));
         entry.insert("o", Bson::Document(o));
+        // mongod's drop entry says how many documents went with it.
+        entry.insert("o2", bson::doc! {"numRecords": records});
         self.emit_oplog(session, vec![entry], vec![None])?;
         Ok(())
+    }
+
+    /// How many documents `db.coll` holds, read on `session` (a drop counts
+    /// them for its oplog entry while it holds the collection's lock).
+    fn count_records(&self, session: &Session, db: &str, coll: &str) -> Result<i64> {
+        if !self.enable_oplog {
+            return Ok(0);
+        }
+        let mut n = 0i64;
+        self.visit_docs(session, db, coll, |_, _, _| {
+            n += 1;
+            Ok(())
+        })?;
+        Ok(n)
     }
 
     /// Phase 2 of a chunked drop: delete the unregistered collection's rows in
@@ -11222,6 +11342,7 @@ impl Storage {
                         } else {
                             None
                         };
+                        let records = self.count_records(&session, db, c)?;
                         self.purge_collection_tables(&session, db, c)?;
                         let rc = session.open_cursor(COLL_TABLE, None)?;
                         rc.set_key_ss(db, c);
@@ -11234,7 +11355,7 @@ impl Storage {
                             Err(e) => return Err(e.into()),
                         }
                         if let Some(ui) = &ui {
-                            self.emit_drop_oplog(&session, db, c, ui)?;
+                            self.emit_drop_oplog(&session, db, c, ui, records)?;
                         }
                         Ok(())
                     })
@@ -11268,7 +11389,8 @@ impl Storage {
                     t.set_value_u(b"");
                     t.insert()?;
                     if let Some(ui) = &ui {
-                        self.emit_drop_oplog(&session, db, c, ui)?;
+                        let records = self.count_records(&session, db, c)?;
+                        self.emit_drop_oplog(&session, db, c, ui, records)?;
                     }
                     Ok(())
                 })

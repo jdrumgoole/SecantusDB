@@ -193,8 +193,9 @@ struct Shared {
     /// `Arc` (not via `Shared`) so a connection thread can drop its `Shared`
     /// ref — and thus the storage ref — *before* it decrements the count.
     active: Arc<AtomicUsize>,
-    /// The built rustls server config when TLS is on (shared across connections).
-    tls: Option<Arc<rustls::ServerConfig>>,
+    /// The built rustls server config when TLS is on (shared across
+    /// connections), replaced by `rotateCertificates`.
+    tls: Option<Arc<TlsState>>,
     /// Global cap on concurrent in-flight message-body allocations.
     alloc_budget: AllocBudget,
     /// Live-connection registry: `conn_id → a clone of the connection's socket`,
@@ -377,7 +378,10 @@ pub fn bind(
     // Build the rustls config up front so a bad cert / key fails `bind`, not the
     // first connection.
     let tls = match &config.tls {
-        Some(opts) => Some(build_tls_config(opts)?),
+        Some(opts) => Some(Arc::new(TlsState {
+            options: opts.clone(),
+            config: std::sync::RwLock::new(build_tls_config(opts)?),
+        })),
         None => None,
     };
 
@@ -567,7 +571,7 @@ fn handle_connection(tcp: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
     auth_state.peer_address = tcp.peer_addr().ok().map(|a| a.to_string());
     let conn_auth = Arc::new(Mutex::new(auth_state));
 
-    match shared.tls.clone() {
+    match shared.tls.as_ref().map(|t| t.current()) {
         Some(tls_config) => {
             let mut tcp = tcp;
             let mut conn = match rustls::ServerConnection::new(tls_config) {
@@ -872,6 +876,56 @@ fn serve<S: Read + Write>(
     }
 }
 
+/// The TLS options and the config built from them, which
+/// `rotateCertificates` rebuilds from the same files.
+struct TlsState {
+    options: TlsOptions,
+    config: std::sync::RwLock<Arc<rustls::ServerConfig>>,
+}
+
+impl TlsState {
+    fn current(&self) -> Arc<rustls::ServerConfig> {
+        self.config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+impl secantus_commands::CertificateRotator for TlsState {
+    fn rotate(&self) -> Result<(), String> {
+        // Each file is read first so a failure names the one that failed, in
+        // mongod's words; a new connection keeps the old config until the
+        // whole set loads.
+        let mut files = vec![
+            self.options.cert_file.as_str(),
+            self.options.key_file.as_str(),
+        ];
+        if let Some(ca) = &self.options.ca_file {
+            files.push(ca);
+        }
+        for file in files {
+            let shown = std::path::absolute(file)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| file.to_string());
+            let readable = std::fs::read(file)
+                .map_err(|_| "Failed opening file".to_string())
+                .and_then(|bytes| {
+                    let mut reader = std::io::BufReader::new(bytes.as_slice());
+                    let any = rustls_pemfile::read_all(&mut reader).any(|item| item.is_ok());
+                    any.then_some(())
+                        .ok_or_else(|| "no PEM data found in file".to_string())
+                });
+            if let Err(why) = readable {
+                return Err(format!("Unable to load PEM from '{shown}': {why}"));
+            }
+        }
+        let built = build_tls_config(&self.options).map_err(|e| e.to_string())?;
+        *self.config.write().unwrap_or_else(|e| e.into_inner()) = built;
+        Ok(())
+    }
+}
+
 /// Build the shared rustls server config from [`TlsOptions`]: the server cert
 /// chain and key, plus (when `ca_file` is set) a client-cert verifier —
 /// mandatory under `require_client_cert`, accept-if-present otherwise.
@@ -1133,6 +1187,12 @@ fn make_context(
         .with_failpoints_opt(shared.failpoints.clone())
         .with_conn_auth(conn_auth.clone())
         .with_conn_killer(shared.conn_killer.clone())
+        .with_cert_rotator(
+            shared
+                .tls
+                .clone()
+                .map(|t| t as Arc<dyn secantus_commands::CertificateRotator>),
+        )
         .with_ops(shared.ops.clone())
         .with_logs(shared.logs.clone())
         .with_top_stats(shared.top_stats.clone())

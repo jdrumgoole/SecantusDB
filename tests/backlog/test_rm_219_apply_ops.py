@@ -212,3 +212,37 @@ def test_oplog_entries_have_mongods_shape(rust_mongo: Any, mongod_rs: Any) -> No
     """mongod 8.2.11 logs an update as its `$v: 2` diff (`u` / `i` / `s<field>`
     sections), a delete with no `o2`, and a drop with `o2: {numRecords}`."""
     assert _oplog_entries(rust_mongo) == _oplog_entries(mongod_rs)
+
+
+def _ddl_entries(client: Any) -> list:
+    """The entries single-document writes and DDL leave (an index built on
+    an empty collection, which mongod logs as one `createIndexes`)."""
+    db = client.rm224
+    client.drop_database("rm224")
+    start = client.local["oplog.rs"].find_one(sort=[("$natural", -1)])["ts"]
+    db.create_collection("c")
+    db.c.create_index([("y", -1)], name="yy", unique=True, sparse=True, hidden=True)
+    db.c.insert_one({"_id": 1})
+    db.c.insert_one({"_id": 2})
+    db.c.delete_one({"_id": 1})
+    db.c.drop_index("yy")
+    client.admin.command("renameCollection", "rm224.c", to="rm224.d")
+    db.d.drop()
+    entries = [
+        {k: e[k] for k in ("op", "ns", "o", "o2") if k in e}
+        # mongod writes entries of its own (config collections it creates
+        # lazily), so only this test's namespace is read.
+        for e in client.local["oplog.rs"].find(
+            {"ts": {"$gt": start}, "ns": {"$regex": "^rm224\\."}}
+        )
+    ]
+    client.drop_database("rm224")
+    return entries
+
+
+@pytest.mark.backlog_fixed("RM-224")
+def test_oplog_ddl_and_delete_entries_have_mongods_shape(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """mongod 8.2.11: a delete has no `o2`; a one-index `createIndexes` is
+    the spec (`v`, `unique`, `hidden` first); `dropIndexes` keeps the spec in
+    `o2`; a rename says `stayTemp: false`; a drop has `o2: {numRecords}`."""
+    assert _ddl_entries(rust_mongo) == _ddl_entries(mongod_rs)

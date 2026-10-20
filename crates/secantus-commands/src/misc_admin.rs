@@ -335,3 +335,137 @@ pub(crate) fn write_block_bypass(ctx: &CommandContext) -> Option<Box<dyn std::an
     .then(|| storage.bypass_user_write_block())
     .flatten()
 }
+
+/// `rotateCertificates`: re-read the TLS certificate, key and CA files and
+/// use them for new connections. With TLS off there is nothing to rotate and
+/// mongod 8.2.11 answers `ok`; a file that does not load is 140
+/// InvalidSSLConfiguration and the certificate in use stays.
+pub fn rotate_certificates(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    for (k, v) in doc.iter().skip(1) {
+        match k.as_str() {
+            "message" => {
+                if !matches!(v, Bson::String(_)) {
+                    return Err(wrong_type("rotateCertificates.message", v, "string"));
+                }
+            }
+            k if crate::params::is_generic_arg(k) => {}
+            k => {
+                return Err(CommandError::new(
+                    40415,
+                    "IDLUnknownField",
+                    format!("BSON field 'rotateCertificates.{k}' is an unknown field."),
+                ))
+            }
+        }
+    }
+    if let Some(rotator) = &ctx.cert_rotator {
+        rotator
+            .rotate()
+            .map_err(|why| CommandError::new(140, "InvalidSSLConfiguration", why))?;
+    }
+    Ok(doc! {"ok": 1.0})
+}
+
+/// `validateDBMetadata`: what in the catalog API Version 1 does not allow,
+/// with `apiParameters: {version: "1", strict: true}` (any other API
+/// parameters find nothing). Measured on mongod 8.2.11: a `sparse` or `text`
+/// index is listed as 323; a view whose pipeline, nested ones included, uses
+/// a stage outside the API fails the command with that stage's 323; other
+/// index types, options, validators and collection kinds pass. With no `db`
+/// every database is read, in name order, and a database or collection that
+/// does not exist has nothing to report.
+pub fn validate_db_metadata(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let mut api = None;
+    let mut db_arg = None;
+    let mut coll_arg = None;
+    for (k, v) in doc.iter().skip(1) {
+        match k.as_str() {
+            "apiParameters" => match v {
+                Bson::Document(d) => api = Some(d),
+                other => {
+                    return Err(wrong_type(
+                        "validateDBMetadata.apiParameters",
+                        other,
+                        "object",
+                    ))
+                }
+            },
+            "db" => match v {
+                Bson::String(s) => db_arg = Some(s.clone()),
+                other => return Err(wrong_type("validateDBMetadata.db", other, "string")),
+            },
+            "collection" => match v {
+                Bson::String(s) => coll_arg = Some(s.clone()),
+                other => return Err(wrong_type("validateDBMetadata.collection", other, "string")),
+            },
+            k if crate::params::is_generic_arg(k) => {}
+            k => {
+                return Err(CommandError::new(
+                    40415,
+                    "IDLUnknownField",
+                    format!("BSON field 'validateDBMetadata.{k}' is an unknown field."),
+                ))
+            }
+        }
+    }
+    let Some(api) = api else {
+        return Err(CommandError::new(
+            40414,
+            "IDLFailedToParse",
+            "BSON field 'validateDBMetadata.apiParameters' is missing but a required field",
+        ));
+    };
+    let strict_v1 = api.get_str("version") == Ok("1") && api.get_bool("strict") == Ok(true);
+    let mut errors: Vec<Bson> = Vec::new();
+    if strict_v1 {
+        let storage = ctx.storage()?;
+        let mut dbs = match db_arg {
+            Some(db) => vec![db],
+            None => storage
+                .list_databases()
+                .map_err(crate::util::command_error)?,
+        };
+        dbs.sort();
+        for db in dbs {
+            let mut colls = storage
+                .list_collections(&db)
+                .map_err(crate::util::command_error)?;
+            colls.sort();
+            for coll in colls {
+                if coll_arg.as_ref().is_some_and(|c| *c != coll) {
+                    continue;
+                }
+                let options = storage
+                    .get_collection_options(&db, &coll)
+                    .unwrap_or_default();
+                if options.contains_key("viewOn") {
+                    // The catalog keeps a view's pipeline as `viewPipeline`.
+                    if let Ok(pipeline) = options.get_array("viewPipeline") {
+                        if let Some(stage) = crate::first_non_v1_stage(pipeline) {
+                            return Err(crate::api_strict_stage_error(&stage));
+                        }
+                    }
+                    continue;
+                }
+                for ix in storage.list_indexes(&db, &coll).unwrap_or_default() {
+                    let sparse = ix.get_bool("sparse").unwrap_or(false);
+                    let text = ix
+                        .get_document("key")
+                        .is_ok_and(|k| k.values().any(|v| v.as_str() == Some("text")));
+                    if sparse || text {
+                        errors.push(Bson::Document(doc! {
+                            "ns": format!("{db}.{coll}"),
+                            "code": 323,
+                            "codeName": "APIStrictError",
+                            "errmsg": format!(
+                                "The index with name {} is not allowed in API version 1.",
+                                ix.get_str("name").unwrap_or_default()
+                            ),
+                        }));
+                    }
+                }
+            }
+        }
+    }
+    Ok(doc! {"apiVersionErrors": errors, "ok": 1.0})
+}

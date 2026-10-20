@@ -847,6 +847,14 @@ pub trait Storage: Send + Sync {
 
     /// Append `appendOplogNote`'s no-op oplog entry carrying `data`.
     /// Default: unsupported, a backend with no oplog.
+    /// Append a command entry `{op: "c", ns, o}` that changes no data
+    /// (`dbCheck`'s). Default: nowhere to write it.
+    fn append_command_entry(&self, _ns: &str, _o: Document) -> Result<(), StorageError> {
+        Err(StorageError::Internal(
+            "this storage backend has no oplog".into(),
+        ))
+    }
+
     fn append_oplog_note(&self, _data: Document) -> Result<(), StorageError> {
         Err(StorageError::Internal(
             "appendOplogNote: this storage backend has no oplog".into(),

@@ -51,6 +51,7 @@ pub mod cluster_admin;
 pub mod cluster_params;
 pub mod crud;
 pub mod cursors;
+mod db_check;
 mod dbhash;
 mod ddl_checks;
 pub mod diagnostics;
@@ -149,6 +150,14 @@ pub trait ConnectionKiller: Send + Sync {
     fn kill(&self, conn_id: i64) -> bool;
 }
 
+/// Lets `rotateCertificates` reload the server's TLS certificate and key
+/// from their files. Implemented by the server when TLS is on.
+pub trait CertificateRotator: Send + Sync {
+    /// Re-read the files and use them for new connections; on failure keep
+    /// the certificate in use and say why, as mongod's 140 message does.
+    fn rotate(&self) -> Result<(), String>;
+}
+
 /// The per-request state a handler reads. Handshake- and CRUD-scoped for this
 /// slice; it grows (auth, sessions, cursors, metrics, …) as command families
 /// land. The fields mirror the subset of `commands.py::CommandContext` the
@@ -207,6 +216,8 @@ pub struct CommandContext {
     /// by its `conn_id`. `None` until the server wires one in (and in unit-test
     /// contexts).
     pub conn_killer: Option<Arc<dyn ConnectionKiller>>,
+    /// The server's TLS certificate reloader; `None` when TLS is off.
+    pub cert_rotator: Option<Arc<dyn CertificateRotator>>,
     /// The server's running operations (`currentOp`, `killOp`). `None` in
     /// unit-test contexts.
     pub ops: Option<Arc<ops::OpRegistry>>,
@@ -302,6 +313,7 @@ impl CommandContext {
             failpoints: None,
             close_connection: false,
             conn_killer: None,
+            cert_rotator: None,
             ops: None,
             logs: None,
             conn_stats: None,
@@ -359,6 +371,12 @@ impl CommandContext {
     /// uses it to close a connection by its `conn_id`.
     pub fn with_conn_killer(mut self, conn_killer: Arc<dyn ConnectionKiller>) -> Self {
         self.conn_killer = Some(conn_killer);
+        self
+    }
+
+    /// Attach the server's TLS certificate reloader (builder-style).
+    pub fn with_cert_rotator(mut self, rotator: Option<Arc<dyn CertificateRotator>>) -> Self {
+        self.cert_rotator = rotator;
         self
     }
 
@@ -693,6 +711,9 @@ fn lookup(name: &str) -> Option<Handler> {
         "dropConnections" => misc_admin::drop_connections,
         "setUserWriteBlockMode" => misc_admin::set_user_write_block_mode,
         "applyOps" => apply_ops::apply_ops,
+        "rotateCertificates" => misc_admin::rotate_certificates,
+        "validateDBMetadata" => misc_admin::validate_db_metadata,
+        "dbCheck" => db_check::db_check,
         "releaseMemory" => misc_admin::release_memory,
         "filemd5" => misc_admin::filemd5,
         "planCacheClear" => replset_admin::plan_cache_clear,
@@ -2860,18 +2881,8 @@ fn validate_api(doc: &Document, name: &str) -> Result<(), CommandError> {
         // land an APIStrictError from inside an allowed command.
         if name == "aggregate" {
             if let Some(Bson::Array(pipeline)) = doc.get("pipeline") {
-                for stage in pipeline {
-                    if let Some(s) = stage.as_document().and_then(|d| d.keys().next()) {
-                        if !api_v1_agg_stage(s) {
-                            return Err(CommandError::new(
-                                323,
-                                "APIStrictError",
-                                format!(
-                                    "{s} is not allowed with 'apiStrict: true' in API Version 1"
-                                ),
-                            ));
-                        }
-                    }
+                if let Some(s) = first_non_v1_stage(pipeline) {
+                    return Err(api_strict_stage_error(&s));
                 }
             }
         }
@@ -2905,6 +2916,45 @@ fn non_v1_mongod_command(name: &str) -> bool {
 /// A pipeline stage outside this set under `apiStrict: true` is an
 /// `APIStrictError`. Deliberately excludes `$listLocalSessions` / `$listSessions`
 /// / `$currentOp` — the stages driver tests probe with.
+/// mongod's refusal of a stage outside API Version 1 under `apiStrict`.
+pub(crate) fn api_strict_stage_error(stage: &str) -> CommandError {
+    CommandError::new(
+        323,
+        "APIStrictError",
+        format!("{stage} is not allowed with 'apiStrict: true' in API Version 1"),
+    )
+}
+
+/// The first stage outside API Version 1 in `pipeline`, looking inside the
+/// sub-pipelines of `$facet`, `$lookup` and `$unionWith` as mongod does
+/// (measured 8.2.11: each refuses a nested `$planCacheStats` with 323).
+pub(crate) fn first_non_v1_stage(pipeline: &[Bson]) -> Option<String> {
+    for stage in pipeline {
+        let Some(d) = stage.as_document() else {
+            continue;
+        };
+        let Some((name, spec)) = d.iter().next() else {
+            continue;
+        };
+        if !api_v1_agg_stage(name) {
+            return Some(name.clone());
+        }
+        let nested: Vec<&Vec<Bson>> = match (name.as_str(), spec) {
+            ("$facet", Bson::Document(f)) => f.values().filter_map(Bson::as_array).collect(),
+            ("$lookup" | "$unionWith", Bson::Document(l)) => {
+                l.get_array("pipeline").ok().into_iter().collect()
+            }
+            _ => Vec::new(),
+        };
+        if let Some(found) = nested.into_iter().find_map(|p| first_non_v1_stage(p)) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Whether `stage` is in API Version 1 (measured 8.2.11 under `apiStrict`:
+/// `$fill` and `$indexStats` are refused although they run otherwise).
 pub(crate) fn api_v1_agg_stage(stage: &str) -> bool {
     matches!(
         stage,
@@ -2917,11 +2967,9 @@ pub(crate) fn api_v1_agg_stage(stage: &str) -> bool {
             | "$densify"
             | "$documents"
             | "$facet"
-            | "$fill"
             | "$geoNear"
             | "$graphLookup"
             | "$group"
-            | "$indexStats"
             | "$limit"
             | "$lookup"
             | "$match"
