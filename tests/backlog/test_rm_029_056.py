@@ -713,25 +713,6 @@ def _same_order(rust: Any, ref: Any, name: str, indexes: list, command: dict, **
     assert got == want
 
 
-@pytest.mark.backlog("RM-049")
-def test_ties_under_a_sort_with_a_limit(rust_mongo: Any, mongod: Any) -> None:
-    """`{a: 5}, sort {a: -1}, skip 1, limit 2`, no index: mongod's top-k heap
-    leaves the tied documents in its own order."""
-    command = {"find": "c", "filter": {"a": 5}, "sort": {"a": -1}, "skip": 1, "limit": 2}
-    _same_order(rust_mongo, mongod, "rm049", [], command)
-
-
-@pytest.mark.backlog("RM-049")
-def test_ties_under_an_aggregate_sort_with_a_limit(rust_mongo: Any, mongod: Any) -> None:
-    """`$sort {b: 1}, $limit 3`, no index: the heap's order of the ties."""
-    command = {
-        "aggregate": "c",
-        "pipeline": [{"$sort": {"b": 1}}, {"$limit": 3}],
-        "cursor": {},
-    }
-    _same_order(rust_mongo, mongod, "rm049a", [], command)
-
-
 @pytest.mark.backlog_fixed("RM-050")
 def test_ties_between_merged_scans(rust_mongo: Any, mongod: Any) -> None:
     """`{a: {$in: [5, 3]}}, sort {b: 1}` over `{a: 1, b: 1}`: mongod merges a

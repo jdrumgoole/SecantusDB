@@ -348,7 +348,7 @@ Each unblocks rows that otherwise stay open.
 | SBE explain (RM-071, RM-072) | transcribe mongod's stage builders and execute the slot programs |
 | Python-server compatibility | no longer a constraint, on-disk format included (`CLAUDE.md`) |
 | Unknown-hint wording (RM-051) | not reproduced; scope decision. Still to do: mark the rows accepted in each probe |
-| Ties under a sort with a limit (RM-049) | measure a Linux mongod first; reproduce libc++'s heap if it agrees, accept if not |
+| Ties under a sort with a limit (RM-049) | measured 2026-10-20: Linux and macOS mongod disagree (309 of 540), so accepted as a scope decision |
 | Lazy cursors | stream as mongod does: a suspended plan pulled a batch at a time |
 | Index build order (RM-081, RM-107 folded in) | record it in the catalog |
 | A schema change under an open transaction (RM-084) | model mongod's collection locks; DDL waits and answers 50 at `maxTimeMS` |

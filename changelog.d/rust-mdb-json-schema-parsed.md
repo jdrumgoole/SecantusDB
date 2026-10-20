@@ -64,3 +64,9 @@ type (unless the schema declares that one type), a nested object as
   equality builds (`{"_id.x": 1}` upserts `_id: {x: 1}`, as mongod 8.2.11
   does; it minted an ObjectId)
   (`crates/secantus-storage-adapter/tests/command_crud_wt.rs::update_constants_and_upsert_supplied`).
+- RM-049 closed as a scope decision: mongod's order for documents that tie
+  under a sort with a limit is its C++ library's heap, and a Linux mongod
+  8.2.12 (libstdc++) and a macOS mongod 8.2.11 (libc++) disagree on 309 of
+  540 measured cases, so no order is mongod's (Joe's decision of
+  2026-10-16 for that outcome). Its two gap tests, which asserted the macOS
+  answer, were retired with it.

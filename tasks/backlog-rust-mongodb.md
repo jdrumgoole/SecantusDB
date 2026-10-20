@@ -961,19 +961,20 @@ What the order follows, each measured:
 
 Still different, all 77:
 
-- [ ] **Ties under a sort with a limit** (62). mongod keeps the first
-      `limit` documents of a blocking sort in a heap, and the order the heap
-      leaves equal documents in is its standard library's (`make_heap` and
-      `pop_heap`; working libc++'s by hand gives mongod's answer for
-      `{a: 5}, sort {a: -1}, skip 1, limit 2`). This server keeps them in
-      the order they arrived. A Linux mongod is built on another library
-      and was not measured.
-      **Decided 2026-10-16 (Joe):** measure the cases against mongod 8.2.11
-      on Linux (libstdc++) first. If Linux agrees with macOS, reproduce
-      libc++'s heap; if not, mongod has no single answer and the divergence
-      is accepted.
-      Backlog-ID: RM-049
-      Verify: tests/backlog/test_rm_029_056.py::test_ties_under_a_sort_with_a_limit,tests/backlog/test_rm_029_056.py::test_ties_under_an_aggregate_sort_with_a_limit
+- **Scope decision — ties under a sort with a limit keep their arrival
+  order** (this was RM-049; decided by Joe 2026-10-16, measured
+  2026-10-20). mongod keeps the first `skip + limit` documents of a
+  blocking sort in a heap (`TopKSorter`: `make_heap`, then `pop_heap` /
+  `push_heap` per better document, `sort_heap` at the end), and the order
+  equal documents come out in is the C++ library's. The decision was to
+  reproduce libc++'s heap if a Linux (libstdc++) mongod agreed with the
+  macOS one, and otherwise to accept the divergence. It does not: over 540
+  cases of 3 to 40 documents with ties (`find` and `aggregate`, limits 2 to
+  11, skips 0 to 2), mongod 8.2.12 on Ubuntu 24.04 and mongod 8.2.11 on
+  macOS returned different orders in 309. No order is mongod's, so this
+  server's (equal documents in the order the plan reads them) stands. The
+  two gap tests were retired with the item: they asserted the macOS
+  answer, which a Linux mongod would fail too.
 - **An unknown hint's wording is mongod's since 2026-10-20** (it was an
   accepted difference, Joe 2026-10-16, formerly RM-051). The planner's text,
   `error processing query: ns=<ns>Tree: <query tree>\nSort: ...`, is
