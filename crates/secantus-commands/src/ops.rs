@@ -29,7 +29,9 @@ pub struct RunningOp {
     pub ns: String,
     pub command: Document,
     pub started: Instant,
-    killed: AtomicBool,
+    /// Set by `killOp`; installed with `deadline` while the operation runs,
+    /// so every scan's deadline poll sees it.
+    killed: Arc<AtomicBool>,
 }
 
 impl RunningOp {
@@ -157,6 +159,7 @@ pub struct OpGuard {
     registry: Arc<OpRegistry>,
     opid: i64,
     previous: Option<Current>,
+    _interrupt: secantus_core::deadline::InterruptGuard,
 }
 
 impl Drop for OpGuard {
@@ -213,8 +216,9 @@ pub fn begin(registry: &Arc<OpRegistry>, doc: &Document, ctx: &crate::CommandCon
         ns,
         command: doc.clone(),
         started: Instant::now(),
-        killed: AtomicBool::new(false),
+        killed: Arc::new(AtomicBool::new(false)),
     });
+    let killed = running.killed.clone();
     registry
         .ops
         .lock()
@@ -232,10 +236,12 @@ pub fn begin(registry: &Arc<OpRegistry>, doc: &Document, ctx: &crate::CommandCon
             host,
         })
     });
+    let interrupt = secantus_core::deadline::watch_interrupt(killed);
     OpGuard {
         registry: registry.clone(),
         opid,
         previous,
+        _interrupt: interrupt,
     }
 }
 

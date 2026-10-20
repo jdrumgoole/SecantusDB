@@ -403,6 +403,44 @@ def test_diagnostic_stages(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F8
 # ------------------------------------------------ RM-216 operation registry --
 
 
+@pytest.mark.backlog_fixed("RM-216")
+def test_kill_op_interrupts_a_long_find(rust_mongo: Any) -> None:
+    """mongod 8.2.11 ends a find that `killOp` names, mid-scan, with 11601
+    "Executor error during find command: <ns> :: caused by :: operation was
+    interrupted" (measured 2026-10-20 over 200,000 documents). The scan
+    reads the kill where it reads its deadline."""
+    db = _db(rust_mongo, "rm216k")
+    for start in range(0, 200_000, 20_000):
+        db.big.insert_many([{"_id": i, "s": f"v{i:07d}"} for i in range(start, start + 20_000)])
+    host, port = rust_mongo.address
+    killer = pymongo.MongoClient(host, port, directConnection=True)
+    try:
+        for _ in range(3):
+            got: dict = {}
+            reader = threading.Thread(
+                target=lambda got=got: got.setdefault(
+                    "r", answer(lambda: len(list(db.big.find({"s": {"$regex": "zzz$"}}))))
+                ),
+                daemon=True,
+            )
+            reader.start()
+            killed = False
+            for _ in range(200):
+                time.sleep(0.01)
+                ops = killer.admin.command({"currentOp": 1, "ns": "rm216k.big"})["inprog"]
+                ops = [o for o in ops if o.get("op") == "query"]
+                if ops:
+                    killer.admin.command("killOp", op=ops[0]["opid"])
+                    killed = True
+                    break
+            reader.join(60)
+            if killed and got.get("r", ("ok",))[0] == "err":
+                break
+        assert got.get("r") == ("err", 11601)
+    finally:
+        killer.close()
+
+
 def _idle_cursors(client: Any) -> tuple:
     db = _db(client, "rm216")
     db.c.insert_many([{"_id": i} for i in range(10)])

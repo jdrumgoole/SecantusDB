@@ -573,15 +573,11 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       also lacks.
       Backlog-ID: RM-215
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_diagnostic_stages
-- [ ] **`killOp` interrupts only a waiting `getMore`, and the operation
-      rows lack mongod's detail.** Since 2026-10-20 a registry of running
-      operations stands behind `currentOp`, `$currentOp` (with
-      `idleCursors`) and `killOp`, which ends a waiting tailable `getMore`
-      with 11601. Open:
-      - a long query, aggregation or index build is listed but not
-        interrupted: `killOp` sets the flag, and only the getMore await
-        reads it. mongod checks for interrupts as it works (the deadline
-        polls here are where to read it);
+- [ ] **The operation rows `currentOp` lists lack mongod's detail.** Since
+      2026-10-20 a registry of running operations stands behind
+      `currentOp`, `$currentOp` (with `idleCursors`) and `killOp`, which
+      ends the operation it names with 11601 wherever it next checks: a
+      waiting getMore, or any scan's deadline poll. Open:
       - a row has no `currentOpTime`, `lsid`, `planSummary`,
         `queryFramework`, `numYields`, `locks`, `queues` or `waitingForLock`;
         a getMore's `cursor` block has only its id; an idle cursor's has no
@@ -591,7 +587,7 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       - `$currentOp`'s `allUsers`, `idleConnections` and `idleSessions`
         options are not applied.
       Backlog-ID: RM-216
-      Verify: none -- interrupting a long scan needs one that outlasts a test's timing; the registry's own tests are backlog_fixed
+      Verify: none -- the missing fields are mongod's internal accounting; the registry's own tests are backlog_fixed
 - [ ] **Ten commands mongod runs are 59 CommandNotFound here.**
       mongod 8.2.11 (one-member replica set) answers each with success or
       an error of its own:

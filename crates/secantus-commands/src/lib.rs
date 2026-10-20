@@ -765,6 +765,38 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     };
     ctx.profiling = profiler::begin(name, doc, ctx);
     let mut reply = dispatch_inner(doc, ctx);
+    // A killed operation's deadline polls fail as a spent budget would; the
+    // operation was interrupted, which mongod reports as 11601, keeping
+    // whatever wrapper the error carries (RM-216).
+    if ops::current_killed() && reply.get_i32("code") == Ok(50) {
+        let message = reply
+            .get_str("errmsg")
+            .unwrap_or("operation exceeded time limit")
+            .replace("operation exceeded time limit", "operation was interrupted");
+        // A kill that lands before execution (in planning) carries no
+        // executor wrapper; mongod reports it under one wherever it lands
+        // (measured 8.2.11: a killed find is "Executor error during find
+        // command: <ns> :: caused by :: operation was interrupted").
+        let message = if message.contains(" :: caused by :: ") {
+            message
+        } else {
+            let ns = |coll: &str| format!("{}.{coll}", ctx.db_name);
+            match (name, doc.get_str(name)) {
+                ("find", Ok(coll)) => {
+                    format!("Executor error during find command: {} :: caused by :: {message}", ns(coll))
+                }
+                ("aggregate" | "count" | "distinct", Ok(coll)) => format!(
+                    "Executor error during {name} command on namespace: {} :: caused by :: {message}",
+                    ns(coll)
+                ),
+                ("getMore", _) => format!("Executor error during getMore :: caused by :: {message}"),
+                _ => message,
+            }
+        };
+        reply.insert("errmsg", message);
+        reply.insert("code", 11601_i32);
+        reply.insert("codeName", "Interrupted");
+    }
     // A journaled write is acknowledged only once the journal holds it:
     // mongod's `waitUntilDurable`. Before this, `j` was echoed and no sync
     // followed, and a SIGKILL lost writes acknowledged with `j: true`.
