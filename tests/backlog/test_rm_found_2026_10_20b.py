@@ -501,7 +501,7 @@ def _kill_by_pattern(client: Any) -> tuple:
         f.close()
 
 
-@pytest.mark.backlog("RM-217")
+@pytest.mark.backlog_fixed("RM-217")
 def test_kill_sessions_by_pattern_kills_only_the_match(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
     """mongod 8.2.11: `killAllSessionsByPattern` naming s1's lsid aborts
     s1's transaction (251 on commit) and leaves s2's to commit."""
@@ -522,7 +522,7 @@ def _kill_closes_cursor(client: Any, command: str) -> tuple:
         f.close()
 
 
-@pytest.mark.backlog("RM-217")
+@pytest.mark.backlog_fixed("RM-217")
 def test_kill_all_sessions_closes_cursors(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
     """mongod 8.2.11: after `killAllSessions: []` or
     `killAllSessionsByPattern: []` a session's open cursor is gone (43

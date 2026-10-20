@@ -333,6 +333,7 @@ fn run_checked(
         Ok(t) => t,
         Err(reply) => return reply,
     };
+    registry.set_owner(lsid, user_digest(&authenticated(ctx)));
     statement(name, handler, doc, ctx, env, &registry, &txn)
 }
 
@@ -1110,6 +1111,7 @@ fn retryable_write(
         Ok(done) => done,
         Err(reply) => return reply,
     };
+    registry.set_owner(lsid, user_digest(&authenticated(ctx)));
     let (reply, records) = match name {
         "insert" => retry_insert(handler, doc, ctx, &ids, &done),
         "update" | "delete" => retry_batch(name, handler, doc, ctx, &ids, &done),

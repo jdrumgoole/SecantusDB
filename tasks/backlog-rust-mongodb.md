@@ -596,15 +596,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       - A long query or index build cannot be found or interrupted.
       Backlog-ID: RM-216
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_current_op_lists_idle_cursors,tests/backlog/test_rm_found_2026_10_20b.py::test_current_op_sees_a_running_operation
-- [ ] **`killAllSessionsByPattern` ignores its pattern, and the kill
-      commands leave cursors open.** The patterns are parsed and then
-      `abort_all()` runs (`secantus-commands/src/lib.rs`). A pattern naming
-      only s1's lsid aborted s2's transaction too; mongod 8.2.11 lets s2
-      commit. After `killAllSessions: []` or `killAllSessionsByPattern:
-      []` a session's open cursor still answers getMore here; on mongod it
-      is gone (43 CursorNotFound).
-      Backlog-ID: RM-217
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_kill_sessions_by_pattern_kills_only_the_match,tests/backlog/test_rm_found_2026_10_20b.py::test_kill_all_sessions_closes_cursors
 - [ ] **Seventeen commands mongod runs are 59 CommandNotFound here.**
       mongod 8.2.11 (one-member replica set) answers each with success or
       an error of its own:

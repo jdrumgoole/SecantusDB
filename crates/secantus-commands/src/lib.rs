@@ -1670,11 +1670,31 @@ fn kill_sessions(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! { "ok": 1.0 })
 }
 
-/// `killAllSessions` / `killAllSessionsByPattern` — abort every open
-/// transaction, whatever user or pattern is named. Driver test runners call
-/// it between tests to clear a transaction an earlier test left open; as a
-/// no-op it let one leaked transaction turn every later write into a
-/// `WriteConflict` retry storm (pymongo's unified transaction tests, 2026-09-25).
+/// One session a kill command names: its `lsid` (id and owner `uid`), its
+/// owner `uid`, or both. A field left out matches anything, so an empty
+/// pattern is every session.
+#[derive(Default)]
+struct KillPattern {
+    lsid: Option<(Vec<u8>, Vec<u8>)>,
+    uid: Option<Vec<u8>>,
+}
+
+impl KillPattern {
+    fn matches(&self, lsid: &[u8], owner: &[u8]) -> bool {
+        self.lsid
+            .as_ref()
+            .is_none_or(|(id, uid)| id == lsid && uid == owner)
+            && self.uid.as_ref().is_none_or(|uid| uid == owner)
+    }
+}
+
+/// `killAllSessions` / `killAllSessionsByPattern` — abort the transactions
+/// and kill the cursors of the sessions named: by user for the first (an
+/// empty user is the no-user digest), by `lsid` and `uid` for the second,
+/// whose `users` and `roles` are whom to act AS and select nothing. An empty
+/// list is every session. Measured 8.2.11, 2026-10-20 -- every pattern
+/// aborted every transaction, and no cursor was killed. Driver test runners
+/// send the empty form between tests to clear a leaked transaction.
 fn kill_all_sessions(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let name = command_name(doc);
     let owner = if name == "killAllSessions" {
@@ -1709,6 +1729,7 @@ fn kill_all_sessions(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     // Each entry is parsed whether or not any session matches it (mongod
     // 8.2.11): a user is `{user, db}`, both strings, and a pattern has only
     // the fields mongod's parser knows.
+    let mut selected: Vec<KillPattern> = Vec::new();
     for (i, pattern) in patterns.iter().enumerate() {
         let Bson::Document(pattern) = pattern else {
             return Err(wrong(&format!("{path}.{i}"), pattern, "object"));
@@ -1724,6 +1745,17 @@ fn kill_all_sessions(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
                     return Err(missing(&format!("{path}.{required}")));
                 }
             }
+            let user = pattern.get_str("user").unwrap_or_default();
+            let db = pattern.get_str("db").unwrap_or_default();
+            let named = if user.is_empty() {
+                Vec::new()
+            } else {
+                vec![(db.to_string(), user.to_string())]
+            };
+            selected.push(KillPattern {
+                lsid: None,
+                uid: Some(session::user_digest(&named)),
+            });
         } else {
             if let Some(key) = pattern
                 .keys()
@@ -1735,14 +1767,64 @@ fn kill_all_sessions(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
                     format!("BSON field '{path}.{key}' is an unknown field."),
                 ));
             }
-            let lsid = pattern.get_document("lsid").ok();
-            if lsid.is_some_and(|l| !l.contains_key("uid")) {
-                return Err(missing(&format!("{path}.lsid.uid")));
+            let mut chosen = KillPattern::default();
+            match pattern.get("lsid") {
+                None | Some(Bson::Null) => {}
+                Some(Bson::Document(lsid)) => {
+                    let id = session::session_id(lsid, &format!("{path}.lsid"))?;
+                    let Some(Bson::Binary(uid)) = lsid.get("uid") else {
+                        return Err(missing(&format!("{path}.lsid.uid")));
+                    };
+                    chosen.lsid = Some((id, uid.bytes.clone()));
+                }
+                Some(other) => return Err(wrong(&format!("{path}.lsid"), other, "object")),
             }
+            match pattern.get("uid") {
+                None | Some(Bson::Null) => {}
+                Some(Bson::Binary(uid)) => chosen.uid = Some(uid.bytes.clone()),
+                Some(other) => return Err(wrong(&format!("{path}.uid"), other, "binData")),
+            }
+            for (field, fields) in [("users", ["user", "db"]), ("roles", ["role", "db"])] {
+                let entries = match pattern.get(field) {
+                    None | Some(Bson::Null) => continue,
+                    Some(Bson::Array(entries)) => entries,
+                    Some(other) => return Err(wrong(&format!("{path}.{field}"), other, "array")),
+                };
+                // A misshapen entry is named by index; a field inside one is
+                // not (mongod's own paths, measured 8.2.11).
+                for (j, entry) in entries.iter().enumerate() {
+                    let Bson::Document(entry) = entry else {
+                        return Err(wrong(&format!("{path}.{field}.{j}"), entry, "object"));
+                    };
+                    for key in fields {
+                        match entry.get(key) {
+                            Some(Bson::String(_)) => {}
+                            None | Some(Bson::Null) => {
+                                return Err(missing(&format!("{path}.{field}.{key}")))
+                            }
+                            Some(other) => {
+                                return Err(wrong(
+                                    &format!("{path}.{field}.{key}"),
+                                    other,
+                                    "string",
+                                ))
+                            }
+                        }
+                    }
+                }
+            }
+            selected.push(chosen);
         }
     }
+    if patterns.is_empty() {
+        selected.push(KillPattern::default());
+    }
+    let picks = |lsid: &[u8], owner: &[u8]| selected.iter().any(|p| p.matches(lsid, owner));
     if let Some(reg) = &ctx.transactions {
-        reg.abort_all();
+        reg.abort_matching(&session::user_digest(&[]), picks);
+    }
+    if let Some(cursors) = &ctx.cursors {
+        cursors.kill_matching(picks);
     }
     Ok(doc! { "ok": 1.0 })
 }

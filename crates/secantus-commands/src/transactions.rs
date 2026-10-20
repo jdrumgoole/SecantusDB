@@ -382,6 +382,9 @@ struct Session {
     active: i64,
     kind: Kind,
     last_use: f64,
+    /// The `uid` of the user that owns the session, once a statement has
+    /// said (`set_owner`); `None` reads as the no-user digest.
+    owner: Option<Vec<u8>>,
 }
 
 struct Inner {
@@ -575,6 +578,7 @@ impl TransactionRegistry {
                     active: txn_number,
                     kind: Kind::Txn(txn.clone()),
                     last_use: now,
+                    owner: None,
                 },
             );
             drop(inner);
@@ -761,6 +765,7 @@ impl TransactionRegistry {
                 active: txn_number,
                 kind: Kind::Retryable(Applied::default()),
                 last_use: now,
+                owner: None,
             },
         );
         // A transaction is locked only once the registry is released.
@@ -810,6 +815,38 @@ impl TransactionRegistry {
             _ => None,
         };
         if let Some(c) = txn {
+            self.abort_locked(&c);
+        }
+    }
+
+    /// Record which user owns a session (its `uid`), for the kill commands'
+    /// patterns. A session keeps the owner it was first used by.
+    pub fn set_owner(&self, lsid_bytes: &[u8], uid: Vec<u8>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(session) = inner.sessions.get_mut(lsid_bytes) {
+            session.owner.get_or_insert(uid);
+        }
+    }
+
+    /// `killAllSessionsByPattern`: abort the transaction of every session
+    /// `matches(lsid, owner uid)` picks. `default_owner` stands in for a
+    /// session no statement has named an owner for.
+    pub fn abort_matching(&self, default_owner: &[u8], matches: impl Fn(&[u8], &[u8]) -> bool) {
+        let picked: Vec<Arc<Mutex<Transaction>>> = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sessions
+            .iter()
+            .filter_map(|(lsid, s)| match &s.kind {
+                Kind::Txn(c) if matches(lsid, s.owner.as_deref().unwrap_or(default_owner)) => {
+                    Some(c.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        // Each is locked with the registry released, as `open_transactions`.
+        for c in picked {
             self.abort_locked(&c);
         }
     }

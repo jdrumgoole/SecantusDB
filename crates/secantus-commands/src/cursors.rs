@@ -646,6 +646,18 @@ impl CursorRegistry {
             .retain(|_, e| e.owner.as_ref().is_none_or(|o| o.lsid != lsid));
     }
 
+    /// Kill every cursor whose session `matches(lsid, owner uid)` picks
+    /// (`killAllSessionsByPattern`). The owner is the user the cursor was
+    /// opened by; a cursor outside any session is left alone.
+    pub fn kill_matching(&self, matches: impl Fn(&[u8], &[u8]) -> bool) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.cursors.retain(|_, e| {
+            e.owner
+                .as_ref()
+                .is_none_or(|o| !matches(&o.lsid, &crate::session::user_digest(&e.users)))
+        });
+    }
+
     /// Flag a non-tailable cursor as opened under a `maxTimeMS`.
     pub fn mark_time_limited(&self, cursor_id: i64) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
