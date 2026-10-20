@@ -355,6 +355,7 @@ pub(crate) fn check(
         "lockInfo" => c.cluster("serverStatus"),
         "getClusterParameter" => c.cluster("getClusterParameter"),
         "setClusterParameter" => c.cluster("setClusterParameter"),
+        "setUserWriteBlockMode" => c.cluster("setUserWriteBlockMode"),
         "invalidateUserCache" => c.cluster("invalidateUserCache"),
         "replSetGetRBID" => c.cluster("internal"),
         "replSetFreeze" | "replSetMaintenance" => c.cluster("replSetStateChange"),

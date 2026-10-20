@@ -2387,6 +2387,16 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             .or_else(|| {
                 (!exists && held + built_here.len() >= MAX_INDEXES)
                     .then(|| (BuildStep::Prepare, BuildProblem::Refused(67, too_many())))
+            })
+            // A user write block refuses a new index as its build starts.
+            .or_else(|| {
+                let reason = (!exists)
+                    .then(|| storage.user_write_block_for(&ctx.db_name))
+                    .flatten()?;
+                Some((
+                    BuildStep::Init,
+                    BuildProblem::Refused(371, format!("User writes blocked, reason: {reason}")),
+                ))
             });
         if let Some((step, problem)) = refused {
             let e = build_failure(

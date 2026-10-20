@@ -690,6 +690,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "replSetFreeze" => misc_admin::repl_set_freeze,
         "replSetMaintenance" => misc_admin::repl_set_maintenance,
         "dropConnections" => misc_admin::drop_connections,
+        "setUserWriteBlockMode" => misc_admin::set_user_write_block_mode,
         "releaseMemory" => misc_admin::release_memory,
         "filemd5" => misc_admin::filemd5,
         "planCacheClear" => replset_admin::plan_cache_clear,
@@ -1962,6 +1963,7 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
         b => b,
     };
     let _deadline = deadline::arm((budget > 0).then_some(budget));
+    let _write_block_bypass = misc_admin::write_block_bypass(ctx);
     // Expressions are parsed under the feature compatibility version.
     let _fcv = secantus_core::expressions::gate_fcv(
         ctx.server_params.is_some() && cluster_admin::current_fcv(ctx) == "8.0",

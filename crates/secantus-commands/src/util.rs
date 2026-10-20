@@ -436,7 +436,9 @@ pub(crate) fn encode_docs(docs: Vec<Document>) -> Result<Vec<Vec<u8>>, CommandEr
 /// message; the engine sets `exec` and the handler supplies the name. Mirrors
 /// the two sites in `secantus.commands` that do the same on the Python server.
 pub(crate) fn exec_wrapped(errmsg: String, exec: bool, command: &str) -> String {
-    if exec {
+    // With no command to name (a DDL path reporting a storage error) there
+    // is no executor, so no wrapper.
+    if exec && !command.is_empty() {
         format!("Plan executor error during {command} :: caused by :: {errmsg}")
     } else {
         errmsg

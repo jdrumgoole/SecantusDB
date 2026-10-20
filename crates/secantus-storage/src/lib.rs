@@ -654,6 +654,43 @@ struct IndexPlan {
 /// so does not log: the `local` database, and a database's
 /// `system.profile` -- its documents, and its creation and drop (measured
 /// 8.2.11: none of them reaches the oplog).
+/// Where mongod keeps the user write block (`setUserWriteBlockMode`): one
+/// document, `_id: ""`, present while writes are blocked.
+const WRITE_BLOCK_DB: &str = "config";
+const WRITE_BLOCK_COLL: &str = "user_writes_critical_sections";
+
+thread_local! {
+    /// Set while this thread's writes may pass a user write block: an
+    /// internal writer, or a user holding `bypassWriteBlockingMode`.
+    static WRITE_BLOCK_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Lets this thread's writes pass a user write block while it lives.
+#[must_use = "the bypass ends when this guard drops"]
+pub struct WriteBlockBypass(bool);
+
+impl Drop for WriteBlockBypass {
+    fn drop(&mut self) {
+        WRITE_BLOCK_BYPASS.with(|b| b.set(self.0));
+    }
+}
+
+/// Let this thread's writes pass a user write block until the guard drops.
+pub fn bypass_user_write_block() -> WriteBlockBypass {
+    WriteBlockBypass(WRITE_BLOCK_BYPASS.with(|b| b.replace(true)))
+}
+
+/// Whether an oplog entry writes a user namespace: one outside `admin`,
+/// `config` and `local`, which mongod's user write block leaves alone.
+fn oplog_entry_is_user_write(e: &OplogEntry) -> bool {
+    let ns = match e {
+        OplogEntry::Doc(d) => d.get_str("ns").ok(),
+        OplogEntry::Raw(buf) => buf.get_str("ns").ok(),
+    };
+    let db = ns.and_then(|ns| ns.split('.').next()).unwrap_or("");
+    !matches!(db, "" | "admin" | "config" | "local")
+}
+
 fn oplog_entry_is_local(e: &OplogEntry) -> bool {
     let (ns, target) = match e {
         OplogEntry::Doc(d) => (
@@ -4251,6 +4288,10 @@ pub struct Storage {
     /// checkpoint throughout. (The other checkpoints hold `lock`, which the
     /// check holds too.)
     checkpoint_gate: Arc<Mutex<()>>,
+    /// The reason user writes are blocked (`setUserWriteBlockMode`), or
+    /// `None`. Persisted in `config.user_writes_critical_sections` and read
+    /// back at open.
+    user_write_block: std::sync::RwLock<Option<String>>,
 }
 
 /// Strictly-monotonic oplog bookkeeping: the next int64 seq to mint and the last
@@ -6206,6 +6247,7 @@ impl Storage {
             journal_join: Mutex::new(None),
             closed: AtomicBool::new(false),
             checkpoint_gate: Arc::new(Mutex::new(())),
+            user_write_block: std::sync::RwLock::new(None),
         };
         // Before anything looks a key up: crash recovery below replays writes
         // by `_id`.
@@ -6235,6 +6277,7 @@ impl Storage {
         storage.note_existing_timeseries()?;
         storage.backfill_document_id_claims()?;
         storage.backfill_collated_id_claims()?;
+        storage.load_user_write_block()?;
         Ok(storage)
     }
 
@@ -6754,6 +6797,29 @@ impl Storage {
         } else {
             (entries, pre_images)
         };
+        // A user write block refuses the write here, where mongod's op
+        // observer does: at the point the write is about to happen, inside
+        // its transaction, so nothing of it commits. A write that changes
+        // nothing emits nothing and passes, as on mongod.
+        if !WRITE_BLOCK_BYPASS.with(|b| b.get()) {
+            if let Some(reason) = self.user_writes_blocked() {
+                if let Some(e) = entries.iter().find(|e| oplog_entry_is_user_write(e)) {
+                    // A document write that reaches here comes from an
+                    // update, a delete or an upsert (an insert is refused
+                    // before it writes), which mongod reports under the
+                    // update executor's wrapper; a DDL write it reports bare.
+                    let op = match e {
+                        OplogEntry::Doc(d) => d.get_str("op").ok().map(str::to_string),
+                        OplogEntry::Raw(buf) => buf.get_str("op").ok().map(str::to_string),
+                    };
+                    return Err(StorageError::QueryError {
+                        code: 371,
+                        errmsg: format!("User writes blocked, reason: {reason}"),
+                        exec: op.as_deref() != Some("c"),
+                    });
+                }
+            }
+        }
         // A transaction statement's writes name the transaction, as mongod's
         // do. Stamped here, on the statement's thread, whichever thread later
         // writes the entries.
@@ -9989,6 +10055,22 @@ impl Storage {
             let (_, _, _) = self.insert_chunk(db, coll, &[], 0, ordered)?;
             return Ok((0, errors));
         }
+        // A user write block refuses each document as mongod's insert does,
+        // one write error per document (the first alone when ordered), and
+        // creates no collection. A profile entry is the server's own write.
+        if coll != PROFILE_COLLECTION {
+            if let Some(reason) = self.user_write_block_for(db) {
+                let refused = if ordered { 1 } else { docs.len() };
+                for index in 0..refused {
+                    errors.push(bson::doc! {
+                        "index": index as i32,
+                        "code": 371_i32,
+                        "errmsg": format!("User writes blocked, reason: {reason}"),
+                    });
+                }
+                return Ok((0, errors));
+            }
+        }
         let n = docs.len();
         let mut start = 0usize;
         while start < n {
@@ -10280,6 +10362,91 @@ impl Storage {
             }
             Ok((inserted, errors, stopped))
         })
+    }
+
+    /// The reason user writes are blocked, or `None` when they are not.
+    pub fn user_writes_blocked(&self) -> Option<String> {
+        self.user_write_block
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The reason a write to `db` by this thread would be refused, or `None`:
+    /// for a check made before a write starts (an index build refuses at its
+    /// start, before it scans).
+    pub fn user_write_block_for(&self, db: &str) -> Option<String> {
+        if WRITE_BLOCK_BYPASS.with(|b| b.get()) || matches!(db, "admin" | "config" | "local") {
+            return None;
+        }
+        self.user_writes_blocked()
+    }
+
+    /// Block user writes for `reason`, as `setUserWriteBlockMode` does:
+    /// mongod's document in `config.user_writes_critical_sections` is written
+    /// first, so the block survives a restart.
+    pub fn block_user_writes(&self, reason: &str) -> Result<()> {
+        let mut row = bson::doc! {
+            "_id": "",
+            "blockNewUserShardedDDL": false,
+            "blockUserWrites": true,
+        };
+        // mongod leaves the default reason out.
+        if reason != "Unspecified" {
+            row.insert("blockUserWritesReason", reason);
+        }
+        let bytes = bson::to_vec(&row).map_err(|e| StorageError::Bson(e.to_string()))?;
+        if !self.replace_by_id(
+            WRITE_BLOCK_DB,
+            WRITE_BLOCK_COLL,
+            &Bson::String(String::new()),
+            &bytes,
+        )? {
+            self.insert_one(WRITE_BLOCK_DB, WRITE_BLOCK_COLL, &bytes)?;
+        }
+        *self
+            .user_write_block
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(reason.to_string());
+        Ok(())
+    }
+
+    /// Lift a user write block, removing its document.
+    pub fn unblock_user_writes(&self) -> Result<()> {
+        self.delete_by_id(
+            WRITE_BLOCK_DB,
+            WRITE_BLOCK_COLL,
+            &Bson::String(String::new()),
+        )?;
+        *self
+            .user_write_block
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        Ok(())
+    }
+
+    /// Read a persisted user write block back at open.
+    fn load_user_write_block(&self) -> Result<()> {
+        let Some(raw) = self.find_by_id(
+            WRITE_BLOCK_DB,
+            WRITE_BLOCK_COLL,
+            &Bson::String(String::new()),
+        )?
+        else {
+            return Ok(());
+        };
+        let row = decode_doc(&raw)?;
+        if row.get_bool("blockUserWrites").unwrap_or(false) {
+            let reason = row
+                .get_str("blockUserWritesReason")
+                .unwrap_or("Unspecified")
+                .to_string();
+            *self
+                .user_write_block
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = Some(reason);
+        }
+        Ok(())
     }
 
     /// Fetch a document by `_id`. Returns its BSON bytes, or `None`.
@@ -11108,7 +11275,10 @@ impl Storage {
             })?;
             self.purge_dropped_collection(db, c)?;
         }
-        if self.enable_oplog {
+        // A database with no collections does not exist, and mongod writes no
+        // oplog entry for dropping it (measured 8.2.11): a change stream sees
+        // no `dropDatabase`, and a user write block does not refuse it.
+        if self.enable_oplog && !colls.is_empty() {
             self.retry_write_conflicts("drop_database", || {
                 let session = self.op_session()?;
                 self.with_statement_txn(&session, || {

@@ -785,7 +785,18 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         collation.as_ref(),
         doc,
         client_metadata.as_ref(),
-    )?;
+    )
+    .map_err(|mut e| {
+        // A `$out` / `$merge` refused by a user write block is the
+        // executor's error, as on mongod (8.2.11).
+        if e.code == 371 && !e.errmsg.starts_with("Executor error") {
+            e.errmsg = format!(
+                "Executor error during aggregate command on namespace: {ns} :: caused by :: {}",
+                e.errmsg
+            );
+        }
+        e
+    })?;
 
     // The pipeline result is already decoded `Document`s. Send the `firstBatch`
     // straight to the wire as `Bson` and encode only the cursor remainder for the
