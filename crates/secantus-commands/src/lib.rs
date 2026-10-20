@@ -741,6 +741,18 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     };
     ctx.profiling = profiler::begin(name, doc, ctx);
     let mut reply = dispatch_inner(doc, ctx);
+    // A journaled write is acknowledged only once the journal holds it:
+    // mongod's `waitUntilDurable`. Before this, `j` was echoed and no sync
+    // followed, and a SIGKILL lost writes acknowledged with `j: true`.
+    if wants_journal(name, doc, client_wc, default_wc.as_ref()) {
+        if let Some(storage) = &ctx.storage {
+            if let Err(e) = storage.flush_journal() {
+                // The write is not durable: that is the answer, not a
+                // footnote to an `ok: 1`.
+                reply = crate::util::command_error(e).into_reply();
+            }
+        }
+    }
     // An unacknowledged write's reply is zeroed below; its profile entry
     // records what it did.
     let inner_n = ctx.profiling.as_ref().and_then(|_| match reply.get("n") {
@@ -970,6 +982,43 @@ fn attach_write_concern_error(wc: &Document, provenance: &str, reply: &mut Docum
 /// sends none: measured on mongod 8.2.11 with a default of `w: 3` on a
 /// one-member set (2026-10-14), each of these answered with the
 /// `customDefault` write-concern error and a read did not.
+/// Whether a command's write concern holds it to the journal before it is
+/// acknowledged. `j: true` does; with `j` unset, `w: "majority"` does,
+/// because `writeConcernMajorityJournalDefault` is true on this one-member
+/// set -- and that is the implicit default, so a write with no write concern
+/// at all is journaled, as on mongod 8.2.11. `w: 0` never waits. A statement
+/// inside a transaction takes no write concern; its commit does.
+fn wants_journal(
+    name: &str,
+    doc: &Document,
+    client_wc: Option<&Document>,
+    default_wc: Option<&Document>,
+) -> bool {
+    let in_transaction = doc.contains_key("autocommit");
+    let takes =
+        name == "commitTransaction" || (!in_transaction && takes_default_write_concern(name, doc));
+    if !takes {
+        return false;
+    }
+    let wc = client_wc.filter(|wc| !wc.is_empty()).or(default_wc);
+    let Some(wc) = wc else {
+        return true; // the implicit `{w: "majority"}`
+    };
+    let truthy = |v: &Bson| match v {
+        Bson::Boolean(b) => *b,
+        Bson::Int32(n) => *n != 0,
+        Bson::Int64(n) => *n != 0,
+        Bson::Double(d) => *d != 0.0,
+        _ => false,
+    };
+    match (wc.get("w"), wc.get("j")) {
+        (Some(w), _) if crate::util::as_i64(w) == Some(0) => false,
+        (_, Some(j)) => truthy(j),
+        (Some(Bson::String(w)), None) => w == "majority",
+        _ => false,
+    }
+}
+
 fn takes_default_write_concern(name: &str, doc: &Document) -> bool {
     match name {
         "insert"

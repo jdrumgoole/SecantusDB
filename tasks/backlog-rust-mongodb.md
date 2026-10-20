@@ -108,11 +108,11 @@ Single-node change streams are implemented and conformant for typical pymongo `w
       ignored: an unsatisfiable `w` (e.g. `w: 2` against the one-member set)
       is rejected as mongod rejects it, `{code: 100, codeName:
       "CannotSatisfyWriteConcern", errmsg: "Not enough data-bearing nodes"}`,
-      on both servers. What remains accept-and-ignore is `j` / `wtimeout` /
-      `w: "majority"` durability semantics. That was recorded as something a
-      single node satisfies trivially; it is not -- a `j: true` write is
-      acknowledged without a journal flush and is lost to a kill (RM-186,
-      §7.085, measured 2026-10-20).
+      on both servers. `j` and `w: "majority"` are honoured as mongod honours
+      them: the Rust MongoDB server syncs the journal before acknowledging
+      such a write (the implicit default included), and a journal flusher
+      syncs every 100 ms for the rest (fixed 2026-10-20). `wtimeout` remains
+      accept-and-ignore: one node has nothing to wait for.
 - **INHERENT (recorded): the C-driver gauge tests a single-node
       surrogate cannot pass.** `/change_stream/live/read_prefs`,
       `/Client/command_secondary`, `/Collection/aggregate/secondary` and the
@@ -604,20 +604,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       features rather than replies.
       Backlog-ID: RM-219
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_commands_mongod_runs_are_commands_here
-- [ ] **`fsync` with `lock: true` is refused** (9, "not supported by
-      SecantusDB", `diagnostics.rs`) while `fsyncUnlock` exists. mongod
-      8.2.11 takes the lock (`lockCount: 1`), blocking writes until
-      `fsyncUnlock`; backup tools use the pair.
-      Backlog-ID: RM-220
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_fsync_lock
-- [ ] **OP_MSG checksums are not verified, and unknown required flag bits
-      are accepted.** `secantus-wire` trims the CRC-32C trailer without
-      checking it. A `ping` with a wrong checksum, or with required flag
-      bit 3 set, gets a normal reply here; mongod 8.2.11 closes the
-      connection for both. Wire fidelity: a corrupted message is answered
-      as though it were sound.
-      Backlog-ID: RM-221
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_op_msg_bad_checksum_is_refused,tests/backlog/test_rm_found_2026_10_20b.py::test_op_msg_unknown_required_flag_is_refused
 - [ ] **A string that is not valid UTF-8 is refused.** An insert whose
       string holds the bytes `0xff 0xfe` answers 1 "BSON error: utf-8
       encoding error"; mongod 8.2.11 stores it (n: 1). Data mongod keeps is
@@ -626,13 +612,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       would keep them.
       Backlog-ID: RM-222
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_insert_string_with_invalid_utf8
-- [ ] **An update that grows a document past 16 MB has the wrong message.**
-      Same code (10334), but this server says "object to insert too large.
-      size in bytes: …, max size: 16777216" where mongod 8.2.11 says "Plan
-      executor error during update :: caused by :: Resulting document
-      after update is larger than 16777216".
-      Backlog-ID: RM-223
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_update_past_16mb_message
 
 ### 7.085 The shared Rust storage, audited -- 2026-10-20
 
@@ -642,27 +621,6 @@ mongod 8.2.11 with a `secantusd-rs` built from tree `af2629ec`; the rest
 were confirmed by reading the code path and need a fault no quick test can
 inject (a panic, a power loss, a failing checkpoint).
 
-- [ ] **A write acknowledged with `j: true` is lost when the server is
-      killed.** The Rust MongoDB server opens WiredTiger with
-      `transaction_sync=(enabled=false)` (`secantus-storage/src/lib.rs`
-      `DEFAULT_CONFIG`; `--sync-on-commit` is off by default) and nothing
-      ever calls `WT_SESSION::log_flush`: `j` is parsed and echoed back
-      (`secantus-commands/src/lib.rs`, the write-concern echo) and no flush
-      follows. Only the checkpoint thread syncs, every 60 s. Measured: 50
-      inserts each acknowledged with `{w: 1, j: true}`, then SIGKILL and
-      restart, five times -- 216 of the 250 writes were gone (four runs kept
-      0, 0, 1 and 33 of 50). mongod 8.2.11 kept all 250: `j: true` waits for
-      the journal to be synced before it acknowledges, and its journal
-      flusher bounds the loss for a write without `j` to about 100 ms
-      (`storage.journal.commitIntervalMs`). The Rust PostgreSQL server
-      measured the same loss and syncs every commit for it
-      (`secantus-pg/src/server.rs`). The fix is mongod's mechanism: flush
-      the log before acknowledging a `j: true` (or `w: "majority"`, which
-      implies it on a one-member set) write, and run a periodic journal
-      flush for the rest. (§3.2's "a single node satisfies `j` trivially"
-      was wrong; it now points here.)
-      Backlog-ID: RM-186
-      Verify: tests/backlog/test_rm_found_2026_10_20.py::test_j_true_write_survives_sigkill
 - [ ] **`createIndexes` on a collection bigger than the WiredTiger cache
       can afford in one transaction never returns.** The backfill runs in a
       single `with_statement_txn` (`Storage::create_index`), collecting every
@@ -694,29 +652,6 @@ inject (a panic, a power loss, a failing checkpoint).
       it die. §7.069 covers a panic while OPENING a store, in CI.
       Backlog-ID: RM-188
       Verify: none -- needs a WiredTiger panic injected into a running server
-- [ ] **A failure while the store closes cannot reach the caller.** The
-      close-time oplog-meta persist and final checkpoint run inside
-      `impl Drop for Storage` and only `eprintln!` a failure; there is no
-      fallible `close()`. `secantus-wt`'s `Connection`, `Session` and `Cursor`
-      `Drop`s discard the return code of WiredTiger's own `close`. So a
-      daemon whose last checkpoint failed exits 0, against CLAUDE.md's rule
-      that a close-path error is the headline. A `Storage::close() ->
-      Result` the servers call on shutdown, with the exit status following
-      it, is the fix.
-      Backlog-ID: RM-189
-      Verify: none -- needs a checkpoint failure injected at shutdown
-- [ ] **Point-in-time-recovery oplog segments and backup archives are never
-      synced to disk.** `pitr_archive::write_segment` writes a `.part` file
-      and renames it with no `sync_all` on the file or the directory (there
-      is none anywhere in the crate); `prune_oplog` then deletes the archived
-      rows from WiredTiger, and the next checkpoint makes that delete durable
-      while the segment may still be only in the page cache. A power loss can
-      leave a missing or empty segment: a permanent gap in the recovery
-      chain. `create_archive` writes straight to `output_path` with no
-      temporary file, so a failure part-way leaves a truncated archive under
-      the final name.
-      Backlog-ID: RM-190
-      Verify: none -- needs a power loss between the segment write and the checkpoint
 - [ ] **`count({})`, `collStats`, `dataSize` and `dbStats` read the whole
       collection into memory.** `scan_docs` returns a `Vec` of every
       document's bytes; `count_matching` with an empty filter is

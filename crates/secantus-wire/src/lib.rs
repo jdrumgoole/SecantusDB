@@ -254,6 +254,90 @@ pub const OP_GET_MORE_REMOVED_CODE: i32 = 5739101;
 /// `OP_REPLY` response flag: the query failed (`QueryFailure`).
 pub const OP_REPLY_FLAG_QUERY_FAILURE: u32 = 1 << 1;
 
+/// The `OP_MSG` flag bits a receiver must understand: the low 16. mongod
+/// refuses a message with any it does not know, where the high 16 are
+/// optional and ignored.
+const OP_MSG_REQUIRED_FLAG_BITS: u32 = 0xFFFF;
+
+/// Why mongod would drop the connection over this `OP_MSG` frame before
+/// reading it: a required flag bit it does not know, or a CRC-32C checksum
+/// that does not match the message. `None` for a sound frame. Measured
+/// 8.2.11, 2026-10-20: both closed the connection, where this server
+/// answered as though the frame were sound (the checksum was only trimmed).
+pub fn op_msg_frame_problem(header: &Header, body: &[u8]) -> Option<&'static str> {
+    if body.len() < 4 {
+        return None; // the parser's own refusal
+    }
+    let flags = rd_u32(body, 0);
+    let known = OP_MSG_FLAG_CHECKSUM_PRESENT | OP_MSG_FLAG_MORE_TO_COME;
+    if flags & OP_MSG_REQUIRED_FLAG_BITS & !known != 0 {
+        return Some("OP_MSG has an unknown required flag bit");
+    }
+    if flags & OP_MSG_FLAG_CHECKSUM_PRESENT != 0 {
+        if body.len() < 8 {
+            return Some("OP_MSG too short for its checksum");
+        }
+        let (covered, trailer) = body.split_at(body.len() - 4);
+        // The checksum covers the whole message, header included.
+        let mut head = Vec::with_capacity(HEADER_SIZE);
+        head.extend_from_slice(&((HEADER_SIZE + body.len()) as i32).to_le_bytes());
+        head.extend_from_slice(&header.request_id.to_le_bytes());
+        head.extend_from_slice(&header.response_to.to_le_bytes());
+        head.extend_from_slice(&header.op_code.to_le_bytes());
+        let sum = crc32c(crc32c_update(!0, &head), covered);
+        if sum != rd_u32(trailer, 0) {
+            return Some("OP_MSG checksum does not match");
+        }
+    }
+    None
+}
+
+/// The same `OP_MSG` frame with the checksum flag set and its CRC-32C
+/// appended: mongod's reply to a request that carried a checksum carries
+/// one too (measured 8.2.11, 2026-10-20). A frame that is not an `OP_MSG`
+/// comes back unchanged.
+pub fn with_op_msg_checksum(frame: &[u8]) -> Vec<u8> {
+    if frame.len() < HEADER_SIZE + 4 || rd_i32(frame, 12) != OP_MSG {
+        return frame.to_vec();
+    }
+    let mut out = Vec::with_capacity(frame.len() + 4);
+    out.extend_from_slice(frame);
+    out[..4].copy_from_slice(&((frame.len() + 4) as i32).to_le_bytes());
+    let flags = rd_u32(&out, HEADER_SIZE) | OP_MSG_FLAG_CHECKSUM_PRESENT;
+    out[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&flags.to_le_bytes());
+    let sum = crc32c(!0, &out);
+    out.extend_from_slice(&sum.to_le_bytes());
+    out
+}
+
+/// CRC-32C (Castagnoli), the checksum `OP_MSG` carries.
+fn crc32c(state: u32, data: &[u8]) -> u32 {
+    !crc32c_update(state, data)
+}
+
+fn crc32c_update(mut state: u32, data: &[u8]) -> u32 {
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut t = [0u32; 256];
+        for (i, slot) in t.iter_mut().enumerate() {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 {
+                    0x82F6_3B78 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+            }
+            *slot = c;
+        }
+        t
+    });
+    for b in data {
+        state = table[((state ^ u32::from(*b)) & 0xFF) as usize] ^ (state >> 8);
+    }
+    state
+}
+
 /// Parse an `OP_MSG` body (everything after the header): a u32 flags word
 /// followed by kind-0 / kind-1 sections, optionally trailed by a CRC32C when
 /// [`OP_MSG_FLAG_CHECKSUM_PRESENT`] is set. Port of `wire.py::_parse_op_msg`.
@@ -773,6 +857,51 @@ mod tests {
         let seq = &msg.document_sequences[0];
         assert_eq!(seq.identifier, "documents");
         assert_eq!(seq.documents, vec![d0.as_slice(), d1.as_slice()]);
+    }
+
+    #[test]
+    fn crc32c_matches_the_standard_check_value() {
+        // RFC 3720's check value for "123456789".
+        assert_eq!(crc32c(!0, b"123456789"), 0xE306_9283);
+    }
+
+    #[test]
+    fn op_msg_frame_problem_checks_flags_and_checksum() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&OP_MSG_FLAG_CHECKSUM_PRESENT.to_le_bytes());
+        body.push(0);
+        body.extend_from_slice(&enc(&doc! {"ping": 1, "$db": "admin"}));
+        let header = Header {
+            message_length: (HEADER_SIZE + body.len() + 4) as i32,
+            request_id: 7,
+            response_to: 0,
+            op_code: OP_MSG,
+        };
+        let mut head = Vec::new();
+        head.extend_from_slice(&header.message_length.to_le_bytes());
+        head.extend_from_slice(&7i32.to_le_bytes());
+        head.extend_from_slice(&0i32.to_le_bytes());
+        head.extend_from_slice(&OP_MSG.to_le_bytes());
+        let sum = crc32c(crc32c_update(!0, &head), &body);
+        let mut good = body.clone();
+        good.extend_from_slice(&sum.to_le_bytes());
+        assert_eq!(op_msg_frame_problem(&header, &good), None);
+        let mut bad = body.clone();
+        bad.extend_from_slice(&(sum ^ 1).to_le_bytes());
+        assert!(op_msg_frame_problem(&header, &bad).is_some());
+        let mut flagged = good.clone();
+        flagged[0] |= 1 << 3;
+        assert!(op_msg_frame_problem(&header, &flagged).is_some());
+        // An optional (high) bit is ignored.
+        let mut optional = good;
+        optional[3] |= 1 << 5;
+        let sum2 = {
+            let covered = &optional[..optional.len() - 4];
+            crc32c(crc32c_update(!0, &head), covered)
+        };
+        let n = optional.len();
+        optional[n - 4..].copy_from_slice(&sum2.to_le_bytes());
+        assert_eq!(op_msg_frame_problem(&header, &optional), None);
     }
 
     #[test]

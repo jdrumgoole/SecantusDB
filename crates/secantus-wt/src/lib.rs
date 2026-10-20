@@ -173,7 +173,11 @@ impl Drop for Connection {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             if let Some(close) = unsafe { (*self.ptr).close } {
-                unsafe { close(self.ptr, ptr::null()) };
+                // A drop cannot return the error; it must not vanish (RM-189).
+                let rc = unsafe { close(self.ptr, ptr::null()) };
+                if rc != 0 {
+                    eprintln!("secantus-wt: Connection close failed: {:?}", check(rc));
+                }
             }
             self.ptr = ptr::null_mut();
         }
@@ -274,6 +278,12 @@ impl Session {
         self.txn(unsafe { (*self.ptr).checkpoint }, config)
     }
 
+    /// `WT_SESSION::log_flush`: write the log, and with `sync=on` sync it,
+    /// through every commit made so far, in this session or any other.
+    pub fn log_flush(&self, config: Option<&str>) -> Result<()> {
+        self.txn(unsafe { (*self.ptr).log_flush }, config)
+    }
+
     /// Why WiredTiger rolled this session's transaction back
     /// (`WT_SESSION::get_rollback_reason`), or None when it has no reason to
     /// report.
@@ -322,7 +332,11 @@ impl Drop for Session {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             if let Some(close) = unsafe { (*self.ptr).close } {
-                unsafe { close(self.ptr, ptr::null()) };
+                // A drop cannot return the error; it must not vanish (RM-189).
+                let rc = unsafe { close(self.ptr, ptr::null()) };
+                if rc != 0 {
+                    eprintln!("secantus-wt: Session close failed: {:?}", check(rc));
+                }
             }
             self.ptr = ptr::null_mut();
         }
@@ -618,7 +632,11 @@ impl Drop for Cursor {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             if let Some(close) = unsafe { (*self.ptr).close } {
-                unsafe { close(self.ptr) };
+                // A drop cannot return the error; it must not vanish (RM-189).
+                let rc = unsafe { close(self.ptr) };
+                if rc != 0 {
+                    eprintln!("secantus-wt: Cursor close failed: {:?}", check(rc));
+                }
             }
             self.ptr = ptr::null_mut();
         }

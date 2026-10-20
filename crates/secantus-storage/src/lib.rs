@@ -473,6 +473,38 @@ impl PreparedXact {
 /// `storage.py`'s `MAX_BSON_OBJECT_SIZE`.
 const MAX_BSON_OBJECT_SIZE: usize = 16 * 1024 * 1024;
 
+/// The size past which mongod's document serializer refuses a document it
+/// builds, a pipeline update's result among them: 16 MiB plus 16 KiB.
+const MAX_BUILT_DOCUMENT_SIZE: usize = MAX_BSON_OBJECT_SIZE + 16 * 1024;
+
+/// mongod's error for an update whose result is past the BSON limit, under
+/// its "Plan executor error during <command>" wrapper (measured 8.2.11,
+/// 2026-10-20). An operator update says "Resulting document after update is
+/// larger than 16777216", as 10334 for one document and 17419 for a multi
+/// update; a pipeline's result fails the serializer first, above its own
+/// limit. This answered the insert path's "object to insert too large".
+fn update_too_large(size: usize, multi: bool, pipeline: bool) -> StorageError {
+    let (code, errmsg) = if pipeline && size > MAX_BUILT_DOCUMENT_SIZE {
+        (
+            10334,
+            format!(
+                "Serializing Document failed :: caused by :: Size {size} exceeds maximum \
+                 {MAX_BUILT_DOCUMENT_SIZE}"
+            ),
+        )
+    } else {
+        (
+            if multi { 17419 } else { 10334 },
+            format!("Resulting document after update is larger than {MAX_BSON_OBJECT_SIZE}"),
+        )
+    };
+    StorageError::QueryError {
+        code,
+        errmsg,
+        exec: true,
+    }
+}
+
 /// The mongod-shaped per-op write error for an over-limit document (10334).
 fn too_large_write_error(index: usize, size: usize) -> Document {
     bson::doc! {
@@ -1814,6 +1846,9 @@ enum ResolvedHint {
 ///
 /// `statistics=(fast)` is mongod's own setting: the engine keeps the cheap
 /// counters that `serverStatus.wiredTiger` reports ([`Storage::wt_statistics`]).
+/// mongod's `storage.journal.commitIntervalMs` default.
+const JOURNAL_COMMIT_INTERVAL_MS: u64 = 100;
+
 const DEFAULT_CONFIG: &str = "create,session_max=1000,cache_size=4G,\
                               eviction=(threads_min=4,threads_max=4),\
                               log=(enabled=true,file_max=128MB,prealloc=false),\
@@ -4138,6 +4173,12 @@ pub struct Storage {
     /// 250ms tick and clears it.
     checkpoint_requested: Arc<AtomicBool>,
     checkpoint_join: Mutex<Option<JoinHandle<()>>>,
+    /// The journal flusher (mongod's `JournalFlusher`): syncs the log every
+    /// `JOURNAL_COMMIT_INTERVAL`, bounding what a write that did not ask for
+    /// the journal can lose. Stopped by `checkpoint_stop`.
+    journal_join: Mutex<Option<JoinHandle<()>>>,
+    /// Set once [`Storage::close`] has run.
+    closed: AtomicBool,
     /// Held while the periodic thread checkpoints, and while a background
     /// `validate` opens its checkpoint cursors
     /// ([`Storage::check_collection_at_checkpoint`]), so the check reads one
@@ -5674,13 +5715,37 @@ pub fn extract_backup_archive_ex(
 }
 
 impl Drop for Storage {
-    /// Persist the oplog meta row on teardown — the Rust analogue of
-    /// `storage.close`'s `_persist_oplog_meta`. Recovery clamps against the
-    /// tables anyway (`load_oplog_meta`), so a failure here costs only a
-    /// tail-row scan plus a 1s clock bump on the next open — but it is still
-    /// logged, never silent: in a database a close-time write error is a
-    /// durability signal.
+    /// Close the store if nobody did ([`Storage::close`]). A failure here can
+    /// only be logged; a server closes the store itself on shutdown so the
+    /// failure reaches its exit status.
     fn drop(&mut self) {
+        if let Err(e) = self.close() {
+            eprintln!("secantus-storage: close failed: {e:?}");
+        }
+    }
+}
+
+impl Storage {
+    /// Close the store: stop the background threads, persist the oplog meta
+    /// row and take the final checkpoint. Answers the FIRST failure (each is
+    /// also logged): a close-time write error is a durability signal, and a
+    /// daemon whose last checkpoint failed must not exit 0 (RM-189). Runs
+    /// once; a later call, and the `Drop` after it, do nothing. The store is
+    /// not used after this.
+    ///
+    /// The oplog meta row is the Rust analogue of `storage.close`'s
+    /// `_persist_oplog_meta`. Recovery clamps against the tables anyway
+    /// (`load_oplog_meta`), so losing it costs only a tail-row scan plus a 1s
+    /// clock bump on the next open.
+    pub fn close(&self) -> Result<()> {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let mut first: Option<StorageError> = None;
+        let mut fail = |what: &str, e: StorageError| {
+            eprintln!("secantus-storage: {what} failed during close: {e:?}");
+            first.get_or_insert(e);
+        };
         // Prepared transactions still open in this process roll back here
         // (their sessions must close before the connection does); each keeps
         // its durable row, so the next open resolves it by replay.
@@ -5731,9 +5796,17 @@ impl Drop for Storage {
         {
             let _ = h.join();
         }
+        if let Some(h) = self
+            .journal_join
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = h.join();
+        }
         if self.data_nonlogged {
             if let Err(e) = self.stable_checkpoint() {
-                eprintln!("secantus-storage: close-time stable checkpoint failed: {e:?}");
+                fail("the stable checkpoint", e);
             }
         }
         // Async oplog: flush the drainer pool BEFORE persisting meta / checkpointing,
@@ -5763,7 +5836,7 @@ impl Drop for Storage {
         match self.conn.open_session() {
             Ok(session) => {
                 if let Err(e) = self.persist_oplog_meta(&session, meta) {
-                    eprintln!("secantus-storage: failed to persist oplog meta during close: {e:?}");
+                    fail("persisting the oplog meta", e);
                 }
                 // Close-time checkpoint (durable mode) — the Rust analogue of
                 // Python `Storage.close`'s final checkpoint. WiredTiger's
@@ -5782,18 +5855,17 @@ impl Drop for Storage {
                 // database a close-time write error is a durability signal.
                 if self.durable && !self.in_memory {
                     if let Err(e) = session.checkpoint(None) {
-                        eprintln!("secantus-storage: final checkpoint failed during close: {e:?}");
+                        fail("the final checkpoint", e.into());
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("secantus-storage: failed to open session during close: {e:?}");
-            }
+            Err(e) => fail("opening a session", e.into()),
+        }
+        match first {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     }
-}
-
-impl Storage {
     /// True when this store is the non-persistent (`in_memory=true`) variant.
     ///
     /// Read by `serverStatus.storageEngine.persistent`, which must not claim
@@ -6025,6 +6097,8 @@ impl Storage {
             checkpoint_stop: Arc::new(AtomicBool::new(false)),
             checkpoint_requested,
             checkpoint_join: Mutex::new(None),
+            journal_join: Mutex::new(None),
+            closed: AtomicBool::new(false),
             checkpoint_gate: Arc::new(Mutex::new(())),
         };
         // Before anything looks a key up: crash recovery below replays writes
@@ -6042,6 +6116,9 @@ impl Storage {
             // fast test mode (`durable=false`): those stores live for
             // seconds and skip the close checkpoint for the same reason.
             storage.spawn_checkpoint_thread(false);
+        }
+        if storage.durable && !storage.in_memory {
+            storage.spawn_journal_flusher();
         }
         // Finish any chunked drop a crash interrupted (registry row already
         // gone; the leftover rows must not resurface under a re-created name).
@@ -7151,6 +7228,51 @@ impl Storage {
     /// A checkpoint now, as `fsync` asks for one: for a data-nonlogged store
     /// the stable checkpoint (with its marker), for a logged one the plain
     /// checkpoint. Nothing for a store held in memory, which has none.
+    /// Sync the log through every commit made so far, as mongod's
+    /// `waitUntilDurable` does before acknowledging a journaled write
+    /// (`j: true`, or `w: "majority"` on this one-member set). WiredTiger
+    /// groups concurrent flushes into one sync. Fast test mode
+    /// (`durable=false`) gives up only what a power loss takes, so there the
+    /// log buffer is written out without the sync: a killed process still
+    /// keeps the write. An in-memory store has no log.
+    pub fn flush_journal(&self) -> Result<()> {
+        if self.in_memory {
+            return Ok(());
+        }
+        let config = if self.durable { "sync=on" } else { "sync=off" };
+        Ok(self.conn.open_session()?.log_flush(Some(config))?)
+    }
+
+    /// mongod's journal flusher: sync the log every 100 ms
+    /// (`storage.journal.commitIntervalMs`), so a write acknowledged without
+    /// waiting for the journal is lost to a crash for at most that long.
+    fn spawn_journal_flusher(&self) {
+        let stop = self.checkpoint_stop.clone();
+        let conn = self.conn.clone();
+        let handle = thread::Builder::new()
+            .name("secantus-journal".into())
+            .spawn(move || {
+                let interval = std::time::Duration::from_millis(JOURNAL_COMMIT_INTERVAL_MS);
+                while !stop.load(Ordering::Acquire) {
+                    std::thread::sleep(interval);
+                    if let Err(e) = conn
+                        .open_session()
+                        .and_then(|s| s.log_flush(Some("sync=on")))
+                    {
+                        // A failed sync is a durability signal -- loud; the
+                        // next tick tries again.
+                        eprintln!("secantus-storage: periodic journal flush failed: {e:?}");
+                    }
+                }
+            });
+        match handle {
+            Ok(h) => {
+                *self.journal_join.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+            }
+            Err(e) => eprintln!("secantus-storage: could not spawn journal flusher: {e}"),
+        }
+    }
+
     pub fn checkpoint_now(&self) -> Result<()> {
         if self.in_memory {
             return Ok(());
@@ -7414,8 +7536,43 @@ impl Storage {
         session.checkpoint(None)?;
         let manifest = self.pitr_manifest()?;
         let cursor = session.open_cursor("backup:", None)?;
-        let file =
-            std::fs::File::create(output_path).map_err(|e| archive_err("create_archive", e))?;
+        // Written under a temporary name and renamed once synced, so a
+        // failure part-way never leaves a truncated archive under the final
+        // name, and a finished one survives a power loss (RM-190).
+        let final_path = std::path::Path::new(output_path);
+        let dir = final_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        let part = dir.join(format!(
+            ".{}.part",
+            final_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+        let written = self.write_archive_file(&cursor, &part, &manifest);
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&part); // the error below is the headline
+            return Err(e);
+        }
+        std::fs::rename(&part, final_path).map_err(|e| archive_err("create_archive", e))?;
+        pitr_archive::sync_dir(dir).map_err(|e| archive_err("create_archive", e))?;
+        let size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+        Ok(ArchiveInfo {
+            path: output_path.to_string(),
+            size_bytes: size,
+        })
+    }
+
+    /// Tar the backup cursor's files and the manifest into `path`, synced.
+    fn write_archive_file(
+        &self,
+        cursor: &Cursor,
+        path: &std::path::Path,
+        manifest: &serde_json::Value,
+    ) -> Result<()> {
+        let file = std::fs::File::create(path).map_err(|e| archive_err("create_archive", e))?;
         let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
         let mut builder = tar::Builder::new(enc);
         while cursor.next()? {
@@ -7426,7 +7583,7 @@ impl Storage {
                 .map_err(|e| archive_err("create_archive", e))?;
         }
         let data =
-            serde_json::to_vec(&manifest).map_err(|e| archive_err("create_archive manifest", e))?;
+            serde_json::to_vec(manifest).map_err(|e| archive_err("create_archive manifest", e))?;
         let mut header = tar::Header::new_gnu();
         header.set_size(data.len() as u64);
         header.set_mode(0o644);
@@ -7438,12 +7595,10 @@ impl Storage {
             .into_inner()
             .map_err(|e| archive_err("create_archive", e))?
             .finish()
+            .map_err(|e| archive_err("create_archive", e))?
+            .sync_all()
             .map_err(|e| archive_err("create_archive", e))?;
-        let size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
-        Ok(ArchiveInfo {
-            path: output_path.to_string(),
-            size_bytes: size,
-        })
+        Ok(())
     }
 
     /// Take a PITR v2 base snapshot into `archive_dir`, named by its oplog head
@@ -17154,7 +17309,11 @@ impl Storage {
             }
             let new_blob = encode_doc(&new)?;
             if new_blob.len() > MAX_BSON_OBJECT_SIZE {
-                stopped = Some(StorageError::DocumentTooLarge(new_blob.len()));
+                stopped = Some(update_too_large(
+                    new_blob.len(),
+                    true,
+                    update_spec.is_none() && !is_replacement,
+                ));
                 break;
             }
             modified += 1;
@@ -17315,7 +17474,11 @@ impl Storage {
                         }
                         let new_blob = encode_doc(&new)?;
                         if new_blob.len() > MAX_BSON_OBJECT_SIZE {
-                            return Err(StorageError::DocumentTooLarge(new_blob.len()));
+                            return Err(update_too_large(
+                                new_blob.len(),
+                                multi,
+                                update_spec.is_none() && !is_replacement,
+                            ));
                         }
                         modified += 1;
                         // The doc stays at its existing key (`id_k`, suffixed for
@@ -17521,7 +17684,13 @@ impl Storage {
                     }
                     let new_blob = encode_doc(&new)?;
                     if new_blob.len() > MAX_BSON_OBJECT_SIZE {
-                        return Err(StorageError::DocumentTooLarge(new_blob.len()));
+                        return Err(StorageError::QueryError {
+                            code: 17420,
+                            errmsg: format!(
+                                "Document to upsert is larger than {MAX_BSON_OBJECT_SIZE}"
+                            ),
+                            exec: true,
+                        });
                     }
                     // Mint the RecordId + write the `_id` index first, then key the
                     // doc row by that RecordId (framed value carries the id_key).
@@ -21794,6 +21963,62 @@ mod tests {
             Err(other) => panic!("expected Internal fatal, got: {other:?}"),
             Ok(_) => panic!("expected open to be refused for an SSu doc shard"),
         }
+    }
+
+    /// `close` answers once and is then a no-op (the `Drop` after it does
+    /// nothing), and the store it closed opens again intact.
+    #[test]
+    fn close_is_idempotent_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        let opts = StorageOptions {
+            durable: Some(true),
+            ..StorageOptions::default()
+        };
+        let st = Storage::open_with_options(home, &opts).unwrap();
+        st.insert(
+            "app",
+            "c",
+            vec![encode_doc(&doc! {"_id": 1i32}).unwrap()],
+            true,
+        )
+        .unwrap();
+        st.close().unwrap();
+        st.close().unwrap();
+        drop(st);
+        let st = Storage::open_with_options(home, &opts).unwrap();
+        assert_eq!(st.scan_collection("app", "c").unwrap().len(), 1);
+    }
+
+    /// `flush_journal` succeeds on every kind of store: a durable one syncs
+    /// the log, a fast-test one writes it out, an in-memory one has none.
+    /// The journal flusher thread stops when the store closes.
+    #[test]
+    fn flush_journal_on_every_kind_of_store() {
+        for durable in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let opts = StorageOptions {
+                durable: Some(durable),
+                ..StorageOptions::default()
+            };
+            let st = Storage::open_with_options(dir.path().to_str().unwrap(), &opts).unwrap();
+            st.insert(
+                "app",
+                "c",
+                vec![encode_doc(&doc! {"_id": 1i32}).unwrap()],
+                true,
+            )
+            .unwrap();
+            st.flush_journal().unwrap();
+            drop(st);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StorageOptions {
+            wt_config: Some("create,in_memory=true".into()),
+            ..StorageOptions::default()
+        };
+        let mem = Storage::open_with_options(dir.path().to_str().unwrap(), &opts).unwrap();
+        mem.flush_journal().unwrap();
     }
 
     /// `sync_on_commit=true` flips `transaction_sync=enabled` to `true`.

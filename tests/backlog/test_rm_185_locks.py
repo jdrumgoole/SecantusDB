@@ -81,11 +81,13 @@ def _same_counts(got: list, want: list) -> None:
 
 
 def _reference(measure: Callable[[Any], list], client: Any) -> list:
-    """mongod's counts for each case: the least of three runs. Its
+    """mongod's counts for each case: the least of five runs. Its
     background threads (the TTL monitor, the session refresh) take the
     global lock too, and one that fires inside a case's window can only
-    ADD to that case's count."""
-    runs = [measure(client) for _ in range(3)]
+    ADD to that case's count. Three runs were not enough under a loaded
+    machine: on 2026-10-20, with four test workers, a background lock landed
+    in all three windows of one case."""
+    runs = [measure(client) for _ in range(5)]
     out = []
     for cases in zip(*runs, strict=True):
         label = cases[0][0]

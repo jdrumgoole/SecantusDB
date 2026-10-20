@@ -76,11 +76,34 @@ pub fn write_segment(
     std::fs::create_dir_all(archive_dir).map_err(|e| io_err("write_segment", e))?;
     let path = Path::new(archive_dir).join(segment_name(*first, *last));
     let tmp = Path::new(archive_dir).join(format!(".{}.part", segment_name(*first, *last)));
+    // The rows this segment holds are deleted from WiredTiger once it is
+    // written, and the next checkpoint makes that delete durable: the
+    // segment must be on disk first, its name included, or a power loss
+    // leaves a permanent gap in the recovery chain (RM-190).
     std::fs::File::create(&tmp)
-        .and_then(|mut f| f.write_all(&framed))
+        .and_then(|mut f| {
+            f.write_all(&framed)?;
+            f.sync_all()
+        })
         .map_err(|e| io_err("write_segment", e))?;
     std::fs::rename(&tmp, &path).map_err(|e| io_err("write_segment", e))?;
+    sync_dir(Path::new(archive_dir)).map_err(|e| io_err("write_segment", e))?;
     Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+/// Sync a directory, so a file created or renamed in it keeps its name
+/// through a power loss. A Unix notion: Windows will not open a directory
+/// as a file ("Access is denied"), and NTFS journals the rename itself.
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 fn read_segment_file(path: &Path) -> Result<Vec<(i64, Document, Option<Document>)>> {

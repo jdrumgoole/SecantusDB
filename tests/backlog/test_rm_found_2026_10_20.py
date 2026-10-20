@@ -49,7 +49,7 @@ def rust_server(store: Any, *extra: str, socket_timeout_ms: int | None = None) -
         proc.wait(timeout=20)
 
 
-@pytest.mark.backlog("RM-186")
+@pytest.mark.backlog_fixed("RM-186")
 def test_j_true_write_survives_sigkill(tmp_path: Any) -> None:
     """mongod 8.2.11 kept all 50 of 50 inserts acknowledged with
     `{w: 1, j: true}` across a SIGKILL and restart, in each of five runs: `j`

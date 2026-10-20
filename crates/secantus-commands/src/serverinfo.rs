@@ -341,14 +341,21 @@ pub fn sharding_state(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResu
     Ok(doc! { "enabled": false, "ok": 1.0 })
 }
 
-/// `fsyncUnlock`: `fsync` never takes the lock here, so there is never one
-/// to release, and mongod's answer to that is this refusal.
-pub fn fsync_unlock(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
-    Err(CommandError::new(
-        20,
-        "IllegalOperation",
-        "fsyncUnlock called when not locked",
-    ))
+/// `fsyncUnlock`: release one `fsync: {lock: true}`; the writes resume with
+/// the last. With none held, mongod's refusal.
+pub fn fsync_unlock(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    match ctx.locks.as_ref().and_then(|l| l.fsync_unlock()) {
+        Some(count) => Ok(doc! {
+            "info": "fsyncUnlock completed",
+            "lockCount": count as i32,
+            "ok": 1.0,
+        }),
+        None => Err(CommandError::new(
+            20,
+            "IllegalOperation",
+            "fsyncUnlock called when not locked",
+        )),
+    }
 }
 
 /// `connectionStatus`: who this connection has authenticated as. The

@@ -653,6 +653,7 @@ fn serve<S: Read + Write>(
         let mut req = Inbound {
             request_id: header.request_id,
             compressor: None,
+            checksum: false,
         };
         let _inflated_budget;
         let (header, body) = if header.op_code == OP_COMPRESSED {
@@ -682,6 +683,14 @@ fn serve<S: Read + Write>(
             (header, body)
         };
 
+        // A frame mongod would not read -- an unknown required flag bit, a
+        // checksum that does not match -- ends the connection unanswered.
+        if header.op_code == secantus_wire::OP_MSG {
+            if secantus_wire::op_msg_frame_problem(&header, &body).is_some() {
+                return Ok(());
+            }
+            req.checksum = body.first().is_some_and(|f| f & 1 != 0);
+        }
         match secantus_wire::parse_body(header.op_code, &body) {
             Ok(Op::Msg(msg)) => {
                 let more_to_come = msg.flags & OP_MSG_FLAG_MORE_TO_COME != 0;
@@ -1154,6 +1163,8 @@ fn db_from_namespace(ns: &str) -> String {
 struct Inbound {
     request_id: i32,
     compressor: Option<Compressor>,
+    /// The request carried an `OP_MSG` checksum, so the reply does too.
+    checksum: bool,
 }
 
 /// Write one reply frame, compressed when the request was.
@@ -1163,6 +1174,13 @@ fn send_frame<S: Write>(
     shared: &Arc<Shared>,
     frame: &[u8],
 ) -> io::Result<()> {
+    let stamped;
+    let frame = if req.checksum {
+        stamped = secantus_wire::with_op_msg_checksum(frame);
+        stamped.as_slice()
+    } else {
+        frame
+    };
     match req.compressor {
         None => {
             shared.top_stats.count_reply(frame.len());

@@ -1177,6 +1177,10 @@ impl CmdStorage for StorageAdapter {
             .map_err(map_err)
     }
 
+    fn flush_journal(&self) -> Result<(), StorageError> {
+        self.inner.flush_journal().map_err(map_err)
+    }
+
     fn checkpoint_now(&self) -> Result<bool, StorageError> {
         if self.inner.in_memory() {
             return Ok(false);

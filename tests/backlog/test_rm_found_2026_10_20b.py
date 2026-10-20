@@ -633,7 +633,7 @@ def _fsync_lock(client: Any) -> tuple:
     return got
 
 
-@pytest.mark.backlog("RM-220")
+@pytest.mark.backlog_fixed("RM-220")
 def test_fsync_lock(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 takes `fsync: 1, lock: true` (lockCount 1), and
     `fsyncUnlock` releases it."""
@@ -658,7 +658,7 @@ def _raw_op_msg(client: Any, flags: int, trailer: bytes = b"") -> str:
         return "replied" if head else "closed"
 
 
-@pytest.mark.backlog("RM-221")
+@pytest.mark.backlog_fixed("RM-221")
 def test_op_msg_bad_checksum_is_refused(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 closes the connection on an OP_MSG whose CRC-32C
     checksum (flag bit 0) is wrong."""
@@ -666,7 +666,7 @@ def test_op_msg_bad_checksum_is_refused(rust_mongo: Any, mongod: Any) -> None:
     assert _raw_op_msg(rust_mongo, 1, trailer) == _raw_op_msg(mongod, 1, trailer)
 
 
-@pytest.mark.backlog("RM-221")
+@pytest.mark.backlog_fixed("RM-221")
 def test_op_msg_unknown_required_flag_is_refused(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 closes the connection on an OP_MSG with an unknown
     REQUIRED flag bit (bits 0-15; bit 3 here)."""
@@ -723,7 +723,7 @@ def _grow_past_limit(client: Any) -> tuple:
         return (e.code, (e.details or {}).get("errmsg"))
 
 
-@pytest.mark.backlog("RM-223")
+@pytest.mark.backlog_fixed("RM-223")
 def test_update_past_16mb_message(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 refuses an update that grows a document past 16 MB
     with 10334 (as here) and the message "Plan executor error during update :: caused by ::
