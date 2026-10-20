@@ -632,21 +632,21 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Backlog-ID: RM-222
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_insert_string_with_invalid_utf8
 - [ ] **`local.oplog.rs` entries are not mongod's shape.** Since
-      2026-10-20 a delete, a drop (`o2: {numRecords}`), a rename
-      (`stayTemp`), a one-index `createIndexes` and a `dropIndexes` read as
-      mongod 8.2.11 writes them (the view reshapes the stored entry; the
-      count is written at the drop). Open:
-      - an update is the change-stream description it serves
-        (`{updatedFields, removedFields, truncatedArrays}`, dotted paths)
-        where mongod logs its `$v: 2` diff (`u` / `i` / `s<field>`, arrays
-        as `{a: true, u<i>}`), which mongod derives from the operators it
-        applied (a `$pop` is the whole array under `u`). It cannot be
-        rebuilt from the stored description, which says neither which fields
-        are new nor which path parts are array indexes: the fix writes
-        mongod's diff at write time and derives the change stream's
-        description from it, as mongod does;
-      - a batch of inserts is one entry per document, where mongod groups
-        them into one `applyOps` entry with `stmtId`s;
+      2026-10-20 an update (mongod's `$v: 2` diff, stored beside the
+      change-stream description as `o.md`), a batch of inserts (one
+      `applyOps` per group of 500 documents or 256 KiB), a committed
+      transaction (one `applyOps` under its session), a multi-document
+      delete (`applyOps` batches of ten), a delete, a drop
+      (`o2: {numRecords}`), a rename (`stayTemp`), a one-index
+      `createIndexes` and a `dropIndexes` read as mongod 8.2.11 writes them,
+      with its `t` and `v`. Open:
+      - a retryable write's entries carry no session: mongod stamps them
+        with `lsid`, `txnNumber`, `stmtId` and a `prevOpTime` chain
+        (`multiOpType: 1` on an insert group, each insert its `stmtId`), and
+        a `findAndModify` with `needsRetryImage` (measured 8.2.11: a
+        multi-document update or delete carries none). The statement ids
+        have to reach storage through the retry paths in `session.rs`,
+        which re-run only a batch's fresh statements;
       - an index build over documents is one `createIndexes`, where mongod
         writes `startIndexBuild` / `commitIndexBuild` and rows in
         `config.system.indexBuilds`.

@@ -691,6 +691,173 @@ fn oplog_entry_is_user_write(e: &OplogEntry) -> bool {
     !matches!(db, "" | "admin" | "config" | "local")
 }
 
+/// The `o` of an update's oplog entry: `{$v: 2, diff, md}`. `diff` is the
+/// change-stream description change streams and replay read; `md` is
+/// mongod's own `$v: 2` diff of the same update, which `local.oplog.rs`
+/// shows in `diff`'s place (RM-224). A pipeline update's is mongod's
+/// document comparison; an operator update's is read back from the
+/// description over the pre-image.
+fn update_oplog_o(desc: Document, pre: &Document, post: &Document, pipeline: bool) -> Document {
+    let md = if pipeline {
+        secantus_core::diff::pipeline_oplog_diff(pre, post)
+    } else {
+        None
+    }
+    .unwrap_or_else(|| secantus_core::diff::oplog_diff(&desc, pre));
+    let mut o = Document::new();
+    o.insert("$v", 2i32);
+    o.insert("diff", Bson::Document(desc));
+    o.insert("md", Bson::Document(md));
+    o
+}
+
+/// The `local.oplog.rs` view of the stored entries, in order: each entry in
+/// mongod's shape ([`oplog_view_shape`]), the inserts of one group
+/// (`bg.g`, see `mark_insert_groups`) as the one `applyOps` entry mongod
+/// writes for them, and every entry carrying mongod's `t` (the term, 1 here)
+/// and `v` (2) after its `ts`.
+fn oplog_view_entries(entries: Vec<Document>) -> Vec<Document> {
+    let mut out = Vec::with_capacity(entries.len());
+    let mut iter = entries.into_iter().peekable();
+    while let Some(entry) = iter.next() {
+        // A transaction's writes, minted together at its commit, are the one
+        // `applyOps` entry mongod writes for it.
+        if let Some(txn) = txn_of(&entry) {
+            let mut run = vec![entry];
+            while iter.peek().and_then(txn_of) == Some(txn.clone()) {
+                run.push(iter.next().expect("peeked"));
+            }
+            out.push(transaction_view(run, txn));
+            continue;
+        }
+        let group = entry
+            .get_document("bg")
+            .ok()
+            .and_then(|bg| bg.get_i64("g").ok());
+        let shaped = match group {
+            Some(g) => {
+                let mut run = vec![entry];
+                while let Some(next) = iter.peek() {
+                    let same = next
+                        .get_document("bg")
+                        .ok()
+                        .and_then(|bg| bg.get_i64("g").ok())
+                        == Some(g);
+                    if !same {
+                        break;
+                    }
+                    run.push(iter.next().expect("peeked"));
+                }
+                apply_ops_view(run)
+            }
+            None => oplog_view_shape(&entry).unwrap_or(entry),
+        };
+        out.push(with_term_and_version(shaped));
+    }
+    out
+}
+
+/// The session and transaction number a transaction's write carries.
+fn txn_of(entry: &Document) -> Option<(Document, i64)> {
+    if !matches!(entry.get_str("op"), Ok("i" | "u" | "d")) {
+        return None;
+    }
+    Some((
+        entry.get_document("lsid").ok()?.clone(),
+        entry.get_i64("txnNumber").ok()?,
+    ))
+}
+
+/// A committed transaction as mongod 8.2.11 logs it: one `applyOps` entry
+/// holding its writes, under its session, with the start of its
+/// `prevOpTime` chain.
+fn transaction_view(run: Vec<Document>, (lsid, txn): (Document, i64)) -> Document {
+    let first = run[0].clone();
+    let ops: Vec<Bson> = run
+        .into_iter()
+        .map(|e| {
+            let e = oplog_view_shape(&e).unwrap_or(e);
+            let mut op = Document::new();
+            for k in ["op", "ns", "ui", "o", "o2"] {
+                if let Some(v) = e.get(k) {
+                    op.insert(k, v.clone());
+                }
+            }
+            Bson::Document(op)
+        })
+        .collect();
+    let mut out = bson::doc! {
+        "lsid": lsid,
+        "txnNumber": txn,
+        "op": "c",
+        "ns": "admin.$cmd",
+        "o": {"applyOps": ops},
+    };
+    if let Some(ts) = first.get("ts") {
+        out.insert("ts", ts.clone());
+        out.insert("t", 1_i64);
+        out.insert("v", 2_i64);
+    }
+    if let Some(wall) = first.get("wall") {
+        out.insert("wall", wall.clone());
+    }
+    out.insert(
+        "prevOpTime",
+        bson::doc! {"ts": bson::Timestamp { time: 0, increment: 0 }, "t": -1_i64},
+    );
+    out
+}
+
+/// One `applyOps` entry for a group of inserts or of a batched delete's
+/// deletes, as mongod writes it outside a retryable write: the writes under
+/// the first one's time.
+fn apply_ops_view(run: Vec<Document>) -> Document {
+    let first = run[0].clone();
+    let ops: Vec<Bson> = run
+        .into_iter()
+        .map(|e| {
+            let e = oplog_view_shape(&e).unwrap_or(e);
+            let mut op = Document::new();
+            for k in ["op", "ns", "ui", "o", "o2"] {
+                if let Some(v) = e.get(k) {
+                    op.insert(k, v.clone());
+                }
+            }
+            // mongod adds each insert's `stmtId` only for a retryable write,
+            // whose session fields no entry here carries yet (RM-224).
+            Bson::Document(op)
+        })
+        .collect();
+    let mut out = bson::doc! {
+        "op": "c",
+        "ns": "admin.$cmd",
+        "o": {"applyOps": ops},
+    };
+    for k in ["ts", "wall"] {
+        if let Some(v) = first.get(k) {
+            out.insert(k, v.clone());
+        }
+    }
+    out
+}
+
+/// `entry` with mongod's `t` and `v` after its `ts`, where it has neither.
+fn with_term_and_version(entry: Document) -> Document {
+    if entry.contains_key("t") || !entry.contains_key("ts") {
+        return entry;
+    }
+    let mut out = Document::new();
+    for (k, v) in entry {
+        let is_ts = k == "ts";
+        out.insert(k, v);
+        if is_ts {
+            out.insert("t", 1_i64);
+            out.insert("v", 2_i64);
+        }
+    }
+    out
+}
+
 /// An entry as mongod 8.2.11 writes it, where the stored form differs in a
 /// way the entry alone settles (RM-224): a delete has no `o2`; a rename says
 /// `stayTemp: false`; a one-index `createIndexes` is that index's spec; a
@@ -698,6 +865,13 @@ fn oplog_entry_is_user_write(e: &OplogEntry) -> bool {
 /// stored form stays, as change streams and replay read it.
 fn oplog_view_shape(entry: &Document) -> Option<Document> {
     let op = entry.get_str("op").ok()?;
+    if op == "u" {
+        let o = entry.get_document("o").ok()?;
+        let md = o.get_document("md").ok()?;
+        let mut out = entry.clone();
+        out.insert("o", bson::doc! {"$v": 2, "diff": md.clone()});
+        return Some(out);
+    }
     if op == "d" && entry.contains_key("o2") {
         let mut out = entry.clone();
         out.remove("o2");
@@ -3197,6 +3371,9 @@ thread_local! {
     /// documents in, each batch in reverse (`with_reversed_delete_batches`).
     /// 0: in the order they were read.
     static DELETE_BATCH: Cell<usize> = const { Cell::new(0) };
+    /// The `applyOps` group each document of a batched multi-delete belongs
+    /// to, by RecordId (only batches of two or more), for `local.oplog.rs`.
+    static DELETE_GROUPS: RefCell<HashMap<i64, i64>> = RefCell::new(HashMap::new());
 }
 
 /// Run `f` with an unbounded delete outside a transaction removing its
@@ -4368,6 +4545,9 @@ pub struct Storage {
     /// `None`. Persisted in `config.user_writes_critical_sections` and read
     /// back at open.
     user_write_block: std::sync::RwLock<Option<String>>,
+    /// Ids for the groups of inserts mongod logs as one `applyOps`
+    /// (`local.oplog.rs` presents each group as that one entry).
+    insert_groups: AtomicI64,
 }
 
 /// Strictly-monotonic oplog bookkeeping: the next int64 seq to mint and the last
@@ -6324,6 +6504,7 @@ impl Storage {
             closed: AtomicBool::new(false),
             checkpoint_gate: Arc::new(Mutex::new(())),
             user_write_block: std::sync::RwLock::new(None),
+            insert_groups: AtomicI64::new(0),
         };
         // Before anything looks a key up: crash recovery below replays writes
         // by `_id`.
@@ -7413,15 +7594,12 @@ impl Storage {
         }
         let rows = self.read_oplog(0, usize::MAX)?;
         let mut out: Vec<(Document, Vec<u8>)> = Vec::with_capacity(rows.len());
+        let mut decoded = Vec::with_capacity(rows.len());
         for (_seq, blob) in rows {
-            let d = decode_doc(&blob)?;
-            let (d, blob) = match oplog_view_shape(&d) {
-                Some(shaped) => {
-                    let bytes = encode_doc(&shaped)?;
-                    (shaped, bytes)
-                }
-                None => (d, blob),
-            };
+            decoded.push(decode_doc(&blob)?);
+        }
+        for d in oplog_view_entries(decoded) {
+            let blob = encode_doc(&d)?;
             if filter.is_empty()
                 || query_matches(&d, filter, vars, coll_opt).map_err(query_fault)?
             {
@@ -8484,6 +8662,45 @@ impl Storage {
         entry.insert("ns", "");
         entry.insert("o", Bson::Document(data));
         self.emit_oplog(&session, vec![entry], vec![None])
+    }
+
+    /// Mark the entries of an insert batch that mongod logs together as one
+    /// `applyOps`: documents in groups that close at 500 documents or once
+    /// they hold 256 KiB, a group of one being a plain insert, and a group
+    /// in which any document failed being single inserts (mongod retries it
+    /// one document at a time). Measured on mongod 8.2.11. Each marked entry
+    /// carries `bg: {g, s}`, its group and its statement index, which only
+    /// the `local.oplog.rs` view reads.
+    fn mark_insert_groups(
+        &self,
+        outcomes: &[(usize, Option<usize>)],
+        base_index: usize,
+        entries: &mut [OplogEntry],
+    ) {
+        const MAX_DOCS: usize = 500;
+        const MAX_BYTES: usize = 256 * 1024;
+        let mut start = 0;
+        while start < outcomes.len() {
+            let mut end = start;
+            let mut bytes = 0;
+            while end < outcomes.len() && end - start < MAX_DOCS && bytes < MAX_BYTES {
+                bytes += outcomes[end].0;
+                end += 1;
+            }
+            let group = &outcomes[start..end];
+            if group.len() > 1 && group.iter().all(|(_, pos)| pos.is_some()) {
+                let id = self.insert_groups.fetch_add(1, Ordering::Relaxed);
+                for (k, (_, pos)) in group.iter().enumerate() {
+                    if let Some(OplogEntry::Raw(buf)) = pos.and_then(|p| entries.get_mut(p)) {
+                        let mut bg = bson::RawDocumentBuf::new();
+                        bg.append("g", id);
+                        bg.append("s", (base_index + start + k) as i32);
+                        buf.append("bg", bg);
+                    }
+                }
+            }
+            start = end;
+        }
     }
 
     /// Append a command entry `{op: "c", ns, o}` that changes no data, as
@@ -10235,11 +10452,15 @@ impl Storage {
                 let mut errors: Vec<Document> = Vec::new();
                 let mut oplog_entries: Vec<OplogEntry> = Vec::new();
                 let mut stopped = false;
+                // Each document's outcome, for mongod's insert groups: its
+                // size, and its entry's position when it was written.
+                let mut outcomes: Vec<(usize, Option<usize>)> = Vec::with_capacity(docs.len());
                 let doc_cur =
                     session.open_cursor(&doc_table_for(db, coll), Some("overwrite=false"))?;
                 let nat_cur = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
                 for (offset, doc_bytes) in docs.iter().enumerate() {
                     let index = base_index + offset;
+                    outcomes.push((doc_bytes.len(), None));
                     let mut doc = decode_doc(doc_bytes)?;
                     let assigned_id = !doc.contains_key("_id");
                     if assigned_id {
@@ -10417,6 +10638,9 @@ impl Storage {
                         // re-encode of the document body (the oplog hot-path win);
                         // `o2` is the tiny `{_id}`. `doc` is not used afterward.
                         let o2 = encode_id_doc(&id)?;
+                        if let Some(last) = outcomes.last_mut() {
+                            last.1 = Some(oplog_entries.len());
+                        }
                         oplog_entries.push(OplogEntry::Raw(Self::oplog_entry_crud(
                             "i",
                             &ns,
@@ -10425,6 +10649,9 @@ impl Storage {
                             &o2,
                         )?));
                     }
+                }
+                if oplog_on {
+                    self.mark_insert_groups(&outcomes, base_index, &mut oplog_entries);
                 }
                 // Capped-collection eviction: drop oldest non-fresh docs until within
                 // the collection's `size` / `max` bounds. Inserts have no pre-image, so
@@ -17962,9 +18189,7 @@ impl Storage {
                 let o_bytes: &[u8] = match delta {
                     None => &new_blob,
                     Some(diff) => {
-                        let mut o = Document::new();
-                        o.insert("$v", 2i32);
-                        o.insert("diff", Bson::Document(diff));
+                        let o = update_oplog_o(diff, &doc, &new, update_spec.is_none());
                         o_owned = encode_doc(&o)?;
                         &o_owned
                     }
@@ -18137,9 +18362,7 @@ impl Storage {
                             let o_bytes: &[u8] = match delta {
                                 None => &new_blob,
                                 Some(diff) => {
-                                    let mut o = Document::new();
-                                    o.insert("$v", 2i32);
-                                    o.insert("diff", Bson::Document(diff));
+                                    let o = update_oplog_o(diff, &doc, &new, update_spec.is_none());
                                     o_owned = encode_doc(&o)?;
                                     &o_owned
                                 }
@@ -18516,6 +18739,25 @@ impl Storage {
             }
             rids
         };
+        // Each batch of two or more is one `applyOps` entry on mongod.
+        struct ClearGroups;
+        impl Drop for ClearGroups {
+            fn drop(&mut self) {
+                DELETE_GROUPS.with(|g| g.borrow_mut().clear());
+            }
+        }
+        let _clear = ClearGroups;
+        if let batch @ 1.. = DELETE_BATCH.with(Cell::get) {
+            DELETE_GROUPS.with(|g| {
+                let mut g = g.borrow_mut();
+                for chunk in rids.chunks(batch).filter(|c| c.len() > 1) {
+                    let id = self.insert_groups.fetch_add(1, Ordering::Relaxed);
+                    for rid in chunk {
+                        g.insert(*rid, id);
+                    }
+                }
+            });
+        }
         let mut deleted = 0usize;
         let mut idx = 0usize;
         while idx < rids.len() {
@@ -18612,13 +18854,13 @@ impl Storage {
             chunk_bytes += blob.len();
             if oplog_on {
                 let id_doc = encode_id_doc(&doc.get("_id").cloned().unwrap_or(Bson::Null))?;
-                oplog_entries.push(OplogEntry::Raw(Self::oplog_entry_crud(
-                    "d",
-                    &ns,
-                    ui.as_deref(),
-                    &id_doc,
-                    &id_doc,
-                )?));
+                let mut entry = Self::oplog_entry_crud("d", &ns, ui.as_deref(), &id_doc, &id_doc)?;
+                if let Some(g) = DELETE_GROUPS.with(|g| g.borrow().get(&recordid).copied()) {
+                    let mut bg = bson::RawDocumentBuf::new();
+                    bg.append("g", g);
+                    entry.append("bg", bg);
+                }
+                oplog_entries.push(OplogEntry::Raw(entry));
                 pre_images.push(if preimages_on {
                     chunk_bytes += blob.len();
                     Some(blob.clone())

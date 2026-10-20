@@ -356,7 +356,7 @@ pub fn compute_update_description_for(
     };
     walk_docs(pre, post, "", &[], &mut acc)?;
     if let Some(update) = update {
-        report_whole_values(update, post, &mut acc);
+        report_whole_values(update, pre, post, &mut acc);
     }
     let mut out = Document::new();
     out.insert("updatedFields".to_string(), Bson::Document(acc.updated));
@@ -386,12 +386,23 @@ pub fn compute_update_description_for(
 /// Applied after the value diff: every entry at or below such a path collapses
 /// into one entry for the path itself. Positional (`$`, `$[]`, `$[<id>]`) paths
 /// are left to the diff, which already reports the resolved element.
-fn report_whole_values(update: &Document, post: &Document, acc: &mut Acc) {
+fn report_whole_values(update: &Document, pre: &Document, post: &Document, acc: &mut Acc) {
     let mut targets: Vec<(String, bool)> = Vec::new();
     for (op, payload) in update {
         let Bson::Document(fields) = payload else {
             continue;
         };
+        // An array updated through `$[]` or `$[<id>]` is reported whole when
+        // more than one of its elements changed, and element by element when
+        // one did: mongod's array update node logs the whole array once it
+        // modified several (measured 8.2.11, 2026-10-20).
+        for path in fields.keys() {
+            if let Some(prefix) = all_positional_prefix(path) {
+                if changed_elements(pre, post, &prefix) > 1 {
+                    targets.push((prefix, false));
+                }
+            }
+        }
         match op.as_str() {
             "$set" => {
                 for path in fields.keys() {
@@ -454,6 +465,34 @@ fn report_whole_values(update: &Document, post: &Document, acc: &mut Acc) {
             record_ambiguous(&path, &segments, acc);
         }
     }
+}
+
+/// The array path before a path's first `$[]` / `$[<id>]`, when nothing
+/// positional precedes it.
+fn all_positional_prefix(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('.').collect();
+    let at = parts.iter().position(|p| p.starts_with("$["))?;
+    if at == 0 || parts[..at].iter().any(|p| p.starts_with('$')) {
+        return None;
+    }
+    Some(parts[..at].join("."))
+}
+
+/// How many elements of the array at `path` differ between `pre` and `post`
+/// (an element added or removed counts).
+fn changed_elements(pre: &Document, post: &Document, path: &str) -> usize {
+    let (Some(Bson::Array(a)), Some(Bson::Array(b))) = (
+        crate::paths::get_path(pre, path),
+        crate::paths::get_path(post, path),
+    ) else {
+        return 0;
+    };
+    (0..a.len().max(b.len()))
+        .filter(|&i| match (a.get(i), b.get(i)) {
+            (Some(x), Some(y)) => !binary_equal(x, y),
+            _ => true,
+        })
+        .count()
 }
 
 /// `path`'s segments typed against `doc`: an Int32 where the parent is an
@@ -755,6 +794,17 @@ pub fn pipeline_update_description(pre: &Document, post: &Document) -> Option<Do
         out.insert("disambiguatedPaths", Bson::Document(acc.disambiguated));
     }
     Some(out)
+}
+
+/// mongod's own `$v: 2` oplog diff for a PIPELINE update of `pre` into
+/// `post` (`computeOplogDiff`), or `None` when mongod logs a full
+/// replacement -- the same decision [`pipeline_update_description`] makes.
+pub fn pipeline_oplog_diff(pre: &Document, post: &Document) -> Option<Document> {
+    let node = Node::Doc(diff_doc(pre, post).unwrap_or_default());
+    if node.size() + DELTA_OPLOG_OVERHEAD >= bson_size(&Bson::Document(post.clone())) {
+        return None;
+    }
+    Some(node.serialize())
 }
 
 /// Apply a `$v: 2` `updateDescription` (`{updatedFields, removedFields,
@@ -1075,5 +1125,339 @@ mod tests {
             let rolled = apply_update_description(pre.clone(), &diff).expect("apply");
             assert_eq!(rolled, post, "roundtrip failed for pre={pre:?}");
         }
+    }
+}
+
+/// mongod's own `$v: 2` oplog diff for an update described by `desc` (the
+/// `{updatedFields, removedFields, truncatedArrays}` this module computes)
+/// over the document `pre` (RM-224).
+///
+/// mongod derives a change event's description from its oplog diff, and the
+/// description here is measured to match those events, so the diff is the
+/// description read back: an updated path becomes `u` where the field existed
+/// in `pre` and `i` where it did not, each path part stepping into a
+/// sub-document (`s<field>`) or, where `pre` holds an array there, an array
+/// diff (`{a: true, u<i>, s<i>}`); a removed field is `d`; a truncated array
+/// is the array diff's `l`. Sections come in mongod's order -- `d`, `u`, `i`,
+/// then the sub-diffs, each by field name; an array's `l` first, then its
+/// entries by index. Measured against mongod 8.2.11 over 40 operator updates.
+pub fn oplog_diff(desc: &Document, pre: &Document) -> Document {
+    let mut root = OpNode::Doc(OpDocDiff::default());
+    let typed = desc.get_document("disambiguatedPaths").ok();
+    let parts_of = |path: &str| -> Vec<OpPart> {
+        if let Some(parts) = typed.and_then(|t| t.get_array(path).ok()) {
+            return parts
+                .iter()
+                .map(|p| match p {
+                    Bson::String(s) => OpPart::Field(s.clone()),
+                    other => OpPart::Index(
+                        other
+                            .as_i64()
+                            .or(other.as_i32().map(i64::from))
+                            .unwrap_or(0) as usize,
+                    ),
+                })
+                .collect();
+        }
+        resolve_parts(pre, path)
+    };
+    if let Ok(updated) = desc.get_document("updatedFields") {
+        for (path, value) in updated {
+            root.set(&parts_of(path), Some(pre), value.clone());
+        }
+    }
+    if let Ok(removed) = desc.get_array("removedFields") {
+        for path in removed.iter().filter_map(Bson::as_str) {
+            root.remove(&parts_of(path));
+        }
+    }
+    if let Ok(truncated) = desc.get_array("truncatedArrays") {
+        for t in truncated.iter().filter_map(Bson::as_document) {
+            let (Ok(field), Some(size)) = (
+                t.get_str("field"),
+                t.get("newSize")
+                    .and_then(|v| v.as_i64().or(v.as_i32().map(i64::from))),
+            ) else {
+                continue;
+            };
+            root.truncate(&parts_of(field), Some(pre), size);
+        }
+    }
+    match root {
+        OpNode::Doc(d) => d.render(),
+        OpNode::Arr(_) => Document::new(),
+    }
+}
+
+/// A path part: a field name, or an index into an array.
+#[derive(Clone, Debug)]
+enum OpPart {
+    Field(String),
+    Index(usize),
+}
+
+/// The parts of a dotted `path` over `doc`: a part is an index where the
+/// value it steps into is an array and the part is a number.
+fn resolve_parts(doc: &Document, path: &str) -> Vec<OpPart> {
+    let mut parts = Vec::new();
+    let mut here: Option<Bson> = Some(Bson::Document(doc.clone()));
+    for p in path.split('.') {
+        let next = match &here {
+            Some(Bson::Array(items)) => match p.parse::<usize>() {
+                Ok(i) => {
+                    parts.push(OpPart::Index(i));
+                    items.get(i).cloned()
+                }
+                Err(_) => {
+                    parts.push(OpPart::Field(p.to_string()));
+                    None
+                }
+            },
+            Some(Bson::Document(d)) => {
+                parts.push(OpPart::Field(p.to_string()));
+                d.get(p).cloned()
+            }
+            _ => {
+                parts.push(OpPart::Field(p.to_string()));
+                None
+            }
+        };
+        here = next;
+    }
+    parts
+}
+
+#[derive(Default)]
+struct OpDocDiff {
+    d: BTreeSet<String>,
+    u: BTreeMap<String, Bson>,
+    i: BTreeMap<String, Bson>,
+    s: BTreeMap<String, OpNode>,
+}
+
+#[derive(Default)]
+struct OpArrDiff {
+    l: Option<i64>,
+    u: BTreeMap<usize, Bson>,
+    s: BTreeMap<usize, OpNode>,
+}
+
+enum OpNode {
+    Doc(OpDocDiff),
+    Arr(OpArrDiff),
+}
+
+impl OpNode {
+    /// The child node a path steps through at `part`, made for what `pre`
+    /// holds there.
+    fn child(&mut self, part: &OpPart, pre_child: Option<&Bson>) -> &mut OpNode {
+        let fresh = || match pre_child {
+            Some(Bson::Array(_)) => OpNode::Arr(OpArrDiff::default()),
+            _ => OpNode::Doc(OpDocDiff::default()),
+        };
+        match (self, part) {
+            (OpNode::Doc(d), OpPart::Field(f)) => d.s.entry(f.clone()).or_insert_with(fresh),
+            (OpNode::Doc(d), OpPart::Index(i)) => d.s.entry(i.to_string()).or_insert_with(fresh),
+            (OpNode::Arr(a), OpPart::Index(i)) => a.s.entry(*i).or_insert_with(fresh),
+            (OpNode::Arr(a), OpPart::Field(f)) => {
+                a.s.entry(f.parse().unwrap_or(0)).or_insert_with(fresh)
+            }
+        }
+    }
+
+    fn set(&mut self, parts: &[OpPart], pre: Option<&Document>, value: Bson) {
+        self.set_in(
+            parts,
+            pre.map(|d| Bson::Document(d.clone())).as_ref(),
+            value,
+        );
+    }
+
+    fn set_in(&mut self, parts: &[OpPart], pre: Option<&Bson>, value: Bson) {
+        let Some((first, rest)) = parts.split_first() else {
+            return;
+        };
+        let pre_child = step(pre, first);
+        if rest.is_empty() {
+            match (self, first) {
+                (OpNode::Doc(d), part) => {
+                    let name = part_name(part);
+                    if pre_child.is_some() {
+                        d.u.insert(name, value);
+                    } else {
+                        d.i.insert(name, value);
+                    }
+                }
+                (OpNode::Arr(a), part) => {
+                    a.u.insert(part_index(part), value);
+                }
+            }
+            return;
+        }
+        if pre_child.is_none() {
+            // A missing parent: mongod inserts the sub-document it builds.
+            let mut built = value;
+            for part in rest.iter().rev() {
+                built = Bson::Document(bson::doc! { part_name(part): built });
+            }
+            match (self, first) {
+                (OpNode::Doc(d), part) => {
+                    d.i.insert(part_name(part), built);
+                }
+                (OpNode::Arr(a), part) => {
+                    a.u.insert(part_index(part), built);
+                }
+            }
+            return;
+        }
+        let pre_child = pre_child.cloned();
+        self.child(first, pre_child.as_ref())
+            .set_in(rest, pre_child.as_ref(), value);
+    }
+
+    fn remove(&mut self, parts: &[OpPart]) {
+        let Some((first, rest)) = parts.split_first() else {
+            return;
+        };
+        if rest.is_empty() {
+            if let OpNode::Doc(d) = self {
+                d.d.insert(part_name(first));
+            }
+            return;
+        }
+        self.child(first, None).remove(rest);
+    }
+
+    fn truncate(&mut self, parts: &[OpPart], pre: Option<&Document>, size: i64) {
+        let pre = pre.map(|d| Bson::Document(d.clone()));
+        let mut node = self;
+        let mut here = pre;
+        for part in parts {
+            let next = step(here.as_ref(), part).cloned();
+            node = node.child(part, Some(&Bson::Array(Vec::new())));
+            here = next;
+        }
+        if let OpNode::Arr(a) = node {
+            a.l = Some(size);
+        }
+    }
+
+    fn render(self) -> Bson {
+        match self {
+            OpNode::Doc(d) => Bson::Document(d.render()),
+            OpNode::Arr(a) => {
+                let mut out = bson::doc! {"a": true};
+                if let Some(l) = a.l {
+                    match i32::try_from(l) {
+                        Ok(n) => out.insert("l", n),
+                        Err(_) => out.insert("l", l),
+                    };
+                }
+                let mut entries: BTreeMap<usize, (String, Bson)> = BTreeMap::new();
+                for (i, v) in a.u {
+                    entries.insert(i, (format!("u{i}"), v));
+                }
+                for (i, n) in a.s {
+                    entries.insert(i, (format!("s{i}"), n.render()));
+                }
+                for (_, (k, v)) in entries {
+                    out.insert(k, v);
+                }
+                Bson::Document(out)
+            }
+        }
+    }
+}
+
+impl OpDocDiff {
+    fn render(self) -> Document {
+        let mut out = Document::new();
+        if !self.d.is_empty() {
+            out.insert(
+                "d",
+                self.d
+                    .into_iter()
+                    .map(|k| (k, Bson::Boolean(false)))
+                    .collect::<Document>(),
+            );
+        }
+        if !self.u.is_empty() {
+            out.insert("u", self.u.into_iter().collect::<Document>());
+        }
+        if !self.i.is_empty() {
+            out.insert("i", self.i.into_iter().collect::<Document>());
+        }
+        for (k, n) in self.s {
+            out.insert(format!("s{k}"), n.render());
+        }
+        out
+    }
+}
+
+fn step<'a>(here: Option<&'a Bson>, part: &OpPart) -> Option<&'a Bson> {
+    match (here?, part) {
+        (Bson::Document(d), OpPart::Field(f)) => d.get(f),
+        (Bson::Document(d), OpPart::Index(i)) => d.get(i.to_string()),
+        (Bson::Array(a), OpPart::Index(i)) => a.get(*i),
+        _ => None,
+    }
+}
+
+fn part_name(part: &OpPart) -> String {
+    match part {
+        OpPart::Field(f) => f.clone(),
+        OpPart::Index(i) => i.to_string(),
+    }
+}
+
+fn part_index(part: &OpPart) -> usize {
+    match part {
+        OpPart::Index(i) => *i,
+        OpPart::Field(f) => f.parse().unwrap_or(0),
+    }
+}
+
+#[cfg(test)]
+mod oplog_diff_tests {
+    use super::*;
+    use bson::doc;
+
+    fn desc(updated: Document, removed: Vec<&str>) -> Document {
+        doc! {
+            "updatedFields": updated,
+            "removedFields": removed.into_iter().map(Bson::from).collect::<Vec<_>>(),
+            "truncatedArrays": [],
+        }
+    }
+
+    /// mongod 8.2.11's diffs for the same updates.
+    #[test]
+    fn reads_the_description_back_as_mongods_diff() {
+        let pre =
+            doc! {"_id": 1, "x": 1, "s": "a", "a": {"b": 1}, "arr": [1, 2, 3], "objs": [{"k": 1}]};
+        assert_eq!(
+            oplog_diff(
+                &desc(doc! {"x": 2, "new": 1, "a.b": 3, "arr.0": 7}, vec!["s"]),
+                &pre
+            ),
+            doc! {"d": {"s": false}, "u": {"x": 2}, "i": {"new": 1}, "sa": {"u": {"b": 3}}, "sarr": {"a": true, "u0": 7}}
+        );
+        assert_eq!(
+            oplog_diff(&desc(doc! {"q": {"r": {"s": 1}}}, vec![]), &pre),
+            doc! {"i": {"q": {"r": {"s": 1}}}}
+        );
+        assert_eq!(
+            oplog_diff(&desc(doc! {"objs.0.k": 10}, vec![]), &pre),
+            doc! {"sobjs": {"a": true, "s0": {"u": {"k": 10}}}}
+        );
+        let truncated = doc! {
+            "updatedFields": {},
+            "removedFields": [],
+            "truncatedArrays": [{"field": "arr", "newSize": 2}],
+        };
+        assert_eq!(
+            oplog_diff(&truncated, &pre),
+            doc! {"sarr": {"a": true, "l": 2}}
+        );
     }
 }

@@ -4,12 +4,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import re
 from typing import Any
 
+import pymongo
 import pytest
 from bson import Binary, Timestamp
+from pymongo.errors import PyMongoError
 
 from tests.backlog.test_rm_057_084 import mongod_rs  # noqa: F401 - fixture
 
@@ -189,29 +192,120 @@ def test_oplog_natural_descending_reads_the_newest_entry(rust_mongo: Any, mongod
 # ------------------------------------------------- RM-224 oplog entry shapes --
 
 
-def _oplog_entries(client: Any) -> list:
-    """The `local.oplog.rs` entries a few ordinary writes leave, without the
-    fields that differ run to run."""
+UPDATES = [
+    {"$set": {"x": 2}},
+    {"$set": {"new": 1}},
+    {"$set": {"a.b": 2}},
+    {"$set": {"a.c.d": 5}},
+    {"$set": {"q.r.s": 1}},
+    {"$unset": {"a.b": ""}},
+    {"$rename": {"x": "y"}},
+    {"$push": {"arr": {"$each": [4, 5]}}},
+    {"$push": {"arr": {"$each": [0], "$position": 0}}},
+    {"$pop": {"arr": 1}},
+    {"$pull": {"arr": 2}},
+    {"$set": {"arr.5": 50}},
+    {"$set": {"objs.0.k": 10}},
+    {"$set": {"objs.$[].k": 0}},
+    {"$set": {"x": 2, "a.b": 3, "arr.0": 7, "new": 1}, "$unset": {"s": ""}},
+    {"$set": {"arr": [1, 2, 3, 4]}},
+]
+
+
+def _update_entries(client: Any) -> list:
+    """The `o` each update leaves in `local.oplog.rs`."""
+    out = []
+    base = {
+        "_id": 1,
+        "x": 1,
+        "s": "a",
+        "a": {"b": 1, "c": {"d": 1}},
+        "arr": [1, 2, 3],
+        "objs": [{"k": 1}, {"k": 2}],
+    }
+    for update in UPDATES:
+        client.drop_database("rm224")
+        client.rm224.c.insert_one(base)
+        start = client.local["oplog.rs"].find_one(sort=[("$natural", -1)])["ts"]
+        client.rm224.c.update_one({"_id": 1}, update)
+        entry = client.local["oplog.rs"].find_one(
+            {"ts": {"$gt": start}, "ns": "rm224.c", "op": "u"}
+        )
+        out.append(entry["o"] if entry else None)
+    client.drop_database("rm224")
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-224")
+def test_oplog_update_entries_are_mongods_diff(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """mongod 8.2.11 logs an update as its `$v: 2` diff: `u` / `i` / `d` by
+    whether the field existed, `s<field>` into documents and arrays, a whole
+    array where `$pop`, `$pull`, `$position` or a `$[]` that changed several
+    elements rewrote it."""
+    assert _update_entries(rust_mongo) == _update_entries(mongod_rs)
+
+
+def _insert_groups(client: Any) -> list:
+    """How batches of inserts are logged, outside a retryable write: one
+    `applyOps` per group, or plain inserts."""
+    host, port = client.address
+    plain = pymongo.MongoClient(host, port, directConnection=True, retryWrites=False)
+    db = plain.rm224
+    out = []
+    for docs, ordered in [
+        ([{"_id": 1}], True),
+        ([{"_id": i} for i in range(3)], True),
+        ([{"_id": i} for i in range(501)], True),
+        ([{"_id": i, "s": "x" * 100_000} for i in range(6)], True),
+        ([{"_id": i, "s": "x" * 300_000} for i in range(3)], True),
+        ([{"_id": 1}, {"_id": "pre"}, {"_id": 2}, {"_id": 3}], False),
+        ([{"_id": 1}, {"_id": "pre"}, {"_id": 2}], True),
+    ]:
+        plain.drop_database("rm224")
+        db.c.insert_one({"_id": "pre"})
+        start = plain.local["oplog.rs"].find_one(sort=[("$natural", -1)])["ts"]
+        # A batch with a duplicate fails; what it logged is the point.
+        with contextlib.suppress(PyMongoError):
+            db.c.insert_many(docs, ordered=ordered)
+        out.append(
+            [
+                (e["op"], len(e["o"]["applyOps"]) if e["op"] == "c" else 1)
+                for e in plain.local["oplog.rs"].find({"ts": {"$gt": start}, "op": {"$ne": "n"}})
+                if e["ns"] in ("rm224.c", "admin.$cmd")
+            ]
+        )
+    plain.drop_database("rm224")
+    plain.close()
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-224")
+def test_oplog_insert_batches_are_mongods_apply_ops(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """mongod 8.2.11 logs a batch of inserts as `applyOps` entries of up to
+    500 documents or 256 KiB, one document as a plain insert, and a batch
+    with a failed document as single inserts."""
+    assert _insert_groups(rust_mongo) == _insert_groups(mongod_rs)
+
+
+def _retryable_insert_fields(client: Any) -> list:
     db = client.rm224
     client.drop_database("rm224")
-    db.c.insert_one({"_id": 1, "x": 1, "a": {"b": 1}})
+    db.create_collection("c")
     start = client.local["oplog.rs"].find_one(sort=[("$natural", -1)])["ts"]
-    db.c.update_one({"_id": 1}, {"$set": {"x": 2, "a.b": 2, "y": 1}})
-    db.c.delete_one({"_id": 1})
-    db.c.drop()
-    entries = [
-        {k: e[k] for k in ("op", "ns", "o", "o2") if k in e}
-        for e in client.local["oplog.rs"].find({"ts": {"$gt": start}, "op": {"$ne": "n"}})
+    db.c.insert_one({"_id": 1})
+    fields = [
+        sorted(e.keys())
+        for e in client.local["oplog.rs"].find({"ts": {"$gt": start}, "ns": "rm224.c"})
     ]
     client.drop_database("rm224")
-    return entries
+    return fields
 
 
 @pytest.mark.backlog("RM-224")
 def test_oplog_entries_have_mongods_shape(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
-    """mongod 8.2.11 logs an update as its `$v: 2` diff (`u` / `i` / `s<field>`
-    sections), a delete with no `o2`, and a drop with `o2: {numRecords}`."""
-    assert _oplog_entries(rust_mongo) == _oplog_entries(mongod_rs)
+    """mongod 8.2.11 stamps a retryable write's entries with its session:
+    `lsid`, `txnNumber`, `stmtId` and `prevOpTime`."""
+    assert _retryable_insert_fields(rust_mongo) == _retryable_insert_fields(mongod_rs)
 
 
 def _ddl_entries(client: Any) -> list:
@@ -246,3 +340,64 @@ def test_oplog_ddl_and_delete_entries_have_mongods_shape(rust_mongo: Any, mongod
     the spec (`v`, `unique`, `hidden` first); `dropIndexes` keeps the spec in
     `o2`; a rename says `stayTemp: false`; a drop has `o2: {numRecords}`."""
     assert _ddl_entries(rust_mongo) == _ddl_entries(mongod_rs)
+
+
+def _transaction_entries(client: Any) -> list:
+    db = client.rm224
+    client.drop_database("rm224")
+    db.create_collection("c")
+    start = client.local["oplog.rs"].find_one(sort=[("$natural", -1)])["ts"]
+    with client.start_session() as s, s.start_transaction():
+        db.c.insert_one({"_id": 1}, session=s)
+        db.c.update_one({"_id": 1}, {"$set": {"x": 1}}, session=s)
+        db.c.delete_one({"_id": 1}, session=s)
+    entries = [
+        (
+            e["op"],
+            e["ns"],
+            sorted(e.keys()),
+            [(o["op"], o["o"]) for o in e["o"].get("applyOps", [])],
+        )
+        for e in client.local["oplog.rs"].find({"ts": {"$gt": start}, "op": {"$ne": "n"}})
+        if e["ns"] in ("rm224.c", "admin.$cmd")
+    ]
+    client.drop_database("rm224")
+    return entries
+
+
+@pytest.mark.backlog_fixed("RM-224")
+def test_oplog_transaction_is_one_apply_ops(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """mongod 8.2.11 logs a committed transaction as one `applyOps` entry
+    under its `lsid` / `txnNumber`, with `prevOpTime`."""
+    assert _transaction_entries(rust_mongo) == _transaction_entries(mongod_rs)
+
+
+def _delete_batches(client: Any) -> list:
+    out = []
+    for n, query in [(1, {}), (2, {}), (11, {}), (25, {"_id": {"$gte": 5}})]:
+        client.drop_database("rm224")
+        client.rm224.c.insert_many([{"_id": i} for i in range(n)])
+        start = client.local["oplog.rs"].find_one(sort=[("$natural", -1)])["ts"]
+        client.rm224.c.delete_many(query)
+        out.append(
+            [
+                (
+                    e["op"],
+                    [o["o"]["_id"] for o in e["o"]["applyOps"]]
+                    if e["op"] == "c"
+                    else e["o"]["_id"],
+                )
+                for e in client.local["oplog.rs"].find({"ts": {"$gt": start}, "op": {"$ne": "n"}})
+                if e["ns"] in ("rm224.c", "admin.$cmd")
+            ]
+        )
+    client.drop_database("rm224")
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-224")
+def test_oplog_batched_delete_is_apply_ops(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """mongod 8.2.11 logs a multi-document delete in batches of ten, each
+    one `applyOps` holding its deletes last-read first, a batch of one as a
+    plain delete."""
+    assert _delete_batches(rust_mongo) == _delete_batches(mongod_rs)
