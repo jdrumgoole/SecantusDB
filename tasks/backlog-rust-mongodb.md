@@ -679,13 +679,6 @@ inject (a panic, a power loss, a failing checkpoint).
       storage error turned into silence.
       Backlog-ID: RM-193
       Verify: none -- needs a failing WiredTiger write or BSON encode injected into the drainer
-- [ ] **Per-collection write locks are never freed.** `coll_locks` keeps an
-      entry for every namespace ever referenced (deliberately, so a lock's
-      identity survives drop and recreate), so memory grows with the number
-      of collections a long-running server has ever seen. Minor; a test that
-      creates and drops collections by the million is where it shows.
-      Backlog-ID: RM-194
-      Verify: none -- unbounded growth over a server's lifetime, not an answer
 
 ### 7.084 What an authenticated user may run -- 2026-10-14
 

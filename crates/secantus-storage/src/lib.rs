@@ -3944,7 +3944,15 @@ fn partition_compound_range_filter(filter: &Document) -> Option<(Document, Strin
 type EntryOps = Vec<(String, Vec<u8>)>;
 
 /// The per-collection write-lock registry: `(db, coll) → lock`.
-type CollLocks = HashMap<(String, String), Arc<Mutex<()>>>;
+/// The per-collection write locks, and the size at which the next new
+/// namespace prunes the unused ones.
+struct CollLocks {
+    map: HashMap<(String, String), Arc<Mutex<()>>>,
+    prune_at: usize,
+}
+
+/// The fewest entries at which `coll_lock` prunes.
+const COLL_LOCKS_PRUNE_FLOOR: usize = 1024;
 
 /// A capped collection's size and count, kept from one insert to the next so
 /// that bringing it back within bounds does not read the whole collection
@@ -4065,10 +4073,13 @@ pub struct Storage {
     /// rolls the dead transaction back.
     txn_session_pool: Mutex<Vec<crate::Session>>,
     /// Per-collection write locks: CRUD on `(db, coll)` serialises here so
-    /// writes to different collections run in parallel. Entries are created
-    /// on first reference and never removed — the lock identity for a
-    /// namespace stays stable across drop+recreate so in-flight writers and
-    /// DDL always contend on the same mutex. Mirrors `storage._coll_locks`.
+    /// writes to different collections run in parallel. Created on first
+    /// reference; an entry only the map still holds is pruned once the map
+    /// has grown ([`Storage::coll_lock`]). That keeps the identity rule --
+    /// everyone contending on a namespace contends on one mutex, across a
+    /// drop and recreate -- because a clone is taken only under the map's
+    /// own lock: an entry nobody else holds has nobody to stay identical
+    /// for. Mirrors `storage._coll_locks`.
     coll_locks: Mutex<CollLocks>,
     /// Bounds concurrent engine writes. Disabled unless `write_tickets` is set.
     write_tickets: crate::admission::Tickets,
@@ -6102,7 +6113,10 @@ impl Storage {
             home: home.to_string(),
             lock: Mutex::new(()),
             txn_session_pool: Mutex::new(Vec::new()),
-            coll_locks: Mutex::new(HashMap::new()),
+            coll_locks: Mutex::new(CollLocks {
+                map: HashMap::new(),
+                prune_at: COLL_LOCKS_PRUNE_FLOOR,
+            }),
             write_tickets: crate::admission::Tickets::new(opts.write_tickets.unwrap_or(0)),
             ddl_generation: AtomicU64::new(0),
             capped_tallies: Mutex::new(HashMap::new()),
@@ -6227,9 +6241,32 @@ impl Storage {
     /// `storage._coll_lock`.
     fn coll_lock(&self, db: &str, coll: &str) -> Arc<Mutex<()>> {
         let mut reg = self.coll_locks.lock().unwrap_or_else(|e| e.into_inner());
-        reg.entry((db.to_string(), coll.to_string()))
+        let key = (db.to_string(), coll.to_string());
+        if let Some(lock) = reg.map.get(&key) {
+            return lock.clone();
+        }
+        // A new namespace: past the threshold, first let go of the locks no
+        // one holds, so a server that has seen millions of collections does
+        // not keep a mutex for each (RM-194). The threshold doubles past what
+        // is still held, which keeps the pruning amortised.
+        if reg.map.len() >= reg.prune_at {
+            reg.map.retain(|_, lock| Arc::strong_count(lock) > 1);
+            reg.prune_at = (reg.map.len() * 2).max(COLL_LOCKS_PRUNE_FLOOR);
+        }
+        reg.map
+            .entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    /// How many per-collection locks are kept (for tests).
+    #[doc(hidden)]
+    pub fn coll_lock_count(&self) -> usize {
+        self.coll_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map
+            .len()
     }
 
     /// Whether the calling thread is inside a user (multi-document)
