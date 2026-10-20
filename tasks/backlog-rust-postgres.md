@@ -677,10 +677,7 @@ one beside it.
       (RP-050, RP-051, RP-052). `savepoints`, `txn_failed` and
       `in_transaction` are still reset path by path, and some of those
       differences are deliberate, so read each path's comments before
-      merging them. Also for a later slice (Joe, 2026-10-19): `run_batch`
-      drops a failed implicit rollback with `let _ = self.rollback_implicit()`
-      so it cannot mask the statement's own error. The rollback error is
-      then lost entirely; report it alongside the original instead.
+      merging them.
       Neither touches pgwire, the wire protocol or the on-disk format. No
       client sees a different answer, so this is not a divergence. It is
       here because a change to transaction or savepoint state currently has
