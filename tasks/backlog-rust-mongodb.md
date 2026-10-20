@@ -115,9 +115,10 @@ Single-node change streams are implemented and conformant for typical pymongo `w
       is rejected as mongod rejects it, `{code: 100, codeName:
       "CannotSatisfyWriteConcern", errmsg: "Not enough data-bearing nodes"}`,
       on both servers. What remains accept-and-ignore is `j` / `wtimeout` /
-      `w: "majority"` durability semantics, which a single node satisfies
-      trivially, so there is nothing left that a one-member deployment could
-      get wrong.
+      `w: "majority"` durability semantics. That was recorded as something a
+      single node satisfies trivially; it is not -- a `j: true` write is
+      acknowledged without a journal flush and is lost to a kill (RM-186,
+      §7.085, measured 2026-10-20).
 - **INHERENT (recorded): the C-driver gauge tests a single-node
       surrogate cannot pass.** `/change_stream/live/read_prefs`,
       `/Client/command_secondary`, `/Collection/aggregate/secondary` and the
@@ -575,6 +576,132 @@ These are explicit non-goals. Don't add them without a reason.
       Backlog-ID: RM-023
       Verify: tests/backlog/test_rm_001_028.py::test_slow_query_line_says_where_the_time_went
 
+### 7.085 The shared Rust storage, audited -- 2026-10-20
+
+A read-only audit of `secantus-storage` / `secantus-wt`, the layer both
+Rust servers use. The two items with gap tests were reproduced against
+mongod 8.2.11 with a `secantusd-rs` built from tree `af2629ec`; the rest
+were confirmed by reading the code path and need a fault no quick test can
+inject (a panic, a power loss, a failing checkpoint).
+
+- [ ] **A write acknowledged with `j: true` is lost when the server is
+      killed.** The Rust MongoDB server opens WiredTiger with
+      `transaction_sync=(enabled=false)` (`secantus-storage/src/lib.rs`
+      `DEFAULT_CONFIG`; `--sync-on-commit` is off by default) and nothing
+      ever calls `WT_SESSION::log_flush`: `j` is parsed and echoed back
+      (`secantus-commands/src/lib.rs`, the write-concern echo) and no flush
+      follows. Only the checkpoint thread syncs, every 60 s. Measured: 50
+      inserts each acknowledged with `{w: 1, j: true}`, then SIGKILL and
+      restart, five times -- 216 of the 250 writes were gone (four runs kept
+      0, 0, 1 and 33 of 50). mongod 8.2.11 kept all 250: `j: true` waits for
+      the journal to be synced before it acknowledges, and its journal
+      flusher bounds the loss for a write without `j` to about 100 ms
+      (`storage.journal.commitIntervalMs`). The Rust PostgreSQL server
+      measured the same loss and syncs every commit for it
+      (`secantus-pg/src/server.rs`). The fix is mongod's mechanism: flush
+      the log before acknowledging a `j: true` (or `w: "majority"`, which
+      implies it on a one-member set) write, and run a periodic journal
+      flush for the rest. (§3.2's "a single node satisfies `j` trivially"
+      was wrong; it now points here.)
+      Backlog-ID: RM-186
+      Verify: tests/backlog/test_rm_found_2026_10_20.py::test_j_true_write_survives_sigkill
+- [ ] **`createIndexes` on a collection bigger than the WiredTiger cache
+      can afford in one transaction never returns.** The backfill runs in a
+      single `with_statement_txn` (`Storage::create_index`), collecting every
+      entry before inserting any. When WiredTiger rolls that transaction back
+      because its dirty content cannot be evicted, `From<WtError>` asks for
+      the rollback reason only inside a user transaction, so an autocommit
+      build is classified `WriteConflict` and `retry_write_conflicts` retries
+      it with no limit. Measured: at `--cache-size 8M` a build over 5,000
+      300-byte documents logs `create_index retrying on write conflicts` until
+      the client gives up; at 32M so does one over 300,000 (still retrying at
+      120 s). The default 4G cache only moves the threshold. The build also
+      holds the global storage lock and the collection lock throughout, so
+      every DDL and every write to that collection waits on it. mongod 8.2.11
+      built an index over 1,000,000 such documents (345 MB of indexes) at its
+      minimum 0.25 GB cache, in 129 s: its builds sort externally within
+      `maxIndexBuildMemoryUsageMegabytes` and insert in batches while writes
+      continue. `drop_collection` had the same wedge and was fixed by
+      chunking (`tests/drop_chunk.rs`); an index build needs the same, and an
+      engine rollback outside a user transaction must not be retried forever.
+      Backlog-ID: RM-187
+      Verify: tests/backlog/test_rm_found_2026_10_20.py::test_index_build_completes_under_a_small_cache
+- [ ] **A WiredTiger panic while the server is running goes unnoticed.**
+      `secantus-wt`'s `Connection::open` passes a null event handler to
+      `wiredtiger_open`, and nothing checks for `WT_PANIC` (-31804). After a
+      panic every storage call fails, each reaching the client as an ordinary
+      error, while `hello` and `ping` still succeed, and `Drop` then tries to
+      checkpoint the panicked connection. mongod installs an event handler
+      that terminates the process on a panic (`fassert`), so a supervisor sees
+      it die. §7.069 covers a panic while OPENING a store, in CI.
+      Backlog-ID: RM-188
+      Verify: none -- needs a WiredTiger panic injected into a running server
+- [ ] **A failure while the store closes cannot reach the caller.** The
+      close-time oplog-meta persist and final checkpoint run inside
+      `impl Drop for Storage` and only `eprintln!` a failure; there is no
+      fallible `close()`. `secantus-wt`'s `Connection`, `Session` and `Cursor`
+      `Drop`s discard the return code of WiredTiger's own `close`. So a
+      daemon whose last checkpoint failed exits 0, against CLAUDE.md's rule
+      that a close-path error is the headline. A `Storage::close() ->
+      Result` the servers call on shutdown, with the exit status following
+      it, is the fix.
+      Backlog-ID: RM-189
+      Verify: none -- needs a checkpoint failure injected at shutdown
+- [ ] **Point-in-time-recovery oplog segments and backup archives are never
+      synced to disk.** `pitr_archive::write_segment` writes a `.part` file
+      and renames it with no `sync_all` on the file or the directory (there
+      is none anywhere in the crate); `prune_oplog` then deletes the archived
+      rows from WiredTiger, and the next checkpoint makes that delete durable
+      while the segment may still be only in the page cache. A power loss can
+      leave a missing or empty segment: a permanent gap in the recovery
+      chain. `create_archive` writes straight to `output_path` with no
+      temporary file, so a failure part-way leaves a truncated archive under
+      the final name.
+      Backlog-ID: RM-190
+      Verify: none -- needs a power loss between the segment write and the checkpoint
+- [ ] **`count({})`, `collStats`, `dataSize` and `dbStats` read the whole
+      collection into memory.** `scan_docs` returns a `Vec` of every
+      document's bytes; `count_matching` with an empty filter is
+      `scan_docs(...).len()`, `collection_data_size` and `index_sizes` each
+      scan again, `dbStats` runs all three for every collection, and
+      `collection_min_id_key` loads everything to find a minimum. mongod
+      answers all of these from its size-and-count metadata, so on a large
+      collection they are cheap there and can exhaust memory here. RM-080
+      covers `find` / `aggregate` cursors; RM-087 covers fast-count
+      visibility, not its cost.
+      Backlog-ID: RM-191
+      Verify: none -- a memory and time budget, not an answer
+- [ ] **Disk space is never given back, and there is no repair path.**
+      `compact` answers `bytesFreed: 0` without doing anything
+      (`secantus-commands/src/capped_admin.rs`, "There is never anything to
+      free here"), and `secantus-wt` has no binding for
+      `WT_SESSION::compact`. Collections share the 16 document shards, one
+      index-entries table and the oplog shards, so a dropped or emptied
+      collection's pages are only ever reused inside those files. mongod runs
+      WiredTiger's compaction (and `autoCompact` in 8.x). The reply itself is
+      not testable from a small shape: on 40,000 documents with 95% deleted,
+      mongod 8.2.11 also reported `bytesFreed: 0`. There is no
+      `--repair` / salvage either; `secantus-pg/src/main.rs` already
+      recognises `WT_TRY_SALVAGE` and has nothing to offer.
+      Backlog-ID: RM-192
+      Verify: none -- reclaiming disk space; no small shape where mongod reports bytesFreed > 0 was found
+- [ ] **The opt-in async oplog (`--oplog-async`) can drop or blank an
+      entry.** The drainer's final shutdown retry discards a failing batch
+      with `let _ =` (so `docs/concurrency.md`'s "a clean shutdown flushes
+      the drainer" does not hold when a write fails), `Drop` ignores each
+      drainer's `join` result, and an entry that fails to encode is stored
+      as an empty document in its place rather than surfaced. Each is a
+      storage error turned into silence.
+      Backlog-ID: RM-193
+      Verify: none -- needs a failing WiredTiger write or BSON encode injected into the drainer
+- [ ] **Per-collection write locks are never freed.** `coll_locks` keeps an
+      entry for every namespace ever referenced (deliberately, so a lock's
+      identity survives drop and recreate), so memory grows with the number
+      of collections a long-running server has ever seen. Minor; a test that
+      creates and drops collections by the million is where it shows.
+      Backlog-ID: RM-194
+      Verify: none -- unbounded growth over a server's lifetime, not an answer
+
 ### 7.084 What an authenticated user may run -- 2026-10-14
 
 `tools/probes/auth_enforcement.py` starts mongod 8.2.11 and the Rust server
@@ -755,7 +882,9 @@ Still different:
       `indexDetails` (they are WiredTiger statistics of the collection's
       and each index's own table, and here collections share a documents
       shard table and every index one entries table, so no per-collection
-      statistics exist; the shard table's own would count other
+      statistics exist -- which is also why `storageSize` in `collStats` /
+      `dbStats` is `dataSize` copied rather than the bytes on disk, and
+      `indexSize` an estimate; the shard table's own would count other
       collections too); `latencyStats` is zeros; `config.system.sessions`
       exists but holds no sessions (mongod writes them there; here they are
       kept in memory), so `dbHash` on `config` differs, as on `admin` does (`admin.system.keys` holds random signing keys there, a
