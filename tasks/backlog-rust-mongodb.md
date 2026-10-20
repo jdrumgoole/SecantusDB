@@ -1572,14 +1572,6 @@ dropped (four), and `listIndexes` lists by name.
 
 ### 7.03 Rust packages (crates.io) -- open items, 2026-10-01
 
-- [ ] **The embedded Python `RustServer` handle runs no sweepers.**
-      `secantus_mdb::Server` (and the daemon) expire TTL-indexed documents
-      every 60 seconds (`Builder::ttl_sweep`) and can run the noop heartbeat
-      that also prunes the oplog (`Builder::noop_heartbeat`); the Python
-      embedded handle runs neither. Check: `git grep -i "ttl_sweep\|noop_heartbeat"
-      crates/secantus-server-py/` finds nothing (2026-10-14).
-      Backlog-ID: RM-114
-      Verify: none -- embedded Python RustServer handle lifecycle; needs the PyO3 extension and a 60s sweep
 
 ### 7.01 Rust MongoDB server driver-gauge sweep — 2026-09-30
 
@@ -1606,16 +1598,6 @@ dropped (four), and `listIndexes` lists by name.
 
 ### 7.00 Rust MongoDB server batch — 2026-09-30, measured against mongod 8.2.11
 
-- [ ] **Two of the 21 write-command divergences found on 2026-09-02 were
-      never identified as fixed.** Instrumenting `update_operators`,
-      `arg_types_documents`, `update_path_conflicts` and
-      `findandmodify_shapes` with a Rust column (`tools/probes/_servers.py`,
-      `probe_targets()`) found 21 Rust-vs-mongod divergences; 19 were fixed
-      and the record said the other 2 "are recorded below", but no later
-      entry names them. Re-run those four probes against `secantusd-rs` and
-      mongod 8.2.11 and file whatever still differs.
-      Backlog-ID: RM-117
-      Verify: none -- probe re-run campaign to find two unnamed divergences
 
 - **The six message-only bad-hint divergences in
   `tools/probes/arg_types_messages.py`** are gone from the Rust server

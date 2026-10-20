@@ -41,3 +41,13 @@ type (unless the schema declares that one type), a nested object as
 - CI: the `test` and `test-durable` lanes set up Go with setup-go's module
   cache and download the cross-driver Go smoke tests' modules before the
   tests run, so a module proxy error can no longer fail a test. RM-012.
+- The embedded Python `RustServer` handle takes `noop_heartbeat_seconds`:
+  the oplog's noop heartbeat, which also prunes the oplog, as the daemon's
+  `--noop-heartbeat-seconds` writes it (off by default, as there). Its TTL
+  monitor was already there. Fixes RM-114
+  (tests/test_rust_server_smoke.py::test_noop_heartbeat_is_written_only_when_asked).
+- RM-117 closed by measurement: the four write-command probes that found 21
+  divergences on 2026-09-02 (`update_operators`, `arg_types_documents`,
+  `update_path_conflicts`, `findandmodify_shapes`, 155 shapes) find none on
+  the Rust server against mongod 8.2.11 (2026-10-20), so the two never named
+  are gone.
