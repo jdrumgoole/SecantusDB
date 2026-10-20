@@ -163,7 +163,7 @@ jobs:
         run: |
           brew install swig ninja
           bash tools/build_lz4_macos.sh
-          # Both halves, exactly as wheels.yml sets them for cibuildwheel:
+          # Both halves (the PyPI wheel build, retired 2026-10-20, set the same):
           # CMAKE_PREFIX_PATH is how WiredTiger's CMake finds <lz4.h> to compile
           # its builtin lz4 extension, SECANTUS_WT_EXTRA_LIBDIR is how
           # secantus-wt/build.rs finds liblz4.a to link it.

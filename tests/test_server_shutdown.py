@@ -87,9 +87,9 @@ def test_stop_drains_in_flight_change_stream_before_close(wt_home) -> None:
 )
 def test_rapid_teardown_under_read_load_drains_cleanly(tmp_path) -> None:
     # `slow`: ~43s in isolation (12 teardown iterations x 3 hammer threads).
-    # Excluded from the default inner-loop suite via `-m 'not slow'`; the CI
-    # `slow` lane (.github/workflows/test.yml) runs it every push so the
-    # xdist-worker-crash race it guards stays covered. Do NOT cut the
+    # Excluded from the default inner-loop suite via `-m 'not slow'`. It tests
+    # the Python server, which CI no longer runs (fully deprecated,
+    # 2026-10-20); run it by hand with `-m slow`. Do NOT cut the
     # iteration count to speed it up — intermittent races need the reps.
     """Stress: repeatedly tear a server down while connection threads hammer it
     with reads. Each ``stop()`` must drain to zero active connections without

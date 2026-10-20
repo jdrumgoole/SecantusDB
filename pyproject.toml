@@ -39,10 +39,6 @@ dev = [
     "pytest-benchmark>=4.0",  # for tests/test_perf_regression.py
     "pytest-timeout>=2.4",  # per-test deadline; names hung tests instead of letting CI hang at 97%
     "pytest-asyncio>=0.24",  # drives pymongo's async test suite in the validate-pymongo-async gauge
-    # Duration-balanced CI sharding. The test lanes split the suite with
-    # ``--splits N --group K`` against the per-platform files in ci/durations/;
-    # see .github/workflows/record-durations.yml for how those are produced.
-    "pytest-split>=0.10",
     # starlette's TestClient prefers httpx2 and emits a
     # StarletteDeprecationWarning on every construction when only httpx is
     # importable ("Using `httpx` with `starlette.testclient` is deprecated").
@@ -200,8 +196,7 @@ secantus-restore-archive = "secantus.restore_cli:main"
 # apt / dnf / apk / choco) rather than the PyPI `swig` wrapper package.
 # The PyPI wrapper's `swig4.0 -help` shim trips CMake's FindSWIG
 # language-detection probe, so we rely on a real system swig instead.
-# Installation prerequisites are documented in docs/installation.md and
-# satisfied by tool.cibuildwheel.{linux,macos,windows} `before-build`.
+# Installation prerequisites are documented in docs/installation.md.
 requires = ["scikit-build-core>=0.10"]
 build-backend = "scikit_build_core.build"
 
@@ -220,7 +215,7 @@ cmake.version = ">=3.21"
 cmake.build-type = "Release"
 build-dir = "build/{wheel_tag}"
 wheel.packages = ["src/secantus"]
-# vendor/wiredtiger contains GPL'd C source; cibuildwheel needs it.
+# vendor/wiredtiger contains GPL'd C source; a build from the sdist needs it.
 sdist.include = ["vendor/wiredtiger/**"]
 sdist.exclude = [
     # Differential probes are a development tool (they need a live mongod
@@ -302,84 +297,6 @@ sdist.exclude = [
     "bench/**",
     ".github/**",
 ]
-
-[tool.cibuildwheel]
-# Skip 32-bit and pypy targets. Build for every supported CPython ABI
-# (requires-python is ">=3.10") so users on cp310/cp311/cp312/cp313
-# always pip-install a pre-built wheel.
-build = "cp310-* cp311-* cp312-* cp313-*"
-skip = ["*-win32", "*-manylinux_i686", "pp*"]
-build-verbosity = 1
-# Real smoke tests against the installed wheel: server bind, pymongo
-# handshake (hello/ping/serverInfo), unknown-command resilience. A broken
-# wheel that imports cleanly but mishandles requests fails here, not
-# silently in the user's pip install. pytest-xdist is needed because
-# pyproject.toml's [tool.pytest.ini_options] addopts="-n auto" is picked
-# up when pytest walks up from {project}/tests/.
-test-requires = ["pytest", "pytest-xdist"]
-test-command = "pytest -v {project}/tests/test_smoke.py {project}/tests/test_pymongo_smoke.py"
-
-[tool.cibuildwheel.linux]
-# manylinux_2_28 (AlmaLinux 8, dnf) + musllinux_1_2 (Alpine, apk). The
-# storage-engine build (SECANTUS_BUILD_STORAGE_ENGINE=ON) compiles the Rust
-# extensions, which need (a) swig for WiredTiger's Python module, (b) a Rust
-# toolchain, (c) libclang for `secantus-wt`'s bindgen, and (d) **lz4**, the
-# default block compressor since 2026-08-22 — WiredTiger's builtin lz4
-# extension links against it (zlib is already present on every image). We pin manylinux to
-# 2_28 (glibc 2.28+) because its `dnf install clang clang-libs` gives a modern
-# libclang (the CentOS-7 manylinux2014 SCL clang is far more painful). The
-# install path of libclang.so differs by distro (manylinux /usr/lib64, musllinux
-# /usr/lib), so we symlink whichever we find into a fixed /opt/libclang and point
-# LIBCLANG_PATH there (set in the workflows). `$HOME/.cargo/bin` is on PATH via
-# CIBW_ENVIRONMENT so the build sees the rustup-installed cargo.
-manylinux-x86_64-image = "manylinux_2_28"
-manylinux-aarch64-image = "manylinux_2_28"
-archs = ["x86_64", "aarch64"]
-before-build = """
-(dnf install -y swig clang clang-libs clang-devel llvm-libs lz4-devel || apk add --no-cache swig clang clang-dev llvm-dev lz4-dev)
-mkdir -p /opt/libclang
-lc=$(find /usr -name 'libclang.so*' 2>/dev/null | head -1); [ -n "$lc" ] && ln -sf "$lc" /opt/libclang/libclang.so
-command -v cargo >/dev/null 2>&1 || (curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable)
-"""
-
-[tool.cibuildwheel.macos]
-# arm64 only; x86_64 isn't a supported wheel target. The storage-engine build
-# needs swig + Rust + libclang: the macos-14 runner ships Rust and Xcode's clang.
-# We deliberately do NOT install/point at Homebrew's `llvm` — its newer libclang
-# parses WiredTiger's headers into broken bindings (missing WT_CURSOR fields);
-# bindgen auto-discovers Xcode's libclang, which is what the storage-engine CI
-# job uses successfully. `brew install` is idempotent.
-#
-# lz4 is built from source rather than `brew install lz4` (tools/build_lz4_macos.sh).
-# Homebrew builds for the runner's own OS, so its liblz4 carries a minimum
-# target of macOS 14 and `delocate` refuses to bundle it into a wheel targeting
-# macOS 11 — accepting it would mean raising the wheel's floor to 14 and
-# dropping every Apple Silicon user on macOS 11-13. The script builds a STATIC
-# liblz4 at the wheel's own deployment target, so there is no dylib to bundle.
-archs = ["arm64"]
-before-build = "brew install swig && (command -v cargo >/dev/null 2>&1 || brew install rust) && bash tools/build_lz4_macos.sh"
-
-[tool.cibuildwheel.windows]
-archs = ["AMD64"]
-# SWIG (preinstalled, re-installed idempotently) + LLVM for bindgen's libclang.
-# Rust ships preinstalled on the windows-2022 runner, so we don't choco-install
-# it (that would risk shadowing the runner's rustup cargo). Then copy libclang.dll
-# to a SPACE-FREE path: bindgen could not find it at "C:\Program Files\LLVM\bin"
-# (`invalid: []`) because the space in the path doesn't survive cibuildwheel's
-# env serialization on Windows; a no-space LIBCLANG_PATH sidesteps that.
-before-build = 'choco install -y swig llvm && (if not exist C:\libclang mkdir C:\libclang) && copy /Y "C:\Program Files\LLVM\bin\libclang.dll" C:\libclang'
-# libclang + shared cargo target. The PyPI wheel no longer bundles the Rust
-# servers (they ship as crates), so SECANTUS_BUILD_STORAGE_ENGINE is not set
-# here; these two stay for a local storage-engine build. Set here,
-# not in a workflow CIBW_ENVIRONMENT_WINDOWS (none exists, so this isn't
-# overridden). Raw values — cibuildwheel quotes table values itself, so our own
-# quotes once produced a doubled-quote "Malformed environment option".
-# SECANTUS_CARGO_TARGET (no ccache on Windows) just shares one target dir across
-# the 4 CPython builds in the job so the Rust deps compile once, not 4×.
-# Forward slashes: a backslash in C:\... gets eaten when the path flows through
-# CMake (`\c` escape), turning it into the invalid drive-relative `C:cargo-target`.
-# CMake, cargo and clang-sys all accept forward slashes on Windows.
-environment = { LIBCLANG_PATH = 'C:/libclang', SECANTUS_CARGO_TARGET = 'C:/cargo-target' }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

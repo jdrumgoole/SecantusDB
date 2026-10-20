@@ -53,6 +53,13 @@ def _secantus_version() -> str:
         return m.group(1) if m else "unknown"
 
 
+def _rust_server_version() -> str:
+    """The Rust MongoDB server's version, from its crate's ``Cargo.toml``."""
+    toml = (REPO_ROOT / "crates" / "secantusdb" / "Cargo.toml").read_text()
+    m = re.search(r'^version\s*=\s*"([^"]+)"', toml, re.MULTILINE)
+    return m.group(1) if m else "unknown"
+
+
 @dataclass
 class GaugeStats:
     """Normalized per-gauge stats. Every gauge contributes one of these."""
@@ -820,8 +827,26 @@ def _apply_expected_failures(g: GaugeStats) -> None:
             g.expected_failure_entries.append((desc, ef.rationale))
 
 
-def render(raw_dir: Path, out_path: Path) -> None:
-    gauges = [g for g in (c(raw_dir) for c in _COLLECTORS) if g is not None]
+def _report_link(name: str, suffix: str) -> str | None:
+    """The per-driver report for ``name``, for the server ``suffix`` names."""
+    report = _REPORT_LINKS.get(name)
+    if report is None or not suffix:
+        return report
+    if report == "./validation-report.md":
+        # pymongo's report has no driver part: validation-report-rust-server.md
+        return f"./validation-report{suffix}.md"
+    return report.removesuffix(".md") + f"{suffix}.md"
+
+
+def render(raw_dir: Path, out_path: Path, suffix: str = "") -> None:
+    """Write the summary from the raws of one server: ``suffix`` is ``""``
+    for the Python server and ``"-rust-server"`` for the Rust one."""
+    gauges = [g for g in (c(raw_dir, suffix) for c in _COLLECTORS) if g is not None]
+    server_label = (
+        f"the Rust MongoDB server {_rust_server_version()}"
+        if suffix
+        else f"the Python MongoDB server, SecantusDB {_secantus_version()}"
+    )
     for g in gauges:
         _apply_expected_failures(g)
 
@@ -839,7 +864,7 @@ def render(raw_dir: Path, out_path: Path) -> None:
     md.append("# Cross-Driver Conformance Summary")
     md.append("")
     md.append(
-        f"Generated {dt.date.today().isoformat()} — SecantusDB {_secantus_version()}. "
+        f"Generated {dt.date.today().isoformat()} — {server_label}. "
         "Each per-driver gauge runs the driver vendor's own integration test suite "
         "(unmodified) against a SecantusDB daemon and emits its raw output to "
         f"`.validation/`. This summary normalises on **test count** so the {len(gauges)} gauges "
@@ -922,7 +947,7 @@ def render(raw_dir: Path, out_path: Path) -> None:
     )
     md.append("")
     for g in gauges:
-        report = _REPORT_LINKS.get(g.name)
+        report = _report_link(g.name, suffix)
         if report:
             md.append(f"- [{g.name}]({report})")
     md.append("")
@@ -956,8 +981,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--raw-dir", type=Path, default=Path(".validation"))
     parser.add_argument("--out", type=Path, default=Path("docs/validation-summary.md"))
+    # Rust by default: the Python servers are fully deprecated (2026-10-20)
+    # and the weekly gauges no longer run against them.
+    parser.add_argument("--server", choices=("rust", "python"), default="rust")
     args = parser.parse_args()
-    render(args.raw_dir, args.out)
+    render(args.raw_dir, args.out, "" if args.server == "python" else "-rust-server")
     return 0
 
 
