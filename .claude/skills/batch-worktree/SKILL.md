@@ -36,6 +36,11 @@ cd ../SecantusDB-<slug> && git push -u origin <branch>
 Branch off `origin/main`, not local `main` — local can be a hundred commits
 behind.
 
+Release a claim by merging and deleting the branch, or by deleting your own
+branch if you abandon the item. **Never delete or force-push another
+session's claim branch**, however stale it looks: report it and let Joe
+decide.
+
 ## Provision the venv COMPLETELY
 
 A fresh worktree has no `vendor/wiredtiger`, and the main `.venv`'s editable
@@ -214,6 +219,13 @@ Four traps, all hit for real:
   This includes **stashes**, which are repo-global and therefore visible from
   every worktree: `git stash list` in your worktree will show other sessions'
   entries. Leave them. Only pop what you pushed in this conversation.
+
+Tear down in the SAME session that merges: nobody else can tell your
+abandoned branch from live work, and one audit found **235 remote branches
+and 11 worktrees**, nearly all merged months earlier, hiding the few that
+mattered.
+
+**Auditing branches after the fact is much harder than not creating the mess.** `git merge-base --is-ancestor`, `git cherry`, and `git merge-tree` each gave a confidently wrong answer during that audit (squash merges defeat the first two; the third reports conflict markers as though they were content). The signal that actually held up was the PR's merge state, cross-checked against whether `main` already contains the branch's distinctive files. And before reviving any long-lived unmerged branch, check whether `main` has since *rejected* it — one such branch looked like a valuable unmerged CI fix, but `tests/conftest.py` carries a deliberate tripwire against exactly that change because it was tried and caused a `WT_PANIC` cascade.
 
 The branch and worktree are only half of it. Servers still bound to ports,
 WiredTiger temp stores, the `pytest-of-<user>` backlog, and background waiters

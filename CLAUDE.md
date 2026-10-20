@@ -107,10 +107,9 @@ The audience is developers who want fast, ephemeral, single-node MongoDB or
 PostgreSQL behaviour — in a test, in CI, in a container — without running the
 real thing. Not a production-grade emulator.
 
-**Performance work belongs to the Rust servers.** The Python pair is a
-correctness and readability target, not a throughput one; a benchmark that shows
-it slow is reporting the design, not a regression. Route latency / throughput /
-concurrency work to `crates/`.
+**Performance work belongs to the Rust servers.** A benchmark that shows a
+Python server slow is reporting the design, not a regression. Route latency /
+throughput / concurrency work to `crates/`.
 
 ## Design constraints
 
@@ -236,91 +235,15 @@ SecantusDB stores data. In a database, an error is a **correctness and durabilit
 
 ## Architecture
 
-**This section describes the PYTHON reference implementation** (`src/secantus/`).
-The Rust servers mirror these layers in `crates/` — see "Engines" below for the
-crate map. Read this to learn what SecantusDB *does*; read the crates to see what
-a user actually runs.
+The layer map, the WiredTiger table layout the servers share, the index
+planner (equality / range / compound / multikey / partial / sparse / TTL /
+geo), the oplog and change streams were first built in the Python server and
+are described in the **`python-servers` skill**. Read it before changing the
+storage layout or index planning on either side: the Rust storage ported those
+helpers, and the parity suites do not cover them. The Rust crates mirror the
+layers (see "Engines" below).
 
-Layers, roughly outermost-in:
-
-- `src/secantus/server.py` — `SecantusDBServer`: TCP accept loop on a daemon thread, one daemon thread per connection. Owns the `Storage` and the `CursorRegistry`. Per-request, builds a fresh `CommandContext(storage, cursors, db_name)` and calls `dispatch`.
-- `src/secantus/wire.py` — header (16 bytes, little-endian), `OP_MSG` (2013) parse/build, legacy `OP_QUERY` (2004) parse + `OP_REPLY` (1) build for the initial `pymongo` handshake. `OP_MSG` kind-1 document sequences are merged into the body before dispatch (server-side).
-- `src/secantus/commands.py` — single dispatch table keyed on the first key of the request doc. Handshake (`hello`/`isMaster`/`ping`/`buildInfo`/etc.) and CRUD (`insert`/`find`/`update`/`delete`/`count`/`drop`/`aggregate`/`findAndModify`/`listCollections`/...). Errors raised by handlers are caught and turned into `{ok: 0, errmsg, code, codeName}`. Unknown commands return `code: 59 CommandNotFound` so the connection survives.
-- `src/secantus/query.py` — pure `matches(doc, filter, vars=None)`. Field-level operators: `$eq`/`$ne`/`$gt`/`$gte`/`$lt`/`$lte`/`$in`/`$nin`/`$exists`/`$not`/`$regex`+`$options`/`$type`/`$size`/`$all`/`$mod`/`$elemMatch`. Document-level operators: `$and`/`$or`/`$nor`/`$expr` (delegates to `expressions.py`, vars threaded through). Dotted paths walk into both maps and arrays.
-- `src/secantus/projection.py` — `apply_projection(doc, spec)` for `find()`'s `projection` argument. Inclusion/exclusion modes, `_id` defaults, dotted paths, plus the `$elemMatch` projection operator that returns the first array element matching a sub-filter.
-- `src/secantus/update.py` — pure `apply_update(doc, update)`. Operators: `$set`/`$unset`/`$inc`/`$mul`/`$min`/`$max`/`$push`/`$pull`/`$addToSet`/`$pop`/`$rename`. Replacement-style updates preserve `_id`. Mixing operators with replacement fields is rejected.
-- `src/secantus/expressions.py` — pure `evaluate(expr, doc, vars=None)`. The aggregation expression language: field paths (`"$x.y"`), `$$varname` user vars + `$$ROOT`/`$$CURRENT`, `$literal`, arithmetic, comparison, logical, `$cond`/`$ifNull`, `$size`, dates (`$year`/`$month`/`$dayOfMonth`/`$dayOfWeek`/`$hour`/`$minute`/`$second`/`$dateToString`), strings (`$concat`/`$split`/`$trim`/`$ltrim`/`$rtrim`/`$substrCP`/`$strLenCP`/`$indexOfCP`/`$toLower`/`$toUpper`/`$toString`), arrays (`$arrayElemAt`/`$first`/`$last`/`$slice`/`$concatArrays`/`$reverseArray`/`$in`/`$filter`/`$map`/`$reduce`), conversions — `$convert` plus the `$toInt` / `$toLong` / `$toDouble` / `$toDecimal` / `$toString` / `$toBool` / `$toDate` / `$toObjectId` shorthands, which all **delegate to `$convert`** rather than repeating it (they had drifted, and one path crashed on `Decimal128("Infinity")`). String→number parsing is STRICT — Python's `int()` / `float()` strip whitespace and accept PEP-515 underscores where mongod accepts neither, so `$toInt: " 5 "` used to return a number — and failures carry mongod's per-target reason (`No digits`, `Did not consume whole string.`, `Overflow`, `Leading whitespace`, `Empty string`, `Did not consume any digits`, `Failed to parse string to decimal`), which are not the same set for int / double / decimal. Sweep: 480 shapes at zero divergences against 8.2.11 (2026-09-01). Used by the aggregation pipeline and by `$expr` in queries.
-- `src/secantus/aggregate.py` — `apply_pipeline(docs, pipeline, ctx)`. Stages: `$match`, `$count`, `$limit`, `$skip`, `$sort`, `$project` (with computed fields), `$addFields`/`$set`, `$unset`, `$unwind`, `$densify` (`bounds: "full"` / `[min, max]`, `partitionByFields`, positive `step`; date densify with `unit: "week"|"day"|"hour"|"minute"|"second"|"millisecond"` walks by fixed-duration `timedelta`. Variable-length units `month`/`quarter`/`year` rejected — would need `relativedelta`), `$replaceRoot`/`$replaceWith`, `$group`, `$lookup` (both simple and `let`/`pipeline` forms; per-outer-doc lookups go through `Storage.find_matching` whenever the foreign collection has any index whose leading field is `foreignField` — single-field, compound (leading-prefix scan), and multikey (per-element entries) all light up at IXSCAN. No matching index: falls back to an O(N+M) hash-join via `_build_lookup_index` / `_hash_join_lookup`), `$sample`, `$sortByCount`, `$facet`, `$bucket`. `$group` accumulators: `$sum`, `$count`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`, `$addToSet`. `PipelineContext` carries the `Storage`, current `db_name`, and a `vars` map (for `$lookup` `let` bindings, threaded through every stage that calls the expression evaluator).
-- `src/secantus/cursors.py` — `CursorRegistry`. Per-server, thread-safe map of int64 cursor id → remaining docs. Used by `find` and `aggregate` to support pagination via `getMore`/`killCursors`. Cursors carry a `last_access` timestamp; entries idle longer than `idle_ttl_seconds` (default 600s, matching MongoDB's 10-minute cursor TTL) are pruned opportunistically on every `register` / `next_batch` / `kill` / `len`. The clock is injectable (`time_func`) so tests can drive expiry deterministically.
-- `src/secantus/paths.py` — shared dotted-path helpers (`get_path`/`set_path`/`unset_path`/`has_path`/`walk_to_parent`). Used by `update`, `projection`, `aggregate`, and storage's sort.
-- `src/secantus/sortkey.py` — pure `encode_value(v)` and `encode_compound([v1, v2, ...])` that produce **byte-sortable** bytes whose lex order matches MongoDB's BSON cross-type sort order. Layout: `<rank_byte><payload>`. Numbers go through a "lexical decimal" form (sign byte + bias-shifted exponent + paired BCD digits + terminator) so int / long / double / Decimal128 collide on equal value and order correctly across the unified numeric type. NaN / ±Infinity get dedicated bracketing markers. Strings, binary, regex are null-escaped (`\x00 → \x00\xff`) so `\x00\x00` is a safe compound separator. `encode_value_directed(v, direction)` bitwise-inverts the bytes when `direction == -1` so the same encoder drives descending indexes.
-- `src/secantus/storage.py` — WiredTiger-backed store (same engine MongoDB uses). Four tables in one WT connection:
-  - `table:secantus_collections` (key_format=`SS`, value=BSON options blob) — `(db, coll)` registry.
-  - `table:secantus_documents_sh<0..15>` (key_format=`SSq`, value=`u`) — `(db, coll, RecordId) → _frame_doc_value(id_key, bson.encode(doc))`, i.e. a `[u32-LE id_key_len][id_key][blob]` frame. The `RecordId` is a global monotonic insertion counter, so a forward walk of the table IS insertion order (mongod's storage order). `id_key` is `sortkey.encode_value(_id)` — byte-sortable across BSON types — and rides *inside* the value because the key no longer carries it (a timeseries doc's suffixed `id_key` isn't derivable from `_id`). Every `_id` lookup / update / delete / uniqueness probe resolves `id_key → RecordId` through the `_id` index below. The table is sharded 16 ways by a hash of `(db, coll)`; `table:secantus_documents` is the legacy pre-shard single table, folded into the shards at open. **Byte-identical to the Rust server's layout** (cross-server backup / PITR portability); a store written before the RecordId change is refused at open (`IncompatibleStorageFormatError`), there is no in-place migration.
-  - `table:secantus_natural_seq` (key_format=`SSu`, value=`q`) — `(db, coll, id_key) → RecordId`. This is the **`_id` index**: the only way from an `_id` to its doc row, and where a duplicate `_id` is caught (the doc table keys by the unique RecordId, so it can't reject dups itself). The counter is persisted in the oplog-meta state and recovered on reopen by scanning the doc shards for the max RecordId. Insertion order needs no side index any more — it's the doc table's own key order — so `find()` without `sort`, the `$natural` hint, capped-collection eviction, equal-key sort tie-breaks, the `update_matching` / `delete_matching` candidate scans, and a capped collection's tailable cursor (which anchors on a RecordId via `scan_docs_after_recordid` / `collection_min_recordid`) all walk `_scan_docs` and see mongod's order. `table:secantus_natural` (the old forward `seq → id_key` table) is no longer written; that dropped write is the 4→3 insert write-amp cut.
-  - `table:secantus_indexes` (key_format=`SSS`, value=`u`) — `(db, coll, name) → bson.encode({key, options})`.
-  - `table:secantus_index_entries` (key_format=`SSSu`, value=`u`) — `(db, coll, name, packed) → b""` where `packed = escape(sortkey) + b"\x00\x00" + RecordId (8 bytes, big-endian)`. The packed form is in a single trailing `u` column on purpose: WT length-prefixes non-trailing `u` columns, which would break lex order on the sort-key bytes. The trailing half is the **RecordId**, so an IXSCAN fetch reads the doc row directly with no `id_key` hop; big-endian keeps entries for one key in RecordId (insertion) order and is fixed-width, so it needs no escaping. Because WT's `key_format` can't distinguish this from the older id_key form, each index records `options.entryFormat = 2` in the catalog and a store with older entries is refused at open (`entryFormat` is stripped from `listIndexes` like `multikey`). Maintained on every insert/update/delete.
-  WT sessions are thread-affine, kept in `threading.local()`; cursors per session per table are cached and `reset()` between calls. A global `RLock` serializes all public methods so we never have to think about WT's MVCC at the storage layer. `:memory:` is mapped to a `tempfile.mkdtemp()` opened with `in_memory=true` and rmtree'd on `close()`.
-
-### Indexes: equality (incl. compound prefix) + range (incl. compound trailing) + sort
-
-`find_matching` routes through the index entries table for:
-- **Single-field filters**: bare equality (`{field: v}`), `$eq`, `$in`, and any combination of `$gt`/`$gte`/`$lt`/`$lte` against a single-field index. When no single-field index covers `field`, a compound index whose leading field is `field` is used instead — equality lookups become prefix scans (`enc(v) + COMPOUND_SEP`), and range bounds are evaluated with a leading-field-only scan that uses `startswith(esc_X + esc_compound_sep)` to identify boundary rows (a literal find/split on the separator is unreliable because an escaped numeric terminator overlaps with the start of the escaped separator).
-- **Multi-field bare-equality filters**: when the filter's fields are a leading prefix (set-wise) of an ASC compound index, an exact match (filter covers the whole index) or a prefix scan (strict leading prefix) runs. Filter field order doesn't matter — `{b: 20, a: 1}` finds the same `{a:1, b:1}` index as `{a: 1, b: 20}`. Single-field filters can also use a compound index whose leading field matches.
-- **Compound prefix + trailing operator**: filters of the form `{a: 5, b: {$gt: 10}}` (any number of leading bare-equality fields followed by exactly one operator-form field, where that operator field is the next field in the index after the equality prefix) prefix-pin the equalities and apply the operator's bounds to the next column. Supports `$eq`/`$in`/`$gt`/`$gte`/`$lt`/`$lte` on the trailing field.
-- **Mixed-direction compound indexes**: compound indexes accept any per-field direction (`{a:1, b:-1}`, `{a:-1, b:-1}`, etc.). Each field is byte-encoded with `encode_value_directed(value, dir)` so the entries table sorts in the index's natural order. Equality prefix lookups, prefix scans, and the trailing-operator path all work; when the trailing field is DESC the operator semantics flip (`$gt` becomes upper-exclusive in byte order), and unique enforcement still uses a prefix probe.
-
-Sort-by-indexed-field rides the same B-tree. The walk direction is chosen so the result is already in sort order: if the index direction matches the sort direction, walk forward; if they're opposite, walk backward. A single-field sort can be served by any index whose leading field matches — single-field or compound, ASC or DESC — with no Python list reversal in the common path. The post-sort step is skipped.
-
-Unique enforcement is a prefix probe on the entries table, not a full scan.
-
-**Multikey indexes**: when a doc has an array-valued field that an index covers, `_index_key_variants` writes one entry per array element *plus* a whole-array entry. The whole-array entry handles equality queries against the full array (`{tags: ["py", "go"]}`); per-element entries handle scalar element queries (`{tags: "py"}`), `$in`, and range. A dotted path that descends *through* an array — `{"prices.owner_id": 1}` over `{prices: [{owner_id: …}, …]}` — writes one entry per element's leaf value and no whole-array entry (there's no single array to compare against). `paths.get_path_values` is the array-descending path resolver behind all of this (`_index_field_values` adds the whole-array key and the multikey verdict, `_index_field_exists` is the sparse gate); plain `get_path` deliberately does *not* descend, which is what `$set` / projection need. Compound indexes with multiple multikey columns take the cartesian product (real `mongod` rejects this; we accept it but the cardinality blow-up is on the user). Storage flags the index `multikey: True` at insert / update / `create_index` time (sticky — never cleared); the flag still drives sort-acceleration decisions (`_compound_index_for_sort` skips multikey because one doc → many index entries breaks natural-order walks), but query planning treats multikey indexes as first-class — equality / range / `$in` lookups all light up at IXSCAN. `_docs_by_recordids` and `_candidates_iter` dedup the RecordIds returned from index walks because the same doc can appear via more than one element entry. Uniqueness enforcement (`_unique_conflict`, the `createIndexes` pre-check, `find_index_duplicates`) probes **every** key a doc generates, not a canonical one — mongod's unique-multikey rule is "no two docs share any generated key", and a doc indexed through an array has no canonical key among its entries. `_conflict_key_value` recovers the value behind the conflicting key for the dup-key error's `keyValue`.
-
-`hint` is honored on **every** command that takes one — `find`, `count`, `aggregate`, `distinct`, `findAndModify`, and per-statement on `delete` / `update`: pass an index name string, a key-spec dict, `{$natural: 1}` / `{$natural: -1}` (forces a collection scan even when an index would match; `-1` walks it backwards), or `"_id_"` / `{_id: 1}` (walks doc-table order). An unknown hint surfaces as a `BadValue` (code 2) error to the client — on the two write commands as a per-statement `writeErrors` entry with `ok: 1`, which is how mongod reports it. The **string** `"$natural"` is rejected like any other unknown hint: mongod takes only the document form, and `pymongo`'s `.hint("$natural")` produces the string, so accepting it made the natural pymongo call diverge (fixed 2026-08-31, both servers). The hint can also align with the sort spec to skip the post-sort step when the leading field matches.
-
-`maxTimeMS` is **enforced**, not just validated: `secantus/deadline.py` holds a thread-local budget that `dispatch` arms around the handler, and the loops whose length tracks the data poll it (the storage scan and its predicate pass, `count`'s own scan, the write paths' candidate *selection* — before any write, so an expired budget leaves nothing half-applied — the index build, and the aggregation pipeline between stages). An expired budget answers `50 MaxTimeMSExpired`; `createIndexes` wraps it in mongod's index-build envelope. Cooperative, polled every 64 documents. `getMore` is excluded (`_MAX_TIME_MS_NOT_A_DEADLINE`) — there `maxTimeMS` is the awaitData WAIT budget, and arming a deadline would make every tailable poll report a timeout.
-
-`aggregate` also lifts a leading `$match` stage into the initial fetch's filter so a pipeline starting with `[{$match: {...}}]` benefits from the same index acceleration as `find`. The `$match` stage is then skipped in the pipeline so the filter isn't re-applied.
-
-`explain` reports `IXSCAN` when an index would be used and `COLLSCAN` otherwise. `Storage.explain_plan(...)` mirrors `find_matching`'s routing decisions without executing them and returns `{"kind": "IXSCAN", "index_name", "key_pattern", "direction", "multikey", "sorted_by_index"}` or `{"kind": "COLLSCAN"}`; the `_explain` command shapes that into MongoDB's `winningPlan`. For **`find`** that is the full stage tree, not a flat node: `SORT` (with `sortPattern` / `memLimit` / the limit it absorbs) / `SKIP` / `LIMIT` / `PROJECTION_SIMPLE`|`PROJECTION_DEFAULT` wrapping `FETCH(IXSCAN)` or `COLLSCAN`, in mongod's nesting — `sorted_by_index` is what decides whether a blocking `SORT` appears, which is the question a client runs `explain` to answer. The IXSCAN node carries `keyPattern` / `indexName` / `isMultiKey` / `multiKeyPaths` / `isUnique` / `isSparse` / `isPartial` / `indexVersion` / `direction` in mongod's key order; `COLLSCAN` carries `direction`; `FETCH` carries only the RESIDUAL filter and omits the key when the bounds cover the predicate. `queryPlanner.parsedQuery` and the stage `filter`s are mongod's NORMALISED match expression, built by `secantus/explain.py`'s `canonical_match` (bare equality → `$eq`, multi-clause → an `$and` sorted by mongod's match-type ordinal then path, `$ne`/`$nin` → `$not`, `$in` of one → `$eq`, `$in` of none → `$alwaysFalse`, `$all` split, `$type` → numeric codes, `$bitsAll*` → bit positions, `$comment` dropped, `$nor` kept only as the whole query). Not reproduced BY THE PYTHON SERVER: `indexBounds`, `rejectedPlans`, and the `IDHACK` / `EXPRESS_IXSCAN` / `COUNT_SCAN` / `DISTINCT_SCAN` / `PROJECTION_COVERED` executors, and its stage tree is `find`-only. Sweep: `tools/probes/explain_shapes.py`. **The Rust server does reproduce them (2026-10-12)**, because they turned out to follow fixed rules whenever only one index can serve the query: its `explain` (`crates/secantus-commands/src/explain/`) derives the plan from mongod's planning rules — bounds, residual filters, sort and covering, and the `count` / `distinct` / write stages — and derives `executionStats` by walking that plan over the documents. What it still does not reproduce is the part that really is mongod's trial of candidate plans: `rejectedPlans`, the plan cache, and the choice between several usable indexes (a fixed order of preference stands in, and agreed with mongod on every measured case). It reports the plan mongod runs, which is not always how the Rust storage router reads the documents (`tasks/backlog-rust-mongodb.md` 7.075). Sweep: `tools/probes/explain_commands.py`, 786 replies. **Since 2026-10-13 the same plan sets the ORDER the Rust server returns documents in** (`explain/order.rs`, `tasks/backlog-rust-mongodb.md` 7.080): the router says only which documents match, and the plan says in what order mongod reads them, which is also which document a `limit: 1` delete or an update without `multi` changes. A sort is still the store's own; the plan decides how documents that compare equal are left. For a sort the predicate's index does not return, the planner counts mongod's trial of the two candidate plans (`plan::walk_finishes_first`) on a collection of up to 2,000 documents. Sweep: `tools/probes/find_order.py`, 6,531 replies. When a change touches the router or the planner, run it: a router change can no longer move the order, and a planner change now can. The internal `multikey` catalog flag is stripped from `listIndexes` on the way out — mongod doesn't carry it there (re-probed 8.2.11, 2026-08-30); `Storage.index_is_multikey` is the accessor for it. Picker helpers (`_pick_compound_eq_index`, `_pick_compound_range_index`, `_find_leading_field_index`) are shared between the lookup and planning paths.
-
-**Direction support**: single-field and compound indexes accept any per-field direction. The encoder bitwise-inverts the bytes for DESC fields so the WT B-tree gives us the index's natural order with a forward walk. Equality, `$in`, range (`$gt`/`$gte`/`$lt`/`$lte`) — operator semantics flip automatically when targeting a DESC field — and direction-aware sort acceleration all work end-to-end on single-field indexes, and the equality/prefix/trailing-operator paths all work on mixed-direction compound indexes.
-
-**Partial indexes**: indexes accept a `partialFilterExpression` option (e.g. `{status: "active"}`); only docs that `matches()` the expression get entries written, and pickers may use a partial index only when the user query *implies* the partial filter. Implication is sound-not-complete (`_query_implies_partial` / `_op_implies_bound` / `_clause_implies_bounds`, ported to the Rust `query_implies_partial` / `op_implies_bound` / `clause_implies_bounds`): a bare equality matches an equal bare partial value, **and** the range operators `$eq`/`$lt`/`$lte`/`$gt`/`$gte` are recognised on *both* sides — `{a: {$lte: 1.5}}` is implied by a query `a: 1` or `a: {$lt: 1}`. Comparison is via `encode_value` **within one BSON type bracket only**: the range operators are type-bracketed (`{$gt: 0}` matches numbers and nothing else), so comparing across brackets — which is what a bare `encode_value` compare does, since a string sorts above every number — concluded that `{b: "x"}` implied `{b: {$gt: 0}}`, used an index that does not contain those documents, and made `find({a: 5, b: "x"})` return NOTHING (found and fixed 2026-09-01; `_type_bracket` is the gate). **NaN needs a second gate, which the bracket one cannot supply** — NaN is INSIDE the numeric bracket, but the two orders mongod maintains disagree about it: sort places it below `-Infinity` while every range operator excludes it (equality still matches it). So a sort-key compare concluded that `{b: NaN}` implied `{b: {$lte: 1.5}}`, and `find({b: NaN})` over a partial index on that filter returned NOTHING while the same query without the index returned the row — the same silent-data-loss shape as the bracket bug, one value class further in (found and fixed 2026-09-03; `_is_nan_value` refuses any non-`$eq` bound with a NaN on either side, on both servers). Document-level operators and non-range partial operators still aren't reasoned about (→ COLLSCAN, correct but slower). The picker strips partial-filter keys when matching the user filter against the index key spec, so a query like `{status: "active", n: 5}` against a partial index on `{n: 1}` with filter `{status: "active"}` correctly uses the index. A *multi-field* query against a *single-field* partial index also lights up when every residual field is exactly a partial-filter field implied by the query (`_single_field_partial_residual_match`): `find({x: {$gt: 1}, a: 1})` against an `{x:1}` index partial on `{a: {$lte: 1.5}}` rides the index on `x` while `a:1` is partial-implied (rechecked by the exact `matches()` pass). `explain` flags an IXSCAN over a partial index with `isPartial: true`.
-
-**Sparse indexes**: a sparse index holds an entry for a doc with **at least one** of the indexed fields (`_sparse_covers`, mongod's compound-sparse rule); requiring all of them under-indexed compound sparse indexes and lost rows. **An index built before 2026-09-01 under-indexes until it is dropped and recreated** — nothing rewrites existing entries. The pickers refuse a sparse index for any query whose predicates could match a MISSING field (`_sparse_index_usable` / `_predicate_may_match_missing`: bare `null`, ANY comparison against null — `$eq` / `$lte` / `$gte` / `$lt` / `$gt`, not just `$eq`, which the first version of the gate missed — an `$in` containing null, `$exists: false`, `$ne` / `$nin` / `$not`, or an unconstrained indexed field) — a sparse index is usable only when some indexed field is *guaranteed* present. Without that gate `find({a: null})` skipped every doc missing `a`, and any collated or uncollated sort over a sparse index dropped the docs it omits. Both were silent data loss; see `tests/test_sparse_and_partial_index_fidelity.py`.
-
-**TTL indexes**: `expireAfterSeconds` is honoured by `Storage.prune_ttl(db, coll, *, now=None)` which walks the collection, deletes docs whose indexed `datetime` field is older than `now - expireAfterSeconds`, and removes their index entries. The clock is injectable so tests can drive expiry deterministically. There is **no background sweeper** — real MongoDB prunes every 60s; SecantusDB requires the caller to invoke `prune_ttl` explicitly. Docs without the TTL field, with non-date values, or with values inside the window are left untouched.
-
-Multi-field sort acceleration: a sort spec whose `(field, direction)` tuple list exactly matches — or fully inverts — a compound index's key spec walks the index in forward / backward order and skips the Python post-sort entirely. Picker is strict-shape only (partial-prefix sorts, mixed-direction mismatches, and multikey indexes fall back to COLLSCAN + Python sort). `_compound_index_for_sort` lives in `storage.py` next to `_single_field_index_for`; the planner mirrors the same rules in `explain_plan`.
-
-Per-index collation shipped (strength 1/2/3 + `caseLevel` across single-field and compound indexes; `numericOrdering` still falls back to COLLSCAN — see `tasks/backlog-python-mongodb.md` §2 and `docs/indexes.md` "Per-index collation"). **Collated ORDERING is a three-level key, not a single fold** (`collation.sort_levels`, 2026-09-01): primary = base letters (accents stripped, case folded, or digit-run tuples under `numericOrdering`), secondary = each base character's combining marks weighted by a mark-order table measured from mongod (acute before grave — *not* codepoint order) and reversed under `backwards`, tertiary = case rank flipped by `caseFirst`; `strength` truncates the tuple and `caseLevel` re-adds the case rank. `ordering.sort_docs` takes a collation and `find_matching` / the `$sort` stage pass theirs. 17 of 19 sweep cases match mongod 8.2.11 (`tools/probes/collation_order.py`); the two that do not are LOCALE-specific (Swedish sorts `ä` after `z`), which is CLDR data and needs ICU. **A collated sort is never satisfied by the index walk** — the entries table holds the single-level normalisation and cannot express the levels, so `find_matching` withdraws its "already in sort order" conclusion whenever a collation is in play (the index still FETCHES; only the ordering claim is dropped). Before that, the same query returned a *different order* with and without a collated index. The collation SPEC is validated on `find` / `aggregate` / `count` / `distinct` / `findAndModify` and deliberately not on `update` / `delete`, because mongod does not validate it there either.
-
-Out of scope regardless: text / hashed / wildcard indexes.
-
-**Geo support**: `$geoWithin`, `$geoIntersects`, `$near`, `$nearSphere` field operators and `$geoNear` aggregation stage live in `secantus.geo` + `secantus.query` + `secantus.aggregate`. Doc-side accepts GeoJSON (`{type:"Point|Polygon|...", coordinates: ...}`), legacy `[x, y]` pairs, and `{x, y}` / `{lng, lat}` maps. Query-side accepts `$geometry` (GeoJSON), `$box`, `$polygon`, `$center` (planar disk), `$centerSphere` (great-circle cap, radius in radians). Containment and intersection delegate to Shapely (planar — Shapely 2.x); spherical-circle containment uses haversine in `secantus.geo._great_circle_radians` directly. Distance returns meters when spherical (mean-radius `EARTH_RADIUS_METERS = 6_378_100.0` matching `mongod`'s constant) and planar units otherwise. `$geoNear` sorts ascending by distance and attaches the value under `distanceField`. **Index acceleration lives in `secantus.geo_index`**: `2dsphere` indexes use S2 cell coverings (s2sphere library) — each indexed geometry writes its covering cells *plus every ancestor back to level 0*, mirroring real-mongo's S2 scheme. Queries compute their own covering+ancestors and do exact point-lookups against the entries table; the candidate verifier filters false positives via Shapely / haversine. `2d` indexes use bit-interleaved geohash buckets at the user's `bits` precision (default 26), with a single `(lo, hi)` bbox range scan per query. Picker (`_pick_geo_index_for_filter` / `_try_geo_index_id_keys`) lives next to the compound-index pickers; `explain` reports `IXSCAN` with the full `keyPattern: {field: "2dsphere"}` shape. Geo indexes are flagged `multikey: True` at creation so the regular pickers skip them for non-geo queries. Cell IDs are encoded with `geo_index.encode_cell` (fixed-width 8-byte big-endian uint64) so the WT B-tree gives lex byte ordering aligned with cell-ID order.
-
-### Oplog and change streams
-
-Three more WT tables, in the same connection:
-
-- `table:secantus_oplog` (key_format=`q`, value=BSON) — `seq → entry`. `seq` is a strictly-monotonic int64 minted under the storage `RLock`. Entry shape mirrors mongod's oplog: `ts: Timestamp(secs, ord)`, `op: "i"|"u"|"d"|"c"`, `ns`, `ui` (collection UUID, BSON Binary subtype 4), `o`, `o2`, `wall: datetime`. Updates carry `o = {"$v": 2, "diff": <updateDescription>}` where `diff` is a faithful walk-and-compare from `secantus.diff.compute_update_description` (dotted-path `updatedFields`, `removedFields`, `truncatedArrays`).
-- `table:secantus_preimages` (key_format=`q`, value=BSON) — `seq → pre_image_doc`. Only written when the source collection has `changeStreamPreAndPostImages: {enabled: true}` set via `create` / `collMod`. Used to satisfy `fullDocumentBeforeChange` on `update` / `delete` change events.
-- `table:secantus_oplog_meta` (key_format=`S`, value=BSON) — single key `"state"` storing `{next_seq, last_ts_secs, last_ts_ord}`. Persisted at the end of every `_emit_oplog`, recovered on startup so `Timestamp` minting and seq numbering are strictly greater than any previously-emitted value.
-
-Retention: `prune_oplog(*, now=None)` drops entries older than `oplog_retention_seconds` (default 1h) and trims to `oplog_max_entries` (default 100k), deleting paired pre-images. Called opportunistically (every 1000 emits) and exposed publicly. No background sweeper — same pattern as `prune_ttl`.
-
-Periodic noop heartbeats: `Storage.emit_noop_heartbeat()` writes one `{op: "n", ns: "", o: {msg: "periodic noop"}}` row to the oplog. A background thread fires it every `noop_heartbeat_seconds` (default 0 = disabled; mongod's default is 10s and tests can opt in with smaller intervals). Change-stream projection treats `op: "n"` as "skip the event but advance position", so a quiet collection's `postBatchResumeToken` keeps tracking cluster time and stays inside the oplog retention window. Disabled when `enable_oplog=False`.
-
-Cross-thread reads (`read_oplog`, `read_preimage`, `oplog_floor_seq`, `find_seq_for_ts`) open a **fresh WT session per call** rather than reusing the per-thread cached session. WiredTiger's MVCC keeps a session's read snapshot until the session commits / resets; reusing the cached session for tailable getMore polls would never observe rows committed by writer threads on other connections. The fresh session is cheap and uniformly correct.
-
-Cluster time: `Storage.current_cluster_time()` returns the next monotonic `Timestamp(secs, ord)` and persists it. Used in `hello`'s `lastWrite.opTime` and the `aggregate` reply's `operationTime`.
-
-`hello` advertises the server as a single-node `secantus` replica-set primary (`setName: "secantus"`, `hosts: [<addr>]`, `secondary: false`, `primary: <addr>`, `me: <addr>`, `electionId`, `lastWrite.opTime.ts`) so pymongo's `Watch` accepts the topology. Inside a `replSetStepDown` window the same reply reports `isWritablePrimary: false` / `secondary: true` and DROPS `primary` and `electionId` — mongod's shape for a node that knows of no primary and won no election — and `topologyVersion.counter` advances, because a driver ignores a `10107` whose topologyVersion is not newer than the one it holds. Switch off via `SecantusDBServer(..., replica_set_name=None)` for tests that want a pure standalone hello reply.
-
-Tailable cursors live in `CursorRegistry`: change-stream cursor IDs are int64-random (`> 2**32`) to dodge driver assumptions; the entry carries a `producer` closure (reads oplog → projects events), `position_seq`, `await_data`, and an `invalidated` flag. `_get_more` blocks on `Storage._oplog_cv` (a separate `Lock`-backed `Condition`, **not** the storage `RLock`) until a writer notifies via `_emit_oplog` or until the per-call timeout expires. PyMongo doesn't always send `maxTimeMS` on change-stream getMore; the server uses 1s as the default tailable wait so the connection thread can be reaped on shutdown.
-
-Event projection lives in `secantus/changestreams.py`: `project(seq, oplog_entry, *, storage, full_document_mode, full_document_before_change_mode, scope) -> (event, invalidates)`. Resume tokens are `{"_data": "<hex>"}` where the hex is `bson.encode({"s": seq, "t": ts, "n": ns, "k": documentKey._id})` — opaque to pymongo but enough state for resume / `startAtOperationTime` / invalidation. Drops on a watched coll, dropDatabase on a watched db, and rename of a watched coll all surface a final `invalidate` event and end the cursor on the next getMore.
+**The Rust MongoDB server reproduces mongod's `explain` (2026-10-12)** -- `indexBounds`, the `IDHACK` / `EXPRESS_IXSCAN` / `COUNT_SCAN` / `DISTINCT_SCAN` / `PROJECTION_COVERED` executors and every command's stages, because they turned out to follow fixed rules whenever only one index can serve the query: its `explain` (`crates/secantus-commands/src/explain/`) derives the plan from mongod's planning rules — bounds, residual filters, sort and covering, and the `count` / `distinct` / write stages — and derives `executionStats` by walking that plan over the documents. What it still does not reproduce is the part that really is mongod's trial of candidate plans: `rejectedPlans`, the plan cache, and the choice between several usable indexes (a fixed order of preference stands in, and agreed with mongod on every measured case). It reports the plan mongod runs, which is not always how the Rust storage router reads the documents (`tasks/backlog-rust-mongodb.md` 7.075). Sweep: `tools/probes/explain_commands.py`, 786 replies. **Since 2026-10-13 the same plan sets the ORDER the Rust server returns documents in** (`explain/order.rs`, `tasks/backlog-rust-mongodb.md` 7.080): the router says only which documents match, and the plan says in what order mongod reads them, which is also which document a `limit: 1` delete or an update without `multi` changes. A sort is still the store's own; the plan decides how documents that compare equal are left. For a sort the predicate's index does not return, the planner counts mongod's trial of the two candidate plans (`plan::walk_finishes_first`) on a collection of up to 2,000 documents. Sweep: `tools/probes/find_order.py`, 6,531 replies. When a change touches the router or the planner, run it: a router change can no longer move the order, and a planner change now can.
 
 ### Type-mapping strategy (the critical decision)
 
@@ -342,517 +265,45 @@ one request path:
   thread in-process and `pymongo` connects over real TCP; Python is only the
   launcher, never an operator. **This is the server the project leads with.**
 - **The Rust PostgreSQL server** (`secantusd-pg`, `crates/secantus-pg`) —
-  the PostgreSQL wire protocol over the same `secantus-storage`. SQL is parsed by
-  **`libpg_query`** (the real PostgreSQL grammar via `pg_query`), lowered by
-  `secantus-pgplan` to the MQL filters `secantus-core` already evaluates, against
-  the catalog in `secantus-pgcatalog`. Plan: `tasks/rust-pgserver-plan.md` — but
-  that file's status header predates most of the work; **reproduce before
-  believing it**. Current shape, measured 2026-09-18 rather than read:
-  - Scored by psycopg 3's own unmodified suite: **5,544 pass, none fail**, of
-    5,731 that ran (149 skipped, 34 xfailed, 4 xpassed; 58 more deselected by
-    the gauge's macOS list), measured 2026-10-12 on macOS with psycopg 3.3.4
-    against the tree of PR #1901 (released as 0.1.0-beta.13), in 1,024 s. On
-    2026-10-13 the RELEASED 0.1.0-beta.14 macOS binary, copied to the path
-    the gauge reads, had the same counts in 270 s, and the released 0.1.0-beta.15 one in 316 s: that is the release build
-    against the debug build every other run here used, not a stale run. The
-    run before the 1,024 s one, on PR #1891's tree (0.1.0-beta.12), had the same counts in
-    1,129 s, and the one before that, on PR #1884's tree (0.1.0-beta.11), had the same counts in
-    1,364 s, and the one before that, on PR #1876's tree (0.1.0-beta.10), had the same counts in
-    1,046 s, and the one before that, on PR #1864's tree (0.1.0-beta.9), had the same counts in
-    1,480 s. A run on PR #1874's tree the same day had two failures, both
-    `test_cursor_raw_async.py::test_leak`, which counts Python objects in the
-    client process and passed on three re-runs. The
-    2026-09-18 run this replaces was 5,545 of 5,729 with one failure,
-    `test_typing.py::test_generic_connect`, a static-typing check that never
-    reaches the wire; it passes with `mypy` 2.3.0 installed. Run it with
-    `SECANTUS_GAUGE_SERVER=rust uv run --no-sync python -m psycopg_validation.runner`
-    (~20 min; it writes `.validation/psycopg-raw-rust.json`, a *different* file
-    from the Python server's — do not use `invoke validate-psycopg`, which
-    hardcodes the Python path and would overwrite the Python report).
-    `./inv validate-psycopg-rust` is the same run, followed by a check that
-    every test it started reported a result.
-  - **Do not compare that to the Python PG server's published 98.6%.** That report
-    predates the widening of this gauge: it covers 39 modules / 4,238 tests, this
-    run covers 72 / 5,729. Re-run both before putting them in one sentence.
-  - **MEASURE IT, DO NOT INHERIT THE NUMBER.** The first figure published here was
-    73.8%, taken by a sub-agent against a checkout sitting 116 commits behind
-    `origin/main` — 50 of them touching this crate. It went on the live website
-    before anyone checked `git log`. **Before quoting a gauge number, confirm the
-    tree the artifact was built from** — `git rev-parse HEAD`, then
-    `git log HEAD..origin/main -- <the crate you measured>`.
-
-    **The cheapest tell is WALL CLOCK, and it needs no canary.** The stale run
-    finished in 82s; the honest one takes 1041s. A gauge that finishes 12x too
-    fast did not get faster — it stopped reaching the code. That check works for
-    any measurement, including the dangerous case where a stale artifact runs to
-    completion and merely answers differently; **treat an implausibly fast run as
-    stale until proven otherwise.** (What actually caught it here was narrower: an
-    *existing* test failing with `invalid port number: "0"`, because the old binary
-    printed its requested address rather than its bound one. Had that parsed, the
-    wrong number would have stood.) This is the same rule the pinned-worktree
-    requirement already imposes on *timing* runs, applied to every other number:
-    gauge rates, validation reports, benchmark tables.
-
-    **Much of this is checked for you now (2026-09-28), but not all of it.**
-    `tools/provenance.py` compares a built artifact's stamped `crates/` tree
-    against `git rev-parse HEAD:crates` and ABORTS, and it is called from the
-    pytest collection hook, both probe launchers, `gauge_common.rust_binary()`,
-    the psycopg gauge runner, and the four `bench/` harnesses that feed published
-    tables. So a stale artifact can no longer silently produce a number from
-    those paths. `SECANTUS_ALLOW_STALE_ARTIFACT=1` overrides it (and still
-    prints), for deliberately measuring an OLD build.
-
-    What is still on you: anything launched by hand, a new harness that does not
-    call it, and an artifact carrying no stamp at all — the check abstains rather
-    than guess, so silence is not proof of freshness. `<binary> --version` prints
-    the tree; compare it yourself when in doubt.
-  - **The gauge number above measures the PROTOCOL and the TYPE SYSTEM, which
-    was this server's strong half while the QUERY LANGUAGE lagged far behind
-    it.** That gap is mostly closed as of 2026-09-28 — the paragraphs below are
-    a running record of the day it closed, and the survey opening this bullet
-    is what it looked like BEFORE. Read to the end before quoting any of it.
-
-    Surveyed 2026-09-28 against a binary built from `HEAD:crates`, seventeen
-    features were refused outright (`0A000 … is not supported yet`). **Six of
-    them landed 2026-09-28** — pattern matching (`LIKE` / `ILIKE` / `~`, with
-    `ESCAPE`), `CASE` in both forms, `ORDER BY` over an expression, and a
-    `WHERE` that does not lower to an MQL filter (evaluated per row as a
-    residual). The predicate corpus is 17/17 against PostgreSQL 14.13.
-
-    **And the survey's own "biggest single lever" landed the same day:
-    SUBQUERIES AND CTEs**, in every UNCORRELATED form — a scalar
-    `(select 1)`, `EXISTS` / `NOT EXISTS`, `IN` / `NOT IN`, `ANY` / `ALL`,
-    `ARRAY(select …)`, `FROM (select …) s` with `s(a, b)` column aliases, and
-    non-recursive `WITH`. The subquery corpus is 45/50 against PostgreSQL
-    14.13 (`tools/probes/pg_corpora/subqueries.sql`); the five that differed
-    were CORRELATED subqueries, which landed 2026-09-29 (below).
-
-    **And window functions landed 2026-09-28 too**, the other lever named
-    above: the whole family (`row_number` / `rank` / `dense_rank` /
-    `percent_rank` / `cume_dist` / `ntile`, `lag` / `lead` / `first_value` /
-    `last_value` / `nth_value`, and the aggregates as windows), `PARTITION BY`
-    and `ORDER BY`, `ROWS` / `RANGE` / `GROUPS` frames with value offsets, all
-    three `EXCLUDE` forms, named `WINDOW` clauses and `FILTER`. Two corpora
-    against PostgreSQL 14.13: `windows.sql` 26/27, `windows2.sql` 48/48.
-
-    **The default frame is the thing to get right, and it is not obvious.**
-    It is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` whether or not
-    the window has an ORDER BY (measured: `over ()`, `over (order by id)` and
-    `over (partition by g)` all parse to the identical `frame_options`), and
-    under RANGE a bound at CURRENT ROW means the row AND ITS PEERS. So tied
-    rows share a running total, and a window with no ORDER BY sees the whole
-    partition — the second is the first with every row a peer, not a separate
-    case. An implementation that treats the default as ROWS is wrong on every
-    tie.
-
-    **`ALTER TABLE` landed 2026-09-28** — `ADD` / `DROP COLUMN`, `SET` /
-    `DROP DEFAULT`, `SET` / `DROP NOT NULL`, `ALTER COLUMN TYPE`,
-    `ADD CONSTRAINT CHECK`, `DROP CONSTRAINT`, `RENAME COLUMN` and
-    `RENAME TO`, several actions per statement. The DDL corpus went 28
-    divergences of 41 to 7, all seven index or view.
-
-    Two rules there are worth carrying. **The stored rows are REWRITTEN** on
-    `ADD` / `DROP COLUMN` rather than left short a field — otherwise a column
-    dropped and re-added under one name would resurrect the old values, which
-    no error would flag. And **`ALTER COLUMN TYPE` is governed by the TYPES,
-    not the values**: PostgreSQL allows it only where an assignment cast
-    exists, so `text -> int` is `42804` even when every value is a digit
-    string (measured across 31 pairs on 14.24 — to a string type always,
-    within the numeric family, within the date/time family, `json`/`jsonb`,
-    and a type to itself; everything else needs `USING`).
-
-    **Sequences and identity columns landed 2026-09-28** — `CREATE` / `ALTER`
-    / `DROP SEQUENCE`, `nextval` / `currval` / `setval`,
-    `pg_get_serial_sequence`, a sequence read as a relation, and
-    `GENERATED ALWAYS` / `BY DEFAULT AS IDENTITY` with both `OVERRIDING`
-    clauses. The sequences corpus went 24 divergences of 26 to 1 (the one left
-    is `information_schema.sequences`).
-
-    That work also closed a **cross-server catalog leak this repo's own rule
-    warns about**: a column's keys that the Rust model does not own —
-    `identity`, `enum_type`, `generated`, `comment` and four more — were
-    written back as unconditional NULLs, so any Rust rewrite of a catalog row
-    ERASED what the Python server recorded. Unreachable until `ALTER TABLE`
-    started rewriting rows, and then immediately reachable. They round-trip
-    verbatim now. **If you add a catalog field to one server, check the other
-    preserves it** — the golden test in `secantus-pgcatalog/src/golden.rs` is
-    what catches this class.
-
-    **`information_schema` and the catalog views landed 2026-09-28** —
-    `information_schema.columns` / `.tables` / `.table_constraints` /
-    `.key_column_usage` / `.sequences`, plus `pg_class`, `pg_namespace`,
-    `pg_index`, `pg_indexes`, `pg_attrdef`, and `pg_attribute` over TABLES
-    rather than only composites. The catalog corpus went 19 divergences of 22
-    to 4.
-
-    Two things there are easy to trip over. **Seven catalog functions worked
-    only as a BARE select-list target** — `version()`, `current_setting()`,
-    `obj_description()` and friends become a `ConstCol` the server resolves
-    when they stand alone, and answered `0A000` inside any expression, which
-    is how a client actually writes them; `scalar::is_scalar` is the gate, and
-    a name absent from it never reaches the evaluator. And
-    **`information_schema`'s views are called `tables` / `columns` /
-    `sequences`**, names a user table may have — a virtual relation wins over
-    the catalog, so they keep their schema in the name (see
-    `secantus_pgplan::relation_name`) or a user's own `columns` table becomes
-    unreachable.
-
-    **General JOINs, correlated subqueries, views and indexes landed
-    2026-09-29.** A JOIN of any kind -- inner / LEFT / RIGHT / FULL / CROSS,
-    `USING`, `NATURAL`, three or more relations, subquery and function sides
-    -- is planned as a SOURCE (`secantus-pgplan/src/joins.rs`) and every
-    clause over it is the single-source planner's, so `SELECT *`, aggregates
-    and windows over a join all work. A correlated subquery becomes a per-row
-    call (`correlated.rs`), evaluated by a runner the executor installs.
-    `CREATE [UNIQUE] INDEX` and `CREATE VIEW` share the Python server's
-    on-disk shape. Corpora: `joins` 0/38, `subqueries` 0/53, `ddl` 0/41,
-    `indexes` 2/48, `views` 2/44, `correlated` 1/24.
-
-    Three rules from that work worth carrying:
-
-    - **A joined row is keyed `alias<U+001F>column`, and the source exposes
-      ONLY those keys.** The lowering resolves a column by its LAST name part
-      and ignores the qualifier, so `j.id` and `k.id` would otherwise be one
-      column. Every reference is rewritten to its key first; one the rewrite
-      misses finds nothing and is a 42703 -- never a binding to the wrong
-      side. A bare name both sides have is 42702.
-    - **The narrow two-table join path still goes FIRST**, because psycopg's
-      catalog queries rely on its regtype-aware OID equality. It now refuses
-      (and so hands to the general planner) the three shapes it answered
-      wrongly: a WHERE on the NULLABLE side of a LEFT JOIN (it pre-filtered,
-      keeping rows PostgreSQL drops), a bare name both sides have, and a
-      qualifier naming neither side.
-    - **A subquery with a side effect runs only in the plan that EXECUTES.**
-      A statement is planned for its Describe as well as its Execute, and an
-      uncorrelated subquery runs during planning -- so `select (select
-      nextval('s'))` advanced the sequence two and three times.
-      `planning_to_execute` marks the executing plan; every other plan sees
-      a volatile subquery return no rows.
-
-    **Functions, triggers, EXPLAIN, LATERAL and passwords landed
-    2026-09-29.** `CREATE FUNCTION ... LANGUAGE sql | plpgsql` is callable
-    everywhere an expression or a FROM item goes; PL/pgSQL runs on an
-    interpreter over `pg_query::parse_plpgsql`'s JSON
-    (`secantus-pg/src/plpgsql_fn.rs`), which also runs the `DO` blocks
-    the older `plpgsql_do.rs` subset refuses. `CREATE TRIGGER` fires BEFORE /
-    AFTER, ROW / STATEMENT (`triggers.rs`). Also landed: window functions over
-    aggregates, expression column defaults, composite `PRIMARY KEY` and
-    multi-column `FOREIGN KEY`, `LATERAL`, `EXPLAIN` (plan shape, zero costs),
-    and SCRAM password verification. Corpora: `functions` 0/27, `triggers`
-    0/41, `triggers2` 0/44, `do_blocks` 0/16.
-
-    Two rules from that work:
-
-    - **A statement that can run user code is its OWN transaction**, even in
-      autocommit (`runs_user_code` sends it through `run_batch`'s implicit
-      transaction). Without that, a trigger or `DO` block that raised after
-      writing left the writes committed.
-    - **User code can write ANY table**, so while a trigger or user function
-      exists, an open savepoint captures every table, not just the statement's
-      target -- otherwise `ROLLBACK TO` left a trigger's writes behind.
-
-    **Full-text search, formatting, datetime, jsonpath and the statistical
-    aggregates landed 2026-09-29** (`fts.rs`, `formatting.rs`, `datetime.rs`,
-    `jsonpath.rs`, `jsonfn.rs`; server `aggregates.rs`). Each was TRANSCRIBED
-    from the PostgreSQL C source rather than written from the docs, and
-    checked by a matrix of `SELECT <expr>` against PostgreSQL 14: numeric
-    `to_char` 471/471, `to_number` 401/401, datetime 1009/1009, jsonpath
-    935/935. Two rules from that work:
-
-    - **PostgreSQL on arm64 contracts floating-point multiply-adds into FMA**,
-      so the last digit of `percentile_cont`, `corr`, `regr_*` and `stddev`
-      over floats only matches with `f64::mul_add` at the same sites. Code
-      that looks algebraically equal still differs in the last digit.
-    - **`char(n)` is stored TRIMMED and padded where it enters an expression**
-      (`ROW_WIDTHS` / `pad_bpchar`), then trimmed again for comparison, `||`
-      and text casts. `octet_length` / `concat` / `format` see the padding;
-      most other functions do not.
-
-    **Batch 7 (2026-09-29)** closed two silent-write bugs and a run of gaps.
-    `UPDATE ... FROM` / `DELETE ... USING` had ignored the extra FROM and
-    written EVERY row; they are now rewritten into correlated subqueries.
-    A `READ ONLY` transaction had written freely; it now refuses (25006).
-    Also landed: automatically updatable views with CHECK OPTION, `int4`
-    overflow (it had silently widened to int8), exact numeric `sqrt` / `exp` /
-    `ln` / `log` / `power` (transcribed scale rules, BigInt values), bit
-    strings, a transcription of `DecodeDateTime` for date/time input,
-    `AT TIME ZONE`, expression indexes with UNIQUE enforced, `ORDER BY` over
-    aggregates, `GROUPING()`. Rules from that work:
-
-    - **A rewrite beats a new plan node.** UPDATE FROM, views, aggregate
-      ORDER BY and an aggregate over a residual WHERE are all AST rewrites
-      onto shapes the planner already runs (correlated subqueries, a FROM
-      subquery). Each needed no executor change.
-    - **Case mapping is Unicode-aware with the SIMPLE mapping**, and the
-      server reports (and `pg_database` records) `C.UTF-8`. This box's
-      reference cluster runs `C`, which maps no non-ASCII letter, so a corpus
-      that measures case or character classes declares `# reference-locale:
-      C.UTF-8` and the probe runs it in a reference database of that locale.
-      Matching the `C` cluster instead would break against every UTF-8-locale
-      server.
-
-    **Batch 12 (2026-09-30)** fixed two more silent wrong answers: a
-    `DELETE ... USING (subquery)` that deleted every row, and a `HAVING` with
-    no `GROUP BY` that was ignored. It also replaced three approximations with
-    PostgreSQL's own machinery:
-    - rules now rewrite the statement (`rule_rewrite.rs`), where they used
-      to run as per-row triggers;
-    - built-in calls pick an overload with `func_select_candidate`
-      (`funcsig.rs`, over PG 15's `pg_proc` / implicit casts / type
-      categories), so `round(int)` is `float8` and
-      `generate_series(int2, int2)` is `42725`;
-    - `pg_type` carries PG 15's facts for the built-ins.
-
-    Rules from that work:
-
-    - **Overload choice is by TYPE CATEGORY, and the answer is often not the
-      "natural" one.** An integer argument to `round` / `ceil` / `floor` picks
-      `float8` over `numeric` because `float8` is the numeric category's
-      preferred type. Read the catalogs (`pg_proc`, `typcategory`,
-      `typispreferred`) rather than reasoning about which overload "fits".
-    - **Check `git ls-files` before naming a new corpus.** A new
-      `overloads.sql` was written over the existing user-function corpus of
-      that name and only the `M` in `git status` gave it away.
-
-    **Batch 13 (2026-09-30)** fixed two privilege bugs: a column GRANT acted
-    as a table GRANT, and a recreated table inherited a dropped one's grants.
-    It also added procedures, `ALTER FUNCTION`, every `ALTER ... RENAME`,
-    and PostgreSQL's own relations in `pg_class` / `pg_attribute`. Rules
-    from that work:
-
-    - **Catalog state the Python server also keeps goes in the Python
-      server's collection and shape.** Column grants, relation ACLs and
-      routine parameter modes each had a Python layout already
-      (`__sql_column_grants__`, `__sql_relation_acl__`, `param_modes`); the
-      first Rust version invented its own and had to be rewritten. Grep
-      `src/secantus/sql/catalog.py` before adding a field.
-    - **Dump reference catalogs with `oid < 16384`.** The shared reference
-      database holds other sessions' tables, whose TOAST relations sit in
-      `pg_toast`; a `pg_class` dump without the filter shipped 42 of them as
-      "system" relations.
-
-    **What remains refused** (re-measured 2026-09-30, after batch 11): no
-    statement the earlier surveys listed. Batch 11 landed `CREATE CAST` /
-    `COLLATION` / `RULE` / `EVENT TRIGGER`, the foreign-data statements
-    (a foreign table refuses reads with PostgreSQL's own `55000`, since no
-    FDW handler exists here), pgcrypto's `pgp_*`, callable `LANGUAGE
-    internal` wrappers, and `pg_get_viewdef` / `pg_rules` / `pg_get_expr` in
-    ruleutils' own layout (`secantus-pgplan/src/ruleutils.rs`). A
-    partition's own column options in `PARTITION OF (...)` work (re-measured;
-    an earlier version of this paragraph still listed them). What each
-    leaves is in `tasks/backlog-rust-postgres.md`'s batch 9 / 10 / 11 entries.
-
-    **Two batch-11 lessons:**
-    - **Both reference servers' OpenSSL 3 builds lack Blowfish and CAST5**,
-      so PostgreSQL itself cannot check those pgcrypto ciphers here. GnuPG
-      was the reference for them; do not "fix" them to agree with a PG error.
-    - **ruleutils prints the ANALYSED query.** Which casts appear depends on
-      the operators PostgreSQL resolves (`text = name` is an operator of its
-      own; `varchar = varchar` is `text = text`, casting both sides). The
-      printer falls back to the text as written rather than guess, and every
-      rule it knows was measured against PostgreSQL 15 on a corpus.
-
-    **Two batch-10 lessons worth not re-deriving:**
-    - **Operators resolve by TYPE, at plan time.** A comparison across type
-      categories (`text = int`, `date = int`, `bool = int`) is PostgreSQL's
-      `42883`; lowered to MQL it compared across BSON types and matched
-      NOTHING -- a silent empty answer. `optype.rs` checks operands typed in
-      the statement's own FROM scope; inside a subquery nothing is checked.
-    - **A probe whose two sides fail identically is vacuous.** A mixed-format
-      probe reported SAME while both runs died on the same Python
-      IndentationError. Count the lines each side produced before believing
-      a diff that says they agree.
-
-    `MERGE`, row-level security (ENFORCED now), `LOCK TABLE`,
-    `statement_timeout` / `lock_timeout`, `CLUSTER`, array lower bounds,
-    `ALTER TABLE ADD UNIQUE / PRIMARY KEY / FOREIGN KEY`, SQL `PREPARE`,
-    `INSTEAD OF` / constraint triggers and transition tables have all
-    landed. `tasks/backlog-rust-postgres.md` has the detail.
-
-    **Three batch-9 lessons worth not re-deriving:**
-    - **An autocommit write ran with NO transaction**, so a SET computed from
-      a row was written after another session's commit -- a silent lost
-      update (`2` where PostgreSQL answers `101`). Autocommit row writes now
-      run in a transaction of their own, retried on a write conflict at READ
-      COMMITTED (`run_autocommit_write`). A probe had to run two sessions
-      concurrently to see it; no single-connection corpus could.
-    - **`Storage::insert` REPORTS a rejected document in its result rather
-      than failing**, and a dozen callers dropped that result -- one of them
-      the table rewrite, which lost rows on a duplicate key.
-      `insert_checked` is the call to use.
-    - **The server reports PostgreSQL 15.0, but the reference cluster is
-      14.** A PG 15.19 cluster (`brew install postgresql@15`, run on port
-      5415) is the reference for what 15 added; a corpus asks for it with
-      `# reference-version: 15`.
-
-    **Correlation detection is still the qualifier check.** `foreign_qualifier`
-    finds a qualified reference naming nothing in the subquery's own FROM and
-    routes the subquery to the per-row path; an UNQUALIFIED outer reference is
-    found by planning and catching 42703 for a name the outer query has.
-    Keep both honest -- the qualifier is ignored everywhere else.
-
-    **Both clause-dropping bugs this survey found are now FIXED** (2026-09-28).
-    `ON CONFLICT` and `GROUPING SETS` / `ROLLUP` / `CUBE` were each parsed and
-    then discarded, so the client got a confident wrong answer — a `23505`
-    where PostgreSQL succeeds, and a `42803` blaming the user's own query —
-    rather than an honest `0A000`. Both are implemented; what each still
-    refuses, it refuses loudly and by name (a partial-index `ON CONFLICT`
-    arbiter, and the `GROUPING()` function). See `tasks/backlog-rust-postgres.md` §5 for the
-    full survey and what DOES work.
-
-    So do not read "96.8% of psycopg passes" as "nearly done". A SQL-shaped gauge
-    (`sqllogictest`, the SQLAlchemy dialect suite) would score very differently.
-    With joins, subqueries (correlated too), CTEs, window functions, views,
-    indexes, `ALTER TABLE`, sequences and `information_schema` landed, what
-    is left is the function surface, and it is measured two ways.
-
-    **The corpora are nearly clean, and that says less than it looks.**
-    Measured 2026-10-14, all 262 corpora under `pg_corpora/`, one at a
-    time (`tools/probes/pg_corpora_sweep.py`): 7 divergences in 9,870
-    checks (13 in 9,737 on 2026-10-12). An earlier version of this paragraph named `fts`,
-    `datetimes` and `char_padding` as the corpora with the most divergences;
-    each was at none when measured. A corpus holds the statements somebody
-    thought to write, so a clean corpus is silent about the rest.
-
-    **`tools/probes/pg_builtin_coverage.py` measures the rest.** It calls
-    every immutable or stable function in PostgreSQL 15's `pg_proc` on both
-    servers, with one sample value for each argument type. On 2026-10-12, of
-    the 1,935 it can call, 619 answered the same before the batch of that
-    day and 1,439 after it. That first run found `sum(interval)` answering
-    zero, `substr` over a `bytea` answering the bytes' debug text and
-    `mod(7.5, 2)` answering 1, none of which a corpus line had asked. Its
-    summary splits what is still refused by what in the catalog refers to
-    the function (an operator, a type's input and output, an index), so
-    the functions a statement calls by name are counted on their own; run
-    it for the current list. `pg_corpora/builtin_coverage.sql` pins what
-    that batch fixed, with PostgreSQL 15.19's answers recorded beside it
-    (`--record`), and `tests/test_rust_pg_builtin_coverage.py` runs them in
-    CI without a PostgreSQL.
-
-    Three rules from that batch:
-
-    - **A built-in is picked by its argument TYPES, and the name-keyed
-      tables cannot do that.** `substr(bytea, int)` reached the text
-      `substr` and rendered the bytes first. An overload the name alone
-      does not settle goes in `secantus-pgplan/src/builtins.rs`, which is
-      asked before the name-keyed paths in all three places a call is
-      planned: the expression evaluator, a FROM-less select list, and a
-      call over one column.
-    - **Every operator is a function too**, and a call by that name
-      (`int4pl(a, b)`) is rewritten into the operator before planning
-      (`builtin_alias.rs`, from PostgreSQL 15's `pg_operator`). The table
-      holds only names measured as refused, and not one with a VARIADIC
-      overload: `jsonb_extract_path(j, 'a')` is the path's first step, and
-      rewriting it to `j #> 'a'` broke a call that had worked.
-    - **Run the corpora one at a time against a shared reference.** Four
-      at once reported 39 divergences where there were 13: an event
-      trigger in one corpus fires for another's DDL, and two corpora that
-      create one schema drop it under each other. `pg_corpora_sweep.py`
-      is serial unless told otherwise, and says so when it was not.
-  - TLS since 2026-10-10 (`--tls-cert-file` / `--tls-key-file`,
-    `PgBuilder::tls`; rustls with the `ring` provider, in
-    `crates/secantus-pg/src/tls.rs`). Since 2026-10-11 also SCRAM channel
-    binding (`scram_binding.rs`), client certificates (`--tls-ca-file`,
-    `--tls-client-cert verify-ca|verify-full|cert`), `--tls-require` and
-    `pg_stat_ssl`. The server has no `pg_hba.conf`: those options are the
-    lines it can stand for, and `TlsPolicy` is what a login is held to.
-    Since 2026-10-11 also revocation lists (`--tls-crl-file`, checked by
-    `crl.rs` and not by rustls, which cannot read a list without
-    extensions), a user name map (`ident.rs`, `--tls-ident-file` /
-    `--tls-user-map`), `--tls-client-name DN`, and a reload of the files
-    on SIGHUP or `pg_reload_conf()` (`live.rs`). And `--hba-file`
-    (`hba.rs`): with a `pg_hba.conf`, its lines decide every login and the
-    options that stood in for such lines are refused beside it.
-    The login rules have a standing comparison with PostgreSQL 15:
-    `tests/test_rust_pg_login_differential.py` runs three probes
-    (`tools/probes/pg_login_*.py`, 915 scenarios) and needs
-    `SECANTUS_PG15_BIN` set to a PostgreSQL 15 `bin` directory, which CI's
-    `pg-oracle` lane installs. **Without that variable it SKIPS**, so a
-    green local suite says nothing about a login change: run it by name.
-    `SECANTUS_GAUGE_TLS=1` gives the psycopg gauge a TLS run, written to
-    `.validation/psycopg-raw-rust-tls.json`. `./inv validate-psycopg-rust
-    --tls` runs the plain gauge and then that one, and
-    `.github/workflows/psycopg-tls.yml` does the same on Linux each week
-    and on a PR that touches the TLS code; both fail on a run that stopped
-    short and on a test that fails over TLS only
-    (`psycopg_validation/check_run.py`). The CI lane is looser on the
-    second, because a hosted runner fails a different timing test in each
-    run: it runs a TLS-only failure again before counting it, and leaves
-    three families of timing test out by name. The embedded Python handle takes
-    the TLS and `pg_hba.conf` options since 2026-10-12.
-    `tasks/backlog-rust-postgres.md` section 3.1 has what is open.
-  - Password verification works since 2026-09-29: a role with a password must
-    pass SCRAM-SHA-256; a role with none is trusted. **An unknown user is
-    REFUSED by default** (Joe, 2026-10-16), as PostgreSQL refuses a role
-    that does not exist; `--trust-unknown-users` (`trust_unknown_users` on
-    the embedded handles) lets it in. A harness that connects as a role
-    nobody created (`test`, `probe`, the OS user) must pass that flag or
-    connect as `postgres` -- the slice tests' `_Server` adds it.
-    **`UNIQUE` IS enforced** — the earlier claim that it was "accepted without
-    being enforced" was stale when measured against PostgreSQL 14.24 on
-    2026-09-20: a duplicate on a column-level or table-level `UNIQUE` raises
-    23505 on INSERT *and* on UPDATE, and several NULLs coexist, exactly as
-    PostgreSQL has it. `DISTINCT`, `DISTINCT ON`, `count(DISTINCT ...)` and
-    `UNION` / `INTERSECT` / `EXCEPT` were genuinely missing until 2026-09-20
-    and are now implemented.
-  - Builds from **its own directory** (`cd crates/secantus-pg && cargo build
-    --release`), because it links WiredTiger and is excluded from the clean
-    workspace. `./inv rust-pgserver-build` (the task lives in `rust_tasks.py`, not
-    `tasks.py`) does the debug build the gauge expects.
+  the PostgreSQL wire protocol over the same `secantus-storage`. SQL is parsed
+  by **`libpg_query`** (the real PostgreSQL grammar via `pg_query`), lowered by
+  `secantus-pgplan` to the MQL filters `secantus-core` already evaluates,
+  against the catalog in `secantus-pgcatalog`. It builds from **its own
+  directory** (`./inv rust-pgserver-build`), because it links WiredTiger and
+  is excluded from the clean workspace. **Before any work on it, read the
+  `rust-pg-server` skill** (`.claude/skills/rust-pg-server/SKILL.md`): how to
+  build, test and measure it, the reference servers (PostgreSQL 15.19 on port
+  5415, 14 as the default cluster), where each kind of change goes, and the
+  rules earlier batches paid for. Open work is `tasks/backlog-rust-postgres.md`;
+  the record of what landed when is git history and `changelog.d/`.
 - **The Python MongoDB server** — the *original* `SecantusDBServer` (pure-Python
   `server` / `wire` / `commands` / `Storage` / operator engines). No Rust in the
   request path.
 - **The Python PostgreSQL server** (`secantus.sql.pgserver`) — the PostgreSQL wire
-  over the same Python `Storage`. The older and **more complete** SQL surface of
-  the two; the Rust one is its port, not its replacement.
+  over the same Python `Storage`. Deprecated: the Rust PostgreSQL server is its
+  replacement and now the more complete SQL surface.
 
-#### Versioning: the servers version independently
+#### Versioning: three independent version lines
 
-The Python server and the Rust server are **separate deliverables with separate
-version lines** — they **diverged at `0.5.2`** (Python `0.5.2b33` / Rust crates
-`0.5.2-beta.15`) and advance independently from there. A change that touches only
-one server bumps only that server's version:
+- **The Python package**: `pyproject.toml` `version` + `src/secantus/__init__.py`
+  `__version__` (`0.5.2bN`, PEP 440), set by `invoke release-prepare`.
+- **The Rust MongoDB server**: the `version` of the thirteen MongoDB-side
+  `crates/*/Cargo.toml`, in **lockstep** (`0.MAJOR.PATCH-beta.N`). Bumping the
+  patch (or minor/major) resets the beta label to 0 (`0.5.2-beta.20` →
+  `0.5.3-beta.0`). Surfaced as `buildInfo.secantusVersion`, `secantusd-rs
+  --version` and `RustServer.version` (from `secantus_server::VERSION`).
+- **The Rust PostgreSQL server**: `secantus-pgcatalog` / `secantus-pgplan` /
+  `secantus-pg`, a line of their own that is NOT bumped with the MongoDB server.
 
-- **Python server version** — `pyproject.toml` `version` + `src/secantus/__init__.py`
-  `__version__` (`0.5.2bN`, PEP 440). This is the **PyPI package** version.
-  **Feature PRs do NOT bump it.** The version is assigned at release time by
-  `release-prepare` (`invoke release-prepare X.Y.Z` → `_bump_version_files`). This
-  is deliberate: every PR that bumped the single `version` line picked a concrete
-  number at branch time that was stale by merge time, so any two concurrent PRs
-  conflicted on that one line — the dominant source of cross-session rebase churn
-  (many parallel SQL sessions all bumping `pyproject.toml`). Leaving the version to
-  the release makes concurrent feature PRs independent. Between releases `main`
-  simply carries the last released version.
-- **Rust server version** — the `version` field in the **thirteen** MongoDB-side
-  `crates/*/Cargo.toml`, kept in **lockstep** across them (`0.MAJOR.PATCH-beta.N`,
-  SemVer pre-release). **NOT every crate under `crates/`:** the three PostgreSQL
-  crates (`secantus-pgcatalog` / `secantus-pgplan` / `secantus-pg`) carry
-  their own line, at `0.1.0-beta.0` as of 2026-09-18, and are a **third
-  deliverable that is not bumped with the Rust MongoDB server**. The sweep recipe
-  below is safe only because it substitutes one exact version string — a blanket
-  "bump every Cargo.toml under crates/" would fold the PG crates into the MongoDB
-  server's line, which is wrong. **Feature PRs do NOT bump it** either — like the Python version, it
-  is assigned when a Rust release is cut (the `secantusdb-v<crate-version>` tag),
-  not per-PR. **Bumping the patch (or minor/major) component resets the beta label
-  to 0** — e.g. `0.5.2-beta.20` → `0.5.3-beta.0`, never `0.5.3-beta.21`. There is no
-  single `[workspace.package]` source because the WiredTiger-linked crates
-  (`secantus-storage` / `-wt` / `-storage-adapter` / `-server-py` / `-storage-py` /
-  `secantusdb`) are **excluded** from the clean workspace and can't inherit a
-  workspace version — so at release all thirteen MongoDB-side `Cargo.toml` (and
-  their `Cargo.lock`) carry the number and are bumped together (e.g. `find crates -maxdepth 2 -name
-  Cargo.toml -o -name Cargo.lock | xargs sed -i '' 's/0.5.2-beta.N/0.5.2-beta.N+1/'`).
-  The canonical embedded value is `secantus_server::VERSION`
-  (`env!("CARGO_PKG_VERSION")`); the Rust server **embeds and surfaces** it in
-  `buildInfo.secantusVersion` (over the wire), the `secantusd-rs` binary's
-  `--version`, the embedded Python handle's `RustServer.version` getter, and the
-  `_secantus_server.__version__` module attribute. Between releases `main` carries
-  the last released Rust version.
+Bump a Rust line with `./inv rust-version-bump --to <version> [--line pg]`,
+never a blanket substitution across `crates/`, which would fold the PG crates
+into the MongoDB line. Release mechanics: the `secantusdb-release` skill.
 
 **No version bumps in feature PRs — either server.** Both the Python and the Rust
 version are assigned at release time, so a feature PR touches neither `version`
 line. This is the whole point: an in-flight PR that bumped a version picked a
 number that was stale by merge time, so any two concurrent PRs collided on that
-one line (Python) or on the twelve `Cargo.toml` (Rust). Leaving both to the
+one line (Python) or on the thirteen `Cargo.toml` (Rust). Leaving both to the
 release makes concurrent feature PRs — Python-only, Rust-only, or dual-server —
 independent. Describe the change in a `changelog.d/` fragment (see the
 Documentation / Conventions sections); the release stamps the version.
@@ -869,46 +320,14 @@ engines + geo + aggregation, **no PyO3**), `secantus-storage` (the full WT-backe
 exactly what lets the Rust server / standalone `secantusd-rs` binary reuse the
 engines.
 
-- **Current code vs direction.** Today the code still contains the transitional
-  in-process selection (`src/secantus/engine.py`: `selected()` / `enabled()` and
-  the `query`/`update`/`expressions`/`projection`/`diff`/`sortkey`/`aggregate`
-  shims that delegate to `_secantus_core` when enabled; `SECANTUS_ENGINE=python|
-  rust|auto`). **This is being retired** in favour of the two-server model: the
-  Python server reverts to pure-Python, and `_secantus_core` is kept **only as the
-  parity-test vehicle**. Don't build new in-process selection surface; build the
-  Rust server (`tasks/rust-server-plan.md` §4, R1–R8).
-- **Parity suites stay (a DRIFT detector, not an oracle).** Each Rust engine is
-  pinned byte-for-byte to its pure-Python counterpart by a
-  `tests/test_rust_*_parity.py` suite (curated corpus + randomised fuzz); the
-  Rust side returns a "defer to Python" signal for constructs it can't reproduce
-  exactly (regex → Python `re`, collation, Decimal128 edges, non-ASCII case,
-  etc.). When porting/widening a Rust engine, **extend the parity suite first**;
-  never let the two engines drift.
-
-  **But the Python engine is NOT the Rust server's exemplar** — `mongod` is (see
-  "Design constraints" above). These suites say the two engines moved apart;
-  they never say which one to move. A parity failure is a prompt to probe
-  `mongod`, not a licence to make Rust agree with Python.
-- **The parity suites do NOT cover the STORAGE layer** — they pin `query` /
-  `update` / `expressions` / `projection` / `sortkey` / `diff` / `aggregate`,
-  the pure engines. `secantus-storage` has its own port of the index helpers
-  (`op_implies_bound`, `index_key_variants`, the pickers), and on 2026-09-01 it
-  still carried four index defects — three of them silent data loss — for as long
-  as it took someone to grep for them after the Python side was fixed. **When a
-  fix lands in `src/secantus/storage.py`, grep `crates/secantus-storage/` for the
-  same helper**: nothing else will tell you. `tools/probes/index_result_sets.py`
-  is the standing cover for the index half — it compares a server against ITSELF,
-  with and without the index, so it isolates the index from the sort engine and
-  needs no oracle to say which side is wrong.
-- **Implication for changes:** a change to an operator's semantics lands in the
-  Rust port; the Python module is deprecated and is not changed to match. Keep
-  the parity suite green by updating its expectation for the case the Rust
-  change moved (never by changing the Python engine). The Rust server's pymongo +
-  driver gauges must not regress. Plan / phase status / per-engine
-  fallback lists: `tasks/rust-server-plan.md` (north star), `tasks/rust-rewrite-
-  plan.md`, `tasks/rust-rewrite-phase4-scoping.md`, `tasks/rust-rewrite-spike-
-  findings.md`, `tasks/backlog-rust-mongodb.md` §7. Tooling: `invoke rust-test` / `rust-build`
-  / `rust-parity`.
+- **Parity suites are a DRIFT detector, not a reference.** Each pure Rust
+  engine is pinned to its Python counterpart (`tests/test_rust_*_parity.py`).
+  A failure says the engines moved apart, never which is right: probe
+  `mongod`, and when the Rust change was correct, update the parity
+  EXPECTATION for that case; never change the Python engine to match. The
+  suites do not cover the storage layer. The transitional in-process engine
+  selection (`src/secantus/engine.py`) and the rest of this history are in the
+  `python-servers` skill.
 
 ## Tooling
 
@@ -916,15 +335,37 @@ engines.
 - Python 3.12 pinned via `.python-version`. Managed with `uv`. Always invoke Python via `uv run python -m ...` so `pyenv` doesn't intercept.
 - Build/admin tasks: `tasks.py` (`invoke`). `invoke test`, `invoke lint`, `invoke fmt`, `invoke docs`, `invoke serve`.
 - **Admin-UI screenshots are generated, never hand-captured.** `invoke admin-screenshots` (`scripts/admin_screenshots.py`, `screenshots` extra + `playwright install chromium`) boots a throwaway server on `127.0.0.1:27018`, seeds a fictional dataset, drives all 22 admin pages with Playwright, scrubs machine-specific strings from the DOM, and writes `docs/screenshots/`. That directory is the single source for all three surfaces that show the shots: Sphinx (`docs/admin.md`) references it, the README links it on raw.githubusercontent, and the Pelican build copies four of them into the theme at build time (`website/tasks.py` `SITE_SCREENSHOTS` — the theme's `static/img/` is an untracked build mirror). **Regenerate on every release** — `tests/test_docs_screenshots.py` checks that every page has an image and every image is referenced, but nothing can detect a *stale* image, so the `secantusdb-release` skill makes regeneration a mandatory pre-flight step. The run is also the admin UI's only browser-level smoke test: it exits non-zero on any JS error and warns on any page shot in an empty state (that's how four dead-dashboard bugs were found). When iterating from a worktree whose venv belongs to another checkout, pass `--from-checkout .` so it renders *your* templates and static assets rather than the installed package's.
-- `pytest` with `pytest-xdist` parallel by default (`addopts = "-n auto"`). Tests must use `port=0` and a unique `storage_path` per test — pytest's `tmp_path` fixture gives both isolation and automatic cleanup. The default suite runs against real on-disk WiredTiger (schema / tables / B-tree / within-session behaviour all exercised for real) but in **fast test-storage mode**: `tests/conftest.py` sets `SECANTUS_TEST_FAST_STORAGE=1`, which makes `Storage` / `SecantusDBServer` default to `durable=False` (journal on, close-checkpoint skipped). This removes the per-instance close-checkpoint fsync that serialised across xdist workers (see `tasks/test-performance-plan.md`). **The checkpoint-durability path (crash-/reopen-durability, PITR, backup) is therefore NOT covered by the default local suite** — it is covered by (a) fixtures that pass `durable=True` explicitly (persistence / reopen / PITR / backup) and (b) the CI **`SECANTUS_FORCE_DURABLE=1` full-suite lane** (`.github/workflows/test.yml`), which forces full journal + checkpoint durability everywhere and runs the whole suite that way on every push. To reproduce that locally: `SECANTUS_FORCE_DURABLE=1 uv run python -m pytest`. The shipped server is unaffected — `durable` defaults to durable when no test env is set. (`tests/test_storage.py` has explicit `Storage` / `SecantusDBServer` reopen-roundtrip tests.) The perf-regression suite (`tests/test_perf_regression.py`) is the only test file that stays on `:memory:` storage, because the gates compare against fixed in-memory baselines where on-disk variance would invalidate the thresholds.
+- `pytest` with `pytest-xdist` parallel by default (`addopts = "-n auto"`).
+  Tests must use `port=0` and a unique `storage_path` per test (`tmp_path`).
+  The default suite runs real on-disk WiredTiger in **fast test-storage mode**
+  (`SECANTUS_TEST_FAST_STORAGE=1`: no close-time checkpoint), so **checkpoint
+  durability is NOT covered locally**; CI's `SECANTUS_FORCE_DURABLE=1` lane
+  covers it, and so does running that variable locally. Details:
+  `build-and-test`.
 - **Never use a mock storage — always the real `Storage`.** The legacy `FakeStorage` mock (`tests/sqlfake.py`) has been **removed**: every SQL / PG-server test now drives the real WiredTiger-backed `Storage`, and no new mock should be reintroduced. A mock lets a test pass while diverging from what WiredTiger actually does (row/type round-trips, transactions, cross-session visibility, persistence) — the migration off it surfaced several real bugs the mock had masked (a swallowed tz-aware/naive datetime comparison, a `bytea` equality mismatch, a Describe/Execute uncommitted-DDL protocol crash, timestamptz text-render). Build a real `Storage(str(tmp_path))` (close it in the fixture teardown — `try: yield s finally: s.close()`), seed it via `run_sql` with an unrestricted `Session`, and drive the SQL/PG-server code against that. This is a database — tests prove behaviour against the real engine or they prove nothing.
-- **Driver-conformance gauges** — thirteen gauges run **unmodified** upstream tests against SecantusDB: pymongo (embedded; the headline "MongoDB compatibility" number), pymongo async (embedded; pymongo's native `AsyncMongoClient` suite — the async/await wire path that replaced Motor — reusing the same embedded-server plugin and `vendor/pymongo-tests` submodule, run under `pytest-asyncio`), and mongo-go-driver / mongo-node-driver / mongo-java-driver / mongo-kotlin-driver (the official Kotlin driver — `:driver-kotlin-sync:integrationTest`, which ships inside the `mongo-java-driver` monorepo, so it reuses the same vendored submodule + JDK/Gradle toolchain as the Java gauge) / mongo-ruby-driver / mongo-rust-driver / mongo-php-library (PHPUnit) / mongo-php-driver (`.phpt` C extension) / mongo-c-driver (`test-libmongoc`, built from source) / mongo-cxx-driver (`mongocxx` Catch2 `test_driver`, built from source) / mongo-csharp-driver (C# / .NET; `MongoDB.Driver.Tests` CRUD-spec suite via `dotnet test`) (each a daemon subprocess via `MONGODB_URI` / `MONGOC_TEST_URI`). The other-language gauges catch wire-protocol bugs that pymongo's permissive client misses (e.g. cursor.id-must-be-int64); the PHP-extension, C, and Go gauges are the strictest wire-protocol checks. Note the **C++ gauge binds port 27017** — mongocxx's tests hard-wire the driver default URI with no env override, so `validate-cxx` can't share a host with anything else on 27017 and must stay serial in `validate-all`. The **.NET gauge needs the .NET SDK + gpg** (the driver's Encryption project verifies a downloaded libmongocrypt with gpg at build time). Invocation (`invoke validate{,-pymongo-async,-go,-node,-java,-kotlin,-ruby,-rust,-php-lib,-php-ext,-c,-cxx,-dotnet,-all}`), include paths, language toolchain requirements, and current per-gauge caveats live in `/conformance-gauges`. All gauge dirs are dev-only (excluded from sdist/wheel). Validation runs weekly on `.github/workflows/validate.yml`. **Keep `invoke validate-all --jobs` at 4 or fewer.** Each gauge runs its own GIL-pinned daemon plus a driver test process; beyond ~4 concurrent gauges the CPU contention makes timing-sensitive tests flake — the daemon's `hello`/`getMore` handshakes occasionally exceed a driver's `serverSelectionTimeoutMS` (Go's `TestIndexView` and pymongo's change-stream `test_aggregate_cursor_blocks` awaitData timing are the first to go). A `--jobs 8` run produced exactly that flake (pymongo 1019/9 vs the serial 1020/8); the same gauges pass clean serially or at low parallelism. Serial (`--jobs 1`) is the safe default for a committable number; `--jobs 4` is the practical ceiling when you want speed.
-- **Run the full pymongo gauge (`invoke validate` / `./inv validate --server <python|rust>`) in a sub-agent, not the main session.** A full gauge run streams thousands of lines of pytest output and takes several minutes; capturing that in the main context blows the window for no benefit. Delegate it to a sub-agent (the Agent tool) and have it report back only the headline pass/fail/skip counts, the pass %, and the verbatim list of `FAILED ...::test_name` ids. Use the targeted `invoke validate-one <nodeid> --server <python|rust>` form directly in the main session for the single test you're iterating on — that's small and fast. (Same logic applies to the other-language gauges and `validate-all`.) Rebuild the embedded Rust extension with `./inv rust-server-build` before a rust-server gauge run so it measures current code.
-- **Long runs go through `scripts/detached_run.py`, not a bare background shell.** A supervisor that reaps the shell it spawned signals the whole process group, which killed three multi-minute runs in one session (a full suite twice at ~90%, once at 32%) with no OOM and no test failure — just `[killed]`. The helper starts the command with `start_new_session=True` so it leads its own process group and survives:
-  `uv run python scripts/detached_run.py start --name suite -- python -m pytest -q`, then `status --name suite --tail 20` / `wait --name suite --timeout 3600` / `stop --name suite`. State (pid, argv, log, exit code) lands in `.detached-runs/<name>.{json,log}`. `tests/test_detached_run.py` pins the survival property by signalling the launcher's own group.
-- **The Rust server is built with PGO** (profile-guided optimization) on top of thin-LTO + mimalloc (~12–19% on write/aggregate paths; `tasks/rust-perf-findings.md` Finding 8). Two halves: the **standalone `secantusd-rs` binary** builds two-stage per-arch in `.github/workflows/release-binaries.yml` (on-target profile via `bench/pgo_workload.py`); the **wheel-embedded `_secantus_server` extension** consumes a committed profile at `crates/pgo/_secantus_server.profdata.tar.gz` (CMake extracts it and passes `-Cprofile-use`). Regenerate the committed profile with `invoke rust-pgo-refresh` when the Rust hot paths change materially — it's only a hint (unmatched functions ignored, so a stale/cross-arch profile is safe, never build-breaking). `SECANTUS_PGO_DISABLE=1` turns it off; `SECANTUS_PGO_GENERATE=<dir>` switches the extension build to instrumentation (used by the refresh task). Don't delete the committed `.tar.gz` — it's the wheel's profile, not a stray artifact. **The Rust PostgreSQL server's released binary has fat LTO and a profile too (2026-10-13)**: the LTO is the crate's `[profile.release]`, so every release build and `cargo install` has it, and the profile is collected at release time by `scripts/build_pg_release.sh` from `bench/pgo_workload_pg.py`. Nothing is committed for it. A release build of that crate takes about nine minutes here.
-- WiredTiger is **vendored** as a git submodule at `vendor/wiredtiger` (mongodb-7.0.33). The CMake build is driven by `CMakeLists.txt` (scikit-build-core + ExternalProject) and produces self-contained binary wheels via `cibuildwheel` for **cp310–cp313** on macOS arm64, **manylinux_2_28** + musllinux_1_2 x86_64/aarch64, and Windows AMD64 (read off the published 0.6.0b17 wheel list on 2026-09-27 — this line previously said cp312+cp313 / manylinux2014, which had drifted). macOS x86_64 is intentionally absent (runner-pool scarcity, Apple Silicon is the active target). `pip install SecantusDB` ships pre-built on supported platforms; users never need `cmake`/`ninja`/`swig`. The `cmake/patch_wt_*.py` scripts apply small idempotent patches to the vendored WT tree at `PATCH_COMMAND` time (off64_t→off_t for musl, Python module SUFFIX/dynamic_lookup, etc.); fix WT-side incompat by extending one of these patchers, not by editing the submodule directly. **Two patchers change BEHAVIOUR rather than the build**: `patch_wt_dsync_group.py` (2026-10-07, Joe's call) makes concurrent `method=dsync` commits share log writes (only the PostgreSQL server on macOS uses dsync), and `patch_wt_fsync_group.py` (2026-10-09) credits one `fsync` under `method=fsync` with every commit already written, which every server that syncs per commit off macOS runs. A process kill cannot test the second one, because the page cache survives it: its test is a hard reboot under load (`tasks/backlog-rust-mongodb.md`, the Linux entry). Three builds apply the patches and must agree — the wheel's CMake (`apply_wt_patches.cmake`), the crate's bundled copy (`scripts/wt_sys_refresh.py`, then commit `wiredtiger.sha256`) and `./inv rust-wt-build` (which reads the crate's list) — so a new patcher goes in the first two lists.
-- **Sync with `./inv sync` (`uv sync --all-extras --reinstall-package secantus-core`), never a bare `uv sync --extra dev`.** Two ways a partial or cached sync produces a green run that proved less than it looked: (a) without the `rust` extra there is no `_secantus_core`, so the ~1700 engine-parity tests **do not collect at all** — they `importorskip` it deliberately, the suite still exits 0, and only comparing the collected count (~8,770 at the end of 2026-08) catches it; a partial sync also *prunes*, and once removed the whole Pelican toolchain the website tasks need. (b) `uv sync` does **not** rebuild `secantus-core` when its Rust source changes — it is a path dependency and uv reuses the cached build, so pulling a commit that touches `crates/secantus-core*` leaves the venv comparing current Python against **stale Rust**. That was seen as 31 phantom `test_rust_diff_parity.py` failures on a green `main`, which reads exactly like a regression. `--reinstall-package` busts it.
+- **Driver-conformance gauges** -- thirteen MongoDB-driver gauges and three SQL
+  ones run **unmodified** upstream test suites against SecantusDB (invocation,
+  toolchains and quirks: `/conformance-gauges`). **Keep `invoke validate-all
+  --jobs` at 4 or fewer** (1 for a committable number): beyond that CPU
+  contention flakes timing-sensitive tests. The C++ gauge binds port 27017.
+- **Run full gauges in a sub-agent**, not the main session, and use `invoke
+  validate-one <nodeid> --server <python|rust>` to iterate on one test. Always
+  pass `--server`; see the `measuring` skill.
+- **Long runs go through `scripts/detached_run.py`**, not a bare background
+  shell, which a supervisor reaping its process group kills mid-run
+  (`build-and-test` has the commands).
+- **The Rust servers are built with PGO** on top of LTO. The wheel extension's
+  profile is committed at `crates/pgo/_secantus_server.profdata.tar.gz` (do
+  not delete it; refresh with `invoke rust-pgo-refresh`); the release binaries
+  collect theirs at release time. Details: `build-and-test`.
+- WiredTiger is **vendored** at `vendor/wiredtiger` (mongodb-7.0.33). Fix
+  WiredTiger-side problems by extending a `cmake/patch_wt_*.py` patcher, never by
+  editing the submodule; two patchers change behaviour (group commit under
+  `dsync` / `fsync`), and three builds must apply the same list. Details, and
+  the wheel matrix: the `build-and-test` skill.
+- **Sync with `./inv sync`, never a bare `uv sync`**: `uv sync` does not
+  rebuild the `secantus-core` path dependency, and a sync without the `rust`
+  extra uncollects ~1,700 parity tests while still exiting 0 (`batch-worktree`).
 - To run a single test serially: `uv run python -m pytest -n0 tests/path::test_name`. The `-p no:xdist` form fails because `addopts` still injects `-n auto`.
 - Sphinx docs in `docs/` (Markdown via `myst-parser`, furo theme). Built with `-W` (warnings-as-errors). `invoke docs` to build, `invoke docs-serve` to preview.
 - PyPI publishing is OIDC-only via `.github/workflows/publish.yml` on `vX.Y.Z` tags. The workflow refuses to publish if the tag doesn't match `pyproject.toml`'s version. Never run `uv publish` / `twine upload` manually.
@@ -934,54 +375,20 @@ engines.
 
 Both procedures are managed by skills — they auto-fire on the relevant trigger phrases. To inspect or invoke manually: `/secantusdb-release` and `/secantusdb-website`. The skill files are under `~/.claude/skills/`; treat them as the source of truth and edit them there, not here.
 
-- **Release-time benchmark refresh** — `invoke release-benchmark` re-measures
-  SecantusDB against a real `mongod` on three DigitalOcean droplets (three
-  interleaved passes, incompressible payloads) and prints the table for
-  `docs/benchmark.md`. **Run it after the version bump lands on `main`**, so the
-  measured build is the released one. `docs/benchmark.md` is prose with numbers
-  in it and goes stale silently — nothing fails when the engine gets faster.
-  Details in `bench/DO_CLUSTER.md` "At release time".
+- **Release-time benchmark refresh**: `invoke release-benchmark`, after the
+  version bump lands on `main`, so `docs/benchmark.md` measures the released
+  build (`secantusdb-release`, `bench/DO_CLUSTER.md`).
 - **`secantusdb-release`** — the two-phase pipeline (`release-prepare` once in foreground, `release-finalize` in a foreground retry loop), the sub-agent contract, foreground-only constraints, the 8-step pipeline (pre-flight → pytest → perf gates → changelog collation → bump → tag/push → GitHub Release → PyPI workflow + listing), and the hard prohibitions against manual `git tag`/`uv publish`. Docs are **self-hosted at secantusdb.com/docs/** (main tree) and **/docs/rust/** (Rust server) — they deploy with the post-release website publish, not the release pipeline; the readthedocs.io copies are legacy, kept alive with a moved banner.
-- **A Rust server release ends at the live site, not at the GitHub Release**
-  (rule added 2026-10-08). After a `secantusdb-v*` or `secantusd-pg-v*` tag has
-  published its binaries and crates: bump the pinned tag in
-  `website/pelicanconf.py` (`SECANTUS_RUST_BINARY_TAG` / `SECANTUS_PG_BINARY_TAG`),
-  re-read the server's page template against what shipped, write a blog post by
-  hand under `website/content/blog/` (`changelog.blog` only knows PyPI
-  versions), land it via PR and deploy. Every `secantusd-pg-v*` release gets a
-  post; a `secantusdb-v*` release gets one when a user would notice the
-  change, and only the tag bump when it was cut so a benchmark or PyPI release
-  measures the current build. The `secantusdb-release` skill has the steps.
+- **A Rust server release ends at the live site, not at the GitHub Release**:
+  bump the pinned tag in `website/pelicanconf.py`, re-read the server's page,
+  write the blog post by hand, deploy. Steps: `secantusdb-release`.
 - **`secantusdb-website`** — **website content lives on `main`** (the retired `SecantusDB-website` / `website-dev` worktree pattern is gone; Pelican builds the live site from `main`). Edit `website/` on a short feature branch and land via PR (website-only commits skip the full pytest run — only `website/`, this `CLAUDE.md`, and `.gitignore` qualify), then `invoke deploy` from `main` to build + `aws s3 sync` + invalidate CloudFront. Also covers the driver-panel regeneration and the per-release blog-post template (descriptive title + prose body + link bar — never a stub linking out to GitHub).
 
-  **The site leads with the two Rust servers** (nav: Home / Rust MongoDB / Rust
-  PostgreSQL / Performance / Blog). `rust-db.html`, `rust-pg.html` and
-  `python-db.html` are template-only pages — the content is in
-  `website/themes/secantus/templates/`, not in the near-empty `content/pages/*.md`
-  that select them. Two traps when editing:
-  - **Performance prose goes stale silently and independently of its own table.**
-    Three published claims were wrong in 2026-09 — one contradicted the data table
-    directly below it. The measured source of truth is `docs/benchmark.md`
-    (generated, gated by `tests/test_benchmark_table_fresh.py`); the concurrency
-    chart blocks are generated too, between `<!-- concurrency-viz/-table -->`
-    markers, and `tests/test_concurrency_chart.py` fails if you hand-edit them.
-    When you touch a number on the site, re-derive it from those files.
-  - **The driver panels show BOTH servers, and they are generated — never hand-
-    edited.** `drivers_grid.html` comes from `validation_summary/driver_panels.py`
-    (`--server python|rust|both`, `render_both()`); each collector takes an
-    artifact suffix (`""` for the Python server, `-rust-server` for the Rust one)
-    so one code path reads either set. Regenerate rather than editing, and diff a
-    fresh regeneration against the committed partial when a number looks wrong —
-    they must be byte-identical.
-
-    The generator now REFUSES rather than publishing a comforting number: an
-    empty panel, a truncated gauge run (its rate renders as an em-dash, not a
-    percentage), and artifacts whose dates spread too far apart all abort unless
-    you pass `--allow-stale`. If a panel reads blank on the live site, a gauge
-    did not finish — fix the gauge, do not paper over the panel.
-
-    A `validation_summary/` change is **not** website-only, so it does not get
-    the pytest skip; `tests/test_driver_panels_freshness.py` covers this surface.
+  **The site leads with the two Rust servers.** Its pages are templates,
+  its performance numbers and driver panels are generated (never hand-edit
+  them; a blank panel means a gauge did not finish), and a
+  `validation_summary/` change is not website-only. The traps are in the
+  `secantusdb-website` skill.
 
 ## Backlog of stubs and stopgaps
 
@@ -998,192 +405,34 @@ The backlog is the canonical list of commands that are stubbed, features with si
 
 **Every Rust item is a failing test with prose attached.** Each carries a permanent `Backlog-ID:` (`RM-nnn` / `RP-nnn`) and a `Verify:` line naming a gap test under `tests/backlog/` -- asserting the real product's answer, so it fails while the item is open -- and `python tools/backlog.py verify` runs them all (OPEN / FIXED? / BROKEN / UNCHECKED). A fix turns its gap test into the regression test and the `changelog.d/` fragment names both (`Fixes RM-142 (tests/...::test_x)`), so every fix stays traceable to the test that proves it. **The `backlog` skill is the protocol: read it before filing, working or closing an item.**
 
-## Finding bugs: run it against the oracle, don't reason about the source
+## Finding bugs: run it against the reference server, don't reason about the source
 
 Every bug found in the 2026-08 sweeps came from **executing behaviour and
-comparing against a real server**, not from reading code or the backlog. Two
-reference servers are on this box and both are cheap: `mongod` on `PATH`
-(Homebrew `mongodb-community@8.2`, **8.2.11** as of 2026-08-31, linked as the
-default so the differential gate runs instead of skipping), and a live
-PostgreSQL 14 for the SQL side.
+comparing against a real server**, not from reading code or the backlog, and
+estimates from reading code have been wrong in BOTH directions (a one-line fix
+filed as a 16-site refactor; a "planner slice" that already existed).
+**Reproduce an item before working it, and size it from a probe.**
 
-**Check `mongod --version` before recording a measurement**: a *patch* bump has
-changed an error message here before (the expected-type list ordering above), so
-"8.x" is not specific enough to cite. Cite the version you measured, and prefer
-a `Cellar` path over an `opt` symlink when you want a *specific* build — the
-symlinks move under you, which is how the paragraph this replaced went stale.
+**Read the `differential-probe` skill before probing.** It has the reference
+servers on this box (mongod 8.2.11 on `PATH`, 6.0.16 and 8.3.4 by Cellar path;
+PostgreSQL 15.19 on port 5415 and 14), the probe recipe, the four ways a probe
+lies, and the bug shapes worth grepping for (user paths as dict keys, comments
+citing the other engine, Python `==`/`hash()` for a BSON semantic, serde BSON
+decodes in the Rust servers, missing conflated with null). Cite the exact
+`mongod --version` you measured: a patch bump has changed an error message.
 
-**Three builds are installed, all via Homebrew** (measured 2026-08-31 by running
-each binary's `--version`, not by reading the formula names):
+The standing gate is `tests/test_mongod_differential.py` (`pytest -m
+differential`): a probe that finds something belongs there, or the next
+session re-finds it.
 
-| Build | Path |
-| --- | --- |
-| 6.0.16 | `/opt/homebrew/Cellar/mongodb-community@6.0/6.0.16/bin/mongod` |
-| **8.2.11** (on `PATH`) | `/opt/homebrew/Cellar/mongodb-community@8.2/8.2.11/bin/mongod` |
-| 8.3.4 | `/opt/homebrew/Cellar/mongodb-community/8.3.4/bin/mongod` |
+**Parity is not correctness.** The parity suites pin the two engines to each
+other, so they are equally satisfied by both being wrong (`$bucket`,
+`$densify`, `$stdDev*`), and a hand-run engine-vs-engine sweep is the same
+trap with nothing to warn you. When you are establishing what is correct,
+leave the other SecantusDB server out of the comparison entirely.
 
-Put a `Cellar` `bin` first on `PATH` to probe against a non-default build. So
-the version-difference probing older entries describe **is** reproducible: both
-the 6.0-versus-8.2 comparisons and the 8.3.4 `fullDocument`-position watch item
-can be re-run here today.
-
-Two naming traps in the `opt` symlinks, which is what an earlier version of this
-paragraph got wrong: there is **no `@8.0`** at all, and both
-`/opt/homebrew/opt/mongodb-community` (unversioned) and `@8.3` point at the same
-**8.3.4** keg — which diverges from 8.2 per the note above, so neither is a safe
-default to probe through. **8.2.1 is not installed**; entries citing it record a
-build that is no longer on this box. The `mongodb/brew` tap is current and
-supplies 8.2.11 as `@8.2`'s stable — earlier advice to fetch a tarball from
-`https://fastdl.mongodb.org/osx/mongodb-macos-arm64-<version>.tgz` is only
-needed for a build the tap does not carry.
-
-The standing gate is
-`tests/test_mongod_differential.py` (`pytest -m differential`) — a probe that
-finds something belongs there, or the next session re-finds it.
-
-**Estimates from READING code have been unreliable; estimates from RUNNING it
-have not.** Six cases now, and note the estimate can be wrong in EITHER
-direction — the first four all overstated the work, the last two show it cuts
-both ways:
-
-- `_pg_expandarray(...).x` was called a planner slice and advised against — the
-  inference already existed, and a wider bug sat one level above it.
-- Two campaigns planned off the backlog text were **already substantially
-  done** when measured (42 of 45 Rust constructs; 2 of 8 SQL claims).
-- `$graphLookup` was written up as "does not recurse at all" and scoped as a
-  possible feature build. It recurses — the fixture happened to put a null on
-  the first hop. The fix was a one-line guard.
-- The missing-vs-null fix was sized as "a sentinel in `expressions.py`, which
-  touches every operator". The sentinel already existed; only the comparison
-  operators failed to use it.
-- **`sum()` over an empty GROUP was filed as a 16-site refactor** — a companion
-  counter to be wired at every accumulator registration. The count was made by
-  reading the call sites, and written into the backlog as "counted, not
-  estimated". The companion mechanism ALREADY EXISTED and was already wired at
-  six sites; the defect was ONE LINE inside it (a bare `$ne: [x, null]` that is
-  true for a MISSING field), plus two HAVING paths the entry had explicitly
-  dismissed as not needing it. Fixed 2026-09-05.
-- **`LATERAL <srf>` was sized as a source rewrite** — wrap the bare call in the
-  `SELECT` it is shorthand for. That was tried, twice. It clears the first
-  error and lands on the next; the real blocker is that NO planner can derive
-  the output shape of a FROM-less set-returning projection, and the element
-  type has to come from the outer column's declared array type. Still open, now
-  with a real map in `tasks/backlog-python-postgres.md`.
-
-So: **reproduce an item before working it, and size it from a probe.** A
-fixture that is unlucky in one dimension can turn a narrow bug into what looks
-like a week of work — and a plausible-looking site count can turn a one-line
-fix into a refactor nobody starts.
-
-**A "counted, not estimated" note in the backlog is still a reading, not a
-measurement.** Both entries above carried confident sizing written by a
-previous session. Re-derive from a probe anyway; the cost of re-measuring is
-minutes, and the cost of trusting the number was, in one case, an item left
-untouched for two days because it looked too expensive to start.
-
-**Three bug shapes recur often enough to grep for.** Each has produced multiple
-real defects:
-
-- **A user-supplied path used as a dict key** (3 instances: the upsert seed,
-  `$lookup`'s `as`, `$graphLookup`'s `as`). Produces a document with a literal
-  dot in a key — one mongod cannot make, which then fails to match the query
-  that created it. Anything user-supplied that reaches a key needs `set_path`.
-- **A comment justifying behaviour by something other than the oracle**
-  (6 instances). "matching the pure evaluator", "mirrors mongod's `$in: []`
-  semantics", "Python walk returns None → no-op". The benign form cites mongod
-  *and* is right; the malignant form cites the other engine, or asserts a
-  mongod rule that a probe contradicts. One such comment was trusted enough to
-  write a test from, and the test failed against the real server.
-- **Python's `==` or `hash()` standing in for a BSON semantic** (5 instances,
-  all found 2026-09-05 from one question). They disagree in exactly three
-  places: **NaN**, **signed zero**, and **bool-vs-int**. The codebase already
-  guarded the third — `ordering.bson_equal` exists because `True == 1` swallowed
-  an oplog entry — and the first two were unguarded, which cost:
-  a partial index that returned NOTHING for `find({b: NaN})`; `$min`/`$max`
-  ranking NaN by IEEE instead of sort order; a `$set` of `-0.0` over `0.0`
-  silently NOT STORED (`if new != doc`); a change-stream `updateDescription`
-  blind to signed zero and to a numeric type change; and `$group` giving every
-  NaN its own bucket (`hash(nan)` is 0 but `nan != nan`, so a dict keys it by
-  identity).
-
-  Two of those were silent data loss. Grep for `!= doc`, `== post`, `hash(`,
-  and any dict/set keyed on a document value. **Note that equality and CHANGE
-  DETECTION are different questions** and mongod answers them differently:
-  `{$eq: [0.0, -0.0]}` is true and `find({a: -0.0})` matches a stored `0.0`,
-  while the same pair counts as a change — so one predicate cannot serve both
-  (`ordering.bson_same_stored_value` is the change-detection twin).
-
-- **A serde BSON decode in a Rust server** (found 2026-10-12, one root cause,
-  every code path). `bson::Document::from_reader` and `bson::from_slice` read
-  a sub-document that looks like extended JSON as the value it would stand
-  for: `{a: {$numberLong: "1"}}` comes back as `{a: Int64(1)}`, and `$oid`,
-  `$date`, `$numberInt` and the rest likewise. The Rust MongoDB server
-  decoded stored documents that way, so an update of ANY field of such a
-  document rewrote the sub-document. Decode with
-  `secantus_core::bsondoc::from_bytes`; `tests/test_rust_literal_bson_decode.py`
-  fails if a serde decode reappears in the MongoDB server crates. The
-  PostgreSQL crates' decodes were replaced too (#1955); the parity binding
-  `secantus-core-py` still has serde decodes (`tasks/backlog-rust-mongodb.md`
-  7.077).
-
-- **Missing conflated with null** (3 instances). `get_path` returns `None` for
-  both; `has_path` is what distinguishes them. mongod's rule differs by
-  language — the *query* language treats them alike (`{a: null}` matches a
-  missing field), the *expression* language does not (`$eq: ["$absent", null]`
-  is false).
-
-**Parity is not correctness.** The Rust parity suites pin the two engines to
-each other, so they are equally satisfied by both being wrong — that has
-happened (`$bucket`, `$densify`, `$stdDev*`). Parity catches drift within
-seconds; only the reference server says which side to move. Use both.
-
-**And a parity comparison run by hand is the same trap, with nothing to warn
-you.** On 2026-09-08 a Rust-vs-Python sweep of the decimal transcendentals
-reported "0 divergent of 384" and that number was reported as evidence the Rust
-server was right. It was not: the sweep had been used to CHOOSE the Rust
-server's behaviour, so agreement was guaranteed and meaningless, and three
-shapes where both engines differed from `mongod` were invisible to it. The
-`mongod`-only sweep found them immediately. **When you are establishing what is
-correct, leave the other SecantusDB server out of the comparison entirely.**
-
-**A green suite number means nothing without its baseline.** A worktree venv
-missing `_secantus_core` silently uncollects ~1700 parity tests and still exits
-0. Compare the count against the last known-good run before trusting it — that
-is the only thing that catches it.
-
-## Probes lie in specific, repeatable ways
-
-Every finding here comes from a differential probe, so a probe that is quietly
-broken is worse than no probe: it produces a number that looks like evidence.
-Four distinct failures in one 2026-09 campaign, each of which produced a
-confident and WRONG conclusion before it was caught:
-
-- **A client-side error looks like agreement.** psycopg's COPY API is on the
-  CURSOR, so `conn.copy(...)` raised `AttributeError` — identically on both
-  servers, which the differential read as a match. Twenty of thirty-four
-  scenarios were vacuous and the run reported 33/34 passing, hiding five real
-  divergences. **Report the exception TYPE alongside the SQLSTATE, and count a
-  both-sides-non-database-error as VACUOUS.**
-- **A normalising cast puts one code path in front of every assertion.** A
-  full-text corpus wrote `to_tsvector(...)::text` on every line to make the
-  output comparable — and that cast was itself one of the bugs, so all 27 lines
-  inherited it. Reported 23 divergences; the real count was 13, with the
-  opposite diagnosis (`to_tsvector` looked broken and was fine). **Compare
-  values directly wherever the client can render them.**
-- **State bleeds between scenarios.** A notification queued by an earlier
-  LISTEN/NOTIFY scenario is still deliverable, and a `stop_after=1` drain
-  returns it — reading as the current scenario delivering something it never
-  sent. That produced a convincing false "delivers twice". **Reset to empty
-  between scenarios, not just between runs.**
-- **The probe's own SQL can be the bug.** `pg_advisory_xact_lock` reported zero
-  locks held, which was filed as a lead and chased in a later batch. The call
-  had run in autocommit, so the implicit transaction committed and released the
-  lock immediately — correct behaviour, wrong probe.
-
-The cheap defence for all four: **give every probe a SELF-CHECK scenario that
-must pass on the reference server, and abort the run if it does not.** That is
-what caught `max_prepared_transactions = 0` before a whole 2PC sweep was
-written up as divergences.
+**Before quoting any number** -- a gauge rate, a suite count, a benchmark, a
+corpus divergence count -- read the `measuring` skill.
 
 ## CI is load-bearing — failures are serious bugs, not flakes
 
@@ -1248,28 +497,11 @@ The same arithmetic is why `invoke validate-all --jobs` stays at 4 or fewer
   goes to a session working that side. A change the item needs in the shared
   storage crates is fine -- say in its PR that the other server links it.
 - **Claim a backlog item before working it — the claim is a PUSHED branch.**
-  This repo runs several parallel sessions against the same backlog files, and
-  the same item repeatedly got picked up twice: `set` and `timetz` in the pgtest
-  campaign, plus `tuple` and `procedure`, were each built independently by two
-  sessions and one copy thrown away. Before starting an item:
-  1. `git fetch origin --prune`, then `git ls-remote --heads origin` and
-     `gh pr list --state open`. A branch or open PR matching the item means
-     another session holds it — pick something else.
-  2. **Re-verify the item is still open by reproducing it** — run the corpus
-     file, the failing test, the query. The backlog lags reality: several
-     "open" items here had already been fixed by a parallel session, and two
-     others *understated* the bug (`octet_length` was filed as a `char(n)`
-     padding nit when it was wrong for every string input). Never implement
-     from the backlog text alone.
-  3. Claim it by creating the branch and **pushing it immediately, before the
-     first real commit** — `git push -u origin <branch>` on an empty branch, or
-     open a draft PR. An unpushed local branch is invisible to every other
-     session and claims nothing. The repo already uses one branch per slice;
-     the only change is that the push moves to the start.
-  4. Release by merging and deleting the branch (see the teardown bullet
-     below), or by deleting your own branch if you abandon the item.
-  5. **Never delete or force-push another session's claim branch**, however
-     stale it looks. Report it and let Joe decide.
+  The same item has been built twice by parallel sessions. Check
+  `git ls-remote --heads origin` and `gh pr list --state open` first,
+  **reproduce the item** (the backlog lags reality in both directions), then
+  create the branch and push it before the first commit. Never delete or
+  force-push another session's claim branch. Details: `batch-worktree`.
 - **Batch several slices into ONE branch and PR — do not run the full suite per
   small feature.** The suite is ~6,000 tests and 12–13 minutes; running it after
   every one-file change makes the ceremony cost dwarf the work. Nine
@@ -1288,23 +520,18 @@ The same arithmetic is why `invoke validate-all --jobs` stays at 4 or fewer
   folded into the current batch or written down — it does not get its own full
   cycle.
 - **Major features and non-trivial updates go in a git worktree on a feature branch — never directly on `main`.** New CRUD operators, aggregation stages, storage-layer changes, wire-protocol additions, indexing work, and similar multi-file changes all qualify. Trivial one-file tweaks (typo fixes, single-line config edits) can stay on `main`. Create a worktree alongside the repo: `git worktree add ../SecantusDB-<branch> -b <branch>`. Develop and run the full test suite (and `./inv rust-gate` for Rust-server work) there.
-- **Pin a worktree to a commit for any timing / performance measurement.** Because multiple sessions run parallel worktrees, `main` (and your own checkout) can advance *mid-run* — a baseline, scaling curve, or floor measurement taken across a moving `main` compares different code against a different test population and is worthless. (Observed: a scaling curve was invalidated when `main` moved `3a86d9e5`→`b6b20df7` between runs, the suite growing ~1400 tests underneath it, with a transient breakage flickering through one run.) For any measurement, create a **detached worktree frozen at a SHA** — `git worktree add --detach ../SecantusDB-measure "$(git rev-parse origin/main)"` — run every comparison run there, and confirm `git rev-parse HEAD` is unchanged before *and* after. Caveat: a fresh worktree has no `vendor/wiredtiger`, and the copied-`.so` venv trick (memory `worktree-test-venv`) is fine for *collection* but can throw WT `Session__freecb` errors on `close()` that inflate *runtime* timings — for close-to-metal timing, measure in the main repo's built venv (e.g. a self-contained raw-WT script like `scratchpad/wt_floor.py`) or build WT in the worktree. See `tasks/test-performance-plan.md`.
+- **Pin a worktree to a commit for any timing / performance measurement**
+  (`git worktree add --detach ../SecantusDB-measure "$(git rev-parse
+  origin/main)"`): parallel sessions move `main` mid-run. The `measuring`
+  skill has the rest of what makes a number trustworthy.
 - **Land via branch push + PR, not `git push HEAD:main`.** Push the feature branch (`git push -u origin <branch>`) and open a PR (`gh pr create --base main`); let CI run on the PR, then merge when green. **Do not push straight to `main` from a session** — every session pushing the same ref (`refs/heads/main`) lands them in the same CI concurrency group, so a newer push cancels the older session's in-flight run (and forces constant rebases). One feature branch per session = one CI lane per session; distinct refs never cancel each other. After merge, tear the branch down — see the next bullet. (`test.yml` / `wheels.yml` / `rust-wheels.yml` are keyed `concurrency: ${{ github.workflow }}-${{ github.ref }}`, `cancel-in-progress: true` — per-ref, so the cancel only bites within a single branch, which is what you want.)
-- **Cleaning up is part of finishing the work, not a separate chore.** (Branch and worktree teardown is below; for the rest of what a session leaves behind — daemons still bound to ports, WiredTiger temp stores, the `pytest-of-<user>` backlog that slows every later suite, wedged background waiters — see the `session-cleanup` skill. To close out a whole session — land everything outstanding, record what is left, and reconcile the docs with what changed — see `close-session`; its mirror `start-session` holds the opening checks that stop a session working from a stale picture.) A merged PR whose branch and worktree are still lying around is unfinished. Do it in the *same session that merges*, because nobody else can safely do it later: a parallel session can't tell your abandoned branch from live work, so anything you leave behind survives indefinitely. Left alone this compounds badly — one audit found **235 remote branches and 11 worktrees**, nearly all of them merged months earlier, hiding the handful that mattered. Tear down in this order:
-
-  ```bash
-  gh pr merge <N> --squash                       # merge first
-  git worktree remove ../SecantusDB-<branch>     # worktree BEFORE branch
-  git branch -D <branch>                         # see the -d/-D note below
-  git push origin --delete <branch>              # if it still exists
-  ```
-
-  Three traps, all hit for real:
-  - **Remove the worktree before deleting the branch.** `gh pr merge --delete-branch` aborts with "cannot delete branch ... used by worktree" — and having failed, it skips deleting the *remote* branch too, so you end up thinking it cleaned up when it deleted nothing.
-  - **`git branch -d` refuses branches that did land.** Squash-merged commits are never ancestors of `main`, so `-d`'s safety check fails on perfectly merged work. Confirm with `gh pr view <N> --json state` (`MERGED`) and then use `-D`. Don't reach for `-D` without that confirmation.
-  - **Never remove a worktree or branch you didn't create in this conversation** (global rule), *unless* the user explicitly asks you to reconcile it. Then verify before destroying: clean tree, no unique commits, and — for anything symlinked in (`.venv`, `website/infra/aws-state.json`) — that you're deleting the link and not the target.
-
-  **Auditing branches after the fact is much harder than not creating the mess.** `git merge-base --is-ancestor`, `git cherry`, and `git merge-tree` each gave a confidently wrong answer during that audit (squash merges defeat the first two; the third reports conflict markers as though they were content). The signal that actually held up was the PR's merge state, cross-checked against whether `main` already contains the branch's distinctive files. And before reviving any long-lived unmerged branch, check whether `main` has since *rejected* it — one such branch looked like a valuable unmerged CI fix, but `tests/conftest.py` carries a deliberate tripwire against exactly that change because it was tried and caused a `WT_PANIC` cascade.
+- **Cleaning up is part of finishing the work.** Tear down the branch and
+  worktree in the SAME session that merges (worktree before branch; `-D` only
+  after `gh pr view <N> --json state` says `MERGED`), and never remove a
+  worktree, branch or stash you did not create in this conversation. The
+  sequence and its traps: `batch-worktree`. Everything else a session leaves
+  running: `session-cleanup`; closing a whole session: `close-session`;
+  opening one: `start-session`.
 - **Record the changelog with a fragment, not by editing `docs/changelog.md`.** A feature PR adds one file `changelog.d/<short-slug>.md` holding a single entry (a `###` headline + prose lede + `#### Added` / `#### Fixed` / … sections, no version number or `##` header) — see `changelog.d/README.md`. **Do not edit `docs/changelog.md` directly in a feature PR** and **do not bump the Python `version`** (see the Versioning section): those two shared lines are what made every pair of concurrent PRs conflict. New fragment files never collide, so concurrent sessions stay independent. At release, `invoke changelog-collate` (run automatically by `release-prepare`) folds the fragments into `## [Unreleased]` and deletes them; the normal promote-to-a-dated-section step is unchanged.
 - New CRUD operators or aggregation stages should land with both a unit test (in `tests/test_query.py` / `tests/test_update.py` / `tests/test_aggregate.py` / `tests/test_expressions.py`) and a `pymongo`-driven integration test in `tests/test_crud.py`. The integration test is the conformance proof; the unit test pins the semantics.
 - Layer boundaries to defend: the wire layer never knows about commands; the command layer never knows about SQL; pure operator engines (`query`, `update`, `expressions`, `aggregate`, `projection`) take only docs in and out, no I/O.

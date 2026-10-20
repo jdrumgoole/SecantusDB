@@ -19,6 +19,9 @@ proper) and prints only the disagreements:
         tools/probes/pg_corpora/windows.setup.sql \
         tools/probes/pg_corpora/windows.sql --types
 
+It probes the Rust `secantusd-pg` by default; `--python` selects the
+deprecated Python PG server.
+
 Both servers are driven through the **same `psycopg` connection**, so
 client-side type mapping is identical and every difference is the server's.
 Two rules that the 2026-09-03 sweeps paid for:

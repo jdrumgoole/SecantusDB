@@ -1,6 +1,6 @@
 ---
 name: differential-probe
-description: Find real bugs in SecantusDB by running operations against a live mongod (or PostgreSQL) and diffing the answers, instead of reading code or the backlog. Fires when the user asks to find bugs, check conformance/fidelity for a command or stage, work a backlog item, extend tests/test_mongod_differential.py, or asks "does X match mongod?". Holds the probe recipe, the normalisation rules that stop false positives, the mongod-version hazards that only CI reveals, and the recurring bug shapes worth grepping for.
+description: Find real bugs in SecantusDB by running operations against a live mongod (or PostgreSQL) and diffing the answers, instead of reading code or the backlog. Fires when the user asks to find bugs, check conformance/fidelity for a command or stage, work a backlog item, extend tests/test_mongod_differential.py, or asks "does X match mongod?". Holds the reference servers installed on this box (mongod builds by Cellar path, PostgreSQL 14/15), the probe recipe, the ways a probe lies (vacuous both-sides errors, normalising casts, state bleed, the probe's own SQL), the normalisation rules that stop false positives, the mongod-version hazards that only CI reveals, and the recurring bug shapes worth grepping for.
 ---
 
 # Probe against the oracle; don't reason about the source
@@ -34,6 +34,47 @@ diverged on the first try. Before believing a surface is clean, check the
 harness can actually exercise it: "no findings" from a run that skips the
 surface is not evidence of anything.
 
+## The reference servers on this box
+
+`mongod` on `PATH` (Homebrew `mongodb-community@8.2`, linked as the default so
+`tests/test_mongod_differential.py` runs instead of skipping), PostgreSQL 15.19
+on port 5415 and a PostgreSQL 14 default cluster for the SQL side.
+
+
+**Check `mongod --version` before recording a measurement**: a *patch* bump has
+changed an error message here before (the expected-type list ordering above), so
+"8.x" is not specific enough to cite. Cite the version you measured, and prefer
+a `Cellar` path over an `opt` symlink when you want a *specific* build — the
+symlinks move under you, which is how the paragraph this replaced went stale.
+
+**Three builds are installed, all via Homebrew** (measured 2026-08-31 by running
+each binary's `--version`, not by reading the formula names):
+
+| Build | Path |
+| --- | --- |
+| 6.0.16 | `/opt/homebrew/Cellar/mongodb-community@6.0/6.0.16/bin/mongod` |
+| **8.2.11** (on `PATH`) | `/opt/homebrew/Cellar/mongodb-community@8.2/8.2.11/bin/mongod` |
+| 8.3.4 | `/opt/homebrew/Cellar/mongodb-community/8.3.4/bin/mongod` |
+
+Put a `Cellar` `bin` first on `PATH` to probe against a non-default build. So
+the version-difference probing older entries describe **is** reproducible: both
+the 6.0-versus-8.2 comparisons and the 8.3.4 `fullDocument`-position watch item
+can be re-run here today.
+
+Two naming traps in the `opt` symlinks, which is what an earlier version of this
+paragraph got wrong: there is **no `@8.0`** at all, and both
+`/opt/homebrew/opt/mongodb-community` (unversioned) and `@8.3` point at the same
+**8.3.4** keg — which diverges from 8.2 per the note above, so neither is a safe
+default to probe through. **8.2.1 is not installed**; entries citing it record a
+build that is no longer on this box. The `mongodb/brew` tap is current and
+supplies 8.2.11 as `@8.2`'s stable — earlier advice to fetch a tarball from
+`https://fastdl.mongodb.org/osx/mongodb-macos-arm64-<version>.tgz` is only
+needed for a build the tap does not carry.
+
+The standing gate is
+`tests/test_mongod_differential.py` (`pytest -m differential`) — a probe that
+finds something belongs there, or the next session re-finds it.
+
 ## The recipe
 
 1. **Pick a surface with many option combinations** — a command's arguments, a
@@ -57,22 +98,35 @@ surface is not evidence of anything.
 
 ## On the SQL side: drive BOTH servers through the same psycopg client
 
-The Mongo-side rule above ("compare the RAW reply, not the driver wrapper")
-inverts here. The conformance surface is the **wire**, so probe
-`SecantusPGServer` over TCP with the same `psycopg` connection you use for
-PostgreSQL — one `run(cur, sql)` helper, two cursors:
+The server under test is the Rust `secantusd-pg`; the reference is PostgreSQL
+(15.19 on port 5415, or the 14 default cluster). The deprecated Python PG
+server is never the reference and is not where SQL work goes.
 
-```python
-sec = psycopg.connect(host=host, port=port, dbname="db", user="joe", autocommit=True)
-pg  = psycopg.connect("host=127.0.0.1 port=5432 dbname=postgres user=jdrumgoole", autocommit=True)
+The Mongo-side rule above ("compare the RAW reply, not the driver wrapper")
+inverts here. The conformance surface is the **wire**, so probe `secantusd-pg`
+over TCP with the same `psycopg` connection class you use for PostgreSQL --
+one `run(cur, sql)` helper, two cursors. `tools/probes/pg_differential.py`
+is that harness for a corpus file; it probes `secantusd-pg` by default
+(`--python` selects the deprecated Python server, which it defaulted to until
+2026-10-20 -- a hand-run corpus silently measured the wrong server).
+
+```bash
+uv run --no-sync python tools/probes/pg_differential.py \
+    tools/probes/pg_corpora/windows.setup.sql tools/probes/pg_corpora/windows.sql \
+    --types
 ```
+
+For an ad-hoc probe, start the binary yourself (`secantusd-pg <store>
+127.0.0.1:0 --trust-unknown-users` prints its address) and connect as
+`postgres`.
 
 Client-side type mapping is then identical on both sides, so any difference is
 the server's. Capture `cur.description` too — a wrong **oid** under a right
 value is invisible to a row comparison, and several real bugs here were exactly
 that (`#>` and `LIKE ... ESCAPE` both sent booleans/jsonb under oid 25).
 
-**Calling `run_sql()` directly instead manufactures false positives.** The
+**Probing below the wire manufactures false positives.** The Python server's
+`run_sql()` taught this, and it holds for any in-process entry point: the
 embedded API returns the engine's internal values, which the wire layer
 converts on the way out: a `numeric(p,s)` cast surfaces as a raw
 `Decimal128(...)` and `'2020-01-01'::date` as a `str`. Probed directly, both
@@ -83,8 +137,9 @@ the wire.
 **Check `SHOW lc_ctype` before calling a case-mapping difference a bug.** This
 box's PostgreSQL runs the **C** locale, which treats a non-ASCII letter as a
 word SEPARATOR: `initcap('ÉCOLE')` is `ÉCole` there and `École` on a UTF-8
-PostgreSQL. Same class as the Swedish-collation note in CLAUDE.md — locale
-data, not engine behaviour.
+PostgreSQL. Locale data, not engine behaviour. A corpus that measures case or character
+classes declares `# reference-locale: C.UTF-8` and the harness runs it in a
+reference database of that locale.
 
 ## Normalisation: what you must strip, or you get false positives
 
@@ -202,24 +257,31 @@ mongod truncates the message with an ellipsis *inside* the quotes, so a
 comparison. Re-run the same probe against the old server; a difference in the
 *count* between versions is worth suspecting before it is worth reporting.
 
-## The PYTHON version is a reference server too
+## The Python INTERPRETER version is a variable too
 
-The matrix is 3.10-3.13 and a local run is one of them, so a stdlib behaviour
-that changed between versions is invisible until CI runs — **and on a PR, "CI
-runs" means 3.10 and nothing else.** `test.yml:100` selects
-`["3.10","3.11","3.12","3.13"]` only for `schedule` and `workflow_dispatch`;
-a push or pull_request gets `["3.10"]`. So a defect that needs 3.11+ cannot
-fail a PR at all, and surfaces in the weekly cron that notifies nobody.
-Measured 2026-09-28, when a `cbrt` assertion hardcoded to a Windows/macOS float
-sat red in the cron while every PR went green; it was found only because a
-`workflow_dispatch` was used as a stand-in for a dropped `pull_request` event
-and silently upgraded that run to the full sweep. To check a version-sensitive
-change before merging, dispatch `test.yml` on your branch rather than trusting
-the PR's green. That is not a
-theoretical hazard: `datetime.fromisoformat` accepted **only** 3 or 6
-fractional digits before 3.11, so `TIMESTAMP '2020-01-15 10:30:45.5'` -- an
-ordinary Postgres literal -- parsed on 3.12 and raised on 3.10 (found 2026-09-03
-by this project's own new test, on the 3.10 shards).
+This is about CPython, not the Python servers. **The Python servers are
+deprecated and are never the reference** for what a server should answer:
+that is `mongod` or PostgreSQL. But Python still runs the probes, the gauges,
+the test harness and the deprecated servers' own tests, which must stay green,
+and the stdlib changes between versions.
+
+The supported matrix is 3.10-3.13 and a local run is one of them, so a stdlib
+behaviour that changed between versions is invisible until CI runs it -- **and
+a PR barely runs it.** `test.yml`'s `python-version` matrix is the full
+`["3.10","3.11","3.12","3.13"]` only for `schedule` and `workflow_dispatch`; a
+push or pull_request gets `["3.10"]`, plus macOS on 3.12 through an `include`.
+So a defect that needs 3.11 or 3.13 cannot fail a PR, and surfaces in the
+weekly cron that notifies nobody. Measured 2026-09-28, when a `cbrt`
+assertion hardcoded to a Windows/macOS float sat red in the cron while every
+PR went green; it was found only because a `workflow_dispatch` silently
+upgraded a run to the full sweep. **To check a version-sensitive change
+before merging, dispatch `test.yml` on your branch** rather than trusting the
+PR's green.
+
+The hazard is real: `datetime.fromisoformat` accepted only 3 or 6 fractional
+digits before 3.11, so `TIMESTAMP '2020-01-15 10:30:45.5'` -- an ordinary
+PostgreSQL literal -- parsed on 3.12 and raised on 3.10 in the (now
+deprecated) Python SQL server (found 2026-09-03 on the 3.10 shards).
 
 **Two rules, both learned there:**
 
@@ -239,11 +301,13 @@ by this project's own new test, on the 3.10 shards).
   width but TRUNCATES past six digits, where Postgres ROUNDS. The failing test
   cannot see that half -- you only find it by asking what the *other* version
   answers, and then asking the reference server which of them is right.
+  (On the deprecated servers today, keep the test green -- fix or retire it
+  with a written reason -- rather than extending them; CLAUDE.md, "Project".)
 
 ## Size the work from a probe, never from the source
 
-**Estimates from reading code have been wrong four times, every one in the
-expensive direction:**
+**Estimates from reading code have been wrong six times, and in EITHER
+direction:** the first four overstated the work, the last two show it cuts both ways.
 
 - `_pg_expandarray(...).x` was called a planner slice and advised against — the
   inference already existed, and a wider bug sat one level above it.
@@ -256,10 +320,30 @@ expensive direction:**
   touches every operator". The sentinel already existed; only the comparison
   operators failed to use it.
 
+- **`sum()` over an empty GROUP was filed as a 16-site refactor** — a companion
+  counter to be wired at every accumulator registration. The count was made by
+  reading the call sites, and written into the backlog as "counted, not
+  estimated". The companion mechanism ALREADY EXISTED and was already wired at
+  six sites; the defect was ONE LINE inside it (a bare `$ne: [x, null]` that is
+  true for a MISSING field), plus two HAVING paths the entry had explicitly
+  dismissed as not needing it. Fixed 2026-09-05.
+- **`LATERAL <srf>` was sized as a source rewrite** — wrap the bare call in the
+  `SELECT` it is shorthand for. That was tried, twice. It clears the first
+  error and lands on the next; the real blocker is that NO planner can derive
+  the output shape of a FROM-less set-returning projection, and the element
+  type has to come from the outer column's declared array type. Still open, now
+  with a real map in `tasks/backlog-python-postgres.md`.
+
+**A "counted, not estimated" note in the backlog is still a reading, not a
+measurement.** Both entries above carried confident sizing written by a
+previous session. Re-derive from a probe anyway; the cost of re-measuring is
+minutes, and the cost of trusting the number was, in one case, an item left
+untouched for two days because it looked too expensive to start.
+
 An unlucky fixture in one dimension turns a narrow bug into what looks like a
 week of work. **Vary the fixture before believing a big diagnosis.**
 
-## Four bug shapes worth grepping for
+## Bug shapes worth grepping for
 
 Each has produced multiple real defects:
 
@@ -292,11 +376,77 @@ Each has produced multiple real defects:
   oracle distinguishes them until measured. Fix it as a **subclass**: every
   existing `except`/catch site and reply-shaping path keeps working while the
   code, `codeName` and error labels come from the instance.
+- **Python's `==` or `hash()` standing in for a BSON semantic** (5 instances,
+  all found 2026-09-05 from one question). They disagree in exactly three
+  places: **NaN**, **signed zero**, and **bool-vs-int**. The codebase already
+  guarded the third — `ordering.bson_equal` exists because `True == 1` swallowed
+  an oplog entry — and the first two were unguarded, which cost:
+  a partial index that returned NOTHING for `find({b: NaN})`; `$min`/`$max`
+  ranking NaN by IEEE instead of sort order; a `$set` of `-0.0` over `0.0`
+  silently NOT STORED (`if new != doc`); a change-stream `updateDescription`
+  blind to signed zero and to a numeric type change; and `$group` giving every
+  NaN its own bucket (`hash(nan)` is 0 but `nan != nan`, so a dict keys it by
+  identity).
+
+  Two of those were silent data loss. Grep for `!= doc`, `== post`, `hash(`,
+  and any dict/set keyed on a document value. **Note that equality and CHANGE
+  DETECTION are different questions** and mongod answers them differently:
+  `{$eq: [0.0, -0.0]}` is true and `find({a: -0.0})` matches a stored `0.0`,
+  while the same pair counts as a change — so one predicate cannot serve both
+  (`ordering.bson_same_stored_value` is the change-detection twin).
+
+- **A serde BSON decode in a Rust server** (found 2026-10-12, one root cause,
+  every code path). `bson::Document::from_reader` and `bson::from_slice` read
+  a sub-document that looks like extended JSON as the value it would stand
+  for: `{a: {$numberLong: "1"}}` comes back as `{a: Int64(1)}`, and `$oid`,
+  `$date`, `$numberInt` and the rest likewise. The Rust MongoDB server
+  decoded stored documents that way, so an update of ANY field of such a
+  document rewrote the sub-document. Decode with
+  `secantus_core::bsondoc::from_bytes`; `tests/test_rust_literal_bson_decode.py`
+  fails if a serde decode reappears in the MongoDB server crates. The
+  PostgreSQL crates' decodes were replaced too (#1955); the parity binding
+  `secantus-core-py` still has serde decodes (`tasks/backlog-rust-mongodb.md`
+  7.077).
+
 - **Missing conflated with null** (3 instances). `get_path` returns `None` for
   both; `has_path` distinguishes them. mongod's rule **differs by language**:
   the *query* language treats them alike (`{a: null}` matches a missing field),
   the *expression* language does not (`$eq: ["$absent", null]` is false, and a
   missing field ranks below every value including MinKey).
+
+## Probes lie in specific, repeatable ways
+
+Every finding here comes from a differential probe, so a probe that is quietly
+broken is worse than no probe: it produces a number that looks like evidence.
+Four distinct failures in one 2026-09 campaign, each of which produced a
+confident and WRONG conclusion before it was caught:
+
+- **A client-side error looks like agreement.** psycopg's COPY API is on the
+  CURSOR, so `conn.copy(...)` raised `AttributeError` — identically on both
+  servers, which the differential read as a match. Twenty of thirty-four
+  scenarios were vacuous and the run reported 33/34 passing, hiding five real
+  divergences. **Report the exception TYPE alongside the SQLSTATE, and count a
+  both-sides-non-database-error as VACUOUS.**
+- **A normalising cast puts one code path in front of every assertion.** A
+  full-text corpus wrote `to_tsvector(...)::text` on every line to make the
+  output comparable — and that cast was itself one of the bugs, so all 27 lines
+  inherited it. Reported 23 divergences; the real count was 13, with the
+  opposite diagnosis (`to_tsvector` looked broken and was fine). **Compare
+  values directly wherever the client can render them.**
+- **State bleeds between scenarios.** A notification queued by an earlier
+  LISTEN/NOTIFY scenario is still deliverable, and a `stop_after=1` drain
+  returns it — reading as the current scenario delivering something it never
+  sent. That produced a convincing false "delivers twice". **Reset to empty
+  between scenarios, not just between runs.**
+- **The probe's own SQL can be the bug.** `pg_advisory_xact_lock` reported zero
+  locks held, which was filed as a lead and chased in a later batch. The call
+  had run in autocommit, so the implicit transaction committed and released the
+  lock immediately — correct behaviour, wrong probe.
+
+The cheap defence for all four: **give every probe a SELF-CHECK scenario that
+must pass on the reference server, and abort the run if it does not.** That is
+what caught `max_prepared_transactions = 0` before a whole 2PC sweep was
+written up as divergences.
 
 ## Probing one command finds bugs in its siblings
 
