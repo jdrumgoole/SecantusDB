@@ -632,7 +632,17 @@ one beside it.
         its snapshot was taken under is still the settled one, and any
         catalog write in flight, its own included, settles nothing. The
         shadow script went from 9.8 s to 8.4 s (PostgreSQL 15.19: 8.0 s).
-        Not yet measured on Linux.
+        Linux after that (PR #2040's psycopg-tls run): still over 20 s, in
+        the clear and over TLS (the lane stays green: it fails only on a
+        TLS-only failure). **Decided (Joe, 2026-10-20): keep optimising**,
+        rather than build the lane in release or stop. Measured then: the
+        collection lock was held about 88% of the run, so only work under
+        it counts. Started, NOT landed: branch `rust-pg-batch24` (commit
+        ac15e512, marked WIP) prepares each document's decode, minted
+        `_id`, `_id` key and oplog `o2` before the lock and skips the
+        per-entry `local` check an insert's namespace answers -- 8.2 s to
+        7.6 s on the script; its storage gate was interrupted and nothing
+        else has been run on it.
 
       What the lane gates, given that: a run that stopped short, and a
       test that fails over TLS, passes in the clear, **and fails over TLS
