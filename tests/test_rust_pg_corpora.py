@@ -71,6 +71,35 @@ PINNED_ELSEWHERE = {
 #: tasks/backlog-rust-postgres.md. Fix one and its entry must go.
 KNOWN_DIVERGENCES: dict[str, dict[str, str]] = {}
 
+#: {corpus: {"<sql> [<binding mode>]": (why, [another payload PostgreSQL gives])}}.
+#: The records were made on macOS; a few answers come from the platform's libm,
+#: which PostgreSQL calls as this server does, so PostgreSQL itself answers
+#: differently on the Linux CI runner. Each entry names the other platform's
+#: answer, so the check still compares every value rather than going volatile.
+PLATFORM_ANSWERS: dict[str, dict[str, tuple[str, list]]] = {
+    "math_string_funcs": {
+        "SELECT sinh(0), cosh(0), tanh(0), asinh(0), acosh(1), atanh(0), atan2(1, 1), cot(1)": (
+            # Both compute cot as 1.0 / tan(x). glibc's tan(1) is the correctly
+            # rounded 1.5574077246549023; Apple's is one ulp below it.
+            "cot(1): glibc 0.6420926159343306, macOS libm 0.6420926159343308",
+            [
+                [
+                    [
+                        ["num", "0"],
+                        ["num", "1"],
+                        ["num", "0"],
+                        ["num", "0"],
+                        ["num", "0"],
+                        ["num", "0"],
+                        ["num", "0.7853981633974483"],
+                        ["num", "0.6420926159343306"],
+                    ]
+                ]
+            ],
+        ),
+    },
+}
+
 
 def _corpora() -> list[str]:
     return sorted(
@@ -197,6 +226,9 @@ def test_corpus_answers_as_postgresql_does(corpus: str, connection: psycopg.Conn
             have = (got[0], got_payload, _types(got[3]))
         key = _key(sql, label)
         if want == have:
+            continue
+        platform = PLATFORM_ANSWERS.get(corpus, {}).get(key)
+        if platform and kind == got[0] == "ok" and got_payload in platform[1]:
             continue
         if key in known:
             seen.add(key)
