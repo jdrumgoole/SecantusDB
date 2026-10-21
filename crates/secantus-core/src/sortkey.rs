@@ -384,7 +384,18 @@ fn encode_array(a: &[Bson], coll: Option<&Collation>) -> Result<Vec<u8>, Unsuppo
 /// silently. Entry format 4 changed how documents and arrays ORDER in secondary
 /// indexes; an `_id` key only needs to be the same bytes for the same value,
 /// which the old encoding already is. Mirrors `sortkey.encode_id_key`.
+///
+/// Entry format 5 moved BinData, JavaScript-with-scope and MaxKey in secondary
+/// index keys; an `_id` key keeps format 4's bytes for them
+/// (`order::BinDataOrder::Format4`), or every stored document whose `_id` is a
+/// UUID would be stranded.
 pub fn encode_id_key(v: &Bson) -> Result<Vec<u8>, UnsupportedValue> {
+    crate::order::with_bindata_order(crate::order::BinDataOrder::Format4, || {
+        encode_id_key_inner(v)
+    })
+}
+
+fn encode_id_key_inner(v: &Bson) -> Result<Vec<u8>, UnsupportedValue> {
     match v {
         Bson::Document(d) => {
             let mut out = vec![RANK_DOCUMENT];
@@ -400,6 +411,10 @@ pub fn encode_id_key(v: &Bson) -> Result<Vec<u8>, UnsupportedValue> {
     }
 }
 
+/// MaxKey's rank before entry format 5 gave JavaScript-with-scope its own;
+/// `_id` keys and claims keep it (`order::BinDataOrder::Format4`).
+const FORMAT_4_RANK_MAXKEY: u8 = 14;
+
 /// Byte-sortable encoding of a single BSON value. Byte-exact counterpart of
 /// `secantus.sortkey.encode_value`. `coll` is the index's collation (or `None`);
 /// it applies to every string, nested ones included (entry format 4).
@@ -408,7 +423,13 @@ pub fn encode_value(v: &Bson, coll: Option<&Collation>) -> Result<Vec<u8>, Unsup
     match v {
         Bson::MinKey => out.push(RANK_MINKEY),
         Bson::Null => out.push(RANK_NULL),
-        Bson::MaxKey => out.push(RANK_MAXKEY),
+        Bson::MaxKey => out.push(
+            if crate::order::bindata_order() == crate::order::BinDataOrder::Format4 {
+                FORMAT_4_RANK_MAXKEY
+            } else {
+                RANK_MAXKEY
+            },
+        ),
         Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
             out.push(RANK_NUMBER);
             out.extend(encode_number(v));
@@ -438,6 +459,12 @@ pub fn encode_value(v: &Bson, coll: Option<&Collation>) -> Result<Vec<u8>, Unsup
             out.push(RANK_JAVASCRIPT);
             out.extend(escape(s.as_bytes()));
         }
+        Bson::JavaScriptCodeWithScope(c)
+            if crate::order::bindata_order() == crate::order::BinDataOrder::Format4 =>
+        {
+            out.push(RANK_JAVASCRIPT);
+            out.extend(escape(c.code.as_bytes()));
+        }
         Bson::JavaScriptCodeWithScope(c) => {
             out.push(RANK_JAVASCRIPT_SCOPE);
             out.extend(escape(c.code.as_bytes()));
@@ -452,13 +479,29 @@ pub fn encode_value(v: &Bson, coll: Option<&Collation>) -> Result<Vec<u8>, Unsup
             out.push(RANK_ARRAY);
             out.extend(encode_array(a, coll)?);
         }
-        // Length, then subtype, then bytes, as mongod compares BinData (RM-232;
-        // the subtype byte is new in entry format 5).
+        // In this thread's BinData order (`order::BinDataOrder`): mongod's
+        // length, then subtype, then bytes (the subtype byte is new in entry
+        // format 5, RM-232), or PostgreSQL's bytes, a shorter prefix first --
+        // an escaped string's own order. Storage encodes an index's keys under
+        // the order the index records.
         Bson::Binary(b) => {
             out.push(RANK_BINDATA);
-            out.extend_from_slice(&(b.bytes.len() as u32).to_be_bytes());
-            out.push(u8::from(b.subtype));
-            out.extend(escape(&b.bytes));
+            match crate::order::bindata_order() {
+                crate::order::BinDataOrder::Mongod => {
+                    out.extend_from_slice(&(b.bytes.len() as u32).to_be_bytes());
+                    out.push(u8::from(b.subtype));
+                    out.extend(escape(&b.bytes));
+                }
+                crate::order::BinDataOrder::Format4 => {
+                    out.extend_from_slice(&(b.bytes.len() as u32).to_be_bytes());
+                    out.extend(escape(&b.bytes));
+                }
+                crate::order::BinDataOrder::Bytes => {
+                    out.extend(escape(&b.bytes));
+                    out.extend_from_slice(COMPOUND_SEP);
+                    out.push(u8::from(b.subtype));
+                }
+            }
         }
         Bson::ObjectId(oid) => {
             out.push(RANK_OBJECTID);

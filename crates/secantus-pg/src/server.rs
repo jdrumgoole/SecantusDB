@@ -168,13 +168,18 @@ pub fn open_storage_with_cache(home: &str, cache_size: &str) -> secantus_storage
         &commit_sync_method(&wt_config(cache_size, 1000, synced, log_file_max)),
         synced,
     );
-    Storage::open_with_options(
-        home,
-        &StorageOptions {
-            wt_config: Some(config),
-            ..StorageOptions::default()
-        },
-    )
+    // Opening can rebuild an outdated index (`rebuild_outdated_indexes`); one
+    // this server rebuilds keeps PostgreSQL's BinData order. Scoped, because
+    // the opening thread may be a caller's (an embedded server's Python).
+    secantus_core::order::with_bindata_order(secantus_core::order::BinDataOrder::Bytes, || {
+        Storage::open_with_options(
+            home,
+            &StorageOptions {
+                wt_config: Some(config),
+                ..StorageOptions::default()
+            },
+        )
+    })
 }
 
 /// How long `stop` waits for live connection tasks to finish before giving up
@@ -571,6 +576,7 @@ pub fn bind_with(
     // this cannot hold, as PostgreSQL's 54001 does.
     let runtime = Builder::new_multi_thread()
         .thread_stack_size(WORKER_STACK_BYTES)
+        .on_thread_start(mark_bytea_order)
         .enable_all()
         .build()?;
     let std_listener = std::net::TcpListener::bind(addr)?;
@@ -695,6 +701,7 @@ async fn accept_loop(
             .stack_size(WORKER_STACK_BYTES)
             .spawn(move || {
                 let _guard = guard;
+                mark_bytea_order();
                 // A ONE-worker multi-thread runtime, not a current-thread one:
                 // a statement that sends a notice while it runs
                 // (`live_notices`) hands the worker to another thread with
@@ -706,7 +713,10 @@ async fn accept_loop(
                     .worker_threads(1)
                     .thread_name("secantus-pg-conn-worker")
                     .thread_stack_size(WORKER_STACK_BYTES)
-                    .on_thread_start(|| crate::mark_connection_thread(true))
+                    .on_thread_start(|| {
+                        crate::mark_connection_thread(true);
+                        mark_bytea_order();
+                    })
                     .enable_all()
                     .build()
                 {
@@ -743,6 +753,15 @@ async fn accept_loop(
             eprintln!("secantusd-pg: could not start a connection thread: {e}");
         }
     }
+}
+
+/// Every thread this server runs statements on compares and keys BinData as
+/// PostgreSQL orders `bytea`: byte by byte, a shorter prefix first. The
+/// storage and query engine it shares with the MongoDB server default to
+/// mongod's order (`secantus_core::order::BinDataOrder`); one Python process
+/// can host both servers, so the order is set per thread.
+pub(crate) fn mark_bytea_order() {
+    secantus_core::order::set_thread_bindata_order(secantus_core::order::BinDataOrder::Bytes);
 }
 
 #[cfg(test)]

@@ -10,9 +10,14 @@ themselves; and two documents are equal only with their fields in the same
 order.
 
 The BinData and JavaScript order is also the order of index keys, so the
-index-entry format moves from 4 to 5. A store with indexes written by an
-earlier build is refused at open, as earlier format changes were; rebuild
-it with a dump and restore.
+index-entry format moves from 4 to 5. A format-4 index is rebuilt when its
+store opens; formats 1-3 are still refused.
+
+PostgreSQL orders `bytea`, which the PG server stores as BinData, byte by
+byte instead, so the order is now a property of the server: each thread the
+PG server runs statements on uses PostgreSQL's order, every index records
+the order it was built in and is keyed by it whichever server writes, and a
+server reads only through the indexes in its own order.
 
 #### Fixed
 
@@ -30,7 +35,16 @@ it with a dump and restore.
 
 #### Changed
 
-- `secantus-storage`: index-entry format 5 (`ENTRY_FORMAT`).
+- `secantus-storage`: index-entry format 5 (`ENTRY_FORMAT`); a format-4
+  index is rebuilt at open (`OLDEST_REBUILDABLE_ENTRY_FORMAT`). An index
+  records PostgreSQL's BinData order as the internal `binDataOrder` option,
+  which `listIndexes` and change events leave out. `_id` keys and `_id`
+  claims keep format 4's encoding (`order::BinDataOrder::Format4`), so no
+  stored `_id` moves.
+- `secantus-core` `order::BinDataOrder`: a per-thread BinData order; the PG
+  server (`secantus-pg` `server::mark_bytea_order`) sets PostgreSQL's on its
+  runtime, connection and portal-reader threads, and opens its store in it.
+  New test: `crates/secantus-pg/tests/bytea_order.rs`.
 
 #### Added
 

@@ -86,9 +86,13 @@ fn run_on_reader(job: Job) -> std::io::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel::<Job>();
     tx.send(job.take().expect("unsent"))
         .map_err(|_| std::io::Error::other("reader channel closed"))?;
+    // The reader compares and keys values for the connection that starts it,
+    // so it takes that thread's BinData order (`server::mark_bytea_order`).
+    let order = secantus_core::order::bindata_order();
     std::thread::Builder::new()
         .name("secantusd-pg-portal".into())
         .spawn(move || {
+            secantus_core::order::set_thread_bindata_order(order);
             while let Ok(job) = rx.recv() {
                 job();
                 let mut idle = idle_readers().lock().unwrap_or_else(|e| e.into_inner());

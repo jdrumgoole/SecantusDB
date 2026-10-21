@@ -230,16 +230,81 @@ pub fn cmp(a: &Bson, b: &Bson) -> Ordering {
 /// before `{t: 1, coordinates: []}` (object before array) although
 /// `coordinates` is the smaller name. Measured 8.2.11 (2026-10-06); comparing
 /// the name first put a GeoJSON point without a `crs` ahead of those with one.
-/// mongod's BinData order: length, then subtype, then the bytes (RM-232;
-/// probed 8.2.11). Comparing the bytes alone put `BinData("\x02")` above
+/// The order BinData values take on this thread.
+///
+/// The two servers that share this crate disagree, and both are right for the
+/// product they imitate: mongod orders BinData by length, then subtype, then
+/// bytes (RM-232, probed 8.2.11), while PostgreSQL orders `bytea` -- which the
+/// PG server stores as BinData -- byte by byte, a shorter prefix first. So the
+/// order is a property of the server running the comparison, not of the value.
+/// The MongoDB server takes the default; the PG server sets [`BinDataOrder::Bytes`]
+/// on every thread it runs queries on ([`set_thread_bindata_order`]). It is per
+/// THREAD rather than per process because one Python process can embed both
+/// servers. An index records the order its keys were written in, and storage
+/// encodes that index's keys under it ([`with_bindata_order`]).
+///
+/// A third setting is for KEYS only: [`BinDataOrder::Format4`] reproduces the
+/// encoding entry format 4 gave BinData, JavaScript-with-scope and MaxKey. An
+/// `_id` key, and the uniqueness claim of a document-valued `_id`, are stored
+/// once and looked up by recomputing them, so they must stay the same bytes
+/// for the same value whichever server writes and whatever the entry format;
+/// `sortkey::encode_id_key` and storage's `_id` claims encode under it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinDataOrder {
+    /// Length, then subtype, then bytes: mongod.
+    Mongod,
+    /// The bytes, a shorter prefix first: PostgreSQL's `bytea`.
+    Bytes,
+    /// Entry format 4's key encoding, for `_id` keys and claims only. Compares
+    /// as [`BinDataOrder::Mongod`].
+    Format4,
+}
+
+thread_local! {
+    static BINDATA_ORDER: std::cell::Cell<BinDataOrder> =
+        const { std::cell::Cell::new(BinDataOrder::Mongod) };
+}
+
+/// This thread's BinData order.
+pub fn bindata_order() -> BinDataOrder {
+    BINDATA_ORDER.with(|c| c.get())
+}
+
+/// Set this thread's BinData order for good: for a server's own threads, at
+/// their start.
+pub fn set_thread_bindata_order(order: BinDataOrder) {
+    BINDATA_ORDER.with(|c| c.set(order));
+}
+
+/// Run `f` with this thread's BinData order set to `order`, restoring the one
+/// before afterwards (on unwind too).
+pub fn with_bindata_order<T>(order: BinDataOrder, f: impl FnOnce() -> T) -> T {
+    struct Restore(BinDataOrder);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BINDATA_ORDER.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(BINDATA_ORDER.with(|c| c.replace(order)));
+    f()
+}
+
+/// Two BinData values in this thread's [`BinDataOrder`]. Comparing the bytes
+/// alone on the MongoDB server put `BinData("\x02")` above
 /// `BinData("\x01\x01")` and treated two subtypes of one payload as equal.
 /// `sortkey` encodes the same order into index keys.
 pub fn bindata_cmp(x: &bson::Binary, y: &bson::Binary) -> Ordering {
-    (x.bytes.len(), u8::from(x.subtype), &x.bytes).cmp(&(
-        y.bytes.len(),
-        u8::from(y.subtype),
-        &y.bytes,
-    ))
+    match bindata_order() {
+        BinDataOrder::Mongod | BinDataOrder::Format4 => (
+            x.bytes.len(),
+            u8::from(x.subtype),
+            &x.bytes,
+        )
+            .cmp(&(y.bytes.len(), u8::from(y.subtype), &y.bytes)),
+        BinDataOrder::Bytes => {
+            (&x.bytes, u8::from(x.subtype)).cmp(&(&y.bytes, u8::from(y.subtype)))
+        }
+    }
 }
 
 fn doc_cmp(a: &bson::Document, b: &bson::Document) -> Ordering {
