@@ -975,48 +975,6 @@ libc-collations scope decision above.
       `errors:95` and `prepared_stmt_invalidation:87`.
       Backlog-ID: RP-078
       Verify: tests/backlog/test_rp_found_pgtest.py::test_bind_decodes_parameters, tests/backlog/test_rp_found_pgtest.py::test_bind_checks_its_shape, tests/backlog/test_rp_found_pgtest.py::test_cached_plan_fails_at_bind
-- [ ] **Parse succeeds inside a failed transaction.** After an error in a
-      transaction block, PostgreSQL 15.19 refuses a Parse with 25P02
-      `current transaction is aborted, commands ignored until end of
-      transaction block`, as it refuses every statement. Here the Parse
-      answers ParseComplete. Found by pgtest `aborted_txn:83`.
-      Backlog-ID: RP-079
-      Verify: tests/backlog/test_rp_found_pgtest.py::test_parse_in_aborted_transaction
-- [ ] **Parse does not resolve parameter types the way PostgreSQL does.**
-      Two shapes, one mechanism (`parse_analyze_varparams`):
-      - parameters declared `unknown` (OID 705) for `INSERT INTO t VALUES
-        ($1, $2, $3)` are described as 705 here; PostgreSQL 15.19 resolves
-        them from the target columns and describes `int8, text, float8`;
-      - in `select n::int4, lower($1) from generate_series(0, $1::int) as
-        n`, PostgreSQL types `$1` integer from the cast, so `lower(integer)`
-        does not exist and Parse fails with 42883. Here Parse succeeds,
-        describing `$1` as int4 and `lower` as text;
-      - a parameter DECLARED uuid (OID 2950) in `SELECT id FROM t WHERE v =
-        $1`, `v` varchar, has no `=` operator: PostgreSQL fails Parse with
-        42883. Here Parse and Bind succeed and the 42883 comes at Execute.
-      Found by pgtest `unknown:31`, `parameter_description:40` and
-      `typing:74`.
-      Backlog-ID: RP-080
-      Verify: tests/backlog/test_rp_found_pgtest.py::test_unknown_parameters_take_their_column_types, tests/backlog/test_rp_found_pgtest.py::test_conflicting_parameter_uses_fail_at_parse, tests/backlog/test_rp_found_pgtest.py::test_declared_parameter_type_is_checked_at_parse
-- [ ] **ParameterStatus arrives in the wrong place: before a SET's
-      CommandComplete, and in a different order on every connection.**
-      PostgreSQL 15.19 sends `CommandComplete SET`, then the
-      ParameterStatus for the changed setting (`application_name`,
-      `TimeZone`), then ReadyForQuery; here the ParameterStatus comes
-      first. The startup ParameterStatus messages also come in a different
-      order on each connection (8 orders in 8 connections; PostgreSQL's
-      order is fixed), which looks like a hash map's iteration order.
-      Found by pgtest `param_status:7` and `timezone:53`.
-      Backlog-ID: RP-081
-      Verify: tests/backlog/test_rp_found_pgtest.py::test_set_reports_after_command_complete, tests/backlog/test_rp_found_pgtest.py::test_startup_parameter_order
-- [ ] **RowDescription gives a type size of -1 for void, enums and the
-      reg* types, whose size is 4.** PostgreSQL 15.19 sends the type's
-      `typlen`: 4 for `pg_sleep(0)` (void), for an enum value, and for
-      `regclass` / `regtype` / `regproc`. Here each is -1. A client that
-      sizes buffers from RowDescription reads these as variable-length.
-      Found by pgtest `void:8`, `enum:64` and `oid:10`.
-      Backlog-ID: RP-082
-      Verify: tests/backlog/test_rp_found_pgtest.py::test_fixed_length_types_report_their_size
 - [ ] **A binary regclass or regtype parameter comes back as raw binary in
       a TEXT result, typed `text`.** `SELECT $1, $2, $3, $4, $5` with
       parameters declared `regclass, regnamespace, regproc, regtype, oid`,
@@ -1028,27 +986,6 @@ libc-collations scope decision above.
       answer. Found by pgtest `oid:10`.
       Backlog-ID: RP-083
       Verify: tests/backlog/test_rp_found_pgtest.py::test_reg_parameters_render_as_text
-- [ ] **A BEGIN inside a transaction gives no warning.** PostgreSQL 15.19
-      answers a second BEGIN with a NoticeResponse, WARNING 25001 `there is
-      already a transaction in progress`, by simple query and through a
-      prepared statement. Here there is no notice. Found by pgtest
-      `implicit_txn:49`.
-      Backlog-ID: RP-084
-      Verify: tests/backlog/test_rp_found_pgtest.py::test_begin_inside_a_transaction_warns
-- [ ] **`0::"char"` is an empty value, not the zero byte.** In binary
-      format PostgreSQL 15.19 returns the one byte `00`; here the value is
-      zero bytes long. Found by pgtest `char:201`, which is an expected
-      divergence for its stanza at `:250`; the Rust server stops earlier,
-      here.
-      Backlog-ID: RP-085
-      Verify: tests/backlog/test_rp_found_pgtest.py::test_char_of_zero_is_a_zero_byte
-- [ ] **`COPY ... TO STDOUT CSV HEADER` counts the header line as a row.**
-      For a table of four rows PostgreSQL 15.19's tag is `COPY 4`, here it
-      is `COPY 5`, for `COPY t` and for `COPY (SELECT ...)`. A client that
-      reads the count (psycopg's `rowcount`) is told one row too many.
-      Found by pgtest `copy:71`; PostgreSQL stops at `copy:208`.
-      Backlog-ID: RP-086
-      Verify: tests/backlog/test_rp_found_pgtest.py::test_copy_header_is_not_a_row
 - [ ] **A view's columns report attribute number 0 in RowDescription.**
       For a simple view over a join, PostgreSQL 15.19 names each column's
       base table column (table OID and attnum; the test checks the attnum,
@@ -1057,34 +994,6 @@ libc-collations scope decision above.
       `row_description:125`; PostgreSQL stops at `:380`.
       Backlog-ID: RP-087
       Verify: tests/backlog/test_rp_found_pgtest.py::test_view_columns_name_their_base_columns
-- [ ] **`''::jsonpath` is accepted.** PostgreSQL 15.19 raises 22P02 for an
-      empty jsonpath; here it is a jsonpath of the empty string. Found by
-      pgtest `jsonpath:5` (an expected divergence for its stanza at `:36`;
-      the Rust server stops here first).
-      Backlog-ID: RP-088
-      Verify: tests/backlog/test_rp_found_pgtest.py::test_empty_jsonpath_is_a_syntax_error
-- [ ] **Binding to a portal name that is already open replaces it.** In a
-      transaction, with portal `p2` open and suspended, PostgreSQL 15.19
-      refuses a second Bind to `p2` with 42P03 `portal "p2" already
-      exists` and aborts the transaction. Here the new Bind replaces the
-      open portal and runs. Found by pgtest
-      `multiple_active_portals:137`.
-      Backlog-ID: RP-089
-      Verify: tests/backlog/test_rp_found_pgtest.py::test_bind_to_an_existing_portal
-- [ ] **An unknown type name in a cast is accepted at Parse.** `SELECT
-      $1::GEOMETRY` without PostGIS is 42704 `type "geometry" does not
-      exist` at Parse on PostgreSQL 15.19; here Parse succeeds, and Bind
-      later fails with 22021. Found by pgtest `spatial:8`.
-      Backlog-ID: RP-090
-      Verify: tests/backlog/test_rp_found_pgtest.py::test_unknown_type_fails_at_parse
-- [ ] **Executing an unbound unnamed portal names an internal portal in
-      the error.** Execute of portal `""` with nothing bound is 34000 on
-      both servers, but PostgreSQL 15.19's message is `portal "" does not
-      exist` and this server's is `portal "POSTGRESQL_DEFAULT_NAME" does
-      not exist`, a name the client never sent. A named portal's message is
-      already right. Found by pgtest `portals:24`.
-      Backlog-ID: RP-091
-      Verify: tests/backlog/test_rp_found_pgtest.py::test_unknown_portal_error_names_it
 
 ## Found by the corpus test (2026-10-21)
 

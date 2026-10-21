@@ -8502,7 +8502,8 @@ def test_describe_shapes_and_cursor_portals_match_postgres(home: Path) -> None:
     """The libpq-level Describe shapes psycopg's `tests/pq` checks, on PG 16.
 
     `Describe` of a statement reports a parameter's type from the CAST over
-    it (`$1::int4, $2::text` is 23 / 25; nothing types it -> 705), and an
+    it (`$1::int4, $2::text` is 23 / 25; nothing types it -> text, 25, as
+    PostgreSQL 14 and 15.19 both answer, measured 2026-10-22), and an
     integer expression over cast parameters types from its operands
     (`$1::int8 + $2::int8` is int8, not int4). A `begin; declare ...` simple
     query leaves the session IN a transaction with the cursor open; the
@@ -8534,7 +8535,7 @@ def test_describe_shapes_and_cursor_portals_match_postgres(home: Path) -> None:
             assert [(res.fname(i), res.ftype(i)) for i in range(res.nfields)] == [(b"fld", 20)]
             conn.prepare(b"p3", b"select $1")
             res = conn.describe_prepared(b"p3")
-            assert [res.param_type(i) for i in range(res.nparams)] == [705]
+            assert [res.param_type(i) for i in range(res.nparams)] == [25]
 
             res = conn.exec_(
                 b"begin; declare cur cursor for select * from generate_series(1,10) foo;"
