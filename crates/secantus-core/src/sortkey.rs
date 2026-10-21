@@ -36,7 +36,11 @@ const RANK_REGEX: u8 = 12;
 /// sorted by, that drives the in-memory sort, and moving one alone makes an
 /// index change the sort answer.
 const RANK_JAVASCRIPT: u8 = 13;
-const RANK_MAXKEY: u8 = 14;
+/// JavaScript-with-scope is a type of its own too, after plain JavaScript:
+/// mongod sorts every `Code` before every `Code` with a scope, then by the
+/// code, then by the scope (probed 8.2.11, 2026-10-21; RM-233). Entry format 5.
+const RANK_JAVASCRIPT_SCOPE: u8 = 14;
+const RANK_MAXKEY: u8 = 15;
 
 const NUM_NAN: u8 = 0x00;
 const NUM_NEG_INF: u8 = 0x20;
@@ -429,14 +433,16 @@ pub fn encode_value(v: &Bson, coll: Option<&Collation>) -> Result<Vec<u8>, Unsup
         }
         // A collation has nothing to say about JavaScript, so it is deliberately
         // not applied here (mongod compares code text directly). A with-scope
-        // Code orders by its code text; mongod ignores the scope for ordering.
+        // Code orders by its code text, then by its scope as a document.
         Bson::JavaScriptCode(s) => {
             out.push(RANK_JAVASCRIPT);
             out.extend(escape(s.as_bytes()));
         }
         Bson::JavaScriptCodeWithScope(c) => {
-            out.push(RANK_JAVASCRIPT);
+            out.push(RANK_JAVASCRIPT_SCOPE);
             out.extend(escape(c.code.as_bytes()));
+            out.extend_from_slice(COMPOUND_SEP);
+            out.extend(encode_doc(&c.scope, None)?);
         }
         Bson::Document(d) => {
             out.push(RANK_DOCUMENT);
@@ -446,9 +452,12 @@ pub fn encode_value(v: &Bson, coll: Option<&Collation>) -> Result<Vec<u8>, Unsup
             out.push(RANK_ARRAY);
             out.extend(encode_array(a, coll)?);
         }
+        // Length, then subtype, then bytes, as mongod compares BinData (RM-232;
+        // the subtype byte is new in entry format 5).
         Bson::Binary(b) => {
             out.push(RANK_BINDATA);
             out.extend_from_slice(&(b.bytes.len() as u32).to_be_bytes());
+            out.push(u8::from(b.subtype));
             out.extend(escape(&b.bytes));
         }
         Bson::ObjectId(oid) => {
@@ -545,6 +554,47 @@ mod tests {
 
     fn ev(v: Bson) -> Vec<u8> {
         encode_value(&v, None).unwrap()
+    }
+
+    /// Entry format 5 (RM-232 / RM-233): BinData by length, subtype, bytes;
+    /// JavaScript before JavaScript-with-scope, which orders by code then
+    /// scope -- mongod 8.2.11's order. Each key must also agree with
+    /// `order::cmp`, or an index changes the sort answer.
+    #[test]
+    fn bindata_and_javascript_keys_follow_mongod() {
+        use bson::spec::BinarySubtype;
+        use bson::{doc, Binary, JavaScriptCodeWithScope};
+        let bin = |b: &[u8], s: BinarySubtype| {
+            Bson::Binary(Binary {
+                subtype: s,
+                bytes: b.to_vec(),
+            })
+        };
+        let cws = |c: &str, s: Document| {
+            Bson::JavaScriptCodeWithScope(JavaScriptCodeWithScope {
+                code: c.into(),
+                scope: s,
+            })
+        };
+        let ascending = [
+            bin(b"\x02", BinarySubtype::Generic),
+            bin(b"\x01", BinarySubtype::UserDefined(0x80)),
+            bin(b"\x01\x01", BinarySubtype::Generic),
+            Bson::JavaScriptCode("c".into()),
+            cws("a", doc! {"x": 1}),
+            cws("a", doc! {"x": 2}),
+            cws("b", doc! {}),
+            Bson::MaxKey,
+        ];
+        for w in ascending.windows(2) {
+            assert!(
+                ev(w[0].clone()) < ev(w[1].clone()),
+                "{:?} !< {:?}",
+                w[0],
+                w[1]
+            );
+            assert_eq!(crate::order::cmp(&w[0], &w[1]), std::cmp::Ordering::Less);
+        }
     }
 
     /// Number-key format 2: every number keyed by its exact value, in order,

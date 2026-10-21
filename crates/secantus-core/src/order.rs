@@ -45,7 +45,10 @@ fn type_rank(v: &Bson) -> u8 {
         // `sortkey::RANK_JAVASCRIPT` -- that encoder writes the rank byte
         // persisted index entries are sorted by, and moving one alone makes an
         // index change the sort answer.
-        Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_) => 125,
+        Bson::JavaScriptCode(_) => 125,
+        // A type of its own after JavaScript (`sortkey::RANK_JAVASCRIPT_SCOPE`,
+        // RM-233): every `Code` sorts before every `Code` with a scope.
+        Bson::JavaScriptCodeWithScope(_) => 127,
         Bson::MaxKey => 130,
         _ => 50, // matches Python's `return 5` fallback (never reached: is_sortable bars these)
     }
@@ -179,7 +182,7 @@ pub fn cmp(a: &Bson, b: &Bson) -> Ordering {
             (x.time, x.increment).cmp(&(y.time, y.increment))
         }
         (Bson::ObjectId(x), Bson::ObjectId(y)) => x.bytes().cmp(&y.bytes()),
-        (Bson::Binary(x), Bson::Binary(y)) => x.bytes.cmp(&y.bytes), // subtype ignored (bytes `<`)
+        (Bson::Binary(x), Bson::Binary(y)) => bindata_cmp(x, y),
         // Two regexes compare by pattern, then by option string (probed
         // 8.2.11). This used to report every pair EQUAL, justified by what
         // Python's `<` did -- and Python was wrong: `bson.Regex` defines no
@@ -191,7 +194,10 @@ pub fn cmp(a: &Bson, b: &Bson) -> Ordering {
         (Bson::Document(x), Bson::Document(y)) => doc_cmp(x, y),
         (Bson::Array(x), Bson::Array(y)) => array_cmp(x, y),
         (Bson::JavaScriptCode(x), Bson::JavaScriptCode(y)) => x.cmp(y),
-        (Bson::JavaScriptCodeWithScope(x), Bson::JavaScriptCodeWithScope(y)) => x.code.cmp(&y.code),
+        (Bson::JavaScriptCodeWithScope(x), Bson::JavaScriptCodeWithScope(y)) => x
+            .code
+            .cmp(&y.code)
+            .then_with(|| doc_cmp(&x.scope, &y.scope)),
         // Rank 3: the unified numeric type. NaN sorts BELOW every other number
         // -- `{$cmp: [NaN, 0]}` is -1 on mongod, and the storage sort already
         // places it there. It used to fall through to the numeric arm below and
@@ -224,6 +230,18 @@ pub fn cmp(a: &Bson, b: &Bson) -> Ordering {
 /// before `{t: 1, coordinates: []}` (object before array) although
 /// `coordinates` is the smaller name. Measured 8.2.11 (2026-10-06); comparing
 /// the name first put a GeoJSON point without a `crs` ahead of those with one.
+/// mongod's BinData order: length, then subtype, then the bytes (RM-232;
+/// probed 8.2.11). Comparing the bytes alone put `BinData("\x02")` above
+/// `BinData("\x01\x01")` and treated two subtypes of one payload as equal.
+/// `sortkey` encodes the same order into index keys.
+pub fn bindata_cmp(x: &bson::Binary, y: &bson::Binary) -> Ordering {
+    (x.bytes.len(), u8::from(x.subtype), &x.bytes).cmp(&(
+        y.bytes.len(),
+        u8::from(y.subtype),
+        &y.bytes,
+    ))
+}
+
 fn doc_cmp(a: &bson::Document, b: &bson::Document) -> Ordering {
     for ((ak, av), (bk, bv)) in a.iter().zip(b.iter()) {
         let r = type_rank(av).cmp(&type_rank(bv));
@@ -357,7 +375,13 @@ pub fn bson_lt(a: &Bson, b: &Bson) -> Option<bool> {
             Some((x.time, x.increment) < (y.time, y.increment))
         }
         (Bson::ObjectId(x), Bson::ObjectId(y)) => Some(x.bytes() < y.bytes()),
-        (Bson::Binary(x), Bson::Binary(y)) => Some(x.bytes < y.bytes),
+        (Bson::Binary(x), Bson::Binary(y)) => Some(bindata_cmp(x, y) == Ordering::Less),
+        (Bson::JavaScriptCodeWithScope(x), Bson::JavaScriptCodeWithScope(y)) => Some(
+            x.code
+                .cmp(&y.code)
+                .then_with(|| doc_cmp(&x.scope, &y.scope))
+                == Ordering::Less,
+        ),
         // Pattern, then option string -- see the note in `cmp`.
         (Bson::RegularExpression(x), Bson::RegularExpression(y)) => {
             Some(crate::regexutil::regex_sort_key(x) < crate::regexutil::regex_sort_key(y))

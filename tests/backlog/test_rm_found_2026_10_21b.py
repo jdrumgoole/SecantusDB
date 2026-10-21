@@ -62,6 +62,28 @@ def _diverging(rust_mongo: Any, mongod: Any, shapes: list[tuple]) -> list[str]:
     return out
 
 
+def _sort_orders(rust_mongo: Any, mongod: Any, values: list) -> list[str]:
+    """`find().sort()` over `values`, without an index and then through one:
+    the in-memory comparator and the stored index keys must both give
+    mongod's order."""
+    diffs = []
+    for indexed in (False, True):
+        answers = []
+        for client in (rust_mongo, mongod):
+            coll = _coll(client, "sorted")
+            coll.drop()
+            coll.insert_many([{"_id": i, "v": v} for i, v in enumerate(values)])
+            cursor = coll.find().sort("v", 1)
+            if indexed:
+                coll.create_index("v")
+                cursor = coll.find().sort("v", 1).hint("v_1")
+            answers.append([d["_id"] for d in cursor])
+        if answers[0] != answers[1]:
+            label = "indexed" if indexed else "unindexed"
+            diffs.append(f"$sort {label}: mongod {answers[1]}, rust {answers[0]}")
+    return diffs
+
+
 def _bin(data: bytes, subtype: int = 0) -> Binary:
     return Binary(data, subtype)
 
@@ -69,7 +91,7 @@ def _bin(data: bytes, subtype: int = 0) -> Binary:
 # ------------------------------------------------- comparison and equality --
 
 
-@pytest.mark.backlog("RM-232")
+@pytest.mark.backlog_fixed("RM-232")
 def test_bindata_orders_by_length_then_subtype(rust_mongo: Any, mongod: Any) -> None:
     """mongod orders BinData by length, then subtype, then bytes. The Rust
     comparison orders by the bytes alone, which also moves `$match` and
@@ -93,10 +115,11 @@ def test_bindata_orders_by_length_then_subtype(rust_mongo: Any, mongod: Any) -> 
         ours, theirs = run(_coll(rust_mongo, "bins")), run(_coll(mongod, "bins"))
         if ours != theirs:
             diffs.append(f"{name}: mongod {theirs}, rust {ours}")
+    diffs += _sort_orders(rust_mongo, mongod, [_bin(b"\x01", 5), _bin(b"\x02"), _bin(b"\x01\x01")])
     assert not diffs, "\n".join(diffs)
 
 
-@pytest.mark.backlog("RM-233")
+@pytest.mark.backlog_fixed("RM-233")
 def test_code_with_scope_is_its_own_type_and_scope_counts(rust_mongo: Any, mongod: Any) -> None:
     """mongod ranks JavaScript-with-scope apart from JavaScript and compares
     the scope; the Rust comparison gives them one rank and reads the code only."""
@@ -105,10 +128,16 @@ def test_code_with_scope_is_its_own_type_and_scope_counts(rust_mongo: Any, mongo
         ("$lt scopes", {"$lt": [Code("a", {"x": 1}), Code("a", {"x": 2})]}),
         ("$setEquals scopes", {"$setEquals": [[Code("a", {"x": 1})], [Code("a", {"x": 2})]]}),
     ]
-    assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
+    d = _diverging(rust_mongo, mongod, shapes)
+    d += _sort_orders(
+        rust_mongo,
+        mongod,
+        [Code("b", {"x": 1}), Code("c"), Code("a", {"x": 2}), Code("a", {"x": 1})],
+    )
+    assert not d, "\n".join(d)
 
 
-@pytest.mark.backlog("RM-234")
+@pytest.mark.backlog_fixed("RM-234")
 def test_minkey_and_maxkey_equal_themselves(rust_mongo: Any, mongod: Any) -> None:
     """`{$eq: [MinKey, MinKey]}` is true on mongod; the Rust equality has no
     arm for either type and answers false, so `$ne`, `$in` and
@@ -125,7 +154,7 @@ def test_minkey_and_maxkey_equal_themselves(rust_mongo: Any, mongod: Any) -> Non
     assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
 
 
-@pytest.mark.backlog("RM-235")
+@pytest.mark.backlog_fixed("RM-235")
 def test_document_equality_respects_field_order(rust_mongo: Any, mongod: Any) -> None:
     """mongod compares documents field by field in order, so `{b:1,a:1}` is
     not `{a:1,b:1}`; the Rust equality looks fields up by name."""

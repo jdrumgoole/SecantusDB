@@ -538,35 +538,12 @@ the generic sweep cannot build (`op_switch` had never run at all), so the
 cases in `tools/probes/expression_shapes.py` were written against those
 lines and run against mongod 8.2.11 on macOS arm64. Each item below is one
 root cause; its gap test in `tests/backlog/test_rm_found_2026_10_21b.py`
-holds every shape measured for it and asks mongod live. The first four are
-in the shared comparison code, so they change `$match`, `$sort`-free set
-operators and `$group` answers too, not only expressions.
+holds every shape measured for it and asks mongod live. Four more were
+fixed in the same batch, all in the comparison code every query shares:
+BinData order (RM-232) and JavaScript-with-scope as its own type (RM-233),
+which moved the index-entry format to 5, and MinKey / MaxKey equality
+(RM-234) and field order in document equality (RM-235).
 
-- [ ] **BinData compares by its bytes alone.** mongod orders BinData by
-  length, then subtype, then bytes; the Rust comparison (`order.rs`) reads
-  the bytes only. `{$cmp: [BinData("\x02"), BinData("\x01\x01")]}` is -1 on
-  mongod and 1 here, `$setUnion` of two subtypes keeps one, and
-  `find({b: {$gt: BinData("\x01\x01")}})` returns a document mongod
-  excludes; `$group` `$max` picks the other value. (`find().sort()` on
-  BinData already agrees.)
-  Backlog-ID: RM-232
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_bindata_orders_by_length_then_subtype
-- [ ] **JavaScript-with-scope shares JavaScript's type rank, and its scope is
-  not compared.** `order.rs` ranks both 125 and compares the code; mongod
-  ranks them apart and compares the scope, so `$cmp`, `$lt` and
-  `$setEquals` over `Code("a", {x: 1})` answer differently.
-  Backlog-ID: RM-233
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_code_with_scope_is_its_own_type_and_scope_counts
-- [ ] **MinKey and MaxKey are not equal to themselves.** `py_eq`
-  (`expressions.rs`) has no arm for either and falls to `false`, so `$eq`,
-  `$ne`, `$in`, `$indexOfArray` and nested equality are all inverted.
-  Backlog-ID: RM-234
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_minkey_and_maxkey_equal_themselves
-- [ ] **Document equality ignores field order.** `py_eq` looks each field up
-  by name, so `{b: 1, a: 1}` equals `{a: 1, b: 1}`; mongod compares the
-  fields in order and answers false, in `$eq`, `$in` and nested documents.
-  Backlog-ID: RM-235
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_document_equality_respects_field_order
 - [ ] **Regex `\w`, `\d`, `\s` and `\b` match Unicode characters.** mongod's
   PCRE matches them against ASCII only, with or without the `u` flag, in
   `$regexMatch` / `$regexFind` and in a `find` `$regex`: `^\w$` matches "é"

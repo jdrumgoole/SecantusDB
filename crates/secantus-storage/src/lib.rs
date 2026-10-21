@@ -2973,11 +2973,18 @@ fn escape_kb(kb: &[u8]) -> Vec<u8> {
 ///   SIZE order, so ranges, partial-filter implication and sort walks over
 ///   document keys had to be refused. `_id` keys are NOT index entries and
 ///   keep the old encoding (`sortkey::encode_id_key`).
+/// * 5 — BinData keys carry the subtype between length and bytes, and
+///   JavaScript-with-scope has a rank of its own after JavaScript (14, which
+///   moves MaxKey to 15) keyed by code then scope: mongod's order
+///   (RM-232 / RM-233, decided by Joe 2026-10-21). An older store's keys put
+///   equal-length BinData in byte order and interleave the two JavaScript
+///   types, so it is refused like any earlier format.
 ///
 /// The catalog is the only place this is visible — the WT `key_format` is
 /// `SSSu` for all three — so the marker is how an older store is detected
-/// (`reject_legacy_index_entry_format`). Mirrors the Python `_ENTRY_FORMAT`.
-const ENTRY_FORMAT: i32 = 4;
+/// (`reject_legacy_index_entry_format`). The deprecated Python servers' `_ENTRY_FORMAT`
+/// stays at 4: compatibility with them is no longer a constraint (2026-10-16).
+const ENTRY_FORMAT: i32 = 5;
 
 /// Pack an index-entry payload into a single trailing `u` column:
 /// `escape(kb) + b"\x00\x00" + RecordId(8B big-endian)`. WiredTiger
