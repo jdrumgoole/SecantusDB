@@ -30714,10 +30714,12 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
             // A decimal literal is `numeric`, so `1.5::float8` arrives here as
             // a Decimal128 rather than a Double. Missing this arm made the
             // cast fail outright once decimal literals stopped being floats.
+            // `numeric_float8` is `float8in` over the numeric's text, so a
+            // value past the double range either way is 22003 (RP-066).
             v if is_numeric(v) => numeric_text(v)
-                .and_then(|t| numeric::numeric_text_to_f64(&t))
-                .map(Bson::Double)
-                .ok_or_else(|| bad("double precision", &value)),
+                .ok_or_else(|| bad("double precision", &value))
+                .and_then(|t| float_in(&t, "double precision"))
+                .map(Bson::Double),
             Bson::String(s) => float_in(s, "double precision").map(Bson::Double),
             _ => Err(bad("double precision", &value)),
         },
@@ -33354,7 +33356,7 @@ pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
                     )))
                 }
             };
-            return Ok(Bson::Double(match op {
+            let out = match op {
                 "+" => x + y,
                 "-" => x - y,
                 "*" => x * y,
@@ -33365,7 +33367,28 @@ pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
                     x / y
                 }
                 _ => return Err(Error::Unsupported(format!("operator {op}"))),
-            }));
+            };
+            // `float_overflow_error` / `float_underflow_error`, as
+            // `float8_pl` / `_mi` / `_mul` / `_div` check (RP-066): an
+            // infinity from finite operands, a zero from nonzero ones.
+            let overflow = out.is_infinite() && x.is_finite() && (op == "/" || y.is_finite());
+            let underflow = out == 0.0
+                && match op {
+                    "*" => x != 0.0 && y != 0.0,
+                    "/" => x != 0.0 && y.is_finite(),
+                    _ => false,
+                };
+            if overflow {
+                return Err(Error::NumericOutOfRange(
+                    "value out of range: overflow".into(),
+                ));
+            }
+            if underflow {
+                return Err(Error::NumericOutOfRange(
+                    "value out of range: underflow".into(),
+                ));
+            }
+            return Ok(Bson::Double(out));
         }
     };
 
