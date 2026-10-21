@@ -31,6 +31,7 @@ import pathlib
 import re
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -177,6 +178,37 @@ def mongod() -> Iterator[Any]:
         yield client
     finally:
         client.close()
+        _stop_mongod(proc, dbpath)
+
+
+@pytest.fixture(scope="module")
+def mongod_rs() -> Iterator[Any]:
+    """A throwaway single-node replica set: the reference for change streams
+    and retryable writes, which a standalone mongod refuses."""
+    from tests.mongod_reference import MONGOD, _host_port, _start_mongod, _stop_mongod
+
+    assert MONGOD, "no mongod on PATH: the reference server is required"
+    proc, uri, dbpath = _start_mongod(extra_args=("--replSet", "backlog"))
+    try:
+        boot = pymongo.MongoClient(uri, directConnection=True, serverSelectionTimeoutMS=10_000)
+        host, port = _host_port(uri)
+        boot.admin.command(
+            {
+                "replSetInitiate": {
+                    "_id": "backlog",
+                    "members": [{"_id": 0, "host": f"{host}:{port}"}],
+                }
+            }
+        )
+        deadline = time.monotonic() + 60
+        while not boot.admin.command("hello").get("isWritablePrimary"):
+            assert time.monotonic() < deadline, "the single-node set never became primary"
+            time.sleep(0.2)
+        boot.close()
+        client = pymongo.MongoClient(uri, directConnection=True, serverSelectionTimeoutMS=10_000)
+        yield client
+        client.close()
+    finally:
         _stop_mongod(proc, dbpath)
 
 

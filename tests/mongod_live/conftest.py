@@ -17,22 +17,31 @@ difference rather than an equal Python value.
 
 from __future__ import annotations
 
-import time
-from collections.abc import Iterator
+import pathlib
 from typing import Any
 
-import pymongo
 import pytest
 from bson import json_util
 
-from tests.backlog.conftest import mongo_answer, mongod, rust_mongo  # noqa: F401  (fixtures)
+from tests.backlog.conftest import (  # noqa: F401  (fixtures)
+    mongo_answer,
+    mongod,
+    mongod_rs,
+    rust_mongo,
+)
 
 _CANONICAL = json_util.JSONOptions(json_mode=json_util.JSONMode.CANONICAL)
 
 
+_HERE = pathlib.Path(__file__).parent
+
+
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    # The hook sees every item in the session, not only this directory's:
+    # marking them all would deselect the whole default suite.
     for item in items:
-        item.add_marker(pytest.mark.mongod_live)
+        if _HERE in pathlib.Path(str(item.fspath)).parents:
+            item.add_marker(pytest.mark.mongod_live)
 
 
 def canonical(value: Any) -> str:
@@ -43,29 +52,3 @@ def same(ours: Any, theirs: Any) -> None:
     """Exact, type-aware equality, with both renderings in the message."""
     a, b = canonical(ours), canonical(theirs)
     assert a == b, f"\n  secantusd-rs: {a}\n  mongod:       {b}"
-
-
-@pytest.fixture(scope="module")
-def mongod_rs() -> Iterator[Any]:
-    """A throwaway single-node replica set: the reference for change streams
-    and retryable writes, which a standalone mongod refuses."""
-    from tests.mongod_reference import MONGOD, _host_port, _start_mongod, _stop_mongod
-
-    assert MONGOD, "no mongod on PATH: the reference server is required"
-    proc, uri, dbpath = _start_mongod(extra_args=("--replSet", "live"))
-    try:
-        boot = pymongo.MongoClient(uri, directConnection=True, serverSelectionTimeoutMS=10_000)
-        host, port = _host_port(uri)
-        boot.admin.command(
-            {"replSetInitiate": {"_id": "live", "members": [{"_id": 0, "host": f"{host}:{port}"}]}}
-        )
-        deadline = time.monotonic() + 60
-        while not boot.admin.command("hello").get("isWritablePrimary"):
-            assert time.monotonic() < deadline, "the single-node set never became primary"
-            time.sleep(0.2)
-        boot.close()
-        client = pymongo.MongoClient(uri, directConnection=True, serverSelectionTimeoutMS=10_000)
-        yield client
-        client.close()
-    finally:
-        _stop_mongod(proc, dbpath)

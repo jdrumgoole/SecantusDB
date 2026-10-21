@@ -531,7 +531,8 @@ These are explicit non-goals. Don't add them without a reason.
 
 The first comparison of `$setWindowFields` / `$fill` and of a tail of
 operators no CI test had covered with mongod 8.2.11
-(`tests/mongod_live/`). It found five divergences; two were fixed in the
+(`tests/mongod_live/`), change streams among them. It found six
+divergences; two were fixed in the
 same batch: `$shift` answering null for a MISSING output instead of its
 default (RM-227), and a lowercase `collmod` alias mongod does not have
 (it answers 59). Each left is a
@@ -569,6 +570,20 @@ about forty such points; these are the ones measured.
       errors. Found by `tests/mongod_live/test_operator_tail.py`, 2026-10-21.
       Backlog-ID: RM-228
       Verify: tests/backlog/test_rm_found_2026_10_21.py::test_convert_to_a_target_it_cannot_produce
+- [ ] **A change stream's post-image is the document now, not as the
+      update left it.** On a collection with `changeStreamPreAndPostImages:
+      {enabled: true}`, `fullDocument: "whenAvailable"` / `"required"` makes
+      mongod 8.2.11 answer each update event with the post-image it stored
+      when that update ran: two updates setting `a` to 2 then 3 read back as
+      `a: 2`, `a: 3`. This server looks the document up when the event is
+      read (`a: 3`, `a: 3`) -- `updateLookup`'s semantics -- so once a later
+      write deletes it, "whenAvailable" answers null and "required" fails
+      the stream (47, post-image not found). A silent wrong answer.
+      Pre-images here already match mongod
+      (`tests/mongod_live/test_change_streams.py`); probe how mongod
+      derives the post-image before building it. Found 2026-10-21.
+      Backlog-ID: RM-229
+      Verify: tests/backlog/test_rm_found_2026_10_21.py::test_change_stream_serves_the_stored_post_image
 
 ### 7.086 The Rust MongoDB server, audited -- 2026-10-20
 

@@ -143,8 +143,12 @@ throughput / concurrency work to `crates/`.
   (`PROBED_MONGOD_MAJOR`). **It targets the PYTHON server** (its
   `secantus_uri` fixture starts `SecantusDBServer`), so since 2026-10-20 it
   does not run in CI and is no evidence about the Rust server. For the Rust
-  MongoDB server the evidence is a probe against `mongod` (the
-  `differential-probe` skill) and the sweeps under `tools/probes/`.
+  MongoDB server the evidence is what CI runs against a live mongod 8.2 on
+  every PR (since 2026-10-21, the storage-engine job): the backlog's gap and
+  `backlog_fixed` regression tests (`tools/backlog.py verify --file
+  backlog-rust-mongodb.md --regressions`) and `tests/mongod_live/`; plus
+  probes (the `differential-probe` skill) and the sweeps under
+  `tools/probes/`, which no workflow runs.
 
   **"Stable within a major" is a good default and not a guarantee** — two
   measured counterexamples, so probe rather than assume when a difference looks
@@ -447,9 +451,10 @@ decodes in the Rust servers, missing conflated with null). Cite the exact
 
 A probe that finds something belongs in a test, or the next session re-finds
 it. For the Rust servers that is a regression test beside their own tests (or
-a `tests/backlog/` gap test while it is open), not
-`tests/test_mongod_differential.py`, which targets the deprecated Python
-server.
+a `tests/backlog/` gap test while it is open; for the MongoDB server, a
+comparison no backlog item asked for goes in `tests/mongod_live/`, which CI
+runs against mongod), not `tests/test_mongod_differential.py`, which targets
+the deprecated Python server.
 
 **Parity is not correctness.** The parity suites pin the two engines to each
 other, so they are equally satisfied by both being wrong (`$bucket`,

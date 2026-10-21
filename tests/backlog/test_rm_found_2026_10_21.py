@@ -153,3 +153,38 @@ def test_convert_to_a_target_it_cannot_produce(
     pipeline = [{"$project": {"_id": 0, "r": {"$convert": spec}}}]
     ours, theirs = _answers(rust_mongo, mongod, [{"_id": 1, "x": "5"}], pipeline)
     assert ours == theirs
+
+
+@pytest.mark.backlog("RM-229")
+@pytest.mark.parametrize("full_document", ["whenAvailable", "required"])
+def test_change_stream_serves_the_stored_post_image(
+    rust_mongo: Any, mongod_rs: Any, full_document: str
+) -> None:
+    """mongod 8.2.11, on a collection created with
+    `changeStreamPreAndPostImages: {enabled: true}`: an update event's
+    `fullDocument` is the post-image stored when that update ran -- `a: 2`
+    then `a: 3` here. The Rust server looks the document up as it is when
+    the event is read (`a: 3` both times); once a later write deletes it,
+    "whenAvailable" answers null and "required" fails the stream (47)."""
+    answers = []
+    for client in (rust_mongo, mongod_rs):
+        client.drop_database("rm229")
+        db = client["rm229"]
+        db.create_collection("c", changeStreamPreAndPostImages={"enabled": True})
+        db.c.insert_one({"_id": 1, "a": 1})
+
+        def read(db: Any = db) -> list:
+            with db.c.watch(full_document=full_document, max_await_time_ms=200) as stream:
+                db.c.update_one({"_id": 1}, {"$set": {"a": 2}})
+                db.c.update_one({"_id": 1}, {"$set": {"a": 3}})
+                out = []
+                for _ in range(50):
+                    ev = stream.try_next()
+                    if ev is not None:
+                        out.append(ev.get("fullDocument"))
+                    if len(out) == 2:
+                        break
+                return out
+
+        answers.append(mongo_answer(read))
+    assert answers[0] == answers[1]

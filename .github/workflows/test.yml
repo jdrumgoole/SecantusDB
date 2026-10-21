@@ -1144,13 +1144,23 @@ jobs:
         # the item and turn the test into a regression test), or when a gap
         # test breaks rather than failing on its assertion (BROKEN).
         # `--file` keeps it to the RM items, so no PostgreSQL is needed.
+        #
+        # tests/mongod_live/ then compares the surface no backlog item
+        # covers (window functions, change-stream images, retryable writes,
+        # an operator tail). Both run whatever the first answers, so one
+        # failure never hides the other.
         if: runner.os == 'Linux'
         shell: bash
         run: |
           mongod --version | head -1
-          uv run --no-project --with pymongo==4.17.0 --with pytest --with pytest-xdist \
-            --with "psycopg[binary]==3.3.4" \
-            python tools/backlog.py verify --file backlog-rust-mongodb.md --regressions
+          deps="--with pymongo==4.17.0 --with pytest --with pytest-xdist --with psycopg[binary]==3.3.4"
+          status=0
+          uv run --no-project $deps \
+            python tools/backlog.py verify --file backlog-rust-mongodb.md --regressions || status=1
+          uv run --no-project $deps \
+            python -m pytest tests/mongod_live -m mongod_live -o addopts= -n auto \
+            -p no:cacheprovider -q -rs || status=1
+          exit $status
 
   pg-oracle:
     # The SQL suites that diff against a REAL PostgreSQL. They exist because

@@ -66,7 +66,11 @@ the helpers (`mongo_answer`, `pg_answer`) that turn an error into a value.
 - **Narrow and fast**: the gap the item names, not its neighbours; seconds.
 - Gap tests and regression tests are excluded from the default suite by
   their markers (gap tests fail by design, and both need the reference
-  servers) and run through the verifier.
+  servers) and run through the verifier. **CI runs the RM side on every
+  PR** (since 2026-10-21: the storage-engine job, `verify --file
+  backlog-rust-mongodb.md --regressions` against mongod 8.2), so a
+  regression, a gap test that starts passing (`FIXED?`: close the item in
+  the same PR) or a BROKEN one fails the PR.
 
 ## Filing an item
 
