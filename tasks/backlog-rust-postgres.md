@@ -800,9 +800,15 @@ Not filed:
       | `IntervalStyle = iso_8601` | `P1DT2H` | `1 day 02:00:00` |
       | `bytea_output = escape` | `A\377` | `\x41ff` |
       | `extra_float_digits = 0` | `0.3` | `0.30000000000000004` |
+
+      Below 1, PostgreSQL rounds to `FLT_DIG` / `DBL_DIG` plus the setting:
+      at -1, `(1/3.0)::float4` is `0.33333` and `::float8`
+      `0.33333333333333`; at -15 both are `0.3`. Here the output is always
+      the shortest exact form, the answer for 1 and above (pgtest
+      `float:108`, 2026-10-21).
       | `application_name` in `pg_stat_activity` | the set name | empty |
       Backlog-ID: RP-068
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_output_settings
+      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_output_settings, tests/backlog/test_rp_found_pgtest.py::test_extra_float_digits_below_one
 - [ ] **System columns are missing.** `ctid`, `xmin`, `xmax`, `cmin` and
       `cmax` are 42703 (`tableoid` works). That breaks EF Core / Npgsql's
       `xmin` concurrency token, the `delete ... where ctid = ...`
@@ -829,7 +835,13 @@ Not filed:
       - `pg_dump --schema-only` stops at `pg_is_in_recovery()` (0A000);
       - `pg_dumpall --globals-only` stops on `pg_shseclabel`;
       - `pgbench -i` stops at `COPY ... FREEZE` (0A000);
-      - psql's `\l+`, `\dd`, `\dc`, `\dL`, `\dy` and `\db`.
+      - psql's `\l`, `\l+`, `\dd`, `\dc`, `\dL`, `\dy` and `\db`.
+
+      `\l` and `\l+` stop because `pg_database.datacl` holds `text`
+      values here, though `pg_attribute` says `aclitem[]`, so psql's
+      `array_to_string(d.datacl, ...)` does not resolve (42883). Plain `\l`
+      is the sql-stress gauge's psql catalog smoke, its one failing lane
+      (2026-10-21).
 
       Also unsupported: `pg_current_wal_lsn`, `pg_postmaster_start_time`,
       `pg_relation_filepath`, `pg_tablespace_location`. The test needs
@@ -926,6 +938,141 @@ server.
       this showed up only as a different stop point.
       Backlog-ID: RP-076
       Verify: tests/backlog/test_rp_found_2026_10_21.py::test_nullif_result_type
+
+Found by the first pgtest run against `secantusd-pg` (CockroachDB's
+`pkg/sql/pgwire/testdata/pgtest` corpus, 2026-10-21). The corpus was also
+run, file by file, against a private PostgreSQL 15.19 cluster: it passes 33
+of the 57 files and the Rust server 13. The Rust server fails every file
+PostgreSQL fails, and 20 more; each item below is the first stanza of one of
+those 20 (or of a file where the Rust server stops EARLIER than PostgreSQL),
+reproduced with a raw-protocol probe. The gap tests are in
+`tests/backlog/test_rp_found_pgtest.py`, over the raw client in
+`tests/backlog/pgwire_raw.py`. `float:108` (`extra_float_digits` below 1)
+is RP-068 above. `tuple:36` is not filed: it is `COLLATE "en_US"`, the
+libc-collations scope decision above.
+
+- [ ] **Bind checks nothing: a malformed parameter, a wrong parameter count
+      and a stale cached plan all get BindComplete.** PostgreSQL 15.19
+      decodes every parameter, and checks the message against the
+      statement, while it processes Bind, so the error replaces
+      BindComplete and needs no Execute to surface. Here Bind always
+      answers BindComplete, and then:
+      - a malformed binary parameter (`$1::interval[]`, an empty `inet`,
+        `jsonb` or `varbit`) is never reported at all when no Execute
+        follows (08P01 on PostgreSQL);
+      - a numeric whose digit is out of range (0xFFF0) is 22003 at Execute,
+        not 22P03 at Bind, and a `json[]` whose element type is not json
+        runs and returns `{}` (42804 on PostgreSQL);
+      - binding one parameter to a statement declared with three runs the
+        statement and returns a row (08P01 on PostgreSQL), and six result
+        format codes for three columns is 08P01 only after BindComplete;
+      - re-binding a prepared `SELECT *` after `ALTER TABLE ... DROP
+        COLUMN` sends BindComplete before 0A000 `cached plan must not change
+        result type`.
+      A client that pipelines Bind before Execute sees a portal that was
+      never valid. Found by pgtest `array:8`, `inet:8`, `json:8`,
+      `varbit:8`, `decimal:121`, `json_array:246`, `prepare:23`,
+      `errors:95` and `prepared_stmt_invalidation:87`.
+      Backlog-ID: RP-078
+      Verify: tests/backlog/test_rp_found_pgtest.py::test_bind_decodes_parameters, tests/backlog/test_rp_found_pgtest.py::test_bind_checks_its_shape, tests/backlog/test_rp_found_pgtest.py::test_cached_plan_fails_at_bind
+- [ ] **Parse succeeds inside a failed transaction.** After an error in a
+      transaction block, PostgreSQL 15.19 refuses a Parse with 25P02
+      `current transaction is aborted, commands ignored until end of
+      transaction block`, as it refuses every statement. Here the Parse
+      answers ParseComplete. Found by pgtest `aborted_txn:83`.
+      Backlog-ID: RP-079
+      Verify: tests/backlog/test_rp_found_pgtest.py::test_parse_in_aborted_transaction
+- [ ] **Parse does not resolve parameter types the way PostgreSQL does.**
+      Two shapes, one mechanism (`parse_analyze_varparams`):
+      - parameters declared `unknown` (OID 705) for `INSERT INTO t VALUES
+        ($1, $2, $3)` are described as 705 here; PostgreSQL 15.19 resolves
+        them from the target columns and describes `int8, text, float8`;
+      - in `select n::int4, lower($1) from generate_series(0, $1::int) as
+        n`, PostgreSQL types `$1` integer from the cast, so `lower(integer)`
+        does not exist and Parse fails with 42883. Here Parse succeeds,
+        describing `$1` as int4 and `lower` as text.
+      Found by pgtest `unknown:31` and `parameter_description:40`.
+      Backlog-ID: RP-080
+      Verify: tests/backlog/test_rp_found_pgtest.py::test_unknown_parameters_take_their_column_types, tests/backlog/test_rp_found_pgtest.py::test_conflicting_parameter_uses_fail_at_parse
+- [ ] **ParameterStatus arrives in the wrong place: before a SET's
+      CommandComplete, and in a different order on every connection.**
+      PostgreSQL 15.19 sends `CommandComplete SET`, then the
+      ParameterStatus for the changed setting (`application_name`,
+      `TimeZone`), then ReadyForQuery; here the ParameterStatus comes
+      first. The startup ParameterStatus messages also come in a different
+      order on each connection (8 orders in 8 connections; PostgreSQL's
+      order is fixed), which looks like a hash map's iteration order.
+      Found by pgtest `param_status:7` and `timezone:53`.
+      Backlog-ID: RP-081
+      Verify: tests/backlog/test_rp_found_pgtest.py::test_set_reports_after_command_complete, tests/backlog/test_rp_found_pgtest.py::test_startup_parameter_order
+- [ ] **RowDescription gives a type size of -1 for void, enums and the
+      reg* types, whose size is 4.** PostgreSQL 15.19 sends the type's
+      `typlen`: 4 for `pg_sleep(0)` (void), for an enum value, and for
+      `regclass` / `regtype` / `regproc`. Here each is -1. A client that
+      sizes buffers from RowDescription reads these as variable-length.
+      Found by pgtest `void:8`, `enum:64` and `oid:10`.
+      Backlog-ID: RP-082
+      Verify: tests/backlog/test_rp_found_pgtest.py::test_fixed_length_types_report_their_size
+- [ ] **A binary regclass or regtype parameter comes back as raw binary in
+      a TEXT result, typed `text`.** `SELECT $1, $2, $3, $4, $5` with
+      parameters declared `regclass, regnamespace, regproc, regtype, oid`,
+      bound in binary, and a text-format result: PostgreSQL 15.19 describes
+      the five columns with those types and returns `16777257`,
+      `16777258`, ... as text. Here `regclass` and `regtype` are described
+      as `text`, and the first four values are the parameters' four binary
+      bytes, sent in a column the client was told is text. A silent wrong
+      answer. Found by pgtest `oid:10`.
+      Backlog-ID: RP-083
+      Verify: tests/backlog/test_rp_found_pgtest.py::test_reg_parameters_render_as_text
+- [ ] **A BEGIN inside a transaction gives no warning.** PostgreSQL 15.19
+      answers a second BEGIN with a NoticeResponse, WARNING 25001 `there is
+      already a transaction in progress`, by simple query and through a
+      prepared statement. Here there is no notice. Found by pgtest
+      `implicit_txn:49`.
+      Backlog-ID: RP-084
+      Verify: tests/backlog/test_rp_found_pgtest.py::test_begin_inside_a_transaction_warns
+- [ ] **`0::"char"` is an empty value, not the zero byte.** In binary
+      format PostgreSQL 15.19 returns the one byte `00`; here the value is
+      zero bytes long. Found by pgtest `char:201`, which is an expected
+      divergence for its stanza at `:250`; the Rust server stops earlier,
+      here.
+      Backlog-ID: RP-085
+      Verify: tests/backlog/test_rp_found_pgtest.py::test_char_of_zero_is_a_zero_byte
+- [ ] **`COPY ... TO STDOUT CSV HEADER` counts the header line as a row.**
+      For a table of four rows PostgreSQL 15.19's tag is `COPY 4`, here it
+      is `COPY 5`, for `COPY t` and for `COPY (SELECT ...)`. A client that
+      reads the count (psycopg's `rowcount`) is told one row too many.
+      Found by pgtest `copy:71`; PostgreSQL stops at `copy:208`.
+      Backlog-ID: RP-086
+      Verify: tests/backlog/test_rp_found_pgtest.py::test_copy_header_is_not_a_row
+- [ ] **A view's columns report attribute number 0 in RowDescription.**
+      For a simple view over a join, PostgreSQL 15.19 names each column's
+      base table column (table OID and attnum; the test checks the attnum,
+      1 and 2). Here both are 0, as for a computed column, so a client
+      cannot trace a view column to its table. Found by pgtest
+      `row_description:125`; PostgreSQL stops at `:380`.
+      Backlog-ID: RP-087
+      Verify: tests/backlog/test_rp_found_pgtest.py::test_view_columns_name_their_base_columns
+- [ ] **`''::jsonpath` is accepted.** PostgreSQL 15.19 raises 22P02 for an
+      empty jsonpath; here it is a jsonpath of the empty string. Found by
+      pgtest `jsonpath:5` (an expected divergence for its stanza at `:36`;
+      the Rust server stops here first).
+      Backlog-ID: RP-088
+      Verify: tests/backlog/test_rp_found_pgtest.py::test_empty_jsonpath_is_a_syntax_error
+- [ ] **Binding to a portal name that is already open replaces it.** In a
+      transaction, with portal `p2` open and suspended, PostgreSQL 15.19
+      refuses a second Bind to `p2` with 42P03 `portal "p2" already
+      exists` and aborts the transaction. Here the new Bind replaces the
+      open portal and runs. Found by pgtest
+      `multiple_active_portals:137`.
+      Backlog-ID: RP-089
+      Verify: tests/backlog/test_rp_found_pgtest.py::test_bind_to_an_existing_portal
+- [ ] **An unknown type name in a cast is accepted at Parse.** `SELECT
+      $1::GEOMETRY` without PostGIS is 42704 `type "geometry" does not
+      exist` at Parse on PostgreSQL 15.19; here Parse succeeds, and Bind
+      later fails with 22021. Found by pgtest `spatial:8`.
+      Backlog-ID: RP-090
+      Verify: tests/backlog/test_rp_found_pgtest.py::test_unknown_type_fails_at_parse
 
 ## Found by the corpus test (2026-10-21)
 
