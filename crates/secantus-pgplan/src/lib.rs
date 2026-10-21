@@ -80,6 +80,7 @@ pub fn encode_multi_byte(canonical: &str, text: &str) -> std::result::Result<Vec
 pub mod bytea;
 pub mod cancel;
 pub mod catalog_stmts;
+pub mod copy_opts;
 pub mod correlated;
 pub mod cursor_scroll;
 pub mod datetime;
@@ -3084,6 +3085,8 @@ pub struct CopyFrom {
     /// `HEADER`: a first line of column names, written on the way out and
     /// skipped on the way in.
     pub header: bool,
+    /// DELIMITER, NULL, QUOTE, ESCAPE, FORCE_*, FREEZE and ENCODING.
+    pub options: copy_opts::CopyOptions,
 }
 
 /// `DROP TABLE a, b` / `DROP TABLE IF EXISTS a`.
@@ -33757,53 +33760,6 @@ fn plan_copy(
             "COPY to or from a server-side file".into(),
         ));
     }
-    let mut format = CopyFormat::Text;
-    let mut header = false;
-    for opt in &c.options {
-        if let Some(N::DefElem(d)) = opt.node.as_ref() {
-            let name = d.defname.to_ascii_lowercase();
-            let value = d
-                .arg
-                .as_ref()
-                .and_then(|a| a.node.as_ref())
-                .and_then(|n| match n {
-                    N::String(s) => Some(s.sval.to_ascii_lowercase()),
-                    _ => None,
-                });
-            match (name.as_str(), value.as_deref()) {
-                ("format", Some("text")) => format = CopyFormat::Text,
-                ("format", Some("csv")) => format = CopyFormat::Csv,
-                ("format", Some("binary")) => format = CopyFormat::Binary,
-                ("format", other) => {
-                    return Err(Error::Unsupported(format!(
-                        "COPY ... FORMAT {}",
-                        other.unwrap_or("?")
-                    )))
-                }
-                // `HEADER` alone is true; `HEADER MATCH` (COPY FROM) checks the
-                // names, which is refused rather than skipped unchecked.
-                ("header", None | Some("true" | "on" | "1")) => header = true,
-                ("header", Some("false" | "off" | "0")) => header = false,
-                ("header", Some("match")) => {
-                    return Err(Error::Unsupported("COPY ... HEADER MATCH".into()))
-                }
-                ("header", Some(v)) => {
-                    return Err(Error::Sqlstate(
-                        "22023",
-                        format!("header requires a Boolean value or \"match\": {v}"),
-                    ))
-                }
-                (other, _) => return Err(Error::Unsupported(format!("COPY option {other}"))),
-            }
-        }
-    }
-    // PostgreSQL 15: `cannot specify HEADER in BINARY mode`.
-    if header && format == CopyFormat::Binary {
-        return Err(Error::Sqlstate(
-            "0A000",
-            "cannot specify HEADER in BINARY mode".into(),
-        ));
-    }
     // `COPY (SELECT ...) TO STDOUT`. PostgreSQL allows a query only when
     // copying OUT -- there is nowhere to put rows copied INTO one.
     if c.relation.is_none() {
@@ -33816,12 +33772,17 @@ fn plan_copy(
             ));
         }
         let inner = plan_select(sel, lookup, params)?;
+        let names: Vec<String> = sub_plan_def(&inner, lookup)
+            .map(|d| d.columns.iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default();
+        let parsed = copy_opts::process(&c.options, false, &names, None)?;
         return Ok(Statement::CopyTo(CopyFrom {
             table: String::new(),
             columns: Vec::new(),
-            format,
+            format: parsed.format,
             query: Some(Box::new(inner)),
-            header,
+            header: parsed.header,
+            options: parsed.options,
         }));
     }
     let table = c
@@ -33842,12 +33803,20 @@ fn plan_copy(
         }
         columns.push(name);
     }
+    let named: Vec<String> = if columns.is_empty() {
+        def.columns.iter().map(|c| c.name.clone()).collect()
+    } else {
+        columns.clone()
+    };
+    let all: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
+    let parsed = copy_opts::process(&c.options, c.is_from, &named, Some((&table, &all)))?;
     let spec = CopyFrom {
         table,
         columns,
-        format,
+        format: parsed.format,
         query: None,
-        header,
+        header: parsed.header,
+        options: parsed.options,
     };
     Ok(if c.is_from {
         Statement::CopyFrom(spec)

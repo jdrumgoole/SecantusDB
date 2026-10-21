@@ -39,6 +39,7 @@ mod catalog_meta;
 mod catalog_objects;
 mod catalog_order;
 mod collations;
+mod copy_text;
 mod crl;
 mod db_settings;
 mod distinct_set;
@@ -3821,6 +3822,11 @@ struct CopyInState {
     format: secantus_pgplan::CopyFormat,
     /// `HEADER`: the first line is column names, skipped.
     header: bool,
+    /// DELIMITER, NULL, QUOTE, ESCAPE and ENCODING (RP-073).
+    options: secantus_pgplan::copy_opts::CopyOptions,
+    /// FORCE_NOT_NULL / FORCE_NULL, per target column.
+    force_not_null: Vec<bool>,
+    force_null: Vec<bool>,
     table: String,
     /// Stored field per target column, in the order the data supplies them.
     fields: Vec<String>,
@@ -5226,6 +5232,57 @@ impl PgHandler {
             }
         }
         self.portal_params(portal, &param_types)?;
+        Ok(())
+    }
+
+    /// A table this transaction block created or truncated (for COPY
+    /// FREEZE). Outside a block every statement is a transaction of its own,
+    /// which no later COPY shares.
+    fn note_fresh_in_block(&self, table: &str) {
+        if self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let depth = self
+                .savepoints
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len();
+            self.marks.note_fresh_table(table, depth);
+        }
+    }
+
+    /// COPY FREEZE's precondition (`CopyFrom`): the table was created or
+    /// truncated in this transaction, or PostgreSQL refuses with 55000.
+    fn check_copy_freeze(&self, cf: &secantus_pgplan::CopyFrom) -> PgWireResult<()> {
+        if !cf.options.freeze {
+            return Ok(());
+        }
+        if self
+            .lookup(&cf.table)
+            .is_some_and(|d| partition::is_partitioned(&d))
+        {
+            return Err(Self::user_error(
+                "0A000",
+                "cannot perform COPY FREEZE on a partitioned table".into(),
+            ));
+        }
+        let fresh = self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self.marks.is_fresh_table(
+                &cf.table,
+                self.savepoints
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .len(),
+            );
+        if !fresh {
+            return Err(Self::user_error(
+                "55000",
+                "cannot perform COPY FREEZE because the table was not created or truncated in the current subtransaction".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -31181,6 +31238,7 @@ impl PgHandler {
             }
             Statement::RuleRewrite(p) => self.run_rule_plan(p, max_rows),
             Statement::CreateTable(mut def, if_not_exists) => {
+                self.note_fresh_in_block(&def.name);
                 // An identity column's sequence options: taken out of the
                 // column so they are not stored with the table.
                 let identity_options: HashMap<String, Document> = def
@@ -33870,9 +33928,16 @@ impl PgHandler {
                         .collect()
                 };
                 let n = cols.len();
+                let flags = |list: &[String]| -> Vec<bool> {
+                    cols.iter().map(|c| list.contains(&c.name)).collect()
+                };
+                self.check_copy_freeze(&cf)?;
                 *self.copy_in.lock().unwrap_or_else(|e| e.into_inner()) = Some(CopyInState {
                     format: cf.format,
                     header: cf.header,
+                    options: cf.options.clone(),
+                    force_not_null: flags(&cf.options.force_not_null),
+                    force_null: flags(&cf.options.force_null),
                     table: cf.table.clone(),
                     fields: cols.iter().map(|c| c.field()).collect(),
                     types: cols.iter().map(|c| c.pg_type.clone()).collect(),
@@ -33965,6 +34030,24 @@ impl PgHandler {
 
                 let n = schema.len();
                 let format = ct.format;
+                // FORCE_QUOTE, per output column (RP-073); ENCODING writes the
+                // data in that encoding rather than the client's.
+                let opts = ct.options.clone();
+                let force_quote: Vec<bool> = schema
+                    .iter()
+                    .map(|f| match &opts.force_quote {
+                        secantus_pgplan::copy_opts::ForceQuote::None => false,
+                        secantus_pgplan::copy_opts::ForceQuote::All => true,
+                        secantus_pgplan::copy_opts::ForceQuote::Columns(c) => {
+                            c.iter().any(|n| n == f.name())
+                        }
+                    })
+                    .collect();
+                let row_cenc = opts
+                    .encoding
+                    .as_deref()
+                    .map_or(row_cenc, encoding::client_encoding);
+                let header_opts = opts.clone();
                 // The binary format encodes each field through the SAME codec
                 // the SELECT binary path uses (`encode_binary`), so the two can
                 // never drift: a `DataRowEncoder` over a binary-format schema
@@ -34039,7 +34122,8 @@ impl PgHandler {
                             Ok(CopyData::new(buf.freeze()))
                         }
                         _ => {
-                            let line = copy_text_row(&row, format, &bin_schema);
+                            let line =
+                                copy_text_row(&row, format, &bin_schema, &opts, &force_quote);
                             // COPY text is line-structured with ASCII delimiters
                             // and escapes, so the whole line transcodes as one
                             // blob to the client encoding (only the field
@@ -34082,11 +34166,14 @@ impl PgHandler {
                             })
                             .collect(),
                     );
-                    Ok(CopyData::new(copy_text_row(
-                        &names,
-                        ct.format,
-                        &text_schema,
-                    )))
+                    let line = copy_text_row(&names, ct.format, &text_schema, &header_opts, &[]);
+                    if row_cenc.transcodes() {
+                        let bytes = encoding::encode(row_cenc, &line)
+                            .map_err(|ch| untranslatable_char(ch, row_cenc))?;
+                        Ok(CopyData::new(Bytes::from(bytes)))
+                    } else {
+                        Ok(CopyData::new(line))
+                    }
                 });
                 let headers = usize::from(header_line.is_some());
                 let data = futures::stream::iter(header_line).chain(data);
@@ -35862,6 +35949,7 @@ impl PgHandler {
                 let tables = self.truncate_set(&tables, cascade)?;
                 for table in &tables {
                     self.fire_statement_triggers(table, "BEFORE", "TRUNCATE")?;
+                    self.note_fresh_in_block(table);
                 }
                 for table in &tables {
                     // A partition's rows are in its tree's root.
@@ -41189,41 +41277,6 @@ fn series_table_def(series: &secantus_pgplan::Series) -> TableDef {
     )
 }
 
-/// Parse COPY text or CSV input into rows of optional fields, where `None` is
-/// that format's NULL.
-///
-/// The two formats disagree about exactly one thing that matters here, and it
-/// is the same thing they disagree about on output: TEXT spells NULL `\N` and
-/// an empty field is an empty string, while CSV spells NULL as an unquoted
-/// empty field and an empty string as `""`. A parser that treated an empty CSV
-/// field as an empty string would silently turn every NULL into one.
-fn copy_parse_text(text: &str, format: secantus_pgplan::CopyFormat) -> Vec<Vec<Option<String>>> {
-    use secantus_pgplan::CopyFormat;
-    if format == CopyFormat::Csv {
-        return copy_parse_csv(text);
-    }
-    let mut rows = Vec::new();
-    for line in text.split('\n') {
-        // A trailing newline leaves an empty final line, and `\.` is the
-        // end-of-data marker from the historical protocol.
-        if line.is_empty() || line == "\\." {
-            continue;
-        }
-        rows.push(
-            line.split('\t')
-                .map(|f| {
-                    if f == "\\N" {
-                        None
-                    } else {
-                        Some(unescape_copy_text(f))
-                    }
-                })
-                .collect(),
-        );
-    }
-    rows
-}
-
 /// Undo COPY's text-format escaping for one field.
 ///
 /// PostgreSQL's text COPY recognises `\b \f \n \r \t \v \\`, octal (`\ooo`, up
@@ -41305,66 +41358,6 @@ fn unescape_copy_text(field: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// CSV, where a newline inside quotes is DATA rather than a row separator --
-/// so the rows cannot be found by splitting on newlines first.
-fn copy_parse_csv(text: &str) -> Vec<Vec<Option<String>>> {
-    let mut rows = Vec::new();
-    let mut row: Vec<Option<String>> = Vec::new();
-    let mut field = String::new();
-    let mut quoted = false;
-    let mut was_quoted = false;
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if quoted {
-            if c == '"' {
-                // A doubled quote is one literal quote.
-                if chars.peek() == Some(&'"') {
-                    chars.next();
-                    field.push('"');
-                } else {
-                    quoted = false;
-                }
-            } else {
-                field.push(c);
-            }
-            continue;
-        }
-        match c {
-            '"' => {
-                quoted = true;
-                was_quoted = true;
-            }
-            ',' => {
-                row.push(csv_field(&field, was_quoted));
-                field.clear();
-                was_quoted = false;
-            }
-            '\n' => {
-                row.push(csv_field(&field, was_quoted));
-                field.clear();
-                was_quoted = false;
-                rows.push(std::mem::take(&mut row));
-            }
-            '\r' => {}
-            _ => field.push(c),
-        }
-    }
-    if !field.is_empty() || was_quoted || !row.is_empty() {
-        row.push(csv_field(&field, was_quoted));
-        rows.push(row);
-    }
-    rows
-}
-
-/// An UNQUOTED empty CSV field is NULL; a quoted one is the empty string.
-fn csv_field(text: &str, was_quoted: bool) -> Option<String> {
-    if text.is_empty() && !was_quoted {
-        None
-    } else {
-        Some(text.to_string())
-    }
-}
-
 /// One COPY row in PostgreSQL's text or CSV format.
 ///
 /// The formats differ in more than the delimiter, and the differences are
@@ -41382,21 +41375,21 @@ fn copy_text_row(
     row: &[Option<Bson>],
     format: secantus_pgplan::CopyFormat,
     schema: &[FieldInfo],
+    opts: &secantus_pgplan::copy_opts::CopyOptions,
+    force_quote: &[bool],
 ) -> bytes::Bytes {
     use secantus_pgplan::CopyFormat;
     let csv = format == CopyFormat::Csv;
     let mut out = String::new();
+    let single = row.len() == 1;
     for (i, value) in row.iter().enumerate() {
         if i > 0 {
-            out.push(if csv { ',' } else { '\t' });
+            out.push(opts.delimiter);
         }
         let oid = schema.get(i).map(|f| f.datatype().oid()).unwrap_or(0);
         let text = match value {
             None | Some(Bson::Null) => {
-                if !csv {
-                    out.push_str("\\N");
-                }
-                // CSV's null is the empty field, so there is nothing to write.
+                copy_text::write_field(&mut out, None, csv, opts, false, single);
                 continue;
             }
             // An inet / cidr field is `inet_out` / `cidr_out`, as in a SELECT:
@@ -41432,35 +41425,8 @@ fn copy_text_row(
             }
             Some(other) => secantus_pgplan::value_text(other),
         };
-        if csv {
-            let needs_quote =
-                text.is_empty() || text.chars().any(|c| matches!(c, ',' | '"' | '\n' | '\r'));
-            if needs_quote {
-                out.push('"');
-                for c in text.chars() {
-                    if c == '"' {
-                        out.push('"');
-                    }
-                    out.push(c);
-                }
-                out.push('"');
-            } else {
-                out.push_str(&text);
-            }
-        } else {
-            for c in text.chars() {
-                match c {
-                    '\u{08}' => out.push_str("\\b"),
-                    '\u{0c}' => out.push_str("\\f"),
-                    '\n' => out.push_str("\\n"),
-                    '\r' => out.push_str("\\r"),
-                    '\t' => out.push_str("\\t"),
-                    '\u{0b}' => out.push_str("\\v"),
-                    '\\' => out.push_str("\\\\"),
-                    _ => out.push(c),
-                }
-            }
-        }
+        let force = force_quote.get(i).copied().unwrap_or(false);
+        copy_text::write_field(&mut out, Some(&text), csv, opts, force, single);
     }
     out.push('\n');
     bytes::Bytes::from(out.into_bytes())
@@ -43426,7 +43392,11 @@ impl CopyHandler for PgHandler {
             format => {
                 // COPY's text arrives in the client encoding, and PostgreSQL
                 // converts it as it does a query's (22021 / 22P05 by name).
-                let cenc = self.client_encoding();
+                let cenc = state
+                    .options
+                    .encoding
+                    .as_deref()
+                    .map_or_else(|| self.client_encoding(), encoding::client_encoding);
                 let text = if cenc.transcodes() {
                     encoding::decode(cenc, &state.buffer)
                         .map_err(|e| encoding::undecodable(cenc, e))?
@@ -43453,7 +43423,13 @@ impl CopyHandler for PgHandler {
                         )))
                     })?
                 };
-                let mut parsed = copy_parse_text(&text, format);
+                let mut parsed = copy_text::parse(
+                    &text,
+                    format == CopyFormat::Csv,
+                    &state.options,
+                    &state.force_not_null,
+                    &state.force_null,
+                );
                 if state.header && !parsed.is_empty() {
                     parsed.remove(0);
                 }
