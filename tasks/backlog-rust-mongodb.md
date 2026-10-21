@@ -897,6 +897,17 @@ Still different:
       other command was measured, so each still takes the generic chain. mongod's internal resources
       (`Metadata`, `oplog`, `Mutex`, `MultiDocumentTransactionsBarrier`) are
       locked by its background threads only and are absent here.
+      **The regression tests' reference moves under heavy load** (measured
+      2026-10-21, mongod 8.2.11): run with 12 test workers on this 12-core
+      Mac, mongod read `$out` as 9 global IS (8 idle) and `$merge creating
+      its target` as 4 (2 idle) in all five reference runs, in 4 of 6 full
+      verifier runs -- not background noise, which the least-of-five
+      removes. At 4 workers (CI's `-n auto`) all 264 RM regression tests
+      passed twice. Time-based yielding is involved but does not account for
+      it: with `internalQueryExecYieldPeriodMS` effectively infinite an idle
+      mongod reads `$out` as 7, so the 8 it reads by default already
+      includes a yield. Cause not pinned; judge these tests at 4 workers or
+      fewer.
       Backlog-ID: RM-185
       Verify: tests/backlog/test_rm_185_locks.py::test_lock_counts_of_merge_fail_with_duplicates
 - **Scope decision — `replSetReconfig` takes one member, this server**

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import contextlib
 import itertools
-import time
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -28,25 +27,6 @@ def _flat(client: Any) -> dict:
     }
 
 
-def _settled(client: Any) -> dict:
-    """The counts once nothing is still moving them. mongod finishes some
-    work after the reply (the setup's own writes, the previous case's
-    asynchronous tail), and on a loaded machine that tail lands inside the
-    next case's window: in a 12-worker run on 2026-10-21 it added two global
-    IS to `$merge creating its target` and one to `$out replacing its
-    target` in all five reference runs. `serverStatus` itself takes no lock
-    these counts include (measured on 8.2.11), so polling it is clean."""
-    deadline = time.monotonic() + 10
-    last = _flat(client)
-    while time.monotonic() < deadline:
-        time.sleep(0.2)
-        now = _flat(client)
-        if now == last:
-            return now
-        last = now
-    return last
-
-
 def _quiet(fn: Callable[[], Any]) -> None:
     # An error answer is part of what is measured.
     with contextlib.suppress(Exception):
@@ -56,7 +36,7 @@ def _quiet(fn: Callable[[], Any]) -> None:
 def _deltas(client: Any, cases: list) -> list:
     out = []
     for label, fn in cases:
-        before = _settled(client)
+        before = _flat(client)
         _quiet(fn)
         after = _flat(client)
         keys = set(before) | set(after)
@@ -97,7 +77,13 @@ def _same_counts(got: list, want: list) -> None:
             assert theirs.get(_BUILD_POLLS, 0) >= ours.get(_BUILD_POLLS, 0), label
             ours.pop(_BUILD_POLLS, None)
             theirs.pop(_BUILD_POLLS, None)
-        assert (label, ours) == (label, theirs)
+        assert (label, ours) == (label, theirs), (
+            f"mongod's five runs of {label!r}: {_RUNS.get(label)}"
+        )
+
+
+#: Each case's five reference runs, by label, from the last `_reference`.
+_RUNS: dict[str, list] = {}
 
 
 def _reference(measure: Callable[[Any], list], client: Any) -> list:
@@ -112,6 +98,9 @@ def _reference(measure: Callable[[Any], list], client: Any) -> list:
     for cases in zip(*runs, strict=True):
         label = cases[0][0]
         counts = [dict(c[1]) for c in cases]
+        # Kept for the failure message: an extra lock in all five runs is
+        # not background noise, and the runs say where it sits.
+        _RUNS[label] = counts
         keys = set().union(*counts)
         least = {k: min(c.get(k, 0) for c in counts) for k in keys}
         out.append((label, sorted((k, n) for k, n in least.items() if n)))

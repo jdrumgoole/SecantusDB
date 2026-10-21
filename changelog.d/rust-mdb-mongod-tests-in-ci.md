@@ -50,9 +50,6 @@ with gap tests.
 - The server ran `collmod`, a lowercase alias mongod 8.2 does not have (59
   CommandNotFound). Pinned by
   `tests/mongod_live/test_operator_tail.py::test_command_matches_mongod[collmod]`.
-- RM-185's lock-count regression tests failed under parallel load: mongod's
-  asynchronous tail work from the previous case landed in the next case's
-  window. Each case now waits for the counts to settle before it starts.
 - `tests/test_ci_runs_rust_server_tests.py` now also catches files gated on
   `_secantus_core` or the binary (`SECANTUSDB_BIN`), and records why each
   retired parity suite does not run.
@@ -69,3 +66,9 @@ Filed with gap tests in `tests/backlog/test_rm_found_2026_10_21.py`:
   ignores `onError`.
 - RM-229: a change stream's post-image is the document as it is when the
   event is read, not as the update left it.
+
+Measured while wiring the lane: RM-185's lock-count regression tests pass at
+CI's parallelism (all 264 RM regression tests, twice, at 4 workers) but
+drift at 12 workers on a 12-core Mac, where mongod's own counts rise in all
+five reference runs. The cause is not pinned; RM-185 records what was ruled
+out. A failure now prints mongod's five runs for the case.
