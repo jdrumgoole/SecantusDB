@@ -8073,6 +8073,33 @@ pub fn set_views(views: Vec<(String, String)>) {
     PLAN_VIEWS.with(|v| *v.borrow_mut() = views);
 }
 
+thread_local! {
+    /// Each view's relation oid, for the RowDescription of the columns read
+    /// through it (`ftable` / `ftablecol` name the VIEW, as PostgreSQL's do).
+    static PLAN_VIEW_OIDS: std::cell::RefCell<std::collections::HashMap<String, i64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// The FROM aliases `expand_views` gave a view's subquery, with the view.
+    static EXPANDED_VIEWS: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install the views' relation oids beside `set_views`.
+pub fn set_view_oids(oids: Vec<(String, i64)>) {
+    PLAN_VIEW_OIDS.with(|v| *v.borrow_mut() = oids.into_iter().collect());
+}
+
+/// The view a FROM subquery under `alias` was expanded from, and its oid.
+fn expanded_view_oid(alias: &str) -> Option<i64> {
+    let view = EXPANDED_VIEWS.with(|e| {
+        e.borrow()
+            .iter()
+            .rev()
+            .find(|(a, _)| a == alias)
+            .map(|(_, v)| v.clone())
+    })?;
+    PLAN_VIEW_OIDS.with(|v| v.borrow().get(&view).copied())
+}
+
 pub(crate) fn view_definition(name: &str) -> Option<String> {
     PLAN_VIEWS.with(|v| {
         v.borrow()
@@ -8151,6 +8178,13 @@ fn expand_views_in_from(item: &mut pg_query::protobuf::Node, depth: usize) -> Re
                     aliasname: r.relname.clone(),
                     colnames: Vec::new(),
                 });
+            EXPANDED_VIEWS.with(|e| {
+                let mut e = e.borrow_mut();
+                if e.len() >= 64 {
+                    e.clear();
+                }
+                e.push((alias.aliasname.clone(), r.relname.clone()));
+            });
             item.node = Some(N::RangeSubselect(Box::new(
                 pg_query::protobuf::RangeSubselect {
                     lateral: false,
@@ -20447,6 +20481,14 @@ fn plan_from_subquery(
     for (c, name) in def.columns.iter_mut().zip(&colnames) {
         c.name = name.clone();
     }
+    // A view's columns are the VIEW's in a RowDescription, each at its
+    // position there, computed ones included (RP-087). A plain subquery's
+    // keep the base column they pass through (`select_output_def`).
+    if let Some(oid) = expanded_view_oid(&alias) {
+        for (i, c) in def.columns.iter_mut().enumerate() {
+            c.source = i16::try_from(i + 1).ok().map(|n| (oid, n));
+        }
+    }
     distinct_fields(&mut def);
     def.name = alias.clone();
     Ok(SubSource {
@@ -21485,6 +21527,7 @@ pub fn select_output_def(
             None => {
                 if let Some(c) = src {
                     col.typmod = c.typmod;
+                    col.source = c.source;
                 }
             }
             Some(e) => col.typmod = column_expr_typmod(e),

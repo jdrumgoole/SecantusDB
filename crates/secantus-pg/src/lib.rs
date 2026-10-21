@@ -32,6 +32,7 @@
 
 mod advisory;
 mod aggregates;
+mod binary_recv;
 mod casts;
 mod catalog_fill;
 mod catalog_meta;
@@ -4498,6 +4499,12 @@ impl PgHandler {
         );
         let mut views = self.views().unwrap_or_default();
         views.extend(partitions);
+        secantus_pgplan::set_view_oids(
+            views
+                .iter()
+                .filter_map(|(n, _)| Some((n.clone(), self.relation_oid(n)?)))
+                .collect(),
+        );
         secantus_pgplan::set_views(views);
         secantus_pgplan::view_dml::set_checked_views(checked);
         secantus_pgplan::view_dml::set_view_defaults(self.view_column_defaults());
@@ -5141,6 +5148,68 @@ impl PgHandler {
                     })
             })
             .collect()
+    }
+
+    /// What PostgreSQL's Bind settles before it answers BindComplete
+    /// (RP-078): a prepared statement whose result columns have changed since
+    /// it was planned is 0A000, the result format codes must name one or every
+    /// column, and every parameter is decoded -- so a malformed value is the
+    /// Bind's error, with or without an Execute behind it.
+    fn check_bound_portal(
+        &self,
+        portal: &Portal<ParsedStatement>,
+        result_formats: usize,
+    ) -> PgWireResult<()> {
+        self.install_user_types();
+        self.check_cached_result_type(portal.statement.as_ref())?;
+        let declared = self.param_type_names(portal.statement.as_ref());
+        if result_formats > 1 {
+            if let Ok(fields) =
+                self.describe_fields(&portal.statement.statement.sql, declared.len(), &declared)
+            {
+                let columns = fields.map_or(0, |f| f.len());
+                if columns != result_formats {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "08P01".into(), // protocol_violation
+                        format!(
+                            "bind message has {result_formats} result formats but query has {columns} columns"
+                        ),
+                    ))));
+                }
+            }
+        }
+        let mut param_types =
+            secantus_pgplan::infer_param_types(&portal.statement.statement.sql, &declared);
+        self.type_untyped_binary_params(portal, &mut param_types);
+        // A binary value is held to its type's receive function first: the
+        // decoder below reads more forgivingly than PostgreSQL does.
+        let utf8 = matches!(self.client_encoding(), encoding::ClientEncoding::Utf8);
+        for (i, raw) in portal.parameters.iter().enumerate() {
+            let binary = match &portal.parameter_format {
+                Format::UnifiedText => false,
+                Format::UnifiedBinary => true,
+                Format::Individual(codes) => codes.get(i).copied().unwrap_or(0) == 1,
+            };
+            let Some(bytes) = raw.as_ref().filter(|_| binary) else {
+                continue;
+            };
+            let ty = portal
+                .statement
+                .parameter_types
+                .get(i)
+                .cloned()
+                .flatten()
+                .or_else(|| {
+                    let name = param_types.get(i).and_then(|n| n.as_deref())?;
+                    Some(self.user_wire_type(name).unwrap_or_else(|| wire_type(name)))
+                });
+            if let Some(ty) = ty {
+                binary_recv::check(&ty, bytes, i, utf8)?;
+            }
+        }
+        self.portal_params(portal, &param_types)?;
+        Ok(())
     }
 
     /// Parse analysis for an extended-protocol Parse: the raw parse of every
@@ -20659,6 +20728,8 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             1033 => "aclitem",
             603 => "box",
             24 => "regproc",
+            2205 => "regclass",
+            2206 => "regtype",
             2202 => "regprocedure",
             2203 => "regoper",
             2204 => "regoperator",
@@ -41479,6 +41550,17 @@ fn decode_parameter(
                 .ok_or_else(|| {
                     PgHandler::user_error("22P03", "invalid external pg_snapshot data".into())
                 }),
+            // A reg* value is its 4-byte oid (`regclassrecv` is `oidrecv`),
+            // read as the cast from that oid reads it: the name when one
+            // exists, the number otherwise (RP-083).
+            Some(
+                oid @ (24 | 2202 | 2203 | 2204 | 2205 | 2206 | 3734 | 3769 | 4089 | 4096 | 4191),
+            ) if bytes.len() == 4 => {
+                let n = i64::from(u32::from_be_bytes(bytes[..4].try_into().expect("checked")));
+                let target = secantus_pgplan::pgtypes::name_of_oid(i64::from(oid)).unwrap_or("oid");
+                secantus_pgplan::cast_value_with_tz(Bson::Int64(n), target, tz)
+                    .map_err(|e| PgHandler::err(&e))
+            }
             // An oid is a 4-byte UNSIGNED integer; through i64 so the value
             // survives the top bit.
             Some(26) if bytes.len() == 4 => Ok(Bson::Int64(i64::from(u32::from_be_bytes(
@@ -42928,6 +43010,34 @@ impl ExtendedQueryHandler for PgHandler {
             self.note_failure();
             return Err(PgWireError::StatementNotFound(statement_name.to_owned()));
         };
+        // The message's shape against the statement, first, as
+        // `exec_bind_message` checks it (RP-078).
+        let protocol = |message: String| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "08P01".into(), // protocol_violation
+                message,
+            )))
+        };
+        let supplied = message.parameters.len();
+        let formats = message.parameter_format_codes.len();
+        if formats > 1 && formats != supplied {
+            self.note_failure();
+            return Err(protocol(format!(
+                "bind message has {formats} parameter formats but {supplied} parameters"
+            )));
+        }
+        let required = statement
+            .parameter_types
+            .len()
+            .max(secantus_pgplan::max_param_number(&statement.statement.sql));
+        if supplied != required {
+            self.note_failure();
+            return Err(protocol(format!(
+                "bind message supplies {supplied} parameters, but prepared statement \"{}\" requires {required}",
+                message.statement_name.as_deref().unwrap_or("")
+            )));
+        }
         // As `exec_bind_message`: an aborted block binds only the statements
         // that end it (RP-079).
         if self.txn_failed.load(std::sync::atomic::Ordering::Relaxed)
@@ -42954,6 +43064,8 @@ impl ExtendedQueryHandler for PgHandler {
             }
         }
         let portal = Portal::try_new(&message, statement).inspect_err(|_| self.note_failure())?;
+        self.check_bound_portal(&portal, message.result_column_format_codes.len())
+            .inspect_err(|_| self.note_failure())?;
         self.note_wire_portal(
             &portal.name,
             &portal.statement.statement.sql,
