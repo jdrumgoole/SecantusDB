@@ -1,0 +1,20 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["select * from ts_stat('select v from tst_t') order by 1", "", "ok", [[["str", "a"], ["num", "2"], ["num", "3"]], [["str", "b"], ["num", "1"], ["num", "1"]], [["str", "c"], ["num", "1"], ["num", "1"]], [["str", "d"], ["num", "1"], ["num", "1"]]], [25, 23, 23]],
+["select * from ts_stat('select v from tst_t', 'ab') order by 1", "", "ok", [[["str", "a"], ["num", "1"], ["num", "2"]]], [25, 23, 23]],
+["select * from ts_stat('select v from tst_t', 'd') order by 1", "", "ok", [[["str", "a"], ["num", "1"], ["num", "1"]], [["str", "b"], ["num", "1"], ["num", "1"]]], [25, 23, 23]],
+["select * from ts_stat('select v from tst_t', 'x') order by 1", "", "ok", [[["str", "a"], ["num", "2"], ["num", "3"]], [["str", "b"], ["num", "1"], ["num", "1"]], [["str", "c"], ["num", "1"], ["num", "1"]], [["str", "d"], ["num", "1"], ["num", "1"]]], [25, 23, 23]],
+["select * from ts_stat('select v from tst_t', 'AbCd') order by 1", "", "ok", [[["str", "a"], ["num", "2"], ["num", "3"]], [["str", "b"], ["num", "1"], ["num", "1"]]], [25, 23, 23]],
+["select * from ts_stat('select t from tst_t')", "", "err", "22023: ts_stat query must return one tsvector column", []],
+["select * from ts_stat('select v, v from tst_t')", "", "err", "22023: ts_stat query must return one tsvector column", []],
+["select * from ts_stat('select v from tst_t where false')", "", "ok", [], [25, 23, 23]],
+["select word, nentry from ts_stat('select to_tsvector(''english'', ''The cats sat on the cats mat'')') order by 2 desc, 1", "", "ok", [[["str", "cat"], ["num", "2"]], [["str", "mat"], ["num", "1"]], [["str", "sat"], ["num", "1"]]], [25, 23]],
+["select (ts_stat('select v from tst_t')).word order by 1", "", "ok", [[["str", "a"]], [["str", "b"]], [["str", "c"]], [["str", "d"]]], [25]],
+["select * from ts_stat(null)", "", "ok", [], [25, 23, 23]],
+["select count(*) from ts_stat('select v from tst_t', null)", "", "ok", [[["num", "0"]]], [20]],
+["select pg_typeof(ndoc)::text, pg_typeof(word)::text from ts_stat('select v from tst_t') limit 1", "", "ok", [[["str", "integer"], ["str", "text"]]], [25, 25]],
+["select * from rows from (ts_stat('select v from tst_t')) order by 1", "", "ok", [[["str", "a"], ["num", "2"], ["num", "3"]], [["str", "b"], ["num", "1"], ["num", "1"]], [["str", "c"], ["num", "1"], ["num", "1"]], [["str", "d"], ["num", "1"], ["num", "1"]]], [25, 23, 23]],
+["select * from rows from (ts_parse('default', 'a b'))", "", "ok", [[["num", "1"], ["str", "a"]], [["num", "12"], ["str", " "]], [["num", "1"], ["str", "b"]]], [23, 25]],
+["select * from (select 1) s, lateral ts_stat('select v from tst_t') order by 2", "", "ok", [[["num", "1"], ["str", "a"], ["num", "2"], ["num", "3"]], [["num", "1"], ["str", "b"], ["num", "1"], ["num", "1"]], [["num", "1"], ["str", "c"], ["num", "1"], ["num", "1"]], [["num", "1"], ["str", "d"], ["num", "1"], ["num", "1"]]], [23, 25, 23, 23]]
+]}

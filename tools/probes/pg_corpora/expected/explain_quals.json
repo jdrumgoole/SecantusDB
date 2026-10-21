@@ -1,0 +1,18 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["create table ex_a (id int primary key, v int, t text)", "", "ok", [], []],
+["create table ex_b (id int, a_id int)", "", "ok", [], []],
+["explain (costs off) select * from ex_a where v > 5", "", "ok", [[["str", "Seq Scan on ex_a"]], [["str", "  Filter: (v > 5)"]]], [25]],
+["explain (costs off) select * from ex_a where id = 1", "", "ok", [[["str", "Index Scan using ex_a_pkey on ex_a"]], [["str", "  Index Cond: (id = 1)"]]], [25]],
+["explain (costs off) select count(*) from ex_a group by v", "", "ok", [[["str", "HashAggregate"]], [["str", "  Group Key: v"]], [["str", "  ->  Seq Scan on ex_a"]]], [25]],
+["explain (costs off) select * from ex_a order by t limit 3", "", "ok", [[["str", "Limit"]], [["str", "  ->  Sort"]], [["str", "        Sort Key: t"]], [["str", "        ->  Seq Scan on ex_a"]]], [25]],
+["explain (costs off) select * from ex_a where t like 'x%' and v < 3", "", "ok", [[["str", "Seq Scan on ex_a"]], [["str", "  Filter: ((t ~~ 'x%'::text) AND (v < 3))"]]], [25]],
+["explain (costs off, format json) select * from ex_a where v > 5", "", "ok", [[["list", [["dict", "{'Plan': {'Node Type': 'Seq Scan', 'Parallel Aware': False, 'Async Capable': False, 'Relation Name': 'ex_a', 'Alias': 'ex_a', 'Filter': '(v > 5)'}}"]]]]], [114]],
+["explain (costs off) update ex_a set v = 1 where v = 2", "", "ok", [[["str", "Update on ex_a"]], [["str", "  ->  Seq Scan on ex_a"]], [["str", "        Filter: (v = 2)"]]], [25]],
+["explain (costs off) delete from ex_a where id = 3", "", "ok", [[["str", "Delete on ex_a"]], [["str", "  ->  Index Scan using ex_a_pkey on ex_a"]], [["str", "        Index Cond: (id = 3)"]]], [25]],
+["create table ex_c (id int, v int)", "", "ok", [], []],
+["create table ex_d (id int, w int)", "", "ok", [], []],
+["explain (costs off) select * from ex_c c join ex_d d on c.id = d.id where c.v > 1 and d.w < 2 and c.v < d.w", "", "ok", [[["str", "Hash Join"]], [["str", "  Hash Cond: (c.id = d.id)"]], [["str", "  Join Filter: (c.v < d.w)"]], [["str", "  ->  Seq Scan on ex_c c"]], [["str", "        Filter: (v > 1)"]], [["str", "  ->  Hash"]], [["str", "        ->  Seq Scan on ex_d d"]], [["str", "              Filter: (w < 2)"]]], [25]],
+["drop table ex_a, ex_b, ex_c, ex_d", "", "ok", [], []]
+]}

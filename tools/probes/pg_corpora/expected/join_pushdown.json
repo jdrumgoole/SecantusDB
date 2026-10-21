@@ -1,0 +1,18 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {"13": "reads the clock or the server process"},
+"checks": [
+["select a.id, b.id from jp14_a a join jp14_b b on b.a_id = a.id where a.v = 2 and b.id > 10 order by 1, 2;", "", "ok", [[["num", "2"], ["num", "27"]], [["num", "12"], ["num", "12"]], [["num", "17"], ["num", "17"]]], [23, 23]],
+["select a.id, b.id from jp14_a a left join jp14_b b on b.a_id = a.id where a.v = 3 order by 1, 2;", "", "ok", [[["num", "3"], ["num", "3"]], [["num", "3"], ["num", "28"]], [["num", "8"], ["num", "8"]], [["num", "13"], ["num", "13"]], [["num", "18"], ["num", "18"]]], [23, 23]],
+["select a.id, b.id from jp14_a a left join jp14_b b on b.a_id = a.id where b.id is null and a.id < 8 order by 1, 2;", "", "ok", [], [23, 23]],
+["select a.id, b.id from jp14_a a right join jp14_b b on b.a_id = a.id where a.id is null order by 1, 2;", "", "ok", [[["NoneType", "None"], ["num", "21"]], [["NoneType", "None"], ["num", "22"]], [["NoneType", "None"], ["num", "23"]], [["NoneType", "None"], ["num", "24"]], [["NoneType", "None"], ["num", "25"]]], [23, 23]],
+["select a.id, b.id from jp14_a a full join jp14_b b on b.a_id = a.id where a.v = 1 or b.id = 29 order by 1, 2;", "", "ok", [[["num", "1"], ["num", "1"]], [["num", "1"], ["num", "26"]], [["num", "4"], ["num", "29"]], [["num", "6"], ["num", "6"]], [["num", "11"], ["num", "11"]], [["num", "16"], ["num", "16"]]], [23, 23]],
+["select count(*) from jp14_a a, jp14_b b where a.id = b.a_id and a.v in (1, 2) and b.w like 'w1%';", "", "ok", [[["num", "5"]]], [20]],
+["select a.id from jp14_a a join jp14_b b on b.a_id = a.id where a.id = $$3$$::int order by 1;", "", "ok", [[["num", "3"]], [["num", "3"]]], [23]],
+["select x.id, y.id from jp14_a x join jp14_a y on x.v = y.v where x.id = 4 and y.id <> 4 order by 1, 2;", "", "ok", [[["num", "4"], ["num", "9"]], [["num", "4"], ["num", "14"]], [["num", "4"], ["num", "19"]]], [23, 23]],
+["select a.id from jp14_a a join jp14_b b on true where a.id = 1 and b.id = 1;", "", "ok", [[["num", "1"]]], [23]],
+["select a.id, b.id from jp14_a a join jp14_b b on b.a_id = a.id where lower(b.w) = 'w12' order by 1, 2;", "", "ok", [[["num", "12"], ["num", "12"]]], [23, 23]],
+["select a.id, b.id from jp14_a a join jp14_b b on b.a_id = a.id where abs(a.v - 3) = 1 and length(w) = 3 order by 1, 2;", "", "ok", [[["num", "2"], ["num", "27"]], [["num", "4"], ["num", "29"]], [["num", "12"], ["num", "12"]], [["num", "14"], ["num", "14"]], [["num", "17"], ["num", "17"]], [["num", "19"], ["num", "19"]]], [23, 23]],
+["select a.id, b.id from jp14_a a left join jp14_b b on b.a_id = a.id where upper(b.w) like 'W2%' order by 1, 2;", "", "ok", [[["num", "1"], ["num", "26"]], [["num", "2"], ["num", "2"]], [["num", "2"], ["num", "27"]], [["num", "3"], ["num", "28"]], [["num", "4"], ["num", "29"]], [["num", "20"], ["num", "20"]]], [23, 23]],
+["select a.id, b.id from jp14_a a left join jp14_b b on b.a_id = a.id where coalesce(b.w, 'none') = 'none' order by 1, 2;", "", "ok", [], [23, 23]],
+["select count(*) from jp14_a a join jp14_b b on b.a_id = a.id where a.v < random() + 10;", "", "ok", [[["num", "25"]]], [20]]
+]}

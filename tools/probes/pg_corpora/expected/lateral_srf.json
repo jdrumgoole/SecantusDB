@@ -1,0 +1,13 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT t.id, x FROM sc21 t, LATERAL unnest(t.arr) AS x ORDER BY t.id, x", "", "ok", [[["num", "1"], ["num", "1"]], [["num", "1"], ["num", "2"]], [["num", "1"], ["num", "3"]]], [23, 23]],
+["SELECT t.id, x FROM sc21 t CROSS JOIN LATERAL unnest(t.arr) AS x ORDER BY t.id, x", "", "ok", [[["num", "1"], ["num", "1"]], [["num", "1"], ["num", "2"]], [["num", "1"], ["num", "3"]]], [23, 23]],
+["SELECT t.id, x FROM sc21 t LEFT JOIN LATERAL unnest(t.arr) AS x ON true ORDER BY t.id, x", "", "ok", [[["num", "1"], ["num", "1"]], [["num", "1"], ["num", "2"]], [["num", "1"], ["num", "3"]], [["num", "2"], ["NoneType", "None"]]], [23, 23]],
+["SELECT t.id, g FROM sc21 t, LATERAL generate_series(1, t.id) AS g ORDER BY t.id, g", "", "ok", [[["num", "1"], ["num", "1"]], [["num", "2"], ["num", "1"]], [["num", "2"], ["num", "2"]]], [23, 23]],
+["SELECT t.id, e FROM sc21 t, LATERAL jsonb_array_elements(t.j->'a'->'b') AS e ORDER BY t.id", "", "ok", [[["num", "1"], ["num", "1"]], [["num", "1"], ["num", "2"]], [["num", "1"], ["num", "3"]]], [23, 3802]],
+["SELECT t.id, y.v FROM sc21 t, LATERAL (SELECT t.id * 2 AS v) y ORDER BY t.id", "", "ok", [[["num", "1"], ["num", "2"]], [["num", "2"], ["num", "4"]]], [23, 23]],
+["SELECT t.id, p FROM sc21 t, LATERAL regexp_split_to_table(t.s, ',') AS p ORDER BY t.id, p", "", "ok", [[["num", "1"], ["str", "x"]], [["num", "1"], ["str", "y"]], [["num", "2"], ["str", "z"]]], [23, 25]],
+["SELECT count(*) FROM sc21 t, LATERAL unnest(t.arr) AS x", "", "ok", [[["num", "3"]]], [20]],
+["SELECT t.id FROM sc21 t, LATERAL unnest(t.arr) AS x WHERE x > 1 ORDER BY t.id", "", "ok", [[["num", "1"]], [["num", "1"]]], [23]]
+]}

@@ -1,0 +1,14 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["select '(abcd,x)'::ovf_t", "", "err", "22001: value too long for type character(3)", []],
+["select '(abcd,x)'::ovf_t::text", "", "err", "22001: value too long for type character(3)", []],
+["select 1, '(abc)'::ovf_ct", "", "err", "22001: value too long for type character(2)", []],
+["insert into ovf_t values ('abcd', 'x')", "", "err", "22001: value too long for type character(3)", []],
+["select 'abcd'::char(3)", "", "ok", [[["str", "abc"]]], [1042]],
+["select row('abcd', 'x')::ovf_t", "", "ok", [[["str", "(abc,x)"]]], [18464]],
+["update ovf_t set c = 'abcde'", "", "err", "22001: value too long for type character(3)", []],
+["select row('ab  cd', 'x')::ovf_t::text", "", "ok", [[["str", "(\"ab \",x)"]]], [25]],
+["select row(null, 'x')::ovf_t::text", "", "ok", [[["str", "(,x)"]]], [25]],
+["select row('a', 'x')::ovf_t::text", "", "ok", [[["str", "(\"a  \",x)"]]], [25]]
+]}

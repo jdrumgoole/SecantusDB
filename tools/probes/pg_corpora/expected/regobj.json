@@ -1,0 +1,16 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT 'public'::regnamespace, 'public'::regnamespace::oid, 'pg_catalog'::regnamespace::oid", "", "ok", [[["str", "public"], ["num", "2200"], ["num", "11"]]], [4089, 26, 26]],
+["SELECT 'ro_s'::regnamespace::text", "", "ok", [[["str", "ro_s"]]], [25]],
+["SELECT 'nosuch'::regnamespace", "", "err", "3F000: schema \"nosuch\" does not exist", []],
+["SELECT nspname FROM pg_namespace WHERE nspname IN ('public', 'ro_s', 'pg_catalog') ORDER BY 1", "", "ok", [[["str", "pg_catalog"]], [["str", "public"]], [["str", "ro_s"]]], [19]],
+["SELECT relname FROM pg_class WHERE relnamespace = 'public'::regnamespace AND relname = 'ro_t'", "", "ok", [[["str", "ro_t"]]], [19]],
+["SELECT 'nosuch_role'::regrole", "", "err", "42704: role \"nosuch_role\" does not exist", []],
+["SELECT 'ro_f'::regproc::text, 'ro_f(integer, text)'::regprocedure::text, 'ro_f(int4, text)'::regprocedure::text", "", "ok", [[["str", "ro_f"], ["str", "ro_f(integer,text)"], ["str", "ro_f(integer,text)"]]], [25, 25, 25]],
+["SELECT 'nosuch_fn'::regproc", "", "err", "42883: function \"nosuch_fn\" does not exist", []],
+["SELECT proname FROM pg_proc WHERE oid = 'ro_f'::regproc", "", "ok", [[["str", "ro_f"]]], [19]],
+["SELECT proname, pronamespace::regnamespace FROM pg_proc WHERE proname = 'ro_f'", "", "ok", [[["str", "ro_f"], ["str", "public"]]], [19, 4089]],
+["SELECT pg_typeof('public'::regnamespace), pg_typeof('ro_f'::regproc)", "", "ok", [[["str", "regnamespace"], ["str", "regproc"]]], [2206, 2206]],
+["SELECT 0::regnamespace, 12345::regproc", "", "ok", [[["str", "-"], ["str", "12345"]]], [4089, 24]]
+]}

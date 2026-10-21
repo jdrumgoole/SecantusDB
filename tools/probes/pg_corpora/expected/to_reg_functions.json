@@ -1,0 +1,14 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {"2": "reads the clock or the server process"},
+"checks": [
+["SELECT to_regnamespace('public')::oid, to_regnamespace('nope'), to_regrole(current_user::text) IS NOT NULL, to_regrole('nope')", "", "ok", [[["num", "2200"], ["NoneType", "None"], ["bool", true], ["NoneType", "None"]]], [26, 4089, 16, 4096]],
+["SELECT to_regcollation('\"sv-x-icu\"')::oid, to_regcollation('nope'), to_regcollation('C'), to_regcollation('\"C\"')::oid", "", "ok", [[["num", "13496"], ["NoneType", "None"], ["NoneType", "None"], ["num", "950"]]], [26, 4191, 4191, 26]],
+["SELECT to_regproc('abs'), to_regproc('now')::text, to_regproc('nope'), to_regprocedure('nope(int4)')", "", "ok", [[["NoneType", "None"], ["str", "now"], ["NoneType", "None"], ["NoneType", "None"]]], [24, 25, 24, 2202]],
+["SELECT pg_typeof(to_regnamespace('public')), pg_typeof(to_regrole('x')), pg_typeof(to_regcollation('x')), pg_typeof(to_regproc('x')), pg_typeof(to_regprocedure('x()'))", "", "ok", [[["str", "regnamespace"], ["str", "regrole"], ["str", "regcollation"], ["str", "regproc"], ["str", "regprocedure"]]], [2206, 2206, 2206, 2206, 2206]],
+["SELECT n.nspname FROM pg_namespace n WHERE n.oid = to_regnamespace('pg_catalog')", "", "ok", [[["str", "pg_catalog"]]], [19]],
+["SELECT to_regproc(NULL), to_regnamespace(NULL)", "", "ok", [[["NoneType", "None"], ["NoneType", "None"]]], [24, 4089]],
+["SELECT to_regnamespace('a.b')", "", "err", "42602: invalid name syntax", []],
+["SELECT to_regrole('a.b')", "", "err", "42602: invalid name syntax", []],
+["SELECT to_regnamespace('\"a.b\"')", "", "ok", [[["NoneType", "None"]]], [4089]],
+["SELECT 'a.b.c.d'::regnamespace::text", "", "err", "42602: invalid name syntax", []]
+]}

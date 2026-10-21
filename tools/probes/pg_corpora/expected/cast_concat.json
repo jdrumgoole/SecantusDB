@@ -1,0 +1,19 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["SET timezone = 'UTC'", "", "ok", [], []],
+["SELECT 'a' || n, n || 'b', 'a' || m, 'a' || f, 'a' || i, 'a' || d, 'a' || b FROM xcc_t", "", "ok", [[["str", "a1.50"], ["str", "1.50b"], ["str", "a2.25"], ["str", "a1e+20"], ["str", "a3"], ["str", "a2020-01-01"], ["str", "atrue"]]], [25, 25, 25, 25, 25, 25, 25]],
+["SELECT 'a' || t, 'a' || iv, 'a' || u, 'y' || 0.1::float4, t || '!', 'z' || tz, 'r' || r FROM xcc_t", "", "ok", [[["str", "a2020-01-01 10:00:00.5"], ["str", "a1 day 02:00:00"], ["str", "aa0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"], ["str", "y0.1"], ["str", "2020-01-01 10:00:00.5!"], ["str", "z2020-01-01 10:00:00.5+00"], ["str", "r2.25"]]], [25, 25, 25, 25, 25, 25, 25]],
+["SELECT 'x' || 1.50::numeric(5,2), '{3}' || array[1,2], array[1] || '{4}'", "", "ok", [[["str", "x1.50"], ["list", [["num", "3"], ["num", "1"], ["num", "2"]]], ["list", [["num", "1"], ["num", "4"]]]]], [25, 1007, 1007]],
+["SELECT r::numeric(5,1), m::numeric(5,1), i::numeric(5,1), s::varchar(3), s::char(2) FROM xcc_t", "", "ok", [[["num", "2.3"], ["num", "2.3"], ["num", "3"], ["str", "abc"], ["str", "ab"]]], [1700, 1700, 1700, 1043, 1042]],
+["SELECT t::timestamp(0), t::timestamp(3)::text, tz::timestamptz(0), tz::timestamp(0), t::timestamptz(0) FROM xcc_t", "", "ok", [[["ts", "2020-01-01T10:00:01"], ["str", "2020-01-01 10:00:00.5"], ["ts", "2020-01-01T10:00:01+00:00"], ["ts", "2020-01-01T10:00:01"], ["ts", "2020-01-01T10:00:01+00:00"]]], [1114, 25, 1184, 1114, 1184]],
+["SELECT '2020-01-01 10:00:00.555555'::timestamp(3), '1990-01-01 00:00:00.5'::timestamp(0), '1999-12-31 23:59:59.95+00'::timestamptz(1)", "", "ok", [[["ts", "2020-01-01T10:00:00.556000"], ["ts", "1990-01-01T00:00:00"], ["ts", "1999-12-31T23:59:59.900000+00:00"]]], [1114, 1114, 1184]],
+["SELECT a, a FROM xcc_o ORDER BY a", "", "ok", [[["num", "1"], ["num", "1"]], [["num", "2"], ["num", "2"]]], [23, 23]],
+["SELECT a, b AS a FROM xcc_o ORDER BY a", "", "err", "42702: ORDER BY \"a\" is ambiguous", []],
+["SELECT a::int8, a::text FROM xcc_o ORDER BY a", "", "err", "42702: ORDER BY \"a\" is ambiguous", []],
+["SELECT a AS x, a AS x FROM xcc_o ORDER BY x", "", "ok", [[["num", "1"], ["num", "1"]], [["num", "2"], ["num", "2"]]], [23, 23]],
+["SELECT xcc_o.a, a FROM xcc_o ORDER BY a", "", "ok", [[["num", "1"], ["num", "1"]], [["num", "2"], ["num", "2"]]], [23, 23]],
+["SELECT a AS b, b FROM xcc_o ORDER BY b", "", "err", "42702: ORDER BY \"b\" is ambiguous", []],
+["DROP TABLE xcc_t", "", "ok", [], []],
+["DROP TABLE xcc_o", "", "ok", [], []]
+]}

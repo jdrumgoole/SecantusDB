@@ -1,0 +1,18 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["select id from ni15 where n = 5 order by 1;", "", "ok", [[["num", "5"]]], [23]],
+["select id from ni15 where n = 1.5 order by 1;", "", "ok", [], [23]],
+["select id from ni15 where n = 1.2345678901234567890123456789012345 order by 1;", "", "ok", [], [23]],
+["select id from ni15 where n > 39 order by 1;", "", "ok", [[["num", "40"]]], [23]],
+["select id from ni15 where n >= 1e30 order by 1;", "", "ok", [], [23]],
+["select id from ni15 where n < -2 order by 1;", "", "ok", [], [23]],
+["select id from ni15 where n between 1 and 2 order by 1;", "", "ok", [[["num", "1"]], [["num", "2"]]], [23]],
+["select id from ni15 where n between 4 and 6 order by 1;", "", "ok", [[["num", "4"]], [["num", "5"]], [["num", "6"]]], [23]],
+["select id from ni15 where n = 'NaN' order by 1;", "", "ok", [], [23]],
+["select id from ni15 where n > 'Infinity' order by 1;", "", "ok", [], [23]],
+["select id from ni15 where n <> 5 and id > 40 order by 1;", "", "ok", [], [23]],
+["select count(*) from ni15 where n in (1, 2, 5, 1.5);", "", "ok", [[["num", "3"]]], [20]],
+["select count(*) from ni15 where n is null;", "", "ok", [[["num", "0"]]], [20]],
+["select id from ni15 where n < 1.2345678901234567890123456789012346 and n > 1.2 order by 1;", "", "ok", [], [23]]
+]}

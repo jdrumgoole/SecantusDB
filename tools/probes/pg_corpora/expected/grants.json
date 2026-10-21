@@ -1,0 +1,21 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["GRANT SELECT, INSERT ON gr_t TO gr_r", "", "ok", [], []],
+["GRANT ALL ON gr_t TO PUBLIC", "", "ok", [], []],
+["GRANT ALL PRIVILEGES ON TABLE gr_t TO gr_r WITH GRANT OPTION", "", "ok", [], []],
+["GRANT SELECT ON gr_t TO nosuch", "", "err", "42704: role \"nosuch\" does not exist", []],
+["GRANT SELECT ON nosuchtab TO gr_r", "", "err", "42P01: relation \"nosuchtab\" does not exist", []],
+["GRANT USAGE ON gr_t TO gr_r", "", "err", "0LP01: invalid privilege type USAGE for table", []],
+["REVOKE INSERT ON gr_t FROM gr_r", "", "ok", [], []],
+["REVOKE ALL ON gr_t FROM PUBLIC", "", "ok", [], []],
+["GRANT USAGE ON SCHEMA public TO gr_r", "", "ok", [], []],
+["GRANT SELECT ON ALL TABLES IN SCHEMA public TO gr_r", "", "ok", [], []],
+["GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO gr_r", "", "ok", [], []],
+["ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO gr_r", "", "ok", [], []],
+["GRANT gr_r TO CURRENT_USER", "", "ok", [], []],
+["REVOKE gr_r FROM CURRENT_USER", "", "ok", [], []],
+["GRANT nosuch TO gr_r", "", "err", "42704: role \"nosuch\" does not exist", []],
+["GRANT SELECT ON gr_t TO CURRENT_USER", "", "ok", [], []],
+["SELECT count(*) FROM gr_t", "", "ok", [[["num", "0"]]], [20]]
+]}

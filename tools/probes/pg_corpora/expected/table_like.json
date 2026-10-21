@@ -1,0 +1,18 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["CREATE TABLE tl_a (LIKE tl_src)", "", "ok", [], []],
+["SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_name = 'tl_a' ORDER BY ordinal_position", "", "ok", [[["str", "id"], ["str", "integer"], ["str", "NO"], ["NoneType", "None"]], [["str", "name"], ["str", "text"], ["str", "NO"], ["NoneType", "None"]], [["str", "n"], ["str", "integer"], ["str", "YES"], ["NoneType", "None"]], [["str", "u"], ["str", "text"], ["str", "YES"], ["NoneType", "None"]], [["str", "g"], ["str", "integer"], ["str", "YES"], ["NoneType", "None"]]], [19, 1043, 1043, 1043]],
+["INSERT INTO tl_a (id, name, n) VALUES (1, 'a', -1)", "", "ok", [], []],
+["SELECT * FROM tl_a", "", "ok", [[["num", "1"], ["str", "a"], ["num", "-1"], ["NoneType", "None"], ["NoneType", "None"]]], [23, 25, 23, 25, 23]],
+["CREATE TABLE tl_b (LIKE tl_src INCLUDING ALL, extra int)", "", "ok", [], []],
+["SELECT column_name, is_nullable, column_default, is_generated FROM information_schema.columns WHERE table_name = 'tl_b' ORDER BY ordinal_position", "", "ok", [[["str", "id"], ["str", "NO"], ["NoneType", "None"], ["str", "NEVER"]], [["str", "name"], ["str", "NO"], ["str", "'x'::text"], ["str", "NEVER"]], [["str", "n"], ["str", "YES"], ["NoneType", "None"], ["str", "NEVER"]], [["str", "u"], ["str", "YES"], ["NoneType", "None"], ["str", "NEVER"]], [["str", "g"], ["str", "YES"], ["NoneType", "None"], ["str", "ALWAYS"]], [["str", "extra"], ["str", "YES"], ["NoneType", "None"], ["str", "NEVER"]]], [19, 1043, 1043, 1043]],
+["INSERT INTO tl_b (id, n) VALUES (1, -1)", "", "err", "23514: new row for relation \"tl_b\" violates check constraint \"tl_src_n_check\"", []],
+["INSERT INTO tl_b (id, n) VALUES (1, 2)", "", "ok", [], []],
+["INSERT INTO tl_b (id, n) VALUES (1, 3)", "", "err", "23505: duplicate key value violates unique constraint \"tl_b_pkey\"", []],
+["SELECT id, name, n, g FROM tl_b", "", "ok", [[["num", "1"], ["str", "x"], ["num", "2"], ["num", "4"]]], [23, 25, 23, 23]],
+["CREATE TABLE tl_c (LIKE tl_src INCLUDING DEFAULTS)", "", "ok", [], []],
+["INSERT INTO tl_c (id) VALUES (5)", "", "ok", [], []],
+["SELECT id, name FROM tl_c", "", "ok", [[["num", "5"], ["str", "x"]]], [23, 25]],
+["CREATE TABLE tl_d (LIKE nosuch)", "", "err", "42P01: relation \"nosuch\" does not exist", []]
+]}

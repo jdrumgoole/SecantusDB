@@ -1,0 +1,11 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["select pg_typeof(c)::text from dt_t order by id", "", "ok", [[["str", "dt_d"]], [["str", "dt_d"]]], [25]],
+["select pg_typeof(c), pg_typeof(n), pg_typeof(p) from dt_t order by id", "", "ok", [[["str", "dt_d"], ["str", "dt_nn"], ["str", "integer"]], [["str", "dt_d"], ["str", "dt_nn"], ["str", "integer"]]], [2206, 2206, 2206]],
+["select pg_typeof(t.c)::text from dt_t t order by id", "", "ok", [[["str", "dt_d"]], [["str", "dt_d"]]], [25]],
+["select pg_typeof(c + 1)::text, pg_typeof(n || 'a')::text from dt_t order by id", "", "ok", [[["str", "integer"], ["str", "text"]], [["str", "integer"], ["str", "text"]]], [25, 25]],
+["select id from dt_t where pg_typeof(c) = 'dt_d'::regtype order by id", "", "ok", [[["num", "1"]], [["num", "2"]]], [23]],
+["select pg_typeof(c)::oid = 'dt_d'::regtype::oid from dt_t limit 1", "", "ok", [[["bool", true]]], [16]],
+["select c, n from dt_t order by id", "", "ok", [[["num", "5"], ["str", "x"]], [["NoneType", "None"], ["str", "y"]]], [23, 25]]
+]}

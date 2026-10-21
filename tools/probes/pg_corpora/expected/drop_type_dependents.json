@@ -1,0 +1,12 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["drop type dtd_e", "", "err", "2BP01: cannot drop type dtd_e because other objects depend on it", []],
+["drop domain dtd_d2", "", "err", "2BP01: cannot drop type dtd_d2 because other objects depend on it", []],
+["drop domain dtd_d2 cascade", "", "ok", [], []],
+["select * from dtd_v", "", "ok", [[["num", "1"]]], [23]],
+["drop type dtd_e cascade", "", "ok", [], []],
+["select * from dtd_t", "", "ok", [[["num", "1"]]], [23]],
+["select * from dtd_u", "", "ok", [], [23]],
+["select '(5)'::dtd_c::text", "", "ok", [[["str", "(5)"]]], [25]]
+]}

@@ -1,0 +1,19 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT array_agg(v) FROM aa", "", "ok", [[["list", [["num", "5"], ["NoneType", "None"], ["num", "7"]]]]], [1007]],
+["SELECT array_agg(v) FROM aa WHERE false", "", "ok", [[["NoneType", "None"]]], [1007]],
+["SELECT array_agg(v) FROM aa WHERE id=2", "", "ok", [[["list", [["NoneType", "None"]]]]], [1007]],
+["SELECT array_agg(s) FROM aa", "", "ok", [[["list", [["str", "p"], ["NoneType", "None"], ["str", "q"]]]]], [1009]],
+["SELECT string_agg(s, ',') FROM aa", "", "ok", [[["str", "p,q"]]], [25]],
+["SELECT string_agg(s, ',') FROM aa WHERE false", "", "ok", [[["NoneType", "None"]]], [25]],
+["SELECT string_agg(s, ',') FROM aa WHERE id=2", "", "ok", [[["NoneType", "None"]]], [25]],
+["SELECT json_agg(v) FROM aa", "", "ok", [[["list", [["num", "5"], ["NoneType", "None"], ["num", "7"]]]]], [114]],
+["SELECT json_agg(v) FROM aa WHERE false", "", "ok", [[["NoneType", "None"]]], [114]],
+["SELECT jsonb_agg(v) FROM aa WHERE id=2", "", "ok", [[["list", [["NoneType", "None"]]]]], [3802]],
+["SELECT b.id, array_agg(a.v) FROM ab b LEFT JOIN aa a ON a.id=b.id AND a.id<3 GROUP BY b.id ORDER BY b.id", "", "ok", [[["num", "1"], ["list", [["num", "5"]]]], [["num", "2"], ["list", [["NoneType", "None"]]]], [["num", "3"], ["list", [["NoneType", "None"]]]]], [23, 1007]],
+["SELECT array_agg(v ORDER BY id DESC) FROM aa", "", "ok", [[["list", [["num", "7"], ["NoneType", "None"], ["num", "5"]]]]], [1007]],
+["SELECT array_agg(DISTINCT v) FROM aa", "", "ok", [[["list", [["num", "5"], ["num", "7"], ["NoneType", "None"]]]]], [1007]],
+["SELECT array_agg(v) FILTER (WHERE id>99) FROM aa", "", "ok", [[["NoneType", "None"]]], [1007]],
+["SELECT array_agg(v) FILTER (WHERE id<3) FROM aa", "", "ok", [[["list", [["num", "5"], ["NoneType", "None"]]]]], [1007]]
+]}

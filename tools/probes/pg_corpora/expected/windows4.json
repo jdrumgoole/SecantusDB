@@ -1,0 +1,10 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT id FROM w9 WHERE row_number() OVER (ORDER BY id) = 1", "", "err", "42P20: window functions are not allowed in WHERE", []],
+["SELECT id, row_number() OVER (ORDER BY id) FROM w9 WHERE g = 'a' UNION ALL SELECT id, row_number() OVER (ORDER BY id) FROM w9 WHERE g = 'b'", "", "ok", [[["num", "1"], ["num", "1"]], [["num", "2"], ["num", "2"]], [["num", "3"], ["num", "3"]], [["num", "4"], ["num", "1"]], [["num", "5"], ["num", "2"]], [["num", "6"], ["num", "3"]]], [23, 20]],
+["SELECT w9.id, row_number() OVER (ORDER BY w9.id) FROM w9 JOIN w9 AS x ON x.id = w9.id", "", "ok", [[["num", "1"], ["num", "1"]], [["num", "2"], ["num", "2"]], [["num", "3"], ["num", "3"]], [["num", "4"], ["num", "4"]], [["num", "5"], ["num", "5"]], [["num", "6"], ["num", "6"]]], [23, 20]],
+["SELECT n, row_number() OVER (ORDER BY n) FROM generate_series(1,3) AS t(n)", "", "ok", [[["num", "1"], ["num", "1"]], [["num", "2"], ["num", "2"]], [["num", "3"], ["num", "3"]]], [23, 20]],
+["SELECT id, row_number() OVER (PARTITION BY g ORDER BY v, id) FROM w9 ORDER BY id", "", "ok", [[["num", "1"], ["num", "1"]], [["num", "2"], ["num", "2"]], [["num", "3"], ["num", "3"]], [["num", "4"], ["num", "1"]], [["num", "5"], ["num", "3"]], [["num", "6"], ["num", "2"]]], [23, 20]],
+["SELECT id, sum(v) OVER (ORDER BY v, id RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM w9 ORDER BY id", "", "err", "42P20: RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column", []]
+]}

@@ -1,0 +1,16 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["select (aclexplode('{postgres=ar/postgres}'::aclitem[])).privilege_type order by 1", "", "ok", [[["str", "INSERT"]], [["str", "SELECT"]]], [25]],
+["select (aclexplode(acl)).privilege_type, (aclexplode(acl)).is_grantable from r15_t order by 1", "", "ok", [[["str", "DELETE"], ["bool", false]], [["str", "INSERT"], ["bool", false]], [["str", "REFERENCES"], ["bool", false]], [["str", "SELECT"], ["bool", false]], [["str", "TRIGGER"], ["bool", false]], [["str", "TRUNCATE"], ["bool", false]], [["str", "UPDATE"], ["bool", false]]], [25, 16]],
+["select aclexplode(acl) is not null from r15_t limit 1", "", "ok", [[["bool", true]]], [16]],
+["select (pg_options_to_table(array['a=1', 'b=x'])).option_name order by 1", "", "ok", [[["str", "a"]], [["str", "b"]]], [25]],
+["select (pg_options_to_table(array['a=1'])).*", "", "ok", [[["str", "a"], ["str", "1"]]], [25, 25]],
+["select (ts_parse('default', 'foo bar')).token", "", "ok", [[["str", "foo"]], [["str", " "]], [["str", "bar"]]], [25]],
+["select (ts_parse('default', 'foo bar')).*", "", "ok", [[["num", "1"], ["str", "foo"]], [["num", "12"], ["str", " "]], [["num", "1"], ["str", "bar"]]], [23, 25]],
+["select (ts_token_type('default')).alias order by 1 limit 5", "", "ok", [[["str", "asciihword"]], [["str", "asciiword"]], [["str", "blank"]], [["str", "email"]], [["str", "entity"]]], [25]],
+["select (ts_debug('english', 'The cats')).lexemes", "", "ok", [[["list", []]], [["NoneType", "None"]], [["list", [["str", "cat"]]]]], [1009]],
+["select (pg_get_keywords()).word order by 1 limit 3", "", "ok", [[["str", "abort"]], [["str", "absolute"]], [["str", "access"]]], [25]],
+["select (aclexplode(acl)).nosuch from r15_t", "", "err", "42703: could not identify column \"nosuch\" in record data type", []],
+["select (aclexplode(acl)).privilege_type, (aclexplode(acl)).grantee = (select oid from pg_roles where rolname = 'postgres') from r15_t order by 1", "", "ok", [[["str", "DELETE"], ["bool", true]], [["str", "INSERT"], ["bool", true]], [["str", "REFERENCES"], ["bool", true]], [["str", "SELECT"], ["bool", true]], [["str", "TRIGGER"], ["bool", true]], [["str", "TRUNCATE"], ["bool", true]], [["str", "UPDATE"], ["bool", true]]], [25, 16]]
+]}

@@ -4152,7 +4152,9 @@ pub fn plan_with_subqueries(
     let node = pg_query::protobuf::Node {
         node: Some(parse_one_as_sent(sql)?),
     };
+    cancel::check()?;
     let original = node.clone();
+    cancel::check()?;
     plan_with_subqueries_parsed(sql, node, lookup, params, run)
         .map_err(|e| qualify_type_error(e, &original))
 }
@@ -4189,25 +4191,32 @@ fn plan_query_node(
     params: &[Bson],
     run: SubqueryRunner<'_>,
 ) -> Result<Statement> {
+    cancel::check()?;
     if let Some(e) = sql_json_absent(&node, sql, params) {
         return Err(e);
     }
+    cancel::check()?;
     drop_void_out_params(&mut node);
+    cancel::check()?;
     // The resolved values are appended to the bound parameters as `$N`, so
     // the list the statement is finally planned with is longer than the one
     // the client bound.
     pullup::rewrite(&mut node);
+    cancel::check()?;
     prune_outputs::rewrite(&mut node, lookup, params);
+    cancel::check()?;
     event_triggers::rewrite_sources(sql, &mut node)?;
     if let Some(inner) = node.node.as_ref() {
         fdw::refuse_foreign_access(inner, lookup)?;
     }
+    cancel::check()?;
     if let Some(p) = rule_rewrite::plan(&node, lookup, params)? {
         return Ok(Statement::RuleRewrite(p));
     }
     if let Some(st) = instead_of::plan(&node)? {
         return Ok(st);
     }
+    cancel::check()?;
     if let Some(inner) = node.node.as_ref() {
         func_cast::refuse_unresolved(inner)?;
         optype::check(inner, lookup)?;
@@ -4219,9 +4228,13 @@ fn plan_query_node(
         optype::using_to_direction(inner);
     }
     let mut params = params.to_vec();
+    cancel::check()?;
     materialize_dml_ctes(&mut node, lookup, &mut params, run)?;
+    cancel::check()?;
     rewrite_dml_from(&mut node, lookup)?;
+    cancel::check()?;
     materialize_recursive_ctes(&mut node, lookup, &mut params, run)?;
+    cancel::check()?;
     // Views expand BEFORE subqueries resolve: a view's body may hold a
     // (correlated) subquery, which the resolver has to see.
     if let Some(N::SelectStmt(s)) = node.node.as_mut() {
@@ -4229,10 +4242,13 @@ fn plan_query_node(
             **s = expand_views(s)?;
         }
     }
+    cancel::check()?;
     // A recursive CTE inside a FROM subquery -- a view's body among them,
     // now expanded -- is materialised the same way as one at the top.
     materialize_nested_recursive_ctes(&mut node, lookup, &mut params, run)?;
+    cancel::check()?;
     resolve_sublinks(&mut node, lookup, &mut params, run)?;
+    cancel::check()?;
     plan_node(
         node.node
             .ok_or_else(|| Error::Parse("empty statement".into()))?,
@@ -19415,6 +19431,8 @@ fn plan_select(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
 ) -> Result<Statement> {
+    // A cancellation point at every pass: each rewrite below re-enters here.
+    cancel::check()?;
     // `WITH` is shorthand for the FROM-subqueries below, so it is rewritten
     // away before any of the shape checks run -- every one of them would
     // otherwise have to know about it.
@@ -19422,6 +19440,7 @@ fn plan_select(
         let s = locking_past_ctes(s)?;
         return plan_select(&inline_ctes(&s)?, lookup, params);
     }
+    cancel::check()?;
     // A view is shorthand for the subquery it was defined as, so it is
     // rewritten away here, before any shape check looks at the FROM list.
     // The `tableoid` system column, before the views it may name expand.
@@ -19437,18 +19456,22 @@ fn plan_select(
     if !s.locking_clause.is_empty() && !LOCKING_CHECKED.with(|c| c.replace(true)) {
         check_locking(s)?;
     }
+    cancel::check()?;
     // `information_schema._pg_expandarray(arr)` in the select list.
     if let Some(rewritten) = pg_expandarray::rewrite(s)? {
         return plan_select(&rewritten, lookup, params);
     }
+    cancel::check()?;
     // `WITH ORDINALITY` and a several-function `ROWS FROM` as subqueries.
     if let Some(rewritten) = rowsfrom::rewrite(s)? {
         return plan_select(&rewritten, lookup, params);
     }
+    cancel::check()?;
     // `FROM t r(a, b)` renames t's leading columns: the subquery it equals.
     if let Some(rewritten) = column_alias_rewrite(s, lookup)? {
         return plan_select(&rewritten, lookup, params);
     }
+    cancel::check()?;
     // `(j).value` where `j` names a FROM item: the item's column.
     if let Some(rewritten) = alias_field_rewrite(s, lookup)? {
         return plan_select(&rewritten, lookup, params);
@@ -19456,6 +19479,7 @@ fn plan_select(
     if s.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
         return plan_set_operation(s, lookup, params);
     }
+    cancel::check()?;
     // A subquery's aggregate over only this level's columns is this level's
     // (PostgreSQL's agglevelsup), at every level, not just the statement's.
     if let Some(rewritten) = agg_hoist::split_for_outer_aggregates(s, lookup)? {
@@ -19478,36 +19502,45 @@ fn plan_select(
             return plan_select(&one, lookup, params);
         }
     }
+    cancel::check()?;
     enum_order::check_collate_operands(s, lookup)?;
     check_distinct_order(s)?;
     check_distinct_on_order(s)?;
+    cancel::check()?;
     // A set-returning function in the select list (or ORDER BY / GROUP BY)
     // is a LATERAL source (see `srf_tlist`).
     if let Some(rewritten) = srf_tlist::rewrite(s)? {
         return plan_select(&rewritten, lookup, params);
     }
+    cancel::check()?;
     // `(r).f1` over a subquery / CTE record column has the type of the
     // ROW() argument it selects (see `record_fields`).
     if let Some(rewritten) = record_fields::rewrite(s, lookup)? {
         return plan_select(&rewritten, lookup, params);
     }
+    cancel::check()?;
     // A reference to the RELATION itself -- `row_to_json(t)`, `SELECT jr
     // FROM jr`, `(jr.*)::text` -- is the whole row as a record.
     if let Some(rewritten) = whole_row_rewrite(s, lookup, params)? {
         return plan_select(&rewritten, lookup, params);
     }
+    cancel::check()?;
     if let Some(rewritten) = expand_composite_star(s, lookup) {
         return plan_select(&rewritten, lookup, params);
     }
+    cancel::check()?;
     if let Some(rewritten) = expand_star_in_grouped(s, lookup) {
         return plan_select(&rewritten, lookup, params);
     }
+    cancel::check()?;
     if let Some(rewritten) = distinct_on_over_groups(s) {
         return plan_select(&rewritten, lookup, params);
     }
+    cancel::check()?;
     if let Some(rewritten) = distinct_on_over_expressions(s) {
         return plan_select(&rewritten, lookup, params);
     }
+    cancel::check()?;
     // An enum orders by its labels' declared positions, not their text.
     if let Some(rewritten) = enum_order::rewrite(s, lookup)? {
         return plan_select(&rewritten, lookup, params);
@@ -19522,15 +19555,19 @@ fn plan_select(
     {
         return plan_select(&values_as_subquery(s), lookup, params);
     }
+    cancel::check()?;
     if let Some(rewritten) = ungrouped_having(s)? {
         return plan_select(&rewritten, lookup, params);
     }
+    cancel::check()?;
     if let Some(rewritten) = timezone_functions_as_views(s) {
         return plan_select(&rewritten, lookup, params);
     }
+    cancel::check()?;
     if let Some(rewritten) = rewrite_domain_typeof(s, lookup)? {
         return plan_select(&rewritten, lookup, params);
     }
+    cancel::check()?;
     // `xmlagg(x)` is the concatenation of its non-NULL inputs, with or without a FROM.
     if let Some(rewritten) = rewrite_xmlagg(s)? {
         return plan_select(&rewritten, lookup, params);
@@ -19544,16 +19581,19 @@ fn plan_select(
         }
         return plan_select_constant(s, params);
     }
+    cancel::check()?;
     // `FROM t TABLESAMPLE method (p)` is `t` with each row kept with
     // probability p% (see `rewrite_tablesample`).
     if let Some(rewritten) = rewrite_tablesample(s, params)? {
         return plan_select(&rewritten, lookup, params);
     }
+    cancel::check()?;
     // `ORDER BY 1` / `ORDER BY alias` over a COMPUTED output column sorts by
     // the computed value (see `order_by_output_exprs`).
     if let Some(rewritten) = order_by_output_exprs(s) {
         return plan_select(&rewritten, lookup, params);
     }
+    cancel::check()?;
     // A JOIN, or a comma-separated FROM. The narrow two-table join path goes
     // first: it is what psycopg's catalog queries take, and it compares OIDs
     // with the regtype / regclass awareness those need. Anything it refuses

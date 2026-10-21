@@ -1,0 +1,20 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["select 2 = any('{1,2}')", "", "ok", [[["bool", true]]], [16]],
+["select 2 = any('{1,x}')", "", "err", "22P02: invalid input syntax for type integer: \"x\"", []],
+["select n from any_t where n = any('{1,2}')", "", "ok", [[["num", "2"]]], [23]],
+["select n from any_t where n = any('{1,x}')", "", "err", "22P02: invalid input syntax for type integer: \"x\"", []],
+["select s from any_t where s = any('{a,b}')", "", "ok", [[["str", "b"]]], [25]],
+["select 2 <> all('{1,3}')", "", "ok", [[["bool", true]]], [16]],
+["select 2.5 = any('{2.5}')", "", "ok", [[["bool", true]]], [16]],
+["select 'b' = any('{a,b}')", "", "ok", [[["bool", true]]], [16]],
+["select n from any_t where n = any('{}')", "", "ok", [], [23]],
+["select '{1,{2,x}}'::int[]", "", "err", "22P02: malformed array literal: \"{1,{2,x}}\"", []],
+["select '{1,{2}}'::int[]", "", "err", "22P02: malformed array literal: \"{1,{2}}\"", []],
+["select '{{1},{2,3}}'::int[]", "", "err", "22P02: malformed array literal: \"{{1},{2,3}}\"", []],
+["select '{{1},2}'::int[]", "", "err", "22P02: malformed array literal: \"{{1},2}\"", []],
+["select '{{1,2},{3,4}}'::int[]", "", "ok", [[["list", [["list", [["num", "1"], ["num", "2"]]], ["list", [["num", "3"], ["num", "4"]]]]]]], [1007]],
+["select '{{1},{x}}'::int[]", "", "err", "22P02: invalid input syntax for type integer: \"x\"", []],
+["select '{1,{2,x}}'::text[]", "", "err", "22P02: malformed array literal: \"{1,{2,x}}\"", []]
+]}

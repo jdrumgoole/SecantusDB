@@ -1,0 +1,19 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["ALTER TABLE sr ADD COLUMN s serial", "", "ok", [], []],
+["SELECT id, s FROM sr ORDER BY id", "", "ok", [[["num", "1"], ["num", "1"]], [["num", "2"], ["num", "2"]], [["num", "3"], ["num", "3"]]], [23, 23]],
+["INSERT INTO sr (id) VALUES (4) RETURNING s", "", "ok", [[["num", "4"]]], [23]],
+["SELECT column_default, is_nullable, data_type FROM information_schema.columns WHERE table_name = 'sr' AND column_name = 's'", "", "ok", [[["str", "nextval('sr_s_seq'::regclass)"], ["str", "NO"], ["str", "integer"]]], [1043, 1043, 1043]],
+["SELECT pg_get_serial_sequence('sr', 's')", "", "ok", [[["str", "public.sr_s_seq"]]], [25]],
+["ALTER TABLE sr ADD COLUMN b bigserial", "", "ok", [], []],
+["SELECT id, b, pg_typeof(b) FROM sr ORDER BY id", "", "ok", [[["num", "1"], ["num", "1"], ["str", "bigint"]], [["num", "2"], ["num", "2"], ["str", "bigint"]], [["num", "3"], ["num", "3"], ["str", "bigint"]], [["num", "4"], ["num", "4"], ["str", "bigint"]]], [23, 20, 2206]],
+["ALTER TABLE sr ADD COLUMN x smallserial", "", "ok", [], []],
+["SELECT pg_get_serial_sequence('sr', 'x')", "", "ok", [[["str", "public.sr_x_seq1"]]], [25]],
+["SELECT id, x FROM sr ORDER BY id", "", "ok", [[["num", "1"], ["num", "1"]], [["num", "2"], ["num", "2"]], [["num", "3"], ["num", "3"]], [["num", "4"], ["num", "4"]]], [23, 21]],
+["SELECT last_value FROM sr_x_seq", "", "ok", [[["num", "1"]]], [20]],
+["INSERT INTO sr (id, s) VALUES (5, NULL)", "", "err", "23502: null value in column \"s\" of relation \"sr\" violates not-null constraint", []],
+["ALTER TABLE sr ADD COLUMN IF NOT EXISTS s serial", "", "ok", [], []],
+["DROP TABLE sr", "", "ok", [], []],
+["SELECT relname FROM pg_class WHERE relname LIKE 'sr\\_%' ORDER BY relname", "", "ok", [[["str", "sr_x_seq"]]], [19]]
+]}

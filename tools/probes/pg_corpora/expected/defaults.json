@@ -1,0 +1,20 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {"3": "reads the clock or the server process", "8": "reads the clock or the server process", "11": "reads the clock or the server process", "12": "reads the clock or the server process"},
+"checks": [
+["INSERT INTO dx DEFAULT VALUES RETURNING id, n, s", "", "ok", [[["num", "100"], ["num", "3"], ["str", "xy"]]], [23, 23, 25]],
+["INSERT INTO dx (n) VALUES (5), (6) RETURNING id, n", "", "ok", [[["num", "101"], ["num", "5"]], [["num", "102"], ["num", "6"]]], [23, 23]],
+["SELECT count(*), count(DISTINCT u), count(DISTINCT id) FROM dx", "", "ok", [[["num", "3"], ["num", "3"], ["num", "3"]]], [20, 20, 20]],
+["SELECT id FROM dx WHERE created > now() - interval '1 minute' AND day = current_date ORDER BY id", "", "ok", [[["num", "100"]], [["num", "101"]], [["num", "102"]]], [23]],
+["INSERT INTO dx (id, n) VALUES (DEFAULT, 7) RETURNING id", "", "ok", [[["num", "103"]]], [23]],
+["SELECT column_name, column_default FROM information_schema.columns WHERE table_name = 'dx' ORDER BY ordinal_position", "", "ok", [[["str", "id"], ["str", "nextval('dxs'::regclass)"]], [["str", "created"], ["str", "now()"]], [["str", "day"], ["str", "CURRENT_DATE"]], [["str", "u"], ["str", "gen_random_uuid()"]], [["str", "n"], ["str", "(1 + 2)"]], [["str", "s"], ["str", "('x'::text || 'y'::text)"]]], [19, 1043]],
+["ALTER TABLE dx ALTER COLUMN n SET DEFAULT currval('dxs')", "", "ok", [], []],
+["INSERT INTO dx (id) VALUES (500) RETURNING n", "", "ok", [[["num", "103"]]], [23]],
+["ALTER TABLE dx ADD COLUMN t2 timestamptz DEFAULT now()", "", "ok", [], []],
+["UPDATE dx SET n = DEFAULT WHERE id = 500 RETURNING n", "", "ok", [[["num", "103"]]], [23]],
+["UPDATE dx SET n = nextval('dxs') WHERE id < 200 RETURNING n", "", "ok", [[["num", "104"]], [["num", "105"]], [["num", "106"]], [["num", "107"]]], [23]],
+["SELECT current_date = now()::date, localtimestamp IS NOT NULL, current_time IS NOT NULL", "", "ok", [[["bool", true], ["bool", true], ["bool", true]]], [16, 16, 16]],
+["ALTER TABLE dx ADD COLUMN u2 uuid DEFAULT gen_random_uuid()", "", "ok", [], []],
+["SELECT count(DISTINCT u2) = count(*), count(t2) = count(*) FROM dx", "", "ok", [[["bool", true], ["bool", true]]], [16, 16]],
+["INSERT INTO dx (id) VALUES (900) RETURNING t2 IS NOT NULL, u2 IS NOT NULL", "", "ok", [[["bool", true], ["bool", true]]], [16, 16]],
+["SELECT column_name, column_default FROM information_schema.columns WHERE table_name = 'cdf' ORDER BY ordinal_position", "", "ok", [[["str", "a"], ["str", "(1 + 2)"]], [["str", "b"], ["str", "('x'::text || 'y'::text)"]], [["str", "c"], ["str", "abs('-3'::integer)"]], [["str", "d"], ["str", "(1.5 * (2)::numeric)"]], [["str", "f"], ["str", "'-1'::integer"]], [["str", "h"], ["str", "(NOT false)"]], [["str", "i"], ["str", "'{1,2}'::integer[]"]], [["str", "l"], ["str", "'v'::character varying"]], [["str", "m"], ["str", "('-2'::integer * 3)"]], [["str", "n"], ["str", "(true AND false)"]], [["str", "o"], ["str", "'-1.5'::numeric"]], [["str", "p"], ["str", "'{a,b}'::text[]"]], [["str", "q"], ["str", "'-2.5'::numeric"]], [["str", "r"], ["str", "'-9'::integer"]], [["str", "t"], ["str", "'-9000000000'::bigint"]], [["str", "u"], ["str", "'-3'::integer"]]], [19, 1043]]
+]}

@@ -1,0 +1,19 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT * FROM generate_series('2020-01-01'::date, '2020-01-03'::date, '1 day') g", "", "ok", [[["ts", "2020-01-01T00:00:00+00:00"]], [["ts", "2020-01-02T00:00:00+00:00"]], [["ts", "2020-01-03T00:00:00+00:00"]]], [1184]],
+["SELECT g::text FROM generate_series('2020-01-31'::timestamp, '2020-06-01'::timestamp, '1 month') g", "", "ok", [[["str", "2020-01-31 00:00:00"]], [["str", "2020-02-29 00:00:00"]], [["str", "2020-03-29 00:00:00"]], [["str", "2020-04-29 00:00:00"]], [["str", "2020-05-29 00:00:00"]]], [25]],
+["SELECT count(*) FROM generate_series('2020-01-01 00:00'::timestamptz, '2020-01-01 03:00'::timestamptz, interval '30 minutes')", "", "ok", [[["num", "7"]]], [20]],
+["SELECT * FROM generate_series('2020-01-03'::timestamp, '2020-01-01'::timestamp, '-1 day')", "", "ok", [[["ts", "2020-01-03T00:00:00"]], [["ts", "2020-01-02T00:00:00"]], [["ts", "2020-01-01T00:00:00"]]], [1114]],
+["SELECT * FROM generate_series('2020-01-01'::timestamp, '2020-01-03'::timestamp, '0 day')", "", "err", "22023: step size cannot equal zero", []],
+["SELECT g FROM generate_series(1.5, 3, 0.5) g", "", "ok", [[["num", "1.5"]], [["num", "2"]], [["num", "2.5"]], [["num", "3"]]], [1700]],
+["SELECT g::text FROM generate_series(0.1, 0.35, 0.1) g", "", "ok", [[["str", "0.1"]], [["str", "0.2"]], [["str", "0.3"]]], [25]],
+["SELECT * FROM generate_series(1::numeric, 2::numeric)", "", "ok", [[["num", "1"]], [["num", "2"]]], [1700]],
+["SELECT * FROM generate_series(3.0, 1.0, -0.75)", "", "ok", [[["num", "3"]], [["num", "2.25"]], [["num", "1.5"]]], [1700]],
+["SELECT * FROM generate_series(1.0, 2.0, 0)", "", "err", "22023: step size cannot equal zero", []],
+["SELECT * FROM generate_series('NaN'::numeric, 2.0)", "", "err", "22023: start value cannot be NaN", []],
+["SELECT * FROM generate_series(1.0, NULL)", "", "ok", [], [1700]],
+["SELECT pg_typeof(g) FROM generate_series('2020-01-01'::date, '2020-01-01'::date, '1 day') g", "", "ok", [[["str", "timestamp with time zone"]]], [2206]],
+["SELECT pg_typeof(g) FROM generate_series(1.5, 2) g", "", "ok", [[["str", "numeric"]]], [2206]],
+["SELECT x FROM generate_series('2020-01-01'::timestamp, '2020-01-02'::timestamp, '12 hours') AS t(x) ORDER BY x DESC", "", "ok", [[["ts", "2020-01-02T00:00:00"]], [["ts", "2020-01-01T12:00:00"]], [["ts", "2020-01-01T00:00:00"]]], [1114]]
+]}

@@ -1,0 +1,12 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT relfrozenxid::text <> '0', relminmxid::text <> '0', relpersistence, relkind FROM pg_class WHERE relname = 'b48t'", "", "ok", [[["bool", true], ["bool", true], ["str", "p"], ["str", "r"]]], [16, 16, 18, 18]],
+["SELECT relfrozenxid::text, relminmxid::text FROM pg_class WHERE relname = 'b48t_pkey'", "", "ok", [[["str", "0"], ["str", "0"]]], [25, 25]],
+["SELECT attname, attcacheoff, attbyval, attalign, attmissingval IS NULL FROM pg_attribute WHERE attrelid = 'b48t'::regclass AND attnum > 0 ORDER BY attnum", "", "ok", [[["str", "id"], ["num", "-1"], ["bool", true], ["str", "i"], ["bool", true]], [["str", "name"], ["num", "-1"], ["bool", false], ["str", "i"], ["bool", true]], [["str", "e"], ["num", "-1"], ["bool", true], ["str", "i"], ["bool", true]]], [19, 23, 16, 18, 16]],
+["SELECT typowner = (SELECT relowner FROM pg_class WHERE relname = 'b48t'), typdefaultbin IS NULL FROM pg_type WHERE typname = 'b48e'", "", "ok", [[["bool", true], ["bool", true]]], [16, 16]],
+["SELECT pronargdefaults, proargdefaults IS NULL, protrftypes IS NULL, probin IS NULL FROM pg_proc WHERE proname = 'b48tf'", "", "ok", [[["num", "0"], ["bool", true], ["bool", true], ["bool", true]]], [21, 16, 16, 16]],
+["SELECT tgattr::text, tgargs, tgqual IS NULL, tgoldtable IS NULL, tgnewtable IS NULL FROM pg_trigger WHERE tgname = 'b48trg'", "", "ok", [[["str", ""], ["bytes", ""], ["bool", true], ["bool", true], ["bool", true]]], [25, 17, 16, 16, 16]],
+["SELECT lanname, lanispl, lanowner, lanvalidator <> 0 FROM pg_language ORDER BY 1", "", "ok", [[["str", "c"], ["bool", false], ["num", "10"], ["bool", true]], [["str", "internal"], ["bool", false], ["num", "10"], ["bool", true]], [["str", "plpgsql"], ["bool", true], ["num", "10"], ["bool", true]], [["str", "sql"], ["bool", false], ["num", "10"], ["bool", true]]], [19, 16, 26, 16]],
+["SELECT nspacl IS NULL FROM pg_namespace WHERE nspname = 'b48none'", "", "ok", [], [16]]
+]}

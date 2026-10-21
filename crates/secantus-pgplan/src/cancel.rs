@@ -44,6 +44,19 @@ pub(crate) fn pending() -> bool {
     })
 }
 
+/// A cancellation point between planning passes, as PostgreSQL's
+/// `CHECK_FOR_INTERRUPTS` is one through parse analysis and planning. Each
+/// pass walks the whole statement, so a large one (a 200,000-item `IN`
+/// list) plans for seconds; without these a cancel that missed the parse
+/// waited for all of them, and every repeat of a statement misses it,
+/// because the parse is memoised.
+pub(crate) fn check() -> Result<()> {
+    if pending() {
+        return Err(query_canceled());
+    }
+    Ok(())
+}
+
 /// PostgreSQL's 57014 for a cancelled statement.
 pub(crate) fn query_canceled() -> Error {
     Error::Sqlstate("57014", "canceling statement due to user request".into())

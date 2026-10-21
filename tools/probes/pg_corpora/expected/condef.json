@@ -1,0 +1,11 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'cdf_p'::regclass ORDER BY conname", "", "ok", [[["str", "cdf_p_pkey"], ["str", "PRIMARY KEY (a, b)"]], [["str", "cdf_p_u_key"], ["str", "UNIQUE (u)"]]], [19, 25]],
+["SELECT conname, pg_get_constraintdef(oid), confmatchtype FROM pg_constraint WHERE conrelid = 'cdf_c'::regclass ORDER BY conname", "", "ok", [[["str", "cdf_c_a_b_fkey"], ["str", "FOREIGN KEY (a, b) REFERENCES cdf_p(a, b) MATCH FULL ON UPDATE SET NULL DEFERRABLE"], ["str", "f"]], [["str", "cdf_c_n_check"], ["str", "CHECK ((n > 0))"], ["str", " "]], [["str", "cdf_c_pkey"], ["str", "PRIMARY KEY (id)"], ["str", " "]], [["str", "cdf_c_u_fkey"], ["str", "FOREIGN KEY (u) REFERENCES cdf_p(u) ON DELETE CASCADE"], ["str", "s"]], [["str", "m_range"], ["str", "CHECK (((m >= 0) AND (m < 100)))"], ["str", " "]]], [19, 25, 18]],
+["INSERT INTO cdf_c VALUES (1, 1, NULL, 1, 1, NULL)", "", "err", "23503: insert or update on table \"cdf_c\" violates foreign key constraint \"cdf_c_a_b_fkey\"", []],
+["INSERT INTO cdf_c VALUES (2, NULL, NULL, 1, 1, NULL)", "", "ok", [], []],
+["INSERT INTO cdf_c VALUES (3, 1, 2, 1, 1, 'x')", "", "ok", [], []],
+["SELECT pg_get_constraintdef(0)", "", "ok", [[["NoneType", "None"]]], [25]],
+["CREATE TABLE cdf_bad (a int REFERENCES cdf_p (u) MATCH PARTIAL)", "", "err", "0A000: MATCH PARTIAL not yet implemented", []]
+]}

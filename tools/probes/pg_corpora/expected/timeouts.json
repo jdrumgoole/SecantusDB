@@ -1,0 +1,20 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {"2": "reads the clock or the server process", "13": "reads the clock or the server process"},
+"checks": [
+["SHOW statement_timeout", "", "ok", [[["str", "0"]]], [25]],
+["SET statement_timeout = 100", "", "ok", [], []],
+["SELECT pg_sleep(1)", "", "err", "57014: canceling statement due to statement timeout", []],
+["SHOW statement_timeout", "", "ok", [[["str", "100ms"]]], [25]],
+["SET statement_timeout = '2s'", "", "ok", [], []],
+["SHOW statement_timeout", "", "ok", [[["str", "2s"]]], [25]],
+["SET statement_timeout = 'x'", "", "err", "22023: invalid value for parameter \"statement_timeout\": \"x\"", []],
+["SET lock_timeout = -1", "", "err", "22023: -1 ms is outside the valid range for parameter \"lock_timeout\" (0 .. 2147483647)", []],
+["SET lock_timeout = '1min'", "", "ok", [], []],
+["SHOW lock_timeout", "", "ok", [[["str", "1min"]]], [25]],
+["SELECT current_setting('statement_timeout')", "", "ok", [[["str", "2s"]]], [25]],
+["RESET statement_timeout", "", "ok", [], []],
+["SHOW statement_timeout", "", "ok", [[["str", "0"]]], [25]],
+["SELECT pg_sleep(0.2)", "", "ok", [[["str", ""]]], [2278]],
+["RESET lock_timeout", "", "ok", [], []],
+["SHOW lock_timeout", "", "ok", [[["str", "0"]]], [25]]
+]}

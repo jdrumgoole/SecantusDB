@@ -1,0 +1,17 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["CREATE TRIGGER tr_a AFTER INSERT ON tr_t REFERENCING NEW TABLE AS nt FOR EACH STATEMENT EXECUTE FUNCTION tr_ins()", "", "ok", [], []],
+["CREATE TRIGGER tr_b AFTER UPDATE ON tr_t REFERENCING OLD TABLE AS ot NEW TABLE AS nt FOR EACH STATEMENT EXECUTE FUNCTION tr_upd()", "", "ok", [], []],
+["CREATE TRIGGER tr_c AFTER DELETE ON tr_t REFERENCING OLD TABLE AS ot FOR EACH STATEMENT EXECUTE FUNCTION tr_del()", "", "ok", [], []],
+["INSERT INTO tr_t VALUES (1, 10), (2, 20), (3, 30)", "", "ok", [], []],
+["UPDATE tr_t SET n = n + 1 WHERE id < 3", "", "ok", [], []],
+["DELETE FROM tr_t WHERE id > 1", "", "ok", [], []],
+["INSERT INTO tr_t SELECT 9, 9 WHERE false", "", "ok", [], []],
+["SELECT msg FROM tr_log ORDER BY msg", "", "ok", [[["str", "del 2,3"]], [["str", "ins 0 sum 0"]], [["str", "ins 3 sum 60"]], [["str", "upd 1 10->11"]], [["str", "upd 2 20->21"]]], [25]],
+["SELECT count(*) FROM pg_class WHERE relname IN ('nt', 'ot') AND relpersistence = 't'", "", "ok", [[["num", "0"]]], [20]],
+["CREATE TRIGGER tr_bad BEFORE INSERT ON tr_t REFERENCING NEW TABLE AS x FOR EACH STATEMENT EXECUTE FUNCTION tr_ins()", "", "err", "42P17: transition table name can only be specified for an AFTER trigger", []],
+["CREATE TRIGGER tr_bad2 AFTER INSERT ON tr_t REFERENCING OLD TABLE AS x FOR EACH STATEMENT EXECUTE FUNCTION tr_ins()", "", "err", "42P17: OLD TABLE can only be specified for a DELETE or UPDATE trigger", []],
+["CREATE TRIGGER tr_bad3 AFTER INSERT OR DELETE ON tr_t REFERENCING NEW TABLE AS x FOR EACH STATEMENT EXECUTE FUNCTION tr_ins()", "", "err", "0A000: transition tables cannot be specified for triggers with more than one event", []],
+["CREATE TRIGGER tr_bad4 AFTER UPDATE ON tr_t REFERENCING NEW TABLE AS x OLD TABLE AS x FOR EACH STATEMENT EXECUTE FUNCTION tr_ins()", "", "err", "42P17: OLD TABLE name and NEW TABLE name cannot be the same", []]
+]}
