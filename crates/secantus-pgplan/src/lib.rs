@@ -155,6 +155,7 @@ pub mod money;
 pub mod net;
 pub mod numeric;
 pub mod numeric_math;
+pub mod output_style;
 pub mod pg_casts;
 pub mod pgtypes;
 pub mod range;
@@ -29000,49 +29001,31 @@ impl Interval {
     }
 }
 
-/// Render an interval the way PostgreSQL's default `IntervalStyle` does.
+/// Render an interval as `interval_out` does, in the session's
+/// `IntervalStyle` (`output_style::encode_interval`).
 ///
-/// Months split into years and months; each part is pluralised when its value
-/// is not exactly 1 — so `-1 day` prints as `-1 days`, which looks like a typo
-/// and is what PostgreSQL emits. The time part is `HH:MM:SS`, zero-padded, with
-/// hours allowed past 24 (`'25:00:00'` is a valid interval), a trimmed
-/// fraction, and its own sign. A wholly zero interval is `00:00:00`.
+/// Under the default `postgres` style months split into years and months;
+/// each part is pluralised when its value is not exactly 1 -- so `-1 day`
+/// prints as `-1 days`, which looks like a typo and is what PostgreSQL emits
+/// -- and a positive part after a negative one carries a `+` (`-1 mons +3
+/// days`). The time part is `HH:MM:SS`, zero-padded, with hours allowed past
+/// 24, a trimmed fraction, and its own sign. A wholly zero interval is
+/// `00:00:00`.
 pub fn render_interval(iv: &Interval) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let (years, months) = (iv.months / 12, iv.months % 12);
-    let unit = |n: i32, singular: &str| {
-        if n == 1 {
-            format!("{n} {singular}")
-        } else {
-            format!("{n} {singular}s")
-        }
-    };
-    if years != 0 {
-        parts.push(unit(years, "year"));
-    }
-    if months != 0 {
-        parts.push(unit(months, "mon"));
-    }
-    if iv.days != 0 {
-        parts.push(unit(iv.days, "day"));
-    }
-    if iv.micros != 0 || parts.is_empty() {
-        let neg = iv.micros < 0;
-        let a = iv.micros.unsigned_abs();
-        let (h, m, sec, frac) = (
-            a / 3_600_000_000,
-            (a % 3_600_000_000) / 60_000_000,
-            (a % 60_000_000) / 1_000_000,
-            a % 1_000_000,
-        );
-        let mut t = format!("{}{h:02}:{m:02}:{sec:02}", if neg { "-" } else { "" });
-        if frac != 0 {
-            t.push('.');
-            t.push_str(format!("{frac:06}").trim_end_matches('0'));
-        }
-        parts.push(t);
-    }
-    parts.join(" ")
+    // `EncodeInterval`, in the session's `IntervalStyle` (RP-068).
+    let t = iv.micros;
+    output_style::encode_interval(
+        &output_style::ItmParts {
+            year: iv.months / 12,
+            mon: iv.months % 12,
+            mday: iv.days,
+            hour: t / 3_600_000_000,
+            min: ((t / 60_000_000) % 60) as i32,
+            sec: ((t / 1_000_000) % 60) as i32,
+            fsec: (t % 1_000_000) as i32,
+        },
+        output_style::output_style().interval,
+    )
 }
 
 /// `sum` (or, with `avg`, the mean) of interval values: `None` unless every
@@ -29106,11 +29089,30 @@ fn parse_interval(text: &str) -> Result<Interval> {
     if let Some(rest) = t.strip_prefix(['P', 'p']) {
         return parse_iso_interval(rest, text);
     }
+    // `@ 1 min ago`, the `postgres_verbose` spelling: `@` is noise, and a
+    // trailing `ago` negates every field (`DecodeInterval`).
+    let t = t.strip_prefix('@').unwrap_or(t);
+    let mut tokens: Vec<String> = t.split_whitespace().map(str::to_string).collect();
+    let ago = tokens.last().is_some_and(|w| w.eq_ignore_ascii_case("ago"));
+    if ago {
+        tokens.pop();
+    }
+    // Under `IntervalStyle = sql_standard` a leading minus applies to every
+    // later field that has no sign of its own (`-1 2:03:04` is all negative).
+    if output_style::output_style().interval == output_style::IntervalStyle::SqlStandard
+        && tokens.first().is_some_and(|w| w.starts_with('-'))
+    {
+        for w in tokens.iter_mut().skip(1) {
+            if w.starts_with(|c: char| c.is_ascii_digit() || c == '.') {
+                w.insert(0, '-');
+            }
+        }
+    }
     let mut iv = Interval::default();
     let mut pending: Option<f64> = None;
     let mut saw_any = false;
 
-    for token in t.split_whitespace() {
+    for token in tokens.iter().map(String::as_str) {
         // A `HH:MM:SS` chunk, possibly signed.
         if token.contains(':') {
             let (sign, body) = match token.strip_prefix('-') {
@@ -29170,6 +29172,11 @@ fn parse_interval(text: &str) -> Result<Interval> {
     }
     if !saw_any {
         return Err(bad_interval(text));
+    }
+    if ago {
+        iv.months = -iv.months;
+        iv.days = -iv.days;
+        iv.micros = -iv.micros;
     }
     Ok(iv)
 }

@@ -4345,6 +4345,23 @@ impl PgHandler {
             let datestyle = self.session_datestyle();
             let order = datestyle.order;
             secantus_pgplan::set_session_datestyle(datestyle);
+            // How intervals, bytea and floats are written (RP-068).
+            {
+                let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+                let get = |name: &str| settings.get(name).map(|v| v.to_string());
+                secantus_pgplan::output_style::set_output_style(
+                    secantus_pgplan::output_style::OutputStyle {
+                        interval: secantus_pgplan::output_style::IntervalStyle::parse(
+                            &get("IntervalStyle").unwrap_or_default(),
+                        ),
+                        bytea_escape: get("bytea_output")
+                            .is_some_and(|v| v.trim().eq_ignore_ascii_case("escape")),
+                        extra_float_digits: get("extra_float_digits")
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(1),
+                    },
+                );
+            }
             // The zone too: a row expression runs AFTER planning, and a
             // stored timestamptz cast to `timestamp` is the session zone's
             // wall clock.
@@ -24947,7 +24964,17 @@ impl PgHandler {
             "standard_conforming_strings" => (true, value.to_string()),
             //  - application_name: PostgreSQL reports it (GUC_REPORT), and
             //    pgjdbc reads its connection's name back from the report.
-            "application_name" => (true, value.to_string()),
+            "application_name" => {
+                // And `pg_stat_activity` shows it (RP-068).
+                self.backend
+                    .activity
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .application_name = value.to_string();
+                (true, value.to_string())
+            }
+            //  - IntervalStyle: an interval renders in it (`output_style`).
+            "IntervalStyle" => (true, value.to_string()),
             _ => (false, String::new()),
         };
         if report {
