@@ -1,4 +1,4 @@
-"""Run the sqllogictest corpus against a SecantusPGServer daemon, one per file.
+"""Run the sqllogictest corpus against a SecantusDB PostgreSQL daemon, one per file.
 
 The SQL analogue of the driver gauges (tasks/sql-gauges-plan.md G1): the
 SQLite-originated sqllogictest corpus, vendored pristine at
@@ -8,16 +8,17 @@ runner:
 
 1. Preprocesses the included files into ``.validation/slt-corpus/``
    (``slt_validation.preprocess`` — the corpus itself is never modified).
-2. Per file: spawns ``python -m secantus.sql.pgserver`` on a kernel-assigned
-   ephemeral port with a fresh temp storage dir (corpus files assume a clean
+2. Per file: spawns the server ``SECANTUS_GAUGE_SERVER`` names (``python``, the
+   default: ``python -m secantus.sql.pgserver``; ``rust``: ``secantusd-pg``) on a
+   kernel-assigned ephemeral port with a fresh temp storage dir (corpus files assume a clean
    database), verifies the daemon is SecantusDB, and runs
    ``sqllogictest --engine postgres`` against it.
 3. Writes ``.validation/slt-raw.json`` (per-file ok / seconds / first error);
    ``generate_report.py`` renders ``docs/validation-report-slt.md``.
 
 Requires the ``sqllogictest`` binary (``cargo install sqllogictest-bin``).
-Run via ``uv run python -m invoke validate-slt``. Python server only — the
-Rust server has no SQL front end.
+Run via ``uv run python -m invoke validate-slt --server <python|rust>``; the
+Rust server's results go to ``slt-raw-rust-server.json``.
 """
 
 from __future__ import annotations

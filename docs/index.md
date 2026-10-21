@@ -255,6 +255,13 @@ validation-report-php-ext-rust-server
 validation-report-c-rust-server
 validation-report-cxx-rust-server
 validation-report-dotnet-rust-server
+validation-report-psycopg-rust-server
+validation-report-slt-rust-server
+validation-report-sqlalchemy-rust-server
+validation-report-pgx-rust-server
+validation-report-sqlstress-rust-server
+validation-report-pgtest-rust-server
+validation-report-pgjdbc-rust-server
 api
 changelog
 ```

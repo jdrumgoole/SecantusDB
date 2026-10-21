@@ -1112,8 +1112,7 @@ def _run_gauge(
     else:
         artifact.unlink(missing_ok=True)
 
-    # The SQL-server gauges (psycopg, slt) have no python/rust server split, so
-    # they pass server=None and the selector env var is simply not set.
+    # server=None leaves the selector unset, so the runner takes its default.
     selector = f"SECANTUS_GAUGE_SERVER={server} " if server is not None else ""
     c.run(
         f"{selector}PYTHONPATH=. uv run --no-sync python -m {module}",
@@ -1460,35 +1459,62 @@ def validate_node(c: Context, server: str = "python") -> None:
     print(f"\nWrote docs/validation-report-node{suffix}.md")
 
 
+def _sql_gauge_suffix(server: str) -> str:
+    """The report suffix of a SQL gauge's ``--server``: none for the Python
+    PostgreSQL server, ``-rust-server`` for ``secantusd-pg``. The runners pick
+    the server from ``SECANTUS_GAUGE_SERVER``, which ``_run_gauge`` sets from
+    ``server``; ``pg_gauge_server`` holds the matching raw-file names."""
+    if server not in ("python", "rust"):
+        raise SystemExit(f"--server must be 'python' or 'rust', got {server!r}")
+    return "" if server == "python" else "-rust-server"
+
+
 @task(name="validate-psycopg")
-def validate_psycopg(c: Context) -> None:
+def validate_psycopg(c: Context, server: str = "python") -> None:
     """Run psycopg 3's vendored test suite against a SecantusPGServer daemon.
 
     The SQL-server conformance gauge (tasks/sql-gauges-plan.md G2): psycopg's
     own tests, unmodified, over a real TCP connection with PSYCOPG_TEST_DSN
     pointing at a daemon SecantusPGServer. Generates
-    docs/validation-report-psycopg.md. Python server only — the Rust server
-    has no SQL front end.
+    docs/validation-report-psycopg.md.
+
+    ``--server rust`` drives ``secantusd-pg`` (build it first with
+    ``./inv rust-pgserver-build``) and writes
+    docs/validation-report-psycopg-rust-server.md, after
+    ``psycopg_validation.check_run`` has confirmed the run accounted for every
+    test it started. ``validate-psycopg-rust`` is the same run plus the TLS
+    comparison, and writes no report.
     """
     import pathlib
 
+    suffix = _sql_gauge_suffix(server)
+    # The runner names the Rust run's raw `psycopg-raw-rust.json`.
+    raw_suffix = "" if server == "python" else "-rust"
     if not pathlib.Path("vendor/psycopg/tests").exists():
         c.run("git submodule update --init vendor/psycopg", pty=PTY)
     _run_gauge(
         c,
         module="psycopg_validation.runner",
-        raw=".validation/psycopg-raw.json",
-        report="docs/validation-report-psycopg.md",
+        raw=f".validation/psycopg-raw{raw_suffix}.json",
+        report=f"docs/validation-report-psycopg{suffix}.md",
+        server=server,
         hint=(
             "A missing `vendor/psycopg` submodule or PG-server startup failure is the usual cause."
         ),
     )
+    if server == "rust":
+        # A truncated run is a failure, never a rate: refuse before rendering.
+        c.run(
+            "uv run --no-sync python -m psycopg_validation.check_run "
+            f".validation/psycopg-raw{raw_suffix}.json",
+            pty=PTY,
+        )
     c.run(
         "uv run --no-sync python -m psycopg_validation.generate_report "
-        ".validation/psycopg-raw.json docs/validation-report-psycopg.md",
+        f".validation/psycopg-raw{raw_suffix}.json docs/validation-report-psycopg{suffix}.md",
         pty=PTY,
     )
-    print("\nWrote docs/validation-report-psycopg.md")
+    print(f"\nWrote docs/validation-report-psycopg{suffix}.md")
 
 
 @task(name="validate-psycopg-rust")
@@ -1534,7 +1560,7 @@ def validate_psycopg_rust(c: Context, tls: bool = False) -> None:
 
 
 @task(name="validate-sqlalchemy")
-def validate_sqlalchemy(c: Context) -> None:
+def validate_sqlalchemy(c: Context, server: str = "python") -> None:
     """Run SQLAlchemy's dialect-compliance suite against a SecantusPGServer daemon.
 
     The SQL-server ORM gauge (tasks/sql-gauges-plan.md G6): SQLAlchemy's own
@@ -1542,58 +1568,64 @@ def validate_sqlalchemy(c: Context) -> None:
     vendored, it ships in the sqlalchemy package) over the stock
     postgresql+psycopg dialect, with SecantusDB's capability declarations in
     sqlalchemy_validation/requirements.py. Generates
-    docs/validation-report-sqlalchemy.md. Python server only — the Rust
-    server has no SQL front end.
+    docs/validation-report-sqlalchemy.md, or ...-rust-server.md with
+    ``--server rust`` (``secantusd-pg``).
     """
+    suffix = _sql_gauge_suffix(server)
     _run_gauge(
         c,
         module="sqlalchemy_validation.runner",
-        raw=".validation/sqlalchemy-raw.json",
-        report="docs/validation-report-sqlalchemy.md",
+        raw=f".validation/sqlalchemy-raw{suffix}.json",
+        report=f"docs/validation-report-sqlalchemy{suffix}.md",
+        server=server,
         hint="A PG-server startup failure is the usual cause (nothing is vendored).",
     )
     c.run(
         "uv run --no-sync python -m sqlalchemy_validation.generate_report "
-        ".validation/sqlalchemy-raw.json docs/validation-report-sqlalchemy.md",
+        f".validation/sqlalchemy-raw{suffix}.json docs/validation-report-sqlalchemy{suffix}.md",
         pty=PTY,
     )
-    print("\nWrote docs/validation-report-sqlalchemy.md")
+    print(f"\nWrote docs/validation-report-sqlalchemy{suffix}.md")
 
 
 @task(name="sql-stress")
-def sql_stress(c: Context) -> None:
+def sql_stress(c: Context, server: str = "python") -> None:
     """Run the pgbench + psql stress/smoke against a SecantusPGServer daemon.
 
     The SQL-server always-on smoke (tasks/sql-gauges-plan.md G7): unmodified
     pgbench init (DDL + COPY + ALTER ADD PRIMARY KEY) and TPC-B in all three
     protocol modes plus a concurrent select-only lane, then a psql catalog
     smoke. Any error or dropped connection is a bug. Requires pgbench + psql
-    on PATH. Generates docs/validation-report-sqlstress.md.
+    on PATH. Generates docs/validation-report-sqlstress.md, or
+    ...-rust-server.md with ``--server rust`` (``secantusd-pg``).
     """
+    suffix = _sql_gauge_suffix(server)
     _run_gauge(
         c,
         module="sqlstress_validation.runner",
-        raw=".validation/sqlstress-raw.json",
-        report="docs/validation-report-sqlstress.md",
+        raw=f".validation/sqlstress-raw{suffix}.json",
+        report=f"docs/validation-report-sqlstress{suffix}.md",
+        server=server,
         hint="pgbench/psql missing from PATH or a PG-server startup failure is the usual cause.",
     )
     c.run(
         "uv run --no-sync python -m sqlstress_validation.generate_report "
-        ".validation/sqlstress-raw.json docs/validation-report-sqlstress.md",
+        f".validation/sqlstress-raw{suffix}.json docs/validation-report-sqlstress{suffix}.md",
         pty=PTY,
     )
-    print("\nWrote docs/validation-report-sqlstress.md")
+    print(f"\nWrote docs/validation-report-sqlstress{suffix}.md")
 
 
 @task(name="validate-pgjdbc")
-def validate_pgjdbc(c: Context, shard: str = "") -> None:
+def validate_pgjdbc(c: Context, shard: str = "", server: str = "python") -> None:
     """Run pgjdbc's own test suite against a SecantusPGServer daemon.
 
     The SQL-server JDBC gauge (tasks/sql-gauges-plan.md G5): the official
     PostgreSQL JDBC driver's suite, unmodified, targeted via pgjdbc's stock
     build.local.properties (gitignored upstream, so the submodule stays
     pristine). Requires a JDK 21 (pgjdbc's Gradle toolchain). Generates
-    docs/validation-report-pgjdbc.md. Python server only.
+    docs/validation-report-pgjdbc.md, or ...-rust-server.md with
+    ``--server rust`` (``secantusd-pg``).
 
     ``--shard K/N`` runs only the k-th round-robin slice of the class list and
     writes ``.validation/pgjdbc-raw-shard-K.json`` WITHOUT generating a report
@@ -1602,14 +1634,16 @@ def validate_pgjdbc(c: Context, shard: str = "") -> None:
     """
     import pathlib
 
+    suffix = _sql_gauge_suffix(server)
     if not pathlib.Path("vendor/pgjdbc/gradlew").exists():
         c.run("git submodule update --init vendor/pgjdbc", pty=PTY)
     if shard:
         k = shard.split("/", 1)[0]
-        raw = pathlib.Path(f".validation/pgjdbc-raw-shard-{k}.json")
+        raw = pathlib.Path(f".validation/pgjdbc-raw-shard-{k}{suffix}.json")
         raw.unlink(missing_ok=True)  # same freshness discipline as _run_gauge
         c.run(
-            f"SECANTUS_PGJDBC_SHARD={shard} uv run --no-sync python -m pgjdbc_validation.runner",
+            f"SECANTUS_GAUGE_SERVER={server} SECANTUS_PGJDBC_SHARD={shard} "
+            "uv run --no-sync python -m pgjdbc_validation.runner",
             pty=PTY,
             warn=True,  # failing tests still produce the raw artifact — the deliverable
         )
@@ -1629,8 +1663,9 @@ def validate_pgjdbc(c: Context, shard: str = "") -> None:
     _run_gauge(
         c,
         module="pgjdbc_validation.runner",
-        raw=".validation/pgjdbc-raw.json",
-        report="docs/validation-report-pgjdbc.md",
+        raw=f".validation/pgjdbc-raw{suffix}.json",
+        report=f"docs/validation-report-pgjdbc{suffix}.md",
+        server=server,
         hint=(
             "A missing `vendor/pgjdbc` submodule, no JDK 21, or a PG-server startup failure is the "
             "usual cause."
@@ -1638,14 +1673,14 @@ def validate_pgjdbc(c: Context, shard: str = "") -> None:
     )
     c.run(
         "uv run --no-sync python -m pgjdbc_validation.generate_report "
-        ".validation/pgjdbc-raw.json docs/validation-report-pgjdbc.md",
+        f".validation/pgjdbc-raw{suffix}.json docs/validation-report-pgjdbc{suffix}.md",
         pty=PTY,
     )
-    print("\nWrote docs/validation-report-pgjdbc.md")
+    print(f"\nWrote docs/validation-report-pgjdbc{suffix}.md")
 
 
 @task(name="validate-pgjdbc-report")
-def validate_pgjdbc_report(c: Context) -> None:
+def validate_pgjdbc_report(c: Context, server: str = "python") -> None:
     """Merge a COMPLETE set of pgjdbc shard raws into the conformance report.
 
     Counterpart of ``validate-pgjdbc --shard K/N``: expects every
@@ -1661,18 +1696,28 @@ def validate_pgjdbc_report(c: Context) -> None:
     import glob
     import pathlib
 
+    suffix = _sql_gauge_suffix(server)
+    report = f"docs/validation-report-pgjdbc{suffix}.md"
+    # One server's shards only: a Python glob would otherwise also match the
+    # Rust server's `-rust-server` shard files.
+    shards = sorted(
+        f
+        for f in glob.glob(f".validation/pgjdbc-raw-shard-*{suffix}.json")
+        if server == "rust" or not f.endswith("-rust-server.json")
+    )
+    if not shards:
+        raise SystemExit(f"no .validation/pgjdbc-raw-shard-*{suffix}.json to merge")
     c.run(
-        "uv run --no-sync python -m pgjdbc_validation.generate_report "
-        ".validation/pgjdbc-raw-shard-*.json docs/validation-report-pgjdbc.md",
+        f"uv run --no-sync python -m pgjdbc_validation.generate_report {' '.join(shards)} {report}",
         pty=PTY,
     )
-    for consumed in glob.glob(".validation/pgjdbc-raw-shard-*.json"):
+    for consumed in shards:
         pathlib.Path(consumed).unlink()
-    print("\nWrote docs/validation-report-pgjdbc.md (shard raws consumed)")
+    print(f"\nWrote {report} (shard raws consumed)")
 
 
 @task(name="validate-pgtest")
-def validate_pgtest(c: Context) -> None:
+def validate_pgtest(c: Context, server: str = "python") -> None:
     """Run CockroachDB's pgtest wire corpus against a SecantusPGServer daemon.
 
     The SQL-server wire-protocol gauge (tasks/sql-gauges-plan.md G3): ~54
@@ -1680,13 +1725,16 @@ def validate_pgtest(c: Context) -> None:
     pkg/testutils/pgtest runner verbatim. Corpus + runner are fetched at a
     pinned commit via a sparse blob-filtered clone (cached under
     .validation/) — never vendored. Requires go + network on first run.
-    Generates docs/validation-report-pgtest.md. Python server only.
+    Generates docs/validation-report-pgtest.md, or ...-rust-server.md with
+    ``--server rust`` (``secantusd-pg``).
     """
+    suffix = _sql_gauge_suffix(server)
     _run_gauge(
         c,
         module="pgtest_validation.runner",
-        raw=".validation/pgtest-raw.json",
-        report="docs/validation-report-pgtest.md",
+        raw=f".validation/pgtest-raw{suffix}.json",
+        report=f"docs/validation-report-pgtest{suffix}.md",
+        server=server,
         hint=(
             "Missing `go`, no network for the pinned cockroach fetch, or a "
             "PG-server startup failure is the usual cause."
@@ -1694,30 +1742,33 @@ def validate_pgtest(c: Context) -> None:
     )
     c.run(
         "uv run --no-sync python -m pgtest_validation.generate_report "
-        ".validation/pgtest-raw.json docs/validation-report-pgtest.md",
+        f".validation/pgtest-raw{suffix}.json docs/validation-report-pgtest{suffix}.md",
         pty=PTY,
     )
-    print("\nWrote docs/validation-report-pgtest.md")
+    print(f"\nWrote docs/validation-report-pgtest{suffix}.md")
 
 
 @task(name="validate-pgx")
-def validate_pgx(c: Context) -> None:
+def validate_pgx(c: Context, server: str = "python") -> None:
     """Run jackc/pgx's pgconn + pgproto3 tests against a SecantusPGServer daemon.
 
     The SQL-server low-level Go gauge (tasks/sql-gauges-plan.md G4): the
     strictest hand-rolled pgwire client, run unmodified from vendor/pgx via
     PGX_TEST_DATABASE. Requires the Go toolchain. Generates
-    docs/validation-report-pgx.md. Python server only.
+    docs/validation-report-pgx.md, or ...-rust-server.md with
+    ``--server rust`` (``secantusd-pg``).
     """
     import pathlib
 
+    suffix = _sql_gauge_suffix(server)
     if not pathlib.Path("vendor/pgx/pgconn").exists():
         c.run("git submodule update --init vendor/pgx", pty=PTY)
     _run_gauge(
         c,
         module="pgx_validation.runner",
-        raw=".validation/pgx-raw.json",
-        report="docs/validation-report-pgx.md",
+        raw=f".validation/pgx-raw{suffix}.json",
+        report=f"docs/validation-report-pgx{suffix}.md",
+        server=server,
         hint=(
             "A missing `vendor/pgx` submodule, missing `go`, or a PG-server "
             "startup failure is the usual cause."
@@ -1725,31 +1776,33 @@ def validate_pgx(c: Context) -> None:
     )
     c.run(
         "uv run --no-sync python -m pgx_validation.generate_report "
-        ".validation/pgx-raw.json docs/validation-report-pgx.md",
+        f".validation/pgx-raw{suffix}.json docs/validation-report-pgx{suffix}.md",
         pty=PTY,
     )
-    print("\nWrote docs/validation-report-pgx.md")
+    print(f"\nWrote docs/validation-report-pgx{suffix}.md")
 
 
 @task(name="validate-slt")
-def validate_slt(c: Context) -> None:
+def validate_slt(c: Context, server: str = "python") -> None:
     """Run the sqllogictest corpus against a SecantusPGServer daemon.
 
     The SQL-server correctness gauge (tasks/sql-gauges-plan.md G1): the
     SQLite-originated sqllogictest corpus, vendored unmodified, executed by
     sqllogictest-rs (``cargo install sqllogictest-bin``) over real pgwire —
-    one fresh daemon per file. Generates docs/validation-report-slt.md.
-    Python server only — the Rust server has no SQL front end.
+    one fresh daemon per file. Generates docs/validation-report-slt.md, or
+    ...-rust-server.md with ``--server rust`` (``secantusd-pg``).
     """
     import pathlib
 
+    suffix = _sql_gauge_suffix(server)
     if not pathlib.Path("vendor/sqllogictest/test").exists():
         c.run("git submodule update --init vendor/sqllogictest", pty=PTY)
     _run_gauge(
         c,
         module="slt_validation.runner",
-        raw=".validation/slt-raw.json",
-        report="docs/validation-report-slt.md",
+        raw=f".validation/slt-raw{suffix}.json",
+        report=f"docs/validation-report-slt{suffix}.md",
+        server=server,
         hint=(
             "A missing `vendor/sqllogictest` submodule or PG-server startup failure is the usual "
             "cause."
@@ -1757,10 +1810,10 @@ def validate_slt(c: Context) -> None:
     )
     c.run(
         "uv run --no-sync python -m slt_validation.generate_report "
-        ".validation/slt-raw.json docs/validation-report-slt.md",
+        f".validation/slt-raw{suffix}.json docs/validation-report-slt{suffix}.md",
         pty=PTY,
     )
-    print("\nWrote docs/validation-report-slt.md")
+    print(f"\nWrote docs/validation-report-slt{suffix}.md")
 
 
 @task(name="validate-ruby")

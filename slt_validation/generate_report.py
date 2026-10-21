@@ -16,6 +16,8 @@ import json
 import re
 from pathlib import Path
 
+import pg_gauge_server
+
 from .include_paths import EXPECTED_DIVERGENCES
 
 
@@ -66,7 +68,8 @@ def main() -> int:
     lines.append("# sqllogictest conformance report")
     lines.append("")
     lines.append(
-        f"SecantusDB (Python server) {_secantus_version()} · corpus `gregrahn/sqllogictest` "
+        f"{pg_gauge_server.server_line(args.out, _secantus_version())} · "
+        "corpus `gregrahn/sqllogictest` "
         f"@ `{_corpus_rev()}` · sqllogictest-rs over pgwire · "
         f"{dt.date.today().isoformat()}"
     )
@@ -76,7 +79,10 @@ def main() -> int:
         f"({len(expected)} expected divergences, {len(unexpected)} unexpected failures)."
     )
     lines.append("")
-    lines.append("Regenerate with `uv run python -m invoke validate-slt`.")
+    lines.append(
+        "Regenerate with `uv run python -m invoke validate-slt --server "
+        f"{'rust' if pg_gauge_server.is_rust_report(args.out) else 'python'}`."
+    )
     lines.append("")
     lines.append("| lane | file | result | seconds |")
     lines.append("|---|---|---|---:|")

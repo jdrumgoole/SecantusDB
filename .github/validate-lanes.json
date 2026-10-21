@@ -63,5 +63,65 @@
     "name": "dotnet-rust-server",
     "task": "validate-dotnet --server rust",
     "report": "docs/validation-report-dotnet-rust-server.md"
+  },
+  {
+    "name": "psycopg-rust-server",
+    "pg": true,
+    "task": "validate-psycopg --server rust",
+    "report": "docs/validation-report-psycopg-rust-server.md"
+  },
+  {
+    "name": "sqlalchemy-rust-server",
+    "pg": true,
+    "task": "validate-sqlalchemy --server rust",
+    "report": "docs/validation-report-sqlalchemy-rust-server.md"
+  },
+  {
+    "name": "sql-stress-rust-server",
+    "pg": true,
+    "task": "sql-stress --server rust",
+    "report": "docs/validation-report-sqlstress-rust-server.md"
+  },
+  {
+    "name": "pgjdbc-rust-server-1",
+    "group": "pgjdbc-rust-server",
+    "pg": true,
+    "task": "validate-pgjdbc --server rust --shard 1/4"
+  },
+  {
+    "name": "pgjdbc-rust-server-2",
+    "group": "pgjdbc-rust-server",
+    "pg": true,
+    "task": "validate-pgjdbc --server rust --shard 2/4"
+  },
+  {
+    "name": "pgjdbc-rust-server-3",
+    "group": "pgjdbc-rust-server",
+    "pg": true,
+    "task": "validate-pgjdbc --server rust --shard 3/4"
+  },
+  {
+    "name": "pgjdbc-rust-server-4",
+    "group": "pgjdbc-rust-server",
+    "pg": true,
+    "task": "validate-pgjdbc --server rust --shard 4/4"
+  },
+  {
+    "name": "pgtest-rust-server",
+    "pg": true,
+    "task": "validate-pgtest --server rust",
+    "report": "docs/validation-report-pgtest-rust-server.md"
+  },
+  {
+    "name": "pgx-rust-server",
+    "pg": true,
+    "task": "validate-pgx --server rust",
+    "report": "docs/validation-report-pgx-rust-server.md"
+  },
+  {
+    "name": "slt-rust-server",
+    "pg": true,
+    "task": "validate-slt --server rust",
+    "report": "docs/validation-report-slt-rust-server.md"
   }
 ]

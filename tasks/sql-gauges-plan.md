@@ -1,5 +1,13 @@
 # SQL server external conformance gauges plan
 
+> **Server change, 2026-10-21.** Every number and "weekly in `validate.yml`"
+> below was measured on the deprecated Python PostgreSQL server. The weekly
+> lanes now measure the Rust server, `secantusd-pg` (`--server rust`, the
+> `*-rust-server` lanes and `docs/validation-report-*-rust-server.md`). Its
+> first sqllogictest run: 40 of 60 lane-files pass. PostgreSQL 15.19 itself
+> fails 9 of the 30 files (all expected divergences now), and the Rust server
+> fails one more, RP-075 (`tasks/backlog-rust-postgres.md`).
+
 **Status: SIX gauges landed; portfolio open** (headline corrected 2026-08-20 — it
 still said "first two" while four more had shipped). `tasks.py` defines
 `validate-slt`, `validate-psycopg`, `validate-sqlalchemy`, `validate-pgjdbc`,

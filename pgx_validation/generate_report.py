@@ -18,6 +18,7 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
+import pg_gauge_server
 from validation_summary.rates import pass_rate
 
 
@@ -73,7 +74,7 @@ def main() -> None:
     lines = [
         "# pgx (pgconn + pgproto3) conformance report",
         "",
-        f"- SecantusDB (Python server) {_secantus_version()}",
+        f"- {pg_gauge_server.server_line(args.output_md, _secantus_version())}",
         f"- suite: vendor/pgx @ {_pgx_version()} (`go test`, unmodified)",
         f"- generated: {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
         "",

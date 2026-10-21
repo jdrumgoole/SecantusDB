@@ -877,6 +877,56 @@ Not filed:
       Backlog-ID: RP-074
       Verify: tests/backlog/test_rp_found_2026_10_20.py::test_smaller_answers
 
+## Found by the weekly SQL gauges
+
+Found by the first run of the weekly SQL gauges against `secantusd-pg`
+(`validate.yml`, 2026-10-21). Each was reproduced against a `secantusd-pg`
+built from the run's tree and against a PRIVATE PostgreSQL 15.19 cluster
+(`initdb --locale=C -E UTF8`). The gap tests are in
+`tests/backlog/test_rp_found_2026_10_21.py`.
+
+Not filed: PostgreSQL 15.19 itself fails 9 of the gauge's 30 files, on
+SQLite-only behaviour the corpus expects, and they are recorded as expected
+divergences in `slt_validation/include_paths.py`. The Rust server fails the
+same 9, and stops at the same statement as PostgreSQL in 8 of them; the
+ninth, `random/expr/slt_good_0.test`, is RP-076. Because a file stops at its
+first failure, the rest of each of those 9 files is measured by neither
+server.
+
+- [ ] **A strict operator with a NULL constant argument is evaluated row by
+      row instead of folding to NULL, so `c / 0 = NULL` raises.** On a table
+      with rows, `select count(*) from t where c / 0 = NULL` is 22012
+      `division by zero` here. PostgreSQL 15.19 returns 0: its planner folds
+      a strict operator or function that has a NULL constant argument to NULL
+      before execution (`eval_const_expressions`), so the plan is
+      `One-Time Filter: false` and the division never runs. The same holds
+      for `NULL = c / 0`, `c / 0 + NULL > 1`, the comparison in a select
+      list, and under `AND` / `OR`. A non-strict test (`c / 0 IS NULL`) and a
+      comparison with a column (`c / 0 = d`) still raise 22012 on PostgreSQL,
+      so the fix is the folding rule, not tolerating the error. Found by
+      `random/aggregates/slt_good_1.test:66475`
+      (`WHERE ( + col1 ) / - + 0 = NULL`), the sqllogictest gauge's one
+      unexpected failure that PostgreSQL passes.
+      Backlog-ID: RP-075
+      Verify: tests/backlog/test_rp_found_2026_10_21.py::test_strict_null_folding
+- [ ] **`NULLIF` takes its first argument's type even when PostgreSQL
+      coerces it, so `nullif(53, 80::numeric) / -71` is integer division.**
+      Here `pg_typeof(nullif(53, 80::numeric))` is `integer` and the
+      division returns `0`. PostgreSQL 15.19 gives NULLIF the left input type
+      of the `=` operator it resolves: `int = numeric` resolves to
+      `numeric = numeric`, so the result is `numeric` and the division is
+      `-0.74647887323943661972`. The same for `nullif(53, 80.5)` (numeric)
+      and `nullif(1, 2::float8)` (double precision). The rule is the
+      operator's input type, not promotion: `nullif(1::int2, 2::int8)` stays
+      `smallint` on PostgreSQL, through the cross-type `int28eq`, and the
+      Rust server already agrees there. A silent wrong answer. Found by
+      `random/expr/slt_good_0.test:45345`, where PostgreSQL stops on the
+      corpus's SQLite answer `0` and the Rust server, giving that same wrong
+      answer, runs on to line 62223. The file is an expected divergence, so
+      this showed up only as a different stop point.
+      Backlog-ID: RP-076
+      Verify: tests/backlog/test_rp_found_2026_10_21.py::test_nullif_result_type
+
 ## Code structure (2026-10-19)
 
 - [ ] **Rust PG server: `PgHandler` holds every piece of session state in

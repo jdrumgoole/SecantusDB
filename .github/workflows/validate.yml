@@ -2,16 +2,14 @@ name: Validate (driver conformance)
 
 # Runs the vendored MongoDB driver test suites (pymongo, pymongo-async, go,
 # node, java, kotlin, ruby, rust, php-lib, php-ext, c, cxx, dotnet), each
-# unmodified, against the Rust MongoDB server (the `*-rust-server` lanes) and
-# regenerates the per-driver `docs/validation-report*-rust-server.md` files.
-#
-# The lanes against the Python servers, and the SQL lanes (psycopg,
-# sqlalchemy, sql-stress, pgjdbc, pgtest, pgx, slt), which all ran against the
-# Python PostgreSQL server, stopped with the Python servers' full deprecation
-# (2026-10-20). No weekly SQL gauge runs against the Rust PostgreSQL server
-# yet. Slow (~10–15 min per driver on
-# a fresh WT build) so this is NOT on every push — it runs weekly on
-# Monday and can be triggered manually.
+# unmodified, against the Rust MongoDB server, and the SQL gauges (psycopg,
+# sqlalchemy, sql-stress, pgjdbc, pgtest, pgx, slt) against the Rust
+# PostgreSQL server, `secantusd-pg` (the SQL lanes carry `"pg": true` in
+# .github/validate-lanes.json). Every lane is a `*-rust-server` lane and
+# regenerates its `docs/validation-report*-rust-server.md`. The lanes against
+# the Python servers stopped with their full deprecation (2026-10-20).
+# Slow (~10–15 min per driver on a fresh WT build) so this is NOT on every
+# push — it runs weekly on Monday and can be triggered manually.
 #
 # Layout: each driver gauge runs as its own matrix entry on a fresh
 # runner with only the toolchain it needs. The `aggregate` job that
@@ -28,8 +26,8 @@ on:
     inputs:
       only:
         description: >-
-          Comma-separated lane names to run (e.g. "rust-rust-server" or
-          "go-rust-server,c-rust-server"). Empty = every lane. Single-lane dispatches are
+          Comma-separated lane or group names to run (e.g. "rust-rust-server",
+          "go-rust-server,c-rust-server" or "pgjdbc-rust-server"). Empty = every lane. Single-lane dispatches are
           how a wedged or flaky gauge gets diagnosed without burning the
           whole matrix; the aggregate/report PR step is skipped
           for filtered runs (a partial artifact set must never overwrite
@@ -89,8 +87,11 @@ jobs:
     # gauge spent two consecutive weekly runs crawling to the 6h kill (cold
     # cargo cache + per-filter timeouts compounding — see rust_validation/
     # runner.py's pre-build note). The slowest healthy lane (cxx cold build)
-    # is ~30-40 min; 2h is generous headroom for any cold cache.
-    timeout-minutes: 120
+    # is ~30-40 min; 2h is generous headroom for any cold cache. The slt lane
+    # runs 60 files twice (simple and extended protocol), a fresh server per
+    # file; 5h was its calibration on the Python server, kept until a run of
+    # the Rust server measures it.
+    timeout-minutes: ${{ matrix.driver.name == 'slt-rust-server' && 300 || 120 }}
     strategy:
       fail-fast: false
       matrix:
@@ -142,6 +143,30 @@ jobs:
         env:
           SKBUILD_CMAKE_DEFINE: SECANTUS_BUILD_STORAGE_ENGINE=ON
         run: uv sync --extra dev
+
+      # The SQL lanes measure the Rust PostgreSQL server, which builds from
+      # its own directory against the WiredTiger the sync above built. The
+      # gauges run the debug binary (`pg_gauge_server.RUST_BINARY`) and refuse
+      # one not built from this tree, so it is built here rather than cached.
+      - name: Build secantusd-pg
+        if: matrix.driver.pg
+        shell: bash
+        run: |
+          WT="$PWD/$(ls -d build/*/wt-build | head -1)"
+          export SECANTUS_WT_INCLUDE="$WT/include" SECANTUS_WT_LIB="$WT"
+          # bindgen needs libclang; find it wherever the runner's LLVM put it.
+          lc="$(find /usr/lib /usr/lib64 \( -name 'libclang.so*' -o -name 'libclang-[0-9]*.so*' \) 2>/dev/null | sort | head -1)"
+          test -n "$lc" || { echo "libclang not found" >&2; exit 1; }
+          export LIBCLANG_PATH="$(dirname "$lc")"
+          (cd crates/secantus-pg && cargo build --bin secantusd-pg)
+          test -x crates/secantus-pg/target/debug/secantusd-pg
+
+      # The sql-stress smoke drives unmodified pgbench + psql.
+      - name: Install pgbench + psql
+        if: matrix.driver.name == 'sql-stress-rust-server'
+        uses: ./.github/actions/apt-install
+        with:
+          packages: postgresql-contrib postgresql-client
 
       # The C gauge builds the vendored mongo-c-driver's test-libmongoc
       # binary from source (CMake): needs cmake + OpenSSL headers. A C
@@ -207,7 +232,7 @@ jobs:
             ${{ runner.os }}-nuget-
 
       - name: Set up Go
-        if: matrix.driver.name == 'go-rust-server'
+        if: matrix.driver.name == 'go-rust-server' || matrix.driver.name == 'pgx-rust-server' || matrix.driver.name == 'pgtest-rust-server'
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version: "1.25"
@@ -245,14 +270,14 @@ jobs:
             ${{ runner.os }}-node-modules-
 
       - name: Set up JDK
-        if: matrix.driver.name == 'java-rust-server' || matrix.driver.name == 'kotlin-rust-server'
+        if: matrix.driver.name == 'java-rust-server' || matrix.driver.name == 'kotlin-rust-server' || startsWith(matrix.driver.name, 'pgjdbc')
         uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6  # v5
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Cache Gradle caches + wrapper
-        if: matrix.driver.name == 'java-rust-server' || matrix.driver.name == 'kotlin-rust-server'
+        if: matrix.driver.name == 'java-rust-server' || matrix.driver.name == 'kotlin-rust-server' || startsWith(matrix.driver.name, 'pgjdbc')
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: |
@@ -291,6 +316,26 @@ jobs:
           # ahead of that as of writing.
           toolchain: stable
 
+      # The slt gauge's runner binary. Cached by pinned version so the
+      # ~3-min cargo build only happens when the pin moves; the version pin
+      # mirrors the psycopg==3.3.4 discipline (the gauge measures SecantusDB,
+      # not runner drift). slt_validation/runner.py falls back to
+      # ~/.cargo/bin/sqllogictest, which is where cargo install puts it.
+      - name: Cache sqllogictest binary
+        if: matrix.driver.name == 'slt-rust-server'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cargo/bin/sqllogictest
+          key: ${{ runner.os }}-sqllogictest-bin-0.29.1
+
+      - name: Install sqllogictest-rs
+        if: matrix.driver.name == 'slt-rust-server'
+        run: |
+          if [ ! -x ~/.cargo/bin/sqllogictest ]; then
+            cargo install sqllogictest-bin --version 0.29.1 --locked
+          fi
+          ~/.cargo/bin/sqllogictest --version
+
       # Split restore/save (not plain actions/cache) so a failed or killed
       # job STILL saves the compiled target. The plain form only saves on
       # job success, which is how the rust gauge wedged itself for two
@@ -328,6 +373,10 @@ jobs:
           # gauge_common.rust_binary()'s default search only covers the cargo
           # target dir; the storage-engine sync stages the daemon in .venv/bin.
           SECANTUSDB_BIN: .venv/bin/secantusd-rs
+          # The 2-core runner executes slt files 5-10x slower than a dev
+          # machine; 300s (the local calibration) timed out ~15 files that
+          # passed locally in ~25s each on the first weekly slt run.
+          SECANTUS_SLT_FILE_TIMEOUT: ${{ matrix.driver.name == 'slt-rust-server' && '900' || '' }}
         run: uv run python -m invoke ${{ matrix.driver.task }}
 
       # Companion of the split restore above: persist the compiled driver
@@ -344,13 +393,20 @@ jobs:
             vendor/mongo-rust-driver/target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
+      # The steps below run when the gauge step FAILED too (`!cancelled()`).
+      # A gauge whose generator exits non-zero on unexpected failures (slt
+      # does) still wrote its report, and that report is the finding: when
+      # these steps were skipped, a red lane's numbers never reached the
+      # reports PR, so a regression removed its own evidence. The lane stays
+      # red; a lane that wrote nothing fails again here on the missing file.
       - name: Show report summary
+        if: ${{ !cancelled() && matrix.driver.report != '' }}
         run: head -50 ${{ matrix.driver.report }}
 
       - name: Upload report artifact
         # Shard lanes (a `group` without a `report`) produce only a raw
         # artifact; their group's merge job renders the report.
-        if: matrix.driver.report != ''
+        if: ${{ !cancelled() && matrix.driver.report != '' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: report-${{ matrix.driver.name }}
@@ -362,6 +418,7 @@ jobs:
       # executes exactly one gauge, so its .validation/ holds only that gauge's
       # artifacts.
       - name: Upload raw gauge output
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: raw-${{ matrix.driver.name }}
@@ -373,9 +430,67 @@ jobs:
           # regenerated from an empty .validation/ — "the 0 gauges").
           include-hidden-files: true
 
+  pgjdbc-report:
+    name: Merge pgjdbc shards into the report
+    needs: [plan, validate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # `always()` so one red shard still yields a merged report of whatever
+    # completed — the generator itself refuses an INCOMPLETE shard set, so a
+    # missing shard fails here loudly instead of shipping a short denominator.
+    if: >-
+      always() && !cancelled() &&
+      contains(needs.plan.outputs.matrix, 'pgjdbc-rust-server-1')
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Download pgjdbc shard raws
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: raw-pgjdbc-rust-server-*
+          path: artifacts
+
+      - name: Reassemble .validation
+        run: |
+          shopt -s nullglob
+          mkdir -p .validation
+          staged=0
+          for d in artifacts/raw-pgjdbc-rust-server-*/; do
+            cp -R "$d". .validation/
+            staged=$((staged + 1))
+          done
+          if [ "$staged" -eq 0 ]; then
+            echo "::error::no pgjdbc shard raw artifacts found — the shard jobs uploaded nothing"
+            exit 1
+          fi
+          ls .validation/
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Merge shards into the report
+        # --no-project: the generator is stdlib-only (it reads the server's
+        # version from its Cargo.toml), so no WT build is needed here.
+        run: |
+          PYTHONPATH=. uv run --no-project python -m pgjdbc_validation.generate_report \
+            .validation/pgjdbc-raw-shard-*-rust-server.json docs/validation-report-pgjdbc-rust-server.md
+
+      - name: Upload merged report artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: report-pgjdbc-rust-server
+          path: docs/validation-report-pgjdbc-rust-server.md
+          if-no-files-found: error
+
   aggregate:
     name: Aggregate reports and open PR
-    needs: [validate]
+    needs: [validate, pgjdbc-report]
     runs-on: ubuntu-latest
     # `always()` so the aggregate step runs even if one driver gauge fails —
     # we still want to ship the reports for the gauges that did succeed so a
@@ -470,8 +585,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
           git add docs/validation-report*.md docs/validation-summary.md
-          git commit -m "Refresh validation reports + cross-driver summary (driver gauges against the Rust MongoDB server)"
+          git commit -m "Refresh validation reports + cross-driver summary (driver gauges against the Rust MongoDB server, SQL gauges against the Rust PostgreSQL server)"
           git push -u origin "$branch"
           gh pr create \
             --title "Refresh validation reports" \
-            --body "Automated weekly refresh of every driver-conformance validation report, each MongoDB driver's own suite against the Rust MongoDB server (the \`*-rust-server\` lanes). The cross-driver summary (docs/validation-summary.md) is regenerated from the same run's raw artifacts. Inspect the per-category numbers for regressions or new pass-rate wins. Per-driver gauges ran in parallel; check each gauge's job log for the underlying pytest / mocha / rspec / gradle / go-test / cargo-test / phpunit / run-tests.php / dotnet-test output."
+            --body "Automated weekly refresh of every driver-conformance validation report, each MongoDB driver's own suite against the Rust MongoDB server and each SQL gauge against the Rust PostgreSQL server (the \`*-rust-server\` lanes). The cross-driver summary (docs/validation-summary.md) is regenerated from the same run's raw artifacts. Inspect the per-category numbers for regressions or new pass-rate wins. Per-driver gauges ran in parallel; check each gauge's job log for the underlying pytest / mocha / rspec / gradle / go-test / cargo-test / phpunit / run-tests.php / dotnet-test / pgbench / sqllogictest output."

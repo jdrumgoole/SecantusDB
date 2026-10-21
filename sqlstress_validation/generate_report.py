@@ -13,6 +13,8 @@ import json
 import re
 from pathlib import Path
 
+import pg_gauge_server
+
 
 def _secantus_version() -> str:
     try:
@@ -37,7 +39,7 @@ def main() -> None:
     lines = [
         "# pgbench + psql stress/smoke report",
         "",
-        f"- SecantusDB (Python server) {_secantus_version()}",
+        f"- {pg_gauge_server.server_line(args.output_md, _secantus_version())}",
         "- pgbench TPC-B (simple / extended / prepared) + select-only + psql catalog smoke",
         f"- generated: {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
         "",

@@ -1,6 +1,7 @@
-"""Which PostgreSQL server a PG gauge drives: the Python reference server
-(the default) or the Rust one, chosen by ``SECANTUS_GAUGE_SERVER`` the way
+"""Which PostgreSQL server a PG gauge drives: the Python server (the default,
+deprecated) or the Rust one, chosen by ``SECANTUS_GAUGE_SERVER`` the way
 the MongoDB gauges and the psycopg / sqllogictest gauges already choose.
+The weekly ``validate.yml`` lanes measure the Rust one.
 
 The Rust server's results go to a ``-rust-server`` sibling of the gauge's
 raw report, so a Rust run never overwrites the Python server's published
@@ -12,6 +13,7 @@ website.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -40,6 +42,28 @@ def raw_out(path: Path) -> Path:
     if which() == "python":
         return path
     return path.with_name(f"{path.stem}-rust-server{path.suffix}")
+
+
+def is_rust_report(report: str | Path) -> bool:
+    """Whether ``report`` is a Rust-server report: its name ends ``-rust-server``,
+    the suffix every Rust-server raw and report carries."""
+    return Path(report).stem.endswith("-rust-server")
+
+
+def rust_version() -> str:
+    """The Rust PostgreSQL server's version, from its crate's ``Cargo.toml``
+    (its own version line, not the MongoDB server's)."""
+    toml = (REPO_ROOT / "crates" / "secantus-pg" / "Cargo.toml").read_text()
+    m = re.search(r'^version\s*=\s*"([^"]+)"', toml, re.MULTILINE)
+    return m.group(1) if m else "unknown"
+
+
+def server_line(report: str | Path, python_version: str) -> str:
+    """The "which server was measured" line a report prints, chosen by the
+    report's own name, so a Rust run can never be labelled the Python server."""
+    if is_rust_report(report):
+        return f"SecantusDB (Rust PostgreSQL server, `secantusd-pg`) {rust_version()}"
+    return f"SecantusDB (Python server) {python_version}"
 
 
 def daemon_argv(host: str, port: int, storage_dir: str) -> list[str]:

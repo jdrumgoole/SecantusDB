@@ -106,7 +106,7 @@ def _shard_classes(classes: list[str], n: int) -> list[list[str]]:
 def _raw_out_path(shard: tuple[int, int] | None) -> Path:
     if shard is None:
         return RAW_OUT
-    return REPO_ROOT / ".validation" / f"pgjdbc-raw-shard-{shard[0]}.json"
+    return pg_gauge_server.raw_out(REPO_ROOT / ".validation" / f"pgjdbc-raw-shard-{shard[0]}.json")
 
 
 def _pick_ephemeral_port() -> int:

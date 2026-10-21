@@ -18,6 +18,7 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
+import pg_gauge_server
 from validation_summary.rates import pass_rate
 
 
@@ -81,7 +82,7 @@ def main() -> None:
     lines = [
         "# SQLAlchemy dialect-compliance report",
         "",
-        f"- SecantusDB (Python server) {_secantus_version()}",
+        f"- {pg_gauge_server.server_line(args.output_md, _secantus_version())}",
         f"- suite: sqlalchemy.testing.suite @ SQLAlchemy {_sqlalchemy_version()}, "
         "postgresql+psycopg dialect",
         f"- generated: {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
