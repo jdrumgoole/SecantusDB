@@ -1536,6 +1536,16 @@ fn transaction_statement_tag(sql: &str) -> Option<&'static str> {
     })
 }
 
+/// Whether `sql` ends a transaction block (`IsTransactionExitStmt`): COMMIT,
+/// ROLLBACK, ROLLBACK TO and PREPARE TRANSACTION, the statements an aborted
+/// block still takes through Parse and Bind.
+fn exits_transaction(sql: &str) -> bool {
+    matches!(
+        transaction_statement_tag(sql),
+        Some("COMMIT" | "ROLLBACK" | "PREPARE TRANSACTION")
+    )
+}
+
 /// The interpreter's error as a wire error.
 fn wire_pl_error(e: plpgsql_fn::PlError) -> PgWireError {
     let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate, e.message);
@@ -5131,6 +5141,79 @@ impl PgHandler {
                     })
             })
             .collect()
+    }
+
+    /// Parse analysis for an extended-protocol Parse: the raw parse of every
+    /// statement, and for the statements PostgreSQL analyses there (SELECT,
+    /// INSERT, UPDATE, DELETE, MERGE and VALUES; utility statements wait for
+    /// Execute), the describe pass that resolves its names and types.
+    fn analyse_at_parse(&self, stmt: &StoredStatement<ParsedStatement>) -> PgWireResult<()> {
+        use pg_query::protobuf::node::Node as N;
+        let sql = &stmt.statement.sql;
+        if is_empty_query(sql.trim().trim_end_matches(';').trim()) {
+            return Ok(());
+        }
+        let analysed = match pg_query::parse(sql) {
+            Ok(parsed) => {
+                parsed.protobuf.stmts.len() == 1
+                    && matches!(
+                        parsed.protobuf.stmts[0]
+                            .stmt
+                            .as_ref()
+                            .and_then(|s| s.node.as_ref()),
+                        Some(
+                            N::SelectStmt(_)
+                                | N::InsertStmt(_)
+                                | N::UpdateStmt(_)
+                                | N::DeleteStmt(_)
+                                | N::MergeStmt(_)
+                        )
+                    )
+            }
+            // The describe pass reports a syntax error as Describe would.
+            Err(_) => true,
+        };
+        if !analysed {
+            return Ok(());
+        }
+        self.install_user_types();
+        // Each undeclared parameter takes the type its first typed use gives
+        // it, as `parse_analyze_varparams` fixes it: `$1::int` makes `$1` an
+        // integer for every other use, so `lower($1)` beside it is 42883.
+        let declared = self.param_type_names(stmt);
+        let column_type = |table: &str, column: secantus_pgplan::ColumnRef<'_>| {
+            self.lookup(table).and_then(|def| {
+                let col = match column {
+                    secantus_pgplan::ColumnRef::Name(name) => def.column(name),
+                    secantus_pgplan::ColumnRef::Position(pos) => def.columns.get(pos),
+                };
+                col.map(|c| c.pg_type.clone())
+            })
+        };
+        let inferred = secantus_pgplan::catalog_param_types_opt(sql, &declared, &column_type);
+        let param_types: Vec<Option<String>> = declared
+            .iter()
+            .enumerate()
+            .map(|(i, d)| d.clone().or_else(|| inferred.get(i).cloned().flatten()))
+            .collect();
+        match self.describe_fields(sql, param_types.len(), &param_types) {
+            Ok(_) => Ok(()),
+            // Only what analysis itself raises: the names and types (class
+            // 42) and a literal that does not read as its type (22P02).
+            // Whatever folding constants raises (`1/0`) is the plan's, at
+            // Bind or Execute, and so is a refusal (0A000) of this server's.
+            Err(PgWireError::UserError(info))
+                if info.code.starts_with("42") || info.code == "22P02" =>
+            {
+                let e = PgWireError::UserError(info);
+                let map = self.string_map(sql);
+                Err(Self::restore_position(
+                    Self::syntax_positioned(e, sql),
+                    map.as_ref(),
+                ))
+            }
+            Err(_) => Ok(()),
+        }
     }
 
     /// The `pg_prepared_statements` row for a freshly parsed NAMED statement.
@@ -20681,8 +20764,29 @@ fn type_size(ty: &Type) -> i16 {
     match *ty {
         Type::BOOL | Type::CHAR => 1,
         Type::INT2 => 2,
-        Type::INT4 | Type::FLOAT4 | Type::DATE | Type::OID | Type::REGTYPE | Type::REGCLASS => 4,
+        Type::INT4
+        | Type::FLOAT4
+        | Type::DATE
+        | Type::OID
+        | Type::XID
+        | Type::CID
+        | Type::VOID
+        | Type::REGTYPE
+        | Type::REGCLASS
+        | Type::REGPROC
+        | Type::REGPROCEDURE
+        | Type::REGOPER
+        | Type::REGOPERATOR
+        | Type::REGNAMESPACE
+        | Type::REGROLE
+        | Type::REGCONFIG
+        | Type::REGDICTIONARY
+        | Type::REGCOLLATION => 4,
+        // An enum is its 4-byte label oid (RP-082).
+        _ if matches!(ty.kind(), postgres_types::Kind::Enum(_)) => 4,
         Type::INT8
+        | Type::MONEY
+        | Type::XID8
         | Type::FLOAT8
         | Type::TIME
         | Type::TIMESTAMP
@@ -21923,7 +22027,8 @@ impl SimpleQueryHandler for PgHandler {
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        self.flush_notifications(client).await
+        self.flush_notifications(client).await?;
+        self.report_pending_params(client).await
     }
 
     /// The query text arrives in the client's `client_encoding`, not
@@ -22067,8 +22172,13 @@ impl SimpleQueryHandler for PgHandler {
             Err(e) => out.and(Err(e)),
         };
         self.flush_notices(_c).await?;
-        // Report any GUC change (TimeZone, ...) so the client tracks it.
-        self.report_pending_params(_c).await?;
+        // A GUC change (TimeZone, ...) is reported after the command tags,
+        // just before ReadyForQuery (`before_ready_for_query`), as
+        // `ReportChangedGUCOptions` does (RP-081). A failed query does not
+        // reach that hook, so its changes go out here, ahead of its error.
+        if out.is_err() {
+            self.report_pending_params(_c).await?;
+        }
         self.settle_failed_commit(_c);
         // A FATAL error (`pg_terminate_backend` on this backend) ends the
         // connection. pgwire's own error path would send a `ReadyForQuery`
@@ -28253,10 +28363,20 @@ impl PgHandler {
             control,
             TransactionControl::Begin(_) | TransactionControl::Start(_)
         );
+        // A BEGIN inside a block is PostgreSQL's WARNING 25001, and the block
+        // goes on as it was: its savepoints, temp-table marks and all
+        // (`BeginTransactionBlock`, RP-084).
+        let nested = opens
+            && self
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed);
+        if nested {
+            self.warning("25001", "there is already a transaction in progress".into());
+        }
         // What the block did to temporary tables and holdable cursors only
         // matters to a PREPARE of THIS block; a new block starts clean. The
         // reset is on the OPEN, not on every control: a PREPARE reads them.
-        if opens {
+        if opens && !nested {
             self.touched_temp
                 .store(false, std::sync::atomic::Ordering::Relaxed);
             self.holdable_declared
@@ -28268,10 +28388,12 @@ impl PgHandler {
             self.pending.clear();
         }
         // Every savepoint belongs to the block that is starting or ending.
-        self.savepoints
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        if !nested {
+            self.savepoints
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
         let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
         // A COMMIT of a FAILED transaction is a rollback, and PostgreSQL says
         // so in the command tag: `ROLLBACK`, not `COMMIT`. A client that
@@ -33868,8 +33990,11 @@ impl PgHandler {
                         &text_schema,
                     )))
                 });
+                let headers = usize::from(header_line.is_some());
                 let data = futures::stream::iter(header_line).chain(data);
-                Ok(vec![Response::CopyOut(CopyResponse::new(code, n, data))])
+                Ok(vec![Response::CopyOut(
+                    CopyResponse::new(code, n, data).with_header_messages(headers),
+                )])
             }
 
             Statement::CreateExtension {
@@ -37335,6 +37460,15 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
     if matches!(*ty, Type::BIT | Type::VARBIT) {
         if let Bson::String(bits) = v {
             return enc.encode_field(&Some(secantus_pgplan::bits::to_wire(bits)));
+        }
+    }
+    // `"char"` is one byte, and the empty text is its zero byte
+    // (`charsend`, RP-085).
+    if *ty == Type::CHAR {
+        if let Bson::String(c) = v {
+            if c.is_empty() {
+                return enc.encode_field(&Some(vec![0u8]));
+            }
         }
     }
     // `int2vector` / `oidvector` send as a one-dimensional array whose lower
@@ -42518,7 +42652,23 @@ impl ExtendedQueryHandler for PgHandler {
         let rewritten = self.apply_string_syntax(&decoded);
         self.flush_notices(client).await?;
         message.query = rewritten?;
+        // An aborted block refuses every Parse but the statements that end
+        // it, as `exec_parse_message` does (RP-079).
+        if self.txn_failed.load(std::sync::atomic::Ordering::Relaxed)
+            && !exits_transaction(&message.query)
+        {
+            return Err(Self::in_failed_transaction());
+        }
         let stmt = StoredStatement::parse(client, &message, parser).await?;
+        // PostgreSQL analyses the statement at Parse (`exec_parse_message`):
+        // a syntax error, an unknown table, column, function or type, and a
+        // parameter whose uses conflict, are the Parse's error, before any
+        // Bind (RP-080, RP-090). The describe pass is that analysis here, and
+        // its answer is cached for the Describe that usually follows.
+        if let Err(e) = self.analyse_at_parse(&stmt) {
+            self.note_failure();
+            return Err(e);
+        }
         // The message's own name, not `stmt.id`: the wire store files the
         // unnamed statement under its `DEFAULT_NAME` placeholder.
         if message.name.as_deref().is_some_and(|n| !n.is_empty()) {
@@ -42659,7 +42809,10 @@ impl ExtendedQueryHandler for PgHandler {
                             (t != Type::VARCHAR || matches!(name, "varchar" | "character varying"))
                                 .then_some(t)
                         })
-                        .unwrap_or(Type::UNKNOWN)
+                        // What analysis leaves unresolved is `text` once it
+                        // succeeds (`select $1`, `$1 = $2`): PostgreSQL
+                        // never describes a parameter as `unknown`.
+                        .unwrap_or(Type::TEXT)
                 })
             })
             .collect();
@@ -42714,6 +42867,7 @@ impl ExtendedQueryHandler for PgHandler {
             self.forget_wire_portals();
         }
         self.flush_notifications(client).await?;
+        self.report_pending_params(client).await?;
         self.end_message_cycle();
         client
             .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
@@ -42774,6 +42928,31 @@ impl ExtendedQueryHandler for PgHandler {
             self.note_failure();
             return Err(PgWireError::StatementNotFound(statement_name.to_owned()));
         };
+        // As `exec_bind_message`: an aborted block binds only the statements
+        // that end it (RP-079).
+        if self.txn_failed.load(std::sync::atomic::Ordering::Relaxed)
+            && !exits_transaction(&statement.statement.sql)
+        {
+            return Err(Self::in_failed_transaction());
+        }
+        // A named portal lasts until it is closed or its transaction ends;
+        // binding over one still open is 42P03, and aborts the block
+        // (`CreatePortal`, RP-089). The unnamed portal is replaced silently.
+        if let Some(name) = message.portal_name.as_deref().filter(|n| !n.is_empty()) {
+            let open = self
+                .wire_portals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(name);
+            if open {
+                self.note_failure();
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "42P03".into(), // duplicate_cursor
+                    format!("portal \"{name}\" already exists"),
+                ))));
+            }
+        }
         let portal = Portal::try_new(&message, statement).inspect_err(|_| self.note_failure())?;
         self.note_wire_portal(
             &portal.name,
@@ -42915,8 +43094,8 @@ impl ExtendedQueryHandler for PgHandler {
         self.flush_notices(_c).await?;
         self.settle_failed_commit(_c);
         let mut responses = result?;
-        // Report any GUC change (TimeZone, DateStyle, ...) the statement made.
-        self.report_pending_params(_c).await?;
+        // A GUC change (TimeZone, DateStyle, ...) is reported at the Sync,
+        // before its ReadyForQuery (RP-081).
         // One portal is one statement, so exactly one response.
         self.apply_mixed_formats(responses.remove(0))
     }
