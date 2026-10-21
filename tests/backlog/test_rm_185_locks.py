@@ -7,11 +7,37 @@ from __future__ import annotations
 import contextlib
 import itertools
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pymongo
 import pytest
+
+
+@pytest.fixture(scope="module")
+def mongod() -> Iterator[Any]:
+    """The reference, with time-based plan yielding off.
+
+    mongod's executor yields -- releases and re-takes its locks -- once an
+    operation has run `internalQueryExecYieldPeriodMS` (10 ms), and each
+    re-take counts. Its builds differ here: on Linux x86-64 (8.2.12, CI, the
+    exemplar build: Joe, 2026-10-21) `$out` reads 7 global IS, on macOS
+    arm64 8 idle and 9 on a loaded machine; with the period off, macOS reads
+    7 as Linux does. So the period is off: the counts are the Linux build's
+    on any machine, and do not move with load."""
+    from tests.mongod_reference import MONGOD, _start_mongod, _stop_mongod
+
+    assert MONGOD, "no mongod on PATH: the reference server is required"
+    proc, uri, dbpath = _start_mongod(
+        extra_args=("--setParameter", "internalQueryExecYieldPeriodMS=86400000")
+    )
+    client = pymongo.MongoClient(uri, serverSelectionTimeoutMS=10_000)
+    try:
+        yield client
+    finally:
+        client.close()
+        _stop_mongod(proc, dbpath)
+
 
 # Internal resources mongod's background threads lock; this server has none.
 _INTERNAL = {"Metadata", "oplog", "MultiDocumentTransactionsBarrier"}
@@ -77,7 +103,13 @@ def _same_counts(got: list, want: list) -> None:
             assert theirs.get(_BUILD_POLLS, 0) >= ours.get(_BUILD_POLLS, 0), label
             ours.pop(_BUILD_POLLS, None)
             theirs.pop(_BUILD_POLLS, None)
-        assert (label, ours) == (label, theirs)
+        assert (label, ours) == (label, theirs), (
+            f"mongod's five runs of {label!r}: {_RUNS.get(label)}"
+        )
+
+
+#: Each case's five reference runs, by label, from the last `_reference`.
+_RUNS: dict[str, list] = {}
 
 
 def _reference(measure: Callable[[Any], list], client: Any) -> list:
@@ -92,6 +124,9 @@ def _reference(measure: Callable[[Any], list], client: Any) -> list:
     for cases in zip(*runs, strict=True):
         label = cases[0][0]
         counts = [dict(c[1]) for c in cases]
+        # Kept for the failure message: an extra lock in all five runs is
+        # not background noise, and the runs say where it sits.
+        _RUNS[label] = counts
         keys = set().union(*counts)
         least = {k: min(c.get(k, 0) for c in counts) for k in keys}
         out.append((label, sorted((k, n) for k, n in least.items() if n)))

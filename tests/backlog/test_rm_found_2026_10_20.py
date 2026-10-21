@@ -77,7 +77,11 @@ def test_index_build_completes_under_a_small_cache(tmp_path: Any) -> None:
     ):
         coll = client.t.c
         pad = os.urandom(150).hex()
-        coll.insert_many([{"_id": i, "s": f"{i:09d}{pad}"} for i in range(5000)])
+        # The documents go in on a client with no socket timeout: the 20 s
+        # one is for the build, and an insert this slow (CI's runner) timed
+        # out, was retried by pymongo while still running, and hit RM-230.
+        with pymongo.MongoClient(*client.address, directConnection=True) as loader:
+            loader.t.c.insert_many([{"_id": i, "s": f"{i:09d}{pad}"} for i in range(5000)])
         try:
             answer: tuple = ("ok", coll.create_index("s"))
         except pymongo.errors.PyMongoError as e:

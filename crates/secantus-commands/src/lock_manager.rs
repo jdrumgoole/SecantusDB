@@ -738,10 +738,13 @@ pub fn statement_rounds(
     }
 }
 
-/// An `aggregate` that ends in `$out` (mongod 8.2.11): a round that reads
-/// the source, seven of the global IS while the pipeline and its target are
-/// checked, the temporary collection and the target in X twice -- three
-/// times when the target exists and is replaced -- and two write rounds.
+/// An `aggregate` that ends in `$out` (mongod 8.2.12 on Linux x86-64, the
+/// exemplar build): a round that reads the source, six of the global IS
+/// while the pipeline and its target are checked, the temporary collection
+/// and the target in X twice -- three times when the target exists and is
+/// replaced -- and two write rounds. The macOS arm64 build reads one more
+/// global IS: a time-based plan yield that its Linux build does not make
+/// (with `internalQueryExecYieldPeriodMS` off, macOS reads six too; RM-185).
 /// `$merge` writes a round per document, which is not known before the
 /// pipeline runs: it takes them as it writes (`write_rounds`).
 fn out_rounds(
@@ -777,7 +780,7 @@ fn out_rounds(
         (Resource::Database(db.to_string()), Is),
         (Resource::Collection(format!("{db}.{src}")), Is),
     ]];
-    rounds.extend((0..7).map(|_| vec![(Resource::Global, Is)]));
+    rounds.extend((0..6).map(|_| vec![(Resource::Global, Is)]));
     let replaced = out_db == db && facts.exists(&target);
     rounds.extend((0..if replaced { 3 } else { 2 }).map(|_| write(X)));
     rounds.extend((0..2).map(|_| write(Ix)));

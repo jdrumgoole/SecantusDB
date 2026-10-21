@@ -527,6 +527,95 @@ These are explicit non-goals. Don't add them without a reason.
       Backlog-ID: RM-023
       Verify: tests/backlog/test_rm_001_028.py::test_slow_query_line_says_where_the_time_went
 
+### 7.087 Window functions and the operator tail against mongod -- 2026-10-21
+
+The first comparison of `$setWindowFields` / `$fill` and of a tail of
+operators no CI test had covered with mongod 8.2.11
+(`tests/mongod_live/`), change streams among them. It found six
+divergences; two were fixed in the
+same batch: `$shift` answering null for a MISSING output instead of its
+default (RM-227), and a lowercase `collmod` alias mongod does not have
+(it answers 59). Each left is a
+`Fallback::Defer` in `crates/secantus-core/src/windowfields.rs`: with no
+Python behind the Rust server, a deferral answers 2 "aggregation pipeline
+uses a stage or operator not supported by the Rust server". The file has
+about forty such points; these are the ones measured.
+
+- [ ] **`$expMovingAvg` refuses a null, missing or Decimal128 input.**
+      `ema_values` defers on any input `as_number` does not read, so a
+      partition with one such row answers code 2. mongod 8.2.11 averages
+      past them: a null or missing row answers null and leaves the average
+      where it was, and a Decimal128 input makes the average decimal.
+      Backlog-ID: RM-225
+      Verify: tests/backlog/test_rm_found_2026_10_21.py::test_exp_moving_avg_over_null_missing_and_decimal
+- [ ] **Window specs mongod refuses answer code 2, not mongod's code.**
+      `$linearFill` without a one-field `sortBy` (mongod: 605001), `$shift`
+      with a `window` (9, "$shift does not accept a 'window' field"), range
+      bounds with a two-field `sortBy` (5339902) and a range window over a
+      null sort value (5429414, "Invalid range: Expected the sortBy field to
+      be a number, but it was null"). Each is a deferral where a refusal by
+      name (`Fallback::mongo(code, msg)`) belongs.
+      Backlog-ID: RM-226
+      Verify: tests/backlog/test_rm_found_2026_10_21.py::test_window_spec_errors_carry_mongods_codes
+- [ ] **`$convert` to a target it cannot produce answers code 2, and
+      ignores `onError`.** `convert_target` defers on any `to` outside the
+      nine convertible types (`expressions.rs`). mongod 8.2.11 tells three
+      cases apart: an unknown name ("uuid", "foo", `{type: "uuid"}`) is 2
+      "Unknown type name: uuid", `onError` or not; a number that is no BSON
+      type is 9 "In $convert, numeric value for 'to' does not correspond to
+      a BSON type: 99"; a real BSON type `$convert` cannot produce ("array",
+      "timestamp", "null", "regex", 4) is 241 "Unsupported conversion from
+      string to array in $convert with no onError value" -- and with
+      `onError` mongod answers the `onError` value, where this server
+      errors. Found by `tests/mongod_live/test_operator_tail.py`, 2026-10-21.
+      Backlog-ID: RM-228
+      Verify: tests/backlog/test_rm_found_2026_10_21.py::test_convert_to_a_target_it_cannot_produce
+- [ ] **A change stream's post-image is the document now, not as the
+      update left it.** On a collection with `changeStreamPreAndPostImages:
+      {enabled: true}`, `fullDocument: "whenAvailable"` / `"required"` makes
+      mongod 8.2.11 answer each update event with the post-image it stored
+      when that update ran: two updates setting `a` to 2 then 3 read back as
+      `a: 2`, `a: 3`. This server looks the document up when the event is
+      read (`a: 3`, `a: 3`) -- `updateLookup`'s semantics -- so once a later
+      write deletes it, "whenAvailable" answers null and "required" fails
+      the stream (47, post-image not found). A silent wrong answer.
+      Pre-images here already match mongod
+      (`tests/mongod_live/test_change_streams.py`); probe how mongod
+      derives the post-image before building it. Found 2026-10-21.
+      Backlog-ID: RM-229
+      Verify: tests/backlog/test_rm_found_2026_10_21.py::test_change_stream_serves_the_stored_post_image
+- [ ] **A retryable write retried while its first attempt is still running
+      runs twice.** A driver that times out on a slow write retries it with
+      the same `lsid` and `txnNumber`. mongod 8.2.11 makes the second
+      attempt wait for the session the first has checked out, then answers
+      it from the first's result: both answer `{n: 30000}`. This server runs
+      the two side by side, and whichever comes second answers E11000 on the
+      documents the other wrote (`n: 0`), so the driver reports a failed
+      insert that succeeded; an update or delete retried this way could
+      apply twice (not yet measured). Found 2026-10-21 by RM-187's
+      regression test on CI's slower runner, where a 5,000-document insert
+      at an 8 MB cache outlasted pymongo's 20 s socket timeout. Sequential
+      retries (the first attempt finished) are answered correctly
+      (`tests/mongod_live/test_retryable_writes.py`).
+      Backlog-ID: RM-230
+      Verify: tests/backlog/test_rm_found_2026_10_21.py::test_a_retry_waits_for_the_attempt_still_running
+- [ ] **`$near` returns documents tied at one distance in the macOS build's
+      order, not the Linux build's.** mongod's builds disagree: for four
+      points at distance 1, Linux x86-64 8.2.12 (CI) answers `[2, 1, 3, 0]`,
+      macOS arm64 8.2.11 / 8.2.12 answer `[2, 3, 0, 1]`, and this server
+      returns the macOS order. **Decided (Joe, 2026-10-21): the Linux build
+      is the exemplar** where builds differ. The tie order is not a rounding
+      matter (the distances are exact), so probe what orders Linux's ties
+      before building. The other build split measured, a window `$stdDev`'s
+      last digit (the macOS build fuses `count * x - sum` into one rounding),
+      was fixed in the same batch (`windowfields.rs` rounds twice, as Linux
+      does; `test_std_dev_window_rounds_as_the_linux_build`). Not yet
+      measured on Linux, and written to the macOS build's fused arithmetic:
+      the `$group` deviation (`group.rs`, `delta.mul_add`) and the 2d
+      distances (`geohash2d.rs`, two `mul_add`s).
+      Backlog-ID: RM-231
+      Verify: tests/backlog/test_rm_029_056.py::test_near_ties_in_scan_order
+
 ### 7.086 The Rust MongoDB server, audited -- 2026-10-20
 
 An audit of the command, expression and wire layers, each finding reproduced
@@ -557,7 +646,11 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       holding it all in memory; `allowDiskUse` is only type-checked
       (`aggregate.rs`). A blocking `$sort` already agrees. mongod's
       mechanism is per-stage memory accounting with spilling to disk when
-      `allowDiskUse` permits it.
+      `allowDiskUse` permits it. **The cost is far past the data's size**
+      (measured 2026-10-21, debug build): the gap test's 110 MB of documents
+      take `secantusd-rs` to a 14.5 GB peak RSS, where mongod peaks at 90 MB
+      refusing them -- enough to kill a 16 GB CI runner, so CI's verifier
+      runs with `--skip RM-211`; run its gap test by hand.
       Backlog-ID: RM-211
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_aggregation_memory_limits
 - `$convert` to binData subtype 2 (the deprecated "old binary") is
@@ -839,6 +932,17 @@ Still different:
       other command was measured, so each still takes the generic chain. mongod's internal resources
       (`Metadata`, `oplog`, `Mutex`, `MultiDocumentTransactionsBarrier`) are
       locked by its background threads only and are absent here.
+      **Time-based plan yields** (measured 2026-10-21): mongod's executor
+      yields after `internalQueryExecYieldPeriodMS` (10 ms), and each re-take
+      of a lock counts. `$out` reads 7 global IS on Linux x86-64 8.2.12 (CI,
+      the exemplar build: Joe, 2026-10-21), 8 on macOS arm64 idle and 9 on a
+      loaded Mac; with the period off, macOS reads 7 too. So this server
+      takes Linux's 7, and the regression tests' reference mongod runs with
+      the period off, which gives Linux's counts on any machine and stops
+      them moving with load. Still unexplained: at 12 test workers on a
+      12-core Mac, `$merge creating its target` read 4 global IS (2 idle) in
+      all five reference runs, with yielding off as well; at CI's 4 workers
+      it reads 2.
       Backlog-ID: RM-185
       Verify: tests/backlog/test_rm_185_locks.py::test_lock_counts_of_merge_fail_with_duplicates
 - **Scope decision — `replSetReconfig` takes one member, this server**

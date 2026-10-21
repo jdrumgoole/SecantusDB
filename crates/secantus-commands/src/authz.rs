@@ -260,7 +260,7 @@ pub(crate) fn check(
             }
         }
         "drop" => c.on_collection(doc, name, &["dropCollection"]),
-        "collMod" | "collmod" => c.on_collection(doc, name, &["collMod"]),
+        "collMod" => c.on_collection(doc, name, &["collMod"]),
         "convertToCapped" => c.on_collection(doc, name, &["convertToCapped"]),
         "cloneCollectionAsCapped" => {
             c.on_collection(doc, name, &["find"]);

@@ -475,18 +475,19 @@ def test_geo_within_in_2d_scan_order(rust_mongo: Any, mongod: Any) -> None:
     assert run(rust_mongo) == run(mongod)
 
 
-@pytest.mark.backlog_fixed("RM-041")
-def test_near_ties_in_scan_order(rust_mongo: Any, mongod: Any) -> None:
+@pytest.mark.backlog("RM-231")
+def test_near_ties_in_scan_order(rust_mongo: Any) -> None:
     """Four points at one distance from a `$near`: mongod returns them in its
-    scan's order."""
+    scan's order, and that order depends on the build. Linux x86-64 8.2.12
+    (CI, 2026-10-21) answers [2, 1, 3, 0]; macOS arm64 8.2.11 and 8.2.12
+    answer [2, 3, 0, 1], which this server returns. The Linux build is the
+    exemplar (Joe, 2026-10-21), so its answer is recorded here rather than
+    asked of whichever mongod is on PATH. Was RM-041's regression test."""
     docs = [{"_id": 0, "loc": [1, 0]}, {"_id": 1, "loc": [0, 1]}, {"_id": 2, "loc": [-1, 0]}]
     docs.append({"_id": 3, "loc": [0, -1]})
     command = {"find": "c", "filter": {"loc": {"$near": [0, 0]}}}
-
-    def run(client: Any) -> tuple:
-        return _ids(_seed(client, "rm041n", docs, [_index({"loc": "2d"})]), command)
-
-    assert run(rust_mongo) == run(mongod)
+    got = _ids(_seed(rust_mongo, "rm041n", docs, [_index({"loc": "2d"})]), command)
+    assert got == ("ok", [2, 1, 3, 0])
 
 
 @pytest.mark.backlog_fixed("RM-042")

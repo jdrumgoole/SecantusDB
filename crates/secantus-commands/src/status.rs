@@ -296,7 +296,7 @@ impl StatusCounters {
                 slot.pipeline.fetch_add(1, Relaxed);
             }
         }
-        if matches!(name, "create" | "collMod" | "collmod") {
+        if matches!(name, "create" | "collMod") {
             if let Ok(validator) = request.get_document("validator") {
                 slot.validator_total.fetch_add(1, Relaxed);
                 if !ok {

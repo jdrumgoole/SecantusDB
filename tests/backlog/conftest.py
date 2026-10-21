@@ -31,6 +31,7 @@ import pathlib
 import re
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -49,7 +50,7 @@ PG15_DSN = os.environ.get(
 )
 
 
-def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     here = pathlib.Path(__file__).parent
     for item in items:
         marked = list(item.iter_markers("backlog")) or list(item.iter_markers("backlog_fixed"))
@@ -57,6 +58,29 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             raise pytest.UsageError(
                 f"{item.nodeid}: needs @pytest.mark.backlog(ID) or @pytest.mark.backlog_fixed(ID)"
             )
+    # `tools/backlog.py verify --file F --regressions` runs one server's
+    # tests: SECANTUS_BACKLOG_PREFIXES=RM keeps only items whose IDs carry
+    # that prefix, so the MongoDB run needs no PostgreSQL reference.
+    # SECANTUS_BACKLOG_SKIP=RM-211 drops the gap tests of the items `verify
+    # --skip` names (CI: one that needs more memory than a runner has).
+    prefixes = tuple(p for p in os.environ.get("SECANTUS_BACKLOG_PREFIXES", "").split(",") if p)
+    skip = {s for s in os.environ.get("SECANTUS_BACKLOG_SKIP", "").split(",") if s}
+    if not prefixes and not skip:
+        return
+    keep, drop = [], []
+    for item in items:
+        ids = [
+            a
+            for name in ("backlog", "backlog_fixed")
+            for m in item.iter_markers(name)
+            for a in m.args
+        ]
+        gap_ids = {a for m in item.iter_markers("backlog") for a in m.args}
+        wanted = not ids or not prefixes or any(i.startswith(prefixes) for i in ids)
+        (keep if wanted and not skip & gap_ids else drop).append(item)
+    if drop:
+        config.hook.pytest_deselected(items=drop)
+        items[:] = keep
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -150,7 +174,7 @@ def rust_mongo(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Any]:
 def mongod() -> Iterator[Any]:
     """A pymongo client to a throwaway mongod (the reference). Errors -- never
     skips -- when there is none: a gap test without its reference is BROKEN."""
-    from tests.test_mongod_differential import MONGOD, _start_mongod, _stop_mongod
+    from tests.mongod_reference import MONGOD, _start_mongod, _stop_mongod
 
     assert MONGOD, "no mongod on PATH: the reference server is required"
     proc, uri, dbpath = _start_mongod()
@@ -159,6 +183,37 @@ def mongod() -> Iterator[Any]:
         yield client
     finally:
         client.close()
+        _stop_mongod(proc, dbpath)
+
+
+@pytest.fixture(scope="module")
+def mongod_rs() -> Iterator[Any]:
+    """A throwaway single-node replica set: the reference for change streams
+    and retryable writes, which a standalone mongod refuses."""
+    from tests.mongod_reference import MONGOD, _host_port, _start_mongod, _stop_mongod
+
+    assert MONGOD, "no mongod on PATH: the reference server is required"
+    proc, uri, dbpath = _start_mongod(extra_args=("--replSet", "backlog"))
+    try:
+        boot = pymongo.MongoClient(uri, directConnection=True, serverSelectionTimeoutMS=10_000)
+        host, port = _host_port(uri)
+        boot.admin.command(
+            {
+                "replSetInitiate": {
+                    "_id": "backlog",
+                    "members": [{"_id": 0, "host": f"{host}:{port}"}],
+                }
+            }
+        )
+        deadline = time.monotonic() + 60
+        while not boot.admin.command("hello").get("isWritablePrimary"):
+            assert time.monotonic() < deadline, "the single-node set never became primary"
+            time.sleep(0.2)
+        boot.close()
+        client = pymongo.MongoClient(uri, directConnection=True, serverSelectionTimeoutMS=10_000)
+        yield client
+        client.close()
+    finally:
         _stop_mongod(proc, dbpath)
 
 

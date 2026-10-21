@@ -402,6 +402,26 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo test
 
+      - name: The $group field pushdown, against the real Rust engine
+        # tests/test_rust_group_field_pushdown.py pins that decoding only the
+        # fields a `$group` reads gives exactly the answer decoding the whole
+        # document gives, through `_secantus_core.apply_pipeline` -- the engine
+        # the Rust server runs, with no Python engine in the comparison. It
+        # `importorskip`s `_secantus_core`, and once the parity step went
+        # (2026-10-20) no job built the extension, so it skipped everywhere.
+        # The build reuses this job's cargo target.
+        shell: bash
+        run: |
+          uv pip install ./crates/secantus-core-py
+          uv run --no-sync python -m pytest tests/test_rust_group_field_pushdown.py \
+            -o addopts= -p no:cacheprovider -q -rs
+          # Three more files gated on the same extension, each pinning the
+          # Rust engine to answers recorded from mongod 8.2.11. `-k rust`
+          # leaves out their Python-engine halves (deprecated).
+          uv run --no-sync python -m pytest tests/test_tolower_timestamp_local_time.py \
+            tests/test_decimal128_special_values.py tests/test_decimal128_zero_and_avg.py \
+            -k rust -o addopts= -p no:cacheprovider -q -rs
+
   # The WiredTiger-linking Rust storage crate (`secantus-storage`, Phase 4) — the
   # secondary-index + CRUD storage layer. It's excluded from the `crates/`
   # workspace (it links the vendored WiredTiger C library and needs libclang), so
@@ -675,8 +695,8 @@ jobs:
       # `./inv rust-test` reports success having never compiled them). Two of
       # these are shipped artifacts: `secantusdb` is the standalone binary and
       # `secantus-server-py` is the embedded handle the Rust gauge drives.
-      # clippy (not test) on purpose: it type-checks everything for the cost of
-      # a check, and these crates' behaviour is covered by the Python suites.
+      # clippy only here: `secantusdb`'s and `secantus-wt`'s own tests run in
+      # the next step, and the other three have none of their own.
       # `secantus-pg` (the PostgreSQL server) joined on 2026-10-07: it was built
       # and its integration tests run in another job, but never linted, and six
       # `clippy::drop_non_drop` errors sat in it unreported. The pgwire fork
@@ -689,6 +709,21 @@ jobs:
             (cd "crates/$crate" \
               && cargo fmt --check \
               && cargo clippy --all-targets -- -D warnings)
+            echo "::endgroup::"
+          done
+
+      - name: Cargo test (secantusdb, secantus-wt)
+        # These two crates' tests ran in no job: the step above lints them,
+        # on the grounds that "the Python suites" covered them, but nothing
+        # in Python drives `secantusdb/tests/embedded.rs` (the
+        # `secantus_mdb::Server` embedding API the crate is published for)
+        # or `compression.rs`, and `secantus-wt`'s own tests ran only in
+        # wt-sys.yml, which a path filter limits to WiredTiger changes.
+        run: |
+          set -e
+          for crate in secantusdb secantus-wt; do
+            echo "::group::$crate"
+            (cd "crates/$crate" && cargo test)
             echo "::endgroup::"
           done
 
@@ -807,11 +842,26 @@ jobs:
           echo "test temp dir: $(cat /tmp/tdir)"
           df -h "$(cat /tmp/tdir)" || df -h . || true
 
+      - name: Register the MongoDB 8.2 apt repository (Linux)
+        # For `mongodb-org-server`: the reference mongod the Rust MongoDB
+        # server's backlog tests compare against (the step "Rust MongoDB
+        # server against mongod" below). 8.2 because every recorded
+        # expectation was measured on 8.2.1 / 8.2.11, and a patch bump has
+        # moved an error message before. The KEY is `server-8.0.asc` on
+        # purpose: there is no `server-8.2.asc`, and MongoDB signs both series
+        # with one key (fingerprint 4B0752C1BCA238C0B4EE14DC41DE058A4E7DCA05).
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL --retry 3 --retry-all-errors --max-time 60 \
+            https://www.mongodb.org/static/pgp/server-8.0.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server.gpg
+          echo "deb [signed-by=/usr/share/keyrings/mongodb-server.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.2 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.2.list
+
       - name: Install toolchain (Linux)
         if: runner.os == 'Linux'
         uses: ./.github/actions/apt-install
         with:
-          packages: swig clang libclang-dev llvm-dev ninja-build liblz4-dev
+          packages: swig clang libclang-dev llvm-dev ninja-build liblz4-dev mongodb-org-server
 
       - name: Install toolchain (macOS)
         if: runner.os == 'macOS'
@@ -1046,10 +1096,8 @@ jobs:
         # job builds `_secantus_server`; this is the only lane that does, so
         # it's where these invariants get continuously enforced. `-k rust`
         # selects only the `[rust]` parametrization: the `[python]` params
-        # run in the main test lanes already, so running them here would
-        # only repeat them. (The wheel does ship the SWIG `wiredtiger`
-        # binding -- `CMakeLists.txt` builds it with ENABLE_PYTHON=ON -- so
-        # that is not the reason.)
+        # exercise the Python server, fully deprecated and out of CI since
+        # 2026-10-20, so they run nowhere by decision.
         shell: bash
         run: >-
           uv run --no-project --with pymongo --with pytest
@@ -1086,9 +1134,65 @@ jobs:
           fi
           export SECANTUS_WT_INCLUDE="$wt/include" SECANTUS_WT_LIB="$wt"
           cargo build --manifest-path crates/secantusdb/Cargo.toml
-          uv run --no-project --with pymongo --with pytest \
-            python -m pytest tests/test_rust_binary_smoke.py \
-            -o addopts= -p no:cacheprovider -q
+          # test_rust_binary_pitr.py (PITR restore and --preserve-oplog
+          # against this binary) ran in no job until 2026-10-21: it imports
+          # `secantus` for its seeding, so the test job's selector drops it,
+          # and the `importorskip("_secantus_server")` guard never saw it.
+          # test_rust_binary_crash_durability.py SIGKILLs the binary in the
+          # middle of concurrent `j: true` writes in its DEFAULT mode, which
+          # test_crash_recovery.py (data-nonlogged mode only) does not cover.
+          uv run --no-project --with pymongo --with pytest --with pytest-timeout \
+            --with "$(ls dist-storage/*.whl)" \
+            python -m pytest tests/test_rust_binary_smoke.py tests/test_rust_binary_pitr.py \
+            tests/test_rust_binary_crash_durability.py \
+            -o addopts= -p no:cacheprovider -q -rs
+
+      - name: Rust MongoDB server against mongod (the backlog's tests)
+        # Every RM item's gap test (fails while the item is open) and every
+        # fixed item's regression test (`backlog_fixed`), against a live
+        # mongod 8.2 -- the only comparison of the Rust MongoDB server with
+        # the real product that runs on a PR. Until 2026-10-21 none of them
+        # ran anywhere but a developer's box: pytest's addopts deselect both
+        # markers, and no job ran `tools/backlog.py verify`.
+        #
+        # verify exits non-zero when a regression test fails or skips
+        # (REGRESSED), when an open item's gap test passes (FIXED?: close
+        # the item and turn the test into a regression test), or when a gap
+        # test breaks rather than failing on its assertion (BROKEN).
+        # `--file` keeps it to the RM items, so no PostgreSQL is needed.
+        #
+        # `--skip RM-211`, a scope decision: that item IS the server's lack of
+        # aggregation memory limits, and its gap test drives secantusd-rs to
+        # ~14.5 GB RSS (110 MB of documents through $group / $push / $facet /
+        # $lookup), which on this 16 GB runner SIGTERMs the whole step (first
+        # run, 2026-10-21). What is lost: CI cannot see RM-211 turn FIXED?;
+        # `tools/backlog.py verify --id RM-211` still runs it on a 32 GB box.
+        #
+        # tests/mongod_live/ then compares the surface no backlog item
+        # covers (window functions, change-stream images, retryable writes,
+        # an operator tail). Both run whatever the first answers, so one
+        # failure never hides the other.
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mongod --version | head -1
+          deps="--with pymongo==4.17.0 --with pytest --with pytest-xdist --with psycopg[binary]==3.3.4"
+          status=0
+          uv run --no-project $deps \
+            python tools/backlog.py verify --file backlog-rust-mongodb.md --regressions \
+            --skip RM-211 || status=1
+          uv run --no-project $deps \
+            python -m pytest tests/mongod_live -m mongod_live -o addopts= -n auto \
+            -p no:cacheprovider -q -rs || status=1
+          exit $status
+
+      - name: Memory pressure, if the mongod comparison failed
+        # A step SIGTERMed by the runner (exit 143) prints no test summary;
+        # the kernel log says whether memory ran out, and who it killed.
+        if: failure() && runner.os == 'Linux'
+        run: |
+          free -m
+          sudo dmesg -T | grep -iE "out of memory|oom-kill|killed process" | tail -20 || true
 
   pg-oracle:
     # The SQL suites that diff against a REAL PostgreSQL. They exist because

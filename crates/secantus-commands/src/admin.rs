@@ -663,7 +663,7 @@ fn coll_mod_inner(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("BSON field 'collMod.{unknown}' is an unknown field."),
         ));
     }
-    let coll = match doc.get("collMod").or_else(|| doc.get("collmod")) {
+    let coll = match doc.get("collMod") {
         Some(Bson::String(s)) => s.clone(),
         _ => {
             return Err(CommandError::new(

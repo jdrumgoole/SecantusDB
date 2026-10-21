@@ -18,6 +18,7 @@ Usage::
     python tools/backlog.py ids              # give every open item an ID
     python tools/backlog.py list [--file F]  # ID, verify, headline
     python tools/backlog.py verify [--file F] [--id ID ...]
+    python tools/backlog.py verify --file F --regressions   # what CI runs
 
 ``verify`` runs every named gap test in one pytest run and reports each item:
 
@@ -26,6 +27,8 @@ Usage::
                probably done -- confirm, then delete it (see the backlog skill).
 ``BROKEN``     a gap test errored, was skipped, or failed on something other
                than an assertion: the check is not measuring the gap. Fix it.
+``SKIPPED``    ``--skip ID`` named it, so its gap tests did not run; never
+               counted as passing (the caller says why, as CI does for RM-211).
 ``UNCHECKED``  the item has ``Verify: none -- ...`` (by design) or no Verify
                line at all (a defect in the backlog: write one).
 
@@ -192,14 +195,28 @@ def selected(files: list[str] | None, ids: list[str] | None) -> list[Item]:
     return out
 
 
-def verify(items: list[Item], regressions: bool = True) -> tuple[list[Verdict], list[dict]]:
-    """Run every gap test the items name, in one pytest run."""
+def verify(
+    items: list[Item],
+    regressions: bool = True,
+    prefixes: list[str] | None = None,
+    skip: list[str] | None = None,
+) -> tuple[list[Verdict], list[dict]]:
+    """Run every gap test the items name, in one pytest run.
+
+    ``prefixes`` (``["RM"]``) limits the regression tests to those IDs, so
+    one server's items and regressions run without the other's reference."""
     tests = sorted({t for it in items for t in it.tests})
     results: dict[str, dict] = {}
     if tests or regressions:
         with tempfile.TemporaryDirectory() as tmp:
             report = pathlib.Path(tmp) / "report.json"
             env = dict(os.environ, SECANTUS_BACKLOG_REPORT=str(report))
+            if prefixes:
+                env["SECANTUS_BACKLOG_PREFIXES"] = ",".join(prefixes)
+            if skip:
+                # Deselected at collection: a regressions run sweeps all of
+                # tests/backlog, so leaving them out of `tests` is not enough.
+                env["SECANTUS_BACKLOG_SKIP"] = ",".join(skip)
             marks, paths = "backlog", list(tests)
             if regressions:
                 marks, paths = "backlog or backlog_fixed", [*tests, "tests/backlog"]
@@ -272,6 +289,19 @@ def main() -> int:
         p = sub.add_parser(name)
         p.add_argument("--file", action="append", choices=list(FILES))
         p.add_argument("--id", action="append")
+    sub.choices["verify"].add_argument(
+        "--regressions",
+        action="store_true",
+        help="with --file: also run that file's regression (backlog_fixed) tests",
+    )
+    sub.choices["verify"].add_argument(
+        "--skip",
+        action="append",
+        default=[],
+        metavar="ID",
+        help="do not run this item's gap tests; reported SKIPPED, never as passing "
+        "(the caller states why: CI skips RM-211, whose test needs ~15 GB)",
+    )
     args = ap.parse_args()
     if args.cmd == "ids":
         print(f"assigned {assign_ids()} IDs")
@@ -283,7 +313,21 @@ def main() -> int:
             print(f"         {it.file}:{it.line}  {it.headline[:100]}")
         return 0
     # A run scoped to some items checks only those items' gap tests.
-    verdicts, regressed = verify(items, regressions=not (args.file or args.id))
+    # --regressions brings them back for a --file run, limited to its prefix
+    # (CI runs `verify --file backlog-rust-mongodb.md --regressions`).
+    scoped = bool(args.file or args.id)
+    prefixes = [FILES[f] for f in args.file] if args.file else None
+    skipped = [it for it in items if it.id in args.skip]
+    unknown = sorted(set(args.skip) - {it.id for it in items})
+    if unknown:
+        ap.error(f"--skip names no item in this selection: {', '.join(unknown)}")
+    verdicts, regressed = verify(
+        [it for it in items if it.id not in args.skip],
+        regressions=not scoped or args.regressions,
+        prefixes=prefixes,
+        skip=args.skip,
+    )
+    verdicts += [Verdict(it, "SKIPPED", ["--skip: its gap tests were not run"]) for it in skipped]
     counts: dict[str, int] = {}
     for v in verdicts:
         counts[v.status] = counts.get(v.status, 0) + 1
@@ -296,7 +340,11 @@ def main() -> int:
     if regressed:
         counts["REGRESSED"] = len(regressed)
     print("=== " + ", ".join(f"{n} {s}" for s, n in sorted(counts.items())))
-    checked = [v for v in verdicts if v.status != "UNCHECKED" or v.item.verify is None]
+    checked = [
+        v
+        for v in verdicts
+        if v.status != "SKIPPED" and (v.status != "UNCHECKED" or v.item.verify is None)
+    ]
     return 0 if all(v.status == "OPEN" for v in checked) and not regressed else 1
 
 
