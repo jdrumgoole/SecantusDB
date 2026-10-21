@@ -812,6 +812,28 @@ def rust_binary_build(c: Context, release: bool = False) -> None:
     print(f"binary: {_RUST_BINARY_DIR}/target/{sub}/secantusd-rs{ext}")
 
 
+@task(name="rust-mdb-coverage")
+def rust_mdb_coverage(c: Context, gauges: str = "", out: str = "", keep: bool = False) -> None:
+    """Measure the Rust MongoDB server's line coverage and write ``docs-rust/coverage.md``.
+
+    Suites and driver gauges separately and combined (``scripts/rust_mdb_coverage.py``).
+    Run it from the clean main checkout, where the gauges' toolchains and
+    submodules are, through ``scripts/detached_run.py``: it takes about 45
+    minutes. ``--gauges none`` measures the suites alone; ``--gauges go,java``
+    picks gauges. WiredTiger / libclang prerequisites as ``rust-binary-build``.
+    """
+    _build_wiredtiger()
+    args = []
+    if gauges:
+        args += ["--gauges", gauges]
+    if out:
+        args += ["--out", out]
+    if keep:
+        args.append("--keep")
+    cmd = shlex.join([sys.executable, "scripts/rust_mdb_coverage.py", *args])
+    c.run(cmd, pty=os.name != "nt", env=_rust_env())
+
+
 @task(name="rust-server-build")
 def rust_server_build(c: Context) -> None:
     """Rebuild the embedded ``_secantus_server`` extension into the project venv.

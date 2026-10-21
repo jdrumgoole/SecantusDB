@@ -62,6 +62,7 @@ embedded
 security
 recovery
 conformance
+coverage
 architecture
 releases
 ```

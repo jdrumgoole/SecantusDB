@@ -43,6 +43,19 @@ binary's inode can get the new copy SIGKILLed (exit 137, no message) --
 `rm` first, then copy. And a rebase or pull while a build runs leaves a
 binary built from neither tree; the provenance check will refuse it.
 
+## Coverage
+
+- **`./inv rust-mdb-coverage` measures the Rust MongoDB server's line
+  coverage** (`scripts/rust_mdb_coverage.py`) and rewrites
+  `docs-rust/coverage.md`: the cargo tests plus the Python suites CI runs
+  against the binary, the eleven daemon driver gauges, and both together,
+  per crate. It instruments every crate through `RUSTFLAGS`
+  (`cargo-llvm-cov`'s wrapper skips path dependencies), builds into a
+  directory outside the repository, and copies `.validation/` aside while
+  the gauges overwrite it. Run it from the clean main checkout through
+  `detached_run.py`: about 45 minutes and ~20 GB. The pymongo gauges and the
+  embedded-extension tests are not counted.
+
 ## WiredTiger
 
 - WiredTiger is **vendored** as a git submodule at `vendor/wiredtiger` (mongodb-7.0.33). The CMake build is driven by `CMakeLists.txt` (scikit-build-core + ExternalProject) and produces self-contained binary wheels via `cibuildwheel` for **cp310–cp313** on macOS arm64, **manylinux_2_28** + musllinux_1_2 x86_64/aarch64, and Windows AMD64 (read off the published 0.6.0b17 wheel list on 2026-09-27 — this line previously said cp312+cp313 / manylinux2014, which had drifted). macOS x86_64 is intentionally absent (runner-pool scarcity, Apple Silicon is the active target). `pip install SecantusDB` ships pre-built on supported platforms; users never need `cmake`/`ninja`/`swig`. The `cmake/patch_wt_*.py` scripts apply small idempotent patches to the vendored WT tree at `PATCH_COMMAND` time (off64_t→off_t for musl, Python module SUFFIX/dynamic_lookup, etc.); fix WT-side incompat by extending one of these patchers, not by editing the submodule directly. **Two patchers change BEHAVIOUR rather than the build**: `patch_wt_dsync_group.py` (2026-10-07, Joe's call) makes concurrent `method=dsync` commits share log writes (only the PostgreSQL server on macOS uses dsync), and `patch_wt_fsync_group.py` (2026-10-09) credits one `fsync` under `method=fsync` with every commit already written, which every server that syncs per commit off macOS runs. A process kill cannot test the second one, because the page cache survives it: its test is a hard reboot under load (`tasks/backlog-rust-mongodb.md`, the Linux entry). Three builds apply the patches and must agree — the wheel's CMake (`apply_wt_patches.cmake`), the crate's bundled copy (`scripts/wt_sys_refresh.py`, then commit `wiredtiger.sha256`) and `./inv rust-wt-build` (which reads the crate's list) — so a new patcher goes in the first two lists.
