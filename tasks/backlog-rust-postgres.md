@@ -990,10 +990,14 @@ libc-collations scope decision above.
       - in `select n::int4, lower($1) from generate_series(0, $1::int) as
         n`, PostgreSQL types `$1` integer from the cast, so `lower(integer)`
         does not exist and Parse fails with 42883. Here Parse succeeds,
-        describing `$1` as int4 and `lower` as text.
-      Found by pgtest `unknown:31` and `parameter_description:40`.
+        describing `$1` as int4 and `lower` as text;
+      - a parameter DECLARED uuid (OID 2950) in `SELECT id FROM t WHERE v =
+        $1`, `v` varchar, has no `=` operator: PostgreSQL fails Parse with
+        42883. Here Parse and Bind succeed and the 42883 comes at Execute.
+      Found by pgtest `unknown:31`, `parameter_description:40` and
+      `typing:74`.
       Backlog-ID: RP-080
-      Verify: tests/backlog/test_rp_found_pgtest.py::test_unknown_parameters_take_their_column_types, tests/backlog/test_rp_found_pgtest.py::test_conflicting_parameter_uses_fail_at_parse
+      Verify: tests/backlog/test_rp_found_pgtest.py::test_unknown_parameters_take_their_column_types, tests/backlog/test_rp_found_pgtest.py::test_conflicting_parameter_uses_fail_at_parse, tests/backlog/test_rp_found_pgtest.py::test_declared_parameter_type_is_checked_at_parse
 - [ ] **ParameterStatus arrives in the wrong place: before a SET's
       CommandComplete, and in a different order on every connection.**
       PostgreSQL 15.19 sends `CommandComplete SET`, then the
@@ -1073,6 +1077,14 @@ libc-collations scope decision above.
       later fails with 22021. Found by pgtest `spatial:8`.
       Backlog-ID: RP-090
       Verify: tests/backlog/test_rp_found_pgtest.py::test_unknown_type_fails_at_parse
+- [ ] **Executing an unbound unnamed portal names an internal portal in
+      the error.** Execute of portal `""` with nothing bound is 34000 on
+      both servers, but PostgreSQL 15.19's message is `portal "" does not
+      exist` and this server's is `portal "POSTGRESQL_DEFAULT_NAME" does
+      not exist`, a name the client never sent. A named portal's message is
+      already right. Found by pgtest `portals:24`.
+      Backlog-ID: RP-091
+      Verify: tests/backlog/test_rp_found_pgtest.py::test_unknown_portal_error_names_it
 
 ## Found by the corpus test (2026-10-21)
 

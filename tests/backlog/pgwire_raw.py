@@ -86,6 +86,9 @@ class Wire:
     def __init__(self, host: str, port: int, user: str, dbname: str = "postgres") -> None:
         self.sock = socket.create_connection((host, port), timeout=10)
         self.buf = b""
+        #: Every ErrorResponse's fields, in arrival order (the decoded reply
+        #: keeps only the SQLSTATE).
+        self.errors: list[dict[str, str]] = []
         params = _cstr("user") + _cstr(user) + _cstr("database") + _cstr(dbname) + b"\0"
         body = struct.pack("!i", 196608) + params
         self.sock.sendall(struct.pack("!i", len(body) + 4) + body)
@@ -119,6 +122,8 @@ class Wire:
         kind = self._read(1)
         (length,) = struct.unpack("!i", self._read(4))
         body = self._read(length - 4)
+        if kind == b"E":
+            self.errors.append(_fields(body))
         return _decode(kind, body)
 
     def _until_ready(self) -> list[tuple]:
