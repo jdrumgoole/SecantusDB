@@ -61,8 +61,11 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     # `tools/backlog.py verify --file F --regressions` runs one server's
     # tests: SECANTUS_BACKLOG_PREFIXES=RM keeps only items whose IDs carry
     # that prefix, so the MongoDB run needs no PostgreSQL reference.
+    # SECANTUS_BACKLOG_SKIP=RM-211 drops the gap tests of the items `verify
+    # --skip` names (CI: one that needs more memory than a runner has).
     prefixes = tuple(p for p in os.environ.get("SECANTUS_BACKLOG_PREFIXES", "").split(",") if p)
-    if not prefixes:
+    skip = {s for s in os.environ.get("SECANTUS_BACKLOG_SKIP", "").split(",") if s}
+    if not prefixes and not skip:
         return
     keep, drop = [], []
     for item in items:
@@ -72,7 +75,9 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             for m in item.iter_markers(name)
             for a in m.args
         ]
-        (keep if not ids or any(i.startswith(prefixes) for i in ids) else drop).append(item)
+        gap_ids = {a for m in item.iter_markers("backlog") for a in m.args}
+        wanted = not ids or not prefixes or any(i.startswith(prefixes) for i in ids)
+        (keep if wanted and not skip & gap_ids else drop).append(item)
     if drop:
         config.hook.pytest_deselected(items=drop)
         items[:] = keep

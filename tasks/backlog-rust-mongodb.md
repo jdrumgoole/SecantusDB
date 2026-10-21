@@ -615,7 +615,11 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       holding it all in memory; `allowDiskUse` is only type-checked
       (`aggregate.rs`). A blocking `$sort` already agrees. mongod's
       mechanism is per-stage memory accounting with spilling to disk when
-      `allowDiskUse` permits it.
+      `allowDiskUse` permits it. **The cost is far past the data's size**
+      (measured 2026-10-21, debug build): the gap test's 110 MB of documents
+      take `secantusd-rs` to a 14.5 GB peak RSS, where mongod peaks at 90 MB
+      refusing them -- enough to kill a 16 GB CI runner, so CI's verifier
+      runs with `--skip RM-211`; run its gap test by hand.
       Backlog-ID: RM-211
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_aggregation_memory_limits
 - `$convert` to binData subtype 2 (the deprecated "old binary") is

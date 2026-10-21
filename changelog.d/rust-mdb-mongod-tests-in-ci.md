@@ -29,7 +29,11 @@ with gap tests.
   `test_decimal128_special_values.py` and `test_decimal128_zero_and_avg.py`.
 - `tools/backlog.py verify --regressions`: with `--file`, also run that
   server's regression tests (`SECANTUS_BACKLOG_PREFIXES` limits them to its
-  ID prefix, so the MongoDB run needs no PostgreSQL).
+  ID prefix, so the MongoDB run needs no PostgreSQL), and `--skip ID`,
+  which deselects an item's gap tests and reports it SKIPPED, never as
+  passing. CI skips RM-211: its gap test takes `secantusd-rs` to a 14.5 GB
+  peak on 110 MB of documents, and the first CI run of this lane was
+  SIGTERMed on the 16 GB runner (the rest of the lane peaks near 1 GB).
 - `tests/mongod_live/` (marker `mongod_live`, outside the default suite):
   window functions and `$fill`, change-stream pre-images,
   `startAtOperationTime` and split events, retryable-write retries, and an
