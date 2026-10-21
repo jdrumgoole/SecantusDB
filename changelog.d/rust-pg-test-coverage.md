@@ -53,6 +53,24 @@ every `cargo test` target run in the lane that builds the server.
   dropped its client stream before the server finished the handshake.
 - `./inv rust-pgserver-test` (and so `rust-gate`) gates `secantus-pgwire` as
   CI does, and `./inv rust-fmt` formats it and `secantus-pg`.
+- A cancel that arrives while a large statement is being PLANNED is
+  answered at once (RP-002's regression test,
+  `tests/backlog/test_rp_triage.py::test_cancel_during_parse_is_honoured_at_once`,
+  failed the first time CI ran it). Only the parse was a cancellation point,
+  and the parse is memoised, so every repeat of a statement, and every
+  statement on a machine that parses faster than planning takes, waited out
+  the whole plan: a cancel 0.5 s into the test's 200,000-item `IN` list was
+  answered 0.85 s late on a debug build. Planning and the pre-planning passes
+  (privileges, the plan-cache key) now check between passes, as
+  PostgreSQL's `CHECK_FOR_INTERRUPTS` does: the worst case measured is
+  0.15 s on a debug build, against PostgreSQL 15.19's 0.03 s.
+- The corpus records were made on macOS, where `cot(1)` ends `...308`; on
+  glibc, PostgreSQL and this server both print `...306` (both compute
+  `1.0 / tan(x)`). The test accepts the other platform's answer for that
+  check, listed with its reason.
+- The PostgreSQL test fixtures delete each store once its server exits: a
+  store preallocates a 128 MB WiredTiger log, and 1,100 of them filled a
+  CI runner's disk.
 
 #### Found
 
