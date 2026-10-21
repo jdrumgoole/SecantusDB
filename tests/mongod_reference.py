@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -213,3 +214,20 @@ def _host_port(uri: str) -> tuple[str, int]:
     from pymongo.uri_parser import parse_uri
 
     return parse_uri(uri)["nodelist"][0]
+
+
+# mongod renders a wrong-type error's expected-type list in an order that
+# changes between patch releases (8.2.1, 8.2.11 and 8.2.12 all differ, and
+# 8.2.12 orders two fields of one command differently). It is a set; compare
+# it as one. Everything else in the message is still compared exactly.
+_TYPE_LIST = re.compile(r"(expected types \\?')\[([^\]]*)\]")
+
+
+def sort_type_lists(message: str) -> str:
+    """`message` with each "expected types '[...]'" list sorted."""
+
+    def repl(m: re.Match) -> str:
+        items = sorted(part.strip() for part in m.group(2).split(",") if part.strip())
+        return f"{m.group(1)}[{', '.join(items)}]"
+
+    return _TYPE_LIST.sub(repl, message)

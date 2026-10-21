@@ -584,6 +584,37 @@ about forty such points; these are the ones measured.
       derives the post-image before building it. Found 2026-10-21.
       Backlog-ID: RM-229
       Verify: tests/backlog/test_rm_found_2026_10_21.py::test_change_stream_serves_the_stored_post_image
+- [ ] **A retryable write retried while its first attempt is still running
+      runs twice.** A driver that times out on a slow write retries it with
+      the same `lsid` and `txnNumber`. mongod 8.2.11 makes the second
+      attempt wait for the session the first has checked out, then answers
+      it from the first's result: both answer `{n: 30000}`. This server runs
+      the two side by side, and whichever comes second answers E11000 on the
+      documents the other wrote (`n: 0`), so the driver reports a failed
+      insert that succeeded; an update or delete retried this way could
+      apply twice (not yet measured). Found 2026-10-21 by RM-187's
+      regression test on CI's slower runner, where a 5,000-document insert
+      at an 8 MB cache outlasted pymongo's 20 s socket timeout. Sequential
+      retries (the first attempt finished) are answered correctly
+      (`tests/mongod_live/test_retryable_writes.py`).
+      Backlog-ID: RM-230
+      Verify: tests/backlog/test_rm_found_2026_10_21.py::test_a_retry_waits_for_the_attempt_still_running
+- [ ] **`$near` returns documents tied at one distance in the macOS build's
+      order, not the Linux build's.** mongod's builds disagree: for four
+      points at distance 1, Linux x86-64 8.2.12 (CI) answers `[2, 1, 3, 0]`,
+      macOS arm64 8.2.11 / 8.2.12 answer `[2, 3, 0, 1]`, and this server
+      returns the macOS order. **Decided (Joe, 2026-10-21): the Linux build
+      is the exemplar** where builds differ. The tie order is not a rounding
+      matter (the distances are exact), so probe what orders Linux's ties
+      before building. The other build split measured, a window `$stdDev`'s
+      last digit (the macOS build fuses `count * x - sum` into one rounding),
+      was fixed in the same batch (`windowfields.rs` rounds twice, as Linux
+      does; `test_std_dev_window_rounds_as_the_linux_build`). Not yet
+      measured on Linux, and written to the macOS build's fused arithmetic:
+      the `$group` deviation (`group.rs`, `delta.mul_add`) and the 2d
+      distances (`geohash2d.rs`, two `mul_add`s).
+      Backlog-ID: RM-231
+      Verify: tests/backlog/test_rm_029_056.py::test_near_ties_in_scan_order
 
 ### 7.086 The Rust MongoDB server, audited -- 2026-10-20
 
@@ -901,17 +932,17 @@ Still different:
       other command was measured, so each still takes the generic chain. mongod's internal resources
       (`Metadata`, `oplog`, `Mutex`, `MultiDocumentTransactionsBarrier`) are
       locked by its background threads only and are absent here.
-      **The regression tests' reference moves under heavy load** (measured
-      2026-10-21, mongod 8.2.11): run with 12 test workers on this 12-core
-      Mac, mongod read `$out` as 9 global IS (8 idle) and `$merge creating
-      its target` as 4 (2 idle) in all five reference runs, in 4 of 6 full
-      verifier runs -- not background noise, which the least-of-five
-      removes. At 4 workers (CI's `-n auto`) all 264 RM regression tests
-      passed twice. Time-based yielding is involved but does not account for
-      it: with `internalQueryExecYieldPeriodMS` effectively infinite an idle
-      mongod reads `$out` as 7, so the 8 it reads by default already
-      includes a yield. Cause not pinned; judge these tests at 4 workers or
-      fewer.
+      **Time-based plan yields** (measured 2026-10-21): mongod's executor
+      yields after `internalQueryExecYieldPeriodMS` (10 ms), and each re-take
+      of a lock counts. `$out` reads 7 global IS on Linux x86-64 8.2.12 (CI,
+      the exemplar build: Joe, 2026-10-21), 8 on macOS arm64 idle and 9 on a
+      loaded Mac; with the period off, macOS reads 7 too. So this server
+      takes Linux's 7, and the regression tests' reference mongod runs with
+      the period off, which gives Linux's counts on any machine and stops
+      them moving with load. Still unexplained: at 12 test workers on a
+      12-core Mac, `$merge creating its target` read 4 global IS (2 idle) in
+      all five reference runs, with yielding off as well; at CI's 4 workers
+      it reads 2.
       Backlog-ID: RM-185
       Verify: tests/backlog/test_rm_185_locks.py::test_lock_counts_of_merge_fail_with_duplicates
 - **Scope decision — `replSetReconfig` takes one member, this server**

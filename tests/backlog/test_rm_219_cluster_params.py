@@ -17,6 +17,7 @@ from bson import Decimal128, Int64, Timestamp
 from pymongo.errors import PyMongoError
 
 from tests.backlog.test_rm_057_084 import auth_rust, mongod_rs  # noqa: F401 - fixture
+from tests.mongod_reference import sort_type_lists
 
 
 def answer(fn: Callable[[], Any]) -> tuple:
@@ -25,7 +26,8 @@ def answer(fn: Callable[[], Any]) -> tuple:
     try:
         return ("ok", fn())
     except PyMongoError as e:
-        return ("err", getattr(e, "code", None), getattr(e, "details", {}).get("errmsg"))
+        msg = getattr(e, "details", {}).get("errmsg")
+        return ("err", getattr(e, "code", None), sort_type_lists(msg) if msg else msg)
 
 
 DEFAULTS = [

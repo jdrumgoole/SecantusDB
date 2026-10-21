@@ -13,8 +13,10 @@ Every pull request now installs mongod 8.2 and runs the MongoDB backlog's
 gap and regression tests, plus a new set of live comparisons (`tests/mongod_live/`)
 for surface no backlog item covered. A new crash test SIGKILLs the binary in
 the middle of concurrent `j: true` writes in its default mode. The new
-comparisons found six divergences: two are fixed here, and four are filed
-with gap tests.
+comparisons, and the first runs of the lane on Linux, found nine
+divergences: three are fixed here, and six are filed with gap tests --
+among them a retryable write that runs twice, and change-stream post-images
+that are silently wrong.
 
 #### Added
 
@@ -54,6 +56,22 @@ with gap tests.
 - The server ran `collmod`, a lowercase alias mongod 8.2 does not have (59
   CommandNotFound). Pinned by
   `tests/mongod_live/test_operator_tail.py::test_command_matches_mongod[collmod]`.
+- Where mongod's builds disagree, the Linux x86-64 build is the exemplar
+  (Joe, 2026-10-21; CI's reference is Linux 8.2.12, a developer's Mac runs
+  the arm64 build). A window `$stdDev` now computes `count * x - sum` with
+  two roundings as Linux does, not one (the macOS build's FMA): pinned by
+  `tests/backlog/test_rm_found_2026_10_21.py::test_std_dev_window_rounds_as_the_linux_build`
+  (part of RM-231). `$out` takes 7 global IS as Linux does, not macOS's 8,
+  which is a time-based plan yield; RM-185's reference mongod runs with
+  `internalQueryExecYieldPeriodMS` off, which gives Linux's counts on any
+  machine and stops them drifting under load.
+- The RM-181 `$stdDev` regression tests draw multiples of 1/8, which every
+  mongod build computes alike, and check that mongod's incremental answer
+  still differs from a fresh one. RM-219's compares a wrong-type error's
+  expected-type list as the set it is: mongod 8.2.12 orders it differently
+  from 8.2.11, even between two fields of one command
+  (`tests/mongod_reference.py::sort_type_lists`). RM-187's loads its
+  documents on a client with no socket timeout.
 - `tests/test_ci_runs_rust_server_tests.py` now also catches files gated on
   `_secantus_core` or the binary (`SECANTUSDB_BIN`), and records why each
   retired parity suite does not run.
@@ -70,9 +88,15 @@ Filed with gap tests in `tests/backlog/test_rm_found_2026_10_21.py`:
   ignores `onError`.
 - RM-229: a change stream's post-image is the document as it is when the
   event is read, not as the update left it.
+- RM-230: a retryable write retried while its first attempt is still
+  running runs twice; the second answers E11000 for documents the first
+  wrote. RM-187's regression test hit it on CI's slower runner, when a
+  20 s socket timeout made pymongo retry an insert still in progress.
+- RM-231: `$near` returns documents tied at one distance in the macOS
+  build's order, not the Linux build's (`[2, 3, 0, 1]` against
+  `[2, 1, 3, 0]`). Its `$stdDev` half is fixed above.
 
-Measured while wiring the lane: RM-185's lock-count regression tests pass at
-CI's parallelism (all 264 RM regression tests, twice, at 4 workers) but
-drift at 12 workers on a 12-core Mac, where mongod's own counts rise in all
-five reference runs. The cause is not pinned; RM-185 records what was ruled
-out. A failure now prints mongod's five runs for the case.
+The first CI run of the lane also found the Linux runner's limits: RM-211's
+gap test needs about 15 GB (see `--skip`), and RM-185's lock counts move
+with load on a 12-worker Mac (`$merge creating its target`, unexplained,
+recorded in RM-185).

@@ -1178,7 +1178,11 @@ impl RemovableStdDev {
             Bson::Decimal128(d) => d.to_string().parse::<f64>().map_err(|_| Fallback::Defer)?,
             _ => return Err(Fallback::Defer),
         };
-        let delta = (self.count as f64).mul_add(x, -sum);
+        // Two roundings, as mongod's Linux x86-64 build computes it -- the
+        // exemplar (Joe, 2026-10-21). Its macOS arm64 build fuses this into
+        // one rounding (an FMA), and the last digit differs (RM-231).
+        #[allow(clippy::suboptimal_flops)]
+        let delta = self.count as f64 * x - sum;
         self.count += q;
         let qf = q as f64;
         self.sum =

@@ -188,3 +188,113 @@ def test_change_stream_serves_the_stored_post_image(
 
         answers.append(mongo_answer(read))
     assert answers[0] == answers[1]
+
+
+def _op_msg(host: str, port: int, command: dict) -> dict:
+    """One command as a raw OP_MSG on a connection of its own. A driver
+    would replace the `lsid` with a session of its own, and the retry is
+    only a retry if both attempts carry the same one."""
+    import socket
+    import struct
+
+    import bson
+
+    body = b"\x00" + bson.encode(command)
+    msg = struct.pack("<iiii", 16 + 4 + len(body), 1, 0, 2013) + struct.pack("<I", 0) + body
+    with socket.create_connection((host, port), timeout=120) as sock:
+        sock.sendall(msg)
+        head = b""
+        while len(head) < 4:
+            head += sock.recv(4 - len(head))
+        (length,) = struct.unpack("<i", head)
+        rest = b""
+        while len(rest) < length - 4:
+            rest += sock.recv(length - 4 - len(rest))
+    return bson.decode(rest[12 + 4 + 1 :])
+
+
+def _retry_while_running(client: Any, n: int) -> tuple:
+    """Send one retryable insert of `n` documents, and the same command again
+    (same lsid, same txnNumber) on a second connection while the first is
+    still running: what a driver does after a socket timeout. Returns both
+    attempts' `ok`, `n` and first write errors."""
+    import threading
+    import time
+    import uuid
+
+    from bson import Binary, Int64
+
+    host, port = client.address
+    client.drop_database("rm230")
+    cmd = {
+        "insert": "c",
+        "documents": [{"_id": i, "s": "p" * 300} for i in range(n)],
+        "lsid": {"id": Binary(uuid.uuid4().bytes, 4)},
+        "txnNumber": Int64(1),
+        "$db": "rm230",
+    }
+    replies: list = []
+    first = threading.Thread(target=lambda: replies.append(_op_msg(host, port, cmd)), daemon=True)
+    first.start()
+    # 30,000 documents keep the first attempt running well past this; with
+    # few, it could finish first and the second would be a plain (and
+    # correctly answered) retry of a finished write.
+    time.sleep(0.3)
+    replies.append(_op_msg(host, port, cmd))
+    first.join(timeout=120)
+    assert len(replies) == 2, "the first attempt never answered"
+    # Both attempts, in either order: which one runs and which is answered
+    # as the retry depends on which reaches the session first.
+    return sorted(
+        (r.get("ok"), r.get("n"), [(e["index"], e["code"]) for e in r.get("writeErrors", [])][:3])
+        for r in replies
+    )
+
+
+@pytest.mark.backlog("RM-230")
+def test_a_retry_waits_for_the_attempt_still_running(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11: a retry that arrives while its first attempt is still
+    running waits for it (the session is checked out), then answers with the
+    first attempt's result -- both answer `{n: 30000}`, no errors. The Rust
+    server runs the two attempts side by side, and whichever comes second
+    answers E11000 on the documents the other has already written: a
+    driver that timed out reports a failed insert that in fact succeeded.
+    Found when RM-187's regression test hit it on CI's slower runner (a 20 s
+    socket timeout, then pymongo's retry)."""
+    ours = _retry_while_running(rust_mongo, 30_000)
+    theirs = _retry_while_running(mongod_rs, 30_000)
+    assert theirs == [(1.0, 30_000, [])] * 2, theirs  # the reference, as measured
+    assert ours == theirs
+
+
+@pytest.mark.backlog_fixed("RM-231")
+def test_std_dev_window_rounds_as_the_linux_build(rust_mongo: Any) -> None:
+    """mongod's Linux x86-64 build -- the exemplar (Joe, 2026-10-21) --
+    computes a window's `count * x - sum` with two roundings; its macOS
+    arm64 build fuses it into one, and the last digit differs. Recorded
+    from mongod 8.2.12 on CI's Linux runner (2026-10-21): the `$stdDevSamp`
+    of `documents: [-2, 0]` windows over these six doubles. macOS mongod
+    answers 184.0386523296408, 463.51949769953535 and 489.1562645109442 for
+    the last three."""
+    import random
+
+    rng = random.Random(3)
+    xs = [[rng.uniform(-1e3, 1e3) for _ in range(rng.randint(3, 10))] for _ in range(20)][4]
+    pipeline = [
+        {"$documents": [{"i": j, "v": x} for j, x in enumerate(xs)]},
+        {
+            "$setWindowFields": {
+                "sortBy": {"i": 1},
+                "output": {"s": {"$stdDevSamp": "$v", "window": {"documents": [-2, 0]}}},
+            }
+        },
+    ]
+    got = [d["s"] for d in rust_mongo.admin.aggregate(pipeline)]
+    assert got == [
+        None,
+        585.5692783309847,
+        550.3405014627988,
+        184.03865232964097,
+        463.5194976995354,
+        489.15626451094425,
+    ]
