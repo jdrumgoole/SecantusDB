@@ -25837,6 +25837,20 @@ impl PgHandler {
         // COMMIT and ROLLBACK are: rolling back to a savepoint is how a client
         // RECOVERS from the error that poisoned the block.
         if let Statement::Transaction(control) = &stmt {
+            // A COMMIT does the block's temporary tables' ON COMMIT actions
+            // first, inside the block, as `PreCommit_on_commit_actions` does
+            // (RP-065): a commit that then fails undoes them with the rest.
+            if matches!(control, TransactionControl::Commit { .. })
+                && self
+                    .in_transaction
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !self.txn_failed.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                if let Err(e) = self.run_on_commit_actions() {
+                    self.note_failure();
+                    return Err(e);
+                }
+            }
             // Whether the block touched the catalog, read BEFORE the control
             // statement: one that ends the block ends its marks.
             let catalog_touched = self.marks.catalog_changed()
@@ -31127,6 +31141,79 @@ impl PgHandler {
                 temps.push(name);
             }
         }
+        // Outside a block every statement commits as it ends, and so runs
+        // the ON COMMIT actions then (RP-065).
+        if out.is_ok()
+            && !self
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && !self
+                .implicit_extended
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.run_on_commit_actions()?;
+        }
+        out
+    }
+
+    /// The ON COMMIT actions of this session's temporary tables: every
+    /// `DELETE ROWS` table emptied, then every `DROP` table dropped
+    /// (`PreCommit_on_commit_actions`, in its order).
+    fn run_on_commit_actions(&self) -> PgWireResult<()> {
+        thread_local! {
+            static RUNNING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        if RUNNING.with(std::cell::Cell::get) {
+            return Ok(());
+        }
+        let temps = self
+            .temp_tables
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if temps.is_empty() {
+            return Ok(());
+        }
+        let (mut truncate, mut drop) = (Vec::new(), Vec::new());
+        for t in temps {
+            let Some(def) = self.lookup(&t).filter(|d| d.temp) else {
+                continue;
+            };
+            match def.extra.get_str("on_commit") {
+                Ok("delete") => truncate.push(t),
+                Ok("drop") => drop.push(t),
+                _ => {}
+            }
+        }
+        if truncate.is_empty() && drop.is_empty() {
+            return Ok(());
+        }
+        RUNNING.with(|r| r.set(true));
+        // In the block's own storage transaction, when there is one.
+        let out = self.within_block(|| {
+            if !truncate.is_empty() {
+                self.execute(
+                    Statement::Truncate {
+                        tables: truncate,
+                        restart_identity: false,
+                        cascade: false,
+                    },
+                    0,
+                )?;
+            }
+            if !drop.is_empty() {
+                self.execute(
+                    Statement::DropTable(secantus_pgplan::DropTable {
+                        tables: drop,
+                        if_exists: true,
+                        cascade: true,
+                    }),
+                    0,
+                )?;
+            }
+            Ok(())
+        });
+        RUNNING.with(|r| r.set(false));
         out
     }
 

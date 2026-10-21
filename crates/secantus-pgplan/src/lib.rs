@@ -8376,6 +8376,20 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     let table = relation.relname.clone();
     // `CREATE TEMP TABLE`: `relpersistence` is `t` (RELPERSISTENCE_TEMP).
     let temp = relation.relpersistence == "t";
+    // `ON COMMIT DELETE ROWS` / `DROP`: done at each commit (RP-065), and
+    // only a temporary table takes one.
+    let on_commit = match pg_query::protobuf::OnCommitAction::try_from(c.oncommit) {
+        Ok(pg_query::protobuf::OnCommitAction::OncommitDeleteRows) => Some("delete"),
+        Ok(pg_query::protobuf::OnCommitAction::OncommitDrop) => Some("drop"),
+        Ok(pg_query::protobuf::OnCommitAction::OncommitPreserveRows) => Some("preserve"),
+        _ => None,
+    };
+    if on_commit.is_some() && !temp {
+        return Err(Error::Sqlstate(
+            "42P16",
+            "ON COMMIT can only be used on temporary tables".into(),
+        ));
+    }
 
     let mut columns: Vec<Column> = Vec::new();
     // (constraint name if given, expression node, the columns it names) --
@@ -8743,6 +8757,9 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
         def.extra.insert("pk_column_order", table_pk.clone());
     }
     def.temp = temp;
+    if let Some(action) = on_commit.filter(|a| *a != "preserve") {
+        def.extra.insert("on_commit", action);
+    }
     // `CREATE UNLOGGED TABLE` (`relpersistence` `u`): kept so `pg_class`
     // and `pg_relation_is_publishable` can say so; nothing else differs here,
     // where there is no WAL to skip.
