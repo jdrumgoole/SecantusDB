@@ -119,8 +119,37 @@ def _norm(v: object) -> tuple:
     return (type(v).__name__, repr(v))
 
 
+#: `COPY ... TO STDOUT` / `FROM STDIN`, which psycopg runs only through
+#: `cursor.copy()`.
+_COPY_STDIO = re.compile(r"^\s*COPY\b.*\b(TO\s+STDOUT|FROM\s+STDIN)\b", re.IGNORECASE | re.DOTALL)
+
+
+def _run_copy(cur: object, sql: str) -> tuple:
+    """A COPY to the client: the rows it streamed, as one text value. One
+    from the client is sent no data."""
+    with cur.copy(sql) as copy:
+        data = b"".join(bytes(b) for b in copy) if re.search(r"\bTO\s+STDOUT\b", sql, re.I) else b""
+    return ("ok", [(("copy", data.decode("utf-8", "replace")),)], cur.statusmessage, [])
+
+
+def _poisoned(cur: object, sql: str) -> None:
+    """Stop the probe when a statement leaves its connection mid-command.
+
+    Every statement after it then fails with "another command is already in
+    progress" on BOTH servers, which compares as agreement and measures
+    nothing. `COPY ... TO STDOUT` through `execute` did exactly that, and the
+    sweep reported the 13 checks after it in matviews.sql as clean.
+    """
+    from psycopg.pq import TransactionStatus
+
+    if cur.connection.info.transaction_status == TransactionStatus.ACTIVE:
+        raise SystemExit(f"the connection is left mid-command after: {sql}")
+
+
 def _run(cur: object, sql: str, want_types: bool) -> tuple:
     try:
+        if _COPY_STDIO.search(sql):
+            return _run_copy(cur, sql)
         cur.execute(sql)
         if cur.description is None:
             return ("ok", [], cur.statusmessage, [])
@@ -128,6 +157,7 @@ def _run(cur: object, sql: str, want_types: bool) -> tuple:
         types = [d.type_code for d in cur.description] if want_types else []
         return ("ok", rows, cur.statusmessage, types)
     except Exception as exc:  # noqa: BLE001 — the error IS the observation
+        _poisoned(cur, sql)
         code = getattr(getattr(exc, "diag", None), "sqlstate", None)
         return ("err", f"{code}: {str(exc).splitlines()[0]}", None, [])
 
@@ -161,6 +191,7 @@ def _run_params(
         types = [d.type_code for d in cur.description] if want_types else []
         return ("ok", rows, cur.statusmessage, types)
     except Exception as exc:  # noqa: BLE001 — the error IS the observation
+        _poisoned(cur, sql)
         code = getattr(getattr(exc, "diag", None), "sqlstate", None)
         return ("err", f"{code}: {str(exc).splitlines()[0]}", None, [])
 

@@ -1,0 +1,21 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["insert into ia values (1)", "", "ok", [], []],
+["insert into ia values (1, 'x'), (2, 'y', 3)", "", "err", "42601: VALUES lists must all be the same length", []],
+["insert into ia values (1, 'x', 2, 3), (2)", "", "err", "42601: INSERT has more expressions than target columns", []],
+["insert into ia (a) values (1), (2, 3)", "", "err", "42601: VALUES lists must all be the same length", []],
+["insert into ia (a, b) values (1, 'q'), (2)", "", "err", "42601: VALUES lists must all be the same length", []],
+["insert into ia select 1", "", "ok", [], []],
+["insert into ia (a, b) select 1", "", "err", "42601: INSERT has more target columns than expressions", []],
+["insert into ia (a) select 1, 2", "", "err", "42601: INSERT has more expressions than target columns", []],
+["insert into ia select * from ia", "", "ok", [], []],
+["insert into ia (a) select a, b from ia", "", "err", "42601: INSERT has more expressions than target columns", []],
+["insert into ia default values", "", "ok", [], []],
+["insert into ia (a) select 1 union select 2", "", "ok", [], []],
+["insert into ia (a, b) values (default, 'z') returning a, b, c", "", "ok", [[["NoneType", "None"], ["str", "z"], ["num", "7"]]], [23, 25, 23]],
+["select count(*) from ia", "", "ok", [[["num", "8"]]], [20]],
+["values (1, 2), (3)", "", "err", "42601: VALUES lists must all be the same length", []],
+["select * from (values (1), (2, 3)) v", "", "err", "42601: VALUES lists must all be the same length", []],
+["DROP TABLE IF EXISTS ia CASCADE", "", "ok", [], []]
+]}

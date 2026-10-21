@@ -1,0 +1,14 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["DROP TABLE dc_p", "", "err", "2BP01: cannot drop table dc_p because other objects depend on it", []],
+["DROP TABLE dc_p RESTRICT", "", "err", "2BP01: cannot drop table dc_p because other objects depend on it", []],
+["DROP TABLE dc_p CASCADE", "", "ok", [], []],
+["SELECT count(*) FROM information_schema.views WHERE table_name LIKE 'dc\\_%'", "", "ok", [[["num", "0"]]], [20]],
+["SELECT conname FROM pg_constraint WHERE conrelid IN ('dc_c'::regclass, 'dc_c2'::regclass)", "", "ok", [], [19]],
+["INSERT INTO dc_c VALUES (99)", "", "ok", [], []],
+["SELECT * FROM dc_c ORDER BY x", "", "ok", [[["num", "1"]], [["num", "99"]]], [23]],
+["DROP TABLE dc_s", "", "ok", [], []],
+["DROP TABLE dc_c, dc_c2 CASCADE", "", "ok", [], []],
+["DROP TABLE IF EXISTS dc_nope CASCADE", "", "ok", [], []]
+]}

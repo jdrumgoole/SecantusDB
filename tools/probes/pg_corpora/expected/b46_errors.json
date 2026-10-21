@@ -1,0 +1,14 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT a LIKE 'x' FROM b46e", "", "err", "42883: operator does not exist: integer ~~ unknown", []],
+["SELECT a NOT ILIKE 'x' FROM b46e", "", "err", "42883: operator does not exist: integer !~~* unknown", []],
+["SELECT d LIKE 'x' FROM b46e", "", "err", "42883: operator does not exist: date ~~ unknown", []],
+["SELECT s LIKE 'x' FROM b46e", "", "ok", [[["bool", true]]], [16]],
+["SELECT a::text LIKE '1' FROM b46e", "", "ok", [[["bool", true]]], [16]],
+["SELECT * FROM b46e WHERE a LIKE 'x'", "", "err", "42883: operator does not exist: integer ~~ unknown", []],
+["SELECT a FROM b46e x, (SELECT x.a) s", "", "err", "42P01: invalid reference to FROM-clause entry for table \"x\"", []],
+["SELECT a FROM b46e x, (SELECT x.a + 1 AS b) s", "", "err", "42P01: invalid reference to FROM-clause entry for table \"x\"", []],
+["SELECT 1 FROM b46e x, LATERAL (SELECT x.a) s", "", "ok", [[["num", "1"]]], [23]],
+["SELECT * FROM b46e x WHERE EXISTS (SELECT 1 FROM b46e y, (SELECT x.a) z)", "", "ok", [[["num", "1"], ["date", "2024-03-04"], ["str", "x"]]], [23, 1082, 25]]
+]}

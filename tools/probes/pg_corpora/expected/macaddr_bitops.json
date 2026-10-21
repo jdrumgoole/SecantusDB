@@ -1,0 +1,10 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT path '((0,0),(1,1))' < path '((0,0),(1,1),(2,2))', path '((0,0),(1,1))' = path '((0,0),(2,2))', path '((0,0),(1,1))' >= path '((0,0),(2,2))'", "", "ok", [[["bool", true], ["bool", true], ["bool", true]]], [16, 16, 16]],
+["SELECT '08:00:2b:01:02:03'::macaddr & 'ff:ff:ff:00:00:00'::macaddr", "", "ok", [[["str", "08:00:2b:00:00:00"]]], [829]],
+["SELECT '08:00:2b:01:02:03'::macaddr | '00:00:00:ff:ff:ff'::macaddr", "", "ok", [[["str", "08:00:2b:ff:ff:ff"]]], [829]],
+["SELECT ~ '08:00:2b:01:02:03'::macaddr", "", "ok", [[["str", "f7:ff:d4:fe:fd:fc"]]], [829]],
+["SELECT '08:00:2b:01:02:03:04:05'::macaddr8 & 'ff:ff:ff:00:00:00:00:00'::macaddr8, ~ '08:00:2b:01:02:03:04:05'::macaddr8, '08:00:2b:01:02:03:04:05'::macaddr8 | '00:00:00:00:00:00:00:ff'::macaddr8", "", "ok", [[["str", "08:00:2b:00:00:00:00:00"], ["str", "f7:ff:d4:fe:fd:fc:fb:fa"], ["str", "08:00:2b:01:02:03:04:ff"]]], [774, 774, 774]],
+["SELECT pg_typeof(~ '08:00:2b:01:02:03'::macaddr), macaddr_and('08:00:2b:01:02:03', 'ff:ff:ff:00:00:00'), macaddr_not('08:00:2b:01:02:03')", "", "ok", [[["str", "macaddr"], ["str", "08:00:2b:00:00:00"], ["str", "f7:ff:d4:fe:fd:fc"]]], [2206, 829, 829]]
+]}

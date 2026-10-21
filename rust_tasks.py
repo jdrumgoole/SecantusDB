@@ -43,6 +43,8 @@ _RUST_WT_DIR = "crates/secantus-wt"
 _RUST_STORAGE_DIR = "crates/secantus-storage"
 _RUST_ADAPTER_DIR = "crates/secantus-storage-adapter"
 _RUST_PGSERVER_DIR = "crates/secantus-pg"
+# SecantusDB's pgwire fork: excluded from the workspace too, no WiredTiger.
+_RUST_PGWIRE_DIR = "crates/secantus-pgwire"
 _RUST_STORAGE_PY_DIR = "crates/secantus-storage-py"
 _RUST_BINARY_DIR = "crates/secantusdb"
 
@@ -653,16 +655,14 @@ def rust_pgserver_test(c: Context) -> None:
     ``rust-wt-test``.
 
     The pure-Rust halves (``secantus-pgcatalog`` / ``secantus-pgplan``) ARE in
-    the clean workspace and are covered by ``rust-test``.
+    the clean workspace and are covered by ``rust-test``. The pgwire fork
+    (``secantus-pgwire``) is not, and is gated here with it, as CI does.
     """
     env = _rust_env()
-    c.run(f"cd {_RUST_PGSERVER_DIR} && cargo fmt --check", pty=PTY, env=env)
-    c.run(
-        f"cd {_RUST_PGSERVER_DIR} && cargo clippy --all-targets -- -D warnings",
-        pty=PTY,
-        env=env,
-    )
-    c.run(f"cd {_RUST_PGSERVER_DIR} && cargo test", pty=PTY, env=env)
+    for d in (_RUST_PGWIRE_DIR, _RUST_PGSERVER_DIR):
+        c.run(f"cd {d} && cargo fmt --check", pty=PTY, env=env)
+        c.run(f"cd {d} && cargo clippy --all-targets -- -D warnings", pty=PTY, env=env)
+        c.run(f"cd {d} && cargo test", pty=PTY, env=env)
 
 
 @task(name="rust-pgserver-build")
@@ -721,7 +721,13 @@ def rust_fmt(c: Context) -> None:
     """
     env = _rust_env()
     c.run(f"cd {_RUST_WORKSPACE_DIR} && cargo fmt", pty=PTY, env=env)
-    for d in (_RUST_WT_DIR, _RUST_STORAGE_DIR, _RUST_ADAPTER_DIR):
+    for d in (
+        _RUST_WT_DIR,
+        _RUST_STORAGE_DIR,
+        _RUST_ADAPTER_DIR,
+        _RUST_PGWIRE_DIR,
+        _RUST_PGSERVER_DIR,
+    ):
         c.run(f"cd {d} && cargo fmt", pty=PTY, env=env)
 
 

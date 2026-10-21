@@ -1,0 +1,15 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["select array_append('{1.5}', 2)", "", "err", "22P02: invalid input syntax for type integer: \"1.5\"", []],
+["select concat(variadic $$${1,null,3}$$::int[])", "", "err", "22P02: malformed array literal: \"${1,null,3}\"", []],
+["select '{1,x}'::int[]", "", "err", "22P02: invalid input syntax for type integer: \"x\"", []],
+["select array_prepend(1, '{a}')", "", "err", "22P02: invalid input syntax for type integer: \"a\"", []],
+["select a::int[] from ep_t", "", "err", "22P02: invalid input syntax for type integer: \"1.5\"", []],
+["select '(1,x)'::record", "", "err", "0A000: input of anonymous composite types is not implemented", []],
+["select array_cat('{1}', '{y}'::int[])", "", "err", "22P02: invalid input syntax for type integer: \"y\"", []],
+["select '{1.5}'::int[], '{2.5}'::int[]", "", "err", "22P02: invalid input syntax for type integer: \"1.5\"", []],
+["select '(1,x)'::record", "", "err", "0A000: input of anonymous composite types is not implemented", []],
+["select row(1,'x')::record::text", "", "ok", [[["str", "(1,x)"]]], [25]],
+["select null::record is null", "", "ok", [[["bool", true]]], [16]]
+]}

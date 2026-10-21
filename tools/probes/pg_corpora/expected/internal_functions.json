@@ -1,0 +1,18 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["create function in_len(text) returns int language internal as 'textlen'", "", "ok", [], []],
+["select in_len('abcd')", "", "ok", [[["num", "4"]]], [23]],
+["create function in_add(int, int) returns int language internal immutable as 'int4pl'", "", "ok", [], []],
+["select in_add(2, 3)", "", "ok", [[["num", "5"]]], [23]],
+["create function in_up(text) returns text language internal as 'upper'", "", "ok", [], []],
+["select in_up('abc')", "", "ok", [[["str", "ABC"]]], [25]],
+["create function in_abs(numeric) returns numeric language internal as 'numeric_abs'", "", "ok", [], []],
+["select in_abs(-2.5)", "", "ok", [[["num", "2.5"]]], [1700]],
+["create function in_bad(text) returns int language internal as 'no_such_fn'", "", "err", "42883: there is no built-in function named \"no_such_fn\"", []],
+["select proname, prolang = (select oid from pg_language where lanname = 'internal'), prosrc from pg_proc where proname like 'in\\_%' and pronamespace = 'public'::regnamespace order by 1", "", "ok", [[["str", "in_abs"], ["bool", true], ["str", "numeric_abs"]], [["str", "in_add"], ["bool", true], ["str", "int4pl"]], [["str", "in_len"], ["bool", true], ["str", "textlen"]], [["str", "in_up"], ["bool", true], ["str", "upper"]]], [19, 16, 25]],
+["drop function in_len(text)", "", "ok", [], []],
+["drop function in_add(int, int)", "", "ok", [], []],
+["drop function in_up(text)", "", "ok", [], []],
+["drop function in_abs(numeric)", "", "ok", [], []]
+]}

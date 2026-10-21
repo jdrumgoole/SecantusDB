@@ -144,6 +144,10 @@ impl DateStyle {
 }
 
 #[cfg(test)]
+// Upstream pgwire's tests, linted since 2026-10-21: they build a default
+// `FormatOptions` and set one field, and round-trip literal floats such as
+// `3.14`. Both are the test data, not a mistake to rewrite.
+#[allow(clippy::field_reassign_with_default, clippy::approx_constant)]
 mod tests {
     use super::*;
 

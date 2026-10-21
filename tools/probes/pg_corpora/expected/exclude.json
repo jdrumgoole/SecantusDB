@@ -1,0 +1,18 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["INSERT INTO ex_b VALUES (1, 101, '[2020-01-01 10:00, 2020-01-01 12:00)')", "", "ok", [], []],
+["INSERT INTO ex_b VALUES (2, 101, '[2020-01-01 11:00, 2020-01-01 13:00)')", "", "err", "23P01: conflicting key value violates exclusion constraint \"ex_b_room_during_excl\"", []],
+["INSERT INTO ex_b VALUES (3, 102, '[2020-01-01 11:00, 2020-01-01 13:00)')", "", "ok", [], []],
+["INSERT INTO ex_b VALUES (4, 101, '[2020-01-01 12:00, 2020-01-01 13:00)')", "", "ok", [], []],
+["UPDATE ex_b SET during = '[2020-01-01 09:00, 2020-01-01 12:30)' WHERE id = 4", "", "err", "23P01: conflicting key value violates exclusion constraint \"ex_b_room_during_excl\"", []],
+["SELECT id, room FROM ex_b ORDER BY id", "", "ok", [[["num", "1"], ["num", "101"]], [["num", "3"], ["num", "102"]], [["num", "4"], ["num", "101"]]], [23, 23]],
+["INSERT INTO ex_e VALUES (1)", "", "ok", [], []],
+["INSERT INTO ex_e VALUES (1)", "", "err", "23P01: conflicting key value violates exclusion constraint \"ex_e_id_excl\"", []],
+["INSERT INTO ex_e VALUES (NULL), (NULL)", "", "ok", [], []],
+["INSERT INTO ex_r VALUES (1, '[1,5)'), (2, '[5,9)')", "", "ok", [], []],
+["INSERT INTO ex_r VALUES (3, '[4,6)')", "", "err", "23P01: conflicting key value violates exclusion constraint \"no_overlap\"", []],
+["INSERT INTO ex_r VALUES (4, '[10,12)'), (5, '[11,13)')", "", "err", "23P01: conflicting key value violates exclusion constraint \"no_overlap\"", []],
+["SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'ex_r'::regclass ORDER BY conname", "", "ok", [[["str", "ex_r_pkey"], ["str", "p"], ["str", "PRIMARY KEY (id)"]], [["str", "no_overlap"], ["str", "x"], ["str", "EXCLUDE USING gist (r WITH &&)"]]], [19, 18, 25]],
+["SELECT conname, contype FROM pg_constraint WHERE conrelid = 'ex_b'::regclass ORDER BY conname", "", "ok", [[["str", "ex_b_pkey"], ["str", "p"]], [["str", "ex_b_room_during_excl"], ["str", "x"]]], [19, 18]]
+]}

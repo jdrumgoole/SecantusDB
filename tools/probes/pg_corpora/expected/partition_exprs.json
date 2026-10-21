@@ -1,0 +1,20 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["INSERT INTO xpe_l VALUES (1, 'A'), (2, 'b'), (3, 'C')", "", "ok", [], []],
+["INSERT INTO xpe_l VALUES (4, 'D')", "", "err", "23514: no partition of relation \"xpe_l\" found for row", []],
+["SELECT tableoid::regclass::text, id, name FROM xpe_l ORDER BY id", "", "ok", [[["str", "xpe_l_ab"], ["num", "1"], ["str", "A"]], [["str", "xpe_l_ab"], ["num", "2"], ["str", "b"]], [["str", "xpe_l_c"], ["num", "3"], ["str", "C"]]], [25, 23, 25]],
+["INSERT INTO xpe_r VALUES (1, NULL), (7, NULL), (13, NULL), (28, NULL)", "", "ok", [], []],
+["SELECT tableoid::regclass::text, id FROM xpe_r ORDER BY id", "", "ok", [[["str", "xpe_r_lo"], ["num", "1"]], [["str", "xpe_r_hi"], ["num", "7"]], [["str", "xpe_r_lo"], ["num", "13"]], [["str", "xpe_r_hi"], ["num", "28"]]], [25, 23]],
+["INSERT INTO xpe_r VALUES (-3, NULL)", "", "err", "23514: no partition of relation \"xpe_r\" found for row", []],
+["INSERT INTO xpe_o VALUES (100, 5), (1, 15), (0, 10)", "", "ok", [], []],
+["SELECT tableoid::regclass::text, a, b FROM xpe_o ORDER BY a, b", "", "ok", [[["str", "xpe_o2"], ["num", "0"], ["num", "10"]], [["str", "xpe_o2"], ["num", "1"], ["num", "15"]], [["str", "xpe_o1"], ["num", "100"], ["num", "5"]]], [25, 23, 23]],
+["INSERT INTO xpe_o VALUES (1, 25)", "", "err", "23514: no partition of relation \"xpe_o\" found for row", []],
+["SELECT partattrs::text FROM pg_partitioned_table WHERE partrelid IN ('xpe_l'::regclass, 'xpe_o'::regclass) ORDER BY partrelid", "", "ok", [[["str", "0"]], [["str", "2 1"]]], [25]],
+["UPDATE xpe_l SET name = 'c' WHERE id = 1", "", "ok", [], []],
+["SELECT tableoid::regclass::text, id FROM xpe_l ORDER BY id", "", "ok", [[["str", "xpe_l_c"], ["num", "1"]], [["str", "xpe_l_ab"], ["num", "2"]], [["str", "xpe_l_c"], ["num", "3"]]], [25, 23]],
+["SELECT id FROM xpe_l_c ORDER BY id", "", "ok", [[["num", "1"]], [["num", "3"]]], [23]],
+["DROP TABLE xpe_l", "", "ok", [], []],
+["DROP TABLE xpe_r", "", "ok", [], []],
+["DROP TABLE xpe_o", "", "ok", [], []]
+]}

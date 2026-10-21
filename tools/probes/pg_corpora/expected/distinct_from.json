@@ -1,0 +1,13 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT id FROM dd WHERE n IS NOT DISTINCT FROM 10 ORDER BY id", "", "ok", [[["num", "1"]]], [23]],
+["SELECT id FROM dd WHERE n IS DISTINCT FROM 10 ORDER BY id", "", "ok", [[["num", "2"]], [["num", "3"]]], [23]],
+["SELECT id FROM dd WHERE n IS NOT DISTINCT FROM NULL ORDER BY id", "", "ok", [[["num", "2"]]], [23]],
+["SELECT id FROM dd WHERE n IS DISTINCT FROM NULL ORDER BY id", "", "ok", [[["num", "1"]], [["num", "3"]]], [23]],
+["SELECT id FROM dd WHERE s IS DISTINCT FROM 'a' ORDER BY id", "", "ok", [[["num", "2"]], [["num", "3"]]], [23]],
+["SELECT id, n IS DISTINCT FROM 10 FROM dd ORDER BY id", "", "ok", [[["num", "1"], ["bool", false]], [["num", "2"], ["bool", true]], [["num", "3"], ["bool", true]]], [23, 16]],
+["SELECT NULL IS DISTINCT FROM NULL, 1 IS DISTINCT FROM NULL, 1 IS NOT DISTINCT FROM 1", "", "ok", [[["bool", false], ["bool", true], ["bool", true]]], [16, 16, 16]],
+["SELECT a.id, b.id FROM dd a JOIN dd b ON a.n IS NOT DISTINCT FROM b.n ORDER BY 1", "", "ok", [[["num", "1"], ["num", "1"]], [["num", "2"], ["num", "2"]], [["num", "3"], ["num", "3"]]], [23, 23]],
+["DELETE FROM dd WHERE n IS NOT DISTINCT FROM NULL RETURNING id", "", "ok", [[["num", "2"]]], [23]]
+]}

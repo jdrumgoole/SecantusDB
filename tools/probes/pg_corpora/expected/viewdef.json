@@ -1,0 +1,9 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT pg_get_viewdef('vgd_v'::regclass) = (SELECT definition FROM pg_views WHERE viewname = 'vgd_v')", "", "ok", [[["bool", true]]], [16]],
+["SELECT pg_get_viewdef('vgd_t'::regclass) IS NULL, pg_get_viewdef(0) IS NULL", "", "ok", [[["bool", true], ["bool", true]]], [16, 16]],
+["SELECT pg_get_viewdef(c.oid) = pg_get_viewdef('vgd_v') FROM pg_class c WHERE c.relname = 'vgd_v'", "", "ok", [[["bool", true]]], [16]],
+["DROP VIEW vgd_v", "", "ok", [], []],
+["DROP TABLE vgd_t", "", "ok", [], []]
+]}

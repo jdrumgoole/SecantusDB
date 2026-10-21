@@ -1,0 +1,15 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT r.rolname, m.rolname, am.admin_option FROM pg_auth_members am JOIN pg_roles r ON r.oid = am.roleid JOIN pg_roles m ON m.oid = am.member WHERE r.rolname LIKE 'rm_%' ORDER BY 1, 2", "", "ok", [[["str", "rm_a"], ["str", "rm_b"], ["bool", false]], [["str", "rm_c"], ["str", "rm_b"], ["bool", false]], [["str", "rm_d"], ["str", "rm_b"], ["bool", true]]], [19, 19, 16]],
+["SELECT pg_has_role('rm_b', 'rm_a', 'member'), pg_has_role('rm_b', 'rm_a', 'usage'), pg_has_role('rm_b', 'rm_b', 'member')", "", "ok", [[["bool", true], ["bool", true], ["bool", true]]], [16, 16, 16]],
+["SELECT pg_has_role('rm_e', 'rm_a', 'member'), pg_has_role('rm_b', 'rm_c', 'member')", "", "ok", [[["bool", false], ["bool", true]]], [16, 16]],
+["SELECT pg_has_role('rm_b', 'rm_d', 'member with admin option'), pg_has_role('rm_b', 'rm_a', 'MEMBER WITH ADMIN OPTION')", "", "ok", [[["bool", true], ["bool", false]]], [16, 16]],
+["SELECT pg_has_role('rm_a', 'member')", "", "ok", [[["bool", true]]], [16]],
+["SELECT pg_has_role('nosuch', 'rm_a', 'member')", "", "err", "42704: role \"nosuch\" does not exist", []],
+["SELECT pg_has_role('rm_b', 'rm_a', 'bogus')", "", "err", "22023: unrecognized privilege type: \"bogus\"", []],
+["GRANT rm_a TO rm_e", "", "ok", [], []],
+["SELECT pg_has_role('rm_e', 'rm_a', 'member')", "", "ok", [[["bool", true]]], [16]],
+["REVOKE rm_a FROM rm_e", "", "ok", [], []],
+["SELECT pg_has_role('rm_e', 'rm_a', 'member')", "", "ok", [[["bool", false]]], [16]]
+]}

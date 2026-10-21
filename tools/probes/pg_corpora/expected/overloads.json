@@ -1,0 +1,17 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["CREATE FUNCTION ov(a int) RETURNS text LANGUAGE sql AS 'SELECT ''int '' || a'", "", "ok", [], []],
+["CREATE FUNCTION ov(a text) RETURNS text LANGUAGE sql AS 'SELECT ''text '' || a'", "", "ok", [], []],
+["CREATE FUNCTION ov(a int) RETURNS text LANGUAGE sql AS 'SELECT ''again'''", "", "err", "42723: function \"ov\" already exists with same argument types", []],
+["SELECT ov(1), ov('x'), ov('x'::text), ov(2::int)", "", "ok", [[["str", "int 1"], ["str", "text x"], ["str", "text x"], ["str", "int 2"]]], [25, 25, 25, 25]],
+["SELECT ov(1.5)", "", "err", "42883: function ov(numeric) does not exist", []],
+["CREATE OR REPLACE FUNCTION ov(a text) RETURNS text LANGUAGE sql AS 'SELECT ''TEXT '' || a'", "", "ok", [], []],
+["SELECT ov('y')", "", "ok", [[["str", "TEXT y"]]], [25]],
+["SELECT count(*) FROM pg_proc WHERE proname = 'ov'", "", "ok", [[["num", "2"]]], [20]],
+["DROP FUNCTION ov", "", "err", "42725: function name \"ov\" is not unique", []],
+["DROP FUNCTION ov(text)", "", "ok", [], []],
+["SELECT ov('z')", "", "err", "22P02: invalid input syntax for type integer: \"z\"", []],
+["SELECT ov(3)", "", "ok", [[["str", "int 3"]]], [25]],
+["DROP FUNCTION ov(int)", "", "ok", [], []]
+]}

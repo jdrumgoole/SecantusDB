@@ -1,0 +1,20 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["INSERT INTO pcx (id, v) VALUES (1, 5)", "", "ok", [], []],
+["SELECT * FROM pcx ORDER BY id", "", "ok", [[["num", "1"], ["num", "5"], ["NoneType", "None"]]], [23, 23, 25]],
+["INSERT INTO pcx (id, v) VALUES (2, NULL)", "", "err", "23502: null value in column \"v\" of relation \"pcx1\" violates not-null constraint", []],
+["INSERT INTO pcx (id, v) VALUES (3, -1)", "", "err", "23514: new row for relation \"pcx1\" violates check constraint \"pcx1_v\"", []],
+["INSERT INTO pcx1 (id, v) VALUES (4, 4)", "", "ok", [], []],
+["SELECT * FROM pcx1 ORDER BY id", "", "ok", [[["num", "1"], ["num", "5"], ["NoneType", "None"]], [["num", "4"], ["num", "4"], ["str", "dflt"]]], [23, 23, 25]],
+["SELECT column_name, is_nullable, column_default FROM information_schema.columns WHERE table_name = 'pcx1' ORDER BY ordinal_position", "", "ok", [[["str", "id"], ["str", "YES"], ["NoneType", "None"]], [["str", "v"], ["str", "NO"], ["NoneType", "None"]], [["str", "s"], ["str", "YES"], ["str", "'dflt'::text"]]], [19, 1043, 1043]],
+["INSERT INTO pcx VALUES (11, 1, 'a'), (11, 2, 'b')", "", "err", "23505: duplicate key value violates unique constraint \"pcx2_pkey\"", []],
+["INSERT INTO pcx VALUES (11, 1, 'a')", "", "ok", [], []],
+["INSERT INTO pcx2 VALUES (11, 1, 'a')", "", "err", "23505: duplicate key value violates unique constraint \"pcx2_pkey\"", []],
+["UPDATE pcx SET id = 11 WHERE id = 1", "", "err", "23505: duplicate key value violates unique constraint \"pcx2_pkey\"", []],
+["INSERT INTO pcx VALUES (21, 9, 'x')", "", "err", "23514: new row for relation \"pcx3\" violates check constraint \"pcx3_v_check\"", []],
+["INSERT INTO pcx VALUES (21, 1, 'x'), (22, 2, 'x')", "", "err", "23505: duplicate key value violates unique constraint \"pcx3_s_key\"", []],
+["SELECT count(*) FROM pcx", "", "ok", [[["num", "3"]]], [20]],
+["CREATE TABLE pcx4 PARTITION OF pcx (nosuch NOT NULL) FOR VALUES FROM (30) TO (40)", "", "err", "42703: column \"nosuch\" does not exist", []],
+["DROP TABLE pcx CASCADE", "", "ok", [], []]
+]}

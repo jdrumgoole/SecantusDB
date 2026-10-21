@@ -43291,7 +43291,7 @@ impl PgWireServerHandlers for HandlerFactory {
                     .load(std::sync::atomic::Ordering::Relaxed)
                 {
                     let info: ErrorInfo = PgHandler::admin_shutdown().into();
-                    return pgwire::api::IdleEvent::Fatal(info);
+                    return pgwire::api::IdleEvent::Fatal(Box::new(info));
                 }
                 let messages = handler.drain_notifications();
                 if !messages.is_empty() {

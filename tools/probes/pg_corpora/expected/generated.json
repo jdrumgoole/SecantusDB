@@ -1,0 +1,20 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["CREATE TABLE gc (id int PRIMARY KEY, a int, b int GENERATED ALWAYS AS (a * 2) STORED, c text GENERATED ALWAYS AS (upper('x' || a::text)) STORED)", "", "ok", [], []],
+["INSERT INTO gc (id, a) VALUES (1, 3)", "", "ok", [], []],
+["INSERT INTO gc VALUES (2, 4, 5)", "", "err", "428C9: cannot insert a non-DEFAULT value into column \"b\"", []],
+["INSERT INTO gc VALUES (2, 4, DEFAULT)", "", "ok", [], []],
+["INSERT INTO gc (id, a, c) VALUES (3, 1, 'no')", "", "err", "428C9: cannot insert a non-DEFAULT value into column \"c\"", []],
+["UPDATE gc SET a = 10 WHERE id = 1", "", "ok", [], []],
+["UPDATE gc SET b = 1", "", "err", "428C9: column \"b\" can only be updated to DEFAULT", []],
+["UPDATE gc SET b = DEFAULT, a = a + 1 WHERE id = 2", "", "ok", [], []],
+["SELECT * FROM gc ORDER BY id", "", "ok", [[["num", "1"], ["num", "10"], ["num", "20"], ["str", "X10"]], [["num", "2"], ["num", "5"], ["num", "10"], ["str", "X5"]]], [23, 23, 23, 25]],
+["INSERT INTO gc (id, a) VALUES (4, NULL)", "", "ok", [], []],
+["SELECT b, c FROM gc WHERE id = 4", "", "ok", [[["NoneType", "None"], ["NoneType", "None"]]], [23, 25]],
+["SELECT attname, attgenerated FROM pg_attribute WHERE attrelid = 'gc'::regclass AND attnum > 0 ORDER BY attnum", "", "ok", [[["str", "id"], ["str", ""]], [["str", "a"], ["str", ""]], [["str", "b"], ["str", "s"]], [["str", "c"], ["str", "s"]]], [19, 18]],
+["SELECT column_name, is_generated, generation_expression FROM information_schema.columns WHERE table_name = 'gc' ORDER BY ordinal_position", "", "ok", [[["str", "id"], ["str", "NEVER"], ["NoneType", "None"]], [["str", "a"], ["str", "NEVER"], ["NoneType", "None"]], [["str", "b"], ["str", "ALWAYS"], ["str", "(a * 2)"]], [["str", "c"], ["str", "ALWAYS"], ["str", "upper(('x'::text || (a)::text))"]]], [19, 1043, 1043]],
+["SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'gc'::regclass ORDER BY adnum", "", "ok", [[["str", "(a * 2)"]], [["str", "upper(('x'::text || (a)::text))"]]], [25]],
+["INSERT INTO gc (id, a) SELECT 5, 7", "", "ok", [], []],
+["SELECT b FROM gc WHERE id = 5", "", "ok", [[["num", "14"]]], [23]]
+]}

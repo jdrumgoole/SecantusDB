@@ -1,0 +1,17 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT count(*), count(i), count(n), count(t) FROM b60_a", "", "ok", [[["num", "4000"], ["num", "3637"], ["num", "3429"], ["num", "3200"]]], [20, 20, 20, 20]],
+["SELECT sum(i), sum(b), sum(n), min(i), max(i) FROM b60_a", "", "ok", [[["num", "28327"], ["num", "35999999999999975994000"], ["num", "25705.608"], ["num", "-40"], ["num", "56"]]], [20, 1700, 1700, 23, 23]],
+["SELECT min(n), max(n), min(t), max(t), min(c), max(c) FROM b60_a", "", "ok", [[["num", "0"], ["num", "15.004"], ["str", "v0"], ["str", "v999"], ["str", "c0  "], ["str", "c8  "]]], [1700, 1700, 25, 25, 1042, 1042]],
+["SELECT bool_and(f), bool_or(f), bool_and(i > -100) FROM b60_a", "", "ok", [[["bool", false], ["bool", true], ["bool", true]]], [16, 16, 16]],
+["SELECT sum(i), count(*) FROM b60_a WHERE t LIKE 'v1%'", "", "ok", [[["num", "2727"], ["num", "381"]]], [20, 20]],
+["SELECT max(length(t)), min(i * 2), count(*) + 1 FROM b60_a", "", "ok", [[["num", "5"], ["num", "-80"], ["num", "4001"]]], [23, 23, 20]],
+["SELECT count(*), sum(i), min(t), max(n), bool_or(f) FROM b60_a0", "", "err", "42703: column \"t\" does not exist", []],
+["SELECT sum(i) FROM b60_a HAVING count(*) > 10", "", "ok", [[["num", "28327"]]], [20]],
+["SELECT sum(i) FROM b60_a HAVING count(*) > 100000", "", "ok", [], [20]],
+["SELECT avg(i), sum(i::float8), count(DISTINCT i % 10) FROM b60_a", "", "ok", [[["num", "7.7885620016497113"], ["num", "28327"], ["num", "19"]]], [1700, 701, 20]],
+["SELECT count(*) FILTER (WHERE i > 0), max(t) FROM b60_a", "", "ok", [[["num", "2087"], ["str", "v999"]]], [20, 25]],
+["SELECT sum(b) FROM b60_a WHERE id < 3", "", "ok", [[["num", "17999999999999999991"]]], [1700]],
+["SELECT sum(n) * 2, max(i) - min(i) FROM b60_a WHERE id > 2000", "", "ok", [[["num", "25694.356"], ["num", "96"]]], [1700, 23]]
+]}

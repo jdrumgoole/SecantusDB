@@ -1,0 +1,11 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT 'a & b'::tsquery @> 'a'::tsquery, 'a'::tsquery <@ 'a & b'::tsquery, 'a'::tsquery @> 'a & b'::tsquery", "", "ok", [[["bool", true], ["bool", true], ["bool", false]]], [16, 16, 16]],
+["SELECT 'a | b'::tsquery @> 'b & a'::tsquery, 'a & b & c'::tsquery @> 'c | d'::tsquery, '!a'::tsquery @> 'a'::tsquery", "", "ok", [[["bool", true], ["bool", false], ["bool", true]]], [16, 16, 16]],
+["SELECT tsq_mcontains('a & b', 'a'), tsq_mcontained('a', 'a & b')", "", "ok", [[["bool", true], ["bool", true]]], [16, 16]],
+["SELECT tsq_mcontains('a & b', 'a')", "", "ok", [[["bool", true]]], [16]],
+["SELECT tsq_mcontains('a & b'::tsquery, 'a'::tsquery)", "", "ok", [[["bool", true]]], [16]],
+["SELECT 'a & b' @> 'a'::tsquery", "", "ok", [[["bool", true]]], [16]],
+["SELECT 'a'::tsquery <@ 'a & b'", "", "ok", [[["bool", true]]], [16]]
+]}

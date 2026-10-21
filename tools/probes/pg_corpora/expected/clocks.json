@@ -1,0 +1,16 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {"1": "reads the clock or the server process", "2": "reads the clock or the server process", "3": "reads the clock or the server process", "4": "reads the clock or the server process", "5": "reads the clock or the server process", "7": "reads the clock or the server process", "9": "reads the clock or the server process", "10": "reads the clock or the server process"},
+"checks": [
+["begin", "", "ok", [], []],
+["select 'now'::timestamptz = now()", "", "ok", [[["bool", true]]], [16]],
+["select pg_sleep(0.05)", "", "ok", [[["str", ""]]], [2278]],
+["select now() = transaction_timestamp(), now() < statement_timestamp(), statement_timestamp() <= clock_timestamp()", "", "ok", [[["bool", true], ["bool", true], ["bool", true]]], [16, 16, 16]],
+["select current_timestamp = now(), localtimestamp = now()::timestamp, current_date = now()::date", "", "ok", [[["bool", true], ["bool", true], ["bool", true]]], [16, 16, 16]],
+["create table nw_t (t timestamptz default now())", "", "ok", [], []],
+["insert into nw_t values (default)", "", "ok", [], []],
+["select count(*) from nw_t where t = now()", "", "ok", [[["num", "1"]]], [20]],
+["commit", "", "ok", [], []],
+["select now() - statement_timestamp() = interval '0'", "", "ok", [[["bool", true]]], [16]],
+["select clock_timestamp() > now()", "", "ok", [[["bool", true]]], [16]],
+["drop table nw_t", "", "ok", [], []]
+]}

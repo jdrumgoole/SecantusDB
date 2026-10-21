@@ -1,0 +1,22 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["select '(1,x)'::rt_t::text", "", "ok", [[["str", "(1,x)"]]], [25]],
+["select row(1, 'x')::rt_t::text", "", "ok", [[["str", "(1,x)"]]], [25]],
+["select '(ab,x)'::rt_c::text", "", "ok", [[["str", "(\"ab \",x)"]]], [25]],
+["select row('ab', 'x')::rt_c::text", "", "ok", [[["str", "(\"ab \",x)"]]], [25]],
+["select ('(ab,x)'::rt_c).c || '|'", "", "ok", [[["str", "ab|"]]], [25]],
+["alter table rt_t drop column a", "", "ok", [], []],
+["select '(y)'::rt_t::text", "", "ok", [[["str", "(y)"]]], [25]],
+["select '(abcd,x)'::rt_c::text", "", "err", "22001: value too long for type character(3)", []],
+["select '(\"ab  \",x)'::rt_c::text", "", "ok", [[["str", "(\"ab \",x)"]]], [25]],
+["create table rt_d (a int, c char(2))", "", "ok", [], []],
+["alter table rt_d alter column c type char(4)", "", "ok", [], []],
+["select '(1,z)'::rt_d::text", "", "ok", [[["str", "(1,\"z   \")"]]], [25]],
+["alter table rt_d rename column c to cc", "", "ok", [], []],
+["select ('(1,z)'::rt_d).cc", "", "ok", [[["str", "z   "]]], [1042]],
+["select '(ab,x)'::rt_ct::text", "", "ok", [[["str", "(\"ab \",x)"]]], [25]],
+["select row('ab','x')::rt_ct::text", "", "ok", [[["str", "(\"ab \",x)"]]], [25]],
+["select '(abcd,x)'::rt_ct::text", "", "err", "22001: value too long for type character(3)", []],
+["select ('(ab,x)'::rt_ct).c || '|'", "", "ok", [[["str", "ab|"]]], [25]]
+]}

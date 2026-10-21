@@ -1,0 +1,15 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["UPDATE rs_t SET v = 1 WHERE k = 1 RETURNING rs_t.*", "", "ok", [[["num", "1"], ["num", "1"], ["str", "a"]]], [23, 23, 25]],
+["UPDATE rs_t x SET v = 2 WHERE k = 1 RETURNING x.*, 9", "", "ok", [[["num", "1"], ["num", "2"], ["str", "a"], ["num", "9"]]], [23, 23, 25, 23]],
+["UPDATE rs_t SET v = 3 FROM rs_s s2 WHERE s2.k = rs_t.k AND s2.n = 100 RETURNING *", "", "ok", [[["num", "1"], ["num", "3"], ["str", "a"], ["num", "1"], ["num", "100"], ["str", "one"]]], [23, 23, 25, 23, 23, 25]],
+["UPDATE rs_t SET v = 4 FROM rs_s s2 WHERE s2.k = rs_t.k AND s2.n = 100 RETURNING s2.*", "", "ok", [[["num", "1"], ["num", "100"], ["str", "one"]]], [23, 23, 25]],
+["UPDATE rs_t SET v = 5 FROM rs_s s2 WHERE s2.k = rs_t.k AND s2.n = 100 RETURNING rs_t.*, s2.n", "", "ok", [[["num", "1"], ["num", "5"], ["str", "a"], ["num", "100"]]], [23, 23, 25, 23]],
+["UPDATE rs_t SET v = 6 FROM (SELECT 1 AS k, 'x' AS w) q WHERE q.k = rs_t.k RETURNING *", "", "ok", [[["num", "1"], ["num", "6"], ["str", "a"], ["num", "1"], ["str", "x"]]], [23, 23, 25, 23, 25]],
+["UPDATE rs_t SET v = 7 FROM rs_s s2 WHERE s2.k = rs_t.k AND s2.n = 100 RETURNING nope.*", "", "err", "42P01: missing FROM-clause entry for table \"nope\"", []],
+["DELETE FROM rs_t USING rs_s s2 WHERE s2.k = rs_t.k AND s2.n = 200 RETURNING rs_t.*", "", "ok", [[["num", "2"], ["num", "10"], ["str", "b"]]], [23, 23, 25]],
+["DELETE FROM rs_t USING rs_s s2 WHERE s2.k = rs_t.k AND s2.n = 100 RETURNING *", "", "ok", [[["num", "1"], ["num", "6"], ["str", "a"], ["num", "1"], ["num", "100"], ["str", "one"]]], [23, 23, 25, 23, 23, 25]],
+["DELETE FROM rs_t WHERE k = 3 RETURNING rs_t.*", "", "ok", [[["num", "3"], ["num", "20"], ["str", "c"]]], [23, 23, 25]],
+["SELECT * FROM rs_t ORDER BY k", "", "ok", [], [23, 23, 25]]
+]}

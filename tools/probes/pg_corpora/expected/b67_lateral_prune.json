@@ -1,0 +1,23 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {"14": "reads the clock or the server process"},
+"checks": [
+["SELECT count(*) FROM (SELECT a/b AS x FROM b67_l) s, LATERAL (SELECT s.x) l", "", "ok", [[["num", "3"]]], [20]],
+["SELECT count(*) FROM (SELECT a/b AS x, a FROM b67_l) s, LATERAL (SELECT s.x, s.a) l", "", "ok", [[["num", "3"]]], [20]],
+["SELECT s.a FROM (SELECT a/b AS x, a FROM b67_l) s, LATERAL (SELECT s.x AS y) l ORDER BY 1", "", "ok", [[["num", "1"]], [["num", "2"]], [["num", "3"]]], [23]],
+["SELECT l.z FROM (SELECT a/b AS x, a FROM b67_l) s, LATERAL (SELECT s.x AS y, s.a * 10 AS z) l ORDER BY 1", "", "ok", [[["num", "10"]], [["num", "20"]], [["num", "30"]]], [23]],
+["SELECT count(*) FROM (SELECT a/b AS x FROM b67_l) s CROSS JOIN LATERAL (SELECT s.x) l", "", "ok", [[["num", "3"]]], [20]],
+["SELECT count(*) FROM (SELECT a/b AS x FROM b67_l) s JOIN LATERAL (SELECT s.x AS y) l ON true", "", "ok", [[["num", "3"]]], [20]],
+["SELECT count(*) FROM (SELECT a/b AS x FROM b67_l) s LEFT JOIN LATERAL (SELECT s.x AS y) l ON true", "", "ok", [[["num", "3"]]], [20]],
+["SELECT count(*) FROM (SELECT a/b AS x, a FROM b67_l) s, LATERAL (SELECT s.x FROM b67_l t WHERE t.a = s.a) l", "", "ok", [[["num", "3"]]], [20]],
+["SELECT l.y FROM (SELECT a/b AS x FROM b67_l) s, LATERAL (SELECT s.x AS y) l", "", "err", "22012: division by zero", []],
+["SELECT count(*) FROM (SELECT a/b AS x FROM b67_l) s, LATERAL (SELECT s.x WHERE s.x > 0) l", "", "err", "22012: division by zero", []],
+["SELECT count(*) FROM (SELECT a/b AS x FROM b67_l) s, LATERAL (SELECT s.x, nosuch) l", "", "err", "42703: column \"nosuch\" does not exist", []],
+["SELECT count(*) FROM (SELECT a FROM b67_l) s, LATERAL (SELECT s.a / 0 AS q) l", "", "ok", [[["num", "3"]]], [20]],
+["SELECT count(*) FROM (SELECT a FROM b67_l) s, LATERAL (SELECT s.a / 0 AS q, s.a AS r) l WHERE l.r > 1", "", "ok", [[["num", "2"]]], [20]],
+["SELECT count(*) FROM (SELECT a FROM b67_l) s, LATERAL (SELECT DISTINCT s.a / 0 AS q) l", "", "err", "22012: division by zero", []],
+["SELECT count(*) FROM (SELECT a FROM b67_l) s, LATERAL (SELECT random() + s.a / 0 AS q) l", "", "err", "22012: division by zero", []],
+["SELECT count(*) FROM (SELECT a/b AS x FROM b67_l) s, LATERAL (SELECT s.x LIMIT 1) l", "", "ok", [[["num", "3"]]], [20]],
+["SELECT count(*) FROM (SELECT a/b AS x FROM b67_l) s, LATERAL (SELECT s.x UNION ALL SELECT s.x) l", "", "ok", [[["num", "6"]]], [20]],
+["SELECT count(*) FROM (SELECT a/b AS x FROM b67_l) s, LATERAL (SELECT sum(s.x)) l", "", "err", "42803: aggregate functions are not allowed in FROM clause of their own query level", []],
+["SELECT count(*) FROM (SELECT a/b AS x FROM b67_l) s, LATERAL (SELECT s.x FROM generate_series(1, 2)) l", "", "ok", [[["num", "6"]]], [20]]
+]}
