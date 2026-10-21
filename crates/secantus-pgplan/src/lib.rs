@@ -94,6 +94,7 @@ pub mod formatting;
 pub mod fts;
 mod func_cast;
 mod funcsig;
+mod strict_fold;
 pub mod timezones;
 mod ts_debug;
 mod ts_rewrite;
@@ -19483,6 +19484,9 @@ fn plan_select(
         return plan_select(&rewritten, lookup, params);
     }
     let expanded = expand_views(s)?;
+    // A strict operator over a NULL constant is NULL before anything runs
+    // (RP-075).
+    let expanded = strict_fold::fold_select(&expanded)?.unwrap_or(expanded);
     let s = &expanded;
     // The locking clauses, checked once per top-level statement, on the
     // statement as written (views expanded): the rewrites below may move
@@ -23004,6 +23008,13 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                                 || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_)))) =>
                     {
                         static_type(r, &Bson::Null)
+                    }
+                    // Typed from the `=` PostgreSQL resolves: its LEFT input
+                    // type, which an implicit cast may widen (RP-076).
+                    (Some(l), Some(r)) => {
+                        let lt = static_type(l, value);
+                        let rt = static_type(r, &Bson::Null);
+                        funcsig::operator_left_input("=", &lt, &rt).unwrap_or(lt)
                     }
                     (Some(l), _) => static_type(l, value),
                     _ => inferred_type(value).to_string(),
@@ -37198,16 +37209,36 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
             } else {
                 (lhs, rhs)
             };
-            return Ok(
-                if lhs != Bson::Null
-                    && rhs != Bson::Null
-                    && compare_constants(&lhs, &rhs) == Some(std::cmp::Ordering::Equal)
-                {
-                    Bson::Null
-                } else {
-                    lhs
-                },
-            );
+            if lhs != Bson::Null
+                && rhs != Bson::Null
+                && compare_constants(&lhs, &rhs) == Some(std::cmp::Ordering::Equal)
+            {
+                return Ok(Bson::Null);
+            }
+            // The value is the left operand coerced to the `=` operator's
+            // left input type (`nullif(53, 80::numeric)` is numeric 53).
+            if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+                if lhs != Bson::Null && !l_bare {
+                    let lt = static_type(l, &lhs);
+                    let rt = static_type(r, &rhs);
+                    if let Some(input) = funcsig::operator_left_input("=", &lt, &rt) {
+                        if input != lt {
+                            // A `char(n)` loses its padding on the way to
+                            // text, as `rtrim1` does.
+                            let lhs = match lhs {
+                                Bson::String(v)
+                                    if matches!(lt.as_str(), "bpchar" | "char" | "character") =>
+                                {
+                                    Bson::String(v.trim_end_matches(' ').to_string())
+                                }
+                                other => other,
+                            };
+                            return cast_value(lhs, &input);
+                        }
+                    }
+                }
+            }
+            return Ok(lhs);
         }
         if matches!(
             AExprKind::try_from(e.kind),
