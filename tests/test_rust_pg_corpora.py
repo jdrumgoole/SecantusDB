@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -117,6 +118,10 @@ def connection(tmp_path: Path) -> Iterator[psycopg.Connection]:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
+    # WiredTiger preallocates a 128 MB log file per store, which Linux really
+    # allocates; pytest keeps every tmp_path to the end of the session, so one
+    # store per corpus filled a CI runner's disk.
+    shutil.rmtree(tmp_path / "home")
 
 
 def test_every_corpus_has_a_record() -> None:

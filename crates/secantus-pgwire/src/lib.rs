@@ -103,6 +103,11 @@
 //! transactions, cursors, COPY, cancellation and a basic client.
 //!
 
+// clippy 1.99 reports `redundant_field_names` inside the constructors
+// `#[derive(new)]` generates (`Self { salt: salt, .. }`), pointing at the
+// struct's own field declarations; derive-new 0.7.0, the latest, emits them so.
+#![allow(clippy::redundant_field_names)]
+
 #[macro_use]
 extern crate derive_new;
 

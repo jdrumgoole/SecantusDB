@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import os
+import shutil
 import time
 from collections.abc import Iterator
 from decimal import Decimal
@@ -866,6 +867,10 @@ def ours(tmp_path: Path) -> Iterator[psycopg.Connection]:
         for sql in SETUP:
             cur.execute(sql)
         yield conn
+    # WiredTiger preallocates a 128 MB log file per store, which Linux really
+    # allocates; pytest keeps every tmp_path to the end of the session, so 836
+    # stores filled a CI runner's disk. The server has exited by here.
+    shutil.rmtree(home)
 
 
 @pytest.mark.parametrize("sql", QUERIES, ids=lambda s: s[:58])
