@@ -527,6 +527,171 @@ These are explicit non-goals. Don't add them without a reason.
       Backlog-ID: RM-023
       Verify: tests/backlog/test_rm_001_028.py::test_slow_query_line_says_where_the_time_went
 
+### 7.088 Expression code no test had executed, against mongod -- 2026-10-21
+
+A line-coverage run (`docs-rust/coverage.md`, `./inv rust-mdb-coverage`)
+found ~2,000 lines of `crates/secantus-core/src/expressions.rs` that no test
+suite executed; the generic `tools/probes/agg_expressions.py` sweep reached
+about half of them, and none of what it reached diverged beyond the
+authorised Decimal128 last digit. The rest sits behind STRUCTURED arguments
+the generic sweep cannot build (`op_switch` had never run at all), so the
+cases in `tools/probes/expression_shapes.py` were written against those
+lines and run against mongod 8.2.11 on macOS arm64. Each item below is one
+root cause; its gap test in `tests/backlog/test_rm_found_2026_10_21b.py`
+holds every shape measured for it and asks mongod live. The first four are
+in the shared comparison code, so they change `$match`, `$sort`-free set
+operators and `$group` answers too, not only expressions.
+
+- [ ] **BinData compares by its bytes alone.** mongod orders BinData by
+  length, then subtype, then bytes; the Rust comparison (`order.rs`) reads
+  the bytes only. `{$cmp: [BinData("\x02"), BinData("\x01\x01")]}` is -1 on
+  mongod and 1 here, `$setUnion` of two subtypes keeps one, and
+  `find({b: {$gt: BinData("\x01\x01")}})` returns a document mongod
+  excludes; `$group` `$max` picks the other value. (`find().sort()` on
+  BinData already agrees.)
+  Backlog-ID: RM-232
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_bindata_orders_by_length_then_subtype
+- [ ] **JavaScript-with-scope shares JavaScript's type rank, and its scope is
+  not compared.** `order.rs` ranks both 125 and compares the code; mongod
+  ranks them apart and compares the scope, so `$cmp`, `$lt` and
+  `$setEquals` over `Code("a", {x: 1})` answer differently.
+  Backlog-ID: RM-233
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_code_with_scope_is_its_own_type_and_scope_counts
+- [ ] **MinKey and MaxKey are not equal to themselves.** `py_eq`
+  (`expressions.rs`) has no arm for either and falls to `false`, so `$eq`,
+  `$ne`, `$in`, `$indexOfArray` and nested equality are all inverted.
+  Backlog-ID: RM-234
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_minkey_and_maxkey_equal_themselves
+- [ ] **Document equality ignores field order.** `py_eq` looks each field up
+  by name, so `{b: 1, a: 1}` equals `{a: 1, b: 1}`; mongod compares the
+  fields in order and answers false, in `$eq`, `$in` and nested documents.
+  Backlog-ID: RM-235
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_document_equality_respects_field_order
+- [ ] **Regex `\w`, `\d`, `\s` and `\b` match Unicode characters.** mongod's
+  PCRE matches them against ASCII only, with or without the `u` flag, in
+  `$regexMatch` / `$regexFind` and in a `find` `$regex`: `^\w$` matches "é"
+  here and not on mongod.
+  Backlog-ID: RM-236
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_regex_classes_are_ascii
+- [ ] **`$regexFindAll` adds an empty match at the end of the string.** An
+  empty-matching pattern over "abc" is 3 matches on mongod and 4 here.
+  Backlog-ID: RM-237
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_regex_find_all_has_no_trailing_empty_match
+- [ ] **Regex operators do not validate their options.** A bad flag
+  (51108), flags in both the regex and `options` (51107), a NUL in the
+  pattern or options (51109 / 51110) all match here; a non-string `options`
+  (51106) is 2 "not supported".
+  Backlog-ID: RM-238
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_regex_operator_options_are_validated
+- [ ] **`$filter`'s `limit` is mis-read.** An integral double or Decimal128
+  limit is ignored (all elements); zero, negatives and `true` return one
+  element where mongod answers 327392 / 327391; a string, NaN or fraction
+  returns everything.
+  Backlog-ID: RM-239
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_filter_limit
+- [ ] **`$zip` returns `defaults` unevaluated and accepts malformed
+  options.** `defaults: ["$n"]` pads with the string "$n"; `defaults`
+  without `useLongestLength` (34466), of the wrong length (34467) or not an
+  array (34462), and a non-boolean `useLongestLength` (34463) all answer a
+  value.
+  Backlog-ID: RM-240
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_zip_defaults_and_options
+- [ ] **`$sortArray` sorts scalars by their value under a field spec, reads
+  -1.0 as ascending, and does not validate `sortBy`.** mongod treats a
+  scalar as missing under `{a: 1}`, sorts descending for `-1.0`, sorts by
+  value for a Decimal128 direction, and rejects 0 / 2 / `{a: 0}` / `{}`
+  (2942505 / 2942506), a string (2942507) and a non-array input (2942504).
+  Backlog-ID: RM-241
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_sort_array
+- [ ] **`$switch` with no matching branch is "not supported" outside
+  `$project`, and a malformed `$switch` is too.** `op_switch` returns
+  `Fallback::Defer`; only the `$project` / `$addFields` classifier
+  (`aggregate.rs::runtime_error`) turns that into 40066, so a `find` filter or
+  projection and `$match` answer 2. All-constant false cases are 40069 on
+  mongod while it optimizes, even over an empty collection (here: 40066, or
+  success with no documents). Branch errors 40061-40065 are 2 here, and an
+  unknown branch key (40063) is accepted.
+  Backlog-ID: RM-242
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_switch
+- [ ] **`$round` / `$trunc` of a double round its decimal text.** The code
+  computes `(x * 10^p).round() / 10^p`; mongod rounds the exact binary value
+  (`$round: [2.675, 2]` is 2.67, `$trunc: [1.45, 2]` 1.44), so the two also
+  differ at large magnitudes, and `$round: [1e300, 10]` is Infinity here.
+  Also measured: a NaN place (51082 vs 31109), a null value with an
+  out-of-range place (null vs 51083), and `$round: [-2147483648, -1]`, which
+  mongod 8.2.11 on macOS answers as int32 2147483646 (it wraps).
+  Backlog-ID: RM-243
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_round_and_trunc_of_doubles
+- [ ] **`$pow` of 1 or -1 to a negative integer is a double.** mongod keeps
+  the base's integer type (`{$pow: [1, -5]}` is int32 1); the code falls
+  through to `powf`.
+  Backlog-ID: RM-244
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_pow_of_one_with_negative_exponent_stays_integral
+- [ ] **Decimal128 transcendentals beyond the authorised last digit.** Tiny
+  operands underflow to 0 in `$sinh` / `$tanh` / `$atanh` (between 1E-75
+  and 1E-80); results lose mongod's 34-digit form and a zero's exponent;
+  `$sin` of 1E+1200 is 50989 instead of a value; `$sinh` / `$tanh` of
+  1E+34 are 2 "not supported" instead of Infinity / 1.
+  Backlog-ID: RM-245
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_decimal_hyperbolic_and_trig_edges
+- [ ] **`$convert` clamps, underflows and refuses.** A double just past the
+  int32 range (2147483647.5) clamps instead of 241; a string below the
+  smallest normal double is 0 or a subnormal instead of 241; `to` as 1.0 or
+  Decimal128 16 converts on mongod, and as 99 / 16.5 / missing (9), null
+  (null), or an unsupported target (241) -- all 2 here; an `onError` that
+  evaluates to missing gives null; `onNull` with an unknown `to` succeeds.
+  Backlog-ID: RM-246
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_convert
+- [ ] **`$dateToString` reads `format` as literal text and ignores
+  `onNull`.** `format: "$f"` returns "$f"; an expression or null format is
+  18533; `onNull` is never used; years 1-999 are 2 "not supported" (mongod
+  renders "0999-..."); a trailing `%` is 18536 instead of 18535.
+  Backlog-ID: RM-247
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_date_to_string_arguments
+- [ ] **Local times at a daylight-saving change.** A time that happens twice
+  is the later (standard-time) instant on mongod and the earlier one here
+  (`.earliest()` in `named_local_to_utc_ms`); a time that never happens uses
+  the offset before the change on mongod and is 40485 "unrecognized time
+  zone identifier" here, in `$dateFromParts`, `$dateAdd` and `$dateTrunc`.
+  Backlog-ID: RM-248
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_local_times_at_daylight_saving_changes
+- [ ] **Time-zone rules far from now differ from mongod's.** No daylight
+  saving from 2100 on (New York, London, Dublin, Sydney), and historical
+  zones folded into their links (Amsterdam 1900 is +0019 on mongod and
+  +0000 here; Stockholm 1945, Reykjavik 1930, Copenhagen, Oslo and others).
+  The fix is mongod's own zone data, not a newer tzdata.
+  Backlog-ID: RM-249
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_time_zone_rules_far_from_now
+- [ ] **Date arithmetic refuses what mongod computes.** Results outside
+  years 1-9999 (`$dateAdd` of 8000 years or 10^15 ms), a null unit (null),
+  an integral Decimal128 amount or binSize, ObjectId / Timestamp dates, and
+  each argument error mongod names (5166403, 5166405, 5439018, 40521) are
+  all 2 "not supported" here; a huge `binSize` (5439006 on mongod) silently
+  returns 2000-01-01.
+  Backlog-ID: RM-250
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_date_arithmetic_arguments_and_range
+- [ ] **Constant sub-expressions are not evaluated while optimizing.** mongod
+  folds every constant sub-expression first, so `{$cond: [true, 1, {$divide:
+  [1, 0]}]}`, `$ifNull`, a short-circuited `$and` and `$map` over `[]` with
+  an erroring body all fail on mongod and answer here; a constant invalid
+  `$dateToString` format is checked even when the date is null.
+  Backlog-ID: RM-251
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_constant_arguments_are_checked_while_optimizing
+- [ ] **Operator tail: one shape each.** `$firstN` with a NaN `n` (31109 vs
+  5787903) or a Decimal128 `n` (a value vs 2); `$arrayElemAt` of a null
+  array with a string index (null vs 28690); `$toString` of year 1 (a string
+  vs 241); `$percentile` with a Decimal128 `p` (a value vs 7750302); `$meta:
+  "randVal"` (missing vs 17308) and `$meta: "sortKey"` inside `$match`
+  (a value vs 2); `$getField` of `$$REMOVE` (missing vs
+  null); `$setField` with a field path for `field` (4161108 vs a value).
+  Backlog-ID: RM-252
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_operator_tail_codes
+- [ ] **`$bucket` with non-numeric boundaries.** mongod emits the buckets in
+  `_id` order, so a string `default` comes before date buckets; here it
+  comes last. Decimal128 or mixed numeric boundaries are 2 "not supported".
+  Backlog-ID: RM-253
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_bucket_with_non_numeric_boundaries
+
 ### 7.087 Window functions and the operator tail against mongod -- 2026-10-21
 
 The first comparison of `$setWindowFields` / `$fill` and of a tail of
@@ -942,7 +1107,12 @@ Still different:
       them moving with load. Still unexplained: at 12 test workers on a
       12-core Mac, `$merge creating its target` read 4 global IS (2 idle) in
       all five reference runs, with yielding off as well; at CI's 4 workers
-      it reads 2.
+      it reads 2. Four coverage runs on 2026-10-21 (backlog verifier at 4
+      workers, against an instrumented debug build of this server) reported
+      RM-185 REGRESSED twice: once `test_lock_counts_of_merge`, once
+      `test_lock_counts_of_index_build_and_out_shapes`, where the yield-off
+      reference mongod itself read 8 global IS for `$out again` in one of
+      its five runs and 7 in the others -- drift on mongod's side.
       Backlog-ID: RM-185
       Verify: tests/backlog/test_rm_185_locks.py::test_lock_counts_of_merge_fail_with_duplicates
 - **Scope decision — `replSetReconfig` takes one member, this server**
