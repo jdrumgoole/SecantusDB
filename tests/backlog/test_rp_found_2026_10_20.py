@@ -259,6 +259,7 @@ TOOLS = {
     "pg_dump --schema-only": ["pg_dump", "--schema-only"],
     "pg_dumpall --globals-only": ["pg_dumpall", "--globals-only"],
     "pgbench -i": ["pgbench", "-i", "-s", "1"],
+    "psql \\l": ["psql", "-c", "\\l"],
     "psql \\l+": ["psql", "-c", "\\l+"],
     "psql \\dd": ["psql", "-c", "\\dd"],
     "psql \\dc": ["psql", "-c", "\\dc"],
