@@ -1,0 +1,11 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT fdx(1), fdx(1, 'y'), fdx(1, 'y', 7), fdx(1, 'y', 7, 2.5)", "", "ok", [[["str", "x151.5"], ["str", "y151.5"], ["str", "y171.5"], ["str", "y172.5"]]], [25, 25, 25, 25]],
+["SELECT fdp(), fdp(3)", "", "ok", [[["num", "20"], ["num", "6"]]], [23, 23]],
+["SELECT fdx()", "", "err", "42883: function fdx() does not exist", []],
+["SELECT pg_get_function_arguments(p.oid), pg_get_function_identity_arguments(p.oid), pg_get_function_result(p.oid) FROM pg_proc p WHERE proname = 'fdx'", "", "ok", [[["str", "a integer, b text DEFAULT 'x'::text, c integer DEFAULT (2 + 3), d numeric DEFAULT 1.5"], ["str", "a integer, b text, c integer, d numeric"], ["str", "text"]]], [25, 25, 25]],
+["CREATE FUNCTION fdx_bad(a int DEFAULT 1, b int) RETURNS int LANGUAGE sql AS 'select a'", "", "err", "42P13: input parameters after one with a default value must also have defaults", []],
+["DROP FUNCTION fdx(int, text, int, numeric)", "", "ok", [], []],
+["DROP FUNCTION fdp(int)", "", "ok", [], []]
+]}

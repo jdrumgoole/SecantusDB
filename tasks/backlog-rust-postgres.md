@@ -927,6 +927,29 @@ server.
       Backlog-ID: RP-076
       Verify: tests/backlog/test_rp_found_2026_10_21.py::test_nullif_result_type
 
+## Found by the corpus test (2026-10-21)
+
+- [ ] **psql's `\d <table>` takes over a minute: a correlated subquery over
+      a comma join evaluates the whole cross product for every outer row.**
+      psql 15's column query for `\d` holds `(SELECT c.collname FROM
+      pg_collation c, pg_type t WHERE c.oid = a.attcollation AND t.oid =
+      a.atttypid AND a.attcollation <> t.typcollation)`, once per column.
+      The equalities name the OUTER row's columns, so PostgreSQL 15.19 reads
+      one row of each catalog and answers in 3.5 ms. A debug `secantusd-pg`
+      takes 64 s, for a table of one column or of three (the rest of the
+      query takes 0.1 s); the catalogs are 911 and 181 rows, so the cost is
+      the cross product, not the outer rows. A RELEASE build takes 4.3 s,
+      about 1,200 times PostgreSQL. The answer is right, so
+      nothing but time shows it; any client that describes a table (psql,
+      and ORMs' introspection, which send the same shape) waits. Found when
+      `tests/test_rust_pg_corpora.py` first ran every corpus:
+      `psql_describe` took 268 s, 263 of them in four runs of this query.
+      `RP-019` is the same planner's pushdown into a JOIN; this is the
+      correlated-subquery path, where the outer row's values are constants.
+      The gap test itself takes about a minute while this is open.
+      Backlog-ID: RP-077
+      Verify: tests/backlog/test_rp_catalog_latency.py::test_psql_describe_collation_subquery
+
 ## Code structure (2026-10-19)
 
 - [ ] **Rust PG server: `PgHandler` holds every piece of session state in

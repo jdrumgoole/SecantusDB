@@ -1,0 +1,23 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT pg_get_constraintdef(oid), pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conrelid = 'cfx_c'::regclass ORDER BY conname", "", "ok", [[["str", "CHECK ((f >= (1.5)::double precision))"], ["str", "CHECK (f >= 1.5::double precision)"]], [["str", "CHECK ((i > '-3'::integer))"], ["str", "CHECK (i > '-3'::integer)"]], [["str", "FOREIGN KEY (pid) REFERENCES cfx_p(id)"], ["str", "FOREIGN KEY (pid) REFERENCES cfx_p(id)"]], [["str", "PRIMARY KEY (id)"], ["str", "PRIMARY KEY (id)"]], [["str", "CHECK ((v > (0)::numeric))"], ["str", "CHECK (v > 0::numeric)"]]], [25, 25]],
+["SELECT pg_get_indexdef('cfx_c_v'::regclass), pg_get_indexdef('cfx_c_v'::regclass, 0, true), pg_get_indexdef('cfx_c_v'::regclass, 1, true), pg_get_indexdef('cfx_c_v'::regclass, 3, true)", "", "ok", [[["str", "CREATE INDEX cfx_c_v ON public.cfx_c USING btree (v DESC, i)"], ["str", "CREATE INDEX cfx_c_v ON cfx_c USING btree (v DESC, i)"], ["str", "v"], ["str", ""]]], [25, 25, 25, 25]],
+["SELECT pg_get_userbyid(6171), pg_table_is_visible('cfx_c'::regclass), pg_type_is_visible(23)", "", "ok", [[["str", "pg_database_owner"], ["bool", true], ["bool", true]]], [19, 16, 16]],
+["SELECT relname, relhastriggers, relchecks, relreplident FROM pg_class WHERE relname IN ('cfx_c', 'cfx_p', 'cfx_c_v', 'cfx_s') ORDER BY relname", "", "ok", [[["str", "cfx_c"], ["bool", true], ["num", "3"], ["str", "d"]], [["str", "cfx_c_v"], ["bool", false], ["num", "0"], ["str", "n"]], [["str", "cfx_p"], ["bool", true], ["num", "0"], ["str", "d"]], [["str", "cfx_s"], ["bool", false], ["num", "0"], ["str", "n"]]], [19, 16, 21, 18]],
+["SELECT seqtypid::regtype, seqstart, seqincrement FROM pg_sequence WHERE seqrelid = 'cfx_s'::regclass", "", "ok", [[["str", "bigint"], ["num", "5"], ["num", "1"]]], [2206, 20, 20]],
+["SELECT nextval('cfx_s'::regclass), currval('cfx_s'::regclass), 'cfx_s'::regclass::text", "", "ok", [[["num", "5"], ["num", "5"], ["str", "cfx_s"]]], [20, 20, 25]],
+["SELECT collname FROM pg_collation WHERE oid = 100", "", "ok", [[["str", "default"]]], [19]],
+["SELECT amname FROM pg_am WHERE oid = 403", "", "ok", [[["str", "btree"]]], [19]],
+["SELECT count(*) FROM cfx_a a, cfx_b b WHERE a.id = b.id", "", "ok", [[["num", "3"]]], [20]],
+["SELECT a.id, sum(b.w) FROM cfx_a a, cfx_b b WHERE a.id = b.id GROUP BY a.id ORDER BY a.id", "", "ok", [[["num", "1"], ["num", "30"]], [["num", "2"], ["num", "5"]]], [23, 20]],
+["SELECT a.id, count(*) FROM cfx_a a JOIN cfx_b b ON true WHERE a.id = b.id AND b.w > 6 GROUP BY a.id HAVING count(*) > 1", "", "ok", [[["num", "1"], ["num", "2"]]], [23, 20]],
+["SELECT id, array(SELECT 'x' || y FROM unnest(cfx_a.opts) y) FROM cfx_a ORDER BY id", "", "ok", [[["num", "1"], ["list", [["str", "xa=1"]]]], [["num", "2"], ["list", []]]], [23, 1009]],
+["SELECT a.id, array_to_string(a.opts || array(SELECT 't.' || y FROM unnest(b.opts) y), ', ') FROM cfx_a a LEFT JOIN cfx_b b ON a.id = b.id AND b.w = 10 ORDER BY a.id", "", "ok", [[["num", "1"], ["str", "a=1, t.b=2"]], [["num", "2"], ["str", ""]]], [23, 25]],
+["SELECT id, (SELECT count(*) FROM unnest(cfx_a.opts) u) FROM cfx_a ORDER BY id", "", "ok", [[["num", "1"], ["num", "1"]], [["num", "2"], ["num", "0"]]], [23, 20]],
+["DROP TABLE cfx_c", "", "ok", [], []],
+["DROP TABLE cfx_p", "", "ok", [], []],
+["DROP SEQUENCE cfx_s", "", "ok", [], []],
+["DROP TABLE cfx_a", "", "ok", [], []],
+["DROP TABLE cfx_b", "", "ok", [], []]
+]}

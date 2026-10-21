@@ -374,13 +374,29 @@ jobs:
       - name: Cache cargo registry + target (clean workspace)
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
-          workspaces: crates
+          workspaces: |
+            crates
+            crates/secantus-pgwire
           cache-on-failure: true
 
       - name: Cargo fmt / clippy / unit tests
         # Run across the whole Rust workspace (the pure-engine `secantus-core`
         # lib crate + the `secantus-core-py` PyO3 bindings crate).
         working-directory: crates
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+      - name: Cargo fmt / clippy / tests (secantus-pgwire)
+        # SecantusDB's fork of pgwire, which the Rust PostgreSQL server speaks
+        # through. It is excluded from the workspace (its own lockfile and
+        # target), so the step above never reaches it. It was left out of CI
+        # as "upstream's code", but the fork carries our own patches -- the
+        # error transcoder, idle events, the TLS changes -- and when it was
+        # first linted (2026-10-21) two clippy errors sat in exactly those,
+        # with 156 tests that had never run in CI. It links no WiredTiger.
+        working-directory: crates/secantus-pgwire
         run: |
           cargo fmt --check
           cargo clippy --all-targets -- -D warnings
@@ -684,7 +700,7 @@ jobs:
       # `secantus-pg` (the PostgreSQL server) joined on 2026-10-07: it was built
       # and its integration tests run in another job, but never linted, and six
       # `clippy::drop_non_drop` errors sat in it unreported. The pgwire fork
-      # (`secantus-pgwire`) is upstream's code and is left out on purpose.
+      # (`secantus-pgwire`) links no WiredTiger, so the `rust` job gates it.
       - name: Cargo fmt / clippy (the remaining WT-linked crates)
         run: |
           set -e
@@ -1190,7 +1206,10 @@ jobs:
     # only. It is a separate job because it builds the Rust PostgreSQL server,
     # which the ``test`` job does not.
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 45 until 2026-10-21, when the differential suite, every corpus, every
+    # secantus-pg cargo test and the backlog's PG tests joined a lane that
+    # took about 11 minutes.
+    timeout-minutes: 60
     env:
       UV_PYTHON: "3.10"
       # The suites read this (tests/pg_oracle.py); without it they fall back to
@@ -1315,7 +1334,11 @@ jobs:
       # `signals` starts the binary with SIGTERM blocked / ignored, as a
       # supervisor may leave it, and requires it to stop on SIGTERM.
       # `pg_server` covers `secantus_pg::PgServer`, the crates.io embedding API.
-      - name: Run the embedded pgserver tests
+      # EVERY target runs, not a named list: the list this step used to carry
+      # (`embedded`, `signals`, `pg_server`) left the crate's ~100 unit tests,
+      # `tls`, `connection_addrs`, `declare_reads` and the doctests running
+      # nowhere but a developer's box, and a new test file joined them silently.
+      - name: Run the secantus-pg cargo tests
         shell: bash
         run: |
           WT="$PWD/$(ls -d build/*/wt-build | head -1)"
@@ -1323,7 +1346,7 @@ jobs:
           lc="$(find /usr/lib /usr/lib64 \( -name 'libclang.so*' -o -name 'libclang-[0-9]*.so*' \) 2>/dev/null | sort | head -1)"
           test -n "$lc" || { echo "libclang not found" >&2; exit 1; }
           export LIBCLANG_PATH="$(dirname "$lc")"
-          (cd crates/secantus-pg && cargo test --test embedded --test signals --test pg_server)
+          (cd crates/secantus-pg && cargo test)
 
       - name: Verify the reference server is reachable
         # Fail CLOSED. The whole point of this job is that these suites stop
@@ -1349,16 +1372,13 @@ jobs:
           # The Rust pgserver SLICE suite. It needs only the binary, runs in a
           # few minutes, and is deterministic -- and it is the suite that has
           # pre-existing tests a shared-code change can silently break (that is
-          # exactly how #1363 left `main` red under green CI). The DIFFERENTIAL
-          # suite (~800 tests doing DDL against one shared postgres) is too slow
-          # to fit this lane's budget and is already run locally against a real
-          # PostgreSQL before every pgserver change lands, so it stays local.
+          # exactly how #1363 left `main` red under green CI).
           files="tests/test_rust_pgserver_slice.py"
-          # ...but single differential tests whose only other home is a dev box
-          # with a local PostgreSQL may be named here: one node costs seconds,
-          # not the suite's minutes. This one pins a Rust numeric-bracket fix
-          # found on a Windows box that has no PostgreSQL to run it against.
-          files="$files tests/test_rust_pgserver_differential.py::test_tiny_wide_numeric_filters_match_postgres"
+          # The DIFFERENTIAL suite, whole: 836 cases against the PostgreSQL 14
+          # service above. It was left out as too slow for this lane, with one
+          # node named, so 13 of its 14 tests ran only on a developer's box.
+          # Measured 2026-10-21: six minutes at -n 4 on a loaded laptop.
+          files="$files tests/test_rust_pgserver_differential.py"
           # The release smoke test, in the one lane that already builds the
           # binary it needs. It is `skipif`-gated on that binary existing, so
           # anywhere else it silently collects nothing -- a release gate that
@@ -1371,6 +1391,11 @@ jobs:
           # Composite keys named like extended JSON (`"$date"`), pinned
           # with PostgreSQL 15.19's answers written in. Binary only.
           files="$files tests/test_rust_pg_dollar_names.py"
+          # Every differential corpus under tools/probes/pg_corpora/, held to
+          # PostgreSQL's recorded answers (pg_corpora/expected/). Binary only.
+          # Until 2026-10-21 the corpora ran on a developer's box and nowhere
+          # else, so what they pinned could regress under a green CI.
+          files="$files tests/test_rust_pg_corpora.py"
           echo "oracle suites: $files"
           test -n "$files"
           PYTHONPATH=tests uv run python -m pytest $files -q -n auto \
@@ -1415,3 +1440,35 @@ jobs:
           "$SECANTUS_PG15_BIN/postgres" --version
           uv run python -m pytest tests/test_rust_pg_login_differential.py -q -n 3 \
             -p no:cacheprovider -rs
+
+      # The regression tests fixed Rust PG backlog items became
+      # (`backlog_fixed`, tests/backlog/). The default run deselects them,
+      # because they need the reference servers, and until 2026-10-21 nothing
+      # selected them again: over a hundred regression tests ran nowhere but
+      # `tools/backlog.py verify` on a developer's box. They ask a PostgreSQL 15
+      # (the `pg15` fixture), which this step starts from the binaries above on
+      # the port a developer box uses for it.
+      - name: Start a PostgreSQL 15 reference
+        shell: bash
+        run: |
+          B=/usr/lib/postgresql/15/bin
+          D="$RUNNER_TEMP/pg15-reference"
+          "$B/initdb" -D "$D" -U postgres --locale=C.UTF-8 -E UTF8 -A trust > /dev/null
+          "$B/pg_ctl" -D "$D" -l "$D.log" -w \
+            -o "-p 5415 -k '' -c listen_addresses=127.0.0.1" start
+          psql "host=127.0.0.1 port=5415 dbname=postgres user=postgres" -Atc 'show server_version'
+
+      - name: Run the Rust PG backlog regression and gap tests
+        shell: bash
+        env:
+          SECANTUS_PG_ORACLE_DSN_15: "host=127.0.0.1 port=5415 dbname=postgres user=postgres"
+          SECANTUS_PG15_BIN: /usr/lib/postgresql/15/bin
+        run: |
+          # `-m backlog_fixed` replaces addopts' `-m`, which deselects them.
+          uv run python -m pytest -m backlog_fixed tests/backlog/test_rust_postgres_gaps.py \
+            tests/backlog/test_rp_*.py -q -n auto -p no:cacheprovider -rs
+          # And the OPEN items' gap tests, through the backlog's own runner: it
+          # exits non-zero when a gap test no longer measures its gap (BROKEN)
+          # or now passes (FIXED? -- a change fixed the item; close it in the
+          # same PR, as the backlog skill says). About ten seconds.
+          uv run python tools/backlog.py verify --file backlog-rust-postgres.md

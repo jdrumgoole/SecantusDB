@@ -1,0 +1,8 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT 1099511627776::int8::int4", "", "err", "22003: integer out of range", []],
+["SELECT 1099511627776::int8::int2", "", "err", "22003: smallint out of range", []],
+["SELECT (-1099511627776)::int8::int4", "", "err", "22003: integer out of range", []],
+["SELECT 2147483647::int8::int4", "", "ok", [[["num", "2147483647"]]], [23]]
+]}

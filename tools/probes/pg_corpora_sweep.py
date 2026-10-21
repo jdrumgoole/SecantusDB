@@ -7,7 +7,7 @@ reproduce.
 
 Usage::
 
-    python tools/probes/pg_corpora_sweep.py [--out DIR] [--jobs N] [NAME ...]
+    python tools/probes/pg_corpora_sweep.py [--out DIR] [--jobs N] [--record DIR] [NAME ...]
 
 **One corpus at a time is the default, and the only run to quote.** The
 corpora share one reference database: an event trigger one corpus creates
@@ -18,6 +18,14 @@ it reports, by name, without it.
 
 Each corpus's full output is kept in ``--out`` (default: a directory under
 the system temporary directory, printed at the end).
+
+``--record DIR`` also writes each corpus's REFERENCE answers to
+``DIR/<corpus>.json`` (``pg_differential.py --record``). That is how
+``tools/probes/pg_corpora/expected/`` is made, which
+``tests/test_rust_pg_corpora.py`` holds the server to in CI, where there is
+no PostgreSQL to ask. Record against fresh reference clusters, not the shared
+ones: corpora leave roles behind on a cluster they ran on, and a later
+corpus's answer can depend on them.
 """
 
 from __future__ import annotations
@@ -34,15 +42,17 @@ CORPORA = REPO_ROOT / "tools" / "probes" / "pg_corpora"
 PROBE = REPO_ROOT / "tools" / "probes" / "pg_differential.py"
 
 
-def _run(name: str, out: pathlib.Path) -> tuple[str, str, int]:
+def _run(name: str, out: pathlib.Path, record: pathlib.Path | None = None) -> tuple[str, str, int]:
     """(corpus, divergences or what went wrong, checks)."""
     setup = CORPORA / f"{name}.setup.sql"
     if not setup.exists():
         return name, "NO-SETUP", 0
+    extra = [f"--record={record / f'{name}.json'}"] if record is not None else []
     try:
         done = subprocess.run(
             [sys.executable, str(PROBE), str(setup), str(CORPORA / f"{name}.sql")]
-            + ["--types", "--rust"],
+            + ["--types", "--rust"]
+            + extra,
             capture_output=True,
             text=True,
             timeout=900,
@@ -55,12 +65,19 @@ def _run(name: str, out: pathlib.Path) -> tuple[str, str, int]:
     if not match:
         # The probe did not reach its summary: it is not a count of zero.
         return name, "DID-NOT-FINISH", 0
+    # Nor is a probe that printed its summary and then died. matviews.sql's
+    # did (writing its record), and was counted as a clean corpus.
+    if "Traceback (most recent call last)" in done.stderr or (
+        record is not None and not (record / f"{name}.json").exists()
+    ):
+        return name, "DID-NOT-FINISH", 0
     return name, match.group(1), int(match.group(2))
 
 
 def main(argv: list[str]) -> int:
     jobs = 1
     out = None
+    record = None
     names: list[str] = []
     args = iter(argv)
     for arg in args:
@@ -68,6 +85,9 @@ def main(argv: list[str]) -> int:
             jobs = int(next(args))
         elif arg == "--out":
             out = pathlib.Path(next(args))
+        elif arg == "--record":
+            record = pathlib.Path(next(args))
+            record.mkdir(parents=True, exist_ok=True)
         else:
             names.append(arg)
     if out is None:
@@ -82,7 +102,7 @@ def main(argv: list[str]) -> int:
         return 2
     chosen = names or every
     with ThreadPoolExecutor(jobs) as pool:
-        results = list(pool.map(lambda n: _run(n, out), chosen))
+        results = list(pool.map(lambda n: _run(n, out, record), chosen))
 
     unfinished = [(n, d) for n, d, _ in results if not d.isdigit()]
     counted = [(n, int(d), c) for n, d, c in results if d.isdigit()]

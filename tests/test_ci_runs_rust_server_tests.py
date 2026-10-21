@@ -81,6 +81,13 @@ def _gated_files() -> list[str]:
     return out
 
 
+def _workflow_code(path: Path) -> str:
+    """A workflow with its YAML comments removed: a comment that MENTIONS a
+    file (the build step's note on why it builds the binary) runs nothing, and
+    the first version of this scan counted one as running the file."""
+    return "\n".join(re.sub(r"(^|\s)#.*", "", ln) for ln in path.read_text("utf-8").splitlines())
+
+
 def test_the_gate_pattern_still_matches_something() -> None:
     """Guard against the scan silently matching nothing if the idiom changes."""
     gated = _gated_files()
@@ -91,7 +98,7 @@ def test_the_gate_pattern_still_matches_something() -> None:
 
 
 def test_every_rust_server_test_file_runs_in_ci() -> None:
-    workflow = "\n".join(p.read_text(encoding="utf-8") for p in sorted(WORKFLOWS.glob("*.yml")))
+    workflow = "\n".join(_workflow_code(p) for p in sorted(WORKFLOWS.glob("*.yml")))
     missing = [
         name
         for name in _gated_files()
@@ -111,5 +118,67 @@ def test_every_rust_server_test_file_runs_in_ci() -> None:
 
 def test_exclusions_all_carry_a_reason() -> None:
     for name, reason in DELIBERATELY_NOT_IN_CI.items():
+        assert reason.strip(), f"{name} is excluded from CI with no reason given"
+        assert (TESTS / name).exists(), f"{name} is excluded but no longer exists — drop the entry"
+
+
+# --- The Rust PostgreSQL server ---------------------------------------------
+#
+# The same hole, for the `secantusd-pg` BINARY rather than the extension. A file
+# that builds the binary's path (`"secantus-pg" / "target"`), or borrows the
+# slice suite's `_Server`, skips wherever the binary is not built -- which is
+# every lane but the ones that build it. Found on 2026-10-21: of the 14 tests in
+# `test_rust_pgserver_differential.py`, ONE ran in CI, because the workflow
+# named a single node of the file and the scan above was looking for the
+# extension's idiom only.
+#
+# A file counts only when a workflow names the WHOLE file. `tests/x.py::one`
+# runs one test, and is what left the other thirteen running nowhere.
+
+WORKFLOWS = REPO / ".github" / "workflows"
+
+_PG_GATE = re.compile(r'"secantus-pg"\s*/\s*"target"|from tests\.test_rust_pgserver_slice import')
+
+# Binary-gated files deliberately run in no workflow, each with the reason.
+PG_DELIBERATELY_NOT_IN_CI: dict[str, str] = {}
+
+
+def _pg_gated_files() -> list[str]:
+    return sorted(
+        path.name
+        for path in TESTS.glob("test_*.py")
+        if path.name != SELF and _PG_GATE.search(path.read_text(encoding="utf-8"))
+    )
+
+
+def _named_whole(name: str) -> bool:
+    pattern = re.compile(rf"tests/{re.escape(name)}(?!::)\b")
+    return any(pattern.search(_workflow_code(w)) for w in sorted(WORKFLOWS.glob("*.yml")))
+
+
+def test_the_pg_gate_pattern_still_matches_something() -> None:
+    gated = _pg_gated_files()
+    assert "test_rust_pgserver_slice.py" in gated, gated
+    assert "test_rust_pgserver_differential.py" in gated, gated
+
+
+def test_every_rust_pg_server_test_file_runs_in_ci() -> None:
+    missing = [
+        name
+        for name in _pg_gated_files()
+        if name not in PG_DELIBERATELY_NOT_IN_CI and not _named_whole(name)
+    ]
+    assert not missing, (
+        "these files need the secantusd-pg binary and no workflow runs the whole file, "
+        "so they (or all but the named nodes) run nowhere:\n  "
+        + "\n  ".join(missing)
+        + "\n\nName the file in the pg-oracle job of .github/workflows/test.yml (or a "
+        "scheduled workflow that builds secantusd-pg), or record a reason in "
+        "PG_DELIBERATELY_NOT_IN_CI."
+    )
+
+
+def test_pg_exclusions_all_carry_a_reason() -> None:
+    for name, reason in PG_DELIBERATELY_NOT_IN_CI.items():
         assert reason.strip(), f"{name} is excluded from CI with no reason given"
         assert (TESTS / name).exists(), f"{name} is excluded but no longer exists — drop the entry"

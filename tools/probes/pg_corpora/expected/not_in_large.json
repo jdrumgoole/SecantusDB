@@ -1,0 +1,18 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["select count(*) from nl15_a where id not in (select k from nl15_b where k is not null);", "", "ok", [[["num", "31"]]], [20]],
+["select count(*) from nl15_a where id not in (select k from nl15_b);", "", "ok", [[["num", "0"]]], [20]],
+["select count(*) from nl15_a where id in (select k from nl15_b);", "", "ok", [[["num", "30"]]], [20]],
+["select count(*) from nl15_a where f not in (select f from nl15_b where f is not null);", "", "ok", [[["num", "30"]]], [20]],
+["select count(*) from nl15_a where f in (select f from nl15_b);", "", "ok", [[["num", "32"]]], [20]],
+["select count(*) from nl15_a where t not in (select t from nl15_b where t is not null);", "", "ok", [[["num", "40"]]], [20]],
+["select count(*) from nl15_a where t in (select t from nl15_b);", "", "ok", [[["num", "21"]]], [20]],
+["select count(*) from nl15_a where n not in (select n from nl15_b where n is not null);", "", "ok", [[["num", "30"]]], [20]],
+["select count(*) from nl15_a where n in (select n from nl15_b);", "", "ok", [[["num", "31"]]], [20]],
+["select count(*) from nl15_a a where not exists (select 1 from nl15_b b where b.k = a.id);", "", "ok", [[["num", "32"]]], [20]],
+["select count(*) from nl15_a a where not exists (select 1 from nl15_b b where b.f = a.f);", "", "ok", [[["num", "30"]]], [20]],
+["select count(*) from nl15_a where not (id = any (array(select k from nl15_b where k is not null)));", "", "ok", [[["num", "31"]]], [20]],
+["select count(*) from nl15_a where not (id <> all (array(select k from nl15_b where k is not null)));", "", "ok", [[["num", "30"]]], [20]],
+["select count(*) from nl15_a where id <> all (array(select k from nl15_b));", "", "ok", [[["num", "0"]]], [20]]
+]}

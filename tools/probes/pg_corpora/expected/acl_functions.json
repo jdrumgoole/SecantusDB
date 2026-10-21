@@ -1,0 +1,19 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT acldefault('r', 99999), acldefault('f', 99999), acldefault('n', 99999), acldefault('s', 99999), acldefault('T', 99999), acldefault('l', 99999), acldefault('d', 99999), acldefault('c', 99999), acldefault('S', 99999), acldefault('p', 99999), acldefault('L', 99999), acldefault('t', 99999), acldefault('F', 99999)", "", "ok", [[["list", [["str", "99999=arwdDxt/99999"]]], ["list", [["str", "=X/99999"], ["str", "99999=X/99999"]]], ["list", [["str", "99999=UC/99999"]]], ["list", [["str", "99999=rwU/99999"]]], ["list", [["str", "=U/99999"], ["str", "99999=U/99999"]]], ["list", [["str", "=U/99999"], ["str", "99999=U/99999"]]], ["list", [["str", "=Tc/99999"], ["str", "99999=CTc/99999"]]], ["list", []], ["list", [["str", "99999=U/99999"]]], ["list", [["str", "99999=sA/99999"]]], ["list", [["str", "99999=rw/99999"]]], ["list", [["str", "99999=C/99999"]]], ["list", [["str", "99999=U/99999"]]]]], [1034, 1034, 1034, 1034, 1034, 1034, 1034, 1034, 1034, 1034, 1034, 1034, 1034]],
+["SELECT acldefault('a', 99999)", "", "err", "XX000: unrecognized objtype abbreviation: a", []],
+["SELECT makeaclitem(99999, 99998, 'select', false), makeaclitem(0, 99998, 'USAGE', true), makeaclitem(99999, 99998, 'Alter System', false), makeaclitem(99999, 99998, 'temporary', false)", "", "ok", [[["str", "99999=r/99998"], ["str", "=U*/99998"], ["str", "99999=A/99998"], ["str", "99999=T/99998"]]], [1033, 1033, 1033, 1033]],
+["SELECT makeaclitem(99999, 99998, 'SELECT, insert', true)", "", "err", "22023: unrecognized privilege type: \"SELECT, insert\"", []],
+["SELECT makeaclitem(99999, 99998, 'abc', true)", "", "err", "22023: unrecognized privilege type: \"abc\"", []],
+["SELECT makeaclitem(null, 1, 'select', true), acldefault(null, 1), pg_typeof(acldefault('r', 1)), pg_typeof(makeaclitem(1, 1, 'select', true))", "", "ok", [[["NoneType", "None"], ["NoneType", "None"], ["str", "aclitem[]"], ["str", "aclitem"]]], [1033, 1034, 2206, 2206]],
+["SELECT grantor::regrole::text, grantee::regrole::text, privilege_type, is_grantable from aclexplode(array[makeaclitem('acl_a'::regrole::oid, 'acl_b'::regrole::oid, 'select', true), makeaclitem(0, 'acl_b'::regrole::oid, 'usage', false)])", "", "ok", [[["str", "acl_b"], ["str", "acl_a"], ["str", "SELECT"], ["bool", true]], [["str", "acl_b"], ["str", "-"], ["str", "USAGE"], ["bool", false]]], [25, 25, 25, 16]],
+["SELECT grantee::regrole::text, privilege_type from aclexplode('{acl_a=r*w/acl_b,=X/acl_b}'::aclitem[])", "", "ok", [[["str", "acl_a"], ["str", "SELECT"]], [["str", "acl_a"], ["str", "UPDATE"]], [["str", "-"], ["str", "EXECUTE"]]], [25, 25]],
+["SELECT privilege_type from aclexplode(acldefault('d', 'acl_a'::regrole::oid))", "", "ok", [[["str", "TEMPORARY"]], [["str", "CONNECT"]], [["str", "CREATE"]], [["str", "TEMPORARY"]], [["str", "CONNECT"]]], [25]],
+["SELECT count(*) from aclexplode('{}'::aclitem[])", "", "err", "22023: ACL arrays must be one-dimensional", []],
+["SELECT acldefault('r', 'acl_a'::regrole::oid)", "", "ok", [[["list", [["str", "acl_a=arwdDxt/acl_a"]]]]], [1034]],
+["SELECT * FROM aclexplode(acldefault('d', 99999))", "", "ok", [[["num", "99999"], ["num", "0"], ["str", "TEMPORARY"], ["bool", false]], [["num", "99999"], ["num", "0"], ["str", "CONNECT"], ["bool", false]], [["num", "99999"], ["num", "99999"], ["str", "CREATE"], ["bool", false]], [["num", "99999"], ["num", "99999"], ["str", "TEMPORARY"], ["bool", false]], [["num", "99999"], ["num", "99999"], ["str", "CONNECT"], ["bool", false]]], [26, 26, 25, 16]],
+["SELECT * FROM aclexplode(NULL)", "", "ok", [], [26, 26, 25, 16]],
+["DROP ROLE acl_a", "", "ok", [], []],
+["DROP ROLE acl_b", "", "ok", [], []]
+]}

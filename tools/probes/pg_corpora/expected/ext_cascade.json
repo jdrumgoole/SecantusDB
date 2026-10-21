@@ -1,0 +1,14 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["DROP EXTENSION hstore", "", "err", "2BP01: cannot drop extension hstore because other objects depend on it", []],
+["SELECT isempty('[1,2)')", "", "err", "42725: function isempty(unknown) is not unique", []],
+["SELECT isempty('[1,2)'::int4range)", "", "ok", [[["bool", false]]], [16]],
+["SELECT lower_inc(NULL)", "", "err", "42725: function lower_inc(unknown) is not unique", []],
+["DROP EXTENSION hstore CASCADE", "", "ok", [], []],
+["SELECT * FROM ec_t", "", "ok", [[["num", "1"], ["num", "5"]]], [23, 23]],
+["SELECT h FROM ec_t", "", "err", "42703: column \"h\" does not exist", []],
+["SELECT column_name FROM information_schema.columns WHERE table_name = 'ec_u' ORDER BY 1", "", "ok", [[["str", "id"]]], [19]],
+["SELECT count(*) FROM pg_extension WHERE extname = 'hstore'", "", "ok", [[["num", "0"]]], [20]],
+["CREATE EXTENSION hstore", "", "ok", [], []]
+]}

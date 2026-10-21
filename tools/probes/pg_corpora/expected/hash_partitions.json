@@ -1,0 +1,22 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT tableoid::regclass::text, count(*) FROM hp_i GROUP BY 1 ORDER BY 1", "", "ok", [[["str", "hp_i0"], ["num", "15"]], [["str", "hp_i1"], ["num", "19"]], [["str", "hp_i2"], ["num", "13"]], [["str", "hp_i3"], ["num", "17"]]], [25, 20]],
+["SELECT id FROM hp_i0 ORDER BY id", "", "ok", [[["num", "-19"]], [["num", "-18"]], [["num", "-3"]], [["num", "0"]], [["num", "1"]], [["num", "12"]], [["num", "14"]], [["num", "16"]], [["num", "17"]], [["num", "26"]], [["num", "28"]], [["num", "30"]], [["num", "32"]], [["num", "34"]], [["NoneType", "None"]]], [23]],
+["SELECT id FROM hp_i3 ORDER BY id", "", "ok", [[["num", "-20"]], [["num", "-16"]], [["num", "-14"]], [["num", "-10"]], [["num", "-9"]], [["num", "-5"]], [["num", "4"]], [["num", "6"]], [["num", "7"]], [["num", "10"]], [["num", "15"]], [["num", "22"]], [["num", "24"]], [["num", "29"]], [["num", "33"]], [["num", "40"]], [["num", "2147483647"]]], [23]],
+["SELECT tableoid::regclass::text, k FROM hp_t ORDER BY k", "", "ok", [[["str", "hp_t2"], ["str", ""]], [["str", "hp_t2"], ["str", "a"]], [["str", "hp_t0"], ["str", "a much longer string that spans several twelve byte blocks"]], [["str", "hp_t0"], ["str", "ab"]], [["str", "hp_t1"], ["str", "abc"]], [["str", "hp_t2"], ["str", "abcd"]], [["str", "hp_t1"], ["str", "hello world"]], [["str", "hp_t2"], ["str", "thirteen bytes!"]], [["str", "hp_t2"], ["str", "twelve bytes"]], [["str", "hp_t0"], ["str", "ünïcödé"]]], [25, 25]],
+["SELECT tableoid::regclass::text, count(*) FROM hp_m GROUP BY 1 ORDER BY 1", "", "ok", [[["str", "hp_m0"], ["num", "1"]], [["str", "hp_m1"], ["num", "1"]]], [25, 20]],
+["SELECT a FROM hp_m1 ORDER BY a", "", "ok", [[["num", "-5"]]], [20]],
+["SELECT pg_get_expr(relpartbound, oid) FROM pg_class WHERE relname = 'hp_i2'", "", "ok", [[["str", "FOR VALUES WITH (modulus 4, remainder 2)"]]], [25]],
+["SELECT partstrat FROM pg_partitioned_table WHERE partrelid = 'hp_i'::regclass", "", "ok", [[["str", "h"]]], [18]],
+["CREATE TABLE hp_i4 PARTITION OF hp_i FOR VALUES WITH (modulus 4, remainder 1)", "", "err", "42P17: partition \"hp_i4\" would overlap partition \"hp_i1\"", []],
+["CREATE TABLE hp_i5 PARTITION OF hp_i FOR VALUES WITH (modulus 3, remainder 1)", "", "err", "42P17: every hash partition modulus must be a factor of the next larger modulus", []],
+["CREATE TABLE hp_i6 PARTITION OF hp_i FOR VALUES WITH (modulus 0, remainder 0)", "", "err", "42P16: modulus for hash partition must be an integer value greater than zero", []],
+["CREATE TABLE hp_i7 PARTITION OF hp_i FOR VALUES WITH (modulus 4, remainder 4)", "", "err", "42P16: remainder for hash partition must be less than modulus", []],
+["CREATE TABLE hp_i8 PARTITION OF hp_i DEFAULT", "", "err", "42P16: a hash-partitioned table may not have a default partition", []],
+["CREATE TABLE hp_i9 PARTITION OF hp_i FOR VALUES IN (1)", "", "err", "42P16: invalid bound specification for a hash partition", []],
+["UPDATE hp_i SET id = id + 1 WHERE id = 5", "", "ok", [], []],
+["SELECT tableoid::regclass::text FROM hp_i WHERE id = 6 ORDER BY 1", "", "ok", [[["str", "hp_i3"]], [["str", "hp_i3"]]], [25]],
+["DELETE FROM hp_i WHERE id BETWEEN 0 AND 10", "", "ok", [], []],
+["SELECT count(*) FROM hp_i", "", "ok", [[["num", "53"]]], [20]]
+]}

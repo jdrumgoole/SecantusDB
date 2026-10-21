@@ -1,0 +1,21 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT sum(n) FROM r", "", "ok", [[["num", "15"]]], [20]],
+["WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r ORDER BY n", "", "ok", [[["num", "1"]], [["num", "2"]], [["num", "3"]]], [23]],
+["WITH RECURSIVE t(id, name, depth) AS (SELECT id, name, 0 FROM rt_emp WHERE boss IS NULL UNION ALL SELECT e.id, e.name, t.depth + 1 FROM rt_emp e JOIN t ON e.boss = t.id) SELECT name, depth FROM t ORDER BY depth, name", "", "ok", [[["str", "ceo"], ["num", "0"]], [["str", "cfo"], ["num", "1"]], [["str", "cto"], ["num", "1"]], [["str", "dev"], ["num", "2"]], [["str", "intern"], ["num", "3"]]], [25, 23]],
+["WITH RECURSIVE up(id, boss) AS (SELECT id, boss FROM rt_emp WHERE id = 5 UNION SELECT e.id, e.boss FROM rt_emp e, up WHERE e.id = up.boss) SELECT id FROM up ORDER BY id", "", "ok", [[["num", "1"]], [["num", "2"]], [["num", "4"]], [["num", "5"]]], [23]],
+["WITH RECURSIVE c(x) AS (SELECT 1 UNION SELECT (x % 3) + 1 FROM c) SELECT x FROM c ORDER BY x", "", "ok", [[["num", "1"]], [["num", "2"]], [["num", "3"]]], [23]],
+["WITH RECURSIVE f(n, fact) AS (SELECT 1, 1::numeric UNION ALL SELECT n + 1, fact * (n + 1) FROM f WHERE n < 20) SELECT fact::text FROM f WHERE n = 20", "", "ok", [[["str", "2432902008176640000"]]], [25]],
+["WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3), s AS (SELECT n * 10 AS m FROM r) SELECT m FROM s ORDER BY m", "", "ok", [[["num", "10"]], [["num", "20"]], [["num", "30"]]], [23]],
+["WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 4) SELECT count(*) FROM rt_emp WHERE id IN (SELECT n FROM r)", "", "ok", [[["num", "4"]]], [20]],
+["WITH RECURSIVE r(n) AS (SELECT n FROM r) SELECT * FROM r", "", "err", "42P19: recursive query \"r\" does not have the form non-recursive-term UNION [ALL] recursive-term", []],
+["WITH RECURSIVE r(n) AS (SELECT 1 WHERE false UNION ALL SELECT n + 1 FROM r) SELECT count(*) FROM r", "", "ok", [[["num", "0"]]], [20]],
+["WITH RECURSIVE p(path, id) AS (SELECT name, id FROM rt_emp WHERE id = 1 UNION ALL SELECT p.path || '/' || e.name, e.id FROM rt_emp e JOIN p ON e.boss = p.id) SELECT path FROM p ORDER BY path", "", "ok", [[["str", "ceo"]], [["str", "ceo/cfo"]], [["str", "ceo/cto"]], [["str", "ceo/cto/dev"]], [["str", "ceo/cto/dev/intern"]]], [25]],
+["WITH r AS (SELECT 1 AS n) SELECT n FROM r", "", "ok", [[["num", "1"]]], [23]],
+["WITH RECURSIVE r(n) AS (SELECT 1::int2 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r", "", "err", "42804: recursive query \"r\" column 1 has type smallint in non-recursive term but type integer overall", []],
+["WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1.5 FROM r WHERE n < 3) SELECT n FROM r", "", "err", "42804: recursive query \"r\" column 1 has type integer in non-recursive term but type numeric overall", []],
+["WITH RECURSIVE r(n) AS (SELECT 1::int8 UNION ALL SELECT (n + 1)::int4 FROM r WHERE n < 3) SELECT n FROM r", "", "ok", [[["num", "1"]], [["num", "2"]], [["num", "3"]]], [20]],
+["WITH RECURSIVE r(n) AS (SELECT 1.0 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r", "", "ok", [[["num", "1"]], [["num", "2"]], [["num", "3"]]], [1700]],
+["WITH RECURSIVE r(s) AS (SELECT 'a'::varchar UNION ALL SELECT s || 'b' FROM r WHERE length(s) < 3) SELECT s FROM r", "", "ok", [[["str", "a"]], [["str", "ab"]], [["str", "abb"]]], [1043]]
+]}

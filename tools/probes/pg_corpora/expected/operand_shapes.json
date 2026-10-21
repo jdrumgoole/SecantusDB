@@ -1,0 +1,16 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["create table ops_t (id int, arr int[], t text)", "", "ok", [], []],
+["insert into ops_t values (1, '{1,2}', 'a')", "", "ok", [], []],
+["select id from ops_t where arr[1] = true", "", "err", "42883: operator does not exist: integer = boolean", []],
+["select id from ops_t where arr[1] = 'x'", "", "err", "22P02: invalid input syntax for type integer: \"x\"", []],
+["select id from ops_t where arr[1] = 1", "", "ok", [[["num", "1"]]], [23]],
+["select id from ops_t where row(id, t) = row(1, 'a')", "", "ok", [[["num", "1"]]], [23]],
+["select id from ops_t where row(id, t) = row(true, 'a')", "", "err", "42883: operator does not exist: integer = boolean", []],
+["select id from (select id, row_number() over () as rn from ops_t) s where rn = 'x'", "", "err", "22P02: invalid input syntax for type bigint: \"x\"", []],
+["select id from (select id, row_number() over () as rn from ops_t) s where rn = true", "", "err", "42883: operator does not exist: bigint = boolean", []],
+["select id from ops_t where arr[1:1] = '{1}'", "", "ok", [[["num", "1"]]], [23]],
+["select id from ops_t where (arr[1] + 1) = 'y'", "", "err", "22P02: invalid input syntax for type integer: \"y\"", []],
+["drop table ops_t", "", "ok", [], []]
+]}

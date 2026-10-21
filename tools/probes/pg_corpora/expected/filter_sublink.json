@@ -1,0 +1,17 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["select count(*) filter (where exists (select 1 from fs24_t t where t.x = o.a)) from fs24_o o;", "", "ok", [[["num", "4"]]], [20]],
+["select count(*) filter (where o.a in (select x from fs24_t)) from fs24_o o;", "", "ok", [[["num", "4"]]], [20]],
+["select count(*) filter (where o.a not in (select x from fs24_t where x is not null)) from fs24_o o;", "", "ok", [[["num", "1"]]], [20]],
+["select sum(o.b) filter (where exists (select 1 from fs24_t t where t.x = o.a and t.f)) from fs24_o o;", "", "ok", [[["num", "3"]]], [20]],
+["select avg(o.a) filter (where o.b = (select min(y) from fs24_t)) from fs24_o o;", "", "ok", [[["num", "35"]]], [1700]],
+["select min(o.id) filter (where o.a > (select avg(x) from fs24_t)), max(o.id) filter (where o.a > (select avg(x) from fs24_t)) from fs24_o o;", "", "ok", [[["num", "4"], ["num", "6"]]], [23, 23]],
+["select o.b, count(*) filter (where exists (select 1 from fs24_t t where t.x = o.a)) from fs24_o o group by o.b order by o.b nulls first;", "", "ok", [[["NoneType", "None"], ["num", "0"]], [["num", "1"], ["num", "2"]], [["num", "2"], ["num", "2"]]], [23, 20]],
+["select string_agg(o.id::text, ',' order by o.id) filter (where o.a in (select x from fs24_t where f)) from fs24_o o;", "", "ok", [[["str", "1,5"]]], [25]],
+["select count(distinct o.a) filter (where o.a in (select x from fs24_t)) from fs24_o o;", "", "ok", [[["num", "3"]]], [20]],
+["select bool_and(o.a > 5) filter (where exists (select 1 from fs24_t t where t.y = o.b)) from fs24_o o;", "", "ok", [[["bool", true]]], [16]],
+["select count(*) filter (where (select max(t.x) from fs24_t t where t.y = o.b) > 15) from fs24_o o;", "", "ok", [[["num", "0"]]], [20]],
+["select count(*) filter (where exists (select 1 from fs24_t t where t.x = o.a)) from fs24_o o where false;", "", "ok", [[["num", "0"]]], [20]],
+["select o.b from fs24_o o group by o.b having count(*) filter (where o.a in (select x from fs24_t)) > 0 order by 1 nulls first;", "", "ok", [[["num", "1"]], [["num", "2"]]], [23]]
+]}

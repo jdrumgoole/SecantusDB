@@ -1,0 +1,15 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["select x + 1 from (values (1.5::float8), ('2.5')) v(x) order by 1;", "", "ok", [[["num", "2.5"]], [["num", "3.5"]]], [701]],
+["select x, pg_typeof(x) from (values (1::int), ('2')) v(x) order by 1;", "", "ok", [[["num", "1"], ["str", "integer"]], [["num", "2"], ["str", "integer"]]], [23, 2206]],
+["select sum(x) from (values (1.5::numeric), ('2.25')) v(x);", "", "ok", [[["num", "3.75"]]], [1700]],
+["select x from (values ('2020-01-01'::date), ('2020-01-02')) v(x) order by 1;", "", "ok", [[["date", "2020-01-01"]], [["date", "2020-01-02"]]], [1082]],
+["select count(distinct x) from (values ('NaN'::float8), ('NaN')) v(x);", "", "ok", [[["num", "1"]]], [20]],
+["select count(*) from wn14 group by x order by 1;", "", "ok", [[["num", "1"]], [["num", "2"]], [["num", "2"]]], [20]],
+["select count(*) from wn14 group by n order by 1;", "", "ok", [[["num", "1"]], [["num", "2"]], [["num", "2"]]], [20]],
+["select count(distinct x), count(distinct n) from wn14;", "", "ok", [[["num", "3"], ["num", "3"]]], [20, 20]],
+["select x::text from (select distinct x from wn14) s order by 1;", "", "ok", [[["str", "-0"]], [["str", "1"]], [["str", "NaN"]]], [25]],
+["select pg_typeof(x), x::text from (values ('NaN'::float8), ('NaN')) v(x);", "", "ok", [[["str", "double precision"], ["str", "NaN"]], [["str", "double precision"], ["str", "NaN"]]], [2206, 25]],
+["select x::text, count(*) over (partition by x) from (values ('NaN'::float8), ('NaN')) v(x);", "", "ok", [[["str", "NaN"], ["num", "2"]], [["str", "NaN"], ["num", "2"]]], [25, 20]]
+]}

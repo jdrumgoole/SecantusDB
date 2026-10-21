@@ -785,7 +785,7 @@ macro_rules! process_socket_messages {
                             }
                             IdleEvent::Fatal(error) => {
                                 let _ = socket
-                                    .send(PgWireBackendMessage::ErrorResponse(error.into()))
+                                    .send(PgWireBackendMessage::ErrorResponse((*error).into()))
                                     .await;
                                 break;
                             }
@@ -983,7 +983,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn server_name_metadata_is_set_from_tls_sni() {
         use std::net::SocketAddr;
         use tokio::io::duplex;
@@ -1019,7 +1018,10 @@ mod tests {
 
         // client side: connect with SNI=localhost over in-memory IO
         let server_name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
-        let _ = connector.connect(server_name, client_io).await.unwrap();
+        // Held until the server has answered: dropping the client stream as
+        // soon as its handshake returns closed the pipe while the server was
+        // still finishing its own side, and its accept failed with BrokenPipe.
+        let _client = connector.connect(server_name, client_io).await.unwrap();
 
         // verify server observed SNI and stored as `server_name`
         let observed = rx.await.expect("server_name from server");

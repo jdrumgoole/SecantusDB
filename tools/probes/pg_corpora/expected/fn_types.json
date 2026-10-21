@@ -1,0 +1,21 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT upper(1)", "", "err", "42883: function upper(integer) does not exist", []],
+["SELECT lower(true)", "", "err", "42883: function lower(boolean) does not exist", []],
+["SELECT upper(NULL), upper('x'), upper('x'::varchar), upper('x'::name)", "", "ok", [[["NoneType", "None"], ["str", "X"], ["str", "X"], ["str", "X"]]], [25, 25, 25, 25]],
+["SELECT upper(id) FROM ft_e", "", "err", "42883: function upper(integer) does not exist", []],
+["SELECT upper(id) FROM ft_r", "", "err", "42883: function upper(integer) does not exist", []],
+["SELECT upper(d) FROM ft_e", "", "err", "42883: function upper(date) does not exist", []],
+["SELECT upper(v), lower(s) FROM ft_e", "", "ok", [], [25, 25]],
+["SELECT repeat(id, 2) FROM ft_e", "", "err", "42883: function repeat(integer, integer) does not exist", []],
+["SELECT repeat(s, id) FROM ft_r", "", "ok", [[["str", "a"]]], [25]],
+["SELECT replace(s, 'a', id::text) FROM ft_r", "", "ok", [[["str", "1"]]], [25]],
+["SELECT nosuch(id) FROM ft_e", "", "err", "42883: function nosuch(integer) does not exist", []],
+["SELECT nosuch(id) FROM ft_r", "", "err", "42883: function nosuch(integer) does not exist", []],
+["SELECT s FROM ft_e WHERE upper(id) = 'X'", "", "err", "42883: function upper(integer) does not exist", []],
+["SELECT length(id) FROM ft_e", "", "err", "42883: function length(integer) does not exist", []],
+["SELECT left(s, 1), right(s, 1), lpad(s, 3), reverse(s), initcap(s), ascii(s) FROM ft_r", "", "ok", [[["str", "a"], ["str", "a"], ["str", "  a"], ["str", "a"], ["str", "A"], ["num", "97"]]], [25, 25, 25, 25, 25, 23]],
+["SELECT strpos(s, 'a'), split_part(s, 'a', 1), starts_with(s, 'a') FROM ft_r", "", "ok", [[["num", "1"], ["str", ""], ["bool", true]]], [23, 25, 16]],
+["SELECT upper(s || id) FROM ft_r", "", "ok", [[["str", "A1"]]], [25]]
+]}

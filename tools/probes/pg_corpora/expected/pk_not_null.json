@@ -1,0 +1,14 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["INSERT INTO dvp DEFAULT VALUES", "", "err", "23502: null value in column \"id\" of relation \"dvp\" violates not-null constraint", []],
+["INSERT INTO dvp (v) VALUES ('x')", "", "err", "23502: null value in column \"id\" of relation \"dvp\" violates not-null constraint", []],
+["INSERT INTO dvp VALUES (NULL, 'y')", "", "err", "23502: null value in column \"id\" of relation \"dvp\" violates not-null constraint", []],
+["INSERT INTO dvp VALUES (1, 'y')", "", "ok", [], []],
+["UPDATE dvp SET id = NULL", "", "err", "23502: null value in column \"id\" of relation \"dvp\" violates not-null constraint", []],
+["INSERT INTO dvs (v) VALUES ('a')", "", "ok", [], []],
+["INSERT INTO dvc (a) VALUES (1)", "", "err", "23502: null value in column \"b\" of relation \"dvc\" violates not-null constraint", []],
+["SELECT * FROM dvp", "", "ok", [[["num", "1"], ["str", "y"]]], [23, 25]],
+["SELECT * FROM dvs", "", "ok", [[["num", "1"], ["str", "a"]]], [23, 25]],
+["SELECT count(*) FROM dvc", "", "ok", [[["num", "0"]]], [20]]
+]}

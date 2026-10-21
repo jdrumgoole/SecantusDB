@@ -1,0 +1,22 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["CREATE TYPE ea_m AS ENUM ('a', 'b')", "", "ok", [], []],
+["ALTER TYPE ea_m ADD VALUE 'b'", "", "err", "42710: enum label \"b\" already exists", []],
+["ALTER TYPE ea_m ADD VALUE IF NOT EXISTS 'b'", "", "ok", [], []],
+["ALTER TYPE ea_m ADD VALUE 'z' BEFORE 'nope'", "", "err", "22023: \"nope\" is not an existing enum label", []],
+["ALTER TYPE ea_m ADD VALUE 'c' AFTER 'a'", "", "ok", [], []],
+["ALTER TYPE ea_m ADD VALUE 'first' BEFORE 'a'", "", "ok", [], []],
+["ALTER TYPE ea_m ADD VALUE 'last'", "", "ok", [], []],
+["CREATE TABLE ea_t (x ea_m, xs ea_m[])", "", "ok", [], []],
+["INSERT INTO ea_t VALUES ('c', '{c,b}'), ('b', '{a}')", "", "ok", [], []],
+["ALTER TYPE ea_m RENAME VALUE 'c' TO 'cc'", "", "ok", [], []],
+["SELECT x::text, xs::text FROM ea_t ORDER BY x", "", "ok", [[["str", "b"], ["str", "{a}"]], [["str", "cc"], ["str", "{cc,b}"]]], [25, 25]],
+["SELECT x FROM ea_t WHERE x > 'a' ORDER BY x", "", "ok", [[["str", "cc"]], [["str", "b"]]], [17653]],
+["ALTER TYPE ea_m RENAME VALUE 'nope' TO 'q'", "", "err", "22023: \"nope\" is not an existing enum label", []],
+["ALTER TYPE ea_m RENAME VALUE 'a' TO 'b'", "", "err", "42710: enum label \"b\" already exists", []],
+["SELECT enum_range(NULL::ea_m), enum_first(NULL::ea_m), enum_last(NULL::ea_m), pg_typeof(enum_range(NULL::ea_m))", "", "ok", [[["str", "{first,a,cc,b,last}"], ["str", "first"], ["str", "last"], ["str", "ea_m[]"]]], [17652, 17653, 17653, 2206]],
+["SELECT enum_range('a'::ea_m, 'b'::ea_m), enum_range(NULL, 'cc'::ea_m)", "", "ok", [[["str", "{a,cc,b}"], ["str", "{first,a,cc}"]]], [17652, 17652]],
+["SELECT enumlabel FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'ea_m' ORDER BY enumsortorder", "", "ok", [[["str", "first"]], [["str", "a"]], [["str", "cc"]], [["str", "b"]], [["str", "last"]]], [19]],
+["ALTER TYPE nosuch_enum ADD VALUE 'x'", "", "err", "42704: type \"nosuch_enum\" does not exist", []]
+]}

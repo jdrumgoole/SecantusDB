@@ -1,0 +1,16 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["EXPLAIN (COSTS OFF) SELECT * FROM exq", "", "ok", [[["str", "Seq Scan on exq"]]], [25]],
+["EXPLAIN (COSTS OFF) SELECT * FROM exq ORDER BY g", "", "ok", [[["str", "Sort"]], [["str", "  Sort Key: g"]], [["str", "  ->  Seq Scan on exq"]]], [25]],
+["EXPLAIN (COSTS OFF) SELECT * FROM exq ORDER BY g LIMIT 1", "", "ok", [[["str", "Limit"]], [["str", "  ->  Sort"]], [["str", "        Sort Key: g"]], [["str", "        ->  Seq Scan on exq"]]], [25]],
+["EXPLAIN (COSTS OFF) SELECT g, count(*) FROM exq GROUP BY g", "", "ok", [[["str", "HashAggregate"]], [["str", "  Group Key: g"]], [["str", "  ->  Seq Scan on exq"]]], [25]],
+["EXPLAIN (COSTS OFF) SELECT count(*) FROM exq", "", "ok", [[["str", "Aggregate"]], [["str", "  ->  Seq Scan on exq"]]], [25]],
+["EXPLAIN (COSTS OFF) INSERT INTO exq VALUES (3, 3, 'c')", "", "ok", [[["str", "Insert on exq"]], [["str", "  ->  Result"]]], [25]],
+["EXPLAIN (COSTS OFF) SELECT 1", "", "ok", [[["str", "Result"]]], [25]],
+["EXPLAIN (FORMAT YAML, COSTS OFF) SELECT 1", "", "ok", [[["str", "- Plan: \n    Node Type: \"Result\"\n    Parallel Aware: false\n    Async Capable: false"]]], [25]],
+["EXPLAIN (NOSUCH) SELECT 1", "", "err", "42601: unrecognized EXPLAIN option \"nosuch\"", []],
+["EXPLAIN SELECT * FROM nosuch", "", "err", "42P01: relation \"nosuch\" does not exist", []],
+["EXPLAIN (FORMAT XML, COSTS OFF) SELECT 1", "", "ok", [[["str", "<explain xmlns=\"http://www.postgresql.org/2009/explain\">\n  <Query>\n    <Plan>\n      <Node-Type>Result</Node-Type>\n      <Parallel-Aware>false</Parallel-Aware>\n      <Async-Capable>false</Async-Capable>\n    </Plan>\n  </Query>\n</explain>"]]], [142]],
+["EXPLAIN (FORMAT JSON, COSTS OFF) SELECT 1", "", "ok", [[["list", [["dict", "{'Plan': {'Node Type': 'Result', 'Parallel Aware': False, 'Async Capable': False}}"]]]]], [114]]
+]}

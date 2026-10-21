@@ -1,0 +1,17 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["ALTER TABLE ac ADD COLUMN u int UNIQUE", "", "ok", [], []],
+["ALTER TABLE ac ADD COLUMN c int CHECK (c > 0)", "", "ok", [], []],
+["ALTER TABLE ac ADD COLUMN p int PRIMARY KEY", "", "err", "23502: column \"p\" of relation \"ac\" contains null values", []],
+["ALTER TABLE ac ADD COLUMN r int REFERENCES ac (id)", "", "err", "42830: there is no unique constraint matching given keys for referenced table \"ac\"", []],
+["ALTER TABLE ac2 ADD COLUMN r int REFERENCES ac2 (id), ADD COLUMN q text UNIQUE", "", "ok", [], []],
+["SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'ac2'::regclass ORDER BY 1", "", "ok", [[["str", "ac2_pkey"], ["str", "PRIMARY KEY (id)"]], [["str", "ac2_q_key"], ["str", "UNIQUE (q)"]], [["str", "ac2_r_fkey"], ["str", "FOREIGN KEY (r) REFERENCES ac2(id)"]]], [19, 25]],
+["INSERT INTO ac2 VALUES (2, 9, 'x')", "", "err", "23503: insert or update on table \"ac2\" violates foreign key constraint \"ac2_r_fkey\"", []],
+["INSERT INTO ac2 VALUES (2, 1, 'x')", "", "ok", [], []],
+["INSERT INTO ac2 VALUES (3, 1, 'x')", "", "err", "23505: duplicate key value violates unique constraint \"ac2_q_key\"", []],
+["SELECT a, b FROM rc WHERE (a, b) IN (SELECT 1, 2 UNION ALL SELECT 2, 5) ORDER BY 1, 2", "", "ok", [[["num", "1"], ["num", "2"]]], [23, 23]],
+["SELECT a, b FROM rc WHERE (a, b) NOT IN (SELECT 1, 2) ORDER BY 1, 2", "", "ok", [[["num", "1"], ["num", "3"]], [["num", "2"], ["NoneType", "None"]]], [23, 23]],
+["SELECT (1, NULL) IN (SELECT 1, 2), (1, 2) NOT IN (SELECT 1, NULL::int), (1,2) IN (SELECT 1, 2 WHERE false)", "", "ok", [[["NoneType", "None"], ["NoneType", "None"], ["bool", false]]], [16, 16, 16]],
+["SELECT a FROM rc WHERE (a, b) IN (SELECT 1)", "", "err", "42601: subquery has too few columns", []]
+]}

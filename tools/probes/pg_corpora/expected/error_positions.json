@@ -1,0 +1,16 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["select (c).b + 1 from ep15_t;", "", "err", "42883: operator does not exist: text + integer", []],
+["select g + 'a' from generate_series(1, 2) g;", "", "err", "22P02: invalid input syntax for type integer: \"a\"", []],
+["select x + 1 from ep15_t;", "", "err", "42883: operator does not exist: text + integer", []],
+["select id, x from ep15_t where x = 1;", "", "err", "42883: operator does not exist: text = integer", []],
+["select id from ep15_t where id = 'a';", "", "err", "22P02: invalid input syntax for type integer: \"a\"", []],
+["select nope from ep15_t;", "", "err", "42703: column \"nope\" does not exist", []],
+["select id from ep15_t t where t.nope = 1;", "", "err", "42703: column t.nope does not exist", []],
+["select id, id from ep15_t order by zz;", "", "err", "42703: column \"zz\" does not exist", []],
+["select length(id) from ep15_t;", "", "err", "42883: function length(integer) does not exist", []],
+["select x::int + true from ep15_t;", "", "err", "42883: operator does not exist: integer + boolean", []],
+["select id from ep15_t where x > 1 and id = 'q';", "", "err", "42883: operator does not exist: text > integer", []],
+["select (c).b + 1 from (select row(1,'x')::record as c) s;", "", "err", "42703: could not identify column \"b\" in record data type", []]
+]}

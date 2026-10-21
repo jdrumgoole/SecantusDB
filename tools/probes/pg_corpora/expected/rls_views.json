@@ -1,0 +1,17 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["SET ROLE rv_alice", "", "ok", [], []],
+["SELECT * FROM rv_t ORDER BY id", "", "ok", [[["num", "1"], ["str", "rv_alice"]]], [23, 25]],
+["SELECT * FROM rv_v ORDER BY id", "", "ok", [[["num", "1"], ["str", "rv_alice"]], [["num", "2"], ["str", "rv_bob"]], [["num", "3"], ["str", "rv_carol"]]], [23, 25]],
+["SELECT * FROM rv_vb ORDER BY id", "", "ok", [[["num", "1"], ["str", "rv_alice"]], [["num", "2"], ["str", "rv_bob"]]], [23, 25]],
+["SELECT * FROM rv_vc ORDER BY id", "", "ok", [[["num", "1"], ["str", "rv_alice"]], [["num", "2"], ["str", "rv_bob"]], [["num", "3"], ["str", "rv_carol"]]], [23, 25]],
+["SELECT count(*) FROM rv_v JOIN rv_t USING (id)", "", "ok", [[["num", "1"]]], [20]],
+["SELECT (SELECT count(*) FROM rv_vb), (SELECT count(*) FROM rv_t)", "", "ok", [[["num", "2"], ["num", "1"]]], [20, 20]],
+["RESET ROLE", "", "ok", [], []],
+["SET ROLE rv_bob", "", "ok", [], []],
+["SELECT * FROM rv_t ORDER BY id", "", "ok", [[["num", "1"], ["str", "rv_alice"]], [["num", "2"], ["str", "rv_bob"]]], [23, 25]],
+["SELECT * FROM rv_v ORDER BY id", "", "ok", [[["num", "1"], ["str", "rv_alice"]], [["num", "2"], ["str", "rv_bob"]], [["num", "3"], ["str", "rv_carol"]]], [23, 25]],
+["RESET ROLE", "", "ok", [], []],
+["SELECT * FROM rv_vb ORDER BY id", "", "ok", [[["num", "1"], ["str", "rv_alice"]], [["num", "2"], ["str", "rv_bob"]]], [23, 25]]
+]}

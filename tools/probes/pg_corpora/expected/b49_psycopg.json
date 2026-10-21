@@ -1,0 +1,23 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT 'empty' = 'empty'::int4range", "", "ok", [[["bool", true]]], [16]],
+["SELECT 'empty' = '[1,2)'::int4range", "", "ok", [[["bool", false]]], [16]],
+["SELECT '[1,3)'::int8range = '[1,3)'", "", "ok", [[["bool", true]]], [16]],
+["SELECT 'empty'::datemultirange = '{}'", "", "err", "22P02: malformed multirange literal: \"empty\"", []],
+["SELECT '[1,5)'::int4range @> '[2,3)'", "", "ok", [[["bool", true]]], [16]],
+["SELECT chr(32)::bpchar, octet_length(chr(32)::bpchar), length(chr(32)::bpchar)", "", "ok", [[["str", " "], ["num", "1"], ["num", "0"]]], [1042, 23, 23]],
+["SELECT 'a  '::bpchar, octet_length('a  '::bpchar), 'a  '::bpchar = 'a'", "", "ok", [[["str", "a  "], ["num", "3"], ["bool", true]]], [1042, 23, 16]],
+["SELECT ARRAY[' ', 'b ']::bpchar[]", "", "ok", [[["list", [["str", " "], ["str", "b "]]]]], [1014]],
+["SELECT '{\" \",\"b \"}'::bpchar[]", "", "ok", [[["list", [["str", " "], ["str", "b "]]]]], [1014]],
+["SELECT 'ab'::char(4), octet_length('ab'::char(4))", "", "ok", [[["str", "ab  "], ["num", "4"]]], [1042, 23]],
+["SELECT ARRAY[set_byte('x', 0, 1)]", "", "ok", [[["list", [["bytes", "01"]]]]], [1001]],
+["SELECT '{\"\\\\x01\"}'::bytea[] = ARRAY[set_byte('x', 0, 1)]", "", "ok", [[["bool", true]]], [16]],
+["SELECT pg_typeof(ARRAY[set_byte('x', 0, 1)])", "", "ok", [[["str", "bytea[]"]]], [2206]],
+["CREATE TEMP TABLE b49_self (data int PRIMARY KEY, ref int REFERENCES b49_self (data) DEFERRABLE INITIALLY DEFERRED)", "", "ok", [], []],
+["INSERT INTO b49_self VALUES (1, 1)", "", "ok", [], []],
+["CREATE TEMP TABLE b49_chk (data int CONSTRAINT b49_chk_eq1 CHECK (data = 1))", "", "ok", [], []],
+["INSERT INTO b49_chk VALUES (2)", "", "err", "23514: new row for relation \"b49_chk\" violates check constraint \"b49_chk_eq1\"", []],
+["DROP TABLE b49_chk", "", "ok", [], []],
+["DROP TABLE b49_self", "", "ok", [], []]
+]}

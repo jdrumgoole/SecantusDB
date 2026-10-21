@@ -1,0 +1,16 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["select id from sj14_a a where exists (select 1 from sj14_b b where b.a_id = a.id) order by 1;", "", "ok", [[["num", "1"]], [["num", "3"]], [["num", "5"]]], [23]],
+["select id from sj14_a a where not exists (select 1 from sj14_b b where b.a_id = a.id) order by 1 nulls first;", "", "ok", [[["NoneType", "None"]], [["num", "2"]]], [23]],
+["select id from sj14_a a where exists (select 1 from sj14_b b where a.id = b.a_id and b.w = 'x') order by 1;", "", "ok", [[["num", "1"]], [["num", "3"]]], [23]],
+["select id from sj14_a a where not exists (select * from sj14_b b where b.a_id = a.id and w is not null) order by 1 nulls first;", "", "ok", [[["NoneType", "None"]], [["num", "2"]], [["num", "5"]]], [23]],
+["select id from sj14_a a where a.v > 5 and exists (select 1 from sj14_b where sj14_b.a_id = a.id) order by 1;", "", "ok", [[["num", "1"]], [["num", "5"]]], [23]],
+["select id from sj14_a a where exists (select count(*) from sj14_b b where b.a_id = a.id) order by 1 nulls first;", "", "ok", [[["NoneType", "None"]], [["num", "1"]], [["num", "2"]], [["num", "3"]], [["num", "5"]]], [23]],
+["select id from sj14_a a where exists (select 1 from sj14_b b where b.a_id = a.id limit 0) order by 1;", "", "ok", [], [23]],
+["select id, exists (select 1 from sj14_b b where b.a_id = a.id) from sj14_a a order by 1 nulls first;", "", "ok", [[["NoneType", "None"], ["bool", false]], [["num", "1"], ["bool", true]], [["num", "2"], ["bool", false]], [["num", "3"], ["bool", true]], [["num", "5"], ["bool", true]]], [23, 16]],
+["select id from sj14_a a where exists (select 1 from sj14_b b where b.a_id = a.id and b.id = a.v / 10) order by 1;", "", "ok", [[["num", "1"]], [["num", "5"]]], [23]],
+["select id from sj14_a a where exists (select 1 from sj14_b a where a.a_id = 1) order by 1 nulls first;", "", "ok", [[["NoneType", "None"]], [["num", "1"]], [["num", "2"]], [["num", "3"]], [["num", "5"]]], [23]],
+["select id from sj14_a a where not (not exists (select 1 from sj14_b b where b.a_id = a.id)) order by 1;", "", "ok", [[["num", "1"]], [["num", "3"]], [["num", "5"]]], [23]],
+["select count(*) from sj14_a a join sj14_b b on b.id = a.id where exists (select 1 from sj14_b c where c.a_id = b.id);", "", "ok", [[["num", "3"]]], [20]]
+]}

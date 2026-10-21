@@ -1,0 +1,15 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT x from generate_series(1,6) x order by x % 2", "", "ok", [[["num", "2"]], [["num", "4"]], [["num", "6"]], [["num", "1"]], [["num", "3"]], [["num", "5"]]], [23]],
+["SELECT x from generate_series(1,6) x order by x % 2, x desc", "", "ok", [[["num", "6"]], [["num", "4"]], [["num", "2"]], [["num", "5"]], [["num", "3"]], [["num", "1"]]], [23]],
+["SELECT x * 10 as y from generate_series(1,4) x order by -x", "", "ok", [[["num", "40"]], [["num", "30"]], [["num", "20"]], [["num", "10"]]], [23]],
+["SELECT x from generate_series(1,6) x order by 1 desc", "", "ok", [[["num", "6"]], [["num", "5"]], [["num", "4"]], [["num", "3"]], [["num", "2"]], [["num", "1"]]], [23]],
+["SELECT x from generate_series(1,6) x order by x desc limit 2", "", "ok", [[["num", "6"]], [["num", "5"]]], [23]],
+["SELECT g from generate_series(1,5) g order by g % 3 desc, g", "", "ok", [[["num", "2"]], [["num", "5"]], [["num", "1"]], [["num", "4"]], [["num", "3"]]], [23]],
+["SELECT x * 10 as y from generate_series(1,4) x order by y desc", "", "ok", [[["num", "40"]], [["num", "30"]], [["num", "20"]], [["num", "10"]]], [23]],
+["SELECT x * 10 from generate_series(1,4) x order by 1 desc", "", "ok", [[["num", "40"]], [["num", "30"]], [["num", "20"]], [["num", "10"]]], [23]],
+["SELECT x from generate_series(1,6) x where x > 2 order by x % 2 limit 3", "", "ok", [[["num", "4"]], [["num", "6"]], [["num", "3"]]], [23]],
+["SELECT count(*) from generate_series(1,10) x", "", "ok", [[["num", "10"]]], [20]],
+["SELECT x from generate_series(1,10,3) x order by x desc", "", "ok", [[["num", "10"]], [["num", "7"]], [["num", "4"]], [["num", "1"]]], [23]]
+]}

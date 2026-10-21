@@ -1,0 +1,14 @@
+{"reference": "15.19 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT sum(d), avg(d), count(d) FROM b61_f", "", "ok", [[["num", "666941.0915143169"], ["num", "200.04231899049697"], ["num", "3334"]]], [701, 701, 20]],
+["SELECT sum(r), avg(r) FROM b61_f WHERE id < 1500", "", "ok", [[["num", "299857.28"], ["num", "224.94940560926466"]]], [700, 701]],
+["SELECT avg(r) FROM b61_f", "", "ok", [[["num", "600.0773705993313"]]], [701]],
+["SELECT avg(i), avg(b), avg(n), avg(s) FROM b61_f", "", "ok", [[["num", "7.7885620016497113"], ["num", "8999999999999993999"], ["num", "7.4965319335083115"], ["num", "147.025"]]], [1700, 1700, 1700, 1700]],
+["SELECT avg(i), sum(d), max(d), min(r) FROM b61_f WHERE pad LIKE 'x%'", "", "ok", [[["num", "7.7885620016497113"], ["num", "666941.0915143169"], ["num", "400.00025"], ["num", "1.1"]]], [1700, 701, 701, 700]],
+["SELECT sum(d), avg(r), avg(n) FROM b61_f0", "", "ok", [[["NoneType", "None"], ["NoneType", "None"], ["NoneType", "None"]]], [701, 701, 1700]],
+["SELECT avg(d) FROM b61_f WHERE id > 3990", "", "ok", [[["num", "399.54469472963456"]]], [701]],
+["SELECT sum(d) * 2, avg(n) + 1 FROM b61_f", "", "ok", [[["num", "1333882.1830286337"], ["num", "8.4965319335083115"]]], [701, 1700]],
+["SELECT avg(i), sum(d) FROM b61_f HAVING count(*) > 10", "", "ok", [[["num", "7.7885620016497113"], ["num", "666941.0915143169"]]], [1700, 701]],
+["SELECT sum(r) FROM b61_f WHERE s < 100", "", "ok", [[["num", "744639.3"]]], [700]]
+]}

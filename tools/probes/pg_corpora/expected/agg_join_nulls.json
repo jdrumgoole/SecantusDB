@@ -1,0 +1,16 @@
+{"reference": "14.13 (Homebrew)",
+"volatile": {},
+"checks": [
+["SELECT j.id, sum(k.v) FROM lj20 j LEFT JOIN lk20 k ON k.jid = j.id GROUP BY j.id ORDER BY j.id", "", "ok", [[["num", "1"], ["num", "12"]], [["num", "2"], ["NoneType", "None"]], [["num", "3"], ["NoneType", "None"]]], [23, 20]],
+["SELECT j.id, sum(k.w) FROM lj20 j LEFT JOIN lk20 k ON k.jid = j.id GROUP BY j.id ORDER BY j.id", "", "ok", [[["num", "1"], ["num", "13"]], [["num", "2"], ["NoneType", "None"]], [["num", "3"], ["NoneType", "None"]]], [23, 1700]],
+["SELECT j.id, count(k.v) FROM lj20 j LEFT JOIN lk20 k ON k.jid = j.id GROUP BY j.id ORDER BY j.id", "", "ok", [[["num", "1"], ["num", "2"]], [["num", "2"], ["num", "0"]], [["num", "3"], ["num", "0"]]], [23, 20]],
+["SELECT j.id, count(*) FROM lj20 j LEFT JOIN lk20 k ON k.jid = j.id GROUP BY j.id ORDER BY j.id", "", "ok", [[["num", "1"], ["num", "2"]], [["num", "2"], ["num", "1"]], [["num", "3"], ["num", "1"]]], [23, 20]],
+["SELECT j.id, avg(k.v) FROM lj20 j LEFT JOIN lk20 k ON k.jid = j.id GROUP BY j.id ORDER BY j.id", "", "ok", [[["num", "1"], ["num", "6"]], [["num", "2"], ["NoneType", "None"]], [["num", "3"], ["NoneType", "None"]]], [23, 1700]],
+["SELECT j.id, min(k.v), max(k.v) FROM lj20 j LEFT JOIN lk20 k ON k.jid = j.id GROUP BY j.id ORDER BY j.id", "", "ok", [[["num", "1"], ["num", "5"], ["num", "7"]], [["num", "2"], ["NoneType", "None"], ["NoneType", "None"]], [["num", "3"], ["NoneType", "None"], ["NoneType", "None"]]], [23, 23, 23]],
+["SELECT j.id, array_agg(k.v) FROM lj20 j LEFT JOIN lk20 k ON k.jid = j.id GROUP BY j.id ORDER BY j.id", "", "ok", [[["num", "1"], ["list", [["num", "5"], ["num", "7"]]]], [["num", "2"], ["list", [["NoneType", "None"]]]], [["num", "3"], ["list", [["NoneType", "None"]]]]], [23, 1007]],
+["SELECT j.id, string_agg(k.v::text, ',') FROM lj20 j LEFT JOIN lk20 k ON k.jid = j.id GROUP BY j.id ORDER BY j.id", "", "ok", [[["num", "1"], ["str", "5,7"]], [["num", "2"], ["NoneType", "None"]], [["num", "3"], ["NoneType", "None"]]], [23, 25]],
+["SELECT j.id, coalesce(sum(k.v), -1) FROM lj20 j LEFT JOIN lk20 k ON k.jid = j.id GROUP BY j.id ORDER BY j.id", "", "ok", [[["num", "1"], ["num", "12"]], [["num", "2"], ["num", "-1"]], [["num", "3"], ["num", "-1"]]], [23, 20]],
+["SELECT j.id FROM lj20 j LEFT JOIN lk20 k ON k.jid = j.id GROUP BY j.id HAVING sum(k.v) IS NULL ORDER BY j.id", "", "ok", [[["num", "2"]], [["num", "3"]]], [23]],
+["SELECT j.g, sum(k.v) FROM lj20 j LEFT JOIN lk20 k ON k.jid = j.id GROUP BY j.g ORDER BY j.g", "", "ok", [[["str", "x"], ["num", "12"]], [["str", "y"], ["NoneType", "None"]], [["str", "z"], ["NoneType", "None"]]], [25, 20]],
+["SELECT sum(k.v) FROM lj20 j LEFT JOIN lk20 k ON k.jid = j.id WHERE j.id = 3", "", "ok", [[["NoneType", "None"]]], [20]]
+]}

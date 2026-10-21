@@ -25444,6 +25444,9 @@ impl PgHandler {
         // start before the check. An aborted block answers 25P02 instead.
         if !self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) {
             self.within_block(|| self.check_sql_privileges(sql))?;
+            // Each of these walks the whole statement: cancellation points
+            // between them, as through PostgreSQL's parse analysis.
+            self.check_cancel()?;
             self.with_cancel_hook(|| self.wait_for_table_locks(sql))?;
             self.isolate_for_planning(sql)?;
         }
@@ -25481,6 +25484,8 @@ impl PgHandler {
             _ => None,
         };
         let templated = templated.or_else(|| self.family_plan(family.as_ref()?));
+        // `literal_family` reads every literal in the text.
+        self.check_cancel()?;
         let reused = templated.is_some();
         let planned = match templated {
             Some(stmt) => Ok(stmt),
@@ -43291,7 +43296,7 @@ impl PgWireServerHandlers for HandlerFactory {
                     .load(std::sync::atomic::Ordering::Relaxed)
                 {
                     let info: ErrorInfo = PgHandler::admin_shutdown().into();
-                    return pgwire::api::IdleEvent::Fatal(info);
+                    return pgwire::api::IdleEvent::Fatal(Box::new(info));
                 }
                 let messages = handler.drain_notifications();
                 if !messages.is_empty() {
