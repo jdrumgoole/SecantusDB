@@ -154,6 +154,22 @@ def conflicting_parameter_uses_fail_at_parse(connect: Connect) -> tuple:
     )
 
 
+def declared_parameter_type_is_checked_at_parse(connect: Connect) -> tuple:
+    """`$1` declared uuid compared with a varchar column has no operator:
+    42883 at Parse, before any Bind (pgtest typing:74)."""
+    w = connect()
+    w.run(query("DROP TABLE IF EXISTS rp_typing"))
+    w.run(query("CREATE TABLE rp_typing (id INT, v VARCHAR)"))
+    out = w.run(
+        parse("SELECT id FROM rp_typing WHERE v = $1", "s3", (2950,)),
+        bind("s3", "p1", (b"9AC39CE2-0623-4632-A965-9A51C95682D4",), (0,)),
+        execute("p1"),
+        SYNC,
+    )
+    w.run(query("DROP TABLE rp_typing"))
+    return (out,)
+
+
 # -------------------------------------------------- SET's reply order --
 
 
@@ -348,6 +364,21 @@ def bind_to_an_existing_portal(connect: Connect) -> tuple:
     return first, again
 
 
+# ------------------------------------------ an unknown portal's name --
+
+
+def unknown_portal_error_names_it(connect: Connect) -> tuple:
+    """Executing a portal that was never bound is 34000, and the message
+    names the portal the client sent: `portal "" does not exist` for the
+    unnamed one (pgtest portals:24)."""
+    w = connect()
+    out = []
+    for name in ("", "nope"):
+        replies = w.run(execute(name), SYNC)
+        out.append((replies, w.errors[-1]["M"]))
+    return tuple(out)
+
+
 # ----------------------------------------------- an unknown type name --
 
 
@@ -526,6 +557,13 @@ EXPECTED: dict[str, tuple] = {
         [("ParseComplete",), ("ErrorResponse", "42P03"), ("ReadyForQuery", "E")],
     ),
     "unknown_type_fails_at_parse": ([("ErrorResponse", "42704"), ("ReadyForQuery", "I")],),
+    "declared_parameter_type_is_checked_at_parse": (
+        [("ErrorResponse", "42883"), ("ReadyForQuery", "I")],
+    ),
+    "unknown_portal_error_names_it": (
+        ([("ErrorResponse", "34000"), ("ReadyForQuery", "I")], 'portal "" does not exist'),
+        ([("ErrorResponse", "34000"), ("ReadyForQuery", "I")], 'portal "nope" does not exist'),
+    ),
 }
 
 
@@ -627,3 +665,17 @@ def test_bind_to_an_existing_portal(wire: Connect) -> None:
 @pytest.mark.backlog("RP-090")
 def test_unknown_type_fails_at_parse(wire: Connect) -> None:
     _check("unknown_type_fails_at_parse", unknown_type_fails_at_parse, wire)
+
+
+@pytest.mark.backlog("RP-080")
+def test_declared_parameter_type_is_checked_at_parse(wire: Connect) -> None:
+    _check(
+        "declared_parameter_type_is_checked_at_parse",
+        declared_parameter_type_is_checked_at_parse,
+        wire,
+    )
+
+
+@pytest.mark.backlog("RP-091")
+def test_unknown_portal_error_names_it(wire: Connect) -> None:
+    _check("unknown_portal_error_names_it", unknown_portal_error_names_it, wire)

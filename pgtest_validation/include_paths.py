@@ -5,6 +5,13 @@ lives here. ``EXCLUDE`` names files not run at all (only for hangs or
 crdb-internals that can't produce a meaningful non-crdb run);
 ``EXPECTED_DIVERGENCES`` maps a file to a one-line reason and keeps the gauge
 green while the failure is a documented gap rather than a regression.
+
+A listed file counts as expected wherever it fails, so each reason names the
+line where the Rust server stops and the line where PostgreSQL 15.19 stops
+(both measured 2026-10-21, a private `initdb --locale=C -E UTF8` cluster for
+PostgreSQL). Where the Rust server stops earlier, the earlier line is an open
+backlog item, named here; re-measure and update the reason when a fix moves
+the stop.
 """
 
 #: Corpus files skipped entirely (relative to testdata/pgtest).
@@ -13,22 +20,14 @@ EXCLUDE: set[str] = set()
 #: file -> reason. A file listed here that PASSES is reported loudly.
 EXPECTED_DIVERGENCES: dict[str, str] = {
     "multiple_active_portals": (
-        "A CockroachDB pausable-portal test. Two of its subtests can't pass "
-        "against a non-crdb server: (1) `query_timeout` expects a portal paged "
-        "MaxRows:1 to emit N DataRows and THEN a 57014 statement-timeout on the "
-        "next pull — that incremental behaviour needs LAZY per-row portal "
-        "evaluation, but SecantusDB materialises a portal's result eagerly "
-        "(statement_timeout IS enforced for simple / single-statement queries, "
-        "just not row-by-row across a paged portal); (2) "
-        "`interleave_with_unpausable_portal` pins crdb's `0A000 unimplemented: "
-        "the statement for a pausable portal must be a read-only SELECT` error "
-        "(with a go.crdb.dev hint) for interleaving a non-read-only portal — "
-        "real PostgreSQL interleaves those fine and emits no such error. Every "
-        "other subtest passes (select_from_individual_resources, "
-        "select_from_same_table, bind_to_an_existing_active_portal, "
-        "not_in_explicit_transaction, drop_table_when_there_are_dependent_"
-        "active_portals, different_portals_bind_to_the_same_statement, "
-        "more_complicated_stmts, not_supported_statements)."
+        "A CockroachDB pausable-portal test, which PostgreSQL 15.19 fails "
+        "too: `query_timeout` expects a portal paged MaxRows:1 to emit N "
+        "DataRows and THEN a 57014 statement-timeout on the next pull, and "
+        "`interleave_with_unpausable_portal` pins crdb's `0A000 the "
+        "statement for a pausable portal must be a read-only SELECT`, which "
+        "real PostgreSQL never raises. The Rust server ALSO fails "
+        "`bind_to_an_existing_active_portal` (:137): binding to a portal "
+        "name already open is accepted instead of 42P03 (RP-089)."
     ),
     "multiple_active_portals/query_timeout": (
         "Expects a portal paged MaxRows:1 to emit several DataRows and then a "
@@ -38,108 +37,74 @@ EXPECTED_DIVERGENCES: dict[str, str] = {
         "queries) can't page a portal row-by-row against the deadline."
     ),
     "portals": (
-        "portals:1182 compares the CHECK-violation MESSAGE with "
-        "keepErrMessage and pins crdb's wording ('failed to satisfy CHECK "
-        "constraint (a > 1.0:::FLOAT8)'). We emit real PostgreSQL's ('new row "
-        'for relation "t" violates check constraint "t_a_check"\'), which is '
-        "what psycopg/pgjdbc users parse — matching crdb would be a fidelity "
-        "REGRESSION. Everything up to :1182 passes (1182 of 1550 lines, "
-        "including PortalSuspended-on-exact-MaxRows and per-Execute row "
-        "counts). NOTE: the stanzas after :1182 are therefore NOT exercised — "
-        "they cover 34000 'unknown portal' (already implemented, slice 21) and "
-        "42P03 'cursor \"p\" already exists as portal' (NOT implemented). See "
-        "tasks/backlog.md."
+        "Both servers stop at portals:24, an Execute of the unnamed portal "
+        "with nothing bound: 34000 on both, but the stanza pins crdb's "
+        'message `unknown portal ""` where PostgreSQL 15.19 says `portal '
+        '"" does not exist`. The Rust server\'s message names an internal '
+        'portal instead (`portal "POSTGRESQL_DEFAULT_NAME" does not '
+        "exist`, RP-091). Nothing after :24 is exercised."
     ),
     "jsonpath": (
-        "jsonpath:36/:76 expect crdb's BINARY jsonpath form — version byte + "
-        "the SINGLE-QUOTED text ('$' -> 01272427). Real PostgreSQL's "
-        "jsonpath_send emits the version byte + the canonical text WITHOUT "
-        "outer quotes (0124), which is what we send. Everything else in the "
-        'file is green (oid 4072, canonical $."abc" text, 42601 on an '
-        "empty path, jsonb_path_query)."
+        "Both servers stop at jsonpath:5, `SELECT ''::JSONPATH`, where the "
+        "stanza expects 42601. PostgreSQL 15.19 raises 22P02; the Rust server "
+        "accepts the empty path with no error (RP-088). The binary-form "
+        "stanzas at :36 / :76 (crdb's single-quoted jsonpath_send) are not "
+        "reached."
     ),
     "int2vector": (
-        "int2vector:26 expects indoption={2} for a plain primary key — "
-        "crdb's NULLS-FIRST pkey representation. Real PostgreSQL reports 0 "
-        "(ASC, NULLS LAST), and so do we; matching crdb's 2 would corrupt "
-        "SQLAlchemy index reflection. The BINARY int2vector encoding the "
-        "stanza actually regression-tests (int2 array elements, elemoid 21 "
-        "— crdb #111907 shipped int8 once) is implemented and correct."
+        "Both servers stop at int2vector:10: the stanza expects no notice for "
+        "`DROP TABLE IF EXISTS t` on a missing table, and PostgreSQL 15.19 "
+        'and the Rust server both send NOTICE `table "t" does not exist, '
+        "skipping`. The indoption stanza at :26 (crdb's NULLS-FIRST {2} for a "
+        "plain primary key; PostgreSQL reports 0) is not reached."
     ),
     "row_description": (
-        "row_description:376 sends `SELECT 'foo'::STRING, 'bar'::STRING(2)` "
-        "with NO crdb_only marker and expects crdb's STRING aliases (text/25 "
-        "and varchar/1043 typmod 6, truncating 'bar' to 'ba'). Real PostgreSQL "
-        '14 rejects both casts outright — `ERROR: 42704 type "string" does '
-        "not exist` (probed) — so the stanza can't pass against any non-crdb "
-        "server, and matching crdb's varchar(2) truncation would diverge from "
-        "PG. Everything before :376 is green: base-column identity across a "
-        "JOIN and through a VIEW, char(n) blank padding on the wire, and "
-        "attnum stability across ALTER COLUMN TYPE."
+        "PostgreSQL 15.19 stops at row_description:380, `SELECT "
+        "'foo'::STRING, 'bar'::STRING(2)`: crdb's STRING alias, which "
+        'PostgreSQL rejects with 42704 `type "string" does not exist`. The '
+        "Rust server stops earlier, at :125: a view's columns report "
+        "attnum 0 instead of their base columns' 1 and 2 (RP-087)."
     ),
-    # NOTE: this key was written TWICE, by two sessions independently, and
-    # Python silently kept only the second -- so the first session's findings
-    # were invisible here until `ruff` was pointed at this directory on
-    # 2026-09-28 (F601). Both are preserved below rather than one being picked,
-    # because both were measured and neither is refuted by the other. They
-    # disagree on ONE detail: the offending line is cited as `procedure:66` by
-    # one and `procedure:68` by the other. Re-run the gauge before quoting
-    # either number.
     "procedure": (
-        "procedure:66/68 (and the extended-protocol CALL after it) compare the "
-        "NoticeResponse of a plpgsql `RAISE NOTICE` and pin crdb's internal "
-        "source-location fields — `File:builtins.go, Routine:func401` — with no "
-        "crdb_only marker, and the runner does NOT normalize them (it only "
-        "zeroes Line). Those fields name the server's own source file and "
-        "function, so no other implementation can match them: real PostgreSQL 14 "
-        "emits `Routine=exec_stmt_raise, File=pl_exec.c` (probed), and SecantusDB "
-        "leaves them empty rather than fabricate a C source location it does not "
-        "have. So the stanza cannot pass against any non-crdb server. "
-        "Everything it actually regression-tests is green: CREATE PROCEDURE "
-        "... LANGUAGE plpgsql with an `a INOUT int` argmode, CALL returning the "
-        "INOUT value as the result row, the plpgsql body (INSERT + RAISE "
-        "NOTICE), the three RAISE NOTICE messages (foo / bar / baz) arriving in "
-        "order with SQLSTATE 00000 followed by CommandComplete CALL, "
-        "COMMIT/ROLLBACK inside the procedure, and DROP PROCEDURE — over both "
-        "the simple and extended protocols."
+        "Both servers stop at procedure:66, the NoticeResponse of a plpgsql "
+        "`RAISE NOTICE`: the stanza pins crdb's source-location fields "
+        "(`File:builtins.go, Routine:func401`), which no other server can "
+        "match. PostgreSQL 15.19 sends `pl_exec.c` / `exec_stmt_raise`; the "
+        "Rust server leaves both empty rather than name a C source it does "
+        "not have. The messages themselves (foo / bar / baz, SQLSTATE 00000) "
+        "match."
     ),
     "typing": (
-        "typing's two non-crdb stanzas both use keepErrMessage and pin crdb's "
-        "wording for a mixed-type comparison: 22023 'unsupported comparison "
-        "operator: <varchar> = <uuid>' (and <varchar> = <bool>). Real "
-        "PostgreSQL 14 raises 42883 'operator does not exist: character "
-        "varying = uuid' (probed), which is what we now emit — matching crdb "
-        "would be a fidelity REGRESSION, same as the portals file. The "
-        "behaviour the stanzas actually regression-test (a DECLARED parameter "
-        "type making the comparison unresolvable AT PARSE, rather than a "
-        "predicate that silently matches nothing) is implemented and correct."
+        "Both servers stop at typing:74, a Parse of `SELECT id FROM t WHERE v "
+        "= $1` with `$1` declared uuid against a varchar column: the stanza "
+        "pins crdb's 22023 `unsupported comparison operator`. PostgreSQL "
+        "15.19 fails the Parse with 42883 `operator does not exist: "
+        "character varying = uuid`; the Rust server sends the same 42883, "
+        "but only at Execute, after ParseComplete and BindComplete (RP-080)."
     ),
     "char": (
-        "char:250 pins TableOID=105 — crdb's deterministic descriptor id, "
-        "with no ignore_table_oids directive on that stanza. Real PostgreSQL "
-        "reports its own pg_class oid there too (installation-specific), so "
-        "the stanza can't pass against any non-crdb server. Everything else "
-        'in the file is green (oid-18 "char": casts, columns, params, '
-        "1-char truncation, NULL for empty/zero-byte, binary format)."
+        "PostgreSQL 15.19 stops at char:250, which pins TableOID=105 (crdb's "
+        "descriptor id) with no ignore_table_oids directive. The Rust server "
+        'stops earlier, at :201: `SELECT 0::"char"` in binary comes back '
+        "NULL instead of the byte 00 (RP-085)."
     ),
     "spatial": (
-        "PostGIS GEOMETRY/GEOGRAPHY — an extension type outside SecantusDB's "
-        "core-PostgreSQL SQL scope (the surrogate models MongoDB, not PostGIS). "
-        "A GEOMETRY value can't round-trip its EWKB binary form; an untyped "
-        "binary GEOMETRY parameter now surfaces a faithful 22P03 rather than a "
-        "generic internal error, but the type itself is not implemented."
+        "PostGIS GEOMETRY/GEOGRAPHY, an extension type outside SecantusDB's "
+        "core-PostgreSQL scope. Both servers stop at spatial:8, a Parse of "
+        "`SELECT $1::GEOMETRY`. PostgreSQL 15.19 without PostGIS fails the "
+        'Parse with 42704 `type "geometry" does not exist`; the Rust server '
+        "accepts the Parse and fails the binary parameter with 22021 "
+        "(RP-090)."
     ),
     "box2d": (
-        "PostGIS BOX2D — an extension type outside SecantusDB's core-PostgreSQL "
-        "SQL scope. The ``::BOX2D`` cast falls through to a text passthrough, so "
-        "the binary result is the text form rather than PostGIS's four-float8 "
-        "box encoding. Out of scope, like GEOMETRY (see ``spatial``)."
+        "PostGIS BOX2D, an extension type outside SecantusDB's "
+        "core-PostgreSQL scope. Both servers stop at box2d:9 with 42704 "
+        '`type "box2d" does not exist`, as PostgreSQL does without PostGIS.'
     ),
     "pgvector": (
-        "The pgvector VECTOR type — an extension outside SecantusDB's "
-        "core-PostgreSQL SQL scope. A ``VECTOR`` column is rejected with a "
-        "faithful 0A000 (unsupported column type), which is correct emulation "
-        "of a server without the extension installed, but the corpus expects a "
-        "working vector type."
+        "The pgvector VECTOR type, an extension outside SecantusDB's "
+        "core-PostgreSQL scope. Both servers stop at pgvector:15 with 42704 "
+        '`type "vector" does not exist`, as PostgreSQL does without the '
+        "extension."
     ),
 }
