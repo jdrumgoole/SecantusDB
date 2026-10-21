@@ -49,7 +49,7 @@ PG15_DSN = os.environ.get(
 )
 
 
-def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     here = pathlib.Path(__file__).parent
     for item in items:
         marked = list(item.iter_markers("backlog")) or list(item.iter_markers("backlog_fixed"))
@@ -57,6 +57,24 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             raise pytest.UsageError(
                 f"{item.nodeid}: needs @pytest.mark.backlog(ID) or @pytest.mark.backlog_fixed(ID)"
             )
+    # `tools/backlog.py verify --file F --regressions` runs one server's
+    # tests: SECANTUS_BACKLOG_PREFIXES=RM keeps only items whose IDs carry
+    # that prefix, so the MongoDB run needs no PostgreSQL reference.
+    prefixes = tuple(p for p in os.environ.get("SECANTUS_BACKLOG_PREFIXES", "").split(",") if p)
+    if not prefixes:
+        return
+    keep, drop = [], []
+    for item in items:
+        ids = [
+            a
+            for name in ("backlog", "backlog_fixed")
+            for m in item.iter_markers(name)
+            for a in m.args
+        ]
+        (keep if not ids or any(i.startswith(prefixes) for i in ids) else drop).append(item)
+    if drop:
+        config.hook.pytest_deselected(items=drop)
+        items[:] = keep
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -150,7 +168,7 @@ def rust_mongo(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Any]:
 def mongod() -> Iterator[Any]:
     """A pymongo client to a throwaway mongod (the reference). Errors -- never
     skips -- when there is none: a gap test without its reference is BROKEN."""
-    from tests.test_mongod_differential import MONGOD, _start_mongod, _stop_mongod
+    from tests.mongod_reference import MONGOD, _start_mongod, _stop_mongod
 
     assert MONGOD, "no mongod on PATH: the reference server is required"
     proc, uri, dbpath = _start_mongod()

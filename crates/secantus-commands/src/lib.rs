@@ -617,7 +617,6 @@ fn lookup(name: &str) -> Option<Handler> {
         "killCursors" => cursors::kill_cursors,
         "create" => admin::create,
         "collMod" => admin::coll_mod,
-        "collmod" => admin::coll_mod,
         "convertToCapped" => capped_admin::convert_to_capped,
         "cloneCollectionAsCapped" => capped_admin::clone_collection_as_capped,
         "compact" => capped_admin::compact,
@@ -1116,7 +1115,6 @@ fn takes_default_write_concern(name: &str, doc: &Document) -> bool {
         | "dropDatabase"
         | "renameCollection"
         | "collMod"
-        | "collmod"
         | "convertToCapped"
         | "cloneCollectionAsCapped"
         | "setFeatureCompatibilityVersion"
@@ -1270,7 +1268,6 @@ fn is_write_concern_command(name: &str) -> bool {
             | "findandmodify"
             | "create"
             | "collMod"
-            | "collmod"
             | "convertToCapped"
             | "cloneCollectionAsCapped"
             | "createIndexes"
@@ -1473,7 +1470,6 @@ fn collection_name_problem(name: &str, doc: &Document, db: &str) -> Option<Comma
             | "drop"
             | "create"
             | "collMod"
-            | "collmod"
             | "dropIndexes"
             | "collStats"
             | "collstats"

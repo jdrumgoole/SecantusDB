@@ -1234,7 +1234,9 @@ fn window_bounds(slot: usize, n: usize, window: Option<&Document>) -> R<(i64, i6
 
 /// `$shift` — the `output` expression evaluated on the row `by` positions away in
 /// the sorted partition, or `default` (a constant, evaluated on the current row)
-/// / `null` when that position is out of the partition. Mirrors `_shift_value`.
+/// / `null` when that position is out of the partition, or when `output`
+/// evaluates to MISSING there: mongod 8.2.11 answers the default for a shifted
+/// row whose `$x` is absent, and keeps an explicit `null` (RM-226).
 fn shift_value(
     spec: &Document,
     pos: usize,
@@ -1250,11 +1252,14 @@ fn shift_value(
     let output = spec.get("output").ok_or(Fallback::Defer)?;
     let idx = pos as i64 + by;
     if idx >= 0 && (idx as usize) < slots.len() {
-        expressions::evaluate(&docs[slots[idx as usize]], output, vars)
-    } else if let Some(default) = spec.get("default") {
-        expressions::evaluate(&docs[slots[pos]], default, vars)
-    } else {
-        Ok(Bson::Null)
+        let v = expressions::evaluate_or_missing(&docs[slots[idx as usize]], output, vars)?;
+        if !matches!(v, Bson::Undefined) {
+            return Ok(v);
+        }
+    }
+    match spec.get("default") {
+        Some(default) => expressions::evaluate(&docs[slots[pos]], default, vars),
+        None => Ok(Bson::Null),
     }
 }
 

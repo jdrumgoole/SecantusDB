@@ -18,6 +18,7 @@ Usage::
     python tools/backlog.py ids              # give every open item an ID
     python tools/backlog.py list [--file F]  # ID, verify, headline
     python tools/backlog.py verify [--file F] [--id ID ...]
+    python tools/backlog.py verify --file F --regressions   # what CI runs
 
 ``verify`` runs every named gap test in one pytest run and reports each item:
 
@@ -192,14 +193,21 @@ def selected(files: list[str] | None, ids: list[str] | None) -> list[Item]:
     return out
 
 
-def verify(items: list[Item], regressions: bool = True) -> tuple[list[Verdict], list[dict]]:
-    """Run every gap test the items name, in one pytest run."""
+def verify(
+    items: list[Item], regressions: bool = True, prefixes: list[str] | None = None
+) -> tuple[list[Verdict], list[dict]]:
+    """Run every gap test the items name, in one pytest run.
+
+    ``prefixes`` (``["RM"]``) limits the regression tests to those IDs, so
+    one server's items and regressions run without the other's reference."""
     tests = sorted({t for it in items for t in it.tests})
     results: dict[str, dict] = {}
     if tests or regressions:
         with tempfile.TemporaryDirectory() as tmp:
             report = pathlib.Path(tmp) / "report.json"
             env = dict(os.environ, SECANTUS_BACKLOG_REPORT=str(report))
+            if prefixes:
+                env["SECANTUS_BACKLOG_PREFIXES"] = ",".join(prefixes)
             marks, paths = "backlog", list(tests)
             if regressions:
                 marks, paths = "backlog or backlog_fixed", [*tests, "tests/backlog"]
@@ -272,6 +280,11 @@ def main() -> int:
         p = sub.add_parser(name)
         p.add_argument("--file", action="append", choices=list(FILES))
         p.add_argument("--id", action="append")
+    sub.choices["verify"].add_argument(
+        "--regressions",
+        action="store_true",
+        help="with --file: also run that file's regression (backlog_fixed) tests",
+    )
     args = ap.parse_args()
     if args.cmd == "ids":
         print(f"assigned {assign_ids()} IDs")
@@ -283,7 +296,13 @@ def main() -> int:
             print(f"         {it.file}:{it.line}  {it.headline[:100]}")
         return 0
     # A run scoped to some items checks only those items' gap tests.
-    verdicts, regressed = verify(items, regressions=not (args.file or args.id))
+    # --regressions brings them back for a --file run, limited to its prefix
+    # (CI runs `verify --file backlog-rust-mongodb.md --regressions`).
+    scoped = bool(args.file or args.id)
+    prefixes = [FILES[f] for f in args.file] if args.file else None
+    verdicts, regressed = verify(
+        items, regressions=not scoped or args.regressions, prefixes=prefixes
+    )
     counts: dict[str, int] = {}
     for v in verdicts:
         counts[v.status] = counts.get(v.status, 0) + 1

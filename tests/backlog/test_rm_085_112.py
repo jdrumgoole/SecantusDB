@@ -37,7 +37,7 @@ _RS_BANNER = re.compile(r"secantusd-rs listening on (\S+):(\d+)")
 def mongod_rs() -> Iterator[Any]:
     """A pymongo client to a throwaway SINGLE-NODE replica set (the reference
     for transactions and change streams)."""
-    from tests.test_mongod_differential import MONGOD, _host_port, _start_mongod, _stop_mongod
+    from tests.mongod_reference import MONGOD, _host_port, _start_mongod, _stop_mongod
 
     assert MONGOD, "no mongod on PATH: the reference server is required"
     proc, uri, dbpath = _start_mongod(extra_args=("--replSet", "rm4set"))

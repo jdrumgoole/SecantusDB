@@ -527,6 +527,49 @@ These are explicit non-goals. Don't add them without a reason.
       Backlog-ID: RM-023
       Verify: tests/backlog/test_rm_001_028.py::test_slow_query_line_says_where_the_time_went
 
+### 7.087 Window functions and the operator tail against mongod -- 2026-10-21
+
+The first comparison of `$setWindowFields` / `$fill` and of a tail of
+operators no CI test had covered with mongod 8.2.11
+(`tests/mongod_live/`). It found five divergences; two were fixed in the
+same batch: `$shift` answering null for a MISSING output instead of its
+default (RM-227), and a lowercase `collmod` alias mongod does not have
+(it answers 59). Each left is a
+`Fallback::Defer` in `crates/secantus-core/src/windowfields.rs`: with no
+Python behind the Rust server, a deferral answers 2 "aggregation pipeline
+uses a stage or operator not supported by the Rust server". The file has
+about forty such points; these are the ones measured.
+
+- [ ] **`$expMovingAvg` refuses a null, missing or Decimal128 input.**
+      `ema_values` defers on any input `as_number` does not read, so a
+      partition with one such row answers code 2. mongod 8.2.11 averages
+      past them: a null or missing row answers null and leaves the average
+      where it was, and a Decimal128 input makes the average decimal.
+      Backlog-ID: RM-225
+      Verify: tests/backlog/test_rm_found_2026_10_21.py::test_exp_moving_avg_over_null_missing_and_decimal
+- [ ] **Window specs mongod refuses answer code 2, not mongod's code.**
+      `$linearFill` without a one-field `sortBy` (mongod: 605001), `$shift`
+      with a `window` (9, "$shift does not accept a 'window' field"), range
+      bounds with a two-field `sortBy` (5339902) and a range window over a
+      null sort value (5429414, "Invalid range: Expected the sortBy field to
+      be a number, but it was null"). Each is a deferral where a refusal by
+      name (`Fallback::mongo(code, msg)`) belongs.
+      Backlog-ID: RM-226
+      Verify: tests/backlog/test_rm_found_2026_10_21.py::test_window_spec_errors_carry_mongods_codes
+- [ ] **`$convert` to a target it cannot produce answers code 2, and
+      ignores `onError`.** `convert_target` defers on any `to` outside the
+      nine convertible types (`expressions.rs`). mongod 8.2.11 tells three
+      cases apart: an unknown name ("uuid", "foo", `{type: "uuid"}`) is 2
+      "Unknown type name: uuid", `onError` or not; a number that is no BSON
+      type is 9 "In $convert, numeric value for 'to' does not correspond to
+      a BSON type: 99"; a real BSON type `$convert` cannot produce ("array",
+      "timestamp", "null", "regex", 4) is 241 "Unsupported conversion from
+      string to array in $convert with no onError value" -- and with
+      `onError` mongod answers the `onError` value, where this server
+      errors. Found by `tests/mongod_live/test_operator_tail.py`, 2026-10-21.
+      Backlog-ID: RM-228
+      Verify: tests/backlog/test_rm_found_2026_10_21.py::test_convert_to_a_target_it_cannot_produce
+
 ### 7.086 The Rust MongoDB server, audited -- 2026-10-20
 
 An audit of the command, expression and wire layers, each finding reproduced

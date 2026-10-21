@@ -32,7 +32,7 @@ from tests.backlog.conftest import _RS_BANNER, RS_BINARY, drain_output, mongo_an
 def mongod_rs() -> Iterator[Any]:
     """A one-member replica set (mongod 8.2.11): the reference for
     transactions, change streams and `$$CLUSTER_TIME`."""
-    from tests.test_mongod_differential import MONGOD, _start_mongod, _stop_mongod
+    from tests.mongod_reference import MONGOD, _start_mongod, _stop_mongod
 
     assert MONGOD, "no mongod on PATH: the reference server is required"
     proc, uri, dbpath = _start_mongod(extra_args=("--replSet", "rs0"))
