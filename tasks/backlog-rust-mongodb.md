@@ -527,6 +527,44 @@ These are explicit non-goals. Don't add them without a reason.
       Backlog-ID: RM-023
       Verify: tests/backlog/test_rm_001_028.py::test_slow_query_line_says_where_the_time_went
 
+### 7.089 Query-operator code no test had executed, against mongod -- 2026-10-22
+
+The same coverage run found ~480 lines of `crates/secantus-core/src/query.rs`
+that no suite executed: the argument checks of `$type`, `$mod`, `$size` and
+the bit operators, regex options, `$where`, path components, `$elemMatch` /
+`$all` parsing, `$expr` field paths, and most of `$jsonSchema`. The cases in
+`tools/probes/query_shapes.py` were written against them and run against
+mongod 8.2.11. Of the 626 operator cases, 66 gave a wrong result, 37 a
+wrong code and 32 a wrong message; the batch that found them filed and
+fixed nine root causes, RM-259 to RM-267, each pinned by a regression test
+in `tests/backlog/test_rm_query_shapes.py` that asks mongod live. What
+remains is the five `$where` cases, refused by design as a `--noscripting`
+mongod refuses them (above). The 287 `$jsonSchema` cases are not yet
+worked: 24 wrong results, 126 wrong codes and 10 wrong messages, filed as
+the two items below.
+
+- [ ] **`$jsonSchema` matches different documents from mongod.** mongod
+  reads the names in `required` and `properties` as dotted paths
+  (`required: ["a.b"]` needs `a: {b: ...}`, not a field named `a.b`);
+  compares documents in `enum` and `uniqueItems` regardless of field order;
+  computes `multipleOf` in Decimal128 (`0.3` is a multiple of `0.1`); and
+  excludes NaN from `minimum` / `maximum` while `minimum: NaN` matches only
+  NaN. The Rust server reads names as single fields, compares documents in
+  order, divides doubles and lets NaN through. 24 of the probe's 287 schema
+  cases.
+  Backlog-ID: RM-268
+  Verify: tests/backlog/test_rm_json_schema.py::test_json_schema_answers
+- [ ] **A malformed `$jsonSchema` is not refused.** mongod parses the whole
+  schema before matching and refuses an unknown keyword (9 "Unknown
+  $jsonSchema keyword: bogus"), an unsupported one (`$ref`, `default`,
+  `format`, ...), a keyword argument of the wrong type (14) or range (9),
+  `type` beside `bsonType`, and an unknown type alias (2). The Rust server
+  validates few of these: most match documents, a few answer "not
+  supported". 136 of the 287 cases.
+  Backlog-ID: RM-269
+  Verify: tests/backlog/test_rm_json_schema.py::test_json_schema_validation
+
+
 ### 7.088 Expression code no test had executed, against mongod -- 2026-10-21
 
 A line-coverage run (`docs-rust/coverage.md`, `./inv rust-mdb-coverage`)

@@ -425,6 +425,16 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             )
             .into_reply());
         }
+        // A `$text` anywhere in a later `$match`, under `$and` / `$or`
+        // included (measured 8.2.11, 2026-10-22).
+        if i > 0 && matches!(d.get("$match"), Some(Bson::Document(m)) if filter_has_text(m)) {
+            return Ok(CommandError::new(
+                17313,
+                "Location17313",
+                "$match with $text is only allowed as the first pipeline stage",
+            )
+            .into_reply());
+        }
         if i > 0 && d.contains_key("$changeStream") {
             return Ok(CommandError::new(
                 40602,
@@ -5173,6 +5183,18 @@ fn pipeline_fold_error(pipeline: &Bson) -> Option<(i32, String)> {
             _ => None,
         };
         in_filter.or_else(|| stage_fold_error(s))
+    })
+}
+
+/// Whether a filter holds `$text`, at the top or inside `$and` / `$or` /
+/// `$nor`.
+fn filter_has_text(filter: &Document) -> bool {
+    filter.iter().any(|(k, v)| match (k.as_str(), v) {
+        ("$text", _) => true,
+        ("$and" | "$or" | "$nor", Bson::Array(a)) => a
+            .iter()
+            .any(|e| matches!(e, Bson::Document(d) if filter_has_text(d))),
+        _ => false,
     })
 }
 
