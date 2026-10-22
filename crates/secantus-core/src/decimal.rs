@@ -2108,15 +2108,11 @@ pub fn atan(a: &Dec) -> Option<Dec> {
             let h = with_precision(|p| Some(hp_half_pi(p)))?;
             Some(if *s < 0 { neg(&h) } else { h })
         }
-        Dec::Fin { sign, .. } => {
+        Dec::Fin { .. } => {
             if a.is_zero() {
-                return Some(Dec::Fin {
-                    sign: *sign,
-                    coeff: vec![0],
-                    exp: 0,
-                });
+                return Some(zero_shifted(a, 0));
             }
-            with_precision(|p| hp_atan(a, p))
+            with_precision(|p| hp_atan(a, p)).map(pad_34)
         }
     }
 }
@@ -2128,11 +2124,7 @@ pub fn asin(a: &Dec) -> Option<Dec> {
         Dec::Inf(_) => None,
         Dec::Fin { sign, .. } => {
             if a.is_zero() {
-                return Some(Dec::Fin {
-                    sign: *sign,
-                    coeff: vec![0],
-                    exp: -40,
-                });
+                return Some(zero_shifted(a, -40));
             }
             let one = hp_from_i64(1, 0);
             match cmp_abs(a, &one)? {
@@ -2145,7 +2137,8 @@ pub fn asin(a: &Dec) -> Option<Dec> {
                 std::cmp::Ordering::Less => with_precision(|p| {
                     let r = hp_sqrt(&hp_sub(&one, &hp_mul(a, a, p), p), p);
                     hp_atan(&hp_div(a, &r, p), p)
-                }),
+                })
+                .map(pad_34),
             }
         }
     }
@@ -2182,20 +2175,116 @@ pub fn acos(a: &Dec) -> Option<Dec> {
                 };
                 Some(hp_sub(&hp_half_pi(p), &s, p))
             })
+            // `acos(1)` is a zero at the minimum quantum, `0E-6176`
+            // (measured 8.2.11, 2026-10-22).
+            .map(|r| {
+                if r.is_zero() {
+                    Dec::Fin {
+                        sign: 1,
+                        coeff: vec![0],
+                        exp: MIN_EXP,
+                    }
+                } else {
+                    r
+                }
+            })
         }
     }
 }
 
-/// 2*pi to ~1200 significant digits, for reducing a circular argument.
-///
-/// Reduction needs pi to roughly (the argument's decimal exponent + the working
-/// precision) digits, because `x - k*2pi` cancels away everything above the
-/// remainder. 1200 covers `|x|` up to about 1e1100 at the widest precision
-/// [`with_precision`] uses; past that `hp_reduce_2pi` gives up rather than
-/// return a value it cannot justify, and the operator defers. mongod answers
-/// those (it carries pi to the full decimal128 range) so this is a known,
-/// bounded gap rather than a wrong answer.
+/// 2*pi to ~1200 significant digits, for reducing a circular argument whose
+/// decimal exponent is at most [`PAYNE_HANEK_FROM`]: `x - k*2pi` cancels away
+/// everything above the remainder, so the reduction needs pi to roughly (the
+/// argument's exponent + the working precision) digits.
 const TWO_PI_TEXT: &str = "6.283185307179586476925286766559005768394338798750211641949889184615632812572417997256069650684234135964296173026564613294187689219101164463450718816256962234900568205403877042211119289245897909860763928857621951331866892256951296467573566330542403818291297133846920697220908653296426787214520498282547449174013212631176349763041841925658508183430728735785180720022661061097640933042768293903883023218866114540731519183906184372234763865223586210237096148924759925499134703771505449782455876366023898259667346724881313286172042789892790449474381404359721887405541078434352586353504769349636935338810264001136254290527121655571542685515579218347274357442936881802449906860293099170742101584559378517847084039912224258043921728068836319627259549542619921037414422699999996745956099902119463465632192637190048918910693816605285044616506689370070523862376342020006275677505773175066416762841234355338294607196506980857510937462319125727764707575187503915563715561064342453613226003855753222391818432840397876190514402130971726557731872306763655936460603904070603705937991547245198827782499443550566958263031149714484908301391901659066233723455711778150196763509274929878638510120801855403342278019697648025716723207";
+
+/// Above this adjusted exponent the argument is reduced by Payne-Hanek
+/// instead ([`hp_reduce_payne_hanek`]): dividing 6,000-digit numbers took
+/// seven seconds for `$sin` of `1E+6000` in a debug build.
+const PAYNE_HANEK_FROM: i32 = 300;
+
+/// The digits of `1 / (2*pi)` after the point, 6,650 of them: enough for any
+/// decimal128 exponent (at most 6111 for an integral coefficient) plus the
+/// widest working precision. mongod reduces the whole format -- `$sin` of
+/// `1E+6000` is a value, which agrees with the true one to the authorised last
+/// digit -- where this server used to stop near `1E+1100` with 50989 (RM-245;
+/// digits from mpmath, 2026-10-22, checked against 2*pi to 6,540 digits).
+const INV_TWO_PI_DIGITS: &str = concat!(
+    "159154943091895335768883763372514362034459645740456448747667344058896797634226535090113802",
+    "766253085956072842726757958036892911846114578652877967410731699839229239966937409077573077",
+    "746396925307688717392896217397661693362390241723629011832380114222699755715940461890086902",
+    "673956120489410936937844085528723099946443400248672347739459610898323096783074906166986462",
+    "804699448652187881574786566964241038995874139348609983868099199962442875585171178858431117",
+    "518767160546547536988009739460364759333768059302494496635305327156775503220324777816397166",
+    "022946748119598165840606016803035998133911987498832786654435279755070016240677564388849571",
+    "310880122199376147681377764737890633068046457978481761312427314069960775024500297759857089",
+    "056902796785131525210016317746020924811606240561456203146484089248459191435211575407556200",
+    "871526606802217159140757474582722597746285399875155329390813981772409358254797073328719040",
+    "699975907657707849347039358982808717342564036689511662545705943327631268650026122717971153",
+    "211259950438667945037625560836317116952597581282249416233343145106123536878563113636692167",
+    "142069746960129250578336053119608594509839556718709954746510431623815517580839442979970999",
+    "505254387566129445883306846050785291515141040489298850638816077619699307341038999578691890",
+    "598093737772061875432227189301366255261238780387538881106814067654340828278526933426799556",
+    "070790386060352738996245125995749276297023594095584301164829641185577712405754449457021789",
+    "769792409490327294770216649603565318153544003840689874717691588763190966506964404776970687",
+    "683656778104779795450353395758301881838687937766124814953059965580219083598751035127129043",
+    "231580498719686877759465663462210342044408554978503792738694293536619377829287359378434703",
+    "230237145837923557118636341929460183182291964165008783079331353497790997458649290267450609",
+    "893689094588305033703053805473123215809431976760322831314189809749822438335174356989847501",
+    "039500683880039786723599608024002739010874954854787923568261139948903268997427083496114920",
+    "828903776784743035504568456083671479308456723327035485392556202086839324099562211753318394",
+    "020970793570774965498808686066360968661967037474542102831219251846224834991161149566556037",
+    "969676139931282996077608277990100783036002338272987908540238761557445430926011910054337998",
+    "389046549212482951607072853005227210236017523313173179759311050328155109373913639645305792",
+    "607180083617954876724645980473977292448109200937125786918332895886283990435868666639756734",
+    "451409503637327191743113880663830725923027597345060548212778037065337783032170987734966568",
+    "490800326988506741791464683508281616853314336160730995149853119819733758444209841655954152",
+    "250643394312864440383883561508797716450170647067518774560591608716857857939226234756331711",
+    "132998655941596890719850688744230057519197705690038218392562203387423536256808354156517297",
+    "108811721795936832564885187499748708553116598306101392144544601614884527702511411070248521",
+    "739745103866736403872860099674893173561812071174047889936888655692307848502305705714406363",
+    "863202368520107410057485922811157219680039782475953001669585221230346418773650435467646456",
+    "565971901123084767099309708591283646669191776938791433315566506698132164152100895711728623",
+    "842607067845176011134508006994768422356989624880515775980953397080854750597536265649034394",
+    "454205817886435683042000315095594743439252544850674914290864751442303321332456951163494567",
+    "753939424036090543833552829243422034948436615146632286024776666604953140657343575530140908",
+    "279880914786693434922737602634997829957018161964321233140475762897484082891174097478263789",
+    "918169993948749771519898187266629460183053958327520923635068538892284682472599725283007668",
+    "569375836597229198244297474061638183113958306744348516928597383237392662402434501997809940",
+    "402189613483427361367644991382715416606342482936374185061226108613211998633462847099418399",
+    "427429559156283339904803821175011612116672051912579303552929241134403116134112495318385926",
+    "958490443846807849097398280885529704515305399140098869884088365483665222466862408725401404",
+    "009117874212204523075334739725381494038841905868423115946322744339066125162393106283195323",
+    "883392131534556381511752035108745955820112375435976815534018740739434036339780388172100453",
+    "169182951948795917673954177879243527617407246059391602732282879468193649128949714953432552",
+    "723591659298072479985806126900733218844526794335045580195249256630620487661613436533992028",
+    "754520855534414409905129827274546591181322232840511666156507098375574337295486312041121716",
+    "380915606161165732000083306114606181280326258695951602463216613857661480471993270777131644",
+    "120159496011063283052075958348503050790955849829821867402898385513832395702080763975504292",
+    "259847647071016426974384504309165864528360324933604354657237557916136632412045780996971566",
+    "340221588054579431328278005524613208890187421210924489104100521549680971137207540057109634",
+    "066431357454399159769435788920793425617783022237011486424925239248728713132021766736075664",
+    "559827260957415660234378743629132109748589715071307391040726435414179705722265479803815127",
+    "595791240025344680482202617342299001020483062463033796474678190501811830375153802879523433",
+    "419550213568977091290561431787879208620574499925789756901849210324206471385191138814756402",
+    "097605548957937851414041453051515839642823265406020603311891586570272086250269916393751527",
+    "887360608114556948421032240777272742165136423436699271634030940530748065268509301658921369",
+    "214143129371341061571537140620397847618426502978078606266969960809184223476335047746719017",
+    "450451446166382846208240867359510237130290444377940853503445442633413062630745951383031022",
+    "931469344668328517663282415152101794226443957181217170217564921964449396532222187658488244",
+    "511909401340504432139858628621083179393960844389801914787389772331028631013148695521262051",
+    "827806349457118662778256598831005351552316659843940902218063144545212129789734471488741258",
+    "268223860236027109981191520568823472398358013366068378632886792861973236725360668521685632",
+    "011948978073395841919066595838678529412418718217279875061039460648195857456200608921228416",
+    "394373846549589932028481236433466119707324309545859073361878629063185016510626757685121635",
+    "758869630745199922001077667683094698149756226824347936713108412102195208994819124440487511",
+    "710591844139907889455775184621619041530934543802808938628073237578615267797114332324196985",
+    "780563763018088438664060717536832136262967122426094285401109632182627651201170225529292896",
+    "555946082049384090690760692003954646191640021567336017909631872891998634341086903200579663",
+    "710312861235698881764036425254083709810814835190312131862472281810508451236901906466322359",
+    "388724546307372728087898300410189485913673742589418124056729191238003306344998219631580386",
+    "38105424578934500845532803135118843410073730605956544373624887712926289807423539",
+);
 
 /// `x` reduced into `[-pi, pi]`, or `None` when the embedded 2*pi is too short
 /// to do it without losing the remainder.
@@ -2206,6 +2295,9 @@ fn hp_reduce_2pi(x: &Dec, prec: usize) -> Option<Dec> {
         return Some(x.clone());
     }
     // Digits consumed by the quotient, plus the precision we must keep.
+    if adj > PAYNE_HANEK_FROM {
+        return hp_reduce_payne_hanek(x, prec);
+    }
     if adj as usize + prec + 20 > 1180 {
         return None;
     }
@@ -2226,6 +2318,42 @@ fn hp_reduce_2pi(x: &Dec, prec: usize) -> Option<Dec> {
         r = signed;
     }
     Some(r)
+}
+
+/// Payne-Hanek reduction of a LARGE `x = C * 10^e` (`e > 0`) into `[-pi, pi]`.
+///
+/// `x / 2pi = C * (10^e / 2pi)`, and the integer part of `10^e / 2pi` only
+/// adds whole turns, so the remainder needs just the digits of `1 / 2pi`
+/// from position `e` on: the fractional part of `C * 0.d[e+1] d[e+2] ...`,
+/// times 2pi. A window of `prec + 80` digits keeps the truncation error far
+/// below the working precision.
+fn hp_reduce_payne_hanek(x: &Dec, prec: usize) -> Option<Dec> {
+    let Dec::Fin { sign, coeff, exp } = x else {
+        return None;
+    };
+    let shift = usize::try_from(*exp).ok()?;
+    let width = prec + 80;
+    let digits = INV_TWO_PI_DIGITS.as_bytes().get(shift..shift + width)?;
+    let window = Dec::Fin {
+        sign: 1,
+        coeff: digits.iter().map(|b| b - b'0').collect(),
+        exp: -(width as i32),
+    };
+    let c = Dec::Fin {
+        sign: 1,
+        coeff: coeff.clone(),
+        exp: 0,
+    };
+    let wide = width + coeff.len() + 4;
+    let product = hp_mul(&c, &window, wide);
+    let turns = hp_sub(&product, &hp_trunc_toward_zero(&product, wide), wide);
+    let two_pi = parse(TWO_PI_TEXT)?;
+    let mut r = hp_mul(&turns, &two_pi, prec + 20);
+    let pi = hp_div(&two_pi, &hp_from_i64(2, 0), prec + 20);
+    if cmp_abs(&r, &pi)? == std::cmp::Ordering::Greater {
+        r = hp_sub(&r, &two_pi, prec + 20);
+    }
+    Some(if *sign < 0 { hp_neg(&r) } else { r })
 }
 
 /// Truncate toward zero to an integral `Dec`, at `prec` digits.
@@ -2306,24 +2434,60 @@ fn hp_cos_series(t: &Dec, prec: usize) -> Dec {
     acc
 }
 
+/// A zero result with the zero argument's sign and exponent moved by `shift`,
+/// within the format: mongod's `$tan`, `$asin` and `$sinh` of a zero are the
+/// argument's exponent less 40 (`0E+5` is `0E-35`, `-0.00` is `-0E-42`),
+/// and `$sin`, `$atan` and `$tanh` return it as it came (`shift` 0).
+/// Measured 8.2.11, 2026-10-22 (RM-245).
+fn zero_shifted(zero: &Dec, shift: i32) -> Dec {
+    match zero {
+        Dec::Fin { sign, exp, .. } => Dec::Fin {
+            sign: *sign,
+            coeff: vec![0],
+            exp: (exp + shift).clamp(MIN_EXP, MAX_EXP),
+        },
+        other => other.clone(),
+    }
+}
+
+/// A result of exactly +/-1 as a bare `1`: mongod's `$cos`, `$cosh` and
+/// `$tanh` answer `1`, not `1.000000000000000000000000000000000`, once the
+/// computed value rounds to one (`$tanh` of 40, `$cos` of `1E-18`).
+fn bare_if_one(d: Dec) -> Dec {
+    if let Dec::Fin { sign, coeff, exp } = &d {
+        let mag = strip_leading(coeff);
+        let zeros = mag.iter().rev().take_while(|x| **x == 0).count();
+        if mag.len() == zeros + 1 && mag[0] == 1 && exp + zeros as i32 == 0 {
+            return Dec::Fin {
+                sign: *sign,
+                coeff: vec![1],
+                exp: 0,
+            };
+        }
+    }
+    d
+}
+
+/// `|a|` compared with the decimal `bound`.
+fn abs_cmp_text(a: &Dec, bound: &str) -> Option<std::cmp::Ordering> {
+    cmp_abs(a, &parse(bound)?)
+}
+
 /// `sin(x)` at decimal128 precision. `None` for an infinity (mongod's 50989)
 /// or an argument too large for the embedded 2*pi.
 pub fn sin(a: &Dec) -> Option<Dec> {
     match a {
         Dec::Nan => Some(Dec::Nan),
         Dec::Inf(_) => None,
-        Dec::Fin { sign, .. } => {
+        Dec::Fin { .. } => {
             if a.is_zero() {
-                return Some(Dec::Fin {
-                    sign: *sign,
-                    coeff: vec![0],
-                    exp: 0,
-                });
+                return Some(zero_shifted(a, 0));
             }
             with_precision(|p| {
                 let t = hp_reduce_2pi(a, p)?;
                 Some(hp_sin_series(&t, p))
             })
+            .map(pad_34)
         }
     }
 }
@@ -2334,13 +2498,18 @@ pub fn cos(a: &Dec) -> Option<Dec> {
         Dec::Nan => Some(Dec::Nan),
         Dec::Inf(_) => None,
         Dec::Fin { .. } => {
-            if a.is_zero() {
+            // An argument whose EXPONENT is -53 or less answers the padded
+            // constant, whatever its digits (`999999E-53` included); one with
+            // a larger exponent is computed, and a value that rounds to one is
+            // a bare `1` (measured 8.2.11, 2026-10-22).
+            if a.is_zero() || matches!(a, Dec::Fin { exp, .. } if *exp <= -53) {
                 return parse("1.000000000000000000000000000000000");
             }
             with_precision(|p| {
                 let t = hp_reduce_2pi(a, p)?;
                 Some(hp_cos_series(&t, p))
             })
+            .map(bare_if_one)
         }
     }
 }
@@ -2350,13 +2519,9 @@ pub fn tan(a: &Dec) -> Option<Dec> {
     match a {
         Dec::Nan => Some(Dec::Nan),
         Dec::Inf(_) => None,
-        Dec::Fin { sign, .. } => {
+        Dec::Fin { .. } => {
             if a.is_zero() {
-                return Some(Dec::Fin {
-                    sign: *sign,
-                    coeff: vec![0],
-                    exp: -40,
-                });
+                return Some(zero_shifted(a, -40));
             }
             with_precision(|p| {
                 let t = hp_reduce_2pi(a, p)?;
@@ -2366,6 +2531,7 @@ pub fn tan(a: &Dec) -> Option<Dec> {
                 }
                 Some(hp_div(&hp_sin_series(&t, p), &c, p))
             })
+            .map(pad_34)
         }
     }
 }
@@ -2413,15 +2579,20 @@ pub fn sinh(a: &Dec) -> Option<Dec> {
         Dec::Inf(s) => Some(Dec::Inf(*s)),
         Dec::Fin { sign, .. } => {
             if a.is_zero() {
-                // The zero constants are mongod's own quanta, not something the
-                // series produces — the same table the Python engine carries.
-                return Some(Dec::Fin {
-                    sign: *sign,
-                    coeff: vec![0],
-                    exp: -40,
-                });
+                return Some(zero_shifted(a, -40));
             }
-            with_precision(|p| hp_sinh(a, p))
+            // e^x overflows the format from about 14150; past 1E+5 the
+            // exponential is not even attempted.
+            if hp_adjusted(a)? >= 5 {
+                return Some(Dec::Inf(*sign));
+            }
+            // sinh(x) = x + x^3/6: twenty orders below one, the cube is past
+            // all 34 digits, and the fixed working precision would lose x
+            // altogether (`1E-80` came back 0). mongod answers x, padded.
+            if hp_adjusted(a)? <= -20 {
+                return Some(pad_34(a.clone()));
+            }
+            with_precision(|p| hp_sinh(a, p)).map(pad_34)
         }
     }
 }
@@ -2432,10 +2603,16 @@ pub fn cosh(a: &Dec) -> Option<Dec> {
         Dec::Nan => Some(Dec::Nan),
         Dec::Inf(_) => Some(Dec::Inf(1)),
         Dec::Fin { .. } => {
-            if a.is_zero() {
+            // Up to `1E-40` mongod answers the padded constant; above it a
+            // value that rounds to one is a bare `1` (bisected against
+            // 8.2.11, 2026-10-22).
+            if a.is_zero() || abs_cmp_text(a, "1E-40")? != std::cmp::Ordering::Greater {
                 return parse("1.000000000000000000000000000000000");
             }
-            with_precision(|p| hp_cosh(a, p))
+            if hp_adjusted(a)? >= 5 {
+                return Some(Dec::Inf(1));
+            }
+            with_precision(|p| hp_cosh(a, p)).map(bare_if_one)
         }
     }
 }
@@ -2447,13 +2624,18 @@ pub fn tanh(a: &Dec) -> Option<Dec> {
         Dec::Inf(s) => Some(hp_from_i64(*s as i64, 0)),
         Dec::Fin { sign, .. } => {
             if a.is_zero() {
-                return Some(Dec::Fin {
-                    sign: *sign,
-                    coeff: vec![0],
-                    exp: 0,
-                });
+                return Some(zero_shifted(a, 0));
             }
-            with_precision(|p| hp_tanh(a, p))
+            // tanh rounds to +/-1 from about 40; past 100 the exponentials
+            // are not even attempted.
+            if hp_adjusted(a)? >= 2 {
+                return Some(hp_from_i64(*sign as i64, 0));
+            }
+            // tanh(x) = x - x^3/3: as for `sinh`, x itself, padded.
+            if hp_adjusted(a)? <= -20 {
+                return Some(pad_34(a.clone()));
+            }
+            with_precision(|p| hp_tanh(a, p)).map(|r| bare_if_one(pad_34(r)))
         }
     }
 }
@@ -2500,6 +2682,12 @@ pub fn atanh(a: &Dec) -> Option<Dec> {
                 std::cmp::Ordering::Greater => return None,
                 std::cmp::Ordering::Equal => return Some(Dec::Inf(*sign)),
                 std::cmp::Ordering::Less => {}
+            }
+            // An argument whose EXPONENT is below -50 is answered as it came,
+            // unpadded -- `1.5E-50` (15E-51) and `1.000E-50` as written, where
+            // `1E-50` and `2E-50` are computed (measured 8.2.11, 2026-10-22).
+            if matches!(a, Dec::Fin { exp, .. } if *exp < -50) {
+                return Some(a.clone());
             }
             with_precision(|p| {
                 let num = hp_add(&one, a, p);
@@ -3257,5 +3445,67 @@ mod granularity_tests {
         assert_eq!(up("0.2"), "0.250000000000000");
         assert_eq!(up("0.02"), "0.0250000000000000");
         assert_eq!(down("2E-7"), "1.60000000000000E-7");
+    }
+}
+
+#[cfg(test)]
+mod trig_edge_tests {
+    use super::*;
+
+    fn run(f: fn(&Dec) -> Option<Dec>, v: &str) -> String {
+        to_string(&f(&parse(v).unwrap()).unwrap())
+    }
+
+    /// mongod 8.2.11, 2026-10-22 (RM-245).
+    #[test]
+    fn zeros_carry_mongods_quanta() {
+        assert_eq!(run(sin, "0E+5"), "0E+5");
+        assert_eq!(run(atan, "-0.00"), "-0.00");
+        assert_eq!(run(tanh, "0E+6111"), "0E+6111");
+        assert_eq!(run(tan, "0E+5"), "0E-35");
+        assert_eq!(run(asin, "-0.00"), "-0E-42");
+        assert_eq!(run(sinh, "0E+6111"), "0E+6071");
+        assert_eq!(run(sinh, "0E-6176"), "0E-6176");
+        assert_eq!(run(acos, "1"), "0E-6176");
+    }
+
+    #[test]
+    fn tiny_results_are_padded_or_passed_through() {
+        assert_eq!(run(sin, "1E-50"), "1.000000000000000000000000000000000E-50");
+        assert_eq!(
+            run(sinh, "1E-80"),
+            "1.000000000000000000000000000000000E-80"
+        );
+        assert_eq!(run(tanh, "1E-6176"), "1E-6176");
+        assert_eq!(
+            run(atanh, "1E-50"),
+            "1.000000000000000000000000000000000E-50"
+        );
+        assert_eq!(run(atanh, "1.5E-50"), "1.5E-50");
+        assert_eq!(run(cos, "1E-52"), "1");
+        assert_eq!(
+            run(cos, "999999E-53"),
+            "1.000000000000000000000000000000000"
+        );
+        assert_eq!(run(cosh, "1E-40"), "1.000000000000000000000000000000000");
+        assert_eq!(run(cosh, "1.5E-40"), "1");
+        assert_eq!(run(tanh, "40"), "1");
+    }
+
+    #[test]
+    fn overflow_and_saturation() {
+        assert_eq!(run(sinh, "-1E+34"), "-Infinity");
+        assert_eq!(run(cosh, "1E+100"), "Infinity");
+        assert_eq!(run(tanh, "-1E+34"), "-1");
+    }
+
+    /// Correctly rounded, from mpmath at 6,400 digits (2026-10-22): the
+    /// Payne-Hanek path above `1E+300` and the division path below it.
+    #[test]
+    fn huge_arguments_reduce_correctly() {
+        assert_eq!(run(sin, "1E+6000"), "-0.7249266534376325863453460198136025");
+        assert_eq!(run(cos, "1E+1100"), "0.5014792131868715285357509814209175");
+        assert_eq!(run(sin, "1E+1100"), "-0.8651696936101473595356098207779896");
+        assert_eq!(run(tan, "1E+6000"), "1.052408860229401513505574301283600");
     }
 }

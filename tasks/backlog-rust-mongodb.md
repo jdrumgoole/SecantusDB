@@ -556,14 +556,9 @@ fixed RM-255 to RM-257 (in the harness, 63 wrong codes became 13); RM-258
 was filed open.
 RM-251 closed after it: constant sub-expressions are folded bottom-up in
 every stage, as mongod folds them.
+RM-245 closed after that: the Decimal128 transcendentals now differ from
+mongod only in the authorised last digit.
 
-- [ ] **Decimal128 transcendentals beyond the authorised last digit.** Tiny
-  operands underflow to 0 in `$sinh` / `$tanh` / `$atanh` (between 1E-75
-  and 1E-80); results lose mongod's 34-digit form and a zero's exponent;
-  `$sin` of 1E+1200 is 50989 instead of a value; `$sinh` / `$tanh` of
-  1E+34 are 2 "not supported" instead of Infinity / 1.
-  Backlog-ID: RM-245
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_decimal_hyperbolic_and_trig_edges
 - [ ] **`$dateFromString` of a five-digit year is ten seconds out.**
   `"10000-01-01"` is read by timelib as the no-colon time `1000` and the
   date `0-01-01`; mongod answers 2000-01-01T09:59:50Z and the Rust port of
