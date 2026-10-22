@@ -1592,8 +1592,8 @@ pub fn py_order(a: &Bson, b: &Bson) -> Result<Option<Ordering>, Fallback> {
             Some((x.time, x.increment).cmp(&(y.time, y.increment)))
         }
         (Bson::ObjectId(x), Bson::ObjectId(y)) => Some(x.bytes().cmp(&y.bytes())),
-        // Python `Binary < Binary` compares bytes content (subtype ignored).
-        (Bson::Binary(x), Bson::Binary(y)) => Some(x.bytes.cmp(&y.bytes)),
+        // Length, then subtype, then bytes, as mongod orders BinData (RM-232).
+        (Bson::Binary(x), Bson::Binary(y)) => Some(crate::order::bindata_cmp(x, y)),
         // null-vs-null, regex, and different types are not orderable in Python.
         _ => None,
     })
@@ -9400,6 +9400,9 @@ pub fn py_eq(a: &Bson, b: &Bson) -> Result<bool, Fallback> {
     }
     Ok(match (a, b) {
         (Bson::Null, Bson::Null) => true,
+        // Each is a type with one value (RM-234): with no arm here they fell to
+        // `false`, so `{$eq: [MinKey, MinKey]}` was false and `$ne` true.
+        (Bson::MinKey, Bson::MinKey) | (Bson::MaxKey, Bson::MaxKey) => true,
         // Equal by the active collation when an aggregation or update runs
         // with one. The change-stream diff turns it off first (`diff.rs`):
         // whether a write CHANGED a value is never a collation question.
@@ -9425,14 +9428,16 @@ pub fn py_eq(a: &Bson, b: &Bson) -> Result<bool, Fallback> {
                 true
             }
         }
+        // Field by field IN ORDER, as mongod compares documents (RM-235):
+        // `{b: 1, a: 1}` is not `{a: 1, b: 1}`. Looking each name up in the
+        // other document made them equal.
         (Bson::Document(x), Bson::Document(y)) => {
             if x.len() != y.len() {
                 false
             } else {
-                for (k, xv) in x {
-                    match y.get(k) {
-                        Some(yv) if py_eq(xv, yv)? => {}
-                        _ => return Ok(false),
+                for ((xk, xv), (yk, yv)) in x.iter().zip(y) {
+                    if xk != yk || !py_eq(xv, yv)? {
+                        return Ok(false);
                     }
                 }
                 true

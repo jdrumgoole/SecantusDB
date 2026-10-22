@@ -40,6 +40,7 @@ use secantus_core::collation::Collation;
 use secantus_core::deadline;
 use secantus_core::diff::compute_update_description_for;
 use secantus_core::order;
+use secantus_core::order::{with_bindata_order, BinDataOrder};
 use secantus_core::query::matches as query_matches;
 use secantus_core::sortkey::{self, COMPOUND_SEP, RANK_MINKEY};
 use secantus_core::{get_path, get_path_values};
@@ -1263,7 +1264,7 @@ fn reject_legacy_index_entry_format(session: &Session) -> Result<()> {
                 .ok()
                 .and_then(|o| o.get_i32("entryFormat").ok())
                 .unwrap_or(1);
-            if fmt < ENTRY_FORMAT {
+            if fmt < OLDEST_REBUILDABLE_ENTRY_FORMAT {
                 return Err(StorageError::Internal(format!(
                     "SecantusDB storage at this path has index entries written by a \
                      build before the RecordId index-entry change: index '{name}' on \
@@ -1893,6 +1894,20 @@ struct IndexDesc {
     id_claim: bool,
     /// With `id_claim`: the collection is clustered.
     clustered: bool,
+    /// The BinData order this index's keys are written in (see
+    /// [`BINDATA_ORDER_OPT`]); an `_id` claim's is always
+    /// [`BinDataOrder::Format4`].
+    key_order: BinDataOrder,
+}
+
+impl IndexDesc {
+    /// The index keys `doc` gives this index, encoded in the index's own
+    /// BinData order whichever server is writing.
+    fn key_variants(&self, doc: &Document, sparse: bool) -> Result<Vec<Vec<u8>>> {
+        with_bindata_order(self.key_order, || {
+            index_key_variants_c(doc, &self.key_spec, sparse, self.collation.as_ref())
+        })
+    }
 }
 
 /// A `2d` geohash index's parameters (field + bucketing range / precision).
@@ -2921,6 +2936,12 @@ fn index_entries_outdated(key: &Document, opts: &Document) -> bool {
     if opts.get_i32(NUMBER_KEYS).ok() != Some(sortkey::NUMBER_KEY_FORMAT) {
         return true;
     }
+    // Format 4 has format 5's entry layout and keys only BinData,
+    // JavaScript-with-scope and MaxKey differently, so it is re-keyed rather
+    // than refused (`OLDEST_REBUILDABLE_ENTRY_FORMAT`).
+    if opts.get_i32("entryFormat").ok() < Some(ENTRY_FORMAT) {
+        return true;
+    }
     if parse_geo_2d(key, opts).is_some() {
         return opts.get_i32(GEO_KEYS).ok() != Some(GEO_KEY_FORMAT);
     }
@@ -2933,6 +2954,30 @@ fn index_entries_outdated(key: &Document, opts: &Document) -> bool {
         .and_then(secantus_core::collation::parse)
         .is_some();
     collated && opts.get_i32(COLLATION_KEYS).ok() != Some(secantus_core::collation::KEY_FORMAT)
+}
+
+/// The catalog option recording an index whose keys put BinData in
+/// PostgreSQL's byte order (`"bytes"`): one the PG server built. Absent means
+/// mongod's order. Both servers share a store, so each index keeps the order it
+/// was built in -- storage encodes its keys under it whichever server writes --
+/// and a server plans only with the indexes in its own order
+/// ([`index_serves_this_thread`]). Not a user option: `listIndexes` and change
+/// events leave it out, and a rebuild keeps it.
+const BINDATA_ORDER_OPT: &str = "binDataOrder";
+
+/// The BinData order an index's keys were written in.
+fn index_bindata_order(opts: &Document) -> BinDataOrder {
+    match opts.get_str(BINDATA_ORDER_OPT) {
+        Ok("bytes") => BinDataOrder::Bytes,
+        _ => BinDataOrder::Mongod,
+    }
+}
+
+/// Whether this thread's server may read through an index: its keys must be
+/// in the server's own BinData order, or a range over BinData would scan the
+/// wrong stretch. The other server's index is still maintained on every write.
+fn index_serves_this_thread(opts: &Document) -> bool {
+    index_bindata_order(opts) == order::bindata_order()
 }
 
 /// The collation an index's ENTRIES are keyed by, from its catalog options.
@@ -2973,11 +3018,25 @@ fn escape_kb(kb: &[u8]) -> Vec<u8> {
 ///   SIZE order, so ranges, partial-filter implication and sort walks over
 ///   document keys had to be refused. `_id` keys are NOT index entries and
 ///   keep the old encoding (`sortkey::encode_id_key`).
+/// * 5 — BinData keys carry the subtype between length and bytes, and
+///   JavaScript-with-scope has a rank of its own after JavaScript (14, which
+///   moves MaxKey to 15) keyed by code then scope: mongod's order
+///   (RM-232 / RM-233, decided by Joe 2026-10-21). A format-4 index is
+///   rebuilt when the store opens (`index_entries_outdated`); formats 1-3 are
+///   still refused. The PG server's indexes record PostgreSQL's BinData order
+///   instead (`BINDATA_ORDER_OPT`).
 ///
 /// The catalog is the only place this is visible — the WT `key_format` is
 /// `SSSu` for all three — so the marker is how an older store is detected
-/// (`reject_legacy_index_entry_format`). Mirrors the Python `_ENTRY_FORMAT`.
-const ENTRY_FORMAT: i32 = 4;
+/// (`reject_legacy_index_entry_format`). The deprecated Python servers' `_ENTRY_FORMAT`
+/// stays at 4: compatibility with them is no longer a constraint (2026-10-16).
+const ENTRY_FORMAT: i32 = 5;
+
+/// The oldest entry format an open brings up to date by rebuilding the index
+/// (`rebuild_outdated_indexes`) instead of refusing the store: 4, whose entries
+/// are laid out as 5's and differ only in how a few types are keyed. A store
+/// the deprecated Python servers write is format 4, and opens.
+const OLDEST_REBUILDABLE_ENTRY_FORMAT: i32 = 4;
 
 /// Pack an index-entry payload into a single trailing `u` column:
 /// `escape(kb) + b"\x00\x00" + RecordId(8B big-endian)`. WiredTiger
@@ -10648,23 +10707,18 @@ impl Storage {
                             // `keyValue` and extra fields (RM-142, measured 8.2.11).
                             let mut id_conflict: Option<UniqueConflict> = None;
                             if let Some(claim) = self.id_claim_desc(&session, db, coll)? {
-                                let kb = index_key_variants_c(
-                                    &doc,
-                                    &claim.key_spec,
-                                    false,
-                                    claim.collation.as_ref(),
-                                )?
-                                .into_iter()
-                                .next();
+                                let kb = claim.key_variants(&doc, false)?.into_iter().next();
                                 if let Some(kb) = kb {
-                                    let conflict = UniqueConflict::new(
-                                        ns.clone(),
-                                        &claim.name,
-                                        &claim.key_spec,
-                                        &doc,
-                                        &kb,
-                                        claim.collation.as_ref(),
-                                    )
+                                    let conflict = with_bindata_order(claim.key_order, || {
+                                        UniqueConflict::new(
+                                            ns.clone(),
+                                            &claim.name,
+                                            &claim.key_spec,
+                                            &doc,
+                                            &kb,
+                                            claim.collation.as_ref(),
+                                        )
+                                    })
                                     .on_clustered(claim.clustered);
                                     errmsg = conflict.errmsg();
                                     id_conflict = Some(conflict);
@@ -12910,6 +12964,14 @@ impl Storage {
         // enumerated user-facing options, so it never provokes a false conflict.
         stored_options.insert("entryFormat", ENTRY_FORMAT);
         stored_options.insert(NUMBER_KEYS, sortkey::NUMBER_KEY_FORMAT);
+        // The PG server's index keeps PostgreSQL's BinData order; a rebuild
+        // passes the recorded order back in and keeps it.
+        if !stored_options.contains_key(BINDATA_ORDER_OPT)
+            && order::bindata_order() == BinDataOrder::Bytes
+        {
+            stored_options.insert(BINDATA_ORDER_OPT, "bytes");
+        }
+        let build_order = index_bindata_order(&stored_options);
         if !stored_options.contains_key(BUILD_SEQ) {
             let last = self
                 .iter_indexes(session, db, coll)?
@@ -13035,20 +13097,27 @@ impl Storage {
                 if !multikey && doc_makes_multikey(&d, key_spec) {
                     multikey = true;
                 }
-                for kb in index_key_variants_c(&d, key_spec, sparse, key_coll.as_ref())? {
+                for kb in with_bindata_order(build_order, || {
+                    index_key_variants_c(&d, key_spec, sparse, key_coll.as_ref())
+                })? {
                     // Uniqueness is checked against the same key variants the
                     // entries are built from — mongod's unique-multikey rule is
                     // "no two docs share any generated key".
                     if unique && !seen.insert(kb.clone()) {
                         // A pre-existing doc already holds this key — can't
                         // build a unique index over the data.
-                        return Err(StorageError::DuplicateKey(Box::new(UniqueConflict::new(
-                            format!("{db}.{coll}"),
-                            name,
-                            key_spec,
-                            &d,
-                            &kb,
-                            key_coll.as_ref(),
+                        return Err(StorageError::DuplicateKey(Box::new(with_bindata_order(
+                            build_order,
+                            || {
+                                UniqueConflict::new(
+                                    format!("{db}.{coll}"),
+                                    name,
+                                    key_spec,
+                                    &d,
+                                    &kb,
+                                    key_coll.as_ref(),
+                                )
+                            },
                         ))));
                     }
                     entries.push((kb, rid));
@@ -13331,9 +13400,7 @@ impl Storage {
             // Grouped over every key the doc contributes (sparse: none),
             // matching what `unique_conflict` would refuse — on a multikey
             // index two docs collide as soon as they share one generated key.
-            for kb in
-                index_key_variants_c(&doc, &desc.key_spec, desc.sparse, desc.collation.as_ref())?
-            {
+            for kb in desc.key_variants(&doc, desc.sparse)? {
                 match index_of.get(&kb) {
                     Some(&i) => groups[i].push(id.clone()),
                     None => {
@@ -13496,7 +13563,9 @@ impl Storage {
     ) -> Result<Vec<(String, Document, Document)>> {
         let mut indexes = self.iter_indexes(session, db, coll)?;
         indexes.retain(|(_, _, opts)| {
-            !opts.get_bool("hidden").unwrap_or(false) && !opts.contains_key(COLLATION_KEYS)
+            !opts.get_bool("hidden").unwrap_or(false)
+                && !opts.contains_key(COLLATION_KEYS)
+                && index_serves_this_thread(opts)
         });
         Ok(indexes)
     }
@@ -13526,7 +13595,9 @@ impl Storage {
     /// [`Self::visible_indexes`]).
     fn planner_descs(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<IndexDesc>> {
         let mut descs = self.index_descs(session, db, coll)?;
-        descs.retain(|d| !d.hidden && d.collation.is_none());
+        let order = order::bindata_order();
+        descs
+            .retain(|d| !d.hidden && d.collation.is_none() && (d.id_claim || d.key_order == order));
         Ok(descs)
     }
 
@@ -14289,7 +14360,7 @@ impl Storage {
         if !self.doc_in_partial(doc, desc)? {
             return Ok(out);
         }
-        for kb in index_key_variants_c(doc, &desc.key_spec, desc.sparse, desc.collation.as_ref())? {
+        for kb in desc.key_variants(doc, desc.sparse)? {
             out.push(pack_entry(&kb, recordid));
         }
         Ok(out)
@@ -14341,9 +14412,7 @@ impl Storage {
             if !claimed || !self.doc_in_partial(doc, desc)? {
                 continue;
             }
-            for kb in
-                index_key_variants_c(doc, &desc.key_spec, desc.sparse, desc.collation.as_ref())?
-            {
+            for kb in desc.key_variants(doc, desc.sparse)? {
                 let esc = escape_kb(&kb);
                 claims.reset()?;
                 claims.set_key_sssu(db, &key_coll(db, coll), &desc.name, &esc);
@@ -14373,14 +14442,16 @@ impl Storage {
                             }
                         }
                         return Err(StorageError::DuplicateKey(Box::new(
-                            UniqueConflict::new(
-                                format!("{db}.{coll}"),
-                                &desc.name,
-                                &desc.key_spec,
-                                doc,
-                                &kb,
-                                desc.collation.as_ref(),
-                            )
+                            with_bindata_order(desc.key_order, || {
+                                UniqueConflict::new(
+                                    format!("{db}.{coll}"),
+                                    &desc.name,
+                                    &desc.key_spec,
+                                    doc,
+                                    &kb,
+                                    desc.collation.as_ref(),
+                                )
+                            })
                             .on_clustered(desc.clustered),
                         )));
                     }
@@ -14432,9 +14503,7 @@ impl Storage {
         let claims = session.open_cursor(UNIQ_TABLE, None)?;
         for desc in descs {
             if desc.id_claim || (desc.name != "_id_" && (desc.unique || desc.prepare_unique)) {
-                for kb in
-                    index_key_variants_c(doc, &desc.key_spec, desc.sparse, desc.collation.as_ref())?
-                {
+                for kb in desc.key_variants(doc, desc.sparse)? {
                     claims.reset()?;
                     claims.set_key_sssu(db, &key_coll(db, coll), &desc.name, &escape_kb(&kb));
                     match claims.search() {
@@ -14639,6 +14708,7 @@ impl Storage {
                     geo_sphere,
                     id_claim: false,
                     clustered: false,
+                    key_order: index_bindata_order(&opts),
                 }
             })
             .collect();
@@ -14792,6 +14862,7 @@ impl Storage {
             geo_sphere: None,
             id_claim: true,
             clustered: false,
+            key_order: BinDataOrder::Format4,
         }))
     }
 
@@ -14903,7 +14974,9 @@ impl Storage {
                         if !matches!(doc.get("_id"), Some(Bson::Document(_))) {
                             continue;
                         }
-                        for kb in index_key_variants_c(&doc, &key_spec, false, None)? {
+                        for kb in with_bindata_order(BinDataOrder::Format4, || {
+                            index_key_variants_c(&doc, &key_spec, false, None)
+                        })? {
                             match self.claim_stored_id(
                                 &session,
                                 (&claims, &owners),
@@ -15041,7 +15114,9 @@ impl Storage {
                     let (mut taken, mut held) = (0u64, 0u64);
                     for (recordid, _id_k, blob) in chunk {
                         let doc = decode_doc(blob)?;
-                        for kb in index_key_variants_c(&doc, &key_spec, false, Some(collation))? {
+                        for kb in with_bindata_order(BinDataOrder::Format4, || {
+                            index_key_variants_c(&doc, &key_spec, false, Some(collation))
+                        })? {
                             match self.claim_stored_id(
                                 &session,
                                 (&claims, &owners),
@@ -15386,6 +15461,7 @@ impl Storage {
                 geo_sphere: None,
                 id_claim: true,
                 clustered,
+                key_order: BinDataOrder::Format4,
             }),
         )
     }
@@ -15466,9 +15542,7 @@ impl Storage {
             // record of who holds the key.
             if desc.id_claim {
                 let claims = session.open_cursor(UNIQ_TABLE, None)?;
-                for kb in
-                    index_key_variants_c(candidate, &desc.key_spec, false, desc.collation.as_ref())?
-                {
+                for kb in desc.key_variants(candidate, false)? {
                     claims.reset()?;
                     claims.set_key_sssu(db, &key_coll(db, coll), &desc.name, &escape_kb(&kb));
                     let owner = match claims.search() {
@@ -15480,14 +15554,16 @@ impl Storage {
                         && self.claim_owner_exists(session, db, coll, owner)?
                     {
                         return Ok(Some(
-                            UniqueConflict::new(
-                                format!("{db}.{coll}"),
-                                &desc.name,
-                                &desc.key_spec,
-                                candidate,
-                                &kb,
-                                desc.collation.as_ref(),
-                            )
+                            with_bindata_order(desc.key_order, || {
+                                UniqueConflict::new(
+                                    format!("{db}.{coll}"),
+                                    &desc.name,
+                                    &desc.key_spec,
+                                    candidate,
+                                    &kb,
+                                    desc.collation.as_ref(),
+                                )
+                            })
                             .on_clustered(desc.clustered),
                         ));
                     }
@@ -15499,12 +15575,7 @@ impl Storage {
             if (!desc.unique && !desc.prepare_unique) || !self.doc_in_partial(candidate, desc)? {
                 continue;
             }
-            for kb in index_key_variants_c(
-                candidate,
-                &desc.key_spec,
-                desc.sparse,
-                desc.collation.as_ref(),
-            )? {
+            for kb in desc.key_variants(candidate, desc.sparse)? {
                 let esc_kb = escape_kb(&kb);
                 let mut seed = esc_kb.clone();
                 seed.extend_from_slice(ENTRY_SEP);
@@ -15535,14 +15606,16 @@ impl Storage {
                     // "not me" rather than silently matching.
                     let is_self = row_id.is_some() && exclude_recordid == row_id;
                     if !is_self {
-                        return Ok(Some(UniqueConflict::new(
-                            format!("{db}.{coll}"),
-                            &desc.name,
-                            &desc.key_spec,
-                            candidate,
-                            &kb,
-                            desc.collation.as_ref(),
-                        )));
+                        return Ok(Some(with_bindata_order(desc.key_order, || {
+                            UniqueConflict::new(
+                                format!("{db}.{coll}"),
+                                &desc.name,
+                                &desc.key_spec,
+                                candidate,
+                                &kb,
+                                desc.collation.as_ref(),
+                            )
+                        })));
                     }
                     more = cur.next()?;
                 }
@@ -16121,7 +16194,9 @@ impl Storage {
                 } else if packed.is_empty() {
                     0
                 } else {
-                    reference_key_count(&doc, &desc.key_spec, desc.collation.as_ref())
+                    with_bindata_order(desc.key_order, || {
+                        reference_key_count(&doc, &desc.key_spec, desc.collation.as_ref())
+                    })
                 };
                 *keys.entry(desc.name.clone()).or_default() += held;
                 expected
@@ -21120,6 +21195,7 @@ fn index_event_spec(payload: &Document, name: &str) -> Document {
                     | "ns"
                     | "multikey"
                     | "entryFormat"
+                    | "binDataOrder"
                     | "collationKeys"
                     | "numberKeys"
                     | "geoKeys"
@@ -22475,6 +22551,103 @@ mod tests {
         let meta = sess.open_cursor(OPLOG_META_TABLE, None).unwrap();
         meta.set_key_s(NUMBER_KEYS_META);
         meta.remove().unwrap();
+    }
+
+    /// An index of entry format 4 -- laid out as format 5, keying BinData
+    /// without its subtype -- is rebuilt when the store opens, not refused
+    /// (RM-232), and answers from the rebuilt entries.
+    #[test]
+    fn open_rebuilds_an_entry_format_4_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("db");
+        std::fs::create_dir_all(&home).unwrap();
+        let home_s = home.to_str().unwrap();
+        let bin = |b: &[u8], s: u8| {
+            Bson::Binary(bson::Binary {
+                subtype: s.into(),
+                bytes: b.to_vec(),
+            })
+        };
+        {
+            let st = Storage::open(home_s).unwrap();
+            let docs = [
+                (1, bin(b"\x01", 5)),
+                (2, bin(b"\x02", 0)),
+                (3, bin(b"\x01\x01", 0)),
+            ]
+            .into_iter()
+            .map(|(u, b)| encode_doc(&doc! {"_id": u, "u": u, "b": b}).unwrap())
+            .collect();
+            st.insert("app", "c", docs, true).unwrap();
+            st.create_index("app", "c", "b_1", &doc! {"b": 1i32}, &Document::new())
+                .unwrap();
+        }
+        age_index(home_s, "c", "b_1", |o| {
+            o.insert("entryFormat", 4i32);
+        });
+        let st = Storage::open(home_s).unwrap();
+        let (_, _, opts) = st
+            .iter_indexes(&st.conn.open_session().unwrap(), "app", "c")
+            .unwrap()
+            .into_iter()
+            .find(|(n, _, _)| n == "b_1")
+            .unwrap();
+        assert_eq!(opts.get_i32("entryFormat").ok(), Some(ENTRY_FORMAT));
+        assert_eq!(ids_of(&st, "c", doc! {"b": bin(b"\x02", 0)}), vec![2]);
+        // mongod's order: length, then subtype, then bytes. `\x01` of subtype 5
+        // and the longer `\x01\x01` are both above `\x02` of subtype 0.
+        assert_eq!(
+            ids_of(&st, "c", doc! {"b": {"$gt": bin(b"\x02", 0)}}),
+            vec![1, 3]
+        );
+    }
+
+    /// An index built on a thread in PostgreSQL's BinData order (the PG
+    /// server's) records it, keeps its keys in it when the MongoDB server
+    /// writes, and serves only threads in that order: each server answers a
+    /// BinData range in its own product's order through a shared store.
+    #[test]
+    fn an_index_keeps_the_bindata_order_it_was_built_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("db");
+        std::fs::create_dir_all(&home).unwrap();
+        let st = Storage::open(home.to_str().unwrap()).unwrap();
+        let bin = |b: &[u8]| {
+            Bson::Binary(bson::Binary {
+                subtype: 0u8.into(),
+                bytes: b.to_vec(),
+            })
+        };
+        let put = |u: i32, b: &[u8]| {
+            st.insert(
+                "app",
+                "c",
+                vec![encode_doc(&doc! {"_id": u, "u": u, "b": bin(b)}).unwrap()],
+                true,
+            )
+            .unwrap();
+        };
+        put(1, b"x8");
+        with_bindata_order(BinDataOrder::Bytes, || {
+            st.create_index("app", "c", "b_1", &doc! {"b": 1i32}, &Document::new())
+                .unwrap()
+        });
+        let (_, _, opts) = st
+            .iter_indexes(&st.conn.open_session().unwrap(), "app", "c")
+            .unwrap()
+            .into_iter()
+            .find(|(n, _, _)| n == "b_1")
+            .unwrap();
+        assert_eq!(opts.get_str(BINDATA_ORDER_OPT).ok(), Some("bytes"));
+        // Written by the MongoDB server's thread: keyed in the index's order.
+        put(2, b"x10");
+        put(3, b"x9");
+        let above_x8 = doc! {"b": {"$gt": bin(b"x8")}};
+        // PostgreSQL's order, through the index: only "x9" is above "x8".
+        let pg = with_bindata_order(BinDataOrder::Bytes, || ids_of(&st, "c", above_x8.clone()));
+        assert_eq!(pg, vec![3]);
+        // mongod's order, without it: the longer "x10" is above "x8" too.
+        assert_eq!(ids_of(&st, "c", above_x8), vec![2, 3]);
     }
 
     fn ids_of(st: &Storage, coll: &str, filter: Document) -> Vec<i32> {

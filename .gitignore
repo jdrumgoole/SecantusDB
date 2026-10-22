@@ -154,3 +154,7 @@ bench/results/do/
 
 # graphify knowledge-graph output (local analysis; graph.json alone is ~57 MB).
 graphify-out/
+
+# LLVM coverage profiles from an instrumented build (scripts/rust_mdb_coverage.py)
+*.profraw
+*.profdata
