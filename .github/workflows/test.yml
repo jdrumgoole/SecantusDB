@@ -1282,6 +1282,16 @@ jobs:
     # secantus-pg cargo test and the backlog's PG tests joined a lane that
     # took about 11 minutes.
     timeout-minutes: 60
+    # Two shards since 2026-10-22, when this job became the whole PR run's
+    # critical path (19-27 min, the suite step alone 11-18). Each shard
+    # builds `secantusd-pg` and runs its share; the `server` shard keeps
+    # everything else (secantusd-rs, the cargo tests, the login and backlog
+    # comparisons). The split is by FILE: a file named in neither list runs
+    # nowhere, so a new suite joins one of them in the step below.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [server, corpora]
     env:
       UV_PYTHON: "3.10"
       # The suites read this (tests/pg_oracle.py); without it they fall back to
@@ -1390,6 +1400,7 @@ jobs:
       # than not having them (a green summary that proves nothing). Same
       # reasoning as the secantusd-pg build above.
       - name: Build secantusd-rs (for the cross-protocol tests)
+        if: matrix.shard == 'server'
         shell: bash
         run: |
           WT="$PWD/$(ls -d build/*/wt-build | head -1)"
@@ -1411,6 +1422,7 @@ jobs:
       # `tls`, `connection_addrs`, `declare_reads` and the doctests running
       # nowhere but a developer's box, and a new test file joined them silently.
       - name: Run the secantus-pg cargo tests
+        if: matrix.shard == 'server'
         shell: bash
         run: |
           WT="$PWD/$(ls -d build/*/wt-build | head -1)"
@@ -1421,6 +1433,7 @@ jobs:
           (cd crates/secantus-pg && cargo test)
 
       - name: Verify the reference server is reachable
+        if: matrix.shard == 'server'
         # Fail CLOSED. The whole point of this job is that these suites stop
         # skipping, and a skip is invisible in a green pytest summary — so
         # prove the connection here, where a failure is unambiguous.
@@ -1445,12 +1458,19 @@ jobs:
           # few minutes, and is deterministic -- and it is the suite that has
           # pre-existing tests a shared-code change can silently break (that is
           # exactly how #1363 left `main` red under green CI).
+          # Split by shard (see `strategy` above). server: the two suites
+          # that need the reference server or secantusd-rs. corpora: the
+          # binary-only files, led by the corpora (one corpus, b66_join_stream,
+          # is a 3-minute test on its own).
+          if [ "${{ matrix.shard }}" = "server" ]; then
           files="tests/test_rust_pgserver_slice.py"
           # The DIFFERENTIAL suite, whole: 836 cases against the PostgreSQL 14
           # service above. It was left out as too slow for this lane, with one
           # node named, so 13 of its 14 tests ran only on a developer's box.
           # Measured 2026-10-21: six minutes at -n 4 on a loaded laptop.
           files="$files tests/test_rust_pgserver_differential.py"
+          else
+          files=""
           # The release smoke test, in the one lane that already builds the
           # binary it needs. It is `skipif`-gated on that binary existing, so
           # anywhere else it silently collects nothing -- a release gate that
@@ -1468,6 +1488,7 @@ jobs:
           # Until 2026-10-21 the corpora ran on a developer's box and nowhere
           # else, so what they pinned could regress under a green CI.
           files="$files tests/test_rust_pg_corpora.py"
+          fi
           echo "oracle suites: $files"
           test -n "$files"
           # --dist worksteal: the default `loadgroup` hands each worker a
@@ -1486,6 +1507,7 @@ jobs:
       # container above cannot be made to do. 15 because that is the major
       # the answers were measured against and the one the server reports.
       - name: Add the PostgreSQL apt repository
+        if: matrix.shard == 'server'
         shell: bash
         run: |
           if ! grep -rqs apt.postgresql.org /etc/apt/sources.list /etc/apt/sources.list.d/; then
@@ -1503,11 +1525,13 @@ jobs:
           echo "create_main_cluster = false" | sudo tee -a /etc/postgresql-common/createcluster.conf
 
       - name: Install PostgreSQL 15
+        if: matrix.shard == 'server'
         uses: ./.github/actions/apt-install
         with:
           packages: postgresql-15
 
       - name: Run the login comparisons against PostgreSQL 15
+        if: matrix.shard == 'server'
         # SECANTUS_REQUIRE_PG15 makes a missing directory a failure: these
         # tests skip without one, and this is the only lane that has it.
         shell: bash
@@ -1527,6 +1551,7 @@ jobs:
       # (the `pg15` fixture), which this step starts from the binaries above on
       # the port a developer box uses for it.
       - name: Start a PostgreSQL 15 reference
+        if: matrix.shard == 'server'
         shell: bash
         run: |
           B=/usr/lib/postgresql/15/bin
@@ -1537,6 +1562,7 @@ jobs:
           psql "host=127.0.0.1 port=5415 dbname=postgres user=postgres" -Atc 'show server_version'
 
       - name: Run the Rust PG backlog regression and gap tests
+        if: matrix.shard == 'server'
         shell: bash
         env:
           SECANTUS_PG_ORACLE_DSN_15: "host=127.0.0.1 port=5415 dbname=postgres user=postgres"
