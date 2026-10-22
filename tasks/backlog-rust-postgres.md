@@ -751,39 +751,22 @@ Not filed:
       has a model to build on (`xids.rs`).
       Backlog-ID: RP-069
       Verify: tests/backlog/test_rp_found_2026_10_20.py::test_system_columns
-- [ ] **127 of PostgreSQL 15's 203 `pg_catalog` / `information_schema`
-      tables and views cannot be queried** (42P01). The full list is
-      `tests/backlog/rp070_catalog_relations.txt`, generated from PostgreSQL
-      15.19's `pg_class`. Missing examples:
-      - `information_schema.schemata`, `routines`, `check_constraints`,
-        `referential_constraints`, `triggers`, `parameters`;
-      - `pg_stat_user_tables` and the rest of `pg_stat_*` / `pg_statio_*`;
-      - `pg_stats` / `pg_statistic` (ANALYZE models statistics);
-      - `pg_aggregate`, `pg_default_acl`, `pg_shseclabel`,
-        `pg_db_role_setting`.
-
-      This is why the client tools in RP-071 fail.
+- [ ] **The cumulative statistics views cannot be queried** (42P01): the 21
+      `pg_stat_*_tables` / `_indexes` / `_functions`, `pg_stat_xact_*`,
+      `pg_stat_database` and `pg_statio_*` views. Every other relation in
+      PostgreSQL 15.19's `pg_class` (`tests/backlog/rp070_catalog_relations.txt`)
+      now answers, as PostgreSQL's own view definition over this server's
+      catalogs, from PostgreSQL's built-in rows, or from this server's state.
+      **Decided (Joe, 2026-10-22): model the counters, refuse the
+      internals** -- PostgreSQL's cumulative-statistics model (per-table,
+      per-index and per-function counters, the database's counters,
+      persisted across restarts) behind those views; the server's internals
+      (`pg_backend_memory_contexts`, `pg_shmem_allocations`,
+      `pg_stat_bgwriter`, `pg_stat_wal`, `pg_stat_slru`, `pg_stat_archiver`)
+      refused by name, 0A000, which the gap test expects. Relations refused
+      for reasons other items record (RP-098 .. RP-101) are left to theirs.
       Backlog-ID: RP-070
       Verify: tests/backlog/test_rp_found_2026_10_20.py::test_catalog_relations_are_queryable
-- [ ] **PostgreSQL's own client tools fail.** With the PostgreSQL 15 binaries,
-      each of these exits 0 against PostgreSQL 15.19 and non-zero here:
-      - `pg_dump --schema-only` stops at `pg_is_in_recovery()` (0A000);
-      - `pg_dumpall --globals-only` stops on `pg_shseclabel`;
-      - `pgbench -i` stops at `COPY ... FREEZE` (0A000);
-      - psql's `\l`, `\l+`, `\dd`, `\dc`, `\dL`, `\dy` and `\db`.
-
-      `\l` and `\l+` stop because `pg_database.datacl` holds `text`
-      values here, though `pg_attribute` says `aclitem[]`, so psql's
-      `array_to_string(d.datacl, ...)` does not resolve (42883). Plain `\l`
-      is the sql-stress gauge's psql catalog smoke, its one failing lane
-      (2026-10-21).
-
-      Also unsupported: `pg_current_wal_lsn`, `pg_postmaster_start_time`,
-      `pg_relation_filepath`, `pg_tablespace_location`. The test needs
-      the PostgreSQL 15 tools (`SECANTUS_PG15_BIN`, or Homebrew's
-      `postgresql@15`).
-      Backlog-ID: RP-071
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_client_tools
 - [ ] **Statements still refused with 0A000** (`... is not supported yet`),
       each of which PostgreSQL 15.19 runs:
       - `ALTER SYSTEM` (set and reset), `ALTER ROLE ... SET`;
@@ -801,6 +784,111 @@ Not filed:
       surveys listed" is refused no longer held.
       Backlog-ID: RP-072
       Verify: tests/backlog/test_rp_found_2026_10_20.py::test_statements_not_refused
+
+## Found by batch 26 (2026-10-22)
+
+Found while making PostgreSQL 15's `pg_dump`, `pg_dumpall` and `psql` answer
+as they do against PostgreSQL 15.19 (RP-070, RP-071). The gap tests are
+scenarios in `tests/backlog/test_rp_batch26.py`, measured on a private 15.19
+cluster.
+
+- [ ] **A record column's field types are lost through a FROM subquery.**
+      `(ss.x).n` over a subquery column `information_schema._pg_expandarray(a)
+      AS x` is described as `text` when the subquery returns no rows, where
+      PostgreSQL types it from the function's OUT parameters (`n integer`, `x`
+      the array's element). So `information_schema.element_types` fails with
+      42804 on a database without user functions (its UNION arms disagree),
+      and `parameters` and `triggered_update_columns` are typed wrong there.
+      Backlog-ID: RP-098
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[a record's fields through a subquery]
+- [ ] **ANALYZE computes no column statistics**, so `pg_statistic`,
+      `pg_stats` and the extended-statistics relations (`pg_statistic_ext_data`,
+      `pg_stats_ext`, `pg_stats_ext_exprs`) are refused by name (0A000).
+      PostgreSQL's ANALYZE samples up to 300 x `default_statistics_target`
+      rows (all of a smaller table, so deterministic there) and records
+      `null_frac`, `avg_width`, `n_distinct`, the most common values and a
+      histogram per column. The planner's cost model (RP-028) would read them.
+      Backlog-ID: RP-099
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[ANALYZE computes statistics]
+- [ ] **The progress views are refused by name** (0A000):
+      `pg_stat_progress_vacuum`, `_analyze`, `_cluster`, `_copy`,
+      `_create_index`, `_basebackup`. PostgreSQL reports a row per backend
+      running that command, which a COPY or CREATE INDEX here never
+      publishes.
+      Backlog-ID: RP-100
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[progress views]
+- [ ] **The configuration-file views are refused by name** (0A000):
+      `pg_hba_file_rules` and `pg_ident_file_mappings` (the server reads a
+      `pg_hba.conf` / `pg_ident.conf` when given one, but keeps only their
+      meaning, not the raw tokens these views report), `pg_config` (no
+      PostgreSQL installation stands behind it) and `pg_file_settings` (no
+      `postgresql.conf`).
+      Backlog-ID: RP-101
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[configuration-file views]
+- [ ] **PostgreSQL's built-in objects are missing from several catalogs.**
+      `pg_proc` lists only user functions (PostgreSQL 15.19 has 3,233 in
+      `pg_catalog`), `pg_type` lacks the system relations' row types, and
+      `pg_constraint` the system catalogs' constraints. Views over them come
+      out short: `information_schema.routines` has 13 rows on a fresh
+      database where PostgreSQL has 3,244, `parameters` 22 for 6,480.
+      Backlog-ID: RP-102
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[built-in objects in the catalogs]
+- [ ] **`GRANT` / `REVOKE` on a schema is accepted but not recorded**, so
+      `pg_namespace.nspacl` keeps initdb's ACL and pg_dump loses the change.
+      Backlog-ID: RP-103
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[schema privileges]
+- [ ] **What another role creates is reported as the bootstrap
+      superuser's.** A schema made `AUTHORIZATION r`, or a type a role other
+      than the bootstrap superuser creates, has owner 10 in `nspowner` /
+      `typowner` (ALTER TYPE ... OWNER TO is recorded). `pg_shdepend` lists
+      ownership and ACL rows for this database and the databases' owners,
+      but not other databases' objects.
+      Backlog-ID: RP-104
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[owners of what another role creates]
+- [ ] **`pg_depend` records only dependencies between relations and column
+      defaults**: owned and identity sequences, indexes on their columns,
+      partitions and inheritance children, defaults on their sequence and
+      types. Constraints, rules, triggers, types and functions record none,
+      and an expression index depends on its table as a whole rather than
+      the columns its expression reads.
+      Backlog-ID: RP-105
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[dependencies beyond relations]
+- [ ] **A misspelled outer column in a FROM function is 0A000, not 42703.**
+      `(select max(x) from unnest(a) x)` with no `a` anywhere answers
+      `ColumnRef is not supported yet`; PostgreSQL says `column "a" does not
+      exist`.
+      Backlog-ID: RP-106
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[an unknown name in a FROM function]
+- [ ] **Catalog columns of `pg_node_tree` and `anyarray` are typed `text`**:
+      `pg_attrdef.adbin`, `pg_index.indexprs` / `indpred`,
+      `pg_class.relpartbound`, `pg_policy.polqual`, `pg_rewrite.ev_action`,
+      `pg_trigger.tgqual`, `pg_type.typdefaultbin`, `pg_proc.proargdefaults`
+      and others (194 in PostgreSQL), and `pg_attribute.attmissingval`
+      (anyarray, 2277).
+      Backlog-ID: RP-107
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[expression columns' types]
+- [ ] **A child column merged with a parent's is not local.** `create table
+      c (x int, y int) inherits (p)` where `p` has `x`: PostgreSQL keeps `x`
+      `attislocal = true` with `attinhcount = 1`; this server, which does not
+      record the merge, reports `attislocal = false`.
+      Backlog-ID: RP-109
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[a merged inherited column]
+- [ ] **`pg_largeobject` shows pages a large object never wrote.** The store
+      keeps 256 KB chunks, so a write past the end of a stored chunk fills
+      the pages between with zeros, where PostgreSQL has no row for a page
+      never written (`lo_put` at 10000 after one byte: pages 0 and 4).
+      Backlog-ID: RP-110
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[a large object's pages]
+- [ ] **A type off the search path still resolves by its bare name.** With
+      `search_path` set to `''`, `'mood'::regtype` finds `public.mood` here;
+      PostgreSQL answers 42704, and `to_regtype('mood')` NULL.
+      Backlog-ID: RP-111
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[a type off the search path]
+- [ ] **The WAL and file-location functions are refused** (0A000):
+      `pg_current_wal_lsn()` and `pg_relation_filepath()`. This server writes
+      no PostgreSQL WAL and keeps no PostgreSQL relation files.
+      Backlog-ID: RP-112
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[WAL and file functions]
 
 ## Found by the corpus test (2026-10-21)
 

@@ -457,6 +457,7 @@ pub(crate) fn mentions_tableoid(s: &pg_query::protobuf::SelectStmt) -> bool {
         .chain(s.where_clause.iter().map(|b| &**b))
         .chain(s.group_clause.iter())
         .chain(s.sort_clause.iter())
+        .chain(s.from_clause.iter())
         .any(|n| {
             n.node.as_ref().is_some_and(|x| {
                 x.nodes().iter().any(|(r, _, _, _)| {
@@ -596,6 +597,27 @@ pub(crate) fn rewrite_tableoid(
     }
     for g in &mut out.group_clause {
         walk_expr(g, &mut replace)?;
+    }
+    // A JOIN's ON clause (psql's `d.classoid = l.tableoid`).
+    fn join_quals(
+        n: &mut pg_query::protobuf::Node,
+        f: &mut dyn FnMut(&mut pg_query::protobuf::Node) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(N::JoinExpr(j)) = n.node.as_mut() {
+            if let Some(l) = j.larg.as_deref_mut() {
+                join_quals(l, f)?;
+            }
+            if let Some(r) = j.rarg.as_deref_mut() {
+                join_quals(r, f)?;
+            }
+            if let Some(q) = j.quals.as_deref_mut() {
+                walk_expr(q, f)?;
+            }
+        }
+        Ok(())
+    }
+    for fc in &mut out.from_clause {
+        join_quals(fc, &mut replace)?;
     }
     Ok(changed.then_some(out))
 }

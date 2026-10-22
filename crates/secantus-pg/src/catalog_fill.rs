@@ -91,16 +91,16 @@ pub(crate) fn extra_columns(name: &str) -> &'static [(&'static str, &'static str
             ("typanalyze", "regproc"),
             ("typsubscript", "regproc"),
             ("typndims", "int4"),
-            ("typacl", "text[]"),
+            ("typacl", "aclitem[]"),
             ("typowner", "oid"),
         ],
         "pg_proc" => &[
             ("proparallel", secantus_pgplan::QUOTED_CHAR),
-            ("proacl", "text[]"),
+            ("proacl", "aclitem[]"),
             ("procost", "float4"),
             ("prorows", "float4"),
             ("proleakproof", "bool"),
-            ("prosupport", "oid"),
+            ("prosupport", "regproc"),
             ("proconfig", "text[]"),
             ("provariadic", "oid"),
             ("prosqlbody", "text"),
@@ -120,7 +120,7 @@ pub(crate) fn extra_columns(name: &str) -> &'static [(&'static str, &'static str
         "pg_extension" => &[
             ("extowner", "oid"),
             ("extnamespace", "oid"),
-            ("extconfig", "text[]"),
+            ("extconfig", "oid[]"),
             ("extcondition", "text[]"),
         ],
         _ => &[],
@@ -173,7 +173,7 @@ pub(crate) fn pg_am_def() -> TableDef {
         vec![
             Column::new("oid", "oid", false),
             Column::new("amname", "name", false),
-            Column::new("amhandler", "text", false),
+            Column::new("amhandler", "regproc", false),
             Column::new("amtype", secantus_pgplan::QUOTED_CHAR, false),
         ],
     )
@@ -212,6 +212,185 @@ pub(crate) fn pg_depend_def() -> TableDef {
             Column::new("deptype", secantus_pgplan::QUOTED_CHAR, false),
         ],
     )
+}
+
+impl PgHandler {
+    /// `(type name, owner oid)` for each type ALTER ... OWNER TO gave one.
+    pub(crate) fn type_owner_oids(&self) -> Vec<(String, i64)> {
+        let roles = self.roles().unwrap_or_default();
+        self.storage
+            .find_matching(self.db(), Self::TYPE_OWNER_COLLECTION, &Document::new())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|b| crate::decode_doc(b).ok())
+            .filter_map(|d| {
+                let name = d.get_str("_id").ok()?.to_string();
+                let owner = d.get_str("owner").ok()?;
+                let oid = roles.iter().find(|r| r.name == owner).map_or(10, |r| r.oid);
+                Some((name, oid))
+            })
+            .collect()
+    }
+
+    /// `pg_depend`'s rows between relations, as PostgreSQL records them for
+    /// user objects (pg_dump reads them to know which sequence a column
+    /// owns):
+    /// - a sequence OWNED BY a column (`serial`) on that column, `a`; an
+    ///   identity column's, `i`;
+    /// - an index on each of its key columns, `a` (an expression key on the
+    ///   table as a whole); one backing a PRIMARY KEY or UNIQUE constraint
+    ///   depends on the constraint instead, which is not listed here;
+    /// - a partition on its parent, `a`; an `INHERITS` child on each
+    ///   parent, `n`.
+    pub(crate) fn pg_depend_rows(&self, def: &TableDef) -> Vec<Document> {
+        const PG_CLASS: i64 = 1259;
+        let f = |name: &str| def.field_of(name).expect("column");
+        let row = |objid: i64, refobjid: i64, refsub: i32, deptype: &str| {
+            let mut d = Document::new();
+            d.insert(f("classid"), Bson::Int64(PG_CLASS));
+            d.insert(f("objid"), Bson::Int64(objid));
+            d.insert(f("objsubid"), Bson::Int32(0));
+            d.insert(f("refclassid"), Bson::Int64(PG_CLASS));
+            d.insert(f("refobjid"), Bson::Int64(refobjid));
+            d.insert(f("refobjsubid"), Bson::Int32(refsub));
+            d.insert(f("deptype"), deptype);
+            d
+        };
+        let defs = self.all_table_defs().unwrap_or_default();
+        let mut out = Vec::new();
+        // Sequences owned by a column.
+        for s in self.all_sequence_docs().unwrap_or_default() {
+            let (Ok(seq), Ok(owner)) = (s.get_str("_id"), s.get_str("owned_by")) else {
+                continue;
+            };
+            let Some((table, column)) = owner.rsplit_once('.') else {
+                continue;
+            };
+            let Some(t) = defs.iter().find(|d| d.name == table) else {
+                continue;
+            };
+            let Some(pos) = t.columns.iter().position(|c| c.name == column) else {
+                continue;
+            };
+            let identity = t.columns[pos].identity.is_some();
+            if let Some(to) = self.relation_oid(&t.name) {
+                out.push(row(
+                    Self::sequence_oid(seq),
+                    to,
+                    pos as i32 + 1,
+                    if identity { "i" } else { "a" },
+                ));
+            }
+        }
+        // Indexes on their columns.
+        for ix in self.index_relations() {
+            let backs_constraint = ix.primary
+                || ix
+                    .table
+                    .unique_constraints
+                    .iter()
+                    .any(|u| u.name == ix.name);
+            if backs_constraint {
+                continue;
+            }
+            let Some(to) = self.relation_oid(&ix.table.name) else {
+                continue;
+            };
+            let mut seen = Vec::new();
+            for k in ix.keys.iter().chain(&ix.include) {
+                if !seen.contains(k) {
+                    seen.push(*k);
+                    out.push(row(ix.oid, to, *k, "a"));
+                }
+            }
+        }
+        // Column defaults: each on its column (`a`; a generated column's
+        // expression `i`, and on the columns it reads, `n`); a `nextval`
+        // default on its sequence and a cast to a user type on the type, `n`.
+        for t in &defs {
+            let Some(rel) = self.relation_oid(&t.name) else {
+                continue;
+            };
+            for (i, c) in t.columns.iter().enumerate() {
+                let attnum = i as i32 + 1;
+                let generated = c.extra.get_str("generated").ok();
+                let expr = match generated {
+                    Some(g) => g.to_string(),
+                    None => match Self::default_expression(c) {
+                        Bson::String(e) => e,
+                        _ => continue,
+                    },
+                };
+                let ad = Self::attrdef_oid(&t.name, attnum as usize);
+                let mut push = |refclass: i64, refobj: i64, refsub: i32, deptype: &str| {
+                    let mut d = row(ad, refobj, refsub, deptype);
+                    d.insert(f("classid"), Bson::Int64(2604));
+                    d.insert(f("refclassid"), Bson::Int64(refclass));
+                    out.push(d);
+                };
+                push(
+                    PG_CLASS,
+                    rel,
+                    attnum,
+                    if generated.is_some() { "i" } else { "a" },
+                );
+                let Ok(scan) = pg_query::scan(&expr) else {
+                    continue;
+                };
+                let toks = scan.tokens;
+                let text = |k: usize| &expr[toks[k].start as usize..toks[k].end as usize];
+                for k in 0..toks.len() {
+                    let ident = toks[k].token == pg_query::protobuf::Token::Ident as i32;
+                    if generated.is_some() && ident && (k == 0 || text(k - 1) != "::") {
+                        if let Some(p) = t.columns.iter().position(|col| col.name == text(k)) {
+                            push(PG_CLASS, rel, p as i32 + 1, "n");
+                        }
+                    }
+                    if toks[k].token == pg_query::protobuf::Token::Sconst as i32
+                        && k + 2 < toks.len()
+                        && text(k + 1) == "::"
+                        && text(k + 2).eq_ignore_ascii_case("regclass")
+                    {
+                        let lit = text(k);
+                        let name = lit[1..lit.len() - 1].to_string();
+                        // `'public.s'::regclass` is `public`'s `s`.
+                        let name = name
+                            .strip_prefix("public.")
+                            .map_or(name.clone(), str::to_string);
+                        if self
+                            .all_sequence_docs()
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|s| s.get_str("_id") == Ok(name.as_str()))
+                        {
+                            push(PG_CLASS, Self::sequence_oid(&name), 0, "n");
+                        }
+                    }
+                    if ident && k > 0 && text(k - 1) == "::" {
+                        if let Some(o) = self.type_oid_by_name(text(k)).filter(|o| *o >= 16384) {
+                            push(1247, o, 0, "n");
+                        }
+                    }
+                }
+            }
+        }
+        // Partitions and inheritance children.
+        for t in &defs {
+            let Some(child) = self.relation_oid(&t.name) else {
+                continue;
+            };
+            if let Some(parent) = crate::partition::parent_of(t).and_then(|p| self.relation_oid(p))
+            {
+                out.push(row(child, parent, 0, "a"));
+            }
+            for p in Self::inherited_parents(t) {
+                if let Some(parent) = self.relation_oid(&p) {
+                    out.push(row(child, parent, 0, "n"));
+                }
+            }
+        }
+        out
+    }
 }
 
 /// `pg_publication_namespace` (PostgreSQL 15's `FOR TABLES IN SCHEMA`):
@@ -503,7 +682,12 @@ impl PgHandler {
                 let mut d = Document::new();
                 d.insert(f("schemaname"), schema.as_str());
                 d.insert(f("sequencename"), bare.as_str());
-                d.insert(f("sequenceowner"), secantus_pgplan::regobj::role_name(10));
+                d.insert(
+                    f("sequenceowner"),
+                    s.get_str("owner")
+                        .map(str::to_string)
+                        .unwrap_or_else(|_| secantus_pgplan::regobj::role_name(10)),
+                );
                 d.insert(f("data_type"), secantus_pgplan::regtype_value(typ));
                 d.insert(f("start_value"), Bson::Int64(int("start", 1)));
                 d.insert(f("min_value"), Bson::Int64(int("min_value", 1)));
@@ -567,16 +751,13 @@ impl PgHandler {
                         } else {
                             format!("{prefix}{name} {ty}")
                         };
-                        let default = match defaults.get(i).cloned().flatten() {
-                            None => String::new(),
-                            Some(sql) if sql.starts_with('\'') && sql.ends_with('\'') => {
-                                format!(" DEFAULT {sql}::{ty}")
-                            }
-                            Some(sql) => format!(
-                                " DEFAULT {}",
-                                secantus_pgplan::generation_expression(&sql).unwrap_or(sql)
-                            ),
-                        };
+                        let default = defaults
+                            .get(i)
+                            .cloned()
+                            .flatten()
+                            .map_or_else(String::new, |sql| {
+                                format!(" DEFAULT {}", default_text(sql, &ty))
+                            });
                         (format!("{bare}{default}"), bare)
                     })
                     .collect();
@@ -609,6 +790,43 @@ impl PgHandler {
                 };
                 let oid = Self::index_oid(&format!("fn:{}", d.get_str("_id").unwrap_or_default()));
                 (oid, args.join(", "), identity.join(", "), result)
+            })
+            .collect()
+    }
+
+    /// Each function's parameter defaults as `pg_get_function_arg_default`
+    /// prints them, by input parameter.
+    pub(crate) fn function_arg_defaults(&self) -> Vec<(i64, Vec<Option<String>>)> {
+        self.type_catalog_docs(Self::FUNCTION_COLLECTION)
+            .unwrap_or_default()
+            .iter()
+            .map(|d| {
+                let types: Vec<String> = d
+                    .get_array("param_types")
+                    .map(|a| {
+                        a.iter()
+                            .map(|v| v.as_str().unwrap_or_default().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let defaults: Vec<Option<String>> = d
+                    .get_array("param_defaults")
+                    .map(|a| a.iter().map(|v| v.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                let texts = types
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let ty = self.display_type_name(t);
+                        defaults
+                            .get(i)
+                            .cloned()
+                            .flatten()
+                            .map(|sql| default_text(sql, &ty))
+                    })
+                    .collect();
+                let oid = Self::index_oid(&format!("fn:{}", d.get_str("_id").unwrap_or_default()));
+                (oid, texts)
             })
             .collect()
     }
@@ -651,7 +869,49 @@ impl PgHandler {
                 d.insert(f("description"), text);
                 d
             })
+            .chain(self.schema_comments().into_iter().map(|(oid, text)| {
+                let mut d = Document::new();
+                d.insert(f("objoid"), Bson::Int64(oid));
+                d.insert(f("classoid"), Bson::Int64(2615));
+                d.insert(f("objsubid"), Bson::Int32(0));
+                d.insert(f("description"), text);
+                d
+            }))
             .collect()
+    }
+
+    /// `(namespace oid, comment)` for each schema with one: `initdb`'s on
+    /// `public` until a COMMENT replaces or removes it, then COMMENT ON
+    /// SCHEMA's.
+    fn schema_comments(&self) -> Vec<(i64, String)> {
+        let namespaces = self.namespaces();
+        let stored: Vec<Document> = self
+            .storage
+            .find_matching(
+                self.db(),
+                Self::COMMENT_COLLECTION,
+                &bson::doc! {"kind": "schema"},
+            )
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|b| crate::decode_doc(b).ok())
+            .collect();
+        let mut out = Vec::new();
+        if !stored.iter().any(|d| d.get_str("name") == Ok("public")) {
+            out.push((
+                Self::PUBLIC_NAMESPACE_OID,
+                "standard public schema".to_string(),
+            ));
+        }
+        for d in &stored {
+            let (Ok(name), Ok(text)) = (d.get_str("name"), d.get_str("comment")) else {
+                continue;
+            };
+            if let Some((_, oid)) = namespaces.iter().find(|(n, _)| n == name) {
+                out.push((*oid, text.to_string()));
+            }
+        }
+        out
     }
 
     /// Every function's `(oid, pg_get_functiondef text)`, laid out as
@@ -722,7 +982,7 @@ impl PgHandler {
             let mut d = Document::new();
             d.insert(f("oid"), Bson::Int64(oid));
             d.insert(f("amname"), name);
-            d.insert(f("amhandler"), handler);
+            d.insert(f("amhandler"), self.regproc_bson(handler));
             d.insert(f("amtype"), kind);
             d
         })
@@ -757,6 +1017,12 @@ impl PgHandler {
             _ => Vec::new(),
         };
         let table_by_oid = |oid: i64| tables.iter().find(|(o, _)| *o == oid).map(|(_, t)| t);
+        // `ALTER TYPE ... OWNER TO`'s owners, by type name.
+        let type_owners: Vec<(String, i64)> = if name == "pg_type" {
+            self.type_owner_oids()
+        } else {
+            Vec::new()
+        };
         // Per index: each key's type oid and whether it sorts DESC.
         let index_keys: Vec<(i64, Vec<(i64, bool)>)> = if name == "pg_index" {
             self.index_relations()
@@ -1005,32 +1271,80 @@ impl PgHandler {
                                     None => Bson::Int64(type_collation(type_oid)),
                                 }
                             }
-                            "attlen" => Bson::Int32(match type_oid {
-                                16 | 18 => 1,
-                                21 => 2,
-                                23 | 26 | 700 | 1082 => 4,
-                                20 | 701 | 1114 | 1184 | 1083 => 8,
-                                19 => 64,
-                                2950 => 16,
-                                1186 => 16,
-                                _ => -1,
-                            }),
-                            // A fixed-width type is stored `p`lain, a
-                            // varlena one `x` (extended), as `typstorage`.
-                            "attstorage" => Bson::String(match type_oid {
-                                16 | 18 | 20 | 21 | 23 | 26 | 700 | 701 | 1082 | 1083 | 1114
-                                | 1184 | 1186 | 2950 | 19 => "p".into(),
-                                // numeric, inet and cidr are kept inline.
-                                1700 | 869 | 650 => "m".into(),
-                                _ => "x".into(),
-                            }),
+                            // The column type's `typlen` / `typstorage`: a
+                            // domain's base type's, an enum's 4 bytes plain.
+                            "attlen" | "attstorage" => {
+                                let base = secantus_pgplan::domains::domain_name_of_oid(type_oid)
+                                    .and_then(|n| secantus_pgplan::domains::domain_base(&n))
+                                    .and_then(|b| secantus_pgplan::pgtypes::oid_of_name(&b))
+                                    .unwrap_or(type_oid);
+                                let column = if c == "attlen" {
+                                    "typlen"
+                                } else {
+                                    "typstorage"
+                                };
+                                if enum_oids.contains(&base) {
+                                    if c == "attlen" {
+                                        Bson::Int32(4)
+                                    } else {
+                                        Bson::String("p".into())
+                                    }
+                                } else {
+                                    crate::pg_type_facts::builtin(base, column).unwrap_or_else(
+                                        || {
+                                            // A composite, range or other user type: a varlena.
+                                            if c == "attlen" {
+                                                Bson::Int32(-1)
+                                            } else {
+                                                Bson::String("x".into())
+                                            }
+                                        },
+                                    )
+                                }
+                            }
                             "attcompression" => Bson::String(String::new()),
                             "attacl" => match table_by_oid(int(get(row, "attrelid"))) {
                                 Some(t) => self.column_acl(t, &text(get(row, "attname"))),
-                                None => Bson::Null,
+                                // A system column: initdb's.
+                                None => crate::system_catalogs::initial_acl(
+                                    1259,
+                                    int(get(row, "attrelid")),
+                                    i32::try_from(int(get(row, "attnum"))).unwrap_or(0),
+                                )
+                                .unwrap_or(Bson::Null),
                             },
                             "attoptions" | "attfdwoptions" => Bson::Null,
-                            "attndims" | "attinhcount" => Bson::Int32(0),
+                            "attndims" => Bson::Int32(0),
+                            // An inherited column counts the parents it
+                            // comes from, and is not local
+                            // (`MergeAttributes`).
+                            "attinhcount" | "attislocal" => {
+                                let parents = table_by_oid(int(get(row, "attrelid")))
+                                    .map(|t| {
+                                        let attname = text(get(row, "attname"));
+                                        let mut names = Self::inherited_parents(t);
+                                        names.extend(
+                                            crate::partition::parent_of(t).map(str::to_string),
+                                        );
+                                        names
+                                            .iter()
+                                            .filter(|p| {
+                                                tables.iter().any(|(_, d)| {
+                                                    d.name == **p
+                                                        && d.columns
+                                                            .iter()
+                                                            .any(|col| col.name == attname)
+                                                })
+                                            })
+                                            .count()
+                                    })
+                                    .unwrap_or(0);
+                                if c == "attinhcount" {
+                                    Bson::Int32(parents as i32)
+                                } else {
+                                    Bson::Boolean(parents == 0)
+                                }
+                            }
                             "attstattarget" | "attcacheoff" => Bson::Int32(-1),
                             "attbyval" | "attalign" => {
                                 let col = if c == "attbyval" {
@@ -1046,14 +1360,21 @@ impl PgHandler {
                                     }
                                 })
                             }
-                            "attislocal" => Bson::Boolean(true),
                             _ => Bson::Boolean(false),
                         }
                     }
                     ("pg_type", "typisdefined") => Bson::Boolean(true),
                     ("pg_type", "typndims") => Bson::Int32(0),
                     ("pg_type", "typacl") => Bson::Null,
-                    ("pg_type", "typowner") => Bson::Int64(10),
+                    ("pg_type", "typowner") => {
+                        let name = text(get(row, "typname"));
+                        Bson::Int64(
+                            type_owners
+                                .iter()
+                                .find(|(n, _)| *n == name)
+                                .map_or(10, |(_, o)| *o),
+                        )
+                    }
                     ("pg_type", c) if crate::pg_type_facts::COLUMNS.contains(&c) => {
                         let oid = int(get(row, "oid"));
                         crate::pg_type_facts::builtin(oid, c)
@@ -1087,7 +1408,8 @@ impl PgHandler {
                             },
                         ),
                         "proleakproof" => Bson::Boolean(false),
-                        "prosupport" | "provariadic" => Bson::Int64(0),
+                        "prosupport" => self.regproc_bson(""),
+                        "provariadic" => Bson::Int64(0),
                         "pronargdefaults" => Bson::Int32(0),
                         _ => Bson::Null,
                     },
@@ -1133,5 +1455,15 @@ impl PgHandler {
                 row.insert(f, value);
             }
         }
+    }
+}
+
+/// A parameter default as ruleutils prints it: a string literal typed
+/// (`'x'::text`), an expression as `pg_get_expr` gives it.
+fn default_text(sql: String, ty: &str) -> String {
+    if sql.starts_with('\'') && sql.ends_with('\'') {
+        format!("{sql}::{ty}")
+    } else {
+        secantus_pgplan::generation_expression(&sql).unwrap_or(sql)
     }
 }

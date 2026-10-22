@@ -38,6 +38,28 @@ pub(crate) fn relation_rows(def: &TableDef, db: &str) -> Vec<Document> {
             d.insert(f("table_schema"), schema);
             d.insert(f("table_name"), name);
             d.insert(f("table_type"), kind);
+            for k in [
+                "self_referencing_column_name",
+                "reference_generation",
+                "user_defined_type_catalog",
+                "user_defined_type_schema",
+                "user_defined_type_name",
+                "commit_action",
+            ] {
+                if let Some(field) = def.field_of(k) {
+                    d.insert(field, Bson::Null);
+                }
+            }
+            // Every table, and the two system views PostgreSQL 15.19 finds
+            // auto-updatable.
+            let insertable =
+                kind == "BASE TABLE" || matches!(name, "pg_group" | "pg_stat_database_conflicts");
+            if let Some(field) = def.field_of("is_insertable_into") {
+                d.insert(field, if insertable { "YES" } else { "NO" });
+            }
+            if let Some(field) = def.field_of("is_typed") {
+                d.insert(field, "NO");
+            }
             Some(d)
         })
         .collect()
@@ -473,4 +495,39 @@ pub(crate) fn pg_get_keywords_rows(def: &TableDef) -> Vec<Document> {
             Some(d)
         })
         .collect()
+}
+
+/// `(name, type oid, typmod)` for each column of one of PostgreSQL's own
+/// relations, in attnum order, by the name this server gives it (`pg_amop`,
+/// `information_schema.sql_features`).
+pub(crate) fn system_relation_columns(relation: &str) -> Option<Vec<(String, i64, i32)>> {
+    let (nsp, rel) = match relation.split_once('.') {
+        Some(("information_schema", r)) => ("information_schema", r),
+        Some(_) => return None,
+        None => ("pg_catalog", relation),
+    };
+    let oid = CLASSES.lines().find_map(|line| {
+        let c: Vec<&str> = line.split('\t').collect();
+        (c.get(1) == Some(&rel) && c.get(2) == Some(&nsp)).then(|| c[0].to_string())
+    })?;
+    let mut cols: Vec<(i32, String, i64, i32)> = ATTRIBUTES
+        .lines()
+        .filter_map(|l| {
+            let c: Vec<&str> = l.split('\t').collect();
+            if c.first() != Some(&oid.as_str()) {
+                return None;
+            }
+            let num: i32 = c.get(3)?.parse().ok()?;
+            (num > 0).then(|| {
+                (
+                    num,
+                    c[1].to_string(),
+                    c[2].parse().unwrap_or(25),
+                    c.get(5).and_then(|t| t.parse().ok()).unwrap_or(-1),
+                )
+            })
+        })
+        .collect();
+    cols.sort_by_key(|c| c.0);
+    Some(cols.into_iter().map(|(_, n, t, m)| (n, t, m)).collect())
 }

@@ -557,6 +557,8 @@ pub fn bind_with(
     databases: Arc<DatabaseRegistry>,
     options: &ServerOptions,
 ) -> io::Result<RunningPgServer> {
+    // The server's start, as `pg_postmaster_start_time()` reports it.
+    secantus_pgplan::scalar::postmaster_start();
     let live = Arc::new(crate::live::Live {
         hba: match options.hba_files()? {
             Some(files) => Some(crate::hba::LiveHba::new(files)?),

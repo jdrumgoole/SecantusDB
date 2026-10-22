@@ -332,6 +332,12 @@ pub(crate) fn operator_left_input(op: &str, l: &str, r: &str) -> Option<String> 
     }
 }
 
+/// `pg_type.typcategory` and `typispreferred` of a built-in type, by oid.
+pub fn category_preferred_of_oid(oid: i64) -> Option<(char, bool)> {
+    let name = crate::pgtypes::type_name_of_oid(oid)?;
+    categories().get(&planner_type(&name)).copied()
+}
+
 /// `pg_type.typcategory` of a built-in type, by oid.
 pub(crate) fn category_of_oid(oid: i64) -> Option<char> {
     let name = crate::pgtypes::name_of_oid(oid)?;
