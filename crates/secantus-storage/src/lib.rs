@@ -4515,6 +4515,9 @@ pub struct Storage {
     coll_locks: Mutex<CollLocks>,
     /// Bounds concurrent engine writes. Disabled unless `write_tickets` is set.
     write_tickets: crate::admission::Tickets,
+    /// The newest log record `log_position` found, where its next scan
+    /// resumes.
+    log_tail: Mutex<Option<(u32, u32)>>,
     /// Namespace-DDL generation: bumped after a committed `drop_collection` /
     /// `drop_database` / `rename_collection` / `drop_index` / `drop_all_indexes`.
     /// Lock-free multi-row readers snapshot it before their scan and re-run the
@@ -6594,6 +6597,7 @@ impl Storage {
                 prune_at: COLL_LOCKS_PRUNE_FLOOR,
             }),
             write_tickets: crate::admission::Tickets::new(opts.write_tickets.unwrap_or(0)),
+            log_tail: Mutex::new(None),
             ddl_generation: AtomicU64::new(0),
             capped_tallies: Mutex::new(HashMap::new()),
             record_ids: Mutex::new(HashMap::new()),
@@ -8964,6 +8968,38 @@ impl Storage {
     /// control is off: nothing waits).
     pub fn writes_waiting(&self) -> usize {
         self.write_tickets.waiting()
+    }
+
+    /// The write-ahead log's position: `(log file number, offset)` of its
+    /// newest record, read through WiredTiger's `log:` cursor -- so it only
+    /// moves forward, and moves when a logged write commits. `None` when the
+    /// log is off. A scan resumes at the record the last one found; one whose
+    /// file the log has since removed starts over at the oldest record.
+    pub fn log_position(&self) -> Result<Option<(u32, u32)>> {
+        let mut tail = self.log_tail.lock().unwrap_or_else(|e| e.into_inner());
+        let session = self.conn.open_session()?;
+        let cursor = match session.open_cursor("log:", None) {
+            Ok(c) => c,
+            Err(e) if e.is_not_supported() || e.is_not_found() => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut last = None;
+        if let Some((file, offset)) = *tail {
+            cursor.set_key_iii(file, offset, 0);
+            if cursor.search().is_ok() {
+                last = Some((file, offset));
+            } else {
+                cursor.reset()?;
+            }
+        }
+        while cursor.next()? {
+            let (file, offset, _) = cursor.get_key_iii()?;
+            last = Some((file, offset));
+        }
+        if last.is_some() {
+            *tail = last;
+        }
+        Ok(*tail)
     }
 
     /// The engine's version string, and the connection's statistics as

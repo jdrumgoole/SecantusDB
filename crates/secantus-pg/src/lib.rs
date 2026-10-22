@@ -39,6 +39,7 @@ mod catalog_meta;
 mod catalog_objects;
 mod catalog_order;
 mod collations;
+mod config_views;
 mod copy_text;
 mod crl;
 mod database_ddl;
@@ -3674,6 +3675,12 @@ pub struct PgHandler {
     /// after a `ReadyForQuery`, cleared when the next one is sent. See
     /// `begin_message_cycle`.
     cycle_open: Arc<AtomicBool>,
+    /// Counts message cycles: the catalog rows `virtual_rows` computed are
+    /// kept for the rest of the cycle that computed them.
+    message_cycle: std::sync::atomic::AtomicU64,
+    /// `virtual_rows`' unfiltered rows per relation, for one message cycle,
+    /// catalog version and settings generation.
+    virtual_cache: Mutex<HashMap<String, CachedRows>>,
     /// A statement in the open group failed: the group rolls back at `Sync`.
     group_failed: AtomicBool,
     /// NOTIFYs of the open transaction, `(channel, payload)` in first-issue
@@ -4053,6 +4060,8 @@ impl PgHandler {
             commit_failed: AtomicBool::new(false),
             implicit_extended: AtomicBool::new(false),
             cycle_open: Arc::new(AtomicBool::new(false)),
+            message_cycle: std::sync::atomic::AtomicU64::new(0),
+            virtual_cache: Mutex::new(HashMap::new()),
             group_failed: AtomicBool::new(false),
             pending_notifies: Mutex::new(Vec::new()),
             pending_listens: Mutex::new(Vec::new()),
@@ -5952,20 +5961,25 @@ impl PgHandler {
         let in_sets = secantus_core::query::InSets::prepare(&agg.filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         let docs: Vec<Document> = match &agg.series {
-            Some(series) => series
-                .values()
-                .into_iter()
-                .map(|v| {
+            Some(series) => {
+                let mut docs = Vec::new();
+                for (i, v) in series.values().into_iter().enumerate() {
+                    // A cancellation point every so many rows, as PostgreSQL's
+                    // executor checks for interrupts row by row (RP-129).
+                    if i % 65_536 == 65_535 {
+                        self.check_cancel()?;
+                    }
                     let mut d = Document::new();
                     d.insert(series.column.clone(), Bson::Int32(v as i32));
-                    d
-                })
-                .filter(|d| {
-                    agg.filter.is_empty()
-                        || secantus_core::query::matches(d, &agg.filter, &empty, None)
+                    if agg.filter.is_empty()
+                        || secantus_core::query::matches(&d, &agg.filter, &empty, None)
                             .unwrap_or(false)
-                })
-                .collect(),
+                    {
+                        docs.push(d);
+                    }
+                }
+                docs
+            }
             // A virtual table's rows are computed, not read: without
             // this arm `count(*) from pg_type` fell through to storage,
             // found no such collection, and answered 0 -- the right
@@ -8388,6 +8402,7 @@ impl PgHandler {
         let all: Vec<usize> = (0..rrows.len()).collect();
         let mut right_matched = vec![false; rrows.len()];
         let mut stopped = false;
+        let mut pairs = 0usize;
         left(&mut |lrows: Vec<Document>| {
             if stopped {
                 return Ok(false);
@@ -8414,6 +8429,11 @@ impl PgHandler {
                 };
                 let mut matched = false;
                 for i in candidates {
+                    // A cancellation point every so many pairs (RP-129).
+                    pairs += 1;
+                    if pairs.is_multiple_of(65_536) {
+                        self.check_cancel()?;
+                    }
                     let d = combine(Some(l), Some(&rrows[i]));
                     if passes(&d)? {
                         matched = true;
@@ -8753,6 +8773,7 @@ impl PgHandler {
             .map(|(_, r_on)| crate::stream_join::NarrowIndex::new(&right_rows, r_on));
         let join_batch = |lefts: Vec<Document>| -> PgWireResult<Vec<Document>> {
             let mut out = Vec::new();
+            let mut pairs = 0usize;
             for l in &lefts {
                 if !left_preds.iter().all(|keep| keep(l)) {
                     continue;
@@ -8775,6 +8796,11 @@ impl PgHandler {
                     matches.into_iter().map(Some).collect()
                 };
                 for r in rights {
+                    // A cancellation point every so many pairs (RP-129).
+                    pairs += 1;
+                    if pairs.is_multiple_of(65_536) {
+                        self.check_cancel()?;
+                    }
                     let mut doc = Document::new();
                     for (i, (_, alias, col)) in join.columns.iter().enumerate() {
                         let out_name = &keys[i];
@@ -15887,6 +15913,94 @@ impl PgHandler {
         Ok(Bson::String(String::new()))
     }
 
+    /// The write-ahead log and relation-file functions, over WiredTiger's
+    /// own (Joe, 2026-10-22): the log's position is WiredTiger's newest log
+    /// record as an LSN -- its log file's number the high half, its offset
+    /// the low -- and a relation's file is the WiredTiger file holding it.
+    fn wal_call(&self, name: &str, args: &[Bson]) -> PgWireResult<Bson> {
+        use secantus_pgplan::systypes::{lsn_bson, lsn_of};
+        let arg = |i: usize| args.get(i).cloned().unwrap_or(Bson::Null);
+        match name {
+            "pg_current_wal_lsn" | "pg_current_wal_insert_lsn" | "pg_current_wal_flush_lsn" => {
+                let (file, offset) = self
+                    .storage
+                    .log_position()
+                    .map_err(|e| Self::storage_err("could not read the log", e))?
+                    .unwrap_or((0, 0));
+                Ok(lsn_bson((u64::from(file) << 32) | u64::from(offset)))
+            }
+            // `XLByteToPrevSeg`: the 16 MB segment holding the byte before the
+            // position, on timeline 1, as `XLogFileName` spells it.
+            "pg_walfile_name" => {
+                let Some(lsn) = lsn_of(&arg(0)) else {
+                    return Ok(Bson::Null);
+                };
+                const SEGMENT: u64 = 16 * 1024 * 1024;
+                const PER_ID: u64 = 0x1_0000_0000 / SEGMENT;
+                let segment = lsn.saturating_sub(1) / SEGMENT;
+                Ok(Bson::String(format!(
+                    "{:08X}{:08X}{:08X}",
+                    1,
+                    segment / PER_ID,
+                    segment % PER_ID
+                )))
+            }
+            "pg_wal_lsn_diff" => match (lsn_of(&arg(0)), lsn_of(&arg(1))) {
+                (Some(a), Some(b)) => Ok(secantus_pgplan::numeric::numeric_bson(
+                    &(i128::from(a) - i128::from(b)).to_string(),
+                )),
+                _ => Ok(Bson::Null),
+            },
+            // The WiredTiger file a relation's rows are in, relative to the
+            // data directory; NULL for one with no storage (a view, a
+            // catalog this server computes).
+            _ => {
+                let oid = match arg(0) {
+                    Bson::Null => return Ok(Bson::Null),
+                    Bson::Int32(i) => i64::from(i),
+                    Bson::Int64(i) => i,
+                    other => match secantus_pgplan::regclass_oid(&other) {
+                        Some(o) => o,
+                        None => {
+                            let n = secantus_pgplan::value_text(&other);
+                            match self.relation_oid(&n) {
+                                Some(o) => o,
+                                None => {
+                                    return Err(Self::user_error(
+                                        "42P01",
+                                        format!("relation \"{n}\" does not exist"),
+                                    ))
+                                }
+                            }
+                        }
+                    },
+                };
+                let Some(rel) = self
+                    .relations()
+                    .into_iter()
+                    .find(|(_, o, _)| *o == oid)
+                    .map(|(n, _, _)| n)
+                else {
+                    return Ok(Bson::Null);
+                };
+                let table =
+                    if let Some(ix) = self.index_relations().into_iter().find(|ix| ix.oid == oid) {
+                        secantus_storage::index_table(&ix.name).to_string()
+                    } else if self.sequence_names().contains(&rel) {
+                        secantus_storage::collection_table(self.db(), SEQUENCE_COLLECTION)
+                    } else if self.lookup(&rel).is_some() && Self::virtual_table(&rel).is_none() {
+                        secantus_storage::collection_table(self.db(), &rel)
+                    } else {
+                        return Ok(Bson::Null);
+                    };
+                Ok(Bson::String(format!(
+                    "{}.wt",
+                    table.strip_prefix("table:").unwrap_or(&table)
+                )))
+            }
+        }
+    }
+
     /// The storage-size functions. Sizes are this store's, not PostgreSQL's
     /// page arithmetic: a relation's rows' encoded bytes rounded up to 8 kB
     /// pages (0 when empty), each index one page per 8 kB of its table.
@@ -17132,7 +17246,87 @@ impl PgHandler {
     }
 
     /// The rows of one virtual table, already filtered.
+    ///
+    /// A catalog relation's rows are computed once per message cycle: a
+    /// correlated subquery over one (pg_dump's `NOT EXISTS (SELECT 1 FROM
+    /// pg_depend WHERE objid = p.oid ...)` for every function) read it
+    /// again for each outer row. The catalog version and the settings
+    /// generation are part of the key, so a change within the cycle -- DDL
+    /// a function ran, a `SET ROLE` -- reads afresh. Relations whose rows
+    /// move with data (sequences, large objects, activity) are not cached.
     fn virtual_rows(&self, name: &str, filter: &Document) -> Option<Vec<Document>> {
+        const CACHED: &[&str] = &[
+            "pg_am",
+            "pg_attrdef",
+            "pg_attribute",
+            "pg_cast",
+            "pg_class",
+            "pg_collation",
+            "pg_constraint",
+            "pg_depend",
+            "pg_description",
+            "pg_extension",
+            "pg_index",
+            "pg_inherits",
+            "pg_init_privs",
+            "pg_language",
+            "pg_namespace",
+            "pg_opclass",
+            "pg_operator",
+            "pg_policy",
+            "pg_proc",
+            "pg_rewrite",
+            "pg_shdepend",
+            "pg_trigger",
+            "pg_type",
+        ];
+        if !CACHED.contains(&name) {
+            return self.virtual_rows_uncached(name, filter);
+        }
+        let key = (
+            self.message_cycle
+                .load(std::sync::atomic::Ordering::Relaxed),
+            catalog_cache()
+                .version
+                .load(std::sync::atomic::Ordering::SeqCst),
+            self.settings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .generation(),
+        );
+        let hit = self
+            .virtual_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .filter(|(c, v, g, _)| (*c, *v, *g) == key)
+            .map(|(_, _, _, rows)| Arc::clone(rows));
+        let rows = match hit {
+            Some(rows) => rows,
+            None => {
+                let rows = Arc::new(self.virtual_rows_uncached(name, &Document::new())?);
+                self.virtual_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(name.to_string(), (key.0, key.1, key.2, Arc::clone(&rows)));
+                rows
+            }
+        };
+        if filter.is_empty() {
+            return Some(rows.as_ref().clone());
+        }
+        let empty = Document::new();
+        let in_sets = secantus_core::query::InSets::prepare(filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
+        Some(
+            rows.iter()
+                .filter(|d| secantus_core::query::matches(d, filter, &empty, None).unwrap_or(false))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    fn virtual_rows_uncached(&self, name: &str, filter: &Document) -> Option<Vec<Document>> {
         let def = Self::virtual_table(name)?;
         let mut rows: Vec<Document> = match name {
             "pg_collation" => {
@@ -25702,6 +25896,9 @@ impl PgHandler {
         if name.starts_with("pg_") && name.ends_with("_size") {
             return self.size_call(name, args);
         }
+        if name.contains("wal") || name == "pg_relation_filepath" {
+            return self.wal_call(name, args);
+        }
         if name.contains("advisory") {
             return self.advisory_call(name, args);
         }
@@ -25902,10 +26099,22 @@ impl PgHandler {
     /// statement is still parsing (`secantus_pgplan::cancel`). The flag is
     /// only looked at there; `check_cancel` takes it.
     fn with_cancel_hook<R>(&self, f: impl FnOnce() -> R) -> R {
+        // A cancel, or the statement's deadline passing: PostgreSQL checks
+        // both at each `CHECK_FOR_INTERRUPTS`, planning included.
         let cancel = || {
-            self.backend
+            if self
+                .backend
                 .cancel
                 .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Some("canceling statement due to user request");
+            }
+            self.backend
+                .deadline
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some_and(|d| std::time::Instant::now() >= d)
+                .then_some("canceling statement due to statement timeout")
         };
         secantus_pgplan::cancel::with_cancel_hook(&cancel, f)
     }
@@ -26591,6 +26800,7 @@ impl PgHandler {
         use std::sync::atomic::Ordering::Relaxed;
         if !self.cycle_open.swap(true, Relaxed) {
             self.backend.cancel.store(false, Relaxed);
+            self.message_cycle.fetch_add(1, Relaxed);
         }
     }
 
@@ -30513,21 +30723,23 @@ impl PgHandler {
                 // Large scalar `$in` / `$nin` lists hashed once for these rows.
                 let in_sets = secantus_core::query::InSets::prepare(&sel.filter);
                 let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
-                let docs = series
-                    .values()
-                    .into_iter()
-                    .map(|v| {
-                        let mut d = Document::new();
-                        d.insert(column.clone(), Bson::Int32(v as i32));
-                        d
-                    })
+                let mut docs = Vec::new();
+                for (i, v) in series.values().into_iter().enumerate() {
+                    // A cancellation point every so many rows, as PostgreSQL's
+                    // executor checks for interrupts row by row (RP-129).
+                    if i % 65_536 == 65_535 {
+                        self.check_cancel()?;
+                    }
+                    let mut d = Document::new();
+                    d.insert(column.clone(), Bson::Int32(v as i32));
                     // The WHERE clause, over the one generated column.
-                    .filter(|d| {
-                        sel.filter.is_empty()
-                            || secantus_core::query::matches(d, &sel.filter, &empty, None)
-                                .unwrap_or(false)
-                    })
-                    .collect();
+                    if sel.filter.is_empty()
+                        || secantus_core::query::matches(&d, &sel.filter, &empty, None)
+                            .unwrap_or(false)
+                    {
+                        docs.push(d);
+                    }
+                }
                 (docs, series_table_def(series))
             }
             (None, _) if Self::virtual_table(&sel.table).is_some() => {
@@ -44865,6 +45077,10 @@ fn copy_field(
         _ => secantus_pgplan::cast_text_to(&text, pg_type, tz).map_err(|e| PgHandler::err(&e))?,
     })
 }
+
+/// `virtual_rows`' cache entry: the message cycle, catalog version and
+/// settings generation it was computed under, and the rows.
+type CachedRows = (u64, u64, u64, Arc<Vec<Document>>);
 
 #[async_trait]
 impl CopyHandler for PgHandler {

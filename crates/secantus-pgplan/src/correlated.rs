@@ -1002,6 +1002,13 @@ pub(crate) const SEQUENCE_FUNCTIONS: &[&str] = &[
     "pg_try_advisory_xact_lock_shared",
     // Who blocks whom lives in the executor's wait-for graph.
     "pg_blocking_pids",
+    // The write-ahead log's position and a relation's file are the store's.
+    "pg_current_wal_lsn",
+    "pg_current_wal_insert_lsn",
+    "pg_current_wal_flush_lsn",
+    "pg_walfile_name",
+    "pg_wal_lsn_diff",
+    "pg_relation_filepath",
     // The role graph lives in the executor's catalog.
     "pg_has_role",
     // Large objects live in the store.
@@ -1045,6 +1052,9 @@ pub fn executor_function_type(name: &str) -> Option<&'static str> {
         "lo_lseek64" | "lo_tell64" => "int8",
         "loread" | "lo_get" => "bytea",
         "lo_put" => "void",
+        "pg_current_wal_lsn" | "pg_current_wal_insert_lsn" | "pg_current_wal_flush_lsn" => "pg_lsn",
+        "pg_walfile_name" | "pg_relation_filepath" => "text",
+        "pg_wal_lsn_diff" => "numeric",
         _ => return None,
     })
 }

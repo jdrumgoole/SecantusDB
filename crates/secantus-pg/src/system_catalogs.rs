@@ -76,6 +76,10 @@ const STATEFUL: &[&str] = &[
     "pg_stat_database_conflicts",
     "pg_stat_recovery_prefetch",
     "pg_shdepend",
+    "pg_hba_file_rules",
+    "pg_ident_file_mappings",
+    "pg_file_settings",
+    "pg_config",
 ];
 
 /// The extensions `CREATE EXTENSION` installs here, with their control files'
@@ -239,6 +243,12 @@ impl PgHandler {
                     .collect()
             }
             "pg_shdepend" => self.shdepend_rows(def),
+            "pg_hba_file_rules" => self.hba_file_rule_rows(def),
+            "pg_ident_file_mappings" => self.ident_file_mapping_rows(def),
+            "pg_config" => self.pg_config_rows(def),
+            // No `postgresql.conf` is read: the settings come from the
+            // command line and the defaults.
+            "pg_file_settings" => Vec::new(),
             // Recovery conflicts arise only on a standby: every database's
             // counts are zero on a primary.
             "pg_stat_database_conflicts" => {

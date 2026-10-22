@@ -33732,6 +33732,19 @@ fn is_time_text(v: &Bson) -> bool {
         })
 }
 
+/// `infinity` / `-infinity` as a stored date or timestamp: `Some(true)` for
+/// the upper, `Some(false)` for the lower.
+pub(crate) fn infinite_datetime(v: &Bson) -> Option<bool> {
+    match v {
+        Bson::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "infinity" | "+infinity" => Some(true),
+            "-infinity" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
     // `pg_trgm`'s operators over two texts.
     if let (Bson::String(a), Bson::String(b)) = (&lhs, &rhs) {
@@ -33750,6 +33763,43 @@ pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
     // NULL propagates through every operator here (PG: `1 + NULL` is NULL).
     if lhs == Bson::Null || rhs == Bson::Null {
         return Ok(Bson::Null);
+    }
+    // An infinite date or timestamp (stored as its text) plus or minus a
+    // finite interval or day count is itself, as PostgreSQL's extreme values
+    // are (`timestamp_pl_interval`, `date_pli`) -- RP-060.
+    if matches!(op, "+" | "-") {
+        let finite_offset = |v: &Bson| {
+            Interval::from_bson(v).is_some() || matches!(v, Bson::Int32(_) | Bson::Int64(_))
+        };
+        if infinite_datetime(&lhs).is_some() && finite_offset(&rhs) {
+            return Ok(lhs);
+        }
+        if op == "+" && infinite_datetime(&rhs).is_some() && finite_offset(&lhs) {
+            return Ok(rhs);
+        }
+        // One date or timestamp less another, either infinite: 22008.
+        let datetime = |v: &Bson| {
+            infinite_datetime(v).is_some()
+                || matches!(v, Bson::DateTime(_))
+                || matches!(v, Bson::Document(d) if d.contains_key(COMPOSITE_DATE))
+                || matches!(v, Bson::String(s) if parse_date(s).is_ok())
+        };
+        if op == "-"
+            && (infinite_datetime(&lhs).is_some() || infinite_datetime(&rhs).is_some())
+            && datetime(&lhs)
+            && datetime(&rhs)
+        {
+            let dates = [&lhs, &rhs]
+                .iter()
+                .any(|v| matches!(v, Bson::String(s) if infinite_datetime(v).is_none() && parse_date(s).is_ok()));
+            return Err(Error::Sqlstate(
+                "22008",
+                format!(
+                    "cannot subtract infinite {}",
+                    if dates { "dates" } else { "timestamps" }
+                ),
+            ));
+        }
     }
     // box operators (`geo_ops.c`): equality and ordering compare AREAS within
     // EPSILON, `~=` compares corners, the rest are positional.
@@ -39148,9 +39198,50 @@ fn coerce_to_column(def: &TableDef, field: &str, value: Bson) -> Result<Bson> {
 /// stored `10:00:00.123456`, whose millisecond part is equal, and `t =
 /// '...123456'` compares a value carrying the remainder. So each operator
 /// compares the millisecond part and, where that is equal, the remainder.
-/// `None` for a value that is not an instant (`infinity`, say), which keeps
-/// the plain comparison.
+/// `infinity` / `-infinity` are stored as their text, and PostgreSQL orders
+/// them above and below every instant (its `DT_NOEND` / `DT_NOBEGIN` are the
+/// type's extreme values): a range over an instant also takes the infinity on
+/// its side, and one over an infinity matches by that order (RP-060). `None`
+/// for any other value, which keeps the plain comparison.
 fn timestamp_filter(field: &str, op: &str, value: &Bson) -> Option<Document> {
+    if let Bson::String(s) = value {
+        return infinite_timestamp_filter(field, op, s);
+    }
+    let finite = finite_timestamp_filter(field, op, value)?;
+    let beyond = match op {
+        "$gt" | "$gte" => "infinity",
+        "$lt" | "$lte" => "-infinity",
+        _ => return Some(finite),
+    };
+    Some(doc! { "$or": [finite, { field: beyond }] })
+}
+
+/// A comparison with `infinity` / `-infinity` itself, by PostgreSQL's order.
+fn infinite_timestamp_filter(field: &str, op: &str, value: &str) -> Option<Document> {
+    let infinity = match value.trim().to_ascii_lowercase().as_str() {
+        "infinity" | "+infinity" => "infinity",
+        "-infinity" => "-infinity",
+        _ => return None,
+    };
+    let is = || doc! { field: infinity };
+    let any = || doc! { field: { "$ne": Bson::Null } };
+    let not_it = || doc! { "$and": [any(), { field: { "$ne": infinity } }] };
+    // Is every other value on this side of it?
+    let top = infinity == "infinity";
+    Some(match (op, top) {
+        ("$eq", _) => is(),
+        ("$ne", _) => not_it(),
+        ("$gt", true) | ("$lt", false) => match_nothing(),
+        ("$gte", true) | ("$lte", false) => is(),
+        ("$lt", true) | ("$gt", false) => not_it(),
+        ("$lte", true) | ("$gte", false) => any(),
+        _ => return None,
+    })
+}
+
+/// `timestamp_filter` for an instant: the millisecond part, then the
+/// remainder.
+fn finite_timestamp_filter(field: &str, op: &str, value: &Bson) -> Option<Document> {
     let (date, us) = match value {
         Bson::DateTime(_) => (value.clone(), 0),
         Bson::Document(d) => match (d.get(COMPOSITE_DATE), d.get(COMPOSITE_US)) {

@@ -703,23 +703,6 @@ Not filed:
   questions.
 - The slow 1M-row block cursor needs a release-build measurement first.
 
-- [ ] **`infinity` / `-infinity` dates and timestamps are stored as strings,
-      and comparisons drop rows.** `secantus-pg` writes them as
-      `Bson::String("infinity")` beside BSON dates. Rows `infinity`,
-      `2021-01-01` and `-infinity` give the following:
-      - `where t > '2020-01-01'` returns {2} where PostgreSQL 15.19
-        returns {1, 2}.
-      - With an index on `t`, `t between '-infinity' and 'infinity'`
-        returns {1, 3} and drops the FINITE row; PostgreSQL returns all
-        three.
-      - `t + interval '1 day'` and `d + 1` are 42883 on an infinite
-        value; PostgreSQL answers `infinity` / `-infinity`.
-
-      A silent wrong answer. PostgreSQL stores them as the extreme values
-      of the type (`DT_NOBEGIN` / `DT_NOEND`), which sort below and above
-      every finite value.
-      Backlog-ID: RP-060
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_infinite_timestamps
 - [ ] **SERIALIZABLE is snapshot isolation: write skew commits.** Two
       SERIALIZABLE transactions each read both on-call rows and set their
       own to false; both commit here, leaving nobody on call. PostgreSQL
@@ -815,14 +798,6 @@ cluster.
       phases this server's build has.
       Backlog-ID: RP-100
       Verify: tests/backlog/test_rp_batch26.py::test_scenario[progress views]
-- [ ] **The configuration-file views are refused by name** (0A000):
-      `pg_hba_file_rules` and `pg_ident_file_mappings` (the server reads a
-      `pg_hba.conf` / `pg_ident.conf` when given one, but keeps only their
-      meaning, not the raw tokens these views report), `pg_config` (no
-      PostgreSQL installation stands behind it) and `pg_file_settings` (no
-      `postgresql.conf`).
-      Backlog-ID: RP-101
-      Verify: tests/backlog/test_rp_batch26.py::test_scenario[configuration-file views]
 - [ ] **`pg_depend` misses a constant's type and a range's functions.**
       Every object's dependencies are recorded as PostgreSQL 15.19 records
       them (`crates/secantus-pg/src/depend.rs`), except: the type of a
@@ -833,11 +808,6 @@ cluster.
       classes and extension membership (`e`) are not recorded either.
       Backlog-ID: RP-105
       Verify: tests/backlog/test_rp_batch26.py::test_scenario[dependencies on a constant's type and a range's functions]
-- [ ] **The WAL and file-location functions are refused** (0A000):
-      `pg_current_wal_lsn()` and `pg_relation_filepath()`. This server writes
-      no PostgreSQL WAL and keeps no PostgreSQL relation files.
-      Backlog-ID: RP-112
-      Verify: tests/backlog/test_rp_batch26.py::test_scenario[WAL and file functions]
 
 ## Found by batch 28 (2026-10-22)
 
@@ -854,18 +824,6 @@ tests are scenarios in `tests/backlog/test_rp_batch26.py`.
       from planning the view.
       Backlog-ID: RP-117
       Verify: tests/backlog/test_rp_batch26.py::test_scenario[a view's row type is a type]
-- [ ] **`statement_timeout` ends a long statement seconds late.** A 1 s
-      timeout on `count(*)` over a 50-million-row `generate_series` answers
-      57014 after 14.6 s (release build), on a 36-million-pair nested-loop
-      join after 10.5 s; PostgreSQL 15.19 answers at 1.0 s. The planner's
-      cancellation hook reads only the backend's cancel flag, not the
-      statement's deadline, so work done while planning (a FROM function's
-      rows are produced then) and the joins between cancellation points
-      never see it. The fix is a deadline the planner's hook can read, with
-      the planner's 57014 then saying `statement timeout` rather than `user
-      request`.
-      Backlog-ID: RP-129
-      Verify: tests/backlog/test_rp_batch26.py::test_statement_timeout_is_prompt
 - [ ] **The `information_schema` views over every built-in function take
       seconds** (release build, a fresh database): `routines` 3.6 s,
       `parameters` 2.5 s, `data_type_privileges` 6.4 s, `element_types` 52 s,

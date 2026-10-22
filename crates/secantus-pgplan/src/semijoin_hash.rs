@@ -584,6 +584,9 @@ enum Entry {
     /// The shape does not qualify, or a value could not be hashed.
     No,
     Built(Index),
+    /// No row survives the conjuncts that do not read the outer row, so none
+    /// does for any outer value (`empty_probe`).
+    Empty,
 }
 
 thread_local! {
@@ -701,8 +704,10 @@ pub(crate) fn lookup(sql: &str, params: &[Bson], run: Runner) -> Result<Option<V
     }
     CACHE.with(|c| {
         let cache = c.borrow();
-        let Some(Entry::Built(ix)) = cache.as_ref().and_then(|m| m.get(sql)) else {
-            return Ok(None);
+        let ix = match cache.as_ref().and_then(|m| m.get(sql)) {
+            Some(Entry::Built(ix)) => ix,
+            Some(Entry::Empty) => return Ok(Some(Vec::new())),
+            _ => return Ok(None),
         };
         let mut key = Vec::with_capacity(ix.params.len());
         for (i, &p) in ix.params.iter().enumerate() {
@@ -802,7 +807,14 @@ fn build(sql: &str, run: Runner) -> Result<Entry> {
         offset,
     }) = rewrite(sql)
     else {
-        return Ok(Entry::No);
+        // A correlation the index cannot key on (`p.oid = t.a OR p.oid =
+        // t.b`, which pg_dump asks of pg_cast and pg_transform for every
+        // function) still costs one run when the rest of the WHERE admits
+        // no row at all.
+        return Ok(match empty_probe(sql) {
+            Some(probe) if matches!(run(&probe, &[]), Ok(rows) if rows.is_empty()) => Entry::Empty,
+            _ => Entry::No,
+        });
     };
     // Run once, the select list is evaluated over EVERY row -- also rows
     // no outer value reaches, where PostgreSQL never evaluates it. A data
@@ -1249,6 +1261,72 @@ fn rewrite(sql: &str) -> Option<Rewritten> {
         limit,
         offset,
     })
+}
+
+/// `sql` with every top-level WHERE conjunct that reads the outer row
+/// (a `$N`) dropped, and `LIMIT 1`: a superset of the rows any outer value
+/// gives, so none here means none for every one. Only for a plain filter of
+/// its FROM -- no aggregate (which answers a row over no rows), grouping,
+/// set operation, CTE, or outer reference outside the WHERE.
+fn empty_probe(sql: &str) -> Option<String> {
+    let mut parsed = pg_query::parse(sql).ok()?.protobuf;
+    if parsed.stmts.len() != 1 {
+        return None;
+    }
+    let stmt = parsed.stmts[0].stmt.as_mut()?;
+    let Some(N::SelectStmt(s)) = stmt.node.as_mut() else {
+        return None;
+    };
+    if s.op != pg_query::protobuf::SetOperation::SetopNone as i32
+        || !s.group_clause.is_empty()
+        || s.having_clause.is_some()
+        || s.with_clause.is_some()
+        || !s.values_lists.is_empty()
+        || s.into_clause.is_some()
+        || s.from_clause.is_empty()
+        || s.target_list
+            .iter()
+            .any(|t| contains(t, &is_groupable_aggregate))
+        // Over several relations the probe is their cross product, which the
+        // per-row path's keys keep small (RP-077).
+        || s.from_clause.iter().map(relation_count).sum::<usize>() > 1
+    {
+        return None;
+    }
+    let outer = |n: &N| matches!(n, N::ParamRef(_));
+    if s.target_list.iter().any(|t| contains(t, &outer))
+        || s.from_clause.iter().any(|f| contains(f, &outer))
+        || s.sort_clause.iter().any(|f| contains(f, &outer))
+    {
+        return None;
+    }
+    let where_clause = s.where_clause.take()?;
+    let mut conjuncts = Vec::new();
+    split_and(*where_clause, &mut conjuncts);
+    let keep: Vec<_> = conjuncts
+        .into_iter()
+        .filter(|c| !contains(c, &outer))
+        .collect();
+    // What is run once must answer as it would per row: no volatile call.
+    let volatile = |n: &N| matches!(n, N::FuncCall(_)) && !immutable_call(n);
+    if keep.iter().any(|c| contains(c, &volatile))
+        || s.target_list.iter().any(|t| contains(t, &volatile))
+    {
+        return None;
+    }
+    s.where_clause = and_of(keep).map(Box::new);
+    s.sort_clause.clear();
+    s.limit_offset = None;
+    s.limit_option = pg_query::protobuf::LimitOption::Count as i32;
+    s.limit_count = Some(Box::new(pg_query::protobuf::Node {
+        node: Some(N::AConst(pg_query::protobuf::AConst {
+            val: Some(pg_query::protobuf::a_const::Val::Ival(
+                pg_query::protobuf::Integer { ival: 1 },
+            )),
+            ..Default::default()
+        })),
+    }));
+    pg_query::deparse(&parsed).ok()
 }
 
 /// `SELECT pg_collation_for(col) FROM <s's FROM> LIMIT 1`: the collation a

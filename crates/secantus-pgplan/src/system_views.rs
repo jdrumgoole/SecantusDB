@@ -131,19 +131,6 @@ const REFUSED: &[(&str, &str)] = &[
         "pg_stat_progress_vacuum",
         "commands do not report their progress on this server",
     ),
-    // No PostgreSQL installation or configuration file stands behind it.
-    ("pg_config", "this server is not a PostgreSQL installation"),
-    ("pg_file_settings", "this server reads no postgresql.conf"),
-    // Its pg_hba.conf decides logins, but the lines' raw tokens, which these
-    // report, are not kept.
-    (
-        "pg_hba_file_rules",
-        "this server does not report its pg_hba.conf lines",
-    ),
-    (
-        "pg_ident_file_mappings",
-        "this server does not report its pg_ident.conf lines",
-    ),
 ];
 
 /// 0A000 for a system relation refused by name.

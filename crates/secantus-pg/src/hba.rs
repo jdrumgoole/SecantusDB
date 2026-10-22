@@ -274,6 +274,9 @@ impl Address {
 pub(crate) struct HbaPolicy {
     pub hba: Hba,
     maps: HashMap<String, UserMap>,
+    /// The files it was read from, which `pg_hba_file_rules` and
+    /// `pg_ident_file_mappings` read again, as PostgreSQL's do.
+    pub files: HbaFiles,
 }
 
 /// Where a policy is read from.
@@ -313,7 +316,11 @@ impl HbaPolicy {
                 maps.insert(map.to_string(), crate::ident::read(ident_file, map)?);
             }
         }
-        Ok(HbaPolicy { hba, maps })
+        Ok(HbaPolicy {
+            hba,
+            maps,
+            files: files.clone(),
+        })
     }
 
     /// The user name map a line names.
@@ -399,7 +406,15 @@ fn fields(line: &str, dir: Option<&Path>, depth: usize) -> Result<Vec<Vec<Token>
             Some(_) => {}
         }
         let mut field: Vec<Token> = Vec::new();
+        let mut after_comma = false;
         loop {
+            // A list goes on past blanks after its comma (`all, test`), as
+            // PostgreSQL's `next_token` skips them before the next token.
+            if after_comma {
+                while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                    chars.next();
+                }
+            }
             let mut text = String::new();
             let mut quoted = false;
             let mut was_quoted = false;
@@ -446,11 +461,35 @@ fn fields(line: &str, dir: Option<&Path>, depth: usize) -> Result<Vec<Vec<Token>
             if !more {
                 break;
             }
+            after_comma = true;
         }
         if !field.is_empty() {
             out.push(field);
         }
     }
+}
+
+/// The hba file's lines as `pg_hba_file_rules` shows them: each line's
+/// number and fields, each field its tokens' text -- the tokenizer the
+/// policy is read with, so the view and the logins read the file alike.
+pub(crate) fn file_lines(path: &Path) -> Vec<(usize, Vec<Vec<String>>)> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    logical_lines(&text)
+        .into_iter()
+        .filter_map(|(number, line)| {
+            let fs = fields(&line, path.parent(), 0).ok()?;
+            (!fs.is_empty()).then(|| {
+                (
+                    number,
+                    fs.into_iter()
+                        .map(|f| f.into_iter().map(|t| t.text).collect())
+                        .collect(),
+                )
+            })
+        })
+        .collect()
 }
 
 /// The tokens of an `@file`: every token of every line, comments dropped.
@@ -826,6 +865,22 @@ local       all        all                                    trust
 host        \"all\"      \"+odd\"      ::1/128                    trust
 hostssl     all        mapped      all            cert  map=m clientname=DN
 ";
+
+    /// RP-132: a list goes on past blanks after its comma (`all,  test`),
+    /// as PostgreSQL 15.19 reads it; the space ended the field, and the
+    /// address was then taken for the method.
+    #[test]
+    fn a_list_continues_past_blanks_after_its_comma() {
+        let hba = Hba::parse("host    all,  test   alice,   bob   127.0.0.1/32   trust\n")
+            .expect("PostgreSQL reads this line");
+        for (user, database) in [("alice", "test"), ("bob", "postgres")] {
+            assert!(
+                decide(&hba, false, user, database).is_some(),
+                "{user} {database}"
+            );
+        }
+        assert!(decide(&hba, false, "carol", "test").is_none());
+    }
 
     fn decide<'a>(hba: &'a Hba, tls: bool, user: &str, database: &str) -> Option<&'a Rule> {
         decide_from(hba, tls, user, database, "127.0.0.1")
