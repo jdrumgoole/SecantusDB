@@ -21,7 +21,7 @@ import os
 import sys
 
 import pymongo
-from bson import SON, Decimal128, Int64, Regex, json_util
+from bson import SON, Binary, Decimal128, Int64, Regex, json_util
 
 MONGOD = os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27041/?directConnection=true")
 SERVER = os.environ.get("PROBE_SERVER")
@@ -163,6 +163,303 @@ CASES = [
         js(a={"properties": {"b": {}}, "required": ["b"]}),
         [{"_id": 1, "a": {"c": 1}}],
     ),
+    # --- shapes the first cases left unexecuted (2026-10-22) -------------------
+    # $jsonSchema: paths, numbers and equality as the matcher reads them
+    ("dotted-property", js(**{"a.b": {"bsonType": "int"}}), [{"_id": 1, "a": {"b": "x"}}]),
+    (
+        "dotted-property-array",
+        js(**{"a.b": {"minimum": 5}}),
+        [{"_id": 1, "a": [{"b": 1}, {"b": 2}]}, {"_id": 2, "a": [{"b": 1}, {"b": 9}, {"b": "x"}]}],
+    ),
+    ("dotted-required", {"$jsonSchema": {"required": ["a.b"]}}, [{"_id": 1, "a": {"c": 1}}]),
+    ("literal-dotted-field", {"$jsonSchema": {"required": ["a.b"]}}, [{"_id": 1, "a.b": 1}]),
+    ("multipleOf-decimal-rule", js(a={"multipleOf": 0.1}), [{"_id": 1, "a": 0.35}]),
+    (
+        "multipleOf-passes-fails-other",
+        js(a={"multipleOf": 0.1, "maximum": 0}),
+        [{"_id": 1, "a": 0.3}],
+    ),
+    ("multipleOf-decimal-value", js(a={"multipleOf": 2}), [{"_id": 1, "a": Decimal128("3.0")}]),
+    ("multipleOf-nan-value", js(a={"multipleOf": 2}), [{"_id": 1, "a": float("nan")}]),
+    ("minimum-decimal-bound", js(a={"minimum": Decimal128("5.5")}), [{"_id": 1, "a": 5}]),
+    ("minimum-nan-value", js(a={"minimum": 0}), [{"_id": 1, "a": float("nan")}]),
+    ("maximum-nan-bound", js(a={"maximum": float("nan")}), [{"_id": 1, "a": 1}]),
+    (
+        "enum-field-order",
+        js(a={"enum": [{"x": 1, "y": 2}], "bsonType": "string"}),
+        [
+            {"_id": 1, "a": {"y": 2, "x": 1}},
+        ],
+    ),
+    ("enum-document", js(a={"enum": [{"x": 1}]}), [{"_id": 1, "a": {"x": 2}}]),
+    ("enum-array-value", js(a={"enum": [1]}), [{"_id": 1, "a": [1]}]),
+    (
+        "uniqueItems-field-order",
+        js(a={"uniqueItems": True}),
+        [{"_id": 1, "a": [{"x": 1, "y": 2}, {"y": 2, "x": 1}]}],
+    ),
+    (
+        "uniqueItems-cross-type",
+        js(a={"uniqueItems": True}),
+        [{"_id": 1, "a": [1, Int64(1), 2.0, 2]}],
+    ),
+    (
+        "uniqueItems-nan",
+        js(a={"uniqueItems": True}),
+        [{"_id": 1, "a": [float("nan"), Decimal128("NaN")]}],
+    ),
+    ("minLength-non-ascii", js(a={"minLength": 3}), [{"_id": 1, "a": "é\U0001f600"}]),
+    ("pattern-symbol-ignored", js(a={"pattern": "^x", "bsonType": "int"}), [{"_id": 1, "a": "y"}]),
+    ("type-number", js(a={"type": "number"}), [{"_id": 1, "a": "s"}]),
+    ("type-boolean-list", js(a={"type": ["boolean", "null"]}), [{"_id": 1, "a": 1}]),
+    ("bsonType-number-array", js(a={"bsonType": "number"}), [{"_id": 1, "a": [1, 2]}]),
+    ("bsonType-object-for-array", js(a={"bsonType": "object"}), [{"_id": 1, "a": [{"b": 1}]}]),
+    # nesting, combinators, titles
+    (
+        "items-nested-properties",
+        js(a={"items": {"properties": {"x": {"minimum": 2}}, "required": ["x"]}}),
+        [{"_id": 1, "a": [{"x": 3}, {"x": 1}, {"y": 1}]}],
+    ),
+    (
+        "items-two-failing",
+        js(a={"items": {"bsonType": "int"}}),
+        [{"_id": 1, "a": ["x", "y"]}],
+    ),
+    (
+        "items-array-and-additional-schema",
+        js(a={"items": [{"bsonType": "int"}], "additionalItems": {"bsonType": "string"}}),
+        [{"_id": 1, "a": ["x", 1, "ok", 2]}],
+    ),
+    (
+        "items-array-shorter",
+        js(a={"items": [{}, {"bsonType": "int"}]}),
+        [{"_id": 1, "a": [1, "x"]}],
+    ),
+    (
+        "title-description",
+        {
+            "$jsonSchema": {
+                "title": "T",
+                "description": "D",
+                "properties": {"a": {"title": "t", "description": "d", "bsonType": "int"}},
+            }
+        },
+        [{"_id": 1, "a": "x"}],
+    ),
+    (
+        "description-in-items",
+        js(a={"items": {"description": "each", "bsonType": "int"}}),
+        [{"_id": 1, "a": ["x"]}],
+    ),
+    (
+        "allOf-nested-property",
+        js(a={"allOf": [{"bsonType": "int"}, {"minimum": 5}]}),
+        [{"_id": 1, "a": 1}],
+    ),
+    (
+        "anyOf-under-property",
+        js(a={"anyOf": [{"bsonType": "string"}, {"minimum": 5}]}),
+        [{"_id": 1, "a": 1}],
+    ),
+    ("not-under-property", js(a={"not": {"bsonType": "int"}}), [{"_id": 1, "a": 1}]),
+    (
+        "not-top-with-properties",
+        {"$jsonSchema": {"not": {"properties": {"a": {"bsonType": "int"}}}}},
+        [{"_id": 1, "a": 1}],
+    ),
+    (
+        "oneOf-under-property-two",
+        js(a={"oneOf": [{"minimum": 0}, {"maximum": 10}]}),
+        [{"_id": 1, "a": 5}],
+    ),
+    (
+        "nested-additionalProperties-false",
+        js(a={"properties": {"x": {}}, "additionalProperties": False}),
+        [{"_id": 1, "a": {"x": 1, "y": 2, "z": 3}}],
+    ),
+    (
+        "patternProperties-and-additional",
+        {
+            "$jsonSchema": {
+                "properties": {"_id": {}},
+                "patternProperties": {"^x": {"bsonType": "int"}},
+                "additionalProperties": {"bsonType": "string"},
+            }
+        },
+        [{"_id": 1, "xa": "s", "b": 2, "xb": 3}],
+    ),
+    (
+        "patternProperties-two-patterns",
+        {"$jsonSchema": {"patternProperties": {"a": {"bsonType": "int"}, "b": {"minimum": 5}}}},
+        [{"_id": 1, "ab": "x"}],
+    ),
+    (
+        "nested-dependencies",
+        js(a={"dependencies": {"b": ["c"], "d": {"required": ["e"]}}}),
+        [{"_id": 1, "a": {"b": 1, "d": 1}}],
+    ),
+    (
+        "nested-minProperties",
+        js(a={"minProperties": 3, "maxProperties": 0}),
+        [{"_id": 1, "a": {"x": 1}}],
+    ),
+    (
+        "required-and-properties-same",
+        {"$jsonSchema": {"required": ["a"], "properties": {"a": {"bsonType": "int"}}}},
+        [{"_id": 1, "a": "x"}, {"_id": 2}],
+    ),
+    ("top-enum-scalar", {"$jsonSchema": {"enum": [1, 2]}}, [{"_id": 1}]),
+    ("top-type-list", {"$jsonSchema": {"type": ["string", "array"]}}, [{"_id": 1}]),
+    ("top-minimum-ignored", {"$jsonSchema": {"minimum": 5, "required": ["z"]}}, [{"_id": 1}]),
+    ("encrypt-not-bindata", js(a={"encrypt": {}}), [{"_id": 1, "a": 1}]),
+    ("encrypt-wrong-subtype", js(a={"encrypt": {}}), [{"_id": 1, "a": Binary(b"x", 0)}]),
+    (
+        "schema-in-or",
+        {"$or": [{"$jsonSchema": {"required": ["a"]}}, {"b": 1}]},
+        [{"_id": 1, "b": 2}],
+    ),
+    ("schema-in-nor", {"$nor": [{"$jsonSchema": {"required": ["_id"]}}]}, [{"_id": 1}]),
+    # query-operator validators
+    ("q-ne", {"a": {"$ne": 1}}, [{"_id": 1, "a": 1}]),
+    ("q-lte-array", {"a": {"$lte": 0}}, [{"_id": 1, "a": [1, 2]}]),
+    ("q-missing-gt", {"a": {"$gt": 1}}, [{"_id": 1}]),
+    ("q-mod", {"a": {"$mod": [3, 1]}}, [{"_id": 1, "a": 5}]),
+    ("q-bits", {"a": {"$bitsAllSet": 3}}, [{"_id": 1, "a": 4}]),
+    ("q-bits-any-clear", {"a": {"$bitsAnyClear": [0]}}, [{"_id": 1, "a": 1}]),
+    ("q-type-list", {"a": {"$type": ["string", "bool"]}}, [{"_id": 1, "a": 1}]),
+    ("q-exists-false-null", {"a": {"$exists": False}}, [{"_id": 1, "a": None}]),
+    ("q-eq-null-missing", {"a": {"$ne": None}}, [{"_id": 1}]),
+    ("q-in-regex", {"a": {"$in": [Regex("^x"), 1]}}, [{"_id": 1, "a": "y"}]),
+    ("q-nin-array", {"a": {"$nin": [1]}}, [{"_id": 1, "a": [2, 1]}]),
+    ("q-all-elemMatch", {"a": {"$all": [{"$elemMatch": {"b": 1}}]}}, [{"_id": 1, "a": [{"b": 2}]}]),
+    ("q-elemMatch-object", {"a": {"$elemMatch": {"b": 1, "c": 2}}}, [{"_id": 1, "a": [{"b": 1}]}]),
+    ("q-size-not-array", {"a": {"$size": 0}}, [{"_id": 1, "a": 5}]),
+    ("q-not-regex", {"a": {"$not": Regex("^x")}}, [{"_id": 1, "a": "xy"}]),
+    ("q-not-two-ops", {"a": {"$not": {"$gt": 1, "$lt": 9}}}, [{"_id": 1, "a": 5}]),
+    ("q-nor-two", {"$nor": [{"a": 1}, {"b": 1}]}, [{"_id": 1, "a": 1, "b": 1}]),
+    ("q-or-nested-and", {"$or": [{"$and": [{"a": 1}, {"b": 1}]}, {"c": 1}]}, [{"_id": 1, "a": 1}]),
+    ("q-and-three", {"$and": [{"a": 1}, {"b": 1}, {"c": 1}]}, [{"_id": 1, "a": 2, "c": 1}]),
+    (
+        "q-expr-and",
+        {"$expr": {"$and": [{"$gt": ["$a", 1]}, {"$lt": ["$a", 0]}]}},
+        [{"_id": 1, "a": 5}],
+    ),
+    (
+        "q-expr-with-field",
+        SON([("$expr", {"$eq": ["$a", 2]}), ("b", 1)]),
+        [{"_id": 1, "a": 1, "b": 2}],
+    ),
+    ("q-dotted-array", {"a.b": {"$gt": 5}}, [{"_id": 1, "a": [{"b": 1}, {"b": 2}]}]),
+    ("q-dotted-index", {"a.0": {"$gt": 5}}, [{"_id": 1, "a": [1, 2]}]),
+    ("q-alwaysFalse", {"$alwaysFalse": 1}, [{"_id": 1}]),
+    ("q-eq-document", {"a": {"b": 1}}, [{"_id": 1, "a": {"b": 2}}]),
+    ("q-eq-regex-field", {"a": {"$eq": Regex("x")}}, [{"_id": 1, "a": "x"}]),
+    ("q-geoWithin", {"a": {"$geoWithin": {"$box": [[0, 0], [1, 1]]}}}, [{"_id": 1, "a": [5, 5]}]),
+    ("q-comment", {"a": 1, "$comment": "c"}, [{"_id": 1, "a": 2}]),
+    # where a sub-schema's title / description surface
+    (
+        "title-in-allOf",
+        js(a={"allOf": [{"title": "A0", "bsonType": "int"}, {"description": "A1", "minimum": 5}]}),
+        [{"_id": 1, "a": "x"}],
+    ),
+    (
+        "title-in-anyOf",
+        js(a={"anyOf": [{"title": "B0", "bsonType": "int"}]}),
+        [{"_id": 1, "a": "x"}],
+    ),
+    (
+        "title-in-oneOf",
+        js(
+            a={"oneOf": [{"title": "C0", "bsonType": "int"}, {"bsonType": "string", "title": "C1"}]}
+        ),
+        [{"_id": 1, "a": 1.5}, {"_id": 2, "a": "s"}],
+    ),
+    ("title-in-not", js(a={"not": {"title": "N", "bsonType": "int"}}), [{"_id": 1, "a": 1}]),
+    (
+        "title-in-tuple-items",
+        js(a={"items": [{"title": "T0", "bsonType": "int"}]}),
+        [{"_id": 1, "a": ["x"]}],
+    ),
+    (
+        "title-in-additionalItems",
+        js(a={"items": [{}], "additionalItems": {"title": "AI", "bsonType": "int"}}),
+        [{"_id": 1, "a": [1, "x"]}],
+    ),
+    (
+        "title-in-additionalProperties",
+        {"$jsonSchema": {"additionalProperties": {"title": "AP", "bsonType": "int"}}},
+        [{"_id": 1, "b": "x"}],
+    ),
+    (
+        "title-in-patternProperties",
+        {"$jsonSchema": {"patternProperties": {"^b": {"title": "PP", "bsonType": "int"}}}},
+        [{"_id": 1, "b": "x"}],
+    ),
+    (
+        "title-in-dependencies",
+        {"$jsonSchema": {"dependencies": {"a": {"title": "D", "required": ["z"]}}}},
+        [{"_id": 1, "a": 1}],
+    ),
+    (
+        "title-nested-properties",
+        js(a={"title": "outer", "properties": {"b": {"title": "inner", "bsonType": "int"}}}),
+        [{"_id": 1, "a": {"b": "x"}}],
+    ),
+    ("title-only-top", {"$jsonSchema": {"title": "T", "required": ["z"]}}, [{"_id": 1}]),
+    # array operators over a non-array, and constant predicates
+    ("q-all-not-array", {"a": {"$all": [1]}}, [{"_id": 1, "a": 2}]),
+    ("q-elemMatch-not-array", {"a": {"$elemMatch": {"$gt": 1}}}, [{"_id": 1, "a": 5}]),
+    ("q-size-missing", {"a": {"$size": 1}}, [{"_id": 1}]),
+    ("q-alwaysFalse-in-or", {"$or": [{"$alwaysFalse": 1}, {"a": 1}]}, [{"_id": 1, "a": 2}]),
+    ("q-alwaysTrue-in-nor", {"$nor": [{"$alwaysTrue": 1}]}, [{"_id": 1}]),
+    (
+        "q-geoIntersects",
+        {"a": {"$geoIntersects": {"$geometry": {"type": "Point", "coordinates": [0, 0]}}}},
+        [{"_id": 1, "a": {"type": "Point", "coordinates": [5, 5]}}],
+    ),
+    (
+        "q-geoWithin-not-geo",
+        {"a": {"$geoWithin": {"$box": [[0, 0], [1, 1]]}}},
+        [{"_id": 1, "a": "x"}],
+    ),
+    (
+        "q-not-geoWithin",
+        {"a": {"$not": {"$geoWithin": {"$box": [[0, 0], [9, 9]]}}}},
+        [{"_id": 1, "a": [5, 5]}],
+    ),
+    ("q-dotted-index-missing", {"a.5": {"$gt": 5}}, [{"_id": 1, "a": [1, 2]}]),
+    ("q-dotted-index-docs", {"a.0.b": {"$gt": 5}}, [{"_id": 1, "a": [{"b": 1}, {"b": 2}]}]),
+    ("q-dotted-numeric-field", {"a.0": {"$gt": 5}}, [{"_id": 1, "a": [{"0": 1}, 2]}]),
+    (
+        "schema-in-not-elem",
+        {"$nor": [{"$jsonSchema": {"properties": {"a": {"bsonType": "int"}}}}]},
+        [{"_id": 1, "a": 1}],
+    ),
+    (
+        "q-dotted-first-element-missing",
+        {"a.b": {"$gt": 5}},
+        [{"_id": 1, "a": [{"c": 1}, {"b": 2}]}],
+    ),
+    ("q-dotted-scalar-element", {"a.b": {"$gt": 5}}, [{"_id": 1, "a": [3, {"b": 2}]}]),
+    ("q-dotted-empty-array", {"a.b": {"$gt": 5}}, [{"_id": 1, "a": {"b": []}}]),
+    ("q-alwaysTrue-satisfied", {"$and": [{"a": 1}, {"$alwaysTrue": 1}]}, [{"_id": 1, "a": 2}]),
+    ("q-bits-string", {"a": {"$bitsAllSet": 1}}, [{"_id": 1, "a": "x"}]),
+    ("q-mod-string", {"a": {"$mod": [2, 0]}}, [{"_id": 1, "a": "x"}]),
+    ("q-regex-number", {"a": {"$regex": "x"}}, [{"_id": 1, "a": 5}]),
+    ("q-regex-mixed-array", {"a": {"$regex": "x"}}, [{"_id": 1, "a": [5, "y"]}]),
+    ("encrypt-with-bsonType", js(a={"encrypt": {"bsonType": "string"}}), [{"_id": 1, "a": 5}]),
+    (
+        "additionalProperties-false-and-pattern",
+        {
+            "$jsonSchema": {
+                "properties": {"_id": {}},
+                "patternProperties": {"^x": {"bsonType": "int"}},
+                "additionalProperties": False,
+            }
+        },
+        [{"_id": 1, "xa": "s", "b": 2}],
+    ),
+    ("q-many-ops-one-field", {"a": {"$gt": 1, "$type": "int", "$ne": 5}}, [{"_id": 1, "a": 5}]),
 ]
 
 

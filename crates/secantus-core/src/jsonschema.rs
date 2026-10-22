@@ -1338,6 +1338,23 @@ fn push_unordered_key(v: &Bson, out: &mut Vec<u8>) -> Result<(), Fallback> {
     Ok(())
 }
 
+/// Whether `enum` / `uniqueItems` call two values equal.
+pub(crate) fn values_equal(a: &Bson, b: &Bson) -> bool {
+    matches!((unordered_key(a), unordered_key(b)), (Ok(x), Ok(y)) if x == y)
+}
+
+/// Whether `value` is a multiple of `divisor` as `multipleOf` computes it: in
+/// Decimal128, a double converted at 15 significant digits.
+pub(crate) fn multiple_of(value: &Bson, divisor: &Bson) -> bool {
+    if !is_number(value) || !is_number(divisor) {
+        return false;
+    }
+    match (decimal::from_bson(value), decimal::from_bson(divisor)) {
+        (Some(v), Some(d @ Dec::Fin { .. })) => decimal::rem(&v, &d).is_some_and(|r| r.is_zero()),
+        _ => false,
+    }
+}
+
 /// The document an `ExpressionWithPlaceholder` is matched against.
 fn placeholder_doc(v: &Bson) -> Document {
     let mut d = Document::new();

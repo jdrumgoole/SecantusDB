@@ -1857,6 +1857,17 @@ pub fn bson_type_name(v: &Bson) -> &'static str {
     }
 }
 
+/// Whether `$jsonSchema`'s `enum` and `uniqueItems` call two values equal:
+/// numbers by value across types, documents whatever their field order.
+pub fn json_schema_values_equal(a: &Bson, b: &Bson) -> bool {
+    crate::jsonschema::values_equal(a, b)
+}
+
+/// Whether `value` satisfies `multipleOf: divisor` (computed in Decimal128).
+pub fn json_schema_multiple_of(value: &Bson, divisor: &Bson) -> bool {
+    crate::jsonschema::multiple_of(value, divisor)
+}
+
 /// mongod's refusal of a malformed `$jsonSchema`, as `(code, codeName,
 /// errmsg)`, or `None` for one it accepts. mongod translates the schema when it
 /// parses the filter, so the command layer asks this up front: a bad schema is

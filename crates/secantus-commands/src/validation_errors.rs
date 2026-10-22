@@ -12,23 +12,57 @@
 //! which builds one AND of: the scalar keywords (`pattern`, `maxLength`,
 //! `minLength`, `multipleOf`, `maximum`, `minimum`), the array keywords
 //! (`minItems`, `maxItems`, `uniqueItems`, `items`, `additionalItems`), the
-//! object keywords (`properties`, `patternProperties` / `additionalProperties`,
+//! object keywords (`properties`, `additionalProperties` / `patternProperties`,
 //! `required`, `minProperties`, `maxProperties`, `dependencies`), the logical
 //! ones (`allOf`, `anyOf`, `oneOf`, `not`, `enum`), and -- below the top level
 //! -- the type restriction LAST. Every scalar / array / object keyword is a
 //! restriction on its own type: it cannot fail for a value of another type.
 //!
 //! Which document FAILS is still decided by the matcher; this module only
-//! explains a failure already established. `tools/probes/
+//! explains a failure already established, and asks the matcher's own rules
+//! (`secantus_core::query::json_schema_*`) whether a keyword holds, so the two
+//! cannot disagree about `multipleOf` or equality. `tools/probes/
 //! validation_error_details.py` compares the output with mongod exactly.
 
 use bson::{doc, Bson, Document};
 use secantus_core::query::bson_type_name;
 
-/// The explanation for `doc` failing `validator`.
-pub(crate) fn explain(validator: &Document, doc: &Document) -> Document {
+/// The explanation for `doc` failing `validator`, or -- like mongod's
+/// generator, which needs an annotation on every node it visits -- the
+/// message it gives up with.
+pub(crate) fn explain(validator: &Document, doc: &Document) -> Result<Document, String> {
+    if let Some(expr) = unannotated(validator) {
+        return Err(format!(
+            "Cannot generate validation error details: no annotation found for expression {expr}"
+        ));
+    }
     let node = parse_filter(validator);
-    explain_node(&node, doc, false).unwrap_or_else(|| doc! {"operatorName": "validator"})
+    Ok(explain_node(&node, doc, false).unwrap_or_else(|| doc! {"operatorName": "validator"}))
+}
+
+/// The first clause, in the generator's walk, that the validator parser
+/// leaves without an error annotation: `$alwaysTrue` / `$alwaysFalse`
+/// (measured 8.2.11, 2026-10-22).
+fn unannotated(filter: &Document) -> Option<String> {
+    for (key, value) in filter {
+        match key.as_str() {
+            "$alwaysTrue" | "$alwaysFalse" => {
+                return Some(format!(
+                    "{{ {key}: {} }}",
+                    secantus_core::query::bson_value_repr(value)
+                ))
+            }
+            "$and" | "$or" | "$nor" => {
+                for sub in value.as_array().into_iter().flatten() {
+                    if let Some(found) = sub.as_document().and_then(unannotated) {
+                        return Some(found);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 // --- query-operator validators ----------------------------------------------
@@ -237,6 +271,9 @@ fn explain_node(node: &Node, doc: &Document, inverted: bool) -> Option<Document>
                 "expressionResult": result,
             }
         }
+        Node::JsonSchema(_) if inverted => {
+            doc! {"operatorName": "$jsonSchema", "reason": "schema matched"}
+        }
         Node::JsonSchema(schema) => explain_json_schema(schema, doc),
     })
 }
@@ -281,6 +318,15 @@ fn leaf_reasons(op: &str) -> (&'static str, &'static str) {
             "array did satisfy the child predicate",
         ),
         "$type" => ("type did not match", "type did match"),
+        "$geoWithin" => (
+            "none of the considered geometries were contained within the expression\u{2019}s geometry",
+            "at least one of considered geometries was contained within the expression\u{2019}s \
+             geometry",
+        ),
+        "$geoIntersects" => (
+            "none of the considered geometries intersected the expression\u{2019}s geometry",
+            "at least one of considered geometries intersected the expression\u{2019}s geometry",
+        ),
         "$bitsAllSet" | "$bitsAllClear" | "$bitsAnySet" | "$bitsAnyClear" => (
             "bitwise operator failed to match",
             "bitwise operator matched successfully",
@@ -320,6 +366,30 @@ fn leaf_details(
         d.insert("reason", "field was missing");
         return d;
     };
+    if let Some(expected) = expected_types(op) {
+        if !values.iter().any(|v| expected.contains(&bson_type_name(v))) {
+            d.insert("reason", "type did not match");
+            append_considered_types(&mut d, &values);
+            if expected.len() == 1 {
+                d.insert("expectedType", expected[0]);
+            } else {
+                d.insert("expectedTypes", expected.to_vec());
+            }
+            append_considered(&mut d, &values);
+            return d;
+        }
+    }
+    if matches!(op, "$geoWithin" | "$geoIntersects")
+        && !values.iter().any(is_geometry)
+        && !path_values(doc, field, false).is_some_and(|w| w.iter().any(is_geometry))
+    {
+        d.insert(
+            "reason",
+            "could not find a valid geometry at the given path",
+        );
+        append_considered(&mut d, &values);
+        return d;
+    }
     let (normal, inv) = leaf_reasons(op);
     d.insert("reason", if inverted { inv } else { normal });
     append_considered(&mut d, &values);
@@ -327,6 +397,34 @@ fn leaf_details(
         append_considered_types(&mut d, &values);
     }
     d
+}
+
+/// The types a leaf operator can match at all; `None` when it takes any.
+/// A value of none of them is "type did not match" (`generatePathError`).
+fn expected_types(op: &str) -> Option<&'static [&'static str]> {
+    Some(match op {
+        "$size" | "$elemMatch" => &["array"],
+        "$bitsAllSet" | "$bitsAllClear" | "$bitsAnySet" | "$bitsAnyClear" => {
+            &["binData", "decimal", "double", "int", "long"]
+        }
+        "$mod" => &["decimal", "double", "int", "long"],
+        "$regex" => &["regex", "string", "symbol"],
+        _ => return None,
+    })
+}
+
+/// Whether a value could be read as a geometry: a GeoJSON object, or a
+/// legacy point (two numbers, as an array or a document).
+fn is_geometry(v: &Bson) -> bool {
+    let two_numbers = |mut it: Box<dyn Iterator<Item = &Bson> + '_>| matches!((it.next(), it.next()), (Some(a), Some(b)) if is_number(a) && is_number(b));
+    match v {
+        Bson::Document(d) if d.get("type").is_some_and(|t| matches!(t, Bson::String(_))) => {
+            d.contains_key("coordinates") || d.contains_key("geometries")
+        }
+        Bson::Document(d) => two_numbers(Box::new(d.values())),
+        Bson::Array(a) => two_numbers(Box::new(a.iter())),
+        _ => false,
+    }
 }
 
 fn append_considered(d: &mut Document, values: &[Bson]) {
@@ -357,34 +455,64 @@ fn append_considered_types(d: &mut Document, values: &[Bson]) {
 /// ELEMENTS (mongod's `kTraverseOmitArray`); arrays along the way are walked
 /// into their document elements either way.
 fn path_values(doc: &Document, path: &str, traverse: bool) -> Option<Vec<Bson>> {
-    fn walk(v: &Bson, parts: &[&str], traverse: bool, out: &mut Vec<Bson>, found: &mut bool) {
+    // The walk yields what mongod's path iterator yields, in its order, with
+    // `None` where a branch finds the path missing; mongod's generator stops
+    // collecting at the first of those (`createValuesArray`), so
+    // `{"a.0.b": ...}` over `a: [{b: 1}]` is "field was missing" -- the field
+    // `"0"` of `{b: 1}` is read, and missing, before the position is.
+    fn walk(
+        v: &Bson,
+        parts: &[&str],
+        traverse: bool,
+        out: &mut Vec<Option<Bson>>,
+        found: &mut Option<bool>,
+    ) {
         if parts.is_empty() {
-            *found = true;
+            found.get_or_insert(true);
             match v {
-                Bson::Array(a) if traverse => out.extend(a.iter().cloned()),
-                other => out.push(other.clone()),
+                Bson::Array(a) if traverse => out.extend(a.iter().cloned().map(Some)),
+                other => out.push(Some(other.clone())),
             }
             return;
         }
         match v {
-            Bson::Document(d) => {
-                if let Some(next) = d.get(parts[0]) {
-                    walk(next, &parts[1..], traverse, out, found);
+            Bson::Document(d) => match d.get(parts[0]) {
+                Some(next) => walk(next, &parts[1..], traverse, out, found),
+                None => {
+                    found.get_or_insert(false);
+                    out.push(None);
                 }
-            }
+            },
             Bson::Array(a) => {
+                // Each element's field of that name, then -- for a numeric
+                // component -- the element at that position, whose own array
+                // is not traversed again.
                 for e in a {
                     if matches!(e, Bson::Document(_)) {
                         walk(e, parts, traverse, out, found);
                     }
                 }
+                let index = parts[0];
+                if !index.is_empty()
+                    && index.bytes().all(|b| b.is_ascii_digit())
+                    && (index == "0" || !index.starts_with('0'))
+                {
+                    if let Some(e) = index.parse::<usize>().ok().and_then(|i| a.get(i)) {
+                        let traverse = traverse && parts.len() > 1;
+                        walk(e, &parts[1..], traverse, out, found);
+                    }
+                }
             }
-            _ => {}
+            _ => {
+                found.get_or_insert(false);
+                out.push(None);
+            }
         }
     }
     let parts: Vec<&str> = path.split('.').collect();
     let mut out = Vec::new();
-    let mut found = false;
+    // Whether the FIRST thing the walk meets is the leaf (`pathExists`).
+    let mut found = None;
     walk(
         &Bson::Document(doc.clone()),
         &parts,
@@ -392,7 +520,9 @@ fn path_values(doc: &Document, path: &str, traverse: bool) -> Option<Vec<Bson>> 
         &mut out,
         &mut found,
     );
-    found.then_some(out)
+    let values: Vec<Bson> = out.into_iter().map_while(|v| v).collect();
+    // Nothing collected: the path is missing, or it holds an empty array.
+    (found == Some(true) || !values.is_empty()).then_some(values)
 }
 
 // --- $jsonSchema ------------------------------------------------------------
@@ -414,21 +544,120 @@ fn explain_json_schema(schema: &Document, doc: &Document) -> Document {
         }
     }
     let rules = explain_value(schema, &Bson::Document(doc.clone()), true);
-    doc! {"operatorName": "$jsonSchema", "schemaRulesNotSatisfied": rules}
+    let mut d = doc! {"operatorName": "$jsonSchema"};
+    annotate(&mut d, schema);
+    d.insert("schemaRulesNotSatisfied", rules);
+    d
+}
+
+/// A sub-schema's `title` and `description`, on the entry that reports it.
+fn annotate(d: &mut Document, schema: &Document) {
+    for kw in ["title", "description"] {
+        if let Some(Bson::String(s)) = schema.get(kw) {
+            d.insert(kw, s.clone());
+        }
+    }
+}
+
+/// The kinds of value a restriction keyword applies to.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    String,
+    Number,
+    Array,
+    Object,
+}
+
+/// When a schema below the root states exactly one type, mongod drops every
+/// restriction keyword for another kind of value rather than testing it
+/// (`makeRestriction`): `{bsonType: "int", pattern: "^x"}` never reports
+/// `pattern`. `Some(None)` is a single type no restriction applies to.
+fn single_stated_kind(schema: &Document) -> Option<Option<Kind>> {
+    let spec = match (schema.get("bsonType"), schema.get("type")) {
+        (Some(t), _) | (None, Some(t)) => t,
+        // `encrypt` alone implies binData.
+        (None, None) if schema.contains_key("encrypt") => return Some(None),
+        (None, None) => return None,
+    };
+    let names: std::collections::BTreeSet<&str> = match spec {
+        Bson::String(s) => [s.as_str()].into(),
+        Bson::Array(a) => a.iter().filter_map(Bson::as_str).collect(),
+        _ => return None,
+    };
+    let mut names = names.into_iter();
+    let (Some(name), None) = (names.next(), names.next()) else {
+        return None;
+    };
+    Some(match name {
+        "string" => Some(Kind::String),
+        "number" | "double" | "int" | "long" | "decimal" => Some(Kind::Number),
+        "array" => Some(Kind::Array),
+        "object" => Some(Kind::Object),
+        _ => None,
+    })
+}
+
+/// Whether an encrypted value's original type (byte 17 of the payload) is one
+/// `encrypt.bsonType` names.
+fn encrypted_type_matches(spec: &Bson, code: i8) -> bool {
+    let names: Vec<&str> = match spec {
+        Bson::String(s) => vec![s.as_str()],
+        Bson::Array(a) => a.iter().filter_map(Bson::as_str).collect(),
+        _ => return true,
+    };
+    let numbers = [1, 16, 18, 19];
+    names.iter().any(|n| {
+        let want: &[i8] = match *n {
+            "number" => &numbers,
+            "double" => &[1],
+            "string" => &[2],
+            "object" => &[3],
+            "array" => &[4],
+            "binData" => &[5],
+            "undefined" => &[6],
+            "objectId" => &[7],
+            "bool" => &[8],
+            "date" => &[9],
+            "null" => &[10],
+            "regex" => &[11],
+            "dbPointer" => &[12],
+            "javascript" => &[13],
+            "symbol" => &[14],
+            "javascriptWithScope" => &[15],
+            "int" => &[16],
+            "timestamp" => &[17],
+            "long" => &[18],
+            "decimal" => &[19],
+            "minKey" => &[-1],
+            "maxKey" => &[127],
+            _ => &[],
+        };
+        want.contains(&code)
+    })
+}
+
+/// Whether a property path exists in `obj`, as `$exists` reads it.
+fn has_path(obj: &Document, name: &str) -> bool {
+    if name.contains('.') {
+        filter_matches(obj, &doc! {name: {"$exists": true}})
+    } else {
+        obj.contains_key(name)
+    }
+}
+
+/// The value a `properties` name names: a dotted name is a path through
+/// documents.
+fn property_value(obj: &Document, name: &str) -> Option<Bson> {
+    let mut parts = name.split('.');
+    let mut cur = obj.get(parts.next()?)?;
+    for part in parts {
+        cur = cur.as_document()?.get(part)?;
+    }
+    Some(cur.clone())
 }
 
 fn schema_matches(schema: &Document, value: &Bson, top: bool) -> bool {
     explain_value(schema, value, top).is_empty()
-}
-
-fn as_f64(v: &Bson) -> Option<f64> {
-    match v {
-        Bson::Int32(n) => Some(f64::from(*n)),
-        Bson::Int64(n) => Some(*n as f64),
-        Bson::Double(d) => Some(*d),
-        Bson::Decimal128(d) => d.to_string().parse().ok(),
-        _ => None,
-    }
 }
 
 fn is_number(v: &Bson) -> bool {
@@ -468,22 +697,20 @@ fn type_matches(kw: &str, spec: &Bson, value: &Bson) -> bool {
     })
 }
 
-fn bson_equal(a: &Bson, b: &Bson) -> bool {
-    secantus_core::order::is_comparable(a)
-        && secantus_core::order::is_comparable(b)
-        && secantus_core::order::cmp(a, b) == std::cmp::Ordering::Equal
-        && std::mem::discriminant(a) == std::mem::discriminant(b)
-        || (is_number(a) && is_number(b) && as_f64(a) == as_f64(b))
-}
-
 /// Every rule of `schema` that `value` breaks, in mongod's order. `top` is the
 /// root schema, which has no path and so no type restriction of its own.
 fn explain_value(schema: &Document, value: &Bson, top: bool) -> Vec<Bson> {
     let mut out: Vec<Bson> = Vec::new();
     let mut push = |d: Document| out.push(Bson::Document(d));
+    let stated = if top {
+        None
+    } else {
+        single_stated_kind(schema)
+    };
+    let applies = |kind: Kind| stated.is_none_or(|k| k == Some(kind));
 
     // Scalar keywords -- strings and numbers only.
-    if let Bson::String(s) = value {
+    if let (Bson::String(s), true) = (value, applies(Kind::String)) {
         if let Some(Bson::String(p)) = schema.get("pattern") {
             if !filter_matches(
                 &doc! {"v": value.clone()},
@@ -511,9 +738,9 @@ fn explain_value(schema: &Document, value: &Bson, top: bool) -> Vec<Bson> {
             }
         }
     }
-    if is_number(value) {
-        if let (Some(m), Some(v)) = (schema.get("multipleOf").and_then(as_f64), as_f64(value)) {
-            if m != 0.0 && (v / m).fract() != 0.0 {
+    if is_number(value) && applies(Kind::Number) {
+        if let Some(m) = schema.get("multipleOf") {
+            if !secantus_core::query::json_schema_multiple_of(value, m) {
                 push(doc! {
                     "operatorName": "multipleOf",
                     "specifiedAs": {"multipleOf": schema.get("multipleOf").unwrap().clone()},
@@ -550,7 +777,7 @@ fn explain_value(schema: &Document, value: &Bson, top: bool) -> Vec<Bson> {
     }
 
     // Array keywords.
-    if let Bson::Array(items) = value {
+    if let (Bson::Array(items), true) = (value, applies(Kind::Array)) {
         let n = items.len() as i64;
         for (kw, too_many) in [("minItems", false), ("maxItems", true)] {
             if let Some(limit) = as_count(schema.get(kw)) {
@@ -569,7 +796,7 @@ fn explain_value(schema: &Document, value: &Bson, top: bool) -> Vec<Bson> {
             let dup = items.iter().enumerate().find_map(|(i, a)| {
                 items[..i]
                     .iter()
-                    .any(|b| bson_equal(a, b))
+                    .any(|b| secantus_core::query::json_schema_values_equal(a, b))
                     .then(|| a.clone())
             });
             if let Some(dup) = dup {
@@ -588,12 +815,12 @@ fn explain_value(schema: &Document, value: &Bson, top: bool) -> Vec<Bson> {
                     let d = explain_value(item_schema, it, false);
                     (!d.is_empty()).then_some((i, d))
                 }) {
-                    push(doc! {
-                        "operatorName": "items",
-                        "reason": "At least one item did not match the sub-schema",
-                        "itemIndex": i as i32,
-                        "details": details,
-                    });
+                    let mut d = doc! {"operatorName": "items"};
+                    annotate(&mut d, item_schema);
+                    d.insert("reason", "At least one item did not match the sub-schema");
+                    d.insert("itemIndex", i as i32);
+                    d.insert("details", details);
+                    push(d);
                 }
             }
             Some(Bson::Array(schemas)) => {
@@ -626,12 +853,15 @@ fn explain_value(schema: &Document, value: &Bson, top: bool) -> Vec<Bson> {
                                     (!d.is_empty()).then_some((i + schemas.len(), d))
                                 })
                             {
-                                push(doc! {
-                                    "operatorName": "additionalItems",
-                                    "reason": "At least one additional item did not match the sub-schema",
-                                    "itemIndex": i as i32,
-                                    "details": details,
-                                });
+                                let mut d = doc! {"operatorName": "additionalItems"};
+                                annotate(&mut d, add);
+                                d.insert(
+                                    "reason",
+                                    "At least one additional item did not match the sub-schema",
+                                );
+                                d.insert("itemIndex", i as i32);
+                                d.insert("details", details);
+                                push(d);
                             }
                         }
                         _ => {}
@@ -642,8 +872,28 @@ fn explain_value(schema: &Document, value: &Bson, top: bool) -> Vec<Bson> {
         }
     }
 
+    // `encrypt`: the value must be encrypted (binData subtype 6), and of the
+    // stated type when one is given.
+    if let (Ok(enc), false) = (schema.get_document("encrypt"), top) {
+        match value {
+            Bson::Binary(b) if u8::from(b.subtype) == 6 => {
+                let wrong_type = enc.get("bsonType").is_some_and(|t| {
+                    b.bytes.len() < 18
+                        || !matches!(b.bytes[0], 1 | 2)
+                        || !encrypted_type_matches(t, b.bytes[17] as i8)
+                });
+                if wrong_type {
+                    push(
+                        doc! {"operatorName": "encrypt", "reason": "encrypted value has wrong type"},
+                    );
+                }
+            }
+            _ => push(doc! {"operatorName": "encrypt", "reason": "value was not encrypted"}),
+        }
+    }
+
     // Object keywords.
-    if let Bson::Document(obj) = value {
+    if let (Bson::Document(obj), true) = (value, applies(Kind::Object)) {
         explain_object(schema, obj, &mut push);
     }
 
@@ -693,7 +943,18 @@ fn explain_value(schema: &Document, value: &Bson, top: bool) -> Vec<Bson> {
         }
     }
     if let Ok(options) = schema.get_array("enum") {
-        if !options.iter().any(|o| bson_equal(o, value)) {
+        // At the root only a document can equal a stored document: an enum
+        // of none matches nothing.
+        if top && !options.iter().any(|o| matches!(o, Bson::Document(_))) {
+            push(doc! {
+                "operatorName": "enum",
+                "specifiedAs": {"enum": options.clone()},
+                "reason": "expression always evaluates to false",
+            });
+        } else if !options
+            .iter()
+            .any(|o| secantus_core::query::json_schema_values_equal(o, value))
+        {
             push(doc! {
                 "operatorName": "enum",
                 "specifiedAs": {"enum": options.clone()},
@@ -733,7 +994,12 @@ fn indexed_schemas(
         .enumerate()
         .filter_map(|(i, s)| {
             let d = explain_value(s, value, top);
-            keep(&d).then(|| Bson::Document(doc! {"index": i as i32, "details": d}))
+            keep(&d).then(|| {
+                let mut entry = doc! {"index": i as i32};
+                annotate(&mut entry, s);
+                entry.insert("details", d);
+                Bson::Document(entry)
+            })
         })
         .collect()
 }
@@ -745,15 +1011,24 @@ fn explain_object(schema: &Document, obj: &Document, push: &mut impl FnMut(Docum
             .iter()
             .filter_map(|(name, sub)| {
                 let sub = sub.as_document()?;
-                let v = obj.get(name)?;
-                let d = explain_value(sub, v, false);
-                (!d.is_empty()).then(|| Bson::Document(doc! {"propertyName": name, "details": d}))
+                let v = property_value(obj, name)?;
+                let d = explain_value(sub, &v, false);
+                (!d.is_empty()).then(|| {
+                    let mut entry = doc! {"propertyName": name};
+                    annotate(&mut entry, sub);
+                    entry.insert("details", d);
+                    Bson::Document(entry)
+                })
             })
             .collect();
         if !failing.is_empty() {
             push(doc! {"operatorName": "properties", "propertiesNotSatisfied": failing});
         }
     }
+    // mongod builds one node for `additionalProperties` and
+    // `patternProperties`, whose first child is the former: its error comes
+    // first.
+    let mut pattern_error = None;
     let patterns = schema.get_document("patternProperties").ok();
     if let Some(patterns) = patterns {
         let mut failing = Vec::new();
@@ -769,17 +1044,17 @@ fn explain_object(schema: &Document, obj: &Document, push: &mut impl FnMut(Docum
                 if hit {
                     let d = explain_value(sub, v, false);
                     if !d.is_empty() {
-                        failing.push(Bson::Document(doc! {
-                            "propertyName": name,
-                            "regexMatched": pattern.clone(),
-                            "details": d,
-                        }));
+                        let mut entry = doc! {"propertyName": name};
+                        annotate(&mut entry, sub);
+                        entry.insert("regexMatched", pattern.clone());
+                        entry.insert("details", d);
+                        failing.push(Bson::Document(entry));
                     }
                 }
             }
         }
         if !failing.is_empty() {
-            push(doc! {"operatorName": "patternProperties", "details": failing});
+            pattern_error = Some(doc! {"operatorName": "patternProperties", "details": failing});
         }
     }
     if let Some(additional) = schema.get("additionalProperties") {
@@ -811,21 +1086,27 @@ fn explain_object(schema: &Document, obj: &Document, push: &mut impl FnMut(Docum
                             (!d.is_empty()).then(|| (k.clone(), d))
                         })
                 {
-                    push(doc! {
-                        "operatorName": "additionalProperties",
-                        "reason": "at least one additional property did not match the subschema",
-                        "failingProperty": name,
-                        "details": d,
-                    });
+                    let mut entry = doc! {"operatorName": "additionalProperties"};
+                    annotate(&mut entry, sub);
+                    entry.insert(
+                        "reason",
+                        "at least one additional property did not match the subschema",
+                    );
+                    entry.insert("failingProperty", name);
+                    entry.insert("details", d);
+                    push(entry);
                 }
             }
             _ => {}
         }
     }
+    if let Some(e) = pattern_error {
+        push(e);
+    }
     if let Ok(required) = schema.get_array("required") {
         let missing: Vec<Bson> = required
             .iter()
-            .filter(|r| r.as_str().is_some_and(|n| !obj.contains_key(n)))
+            .filter(|r| r.as_str().is_some_and(|n| !has_path(obj, n)))
             .cloned()
             .collect();
         if !missing.is_empty() {
@@ -852,14 +1133,14 @@ fn explain_object(schema: &Document, obj: &Document, push: &mut impl FnMut(Docum
     if let Ok(deps) = schema.get_document("dependencies") {
         let mut failing = Vec::new();
         for (prop, dep) in deps {
-            if !obj.contains_key(prop) {
+            if !has_path(obj, prop) {
                 continue;
             }
             match dep {
                 Bson::Array(names) => {
                     let missing: Vec<Bson> = names
                         .iter()
-                        .filter(|n| n.as_str().is_some_and(|n| !obj.contains_key(n)))
+                        .filter(|n| n.as_str().is_some_and(|n| !has_path(obj, n)))
                         .cloned()
                         .collect();
                     if !missing.is_empty() {
@@ -889,8 +1170,11 @@ fn explain_object(schema: &Document, obj: &Document, push: &mut impl FnMut(Docum
 /// Expected values are mongod 8.2.11's, measured 2026-09-30.
 #[cfg(test)]
 mod tests {
-    use super::explain;
-    use bson::{bson, doc};
+    use bson::{bson, doc, Document};
+
+    fn explain(validator: &Document, doc: &Document) -> Document {
+        super::explain(validator, doc).unwrap()
+    }
 
     #[test]
     fn schema_rules_come_in_mongods_order_not_the_schemas() {
@@ -983,6 +1267,38 @@ mod tests {
                 "operatorName": "$gt", "specifiedAs": {"a": {"$gt": 5}},
                 "reason": "comparison succeeded", "consideredValue": 9,
             }}
+        );
+    }
+
+    /// A dotted property name is a path; a keyword the stated single type
+    /// rules out is not reported (measured 8.2.11, 2026-10-22).
+    #[test]
+    fn dotted_names_are_paths_and_stated_types_drop_keywords() {
+        let v = doc! {"$jsonSchema": {"properties": {"a.b": {"bsonType": "int", "pattern": "^x"}}}};
+        assert_eq!(
+            explain(&v, &doc! {"_id": 1, "a": {"b": "y"}}),
+            doc! {"operatorName": "$jsonSchema", "schemaRulesNotSatisfied": [
+                {"operatorName": "properties", "propertiesNotSatisfied": [
+                    {"propertyName": "a.b", "details": [{
+                        "operatorName": "bsonType", "specifiedAs": {"bsonType": "int"},
+                        "reason": "type did not match", "consideredValue": "y",
+                        "consideredType": "string",
+                    }]},
+                ]},
+            ]}
+        );
+    }
+
+    /// mongod's generator cannot explain `$alwaysFalse`, and says so.
+    #[test]
+    fn always_false_is_not_explained() {
+        assert_eq!(
+            super::explain(&doc! {"$alwaysFalse": 1}, &doc! {"_id": 1}),
+            Err(
+                "Cannot generate validation error details: no annotation found for expression \
+                 { $alwaysFalse: 1 }"
+                    .to_string()
+            )
         );
     }
 }

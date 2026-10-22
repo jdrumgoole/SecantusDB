@@ -527,6 +527,22 @@ These are explicit non-goals. Don't add them without a reason.
       Backlog-ID: RM-023
       Verify: tests/backlog/test_rm_001_028.py::test_slow_query_line_says_where_the_time_went
 
+- [ ] **RM-185's lock-count reference moves under the verifier's load.**
+  `python tools/backlog.py verify --regressions` runs its tests with
+  `-n auto`; on this 12-core Mac that intermittently reports RM-185
+  REGRESSED (five of ten full runs, 2026-10-21 and 22). The test files pass
+  when run alone, three copies at once included. In the failing runs mongod
+  read `$out replacing its target` with 8 global IS in all five of its runs,
+  where the Rust server and an idle mongod read 7. The module's reference
+  already turns off time-based plan yielding (`internalQueryExecYieldPeriodMS`),
+  so that is not the whole cause. Forcing a yield on every iteration
+  (`internalQueryExecYieldIterations=1`) raises the same counts. Something
+  under load still makes mongod re-take a lock, most likely a yield on a
+  storage-engine conflict or cache pressure with twelve mongods running at
+  once. CI's Linux lane has not shown it. The server's counts do not move;
+  the reference does.
+  Backlog-ID: RM-274
+  Verify: none -- an instability in the reference measurement under parallel load, reproduced only by the full regression run on a loaded Mac
 ### 7.088 Expression code no test had executed, against mongod -- 2026-10-21
 
 A line-coverage run (`docs-rust/coverage.md`, `./inv rust-mdb-coverage`)
