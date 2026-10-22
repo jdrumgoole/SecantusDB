@@ -170,8 +170,20 @@ pub(crate) fn in_from(from: &[pg_query::protobuf::Node]) -> bool {
             Some(N::JoinExpr(j)) => {
                 j.larg.as_deref().is_some_and(walk) || j.rarg.as_deref().is_some_and(walk)
             }
+            // A FROM subquery's own FROM, and its set operation's arms.
+            Some(N::RangeSubselect(rs)) => {
+                match rs.subquery.as_deref().and_then(|q| q.node.as_ref()) {
+                    Some(N::SelectStmt(sel)) => select(sel),
+                    _ => false,
+                }
+            }
             _ => false,
         }
+    }
+    fn select(s: &pg_query::protobuf::SelectStmt) -> bool {
+        s.from_clause.iter().any(walk)
+            || s.larg.as_deref().is_some_and(select)
+            || s.rarg.as_deref().is_some_and(select)
     }
     from.iter().any(walk)
 }

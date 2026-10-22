@@ -531,3 +531,13 @@ pub(crate) fn system_relation_columns(relation: &str) -> Option<Vec<(String, i64
     cols.sort_by_key(|c| c.0);
     Some(cols.into_iter().map(|(_, n, t, m)| (n, t, m)).collect())
 }
+
+/// A system relation's column name by number (`pg_attribute_system.tsv`).
+pub(crate) fn system_attribute_name(relid: i64, attnum: i64) -> Option<String> {
+    let (relid, attnum) = (relid.to_string(), attnum.to_string());
+    ATTRIBUTES.lines().find_map(|l| {
+        let c: Vec<&str> = l.split('\t').collect();
+        (c.first() == Some(&relid.as_str()) && c.get(3) == Some(&attnum.as_str()))
+            .then(|| c[1].to_string())
+    })
+}

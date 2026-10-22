@@ -23,7 +23,7 @@ const VALIDATORS: &[(&str, i64)] = &[
 ];
 
 /// The `plpgsql` language's oid on this server (`pg_language`).
-const PLPGSQL_LANGUAGE: i64 = 14078;
+const PLPGSQL_LANGUAGE: i64 = 14035;
 
 thread_local! {
     /// The user functions' `(oid, prolang)`, installed per statement by the

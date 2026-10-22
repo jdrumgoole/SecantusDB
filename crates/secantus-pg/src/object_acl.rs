@@ -760,7 +760,8 @@ impl PgHandler {
         };
         let (role, rest) = if explicit_role {
             let r = text(&args[0]);
-            if self.role(&r)?.is_none() && r != self.session_user_name() {
+            // `get_role_oid_or_public`: `public` is PUBLIC.
+            if r != "public" && self.role(&r)?.is_none() && r != self.session_user_name() {
                 return Err(Self::user_error(
                     "42704",
                     format!("role \"{r}\" does not exist"),
@@ -850,7 +851,42 @@ impl PgHandler {
                 held("sequence", &key)?
             }
             "has_function_privilege" => {
-                let written = text(&rest[0]);
+                let mut written = text(&rest[0]);
+                // A function by oid -- an oid argument, or digits, which
+                // `regprocedurein` reads as one.
+                let by_oid = match &rest[0] {
+                    Bson::Int64(o) => Some(*o),
+                    Bson::Int32(o) => Some(i64::from(*o)),
+                    Bson::String(t) if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()) => {
+                        t.parse().ok()
+                    }
+                    _ => None,
+                };
+                if let Some(oid) = by_oid {
+                    let user = self
+                        .functions()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|f| Self::index_oid(&format!("fn:{}", f.key)) == oid);
+                    match user {
+                        Some(f) => written = format!("{}({})", f.name, f.param_types.join(",")),
+                        // A built-in: EXECUTE is PUBLIC's from initdb.
+                        None if self.is_builtin_function_oid(oid) => {
+                            let all = kind_privileges("function");
+                            if let Some((_, _, w)) =
+                                wanted.iter().find(|(p, _, _)| !all.contains(&p.as_str()))
+                            {
+                                return Err(Self::user_error(
+                                    "22023",
+                                    format!("unrecognized privilege type: \"{w}\""),
+                                ));
+                            }
+                            return Ok(Bson::Boolean(true));
+                        }
+                        // No such function: NULL, as PostgreSQL answers.
+                        None => return Ok(Bson::Null),
+                    }
+                }
                 if !written.contains('(') {
                     return Err(Self::user_error(
                         "22P02",

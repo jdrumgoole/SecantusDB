@@ -587,34 +587,4 @@ impl PgHandler {
             })
             .collect()
     }
-
-    /// The `lo_*` functions' rows in `pg_proc`, so a client finds their oids.
-    pub(crate) fn lo_pg_proc_rows(def: &TableDef) -> Vec<Document> {
-        let f = |name: &str| def.field_of(name).expect("column");
-        LO_PROCS
-            .iter()
-            .map(|(name, oid, args, ret)| {
-                let mut row = Document::new();
-                row.insert(f("oid"), Bson::Int64(*oid));
-                row.insert(f("proname"), *name);
-                row.insert(f("pronamespace"), Bson::Int64(11));
-                row.insert(f("proowner"), Bson::Int64(10));
-                row.insert(f("prolang"), Bson::Int64(12));
-                row.insert(f("prokind"), "f");
-                row.insert(f("prosecdef"), false);
-                row.insert(f("proisstrict"), true);
-                row.insert(f("proretset"), false);
-                row.insert(f("provolatile"), "v");
-                row.insert(f("pronargs"), Bson::Int32(args.len() as i32));
-                row.insert(f("prorettype"), Bson::Int64(*ret));
-                row.insert(
-                    f("proargtypes"),
-                    Bson::Array(args.iter().map(|a| Bson::Int64(*a)).collect()),
-                );
-                row.insert(f("proargnames"), Bson::Null);
-                row.insert(f("prosrc"), *name);
-                row
-            })
-            .collect()
-    }
 }

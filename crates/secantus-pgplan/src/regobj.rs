@@ -286,14 +286,28 @@ pub fn text(kind: &str, oid: i64) -> String {
         "regdictionary" => {
             crate::ts_catalog::name_of(oid, true).map(crate::scalar::quote_identifier)
         }
+        // `regprocout`: each part of the name quoted as an identifier needs
+        // (`"RI_FKey_check_ins"`).
         "regproc" => PROCS
             .with(|t| {
                 t.borrow()
                     .iter()
                     .find(|(_, o, _)| *o == oid)
-                    .map(|(n, _, _)| n.clone())
+                    .map(|(n, _, _)| {
+                        let (schema, name) = crate::schemas::split_key(n);
+                        // Qualified unless its schema is on the search path.
+                        if !crate::schemas::search_path().contains(&schema) {
+                            format!(
+                                "{}.{}",
+                                crate::scalar::quote_identifier(&schema),
+                                crate::scalar::quote_identifier(&name)
+                            )
+                        } else {
+                            crate::scalar::quote_identifier(&name)
+                        }
+                    })
             })
-            .or_else(|| builtin_proc_name(oid).map(str::to_string)),
+            .or_else(|| builtin_proc_name(oid).map(crate::scalar::quote_identifier)),
         // `regoperout`: the bare name when it alone finds this operator,
         // else qualified (`551::regoper` is `pg_catalog.+`).
         "regoper" => builtin_operators().iter().find(|o| o.0 == oid).map(|o| {
@@ -398,25 +412,34 @@ pub fn resolve(kind: &str, input: &str) -> Result<i64> {
                 .ok_or_else(|| Error::UndefinedObject(format!("role \"{name}\" does not exist")))
         }
         "regproc" => {
-            let mut name = unquote(input);
+            // `stringToQualifiedNameList`: a quoted part keeps its case.
+            let parts = crate::split_relation_name(input)?;
             // `pg_catalog.array_in`: the built-ins live in pg_catalog.
-            let qualified_builtin = match name.strip_prefix("pg_catalog.") {
-                Some(bare) => {
-                    name = bare.to_string();
-                    true
-                }
-                None => false,
+            let (name, qualified_builtin) = match parts.as_slice() {
+                [schema, bare] if schema == "pg_catalog" => (bare.clone(), true),
+                [schema, bare] => (crate::schemas::relation_key(schema, bare), false),
+                _ => (parts.join("."), false),
             };
-            let mut hits: Vec<i64> = if qualified_builtin {
-                Vec::new()
-            } else {
+            let named = |key: &str| -> Vec<i64> {
                 PROCS.with(|t| {
                     t.borrow()
                         .iter()
-                        .filter(|(n, _, _)| *n == name)
+                        .filter(|(n, _, _)| n == key)
                         .map(|(_, o, _)| *o)
                         .collect()
                 })
+            };
+            let mut hits: Vec<i64> = if qualified_builtin {
+                Vec::new()
+            } else if parts.len() == 1 {
+                // A bare name: the first schema on the search path holding it.
+                crate::schemas::search_path()
+                    .iter()
+                    .map(|s| named(&crate::schemas::relation_key(s, &name)))
+                    .find(|h| !h.is_empty())
+                    .unwrap_or_default()
+            } else {
+                named(&name)
             };
             if hits.is_empty() {
                 hits = builtin_proc_oids(&name).to_vec();

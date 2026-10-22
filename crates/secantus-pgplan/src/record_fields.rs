@@ -453,3 +453,203 @@ pub(crate) fn rewrite(
     }
     Ok(changed.then_some(out))
 }
+
+/// `(ss.x).n` / `(ss.x).x` over a FROM subquery's `_pg_expandarray(arr)`
+/// column, as a column of the subquery itself: the subquery selects
+/// `(_pg_expandarray(arr)).n` beside `x`, and the outer query reads that
+/// column. The value is the same; what changes is that a join or filter on
+/// it compares a column, which the join planner can hash, where the field
+/// selection made every pair of rows a candidate -- `information_schema
+/// .parameters` joins `pg_type` on `t.oid = (ss.x).x` over every function's
+/// arguments. Only where the extra column cannot show: no `*` in the outer
+/// select list, and a plain subquery (no set operation, DISTINCT, GROUP BY
+/// or window) that it can be added to.
+pub(crate) fn push_down(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<Option<pg_query::protobuf::SelectStmt>> {
+    let star = s.target_list.iter().any(|t| {
+        t.node.as_ref().is_some_and(|n| {
+            n.nodes()
+                .iter()
+                .any(|(n, _, _, _)| matches!(n, pg_query::NodeRef::AStar(_)))
+        })
+    });
+    if star {
+        return Ok(None);
+    }
+    let origins = origins(s);
+    if !origins
+        .iter()
+        .any(|(_, _, o)| matches!(o, Origin::Expand(..)))
+    {
+        return Ok(None);
+    }
+    // (alias, column, field, the subquery column standing in for it, the
+    // type the selection is cast to)
+    let mut wanted: Vec<(
+        String,
+        String,
+        String,
+        String,
+        Option<pg_query::protobuf::TypeName>,
+    )> = Vec::new();
+    let mut out = s.clone();
+    let mut visit = |n: &mut pg_query::protobuf::Node| -> Result<()> {
+        // The cast `rewrite` put around the selection goes with it into the
+        // subquery, so the outer query reads a bare column (a cast key would
+        // not hash either).
+        let (selected, cast) = match n.node.as_ref() {
+            Some(N::TypeCast(tc)) => match tc.arg.as_deref() {
+                Some(a) if selection(a).is_some() => (a.clone(), tc.type_name.clone()),
+                _ => return Ok(()),
+            },
+            _ => (n.clone(), None),
+        };
+        let Some((arg, field)) = selection(&selected) else {
+            return Ok(());
+        };
+        if !matches!(field, "x" | "n") {
+            return Ok(());
+        }
+        let Some(N::ColumnRef(c)) = arg.node.as_ref() else {
+            return Ok(());
+        };
+        if !matches!(resolve(c, s, &origins, lookup), Some(Origin::Expand(..))) {
+            return Ok(());
+        }
+        let parts = names(&c.fields);
+        let (alias, column) = match parts.as_slice() {
+            [q, col] => (q.clone(), col.clone()),
+            [col] => match origins.iter().find(|(_, n, _)| n == col) {
+                Some((a, _, _)) => (a.clone(), col.clone()),
+                None => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        let cast_name: String = cast
+            .as_ref()
+            .map(type_name_of)
+            .unwrap_or_default()
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect();
+        let name = format!("__pgx_{column}_{field}_{cast_name}");
+        if !wanted.iter().any(|w| w.0 == alias && w.3 == name) {
+            wanted.push((alias.clone(), column, field.to_string(), name.clone(), cast));
+        }
+        *n = pg_query::protobuf::Node {
+            node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                fields: vec![string_node(&alias), string_node(&name)],
+                location: -1,
+            })),
+        };
+        Ok(())
+    };
+    for t in &mut out.target_list {
+        if let Some(N::ResTarget(rt)) = t.node.as_mut() {
+            // An unnamed `(ss.x).n` is the column `n`, as PostgreSQL names a
+            // field selection; the column standing in for it must keep that.
+            if rt.name.is_empty() {
+                let field = rt.val.as_deref().and_then(|v| {
+                    let v = match v.node.as_ref() {
+                        Some(N::TypeCast(tc)) => tc.arg.as_deref()?,
+                        _ => v,
+                    };
+                    selection(v).map(|(_, f)| f.to_string())
+                });
+                if let Some(f) = field {
+                    rt.name = f;
+                }
+            }
+            if let Some(v) = rt.val.as_deref_mut() {
+                walk_expr(v, &mut visit)?;
+            }
+        }
+    }
+    if let Some(w) = out.where_clause.as_deref_mut() {
+        walk_expr(w, &mut visit)?;
+    }
+    for sb in &mut out.sort_clause {
+        if let Some(N::SortBy(b)) = sb.node.as_mut() {
+            if let Some(n) = b.node.as_deref_mut() {
+                walk_expr(n, &mut visit)?;
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return Ok(None);
+    }
+    for item in &mut out.from_clause {
+        let Some(N::RangeSubselect(rs)) = item.node.as_mut() else {
+            continue;
+        };
+        let Some(alias) = rs.alias.as_mut() else {
+            continue;
+        };
+        let mine: Vec<_> = wanted.iter().filter(|w| w.0 == alias.aliasname).collect();
+        if mine.is_empty() {
+            continue;
+        }
+        let colnames = names(&alias.colnames);
+        let Some(N::SelectStmt(q)) = rs.subquery.as_deref_mut().and_then(|n| n.node.as_mut())
+        else {
+            return Ok(None);
+        };
+        if q.op != pg_query::protobuf::SetOperation::SetopNone as i32
+            || !q.distinct_clause.is_empty()
+            || !q.group_clause.is_empty()
+            || !q.window_clause.is_empty()
+            || q.having_clause.is_some()
+        {
+            return Ok(None);
+        }
+        for (_, column, field, name, cast) in mine {
+            // The target the column names: by the alias's list, else its own.
+            let index = match colnames.iter().position(|c| c == column) {
+                Some(i) => Some(i),
+                None => q.target_list.iter().position(
+                    |t| matches!(t.node.as_ref(), Some(N::ResTarget(rt)) if rt.name == *column),
+                ),
+            };
+            let Some(Some(N::ResTarget(rt))) = index
+                .and_then(|i| q.target_list.get(i))
+                .map(|t| t.node.as_ref())
+            else {
+                return Ok(None);
+            };
+            let Some(val) = rt.val.clone() else {
+                return Ok(None);
+            };
+            let mut selected = pg_query::protobuf::Node {
+                node: Some(N::AIndirection(Box::new(
+                    pg_query::protobuf::AIndirection {
+                        arg: Some(val),
+                        indirection: vec![string_node(field)],
+                    },
+                ))),
+            };
+            if let Some(t) = cast {
+                selected = pg_query::protobuf::Node {
+                    node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                        arg: Some(Box::new(selected)),
+                        type_name: Some(t.clone()),
+                        location: -1,
+                    }))),
+                };
+            }
+            q.target_list.push(pg_query::protobuf::Node {
+                node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                    name: name.clone(),
+                    val: Some(Box::new(selected)),
+                    location: -1,
+                    ..Default::default()
+                }))),
+            });
+            if !alias.colnames.is_empty() {
+                alias.colnames.push(string_node(name));
+            }
+        }
+    }
+    Ok(Some(out))
+}

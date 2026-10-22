@@ -20,6 +20,7 @@ from __future__ import annotations
 import pathlib
 import subprocess
 import sys
+import time
 from typing import Any
 
 import psycopg
@@ -287,7 +288,11 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
         "RP-098",
         False,
         [
-            "select count(*) >= 0 from information_schema.element_types",
+            # element_types' UNION, narrowed to its arms' types (the view
+            # itself now reads every built-in function).
+            "select pg_typeof(n)::text from (select (ss.x).n from (select "
+            "information_schema._pg_expandarray(array[7]) as x where false) ss "
+            "union all select 1) u",
             "select pg_typeof(n)::text from (select (ss.x).n from (select "
             "information_schema._pg_expandarray(array[7]) as x) ss) t",
         ],
@@ -316,6 +321,194 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
             "select * from rp26_u, unnest(b) u",
             "select * from rp26_u, unnest(b) with ordinality u(x, n)",
             "select * from rp26_u, lateral (select * from unnest(b)) q",
+        ],
+    ),
+    "triggers PostgreSQL makes and their functions": (
+        "RP-115",
+        False,
+        [
+            "create table rp28_p (id int primary key)",
+            "create table rp28_c (r int references rp28_p on delete cascade)",
+            "create function rp28_tf() returns trigger language plpgsql as 'begin return new; end'",
+            "create trigger rp28_t before insert on rp28_c for each row execute function rp28_tf()",
+            "select tgrelid::regclass::text, regexp_replace(tgname, '[0-9]+$', 'N'), "
+            "tgname = 'RI_ConstraintTrigger_' || substr(tgname, 22, 1) || '_' || oid, "
+            "tgfoid::regproc::text, tgtype, tgisinternal, tgconstrrelid::regclass::text, "
+            "tgconstrindid::regclass::text, (select conname from pg_constraint where oid = "
+            "tgconstraint) from pg_trigger where tgrelid in ('rp28_p'::regclass, "
+            "'rp28_c'::regclass) order by tgisinternal, 1, 4",
+            "drop table rp28_c",
+            "drop table rp28_p",
+            "drop function rp28_tf()",
+        ],
+    ),
+    "a composite type's relation": (
+        "RP-116",
+        False,
+        [
+            "create type rp28_comp as (x int)",
+            "select typrelid::regclass::text, (select relkind from pg_class where oid = typrelid) "
+            "from pg_type where typname = 'rp28_comp'",
+            "select 'rp28_comp'::regclass::text",
+            "select * from rp28_comp",
+            "insert into rp28_comp values (1)",
+            "drop table if exists rp28_comp",
+            "drop type rp28_comp",
+        ],
+    ),
+    "a view's row type is a type": (
+        "RP-117",
+        True,
+        [
+            "create view rp28_v as select 1 as one",
+            "select typarray::regtype::text from pg_type where typname = 'rp28_v'",
+            "select '_rp28_v'::regtype::text",
+            "select 'rp28_v'::regtype::text",
+            "select row(1)::rp28_v::text, ('(2)'::rp28_v).one",
+            "select pg_typeof(v)::text from rp28_v v",
+            "drop view rp28_v",
+        ],
+    ),
+    "an index created in the open block": (
+        "RP-118",
+        False,
+        [
+            "begin",
+            "create table rp28_i (a int)",
+            "create index rp28_ix on rp28_i (a)",
+            "select 'rp28_ix'::regclass::text",
+            "select (select oid from pg_class where relname = 'rp28_ix')::regclass::text",
+            "rollback",
+        ],
+    ),
+    "regproc names": (
+        "RP-119",
+        False,
+        [
+            "select 1644::regproc::text, 'pg_catalog.\"RI_FKey_check_ins\"'::regproc::oid",
+            "create schema rp28_s",
+            "create function rp28_s.h() returns int language sql as 'select 1'",
+            "select 'rp28_s.h'::regproc::text",
+            "set search_path = rp28_s, public",
+            "select 'h'::regproc::text",
+            "reset search_path",
+            "drop function rp28_s.h()",
+            "drop schema rp28_s",
+        ],
+    ),
+    "the plpgsql language's oid": (
+        "RP-120",
+        False,
+        [
+            "select oid, lanplcallfoid, laninline, lanvalidator from pg_language "
+            "where lanname = 'plpgsql'",
+        ],
+    ),
+    "a function's user-typed arguments": (
+        "RP-121",
+        False,
+        [
+            "create type rp28_m as enum ('a')",
+            "create function rp28_f(x rp28_m, y int, z rp28_m[]) returns rp28_m "
+            "language sql as 'select x'",
+            "select proargtypes::regtype[]::text, prorettype::regtype::text from pg_proc "
+            "where proname = 'rp28_f'",
+            "drop function rp28_f(rp28_m, int, rp28_m[])",
+            "drop type rp28_m",
+        ],
+    ),
+    "a trigger's UPDATE OF columns": (
+        "RP-122",
+        False,
+        [
+            "create table rp28_q (a int, b int, c int)",
+            "create function rp28_tf2() returns trigger language plpgsql as "
+            "'begin return new; end'",
+            "create trigger rp28_tu after update of c, a on rp28_q for each row "
+            "execute function rp28_tf2()",
+            "select tgattr::text from pg_trigger where tgname = 'rp28_tu'",
+            "drop table rp28_q",
+            "drop function rp28_tf2()",
+        ],
+    ),
+    "a vector as an array": (
+        "RP-123",
+        False,
+        [
+            "select '1 2'::int2vector::int2[]::text, '23 25'::oidvector::oid[]::text, "
+            "array_lower('1 2'::int2vector::int2[], 1)",
+            "select indkey::int2[]::text from pg_index "
+            "where indexrelid = 'pg_class_oid_index'::regclass",
+        ],
+    ),
+    "dependencies on a constant's type and a range's functions": (
+        "RP-105",
+        True,
+        [
+            "create type rp28_e as enum ('a', 'b')",
+            "create table rp28_d (a int, b rp28_e)",
+            "create index rp28_dp on rp28_d (a) where b = 'a'",
+            "select count(*) from pg_depend where objid = 'rp28_dp'::regclass "
+            "and refclassid = 'pg_type'::regclass",
+            "create type rp28_r as range (subtype = int4)",
+            "select count(*) from pg_depend d join pg_proc p on p.oid = d.objid "
+            "where d.classid = 'pg_proc'::regclass "
+            "and p.proname in ('rp28_r', 'rp28_r_multirange')",
+            "drop type rp28_r",
+            "drop table rp28_d",
+            "drop type rp28_e",
+        ],
+    ),
+    "a materialized view's rule": (
+        "RP-124",
+        False,
+        [
+            "create table rp28_mq (a int)",
+            "create materialized view rp28_mm as select a from rp28_mq",
+            "select rulename, ev_type, is_instead from pg_rewrite "
+            "where ev_class = 'rp28_mm'::regclass",
+            "select refobjsubid, deptype from pg_depend d join pg_rewrite r on r.oid = d.objid "
+            "where r.ev_class = 'rp28_mm'::regclass and d.refobjid = 'rp28_mq'::regclass",
+            "drop materialized view rp28_mm",
+            "drop table rp28_mq",
+        ],
+    ),
+    "has_function_privilege by oid": (
+        "RP-125",
+        False,
+        [
+            "select has_function_privilege(1644::oid, 'EXECUTE'), "
+            "has_function_privilege(999999::oid, 'EXECUTE') is null, "
+            "has_function_privilege('public', 1644::oid, 'EXECUTE'), "
+            "has_function_privilege('1644', 'EXECUTE')",
+        ],
+    ),
+    "information_schema's namespace": (
+        "RP-126",
+        False,
+        [
+            "select oid from pg_namespace where nspname = 'information_schema'",
+            "select count(*) from information_schema.routines "
+            "where specific_schema = 'information_schema'",
+        ],
+    ),
+    "a view inside a FROM subquery": (
+        "RP-128",
+        False,
+        [
+            "select count(*) from (select domain_name from information_schema.domains) x",
+            "select count(*) from pg_namespace n where (n.nspname::text, 'a') in "
+            "(select domain_schema::text, domain_name::text from information_schema.domains)",
+        ],
+    ),
+    "a long generate_series": (
+        "RP-130",
+        False,
+        [
+            # The timestamp series only: the numeric one shares the fix and
+            # takes minutes in a debug build (10 million decimal additions).
+            "select count(*) from generate_series(timestamp '2000-01-01', "
+            "timestamp '2000-01-01' + interval '10000001 seconds', interval '1 second')",
         ],
     ),
     "ANALYZE computes statistics": (
@@ -350,7 +543,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "built-in objects in the catalogs": (
         "RP-102",
-        True,
+        False,
         [
             "select count(*) from pg_proc where pronamespace = 'pg_catalog'::regnamespace",
             "select count(*) from pg_type where typrelid <> 0 and typnamespace in "
@@ -388,7 +581,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "dependencies beyond relations": (
         "RP-105",
-        True,
+        False,
         [
             "create table rp26_d (a int check (a > 0), b int)",
             "create index rp26_d_expr on rp26_d ((a + b))",
@@ -642,7 +835,7 @@ EXPECTED: dict[str, Any] = {
         [("x", "True", "1"), ("y", "True", "0")],
         "DROP TABLE",
     ],
-    "a record's fields through a subquery": [[("True",)], [("integer",)]],
+    "a record's fields through a subquery": [[("integer",)], [("integer",)]],
     "a FROM function over the row to its left": [
         "CREATE TABLE",
         "INSERT 0 1",
@@ -764,6 +957,140 @@ EXPECTED: dict[str, Any] = {
         "DROP MATERIALIZED VIEW",
     ],
     "other database owners": [("rp26_shd_db", "pg_class", "o")],
+    "triggers PostgreSQL makes and their functions": [
+        "CREATE TABLE",
+        "CREATE TABLE",
+        "CREATE FUNCTION",
+        "CREATE TRIGGER",
+        [
+            ("rp28_c", "rp28_t", "False", "rp28_tf", "7", "False", "-", "-", "None"),
+            (
+                "rp28_c",
+                "RI_ConstraintTrigger_c_N",
+                "True",
+                '"RI_FKey_check_ins"',
+                "5",
+                "True",
+                "rp28_p",
+                "rp28_p_pkey",
+                "rp28_c_r_fkey",
+            ),
+            (
+                "rp28_c",
+                "RI_ConstraintTrigger_c_N",
+                "True",
+                '"RI_FKey_check_upd"',
+                "17",
+                "True",
+                "rp28_p",
+                "rp28_p_pkey",
+                "rp28_c_r_fkey",
+            ),
+            (
+                "rp28_p",
+                "RI_ConstraintTrigger_a_N",
+                "True",
+                '"RI_FKey_cascade_del"',
+                "9",
+                "True",
+                "rp28_c",
+                "rp28_p_pkey",
+                "rp28_c_r_fkey",
+            ),
+            (
+                "rp28_p",
+                "RI_ConstraintTrigger_a_N",
+                "True",
+                '"RI_FKey_noaction_upd"',
+                "17",
+                "True",
+                "rp28_c",
+                "rp28_p_pkey",
+                "rp28_c_r_fkey",
+            ),
+        ],
+        "DROP TABLE",
+        "DROP TABLE",
+        "DROP FUNCTION",
+    ],
+    "a composite type's relation": [
+        "CREATE TYPE",
+        [("rp28_comp", "c")],
+        [("rp28_comp",)],
+        ("ERR", "42809"),
+        ("ERR", "42809"),
+        ("ERR", "42809"),
+        "DROP TYPE",
+    ],
+    "a view's row type is a type": [
+        "CREATE VIEW",
+        [("rp28_v[]",)],
+        [("rp28_v[]",)],
+        [("rp28_v",)],
+        [("(1)", "2")],
+        [("rp28_v",)],
+        "DROP VIEW",
+    ],
+    "an index created in the open block": [
+        "BEGIN",
+        "CREATE TABLE",
+        "CREATE INDEX",
+        [("rp28_ix",)],
+        [("rp28_ix",)],
+        "ROLLBACK",
+    ],
+    "regproc names": [
+        [('"RI_FKey_check_ins"', "1644")],
+        "CREATE SCHEMA",
+        "CREATE FUNCTION",
+        [("rp28_s.h",)],
+        "SET",
+        [("h",)],
+        "RESET",
+        "DROP FUNCTION",
+        "DROP SCHEMA",
+    ],
+    "the plpgsql language's oid": [[("14035", "14032", "14033", "14034")]],
+    "a function's user-typed arguments": [
+        "CREATE TYPE",
+        "CREATE FUNCTION",
+        [("[0:2]={rp28_m,integer,rp28_m[]}", "rp28_m")],
+        "DROP FUNCTION",
+        "DROP TYPE",
+    ],
+    "a trigger's UPDATE OF columns": [
+        "CREATE TABLE",
+        "CREATE FUNCTION",
+        "CREATE TRIGGER",
+        [("3 1",)],
+        "DROP TABLE",
+        "DROP FUNCTION",
+    ],
+    "a vector as an array": [[("[0:1]={1,2}", "[0:1]={23,25}", "0")], [("[0:0]={1}",)]],
+    "dependencies on a constant's type and a range's functions": [
+        "CREATE TYPE",
+        "CREATE TABLE",
+        "CREATE INDEX",
+        [("1",)],
+        "CREATE TYPE",
+        [("17",)],
+        "DROP TYPE",
+        "DROP TABLE",
+        "DROP TYPE",
+    ],
+    "a materialized view's rule": [
+        "CREATE TABLE",
+        "SELECT 0",
+        [("_RETURN", "1", "True")],
+        [("1", "n")],
+        "DROP MATERIALIZED VIEW",
+        "DROP TABLE",
+    ],
+    "has_function_privilege by oid": [[("True", "True", "True", "True")]],
+    "information_schema's namespace": [[("13679",)], [("11",)]],
+    "a view inside a FROM subquery": [[("5",)], [("0",)]],
+    "copy char array": [("{i,o}", "i"), ("{v}", "v")],
+    "a long generate_series": [[("10000002",)]],
     "memberships": [
         ["CREATE ROLE", "CREATE ROLE", "GRANT ROLE", "CREATE DATABASE"],
         [("True", "1")],
@@ -910,6 +1237,37 @@ def test_other_databases_objects_in_pg_shdepend(rust_pg: Any) -> None:
     assert other_database_owners(_dsn(rust_pg)) == EXPECTED["other database owners"]
 
 
+def copy_char_array(dsn: str) -> list[Any]:
+    """RP-127: COPY into a `"char"[]` column stores an array."""
+    with psycopg.connect(dsn + " dbname=postgres", autocommit=True) as conn:
+        conn.execute('create temp table rp28_ca (m "char"[])')
+        with conn.cursor().copy("copy rp28_ca from stdin") as copy:
+            copy.write("{v}\n{i,o}\n")
+        return _answer(conn, "select m::text, m[1]::text from rp28_ca order by 1")
+
+
+@pytest.mark.backlog_fixed("RP-127")
+def test_copy_into_a_char_array(rust_pg: Any) -> None:
+    assert copy_char_array(_dsn(rust_pg)) == EXPECTED["copy char array"]
+
+
+def timeout_latency(dsn: str) -> tuple[Any, bool]:
+    """RP-129: statement_timeout ends a long statement at the deadline.
+
+    PostgreSQL 15.19 answers 57014 about 0.3 s in (it checks for interrupts
+    row by row); the bound below leaves room for a slow machine."""
+    with psycopg.connect(dsn + " dbname=postgres", autocommit=True) as conn:
+        conn.execute("set statement_timeout = '300ms'")
+        started = time.monotonic()
+        answer = _answer(conn, "select count(*) from generate_series(1, 30000000)")
+        return answer, time.monotonic() - started < 3.0
+
+
+@pytest.mark.backlog("RP-129")
+def test_statement_timeout_is_prompt(rust_pg: Any) -> None:
+    assert timeout_latency(_dsn(rust_pg)) == (("ERR", "57014"), True)
+
+
 @pytest.mark.backlog_fixed("RP-094")
 def test_copy_of_a_table(rust_pg: Any) -> None:
     assert copy_table(_dsn(rust_pg)) == EXPECTED["copy table"]
@@ -935,6 +1293,7 @@ if __name__ == "__main__":
     }
     measured["memberships"] = memberships(dsn)
     measured["copy table"] = copy_table(dsn)
+    measured["copy char array"] = copy_char_array(dsn)
     measured["other database owners"] = other_database_owners(dsn)
     print("EXPECTED: dict[str, Any] = " + pprint.pformat(measured, width=100, sort_dicts=True))
     port = int(dsn.split("port=")[1].split()[0])
