@@ -527,6 +527,58 @@ These are explicit non-goals. Don't add them without a reason.
       Backlog-ID: RM-023
       Verify: tests/backlog/test_rm_001_028.py::test_slow_query_line_says_where_the_time_went
 
+### 7.088 Expression code no test had executed, against mongod -- 2026-10-21
+
+A line-coverage run (`docs-rust/coverage.md`, `./inv rust-mdb-coverage`)
+found ~2,000 lines of `crates/secantus-core/src/expressions.rs` that no test
+suite executed; the generic `tools/probes/agg_expressions.py` sweep reached
+about half of them, and none of what it reached diverged beyond the
+authorised Decimal128 last digit. The rest sits behind STRUCTURED arguments
+the generic sweep cannot build (`op_switch` had never run at all), so the
+cases in `tools/probes/expression_shapes.py` were written against those
+lines and run against mongod 8.2.11 on macOS arm64. Each item below is one
+root cause; its gap test in `tests/backlog/test_rm_found_2026_10_21b.py`
+holds every shape measured for it and asks mongod live. Four more were
+fixed in the same batch, all in the comparison code every query shares:
+BinData order (RM-232) and JavaScript-with-scope as its own type (RM-233),
+which moved the index-entry format to 5, and MinKey / MaxKey equality
+(RM-234) and field order in document equality (RM-235). On 2026-10-22 a
+second batch took the "not supported" refusals out of the expression engine
+(in the harness, 207 refusals became 3) and closed RM-238, RM-240,
+RM-241, RM-242, RM-247 and RM-250, and parts of RM-246 and RM-252. A third
+batch the same day closed the silent wrong values RM-236, RM-237, RM-239,
+RM-243, RM-244 and RM-248 (in the harness, 98 wrong values became 34).
+RM-249 followed: the server now answers time-zone questions from mongod's
+own timezonedb (`crates/secantus-core/tzdata/`), and `tools/probes/time_zones.py`
+finds no difference on any of 601 names.
+A fourth batch closed RM-246 and RM-252 and part of RM-251, and filed and
+fixed RM-255 to RM-257 (in the harness, 63 wrong codes became 13); RM-258
+was filed open.
+RM-251 closed after it: constant sub-expressions are folded bottom-up in
+every stage, as mongod folds them.
+
+- [ ] **Decimal128 transcendentals beyond the authorised last digit.** Tiny
+  operands underflow to 0 in `$sinh` / `$tanh` / `$atanh` (between 1E-75
+  and 1E-80); results lose mongod's 34-digit form and a zero's exponent;
+  `$sin` of 1E+1200 is 50989 instead of a value; `$sinh` / `$tanh` of
+  1E+34 are 2 "not supported" instead of Infinity / 1.
+  Backlog-ID: RM-245
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_decimal_hyperbolic_and_trig_edges
+- [ ] **`$dateFromString` of a five-digit year is ten seconds out.**
+  `"10000-01-01"` is read by timelib as the no-colon time `1000` and the
+  date `0-01-01`; mongod answers 2000-01-01T09:59:50Z and the Rust port of
+  the scanner 10:00:00 (so does `"1000 0-01-01"`, and `"2000 0-03-04"` is
+  19:59:50 on mongod). Some rule after `gnunocolon` in timelib's
+  `parse_date.re` subtracts the ten seconds and the port does not; found by
+  `tools/probes/expression_shapes.py`, not yet traced.
+  Backlog-ID: RM-258
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_date_from_string_five_digit_year
+- [ ] **`$bucket` with non-numeric boundaries.** mongod emits the buckets in
+  `_id` order, so a string `default` comes before date buckets; here it
+  comes last. Decimal128 or mixed numeric boundaries are 2 "not supported".
+  Backlog-ID: RM-253
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_bucket_with_non_numeric_boundaries
+
 ### 7.087 Window functions and the operator tail against mongod -- 2026-10-21
 
 The first comparison of `$setWindowFields` / `$fill` and of a tail of
@@ -557,19 +609,6 @@ about forty such points; these are the ones measured.
       name (`Fallback::mongo(code, msg)`) belongs.
       Backlog-ID: RM-226
       Verify: tests/backlog/test_rm_found_2026_10_21.py::test_window_spec_errors_carry_mongods_codes
-- [ ] **`$convert` to a target it cannot produce answers code 2, and
-      ignores `onError`.** `convert_target` defers on any `to` outside the
-      nine convertible types (`expressions.rs`). mongod 8.2.11 tells three
-      cases apart: an unknown name ("uuid", "foo", `{type: "uuid"}`) is 2
-      "Unknown type name: uuid", `onError` or not; a number that is no BSON
-      type is 9 "In $convert, numeric value for 'to' does not correspond to
-      a BSON type: 99"; a real BSON type `$convert` cannot produce ("array",
-      "timestamp", "null", "regex", 4) is 241 "Unsupported conversion from
-      string to array in $convert with no onError value" -- and with
-      `onError` mongod answers the `onError` value, where this server
-      errors. Found by `tests/mongod_live/test_operator_tail.py`, 2026-10-21.
-      Backlog-ID: RM-228
-      Verify: tests/backlog/test_rm_found_2026_10_21.py::test_convert_to_a_target_it_cannot_produce
 - [ ] **A change stream's post-image is the document now, not as the
       update left it.** On a collection with `changeStreamPreAndPostImages:
       {enabled: true}`, `fullDocument: "whenAvailable"` / `"required"` makes
@@ -942,7 +981,12 @@ Still different:
       them moving with load. Still unexplained: at 12 test workers on a
       12-core Mac, `$merge creating its target` read 4 global IS (2 idle) in
       all five reference runs, with yielding off as well; at CI's 4 workers
-      it reads 2.
+      it reads 2. Four coverage runs on 2026-10-21 (backlog verifier at 4
+      workers, against an instrumented debug build of this server) reported
+      RM-185 REGRESSED twice: once `test_lock_counts_of_merge`, once
+      `test_lock_counts_of_index_build_and_out_shapes`, where the yield-off
+      reference mongod itself read 8 global IS for `$out again` in one of
+      its five runs and 7 in the others -- drift on mongod's side.
       Backlog-ID: RM-185
       Verify: tests/backlog/test_rm_185_locks.py::test_lock_counts_of_merge_fail_with_duplicates
 - **Scope decision — `replSetReconfig` takes one member, this server**
@@ -2046,6 +2090,23 @@ touched:
 
 ## Weekly validate.yml failures (2026-08-03 triage)
 
+
+## The backlog verifier's pytest stalled once in CI (2026-10-21)
+
+- [ ] **One CI run of the storage-engine (ubuntu) backlog step stalled for
+  300 s and was killed.** PR #2082's run 39691311797, first attempt: the
+  `tools/backlog.py verify --regressions` pytest reported no test for 301 s
+  ("=== pytest session stalled ==="), three tests of
+  `tests/backlog/test_rm_found_2026_10_20b.py` never ran
+  (`test_snapshot_read_at_cluster_time`,
+  `test_snapshot_session_keeps_its_snapshot`, `test_diagnostic_stages`), and
+  the step failed. The re-run passed, `main` had passed six runs in a row,
+  and the module ran in 23 s locally. Not known: which test hung. The
+  stall dump prints the CONTROLLER's threads only, so the next stall should
+  dump the workers' stacks too (and the servers they started) -- that is
+  the change that makes this diagnosable.
+  Backlog-ID: RM-254
+  Verify: none -- an intermittent CI stall whose hung test is unknown
 
 ## The macOS `test` lane wedges for its whole 30-minute cap, rarely (2026-09-18)
 

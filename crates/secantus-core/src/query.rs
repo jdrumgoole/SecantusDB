@@ -354,6 +354,7 @@ fn match_clause(
             // this match was given is made active for the evaluation.
             let value = {
                 let _on = coll.map(|c| collation::activate(Some(c)));
+                let _filter = expressions::enter_query_filter();
                 expressions::evaluate(doc, cond, vars)?
             };
             Ok(expressions::truthy(&value) && expr_in_by_value(doc, cond, vars, coll)?)
@@ -1430,15 +1431,16 @@ fn compare_values(
                 _ => None,
             }
         }
-        fn js_text(v: &Bson) -> Option<&str> {
-            match v {
-                Bson::JavaScriptCode(s) => Some(s),
-                Bson::JavaScriptCodeWithScope(c) => Some(&c.code),
-                _ => None,
+        // JavaScript and JavaScript-with-scope are two types to mongod, each
+        // comparing only with itself; a scope compares as a document (RM-233).
+        match (a, b) {
+            (Bson::JavaScriptCode(x), Bson::JavaScriptCode(y)) => return Ok(Some(x.cmp(y))),
+            (Bson::JavaScriptCodeWithScope(_), Bson::JavaScriptCodeWithScope(_)) => {
+                return Ok(Some(crate::order::cmp(a, b)));
             }
-        }
-        if let (Some(x), Some(y)) = (js_text(a), js_text(b)) {
-            return Ok(Some(x.cmp(y)));
+            (Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_), _)
+            | (_, Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_)) => return Ok(None),
+            _ => {}
         }
         let (Some(x), Some(y)) = (string_text(a), string_text(b)) else {
             return Ok(None);
@@ -1457,7 +1459,7 @@ fn compare_values(
             Some((x.time, x.increment).cmp(&(y.time, y.increment)))
         }
         (Bson::ObjectId(x), Bson::ObjectId(y)) => Some(x.bytes().cmp(&y.bytes())),
-        (Bson::Binary(x), Bson::Binary(y)) => Some(x.bytes.cmp(&y.bytes)),
+        (Bson::Binary(x), Bson::Binary(y)) => Some(crate::order::bindata_cmp(x, y)),
         // Different (non-numeric) types or null-vs-null: not comparable.
         _ => None,
     })

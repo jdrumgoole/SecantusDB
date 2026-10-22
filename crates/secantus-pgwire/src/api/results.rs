@@ -873,6 +873,9 @@ pub struct CopyResponse {
     pub format: i8,
     pub columns: usize,
     pub data_stream: SendableCopyDataStream,
+    /// Leading `CopyData` messages that are not rows (a CSV / text
+    /// `HEADER` line), left out of the `COPY n` tag. SecantusDB local patch.
+    pub header_messages: usize,
 }
 
 impl std::fmt::Debug for CopyResponse {
@@ -898,14 +901,22 @@ impl CopyResponse {
                 format,
                 columns,
                 data_stream: Box::pin(data_stream),
+                header_messages: 0,
             }
         } else {
             CopyResponse {
                 format,
                 columns,
                 data_stream: Box::pin(data_stream),
+                header_messages: 0,
             }
         }
+    }
+
+    /// The response with its first `n` messages uncounted in the tag.
+    pub fn with_header_messages(mut self, n: usize) -> CopyResponse {
+        self.header_messages = n;
+        self
     }
 
     /// Get mutable access to the underlying copy data stream.

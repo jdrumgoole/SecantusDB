@@ -16,26 +16,32 @@ pub(crate) fn rewrite(
 ) -> Result<Option<pg_query::protobuf::SelectStmt>> {
     let mut out = s.clone();
     let mut changed = false;
-    for item in &mut out.from_clause {
-        changed |= rewrite_item(item)?;
+    for (i, item) in out.from_clause.iter_mut().enumerate() {
+        changed |= rewrite_item(item, i > 0)?;
     }
     Ok(changed.then_some(out))
 }
 
-fn rewrite_item(item: &mut pg_query::protobuf::Node) -> Result<bool> {
+/// `has_left`: a FROM item stands to this one's left, which a function in
+/// FROM reads implicitly (it is LATERAL whether or not it says so); the
+/// subquery standing in for it has to say so.
+fn rewrite_item(item: &mut pg_query::protobuf::Node, has_left: bool) -> Result<bool> {
     match item.node.as_mut() {
         Some(N::JoinExpr(j)) => {
             let mut changed = false;
             if let Some(l) = j.larg.as_deref_mut() {
-                changed |= rewrite_item(l)?;
+                changed |= rewrite_item(l, has_left)?;
             }
             if let Some(r) = j.rarg.as_deref_mut() {
-                changed |= rewrite_item(r)?;
+                changed |= rewrite_item(r, true)?;
             }
             Ok(changed)
         }
         Some(N::RangeFunction(rf)) if rf.ordinality => {
-            let rewritten = as_subselect(rf)?;
+            let mut rewritten = as_subselect(rf)?;
+            if let N::RangeSubselect(rs) = &mut rewritten {
+                rs.lateral |= has_left;
+            }
             item.node = Some(rewritten);
             Ok(true)
         }

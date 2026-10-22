@@ -33,6 +33,12 @@ enum Origin {
     ),
     /// A VALUES list column of records.
     Values,
+    /// `information_schema._pg_expandarray(arr)` in the select list of
+    /// `leaf`: its OUT parameters, `x` (the array's element) and `n integer`.
+    Expand(
+        Box<pg_query::protobuf::Node>,
+        Box<pg_query::protobuf::SelectStmt>,
+    ),
 }
 
 /// `(alias, column, origin)` for every record column the FROM items expose.
@@ -78,7 +84,26 @@ fn add_origins(
         let Some(N::ResTarget(rt)) = t.node.as_ref() else {
             continue;
         };
-        let Some(N::RowExpr(row)) = rt.val.as_deref().and_then(|v| v.node.as_ref()) else {
+        let val = rt.val.as_deref().and_then(|v| v.node.as_ref());
+        if let Some(N::FuncCall(fc)) = val {
+            if let ([arg], Some("_pg_expandarray")) = (fc.args.as_slice(), func_name(fc).as_deref())
+            {
+                let name = colnames.get(i).cloned().unwrap_or_else(|| {
+                    if rt.name.is_empty() {
+                        "_pg_expandarray".to_string()
+                    } else {
+                        rt.name.clone()
+                    }
+                });
+                out.push((
+                    alias.to_string(),
+                    name,
+                    Origin::Expand(Box::new(arg.clone()), Box::new(leaf.clone())),
+                ));
+            }
+            continue;
+        }
+        let Some(N::RowExpr(row)) = val else {
             continue;
         };
         let name = colnames.get(i).cloned().unwrap_or_else(|| {
@@ -272,7 +297,48 @@ fn selected_arg<'o>(
     };
     match resolve(c, s, origins, lookup)? {
         Origin::Row(args, leaf) => Some((args.get(position(field)?)?, leaf)),
-        Origin::Values => None,
+        Origin::Values | Origin::Expand(..) => None,
+    }
+}
+
+/// The type of `(c).x` / `(c).n` where `c` is a subquery's
+/// `_pg_expandarray(arr)` column.
+fn expand_field_type(
+    arg: &pg_query::protobuf::Node,
+    field: &str,
+    s: &pg_query::protobuf::SelectStmt,
+    origins: &Origins,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<String> {
+    let Some(N::ColumnRef(c)) = arg.node.as_ref() else {
+        return None;
+    };
+    let Origin::Expand(array, leaf) = resolve(c, s, origins, lookup)? else {
+        return None;
+    };
+    match field {
+        "n" => Some("int4".to_string()),
+        "x" => element_type(array, leaf, lookup),
+        _ => None,
+    }
+}
+
+/// The element type of the array expression `e` in `leaf`'s select list.
+fn element_type(
+    e: &pg_query::protobuf::Node,
+    leaf: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<String> {
+    let of_array = |t: &str| match t {
+        "int2vector" => Some("int2".to_string()),
+        "oidvector" => Some("oid".to_string()),
+        _ => t.strip_suffix("[]").map(str::to_string),
+    };
+    match e.node.as_ref()? {
+        N::TypeCast(tc) => of_array(&type_name_of(tc.type_name.as_ref()?)),
+        N::AArrayExpr(a) => optype::type_in_select(leaf, a.elements.first()?, lookup),
+        N::CoalesceExpr(c) => c.args.iter().find_map(|a| element_type(a, leaf, lookup)),
+        _ => of_array(&optype::type_in_select(leaf, e, lookup)?),
     }
 }
 
@@ -307,7 +373,8 @@ pub(crate) fn rewrite(
         }
         if let Some(N::TypeCast(tc)) = n.node.as_ref() {
             if let Some((arg, field)) = tc.arg.as_deref().and_then(selection) {
-                skip_next = selected_arg(arg, field, s, &origins, lookup).is_some();
+                skip_next = selected_arg(arg, field, s, &origins, lookup).is_some()
+                    || expand_field_type(arg, field, s, &origins, lookup).is_some();
             }
             return Ok(());
         }
@@ -348,10 +415,11 @@ pub(crate) fn rewrite(
                 ));
             }
         }
-        let Some((e, leaf)) = selected_arg(arg, field, s, &origins, lookup) else {
-            return Ok(());
+        let ty = match selected_arg(arg, field, s, &origins, lookup) {
+            Some((e, leaf)) => field_type(e, leaf, lookup),
+            None => expand_field_type(arg, field, s, &origins, lookup),
         };
-        let Some(ty) = field_type(e, leaf, lookup) else {
+        let Some(ty) = ty else {
             return Ok(());
         };
         let selected = n.clone();

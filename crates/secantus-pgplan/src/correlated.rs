@@ -317,6 +317,96 @@ pub(crate) fn inner_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
     names
 }
 
+/// The bare column names in the arguments of the subquery's FROM functions.
+fn function_arg_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in &s.from_clause {
+        let Some(rf @ N::RangeFunction(_)) = item.node.as_ref() else {
+            continue;
+        };
+        for (n, _, _, _) in rf.nodes() {
+            if let pg_query::NodeRef::ColumnRef(c) = n {
+                if let Some([name]) = parts_of(c).as_deref() {
+                    if !out.contains(name) {
+                        out.push(name.clone());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The bare names in FROM functions' arguments -- at this level or inside a
+/// FROM subquery -- that no relation beside the function has: a function
+/// has no columns of its own, so such a name is the row to the LEFT of a
+/// LATERAL item (`unnest(a) WITH ORDINALITY`, which `rowsfrom` makes a
+/// subquery).
+pub(crate) fn left_function_args(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Vec<String> {
+    let mut out: Vec<String> = function_arg_names(s)
+        .into_iter()
+        .filter(|n| !inner_column(s, n, lookup))
+        .collect();
+    for item in &s.from_clause {
+        if let Some(N::RangeSubselect(rs)) = item.node.as_ref() {
+            if let Some(N::SelectStmt(sel)) = rs.subquery.as_deref().and_then(|q| q.node.as_ref()) {
+                for n in left_function_args(sel, lookup) {
+                    if !out.contains(&n) && !inner_column(s, &n, lookup) {
+                        out.push(n);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether a FROM function's argument names a column of the outer query that
+/// no relation of the subquery has (`unnest(evttags)` under psql's `\dy`).
+pub(crate) fn function_arg_outer_ref(
+    inner: &pg_query::protobuf::SelectStmt,
+    outer: &[String],
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> bool {
+    function_arg_names(inner)
+        .iter()
+        .any(|n| outer.contains(n) && !inner_column(inner, n, lookup))
+}
+
+/// A bare name in a FROM function's arguments that no relation of the
+/// subquery and nothing of the outer query has.
+pub(crate) fn unknown_function_arg(
+    inner: &pg_query::protobuf::SelectStmt,
+    outer: &[String],
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<String> {
+    function_arg_names(inner)
+        .into_iter()
+        .find(|n| !outer.contains(n) && !inner_column(inner, n, lookup))
+}
+
+/// Does a relation in the subquery's FROM have a column `name`?
+fn inner_column(
+    s: &pg_query::protobuf::SelectStmt,
+    name: &str,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> bool {
+    s.from_clause
+        .iter()
+        .filter_map(|item| item.node.as_ref())
+        .any(|item| {
+            item.nodes().iter().any(|(n, _, _, _)| match n {
+                pg_query::NodeRef::RangeVar(r) => {
+                    lookup(&r.relname).is_some_and(|d| d.columns.iter().any(|c| c.name == name))
+                }
+                _ => false,
+            })
+        })
+}
+
 fn parts_of(c: &pg_query::protobuf::ColumnRef) -> Option<Vec<String>> {
     c.fields
         .iter()
@@ -428,6 +518,27 @@ pub(crate) fn correlate(
                 if outer.contains(&name) && !outer_refs.contains(&vec![name.clone()]) =>
             {
                 outer_refs.push(vec![name]);
+            }
+            // A bare name in a FROM function's arguments
+            // (`unnest(evttags)`, `pg_options_to_table(fdwoptions)`) is
+            // refused before it can be found undefined: it is the outer
+            // row's when the outer query has it and no relation of the
+            // subquery does (a FROM function may read an earlier FROM item,
+            // which is the nearer scope).
+            Err(e @ Error::Unsupported(_)) => {
+                let fresh: Vec<Vec<String>> = function_arg_names(inner)
+                    .into_iter()
+                    .filter(|n| outer.contains(n) && !inner_column(inner, n, lookup))
+                    .map(|n| vec![n])
+                    .filter(|r| !outer_refs.contains(r))
+                    .collect();
+                if fresh.is_empty() {
+                    match typed_probe(inner, &outer_refs, first, lookup, params) {
+                        Some(p) => break (p, body),
+                        None => return Err(e),
+                    }
+                }
+                outer_refs.extend(fresh);
             }
             // An untyped NULL parameter is `text`, which a call over the
             // outer value may not take (`max(s.x) over ()`): typed by the
@@ -861,6 +972,11 @@ pub fn with_sequence_hook<R>(hook: &SequenceHook<'_>, f: impl FnOnce() -> R) -> 
 pub(crate) const SEQUENCE_FUNCTIONS: &[&str] = &[
     // `pg_trgm`'s `set_limit` writes the session's threshold.
     "set_limit",
+    // `set_config` over a row's values (`set_config(name, v, false) FROM
+    // pg_settings`, which pg_dump sends) writes the session's settings.
+    "set_config",
+    "pg_my_temp_schema",
+    "pg_get_serial_sequence",
     "nextval",
     "currval",
     "setval",
@@ -920,6 +1036,9 @@ pub fn executor_function_type(name: &str) -> Option<&'static str> {
         n if n.contains("advisory") => "void",
         "pg_has_role" => "bool",
         "set_limit" => "float4",
+        "set_config" => "text",
+        "pg_my_temp_schema" => "oid",
+        "pg_get_serial_sequence" => "text",
         "lo_creat" | "lo_create" | "lo_from_bytea" => "oid",
         "lo_unlink" | "lo_open" | "lo_close" | "lowrite" | "lo_lseek" | "lo_tell"
         | "lo_truncate" | "lo_truncate64" => "int4",

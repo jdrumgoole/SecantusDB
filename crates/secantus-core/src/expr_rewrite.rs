@@ -132,28 +132,89 @@ fn evaluate_constant(e: &Bson) -> Option<Bson> {
     crate::expressions::evaluate(&Document::new(), e, &Document::new()).ok()
 }
 
-/// The error mongod raises while it optimizes a query's `$expr`: the first
+/// The error mongod raises while it optimizes an expression: the first
 /// constant sub-expression that fails to evaluate (measured 8.2.11,
 /// 2026-10-16: `{$add: ["$a", {$divide: [1, 0]}]}` fails before any
-/// document is read, on an empty collection too). Folding visits every
-/// constant subtree, so an `$and` that would short-circuit at run time does
-/// not hide one.
+/// document is read, on an empty collection too).
+///
+/// mongod optimizes BOTTOM-UP, every child before its parent and left to
+/// right, and evaluates each constant one it folds. So a failing constant
+/// fails the pipeline wherever it sits: in a `$cond` branch that is never
+/// taken, after a short-circuiting `$and`, as the `in` of a `$map` over `[]`
+/// or the `cond` of a `$filter` (measured 8.2.11, 2026-10-22). The children
+/// of an operator mongod never folds itself (`$map`, `$filter`, `$reduce`,
+/// `$rand`, ...) are still folded. Only `$literal`'s contents and the code
+/// of `$function` / `$accumulator` are not expressions to visit, and
+/// `$switch` folds its own way (`switch_fault`).
 pub fn constant_expr_fault(arg: &Bson) -> Option<crate::fallback::Fallback> {
-    if is_constant(arg) {
+    let child = match arg {
+        Bson::Array(items) => items.iter().find_map(constant_expr_fault),
+        Bson::Document(d) => match d.iter().next() {
+            Some((op, _))
+                if d.len() == 1
+                    && matches!(op.as_str(), "$literal" | "$function" | "$accumulator") =>
+            {
+                None
+            }
+            Some((op, spec)) if d.len() == 1 && op == "$switch" => switch_fault(spec),
+            _ => d.values().find_map(constant_expr_fault),
+        },
+        _ => None,
+    };
+    if child.is_some() {
+        return child;
+    }
+    // Constant AND one mongod folds: some operators it never evaluates while
+    // optimizing, whatever their arguments (`aggregate::is_constant_expression`).
+    if is_constant(arg) && crate::aggregate::is_constant_expression(arg, &[]) {
         return crate::expressions::evaluate(&Document::new(), arg, &Document::new())
             .err()
             // A PARSE error (a missing required argument) is reported bare,
             // and by the command's own checks, not as an optimizer failure.
             .filter(|f| f.as_mongo().is_some() && !f.is_bare());
     }
-    match arg {
-        Bson::Array(items) => items.iter().find_map(constant_expr_fault),
-        Bson::Document(d) => match d.iter().next() {
-            Some((op, _)) if d.len() == 1 && has_named_arguments(op) => None,
-            _ => d.values().find_map(constant_expr_fault),
-        },
-        _ => None,
+    None
+}
+
+/// How mongod optimizes a `$switch` (measured 8.2.11, 2026-10-22): `default`
+/// first, then each branch in order -- its `case`, and then, when the case
+/// folds to a constant, either its `then` and nothing after it (a truthy
+/// case) or nothing of it at all (a falsy one); a case that reads the
+/// document has its `then` optimized and the walk goes on. So
+/// `{branches: [{case: true, then: 1}, {case: {$divide: [1, 0]}, then: 2}]}`
+/// answers 1, while an erroring `default` beside it does not.
+fn switch_fault(spec: &Bson) -> Option<crate::fallback::Fallback> {
+    let Bson::Document(spec) = spec else {
+        return constant_expr_fault(spec);
+    };
+    if let Some(fault) = spec.get("default").and_then(constant_expr_fault) {
+        return Some(fault);
     }
+    let Some(Bson::Array(branches)) = spec.get("branches") else {
+        return None;
+    };
+    for branch in branches {
+        let Bson::Document(branch) = branch else {
+            continue;
+        };
+        let (case, then) = (branch.get("case"), branch.get("then"));
+        if let Some(fault) = case.and_then(constant_expr_fault) {
+            return Some(fault);
+        }
+        let constant_case = case
+            .filter(|c| is_constant(c) && crate::aggregate::is_constant_expression(c, &[]))
+            .and_then(evaluate_constant);
+        match constant_case {
+            Some(v) if crate::expressions::truthy(&v) => return then.and_then(constant_expr_fault),
+            Some(_) => continue,
+            None => {
+                if let Some(fault) = then.and_then(constant_expr_fault) {
+                    return Some(fault);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// [`constant_expr_fault`] over every `$expr` in a query filter, as mongod's
@@ -433,5 +494,38 @@ mod tests {
                 doc! {"b": {"$eq": 2}},
             ]
         );
+    }
+
+    /// mongod 8.2.11 (2026-10-22): every constant sub-expression is folded,
+    /// bottom-up, wherever it sits -- except a `$switch`'s branches after a
+    /// constant truthy case, and a constant falsy case's `then`.
+    #[test]
+    fn constant_faults_are_found_bottom_up() {
+        use super::constant_expr_fault;
+        let d = bson!({"$divide": [1, 0]});
+        let faults = |e: Bson| constant_expr_fault(&e).is_some();
+        for e in [
+            bson!({"$cond": [true, 1, d.clone()]}),
+            bson!({"$cond": [{"$eq": ["$n", 2]}, 1, d.clone()]}),
+            bson!({"$ifNull": [1, d.clone()]}),
+            bson!({"$and": [false, d.clone()]}),
+            bson!({"$map": {"input": [], "in": d.clone()}}),
+            bson!({"$map": {"input": "$a", "in": d.clone()}}),
+            bson!({"$let": {"vars": {"x": d.clone()}, "in": 1}}),
+            bson!({"a": [1, d.clone()]}),
+            bson!({"$switch": {"branches": [{"case": true, "then": 1}], "default": d.clone()}}),
+            bson!({"$switch": {"branches": [{"case": false, "then": 1}, {"case": d.clone(), "then": 2}]}}),
+            bson!({"$switch": {"branches": [{"case": "$n", "then": d.clone()}]}}),
+        ] {
+            assert!(faults(e.clone()), "{e}");
+        }
+        for e in [
+            bson!({"$switch": {"branches": [{"case": true, "then": 1}, {"case": d.clone(), "then": 2}]}}),
+            bson!({"$switch": {"branches": [{"case": false, "then": d.clone()}], "default": 1}}),
+            bson!({"$literal": d.clone()}),
+            bson!({"$add": ["$n", 1]}),
+        ] {
+            assert!(!faults(e.clone()), "{e}");
+        }
     }
 }

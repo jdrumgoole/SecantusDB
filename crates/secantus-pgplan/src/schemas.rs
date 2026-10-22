@@ -211,6 +211,23 @@ pub fn search_path() -> Vec<String> {
         .collect()
 }
 
+/// A stored name (`name` for `public`'s, `schema.name` for another schema's)
+/// as PostgreSQL prints an object: bare while the current `search_path`
+/// reaches its schema (`pg_catalog` always), qualified otherwise -- the rule
+/// of `generate_relation_name`, `TypeIsVisible` and `FunctionIsVisible`
+/// (short of an earlier schema holding the same name). Unquoted.
+pub fn visible_name(stored: &str) -> String {
+    let (schema, bare) = match stored.split_once('.') {
+        Some((s, b)) => (s.to_string(), b),
+        None => ("public".to_string(), stored),
+    };
+    if schema == "pg_catalog" || search_path().contains(&schema) {
+        bare.to_string()
+    } else {
+        format!("{schema}.{bare}")
+    }
+}
+
 /// Is the path one that can only ever resolve to `public` -- nothing to
 /// rewrite?
 fn path_is_trivial(path: &[String]) -> bool {

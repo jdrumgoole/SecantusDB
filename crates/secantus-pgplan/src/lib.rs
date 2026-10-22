@@ -80,9 +80,11 @@ pub fn encode_multi_byte(canonical: &str, text: &str) -> std::result::Result<Vec
 pub mod bytea;
 pub mod cancel;
 pub mod catalog_stmts;
+pub mod copy_opts;
 pub mod correlated;
 pub mod cursor_scroll;
 pub mod datetime;
+mod datum_size;
 pub mod domains;
 pub mod dtparse;
 mod enum_order;
@@ -94,6 +96,11 @@ pub mod formatting;
 pub mod fts;
 mod func_cast;
 mod funcsig;
+mod named_args;
+mod schema_functions;
+mod search_cycle;
+mod strict_fold;
+mod system_views;
 pub mod timezones;
 mod ts_debug;
 mod ts_rewrite;
@@ -103,6 +110,7 @@ pub mod wparser;
 mod xml_catalog;
 mod xml_export;
 mod xml_schema;
+pub use funcsig::category_preferred_of_oid;
 pub use funcsig::is_builtin_function_name as is_known_function;
 mod optype;
 mod semijoin;
@@ -155,6 +163,7 @@ pub mod money;
 pub mod net;
 pub mod numeric;
 pub mod numeric_math;
+pub mod output_style;
 pub mod pg_casts;
 pub mod pgtypes;
 pub mod range;
@@ -746,6 +755,8 @@ pub enum Statement {
     CreateSchema {
         name: String,
         if_not_exists: bool,
+        /// `AUTHORIZATION role`: the schema's owner.
+        authorization: Option<String>,
     },
     /// `CREATE TYPE <name> AS (<field type>, ...)` -- a composite type.
     CreateComposite {
@@ -774,9 +785,21 @@ pub enum Statement {
         if_exists: bool,
         cascade: bool,
     },
-    /// `CREATE DATABASE <name>` -- the options are accepted and ignored.
+    /// `CREATE DATABASE <name> [WITH option value ...]`: each option by its
+    /// lower-case name (`template`, `encoding`, `owner`, `connection_limit`,
+    /// `is_template`, `allow_connections`, `locale`, `lc_collate`, ...) with
+    /// its value as text, as the statement gave them (RP-064).
     CreateDatabase {
         name: String,
+        options: Vec<(String, String)>,
+    },
+    /// `ALTER DATABASE d [WITH] option value ...` / `RENAME TO n` /
+    /// `OWNER TO r` (RP-064).
+    AlterDatabase {
+        name: String,
+        options: Vec<(String, String)>,
+        rename: Option<String>,
+        owner: Option<String>,
     },
     /// `DROP DATABASE [IF EXISTS] <name>`.
     DropDatabase {
@@ -860,9 +883,16 @@ pub enum Statement {
         members: Vec<String>,
         admin: bool,
     },
-    /// `ALTER DEFAULT PRIVILEGES ...`: accepted, and changes nothing a
-    /// single-user test server acts on.
-    AlterDefaultPrivileges,
+    /// `ALTER DEFAULT PRIVILEGES [FOR ROLE r, ...] [IN SCHEMA s, ...]
+    /// GRANT | REVOKE ...`: the grant or revoke, kept for the objects those
+    /// roles create from now on (`pg_default_acl`). `kind` in the action is
+    /// what it applies to (`table`, `sequence`, `function`, `type`,
+    /// `schema`); its objects are empty.
+    AlterDefaultPrivileges {
+        roles: Vec<String>,
+        schemas: Vec<String>,
+        action: Box<Statement>,
+    },
     /// `COMMENT ON <kind> <object> IS '...' | NULL`. `kind` is the object
     /// type in lower case (`table`, `column`, `index`, `constraint`, ...);
     /// `names` its name parts (`[table, column]`, `[table, constraint]`, a
@@ -891,6 +921,18 @@ pub enum Statement {
     },
     /// `RESET name` / `RESET ALL`.
     Reset(String),
+    /// `ALTER MATERIALIZED VIEW m RENAME TO n`.
+    RenameMatView {
+        matview: String,
+        to: String,
+        missing_ok: bool,
+    },
+    /// `ALTER TYPE t OWNER TO r` / `ALTER DOMAIN d OWNER TO r`.
+    AlterTypeOwner {
+        name: String,
+        owner: String,
+        domain: bool,
+    },
     /// `ALTER DATABASE d SET name = value` (`value` None for `RESET name` /
     /// `SET name TO DEFAULT`; `name` None for `RESET ALL`).
     AlterDatabaseSet {
@@ -1052,6 +1094,8 @@ pub enum Statement {
     RefreshMatView {
         name: String,
         with_data: bool,
+        /// `CONCURRENTLY`.
+        concurrent: bool,
     },
     /// `DROP MATERIALIZED VIEW [IF EXISTS] names`.
     DropMatView {
@@ -2048,6 +2092,13 @@ pub enum AlterTableAction {
     /// `OWNER TO role`: checked (the role must exist) and otherwise a no-op,
     /// since every relation here is the session's.
     OwnerTo(String),
+    /// `ALTER COLUMN c ADD GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY
+    /// [(options)]`.
+    AddIdentity {
+        column: String,
+        always: bool,
+        options: SequenceOptions,
+    },
     /// `VALIDATE CONSTRAINT name`: every constraint here is validated when
     /// added, so only its existence is checked.
     ValidateConstraint(String),
@@ -3082,6 +3133,8 @@ pub struct CopyFrom {
     /// `HEADER`: a first line of column names, written on the way out and
     /// skipped on the way in.
     pub header: bool,
+    /// DELIMITER, NULL, QUOTE, ESCAPE, FORCE_*, FREEZE and ENCODING.
+    pub options: copy_opts::CopyOptions,
 }
 
 /// `DROP TABLE a, b` / `DROP TABLE IF EXISTS a`.
@@ -3425,6 +3478,46 @@ fn array_subscript(
     }
     // An array whose lower bound is not 1 is subscripted relative to it: each
     // dimension's subscripts move by that dimension's bound.
+    // `name` is a fixed-length array of 64 `"char"` from 0
+    // (`raw_array_subscript_handler`): the byte at the index, a zero byte
+    // past the name's end, NULL outside the array. pg_dump writes
+    // `typname[0] = '_'`.
+    if static_type(arg, &value) == "name" {
+        if value == Bson::Null {
+            return Ok(Bson::Null);
+        }
+        let [only] = indirection else {
+            return Ok(Bson::Null);
+        };
+        let Some(N::AIndices(idx)) = only.node.as_ref() else {
+            return Err(Error::Unsupported("this field selection".into()));
+        };
+        if idx.is_slice {
+            return Err(Error::FeatureNotSupported(
+                "slices of fixed-length arrays not implemented".into(),
+            ));
+        }
+        let i = match idx
+            .uidx
+            .as_deref()
+            .map(|n| const_value(n, params))
+            .transpose()?
+        {
+            None | Some(Bson::Null) => return Ok(Bson::Null),
+            Some(v) => arrays::subscript_index(&v)?,
+        };
+        if !(0..64).contains(&i) {
+            return Ok(Bson::Null);
+        }
+        let text = value_text(&value);
+        let byte = text.as_bytes().get(i as usize).copied().unwrap_or(0);
+        let literal = match byte {
+            0 => String::new(),
+            b if b < 128 => char::from(b).to_string(),
+            b => format!("\\{b:03o}"),
+        };
+        return cast_value(Bson::String(literal), QUOTED_CHAR);
+    }
     let lower = arrays::lower_bounds(&value);
     let value = arrays::strip(&value);
     if !matches!(value, Bson::Array(_)) {
@@ -3865,6 +3958,10 @@ fn check_depth(tree: &pg_query::protobuf::ParseResult) -> Result<()> {
 }
 
 fn parse_one(sql: &str) -> Result<N> {
+    // `information_schema`'s SQL helpers are inlined, as PostgreSQL inlines
+    // a SQL function's call.
+    let inlined = schema_functions::inline(sql);
+    let sql = inlined.as_deref().unwrap_or(sql);
     let parsed = parse_tree(sql)?;
     let stmts = &parsed.stmts;
     if stmts.len() > 1 {
@@ -4385,7 +4482,59 @@ fn plan_node(
                 },
             ))
         }
+        N::RenameStmt(r)
+            if ObjectType::try_from(r.rename_type) == Ok(ObjectType::ObjectDatabase) =>
+        {
+            Ok(Statement::AlterDatabase {
+                name: r.subname.clone(),
+                options: Vec::new(),
+                rename: Some(r.newname.clone()),
+                owner: None,
+            })
+        }
         N::RenameStmt(r) => plan_rename(&r),
+        N::AlterDatabaseStmt(a) => {
+            let mut options = Vec::new();
+            for o in &a.options {
+                let Some(N::DefElem(d)) = o.node.as_ref() else {
+                    continue;
+                };
+                let value = match d.arg.as_deref().and_then(|x| x.node.as_ref()) {
+                    None => String::new(),
+                    Some(N::String(s)) => s.sval.clone(),
+                    Some(N::Integer(i)) => i.ival.to_string(),
+                    Some(N::Boolean(b)) => b.boolval.to_string(),
+                    Some(N::AConst(c)) => match c.val.as_ref() {
+                        Some(a_const::Val::Sval(s)) => s.sval.clone(),
+                        Some(a_const::Val::Ival(i)) => i.ival.to_string(),
+                        Some(a_const::Val::Boolval(b)) => b.boolval.to_string(),
+                        _ => String::new(),
+                    },
+                    _ => String::new(),
+                };
+                options.push((d.defname.clone(), value));
+            }
+            Ok(Statement::AlterDatabase {
+                name: a.dbname.clone(),
+                options,
+                rename: None,
+                owner: None,
+            })
+        }
+        N::AlterOwnerStmt(a)
+            if ObjectType::try_from(a.object_type) == Ok(ObjectType::ObjectDatabase) =>
+        {
+            let name = match a.object.as_deref().and_then(|o| o.node.as_ref()) {
+                Some(N::String(s)) => s.sval.clone(),
+                _ => String::new(),
+            };
+            Ok(Statement::AlterDatabase {
+                name,
+                options: Vec::new(),
+                rename: None,
+                owner: a.newowner.as_ref().map(role_spec_name),
+            })
+        }
         N::CreateStatsStmt(s) => catalog_stmts::plan_create_statistics(&s, lookup),
         N::AlterStatsStmt(s) => Ok(catalog_stmts::plan_alter_statistics(&s)),
         N::SecLabelStmt(s) => Err(catalog_stmts::plan_security_label(&s)),
@@ -4434,6 +4583,7 @@ fn plan_node(
                 .map(relation_name)
                 .ok_or_else(|| Error::Parse("REFRESH without a relation".into()))?,
             with_data: !r.skip_data,
+            concurrent: r.concurrent,
         }),
         N::CreateDomainStmt(c) => domains::plan_create_domain(&c),
         N::AlterDomainStmt(a) => domains::plan_alter_domain(&a),
@@ -4460,14 +4610,115 @@ fn plan_node(
                 admin,
             })
         }
-        N::AlterDefaultPrivilegesStmt(_) => Ok(Statement::AlterDefaultPrivileges),
-        N::CreateSchemaStmt(c) => Ok(Statement::CreateSchema {
-            name: c.schemaname.clone(),
-            if_not_exists: c.if_not_exists,
-        }),
-        N::CreatedbStmt(c) => Ok(Statement::CreateDatabase {
-            name: c.dbname.clone(),
-        }),
+        N::AlterDefaultPrivilegesStmt(a) => {
+            let mut roles = Vec::new();
+            let mut schemas = Vec::new();
+            for opt in &a.options {
+                let Some(N::DefElem(d)) = opt.node.as_ref() else {
+                    continue;
+                };
+                let items: Vec<&pg_query::protobuf::Node> =
+                    match d.arg.as_deref().and_then(|x| x.node.as_ref()) {
+                        Some(N::List(l)) => l.items.iter().collect(),
+                        _ => Vec::new(),
+                    };
+                for item in items {
+                    match item.node.as_ref() {
+                        Some(N::RoleSpec(r)) if d.defname == "roles" => {
+                            roles.push(role_spec_name(r))
+                        }
+                        Some(N::String(st)) if d.defname == "schemas" => {
+                            schemas.push(st.sval.clone())
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let grant = a
+                .action
+                .as_ref()
+                .ok_or_else(|| Error::Parse("ALTER DEFAULT PRIVILEGES without an action".into()))?;
+            if !schemas.is_empty()
+                && pg_query::protobuf::ObjectType::try_from(grant.objtype)
+                    == Ok(pg_query::protobuf::ObjectType::ObjectSchema)
+            {
+                return Err(Error::Sqlstate(
+                    "0LP01",
+                    "cannot use IN SCHEMA clause when using GRANT/REVOKE ON SCHEMAS".into(),
+                ));
+            }
+            Ok(Statement::AlterDefaultPrivileges {
+                roles,
+                schemas,
+                action: Box::new(plan_grant(grant)?),
+            })
+        }
+        N::CreateSchemaStmt(c) => {
+            let authorization = c.authrole.as_ref().map(role_spec_name);
+            // `CREATE SCHEMA AUTHORIZATION r` names the schema after the role.
+            let name = if c.schemaname.is_empty() {
+                authorization.clone().unwrap_or_default()
+            } else {
+                c.schemaname.clone()
+            };
+            Ok(Statement::CreateSchema {
+                name,
+                if_not_exists: c.if_not_exists,
+                authorization,
+            })
+        }
+        N::CreatedbStmt(c) => {
+            use pg_query::protobuf::a_const::Val;
+            let mut options = Vec::new();
+            for o in &c.options {
+                let Some(N::DefElem(d)) = o.node.as_ref() else {
+                    continue;
+                };
+                let value = match d.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                    None => String::new(),
+                    Some(N::String(s)) => s.sval.clone(),
+                    Some(N::Integer(i)) => i.ival.to_string(),
+                    Some(N::Float(f)) => f.fval.clone(),
+                    Some(N::Boolean(b)) => b.boolval.to_string(),
+                    Some(N::AConst(c)) => match c.val.as_ref() {
+                        Some(Val::Sval(s)) => s.sval.clone(),
+                        Some(Val::Ival(i)) => i.ival.to_string(),
+                        Some(Val::Fval(f)) => f.fval.clone(),
+                        Some(Val::Boolval(b)) => b.boolval.to_string(),
+                        _ => String::new(),
+                    },
+                    Some(N::RoleSpec(r)) => role_spec_name(r),
+                    Some(N::TypeName(t)) => t
+                        .names
+                        .last()
+                        .and_then(|n| match n.node.as_ref() {
+                            Some(N::String(s)) => Some(s.sval.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default(),
+                    _ => {
+                        return Err(Error::Unsupported(format!(
+                            "CREATE DATABASE option {}",
+                            d.defname
+                        )))
+                    }
+                };
+                if options
+                    .iter()
+                    .any(|(n, _): &(String, String)| *n == d.defname)
+                {
+                    return Err(Error::Sqlstate(
+                        "42601",
+                        "conflicting or redundant options".into(),
+                    ));
+                }
+                options.push((d.defname.clone(), value));
+            }
+            Ok(Statement::CreateDatabase {
+                name: c.dbname.clone(),
+                options,
+            })
+        }
         N::DropdbStmt(d) => Ok(Statement::DropDatabase {
             name: d.dbname.clone(),
             if_exists: d.missing_ok,
@@ -4577,6 +4828,34 @@ fn plan_node(
         }
         N::AlterOwnerStmt(a) if alter_routine::plan_owner(&a).is_some() => {
             alter_routine::plan_owner(&a).expect("checked")
+        }
+        N::AlterOwnerStmt(a)
+            if matches!(
+                ObjectType::try_from(a.object_type),
+                Ok(ObjectType::ObjectType | ObjectType::ObjectDomain)
+            ) =>
+        {
+            let mut names = Vec::new();
+            fn strings(n: &pg_query::protobuf::Node, out: &mut Vec<String>) {
+                match n.node.as_ref() {
+                    Some(N::String(s)) => out.push(s.sval.clone()),
+                    Some(N::List(l)) => l.items.iter().for_each(|i| strings(i, out)),
+                    Some(N::TypeName(t)) => t.names.iter().for_each(|i| strings(i, out)),
+                    _ => {}
+                }
+            }
+            if let Some(o) = a.object.as_deref() {
+                strings(o, &mut names);
+            }
+            let name = match names.as_slice() {
+                [schema, bare] if schema == "public" => bare.clone(),
+                _ => names.join("."),
+            };
+            Ok(Statement::AlterTypeOwner {
+                name,
+                owner: a.newowner.as_ref().map(role_spec_name).unwrap_or_default(),
+                domain: ObjectType::try_from(a.object_type) == Ok(ObjectType::ObjectDomain),
+            })
         }
         N::CreateCastStmt(c) => user_casts::plan_create(&c),
         N::RuleStmt(r) => plan_create_rule(&r),
@@ -6250,6 +6529,16 @@ fn plan_alter_action(
                 &stored, &edits,
             )?))
         }
+        Ok(AT::AtAddIdentity) => {
+            let Some(N::Constraint(k)) = cmd.def.as_deref().and_then(|d| d.node.as_ref()) else {
+                return Err(Error::Parse("ADD GENERATED without an identity".into()));
+            };
+            Ok(AlterTableAction::AddIdentity {
+                column: cmd.name.clone(),
+                always: k.generated_when == "a",
+                options: plan_sequence_options(&k.options)?,
+            })
+        }
         Ok(AT::AtEnableRowSecurity) => Ok(AlterTableAction::RowSecurity {
             enable: Some(true),
             force: None,
@@ -6739,6 +7028,22 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
         AlterTableAction::OwnerTo(role) => {
             def.extra.insert("owner", role.clone());
         }
+        AlterTableAction::AddIdentity {
+            column,
+            always,
+            options,
+        } => {
+            let table = def.name.clone();
+            if let Some(c) = def.columns.iter_mut().find(|c| c.name == *column) {
+                c.identity = Some(if *always { "always" } else { "by_default" }.to_string());
+                c.sequence = Some(
+                    options
+                        .sequence_name
+                        .clone()
+                        .unwrap_or_else(|| format!("{table}_{column}_seq")),
+                );
+            }
+        }
         AlterTableAction::ClusterOn(index) => match index {
             Some(i) => {
                 def.extra.insert("clustered_index", i.clone());
@@ -6983,6 +7288,11 @@ fn plan_rename(r: &pg_query::protobuf::RenameStmt) -> Result<Statement> {
             to: r.newname.clone(),
             missing_ok: r.missing_ok,
         }),
+        Ok(ObjectType::ObjectMatview) => Ok(Statement::RenameMatView {
+            matview: table,
+            to: r.newname.clone(),
+            missing_ok: r.missing_ok,
+        }),
         Ok(ObjectType::ObjectTabconstraint) => Err(Error::Unsupported(
             "ALTER TABLE ... RENAME CONSTRAINT".into(),
         )),
@@ -7012,6 +7322,9 @@ pub struct SequenceOptions {
     pub data_type: Option<String>,
     /// `CACHE n`.
     pub cache: Option<i64>,
+    /// `SEQUENCE NAME s`, an identity column's sequence's name (pg_dump's
+    /// `ADD GENERATED ... AS IDENTITY (SEQUENCE NAME public.t_id_seq ...)`).
+    pub sequence_name: Option<String>,
 }
 
 /// The `column.extra` key an identity column's sequence options ride in
@@ -7081,6 +7394,11 @@ fn plan_sequence_options(options: &[pg_query::protobuf::Node]) -> Result<Sequenc
                         .collect::<Vec<_>>(),
                     _ => Vec::new(),
                 };
+                // `public.t.c` is `public`'s `t`, kept as its bare key.
+                let parts = match parts.as_slice() {
+                    [schema, rest @ ..] if schema == "public" && rest.len() == 2 => rest.to_vec(),
+                    _ => parts,
+                };
                 out.owned_by = Some(
                     if parts.len() == 1 && parts[0].eq_ignore_ascii_case("none") {
                         String::new()
@@ -7114,6 +7432,23 @@ fn plan_sequence_options(options: &[pg_query::protobuf::Node]) -> Result<Sequenc
             // `CACHE` is recorded (`pg_sequence.seqcache`); every value is
             // handed out one at a time here, which is what `CACHE 1` does.
             "cache" => out.cache = value()?,
+            "sequence_name" => {
+                let parts: Vec<String> = match d.arg.as_deref().and_then(|n| n.node.as_ref()) {
+                    Some(N::List(l)) => l
+                        .items
+                        .iter()
+                        .filter_map(|i| match i.node.as_ref() {
+                            Some(N::String(s)) => Some(s.sval.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                out.sequence_name = Some(match parts.as_slice() {
+                    [schema, bare] if schema == "public" => bare.clone(),
+                    _ => parts.join("."),
+                });
+            }
             other => return Err(Error::Unsupported(format!("the sequence option {other}"))),
         }
     }
@@ -7675,6 +8010,17 @@ pub fn set_function_sigs(sigs: Vec<(i64, String, String, String)>) {
     FUNCTION_SIGS.with(|d| *d.borrow_mut() = sigs);
 }
 
+thread_local! {
+    /// `(function oid, each input parameter's default text)`.
+    static FUNCTION_ARG_DEFAULTS: std::cell::RefCell<Vec<(i64, Vec<Option<String>>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install what `pg_get_function_arg_default` answers from.
+pub fn set_function_arg_defaults(defaults: Vec<(i64, Vec<Option<String>>)>) {
+    FUNCTION_ARG_DEFAULTS.with(|d| *d.borrow_mut() = defaults);
+}
+
 /// Install the partition keys `pg_get_partkeydef` answers from.
 pub fn set_partkey_defs(defs: Vec<(i64, String)>) {
     PARTKEY_DEFS.with(|d| *d.borrow_mut() = defs);
@@ -8073,6 +8419,35 @@ pub fn set_views(views: Vec<(String, String)>) {
     PLAN_VIEWS.with(|v| *v.borrow_mut() = views);
 }
 
+thread_local! {
+    /// Each view's relation oid, for the RowDescription of the columns read
+    /// through it (`ftable` / `ftablecol` name the VIEW, as PostgreSQL's do).
+    static PLAN_VIEW_OIDS: std::cell::RefCell<std::collections::HashMap<String, i64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// The FROM aliases `expand_views` gave a view's subquery, with the view.
+    static EXPANDED_VIEWS: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install the views' relation oids beside `set_views`.
+pub fn set_view_oids(oids: Vec<(String, i64)>) {
+    PLAN_VIEW_OIDS.with(|v| *v.borrow_mut() = oids.into_iter().collect());
+}
+
+/// The view a FROM subquery under `alias` was expanded from, and its oid.
+fn expanded_view_oid(alias: &str) -> Option<i64> {
+    let view = EXPANDED_VIEWS.with(|e| {
+        e.borrow()
+            .iter()
+            .rev()
+            .find(|(a, _)| a == alias)
+            .map(|(_, v)| v.clone())
+    })?;
+    PLAN_VIEW_OIDS
+        .with(|v| v.borrow().get(&view).copied())
+        .or_else(|| system_views::oid(&view))
+}
+
 pub(crate) fn view_definition(name: &str) -> Option<String> {
     PLAN_VIEWS.with(|v| {
         v.borrow()
@@ -8093,7 +8468,11 @@ pub fn is_view(name: &str) -> bool {
 /// expression and each side of a set operation are all planned through
 /// `plan_select` in their turn, which expands their own references.
 fn expand_views(s: &pg_query::protobuf::SelectStmt) -> Result<pg_query::protobuf::SelectStmt> {
-    if PLAN_VIEWS.with(|v| v.borrow().is_empty()) && !rls::active() && !inherit::descendants_any() {
+    if PLAN_VIEWS.with(|v| v.borrow().is_empty())
+        && !rls::active()
+        && !inherit::descendants_any()
+        && !system_views::in_from(&s.from_clause)
+    {
         return Ok(s.clone());
     }
     let mut out = s.clone();
@@ -8114,11 +8493,27 @@ fn expand_views_in_from(item: &mut pg_query::protobuf::Node, depth: usize) -> Re
     inherit::expand_from(item)?;
     match item.node.as_mut() {
         Some(N::RangeVar(r)) => {
-            if !(r.schemaname.is_empty() || r.schemaname == "public") || !r.catalogname.is_empty() {
+            if !r.catalogname.is_empty() {
                 return Ok(());
             }
-            let Some(definition) = view_definition(&r.relname) else {
-                return Ok(());
+            if let Some(e) = system_views::refusal(&r.schemaname, &r.relname) {
+                return Err(e);
+            }
+            // PostgreSQL's own views first: `pg_catalog` precedes the path.
+            let system = system_views::definition(&r.schemaname, &r.relname);
+            let definition = match system {
+                Some(d) => d.to_string(),
+                None if r.schemaname.is_empty() || r.schemaname == "public" => {
+                    let Some(d) = view_definition(&r.relname) else {
+                        return Ok(());
+                    };
+                    d
+                }
+                None => return Ok(()),
+            };
+            let view_name = match (system, r.schemaname.as_str()) {
+                (Some(_), "information_schema") => format!("information_schema.{}", r.relname),
+                _ => r.relname.clone(),
             };
             // A view whose definition reaches itself (only possible through
             // OR REPLACE) is PostgreSQL's 42P17 at query time.
@@ -8151,6 +8546,13 @@ fn expand_views_in_from(item: &mut pg_query::protobuf::Node, depth: usize) -> Re
                     aliasname: r.relname.clone(),
                     colnames: Vec::new(),
                 });
+            EXPANDED_VIEWS.with(|e| {
+                let mut e = e.borrow_mut();
+                if e.len() >= 64 {
+                    e.clear();
+                }
+                e.push((alias.aliasname.clone(), view_name.clone()));
+            });
             item.node = Some(N::RangeSubselect(Box::new(
                 pg_query::protobuf::RangeSubselect {
                     lateral: false,
@@ -8337,6 +8739,20 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     let table = relation.relname.clone();
     // `CREATE TEMP TABLE`: `relpersistence` is `t` (RELPERSISTENCE_TEMP).
     let temp = relation.relpersistence == "t";
+    // `ON COMMIT DELETE ROWS` / `DROP`: done at each commit (RP-065), and
+    // only a temporary table takes one.
+    let on_commit = match pg_query::protobuf::OnCommitAction::try_from(c.oncommit) {
+        Ok(pg_query::protobuf::OnCommitAction::OncommitDeleteRows) => Some("delete"),
+        Ok(pg_query::protobuf::OnCommitAction::OncommitDrop) => Some("drop"),
+        Ok(pg_query::protobuf::OnCommitAction::OncommitPreserveRows) => Some("preserve"),
+        _ => None,
+    };
+    if on_commit.is_some() && !temp {
+        return Err(Error::Sqlstate(
+            "42P16",
+            "ON COMMIT can only be used on temporary tables".into(),
+        ));
+    }
 
     let mut columns: Vec<Column> = Vec::new();
     // (constraint name if given, expression node, the columns it names) --
@@ -8534,14 +8950,18 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                                 }
                                 .to_string(),
                             );
-                            column.sequence = Some(format!("{table}_{}_seq", cd.colname));
                             // An identity column is NOT NULL by definition.
                             column.nullable = false;
                             // `AS IDENTITY (START 5 INCREMENT 2)`: the
                             // sequence's options, carried to where CREATE
                             // TABLE makes it (`IDENTITY_OPTIONS`, removed
                             // there before the table is stored).
-                            let o = plan_sequence_options(&k.options)?;
+                            let mut o = plan_sequence_options(&k.options)?;
+                            column.sequence = Some(
+                                o.sequence_name
+                                    .take()
+                                    .unwrap_or_else(|| format!("{table}_{}_seq", cd.colname)),
+                            );
                             if o != SequenceOptions::default() {
                                 let mut d = Document::new();
                                 for (key, v) in [
@@ -8704,6 +9124,9 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
         def.extra.insert("pk_column_order", table_pk.clone());
     }
     def.temp = temp;
+    if let Some(action) = on_commit.filter(|a| *a != "preserve") {
+        def.extra.insert("on_commit", action);
+    }
     // `CREATE UNLOGGED TABLE` (`relpersistence` `u`): kept so `pg_class`
     // and `pg_relation_is_publishable` can say so; nothing else differs here,
     // where there is no WAL to skip.
@@ -12245,8 +12668,9 @@ fn srf_rows(
             let a = args(1)?;
             let mut rows = Vec::new();
             if let Bson::Array(items) = arrays::strip(&a[0]) {
-                // `check_acl`: an empty array has no dimension at all.
-                if items.is_empty() {
+                // `check_acl`: an empty array has no dimension at all --
+                // unless a function built it with one (`acldefault`).
+                if items.is_empty() && !arrays::is_one_dimensional_empty(&a[0]) {
                     return Err(Error::Sqlstate(
                         "22023",
                         "ACL arrays must be one-dimensional".into(),
@@ -13070,6 +13494,7 @@ fn expression_column_name(node: &pg_query::protobuf::Node) -> String {
         Some(N::AExpr(e)) if AExprKind::try_from(e.kind) == Ok(AExprKind::AexprNullif) => {
             "nullif".to_string()
         }
+        Some(N::CaseExpr(_)) => "case".to_string(),
         // A subscript / field selection names from what it selects: `x[1]`
         // is `x`, `(array[1, 2])[1]` is `array`, and `(r).f` is the field.
         Some(N::AIndirection(ind)) => {
@@ -13084,6 +13509,40 @@ fn expression_column_name(node: &pg_query::protobuf::Node) -> String {
             }
         }
         _ => "?column?".to_string(),
+    }
+}
+
+/// A rewrite that replaces a select-list expression (`>>` over inets as
+/// `__net_op(...)`, `xmlagg` as `string_agg(...)::xml`) must not rename its
+/// column: each unnamed target keeps the name its ORIGINAL expression gave
+/// it (`?column?`, `xmlagg`), as an explicit name.
+fn keep_target_names(
+    before: &pg_query::protobuf::SelectStmt,
+    after: &mut pg_query::protobuf::SelectStmt,
+) {
+    if before.target_list.len() != after.target_list.len() {
+        return;
+    }
+    for (b, a) in before.target_list.iter().zip(after.target_list.iter_mut()) {
+        let (Some(N::ResTarget(rb)), Some(N::ResTarget(ra))) = (b.node.as_ref(), a.node.as_mut())
+        else {
+            continue;
+        };
+        if !rb.name.is_empty() || !ra.name.is_empty() {
+            continue;
+        }
+        let (Some(vb), Some(va)) = (rb.val.as_deref(), ra.val.as_deref()) else {
+            continue;
+        };
+        if matches!(vb.node.as_ref(), Some(N::ColumnRef(c))
+            if c.fields.iter().any(|f| matches!(f.node.as_ref(), Some(N::AStar(_)))))
+        {
+            continue;
+        }
+        let name = expression_column_name(vb);
+        if expression_column_name(va) != name {
+            ra.name = name;
+        }
     }
 }
 
@@ -13764,6 +14223,26 @@ fn plan_table_targets(
                 // The overload PostgreSQL picks for these argument types
                 // (`round` of an integer is the float8 one).
                 let selected = funcsig::result_type(&name, &types);
+                // The column is named for the function as written, whatever
+                // it runs as below.
+                let out = if rt.name.is_empty() {
+                    name.clone()
+                } else {
+                    rt.name.clone()
+                };
+                // `pg_column_size` of a stored column is the heap's packed
+                // form of its declared type (RP-074).
+                let mut args = args;
+                if name == "pg_column_size" {
+                    let ty = def
+                        .column(&column)
+                        .map(|c| c.pg_type.clone())
+                        .unwrap_or_default();
+                    args.push(Some(Bson::String(format!(
+                        "{}{ty}",
+                        scalar::STORED_SIZE_MARK
+                    ))));
+                }
                 // `length` of a tsvector counts its lexemes.
                 let name = if name == "length"
                     && def.column(&column).is_some_and(|c| c.pg_type == "tsvector")
@@ -13778,11 +14257,6 @@ fn plan_table_targets(
                     "geom_length".to_string()
                 } else {
                     name
-                };
-                let out = if rt.name.is_empty() {
-                    name.clone()
-                } else {
-                    rt.name.clone()
                 };
                 columns.push((out, field));
                 casts.push(Some(ColumnExpr::Call {
@@ -15803,11 +16277,6 @@ fn aggregate_distinct(s: &pg_query::protobuf::SelectStmt) -> Result<bool> {
     Err(Error::Unsupported("DISTINCT ON with an aggregate".into()))
 }
 
-/// The most rows a recursive CTE may produce. PostgreSQL has no limit and
-/// runs a non-terminating recursion until it is cancelled; a test server
-/// answering an error instead of exhausting memory is the kinder failure.
-const RECURSIVE_CTE_ROW_LIMIT: usize = 1_000_000;
-
 /// Plan and run one SELECT (its own subqueries resolved first), answering its
 /// rows and its output columns.
 /// A query's rows and its `(name, type)` columns.
@@ -16142,6 +16611,74 @@ fn materialize_nested_recursive_ctes(
     select(node, lookup, params, run)
 }
 
+/// The rows of CTE `name` that `s` can read at most, when `s` reads only
+/// them, in order, under a LIMIT: `SELECT <columns> FROM name LIMIT k
+/// [OFFSET o]`, with no WHERE, grouping, ordering, DISTINCT, window or
+/// locking, and no other CTE reading `name`. Such a query takes the CTE's
+/// first `k + o` rows as they are produced, which is all a CTE scan runs.
+fn recursion_budget(
+    s: &pg_query::protobuf::SelectStmt,
+    with: &pg_query::protobuf::WithClause,
+    name: &str,
+) -> Option<usize> {
+    let only_from = matches!(s.from_clause.as_slice(),
+        [f] if matches!(f.node.as_ref(), Some(N::RangeVar(r)) if r.relname == name && r.schemaname.is_empty()));
+    if !only_from
+        || s.op != pg_query::protobuf::SetOperation::SetopNone as i32
+        || s.where_clause.is_some()
+        || !s.group_clause.is_empty()
+        || s.having_clause.is_some()
+        || !s.distinct_clause.is_empty()
+        || !s.sort_clause.is_empty()
+        || !s.window_clause.is_empty()
+        || !s.locking_clause.is_empty()
+        || s.limit_option != pg_query::protobuf::LimitOption::Count as i32
+    {
+        return None;
+    }
+    // Plain columns only: an aggregate, a window or a set-returning call
+    // reads every row.
+    let plain = s.target_list.iter().all(|t| match t.node.as_ref() {
+        Some(N::ResTarget(rt)) => matches!(
+            rt.val.as_deref().and_then(|v| v.node.as_ref()),
+            Some(N::ColumnRef(_) | N::AConst(_))
+        ),
+        _ => false,
+    });
+    if !plain {
+        return None;
+    }
+    let int = |n: Option<&pg_query::protobuf::Node>| -> Option<usize> {
+        match n?.node.as_ref()? {
+            N::AConst(c) => match c.val.as_ref()? {
+                pg_query::protobuf::a_const::Val::Ival(i) => usize::try_from(i.ival).ok(),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let limit = int(s.limit_count.as_deref())?;
+    let offset = match s.limit_offset.as_deref() {
+        None => 0,
+        some => int(some)?,
+    };
+    let read_elsewhere = with.ctes.iter().any(|c| match c.node.as_ref() {
+        Some(N::CommonTableExpr(o)) if o.ctename != name => matches!(
+            o.ctequery.as_deref().and_then(|q| q.node.as_ref()),
+            Some(N::SelectStmt(b)) if reads_relation(b, name)
+        ),
+        _ => false,
+    });
+    (!read_elsewhere).then_some(limit.saturating_add(offset))
+}
+
+/// Does a CTE's query read the CTE itself (`cterecursive`, which the raw
+/// parse tree leaves unset)?
+fn reads_relation_node(c: &pg_query::protobuf::CommonTableExpr) -> bool {
+    matches!(c.ctequery.as_deref().and_then(|q| q.node.as_ref()),
+        Some(N::SelectStmt(body)) if reads_relation(body, &c.ctename))
+}
+
 fn materialize_recursive_ctes(
     node: &mut pg_query::protobuf::Node,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -16151,12 +16688,27 @@ fn materialize_recursive_ctes(
     let Some(N::SelectStmt(s)) = node.node.as_mut() else {
         return Ok(());
     };
-    let Some(with) = s.with_clause.as_mut() else {
-        return Ok(());
-    };
-    if !with.recursive {
+    if !s.with_clause.as_ref().is_some_and(|w| w.recursive) {
         return Ok(());
     }
+    // How many of a CTE's rows the query above can read, when that is all
+    // it reads (RP-063): a CTE scan pulls rows only as they are asked for.
+    let budgets: Vec<(String, usize)> = s
+        .with_clause
+        .as_ref()
+        .map(|w| {
+            w.ctes
+                .iter()
+                .filter_map(|c| match c.node.as_ref() {
+                    Some(N::CommonTableExpr(c)) => {
+                        recursion_budget(s, w, &c.ctename).map(|b| (c.ctename.clone(), b))
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let with = s.with_clause.as_mut().expect("checked");
     #[allow(clippy::type_complexity)]
     let mut done: Vec<(
         String,
@@ -16167,6 +16719,9 @@ fn materialize_recursive_ctes(
         let Some(N::CommonTableExpr(c)) = cte.node.as_mut() else {
             return Err(Error::Unsupported("this WITH item".into()));
         };
+        // SEARCH and CYCLE become columns of the CTE's two terms (RP-062).
+        c.cterecursive = c.cterecursive || reads_relation_node(c);
+        search_cycle::rewrite(c)?;
         let Some(N::SelectStmt(body)) = c.ctequery.as_deref().and_then(|q| q.node.as_ref()) else {
             return Err(Error::Unsupported("a data-modifying WITH".into()));
         };
@@ -16194,17 +16749,18 @@ fn materialize_recursive_ctes(
                     ),
                 ));
             }
+            let budget = budgets
+                .iter()
+                .find(|(n, _)| *n == c.ctename)
+                .map(|(_, b)| *b);
             let (mut rows, cols) = run_select(base, lookup, params, run)?;
+            // UNION keeps each row's first appearance; a set of row keys
+            // keeps that linear (a `Vec::contains` made 20,000 steps take
+            // seconds).
+            let key = |r: &Vec<Bson>| format!("{r:?}");
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             if !body.all {
-                let mut seen: Vec<Vec<Bson>> = Vec::new();
-                rows.retain(|r| {
-                    if seen.contains(r) {
-                        false
-                    } else {
-                        seen.push(r.clone());
-                        true
-                    }
-                });
+                rows.retain(|r| seen.insert(key(r)));
             }
             let types: Vec<String> = cols.iter().map(|(_, t)| t.clone()).collect();
             let names: Vec<pg_query::protobuf::Node> = if c.aliascolnames.is_empty() {
@@ -16213,7 +16769,11 @@ fn materialize_recursive_ctes(
                 c.aliascolnames.clone()
             };
             let mut working = rows.clone();
+            if budget.is_some_and(|b| rows.len() >= b) {
+                working.clear();
+            }
             while !working.is_empty() {
+                cancel::check()?;
                 let mut p = params.clone();
                 let table = values_select(&working, &types, &mut p);
                 let step = substitute_ctes(step, &[(c.ctename.clone(), table, names.clone())]);
@@ -16233,25 +16793,18 @@ fn materialize_recursive_ctes(
                     }
                 }
                 if !body.all {
-                    let mut kept: Vec<Vec<Bson>> = Vec::new();
-                    for r in fresh.drain(..) {
-                        if !rows.contains(&r) && !kept.contains(&r) {
-                            kept.push(r);
-                        }
-                    }
-                    fresh = kept;
-                }
-                if rows.len() + fresh.len() > RECURSIVE_CTE_ROW_LIMIT {
-                    return Err(Error::Sqlstate(
-                        "54000",
-                        format!(
-                            "recursive query \"{}\" produced more than {RECURSIVE_CTE_ROW_LIMIT} rows",
-                            c.ctename
-                        ),
-                    ));
+                    fresh.retain(|r| seen.insert(key(r)));
                 }
                 rows.extend(fresh.iter().cloned());
                 working = fresh;
+                // The query above has read all it will.
+                if let Some(b) = budget.filter(|b| rows.len() >= *b) {
+                    rows.truncate(b);
+                    break;
+                }
+            }
+            if let Some(b) = budget {
+                rows.truncate(b);
             }
             (rows, cols)
         };
@@ -16990,8 +17543,8 @@ fn resolve_sublinks_in_select_scoped(
     {
         resolve_sublinks_in_select(side, lookup, params, run)?;
     }
-    for item in &mut s.from_clause {
-        resolve_sublinks_in_from(item, lookup, params, run)?;
+    for (i, item) in s.from_clause.iter_mut().enumerate() {
+        resolve_sublinks_in_from(item, i > 0, lookup, params, run)?;
     }
 
     // A FILTER holding a subquery, as the CASE argument it is equivalent to.
@@ -17033,8 +17586,11 @@ fn resolve_sublinks_in_select_scoped(
     Ok(())
 }
 
+/// `has_left`: a FROM item stands to this one's left (see
+/// `rowsfrom::rewrite`).
 fn resolve_sublinks_in_from(
     item: &mut pg_query::protobuf::Node,
+    has_left: bool,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &mut Vec<Bson>,
     run: SubqueryRunner<'_>,
@@ -17044,7 +17600,11 @@ fn resolve_sublinks_in_from(
     // (`ARRAY(SELECT f(...))`) are resolved with the rest.
     if let Some(N::RangeFunction(rf)) = item.node.as_ref() {
         if rf.ordinality {
-            item.node = Some(rowsfrom::as_subselect(rf)?);
+            let mut rewritten = rowsfrom::as_subselect(rf)?;
+            if let N::RangeSubselect(rs) = &mut rewritten {
+                rs.lateral |= has_left;
+            }
+            item.node = Some(rewritten);
         }
     }
     match item.node.as_mut() {
@@ -17069,11 +17629,11 @@ fn resolve_sublinks_in_from(
             Ok(())
         }
         Some(N::JoinExpr(j)) => {
-            for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
-                .into_iter()
-                .flatten()
-            {
-                resolve_sublinks_in_from(side, lookup, params, run)?;
+            if let Some(l) = j.larg.as_deref_mut() {
+                resolve_sublinks_in_from(l, has_left, lookup, params, run)?;
+            }
+            if let Some(r) = j.rarg.as_deref_mut() {
+                resolve_sublinks_in_from(r, true, lookup, params, run)?;
             }
             Ok(())
         }
@@ -17100,6 +17660,20 @@ fn collect_from_columns(
             }
         }
         Some(N::RangeSubselect(rs)) => {
+            // `(values (...)) v(a)`: the alias names the columns.
+            let aliased: Vec<String> = rs
+                .alias
+                .iter()
+                .flat_map(|a| a.colnames.iter())
+                .filter_map(|n| match n.node.as_ref() {
+                    Some(N::String(s)) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .collect();
+            if !aliased.is_empty() {
+                out.extend(aliased);
+                return;
+            }
             if let Some(N::SelectStmt(inner)) = rs.subquery.as_ref().and_then(|q| q.node.as_ref()) {
                 for t in &inner.target_list {
                     if let Some(N::ResTarget(rt)) = t.node.as_ref() {
@@ -17113,6 +17687,25 @@ fn collect_from_columns(
                             }
                         }
                     }
+                }
+            }
+        }
+        // A FROM function's columns: its alias's column list (`f(x)`), or
+        // the alias itself for a one-column function.
+        Some(N::RangeFunction(rf)) => {
+            if let Some(a) = rf.alias.as_ref() {
+                let names: Vec<String> = a
+                    .colnames
+                    .iter()
+                    .filter_map(|n| match n.node.as_ref() {
+                        Some(N::String(s)) => Some(s.sval.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if names.is_empty() {
+                    out.push(a.aliasname.clone());
+                } else {
+                    out.extend(names);
                 }
             }
         }
@@ -17725,7 +18318,10 @@ fn resolve_one_sublink(
     // see a qualified one: the lowering resolves a column by its LAST name
     // part and ignores the qualifier, so `e.dept_id = d.id` would bind the
     // outer `d.id` to the inner table's own `id` and plan clean.
-    if foreign_qualifier(&inner).is_some() || correlated::fromless_outer_ref(&inner, outer) {
+    if foreign_qualifier(&inner).is_some()
+        || correlated::fromless_outer_ref(&inner, outer)
+        || correlated::function_arg_outer_ref(&inner, outer, lookup)
+    {
         let test = sl.testexpr.as_deref().cloned();
         let mut sl = sl.clone();
         if let Some(mut t) = test {
@@ -17747,6 +18343,15 @@ fn resolve_one_sublink(
                 sl.testexpr = Some(Box::new(t));
             }
             return correlated::correlate(&sl, &inner, lookup, params, outer);
+        }
+        // A bare name in a FROM function's arguments that neither the
+        // subquery nor the query around it has is PostgreSQL's 42703.
+        Err(Error::Unsupported(_))
+            if correlated::unknown_function_arg(&inner, outer, lookup).is_some() =>
+        {
+            return Err(Error::UndefinedColumn(
+                correlated::unknown_function_arg(&inner, outer, lookup).expect("checked"),
+            ));
         }
         Err(e) => return Err(e),
     };
@@ -19437,6 +20042,11 @@ fn plan_select(
     // away before any of the shape checks run -- every one of them would
     // otherwise have to know about it.
     if s.with_clause.is_some() {
+        // SEARCH and CYCLE are rewritten into their CTE's terms first, as
+        // PostgreSQL's rewriter does (RP-062).
+        if let Some(rewritten) = search_cycle::rewrite_select(s)? {
+            return plan_select(&rewritten, lookup, params);
+        }
         let s = locking_past_ctes(s)?;
         return plan_select(&inline_ctes(&s)?, lookup, params);
     }
@@ -19448,6 +20058,9 @@ fn plan_select(
         return plan_select(&rewritten, lookup, params);
     }
     let expanded = expand_views(s)?;
+    // A strict operator over a NULL constant is NULL before anything runs
+    // (RP-075).
+    let expanded = strict_fold::fold_select(&expanded)?.unwrap_or(expanded);
     let s = &expanded;
     // The locking clauses, checked once per top-level statement, on the
     // statement as written (views expanded): the rewrites below may move
@@ -19542,7 +20155,8 @@ fn plan_select(
     }
     cancel::check()?;
     // An enum orders by its labels' declared positions, not their text.
-    if let Some(rewritten) = enum_order::rewrite(s, lookup)? {
+    if let Some(mut rewritten) = enum_order::rewrite(s, lookup)? {
+        keep_target_names(s, &mut rewritten);
         return plan_select(&rewritten, lookup, params);
     }
     // A bare `VALUES` with ORDER BY / LIMIT / OFFSET: the clauses belong to
@@ -19569,7 +20183,8 @@ fn plan_select(
     }
     cancel::check()?;
     // `xmlagg(x)` is the concatenation of its non-NULL inputs, with or without a FROM.
-    if let Some(rewritten) = rewrite_xmlagg(s)? {
+    if let Some(mut rewritten) = rewrite_xmlagg(s)? {
+        keep_target_names(s, &mut rewritten);
         return plan_select(&rewritten, lookup, params);
     }
     if s.from_clause.is_empty() {
@@ -20446,6 +21061,14 @@ fn plan_from_subquery(
     }
     for (c, name) in def.columns.iter_mut().zip(&colnames) {
         c.name = name.clone();
+    }
+    // A view's columns are the VIEW's in a RowDescription, each at its
+    // position there, computed ones included (RP-087). A plain subquery's
+    // keep the base column they pass through (`select_output_def`).
+    if let Some(oid) = expanded_view_oid(&alias) {
+        for (i, c) in def.columns.iter_mut().enumerate() {
+            c.source = i16::try_from(i + 1).ok().map(|n| (oid, n));
+        }
     }
     distinct_fields(&mut def);
     def.name = alias.clone();
@@ -21398,37 +22021,46 @@ pub fn sub_plan_def(
     }
 }
 
-/// Two set-operation sides' common column type, as `select_common_type`
-/// chooses it: the wider number, the wider date/time, and among the string
-/// types `text` (preferred) or else the left side's -- unless only the left
-/// casts implicitly to the right (`varchar` / `bpchar` to `name`).
-/// Mismatched categories are the executor's 42804; this keeps the left.
+/// Two set-operation sides' common column type, PostgreSQL's
+/// `select_common_type` (the server's `unify_set_op_type` is the same rule):
+/// within one type category the left type stands unless it is not the
+/// category's preferred type and casts implicitly to the right one, which does
+/// not cast back -- `int4` / `int8` is `int8`, `int4` / `regclass` `regclass`,
+/// `oid` / `regclass` `oid`. An array is judged by its element. Mismatched
+/// categories are the executor's 42804; this keeps the left.
 fn set_op_common_type(left: &str, right: &str) -> String {
-    let rank = |t: &str| -> Option<(u8, u8)> {
-        Some(match t {
-            "int2" => (1, 1),
-            "int4" => (1, 2),
-            "int8" => (1, 3),
-            "numeric" => (1, 4),
-            "float4" => (1, 5),
-            "float8" => (1, 6),
-            "text" | "varchar" | "bpchar" | "name" => (2, 0),
-            "date" => (3, 1),
-            "timestamp" => (3, 2),
-            "timestamptz" => (3, 3),
-            _ => return None,
-        })
+    if left == right {
+        return left.to_string();
+    }
+    let oid = pgtypes::oid_of_name;
+    let (Some(l), Some(r)) = (oid(left), oid(right)) else {
+        return left.to_string();
     };
-    match (rank(left), rank(right)) {
-        (Some((2, _)), Some((2, _))) => {
-            if left != "text" && matches!(left, "varchar" | "bpchar") && right == "name" {
-                right.to_string()
-            } else {
-                left.to_string()
-            }
-        }
-        (Some((lc, lr)), Some((rc, rr))) if lc == rc && rr > lr => right.to_string(),
-        _ => left.to_string(),
+    let (Some((lc, preferred)), Some((rc, _))) = (
+        funcsig::category_preferred_of_oid(l),
+        funcsig::category_preferred_of_oid(r),
+    ) else {
+        return left.to_string();
+    };
+    if lc != rc {
+        return left.to_string();
+    }
+    let (cl, cr) = match (left.strip_suffix("[]"), right.strip_suffix("[]")) {
+        (Some(a), Some(b)) => match (pgtypes::oid_of_name(a), pgtypes::oid_of_name(b)) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return left.to_string(),
+        },
+        _ => (l, r),
+    };
+    let implicit = |s: i64, t: i64| {
+        pg_casts::BUILTIN_CASTS
+            .iter()
+            .any(|(_, src, tgt, _, ctx, _)| *src == s && *tgt == t && *ctx == b'i')
+    };
+    if !preferred && implicit(cl, cr) && !implicit(cr, cl) {
+        right.to_string()
+    } else {
+        left.to_string()
     }
 }
 
@@ -21485,6 +22117,7 @@ pub fn select_output_def(
             None => {
                 if let Some(c) = src {
                     col.typmod = c.typmod;
+                    col.source = c.source;
                 }
             }
             Some(e) => col.typmod = column_expr_typmod(e),
@@ -22105,7 +22738,7 @@ pub(crate) fn is_aggregate_call(f: &pg_query::protobuf::FuncCall) -> bool {
 pub(crate) fn session_function(name: &str) -> Option<Bson> {
     Some(match name {
         "version" => Bson::String(format!(
-            "PostgreSQL 15.0 (SecantusDB) on {}, compiled by rust",
+            "PostgreSQL 15.19 (SecantusDB) on {}, compiled by rust",
             std::env::consts::ARCH
         )),
         "current_schema" => Bson::String("public".into()),
@@ -22661,6 +23294,7 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                         | "pg_get_function_arguments"
                         | "pg_get_function_identity_arguments"
                         | "pg_get_function_result"
+                        | "pg_get_function_arg_default"
                         | "pg_get_functiondef"
                 )
             ) =>
@@ -22882,6 +23516,8 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                     if any_slice { "int2[]" } else { "int2" }.to_string()
                 }
                 None if base == "oidvector" => if any_slice { "oid[]" } else { "oid" }.to_string(),
+                // `name` is an array of `"char"`.
+                None if base == "name" => QUOTED_CHAR.to_string(),
                 None if base == "point" => "float8".to_string(),
                 None if matches!(base.as_str(), "lseg" | "box") => "point".to_string(),
                 None => inferred_type(value).to_string(),
@@ -22902,6 +23538,26 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                     field.and_then(|f| fields.iter().find(|(n, _)| n == f).map(|(_, t)| t.clone()))
                 })
             });
+            // `(information_schema._pg_expandarray(a)).x` / `.n`: its OUT
+            // parameters, `x anyelement` (the array's element) and `n
+            // integer`; reached through a FROM subquery's column too.
+            let expand_field = || {
+                let call = match ind.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                    Some(N::FuncCall(fc)) => Some(fc.as_ref().clone()),
+                    _ => None,
+                }?;
+                if func_name(&call).as_deref() != Some("_pg_expandarray") {
+                    return None;
+                }
+                match field? {
+                    "n" => Some("int4".to_string()),
+                    "x" => {
+                        let t = static_type(call.args.first()?, &Bson::Null);
+                        t.strip_suffix("[]").map(str::to_string)
+                    }
+                    _ => None,
+                }
+            };
             // A ROW()'s `fN` is its Nth argument, a nested ROW() a record.
             let row_field = || {
                 let Some(N::RowExpr(r)) = ind.arg.as_deref().and_then(|a| a.node.as_ref()) else {
@@ -22912,6 +23568,7 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                 Some(static_type(e, value))
             };
             field_type
+                .or_else(expand_field)
                 .or_else(row_field)
                 .unwrap_or_else(|| match record_fields(value) {
                     Some(_) => "record".to_string(),
@@ -22960,6 +23617,13 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                                 || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_)))) =>
                     {
                         static_type(r, &Bson::Null)
+                    }
+                    // Typed from the `=` PostgreSQL resolves: its LEFT input
+                    // type, which an implicit cast may widen (RP-076).
+                    (Some(l), Some(r)) => {
+                        let lt = static_type(l, value);
+                        let rt = static_type(r, &Bson::Null);
+                        funcsig::operator_left_input("=", &lt, &rt).unwrap_or(lt)
                     }
                     (Some(l), _) => static_type(l, value),
                     _ => inferred_type(value).to_string(),
@@ -24413,6 +25077,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     || name == "pg_get_function_arguments"
                     || name == "pg_get_function_identity_arguments"
                     || name == "pg_get_function_result"
+                    || name == "pg_get_function_arg_default"
                     || name == "pg_get_functiondef"
                     || (name.starts_with("has_") && name.ends_with("_privilege"))
                 {
@@ -24512,6 +25177,24 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 // they stand alone, and folding them here would freeze a
                 // `current_setting` the session may still change.
                 let name = overload_name(f, name);
+                // `pg_column_size` reads its argument's type (RP-074): through
+                // the expression evaluator, which has it.
+                if name == "pg_column_size" {
+                    let node = pg_query::protobuf::Node {
+                        node: Some(N::FuncCall(f.clone())),
+                    };
+                    columns.push((
+                        if rt.name.is_empty() {
+                            name.clone()
+                        } else {
+                            rt.name.clone()
+                        },
+                        ConstCol::Value(const_value(&node, params)?),
+                        "int4".into(),
+                        -1,
+                    ));
+                    continue;
+                }
                 let datetime_typed = datetime_result_type(f, &name);
                 if let Some(t) = datetime_typed.clone() {
                     if let Some(value) = datetime_call(f, &name, params) {
@@ -26253,7 +26936,17 @@ pub fn regtype_text(oid: i64) -> String {
     {
         return format!("{}[]", display_type(name));
     }
-    let user_name = |oid: i64| user_type_name(oid).or_else(|| user_composite_name(oid));
+    // Named as it is visible (`public.mood` with `public` off the path).
+    // A `public` type named after a built-in (`public.uuid`) is shadowed by
+    // `pg_catalog`'s, searched first, so it is never visible bare.
+    let user_name = |oid: i64| {
+        user_type_name(oid)
+            .or_else(|| user_composite_name(oid))
+            .map(|n| match n.strip_prefix("public.") {
+                Some(bare) if pgtypes::shadowed_by_catalog(bare) => n,
+                _ => schemas::visible_name(&n),
+            })
+    };
     if let Some(name) = user_name(oid) {
         // PostgreSQL renders a regtype per IDENTIFIER PART: a schema-qualified
         // `testschema.testcomp` prints unquoted as `schema.name` (each part
@@ -26362,6 +27055,13 @@ static SYSTEM_RELATIONS: std::sync::OnceLock<Vec<(String, String, i64)>> =
 /// Install the system relations (the first call wins; they never change).
 pub fn set_system_relations(relations: Vec<(String, String, i64)>) {
     let _ = SYSTEM_RELATIONS.set(relations);
+}
+
+/// Is `name` one of `pg_catalog`'s relations (always searched, even under an
+/// empty `search_path`)?
+pub(crate) fn is_pg_catalog_relation(name: &str) -> bool {
+    system_relation("pg_catalog", name).is_some()
+        || CATALOG_RELATIONS.iter().any(|(n, _)| *n == name)
 }
 
 fn system_relation(schema: &str, name: &str) -> Option<i64> {
@@ -28112,6 +28812,12 @@ fn text_type_oid(name: &str) -> Option<i64> {
     let Some((parts, array)) = parsed_type_name(name) else {
         return user_type_or_array_oid(name);
     };
+    // A bare name finds a `public` type only while `public` is on the search
+    // path (`TypenameGetTypid`): pg_dump sets it empty, and `'mood'::regtype`
+    // is then 42704, `to_regtype('mood')` NULL.
+    if parts.len() == 1 && !schemas::search_path().iter().any(|s| s == "public") {
+        return None;
+    }
     let base = match parts
         .iter()
         .map(String::as_str)
@@ -28136,7 +28842,7 @@ fn text_type_oid(name: &str) -> Option<i64> {
     })
 }
 
-fn user_type_or_array_oid(name: &str) -> Option<i64> {
+pub(crate) fn user_type_or_array_oid(name: &str) -> Option<i64> {
     let trimmed = name.trim();
     let element = if let Some(e) = trimmed.strip_suffix("[]") {
         Some(e.trim_end())
@@ -28957,49 +29663,31 @@ impl Interval {
     }
 }
 
-/// Render an interval the way PostgreSQL's default `IntervalStyle` does.
+/// Render an interval as `interval_out` does, in the session's
+/// `IntervalStyle` (`output_style::encode_interval`).
 ///
-/// Months split into years and months; each part is pluralised when its value
-/// is not exactly 1 — so `-1 day` prints as `-1 days`, which looks like a typo
-/// and is what PostgreSQL emits. The time part is `HH:MM:SS`, zero-padded, with
-/// hours allowed past 24 (`'25:00:00'` is a valid interval), a trimmed
-/// fraction, and its own sign. A wholly zero interval is `00:00:00`.
+/// Under the default `postgres` style months split into years and months;
+/// each part is pluralised when its value is not exactly 1 -- so `-1 day`
+/// prints as `-1 days`, which looks like a typo and is what PostgreSQL emits
+/// -- and a positive part after a negative one carries a `+` (`-1 mons +3
+/// days`). The time part is `HH:MM:SS`, zero-padded, with hours allowed past
+/// 24, a trimmed fraction, and its own sign. A wholly zero interval is
+/// `00:00:00`.
 pub fn render_interval(iv: &Interval) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let (years, months) = (iv.months / 12, iv.months % 12);
-    let unit = |n: i32, singular: &str| {
-        if n == 1 {
-            format!("{n} {singular}")
-        } else {
-            format!("{n} {singular}s")
-        }
-    };
-    if years != 0 {
-        parts.push(unit(years, "year"));
-    }
-    if months != 0 {
-        parts.push(unit(months, "mon"));
-    }
-    if iv.days != 0 {
-        parts.push(unit(iv.days, "day"));
-    }
-    if iv.micros != 0 || parts.is_empty() {
-        let neg = iv.micros < 0;
-        let a = iv.micros.unsigned_abs();
-        let (h, m, sec, frac) = (
-            a / 3_600_000_000,
-            (a % 3_600_000_000) / 60_000_000,
-            (a % 60_000_000) / 1_000_000,
-            a % 1_000_000,
-        );
-        let mut t = format!("{}{h:02}:{m:02}:{sec:02}", if neg { "-" } else { "" });
-        if frac != 0 {
-            t.push('.');
-            t.push_str(format!("{frac:06}").trim_end_matches('0'));
-        }
-        parts.push(t);
-    }
-    parts.join(" ")
+    // `EncodeInterval`, in the session's `IntervalStyle` (RP-068).
+    let t = iv.micros;
+    output_style::encode_interval(
+        &output_style::ItmParts {
+            year: iv.months / 12,
+            mon: iv.months % 12,
+            mday: iv.days,
+            hour: t / 3_600_000_000,
+            min: ((t / 60_000_000) % 60) as i32,
+            sec: ((t / 1_000_000) % 60) as i32,
+            fsec: (t % 1_000_000) as i32,
+        },
+        output_style::output_style().interval,
+    )
 }
 
 /// `sum` (or, with `avg`, the mean) of interval values: `None` unless every
@@ -29063,11 +29751,30 @@ fn parse_interval(text: &str) -> Result<Interval> {
     if let Some(rest) = t.strip_prefix(['P', 'p']) {
         return parse_iso_interval(rest, text);
     }
+    // `@ 1 min ago`, the `postgres_verbose` spelling: `@` is noise, and a
+    // trailing `ago` negates every field (`DecodeInterval`).
+    let t = t.strip_prefix('@').unwrap_or(t);
+    let mut tokens: Vec<String> = t.split_whitespace().map(str::to_string).collect();
+    let ago = tokens.last().is_some_and(|w| w.eq_ignore_ascii_case("ago"));
+    if ago {
+        tokens.pop();
+    }
+    // Under `IntervalStyle = sql_standard` a leading minus applies to every
+    // later field that has no sign of its own (`-1 2:03:04` is all negative).
+    if output_style::output_style().interval == output_style::IntervalStyle::SqlStandard
+        && tokens.first().is_some_and(|w| w.starts_with('-'))
+    {
+        for w in tokens.iter_mut().skip(1) {
+            if w.starts_with(|c: char| c.is_ascii_digit() || c == '.') {
+                w.insert(0, '-');
+            }
+        }
+    }
     let mut iv = Interval::default();
     let mut pending: Option<f64> = None;
     let mut saw_any = false;
 
-    for token in t.split_whitespace() {
+    for token in tokens.iter().map(String::as_str) {
         // A `HH:MM:SS` chunk, possibly signed.
         if token.contains(':') {
             let (sign, body) = match token.strip_prefix('-') {
@@ -29127,6 +29834,11 @@ fn parse_interval(text: &str) -> Result<Interval> {
     }
     if !saw_any {
         return Err(bad_interval(text));
+    }
+    if ago {
+        iv.months = -iv.months;
+        iv.days = -iv.days;
+        iv.micros = -iv.micros;
     }
     Ok(iv)
 }
@@ -30146,11 +30858,12 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
             return Ok(arrays::bounded(cast_value_inner(plain, target)?, &lower));
         }
         if matches!(target, "text" | "varchar" | "bpchar" | "name") {
-            return Ok(Bson::String(format!(
-                "{}={}",
-                arrays::dims_text(&value).unwrap_or_default(),
-                value_text(&plain)
-            )));
+            // An empty array of one dimension (`acldefault('c', ...)`) has no
+            // bounds to show: `{}`.
+            return Ok(Bson::String(match arrays::dims_text(&value) {
+                Some(dims) => format!("{dims}={}", value_text(&plain)),
+                None => value_text(&plain),
+            }));
         }
         return cast_value_inner(plain, target);
     }
@@ -30653,10 +31366,12 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
             // A decimal literal is `numeric`, so `1.5::float8` arrives here as
             // a Decimal128 rather than a Double. Missing this arm made the
             // cast fail outright once decimal literals stopped being floats.
+            // `numeric_float8` is `float8in` over the numeric's text, so a
+            // value past the double range either way is 22003 (RP-066).
             v if is_numeric(v) => numeric_text(v)
-                .and_then(|t| numeric::numeric_text_to_f64(&t))
-                .map(Bson::Double)
-                .ok_or_else(|| bad("double precision", &value)),
+                .ok_or_else(|| bad("double precision", &value))
+                .and_then(|t| float_in(&t, "double precision"))
+                .map(Bson::Double),
             Bson::String(s) => float_in(s, "double precision").map(Bson::Double),
             _ => Err(bad("double precision", &value)),
         },
@@ -33293,7 +34008,7 @@ pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
                     )))
                 }
             };
-            return Ok(Bson::Double(match op {
+            let out = match op {
                 "+" => x + y,
                 "-" => x - y,
                 "*" => x * y,
@@ -33304,7 +34019,28 @@ pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
                     x / y
                 }
                 _ => return Err(Error::Unsupported(format!("operator {op}"))),
-            }));
+            };
+            // `float_overflow_error` / `float_underflow_error`, as
+            // `float8_pl` / `_mi` / `_mul` / `_div` check (RP-066): an
+            // infinity from finite operands, a zero from nonzero ones.
+            let overflow = out.is_infinite() && x.is_finite() && (op == "/" || y.is_finite());
+            let underflow = out == 0.0
+                && match op {
+                    "*" => x != 0.0 && y != 0.0,
+                    "/" => x != 0.0 && y.is_finite(),
+                    _ => false,
+                };
+            if overflow {
+                return Err(Error::NumericOutOfRange(
+                    "value out of range: overflow".into(),
+                ));
+            }
+            if underflow {
+                return Err(Error::NumericOutOfRange(
+                    "value out of range: underflow".into(),
+                ));
+            }
+            return Ok(Bson::Double(out));
         }
     };
 
@@ -33673,53 +34409,6 @@ fn plan_copy(
             "COPY to or from a server-side file".into(),
         ));
     }
-    let mut format = CopyFormat::Text;
-    let mut header = false;
-    for opt in &c.options {
-        if let Some(N::DefElem(d)) = opt.node.as_ref() {
-            let name = d.defname.to_ascii_lowercase();
-            let value = d
-                .arg
-                .as_ref()
-                .and_then(|a| a.node.as_ref())
-                .and_then(|n| match n {
-                    N::String(s) => Some(s.sval.to_ascii_lowercase()),
-                    _ => None,
-                });
-            match (name.as_str(), value.as_deref()) {
-                ("format", Some("text")) => format = CopyFormat::Text,
-                ("format", Some("csv")) => format = CopyFormat::Csv,
-                ("format", Some("binary")) => format = CopyFormat::Binary,
-                ("format", other) => {
-                    return Err(Error::Unsupported(format!(
-                        "COPY ... FORMAT {}",
-                        other.unwrap_or("?")
-                    )))
-                }
-                // `HEADER` alone is true; `HEADER MATCH` (COPY FROM) checks the
-                // names, which is refused rather than skipped unchecked.
-                ("header", None | Some("true" | "on" | "1")) => header = true,
-                ("header", Some("false" | "off" | "0")) => header = false,
-                ("header", Some("match")) => {
-                    return Err(Error::Unsupported("COPY ... HEADER MATCH".into()))
-                }
-                ("header", Some(v)) => {
-                    return Err(Error::Sqlstate(
-                        "22023",
-                        format!("header requires a Boolean value or \"match\": {v}"),
-                    ))
-                }
-                (other, _) => return Err(Error::Unsupported(format!("COPY option {other}"))),
-            }
-        }
-    }
-    // PostgreSQL 15: `cannot specify HEADER in BINARY mode`.
-    if header && format == CopyFormat::Binary {
-        return Err(Error::Sqlstate(
-            "0A000",
-            "cannot specify HEADER in BINARY mode".into(),
-        ));
-    }
     // `COPY (SELECT ...) TO STDOUT`. PostgreSQL allows a query only when
     // copying OUT -- there is nowhere to put rows copied INTO one.
     if c.relation.is_none() {
@@ -33732,12 +34421,17 @@ fn plan_copy(
             ));
         }
         let inner = plan_select(sel, lookup, params)?;
+        let names: Vec<String> = sub_plan_def(&inner, lookup)
+            .map(|d| d.columns.iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default();
+        let parsed = copy_opts::process(&c.options, false, &names, None)?;
         return Ok(Statement::CopyTo(CopyFrom {
             table: String::new(),
             columns: Vec::new(),
-            format,
+            format: parsed.format,
             query: Some(Box::new(inner)),
-            header,
+            header: parsed.header,
+            options: parsed.options,
         }));
     }
     let table = c
@@ -33758,12 +34452,20 @@ fn plan_copy(
         }
         columns.push(name);
     }
+    let named: Vec<String> = if columns.is_empty() {
+        def.columns.iter().map(|c| c.name.clone()).collect()
+    } else {
+        columns.clone()
+    };
+    let all: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
+    let parsed = copy_opts::process(&c.options, c.is_from, &named, Some((&table, &all)))?;
     let spec = CopyFrom {
         table,
         columns,
-        format,
+        format: parsed.format,
         query: None,
-        header,
+        header: parsed.header,
+        options: parsed.options,
     };
     Ok(if c.is_from {
         Statement::CopyFrom(spec)
@@ -36278,6 +36980,27 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         if let Some(result) = correlated::eval_correlated(f, params) {
             return result;
         }
+        // `pg_column_size` reads its argument's TYPE and where it came
+        // from, not only its value (RP-074).
+        if func_name(f).as_deref() == Some("pg_column_size")
+            && f.args.len() == 1
+            && f.over.is_none()
+        {
+            let arg = &f.args[0];
+            let value = const_value(arg, params)?;
+            // A bare string literal is `unknown`, a C string (typlen -2).
+            let untyped = matches!(arg.node.as_ref(), Some(N::AConst(c))
+                if matches!(c.val, Some(a_const::Val::Sval(_))));
+            let ty = if untyped {
+                "unknown".to_string()
+            } else {
+                static_type(arg, &value)
+            };
+            let from_table = matches!(arg.node.as_ref(), Some(N::ColumnRef(_)));
+            return Ok(
+                datum_size::column_size(&value, &ty, from_table).map_or(Bson::Null, Bson::Int32)
+            );
+        }
         if let Some(result) = collation_for_call(f, params) {
             return result;
         }
@@ -36482,6 +37205,36 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                     )
                 }));
             }
+        }
+        // `pg_get_function_arg_default(fn, n)`: the n-th parameter's default,
+        // NULL for none, an unknown function or a position past the end.
+        if func_name(f).as_deref() == Some("pg_get_function_arg_default")
+            && f.args.len() == 2
+            && !correlated::user_function_named("pg_get_function_arg_default")
+        {
+            let int = |v: Bson| match v {
+                Bson::Int32(i) => Some(i64::from(i)),
+                Bson::Int64(i) => Some(i),
+                Bson::String(t) => t.trim().parse().ok(),
+                other => regobj::from_bson(&other).map(|(_, o)| o),
+            };
+            let (Some(oid), Some(n)) = (
+                int(const_value(&f.args[0], params)?),
+                int(const_value(&f.args[1], params)?),
+            ) else {
+                return Ok(Bson::Null);
+            };
+            return Ok(FUNCTION_ARG_DEFAULTS.with(|d| {
+                d.borrow()
+                    .iter()
+                    .find(|(o, _)| *o == oid)
+                    .and_then(|(_, defaults)| {
+                        usize::try_from(n - 1)
+                            .ok()
+                            .and_then(|i| defaults.get(i).cloned().flatten())
+                    })
+                    .map_or(Bson::Null, Bson::String)
+            }));
         }
         // `pg_get_partkeydef(table)`: `LIST (k)`, `RANGE (a, b)`; NULL for a
         // table that is not partitioned.
@@ -37148,16 +37901,36 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
             } else {
                 (lhs, rhs)
             };
-            return Ok(
-                if lhs != Bson::Null
-                    && rhs != Bson::Null
-                    && compare_constants(&lhs, &rhs) == Some(std::cmp::Ordering::Equal)
-                {
-                    Bson::Null
-                } else {
-                    lhs
-                },
-            );
+            if lhs != Bson::Null
+                && rhs != Bson::Null
+                && compare_constants(&lhs, &rhs) == Some(std::cmp::Ordering::Equal)
+            {
+                return Ok(Bson::Null);
+            }
+            // The value is the left operand coerced to the `=` operator's
+            // left input type (`nullif(53, 80::numeric)` is numeric 53).
+            if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+                if lhs != Bson::Null && !l_bare {
+                    let lt = static_type(l, &lhs);
+                    let rt = static_type(r, &rhs);
+                    if let Some(input) = funcsig::operator_left_input("=", &lt, &rt) {
+                        if input != lt {
+                            // A `char(n)` loses its padding on the way to
+                            // text, as `rtrim1` does.
+                            let lhs = match lhs {
+                                Bson::String(v)
+                                    if matches!(lt.as_str(), "bpchar" | "char" | "character") =>
+                                {
+                                    Bson::String(v.trim_end_matches(' ').to_string())
+                                }
+                                other => other,
+                            };
+                            return cast_value(lhs, &input);
+                        }
+                    }
+                }
+            }
+            return Ok(lhs);
         }
         if matches!(
             AExprKind::try_from(e.kind),
@@ -38576,8 +39349,11 @@ fn lower_pattern_match(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Doc
         if column.pg_type == "bytea" && is_like && !insensitive {
             return Err(Error::Unsupported("a pattern match over bytea".into()));
         }
+        // A domain matches as its base type (`information_schema`'s
+        // `sql_identifier` is `name`).
+        let base = domains::domain_base(&column.pg_type).unwrap_or_else(|| column.pg_type.clone());
         if !matches!(
-            column.pg_type.as_str(),
+            base.as_str(),
             "text" | "varchar" | "bpchar" | "name" | "citext"
         ) {
             return Err(Error::UndefinedFunction(format!(

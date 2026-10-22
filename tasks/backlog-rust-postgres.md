@@ -729,80 +729,21 @@ Not filed:
       above is a different question.
       Backlog-ID: RP-061
       Verify: tests/backlog/test_rp_found_2026_10_20.py::test_serializable_write_skew
-- [ ] **Recursive CTE `SEARCH` and `CYCLE` clauses are parsed and
-      dropped.** `secantus-pgplan` never reads the parse tree's
-      `search_clause` or `cycle_clause`:
-      - `SEARCH DEPTH FIRST BY n SET ord` leaves no `ord` column (42703
-        when selected).
-      - `CYCLE n SET is_cycle USING path` does not stop the recursion; it
-        runs until `statement_timeout` (57014) or the row cap, where
-        PostgreSQL 15.19 returns 3 rows.
-
-      Until they are implemented, both must be refused by name (0A000)
-      rather than ignored.
-      Backlog-ID: RP-062
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_recursive_search_and_cycle
-- [ ] **A recursive CTE is run to completion before anything above it.**
-      `with recursive t(n) as (select 1 union all select n + 1 from t)
-      select n from t limit 3` never returns here (57014 at a 5 s timeout);
-      PostgreSQL 15.19 answers at once, because a CTE scan pulls only the
-      rows asked for. Related, and not covered by the test:
-      - `RECURSIVE_CTE_ROW_LIMIT` (1,000,000) is an invented 54000 that
-        PostgreSQL does not have.
-      - `UNION` deduplication is a quadratic `Vec::contains`: a
-        20,000-step UNION recursion took 10.6 s against PostgreSQL's
-        0.04 s (debug build).
-      Backlog-ID: RP-063
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_recursive_cte_under_limit
-- [ ] **`CREATE DATABASE` drops every option.**
-      `Statement::CreateDatabase { name }` keeps only the name:
-      - `TEMPLATE tsrc` gives an EMPTY database (its table is 42P01).
-        Cloning a template is a common way to isolate tests.
-      - `ENCODING 'LATIN1'` is recorded as UTF8.
-      - `CONNECTION LIMIT 3` as -1, and OWNER is dropped.
-
-      `ALTER DATABASE` is refused outright.
+- [ ] **A database created with a non-UTF8 `ENCODING` still behaves as
+      UTF8.** `CREATE DATABASE ... ENCODING 'LATIN1'` is recorded (and
+      `pg_database` shows it), and TEMPLATE, OWNER, CONNECTION LIMIT,
+      IS_TEMPLATE, ALLOW_CONNECTIONS and ALTER DATABASE are PostgreSQL's
+      (2026-10-22). Inside such a database PostgreSQL 15.19 reports
+      `server_encoding` as LATIN1, defaults `client_encoding` to it, refuses a
+      character LATIN1 lacks on the way from the client (22P05), and its byte
+      functions count LATIN1 bytes: `octet_length('é')` is 1, `convert_to`
+      and `::bytea` give `\xe9`, `chr(8364)` is 54000. Here every database is
+      UTF8 inside. **Decided (Joe, 2026-10-22): emulate the encoding** --
+      PostgreSQL's model, the server encoding per database with the
+      client-to-server conversion and the byte functions honouring it -- as
+      its own slice.
       Backlog-ID: RP-064
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_create_database_options
-- [ ] **Temporary tables ignore `ON COMMIT`.** A row in an `ON COMMIT
-      DELETE ROWS` table is still there after COMMIT (count 1; PostgreSQL
-      15.19: 0), and an `ON COMMIT DROP` table outlives its transaction.
-      `oncommit` is read nowhere in the PG crates.
-      Backlog-ID: RP-065
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_temp_table_on_commit
-- [ ] **float8 overflow and underflow return Infinity or 0.**
-      PostgreSQL 15.19 raises 22003 for:
-      - `'1e308'::float8 * 10` and `+`;
-      - `col * 10` over a stored 1e308;
-      - `'1e-300'::float8 * '1e-300'::float8`;
-      - `1e400::numeric::float8` and `1e-400::numeric::float8`.
-
-      Every one succeeds here. `sum()` already raises 22003; the scalar
-      operators and the cast lack PostgreSQL's `float_overflow_error` /
-      `float_underflow_error` checks.
-      Backlog-ID: RP-066
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_float8_out_of_range
-- [ ] **`ALTER DEFAULT PRIVILEGES` does nothing, and a role's `CONNECTION
-      LIMIT` is not enforced.** `secantus-pgplan` accepts the statement
-      as a no-op ("single-user test server"), but GRANT and row-level
-      security are enforced now, so a table created afterwards lacks the
-      grant: `has_table_privilege` is false where PostgreSQL 15.19 says
-      true. The connection limit is stored and never checked: a role with
-      `CONNECTION LIMIT 0` logs in, where PostgreSQL refuses (53300).
-      Both are permission answers that are silently wrong.
-      Backlog-ID: RP-067
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_default_privileges_and_connection_limit
-- [ ] **Output settings are accepted and ignored.** PostgreSQL 15.19 and
-      this server answer differently:
-
-      | setting | PostgreSQL 15.19 | here |
-      | --- | --- | --- |
-      | `IntervalStyle = iso_8601` | `P1DT2H` | `1 day 02:00:00` |
-      | `bytea_output = escape` | `A\377` | `\x41ff` |
-      | `extra_float_digits = 0` | `0.3` | `0.30000000000000004` |
-      | `application_name` in `pg_stat_activity` | the set name | empty |
-      Backlog-ID: RP-068
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_output_settings
+      Verify: tests/backlog/test_rp064_encoding.py::test_latin1_database_behaves_as_latin1
 - [ ] **System columns are missing.** `ctid`, `xmin`, `xmax`, `cmin` and
       `cmax` are 42703 (`tableoid` works). That breaks EF Core / Npgsql's
       `xmin` concurrency token, the `delete ... where ctid = ...`
@@ -810,33 +751,22 @@ Not filed:
       has a model to build on (`xids.rs`).
       Backlog-ID: RP-069
       Verify: tests/backlog/test_rp_found_2026_10_20.py::test_system_columns
-- [ ] **127 of PostgreSQL 15's 203 `pg_catalog` / `information_schema`
-      tables and views cannot be queried** (42P01). The full list is
-      `tests/backlog/rp070_catalog_relations.txt`, generated from PostgreSQL
-      15.19's `pg_class`. Missing examples:
-      - `information_schema.schemata`, `routines`, `check_constraints`,
-        `referential_constraints`, `triggers`, `parameters`;
-      - `pg_stat_user_tables` and the rest of `pg_stat_*` / `pg_statio_*`;
-      - `pg_stats` / `pg_statistic` (ANALYZE models statistics);
-      - `pg_aggregate`, `pg_default_acl`, `pg_shseclabel`,
-        `pg_db_role_setting`.
-
-      This is why the client tools in RP-071 fail.
+- [ ] **The cumulative statistics views cannot be queried** (42P01): the 21
+      `pg_stat_*_tables` / `_indexes` / `_functions`, `pg_stat_xact_*`,
+      `pg_stat_database` and `pg_statio_*` views. Every other relation in
+      PostgreSQL 15.19's `pg_class` (`tests/backlog/rp070_catalog_relations.txt`)
+      now answers, as PostgreSQL's own view definition over this server's
+      catalogs, from PostgreSQL's built-in rows, or from this server's state.
+      **Decided (Joe, 2026-10-22): model the counters, refuse the
+      internals** -- PostgreSQL's cumulative-statistics model (per-table,
+      per-index and per-function counters, the database's counters,
+      persisted across restarts) behind those views; the server's internals
+      (`pg_backend_memory_contexts`, `pg_shmem_allocations`,
+      `pg_stat_bgwriter`, `pg_stat_wal`, `pg_stat_slru`, `pg_stat_archiver`)
+      refused by name, 0A000, which the gap test expects. Relations refused
+      for reasons other items record (RP-098 .. RP-101) are left to theirs.
       Backlog-ID: RP-070
       Verify: tests/backlog/test_rp_found_2026_10_20.py::test_catalog_relations_are_queryable
-- [ ] **PostgreSQL's own client tools fail.** With the PostgreSQL 15 binaries,
-      each of these exits 0 against PostgreSQL 15.19 and non-zero here:
-      - `pg_dump --schema-only` stops at `pg_is_in_recovery()` (0A000);
-      - `pg_dumpall --globals-only` stops on `pg_shseclabel`;
-      - `pgbench -i` stops at `COPY ... FREEZE` (0A000);
-      - psql's `\l+`, `\dd`, `\dc`, `\dL`, `\dy` and `\db`.
-
-      Also unsupported: `pg_current_wal_lsn`, `pg_postmaster_start_time`,
-      `pg_relation_filepath`, `pg_tablespace_location`. The test needs
-      the PostgreSQL 15 tools (`SECANTUS_PG15_BIN`, or Homebrew's
-      `postgresql@15`).
-      Backlog-ID: RP-071
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_client_tools
 - [ ] **Statements still refused with 0A000** (`... is not supported yet`),
       each of which PostgreSQL 15.19 runs:
       - `ALTER SYSTEM` (set and reset), `ALTER ROLE ... SET`;
@@ -854,101 +784,62 @@ Not filed:
       surveys listed" is refused no longer held.
       Backlog-ID: RP-072
       Verify: tests/backlog/test_rp_found_2026_10_20.py::test_statements_not_refused
-- [ ] **COPY refuses `FORCE_QUOTE`, `FORCE_NOT_NULL`, `FORCE_NULL` and
-      `FREEZE`** (0A000, `secantus-pgplan`). PostgreSQL 15.19 takes all
-      four, and `pgbench -i` uses `FREEZE`.
-      Backlog-ID: RP-073
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_copy_options
-- [ ] **Smaller wrong answers.**
-      - Named arguments to a built-in fail: `make_interval(days => 1)` is
-        42883.
-      - Result column names: an inet `>>` is named `__net_op`, an internal
-        name leaking, where PostgreSQL says `?column?`; a `CASE` is
-        `?column?` where it says `case`; `xmlagg` is named `string_agg`.
-      - `pg_column_size` answers 4, 6, 8, 4 for text, a row, an int array
-        and a numeric, where PostgreSQL 15.19 answers 7, 32, 36, 10.
-      - `REFRESH MATERIALIZED VIEW CONCURRENTLY` on a view with no unique
-        index is accepted; PostgreSQL refuses it (55000).
 
-      Not in the test:
-      - the 63-byte identifier-truncation NOTICE is missing;
-      - an unavailable extension's error DETAIL cites a `/postgresql/16/`
-        path on a server that reports 15.0.
-      Backlog-ID: RP-074
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_smaller_answers
+## Found by batch 26 (2026-10-22)
 
-## Found by the weekly SQL gauges
+Found while making PostgreSQL 15's `pg_dump`, `pg_dumpall` and `psql` answer
+as they do against PostgreSQL 15.19 (RP-070, RP-071). The gap tests are
+scenarios in `tests/backlog/test_rp_batch26.py`, measured on a private 15.19
+cluster.
 
-Found by the first run of the weekly SQL gauges against `secantusd-pg`
-(`validate.yml`, 2026-10-21). Each was reproduced against a `secantusd-pg`
-built from the run's tree and against a PRIVATE PostgreSQL 15.19 cluster
-(`initdb --locale=C -E UTF8`). The gap tests are in
-`tests/backlog/test_rp_found_2026_10_21.py`.
-
-Not filed: PostgreSQL 15.19 itself fails 9 of the gauge's 30 files, on
-SQLite-only behaviour the corpus expects, and they are recorded as expected
-divergences in `slt_validation/include_paths.py`. The Rust server fails the
-same 9, and stops at the same statement as PostgreSQL in 8 of them; the
-ninth, `random/expr/slt_good_0.test`, is RP-076. Because a file stops at its
-first failure, the rest of each of those 9 files is measured by neither
-server.
-
-- [ ] **A strict operator with a NULL constant argument is evaluated row by
-      row instead of folding to NULL, so `c / 0 = NULL` raises.** On a table
-      with rows, `select count(*) from t where c / 0 = NULL` is 22012
-      `division by zero` here. PostgreSQL 15.19 returns 0: its planner folds
-      a strict operator or function that has a NULL constant argument to NULL
-      before execution (`eval_const_expressions`), so the plan is
-      `One-Time Filter: false` and the division never runs. The same holds
-      for `NULL = c / 0`, `c / 0 + NULL > 1`, the comparison in a select
-      list, and under `AND` / `OR`. A non-strict test (`c / 0 IS NULL`) and a
-      comparison with a column (`c / 0 = d`) still raise 22012 on PostgreSQL,
-      so the fix is the folding rule, not tolerating the error. Found by
-      `random/aggregates/slt_good_1.test:66475`
-      (`WHERE ( + col1 ) / - + 0 = NULL`), the sqllogictest gauge's one
-      unexpected failure that PostgreSQL passes.
-      Backlog-ID: RP-075
-      Verify: tests/backlog/test_rp_found_2026_10_21.py::test_strict_null_folding
-- [ ] **`NULLIF` takes its first argument's type even when PostgreSQL
-      coerces it, so `nullif(53, 80::numeric) / -71` is integer division.**
-      Here `pg_typeof(nullif(53, 80::numeric))` is `integer` and the
-      division returns `0`. PostgreSQL 15.19 gives NULLIF the left input type
-      of the `=` operator it resolves: `int = numeric` resolves to
-      `numeric = numeric`, so the result is `numeric` and the division is
-      `-0.74647887323943661972`. The same for `nullif(53, 80.5)` (numeric)
-      and `nullif(1, 2::float8)` (double precision). The rule is the
-      operator's input type, not promotion: `nullif(1::int2, 2::int8)` stays
-      `smallint` on PostgreSQL, through the cross-type `int28eq`, and the
-      Rust server already agrees there. A silent wrong answer. Found by
-      `random/expr/slt_good_0.test:45345`, where PostgreSQL stops on the
-      corpus's SQLite answer `0` and the Rust server, giving that same wrong
-      answer, runs on to line 62223. The file is an expected divergence, so
-      this showed up only as a different stop point.
-      Backlog-ID: RP-076
-      Verify: tests/backlog/test_rp_found_2026_10_21.py::test_nullif_result_type
+- [ ] **ANALYZE computes no column statistics**, so `pg_statistic`,
+      `pg_stats` and the extended-statistics relations (`pg_statistic_ext_data`,
+      `pg_stats_ext`, `pg_stats_ext_exprs`) are refused by name (0A000).
+      PostgreSQL's ANALYZE samples up to 300 x `default_statistics_target`
+      rows (all of a smaller table, so deterministic there) and records
+      `null_frac`, `avg_width`, `n_distinct`, the most common values and a
+      histogram per column. The planner's cost model (RP-028) would read them.
+      Backlog-ID: RP-099
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[ANALYZE computes statistics]
+- [ ] **The progress views are refused by name** (0A000):
+      `pg_stat_progress_vacuum`, `_analyze`, `_cluster`, `_copy`,
+      `_create_index`, `_basebackup`. PostgreSQL reports a row per backend
+      running that command, which a COPY or CREATE INDEX here never
+      publishes.
+      Backlog-ID: RP-100
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[progress views]
+- [ ] **The configuration-file views are refused by name** (0A000):
+      `pg_hba_file_rules` and `pg_ident_file_mappings` (the server reads a
+      `pg_hba.conf` / `pg_ident.conf` when given one, but keeps only their
+      meaning, not the raw tokens these views report), `pg_config` (no
+      PostgreSQL installation stands behind it) and `pg_file_settings` (no
+      `postgresql.conf`).
+      Backlog-ID: RP-101
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[configuration-file views]
+- [ ] **PostgreSQL's built-in objects are missing from several catalogs.**
+      `pg_proc` lists only user functions (PostgreSQL 15.19 has 3,233 in
+      `pg_catalog`), `pg_type` lacks the system relations' row types, and
+      `pg_constraint` the system catalogs' constraints. Views over them come
+      out short: `information_schema.routines` has 13 rows on a fresh
+      database where PostgreSQL has 3,244, `parameters` 22 for 6,480.
+      Backlog-ID: RP-102
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[built-in objects in the catalogs]
+- [ ] **`pg_depend` records only dependencies between relations and column
+      defaults**: owned and identity sequences, indexes on their columns,
+      partitions and inheritance children, defaults on their sequence and
+      types. Constraints, rules, triggers, types and functions record none,
+      and an expression index depends on its table as a whole rather than
+      the columns its expression reads.
+      Backlog-ID: RP-105
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[dependencies beyond relations]
+- [ ] **The WAL and file-location functions are refused** (0A000):
+      `pg_current_wal_lsn()` and `pg_relation_filepath()`. This server writes
+      no PostgreSQL WAL and keeps no PostgreSQL relation files.
+      Backlog-ID: RP-112
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[WAL and file functions]
 
 ## Found by the corpus test (2026-10-21)
 
-- [ ] **psql's `\d <table>` takes over a minute: a correlated subquery over
-      a comma join evaluates the whole cross product for every outer row.**
-      psql 15's column query for `\d` holds `(SELECT c.collname FROM
-      pg_collation c, pg_type t WHERE c.oid = a.attcollation AND t.oid =
-      a.atttypid AND a.attcollation <> t.typcollation)`, once per column.
-      The equalities name the OUTER row's columns, so PostgreSQL 15.19 reads
-      one row of each catalog and answers in 3.5 ms. A debug `secantusd-pg`
-      takes 64 s, for a table of one column or of three (the rest of the
-      query takes 0.1 s); the catalogs are 911 and 181 rows, so the cost is
-      the cross product, not the outer rows. A RELEASE build takes 4.3 s,
-      about 1,200 times PostgreSQL. The answer is right, so
-      nothing but time shows it; any client that describes a table (psql,
-      and ORMs' introspection, which send the same shape) waits. Found when
-      `tests/test_rust_pg_corpora.py` first ran every corpus:
-      `psql_describe` took 268 s, 263 of them in four runs of this query.
-      `RP-019` is the same planner's pushdown into a JOIN; this is the
-      correlated-subquery path, where the outer row's values are constants.
-      The gap test itself takes about a minute while this is open.
-      Backlog-ID: RP-077
-      Verify: tests/backlog/test_rp_catalog_latency.py::test_psql_describe_collation_subquery
 
 ## Code structure (2026-10-19)
 

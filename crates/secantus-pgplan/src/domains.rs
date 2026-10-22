@@ -59,17 +59,79 @@ pub fn user_domain(name: &str) -> Option<Domain> {
         Some(bare) if !crate::pgtypes::shadowed_by_catalog(bare) => bare.to_string(),
         _ => target,
     };
-    PLAN_USER_DOMAINS.with(|d| d.borrow().iter().find(|x| x.name == target).cloned())
+    PLAN_USER_DOMAINS
+        .with(|d| d.borrow().iter().find(|x| x.name == target).cloned())
+        .or_else(|| system_domains().iter().find(|x| x.name == target).cloned())
+}
+
+/// `information_schema`'s five domains (`information_schema.sql`), with
+/// PostgreSQL 15.19's oids, constraints and defaults.
+pub fn system_domains() -> &'static [Domain] {
+    static DOMAINS: std::sync::OnceLock<Vec<Domain>> = std::sync::OnceLock::new();
+    DOMAINS.get_or_init(|| {
+        let d = |name: &str, oid, base: &str, typmod, checks: &[(&str, &str)], default: Option<&str>| {
+            Domain {
+                name: format!("information_schema.{name}"),
+                oid,
+                base: base.to_string(),
+                typmod,
+                not_null: false,
+                checks: checks
+                    .iter()
+                    .map(|(n, e)| (n.to_string(), e.to_string()))
+                    .collect(),
+                default_sql: default.map(str::to_string),
+            }
+        };
+        vec![
+            d(
+                "cardinal_number",
+                13693,
+                "int4",
+                -1,
+                &[("cardinal_number_domain_check", "VALUE >= 0")],
+                None,
+            ),
+            d("character_data", 13696, "varchar", -1, &[], None),
+            d("sql_identifier", 13698, "name", -1, &[], None),
+            d(
+                "time_stamp",
+                13704,
+                "timestamptz",
+                2,
+                &[],
+                Some("CURRENT_TIMESTAMP(2)"),
+            ),
+            d(
+                "yes_or_no",
+                13706,
+                "varchar",
+                7,
+                &[(
+                    "yes_or_no_check",
+                    "(VALUE)::text = ANY ((ARRAY['YES'::character varying, 'NO'::character varying])::text[])",
+                )],
+                None,
+            ),
+        ]
+    })
 }
 
 /// A domain's name by its type oid.
 pub fn domain_name_of_oid(oid: i64) -> Option<String> {
-    PLAN_USER_DOMAINS.with(|d| {
-        d.borrow()
-            .iter()
-            .find(|x| x.oid == oid)
-            .map(|x| x.name.clone())
-    })
+    PLAN_USER_DOMAINS
+        .with(|d| {
+            d.borrow()
+                .iter()
+                .find(|x| x.oid == oid)
+                .map(|x| x.name.clone())
+        })
+        .or_else(|| {
+            system_domains()
+                .iter()
+                .find(|x| x.oid == oid)
+                .map(|x| x.name.clone())
+        })
 }
 
 /// A domain's base type, for the wire.

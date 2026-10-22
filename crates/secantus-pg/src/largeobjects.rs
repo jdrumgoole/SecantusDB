@@ -21,6 +21,8 @@ const CHUNK: i64 = 256 * 1024;
 const FIRST_LO_OID: i64 = 16384;
 const MAX_LO_SIZE: i64 = 4 * 1024 * 1024 * 1024 * 1024;
 const INV_WRITE: i32 = 0x0002_0000;
+/// PostgreSQL's `LOBLKSIZE`: `pg_largeobject` keeps an object in pages this long.
+const LOBLKSIZE: i64 = 2048;
 
 /// PostgreSQL's own oids (`pg_proc.dat`): name, oid, argument types, result.
 pub(crate) const LO_PROCS: &[(&str, i64, &[i64], i64)] = &[
@@ -146,12 +148,49 @@ impl PgHandler {
             }))
     }
 
-    fn lo_set_size(&self, oid: i64, size: i64) -> PgWireResult<()> {
+    /// The object's record: its size and, for one this server has kept them
+    /// for, the length of each `LOBLKSIZE` page a write reached
+    /// (`pg_largeobject`'s rows). A record without the map is an older
+    /// store's.
+    fn lo_store_meta(
+        &self,
+        oid: i64,
+        size: i64,
+        pages: Option<&std::collections::BTreeMap<i64, i64>>,
+    ) -> PgWireResult<()> {
         self.lo_delete(LO_COLLECTION, bson::doc! {"_id": int_bson(oid)})?;
-        self.lo_insert(
-            LO_COLLECTION,
-            bson::doc! {"_id": int_bson(oid), "size": int_bson(size)},
-        )
+        let mut doc = bson::doc! {"_id": int_bson(oid), "size": int_bson(size)};
+        if let Some(pages) = pages {
+            let mut map = Document::new();
+            for (p, len) in pages {
+                map.insert(p.to_string(), int_bson(*len));
+            }
+            doc.insert("pages", map);
+        }
+        self.lo_insert(LO_COLLECTION, doc)
+    }
+
+    /// The page map (`None` for an older store's object, which has none).
+    pub(crate) fn lo_pages(
+        &self,
+        oid: i64,
+    ) -> PgWireResult<Option<std::collections::BTreeMap<i64, i64>>> {
+        Ok(self
+            .lo_find(LO_COLLECTION, bson::doc! {"_id": int_bson(oid)})?
+            .first()
+            .and_then(|d| d.get_document("pages").ok().cloned())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| {
+                        let len = match v {
+                            Bson::Int32(n) => i64::from(*n),
+                            Bson::Int64(n) => *n,
+                            _ => return None,
+                        };
+                        Some((k.parse().ok()?, len))
+                    })
+                    .collect()
+            }))
     }
 
     fn chunk_id(oid: i64, idx: i64) -> Document {
@@ -221,10 +260,21 @@ impl PgHandler {
                 self.lo_put_chunk(oid, idx, chunk)?;
             }
         }
-        if end > self.lo_size(oid)?.unwrap_or(0) {
-            self.lo_set_size(oid, end)?;
+        // Each page the write reached is as long as its furthest byte
+        // (`inv_write`): one written past the end of the last leaves the
+        // pages between unwritten, which PostgreSQL keeps no row for.
+        let size = self.lo_size(oid)?.unwrap_or(0).max(end);
+        let mut pages = self.lo_pages(oid)?;
+        if let Some(map) = pages.as_mut() {
+            if !data.is_empty() {
+                for p in pos / LOBLKSIZE..=(end - 1) / LOBLKSIZE {
+                    let len = (end - p * LOBLKSIZE).min(LOBLKSIZE);
+                    let entry = map.entry(p).or_insert(0);
+                    *entry = (*entry).max(len);
+                }
+            }
         }
-        Ok(())
+        self.lo_store_meta(oid, size, pages.as_ref())
     }
 
     fn lo_truncate_to(&self, oid: i64, len: i64) -> PgWireResult<()> {
@@ -240,7 +290,19 @@ impl PgHandler {
                 self.lo_put_chunk(oid, last, keep)?;
             }
         }
-        self.lo_set_size(oid, len)
+        // `inv_truncate`: the pages past the new end go, the one holding it
+        // is cut there -- or, extending, written out to it.
+        let mut pages = self.lo_pages(oid)?;
+        if let Some(map) = pages.as_mut() {
+            map.retain(|p, _| p * LOBLKSIZE < len);
+            if len > 0 {
+                let p = (len - 1) / LOBLKSIZE;
+                let at = len - p * LOBLKSIZE;
+                let entry = map.entry(p).or_insert(at);
+                *entry = if len < size { (*entry).min(at) } else { at };
+            }
+        }
+        self.lo_store_meta(oid, len, pages.as_ref())
     }
 
     fn lo_next_oid(&self) -> PgWireResult<i64> {
@@ -319,7 +381,10 @@ impl PgHandler {
                         format!("duplicate key value violates unique constraint \"pg_largeobject_metadata_oid_index\"\nDetail: Key (oid)=({oid}) already exists."),
                     ));
                 }
-                self.lo_insert(LO_COLLECTION, bson::doc! {"_id": int_bson(oid), "size": 0})?;
+                self.lo_insert(
+                    LO_COLLECTION,
+                    bson::doc! {"_id": int_bson(oid), "size": 0, "pages": Document::new()},
+                )?;
                 Ok(i32_out(oid))
             }
             "lo_open" => {
@@ -482,6 +547,27 @@ impl PgHandler {
     }
 
     /// `pg_largeobject_metadata`: one row per large object.
+    /// Every large object in this database, by oid, with its bytes.
+    pub(crate) fn large_objects(&self) -> Vec<(i64, Vec<u8>)> {
+        let mut oids: Vec<i64> = self
+            .lo_find(LO_COLLECTION, Document::new())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|d| match d.get("_id") {
+                Some(Bson::Int32(n)) => Some(i64::from(*n)),
+                Some(Bson::Int64(n)) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        oids.sort_unstable();
+        oids.into_iter()
+            .map(|oid| {
+                let size = self.lo_size(oid).ok().flatten().unwrap_or(0);
+                (oid, self.lo_read(oid, 0, size).unwrap_or_default())
+            })
+            .collect()
+    }
+
     pub(crate) fn lo_metadata_rows(&self, def: &TableDef) -> Vec<Document> {
         let f = |name: &str| def.field_of(name).expect("column");
         self.lo_find(LO_COLLECTION, Document::new())

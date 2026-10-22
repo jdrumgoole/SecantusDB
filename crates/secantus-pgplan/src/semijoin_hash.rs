@@ -1160,6 +1160,38 @@ fn rewrite(sql: &str) -> Option<Rewritten> {
     if keys.is_empty() && filters.is_empty() {
         return None;
     }
+    // With the keys on two or more relations of a FROM that joins several,
+    // running once without them is their CROSS PRODUCT: psql's `\d` column
+    // query (`FROM pg_collation c, pg_type t WHERE c.oid = $1 AND t.oid =
+    // $2`) built 911 x 181 rows per call and took a minute (RP-077). Per row,
+    // each relation is filtered by its key first, as PostgreSQL's subplan is.
+    let relations = s.from_clause.iter().map(relation_count).sum::<usize>();
+    if relations > 1 {
+        let mut qualifiers: Vec<String> = Vec::new();
+        for col in keys
+            .iter()
+            .map(|(c, _)| c)
+            .chain(filters.iter().map(|(c, _)| c))
+        {
+            let q = match col.node.as_ref() {
+                Some(N::ColumnRef(c)) if c.fields.len() >= 2 => {
+                    match c.fields[c.fields.len() - 2].node.as_ref() {
+                        Some(N::String(s)) => Some(s.sval.clone()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            // An unqualified key's relation is not known here: per row.
+            let q = q?;
+            if !qualifiers.contains(&q) {
+                qualifiers.push(q);
+            }
+        }
+        if qualifiers.len() > 1 {
+            return None;
+        }
+    }
     // A filter changes which rows an aggregate sees per outer row, which a
     // grouping by the keys alone cannot express: `count` / `min` / `max`
     // of one column are then computed per outer row (`Late`), the rows
@@ -1415,6 +1447,18 @@ fn immutable_call(n: &N) -> bool {
                     // a STABLE timestamptz overload).
                     || matches!((name.as_str(), f.args.len()), ("generate_series", 2) | ("unnest", 1)))
         })
+}
+
+/// How many relations a FROM item reads (a JOIN counts both sides).
+fn relation_count(n: &pg_query::protobuf::Node) -> usize {
+    match n.node.as_ref() {
+        Some(N::JoinExpr(j)) => {
+            j.larg.as_deref().map_or(0, relation_count)
+                + j.rarg.as_deref().map_or(0, relation_count)
+        }
+        Some(_) => 1,
+        None => 0,
+    }
 }
 
 fn tables_only(n: &pg_query::protobuf::Node) -> bool {

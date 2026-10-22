@@ -272,6 +272,72 @@ pub(crate) fn operator_ambiguous(op: &str, l: &str, r: &str) -> bool {
     cands.len() > 1
 }
 
+/// The LEFT input type of the binary operator `op` that PostgreSQL resolves
+/// for `l op r` (`oper_select_candidate`): `l` itself when an operator takes
+/// `(l, r)` exactly, otherwise the one candidate left after keeping the most
+/// exact matches, then the most exact-or-preferred ones. `None` when the
+/// types are not both known built-ins or no single candidate remains. NULLIF
+/// takes this type (RP-076): `int4 = numeric` resolves to `numeric =
+/// numeric`, so `nullif(53, 80::numeric)` is numeric, while `int2 = int8`
+/// is the cross-type `int28eq` and keeps `int2`.
+pub(crate) fn operator_left_input(op: &str, l: &str, r: &str) -> Option<String> {
+    let cats = categories();
+    if l == "unknown"
+        || r == "unknown"
+        || l.ends_with("[]")
+        || r.ends_with("[]")
+        || !cats.contains_key(l)
+        || !cats.contains_key(r)
+    {
+        return None;
+    }
+    let all = binary_operators().get(op)?;
+    if all.iter().any(|(a, b)| a == l && b == r) {
+        return Some(l.to_string());
+    }
+    let mut cands: Vec<&(String, String)> = all
+        .iter()
+        .filter(|(a, b)| accepts(a, l) && accepts(b, r))
+        .collect();
+    if cands.iter().any(|c| {
+        [&c.0, &c.1].iter().any(|p| {
+            p.starts_with("any") || matches!(p.as_str(), "record" | "internal" | "cstring")
+        })
+    }) {
+        return None;
+    }
+    let args = [l, r];
+    let keep_best = |cands: &mut Vec<&(String, String)>, score: &dyn Fn(&str, &str) -> bool| {
+        let count = |c: &&(String, String)| {
+            [c.0.as_str(), c.1.as_str()]
+                .iter()
+                .zip(args)
+                .filter(|(p, a)| score(p, a))
+                .count()
+        };
+        let best = cands.iter().map(count).max().unwrap_or(0);
+        cands.retain(|c| count(c) == best);
+    };
+    keep_best(&mut cands, &|p, a| p == a);
+    keep_best(&mut cands, &|p, a| {
+        p == a
+            || matches!(
+                (cats.get(p), cats.get(a)),
+                (Some((pc, true)), Some((ac, _))) if pc == ac
+            )
+    });
+    match cands.as_slice() {
+        [one] => Some(one.0.clone()),
+        _ => None,
+    }
+}
+
+/// `pg_type.typcategory` and `typispreferred` of a built-in type, by oid.
+pub fn category_preferred_of_oid(oid: i64) -> Option<(char, bool)> {
+    let name = crate::pgtypes::type_name_of_oid(oid)?;
+    categories().get(&planner_type(&name)).copied()
+}
+
 /// `pg_type.typcategory` of a built-in type, by oid.
 pub(crate) fn category_of_oid(oid: i64) -> Option<char> {
     let name = crate::pgtypes::name_of_oid(oid)?;

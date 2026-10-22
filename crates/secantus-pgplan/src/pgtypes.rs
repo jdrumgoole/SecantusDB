@@ -42,7 +42,8 @@ pub const BUILTIN_TYPES: &[(&str, i64, i64)] = &[
     ("timetz", 1266, 1270),
     ("numeric", 1700, 1231),
     ("regclass", 2205, 2210),
-    ("regproc", 24, 1008),
+    // A catalog's stored expression tree; it has no array type.
+    ("pg_node_tree", 194, 0),
     ("regprocedure", 2202, 2207),
     ("regoper", 2203, 2208),
     ("regoperator", 2204, 2209),

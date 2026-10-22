@@ -3229,7 +3229,18 @@ impl Printer<'_> {
                         }
                         bare.to_string()
                     }
-                    None => rv.relname.clone(),
+                    // A `public` table, likewise, while `public` is off the
+                    // path (pg_dump sets it empty); `pg_catalog`'s are
+                    // always found.
+                    None => {
+                        if matches!(rv.schemaname.as_str(), "" | "public")
+                            && !crate::is_pg_catalog_relation(&rv.relname)
+                            && !crate::schemas::search_path().iter().any(|s| s == "public")
+                        {
+                            self.buf.push_str("public.");
+                        }
+                        rv.relname.clone()
+                    }
                 };
                 self.buf.push_str(&q(&bare));
                 let written = rv

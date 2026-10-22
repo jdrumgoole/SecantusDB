@@ -308,7 +308,16 @@ impl PgHandler {
                     .collect();
                 text.push_str(&format!(
                     " EXECUTE FUNCTION {}({})",
-                    t.get_str("function").unwrap_or_default(),
+                    {
+                        // A built-in (`suppress_redundant_updates_trigger`)
+                        // is `pg_catalog`'s, always found.
+                        let f = t.get_str("function").unwrap_or_default();
+                        if secantus_pgplan::is_known_function(f) && !f.contains('.') {
+                            f.to_string()
+                        } else {
+                            secantus_pgplan::schemas::visible_name(f)
+                        }
+                    },
                     args.join(", ")
                 ));
                 (Self::trigger_oid(t), text)

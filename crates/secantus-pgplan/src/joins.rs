@@ -198,6 +198,8 @@ struct ScopeCol {
     bare: bool,
     /// Part of `SELECT *`.
     star: bool,
+    /// The base column it reads, for the RowDescription (RP-087).
+    source: Option<(i64, i16)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -421,7 +423,11 @@ fn finish_join_source(
         scope
             .cols
             .iter()
-            .map(|c| Column::new(&c.key, &c.pg_type, false))
+            .map(|c| {
+                let mut col = Column::new(&c.key, &c.pg_type, false);
+                col.source = c.source;
+                col
+            })
             .collect(),
     );
     let mut out = s.clone();
@@ -740,6 +746,13 @@ fn lateral_leaf(
     let mut types: Vec<String> = Vec::new();
     let base = params.len() + 1;
     let mut failure: Option<Error> = None;
+    // A bare FROM-function argument the left side does not have either.
+    let mut unresolved: Option<String> = None;
+    let from_args = if function {
+        Vec::new()
+    } else {
+        crate::correlated::left_function_args(&inner, lookup)
+    };
     crate::correlated::walk_select(&mut inner, &mut |n| {
         let Some(N::ColumnRef(c)) = n.node.as_ref() else {
             return Ok(());
@@ -751,7 +764,7 @@ fn lateral_leaf(
             [_, qualifier, _] | [qualifier, _] => left.aliases.contains(qualifier),
             // A function has no columns of its own, so a bare name in its
             // arguments can only be the left side's.
-            [_] => function,
+            [name] => function || from_args.contains(name),
             _ => false,
         };
         if !points_left {
@@ -759,7 +772,12 @@ fn lateral_leaf(
         }
         let key = match left.resolve(&parts) {
             Ok(Some(k)) => k,
-            Ok(None) => return Ok(()),
+            Ok(None) => {
+                if let [name] = parts.as_slice() {
+                    unresolved.get_or_insert_with(|| name.clone());
+                }
+                return Ok(());
+            }
             Err(e) => {
                 failure.get_or_insert(e);
                 return Ok(());
@@ -799,6 +817,11 @@ fn lateral_leaf(
         return Err(e);
     }
     if keys.is_empty() {
+        // A bare FROM-function argument that is no column anywhere is
+        // PostgreSQL's 42703 (the planner could only call it unsupported).
+        if let Some(name) = unresolved {
+            return Err(Error::UndefinedColumn(name));
+        }
         // It reads nothing on its left after all.
         return Ok(None);
     }
@@ -806,7 +829,14 @@ fn lateral_leaf(
     // row re-plans it with its own.
     let mut sample_params = params.to_vec();
     sample_params.extend(types.iter().map(|t| sample_value_for_type(t)));
-    let plan = plan_select(&inner, lookup, &sample_params)?;
+    let plan = match plan_select(&inner, lookup, &sample_params) {
+        // It names a column nothing has: PostgreSQL's 42703, where the
+        // planner could only say it cannot read the reference.
+        Err(Error::Unsupported(_)) if unresolved.is_some() => {
+            return Err(Error::UndefinedColumn(unresolved.unwrap_or_default()));
+        }
+        p => p?,
+    };
     let def = sub_plan_def(&plan, lookup)?;
     let names: Vec<String> = colnames.iter().filter_map(alias_colname).collect();
     let bare_alias = matches!(
@@ -849,6 +879,7 @@ fn lateral_leaf(
             pg_type: c.pg_type.clone(),
             bare: true,
             star: true,
+            source: c.source,
         });
     }
     Ok(Some((
@@ -1007,6 +1038,7 @@ fn leaf_with_names(
             pg_type: typed.columns[i].pg_type.clone(),
             bare: true,
             star: true,
+            source: typed.columns[i].source,
         });
     }
     Ok((
@@ -1126,6 +1158,13 @@ fn build_join(
         merged.push((key.clone(), l.key.clone(), r.key.clone()));
         hidden.push(l.key.clone());
         hidden.push(r.key.clone());
+        // The merged column is the left side's (the right's under a RIGHT
+        // join); a FULL join's is a COALESCE of both, read from neither.
+        let source = match pg_query::protobuf::JoinType::try_from(j.jointype) {
+            Ok(pg_query::protobuf::JoinType::JoinFull) => None,
+            Ok(pg_query::protobuf::JoinType::JoinRight) => r.source,
+            _ => l.source,
+        };
         merged_cols.push(ScopeCol {
             alias: String::new(),
             name: name.clone(),
@@ -1133,6 +1172,7 @@ fn build_join(
             pg_type: l.pg_type.clone(),
             bare: true,
             star: true,
+            source,
         });
     }
     let mut scope = Scope {

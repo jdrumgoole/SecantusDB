@@ -337,7 +337,10 @@ pub trait ExtendedQueryHandler: Send + Sync {
         let max_rows = message.max_rows as usize;
 
         let Some(portal) = client.portal_store().get_portal(portal_name) else {
-            return Err(PgWireError::PortalNotFound(portal_name.to_owned()));
+            // The name the client sent: the unnamed portal is `""` in
+            // PostgreSQL's message, never the store's placeholder.
+            let sent = message.name.as_deref().unwrap_or("");
+            return Err(PgWireError::PortalNotFound(sent.to_owned()));
         };
         // Execute query if the portal hasn't been started yet
         let needs_fetch = if matches!(
@@ -480,7 +483,8 @@ pub trait ExtendedQueryHandler: Send + Sync {
                     let describe_response = self.do_describe_portal(client, &portal).await?;
                     send_describe_response(client, &describe_response).await?;
                 } else {
-                    return Err(PgWireError::PortalNotFound(name.to_owned()));
+                    let sent = message.name.as_deref().unwrap_or("");
+                    return Err(PgWireError::PortalNotFound(sent.to_owned()));
                 }
             }
             _ => return Err(PgWireError::InvalidTargetType(message.target_type)),

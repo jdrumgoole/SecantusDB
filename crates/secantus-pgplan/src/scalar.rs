@@ -78,6 +78,11 @@ const CATALOG_NAMES: &[&str] = &[
     "current_catalog",
     "current_setting",
     "pg_backend_pid",
+    "pg_is_in_recovery",
+    "pg_is_wal_replay_paused",
+    "pg_postmaster_start_time",
+    "pg_conf_load_time",
+    "pg_tablespace_location",
     // Not `pg_blocking_pids`: it rides the executor hook like the advisory
     // locks (`correlated::SEQUENCE_FUNCTIONS`), and listing it here too
     // routes select lists through the const-col path, which cannot take a
@@ -89,6 +94,7 @@ const CATALOG_NAMES: &[&str] = &[
     "pg_client_encoding",
     "pg_reload_conf",
     "format_type",
+    "pg_encoding_max_length",
     "obj_description",
     "col_description",
     "shobj_description",
@@ -316,6 +322,13 @@ fn connection_addr(name: &str) -> Bson {
 
 /// Install the PID `pg_backend_pid()` answers inside an expression on this
 /// thread. A connection's statements all run on its own thread.
+/// When the server started: `pg_postmaster_start_time()`, and
+/// `pg_conf_load_time()`, which this server's configuration shares.
+pub fn postmaster_start() -> bson::DateTime {
+    static START: std::sync::OnceLock<bson::DateTime> = std::sync::OnceLock::new();
+    *START.get_or_init(bson::DateTime::now)
+}
+
 pub fn set_backend_pid(pid: i32) {
     BACKEND_PID.with(|p| p.set(pid));
 }
@@ -441,6 +454,27 @@ pub fn pg_regex_source(pattern: &str) -> String {
     while i < chars.len() {
         let c = chars[i];
         if c == '\\' {
+            // The class escapes are spelled out as the `regex` crate's own
+            // Unicode definitions. A pattern lowered to a MongoDB `$regex`
+            // filter is compiled by `secantus-core`, which reads `\w`, `\d`
+            // and `\s` as mongod's ASCII classes; spelled out, they mean the
+            // same on every path here.
+            const WORD: &str = r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\p{Join_Control}";
+            let spelled = match chars.get(i + 1) {
+                Some('w') if in_bracket => Some(WORD.to_string()),
+                Some('w') => Some(format!("[{WORD}]")),
+                Some('W') => Some(format!("[^{WORD}]")),
+                Some('d') => Some(r"\p{Nd}".to_string()),
+                Some('D') => Some(r"\P{Nd}".to_string()),
+                Some('s') => Some(r"\p{White_Space}".to_string()),
+                Some('S') => Some(r"\P{White_Space}".to_string()),
+                _ => None,
+            };
+            if let Some(spelled) = spelled {
+                out.push_str(&spelled);
+                i += 2;
+                continue;
+            }
             out.push(c);
             if let Some(n) = chars.get(i + 1) {
                 out.push(*n);
@@ -1428,16 +1462,38 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             ))
         }
         // `acldefault` / `makeaclitem` (acl.c): strict, so a NULL is NULL.
+        // The most bytes one character takes in encoding `n` (PostgreSQL
+        // 15.19's `pg_wchar_table`, measured for 0..41); NULL for an id no
+        // encoding has.
+        "pg_encoding_max_length" => {
+            need(1)?;
+            let Some(n) = as_i64(&arg(0)) else {
+                return Ok(Bson::Null);
+            };
+            Ok(match n {
+                0 | 8..=34 => Bson::Int32(1),
+                35..=38 | 41 => Bson::Int32(2),
+                1..=3 | 5 | 40 => Bson::Int32(3),
+                4 | 6 | 7 | 39 => Bson::Int32(4),
+                _ => Bson::Null,
+            })
+        }
         "acldefault" | "makeaclitem" if args.contains(&Bson::Null) => Ok(Bson::Null),
         "acldefault" => {
             need(2)?;
             let owner = as_i64(&arg(1)).ok_or_else(|| wrong_args(name))?;
-            Ok(Bson::Array(
-                crate::acl::acldefault(&text(&arg(0)), owner)?
-                    .into_iter()
-                    .map(Bson::String)
-                    .collect(),
-            ))
+            let items: Vec<Bson> = crate::acl::acldefault(&text(&arg(0)), owner)?
+                .into_iter()
+                .map(Bson::String)
+                .collect();
+            // `acldefault` builds its ACL with one dimension even when it is
+            // empty (a column's, a type's for nobody): unlike the literal
+            // `'{}'`, `aclexplode` reads it as no privileges.
+            Ok(if items.is_empty() {
+                crate::arrays::one_dimensional_empty()
+            } else {
+                Bson::Array(items)
+            })
         }
         "makeaclitem" => {
             need(4)?;
@@ -1827,6 +1883,30 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             Ok(Bson::Array(out))
         }
         "pg_backend_pid" => Ok(Bson::Int32(BACKEND_PID.with(|p| p.get()))),
+        // A single node is never a standby replaying WAL (RP-071).
+        "pg_is_in_recovery" => Ok(Bson::Boolean(false)),
+        "pg_is_wal_replay_paused" => Err(Error::Sqlstate(
+            "55000",
+            "recovery is not in progress".into(),
+        )),
+        "pg_postmaster_start_time" | "pg_conf_load_time" => Ok(Bson::DateTime(postmaster_start())),
+        // The two tablespaces `initdb` makes live in the data directory,
+        // which is '' (`pg_tablespace_location`); there are no others.
+        "pg_tablespace_location" => match args.first() {
+            None | Some(Bson::Null) => Ok(Bson::Null),
+            Some(v) => match crate::regclass_oid(v).or_else(|| match v {
+                Bson::Int32(i) => Some(i64::from(*i)),
+                Bson::Int64(i) => Some(*i),
+                other => crate::value_text(other).trim().parse().ok(),
+            }) {
+                Some(0 | 1663 | 1664) => Ok(Bson::String(String::new())),
+                Some(oid) => Err(Error::Sqlstate(
+                    "58P01",
+                    format!("could not stat file \"pg_tblspc/{oid}\": No such file or directory"),
+                )),
+                None => Ok(Bson::Null),
+            },
+        },
         "inet_client_addr" | "inet_client_port" | "inet_server_addr" | "inet_server_port" => {
             Ok(connection_addr(name))
         }
@@ -1890,7 +1970,11 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         // `pg_get_expr(adbin, adrelid)` renders a stored expression. This
         // server keeps `adbin` as the rendered TEXT already (see the
         // `pg_attrdef` rows), so it hands the first argument straight back.
-        "pg_get_expr" => Ok(args.first().cloned().unwrap_or(Bson::Null)),
+        "pg_get_expr" => Ok(match args.first() {
+            Some(Bson::String(sql)) => Bson::String(regclass_constants_visible(sql)),
+            Some(other) => other.clone(),
+            None => Bson::Null,
+        }),
         // Every object lives on the one search path (`public`, then
         // `pg_catalog`), so any object is visible by its bare name.
         // Every table is a regular, permanent one or a view; a view (or a
@@ -2008,7 +2092,14 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         }),
         "pg_size_pretty" => size_pretty(&args[0]),
         "pg_size_bytes" => size_bytes(&crate::value_text(&args[0])),
-        "pg_column_size" => Ok(column_size(&args[0])),
+        // Over a stored column the lowering passes its declared type.
+        "pg_column_size" => Ok(match args.get(1).and_then(Bson::as_str) {
+            Some(mark) if mark.starts_with(STORED_SIZE_MARK) => {
+                crate::datum_size::column_size(&args[0], &mark[STORED_SIZE_MARK.len()..], true)
+                    .map_or(Bson::Null, Bson::Int32)
+            }
+            _ => column_size(&args[0]),
+        }),
         // A PROCEDURE is not callable in an expression.
         _ if crate::correlated::is_user_procedure(name, args.len()) => Err(Error::Sqlstate(
             "42809",
@@ -2802,6 +2893,7 @@ pub fn static_result_type(name: &str) -> &'static str {
         | "jsonb_path_query_first_tz"
         | "jsonb_path_query_array_tz" => "jsonb",
         "acldefault" => "aclitem[]",
+        "pg_encoding_max_length" => "int4",
         "makeaclitem" => "aclitem",
         "lpad" | "rpad" | "to_hex" | "cash_words" | "translate" | "overlay" | "quote_literal"
         | "quote_nullable" | "unistr" | "convert_from" | "normalize" => "text",
@@ -2973,6 +3065,10 @@ fn size_bytes(text: &str) -> Result<Bson> {
 
 /// `pg_column_size(value)`: the bytes the value's datum takes -- a short
 /// varlena (under 127 bytes) carries a 1-byte header, a longer one 4.
+/// The marker on `pg_column_size`'s second (internal) argument that names
+/// a stored column's declared type.
+pub(crate) const STORED_SIZE_MARK: &str = "\u{1f}stored:";
+
 fn column_size(v: &Bson) -> Bson {
     match v {
         Bson::Null => Bson::Null,
@@ -3031,3 +3127,98 @@ pub(crate) const PG_ENCODINGS: &[&str] = &[
     "JOHAB",
     "SHIFT_JIS_2004",
 ];
+
+/// An expression's `'name'::regclass` constants and casts to user types as
+/// ruleutils prints them: the relation or type qualified while its schema is
+/// off the search path, as pg_dump sets it (`nextval('public.c_id_seq'::
+/// regclass)`, `'ok'::public.mood`); a `pg_catalog` relation always bare.
+fn regclass_constants_visible(sql: &str) -> String {
+    use pg_query::protobuf::Token;
+    if !sql.contains("::") {
+        return sql.to_string();
+    }
+    let Ok(scan) = pg_query::scan(sql) else {
+        return sql.to_string();
+    };
+    let t = scan.tokens;
+    let text = |i: usize| &sql[t[i].start as usize..t[i].end as usize];
+    let mut out = String::with_capacity(sql.len());
+    let mut cursor = 0;
+    for i in 0..t.len() {
+        // `::mood`: a user type, named as it is visible.
+        if i > 0 && text(i - 1) == "::" && t[i].token == Token::Ident as i32 {
+            let name = text(i);
+            let qualified = i + 2 < t.len() && text(i + 1) == ".";
+            // Looked up by its stored name, whatever the path: the text names
+            // the type the expression was written with.
+            let user = !qualified
+                && crate::pgtypes::oid_of_name(name).is_none()
+                && crate::user_type_or_array_oid(&crate::pgtypes::user_type_key(name)).is_some();
+            if user {
+                out.push_str(&sql[cursor..t[i].start as usize]);
+                out.push_str(&crate::schemas::visible_name(name));
+                cursor = t[i].end as usize;
+            }
+            continue;
+        }
+        let cast = t[i].token == Token::Sconst as i32
+            && i + 2 < t.len()
+            && text(i + 1) == "::"
+            && text(i + 2).eq_ignore_ascii_case("regclass");
+        if !cast {
+            continue;
+        }
+        let lit = text(i);
+        let name = lit[1..lit.len() - 1].replace("''", "'");
+        if name.contains('"') || crate::is_pg_catalog_relation(&name) {
+            continue;
+        }
+        let shown = crate::schemas::visible_name(&name);
+        out.push_str(&sql[cursor..t[i].start as usize]);
+        out.push_str(&quote_literal(&shown));
+        cursor = t[i].end as usize;
+    }
+    out.push_str(&sql[cursor..]);
+    out
+}
+
+#[cfg(test)]
+mod pg_regex_source_tests {
+    use super::pg_regex_source;
+
+    /// The spelled-out class escapes match exactly what the `regex` crate's
+    /// own Unicode classes match, so no path that compiles a PostgreSQL
+    /// pattern changed meaning when `secantus-core` made them ASCII for
+    /// mongod.
+    #[test]
+    fn class_escapes_keep_the_regex_crates_meaning() {
+        let samples: Vec<char> = (0u32..0x3000)
+            .chain([0x1f600, 0x200d, 0x2028, 0xff10, 0xfeff])
+            .filter_map(char::from_u32)
+            .collect();
+        for pattern in [
+            r"^\w$",
+            r"^\W$",
+            r"^\d$",
+            r"^\D$",
+            r"^\s$",
+            r"^\S$",
+            r"^[\w]$",
+            r"^[^\w-]$",
+            r"^[\d\s]$",
+            r"^[x\W]$",
+        ] {
+            let own = regex::Regex::new(pattern).unwrap();
+            let spelled = regex::Regex::new(&pg_regex_source(pattern)).unwrap();
+            for c in &samples {
+                let s = c.to_string();
+                assert_eq!(
+                    own.is_match(&s),
+                    spelled.is_match(&s),
+                    "{pattern} on U+{:04X}",
+                    *c as u32
+                );
+            }
+        }
+    }
+}

@@ -220,6 +220,10 @@ pub(crate) fn per_table(node: &N) -> Result<Option<(&'static str, Vec<N>)>> {
 /// `CREATE TABLE c (...) INHERITS (p, ...)`: the parents' columns first,
 /// in order, then the child's own; a column declared on both must agree in
 /// type (42804) and is merged. Each parent's CHECKs and NOT NULLs come too.
+/// The `Column::extra` mark of an inherited column the child also declares,
+/// which `pg_attribute.attislocal` reports.
+pub const LOCAL_KEY: &str = "attislocal";
+
 pub(crate) fn merge_parents(
     def: &mut TableDef,
     parents: &[String],
@@ -245,6 +249,8 @@ pub(crate) fn merge_parents(
             }
             col.default = c.default.clone();
             col.extra = c.extra.clone();
+            // Only the child's own declaration makes a column local.
+            col.extra.remove(LOCAL_KEY);
             columns.push(col);
         }
         for k in &pdef.check_constraints {
@@ -264,6 +270,8 @@ pub(crate) fn merge_parents(
             if c.default.is_some() {
                 existing.default = c.default.clone();
             }
+            // Declared here too: merged, and local (`MergeAttributes`).
+            existing.extra.insert(LOCAL_KEY, true);
             continue;
         }
         columns.push(c);

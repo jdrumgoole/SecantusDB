@@ -239,10 +239,49 @@ CATALOG_RELATIONS = (
 )
 
 
+# Decided (Joe, 2026-10-22): the server's internals are refused by name.
+REFUSED_INTERNALS = {
+    "pg_catalog.pg_backend_memory_contexts",
+    "pg_catalog.pg_shmem_allocations",
+    "pg_catalog.pg_stat_bgwriter",
+    "pg_catalog.pg_stat_wal",
+    "pg_catalog.pg_stat_slru",
+    "pg_catalog.pg_stat_archiver",
+}
+
+# Relations another item covers, with its own gap test.
+OTHER_ITEMS = {
+    "information_schema.element_types": "RP-098",
+    "pg_catalog.pg_statistic": "RP-099",
+    "pg_catalog.pg_stats": "RP-099",
+    "pg_catalog.pg_statistic_ext_data": "RP-099",
+    "pg_catalog.pg_stats_ext": "RP-099",
+    "pg_catalog.pg_stats_ext_exprs": "RP-099",
+    "pg_catalog.pg_stat_progress_analyze": "RP-100",
+    "pg_catalog.pg_stat_progress_basebackup": "RP-100",
+    "pg_catalog.pg_stat_progress_cluster": "RP-100",
+    "pg_catalog.pg_stat_progress_copy": "RP-100",
+    "pg_catalog.pg_stat_progress_create_index": "RP-100",
+    "pg_catalog.pg_stat_progress_vacuum": "RP-100",
+    "pg_catalog.pg_hba_file_rules": "RP-101",
+    "pg_catalog.pg_ident_file_mappings": "RP-101",
+    "pg_catalog.pg_config": "RP-101",
+    "pg_catalog.pg_file_settings": "RP-101",
+}
+
+
 def catalog_relations(conn: Any, dsn: Dsn) -> list:
-    return [
-        name for name in CATALOG_RELATIONS if _state(conn, f"select * from {name} limit 0") != "ok"
-    ]
+    """Each relation that does not answer as decided: queryable, or 0A000
+    for the internals."""
+    out = []
+    for name in CATALOG_RELATIONS:
+        if name in OTHER_ITEMS:
+            continue
+        state = _state(conn, f"select * from {name} limit 0")
+        want = "0A000" if name in REFUSED_INTERNALS else "ok"
+        if state != want:
+            out.append((name, state))
+    return out
 
 
 # --------------------------------------------------- RP-071 client tools --
@@ -259,6 +298,7 @@ TOOLS = {
     "pg_dump --schema-only": ["pg_dump", "--schema-only"],
     "pg_dumpall --globals-only": ["pg_dumpall", "--globals-only"],
     "pgbench -i": ["pgbench", "-i", "-s", "1"],
+    "psql \\l": ["psql", "-c", "\\l"],
     "psql \\l+": ["psql", "-c", "\\l+"],
     "psql \\dd": ["psql", "-c", "\\dd"],
     "psql \\dc": ["psql", "-c", "\\dc"],
@@ -459,47 +499,47 @@ def test_serializable_write_skew(rust_pg: Any) -> None:
     _check("serializable_write_skew", rust_pg)
 
 
-@pytest.mark.backlog("RP-062")
+@pytest.mark.backlog_fixed("RP-062")
 def test_recursive_search_and_cycle(rust_pg: Any) -> None:
     """PostgreSQL 15.19 adds the SEARCH column and stops a CYCLE."""
     _check("search_and_cycle", rust_pg)
 
 
-@pytest.mark.backlog("RP-063")
+@pytest.mark.backlog_fixed("RP-063")
 def test_recursive_cte_under_limit(rust_pg: Any) -> None:
     """PostgreSQL 15.19 answers an unbounded recursion under LIMIT 3 at once."""
     _check("recursive_with_limit", rust_pg)
 
 
-@pytest.mark.backlog("RP-064")
+@pytest.mark.backlog_fixed("RP-064")
 def test_create_database_options(rust_pg: Any) -> None:
     """PostgreSQL 15.19 copies a TEMPLATE's tables and records ENCODING and
     CONNECTION LIMIT."""
     _check("create_database_options", rust_pg)
 
 
-@pytest.mark.backlog("RP-065")
+@pytest.mark.backlog_fixed("RP-065")
 def test_temp_table_on_commit(rust_pg: Any) -> None:
     """PostgreSQL 15.19 empties an ON COMMIT DELETE ROWS table and drops an
     ON COMMIT DROP one at commit."""
     _check("temp_on_commit", rust_pg)
 
 
-@pytest.mark.backlog("RP-066")
+@pytest.mark.backlog_fixed("RP-066")
 def test_float8_out_of_range(rust_pg: Any) -> None:
     """PostgreSQL 15.19 raises 22003 for float8 overflow and underflow, in
     arithmetic and in a numeric -> float8 cast."""
     _check("float8_range", rust_pg)
 
 
-@pytest.mark.backlog("RP-067")
+@pytest.mark.backlog_fixed("RP-067")
 def test_default_privileges_and_connection_limit(rust_pg: Any) -> None:
     """PostgreSQL 15.19 applies ALTER DEFAULT PRIVILEGES to a table created
     afterwards, and refuses a login past a role's CONNECTION LIMIT."""
     _check("default_privileges_and_limits", rust_pg)
 
 
-@pytest.mark.backlog("RP-068")
+@pytest.mark.backlog_fixed("RP-068")
 def test_output_settings(rust_pg: Any) -> None:
     """PostgreSQL 15.19 honours IntervalStyle, bytea_output and
     extra_float_digits, and shows application_name in pg_stat_activity."""
@@ -515,11 +555,13 @@ def test_system_columns(rust_pg: Any) -> None:
 @pytest.mark.backlog("RP-070")
 def test_catalog_relations_are_queryable(rust_pg: Any) -> None:
     """Every pg_catalog / information_schema table and view in PostgreSQL
-    15.19's pg_class (rp070_catalog_relations.txt) can be selected from."""
+    15.19's pg_class (rp070_catalog_relations.txt) can be selected from, but
+    the server's internals, refused by name (Joe, 2026-10-22); the relations
+    other items cover are left to their gap tests."""
     _check("catalog_relations", rust_pg)
 
 
-@pytest.mark.backlog("RP-071")
+@pytest.mark.backlog_fixed("RP-071")
 def test_client_tools(rust_pg: Any) -> None:
     """PostgreSQL 15's pg_dump, pg_dumpall -g, pgbench -i and these psql
     meta-commands all exit 0 against PostgreSQL 15.19."""
@@ -532,14 +574,14 @@ def test_statements_not_refused(rust_pg: Any) -> None:
     _check("refused_statements", rust_pg)
 
 
-@pytest.mark.backlog("RP-073")
+@pytest.mark.backlog_fixed("RP-073")
 def test_copy_options(rust_pg: Any) -> None:
     """PostgreSQL 15.19 takes FORCE_QUOTE, FORCE_NOT_NULL, FORCE_NULL and
     FREEZE."""
     _check("copy_options", rust_pg)
 
 
-@pytest.mark.backlog("RP-074")
+@pytest.mark.backlog_fixed("RP-074")
 def test_smaller_answers(rust_pg: Any) -> None:
     """PostgreSQL 15.19: named arguments to a built-in, its result column
     names, pg_column_size, and REFRESH ... CONCURRENTLY without a unique

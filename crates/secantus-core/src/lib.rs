@@ -57,6 +57,7 @@ pub mod order;
 mod paths;
 mod regexutil;
 mod summation;
+mod tzdb;
 mod windowfields;
 
 // Re-export the read-only dotted-path helpers (only) so the Rust storage layer's
@@ -78,4 +79,4 @@ pub use numeric::{format_double_g, format_double_spec};
 // can decode just the top-level fields a `$group` reads from wide documents
 // ahead of the stage, instead of materializing every field. The `group` module
 // itself stays private.
-pub use group::{pipeline_prefix_fields, referenced_top_level_fields};
+pub use group::{percentile_spec, pipeline_prefix_fields, referenced_top_level_fields};

@@ -29,7 +29,7 @@
 //! The remaining operators are *principled* defers — they can't be reproduced
 //! without a fidelity risk: regex (`$regexMatch`/…) needs Python's `re`;
 //! `$dateToString` handles a numeric-directive `strftime` subset (named IANA
-//! zones via `chrono-tz`); `$dateFromString` / `$toDate` parse through the
+//! zones from mongod's own zone data, `crate::tzdb`); `$dateFromString` / `$toDate` parse through the
 //! timelib port in `crate::timelib`, with and without a `format`;
 //! `$convert`/`$toDecimal` + float-`str()` / string-parse / Decimal128
 //! conversions; `$round`/`$pow`/`$trunc` (rounding mode); `$sortArray`
@@ -508,6 +508,10 @@ const ALLOWED_FIELDS: &[(&str, &[&str])] = &[
         &["startDate", "endDate", "unit", "timezone", "startOfWeek"],
     ),
     ("$getField", &["field", "input"]),
+    (
+        "$convert",
+        &["input", "to", "onError", "onNull", "format", "byteOrder"],
+    ),
 ];
 
 /// Whether every key in `d` is one `op` recognises. `false` means some other
@@ -538,6 +542,14 @@ fn all_fields_recognised(op: &str, d: &Document) -> bool {
 /// answer a wrong VALUE instead of erroring.
 type RequiredField = (&'static str, i32, &'static str);
 const REQUIRED_FIELDS: &[(&str, &[RequiredField])] = &[
+    // Measured 8.2.11, 2026-10-22.
+    (
+        "$convert",
+        &[
+            ("input", 9, "Missing 'input' parameter to $convert"),
+            ("to", 9, "Missing 'to' parameter to $convert"),
+        ],
+    ),
     (
         "$trim",
         &[("input", 50695, "$trim requires an 'input' field")],
@@ -798,6 +810,8 @@ pub fn check_required_fields(op: &str, arg: &Bson) -> Result<(), Fallback> {
     }
     match op {
         "$sigmoid" => return sigmoid_parse(arg),
+        "$switch" => return switch_parse(arg),
+        "$sortArray" => return sort_array_parse(arg),
         "$similarityCosine" | "$similarityDotProduct" | "$similarityEuclidean" => {
             return similarity_parse(op, arg).map(|_| ())
         }
@@ -832,25 +846,70 @@ pub fn check_required_fields(op: &str, arg: &Bson) -> Result<(), Fallback> {
             }
         }
         "$map" | "$filter" => {
-            if let Some(Bson::String(name)) = d.get("as") {
-                user_var_name_parse(name)?;
+            match d.get("as") {
+                Some(Bson::String(name)) => user_var_name_parse(name)?,
+                // mongod reads a non-string `as` as the empty name (measured
+                // 8.2.11 for `$filter`, 2026-10-22).
+                Some(_) if op == "$filter" => {
+                    return Err(Fallback::mongo(9, "empty variable names are not allowed").bare())
+                }
+                _ => {}
             }
         }
-        // `inputs` is a LIST of expressions, each its own array, and not an
-        // expression that makes a list. Measured 8.2.11, 2026-10-20.
-        "$zip" => match d.get("inputs") {
-            Some(Bson::Array(_)) | None => {}
-            Some(other) => {
+        "$zip" => {
+            // `inputs` is a LIST of expressions, each its own array, and not an
+            // expression that makes a list. Measured 8.2.11, 2026-10-20.
+            if let Some(inputs) = d.get("inputs").filter(|v| !matches!(v, Bson::Array(_))) {
                 return Err(Fallback::mongo(
                     34461,
                     format!(
                         "inputs must be an array of expressions, found {}",
-                        type_name(other)
+                        type_name(inputs)
                     ),
                 )
-                .bare())
+                .bare());
             }
-        },
+            // Measured 8.2.11, 2026-10-22.
+            if let Some(defaults) = d.get("defaults").filter(|v| !matches!(v, Bson::Array(_))) {
+                return Err(Fallback::mongo(
+                    34462,
+                    format!(
+                        "defaults must be an array of expressions, found {}",
+                        type_name(defaults)
+                    ),
+                )
+                .bare());
+            }
+            // mongod names "object" whatever the value is (measured 8.2.11).
+            let longest = d.get("useLongestLength");
+            if longest.is_some_and(|v| !matches!(v, Bson::Boolean(_))) {
+                return Err(Fallback::mongo(
+                    34463,
+                    "useLongestLength must be a bool, found object",
+                )
+                .bare());
+            }
+            // An empty `defaults` is no defaults (measured 8.2.11).
+            if let Some(Bson::Array(defaults)) = d
+                .get("defaults")
+                .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+            {
+                if longest != Some(&Bson::Boolean(true)) {
+                    return Err(Fallback::mongo(
+                        34466,
+                        "cannot specify defaults unless useLongestLength is true",
+                    )
+                    .bare());
+                }
+                if Some(defaults.len()) != d.get("inputs").and_then(Bson::as_array).map(Vec::len) {
+                    return Err(Fallback::mongo(
+                        34467,
+                        "defaults and inputs must have the same length",
+                    )
+                    .bare());
+                }
+            }
+        }
         _ => {}
     }
     if let Some((_, field, code, message)) =
@@ -987,7 +1046,7 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$degreesToRadians" => op_deg_rad(arg, ctx, true),
         "$radiansToDegrees" => op_deg_rad(arg, ctx, false),
         // date component extractors — bare date expr or `{date, timezone}` object
-        // form (fixed-offset + named IANA zones via chrono-tz; instant→local)
+        // form (fixed-offset + named zones from `crate::tzdb`; instant→local)
         "$year" => date_part(arg, ctx, DatePart::Year),
         "$month" => date_part(arg, ctx, DatePart::Month),
         "$dayOfMonth" => date_part(arg, ctx, DatePart::Day),
@@ -1329,6 +1388,28 @@ pub fn first_unknown_expr_operator(expr: &Bson) -> Option<String> {
     }
 }
 
+thread_local! {
+    static IN_QUERY_FILTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While alive, expressions are evaluated inside a query filter's `$expr`.
+pub(crate) struct QueryFilterScope(bool);
+
+impl Drop for QueryFilterScope {
+    fn drop(&mut self) {
+        IN_QUERY_FILTER.with(|f| f.set(self.0));
+    }
+}
+
+/// Mark the expressions evaluated until the guard drops as a query filter's.
+pub(crate) fn enter_query_filter() -> QueryFilterScope {
+    QueryFilterScope(IN_QUERY_FILTER.with(|f| f.replace(true)))
+}
+
+fn in_query_filter() -> bool {
+    IN_QUERY_FILTER.with(std::cell::Cell::get)
+}
+
 /// `$meta`: a document's metadata. This engine keeps none with a document,
 /// so a keyword mongod knows evaluates to MISSING -- which is mongod's
 /// answer wherever the metadata is not available (measured 8.2.11:
@@ -1342,7 +1423,8 @@ pub fn first_unknown_expr_operator(expr: &Bson) -> Option<String> {
 /// (40218). After a `$geoNear` the command layer rewrites them into reads
 /// of fields the stage writes, and `sortKey` after a `$sort` likewise
 /// (`agg_meta::rewrite_sort_metadata`); with no `$sort` in reach `sortKey`
-/// becomes `[]` in `$addFields` there, and is refused here otherwise.
+/// becomes `[]` in `$addFields` and `$group` there, is missing in a query
+/// filter's `$expr`, and is refused here otherwise.
 fn op_meta(arg: &Bson) -> R {
     let unavailable = |what: &str| {
         Err(Fallback::mongo(
@@ -1360,6 +1442,10 @@ fn op_meta(arg: &Bson) -> R {
             // the command layer reads it from a field instead (`hybrid`).
             "score" => unavailable("score"),
             "scoreDetails" => unavailable("scoreDetails"),
+            // A query filter never sees a sort key: in a `find` filter's or
+            // a `$match`'s `$expr` it is missing (mongod 8.2.11,
+            // 2026-10-22; RM-252). Elsewhere the command layer rewrites it.
+            "sortKey" if in_query_filter() => Ok(Bson::Undefined),
             "sortKey" => Err(Fallback::Defer),
             known if crate::projection::META_KEYWORDS.contains(&known) => Ok(Bson::Undefined),
             _ => Err(Fallback::Defer),
@@ -1592,8 +1678,8 @@ pub fn py_order(a: &Bson, b: &Bson) -> Result<Option<Ordering>, Fallback> {
             Some((x.time, x.increment).cmp(&(y.time, y.increment)))
         }
         (Bson::ObjectId(x), Bson::ObjectId(y)) => Some(x.bytes().cmp(&y.bytes())),
-        // Python `Binary < Binary` compares bytes content (subtype ignored).
-        (Bson::Binary(x), Bson::Binary(y)) => Some(x.bytes.cmp(&y.bytes)),
+        // Length, then subtype, then bytes, as mongod orders BinData (RM-232).
+        (Bson::Binary(x), Bson::Binary(y)) => Some(crate::order::bindata_cmp(x, y)),
         // null-vs-null, regex, and different types are not orderable in Python.
         _ => None,
     })
@@ -1679,27 +1765,118 @@ fn op_if_null(arg: &Bson, ctx: &Ctx, ret: Ret) -> R {
     ret(fallback, ctx)
 }
 
-fn op_switch(arg: &Bson, ctx: &Ctx, ret: Ret) -> R {
+/// `$switch`'s parse, as mongod 8.2.11 checks it (RM-242): the argument is an
+/// object (40060) whose keys are `branches` and `default` (40067); `branches`
+/// is an array (40061) of objects (40062) whose keys are `case` and `then`
+/// (40063), each present (40064 / 40065); and there is at least one (40068).
+/// mongod reads the fields in order, so the first bad one names the error.
+fn switch_parse(arg: &Bson) -> Result<(), Fallback> {
+    let refuse = |code: i32, message: String| Err(Fallback::mongo(code, message).bare());
     let Bson::Document(d) = arg else {
+        return refuse(
+            40060,
+            format!(
+                "$switch requires an object as an argument, found: {}",
+                type_name(arg)
+            ),
+        );
+    };
+    let mut branch_count = 0;
+    for (key, value) in d {
+        match key.as_str() {
+            "branches" => {
+                let Bson::Array(branches) = value else {
+                    return refuse(
+                        40061,
+                        format!(
+                            "$switch expected an array for 'branches', found: {}",
+                            type_name(value)
+                        ),
+                    );
+                };
+                for branch in branches {
+                    let Bson::Document(b) = branch else {
+                        return refuse(
+                            40062,
+                            format!(
+                                "$switch expected each branch to be an object, found: {}",
+                                type_name(branch)
+                            ),
+                        );
+                    };
+                    if let Some(k) = b.keys().find(|k| !matches!(k.as_str(), "case" | "then")) {
+                        return refuse(
+                            40063,
+                            format!("$switch found an unknown argument to a branch: {k}"),
+                        );
+                    }
+                    if !b.contains_key("case") {
+                        return refuse(
+                            40064,
+                            "$switch requires each branch have a 'case' expression".into(),
+                        );
+                    }
+                    if !b.contains_key("then") {
+                        return refuse(
+                            40065,
+                            "$switch requires each branch have a 'then' expression.".into(),
+                        );
+                    }
+                }
+                branch_count += branches.len();
+            }
+            "default" => {}
+            other => return refuse(40067, format!("$switch found an unknown argument: {other}")),
+        }
+    }
+    if branch_count == 0 {
+        return refuse(40068, "$switch requires at least one branch".into());
+    }
+    Ok(())
+}
+
+fn op_switch(arg: &Bson, ctx: &Ctx, ret: Ret) -> R {
+    // `switch_parse` has checked the shape; a malformed `$switch` never gets here.
+    let (Bson::Document(d), Some(Bson::Array(branches))) =
+        (arg, arg.as_document().and_then(|d| d.get("branches")))
+    else {
         return Err(Fallback::Defer);
     };
-    let Some(Bson::Array(branches)) = d.get("branches") else {
-        return Err(Fallback::Defer);
-    };
+    let mut constant = true;
     for branch in branches {
-        let Bson::Document(b) = branch else {
-            return Err(Fallback::Defer);
-        };
-        let (Some(case), Some(then)) = (b.get("case"), b.get("then")) else {
+        let Some((Some(case), Some(then))) =
+            branch.as_document().map(|b| (b.get("case"), b.get("then")))
+        else {
             return Err(Fallback::Defer);
         };
         if truthy(&eval(case, ctx)?) {
             return ret(then, ctx);
         }
+        constant &= crate::aggregate::is_constant_expression(
+            case,
+            &ctx.vars.keys().cloned().collect::<Vec<_>>(),
+        );
     }
-    match d.get("default") {
-        Some(def) => ret(def, ctx),
-        None => Err(Fallback::Defer), // Python raises when no branch matches and no default
+    if let Some(def) = d.get("default") {
+        return ret(def, ctx);
+    }
+    // No branch matched and there is no default. mongod drops every constant
+    // false case while it optimizes, and refuses a `$switch` left with none
+    // (40069) before reading a document; one with a case that reads the
+    // document fails per document (40066). Each used to defer, which outside
+    // `$project` answered 2 "not supported".
+    if constant {
+        Err(Fallback::mongo(
+            40069,
+            "Cannot execute a switch statement where all the cases evaluate to false without a default",
+        )
+        .with_folded(true))
+    } else {
+        Err(Fallback::mongo(
+            40066,
+            "$switch could not find a matching branch for an input, and no default was specified.",
+        )
+        .with_folded(false))
     }
 }
 
@@ -2121,6 +2298,24 @@ fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
     }
     let arr = eval(&pair[0], ctx)?;
     let idx = eval(&pair[1], ctx)?;
+    // A null or missing operand is null before either is checked, and the
+    // array is checked before the index: `{$arrayElemAt: [null, "x"]}` is
+    // null and `[5, "x"]` is 28689 (measured 8.2.11, 2026-10-22).
+    if is_null(&arr) || is_null(&idx) {
+        return Ok(Bson::Null);
+    }
+    let a = match &arr {
+        Bson::Array(a) => a,
+        other => {
+            return Err(wrong_type(
+                28689,
+                "$arrayElemAt's first argument must be an array, but is {}",
+                &pair[0],
+                other,
+                ctx,
+            ))
+        }
+    };
     // `coerce_index` is shared with `$slice` / `$substr`, whose rules were
     // measured separately, so `$arrayElemAt`'s two extra rules live here:
     // a DECIMAL index is accepted (`NumberDecimal("1")` is element 1), and
@@ -2208,19 +2403,6 @@ fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
             ));
         }
     };
-    let a = match &arr {
-        Bson::Array(a) => a,
-        Bson::Null | Bson::Undefined => return Ok(Bson::Null),
-        other => {
-            return Err(wrong_type(
-                28689,
-                "$arrayElemAt's first argument must be an array, but is {}",
-                &pair[0],
-                other,
-                ctx,
-            ))
-        }
-    };
     let len = a.len() as i128;
     let resolved = if i < 0 { i + len } else { i };
     if (0..len).contains(&resolved) {
@@ -2298,10 +2480,32 @@ fn nelem_n_and_input(arg: &Bson, ctx: &Ctx) -> Result<(usize, Vec<Bson>), Fallba
         }
         Bson::Int32(x) => *x as i64,
         Bson::Int64(x) => *x,
-        Bson::Double(x) if x.is_finite() && x.fract() == 0.0 => *x as i64,
-        // Decimal128 goes to Python: whether its value is integral needs the
-        // decimal engine, and the two codes hang off exactly that question.
-        Bson::Decimal128(_) => return Err(Fallback::Defer),
+        // A double mongod cannot hold in a long -- NaN, an infinity, past
+        // 2^63 -- fails converting before the integral check (31109).
+        Bson::Double(x) if !x.is_finite() || x.abs() >= 9.223_372_036_854_776e18 => {
+            return Err(Fallback::mongo(
+                31109,
+                format!(
+                    "Can't coerce out of range value {} to long",
+                    format_double_g(*x)
+                ),
+            ));
+        }
+        Bson::Double(x) if x.fract() == 0.0 => *x as i64,
+        // A Decimal128 must hold an int64 exactly; anything else, NaN and
+        // 1E+40 included, is 5787903 (measured 8.2.11, 2026-10-22).
+        Bson::Decimal128(_) => match crate::decimal::decimal_to_i64_exact(&n_val) {
+            Some(n) => n,
+            None => {
+                return Err(Fallback::mongo(
+                    5787903,
+                    format!(
+                        "Value for 'n' must be of integral type, but found {}",
+                        nelem_render(&n_val)
+                    ),
+                ))
+            }
+        },
         Bson::Double(_) => {
             return Err(Fallback::mongo(
                 5787903,
@@ -3453,22 +3657,6 @@ fn op_merge_objects(arg: &Bson, ctx: &Ctx) -> R {
     Ok(Bson::Document(result))
 }
 
-/// Python `bool()` of a *literal* spec value (not evaluated): empty
-/// collections / strings, zero, false, null, and a missing key are all falsy.
-fn py_bool_literal(v: Option<&Bson>) -> bool {
-    match v {
-        None | Some(Bson::Null) => false,
-        Some(Bson::Boolean(b)) => *b,
-        Some(Bson::Int32(n)) => *n != 0,
-        Some(Bson::Int64(n)) => *n != 0,
-        Some(Bson::Double(d)) => *d != 0.0,
-        Some(Bson::String(s)) => !s.is_empty(),
-        Some(Bson::Array(a)) => !a.is_empty(),
-        Some(Bson::Document(d)) => !d.is_empty(),
-        Some(_) => true,
-    }
-}
-
 /// mongod's refusal of a `$getField` whose `field` is not a string.
 ///
 /// The executor prefix comes from `aggregate::is_constant_expression`, which
@@ -3532,7 +3720,12 @@ fn op_get_field(arg: &Bson, ctx: &Ctx) -> R {
                         None => return Ok(Bson::Undefined), // input missing -> missing
                     }
                 }
-                Some(e) => eval(e, ctx)?,
+                // Any other input that evaluates to missing -- `$$REMOVE` --
+                // is missing too (measured 8.2.11, 2026-10-22).
+                Some(e) => match eval_field_value(e, ctx)? {
+                    Bson::Undefined => return Ok(Bson::Undefined),
+                    v => v,
+                },
                 None => Bson::Document(ctx.doc.clone()),
             };
             (field, input)
@@ -3608,7 +3801,25 @@ fn set_field_name_parse(d: &Document) -> Result<(), Fallback> {
         return Ok(());
     };
     let constant = match field {
-        Bson::String(s) if s.starts_with('$') => return Ok(()), // a path: its own parse
+        // A field path or a system variable is refused, rendered as mongod
+        // serializes it: `$a.b` is `$CURRENT.a.b`, `$$ROOT.a` is `$ROOT.a`.
+        // A user variable is resolved first, as on mongod (an unbound one is
+        // 17276), so it is left to that. Measured 8.2.11, 2026-10-22.
+        Bson::String(s) if s.starts_with('$') => {
+            let shown = match s.strip_prefix("$$") {
+                Some(var) if var.starts_with(|c: char| c.is_ascii_uppercase()) => format!("${var}"),
+                Some(_) => return Ok(()),
+                None => format!("$CURRENT.{}", &s[1..]),
+            };
+            return Err(Fallback::mongo(
+                4161108,
+                format!(
+                    "'{shown}' is a field path reference which is not allowed in this context. \
+                     Did you mean {{$literal: '{shown}'}}?"
+                ),
+            )
+            .bare());
+        }
         Bson::Document(inner) if inner.len() == 1 && inner.contains_key("$literal") => {
             inner.get("$literal").cloned().unwrap_or(Bson::Null)
         }
@@ -3729,13 +3940,16 @@ fn op_zip(arg: &Bson, ctx: &Ctx) -> R {
     }
     let arrs: Vec<&Vec<Bson>> = inputs.iter().collect();
     let n_inputs = arrs.len();
-    // useLongestLength / defaults are read as *literals* (Python doesn't eval).
-    let use_longest = py_bool_literal(d.get("useLongestLength"));
+    // `check_required_fields` has checked the options: `useLongestLength` is
+    // a literal bool, and `defaults` an array as long as `inputs`, each
+    // element an expression evaluated here; a missing one leaves its slot out
+    // of the row (measured 8.2.11, 2026-10-22).
+    let use_longest = d.get("useLongestLength") == Some(&Bson::Boolean(true));
     let defaults: Vec<Bson> = match d.get("defaults") {
-        Some(dv) if py_bool_literal(Some(dv)) => match dv {
-            Bson::Array(dl) => dl.clone(),
-            _ => return Err(Fallback::Defer), // truthy non-list -> Python raises
-        },
+        Some(Bson::Array(dl)) => dl
+            .iter()
+            .map(|e| eval_field_value(e, ctx))
+            .collect::<Result<_, _>>()?,
         _ => vec![Bson::Null; n_inputs],
     };
     let mut out: Vec<Bson> = Vec::new();
@@ -3745,10 +3959,13 @@ fn op_zip(arg: &Bson, ctx: &Ctx) -> R {
             let row: Vec<Bson> = arrs
                 .iter()
                 .enumerate()
-                .map(|(j, a)| {
-                    a.get(i)
-                        .cloned()
-                        .unwrap_or_else(|| defaults.get(j).cloned().unwrap_or(Bson::Null))
+                .filter_map(|(j, a)| match a.get(i) {
+                    Some(v) => Some(v.clone()),
+                    None => match defaults.get(j) {
+                        Some(Bson::Undefined) => None,
+                        Some(v) => Some(v.clone()),
+                        None => Some(Bson::Null),
+                    },
                 })
                 .collect();
             out.push(Bson::Array(row));
@@ -3890,9 +4107,12 @@ fn op_filter(arg: &Bson, ctx: &Ctx) -> R {
     let var = as_var_name(d.get("as"))?;
     let null = Bson::Null;
     let cond = d.get("cond").unwrap_or(&null);
-    // `limit` only bounds the output when it evaluates to an integer.
+    // mongod returns an empty input before it looks at `limit` at all.
+    if arr.is_empty() {
+        return Ok(Bson::Array(arr));
+    }
     let limit = match d.get("limit") {
-        Some(e) => as_int_like(&eval(e, ctx)?),
+        Some(e) => filter_limit(&eval(e, ctx)?)?,
         None => None,
     };
     let mut out: Vec<Bson> = Vec::new();
@@ -3907,6 +4127,38 @@ fn op_filter(arg: &Bson, ctx: &Ctx) -> R {
         }
     }
     Ok(Bson::Array(out))
+}
+
+/// `$filter`'s evaluated `limit`, as mongod 8.2.11 reads it (2026-10-22):
+/// null or missing is no limit; any number holding an int32 exactly is the
+/// limit (`2.0` and `Decimal128("2")` count) and must be positive (327392,
+/// `-0.0` included); anything else -- a bool, a string, NaN, a fraction, a
+/// long past int32 -- is 327391. Both are runtime errors, never folded.
+fn filter_limit(v: &Bson) -> Result<Option<i128>, Fallback> {
+    if is_null(v) {
+        return Ok(None);
+    }
+    let n = match v {
+        Bson::Int32(n) => Some(*n as i64),
+        Bson::Int64(n) => Some(*n),
+        Bson::Double(x) if x.fract() == 0.0 => Some(*x as i64),
+        Bson::Decimal128(_) => crate::decimal::decimal_to_i64_exact(v),
+        _ => None,
+    };
+    let render = crate::aggregate::render_value_compact(v);
+    match n.and_then(|n| i32::try_from(n).ok()) {
+        Some(n) if n > 0 => Ok(Some(n as i128)),
+        Some(_) => Err(Fallback::mongo(
+            327392,
+            format!("$filter: limit must be greater than 0: {render}"),
+        )
+        .with_folded(false)),
+        None => Err(Fallback::mongo(
+            327391,
+            format!("$filter: limit must be represented as a 32-bit integral value: {render}"),
+        )
+        .with_folded(false)),
+    }
 }
 
 fn op_reduce(arg: &Bson, ctx: &Ctx) -> R {
@@ -4581,10 +4833,8 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 /// mongod accepts a bare date expression *or* a `{date, timezone}` object; the
 /// object form is a document with a `date` key that isn't itself an operator
 /// (`{$op: …}`). A `timezone` shifts the wall clock: fixed-offset (`±HH:MM` / `UTC`
-/// / `GMT`) is constant, a *named* IANA zone resolves its DST-correct offset at the
-/// instant via `chrono-tz` (the unambiguous instant→wall-clock direction, matching
-/// `$dateToString` and Python `zoneinfo`). An unknown zone / non-string timezone
-/// defers to Python.
+/// / `GMT`) is constant, a *named* zone resolves its offset at the instant from
+/// mongod's own zone data (`crate::tzdb`).
 /// The instant a date-operator OPERAND names, in epoch milliseconds.
 ///
 /// mongod accepts every BSON type that CARRIES a timestamp -- Date, ObjectId
@@ -4749,20 +4999,6 @@ fn days_in_month(y: i64, m: i64) -> i64 {
     }
 }
 
-// Python `datetime` range in BSON milliseconds: [0001-01-01, 9999-12-31
-// 23:59:59.999]. Date arithmetic landing outside defers to Python (which raises
-// OverflowError / ValueError).
-const DATETIME_MIN_MS: i64 = -62_135_596_800_000;
-const DATETIME_MAX_MS: i64 = 253_402_300_799_999;
-
-fn bounded_datetime(millis: i128) -> R {
-    if (DATETIME_MIN_MS as i128..=DATETIME_MAX_MS as i128).contains(&millis) {
-        Ok(Bson::DateTime(bson::DateTime::from_millis(millis as i64)))
-    } else {
-        Err(Fallback::Defer)
-    }
-}
-
 /// Why a date string did not convert.
 enum FreeFormError {
     /// mongod's `ConversionFailure` (241) with this message: a parse error,
@@ -4780,7 +5016,7 @@ enum FreeFormError {
 enum MongoTz {
     Utc,
     Offset(i64),
-    Named(chrono_tz::Tz),
+    Named(&'static crate::tzdb::Zone),
 }
 
 fn mongo_tz(spec: Option<&Bson>) -> Result<MongoTz, FreeFormError> {
@@ -4792,8 +5028,8 @@ fn mongo_tz(spec: Option<&Bson>) -> Result<MongoTz, FreeFormError> {
     if name == "UTC" {
         return Ok(MongoTz::Utc);
     }
-    if let Ok(tz) = name.parse::<chrono_tz::Tz>() {
-        return Ok(MongoTz::Named(tz));
+    if let Some(zone) = crate::tzdb::zone(name) {
+        return Ok(MongoTz::Named(zone));
     }
     let b = name.as_bytes();
     let sign = match b.first() {
@@ -4894,46 +5130,16 @@ fn resolve_date_string(
     })
 }
 
-/// `timelib_get_time_zone_offset_info` over chrono-tz: the UTC offset in
-/// effect at `ts`, the instant that offset took effect (`i64::MIN` if none
-/// was found within a year and a day), and whether it is daylight time.
-fn zone_offset_info(zone: chrono_tz::Tz, ts: i64) -> (i64, i64, bool) {
-    use chrono::{Offset, TimeZone};
-    use chrono_tz::OffsetComponents;
-    let at = |s: i64| {
-        let off = zone.offset_from_utc_datetime(
-            &chrono::DateTime::from_timestamp(s, 0)
-                .unwrap_or_default()
-                .naive_utc(),
-        );
-        (
-            i64::from(off.fix().local_minus_utc()),
-            off.dst_offset().num_seconds() != 0,
-        )
-    };
-    let (offset, is_dst) = at(ts);
-    // Walk back a day at a time to the first day with another offset, then
-    // bisect that day to the second.
-    let mut same = ts;
-    let mut transition = i64::MIN;
-    for _ in 0..367 {
-        let earlier = same - 86_400;
-        if at(earlier).0 != offset {
-            let (mut lo, mut hi) = (earlier, same);
-            while hi - lo > 1 {
-                let mid = lo + (hi - lo) / 2;
-                if at(mid).0 == offset {
-                    hi = mid;
-                } else {
-                    lo = mid;
-                }
-            }
-            transition = hi;
-            break;
-        }
-        same = earlier;
+/// `timelib_get_time_zone_offset_info` over mongod's zone data: the UTC
+/// offset in effect at `ts` (seconds), the instant that offset took effect
+/// (`i64::MIN` before the first transition), and whether it is daylight
+/// time. Where timelib finds no type its callers keep their zeroed
+/// defaults, which is what `None` maps to here.
+fn zone_offset_info(zone: &crate::tzdb::Zone, ts: i64) -> (i64, i64, bool) {
+    match zone.offset_info(ts) {
+        Some((t, since)) => (t.offset, since, t.is_dst),
+        None => (0, 0, false),
     }
-    (offset, transition, is_dst)
 }
 
 /// The zone-ID branch of timelib's `do_adjust_timezone`: the seconds to add
@@ -4941,7 +5147,7 @@ fn zone_offset_info(zone: chrono_tz::Tz, ts: i64) -> (i64, i64, bool) {
 /// gap or overlap this picks what mongod picks -- measured, a London `02:30`
 /// on the spring-forward day is 01:30Z and `01:30` on the fall-back day is
 /// 01:30Z -- which a plain "earliest local match" does not.
-fn timelib_zone_adjustment(zone: chrono_tz::Tz, sse: i64, dst: bool) -> i64 {
+fn timelib_zone_adjustment(zone: &crate::tzdb::Zone, sse: i64, dst: bool) -> i64 {
     let (current_offset, _, current_is_dst) = zone_offset_info(zone, sse);
     let (after_offset, after_transition_time, _) = zone_offset_info(zone, sse - current_offset);
     let mut actual_offset = after_offset;
@@ -5057,7 +5263,7 @@ fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
 /// A `timezone` shifts the wall clock before rendering (naive input is treated as
 /// UTC): a fixed offset (`±HHMM` / `±HH:MM` / `UTC` / `GMT`) is constant, and a
 /// *named* IANA zone (`America/New_York`, …) resolves its DST-correct offset at the
-/// rendered instant via `chrono-tz`. An unknown zone name defers to Python.
+/// rendered instant from mongod's own zone data (`crate::tzdb`).
 ///
 /// Renders the unambiguous directives — `%Y` (4-digit year), `%m`/`%d`/`%H`/`%M`/
 /// `%S` (2-digit), `%L` (3-digit millis), `%j` (3-digit day-of-year), `%w`
@@ -5068,10 +5274,39 @@ fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
 fn op_date_to_string(arg: &Bson, ctx: &Ctx) -> R {
     let spec = arg.as_document().ok_or(Fallback::Defer)?;
     precheck_constant_timezone(spec, ctx, None)?;
+    // `format` is read before the date (measured 8.2.11, 2026-10-22): a null
+    // one answers null even beside a date that is not one, one that is not a
+    // string is 18533 even beside a null date, and a string's directives are
+    // checked first too. The wrapper is the expression's own: "Failed to
+    // optimize" when everything is constant.
+    let format = spec.get("format").map(|e| eval(e, ctx)).transpose()?;
+    match &format {
+        Some(Bson::String(f)) => {
+            render_date_at(0, f, 0)?;
+        }
+        Some(v) if is_null(v) => return Ok(Bson::Null),
+        Some(other) => {
+            return Err(Fallback::mongo(
+                18533,
+                format!(
+                    "$dateToString requires that 'format' be a string, found: {} with value {}",
+                    type_name(other),
+                    crate::aggregate::render_value_compact(other)
+                ),
+            ))
+        }
+        None => {}
+    }
     let date_expr = spec.get("date").ok_or(Fallback::Defer)?;
     let date = eval(date_expr, ctx)?;
-    if matches!(date, Bson::Null | Bson::Undefined) {
-        return Ok(Bson::Null);
+    // A null or missing date is `onNull`'s answer, a missing `onNull` field
+    // included (RM-247).
+    if is_null(&date) {
+        // A missing `onNull` value leaves the field missing.
+        return match spec.get("onNull") {
+            Some(on) => eval_field_value(on, ctx),
+            None => Ok(Bson::Null),
+        };
     }
     // Any type that carries an instant: a Timestamp's seconds and an
     // ObjectId's generation time render too (measured 8.2.11, 2026-10-20).
@@ -5086,23 +5321,15 @@ fn op_date_to_string(arg: &Bson, ctx: &Ctx) -> R {
         return Ok(Bson::Null);
     }
     let tz_offset = timezone_offset_ms(tz.as_spec(), millis)?;
-    let fmt = match spec.get("format") {
+    let fmt = match &format {
         // The default format ends in `Z` only for UTC itself -- no zone,
         // `UTC` or a zero offset. `GMT` and every named zone print without
         // it, whatever their offset (probed 8.2.11, 2026-10-16).
         None if matches!(mongo_tz(tz.as_spec()), Ok(MongoTz::Utc)) => "%Y-%m-%dT%H:%M:%S.%LZ",
         None => "%Y-%m-%dT%H:%M:%S.%L",
         Some(Bson::String(s)) => s.as_str(),
-        Some(other) => {
-            return Err(Fallback::mongo(
-                18533,
-                format!(
-                    "$dateToString requires that 'format' be a string, found: {} with value {}",
-                    type_name(other),
-                    crate::aggregate::render_value_compact(other)
-                ),
-            ))
-        }
+        // A null or non-string format returned above.
+        Some(_) => return Ok(Bson::Null),
     };
     Ok(Bson::String(render_date_at(
         millis + tz_offset,
@@ -5172,9 +5399,22 @@ fn render_date_at(millis: i64, fmt: &str, offset_ms: i64) -> Result<String, Fall
     let days = millis.div_euclid(86_400_000);
     let ms_of_day = millis.rem_euclid(86_400_000);
     let (y, m, d) = civil_from_days(days);
-    if !(1000..=9999).contains(&y) {
-        return Err(Fallback::Defer); // glibc `%Y` zero-pads only in this range
-    }
+    // A YEAR component mongod renders must lie in 0-9999 (18537): `%Y`, and
+    // the ISO week-year `%G`, which for 0000-01-01 is -1. The other directives
+    // render any date (measured 8.2.11, 2026-10-22).
+    let year_in_range = |year: i64| {
+        if (0..=9999).contains(&year) {
+            Ok(year)
+        } else {
+            Err(Fallback::mongo(
+                18537,
+                format!(
+                    "Could not convert date to string: date component was outside the supported \
+                     range of 0-9999: {year}"
+                ),
+            ))
+        }
+    };
     let hh = ms_of_day / 3_600_000;
     let mi = (ms_of_day / 60_000) % 60;
     let ss = (ms_of_day / 1000) % 60;
@@ -5183,7 +5423,10 @@ fn render_date_at(millis: i64, fmt: &str, offset_ms: i64) -> Result<String, Fall
     let day_of_year = days - days_from_civil(y, 1, 1) + 1;
     let (iso_y, iso_w) = iso_week(days);
     let off_minutes = offset_ms / 60_000;
-    let (sign, abs_min) = if off_minutes < 0 {
+    // `%z` takes its sign from the offset in SECONDS, so a local mean time
+    // under a minute west of UTC is `-0000` (Accra before 1918 is -0:00:52;
+    // measured 8.2.11, 2026-10-22); `%Z` is whole minutes, truncated.
+    let (sign, abs_min) = if offset_ms < 0 {
         ('-', -off_minutes)
     } else {
         ('+', off_minutes)
@@ -5196,7 +5439,7 @@ fn render_date_at(millis: i64, fmt: &str, offset_ms: i64) -> Result<String, Fall
             continue;
         }
         match chars.next() {
-            Some('Y') => out.push_str(&format!("{y:04}")),
+            Some('Y') => out.push_str(&format!("{:04}", year_in_range(y)?)),
             Some('m') => out.push_str(&format!("{m:02}")),
             Some('d') => out.push_str(&format!("{d:02}")),
             Some('H') => out.push_str(&format!("{hh:02}")),
@@ -5206,7 +5449,7 @@ fn render_date_at(millis: i64, fmt: &str, offset_ms: i64) -> Result<String, Fall
             Some('j') => out.push_str(&format!("{day_of_year:03}")),
             Some('w') => out.push_str(&(((py_weekday + 1) % 7) + 1).to_string()),
             Some('u') => out.push_str(&(py_weekday + 1).to_string()),
-            Some('G') => out.push_str(&format!("{iso_y:04}")),
+            Some('G') => out.push_str(&format!("{:04}", year_in_range(iso_y)?)),
             Some('V') => out.push_str(&format!("{iso_w:02}")),
             Some('U') => out.push_str(&format!("{:02}", sunday_week(days, y))),
             Some('b') => out.push_str(MONTH_ABBR[(m - 1) as usize]),
@@ -5214,6 +5457,12 @@ fn render_date_at(millis: i64, fmt: &str, offset_ms: i64) -> Result<String, Fall
             Some('z') => out.push_str(&format!("{sign}{:02}{:02}", abs_min / 60, abs_min % 60)),
             Some('Z') => out.push_str(&off_minutes.to_string()),
             Some('%') => out.push('%'),
+            None => {
+                return Err(Fallback::mongo(
+                    18535,
+                    "Unmatched '%' at end of format string",
+                ));
+            }
             other => {
                 return Err(Fallback::mongo(
                     18536,
@@ -5252,18 +5501,6 @@ fn resolve_tz_offset(name: &str) -> Option<i64> {
     }
 }
 
-/// Resolve a *named* IANA zone (`"America/New_York"`, `"Europe/Dublin"`, …) to its
-/// signed UTC offset **in milliseconds at the given UTC instant** — DST-correct,
-/// since the offset of a zone depends on when you ask. Returns `None` for a name
-/// `chrono-tz` doesn't know (the caller defers to Python, which resolves it or
-/// raises "unknown timezone").
-///
-/// This is the *instant → wall-clock* direction, which is total and unambiguous:
-/// every UTC instant maps to exactly one local time in a zone (unlike the reverse,
-/// where a DST gap/overlap makes a naive local time ambiguous). So `chrono-tz` and
-/// Python `zoneinfo` return the identical offset for any instant whose governing
-/// rule both tz databases agree on — which is why `$dateToString` can compute
-/// natively here while `$dateFromString`'s named-zone form still defers.
 /// mongod's unrecognised-timezone failure (40485), in the two forms it has.
 ///
 /// `$dateTrunc` and `$dateDiff` name the parameter they were parsing; every
@@ -5338,7 +5575,7 @@ fn eval_timezone(
     match eval(expr, ctx)? {
         Bson::Null | Bson::Undefined => Ok(TzArg::Null),
         Bson::String(s) => {
-            if resolve_tz_offset(&s).is_some() || s.parse::<chrono_tz::Tz>().is_ok() {
+            if resolve_tz_offset(&s).is_some() || crate::tzdb::is_zone(&s) {
                 Ok(TzArg::Zone(Bson::String(s)))
             } else {
                 Err(tz_error(&s, operator).with_folded(folded))
@@ -5376,16 +5613,8 @@ fn precheck_constant_timezone(
 }
 
 fn named_tz_offset_ms(name: &str, utc_millis: i64) -> Option<i64> {
-    use chrono::{DateTime, Offset, TimeZone, Utc};
-    let tz: chrono_tz::Tz = name.parse().ok()?;
-    let secs = utc_millis.div_euclid(1000);
-    let nanos = (utc_millis.rem_euclid(1000) * 1_000_000) as u32;
-    let instant: DateTime<Utc> = DateTime::from_timestamp(secs, nanos)?;
-    let offset_secs = tz
-        .offset_from_utc_datetime(&instant.naive_utc())
-        .fix()
-        .local_minus_utc();
-    Some(offset_secs as i64 * 1000)
+    let zone = crate::tzdb::zone(name)?;
+    Some(zone_offset_info(zone, utc_millis.div_euclid(1000)).0 * 1000)
 }
 
 /// Resolve a `timezone` spec field to a signed wall-clock offset in **milliseconds
@@ -5393,9 +5622,8 @@ fn named_tz_offset_ms(name: &str, utc_millis: i64) -> Option<i64> {
 /// (`$dateToString`, the `{date, timezone}` extractors, `$dateToParts`). Absent /
 /// `null` timezone → 0 (UTC), matching Python's `_resolve_timezone(None)`; a
 /// fixed-offset (`±HH:MM` / `UTC` / `GMT`) is constant; a named IANA zone resolves
-/// its DST-correct offset at the instant via `chrono-tz`. The callers pass a zone
-/// [`eval_timezone`] has already evaluated and checked. This is *not* used by `$dateFromString`, whose named-zone
-/// (local→instant) direction is DST-ambiguous and deliberately defers.
+/// its offset at the instant from mongod's own zone data (`crate::tzdb`). The
+/// callers pass a zone [`eval_timezone`] has already evaluated and checked.
 fn timezone_offset_ms(tz: Option<&Bson>, utc_millis: i64) -> Result<i64, Fallback> {
     match tz {
         None | Some(Bson::Null) => Ok(0),
@@ -5407,97 +5635,243 @@ fn timezone_offset_ms(tz: Option<&Bson>, utc_millis: i64) -> Result<i64, Fallbac
     }
 }
 
-fn shift_ms(start: i64, amount: i128, unit_ms: i128) -> R {
-    bounded_datetime(start as i128 + amount * unit_ms)
+/// A shifted instant, or `None` past the int64 milliseconds a date holds.
+fn shift_ms(start: i64, amount: i128, unit_ms: i128) -> Option<i64> {
+    i64::try_from(start as i128 + amount * unit_ms).ok()
 }
 
-fn add_months(start: i64, months: i128) -> R {
+/// `start` moved by `months` calendar months, the day clamped to the new
+/// month's last. Any year an int64 of milliseconds reaches: mongod's dates are
+/// not bounded to 1-9999 (`$dateAdd` of 8000 years answers, measured 8.2.11).
+fn add_months(start: i64, months: i128) -> Option<i64> {
     let days = start.div_euclid(86_400_000);
     let ms_of_day = start.rem_euclid(86_400_000);
     let (y, m, d) = civil_from_days(days);
     let total = (m - 1) as i128 + months;
-    let new_year = y as i128 + total.div_euclid(12);
-    let new_month = total.rem_euclid(12) + 1; // [1, 12]
-    if !(1..=9999).contains(&new_year) {
-        return Err(Fallback::Defer); // Python datetime year out of range
-    }
-    let last = days_in_month(new_year as i64, new_month as i64);
-    let new_day = d.min(last);
-    let new_days = days_from_civil(new_year as i64, new_month as i64, new_day);
-    bounded_datetime(new_days as i128 * 86_400_000 + ms_of_day as i128)
+    let new_year = i64::try_from(y as i128 + total.div_euclid(12)).ok()?;
+    let new_month = (total.rem_euclid(12) + 1) as i64; // [1, 12]
+    let new_day = d.min(days_in_month(new_year, new_month));
+    let new_days = days_from_civil(new_year, new_month, new_day);
+    i64::try_from(new_days as i128 * 86_400_000 + ms_of_day as i128).ok()
 }
 
-/// `_shift_date`: positive `amount` adds; an unsupported unit defers.
-fn shift_date(start: i64, unit: &str, amount: i128) -> R {
+/// `start` moved by `amount` of a (validated) `unit`; `None` on overflow.
+fn shift_date(start: i64, unit: &str, amount: i128) -> Option<i64> {
     match unit {
-        "year" => add_months(start, amount * 12),
-        "quarter" => add_months(start, amount * 3),
+        "year" => add_months(start, amount.checked_mul(12)?),
+        "quarter" => add_months(start, amount.checked_mul(3)?),
         "month" => add_months(start, amount),
         "week" => shift_ms(start, amount, 604_800_000),
         "day" => shift_ms(start, amount, 86_400_000),
         "hour" => shift_ms(start, amount, 3_600_000),
         "minute" => shift_ms(start, amount, 60_000),
         "second" => shift_ms(start, amount, 1000),
-        "millisecond" => shift_ms(start, amount, 1),
-        _ => Err(Fallback::Defer),
+        _ => shift_ms(start, amount, 1),
     }
 }
 
-/// `$dateAdd` (sign +1) / `$dateSubtract` (sign -1).
-/// An integer date argument (amount / binSize): an int or a whole double; a
-/// fractional double / bool / non-numeric -> None (defer so Python raises the
-/// mongod error rather than coercing a bool or rejecting a valid whole double).
-fn date_int(v: &Bson) -> Option<i128> {
+/// The units mongod's date arithmetic takes.
+const DATE_UNITS: &[&str] = &[
+    "year",
+    "quarter",
+    "month",
+    "week",
+    "day",
+    "hour",
+    "minute",
+    "second",
+    "millisecond",
+];
+
+/// A date operator's `unit`, checked as mongod checks it: a string (5439013)
+/// naming a unit (9). Measured 8.2.11, 2026-10-22.
+fn date_unit_arg(op: &str, v: &Bson) -> Result<String, Fallback> {
+    let Bson::String(unit) = v else {
+        return Err(Fallback::mongo(
+            5439013,
+            format!(
+                "{op} requires 'unit' to be a string, but got {}",
+                type_name(v)
+            ),
+        ));
+    };
+    if !DATE_UNITS.contains(&unit.as_str()) {
+        return Err(Fallback::mongo(
+            9,
+            format!(
+                "{op} parameter 'unit' value parsing failed :: caused by :: unknown time unit \
+                 value: {unit}"
+            ),
+        ));
+    }
+    Ok(unit.clone())
+}
+
+/// The milliseconds of a value mongod's date arithmetic reads as a date: a
+/// date, or the seconds of a Timestamp or an ObjectId (measured 8.2.11).
+fn date_like_ms(v: &Bson) -> Option<i64> {
     match v {
-        Bson::Int32(n) => Some(*n as i128),
-        Bson::Int64(n) => Some(*n as i128),
-        Bson::Double(d) if d.fract() == 0.0 => Some(*d as i128),
+        Bson::DateTime(d) => Some(d.timestamp_millis()),
+        Bson::Timestamp(ts) => Some(i64::from(ts.time) * 1000),
+        Bson::ObjectId(oid) => Some(oid.timestamp().timestamp_millis()),
         _ => None,
     }
 }
 
+/// A whole number mongod takes as a date `amount` or `binSize`: an int, a
+/// long, or a double or Decimal128 holding an int64 exactly.
+fn date_integer(v: &Bson) -> Option<i64> {
+    match v {
+        Bson::Int32(n) => Some(i64::from(*n)),
+        Bson::Int64(n) => Some(*n),
+        Bson::Double(d)
+            if d.is_finite() && d.fract() == 0.0 && d.abs() < 9.223_372_036_854_776e18 =>
+        {
+            Some(*d as i64)
+        }
+        Bson::Decimal128(_) => crate::decimal::decimal_to_i64_exact(v),
+        _ => None,
+    }
+}
+
+/// The largest `amount` of each unit `$dateAdd` / `$dateSubtract` accept,
+/// either sign; one more is 5976500. Measured by bisection against mongod
+/// 8.2.11 (2026-10-22): they are not a whole number of anything, so they are
+/// a table. A millisecond amount has no limit.
+const DATE_ADD_LIMITS: &[(&str, i64)] = &[
+    ("year", 584_942_417),
+    ("quarter", 2_339_769_671),
+    ("month", 7_019_309_015),
+    ("week", 30_500_568_904),
+    ("day", 213_503_982_334),
+    ("hour", 5_124_095_576_039),
+    ("minute", 307_445_734_562_399),
+    ("second", 18_446_744_073_743_999),
+];
+
+/// The checks mongod makes while it optimizes a date operator that reads the
+/// document: a CONSTANT `binSize` (`$dateTrunc`), then a constant `unit`,
+/// then a constant `startOfWeek` are validated before anything is read, so a bad one fails even beside a
+/// null date, under "Failed to optimize pipeline". A wholly constant
+/// expression is simply evaluated, null first (measured 8.2.11, 2026-10-22).
+fn precheck_constant_date_args(
+    op: &str,
+    arg: &Bson,
+    d: &Document,
+    ctx: &Ctx,
+) -> Result<(), Fallback> {
+    let bound: Vec<String> = ctx.vars.keys().cloned().collect();
+    if crate::aggregate::is_constant_expression(arg, &bound) {
+        return Ok(());
+    }
+    let constant = |field: &str| {
+        d.get(field)
+            .filter(|e| crate::aggregate::is_constant_expression(e, &bound))
+            .map(|e| eval(e, ctx))
+            .transpose()
+    };
+    if op == "$dateTrunc" {
+        if let Some(v) = constant("binSize")?.filter(|v| !is_null(v)) {
+            trunc_bin_size(&v).map_err(|f| f.with_folded(true))?;
+        }
+    }
+    if let Some(v) = constant("unit")?.filter(|v| !is_null(v)) {
+        date_unit_arg(op, &v).map_err(|f| f.with_folded(true))?;
+    }
+    if matches!(op, "$dateTrunc" | "$dateDiff") {
+        if let Some(v) = constant("startOfWeek")?.filter(|v| !is_null(v)) {
+            parse_start_of_week(op, &v).map_err(|f| f.with_folded(true))?;
+        }
+    }
+    if op == "$dateSubtract" {
+        if let Some(amount) = constant("amount")?.as_ref().and_then(date_integer) {
+            if amount == i64::MIN {
+                return Err(Fallback::mongo(
+                    6045000,
+                    format!("invalid {op} 'amount' parameter value: {amount}"),
+                )
+                .with_folded(true));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `$dateAdd` (sign +1) / `$dateSubtract` (sign -1), in mongod 8.2.11's order:
+/// a null argument (or timezone) answers null; then `unit` (5439013 / 9), the
+/// start (5166403: a date, Timestamp or ObjectId), the amount (5166405: a
+/// whole number), its limit (5976500) and the result's range (5166406).
 fn op_date_add(arg: &Bson, ctx: &Ctx, sign: i128) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback::Defer);
     };
+    let op = if sign > 0 {
+        "$dateAdd"
+    } else {
+        "$dateSubtract"
+    };
     precheck_constant_timezone(d, ctx, None)?;
+    precheck_constant_date_args(op, arg, d, ctx)?;
     let start = eval_opt(d.get("startDate"), ctx)?;
+    let unit_v = eval_opt(d.get("unit"), ctx)?;
     let amount_v = eval_opt(d.get("amount"), ctx)?;
-    if is_null(&start) || is_null(&amount_v) {
-        return Ok(Bson::Null);
-    }
-    let Bson::DateTime(start_dt) = start else {
-        return Err(Fallback::Defer); // not a datetime -> Python raises
-    };
-    let Bson::String(unit) = eval_opt(d.get("unit"), ctx)? else {
-        return Err(Fallback::Defer); // unit must be a string
-    };
-    let Some(amount) = date_int(&amount_v) else {
-        return Err(Fallback::Defer); // fractional / bool / non-numeric -> Python raises 5166405
-    };
     // A CALENDAR unit shifts the LOCAL wall clock: noon Eastern plus one day is
-    // noon Eastern, which is 23 real hours across a spring-forward. The
-    // timezone was ignored outright, so every such shift was an hour out.
-    // Sub-day units are absolute, which is why +24 `hour` differs from +1 `day`.
+    // noon Eastern, which is 23 real hours across a spring-forward. Sub-day
+    // units are absolute, which is why +24 `hour` differs from +1 `day`.
     // `None`: only `$dateTrunc` and `$dateDiff` name the parameter in the
     // failure message; `$dateAdd` / `$dateSubtract` report it bare.
     let tz = eval_timezone(d.get("timezone"), ctx, None)?;
-    if matches!(tz, TzArg::Null) {
+    if is_null(&start) || is_null(&unit_v) || is_null(&amount_v) || matches!(tz, TzArg::Null) {
         return Ok(Bson::Null);
     }
+    let unit = date_unit_arg(op, &unit_v)?;
+    let Some(millis) = date_like_ms(&start) else {
+        return Err(Fallback::mongo(
+            5166403,
+            format!("{op} requires startDate to be convertible to a date"),
+        ));
+    };
+    let Some(amount) = date_integer(&amount_v) else {
+        return Err(Fallback::mongo(
+            5166405,
+            format!("{op} expects integer amount of time units"),
+        ));
+    };
+    if sign < 0 && amount == i64::MIN {
+        // Negating it overflows a long (measured 8.2.11).
+        return Err(Fallback::mongo(
+            6045000,
+            format!("invalid {op} 'amount' parameter value: {amount}"),
+        ));
+    }
+    let amount = sign * amount as i128;
+    if let Some((_, limit)) = DATE_ADD_LIMITS.iter().find(|(u, _)| *u == unit) {
+        if amount.abs() > *limit as i128 {
+            return Err(Fallback::mongo(
+                5976500,
+                format!("invalid dateAdd 'amount' parameter value: {amount} {unit}"),
+            ));
+        }
+    }
+    let overflowed = || Fallback::mongo(5166406, "dateAdd overflowed");
     let tz = tz.as_spec();
-    let millis = start_dt.timestamp_millis();
     if tz.is_none() || matches!(tz, Some(Bson::Null)) || subday_unit_ms(&unit).is_some() {
-        return shift_date(millis, &unit, sign * amount);
+        let shifted = shift_date(millis, &unit, amount).ok_or_else(overflowed)?;
+        return Ok(Bson::DateTime(bson::DateTime::from_millis(shifted)));
     }
     let local = millis + timezone_offset_ms(tz, millis)?;
-    let shifted = shift_date(local, &unit, sign * amount)?;
-    let Bson::DateTime(shifted_dt) = shifted else {
-        return Ok(shifted);
+    let shifted = shift_date(local, &unit, amount).ok_or_else(overflowed)?;
+    // A shifted local time that happens twice keeps the start's daylight
+    // saving: a day added to 01:30 EDT on the day before New York's autumn
+    // change is 01:30 EDT, the EARLIER instant, where `$dateFromParts` takes
+    // the later (measured 8.2.11, 2026-10-22).
+    let instant = match tz {
+        Some(Bson::String(s)) if resolve_tz_offset(s).is_none() => {
+            named_local_to_utc_ms(s, shifted, Some(millis)).ok_or_else(|| tz_error(s, None))?
+        }
+        _ => tz_instant_from_local_ms(tz, shifted)?,
     };
-    Ok(Bson::DateTime(bson::DateTime::from_millis(
-        tz_instant_from_local_ms(tz, shifted_dt.timestamp_millis())?,
-    )))
+    Ok(Bson::DateTime(bson::DateTime::from_millis(instant)))
 }
 
 fn op_date_diff(arg: &Bson, ctx: &Ctx) -> R {
@@ -5505,6 +5879,7 @@ fn op_date_diff(arg: &Bson, ctx: &Ctx) -> R {
         return Err(Fallback::Defer);
     };
     precheck_constant_timezone(d, ctx, Some("$dateDiff"))?;
+    precheck_constant_date_args("$dateDiff", arg, d, ctx)?;
     // A missing required *parameter* (key absent) is a mongod parse error
     // (Location5166303/4/5) -> Python raises; a present-but-null one yields null.
     for param in ["startDate", "endDate", "unit"] {
@@ -5512,17 +5887,27 @@ fn op_date_diff(arg: &Bson, ctx: &Ctx) -> R {
             return Err(Fallback::Defer);
         }
     }
+    // mongod 8.2.11's order: a null argument answers null, then `unit`
+    // (5439013 / 9), then each date (5166307: a date, Timestamp or ObjectId).
     let start = eval_opt(d.get("startDate"), ctx)?;
     let end = eval_opt(d.get("endDate"), ctx)?;
-    if is_null(&start) || is_null(&end) {
+    let unit_v = eval_opt(d.get("unit"), ctx)?;
+    if is_null(&start) || is_null(&end) || is_null(&unit_v) {
         return Ok(Bson::Null);
     }
-    let (Bson::DateTime(s), Bson::DateTime(e)) = (start, end) else {
-        return Err(Fallback::Defer);
+    let unit = date_unit_arg("$dateDiff", &unit_v)?;
+    let date_of = |v: &Bson, name: &str| {
+        date_like_ms(v).ok_or_else(|| {
+            Fallback::mongo(
+                5166307,
+                format!(
+                    "$dateDiff requires '{name}' to be a date, but got {}",
+                    type_name(v)
+                ),
+            )
+        })
     };
-    let Bson::String(unit) = eval_opt(d.get("unit"), ctx)? else {
-        return Err(Fallback::Defer);
-    };
+    let (sm, em) = (date_of(&start, "startDate")?, date_of(&end, "endDate")?);
     // mongod counts BOUNDARY CROSSINGS in the timezone, which is the same bin
     // index `$dateTrunc` floors to -- so this is one subtraction, not a second
     // implementation of the calendar. The timezone used to be ignored entirely
@@ -5533,12 +5918,11 @@ fn op_date_diff(arg: &Bson, ctx: &Ctx) -> R {
         return Ok(Bson::Null);
     }
     let tz = tz.as_spec();
-    let start_of_week = match start_of_week_arg("$dateDiff", d, ctx)? {
+    let start_of_week = match start_of_week_arg("$dateDiff", arg, d, &unit, ctx)? {
         StartOfWeek::Null => return Ok(Bson::Null),
         StartOfWeek::Absent => None,
         StartOfWeek::Day(day) => Some(day),
     };
-    let (sm, em) = (s.timestamp_millis(), e.timestamp_millis());
     let value = date_bin_index(em, &unit, 1, tz, start_of_week.as_deref())?
         - date_bin_index(sm, &unit, 1, tz, start_of_week.as_deref())?;
     Ok(Bson::Int64(value))
@@ -5553,9 +5937,8 @@ const TRUNC_REF_YEAR: i64 = 2000;
 /// A local wall clock back to the instant it names.
 ///
 /// The counterpart of `timezone_offset_ms`, which only goes instant→wall-clock.
-/// `earliest()` matches Python `zoneinfo`'s `fold=0` for an ambiguous local time
-/// (the hour repeated when DST ends); a local time inside a DST GAP does not
-/// exist at all, and chrono answers `None` there, which defers.
+/// See `named_local_to_utc_ms` for the local times a change of offset makes
+/// ambiguous or skips.
 fn tz_instant_from_local_ms(tz: Option<&Bson>, local_millis: i64) -> Result<i64, Fallback> {
     match tz {
         None | Some(Bson::Null) => Ok(local_millis),
@@ -5563,23 +5946,28 @@ fn tz_instant_from_local_ms(tz: Option<&Bson>, local_millis: i64) -> Result<i64,
             if let Some(off_min) = resolve_tz_offset(s) {
                 return Ok(local_millis - off_min * 60_000);
             }
-            named_local_to_utc_ms(s, local_millis).ok_or_else(|| tz_error(s, None))
+            named_local_to_utc_ms(s, local_millis, None).ok_or_else(|| tz_error(s, None))
         }
         Some(_) => Err(Fallback::Defer),
     }
 }
 
-fn named_local_to_utc_ms(name: &str, local_millis: i64) -> Option<i64> {
-    use chrono::{DateTime, TimeZone};
-    let tz: chrono_tz::Tz = name.parse().ok()?;
-    let secs = local_millis.div_euclid(1000);
-    let nanos = (local_millis.rem_euclid(1000) * 1_000_000) as u32;
-    let naive = DateTime::from_timestamp(secs, nanos)?.naive_utc();
-    Some(
-        tz.from_local_datetime(&naive)
-            .earliest()?
-            .timestamp_millis(),
-    )
+/// The instant a local wall clock in zone `name` names: timelib's
+/// `do_adjust_timezone` (`timelib_zone_adjustment`), as mongod reaches it.
+/// Its answer at a change of offset turns on the time's daylight-saving
+/// flag, which is the zone's at the 1970 epoch for a time built from parts
+/// or a string -- `timelib_set_timezone` reads it at `sse` 0 -- and the
+/// start date's for `$dateAdd`, which `timelib_unixtime2local` set before
+/// `timelib_add` (`like`). So a time that happens twice is the standard-time
+/// instant from parts and keeps the start's daylight saving in `$dateAdd`,
+/// and one that never happens is read with the offset before the change
+/// (measured 8.2.11, 2026-10-22, in New York, London, Sydney, Lord Howe and
+/// São Paulo).
+fn named_local_to_utc_ms(name: &str, local_millis: i64, like: Option<i64>) -> Option<i64> {
+    let zone = crate::tzdb::zone(name)?;
+    let dst = zone_offset_info(zone, like.map_or(0, |ms| ms.div_euclid(1000))).2;
+    let sse = local_millis.div_euclid(1000);
+    Some(local_millis + timelib_zone_adjustment(zone, sse, dst) * 1000)
 }
 
 /// Day number of the first `start_of_week` weekday on or after 2000-01-01.
@@ -5666,19 +6054,46 @@ fn trunc_reference_instant_ms(tz: Option<&Bson>) -> Result<i64, Fallback> {
     tz_instant_from_local_ms(tz, days_from_civil(TRUNC_REF_YEAR, 1, 1) * 86_400_000)
 }
 
-/// `startOfWeek` as mongod parses it for `$dateTrunc` / `$dateDiff`, whatever
-/// the unit (measured 8.2.11, 2026-10-07): a day name or its three-letter
-/// abbreviation, case-insensitive (`mon`, `MON`, `MonDay`; not `tues` /
-/// `thur`); a non-string is 5439015, an unrecognised string 5439016. `Ok(None)`
-/// when absent; `Err` with a `null` marker is handled by the caller via
-/// [`StartOfWeek::Null`]. The abbreviations used to be refused outright.
+/// `startOfWeek` for `$dateTrunc` / `$dateDiff`. A day name or its
+/// three-letter abbreviation, case-insensitive (`mon`, `MON`, `MonDay`; not
+/// `tues` / `thur`); a non-string is 5439015, an unrecognised string 5439016.
+/// The abbreviations used to be refused outright.
+///
+/// It is only READ for the `week` unit (measured 8.2.11, 2026-10-22): a
+/// field path is evaluated for `week` alone, and a wholly constant
+/// expression is evaluated the same way. In an expression that reads the
+/// document, though, a CONSTANT `startOfWeek` is parsed while optimizing --
+/// a bad one fails whatever the unit (`precheck_constant_date_args`) and a
+/// null one makes the answer null.
 enum StartOfWeek {
     Absent,
     Null,
     Day(String),
 }
 
-fn start_of_week_arg(op: &str, d: &bson::Document, ctx: &Ctx) -> Result<StartOfWeek, Fallback> {
+fn start_of_week_arg(
+    op: &str,
+    arg: &Bson,
+    d: &bson::Document,
+    unit: &str,
+    ctx: &Ctx,
+) -> Result<StartOfWeek, Fallback> {
+    let Some(e) = d.get("startOfWeek") else {
+        return Ok(StartOfWeek::Absent);
+    };
+    if unit != "week" {
+        let bound: Vec<String> = ctx.vars.keys().cloned().collect();
+        let parsed_while_optimizing = crate::aggregate::is_constant_expression(e, &bound)
+            && !crate::aggregate::is_constant_expression(arg, &bound);
+        if parsed_while_optimizing && is_null(&eval(e, ctx)?) {
+            return Ok(StartOfWeek::Null);
+        }
+        return Ok(StartOfWeek::Absent);
+    }
+    parse_start_of_week(op, &eval(e, ctx)?)
+}
+
+fn parse_start_of_week(op: &str, v: &Bson) -> Result<StartOfWeek, Fallback> {
     const DAYS: [&str; 7] = [
         "monday",
         "tuesday",
@@ -5688,10 +6103,7 @@ fn start_of_week_arg(op: &str, d: &bson::Document, ctx: &Ctx) -> Result<StartOfW
         "saturday",
         "sunday",
     ];
-    let Some(e) = d.get("startOfWeek") else {
-        return Ok(StartOfWeek::Absent);
-    };
-    match eval(e, ctx)? {
+    match v {
         Bson::Null | Bson::Undefined => Ok(StartOfWeek::Null),
         Bson::String(s) => {
             let lower = s.to_ascii_lowercase();
@@ -5712,51 +6124,92 @@ fn start_of_week_arg(op: &str, d: &bson::Document, ctx: &Ctx) -> Result<StartOfW
             5439015,
             format!(
                 "{op} requires 'startOfWeek' to be a string, but got {}",
-                type_name(&other)
+                type_name(other)
             ),
         )),
     }
 }
 
+/// `$dateTrunc`'s `binSize`: a whole int64 (5439017) above zero (5439018).
+fn trunc_bin_size(v: &Bson) -> Result<i64, Fallback> {
+    let Some(n) = date_integer(v) else {
+        return Err(Fallback::mongo(
+            5439017,
+            format!(
+                "$dateTrunc requires 'binSize' to be a 64-bit integer, but got value '{}' of type {}",
+                crate::aggregate::render_value_compact(v),
+                type_name(v)
+            ),
+        ));
+    };
+    if n <= 0 {
+        return Err(Fallback::mongo(
+            5439018,
+            format!("$dateTrunc requires 'binSize' to be greater than 0, but got value {n}"),
+        ));
+    }
+    Ok(n)
+}
+
+/// `$dateTrunc`, in mongod 8.2.11's order: a constant `binSize` is checked
+/// while the pipeline is optimized, before anything is read; then a null
+/// argument answers null; then `binSize`, `unit` (5439013 / 9), the date
+/// (5166307: a date, Timestamp or ObjectId), `startOfWeek`, and the bin's
+/// range -- a calendar bin past 10^11 is 5439006, a sub-day bin past an int64
+/// of milliseconds 5439002. Measured 2026-10-22.
 fn op_date_trunc(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback::Defer);
     };
     precheck_constant_timezone(d, ctx, Some("$dateTrunc"))?;
+    precheck_constant_date_args("$dateTrunc", arg, d, ctx)?;
     let date = eval_opt(d.get("date"), ctx)?;
-    if is_null(&date) {
+    let unit_v = eval_opt(d.get("unit"), ctx)?;
+    let bin_v = d.get("binSize").map(|e| eval(e, ctx)).transpose()?;
+    let tz = eval_timezone(d.get("timezone"), ctx, Some("$dateTrunc"))?;
+    if is_null(&date)
+        || is_null(&unit_v)
+        || bin_v.as_ref().is_some_and(is_null)
+        || matches!(tz, TzArg::Null)
+    {
         return Ok(Bson::Null);
     }
-    let Bson::DateTime(dt) = date else {
-        return Err(Fallback::Defer);
-    };
-    let Bson::String(unit) = eval_opt(d.get("unit"), ctx)? else {
-        return Err(Fallback::Defer);
-    };
-    let bin: i64 = match d.get("binSize") {
-        Some(e) => match date_int(&eval(e, ctx)?) {
-            Some(n) if n >= 1 => n as i64,
-            // fractional / bool / non-numeric (5439017) or < 1 (5439018) -> Python.
-            _ => return Err(Fallback::Defer),
-        },
+    let bin = match &bin_v {
+        Some(v) => trunc_bin_size(v)?,
         None => 1,
     };
-    let tz = eval_timezone(d.get("timezone"), ctx, Some("$dateTrunc"))?;
-    if matches!(tz, TzArg::Null) {
-        return Ok(Bson::Null);
-    }
+    let unit = date_unit_arg("$dateTrunc", &unit_v)?;
+    let Some(millis) = date_like_ms(&date) else {
+        return Err(Fallback::mongo(
+            5166307,
+            format!(
+                "$dateTrunc requires 'date' to be a date, but got {}",
+                type_name(&date)
+            ),
+        ));
+    };
     let tz = tz.as_spec();
-    let start_of_week = match start_of_week_arg("$dateTrunc", d, ctx)? {
+    let start_of_week = match start_of_week_arg("$dateTrunc", arg, d, &unit, ctx)? {
         StartOfWeek::Null => return Ok(Bson::Null),
         StartOfWeek::Absent => None,
         StartOfWeek::Day(day) => Some(day),
     };
-    let millis = dt.timestamp_millis();
+    let overflowed = || Fallback::mongo(5439002, "dateTrunc overflowed");
+    match subday_unit_ms(&unit) {
+        Some(unit_ms) if unit_ms.checked_mul(bin).is_none() => return Err(overflowed()),
+        None if bin > 100_000_000_000 => {
+            return Err(Fallback::mongo(
+                5439006,
+                "dateTrunc unsupported binSize value",
+            ))
+        }
+        _ => {}
+    }
     let index = date_bin_index(millis, &unit, bin, tz, start_of_week.as_deref())?;
 
     let result: i128 = if let Some(unit_ms) = subday_unit_ms(&unit) {
         let reference = trunc_reference_instant_ms(tz)?;
-        let step = unit_ms.checked_mul(bin).ok_or(Fallback::Defer)? as i128;
+        let step = unit_ms.checked_mul(bin).ok_or_else(overflowed)? as i128;
         reference as i128 + index as i128 * step
     } else {
         // Rebuild the LOCAL wall clock this bin starts at, then ask the zone
@@ -5785,7 +6238,8 @@ fn op_date_trunc(arg: &Bson, ctx: &Ctx) -> R {
         };
         tz_instant_from_local_ms(tz, local_days * 86_400_000)? as i128
     };
-    bounded_datetime(result)
+    let result = i64::try_from(result).map_err(|_| overflowed())?;
+    Ok(Bson::DateTime(bson::DateTime::from_millis(result)))
 }
 
 // --- type conversions ---------------------------------------------------
@@ -5805,6 +6259,9 @@ enum Conv {
     /// client, which is the difference between the Rust server reporting the
     /// bad input and reporting that it cannot do `$convert`.
     Named(Fallback),
+    /// An error `onError` does NOT catch: a date whose year is outside
+    /// 0-9999 cannot be rendered as a string at all (18537, measured 8.2.11).
+    Fatal(Fallback),
     Unsupported,
 }
 
@@ -5841,7 +6298,7 @@ fn op_to_shorthand(arg: &Bson, ctx: &Ctx, code: i32) -> R {
     match convert_with(&v, code, &PLAIN_CONVERSION) {
         Conv::Ok(out) => Ok(out),
         // With no `onError` to catch it, a named failure IS the answer.
-        Conv::Named(fault) => Err(fault),
+        Conv::Named(fault) | Conv::Fatal(fault) => Err(fault),
         Conv::Unsupported => Err(unsupported_conversion(&v, code)),
         Conv::Failed => Err(Fallback::Defer),
     }
@@ -5849,18 +6306,30 @@ fn op_to_shorthand(arg: &Bson, ctx: &Ctx, code: i32) -> R {
 
 fn op_convert(arg: &Bson, ctx: &Ctx) -> R {
     let spec = arg.as_document().ok_or(Fallback::Defer)?;
+    // Both are present: `check_required_fields` refuses the spec otherwise.
     let (Some(input), Some(to)) = (spec.get("input"), spec.get("to")) else {
-        return Err(Fallback::Defer); // Python raises: requires {input, to}
+        return Err(Fallback::Defer);
     };
     let value = eval(input, ctx)?;
     let target = eval(to, ctx)?;
-    if matches!(value, Bson::Null) {
-        return match spec.get("onNull") {
-            Some(on) => eval(on, ctx),
-            None => Ok(Bson::Null),
+    let on_null = || match spec.get("onNull") {
+        Some(on) => eval_field_value(on, ctx),
+        None => Ok(Bson::Null),
+    };
+    // A null target answers null (after a null input's `onNull`); any other is
+    // checked BEFORE the input is: an unknown one fails beside a null input too
+    // (measured 8.2.11, 2026-10-22).
+    if is_null(&target) {
+        return if is_null(&value) {
+            on_null()
+        } else {
+            Ok(Bson::Null)
         };
     }
     let (code, subtype) = convert_target(&target)?;
+    if matches!(value, Bson::Null) {
+        return on_null();
+    }
     let format = convert_format(spec, ctx)?;
     let big_endian = convert_byte_order(spec, ctx)?;
     // A string to binData, or binData to a string, has no default format:
@@ -5878,20 +6347,21 @@ fn op_convert(arg: &Bson, ctx: &Ctx) -> R {
     match convert_with(&value, code, &opts) {
         Conv::Ok(v) => Ok(v),
         Conv::Failed => match spec.get("onError") {
-            Some(on) => eval(on, ctx),
+            Some(on) => eval_field_value(on, ctx),
             None => Err(Fallback::Defer), // Python raises "$convert failed"
         },
         Conv::Named(fault) => match spec.get("onError") {
-            Some(on) => eval(on, ctx),
+            Some(on) => eval_field_value(on, ctx),
             None => Err(fault),
         },
+        Conv::Fatal(fault) => Err(fault),
         // `onError` catches an unsupported PAIR exactly as it catches a
         // conversion that failed -- probed 8.2.11, where
         // `{$convert: {input: ObjectId(), to: "int", onError: "E"}}` answers
         // "E". This arm ignored `onError` and deferred, so the one form that
         // exists to survive a bad conversion was the one that could not.
         Conv::Unsupported => match spec.get("onError") {
-            Some(on) => eval(on, ctx),
+            Some(on) => eval_field_value(on, ctx),
             None => Err(unsupported_conversion(&value, code)),
         },
     }
@@ -5916,7 +6386,7 @@ fn op_to_uuid(arg: &Bson, ctx: &Ctx) -> R {
     };
     match convert_with(&v, 5, &opts) {
         Conv::Ok(out) => Ok(out),
-        Conv::Named(fault) => Err(fault),
+        Conv::Named(fault) | Conv::Fatal(fault) => Err(fault),
         Conv::Unsupported => Err(unsupported_conversion(&v, 5)),
         Conv::Failed => Err(Fallback::Defer),
     }
@@ -6014,7 +6484,7 @@ fn convert_byte_order(spec: &Document, ctx: &Ctx) -> Result<bool, Fallback> {
 /// to binData and is checked only there; other keys are ignored.
 fn convert_target(target: &Bson) -> Result<(i32, u8), Fallback> {
     let Bson::Document(d) = target else {
-        return Ok((convert_target_code(target).ok_or(Fallback::Defer)?, 0));
+        return Ok((convert_target_code(target)?, 0));
     };
     let Some(t) = d.get("type") else {
         return Err(Fallback::mongo(
@@ -6022,7 +6492,7 @@ fn convert_target(target: &Bson) -> Result<(i32, u8), Fallback> {
             "$convert's 'to' argument must be a string or number, but is missing",
         ));
     };
-    let code = convert_target_code(t).ok_or(Fallback::Defer)?;
+    let code = convert_target_code(t)?;
     let subtype = match d.get("subtype") {
         Some(s) if code == 5 => bindata_subtype(s)?,
         _ => 0,
@@ -6281,27 +6751,78 @@ fn encode_bindata_string(subtype: u8, bytes: &[u8], format: BinFormat) -> Result
     }
 }
 
-/// mongod's `$convert` target codes (`expressions._CONVERT_TARGETS`): the string
-/// alias or the numeric code. A double / unknown target -> `None` (Python raises).
-fn convert_target_code(target: &Bson) -> Option<i32> {
-    let code = match target {
-        Bson::String(s) => match s.as_str() {
-            "double" => 1,
-            "string" => 2,
-            "binData" => 5,
-            "objectId" => 7,
-            "bool" => 8,
-            "date" => 9,
-            "int" => 16,
-            "long" => 18,
-            "decimal" => 19,
-            _ => return None,
-        },
-        Bson::Int32(n) => *n,
-        Bson::Int64(n) => *n as i32,
-        _ => return None,
+/// BSON's types by number and by the name mongod gives them (0 is
+/// "missing"). Every one is a valid `$convert` target; the ones it cannot
+/// convert to are 241 "Unsupported conversion" (measured 8.2.11, 2026-10-22).
+const BSON_TYPE_NAMES: &[(i32, &str)] = &[
+    (-1, "minKey"),
+    (0, "missing"),
+    (1, "double"),
+    (2, "string"),
+    (3, "object"),
+    (4, "array"),
+    (5, "binData"),
+    (6, "undefined"),
+    (7, "objectId"),
+    (8, "bool"),
+    (9, "date"),
+    (10, "null"),
+    (11, "regex"),
+    (12, "dbPointer"),
+    (13, "javascript"),
+    (14, "symbol"),
+    (15, "javascriptWithScope"),
+    (16, "int"),
+    (17, "timestamp"),
+    (18, "long"),
+    (19, "decimal"),
+    (127, "maxKey"),
+];
+
+/// A `$convert` target, as mongod reads it: a type name (2 "Unknown type
+/// name"), or a number that is an int32 (9 "not an integer") naming a BSON
+/// type (9 "does not correspond"); anything else is 9 "must be a string or
+/// number". Measured 8.2.11, 2026-10-22.
+fn convert_target_code(target: &Bson) -> Result<i32, Fallback> {
+    let number = match target {
+        Bson::String(s) => {
+            return BSON_TYPE_NAMES
+                .iter()
+                .find(|(_, name)| name == s)
+                .map(|(code, _)| *code)
+                .ok_or_else(|| Fallback::mongo(2, format!("Unknown type name: {s}")));
+        }
+        Bson::Int32(n) => f64::from(*n),
+        Bson::Int64(n) => *n as f64,
+        Bson::Double(d) => *d,
+        Bson::Decimal128(_) => decimal_as_f64(target).unwrap_or(f64::NAN),
+        other => {
+            return Err(Fallback::mongo(
+                9,
+                format!(
+                    "$convert's 'to' argument must be a string or number, but is {}",
+                    type_name(other)
+                ),
+            ))
+        }
     };
-    matches!(code, 1 | 2 | 5 | 7 | 8 | 9 | 16 | 18 | 19).then_some(code)
+    if !number.is_finite() || number.fract() != 0.0 || number.abs() > f64::from(i32::MAX) {
+        return Err(Fallback::mongo(
+            9,
+            "In $convert, numeric 'to' argument is not an integer",
+        ));
+    }
+    let code = number as i32;
+    if BSON_TYPE_NAMES.iter().any(|(c, _)| *c == code) {
+        Ok(code)
+    } else {
+        Err(Fallback::mongo(
+            9,
+            format!(
+                "In $convert, numeric value for 'to' does not correspond to a BSON type: {code}"
+            ),
+        ))
+    }
 }
 
 /// mongod's numeric-string syntax, which is C's `strtod` and NOT the host
@@ -6504,6 +7025,19 @@ fn parse_float_string(value: &str) -> Result<f64, Fallback> {
     if parsed.is_infinite() && !spells_infinity(value) {
         return Err(number_parse_error(value, "Out of range"));
     }
+    // And one too SMALL for a normal double: a subnormal result, or zero from
+    // a string with a non-zero digit, is `strtod`'s ERANGE too -- `"1e-400"`,
+    // `"4.9e-324"` and `"2.2250738585072011e-308"` are 241, the smallest
+    // normal `"2.2250738585072014e-308"` parses (measured 8.2.11, 2026-10-22).
+    let mantissa = value.split(['e', 'E']).next().unwrap_or("");
+    let underflowed = if parsed == 0.0 {
+        mantissa.bytes().any(|b| (b'1'..=b'9').contains(&b))
+    } else {
+        parsed.abs() < f64::MIN_POSITIVE
+    };
+    if underflowed {
+        return Err(number_parse_error(value, "Out of range"));
+    }
     Ok(parsed)
 }
 
@@ -6640,18 +7174,10 @@ fn decimal_is_zero(v: &Bson) -> bool {
 /// The target-type name mongod prints in a conversion error, from the numeric
 /// `to` code `$convert` takes.
 fn conversion_target_name(code: i32) -> &'static str {
-    match code {
-        1 => "double",
-        2 => "string",
-        5 => "binData",
-        7 => "objectId",
-        8 => "bool",
-        9 => "date",
-        16 => "int",
-        18 => "long",
-        19 => "decimal",
-        _ => "unknown",
-    }
+    BSON_TYPE_NAMES
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map_or("unknown", |(_, name)| name)
 }
 
 /// mongod's `241` for a `binData` whose byte length no numeric target accepts.
@@ -6831,10 +7357,11 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
         },
         // string
         2 => match to_string_value(value) {
-            Some(text) => Conv::Ok(Bson::String(text)),
+            Ok(Some(text)) => Conv::Ok(Bson::String(text)),
+            Err(fault) => Conv::Fatal(fault),
             // Binary wants a base64 encoder this crate does not carry, and
             // JavaScript is a ConversionFailure mongod names -- both to Python.
-            None => Conv::Unsupported,
+            Ok(None) => Conv::Unsupported,
         },
         // bool — non-(bool/int/double/string/Decimal128) is truthy.
         8 => match value {
@@ -6885,6 +7412,16 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
                 Conv::Failed => Conv::Named(overflow_conversion(value)),
                 other => other,
             },
+            // For an int the DOUBLE is range-checked before it truncates:
+            // 2147483647.5 overflows, where its truncation would fit
+            // (measured 8.2.11, 2026-10-22).
+            Bson::Double(d) if code == 16 && (*d > i32::MAX as f64 || *d < i32::MIN as f64) => {
+                Conv::Named(if d.is_finite() {
+                    overflow_conversion(value)
+                } else {
+                    nonfinite_conversion(*d)
+                })
+            }
             Bson::Double(d) if d.is_finite() && *d >= i64::MIN as f64 && *d <= i64::MAX as f64 => {
                 match wrap_int(d.trunc() as i128, code) {
                     Conv::Failed => Conv::Named(overflow_conversion(value)),
@@ -7195,23 +7732,26 @@ fn decimal128_from_str(s: &str) -> Result<Option<bson::Decimal128>, &'static str
 /// ConversionFailure types. Shared by `$toString` and `$convert {to: "string"}`
 /// -- they are the same operation in mongod, and two copies is exactly how
 /// `$toBool` and `$convert {to: "bool"}` came to disagree inside one engine.
-fn to_string_value(v: &Bson) -> Option<String> {
-    Some(match v {
+fn to_string_value(v: &Bson) -> Result<Option<String>, Fallback> {
+    Ok(Some(match v {
         Bson::Int32(n) => n.to_string(),
         Bson::Int64(n) => n.to_string(),
         Bson::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
         Bson::Double(d) => format_double_roundtrip(*d),
         Bson::Decimal128(d) => d.to_string(),
         Bson::ObjectId(oid) => oid.to_hex(),
-        Bson::DateTime(dt) => render_date(dt.timestamp_millis(), "%Y-%m-%dT%H:%M:%S.%LZ").ok()?,
+        Bson::DateTime(dt) => render_date(dt.timestamp_millis(), "%Y-%m-%dT%H:%M:%S.%LZ")?,
         Bson::String(s) => s.clone(),
         // binData stringifies in the `auto` format: base64, except the UUID
         // form for a 16-byte subtype 4. Measured 8.2.11, 2026-10-20.
         Bson::Binary(b) => {
-            encode_bindata_string(u8::from(b.subtype), &b.bytes, BinFormat::Auto).ok()?
+            match encode_bindata_string(u8::from(b.subtype), &b.bytes, BinFormat::Auto) {
+                Ok(s) => s,
+                Err(_) => return Ok(None),
+            }
         }
-        _ => return None,
-    })
+        _ => return Ok(None),
+    }))
 }
 
 /// Standard base64 with padding. Small enough not to earn a dependency, and
@@ -7262,8 +7802,9 @@ fn compile_regex(
         Some(e) => eval(e, ctx)?,
         None => return Err(Fallback::Defer), // Python `_resolve_regex` raises
     };
+    // A null `options` is no options (measured 8.2.11).
     let options = match spec.get("options") {
-        Some(e) => Some(eval(e, ctx)?),
+        Some(e) => Some(eval(e, ctx)?).filter(|v| !is_null(v)),
         None => None,
     };
     regexutil::compile(&pattern, options.as_ref()).map_err(|_| {
@@ -7288,18 +7829,76 @@ fn compile_regex(
     })
 }
 
-/// The evaluated `input`, or `None` when it isn't a string (caller returns the
-/// operator's empty value without compiling the regex — Python's short-circuit).
-fn regex_input(spec: &Document, ctx: &Ctx) -> Result<Option<String>, Fallback> {
-    let input = match spec.get("input") {
-        Some(e) => eval(e, ctx)?,
-        None => Bson::Null,
+/// The regex operators' `regex` and `options`, checked as mongod 8.2.11
+/// checks them -- BEFORE the input, so they fail beside a null one: `regex` a
+/// string or regex (51105), `options` a string (51106) and not beside a
+/// regex's own flags (51107, an empty string included), no NUL in either
+/// (51109 / 51110), and only the flags `imsxu` (51108). A constant pair fails
+/// while the pipeline is optimized. `Ok(false)` when `regex` is null: the
+/// operator's empty result. Measured 2026-10-22.
+fn check_regex_args(spec: &Document, ctx: &Ctx, op: &str) -> Result<bool, Fallback> {
+    let vars: Vec<String> = ctx.vars.keys().cloned().collect();
+    let constant = ["regex", "options"].iter().all(|k| {
+        spec.get(*k)
+            .is_none_or(|e| crate::aggregate::is_constant_expression(e, &vars))
+    });
+    let fail =
+        |code: i32, message: String| Err(Fallback::mongo(code, message).with_folded(constant));
+    let regex = eval_opt(spec.get("regex"), ctx)?;
+    let options = eval_opt(spec.get("options"), ctx)?;
+    let (pattern, own_flags) = match &regex {
+        v if is_null(v) => return Ok(false),
+        Bson::String(s) => (s.as_str(), ""),
+        Bson::RegularExpression(r) => (r.pattern.as_str(), r.options.as_str()),
+        _ => {
+            return fail(
+                51105,
+                format!("{op} needs 'regex' to be of type string or regex"),
+            )
+        }
     };
-    Ok(match input {
+    let options = match &options {
+        v if is_null(v) => None,
+        Bson::String(s) => Some(s.as_str()),
+        _ => return fail(51106, format!("{op} needs 'options' to be of type string")),
+    };
+    if options.is_some() && !own_flags.is_empty() {
+        return fail(
+            51107,
+            format!("{op}: found regex option(s) specified in both 'regex' and 'option' fields"),
+        );
+    }
+    if pattern.contains('\0') {
+        return fail(
+            51109,
+            format!("{op}: regular expression cannot contain an embedded null byte"),
+        );
+    }
+    let flags = options.unwrap_or(own_flags);
+    if flags.contains('\0') {
+        return fail(
+            51110,
+            format!("{op}: regular expression options cannot contain an embedded null byte"),
+        );
+    }
+    if let Some(bad) = flags.chars().find(|c| !"imsxu".contains(*c)) {
+        return fail(51108, format!("{op} invalid flag in regex options: {bad}"));
+    }
+    Ok(true)
+}
+
+/// The evaluated `input`, or `None` for a null one (the operator's empty
+/// result); anything else that is not a string is 51104.
+fn regex_input(spec: &Document, ctx: &Ctx, op: &str) -> Result<Option<String>, Fallback> {
+    Ok(match eval_opt(spec.get("input"), ctx)? {
         Bson::String(s) => Some(s),
-        Bson::Null => None,
-        // A non-string, non-null input is mongod Location51104 -> Python raises.
-        _ => return Err(Fallback::Defer),
+        v if is_null(&v) => None,
+        _ => {
+            return Err(
+                Fallback::mongo(51104, format!("{op} needs 'input' to be of type string"))
+                    .with_folded(false),
+            )
+        }
     })
 }
 
@@ -7320,7 +7919,10 @@ fn regex_match_doc(m: regexutil::RegexMatch) -> Bson {
 
 fn op_regex_match(arg: &Bson, ctx: &Ctx) -> R {
     let spec = arg.as_document().ok_or(Fallback::Defer)?;
-    let Some(s) = regex_input(spec, ctx)? else {
+    if !check_regex_args(spec, ctx, "$regexMatch")? {
+        return Ok(Bson::Boolean(false));
+    }
+    let Some(s) = regex_input(spec, ctx, "$regexMatch")? else {
         return Ok(Bson::Boolean(false));
     };
     let re = compile_regex(spec, ctx, "$regexMatch")?;
@@ -7329,7 +7931,10 @@ fn op_regex_match(arg: &Bson, ctx: &Ctx) -> R {
 
 fn op_regex_find(arg: &Bson, ctx: &Ctx) -> R {
     let spec = arg.as_document().ok_or(Fallback::Defer)?;
-    let Some(s) = regex_input(spec, ctx)? else {
+    if !check_regex_args(spec, ctx, "$regexFind")? {
+        return Ok(Bson::Null);
+    }
+    let Some(s) = regex_input(spec, ctx, "$regexFind")? else {
         return Ok(Bson::Null);
     };
     let re = compile_regex(spec, ctx, "$regexFind")?;
@@ -7341,7 +7946,10 @@ fn op_regex_find(arg: &Bson, ctx: &Ctx) -> R {
 
 fn op_regex_find_all(arg: &Bson, ctx: &Ctx) -> R {
     let spec = arg.as_document().ok_or(Fallback::Defer)?;
-    let Some(s) = regex_input(spec, ctx)? else {
+    if !check_regex_args(spec, ctx, "$regexFindAll")? {
+        return Ok(Bson::Array(Vec::new()));
+    }
+    let Some(s) = regex_input(spec, ctx, "$regexFindAll")? else {
         return Ok(Bson::Array(Vec::new()));
     };
     let re = compile_regex(spec, ctx, "$regexFindAll")?;
@@ -7353,17 +7961,7 @@ fn op_regex_find_all(arg: &Bson, ctx: &Ctx) -> R {
 
 // --- math ---------------------------------------------------------------
 
-/// The f64 for a unary math operator, deferring bool *and* non-numeric to Python
-/// (which raises Location28765 / 51081 rather than coercing a bool or computing
-/// on a string). Real numbers only; null is handled by the caller.
-fn math_float(v: &Bson) -> Result<f64, Fallback> {
-    if matches!(v, Bson::Boolean(_)) {
-        return Err(Fallback::Defer);
-    }
-    as_float_like(v).ok_or(Fallback::Defer)
-}
-
-/// [`math_float`] that NAMES the type error rather than deferring. Decimal128
+/// The f64 for a unary math operator, naming the type error. Decimal128
 /// still defers -- it is numeric to mongod, so the operator has a real answer
 /// and computing it needs the decimal engine -- but a bool / string / document /
 /// date operand is a type error mongod states, and stating it is the difference
@@ -8083,8 +8681,14 @@ fn op_pow(arg: &Bson, ctx: &Ctx) -> R {
             if let Some(r) = u32::try_from(exp).ok().and_then(|e| base.checked_pow(e)) {
                 return Ok(int_result(r, is_int64(b) || is_int64(e)));
             }
+        } else if base == 1 || base == -1 {
+            // The one integral answer a negative exponent has: mongod keeps
+            // it integral, `{$pow: [1, -5]}` is int32 1 and `[-1, -5]` is -1
+            // (measured 8.2.11, 2026-10-22).
+            let r = if base == 1 || exp % 2 == 0 { 1 } else { -1 };
+            return Ok(int_result(r, is_int64(b) || is_int64(e)));
         }
-        // negative exponent -> float, handled below.
+        // any other negative exponent -> float, handled below.
     }
     let (Some(a), Some(b)) = (as_float_like(&vals[0]), as_float_like(&vals[1])) else {
         return Err(Fallback::Defer);
@@ -8117,7 +8721,7 @@ const INT32_MAX_F: f64 = i32::MAX as f64;
 /// this order, each with its own code:
 ///
 /// 1. `Value::coerceToLong` — a non-numeric (string, bool, ...) is
-///    Location16004, a NaN / Infinity is Location31109.
+///    Location16004, a double NaN / Infinity is Location31109.
 /// 2. `Value::integral()` — Location51082.
 /// 3. the `[-20, 100]` bounds — Location51083.
 ///
@@ -8132,7 +8736,17 @@ fn round_precision(place: &Bson, op: &str) -> Result<Option<i64>, Fallback> {
         // The canonical decimal string parses exactly over the whole region
         // this function can accept; anything it cannot represent is far outside
         // the int32 window and lands on Location51082 either way.
-        Bson::Decimal128(d) => d.to_string().parse::<f64>().unwrap_or(f64::NAN),
+        // A decimal NaN or infinity is not integral (51082): only a DOUBLE
+        // goes through `coerceToLong`'s 31109 first (measured 8.2.11,
+        // 2026-10-22).
+        Bson::Decimal128(d) => {
+            let value = d.to_string().parse::<f64>().unwrap_or(f64::NAN);
+            if value.is_finite() {
+                value
+            } else {
+                f64::MAX
+            }
+        }
         other => {
             return Err(Fallback::mongo(
                 16004,
@@ -8172,25 +8786,67 @@ fn round_precision(place: &Bson, op: &str) -> Result<Option<i64>, Fallback> {
     Ok(Some(n))
 }
 
-fn round_trunc_args(arg: &Bson, ctx: &Ctx, op: &str) -> Result<(Bson, Option<i32>), Fallback> {
-    match arg {
-        Bson::Array(a) if !a.is_empty() => {
-            let n = eval(&a[0], ctx)?;
-            let place = if a.len() > 1 {
-                round_precision(&eval(&a[1], ctx)?, op)?.map(|p| p as i32)
-            } else {
-                Some(0)
-            };
-            Ok((n, place))
-        }
-        Bson::Array(_) => Err(Fallback::Defer),
-        other => Ok((eval(other, ctx)?, Some(0))),
+/// `$round` / `$trunc`'s value and place, in mongod's order (8.2.11,
+/// 2026-10-22): a null or missing value is null before the place is even
+/// looked at (`{$round: [null, 200]}` is null, not 51083), a non-number is
+/// 51081 whatever the place, and only then is the place validated. `None`
+/// means the answer is null.
+fn round_trunc_args(arg: &Bson, ctx: &Ctx, op: &str) -> Result<Option<(Bson, i32)>, Fallback> {
+    let (value, place) = match arg {
+        Bson::Array(a) if !a.is_empty() => (&a[0], a.get(1)),
+        Bson::Array(_) => return Err(Fallback::Defer),
+        other => (other, None),
+    };
+    let n = eval(value, ctx)?;
+    if is_null(&n) {
+        return Ok(None);
     }
+    if !matches!(
+        n,
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+    ) {
+        return Err(Fallback::mongo(
+            51081,
+            format!(
+                "{op} only supports numeric types, not {}",
+                crate::query::bson_type_name(&n)
+            ),
+        ));
+    }
+    let place = match place {
+        // A null precision makes the whole operator null, which is distinct
+        // from a precision of 0.
+        Some(p) => match round_precision(&eval(p, ctx)?, op)? {
+            Some(p) => p as i32,
+            None => return Ok(None),
+        },
+        None => 0,
+    };
+    Ok(Some((n, place)))
 }
 
-// `$round`: round-half-to-even (Python `round`). An int stays an int (unchanged
-// for place >= 0; rounded to the 10^|place| place for place < 0); a double rounds
-// to `place` decimals as a double. Mirrors `expressions._op_round`.
+/// A double rounded as mongod rounds it: converted to a Decimal128 of 34
+/// significant digits, rounded there, and converted back. So it is the
+/// double's exact binary value that rounds, not its shortest decimal text:
+/// `{$round: [2.675, 2]}` is 2.67 and `{$trunc: [1.45, 2]}` 1.44, because
+/// those doubles sit just below 2.675 and 1.45 (measured 8.2.11,
+/// 2026-10-22). `(x * 10^p).round() / 10^p`, which stood here, rounded the
+/// text, lost digits at large magnitudes and overflowed `1e300` to infinity.
+fn double_rounded(x: f64, place: i32, mode: crate::decimal::RoundMode) -> R {
+    if !x.is_finite() {
+        return Ok(Bson::Double(x));
+    }
+    let d = crate::decimal::parse(&format!("{x:.33e}")).ok_or(Fallback::Defer)?;
+    let rounded = crate::decimal::round_to_exp(&d, -place, mode).ok_or(Fallback::Defer)?;
+    crate::decimal::to_string(&rounded)
+        .parse::<f64>()
+        .map(Bson::Double)
+        .map_err(|_| Fallback::Defer)
+}
+
+// `$round`: round-half-to-even. An int stays an int (unchanged for place >= 0;
+// rounded to the 10^|place| place for place < 0); a double rounds through a
+// Decimal128 (`double_rounded`).
 /// `v` rounded half-to-even at `10^power`, entirely in integers.
 ///
 /// `power` is non-negative. Ties go to the even multiple, which is what
@@ -8212,14 +8868,10 @@ fn round_half_even_i128(v: i128, power: i32) -> i128 {
 }
 
 fn op_round(arg: &Bson, ctx: &Ctx) -> R {
-    let (n, place) = round_trunc_args(arg, ctx, "$round")?;
-    let Some(place) = place else {
-        // A null precision makes the whole operator null, which is
-        // distinct from a precision of 0.
+    let Some((n, place)) = round_trunc_args(arg, ctx, "$round")? else {
         return Ok(Bson::Null);
     };
     match n {
-        Bson::Null => Ok(Bson::Null),
         Bson::Int32(_) | Bson::Int64(_) => {
             if place >= 0 {
                 return Ok(n);
@@ -8242,12 +8894,16 @@ fn op_round(arg: &Bson, ctx: &Ctx) -> R {
                     ),
                 ));
             }
+            // mongod widens an int32 result only past int32's TOP: one below
+            // its bottom is cast back to int32 and wraps, so
+            // `{$round: [-2147483648, -1]}` is int32 2147483646 (measured
+            // 8.2.11, 2026-10-22).
+            if matches!(n, Bson::Int32(_)) && rounded <= i32::MAX as i128 {
+                return Ok(Bson::Int32(rounded as i64 as i32));
+            }
             Ok(int_result(rounded, is_int64(&n)))
         }
-        Bson::Double(d) => {
-            let factor = 10f64.powi(place);
-            Ok(Bson::Double((d * factor).round_ties_even() / factor))
-        }
+        Bson::Double(d) => double_rounded(d, place, crate::decimal::RoundMode::HalfEven),
         // The RESULT keeps the requested place as its quantum: `2.567` at
         // place 2 is `2.57`, and `25` at place -1 is `2E+1`.
         v @ Bson::Decimal128(_) => decimal_rounded(&v, -place, crate::decimal::RoundMode::HalfEven),
@@ -8255,18 +8911,13 @@ fn op_round(arg: &Bson, ctx: &Ctx) -> R {
     }
 }
 
-// `$trunc`: truncate toward zero to `place` decimals. Python computes
-// `math.trunc(n * 10**place) / 10**place`, and `/` is float division, so the
-// result is always a double (even for an int input). Mirrors `_op_trunc`.
+// `$trunc`: truncate toward zero to `place` decimals. An integer stays an
+// integer; a double truncates through a Decimal128 (`double_rounded`).
 fn op_trunc(arg: &Bson, ctx: &Ctx) -> R {
-    let (n, place) = round_trunc_args(arg, ctx, "$trunc")?;
-    let Some(place) = place else {
-        // A null precision makes the whole operator null, which is
-        // distinct from a precision of 0.
+    let Some((n, place)) = round_trunc_args(arg, ctx, "$trunc")? else {
         return Ok(Bson::Null);
     };
     match n {
-        Bson::Null => Ok(Bson::Null),
         // Toward ZERO at the requested place, keeping it as the quantum:
         // `2.567` at place 2 is `2.56`, not the `2.57` `$round` gives.
         Bson::Decimal128(_) => decimal_rounded(&n, -place, crate::decimal::RoundMode::Trunc),
@@ -8285,76 +8936,141 @@ fn op_trunc(arg: &Bson, ctx: &Ctx) -> R {
                 };
                 return Ok(int_result(kept, is_int64(&n)));
             }
-            let nf = math_float(&n)?; // bool / non-numeric -> Python (51081)
-            let factor = 10f64.powi(place);
-            let truncated = (nf * factor).trunc() / factor;
-            // Type-preserving, as `$floor` / `$ceil`: dividing by `factor`
-            // made every int result a double (`$trunc` of 1 answered 1.0).
-            match n {
-                Bson::Int32(_) | Bson::Int64(_) => Ok(int_result(truncated as i128, is_int64(&n))),
-                _ => Ok(Bson::Double(truncated)),
-            }
+            let Bson::Double(x) = n else {
+                return Err(Fallback::Defer); // round_trunc_args admits numbers only
+            };
+            double_rounded(x, place, crate::decimal::RoundMode::Trunc)
         }
     }
 }
 
-// The sort key for one `$sortArray` element under a `sortBy` field: the field
-// value for a document element (missing -> null), else the whole element. Mirrors
-// `expressions._make_sort_key`.
+/// A `$sortArray` direction: any number equal to 1 or -1 (`-1.0`,
+/// `Decimal128("-1")` and a long all count, measured 8.2.11).
+fn sort_array_direction(v: &Bson) -> Option<i32> {
+    if !matches!(
+        v,
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+    ) || crate::query::is_nan_bson(v)
+    {
+        return None;
+    }
+    let n = numeric::classify(v)?;
+    [1, -1].into_iter().find(|d| {
+        numeric::classify(&Bson::Int32(*d))
+            .is_some_and(|k| numeric::cmp(&n, &k) == Some(std::cmp::Ordering::Equal))
+    })
+}
+
+/// `$sortArray`'s parse, as mongod 8.2.11 checks it: an object (2942500) of
+/// `input` and `sortBy` (2942501), both present (2942502 / 2942503); `sortBy`
+/// a number that is 1 or -1 (2942506), or a non-empty document whose every
+/// value is (2942505); anything else 2942507. Measured 2026-10-22.
+fn sort_array_parse(arg: &Bson) -> Result<(), Fallback> {
+    let refuse = |code: i32, message: String| Err(Fallback::mongo(code, message).bare());
+    let Bson::Document(d) = arg else {
+        return refuse(
+            2942500,
+            format!(
+                "$sortArray requires an object as an argument, found: {}",
+                type_name(arg)
+            ),
+        );
+    };
+    if let Some(k) = d.keys().find(|k| !matches!(k.as_str(), "input" | "sortBy")) {
+        return refuse(
+            2942501,
+            format!("$sortArray found an unknown argument: {k}"),
+        );
+    }
+    if !d.contains_key("input") {
+        return refuse(
+            2942502,
+            "$sortArray requires 'input' to be specified".into(),
+        );
+    }
+    let Some(sort_by) = d.get("sortBy") else {
+        return refuse(
+            2942503,
+            "$sortArray requires 'sortBy' to be specified".into(),
+        );
+    };
+    match sort_by {
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
+            if sort_array_direction(sort_by).is_none() {
+                return refuse(
+                    2942506,
+                    "The $sort element value must be either 1 or -1".into(),
+                );
+            }
+        }
+        Bson::Document(fields) => {
+            if fields.is_empty() {
+                return refuse(
+                    2942505,
+                    "BadValue: The sort pattern is empty when it should be a set of fields.".into(),
+                );
+            }
+            if fields.values().any(|v| sort_array_direction(v).is_none()) {
+                return refuse(
+                    2942505,
+                    "BadValue: The sort element value must be either 1 or -1".into(),
+                );
+            }
+        }
+        _ => return refuse(
+            2942507,
+            "The $sort is invalid: use 1/-1 to sort the whole element, or {field:1/-1} to sort \
+                 embedded fields"
+                .into(),
+        ),
+    }
+    Ok(())
+}
+
+// The sort key for one `$sortArray` element under a `sortBy` field: the field's
+// value in a document element; anything else -- a scalar, or a document
+// without the field -- is missing, which sorts as null and keeps its place
+// among the others (`[3, 1, {a: 0}]` by `{a: 1}` stays `[3, 1, {a: 0}]` on
+// mongod 8.2.11; this used to sort a scalar by its own value).
 fn sort_array_field_value(elem: &Bson, field: &str) -> Bson {
     match elem {
         Bson::Document(d) => paths::get_path(d, field).cloned().unwrap_or(Bson::Null),
-        other => other.clone(),
+        _ => Bson::Null,
     }
 }
 
-// `$sortArray`: {input, sortBy}. `sortBy` is `1`/`-1` (sort whole elements) or a
-// `{field: dir, …}` document (sort by fields). Sorting uses BSON sort order
-// (`order::cmp`, the same order as `$sort` / Python's `_SortKey`) and is stable.
-// Defers when any sort value isn't totally orderable (bool / NaN / Decimal128 /
-// …) — `order::cmp`'s precondition — matching the "defer to Python" engine
-// contract. Mirrors `expressions._op_sort_array`.
+/// `$sortArray`: `{input, sortBy}` (checked by `sort_array_parse`). `sortBy` is
+/// a direction (sort whole elements) or a `{field: direction, ...}` document;
+/// the sort is BSON order (`order::cmp`) and stable.
 fn op_sort_array(arg: &Bson, ctx: &Ctx) -> R {
     let spec = arg.as_document().ok_or(Fallback::Defer)?;
     let (Some(input), Some(sort_by)) = (spec.get("input"), spec.get("sortBy")) else {
-        return Err(Fallback::Defer); // Python raises: requires {input, sortBy}
+        return Err(Fallback::Defer);
     };
-    let mut out = match eval(input, ctx)? {
-        Bson::Null => return Ok(Bson::Null),
+    let input = eval(input, ctx)?;
+    let mut out = match input {
+        v if is_null(&v) => return Ok(Bson::Null),
         Bson::Array(a) => a,
-        _ => return Err(Fallback::Defer), // Python raises: input must be an array
-    };
-    match sort_by {
-        Bson::Int32(_) | Bson::Int64(_) => {
-            if !out.iter().all(crate::order::is_sortable) {
-                return Err(Fallback::Defer);
-            }
-            let desc = as_int_like(sort_by) == Some(-1);
-            // `cmp(b, a)` for descending keeps equal elements in original order
-            // (stable), matching Python's `sorted(reverse=True)`.
-            out.sort_by(|a, b| {
-                if desc {
-                    crate::order::cmp(b, a)
-                } else {
-                    crate::order::cmp(a, b)
-                }
-            });
+        other => {
+            return Err(Fallback::mongo(
+                2942504,
+                format!(
+                    "The input argument to $sortArray must be an array, but was of type: {}",
+                    type_name(&other)
+                ),
+            )
+            .with_folded(false))
         }
+    };
+    if !out.iter().all(crate::order::is_sortable) {
+        return Err(Fallback::Defer);
+    }
+    match sort_by {
         Bson::Document(fields) => {
-            // bson's Document iterator isn't double-ended, so collect to reverse.
+            // Sort by the last field first, stably, so earlier fields decide.
             let field_list: Vec<(&String, &Bson)> = fields.iter().collect();
-            for (field, _) in &field_list {
-                if !out
-                    .iter()
-                    .all(|e| crate::order::is_sortable(&sort_array_field_value(e, field)))
-                {
-                    return Err(Fallback::Defer);
-                }
-            }
-            // Reversed multi-pass stable sort (sort by the last field first), so
-            // earlier fields take precedence — mirrors the Python impl.
             for (field, direction) in field_list.iter().rev() {
-                let desc = as_int_like(direction) == Some(-1);
+                let desc = sort_array_direction(direction) == Some(-1);
                 out.sort_by(|a, b| {
                     let o = crate::order::cmp(
                         &sort_array_field_value(a, field),
@@ -8368,7 +9084,17 @@ fn op_sort_array(arg: &Bson, ctx: &Ctx) -> R {
                 });
             }
         }
-        _ => return Err(Fallback::Defer), // Python raises: sortBy must be int or document
+        direction => {
+            let desc = sort_array_direction(direction) == Some(-1);
+            // `cmp(b, a)` for descending keeps equal elements in their order.
+            out.sort_by(|a, b| {
+                if desc {
+                    crate::order::cmp(b, a)
+                } else {
+                    crate::order::cmp(a, b)
+                }
+            });
+        }
     }
     Ok(Bson::Array(out))
 }
@@ -8380,12 +9106,30 @@ fn op_date_to_parts(arg: &Bson, ctx: &Ctx) -> R {
         return Err(Fallback::Defer);
     };
     precheck_constant_timezone(d, ctx, None)?;
-    match eval_opt(d.get("date"), ctx)? {
-        Bson::Null => Ok(Bson::Null),
-        Bson::DateTime(dt) => {
+    // mongod 8.2.11 checks `iso8601` first -- a non-boolean is 40521 even
+    // beside a null date -- then answers null for a null one or a null date;
+    // the date may be a Timestamp or an ObjectId, and anything else is 16006.
+    let iso8601 = match d.get("iso8601").map(|e| eval(e, ctx)).transpose()? {
+        None => false,
+        Some(Bson::Boolean(b)) => b,
+        Some(v) if is_null(&v) => return Ok(Bson::Null),
+        Some(v) => {
+            return Err(Fallback::mongo(
+                40521,
+                format!("iso8601 must evaluate to a bool, found {}", type_name(&v)),
+            ))
+        }
+    };
+    let date = eval_opt(d.get("date"), ctx)?;
+    match date_like_ms(&date) {
+        _ if is_null(&date) => Ok(Bson::Null),
+        None => Err(Fallback::mongo(
+            16006,
+            format!("can't convert from BSON type {} to Date", type_name(&date)),
+        )),
+        Some(base) => {
             // A `timezone` shifts the instant into that zone before the parts are
             // read (instant→wall-clock, unambiguous); absent/UTC leaves it in UTC.
-            let base = dt.timestamp_millis();
             let tz = eval_timezone(d.get("timezone"), ctx, None)?;
             if matches!(tz, TzArg::Null) {
                 return Ok(Bson::Null);
@@ -8394,13 +9138,6 @@ fn op_date_to_parts(arg: &Bson, ctx: &Ctx) -> R {
             let days = millis.div_euclid(86_400_000);
             let ms = millis.rem_euclid(86_400_000);
             let (y, m, dy) = civil_from_days(days);
-            let iso8601 = match d.get("iso8601") {
-                None => false,
-                Some(e) => match eval(e, ctx)? {
-                    Bson::Boolean(b) => b,
-                    _ => return Err(Fallback::Defer),
-                },
-            };
             let mut out = Document::new();
             if iso8601 {
                 let (iso_year, iso_week) = iso_year_week(y, m, dy).ok_or(Fallback::Defer)?;
@@ -8422,7 +9159,6 @@ fn op_date_to_parts(arg: &Bson, ctx: &Ctx) -> R {
             out.insert("millisecond".to_string(), Bson::Int32((ms % 1000) as i32));
             Ok(Bson::Document(out))
         }
-        _ => Err(Fallback::Defer),
     }
 }
 
@@ -8695,7 +9431,12 @@ fn op_type(arg: &Bson, ctx: &Ctx) -> R {
             }
         }
     }
-    Ok(Bson::String(type_name(&eval(arg, ctx)?).into()))
+    // Any other operand that evaluates to missing -- a `$meta` mongod has no
+    // value for, a `$getField` of an absent field -- is "missing" too.
+    match eval_field_value(arg, ctx)? {
+        Bson::Undefined => Ok(Bson::String("missing".into())),
+        v => Ok(Bson::String(type_name(&v).into())),
+    }
 }
 
 /// `$isNumber`: true for int / long / double / decimal (not bool).
@@ -9009,9 +9750,12 @@ fn op_index_of(arg: &Bson, ctx: &Ctx, bytes: bool) -> R {
 }
 
 /// A `$substrBytes` index, coerced to a long the way mongod coerces it: a
-/// double truncates, a decimal rounds half to even (`1.5` is 2), and a value
-/// no long holds is 31109. Anything else is not a number. Measured 8.2.11,
-/// 2026-10-20.
+/// double truncates and one no long holds is 31109; a decimal rounds half to
+/// even (`1.5` is 2) and one no long holds -- NaN, an infinity, 1E+20 -- is
+/// `INT64_MIN`, Decimal128's invalid-conversion result, so as a start it is
+/// 50752 "(got: -9223372036854775808)" and as a length it means "to the
+/// end". Anything else is not a number. Measured 8.2.11, 2026-10-20 and
+/// 2026-10-22.
 fn substr_bytes_index(
     v: &Bson,
     code: i32,
@@ -9031,10 +9775,10 @@ fn substr_bytes_index(
         Bson::Int64(n) => Ok(*n),
         Bson::Double(d) if in_range(*d) => Ok(d.trunc() as i64),
         Bson::Double(d) => Err(out_of_range(format_double_g(*d))),
-        Bson::Decimal128(d) => match decimal_as_f64(v) {
-            Some(f) if in_range(f) => Ok(f.round_ties_even() as i64),
-            _ => Err(out_of_range(d.to_string())),
-        },
+        Bson::Decimal128(_) => Ok(crate::decimal::from_bson(v)
+            .and_then(|d| crate::decimal::round_to_exp(&d, 0, crate::decimal::RoundMode::HalfEven))
+            .and_then(|d| crate::decimal::trunc_to_i64(&d))
+            .unwrap_or(i64::MIN)),
         other => Err(wrong_type(
             code,
             &format!("$substrBytes:  {label} must be a numeric type (is BSON type {{}})"),
@@ -9400,6 +10144,9 @@ pub fn py_eq(a: &Bson, b: &Bson) -> Result<bool, Fallback> {
     }
     Ok(match (a, b) {
         (Bson::Null, Bson::Null) => true,
+        // Each is a type with one value (RM-234): with no arm here they fell to
+        // `false`, so `{$eq: [MinKey, MinKey]}` was false and `$ne` true.
+        (Bson::MinKey, Bson::MinKey) | (Bson::MaxKey, Bson::MaxKey) => true,
         // Equal by the active collation when an aggregation or update runs
         // with one. The change-stream diff turns it off first (`diff.rs`):
         // whether a write CHANGED a value is never a collation question.
@@ -9425,14 +10172,16 @@ pub fn py_eq(a: &Bson, b: &Bson) -> Result<bool, Fallback> {
                 true
             }
         }
+        // Field by field IN ORDER, as mongod compares documents (RM-235):
+        // `{b: 1, a: 1}` is not `{a: 1, b: 1}`. Looking each name up in the
+        // other document made them equal.
         (Bson::Document(x), Bson::Document(y)) => {
             if x.len() != y.len() {
                 false
             } else {
-                for (k, xv) in x {
-                    match y.get(k) {
-                        Some(yv) if py_eq(xv, yv)? => {}
-                        _ => return Ok(false),
+                for ((xk, xv), (yk, yv)) in x.iter().zip(y) {
+                    if xk != yk || !py_eq(xv, yv)? {
+                        return Ok(false);
                     }
                 }
                 true

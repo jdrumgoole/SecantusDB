@@ -1,3 +1,4 @@
+# reference-version: 15
 # reference-locale: C.UTF-8
 # --- pattern / regex corners not covered before
 SELECT regexp_replace('a1b2c3', '[0-9]', 'X', 'g'), regexp_replace('aaa', 'a', 'X', 'gi')

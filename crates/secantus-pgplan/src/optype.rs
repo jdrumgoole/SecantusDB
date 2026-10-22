@@ -366,7 +366,15 @@ pub(crate) fn type_in_select(
 }
 
 /// The type an operand has statically, or `None`.
+/// An operand's type, a domain read as its base type (operator resolution
+/// looks through a domain, `getBaseType`): a view column of
+/// `information_schema.sql_identifier` compares as `name`.
 fn operand_type(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
+    let t = operand_type_declared(n, scope)?;
+    Some(crate::domains::domain_base(&t).unwrap_or(t))
+}
+
+fn operand_type_declared(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
     use pg_query::protobuf::a_const::Val;
     match n.node.as_ref()? {
         N::AConst(c) if !c.isnull => match c.val.as_ref()? {

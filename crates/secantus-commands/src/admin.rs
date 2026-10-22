@@ -1818,6 +1818,7 @@ pub(crate) fn listed_indexes(
         ix.remove("numberKeys");
         ix.remove("pythonKeys");
         ix.remove("buildSeq");
+        ix.remove("binDataOrder");
         ix.remove("multikeyPaths");
         *ix = listed_spec(std::mem::take(ix));
     }
@@ -3428,6 +3429,7 @@ pub(crate) const INDEX_CATALOG_ONLY: &[&str] = &[
     "numberKeys",
     "pythonKeys",
     "buildSeq",
+    "binDataOrder",
     "multikeyPaths",
 ];
 
