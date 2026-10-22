@@ -34,3 +34,6 @@ Rust server does **not** have relative to the Python server:
 Everything else — CRUD, aggregation, change streams with pre-images and
 resume, multi-document transactions, indexes (compound, partial, TTL,
 geo), auth/RBAC/TLS, backup/PITR — is at parity.
+
+How much of the server's own source those gauges and the project's test
+suites execute is measured separately, in [Test coverage](coverage.md).
