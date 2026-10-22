@@ -1470,8 +1470,14 @@ jobs:
           files="$files tests/test_rust_pg_corpora.py"
           echo "oracle suites: $files"
           test -n "$files"
+          # --dist worksteal: the default `loadgroup` hands each worker a
+          # fixed share up front, and a few long tests at the end of a share
+          # left three of four workers idle -- run 39749683550 spent 4m44 on
+          # its last 24 tests. None of these files uses `xdist_group`, which
+          # worksteal would not honour. --durations names the long tests, so
+          # the next imbalance is visible in the log instead of guessed.
           PYTHONPATH=tests uv run python -m pytest $files -q -n auto \
-            -p no:cacheprovider -rs
+            --dist worksteal --durations=40 -p no:cacheprovider -rs
 
       # The login rules (TLS options, revocation lists, user name maps,
       # pg_hba.conf) are compared with a PostgreSQL 15 this job runs itself:
