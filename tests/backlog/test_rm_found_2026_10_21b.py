@@ -418,17 +418,26 @@ def test_decimal_hyperbolic_and_trig_edges(rust_mongo: Any, mongod: Any) -> None
 # ------------------------------------------------------------- conversion --
 
 
-@pytest.mark.backlog("RM-246")
+@pytest.mark.backlog_fixed("RM-246")
 def test_convert(rust_mongo: Any, mongod: Any) -> None:
-    """`$convert`: a double just past the int32 range is 241 on mongod, not a
-    clamp, and a string below the smallest normal double is 241, not 0 or a
-    subnormal."""
+    """`$convert`: a double just past the int32 range is 241 on mongod -- the
+    double is range-checked before it truncates -- and a string below the
+    smallest normal double is 241. The Rust server clamped the first and
+    answered 0 or a subnormal for the second."""
     c = lambda inp, to, **kw: {"$convert": {"input": inp, "to": to, **kw}}  # noqa: E731
     shapes = [
         ("2147483647.5 to int", c(2147483647.5, "int")),
         ("-2147483648.9 to int", c(-2147483648.9, "int")),
         ("1e-400 to double", c("1e-400", "double")),
         ("4.9e-324 to double", c("4.9e-324", "double")),
+        ("-2147483648.5 to int", c(-2147483648.5, "int")),
+        ("$toInt 2147483647.5", {"$toInt": 2147483647.5}),
+        ("Decimal 2147483647.5 to int", c(Decimal128("2147483647.5"), "int")),
+        ("-2^63 to long", c(-9.2233720368547758e18, "long")),
+        ("just below DBL_MIN to double", c("2.2250738585072011e-308", "double")),
+        ("DBL_MIN to double", c("2.2250738585072014e-308", "double")),
+        ("-1e-400 to double", c("-1e-400", "double")),
+        ("0e-500 to double", c("0e-500", "double")),
     ]
     assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
 
@@ -604,42 +613,97 @@ def test_date_arithmetic_arguments_and_range(rust_mongo: Any, mongod: Any) -> No
 def test_constant_arguments_are_checked_while_optimizing(rust_mongo: Any, mongod: Any) -> None:
     """mongod evaluates every constant sub-expression when it optimizes the
     pipeline, so an erroring constant fails even in a branch that is never
-    taken, and a constant `$dateToString` format is validated even when the
-    date is null. The Rust server evaluates lazily and answers."""
+    taken. The Rust server evaluates lazily and answers."""
     shapes = [
         ("$cond untaken", {"$cond": [True, 1, {"$divide": [1, 0]}]}),
         ("$ifNull untaken", {"$ifNull": [1, {"$divide": [1, 0]}]}),
         ("$and short circuit", {"$and": [False, {"$divide": [1, 0]}]}),
         ("$map over empty", {"$map": {"input": [], "in": {"$divide": [1, 0]}}}),
-        ("$dateToString bad format null date", {"$dateToString": {"date": None, "format": "%Q"}}),
     ]
     assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
 
 
-@pytest.mark.backlog("RM-252")
-def test_operator_tail_codes(rust_mongo: Any, mongod: Any) -> None:
-    """One shape each, a wrong code, a refusal or a null for a missing value:
-    `$arrayElemAt` of a null array with a bad index, `$percentile` with a
-    Decimal128 `p`, `$meta: "sortKey"` in `$match`, `$getField` of
-    `$$REMOVE`, and `$setField` with a field path for `field`."""
+@pytest.mark.backlog_fixed("RM-251")
+def test_date_to_string_reads_format_first(rust_mongo: Any, mongod: Any) -> None:
+    """`$dateToString` reads `format` before the date: a bad directive or a
+    non-string format fails even beside a null date, and a null format is
+    null even beside a date that is not one."""
+    dts = lambda **kw: {"$dateToString": kw}  # noqa: E731
     shapes = [
-        ("$arrayElemAt null array string index", {"$arrayElemAt": [None, "x"]}),
-        (
-            "$percentile Decimal p",
-            {"$percentile": {"input": [1, 2], "p": [Decimal128("0.5")], "method": "approximate"}},
-        ),
-        ("$meta sortKey in $match", {"$meta": "sortKey"}, None, "$match"),
-        ("$getField of $$REMOVE", {"$getField": {"field": "x", "input": "$$REMOVE"}}),
-        ("$setField field path", {"$setField": {"field": "$s", "input": {}, "value": 1}}),
+        ("bad directive, null date", dts(date=None, format="%Q")),
+        ("int format, null date", dts(date=None, format=5)),
+        ("int format, null field", dts(date="$nul", format=5)),
+        ("int format, missing field", dts(date="$nope", format=5)),
+        ("null format, string date", dts(date="x", format=None)),
+        ("int format, string date", dts(date="x", format=5)),
     ]
     assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
 
 
 @pytest.mark.backlog_fixed("RM-252")
+def test_operator_tail_codes(rust_mongo: Any, mongod: Any) -> None:
+    """`$meta: "sortKey"` is missing in a query filter's `$expr`, `$redact`
+    included and after a `$sort` too, and `[]` in a `$group` with no sort in
+    reach. The Rust server answered 2 "not supported"."""
+    shapes = [
+        ("$meta sortKey in $match", {"$meta": "sortKey"}, None, "$match"),
+        ("$type of sortKey in $match", {"$type": {"$meta": "sortKey"}}, None, "$match"),
+    ]
+    diffs = _diverging(rust_mongo, mongod, shapes)
+    is_missing = {"$expr": {"$eq": [{"$type": {"$meta": "sortKey"}}, "missing"]}}
+    for label, run in (
+        ("find $expr", lambda c: [d["_id"] for d in c.find(is_missing)]),
+        (
+            "$sort then $match",
+            lambda c: [
+                d["_id"] for d in c.aggregate([{"$sort": {"a": 1}}, {"$match": is_missing}])
+            ],
+        ),
+        (
+            "$redact",
+            lambda c: [
+                d["_id"]
+                for d in c.aggregate(
+                    [{"$redact": {"$cond": [is_missing["$expr"], "$$KEEP", "$$PRUNE"]}}]
+                )
+            ],
+        ),
+        (
+            "$group no sort",
+            lambda c: list(c.aggregate([{"$group": {"_id": {"$meta": "sortKey"}}}])),
+        ),
+    ):
+        answers = []
+        for client in (rust_mongo, mongod):
+            coll = _coll(client, "sortkey")
+            coll.drop()
+            coll.insert_many([{"_id": 1, "a": 2}, {"_id": 2, "a": 1}])
+            answers.append(mongo_answer(lambda: run(coll))[:2])  # noqa: B023 -- called at once
+        if answers[0] != answers[1]:
+            diffs.append(f"{label}: mongod {answers[1]}, rust {answers[0]}")
+    assert not diffs, "\n".join(diffs)
+
+
+@pytest.mark.backlog_fixed("RM-252")
 def test_operator_tail_codes_fixed(rust_mongo: Any, mongod: Any) -> None:
     """The `$firstN` family with a NaN or Decimal128 `n`, `$toString` of year
-    1 and `$meta: "randVal"` answer as mongod does."""
+    1, `$meta: "randVal"`, `$arrayElemAt` of a null array with a bad index
+    (null first, then the array, then the index), `$percentile` with a
+    Decimal128 `p`, `$getField` of `$$REMOVE` (missing) and `$setField` with a
+    field path for `field` (4161108) answer as mongod does."""
     shapes = [
+        ("$arrayElemAt null array string index", {"$arrayElemAt": [None, "x"]}),
+        ("$arrayElemAt null array fraction", {"$arrayElemAt": [None, 1.5]}),
+        ("$arrayElemAt missing array string index", {"$arrayElemAt": ["$nope", "x"]}),
+        ("$arrayElemAt scalar string index", {"$arrayElemAt": [5, "x"]}),
+        (
+            "$percentile Decimal p",
+            {"$percentile": {"input": [1, 2], "p": [Decimal128("0.5")], "method": "approximate"}},
+        ),
+        ("$getField of $$REMOVE", {"$getField": {"field": "x", "input": "$$REMOVE"}}),
+        ("$setField field path", {"$setField": {"field": "$s", "input": {}, "value": 1}}),
+        ("$setField $$ROOT path", {"$setField": {"field": "$$ROOT.a", "input": {}, "value": 1}}),
+        ("$unsetField field path", {"$unsetField": {"field": "$s.t", "input": {}}}),
         ("$firstN NaN n", {"$firstN": {"input": [1, 2], "n": float("nan")}}),
         ("$firstN Decimal n", {"$firstN": {"input": [1, 2], "n": Decimal128("1")}}),
         ("$toString year 1", {"$toString": datetime.datetime(1, 1, 1)}),
@@ -684,3 +748,122 @@ def test_bucket_with_non_numeric_boundaries(rust_mongo: Any, mongod: Any) -> Non
         if ours != theirs:
             diffs.append(f"{name}: mongod {theirs}, rust {ours}")
     assert not diffs, "\n".join(diffs)
+
+
+# ------------------------------------------------- found 2026-10-22, later --
+
+
+@pytest.mark.backlog_fixed("RM-255")
+def test_substr_bytes_decimal_indices(rust_mongo: Any, mongod: Any) -> None:
+    """`$substrBytes` / `$substr` coerce a Decimal128 index the way
+    Decimal128 converts to a long: half to even, and a value no long holds
+    (NaN, an infinity, 1E+20) becomes INT64_MIN -- 50752 as a start, "to the
+    end" as a length. The Rust server answered 31109 for all of those."""
+    d = Decimal128
+    shapes = []
+    for op in ("$substrBytes", "$substr"):
+        for v in ("NaN", "1E+20", "-1E+20", "Infinity", "-Infinity", "9223372036854775808"):
+            shapes.append((f"{op} start {v}", {op: ["abcdef", d(v), 2]}))
+            shapes.append((f"{op} length {v}", {op: ["abcdef", 1, d(v)]}))
+        for v in ("3.5", "2.5", "0.9", "-0.5", "9223372036854775807"):
+            shapes.append((f"{op} start {v}", {op: ["abcdef", d(v), 2]}))
+    assert not (diffs := _diverging(rust_mongo, mongod, shapes)), "\n".join(diffs)
+
+
+@pytest.mark.backlog_fixed("RM-256")
+def test_start_of_week_only_matters_for_weeks(rust_mongo: Any, mongod: Any) -> None:
+    """`startOfWeek` is read only for the `week` unit -- except that, in an
+    expression that reads the document, a CONSTANT one is parsed while
+    optimizing whatever the unit: a bad one fails and a null one makes the
+    answer null. The Rust server read it for every unit, so a null field
+    answered null and a wholly constant `startOfWeek: 1` beside `unit: "day"`
+    failed."""
+    doc = {**DOC, "a": datetime.datetime(2026, 1, 1), "b": datetime.datetime(2026, 1, 20)}
+    doc |= {"bad": 1, "xyz": "xyz", "u": "day"}
+    t0, t1 = datetime.datetime(2026, 1, 1), datetime.datetime(2026, 1, 20)
+    shapes = []
+    for sow in (1, "xyz", None, "$bad", "$xyz", "$nul", "mon"):
+        for unit in ("day", "$u", "week"):
+            diff = {
+                "$dateDiff": {"startDate": "$a", "endDate": "$b", "unit": unit, "startOfWeek": sow}
+            }
+            trunc = {"$dateTrunc": {"date": "$b", "unit": unit, "startOfWeek": sow}}
+            shapes.append((f"$dateDiff {unit} {sow!r}", diff, doc))
+            shapes.append((f"$dateTrunc {unit} {sow!r}", trunc, doc))
+        constant = {
+            "$dateDiff": {"startDate": t0, "endDate": t1, "unit": "day", "startOfWeek": sow}
+        }
+        shapes.append((f"constant $dateDiff day {sow!r}", constant))
+    assert not (diffs := _diverging(rust_mongo, mongod, shapes)), "\n".join(diffs)
+
+
+def _group_once(client: Any, acc: dict) -> list:
+    """`acc` as the one accumulator of a `$group` over the `pct` collection."""
+    return list(_coll(client, "pct").aggregate([{"$group": {"_id": None, "z": acc}}]))
+
+
+@pytest.mark.backlog_fixed("RM-257")
+def test_percentile_p_is_a_constant_expression(rust_mongo: Any, mongod: Any) -> None:
+    """`$percentile`'s `p` must be a CONSTANT expression (7750300 for a field
+    path anywhere in it) and is evaluated, so `$literal`, `$concatArrays` and
+    constant elements count; Decimal128 elements are accepted; and a
+    non-string `method` is 14 before anything else. The Rust server read `p`
+    as a literal array of int/long/double and called every bad `method` 2.
+
+    No NaN `p` here: mongod 8.2.12 on Linux x86-64 segfaults on one (its
+    float-to-index cast of NaN reads out of bounds) and takes the reference
+    down for every later test; arm64 answers the lowest value."""
+    p = lambda value, **kw: {  # noqa: E731
+        "$percentile": {"input": [3, 1, 2], "p": value, "method": "approximate", **kw}
+    }
+    shapes = [
+        ("Decimal", p([Decimal128("0.5")])),
+        ("$literal", p({"$literal": [0.25]})),
+        ("$literal scalar", p({"$literal": 0.25})),
+        ("constant element", p([{"$divide": [1, 4]}])),
+        ("constant element out of range", p([{"$divide": [3, 2]}])),
+        ("$concatArrays", p({"$concatArrays": [[0.5]]})),
+        ("field path", p("$arr")),
+        ("field path element", p(["$n"])),
+        ("non-constant element", p([{"$add": ["$n", 0]}])),
+        ("nested array", p([[0.5]])),
+        ("method int", p([0.5], method=1)),
+        ("method null", p([0.5], method=None)),
+        ("$median method int", {"$median": {"input": [1, 2], "method": 1}}),
+        ("bad p and method int", p("$arr", method=1)),
+    ]
+    diffs = _diverging(rust_mongo, mongod, shapes)
+    for client in (rust_mongo, mongod):
+        coll = _coll(client, "pct")
+        coll.drop()
+        coll.insert_many([{"_id": 1, "v": 1}, {"_id": 2, "v": 2}])
+    for label, acc in (
+        (
+            "$group Decimal p",
+            {"$percentile": {"input": "$v", "p": [Decimal128("0.5")], "method": "approximate"}},
+        ),
+        (
+            "$group field-path p",
+            {"$percentile": {"input": "$v", "p": "$v", "method": "approximate"}},
+        ),
+        ("$group method int", {"$median": {"input": "$v", "method": 1}}),
+    ):
+        ours = mongo_answer(lambda: _group_once(rust_mongo, acc))  # noqa: B023 -- called at once
+        theirs = mongo_answer(lambda: _group_once(mongod, acc))  # noqa: B023
+        if ours[:2] != theirs[:2]:
+            diffs.append(f"{label}: mongod {theirs[:2]}, rust {ours[:2]}")
+    assert not diffs, "\n".join(diffs)
+
+
+@pytest.mark.backlog("RM-258")
+def test_date_from_string_five_digit_year(rust_mongo: Any, mongod: Any) -> None:
+    """mongod's timelib reads `"10000-01-01"` as a no-colon time `1000` and
+    the date `0-01-01`, and answers 2000-01-01T09:59:50Z; the Rust port of
+    the same scanner answers 10:00:00. The ten seconds come from a rule after
+    `gnunocolon` that the port does not reproduce."""
+    shapes = [
+        ("10000-01-01", {"$dateFromString": {"dateString": "10000-01-01"}}),
+        ("1000 0-01-01", {"$dateFromString": {"dateString": "1000 0-01-01"}}),
+        ("2000 0-03-04", {"$dateFromString": {"dateString": "2000 0-03-04"}}),
+    ]
+    assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)

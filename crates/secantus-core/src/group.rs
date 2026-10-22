@@ -2106,11 +2106,13 @@ pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<V
 /// are eight different numbers with no pattern between them, so this is a
 /// transcription of a measurement (8.2.11, 2026-09-08), not a rule.
 ///
-/// The ORDER is mongod's IDL field-declaration order -- `input`, then `p` (for
-/// `$percentile`), then `method` -- with an unknown field outranking all of
-/// them. Two consequences that are not guessable: `{$median: {}}` names
-/// `input` and not `method`, and `{$percentile: {input, method: "exact",
-/// p: "x"}}` reports the `p` shape rather than the bad method.
+/// The ORDER is mongod's IDL parse: an unknown field, then a non-string
+/// `method` (14), then a missing field in declaration order -- `input`, `p`
+/// (for `$percentile`), `method` -- then `p`'s value, then `method`'s. Some
+/// consequences that are not guessable: `{$median: {}}` names `input` and not
+/// `method`, `{$percentile: {input, method: "exact", p: "x"}}` reports the
+/// `p` shape rather than the bad method, and `method: 1` outranks a missing
+/// `input`.
 pub fn percentile_spec<'a>(
     arg: &'a Bson,
     op: &str,
@@ -2153,56 +2155,98 @@ pub fn percentile_spec<'a>(
             format!("BSON field '{op}.{field}' is missing but a required field"),
         )
     };
+    // `method` is typed by mongod's IDL parse, before any field is found
+    // missing: a non-string is 14 whatever else is wrong; null counts as
+    // missing (measured 8.2.11, 2026-10-22).
+    let method = spec.get("method").filter(|m| !matches!(m, Bson::Null));
+    if let Some(m) = method.filter(|m| !matches!(m, Bson::String(_))) {
+        return Err(Fallback::mongo(
+            14,
+            format!(
+                "BSON field '{op}.method' is the wrong type '{}', expected type 'string'",
+                crate::query::bson_type_name(m)
+            ),
+        ));
+    }
     let input = spec.get("input").ok_or_else(|| missing("input"))?;
-    let ps = if op == "$median" {
+    let raw_p = if op == "$median" {
         None
     } else {
-        // `p` is read BEFORE `method`, so a bad `p` outranks a bad method.
-        let raw = spec.get("p").ok_or_else(|| missing("p"))?;
-        let bad = |v: &Bson, code: i32| {
-            Fallback::mongo(
-                code,
-                format!(
-                    "The $percentile 'p' field must be an array of numbers from \
-                     [0.0, 1.0], but found: {}",
-                    render(v)
-                ),
-            )
-        };
-        // A non-array AND an EMPTY array are the same code; a bad ELEMENT is
-        // 7750302 (not a number) or 7750303 (out of range).
-        let Bson::Array(items) = raw else {
-            return Err(bad(raw, 7750301));
-        };
-        if items.is_empty() {
-            return Err(bad(raw, 7750301));
-        }
-        let mut parsed = Vec::with_capacity(items.len());
-        for item in items {
-            let f = match item {
-                Bson::Int32(n) => f64::from(*n),
-                Bson::Int64(n) => *n as f64,
-                Bson::Double(d) => *d,
-                other => return Err(bad(other, 7750302)),
-            };
-            if !(0.0..=1.0).contains(&f) {
-                return Err(bad(item, 7750303));
-            }
-            parsed.push(f);
-        }
-        Some(parsed)
+        Some(spec.get("p").ok_or_else(|| missing("p"))?)
     };
-    match spec.get("method") {
-        None => return Err(missing("method")),
-        Some(Bson::String(m)) if m == "approximate" => {}
-        Some(_) => {
-            return Err(Fallback::mongo(
-                2,
-                "Currently only 'approximate' can be used as a percentile 'method'.",
-            ));
-        }
+    let method = method.ok_or_else(|| missing("method"))?;
+    // `p` is checked before `method`'s VALUE, so a bad `p` outranks
+    // `method: "exact"`.
+    let ps = match raw_p {
+        None => None,
+        Some(raw) => Some(percentile_ps(raw)?),
+    };
+    if !matches!(method, Bson::String(m) if m == "approximate") {
+        return Err(Fallback::mongo(
+            2,
+            "Currently only 'approximate' can be used as a percentile 'method'.",
+        ));
     }
     Ok((input, ps))
+}
+
+/// `$percentile`'s `p`, as mongod 8.2.11 reads it (2026-10-22). It must be a
+/// CONSTANT expression -- a field path anywhere in it is 7750300 -- and is
+/// evaluated, so `{$literal: [0.25]}`, `{$concatArrays: [[0.5]]}` and
+/// `[{$divide: [1, 4]}]` all count. The value must be a non-empty array
+/// (7750301) of numbers (7750302) in [0, 1] (7750303); a Decimal128 counts as
+/// its double, and NaN is accepted. With NaN, mongod 8.2.12 on Linux x86-64
+/// SEGFAULTS (`ceil(NaN * n)` cast to an index reads out of bounds;
+/// 2026-10-22, CI), while arm64's cast gives 0 and answers the lowest value.
+/// This server answers the lowest value: there is no answer to match in a
+/// crash.
+fn percentile_ps(raw: &Bson) -> Result<Vec<f64>, Fallback> {
+    const ARRAY_OF_NUMBERS: &str =
+        "The $percentile 'p' field must be an array of numbers from [0.0, 1.0], but found: ";
+    if !crate::aggregate::is_constant_expression(raw, &[]) {
+        return Err(Fallback::mongo(
+            7750300,
+            format!(
+                "The $percentile 'p' field must be an array of constant values, but found \
+                 value: {}.",
+                crate::update::render_shell(raw)
+            ),
+        ));
+    }
+    let value = crate::expressions::evaluate(&Document::new(), raw, &Document::new())?;
+    let items = match &value {
+        Bson::Array(items) if !items.is_empty() => items,
+        other => {
+            return Err(Fallback::mongo(
+                7750301,
+                format!("{ARRAY_OF_NUMBERS}{}", render(other)),
+            ))
+        }
+    };
+    let mut parsed = Vec::with_capacity(items.len());
+    for item in items {
+        let element = || crate::aggregate::render_value_compact(item);
+        let f = match item {
+            Bson::Int32(n) => f64::from(*n),
+            Bson::Int64(n) => *n as f64,
+            Bson::Double(d) => *d,
+            Bson::Decimal128(d) => d.to_string().parse::<f64>().unwrap_or(f64::NAN),
+            _ => {
+                return Err(Fallback::mongo(
+                    7750302,
+                    format!("{ARRAY_OF_NUMBERS}{}", element()),
+                ))
+            }
+        };
+        if !f.is_nan() && !(0.0..=1.0).contains(&f) {
+            return Err(Fallback::mongo(
+                7750303,
+                format!("{ARRAY_OF_NUMBERS}{}", element()),
+            ));
+        }
+        parsed.push(f);
+    }
+    Ok(parsed)
 }
 
 /// mongod's rendering of a value inside these messages: a string is quoted,

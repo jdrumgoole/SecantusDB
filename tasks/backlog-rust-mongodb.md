@@ -551,6 +551,9 @@ RM-243, RM-244 and RM-248 (in the harness, 98 wrong values became 34).
 RM-249 followed: the server now answers time-zone questions from mongod's
 own timezonedb (`crates/secantus-core/tzdata/`), and `tools/probes/time_zones.py`
 finds no difference on any of 601 names.
+A fourth batch closed RM-246 and RM-252 and part of RM-251, and filed and
+fixed RM-255 to RM-257 (in the harness, 63 wrong codes became 13); RM-258
+was filed open.
 
 - [ ] **Decimal128 transcendentals beyond the authorised last digit.** Tiny
   operands underflow to 0 in `$sinh` / `$tanh` / `$atanh` (between 1E-75
@@ -559,26 +562,22 @@ finds no difference on any of 601 names.
   1E+34 are 2 "not supported" instead of Infinity / 1.
   Backlog-ID: RM-245
   Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_decimal_hyperbolic_and_trig_edges
-- [ ] **`$convert` clamps and underflows.** A double just past the int32
-  range (2147483647.5) clamps instead of 241, and a string below the
-  smallest normal double is 0 or a subnormal instead of 241. (Its `to`
-  shapes and a missing `onError` value were fixed on 2026-10-22.)
-  Backlog-ID: RM-246
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_convert
 - [ ] **Constant sub-expressions are not evaluated while optimizing.** mongod
   folds every constant sub-expression first, so `{$cond: [true, 1, {$divide:
   [1, 0]}]}`, `$ifNull`, a short-circuited `$and` and `$map` over `[]` with
-  an erroring body all fail on mongod and answer here; a constant invalid
-  `$dateToString` format is checked even when the date is null.
+  an erroring body all fail on mongod and answer here. (`$dateToString`
+  reading its `format` before the date was fixed on 2026-10-22.)
   Backlog-ID: RM-251
   Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_constant_arguments_are_checked_while_optimizing
-- [ ] **Operator tail: one shape each.** `$arrayElemAt` of a null array
-  with a string index (null vs 28690); `$percentile` with a Decimal128 `p`
-  (a value vs 7750302); `$meta: "sortKey"` inside `$match` (a value vs 2);
-  `$getField` of `$$REMOVE` (missing vs null); `$setField` with a field
-  path for `field` (4161108 vs a value).
-  Backlog-ID: RM-252
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_operator_tail_codes
+- [ ] **`$dateFromString` of a five-digit year is ten seconds out.**
+  `"10000-01-01"` is read by timelib as the no-colon time `1000` and the
+  date `0-01-01`; mongod answers 2000-01-01T09:59:50Z and the Rust port of
+  the scanner 10:00:00 (so does `"1000 0-01-01"`, and `"2000 0-03-04"` is
+  19:59:50 on mongod). Some rule after `gnunocolon` in timelib's
+  `parse_date.re` subtracts the ten seconds and the port does not; found by
+  `tools/probes/expression_shapes.py`, not yet traced.
+  Backlog-ID: RM-258
+  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_date_from_string_five_digit_year
 - [ ] **`$bucket` with non-numeric boundaries.** mongod emits the buckets in
   `_id` order, so a string `default` comes before date buckets; here it
   comes last. Decimal128 or mixed numeric boundaries are 2 "not supported".

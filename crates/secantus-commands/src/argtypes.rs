@@ -2172,54 +2172,12 @@ fn percentile_field_problem(op: &str, spec: &bson::Document) -> Option<(i32, Str
     if op != "$median" && op != "$percentile" {
         return None;
     }
-    let missing = |field: &str| {
-        Some((
-            40414,
-            format!("BSON field '{op}.{field}' is missing but a required field"),
-        ))
-    };
-    if !spec.contains_key("input") {
-        return missing("input");
-    }
-    if op == "$percentile" {
-        let Some(raw) = spec.get("p") else {
-            return missing("p");
-        };
-        let bad = |v: &Bson, code: i32| {
-            Some((
-                code,
-                format!(
-                    "The $percentile 'p' field must be an array of numbers from \
-                     [0.0, 1.0], but found: {}",
-                    render_stage_value(v)
-                ),
-            ))
-        };
-        let Bson::Array(items) = raw else {
-            return bad(raw, 7750301);
-        };
-        if items.is_empty() {
-            return bad(raw, 7750301);
+    // One validator for both positions and for the evaluator: the core's.
+    match secantus_core::percentile_spec(&Bson::Document(spec.clone()), op) {
+        Err(secantus_core::fallback::Fallback::Mongo { code, message, .. }) => {
+            Some((code, message))
         }
-        for item in items {
-            let f = match item {
-                Bson::Int32(n) => f64::from(*n),
-                Bson::Int64(n) => *n as f64,
-                Bson::Double(d) => *d,
-                other => return bad(other, 7750302),
-            };
-            if !(0.0..=1.0).contains(&f) {
-                return bad(item, 7750303);
-            }
-        }
-    }
-    match spec.get("method") {
-        None => missing("method"),
-        Some(Bson::String(m)) if m == "approximate" => None,
-        Some(_) => Some((
-            2,
-            "Currently only 'approximate' can be used as a percentile 'method'.".to_string(),
-        )),
+        _ => None,
     }
 }
 
