@@ -88,6 +88,7 @@ VIEWS = [
     "pg_catalog.pg_group",
     "pg_catalog.pg_seclabels",
     "pg_catalog.pg_shadow",
+    "pg_catalog.pg_stats",
 ]
 
 # Tables whose rows are PostgreSQL's built-in objects and nothing else on a

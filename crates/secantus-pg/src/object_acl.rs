@@ -131,7 +131,15 @@ impl PgHandler {
                     })
                     .unwrap_or_default()
             }
-            ("function", _) => vec![("PUBLIC".into(), vec!["EXECUTE".into()], vec![])],
+            // `acldefault`: PUBLIC's EXECUTE, then the owner's.
+            ("function", key) => vec![
+                ("PUBLIC".into(), vec!["EXECUTE".into()], vec![]),
+                (
+                    self.object_owner("function", key),
+                    vec!["EXECUTE".into()],
+                    vec![],
+                ),
+            ],
             _ => Vec::new(),
         }
     }
@@ -176,6 +184,88 @@ impl PgHandler {
             }
             if let Some(i) = item(&grantee, &privs, &options) {
                 items.push(Bson::String(i));
+            }
+        }
+        Bson::Array(items)
+    }
+
+    /// A routine's `proacl`: NULL (the default, `=X/owner,owner=X/owner`)
+    /// until a GRANT or REVOKE records one, then the owner's EXECUTE after
+    /// PUBLIC's while PUBLIC still holds the default's grant, and every
+    /// other grantee in the order it was granted.
+    pub(crate) fn function_acl(&self, key: &str, owner: &str) -> Bson {
+        if self.object_acl_doc("function", key).is_none() {
+            return Bson::Null;
+        }
+        let quoted = |n: &str| {
+            if n.eq_ignore_ascii_case("PUBLIC") {
+                String::new()
+            } else {
+                secantus_pgplan::scalar::quote_identifier(n)
+            }
+        };
+        let owner_q = quoted(owner);
+        let grants = self.object_grants("function", key);
+        let item = |grantee: &str, privs: &[String], options: &[String]| -> Option<Bson> {
+            privs.iter().any(|p| p == "EXECUTE").then(|| {
+                let star = if options.iter().any(|p| p == "EXECUTE") {
+                    "*"
+                } else {
+                    ""
+                };
+                Bson::String(format!("{}=X{star}/{owner_q}", quoted(grantee)))
+            })
+        };
+        // In the ACL's own order; one recorded before the owner's entry was
+        // kept shows the owner where `acldefault` puts it.
+        let mut items: Vec<Bson> = grants
+            .iter()
+            .filter_map(|(grantee, privs, options)| item(grantee, privs, options))
+            .collect();
+        if !grants.iter().any(|(g, _, _)| g == owner) {
+            let public_first = grants
+                .first()
+                .is_some_and(|(g, _, _)| g.eq_ignore_ascii_case("PUBLIC"));
+            let at = usize::from(public_first).min(items.len());
+            items.insert(at, Bson::String(format!("{owner_q}=X/{owner_q}")));
+        }
+        Bson::Array(items)
+    }
+
+    /// A sequence's `relacl`: NULL (the default) until a GRANT or REVOKE
+    /// records one, then the owner's `rwU` and each grantee's privileges,
+    /// granted by the owner, in `ACL_ALL_RIGHTS_STR` order.
+    pub(crate) fn sequence_acl(&self, name: &str, owner: &str) -> Bson {
+        if self.object_acl_doc("sequence", name).is_none() {
+            return Bson::Null;
+        }
+        let quoted = |n: &str| {
+            if n.eq_ignore_ascii_case("PUBLIC") {
+                String::new()
+            } else {
+                secantus_pgplan::scalar::quote_identifier(n)
+            }
+        };
+        let owner_q = quoted(owner);
+        let mut items = vec![Bson::String(format!("{owner_q}=rwU/{owner_q}"))];
+        for (grantee, privs, options) in self.object_grants("sequence", name) {
+            if grantee == owner {
+                continue;
+            }
+            let mut letters = String::new();
+            for (word, letter) in [("SELECT", 'r'), ("UPDATE", 'w'), ("USAGE", 'U')] {
+                if privs.iter().any(|p| p == word) {
+                    letters.push(letter);
+                    if options.iter().any(|p| p == word) {
+                        letters.push('*');
+                    }
+                }
+            }
+            if !letters.is_empty() {
+                items.push(Bson::String(format!(
+                    "{}={letters}/{owner_q}",
+                    quoted(&grantee)
+                )));
             }
         }
         Bson::Array(items)
@@ -319,7 +409,11 @@ impl PgHandler {
                 }
                 // Already the catalog key: the planner resolved the RangeVar.
                 "sequence" => object.clone(),
-                _ => self.function_acl_key(object)?,
+                _ => {
+                    let key = self.function_acl_key(object)?;
+                    self.check_routine_kind(&key, written_kind)?;
+                    key
+                }
             };
             let mut grants = self.object_grants(kind, &name);
             for grantee in grantees {
@@ -373,6 +467,28 @@ impl PgHandler {
             )?;
         }
         Ok(())
+    }
+
+    /// `LookupFuncWithArgs`' kind check: `ON FUNCTION` names no procedure
+    /// and `ON PROCEDURE` no function (42809).
+    fn check_routine_kind(&self, key: &str, written_kind: &str) -> PgWireResult<()> {
+        let Some(f) = self.functions()?.into_iter().find(|f| f.key == key) else {
+            return Ok(());
+        };
+        let wrong = match written_kind {
+            "function" if f.is_procedure => "function",
+            "procedure" if !f.is_procedure => "procedure",
+            _ => return Ok(()),
+        };
+        let args: Vec<String> = f
+            .param_types
+            .iter()
+            .map(|t| self.display_type_name(t))
+            .collect();
+        Err(Self::user_error(
+            "42809",
+            format!("{}({}) is not a {wrong}", f.name, args.join(", ")),
+        ))
     }
 
     /// A signature as text (`'s.f(integer, text)'`) in the planner's

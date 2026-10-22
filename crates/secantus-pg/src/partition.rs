@@ -925,6 +925,7 @@ impl PgHandler {
             .map_err(|e| {
                 let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate, e.message);
                 info.detail = e.detail;
+                info.hint = e.hint;
                 PgWireError::UserError(Box::new(info))
             })
     }

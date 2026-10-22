@@ -67,6 +67,7 @@ mod live_notices;
 mod lock_manager;
 mod merge;
 mod object_acl;
+mod owned;
 mod partition;
 mod pg15_settings;
 mod pg_type_facts;
@@ -83,6 +84,7 @@ mod scan_partitions;
 mod schema_rows;
 mod scram_binding;
 mod server;
+mod statistic;
 mod stream_join;
 mod system_catalogs;
 mod table_locks;
@@ -1758,6 +1760,7 @@ impl plpgsql_fn::Host for PlHost<'_> {
     ) -> Result<u64, plpgsql_fn::PlError> {
         self.check_volatility(sql, params, types)?;
         let stmt = self.plan(sql, params, types)?;
+        let changes_catalog = PgHandler::may_change_catalog(&stmt);
         let _nested = NestedStatement::enter(self.h);
         // A nested CALL keeps the non-atomic context, and its statements
         // join the transaction themselves (holding the guard across it would
@@ -1777,6 +1780,13 @@ impl plpgsql_fn::Host for PlHost<'_> {
                 })
             })?
         };
+        // The planner's catalog was published for the statement around this
+        // one: a DDL here republishes it, so the next statement of the same
+        // body sees what this one created or dropped (a DROP VIEW, then a
+        // DROP TABLE of what the view read).
+        if changes_catalog {
+            self.h.install_user_types();
+        }
         Ok(responses
             .iter()
             .filter_map(|r| match r {
@@ -2795,7 +2805,8 @@ impl PgHandler {
                 None,
             )
             .map_err(|e| Self::storage_err("could not drop the role", e))?;
-        Ok(())
+        // `DropSetting`: the role's `ALTER ROLE ... SET` defaults go with it.
+        self.drop_role_settings(bson::doc! {"role": name})
     }
 
     /// Apply a `CREATE / ALTER ROLE` option list to a role.
@@ -2871,6 +2882,19 @@ impl PgHandler {
     /// (`grantee=privs/grantor`, `*` after a privilege held WITH GRANT
     /// OPTION, an empty grantee for PUBLIC).
     fn relation_acl(&self, relname: &str, kind: &str) -> Bson {
+        if kind == "S" {
+            let owner = self
+                .sequence_doc(relname)
+                .ok()
+                .flatten()
+                .and_then(|d| d.get_str("owner").ok().map(str::to_string))
+                .or_else(|| {
+                    self.role_by_name_or_oid(&Bson::Int64(RoleInfo::BOOTSTRAP_OID))
+                        .ok()
+                })
+                .unwrap_or_default();
+            return self.sequence_acl(relname, &owner);
+        }
         if !matches!(kind, "r" | "v" | "m" | "p" | "f") {
             return Bson::Null;
         }
@@ -17931,6 +17955,7 @@ impl PgHandler {
                     .map(|d| d.to_vec())
                     .unwrap_or_default();
                 let row_types = self.composites().unwrap_or_default();
+                let type_owners = self.type_owner_oids();
                 let mut rows = Vec::new();
                 let indexes = self.index_relations();
                 let matviews: Vec<String> = self
@@ -17986,7 +18011,9 @@ impl PgHandler {
                         f("relpersistence"),
                         if t.temp {
                             "t"
-                        } else if t.extra.get_bool("unlogged").unwrap_or(false) {
+                        } else if t.extra.get_bool("unlogged").unwrap_or(false)
+                            || t.extra.get_str("relpersistence") == Ok("u")
+                        {
                             "u"
                         } else {
                             "p"
@@ -17995,6 +18022,12 @@ impl PgHandler {
                     let (rls, forced) = self.row_security(&t.name);
                     d.insert(f("relrowsecurity"), rls);
                     d.insert(f("relforcerowsecurity"), forced);
+                    // `ALTER TABLE ... SET (...)`'s options.
+                    if let (Ok(options), Some(field)) =
+                        (t.extra.get_array("reloptions"), def.field_of("reloptions"))
+                    {
+                        d.insert(field, Bson::Array(options.clone()));
+                    }
                     rows.push(d);
                 }
                 for ix in &indexes {
@@ -18013,7 +18046,11 @@ impl PgHandler {
                     d.insert(f("relnatts"), Bson::Int32(ix.keys.len() as i32));
                     d.insert(f("relhasindex"), false);
                     d.insert(f("reltuples"), Bson::Double(-1.0));
-                    d.insert(f("relowner"), Bson::Int64(10));
+                    // An index is its table's owner's.
+                    d.insert(
+                        f("relowner"),
+                        Bson::Int64(owner_oid(ix.table.extra.get_str("owner").ok())),
+                    );
                     d.insert(f("relpersistence"), if ix.table.temp { "t" } else { "p" });
                     d.insert(f("relrowsecurity"), false);
                     d.insert(f("relforcerowsecurity"), false);
@@ -18128,7 +18165,16 @@ impl PgHandler {
                     d.insert(f("relnatts"), Bson::Int32(fields.len() as i32));
                     d.insert(f("relhasindex"), false);
                     d.insert(f("reltuples"), Bson::Double(-1.0));
-                    d.insert(f("relowner"), Bson::Int64(10));
+                    // A composite type's relation is its type's owner's.
+                    d.insert(
+                        f("relowner"),
+                        Bson::Int64(
+                            type_owners
+                                .iter()
+                                .find(|(n, _)| *n == bare || *n == name)
+                                .map_or(10, |(_, o)| *o),
+                        ),
+                    );
                     d.insert(f("relpersistence"), "p");
                     d.insert(f("relrowsecurity"), false);
                     d.insert(f("relforcerowsecurity"), false);
@@ -19041,6 +19087,21 @@ impl PgHandler {
                             .and_then(|o| roles.iter().find(|r| r.name == o))
                             .map_or(10, |r| r.oid);
                         row.insert(f("proowner"), Bson::Int64(owner));
+                        if let Some(field) = def.field_of("proacl") {
+                            let owner_name = roles
+                                .iter()
+                                .find(|r| r.oid == owner)
+                                .map(|r| r.name.clone())
+                                .or_else(|| self.role_by_name_or_oid(&Bson::Int64(owner)).ok())
+                                .unwrap_or_default();
+                            row.insert(
+                                field,
+                                self.function_acl(
+                                    d.get_str("_id").unwrap_or_default(),
+                                    &owner_name,
+                                ),
+                            );
+                        }
                         row.insert(f("prolang"), Bson::Int64(lang));
                         row.insert(
                             f("prokind"),
@@ -19462,6 +19523,18 @@ impl PgHandler {
                             def.field_of("atttypmod").expect("column"),
                             Bson::Int32(c.typmod),
                         );
+                        // `ALTER COLUMN ... SET STORAGE / STATISTICS`.
+                        if let (Ok(storage), Some(field)) =
+                            (c.extra.get_str("attstorage"), def.field_of("attstorage"))
+                        {
+                            d.insert(field, storage);
+                        }
+                        if let (Ok(target), Some(field)) = (
+                            c.extra.get_i32("attstattarget"),
+                            def.field_of("attstattarget"),
+                        ) {
+                            d.insert(field, Bson::Int32(target));
+                        }
                         let generated = c.extra.get_str("generated").is_ok();
                         d.insert(
                             def.field_of("atthasdef").expect("column"),
@@ -20444,8 +20517,27 @@ impl PgHandler {
         // reads it like a one-row table. Checked only after the catalog misses,
         // so the ordinary table path costs nothing; not cached either, because
         // its one row changes on every `nextval`.
+        // Planning runs with the open block's transaction unbound, so a
+        // sequence the block wrote is read through that transaction.
         if def.is_none() {
-            if let Ok(Some(_)) = self.sequence_doc(name) {
+            let written_here =
+                !self.storage.in_user_txn() && self.pending.sequences().contains(name);
+            let found = if written_here {
+                match self.txn.try_lock() {
+                    Ok(mut guard) => match guard.as_mut() {
+                        Some(handle) => self
+                            .storage
+                            .with_user_transaction(handle, || self.sequence_doc_here(name))
+                            .ok()
+                            .and_then(|r| r.ok()),
+                        None => self.sequence_doc(name).ok(),
+                    },
+                    Err(_) => self.sequence_doc(name).ok(),
+                }
+            } else {
+                self.sequence_doc(name).ok()
+            };
+            if let Some(Some(_)) = found {
                 return Some(Self::sequence_table_def(name));
             }
         }
@@ -24355,6 +24447,47 @@ impl PgHandler {
             A::OwnerTo(role) => {
                 return Ok(Some(A::OwnerTo(self.grantee_name(role)?)));
             }
+            A::SetPersistence(_) | A::RelOptions(_) => return Ok(Some(action.clone())),
+            // `ATExecSetStorage`: a fixed-length type is only ever PLAIN.
+            A::ColumnStorage { column, storage } => {
+                let Some(c) = def.column(column) else {
+                    return Err(missing_column(column));
+                };
+                let fixed = secantus_pgplan::pgtypes::oid_of_name(&c.pg_type)
+                    .and_then(|oid| pg_type_facts::builtin(oid, "typlen"))
+                    .and_then(|v| bson_i64(&v))
+                    .is_some_and(|len| len > 0);
+                if fixed && *storage != 'p' {
+                    return Err(Self::user_error(
+                        "0A000",
+                        format!(
+                            "column data type {} can only have storage PLAIN",
+                            self.display_type_name(&c.pg_type)
+                        ),
+                    ));
+                }
+                return Ok(Some(action.clone()));
+            }
+            // `ATExecSetStatistics`: -1 (the default) up to 10,000.
+            A::ColumnStatistics { column, target } => {
+                if def.column(column).is_none() {
+                    return Err(missing_column(column));
+                }
+                if *target < -1 {
+                    return Err(Self::user_error(
+                        "22023",
+                        format!("statistics target {target} is too low"),
+                    ));
+                }
+                if *target > 10_000 {
+                    self.warning("22023", "lowering statistics target to 10000".into());
+                    return Ok(Some(A::ColumnStatistics {
+                        column: column.clone(),
+                        target: 10_000,
+                    }));
+                }
+                return Ok(Some(action.clone()));
+            }
             // `ATExecAddIdentity`, in its order.
             A::AddIdentity { column, .. } => {
                 let Some(c) = def.column(column) else {
@@ -24621,7 +24754,11 @@ impl PgHandler {
                 self.set_trigger_enabled(table, name.as_deref(), *enabled)
             }
             A::RuleEnabled { name, enabled } => self.set_rule_enabled(table, name, *enabled),
-            A::ForeignOptions(_) => Ok(()),
+            A::ForeignOptions(_)
+            | A::SetPersistence(_)
+            | A::RelOptions(_)
+            | A::ColumnStorage { .. }
+            | A::ColumnStatistics { .. } => Ok(()),
             // The identity's sequence, owned by the column, typed by it.
             A::AddIdentity {
                 column, options, ..
@@ -24663,7 +24800,23 @@ impl PgHandler {
                 check.not_valid = false;
                 self.apply_alter_rows(table, def, &A::AddCheck(check), before)
             }
-            A::OwnerTo(_) | A::ClusterOn(_) => Ok(()),
+            // `ATExecChangeOwner`: the sequences the table's columns own
+            // change owner with it.
+            A::OwnerTo(role) => {
+                let prefix = format!("{table}.");
+                for seq in self.all_sequence_docs()? {
+                    if seq
+                        .get_str("owned_by")
+                        .is_ok_and(|o| o.strip_prefix(&prefix).is_some_and(|c| !c.contains('.')))
+                    {
+                        if let Ok(name) = seq.get_str("_id") {
+                            self.set_sequence_owner(name, role)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            A::ClusterOn(_) => Ok(()),
             A::AddUnique(uq) => {
                 self.check_existing_unique(
                     table,
@@ -25527,6 +25680,28 @@ impl PgHandler {
     fn has_table_catalog(&self, name: &str) -> bool {
         self.all_table_defs()
             .is_ok_and(|defs| defs.iter().any(|d| d.name == name))
+    }
+
+    /// `ATExecChangeOwner`: a sequence a column owns changes owner only
+    /// with its table (0A000).
+    fn refuse_linked_sequence_owner(&self, name: &str) -> PgWireResult<()> {
+        let linked = self
+            .sequence_doc(name)?
+            .and_then(|d| d.get_str("owned_by").ok().map(str::to_string))
+            .and_then(|o| o.rsplit_once('.').map(|(t, _)| t.to_string()))
+            .filter(|t| !t.is_empty());
+        if let Some(table) = linked {
+            let mut info = ErrorInfo::new(
+                "ERROR".into(),
+                "0A000".into(),
+                format!("cannot change owner of sequence \"{name}\""),
+            );
+            info.detail = Some(format!(
+                "Sequence \"{name}\" is linked to table \"{table}\"."
+            ));
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+        Ok(())
     }
 
     /// `ALTER TABLE / SEQUENCE s OWNER TO r`: the sequence's owner, on its
@@ -32016,7 +32191,9 @@ impl PgHandler {
             | Statement::RenameColumn { .. } => "ALTER TABLE",
             Statement::CreateSequence { .. } => "CREATE SEQUENCE",
             Statement::DropSequence { .. } => "DROP SEQUENCE",
-            Statement::AlterSequence { .. } => "ALTER SEQUENCE",
+            Statement::AlterSequence { .. } | Statement::AlterSequenceOwner { .. } => {
+                "ALTER SEQUENCE"
+            }
             Statement::DropTable(_) => "DROP TABLE",
             Statement::CreateIndex(_) => "CREATE INDEX",
             Statement::DropIndex { .. } => "DROP INDEX",
@@ -32084,6 +32261,10 @@ impl PgHandler {
             Statement::CreateRole { .. } => "CREATE ROLE",
             Statement::AlterRole { .. } => "ALTER ROLE",
             Statement::DropRole { .. } => "DROP ROLE",
+            Statement::AlterRoleSet { .. } => "ALTER ROLE",
+            Statement::AlterSchemaOwner { .. } => "ALTER SCHEMA",
+            Statement::ReassignOwned { .. } => "REASSIGN OWNED",
+            Statement::DropOwned { .. } => "DROP OWNED",
             Statement::CreateExtension { .. } => "CREATE EXTENSION",
             Statement::DropExtension { .. } => "DROP EXTENSION",
             Statement::Comment { .. } => "COMMENT",
@@ -33349,6 +33530,8 @@ impl PgHandler {
                     ))));
                 }
                 self.databases.remove(&self.storage, &info.name)?;
+                // `DropSetting`: every `ALTER ROLE ... IN DATABASE` of it.
+                self.drop_role_settings(bson::doc! {"database": &info.name})?;
                 Ok(vec![Response::Execution(Tag::new("DROP DATABASE"))])
             }
 
@@ -33428,10 +33611,38 @@ impl PgHandler {
                             }
                         })
                         .collect();
+                    // The routines it holds.
+                    let in_schema: HashSet<String> = self
+                        .type_catalog_docs(Self::FUNCTION_COLLECTION)?
+                        .iter()
+                        .filter(|d| d.get_str("schema") == Ok(name.as_str()))
+                        .filter_map(|d| d.get_str("_id").ok().map(str::to_string))
+                        .collect();
+                    let routines: Vec<UserFunction> = self
+                        .functions()?
+                        .into_iter()
+                        .filter(|f| in_schema.contains(&f.key))
+                        .collect();
+                    descs.extend(routines.iter().map(|f| {
+                        let args: Vec<String> = f
+                            .param_types
+                            .iter()
+                            .map(|t| self.display_type_name(t))
+                            .collect();
+                        let kind = if f.is_procedure {
+                            "procedure"
+                        } else {
+                            "function"
+                        };
+                        // `format_procedure`'s form: no blank after a comma.
+                        format!("{kind} {name}.{}({})", f.name, args.join(","))
+                    }));
                     // The relations it holds, stored as `schema.name`.
                     let relations = self.schema_relations(name)?;
                     descs.extend(relations.iter().map(|(kind, key)| format!("{kind} {key}")));
-                    if (!members.is_empty() || !relations.is_empty()) && !cascade {
+                    if (!members.is_empty() || !relations.is_empty() || !routines.is_empty())
+                        && !cascade
+                    {
                         let mut info = ErrorInfo::new(
                             "ERROR".into(),
                             "2BP01".into(),
@@ -33450,6 +33661,10 @@ impl PgHandler {
                     }
                     self.cascade_notice(&descs);
                     self.drop_schema_relations(&relations)?;
+                    for f in &routines {
+                        self.delete_type_doc(Self::FUNCTION_COLLECTION, &f.key)?;
+                        self.drop_object_acl("function", &f.key)?;
+                    }
                     for (coll, id) in &members {
                         self.delete_type_doc(coll, id)?;
                     }
@@ -34711,6 +34926,7 @@ impl PgHandler {
                             ));
                         };
                         let owner = self.grantee_name(role)?;
+                        self.refuse_linked_sequence_owner(&table)?;
                         self.set_sequence_owner(&table, &owner)?;
                     }
                     return Ok(vec![Response::Execution(Tag::new("ALTER TABLE"))]);
@@ -36266,6 +36482,11 @@ impl PgHandler {
                         ))));
                     }
                 }
+                // `checkSharedDependencies`, for each role before any is
+                // dropped.
+                for name in &to_drop {
+                    self.check_role_unreferenced(name)?;
+                }
                 for name in &to_drop {
                     self.delete_role(name)?;
                 }
@@ -36937,6 +37158,65 @@ impl PgHandler {
                 Ok(vec![Response::Execution(Tag::new("SET"))])
             }
 
+            Statement::AlterSchemaOwner { name, owner } => {
+                if !self.namespaces().iter().any(|(n, _)| *n == name) {
+                    return Err(Self::user_error(
+                        "3F000",
+                        format!("schema \"{name}\" does not exist"),
+                    ));
+                }
+                let owner = self.grantee_name(&owner)?;
+                let me = self.current_role_name();
+                let current = self.schema_owner_name(&name);
+                if !self.is_superuser(&me) && current.as_deref() != Some(me.as_str()) {
+                    return Err(Self::user_error(
+                        "42501",
+                        format!("must be owner of schema {name}"),
+                    ));
+                }
+                let mut doc = self
+                    .type_catalog_docs(Self::SCHEMA_COLLECTION)?
+                    .iter()
+                    .find(|d| d.get_str("_id") == Ok(name.as_str()))
+                    .cloned()
+                    .unwrap_or_else(|| bson::doc! {"_id": &name, "schema": &name});
+                doc.insert("owner", owner);
+                self.delete_type_doc(Self::SCHEMA_COLLECTION, &name)?;
+                self.insert_type_doc(Self::SCHEMA_COLLECTION, &name, doc)?;
+                Ok(vec![Response::Execution(Tag::new("ALTER SCHEMA"))])
+            }
+            Statement::ReassignOwned { roles, to } => self.reassign_owned(&roles, &to),
+            Statement::DropOwned { roles, cascade } => self.drop_owned(&roles, cascade),
+            Statement::AlterSequenceOwner {
+                name,
+                owner,
+                missing_ok,
+            } => {
+                if self.sequence_doc(&name)?.is_none() {
+                    if missing_ok {
+                        self.notice(
+                            "00000",
+                            format!("relation \"{name}\" does not exist, skipping"),
+                            None,
+                        );
+                        return Ok(vec![Response::Execution(Tag::new("ALTER SEQUENCE"))]);
+                    }
+                    return Err(Self::user_error(
+                        "42P01",
+                        format!("relation \"{name}\" does not exist"),
+                    ));
+                }
+                let owner = self.grantee_name(&owner)?;
+                self.refuse_linked_sequence_owner(&name)?;
+                self.set_sequence_owner(&name, &owner)?;
+                Ok(vec![Response::Execution(Tag::new("ALTER SEQUENCE"))])
+            }
+            Statement::AlterRoleSet {
+                role,
+                database,
+                name,
+                value,
+            } => self.alter_role_set(role.as_deref(), database.as_deref(), name, value),
             Statement::AlterDatabaseSet {
                 database,
                 name,
@@ -40216,6 +40496,19 @@ fn encode_field_value_inner(
     if *field.datatype() == Type::XML {
         if let Some(Bson::String(text)) = v {
             return enc.encode_field(&Some(secantus_pgplan::xml::out(text)));
+        }
+    }
+    // An `anyarray` (`pg_statistic.stavalues*`, `pg_stats`' value columns)
+    // has no element type for the wire to quote by: its text is `array_out`'s
+    // (`{"a  "}`), sent as raw bytes.
+    if *field.datatype() == Type::ANYARRAY {
+        if let Some(Bson::Array(items)) = v {
+            return enc.encode_field_with_type_and_format(
+                &RawEncoded(secantus_pgplan::render_array(items).into_bytes()),
+                field.datatype(),
+                field.format(),
+                &FormatOptions::default(),
+            );
         }
     }
     // `int2vector` / `oidvector` (pg_index.indkey): space-separated, no braces.

@@ -85,15 +85,7 @@ const REFUSED: &[(&str, &str)] = &[
     ("pg_stat_wal", "this server writes no PostgreSQL WAL"),
     ("pg_stat_slru", "this server has no SLRU caches"),
     ("pg_stat_archiver", "this server has no WAL archiver"),
-    // ANALYZE computes no column statistics here.
-    (
-        "pg_statistic",
-        "ANALYZE does not compute column statistics on this server",
-    ),
-    (
-        "pg_stats",
-        "ANALYZE does not compute column statistics on this server",
-    ),
+    // ANALYZE computes no extended statistics here.
     (
         "pg_statistic_ext_data",
         "ANALYZE does not compute extended statistics on this server",

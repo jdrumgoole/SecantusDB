@@ -752,12 +752,12 @@ Not filed:
       Verify: tests/backlog/test_rp_found_2026_10_20.py::test_catalog_relations_are_queryable
 - [ ] **Statements still refused with 0A000** (`... is not supported yet`),
       each of which PostgreSQL 15.19 runs:
-      - `ALTER SYSTEM` (set and reset), `ALTER ROLE ... SET`;
-      - `REASSIGN OWNED`, `DROP OWNED`;
-      - `ALTER TYPE ... ADD ATTRIBUTE`, `CREATE TEXT SEARCH CONFIGURATION`;
-      - `ALTER TABLE ... SET LOGGED / UNLOGGED / (fillfactor) / STORAGE /
-        STATISTICS`;
-      - `WHERE CURRENT OF`.
+      - `ALTER SYSTEM` (set and reset);
+      - `ALTER TYPE ... ADD ATTRIBUTE` / `RENAME ATTRIBUTE`, `CREATE TEXT
+        SEARCH CONFIGURATION`;
+      - `WHERE CURRENT OF` (`CurrentOfExpr`), on a table with rows; over
+        an empty one it answers `UPDATE 0` where PostgreSQL raises 24000
+        (`cursor "c" is not positioned on a row`).
 
       Several appear in `pg_dump` output. Not checked by the test:
       `ALTER EXTENSION`, `ALTER OPERATOR`, `ALTER COLLATION`, `CREATE
@@ -766,7 +766,33 @@ Not filed:
       subscriptions. CLAUDE.md's old claim that "no statement the earlier
       surveys listed" is refused no longer held.
       Backlog-ID: RP-072
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_statements_not_refused
+      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_statements_not_refused, tests/backlog/test_rp_batch30.py::test_scenario[WHERE CURRENT OF a cursor not on a row]
+
+## Found by batch 30 (2026-10-22)
+
+Found while building `REASSIGN OWNED` and `DROP OWNED` (RP-072). The gap
+tests are scenarios in `tests/backlog/test_rp_batch30.py`, measured on a
+private 15.19 cluster. RP-133 .. RP-136 and RP-138 .. RP-142 were found and
+fixed in the same batch; their tests there are regression tests.
+
+- [ ] **A relation's oid is not its place in creation order.** PostgreSQL
+      draws every oid from one counter, so oids rise as objects are made,
+      and DROP ROLE's DETAIL lists the role's objects in oid order
+      (`shared_dependency_comparator`): a sequence made before a table is
+      listed first. Here a sequence's, a view's and an index's oid is a
+      hash of its name in a band of its own (`sequence_oid`, `view_oid`,
+      `index_oid`), so the DETAIL -- which this server sorts by oid as
+      PostgreSQL does -- and any `ORDER BY oid` come out in another order.
+      Backlog-ID: RP-137
+      Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order]
+- [ ] **Two schemas' routines of one name collide.** A routine's catalog
+      key is its name and arity (`name/nargs`), not its schema, so after
+      `create function a.h()` the `create function b.h()` that PostgreSQL
+      takes is 42723 (`function "h" already exists with same argument
+      types`), and `b.h()` calls `a.h()`. The key would need the schema, and
+      every reader of `__sql_functions__` with it.
+      Backlog-ID: RP-143
+      Verify: tests/backlog/test_rp_batch30.py::test_scenario[two schemas' routines of one name]
 
 ## Found by batch 26 (2026-10-22)
 
@@ -775,15 +801,15 @@ as they do against PostgreSQL 15.19 (RP-070, RP-071). The gap tests are
 scenarios in `tests/backlog/test_rp_batch26.py`, measured on a private 15.19
 cluster.
 
-- [ ] **ANALYZE computes no column statistics**, so `pg_statistic`,
-      `pg_stats` and the extended-statistics relations (`pg_statistic_ext_data`,
-      `pg_stats_ext`, `pg_stats_ext_exprs`) are refused by name (0A000).
-      PostgreSQL's ANALYZE samples up to 300 x `default_statistics_target`
-      rows (all of a smaller table, so deterministic there) and records
-      `null_frac`, `avg_width`, `n_distinct`, the most common values and a
-      histogram per column. The planner's cost model (RP-028) would read them.
+- [ ] **ANALYZE computes no extended statistics**, so
+      `pg_statistic_ext_data`, `pg_stats_ext` and `pg_stats_ext_exprs` are
+      refused by name (0A000). `CREATE STATISTICS` is recorded, but ANALYZE
+      does not build its `ndistinct`, `dependencies` or `mcv` objects as
+      PostgreSQL's `BuildRelationExtStatistics` does. (Column statistics --
+      `pg_statistic`, `pg_stats` -- are served, for the types ANALYZE
+      samples here.)
       Backlog-ID: RP-099
-      Verify: tests/backlog/test_rp_batch26.py::test_scenario[ANALYZE computes statistics]
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[ANALYZE computes extended statistics]
 - [ ] **The progress views are refused by name** (0A000):
       `pg_stat_progress_vacuum`, `_analyze`, `_cluster`, `_copy`,
       `_create_index`, `_basebackup`. PostgreSQL reports a row per backend

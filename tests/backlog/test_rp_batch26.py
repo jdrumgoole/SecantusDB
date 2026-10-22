@@ -537,9 +537,22 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
             "select 'infinity'::timestamp - '2000-01-01'::timestamp",
         ],
     ),
-    "ANALYZE computes statistics": (
+    "ANALYZE computes extended statistics": (
         "RP-099",
         True,
+        [
+            "create table rp30_e (a int, b int)",
+            "insert into rp30_e select g % 4, g % 2 from generate_series(1, 40) g",
+            "create statistics rp30_es (ndistinct, dependencies) on a, b from rp30_e",
+            "analyze rp30_e",
+            "select statistics_name, n_distinct::text, dependencies::text from pg_stats_ext "
+            "where tablename = 'rp30_e'",
+            "drop table rp30_e",
+        ],
+    ),
+    "ANALYZE computes statistics": (
+        "RP-099",
+        False,
         [
             "create table rp26_a (x int)",
             "insert into rp26_a values (1), (1), (null)",
@@ -1186,6 +1199,14 @@ EXPECTED: dict[str, Any] = {
         ],
         [("1", "infinity"), ("2", "2021-01-01 00:00:00"), ("3", "-infinity")],
         ("ERR", "22008"),
+    ],
+    "ANALYZE computes extended statistics": [
+        "CREATE TABLE",
+        "INSERT 0 40",
+        "CREATE STATISTICS",
+        "ANALYZE",
+        [("rp30_es", '{"1, 2": 4}', '{"1 => 2": 1.000000}')],
+        "DROP TABLE",
     ],
     "memberships": [
         ["CREATE ROLE", "CREATE ROLE", "GRANT ROLE", "CREATE DATABASE"],
