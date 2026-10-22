@@ -1,8 +1,9 @@
 """Batch 31 of the Rust PG server (2026-10-23): the regression tests of
 what it fixed -- RP-072's `WHERE CURRENT OF`, RP-143, two schemas'
 routines of one name, and RP-145 .. RP-148, found while fixing it -- and
-the gap tests of what it filed open (RP-149 .. RP-151, and RP-137's DROP
-SCHEMA order).
+the gap tests of what it filed open (RP-149, RP-150, RP-154, and RP-137's
+DROP SCHEMA order). RP-151 .. RP-153 and RP-155 were found and fixed here
+too.
 
 As in `test_rp_batch30.py`: each scenario is a list of statements run in
 one autocommit connection, and a statement's answer is its rows, its
@@ -300,10 +301,80 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
             "drop table rp31_y",
         ],
     ),
+    "FETCH and MOVE in PL/pgSQL take SQL's steps": (
+        "RP-151",
+        False,
+        [
+            "create table rp31_x (a int, b text)",
+            "insert into rp31_x values (1, 'x'), (2, 'y'), (3, 'z')",
+            "~do $$ declare c scroll cursor for select a from rp31_x order by a; v int; n int; "
+            "begin open c; fetch last from c into v; raise notice 'last %', v; "
+            "fetch prior from c into v; raise notice 'prior %', v; "
+            "fetch absolute 1 from c into v; raise notice 'abs %', v; "
+            "fetch relative 5 from c into v; raise notice 'rel % found %', v, found; "
+            "move first from c; get diagnostics n = row_count; "
+            "raise notice 'moved % found %', n, found; "
+            "move forward all from c; get diagnostics n = row_count; "
+            "raise notice 'all % found %', n, found; close c; end $$",
+            "do $$ declare c refcursor; v int; begin fetch c into v; end $$",
+            "~do $$ declare c refcursor; v int; begin open c for select a from rp31_x order by a; "
+            "fetch c into v; raise notice 'v % c %', v, c; close c; fetch c into v; end $$",
+            "~do $$ declare c cursor for select a from rp31_x order by a; v int; begin open c; "
+            "loop fetch c into v; exit when not found; raise notice 'loop %', v; end loop; "
+            "close c; end $$",
+            "do $$ declare c no scroll cursor for select a from rp31_x order by a; v int; "
+            "begin open c; fetch c into v; fetch prior from c into v; end $$",
+            "do $$ declare c refcursor := 'rp31_mine'; v int; begin open c for select a from "
+            "rp31_x where a = 2; fetch c into v; update rp31_x set b = 'rc' where current of c; "
+            "close c; end $$",
+            "select * from rp31_x order by a",
+            "drop table rp31_x",
+        ],
+    ),
+    # ---------------------------------------- RP-152 RAISE's boolean text
+    "RAISE writes a boolean as its output function does": (
+        "RP-152",
+        False,
+        [
+            "~do $$ declare b boolean := true; begin raise notice '% % %', b, false, found; end $$",
+        ],
+    ),
+    # --------------------------- RP-153 / RP-155 a record with no row yet
+    "an INTO with no row leaves a record of NULLs": (
+        "RP-153",
+        False,
+        [
+            "create table rp31_r (a int, b text)",
+            "~do $$ declare r record; begin select * into r from rp31_r; "
+            "raise notice 'r % %', r.a, r.b; end $$",
+            "drop table rp31_r",
+        ],
+    ),
+    "a field of a record nothing has assigned": (
+        "RP-155",
+        False,
+        [
+            "!do $$ declare r record; begin raise notice 'r %', r.a; end $$",
+            "!do $$ declare r record; x int; begin x := r.a; end $$",
+        ],
+    ),
     # ---------------------------------------------------- open: filed here
+    "a whole record in a PL/pgSQL expression": (
+        "RP-154",
+        True,
+        [
+            "create table rp31_r (a int, b text)",
+            "insert into rp31_r values (1, 'q')",
+            "~do $$ declare r record; begin select * into r from rp31_r; "
+            "raise notice 'r %', r; end $$",
+            "~do $$ declare r record; begin select * into r from rp31_r where false; "
+            "raise notice 'r %', r; end $$",
+            "drop table rp31_r",
+        ],
+    ),
     "FETCH and CLOSE a cursor in PL/pgSQL": (
         "RP-151",
-        True,
+        False,
         [
             "create table rp31_x (a int, b text)",
             "insert into rp31_x values (1, 'x'), (2, 'y')",
@@ -487,6 +558,29 @@ EXPECTED: dict[str, Any] = {
         [("1", "pl"), ("2", "y")],
         "DROP TABLE",
     ],
+    "FETCH and MOVE in PL/pgSQL take SQL's steps": [
+        "CREATE TABLE",
+        "INSERT 0 3",
+        (
+            "DO",
+            [
+                "last 3",
+                "prior 2",
+                "abs 1",
+                "rel <NULL> found f",
+                "moved 1 found t",
+                "all 2 found t",
+            ],
+        ),
+        ("ERR", "22004"),
+        (("ERR", "34000"), ["v 1 c <unnamed portal 1>"]),
+        ("DO", ["loop 1", "loop 2", "loop 3"]),
+        ("ERR", "55000"),
+        "DO",
+        [("1", "x"), ("2", "rc"), ("3", "z")],
+        "DROP TABLE",
+    ],
+    "RAISE writes a boolean as its output function does": [("DO", ["t f f"])],
     "UPDATE and DELETE WHERE CURRENT OF": [
         "CREATE TABLE",
         "CREATE TABLE",
@@ -593,6 +687,10 @@ EXPECTED: dict[str, Any] = {
         [("rp31_a", "h"), ("rp31_b", "h")],
         "DROP SCHEMA",
     ],
+    "a field of a record nothing has assigned": [
+        ("ERR", "55000", "The tuple structure of a not-yet-assigned record is indeterminate."),
+        ("ERR", "55000", "The tuple structure of a not-yet-assigned record is indeterminate."),
+    ],
     "a procedure in DROP SCHEMA's notice": [
         "CREATE SCHEMA",
         "CREATE PROCEDURE",
@@ -609,6 +707,18 @@ EXPECTED: dict[str, Any] = {
         ("ERR", "3F000"),
         ("ERR", "3F000"),
         "DROP FUNCTION",
+    ],
+    "a whole record in a PL/pgSQL expression": [
+        "CREATE TABLE",
+        "INSERT 0 1",
+        ("DO", ["r (1,q)"]),
+        ("DO", ["r (,)"]),
+        "DROP TABLE",
+    ],
+    "an INTO with no row leaves a record of NULLs": [
+        "CREATE TABLE",
+        ("DO", ["r <NULL> <NULL>"]),
+        "DROP TABLE",
     ],
     "an unqualified CREATE FUNCTION lands on the search_path": [
         "CREATE SCHEMA",

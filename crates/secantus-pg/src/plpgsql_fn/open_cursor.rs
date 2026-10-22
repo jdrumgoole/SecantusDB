@@ -20,10 +20,13 @@ impl Interp<'_> {
             .ok_or_else(|| PlError::new("XX000", "OPEN without a cursor variable"))?;
         // Scrollable unless NO SCROLL (CURSOR_OPT_NO_SCROLL): the rows are
         // kept, so backward fetches work, and pg_cursors says so.
-        let scroll = !body
+        // A bound cursor declares it (`c NO SCROLL CURSOR FOR ...`).
+        let options = body
             .get("cursor_options")
             .and_then(Value::as_u64)
-            .is_some_and(|o| o & 0x0004 != 0);
+            .unwrap_or(0)
+            | self.cursor_options.get(&var).copied().unwrap_or(0);
+        let scroll = options & 0x0004 == 0;
         let (statement, (sql, params, types)) =
             if let Some(q) = body.get("query").and_then(|q| expr_query(q)) {
                 (q.0.to_string(), self.bind(q.0)?)
@@ -56,6 +59,105 @@ impl Interp<'_> {
         self.set_var(var, Bson::String(name))?;
         Ok(Flow::Next)
     }
+
+    /// The portal a cursor variable names: its value (22004 when NULL, as
+    /// `exec_stmt_fetch` refuses it).
+    fn portal_of(&self, body: &Value) -> Result<String, PlError> {
+        let var = body
+            .get("curvar")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .ok_or_else(|| PlError::new("XX000", "a cursor statement without a variable"))?;
+        match self.datums.get(var) {
+            Some(Datum::Var { value, name, .. }) => match value {
+                Bson::Null => Err(PlError::new(
+                    "22004",
+                    format!("cursor variable \"{name}\" is null"),
+                )),
+                Bson::String(s) => Ok(s.clone()),
+                other => Ok(secantus_pgplan::value_text(other)),
+            },
+            _ => Err(PlError::new(
+                "XX000",
+                "a cursor statement without a variable",
+            )),
+        }
+    }
+
+    /// `FETCH [direction] cur INTO target` / `MOVE [direction] cur`: one
+    /// step of the portal, as the SQL statement takes it. A FETCH fills its
+    /// target with the row the cursor then sits on (NULLs past either end)
+    /// and sets FOUND by it; a MOVE sets FOUND when it moved over a row.
+    pub(super) fn fetch_cursor(&mut self, body: &Value) -> Result<Flow, PlError> {
+        use secantus_pgplan::FetchDirection as Fd;
+        let is_move = body
+            .get("is_move")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !is_move
+            && body
+                .get("returns_multiple_rows")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            return Err(PlError::new(
+                "42601",
+                "FETCH statement cannot return multiple rows",
+            ));
+        }
+        let portal = self.portal_of(body)?;
+        let direction = match body.get("direction").and_then(Value::as_u64) {
+            Some(1) => Fd::Backward,
+            Some(2) => Fd::Absolute,
+            Some(3) => Fd::Relative,
+            _ => Fd::Forward,
+        };
+        let count = match body.get("expr") {
+            Some(e) => match self.eval(e)? {
+                Bson::Int32(n) => i64::from(n),
+                Bson::Int64(n) => n,
+                Bson::Double(f) => f as i64,
+                Bson::Null => 0,
+                other => secantus_pgplan::value_text(&other).parse().unwrap_or(0),
+            },
+            None => body.get("how_many").and_then(Value::as_i64).unwrap_or(0),
+        };
+        let (moved, out) = self.host.fetch_cursor(&portal, direction, count)?;
+        if is_move {
+            self.set_found(moved > 0);
+            self.row_count = moved;
+            return Ok(Flow::Next);
+        }
+        let target = self.target_datum(body)?;
+        let first = out.rows.first().map(|r| r.as_slice());
+        self.assign_row(target, &out.columns, first)?;
+        self.set_found(first.is_some());
+        self.row_count = u64::from(first.is_some());
+        Ok(Flow::Next)
+    }
+
+    /// `CLOSE cur`.
+    pub(super) fn close_cursor(&mut self, body: &Value) -> Result<Flow, PlError> {
+        let portal = self.portal_of(body)?;
+        self.host.close_cursor(&portal)?;
+        Ok(Flow::Next)
+    }
+}
+
+/// The bound cursors' declared options, by datum number.
+pub(super) fn cursor_options(f: &Value) -> HashMap<usize, u64> {
+    f.get("datums")
+        .and_then(Value::as_array)
+        .map(|ds| {
+            ds.iter()
+                .enumerate()
+                .filter_map(|(i, d)| {
+                    let o = d.get("PLpgSQL_var")?.get("cursor_options")?.as_u64()?;
+                    Some((i, o))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The bound cursors' queries (`c CURSOR FOR SELECT ...`), by datum number.

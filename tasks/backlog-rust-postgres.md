@@ -791,8 +791,8 @@ fixed in the same batch; their tests there are regression tests.
 
 Found while telling two schemas' routines apart (RP-143). The gap tests are
 scenarios in `tests/backlog/test_rp_batch31.py`, measured on a private
-15.19 cluster. RP-145 .. RP-148 were found and fixed in the same batch;
-their tests there are regression tests.
+15.19 cluster. RP-145 .. RP-148, RP-151 .. RP-153 and RP-155 were found
+and fixed in the same batch; their tests there are regression tests.
 
 - [ ] **A built-in is reached through any schema.** `select
       public.lower('A')` and `select s.lower('A')` (for a schema `s`)
@@ -814,16 +814,15 @@ their tests there are regression tests.
       depend on them in turn.
       Backlog-ID: RP-150
       Verify: tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA's refusal names what depends on its members]
-- [ ] **PL/pgSQL's FETCH, MOVE and CLOSE are refused** (0A000, `the
-      statement fetch in a PL/pgSQL function is not supported yet`). A
-      body can OPEN a cursor (to return a `refcursor`), but not read it, so
-      `open c; fetch c into r; update t ... where current of c; close c`
-      -- PostgreSQL's way to update the rows a loop reads -- fails at the
-      FETCH. A cursor the body opens (`plpgsql_portals`) also keeps no row
-      ids, so once FETCH reads it, `WHERE CURRENT OF` it needs them as the
-      top-level cursor has (`current_of.rs`).
-      Backlog-ID: RP-151
-      Verify: tests/backlog/test_rp_batch31.py::test_scenario[FETCH and CLOSE a cursor in PL/pgSQL]
+- [ ] **A whole record in a PL/pgSQL expression is 42703.** `raise notice
+      '%', r` over a record `r` that a SELECT INTO filled is `column "r"
+      does not exist`; PostgreSQL writes the row (`(1,q)`, and `(,)` for
+      the all-NULL row an INTO with no row leaves). Binding an expression
+      replaces a variable or a record's field (`r.a`) with a parameter, but
+      a record as a whole has no parameter form: it would be a composite
+      value of the record's row type.
+      Backlog-ID: RP-154
+      Verify: tests/backlog/test_rp_batch31.py::test_scenario[a whole record in a PL/pgSQL expression]
 
 ## Found by batch 26 (2026-10-22)
 

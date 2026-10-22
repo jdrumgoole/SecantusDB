@@ -1,6 +1,7 @@
 ### Rust PostgreSQL server: WHERE CURRENT OF, and a routine belongs to its schema
 
-`UPDATE` and `DELETE ... WHERE CURRENT OF` change the row a cursor sits on.
+`UPDATE` and `DELETE ... WHERE CURRENT OF` change the row a cursor sits on,
+and a PL/pgSQL body can FETCH, MOVE and CLOSE the cursor it opens.
 Two schemas can each hold a function of one name, as in PostgreSQL 15.19.
 A call, a DROP, an ALTER, a GRANT and a CALL find the routine by the schema
 they name or, unqualified, by the search path. `DROP SCHEMA a, b` is one
@@ -21,6 +22,17 @@ deletion.
   not a simply updatable scan of the table, or one held from a committed
   transaction. RP-072 is down to `ALTER SYSTEM`, `ALTER TYPE ... ADD /
   RENAME ATTRIBUTE` and `CREATE TEXT SEARCH CONFIGURATION`.
+
+- Fixes RP-151 (`tests/backlog/test_rp_batch31.py::test_scenario[FETCH and CLOSE a cursor in PL/pgSQL]`
+  and `[FETCH and MOVE in PL/pgSQL take SQL's steps]`): PL/pgSQL's `FETCH
+  [direction] c INTO target`, `MOVE [direction] c` and `CLOSE c`, which
+  were refused (0A000). Each step is the SQL statement's. A FETCH fills its
+  target with the row the cursor then sits on, or NULLs past either end,
+  and sets FOUND and ROW_COUNT by it. A MOVE sets them by the rows it moved
+  over. A NULL cursor variable is 22004, and a bound cursor declared NO
+  SCROLL scans forward only. `WHERE CURRENT OF c` in a body names the
+  portal the variable holds, and a cursor the body opens keeps its rows'
+  ids for it.
 
 #### Fixed
 
@@ -57,6 +69,16 @@ deletion.
   DROP SCHEMA's notice and refusal call a procedure a function, as
   PostgreSQL 15's `getObjectDescription` does.
 
+- Fixes RP-152 (`tests/backlog/test_rp_batch31.py::test_scenario[RAISE writes a boolean as its output function does]`):
+  RAISE writes a boolean `t` / `f`, as `boolout` does, not `true` /
+  `false`.
+- Fixes RP-153 (`tests/backlog/test_rp_batch31.py::test_scenario[an INTO with no row leaves a record of NULLs]`):
+  a SELECT INTO (or FETCH) that finds no row leaves a record target with
+  the query's row type and every field NULL. `r.a` used to be 42703.
+- Fixes RP-155 (`tests/backlog/test_rp_batch31.py::test_scenario[a field of a record nothing has assigned]`):
+  a field of a record nothing has assigned is 55000 (`record "r" is not
+  assigned yet`) with PostgreSQL's DETAIL and CONTEXT, not 42703.
+
 #### Known
 
 - RP-149, filed: a built-in is reached through any schema (`public.lower`
@@ -65,9 +87,9 @@ deletion.
 - RP-150, filed: DROP SCHEMA's refusal names the schema's members but not
   the objects that depend on them in turn
   (`tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA's refusal names what depends on its members]`).
-- RP-151, filed: PL/pgSQL's FETCH, MOVE and CLOSE are refused, so a body
-  cannot read the cursor it opens
-  (`tests/backlog/test_rp_batch31.py::test_scenario[FETCH and CLOSE a cursor in PL/pgSQL]`).
+- RP-154, filed: a whole record in a PL/pgSQL expression (`raise notice
+  '%', r`) is 42703
+  (`tests/backlog/test_rp_batch31.py::test_scenario[a whole record in a PL/pgSQL expression]`).
 - RP-137 now also covers DROP SCHEMA's notice, which lists a schema's
   members grouped by kind rather than in creation order
   (`tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]`).

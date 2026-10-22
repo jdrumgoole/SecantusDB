@@ -1726,6 +1726,22 @@ impl plpgsql_fn::Host for PlHost<'_> {
         self.open_portal(name, statement, sql, params, types, scroll)
     }
 
+    fn fetch_cursor(
+        &self,
+        name: &str,
+        direction: secantus_pgplan::FetchDirection,
+        count: i64,
+    ) -> Result<(u64, plpgsql_fn::QueryOut), plpgsql_fn::PlError> {
+        self.fetch_portal(name, direction, count)
+    }
+
+    fn close_cursor(&self, name: &str) -> Result<(), plpgsql_fn::PlError> {
+        self.h
+            .execute_statement(Statement::CloseCursor(name.to_string()), 0)
+            .map(|_| ())
+            .map_err(|e| pl_error(&e))
+    }
+
     fn query(
         &self,
         sql: &str,
@@ -23744,6 +23760,18 @@ impl PgHandler {
         count: i64,
         is_move: bool,
     ) -> PgWireResult<Vec<Response>> {
+        self.fetch_n(name, direction, count, is_move)
+            .map(|(_, r)| r)
+    }
+
+    /// `fetch`, with the number of rows it moved over or returned.
+    pub(crate) fn fetch_n(
+        &self,
+        name: &str,
+        direction: secantus_pgplan::FetchDirection,
+        count: i64,
+        is_move: bool,
+    ) -> PgWireResult<(usize, Vec<Response>)> {
         use secantus_pgplan::FetchDirection as Fd;
         let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
         let Some(cursor) = cursors.get_mut(name) else {
@@ -23873,7 +23901,7 @@ impl PgHandler {
             if cursor.tail.is_some() {
                 portal_stream::trim_cursor(cursor);
             }
-            return Ok(vec![Response::Execution(Tag::new(&format!("MOVE {n}")))]);
+            return Ok((n, vec![Response::Execution(Tag::new(&format!("MOVE {n}")))]));
         }
         // A BINARY fetch re-encodes the captured typed values in binary; every
         // other fetch reuses the text rows frozen at DECLARE. `binary_results`
@@ -23923,7 +23951,7 @@ impl PgHandler {
         // The tag is just `FETCH`: the wire layer appends the row count, so
         // building `FETCH 2` here produced `FETCH 2 2` on the wire.
         response.command_tag = "FETCH".to_string();
-        Ok(vec![Response::Query(response)])
+        Ok((n, vec![Response::Query(response)]))
     }
 
     /// `INSERT ... SELECT`: every target column needs an ASSIGNMENT cast from
@@ -31809,6 +31837,19 @@ impl PgHandler {
         match stmt {
             Statement::Select(sel) => {
                 let (docs, def) = self.select_docs(sel, 0)?;
+                // A PL/pgSQL OPEN over a simply updatable scan keeps the
+                // rows' ids (`open_portal`).
+                if let Some(ids) = self
+                    .cursor_ids
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_mut()
+                {
+                    ids.extend(
+                        docs.iter()
+                            .map(|d| d.get("_id").cloned().unwrap_or(Bson::Null)),
+                    );
+                }
                 let schema = self.row_schema(&def, &sel.columns, &sel.casts);
                 let tz = self.session_timezone();
                 let rows = docs
