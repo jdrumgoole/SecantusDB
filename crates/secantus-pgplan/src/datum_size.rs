@@ -252,7 +252,11 @@ fn record_size(v: &Bson, fields: &[Bson]) -> usize {
             .cloned()
             .unwrap_or_else(|| inferred_type(f).to_string());
         // A ROW's unknown literal is resolved to text (`transformRowExpr`).
-        let ty = if ty == "unknown" { "text".to_string() } else { ty };
+        let ty = if ty == "unknown" {
+            "text".to_string()
+        } else {
+            ty
+        };
         let varlena = ty.ends_with("[]") || record_fields(f).is_some() || layout(&ty).0 == -1;
         let size = in_memory(f, &ty).unwrap_or(0);
         if varlena && size - 4 < 127 {

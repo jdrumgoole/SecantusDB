@@ -1183,9 +1183,7 @@ fn rewrite(sql: &str) -> Option<Rewritten> {
                 _ => None,
             };
             // An unqualified key's relation is not known here: per row.
-            let Some(q) = q else {
-                return None;
-            };
+            let q = q?;
             if !qualifiers.contains(&q) {
                 qualifiers.push(q);
             }
