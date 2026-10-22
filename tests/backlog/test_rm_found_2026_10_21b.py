@@ -825,11 +825,15 @@ def test_operator_tail_codes_fixed(rust_mongo: Any, mongod: Any) -> None:
     assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
 
 
-@pytest.mark.backlog("RM-253")
+@pytest.mark.backlog_fixed("RM-253")
 def test_bucket_with_non_numeric_boundaries(rust_mongo: Any, mongod: Any) -> None:
     """`$bucket` emits buckets in `_id` order, so a string `default` comes
-    before date buckets; the Rust server puts the default last, and answers 2
-    "not supported" for Decimal128 or mixed numeric boundaries."""
+    before date buckets and a numeric one below the boundaries first; it
+    places Decimal128 and mixed numeric boundaries by BSON order, honours a
+    null `default`, and refuses a malformed spec with its own code (40191-
+    40202). The Rust server put the default last, answered 2 "not supported"
+    for Decimal128 boundaries and every malformed spec, and read a null
+    default as none."""
     docs = [{"_id": i, "v": v} for i, v in enumerate([datetime.datetime(2020, 1, 1), "x", 5])]
 
     def run(client: Any, spec: dict) -> Any:
@@ -854,6 +858,24 @@ def test_bucket_with_non_numeric_boundaries(rust_mongo: Any, mongod: Any) -> Non
             "boundaries": [0, Decimal128("10"), 20.5],
             "default": "o",
         },
+        "numeric default below": {"groupBy": "$v", "boundaries": [0, 10], "default": -5},
+        "null default": {"groupBy": "$v", "boundaries": [0, 10], "default": None},
+        "decimal default": {"groupBy": "$v", "boundaries": [0, 10], "default": Decimal128("-1")},
+        "string boundaries": {"groupBy": "$v", "boundaries": ["a", "y", "z"], "default": 0},
+        "constant expression boundary": {
+            "groupBy": "$v",
+            "boundaries": [0, {"$add": [1, 9]}],
+            "default": "o",
+        },
+        "NaN boundary": {"groupBy": "$v", "boundaries": [float("nan"), 0, 10], "default": "o"},
+        "mixed types": {"groupBy": "$v", "boundaries": [0, "a"], "default": None},
+        "unsorted": {"groupBy": "$v", "boundaries": [10, 0], "default": "o"},
+        "one boundary": {"groupBy": "$v", "boundaries": [0], "default": "o"},
+        "boundaries not array": {"groupBy": "$v", "boundaries": 5, "default": "o"},
+        "field-path boundary": {"groupBy": "$v", "boundaries": [0, "$v"]},
+        "default inside": {"groupBy": "$v", "boundaries": [0, 10], "default": 5},
+        "groupBy literal": {"groupBy": "v", "boundaries": [0, 10]},
+        "output not object": {"groupBy": "$v", "boundaries": [0, 10], "default": "o", "output": 5},
     }
     diffs = []
     for name, spec in specs.items():

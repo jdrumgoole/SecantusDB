@@ -558,6 +558,7 @@ RM-251 closed after it: constant sub-expressions are folded bottom-up in
 every stage, as mongod folds them.
 RM-245 closed after that: the Decimal128 transcendentals now differ from
 mongod only in the authorised last digit.
+RM-253 closed after that: `$bucket` parses, places and orders as mongod's.
 
 - [ ] **`$dateFromString` of a five-digit year is ten seconds out.**
   `"10000-01-01"` is read by timelib as the no-colon time `1000` and the
@@ -568,11 +569,6 @@ mongod only in the authorised last digit.
   `tools/probes/expression_shapes.py`, not yet traced.
   Backlog-ID: RM-258
   Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_date_from_string_five_digit_year
-- [ ] **`$bucket` with non-numeric boundaries.** mongod emits the buckets in
-  `_id` order, so a string `default` comes before date buckets; here it
-  comes last. Decimal128 or mixed numeric boundaries are 2 "not supported".
-  Backlog-ID: RM-253
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_bucket_with_non_numeric_boundaries
 
 ### 7.087 Window functions and the operator tail against mongod -- 2026-10-21
 
