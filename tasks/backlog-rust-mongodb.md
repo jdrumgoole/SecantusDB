@@ -252,7 +252,9 @@ These are explicit non-goals. Don't add them without a reason.
 - **Scope decision — no server-side JavaScript** (Joe, 2026-10-16,
   formerly RM-009). `$where`, `$function`, `$accumulator` and `mapReduce`
   are refused as `mongod --noscripting` 8.2.11 refuses them (6108304 in a
-  query, 2 in an aggregation `$match`, 31264 for mapReduce); MongoDB
+  query, 2 in an aggregation `$match`, 31264 for mapReduce, and 31264 for
+  `$accumulator` once a document reaches it -- over no documents that mongod
+  succeeds, and so does this server, measured 2026-10-22); MongoDB
   deprecated all four in 8.0. Pinned by
   `tests/test_mongod_differential.py::test_where_refusal_matches_a_scriptless_mongod`
   / `::test_where_in_aggregate_match_is_a_context_error`. The three Go
@@ -543,6 +545,51 @@ These are explicit non-goals. Don't add them without a reason.
   the reference does.
   Backlog-ID: RM-274
   Verify: none -- an instability in the reference measurement under parallel load, reproduced only by the full regression run on a loaded Mac
+### 7.090 `$group` code no test had executed, against mongod -- 2026-10-22
+
+The 2026-10-21 coverage run left 455 lines of `secantus-core/src/group.rs`
+unexecuted: the accumulators' corners, `$median` / `$percentile`,
+`$mergeObjects`, the N-accumulators' arguments, `$bucket` and `$bucketAuto`.
+`tools/probes/group_shapes.py` was written against them. On `main`, 43 of
+its first 245 cases differed from mongod 8.2.11. The batch that wrote it fixed
+five causes (RM-275 to RM-279, regression tests in
+`tests/backlog/test_rm_group_shapes.py`); the two below remain. Of the
+probe's 282 cases, 9 differ: eight are RM-280, and one is `$accumulator`,
+which a mongod with scripting runs and this server refuses by design (Scope
+decision, above).
+
+Not a divergence: the ORDER of `$addToSet` / `$setUnion` elements, and of
+equal counts after `$sortByCount`. mongod takes them from a hash table and
+does not fix it: the same pipeline on the same mongod gave each of two
+orders, 9 and 11 times in 20 runs (8.2.11, 2026-10-23). The order this
+server returns is one mongod gives, and the probe compares them as sets.
+
+- [ ] **A `$group` mongod runs in SBE fails with SBE's error codes.** mongod
+  pushes a `$group` into its slot-based engine when only `$match`, `$sort`,
+  `$limit` or `$project` come before it. After `$addFields` or `$unwind` it
+  runs the classic engine. The errors differ:
+
+  | error | SBE | classic |
+  | --- | --- | --- |
+  | bad `n` | 7548606 (constant) / 7548607 | 5787902 / 5787903 / 5787908 |
+  | `$mergeObjects` of a non-object | 5911200 "only supports objects" | 40400 |
+  | `$ln` of a string in the key | 7157705 | 28765 |
+
+  The Rust server answers the classic codes everywhere. The faithful fix is
+  mongod's SBE-eligibility rule plus SBE's messages for each expression;
+  measured only for `$group` so far.
+  Backlog-ID: RM-280
+  Verify: tests/backlog/test_rm_group_shapes.py::test_group_in_sbe_error_codes
+- [ ] **An expression object with two operator fields is read as a literal
+  document.** mongod refuses `{$add: [1], $b: 2}` wherever it parses an
+  expression: 15983 "An object representing an expression must have exactly
+  one field" in `$addFields`, `$set`, `$expr` and `$group`, and 16410 in
+  `$project`. The `$group` / `$bucket` / `$bucketAuto` / `$sortByCount`
+  positions are fixed (RM-275); everywhere else the Rust server returns the
+  object as a value.
+  Backlog-ID: RM-281
+  Verify: tests/backlog/test_rm_group_shapes.py::test_expression_object_with_two_operators
+
 ### 7.088 Expression code no test had executed, against mongod -- 2026-10-21
 
 A line-coverage run (`docs-rust/coverage.md`, `./inv rust-mdb-coverage`)

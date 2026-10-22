@@ -1,14 +1,12 @@
 //! `$group` (and `$sortByCount`) — Rust port of `secantus.aggregate._stage_group`
 //! and its accumulators. The trickiest pipeline stage to reproduce faithfully:
 //!
-//! * **Group-key bucketing** must match Python's dict semantics, where
-//!   `1 == 1.0 == True == Decimal128("1")` collapse into one bucket and
-//!   embedded docs / arrays recurse (`_hashable`). We canonicalise each key
-//!   value into a hashable `GKey` (numbers + bool normalised through
-//!   `numeric::NumVal`, so the cross-type collision is exact) and bucket on
-//!   that, preserving first-seen `_id` and insertion order. Key types we can't
-//!   canonicalise without a fidelity risk (Decimal128, NaN, Binary/Timestamp/
-//!   Regex/Min/MaxKey, exotic) defer the whole stage to Python.
+//! * **Group-key bucketing** follows mongod's value equality: numbers by value
+//!   across types (`1 == 1.0 == Decimal128("1")`, every NaN together), a bool
+//!   never equal to a number, and documents compared field by field IN ORDER
+//!   (`{a: 1, b: 2}` and `{b: 2, a: 1}` are two groups). Each key value is
+//!   canonicalised into a hashable `GKey`, keeping first-seen `_id` and
+//!   insertion order.
 //!
 //! * **Accumulators** reproduce mongod's exact numeric semantics: `$sum`/`$avg`
 //!   accumulate only numeric operands (int stays int, any float widens; string
@@ -134,7 +132,9 @@ pub enum GKey {
     Collated(Vec<u8>),
     Date(i64),
     Oid([u8; 12]),
-    Doc(Vec<(String, GKey)>), // sorted by field name
+    /// Fields in the document's own order: mongod keys `{a: 1, b: 2}` and
+    /// `{b: 2, a: 1}` apart (measured 8.2.11, 2026-10-22).
+    Doc(Vec<(String, GKey)>),
     Arr(Vec<GKey>),
     /// Every NaN, of any numeric type, buckets together.
     ///
@@ -179,9 +179,6 @@ pub fn gkey(v: &Bson) -> R<GKey> {
             for (k, val) in d {
                 items.push((k.clone(), gkey(val)?));
             }
-            // `_hashable` sorts the (key, hashed-value) pairs; keys are unique so
-            // sorting by key alone reproduces the order.
-            items.sort_by(|a, b| a.0.cmp(&b.0));
             Ok(GKey::Doc(items))
         }
         Bson::Array(a) => {
@@ -460,6 +457,13 @@ pub(crate) enum Acc {
         dirs: Vec<bool>, // true == descending
         items: Vec<(Vec<Bson>, Bson)>,
     },
+    // `$concatArrays` / `$setUnion` (accumulators since 8.1): every element of
+    // each array operand, in order; `$setUnion` keeps the first of equal ones.
+    ConcatArrays(Vec<Bson>),
+    SetUnion(Vec<Bson>),
+    // `$accumulator`: user JavaScript, which this server -- like a mongod
+    // started with `--noscripting` -- cannot run.
+    Script,
 }
 
 #[derive(Clone, Copy)]
@@ -558,6 +562,9 @@ pub(crate) fn new_acc(op: &str) -> R<Acc> {
             ps: None,
             values: Vec::new(),
         },
+        "$concatArrays" => Acc::ConcatArrays(Vec::new()),
+        "$setUnion" => Acc::SetUnion(Vec::new()),
+        "$accumulator" => Acc::Script,
         _ => return Err(Fallback::Defer), // unsupported accumulator -> Python (raises or handles)
     })
 }
@@ -677,21 +684,52 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
             }
         }
         Acc::MergeObjects(merged) => {
-            // Null/missing operand -> skip. Non-null, non-document operand ->
-            // defer to Python (which raises Location 40400). Document -> merge
-            // with later-key-wins semantics.
+            // Null / undefined / missing -> skip; a document merges, later
+            // keys winning; anything else is mongod's classic-engine 40400.
             if let Some(v) = eval_or_missing(arg, doc, vars)? {
                 match v {
-                    Bson::Null => {}
+                    Bson::Null | Bson::Undefined => {}
                     Bson::Document(d) => {
                         for (k, val) in d {
                             merged.insert(k, val);
                         }
                     }
-                    _ => return Err(Fallback::Defer),
+                    other => {
+                        return Err(Fallback::mongo(
+                            40400,
+                            format!(
+                                "$mergeObjects requires object inputs, but input {} is of type {}",
+                                crate::query::bson_value_repr(&other),
+                                crate::query::bson_type_name(&other)
+                            ),
+                        ))
+                    }
                 }
             }
         }
+        Acc::ConcatArrays(items) => {
+            if let Some(v) = eval_or_missing(arg, doc, vars)? {
+                items.extend(array_operand("$concatArrays", v)?);
+            }
+        }
+        Acc::SetUnion(items) => {
+            if let Some(v) = eval_or_missing(arg, doc, vars)? {
+                for e in array_operand("$setUnion", v)? {
+                    let key = gkey(&e)?;
+                    let mut present = false;
+                    for existing in items.iter() {
+                        if gkey(existing)? == key {
+                            present = true;
+                            break;
+                        }
+                    }
+                    if !present {
+                        items.push(e);
+                    }
+                }
+            }
+        }
+        Acc::Script => return Err(no_script_engine()),
         Acc::StdDev { values, .. } => {
             // mongod counts only int / long / double / decimal. bool, null,
             // string, array and document values are silently *skipped*, not
@@ -743,16 +781,8 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
             let Bson::Document(d) = arg else {
                 return Err(Fallback::Defer);
             };
-            let nn = match eval(d.get("n").ok_or(Fallback::Defer)?, doc, vars)? {
-                Bson::Int32(x) => x as i64,
-                Bson::Int64(x) => x,
-                Bson::Double(x) if x.is_finite() && x.fract() == 0.0 => x as i64,
-                _ => return Err(Fallback::Defer),
-            };
-            if nn <= 0 {
-                return Err(Fallback::Defer);
-            }
-            *n = Some(nn as usize);
+            let nn = group_n(d.get("n").ok_or(Fallback::Defer)?, vars)?;
+            *n = Some(nn);
             vals.push(eval(d.get("input").ok_or(Fallback::Defer)?, doc, vars)?);
         }
         Acc::TopN {
@@ -777,19 +807,11 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
                 return Err(Fallback::Defer);
             }
             let nn = if has_n {
-                match eval(d.get("n").unwrap(), doc, vars)? {
-                    Bson::Int32(x) => x as i64,
-                    Bson::Int64(x) => x,
-                    Bson::Double(x) if x.is_finite() && x.fract() == 0.0 => x as i64,
-                    _ => return Err(Fallback::Defer),
-                }
+                group_n(d.get("n").unwrap(), vars)?
             } else {
                 1
             };
-            if nn <= 0 {
-                return Err(Fallback::Defer);
-            }
-            *n = Some(nn as usize);
+            *n = Some(nn);
             if dirs.is_empty() {
                 *dirs = sortby
                     .values()
@@ -809,6 +831,105 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
         }
     }
     Ok(())
+}
+
+/// `AccumulatorN::validateN`, as mongod's classic engine checks `n` when a
+/// group starts: a number, integral, and positive. (When mongod runs the
+/// `$group` in SBE -- a `$group` after only `$match` / `$sort` / `$limit` /
+/// `$project` -- the same mistakes are 7548606 / 7548607 instead; see
+/// RM-280.)
+fn validate_n(v: &Bson) -> R<usize> {
+    let shown = crate::query::bson_value_repr(v);
+    let not_integral = || {
+        Fallback::mongo(
+            5787903,
+            format!("Value for 'n' must be of integral type, but found {shown}"),
+        )
+    };
+    let n: i64 = match v {
+        Bson::Int32(x) => i64::from(*x),
+        Bson::Int64(x) => *x,
+        Bson::Double(x) if x.is_nan() || x.fract() != 0.0 => return Err(not_integral()),
+        Bson::Double(x) => *x as i64,
+        Bson::Decimal128(_) => decimal::decimal_to_i64_exact(v).ok_or_else(not_integral)?,
+        _ => {
+            return Err(Fallback::mongo(
+                5787902,
+                format!("Value for 'n' must be of integral type, but found {shown}"),
+            ))
+        }
+    };
+    if n <= 0 {
+        return Err(Fallback::mongo(
+            5787908,
+            format!("'n' must be greater than 0, found {n}"),
+        ));
+    }
+    usize::try_from(n).map_err(|_| Fallback::Defer)
+}
+
+/// An N-accumulator's `n`: an initializer, evaluated against an EMPTY
+/// document -- not the group's documents, and not its key either: `n: "$k"`
+/// and `n: "$_id"` are both missing (measured 8.2.11, 2026-10-22).
+fn group_n(n_expr: &Bson, vars: &Document) -> R<usize> {
+    // A constant double mongod cannot make a long fails while it optimizes
+    // the pipeline, before any group starts.
+    if let Bson::Double(d) = n_expr {
+        if !(d.is_finite() && (-9.223_372_036_854_776e18..9.223_372_036_854_776e18).contains(d)) {
+            let shown = if d.is_nan() {
+                "nan".to_string()
+            } else if *d > 0.0 {
+                "inf".to_string()
+            } else {
+                "-inf".to_string()
+            };
+            let shown = if d.is_finite() {
+                crate::format_double_g(*d)
+            } else {
+                shown
+            };
+            return Err(parse_error(
+                31109,
+                format!(
+                    "Failed to optimize pipeline :: caused by :: Can't coerce out of range value \
+                     {shown} to long"
+                ),
+            ));
+        }
+    }
+    match eval_or_missing(n_expr, &Document::new(), vars)? {
+        Some(v) => validate_n(&v),
+        None => Err(Fallback::mongo(
+            5787902,
+            "Value for 'n' must be of integral type, but found MISSING",
+        )),
+    }
+}
+
+/// The array a `$concatArrays` / `$setUnion` accumulator takes from one
+/// document, or mongod's TypeMismatch.
+fn array_operand(op: &str, v: Bson) -> R<Vec<Bson>> {
+    match v {
+        Bson::Array(a) => Ok(a),
+        other => Err(Fallback::mongo(
+            14,
+            format!(
+                "{op} requires array inputs, but input {} is of type {}",
+                crate::query::bson_value_repr(&other),
+                crate::query::bson_type_name(&other)
+            ),
+        )),
+    }
+}
+
+/// What a mongod without a JavaScript engine answers when a document reaches
+/// `$accumulator` (measured 8.2.11 `--noscripting`, 2026-10-22). Over no
+/// documents it is never called, and the pipeline succeeds there too.
+fn no_script_engine() -> Fallback {
+    Fallback::mongo(
+        31264,
+        "Cannot run server-side javascript without the javascript engine enabled",
+    )
 }
 
 /// Stable-sort the `(sort_values, output)` items by the `sortBy` directions and
@@ -992,6 +1113,10 @@ fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
             Acc::MergeObjects(merged) => {
                 out.insert(field.to_string(), Bson::Document(merged));
             }
+            Acc::ConcatArrays(items) | Acc::SetUnion(items) => {
+                out.insert(field.to_string(), Bson::Array(items));
+            }
+            Acc::Script => return Err(no_script_engine()),
             Acc::StdDev { values, pop } => {
                 // mongod always emits the field, answering `null` when the group
                 // held no numeric value. Omitting it (which the pure code also
@@ -1053,6 +1178,8 @@ pub(crate) fn finalize_window_value(acc: Acc) -> R<Bson> {
         // Empty window -> {} (a fresh accumulator over zero docs), matching
         // `_empty_window_value("$mergeObjects")`.
         Acc::MergeObjects(merged) => Bson::Document(merged),
+        Acc::ConcatArrays(items) | Acc::SetUnion(items) => Bson::Array(items),
+        Acc::Script => return Err(no_script_engine()),
         // A window writes a value into every row: empty / degenerate -> null.
         Acc::StdDev { values, pop } => std_dev(&values, pop).map_or(Bson::Null, Bson::Double),
         Acc::Percentile {
@@ -1305,6 +1432,260 @@ fn collect_fields(expr: &Bson, out: &mut std::collections::BTreeSet<String>) -> 
     }
 }
 
+/// The accumulators `$group`, `$bucket` and `$bucketAuto` know.
+const ACCUMULATORS: &[&str] = &[
+    "$sum",
+    "$count",
+    "$avg",
+    "$min",
+    "$max",
+    "$first",
+    "$last",
+    "$push",
+    "$addToSet",
+    "$mergeObjects",
+    "$stdDevPop",
+    "$stdDevSamp",
+    "$firstN",
+    "$lastN",
+    "$maxN",
+    "$minN",
+    "$top",
+    "$bottom",
+    "$topN",
+    "$bottomN",
+    "$median",
+    "$percentile",
+    "$concatArrays",
+    "$setUnion",
+    "$accumulator",
+];
+
+/// A number's value as a double -- int, long, double or Decimal128, and never
+/// a bool, which mongod's argument checks refuse (`buckets: true` is 40241;
+/// measured 8.2.11, 2026-10-23). A Decimal128 that is not a whole long reads
+/// as NaN, so it fails an integral check.
+fn number_value(v: &Bson) -> Option<f64> {
+    match v {
+        Bson::Int32(n) => Some(f64::from(*n)),
+        Bson::Int64(n) => Some(*n as f64),
+        Bson::Double(d) => Some(*d),
+        Bson::Decimal128(_) => Some(
+            decimal::decimal_to_i64_exact(v)
+                .map(|n| n as f64)
+                .unwrap_or(f64::NAN),
+        ),
+        _ => None,
+    }
+}
+
+fn parse_error(code: i32, msg: impl Into<String>) -> Fallback {
+    Fallback::mongo(code, msg).bare()
+}
+
+/// `AccumulationStatement::parseAccumulationStatement`: one output field of a
+/// `$group` (or of a `$bucket` / `$bucketAuto` `output`), checked as mongod
+/// parses it -- an accumulator object (40234), a field name without `.`
+/// (40235) or a leading `$` (40236), one operator (40238) whose argument is
+/// not an array (40237), a known accumulator (15952) -- then the accumulator's
+/// own argument. Every one is a parse error: an empty collection reports it.
+fn parse_accumulator<'a>(field: &'a str, spec: &'a Bson) -> R<Compiled<'a>> {
+    let op_doc = match spec {
+        Bson::Document(d) if d.keys().next().is_some_and(|k| k.starts_with('$')) => d,
+        _ => {
+            return Err(parse_error(
+                40234,
+                format!("The field '{field}' must be an accumulator object"),
+            ))
+        }
+    };
+    if field.contains('.') {
+        return Err(parse_error(
+            40235,
+            format!("The field name '{field}' cannot contain '.'"),
+        ));
+    }
+    if field.starts_with('$') {
+        return Err(parse_error(
+            40236,
+            format!("The field name '{field}' cannot be an operator name"),
+        ));
+    }
+    if op_doc.len() != 1 {
+        return Err(parse_error(
+            40238,
+            format!(
+                "The field '{field}' must specify one accumulator: {field}: {}",
+                crate::query::bson_value_repr(spec)
+            ),
+        ));
+    }
+    let (op, arg) = op_doc.iter().next().expect("one field");
+    if matches!(arg, Bson::Array(_)) {
+        return Err(parse_error(
+            40237,
+            format!("The {op} accumulator is a unary operator"),
+        ));
+    }
+    if !ACCUMULATORS.contains(&op.as_str()) {
+        return Err(parse_error(15952, format!("unknown group operator '{op}'")));
+    }
+    check_accumulator_argument(op, arg)?;
+    Ok(Compiled { field, op, arg })
+}
+
+/// Each accumulator's own parser: what its argument must look like.
+fn check_accumulator_argument(op: &str, arg: &Bson) -> R<()> {
+    let spec = |code: i32| {
+        parse_error(
+            code,
+            format!(
+                "specification must be an object; found {op}: {}",
+                crate::query::bson_value_repr(arg)
+            ),
+        )
+    };
+    match op {
+        "$count" => {
+            if !matches!(arg, Bson::Document(d) if d.is_empty()) {
+                return Err(parse_error(14, "$count takes no arguments, i.e. $count:{}"));
+            }
+        }
+        "$accumulator" => {
+            if !matches!(arg, Bson::Document(_)) {
+                return Err(parse_error(
+                    4544703,
+                    format!(
+                        "$accumulator expects an object as an argument; found: {}",
+                        crate::query::bson_type_name(arg)
+                    ),
+                ));
+            }
+        }
+        // `AccumulatorN::parseArgs`.
+        "$firstN" | "$lastN" | "$maxN" | "$minN" => {
+            let Bson::Document(d) = arg else {
+                return Err(spec(if matches!(op, "$firstN" | "$lastN") {
+                    5787801
+                } else {
+                    5787900
+                }));
+            };
+            for (name, value) in d {
+                if name != "n" && name != "input" {
+                    return Err(parse_error(
+                        5787901,
+                        format!("Unknown argument for 'n' operator: {name}"),
+                    ));
+                }
+                expression_object_check(value)?;
+            }
+            if !d.contains_key("n") {
+                return Err(parse_error(5787906, "Missing value for 'n'"));
+            }
+            if !d.contains_key("input") {
+                return Err(parse_error(5787907, "Missing value for 'input'"));
+            }
+        }
+        // `accumulatorNParseArgs` and the sort pattern it builds.
+        "$top" | "$bottom" | "$topN" | "$bottomN" => {
+            let Bson::Document(d) = arg else {
+                return Err(spec(5788001));
+            };
+            let with_n = matches!(op, "$topN" | "$bottomN");
+            let mut sort_by = None;
+            for (name, value) in d {
+                match name.as_str() {
+                    "n" if with_n => expression_object_check(value)?,
+                    "output" => expression_object_check(value)?,
+                    "sortBy" => match value {
+                        Bson::Document(sb) => sort_by = Some(sb),
+                        _ => {
+                            return Err(parse_error(
+                                10065,
+                                "invalid parameter: expected an object (sortBy)",
+                            ))
+                        }
+                    },
+                    _ => {
+                        return Err(parse_error(
+                            5788002,
+                            format!("Unknown argument to {op} '{name}'"),
+                        ))
+                    }
+                }
+            }
+            if with_n && !d.contains_key("n") {
+                return Err(parse_error(5788003, "Missing value for 'n'"));
+            }
+            if !d.contains_key("output") {
+                return Err(parse_error(5788004, "Missing value for 'output'"));
+            }
+            let Some(sort_by) = sort_by else {
+                return Err(parse_error(5788005, "Missing value for 'sortBy'"));
+            };
+            for direction in sort_by.values() {
+                match direction {
+                    Bson::Document(m) if m.contains_key("$meta") => {
+                        if m.get("$meta") == Some(&Bson::String("textScore".into())) {
+                            return Err(parse_error(
+                                40218,
+                                "query requires text score metadata, but it is not available",
+                            ));
+                        }
+                        return Err(Fallback::Defer);
+                    }
+                    d if number_value(d).is_some_and(|x| x == 1.0 || x == -1.0) => {}
+                    d if number_value(d).is_some() => {
+                        return Err(parse_error(
+                            15975,
+                            "$sort key ordering must be 1 (for ascending) or -1 (for descending)",
+                        ))
+                    }
+                    other => {
+                        let field = sort_by
+                            .iter()
+                            .find(|(_, v)| *v == other)
+                            .map(|(k, _)| k.as_str())
+                            .unwrap_or_default();
+                        return Err(parse_error(
+                            15974,
+                            format!(
+                                "Illegal key in $sort specification: {field}: {}",
+                                crate::query::bson_value_repr(other)
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        _ => expression_object_check(arg)?,
+    }
+    Ok(())
+}
+
+/// `Expression::parseObject`'s first rule: an object whose first field names
+/// an operator is that one operator, and has no other field (15983). Walked
+/// through operator arguments, arrays and object expressions; a `$literal` is
+/// a value and is not looked into.
+fn expression_object_check(expr: &Bson) -> R<()> {
+    match expr {
+        Bson::Array(a) => a.iter().try_for_each(expression_object_check),
+        Bson::Document(d) => match d.iter().next() {
+            Some((k, _)) if k.starts_with('$') && d.len() > 1 => Err(parse_error(
+                15983,
+                format!(
+                    "An object representing an expression must have exactly one field: {}",
+                    crate::query::bson_value_repr(expr)
+                ),
+            )),
+            Some((k, _)) if k == "$literal" || k == "$const" => Ok(()),
+            _ => d.values().try_for_each(expression_object_check),
+        },
+        _ => Ok(()),
+    }
+}
+
 /// Compile the accumulator specs (each must be a single-op doc) and run the
 /// group. Shared by `$group` and `$sortByCount`.
 fn run_group(
@@ -1313,18 +1694,13 @@ fn run_group(
     docs: &[Document],
     vars: &Document,
 ) -> R<Vec<Document>> {
-    // Validate accumulator shape up front (each is `{op: arg}`).
+    // Every accumulator is parsed before any document is read.
+    expression_object_check(id_expr)?;
     let mut compiled: Vec<Compiled> = Vec::with_capacity(accumulators.len());
     for (field, spec) in accumulators {
-        let Bson::Document(d) = spec else {
-            return Err(Fallback::Defer); // Python raises
-        };
-        if d.len() != 1 {
-            return Err(Fallback::Defer);
-        }
-        let (op, arg) = d.iter().next().unwrap();
-        new_acc(op)?; // reject unsupported ops before doing work
-        compiled.push(Compiled { field, op, arg });
+        let c = parse_accumulator(field, spec)?;
+        new_acc(c.op)?;
+        compiled.push(c);
     }
 
     let mut index: HashMap<GKey, usize> = HashMap::new();
@@ -1387,8 +1763,9 @@ pub fn sort_by_count_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R
     // non-expression object -> 40147) defers so Python raises the exact code.
     match spec {
         Bson::String(s) if s.starts_with('$') => {}
-        Bson::Document(d)
-            if d.len() == 1 && d.keys().next().is_some_and(|k| k.starts_with('$')) => {}
+        Bson::Document(d) if d.keys().next().is_some_and(|k| k.starts_with('$')) => {
+            expression_object_check(spec)?
+        }
         _ => return Err(Fallback::Defer),
     }
     let count_acc = bson::doc! {"$sum": 1i32};
@@ -1414,14 +1791,8 @@ fn accumulate_into(
 ) -> R<Document> {
     let mut compiled: Vec<(&str, &Bson, Acc)> = Vec::with_capacity(output_spec.len());
     for (field, spec) in output_spec {
-        let Bson::Document(d) = spec else {
-            return Err(Fallback::Defer); // Python raises (accumulator must be a doc)
-        };
-        if d.len() != 1 {
-            return Err(Fallback::Defer);
-        }
-        let (op, arg) = d.iter().next().unwrap();
-        compiled.push((field.as_str(), arg, new_acc(op)?));
+        let c = parse_accumulator(field, spec)?;
+        compiled.push((c.field, c.arg, new_acc(c.op)?));
     }
     for d in docs {
         for (_field, arg, acc) in compiled.iter_mut() {
@@ -1574,6 +1945,12 @@ pub fn bucket_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Do
         }
     }
 
+    // mongod rewrites `$bucket` into a `$group`, whose parse checks the
+    // output accumulators -- before any document is read.
+    expression_object_check(&group_by)?;
+    for (field, spec) in output_spec {
+        parse_accumulator(field, spec)?;
+    }
     // One bucket per lower boundary, then the default.
     let mut keys: Vec<Bson> = boundaries[..nb - 1].to_vec();
     if let Some(dv) = &default {
@@ -2036,32 +2413,127 @@ fn bucket_auto_granular(
 }
 
 pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Document>> {
+    // `DocumentSourceBucketAuto::createFromBson`: the arguments are checked
+    // in the order they are written, every error bare (measured 8.2.11,
+    // 2026-10-22).
     let Bson::Document(s) = spec else {
-        return Err(Fallback::Defer);
+        return Err(parse_error(
+            40240,
+            format!(
+                "The argument to $bucketAuto must be an object, but found type: {}",
+                crate::query::bson_type_name(spec)
+            ),
+        ));
     };
-    let Some(group_by) = s.get("groupBy") else {
-        return Err(Fallback::Defer);
+    let mut group_by = None;
+    let mut n_buckets: Option<i64> = None;
+    let mut output = None;
+    let mut granularity: Option<&str> = None;
+    for (name, value) in s {
+        match name.as_str() {
+            "groupBy" => {
+                let ok = match value {
+                    Bson::Document(d) => d.keys().next().is_some_and(|k| k.starts_with('$')),
+                    Bson::String(p) => p.len() > 1 && p.starts_with('$'),
+                    _ => false,
+                };
+                if !ok {
+                    return Err(parse_error(
+                        40239,
+                        format!(
+                            "The $bucketAuto 'groupBy' field must be defined as a $-prefixed \
+                             path or an expression object, but found: {}",
+                            crate::aggregate::render_value_compact(value)
+                        ),
+                    ));
+                }
+                expression_object_check(value)?;
+                group_by = Some(value);
+            }
+            "buckets" => {
+                let Some(f) = number_value(value) else {
+                    return Err(parse_error(
+                        40241,
+                        format!(
+                            "The $bucketAuto 'buckets' field must be a numeric value, but found \
+                             type: {}",
+                            crate::query::bson_type_name(value)
+                        ),
+                    ));
+                };
+                if f.fract() != 0.0 || f < f64::from(i32::MIN) || f > f64::from(i32::MAX) {
+                    return Err(parse_error(
+                        40242,
+                        format!(
+                            "The $bucketAuto 'buckets' field must be representable as a 32-bit \
+                             integer, but found {}",
+                            crate::format_double_g(f)
+                        ),
+                    ));
+                }
+                n_buckets = Some(f as i64);
+            }
+            "output" => {
+                let Bson::Document(d) = value else {
+                    return Err(parse_error(
+                        40244,
+                        format!(
+                            "The $bucketAuto 'output' field must be an object, but found type: {}",
+                            crate::query::bson_type_name(value)
+                        ),
+                    ));
+                };
+                for (field, acc) in d {
+                    parse_accumulator(field, acc)?;
+                }
+                output = Some(d);
+            }
+            "granularity" => {
+                let Bson::String(g) = value else {
+                    return Err(parse_error(
+                        40261,
+                        format!(
+                            "The $bucketAuto 'granularity' field must be a string, but found \
+                             type: {}",
+                            crate::query::bson_type_name(value)
+                        ),
+                    ));
+                };
+                if !is_valid_granularity(g) {
+                    return Err(parse_error(
+                        40257,
+                        format!("Unknown rounding granularity '{g}'"),
+                    ));
+                }
+                granularity = Some(g.as_str());
+            }
+            other => {
+                return Err(parse_error(
+                    40245,
+                    format!("Unrecognized option to $bucketAuto: {other}"),
+                ))
+            }
+        }
+    }
+    let (Some(group_by), Some(n_buckets)) = (group_by, n_buckets) else {
+        return Err(parse_error(
+            40246,
+            "$bucketAuto requires 'groupBy' and 'buckets' to be specified",
+        ));
     };
-    // buckets: a positive integer, or a whole double (mongod accepts 2.0). Any
-    // other value (bool, fractional double, non-positive, non-number, missing)
-    // defers so Python raises the exact code (40241/40242/40243/40246).
-    let n_buckets = match s.get("buckets") {
-        Some(Bson::Int32(n)) if *n >= 1 => *n as usize,
-        Some(Bson::Int64(n)) if *n >= 1 => *n as usize,
-        Some(Bson::Double(d)) if d.fract() == 0.0 && *d >= 1.0 => *d as usize,
-        _ => return Err(Fallback::Defer),
-    };
+    if n_buckets <= 0 {
+        return Err(parse_error(
+            40243,
+            format!(
+                "The $bucketAuto 'buckets' field must be greater than 0, but found: {n_buckets}"
+            ),
+        ));
+    }
+    let n_buckets = n_buckets as usize;
     let default_output = bson::doc! {"count": {"$sum": 1i32}};
-    let output_spec: &Document = match s.get("output") {
-        Some(Bson::Document(d)) if !d.is_empty() => d,
-        None | Some(Bson::Document(_)) => &default_output,
-        Some(_) => return Err(Fallback::Defer),
-    };
-    // A non-string / unknown granularity defers so Python raises 40261 / 40257.
-    let granularity: Option<&str> = match s.get("granularity") {
-        None => None,
-        Some(Bson::String(g)) if is_valid_granularity(g) => Some(g.as_str()),
-        Some(_) => return Err(Fallback::Defer),
+    let output_spec: &Document = match output {
+        Some(d) if !d.is_empty() => d,
+        _ => &default_output,
     };
 
     // Evaluate groupBy per doc, then sort by the byte-sortable encoding (the same
@@ -2099,14 +2571,14 @@ pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<V
 
     let mut out: Vec<Document> = Vec::new();
     let mut i = 0usize;
+    // mongod's `approxBucketSize`: the document count over the bucket count,
+    // ROUNDED (half away from zero) once, at least 1. Each bucket takes that
+    // many and the last takes the rest: 10 values in 3 buckets are 3/3/4,
+    // 8 are 3/3/2 (measured 8.2.11, 2026-10-22). A ceiling recomputed per
+    // bucket gave 4/3/3 for the first.
+    let bucket_size = std::cmp::max(1, (keyed.len() as f64 / n_buckets as f64).round() as usize);
     while i < keyed.len() && out.len() < n_buckets {
         let is_last = out.len() == n_buckets - 1;
-        // The REMAINDER goes to the earlier buckets: 8 values into 3 buckets is
-        // 3/3/2, not 2/3/3. Recomputed each time from what is left, so a bucket
-        // that grew to keep equal values together does not distort the ones
-        // after it (measured 8.2.11, 2026-09-09, at 2 / 3 / 4 buckets).
-        let remaining_buckets = n_buckets - out.len();
-        let bucket_size = std::cmp::max(1, (keyed.len() - i).div_ceil(remaining_buckets));
         let mut end = if is_last {
             keyed.len()
         } else {
