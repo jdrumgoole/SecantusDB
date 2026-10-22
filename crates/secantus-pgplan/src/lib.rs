@@ -95,6 +95,7 @@ pub mod formatting;
 pub mod fts;
 mod func_cast;
 mod funcsig;
+mod search_cycle;
 mod strict_fold;
 pub mod timezones;
 mod ts_debug;
@@ -16198,6 +16199,13 @@ fn materialize_nested_recursive_ctes(
     select(node, lookup, params, run)
 }
 
+/// Does a CTE's query read the CTE itself (`cterecursive`, which the raw
+/// parse tree leaves unset)?
+fn reads_relation_node(c: &pg_query::protobuf::CommonTableExpr) -> bool {
+    matches!(c.ctequery.as_deref().and_then(|q| q.node.as_ref()),
+        Some(N::SelectStmt(body)) if reads_relation(body, &c.ctename))
+}
+
 fn materialize_recursive_ctes(
     node: &mut pg_query::protobuf::Node,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -16223,6 +16231,9 @@ fn materialize_recursive_ctes(
         let Some(N::CommonTableExpr(c)) = cte.node.as_mut() else {
             return Err(Error::Unsupported("this WITH item".into()));
         };
+        // SEARCH and CYCLE become columns of the CTE's two terms (RP-062).
+        c.cterecursive = c.cterecursive || reads_relation_node(c);
+        search_cycle::rewrite(c)?;
         let Some(N::SelectStmt(body)) = c.ctequery.as_deref().and_then(|q| q.node.as_ref()) else {
             return Err(Error::Unsupported("a data-modifying WITH".into()));
         };
@@ -19493,6 +19504,11 @@ fn plan_select(
     // away before any of the shape checks run -- every one of them would
     // otherwise have to know about it.
     if s.with_clause.is_some() {
+        // SEARCH and CYCLE are rewritten into their CTE's terms first, as
+        // PostgreSQL's rewriter does (RP-062).
+        if let Some(rewritten) = search_cycle::rewrite_select(s)? {
+            return plan_select(&rewritten, lookup, params);
+        }
         let s = locking_past_ctes(s)?;
         return plan_select(&inline_ctes(&s)?, lookup, params);
     }
