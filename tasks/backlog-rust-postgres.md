@@ -785,6 +785,14 @@ fixed in the same batch; their tests there are regression tests.
       PostgreSQL does -- and any `ORDER BY oid` come out in another order.
       Backlog-ID: RP-137
       Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order]
+- [ ] **Two schemas' routines of one name collide.** A routine's catalog
+      key is its name and arity (`name/nargs`), not its schema, so after
+      `create function a.h()` the `create function b.h()` that PostgreSQL
+      takes is 42723 (`function "h" already exists with same argument
+      types`), and `b.h()` calls `a.h()`. The key would need the schema, and
+      every reader of `__sql_functions__` with it.
+      Backlog-ID: RP-143
+      Verify: tests/backlog/test_rp_batch30.py::test_scenario[two schemas' routines of one name]
 
 ## Found by batch 26 (2026-10-22)
 

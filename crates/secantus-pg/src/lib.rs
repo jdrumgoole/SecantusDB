@@ -33611,10 +33611,38 @@ impl PgHandler {
                             }
                         })
                         .collect();
+                    // The routines it holds.
+                    let in_schema: HashSet<String> = self
+                        .type_catalog_docs(Self::FUNCTION_COLLECTION)?
+                        .iter()
+                        .filter(|d| d.get_str("schema") == Ok(name.as_str()))
+                        .filter_map(|d| d.get_str("_id").ok().map(str::to_string))
+                        .collect();
+                    let routines: Vec<UserFunction> = self
+                        .functions()?
+                        .into_iter()
+                        .filter(|f| in_schema.contains(&f.key))
+                        .collect();
+                    descs.extend(routines.iter().map(|f| {
+                        let args: Vec<String> = f
+                            .param_types
+                            .iter()
+                            .map(|t| self.display_type_name(t))
+                            .collect();
+                        let kind = if f.is_procedure {
+                            "procedure"
+                        } else {
+                            "function"
+                        };
+                        // `format_procedure`'s form: no blank after a comma.
+                        format!("{kind} {name}.{}({})", f.name, args.join(","))
+                    }));
                     // The relations it holds, stored as `schema.name`.
                     let relations = self.schema_relations(name)?;
                     descs.extend(relations.iter().map(|(kind, key)| format!("{kind} {key}")));
-                    if (!members.is_empty() || !relations.is_empty()) && !cascade {
+                    if (!members.is_empty() || !relations.is_empty() || !routines.is_empty())
+                        && !cascade
+                    {
                         let mut info = ErrorInfo::new(
                             "ERROR".into(),
                             "2BP01".into(),
@@ -33633,6 +33661,10 @@ impl PgHandler {
                     }
                     self.cascade_notice(&descs);
                     self.drop_schema_relations(&relations)?;
+                    for f in &routines {
+                        self.delete_type_doc(Self::FUNCTION_COLLECTION, &f.key)?;
+                        self.drop_object_acl("function", &f.key)?;
+                    }
                     for (coll, id) in &members {
                         self.delete_type_doc(coll, id)?;
                     }

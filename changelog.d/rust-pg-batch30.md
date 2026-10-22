@@ -78,7 +78,16 @@ behind with an owner that no longer exists.
   `pg_proc.proacl` shows a routine's grants in ACL order (it was always
   NULL).
 
+- Fixes RP-144 (`tests/backlog/test_rp_batch30.py::test_scenario[DROP SCHEMA drops the routines in it]`):
+  DROP SCHEMA ... CASCADE drops the functions and procedures in the schema,
+  and without CASCADE they are 2BP01. They used to stay behind, listed in
+  `public`.
+
 #### Known
+
+- RP-143, filed: two schemas' routines of one name collide, because a
+  routine's catalog key has no schema
+  (`tests/backlog/test_rp_batch30.py::test_scenario[two schemas' routines of one name]`).
 
 - RP-137, filed: a sequence's, view's and index's oid is a hash of its name,
   so oids do not rise in creation order as PostgreSQL's do, and DROP ROLE's

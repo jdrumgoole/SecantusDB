@@ -348,6 +348,32 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
             "drop role rp30_q",
         ],
     ),
+    # ------------------------------------------ RP-143, RP-144 schemas' routines
+    "two schemas' routines of one name": (
+        "RP-143",
+        True,
+        [
+            "create schema rp30_za",
+            "create schema rp30_zb",
+            "create function rp30_za.h() returns int language sql as 'select 1'",
+            "create function rp30_zb.h() returns int language sql as 'select 2'",
+            "select rp30_za.h(), rp30_zb.h()",
+            "drop schema rp30_za, rp30_zb cascade",
+        ],
+    ),
+    "DROP SCHEMA drops the routines in it": (
+        "RP-144",
+        False,
+        [
+            "create schema rp30_zs",
+            "create function rp30_zs.g(int, text) returns int language sql as 'select 3'",
+            "!drop schema rp30_zs",
+            "drop schema rp30_zs cascade",
+            "select count(*) from pg_proc where proname = 'g'",
+            "create function g(int, text) returns int language sql as 'select 4'",
+            "drop function g(int, text)",
+        ],
+    ),
     # ------------------------------------------ RP-141 DDL in a PL/pgSQL body
     "a DO block drops a view, then its table": (
         "RP-141",
@@ -424,6 +450,23 @@ def test_role_setting_sources(rust_pg: Any) -> None:
 
 
 EXPECTED: dict[str, Any] = {
+    "two schemas' routines of one name": [
+        "CREATE SCHEMA",
+        "CREATE SCHEMA",
+        "CREATE FUNCTION",
+        "CREATE FUNCTION",
+        [("1", "2")],
+        "DROP SCHEMA",
+    ],
+    "DROP SCHEMA drops the routines in it": [
+        "CREATE SCHEMA",
+        "CREATE FUNCTION",
+        ("ERR", "2BP01", "function rp30_zs.g(integer,text) depends on schema rp30_zs"),
+        "DROP SCHEMA",
+        [("0",)],
+        "CREATE FUNCTION",
+        "DROP FUNCTION",
+    ],
     "WHERE CURRENT OF a cursor not on a row": [
         "CREATE TABLE",
         "INSERT 0 1",
