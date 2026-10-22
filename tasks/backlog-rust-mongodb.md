@@ -559,16 +559,9 @@ every stage, as mongod folds them.
 RM-245 closed after that: the Decimal128 transcendentals now differ from
 mongod only in the authorised last digit.
 RM-253 closed after that: `$bucket` parses, places and orders as mongod's.
+RM-258 closed last: a no-colon `HHMM` time is ten seconds early on mongod,
+whose timelib leaves the microseconds unset, and here too.
 
-- [ ] **`$dateFromString` of a five-digit year is ten seconds out.**
-  `"10000-01-01"` is read by timelib as the no-colon time `1000` and the
-  date `0-01-01`; mongod answers 2000-01-01T09:59:50Z and the Rust port of
-  the scanner 10:00:00 (so does `"1000 0-01-01"`, and `"2000 0-03-04"` is
-  19:59:50 on mongod). Some rule after `gnunocolon` in timelib's
-  `parse_date.re` subtracts the ten seconds and the port does not; found by
-  `tools/probes/expression_shapes.py`, not yet traced.
-  Backlog-ID: RM-258
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_date_from_string_five_digit_year
 
 ### 7.087 Window functions and the operator tail against mongod -- 2026-10-21
 

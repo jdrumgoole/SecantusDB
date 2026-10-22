@@ -190,9 +190,15 @@ fn from_string(text: &str, parsed: Parsed) -> Result<Time, String> {
 /// even when it would fit in milliseconds. There is no other bound: year 0
 /// and year -100000 are ordinary dates.
 pub(crate) fn millis(t: &Time) -> Result<i64, ()> {
-    let us = if t.us == UNSET { 0 } else { t.us };
+    // mongod computes `Seconds(sse) + Microseconds(us)` with `us` as timelib
+    // left it -- and timelib leaves it UNSET (-9999999) after a time it parsed
+    // without seconds' fraction from a rule that does not set it, such as
+    // `gnunocolon` (`"1000"` as 10:00). mongod zeroes it only when the whole
+    // time is missing, so `"10000-01-01"` is 2000-01-01T09:59:50Z: 9.999999
+    // seconds early, truncated to the millisecond. Measured against 8.2.11
+    // and traced in its own timelib, 2026-10-22 (RM-258).
     let micros = t.sse.checked_mul(1_000_000).ok_or(())?;
-    Ok(micros.checked_add(us).ok_or(())? / 1000)
+    Ok(micros.checked_add(t.us).ok_or(())? / 1000)
 }
 
 #[cfg(test)]
