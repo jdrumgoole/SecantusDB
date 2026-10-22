@@ -4650,7 +4650,7 @@ impl PgHandler {
         let version = catalog_cache()
             .version
             .load(std::sync::atomic::Ordering::SeqCst);
-        let serial = if overlay_empty && !self.any_temp_function() {
+        let serial = if overlay_empty && !self.any_temp_function() && !self.marks.roles_written() {
             0
         } else {
             self.session_serial
@@ -4708,10 +4708,17 @@ impl PgHandler {
         secantus_pgplan::view_dml::set_view_defaults(self.view_column_defaults());
         secantus_pgplan::partitions::set_tableoids(self.tableoid_expressions());
         secantus_pgplan::regobj::set_namespaces(self.namespaces());
+        // A role the open block created is named by `::regrole` in that
+        // block, as PostgreSQL's syscache sees its own transaction's rows.
+        let roles = if self.marks.roles_written() {
+            self.in_open_transaction(|| self.roles())
+        } else {
+            self.roles()
+        };
         secantus_pgplan::regobj::set_roles(
             std::iter::once((self.session_user_name(), 10i64))
                 .chain(
-                    self.roles()
+                    roles
                         .unwrap_or_default()
                         .into_iter()
                         .map(|r| (r.name, r.oid)),
@@ -16428,7 +16435,7 @@ impl PgHandler {
                     Column::new("relrowsecurity", "bool", false),
                     Column::new("relforcerowsecurity", "bool", false),
                     Column::new("relispartition", "bool", false),
-                    Column::new("relpartbound", "text", false),
+                    Column::new("relpartbound", "pg_node_tree", false),
                 ],
             )),
             "pg_namespace" => Some(TableDef::new(
@@ -16525,7 +16532,7 @@ impl PgHandler {
                     Column::new("oid", "oid", false),
                     Column::new("adrelid", "oid", false),
                     Column::new("adnum", "int2", false),
-                    Column::new("adbin", "text", false),
+                    Column::new("adbin", "pg_node_tree", false),
                 ],
             )),
             "pg_type" => Some(TableDef::new(
@@ -17784,32 +17791,27 @@ impl PgHandler {
             }
             "pg_namespace" => {
                 let f = |name: &str| def.field_of(name).expect("column");
+                let roles = self.roles().unwrap_or_default();
                 self.namespaces()
                     .into_iter()
                     .map(|(name, oid)| {
                         let mut d = Document::new();
                         d.insert(f("oid"), Bson::Int64(oid));
-                        // `public` belongs to `pg_database_owner` since 15.
-                        d.insert(
-                            f("nspowner"),
-                            Bson::Int64(if name == "public" { 6171 } else { 10 }),
-                        );
-                        // initdb's ACLs (`pg_init_privs`); any other schema
-                        // has the default, NULL.
-                        let acl = |owner: &str| {
-                            Bson::Array(vec![
-                                Bson::String(format!("{owner}=UC/{owner}")),
-                                Bson::String(format!("=U/{owner}")),
-                            ])
-                        };
-                        d.insert(
-                            f("nspacl"),
-                            match name.as_str() {
-                                "public" => acl("pg_database_owner"),
-                                "pg_catalog" | "information_schema" => acl("postgres"),
-                                _ => Bson::Null,
-                            },
-                        );
+                        // `public` belongs to `pg_database_owner` since 15; a
+                        // schema CREATE SCHEMA made, to the role it names.
+                        let owner = self.schema_owner_name(&name).unwrap_or_else(|| {
+                            if name == "public" {
+                                "pg_database_owner".to_string()
+                            } else {
+                                "postgres".to_string()
+                            }
+                        });
+                        let owner_oid = roles
+                            .iter()
+                            .find(|r| r.name == owner)
+                            .map_or(RoleInfo::BOOTSTRAP_OID, |r| r.oid);
+                        d.insert(f("nspowner"), Bson::Int64(owner_oid));
+                        d.insert(f("nspacl"), self.schema_acl(&name, &owner));
                         d.insert(f("nspname"), name);
                         d
                     })
@@ -21530,6 +21532,8 @@ fn wire_type(pg_type: &str) -> Type {
         "bool" | "boolean" => Type::BOOL,
         "void" => Type::VOID,
         "cstring" => Type::CSTRING,
+        // `pg_attribute.attmissingval` (RP-107).
+        "anyarray" => Type::ANYARRAY,
         // `text` is oid 25, NOT varchar (1043). PostgreSQL distinguishes them
         // and clients read the oid: psycopg decodes both to `str` so a value
         // comparison never notices, but pgjdbc and pgx do.
@@ -32025,6 +32029,12 @@ impl PgHandler {
                 _ => None,
             }
         };
+        let types_dropped: Vec<String> = match &stmt {
+            Statement::DropType { names, .. } | Statement::DropDomain { names, .. } => {
+                names.clone()
+            }
+            _ => Vec::new(),
+        };
         let temp_created = match &stmt {
             Statement::CreateTable(def, _) if def.temp => Some(def.name.clone()),
             Statement::CreateTableAs {
@@ -32059,6 +32069,13 @@ impl PgHandler {
         }
         if let (Some((kind, object, schema)), Ok(_)) = (&created, &out) {
             if let Err(e) = self.apply_default_privileges(kind, object, schema) {
+                out = Err(e);
+            }
+        }
+        // A type is owned by the role that created it (`TypeCreate`'s
+        // `typowner = GetUserId()`); a DROP takes the owner with it.
+        if out.is_ok() {
+            if let Err(e) = self.note_type_owner(&types_dropped, created.as_ref()) {
                 out = Err(e);
             }
         }
@@ -32175,6 +32192,36 @@ impl PgHandler {
     /// under `pg_temp_N.name`, so no other session sees or collides with them.
     pub(crate) fn temp_schema_name(&self) -> String {
         format!("pg_temp_{}", self.session_serial)
+    }
+
+    /// Record the owner of the type a statement created, or forget the
+    /// owners of those it `dropped`. A type made by the bootstrap superuser needs no
+    /// record: `pg_type.typowner` defaults to it.
+    fn note_type_owner(
+        &self,
+        dropped: &[String],
+        created: Option<&(&str, String, String)>,
+    ) -> PgWireResult<()> {
+        let key = |name: &str| name.strip_prefix("public.").unwrap_or(name).to_string();
+        for name in dropped {
+            self.put_comment_doc(Self::TYPE_OWNER_COLLECTION, &key(name), None)?;
+        }
+        if let Some(("type", object, _)) = created {
+            let owner = self.current_role_name();
+            if self
+                .roles_shared()?
+                .iter()
+                .any(|r| r.name == owner && r.oid != RoleInfo::BOOTSTRAP_OID)
+            {
+                let name = key(object);
+                self.put_comment_doc(
+                    Self::TYPE_OWNER_COLLECTION,
+                    &name,
+                    Some(bson::doc! {"_id": &name, "owner": &owner}),
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Drop every temporary table this session created, as PostgreSQL does
@@ -32876,7 +32923,12 @@ impl PgHandler {
             Statement::CreateSchema {
                 name,
                 if_not_exists,
+                authorization,
             } => {
+                let owner = match authorization {
+                    Some(role) => self.grantee_name(&role)?,
+                    None => self.current_role_name(),
+                };
                 self.ensure_collection(Self::SCHEMA_COLLECTION)?;
                 let exists = !self
                     .storage
@@ -32898,8 +32950,7 @@ impl PgHandler {
                         format!("schema \"{name}\" already exists"),
                     ))));
                 }
-                let doc =
-                    bson::doc! {"_id": &name, "schema": &name, "owner": self.current_role_name()};
+                let doc = bson::doc! {"_id": &name, "schema": &name, "owner": owner};
                 // Noted for the rest of the transaction, as every other
                 // CREATE is: planning reads the catalog outside it, and a
                 // `create table s.t` after `create schema s` in one block

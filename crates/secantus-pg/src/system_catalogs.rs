@@ -457,6 +457,38 @@ impl PgHandler {
                 push(0, 1262, db.oid, o, "o");
             }
         }
+        // pg_shdepend is shared: every database's objects, each read as a
+        // connection to that database reads its catalogs.
+        for db in &databases {
+            let objects = if db.oid == here {
+                self.owned_objects(&role_oid)
+            } else {
+                let other = PgHandler::new(Arc::clone(&self.storage), Arc::clone(&self.databases));
+                let _ = other.db.set(db.name.clone());
+                other.owned_objects(&role_oid)
+            };
+            for (classid, oid, owner, acl) in objects {
+                push(db.oid, classid, oid, owner, "o");
+                for o in acl {
+                    push(db.oid, classid, oid, o, "a");
+                }
+            }
+        }
+        if databases.iter().any(|d| d.oid != here) {
+            // The other databases' reads published their catalogs to this
+            // thread's planner; put this connection's back.
+            self.install_user_types();
+        }
+        out
+    }
+
+    /// `(class oid, object oid, owner, other roles its ACL names)` for every
+    /// user object this database's pg_class, pg_proc and pg_type list.
+    fn owned_objects(
+        &self,
+        role_oid: &dyn Fn(&str) -> Option<i64>,
+    ) -> Vec<(i64, i64, i64, Vec<i64>)> {
+        let mut out = Vec::new();
         // (catalog, its class oid, the owner and ACL columns).
         for (catalog, classid, owner_col, acl_col) in [
             ("pg_class", 1259, "relowner", "relacl"),
@@ -486,27 +518,23 @@ impl PgHandler {
                 if oid < 16384 {
                     continue;
                 }
-                push(here, classid, oid, owner, "o");
-                let Some(Bson::Array(items)) = acl_f.as_ref().and_then(|a| r.get(a)) else {
-                    continue;
-                };
                 let mut named: Vec<i64> = Vec::new();
-                for item in items.iter().filter_map(Bson::as_str) {
-                    let Some((grantee, rest)) = item.split_once('=') else {
-                        continue;
-                    };
-                    let grantor = rest.rsplit_once('/').map_or("", |(_, g)| g);
-                    for name in [grantee, grantor] {
-                        if let Some(o) = (!name.is_empty()).then(|| role_oid(name)).flatten() {
-                            if o != owner && !named.contains(&o) {
-                                named.push(o);
+                if let Some(Bson::Array(items)) = acl_f.as_ref().and_then(|a| r.get(a)) {
+                    for item in items.iter().filter_map(Bson::as_str) {
+                        let Some((grantee, rest)) = item.split_once('=') else {
+                            continue;
+                        };
+                        let grantor = rest.rsplit_once('/').map_or("", |(_, g)| g);
+                        for name in [grantee, grantor] {
+                            if let Some(o) = (!name.is_empty()).then(|| role_oid(name)).flatten() {
+                                if o != owner && !named.contains(&o) {
+                                    named.push(o);
+                                }
                             }
                         }
                     }
                 }
-                for o in named {
-                    push(here, classid, oid, o, "a");
-                }
+                out.push((classid, oid, owner, named));
             }
         }
         out
@@ -564,13 +592,31 @@ impl PgHandler {
             .collect()
     }
 
-    /// `pg_largeobject`: each large object in `LOBLKSIZE` pages, the last one
-    /// short. The store keeps 256 KB chunks, so a page inside a stored chunk
-    /// that was never written shows as zeros where PostgreSQL has no page.
+    /// `pg_largeobject`: each page a write reached, as long as its furthest
+    /// byte (the object's page map). An older store's object, which has no
+    /// map, shows its bytes in contiguous `LOBLKSIZE` pages.
     fn largeobject_rows(&self, def: &TableDef) -> Vec<Document> {
         let f = |n: &str| def.field_of(n).expect("column");
         let mut out = Vec::new();
         for (oid, data) in self.large_objects() {
+            if let Ok(Some(pages)) = self.lo_pages(oid) {
+                for (pageno, len) in pages {
+                    let start = (pageno as usize) * LOBLKSIZE;
+                    let end = (start + len as usize).min(data.len());
+                    let mut d = Document::new();
+                    d.insert(f("loid"), Bson::Int64(oid));
+                    d.insert(f("pageno"), Bson::Int32(pageno as i32));
+                    d.insert(
+                        f("data"),
+                        Bson::Binary(bson::Binary {
+                            subtype: bson::spec::BinarySubtype::Generic,
+                            bytes: data.get(start..end).unwrap_or_default().to_vec(),
+                        }),
+                    );
+                    out.push(d);
+                }
+                continue;
+            }
             for (pageno, page) in data.chunks(LOBLKSIZE).enumerate() {
                 let mut d = Document::new();
                 d.insert(f("loid"), Bson::Int64(oid));

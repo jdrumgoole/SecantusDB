@@ -755,6 +755,8 @@ pub enum Statement {
     CreateSchema {
         name: String,
         if_not_exists: bool,
+        /// `AUTHORIZATION role`: the schema's owner.
+        authorization: Option<String>,
     },
     /// `CREATE TYPE <name> AS (<field type>, ...)` -- a composite type.
     CreateComposite {
@@ -4651,10 +4653,20 @@ fn plan_node(
                 action: Box::new(plan_grant(grant)?),
             })
         }
-        N::CreateSchemaStmt(c) => Ok(Statement::CreateSchema {
-            name: c.schemaname.clone(),
-            if_not_exists: c.if_not_exists,
-        }),
+        N::CreateSchemaStmt(c) => {
+            let authorization = c.authrole.as_ref().map(role_spec_name);
+            // `CREATE SCHEMA AUTHORIZATION r` names the schema after the role.
+            let name = if c.schemaname.is_empty() {
+                authorization.clone().unwrap_or_default()
+            } else {
+                c.schemaname.clone()
+            };
+            Ok(Statement::CreateSchema {
+                name,
+                if_not_exists: c.if_not_exists,
+                authorization,
+            })
+        }
         N::CreatedbStmt(c) => {
             use pg_query::protobuf::a_const::Val;
             let mut options = Vec::new();
@@ -17531,8 +17543,8 @@ fn resolve_sublinks_in_select_scoped(
     {
         resolve_sublinks_in_select(side, lookup, params, run)?;
     }
-    for item in &mut s.from_clause {
-        resolve_sublinks_in_from(item, lookup, params, run)?;
+    for (i, item) in s.from_clause.iter_mut().enumerate() {
+        resolve_sublinks_in_from(item, i > 0, lookup, params, run)?;
     }
 
     // A FILTER holding a subquery, as the CASE argument it is equivalent to.
@@ -17574,8 +17586,11 @@ fn resolve_sublinks_in_select_scoped(
     Ok(())
 }
 
+/// `has_left`: a FROM item stands to this one's left (see
+/// `rowsfrom::rewrite`).
 fn resolve_sublinks_in_from(
     item: &mut pg_query::protobuf::Node,
+    has_left: bool,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &mut Vec<Bson>,
     run: SubqueryRunner<'_>,
@@ -17585,7 +17600,11 @@ fn resolve_sublinks_in_from(
     // (`ARRAY(SELECT f(...))`) are resolved with the rest.
     if let Some(N::RangeFunction(rf)) = item.node.as_ref() {
         if rf.ordinality {
-            item.node = Some(rowsfrom::as_subselect(rf)?);
+            let mut rewritten = rowsfrom::as_subselect(rf)?;
+            if let N::RangeSubselect(rs) = &mut rewritten {
+                rs.lateral |= has_left;
+            }
+            item.node = Some(rewritten);
         }
     }
     match item.node.as_mut() {
@@ -17610,11 +17629,11 @@ fn resolve_sublinks_in_from(
             Ok(())
         }
         Some(N::JoinExpr(j)) => {
-            for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
-                .into_iter()
-                .flatten()
-            {
-                resolve_sublinks_in_from(side, lookup, params, run)?;
+            if let Some(l) = j.larg.as_deref_mut() {
+                resolve_sublinks_in_from(l, has_left, lookup, params, run)?;
+            }
+            if let Some(r) = j.rarg.as_deref_mut() {
+                resolve_sublinks_in_from(r, true, lookup, params, run)?;
             }
             Ok(())
         }
@@ -18324,6 +18343,15 @@ fn resolve_one_sublink(
                 sl.testexpr = Some(Box::new(t));
             }
             return correlated::correlate(&sl, &inner, lookup, params, outer);
+        }
+        // A bare name in a FROM function's arguments that neither the
+        // subquery nor the query around it has is PostgreSQL's 42703.
+        Err(Error::Unsupported(_))
+            if correlated::unknown_function_arg(&inner, outer, lookup).is_some() =>
+        {
+            return Err(Error::UndefinedColumn(
+                correlated::unknown_function_arg(&inner, outer, lookup).expect("checked"),
+            ));
         }
         Err(e) => return Err(e),
     };
@@ -28784,6 +28812,12 @@ fn text_type_oid(name: &str) -> Option<i64> {
     let Some((parts, array)) = parsed_type_name(name) else {
         return user_type_or_array_oid(name);
     };
+    // A bare name finds a `public` type only while `public` is on the search
+    // path (`TypenameGetTypid`): pg_dump sets it empty, and `'mood'::regtype`
+    // is then 42704, `to_regtype('mood')` NULL.
+    if parts.len() == 1 && !schemas::search_path().iter().any(|s| s == "public") {
+        return None;
+    }
     let base = match parts
         .iter()
         .map(String::as_str)
@@ -28808,7 +28842,7 @@ fn text_type_oid(name: &str) -> Option<i64> {
     })
 }
 
-fn user_type_or_array_oid(name: &str) -> Option<i64> {
+pub(crate) fn user_type_or_array_oid(name: &str) -> Option<i64> {
     let trimmed = name.trim();
     let element = if let Some(e) = trimmed.strip_suffix("[]") {
         Some(e.trim_end())

@@ -48,8 +48,8 @@ pub(crate) fn extra_columns(name: &str) -> &'static [(&'static str, &'static str
             ("indimmediate", "bool"),
             ("indisreplident", "bool"),
             ("indnullsnotdistinct", "bool"),
-            ("indexprs", "text"),
-            ("indpred", "text"),
+            ("indexprs", "pg_node_tree"),
+            ("indpred", "pg_node_tree"),
             ("indclass", "oidvector"),
             ("indoption", "int2vector"),
             ("indcollation", "oidvector"),
@@ -103,7 +103,7 @@ pub(crate) fn extra_columns(name: &str) -> &'static [(&'static str, &'static str
             ("prosupport", "regproc"),
             ("proconfig", "text[]"),
             ("provariadic", "oid"),
-            ("prosqlbody", "text"),
+            ("prosqlbody", "pg_node_tree"),
             ("proargmodes", "\"char\"[]"),
             ("proallargtypes", "oid[]"),
             ("pronargdefaults", "int2"),
@@ -190,8 +190,8 @@ pub(crate) fn pg_policy_def() -> TableDef {
             Column::new("polcmd", secantus_pgplan::QUOTED_CHAR, false),
             Column::new("polpermissive", "bool", false),
             Column::new("polroles", "oid[]", false),
-            Column::new("polqual", "text", false),
-            Column::new("polwithcheck", "text", false),
+            Column::new("polqual", "pg_node_tree", false),
+            Column::new("polwithcheck", "pg_node_tree", false),
         ],
     )
 }
@@ -1339,10 +1339,19 @@ impl PgHandler {
                                             .count()
                                     })
                                     .unwrap_or(0);
+                                // A column the child declares beside a
+                                // parent's is merged and still local.
+                                let declared = table_by_oid(int(get(row, "attrelid")))
+                                    .and_then(|t| t.column(&text(get(row, "attname"))))
+                                    .is_some_and(|col| {
+                                        col.extra
+                                            .get_bool(secantus_pgplan::inherit::LOCAL_KEY)
+                                            .unwrap_or(false)
+                                    });
                                 if c == "attinhcount" {
                                     Bson::Int32(parents as i32)
                                 } else {
-                                    Bson::Boolean(parents == 0)
+                                    Bson::Boolean(parents == 0 || declared)
                                 }
                             }
                             "attstattarget" | "attcacheoff" => Bson::Int32(-1),

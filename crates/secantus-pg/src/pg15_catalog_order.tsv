@@ -23,7 +23,7 @@ pg_attribute	attcollation	oid
 pg_attribute	attacl	aclitem[]
 pg_attribute	attoptions	text[]
 pg_attribute	attfdwoptions	text[]
-pg_attribute	attmissingval	text
+pg_attribute	attmissingval	anyarray
 pg_authid	oid	oid
 pg_authid	rolname	name
 pg_authid	rolsuper	bool
@@ -68,7 +68,7 @@ pg_class	relfrozenxid	xid
 pg_class	relminmxid	xid
 pg_class	relacl	aclitem[]
 pg_class	reloptions	text[]
-pg_class	relpartbound	text
+pg_class	relpartbound	pg_node_tree
 pg_collation	oid	oid
 pg_collation	collname	name
 pg_collation	collnamespace	oid
@@ -105,7 +105,7 @@ pg_constraint	conppeqop	oid[]
 pg_constraint	conffeqop	oid[]
 pg_constraint	confdelsetcols	int2[]
 pg_constraint	conexclop	oid[]
-pg_constraint	conbin	text
+pg_constraint	conbin	pg_node_tree
 pg_database	oid	oid
 pg_database	datname	name
 pg_database	datdba	oid
@@ -153,8 +153,8 @@ pg_index	indkey	int2vector
 pg_index	indcollation	oidvector
 pg_index	indclass	oidvector
 pg_index	indoption	int2vector
-pg_index	indexprs	text
-pg_index	indpred	text
+pg_index	indexprs	pg_node_tree
+pg_index	indpred	pg_node_tree
 pg_language	oid	oid
 pg_language	lanname	name
 pg_language	lanowner	oid
@@ -197,7 +197,7 @@ pg_partitioned_table	partdefid	oid
 pg_partitioned_table	partattrs	int2vector
 pg_partitioned_table	partclass	oidvector
 pg_partitioned_table	partcollation	oidvector
-pg_partitioned_table	partexprs	text
+pg_partitioned_table	partexprs	pg_node_tree
 pg_prepared_statements	name	text
 pg_prepared_statements	statement	text
 pg_prepared_statements	prepare_time	timestamptz
@@ -228,11 +228,11 @@ pg_proc	proargtypes	oidvector
 pg_proc	proallargtypes	oid[]
 pg_proc	proargmodes	"char"[]
 pg_proc	proargnames	text[]
-pg_proc	proargdefaults	text
+pg_proc	proargdefaults	pg_node_tree
 pg_proc	protrftypes	oid[]
 pg_proc	prosrc	text
 pg_proc	probin	text
-pg_proc	prosqlbody	text
+pg_proc	prosqlbody	pg_node_tree
 pg_proc	proconfig	text[]
 pg_proc	proacl	aclitem[]
 pg_range	rngtypid	oid
@@ -248,8 +248,8 @@ pg_rewrite	ev_class	oid
 pg_rewrite	ev_type	"char"
 pg_rewrite	ev_enabled	"char"
 pg_rewrite	is_instead	bool
-pg_rewrite	ev_qual	text
-pg_rewrite	ev_action	text
+pg_rewrite	ev_qual	pg_node_tree
+pg_rewrite	ev_action	pg_node_tree
 pg_roles	rolname	name
 pg_roles	rolsuper	bool
 pg_roles	rolinherit	bool
@@ -279,7 +279,7 @@ pg_trigger	tginitdeferred	bool
 pg_trigger	tgnargs	int2
 pg_trigger	tgattr	int2vector
 pg_trigger	tgargs	bytea
-pg_trigger	tgqual	text
+pg_trigger	tgqual	pg_node_tree
 pg_trigger	tgoldtable	name
 pg_trigger	tgnewtable	name
 pg_type	oid	oid
@@ -311,6 +311,6 @@ pg_type	typbasetype	oid
 pg_type	typtypmod	int4
 pg_type	typndims	int4
 pg_type	typcollation	oid
-pg_type	typdefaultbin	text
+pg_type	typdefaultbin	pg_node_tree
 pg_type	typdefault	text
 pg_type	typacl	aclitem[]

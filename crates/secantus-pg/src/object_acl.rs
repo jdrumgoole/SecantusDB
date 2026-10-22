@@ -136,6 +136,63 @@ impl PgHandler {
         }
     }
 
+    /// A schema's `nspacl`: initdb's for the built-in schemas until a GRANT or
+    /// REVOKE records one, NULL (the default) for any other until then; a
+    /// recorded one is the owner's `UC` and each grantee's privileges, granted
+    /// by the owner.
+    pub(crate) fn schema_acl(&self, name: &str, owner: &str) -> Bson {
+        let item = |grantee: &str, privs: &[String], options: &[String]| -> Option<String> {
+            let mut letters = String::new();
+            for (word, letter) in [("USAGE", 'U'), ("CREATE", 'C')] {
+                if privs.iter().any(|p| p == word) {
+                    letters.push(letter);
+                    if options.iter().any(|p| p == word) {
+                        letters.push('*');
+                    }
+                }
+            }
+            (!letters.is_empty()).then(|| {
+                let grantee = if grantee.eq_ignore_ascii_case("PUBLIC") {
+                    ""
+                } else {
+                    grantee
+                };
+                format!("{grantee}={letters}/{owner}")
+            })
+        };
+        let Some(_) = self.object_acl_doc("schema", name) else {
+            return match name {
+                "public" | "pg_catalog" | "information_schema" => Bson::Array(vec![
+                    Bson::String(format!("{owner}=UC/{owner}")),
+                    Bson::String(format!("=U/{owner}")),
+                ]),
+                _ => Bson::Null,
+            };
+        };
+        let mut items = vec![Bson::String(format!("{owner}=UC/{owner}"))];
+        for (grantee, privs, options) in self.object_grants("schema", name) {
+            if grantee == owner {
+                continue;
+            }
+            if let Some(i) = item(&grantee, &privs, &options) {
+                items.push(Bson::String(i));
+            }
+        }
+        Bson::Array(items)
+    }
+
+    /// The owner a schema's catalog row names: the one CREATE SCHEMA recorded,
+    /// `pg_database_owner` for `public`, the bootstrap superuser otherwise.
+    pub(crate) fn schema_owner_name(&self, name: &str) -> Option<String> {
+        self.type_catalog_docs(Self::SCHEMA_COLLECTION)
+            .ok()
+            .and_then(|docs| {
+                docs.iter()
+                    .find(|d| d.get_str("_id") == Ok(name))
+                    .and_then(|d| d.get_str("owner").ok().map(str::to_string))
+            })
+    }
+
     /// The owner of `(kind, name)`: recorded on a schema / sequence /
     /// function at CREATE; the login role for one made before that was.
     fn object_owner(&self, kind: &str, name: &str) -> String {

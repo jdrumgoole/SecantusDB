@@ -285,11 +285,37 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ---------------------------------------------------- filed, still open
     "a record's fields through a subquery": (
         "RP-098",
-        True,
+        False,
         [
             "select count(*) >= 0 from information_schema.element_types",
             "select pg_typeof(n)::text from (select (ss.x).n from (select "
             "information_schema._pg_expandarray(array[7]) as x) ss) t",
+        ],
+    ),
+    "a FROM function over the row to its left": (
+        "RP-113",
+        False,
+        [
+            "create temp table rp26_l (a int[])",
+            "insert into rp26_l values (array[5, 6])",
+            "select * from rp26_l, unnest(a) with ordinality u(x, n)",
+            "select * from rp26_l, lateral unnest(a) with ordinality u(x, n)",
+            "select (information_schema._pg_expandarray(a)).n from rp26_l",
+            "select pg_typeof(n)::text from (select (ss.x).n from (select "
+            "information_schema._pg_expandarray(a) as x from rp26_l) ss) t",
+            "select pg_typeof(x)::text from (select (ss.x).x from (select "
+            "information_schema._pg_expandarray(coalesce(proallargtypes, proargtypes::oid[])) "
+            "as x from pg_proc) ss) t limit 1",
+        ],
+    ),
+    "an unknown name in a FROM function beside a table": (
+        "RP-114",
+        False,
+        [
+            "create temp table rp26_u (a int[])",
+            "select * from rp26_u, unnest(b) u",
+            "select * from rp26_u, unnest(b) with ordinality u(x, n)",
+            "select * from rp26_u, lateral (select * from unnest(b)) q",
         ],
     ),
     "ANALYZE computes statistics": (
@@ -334,7 +360,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "schema privileges": (
         "RP-103",
-        True,
+        False,
         [
             "begin",
             "grant create on schema public to public",
@@ -344,7 +370,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "owners of what another role creates": (
         "RP-104",
-        True,
+        False,
         [
             "create role rp26_maker",
             "create schema rp26_sch authorization rp26_maker",
@@ -374,14 +400,14 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "an unknown name in a FROM function": (
         "RP-106",
-        True,
+        False,
         [
             "select (select max(x) from unnest(a) x) from (values (array[1, 5])) v(b)",
         ],
     ),
     "expression columns' types": (
         "RP-107",
-        True,
+        False,
         [
             "create table rp26_e (a int default 1)",
             "select pg_typeof(adbin)::text from pg_attrdef where adrelid = 'rp26_e'::regclass",
@@ -400,7 +426,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "a merged inherited column": (
         "RP-109",
-        True,
+        False,
         [
             "create table rp26_b (x int)",
             "create table rp26_k (x int, y int) inherits (rp26_b)",
@@ -411,7 +437,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "a type off the search path": (
         "RP-111",
-        True,
+        False,
         [
             "create type rp26_hidden as enum ('a')",
             "select pg_catalog.set_config('search_path', '', false)",
@@ -431,7 +457,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "a large object's pages": (
         "RP-110",
-        True,
+        False,
         [
             "select lo_from_bytea(260011, '\\x01')",
             "select lo_put(260011, 10000, '\\x02')",
@@ -482,6 +508,26 @@ def memberships(dsn: str) -> list[Any]:
         for s in ("drop database rp26_other", "drop role rp26_member", "drop role rp26_group"):
             _answer(conn, s)
     return [setup, seen]
+
+
+def other_database_owners(dsn: str) -> list[Any]:
+    """RP-104: pg_shdepend is shared, so another database's objects show."""
+    with psycopg.connect(dsn + " dbname=postgres", autocommit=True) as conn:
+        for s in ("create role rp26_shd", "create database rp26_shd_db owner rp26_shd"):
+            _answer(conn, s)
+    with psycopg.connect(dsn + " dbname=rp26_shd_db", autocommit=True) as conn:
+        for s in ("create table rp26_shd_t (a int)", "alter table rp26_shd_t owner to rp26_shd"):
+            _answer(conn, s)
+    with psycopg.connect(dsn + " dbname=postgres", autocommit=True) as conn:
+        seen = _answer(
+            conn,
+            "select d.datname, s.classid::regclass::text, s.deptype from pg_shdepend s "
+            "join pg_database d on d.oid = s.dbid join pg_roles r on r.oid = s.refobjid "
+            "where r.rolname = 'rp26_shd' order by 1, 2, 3",
+        )
+        for s in ("drop database rp26_shd_db", "drop role rp26_shd"):
+            _answer(conn, s)
+    return seen
 
 
 def copy_table(dsn: str) -> list[str]:
@@ -597,6 +643,21 @@ EXPECTED: dict[str, Any] = {
         "DROP TABLE",
     ],
     "a record's fields through a subquery": [[("True",)], [("integer",)]],
+    "a FROM function over the row to its left": [
+        "CREATE TABLE",
+        "INSERT 0 1",
+        [("[5, 6]", "5", "1"), ("[5, 6]", "6", "2")],
+        [("[5, 6]", "5", "1"), ("[5, 6]", "6", "2")],
+        [("1",), ("2",)],
+        [("integer",), ("integer",)],
+        [("oid",)],
+    ],
+    "an unknown name in a FROM function beside a table": [
+        "CREATE TABLE",
+        ("ERR", "42703"),
+        ("ERR", "42703"),
+        ("ERR", "42703"),
+    ],
     "a renamed table keeps its row type": [
         "CREATE TABLE",
         "ALTER TABLE",
@@ -702,6 +763,7 @@ EXPECTED: dict[str, Any] = {
         [("1",)],
         "DROP MATERIALIZED VIEW",
     ],
+    "other database owners": [("rp26_shd_db", "pg_class", "o")],
     "memberships": [
         ["CREATE ROLE", "CREATE ROLE", "GRANT ROLE", "CREATE DATABASE"],
         [("True", "1")],
@@ -843,6 +905,11 @@ def test_memberships_are_the_clusters(rust_pg: Any) -> None:
     assert memberships(_dsn(rust_pg)) == EXPECTED["memberships"]
 
 
+@pytest.mark.backlog_fixed("RP-104")
+def test_other_databases_objects_in_pg_shdepend(rust_pg: Any) -> None:
+    assert other_database_owners(_dsn(rust_pg)) == EXPECTED["other database owners"]
+
+
 @pytest.mark.backlog_fixed("RP-094")
 def test_copy_of_a_table(rust_pg: Any) -> None:
     assert copy_table(_dsn(rust_pg)) == EXPECTED["copy table"]
@@ -868,6 +935,7 @@ if __name__ == "__main__":
     }
     measured["memberships"] = memberships(dsn)
     measured["copy table"] = copy_table(dsn)
+    measured["other database owners"] = other_database_owners(dsn)
     print("EXPECTED: dict[str, Any] = " + pprint.pformat(measured, width=100, sort_dicts=True))
     port = int(dsn.split("port=")[1].split()[0])
     load_schema(port, _pg15_bin())
