@@ -508,6 +508,10 @@ const ALLOWED_FIELDS: &[(&str, &[&str])] = &[
         &["startDate", "endDate", "unit", "timezone", "startOfWeek"],
     ),
     ("$getField", &["field", "input"]),
+    (
+        "$convert",
+        &["input", "to", "onError", "onNull", "format", "byteOrder"],
+    ),
 ];
 
 /// Whether every key in `d` is one `op` recognises. `false` means some other
