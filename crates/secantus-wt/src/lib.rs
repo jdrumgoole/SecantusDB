@@ -524,6 +524,23 @@ impl Cursor {
         check(unsafe { cur_fn!(self, get_key)(self.ptr, &mut v as *mut i64) })?;
         Ok(v)
     }
+    /// `key_format=III` -- a `log:` cursor's key: the record's log file
+    /// number, its offset in the file, and its counter within the record.
+    pub fn set_key_iii(&self, a: u32, b: u32, c: u32) {
+        unsafe { cur_fn!(self, set_key)(self.ptr, a, b, c) };
+    }
+    pub fn get_key_iii(&self) -> Result<(u32, u32, u32)> {
+        let (mut a, mut b, mut c): (u32, u32, u32) = (0, 0, 0);
+        check(unsafe {
+            cur_fn!(self, get_key)(
+                self.ptr,
+                &mut a as *mut u32,
+                &mut b as *mut u32,
+                &mut c as *mut u32,
+            )
+        })?;
+        Ok((a, b, c))
+    }
     pub fn get_key_ss(&self) -> Result<(String, String)> {
         let (mut a, mut b): (*const c_char, *const c_char) = (ptr::null(), ptr::null());
         check(unsafe { cur_fn!(self, get_key)(self.ptr, &mut a, &mut b) })?;

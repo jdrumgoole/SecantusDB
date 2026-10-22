@@ -8487,10 +8487,14 @@ fn expand_views(s: &pg_query::protobuf::SelectStmt) -> Result<pg_query::protobuf
 }
 
 fn expand_views_in_from(item: &mut pg_query::protobuf::Node, depth: usize) -> Result<()> {
-    // A table row-level security restricts reads as its filtered subquery.
-    rls::expand_from(item)?;
-    // A parent read without ONLY reads its descendants too.
-    inherit::expand_from(item)?;
+    // Inside a FROM subquery only system views expand early; its tables'
+    // RLS and descendants are the subquery's own planning's to expand.
+    if !SYSTEM_VIEWS_ONLY.with(std::cell::Cell::get) {
+        // A table row-level security restricts reads as its filtered subquery.
+        rls::expand_from(item)?;
+        // A parent read without ONLY reads its descendants too.
+        inherit::expand_from(item)?;
+    }
     match item.node.as_mut() {
         Some(N::RangeVar(r)) => {
             if !r.catalogname.is_empty() {
@@ -8501,6 +8505,12 @@ fn expand_views_in_from(item: &mut pg_query::protobuf::Node, depth: usize) -> Re
             }
             // PostgreSQL's own views first: `pg_catalog` precedes the path.
             let system = system_views::definition(&r.schemaname, &r.relname);
+            // Inside a FROM subquery only the system views expand early (see
+            // `expand_views_in_select`); a user view waits for the subquery's
+            // own planning, as it always has.
+            if system.is_none() && SYSTEM_VIEWS_ONLY.with(std::cell::Cell::get) {
+                return Ok(());
+            }
             let definition = match system {
                 Some(d) => d.to_string(),
                 None if r.schemaname.is_empty() || r.schemaname == "public" => {
@@ -8570,8 +8580,49 @@ fn expand_views_in_from(item: &mut pg_query::protobuf::Node, depth: usize) -> Re
             }
             Ok(())
         }
+        // A system view read inside a FROM subquery expands with the rest,
+        // so the subqueries its body holds (an `information_schema` helper
+        // inlines to one) are resolved with the statement's: expanded only
+        // once the subquery was planned, they reached planning unresolved
+        // ("SubLink is not supported").
+        Some(N::RangeSubselect(rs)) => {
+            match rs.subquery.as_deref_mut().and_then(|q| q.node.as_mut()) {
+                Some(N::SelectStmt(sel)) => {
+                    let previous = SYSTEM_VIEWS_ONLY.with(|f| f.replace(true));
+                    let out = expand_views_in_select(sel, depth);
+                    SYSTEM_VIEWS_ONLY.with(|f| f.set(previous));
+                    out
+                }
+                _ => Ok(()),
+            }
+        }
         _ => Ok(()),
     }
+}
+
+thread_local! {
+    /// Set while `expand_views_in_from` walks into a FROM subquery: there it
+    /// expands only PostgreSQL's own views.
+    static SYSTEM_VIEWS_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `expand_views_in_from` over a subquery's FROM and its set operation's
+/// arms; one with its own WITH is left to its own planning, as the
+/// statement's is.
+fn expand_views_in_select(s: &mut pg_query::protobuf::SelectStmt, depth: usize) -> Result<()> {
+    if s.with_clause.is_some() {
+        return Ok(());
+    }
+    for item in &mut s.from_clause {
+        expand_views_in_from(item, depth)?;
+    }
+    for arm in [s.larg.as_deref_mut(), s.rarg.as_deref_mut()]
+        .into_iter()
+        .flatten()
+    {
+        expand_views_in_select(arm, depth)?;
+    }
+    Ok(())
 }
 
 /// The error for a statement whose target relation is not a table: a VIEW is
@@ -12900,7 +12951,6 @@ fn series_rows(
     call: &pg_query::protobuf::FuncCall,
     params: &[Bson],
 ) -> Result<SrfRows> {
-    const MAX_ROWS: usize = 10_000_000;
     let vals = call
         .args
         .iter()
@@ -12946,8 +12996,12 @@ fn series_rows(
             } else {
                 ord.is_ge()
             };
-            if !within || rows.len() >= MAX_ROWS {
+            if !within {
                 break;
+            }
+            // A long series is cancellable, as PostgreSQL's is row by row.
+            if rows.len() % 65_536 == 65_535 {
+                cancel::check()?;
             }
             rows.push(vec![numeric::numeric_bson(&cur)]);
             cur = match decimal_arith("+", &cur, &step) {
@@ -12981,8 +13035,8 @@ fn series_rows(
         return Err(zero_step());
     }
     while (span > 0 && cur <= stop) || (span < 0 && cur >= stop) {
-        if rows.len() >= MAX_ROWS {
-            break;
+        if rows.len() % 65_536 == 65_535 {
+            cancel::check()?;
         }
         rows.push(vec![timestamptz_value_from_micros(cur)]);
         match add_interval_to_micros(cur, &step, 1) {
@@ -18293,6 +18347,17 @@ fn resolve_one_sublink(
     if sl.sub_link_type == SubLinkType::ExistsSublink as i32 {
         simplify_exists(&mut inner);
     }
+    // Its system views expand first, as the statement's do, so the
+    // subqueries their bodies hold are resolved here too.
+    if inner.with_clause.is_none() && system_views::in_from(&inner.from_clause) {
+        let previous = SYSTEM_VIEWS_ONLY.with(|f| f.replace(true));
+        let expanded = inner
+            .from_clause
+            .iter_mut()
+            .try_for_each(|item| expand_views_in_from(item, 0));
+        SYSTEM_VIEWS_ONLY.with(|f| f.set(previous));
+        expanded?;
+    }
     resolve_sublinks_in_select(&mut inner, lookup, params, run)?;
     // The enclosing statements' CTEs are in scope, behind the subquery's own
     // (inlining takes the first definition of a name, so its own win). Added
@@ -20129,6 +20194,10 @@ fn plan_select(
     // `(r).f1` over a subquery / CTE record column has the type of the
     // ROW() argument it selects (see `record_fields`).
     if let Some(rewritten) = record_fields::rewrite(s, lookup)? {
+        return plan_select(&rewritten, lookup, params);
+    }
+    // A join on an `_pg_expandarray` field, as one on a column.
+    if let Some(rewritten) = record_fields::push_down(s, lookup)? {
         return plan_select(&rewritten, lookup, params);
     }
     cancel::check()?;
@@ -28456,6 +28525,24 @@ pub type CompositeFields = Vec<(String, String)>;
 /// A composite type as the planner holds it: `(resolution name, oid, fields)`.
 pub type CompositeType = (String, i64, CompositeFields);
 
+thread_local! {
+    /// The standalone composite types (`CREATE TYPE t AS (...)`), by
+    /// resolution name: relations of kind `c`, which a FROM or a DML names
+    /// to be told "is a composite type" -- not a table's row type.
+    static STANDALONE_COMPOSITES: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install the standalone composite types' names.
+pub fn set_standalone_composites(names: Vec<String>) {
+    STANDALONE_COMPOSITES.with(|c| *c.borrow_mut() = names);
+}
+
+/// Is `name` a standalone composite type?
+pub fn is_standalone_composite(name: &str) -> bool {
+    STANDALONE_COMPOSITES.with(|c| c.borrow().iter().any(|n| n == name))
+}
+
 /// Composite types: `(resolution name, oid, [(field name, field type)])`.
 pub fn set_user_composites(composites: Vec<CompositeType>) {
     PLAN_USER_COMPOSITES_BY_NAME
@@ -29174,6 +29261,15 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
                         prev = Some(target);
                         continue;
                     }
+                }
+                // int2vector -> an array keeps its lower bound of 0.
+                if target.ends_with("[]")
+                    && matches!(prev, Some("int2vector" | "oidvector"))
+                    && matches!(v, Bson::Array(_))
+                {
+                    v = arrays::bounded(cast_value(v, target)?, &[0]);
+                    prev = Some(target);
+                    continue;
                 }
                 // int2vector -> text is space-separated: `2 3`.
                 if matches!(target.as_str(), "text" | "varchar" | "name")
@@ -33636,6 +33732,19 @@ fn is_time_text(v: &Bson) -> bool {
         })
 }
 
+/// `infinity` / `-infinity` as a stored date or timestamp: `Some(true)` for
+/// the upper, `Some(false)` for the lower.
+pub(crate) fn infinite_datetime(v: &Bson) -> Option<bool> {
+    match v {
+        Bson::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "infinity" | "+infinity" => Some(true),
+            "-infinity" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
     // `pg_trgm`'s operators over two texts.
     if let (Bson::String(a), Bson::String(b)) = (&lhs, &rhs) {
@@ -33654,6 +33763,43 @@ pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
     // NULL propagates through every operator here (PG: `1 + NULL` is NULL).
     if lhs == Bson::Null || rhs == Bson::Null {
         return Ok(Bson::Null);
+    }
+    // An infinite date or timestamp (stored as its text) plus or minus a
+    // finite interval or day count is itself, as PostgreSQL's extreme values
+    // are (`timestamp_pl_interval`, `date_pli`) -- RP-060.
+    if matches!(op, "+" | "-") {
+        let finite_offset = |v: &Bson| {
+            Interval::from_bson(v).is_some() || matches!(v, Bson::Int32(_) | Bson::Int64(_))
+        };
+        if infinite_datetime(&lhs).is_some() && finite_offset(&rhs) {
+            return Ok(lhs);
+        }
+        if op == "+" && infinite_datetime(&rhs).is_some() && finite_offset(&lhs) {
+            return Ok(rhs);
+        }
+        // One date or timestamp less another, either infinite: 22008.
+        let datetime = |v: &Bson| {
+            infinite_datetime(v).is_some()
+                || matches!(v, Bson::DateTime(_))
+                || matches!(v, Bson::Document(d) if d.contains_key(COMPOSITE_DATE))
+                || matches!(v, Bson::String(s) if parse_date(s).is_ok())
+        };
+        if op == "-"
+            && (infinite_datetime(&lhs).is_some() || infinite_datetime(&rhs).is_some())
+            && datetime(&lhs)
+            && datetime(&rhs)
+        {
+            let dates = [&lhs, &rhs]
+                .iter()
+                .any(|v| matches!(v, Bson::String(s) if infinite_datetime(v).is_none() && parse_date(s).is_ok()));
+            return Err(Error::Sqlstate(
+                "22008",
+                format!(
+                    "cannot subtract infinite {}",
+                    if dates { "dates" } else { "timestamps" }
+                ),
+            ));
+        }
     }
     // box operators (`geo_ops.c`): equality and ordering compare AREAS within
     // EPSILON, `~=` compares corners, the rest are positional.
@@ -36452,6 +36598,17 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
             .ok_or_else(|| Error::Parse("cast with no operand".into()))?;
         let value = const_value(arg, params)?;
         let target = tc.type_name.as_ref().map(type_name_of).unwrap_or_default();
+        // An `int2vector` / `oidvector` as an array is subscripted from 0, as
+        // the vector is (`'1 2'::int2vector::int2[]` is `[0:1]={1,2}`).
+        if target.ends_with("[]")
+            && value != Bson::Null
+            && matches!(
+                static_type(arg, &value).as_str(),
+                "int2vector" | "oidvector"
+            )
+        {
+            return Ok(arrays::bounded(cast_value(value, &target)?, &[0]));
+        }
         // `cstring` is a value's output text (an I/O conversion): the text
         // cast's, except that a `char(n)` keeps its padding (`bpcharout`).
         if target == "cstring" {
@@ -39041,9 +39198,50 @@ fn coerce_to_column(def: &TableDef, field: &str, value: Bson) -> Result<Bson> {
 /// stored `10:00:00.123456`, whose millisecond part is equal, and `t =
 /// '...123456'` compares a value carrying the remainder. So each operator
 /// compares the millisecond part and, where that is equal, the remainder.
-/// `None` for a value that is not an instant (`infinity`, say), which keeps
-/// the plain comparison.
+/// `infinity` / `-infinity` are stored as their text, and PostgreSQL orders
+/// them above and below every instant (its `DT_NOEND` / `DT_NOBEGIN` are the
+/// type's extreme values): a range over an instant also takes the infinity on
+/// its side, and one over an infinity matches by that order (RP-060). `None`
+/// for any other value, which keeps the plain comparison.
 fn timestamp_filter(field: &str, op: &str, value: &Bson) -> Option<Document> {
+    if let Bson::String(s) = value {
+        return infinite_timestamp_filter(field, op, s);
+    }
+    let finite = finite_timestamp_filter(field, op, value)?;
+    let beyond = match op {
+        "$gt" | "$gte" => "infinity",
+        "$lt" | "$lte" => "-infinity",
+        _ => return Some(finite),
+    };
+    Some(doc! { "$or": [finite, { field: beyond }] })
+}
+
+/// A comparison with `infinity` / `-infinity` itself, by PostgreSQL's order.
+fn infinite_timestamp_filter(field: &str, op: &str, value: &str) -> Option<Document> {
+    let infinity = match value.trim().to_ascii_lowercase().as_str() {
+        "infinity" | "+infinity" => "infinity",
+        "-infinity" => "-infinity",
+        _ => return None,
+    };
+    let is = || doc! { field: infinity };
+    let any = || doc! { field: { "$ne": Bson::Null } };
+    let not_it = || doc! { "$and": [any(), { field: { "$ne": infinity } }] };
+    // Is every other value on this side of it?
+    let top = infinity == "infinity";
+    Some(match (op, top) {
+        ("$eq", _) => is(),
+        ("$ne", _) => not_it(),
+        ("$gt", true) | ("$lt", false) => match_nothing(),
+        ("$gte", true) | ("$lte", false) => is(),
+        ("$lt", true) | ("$gt", false) => not_it(),
+        ("$lte", true) | ("$gte", false) => any(),
+        _ => return None,
+    })
+}
+
+/// `timestamp_filter` for an instant: the millisecond part, then the
+/// remainder.
+fn finite_timestamp_filter(field: &str, op: &str, value: &Bson) -> Option<Document> {
     let (date, us) = match value {
         Bson::DateTime(_) => (value.clone(), 0),
         Bson::Document(d) => match (d.get(COMPOSITE_DATE), d.get(COMPOSITE_US)) {

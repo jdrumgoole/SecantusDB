@@ -103,6 +103,11 @@ STATIC_TABLES = [
     "pg_catalog.pg_conversion",
     "pg_catalog.pg_init_privs",
     "pg_catalog.pg_opfamily",
+    # Every built-in function, type and catalog constraint (RP-102); the
+    # server lists its users' objects after them.
+    "pg_catalog.pg_proc",
+    "pg_catalog.pg_type",
+    "pg_catalog.pg_constraint",
 ]
 
 
@@ -146,10 +151,17 @@ def main(dsn: str) -> None:
         out = []
         for table in STATIC_TABLES:
             out.append(f"\\relation {table}\n")
-            # A reg* column as its oid, which the server renders by name.
+            # A reg* column as its oid, which the server renders by name; an
+            # expression (pg_node_tree) as the SQL text the server keeps for
+            # its own objects' expressions.
             columns = conn.execute(
                 "select case when atttypid::regtype::text like 'reg%%'"
-                " then quote_ident(attname) || '::oid' else quote_ident(attname) end"
+                " then quote_ident(attname) || '::oid'"
+                " when atttypid = 'pg_node_tree'::regtype then"
+                " case attname when 'conbin' then 'pg_get_expr(conbin, conrelid)'"
+                " when 'prosqlbody' then 'pg_get_function_sqlbody(oid)'"
+                " else 'pg_get_expr(' || quote_ident(attname) || ', 0)' end"
+                " else quote_ident(attname) end"
                 " from pg_attribute where attrelid = %s::regclass and attnum > 0"
                 " order by attnum",
                 (table,),

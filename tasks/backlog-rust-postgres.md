@@ -703,23 +703,6 @@ Not filed:
   questions.
 - The slow 1M-row block cursor needs a release-build measurement first.
 
-- [ ] **`infinity` / `-infinity` dates and timestamps are stored as strings,
-      and comparisons drop rows.** `secantus-pg` writes them as
-      `Bson::String("infinity")` beside BSON dates. Rows `infinity`,
-      `2021-01-01` and `-infinity` give the following:
-      - `where t > '2020-01-01'` returns {2} where PostgreSQL 15.19
-        returns {1, 2}.
-      - With an index on `t`, `t between '-infinity' and 'infinity'`
-        returns {1, 3} and drops the FINITE row; PostgreSQL returns all
-        three.
-      - `t + interval '1 day'` and `d + 1` are 42883 on an infinite
-        value; PostgreSQL answers `infinity` / `-infinity`.
-
-      A silent wrong answer. PostgreSQL stores them as the extreme values
-      of the type (`DT_NOBEGIN` / `DT_NOEND`), which sort below and above
-      every finite value.
-      Backlog-ID: RP-060
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_infinite_timestamps
 - [ ] **SERIALIZABLE is snapshot isolation: write skew commits.** Two
       SERIALIZABLE transactions each read both on-call rows and set their
       own to false; both commit here, leaving nobody on call. PostgreSQL
@@ -806,37 +789,52 @@ cluster.
       `_create_index`, `_basebackup`. PostgreSQL reports a row per backend
       running that command, which a COPY or CREATE INDEX here never
       publishes.
+      **Decided (Joe, 2026-10-22): stream COPY, slots for every command.**
+      COPY FROM parses and inserts rows as CopyData arrives, as PostgreSQL
+      does (it buffers to CopyDone today), so `pg_stat_progress_copy`'s
+      counters move as PostgreSQL's do; every command keeps a per-backend
+      progress slot read through `pg_stat_get_progress_info` and
+      PostgreSQL's own six view definitions; CREATE INDEX reports the
+      phases this server's build has.
       Backlog-ID: RP-100
       Verify: tests/backlog/test_rp_batch26.py::test_scenario[progress views]
-- [ ] **The configuration-file views are refused by name** (0A000):
-      `pg_hba_file_rules` and `pg_ident_file_mappings` (the server reads a
-      `pg_hba.conf` / `pg_ident.conf` when given one, but keeps only their
-      meaning, not the raw tokens these views report), `pg_config` (no
-      PostgreSQL installation stands behind it) and `pg_file_settings` (no
-      `postgresql.conf`).
-      Backlog-ID: RP-101
-      Verify: tests/backlog/test_rp_batch26.py::test_scenario[configuration-file views]
-- [ ] **PostgreSQL's built-in objects are missing from several catalogs.**
-      `pg_proc` lists only user functions (PostgreSQL 15.19 has 3,233 in
-      `pg_catalog`), `pg_type` lacks the system relations' row types, and
-      `pg_constraint` the system catalogs' constraints. Views over them come
-      out short: `information_schema.routines` has 13 rows on a fresh
-      database where PostgreSQL has 3,244, `parameters` 22 for 6,480.
-      Backlog-ID: RP-102
-      Verify: tests/backlog/test_rp_batch26.py::test_scenario[built-in objects in the catalogs]
-- [ ] **`pg_depend` records only dependencies between relations and column
-      defaults**: owned and identity sequences, indexes on their columns,
-      partitions and inheritance children, defaults on their sequence and
-      types. Constraints, rules, triggers, types and functions record none,
-      and an expression index depends on its table as a whole rather than
-      the columns its expression reads.
+- [ ] **`pg_depend` misses a constant's type and a range's functions.**
+      Every object's dependencies are recorded as PostgreSQL 15.19 records
+      them (`crates/secantus-pg/src/depend.rs`), except: the type of a
+      constant an expression holds (an index predicate `b = 'a'` over an
+      enum column depends on the enum, as does a view comparing to one), and
+      a range type's constructor functions and multirange cast, which
+      `pg_proc` / `pg_cast` here do not list at all. Collations, operator
+      classes and extension membership (`e`) are not recorded either.
       Backlog-ID: RP-105
-      Verify: tests/backlog/test_rp_batch26.py::test_scenario[dependencies beyond relations]
-- [ ] **The WAL and file-location functions are refused** (0A000):
-      `pg_current_wal_lsn()` and `pg_relation_filepath()`. This server writes
-      no PostgreSQL WAL and keeps no PostgreSQL relation files.
-      Backlog-ID: RP-112
-      Verify: tests/backlog/test_rp_batch26.py::test_scenario[WAL and file functions]
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[dependencies on a constant's type and a range's functions]
+
+## Found by batch 28 (2026-10-22)
+
+Found while measuring `pg_depend` (RP-105) against PostgreSQL 15.19. The gap
+tests are scenarios in `tests/backlog/test_rp_batch26.py`.
+
+- [ ] **A view's row type is not a type.** `pg_type` lists it and its
+      array, but the planner does not know them: `'v'::regtype` and
+      `'_v'::regtype` are 42704, `typarray::regtype` prints a bare oid,
+      `row(1)::v` and `'(1)'::v` are refused, and a whole-row reference to
+      the view is `record`, where PostgreSQL types it `v`. A view's row type
+      is a composite like a table's; serving it needs the view's column
+      types where the planner registers composites, which today come only
+      from planning the view.
+      Backlog-ID: RP-117
+      Verify: tests/backlog/test_rp_batch26.py::test_scenario[a view's row type is a type]
+- [ ] **The `information_schema` views over every built-in function take
+      seconds** (release build, a fresh database): `routines` 3.6 s,
+      `parameters` 2.5 s, `data_type_privileges` 6.4 s, `element_types` 52 s,
+      where PostgreSQL 15.19 takes 2-47 ms. They answer PostgreSQL's rows
+      since RP-102 listed the 3,244 built-ins. The cost is mostly a LATERAL
+      FROM function (`_pg_expandarray` becomes `unnest(...) WITH
+      ORDINALITY`) re-planned and run as SQL once per left row
+      (`PgHandler::lateral_rows`), and per-row expression evaluation over
+      the joins.
+      Backlog-ID: RP-131
+      Verify: none -- a performance budget; every answer matches PostgreSQL's
 
 ## Found by the corpus test (2026-10-21)
 

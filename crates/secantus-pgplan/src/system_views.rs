@@ -131,19 +131,6 @@ const REFUSED: &[(&str, &str)] = &[
         "pg_stat_progress_vacuum",
         "commands do not report their progress on this server",
     ),
-    // No PostgreSQL installation or configuration file stands behind it.
-    ("pg_config", "this server is not a PostgreSQL installation"),
-    ("pg_file_settings", "this server reads no postgresql.conf"),
-    // Its pg_hba.conf decides logins, but the lines' raw tokens, which these
-    // report, are not kept.
-    (
-        "pg_hba_file_rules",
-        "this server does not report its pg_hba.conf lines",
-    ),
-    (
-        "pg_ident_file_mappings",
-        "this server does not report its pg_ident.conf lines",
-    ),
 ];
 
 /// 0A000 for a system relation refused by name.
@@ -170,8 +157,20 @@ pub(crate) fn in_from(from: &[pg_query::protobuf::Node]) -> bool {
             Some(N::JoinExpr(j)) => {
                 j.larg.as_deref().is_some_and(walk) || j.rarg.as_deref().is_some_and(walk)
             }
+            // A FROM subquery's own FROM, and its set operation's arms.
+            Some(N::RangeSubselect(rs)) => {
+                match rs.subquery.as_deref().and_then(|q| q.node.as_ref()) {
+                    Some(N::SelectStmt(sel)) => select(sel),
+                    _ => false,
+                }
+            }
             _ => false,
         }
+    }
+    fn select(s: &pg_query::protobuf::SelectStmt) -> bool {
+        s.from_clause.iter().any(walk)
+            || s.larg.as_deref().is_some_and(select)
+            || s.rarg.as_deref().is_some_and(select)
     }
     from.iter().any(walk)
 }

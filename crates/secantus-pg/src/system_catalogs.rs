@@ -76,6 +76,10 @@ const STATEFUL: &[&str] = &[
     "pg_stat_database_conflicts",
     "pg_stat_recovery_prefetch",
     "pg_shdepend",
+    "pg_hba_file_rules",
+    "pg_ident_file_mappings",
+    "pg_file_settings",
+    "pg_config",
 ];
 
 /// The extensions `CREATE EXTENSION` installs here, with their control files'
@@ -239,6 +243,12 @@ impl PgHandler {
                     .collect()
             }
             "pg_shdepend" => self.shdepend_rows(def),
+            "pg_hba_file_rules" => self.hba_file_rule_rows(def),
+            "pg_ident_file_mappings" => self.ident_file_mapping_rows(def),
+            "pg_config" => self.pg_config_rows(def),
+            // No `postgresql.conf` is read: the settings come from the
+            // command line and the defaults.
+            "pg_file_settings" => Vec::new(),
             // Recovery conflicts arise only on a standby: every database's
             // counts are zero on a primary.
             "pg_stat_database_conflicts" => {
@@ -291,7 +301,10 @@ impl PgHandler {
         }
     }
 
-    fn static_rows(&self, name: &str, def: &TableDef) -> Vec<Document> {
+    /// A dumped relation's rows, each column converted by the type `def`
+    /// gives it (found by name: a catalog the server declares itself may
+    /// order its columns differently).
+    pub(crate) fn static_rows(&self, name: &str, def: &TableDef) -> Vec<Document> {
         let columns = catalog_meta::system_relation_columns(name).unwrap_or_default();
         let tz = self.session_timezone();
         let rows = copy_text::parse(
@@ -304,7 +317,10 @@ impl PgHandler {
         rows.into_iter()
             .map(|raw| {
                 let mut d = Document::new();
-                for (((col, oid, _), value), c) in columns.iter().zip(raw).zip(&def.columns) {
+                for ((col, oid, _), value) in columns.iter().zip(raw) {
+                    let Some(c) = def.columns.iter().find(|c| c.name == *col) else {
+                        continue;
+                    };
                     let value = match value {
                         None => Bson::Null,
                         Some(text) => match secantus_pgplan::pgtypes::name_of_oid(*oid) {
@@ -312,6 +328,8 @@ impl PgHandler {
                             Some(t) if t.starts_with("reg") => text
                                 .parse()
                                 .map_or(Bson::Null, |o| secantus_pgplan::regobj::value(t, o)),
+                            // An expression, dumped as its SQL text.
+                            _ if c.pg_type == "pg_node_tree" => Bson::String(text),
                             _ => {
                                 let wire = wire_type(&c.pg_type);
                                 copy_field(&text, &c.pg_type, &wire, &tz).unwrap_or(Bson::Null)

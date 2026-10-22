@@ -485,7 +485,7 @@ def _check(name: str, rust_pg: Any) -> None:
     assert got == EXPECTED[name]
 
 
-@pytest.mark.backlog("RP-060")
+@pytest.mark.backlog_fixed("RP-060")
 def test_infinite_timestamps(rust_pg: Any) -> None:
     """PostgreSQL 15.19 orders `infinity` / `-infinity` with finite values,
     adds to them, and an index on the column returns all three rows."""

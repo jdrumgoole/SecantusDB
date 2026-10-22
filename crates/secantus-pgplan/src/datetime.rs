@@ -397,6 +397,32 @@ fn timetz_of(v: &Bson) -> Result<(i64, i64)> {
 /// `extract` (numeric) / `date_part` (float8) over a value of static type
 /// `ty`.
 pub fn part(name: &str, v: &Bson, ty: &str, numeric: bool) -> Result<Bson> {
+    // An infinite date or timestamp (`NonFiniteTimestampTzPart`): the units
+    // that grow without bound are +/-Infinity, every other unit NULL.
+    if let Some(upper) = crate::infinite_datetime(v).filter(|_| ty != "interval") {
+        if let Some(u) = unit(name) {
+            return Ok(match u {
+                Unit::Epoch
+                | Unit::Julian
+                | Unit::Year
+                | Unit::Decade
+                | Unit::Century
+                | Unit::Millennium
+                | Unit::IsoYear => {
+                    if numeric {
+                        crate::numeric::numeric_bson(if upper { "Infinity" } else { "-Infinity" })
+                    } else {
+                        Bson::Double(if upper {
+                            f64::INFINITY
+                        } else {
+                            f64::NEG_INFINITY
+                        })
+                    }
+                }
+                _ => Bson::Null,
+            });
+        }
+    }
     let out = |p: Part| {
         if numeric {
             part_numeric(p)
@@ -663,6 +689,10 @@ fn trunc_unit(name: &str, kind: &str) -> Result<Unit> {
 }
 
 pub fn trunc(name: &str, v: &Bson, ty: &str) -> Result<Bson> {
+    // An infinite date or timestamp truncates to itself.
+    if crate::infinite_datetime(v).is_some() && ty != "interval" && unit(name).is_some() {
+        return Ok(v.clone());
+    }
     // There is no `date_trunc(text, time)`: a time of day takes the
     // interval overload, by its implicit cast.
     if matches!(ty, "time" | "time without time zone") {

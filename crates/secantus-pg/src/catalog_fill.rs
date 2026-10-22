@@ -196,9 +196,7 @@ pub(crate) fn pg_policy_def() -> TableDef {
     )
 }
 
-/// `pg_depend`: kept empty -- no client reads a dependency this server
-/// would record differently from "none" (psql asks it about internal
-/// triggers only).
+/// `pg_depend`: what each object depends on (`PgHandler::pg_depend_rows`).
 pub(crate) fn pg_depend_def() -> TableDef {
     TableDef::new(
         "pg_depend",
@@ -237,9 +235,6 @@ impl PgHandler {
     /// owns):
     /// - a sequence OWNED BY a column (`serial`) on that column, `a`; an
     ///   identity column's, `i`;
-    /// - an index on each of its key columns, `a` (an expression key on the
-    ///   table as a whole); one backing a PRIMARY KEY or UNIQUE constraint
-    ///   depends on the constraint instead, which is not listed here;
     /// - a partition on its parent, `a`; an `INHERITS` child on each
     ///   parent, `n`.
     pub(crate) fn pg_depend_rows(&self, def: &TableDef) -> Vec<Document> {
@@ -280,28 +275,6 @@ impl PgHandler {
                     pos as i32 + 1,
                     if identity { "i" } else { "a" },
                 ));
-            }
-        }
-        // Indexes on their columns.
-        for ix in self.index_relations() {
-            let backs_constraint = ix.primary
-                || ix
-                    .table
-                    .unique_constraints
-                    .iter()
-                    .any(|u| u.name == ix.name);
-            if backs_constraint {
-                continue;
-            }
-            let Some(to) = self.relation_oid(&ix.table.name) else {
-                continue;
-            };
-            let mut seen = Vec::new();
-            for k in ix.keys.iter().chain(&ix.include) {
-                if !seen.contains(k) {
-                    seen.push(*k);
-                    out.push(row(ix.oid, to, *k, "a"));
-                }
             }
         }
         // Column defaults: each on its column (`a`; a generated column's
@@ -389,6 +362,8 @@ impl PgHandler {
                 }
             }
         }
+        // Every other kind of object's.
+        out.extend(self.object_depend_rows(def));
         out
     }
 }

@@ -9,10 +9,12 @@
 
 use super::*;
 
-/// Whether a cancel has arrived for this backend. It is only LOOKED at:
-/// the statement's own cancellation point takes it, so a caller that
-/// swallows the parse error (a lock or privilege pre-pass) cannot lose it.
-pub type CancelHook<'a> = dyn Fn() -> bool + 'a;
+/// Whether the statement must stop -- a cancel arrived for this backend, or
+/// its `statement_timeout` passed -- as the message its 57014 carries. It
+/// is only LOOKED at: the statement's own cancellation point takes a
+/// cancel, so a caller that swallows the parse error (a lock or privilege
+/// pre-pass) cannot lose it.
+pub type CancelHook<'a> = dyn Fn() -> Option<&'static str> + 'a;
 type Hook = CancelHook<'static>;
 
 thread_local! {
@@ -36,12 +38,18 @@ pub fn with_cancel_hook<R>(hook: &CancelHook<'_>, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// Has a cancel arrived for the statement being planned?
-pub(crate) fn pending() -> bool {
-    CANCEL_HOOK.with(|h| h.get()).is_some_and(|p| {
+/// Why the statement being planned must stop, if it must.
+fn reason() -> Option<&'static str> {
+    CANCEL_HOOK.with(|h| h.get()).and_then(|p| {
         // SAFETY: installed by `with_cancel_hook`, whose borrow is live.
         unsafe { (*p)() }
     })
+}
+
+/// Has a cancel arrived for the statement being planned (or its timeout
+/// passed)?
+pub(crate) fn pending() -> bool {
+    reason().is_some()
 }
 
 /// A cancellation point between planning passes, as PostgreSQL's
@@ -51,15 +59,10 @@ pub(crate) fn pending() -> bool {
 /// waited for all of them, and every repeat of a statement misses it,
 /// because the parse is memoised.
 pub(crate) fn check() -> Result<()> {
-    if pending() {
-        return Err(query_canceled());
+    match reason() {
+        Some(message) => Err(Error::Sqlstate("57014", message.into())),
+        None => Ok(()),
     }
-    Ok(())
-}
-
-/// PostgreSQL's 57014 for a cancelled statement.
-pub(crate) fn query_canceled() -> Error {
-    Error::Sqlstate("57014", "canceling statement due to user request".into())
 }
 
 /// Run `work` on its own thread (with `stack` bytes of stack), polling for
@@ -88,8 +91,8 @@ pub(crate) fn interruptible<T: Send + 'static>(
         match rx.recv_timeout(std::time::Duration::from_millis(5)) {
             Ok(out) => return out,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if pending() {
-                    return Err(query_canceled());
+                if let Some(message) = reason() {
+                    return Err(Error::Sqlstate("57014", message.into()));
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
