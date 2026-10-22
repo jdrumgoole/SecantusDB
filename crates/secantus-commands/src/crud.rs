@@ -34,7 +34,19 @@ pub(crate) fn validation_error_info(validator: &Document, doc: &Document) -> Doc
     if let Some(id) = doc.get("_id") {
         info.insert("failingDocumentId", id.clone());
     }
-    info.insert("details", crate::validation_errors::explain(validator, doc));
+    match crate::validation_errors::explain(validator, doc) {
+        Ok(details) => {
+            info.insert("details", details);
+        }
+        // mongod still refuses the write, and says why it cannot explain.
+        Err(errmsg) => {
+            info.insert("note", "failed to generate document validation error");
+            info.insert(
+                "details",
+                doc! {"code": 4994600, "codeName": "Location4994600", "errmsg": errmsg},
+            );
+        }
+    }
     info
 }
 
