@@ -29,7 +29,7 @@
 //! The remaining operators are *principled* defers — they can't be reproduced
 //! without a fidelity risk: regex (`$regexMatch`/…) needs Python's `re`;
 //! `$dateToString` handles a numeric-directive `strftime` subset (named IANA
-//! zones via `chrono-tz`); `$dateFromString` / `$toDate` parse through the
+//! zones from mongod's own zone data, `crate::tzdb`); `$dateFromString` / `$toDate` parse through the
 //! timelib port in `crate::timelib`, with and without a `format`;
 //! `$convert`/`$toDecimal` + float-`str()` / string-parse / Decimal128
 //! conversions; `$round`/`$pow`/`$trunc` (rounding mode); `$sortArray`
@@ -1046,7 +1046,7 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$degreesToRadians" => op_deg_rad(arg, ctx, true),
         "$radiansToDegrees" => op_deg_rad(arg, ctx, false),
         // date component extractors — bare date expr or `{date, timezone}` object
-        // form (fixed-offset + named IANA zones via chrono-tz; instant→local)
+        // form (fixed-offset + named zones from `crate::tzdb`; instant→local)
         "$year" => date_part(arg, ctx, DatePart::Year),
         "$month" => date_part(arg, ctx, DatePart::Month),
         "$dayOfMonth" => date_part(arg, ctx, DatePart::Day),
@@ -4778,10 +4778,8 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 /// mongod accepts a bare date expression *or* a `{date, timezone}` object; the
 /// object form is a document with a `date` key that isn't itself an operator
 /// (`{$op: …}`). A `timezone` shifts the wall clock: fixed-offset (`±HH:MM` / `UTC`
-/// / `GMT`) is constant, a *named* IANA zone resolves its DST-correct offset at the
-/// instant via `chrono-tz` (the unambiguous instant→wall-clock direction, matching
-/// `$dateToString` and Python `zoneinfo`). An unknown zone / non-string timezone
-/// defers to Python.
+/// / `GMT`) is constant, a *named* zone resolves its offset at the instant from
+/// mongod's own zone data (`crate::tzdb`).
 /// The instant a date-operator OPERAND names, in epoch milliseconds.
 ///
 /// mongod accepts every BSON type that CARRIES a timestamp -- Date, ObjectId
@@ -4963,7 +4961,7 @@ enum FreeFormError {
 enum MongoTz {
     Utc,
     Offset(i64),
-    Named(chrono_tz::Tz),
+    Named(&'static crate::tzdb::Zone),
 }
 
 fn mongo_tz(spec: Option<&Bson>) -> Result<MongoTz, FreeFormError> {
@@ -4975,8 +4973,8 @@ fn mongo_tz(spec: Option<&Bson>) -> Result<MongoTz, FreeFormError> {
     if name == "UTC" {
         return Ok(MongoTz::Utc);
     }
-    if let Ok(tz) = name.parse::<chrono_tz::Tz>() {
-        return Ok(MongoTz::Named(tz));
+    if let Some(zone) = crate::tzdb::zone(name) {
+        return Ok(MongoTz::Named(zone));
     }
     let b = name.as_bytes();
     let sign = match b.first() {
@@ -5077,46 +5075,16 @@ fn resolve_date_string(
     })
 }
 
-/// `timelib_get_time_zone_offset_info` over chrono-tz: the UTC offset in
-/// effect at `ts`, the instant that offset took effect (`i64::MIN` if none
-/// was found within a year and a day), and whether it is daylight time.
-fn zone_offset_info(zone: chrono_tz::Tz, ts: i64) -> (i64, i64, bool) {
-    use chrono::{Offset, TimeZone};
-    use chrono_tz::OffsetComponents;
-    let at = |s: i64| {
-        let off = zone.offset_from_utc_datetime(
-            &chrono::DateTime::from_timestamp(s, 0)
-                .unwrap_or_default()
-                .naive_utc(),
-        );
-        (
-            i64::from(off.fix().local_minus_utc()),
-            off.dst_offset().num_seconds() != 0,
-        )
-    };
-    let (offset, is_dst) = at(ts);
-    // Walk back a day at a time to the first day with another offset, then
-    // bisect that day to the second.
-    let mut same = ts;
-    let mut transition = i64::MIN;
-    for _ in 0..367 {
-        let earlier = same - 86_400;
-        if at(earlier).0 != offset {
-            let (mut lo, mut hi) = (earlier, same);
-            while hi - lo > 1 {
-                let mid = lo + (hi - lo) / 2;
-                if at(mid).0 == offset {
-                    hi = mid;
-                } else {
-                    lo = mid;
-                }
-            }
-            transition = hi;
-            break;
-        }
-        same = earlier;
+/// `timelib_get_time_zone_offset_info` over mongod's zone data: the UTC
+/// offset in effect at `ts` (seconds), the instant that offset took effect
+/// (`i64::MIN` before the first transition), and whether it is daylight
+/// time. Where timelib finds no type its callers keep their zeroed
+/// defaults, which is what `None` maps to here.
+fn zone_offset_info(zone: &crate::tzdb::Zone, ts: i64) -> (i64, i64, bool) {
+    match zone.offset_info(ts) {
+        Some((t, since)) => (t.offset, since, t.is_dst),
+        None => (0, 0, false),
     }
-    (offset, transition, is_dst)
 }
 
 /// The zone-ID branch of timelib's `do_adjust_timezone`: the seconds to add
@@ -5124,7 +5092,7 @@ fn zone_offset_info(zone: chrono_tz::Tz, ts: i64) -> (i64, i64, bool) {
 /// gap or overlap this picks what mongod picks -- measured, a London `02:30`
 /// on the spring-forward day is 01:30Z and `01:30` on the fall-back day is
 /// 01:30Z -- which a plain "earliest local match" does not.
-fn timelib_zone_adjustment(zone: chrono_tz::Tz, sse: i64, dst: bool) -> i64 {
+fn timelib_zone_adjustment(zone: &crate::tzdb::Zone, sse: i64, dst: bool) -> i64 {
     let (current_offset, _, current_is_dst) = zone_offset_info(zone, sse);
     let (after_offset, after_transition_time, _) = zone_offset_info(zone, sse - current_offset);
     let mut actual_offset = after_offset;
@@ -5240,7 +5208,7 @@ fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
 /// A `timezone` shifts the wall clock before rendering (naive input is treated as
 /// UTC): a fixed offset (`±HHMM` / `±HH:MM` / `UTC` / `GMT`) is constant, and a
 /// *named* IANA zone (`America/New_York`, …) resolves its DST-correct offset at the
-/// rendered instant via `chrono-tz`. An unknown zone name defers to Python.
+/// rendered instant from mongod's own zone data (`crate::tzdb`).
 ///
 /// Renders the unambiguous directives — `%Y` (4-digit year), `%m`/`%d`/`%H`/`%M`/
 /// `%S` (2-digit), `%L` (3-digit millis), `%j` (3-digit day-of-year), `%w`
@@ -5396,7 +5364,10 @@ fn render_date_at(millis: i64, fmt: &str, offset_ms: i64) -> Result<String, Fall
     let day_of_year = days - days_from_civil(y, 1, 1) + 1;
     let (iso_y, iso_w) = iso_week(days);
     let off_minutes = offset_ms / 60_000;
-    let (sign, abs_min) = if off_minutes < 0 {
+    // `%z` takes its sign from the offset in SECONDS, so a local mean time
+    // under a minute west of UTC is `-0000` (Accra before 1918 is -0:00:52;
+    // measured 8.2.11, 2026-10-22); `%Z` is whole minutes, truncated.
+    let (sign, abs_min) = if offset_ms < 0 {
         ('-', -off_minutes)
     } else {
         ('+', off_minutes)
@@ -5471,18 +5442,6 @@ fn resolve_tz_offset(name: &str) -> Option<i64> {
     }
 }
 
-/// Resolve a *named* IANA zone (`"America/New_York"`, `"Europe/Dublin"`, …) to its
-/// signed UTC offset **in milliseconds at the given UTC instant** — DST-correct,
-/// since the offset of a zone depends on when you ask. Returns `None` for a name
-/// `chrono-tz` doesn't know (the caller defers to Python, which resolves it or
-/// raises "unknown timezone").
-///
-/// This is the *instant → wall-clock* direction, which is total and unambiguous:
-/// every UTC instant maps to exactly one local time in a zone (unlike the reverse,
-/// where a DST gap/overlap makes a naive local time ambiguous). So `chrono-tz` and
-/// Python `zoneinfo` return the identical offset for any instant whose governing
-/// rule both tz databases agree on — which is why `$dateToString` can compute
-/// natively here while `$dateFromString`'s named-zone form still defers.
 /// mongod's unrecognised-timezone failure (40485), in the two forms it has.
 ///
 /// `$dateTrunc` and `$dateDiff` name the parameter they were parsing; every
@@ -5557,7 +5516,7 @@ fn eval_timezone(
     match eval(expr, ctx)? {
         Bson::Null | Bson::Undefined => Ok(TzArg::Null),
         Bson::String(s) => {
-            if resolve_tz_offset(&s).is_some() || s.parse::<chrono_tz::Tz>().is_ok() {
+            if resolve_tz_offset(&s).is_some() || crate::tzdb::is_zone(&s) {
                 Ok(TzArg::Zone(Bson::String(s)))
             } else {
                 Err(tz_error(&s, operator).with_folded(folded))
@@ -5595,16 +5554,8 @@ fn precheck_constant_timezone(
 }
 
 fn named_tz_offset_ms(name: &str, utc_millis: i64) -> Option<i64> {
-    use chrono::{DateTime, Offset, TimeZone, Utc};
-    let tz: chrono_tz::Tz = name.parse().ok()?;
-    let secs = utc_millis.div_euclid(1000);
-    let nanos = (utc_millis.rem_euclid(1000) * 1_000_000) as u32;
-    let instant: DateTime<Utc> = DateTime::from_timestamp(secs, nanos)?;
-    let offset_secs = tz
-        .offset_from_utc_datetime(&instant.naive_utc())
-        .fix()
-        .local_minus_utc();
-    Some(offset_secs as i64 * 1000)
+    let zone = crate::tzdb::zone(name)?;
+    Some(zone_offset_info(zone, utc_millis.div_euclid(1000)).0 * 1000)
 }
 
 /// Resolve a `timezone` spec field to a signed wall-clock offset in **milliseconds
@@ -5612,9 +5563,8 @@ fn named_tz_offset_ms(name: &str, utc_millis: i64) -> Option<i64> {
 /// (`$dateToString`, the `{date, timezone}` extractors, `$dateToParts`). Absent /
 /// `null` timezone → 0 (UTC), matching Python's `_resolve_timezone(None)`; a
 /// fixed-offset (`±HH:MM` / `UTC` / `GMT`) is constant; a named IANA zone resolves
-/// its DST-correct offset at the instant via `chrono-tz`. The callers pass a zone
-/// [`eval_timezone`] has already evaluated and checked. This is *not* used by `$dateFromString`, whose named-zone
-/// (local→instant) direction is DST-ambiguous and deliberately defers.
+/// its offset at the instant from mongod's own zone data (`crate::tzdb`). The
+/// callers pass a zone [`eval_timezone`] has already evaluated and checked.
 fn timezone_offset_ms(tz: Option<&Bson>, utc_millis: i64) -> Result<i64, Fallback> {
     match tz {
         None | Some(Bson::Null) => Ok(0),
@@ -5938,49 +5888,22 @@ fn tz_instant_from_local_ms(tz: Option<&Bson>, local_millis: i64) -> Result<i64,
     }
 }
 
-/// The instant a local wall clock in zone `name` names, as mongod resolves
-/// it (8.2.11, 2026-10-22): a time that happens twice, in the hour repeated
-/// when daylight saving ends, is the LATER instant, in standard time; a time
-/// that never happens, in the hour skipped when it starts, is read with the
-/// offset in force before the change, so 02:30 on New York's spring-forward
-/// day is 07:30Z (03:30 EDT). Measured in `$dateFromParts`, `$dateAdd` and
-/// `$dateFromString`, in New York, London, Sydney, Lord Howe's half-hour
-/// change and São Paulo's midnight one.
-///
-/// `like` is an instant whose daylight saving a repeated time keeps when it
-/// has one: `$dateAdd` resolves to the start date's (see `op_date_add`).
+/// The instant a local wall clock in zone `name` names: timelib's
+/// `do_adjust_timezone` (`timelib_zone_adjustment`), as mongod reaches it.
+/// Its answer at a change of offset turns on the time's daylight-saving
+/// flag, which is the zone's at the 1970 epoch for a time built from parts
+/// or a string -- `timelib_set_timezone` reads it at `sse` 0 -- and the
+/// start date's for `$dateAdd`, which `timelib_unixtime2local` set before
+/// `timelib_add` (`like`). So a time that happens twice is the standard-time
+/// instant from parts and keeps the start's daylight saving in `$dateAdd`,
+/// and one that never happens is read with the offset before the change
+/// (measured 8.2.11, 2026-10-22, in New York, London, Sydney, Lord Howe and
+/// São Paulo).
 fn named_local_to_utc_ms(name: &str, local_millis: i64, like: Option<i64>) -> Option<i64> {
-    use chrono::{DateTime, LocalResult, Offset, TimeZone};
-    use chrono_tz::OffsetComponents;
-    let tz: chrono_tz::Tz = name.parse().ok()?;
-    let secs = local_millis.div_euclid(1000);
-    let nanos = (local_millis.rem_euclid(1000) * 1_000_000) as u32;
-    let naive = DateTime::from_timestamp(secs, nanos)?.naive_utc();
-    match tz.from_local_datetime(&naive) {
-        LocalResult::Single(t) => Some(t.timestamp_millis()),
-        LocalResult::Ambiguous(earlier, later) => {
-            let in_dst = |o: &chrono_tz::TzOffset| !o.dst_offset().is_zero();
-            let keep_earlier = like
-                .and_then(DateTime::from_timestamp_millis)
-                .is_some_and(|l| {
-                    let like_dst = in_dst(&tz.offset_from_utc_datetime(&l.naive_utc()));
-                    like_dst == in_dst(earlier.offset()) && like_dst != in_dst(later.offset())
-                });
-            Some(if keep_earlier { earlier } else { later }.timestamp_millis())
-        }
-        LocalResult::None => {
-            // In a gap, the offset before the change and the one after each
-            // map the local time to an instant on the other side of it, so
-            // the two lookups below find both; the one before is the smaller.
-            let offset_at = |ms: i64| -> Option<i64> {
-                let utc = DateTime::from_timestamp_millis(ms)?.naive_utc();
-                Some(i64::from(tz.offset_from_utc_datetime(&utc).fix().local_minus_utc()) * 1000)
-            };
-            let first = offset_at(local_millis)?;
-            let second = offset_at(local_millis - first)?;
-            Some(local_millis - first.min(second))
-        }
-    }
+    let zone = crate::tzdb::zone(name)?;
+    let dst = zone_offset_info(zone, like.map_or(0, |ms| ms.div_euclid(1000))).2;
+    let sse = local_millis.div_euclid(1000);
+    Some(local_millis + timelib_zone_adjustment(zone, sse, dst) * 1000)
 }
 
 /// Day number of the first `start_of_week` weekday on or after 2000-01-01.
