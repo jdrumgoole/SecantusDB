@@ -11031,7 +11031,9 @@ def test_create_role_records_the_role_and_its_verifier(home: Path) -> None:
         cur.execute(
             "select oid, rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb,"
             " rolcanlogin, rolreplication, rolconnlimit, rolpassword, rolvaliduntil::text,"
-            " rolbypassrls, rolconfig from pg_roles order by oid"
+            " rolbypassrls, rolconfig from pg_roles"
+            # PostgreSQL's predefined roles are listed too (RP-070).
+            " where rolname !~ '^pg_' order by oid"
         )
         rows = cur.fetchall()
         assert rows[0] == (
@@ -11131,7 +11133,7 @@ def test_create_role_records_the_role_and_its_verifier(home: Path) -> None:
             autocommit=True,
         ) as other:
             other.execute("drop role test")
-        cur.execute("select rolname from pg_roles")
+        cur.execute("select rolname from pg_roles where rolname !~ '^pg_'")
         assert cur.fetchall() == [("postgres",)]
 
 
@@ -16526,7 +16528,8 @@ def test_role_membership_and_reg_types(home: Path) -> None:
             conn,
             "SELECT pg_has_role('rb', 'ra', 'member'), pg_has_role('rc', 'ra', 'member')",
         ) == [(True, False)]
-        assert _fetch(conn, "SELECT count(*) FROM pg_auth_members") == [(1,)]
+        # Beside PostgreSQL 15's three built-in memberships (`pg_monitor`'s).
+        assert _fetch(conn, "SELECT count(*) FROM pg_auth_members") == [(4,)]
         conn.execute("CREATE SCHEMA rs")
         conn.execute("CREATE FUNCTION rf(a int) RETURNS int LANGUAGE sql AS 'SELECT a'")
         assert _fetch(

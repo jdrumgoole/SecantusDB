@@ -338,6 +338,23 @@ pub fn is_bounded(v: &Bson) -> bool {
     matches!(v, Bson::Document(d) if d.len() == 2 && d.contains_key(LB_KEY) && d.contains_key(ITEMS_KEY))
 }
 
+/// An array of one dimension and no elements -- which only a function can
+/// build (`acldefault`); a literal `'{}'` has no dimension at all. Held as a
+/// bounded array with no items.
+pub fn one_dimensional_empty() -> Bson {
+    let mut d = bson::Document::new();
+    d.insert(LB_KEY, Bson::Array(vec![Bson::Int32(1)]));
+    d.insert(ITEMS_KEY, Bson::Array(Vec::new()));
+    Bson::Document(d)
+}
+
+/// Is `v` an array of one dimension and no elements?
+pub fn is_one_dimensional_empty(v: &Bson) -> bool {
+    is_bounded(v)
+        && matches!(strip(v), Bson::Array(a) if a.is_empty())
+        && lower_bounds(v).len() == 1
+}
+
 /// `v` as a plain array, its bounds dropped (anything else unchanged).
 pub fn strip(v: &Bson) -> Bson {
     match v {
@@ -422,6 +439,9 @@ fn call_plain(name: &str, args: &[Bson]) -> Result<Bson> {
                 return Ok(Bson::Null);
             }
             need_array(name, &a)?;
+            if is_one_dimensional_empty(&a) {
+                return Ok(Bson::Int32(1));
+            }
             let n = dim_lengths(&a).len();
             // A zero-dimensional array (`ARRAY[]::int[]`) has no dimension
             // count to report: PostgreSQL answers NULL, not 0.

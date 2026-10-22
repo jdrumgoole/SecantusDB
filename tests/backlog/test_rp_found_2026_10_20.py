@@ -239,10 +239,49 @@ CATALOG_RELATIONS = (
 )
 
 
+# Decided (Joe, 2026-10-22): the server's internals are refused by name.
+REFUSED_INTERNALS = {
+    "pg_catalog.pg_backend_memory_contexts",
+    "pg_catalog.pg_shmem_allocations",
+    "pg_catalog.pg_stat_bgwriter",
+    "pg_catalog.pg_stat_wal",
+    "pg_catalog.pg_stat_slru",
+    "pg_catalog.pg_stat_archiver",
+}
+
+# Relations another item covers, with its own gap test.
+OTHER_ITEMS = {
+    "information_schema.element_types": "RP-098",
+    "pg_catalog.pg_statistic": "RP-099",
+    "pg_catalog.pg_stats": "RP-099",
+    "pg_catalog.pg_statistic_ext_data": "RP-099",
+    "pg_catalog.pg_stats_ext": "RP-099",
+    "pg_catalog.pg_stats_ext_exprs": "RP-099",
+    "pg_catalog.pg_stat_progress_analyze": "RP-100",
+    "pg_catalog.pg_stat_progress_basebackup": "RP-100",
+    "pg_catalog.pg_stat_progress_cluster": "RP-100",
+    "pg_catalog.pg_stat_progress_copy": "RP-100",
+    "pg_catalog.pg_stat_progress_create_index": "RP-100",
+    "pg_catalog.pg_stat_progress_vacuum": "RP-100",
+    "pg_catalog.pg_hba_file_rules": "RP-101",
+    "pg_catalog.pg_ident_file_mappings": "RP-101",
+    "pg_catalog.pg_config": "RP-101",
+    "pg_catalog.pg_file_settings": "RP-101",
+}
+
+
 def catalog_relations(conn: Any, dsn: Dsn) -> list:
-    return [
-        name for name in CATALOG_RELATIONS if _state(conn, f"select * from {name} limit 0") != "ok"
-    ]
+    """Each relation that does not answer as decided: queryable, or 0A000
+    for the internals."""
+    out = []
+    for name in CATALOG_RELATIONS:
+        if name in OTHER_ITEMS:
+            continue
+        state = _state(conn, f"select * from {name} limit 0")
+        want = "0A000" if name in REFUSED_INTERNALS else "ok"
+        if state != want:
+            out.append((name, state))
+    return out
 
 
 # --------------------------------------------------- RP-071 client tools --
@@ -516,11 +555,13 @@ def test_system_columns(rust_pg: Any) -> None:
 @pytest.mark.backlog("RP-070")
 def test_catalog_relations_are_queryable(rust_pg: Any) -> None:
     """Every pg_catalog / information_schema table and view in PostgreSQL
-    15.19's pg_class (rp070_catalog_relations.txt) can be selected from."""
+    15.19's pg_class (rp070_catalog_relations.txt) can be selected from, but
+    the server's internals, refused by name (Joe, 2026-10-22); the relations
+    other items cover are left to their gap tests."""
     _check("catalog_relations", rust_pg)
 
 
-@pytest.mark.backlog("RP-071")
+@pytest.mark.backlog_fixed("RP-071")
 def test_client_tools(rust_pg: Any) -> None:
     """PostgreSQL 15's pg_dump, pg_dumpall -g, pgbench -i and these psql
     meta-commands all exit 0 against PostgreSQL 15.19."""

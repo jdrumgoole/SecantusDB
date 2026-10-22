@@ -82,6 +82,7 @@ mod schema_rows;
 mod scram_binding;
 mod server;
 mod stream_join;
+mod system_catalogs;
 mod table_locks;
 mod tls;
 mod triggers;
@@ -383,9 +384,14 @@ thread_local! {
     /// matters: an overlay is open for the whole of a block that created a
     /// table, and republishing every planner type table on every statement
     /// of that block cost ~40us each (measured 2026-09-19).
-    static INSTALLED_USER_TYPES: std::cell::RefCell<Option<(usize, String, u64, u64)>> =
+    static INSTALLED_USER_TYPES: std::cell::RefCell<Option<InstalledTypesKey>> =
         const { std::cell::RefCell::new(None) };
 }
+
+/// What the published planner tables were built for: the store, the
+/// database, the catalog version, the session serial (a temp overlay) and the
+/// `search_path` the texts were rendered under.
+type InstalledTypesKey = (usize, String, u64, u64, String);
 
 /// A session's GUCs, carrying a generation that moves on every MUTABLE
 /// access (any `insert`, `remove`, assignment ...), so a reader can tell
@@ -2465,6 +2471,49 @@ impl DatabaseRegistry {
 /// client already sent a verifier (libpq's `PQchangePassword` does). A login
 /// as a role that has one is checked against it over SCRAM-SHA-256 (see
 /// `continue_password_login`).
+/// PostgreSQL 15's built-in memberships (`pg_auth_members.dat`): `(role,
+/// member)`, granted by the bootstrap superuser, without ADMIN.
+const BUILTIN_MEMBERSHIPS: &[(&str, &str)] = &[
+    ("pg_read_all_settings", "pg_monitor"),
+    ("pg_read_all_stats", "pg_monitor"),
+    ("pg_stat_scan_tables", "pg_monitor"),
+];
+
+/// PostgreSQL 15's predefined roles (`pg_authid.dat`), by oid.
+const PREDEFINED_ROLES: &[(i64, &str)] = &[
+    (3373, "pg_monitor"),
+    (3374, "pg_read_all_settings"),
+    (3375, "pg_read_all_stats"),
+    (3377, "pg_stat_scan_tables"),
+    (4200, "pg_signal_backend"),
+    (4544, "pg_checkpoint"),
+    (4569, "pg_read_server_files"),
+    (4570, "pg_write_server_files"),
+    (4571, "pg_execute_server_program"),
+    (6171, "pg_database_owner"),
+    (6181, "pg_read_all_data"),
+    (6182, "pg_write_all_data"),
+];
+
+fn is_predefined_role(name: &str) -> bool {
+    PREDEFINED_ROLES.iter().any(|(_, n)| *n == name)
+}
+
+/// 42939 for a role name starting `pg_`, as `check_rolespec_name` and
+/// `CreateRole` refuse one.
+fn reserved_role_name(name: &str, detail: &str) -> PgWireResult<()> {
+    if !name.starts_with("pg_") {
+        return Ok(());
+    }
+    let mut info = ErrorInfo::new(
+        "ERROR".into(),
+        "42939".into(), // reserved_name
+        format!("role name \"{name}\" is reserved"),
+    );
+    info.detail = Some(detail.to_string());
+    Err(PgWireError::UserError(Box::new(info)))
+}
+
 #[derive(Clone, Debug)]
 struct RoleInfo {
     oid: i64,
@@ -2642,6 +2691,22 @@ impl PgHandler {
     fn read_roles(&self) -> PgWireResult<Vec<RoleInfo>> {
         let ns = DatabaseRegistry::NAMESPACE;
         let mut out = vec![RoleInfo::bootstrap()];
+        // PostgreSQL's predefined roles (`pg_authid.dat`): NOLOGIN, INHERIT,
+        // no password, and no DDL reaches them (`check_rolespec_name`).
+        out.extend(PREDEFINED_ROLES.iter().map(|(oid, name)| RoleInfo {
+            oid: *oid,
+            name: (*name).to_string(),
+            superuser: false,
+            inherit: true,
+            createrole: false,
+            createdb: false,
+            canlogin: false,
+            replication: false,
+            bypassrls: false,
+            connlimit: -1,
+            password: None,
+            valid_until: Bson::Null,
+        }));
         let exists = self
             .storage
             .collection_exists(ns, Self::ROLE_COLLECTION)
@@ -2656,7 +2721,7 @@ impl PgHandler {
             .iter()
             .filter_map(|bytes| decode_doc(bytes).ok())
             .filter_map(|d| RoleInfo::from_doc(&d))
-            .filter(|r| r.oid != RoleInfo::BOOTSTRAP_OID)
+            .filter(|r| r.oid != RoleInfo::BOOTSTRAP_OID && !is_predefined_role(&r.name))
             .collect();
         stored.sort_by_key(|r| r.oid);
         out.extend(stored);
@@ -4337,6 +4402,8 @@ impl PgHandler {
     const MATVIEW_COLLECTION: &'static str = "__sql_matviews__";
     /// `CREATE DOMAIN`: the Python server's `__sql_domains__` document.
     const DOMAIN_COLLECTION: &'static str = "__sql_domains__";
+    /// `ALTER TYPE / DOMAIN ... OWNER TO`: a user type's owner, by name.
+    const TYPE_OWNER_COLLECTION: &'static str = "__sql_type_owners__";
     /// `ALTER TABLE ... ROW LEVEL SECURITY`: `{_id: table, table, enabled,
     /// forced}`, and `CREATE POLICY`: `{_id: "<table>\0<name>", name, table,
     /// command, roles, permissive, using, check}` -- the Python server's
@@ -4566,8 +4633,12 @@ impl PgHandler {
         // Copied only when the session's settings changed since this thread
         // last installed them: the map holds every PostgreSQL GUC, and
         // cloning it per statement was a fifth of a `select 1`'s server time.
+        // What the published texts are rendered under: ruleutils qualifies
+        // a name the search path does not reach (pg_dump sets it empty).
+        let search_path;
         {
             let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+            search_path = settings.map.get("search_path").cloned().unwrap_or_default();
             if INSTALLED_SETTINGS.with(|g| g.get()) == settings.generation() {
                 secantus_pgplan::set_session_database(self.db());
             } else {
@@ -4586,12 +4657,22 @@ impl PgHandler {
         };
         if INSTALLED_USER_TYPES.with(|c| {
             c.borrow().as_ref().is_some_and(|k| {
-                k.0 == storage_ptr && k.1 == self.db() && k.2 == version && k.3 == serial
+                k.0 == storage_ptr
+                    && k.1 == self.db()
+                    && k.2 == version
+                    && k.3 == serial
+                    && k.4 == search_path
             })
         }) {
             return;
         }
-        let held = (storage_ptr, self.db().to_string(), version, serial);
+        let held = (
+            storage_ptr,
+            self.db().to_string(),
+            version,
+            serial,
+            search_path,
+        );
         self.publish_user_types();
         // A view assembled from reads taken under a transaction's own
         // snapshot is that block's private one and is not reusable (see
@@ -4682,6 +4763,7 @@ impl PgHandler {
         secantus_pgplan::set_index_defs(self.index_defs());
         secantus_pgplan::set_trigger_defs(self.trigger_defs());
         secantus_pgplan::set_function_sigs(self.function_sigs());
+        secantus_pgplan::set_function_arg_defaults(self.function_arg_defaults());
         secantus_pgplan::set_function_defs(self.function_defs());
         secantus_pgplan::set_partkey_defs(
             self.all_table_defs()
@@ -9736,6 +9818,11 @@ impl PgHandler {
     }
 
     /// A sequence's relation oid: stable for its name, in its own band.
+    /// A column default's `pg_attrdef` oid, stable for the column.
+    pub(crate) fn attrdef_oid(table: &str, attnum: usize) -> i64 {
+        Self::index_oid(&format!("attrdef:{table}:{attnum}"))
+    }
+
     pub(crate) fn sequence_oid(name: &str) -> i64 {
         Self::index_oid(&format!("seq:{name}")) | 0x0400_0000
     }
@@ -10109,7 +10196,8 @@ impl PgHandler {
             "citext" => Some(("1.6", true, &["citext"])),
             // Operator classes only: GIN / GiST over the scalar types.
             "btree_gin" => Some(("1.3", true, &[])),
-            "btree_gist" => Some(("1.6", true, &[])),
+            // PostgreSQL 15.19 ships 1.7 (14 had 1.6).
+            "btree_gist" => Some(("1.7", true, &[])),
             // Functions only: digest / hmac / crypt / gen_salt / ...
             "pgcrypto" => Some(("1.3", true, &[])),
             // Trigram similarity: functions and operators, no types.
@@ -11570,7 +11658,11 @@ impl PgHandler {
                 let mut text = format!(
                     "FOREIGN KEY ({}) REFERENCES {}({})",
                     qlist(&fk.columns),
-                    fk.ref_table.split('.').map(q).collect::<Vec<_>>().join("."),
+                    secantus_pgplan::schemas::visible_name(&fk.ref_table)
+                        .split('.')
+                        .map(q)
+                        .collect::<Vec<_>>()
+                        .join("."),
                     qlist(&ref_columns)
                 );
                 if fk.match_full {
@@ -12126,6 +12218,39 @@ impl PgHandler {
             .and_then(|d| d.get_str("owner").ok().map(str::to_string))
     }
 
+    /// A materialized view created WITH NO DATA (or refreshed so) cannot be
+    /// read until a REFRESH fills it: 55000 at the scan
+    /// (`ExecOpenScanRelation`).
+    fn check_matviews_populated(&self, sql: &str) -> PgWireResult<()> {
+        if REFRESHING_MATVIEW.with(|f| f.get()) {
+            return Ok(());
+        }
+        let unpopulated: Vec<String> = self
+            .matviews()?
+            .into_iter()
+            .filter(|(_, _, populated)| !populated)
+            .map(|(n, _, _)| n)
+            .collect();
+        if unpopulated.is_empty() {
+            return Ok(());
+        }
+        for (t, privilege) in secantus_pgplan::privileges::sql_relations(sql) {
+            if privilege == "SELECT" && unpopulated.contains(&t) {
+                let mut info = ErrorInfo::new(
+                    "ERROR".into(),
+                    "55000".into(), // object_not_in_prerequisite_state
+                    format!(
+                        "materialized view \"{}\" has not been populated",
+                        secantus_pgplan::schemas::split_key(&t).1
+                    ),
+                );
+                info.hint = Some("Use the REFRESH MATERIALIZED VIEW command.".into());
+                return Err(PgWireError::UserError(Box::new(info)));
+            }
+        }
+        Ok(())
+    }
+
     /// Check the relations `sql` names against the effective role, as
     /// PostgreSQL's executor does: a view is checked AS A VIEW for the
     /// caller, and the relations its definition reads are checked for the
@@ -12139,6 +12264,7 @@ impl PgHandler {
     }
 
     fn check_sql_privileges_inner(&self, sql: &str) -> PgWireResult<()> {
+        self.check_matviews_populated(sql)?;
         let role = self.current_role_name();
         self.check_schema_create(&role, sql)?;
         self.check_builtin_execute(&role, sql)?;
@@ -13769,10 +13895,16 @@ impl PgHandler {
                 self.put_comment_doc(Self::FUNCTION_COLLECTION, &id, Some(doc))
             }
             "domain" => self.comment_on_domain(&Self::comment_relation(names), comment),
+            "database" | "role" => {
+                self.comment_on_shared(kind, names.last().map_or("", String::as_str), comment)
+            }
             _ => {
                 let name = Self::comment_relation(names);
-                if matches!(kind, "view" | "materialized view")
-                    && !self.views()?.iter().any(|(n, _)| *n == name)
+                if kind == "view" && !self.views()?.iter().any(|(n, _)| *n == name) {
+                    return Err(missing_relation(&name));
+                }
+                if kind == "materialized view"
+                    && !self.matviews()?.iter().any(|(n, _, _)| *n == name)
                 {
                     return Err(missing_relation(&name));
                 }
@@ -13784,14 +13916,25 @@ impl PgHandler {
                 {
                     return Err(missing_relation(&name));
                 }
+                if kind == "schema" && !secantus_pgplan::schemas::schema_exists(&name) {
+                    return Err(Self::user_error(
+                        "3F000",
+                        format!("schema \"{name}\" does not exist"),
+                    ));
+                }
                 let id = format!("{kind}\0{name}");
-                self.put_comment_doc(
-                    Self::COMMENT_COLLECTION,
-                    &id,
-                    comment.map(
-                        |c| bson::doc! {"_id": &id, "kind": kind, "name": &name, "comment": c},
-                    ),
-                )
+                // A schema's removed comment is kept as a record without
+                // one, so `public` does not take initdb's back.
+                let doc = match comment {
+                    Some(c) => {
+                        Some(bson::doc! {"_id": &id, "kind": kind, "name": &name, "comment": c})
+                    }
+                    None if kind == "schema" => {
+                        Some(bson::doc! {"_id": &id, "kind": kind, "name": &name})
+                    }
+                    None => None,
+                };
+                self.put_comment_doc(Self::COMMENT_COLLECTION, &id, doc)
             }
         }
     }
@@ -14301,20 +14444,35 @@ impl PgHandler {
 
     /// `GRANT role TO member` / `REVOKE role FROM member`.
     /// `(role, member, admin_option)` of every recorded membership.
+    /// `(role, member, admin option)` for every membership: PostgreSQL's
+    /// built-in ones (`pg_auth_members.dat`), then GRANT's. Memberships are
+    /// the cluster's, as `pg_auth_members` is shared, so they are kept beside
+    /// the roles; a store written before that keeps them per database, and
+    /// the current database's are read too.
     fn role_memberships(&self) -> Vec<(String, String, bool)> {
-        self.storage
-            .find_matching(self.db(), Self::ROLE_MEMBER_COLLECTION, &Document::new())
-            .unwrap_or_default()
+        let mut out: Vec<(String, String, bool)> = BUILTIN_MEMBERSHIPS
             .iter()
-            .filter_map(|b| decode_doc(b).ok())
-            .map(|d| {
-                (
+            .map(|(r, m)| ((*r).to_string(), (*m).to_string(), false))
+            .collect();
+        for ns in [DatabaseRegistry::NAMESPACE, self.db()] {
+            for d in self
+                .storage
+                .find_matching(ns, Self::ROLE_MEMBER_COLLECTION, &Document::new())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|b| decode_doc(b).ok())
+            {
+                let edge = (
                     d.get_str("role").unwrap_or_default().to_string(),
                     d.get_str("member").unwrap_or_default().to_string(),
                     d.get_bool("admin_option").unwrap_or(false),
-                )
-            })
-            .collect()
+                );
+                if !out.iter().any(|(r, m, _)| *r == edge.0 && *m == edge.1) {
+                    out.push(edge);
+                }
+            }
+        }
+        out
     }
 
     /// A role name, or an oid given for one.
@@ -14331,8 +14489,10 @@ impl PgHandler {
                 .map(|r| r.name)
         };
         let found = match v {
-            Bson::Int32(o) => by_oid(i64::from(*o)),
-            Bson::Int64(o) => by_oid(*o),
+            // An oid is not checked (`pg_has_role_id`): one no role has is a
+            // role nobody is a member of.
+            Bson::Int32(o) => by_oid(i64::from(*o)).or_else(|| Some(format!("\0{o}"))),
+            Bson::Int64(o) => by_oid(*o).or_else(|| Some(format!("\0{o}"))),
             other => {
                 let name = secantus_pgplan::value_text(other);
                 (name == session || self.role(&name)?.is_some()).then_some(name)
@@ -14397,7 +14557,20 @@ impl PgHandler {
         if superuser {
             return Ok(Bson::Boolean(true));
         }
-        let edges = self.role_memberships();
+        let mut edges = self.role_memberships();
+        let owner = self
+            .databases
+            .all(&self.storage)?
+            .into_iter()
+            .find(|d| d.name == self.db())
+            .map(|d| d.owner)
+            .unwrap_or_default();
+        let owner = if owner.is_empty() {
+            self.role_by_name_or_oid(&Bson::Int64(10))?
+        } else {
+            owner
+        };
+        edges.push(("pg_database_owner".to_string(), owner, false));
         // Every role `user` reaches through membership.
         let mut reached = vec![user.clone()];
         let mut i = 0;
@@ -14422,6 +14595,47 @@ impl PgHandler {
         Ok(Bson::Boolean(any))
     }
 
+    /// Record (or with `None` remove) one membership, beside the roles; an
+    /// older store's per-database record of it goes too.
+    fn put_membership(&self, id: &str, doc: Option<Document>) -> PgWireResult<()> {
+        let err = |e| Self::storage_err("could not record the role membership", e);
+        let ns = DatabaseRegistry::NAMESPACE;
+        if !self
+            .storage
+            .collection_exists(ns, Self::ROLE_MEMBER_COLLECTION)
+            .map_err(err)?
+        {
+            self.storage
+                .create_collection(ns, Self::ROLE_MEMBER_COLLECTION)
+                .map_err(err)?;
+        }
+        for db in [ns, self.db()] {
+            if self
+                .storage
+                .collection_exists(db, Self::ROLE_MEMBER_COLLECTION)
+                .map_err(err)?
+            {
+                self.storage
+                    .delete_matching(
+                        db,
+                        Self::ROLE_MEMBER_COLLECTION,
+                        &bson::doc! {"_id": id},
+                        0,
+                        &Document::new(),
+                        None,
+                    )
+                    .map_err(err)?;
+            }
+        }
+        if let Some(d) = doc {
+            let bytes = encode_doc(&d).map_err(|e| Self::storage_err("could not encode", e))?;
+            self.storage
+                .insert(ns, Self::ROLE_MEMBER_COLLECTION, vec![bytes], true)
+                .map_err(err)?;
+        }
+        Ok(())
+    }
+
     fn grant_role(
         &self,
         is_grant: bool,
@@ -14443,7 +14657,7 @@ impl PgHandler {
                 let doc = is_grant.then(|| {
                     bson::doc! {"_id": &id, "role": role, "member": member, "admin_option": admin}
                 });
-                self.put_comment_doc(Self::ROLE_MEMBER_COLLECTION, &id, doc)?;
+                self.put_membership(&id, doc)?;
             }
         }
         Ok(())
@@ -15337,14 +15551,36 @@ impl PgHandler {
             .map_err(|e| Self::storage_err("could not refresh the materialized view", e))?;
         if with_data {
             let host = PlHost { h: self };
+            // The definition is the text CREATE stored, which PostgreSQL
+            // would have bound to its relations then: it is read under the
+            // default path, not the session's (`''` in a pg_dump restore).
+            let saved_path = self
+                .settings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert("search_path".into(), "\"$user\", public".into());
             REFRESHING_MATVIEW.with(|f| f.set(true));
+            // The target named with its schema: pg_dump's restore runs this
+            // with `search_path` set to ''.
+            let (schema, bare) = secantus_pgplan::schemas::split_key(name);
             let out = plpgsql_fn::Host::execute(
                 &host,
-                &format!("INSERT INTO \"{name}\" SELECT * FROM ({definition}) __mv"),
+                &format!(
+                    "INSERT INTO {}.{} SELECT * FROM ({definition}) __mv",
+                    secantus_pgplan::scalar::quote_identifier(&schema),
+                    secantus_pgplan::scalar::quote_identifier(&bare)
+                ),
                 &[],
                 &[],
             );
             REFRESHING_MATVIEW.with(|f| f.set(false));
+            {
+                let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+                match saved_path {
+                    Some(p) => settings.insert("search_path".into(), p),
+                    None => settings.remove("search_path"),
+                };
+            }
             out.map_err(|e| {
                 let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate, e.message);
                 info.detail = e.detail;
@@ -15821,6 +16057,14 @@ impl PgHandler {
                 out.push((oid, 0, c.to_string()));
             }
         }
+        // COMMENT ON FUNCTION / PROCEDURE, kept on the function's record,
+        // under the oid `pg_proc` gives it.
+        for d in self.user_function_docs().unwrap_or_default() {
+            if let Ok(c) = d.get_str("comment") {
+                let key = d.get_str("_id").unwrap_or_default();
+                out.push((Self::index_oid(&format!("fn:{key}")), 0, c.to_string()));
+            }
+        }
         for d in self
             .storage
             .find_matching(self.db(), Self::COMMENT_COLLECTION, &Document::new())
@@ -16079,16 +16323,6 @@ impl PgHandler {
                     Column::new("is_trigger_insertable_into", "varchar", false),
                 ],
             )),
-            "information_schema.domains" => Some(TableDef::new(
-                "domains",
-                vec![
-                    Column::new("domain_catalog", "name", false),
-                    Column::new("domain_schema", "name", false),
-                    Column::new("domain_name", "name", false),
-                    Column::new("data_type", "varchar", false),
-                    Column::new("domain_default", "varchar", false),
-                ],
-            )),
             "information_schema.tables" => Some(TableDef::new(
                 "tables",
                 vec![
@@ -16096,6 +16330,14 @@ impl PgHandler {
                     Column::new("table_schema", "name", false),
                     Column::new("table_name", "name", false),
                     Column::new("table_type", "varchar", false),
+                    Column::new("self_referencing_column_name", "name", false),
+                    Column::new("reference_generation", "varchar", false),
+                    Column::new("user_defined_type_catalog", "name", false),
+                    Column::new("user_defined_type_schema", "name", false),
+                    Column::new("user_defined_type_name", "name", false),
+                    Column::new("is_insertable_into", "varchar", false),
+                    Column::new("is_typed", "varchar", false),
+                    Column::new("commit_action", "varchar", false),
                 ],
             )),
             "information_schema.table_constraints" => Some(TableDef::new(
@@ -16108,6 +16350,10 @@ impl PgHandler {
                     Column::new("table_schema", "name", false),
                     Column::new("table_name", "name", false),
                     Column::new("constraint_type", "varchar", false),
+                    Column::new("is_deferrable", "varchar", false),
+                    Column::new("initially_deferred", "varchar", false),
+                    Column::new("enforced", "varchar", false),
+                    Column::new("nulls_distinct", "varchar", false),
                 ],
             )),
             "information_schema.key_column_usage" => Some(TableDef::new(
@@ -16121,6 +16367,7 @@ impl PgHandler {
                     Column::new("table_name", "name", false),
                     Column::new("column_name", "name", false),
                     Column::new("ordinal_position", "int4", false),
+                    Column::new("position_in_unique_constraint", "int4", false),
                 ],
             )),
             "information_schema.sequences" => Some(TableDef::new(
@@ -16130,6 +16377,9 @@ impl PgHandler {
                     Column::new("sequence_schema", "name", false),
                     Column::new("sequence_name", "name", false),
                     Column::new("data_type", "varchar", false),
+                    Column::new("numeric_precision", "int4", false),
+                    Column::new("numeric_precision_radix", "int4", false),
+                    Column::new("numeric_scale", "int4", false),
                     Column::new("start_value", "varchar", false),
                     Column::new("minimum_value", "varchar", false),
                     Column::new("maximum_value", "varchar", false),
@@ -16187,6 +16437,7 @@ impl PgHandler {
                     Column::new("oid", "oid", false),
                     Column::new("nspname", "name", false),
                     Column::new("nspowner", "oid", false),
+                    Column::new("nspacl", "aclitem[]", false),
                 ],
             )),
             "pg_index" => Some(TableDef::new(
@@ -16706,6 +16957,7 @@ impl PgHandler {
             "pg_depend" => Some(catalog_fill::pg_depend_def()),
             "pg_publication_namespace" => Some(catalog_fill::pg_publication_namespace_def()),
             other if fdw::fdw_catalog_def(other).is_some() => fdw::fdw_catalog_def(other),
+            other if system_catalogs::is_system_catalog(other) => system_catalogs::def(other),
             _ => Self::catalog_object_table(name),
         }
     }
@@ -16737,7 +16989,10 @@ impl PgHandler {
             "pg_event_trigger_ddl_commands" => self.ddl_commands_rows(&def),
             "pg_rules" => self.pg_rules_rows(&def),
             "pg_get_keywords" => catalog_meta::pg_get_keywords_rows(&def),
-            "pg_depend" => Vec::new(),
+            other if system_catalogs::is_system_catalog(other) => {
+                self.system_catalog_rows(other, &def)
+            }
+            "pg_depend" => self.pg_depend_rows(&def),
             "pg_publication_namespace" => Vec::new(),
             "information_schema.columns" => {
                 let f = |name: &str| def.field_of(name).expect("column");
@@ -16982,60 +17237,65 @@ impl PgHandler {
                     })
                     .collect()
             }
-            "information_schema.domains" => {
-                let f = |name: &str| def.field_of(name).expect("column");
-                let db = self.db().to_string();
-                self.domains()
-                    .ok()?
-                    .into_iter()
-                    .map(|dm| {
-                        let mut d = Document::new();
-                        d.insert(f("domain_catalog"), db.as_str());
-                        d.insert(f("domain_schema"), "public");
-                        d.insert(f("domain_name"), dm.name.as_str());
-                        d.insert(f("data_type"), secantus_pgplan::display_type(&dm.base));
-                        d.insert(
-                            f("domain_default"),
-                            dm.default_sql.map_or(Bson::Null, Bson::String),
-                        );
-                        d
-                    })
-                    .collect()
-            }
+            // PostgreSQL 15's `information_schema.tables`: a relation of the
+            // session's own temp schema is `LOCAL TEMPORARY`, another
+            // session's is not listed (`pg_is_other_temp_schema`), and
+            // `is_insertable_into` is `pg_relation_is_updatable`'s INSERT bit
+            // for a view or foreign table. No table here is typed (`OF type`).
             "information_schema.tables" => {
                 let f = |name: &str| def.field_of(name).expect("column");
                 let db = self.db().to_string();
+                let own_temp = self.temp_schema_name();
+                let common = |d: &mut Document, insertable: bool| {
+                    for k in [
+                        "self_referencing_column_name",
+                        "reference_generation",
+                        "user_defined_type_catalog",
+                        "user_defined_type_schema",
+                        "user_defined_type_name",
+                        "commit_action",
+                    ] {
+                        d.insert(f(k), Bson::Null);
+                    }
+                    d.insert(
+                        f("is_insertable_into"),
+                        if insertable { "YES" } else { "NO" },
+                    );
+                    d.insert(f("is_typed"), "NO");
+                };
                 self.all_table_defs()
                     .ok()?
                     .into_iter()
+                    .filter(|t| !t.temp || Self::schema_of(t) == own_temp)
                     .map(|t| {
                         let mut d = Document::new();
                         d.insert(f("table_catalog"), db.as_str());
                         d.insert(f("table_schema"), Self::schema_of(&t));
                         d.insert(f("table_name"), t.name.as_str());
-                        // A temporary table is still a BASE TABLE; `LOCAL
-                        // TEMPORARY` is the table_type of a declared local
-                        // temporary, which this server has none of.
                         d.insert(
                             f("table_type"),
-                            if secantus_pgplan::fdw::is_foreign(&t) {
+                            if t.temp {
+                                "LOCAL TEMPORARY"
+                            } else if secantus_pgplan::fdw::is_foreign(&t) {
                                 "FOREIGN"
                             } else {
                                 "BASE TABLE"
                             },
                         );
+                        common(&mut d, true);
                         d
                     })
                     .chain(
                         self.views()
                             .ok()?
                             .into_iter()
-                            .map(|(name, _)| {
+                            .map(|(name, sql)| {
                                 let mut d = Document::new();
                                 d.insert(f("table_catalog"), db.as_str());
                                 d.insert(f("table_schema"), "public");
                                 d.insert(f("table_name"), name);
                                 d.insert(f("table_type"), "VIEW");
+                                common(&mut d, secantus_pgplan::view_dml::is_updatable(&sql));
                                 d
                             })
                             .collect::<Vec<_>>(),
@@ -17047,9 +17307,23 @@ impl PgHandler {
                 let f = |name: &str| def.field_of(name).expect("column");
                 let db = self.db().to_string();
                 let mut rows = Vec::new();
+                let own_temp = self.temp_schema_name();
+                let namespaces = self.namespaces();
                 for t in self.all_table_defs().ok()? {
                     let schema = Self::schema_of(&t);
-                    let push = |name: &str, kind: &str, rows: &mut Vec<Document>| {
+                    // Another session's temp schema is not listed
+                    // (`pg_is_other_temp_schema`).
+                    if t.temp && schema != own_temp {
+                        continue;
+                    }
+                    // `(name, type, deferrable, deferred, nulls_distinct)`.
+                    let push = |name: &str,
+                                kind: &str,
+                                deferrable: bool,
+                                deferred: bool,
+                                nulls_distinct: Option<bool>,
+                                rows: &mut Vec<Document>| {
+                        let yes = |b: bool| if b { "YES" } else { "NO" };
                         let mut d = Document::new();
                         d.insert(f("constraint_catalog"), db.as_str());
                         d.insert(f("constraint_schema"), schema.as_str());
@@ -17058,31 +17332,67 @@ impl PgHandler {
                         d.insert(f("table_schema"), schema.as_str());
                         d.insert(f("table_name"), t.name.as_str());
                         d.insert(f("constraint_type"), kind);
+                        d.insert(f("is_deferrable"), yes(deferrable));
+                        d.insert(f("initially_deferred"), yes(deferred));
+                        d.insert(f("enforced"), "YES");
+                        d.insert(
+                            f("nulls_distinct"),
+                            nulls_distinct.map_or(Bson::Null, |b| Bson::String(yes(b).into())),
+                        );
                         rows.push(d);
                     };
                     if t.columns.iter().any(|c| c.pk) {
-                        push(&pk_constraint_name(&t), "PRIMARY KEY", &mut rows);
-                    }
-                    for u in &t.unique_constraints {
-                        push(&u.name, "UNIQUE", &mut rows);
-                    }
-                    for c in &t.check_constraints {
-                        push(&c.name, "CHECK", &mut rows);
-                    }
-                    // PostgreSQL records a CHECK for every NOT NULL column
-                    // too, named `<n>_not_null`, and a client counting
-                    // constraints sees them. The PRIMARY KEY column is one of
-                    // them: its NOT NULL is implicit but still recorded, so
-                    // excluding it under-counted every table by one.
-                    for c in t.columns.iter().filter(|c| !c.nullable) {
                         push(
-                            &format!("{}_{}_not_null", t.name, c.name),
-                            "CHECK",
+                            &pk_constraint_name(&t),
+                            "PRIMARY KEY",
+                            false,
+                            false,
+                            None,
                             &mut rows,
                         );
                     }
+                    // An EXCLUDE constraint is not listed (contype 'x').
+                    for u in t.unique_constraints.iter().filter(|u| !u.exclusion) {
+                        push(
+                            &u.name,
+                            "UNIQUE",
+                            u.deferrable,
+                            u.initially_deferred,
+                            Some(!u.nulls_not_distinct),
+                            &mut rows,
+                        );
+                    }
+                    for c in &t.check_constraints {
+                        push(&c.name, "CHECK", false, false, None, &mut rows);
+                    }
                     for fk in &t.foreign_keys {
-                        push(&fk.name, "FOREIGN KEY", &mut rows);
+                        push(
+                            &fk.name,
+                            "FOREIGN KEY",
+                            fk.deferrable,
+                            fk.initially_deferred,
+                            None,
+                            &mut rows,
+                        );
+                    }
+                    // PostgreSQL lists a CHECK for every NOT NULL column too,
+                    // after the real constraints, named
+                    // `<namespace oid>_<table oid>_<attnum>_not_null`. The
+                    // PRIMARY KEY's columns are among them.
+                    let nsp = namespaces
+                        .iter()
+                        .find(|(n, _)| *n == schema)
+                        .map_or(Self::PUBLIC_NAMESPACE_OID, |(_, o)| *o);
+                    let rel = self.relation_oid(&t.name).unwrap_or(0);
+                    for (i, _) in t.columns.iter().enumerate().filter(|(_, c)| !c.nullable) {
+                        push(
+                            &format!("{nsp}_{rel}_{}_not_null", i + 1),
+                            "CHECK",
+                            false,
+                            false,
+                            None,
+                            &mut rows,
+                        );
                     }
                 }
                 rows
@@ -17112,9 +17422,17 @@ impl PgHandler {
                 let f = |name: &str| def.field_of(name).expect("column");
                 let db = self.db().to_string();
                 let mut rows = Vec::new();
+                let own_temp = self.temp_schema_name();
                 for t in self.all_table_defs().ok()? {
                     let schema = Self::schema_of(&t);
-                    let push = |name: &str, column: &str, pos: i32, rows: &mut Vec<Document>| {
+                    if t.temp && schema != own_temp {
+                        continue;
+                    }
+                    let push = |name: &str,
+                                column: &str,
+                                pos: i32,
+                                unique_pos: Option<i32>,
+                                rows: &mut Vec<Document>| {
                         let mut d = Document::new();
                         d.insert(f("constraint_catalog"), db.as_str());
                         d.insert(f("constraint_schema"), schema.as_str());
@@ -17124,6 +17442,10 @@ impl PgHandler {
                         d.insert(f("table_name"), t.name.as_str());
                         d.insert(f("column_name"), column);
                         d.insert(f("ordinal_position"), Bson::Int32(pos));
+                        d.insert(
+                            f("position_in_unique_constraint"),
+                            unique_pos.map_or(Bson::Null, Bson::Int32),
+                        );
                         rows.push(d);
                     };
                     // Only the KEY constraints appear here -- a CHECK names no
@@ -17132,16 +17454,43 @@ impl PgHandler {
                     // constraint of any kind.
                     let pkey = pk_constraint_name(&t);
                     for (i, c) in secantus_pgplan::ordered_pk_columns(&t).iter().enumerate() {
-                        push(&pkey, &c.name, (i + 1) as i32, &mut rows);
+                        push(&pkey, &c.name, (i + 1) as i32, None, &mut rows);
                     }
-                    for u in &t.unique_constraints {
+                    for u in t.unique_constraints.iter().filter(|u| !u.exclusion) {
                         for (i, c) in u.columns.iter().enumerate() {
-                            push(&u.name, c, (i + 1) as i32, &mut rows);
+                            push(&u.name, c, (i + 1) as i32, None, &mut rows);
                         }
                     }
                     for fk in &t.foreign_keys {
+                        // The referenced unique key, in its own column order:
+                        // `_pg_index_position(conindid, confkey[n])`.
+                        let key: Vec<String> = self
+                            .lookup(&fk.ref_table)
+                            .and_then(|r| {
+                                let same = |cols: &[String]| {
+                                    cols.len() == fk.ref_columns.len()
+                                        && cols.iter().all(|c| fk.ref_columns.contains(c))
+                                };
+                                let pk: Vec<String> = secantus_pgplan::ordered_pk_columns(&r)
+                                    .iter()
+                                    .map(|c| c.name.clone())
+                                    .collect();
+                                if same(&pk) {
+                                    return Some(pk);
+                                }
+                                r.unique_constraints
+                                    .iter()
+                                    .find(|u| !u.exclusion && same(&u.columns))
+                                    .map(|u| u.columns.clone())
+                            })
+                            .unwrap_or_default();
                         for (i, c) in fk.columns.iter().enumerate() {
-                            push(&fk.name, c, (i + 1) as i32, &mut rows);
+                            let unique_pos = fk
+                                .ref_columns
+                                .get(i)
+                                .and_then(|rc| key.iter().position(|k| k == rc))
+                                .map(|p| p as i32 + 1);
+                            push(&fk.name, c, (i + 1) as i32, unique_pos, &mut rows);
                         }
                     }
                 }
@@ -17174,14 +17523,16 @@ impl PgHandler {
                         d.insert(f("sequence_catalog"), db.as_str());
                         d.insert(f("sequence_schema"), "public");
                         d.insert(f("sequence_name"), s.get_str("_id").unwrap_or_default());
-                        d.insert(
-                            f("data_type"),
-                            match s.get_str("data_type") {
-                                Ok("int2") => "smallint",
-                                Ok("int4") => "integer",
-                                _ => "bigint",
-                            },
-                        );
+                        let (data_type, bits) = match s.get_str("data_type") {
+                            Ok("int2") => ("smallint", 16),
+                            Ok("int4") => ("integer", 32),
+                            _ => ("bigint", 64),
+                        };
+                        d.insert(f("data_type"), data_type);
+                        // `_pg_numeric_precision` and friends: binary.
+                        d.insert(f("numeric_precision"), Bson::Int32(bits));
+                        d.insert(f("numeric_precision_radix"), Bson::Int32(2));
+                        d.insert(f("numeric_scale"), Bson::Int32(0));
                         // The bounds are TEXT in this view, which is the SQL
                         // standard's shape for a value that may not fit the
                         // view's own numeric type.
@@ -17358,7 +17709,10 @@ impl PgHandler {
                     d.insert(f("relnatts"), Bson::Int32(3));
                     d.insert(f("relhasindex"), false);
                     d.insert(f("reltuples"), Bson::Double(1.0));
-                    d.insert(f("relowner"), Bson::Int64(10));
+                    d.insert(
+                        f("relowner"),
+                        Bson::Int64(owner_oid(s.get_str("owner").ok())),
+                    );
                     d.insert(f("relpersistence"), "p");
                     d.insert(f("relrowsecurity"), false);
                     d.insert(f("relforcerowsecurity"), false);
@@ -17439,6 +17793,22 @@ impl PgHandler {
                         d.insert(
                             f("nspowner"),
                             Bson::Int64(if name == "public" { 6171 } else { 10 }),
+                        );
+                        // initdb's ACLs (`pg_init_privs`); any other schema
+                        // has the default, NULL.
+                        let acl = |owner: &str| {
+                            Bson::Array(vec![
+                                Bson::String(format!("{owner}=UC/{owner}")),
+                                Bson::String(format!("=U/{owner}")),
+                            ])
+                        };
+                        d.insert(
+                            f("nspacl"),
+                            match name.as_str() {
+                                "public" => acl("pg_database_owner"),
+                                "pg_catalog" | "information_schema" => acl("postgres"),
+                                _ => Bson::Null,
+                            },
                         );
                         d.insert(f("nspname"), name);
                         d
@@ -17663,7 +18033,7 @@ impl PgHandler {
                             continue;
                         }
                         let mut d = Document::new();
-                        d.insert(f("oid"), Bson::Int64(0));
+                        d.insert(f("oid"), Bson::Int64(Self::attrdef_oid(&t.name, i + 1)));
                         d.insert(f("adrelid"), Bson::Int64(oid));
                         d.insert(f("adnum"), Bson::Int32((i + 1) as i32));
                         // `adbin` is a parse tree in PostgreSQL, read through
@@ -20783,10 +21153,12 @@ fn default_settings() -> HashMap<String, String> {
         ("lc_monetary", "C"),
         ("lc_numeric", "C"),
         ("lc_time", "C"),
-        ("server_version", "15.0"),
+        // PostgreSQL 15.19, the release every answer is measured against
+        // (Joe, 2026-10-22, RP-108).
+        ("server_version", "15.19"),
         // The numeric form every client that gates on a server version
-        // actually reads -- `major * 10000 + minor`, so 15.0 is 150000.
-        ("server_version_num", "150000"),
+        // actually reads -- `major * 10000 + minor`, so 15.19 is 150019.
+        ("server_version_num", "150019"),
         // Read by a client before `ALTER USER ... PASSWORD` to pick the hash
         // (libpq's `PQchangePassword`); PostgreSQL 16's default.
         ("password_encryption", "scram-sha-256"),
@@ -23152,10 +23524,26 @@ impl PgHandler {
                 v
             }
             Statement::RenameTable { table, to, .. } => {
-                let mut v = vec![table.clone(), to.clone(), CATALOG_COLLECTION.to_string()];
+                let mut v = vec![
+                    table.clone(),
+                    to.clone(),
+                    CATALOG_COLLECTION.to_string(),
+                    Self::COMPOSITE_COLLECTION.to_string(),
+                ];
                 v.extend(Self::grant_collections().map(String::from));
                 v
             }
+            Statement::RenameMatView { matview, to, .. } => {
+                let mut v = vec![
+                    matview.clone(),
+                    to.clone(),
+                    CATALOG_COLLECTION.to_string(),
+                    Self::MATVIEW_COLLECTION.to_string(),
+                ];
+                v.extend(Self::grant_collections().map(String::from));
+                v
+            }
+            Statement::AlterTypeOwner { .. } => vec![Self::TYPE_OWNER_COLLECTION.to_string()],
             Statement::Update(u) => vec![u.table.clone()],
             Statement::Delete(d) => vec![d.table.clone()],
             // CASCADE can widen the list to referencing tables, and RESTART
@@ -23549,6 +23937,36 @@ impl PgHandler {
             A::OwnerTo(role) => {
                 return Ok(Some(A::OwnerTo(self.grantee_name(role)?)));
             }
+            // `ATExecAddIdentity`, in its order.
+            A::AddIdentity { column, .. } => {
+                let Some(c) = def.column(column) else {
+                    return Err(missing_column(column));
+                };
+                if !matches!(c.pg_type.as_str(), "int2" | "int4" | "int8") {
+                    return Err(Self::user_error(
+                        "22023",
+                        "identity column type must be smallint, integer, or bigint".into(),
+                    ));
+                }
+                let prerequisite = |what: &str| {
+                    Self::user_error(
+                        "55000",
+                        format!("column \"{column}\" of relation \"{table}\" {what}"),
+                    )
+                };
+                if c.nullable {
+                    return Err(prerequisite(
+                        "must be declared NOT NULL before identity can be added",
+                    ));
+                }
+                if c.identity.is_some() {
+                    return Err(prerequisite("is already an identity column"));
+                }
+                if c.default.is_some() || c.sequence.is_some() {
+                    return Err(prerequisite("already has a default value"));
+                }
+                return Ok(Some(action.clone()));
+            }
             A::ClusterOn(Some(index)) => {
                 self.cluster_keys(table, index)?;
                 return Ok(Some(action.clone()));
@@ -23786,6 +24204,39 @@ impl PgHandler {
             }
             A::RuleEnabled { name, enabled } => self.set_rule_enabled(table, name, *enabled),
             A::ForeignOptions(_) => Ok(()),
+            // The identity's sequence, owned by the column, typed by it.
+            A::AddIdentity {
+                column, options, ..
+            } => {
+                let Some(seq) = def.column(column).and_then(|c| c.sequence.clone()) else {
+                    return Ok(());
+                };
+                if self.sequence_doc(&seq)?.is_some() || self.lookup(&seq).is_some() {
+                    return Err(Self::user_error(
+                        "42P07",
+                        format!("relation \"{seq}\" already exists"),
+                    ));
+                }
+                let ty = def
+                    .column(column)
+                    .map(|c| c.pg_type.clone())
+                    .unwrap_or_default();
+                let mut o = options.clone();
+                o.sequence_name = None;
+                o.owned_by = Some(format!("{table}.{column}"));
+                o.data_type = Some(ty);
+                self.ensure_collection(SEQUENCE_COLLECTION)?;
+                let mut doc = Self::new_sequence_doc(&seq, &o)?;
+                doc.insert("owner", self.current_role_name());
+                let bytes = encode_doc(&doc)
+                    .map_err(|e| Self::storage_err("could not encode the sequence", e))?;
+                self.insert_checked(
+                    SEQUENCE_COLLECTION,
+                    vec![bytes],
+                    "could not create the sequence",
+                )?;
+                Ok(())
+            }
             A::ValidateConstraint(name) => {
                 let Some(check) = before.check_constraints.iter().find(|c| c.name == *name) else {
                     return Ok(());
@@ -24374,6 +24825,41 @@ impl PgHandler {
         Ok(())
     }
 
+    /// Re-key a relation's row type from `old` to `new`, keeping its oid.
+    fn rename_row_type(&self, old: &str, new: &str) -> PgWireResult<()> {
+        self.ensure_collection(Self::COMPOSITE_COLLECTION)?;
+        let Some(mut row_type) = self
+            .type_catalog_docs(Self::COMPOSITE_COLLECTION)?
+            .iter()
+            .find(|d| d.get_str("_id") == Ok(old) && d.get_bool("relation").unwrap_or(false))
+            .cloned()
+        else {
+            return Ok(());
+        };
+        self.storage
+            .delete_matching(
+                self.db(),
+                Self::COMPOSITE_COLLECTION,
+                &bson::doc! { "_id": old, "relation": true },
+                0,
+                &Document::new(),
+                None,
+            )
+            .map_err(|e| Self::storage_err("could not rename the row type", e))?;
+        row_type.insert("_id", new);
+        row_type.insert("composite", new);
+        let bytes = encode_doc(&row_type)
+            .map_err(|e| Self::storage_err("could not encode the row type", e))?;
+        self.insert_checked(
+            Self::COMPOSITE_COLLECTION,
+            vec![bytes],
+            "could not record the row type",
+        )?;
+        self.note_uncommitted_type(Self::COMPOSITE_COLLECTION, old, None);
+        self.note_uncommitted_type(Self::COMPOSITE_COLLECTION, new, Some(row_type));
+        Ok(())
+    }
+
     fn delete_catalog(&self, name: &str) -> PgWireResult<()> {
         self.ensure_collection(CATALOG_COLLECTION)?;
         self.storage
@@ -24618,6 +25104,34 @@ impl PgHandler {
     }
 
     /// A sequence's stored document, or `None` when there is no such sequence.
+    /// Does `name` have a table's catalog row (not a sequence's or a view's
+    /// stand-in definition)?
+    fn has_table_catalog(&self, name: &str) -> bool {
+        self.all_table_defs()
+            .is_ok_and(|defs| defs.iter().any(|d| d.name == name))
+    }
+
+    /// `ALTER TABLE / SEQUENCE s OWNER TO r`: the sequence's owner, on its
+    /// record.
+    fn set_sequence_owner(&self, name: &str, owner: &str) -> PgWireResult<()> {
+        self.storage
+            .update_matching(
+                self.db(),
+                SEQUENCE_COLLECTION,
+                &bson::doc! { "_id": name },
+                &bson::doc! { "$set": { "owner": owner } },
+                false,
+                false,
+                &[],
+                &Document::new(),
+                None,
+                None,
+                false,
+            )
+            .map_err(|e| Self::storage_err("could not record the sequence owner", e))?;
+        Ok(())
+    }
+
     fn sequence_doc(&self, name: &str) -> PgWireResult<Option<Document>> {
         self.read_sequences(|| self.sequence_doc_here(name))
     }
@@ -25011,6 +25525,39 @@ impl PgHandler {
         }
         if name.starts_with("lo") && largeobjects::is_sql_function(name) {
             return self.lo_sql_call(name, args);
+        }
+        // `set_config` in an expression: the same as a select-list one
+        // (RP-071). A NULL name is NULL, as there.
+        if name == "pg_my_temp_schema" {
+            // The session's `pg_temp_N`, once it exists; 0 before.
+            let own = self.temp_schema_name();
+            return Ok(Bson::Int64(
+                self.namespaces()
+                    .into_iter()
+                    .find(|(n, _)| *n == own)
+                    .map_or(0, |(_, o)| o),
+            ));
+        }
+        if name == "pg_get_serial_sequence" {
+            let arg = |i: usize| {
+                Box::new(secantus_pgplan::ConstCol::Value(
+                    args.get(i).cloned().unwrap_or(Bson::Null),
+                ))
+            };
+            return self.resolve_const_col(&secantus_pgplan::ConstCol::SerialSequence {
+                table: arg(0),
+                column: arg(1),
+            });
+        }
+        if name == "set_config" {
+            let Some(Bson::String(setting)) = args.first() else {
+                return Ok(Bson::Null);
+            };
+            return self.resolve_const_col(&secantus_pgplan::ConstCol::SetConfig {
+                name: setting.clone(),
+                value: args.get(1).cloned().unwrap_or(Bson::Null),
+                is_local: matches!(args.get(2), Some(Bson::Boolean(true))),
+            });
         }
         // `pg_trgm`'s `set_limit(real)`: the session's similarity threshold.
         if name == "set_limit" {
@@ -30306,17 +30853,15 @@ impl PgHandler {
             .map(|(t, _, _)| format!("{t}[]"))
     }
 
-    /// The result type of one set-operation column, or 42804.
-    ///
-    /// PostgreSQL unifies the two sides within a type CATEGORY and refuses
-    /// across categories -- `text UNION integer` is
-    /// `UNION types text and integer cannot be matched`, while `int4 UNION
-    /// int8` is `bigint` and `numeric UNION float8` is `double precision`
-    /// (all measured on 14.24, 2026-09-20). A NULL-typed side takes the
-    /// other's type.
-    ///
-    /// The numeric and datetime widenings are PostgreSQL's, and so is the
-    /// string rule (see below).
+    /// The result type of one set-operation column, or 42804:
+    /// PostgreSQL's `select_common_type` for the two sides. Both must be of
+    /// one type category (`text UNION integer` is 42804); the left type stands
+    /// unless it is not its category's preferred type and casts implicitly to
+    /// the right one, which does not cast back (`int4 UNION int8` is bigint,
+    /// `numeric UNION float8` double precision, `int4 UNION regclass`
+    /// regclass, while `oid UNION regclass` stays oid: those cast both ways).
+    /// Arrays are judged by their elements, as `can_coerce_type` judges an
+    /// array cast. A NULL-typed side takes the other's type.
     fn unify_set_op_type(kind: &str, left: &Type, right: &Type) -> PgWireResult<Type> {
         if left == right {
             return Ok(left.clone());
@@ -30327,46 +30872,8 @@ impl PgHandler {
         if *right == Type::UNKNOWN {
             return Ok(left.clone());
         }
-        // (category, widening rank) -- a higher rank wins within a category.
-        let rank = |t: &Type| -> Option<(u8, u8)> {
-            Some(match *t {
-                Type::INT2 => (1, 1),
-                Type::INT4 => (1, 2),
-                Type::INT8 => (1, 3),
-                Type::NUMERIC => (1, 4),
-                Type::FLOAT4 => (1, 5),
-                Type::FLOAT8 => (1, 6),
-                Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => (2, 0),
-                Type::DATE => (3, 1),
-                Type::TIMESTAMP => (3, 2),
-                Type::TIMESTAMPTZ => (3, 3),
-                _ => return None,
-            })
-        };
-        match (rank(left), rank(right)) {
-            (Some((lc, lr)), Some((rc, rr))) if lc == rc => {
-                if lc == 2 {
-                    // `select_common_type`: text is the category's preferred
-                    // type and wins; otherwise the left type gives way to the
-                    // right one when only the left casts implicitly to it
-                    // (`varchar UNION name` is name, `bpchar UNION text` stays
-                    // bpchar -- those cast both ways).
-                    let (l, r) = (i64::from(left.oid()), i64::from(right.oid()));
-                    if *left != Type::TEXT
-                        && casts::implicit_cast(l, r)
-                        && !casts::implicit_cast(r, l)
-                    {
-                        return Ok(right.clone());
-                    }
-                    return Ok(left.clone());
-                }
-                Ok(if lr >= rr {
-                    left.clone()
-                } else {
-                    right.clone()
-                })
-            }
-            _ => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+        let mismatch = || {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
                 "42804".into(), // datatype_mismatch
                 format!(
@@ -30374,8 +30881,58 @@ impl PgHandler {
                     secantus_pgplan::display_type(left.name()),
                     secantus_pgplan::display_type(right.name()),
                 ),
-            )))),
+            )))
+        };
+        let (l, r) = (i64::from(left.oid()), i64::from(right.oid()));
+        let (Some((lc, preferred)), Some((rc, _))) = (
+            secantus_pgplan::category_preferred_of_oid(l),
+            secantus_pgplan::category_preferred_of_oid(r),
+        ) else {
+            return Err(mismatch());
+        };
+        if lc != rc {
+            return Err(mismatch());
         }
+        // An array's cast is its element's.
+        let element = |t: &Type| match t.kind() {
+            postgres_types::Kind::Array(e) => Some(e.clone()),
+            _ => None,
+        };
+        let (le, re) = (element(left), element(right));
+        let (cl, cr) = match (&le, &re) {
+            (Some(a), Some(b)) => (i64::from(a.oid()), i64::from(b.oid())),
+            _ => (l, r),
+        };
+        if !preferred && casts::implicit_cast(cl, cr) && !casts::implicit_cast(cr, cl) {
+            return Ok(right.clone());
+        }
+        Ok(left.clone())
+    }
+
+    /// 42846 when a set operation's side has no implicit cast to the type the
+    /// two sides unify to (`numeric UNION oid`: both numeric-category, but
+    /// oid does not cast to numeric). An array is judged by its element.
+    fn check_set_op_conversion(kind: &str, from: &Type, to: &Type) -> PgWireResult<()> {
+        let element = |t: &Type| match t.kind() {
+            postgres_types::Kind::Array(e) => Some(e.clone()),
+            _ => None,
+        };
+        let (f, t) = match (element(from), element(to)) {
+            (Some(a), Some(b)) => (a, b),
+            _ => (from.clone(), to.clone()),
+        };
+        if f == t || casts::implicit_cast(i64::from(f.oid()), i64::from(t.oid())) {
+            return Ok(());
+        }
+        Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            "42846".into(), // cannot_coerce
+            format!(
+                "{kind} could not convert type {} to {}",
+                secantus_pgplan::display_type(from.name()),
+                secantus_pgplan::display_type(to.name()),
+            ),
+        ))))
     }
 
     /// The row description of a set operation, which PostgreSQL takes from the
@@ -30586,6 +31143,9 @@ impl PgHandler {
         // The columns whose untyped literal side is read as the other side's
         // type: (column, the side holding the literal is the left, type name).
         let mut retype: Vec<(usize, bool, String)> = Vec::new();
+        // The columns whose typed side is converted to the unified type:
+        // (column, the left side, from type, to type).
+        let mut convert: Vec<(usize, bool, Type, Type)> = Vec::new();
         for (i, (l, r)) in left_schema.iter().zip(&right_schema).enumerate() {
             let ty = if flag(&right_nulls, i) {
                 l.datatype().clone()
@@ -30602,7 +31162,14 @@ impl PgHandler {
                 }
                 r.datatype().clone()
             } else {
-                Self::unify_set_op_type(op, l.datatype(), r.datatype())?
+                let ty = Self::unify_set_op_type(op, l.datatype(), r.datatype())?;
+                for (on_left, side) in [(true, l.datatype()), (false, r.datatype())] {
+                    if *side != ty {
+                        Self::check_set_op_conversion(op, side, &ty)?;
+                        convert.push((i, on_left, side.clone(), ty.clone()));
+                    }
+                }
+                ty
             };
             schema.push(self.field(l.name().to_string(), ty));
         }
@@ -30617,6 +31184,31 @@ impl PgHandler {
                             .map_err(|e| Self::err(&e))?;
                         row[*i] = Some(v);
                     }
+                }
+            }
+        }
+        if !convert.is_empty() {
+            let tz = self.session_timezone();
+            for (i, on_left, from, to) in &convert {
+                let Some(target) = Self::planner_type_name(to) else {
+                    continue;
+                };
+                let rows = if *on_left { &mut left } else { &mut right };
+                for row in rows.iter_mut() {
+                    let Some(Some(v)) = row.get(*i).cloned() else {
+                        continue;
+                    };
+                    // `bpchar` to a string type drops its padding (`rtrim1`).
+                    let v = match (v, from) {
+                        (Bson::String(t), &Type::BPCHAR) => {
+                            Bson::String(t.trim_end_matches(' ').to_string())
+                        }
+                        (v, _) => v,
+                    };
+                    row[*i] = Some(
+                        secantus_pgplan::cast_value_with_tz(v, &target, &tz)
+                            .map_err(|e| Self::err(&e))?,
+                    );
                 }
             }
         }
@@ -31829,6 +32421,7 @@ impl PgHandler {
                             })),
                             cycle: o.get_bool("cycle").ok(),
                             restart: None,
+                            sequence_name: None,
                             owned_by: Some(owned_by.clone()),
                             data_type: Some(
                                 match c.pg_type.as_str() {
@@ -33609,6 +34202,36 @@ impl PgHandler {
                 missing_ok,
                 actions,
             } => {
+                // ALTER TABLE on a sequence takes OWNER TO; any other action
+                // is refused (`ATSimplePermissions`), never written as a
+                // table's catalog row.
+                if !self.has_table_catalog(&table) && self.sequence_doc(&table)?.is_some() {
+                    for action in &actions {
+                        let secantus_pgplan::AlterTableAction::OwnerTo(role) = action else {
+                            use secantus_pgplan::AlterTableAction as A;
+                            let label = match action {
+                                A::AddColumn { .. } => "ADD COLUMN",
+                                A::DropColumn { .. } => "DROP COLUMN",
+                                A::SetDefault { .. } => "ALTER COLUMN ... SET DEFAULT",
+                                A::SetNotNull { .. } => "ALTER COLUMN ... SET NOT NULL",
+                                A::AlterType { .. } => "ALTER COLUMN ... SET DATA TYPE",
+                                A::AddCheck(_) | A::AddUnique(_) | A::AddPrimaryKey { .. } => {
+                                    "ADD CONSTRAINT"
+                                }
+                                _ => "ALTER TABLE",
+                            };
+                            return Err(Self::user_error(
+                                "42809",
+                                format!(
+                                    "ALTER action {label} cannot be performed on relation \"{table}\""
+                                ),
+                            ));
+                        };
+                        let owner = self.grantee_name(role)?;
+                        self.set_sequence_owner(&table, &owner)?;
+                    }
+                    return Ok(vec![Response::Execution(Tag::new("ALTER TABLE"))]);
+                }
                 let Some(mut def) = self.lookup(&table) else {
                     if missing_ok {
                         return Ok(vec![Response::Execution(Tag::new("ALTER TABLE"))]);
@@ -33697,8 +34320,11 @@ impl PgHandler {
                     .rename_collection(self.db(), &table, self.db(), &to, false)
                     .map_err(|e| Self::storage_err("could not rename the table", e))?;
                 // The catalog row is KEYED by the table name, so the rename is
-                // a delete plus an insert rather than an update in place.
+                // a delete plus an insert rather than an update in place. Its
+                // row type -- which `pg_class` and regclass read the relation's
+                // name and oid from -- follows, as `RenameRelation` renames it.
                 self.delete_catalog(&table)?;
+                self.rename_row_type(&table, &to)?;
                 def.name = to.clone();
                 self.rewrite_catalog(&to, &def)?;
                 self.note_uncommitted(&table, None);
@@ -34439,16 +35065,28 @@ impl PgHandler {
                             };
                             let types: Vec<Type> =
                                 schema.iter().map(|fi| fi.datatype().clone()).collect();
+                            // The text formats render a cell as a SELECT of the
+                            // table does (a timestamptz in the session's zone,
+                            // offset and all); binary keeps the stored value
+                            // for its codec.
+                            let tz = self.session_timezone();
+                            let textual = ct.format != CopyFormat::Binary;
                             let values = docs
                                 .iter()
                                 .map(|d| {
                                     fields
                                         .iter()
                                         .zip(types.iter())
-                                        .map(|(f, ty)| copy_reassemble(d, f, ty))
-                                        .collect::<Vec<_>>()
+                                        .map(|(f, ty)| {
+                                            if textual {
+                                                resolve_cell(d, f, None, ty, &tz)
+                                            } else {
+                                                Ok(copy_reassemble(d, f, ty))
+                                            }
+                                        })
+                                        .collect::<PgWireResult<Vec<_>>>()
                                 })
-                                .collect();
+                                .collect::<PgWireResult<Vec<_>>>()?;
                             (schema, values)
                         }
                     };
@@ -35044,6 +35682,7 @@ impl PgHandler {
             }
 
             Statement::CreateRole { name, options } => {
+                reserved_role_name(&name, "Role names starting with \"pg_\" are reserved.")?;
                 // Every connection is trusted, so the session's own user is a
                 // role that exists whether or not a record says so.
                 if self.role(&name)?.is_some() || name == self.session_user_name() {
@@ -35069,6 +35708,7 @@ impl PgHandler {
                 Ok(vec![Response::Execution(Tag::new("CREATE ROLE"))])
             }
             Statement::AlterRole { name, options } => {
+                reserved_role_name(&name, "Cannot alter reserved roles.")?;
                 let (mut info, new) = match self.role(&name)? {
                     Some(info) => (info, false),
                     // The session's user connected without a record (trust
@@ -35097,7 +35737,7 @@ impl PgHandler {
                 let me = self.session_user_name();
                 let mut to_drop = Vec::new();
                 for name in &names {
-                    if name == "postgres" {
+                    if name == "postgres" || is_predefined_role(name) {
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".into(),
                             "2BP01".into(), // dependent_objects_still_exist
@@ -35805,6 +36445,68 @@ impl PgHandler {
                 name,
                 value,
             } => self.alter_database_set(&database, name, value),
+            Statement::RenameMatView {
+                matview,
+                to,
+                missing_ok,
+            } => {
+                let Some((_, definition, populated)) =
+                    self.matviews()?.into_iter().find(|(n, _, _)| *n == matview)
+                else {
+                    if missing_ok {
+                        return Ok(vec![Response::Execution(Tag::new(
+                            "ALTER MATERIALIZED VIEW",
+                        ))]);
+                    }
+                    return Err(Self::user_error(
+                        "42P01",
+                        format!("relation \"{matview}\" does not exist"),
+                    ));
+                };
+                // Its rows' table renames as a table does; the definition
+                // moves to the new name.
+                self.execute(
+                    Statement::RenameTable {
+                        table: matview.clone(),
+                        to: to.clone(),
+                        missing_ok: false,
+                    },
+                    max_rows,
+                )?;
+                self.delete_type_doc(Self::MATVIEW_COLLECTION, &matview)?;
+                self.put_matview(&to, &definition, populated)?;
+                Ok(vec![Response::Execution(Tag::new(
+                    "ALTER MATERIALIZED VIEW",
+                ))])
+            }
+            Statement::AlterTypeOwner {
+                name,
+                owner,
+                domain,
+            } => {
+                let is_type = if domain {
+                    secantus_pgplan::domains::user_domain(&name).is_some()
+                } else {
+                    self.type_oid_by_name(&name).is_some_and(|o| o >= 16384)
+                };
+                if !is_type {
+                    return Err(Self::user_error(
+                        "42704",
+                        format!("type \"{name}\" does not exist"),
+                    ));
+                }
+                let owner = self.grantee_name(&owner)?;
+                self.put_comment_doc(
+                    Self::TYPE_OWNER_COLLECTION,
+                    &name,
+                    Some(bson::doc! {"_id": &name, "owner": &owner}),
+                )?;
+                Ok(vec![Response::Execution(Tag::new(if domain {
+                    "ALTER DOMAIN"
+                } else {
+                    "ALTER TYPE"
+                }))])
+            }
 
             Statement::Reset(name) => {
                 let db_defaults = self.db_setting_defaults();

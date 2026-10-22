@@ -14,9 +14,14 @@ impl PgHandler {
 
     /// The stored defaults of the session's database, by GUC name.
     pub(crate) fn db_setting_defaults(&self) -> Vec<(String, String)> {
+        self.db_setting_defaults_of(self.db())
+    }
+
+    /// Database `db`'s `ALTER DATABASE ... SET` defaults, sorted by name.
+    pub(crate) fn db_setting_defaults_of(&self, db: &str) -> Vec<(String, String)> {
         let Ok(docs) =
             self.storage
-                .find_matching(self.db(), Self::DB_SETTINGS_COLLECTION, &Document::new())
+                .find_matching(db, Self::DB_SETTINGS_COLLECTION, &Document::new())
         else {
             return Vec::new();
         };

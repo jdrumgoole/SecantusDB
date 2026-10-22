@@ -482,6 +482,27 @@ impl PgHandler {
     }
 
     /// `pg_largeobject_metadata`: one row per large object.
+    /// Every large object in this database, by oid, with its bytes.
+    pub(crate) fn large_objects(&self) -> Vec<(i64, Vec<u8>)> {
+        let mut oids: Vec<i64> = self
+            .lo_find(LO_COLLECTION, Document::new())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|d| match d.get("_id") {
+                Some(Bson::Int32(n)) => Some(i64::from(*n)),
+                Some(Bson::Int64(n)) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        oids.sort_unstable();
+        oids.into_iter()
+            .map(|oid| {
+                let size = self.lo_size(oid).ok().flatten().unwrap_or(0);
+                (oid, self.lo_read(oid, 0, size).unwrap_or_default())
+            })
+            .collect()
+    }
+
     pub(crate) fn lo_metadata_rows(&self, def: &TableDef) -> Vec<Document> {
         let f = |name: &str| def.field_of(name).expect("column");
         self.lo_find(LO_COLLECTION, Document::new())
