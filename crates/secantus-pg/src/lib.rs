@@ -32,14 +32,18 @@
 
 mod advisory;
 mod aggregates;
+mod binary_recv;
 mod casts;
 mod catalog_fill;
 mod catalog_meta;
 mod catalog_objects;
 mod catalog_order;
 mod collations;
+mod copy_text;
 mod crl;
+mod database_ddl;
 mod db_settings;
+mod default_acl;
 mod distinct_set;
 mod do_block;
 mod embedded;
@@ -1536,6 +1540,16 @@ fn transaction_statement_tag(sql: &str) -> Option<&'static str> {
     })
 }
 
+/// Whether `sql` ends a transaction block (`IsTransactionExitStmt`): COMMIT,
+/// ROLLBACK, ROLLBACK TO and PREPARE TRANSACTION, the statements an aborted
+/// block still takes through Parse and Bind.
+fn exits_transaction(sql: &str) -> bool {
+    matches!(
+        transaction_statement_tag(sql),
+        Some("COMMIT" | "ROLLBACK" | "PREPARE TRANSACTION")
+    )
+}
+
 /// The interpreter's error as a wire error.
 fn wire_pl_error(e: plpgsql_fn::PlError) -> PgWireError {
     let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate, e.message);
@@ -2181,6 +2195,32 @@ pub struct DatabaseInfo {
     pub name: String,
     pub is_template: bool,
     pub allow_conn: bool,
+    /// `datdba`'s role name; empty for the bootstrap superuser.
+    pub owner: String,
+    /// `pg_encoding_to_char(encoding)`: `UTF8` unless CREATE DATABASE said.
+    pub encoding: String,
+    pub collate: String,
+    pub ctype: String,
+    /// `datconnlimit`, -1 for none.
+    pub connlimit: i32,
+}
+
+impl DatabaseInfo {
+    /// A database as `initdb` leaves one: UTF8, `C.UTF-8`, no limit, owned
+    /// by the bootstrap superuser.
+    fn defaults() -> Self {
+        DatabaseInfo {
+            oid: 0,
+            name: String::new(),
+            is_template: false,
+            allow_conn: true,
+            owner: String::new(),
+            encoding: "UTF8".into(),
+            collate: "C.UTF-8".into(),
+            ctype: "C.UTF-8".into(),
+            connlimit: -1,
+        }
+    }
 }
 
 /// The databases this server has, which is what a startup packet's `database`
@@ -2224,6 +2264,7 @@ impl DatabaseRegistry {
             name: name.to_string(),
             is_template,
             allow_conn,
+            ..DatabaseInfo::defaults()
         };
         [
             info(1, "template1", true, true),
@@ -2246,11 +2287,20 @@ impl DatabaseRegistry {
             .iter()
             .filter_map(|bytes| decode_doc(bytes).ok())
             .filter_map(|d| {
+                let text = |k: &str, default: &str| {
+                    d.get_str(k)
+                        .map_or_else(|_| default.to_string(), str::to_string)
+                };
                 Some(DatabaseInfo {
                     oid: d.get("oid").and_then(bson_i64)?,
                     name: d.get_str("_id").ok()?.to_string(),
-                    is_template: false,
-                    allow_conn: true,
+                    is_template: d.get_bool("is_template").unwrap_or(false),
+                    allow_conn: d.get_bool("allow_connections").unwrap_or(true),
+                    owner: text("owner", ""),
+                    encoding: text("encoding", "UTF8"),
+                    collate: text("collate", "C.UTF-8"),
+                    ctype: text("ctype", "C.UTF-8"),
+                    connlimit: d.get_i32("connection_limit").unwrap_or(-1),
                 })
             })
             .collect();
@@ -2275,13 +2325,18 @@ impl DatabaseRegistry {
             out.push(DatabaseInfo {
                 oid: next_oid,
                 name,
-                is_template: false,
-                allow_conn: true,
+                ..DatabaseInfo::defaults()
             });
         }
         for info in self.persisted(storage)? {
-            if !out.iter().any(|d| d.name == info.name) {
-                out.push(info);
+            match out.iter_mut().find(|d| d.name == info.name) {
+                // An ALTER DATABASE of a built-in or configured database is
+                // recorded too: its fields, under its own oid.
+                Some(d) => {
+                    let oid = d.oid;
+                    *d = DatabaseInfo { oid, ..info };
+                }
+                None => out.push(info),
             }
         }
         Ok(out)
@@ -2292,7 +2347,7 @@ impl DatabaseRegistry {
     }
 
     /// Records a `CREATE DATABASE`. The caller has checked the name is new.
-    fn create(&self, storage: &Storage, name: &str) -> PgWireResult<()> {
+    fn create(&self, storage: &Storage, name: &str, fields: Document) -> PgWireResult<()> {
         let exists = storage
             .collection_exists(Self::NAMESPACE, Self::COLLECTION)
             .map_err(|e| PgHandler::storage_err("could not record the database", e))?;
@@ -2311,7 +2366,58 @@ impl DatabaseRegistry {
             .unwrap_or(Self::FIRST_USER_OID)
             .max(Self::FIRST_USER_OID)
             + 1;
-        let doc = bson::doc! {"_id": name, "oid": oid};
+        let mut doc = bson::doc! {"_id": name, "oid": oid};
+        doc.extend(fields);
+        let bytes = encode_doc(&doc)
+            .map_err(|e| PgHandler::storage_err("could not encode the database", e))?;
+        storage
+            .insert(Self::NAMESPACE, Self::COLLECTION, vec![bytes], true)
+            .map_err(|e| PgHandler::storage_err("could not record the database", e))?;
+        Ok(())
+    }
+
+    /// ALTER DATABASE: rewrite a database's record with `fields` changed (a
+    /// built-in or configured one gets a record of its own), or renamed.
+    fn update(
+        &self,
+        storage: &Storage,
+        name: &str,
+        fields: Document,
+        rename: Option<&str>,
+    ) -> PgWireResult<()> {
+        let info = self.lookup(storage, name)?.ok_or_else(|| {
+            PgHandler::user_error("3D000", format!("database \"{name}\" does not exist"))
+        })?;
+        if !storage
+            .collection_exists(Self::NAMESPACE, Self::COLLECTION)
+            .map_err(|e| PgHandler::storage_err("could not record the database", e))?
+        {
+            storage
+                .create_collection(Self::NAMESPACE, Self::COLLECTION)
+                .map_err(|e| PgHandler::storage_err("could not record the database", e))?;
+        }
+        let mut doc = bson::doc! {
+            "_id": rename.unwrap_or(name),
+            "oid": info.oid,
+            "is_template": info.is_template,
+            "allow_connections": info.allow_conn,
+            "owner": info.owner.clone(),
+            "encoding": info.encoding.clone(),
+            "collate": info.collate.clone(),
+            "ctype": info.ctype.clone(),
+            "connection_limit": info.connlimit,
+        };
+        doc.extend(fields);
+        storage
+            .delete_matching(
+                Self::NAMESPACE,
+                Self::COLLECTION,
+                &bson::doc! {"_id": name},
+                0,
+                &Document::new(),
+                None,
+            )
+            .map_err(|e| PgHandler::storage_err("could not record the database", e))?;
         let bytes = encode_doc(&doc)
             .map_err(|e| PgHandler::storage_err("could not encode the database", e))?;
         storage
@@ -3810,6 +3916,11 @@ struct CopyInState {
     format: secantus_pgplan::CopyFormat,
     /// `HEADER`: the first line is column names, skipped.
     header: bool,
+    /// DELIMITER, NULL, QUOTE, ESCAPE and ENCODING (RP-073).
+    options: secantus_pgplan::copy_opts::CopyOptions,
+    /// FORCE_NOT_NULL / FORCE_NULL, per target column.
+    force_not_null: Vec<bool>,
+    force_null: Vec<bool>,
     table: String,
     /// Stored field per target column, in the order the data supplies them.
     fields: Vec<String>,
@@ -4334,6 +4445,23 @@ impl PgHandler {
             let datestyle = self.session_datestyle();
             let order = datestyle.order;
             secantus_pgplan::set_session_datestyle(datestyle);
+            // How intervals, bytea and floats are written (RP-068).
+            {
+                let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+                let get = |name: &str| settings.get(name).map(|v| v.to_string());
+                secantus_pgplan::output_style::set_output_style(
+                    secantus_pgplan::output_style::OutputStyle {
+                        interval: secantus_pgplan::output_style::IntervalStyle::parse(
+                            &get("IntervalStyle").unwrap_or_default(),
+                        ),
+                        bytea_escape: get("bytea_output")
+                            .is_some_and(|v| v.trim().eq_ignore_ascii_case("escape")),
+                        extra_float_digits: get("extra_float_digits")
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(1),
+                    },
+                );
+            }
             // The zone too: a row expression runs AFTER planning, and a
             // stored timestamptz cast to `timestamp` is the session zone's
             // wall clock.
@@ -4488,6 +4616,12 @@ impl PgHandler {
         );
         let mut views = self.views().unwrap_or_default();
         views.extend(partitions);
+        secantus_pgplan::set_view_oids(
+            views
+                .iter()
+                .filter_map(|(n, _)| Some((n.clone(), self.relation_oid(n)?)))
+                .collect(),
+        );
         secantus_pgplan::set_views(views);
         secantus_pgplan::view_dml::set_checked_views(checked);
         secantus_pgplan::view_dml::set_view_defaults(self.view_column_defaults());
@@ -5131,6 +5265,192 @@ impl PgHandler {
                     })
             })
             .collect()
+    }
+
+    /// What PostgreSQL's Bind settles before it answers BindComplete
+    /// (RP-078): a prepared statement whose result columns have changed since
+    /// it was planned is 0A000, the result format codes must name one or every
+    /// column, and every parameter is decoded -- so a malformed value is the
+    /// Bind's error, with or without an Execute behind it.
+    fn check_bound_portal(
+        &self,
+        portal: &Portal<ParsedStatement>,
+        result_formats: usize,
+    ) -> PgWireResult<()> {
+        self.install_user_types();
+        self.check_cached_result_type(portal.statement.as_ref())?;
+        let declared = self.param_type_names(portal.statement.as_ref());
+        if result_formats > 1 {
+            if let Ok(fields) =
+                self.describe_fields(&portal.statement.statement.sql, declared.len(), &declared)
+            {
+                let columns = fields.map_or(0, |f| f.len());
+                if columns != result_formats {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "08P01".into(), // protocol_violation
+                        format!(
+                            "bind message has {result_formats} result formats but query has {columns} columns"
+                        ),
+                    ))));
+                }
+            }
+        }
+        let mut param_types =
+            secantus_pgplan::infer_param_types(&portal.statement.statement.sql, &declared);
+        self.type_untyped_binary_params(portal, &mut param_types);
+        // A binary value is held to its type's receive function first: the
+        // decoder below reads more forgivingly than PostgreSQL does.
+        let utf8 = matches!(self.client_encoding(), encoding::ClientEncoding::Utf8);
+        for (i, raw) in portal.parameters.iter().enumerate() {
+            let binary = match &portal.parameter_format {
+                Format::UnifiedText => false,
+                Format::UnifiedBinary => true,
+                Format::Individual(codes) => codes.get(i).copied().unwrap_or(0) == 1,
+            };
+            let Some(bytes) = raw.as_ref().filter(|_| binary) else {
+                continue;
+            };
+            let ty = portal
+                .statement
+                .parameter_types
+                .get(i)
+                .cloned()
+                .flatten()
+                .or_else(|| {
+                    let name = param_types.get(i).and_then(|n| n.as_deref())?;
+                    Some(self.user_wire_type(name).unwrap_or_else(|| wire_type(name)))
+                });
+            if let Some(ty) = ty {
+                binary_recv::check(&ty, bytes, i, utf8)?;
+            }
+        }
+        self.portal_params(portal, &param_types)?;
+        Ok(())
+    }
+
+    /// A table this transaction block created or truncated (for COPY
+    /// FREEZE). Outside a block every statement is a transaction of its own,
+    /// which no later COPY shares.
+    fn note_fresh_in_block(&self, table: &str) {
+        if self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let depth = self
+                .savepoints
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len();
+            self.marks.note_fresh_table(table, depth);
+        }
+    }
+
+    /// COPY FREEZE's precondition (`CopyFrom`): the table was created or
+    /// truncated in this transaction, or PostgreSQL refuses with 55000.
+    fn check_copy_freeze(&self, cf: &secantus_pgplan::CopyFrom) -> PgWireResult<()> {
+        if !cf.options.freeze {
+            return Ok(());
+        }
+        if self
+            .lookup(&cf.table)
+            .is_some_and(|d| partition::is_partitioned(&d))
+        {
+            return Err(Self::user_error(
+                "0A000",
+                "cannot perform COPY FREEZE on a partitioned table".into(),
+            ));
+        }
+        let fresh = self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self.marks.is_fresh_table(
+                &cf.table,
+                self.savepoints
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .len(),
+            );
+        if !fresh {
+            return Err(Self::user_error(
+                "55000",
+                "cannot perform COPY FREEZE because the table was not created or truncated in the current subtransaction".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Parse analysis for an extended-protocol Parse: the raw parse of every
+    /// statement, and for the statements PostgreSQL analyses there (SELECT,
+    /// INSERT, UPDATE, DELETE, MERGE and VALUES; utility statements wait for
+    /// Execute), the describe pass that resolves its names and types.
+    fn analyse_at_parse(&self, stmt: &StoredStatement<ParsedStatement>) -> PgWireResult<()> {
+        use pg_query::protobuf::node::Node as N;
+        let sql = &stmt.statement.sql;
+        if is_empty_query(sql.trim().trim_end_matches(';').trim()) {
+            return Ok(());
+        }
+        let analysed = match pg_query::parse(sql) {
+            Ok(parsed) => {
+                parsed.protobuf.stmts.len() == 1
+                    && matches!(
+                        parsed.protobuf.stmts[0]
+                            .stmt
+                            .as_ref()
+                            .and_then(|s| s.node.as_ref()),
+                        Some(
+                            N::SelectStmt(_)
+                                | N::InsertStmt(_)
+                                | N::UpdateStmt(_)
+                                | N::DeleteStmt(_)
+                                | N::MergeStmt(_)
+                        )
+                    )
+            }
+            // The describe pass reports a syntax error as Describe would.
+            Err(_) => true,
+        };
+        if !analysed {
+            return Ok(());
+        }
+        self.install_user_types();
+        // Each undeclared parameter takes the type its first typed use gives
+        // it, as `parse_analyze_varparams` fixes it: `$1::int` makes `$1` an
+        // integer for every other use, so `lower($1)` beside it is 42883.
+        let declared = self.param_type_names(stmt);
+        let column_type = |table: &str, column: secantus_pgplan::ColumnRef<'_>| {
+            self.lookup(table).and_then(|def| {
+                let col = match column {
+                    secantus_pgplan::ColumnRef::Name(name) => def.column(name),
+                    secantus_pgplan::ColumnRef::Position(pos) => def.columns.get(pos),
+                };
+                col.map(|c| c.pg_type.clone())
+            })
+        };
+        let inferred = secantus_pgplan::catalog_param_types_opt(sql, &declared, &column_type);
+        let param_types: Vec<Option<String>> = declared
+            .iter()
+            .enumerate()
+            .map(|(i, d)| d.clone().or_else(|| inferred.get(i).cloned().flatten()))
+            .collect();
+        match self.describe_fields(sql, param_types.len(), &param_types) {
+            Ok(_) => Ok(()),
+            // Only what analysis itself raises: the names and types (class
+            // 42) and a literal that does not read as its type (22P02).
+            // Whatever folding constants raises (`1/0`) is the plan's, at
+            // Bind or Execute, and so is a refusal (0A000) of this server's.
+            Err(PgWireError::UserError(info))
+                if info.code.starts_with("42") || info.code == "22P02" =>
+            {
+                let e = PgWireError::UserError(info);
+                let map = self.string_map(sql);
+                Err(Self::restore_position(
+                    Self::syntax_positioned(e, sql),
+                    map.as_ref(),
+                ))
+            }
+            Err(_) => Ok(()),
+        }
     }
 
     /// The `pg_prepared_statements` row for a freshly parsed NAMED statement.
@@ -11339,21 +11659,39 @@ impl PgHandler {
             .iter()
             .map(|c| def.field_of(c).unwrap_or_else(|| c.clone()))
             .collect();
-        let mut seen: Vec<Vec<Bson>> = Vec::new();
-        for d in self.table_docs(table)? {
-            let key: Vec<Bson> = fields
-                .iter()
-                .map(|f| d.get(f).cloned().unwrap_or(Bson::Null))
-                .collect();
-            if !nulls_not_distinct && key.contains(&Bson::Null) {
-                continue;
-            }
-            if seen.iter().any(|k| {
-                k.iter().zip(&key).all(|(a, b)| {
-                    secantus_pgplan::compare_values(a, b) == Some(std::cmp::Ordering::Equal)
-                        || (*a == Bson::Null && *b == Bson::Null)
-                })
-            }) {
+        // As the btree build finds a duplicate: the keys sorted, each
+        // compared with the next -- linear after the sort, where comparing
+        // each key with every earlier one took minutes over 100,000 rows
+        // (`pgbench -i`'s primary key) -- and the smallest duplicated key
+        // the one reported.
+        let cmp_field = |a: &Bson, b: &Bson| match (a, b) {
+            (Bson::Null, Bson::Null) => std::cmp::Ordering::Equal,
+            (Bson::Null, _) => std::cmp::Ordering::Greater,
+            (_, Bson::Null) => std::cmp::Ordering::Less,
+            _ => secantus_pgplan::compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal),
+        };
+        let cmp_key = |a: &Vec<Bson>, b: &Vec<Bson>| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| cmp_field(x, y))
+                .find(|o| o.is_ne())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        };
+        let mut keys: Vec<Vec<Bson>> = self
+            .table_docs(table)?
+            .iter()
+            .map(|d| {
+                fields
+                    .iter()
+                    .map(|f| d.get(f).cloned().unwrap_or(Bson::Null))
+                    .collect::<Vec<Bson>>()
+            })
+            .filter(|key| nulls_not_distinct || !key.contains(&Bson::Null))
+            .collect();
+        keys.sort_by(cmp_key);
+        for pair in keys.windows(2) {
+            let key = &pair[1];
+            if cmp_key(&pair[0], key).is_eq() {
                 let shown: Vec<String> = key
                     .iter()
                     .map(|v| {
@@ -11376,7 +11714,6 @@ impl PgHandler {
                 ));
                 return Err(PgWireError::UserError(Box::new(info)));
             }
-            seen.push(key);
         }
         Ok(())
     }
@@ -14907,6 +15244,74 @@ impl PgHandler {
 
     /// `REFRESH MATERIALIZED VIEW`: the stored query run again, replacing
     /// the rows (or, `WITH NO DATA`, leaving none).
+    /// `REFRESH ... CONCURRENTLY`'s refusals (`ExecRefreshMatView`, in its
+    /// order): not with WITH NO DATA, not of a view never populated, and only
+    /// over a unique index on plain columns with no WHERE (RP-074). The
+    /// refresh itself is the ordinary one: a single session sees no
+    /// difference between the two.
+    fn check_concurrent_refresh(&self, name: &str, with_data: bool) -> PgWireResult<()> {
+        if !with_data {
+            return Err(Self::user_error(
+                "42601",
+                "CONCURRENTLY and WITH NO DATA options cannot be used together".into(),
+            ));
+        }
+        let Some((_, _, populated)) = self.matviews()?.into_iter().find(|(n, _, _)| n == name)
+        else {
+            // Not a materialized view: `refresh_matview` says so.
+            return Ok(());
+        };
+        if !populated {
+            return Err(Self::user_error(
+                "0A000",
+                "CONCURRENTLY cannot be used when the materialized view is not populated".into(),
+            ));
+        }
+        let def = self.lookup(name);
+        let fields: Vec<String> = def
+            .as_ref()
+            .map(|d| d.columns.iter().map(|c| c.field()).collect())
+            .unwrap_or_default();
+        let keyed = self
+            .storage
+            .list_indexes(self.db(), name)
+            .unwrap_or_default()
+            .iter()
+            .any(|ix| {
+                let options = ix.get_document("options").ok();
+                let unique = options
+                    .and_then(|o| o.get_bool("unique").ok())
+                    .or_else(|| ix.get_bool("unique").ok())
+                    .unwrap_or(false);
+                // A user's WHERE is `sqlPredicate`; a unique index's own
+                // `partialFilterExpression` is how NULLs stay distinct.
+                let partial = options.is_some_and(|o| o.contains_key("sqlPredicate"))
+                    || ix.contains_key("sqlPredicate");
+                ix.get_str("name").is_ok_and(|n| n != "_id_")
+                    && unique
+                    && !partial
+                    && ix
+                        .get_document("key")
+                        .is_ok_and(|k| k.keys().all(|f| fields.iter().any(|c| c == f)))
+            });
+        if !keyed {
+            let mut info = ErrorInfo::new(
+                "ERROR".into(),
+                "55000".into(), // object_not_in_prerequisite_state
+                {
+                    let (schema, bare) = secantus_pgplan::schemas::split_key(name);
+                    format!("cannot refresh materialized view \"{schema}.{bare}\" concurrently")
+                },
+            );
+            info.hint = Some(
+                "Create a unique index with no WHERE clause on one or more columns of the materialized view."
+                    .into(),
+            );
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+        Ok(())
+    }
+
     fn refresh_matview(&self, name: &str, with_data: bool) -> PgWireResult<()> {
         let Some((_, definition, _)) = self.matviews()?.into_iter().find(|(n, _, _)| n == name)
         else {
@@ -16078,11 +16483,11 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("datfrozenxid", "xid", false),
                     secantus_pgcatalog::Column::new("datminmxid", "xid", false),
                     secantus_pgcatalog::Column::new("dattablespace", "oid", false),
-                    secantus_pgcatalog::Column::new("datcollate", "name", false),
-                    secantus_pgcatalog::Column::new("datctype", "name", false),
+                    secantus_pgcatalog::Column::new("datcollate", "text", false),
+                    secantus_pgcatalog::Column::new("datctype", "text", false),
                     secantus_pgcatalog::Column::new("daticulocale", "text", false),
                     secantus_pgcatalog::Column::new("datcollversion", "text", false),
-                    secantus_pgcatalog::Column::new("datacl", "text", false),
+                    secantus_pgcatalog::Column::new("datacl", "aclitem[]", false),
                 ],
             )),
             "pg_locks" => Some(TableDef::new(
@@ -16293,6 +16698,7 @@ impl PgHandler {
             "pg_cast" => Some(casts::pg_cast_def()),
             "pg_rewrite" => Some(rules::pg_rewrite_def()),
             "pg_event_trigger" => Some(event_triggers::pg_event_trigger_def()),
+            "pg_default_acl" => Some(default_acl::pg_default_acl_def()),
             "pg_event_trigger_dropped_objects" => Some(event_triggers::dropped_objects_def()),
             "pg_event_trigger_ddl_commands" => Some(event_triggers::ddl_commands_def()),
             "pg_rules" => Some(rules::pg_rules_def()),
@@ -16326,6 +16732,7 @@ impl PgHandler {
             "pg_rewrite" => self.pg_rewrite_rows(&def),
             other if fdw::fdw_catalog_def(other).is_some() => self.fdw_catalog_rows(other, &def)?,
             "pg_event_trigger" => self.pg_event_trigger_rows(&def),
+            "pg_default_acl" => self.pg_default_acl_rows(&def),
             "pg_event_trigger_dropped_objects" => self.dropped_objects_rows(&def),
             "pg_event_trigger_ddl_commands" => self.ddl_commands_rows(&def),
             "pg_rules" => self.pg_rules_rows(&def),
@@ -18520,20 +18927,33 @@ impl PgHandler {
                         let mut d = Document::new();
                         d.insert(field("oid"), Bson::Int64(info.oid));
                         d.insert(field("datname"), info.name);
-                        d.insert(field("datdba"), Bson::Int64(10));
-                        d.insert(field("encoding"), Bson::Int32(6));
+                        let owner = if info.owner.is_empty() {
+                            10
+                        } else {
+                            self.role(&info.owner).ok().flatten().map_or(10, |r| r.oid)
+                        };
+                        d.insert(field("datdba"), Bson::Int64(owner));
+                        d.insert(
+                            field("encoding"),
+                            secantus_pgplan::scalar::call(
+                                "pg_char_to_encoding",
+                                &[Bson::String(info.encoding.clone())],
+                            )
+                            .and_then(Result::ok)
+                            .unwrap_or(Bson::Int32(6)),
+                        );
                         d.insert(field("datlocprovider"), "c");
                         d.insert(field("datistemplate"), info.is_template);
                         d.insert(field("datallowconn"), info.allow_conn);
-                        d.insert(field("datconnlimit"), Bson::Int32(-1));
+                        d.insert(field("datconnlimit"), Bson::Int32(info.connlimit));
                         d.insert(
                             field("datfrozenxid"),
                             Bson::Int64(i64::from(crate::xids::frozen_xid())),
                         );
                         d.insert(field("datminmxid"), Bson::Int64(1));
                         d.insert(field("dattablespace"), Bson::Int64(1663));
-                        d.insert(field("datcollate"), "C.UTF-8");
-                        d.insert(field("datctype"), "C.UTF-8");
+                        d.insert(field("datcollate"), info.collate.as_str());
+                        d.insert(field("datctype"), info.ctype.as_str());
                         d.insert(field("daticulocale"), Bson::Null);
                         d.insert(field("datcollversion"), Bson::Null);
                         d.insert(field("datacl"), Bson::Null);
@@ -20576,6 +20996,8 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             1033 => "aclitem",
             603 => "box",
             24 => "regproc",
+            2205 => "regclass",
+            2206 => "regtype",
             2202 => "regprocedure",
             2203 => "regoper",
             2204 => "regoperator",
@@ -20681,8 +21103,29 @@ fn type_size(ty: &Type) -> i16 {
     match *ty {
         Type::BOOL | Type::CHAR => 1,
         Type::INT2 => 2,
-        Type::INT4 | Type::FLOAT4 | Type::DATE | Type::OID | Type::REGTYPE | Type::REGCLASS => 4,
+        Type::INT4
+        | Type::FLOAT4
+        | Type::DATE
+        | Type::OID
+        | Type::XID
+        | Type::CID
+        | Type::VOID
+        | Type::REGTYPE
+        | Type::REGCLASS
+        | Type::REGPROC
+        | Type::REGPROCEDURE
+        | Type::REGOPER
+        | Type::REGOPERATOR
+        | Type::REGNAMESPACE
+        | Type::REGROLE
+        | Type::REGCONFIG
+        | Type::REGDICTIONARY
+        | Type::REGCOLLATION => 4,
+        // An enum is its 4-byte label oid (RP-082).
+        _ if matches!(ty.kind(), postgres_types::Kind::Enum(_)) => 4,
         Type::INT8
+        | Type::MONEY
+        | Type::XID8
         | Type::FLOAT8
         | Type::TIME
         | Type::TIMESTAMP
@@ -21627,6 +22070,34 @@ impl PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // A role's CONNECTION LIMIT: its live backends other than this one
+        // (`InitializeSessionUserId`, FATAL 53300 after AuthenticationOk); a
+        // superuser has none (RP-067).
+        let user = client.metadata().get("user").cloned().unwrap_or_default();
+        if let Some(role) = self.role(&user)? {
+            if role.connlimit >= 0 && !role.superuser {
+                let live = backend_registry()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .filter(|b| {
+                        b.activity.lock().unwrap_or_else(|e| e.into_inner()).usename == user
+                    })
+                    .count();
+                if live >= role.connlimit as usize {
+                    client
+                        .send(PgWireBackendMessage::Authentication(
+                            pgwire::messages::startup::Authentication::Ok,
+                        ))
+                        .await?;
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "FATAL".into(),
+                        "53300".into(), // too_many_connections
+                        format!("too many connections for role \"{user}\""),
+                    ))));
+                }
+            }
+        }
         let (pid, secret_key) = PID_GENERATOR.generate(client);
         client.set_pid_and_secret_key(pid, secret_key);
         // The startup ParameterStatus values are the SESSION's settings, so
@@ -21678,6 +22149,17 @@ impl PgHandler {
                 "55000", // object_not_in_prerequisite_state
                 format!("database \"{name}\" is not currently accepting connections"),
             ));
+        }
+        // `datconnlimit` (`CheckMyDatabase`): a superuser has none (RP-064).
+        if info.connlimit >= 0 {
+            let user = self.session_user_name();
+            if !self.is_superuser(&user) && self.sessions_on(&info.name) >= info.connlimit as usize
+            {
+                return Err(fatal(
+                    "53300", // too_many_connections
+                    format!("too many connections for database \"{name}\""),
+                ));
+            }
         }
         let _ = self.db.set(info.name.clone());
         self.backend
@@ -21923,7 +22405,8 @@ impl SimpleQueryHandler for PgHandler {
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        self.flush_notifications(client).await
+        self.flush_notifications(client).await?;
+        self.report_pending_params(client).await
     }
 
     /// The query text arrives in the client's `client_encoding`, not
@@ -22067,8 +22550,13 @@ impl SimpleQueryHandler for PgHandler {
             Err(e) => out.and(Err(e)),
         };
         self.flush_notices(_c).await?;
-        // Report any GUC change (TimeZone, ...) so the client tracks it.
-        self.report_pending_params(_c).await?;
+        // A GUC change (TimeZone, ...) is reported after the command tags,
+        // just before ReadyForQuery (`before_ready_for_query`), as
+        // `ReportChangedGUCOptions` does (RP-081). A failed query does not
+        // reach that hook, so its changes go out here, ahead of its error.
+        if out.is_err() {
+            self.report_pending_params(_c).await?;
+        }
         self.settle_failed_commit(_c);
         // A FATAL error (`pg_terminate_backend` on this backend) ends the
         // connection. pgwire's own error path would send a `ReadyForQuery`
@@ -24766,7 +25254,17 @@ impl PgHandler {
             "standard_conforming_strings" => (true, value.to_string()),
             //  - application_name: PostgreSQL reports it (GUC_REPORT), and
             //    pgjdbc reads its connection's name back from the report.
-            "application_name" => (true, value.to_string()),
+            "application_name" => {
+                // And `pg_stat_activity` shows it (RP-068).
+                self.backend
+                    .activity
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .application_name = value.to_string();
+                (true, value.to_string())
+            }
+            //  - IntervalStyle: an interval renders in it (`output_style`).
+            "IntervalStyle" => (true, value.to_string()),
             _ => (false, String::new()),
         };
         if report {
@@ -25572,6 +26070,20 @@ impl PgHandler {
         // COMMIT and ROLLBACK are: rolling back to a savepoint is how a client
         // RECOVERS from the error that poisoned the block.
         if let Statement::Transaction(control) = &stmt {
+            // A COMMIT does the block's temporary tables' ON COMMIT actions
+            // first, inside the block, as `PreCommit_on_commit_actions` does
+            // (RP-065): a commit that then fails undoes them with the rest.
+            if matches!(control, TransactionControl::Commit { .. })
+                && self
+                    .in_transaction
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !self.txn_failed.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                if let Err(e) = self.run_on_commit_actions() {
+                    self.note_failure();
+                    return Err(e);
+                }
+            }
             // Whether the block touched the catalog, read BEFORE the control
             // statement: one that ends the block ends its marks.
             let catalog_touched = self.marks.catalog_changed()
@@ -26317,7 +26829,60 @@ impl PgHandler {
     /// `\'` in any literal read with backslash escapes when it is `off`, or
     /// `safe_encoding` under a client-only client encoding (scan.l's
     /// `xeescape`, `PG_ENCODING_IS_CLIENT_ONLY`).
+    /// The scanner's NOTICE 42622 for each identifier of NAMEDATALEN (64)
+    /// bytes or more, which it cuts to 63 at a character boundary
+    /// (`truncate_identifier`, RP-074). The scan runs only when the text
+    /// holds a run of 64 bytes that could be one.
+    fn note_truncated_identifiers(&self, sql: &str) {
+        // An unquoted identifier is a run of identifier bytes; a quoted one
+        // may hold anything, so any quote in a long enough text scans.
+        let mut run = 0usize;
+        let long = sql.bytes().any(|b| {
+            run = if b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80 {
+                run + 1
+            } else {
+                0
+            };
+            run >= 64
+        }) || (sql.contains('"') && sql.len() >= 66);
+        if !long {
+            return;
+        }
+        let Ok(scanned) = pg_query::scan(sql) else {
+            return;
+        };
+        for t in &scanned.tokens {
+            if t.token != pg_query::protobuf::Token::Ident as i32 {
+                continue;
+            }
+            let Some(raw) = sql.get(t.start as usize..t.end as usize) else {
+                continue;
+            };
+            let ident = match raw.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+                Some(q) => q.replace("\"\"", "\""),
+                // An unquoted identifier is folded to lower case (ASCII only).
+                None => raw.to_ascii_lowercase(),
+            };
+            if ident.len() < 64 {
+                continue;
+            }
+            let mut cut = 63;
+            while !ident.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            self.notice(
+                "42622",
+                format!(
+                    "identifier \"{ident}\" will be truncated to \"{}\"",
+                    &ident[..cut]
+                ),
+                None,
+            );
+        }
+    }
+
     fn apply_string_syntax(&self, sql: &str) -> PgWireResult<String> {
+        self.note_truncated_identifiers(sql);
         let syntax = {
             let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
             let client_only = settings.get("client_encoding").is_some_and(|e| {
@@ -28253,10 +28818,20 @@ impl PgHandler {
             control,
             TransactionControl::Begin(_) | TransactionControl::Start(_)
         );
+        // A BEGIN inside a block is PostgreSQL's WARNING 25001, and the block
+        // goes on as it was: its savepoints, temp-table marks and all
+        // (`BeginTransactionBlock`, RP-084).
+        let nested = opens
+            && self
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed);
+        if nested {
+            self.warning("25001", "there is already a transaction in progress".into());
+        }
         // What the block did to temporary tables and holdable cursors only
         // matters to a PREPARE of THIS block; a new block starts clean. The
         // reset is on the OPEN, not on every control: a PREPARE reads them.
-        if opens {
+        if opens && !nested {
             self.touched_temp
                 .store(false, std::sync::atomic::Ordering::Relaxed);
             self.holdable_declared
@@ -28268,10 +28843,12 @@ impl PgHandler {
             self.pending.clear();
         }
         // Every savepoint belongs to the block that is starting or ending.
-        self.savepoints
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        if !nested {
+            self.savepoints
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
         let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
         // A COMMIT of a FAILED transaction is a rollback, and PostgreSQL says
         // so in the command tag: `ROLLBACK`, not `COMMIT`. A client that
@@ -30811,6 +31388,51 @@ impl PgHandler {
             Statement::Update(u) => Some(u.table.clone()),
             _ => None,
         };
+        // The object this statement creates, for its role's default
+        // privileges (RP-067): `(kind, object, schema)`.
+        let created: Option<(&str, String, String)> = {
+            let schema_of = |key: &str| secantus_pgplan::schemas::split_key(key).0;
+            let named = |name: &str, schema: &Option<String>| match schema {
+                Some(s) => (format!("{s}.{name}"), s.clone()),
+                None => (name.to_string(), schema_of(name)),
+            };
+            match &stmt {
+                Statement::CreateTable(def, _) => {
+                    Some(("table", def.name.clone(), schema_of(&def.name)))
+                }
+                Statement::CreateTableAs { table, .. } => {
+                    Some(("table", table.clone(), schema_of(table)))
+                }
+                Statement::CreateView(v) => Some(("table", v.name.clone(), schema_of(&v.name))),
+                Statement::CreateSequence { name, .. } => {
+                    Some(("sequence", name.clone(), schema_of(name)))
+                }
+                Statement::CreateSchema { name, .. } => {
+                    Some(("schema", name.clone(), String::new()))
+                }
+                Statement::CreateEnum { name, schema, .. }
+                | Statement::CreateComposite { name, schema, .. }
+                | Statement::CreateRange { name, schema, .. } => {
+                    let (object, s) = named(name, schema);
+                    Some(("type", object, s))
+                }
+                Statement::CreateDomain(d) => Some(("type", d.name.clone(), schema_of(&d.name))),
+                Statement::CreateUserFunction(f) if !f.replace => Some((
+                    "function",
+                    format!(
+                        "{}({})",
+                        f.name,
+                        f.params
+                            .iter()
+                            .map(|(_, t)| t.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                    schema_of(&f.name),
+                )),
+                _ => None,
+            }
+        };
         let temp_created = match &stmt {
             Statement::CreateTable(def, _) if def.temp => Some(def.name.clone()),
             Statement::CreateTableAs {
@@ -30843,6 +31465,11 @@ impl PgHandler {
             bump_catalog_version();
             self.marks.note_catalog_changed();
         }
+        if let (Some((kind, object, schema)), Ok(_)) = (&created, &out) {
+            if let Err(e) = self.apply_default_privileges(kind, object, schema) {
+                out = Err(e);
+            }
+        }
         if let (Some(name), Ok(_)) = (temp_created, &out) {
             secantus_pgplan::schemas::note_relation_key(&name);
             let mut temps = self.temp_tables.lock().unwrap_or_else(|e| e.into_inner());
@@ -30850,6 +31477,79 @@ impl PgHandler {
                 temps.push(name);
             }
         }
+        // Outside a block every statement commits as it ends, and so runs
+        // the ON COMMIT actions then (RP-065).
+        if out.is_ok()
+            && !self
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && !self
+                .implicit_extended
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.run_on_commit_actions()?;
+        }
+        out
+    }
+
+    /// The ON COMMIT actions of this session's temporary tables: every
+    /// `DELETE ROWS` table emptied, then every `DROP` table dropped
+    /// (`PreCommit_on_commit_actions`, in its order).
+    fn run_on_commit_actions(&self) -> PgWireResult<()> {
+        thread_local! {
+            static RUNNING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        if RUNNING.with(std::cell::Cell::get) {
+            return Ok(());
+        }
+        let temps = self
+            .temp_tables
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if temps.is_empty() {
+            return Ok(());
+        }
+        let (mut truncate, mut drop) = (Vec::new(), Vec::new());
+        for t in temps {
+            let Some(def) = self.lookup(&t).filter(|d| d.temp) else {
+                continue;
+            };
+            match def.extra.get_str("on_commit") {
+                Ok("delete") => truncate.push(t),
+                Ok("drop") => drop.push(t),
+                _ => {}
+            }
+        }
+        if truncate.is_empty() && drop.is_empty() {
+            return Ok(());
+        }
+        RUNNING.with(|r| r.set(true));
+        // In the block's own storage transaction, when there is one.
+        let out = self.within_block(|| {
+            if !truncate.is_empty() {
+                self.execute(
+                    Statement::Truncate {
+                        tables: truncate,
+                        restart_identity: false,
+                        cascade: false,
+                    },
+                    0,
+                )?;
+            }
+            if !drop.is_empty() {
+                self.execute(
+                    Statement::DropTable(secantus_pgplan::DropTable {
+                        tables: drop,
+                        if_exists: true,
+                        cascade: true,
+                    }),
+                    0,
+                )?;
+            }
+            Ok(())
+        });
+        RUNNING.with(|r| r.set(false));
         out
     }
 
@@ -30961,6 +31661,7 @@ impl PgHandler {
             }
             Statement::RuleRewrite(p) => self.run_rule_plan(p, max_rows),
             Statement::CreateTable(mut def, if_not_exists) => {
+                self.note_fresh_in_block(&def.name);
                 // An identity column's sequence options: taken out of the
                 // column so they are not stored with the table.
                 let identity_options: HashMap<String, Document> = def
@@ -31526,17 +32227,19 @@ impl PgHandler {
                 )?)])
             }
 
-            Statement::CreateDatabase { name } => {
+            Statement::CreateDatabase { name, options } => {
                 self.refuse_in_transaction_block("CREATE DATABASE")?;
-                if self.databases.lookup(&self.storage, &name)?.is_some() {
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".into(),
-                        "42P04".into(), // duplicate_database
-                        format!("database \"{name}\" already exists"),
-                    ))));
-                }
-                self.databases.create(&self.storage, &name)?;
+                self.create_database(&name, &options)?;
                 Ok(vec![Response::Execution(Tag::new("CREATE DATABASE"))])
+            }
+            Statement::AlterDatabase {
+                name,
+                options,
+                rename,
+                owner,
+            } => {
+                self.alter_database(&name, &options, rename.as_deref(), owner.as_deref())?;
+                Ok(vec![Response::Execution(Tag::new("ALTER DATABASE"))])
             }
 
             Statement::DropDatabase { name, if_exists } => {
@@ -33650,9 +34353,16 @@ impl PgHandler {
                         .collect()
                 };
                 let n = cols.len();
+                let flags = |list: &[String]| -> Vec<bool> {
+                    cols.iter().map(|c| list.contains(&c.name)).collect()
+                };
+                self.check_copy_freeze(&cf)?;
                 *self.copy_in.lock().unwrap_or_else(|e| e.into_inner()) = Some(CopyInState {
                     format: cf.format,
                     header: cf.header,
+                    options: cf.options.clone(),
+                    force_not_null: flags(&cf.options.force_not_null),
+                    force_null: flags(&cf.options.force_null),
                     table: cf.table.clone(),
                     fields: cols.iter().map(|c| c.field()).collect(),
                     types: cols.iter().map(|c| c.pg_type.clone()).collect(),
@@ -33745,6 +34455,24 @@ impl PgHandler {
 
                 let n = schema.len();
                 let format = ct.format;
+                // FORCE_QUOTE, per output column (RP-073); ENCODING writes the
+                // data in that encoding rather than the client's.
+                let opts = ct.options.clone();
+                let force_quote: Vec<bool> = schema
+                    .iter()
+                    .map(|f| match &opts.force_quote {
+                        secantus_pgplan::copy_opts::ForceQuote::None => false,
+                        secantus_pgplan::copy_opts::ForceQuote::All => true,
+                        secantus_pgplan::copy_opts::ForceQuote::Columns(c) => {
+                            c.iter().any(|n| n == f.name())
+                        }
+                    })
+                    .collect();
+                let row_cenc = opts
+                    .encoding
+                    .as_deref()
+                    .map_or(row_cenc, encoding::client_encoding);
+                let header_opts = opts.clone();
                 // The binary format encodes each field through the SAME codec
                 // the SELECT binary path uses (`encode_binary`), so the two can
                 // never drift: a `DataRowEncoder` over a binary-format schema
@@ -33819,7 +34547,8 @@ impl PgHandler {
                             Ok(CopyData::new(buf.freeze()))
                         }
                         _ => {
-                            let line = copy_text_row(&row, format, &bin_schema);
+                            let line =
+                                copy_text_row(&row, format, &bin_schema, &opts, &force_quote);
                             // COPY text is line-structured with ASCII delimiters
                             // and escapes, so the whole line transcodes as one
                             // blob to the client encoding (only the field
@@ -33862,14 +34591,20 @@ impl PgHandler {
                             })
                             .collect(),
                     );
-                    Ok(CopyData::new(copy_text_row(
-                        &names,
-                        ct.format,
-                        &text_schema,
-                    )))
+                    let line = copy_text_row(&names, ct.format, &text_schema, &header_opts, &[]);
+                    if row_cenc.transcodes() {
+                        let bytes = encoding::encode(row_cenc, &line)
+                            .map_err(|ch| untranslatable_char(ch, row_cenc))?;
+                        Ok(CopyData::new(Bytes::from(bytes)))
+                    } else {
+                        Ok(CopyData::new(line))
+                    }
                 });
+                let headers = usize::from(header_line.is_some());
                 let data = futures::stream::iter(header_line).chain(data);
-                Ok(vec![Response::CopyOut(CopyResponse::new(code, n, data))])
+                Ok(vec![Response::CopyOut(
+                    CopyResponse::new(code, n, data).with_header_messages(headers),
+                )])
             }
 
             Statement::CreateExtension {
@@ -33879,7 +34614,8 @@ impl PgHandler {
                 // Only the extensions this server carries an implementation
                 // of can be installed; the rest are PostgreSQL's 0A000 `is
                 // not available`, with its control-file detail and hint
-                // (measured on 16).
+                // (measured on 16; the path names 15, the version this server
+                // reports, as a Debian-packaged PostgreSQL 15 writes it).
                 let Some((version, relocatable, types)) = Self::available_extension(&name) else {
                     let mut info = ErrorInfo::new(
                         "ERROR".into(),
@@ -33888,7 +34624,7 @@ impl PgHandler {
                     );
                     info.detail = Some(format!(
                         "Could not open extension control file \
-                         \"/usr/share/postgresql/16/extension/{name}.control\": \
+                         \"/usr/share/postgresql/15/extension/{name}.control\": \
                          No such file or directory."
                     ));
                     info.hint = Some(
@@ -33984,7 +34720,14 @@ impl PgHandler {
                 self.alter_enum(&name, change)?;
                 Ok(vec![Response::Execution(Tag::new("ALTER TYPE"))])
             }
-            Statement::RefreshMatView { name, with_data } => {
+            Statement::RefreshMatView {
+                name,
+                with_data,
+                concurrent,
+            } => {
+                if concurrent {
+                    self.check_concurrent_refresh(&name, with_data)?;
+                }
                 self.refresh_matview(&name, with_data)?;
                 Ok(vec![Response::Execution(Tag::new(
                     "REFRESH MATERIALIZED VIEW",
@@ -34080,9 +34823,16 @@ impl PgHandler {
                     "REVOKE ROLE"
                 }))])
             }
-            Statement::AlterDefaultPrivileges => Ok(vec![Response::Execution(Tag::new(
-                "ALTER DEFAULT PRIVILEGES",
-            ))]),
+            Statement::AlterDefaultPrivileges {
+                roles,
+                schemas,
+                action,
+            } => {
+                self.alter_default_privileges(&roles, &schemas, &action)?;
+                Ok(vec![Response::Execution(Tag::new(
+                    "ALTER DEFAULT PRIVILEGES",
+                ))])
+            }
             Statement::Comment {
                 kind,
                 names,
@@ -35639,6 +36389,7 @@ impl PgHandler {
                 let tables = self.truncate_set(&tables, cascade)?;
                 for table in &tables {
                     self.fire_statement_triggers(table, "BEFORE", "TRUNCATE")?;
+                    self.note_fresh_in_block(table);
                 }
                 for table in &tables {
                     // A partition's rows are in its tree's root.
@@ -37335,6 +38086,15 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
     if matches!(*ty, Type::BIT | Type::VARBIT) {
         if let Bson::String(bits) = v {
             return enc.encode_field(&Some(secantus_pgplan::bits::to_wire(bits)));
+        }
+    }
+    // `"char"` is one byte, and the empty text is its zero byte
+    // (`charsend`, RP-085).
+    if *ty == Type::CHAR {
+        if let Bson::String(c) = v {
+            if c.is_empty() {
+                return enc.encode_field(&Some(vec![0u8]));
+            }
         }
     }
     // `int2vector` / `oidvector` send as a one-dimensional array whose lower
@@ -40957,41 +41717,6 @@ fn series_table_def(series: &secantus_pgplan::Series) -> TableDef {
     )
 }
 
-/// Parse COPY text or CSV input into rows of optional fields, where `None` is
-/// that format's NULL.
-///
-/// The two formats disagree about exactly one thing that matters here, and it
-/// is the same thing they disagree about on output: TEXT spells NULL `\N` and
-/// an empty field is an empty string, while CSV spells NULL as an unquoted
-/// empty field and an empty string as `""`. A parser that treated an empty CSV
-/// field as an empty string would silently turn every NULL into one.
-fn copy_parse_text(text: &str, format: secantus_pgplan::CopyFormat) -> Vec<Vec<Option<String>>> {
-    use secantus_pgplan::CopyFormat;
-    if format == CopyFormat::Csv {
-        return copy_parse_csv(text);
-    }
-    let mut rows = Vec::new();
-    for line in text.split('\n') {
-        // A trailing newline leaves an empty final line, and `\.` is the
-        // end-of-data marker from the historical protocol.
-        if line.is_empty() || line == "\\." {
-            continue;
-        }
-        rows.push(
-            line.split('\t')
-                .map(|f| {
-                    if f == "\\N" {
-                        None
-                    } else {
-                        Some(unescape_copy_text(f))
-                    }
-                })
-                .collect(),
-        );
-    }
-    rows
-}
-
 /// Undo COPY's text-format escaping for one field.
 ///
 /// PostgreSQL's text COPY recognises `\b \f \n \r \t \v \\`, octal (`\ooo`, up
@@ -41073,66 +41798,6 @@ fn unescape_copy_text(field: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// CSV, where a newline inside quotes is DATA rather than a row separator --
-/// so the rows cannot be found by splitting on newlines first.
-fn copy_parse_csv(text: &str) -> Vec<Vec<Option<String>>> {
-    let mut rows = Vec::new();
-    let mut row: Vec<Option<String>> = Vec::new();
-    let mut field = String::new();
-    let mut quoted = false;
-    let mut was_quoted = false;
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if quoted {
-            if c == '"' {
-                // A doubled quote is one literal quote.
-                if chars.peek() == Some(&'"') {
-                    chars.next();
-                    field.push('"');
-                } else {
-                    quoted = false;
-                }
-            } else {
-                field.push(c);
-            }
-            continue;
-        }
-        match c {
-            '"' => {
-                quoted = true;
-                was_quoted = true;
-            }
-            ',' => {
-                row.push(csv_field(&field, was_quoted));
-                field.clear();
-                was_quoted = false;
-            }
-            '\n' => {
-                row.push(csv_field(&field, was_quoted));
-                field.clear();
-                was_quoted = false;
-                rows.push(std::mem::take(&mut row));
-            }
-            '\r' => {}
-            _ => field.push(c),
-        }
-    }
-    if !field.is_empty() || was_quoted || !row.is_empty() {
-        row.push(csv_field(&field, was_quoted));
-        rows.push(row);
-    }
-    rows
-}
-
-/// An UNQUOTED empty CSV field is NULL; a quoted one is the empty string.
-fn csv_field(text: &str, was_quoted: bool) -> Option<String> {
-    if text.is_empty() && !was_quoted {
-        None
-    } else {
-        Some(text.to_string())
-    }
-}
-
 /// One COPY row in PostgreSQL's text or CSV format.
 ///
 /// The formats differ in more than the delimiter, and the differences are
@@ -41150,21 +41815,21 @@ fn copy_text_row(
     row: &[Option<Bson>],
     format: secantus_pgplan::CopyFormat,
     schema: &[FieldInfo],
+    opts: &secantus_pgplan::copy_opts::CopyOptions,
+    force_quote: &[bool],
 ) -> bytes::Bytes {
     use secantus_pgplan::CopyFormat;
     let csv = format == CopyFormat::Csv;
     let mut out = String::new();
+    let single = row.len() == 1;
     for (i, value) in row.iter().enumerate() {
         if i > 0 {
-            out.push(if csv { ',' } else { '\t' });
+            out.push(opts.delimiter);
         }
         let oid = schema.get(i).map(|f| f.datatype().oid()).unwrap_or(0);
         let text = match value {
             None | Some(Bson::Null) => {
-                if !csv {
-                    out.push_str("\\N");
-                }
-                // CSV's null is the empty field, so there is nothing to write.
+                copy_text::write_field(&mut out, None, csv, opts, false, single);
                 continue;
             }
             // An inet / cidr field is `inet_out` / `cidr_out`, as in a SELECT:
@@ -41200,35 +41865,8 @@ fn copy_text_row(
             }
             Some(other) => secantus_pgplan::value_text(other),
         };
-        if csv {
-            let needs_quote =
-                text.is_empty() || text.chars().any(|c| matches!(c, ',' | '"' | '\n' | '\r'));
-            if needs_quote {
-                out.push('"');
-                for c in text.chars() {
-                    if c == '"' {
-                        out.push('"');
-                    }
-                    out.push(c);
-                }
-                out.push('"');
-            } else {
-                out.push_str(&text);
-            }
-        } else {
-            for c in text.chars() {
-                match c {
-                    '\u{08}' => out.push_str("\\b"),
-                    '\u{0c}' => out.push_str("\\f"),
-                    '\n' => out.push_str("\\n"),
-                    '\r' => out.push_str("\\r"),
-                    '\t' => out.push_str("\\t"),
-                    '\u{0b}' => out.push_str("\\v"),
-                    '\\' => out.push_str("\\\\"),
-                    _ => out.push(c),
-                }
-            }
-        }
+        let force = force_quote.get(i).copied().unwrap_or(false);
+        copy_text::write_field(&mut out, Some(&text), csv, opts, force, single);
     }
     out.push('\n');
     bytes::Bytes::from(out.into_bytes())
@@ -41345,6 +41983,17 @@ fn decode_parameter(
                 .ok_or_else(|| {
                     PgHandler::user_error("22P03", "invalid external pg_snapshot data".into())
                 }),
+            // A reg* value is its 4-byte oid (`regclassrecv` is `oidrecv`),
+            // read as the cast from that oid reads it: the name when one
+            // exists, the number otherwise (RP-083).
+            Some(
+                oid @ (24 | 2202 | 2203 | 2204 | 2205 | 2206 | 3734 | 3769 | 4089 | 4096 | 4191),
+            ) if bytes.len() == 4 => {
+                let n = i64::from(u32::from_be_bytes(bytes[..4].try_into().expect("checked")));
+                let target = secantus_pgplan::pgtypes::name_of_oid(i64::from(oid)).unwrap_or("oid");
+                secantus_pgplan::cast_value_with_tz(Bson::Int64(n), target, tz)
+                    .map_err(|e| PgHandler::err(&e))
+            }
             // An oid is a 4-byte UNSIGNED integer; through i64 so the value
             // survives the top bit.
             Some(26) if bytes.len() == 4 => Ok(Bson::Int64(i64::from(u32::from_be_bytes(
@@ -42518,7 +43167,23 @@ impl ExtendedQueryHandler for PgHandler {
         let rewritten = self.apply_string_syntax(&decoded);
         self.flush_notices(client).await?;
         message.query = rewritten?;
+        // An aborted block refuses every Parse but the statements that end
+        // it, as `exec_parse_message` does (RP-079).
+        if self.txn_failed.load(std::sync::atomic::Ordering::Relaxed)
+            && !exits_transaction(&message.query)
+        {
+            return Err(Self::in_failed_transaction());
+        }
         let stmt = StoredStatement::parse(client, &message, parser).await?;
+        // PostgreSQL analyses the statement at Parse (`exec_parse_message`):
+        // a syntax error, an unknown table, column, function or type, and a
+        // parameter whose uses conflict, are the Parse's error, before any
+        // Bind (RP-080, RP-090). The describe pass is that analysis here, and
+        // its answer is cached for the Describe that usually follows.
+        if let Err(e) = self.analyse_at_parse(&stmt) {
+            self.note_failure();
+            return Err(e);
+        }
         // The message's own name, not `stmt.id`: the wire store files the
         // unnamed statement under its `DEFAULT_NAME` placeholder.
         if message.name.as_deref().is_some_and(|n| !n.is_empty()) {
@@ -42659,7 +43324,10 @@ impl ExtendedQueryHandler for PgHandler {
                             (t != Type::VARCHAR || matches!(name, "varchar" | "character varying"))
                                 .then_some(t)
                         })
-                        .unwrap_or(Type::UNKNOWN)
+                        // What analysis leaves unresolved is `text` once it
+                        // succeeds (`select $1`, `$1 = $2`): PostgreSQL
+                        // never describes a parameter as `unknown`.
+                        .unwrap_or(Type::TEXT)
                 })
             })
             .collect();
@@ -42714,6 +43382,7 @@ impl ExtendedQueryHandler for PgHandler {
             self.forget_wire_portals();
         }
         self.flush_notifications(client).await?;
+        self.report_pending_params(client).await?;
         self.end_message_cycle();
         client
             .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
@@ -42774,7 +43443,62 @@ impl ExtendedQueryHandler for PgHandler {
             self.note_failure();
             return Err(PgWireError::StatementNotFound(statement_name.to_owned()));
         };
+        // The message's shape against the statement, first, as
+        // `exec_bind_message` checks it (RP-078).
+        let protocol = |message: String| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "08P01".into(), // protocol_violation
+                message,
+            )))
+        };
+        let supplied = message.parameters.len();
+        let formats = message.parameter_format_codes.len();
+        if formats > 1 && formats != supplied {
+            self.note_failure();
+            return Err(protocol(format!(
+                "bind message has {formats} parameter formats but {supplied} parameters"
+            )));
+        }
+        let required = statement
+            .parameter_types
+            .len()
+            .max(secantus_pgplan::max_param_number(&statement.statement.sql));
+        if supplied != required {
+            self.note_failure();
+            return Err(protocol(format!(
+                "bind message supplies {supplied} parameters, but prepared statement \"{}\" requires {required}",
+                message.statement_name.as_deref().unwrap_or("")
+            )));
+        }
+        // As `exec_bind_message`: an aborted block binds only the statements
+        // that end it (RP-079).
+        if self.txn_failed.load(std::sync::atomic::Ordering::Relaxed)
+            && !exits_transaction(&statement.statement.sql)
+        {
+            return Err(Self::in_failed_transaction());
+        }
+        // A named portal lasts until it is closed or its transaction ends;
+        // binding over one still open is 42P03, and aborts the block
+        // (`CreatePortal`, RP-089). The unnamed portal is replaced silently.
+        if let Some(name) = message.portal_name.as_deref().filter(|n| !n.is_empty()) {
+            let open = self
+                .wire_portals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(name);
+            if open {
+                self.note_failure();
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "42P03".into(), // duplicate_cursor
+                    format!("portal \"{name}\" already exists"),
+                ))));
+            }
+        }
         let portal = Portal::try_new(&message, statement).inspect_err(|_| self.note_failure())?;
+        self.check_bound_portal(&portal, message.result_column_format_codes.len())
+            .inspect_err(|_| self.note_failure())?;
         self.note_wire_portal(
             &portal.name,
             &portal.statement.statement.sql,
@@ -42915,8 +43639,8 @@ impl ExtendedQueryHandler for PgHandler {
         self.flush_notices(_c).await?;
         self.settle_failed_commit(_c);
         let mut responses = result?;
-        // Report any GUC change (TimeZone, DateStyle, ...) the statement made.
-        self.report_pending_params(_c).await?;
+        // A GUC change (TimeZone, DateStyle, ...) is reported at the Sync,
+        // before its ReadyForQuery (RP-081).
         // One portal is one statement, so exactly one response.
         self.apply_mixed_formats(responses.remove(0))
     }
@@ -43108,7 +43832,11 @@ impl CopyHandler for PgHandler {
             format => {
                 // COPY's text arrives in the client encoding, and PostgreSQL
                 // converts it as it does a query's (22021 / 22P05 by name).
-                let cenc = self.client_encoding();
+                let cenc = state
+                    .options
+                    .encoding
+                    .as_deref()
+                    .map_or_else(|| self.client_encoding(), encoding::client_encoding);
                 let text = if cenc.transcodes() {
                     encoding::decode(cenc, &state.buffer)
                         .map_err(|e| encoding::undecodable(cenc, e))?
@@ -43135,7 +43863,13 @@ impl CopyHandler for PgHandler {
                         )))
                     })?
                 };
-                let mut parsed = copy_parse_text(&text, format);
+                let mut parsed = copy_text::parse(
+                    &text,
+                    format == CopyFormat::Csv,
+                    &state.options,
+                    &state.force_not_null,
+                    &state.force_null,
+                );
                 if state.header && !parsed.is_empty() {
                     parsed.remove(0);
                 }

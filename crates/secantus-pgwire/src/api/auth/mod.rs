@@ -350,6 +350,11 @@ where
         .await?;
 
     if let Some(parameters) = server_parameter_provider.server_parameters(client) {
+        // SecantusDB local patch: in PostgreSQL's order, which is its GUC
+        // table's -- by name, ignoring case -- not a hash map's, which
+        // differed connection to connection.
+        let mut parameters: Vec<(String, String)> = parameters.into_iter().collect();
+        parameters.sort_by_key(|(k, _)| k.to_ascii_lowercase());
         for (k, v) in parameters {
             client
                 .feed(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(

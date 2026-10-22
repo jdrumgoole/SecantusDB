@@ -30,7 +30,7 @@ COLLATION_QUERY = (
 BUDGET_SECONDS = 2.0
 
 
-@pytest.mark.backlog("RP-077")
+@pytest.mark.backlog_fixed("RP-077")
 def test_psql_describe_collation_subquery(pg: Any) -> None:
     """PostgreSQL 15.19 answers `[('v', 'C')]` (measured on a private
     cluster: the scenario creates a table) in milliseconds, because the

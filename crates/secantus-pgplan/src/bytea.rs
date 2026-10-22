@@ -96,7 +96,13 @@ fn parse_escape(s: &str) -> Result<Vec<u8>> {
 }
 
 /// The `\x…` hex text PostgreSQL emits for a `bytea` under `bytea_output = hex`.
+///
+/// Under `bytea_output = escape` it is `byteaout`'s escape form instead
+/// (RP-068): every caller is a bytea's text output.
 pub fn render_hex(bytes: &[u8]) -> String {
+    if crate::output_style::output_style().bytea_escape {
+        return crate::output_style::bytea_escape(bytes);
+    }
     let mut out = String::with_capacity(2 + bytes.len() * 2);
     out.push_str("\\x");
     for b in bytes {

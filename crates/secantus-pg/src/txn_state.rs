@@ -79,6 +79,11 @@ pub(crate) struct TxnMarks {
     /// The transaction wrote a role, so its role reads see its own view,
     /// not the shared committed cache.
     roles_written: AtomicBool,
+    /// Tables the transaction created or truncated, which COPY FREEZE may
+    /// load (`rd_createSubid` / `rd_newRelfilenodeSubid`, at transaction
+    /// rather than subtransaction grain).
+    /// Each with the savepoint depth it happened at.
+    fresh_tables: std::sync::Mutex<Vec<(String, usize)>>,
 }
 
 impl TxnMarks {
@@ -88,6 +93,21 @@ impl TxnMarks {
 
     pub(crate) fn note_roles_written(&self) {
         self.roles_written.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_fresh_table(&self, table: &str, depth: usize) {
+        let mut t = self.fresh_tables.lock().unwrap_or_else(|e| e.into_inner());
+        t.retain(|(n, _)| n != table);
+        t.push((table.to_string(), depth));
+    }
+
+    /// Created or truncated in the current subtransaction: at `depth`.
+    pub(crate) fn is_fresh_table(&self, table: &str, depth: usize) -> bool {
+        self.fresh_tables
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|(n, d)| n == table && *d == depth)
     }
 
     pub(crate) fn catalog_changed(&self) -> bool {
@@ -103,6 +123,10 @@ impl TxnMarks {
     /// bumping the catalog version).
     pub(crate) fn end(&self) -> bool {
         self.roles_written.store(false, Ordering::Relaxed);
+        self.fresh_tables
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.catalog_changed.swap(false, Ordering::Relaxed)
     }
 }

@@ -46,7 +46,10 @@ impl<S> StoredStatement<S> {
         let types = parse
             .type_oids
             .iter()
-            .map(|oid| Type::from_oid(*oid))
+            // `unknown` (705) is as good as unspecified: the server resolves
+            // it from the statement, as `parse_analyze_varparams` does.
+            // (SecantusDB local patch.)
+            .map(|oid| Type::from_oid(*oid).filter(|t| *t != Type::UNKNOWN))
             .collect::<Vec<_>>();
         let statement = parser.parse_sql(client, &parse.query, &types).await?;
         Ok(StoredStatement {
