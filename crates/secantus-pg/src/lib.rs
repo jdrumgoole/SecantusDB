@@ -11565,21 +11565,39 @@ impl PgHandler {
             .iter()
             .map(|c| def.field_of(c).unwrap_or_else(|| c.clone()))
             .collect();
-        let mut seen: Vec<Vec<Bson>> = Vec::new();
-        for d in self.table_docs(table)? {
-            let key: Vec<Bson> = fields
-                .iter()
-                .map(|f| d.get(f).cloned().unwrap_or(Bson::Null))
-                .collect();
-            if !nulls_not_distinct && key.contains(&Bson::Null) {
-                continue;
-            }
-            if seen.iter().any(|k| {
-                k.iter().zip(&key).all(|(a, b)| {
-                    secantus_pgplan::compare_values(a, b) == Some(std::cmp::Ordering::Equal)
-                        || (*a == Bson::Null && *b == Bson::Null)
-                })
-            }) {
+        // As the btree build finds a duplicate: the keys sorted, each
+        // compared with the next -- linear after the sort, where comparing
+        // each key with every earlier one took minutes over 100,000 rows
+        // (`pgbench -i`'s primary key) -- and the smallest duplicated key
+        // the one reported.
+        let cmp_field = |a: &Bson, b: &Bson| match (a, b) {
+            (Bson::Null, Bson::Null) => std::cmp::Ordering::Equal,
+            (Bson::Null, _) => std::cmp::Ordering::Greater,
+            (_, Bson::Null) => std::cmp::Ordering::Less,
+            _ => secantus_pgplan::compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal),
+        };
+        let cmp_key = |a: &Vec<Bson>, b: &Vec<Bson>| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| cmp_field(x, y))
+                .find(|o| o.is_ne())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        };
+        let mut keys: Vec<Vec<Bson>> = self
+            .table_docs(table)?
+            .iter()
+            .map(|d| {
+                fields
+                    .iter()
+                    .map(|f| d.get(f).cloned().unwrap_or(Bson::Null))
+                    .collect::<Vec<Bson>>()
+            })
+            .filter(|key| nulls_not_distinct || !key.contains(&Bson::Null))
+            .collect();
+        keys.sort_by(cmp_key);
+        for pair in keys.windows(2) {
+            let key = &pair[1];
+            if cmp_key(&pair[0], key).is_eq() {
                 let shown: Vec<String> = key
                     .iter()
                     .map(|v| {
@@ -11602,7 +11620,6 @@ impl PgHandler {
                 ));
                 return Err(PgWireError::UserError(Box::new(info)));
             }
-            seen.push(key);
         }
         Ok(())
     }

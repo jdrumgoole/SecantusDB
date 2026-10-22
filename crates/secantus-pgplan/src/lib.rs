@@ -36520,7 +36520,14 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         {
             let arg = &f.args[0];
             let value = const_value(arg, params)?;
-            let ty = static_type(arg, &value);
+            // A bare string literal is `unknown`, a C string (typlen -2).
+            let untyped = matches!(arg.node.as_ref(), Some(N::AConst(c))
+                if matches!(c.val, Some(a_const::Val::Sval(_))));
+            let ty = if untyped {
+                "unknown".to_string()
+            } else {
+                static_type(arg, &value)
+            };
             let from_table = matches!(arg.node.as_ref(), Some(N::ColumnRef(_)));
             return Ok(
                 datum_size::column_size(&value, &ty, from_table).map_or(Bson::Null, Bson::Int32)

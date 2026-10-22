@@ -173,6 +173,10 @@ fn in_memory(v: &Bson, ty: &str) -> Option<usize> {
     if let Some(fields) = record_fields(v) {
         return Some(record_size(v, fields));
     }
+    // `unknown` (and cstring) is a NUL-terminated C string.
+    if matches!(ty, "unknown" | "cstring") {
+        return Some(value_text(v).len() + 1);
+    }
     match layout(ty) {
         (-1, _) => Some(4 + varlena_data(v, ty)?),
         (n, _) => Some(n as usize),

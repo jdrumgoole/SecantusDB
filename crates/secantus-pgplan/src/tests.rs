@@ -314,9 +314,11 @@ fn shapes_sqlglot_mis_parses_reach_us_as_real_statements() {
     // `NOTIFY chan, 'payload'` and `LISTEN chan` used to live here too; all
     // five now EXECUTE rather than merely parsing, which is the stronger
     // result.
-    let sql = "COPY t FROM stdin WITH (freeze on)";
-    let err = plan(sql, &lookup).expect_err(sql);
-    assert_eq!(err.sqlstate(), "0A000", "for {sql} (got {err})");
+    // FREEZE is taken, as PostgreSQL 15 takes it (RP-073).
+    match plan_ok("COPY t FROM stdin WITH (freeze on)") {
+        Statement::CopyFrom(c) => assert!(c.options.freeze),
+        other => panic!("wrong statement: {other:?}"),
+    }
     assert_eq!(
         plan_ok("NOTIFY chan, 'payload'"),
         Statement::Notify {
@@ -662,6 +664,9 @@ fn bound_parameters_substitute_into_the_plan() {
 #[test]
 fn comparing_against_null_matches_nothing() {
     let never = doc! {"$nor": [Document::new()]};
+    // A literal NULL operand is folded first (`strict_fold`, RP-075), to a
+    // NULL WHERE, which lowers to the other filter that matches no row.
+    let folded = doc! {"_id": {"$in": []}};
     for sql in [
         "SELECT id FROM t WHERE n = NULL",
         "SELECT id FROM t WHERE n <> NULL",
@@ -669,7 +674,11 @@ fn comparing_against_null_matches_nothing() {
         "SELECT id FROM t WHERE n <= NULL",
     ] {
         match plan_ok(sql) {
-            Statement::Select(s) => assert_eq!(s.filter, never, "for {sql}"),
+            Statement::Select(s) => assert!(
+                s.filter == never || s.filter == folded,
+                "for {sql}: {:?}",
+                s.filter
+            ),
             other => panic!("wrong statement for {sql}: {other:?}"),
         }
     }
