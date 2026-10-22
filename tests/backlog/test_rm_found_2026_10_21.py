@@ -135,7 +135,7 @@ def test_shift_default_replaces_a_missing_output(rust_mongo: Any, mongod: Any, s
 _CONVERT_TARGETS = ["uuid", "foo", "array", "timestamp", "null", "regex", 99, 4, {"type": "uuid"}]
 
 
-@pytest.mark.backlog("RM-228")
+@pytest.mark.backlog_fixed("RM-228")
 @pytest.mark.parametrize("on_error", [False, True], ids=["plain", "onError"])
 @pytest.mark.parametrize("to", _CONVERT_TARGETS, ids=[repr(t) for t in _CONVERT_TARGETS])
 def test_convert_to_a_target_it_cannot_produce(

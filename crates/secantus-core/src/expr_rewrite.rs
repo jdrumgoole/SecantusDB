@@ -139,7 +139,9 @@ fn evaluate_constant(e: &Bson) -> Option<Bson> {
 /// constant subtree, so an `$and` that would short-circuit at run time does
 /// not hide one.
 pub fn constant_expr_fault(arg: &Bson) -> Option<crate::fallback::Fallback> {
-    if is_constant(arg) {
+    // Constant AND one mongod folds: some operators it never evaluates while
+    // optimizing, whatever their arguments (`aggregate::is_constant_expression`).
+    if is_constant(arg) && crate::aggregate::is_constant_expression(arg, &[]) {
         return crate::expressions::evaluate(&Document::new(), arg, &Document::new())
             .err()
             // A PARSE error (a missing required argument) is reported bare,

@@ -209,7 +209,7 @@ def test_regex_find_all_has_no_trailing_empty_match(rust_mongo: Any, mongod: Any
     assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
 
 
-@pytest.mark.backlog("RM-238")
+@pytest.mark.backlog_fixed("RM-238")
 def test_regex_operator_options_are_validated(rust_mongo: Any, mongod: Any) -> None:
     """mongod rejects a bad flag (51108), flags given twice (51107), a NUL in
     the pattern or options (51109 / 51110) and a non-string option (51106);
@@ -249,7 +249,7 @@ def test_filter_limit(rust_mongo: Any, mongod: Any) -> None:
     assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
 
 
-@pytest.mark.backlog("RM-240")
+@pytest.mark.backlog_fixed("RM-240")
 def test_zip_defaults_and_options(rust_mongo: Any, mongod: Any) -> None:
     """mongod evaluates each `defaults` entry and validates the options
     (34462 / 34463 / 34466 / 34467); the Rust server returns the defaults
@@ -268,7 +268,7 @@ def test_zip_defaults_and_options(rust_mongo: Any, mongod: Any) -> None:
     assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
 
 
-@pytest.mark.backlog("RM-241")
+@pytest.mark.backlog_fixed("RM-241")
 def test_sort_array(rust_mongo: Any, mongod: Any) -> None:
     """`$sortArray`: a scalar sorted by a field spec is MISSING for the sort
     on mongod, a `-1.0` direction is descending, and an invalid `sortBy` or
@@ -294,7 +294,7 @@ def test_sort_array(rust_mongo: Any, mongod: Any) -> None:
 # ---------------------------------------------------------------- $switch --
 
 
-@pytest.mark.backlog("RM-242")
+@pytest.mark.backlog_fixed("RM-242")
 def test_switch(rust_mongo: Any, mongod: Any) -> None:
     """A `$switch` with no matching branch and no default is 40066 per
     document and 40069 when every case is a constant false (mongod refuses it
@@ -398,16 +398,26 @@ def test_decimal_hyperbolic_and_trig_edges(rust_mongo: Any, mongod: Any) -> None
 @pytest.mark.backlog("RM-246")
 def test_convert(rust_mongo: Any, mongod: Any) -> None:
     """`$convert`: a double just past the int32 range is 241 on mongod, not a
-    clamp; a string below the smallest normal double is 241, not 0 or a
-    subnormal; `to` given as a number, a non-integral, null or an
-    unsupported type is a value or a specific error, not 2; and an `onError`
-    that evaluates to missing leaves the field missing."""
+    clamp, and a string below the smallest normal double is 241, not 0 or a
+    subnormal."""
     c = lambda inp, to, **kw: {"$convert": {"input": inp, "to": to, **kw}}  # noqa: E731
     shapes = [
         ("2147483647.5 to int", c(2147483647.5, "int")),
         ("-2147483648.9 to int", c(-2147483648.9, "int")),
         ("1e-400 to double", c("1e-400", "double")),
         ("4.9e-324 to double", c("4.9e-324", "double")),
+    ]
+    assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
+
+
+@pytest.mark.backlog_fixed("RM-246")
+def test_convert_targets_and_fallbacks(rust_mongo: Any, mongod: Any) -> None:
+    """`to` as a number, a non-integral, null or a type `$convert` cannot
+    reach is a value or mongod's own error, not 2 "not supported"; an
+    `onError` that evaluates to missing leaves the field missing; and the
+    target is checked before a null input's `onNull`."""
+    c = lambda inp, to, **kw: {"$convert": {"input": inp, "to": to, **kw}}  # noqa: E731
+    shapes = [
         ("to 1.0", c(5, 1.0)),
         ("to Decimal 16", c(5, Decimal128("16"))),
         ("to 99", c(5, 99)),
@@ -425,7 +435,7 @@ def test_convert(rust_mongo: Any, mongod: Any) -> None:
 # ------------------------------------------------------------------ dates --
 
 
-@pytest.mark.backlog("RM-247")
+@pytest.mark.backlog_fixed("RM-247")
 def test_date_to_string_arguments(rust_mongo: Any, mongod: Any) -> None:
     """`$dateToString` evaluates `format` and honours `onNull`; the Rust
     server reads `format` as literal text, ignores `onNull`, refuses years
@@ -502,7 +512,7 @@ def test_time_zone_rules_far_from_now(rust_mongo: Any, mongod: Any) -> None:
     assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
 
 
-@pytest.mark.backlog("RM-250")
+@pytest.mark.backlog_fixed("RM-250")
 def test_date_arithmetic_arguments_and_range(rust_mongo: Any, mongod: Any) -> None:
     """`$dateAdd` / `$dateTrunc` / `$dateDiff` / `$dateToParts`: mongod
     accepts any int64 millisecond result, an ObjectId or Timestamp date, an
@@ -550,26 +560,32 @@ def test_constant_arguments_are_checked_while_optimizing(rust_mongo: Any, mongod
 
 @pytest.mark.backlog("RM-252")
 def test_operator_tail_codes(rust_mongo: Any, mongod: Any) -> None:
-    """One shape each, all a wrong code, a refusal or a null for a missing
-    value: the `$firstN` family with a NaN or
-    Decimal128 `n`, `$arrayElemAt` of a null array with a bad index,
-    `$toString` of year 1, `$percentile` with a Decimal128 `p`,
-    `$meta: "randVal"`, `$meta: "sortKey"` in `$match`, `$getField` of
+    """One shape each, a wrong code, a refusal or a null for a missing value:
+    `$arrayElemAt` of a null array with a bad index, `$percentile` with a
+    Decimal128 `p`, `$meta: "sortKey"` in `$match`, `$getField` of
     `$$REMOVE`, and `$setField` with a field path for `field`."""
-    nan = float("nan")
     shapes = [
-        ("$firstN NaN n", {"$firstN": {"input": [1, 2], "n": nan}}),
-        ("$firstN Decimal n", {"$firstN": {"input": [1, 2], "n": Decimal128("1")}}),
         ("$arrayElemAt null array string index", {"$arrayElemAt": [None, "x"]}),
-        ("$toString year 1", {"$toString": datetime.datetime(1, 1, 1)}),
         (
             "$percentile Decimal p",
             {"$percentile": {"input": [1, 2], "p": [Decimal128("0.5")], "method": "approximate"}},
         ),
-        ("$meta randVal", {"$meta": "randVal"}),
         ("$meta sortKey in $match", {"$meta": "sortKey"}, None, "$match"),
         ("$getField of $$REMOVE", {"$getField": {"field": "x", "input": "$$REMOVE"}}),
         ("$setField field path", {"$setField": {"field": "$s", "input": {}, "value": 1}}),
+    ]
+    assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
+
+
+@pytest.mark.backlog_fixed("RM-252")
+def test_operator_tail_codes_fixed(rust_mongo: Any, mongod: Any) -> None:
+    """The `$firstN` family with a NaN or Decimal128 `n`, `$toString` of year
+    1 and `$meta: "randVal"` answer as mongod does."""
+    shapes = [
+        ("$firstN NaN n", {"$firstN": {"input": [1, 2], "n": float("nan")}}),
+        ("$firstN Decimal n", {"$firstN": {"input": [1, 2], "n": Decimal128("1")}}),
+        ("$toString year 1", {"$toString": datetime.datetime(1, 1, 1)}),
+        ("$meta randVal", {"$meta": "randVal"}),
     ]
     assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
 

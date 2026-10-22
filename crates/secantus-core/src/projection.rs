@@ -113,6 +113,11 @@ pub const META_KEYWORDS: &[&str] = &[
     "geoNearDistance",
     "geoNearPoint",
     "vectorSearchScore",
+    // Answer missing outside the stages that set them (measured 8.2.11,
+    // 2026-10-22); they used to be refused as unknown (17308).
+    "randVal",
+    "searchScoreDetails",
+    "searchSequenceToken",
 ];
 
 fn slice_spec(v: &Bson) -> Option<&Bson> {
