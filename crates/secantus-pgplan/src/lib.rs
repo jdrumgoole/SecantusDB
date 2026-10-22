@@ -487,6 +487,12 @@ pub enum Statement {
         if_exists: bool,
     },
     /// `ALTER SEQUENCE`, which applies only the options it names.
+    /// `ALTER SEQUENCE s OWNER TO r`.
+    AlterSequenceOwner {
+        name: String,
+        owner: String,
+        missing_ok: bool,
+    },
     AlterSequence {
         name: String,
         options: SequenceOptions,
@@ -937,6 +943,29 @@ pub enum Statement {
     /// `SET name TO DEFAULT`; `name` None for `RESET ALL`).
     AlterDatabaseSet {
         database: String,
+        name: Option<String>,
+        value: Option<String>,
+    },
+    /// `ALTER SCHEMA s OWNER TO r`.
+    AlterSchemaOwner {
+        name: String,
+        owner: String,
+    },
+    /// `REASSIGN OWNED BY roles TO to`.
+    ReassignOwned {
+        roles: Vec<String>,
+        to: String,
+    },
+    /// `DROP OWNED BY roles [CASCADE]`.
+    DropOwned {
+        roles: Vec<String>,
+        cascade: bool,
+    },
+    /// `ALTER ROLE r [IN DATABASE d] SET name = value` (`role` None for
+    /// `ALTER ROLE ALL`; `name` / `value` as `AlterDatabaseSet`'s).
+    AlterRoleSet {
+        role: Option<String>,
+        database: Option<String>,
         name: Option<String>,
         value: Option<String>,
     },
@@ -2070,6 +2099,22 @@ fn output_lock_targets(
 /// do not match, which is the worst failure this server can have.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterTableAction {
+    /// `SET LOGGED` / `SET UNLOGGED`: the relation's `relpersistence`.
+    SetPersistence(char),
+    /// `SET (...)` / `RESET (...)`: the table's `reloptions` after the edit,
+    /// as `name=value` texts.
+    RelOptions(Vec<String>),
+    /// `ALTER COLUMN c SET STORAGE`: its `attstorage` code (checked against
+    /// the type by the executor).
+    ColumnStorage {
+        column: String,
+        storage: char,
+    },
+    /// `ALTER COLUMN c SET STATISTICS n`: its `attstattarget`.
+    ColumnStatistics {
+        column: String,
+        target: i32,
+    },
     /// `ENABLE` / `DISABLE` / `FORCE` / `NO FORCE ROW LEVEL SECURITY`:
     /// `enable` and `force` each set when the action names them.
     RowSecurity {
@@ -4522,6 +4567,18 @@ fn plan_node(
             })
         }
         N::AlterOwnerStmt(a)
+            if ObjectType::try_from(a.object_type) == Ok(ObjectType::ObjectSchema) =>
+        {
+            let name = match a.object.as_deref().and_then(|o| o.node.as_ref()) {
+                Some(N::String(s)) => s.sval.clone(),
+                _ => String::new(),
+            };
+            Ok(Statement::AlterSchemaOwner {
+                name,
+                owner: a.newowner.as_ref().map(role_spec_name).unwrap_or_default(),
+            })
+        }
+        N::AlterOwnerStmt(a)
             if ObjectType::try_from(a.object_type) == Ok(ObjectType::ObjectDatabase) =>
         {
             let name = match a.object.as_deref().and_then(|o| o.node.as_ref()) {
@@ -5123,6 +5180,41 @@ fn plan_node(
             };
             Ok(Statement::AlterDatabaseSet {
                 database: a.dbname.clone(),
+                name,
+                value,
+            })
+        }
+        // `ALTER ROLE r [IN DATABASE d] SET ...`: a default for r's new
+        // sessions (of d), `pg_db_role_setting`'s other rows.
+        N::ReassignOwnedStmt(r) => Ok(Statement::ReassignOwned {
+            roles: role_spec_list(&r.roles),
+            to: r.newrole.as_ref().map(role_spec_name).unwrap_or_default(),
+        }),
+        N::DropOwnedStmt(d) => Ok(Statement::DropOwned {
+            roles: role_spec_list(&d.roles),
+            cascade: pg_query::protobuf::DropBehavior::try_from(d.behavior)
+                == Ok(pg_query::protobuf::DropBehavior::DropCascade),
+        }),
+        N::AlterRoleSetStmt(a) => {
+            let set = a
+                .setstmt
+                .as_ref()
+                .ok_or_else(|| Error::Parse("ALTER ROLE SET without a setting".into()))?;
+            let (name, value) = match VariableSetKind::try_from(set.kind) {
+                Ok(VariableSetKind::VarResetAll) => (None, None),
+                Ok(VariableSetKind::VarReset | VariableSetKind::VarSetDefault) => {
+                    (Some(set.name.clone()), None)
+                }
+                Ok(VariableSetKind::VarSetValue) => match plan_set(set)? {
+                    Statement::Set { name, value } => (Some(name), Some(value)),
+                    _ => return Err(Error::Unsupported("this ALTER ROLE SET form".into())),
+                },
+                _ => return Err(Error::Unsupported("this ALTER ROLE SET form".into())),
+            };
+            let role = a.role.as_ref().map(role_spec_name);
+            Ok(Statement::AlterRoleSet {
+                role,
+                database: (!a.database.is_empty()).then(|| a.database.clone()),
                 name,
                 value,
             })
@@ -6270,6 +6362,29 @@ fn plan_alter_table(
     // Only tables. `ALTER INDEX` / `ALTER SEQUENCE` parse to the same node
     // with a different `objtype`, and answering them as though they were
     // table alterations would be worse than refusing them.
+    // `ALTER SEQUENCE s OWNER TO r`.
+    if a.objtype == ObjectType::ObjectSequence as i32 {
+        let owners: Vec<String> = a
+            .cmds
+            .iter()
+            .filter_map(|c| match c.node.as_ref() {
+                Some(N::AlterTableCmd(c))
+                    if pg_query::protobuf::AlterTableType::try_from(c.subtype)
+                        == Ok(pg_query::protobuf::AlterTableType::AtChangeOwner) =>
+                {
+                    c.newowner.as_ref().map(role_spec_name)
+                }
+                _ => None,
+            })
+            .collect();
+        if !owners.is_empty() && owners.len() == a.cmds.len() {
+            return Ok(Statement::AlterSequenceOwner {
+                name: table,
+                owner: owners.into_iter().last().unwrap_or_default(),
+                missing_ok: a.missing_ok,
+            });
+        }
+    }
     if a.objtype != ObjectType::ObjectTable as i32 {
         return Err(Error::Unsupported(format!(
             "ALTER {}",
@@ -6412,6 +6527,16 @@ fn plan_alter_view(a: &pg_query::protobuf::AlterTableStmt, view: &str) -> Result
 
 /// The word PostgreSQL uses for an object type in `ALTER <word>`, for a
 /// refusal that names what was actually asked for.
+fn role_spec_list(nodes: &[pg_query::protobuf::Node]) -> Vec<String> {
+    nodes
+        .iter()
+        .filter_map(|n| match n.node.as_ref() {
+            Some(N::RoleSpec(r)) => Some(role_spec_name(r)),
+            _ => None,
+        })
+        .collect()
+}
+
 fn object_type_word(objtype: i32) -> &'static str {
     match ObjectType::try_from(objtype) {
         Ok(ObjectType::ObjectIndex) => "INDEX",
@@ -6705,6 +6830,82 @@ fn plan_alter_action(
             name: cmd.name.clone(),
             if_exists: cmd.missing_ok,
         }),
+        Ok(AT::AtSetLogged) => Ok(AlterTableAction::SetPersistence('p')),
+        Ok(AT::AtSetUnLogged) => Ok(AlterTableAction::SetPersistence('u')),
+        Ok(kind @ (AT::AtSetRelOptions | AT::AtResetRelOptions)) => {
+            let reset = kind == AT::AtResetRelOptions;
+            let Some(N::List(l)) = cmd.def.as_deref().and_then(|d| d.node.as_ref()) else {
+                return Err(Error::Parse("SET without options".into()));
+            };
+            let mut options: Vec<String> = def
+                .extra
+                .get_array("reloptions")
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for item in &l.items {
+                let Some(N::DefElem(e)) = item.node.as_ref() else {
+                    continue;
+                };
+                // A TOAST table's options go to the TOAST table, which this
+                // server does not keep apart (they are checked all the same).
+                let toast = e.defnamespace == "toast";
+                let value = e.arg.as_deref().map(reloption_value_text);
+                if !reset {
+                    check_reloption(&e.defname, value.as_deref(), toast)?;
+                }
+                if toast {
+                    continue;
+                }
+                options.retain(|o| o.split('=').next() != Some(e.defname.as_str()));
+                if !reset {
+                    options.push(format!(
+                        "{}={}",
+                        e.defname,
+                        value.unwrap_or_else(|| "true".into())
+                    ));
+                }
+            }
+            Ok(AlterTableAction::RelOptions(options))
+        }
+        Ok(AT::AtSetStorage) => {
+            let word = match cmd.def.as_deref().and_then(|d| d.node.as_ref()) {
+                Some(N::String(s)) => s.sval.to_ascii_lowercase(),
+                _ => return Err(Error::Parse("SET STORAGE without a type".into())),
+            };
+            let storage = match word.as_str() {
+                "plain" => 'p',
+                "external" => 'e',
+                "extended" => 'x',
+                "main" => 'm',
+                _ => {
+                    return Err(Error::InvalidParameter(format!(
+                        "invalid storage type \"{word}\""
+                    )))
+                }
+            };
+            Ok(AlterTableAction::ColumnStorage {
+                column: cmd.name.clone(),
+                storage,
+            })
+        }
+        Ok(AT::AtSetStatistics) => {
+            let target = match cmd.def.as_deref().and_then(|d| d.node.as_ref()) {
+                Some(N::Integer(i)) => i.ival,
+                Some(N::AConst(c)) => match c.val.as_ref() {
+                    Some(pg_query::protobuf::a_const::Val::Ival(i)) => i.ival,
+                    _ => return Err(Error::Parse("SET STATISTICS without a number".into())),
+                },
+                _ => return Err(Error::Parse("SET STATISTICS without a number".into())),
+            };
+            Ok(AlterTableAction::ColumnStatistics {
+                column: cmd.name.clone(),
+                target,
+            })
+        }
         // Everything else -- OWNER, SET STATISTICS, CLUSTER, inheritance,
         // partitioning -- is named rather than lumped under one refusal, so
         // the message says which action was not understood.
@@ -6714,6 +6915,150 @@ fn plan_alter_action(
         ))),
         Err(_) => Err(Error::Unsupported("this ALTER TABLE action".into())),
     }
+}
+
+/// A reloption's value as `reloptions` keeps it: the text written.
+fn reloption_value_text(n: &pg_query::protobuf::Node) -> String {
+    use pg_query::protobuf::a_const::Val;
+    match n.node.as_ref() {
+        Some(N::String(s)) => s.sval.clone(),
+        Some(N::Integer(i)) => i.ival.to_string(),
+        Some(N::Float(f)) => f.fval.clone(),
+        Some(N::Boolean(b)) => b.boolval.to_string(),
+        Some(N::TypeName(t)) => type_name_of(t),
+        Some(N::AConst(c)) => match c.val.as_ref() {
+            Some(Val::Sval(s)) => s.sval.clone(),
+            Some(Val::Ival(i)) => i.ival.to_string(),
+            Some(Val::Fval(f)) => f.fval.clone(),
+            Some(Val::Boolval(b)) => b.boolval.to_string(),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
+/// `parseRelOptions` over a heap's (or its TOAST table's) options: the
+/// name must be one PostgreSQL 15 knows for that kind, and the value of its
+/// type and within its bounds.
+fn check_reloption(name: &str, value: Option<&str>, toast: bool) -> Result<()> {
+    // (name, kind, low, high): `b` boolean, `i` integer, `r` real, `e` the
+    // `vacuum_index_cleanup` enum.
+    const HEAP: &[(&str, char, f64, f64)] = &[
+        ("fillfactor", 'i', 10.0, 100.0),
+        ("autovacuum_enabled", 'b', 0.0, 0.0),
+        ("autovacuum_vacuum_threshold", 'i', 0.0, 2147483647.0),
+        (
+            "autovacuum_vacuum_insert_threshold",
+            'i',
+            -1.0,
+            2147483647.0,
+        ),
+        ("autovacuum_analyze_threshold", 'i', 0.0, 2147483647.0),
+        ("autovacuum_vacuum_cost_limit", 'i', 1.0, 10000.0),
+        ("autovacuum_freeze_min_age", 'i', 0.0, 1000000000.0),
+        ("autovacuum_freeze_max_age", 'i', 100000.0, 2000000000.0),
+        ("autovacuum_freeze_table_age", 'i', 0.0, 2000000000.0),
+        (
+            "autovacuum_multixact_freeze_min_age",
+            'i',
+            0.0,
+            1000000000.0,
+        ),
+        (
+            "autovacuum_multixact_freeze_max_age",
+            'i',
+            10000.0,
+            2000000000.0,
+        ),
+        (
+            "autovacuum_multixact_freeze_table_age",
+            'i',
+            0.0,
+            2000000000.0,
+        ),
+        ("log_autovacuum_min_duration", 'i', -1.0, 2147483647.0),
+        ("toast_tuple_target", 'i', 128.0, 8160.0),
+        ("parallel_workers", 'i', 0.0, 1024.0),
+        ("autovacuum_vacuum_cost_delay", 'r', 0.0, 100.0),
+        ("autovacuum_vacuum_scale_factor", 'r', 0.0, 100.0),
+        ("autovacuum_vacuum_insert_scale_factor", 'r', 0.0, 100.0),
+        ("autovacuum_analyze_scale_factor", 'r', 0.0, 100.0),
+        ("user_catalog_table", 'b', 0.0, 0.0),
+        ("vacuum_index_cleanup", 'e', 0.0, 0.0),
+        ("vacuum_truncate", 'b', 0.0, 0.0),
+    ];
+    // A TOAST table takes the autovacuum and vacuum ones, not these.
+    const HEAP_ONLY: &[&str] = &[
+        "fillfactor",
+        "autovacuum_analyze_threshold",
+        "autovacuum_analyze_scale_factor",
+        "toast_tuple_target",
+        "parallel_workers",
+        "user_catalog_table",
+    ];
+    let unknown = || Error::InvalidParameter(format!("unrecognized parameter \"{name}\""));
+    let Some(&(_, kind, low, high)) = HEAP.iter().find(|(n, ..)| *n == name) else {
+        return Err(unknown());
+    };
+    if toast && HEAP_ONLY.contains(&name) {
+        return Err(unknown());
+    }
+    let Some(v) = value else {
+        // A bare name is `true` for a boolean, and needs a value otherwise.
+        return if kind == 'b' {
+            Ok(())
+        } else {
+            Err(Error::InvalidParameter(format!(
+                "parameter \"{name}\" specified more than once"
+            )))
+        };
+    };
+    match kind {
+        'b' => {
+            if !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "t" | "true" | "y" | "yes" | "on" | "1" | "f" | "false" | "n" | "no" | "off" | "0"
+            ) {
+                return Err(Error::InvalidParameter(format!(
+                    "invalid value for boolean option \"{name}\": {v}"
+                )));
+            }
+        }
+        'e' => {
+            if !matches!(
+                v.to_ascii_lowercase().as_str(),
+                "auto" | "on" | "off" | "true" | "false" | "yes" | "no" | "1" | "0"
+            ) {
+                return Err(Error::InvalidParameter(format!(
+                    "invalid value for enum option \"{name}\": {v}"
+                )));
+            }
+        }
+        _ => {
+            let number: Option<f64> = if kind == 'i' {
+                v.trim().parse::<i64>().ok().map(|n| n as f64)
+            } else {
+                v.trim().parse::<f64>().ok()
+            };
+            let Some(n) = number else {
+                return Err(Error::InvalidParameter(format!(
+                    "invalid value for {} option \"{name}\": {v}",
+                    if kind == 'i' {
+                        "integer"
+                    } else {
+                        "floating point"
+                    }
+                )));
+            };
+            // (PostgreSQL adds the bounds as a DETAIL.)
+            if n < low || n > high {
+                return Err(Error::InvalidParameter(format!(
+                    "value {v} out of bounds for option \"{name}\""
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn alter_action_word(t: pg_query::protobuf::AlterTableType) -> &'static str {
@@ -7024,6 +7369,33 @@ fn default_value_or_expr(
 /// the executor -- see the same shape.
 pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
     match action {
+        AlterTableAction::SetPersistence(p) => {
+            def.extra.insert("relpersistence", p.to_string());
+        }
+        AlterTableAction::RelOptions(options) => {
+            if options.is_empty() {
+                def.extra.remove("reloptions");
+            } else {
+                def.extra.insert(
+                    "reloptions",
+                    options
+                        .iter()
+                        .cloned()
+                        .map(Bson::String)
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        AlterTableAction::ColumnStorage { column, storage } => {
+            if let Some(c) = def.columns.iter_mut().find(|c| c.name == *column) {
+                c.extra.insert("attstorage", storage.to_string());
+            }
+        }
+        AlterTableAction::ColumnStatistics { column, target } => {
+            if let Some(c) = def.columns.iter_mut().find(|c| c.name == *column) {
+                c.extra.insert("attstattarget", *target);
+            }
+        }
         // Nothing in the table's shape.
         AlterTableAction::OwnerTo(role) => {
             def.extra.insert("owner", role.clone());
@@ -30930,6 +31302,26 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
         // The cast's own arms are the list of known types: a probe value
         // that reaches the "no such type" arm is the only refusal kept.
         let base = target.strip_suffix("[]").unwrap_or(target);
+        // A polymorphic pseudo-type has no input function to probe, and a
+        // NULL of it is a value (`NULL::anyarray` in `pg_stats`).
+        if target == base
+            && matches!(
+                base,
+                "anyarray"
+                    | "anyelement"
+                    | "anynonarray"
+                    | "anyenum"
+                    | "anyrange"
+                    | "anymultirange"
+                    | "anycompatible"
+                    | "anycompatiblearray"
+                    | "anycompatiblenonarray"
+                    | "anycompatiblerange"
+                    | "anycompatiblemultirange"
+            )
+        {
+            return Ok(Bson::Null);
+        }
         // The probe's own NOTICEs are not the statement's: `''::tsquery`
         // says it has no lexemes, `null::tsquery` says nothing.
         let notices = fts::notices_len();

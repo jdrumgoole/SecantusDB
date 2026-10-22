@@ -80,6 +80,7 @@ const STATEFUL: &[&str] = &[
     "pg_ident_file_mappings",
     "pg_file_settings",
     "pg_config",
+    "pg_statistic",
 ];
 
 /// The extensions `CREATE EXTENSION` installs here, with their control files'
@@ -135,6 +136,8 @@ pub(crate) fn def(name: &str) -> Option<TableDef> {
 fn type_name(oid: i64) -> String {
     match oid {
         18 => secantus_pgplan::QUOTED_CHAR.to_string(),
+        // `pg_statistic.stavalues*`: an array of the column's own type.
+        2277 => "anyarray".to_string(),
         _ => secantus_pgplan::pgtypes::type_name_of_oid(oid).unwrap_or_else(|| "text".to_string()),
     }
 }
@@ -246,6 +249,7 @@ impl PgHandler {
             "pg_hba_file_rules" => self.hba_file_rule_rows(def),
             "pg_ident_file_mappings" => self.ident_file_mapping_rows(def),
             "pg_config" => self.pg_config_rows(def),
+            "pg_statistic" => self.pg_statistic_rows(def),
             // No `postgresql.conf` is read: the settings come from the
             // command line and the defaults.
             "pg_file_settings" => Vec::new(),
@@ -416,6 +420,43 @@ impl PgHandler {
     fn db_role_setting_rows(&self, def: &TableDef) -> Vec<Document> {
         let f = |n: &str| def.field_of(n).expect("column");
         let mut out = Vec::new();
+        // `ALTER ROLE ... SET`'s rows, one per (database, role).
+        let roles = self.roles().unwrap_or_default();
+        let dbs = self.databases.all(&self.storage).unwrap_or_default();
+        let mut grouped: std::collections::BTreeMap<(i64, i64), Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (role, database, name, value) in self.role_setting_docs() {
+            let role_oid = if role.is_empty() {
+                0
+            } else {
+                match roles.iter().find(|r| r.name == role) {
+                    Some(r) => r.oid,
+                    None => continue,
+                }
+            };
+            let db_oid = if database.is_empty() {
+                0
+            } else {
+                match dbs.iter().find(|d| d.name == database) {
+                    Some(d) => d.oid,
+                    None => continue,
+                }
+            };
+            grouped
+                .entry((db_oid, role_oid))
+                .or_default()
+                .push(format!("{name}={value}"));
+        }
+        for ((db_oid, role_oid), config) in grouped {
+            let mut d = Document::new();
+            d.insert(f("setdatabase"), Bson::Int64(db_oid));
+            d.insert(f("setrole"), Bson::Int64(role_oid));
+            d.insert(
+                f("setconfig"),
+                Bson::Array(config.into_iter().map(Bson::String).collect()),
+            );
+            out.push(d);
+        }
         for db in self.databases.all(&self.storage).unwrap_or_default() {
             let settings = self.db_setting_defaults_of(&db.name);
             if settings.is_empty() {
@@ -509,6 +550,7 @@ impl PgHandler {
         let mut out = Vec::new();
         // (catalog, its class oid, the owner and ACL columns).
         for (catalog, classid, owner_col, acl_col) in [
+            ("pg_namespace", 2615, "nspowner", "nspacl"),
             ("pg_class", 1259, "relowner", "relacl"),
             ("pg_proc", 1255, "proowner", "proacl"),
             ("pg_type", 1247, "typowner", "typacl"),
@@ -521,6 +563,26 @@ impl PgHandler {
                 continue;
             };
             let acl_f = cdef.field_of(acl_col);
+            // The standalone composite types' oids: a row type with a
+            // relation of its own kind `c`.
+            let standalone: HashSet<i64> = if catalog == "pg_type" {
+                self.virtual_rows("pg_class", &Document::new())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|r| {
+                        Self::virtual_table("pg_class")
+                            .and_then(|d| d.field_of("relkind"))
+                            .is_some_and(|k| r.get_str(&k) == Ok("c"))
+                    })
+                    .filter_map(|r| {
+                        Self::virtual_table("pg_class")
+                            .and_then(|d| d.field_of("reltype"))
+                            .and_then(|k| r.get(&k).and_then(crate::bson_i64))
+                    })
+                    .collect()
+            } else {
+                HashSet::new()
+            };
             for r in self
                 .virtual_rows(catalog, &Document::new())
                 .unwrap_or_default()
@@ -534,6 +596,28 @@ impl PgHandler {
                     continue;
                 };
                 if oid < 16384 {
+                    continue;
+                }
+                // What `recordDependencyOnOwner` is never called for: an
+                // index and a composite type's relation (their owner is
+                // the table's, the type's), a relation's row type and an
+                // array type (`isDependentType`).
+                let text = |k: &str| {
+                    cdef.field_of(k)
+                        .and_then(|f| r.get_str(&f).ok().map(str::to_string))
+                        .unwrap_or_default()
+                };
+                let dependent = match catalog {
+                    "pg_class" => matches!(text("relkind").as_str(), "i" | "I" | "c"),
+                    "pg_type" => {
+                        let field_int =
+                            |k: &str| cdef.field_of(k).and_then(|f| int(&f)).unwrap_or(0);
+                        let array = field_int("typelem") != 0 && text("typname").starts_with('_');
+                        array || (field_int("typrelid") != 0 && !standalone.contains(&oid))
+                    }
+                    _ => false,
+                };
+                if dependent {
                     continue;
                 }
                 let mut named: Vec<i64> = Vec::new();

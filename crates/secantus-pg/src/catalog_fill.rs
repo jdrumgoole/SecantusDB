@@ -230,6 +230,34 @@ impl PgHandler {
             .collect()
     }
 
+    /// Every user relation's `(oid, name, owner oid)`, as `pg_class` lists
+    /// them.
+    pub(crate) fn relation_owners(&self) -> Vec<(i64, String, i64)> {
+        let Some(def) = Self::virtual_table("pg_class") else {
+            return Vec::new();
+        };
+        let (Some(oid_f), Some(name_f), Some(owner_f)) = (
+            def.field_of("oid"),
+            def.field_of("relname"),
+            def.field_of("relowner"),
+        ) else {
+            return Vec::new();
+        };
+        self.virtual_rows("pg_class", &Document::new())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| {
+                let oid = r.get(&oid_f).and_then(crate::bson_i64)?;
+                (oid >= 16384).then_some(())?;
+                Some((
+                    oid,
+                    r.get_str(&name_f).ok()?.to_string(),
+                    r.get(&owner_f).and_then(crate::bson_i64)?,
+                ))
+            })
+            .collect()
+    }
+
     /// `pg_depend`'s rows between relations, as PostgreSQL records them for
     /// user objects (pg_dump reads them to know which sequence a column
     /// owns):
@@ -998,6 +1026,12 @@ impl PgHandler {
         } else {
             Vec::new()
         };
+        // Every user relation's `(oid, name, owner)`, for the row types'.
+        let rel_owners: Vec<(i64, String, i64)> = if name == "pg_type" {
+            self.relation_owners()
+        } else {
+            Vec::new()
+        };
         // Per index: each key's type oid and whether it sorts DESC.
         let index_keys: Vec<(i64, Vec<(i64, bool)>)> = if name == "pg_index" {
             self.index_relations()
@@ -1350,13 +1384,32 @@ impl PgHandler {
                     ("pg_type", "typisdefined") => Bson::Boolean(true),
                     ("pg_type", "typndims") => Bson::Int32(0),
                     ("pg_type", "typacl") => Bson::Null,
+                    // A type's own owner; a relation's row type is the
+                    // relation's owner's, an array type its element's.
                     ("pg_type", "typowner") => {
-                        let name = text(get(row, "typname"));
+                        let mut name = text(get(row, "typname"));
+                        let mut relid = int(get(row, "typrelid"));
+                        if int(get(row, "typelem")) != 0 {
+                            if let Some(element) = name.strip_prefix('_') {
+                                name = element.to_string();
+                                relid = rel_owners
+                                    .iter()
+                                    .find(|(_, n, _)| *n == name)
+                                    .map_or(0, |(o, _, _)| *o);
+                            }
+                        }
                         Bson::Int64(
                             type_owners
                                 .iter()
                                 .find(|(n, _)| *n == name)
-                                .map_or(10, |(_, o)| *o),
+                                .map(|(_, o)| *o)
+                                .or_else(|| {
+                                    rel_owners
+                                        .iter()
+                                        .find(|(o, _, _)| relid != 0 && *o == relid)
+                                        .map(|(_, _, owner)| *owner)
+                                })
+                                .unwrap_or(10),
                         )
                     }
                     ("pg_type", c) if crate::pg_type_facts::COLUMNS.contains(&c) => {
