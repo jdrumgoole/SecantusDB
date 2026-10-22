@@ -317,27 +317,17 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 ));
             }
         }
-        // mongod folds a wholly constant output expression while it
-        // optimizes, so one that fails is refused before a document is read,
-        // over an empty collection too: `{$switch: {branches: [{case: false,
-        // then: 1}]}}` is 40069 (RM-242).
-        for key in ["$project", "$addFields", "$set"] {
-            let Some(Bson::Document(spec)) = stage.get(key) else {
-                continue;
-            };
-            // An error the evaluator marks per-document is not mongod's to
-            // raise while optimizing, constant arguments or not.
-            let fault = spec
-                .values()
-                .filter_map(secantus_core::expr_rewrite::constant_expr_fault)
-                .find(|f| f.folded_verdict() != Some(false));
-            if let Some((code, msg)) = fault.as_ref().and_then(|f| f.as_mongo()) {
-                return Err(CommandError::new(
-                    code,
-                    crate::util::error_code_name(code),
-                    format!("Failed to optimize pipeline :: caused by :: {msg}"),
-                ));
-            }
+        // mongod folds every constant sub-expression while it optimizes, so
+        // one that fails is refused before a document is read, over an empty
+        // collection too: `{$switch: {branches: [{case: false, then: 1}]}}`
+        // is 40069 (RM-242), `{$cond: [true, 1, {$divide: [1, 0]}]}` is 2
+        // (RM-251).
+        if let Some((code, msg)) = stage_fold_error(stage) {
+            return Err(CommandError::new(
+                code,
+                crate::util::error_code_name(code),
+                format!("Failed to optimize pipeline :: caused by :: {msg}"),
+            ));
         }
     }
 
@@ -2049,7 +2039,29 @@ fn apply_storage_stage(
     bypass_validation: bool,
 ) -> Result<Vec<Document>, CommandError> {
     match name {
-        "$lookup" => apply_lookup(spec, docs, db, vars, storage, collation),
+        "$lookup" => {
+            // The pipeline is optimized for each outer document, so a constant
+            // sub-expression in it that fails is an executor error -- and none
+            // at all over no outer documents (mongod 8.2.11, 2026-10-22;
+            // RM-251).
+            let sub = spec
+                .and_then(Bson::as_document)
+                .and_then(|l| l.get("pipeline"));
+            if let (Some(sub), false) = (sub, docs.is_empty()) {
+                if let Some((code, msg)) = pipeline_fold_error(sub) {
+                    return Err(CommandError::new(
+                        code,
+                        crate::util::error_code_name(code),
+                        format!(
+                            "Executor error during aggregate command on namespace: {db}.{} :: \
+                             caused by :: Failed to optimize pipeline :: caused by :: {msg}",
+                            coll.unwrap_or_default()
+                        ),
+                    ));
+                }
+            }
+            apply_lookup(spec, docs, db, vars, storage, collation)
+        }
         "$graphLookup" => apply_graph_lookup(spec, docs, db, vars, storage),
         "$facet" => apply_facet(spec, docs, db, coll, vars, storage, collation),
         "$sample" => apply_sample(spec, docs),
@@ -5092,4 +5104,103 @@ mod geo_near_candidate_tests {
         // Too large for a polygon smaller than a hemisphere.
         assert!(disc_polygon(0.0, 0.0, 1.3).is_none());
     }
+}
+
+/// The error mongod raises optimizing one stage's expressions, as `(code,
+/// message)`: every expression the stage holds, folded bottom-up
+/// (`expr_rewrite::constant_expr_fault`), and the pipelines a `$facet` or
+/// `$unionWith` holds, whose own optimizer adds its own prefix (measured
+/// 8.2.11, 2026-10-22). A `$lookup`'s pipeline is optimized per outer
+/// document, at run time, so it is not checked here.
+fn stage_fold_error(stage: &bson::Document) -> Option<(i32, String)> {
+    let (name, spec) = stage.iter().next()?;
+    let nested = |pipeline: &Bson| {
+        pipeline_fold_error(pipeline).map(|(c, m)| {
+            (
+                c,
+                format!("Failed to optimize pipeline :: caused by :: {m}"),
+            )
+        })
+    };
+    let fault = match (name.as_str(), spec) {
+        ("$facet", Bson::Document(d)) => return d.values().find_map(nested),
+        ("$unionWith", Bson::Document(d)) => return d.get("pipeline").and_then(nested),
+        ("$project" | "$addFields" | "$set", Bson::Document(d)) => {
+            d.values().find_map(expression_fault)
+        }
+        ("$group", Bson::Document(d)) => d.iter().find_map(|(k, v)| {
+            if k == "_id" {
+                expression_fault(v)
+            } else {
+                accumulator_fault(v)
+            }
+        }),
+        ("$bucket" | "$bucketAuto", Bson::Document(d)) => d
+            .get("groupBy")
+            .and_then(expression_fault)
+            .or_else(|| match d.get("output") {
+                Some(Bson::Document(out)) => out.values().find_map(accumulator_fault),
+                _ => None,
+            }),
+        ("$setWindowFields", Bson::Document(d)) => d
+            .get("partitionBy")
+            .and_then(expression_fault)
+            .or_else(|| match d.get("output") {
+                Some(Bson::Document(out)) => out.values().find_map(accumulator_fault),
+                _ => None,
+            }),
+        ("$replaceRoot", Bson::Document(d)) => d.get("newRoot").and_then(expression_fault),
+        ("$redact" | "$sortByCount" | "$replaceWith", e) => expression_fault(e),
+        _ => None,
+    };
+    fault
+        .as_ref()
+        .and_then(|f| f.as_mongo())
+        .map(|(c, m)| (c, m.to_string()))
+}
+
+/// [`stage_fold_error`] over a whole pipeline, `$match` filters included:
+/// the first stage's error, without the optimizer's own prefix.
+fn pipeline_fold_error(pipeline: &Bson) -> Option<(i32, String)> {
+    let Bson::Array(stages) = pipeline else {
+        return None;
+    };
+    stages.iter().filter_map(Bson::as_document).find_map(|s| {
+        let in_filter = match s.get("$match") {
+            Some(Bson::Document(filter)) => {
+                secantus_core::expr_rewrite::constant_expr_error_in_filter(filter)
+            }
+            _ => None,
+        };
+        in_filter.or_else(|| stage_fold_error(s))
+    })
+}
+
+/// [`secantus_core::expr_rewrite::constant_expr_fault`], less an error the
+/// evaluator marks as per-document: that is not mongod's to raise while
+/// optimizing, constant arguments or not.
+fn expression_fault(e: &Bson) -> Option<secantus_core::fallback::Fallback> {
+    secantus_core::expr_rewrite::constant_expr_fault(e)
+        .filter(|f| f.folded_verdict() != Some(false))
+}
+
+/// The fault in an accumulator's ARGUMENTS (`{$sum: <expr>}`, `{$topN: {n,
+/// sortBy, output}}`, a window function beside its `window`): the
+/// accumulator itself is not an expression, and neither is a `sortBy` or a
+/// `window` spec.
+fn accumulator_fault(v: &Bson) -> Option<secantus_core::fallback::Fallback> {
+    let Bson::Document(d) = v else {
+        return None;
+    };
+    d.iter()
+        .filter(|(k, _)| k.as_str() != "window")
+        .find_map(|(_, arg)| match arg {
+            Bson::Document(named) if named.keys().next().is_some_and(|k| !k.starts_with('$')) => {
+                named
+                    .iter()
+                    .filter(|(k, _)| k.as_str() != "sortBy")
+                    .find_map(|(_, a)| expression_fault(a))
+            }
+            other => expression_fault(other),
+        })
 }

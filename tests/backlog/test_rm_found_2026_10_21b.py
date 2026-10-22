@@ -609,18 +609,85 @@ def test_date_arithmetic_arguments_and_range(rust_mongo: Any, mongod: Any) -> No
 # ------------------------------------------------- the remaining shapes --
 
 
-@pytest.mark.backlog("RM-251")
+@pytest.mark.backlog_fixed("RM-251")
 def test_constant_arguments_are_checked_while_optimizing(rust_mongo: Any, mongod: Any) -> None:
     """mongod evaluates every constant sub-expression when it optimizes the
-    pipeline, so an erroring constant fails even in a branch that is never
-    taken. The Rust server evaluates lazily and answers."""
+    pipeline, bottom-up, so an erroring constant fails even in a branch that
+    is never taken -- except where `$switch` stops at a constant truthy case
+    or skips a constant falsy one -- and in every stage that holds an
+    expression, a `find` projection and a `$lookup`'s pipeline included. The
+    Rust server evaluated lazily and answered."""
     shapes = [
         ("$cond untaken", {"$cond": [True, 1, {"$divide": [1, 0]}]}),
         ("$ifNull untaken", {"$ifNull": [1, {"$divide": [1, 0]}]}),
         ("$and short circuit", {"$and": [False, {"$divide": [1, 0]}]}),
         ("$map over empty", {"$map": {"input": [], "in": {"$divide": [1, 0]}}}),
+        ("$filter cond", {"$filter": {"input": "$arr", "cond": {"$divide": [1, 0]}}}),
+        ("$reduce in", {"$reduce": {"input": [], "initialValue": 0, "in": {"$divide": [1, 0]}}}),
+        ("$let unused var", {"$let": {"vars": {"x": {"$divide": [1, 0]}}, "in": 1}}),
+        (
+            "$switch after a true case",
+            {
+                "$switch": {
+                    "branches": [
+                        {"case": True, "then": 1},
+                        {"case": {"$divide": [1, 0]}, "then": 2},
+                    ]
+                }
+            },
+        ),
+        (
+            "$switch false case's then",
+            {"$switch": {"branches": [{"case": False, "then": {"$divide": [1, 0]}}], "default": 1}},
+        ),
+        (
+            "$switch default beside a true case",
+            {"$switch": {"branches": [{"case": True, "then": 1}], "default": {"$divide": [1, 0]}}},
+        ),
     ]
-    assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
+    diffs = _diverging(rust_mongo, mongod, shapes)
+    bad = {"$cond": [True, 1, {"$divide": [1, 0]}]}
+    stages = {
+        "$group _id": [{"$group": {"_id": bad}}],
+        "$group accumulator": [{"$group": {"_id": None, "s": {"$sum": bad}}}],
+        "$group $topN": [
+            {"$group": {"_id": None, "t": {"$topN": {"n": 1, "sortBy": {"n": 1}, "output": bad}}}}
+        ],
+        "$redact": [{"$redact": {"$cond": [bad, "$$KEEP", "$$PRUNE"]}}],
+        "$replaceRoot": [{"$replaceRoot": {"newRoot": {"a": bad}}}],
+        "$bucket": [{"$bucket": {"groupBy": bad, "boundaries": [0, 5]}}],
+        "$sortByCount": [{"$sortByCount": bad}],
+        "$setWindowFields": [
+            {
+                "$setWindowFields": {
+                    "sortBy": {"n": 1},
+                    "output": {
+                        "s": {"$sum": bad, "window": {"documents": ["unbounded", "current"]}}
+                    },
+                }
+            }
+        ],
+        "$facet": [{"$facet": {"a": [{"$project": {"z": bad}}]}}],
+        "$unionWith": [{"$unionWith": {"coll": "x", "pipeline": [{"$project": {"z": bad}}]}}],
+        "$lookup": [{"$lookup": {"from": "x", "pipeline": [{"$project": {"z": bad}}], "as": "j"}}],
+    }
+    for label, pipeline in stages.items():
+        answers = []
+        for client in (rust_mongo, mongod):
+            coll = _coll(client)
+            coll.drop()
+            coll.insert_many([{"_id": 1, "n": 2}, {"_id": 2, "n": 3}])
+            answers.append(mongo_answer(lambda: list(coll.aggregate(pipeline)))[:2])  # noqa: B023
+        if answers[0] != answers[1]:
+            diffs.append(f"{label}: mongod {answers[1]}, rust {answers[0]}")
+    answers = []
+    for client in (rust_mongo, mongod):
+        coll = _coll(client, "empty_for_projection")
+        coll.drop()
+        answers.append(mongo_answer(lambda: list(coll.find({}, {"z": bad})))[:2])  # noqa: B023
+    if answers[0] != answers[1]:
+        diffs.append(f"find projection: mongod {answers[1]}, rust {answers[0]}")
+    assert not diffs, "\n".join(diffs)
 
 
 @pytest.mark.backlog_fixed("RM-251")

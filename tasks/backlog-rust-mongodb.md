@@ -554,6 +554,8 @@ finds no difference on any of 601 names.
 A fourth batch closed RM-246 and RM-252 and part of RM-251, and filed and
 fixed RM-255 to RM-257 (in the harness, 63 wrong codes became 13); RM-258
 was filed open.
+RM-251 closed after it: constant sub-expressions are folded bottom-up in
+every stage, as mongod folds them.
 
 - [ ] **Decimal128 transcendentals beyond the authorised last digit.** Tiny
   operands underflow to 0 in `$sinh` / `$tanh` / `$atanh` (between 1E-75
@@ -562,13 +564,6 @@ was filed open.
   1E+34 are 2 "not supported" instead of Infinity / 1.
   Backlog-ID: RM-245
   Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_decimal_hyperbolic_and_trig_edges
-- [ ] **Constant sub-expressions are not evaluated while optimizing.** mongod
-  folds every constant sub-expression first, so `{$cond: [true, 1, {$divide:
-  [1, 0]}]}`, `$ifNull`, a short-circuited `$and` and `$map` over `[]` with
-  an erroring body all fail on mongod and answer here. (`$dateToString`
-  reading its `format` before the date was fixed on 2026-10-22.)
-  Backlog-ID: RM-251
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_constant_arguments_are_checked_while_optimizing
 - [ ] **`$dateFromString` of a five-digit year is ten seconds out.**
   `"10000-01-01"` is read by timelib as the no-colon time `1000` and the
   date `0-01-01`; mongod answers 2000-01-01T09:59:50Z and the Rust port of
