@@ -47,3 +47,54 @@ several values and row counts now match.
   42P03 and aborts the block. Fixes RP-089 (`::test_bind_to_an_existing_portal`).
 - `secantus-pgwire`: a missing unnamed portal is reported as `portal ""`.
   Fixes RP-091 (`::test_unknown_portal_error_names_it`).
+- `secantus-pg`: Bind checks its shape (parameter and result-format counts,
+  a cached plan whose result changed) and holds every binary parameter to
+  its type's receive function (`binary_recv.rs`), all before BindComplete.
+  Fixes RP-078 (`::test_bind_decodes_parameters`, `::test_bind_checks_its_shape`,
+  `::test_cached_plan_fails_at_bind`).
+- `secantus-pg`: binary reg* parameters are read through their oid cast and
+  regclass / regtype parameters keep their types. Fixes RP-083
+  (`::test_reg_parameters_render_as_text`).
+- `secantus-pgplan`: a view's columns name the view in RowDescription, and a
+  subquery's, a CTE's and a join's their base columns. Fixes RP-087
+  (`::test_view_columns_name_their_base_columns`).
+- `secantus-pgplan`, `secantus-pg`: `IntervalStyle` (all four styles, and the
+  default style's `+` after a negative part), `bytea_output = escape`,
+  `extra_float_digits` below 1, interval input `@ ... ago` and
+  `sql_standard`'s leading minus; `SET application_name` shows in
+  `pg_stat_activity`. Fixes RP-068
+  (`tests/backlog/test_rp_found_2026_10_20.py::test_output_settings`,
+  `tests/backlog/test_rp_found_pgtest.py::test_extra_float_digits_below_one`).
+- `secantus-pgplan`: recursive CTE `SEARCH DEPTH FIRST` / `BREADTH FIRST` and
+  `CYCLE`, rewritten as PostgreSQL's rewriter does; they were dropped and a
+  CYCLE never stopped. Fixes RP-062 (`::test_recursive_search_and_cycle`).
+- `secantus-pgplan`: a recursive CTE read under a plain `LIMIT` runs only as
+  far as it is read; UNION deduplication is linear; the invented
+  1,000,000-row 54000 is gone. Fixes RP-063 (`::test_recursive_cte_under_limit`).
+- `secantus-pg`: temporary tables' `ON COMMIT DELETE ROWS` and `ON COMMIT
+  DROP`, and 42P16 for ON COMMIT on a permanent table. Fixes RP-065
+  (`::test_temp_table_on_commit`).
+- `secantus-pgplan`: float8 overflow and underflow are 22003 in `+ - * /` and
+  in the numeric-to-float8 cast. Fixes RP-066 (`::test_float8_out_of_range`).
+- `secantus-pgplan`, `secantus-pg`: every COPY option PostgreSQL 15 takes --
+  DELIMITER, NULL, QUOTE, ESCAPE, FORCE_QUOTE, FORCE_NOT_NULL, FORCE_NULL,
+  FREEZE and ENCODING -- checked, written and read as PostgreSQL does. All
+  but FORMAT and HEADER were refused, DELIMITER and NULL included. Fixes
+  RP-073 (`::test_copy_options`).
+- `secantus-pgplan`, `secantus-pg`: named and defaulted arguments to the
+  built-ins (`pg_proc_argnames.tsv`, from PostgreSQL 15.19's `pg_proc`);
+  `pg_column_size` modelled on the datum layouts, for literals and stored
+  columns; `CASE` columns named `case` and rewritten expressions keeping
+  their names; `REFRESH ... CONCURRENTLY`'s refusals; the 42622
+  identifier-truncation NOTICE. Fixes RP-074 (`::test_smaller_answers`).
+- `secantus-pgplan`: a strict comparison with a NULL constant operand is NULL
+  before the statement runs, as `eval_const_expressions` folds it. Fixes
+  RP-075 (`tests/backlog/test_rp_found_2026_10_21.py::test_strict_null_folding`).
+- `secantus-pgplan`: NULLIF takes the left input type of the `=` operator
+  PostgreSQL resolves. Fixes RP-076 (`::test_nullif_result_type`).
+- `secantus-pg`: the duplicate check behind a new unique index or primary key
+  sorts the keys rather than comparing every pair: `pgbench -i -s 1` took
+  440 s (429 s of it the primary keys), now 20 s.
+
+More regression tests for these, past each item's gap test, are in
+`tests/backlog/test_rp_batch25.py`.

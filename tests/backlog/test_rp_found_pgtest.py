@@ -571,17 +571,17 @@ def _check(name: str, fn: Callable[[Connect], tuple], connect: Connect) -> None:
     assert fn(connect) == EXPECTED[name]
 
 
-@pytest.mark.backlog("RP-078")
+@pytest.mark.backlog_fixed("RP-078")
 def test_bind_decodes_parameters(wire: Connect) -> None:
     _check("bind_decodes_parameters", bind_decodes_parameters, wire)
 
 
-@pytest.mark.backlog("RP-078")
+@pytest.mark.backlog_fixed("RP-078")
 def test_bind_checks_its_shape(wire: Connect) -> None:
     _check("bind_checks_its_shape", bind_checks_its_shape, wire)
 
 
-@pytest.mark.backlog("RP-078")
+@pytest.mark.backlog_fixed("RP-078")
 def test_cached_plan_fails_at_bind(wire: Connect) -> None:
     _check("cached_plan_fails_at_bind", cached_plan_fails_at_bind, wire)
 
@@ -622,12 +622,12 @@ def test_fixed_length_types_report_their_size(wire: Connect) -> None:
     _check("fixed_length_types_report_their_size", fixed_length_types_report_their_size, wire)
 
 
-@pytest.mark.backlog("RP-083")
+@pytest.mark.backlog_fixed("RP-083")
 def test_reg_parameters_render_as_text(wire: Connect) -> None:
     _check("reg_parameters_render_as_text", reg_parameters_render_as_text, wire)
 
 
-@pytest.mark.backlog("RP-068")
+@pytest.mark.backlog_fixed("RP-068")
 def test_extra_float_digits_below_one(wire: Connect) -> None:
     _check("extra_float_digits_below_one", extra_float_digits_below_one, wire)
 
@@ -647,7 +647,7 @@ def test_copy_header_is_not_a_row(wire: Connect) -> None:
     _check("copy_header_is_not_a_row", copy_header_is_not_a_row, wire)
 
 
-@pytest.mark.backlog("RP-087")
+@pytest.mark.backlog_fixed("RP-087")
 def test_view_columns_name_their_base_columns(wire: Connect) -> None:
     _check("view_columns_name_their_base_columns", view_columns_name_their_base_columns, wire)
 

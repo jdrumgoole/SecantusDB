@@ -460,13 +460,13 @@ def test_serializable_write_skew(rust_pg: Any) -> None:
     _check("serializable_write_skew", rust_pg)
 
 
-@pytest.mark.backlog("RP-062")
+@pytest.mark.backlog_fixed("RP-062")
 def test_recursive_search_and_cycle(rust_pg: Any) -> None:
     """PostgreSQL 15.19 adds the SEARCH column and stops a CYCLE."""
     _check("search_and_cycle", rust_pg)
 
 
-@pytest.mark.backlog("RP-063")
+@pytest.mark.backlog_fixed("RP-063")
 def test_recursive_cte_under_limit(rust_pg: Any) -> None:
     """PostgreSQL 15.19 answers an unbounded recursion under LIMIT 3 at once."""
     _check("recursive_with_limit", rust_pg)
@@ -479,14 +479,14 @@ def test_create_database_options(rust_pg: Any) -> None:
     _check("create_database_options", rust_pg)
 
 
-@pytest.mark.backlog("RP-065")
+@pytest.mark.backlog_fixed("RP-065")
 def test_temp_table_on_commit(rust_pg: Any) -> None:
     """PostgreSQL 15.19 empties an ON COMMIT DELETE ROWS table and drops an
     ON COMMIT DROP one at commit."""
     _check("temp_on_commit", rust_pg)
 
 
-@pytest.mark.backlog("RP-066")
+@pytest.mark.backlog_fixed("RP-066")
 def test_float8_out_of_range(rust_pg: Any) -> None:
     """PostgreSQL 15.19 raises 22003 for float8 overflow and underflow, in
     arithmetic and in a numeric -> float8 cast."""
@@ -500,7 +500,7 @@ def test_default_privileges_and_connection_limit(rust_pg: Any) -> None:
     _check("default_privileges_and_limits", rust_pg)
 
 
-@pytest.mark.backlog("RP-068")
+@pytest.mark.backlog_fixed("RP-068")
 def test_output_settings(rust_pg: Any) -> None:
     """PostgreSQL 15.19 honours IntervalStyle, bytea_output and
     extra_float_digits, and shows application_name in pg_stat_activity."""
@@ -533,14 +533,14 @@ def test_statements_not_refused(rust_pg: Any) -> None:
     _check("refused_statements", rust_pg)
 
 
-@pytest.mark.backlog("RP-073")
+@pytest.mark.backlog_fixed("RP-073")
 def test_copy_options(rust_pg: Any) -> None:
     """PostgreSQL 15.19 takes FORCE_QUOTE, FORCE_NOT_NULL, FORCE_NULL and
     FREEZE."""
     _check("copy_options", rust_pg)
 
 
-@pytest.mark.backlog("RP-074")
+@pytest.mark.backlog_fixed("RP-074")
 def test_smaller_answers(rust_pg: Any) -> None:
     """PostgreSQL 15.19: named arguments to a built-in, its result column
     names, pg_column_size, and REFRESH ... CONCURRENTLY without a unique

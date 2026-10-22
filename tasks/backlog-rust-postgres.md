@@ -729,31 +729,6 @@ Not filed:
       above is a different question.
       Backlog-ID: RP-061
       Verify: tests/backlog/test_rp_found_2026_10_20.py::test_serializable_write_skew
-- [ ] **Recursive CTE `SEARCH` and `CYCLE` clauses are parsed and
-      dropped.** `secantus-pgplan` never reads the parse tree's
-      `search_clause` or `cycle_clause`:
-      - `SEARCH DEPTH FIRST BY n SET ord` leaves no `ord` column (42703
-        when selected).
-      - `CYCLE n SET is_cycle USING path` does not stop the recursion; it
-        runs until `statement_timeout` (57014) or the row cap, where
-        PostgreSQL 15.19 returns 3 rows.
-
-      Until they are implemented, both must be refused by name (0A000)
-      rather than ignored.
-      Backlog-ID: RP-062
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_recursive_search_and_cycle
-- [ ] **A recursive CTE is run to completion before anything above it.**
-      `with recursive t(n) as (select 1 union all select n + 1 from t)
-      select n from t limit 3` never returns here (57014 at a 5 s timeout);
-      PostgreSQL 15.19 answers at once, because a CTE scan pulls only the
-      rows asked for. Related, and not covered by the test:
-      - `RECURSIVE_CTE_ROW_LIMIT` (1,000,000) is an invented 54000 that
-        PostgreSQL does not have.
-      - `UNION` deduplication is a quadratic `Vec::contains`: a
-        20,000-step UNION recursion took 10.6 s against PostgreSQL's
-        0.04 s (debug build).
-      Backlog-ID: RP-063
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_recursive_cte_under_limit
 - [ ] **`CREATE DATABASE` drops every option.**
       `Statement::CreateDatabase { name }` keeps only the name:
       - `TEMPLATE tsrc` gives an EMPTY database (its table is 42P01).
@@ -764,24 +739,6 @@ Not filed:
       `ALTER DATABASE` is refused outright.
       Backlog-ID: RP-064
       Verify: tests/backlog/test_rp_found_2026_10_20.py::test_create_database_options
-- [ ] **Temporary tables ignore `ON COMMIT`.** A row in an `ON COMMIT
-      DELETE ROWS` table is still there after COMMIT (count 1; PostgreSQL
-      15.19: 0), and an `ON COMMIT DROP` table outlives its transaction.
-      `oncommit` is read nowhere in the PG crates.
-      Backlog-ID: RP-065
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_temp_table_on_commit
-- [ ] **float8 overflow and underflow return Infinity or 0.**
-      PostgreSQL 15.19 raises 22003 for:
-      - `'1e308'::float8 * 10` and `+`;
-      - `col * 10` over a stored 1e308;
-      - `'1e-300'::float8 * '1e-300'::float8`;
-      - `1e400::numeric::float8` and `1e-400::numeric::float8`.
-
-      Every one succeeds here. `sum()` already raises 22003; the scalar
-      operators and the cast lack PostgreSQL's `float_overflow_error` /
-      `float_underflow_error` checks.
-      Backlog-ID: RP-066
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_float8_out_of_range
 - [ ] **`ALTER DEFAULT PRIVILEGES` does nothing, and a role's `CONNECTION
       LIMIT` is not enforced.** `secantus-pgplan` accepts the statement
       as a no-op ("single-user test server"), but GRANT and row-level
@@ -792,23 +749,6 @@ Not filed:
       Both are permission answers that are silently wrong.
       Backlog-ID: RP-067
       Verify: tests/backlog/test_rp_found_2026_10_20.py::test_default_privileges_and_connection_limit
-- [ ] **Output settings are accepted and ignored.** PostgreSQL 15.19 and
-      this server answer differently:
-
-      | setting | PostgreSQL 15.19 | here |
-      | --- | --- | --- |
-      | `IntervalStyle = iso_8601` | `P1DT2H` | `1 day 02:00:00` |
-      | `bytea_output = escape` | `A\377` | `\x41ff` |
-      | `extra_float_digits = 0` | `0.3` | `0.30000000000000004` |
-
-      Below 1, PostgreSQL rounds to `FLT_DIG` / `DBL_DIG` plus the setting:
-      at -1, `(1/3.0)::float4` is `0.33333` and `::float8`
-      `0.33333333333333`; at -15 both are `0.3`. Here the output is always
-      the shortest exact form, the answer for 1 and above (pgtest
-      `float:108`, 2026-10-21).
-      | `application_name` in `pg_stat_activity` | the set name | empty |
-      Backlog-ID: RP-068
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_output_settings, tests/backlog/test_rp_found_pgtest.py::test_extra_float_digits_below_one
 - [ ] **System columns are missing.** `ctid`, `xmin`, `xmax`, `cmin` and
       `cmax` are 42703 (`tableoid` works). That breaks EF Core / Npgsql's
       `xmin` concurrency token, the `delete ... where ctid = ...`
@@ -866,134 +806,6 @@ Not filed:
       surveys listed" is refused no longer held.
       Backlog-ID: RP-072
       Verify: tests/backlog/test_rp_found_2026_10_20.py::test_statements_not_refused
-- [ ] **COPY refuses `FORCE_QUOTE`, `FORCE_NOT_NULL`, `FORCE_NULL` and
-      `FREEZE`** (0A000, `secantus-pgplan`). PostgreSQL 15.19 takes all
-      four, and `pgbench -i` uses `FREEZE`.
-      Backlog-ID: RP-073
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_copy_options
-- [ ] **Smaller wrong answers.**
-      - Named arguments to a built-in fail: `make_interval(days => 1)` is
-        42883.
-      - Result column names: an inet `>>` is named `__net_op`, an internal
-        name leaking, where PostgreSQL says `?column?`; a `CASE` is
-        `?column?` where it says `case`; `xmlagg` is named `string_agg`.
-      - `pg_column_size` answers 4, 6, 8, 4 for text, a row, an int array
-        and a numeric, where PostgreSQL 15.19 answers 7, 32, 36, 10.
-      - `REFRESH MATERIALIZED VIEW CONCURRENTLY` on a view with no unique
-        index is accepted; PostgreSQL refuses it (55000).
-
-      Not in the test:
-      - the 63-byte identifier-truncation NOTICE is missing;
-      - an unavailable extension's error DETAIL cites a `/postgresql/16/`
-        path on a server that reports 15.0.
-      Backlog-ID: RP-074
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_smaller_answers
-
-## Found by the weekly SQL gauges
-
-Found by the first run of the weekly SQL gauges against `secantusd-pg`
-(`validate.yml`, 2026-10-21). Each was reproduced against a `secantusd-pg`
-built from the run's tree and against a PRIVATE PostgreSQL 15.19 cluster
-(`initdb --locale=C -E UTF8`). The gap tests are in
-`tests/backlog/test_rp_found_2026_10_21.py`.
-
-Not filed: PostgreSQL 15.19 itself fails 9 of the gauge's 30 files, on
-SQLite-only behaviour the corpus expects, and they are recorded as expected
-divergences in `slt_validation/include_paths.py`. The Rust server fails the
-same 9, and stops at the same statement as PostgreSQL in 8 of them; the
-ninth, `random/expr/slt_good_0.test`, is RP-076. Because a file stops at its
-first failure, the rest of each of those 9 files is measured by neither
-server.
-
-- [ ] **A strict operator with a NULL constant argument is evaluated row by
-      row instead of folding to NULL, so `c / 0 = NULL` raises.** On a table
-      with rows, `select count(*) from t where c / 0 = NULL` is 22012
-      `division by zero` here. PostgreSQL 15.19 returns 0: its planner folds
-      a strict operator or function that has a NULL constant argument to NULL
-      before execution (`eval_const_expressions`), so the plan is
-      `One-Time Filter: false` and the division never runs. The same holds
-      for `NULL = c / 0`, `c / 0 + NULL > 1`, the comparison in a select
-      list, and under `AND` / `OR`. A non-strict test (`c / 0 IS NULL`) and a
-      comparison with a column (`c / 0 = d`) still raise 22012 on PostgreSQL,
-      so the fix is the folding rule, not tolerating the error. Found by
-      `random/aggregates/slt_good_1.test:66475`
-      (`WHERE ( + col1 ) / - + 0 = NULL`), the sqllogictest gauge's one
-      unexpected failure that PostgreSQL passes.
-      Backlog-ID: RP-075
-      Verify: tests/backlog/test_rp_found_2026_10_21.py::test_strict_null_folding
-- [ ] **`NULLIF` takes its first argument's type even when PostgreSQL
-      coerces it, so `nullif(53, 80::numeric) / -71` is integer division.**
-      Here `pg_typeof(nullif(53, 80::numeric))` is `integer` and the
-      division returns `0`. PostgreSQL 15.19 gives NULLIF the left input type
-      of the `=` operator it resolves: `int = numeric` resolves to
-      `numeric = numeric`, so the result is `numeric` and the division is
-      `-0.74647887323943661972`. The same for `nullif(53, 80.5)` (numeric)
-      and `nullif(1, 2::float8)` (double precision). The rule is the
-      operator's input type, not promotion: `nullif(1::int2, 2::int8)` stays
-      `smallint` on PostgreSQL, through the cross-type `int28eq`, and the
-      Rust server already agrees there. A silent wrong answer. Found by
-      `random/expr/slt_good_0.test:45345`, where PostgreSQL stops on the
-      corpus's SQLite answer `0` and the Rust server, giving that same wrong
-      answer, runs on to line 62223. The file is an expected divergence, so
-      this showed up only as a different stop point.
-      Backlog-ID: RP-076
-      Verify: tests/backlog/test_rp_found_2026_10_21.py::test_nullif_result_type
-
-Found by the first pgtest run against `secantusd-pg` (CockroachDB's
-`pkg/sql/pgwire/testdata/pgtest` corpus, 2026-10-21). The corpus was also
-run, file by file, against a private PostgreSQL 15.19 cluster: it passes 33
-of the 57 files and the Rust server 13. The Rust server fails every file
-PostgreSQL fails, and 20 more; each item below is the first stanza of one of
-those 20 (or of a file where the Rust server stops EARLIER than PostgreSQL),
-reproduced with a raw-protocol probe. The gap tests are in
-`tests/backlog/test_rp_found_pgtest.py`, over the raw client in
-`tests/backlog/pgwire_raw.py`. `float:108` (`extra_float_digits` below 1)
-is RP-068 above. `tuple:36` is not filed: it is `COLLATE "en_US"`, the
-libc-collations scope decision above.
-
-- [ ] **Bind checks nothing: a malformed parameter, a wrong parameter count
-      and a stale cached plan all get BindComplete.** PostgreSQL 15.19
-      decodes every parameter, and checks the message against the
-      statement, while it processes Bind, so the error replaces
-      BindComplete and needs no Execute to surface. Here Bind always
-      answers BindComplete, and then:
-      - a malformed binary parameter (`$1::interval[]`, an empty `inet`,
-        `jsonb` or `varbit`) is never reported at all when no Execute
-        follows (08P01 on PostgreSQL);
-      - a numeric whose digit is out of range (0xFFF0) is 22003 at Execute,
-        not 22P03 at Bind, and a `json[]` whose element type is not json
-        runs and returns `{}` (42804 on PostgreSQL);
-      - binding one parameter to a statement declared with three runs the
-        statement and returns a row (08P01 on PostgreSQL), and six result
-        format codes for three columns is 08P01 only after BindComplete;
-      - re-binding a prepared `SELECT *` after `ALTER TABLE ... DROP
-        COLUMN` sends BindComplete before 0A000 `cached plan must not change
-        result type`.
-      A client that pipelines Bind before Execute sees a portal that was
-      never valid. Found by pgtest `array:8`, `inet:8`, `json:8`,
-      `varbit:8`, `decimal:121`, `json_array:246`, `prepare:23`,
-      `errors:95` and `prepared_stmt_invalidation:87`.
-      Backlog-ID: RP-078
-      Verify: tests/backlog/test_rp_found_pgtest.py::test_bind_decodes_parameters, tests/backlog/test_rp_found_pgtest.py::test_bind_checks_its_shape, tests/backlog/test_rp_found_pgtest.py::test_cached_plan_fails_at_bind
-- [ ] **A binary regclass or regtype parameter comes back as raw binary in
-      a TEXT result, typed `text`.** `SELECT $1, $2, $3, $4, $5` with
-      parameters declared `regclass, regnamespace, regproc, regtype, oid`,
-      bound in binary, and a text-format result: PostgreSQL 15.19 describes
-      the five columns with those types and returns `16777257`,
-      `16777258`, ... as text. Here `regclass` and `regtype` are described
-      as `text`, and the first four values are the parameters' four binary
-      bytes, sent in a column the client was told is text. A silent wrong
-      answer. Found by pgtest `oid:10`.
-      Backlog-ID: RP-083
-      Verify: tests/backlog/test_rp_found_pgtest.py::test_reg_parameters_render_as_text
-- [ ] **A view's columns report attribute number 0 in RowDescription.**
-      For a simple view over a join, PostgreSQL 15.19 names each column's
-      base table column (table OID and attnum; the test checks the attnum,
-      1 and 2). Here both are 0, as for a computed column, so a client
-      cannot trace a view column to its table. Found by pgtest
-      `row_description:125`; PostgreSQL stops at `:380`.
-      Backlog-ID: RP-087
-      Verify: tests/backlog/test_rp_found_pgtest.py::test_view_columns_name_their_base_columns
 
 ## Found by the corpus test (2026-10-21)
 
