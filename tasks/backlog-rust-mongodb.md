@@ -545,38 +545,10 @@ which moved the index-entry format to 5, and MinKey / MaxKey equality
 (RM-234) and field order in document equality (RM-235). On 2026-10-22 a
 second batch took the "not supported" refusals out of the expression engine
 (in the harness, 207 refusals became 3) and closed RM-238, RM-240,
-RM-241, RM-242, RM-247 and RM-250, and parts of RM-246 and RM-252.
+RM-241, RM-242, RM-247 and RM-250, and parts of RM-246 and RM-252. A third
+batch the same day closed the silent wrong values RM-236, RM-237, RM-239,
+RM-243, RM-244 and RM-248 (in the harness, 98 wrong values became 34).
 
-- [ ] **Regex `\w`, `\d`, `\s` and `\b` match Unicode characters.** mongod's
-  PCRE matches them against ASCII only, with or without the `u` flag, in
-  `$regexMatch` / `$regexFind` and in a `find` `$regex`: `^\w$` matches "é"
-  here and not on mongod.
-  Backlog-ID: RM-236
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_regex_classes_are_ascii
-- [ ] **`$regexFindAll` adds an empty match at the end of the string.** An
-  empty-matching pattern over "abc" is 3 matches on mongod and 4 here.
-  Backlog-ID: RM-237
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_regex_find_all_has_no_trailing_empty_match
-- [ ] **`$filter`'s `limit` is mis-read.** An integral double or Decimal128
-  limit is ignored (all elements); zero, negatives and `true` return one
-  element where mongod answers 327392 / 327391; a string, NaN or fraction
-  returns everything.
-  Backlog-ID: RM-239
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_filter_limit
-- [ ] **`$round` / `$trunc` of a double round its decimal text.** The code
-  computes `(x * 10^p).round() / 10^p`; mongod rounds the exact binary value
-  (`$round: [2.675, 2]` is 2.67, `$trunc: [1.45, 2]` 1.44), so the two also
-  differ at large magnitudes, and `$round: [1e300, 10]` is Infinity here.
-  Also measured: a NaN place (51082 vs 31109), a null value with an
-  out-of-range place (null vs 51083), and `$round: [-2147483648, -1]`, which
-  mongod 8.2.11 on macOS answers as int32 2147483646 (it wraps).
-  Backlog-ID: RM-243
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_round_and_trunc_of_doubles
-- [ ] **`$pow` of 1 or -1 to a negative integer is a double.** mongod keeps
-  the base's integer type (`{$pow: [1, -5]}` is int32 1); the code falls
-  through to `powf`.
-  Backlog-ID: RM-244
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_pow_of_one_with_negative_exponent_stays_integral
 - [ ] **Decimal128 transcendentals beyond the authorised last digit.** Tiny
   operands underflow to 0 in `$sinh` / `$tanh` / `$atanh` (between 1E-75
   and 1E-80); results lose mongod's 34-digit form and a zero's exponent;
@@ -590,13 +562,6 @@ RM-241, RM-242, RM-247 and RM-250, and parts of RM-246 and RM-252.
   shapes and a missing `onError` value were fixed on 2026-10-22.)
   Backlog-ID: RM-246
   Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_convert
-- [ ] **Local times at a daylight-saving change.** A time that happens twice
-  is the later (standard-time) instant on mongod and the earlier one here
-  (`.earliest()` in `named_local_to_utc_ms`); a time that never happens uses
-  the offset before the change on mongod and is 40485 "unrecognized time
-  zone identifier" here, in `$dateFromParts`, `$dateAdd` and `$dateTrunc`.
-  Backlog-ID: RM-248
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_local_times_at_daylight_saving_changes
 - [ ] **Time-zone rules far from now differ from mongod's.** No daylight
   saving from 2100 on (New York, London, Dublin, Sydney), and historical
   zones folded into their links (Amsterdam 1900 is +0019 on mongod and

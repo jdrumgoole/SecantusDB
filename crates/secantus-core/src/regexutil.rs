@@ -76,23 +76,51 @@ impl CompiledRegex {
         }
     }
 
-    /// All non-overlapping matches left-to-right (Python `re.finditer`). `Err(())`
-    /// → defer (a backtrack-limit error from the fancy engine).
+    /// Every match left to right, as mongod's `$regexFindAll` scans: the next
+    /// search starts where a match ended, or one character on after an empty
+    /// one, and the scan stops once that start reaches the end of the string.
+    /// So an empty-matching pattern finds one match per character and none at
+    /// the end ("abc" with "" is 3), an empty string still gets its one
+    /// match, and an empty match straight after a non-empty one counts (`a*`
+    /// over "abc" is "a", "", ""; measured 8.2.11, 2026-10-22). The engines'
+    /// own iterators differ at both ends. `Err(())` → defer (a backtrack-limit
+    /// error from the fancy engine).
     pub(crate) fn find_all(&self, s: &str) -> Result<Vec<RegexMatch>, ()> {
-        match self {
-            CompiledRegex::Literal(lit) => Ok(s
-                .match_indices(lit.as_str())
-                .map(|(at, _)| literal_match(s, lit, at))
-                .collect()),
-            CompiledRegex::Linear(re) => Ok(re.captures_iter(s).map(|c| to_match(s, &c)).collect()),
-            CompiledRegex::Fancy(re) => {
-                let mut out = Vec::new();
-                for caps in re.captures_iter(s) {
-                    out.push(to_match_fancy(s, &caps.map_err(|_| ())?));
-                }
-                Ok(out)
+        let mut out = Vec::new();
+        let mut pos = 0;
+        loop {
+            let found = match self {
+                CompiledRegex::Literal(lit) => s[pos..].find(lit.as_str()).map(|at| {
+                    let at = pos + at;
+                    (at, at + lit.len(), literal_match(s, lit, at))
+                }),
+                CompiledRegex::Linear(re) => re.captures_at(s, pos).map(|c| {
+                    let whole = c.get(0).unwrap();
+                    (whole.start(), whole.end(), to_match(s, &c))
+                }),
+                CompiledRegex::Fancy(re) => match re.captures_from_pos(s, pos) {
+                    Ok(Some(c)) => {
+                        let whole = c.get(0).unwrap();
+                        Some((whole.start(), whole.end(), to_match_fancy(s, &c)))
+                    }
+                    Ok(None) => None,
+                    Err(_) => return Err(()),
+                },
+            };
+            let Some((start, end, m)) = found else {
+                break;
+            };
+            out.push(m);
+            pos = if end > start {
+                end
+            } else {
+                start + s[start..].chars().next().map_or(1, char::len_utf8)
+            };
+            if pos >= s.len() {
+                break;
             }
         }
+        Ok(out)
     }
 }
 
@@ -174,12 +202,11 @@ pub(crate) fn compile(pattern: &Bson, options: Option<&Bson>) -> Result<Compiled
     if plain_literal(pat, ci, ext) {
         return Ok(CompiledRegex::Literal(pat.to_string()));
     }
-    let rewritten = pcre_end_anchors(pat, ml);
-    let pat: &str = rewritten.as_deref().unwrap_or(pat);
-    // Fast path: the linear engine handles almost every pattern -- but not a
-    // rewritten one, which needs lookahead.
-    if rewritten.is_none() {
-        if let Ok(re) = RegexBuilder::new(pat)
+    // Fast path: the linear engine handles almost every pattern -- but not one
+    // whose end anchor was spelled out, which needs lookahead.
+    let linear = pcre_rewrite(pat, ml, Boundary::Linear);
+    if !linear.needs_lookaround {
+        if let Ok(re) = RegexBuilder::new(&linear.pattern)
             .case_insensitive(ci)
             .multi_line(ml)
             .dot_matches_new_line(dotall)
@@ -191,6 +218,7 @@ pub(crate) fn compile(pattern: &Bson, options: Option<&Bson>) -> Result<Compiled
     }
     // Fallback: lookaround / backreferences via the backtracking engine. Flags
     // ride an inline group prefix since fancy-regex has no builder-flag API.
+    let pat = pcre_rewrite(pat, ml, Boundary::Lookaround).pattern;
     let mut flagstr = String::new();
     for (on, ch) in [(ci, 'i'), (ml, 'm'), (dotall, 's'), (ext, 'x')] {
         if on {
@@ -198,7 +226,7 @@ pub(crate) fn compile(pattern: &Bson, options: Option<&Bson>) -> Result<Compiled
         }
     }
     let full = if flagstr.is_empty() {
-        pat.to_string()
+        pat
     } else {
         format!("(?{flagstr}){pat}")
     };
@@ -374,20 +402,50 @@ pub(crate) fn pcre_compile_error(pat: &str) -> Option<String> {
     (depth > 0).then(|| "missing closing parenthesis".to_string())
 }
 
-/// PCRE's lookahead-free spelling of `$` and `\Z`, for a pattern that uses
-/// them -- `None` when it uses neither.
+/// PCRE's ASCII word characters, closed to case folding: under `i` the
+/// `regex` crate folds `k` and `s` to the Kelvin sign and the long s, which
+/// PCRE's `\w` never matches (mongod 8.2.11, 2026-10-22).
+const WORD: &str = "(?-i:[0-9A-Za-z_])";
+const NON_WORD: &str = "(?-i:[^0-9A-Za-z_])";
+/// PCRE2's `\s`: space, tab, LF, VT, FF and CR -- not NBSP or U+0085.
+const SPACE: &str = r"\t\n\x0B\x0C\r\x20";
+
+/// How a rewritten pattern spells `\b` and `\B`.
+#[derive(Clone, Copy, PartialEq)]
+enum Boundary {
+    /// The linear engine's ASCII boundary, `(?-u:\b)`.
+    Linear,
+    /// Lookarounds over [`WORD`], for the backtracking engine, which refuses
+    /// `(?-u:...)`.
+    Lookaround,
+}
+
+/// A pattern rewritten into PCRE's meaning for one engine.
+struct Rewritten {
+    pattern: String,
+    /// Whether it uses lookaround, which only the backtracking engine has.
+    needs_lookaround: bool,
+}
+
+/// The pattern with PCRE's meaning spelled out for the Rust engines.
 ///
-/// Outside multiline mode PCRE's `$` matches at the end of the subject OR
-/// before a newline that ends it; `\Z` always does. The `regex` crate's `$` is
-/// only the very end, so `{s: /foo$/}` missed `"foo\n"` and `$regexFind`
-/// reported no match, where mongod matches both (measured 8.2.11,
-/// 2026-09-30); `\Z` did not compile at all and the query was REFUSED. Both
-/// become `(?=\n?\z)`, which is PCRE's definition verbatim.
+/// **Character classes are ASCII.** mongod compiles with UTF but not UCP, so
+/// `\w`, `\d`, `\s` and `\b` match ASCII only, with or without the `u` flag:
+/// `^\w$` does not match "é", `^\d$` not an Arabic-Indic digit, `^\s$` not a
+/// no-break space (measured 8.2.11, 2026-10-22). The Rust engines' classes
+/// are Unicode, so each is replaced by its ASCII set, inside a bracket class
+/// too (`[\w]`; a negated one nests, `[^0-9]`).
 ///
-/// A `$` inside a character class is a literal and an escaped one is too. When
-/// multiline is on -- by option or by an inline `(?m)` anywhere -- `$` is left
-/// alone: the `regex` crate's multiline `$` is PCRE's.
-fn pcre_end_anchors(pat: &str, multiline: bool) -> Option<String> {
+/// **End anchors.** Outside multiline mode PCRE's `$` matches at the end of
+/// the subject OR before a newline that ends it; `\Z` always does. The
+/// `regex` crate's `$` is only the very end, so `{s: /foo$/}` missed
+/// `"foo\n"` and `$regexFind` reported no match, where mongod matches both
+/// (measured 8.2.11, 2026-09-30); `\Z` did not compile at all and the query
+/// was REFUSED. Both become `(?=\n?\z)`, which is PCRE's definition verbatim.
+/// A `$` inside a character class is a literal and an escaped one is too.
+/// When multiline is on -- by option or by an inline `(?m)` anywhere -- `$`
+/// is left alone: the `regex` crate's multiline `$` is PCRE's.
+fn pcre_rewrite(pat: &str, multiline: bool, boundary: Boundary) -> Rewritten {
     let inline_m = pat.match_indices("(?").any(|(i, _)| {
         pat[i + 2..]
             .chars()
@@ -397,7 +455,7 @@ fn pcre_end_anchors(pat: &str, multiline: bool) -> Option<String> {
     let rewrite_dollar = !multiline && !inline_m;
     const END: &str = "(?=\\n?\\z)";
     let mut out = String::with_capacity(pat.len() + 16);
-    let mut changed = false;
+    let mut needs_lookaround = false;
     let mut in_class = false;
     let mut chars = pat.chars().peekable();
     while let Some(c) = chars.next() {
@@ -405,7 +463,38 @@ fn pcre_end_anchors(pat: &str, multiline: bool) -> Option<String> {
             '\\' => match chars.next() {
                 Some('Z') if !in_class => {
                     out.push_str(END);
-                    changed = true;
+                    needs_lookaround = true;
+                }
+                Some(n @ ('b' | 'B')) if !in_class => match boundary {
+                    Boundary::Linear => {
+                        out.push_str(if n == 'b' { r"(?-u:\b)" } else { r"(?-u:\B)" })
+                    }
+                    Boundary::Lookaround => {
+                        let (at_word, at_other) = (format!("(?={WORD})"), format!("(?!{WORD})"));
+                        let (after_word, after_other) =
+                            (format!("(?<={WORD})"), format!("(?<!{WORD})"));
+                        out.push_str(&if n == 'b' {
+                            format!("(?:{after_word}{at_other}|{after_other}{at_word})")
+                        } else {
+                            format!("(?:{after_word}{at_word}|{after_other}{at_other})")
+                        });
+                        needs_lookaround = true;
+                    }
+                },
+                Some(n @ ('w' | 'W' | 'd' | 'D' | 's' | 'S')) => {
+                    let set = match n.to_ascii_lowercase() {
+                        'w' => "0-9A-Za-z_",
+                        'd' => "0-9",
+                        _ => SPACE,
+                    };
+                    let negated = n.is_ascii_uppercase();
+                    match (in_class, negated, n.to_ascii_lowercase()) {
+                        (false, false, 'w') => out.push_str(WORD),
+                        (false, true, 'w') => out.push_str(NON_WORD),
+                        (false, false, _) => out.push_str(&format!("[{set}]")),
+                        (false, true, _) | (true, true, _) => out.push_str(&format!("[^{set}]")),
+                        (true, false, _) => out.push_str(set),
+                    }
                 }
                 Some(n) => {
                     out.push('\\');
@@ -430,12 +519,15 @@ fn pcre_end_anchors(pat: &str, multiline: bool) -> Option<String> {
             }
             '$' if !in_class && rewrite_dollar => {
                 out.push_str(END);
-                changed = true;
+                needs_lookaround = true;
             }
             _ => out.push(c),
         }
     }
-    changed.then_some(out)
+    Rewritten {
+        pattern: out,
+        needs_lookaround,
+    }
 }
 
 /// mongod's regex-to-regex equality: exact pattern, and options compared as a
@@ -509,6 +601,72 @@ mod pcre_anchor_tests {
         let re = compile(&Bson::String("o$".into()), None).unwrap();
         let m = re.find_first("foo\n").unwrap().expect("matches");
         assert_eq!((m.text.as_str(), m.codepoint_idx), ("o", 2));
+    }
+
+    /// mongod 8.2.11, 2026-10-22: PCRE without UCP, `u` flag or not.
+    #[test]
+    fn character_classes_are_ascii() {
+        let s = ["é", "a", "\u{0661}", "1", "\u{a0}", "\u{b}", "\u{212a}"];
+        assert_eq!(
+            hits("^\\w$", "", &s),
+            [false, true, false, true, false, false, false]
+        );
+        assert_eq!(
+            hits("^\\W$", "", &s),
+            [true, false, true, false, true, true, true]
+        );
+        assert_eq!(
+            hits("^\\d$", "u", &s),
+            [false, false, false, true, false, false, false]
+        );
+        assert_eq!(
+            hits("^\\s$", "", &s),
+            [false, false, false, false, false, true, false]
+        );
+        assert_eq!(
+            hits("^[\\w]$", "", &s),
+            [false, true, false, true, false, false, false]
+        );
+        assert_eq!(
+            hits("^[^\\w]$", "", &s),
+            [true, false, true, false, true, true, true]
+        );
+        // Case folding does not reach the Kelvin sign through `\w`.
+        assert_eq!(
+            hits("^\\w$", "i", &s),
+            [false, true, false, true, false, false, false]
+        );
+        assert_eq!(hits("\\ba", "", &["éa", "ba"]), [true, false]);
+        assert_eq!(hits("\\B", "", &["é"]), [true]);
+        // The backtracking engine (a backreference) gets the same classes.
+        assert_eq!(
+            hits("^(\\w)\\1\\b", "", &["éé", "aa", "aab"]),
+            [false, true, false]
+        );
+    }
+
+    /// mongod's `$regexFindAll` scan, 8.2.11, 2026-10-22.
+    #[test]
+    fn find_all_scans_as_mongod() {
+        let all = |pattern: &str, s: &str| -> Vec<(String, usize)> {
+            compile(&Bson::String(pattern.into()), None)
+                .unwrap()
+                .find_all(s)
+                .unwrap()
+                .into_iter()
+                .map(|m| (m.text, m.codepoint_idx))
+                .collect()
+        };
+        let at = |v: &[(&str, usize)]| -> Vec<(String, usize)> {
+            v.iter().map(|(t, i)| (t.to_string(), *i)).collect()
+        };
+        assert_eq!(all("", "abc"), at(&[("", 0), ("", 1), ("", 2)]));
+        assert_eq!(all("", ""), at(&[("", 0)]));
+        assert_eq!(all("", "é😀"), at(&[("", 0), ("", 1)]));
+        assert_eq!(all("a*", "abc"), at(&[("a", 0), ("", 1), ("", 2)]));
+        assert_eq!(all("a*", "aaa"), at(&[("aaa", 0)]));
+        assert_eq!(all("c|", "abc"), at(&[("", 0), ("", 1), ("c", 2)]));
+        assert_eq!(all("(?<=a)", "aa"), at(&[("", 1)]));
     }
 }
 

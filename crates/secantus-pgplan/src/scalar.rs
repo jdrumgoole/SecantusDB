@@ -441,6 +441,27 @@ pub fn pg_regex_source(pattern: &str) -> String {
     while i < chars.len() {
         let c = chars[i];
         if c == '\\' {
+            // The class escapes are spelled out as the `regex` crate's own
+            // Unicode definitions. A pattern lowered to a MongoDB `$regex`
+            // filter is compiled by `secantus-core`, which reads `\w`, `\d`
+            // and `\s` as mongod's ASCII classes; spelled out, they mean the
+            // same on every path here.
+            const WORD: &str = r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\p{Join_Control}";
+            let spelled = match chars.get(i + 1) {
+                Some('w') if in_bracket => Some(WORD.to_string()),
+                Some('w') => Some(format!("[{WORD}]")),
+                Some('W') => Some(format!("[^{WORD}]")),
+                Some('d') => Some(r"\p{Nd}".to_string()),
+                Some('D') => Some(r"\P{Nd}".to_string()),
+                Some('s') => Some(r"\p{White_Space}".to_string()),
+                Some('S') => Some(r"\P{White_Space}".to_string()),
+                _ => None,
+            };
+            if let Some(spelled) = spelled {
+                out.push_str(&spelled);
+                i += 2;
+                continue;
+            }
             out.push(c);
             if let Some(n) = chars.get(i + 1) {
                 out.push(*n);
@@ -3031,3 +3052,44 @@ pub(crate) const PG_ENCODINGS: &[&str] = &[
     "JOHAB",
     "SHIFT_JIS_2004",
 ];
+
+#[cfg(test)]
+mod pg_regex_source_tests {
+    use super::pg_regex_source;
+
+    /// The spelled-out class escapes match exactly what the `regex` crate's
+    /// own Unicode classes match, so no path that compiles a PostgreSQL
+    /// pattern changed meaning when `secantus-core` made them ASCII for
+    /// mongod.
+    #[test]
+    fn class_escapes_keep_the_regex_crates_meaning() {
+        let samples: Vec<char> = (0u32..0x3000)
+            .chain([0x1f600, 0x200d, 0x2028, 0xff10, 0xfeff])
+            .filter_map(char::from_u32)
+            .collect();
+        for pattern in [
+            r"^\w$",
+            r"^\W$",
+            r"^\d$",
+            r"^\D$",
+            r"^\s$",
+            r"^\S$",
+            r"^[\w]$",
+            r"^[^\w-]$",
+            r"^[\d\s]$",
+            r"^[x\W]$",
+        ] {
+            let own = regex::Regex::new(pattern).unwrap();
+            let spelled = regex::Regex::new(&pg_regex_source(pattern)).unwrap();
+            for c in &samples {
+                let s = c.to_string();
+                assert_eq!(
+                    own.is_match(&s),
+                    spelled.is_match(&s),
+                    "{pattern} on U+{:04X}",
+                    *c as u32
+                );
+            }
+        }
+    }
+}

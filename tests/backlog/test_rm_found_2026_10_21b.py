@@ -174,7 +174,7 @@ def test_document_equality_respects_field_order(rust_mongo: Any, mongod: Any) ->
 # ------------------------------------------------------------------ regex --
 
 
-@pytest.mark.backlog("RM-236")
+@pytest.mark.backlog_fixed("RM-236")
 def test_regex_classes_are_ascii(rust_mongo: Any, mongod: Any) -> None:
     """mongod's PCRE matches `\\w`, `\\d`, `\\s` and `\\b` against ASCII only,
     with or without the `u` flag; the Rust regex matches Unicode classes."""
@@ -184,6 +184,11 @@ def test_regex_classes_are_ascii(rust_mongo: Any, mongod: Any) -> None:
         ("\\s nbsp", {"$regexMatch": {"input": " ", "regex": "^\\s$"}}),
         ("\\b", {"$regexMatch": {"input": "éa", "regex": "\\ba"}}),
         ("$regexFind \\w+", {"$regexFind": {"input": "é1", "regex": "\\w+"}}),
+        ("\\s VT", {"$regexMatch": {"input": "\x0b", "regex": "^\\s$"}}),
+        ("\\B", {"$regexMatch": {"input": "é", "regex": "\\B"}}),
+        ("[^\\w]", {"$regexMatch": {"input": "é", "regex": "^[^\\w]$"}}),
+        ("i Kelvin \\w", {"$regexMatch": {"input": "\u212a", "regex": "^\\w$", "options": "i"}}),
+        ("u flag", {"$regexMatch": {"input": "é", "regex": "^\\w$", "options": "u"}}),
     ]
     diffs = _diverging(rust_mongo, mongod, shapes)
     for client in (rust_mongo, mongod):
@@ -197,14 +202,20 @@ def test_regex_classes_are_ascii(rust_mongo: Any, mongod: Any) -> None:
     assert not diffs, "\n".join(diffs)
 
 
-@pytest.mark.backlog("RM-237")
+@pytest.mark.backlog_fixed("RM-237")
 def test_regex_find_all_has_no_trailing_empty_match(rust_mongo: Any, mongod: Any) -> None:
     """An empty-matching pattern gives mongod one match per position before
-    the end; the Rust server adds one at the end of the string."""
+    the end; the Rust server added one at the end of the string, and skipped
+    an empty match straight after a non-empty one."""
+    fa = lambda inp, rx: {"$regexFindAll": {"input": inp, "regex": rx}}  # noqa: E731
     shapes = [
-        ("empty", {"$size": {"$regexFindAll": {"input": "abc", "regex": ""}}}),
-        ("x*", {"$size": {"$regexFindAll": {"input": "abc", "regex": "x*"}}}),
-        ("multibyte", {"$size": {"$regexFindAll": {"input": "é😀", "regex": ""}}}),
+        ("empty", {"$size": fa("abc", "")}),
+        ("x*", {"$size": fa("abc", "x*")}),
+        ("multibyte", {"$size": fa("é😀", "")}),
+        ("empty input", fa("", "")),
+        ("a* after a match", fa("abc", "a*")),
+        ("c|", fa("abc", "c|")),
+        ("b*", fa("ab", "b*")),
     ]
     assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
 
@@ -230,7 +241,7 @@ def test_regex_operator_options_are_validated(rust_mongo: Any, mongod: Any) -> N
 # ----------------------------------------------------- array operators --
 
 
-@pytest.mark.backlog("RM-239")
+@pytest.mark.backlog_fixed("RM-239")
 def test_filter_limit(rust_mongo: Any, mongod: Any) -> None:
     """mongod takes an integral double `limit` and rejects zero, negatives,
     booleans, strings, NaN and fractions (327391 / 327392); the Rust server
@@ -245,6 +256,10 @@ def test_filter_limit(rust_mongo: Any, mongod: Any) -> None:
         ("string", f("x")),
         ("NaN", f(float("nan"))),
         ("1.5", f(1.5)),
+        ("-0.0", f(-0.0)),
+        ("long past int32", f(Int64(2**40))),
+        ("null", f(None)),
+        ("0 over an empty input", {"$filter": {"input": [], "cond": True, "limit": 0}}),
     ]
     assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
 
@@ -334,7 +349,7 @@ def test_switch(rust_mongo: Any, mongod: Any) -> None:
 # ------------------------------------------------------------- arithmetic --
 
 
-@pytest.mark.backlog("RM-243")
+@pytest.mark.backlog_fixed("RM-243")
 def test_round_and_trunc_of_doubles(rust_mongo: Any, mongod: Any) -> None:
     """mongod rounds a double's exact binary value; the Rust server computes
     `(x * 10^p).round() / 10^p`, which rounds the decimal text, loses
@@ -351,11 +366,17 @@ def test_round_and_trunc_of_doubles(rust_mongo: Any, mongod: Any) -> None:
         ("$round int32 min -1", {"$round": [-2147483648, -1]}),
         ("$round NaN place", {"$round": [1.5, Decimal128("NaN")]}),
         ("$round null 200", {"$round": [None, 200]}),
+        ("$round int32 max -1", {"$round": [2147483647, -1]}),
+        ("$round string 200", {"$round": ["x", 200]}),
+        ("$trunc string", {"$trunc": ["x", 0]}),
+        ("$round 0.125 2", {"$round": [0.125, 2]}),
+        ("$round -0.4 0", {"$round": [-0.4, 0]}),
+        ("$trunc 123456789.123456789 5", {"$trunc": [123456789.123456789, 5]}),
     ]
     assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
 
 
-@pytest.mark.backlog("RM-244")
+@pytest.mark.backlog_fixed("RM-244")
 def test_pow_of_one_with_negative_exponent_stays_integral(rust_mongo: Any, mongod: Any) -> None:
     """`{$pow: [1, -5]}` is int32 1 on mongod (and -1 to an odd power is -1);
     the Rust server falls through to `powf` and answers the double."""
@@ -364,6 +385,8 @@ def test_pow_of_one_with_negative_exponent_stays_integral(rust_mongo: Any, mongo
         ("-1 ^ -5", {"$pow": [-1, -5]}),
         ("-1 ^ -4", {"$pow": [-1, -4]}),
         ("long 1 ^ -3", {"$pow": [Int64(1), -3]}),
+        ("-1 ^ long -3", {"$pow": [-1, Int64(-3)]}),
+        ("2 ^ -1", {"$pow": [2, -1]}),
         ("1 ^ long min", {"$pow": [1, Int64(-(2**63))]}),
     ]
     assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
@@ -456,13 +479,17 @@ def test_date_to_string_arguments(rust_mongo: Any, mongod: Any) -> None:
     assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
 
 
-@pytest.mark.backlog("RM-248")
+@pytest.mark.backlog_fixed("RM-248")
 def test_local_times_at_daylight_saving_changes(rust_mongo: Any, mongod: Any) -> None:
     """A local time that happens twice (the autumn change) is the LATER,
-    standard-time instant on mongod; one that never happens (the spring
-    change) uses the offset before the change. The Rust server takes the
-    earlier instant, and refuses a gap time with 40485 "unrecognized time
-    zone identifier"."""
+    standard-time instant on mongod -- except in `$dateAdd`, which keeps the
+    start date's daylight saving; one that never happens (the spring change)
+    uses the offset before the change. The Rust server took the earlier
+    instant, and refused a gap time with 40485 "unrecognized time zone
+    identifier"."""
+    add = lambda start, unit, n=1, tz="America/New_York": {  # noqa: E731
+        "$dateAdd": {"startDate": start, "unit": unit, "amount": n, "timezone": tz}
+    }
     fp = lambda y, mo, d, h, mi, tz: {  # noqa: E731
         "$dateFromParts": {
             "year": y,
@@ -479,6 +506,14 @@ def test_local_times_at_daylight_saving_changes(rust_mongo: Any, mongod: Any) ->
         ("Sydney overlap", fp(2026, 4, 5, 2, 30, "Australia/Sydney")),
         ("NY gap", fp(2026, 3, 8, 2, 30, "America/New_York")),
         ("London gap", fp(2026, 3, 29, 1, 30, "Europe/London")),
+        ("Lord Howe half-hour gap", fp(2026, 10, 4, 2, 15, "Australia/Lord_Howe")),
+        ("São Paulo midnight gap", fp(2018, 11, 4, 0, 30, "America/Sao_Paulo")),
+        ("$dateAdd EDT day into overlap", add(datetime.datetime(2026, 10, 31, 5, 30), "day")),
+        ("$dateAdd EST month into overlap", add(datetime.datetime(2026, 1, 1, 6, 30), "month", 10)),
+        (
+            "$dateAdd BST day into overlap",
+            add(datetime.datetime(2026, 10, 24, 0, 0), "day", tz="Europe/London"),
+        ),
         (
             "$dateAdd into gap",
             {
