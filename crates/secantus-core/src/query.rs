@@ -354,6 +354,7 @@ fn match_clause(
             // this match was given is made active for the evaluation.
             let value = {
                 let _on = coll.map(|c| collation::activate(Some(c)));
+                let _filter = expressions::enter_query_filter();
                 expressions::evaluate(doc, cond, vars)?
             };
             Ok(expressions::truthy(&value) && expr_in_by_value(doc, cond, vars, coll)?)

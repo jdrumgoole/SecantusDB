@@ -1388,6 +1388,28 @@ pub fn first_unknown_expr_operator(expr: &Bson) -> Option<String> {
     }
 }
 
+thread_local! {
+    static IN_QUERY_FILTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While alive, expressions are evaluated inside a query filter's `$expr`.
+pub(crate) struct QueryFilterScope(bool);
+
+impl Drop for QueryFilterScope {
+    fn drop(&mut self) {
+        IN_QUERY_FILTER.with(|f| f.set(self.0));
+    }
+}
+
+/// Mark the expressions evaluated until the guard drops as a query filter's.
+pub(crate) fn enter_query_filter() -> QueryFilterScope {
+    QueryFilterScope(IN_QUERY_FILTER.with(|f| f.replace(true)))
+}
+
+fn in_query_filter() -> bool {
+    IN_QUERY_FILTER.with(std::cell::Cell::get)
+}
+
 /// `$meta`: a document's metadata. This engine keeps none with a document,
 /// so a keyword mongod knows evaluates to MISSING -- which is mongod's
 /// answer wherever the metadata is not available (measured 8.2.11:
@@ -1401,7 +1423,8 @@ pub fn first_unknown_expr_operator(expr: &Bson) -> Option<String> {
 /// (40218). After a `$geoNear` the command layer rewrites them into reads
 /// of fields the stage writes, and `sortKey` after a `$sort` likewise
 /// (`agg_meta::rewrite_sort_metadata`); with no `$sort` in reach `sortKey`
-/// becomes `[]` in `$addFields` there, and is refused here otherwise.
+/// becomes `[]` in `$addFields` and `$group` there, is missing in a query
+/// filter's `$expr`, and is refused here otherwise.
 fn op_meta(arg: &Bson) -> R {
     let unavailable = |what: &str| {
         Err(Fallback::mongo(
@@ -1419,6 +1442,10 @@ fn op_meta(arg: &Bson) -> R {
             // the command layer reads it from a field instead (`hybrid`).
             "score" => unavailable("score"),
             "scoreDetails" => unavailable("scoreDetails"),
+            // A query filter never sees a sort key: in a `find` filter's or
+            // a `$match`'s `$expr` it is missing (mongod 8.2.11,
+            // 2026-10-22; RM-252). Elsewhere the command layer rewrites it.
+            "sortKey" if in_query_filter() => Ok(Bson::Undefined),
             "sortKey" => Err(Fallback::Defer),
             known if crate::projection::META_KEYWORDS.contains(&known) => Ok(Bson::Undefined),
             _ => Err(Fallback::Defer),
@@ -2271,6 +2298,24 @@ fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
     }
     let arr = eval(&pair[0], ctx)?;
     let idx = eval(&pair[1], ctx)?;
+    // A null or missing operand is null before either is checked, and the
+    // array is checked before the index: `{$arrayElemAt: [null, "x"]}` is
+    // null and `[5, "x"]` is 28689 (measured 8.2.11, 2026-10-22).
+    if is_null(&arr) || is_null(&idx) {
+        return Ok(Bson::Null);
+    }
+    let a = match &arr {
+        Bson::Array(a) => a,
+        other => {
+            return Err(wrong_type(
+                28689,
+                "$arrayElemAt's first argument must be an array, but is {}",
+                &pair[0],
+                other,
+                ctx,
+            ))
+        }
+    };
     // `coerce_index` is shared with `$slice` / `$substr`, whose rules were
     // measured separately, so `$arrayElemAt`'s two extra rules live here:
     // a DECIMAL index is accepted (`NumberDecimal("1")` is element 1), and
@@ -2356,19 +2401,6 @@ fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
                     crate::query::bson_type_name(&idx)
                 ),
             ));
-        }
-    };
-    let a = match &arr {
-        Bson::Array(a) => a,
-        Bson::Null | Bson::Undefined => return Ok(Bson::Null),
-        other => {
-            return Err(wrong_type(
-                28689,
-                "$arrayElemAt's first argument must be an array, but is {}",
-                &pair[0],
-                other,
-                ctx,
-            ))
         }
     };
     let len = a.len() as i128;
@@ -3688,7 +3720,12 @@ fn op_get_field(arg: &Bson, ctx: &Ctx) -> R {
                         None => return Ok(Bson::Undefined), // input missing -> missing
                     }
                 }
-                Some(e) => eval(e, ctx)?,
+                // Any other input that evaluates to missing -- `$$REMOVE` --
+                // is missing too (measured 8.2.11, 2026-10-22).
+                Some(e) => match eval_field_value(e, ctx)? {
+                    Bson::Undefined => return Ok(Bson::Undefined),
+                    v => v,
+                },
                 None => Bson::Document(ctx.doc.clone()),
             };
             (field, input)
@@ -3764,7 +3801,25 @@ fn set_field_name_parse(d: &Document) -> Result<(), Fallback> {
         return Ok(());
     };
     let constant = match field {
-        Bson::String(s) if s.starts_with('$') => return Ok(()), // a path: its own parse
+        // A field path or a system variable is refused, rendered as mongod
+        // serializes it: `$a.b` is `$CURRENT.a.b`, `$$ROOT.a` is `$ROOT.a`.
+        // A user variable is resolved first, as on mongod (an unbound one is
+        // 17276), so it is left to that. Measured 8.2.11, 2026-10-22.
+        Bson::String(s) if s.starts_with('$') => {
+            let shown = match s.strip_prefix("$$") {
+                Some(var) if var.starts_with(|c: char| c.is_ascii_uppercase()) => format!("${var}"),
+                Some(_) => return Ok(()),
+                None => format!("$CURRENT.{}", &s[1..]),
+            };
+            return Err(Fallback::mongo(
+                4161108,
+                format!(
+                    "'{shown}' is a field path reference which is not allowed in this context. \
+                     Did you mean {{$literal: '{shown}'}}?"
+                ),
+            )
+            .bare());
+        }
         Bson::Document(inner) if inner.len() == 1 && inner.contains_key("$literal") => {
             inner.get("$literal").cloned().unwrap_or(Bson::Null)
         }
@@ -5219,12 +5274,28 @@ fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
 fn op_date_to_string(arg: &Bson, ctx: &Ctx) -> R {
     let spec = arg.as_document().ok_or(Fallback::Defer)?;
     precheck_constant_timezone(spec, ctx, None)?;
-    // A string format's directives are checked before the date is read, so a
-    // bad one fails beside a null date too; the wrapper is the expression's
-    // own (measured 8.2.11, 2026-10-22).
+    // `format` is read before the date (measured 8.2.11, 2026-10-22): a null
+    // one answers null even beside a date that is not one, one that is not a
+    // string is 18533 even beside a null date, and a string's directives are
+    // checked first too. The wrapper is the expression's own: "Failed to
+    // optimize" when everything is constant.
     let format = spec.get("format").map(|e| eval(e, ctx)).transpose()?;
-    if let Some(Bson::String(f)) = &format {
-        render_date_at(0, f, 0)?;
+    match &format {
+        Some(Bson::String(f)) => {
+            render_date_at(0, f, 0)?;
+        }
+        Some(v) if is_null(v) => return Ok(Bson::Null),
+        Some(other) => {
+            return Err(Fallback::mongo(
+                18533,
+                format!(
+                    "$dateToString requires that 'format' be a string, found: {} with value {}",
+                    type_name(other),
+                    crate::aggregate::render_value_compact(other)
+                ),
+            ))
+        }
+        None => {}
     }
     let date_expr = spec.get("date").ok_or(Fallback::Defer)?;
     let date = eval(date_expr, ctx)?;
@@ -5250,8 +5321,6 @@ fn op_date_to_string(arg: &Bson, ctx: &Ctx) -> R {
         return Ok(Bson::Null);
     }
     let tz_offset = timezone_offset_ms(tz.as_spec(), millis)?;
-    // `format` is an expression: a null one answers null, and one that is not
-    // a string is 18533, per document even when constant (measured 8.2.11).
     let fmt = match &format {
         // The default format ends in `Z` only for UTC itself -- no zone,
         // `UTC` or a zero offset. `GMT` and every named zone print without
@@ -5259,18 +5328,8 @@ fn op_date_to_string(arg: &Bson, ctx: &Ctx) -> R {
         None if matches!(mongo_tz(tz.as_spec()), Ok(MongoTz::Utc)) => "%Y-%m-%dT%H:%M:%S.%LZ",
         None => "%Y-%m-%dT%H:%M:%S.%L",
         Some(Bson::String(s)) => s.as_str(),
-        Some(v) if is_null(v) => return Ok(Bson::Null),
-        Some(other) => {
-            return Err(Fallback::mongo(
-                18533,
-                format!(
-                    "$dateToString requires that 'format' be a string, found: {} with value {}",
-                    type_name(other),
-                    crate::aggregate::render_value_compact(other)
-                ),
-            )
-            .with_folded(false))
-        }
+        // A null or non-string format returned above.
+        Some(_) => return Ok(Bson::Null),
     };
     Ok(Bson::String(render_date_at(
         millis + tz_offset,
@@ -5691,8 +5750,8 @@ const DATE_ADD_LIMITS: &[(&str, i64)] = &[
 ];
 
 /// The checks mongod makes while it optimizes a date operator that reads the
-/// document: a CONSTANT `binSize` (`$dateTrunc`) and then a constant `unit`
-/// are validated before anything is read, so a bad one fails even beside a
+/// document: a CONSTANT `binSize` (`$dateTrunc`), then a constant `unit`,
+/// then a constant `startOfWeek` are validated before anything is read, so a bad one fails even beside a
 /// null date, under "Failed to optimize pipeline". A wholly constant
 /// expression is simply evaluated, null first (measured 8.2.11, 2026-10-22).
 fn precheck_constant_date_args(
@@ -5718,6 +5777,11 @@ fn precheck_constant_date_args(
     }
     if let Some(v) = constant("unit")?.filter(|v| !is_null(v)) {
         date_unit_arg(op, &v).map_err(|f| f.with_folded(true))?;
+    }
+    if matches!(op, "$dateTrunc" | "$dateDiff") {
+        if let Some(v) = constant("startOfWeek")?.filter(|v| !is_null(v)) {
+            parse_start_of_week(op, &v).map_err(|f| f.with_folded(true))?;
+        }
     }
     if op == "$dateSubtract" {
         if let Some(amount) = constant("amount")?.as_ref().and_then(date_integer) {
@@ -5854,7 +5918,7 @@ fn op_date_diff(arg: &Bson, ctx: &Ctx) -> R {
         return Ok(Bson::Null);
     }
     let tz = tz.as_spec();
-    let start_of_week = match start_of_week_arg("$dateDiff", d, ctx)? {
+    let start_of_week = match start_of_week_arg("$dateDiff", arg, d, &unit, ctx)? {
         StartOfWeek::Null => return Ok(Bson::Null),
         StartOfWeek::Absent => None,
         StartOfWeek::Day(day) => Some(day),
@@ -5990,19 +6054,46 @@ fn trunc_reference_instant_ms(tz: Option<&Bson>) -> Result<i64, Fallback> {
     tz_instant_from_local_ms(tz, days_from_civil(TRUNC_REF_YEAR, 1, 1) * 86_400_000)
 }
 
-/// `startOfWeek` as mongod parses it for `$dateTrunc` / `$dateDiff`, whatever
-/// the unit (measured 8.2.11, 2026-10-07): a day name or its three-letter
-/// abbreviation, case-insensitive (`mon`, `MON`, `MonDay`; not `tues` /
-/// `thur`); a non-string is 5439015, an unrecognised string 5439016. `Ok(None)`
-/// when absent; `Err` with a `null` marker is handled by the caller via
-/// [`StartOfWeek::Null`]. The abbreviations used to be refused outright.
+/// `startOfWeek` for `$dateTrunc` / `$dateDiff`. A day name or its
+/// three-letter abbreviation, case-insensitive (`mon`, `MON`, `MonDay`; not
+/// `tues` / `thur`); a non-string is 5439015, an unrecognised string 5439016.
+/// The abbreviations used to be refused outright.
+///
+/// It is only READ for the `week` unit (measured 8.2.11, 2026-10-22): a
+/// field path is evaluated for `week` alone, and a wholly constant
+/// expression is evaluated the same way. In an expression that reads the
+/// document, though, a CONSTANT `startOfWeek` is parsed while optimizing --
+/// a bad one fails whatever the unit (`precheck_constant_date_args`) and a
+/// null one makes the answer null.
 enum StartOfWeek {
     Absent,
     Null,
     Day(String),
 }
 
-fn start_of_week_arg(op: &str, d: &bson::Document, ctx: &Ctx) -> Result<StartOfWeek, Fallback> {
+fn start_of_week_arg(
+    op: &str,
+    arg: &Bson,
+    d: &bson::Document,
+    unit: &str,
+    ctx: &Ctx,
+) -> Result<StartOfWeek, Fallback> {
+    let Some(e) = d.get("startOfWeek") else {
+        return Ok(StartOfWeek::Absent);
+    };
+    if unit != "week" {
+        let bound: Vec<String> = ctx.vars.keys().cloned().collect();
+        let parsed_while_optimizing = crate::aggregate::is_constant_expression(e, &bound)
+            && !crate::aggregate::is_constant_expression(arg, &bound);
+        if parsed_while_optimizing && is_null(&eval(e, ctx)?) {
+            return Ok(StartOfWeek::Null);
+        }
+        return Ok(StartOfWeek::Absent);
+    }
+    parse_start_of_week(op, &eval(e, ctx)?)
+}
+
+fn parse_start_of_week(op: &str, v: &Bson) -> Result<StartOfWeek, Fallback> {
     const DAYS: [&str; 7] = [
         "monday",
         "tuesday",
@@ -6012,10 +6103,7 @@ fn start_of_week_arg(op: &str, d: &bson::Document, ctx: &Ctx) -> Result<StartOfW
         "saturday",
         "sunday",
     ];
-    let Some(e) = d.get("startOfWeek") else {
-        return Ok(StartOfWeek::Absent);
-    };
-    match eval(e, ctx)? {
+    match v {
         Bson::Null | Bson::Undefined => Ok(StartOfWeek::Null),
         Bson::String(s) => {
             let lower = s.to_ascii_lowercase();
@@ -6036,7 +6124,7 @@ fn start_of_week_arg(op: &str, d: &bson::Document, ctx: &Ctx) -> Result<StartOfW
             5439015,
             format!(
                 "{op} requires 'startOfWeek' to be a string, but got {}",
-                type_name(&other)
+                type_name(other)
             ),
         )),
     }
@@ -6101,7 +6189,7 @@ fn op_date_trunc(arg: &Bson, ctx: &Ctx) -> R {
         ));
     };
     let tz = tz.as_spec();
-    let start_of_week = match start_of_week_arg("$dateTrunc", d, ctx)? {
+    let start_of_week = match start_of_week_arg("$dateTrunc", arg, d, &unit, ctx)? {
         StartOfWeek::Null => return Ok(Bson::Null),
         StartOfWeek::Absent => None,
         StartOfWeek::Day(day) => Some(day),
@@ -6937,6 +7025,19 @@ fn parse_float_string(value: &str) -> Result<f64, Fallback> {
     if parsed.is_infinite() && !spells_infinity(value) {
         return Err(number_parse_error(value, "Out of range"));
     }
+    // And one too SMALL for a normal double: a subnormal result, or zero from
+    // a string with a non-zero digit, is `strtod`'s ERANGE too -- `"1e-400"`,
+    // `"4.9e-324"` and `"2.2250738585072011e-308"` are 241, the smallest
+    // normal `"2.2250738585072014e-308"` parses (measured 8.2.11, 2026-10-22).
+    let mantissa = value.split(['e', 'E']).next().unwrap_or("");
+    let underflowed = if parsed == 0.0 {
+        mantissa.bytes().any(|b| (b'1'..=b'9').contains(&b))
+    } else {
+        parsed.abs() < f64::MIN_POSITIVE
+    };
+    if underflowed {
+        return Err(number_parse_error(value, "Out of range"));
+    }
     Ok(parsed)
 }
 
@@ -7311,6 +7412,16 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
                 Conv::Failed => Conv::Named(overflow_conversion(value)),
                 other => other,
             },
+            // For an int the DOUBLE is range-checked before it truncates:
+            // 2147483647.5 overflows, where its truncation would fit
+            // (measured 8.2.11, 2026-10-22).
+            Bson::Double(d) if code == 16 && (*d > i32::MAX as f64 || *d < i32::MIN as f64) => {
+                Conv::Named(if d.is_finite() {
+                    overflow_conversion(value)
+                } else {
+                    nonfinite_conversion(*d)
+                })
+            }
             Bson::Double(d) if d.is_finite() && *d >= i64::MIN as f64 && *d <= i64::MAX as f64 => {
                 match wrap_int(d.trunc() as i128, code) {
                     Conv::Failed => Conv::Named(overflow_conversion(value)),
@@ -9320,7 +9431,12 @@ fn op_type(arg: &Bson, ctx: &Ctx) -> R {
             }
         }
     }
-    Ok(Bson::String(type_name(&eval(arg, ctx)?).into()))
+    // Any other operand that evaluates to missing -- a `$meta` mongod has no
+    // value for, a `$getField` of an absent field -- is "missing" too.
+    match eval_field_value(arg, ctx)? {
+        Bson::Undefined => Ok(Bson::String("missing".into())),
+        v => Ok(Bson::String(type_name(&v).into())),
+    }
 }
 
 /// `$isNumber`: true for int / long / double / decimal (not bool).
@@ -9634,9 +9750,12 @@ fn op_index_of(arg: &Bson, ctx: &Ctx, bytes: bool) -> R {
 }
 
 /// A `$substrBytes` index, coerced to a long the way mongod coerces it: a
-/// double truncates, a decimal rounds half to even (`1.5` is 2), and a value
-/// no long holds is 31109. Anything else is not a number. Measured 8.2.11,
-/// 2026-10-20.
+/// double truncates and one no long holds is 31109; a decimal rounds half to
+/// even (`1.5` is 2) and one no long holds -- NaN, an infinity, 1E+20 -- is
+/// `INT64_MIN`, Decimal128's invalid-conversion result, so as a start it is
+/// 50752 "(got: -9223372036854775808)" and as a length it means "to the
+/// end". Anything else is not a number. Measured 8.2.11, 2026-10-20 and
+/// 2026-10-22.
 fn substr_bytes_index(
     v: &Bson,
     code: i32,
@@ -9656,10 +9775,10 @@ fn substr_bytes_index(
         Bson::Int64(n) => Ok(*n),
         Bson::Double(d) if in_range(*d) => Ok(d.trunc() as i64),
         Bson::Double(d) => Err(out_of_range(format_double_g(*d))),
-        Bson::Decimal128(d) => match decimal_as_f64(v) {
-            Some(f) if in_range(f) => Ok(f.round_ties_even() as i64),
-            _ => Err(out_of_range(d.to_string())),
-        },
+        Bson::Decimal128(_) => Ok(crate::decimal::from_bson(v)
+            .and_then(|d| crate::decimal::round_to_exp(&d, 0, crate::decimal::RoundMode::HalfEven))
+            .and_then(|d| crate::decimal::trunc_to_i64(&d))
+            .unwrap_or(i64::MIN)),
         other => Err(wrong_type(
             code,
             &format!("$substrBytes:  {label} must be a numeric type (is BSON type {{}})"),

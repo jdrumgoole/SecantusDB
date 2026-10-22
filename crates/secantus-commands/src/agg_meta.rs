@@ -208,7 +208,9 @@ fn is_inclusion(spec: &Document) -> bool {
 /// [`KEEPS_SORT_METADATA`] and into a `$group`. Each is rewritten into a read
 /// of a field the stage that sets it is made to write, and the fields come
 /// off again where the metadata ends. With no sort key in reach, `$addFields`
-/// gives `[]` (mongod 8.2.11) and the other stages are left to refuse it.
+/// and `$group` give `[]` (mongod 8.2.11) and the other stages are left to
+/// refuse it; in `$match` and `$redact` the sort key is always missing (a
+/// leading `$match` becomes the query, whose `$expr` sees it missing too).
 pub(crate) fn rewrite_sort_metadata(stages: &mut Vec<Bson>) {
     const KINDS: [(&str, &str); 3] = [
         ("sortKey", SORT_KEY),
@@ -229,10 +231,15 @@ pub(crate) fn rewrite_sort_metadata(stages: &mut Vec<Bson>) {
         let mut stage = stage;
         let name = name(&stage).to_string();
         let keeps = KEEPS_SORT_METADATA.contains(&name.as_str());
+        // `$match` and `$redact` never see a sort key: there it is MISSING,
+        // after a `$sort` too (mongod 8.2.11, 2026-10-22; RM-252).
+        if matches!(name.as_str(), "$match" | "$redact") {
+            replace_with(&mut stage, "sortKey", &Bson::String("$$REMOVE".into()));
+        }
         if keeps || name == "$group" {
             if sort_live {
                 replace(&mut stage, "sortKey", SORT_KEY);
-            } else if matches!(name.as_str(), "$addFields" | "$set") {
+            } else if matches!(name.as_str(), "$addFields" | "$set" | "$group") {
                 replace_with(
                     &mut stage,
                     "sortKey",
