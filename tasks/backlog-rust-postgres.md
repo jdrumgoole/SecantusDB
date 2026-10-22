@@ -729,26 +729,21 @@ Not filed:
       above is a different question.
       Backlog-ID: RP-061
       Verify: tests/backlog/test_rp_found_2026_10_20.py::test_serializable_write_skew
-- [ ] **`CREATE DATABASE` drops every option.**
-      `Statement::CreateDatabase { name }` keeps only the name:
-      - `TEMPLATE tsrc` gives an EMPTY database (its table is 42P01).
-        Cloning a template is a common way to isolate tests.
-      - `ENCODING 'LATIN1'` is recorded as UTF8.
-      - `CONNECTION LIMIT 3` as -1, and OWNER is dropped.
-
-      `ALTER DATABASE` is refused outright.
+- [ ] **A database created with a non-UTF8 `ENCODING` still behaves as
+      UTF8.** `CREATE DATABASE ... ENCODING 'LATIN1'` is recorded (and
+      `pg_database` shows it), and TEMPLATE, OWNER, CONNECTION LIMIT,
+      IS_TEMPLATE, ALLOW_CONNECTIONS and ALTER DATABASE are PostgreSQL's
+      (2026-10-22). Inside such a database PostgreSQL 15.19 reports
+      `server_encoding` as LATIN1, defaults `client_encoding` to it, refuses a
+      character LATIN1 lacks on the way from the client (22P05), and its byte
+      functions count LATIN1 bytes: `octet_length('é')` is 1, `convert_to`
+      and `::bytea` give `\xe9`, `chr(8364)` is 54000. Here every database is
+      UTF8 inside. **Decided (Joe, 2026-10-22): emulate the encoding** --
+      PostgreSQL's model, the server encoding per database with the
+      client-to-server conversion and the byte functions honouring it -- as
+      its own slice.
       Backlog-ID: RP-064
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_create_database_options
-- [ ] **`ALTER DEFAULT PRIVILEGES` does nothing, and a role's `CONNECTION
-      LIMIT` is not enforced.** `secantus-pgplan` accepts the statement
-      as a no-op ("single-user test server"), but GRANT and row-level
-      security are enforced now, so a table created afterwards lacks the
-      grant: `has_table_privilege` is false where PostgreSQL 15.19 says
-      true. The connection limit is stored and never checked: a role with
-      `CONNECTION LIMIT 0` logs in, where PostgreSQL refuses (53300).
-      Both are permission answers that are silently wrong.
-      Backlog-ID: RP-067
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_default_privileges_and_connection_limit
+      Verify: tests/backlog/test_rp064_encoding.py::test_latin1_database_behaves_as_latin1
 - [ ] **System columns are missing.** `ctid`, `xmin`, `xmax`, `cmin` and
       `cmax` are 42703 (`tableoid` works). That breaks EF Core / Npgsql's
       `xmin` concurrency token, the `delete ... where ctid = ...`

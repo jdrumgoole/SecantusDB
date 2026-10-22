@@ -780,9 +780,21 @@ pub enum Statement {
         if_exists: bool,
         cascade: bool,
     },
-    /// `CREATE DATABASE <name>` -- the options are accepted and ignored.
+    /// `CREATE DATABASE <name> [WITH option value ...]`: each option by its
+    /// lower-case name (`template`, `encoding`, `owner`, `connection_limit`,
+    /// `is_template`, `allow_connections`, `locale`, `lc_collate`, ...) with
+    /// its value as text, as the statement gave them (RP-064).
     CreateDatabase {
         name: String,
+        options: Vec<(String, String)>,
+    },
+    /// `ALTER DATABASE d [WITH] option value ...` / `RENAME TO n` /
+    /// `OWNER TO r` (RP-064).
+    AlterDatabase {
+        name: String,
+        options: Vec<(String, String)>,
+        rename: Option<String>,
+        owner: Option<String>,
     },
     /// `DROP DATABASE [IF EXISTS] <name>`.
     DropDatabase {
@@ -866,9 +878,16 @@ pub enum Statement {
         members: Vec<String>,
         admin: bool,
     },
-    /// `ALTER DEFAULT PRIVILEGES ...`: accepted, and changes nothing a
-    /// single-user test server acts on.
-    AlterDefaultPrivileges,
+    /// `ALTER DEFAULT PRIVILEGES [FOR ROLE r, ...] [IN SCHEMA s, ...]
+    /// GRANT | REVOKE ...`: the grant or revoke, kept for the objects those
+    /// roles create from now on (`pg_default_acl`). `kind` in the action is
+    /// what it applies to (`table`, `sequence`, `function`, `type`,
+    /// `schema`); its objects are empty.
+    AlterDefaultPrivileges {
+        roles: Vec<String>,
+        schemas: Vec<String>,
+        action: Box<Statement>,
+    },
     /// `COMMENT ON <kind> <object> IS '...' | NULL`. `kind` is the object
     /// type in lower case (`table`, `column`, `index`, `constraint`, ...);
     /// `names` its name parts (`[table, column]`, `[table, constraint]`, a
@@ -4395,7 +4414,59 @@ fn plan_node(
                 },
             ))
         }
+        N::RenameStmt(r)
+            if ObjectType::try_from(r.rename_type) == Ok(ObjectType::ObjectDatabase) =>
+        {
+            Ok(Statement::AlterDatabase {
+                name: r.subname.clone(),
+                options: Vec::new(),
+                rename: Some(r.newname.clone()),
+                owner: None,
+            })
+        }
         N::RenameStmt(r) => plan_rename(&r),
+        N::AlterDatabaseStmt(a) => {
+            let mut options = Vec::new();
+            for o in &a.options {
+                let Some(N::DefElem(d)) = o.node.as_ref() else {
+                    continue;
+                };
+                let value = match d.arg.as_deref().and_then(|x| x.node.as_ref()) {
+                    None => String::new(),
+                    Some(N::String(s)) => s.sval.clone(),
+                    Some(N::Integer(i)) => i.ival.to_string(),
+                    Some(N::Boolean(b)) => b.boolval.to_string(),
+                    Some(N::AConst(c)) => match c.val.as_ref() {
+                        Some(a_const::Val::Sval(s)) => s.sval.clone(),
+                        Some(a_const::Val::Ival(i)) => i.ival.to_string(),
+                        Some(a_const::Val::Boolval(b)) => b.boolval.to_string(),
+                        _ => String::new(),
+                    },
+                    _ => String::new(),
+                };
+                options.push((d.defname.clone(), value));
+            }
+            Ok(Statement::AlterDatabase {
+                name: a.dbname.clone(),
+                options,
+                rename: None,
+                owner: None,
+            })
+        }
+        N::AlterOwnerStmt(a)
+            if ObjectType::try_from(a.object_type) == Ok(ObjectType::ObjectDatabase) =>
+        {
+            let name = match a.object.as_deref().and_then(|o| o.node.as_ref()) {
+                Some(N::String(s)) => s.sval.clone(),
+                _ => String::new(),
+            };
+            Ok(Statement::AlterDatabase {
+                name,
+                options: Vec::new(),
+                rename: None,
+                owner: a.newowner.as_ref().map(role_spec_name),
+            })
+        }
         N::CreateStatsStmt(s) => catalog_stmts::plan_create_statistics(&s, lookup),
         N::AlterStatsStmt(s) => Ok(catalog_stmts::plan_alter_statistics(&s)),
         N::SecLabelStmt(s) => Err(catalog_stmts::plan_security_label(&s)),
@@ -4471,14 +4542,105 @@ fn plan_node(
                 admin,
             })
         }
-        N::AlterDefaultPrivilegesStmt(_) => Ok(Statement::AlterDefaultPrivileges),
+        N::AlterDefaultPrivilegesStmt(a) => {
+            let mut roles = Vec::new();
+            let mut schemas = Vec::new();
+            for opt in &a.options {
+                let Some(N::DefElem(d)) = opt.node.as_ref() else {
+                    continue;
+                };
+                let items: Vec<&pg_query::protobuf::Node> =
+                    match d.arg.as_deref().and_then(|x| x.node.as_ref()) {
+                        Some(N::List(l)) => l.items.iter().collect(),
+                        _ => Vec::new(),
+                    };
+                for item in items {
+                    match item.node.as_ref() {
+                        Some(N::RoleSpec(r)) if d.defname == "roles" => {
+                            roles.push(role_spec_name(r))
+                        }
+                        Some(N::String(st)) if d.defname == "schemas" => {
+                            schemas.push(st.sval.clone())
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let grant = a
+                .action
+                .as_ref()
+                .ok_or_else(|| Error::Parse("ALTER DEFAULT PRIVILEGES without an action".into()))?;
+            if !schemas.is_empty()
+                && pg_query::protobuf::ObjectType::try_from(grant.objtype)
+                    == Ok(pg_query::protobuf::ObjectType::ObjectSchema)
+            {
+                return Err(Error::Sqlstate(
+                    "0LP01",
+                    "cannot use IN SCHEMA clause when using GRANT/REVOKE ON SCHEMAS".into(),
+                ));
+            }
+            Ok(Statement::AlterDefaultPrivileges {
+                roles,
+                schemas,
+                action: Box::new(plan_grant(grant)?),
+            })
+        }
         N::CreateSchemaStmt(c) => Ok(Statement::CreateSchema {
             name: c.schemaname.clone(),
             if_not_exists: c.if_not_exists,
         }),
-        N::CreatedbStmt(c) => Ok(Statement::CreateDatabase {
-            name: c.dbname.clone(),
-        }),
+        N::CreatedbStmt(c) => {
+            use pg_query::protobuf::a_const::Val;
+            let mut options = Vec::new();
+            for o in &c.options {
+                let Some(N::DefElem(d)) = o.node.as_ref() else {
+                    continue;
+                };
+                let value = match d.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                    None => String::new(),
+                    Some(N::String(s)) => s.sval.clone(),
+                    Some(N::Integer(i)) => i.ival.to_string(),
+                    Some(N::Float(f)) => f.fval.clone(),
+                    Some(N::Boolean(b)) => b.boolval.to_string(),
+                    Some(N::AConst(c)) => match c.val.as_ref() {
+                        Some(Val::Sval(s)) => s.sval.clone(),
+                        Some(Val::Ival(i)) => i.ival.to_string(),
+                        Some(Val::Fval(f)) => f.fval.clone(),
+                        Some(Val::Boolval(b)) => b.boolval.to_string(),
+                        _ => String::new(),
+                    },
+                    Some(N::RoleSpec(r)) => role_spec_name(r),
+                    Some(N::TypeName(t)) => t
+                        .names
+                        .last()
+                        .and_then(|n| match n.node.as_ref() {
+                            Some(N::String(s)) => Some(s.sval.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default(),
+                    _ => {
+                        return Err(Error::Unsupported(format!(
+                            "CREATE DATABASE option {}",
+                            d.defname
+                        )))
+                    }
+                };
+                if options
+                    .iter()
+                    .any(|(n, _): &(String, String)| *n == d.defname)
+                {
+                    return Err(Error::Sqlstate(
+                        "42601",
+                        "conflicting or redundant options".into(),
+                    ));
+                }
+                options.push((d.defname.clone(), value));
+            }
+            Ok(Statement::CreateDatabase {
+                name: c.dbname.clone(),
+                options,
+            })
+        }
         N::DropdbStmt(d) => Ok(Statement::DropDatabase {
             name: d.dbname.clone(),
             if_exists: d.missing_ok,
@@ -15914,10 +16076,6 @@ fn aggregate_distinct(s: &pg_query::protobuf::SelectStmt) -> Result<bool> {
     }
     Err(Error::Unsupported("DISTINCT ON with an aggregate".into()))
 }
-
-/// The most rows a recursive CTE may produce. PostgreSQL has no limit and
-/// runs a non-terminating recursion until it is cancelled; a test server
-/// answering an error instead of exhausting memory is the kinder failure.
 
 /// Plan and run one SELECT (its own subqueries resolved first), answering its
 /// rows and its output columns.

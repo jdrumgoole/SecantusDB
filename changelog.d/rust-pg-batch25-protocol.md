@@ -96,5 +96,20 @@ several values and row counts now match.
   sorts the keys rather than comparing every pair: `pgbench -i -s 1` took
   440 s (429 s of it the primary keys), now 20 s.
 
+- `secantus-pg`, `secantus-pgplan`: `ALTER DEFAULT PRIVILEGES` (FOR ROLE,
+  IN SCHEMA; tables, sequences, functions, types, schemas) is applied to the
+  objects those roles create, and shown in `pg_default_acl`; a role's
+  `CONNECTION LIMIT` is enforced at login (53300). Fixes RP-067
+  (`tests/backlog/test_rp_found_2026_10_20.py::test_default_privileges_and_connection_limit`).
+- `secantus-pg`, `secantus-pgplan`: `CREATE DATABASE` takes its options --
+  TEMPLATE (the template's tables, rows and indexes copied), OWNER,
+  ENCODING, LOCALE / LC_COLLATE / LC_CTYPE, CONNECTION LIMIT, IS_TEMPLATE,
+  ALLOW_CONNECTIONS -- with `createdb`'s checks, and `ALTER DATABASE`
+  renames, changes the owner and sets those options; a database's
+  connection limit is enforced at login; `pg_database.datacl` is
+  `aclitem[]`. RP-064 stays open for what a non-UTF8 encoding does inside
+  its database (`tests/backlog/test_rp_found_2026_10_20.py::test_create_database_options`
+  now pins the rest).
+
 More regression tests for these, past each item's gap test, are in
 `tests/backlog/test_rp_batch25.py`.

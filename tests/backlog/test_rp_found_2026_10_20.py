@@ -472,7 +472,7 @@ def test_recursive_cte_under_limit(rust_pg: Any) -> None:
     _check("recursive_with_limit", rust_pg)
 
 
-@pytest.mark.backlog("RP-064")
+@pytest.mark.backlog_fixed("RP-064")
 def test_create_database_options(rust_pg: Any) -> None:
     """PostgreSQL 15.19 copies a TEMPLATE's tables and records ENCODING and
     CONNECTION LIMIT."""
@@ -493,7 +493,7 @@ def test_float8_out_of_range(rust_pg: Any) -> None:
     _check("float8_range", rust_pg)
 
 
-@pytest.mark.backlog("RP-067")
+@pytest.mark.backlog_fixed("RP-067")
 def test_default_privileges_and_connection_limit(rust_pg: Any) -> None:
     """PostgreSQL 15.19 applies ALTER DEFAULT PRIVILEGES to a table created
     afterwards, and refuses a login past a role's CONNECTION LIMIT."""

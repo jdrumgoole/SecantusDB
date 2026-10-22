@@ -41,7 +41,9 @@ mod catalog_order;
 mod collations;
 mod copy_text;
 mod crl;
+mod database_ddl;
 mod db_settings;
+mod default_acl;
 mod distinct_set;
 mod do_block;
 mod embedded;
@@ -2193,6 +2195,32 @@ pub struct DatabaseInfo {
     pub name: String,
     pub is_template: bool,
     pub allow_conn: bool,
+    /// `datdba`'s role name; empty for the bootstrap superuser.
+    pub owner: String,
+    /// `pg_encoding_to_char(encoding)`: `UTF8` unless CREATE DATABASE said.
+    pub encoding: String,
+    pub collate: String,
+    pub ctype: String,
+    /// `datconnlimit`, -1 for none.
+    pub connlimit: i32,
+}
+
+impl DatabaseInfo {
+    /// A database as `initdb` leaves one: UTF8, `C.UTF-8`, no limit, owned
+    /// by the bootstrap superuser.
+    fn defaults() -> Self {
+        DatabaseInfo {
+            oid: 0,
+            name: String::new(),
+            is_template: false,
+            allow_conn: true,
+            owner: String::new(),
+            encoding: "UTF8".into(),
+            collate: "C.UTF-8".into(),
+            ctype: "C.UTF-8".into(),
+            connlimit: -1,
+        }
+    }
 }
 
 /// The databases this server has, which is what a startup packet's `database`
@@ -2236,6 +2264,7 @@ impl DatabaseRegistry {
             name: name.to_string(),
             is_template,
             allow_conn,
+            ..DatabaseInfo::defaults()
         };
         [
             info(1, "template1", true, true),
@@ -2258,11 +2287,20 @@ impl DatabaseRegistry {
             .iter()
             .filter_map(|bytes| decode_doc(bytes).ok())
             .filter_map(|d| {
+                let text = |k: &str, default: &str| {
+                    d.get_str(k)
+                        .map_or_else(|_| default.to_string(), str::to_string)
+                };
                 Some(DatabaseInfo {
                     oid: d.get("oid").and_then(bson_i64)?,
                     name: d.get_str("_id").ok()?.to_string(),
-                    is_template: false,
-                    allow_conn: true,
+                    is_template: d.get_bool("is_template").unwrap_or(false),
+                    allow_conn: d.get_bool("allow_connections").unwrap_or(true),
+                    owner: text("owner", ""),
+                    encoding: text("encoding", "UTF8"),
+                    collate: text("collate", "C.UTF-8"),
+                    ctype: text("ctype", "C.UTF-8"),
+                    connlimit: d.get_i32("connection_limit").unwrap_or(-1),
                 })
             })
             .collect();
@@ -2287,13 +2325,18 @@ impl DatabaseRegistry {
             out.push(DatabaseInfo {
                 oid: next_oid,
                 name,
-                is_template: false,
-                allow_conn: true,
+                ..DatabaseInfo::defaults()
             });
         }
         for info in self.persisted(storage)? {
-            if !out.iter().any(|d| d.name == info.name) {
-                out.push(info);
+            match out.iter_mut().find(|d| d.name == info.name) {
+                // An ALTER DATABASE of a built-in or configured database is
+                // recorded too: its fields, under its own oid.
+                Some(d) => {
+                    let oid = d.oid;
+                    *d = DatabaseInfo { oid, ..info };
+                }
+                None => out.push(info),
             }
         }
         Ok(out)
@@ -2304,7 +2347,7 @@ impl DatabaseRegistry {
     }
 
     /// Records a `CREATE DATABASE`. The caller has checked the name is new.
-    fn create(&self, storage: &Storage, name: &str) -> PgWireResult<()> {
+    fn create(&self, storage: &Storage, name: &str, fields: Document) -> PgWireResult<()> {
         let exists = storage
             .collection_exists(Self::NAMESPACE, Self::COLLECTION)
             .map_err(|e| PgHandler::storage_err("could not record the database", e))?;
@@ -2323,7 +2366,58 @@ impl DatabaseRegistry {
             .unwrap_or(Self::FIRST_USER_OID)
             .max(Self::FIRST_USER_OID)
             + 1;
-        let doc = bson::doc! {"_id": name, "oid": oid};
+        let mut doc = bson::doc! {"_id": name, "oid": oid};
+        doc.extend(fields);
+        let bytes = encode_doc(&doc)
+            .map_err(|e| PgHandler::storage_err("could not encode the database", e))?;
+        storage
+            .insert(Self::NAMESPACE, Self::COLLECTION, vec![bytes], true)
+            .map_err(|e| PgHandler::storage_err("could not record the database", e))?;
+        Ok(())
+    }
+
+    /// ALTER DATABASE: rewrite a database's record with `fields` changed (a
+    /// built-in or configured one gets a record of its own), or renamed.
+    fn update(
+        &self,
+        storage: &Storage,
+        name: &str,
+        fields: Document,
+        rename: Option<&str>,
+    ) -> PgWireResult<()> {
+        let info = self.lookup(storage, name)?.ok_or_else(|| {
+            PgHandler::user_error("3D000", format!("database \"{name}\" does not exist"))
+        })?;
+        if !storage
+            .collection_exists(Self::NAMESPACE, Self::COLLECTION)
+            .map_err(|e| PgHandler::storage_err("could not record the database", e))?
+        {
+            storage
+                .create_collection(Self::NAMESPACE, Self::COLLECTION)
+                .map_err(|e| PgHandler::storage_err("could not record the database", e))?;
+        }
+        let mut doc = bson::doc! {
+            "_id": rename.unwrap_or(name),
+            "oid": info.oid,
+            "is_template": info.is_template,
+            "allow_connections": info.allow_conn,
+            "owner": info.owner.clone(),
+            "encoding": info.encoding.clone(),
+            "collate": info.collate.clone(),
+            "ctype": info.ctype.clone(),
+            "connection_limit": info.connlimit,
+        };
+        doc.extend(fields);
+        storage
+            .delete_matching(
+                Self::NAMESPACE,
+                Self::COLLECTION,
+                &bson::doc! {"_id": name},
+                0,
+                &Document::new(),
+                None,
+            )
+            .map_err(|e| PgHandler::storage_err("could not record the database", e))?;
         let bytes = encode_doc(&doc)
             .map_err(|e| PgHandler::storage_err("could not encode the database", e))?;
         storage
@@ -16389,11 +16483,11 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("datfrozenxid", "xid", false),
                     secantus_pgcatalog::Column::new("datminmxid", "xid", false),
                     secantus_pgcatalog::Column::new("dattablespace", "oid", false),
-                    secantus_pgcatalog::Column::new("datcollate", "name", false),
-                    secantus_pgcatalog::Column::new("datctype", "name", false),
+                    secantus_pgcatalog::Column::new("datcollate", "text", false),
+                    secantus_pgcatalog::Column::new("datctype", "text", false),
                     secantus_pgcatalog::Column::new("daticulocale", "text", false),
                     secantus_pgcatalog::Column::new("datcollversion", "text", false),
-                    secantus_pgcatalog::Column::new("datacl", "text", false),
+                    secantus_pgcatalog::Column::new("datacl", "aclitem[]", false),
                 ],
             )),
             "pg_locks" => Some(TableDef::new(
@@ -16604,6 +16698,7 @@ impl PgHandler {
             "pg_cast" => Some(casts::pg_cast_def()),
             "pg_rewrite" => Some(rules::pg_rewrite_def()),
             "pg_event_trigger" => Some(event_triggers::pg_event_trigger_def()),
+            "pg_default_acl" => Some(default_acl::pg_default_acl_def()),
             "pg_event_trigger_dropped_objects" => Some(event_triggers::dropped_objects_def()),
             "pg_event_trigger_ddl_commands" => Some(event_triggers::ddl_commands_def()),
             "pg_rules" => Some(rules::pg_rules_def()),
@@ -16637,6 +16732,7 @@ impl PgHandler {
             "pg_rewrite" => self.pg_rewrite_rows(&def),
             other if fdw::fdw_catalog_def(other).is_some() => self.fdw_catalog_rows(other, &def)?,
             "pg_event_trigger" => self.pg_event_trigger_rows(&def),
+            "pg_default_acl" => self.pg_default_acl_rows(&def),
             "pg_event_trigger_dropped_objects" => self.dropped_objects_rows(&def),
             "pg_event_trigger_ddl_commands" => self.ddl_commands_rows(&def),
             "pg_rules" => self.pg_rules_rows(&def),
@@ -18831,20 +18927,33 @@ impl PgHandler {
                         let mut d = Document::new();
                         d.insert(field("oid"), Bson::Int64(info.oid));
                         d.insert(field("datname"), info.name);
-                        d.insert(field("datdba"), Bson::Int64(10));
-                        d.insert(field("encoding"), Bson::Int32(6));
+                        let owner = if info.owner.is_empty() {
+                            10
+                        } else {
+                            self.role(&info.owner).ok().flatten().map_or(10, |r| r.oid)
+                        };
+                        d.insert(field("datdba"), Bson::Int64(owner));
+                        d.insert(
+                            field("encoding"),
+                            secantus_pgplan::scalar::call(
+                                "pg_char_to_encoding",
+                                &[Bson::String(info.encoding.clone())],
+                            )
+                            .and_then(Result::ok)
+                            .unwrap_or(Bson::Int32(6)),
+                        );
                         d.insert(field("datlocprovider"), "c");
                         d.insert(field("datistemplate"), info.is_template);
                         d.insert(field("datallowconn"), info.allow_conn);
-                        d.insert(field("datconnlimit"), Bson::Int32(-1));
+                        d.insert(field("datconnlimit"), Bson::Int32(info.connlimit));
                         d.insert(
                             field("datfrozenxid"),
                             Bson::Int64(i64::from(crate::xids::frozen_xid())),
                         );
                         d.insert(field("datminmxid"), Bson::Int64(1));
                         d.insert(field("dattablespace"), Bson::Int64(1663));
-                        d.insert(field("datcollate"), "C.UTF-8");
-                        d.insert(field("datctype"), "C.UTF-8");
+                        d.insert(field("datcollate"), info.collate.as_str());
+                        d.insert(field("datctype"), info.ctype.as_str());
                         d.insert(field("daticulocale"), Bson::Null);
                         d.insert(field("datcollversion"), Bson::Null);
                         d.insert(field("datacl"), Bson::Null);
@@ -21961,6 +22070,34 @@ impl PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // A role's CONNECTION LIMIT: its live backends other than this one
+        // (`InitializeSessionUserId`, FATAL 53300 after AuthenticationOk); a
+        // superuser has none (RP-067).
+        let user = client.metadata().get("user").cloned().unwrap_or_default();
+        if let Some(role) = self.role(&user)? {
+            if role.connlimit >= 0 && !role.superuser {
+                let live = backend_registry()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .filter(|b| {
+                        b.activity.lock().unwrap_or_else(|e| e.into_inner()).usename == user
+                    })
+                    .count();
+                if live >= role.connlimit as usize {
+                    client
+                        .send(PgWireBackendMessage::Authentication(
+                            pgwire::messages::startup::Authentication::Ok,
+                        ))
+                        .await?;
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "FATAL".into(),
+                        "53300".into(), // too_many_connections
+                        format!("too many connections for role \"{user}\""),
+                    ))));
+                }
+            }
+        }
         let (pid, secret_key) = PID_GENERATOR.generate(client);
         client.set_pid_and_secret_key(pid, secret_key);
         // The startup ParameterStatus values are the SESSION's settings, so
@@ -22012,6 +22149,17 @@ impl PgHandler {
                 "55000", // object_not_in_prerequisite_state
                 format!("database \"{name}\" is not currently accepting connections"),
             ));
+        }
+        // `datconnlimit` (`CheckMyDatabase`): a superuser has none (RP-064).
+        if info.connlimit >= 0 {
+            let user = self.session_user_name();
+            if !self.is_superuser(&user) && self.sessions_on(&info.name) >= info.connlimit as usize
+            {
+                return Err(fatal(
+                    "53300", // too_many_connections
+                    format!("too many connections for database \"{name}\""),
+                ));
+            }
         }
         let _ = self.db.set(info.name.clone());
         self.backend
@@ -31240,6 +31388,51 @@ impl PgHandler {
             Statement::Update(u) => Some(u.table.clone()),
             _ => None,
         };
+        // The object this statement creates, for its role's default
+        // privileges (RP-067): `(kind, object, schema)`.
+        let created: Option<(&str, String, String)> = {
+            let schema_of = |key: &str| secantus_pgplan::schemas::split_key(key).0;
+            let named = |name: &str, schema: &Option<String>| match schema {
+                Some(s) => (format!("{s}.{name}"), s.clone()),
+                None => (name.to_string(), schema_of(name)),
+            };
+            match &stmt {
+                Statement::CreateTable(def, _) => {
+                    Some(("table", def.name.clone(), schema_of(&def.name)))
+                }
+                Statement::CreateTableAs { table, .. } => {
+                    Some(("table", table.clone(), schema_of(table)))
+                }
+                Statement::CreateView(v) => Some(("table", v.name.clone(), schema_of(&v.name))),
+                Statement::CreateSequence { name, .. } => {
+                    Some(("sequence", name.clone(), schema_of(name)))
+                }
+                Statement::CreateSchema { name, .. } => {
+                    Some(("schema", name.clone(), String::new()))
+                }
+                Statement::CreateEnum { name, schema, .. }
+                | Statement::CreateComposite { name, schema, .. }
+                | Statement::CreateRange { name, schema, .. } => {
+                    let (object, s) = named(name, schema);
+                    Some(("type", object, s))
+                }
+                Statement::CreateDomain(d) => Some(("type", d.name.clone(), schema_of(&d.name))),
+                Statement::CreateUserFunction(f) if !f.replace => Some((
+                    "function",
+                    format!(
+                        "{}({})",
+                        f.name,
+                        f.params
+                            .iter()
+                            .map(|(_, t)| t.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                    schema_of(&f.name),
+                )),
+                _ => None,
+            }
+        };
         let temp_created = match &stmt {
             Statement::CreateTable(def, _) if def.temp => Some(def.name.clone()),
             Statement::CreateTableAs {
@@ -31271,6 +31464,11 @@ impl PgHandler {
         if may_change_catalog {
             bump_catalog_version();
             self.marks.note_catalog_changed();
+        }
+        if let (Some((kind, object, schema)), Ok(_)) = (&created, &out) {
+            if let Err(e) = self.apply_default_privileges(kind, object, schema) {
+                out = Err(e);
+            }
         }
         if let (Some(name), Ok(_)) = (temp_created, &out) {
             secantus_pgplan::schemas::note_relation_key(&name);
@@ -32029,17 +32227,19 @@ impl PgHandler {
                 )?)])
             }
 
-            Statement::CreateDatabase { name } => {
+            Statement::CreateDatabase { name, options } => {
                 self.refuse_in_transaction_block("CREATE DATABASE")?;
-                if self.databases.lookup(&self.storage, &name)?.is_some() {
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".into(),
-                        "42P04".into(), // duplicate_database
-                        format!("database \"{name}\" already exists"),
-                    ))));
-                }
-                self.databases.create(&self.storage, &name)?;
+                self.create_database(&name, &options)?;
                 Ok(vec![Response::Execution(Tag::new("CREATE DATABASE"))])
+            }
+            Statement::AlterDatabase {
+                name,
+                options,
+                rename,
+                owner,
+            } => {
+                self.alter_database(&name, &options, rename.as_deref(), owner.as_deref())?;
+                Ok(vec![Response::Execution(Tag::new("ALTER DATABASE"))])
             }
 
             Statement::DropDatabase { name, if_exists } => {
@@ -34623,9 +34823,16 @@ impl PgHandler {
                     "REVOKE ROLE"
                 }))])
             }
-            Statement::AlterDefaultPrivileges => Ok(vec![Response::Execution(Tag::new(
-                "ALTER DEFAULT PRIVILEGES",
-            ))]),
+            Statement::AlterDefaultPrivileges {
+                roles,
+                schemas,
+                action,
+            } => {
+                self.alter_default_privileges(&roles, &schemas, &action)?;
+                Ok(vec![Response::Execution(Tag::new(
+                    "ALTER DEFAULT PRIVILEGES",
+                ))])
+            }
             Statement::Comment {
                 kind,
                 names,
