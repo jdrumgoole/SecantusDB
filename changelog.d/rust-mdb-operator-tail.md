@@ -41,7 +41,9 @@ No shape newly diverged.
 - `$percentile`'s `p` must be a constant expression, and is evaluated:
   - `$literal`, `$concatArrays` and constant elements count;
   - a field path is 7750300;
-  - NaN and Decimal128 elements are accepted.
+  - NaN and Decimal128 elements are accepted. A NaN `p` crashes mongod
+    8.2.12 on Linux x86-64 (an out-of-bounds read after casting NaN to an
+    index); arm64 answers the lowest value, and so does this server.
 
   A non-string `method` is 14 before anything else, and a null one is
   missing. The command layer's parse-time check now calls the same

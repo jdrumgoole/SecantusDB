@@ -806,16 +806,18 @@ def _group_once(client: Any, acc: dict) -> list:
 def test_percentile_p_is_a_constant_expression(rust_mongo: Any, mongod: Any) -> None:
     """`$percentile`'s `p` must be a CONSTANT expression (7750300 for a field
     path anywhere in it) and is evaluated, so `$literal`, `$concatArrays` and
-    constant elements count; NaN and Decimal128 elements are accepted; and a
+    constant elements count; Decimal128 elements are accepted; and a
     non-string `method` is 14 before anything else. The Rust server read `p`
-    as a literal array of int/long/double and called every bad `method` 2."""
+    as a literal array of int/long/double and called every bad `method` 2.
+
+    No NaN `p` here: mongod 8.2.12 on Linux x86-64 segfaults on one (its
+    float-to-index cast of NaN reads out of bounds) and takes the reference
+    down for every later test; arm64 answers the lowest value."""
     p = lambda value, **kw: {  # noqa: E731
         "$percentile": {"input": [3, 1, 2], "p": value, "method": "approximate", **kw}
     }
     shapes = [
         ("Decimal", p([Decimal128("0.5")])),
-        ("NaN", p([float("nan")])),
-        ("Decimal NaN", p([Decimal128("NaN")])),
         ("$literal", p({"$literal": [0.25]})),
         ("$literal scalar", p({"$literal": 0.25})),
         ("constant element", p([{"$divide": [1, 4]}])),

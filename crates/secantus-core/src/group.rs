@@ -2195,7 +2195,11 @@ pub fn percentile_spec<'a>(
 /// evaluated, so `{$literal: [0.25]}`, `{$concatArrays: [[0.5]]}` and
 /// `[{$divide: [1, 4]}]` all count. The value must be a non-empty array
 /// (7750301) of numbers (7750302) in [0, 1] (7750303); a Decimal128 counts as
-/// its double, and NaN is accepted (it ranks as the lowest value).
+/// its double, and NaN is accepted. With NaN, mongod 8.2.12 on Linux x86-64
+/// SEGFAULTS (`ceil(NaN * n)` cast to an index reads out of bounds;
+/// 2026-10-22, CI), while arm64's cast gives 0 and answers the lowest value.
+/// This server answers the lowest value: there is no answer to match in a
+/// crash.
 fn percentile_ps(raw: &Bson) -> Result<Vec<f64>, Fallback> {
     const ARRAY_OF_NUMBERS: &str =
         "The $percentile 'p' field must be an array of numbers from [0.0, 1.0], but found: ";
