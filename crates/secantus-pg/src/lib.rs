@@ -4651,11 +4651,7 @@ impl PgHandler {
         let version = catalog_cache()
             .version
             .load(std::sync::atomic::Ordering::SeqCst);
-        let serial = if overlay_empty
-            && !self.any_temp_function()
-            && !self.marks.roles_written()
-            && !self.marks.catalog_changed()
-        {
+        let serial = if overlay_empty && !self.any_temp_function() && !self.block_wrote_catalog() {
             0
         } else {
             self.session_serial
@@ -4684,6 +4680,16 @@ impl PgHandler {
         // `may_fill_catalog_cache`): publish it, but do not record it.
         let record = self.may_fill_catalog_cache(version);
         INSTALLED_USER_TYPES.with(|c| *c.borrow_mut() = record.then_some(held));
+    }
+
+    /// Has an open transaction block written the catalog (or the roles)?
+    /// Its own reads must then see those rows, and what it publishes is its
+    /// own. An autocommit statement's marks outlive it until the next
+    /// transaction ends, so the block itself is what is asked about.
+    fn block_wrote_catalog(&self) -> bool {
+        self.in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && (self.marks.catalog_changed() || self.marks.roles_written())
     }
 
     /// Build the planner's user-type tables from the catalog and publish
@@ -4715,7 +4721,7 @@ impl PgHandler {
         secantus_pgplan::regobj::set_namespaces(self.namespaces());
         // A role the open block created is named by `::regrole` in that
         // block, as PostgreSQL's syscache sees its own transaction's rows.
-        let roles = if self.marks.roles_written() {
+        let roles = if self.block_wrote_catalog() {
             self.in_open_transaction(|| self.roles())
         } else {
             self.roles()
@@ -4888,9 +4894,10 @@ impl PgHandler {
         let mut composites: Vec<secantus_pgplan::CompositeType> = Vec::new();
         // A table row type's `char(n)` widths, which a text literal cast to it
         // pads to.
-        let widths: std::collections::HashMap<String, Vec<Option<usize>>> = self
+        let composite_docs = self
             .type_catalog_docs(Self::COMPOSITE_COLLECTION)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let widths: std::collections::HashMap<String, Vec<Option<usize>>> = composite_docs
             .iter()
             .filter_map(|d| {
                 let w = d.get_array("widths").ok()?;
@@ -4919,8 +4926,7 @@ impl PgHandler {
         secantus_pgplan::set_user_types(types);
         secantus_pgplan::set_user_composites(composites);
         secantus_pgplan::set_standalone_composites(
-            self.type_catalog_docs(Self::COMPOSITE_COLLECTION)
-                .unwrap_or_default()
+            composite_docs
                 .iter()
                 .filter(|d| !d.get_bool("relation").unwrap_or(false))
                 .filter_map(|d| {
@@ -5001,7 +5007,7 @@ impl PgHandler {
         );
         // An index the open block created is a relation in that block (its
         // tables reach planning through the overlay; indexes do not).
-        let relations = if self.marks.catalog_changed() {
+        let relations = if self.block_wrote_catalog() {
             self.in_open_transaction(|| Ok(self.relations()))
                 .unwrap_or_else(|_| self.relations())
         } else {
