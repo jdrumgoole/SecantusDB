@@ -1774,7 +1774,6 @@ version = "0.5.3-beta.196"
 dependencies = [
  "bson",
  "chrono",
- "chrono-tz",
  "fancy-regex",
  "geo",
  "icu_collator",

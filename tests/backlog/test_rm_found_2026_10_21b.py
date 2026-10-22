@@ -529,11 +529,14 @@ def test_local_times_at_daylight_saving_changes(rust_mongo: Any, mongod: Any) ->
     assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
 
 
-@pytest.mark.backlog("RM-249")
+@pytest.mark.backlog_fixed("RM-249")
 def test_time_zone_rules_far_from_now(rust_mongo: Any, mongod: Any) -> None:
-    """mongod applies daylight saving after 2099 and keeps each zone's own
-    history; the Rust zone data stops daylight saving in 2100 and folds
-    historical zones into their links (Amsterdam 1900 is +0019 on mongod)."""
+    """mongod answers from timelib's built-in timezonedb (2024.2: tzdata
+    2024b with `backzone`): daylight saving after 2099, each zone's own
+    history (Amsterdam 1900 is +0019), 2024b's rules today (Asuncion), and
+    its own names. The Rust server's chrono-tz stopped daylight saving in
+    2100, folded historical zones into their links, carried 2025b and knew a
+    different set of names. `tools/probes/time_zones.py` sweeps every name."""
     fmt = lambda when, tz: {  # noqa: E731
         "$dateToString": {"date": when, "format": "%H:%M:%S %z", "timezone": tz}
     }
@@ -543,6 +546,26 @@ def test_time_zone_rules_far_from_now(rust_mongo: Any, mongod: Any) -> None:
         ("Amsterdam 1900", fmt(datetime.datetime(1900, 7, 1, 12), "Europe/Amsterdam")),
         ("Stockholm 1945", fmt(datetime.datetime(1945, 7, 1, 12), "Europe/Stockholm")),
         ("Reykjavik 1930", fmt(datetime.datetime(1930, 7, 1, 12), "Atlantic/Reykjavik")),
+        ("NY 9000", fmt(datetime.datetime(9000, 7, 1, 12), "America/New_York")),
+        ("Sydney 2150", fmt(datetime.datetime(2150, 1, 1, 12), "Australia/Sydney")),
+        ("Asuncion 2025", fmt(datetime.datetime(2025, 7, 1, 12), "America/Asuncion")),
+        ("Accra 1850 %z", fmt(datetime.datetime(1850, 7, 1, 12), "Africa/Accra")),
+        ("Factory", fmt(datetime.datetime(2020, 1, 1), "Factory")),
+        ("Coyhaique", fmt(datetime.datetime(2025, 7, 1), "America/Coyhaique")),
+        ("lower-case name", fmt(datetime.datetime(2020, 1, 1), "america/new_york")),
+        (
+            "fromParts NY 2150 gap",
+            {
+                "$dateFromParts": {
+                    "year": 2150,
+                    "month": 3,
+                    "day": 8,
+                    "hour": 2,
+                    "minute": 30,
+                    "timezone": "America/New_York",
+                }
+            },
+        ),
     ]
     assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
 

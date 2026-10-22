@@ -548,6 +548,9 @@ second batch took the "not supported" refusals out of the expression engine
 RM-241, RM-242, RM-247 and RM-250, and parts of RM-246 and RM-252. A third
 batch the same day closed the silent wrong values RM-236, RM-237, RM-239,
 RM-243, RM-244 and RM-248 (in the harness, 98 wrong values became 34).
+RM-249 followed: the server now answers time-zone questions from mongod's
+own timezonedb (`crates/secantus-core/tzdata/`), and `tools/probes/time_zones.py`
+finds no difference on any of 601 names.
 
 - [ ] **Decimal128 transcendentals beyond the authorised last digit.** Tiny
   operands underflow to 0 in `$sinh` / `$tanh` / `$atanh` (between 1E-75
@@ -562,13 +565,6 @@ RM-243, RM-244 and RM-248 (in the harness, 98 wrong values became 34).
   shapes and a missing `onError` value were fixed on 2026-10-22.)
   Backlog-ID: RM-246
   Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_convert
-- [ ] **Time-zone rules far from now differ from mongod's.** No daylight
-  saving from 2100 on (New York, London, Dublin, Sydney), and historical
-  zones folded into their links (Amsterdam 1900 is +0019 on mongod and
-  +0000 here; Stockholm 1945, Reykjavik 1930, Copenhagen, Oslo and others).
-  The fix is mongod's own zone data, not a newer tzdata.
-  Backlog-ID: RM-249
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_time_zone_rules_far_from_now
 - [ ] **Constant sub-expressions are not evaluated while optimizing.** mongod
   folds every constant sub-expression first, so `{$cond: [true, 1, {$divide:
   [1, 0]}]}`, `$ifNull`, a short-circuited `$and` and `$map` over `[]` with

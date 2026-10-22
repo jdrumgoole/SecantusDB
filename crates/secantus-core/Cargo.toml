@@ -54,15 +54,8 @@ fancy-regex = "0.14"
 # it's NOT byte-pinned to the Python evaluator (no parity corpus case); both
 # engines independently produce a fresh value in range.
 rand = "0.9"
-# Named IANA timezones for the `$dateToString` `timezone` field (e.g.
-# "America/New_York"). `chrono-tz` bundles the IANA tz database so the standalone
-# Rust server — which has no Python `zoneinfo` to defer to — can resolve a named
-# zone's UTC offset *at a given instant* (DST-correct). Only the unambiguous
-# instant→wall-clock direction is used, so `chrono-tz` and Python `zoneinfo` agree
-# for any instant in a zone whose rules both tz databases share (the parity corpus
-# stays on post-2007 dates in decade-stable major zones to stay clear of tzdb
-# release skew). `chrono` is the trait provider; default features off — no
-# `clock` / `std::time::SystemTime` needed.
+# Named time zones come from mongod's own zone data (`tzdata/`, read by
+# `src/tzdb.rs`), not a tz crate (RM-249). `chrono` is the calendar arithmetic.
 # `clock` is enabled for ONE behaviour: `$toLower`/`$toUpper` of a Timestamp,
 # which mongod renders in the server process's LOCAL time (see
 # `expressions::coerce_to_string`). mongod resolves a real tz database at the
@@ -73,7 +66,6 @@ rand = "0.9"
 # goes through the CRT instead (see the `libc` edge below) -- `chrono::Local`
 # ignores `TZ` there -- so `clock` carries the Unix half only.
 chrono = { version = "0.4", default-features = false, features = ["alloc", "clock"] }
-chrono-tz = { version = "0.10", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 # `_tzset` + `_localtime64_s`, the MSVC CRT's local-time resolution -- the same
