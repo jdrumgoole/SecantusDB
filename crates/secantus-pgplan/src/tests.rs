@@ -3121,7 +3121,7 @@ fn max_param_number_sees_the_values_of_an_insert() {
 #[test]
 fn create_and_drop_database_plan() {
     match plan_ok("CREATE DATABASE mydb WITH OWNER = joe") {
-        Statement::CreateDatabase { name } => assert_eq!(name, "mydb"),
+        Statement::CreateDatabase { name, .. } => assert_eq!(name, "mydb"),
         other => panic!("wrong statement: {other:?}"),
     }
     match plan_ok("DROP DATABASE IF EXISTS mydb") {

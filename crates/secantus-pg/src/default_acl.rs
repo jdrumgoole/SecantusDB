@@ -109,7 +109,7 @@ impl PgHandler {
             }
         }
         for g in grantees {
-            if g != "PUBLIC" && g.to_ascii_lowercase() != "public" && self.role(g)?.is_none() {
+            if !g.eq_ignore_ascii_case("public") && self.role(g)?.is_none() {
                 return Err(Self::user_error(
                     "42704",
                     format!("role \"{g}\" does not exist"),

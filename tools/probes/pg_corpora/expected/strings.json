@@ -1,4 +1,4 @@
-{"reference": "14.13 (Homebrew)",
+{"reference": "15.19 (Homebrew)",
 "volatile": {},
 "checks": [
 ["SELECT regexp_replace('a1b2c3', '[0-9]', 'X', 'g'), regexp_replace('aaa', 'a', 'X', 'gi')", "", "ok", [[["str", "aXbXcX"], ["str", "XXX"]]], [25, 25]],
@@ -35,7 +35,7 @@
 ["SELECT normalize('a'), normalize('a', NFC)", "", "ok", [[["str", "a"], ["str", "a"]]], [25, 25]],
 ["SELECT 'a' || NULL, concat('a', NULL)", "", "ok", [[["NoneType", "None"], ["str", "a"]]], [25, 25]],
 ["SELECT 'é' ~ '[[:alpha:]]', 'é' ~* 'É', 'Ä' ~ '[[:upper:]]', 'ä' ~ '[[:lower:]]', '٣' ~ '[[:digit:]]', 'é' ~ '\\w'", "", "ok", [[["bool", true], ["bool", true], ["bool", true], ["bool", true], ["bool", false], ["bool", true]]], [16, 16, 16, 16, 16, 16]],
-["SELECT datcollate, datctype FROM pg_database WHERE datname = current_database()", "", "ok", [[["str", "C.UTF-8"], ["str", "C.UTF-8"]]], [19, 19]],
+["SELECT datcollate, datctype FROM pg_database WHERE datname = current_database()", "", "ok", [[["str", "C.UTF-8"], ["str", "C.UTF-8"]]], [25, 25]],
 ["SELECT id FROM s9t WHERE t ~ '^[[:upper:]][[:lower:]]+' ORDER BY id", "", "ok", [[["num", "1"]], [["num", "4"]]], [23]],
 ["SELECT regexp_replace('éa1', '[[:alpha:]]', 'x', 'g'), regexp_split_to_array('aébÄc', '[[:upper:]]'), substring('xéy' from '[[:alpha:]]+'), 'é1' ~ '^[[:alnum:]]+$'", "", "ok", [[["str", "xx1"], ["list", [["str", "aéb"], ["str", "c"]]], ["str", "xéy"], ["bool", true]]], [25, 1009, 25, 16]]
 ]}

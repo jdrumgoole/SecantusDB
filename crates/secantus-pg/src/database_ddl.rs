@@ -92,7 +92,7 @@ impl PgHandler {
                 "conflicting or redundant options".into(),
             ));
         }
-        if let Some(p) = get("locale_provider").filter(|p| p.to_ascii_lowercase() != "libc") {
+        if let Some(p) = get("locale_provider").filter(|p| !p.eq_ignore_ascii_case("libc")) {
             return Err(Self::user_error(
                 "0A000",
                 format!("locale provider \"{p}\" is not supported"),
