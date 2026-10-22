@@ -746,6 +746,13 @@ fn lateral_leaf(
     let mut types: Vec<String> = Vec::new();
     let base = params.len() + 1;
     let mut failure: Option<Error> = None;
+    // A bare FROM-function argument the left side does not have either.
+    let mut unresolved: Option<String> = None;
+    let from_args = if function {
+        Vec::new()
+    } else {
+        crate::correlated::left_function_args(&inner, lookup)
+    };
     crate::correlated::walk_select(&mut inner, &mut |n| {
         let Some(N::ColumnRef(c)) = n.node.as_ref() else {
             return Ok(());
@@ -757,7 +764,7 @@ fn lateral_leaf(
             [_, qualifier, _] | [qualifier, _] => left.aliases.contains(qualifier),
             // A function has no columns of its own, so a bare name in its
             // arguments can only be the left side's.
-            [_] => function,
+            [name] => function || from_args.contains(name),
             _ => false,
         };
         if !points_left {
@@ -765,7 +772,12 @@ fn lateral_leaf(
         }
         let key = match left.resolve(&parts) {
             Ok(Some(k)) => k,
-            Ok(None) => return Ok(()),
+            Ok(None) => {
+                if let [name] = parts.as_slice() {
+                    unresolved.get_or_insert_with(|| name.clone());
+                }
+                return Ok(());
+            }
             Err(e) => {
                 failure.get_or_insert(e);
                 return Ok(());
@@ -805,6 +817,11 @@ fn lateral_leaf(
         return Err(e);
     }
     if keys.is_empty() {
+        // A bare FROM-function argument that is no column anywhere is
+        // PostgreSQL's 42703 (the planner could only call it unsupported).
+        if let Some(name) = unresolved {
+            return Err(Error::UndefinedColumn(name));
+        }
         // It reads nothing on its left after all.
         return Ok(None);
     }
@@ -812,7 +829,14 @@ fn lateral_leaf(
     // row re-plans it with its own.
     let mut sample_params = params.to_vec();
     sample_params.extend(types.iter().map(|t| sample_value_for_type(t)));
-    let plan = plan_select(&inner, lookup, &sample_params)?;
+    let plan = match plan_select(&inner, lookup, &sample_params) {
+        // It names a column nothing has: PostgreSQL's 42703, where the
+        // planner could only say it cannot read the reference.
+        Err(Error::Unsupported(_)) if unresolved.is_some() => {
+            return Err(Error::UndefinedColumn(unresolved.unwrap_or_default()));
+        }
+        p => p?,
+    };
     let def = sub_plan_def(&plan, lookup)?;
     let names: Vec<String> = colnames.iter().filter_map(alias_colname).collect();
     let bare_alias = matches!(

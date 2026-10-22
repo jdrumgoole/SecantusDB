@@ -509,7 +509,7 @@ impl PgHandler {
                     c("stxstattarget", "int4"),
                     c("stxkeys", "int2vector"),
                     c("stxkind", "\"char\"[]"),
-                    c("stxexprs", "text"),
+                    c("stxexprs", "pg_node_tree"),
                 ],
             ),
             "pg_tablespace" => TableDef::new(
@@ -542,7 +542,7 @@ impl PgHandler {
                     c("oid", "oid"),
                     c("prpubid", "oid"),
                     c("prrelid", "oid"),
-                    c("prqual", "text"),
+                    c("prqual", "pg_node_tree"),
                     c("prattrs", "int2vector"),
                 ],
             ),

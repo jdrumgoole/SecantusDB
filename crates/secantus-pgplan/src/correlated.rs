@@ -337,6 +337,33 @@ fn function_arg_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
     out
 }
 
+/// The bare names in FROM functions' arguments -- at this level or inside a
+/// FROM subquery -- that no relation beside the function has: a function
+/// has no columns of its own, so such a name is the row to the LEFT of a
+/// LATERAL item (`unnest(a) WITH ORDINALITY`, which `rowsfrom` makes a
+/// subquery).
+pub(crate) fn left_function_args(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Vec<String> {
+    let mut out: Vec<String> = function_arg_names(s)
+        .into_iter()
+        .filter(|n| !inner_column(s, n, lookup))
+        .collect();
+    for item in &s.from_clause {
+        if let Some(N::RangeSubselect(rs)) = item.node.as_ref() {
+            if let Some(N::SelectStmt(sel)) = rs.subquery.as_deref().and_then(|q| q.node.as_ref()) {
+                for n in left_function_args(sel, lookup) {
+                    if !out.contains(&n) && !inner_column(s, &n, lookup) {
+                        out.push(n);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Whether a FROM function's argument names a column of the outer query that
 /// no relation of the subquery has (`unnest(evttags)` under psql's `\dy`).
 pub(crate) fn function_arg_outer_ref(
@@ -347,6 +374,18 @@ pub(crate) fn function_arg_outer_ref(
     function_arg_names(inner)
         .iter()
         .any(|n| outer.contains(n) && !inner_column(inner, n, lookup))
+}
+
+/// A bare name in a FROM function's arguments that no relation of the
+/// subquery and nothing of the outer query has.
+pub(crate) fn unknown_function_arg(
+    inner: &pg_query::protobuf::SelectStmt,
+    outer: &[String],
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<String> {
+    function_arg_names(inner)
+        .into_iter()
+        .find(|n| !outer.contains(n) && !inner_column(inner, n, lookup))
 }
 
 /// Does a relation in the subquery's FROM have a column `name`?

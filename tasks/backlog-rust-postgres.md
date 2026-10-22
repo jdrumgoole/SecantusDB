@@ -792,15 +792,6 @@ as they do against PostgreSQL 15.19 (RP-070, RP-071). The gap tests are
 scenarios in `tests/backlog/test_rp_batch26.py`, measured on a private 15.19
 cluster.
 
-- [ ] **A record column's field types are lost through a FROM subquery.**
-      `(ss.x).n` over a subquery column `information_schema._pg_expandarray(a)
-      AS x` is described as `text` when the subquery returns no rows, where
-      PostgreSQL types it from the function's OUT parameters (`n integer`, `x`
-      the array's element). So `information_schema.element_types` fails with
-      42804 on a database without user functions (its UNION arms disagree),
-      and `parameters` and `triggered_update_columns` are typed wrong there.
-      Backlog-ID: RP-098
-      Verify: tests/backlog/test_rp_batch26.py::test_scenario[a record's fields through a subquery]
 - [ ] **ANALYZE computes no column statistics**, so `pg_statistic`,
       `pg_stats` and the extended-statistics relations (`pg_statistic_ext_data`,
       `pg_stats_ext`, `pg_stats_ext_exprs`) are refused by name (0A000).
@@ -833,18 +824,6 @@ cluster.
       database where PostgreSQL has 3,244, `parameters` 22 for 6,480.
       Backlog-ID: RP-102
       Verify: tests/backlog/test_rp_batch26.py::test_scenario[built-in objects in the catalogs]
-- [ ] **`GRANT` / `REVOKE` on a schema is accepted but not recorded**, so
-      `pg_namespace.nspacl` keeps initdb's ACL and pg_dump loses the change.
-      Backlog-ID: RP-103
-      Verify: tests/backlog/test_rp_batch26.py::test_scenario[schema privileges]
-- [ ] **What another role creates is reported as the bootstrap
-      superuser's.** A schema made `AUTHORIZATION r`, or a type a role other
-      than the bootstrap superuser creates, has owner 10 in `nspowner` /
-      `typowner` (ALTER TYPE ... OWNER TO is recorded). `pg_shdepend` lists
-      ownership and ACL rows for this database and the databases' owners,
-      but not other databases' objects.
-      Backlog-ID: RP-104
-      Verify: tests/backlog/test_rp_batch26.py::test_scenario[owners of what another role creates]
 - [ ] **`pg_depend` records only dependencies between relations and column
       defaults**: owned and identity sequences, indexes on their columns,
       partitions and inheritance children, defaults on their sequence and
@@ -853,37 +832,6 @@ cluster.
       the columns its expression reads.
       Backlog-ID: RP-105
       Verify: tests/backlog/test_rp_batch26.py::test_scenario[dependencies beyond relations]
-- [ ] **A misspelled outer column in a FROM function is 0A000, not 42703.**
-      `(select max(x) from unnest(a) x)` with no `a` anywhere answers
-      `ColumnRef is not supported yet`; PostgreSQL says `column "a" does not
-      exist`.
-      Backlog-ID: RP-106
-      Verify: tests/backlog/test_rp_batch26.py::test_scenario[an unknown name in a FROM function]
-- [ ] **Catalog columns of `pg_node_tree` and `anyarray` are typed `text`**:
-      `pg_attrdef.adbin`, `pg_index.indexprs` / `indpred`,
-      `pg_class.relpartbound`, `pg_policy.polqual`, `pg_rewrite.ev_action`,
-      `pg_trigger.tgqual`, `pg_type.typdefaultbin`, `pg_proc.proargdefaults`
-      and others (194 in PostgreSQL), and `pg_attribute.attmissingval`
-      (anyarray, 2277).
-      Backlog-ID: RP-107
-      Verify: tests/backlog/test_rp_batch26.py::test_scenario[expression columns' types]
-- [ ] **A child column merged with a parent's is not local.** `create table
-      c (x int, y int) inherits (p)` where `p` has `x`: PostgreSQL keeps `x`
-      `attislocal = true` with `attinhcount = 1`; this server, which does not
-      record the merge, reports `attislocal = false`.
-      Backlog-ID: RP-109
-      Verify: tests/backlog/test_rp_batch26.py::test_scenario[a merged inherited column]
-- [ ] **`pg_largeobject` shows pages a large object never wrote.** The store
-      keeps 256 KB chunks, so a write past the end of a stored chunk fills
-      the pages between with zeros, where PostgreSQL has no row for a page
-      never written (`lo_put` at 10000 after one byte: pages 0 and 4).
-      Backlog-ID: RP-110
-      Verify: tests/backlog/test_rp_batch26.py::test_scenario[a large object's pages]
-- [ ] **A type off the search path still resolves by its bare name.** With
-      `search_path` set to `''`, `'mood'::regtype` finds `public.mood` here;
-      PostgreSQL answers 42704, and `to_regtype('mood')` NULL.
-      Backlog-ID: RP-111
-      Verify: tests/backlog/test_rp_batch26.py::test_scenario[a type off the search path]
 - [ ] **The WAL and file-location functions are refused** (0A000):
       `pg_current_wal_lsn()` and `pg_relation_filepath()`. This server writes
       no PostgreSQL WAL and keeps no PostgreSQL relation files.

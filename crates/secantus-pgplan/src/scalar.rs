@@ -3149,12 +3149,11 @@ fn regclass_constants_visible(sql: &str) -> String {
         if i > 0 && text(i - 1) == "::" && t[i].token == Token::Ident as i32 {
             let name = text(i);
             let qualified = i + 2 < t.len() && text(i + 1) == ".";
+            // Looked up by its stored name, whatever the path: the text names
+            // the type the expression was written with.
             let user = !qualified
-                && crate::cast_value(Bson::String(name.to_string()), "regtype")
-                    .ok()
-                    .and_then(|v| crate::regtype_oid(&v))
-                    .and_then(crate::user_type_name)
-                    .is_some();
+                && crate::pgtypes::oid_of_name(name).is_none()
+                && crate::user_type_or_array_oid(&crate::pgtypes::user_type_key(name)).is_some();
             if user {
                 out.push_str(&sql[cursor..t[i].start as usize]);
                 out.push_str(&crate::schemas::visible_name(name));
