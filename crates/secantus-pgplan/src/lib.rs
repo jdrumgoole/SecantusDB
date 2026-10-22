@@ -15863,7 +15863,6 @@ fn aggregate_distinct(s: &pg_query::protobuf::SelectStmt) -> Result<bool> {
 /// The most rows a recursive CTE may produce. PostgreSQL has no limit and
 /// runs a non-terminating recursion until it is cancelled; a test server
 /// answering an error instead of exhausting memory is the kinder failure.
-const RECURSIVE_CTE_ROW_LIMIT: usize = 1_000_000;
 
 /// Plan and run one SELECT (its own subqueries resolved first), answering its
 /// rows and its output columns.
@@ -16199,6 +16198,67 @@ fn materialize_nested_recursive_ctes(
     select(node, lookup, params, run)
 }
 
+/// The rows of CTE `name` that `s` can read at most, when `s` reads only
+/// them, in order, under a LIMIT: `SELECT <columns> FROM name LIMIT k
+/// [OFFSET o]`, with no WHERE, grouping, ordering, DISTINCT, window or
+/// locking, and no other CTE reading `name`. Such a query takes the CTE's
+/// first `k + o` rows as they are produced, which is all a CTE scan runs.
+fn recursion_budget(
+    s: &pg_query::protobuf::SelectStmt,
+    with: &pg_query::protobuf::WithClause,
+    name: &str,
+) -> Option<usize> {
+    let only_from = matches!(s.from_clause.as_slice(),
+        [f] if matches!(f.node.as_ref(), Some(N::RangeVar(r)) if r.relname == name && r.schemaname.is_empty()));
+    if !only_from
+        || s.op != pg_query::protobuf::SetOperation::SetopNone as i32
+        || s.where_clause.is_some()
+        || !s.group_clause.is_empty()
+        || s.having_clause.is_some()
+        || !s.distinct_clause.is_empty()
+        || !s.sort_clause.is_empty()
+        || !s.window_clause.is_empty()
+        || !s.locking_clause.is_empty()
+        || s.limit_option != pg_query::protobuf::LimitOption::Count as i32
+    {
+        return None;
+    }
+    // Plain columns only: an aggregate, a window or a set-returning call
+    // reads every row.
+    let plain = s.target_list.iter().all(|t| match t.node.as_ref() {
+        Some(N::ResTarget(rt)) => matches!(
+            rt.val.as_deref().and_then(|v| v.node.as_ref()),
+            Some(N::ColumnRef(_) | N::AConst(_))
+        ),
+        _ => false,
+    });
+    if !plain {
+        return None;
+    }
+    let int = |n: Option<&pg_query::protobuf::Node>| -> Option<usize> {
+        match n?.node.as_ref()? {
+            N::AConst(c) => match c.val.as_ref()? {
+                pg_query::protobuf::a_const::Val::Ival(i) => usize::try_from(i.ival).ok(),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let limit = int(s.limit_count.as_deref())?;
+    let offset = match s.limit_offset.as_deref() {
+        None => 0,
+        some => int(some)?,
+    };
+    let read_elsewhere = with.ctes.iter().any(|c| match c.node.as_ref() {
+        Some(N::CommonTableExpr(o)) if o.ctename != name => matches!(
+            o.ctequery.as_deref().and_then(|q| q.node.as_ref()),
+            Some(N::SelectStmt(b)) if reads_relation(b, name)
+        ),
+        _ => false,
+    });
+    (!read_elsewhere).then_some(limit.saturating_add(offset))
+}
+
 /// Does a CTE's query read the CTE itself (`cterecursive`, which the raw
 /// parse tree leaves unset)?
 fn reads_relation_node(c: &pg_query::protobuf::CommonTableExpr) -> bool {
@@ -16215,12 +16275,27 @@ fn materialize_recursive_ctes(
     let Some(N::SelectStmt(s)) = node.node.as_mut() else {
         return Ok(());
     };
-    let Some(with) = s.with_clause.as_mut() else {
-        return Ok(());
-    };
-    if !with.recursive {
+    if !s.with_clause.as_ref().is_some_and(|w| w.recursive) {
         return Ok(());
     }
+    // How many of a CTE's rows the query above can read, when that is all
+    // it reads (RP-063): a CTE scan pulls rows only as they are asked for.
+    let budgets: Vec<(String, usize)> = s
+        .with_clause
+        .as_ref()
+        .map(|w| {
+            w.ctes
+                .iter()
+                .filter_map(|c| match c.node.as_ref() {
+                    Some(N::CommonTableExpr(c)) => {
+                        recursion_budget(s, w, &c.ctename).map(|b| (c.ctename.clone(), b))
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let with = s.with_clause.as_mut().expect("checked");
     #[allow(clippy::type_complexity)]
     let mut done: Vec<(
         String,
@@ -16261,17 +16336,18 @@ fn materialize_recursive_ctes(
                     ),
                 ));
             }
+            let budget = budgets
+                .iter()
+                .find(|(n, _)| *n == c.ctename)
+                .map(|(_, b)| *b);
             let (mut rows, cols) = run_select(base, lookup, params, run)?;
+            // UNION keeps each row's first appearance; a set of row keys
+            // keeps that linear (a `Vec::contains` made 20,000 steps take
+            // seconds).
+            let key = |r: &Vec<Bson>| format!("{r:?}");
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             if !body.all {
-                let mut seen: Vec<Vec<Bson>> = Vec::new();
-                rows.retain(|r| {
-                    if seen.contains(r) {
-                        false
-                    } else {
-                        seen.push(r.clone());
-                        true
-                    }
-                });
+                rows.retain(|r| seen.insert(key(r)));
             }
             let types: Vec<String> = cols.iter().map(|(_, t)| t.clone()).collect();
             let names: Vec<pg_query::protobuf::Node> = if c.aliascolnames.is_empty() {
@@ -16280,7 +16356,11 @@ fn materialize_recursive_ctes(
                 c.aliascolnames.clone()
             };
             let mut working = rows.clone();
+            if budget.is_some_and(|b| rows.len() >= b) {
+                working.clear();
+            }
             while !working.is_empty() {
+                cancel::check()?;
                 let mut p = params.clone();
                 let table = values_select(&working, &types, &mut p);
                 let step = substitute_ctes(step, &[(c.ctename.clone(), table, names.clone())]);
@@ -16300,25 +16380,18 @@ fn materialize_recursive_ctes(
                     }
                 }
                 if !body.all {
-                    let mut kept: Vec<Vec<Bson>> = Vec::new();
-                    for r in fresh.drain(..) {
-                        if !rows.contains(&r) && !kept.contains(&r) {
-                            kept.push(r);
-                        }
-                    }
-                    fresh = kept;
-                }
-                if rows.len() + fresh.len() > RECURSIVE_CTE_ROW_LIMIT {
-                    return Err(Error::Sqlstate(
-                        "54000",
-                        format!(
-                            "recursive query \"{}\" produced more than {RECURSIVE_CTE_ROW_LIMIT} rows",
-                            c.ctename
-                        ),
-                    ));
+                    fresh.retain(|r| seen.insert(key(r)));
                 }
                 rows.extend(fresh.iter().cloned());
                 working = fresh;
+                // The query above has read all it will.
+                if let Some(b) = budget.filter(|b| rows.len() >= *b) {
+                    rows.truncate(b);
+                    break;
+                }
+            }
+            if let Some(b) = budget {
+                rows.truncate(b);
             }
             (rows, cols)
         };
