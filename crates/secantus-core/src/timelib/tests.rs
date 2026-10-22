@@ -391,3 +391,17 @@ fn format_validation_matches_mongod() {
         ))
     );
 }
+
+/// A no-colon `HHMM` time leaves the microseconds UNSET, which mongod adds
+/// as -9999999: ten seconds early after truncation (8.2.11, 2026-10-22,
+/// RM-258). A colon, or seconds, sets them.
+#[test]
+fn a_no_colon_time_is_ten_seconds_early() {
+    assert_eq!(parse_ms("10000-01-01"), Ok(at(2000, 1, 1, 9, 59, 50)));
+    assert_eq!(parse_ms("2026-01-01 1030"), Ok(at(2026, 1, 1, 10, 29, 50)));
+    assert_eq!(parse_ms("2026-01-01 10:30"), Ok(at(2026, 1, 1, 10, 30, 0)));
+    assert_eq!(
+        parse_ms("2026-01-01 103015"),
+        Ok(at(2026, 1, 1, 10, 30, 15))
+    );
+}

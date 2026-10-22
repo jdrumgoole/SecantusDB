@@ -990,15 +990,25 @@ def test_percentile_p_is_a_constant_expression(rust_mongo: Any, mongod: Any) -> 
     assert not diffs, "\n".join(diffs)
 
 
-@pytest.mark.backlog("RM-258")
+@pytest.mark.backlog_fixed("RM-258")
 def test_date_from_string_five_digit_year(rust_mongo: Any, mongod: Any) -> None:
-    """mongod's timelib reads `"10000-01-01"` as a no-colon time `1000` and
-    the date `0-01-01`, and answers 2000-01-01T09:59:50Z; the Rust port of
-    the same scanner answers 10:00:00. The ten seconds come from a rule after
-    `gnunocolon` that the port does not reproduce."""
+    """mongod's timelib reads `"10000-01-01"` as the no-colon time `1000` and
+    the date `0-01-01`. Its `gnunocolon` rule sets hours and minutes but
+    leaves the microseconds UNSET (-9999999), and mongod adds them as they
+    are, so EVERY `HHMM` time is 9.999999 seconds early, truncated to ten:
+    2000-01-01T09:59:50Z, and `"2026-01-01 1030"` is 10:29:50. The Rust port
+    read the unset microseconds as 0 (traced in mongod 8.2.11's own timelib,
+    2026-10-22)."""
+    dfs = lambda s, **kw: {"$dateFromString": {"dateString": s, **kw}}  # noqa: E731
     shapes = [
-        ("10000-01-01", {"$dateFromString": {"dateString": "10000-01-01"}}),
-        ("1000 0-01-01", {"$dateFromString": {"dateString": "1000 0-01-01"}}),
-        ("2000 0-03-04", {"$dateFromString": {"dateString": "2000 0-03-04"}}),
+        ("10000-01-01", dfs("10000-01-01")),
+        ("1000 0-01-01", dfs("1000 0-01-01")),
+        ("2000 0-03-04", dfs("2000 0-03-04")),
+        ("HHMM after a date", dfs("2026-01-01 1030")),
+        ("THHMM", dfs("2026-01-01T1030")),
+        ("HHMM in a zone", dfs("2026-01-01 1030", timezone="America/New_York")),
+        ("HHMMSS", dfs("2026-01-01 103015")),
+        ("HH:MM", dfs("2026-01-01 10:30")),
+        ("format %H%M", dfs("2026-01-01 1030", format="%Y-%m-%d %H%M")),
     ]
     assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
