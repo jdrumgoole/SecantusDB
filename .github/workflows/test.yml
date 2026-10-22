@@ -1284,14 +1284,16 @@ jobs:
     timeout-minutes: 60
     # Two shards since 2026-10-22, when this job became the whole PR run's
     # critical path (19-27 min, the suite step alone 11-18). Each shard
-    # builds `secantusd-pg` and runs its share; the `server` shard keeps
-    # everything else (secantusd-rs, the cargo tests, the login and backlog
-    # comparisons). The split is by FILE: a file named in neither list runs
+    # builds `secantusd-pg` and runs its share. `server`: the slice suite,
+    # secantusd-rs, the cargo tests, the login and backlog comparisons.
+    # `differential`: everything compared with PostgreSQL's answers, live
+    # (the differential suite, against the service below) or recorded (the
+    # corpora and the other binary-only files). The split is by FILE: a file named in neither list runs
     # nowhere, so a new suite joins one of them in the step below.
     strategy:
       fail-fast: false
       matrix:
-        shard: [server, corpora]
+        shard: [server, differential]
     env:
       UV_PYTHON: "3.10"
       # The suites read this (tests/pg_oracle.py); without it they fall back to
@@ -1433,7 +1435,6 @@ jobs:
           (cd crates/secantus-pg && cargo test)
 
       - name: Verify the reference server is reachable
-        if: matrix.shard == 'server'
         # Fail CLOSED. The whole point of this job is that these suites stop
         # skipping, and a skip is invisible in a green pytest summary — so
         # prove the connection here, where a failure is unambiguous.
@@ -1458,19 +1459,19 @@ jobs:
           # few minutes, and is deterministic -- and it is the suite that has
           # pre-existing tests a shared-code change can silently break (that is
           # exactly how #1363 left `main` red under green CI).
-          # Split by shard (see `strategy` above). server: the two suites
-          # that need the reference server or secantusd-rs. corpora: the
-          # binary-only files, led by the corpora (one corpus, b66_join_stream,
-          # is a 3-minute test on its own).
+          # Split by shard (see `strategy` above). Measured 2026-10-22 with
+          # the differential suite in `server`: 7m42 of suites there against
+          # 4m28 here, so it moved. One corpus, b66_join_stream, is a
+          # 3-minute test on its own: no shard of this lane gets below that.
           if [ "${{ matrix.shard }}" = "server" ]; then
           files="tests/test_rust_pgserver_slice.py"
+          else
+          files=""
           # The DIFFERENTIAL suite, whole: 836 cases against the PostgreSQL 14
           # service above. It was left out as too slow for this lane, with one
           # node named, so 13 of its 14 tests ran only on a developer's box.
           # Measured 2026-10-21: six minutes at -n 4 on a loaded laptop.
           files="$files tests/test_rust_pgserver_differential.py"
-          else
-          files=""
           # The release smoke test, in the one lane that already builds the
           # binary it needs. It is `skipif`-gated on that binary existing, so
           # anywhere else it silently collects nothing -- a release gate that
