@@ -4052,9 +4052,12 @@ fn op_filter(arg: &Bson, ctx: &Ctx) -> R {
     let var = as_var_name(d.get("as"))?;
     let null = Bson::Null;
     let cond = d.get("cond").unwrap_or(&null);
-    // `limit` only bounds the output when it evaluates to an integer.
+    // mongod returns an empty input before it looks at `limit` at all.
+    if arr.is_empty() {
+        return Ok(Bson::Array(arr));
+    }
     let limit = match d.get("limit") {
-        Some(e) => as_int_like(&eval(e, ctx)?),
+        Some(e) => filter_limit(&eval(e, ctx)?)?,
         None => None,
     };
     let mut out: Vec<Bson> = Vec::new();
@@ -4069,6 +4072,38 @@ fn op_filter(arg: &Bson, ctx: &Ctx) -> R {
         }
     }
     Ok(Bson::Array(out))
+}
+
+/// `$filter`'s evaluated `limit`, as mongod 8.2.11 reads it (2026-10-22):
+/// null or missing is no limit; any number holding an int32 exactly is the
+/// limit (`2.0` and `Decimal128("2")` count) and must be positive (327392,
+/// `-0.0` included); anything else -- a bool, a string, NaN, a fraction, a
+/// long past int32 -- is 327391. Both are runtime errors, never folded.
+fn filter_limit(v: &Bson) -> Result<Option<i128>, Fallback> {
+    if is_null(v) {
+        return Ok(None);
+    }
+    let n = match v {
+        Bson::Int32(n) => Some(*n as i64),
+        Bson::Int64(n) => Some(*n),
+        Bson::Double(x) if x.fract() == 0.0 => Some(*x as i64),
+        Bson::Decimal128(_) => crate::decimal::decimal_to_i64_exact(v),
+        _ => None,
+    };
+    let render = crate::aggregate::render_value_compact(v);
+    match n.and_then(|n| i32::try_from(n).ok()) {
+        Some(n) if n > 0 => Ok(Some(n as i128)),
+        Some(_) => Err(Fallback::mongo(
+            327392,
+            format!("$filter: limit must be greater than 0: {render}"),
+        )
+        .with_folded(false)),
+        None => Err(Fallback::mongo(
+            327391,
+            format!("$filter: limit must be represented as a 32-bit integral value: {render}"),
+        )
+        .with_folded(false)),
+    }
 }
 
 fn op_reduce(arg: &Bson, ctx: &Ctx) -> R {
@@ -5812,9 +5847,17 @@ fn op_date_add(arg: &Bson, ctx: &Ctx, sign: i128) -> R {
     }
     let local = millis + timezone_offset_ms(tz, millis)?;
     let shifted = shift_date(local, &unit, amount).ok_or_else(overflowed)?;
-    Ok(Bson::DateTime(bson::DateTime::from_millis(
-        tz_instant_from_local_ms(tz, shifted)?,
-    )))
+    // A shifted local time that happens twice keeps the start's daylight
+    // saving: a day added to 01:30 EDT on the day before New York's autumn
+    // change is 01:30 EDT, the EARLIER instant, where `$dateFromParts` takes
+    // the later (measured 8.2.11, 2026-10-22).
+    let instant = match tz {
+        Some(Bson::String(s)) if resolve_tz_offset(s).is_none() => {
+            named_local_to_utc_ms(s, shifted, Some(millis)).ok_or_else(|| tz_error(s, None))?
+        }
+        _ => tz_instant_from_local_ms(tz, shifted)?,
+    };
+    Ok(Bson::DateTime(bson::DateTime::from_millis(instant)))
 }
 
 fn op_date_diff(arg: &Bson, ctx: &Ctx) -> R {
@@ -5880,9 +5923,8 @@ const TRUNC_REF_YEAR: i64 = 2000;
 /// A local wall clock back to the instant it names.
 ///
 /// The counterpart of `timezone_offset_ms`, which only goes instant→wall-clock.
-/// `earliest()` matches Python `zoneinfo`'s `fold=0` for an ambiguous local time
-/// (the hour repeated when DST ends); a local time inside a DST GAP does not
-/// exist at all, and chrono answers `None` there, which defers.
+/// See `named_local_to_utc_ms` for the local times a change of offset makes
+/// ambiguous or skips.
 fn tz_instant_from_local_ms(tz: Option<&Bson>, local_millis: i64) -> Result<i64, Fallback> {
     match tz {
         None | Some(Bson::Null) => Ok(local_millis),
@@ -5890,23 +5932,55 @@ fn tz_instant_from_local_ms(tz: Option<&Bson>, local_millis: i64) -> Result<i64,
             if let Some(off_min) = resolve_tz_offset(s) {
                 return Ok(local_millis - off_min * 60_000);
             }
-            named_local_to_utc_ms(s, local_millis).ok_or_else(|| tz_error(s, None))
+            named_local_to_utc_ms(s, local_millis, None).ok_or_else(|| tz_error(s, None))
         }
         Some(_) => Err(Fallback::Defer),
     }
 }
 
-fn named_local_to_utc_ms(name: &str, local_millis: i64) -> Option<i64> {
-    use chrono::{DateTime, TimeZone};
+/// The instant a local wall clock in zone `name` names, as mongod resolves
+/// it (8.2.11, 2026-10-22): a time that happens twice, in the hour repeated
+/// when daylight saving ends, is the LATER instant, in standard time; a time
+/// that never happens, in the hour skipped when it starts, is read with the
+/// offset in force before the change, so 02:30 on New York's spring-forward
+/// day is 07:30Z (03:30 EDT). Measured in `$dateFromParts`, `$dateAdd` and
+/// `$dateFromString`, in New York, London, Sydney, Lord Howe's half-hour
+/// change and São Paulo's midnight one.
+///
+/// `like` is an instant whose daylight saving a repeated time keeps when it
+/// has one: `$dateAdd` resolves to the start date's (see `op_date_add`).
+fn named_local_to_utc_ms(name: &str, local_millis: i64, like: Option<i64>) -> Option<i64> {
+    use chrono::{DateTime, LocalResult, Offset, TimeZone};
+    use chrono_tz::OffsetComponents;
     let tz: chrono_tz::Tz = name.parse().ok()?;
     let secs = local_millis.div_euclid(1000);
     let nanos = (local_millis.rem_euclid(1000) * 1_000_000) as u32;
     let naive = DateTime::from_timestamp(secs, nanos)?.naive_utc();
-    Some(
-        tz.from_local_datetime(&naive)
-            .earliest()?
-            .timestamp_millis(),
-    )
+    match tz.from_local_datetime(&naive) {
+        LocalResult::Single(t) => Some(t.timestamp_millis()),
+        LocalResult::Ambiguous(earlier, later) => {
+            let in_dst = |o: &chrono_tz::TzOffset| !o.dst_offset().is_zero();
+            let keep_earlier = like
+                .and_then(DateTime::from_timestamp_millis)
+                .is_some_and(|l| {
+                    let like_dst = in_dst(&tz.offset_from_utc_datetime(&l.naive_utc()));
+                    like_dst == in_dst(earlier.offset()) && like_dst != in_dst(later.offset())
+                });
+            Some(if keep_earlier { earlier } else { later }.timestamp_millis())
+        }
+        LocalResult::None => {
+            // In a gap, the offset before the change and the one after each
+            // map the local time to an instant on the other side of it, so
+            // the two lookups below find both; the one before is the smaller.
+            let offset_at = |ms: i64| -> Option<i64> {
+                let utc = DateTime::from_timestamp_millis(ms)?.naive_utc();
+                Some(i64::from(tz.offset_from_utc_datetime(&utc).fix().local_minus_utc()) * 1000)
+            };
+            let first = offset_at(local_millis)?;
+            let second = offset_at(local_millis - first)?;
+            Some(local_millis - first.min(second))
+        }
+    }
 }
 
 /// Day number of the first `start_of_week` weekday on or after 2000-01-01.
@@ -7853,17 +7927,7 @@ fn op_regex_find_all(arg: &Bson, ctx: &Ctx) -> R {
 
 // --- math ---------------------------------------------------------------
 
-/// The f64 for a unary math operator, deferring bool *and* non-numeric to Python
-/// (which raises Location28765 / 51081 rather than coercing a bool or computing
-/// on a string). Real numbers only; null is handled by the caller.
-fn math_float(v: &Bson) -> Result<f64, Fallback> {
-    if matches!(v, Bson::Boolean(_)) {
-        return Err(Fallback::Defer);
-    }
-    as_float_like(v).ok_or(Fallback::Defer)
-}
-
-/// [`math_float`] that NAMES the type error rather than deferring. Decimal128
+/// The f64 for a unary math operator, naming the type error. Decimal128
 /// still defers -- it is numeric to mongod, so the operator has a real answer
 /// and computing it needs the decimal engine -- but a bool / string / document /
 /// date operand is a type error mongod states, and stating it is the difference
@@ -8583,8 +8647,14 @@ fn op_pow(arg: &Bson, ctx: &Ctx) -> R {
             if let Some(r) = u32::try_from(exp).ok().and_then(|e| base.checked_pow(e)) {
                 return Ok(int_result(r, is_int64(b) || is_int64(e)));
             }
+        } else if base == 1 || base == -1 {
+            // The one integral answer a negative exponent has: mongod keeps
+            // it integral, `{$pow: [1, -5]}` is int32 1 and `[-1, -5]` is -1
+            // (measured 8.2.11, 2026-10-22).
+            let r = if base == 1 || exp % 2 == 0 { 1 } else { -1 };
+            return Ok(int_result(r, is_int64(b) || is_int64(e)));
         }
-        // negative exponent -> float, handled below.
+        // any other negative exponent -> float, handled below.
     }
     let (Some(a), Some(b)) = (as_float_like(&vals[0]), as_float_like(&vals[1])) else {
         return Err(Fallback::Defer);
@@ -8617,7 +8687,7 @@ const INT32_MAX_F: f64 = i32::MAX as f64;
 /// this order, each with its own code:
 ///
 /// 1. `Value::coerceToLong` — a non-numeric (string, bool, ...) is
-///    Location16004, a NaN / Infinity is Location31109.
+///    Location16004, a double NaN / Infinity is Location31109.
 /// 2. `Value::integral()` — Location51082.
 /// 3. the `[-20, 100]` bounds — Location51083.
 ///
@@ -8632,7 +8702,17 @@ fn round_precision(place: &Bson, op: &str) -> Result<Option<i64>, Fallback> {
         // The canonical decimal string parses exactly over the whole region
         // this function can accept; anything it cannot represent is far outside
         // the int32 window and lands on Location51082 either way.
-        Bson::Decimal128(d) => d.to_string().parse::<f64>().unwrap_or(f64::NAN),
+        // A decimal NaN or infinity is not integral (51082): only a DOUBLE
+        // goes through `coerceToLong`'s 31109 first (measured 8.2.11,
+        // 2026-10-22).
+        Bson::Decimal128(d) => {
+            let value = d.to_string().parse::<f64>().unwrap_or(f64::NAN);
+            if value.is_finite() {
+                value
+            } else {
+                f64::MAX
+            }
+        }
         other => {
             return Err(Fallback::mongo(
                 16004,
@@ -8672,25 +8752,67 @@ fn round_precision(place: &Bson, op: &str) -> Result<Option<i64>, Fallback> {
     Ok(Some(n))
 }
 
-fn round_trunc_args(arg: &Bson, ctx: &Ctx, op: &str) -> Result<(Bson, Option<i32>), Fallback> {
-    match arg {
-        Bson::Array(a) if !a.is_empty() => {
-            let n = eval(&a[0], ctx)?;
-            let place = if a.len() > 1 {
-                round_precision(&eval(&a[1], ctx)?, op)?.map(|p| p as i32)
-            } else {
-                Some(0)
-            };
-            Ok((n, place))
-        }
-        Bson::Array(_) => Err(Fallback::Defer),
-        other => Ok((eval(other, ctx)?, Some(0))),
+/// `$round` / `$trunc`'s value and place, in mongod's order (8.2.11,
+/// 2026-10-22): a null or missing value is null before the place is even
+/// looked at (`{$round: [null, 200]}` is null, not 51083), a non-number is
+/// 51081 whatever the place, and only then is the place validated. `None`
+/// means the answer is null.
+fn round_trunc_args(arg: &Bson, ctx: &Ctx, op: &str) -> Result<Option<(Bson, i32)>, Fallback> {
+    let (value, place) = match arg {
+        Bson::Array(a) if !a.is_empty() => (&a[0], a.get(1)),
+        Bson::Array(_) => return Err(Fallback::Defer),
+        other => (other, None),
+    };
+    let n = eval(value, ctx)?;
+    if is_null(&n) {
+        return Ok(None);
     }
+    if !matches!(
+        n,
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+    ) {
+        return Err(Fallback::mongo(
+            51081,
+            format!(
+                "{op} only supports numeric types, not {}",
+                crate::query::bson_type_name(&n)
+            ),
+        ));
+    }
+    let place = match place {
+        // A null precision makes the whole operator null, which is distinct
+        // from a precision of 0.
+        Some(p) => match round_precision(&eval(p, ctx)?, op)? {
+            Some(p) => p as i32,
+            None => return Ok(None),
+        },
+        None => 0,
+    };
+    Ok(Some((n, place)))
 }
 
-// `$round`: round-half-to-even (Python `round`). An int stays an int (unchanged
-// for place >= 0; rounded to the 10^|place| place for place < 0); a double rounds
-// to `place` decimals as a double. Mirrors `expressions._op_round`.
+/// A double rounded as mongod rounds it: converted to a Decimal128 of 34
+/// significant digits, rounded there, and converted back. So it is the
+/// double's exact binary value that rounds, not its shortest decimal text:
+/// `{$round: [2.675, 2]}` is 2.67 and `{$trunc: [1.45, 2]}` 1.44, because
+/// those doubles sit just below 2.675 and 1.45 (measured 8.2.11,
+/// 2026-10-22). `(x * 10^p).round() / 10^p`, which stood here, rounded the
+/// text, lost digits at large magnitudes and overflowed `1e300` to infinity.
+fn double_rounded(x: f64, place: i32, mode: crate::decimal::RoundMode) -> R {
+    if !x.is_finite() {
+        return Ok(Bson::Double(x));
+    }
+    let d = crate::decimal::parse(&format!("{x:.33e}")).ok_or(Fallback::Defer)?;
+    let rounded = crate::decimal::round_to_exp(&d, -place, mode).ok_or(Fallback::Defer)?;
+    crate::decimal::to_string(&rounded)
+        .parse::<f64>()
+        .map(Bson::Double)
+        .map_err(|_| Fallback::Defer)
+}
+
+// `$round`: round-half-to-even. An int stays an int (unchanged for place >= 0;
+// rounded to the 10^|place| place for place < 0); a double rounds through a
+// Decimal128 (`double_rounded`).
 /// `v` rounded half-to-even at `10^power`, entirely in integers.
 ///
 /// `power` is non-negative. Ties go to the even multiple, which is what
@@ -8712,14 +8834,10 @@ fn round_half_even_i128(v: i128, power: i32) -> i128 {
 }
 
 fn op_round(arg: &Bson, ctx: &Ctx) -> R {
-    let (n, place) = round_trunc_args(arg, ctx, "$round")?;
-    let Some(place) = place else {
-        // A null precision makes the whole operator null, which is
-        // distinct from a precision of 0.
+    let Some((n, place)) = round_trunc_args(arg, ctx, "$round")? else {
         return Ok(Bson::Null);
     };
     match n {
-        Bson::Null => Ok(Bson::Null),
         Bson::Int32(_) | Bson::Int64(_) => {
             if place >= 0 {
                 return Ok(n);
@@ -8742,12 +8860,16 @@ fn op_round(arg: &Bson, ctx: &Ctx) -> R {
                     ),
                 ));
             }
+            // mongod widens an int32 result only past int32's TOP: one below
+            // its bottom is cast back to int32 and wraps, so
+            // `{$round: [-2147483648, -1]}` is int32 2147483646 (measured
+            // 8.2.11, 2026-10-22).
+            if matches!(n, Bson::Int32(_)) && rounded <= i32::MAX as i128 {
+                return Ok(Bson::Int32(rounded as i64 as i32));
+            }
             Ok(int_result(rounded, is_int64(&n)))
         }
-        Bson::Double(d) => {
-            let factor = 10f64.powi(place);
-            Ok(Bson::Double((d * factor).round_ties_even() / factor))
-        }
+        Bson::Double(d) => double_rounded(d, place, crate::decimal::RoundMode::HalfEven),
         // The RESULT keeps the requested place as its quantum: `2.567` at
         // place 2 is `2.57`, and `25` at place -1 is `2E+1`.
         v @ Bson::Decimal128(_) => decimal_rounded(&v, -place, crate::decimal::RoundMode::HalfEven),
@@ -8755,18 +8877,13 @@ fn op_round(arg: &Bson, ctx: &Ctx) -> R {
     }
 }
 
-// `$trunc`: truncate toward zero to `place` decimals. Python computes
-// `math.trunc(n * 10**place) / 10**place`, and `/` is float division, so the
-// result is always a double (even for an int input). Mirrors `_op_trunc`.
+// `$trunc`: truncate toward zero to `place` decimals. An integer stays an
+// integer; a double truncates through a Decimal128 (`double_rounded`).
 fn op_trunc(arg: &Bson, ctx: &Ctx) -> R {
-    let (n, place) = round_trunc_args(arg, ctx, "$trunc")?;
-    let Some(place) = place else {
-        // A null precision makes the whole operator null, which is
-        // distinct from a precision of 0.
+    let Some((n, place)) = round_trunc_args(arg, ctx, "$trunc")? else {
         return Ok(Bson::Null);
     };
     match n {
-        Bson::Null => Ok(Bson::Null),
         // Toward ZERO at the requested place, keeping it as the quantum:
         // `2.567` at place 2 is `2.56`, not the `2.57` `$round` gives.
         Bson::Decimal128(_) => decimal_rounded(&n, -place, crate::decimal::RoundMode::Trunc),
@@ -8785,15 +8902,10 @@ fn op_trunc(arg: &Bson, ctx: &Ctx) -> R {
                 };
                 return Ok(int_result(kept, is_int64(&n)));
             }
-            let nf = math_float(&n)?; // bool / non-numeric -> Python (51081)
-            let factor = 10f64.powi(place);
-            let truncated = (nf * factor).trunc() / factor;
-            // Type-preserving, as `$floor` / `$ceil`: dividing by `factor`
-            // made every int result a double (`$trunc` of 1 answered 1.0).
-            match n {
-                Bson::Int32(_) | Bson::Int64(_) => Ok(int_result(truncated as i128, is_int64(&n))),
-                _ => Ok(Bson::Double(truncated)),
-            }
+            let Bson::Double(x) = n else {
+                return Err(Fallback::Defer); // round_trunc_args admits numbers only
+            };
+            double_rounded(x, place, crate::decimal::RoundMode::Trunc)
         }
     }
 }
