@@ -392,27 +392,73 @@ def test_pow_of_one_with_negative_exponent_stays_integral(rust_mongo: Any, mongo
     assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
 
 
-@pytest.mark.backlog("RM-245")
+def _within_authorised_last_digit(ours: str, theirs: str) -> bool:
+    """Two `$project` answers that differ only in the authorised last digit
+    of a finite Decimal128 transcendental (Joe, 2026-10-06): both one
+    decimal, unequal, 1-2 units apart in the 34th significant digit. Equal
+    values written differently (`1` and `1.000...`) are NOT within it."""
+    import decimal
+    import json
+
+    def value(answer: str) -> decimal.Decimal | None:
+        try:
+            doc = json.loads(answer)
+            return decimal.Decimal(doc[0]["z"]["$numberDecimal"])
+        except (ValueError, KeyError, IndexError, TypeError, decimal.InvalidOperation):
+            return None
+
+    a, b = value(ours), value(theirs)
+    if a is None or b is None or not a.is_finite() or not b.is_finite() or a == b:
+        return False
+    unit = decimal.Decimal(10) ** (max(abs(a), abs(b)).adjusted() - 33)
+    return abs(a - b) <= 2 * unit
+
+
+@pytest.mark.backlog_fixed("RM-245")
 def test_decimal_hyperbolic_and_trig_edges(rust_mongo: Any, mongod: Any) -> None:
-    """Decimal128 transcendentals past the authorised last digit: tiny
-    operands underflow to 0 in `$sinh` / `$tanh` / `$atanh`, a zero keeps
-    mongod's exponent, huge `$sin` arguments are 50989 instead of a value,
-    and `$sinh` of 1E+34 is 2 "not supported" instead of Infinity."""
+    """Decimal128 transcendentals beyond the authorised last digit, as
+    mongod 8.2.11 answers them (2026-10-22). The Rust server underflowed tiny
+    `$sinh` / `$tanh` / `$atanh` operands to 0, gave every zero the same
+    exponent, left a tiny result unpadded, refused `$sin` of an argument past
+    about 1E+1100 with 50989, and answered 2 for `$sinh` of 1E+34.
+
+    - a zero: `$sin`, `$atan`, `$tanh` return it as it came; `$tan`, `$asin`,
+      `$sinh` move its exponent down 40; `$acos` of 1 is `0E-6176`;
+    - a tiny result is padded to 34 digits within the exponent floor, but
+      `$atanh` of an argument whose exponent is below -50 is the argument;
+    - `$cos` of an argument whose exponent is -53 or less, and `$cosh` up to
+      `1E-40`, are the padded one; above, a result of one is a bare `1`, as
+      is `$tanh` from 40;
+    - `$sinh` / `$cosh` overflow to Infinity and `$tanh` saturates;
+    - `$sin` / `$cos` / `$tan` reduce any argument the format holds.
+
+    The last digit of a finite result may differ: that is authorised."""
     d = Decimal128
     shapes = [
-        ("$sinh 1E-100", {"$sinh": d("1E-100")}),
-        ("$tanh 1E-100", {"$tanh": d("1E-100")}),
-        ("$atanh 1E-100", {"$atanh": d("1E-100")}),
-        ("$sin 1E-100", {"$sin": d("1E-100")}),
-        ("$cos 1E-100", {"$cos": d("1E-100")}),
-        ("$sin 0E+5", {"$sin": d("0E+5")}),
-        ("$tan 0E+5", {"$tan": d("0E+5")}),
-        ("$acos 1", {"$acos": d("1")}),
-        ("$sin 1E+1200", {"$sin": d("1E+1200")}),
-        ("$sinh 1E+34", {"$sinh": d("1E+34")}),
-        ("$tanh 1E+34", {"$tanh": d("1E+34")}),
+        (f"{op} {v}", {op: d(v)})
+        for op, values in {
+            "$sin": ["0E+5", "-0.00", "1E-50", "1.234E-60", "1E-6176", "1E+1200", "1E+6000"],
+            "$cos": ["0E+5", "1E-52", "1E-53", "999999E-53", "1E-100", "1E-30", "1E+6000"],
+            "$tan": ["0E+5", "-0.00", "0E+6111", "1E+6000"],
+            "$asin": ["0E+5", "-0E+3"],
+            "$acos": ["1"],
+            "$atan": ["0E+5", "1E-45", "-1E-60"],
+            "$sinh": ["0E+5", "1E-80", "1E-6143", "1E-6176", "1E+34", "-1E+100"],
+            "$cosh": ["1E-40", "1.5E-40", "9E-41", "1E-20", "1E+34"],
+            "$tanh": ["0E+5", "1E-100", "40", "100", "-1E+34"],
+            "$atanh": ["1E-50", "1.5E-50", "1.000E-50", "1E-100", "3E-49"],
+        }.items()
+        for v in values
     ]
-    assert not (d := _diverging(rust_mongo, mongod, shapes)), "\n".join(d)
+    diffs = []
+    for label, expr in shapes:
+        ours, theirs = (
+            _answer(rust_mongo, expr, DOC, "$project"),
+            _answer(mongod, expr, DOC, "$project"),
+        )
+        if ours != theirs and not _within_authorised_last_digit(ours, theirs):
+            diffs.append(f"{label}: mongod {theirs}, rust {ours}")
+    assert not diffs, "\n".join(diffs)
 
 
 # ------------------------------------------------------------- conversion --
