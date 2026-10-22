@@ -176,15 +176,51 @@ pub fn fixed_arity(op: &str) -> Option<usize> {
         .map(|(_, n)| *n)
 }
 
+/// A dotted path in an EXPRESSION, as mongod's `ExpressionFieldPath` reads
+/// it -- not as a query reads one. Over a document it steps into the field;
+/// over an ARRAY it applies the rest of the path to each DOCUMENT element
+/// (scalars and nested arrays are skipped, and so is an element where the
+/// rest is missing) and the answer is the array of those, empty or not; a
+/// numeric component is a field name, never an index. So over
+/// `a: [{b: 1}, {b: 2}, 5]`, `"$a.b"` is `[1, 2]` and `"$a.zz"` is `[]`, and
+/// `"$arr.0"` over `[1, 2]` is `[]` (measured 8.2.11, 2026-10-22). `None` is
+/// missing. The query layer's `paths::get_path` indexes arrays and never
+/// maps over them, which made every `"$a.b"` through an array missing.
+pub(crate) fn expr_path(doc: &Document, path: &str) -> Option<Bson> {
+    let parts: Vec<&str> = path.split('.').collect();
+    expr_path_from(doc, &parts)
+}
+
+fn expr_path_from(doc: &Document, parts: &[&str]) -> Option<Bson> {
+    expr_path_in(doc.get(parts[0])?, &parts[1..])
+}
+
+/// The rest of an expression path, from a value already reached.
+fn expr_path_in(value: &Bson, rest: &[&str]) -> Option<Bson> {
+    if rest.is_empty() {
+        return Some(value.clone());
+    }
+    match value {
+        Bson::Document(d) => expr_path_from(d, rest),
+        Bson::Array(a) => Some(Bson::Array(
+            a.iter()
+                .filter_map(|e| match e {
+                    Bson::Document(d) => expr_path_from(d, rest),
+                    _ => None,
+                })
+                .collect(),
+        )),
+        _ => None,
+    }
+}
+
 fn eval(expr: &Bson, ctx: &Ctx) -> R {
     match expr {
         Bson::String(s) => {
             if let Some(var) = s.strip_prefix("$$") {
                 resolve_var(var, ctx)
             } else if let Some(path) = s.strip_prefix('$') {
-                Ok(paths::get_path(ctx.doc, path)
-                    .cloned()
-                    .unwrap_or(Bson::Null))
+                Ok(expr_path(ctx.doc, path).unwrap_or(Bson::Null))
             } else {
                 Ok(Bson::String(s.clone()))
             }
@@ -270,9 +306,7 @@ fn eval_field_value(expr: &Bson, ctx: &Ctx) -> R {
     if let Bson::String(s) = expr {
         if !s.starts_with("$$") {
             if let Some(path) = s.strip_prefix('$') {
-                return Ok(paths::get_path(ctx.doc, path)
-                    .cloned()
-                    .unwrap_or(Bson::Undefined));
+                return Ok(expr_path(ctx.doc, path).unwrap_or(Bson::Undefined));
             }
         }
         // `$$REMOVE` IS the missing value -- probed 9-for-9 against mongod
@@ -295,7 +329,7 @@ fn eval_field_value(expr: &Bson, ctx: &Ctx) -> R {
                 None => None,
             };
             match root {
-                Some(Bson::Document(d)) if paths::get_path(&d, rest).is_none() => {
+                Some(Bson::Document(d)) if expr_path(&d, rest).is_none() => {
                     return Ok(Bson::Undefined)
                 }
                 Some(Bson::Document(_) | Bson::Array(_)) | None => {}
@@ -364,10 +398,10 @@ fn resolve_var(name: &str, ctx: &Ctx) -> R {
     };
     match rest {
         None => Ok(value),
-        Some(path) => match value {
-            Bson::Document(d) => Ok(paths::get_path(&d, path).cloned().unwrap_or(Bson::Null)),
-            _ => Ok(Bson::Null),
-        },
+        Some(path) => {
+            let parts: Vec<&str> = path.split('.').collect();
+            Ok(expr_path_in(&value, &parts).unwrap_or(Bson::Null))
+        }
     }
 }
 
@@ -2656,7 +2690,10 @@ fn op_in(arg: &Bson, ctx: &Ctx) -> R {
     if pair.len() != 2 {
         return Err(Fallback::Defer);
     }
-    let needle = eval(&pair[0], ctx)?;
+    // Missing is not null here: `{$in: ["$nope", [null]]}` is false on mongod
+    // (measured 8.2.11, 2026-10-22), where reading the needle with `eval`
+    // made it null and found it.
+    let needle = eval_field_value(&pair[0], ctx)?;
     let hay_v = eval(&pair[1], ctx)?;
     let Bson::Array(hay) = &hay_v else {
         // Null is NOT exempt here -- `{$in: [1, null]}` is this error, where
@@ -2669,6 +2706,9 @@ fn op_in(arg: &Bson, ctx: &Ctx) -> R {
             ctx,
         ));
     };
+    if matches!(needle, Bson::Undefined) {
+        return Ok(Bson::Boolean(false));
+    }
     for elem in hay {
         if py_eq(&needle, elem)? {
             return Ok(Bson::Boolean(true));
@@ -3715,8 +3755,8 @@ fn op_get_field(arg: &Bson, ctx: &Ctx) -> R {
             // than emitting as null (see `add_fields_one`/`project_one`).
             let input = match d.get("input") {
                 Some(Bson::String(s)) if s.starts_with('$') && !s.starts_with("$$") => {
-                    match paths::get_path(ctx.doc, &s[1..]) {
-                        Some(v) => v.clone(),
+                    match expr_path(ctx.doc, &s[1..]) {
+                        Some(v) => v,
                         None => return Ok(Bson::Undefined), // input missing -> missing
                     }
                 }
@@ -9361,7 +9401,7 @@ fn operand_is_missing(arg: &Bson, ctx: &Ctx) -> bool {
         return true;
     }
     match s.strip_prefix('$') {
-        Some(path) if !path.starts_with('$') => paths::get_path(ctx.doc, path).is_none(),
+        Some(path) if !path.starts_with('$') => expr_path(ctx.doc, path).is_none(),
         _ => false,
     }
 }
@@ -9426,7 +9466,7 @@ fn op_type(arg: &Bson, ctx: &Ctx) -> R {
             return Ok(Bson::String("missing".into()));
         }
         if let Some(path) = s.strip_prefix('$') {
-            if !path.starts_with('$') && crate::paths::get_path(ctx.doc, path).is_none() {
+            if !path.starts_with('$') && expr_path(ctx.doc, path).is_none() {
                 return Ok(Bson::String("missing".into()));
             }
         }

@@ -81,10 +81,18 @@ fn apply_stage(
             let Bson::Document(q) = spec else {
                 return Err(Fallback::Defer);
             };
+            // An error the expression evaluator did not stamp is the
+            // matcher's, and mongod raises those while PARSING the filter,
+            // with no pipeline wrapper (`{$and: {}}` is a bare "$and argument
+            // must be an array"; measured 8.2.11, 2026-10-22).
+            let parse_error = |f: Fallback| match f.folded_verdict() {
+                None if f.as_mongo().is_some() => f.bare(),
+                _ => f,
+            };
             let mut out = Vec::new();
             for d in docs {
                 deadline::check()?;
-                if query::matches(&d, q, vars, coll)? {
+                if query::matches(&d, q, vars, coll).map_err(parse_error)? {
                     out.push(d);
                 }
             }
