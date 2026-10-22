@@ -317,6 +317,28 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 ));
             }
         }
+        // mongod folds a wholly constant output expression while it
+        // optimizes, so one that fails is refused before a document is read,
+        // over an empty collection too: `{$switch: {branches: [{case: false,
+        // then: 1}]}}` is 40069 (RM-242).
+        for key in ["$project", "$addFields", "$set"] {
+            let Some(Bson::Document(spec)) = stage.get(key) else {
+                continue;
+            };
+            // An error the evaluator marks per-document is not mongod's to
+            // raise while optimizing, constant arguments or not.
+            let fault = spec
+                .values()
+                .filter_map(secantus_core::expr_rewrite::constant_expr_fault)
+                .find(|f| f.folded_verdict() != Some(false));
+            if let Some((code, msg)) = fault.as_ref().and_then(|f| f.as_mongo()) {
+                return Err(CommandError::new(
+                    code,
+                    crate::util::error_code_name(code),
+                    format!("Failed to optimize pipeline :: caused by :: {msg}"),
+                ));
+            }
+        }
     }
 
     // Inline `explain: true` on the aggregate command (the legacy flag, distinct

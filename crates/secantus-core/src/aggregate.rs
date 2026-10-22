@@ -578,7 +578,9 @@ pub fn is_constant_expression(expr: &Bson, bound: &[String]) -> bool {
             // wholly literal `input` (`{$getField: {field: 0, input: {a: 1}}}`
             // is an EXECUTOR error on 8.2.11, probed 2026-09-02). Nor do the
             // `$similarity*` expressions 8.2 added: two literal vectors of
-            // different sizes are an executor error (probed 2026-10-20).
+            // different sizes are an executor error (probed 2026-10-20). Nor
+            // `$zip`, `$setField` or `$unsetField`: a literal input of the
+            // wrong type is an executor error too (probed 2026-10-22).
             if matches!(
                 op.as_str(),
                 "$rand"
@@ -586,6 +588,9 @@ pub fn is_constant_expression(expr: &Bson, bound: &[String]) -> bool {
                     | "$filter"
                     | "$reduce"
                     | "$getField"
+                    | "$zip"
+                    | "$setField"
+                    | "$unsetField"
                     | "$similarityCosine"
                     | "$similarityDotProduct"
                     | "$similarityEuclidean"

@@ -542,7 +542,10 @@ holds every shape measured for it and asks mongod live. Four more were
 fixed in the same batch, all in the comparison code every query shares:
 BinData order (RM-232) and JavaScript-with-scope as its own type (RM-233),
 which moved the index-entry format to 5, and MinKey / MaxKey equality
-(RM-234) and field order in document equality (RM-235).
+(RM-234) and field order in document equality (RM-235). On 2026-10-22 a
+second batch took the "not supported" refusals out of the expression engine
+(in the harness, 207 refusals became 3) and closed RM-238, RM-240,
+RM-241, RM-242, RM-247 and RM-250, and parts of RM-246 and RM-252.
 
 - [ ] **Regex `\w`, `\d`, `\s` and `\b` match Unicode characters.** mongod's
   PCRE matches them against ASCII only, with or without the `u` flag, in
@@ -554,42 +557,12 @@ which moved the index-entry format to 5, and MinKey / MaxKey equality
   empty-matching pattern over "abc" is 3 matches on mongod and 4 here.
   Backlog-ID: RM-237
   Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_regex_find_all_has_no_trailing_empty_match
-- [ ] **Regex operators do not validate their options.** A bad flag
-  (51108), flags in both the regex and `options` (51107), a NUL in the
-  pattern or options (51109 / 51110) all match here; a non-string `options`
-  (51106) is 2 "not supported".
-  Backlog-ID: RM-238
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_regex_operator_options_are_validated
 - [ ] **`$filter`'s `limit` is mis-read.** An integral double or Decimal128
   limit is ignored (all elements); zero, negatives and `true` return one
   element where mongod answers 327392 / 327391; a string, NaN or fraction
   returns everything.
   Backlog-ID: RM-239
   Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_filter_limit
-- [ ] **`$zip` returns `defaults` unevaluated and accepts malformed
-  options.** `defaults: ["$n"]` pads with the string "$n"; `defaults`
-  without `useLongestLength` (34466), of the wrong length (34467) or not an
-  array (34462), and a non-boolean `useLongestLength` (34463) all answer a
-  value.
-  Backlog-ID: RM-240
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_zip_defaults_and_options
-- [ ] **`$sortArray` sorts scalars by their value under a field spec, reads
-  -1.0 as ascending, and does not validate `sortBy`.** mongod treats a
-  scalar as missing under `{a: 1}`, sorts descending for `-1.0`, sorts by
-  value for a Decimal128 direction, and rejects 0 / 2 / `{a: 0}` / `{}`
-  (2942505 / 2942506), a string (2942507) and a non-array input (2942504).
-  Backlog-ID: RM-241
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_sort_array
-- [ ] **`$switch` with no matching branch is "not supported" outside
-  `$project`, and a malformed `$switch` is too.** `op_switch` returns
-  `Fallback::Defer`; only the `$project` / `$addFields` classifier
-  (`aggregate.rs::runtime_error`) turns that into 40066, so a `find` filter or
-  projection and `$match` answer 2. All-constant false cases are 40069 on
-  mongod while it optimizes, even over an empty collection (here: 40066, or
-  success with no documents). Branch errors 40061-40065 are 2 here, and an
-  unknown branch key (40063) is accepted.
-  Backlog-ID: RM-242
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_switch
 - [ ] **`$round` / `$trunc` of a double round its decimal text.** The code
   computes `(x * 10^p).round() / 10^p`; mongod rounds the exact binary value
   (`$round: [2.675, 2]` is 2.67, `$trunc: [1.45, 2]` 1.44), so the two also
@@ -611,20 +584,12 @@ which moved the index-entry format to 5, and MinKey / MaxKey equality
   1E+34 are 2 "not supported" instead of Infinity / 1.
   Backlog-ID: RM-245
   Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_decimal_hyperbolic_and_trig_edges
-- [ ] **`$convert` clamps, underflows and refuses.** A double just past the
-  int32 range (2147483647.5) clamps instead of 241; a string below the
-  smallest normal double is 0 or a subnormal instead of 241; `to` as 1.0 or
-  Decimal128 16 converts on mongod, and as 99 / 16.5 / missing (9), null
-  (null), or an unsupported target (241) -- all 2 here; an `onError` that
-  evaluates to missing gives null; `onNull` with an unknown `to` succeeds.
+- [ ] **`$convert` clamps and underflows.** A double just past the int32
+  range (2147483647.5) clamps instead of 241, and a string below the
+  smallest normal double is 0 or a subnormal instead of 241. (Its `to`
+  shapes and a missing `onError` value were fixed on 2026-10-22.)
   Backlog-ID: RM-246
   Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_convert
-- [ ] **`$dateToString` reads `format` as literal text and ignores
-  `onNull`.** `format: "$f"` returns "$f"; an expression or null format is
-  18533; `onNull` is never used; years 1-999 are 2 "not supported" (mongod
-  renders "0999-..."); a trailing `%` is 18536 instead of 18535.
-  Backlog-ID: RM-247
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_date_to_string_arguments
 - [ ] **Local times at a daylight-saving change.** A time that happens twice
   is the later (standard-time) instant on mongod and the earlier one here
   (`.earliest()` in `named_local_to_utc_ms`); a time that never happens uses
@@ -639,14 +604,6 @@ which moved the index-entry format to 5, and MinKey / MaxKey equality
   The fix is mongod's own zone data, not a newer tzdata.
   Backlog-ID: RM-249
   Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_time_zone_rules_far_from_now
-- [ ] **Date arithmetic refuses what mongod computes.** Results outside
-  years 1-9999 (`$dateAdd` of 8000 years or 10^15 ms), a null unit (null),
-  an integral Decimal128 amount or binSize, ObjectId / Timestamp dates, and
-  each argument error mongod names (5166403, 5166405, 5439018, 40521) are
-  all 2 "not supported" here; a huge `binSize` (5439006 on mongod) silently
-  returns 2000-01-01.
-  Backlog-ID: RM-250
-  Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_date_arithmetic_arguments_and_range
 - [ ] **Constant sub-expressions are not evaluated while optimizing.** mongod
   folds every constant sub-expression first, so `{$cond: [true, 1, {$divide:
   [1, 0]}]}`, `$ifNull`, a short-circuited `$and` and `$map` over `[]` with
@@ -654,13 +611,11 @@ which moved the index-entry format to 5, and MinKey / MaxKey equality
   `$dateToString` format is checked even when the date is null.
   Backlog-ID: RM-251
   Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_constant_arguments_are_checked_while_optimizing
-- [ ] **Operator tail: one shape each.** `$firstN` with a NaN `n` (31109 vs
-  5787903) or a Decimal128 `n` (a value vs 2); `$arrayElemAt` of a null
-  array with a string index (null vs 28690); `$toString` of year 1 (a string
-  vs 241); `$percentile` with a Decimal128 `p` (a value vs 7750302); `$meta:
-  "randVal"` (missing vs 17308) and `$meta: "sortKey"` inside `$match`
-  (a value vs 2); `$getField` of `$$REMOVE` (missing vs
-  null); `$setField` with a field path for `field` (4161108 vs a value).
+- [ ] **Operator tail: one shape each.** `$arrayElemAt` of a null array
+  with a string index (null vs 28690); `$percentile` with a Decimal128 `p`
+  (a value vs 7750302); `$meta: "sortKey"` inside `$match` (a value vs 2);
+  `$getField` of `$$REMOVE` (missing vs null); `$setField` with a field
+  path for `field` (4161108 vs a value).
   Backlog-ID: RM-252
   Verify: tests/backlog/test_rm_found_2026_10_21b.py::test_operator_tail_codes
 - [ ] **`$bucket` with non-numeric boundaries.** mongod emits the buckets in
@@ -699,19 +654,6 @@ about forty such points; these are the ones measured.
       name (`Fallback::mongo(code, msg)`) belongs.
       Backlog-ID: RM-226
       Verify: tests/backlog/test_rm_found_2026_10_21.py::test_window_spec_errors_carry_mongods_codes
-- [ ] **`$convert` to a target it cannot produce answers code 2, and
-      ignores `onError`.** `convert_target` defers on any `to` outside the
-      nine convertible types (`expressions.rs`). mongod 8.2.11 tells three
-      cases apart: an unknown name ("uuid", "foo", `{type: "uuid"}`) is 2
-      "Unknown type name: uuid", `onError` or not; a number that is no BSON
-      type is 9 "In $convert, numeric value for 'to' does not correspond to
-      a BSON type: 99"; a real BSON type `$convert` cannot produce ("array",
-      "timestamp", "null", "regex", 4) is 241 "Unsupported conversion from
-      string to array in $convert with no onError value" -- and with
-      `onError` mongod answers the `onError` value, where this server
-      errors. Found by `tests/mongod_live/test_operator_tail.py`, 2026-10-21.
-      Backlog-ID: RM-228
-      Verify: tests/backlog/test_rm_found_2026_10_21.py::test_convert_to_a_target_it_cannot_produce
 - [ ] **A change stream's post-image is the document now, not as the
       update left it.** On a collection with `changeStreamPreAndPostImages:
       {enabled: true}`, `fullDocument: "whenAvailable"` / `"required"` makes
@@ -2193,6 +2135,23 @@ touched:
 
 ## Weekly validate.yml failures (2026-08-03 triage)
 
+
+## The backlog verifier's pytest stalled once in CI (2026-10-21)
+
+- [ ] **One CI run of the storage-engine (ubuntu) backlog step stalled for
+  300 s and was killed.** PR #2082's run 39691311797, first attempt: the
+  `tools/backlog.py verify --regressions` pytest reported no test for 301 s
+  ("=== pytest session stalled ==="), three tests of
+  `tests/backlog/test_rm_found_2026_10_20b.py` never ran
+  (`test_snapshot_read_at_cluster_time`,
+  `test_snapshot_session_keeps_its_snapshot`, `test_diagnostic_stages`), and
+  the step failed. The re-run passed, `main` had passed six runs in a row,
+  and the module ran in 23 s locally. Not known: which test hung. The
+  stall dump prints the CONTROLLER's threads only, so the next stall should
+  dump the workers' stacks too (and the servers they started) -- that is
+  the change that makes this diagnosable.
+  Backlog-ID: RM-254
+  Verify: none -- an intermittent CI stall whose hung test is unknown
 
 ## The macOS `test` lane wedges for its whole 30-minute cap, rarely (2026-09-18)
 
