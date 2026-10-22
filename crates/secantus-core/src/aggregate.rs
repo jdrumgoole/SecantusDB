@@ -785,8 +785,8 @@ fn bucket_unmatched_fault(spec: &Bson, docs: &[Document], vars: &Document) -> bo
     let Bson::Document(s) = spec else {
         return false;
     };
-    // An explicit null `default` counts as absent, as it does in `bucket_stage`.
-    if !matches!(s.get("default"), None | Some(Bson::Null)) {
+    // An explicit null `default` is a default, as it is in `bucket_stage`.
+    if s.get("default").is_some() {
         return false;
     }
     let (Some(group_by), Some(Bson::Array(boundaries))) = (s.get("groupBy"), s.get("boundaries"))

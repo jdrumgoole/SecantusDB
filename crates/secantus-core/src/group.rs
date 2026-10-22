@@ -1432,10 +1432,6 @@ fn accumulate_into(
     finalize(id, paired)
 }
 
-/// `$bucket` — place each doc into the half-open boundary range
-/// `boundaries[i] <= value < boundaries[i+1]`, compared in mongod's BSON order
-/// so the numeric types interoperate, falling to `default` when unplaced, then
-/// run the `output` accumulators per bucket.
 /// Canonical type name for a `$bucket` boundary — the numeric BSON types collapse
 /// to one bracket (mongod requires all boundaries the same type).
 fn bucket_ctype(v: &Bson) -> &'static str {
@@ -1445,125 +1441,174 @@ fn bucket_ctype(v: &Bson) -> &'static str {
     }
 }
 
+/// `$bucket`, as mongod 8.2.11 parses and runs it (measured 2026-10-22,
+/// RM-253). mongod rewrites it into a `$group` keyed by a `$switch` over the
+/// boundaries, then a `$sort` on `_id`:
+///
+/// - the spec is checked as it is parsed, every error bare: `groupBy` a path
+///   or an expression (40202); `boundaries` an array (40200) of CONSTANT
+///   values (40191, a constant expression evaluated), at least two (40192),
+///   of one type, the numeric types counting as one (40193), strictly
+///   ascending in BSON order (40194, NaN lowest); `output` an object (40196);
+///   and a `default` of the boundaries' type below the first or at or above
+///   the last (40199) -- a default of another type is not checked, and an
+///   explicit null is a default;
+/// - each document lands in the bucket `boundaries[i] <= v < boundaries[i+1]`
+///   by BSON comparison, any numeric types and Decimal128 included, or in
+///   `default`; with no default an unplaced document is 7158303;
+/// - the buckets come out sorted by `_id`, so a string `default` comes before
+///   date buckets and a numeric one below the boundaries first.
 pub fn bucket_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Document>> {
     let Bson::Document(s) = spec else {
         return Err(Fallback::Defer);
     };
+    let parse_error = |code: i32, msg: String| Err(Fallback::mongo(code, msg).bare());
+    let render = crate::aggregate::render_value_compact;
     let group_by = match s.get("groupBy") {
-        None | Some(Bson::Null) => return Err(Fallback::Defer), // missing groupBy -> Python raises 40198
-        Some(v) => v.clone(),
-    };
-    let Some(Bson::Array(boundaries)) = s.get("boundaries") else {
-        return Err(Fallback::Defer); // missing / non-array boundaries -> Python raises
-    };
-    if boundaries.len() < 2 {
-        return Err(Fallback::Defer);
-    }
-    // Boundaries must all be the same canonical type (40193) and strictly
-    // ascending (40194) -- previously unsorted/mixed boundaries were accepted.
-    let ct0 = bucket_ctype(&boundaries[0]);
-    for w in boundaries.windows(2) {
-        if bucket_ctype(&w[1]) != ct0 {
-            return Err(Fallback::Defer);
+        Some(v @ Bson::String(p)) if p.starts_with('$') => v.clone(),
+        Some(v @ Bson::Document(_)) => v.clone(),
+        Some(other) => {
+            return parse_error(
+                40202,
+                format!(
+                    "The $bucket 'groupBy' field must be defined as a $-prefixed path or an \
+                     expression, but found: {}.",
+                    render(other)
+                ),
+            )
         }
-        if !matches!(expressions::py_order(&w[0], &w[1])?, Some(Ordering::Less)) {
-            return Err(Fallback::Defer);
-        }
-    }
-    // `default is not None` — an explicit null default counts as absent.
-    let default = match s.get("default") {
-        None | Some(Bson::Null) => None,
-        Some(v) => Some(v.clone()),
+        None => return Err(Fallback::Defer), // 40198, raised by the command layer
     };
-    if let Some(dv) = &default {
-        // default must lie outside [first, last) -- below the first boundary or
-        // >= the last (mongod 40199).
-        let below = matches!(
-            expressions::py_order(dv, &boundaries[0])?,
-            Some(Ordering::Less)
-        );
-        let below_last = matches!(
-            expressions::py_order(dv, &boundaries[boundaries.len() - 1])
-                .map_err(|_| Fallback::Defer)?,
-            Some(Ordering::Less)
-        );
-        if !below && below_last {
-            return Err(Fallback::Defer);
+    let raw_boundaries = match s.get("boundaries") {
+        Some(Bson::Array(a)) => a,
+        Some(other) => {
+            return parse_error(
+                40200,
+                format!(
+                    "The $bucket 'boundaries' field must be an array, but found type: {}.",
+                    crate::query::bson_type_name(other)
+                ),
+            )
         }
+        None => return Err(Fallback::Defer), // 40198
+    };
+    let mut boundaries = Vec::with_capacity(raw_boundaries.len());
+    for b in raw_boundaries {
+        if !crate::aggregate::is_constant_expression(b, &[]) {
+            return parse_error(
+                40191,
+                format!(
+                    "The $bucket 'boundaries' field must be an array of constant values, but \
+                     found value: {}.",
+                    render(b)
+                ),
+            );
+        }
+        boundaries.push(eval(b, &Document::new(), vars)?);
     }
     let default_output = bson::doc! {"count": {"$sum": 1i32}};
     let output_spec: &Document = match s.get("output") {
         Some(Bson::Document(d)) if !d.is_empty() => d,
-        None | Some(Bson::Document(_)) => &default_output, // absent / empty -> default
-        Some(_) => return Err(Fallback::Defer), // truthy non-doc -> Python `.items()` raises
-    };
-
-    // Bucket keys = boundaries[..-1] then `default`. Python keys them in a dict,
-    // so equal keys would collapse / reset — defer those pathological collisions.
-    let nb = boundaries.len();
-    let mut seen: Vec<GKey> = Vec::new();
-    let mut keys: Vec<Bson> = Vec::new();
-    for b in &boundaries[..nb - 1] {
-        let gk = gkey(b)?;
-        if seen.contains(&gk) {
-            return Err(Fallback::Defer);
+        None | Some(Bson::Document(_)) => &default_output,
+        Some(other) => {
+            return parse_error(
+                40196,
+                format!(
+                    "The $bucket 'output' field must be an object, but found type: {}.",
+                    crate::query::bson_type_name(other)
+                ),
+            )
         }
-        seen.push(gk);
-        keys.push(b.clone());
+    };
+    if boundaries.len() < 2 {
+        return parse_error(
+            40192,
+            format!(
+                "The $bucket 'boundaries' field must have at least 2 values, but found {} \
+                 value(s).",
+                boundaries.len()
+            ),
+        );
     }
-    let default_idx = if let Some(dv) = &default {
-        let gk = gkey(dv)?;
-        if seen.contains(&gk) {
-            return Err(Fallback::Defer);
+    for w in boundaries.windows(2) {
+        if bucket_ctype(&w[0]) != bucket_ctype(&w[1]) {
+            return parse_error(
+                40193,
+                format!(
+                    "All values in the the 'boundaries' option to $bucket must have the same \
+                     type. Found conflicting types {} and {}.",
+                    crate::query::bson_type_name(&w[0]),
+                    crate::query::bson_type_name(&w[1])
+                ),
+            );
         }
-        keys.push(dv.clone());
-        Some(keys.len() - 1)
-    } else {
-        None
-    };
+    }
+    for (i, w) in boundaries.windows(2).enumerate() {
+        if crate::order::cmp(&w[0], &w[1]) != Ordering::Less {
+            return parse_error(
+                40194,
+                format!(
+                    "The 'boundaries' option to $bucket must be sorted, but elements {} and {} \
+                     are not in ascending order ({} is not less than {}).",
+                    i,
+                    i + 1,
+                    render(&w[0]),
+                    render(&w[1])
+                ),
+            );
+        }
+    }
+    let nb = boundaries.len();
+    let default = s.get("default").cloned();
+    if let Some(dv) = &default {
+        if bucket_ctype(dv) == bucket_ctype(&boundaries[0])
+            && crate::order::cmp(dv, &boundaries[0]) != Ordering::Less
+            && crate::order::cmp(dv, &boundaries[nb - 1]) == Ordering::Less
+        {
+            return parse_error(
+                40199,
+                "The $bucket 'default' field must be less than the lowest boundary or greater \
+                 than or equal to the highest boundary."
+                    .to_string(),
+            );
+        }
+    }
 
+    // One bucket per lower boundary, then the default.
+    let mut keys: Vec<Bson> = boundaries[..nb - 1].to_vec();
+    if let Some(dv) = &default {
+        keys.push(dv.clone());
+    }
     let mut placed: Vec<Vec<&Document>> = vec![Vec::new(); keys.len()];
     for d in docs {
         let v = eval(&group_by, d, vars)?;
-        let mut put = false;
-        for i in 0..nb - 1 {
-            // mongod's BSON order, NOT `py_order`'s emulation of Python's
-            // operators. `py_order` DEFERS on a Decimal128 -- and a defer on
-            // the standalone server is an error -- so one decimal anywhere in
-            // the grouped field failed the whole `$bucket`, where mongod places
-            // it with the other numerics (measured 8.2.11, 2026-09-09).
-            // Mirrors the same switch in `aggregate._stage_bucket`.
-            if crate::order::cmp(&boundaries[i], &v) == Ordering::Greater {
-                continue; // lo > v
-            }
-            if crate::order::cmp(&v, &boundaries[i + 1]) == Ordering::Less {
-                placed[i].push(d);
-                put = true;
-                break;
-            }
-        }
-        if !put {
-            match default_idx {
-                Some(di) => placed[di].push(d),
-                // No matching bucket and no default: mongod errors (Python raises
-                // 7158303). Previously the document was silently DROPPED.
-                None => return Err(Fallback::Defer),
+        let bucket = (0..nb - 1).find(|&i| {
+            crate::order::cmp(&boundaries[i], &v) != Ordering::Greater
+                && crate::order::cmp(&v, &boundaries[i + 1]) == Ordering::Less
+        });
+        match (bucket, default.is_some()) {
+            (Some(i), _) => placed[i].push(d),
+            (None, true) => placed[nb - 1].push(d),
+            (None, false) => {
+                return Err(Fallback::mongo(
+                    7158303,
+                    "$switch could not find a matching branch for an input, and no default \
+                     was specified.",
+                )
+                .with_folded(false))
             }
         }
     }
 
-    let mut out = Vec::with_capacity(keys.len());
-    for (key, bucket_docs) in keys.into_iter().zip(placed) {
-        // mongod emits a bucket only when something landed in it — boundary
-        // buckets and `default` alike (probed 6.0.16: boundaries [0,2,4,8] over
-        // values 1 and 7 answer `_id: 0` and `_id: 4`, omitting the empty
-        // `_id: 2`). Buckets are pre-created to keep boundary order, so the
-        // empty ones are dropped here. This previously emitted a bare `{_id}`
-        // with no accumulator fields, faithfully reproducing the pure-Python
-        // bug; both are fixed together.
-        if bucket_docs.is_empty() {
-            continue;
-        }
+    // mongod emits a bucket only when something landed in it, sorted by `_id`.
+    let mut filled: Vec<(Bson, Vec<&Document>)> = keys
+        .into_iter()
+        .zip(placed)
+        .filter(|(_, bucket_docs)| !bucket_docs.is_empty())
+        .collect();
+    filled.sort_by(|a, b| crate::order::cmp(&a.0, &b.0));
+    let mut out = Vec::with_capacity(filled.len());
+    for (key, bucket_docs) in filled {
         out.push(accumulate_into(key, output_spec, &bucket_docs, vars)?);
     }
     Ok(out)
