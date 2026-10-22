@@ -823,11 +823,13 @@ pub fn parse(text: &str) -> Result<JsonPath> {
         pos: 0,
         input: text,
     };
+    // The grammar's empty `result` leaves no path, which `jsonpath_in`
+    // reports as bad input (RP-088).
     if p.peek().is_none() {
-        return Ok(JsonPath {
-            lax: true,
-            expr: None,
-        });
+        return Err(Error::Sqlstate(
+            "22P02",
+            format!("invalid input syntax for type jsonpath: \"{text}\""),
+        ));
     }
     let mut lax = true;
     if p.is_kw("strict") {

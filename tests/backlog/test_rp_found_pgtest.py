@@ -571,27 +571,27 @@ def _check(name: str, fn: Callable[[Connect], tuple], connect: Connect) -> None:
     assert fn(connect) == EXPECTED[name]
 
 
-@pytest.mark.backlog("RP-078")
+@pytest.mark.backlog_fixed("RP-078")
 def test_bind_decodes_parameters(wire: Connect) -> None:
     _check("bind_decodes_parameters", bind_decodes_parameters, wire)
 
 
-@pytest.mark.backlog("RP-078")
+@pytest.mark.backlog_fixed("RP-078")
 def test_bind_checks_its_shape(wire: Connect) -> None:
     _check("bind_checks_its_shape", bind_checks_its_shape, wire)
 
 
-@pytest.mark.backlog("RP-078")
+@pytest.mark.backlog_fixed("RP-078")
 def test_cached_plan_fails_at_bind(wire: Connect) -> None:
     _check("cached_plan_fails_at_bind", cached_plan_fails_at_bind, wire)
 
 
-@pytest.mark.backlog("RP-079")
+@pytest.mark.backlog_fixed("RP-079")
 def test_parse_in_aborted_transaction(wire: Connect) -> None:
     _check("parse_in_aborted_transaction", parse_in_aborted_transaction, wire)
 
 
-@pytest.mark.backlog("RP-080")
+@pytest.mark.backlog_fixed("RP-080")
 def test_unknown_parameters_take_their_column_types(wire: Connect) -> None:
     _check(
         "unknown_parameters_take_their_column_types",
@@ -600,74 +600,74 @@ def test_unknown_parameters_take_their_column_types(wire: Connect) -> None:
     )
 
 
-@pytest.mark.backlog("RP-080")
+@pytest.mark.backlog_fixed("RP-080")
 def test_conflicting_parameter_uses_fail_at_parse(wire: Connect) -> None:
     _check(
         "conflicting_parameter_uses_fail_at_parse", conflicting_parameter_uses_fail_at_parse, wire
     )
 
 
-@pytest.mark.backlog("RP-081")
+@pytest.mark.backlog_fixed("RP-081")
 def test_set_reports_after_command_complete(wire: Connect) -> None:
     _check("set_reports_after_command_complete", set_reports_after_command_complete, wire)
 
 
-@pytest.mark.backlog("RP-081")
+@pytest.mark.backlog_fixed("RP-081")
 def test_startup_parameter_order(wire: Connect) -> None:
     _check("startup_parameter_order", startup_parameter_order, wire)
 
 
-@pytest.mark.backlog("RP-082")
+@pytest.mark.backlog_fixed("RP-082")
 def test_fixed_length_types_report_their_size(wire: Connect) -> None:
     _check("fixed_length_types_report_their_size", fixed_length_types_report_their_size, wire)
 
 
-@pytest.mark.backlog("RP-083")
+@pytest.mark.backlog_fixed("RP-083")
 def test_reg_parameters_render_as_text(wire: Connect) -> None:
     _check("reg_parameters_render_as_text", reg_parameters_render_as_text, wire)
 
 
-@pytest.mark.backlog("RP-068")
+@pytest.mark.backlog_fixed("RP-068")
 def test_extra_float_digits_below_one(wire: Connect) -> None:
     _check("extra_float_digits_below_one", extra_float_digits_below_one, wire)
 
 
-@pytest.mark.backlog("RP-084")
+@pytest.mark.backlog_fixed("RP-084")
 def test_begin_inside_a_transaction_warns(wire: Connect) -> None:
     _check("begin_inside_a_transaction_warns", begin_inside_a_transaction_warns, wire)
 
 
-@pytest.mark.backlog("RP-085")
+@pytest.mark.backlog_fixed("RP-085")
 def test_char_of_zero_is_a_zero_byte(wire: Connect) -> None:
     _check("char_of_zero_is_a_zero_byte", char_of_zero_is_a_zero_byte, wire)
 
 
-@pytest.mark.backlog("RP-086")
+@pytest.mark.backlog_fixed("RP-086")
 def test_copy_header_is_not_a_row(wire: Connect) -> None:
     _check("copy_header_is_not_a_row", copy_header_is_not_a_row, wire)
 
 
-@pytest.mark.backlog("RP-087")
+@pytest.mark.backlog_fixed("RP-087")
 def test_view_columns_name_their_base_columns(wire: Connect) -> None:
     _check("view_columns_name_their_base_columns", view_columns_name_their_base_columns, wire)
 
 
-@pytest.mark.backlog("RP-088")
+@pytest.mark.backlog_fixed("RP-088")
 def test_empty_jsonpath_is_a_syntax_error(wire: Connect) -> None:
     _check("empty_jsonpath_is_a_syntax_error", empty_jsonpath_is_a_syntax_error, wire)
 
 
-@pytest.mark.backlog("RP-089")
+@pytest.mark.backlog_fixed("RP-089")
 def test_bind_to_an_existing_portal(wire: Connect) -> None:
     _check("bind_to_an_existing_portal", bind_to_an_existing_portal, wire)
 
 
-@pytest.mark.backlog("RP-090")
+@pytest.mark.backlog_fixed("RP-090")
 def test_unknown_type_fails_at_parse(wire: Connect) -> None:
     _check("unknown_type_fails_at_parse", unknown_type_fails_at_parse, wire)
 
 
-@pytest.mark.backlog("RP-080")
+@pytest.mark.backlog_fixed("RP-080")
 def test_declared_parameter_type_is_checked_at_parse(wire: Connect) -> None:
     _check(
         "declared_parameter_type_is_checked_at_parse",
@@ -676,6 +676,6 @@ def test_declared_parameter_type_is_checked_at_parse(wire: Connect) -> None:
     )
 
 
-@pytest.mark.backlog("RP-091")
+@pytest.mark.backlog_fixed("RP-091")
 def test_unknown_portal_error_names_it(wire: Connect) -> None:
     _check("unknown_portal_error_names_it", unknown_portal_error_names_it, wire)

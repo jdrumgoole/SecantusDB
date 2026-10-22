@@ -214,6 +214,11 @@ pub fn float8_text(v: f64) -> String {
     if v == 0.0 {
         return (if v.is_sign_negative() { "-0" } else { "0" }).to_string();
     }
+    // Below 1, `extra_float_digits` rounds to DBL_DIG plus it (RP-068).
+    let extra = crate::output_style::output_style().extra_float_digits;
+    if extra < 1 {
+        return crate::output_style::format_g(v, 15 + extra);
+    }
     // Rust's `{:e}` is the shortest round-trip form: `1.2345678901234568e17`.
     shortest_text(&format!("{:e}", v.abs()), v < 0.0, 15)
 }
@@ -230,6 +235,11 @@ pub fn float4_text(v: f32) -> String {
     }
     if v == 0.0 {
         return (if v.is_sign_negative() { "-0" } else { "0" }).to_string();
+    }
+    // FLT_DIG plus `extra_float_digits` below 1 (RP-068).
+    let extra = crate::output_style::output_style().extra_float_digits;
+    if extra < 1 {
+        return crate::output_style::format_g(f64::from(v), 6 + extra);
     }
     shortest_text(&format!("{:e}", v.abs()), v < 0.0, 6)
 }

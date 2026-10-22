@@ -87,7 +87,7 @@ EXPECTED = {
 }
 
 
-@pytest.mark.backlog("RP-075")
+@pytest.mark.backlog_fixed("RP-075")
 def test_strict_null_folding(pg: Any) -> None:
     """PostgreSQL 15.19 folds `c / 0 = NULL` (and `NULL = ...`, `... + NULL`)
     to NULL before it runs, so the division by zero never happens; the plan
@@ -96,7 +96,7 @@ def test_strict_null_folding(pg: Any) -> None:
     assert strict_null_folding(pg) == EXPECTED["strict_null_folding"]
 
 
-@pytest.mark.backlog("RP-076")
+@pytest.mark.backlog_fixed("RP-076")
 def test_nullif_result_type(pg: Any) -> None:
     """PostgreSQL 15.19 gives NULLIF the left input type of the `=` operator
     it resolves: `nullif(53, 80::numeric)` is numeric (int = numeric resolves

@@ -71,13 +71,14 @@ where
         format,
         columns,
         mut data_stream,
+        header_messages,
     } = resp;
     let copy_resp = CopyOutResponse::new(format, columns as i16, column_formats);
     client
         .send(PgWireBackendMessage::CopyOutResponse(copy_resp))
         .await?;
 
-    let mut rows = 0;
+    let mut rows: usize = 0;
 
     while let Some(copy_data) = data_stream.next().await {
         match copy_data {
@@ -104,7 +105,8 @@ where
         .send(PgWireBackendMessage::CopyDone(copy_done))
         .await?;
 
-    let tag = Tag::new("COPY").with_rows(rows);
+    // A HEADER line is a message, not a row: PostgreSQL's tag counts rows.
+    let tag = Tag::new("COPY").with_rows(rows.saturating_sub(header_messages));
     client
         .send(PgWireBackendMessage::CommandComplete(tag.into()))
         .await?;
@@ -124,6 +126,7 @@ where
         format,
         columns,
         mut data_stream,
+        ..
     } = resp;
     let copy_resp = CopyBothResponse::new(format, columns as i16, column_formats);
     client

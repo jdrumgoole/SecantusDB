@@ -198,6 +198,8 @@ struct ScopeCol {
     bare: bool,
     /// Part of `SELECT *`.
     star: bool,
+    /// The base column it reads, for the RowDescription (RP-087).
+    source: Option<(i64, i16)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -421,7 +423,11 @@ fn finish_join_source(
         scope
             .cols
             .iter()
-            .map(|c| Column::new(&c.key, &c.pg_type, false))
+            .map(|c| {
+                let mut col = Column::new(&c.key, &c.pg_type, false);
+                col.source = c.source;
+                col
+            })
             .collect(),
     );
     let mut out = s.clone();
@@ -849,6 +855,7 @@ fn lateral_leaf(
             pg_type: c.pg_type.clone(),
             bare: true,
             star: true,
+            source: c.source,
         });
     }
     Ok(Some((
@@ -1007,6 +1014,7 @@ fn leaf_with_names(
             pg_type: typed.columns[i].pg_type.clone(),
             bare: true,
             star: true,
+            source: typed.columns[i].source,
         });
     }
     Ok((
@@ -1126,6 +1134,13 @@ fn build_join(
         merged.push((key.clone(), l.key.clone(), r.key.clone()));
         hidden.push(l.key.clone());
         hidden.push(r.key.clone());
+        // The merged column is the left side's (the right's under a RIGHT
+        // join); a FULL join's is a COALESCE of both, read from neither.
+        let source = match pg_query::protobuf::JoinType::try_from(j.jointype) {
+            Ok(pg_query::protobuf::JoinType::JoinFull) => None,
+            Ok(pg_query::protobuf::JoinType::JoinRight) => r.source,
+            _ => l.source,
+        };
         merged_cols.push(ScopeCol {
             alias: String::new(),
             name: name.clone(),
@@ -1133,6 +1148,7 @@ fn build_join(
             pg_type: l.pg_type.clone(),
             bare: true,
             star: true,
+            source,
         });
     }
     let mut scope = Scope {

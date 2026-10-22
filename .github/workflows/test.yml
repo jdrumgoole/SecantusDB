@@ -756,7 +756,13 @@ jobs:
         # the push/PR path is what makes the macOS coverage affordable. The
         # ``Install toolchain (macOS)`` step below exists for exactly these
         # cells (it was unreachable while this matrix was Linux + Windows only).
-        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest","windows-latest","macos-14"]' || '["ubuntu-latest","windows-latest"]') }}
+        #
+        # Windows joins on the push to main (and the cron), not on a PR
+        # (2026-10-22). It was the whole run's critical path: 44-51 min against
+        # 25 for the next job, almost all of it the PGO + LTO wheel build on a
+        # 4-core runner. What is lost: a Windows-only break surfaces on main,
+        # after the merge, not on the PR that caused it.
+        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest","windows-latest","macos-14"]' || github.event_name == 'push' && '["ubuntu-latest","windows-latest"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Move the host time zone off UTC
@@ -787,29 +793,13 @@ jobs:
           try { Set-MpPreference -DisableRealtimeMonitoring $true }
           catch { Write-Warning "could not disable Defender real-time scanning: $_" }
 
-      - name: Reclaim disk (Windows)
-        if: runner.os == 'Windows'
-        # This job keeps a WiredTiger home per test for the whole session --
-        # `tests/conftest.py` REFUSES a mid-session delete policy, because one
-        # was tried and raced WT's background threads into a WT_PANIC cascade,
-        # so the homes cannot simply be cleaned up as they finish. The
-        # concurrency suite at the end of this job is the heaviest writer of
-        # them, and it exhausted the runner with "No space left on device" on a
-        # change that added no storage at all (2026-09-05).
-        #
-        # The `test` job already reclaims preinstalled toolchains on LINUX for
-        # exactly this reason; Windows had no equivalent. The Android SDK is the
-        # large safely-removable item -- this job needs MSVC, CMake, Python and
-        # LLVM, and none of those live under it.
-        shell: pwsh
-        run: |
-          foreach ($p in @('C:\Android', 'C:\Program Files (x86)\Android')) {
-            if (Test-Path $p) {
-              Write-Host "removing $p"
-              Remove-Item -Recurse -Force $p -ErrorAction SilentlyContinue
-            }
-          }
-
+      # A "Reclaim disk (Windows)" step used to delete the Android SDK from C:
+      # here, after the suite ran C: out of space on 2026-09-05. It cost ~4
+      # min a run and was removed on 2026-10-22: the next step is what fixed
+      # that failure (the test homes moved to D:), and the cargo target moved
+      # to D: as well (see "Point cargo at a cacheable target dir"), so C:
+      # holds only the toolchains. The disk steps below report C: on Windows,
+      # so a run that fills it again says so.
       - name: Put the test temp dir on the big drive (Windows)
         if: runner.os == 'Windows'
         # THE actual fix. Python's `tempfile` reads TMP/TEMP, which on this
@@ -841,6 +831,7 @@ jobs:
             echo "${TMP:-.}" > /tmp/tdir
           echo "test temp dir: $(cat /tmp/tdir)"
           df -h "$(cat /tmp/tdir)" || df -h . || true
+          if [ "$RUNNER_OS" = "Windows" ]; then echo "C: (toolchains)"; df -h /c || true; fi
 
       - name: Register the MongoDB 8.2 apt repository (Linux)
         # For `mongodb-org-server`: the reference mongod the Rust MongoDB
@@ -958,8 +949,11 @@ jobs:
         id: cargodir
         shell: bash
         run: |
+          # D: on Windows, not C:. C: is the small drive the test homes once
+          # filled (see "Put the test temp dir on the big drive"), and the
+          # restored cache plus three builds put several GB here.
           if [ "$RUNNER_OS" = "Windows" ]; then
-            dir='C:/cargo-target'
+            dir='D:/cargo-target'
           else
             dir="$HOME/.cargo-target"
           fi
@@ -967,8 +961,43 @@ jobs:
           echo "dir=$dir" >> "$GITHUB_OUTPUT"
           echo "cargo target root: $dir"
 
+      - name: Choose the build mode
+        # `full` is the build users get: thin LTO, codegen-units = 1 and the
+        # committed PGO profile. `fast` turns all three off, which is what
+        # this lane's tests need: they check behaviour, not speed.
+        #
+        # Measured 2026-10-22, run 39749683550 on Windows: the full wheel
+        # build took 26 min (35 in the run before), 12 of them one link of
+        # `_secantus_server`, the step that applies LTO and PGO.
+        #
+        # Linux runs `fast` on a PR AND on the push to main, so that main saves
+        # the cache a PR restores (a PR cannot save one another PR can read).
+        # The full build is still built and tested on every push to main by the
+        # Windows cell, and on all three OSes by the weekly cron. What is lost:
+        # a fault that only the LTO / PGO build has shows up on main, not on the
+        # PR, and on Linux only weekly or at release.
+        id: mode
+        shell: bash
+        run: |
+          mode=full
+          if [ "$RUNNER_OS" = "Linux" ] && { [ "$GITHUB_EVENT_NAME" = "pull_request" ] || [ "$GITHUB_EVENT_NAME" = "push" ]; }; then
+            mode=fast
+          fi
+          if [ "$mode" = "fast" ]; then
+            # CMakeLists.txt reads SECANTUS_PGO_DISABLE by DEFINED, not by
+            # value, so it is written only in this branch.
+            {
+              echo "SECANTUS_PGO_DISABLE=1"
+              echo "CARGO_PROFILE_RELEASE_LTO=off"
+              echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16"
+            } >> "$GITHUB_ENV"
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "build mode: $mode"
+
       - name: Restore cargo target + registry
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: |
             ${{ steps.cargodir.outputs.dir }}
@@ -978,12 +1007,15 @@ jobs:
           # reuse stale artifacts. The WT sha is in the key because
           # secantus-wt's bindgen output is derived from the vendored WT
           # headers — a WT bump invalidates those crates even with an unchanged
-          # lock. restore-keys let an near-miss still seed the dependency
-          # crates, which are the bulk of the 469.
-          key: cargo-${{ matrix.os }}-${{ hashFiles('**/Cargo.lock') }}-wt-${{ steps.wt-sha.outputs.sha }}
+          # lock. The build mode is in it because the profile settings and
+          # RUSTFLAGS are part of every crate's fingerprint: a `full` cache
+          # rebuilds everything in a `fast` build, and the reverse. restore-keys
+          # let a near-miss still seed the dependency crates, which are the
+          # bulk of the 469.
+          key: cargo-${{ matrix.os }}-${{ steps.mode.outputs.mode }}-${{ hashFiles('**/Cargo.lock') }}-wt-${{ steps.wt-sha.outputs.sha }}
           restore-keys: |
-            cargo-${{ matrix.os }}-${{ hashFiles('**/Cargo.lock') }}-
-            cargo-${{ matrix.os }}-
+            cargo-${{ matrix.os }}-${{ steps.mode.outputs.mode }}-${{ hashFiles('**/Cargo.lock') }}-
+            cargo-${{ matrix.os }}-${{ steps.mode.outputs.mode }}-
 
       - name: Build the secantus wheel with the storage engine ON
         # scikit-build-core forwards SKBUILD_CMAKE_DEFINE entries as -D defines,
@@ -992,6 +1024,45 @@ jobs:
         env:
           SKBUILD_CMAKE_DEFINE: SECANTUS_BUILD_STORAGE_ENGINE=ON
         run: uv build --wheel --out-dir dist-storage
+
+      # The cache is saved from main only (pushes and the cron), never from a
+      # PR. A PR's cache is visible to that PR alone, so saving one helped only
+      # its next push, and cost up to 11 min on Windows (4 GB, run
+      # 39749683550) whenever Cargo.lock changed. It is saved here, right after
+      # the build, rather than at the end of the job, so a test failure later
+      # in the job no longer throws the warm build away.
+      - name: Drop this workspace's own crates from the cargo cache
+        # Every run recompiles the workspace crates anyway (a fresh checkout's
+        # mtimes are newer than any cached fingerprint), so their artifacts are
+        # dead weight in the cache: only the third-party crates are reused.
+        # Every workspace crate, and nothing else in the graph, has `secantus`
+        # in its name.
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          root='${{ steps.cargodir.outputs.dir }}'
+          du -sh "$root" || true
+          for t in "$root"/*-target; do
+            for p in "$t"/release "$t"/*/release; do
+              [ -d "$p" ] || continue
+              find "$p/.fingerprint" "$p/build" "$p/deps" -maxdepth 1 -name '*secantus*' \
+                -exec rm -rf {} + 2>/dev/null || true
+              find "$p" -maxdepth 1 -type f -name '*secantus*' -delete 2>/dev/null || true
+              rm -rf "$p/incremental"
+            done
+            rm -rf "$t/pgo"
+          done
+          du -sh "$root" || true
+
+      - name: Save cargo target + registry
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ${{ steps.cargodir.outputs.dir }}
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
 
       - name: Assert the extensions are bundled in the wheel
@@ -1116,6 +1187,7 @@ jobs:
           t=$(cat /tmp/tdir 2>/dev/null || echo .)
           echo "test temp dir: $t"
           df -h "$t" || df -h . || true
+          if [ "$RUNNER_OS" = "Windows" ]; then echo "C: (toolchains)"; df -h /c || true; fi
 
       - name: Build + smoke the standalone secantusd-rs binary (R7)
         # The bin crate links the SAME vendored WiredTiger the wheel build above
