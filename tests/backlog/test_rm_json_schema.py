@@ -1,7 +1,8 @@
-"""Gap tests for the `$jsonSchema` divergences found on 2026-10-22 by
-`tools/probes/query_shapes.py` (its `schema ` cases), written against the
-lines of `secantus-core/src/query.rs` that no test executed. Each test asks
-mongod live and compares the matched `_id`s, or the error's code and message.
+"""Regression tests for the `$jsonSchema` divergences found on 2026-10-22 by
+`tools/probes/query_shapes.py` (its `schema ` cases), and fixed by porting
+mongod's `JSONSchemaParser` (`secantus-core/src/jsonschema.rs`). Each test
+asks mongod live and compares the matched `_id`s, or the error's code and
+message.
 """
 
 from __future__ import annotations
@@ -53,13 +54,14 @@ DOCS = [
 ]
 
 
-@pytest.mark.backlog("RM-268")
+@pytest.mark.backlog_fixed("RM-268")
 def test_json_schema_answers(rust_mongo: Any, mongod: Any) -> None:
     """**$jsonSchema answers differently from mongod.** mongod reads the names
     in `required` and `properties` as dotted paths; compares documents in
     `enum` and `uniqueItems` regardless of field order; computes `multipleOf`
     in Decimal128; and treats NaN and the infinities in `minimum` /
-    `maximum` by its own rule (measured 8.2.11, 2026-10-22)."""
+    `maximum` by its own rule (measured 8.2.11, 2026-10-22). Fixed by
+    translating the schema into mongod's own match-expression tree."""
     shapes = [
         ("required dotted", {"required": ["a.b"]}),
         ("required deep dotted", {"required": ["a.b.c"]}),
@@ -76,7 +78,7 @@ def test_json_schema_answers(rust_mongo: Any, mongod: Any) -> None:
     assert _diverging(rust_mongo, mongod, DOCS, shapes) == []
 
 
-@pytest.mark.backlog("RM-269")
+@pytest.mark.backlog_fixed("RM-269")
 def test_json_schema_validation(rust_mongo: Any, mongod: Any) -> None:
     """**A malformed $jsonSchema is not refused.** mongod parses the whole
     schema first and refuses an unknown or unsupported keyword, a keyword
@@ -108,3 +110,49 @@ def test_json_schema_validation(rust_mongo: Any, mongod: Any) -> None:
         ("schema not an object", 1),
     ]
     assert _diverging(rust_mongo, mongod, DOCS, shapes) == []
+
+
+def _commands(client: Any, schema: Any) -> dict:
+    """What each command that takes a filter answers, over an EMPTY collection."""
+    db = client.rm_json_schema
+    db.c.drop()
+    db.create_collection("c")
+    f = {"$jsonSchema": schema}
+    c = db.c
+    return {
+        "count": mongo_answer(lambda: c.count_documents(f)),
+        "distinct": mongo_answer(lambda: c.distinct("_id", f)),
+        "aggregate": mongo_answer(lambda: list(c.aggregate([{"$match": f}]))),
+        "update": mongo_answer(lambda: c.update_many(f, {"$set": {"z": 1}}).modified_count),
+        "delete": mongo_answer(lambda: c.delete_many(f).deleted_count),
+        "findAndModify": mongo_answer(lambda: c.find_one_and_update(f, {"$set": {"z": 1}})),
+        "validator": _validator(db, f),
+    }
+
+
+def _validator(db: Any, f: dict) -> Any:
+    """Creating a collection with the schema as its validator."""
+    db.v.drop()
+    return mongo_answer(lambda: db.create_collection("v", validator=f).name)
+
+
+@pytest.mark.backlog_fixed("RM-269")
+def test_json_schema_refused_by_every_command(rust_mongo: Any, mongod: Any) -> None:
+    """**A malformed $jsonSchema is refused before any document is read.**
+    mongod translates the schema while it parses the filter, so `count`,
+    `distinct`, `aggregate`, `update`, `delete`, `findAndModify` and a
+    collection validator all refuse it over an empty collection; the Rust
+    server answered as if it were valid (measured 8.2.11, 2026-10-22)."""
+    out = []
+    for schema in (
+        {"properties": {"a": {"enum": []}}},
+        {"required": "a"},
+        {"properties": {"n": {"multipleOf": float("nan")}}},
+    ):
+        ours, theirs = _commands(rust_mongo, schema), _commands(mongod, schema)
+        out += [
+            f"{schema} {k}: mongod {theirs[k]!r}, rust {ours[k]!r}"
+            for k in theirs
+            if ours[k] != theirs[k]
+        ]
+    assert out == []
