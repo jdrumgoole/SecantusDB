@@ -1,0 +1,39 @@
+name: image-libclang
+description: >
+  Point bindgen at the libclang the Ubuntu runner image already ships, instead
+  of installing `clang libclang-dev llvm-dev` from apt on every run. Fails the
+  job if the image has none, so a changed image is an error, not a skip.
+
+# Why (2026-10-22): the apt download of libclang-18-dev stalled for 4-5
+# minutes on the Azure Ubuntu mirror (`Ign:` retries) in about half the runs
+# of the jobs that build the Rust servers, and it was whichever job it hit
+# that set the PR's CI time. The ubuntu-24.04 image installs clang 16, 17 and
+# 18, each with its shared libclang and the clang resource headers bindgen
+# reads (stddef.h and friends), so the download bought nothing.
+#
+# Both bindgen users read LIBCLANG_PATH: secantus-wt's WiredTiger bindings and
+# pg_query's build script. The newest LLVM on the image is chosen, and its
+# version is printed, so a log says which libclang generated the bindings.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        for v in $(ls -d /usr/lib/llvm-*/lib 2>/dev/null \
+                     | sed -E 's#^/usr/lib/llvm-([0-9]+)/lib$#\1#' \
+                     | grep -E '^[0-9]+$' | sort -rn); do
+          d="/usr/lib/llvm-$v/lib"
+          lib=$(ls "$d"/libclang.so* "$d"/libclang-*.so* 2>/dev/null | head -1 || true)
+          hdr=$(ls "$d"/clang/*/include/stddef.h 2>/dev/null | head -1 || true)
+          if [ -n "$lib" ] && [ -n "$hdr" ]; then
+            echo "libclang: $lib"
+            echo "clang resource headers: $(dirname "$hdr")"
+            echo "LIBCLANG_PATH=$d" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "llvm-$v: incomplete (libclang='${lib}', stddef.h='${hdr}')"
+        done
+        echo "::error::no LLVM under /usr/lib/llvm-* has both libclang and its resource headers; the runner image changed -- install clang + libclang-dev again"
+        exit 1

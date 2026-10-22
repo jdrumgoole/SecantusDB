@@ -34,11 +34,20 @@ inputs:
     default: "3"
   attempt-timeout:
     description: >
-      Seconds one attempt (update, then install) may take before it is killed
-      and retried. Well above a healthy run — a warm runner does this in well
+      Seconds the install of one attempt may take before it is killed and
+      retried. Well above a healthy run — a warm runner does this in well
       under a minute — and far below the job timeout it used to consume.
     required: false
     default: "240"
+  update-timeout:
+    description: >
+      Seconds the `apt-get update` of one attempt may take. Shorter than the
+      install's, because it moves only the index files: a healthy update takes
+      5-15s. On 2026-10-22 an unreachable Azure mirror stalled the update, and
+      the job waited out the whole 240s install budget before the retry that
+      pins archive.ubuntu.com (PR #2092, storage-engine).
+    required: false
+    default: "90"
 
 runs:
   using: composite
@@ -48,6 +57,7 @@ runs:
         APT_PACKAGES: ${{ inputs.packages }}
         APT_ATTEMPTS: ${{ inputs.attempts }}
         APT_ATTEMPT_TIMEOUT: ${{ inputs.attempt-timeout }}
+        APT_UPDATE_TIMEOUT: ${{ inputs.update-timeout }}
       run: |
         set -uo pipefail
 
@@ -66,7 +76,9 @@ runs:
           echo "::group::apt-get attempt ${attempt}/${APT_ATTEMPTS}"
           # -k 10: if the timeout's TERM is ignored (apt holding a lock), follow
           # up with KILL 10s later so the attempt cannot outlive its budget.
-          if sudo timeout -k 10 "${APT_ATTEMPT_TIMEOUT}" apt-get "${apt_opts[@]}" update \
+          phase=update; limit="${APT_UPDATE_TIMEOUT}"
+          if sudo timeout -k 10 "${APT_UPDATE_TIMEOUT}" apt-get "${apt_opts[@]}" update \
+            && { phase=install; limit="${APT_ATTEMPT_TIMEOUT}"; } \
             && sudo timeout -k 10 "${APT_ATTEMPT_TIMEOUT}" apt-get "${apt_opts[@]}" install -y ${APT_PACKAGES}; then
             echo "::endgroup::"
             exit 0
@@ -83,9 +95,9 @@ runs:
           # 124 is timeout(1)'s "killed at the deadline" — i.e. the mirror stall
           # this action exists for, as opposed to a genuine package error.
           if [ "${rc}" -eq 124 ]; then
-            reason="timed out after ${APT_ATTEMPT_TIMEOUT}s (mirror stall)"
+            reason="${phase} timed out after ${limit}s (mirror stall)"
           else
-            reason="exited ${rc}"
+            reason="${phase} exited ${rc}"
           fi
           if [ "${attempt}" -ge "${APT_ATTEMPTS}" ]; then
             echo "::error::apt-get ${reason}; giving up after ${APT_ATTEMPTS} attempts"
