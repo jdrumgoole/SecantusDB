@@ -18,3 +18,8 @@ with its shared libclang and the clang resource headers bindgen reads.
   `psycopg-tls.yml` no longer install `clang`, `libclang-dev` or `llvm-dev`;
   they call the action instead, and the `find` that located libclang in
   `pg-oracle` and `psycopg-tls` is gone. The release workflows are unchanged.
+- `.github/actions/apt-install`: `apt-get update` has its own deadline,
+  `update-timeout` (default 90s), instead of sharing the install's 240s. On
+  this PR's first run the Azure mirror stalled the update of `storage-engine`,
+  and the job waited out the full 240s before the retry that pins
+  `archive.ubuntu.com`. A timeout now names the phase that stalled.
