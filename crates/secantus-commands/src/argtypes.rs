@@ -1720,6 +1720,14 @@ pub fn unknown_operator_in_filter(filter: &Document) -> Option<(i32, String)> {
             }
             continue;
         }
+        // mongod translates a `$jsonSchema` while it parses the filter, so a
+        // malformed one is refused before any document is read.
+        if key == "$jsonSchema" {
+            if let Some((code, _, msg)) = secantus_core::query::json_schema_keyword_error(value) {
+                return Some((code, msg));
+            }
+            continue;
+        }
         let mut clause = Document::new();
         clause.insert(key.clone(), value.clone());
         let tried =

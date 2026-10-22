@@ -52,6 +52,7 @@ pub mod expr_rewrite;
 mod fill;
 mod group;
 mod hashed;
+mod jsonschema;
 mod numeric;
 pub mod order;
 mod paths;
