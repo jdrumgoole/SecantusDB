@@ -210,6 +210,7 @@ fn fix(slot: &mut pg_query::protobuf::Node) -> bool {
         .or_else(|| as_cast(slot))
         .or_else(|| builtin_alias::replacement(slot))
         .or_else(|| typmod_cast::replacement(slot))
+        .or_else(|| named_args::replacement(slot))
     {
         Some(cast) => {
             *slot = cast;
@@ -236,7 +237,10 @@ pub(crate) fn rewrite(node: &mut N) {
     let wanted = user_ops::wanted(node)
         || node.nodes().iter().any(|(n, _, _, _)| match n {
             pg_query::NodeRef::FuncCall(f) => {
-                cast_target(f).is_some() || builtin_alias::wanted(f) || typmod_cast::wanted(f)
+                cast_target(f).is_some()
+                    || builtin_alias::wanted(f)
+                    || typmod_cast::wanted(f)
+                    || named_args::wanted(f)
             }
             pg_query::NodeRef::JsonParseExpr(_) => true,
             _ => false,

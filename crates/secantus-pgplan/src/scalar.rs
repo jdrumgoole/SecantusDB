@@ -2008,7 +2008,14 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         }),
         "pg_size_pretty" => size_pretty(&args[0]),
         "pg_size_bytes" => size_bytes(&crate::value_text(&args[0])),
-        "pg_column_size" => Ok(column_size(&args[0])),
+        // Over a stored column the lowering passes its declared type.
+        "pg_column_size" => Ok(match args.get(1).and_then(Bson::as_str) {
+            Some(mark) if mark.starts_with(STORED_SIZE_MARK) => {
+                crate::datum_size::column_size(&args[0], &mark[STORED_SIZE_MARK.len()..], true)
+                    .map_or(Bson::Null, Bson::Int32)
+            }
+            _ => column_size(&args[0]),
+        }),
         // A PROCEDURE is not callable in an expression.
         _ if crate::correlated::is_user_procedure(name, args.len()) => Err(Error::Sqlstate(
             "42809",
@@ -2973,6 +2980,10 @@ fn size_bytes(text: &str) -> Result<Bson> {
 
 /// `pg_column_size(value)`: the bytes the value's datum takes -- a short
 /// varlena (under 127 bytes) carries a 1-byte header, a longer one 4.
+/// The marker on `pg_column_size`'s second (internal) argument that names
+/// a stored column's declared type.
+pub(crate) const STORED_SIZE_MARK: &str = "\u{1f}stored:";
+
 fn column_size(v: &Bson) -> Bson {
     match v {
         Bson::Null => Bson::Null,

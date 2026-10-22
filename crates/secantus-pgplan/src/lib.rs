@@ -84,6 +84,7 @@ pub mod copy_opts;
 pub mod correlated;
 pub mod cursor_scroll;
 pub mod datetime;
+mod datum_size;
 pub mod domains;
 pub mod dtparse;
 mod enum_order;
@@ -95,6 +96,7 @@ pub mod formatting;
 pub mod fts;
 mod func_cast;
 mod funcsig;
+mod named_args;
 mod search_cycle;
 mod strict_fold;
 pub mod timezones;
@@ -1056,6 +1058,8 @@ pub enum Statement {
     RefreshMatView {
         name: String,
         with_data: bool,
+        /// `CONCURRENTLY`.
+        concurrent: bool,
     },
     /// `DROP MATERIALIZED VIEW [IF EXISTS] names`.
     DropMatView {
@@ -4440,6 +4444,7 @@ fn plan_node(
                 .map(relation_name)
                 .ok_or_else(|| Error::Parse("REFRESH without a relation".into()))?,
             with_data: !r.skip_data,
+            concurrent: r.concurrent,
         }),
         N::CreateDomainStmt(c) => domains::plan_create_domain(&c),
         N::AlterDomainStmt(a) => domains::plan_alter_domain(&a),
@@ -13127,6 +13132,7 @@ fn expression_column_name(node: &pg_query::protobuf::Node) -> String {
         Some(N::AExpr(e)) if AExprKind::try_from(e.kind) == Ok(AExprKind::AexprNullif) => {
             "nullif".to_string()
         }
+        Some(N::CaseExpr(_)) => "case".to_string(),
         // A subscript / field selection names from what it selects: `x[1]`
         // is `x`, `(array[1, 2])[1]` is `array`, and `(r).f` is the field.
         Some(N::AIndirection(ind)) => {
@@ -13141,6 +13147,40 @@ fn expression_column_name(node: &pg_query::protobuf::Node) -> String {
             }
         }
         _ => "?column?".to_string(),
+    }
+}
+
+/// A rewrite that replaces a select-list expression (`>>` over inets as
+/// `__net_op(...)`, `xmlagg` as `string_agg(...)::xml`) must not rename its
+/// column: each unnamed target keeps the name its ORIGINAL expression gave
+/// it (`?column?`, `xmlagg`), as an explicit name.
+fn keep_target_names(
+    before: &pg_query::protobuf::SelectStmt,
+    after: &mut pg_query::protobuf::SelectStmt,
+) {
+    if before.target_list.len() != after.target_list.len() {
+        return;
+    }
+    for (b, a) in before.target_list.iter().zip(after.target_list.iter_mut()) {
+        let (Some(N::ResTarget(rb)), Some(N::ResTarget(ra))) = (b.node.as_ref(), a.node.as_mut())
+        else {
+            continue;
+        };
+        if !rb.name.is_empty() || !ra.name.is_empty() {
+            continue;
+        }
+        let (Some(vb), Some(va)) = (rb.val.as_deref(), ra.val.as_deref()) else {
+            continue;
+        };
+        if matches!(vb.node.as_ref(), Some(N::ColumnRef(c))
+            if c.fields.iter().any(|f| matches!(f.node.as_ref(), Some(N::AStar(_)))))
+        {
+            continue;
+        }
+        let name = expression_column_name(vb);
+        if expression_column_name(va) != name {
+            ra.name = name;
+        }
     }
 }
 
@@ -13821,6 +13861,26 @@ fn plan_table_targets(
                 // The overload PostgreSQL picks for these argument types
                 // (`round` of an integer is the float8 one).
                 let selected = funcsig::result_type(&name, &types);
+                // The column is named for the function as written, whatever
+                // it runs as below.
+                let out = if rt.name.is_empty() {
+                    name.clone()
+                } else {
+                    rt.name.clone()
+                };
+                // `pg_column_size` of a stored column is the heap's packed
+                // form of its declared type (RP-074).
+                let mut args = args;
+                if name == "pg_column_size" {
+                    let ty = def
+                        .column(&column)
+                        .map(|c| c.pg_type.clone())
+                        .unwrap_or_default();
+                    args.push(Some(Bson::String(format!(
+                        "{}{ty}",
+                        scalar::STORED_SIZE_MARK
+                    ))));
+                }
                 // `length` of a tsvector counts its lexemes.
                 let name = if name == "length"
                     && def.column(&column).is_some_and(|c| c.pg_type == "tsvector")
@@ -13835,11 +13895,6 @@ fn plan_table_targets(
                     "geom_length".to_string()
                 } else {
                     name
-                };
-                let out = if rt.name.is_empty() {
-                    name.clone()
-                } else {
-                    rt.name.clone()
                 };
                 columns.push((out, field));
                 casts.push(Some(ColumnExpr::Call {
@@ -19690,7 +19745,8 @@ fn plan_select(
     }
     cancel::check()?;
     // An enum orders by its labels' declared positions, not their text.
-    if let Some(rewritten) = enum_order::rewrite(s, lookup)? {
+    if let Some(mut rewritten) = enum_order::rewrite(s, lookup)? {
+        keep_target_names(s, &mut rewritten);
         return plan_select(&rewritten, lookup, params);
     }
     // A bare `VALUES` with ORDER BY / LIMIT / OFFSET: the clauses belong to
@@ -19717,7 +19773,8 @@ fn plan_select(
     }
     cancel::check()?;
     // `xmlagg(x)` is the concatenation of its non-NULL inputs, with or without a FROM.
-    if let Some(rewritten) = rewrite_xmlagg(s)? {
+    if let Some(mut rewritten) = rewrite_xmlagg(s)? {
+        keep_target_names(s, &mut rewritten);
         return plan_select(&rewritten, lookup, params);
     }
     if s.from_clause.is_empty() {
@@ -24676,6 +24733,24 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 // they stand alone, and folding them here would freeze a
                 // `current_setting` the session may still change.
                 let name = overload_name(f, name);
+                // `pg_column_size` reads its argument's type (RP-074): through
+                // the expression evaluator, which has it.
+                if name == "pg_column_size" {
+                    let node = pg_query::protobuf::Node {
+                        node: Some(N::FuncCall(f.clone())),
+                    };
+                    columns.push((
+                        if rt.name.is_empty() {
+                            name.clone()
+                        } else {
+                            rt.name.clone()
+                        },
+                        ConstCol::Value(const_value(&node, params)?),
+                        "int4".into(),
+                        -1,
+                    ));
+                    continue;
+                }
                 let datetime_typed = datetime_result_type(f, &name);
                 if let Some(t) = datetime_typed.clone() {
                     if let Some(value) = datetime_call(f, &name, params) {
@@ -36436,6 +36511,20 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
     if let Some(N::FuncCall(f)) = node.node.as_ref() {
         if let Some(result) = correlated::eval_correlated(f, params) {
             return result;
+        }
+        // `pg_column_size` reads its argument's TYPE and where it came
+        // from, not only its value (RP-074).
+        if func_name(f).as_deref() == Some("pg_column_size")
+            && f.args.len() == 1
+            && f.over.is_none()
+        {
+            let arg = &f.args[0];
+            let value = const_value(arg, params)?;
+            let ty = static_type(arg, &value);
+            let from_table = matches!(arg.node.as_ref(), Some(N::ColumnRef(_)));
+            return Ok(
+                datum_size::column_size(&value, &ty, from_table).map_or(Bson::Null, Bson::Int32)
+            );
         }
         if let Some(result) = collation_for_call(f, params) {
             return result;

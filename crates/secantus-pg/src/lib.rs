@@ -15133,6 +15133,74 @@ impl PgHandler {
 
     /// `REFRESH MATERIALIZED VIEW`: the stored query run again, replacing
     /// the rows (or, `WITH NO DATA`, leaving none).
+    /// `REFRESH ... CONCURRENTLY`'s refusals (`ExecRefreshMatView`, in its
+    /// order): not with WITH NO DATA, not of a view never populated, and only
+    /// over a unique index on plain columns with no WHERE (RP-074). The
+    /// refresh itself is the ordinary one: a single session sees no
+    /// difference between the two.
+    fn check_concurrent_refresh(&self, name: &str, with_data: bool) -> PgWireResult<()> {
+        if !with_data {
+            return Err(Self::user_error(
+                "42601",
+                "CONCURRENTLY and WITH NO DATA options cannot be used together".into(),
+            ));
+        }
+        let Some((_, _, populated)) = self.matviews()?.into_iter().find(|(n, _, _)| n == name)
+        else {
+            // Not a materialized view: `refresh_matview` says so.
+            return Ok(());
+        };
+        if !populated {
+            return Err(Self::user_error(
+                "0A000",
+                "CONCURRENTLY cannot be used when the materialized view is not populated".into(),
+            ));
+        }
+        let def = self.lookup(name);
+        let fields: Vec<String> = def
+            .as_ref()
+            .map(|d| d.columns.iter().map(|c| c.field()).collect())
+            .unwrap_or_default();
+        let keyed = self
+            .storage
+            .list_indexes(self.db(), name)
+            .unwrap_or_default()
+            .iter()
+            .any(|ix| {
+                let options = ix.get_document("options").ok();
+                let unique = options
+                    .and_then(|o| o.get_bool("unique").ok())
+                    .or_else(|| ix.get_bool("unique").ok())
+                    .unwrap_or(false);
+                // A user's WHERE is `sqlPredicate`; a unique index's own
+                // `partialFilterExpression` is how NULLs stay distinct.
+                let partial = options.is_some_and(|o| o.contains_key("sqlPredicate"))
+                    || ix.contains_key("sqlPredicate");
+                ix.get_str("name").is_ok_and(|n| n != "_id_")
+                    && unique
+                    && !partial
+                    && ix
+                        .get_document("key")
+                        .is_ok_and(|k| k.keys().all(|f| fields.iter().any(|c| c == f)))
+            });
+        if !keyed {
+            let mut info = ErrorInfo::new(
+                "ERROR".into(),
+                "55000".into(), // object_not_in_prerequisite_state
+                {
+                    let (schema, bare) = secantus_pgplan::schemas::split_key(name);
+                    format!("cannot refresh materialized view \"{schema}.{bare}\" concurrently")
+                },
+            );
+            info.hint = Some(
+                "Create a unique index with no WHERE clause on one or more columns of the materialized view."
+                    .into(),
+            );
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+        Ok(())
+    }
+
     fn refresh_matview(&self, name: &str, with_data: bool) -> PgWireResult<()> {
         let Some((_, definition, _)) = self.matviews()?.into_iter().find(|(n, _, _)| n == name)
         else {
@@ -26596,7 +26664,60 @@ impl PgHandler {
     /// `\'` in any literal read with backslash escapes when it is `off`, or
     /// `safe_encoding` under a client-only client encoding (scan.l's
     /// `xeescape`, `PG_ENCODING_IS_CLIENT_ONLY`).
+    /// The scanner's NOTICE 42622 for each identifier of NAMEDATALEN (64)
+    /// bytes or more, which it cuts to 63 at a character boundary
+    /// (`truncate_identifier`, RP-074). The scan runs only when the text
+    /// holds a run of 64 bytes that could be one.
+    fn note_truncated_identifiers(&self, sql: &str) {
+        // An unquoted identifier is a run of identifier bytes; a quoted one
+        // may hold anything, so any quote in a long enough text scans.
+        let mut run = 0usize;
+        let long = sql.bytes().any(|b| {
+            run = if b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80 {
+                run + 1
+            } else {
+                0
+            };
+            run >= 64
+        }) || (sql.contains('"') && sql.len() >= 66);
+        if !long {
+            return;
+        }
+        let Ok(scanned) = pg_query::scan(sql) else {
+            return;
+        };
+        for t in &scanned.tokens {
+            if t.token != pg_query::protobuf::Token::Ident as i32 {
+                continue;
+            }
+            let Some(raw) = sql.get(t.start as usize..t.end as usize) else {
+                continue;
+            };
+            let ident = match raw.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+                Some(q) => q.replace("\"\"", "\""),
+                // An unquoted identifier is folded to lower case (ASCII only).
+                None => raw.to_ascii_lowercase(),
+            };
+            if ident.len() < 64 {
+                continue;
+            }
+            let mut cut = 63;
+            while !ident.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            self.notice(
+                "42622",
+                format!(
+                    "identifier \"{ident}\" will be truncated to \"{}\"",
+                    &ident[..cut]
+                ),
+                None,
+            );
+        }
+    }
+
     fn apply_string_syntax(&self, sql: &str) -> PgWireResult<String> {
+        self.note_truncated_identifiers(sql);
         let syntax = {
             let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
             let client_only = settings.get("client_encoding").is_some_and(|e| {
@@ -34276,7 +34397,8 @@ impl PgHandler {
                 // Only the extensions this server carries an implementation
                 // of can be installed; the rest are PostgreSQL's 0A000 `is
                 // not available`, with its control-file detail and hint
-                // (measured on 16).
+                // (measured on 16; the path names 15, the version this server
+                // reports, as a Debian-packaged PostgreSQL 15 writes it).
                 let Some((version, relocatable, types)) = Self::available_extension(&name) else {
                     let mut info = ErrorInfo::new(
                         "ERROR".into(),
@@ -34285,7 +34407,7 @@ impl PgHandler {
                     );
                     info.detail = Some(format!(
                         "Could not open extension control file \
-                         \"/usr/share/postgresql/16/extension/{name}.control\": \
+                         \"/usr/share/postgresql/15/extension/{name}.control\": \
                          No such file or directory."
                     ));
                     info.hint = Some(
@@ -34381,7 +34503,14 @@ impl PgHandler {
                 self.alter_enum(&name, change)?;
                 Ok(vec![Response::Execution(Tag::new("ALTER TYPE"))])
             }
-            Statement::RefreshMatView { name, with_data } => {
+            Statement::RefreshMatView {
+                name,
+                with_data,
+                concurrent,
+            } => {
+                if concurrent {
+                    self.check_concurrent_refresh(&name, with_data)?;
+                }
                 self.refresh_matview(&name, with_data)?;
                 Ok(vec![Response::Execution(Tag::new(
                     "REFRESH MATERIALIZED VIEW",
