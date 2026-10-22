@@ -163,7 +163,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "WHERE CURRENT OF a cursor not on a row": (
         "RP-072",
-        True,
+        False,
         [
             "create table rp30_w (a int)",
             "insert into rp30_w values (1)",
@@ -351,7 +351,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ------------------------------------------ RP-143, RP-144 schemas' routines
     "two schemas' routines of one name": (
         "RP-143",
-        True,
+        False,
         [
             "create schema rp30_za",
             "create schema rp30_zb",

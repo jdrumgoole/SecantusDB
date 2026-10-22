@@ -78,6 +78,8 @@ impl PgHandler {
                 tail: None,
                 base: 0,
                 failed: false,
+                current_of: None,
+                held: false,
             },
         );
         Ok(name)

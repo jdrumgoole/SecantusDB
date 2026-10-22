@@ -42,6 +42,7 @@ mod collations;
 mod config_views;
 mod copy_text;
 mod crl;
+mod current_of;
 mod database_ddl;
 mod db_settings;
 mod default_acl;
@@ -1281,6 +1282,7 @@ fn user_fn_of(d: &Document) -> secantus_pgplan::UserFn {
     };
     secantus_pgplan::UserFn {
         name,
+        schema: d.get_str("schema").unwrap_or("public").to_string(),
         arg_types: strings("param_types"),
         return_type: d.get_str("return_tag").unwrap_or("text").to_string(),
         returns_set: d.get_bool("returns_set").unwrap_or(false)
@@ -3569,6 +3571,9 @@ pub struct PgHandler {
     /// requested before planning, armed for the top-level SELECT only, and
     /// whether the result it produced is a stream (not to be materialised).
     stream_request: std::sync::atomic::AtomicU8,
+    /// Set while DROP SCHEMA drops what it holds: what those drops cascade
+    /// to is collected here, for the schema's one notice, not sent.
+    cascade_capture: Mutex<Option<Vec<String>>>,
     stream_portal: std::sync::atomic::AtomicU8,
     streamed: AtomicBool,
     /// The portal being allowed to stream is in a transaction block.
@@ -3656,6 +3661,9 @@ pub struct PgHandler {
     /// rows stream is drained, and re-encodes them in the FETCH's format. `None`
     /// except during a DECLARE, so a plain SELECT pays only a cheap flag check.
     cursor_capture: std::sync::Arc<Mutex<Option<CapturedRows>>>,
+    /// Armed with `cursor_capture` by a DECLARE over a simply updatable
+    /// scan: each output row's stored `_id`, for `WHERE CURRENT OF`.
+    cursor_ids: std::sync::Arc<Mutex<Option<Vec<Bson>>>>,
     /// A serial unique to this connection for the life of the process,
     /// naming the owner of an uncommitted-type view in
     /// [`INSTALLED_USER_TYPES`]. Distinct from `backend_pid`, which is
@@ -3935,9 +3943,47 @@ struct CursorState {
     /// An error was raised while the cursor ran (PostgreSQL's
     /// `PORTAL_FAILED`): every later read of it is refused.
     failed: bool,
+    /// What `WHERE CURRENT OF` reads of it; `None` when it is not a simply
+    /// updatable scan of one table.
+    current_of: Option<CurrentOf>,
+    /// A WITH HOLD cursor whose transaction has ended: its rows are kept,
+    /// but `WHERE CURRENT OF` refuses it.
+    held: bool,
+}
+
+/// What `WHERE CURRENT OF` needs of a cursor (RP-072): the one table it
+/// scans -- PostgreSQL's `search_plan_tree` reaches a scan through Limit
+/// and Result nodes only, and a FOR UPDATE cursor's row mark names its
+/// table -- and each row's stored `_id`, aligned with `rows` from `base`.
+#[derive(Clone, Debug)]
+pub(crate) struct CurrentOf {
+    pub(crate) table: String,
+    pub(crate) ids: Vec<Bson>,
 }
 
 impl CursorState {
+    /// Drop the first `n` rows of the window, with their ids.
+    fn drain_front(&mut self, n: usize) {
+        self.rows.drain(..n);
+        if let Some(t) = self.typed_rows.as_mut() {
+            t.drain(..n.min(t.len()));
+        }
+        if let Some(c) = self.current_of.as_mut() {
+            c.ids.drain(..n.min(c.ids.len()));
+        }
+        self.base += n;
+    }
+
+    /// Empty the window, to be read again from the start.
+    fn clear_window(&mut self) {
+        self.rows.clear();
+        self.typed_rows = Some(Vec::new());
+        if let Some(c) = self.current_of.as_mut() {
+            c.ids.clear();
+        }
+        self.base = 0;
+    }
+
     /// PortalRunFetch's state check: a failed portal cannot be run (55000).
     fn check_runnable(&self, name: &str) -> std::result::Result<(), String> {
         if self.failed {
@@ -3991,6 +4037,8 @@ struct BaseType {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct UserFunction {
     name: String,
+    /// The schema it lives in (`public` when the document names none).
+    schema: String,
     param_types: Vec<String>,
     return_type: String,
     language: String,
@@ -4058,6 +4106,7 @@ impl PgHandler {
             plan_cache: Mutex::new(HashMap::new()),
             plan_seen: Mutex::new(std::collections::HashSet::new()),
             stream_request: std::sync::atomic::AtomicU8::new(0),
+            cascade_capture: Mutex::new(None),
             stream_portal: std::sync::atomic::AtomicU8::new(0),
             streamed: AtomicBool::new(false),
             stream_in_block: AtomicBool::new(false),
@@ -4072,6 +4121,7 @@ impl PgHandler {
             catalogs_ensured: AtomicBool::new(false),
             savepoints: Mutex::new(Vec::new()),
             cursor_capture: std::sync::Arc::new(Mutex::new(None)),
+            cursor_ids: std::sync::Arc::new(Mutex::new(None)),
             session_serial: {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -4906,7 +4956,10 @@ impl PgHandler {
                 .filter(is_procedure)
                 .filter_map(|d| {
                     let inputs = d.get_array("param_types").map_or(0, |a| a.len());
-                    d.get_str("name").ok().map(|n| (n.to_string(), inputs))
+                    let schema = d.get_str("schema").unwrap_or("public").to_string();
+                    d.get_str("name")
+                        .ok()
+                        .map(|n| (schema, n.to_string(), inputs))
                 })
                 .collect(),
         );
@@ -10350,6 +10403,7 @@ impl PgHandler {
             };
             out.push(UserFunction {
                 name: d.get_str("name").unwrap_or_default().to_string(),
+                schema: d.get_str("schema").unwrap_or("public").to_string(),
                 param_types: strings("param_types"),
                 return_type: d.get_str("return_tag").unwrap_or_default().to_string(),
                 language: d.get_str("language").unwrap_or_default().to_string(),
@@ -10424,7 +10478,75 @@ impl PgHandler {
             .iter()
             .map(|t| self.display_type_name(t))
             .collect();
-        format!("{}({})", f.name, args.join(", "))
+        // Qualified when its schema is off the search path, as
+        // `format_procedure` writes it.
+        let name = if f.schema == "public"
+            || f.schema.starts_with("pg_temp")
+            || secantus_pgplan::schemas::search_path().contains(&f.schema)
+        {
+            f.name.clone()
+        } else {
+            format!("{}.{}", f.schema, f.name)
+        };
+        format!("{name}({})", args.join(", "))
+    }
+
+    /// A routine's catalog key: `name/nargs` in `public` (the key stores have
+    /// always used), `schema.name/nargs` in any other schema, a session's
+    /// temp one included. A second overload at one arity appends
+    /// `/types` to it.
+    pub(crate) fn routine_key(schema: &str, name: &str, nargs: usize) -> String {
+        format!(
+            "{}/{nargs}",
+            secantus_pgplan::schemas::relation_key(schema, name)
+        )
+    }
+
+    /// 3F000 for a routine name qualified with a schema that does not
+    /// exist, as PostgreSQL's `LookupExplicitNamespace` raises it.
+    pub(crate) fn require_routine_schema(&self, name: &str) -> PgWireResult<()> {
+        if name.starts_with("pg_temp.") {
+            return Ok(());
+        }
+        match secantus_pgplan::schemas::split_routine_name(name) {
+            (Some(s), _) if !self.namespaces().iter().any(|(n, _)| n == s) => Err(
+                Self::user_error("3F000", format!("schema \"{s}\" does not exist")),
+            ),
+            _ => Ok(()),
+        }
+    }
+
+    /// The routines a statement's routine name (`schemas::routine_name`)
+    /// reaches: a qualified name's schema's, else those in the first schema
+    /// on the search path holding one of that name -- PostgreSQL's
+    /// `FuncnameGetCandidates` (RP-143). A session's temp routine answers
+    /// to its bare name too, as it did before schemas were told apart.
+    fn routines_named<'a>(functions: &'a [UserFunction], name: &str) -> Vec<&'a UserFunction> {
+        if let Some(bare) = name.strip_prefix("pg_temp.") {
+            return functions
+                .iter()
+                .filter(|f| f.name == bare && f.schema.starts_with("pg_temp"))
+                .collect();
+        }
+        let path = secantus_pgplan::schemas::search_path();
+        let ranked: Vec<(usize, &UserFunction)> = functions
+            .iter()
+            .filter_map(|f| {
+                secantus_pgplan::schemas::routine_rank(name, &f.schema, &f.name, &path)
+                    .map(|r| (r, f))
+            })
+            .collect();
+        if let Some(first) = ranked.iter().map(|r| r.0).min() {
+            return ranked
+                .into_iter()
+                .filter(|r| r.0 == first)
+                .map(|r| r.1)
+                .collect();
+        }
+        functions
+            .iter()
+            .filter(|f| f.name == name && f.schema.starts_with("pg_temp"))
+            .collect()
     }
 
     /// A type name as PostgreSQL displays it: a builtin by its display name
@@ -10561,6 +10683,26 @@ impl PgHandler {
     /// client is listening (as PostgreSQL sends one -- a DROP's CASCADE list
     /// arrives before the statement's long tail), else at its end.
     fn notice(&self, sqlstate: &str, message: String, detail: Option<String>) {
+        if let Some(captured) = self
+            .cascade_capture
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            // `drop cascades to X`, or a count with one DETAIL line per X.
+            if let Some(one) = message.strip_prefix("drop cascades to ") {
+                match &detail {
+                    Some(lines) if one.ends_with(" other objects") => captured.extend(
+                        lines
+                            .lines()
+                            .filter_map(|l| l.strip_prefix("drop cascades to "))
+                            .map(str::to_string),
+                    ),
+                    _ => captured.push(one.to_string()),
+                }
+                return;
+            }
+        }
         let mut info = ErrorInfo::new("NOTICE".into(), sqlstate.into(), message);
         info.detail = detail;
         self.pending_notices
@@ -10689,17 +10831,15 @@ impl PgHandler {
         // `name/nargs` is the shared catalog's key; an OVERLOAD at the same
         // arity (different argument types) takes `name/nargs/types`, which the
         // Python server does not know to look for.
-        let base_key = if temp {
-            format!("{}.{}/{nargs}", self.temp_schema_name(), def.name)
-        } else {
-            format!("{}/{nargs}", def.name)
-        };
-        // A routine's identity is its INPUT types (OUT ones excluded).
+        let schema = def.schema.clone().unwrap_or_else(|| "public".into());
+        let base_key = Self::routine_key(&schema, &def.name, nargs);
+        // A routine's identity is its INPUT types (OUT ones excluded), in
+        // its schema (RP-143).
         let new_types: Vec<String> = def.params.iter().map(|(_, t)| t.clone()).collect();
         let same_arity: Vec<UserFunction> = self
             .functions()?
             .into_iter()
-            .filter(|f| f.name == def.name && f.param_types.len() == nargs)
+            .filter(|f| f.name == def.name && f.schema == schema && f.param_types.len() == nargs)
             .collect();
         let same_signature = same_arity.iter().find(|f| f.param_types == new_types);
         let key = match same_signature {
@@ -26493,6 +26633,9 @@ impl PgHandler {
         let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
         if keep_holdable {
             cursors.retain(|_, c| c.is_holdable);
+            for c in cursors.values_mut() {
+                c.held = true;
+            }
         } else {
             cursors.clear();
         }
@@ -27370,12 +27513,30 @@ impl PgHandler {
             // resolved values are also captured (`cursor_capture`), to be
             // re-encoded per FETCH.
             let tz = self.session_timezone();
+            let in_block = self
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed);
             let capture_typed = matches!(&*query, Statement::Select(_));
             if capture_typed {
                 *self
                     .cursor_capture
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
+            }
+            // The table a simply updatable cursor scans, whose rows' ids
+            // are captured with them.
+            let updatable = match &*query {
+                Statement::Select(sel) if self.simply_updatable(sel) => Some(sel.table.clone()),
+                _ => None,
+            };
+            let take_ids = || {
+                self.cursor_ids
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+            };
+            if updatable.is_some() {
+                *self.cursor_ids.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
             }
             let binary = self
                 .binary_results
@@ -27388,6 +27549,7 @@ impl PgHandler {
                 if let Statement::Select(sel) = &*query {
                     let streamed = self.declare_streamed(sel, &statement, scrollable, holdable);
                     if !matches!(streamed, Ok(None)) {
+                        take_ids();
                         self.binary_results
                             .store(binary, std::sync::atomic::Ordering::Relaxed);
                         self.cursor_capture
@@ -27431,6 +27593,7 @@ impl PgHandler {
                 Err(e) => {
                     // Disarm capture on the error path so the buffer does not
                     // leak into an unrelated later statement.
+                    take_ids();
                     self.cursor_capture
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -27439,6 +27602,7 @@ impl PgHandler {
                 }
             };
             let Some(Response::Query(q)) = responses.into_iter().next() else {
+                take_ids();
                 self.cursor_capture
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -27450,7 +27614,14 @@ impl PgHandler {
                 ))));
             };
             let schema = q.row_schema.clone();
-            let rows = q.data_rows.try_collect::<Vec<_>>().await?;
+            let rows = q.data_rows.try_collect::<Vec<_>>().await;
+            let ids = take_ids();
+            let rows = rows?;
+            // One id per row, or the rows did not come from one scan.
+            let current_of = updatable
+                .zip(ids)
+                .filter(|(_, ids)| ids.len() == rows.len())
+                .map(|(table, ids)| CurrentOf { table, ids });
             let typed_rows = self
                 .cursor_capture
                 .lock()
@@ -27480,6 +27651,10 @@ impl PgHandler {
                         tail: None,
                         base: 0,
                         failed: false,
+                        current_of,
+                        // Declared outside a block, its transaction is
+                        // already over.
+                        held: holdable && !in_block,
                     },
                 );
             if holdable {
@@ -32057,6 +32232,17 @@ impl PgHandler {
         // A `DECLARE CURSOR` over this SELECT arms row capture (see
         // `cursor_capture`); a plain SELECT leaves it disarmed and pays
         // only the `Option` check below -- no lock, no extra clone.
+        let ids = capture_into
+            .is_none()
+            .then(|| {
+                let armed = self
+                    .cursor_ids
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some();
+                armed.then(|| self.cursor_ids.clone())
+            })
+            .flatten();
         let capture = capture_into.or_else(|| {
             let armed = self
                 .cursor_capture
@@ -32067,6 +32253,11 @@ impl PgHandler {
         });
         let rows = source.map(move |d| {
             let d = d?;
+            if let Some(ids) = &ids {
+                if let Some(buf) = ids.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                    buf.push(d.get("_id").cloned().unwrap_or(Bson::Null));
+                }
+            }
             let mut enc = DataRowEncoder::new(schema_ref.clone());
             let mut captured: Option<Vec<Option<Bson>>> =
                 capture.as_ref().map(|_| Vec::with_capacity(fields.len()));
@@ -33584,8 +33775,53 @@ impl PgHandler {
                 // without it their presence is 2BP01. Tables carry no schema
                 // here, so they are left alone.
                 self.ensure_collection(Self::SCHEMA_COLLECTION)?;
+                // Every schema named must exist first (IF EXISTS skips a
+                // missing one with a notice), before anything is dropped.
+                let mut present: Vec<&String> = Vec::new();
                 for name in &names {
-                    let mut members: Vec<(&str, String)> = Vec::new();
+                    let exists = !self
+                        .storage
+                        .find_matching(
+                            self.db(),
+                            Self::SCHEMA_COLLECTION,
+                            &bson::doc! {"_id": name},
+                        )
+                        .map_err(|e| Self::storage_err("could not read schemas", e))?
+                        .is_empty()
+                        || self
+                            .type_catalog_docs(Self::SCHEMA_COLLECTION)?
+                            .iter()
+                            .any(|d| d.get_str("_id") == Ok(name.as_str()));
+                    if exists {
+                        present.push(name);
+                    } else if if_exists {
+                        self.notice(
+                            "00000",
+                            format!("schema \"{name}\" does not exist, skipping"),
+                            None,
+                        );
+                    } else {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "3F000".into(), // invalid_schema_name
+                            format!("schema \"{name}\" does not exist"),
+                        ))));
+                    }
+                }
+                // What each schema holds. The schemas are one deletion, as
+                // in PostgreSQL: one notice, or one refusal, naming the
+                // members of the last schema named first (measured on
+                // 15.19).
+                struct Held {
+                    members: Vec<(&'static str, String)>,
+                    routines: Vec<UserFunction>,
+                    relations: Vec<(&'static str, String)>,
+                    descs: Vec<String>,
+                }
+                let mut held: Vec<(&String, Held)> = Vec::new();
+                for name in present.iter().rev() {
+                    let name: &String = name;
+                    let mut members: Vec<(&'static str, String)> = Vec::new();
                     for coll in [
                         Self::ENUM_COLLECTION,
                         Self::COMPOSITE_COLLECTION,
@@ -33629,68 +33865,88 @@ impl PgHandler {
                             .iter()
                             .map(|t| self.display_type_name(t))
                             .collect();
-                        let kind = if f.is_procedure {
-                            "procedure"
-                        } else {
-                            "function"
-                        };
                         // `format_procedure`'s form: no blank after a comma.
-                        format!("{kind} {name}.{}({})", f.name, args.join(","))
+                        // PostgreSQL 15's `getObjectDescription` calls a
+                        // procedure a function too.
+                        format!("function {name}.{}({})", f.name, args.join(","))
                     }));
                     // The relations it holds, stored as `schema.name`.
                     let relations = self.schema_relations(name)?;
                     descs.extend(relations.iter().map(|(kind, key)| format!("{kind} {key}")));
-                    if (!members.is_empty() || !relations.is_empty() || !routines.is_empty())
-                        && !cascade
-                    {
-                        let mut info = ErrorInfo::new(
-                            "ERROR".into(),
-                            "2BP01".into(),
-                            format!("cannot drop schema {name} because other objects depend on it"),
-                        );
-                        info.detail = Some(
-                            descs
-                                .iter()
-                                .map(|d| format!("{d} depends on schema {name}"))
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        );
-                        info.hint =
-                            Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
-                        return Err(PgWireError::UserError(Box::new(info)));
+                    held.push((
+                        name,
+                        Held {
+                            members,
+                            routines,
+                            relations,
+                            descs,
+                        },
+                    ));
+                }
+                let depends: Vec<String> = held
+                    .iter()
+                    .flat_map(|(name, h)| {
+                        h.descs
+                            .iter()
+                            .map(move |d| format!("{d} depends on schema {name}"))
+                    })
+                    .collect();
+                if !depends.is_empty() && !cascade {
+                    let message = match present.as_slice() {
+                        [one] => {
+                            format!("cannot drop schema {one} because other objects depend on it")
+                        }
+                        _ => "cannot drop desired object(s) because other objects depend on them"
+                            .to_string(),
+                    };
+                    let mut info = ErrorInfo::new("ERROR".into(), "2BP01".into(), message);
+                    info.detail = Some(depends.join("\n"));
+                    info.hint =
+                        Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
+                    return Err(PgWireError::UserError(Box::new(info)));
+                }
+                let mut descs: Vec<String> = held
+                    .iter()
+                    .flat_map(|(_, h)| h.descs.iter().cloned())
+                    .collect();
+                // The members' own drops reach further -- a view in another
+                // schema over a table in this one -- and PostgreSQL names
+                // those in the same notice, after the members.
+                let set_capture = |v: Option<Vec<String>>| {
+                    std::mem::replace(
+                        &mut *self
+                            .cascade_capture
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()),
+                        v,
+                    )
+                };
+                let outer = set_capture(Some(Vec::new()));
+                let dropped: PgWireResult<()> = held
+                    .iter()
+                    .try_for_each(|(_, h)| self.drop_schema_relations(&h.relations));
+                let reached = set_capture(outer).unwrap_or_default();
+                dropped?;
+                for d in reached {
+                    if !descs.contains(&d) {
+                        descs.push(d);
                     }
-                    self.cascade_notice(&descs);
-                    self.drop_schema_relations(&relations)?;
-                    for f in &routines {
+                }
+                self.cascade_notice(&descs);
+                for (_, h) in &held {
+                    for f in &h.routines {
                         self.delete_type_doc(Self::FUNCTION_COLLECTION, &f.key)?;
                         self.drop_object_acl("function", &f.key)?;
                     }
-                    for (coll, id) in &members {
+                    for (coll, id) in &h.members {
                         self.delete_type_doc(coll, id)?;
                     }
                 }
-                for name in &names {
-                    let removed = self
-                        .storage
-                        .delete_matching(
-                            self.db(),
-                            Self::SCHEMA_COLLECTION,
-                            &bson::doc! {"_id": name},
-                            0,
-                            &Document::new(),
-                            None,
-                        )
-                        .map_err(|e| Self::storage_err("could not drop the schema", e))?;
-                    if removed > 0 {
-                        self.drop_object_acl("schema", name)?;
-                    }
-                    if removed == 0 && !if_exists {
-                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "ERROR".into(),
-                            "3F000".into(), // invalid_schema_name
-                            format!("schema \"{name}\" does not exist"),
-                        ))));
-                    }
+                // Through the catalog overlay, as CREATE SCHEMA wrote it: a
+                // schema made in the open block is gone from it too.
+                for name in &present {
+                    self.delete_type_doc(Self::SCHEMA_COLLECTION, name)?;
+                    self.drop_object_acl("schema", name)?;
                 }
                 Ok(vec![Response::Execution(Tag::new("DROP SCHEMA"))])
             }
@@ -34355,6 +34611,7 @@ impl PgHandler {
                 if_exists,
                 cascade,
                 kind,
+                written_args,
             } => {
                 let tag_text = match kind.as_str() {
                     "procedure" => "DROP PROCEDURE",
@@ -34367,8 +34624,23 @@ impl PgHandler {
                     "function"
                 };
                 let tag = || Ok(vec![Response::Execution(Tag::new(tag_text))]);
+                if let Err(e) = self.require_routine_schema(&name) {
+                    if !if_exists {
+                        return Err(e);
+                    }
+                    let (schema, _) = secantus_pgplan::schemas::split_routine_name(&name);
+                    self.notice(
+                        "00000",
+                        format!(
+                            "schema \"{}\" does not exist, skipping",
+                            schema.unwrap_or_default()
+                        ),
+                        None,
+                    );
+                    return tag();
+                }
                 // An aggregate is dropped with DROP AGGREGATE (42809).
-                if !self.functions()?.iter().any(|f| f.name == name)
+                if Self::routines_named(&self.functions()?, &name).is_empty()
                     && self.user_aggregates()?.iter().any(|a| {
                         a.name == name
                             && arg_types
@@ -34418,13 +34690,13 @@ impl PgHandler {
                     wanted = Some(keys);
                 }
                 let functions = self.functions()?;
-                let candidates: Vec<&UserFunction> =
-                    functions.iter().filter(|f| f.name == name).collect();
+                let candidates = Self::routines_named(&functions, &name);
                 let target = match &wanted {
                     Some(keys) => {
                         let Some(f) = candidates.iter().find(|f| f.param_types == *keys) else {
                             let probe = UserFunction {
                                 name: name.clone(),
+                                schema: "public".into(),
                                 param_types: keys.clone(),
                                 return_type: String::new(),
                                 language: String::new(),
@@ -34433,9 +34705,12 @@ impl PgHandler {
                             };
                             let sig = self.function_signature(&probe);
                             if if_exists {
+                                // The name and types as written, as
+                                // `does_not_exist_skipping` names them.
+                                let written = written_args.clone().unwrap_or_default();
                                 self.notice(
                                     "00000",
-                                    format!("{noun} {sig} does not exist, skipping"),
+                                    format!("{noun} {name}({written}) does not exist, skipping"),
                                     None,
                                 );
                                 return tag();
@@ -34481,6 +34756,8 @@ impl PgHandler {
                     },
                 };
                 let sig = self.function_signature(&target);
+                // From here on, the routine's own (bare) name.
+                let name = target.name.clone();
                 // DROP FUNCTION names a function and DROP PROCEDURE a
                 // procedure (DROP ROUTINE either): 42809 across them.
                 if (kind == "procedure" && !target.is_procedure)
@@ -37472,6 +37749,8 @@ impl PgHandler {
 
             Statement::Update(mut upd) => {
                 self.refuse_matview_write(&upd.table)?;
+                upd.filter =
+                    self.resolve_current_of(&upd.table, std::mem::take(&mut upd.filter))?;
                 if let Some(matched) = self.system_catalog_update(&upd)? {
                     return Ok(vec![Response::Execution(
                         Tag::new("UPDATE").with_rows(matched),
@@ -37737,6 +38016,8 @@ impl PgHandler {
 
             Statement::Delete(mut del) => {
                 self.refuse_matview_write(&del.table)?;
+                del.filter =
+                    self.resolve_current_of(&del.table, std::mem::take(&mut del.filter))?;
                 if self.is_system_catalog(&del.table)? {
                     // Nothing matched is PostgreSQL's answer too; removing a
                     // catalog row is not something this server can do.

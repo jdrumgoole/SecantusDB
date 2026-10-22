@@ -103,15 +103,21 @@ impl PgHandler {
                 all
             }
         };
+        self.require_routine_schema(name)?;
+        let functions = self.functions()?;
+        let reached: Vec<&str> = Self::routines_named(&functions, name)
+            .into_iter()
+            .map(|f| f.key.as_str())
+            .collect();
         let procedure = docs.iter().find(|d| {
-            d.get_str("name") == Ok(name)
+            d.get_str("_id").is_ok_and(|id| reached.contains(&id))
                 && d.get_bool("is_procedure").unwrap_or(false)
                 && all_types(d).len() == args.len()
         });
         let Some(doc) = procedure else {
             // A FUNCTION by that name and arity: PostgreSQL's 42809.
             if docs.iter().any(|d| {
-                d.get_str("name") == Ok(name)
+                d.get_str("_id").is_ok_and(|id| reached.contains(&id))
                     && !d.get_bool("is_procedure").unwrap_or(false)
                     && strings(d, "param_types").len() == args.len()
             }) {
@@ -259,10 +265,16 @@ impl PgHandler {
                 message,
             )))
         };
+        self.require_routine_schema(name)?;
         let docs = self.type_catalog_docs(Self::FUNCTION_COLLECTION)?;
+        let functions = self.functions()?;
+        let reached: Vec<&str> = Self::routines_named(&functions, name)
+            .into_iter()
+            .map(|f| f.key.as_str())
+            .collect();
         let by_name: Vec<&Document> = docs
             .iter()
-            .filter(|d| d.get_str("name") == Ok(name))
+            .filter(|d| d.get_str("_id").is_ok_and(|id| reached.contains(&id)))
             .collect();
         let shown = |types: &[String]| {
             format!(
@@ -319,11 +331,26 @@ impl PgHandler {
             return Err(error("42883", format!("{noun} {signature} does not exist")));
         };
         let mut new_id = id.clone();
+        let schema = target.get_str("schema").unwrap_or("public").to_string();
+        let inputs = strings(target, "param_types");
+        let nargs = doc.get_i32("nargs").unwrap_or(inputs.len() as i32) as usize;
+        // The routine's key once it is `name` in `schema`: a second overload
+        // at one arity there takes the long form.
+        let key_in = |schema: &str, name: &str| {
+            let key = Self::routine_key(schema, name, nargs);
+            if raw.iter().any(|d| d.get_str("_id") == Ok(key.as_str())) {
+                format!("{key}/{}", inputs.join(","))
+            } else {
+                key
+            }
+        };
+        let in_schema = |d: &Document, s: &str| d.get_str("schema").unwrap_or("public") == s;
         match action {
             A::Rename(to) => {
-                let inputs = strings(target, "param_types");
                 if docs.iter().any(|d| {
-                    d.get_str("name") == Ok(to.as_str()) && strings(d, "param_types") == inputs
+                    d.get_str("name") == Ok(to.as_str())
+                        && in_schema(d, &schema)
+                        && strings(d, "param_types") == inputs
                 }) {
                     return Err(error(
                         "42723",
@@ -334,11 +361,7 @@ impl PgHandler {
                         ),
                     ));
                 }
-                let nargs = doc.get_i32("nargs").unwrap_or(inputs.len() as i32);
-                new_id = format!("{to}/{nargs}");
-                if raw.iter().any(|d| d.get_str("_id") == Ok(new_id.as_str())) {
-                    new_id = format!("{new_id}/{}", inputs.join(","));
-                }
+                new_id = key_in(&schema, &to);
                 doc.insert("name", to);
                 doc.insert("_id", new_id.clone());
             }
@@ -349,6 +372,22 @@ impl PgHandler {
                         format!("schema \"{schema}\" does not exist"),
                     ));
                 }
+                let bare = target.get_str("name").unwrap_or_default();
+                if docs.iter().any(|d| {
+                    d.get_str("name") == Ok(bare)
+                        && in_schema(d, &schema)
+                        && strings(d, "param_types") == inputs
+                }) {
+                    return Err(error(
+                        "42723",
+                        format!(
+                            "{noun} {} already exists in schema \"{schema}\"",
+                            shown(&inputs).replacen(name, bare, 1)
+                        ),
+                    ));
+                }
+                new_id = key_in(&schema, bare);
+                doc.insert("_id", new_id.clone());
                 if schema == "public" {
                     doc.remove("schema");
                 } else {

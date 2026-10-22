@@ -516,8 +516,9 @@ impl PgHandler {
             return Ok(key.to_string());
         }
         let (name, args) = split_signature(signature);
+        self.require_routine_schema(&name)?;
         let functions = self.functions()?;
-        let candidates: Vec<_> = functions.iter().filter(|f| f.name == name).collect();
+        let candidates = Self::routines_named(&functions, &name);
         match args {
             Some(types) => {
                 if let Some(f) = candidates.iter().find(|f| f.param_types == types) {

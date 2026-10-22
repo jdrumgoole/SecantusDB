@@ -754,10 +754,7 @@ Not filed:
       each of which PostgreSQL 15.19 runs:
       - `ALTER SYSTEM` (set and reset);
       - `ALTER TYPE ... ADD ATTRIBUTE` / `RENAME ATTRIBUTE`, `CREATE TEXT
-        SEARCH CONFIGURATION`;
-      - `WHERE CURRENT OF` (`CurrentOfExpr`), on a table with rows; over
-        an empty one it answers `UPDATE 0` where PostgreSQL raises 24000
-        (`cursor "c" is not positioned on a row`).
+        SEARCH CONFIGURATION`.
 
       Several appear in `pg_dump` output. Not checked by the test:
       `ALTER EXTENSION`, `ALTER OPERATOR`, `ALTER COLLATION`, `CREATE
@@ -766,7 +763,7 @@ Not filed:
       subscriptions. CLAUDE.md's old claim that "no statement the earlier
       surveys listed" is refused no longer held.
       Backlog-ID: RP-072
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_statements_not_refused, tests/backlog/test_rp_batch30.py::test_scenario[WHERE CURRENT OF a cursor not on a row]
+      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_statements_not_refused
 
 ## Found by batch 30 (2026-10-22)
 
@@ -783,16 +780,50 @@ fixed in the same batch; their tests there are regression tests.
       hash of its name in a band of its own (`sequence_oid`, `view_oid`,
       `index_oid`), so the DETAIL -- which this server sorts by oid as
       PostgreSQL does -- and any `ORDER BY oid` come out in another order.
+      DROP SCHEMA ... CASCADE's notice lists a schema's members in the same
+      creation order (`table s.t`, `function s.f()`, `view s.v`); here they
+      come grouped by kind -- types, routines, views, tables, sequences --
+      since nothing records which was made first.
       Backlog-ID: RP-137
-      Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order]
-- [ ] **Two schemas' routines of one name collide.** A routine's catalog
-      key is its name and arity (`name/nargs`), not its schema, so after
-      `create function a.h()` the `create function b.h()` that PostgreSQL
-      takes is 42723 (`function "h" already exists with same argument
-      types`), and `b.h()` calls `a.h()`. The key would need the schema, and
-      every reader of `__sql_functions__` with it.
-      Backlog-ID: RP-143
-      Verify: tests/backlog/test_rp_batch30.py::test_scenario[two schemas' routines of one name]
+      Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order], tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]
+
+## Found by batch 31 (2026-10-23)
+
+Found while telling two schemas' routines apart (RP-143). The gap tests are
+scenarios in `tests/backlog/test_rp_batch31.py`, measured on a private
+15.19 cluster. RP-145 .. RP-148 were found and fixed in the same batch;
+their tests there are regression tests.
+
+- [ ] **A built-in is reached through any schema.** `select
+      public.lower('A')` and `select s.lower('A')` (for a schema `s`)
+      answer `a`; PostgreSQL's built-ins live only in `pg_catalog`, so
+      both are 42883 there, and only `pg_catalog.lower` (or the bare name)
+      finds it. The planner drops a call's schema unless a user function
+      answers to it (`func_name`). The fix must keep an extension's
+      functions reachable through the schema the extension is installed in
+      (`CREATE EXTENSION ... SCHEMA s`), which this server serves as
+      built-ins: it needs each extension's schema.
+      Backlog-ID: RP-149
+      Verify: tests/backlog/test_rp_batch31.py::test_scenario[a built-in reached through a schema]
+- [ ] **DROP SCHEMA's refusal does not name what depends on its members.**
+      `drop schema s` over a table `s.t` that a view `v` in another schema
+      reads is 2BP01 with PostgreSQL's DETAIL `table s.t depends on schema
+      s` and `view v depends on table s.t`; here only the first line. The
+      CASCADE notice does name `view v` (its members' own drops report it),
+      but the refusal finds the schema's members only, not the objects that
+      depend on them in turn.
+      Backlog-ID: RP-150
+      Verify: tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA's refusal names what depends on its members]
+- [ ] **PL/pgSQL's FETCH, MOVE and CLOSE are refused** (0A000, `the
+      statement fetch in a PL/pgSQL function is not supported yet`). A
+      body can OPEN a cursor (to return a `refcursor`), but not read it, so
+      `open c; fetch c into r; update t ... where current of c; close c`
+      -- PostgreSQL's way to update the rows a loop reads -- fails at the
+      FETCH. A cursor the body opens (`plpgsql_portals`) also keeps no row
+      ids, so once FETCH reads it, `WHERE CURRENT OF` it needs them as the
+      top-level cursor has (`current_of.rs`).
+      Backlog-ID: RP-151
+      Verify: tests/backlog/test_rp_batch31.py::test_scenario[FETCH and CLOSE a cursor in PL/pgSQL]
 
 ## Found by batch 26 (2026-10-22)
 

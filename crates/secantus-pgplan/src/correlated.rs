@@ -938,7 +938,19 @@ pub fn has_correlated(expr: &ColumnExpr) -> bool {
 /// Is `name` a user-defined function at SOME arity? A call at another arity
 /// is then PostgreSQL's 42883, not an unimplemented built-in.
 pub(crate) fn user_function_named(name: &str) -> bool {
+    let path = crate::schemas::search_path();
+    USER_FUNCTIONS.with(|f| {
+        f.borrow()
+            .iter()
+            .any(|u| u.answers_to(name, &path).is_some())
+    })
+}
+
+/// Is there a user-defined function or procedure of this bare name in any
+/// schema, or one that answers to this qualified name?
+pub(crate) fn user_function_bare_named(name: &str) -> bool {
     USER_FUNCTIONS.with(|f| f.borrow().iter().any(|u| u.name == name))
+        || USER_PROCEDURES.with(|p| p.borrow().iter().any(|(_, n, _)| n == name))
 }
 
 /// Runs a sequence function -- `nextval` / `currval` / `setval` / `lastval`
@@ -1106,7 +1118,10 @@ pub(crate) fn without_side_effects<R>(f: impl FnOnce() -> R) -> R {
 /// it: enough to type a call and to route one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UserFn {
+    /// The bare name (`pg_temp.<name>` for a session's temp function).
     pub name: String,
+    /// The schema it lives in (`public` unless created in another).
+    pub schema: String,
     pub arg_types: Vec<String>,
     /// The return type; for a set-returning function, of one row's column.
     pub return_type: String,
@@ -1125,6 +1140,17 @@ pub struct UserFn {
     pub defaults: Vec<Option<String>>,
 }
 
+impl UserFn {
+    /// Whether a call written `name` (as `func_name` writes it) may be this
+    /// function, and how early on the search path (`schemas::routine_rank`).
+    pub(crate) fn answers_to(&self, name: &str, path: &[String]) -> Option<usize> {
+        if self.name.starts_with("pg_temp.") || name.starts_with("pg_temp.") {
+            return (self.name == name).then_some(0);
+        }
+        crate::schemas::routine_rank(name, &self.schema, &self.name, path)
+    }
+}
+
 /// What a user function call produced.
 pub enum FnResult {
     Value(Bson),
@@ -1139,20 +1165,25 @@ type FHook = FunctionHook<'static>;
 thread_local! {
     static FUNCTION_HOOK: std::cell::Cell<Option<*const FHook>> = const { std::cell::Cell::new(None) };
     static USER_FUNCTIONS: std::cell::RefCell<Vec<UserFn>> = const { std::cell::RefCell::new(Vec::new()) };
-    static USER_PROCEDURES: std::cell::RefCell<Vec<(String, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static USER_PROCEDURES: std::cell::RefCell<Vec<(String, String, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Install the user-defined PROCEDURES, `(name, number of inputs)`: a
-/// procedure is not a function, so a call of one in an expression is
+/// Install the user-defined PROCEDURES, `(schema, name, number of inputs)`:
+/// a procedure is not a function, so a call of one in an expression is
 /// PostgreSQL's 42809.
-pub fn set_user_procedures(procs: Vec<(String, usize)>) {
+pub fn set_user_procedures(procs: Vec<(String, String, usize)>) {
     USER_PROCEDURES.with(|p| *p.borrow_mut() = procs);
 }
 
 /// Whether a procedure of this name takes `nargs` inputs -- what an
 /// expression calling it resolves to, before 42809 refuses it.
 pub fn is_user_procedure(name: &str, nargs: usize) -> bool {
-    USER_PROCEDURES.with(|p| p.borrow().iter().any(|(n, k)| n == name && *k == nargs))
+    let path = crate::schemas::search_path();
+    USER_PROCEDURES.with(|p| {
+        p.borrow().iter().any(|(s, n, k)| {
+            *k == nargs && crate::schemas::routine_rank(name, s, n, &path).is_some()
+        })
+    })
 }
 
 /// Install the user-defined functions for the statements that follow.
@@ -1170,21 +1201,35 @@ pub(crate) fn user_functions() -> Vec<UserFn> {
 /// literal matching any. Several equally good candidates are PostgreSQL's
 /// `42725 function ... is not unique`, surfaced by the caller as no match.
 pub(crate) fn user_function_for(name: &str, args: &[pg_query::protobuf::Node]) -> Option<UserFn> {
-    let candidates: Vec<UserFn> = USER_FUNCTIONS.with(|f| {
+    let path = crate::schemas::search_path();
+    let mut candidates: Vec<(usize, UserFn)> = USER_FUNCTIONS.with(|f| {
         f.borrow()
             .iter()
-            .filter(|u| {
-                u.name == name
-                    && (u.arg_types.len() == args.len()
-                        || (u.variadic && args.len() >= u.arg_types.len())
-                        // Trailing parameters with a DEFAULT may be left out.
-                        || (args.len() < u.arg_types.len()
-                            && (args.len()..u.arg_types.len())
-                                .all(|i| u.defaults.get(i).is_some_and(Option::is_some))))
+            .filter_map(|u| u.answers_to(name, &path).map(|rank| (rank, u)))
+            .filter(|(_, u)| {
+                u.arg_types.len() == args.len()
+                    || (u.variadic && args.len() >= u.arg_types.len())
+                    // Trailing parameters with a DEFAULT may be left out.
+                    || (args.len() < u.arg_types.len()
+                        && (args.len()..u.arg_types.len())
+                            .all(|i| u.defaults.get(i).is_some_and(Option::is_some)))
             })
-            .cloned()
+            .map(|(rank, u)| (rank, u.clone()))
             .collect()
     });
+    // A routine in an earlier schema on the path hides a later one's of the
+    // same argument types.
+    candidates.sort_by_key(|c| c.0);
+    let mut seen: Vec<Vec<String>> = Vec::new();
+    let candidates: Vec<UserFn> = candidates
+        .into_iter()
+        .filter(|(_, u)| {
+            let fresh = !seen.contains(&u.arg_types);
+            seen.push(u.arg_types.clone());
+            fresh
+        })
+        .map(|(_, u)| u)
+        .collect();
     if candidates.len() <= 1 {
         return candidates.into_iter().next();
     }
