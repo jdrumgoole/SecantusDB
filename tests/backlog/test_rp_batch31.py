@@ -361,7 +361,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ---------------------------------------------------- open: filed here
     "a whole record in a PL/pgSQL expression": (
         "RP-154",
-        True,
+        False,
         [
             "create table rp31_r (a int, b text)",
             "insert into rp31_r values (1, 'q')",
@@ -387,7 +387,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "a built-in reached through a schema": (
         "RP-149",
-        True,
+        False,
         [
             "select public.lower('A')",
             "create schema rp31_n",
@@ -398,7 +398,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "DROP SCHEMA's refusal names what depends on its members": (
         "RP-150",
-        True,
+        False,
         [
             "create schema rp31_o",
             "create table rp31_o.t (a int)",

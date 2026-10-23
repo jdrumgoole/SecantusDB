@@ -22331,6 +22331,39 @@ impl PgHandler {
         }))
     }
 
+    /// The views over relation `key` (of `kind`) not already in `seen`,
+    /// each followed by the views over it, as DROP's DETAIL nests them:
+    /// `(view v, view v depends on table t)`.
+    fn view_dependents(
+        views: &[(String, String)],
+        kind: &str,
+        key: &str,
+        seen: &mut Vec<String>,
+        out: &mut Vec<(String, String)>,
+    ) {
+        for (view, definition) in views {
+            if seen.contains(view) {
+                continue;
+            }
+            let reads = secantus_pgplan::privileges::sql_relations(definition)
+                .iter()
+                .any(|(r, _)| r == key);
+            if !reads {
+                continue;
+            }
+            seen.push(view.clone());
+            let shown = secantus_pgplan::schemas::visible_name(view);
+            out.push((
+                format!("view {shown}"),
+                format!(
+                    "view {shown} depends on {kind} {}",
+                    secantus_pgplan::schemas::visible_name(key)
+                ),
+            ));
+            Self::view_dependents(views, "view", view, seen, out);
+        }
+    }
+
     /// `key`'s current value came from `source`.
     fn mark_source(&self, key: &str, source: GucSource) {
         let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
@@ -34410,14 +34443,27 @@ impl PgHandler {
                         },
                     ));
                 }
-                let depends: Vec<String> = held
+                // Each member, then what depends on it in turn, depth first:
+                // a view elsewhere over one of its relations, and a view over
+                // that view (`(description, depends-on line)`).
+                let views = self.views_shared()?;
+                let members: Vec<String> = held
                     .iter()
-                    .flat_map(|(name, h)| {
-                        h.descs
-                            .iter()
-                            .map(move |d| format!("{d} depends on schema {name}"))
-                    })
+                    .flat_map(|(_, h)| h.relations.iter().map(|(_, k)| k.clone()))
                     .collect();
+                let mut seen: Vec<String> = members.clone();
+                let mut tree: Vec<(String, String)> = Vec::new();
+                for (name, h) in &held {
+                    for d in &h.descs {
+                        tree.push((d.clone(), format!("{d} depends on schema {name}")));
+                        if let Some((kind, key)) =
+                            h.relations.iter().find(|(k, r)| format!("{k} {r}") == *d)
+                        {
+                            Self::view_dependents(&views, kind, key, &mut seen, &mut tree);
+                        }
+                    }
+                }
+                let depends: Vec<String> = tree.iter().map(|(_, l)| l.clone()).collect();
                 if !depends.is_empty() && !cascade {
                     let message = match present.as_slice() {
                         [one] => {
@@ -34432,10 +34478,7 @@ impl PgHandler {
                         Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
                     return Err(PgWireError::UserError(Box::new(info)));
                 }
-                let mut descs: Vec<String> = held
-                    .iter()
-                    .flat_map(|(_, h)| h.descs.iter().cloned())
-                    .collect();
+                let mut descs: Vec<String> = tree.iter().map(|(d, _)| d.clone()).collect();
                 // The members' own drops reach further -- a view in another
                 // schema over a table in this one -- and PostgreSQL names
                 // those in the same notice, after the members.

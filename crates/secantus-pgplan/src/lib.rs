@@ -3480,6 +3480,61 @@ pub fn is_catalog_function(name: &str) -> bool {
         .contains(name)
 }
 
+/// A built-in lives in `pg_catalog` alone: called through any other schema
+/// that holds no user function of its name, it is no function at all (42883,
+/// as `public.lower('A')` is on PostgreSQL), wherever in the statement the
+/// call is.
+fn refuse_qualified_builtins(node: &N) -> Result<()> {
+    for (n, _, _, _) in node.nodes() {
+        let pg_query::NodeRef::FuncCall(f) = n else {
+            continue;
+        };
+        let parts: Vec<&str> = f
+            .funcname
+            .iter()
+            .filter_map(|n| match n.node.as_ref()? {
+                N::String(st) => Some(st.sval.as_str()),
+                _ => None,
+            })
+            .collect();
+        let [.., schema, name] = parts.as_slice() else {
+            continue;
+        };
+        if *schema == "pg_catalog"
+            || is_pg_temp_schema(schema)
+            || !funcsig::is_builtin_function_name(name)
+        {
+            continue;
+        }
+        let qualified = schemas::routine_name([*schema, *name].into_iter());
+        if qualified
+            .as_deref()
+            .is_some_and(correlated::user_function_named)
+        {
+            continue;
+        }
+        let types: Vec<String> = f
+            .args
+            .iter()
+            .map(|a| match a.node.as_ref() {
+                Some(N::AConst(c))
+                    if c.isnull
+                        || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
+                {
+                    "unknown".to_string()
+                }
+                _ => display_type(&static_type(a, &Bson::Null)),
+            })
+            .collect();
+        set_error_location(f.location);
+        return Err(Error::UndefinedFunction(format!(
+            "function {schema}.{name}({}) does not exist",
+            types.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// The bare (schema-less) name of a called function, as PostgreSQL prints it.
 pub(crate) fn func_name(f: &pg_query::protobuf::FuncCall) -> Option<String> {
     let parts: Vec<&str> = f
@@ -4524,6 +4579,7 @@ fn plan_node(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
 ) -> Result<Statement> {
+    refuse_qualified_builtins(&node)?;
     if let Some(st) = fdw::plan(&node, lookup, params)? {
         return Ok(st);
     }

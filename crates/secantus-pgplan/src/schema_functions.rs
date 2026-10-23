@@ -176,6 +176,52 @@ fn text_at<'a>(s: &'a str, t: &pg_query::protobuf::ScanToken) -> &'a str {
     &s[t.start as usize..t.end as usize]
 }
 
+/// Is the call at tokens `start ..= close` a whole, unaliased item of a
+/// select list: after its `SELECT` (or a comma of the same list) and before
+/// a comma, `FROM` or the list's end, at the list's own depth?
+fn whole_target(
+    sql: &str,
+    tokens: &[pg_query::protobuf::ScanToken],
+    start: usize,
+    close: usize,
+) -> bool {
+    let word = |k: usize| text_at(sql, &tokens[k]).to_ascii_lowercase();
+    let mut depth = vec![0i32; tokens.len() + 1];
+    for (k, _) in tokens.iter().enumerate() {
+        let d = depth[k];
+        depth[k + 1] = match word(k).as_str() {
+            "(" | "[" => d + 1,
+            ")" | "]" => d - 1,
+            _ => d,
+        };
+    }
+    let at = depth[start];
+    let before = start.checked_sub(1).map(word);
+    let after = tokens.get(close + 1).map(|_| word(close + 1));
+    let opens = matches!(before.as_deref(), Some("select" | "distinct" | "all" | ","));
+    let ends = matches!(
+        after.as_deref(),
+        None | Some("," | "from" | ";" | ")" | "union" | "where")
+    );
+    if !opens || !ends {
+        return false;
+    }
+    // The nearest list keyword at this depth before the call is a SELECT,
+    // with no clause between.
+    for k in (0..start).rev() {
+        if depth[k] != at {
+            continue;
+        }
+        match word(k).as_str() {
+            "select" => return true,
+            "from" | "where" | "group" | "having" | "order" | "values" | "on" | "set"
+            | "returning" | "when" | "then" | "else" | "array" | "row" | "in" => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// One pass: every `information_schema.<helper>(...)` call replaced.
 fn inline_once(sql: &str) -> Option<String> {
     let tokens = pg_query::scan(sql).ok()?.tokens;
@@ -225,6 +271,12 @@ fn inline_once(sql: &str) -> Option<String> {
         out.push('(');
         out.push_str(&body);
         out.push(')');
+        // A call that is a select-list item of its own keeps the column
+        // name PostgreSQL gives it, the function's.
+        if whole_target(sql, &tokens, i, close) {
+            out.push_str(" AS ");
+            out.push_str(&ident(text(i + 2)));
+        }
         cursor = tokens[close].end as usize;
         changed = true;
         i = close + 1;

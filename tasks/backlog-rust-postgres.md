@@ -773,6 +773,38 @@ fixed in the same batch; their tests there are regression tests.
       Backlog-ID: RP-137
       Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order], tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]
 
+## Found by batch 36 (2026-10-23)
+
+Found while fixing RP-149, RP-150 and RP-154. The gap tests are scenarios in
+`tests/backlog/test_rp_batch36.py`, measured on a private 15.19 cluster.
+RP-174 was found and fixed in the same batch; its test there is a
+regression test.
+
+- [ ] **`CREATE EXTENSION ... SCHEMA s` installs in `public`.** The
+      statement succeeds, but `pg_extension.extnamespace` and the
+      extension's types (`citext`) are `public`, and `'A'::s.citext` is
+      42704. PostgreSQL puts the extension's objects in `s`. The
+      extension's functions are this server's built-ins; reaching them
+      through `s` (and not through `public`) needs each extension's schema
+      known to the call's resolution (`func_name`).
+      Backlog-ID: RP-172
+      Verify: tests/backlog/test_rp_batch36.py::test_scenario[an extension installed in a schema]
+- [ ] **A user function named like a built-in shadows it.** With
+      `create function public.lower(int)`, `lower('Q')` and even
+      `pg_catalog.lower('Q')` call the user function (1), and `abs(-3)`
+      calls a user `public.abs(int)` (99). PostgreSQL resolves an
+      unqualified call over every candidate on the search path, with
+      `pg_catalog` first: `lower('Q')` takes `lower(text)` (an untyped
+      literal prefers a string), `abs(-3)` the built-in with the same
+      argument types, and a `pg_catalog.` call never reaches a user
+      function. Here about twenty planner sites ask
+      `correlated::user_function_named(name)` -- by name alone -- whether a
+      user function owns a call, so the choice cannot be made per call; it
+      needs a user function that shadows a built-in name kept apart from
+      the built-in (its own key) and the call resolved to one or the other.
+      Backlog-ID: RP-173
+      Verify: tests/backlog/test_rp_batch36.py::test_scenario[a user function of a built-in's name]
+
 ## Found by batch 34 (2026-10-23)
 
 Found while building `CREATE TEXT SEARCH CONFIGURATION` (RP-072). The gap
@@ -821,43 +853,6 @@ batch; their tests there are regression tests.
       `information_schema`.
       Backlog-ID: RP-157
       Verify: tests/backlog/test_rp_batch32.py::test_scenario[a dropped table column leaves its attnum]
-
-## Found by batch 31 (2026-10-23)
-
-Found while telling two schemas' routines apart (RP-143). The gap tests are
-scenarios in `tests/backlog/test_rp_batch31.py`, measured on a private
-15.19 cluster. RP-145 .. RP-148, RP-151 .. RP-153 and RP-155 were found
-and fixed in the same batch; their tests there are regression tests.
-
-- [ ] **A built-in is reached through any schema.** `select
-      public.lower('A')` and `select s.lower('A')` (for a schema `s`)
-      answer `a`; PostgreSQL's built-ins live only in `pg_catalog`, so
-      both are 42883 there, and only `pg_catalog.lower` (or the bare name)
-      finds it. The planner drops a call's schema unless a user function
-      answers to it (`func_name`). The fix must keep an extension's
-      functions reachable through the schema the extension is installed in
-      (`CREATE EXTENSION ... SCHEMA s`), which this server serves as
-      built-ins: it needs each extension's schema.
-      Backlog-ID: RP-149
-      Verify: tests/backlog/test_rp_batch31.py::test_scenario[a built-in reached through a schema]
-- [ ] **DROP SCHEMA's refusal does not name what depends on its members.**
-      `drop schema s` over a table `s.t` that a view `v` in another schema
-      reads is 2BP01 with PostgreSQL's DETAIL `table s.t depends on schema
-      s` and `view v depends on table s.t`; here only the first line. The
-      CASCADE notice does name `view v` (its members' own drops report it),
-      but the refusal finds the schema's members only, not the objects that
-      depend on them in turn.
-      Backlog-ID: RP-150
-      Verify: tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA's refusal names what depends on its members]
-- [ ] **A whole record in a PL/pgSQL expression is 42703.** `raise notice
-      '%', r` over a record `r` that a SELECT INTO filled is `column "r"
-      does not exist`; PostgreSQL writes the row (`(1,q)`, and `(,)` for
-      the all-NULL row an INTO with no row leaves). Binding an expression
-      replaces a variable or a record's field (`r.a`) with a parameter, but
-      a record as a whole has no parameter form: it would be a composite
-      value of the record's row type.
-      Backlog-ID: RP-154
-      Verify: tests/backlog/test_rp_batch31.py::test_scenario[a whole record in a PL/pgSQL expression]
 
 ## Found by batch 26 (2026-10-22)
 
