@@ -32,6 +32,7 @@
 
 mod advisory;
 mod aggregates;
+mod alter_system;
 mod binary_recv;
 mod casts;
 mod catalog_fill;
@@ -58,6 +59,7 @@ mod expr_index;
 mod external_sort;
 mod fdw;
 mod grace_join;
+mod guc_values;
 mod hba;
 mod ident;
 mod info_columns;
@@ -412,7 +414,45 @@ pub(crate) struct GucMap {
     /// every statement, two fifths of a point read's server time (measured
     /// 2026-10-07). A write copies it only while a planner still holds it.
     map: Arc<HashMap<String, String>>,
+    /// Where each value came from (`pg_settings.source`), with the value
+    /// it came as: a value changed since, by any path, is the session's own.
+    sources: Arc<HashMap<String, (GucSource, String)>>,
     generation: u64,
+}
+
+/// Where a setting's value came from: PostgreSQL's `GucSource`, lowest
+/// priority first. A source never overrides a value from a higher one, so
+/// a reload of the configuration file leaves what a session SET alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum GucSource {
+    Default,
+    ConfigFile,
+    Global,
+    Database,
+    User,
+    DatabaseUser,
+    Client,
+    /// What the server sets itself: the `transaction_*` parameters start
+    /// here (`InitializeGUCOptions`).
+    Override,
+    Session,
+}
+
+impl GucSource {
+    /// `pg_settings.source`.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::ConfigFile => "configuration file",
+            Self::Global => "global",
+            Self::Database => "database",
+            Self::User => "user",
+            Self::DatabaseUser => "database user",
+            Self::Client => "client",
+            Self::Override => "override",
+            Self::Session => "session",
+        }
+    }
 }
 
 static GUC_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -425,12 +465,91 @@ impl GucMap {
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
+
+    /// Where `name`'s value came from.
+    pub(crate) fn source_of(&self, name: &str) -> GucSource {
+        match (self.map.get(name), self.sources.get(name)) {
+            (None, _) => GucSource::Default,
+            (Some(v), Some((source, as_set))) if v == as_set => *source,
+            _ => GucSource::Session,
+        }
+    }
+
+    /// `name`'s value and where it came from.
+    pub(crate) fn entry_of(&self, name: &str) -> Option<(String, GucSource)> {
+        self.map
+            .get(name)
+            .map(|v| (v.clone(), self.source_of(name)))
+    }
+
+    /// `name` takes `value` from `source`.
+    pub(crate) fn set_from(&mut self, name: &str, value: String, source: GucSource) {
+        Arc::make_mut(&mut self.sources).insert(name.to_string(), (source, value.clone()));
+        self.insert(name.to_string(), value);
+    }
+
+    /// Put `name` back to `entry` (a value and its source), or unset.
+    pub(crate) fn put(&mut self, name: &str, entry: Option<(String, GucSource)>) {
+        match entry {
+            Some((value, GucSource::Session)) => {
+                self.insert(name.to_string(), value);
+                self.mark_session(name);
+            }
+            Some((value, source)) => self.set_from(name, value, source),
+            None => {
+                self.remove(name);
+                self.mark_session(name);
+            }
+        }
+    }
+
+    /// `name` takes `value` from wherever its value came from before: the
+    /// server moving a `transaction_*` parameter with its default.
+    pub(crate) fn insert_keeping_source(&mut self, name: &str, value: String) {
+        let source = self.source_of(name);
+        self.set_from(name, value, source);
+    }
+
+    /// The session set `name` itself (even to the value it had).
+    pub(crate) fn mark_session(&mut self, name: &str) {
+        if self.sources.contains_key(name) {
+            Arc::make_mut(&mut self.sources).remove(name);
+        }
+    }
+
+    /// This map, put back in force: a new generation, so no planner takes
+    /// its copy of the map it replaced for this one.
+    pub(crate) fn restored(mut self) -> Self {
+        self.generation = Self::next_generation();
+        self
+    }
 }
 
+/// The parameters the server sets at each transaction's start.
+pub(crate) const TRANSACTION_GUCS: [&str; 3] = [
+    "transaction_isolation",
+    "transaction_read_only",
+    "transaction_deferrable",
+];
+
+/// A session's defaults: each value's source is `default`, the
+/// `transaction_*` ones' `override`.
 impl From<HashMap<String, String>> for GucMap {
     fn from(map: HashMap<String, String>) -> Self {
+        let sources = map
+            .iter()
+            .map(|(k, v)| {
+                let source = if TRANSACTION_GUCS.contains(&k.as_str()) {
+                    GucSource::Override
+                } else {
+                    GucSource::Default
+                };
+                (k.clone(), (source, v.clone()))
+            })
+            .collect();
         Self {
             map: Arc::new(map),
+            sources: Arc::new(sources),
             generation: Self::next_generation(),
         }
     }
@@ -3204,6 +3323,29 @@ impl PgHandler {
                 ),
             ));
         }
+        if let Some((relkind, granted)) = restricted_system_relation(table) {
+            if self.is_superuser(&role)
+                || granted.is_some_and(|g| privilege == "SELECT" && self.role_is_member(&role, g))
+            {
+                return Ok(());
+            }
+            // `pg_subscription`'s columns but `subconninfo` are PUBLIC's.
+            let bare = table.strip_prefix("pg_catalog.").unwrap_or(table);
+            if bare == "pg_subscription" && privilege == "SELECT" {
+                let all: Vec<String> = PG_SUBSCRIPTION_COLUMNS
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect();
+                let needed = secantus_pgplan::privileges::sql_columns(sql, bare, &all, "SELECT");
+                if !needed.iter().any(|c| c == "subconninfo") {
+                    return Ok(());
+                }
+            }
+            return Err(Self::user_error(
+                "42501",
+                format!("permission denied for {relkind} {bare}"),
+            ));
+        }
         if kind != "view" && self.lookup(table).is_none() {
             return Ok(());
         }
@@ -3772,7 +3914,16 @@ pub struct PgHandler {
     txn_gucs: Mutex<txn_gucs::TxnGucs>,
     /// `set_config(x, v, true)` run outside any transaction: per key, the
     /// value before it, put back when the statement ends (`txn_gucs`).
-    statement_gucs: Mutex<HashMap<String, Option<String>>>,
+    statement_gucs: Mutex<HashMap<String, Option<(String, GucSource)>>>,
+    /// The configuration file as this session last applied it, with the
+    /// reload epoch it was taken at (`alter_system`).
+    config_file: Mutex<(u64, Arc<Vec<alter_system::FileEntry>>)>,
+    /// The parameters whose file value only a restart would apply
+    /// (`pg_settings.pending_restart`).
+    pending_restart: Mutex<std::collections::HashSet<String>>,
+    /// What the startup packet set (`client`): the values RESET returns
+    /// them to.
+    client_settings: Mutex<Vec<(String, String)>>,
     /// Open large-object descriptors (see `largeobjects`).
     lo_descriptors: Mutex<largeobjects::LoDescriptors>,
     /// The last `<unnamed portal N>` a PL/pgSQL OPEN named.
@@ -3893,7 +4044,7 @@ struct Savepoint {
     /// The session settings and the block's GUC bookkeeping as they were:
     /// `ROLLBACK TO` undoes a `SET` made after the savepoint, as
     /// PostgreSQL's GUC stack does.
-    settings: HashMap<String, String>,
+    settings: GucMap,
     txn_gucs: txn_gucs::TxnGucs,
     /// Where the block's write set stood (`UserTransactionHandle::
     /// write_set_len`) when the savepoint was taken, for a ROLLBACK TO that
@@ -4170,6 +4321,9 @@ impl PgHandler {
             holdable_declared: AtomicBool::new(false),
             txn_gucs: Mutex::new(HashMap::new()),
             statement_gucs: Mutex::new(HashMap::new()),
+            config_file: Mutex::new((0, Arc::new(Vec::new()))),
+            pending_restart: Mutex::new(std::collections::HashSet::new()),
+            client_settings: Mutex::new(Vec::new()),
             lo_descriptors: Mutex::new(largeobjects::LoDescriptors::default()),
             portal_seq: std::sync::atomic::AtomicU32::new(0),
             wire_portals: Mutex::new(HashMap::new()),
@@ -4595,6 +4749,46 @@ impl PgHandler {
         }
     }
 
+    /// What `pg_reload_conf()` does on this thread: re-read this server's
+    /// login files and configuration file. The hook is the server's, so it
+    /// is installed again only when the thread last served another server.
+    fn install_reload_hook(&self) {
+        thread_local! {
+            // A weak reference keeps the store's allocation, so no later
+            // store can take its address.
+            static INSTALLED_RELOAD: std::cell::RefCell<std::sync::Weak<Storage>> =
+                const { std::cell::RefCell::new(std::sync::Weak::new()) };
+        }
+        let current = INSTALLED_RELOAD.with(|w| {
+            let mut w = w.borrow_mut();
+            if std::ptr::eq(w.as_ptr(), Arc::as_ptr(&self.storage)) {
+                return true;
+            }
+            *w = Arc::downgrade(&self.storage);
+            false
+        });
+        if current {
+            return;
+        }
+        // `pg_reload_conf()` is a superuser's by default: who may call it is
+        // the built-in EXECUTE check's (`restricted_builtins`), for the role
+        // in effect at the call, GRANTs included; a call that reaches here
+        // reloads.
+        let reloader = self.reloader.clone();
+        // Held weakly: the hook must not keep the store open past the
+        // server's shutdown.
+        let weak = Arc::downgrade(&self.storage);
+        secantus_pgplan::scalar::set_reload_conf(Some(Box::new(move || {
+            if let Some(Err(e)) = reloader.as_ref().map(live::Reloader::reload) {
+                eprintln!("secantusd-pg: configuration was not reloaded: {e}");
+            }
+            if let Some(Err(e)) = weak.upgrade().as_ref().map(alter_system::reload) {
+                eprintln!("secantusd-pg: configuration file was not reloaded: {e}");
+            }
+            true
+        })));
+    }
+
     fn install_user_types(&self) {
         // Whose transaction a `txid_current()` planned on this thread asks
         // about.
@@ -4602,6 +4796,7 @@ impl PgHandler {
             self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
         );
         crate::xids::set_current(&self.storage);
+        self.install_reload_hook();
         // Session state, so installed per statement -- the gate below is
         // per catalog version, and a SET DateStyle changes no catalog.
         // `1/5/2020` is January or May by the session's DateStyle order.
@@ -12560,6 +12755,19 @@ impl PgHandler {
         // checked as the view's OWNER even then, so views still expand.
         if self.is_superuser(&role) && views.is_empty() {
             return Ok(());
+        }
+        // A system relation named with its schema, which the walk below
+        // leaves out.
+        for rel in secantus_pgplan::privileges::sql_catalog_reads(sql) {
+            if restricted_system_relation(&rel).is_some() {
+                self.check_privilege_as(
+                    &role,
+                    &format!("pg_catalog.{rel}"),
+                    "SELECT",
+                    "table",
+                    sql,
+                )?;
+            }
         }
         let mut pending: Vec<(String, String, &'static str, usize, String)> =
             secantus_pgplan::privileges::sql_relations(sql)
@@ -21711,56 +21919,6 @@ fn parse_ms_guc(text: &str) -> Option<i64> {
     None
 }
 
-/// Render a millisecond GUC as `SHOW` does: the largest unit that divides
-/// the value evenly (`1500` -> `1500ms`, `60000` -> `1min`), and a bare `0`.
-fn render_ms_guc(ms: i64) -> String {
-    if ms == 0 {
-        return "0".to_string();
-    }
-    for (unit, factor) in [
-        ("d", 86_400_000),
-        ("h", 3_600_000),
-        ("min", 60_000),
-        ("s", 1_000),
-    ] {
-        if ms % factor == 0 {
-            return format!("{}{unit}", ms / factor);
-        }
-    }
-    format!("{ms}ms")
-}
-
-/// Validate and canonicalise a `SET <ms-guc>` value, answering PostgreSQL's
-/// two `22023` refusals: text that is not a duration (or exceeds the integer
-/// range) is an invalid value, and a negative one is out of range.
-fn canonical_ms_guc(name: &str, value: &str) -> PgWireResult<String> {
-    let invalid = |msg: String| {
-        PgWireError::UserError(Box::new(ErrorInfo::new(
-            "ERROR".into(),
-            "22023".into(),
-            msg,
-        )))
-    };
-    match parse_ms_guc(value) {
-        Some(ms) if ms < 0 => Err(invalid(format!(
-            "{ms} ms is outside the valid range for parameter \"{name}\" (0 .. 2147483647)"
-        ))),
-        Some(ms) if ms <= i32::MAX as i64 => Ok(render_ms_guc(ms)),
-        _ => Err(invalid(format!(
-            "invalid value for parameter \"{name}\": \"{value}\""
-        ))),
-    }
-}
-
-/// The statement-scoped millisecond GUCs this server OBEYS: validated and
-/// canonicalised like the idle timeouts (`SHOW statement_timeout` is `1s`).
-const MS_GUCS: [&str; 2] = ["statement_timeout", "lock_timeout"];
-
-/// The boolean GUCs whose value this server OBEYS, so `SET` validates them as
-/// PostgreSQL does (`22023 parameter "x" requires a Boolean value`) and
-/// stores the canonical `on` / `off` a client reads back.
-const BOOL_GUCS: [&str; 2] = ["standard_conforming_strings", "escape_string_warning"];
-
 /// The `max_prepared_transactions` this server runs with: how many
 /// `PREPARE TRANSACTION`s may be outstanding at once (53200 past it).
 const MAX_PREPARED_TRANSACTIONS: usize = 100;
@@ -21797,55 +21955,6 @@ impl RcReadSet {
 
 /// PostgreSQL's `GIDSIZE`: a transaction identifier is at most 199 BYTES.
 const MAX_GID_BYTES: usize = 200;
-
-/// PostgreSQL's `parse_bool`: `on` / `off` / `true` / `false` / `yes` / `no`
-/// / `1` / `0`, case-insensitively, and any unambiguous prefix of the words
-/// (`t`, `of`, `n`; measured on 16).
-fn canonical_bool_guc(name: &str, value: &str) -> PgWireResult<String> {
-    let v = value.trim().to_ascii_lowercase();
-    let prefix_of = |word: &str| !v.is_empty() && word.starts_with(&v);
-    let parsed = if v == "1" || prefix_of("true") || prefix_of("yes") || v == "on" {
-        Some("on")
-    } else if v == "0"
-        || prefix_of("false")
-        || prefix_of("no")
-        || (v.len() >= 2 && prefix_of("off"))
-    {
-        Some("off")
-    } else {
-        None
-    };
-    parsed.map(str::to_string).ok_or_else(|| {
-        PgWireError::UserError(Box::new(ErrorInfo::new(
-            "ERROR".into(),
-            "22023".into(),
-            format!("parameter \"{name}\" requires a Boolean value"),
-        )))
-    })
-}
-
-/// `backslash_quote`, an enum GUC: guc.c's `backslash_quote_options` --
-/// `safe_encoding`, `on`, `off`, and the hidden `true` / `yes` / `1` (on)
-/// and `false` / `no` / `0` (off), matched without regard to case and never
-/// by a prefix (`of` is refused; measured on PostgreSQL 15.19).
-fn canonical_backslash_quote(value: &str) -> PgWireResult<String> {
-    let v = value.to_ascii_lowercase();
-    let canonical = match v.as_str() {
-        "safe_encoding" => "safe_encoding",
-        "on" | "true" | "yes" | "1" => "on",
-        "off" | "false" | "no" | "0" => "off",
-        _ => {
-            let mut info = ErrorInfo::new(
-                "ERROR".into(),
-                "22023".into(),
-                format!("invalid value for parameter \"backslash_quote\": \"{value}\""),
-            );
-            info.hint = Some("Available values: safe_encoding, on, off.".into());
-            return Err(PgWireError::UserError(Box::new(info)));
-        }
-    };
-    Ok(canonical.to_string())
-}
 
 /// The settings a fresh connection starts with, matching what a client expects
 /// to read back before it has set anything.
@@ -21980,6 +22089,59 @@ type StringMap = Arc<(String, String, secantus_pgplan::escape_strings::PositionM
 /// statements a client keeps prepared at once, and no more.
 const STRING_MAPS_KEPT: usize = 64;
 
+/// The system relations PostgreSQL 15.19 does not grant to PUBLIC
+/// (`relacl` without `=r`), measured on a fresh cluster: each its kind, and
+/// the role SELECT on it is granted to, beside the bootstrap superuser.
+const RESTRICTED_SYSTEM_RELATIONS: [(&str, &str, Option<&str>); 14] = [
+    ("pg_authid", "table", None),
+    (
+        "pg_backend_memory_contexts",
+        "view",
+        Some("pg_read_all_stats"),
+    ),
+    ("pg_config", "view", None),
+    ("pg_file_settings", "view", None),
+    ("pg_hba_file_rules", "view", None),
+    ("pg_ident_file_mappings", "view", None),
+    ("pg_largeobject", "table", None),
+    ("pg_replication_origin_status", "view", None),
+    ("pg_shadow", "view", None),
+    ("pg_shmem_allocations", "view", Some("pg_read_all_stats")),
+    ("pg_statistic", "table", None),
+    ("pg_statistic_ext_data", "table", None),
+    ("pg_subscription", "table", None),
+    ("pg_user_mapping", "table", None),
+];
+
+/// `pg_subscription`'s columns: every one but `subconninfo` is granted to
+/// PUBLIC.
+const PG_SUBSCRIPTION_COLUMNS: [&str; 14] = [
+    "oid",
+    "subdbid",
+    "subskiplsn",
+    "subname",
+    "subowner",
+    "subenabled",
+    "subbinary",
+    "substream",
+    "subtwophasestate",
+    "subdisableonerr",
+    "subconninfo",
+    "subslotname",
+    "subsynccommit",
+    "subpublications",
+];
+
+/// `table`'s kind and the role it is granted to, when it is one of the
+/// [`RESTRICTED_SYSTEM_RELATIONS`].
+fn restricted_system_relation(table: &str) -> Option<(&'static str, Option<&'static str>)> {
+    let bare = table.strip_prefix("pg_catalog.").unwrap_or(table);
+    RESTRICTED_SYSTEM_RELATIONS
+        .iter()
+        .find(|(name, _, _)| *name == bare)
+        .map(|(_, kind, granted)| (*kind, *granted))
+}
+
 /// PostgreSQL 15's parameters that `pg15_settings.tsv` leaves out (the
 /// machine-specific ones); each is still a parameter, refused for its
 /// context rather than as unknown.
@@ -22011,6 +22173,87 @@ impl PgHandler {
     /// name as a placeholder; anything else is 42704 `unrecognized
     /// configuration parameter`, worded with the name as written (measured
     /// on 15.19, `set "NoSuch" = 1` keeps the case).
+    /// `value` for setting `key` as it is stored, the text `SHOW` answers,
+    /// or PostgreSQL's refusal of it: `parse_and_validate_value` and the
+    /// check hooks this server has. A SET, `set_config`, ALTER SYSTEM and
+    /// the configuration file all read a value this way.
+    pub(crate) fn canonical_setting_value(&self, key: &str, value: &str) -> PgWireResult<String> {
+        // DateStyle is stored in its canonical spelling so `SHOW datestyle`
+        // answers what PostgreSQL does (`ISO, MDY`), and so the stored
+        // value and the reported ParameterStatus agree.
+        if key == "DateStyle" {
+            return Ok(
+                secantus_pgplan::DateStyle::parse_over(&self.session_datestyle(), value)
+                    .canonical(),
+            );
+        }
+        if key == "default_text_search_config" {
+            // A configuration by name, kept qualified as PostgreSQL shows it
+            // (`German` -> `pg_catalog.german`).
+            return match secantus_pgplan::ts_catalog::oid_of(value, false)
+                .and_then(|o| secantus_pgplan::ts_catalog::name_of(o, false))
+            {
+                Some(name) => Ok(format!("pg_catalog.{name}")),
+                None => Err(Self::user_error(
+                    "22023",
+                    format!("invalid value for parameter \"{key}\": \"{value}\""),
+                )),
+            };
+        }
+        if key == "TimeZone" {
+            // A bare number of hours is recorded as its POSIX spec, as
+            // PostgreSQL shows it (`3` -> `<+03>-03`).
+            return Ok(secantus_pgplan::TimeZoneSetting::canonical_setting(value)
+                .unwrap_or_else(|| secantus_pgplan::TimeZoneSetting::canonical_name(value)));
+        }
+        guc_values::canonical(key, value).unwrap_or_else(|| Ok(value.to_string()))
+    }
+
+    /// `key`'s current value came from `source`.
+    fn mark_source(&self, key: &str, source: GucSource) {
+        let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = settings.get(key).cloned() {
+            settings.set_from(key, v, source);
+        }
+    }
+
+    /// `key` takes `value` from `source` without a SET: the configuration
+    /// file's value, which no session SET refusal applies to.
+    pub(crate) fn apply_setting_from(
+        &self,
+        key: &str,
+        value: &str,
+        source: GucSource,
+    ) -> PgWireResult<()> {
+        let value = self.canonical_setting_value(key, value)?;
+        if key == "client_encoding" {
+            self.apply_client_encoding(&value)?;
+            self.mark_source(key, source);
+            return Ok(());
+        }
+        let changed = {
+            let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+            let changed = settings.get(key) != Some(&value);
+            settings.set_from(key, value.clone(), source);
+            if let Some(twin) = key.strip_prefix("default_") {
+                if matches!(
+                    twin,
+                    "transaction_read_only" | "transaction_isolation" | "transaction_deferrable"
+                ) && !self
+                    .in_transaction
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    settings.insert_keeping_source(twin, value.clone());
+                }
+            }
+            changed
+        };
+        if changed {
+            self.note_reportable_guc(key, &value);
+        }
+        Ok(())
+    }
+
     pub(crate) fn check_setting_known(&self, name: &str) -> PgWireResult<()> {
         let key = canonical_setting(name);
         let known = key.contains('.')
@@ -23312,17 +23555,7 @@ impl PgHandler {
         if let Some(user) = _c.metadata().get("user") {
             *self.session_user.lock().unwrap_or_else(|e| e.into_inner()) = user.clone();
         }
-        // `pg_reload_conf()` is a superuser's by default: who may call it is
-        // the built-in EXECUTE check's (`restricted_builtins`), for the role
-        // in effect at the call, GRANTs included; a call that reaches here
-        // reloads.
-        let reloader = self.reloader.clone();
-        secantus_pgplan::scalar::set_reload_conf(Some(Box::new(move || {
-            if let Some(Err(e)) = reloader.as_ref().map(live::Reloader::reload) {
-                eprintln!("secantusd-pg: configuration was not reloaded: {e}");
-            }
-            true
-        })));
+        self.install_reload_hook();
         // ErrorResponse / NoticeResponse fields leave in the session's
         // `client_encoding`, like every other text the server sends: a LATIN9
         // client reading an `ERROR: ... \u{20ac}` expects the single byte 0xA4,
@@ -23413,18 +23646,33 @@ impl PgHandler {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         startup.sort();
-        // The database's own defaults (ALTER DATABASE SET) come first, so
-        // anything the client sends overrides them, as in PostgreSQL. One
-        // the SET refuses is skipped (PostgreSQL warns and connects).
-        let db_defaults = self.db_setting_defaults();
-        for (name, value) in &db_defaults {
+        // The configuration file and the database's and roles' defaults
+        // (ALTER DATABASE / ROLE SET) come first, so anything the client
+        // sends overrides them, as in PostgreSQL; each value keeps its
+        // layer's source. One the SET refuses is skipped (PostgreSQL warns
+        // and connects). The file's settings are the server's own, so even
+        // one no session may SET (a `sighup` or `postmaster` one) applies.
+        self.start_config_layer();
+        let db_defaults = self.db_setting_layers();
+        for (name, value, source) in &db_defaults {
+            if *source == GucSource::ConfigFile {
+                if let Err(e) = self.apply_setting_from(name, value, *source) {
+                    eprintln!(
+                        "secantusd-pg: configuration file setting {name} = {value} not applied: {e:?}"
+                    );
+                }
+                continue;
+            }
             let sql = format!(
                 "SET \"{}\" TO '{}'",
                 name.replace('"', "\"\""),
                 value.replace('\'', "''")
             );
-            if let Err(e) = self.run_typed_inner(&sql, &[], &[], 0).await {
-                eprintln!("secantusd-pg: database default {name} = {value} not applied: {e:?}");
+            match self.run_typed_inner(&sql, &[], &[], 0).await {
+                Ok(_) => self.mark_source(name, *source),
+                Err(e) => {
+                    eprintln!("secantusd-pg: database default {name} = {value} not applied: {e:?}")
+                }
             }
         }
         if !db_defaults.is_empty() && startup.is_empty() {
@@ -23452,6 +23700,23 @@ impl PgHandler {
                         )),
                         other => other,
                     })?;
+                // The client's own: RESET returns it here.
+                let key = canonical_setting(&name);
+                self.mark_source(&key, GucSource::Client);
+                let value = self
+                    .settings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&key)
+                    .cloned();
+                if let Some(value) = value {
+                    let mut client = self
+                        .client_settings
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    client.retain(|(k, _)| *k != key);
+                    client.push((key, value));
+                }
             }
             self.report_pending_params(_c).await?;
         }
@@ -27229,6 +27494,9 @@ impl PgHandler {
             self.backend.cancel.store(false, Relaxed);
             self.message_cycle.fetch_add(1, Relaxed);
         }
+        // A reload is taken between messages, as a backend takes the
+        // postmaster's SIGHUP.
+        self.apply_config_reload();
     }
 
     /// The cycle's `ReadyForQuery` is going out: the backend is idle again.
@@ -28544,15 +28812,7 @@ impl PgHandler {
                     // psycopg builds a timestamptz's tzinfo from that report,
                     // so without it a session-zone change was invisible to
                     // the client's loader).
-                    let text = if key == "DateStyle" {
-                        secantus_pgplan::DateStyle::parse(&text).canonical()
-                    } else if BOOL_GUCS.contains(&key.as_str()) {
-                        canonical_bool_guc(&key, &text)?
-                    } else if key == "backslash_quote" {
-                        canonical_backslash_quote(&text)?
-                    } else {
-                        text
-                    };
+                    let text = self.canonical_setting_value(&key, &text)?;
                     // `is_local` outside a block lasts only for the
                     // statement's own implicit transaction: nothing stays.
                     // `is_local` outside any transaction lasts for the
@@ -28566,10 +28826,9 @@ impl PgHandler {
                             .load(std::sync::atomic::Ordering::Relaxed)
                     {
                         self.note_statement_guc(&key);
-                        self.settings
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert(key.clone(), text.clone());
+                        let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+                        settings.insert(key.clone(), text.clone());
+                        settings.mark_session(&key);
                         return Ok(Bson::String(text));
                     }
                     let kept = self.txn_guc_kept(&key);
@@ -28579,6 +28838,7 @@ impl PgHandler {
                     }
                     let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
                     settings.insert(key.clone(), text.clone());
+                    settings.mark_session(&key);
                     drop(settings);
                     self.note_reportable_guc(&key, &text);
                     Ok(Bson::String(text))
@@ -30071,8 +30331,6 @@ impl PgHandler {
                             .settings
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .map
-                            .as_ref()
                             .clone(),
                         txn_gucs: self
                             .txn_gucs
@@ -30214,9 +30472,9 @@ impl PgHandler {
             Some(v) => if v { "on" } else { "off" }.to_string(),
             None => default_of(&settings, "default_transaction_deferrable"),
         };
-        settings.insert("transaction_isolation".into(), isolation);
-        settings.insert("transaction_read_only".into(), read_only);
-        settings.insert("transaction_deferrable".into(), deferrable);
+        settings.insert_keeping_source("transaction_isolation", isolation);
+        settings.insert_keeping_source("transaction_read_only", read_only);
+        settings.insert_keeping_source("transaction_deferrable", deferrable);
     }
 
     /// Reset the `transaction_*` GUCs to the session `default_transaction_*`
@@ -30231,7 +30489,7 @@ impl PgHandler {
             ("transaction_deferrable", "default_transaction_deferrable"),
         ] {
             let value = settings.get(def).cloned().unwrap_or_default();
-            settings.insert(tx.into(), value);
+            settings.insert_keeping_source(tx, value);
         }
     }
 
@@ -37391,26 +37649,27 @@ impl PgHandler {
                 self.check_setting_known(&name)?;
                 let key = canonical_setting(&name);
                 self.warn_reset_transaction(&key);
-                let value = self
-                    .db_setting_defaults()
-                    .into_iter()
-                    .find(|(k, _)| *k == key)
-                    .map(|(_, v)| v)
-                    .or_else(|| self.server_defaults().get(&key).cloned())
-                    // `SET ROLE` has no stored default: it is NONE.
-                    .unwrap_or_else(|| {
-                        if key == "role" {
-                            "none".into()
-                        } else {
-                            String::new()
-                        }
-                    });
+                // `SET ROLE` has no stored default: it is NONE.
+                let (value, source) = self.reset_entry(&key).unwrap_or_else(|| {
+                    let none = if key == "role" { "none" } else { "" };
+                    (none.to_string(), GucSource::Default)
+                });
                 let stmt = if local {
                     Statement::SetLocal { name, value }
                 } else {
                     Statement::Set { name, value }
                 };
-                self.execute_statement(stmt, max_rows)
+                let out = self.execute_statement(stmt, max_rows)?;
+                // The value takes the reset value's source too.
+                let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(now) = settings.get(&key).cloned() {
+                    settings.set_from(&key, now.clone(), source);
+                    drop(settings);
+                    if !local {
+                        self.note_txn_guc_from(&key, false, &now, source);
+                    }
+                }
+                Ok(out)
             }
             Statement::SetLocal { name, value } => {
                 if !self.set_local_allowed() {
@@ -37457,10 +37716,9 @@ impl PgHandler {
                             ));
                         }
                     }
-                    self.settings
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert("role".into(), wanted);
+                    let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+                    settings.insert("role".into(), wanted);
+                    settings.mark_session("role");
                     return Ok(vec![Response::Execution(Tag::new("SET"))]);
                 }
                 if key == "client_encoding" {
@@ -37475,48 +37733,16 @@ impl PgHandler {
                     // invalid name must be refused (not stored), and the stored
                     // value must be the canonical spelling the client reads back.
                     self.apply_client_encoding(&value)?;
+                    self.settings
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .mark_session("client_encoding");
                 } else {
-                    // DateStyle is stored in its canonical spelling so `SHOW
-                    // datestyle` answers what PostgreSQL does (`ISO, MDY`), and so
-                    // the stored value and the reported ParameterStatus agree.
-                    let value = if key == "DateStyle" {
-                        secantus_pgplan::DateStyle::parse_over(&self.session_datestyle(), &value)
-                            .canonical()
-                    } else if IDLE_TIMEOUT_GUCS.iter().any(|(guc, _, _)| *guc == key)
-                        || MS_GUCS.contains(&key.as_str())
-                    {
-                        canonical_ms_guc(&key, &value)?
-                    } else if BOOL_GUCS.contains(&key.as_str()) {
-                        canonical_bool_guc(&key, &value)?
-                    } else if key == "default_text_search_config" {
-                        // A configuration by name, kept qualified as
-                        // PostgreSQL shows it (`German` -> `pg_catalog.german`).
-                        match secantus_pgplan::ts_catalog::oid_of(&value, false)
-                            .and_then(|o| secantus_pgplan::ts_catalog::name_of(o, false))
-                        {
-                            Some(name) => format!("pg_catalog.{name}"),
-                            None => {
-                                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                                    "ERROR".into(),
-                                    "22023".into(),
-                                    format!("invalid value for parameter \"{key}\": \"{value}\""),
-                                ))))
-                            }
-                        }
-                    } else if key == "backslash_quote" {
-                        canonical_backslash_quote(&value)?
-                    } else if key == "TimeZone" {
-                        // A bare number of hours is recorded as its POSIX
-                        // spec, as PostgreSQL shows it (`3` -> `<+03>-03`).
-                        secantus_pgplan::TimeZoneSetting::canonical_setting(&value).unwrap_or_else(
-                            || secantus_pgplan::TimeZoneSetting::canonical_name(&value),
-                        )
-                    } else {
-                        value
-                    };
+                    let value = self.canonical_setting_value(&key, &value)?;
                     self.note_txn_guc(&key, false, &value);
                     let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
                     settings.insert(key.clone(), value.clone());
+                    settings.mark_session(&key);
                     // A session default set outside a block is what the next
                     // implicit transaction runs under, so its `transaction_*`
                     // twin reads the same at once (PostgreSQL:
@@ -37533,7 +37759,7 @@ impl PgHandler {
                             .in_transaction
                             .load(std::sync::atomic::Ordering::Relaxed)
                         {
-                            settings.insert(twin.to_string(), value.clone());
+                            settings.insert_keeping_source(twin, value.clone());
                         }
                     }
                     drop(settings);
@@ -37674,6 +37900,7 @@ impl PgHandler {
                 name,
                 value,
             } => self.alter_database_set(&database, name, value),
+            Statement::AlterSystem { name, value } => self.alter_system(name, value),
             Statement::RenameMatView {
                 matview,
                 to,
@@ -37738,43 +37965,63 @@ impl PgHandler {
             }
 
             Statement::Reset(name) => {
-                let db_defaults = self.db_setting_defaults();
-                let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
                 if name.is_empty() {
-                    *settings = self.server_defaults().into();
-                    settings.extend(db_defaults);
+                    // Every setting back to its reset value, from where that
+                    // came from.
+                    let layers: Vec<(String, String, GucSource)> = self
+                        .db_setting_layers()
+                        .into_iter()
+                        .map(|(k, v, source)| {
+                            let v = self.canonical_setting_value(&k, &v).unwrap_or(v);
+                            (k, v, source)
+                        })
+                        .collect();
+                    let client = self
+                        .client_settings
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    let mut fresh: GucMap = self.server_defaults().into();
+                    for (k, v, source) in layers {
+                        fresh.set_from(&k, v, source);
+                    }
+                    for (k, v) in client {
+                        fresh.set_from(&k, v, GucSource::Client);
+                    }
+                    *self.settings.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
                 } else {
-                    drop(settings);
                     self.check_setting_known(&name)?;
                     let key = canonical_setting(&name);
                     if let Some(msg) = setting_change_refusal(&key) {
                         return Err(Self::user_error("55P02", msg));
                     }
                     self.warn_reset_transaction(&key);
-                    let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-                    // RESET restores the DEFAULT, which is not the same as
-                    // removing the setting: a client reading it back afterwards
-                    // must see the default, not an error. A database's own
-                    // default (ALTER DATABASE SET) comes first.
-                    let db_default = db_defaults
-                        .into_iter()
-                        .find(|(k, _)| *k == key)
-                        .map(|(_, v)| v);
-                    match db_default.as_ref().or(self.server_defaults().get(&key)) {
-                        Some(d) => {
-                            settings.insert(key.clone(), d.clone());
-                            let d = d.clone();
-                            drop(settings);
-                            self.note_reportable_guc(&key, &d);
+                    // RESET restores the reset value, which is not the same
+                    // as removing the setting: a client reading it back
+                    // afterwards must see the default, not an error.
+                    match self.reset_entry(&key) {
+                        Some((v, source)) => {
+                            self.note_txn_guc_from(&key, false, &v, source);
+                            self.settings
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .put(&key, Some((v.clone(), source)));
+                            self.note_reportable_guc(&key, &v);
                         }
                         // A custom (dotted) name RESET is a placeholder
                         // that reads empty (15.19: `reset myapp.y; show
                         // myapp.y` is '').
                         None if key.contains('.') => {
-                            settings.insert(key.clone(), String::new());
+                            self.settings
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .put(&key, Some((String::new(), GucSource::Default)));
                         }
                         None => {
-                            settings.remove(&key);
+                            self.settings
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .put(&key, None);
                         }
                     }
                 }
@@ -46215,17 +46462,22 @@ mod idle_timeout_guc_tests {
 
     #[test]
     fn renders_like_show() {
-        assert_eq!(render_ms_guc(0), "0");
-        assert_eq!(render_ms_guc(250), "250ms");
-        assert_eq!(render_ms_guc(1_500), "1500ms");
-        assert_eq!(render_ms_guc(2_000), "2s");
-        assert_eq!(render_ms_guc(60_000), "1min");
-        assert_eq!(render_ms_guc(7_200_000), "2h");
+        let show = |ms: &str| {
+            guc_values::canonical("idle_session_timeout", ms)
+                .expect("typed")
+                .expect("valid")
+        };
+        assert_eq!(show("0"), "0");
+        assert_eq!(show("250"), "250ms");
+        assert_eq!(show("1500"), "1500ms");
+        assert_eq!(show("2000"), "2s");
+        assert_eq!(show("60000"), "1min");
+        assert_eq!(show("7200000"), "2h");
     }
 
     fn refusal(value: &str) -> String {
-        match canonical_ms_guc("idle_in_transaction_session_timeout", value) {
-            Err(PgWireError::UserError(info)) => {
+        match guc_values::canonical("idle_in_transaction_session_timeout", value) {
+            Some(Err(PgWireError::UserError(info))) => {
                 assert_eq!(info.code, "22023");
                 info.message.clone()
             }
@@ -46249,7 +46501,9 @@ mod idle_timeout_guc_tests {
             "invalid value for parameter \"idle_in_transaction_session_timeout\": \"2147483648\""
         );
         assert_eq!(
-            canonical_ms_guc("idle_session_timeout", "60000").unwrap(),
+            guc_values::canonical("idle_session_timeout", "60000")
+                .expect("typed")
+                .unwrap(),
             "1min"
         );
     }

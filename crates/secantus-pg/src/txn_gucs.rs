@@ -10,9 +10,11 @@
 
 use super::*;
 
-/// Per key: the value before the block first changed it, and the session
-/// value a COMMIT keeps (`None` when only `SET LOCAL` touched it).
-pub(crate) type TxnGucs = HashMap<String, (Option<String>, Option<String>)>;
+/// Per key: the value before the block first changed it, and the value a
+/// COMMIT keeps (`None` when only `SET LOCAL` touched it), each with its
+/// source.
+pub(crate) type TxnGucs =
+    HashMap<String, (Option<(String, GucSource)>, Option<(String, GucSource)>)>;
 
 impl PgHandler {
     fn in_block(&self) -> bool {
@@ -23,6 +25,11 @@ impl PgHandler {
     /// Record a change to `key` the block is about to make. `local` for
     /// `SET LOCAL`; `value` is what a plain SET stores (kept on COMMIT).
     pub(crate) fn note_txn_guc(&self, key: &str, local: bool, value: &str) {
+        self.note_txn_guc_from(key, local, value, GucSource::Session);
+    }
+
+    /// [`Self::note_txn_guc`] for a value from `source` (a RESET's).
+    pub(crate) fn note_txn_guc_from(&self, key: &str, local: bool, value: &str, source: GucSource) {
         // An extended-protocol statement group is a transaction too: what it
         // sets LOCAL ends at its `Sync`.
         if !self.in_block()
@@ -36,12 +43,11 @@ impl PgHandler {
             .settings
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(key)
-            .cloned();
+            .entry_of(key);
         let mut map = self.txn_gucs.lock().unwrap_or_else(|e| e.into_inner());
         let entry = map.entry(key.to_string()).or_insert((before, None));
         if !local {
-            entry.1 = Some(value.to_string());
+            entry.1 = Some((value.to_string(), source));
         }
     }
 
@@ -64,8 +70,7 @@ impl PgHandler {
             .settings
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(key)
-            .cloned();
+            .entry_of(key);
         self.statement_gucs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -75,7 +80,7 @@ impl PgHandler {
 
     /// The statement ended: put back what its `set_config(..., true)` set.
     pub(crate) fn end_statement_gucs(&self) {
-        let changed: HashMap<String, Option<String>> = std::mem::take(
+        let changed: HashMap<String, Option<(String, GucSource)>> = std::mem::take(
             &mut *self
                 .statement_gucs
                 .lock()
@@ -83,14 +88,7 @@ impl PgHandler {
         );
         let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
         for (key, before) in changed {
-            match before {
-                Some(v) => {
-                    settings.insert(key, v);
-                }
-                None => {
-                    settings.remove(&key);
-                }
-            }
+            settings.put(&key, before);
         }
     }
 
@@ -101,27 +99,21 @@ impl PgHandler {
         for (key, (before, kept)) in changed {
             let target = if commit { kept.or(before) } else { before };
             let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-            let current = settings.get(&key).cloned();
+            let current = settings.entry_of(&key);
             if current == target {
                 continue;
             }
-            match &target {
-                Some(v) => {
-                    settings.insert(key.clone(), v.clone());
-                }
-                None => {
-                    settings.remove(&key);
-                }
-            }
+            let value_changed = current.as_ref().map(|(v, _)| v) != target.as_ref().map(|(v, _)| v);
+            settings.put(&key, target.clone());
             drop(settings);
-            if let Some(v) = target {
+            if let Some((v, _)) = target.filter(|_| value_changed) {
                 self.note_reportable_guc(&key, &v);
             }
         }
     }
 
     /// What a COMMIT keeps for `key` so far (outer `None`: not tracked).
-    pub(crate) fn txn_guc_kept(&self, key: &str) -> Option<Option<String>> {
+    pub(crate) fn txn_guc_kept(&self, key: &str) -> Option<Option<(String, GucSource)>> {
         self.txn_gucs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -131,7 +123,11 @@ impl PgHandler {
 
     /// Put back what a COMMIT keeps for `key` after a LOCAL change ran
     /// through the plain SET path (which records its value as kept).
-    pub(crate) fn restore_txn_guc_kept(&self, key: &str, kept: Option<Option<String>>) {
+    pub(crate) fn restore_txn_guc_kept(
+        &self,
+        key: &str,
+        kept: Option<Option<(String, GucSource)>>,
+    ) {
         if let Some(entry) = self
             .txn_gucs
             .lock()
@@ -144,7 +140,7 @@ impl PgHandler {
 
     /// `ROLLBACK TO SAVEPOINT`: put the settings back as they were when the
     /// savepoint was established, reporting a reportable one that changes.
-    pub(crate) fn restore_savepoint_settings(&self, saved: HashMap<String, String>, gucs: TxnGucs) {
+    pub(crate) fn restore_savepoint_settings(&self, saved: GucMap, gucs: TxnGucs) {
         *self.txn_gucs.lock().unwrap_or_else(|e| e.into_inner()) = gucs;
         let changed: Vec<(String, String)> = {
             let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
@@ -153,7 +149,7 @@ impl PgHandler {
                 .filter(|(k, v)| settings.get(*k) != Some(*v))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-            *settings = saved.into();
+            *settings = saved.restored();
             changed
         };
         for (k, v) in changed {

@@ -148,6 +148,30 @@ pub fn sql_relations(sql: &str) -> Vec<(String, &'static str)> {
     out
 }
 
+/// The `pg_catalog` relations a statement names qualified, which
+/// [`sql_relations`] leaves out: the privilege check asks of each whether
+/// the role may use it (a few system relations are not PUBLIC's).
+pub fn sql_catalog_reads(sql: &str) -> Vec<String> {
+    thread_local! {
+        static MEMO: std::cell::RefCell<std::collections::HashMap<String, Vec<String>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    memoised(&MEMO, sql, |sql| {
+        let Ok(parsed) = parse_tree(sql) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = Vec::new();
+        for (node, _, _, _) in parsed.nodes() {
+            if let pg_query::NodeRef::RangeVar(r) = node {
+                if r.schemaname == "pg_catalog" && !out.contains(&r.relname) {
+                    out.push(r.relname.clone());
+                }
+            }
+        }
+        out
+    })
+}
+
 /// A relation as written -- `schema<U+001F>name` -- for `sql_relations`'
 /// memo, resolved by `key_parts` on every call.
 fn raw_key(r: &pg_query::protobuf::RangeVar) -> String {
