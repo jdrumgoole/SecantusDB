@@ -5884,53 +5884,123 @@ const DATE_ADD_LIMITS: &[(&str, i64)] = &[
     ("second", 18_446_744_073_743_999),
 ];
 
-/// The checks mongod makes while it optimizes a date operator that reads the
-/// document: a CONSTANT `binSize` (`$dateTrunc`), then a constant `unit`,
-/// then a constant `startOfWeek` are validated before anything is read, so a bad one fails even beside a
-/// null date, under "Failed to optimize pipeline". A wholly constant
-/// expression is simply evaluated, null first (measured 8.2.11, 2026-10-22).
-fn precheck_constant_date_args(
-    op: &str,
-    arg: &Bson,
-    d: &Document,
-    ctx: &Ctx,
-) -> Result<(), Fallback> {
+/// The arguments mongod's optimizer reads from a date operator that reads the
+/// document, in its order: `unit` (`$dateAdd`, `$dateSubtract`, `$dateTrunc`,
+/// `$dateDiff`), `startOfWeek` (`$dateTrunc`, `$dateDiff`), `timezone`, then
+/// `binSize` (`$dateTrunc`). Each is read only when it is constant: a bad one
+/// fails under "Failed to optimize pipeline", before any document is read,
+/// and a null one makes the whole expression null, so nothing after it is
+/// checked (measured 8.2.11, 2026-10-23: `{$dateTrunc: {date: "$t", unit:
+/// null, timezone: "Mars"}}` is null, `{..., unit: "bogus", timezone:
+/// "Mars"}` the unit's 9). A wholly constant expression is simply evaluated.
+///
+/// `Ok(true)`: the expression is null whatever the document.
+fn optimize_date_args(op: &str, arg: &Bson, d: &Document, ctx: &Ctx) -> Result<bool, Fallback> {
     let bound: Vec<String> = ctx.vars.keys().cloned().collect();
     if crate::aggregate::is_constant_expression(arg, &bound) {
-        return Ok(());
+        return Ok(false);
     }
-    let constant = |field: &str| {
-        d.get(field)
-            .filter(|e| crate::aggregate::is_constant_expression(e, &bound))
-            .map(|e| eval(e, ctx))
-            .transpose()
-    };
+    let named = matches!(op, "$dateTrunc" | "$dateDiff").then_some(op);
+    let mut params = vec![];
+    if matches!(
+        op,
+        "$dateAdd" | "$dateSubtract" | "$dateTrunc" | "$dateDiff"
+    ) {
+        params.push("unit");
+    }
+    if named.is_some() {
+        params.push("startOfWeek");
+    }
+    params.push("timezone");
     if op == "$dateTrunc" {
-        if let Some(v) = constant("binSize")?.filter(|v| !is_null(v)) {
-            trunc_bin_size(&v).map_err(|f| f.with_folded(true))?;
-        }
+        params.push("binSize");
     }
-    if let Some(v) = constant("unit")?.filter(|v| !is_null(v)) {
-        date_unit_arg(op, &v).map_err(|f| f.with_folded(true))?;
-    }
-    if matches!(op, "$dateTrunc" | "$dateDiff") {
-        if let Some(v) = constant("startOfWeek")?.filter(|v| !is_null(v)) {
-            parse_start_of_week(op, &v).map_err(|f| f.with_folded(true))?;
-        }
-    }
-    if op == "$dateSubtract" {
-        if let Some(amount) = constant("amount")?.as_ref().and_then(date_integer) {
-            if amount == i64::MIN {
-                return Err(Fallback::mongo(
-                    6045000,
-                    format!("invalid {op} 'amount' parameter value: {amount}"),
-                )
-                .with_folded(true));
+    for param in params {
+        let Some(e) = d
+            .get(param)
+            .filter(|e| crate::aggregate::is_constant_expression(e, &bound))
+        else {
+            continue;
+        };
+        if param == "timezone" {
+            if matches!(eval_timezone(Some(e), ctx, named)?, TzArg::Null) {
+                return Ok(true);
             }
+            continue;
         }
+        let v = eval(e, ctx)?;
+        if is_null(&v) {
+            return Ok(true);
+        }
+        match param {
+            "unit" => date_unit_arg(op, &v).map(|_| ()),
+            "startOfWeek" => parse_start_of_week(op, &v).map(|_| ()),
+            _ => trunc_bin_size(&v).map(|_| ()),
+        }
+        .map_err(|f| f.with_folded(true))?;
     }
-    Ok(())
+    Ok(false)
 }
+
+/// The fault mongod's optimizer finds in a date operator's constant
+/// arguments before it reads a document ([`optimize_date_args`] and the
+/// constant `timezone` of the other date operators), with `vars` the
+/// constant variables in scope. `None` for anything else, a wholly constant
+/// expression included: that is evaluated, not checked.
+pub fn optimize_date_fault(expr: &Bson, vars: &Document) -> Option<Fallback> {
+    let Bson::Document(outer) = expr else {
+        return None;
+    };
+    let (op, Bson::Document(d)) = outer.iter().next()? else {
+        return None;
+    };
+    if outer.len() != 1 || !DATE_OPERATORS.contains(&op.as_str()) {
+        return None;
+    }
+    let empty = Document::new();
+    let ctx = Ctx { doc: &empty, vars };
+    let bound: Vec<String> = vars.keys().cloned().collect();
+    if crate::aggregate::is_constant_expression(expr, &bound) {
+        return None;
+    }
+    let checked = if matches!(
+        op.as_str(),
+        "$dateAdd" | "$dateSubtract" | "$dateTrunc" | "$dateDiff"
+    ) {
+        optimize_date_args(op, &outer[op.as_str()], d, &ctx).map(|_| ())
+    } else if !d.keys().next().is_some_and(|k| k.starts_with('$')) {
+        // `{$year: {date, timezone}}`, not `{$year: {$toDate: ...}}`.
+        precheck_constant_timezone(d, &ctx, None)
+    } else {
+        Ok(())
+    };
+    checked.err().filter(|f| f.as_mongo().is_some())
+}
+
+/// The operators that take a `timezone`.
+const DATE_OPERATORS: &[&str] = &[
+    "$year",
+    "$month",
+    "$dayOfMonth",
+    "$hour",
+    "$minute",
+    "$second",
+    "$millisecond",
+    "$dayOfYear",
+    "$dayOfWeek",
+    "$week",
+    "$isoWeekYear",
+    "$isoWeek",
+    "$isoDayOfWeek",
+    "$dateToString",
+    "$dateFromString",
+    "$dateToParts",
+    "$dateFromParts",
+    "$dateAdd",
+    "$dateSubtract",
+    "$dateTrunc",
+    "$dateDiff",
+];
 
 /// `$dateAdd` (sign +1) / `$dateSubtract` (sign -1), in mongod 8.2.11's order:
 /// a null argument (or timezone) answers null; then `unit` (5439013 / 9), the
@@ -5945,8 +6015,9 @@ fn op_date_add(arg: &Bson, ctx: &Ctx, sign: i128) -> R {
     } else {
         "$dateSubtract"
     };
-    precheck_constant_timezone(d, ctx, None)?;
-    precheck_constant_date_args(op, arg, d, ctx)?;
+    if optimize_date_args(op, arg, d, ctx)? {
+        return Ok(Bson::Null);
+    }
     let start = eval_opt(d.get("startDate"), ctx)?;
     let unit_v = eval_opt(d.get("unit"), ctx)?;
     let amount_v = eval_opt(d.get("amount"), ctx)?;
@@ -6013,8 +6084,9 @@ fn op_date_diff(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback::Defer);
     };
-    precheck_constant_timezone(d, ctx, Some("$dateDiff"))?;
-    precheck_constant_date_args("$dateDiff", arg, d, ctx)?;
+    if optimize_date_args("$dateDiff", arg, d, ctx)? {
+        return Ok(Bson::Null);
+    }
     // A missing required *parameter* (key absent) is a mongod parse error
     // (Location5166303/4/5) -> Python raises; a present-but-null one yields null.
     for param in ["startDate", "endDate", "unit"] {
@@ -6198,7 +6270,7 @@ fn trunc_reference_instant_ms(tz: Option<&Bson>) -> Result<i64, Fallback> {
 /// field path is evaluated for `week` alone, and a wholly constant
 /// expression is evaluated the same way. In an expression that reads the
 /// document, though, a CONSTANT `startOfWeek` is parsed while optimizing --
-/// a bad one fails whatever the unit (`precheck_constant_date_args`) and a
+/// a bad one fails whatever the unit (`optimize_date_args`) and a
 /// null one makes the answer null.
 enum StartOfWeek {
     Absent,
@@ -6296,8 +6368,9 @@ fn op_date_trunc(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback::Defer);
     };
-    precheck_constant_timezone(d, ctx, Some("$dateTrunc"))?;
-    precheck_constant_date_args("$dateTrunc", arg, d, ctx)?;
+    if optimize_date_args("$dateTrunc", arg, d, ctx)? {
+        return Ok(Bson::Null);
+    }
     let date = eval_opt(d.get("date"), ctx)?;
     let unit_v = eval_opt(d.get("unit"), ctx)?;
     let bin_v = d.get("binSize").map(|e| eval(e, ctx)).transpose()?;

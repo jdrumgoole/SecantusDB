@@ -1298,8 +1298,9 @@ fn date_part(op: &str, arg: &Bson, ctx: &Ctx) -> Option<R> {
 fn date_add(op: &str, arg: &Bson, ctx: &Ctx) -> R {
     // The classic optimizer's checks of constant arguments come first.
     if let Bson::Document(d) = arg {
-        super::precheck_constant_timezone(d, ctx, None)?;
-        super::precheck_constant_date_args(op, arg, d, ctx)?;
+        if super::optimize_date_args(op, arg, d, ctx)? {
+            return Ok(Bson::Null);
+        }
     }
     let Some(n) = Named::new(arg, ctx)? else {
         return apply_classic(op, arg, ctx);
@@ -1355,8 +1356,9 @@ fn date_add(op: &str, arg: &Bson, ctx: &Ctx) -> R {
 fn date_diff(arg: &Bson, ctx: &Ctx) -> R {
     // The classic optimizer's checks of constant arguments come first.
     if let Bson::Document(d) = arg {
-        super::precheck_constant_timezone(d, ctx, Some("$dateDiff"))?;
-        super::precheck_constant_date_args("$dateDiff", arg, d, ctx)?;
+        if super::optimize_date_args("$dateDiff", arg, d, ctx)? {
+            return Ok(Bson::Null);
+        }
     }
     let Some(n) = Named::new(arg, ctx)? else {
         return apply_classic("$dateDiff", arg, ctx);
@@ -1687,8 +1689,9 @@ fn date_from_parts(arg: &Bson, ctx: &Ctx) -> R {
 fn date_trunc(arg: &Bson, ctx: &Ctx) -> R {
     // The classic optimizer's checks of constant arguments come first.
     if let Bson::Document(d) = arg {
-        super::precheck_constant_timezone(d, ctx, Some("$dateTrunc"))?;
-        super::precheck_constant_date_args("$dateTrunc", arg, d, ctx)?;
+        if super::optimize_date_args("$dateTrunc", arg, d, ctx)? {
+            return Ok(Bson::Null);
+        }
     }
     let Some(n) = Named::new(arg, ctx)? else {
         return apply_classic("$dateTrunc", arg, ctx);
