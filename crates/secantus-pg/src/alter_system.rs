@@ -47,20 +47,26 @@ const DISALLOWED: [&str; 10] = [
     "transaction_read_only",
 ];
 
-/// One setting line of the file.
+/// One setting line of a configuration file.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct FileEntry {
     /// As written.
     pub name: String,
     pub value: String,
+    /// The file it is in, absolute.
+    pub file: Arc<str>,
     pub line: i32,
+    /// Its place in the order the files were read.
+    pub seq: usize,
 }
 
-/// A line the file's parser could not read.
+/// A line the parser could not read, or a file it could not open.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct FileError {
+    pub file: Arc<str>,
     pub line: i32,
     pub message: String,
+    pub seq: usize,
 }
 
 /// One store's configuration as the server last read it. The store is held
@@ -92,23 +98,160 @@ fn clusters() -> &'static Mutex<HashMap<usize, Cluster>> {
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The file's path: in the store's directory, made absolute as
-/// PostgreSQL's `DataDir` is.
-pub(crate) fn path(storage: &Storage) -> PathBuf {
+/// The store's directory, made absolute as PostgreSQL's `DataDir` is: the
+/// data directory.
+pub(crate) fn data_directory(storage: &Storage) -> PathBuf {
     let home = Path::new(storage.home());
-    std::fs::canonicalize(home)
-        .unwrap_or_else(|_| home.to_path_buf())
-        .join(AUTO_CONF)
+    std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf())
 }
 
-/// The file's settings and the lines that did not parse; nothing when
-/// there is no file.
+/// The auto file's path.
+pub(crate) fn path(storage: &Storage) -> PathBuf {
+    data_directory(storage).join(AUTO_CONF)
+}
+
+/// The main configuration file's path (`config_file`).
+pub(crate) fn config_file(storage: &Storage) -> PathBuf {
+    data_directory(storage).join("postgresql.conf")
+}
+
+/// How deep `include` may nest (`ParseConfigFile`'s limit).
+const MAX_DEPTH: usize = 10;
+
+/// What the files hold, in the order PostgreSQL reads them: the main
+/// configuration file (when the store has one) with what it includes, then
+/// the auto file. Settings and the lines that did not parse.
 pub(crate) fn read(storage: &Storage) -> std::io::Result<(Vec<FileEntry>, Vec<FileError>)> {
-    match std::fs::read_to_string(path(storage)) {
-        Ok(text) => Ok(parse(&text)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Vec::new(), Vec::new())),
-        Err(e) => Err(e),
+    let mut out = (Vec::new(), Vec::new());
+    let mut seq = 0;
+    let main = config_file(storage);
+    if main.exists() {
+        read_file(&main, 0, false, &mut seq, &mut out)?;
     }
+    read_file(&path(storage), 0, true, &mut seq, &mut out)?;
+    Ok(out)
+}
+
+/// The auto file's settings alone, which ALTER SYSTEM rewrites.
+fn read_auto(storage: &Storage) -> std::io::Result<Vec<FileEntry>> {
+    let mut out = (Vec::new(), Vec::new());
+    read_file(&path(storage), 0, true, &mut 0, &mut out)?;
+    Ok(out.0)
+}
+
+/// One file's settings, with what its `include`, `include_if_exists` and
+/// `include_dir` lines name, relative to its directory.
+fn read_file(
+    file: &Path,
+    depth: usize,
+    missing_ok: bool,
+    seq: &mut usize,
+    out: &mut (Vec<FileEntry>, Vec<FileError>),
+) -> std::io::Result<()> {
+    let shown: Arc<str> = Arc::from(file.display().to_string());
+    let text = match std::fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && missing_ok => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
+    let (mut entries, mut errors) = parse(&text, &shown);
+    // A file is abandoned at its first syntax error, as `ParseConfigFp`
+    // gives up when it reports at DEBUG level -- which is how both
+    // `pg_file_settings` and a reload that will apply nothing see it.
+    if let Some(first) = errors.first().map(|e| e.line) {
+        entries.retain(|e| e.line < first);
+        errors.truncate(1);
+    }
+    let mut errors = errors.into_iter().peekable();
+    for e in entries {
+        while errors.peek().is_some_and(|x| x.line < e.line) {
+            let mut x = errors.next().expect("peeked");
+            x.seq = *seq;
+            *seq += 1;
+            out.1.push(x);
+        }
+        let directive = e.name.to_ascii_lowercase();
+        if matches!(
+            directive.as_str(),
+            "include" | "include_if_exists" | "include_dir"
+        ) {
+            let target = dir.join(&e.value);
+            let fail =
+                |message: String, seq: &mut usize, out: &mut (Vec<FileEntry>, Vec<FileError>)| {
+                    out.1.push(FileError {
+                        file: Arc::clone(&shown),
+                        line: e.line,
+                        message,
+                        seq: *seq,
+                    });
+                    *seq += 1;
+                };
+            if depth + 1 > MAX_DEPTH {
+                fail(
+                    format!(
+                        "could not open configuration file \"{}\": maximum nesting depth exceeded",
+                        target.display()
+                    ),
+                    seq,
+                    out,
+                );
+                continue;
+            }
+            match directive.as_str() {
+                "include_dir" => {
+                    let mut files: Vec<PathBuf> = match std::fs::read_dir(&target) {
+                        Ok(dir) => dir
+                            .filter_map(|d| d.ok().map(|d| d.path()))
+                            .filter(|p| {
+                                p.extension().is_some_and(|x| x == "conf")
+                                    && p.file_name()
+                                        .and_then(|n| n.to_str())
+                                        .is_some_and(|n| !n.starts_with('.'))
+                            })
+                            .collect(),
+                        Err(err) => {
+                            fail(
+                                format!(
+                                    "could not open configuration directory \"{}\": {err}",
+                                    target.display()
+                                ),
+                                seq,
+                                out,
+                            );
+                            continue;
+                        }
+                    };
+                    files.sort();
+                    for f in files {
+                        read_file(&f, depth + 1, false, seq, out)?;
+                    }
+                }
+                _ => {
+                    let if_exists = directive == "include_if_exists";
+                    if let Err(err) = read_file(&target, depth + 1, if_exists, seq, out) {
+                        fail(
+                            format!(
+                                "could not open configuration file \"{}\": {err}",
+                                target.display()
+                            ),
+                            seq,
+                            out,
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+        out.0.push(FileEntry { seq: *seq, ..e });
+        *seq += 1;
+    }
+    for mut x in errors {
+        x.seq = *seq;
+        *seq += 1;
+        out.1.push(x);
+    }
+    Ok(())
 }
 
 /// What the server read from the file at its start or last reload.
@@ -232,9 +375,7 @@ pub(crate) fn reload(storage: &Arc<Storage>) -> std::io::Result<()> {
             std::io::ErrorKind::InvalidData,
             format!(
                 "{} contains errors; unaffected changes were applied: {} at line {}",
-                path(storage).display(),
-                e.message,
-                e.line
+                e.file, e.message, e.line
             ),
         ));
     }
@@ -252,17 +393,25 @@ pub(crate) fn reload(storage: &Arc<Storage>) -> std::io::Result<()> {
 /// `ParseConfigFp` for what this file holds: `name [=] value` lines, the
 /// value a quoted string (`''` and backslash escapes) or a bare word, and
 /// `#` comments.
-fn parse(text: &str) -> (Vec<FileEntry>, Vec<FileError>) {
+fn parse(text: &str, file: &Arc<str>) -> (Vec<FileEntry>, Vec<FileError>) {
     let mut entries = Vec::new();
     let mut errors = Vec::new();
     for (i, raw) in text.lines().enumerate() {
         let line = i32::try_from(i + 1).unwrap_or(i32::MAX);
         match parse_line(raw) {
-            Ok(Some((name, value))) => entries.push(FileEntry { name, value, line }),
+            Ok(Some((name, value))) => entries.push(FileEntry {
+                name,
+                value,
+                file: Arc::clone(file),
+                line,
+                seq: 0,
+            }),
             Ok(None) => {}
             Err(()) => errors.push(FileError {
+                file: Arc::clone(file),
                 line,
                 message: "syntax error".into(),
+                seq: 0,
             }),
         }
     }
@@ -407,9 +556,13 @@ impl PgHandler {
                 format!("unrecognized configuration parameter \"{name}\""),
             ));
         }
-        // Without `GRANT ALTER SYSTEM ON PARAMETER` (refused here), only a
-        // superuser holds the privilege.
-        if !superuser {
+        // A superuser, or a role granted ALTER SYSTEM on the parameter.
+        if !self.parameter_privilege_held(
+            &self.current_role_name(),
+            &name.to_ascii_lowercase(),
+            "ALTER SYSTEM",
+            false,
+        ) {
             return Err(Self::user_error(
                 "42501",
                 format!("permission denied to set parameter \"{name}\""),
@@ -424,13 +577,15 @@ impl PgHandler {
         if let Some(v) = &value {
             self.canonical_setting_value(&key, v)?;
         }
-        let (mut entries, _) = read(&self.storage).map_err(|e| self.auto_conf_error(e))?;
+        let mut entries = read_auto(&self.storage).map_err(|e| self.auto_conf_error(e))?;
         entries.retain(|e| !same_name(&e.name, &name));
         if let Some(value) = value {
             entries.push(FileEntry {
                 name,
                 value,
+                file: Arc::from(""),
                 line: 0,
+                seq: 0,
             });
         }
         self.write_auto_conf(entries)?;
@@ -485,13 +640,13 @@ impl PgHandler {
         Arc::clone(&self.config_file.lock().unwrap_or_else(|e| e.into_inner()).1)
     }
 
-    /// The line of the file a `configuration file` setting came from.
-    pub(crate) fn config_line_of(&self, key: &str) -> Option<i32> {
+    /// The file and line a `configuration file` setting came from.
+    pub(crate) fn config_line_of(&self, key: &str) -> Option<(Arc<str>, i32)> {
         self.file_settings_in_force()
             .iter()
             .rev()
             .find(|e| canonical_setting(&e.name) == key)
-            .map(|e| e.line)
+            .map(|e| (Arc::clone(&e.file), e.line))
     }
 
     /// The SIGHUP a reload sends every backend, processed between
@@ -624,24 +779,29 @@ impl PgHandler {
     /// parameter `pending_restart` in the session that asks.
     pub(crate) fn file_setting_rows(&self, def: &TableDef) -> Vec<Document> {
         let field = |c: &str| def.field_of(c).expect("column");
-        let file = path(&self.storage).display().to_string();
         let (entries, errors) = match read(&self.storage) {
             Ok(read) => read,
             Err(e) => {
-                eprintln!("secantusd-pg: could not read {file}: {e}");
+                eprintln!(
+                    "secantusd-pg: could not read the configuration files of {}: {e}",
+                    data_directory(&self.storage).display()
+                );
                 return Vec::new();
             }
         };
-        let mut rows: Vec<(i32, Document)> = Vec::new();
+        let mut rows: Vec<(usize, Document)> = Vec::new();
         let mut pending: Vec<(String, bool)> = Vec::new();
+        // A file with an error applies nothing (`ProcessConfigFileInternal`
+        // bails out before applying).
+        let failed = !errors.is_empty();
         for (i, e) in entries.iter().enumerate() {
             let key = canonical_setting(&e.name);
             let superseded = entries[i + 1..]
                 .iter()
                 .any(|later| canonical_setting(&later.name) == key);
             let mut error = None;
-            let mut applied = !superseded;
-            if !superseded {
+            let mut applied = !superseded && !failed;
+            if !superseded && !failed {
                 match self.canonical_setting_value(&key, &e.value) {
                     Err(_) => {
                         applied = false;
@@ -665,25 +825,25 @@ impl PgHandler {
                 }
             }
             let mut d = Document::new();
-            d.insert(field("sourcefile"), file.as_str());
+            d.insert(field("sourcefile"), &*e.file);
             d.insert(field("sourceline"), e.line);
             d.insert(field("name"), e.name.as_str());
             d.insert(field("setting"), e.value.as_str());
             d.insert(field("applied"), applied);
             d.insert(field("error"), error.map_or(Bson::Null, Bson::from));
-            rows.push((e.line, d));
+            rows.push((e.seq, d));
         }
         for e in &errors {
             let mut d = Document::new();
-            d.insert(field("sourcefile"), file.as_str());
+            d.insert(field("sourcefile"), &*e.file);
             d.insert(field("sourceline"), e.line);
             d.insert(field("name"), Bson::Null);
             d.insert(field("setting"), Bson::Null);
             d.insert(field("applied"), false);
             d.insert(field("error"), e.message.as_str());
-            rows.push((e.line, d));
+            rows.push((e.seq, d));
         }
-        rows.sort_by_key(|(line, _)| *line);
+        rows.sort_by_key(|(seq, _)| *seq);
         self.mark_pending_restart(pending);
         rows.into_iter()
             .enumerate()
@@ -707,7 +867,7 @@ mod tests {
                     work_mem = '8192'\n\
                     search_path = '\"A b\", c'  # a comment\n\
                     bare 8MB\n";
-        let (entries, errors) = parse(text);
+        let (entries, errors) = parse(text, &Arc::from("f"));
         assert!(errors.is_empty());
         let got: Vec<_> = entries
             .iter()
@@ -722,7 +882,7 @@ mod tests {
                 ("bare", "8MB", 6),
             ]
         );
-        let (_, errors) = parse("work_mem = 'unterminated\n= 'x'\n");
+        let (_, errors) = parse("work_mem = 'unterminated\n= 'x'\n", &Arc::from("f"));
         assert_eq!(errors.len(), 2);
     }
 }

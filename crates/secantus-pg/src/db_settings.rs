@@ -341,13 +341,16 @@ impl PgHandler {
         // pg_read_all_settings.
         let me = self.current_role_name();
         let sees_files = self.is_superuser(&me) || self.role_is_member(&me, "pg_read_all_settings");
-        let file = alter_system::path(&self.storage).display().to_string();
         let mut names: Vec<&String> = defaults.keys().chain(settings.keys()).collect();
         names.sort_by_key(|n| n.to_ascii_lowercase());
         names.dedup();
         names
             .into_iter()
-            .filter(|n| !n.contains('.') && n.as_str() != "role")
+            .filter(|n| {
+                !n.contains('.')
+                    && !HIDDEN_SETTINGS.contains(&n.as_str())
+                    && self.may_read_setting(n)
+            })
             .map(|name| {
                 let setting = settings
                     .get(name)
@@ -372,8 +375,8 @@ impl PgHandler {
                 d.insert(field("setting"), raw(&setting));
                 d.insert(field("source"), source.name());
                 if source == GucSource::ConfigFile && sees_files {
-                    d.insert(field("sourcefile"), file.as_str());
-                    if let Some(line) = self.config_line_of(name) {
+                    if let Some((file, line)) = self.config_line_of(name) {
+                        d.insert(field("sourcefile"), &*file);
                         d.insert(field("sourceline"), line);
                     }
                 }
@@ -417,6 +420,13 @@ impl PgHandler {
                         );
                     }
                 }
+                // With no default of the server's own, PostgreSQL's boot
+                // value (`port` is 5432 whatever the server listens on).
+                let boot = boot.or_else(|| {
+                    pg.map(|p| p.boot_val)
+                        .filter(|b| !b.is_empty())
+                        .map(str::to_string)
+                });
                 if let Some(b) = boot {
                     let b = match pg {
                         Some(p) if p.show == b => p.boot_val.to_string(),

@@ -72,6 +72,7 @@ mod lock_manager;
 mod merge;
 mod object_acl;
 mod owned;
+mod parameter_acl;
 mod partition;
 mod pg15_settings;
 mod pg_type_facts;
@@ -428,6 +429,9 @@ pub(crate) struct GucMap {
 pub(crate) enum GucSource {
     Default,
     ConfigFile,
+    /// The server's own startup: its port, and that it makes no Unix
+    /// socket.
+    CommandLine,
     Global,
     Database,
     User,
@@ -450,6 +454,7 @@ impl GucSource {
             Self::User => "user",
             Self::DatabaseUser => "database user",
             Self::Client => "client",
+            Self::CommandLine => "command line",
             Self::Override => "override",
             Self::Session => "session",
         }
@@ -3925,6 +3930,9 @@ pub struct PgHandler {
     /// What the startup packet set (`client`): the values RESET returns
     /// them to.
     client_settings: Mutex<Vec<(String, String)>>,
+    /// The server applying a database's or role's defaults, which a
+    /// superuser recorded: no `SET` privilege is asked of the session.
+    privileged_set: AtomicBool,
     /// Open large-object descriptors (see `largeobjects`).
     lo_descriptors: Mutex<largeobjects::LoDescriptors>,
     /// The last `<unnamed portal N>` a PL/pgSQL OPEN named.
@@ -4325,6 +4333,7 @@ impl PgHandler {
             config_file: Mutex::new((0, Arc::new(Vec::new()))),
             pending_restart: Mutex::new(std::collections::HashSet::new()),
             client_settings: Mutex::new(Vec::new()),
+            privileged_set: AtomicBool::new(false),
             lo_descriptors: Mutex::new(largeobjects::LoDescriptors::default()),
             portal_seq: std::sync::atomic::AtomicU32::new(0),
             wire_portals: Mutex::new(HashMap::new()),
@@ -22001,6 +22010,11 @@ fn default_settings() -> HashMap<String, String> {
         ("default_transaction_read_only", "off"),
         ("default_transaction_deferrable", "off"),
         ("search_path", "\"$user\", public"),
+        // With no `postgresql.conf` to set it, the boot value; and two
+        // parameters `pg_settings` does not list (`GUC_NO_SHOW_ALL`).
+        ("log_timezone", "GMT"),
+        ("default_with_oids", "off"),
+        ("ssl_renegotiation_limit", "0"),
         ("idle_in_transaction_session_timeout", "0"),
         ("idle_session_timeout", "0"),
         ("statement_timeout", "0"),
@@ -22228,6 +22242,93 @@ impl PgHandler {
                 .unwrap_or_else(|| secantus_pgplan::TimeZoneSetting::canonical_name(value)));
         }
         guc_values::canonical(key, value).unwrap_or_else(|| Ok(value.to_string()))
+    }
+
+    /// The settings the server itself decides: where its files are (the
+    /// data directory, the main configuration file, the login files --
+    /// `--hba-file`'s, or the data directory's `pg_hba.conf`), the port it
+    /// listens on, and that it makes no Unix socket.
+    fn apply_server_settings(&self, port: Option<u16>) {
+        let dir = alter_system::data_directory(&self.storage);
+        let (hba, ident) = match self.hba.as_ref() {
+            Some(h) => (
+                h.files.hba_file.clone(),
+                h.files
+                    .ident_file
+                    .clone()
+                    .unwrap_or_else(|| dir.join("pg_ident.conf")),
+            ),
+            None => (dir.join("pg_hba.conf"), dir.join("pg_ident.conf")),
+        };
+        let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        for (key, value) in [
+            ("data_directory", dir.clone()),
+            ("config_file", alter_system::config_file(&self.storage)),
+            ("hba_file", hba),
+            ("ident_file", ident),
+        ] {
+            settings.set_from(key, value.display().to_string(), GucSource::Override);
+        }
+        if let Some(port) = port {
+            settings.set_from("port", port.to_string(), GucSource::CommandLine);
+        }
+        settings.set_from(
+            "unix_socket_directories",
+            String::new(),
+            GucSource::CommandLine,
+        );
+    }
+
+    /// Whether the role in effect may read `key` (`GUC_SUPERUSER_ONLY`
+    /// ones are a superuser's or a member's of pg_read_all_settings).
+    pub(crate) fn may_read_setting(&self, key: &str) -> bool {
+        if !pg15_settings::SUPERUSER_ONLY.contains(&key) {
+            return true;
+        }
+        let me = self.current_role_name();
+        self.is_superuser(&me) || self.role_is_member(&me, "pg_read_all_settings")
+    }
+
+    /// 42501 for a parameter the role may not read.
+    fn check_read_setting(&self, key: &str) -> PgWireResult<()> {
+        if self.may_read_setting(key) {
+            return Ok(());
+        }
+        Err(Self::user_error(
+            "42501",
+            format!(
+                "must be superuser or have privileges of pg_read_all_settings to examine \"{key}\""
+            ),
+        ))
+    }
+
+    /// `key`'s current value, as SHOW and `current_setting` read it: the
+    /// stored one, or one PostgreSQL derives from the roles -- `is_superuser`
+    /// follows the role in effect (`SET ROLE`), `session_authorization` the
+    /// session user.
+    fn read_setting(&self, key: &str) -> PgWireResult<Option<String>> {
+        self.check_read_setting(key)?;
+        let stored = self
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned();
+        Ok(stored.or_else(|| match key {
+            "is_superuser" => {
+                let role = self.current_role_name();
+                Some(
+                    if self.is_superuser(&role) {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                    .into(),
+                )
+            }
+            "session_authorization" => Some(self.session_user_name()),
+            _ => None,
+        }))
     }
 
     /// `key`'s current value came from `source`.
@@ -23674,6 +23775,7 @@ impl PgHandler {
         // and connects). The file's settings are the server's own, so even
         // one no session may SET (a `sighup` or `postmaster` one) applies.
         self.start_config_layer();
+        self.apply_server_settings(_c.local_addr().map(|a| a.port()));
         let db_defaults = self.db_setting_layers();
         for (name, value, source) in &db_defaults {
             if *source == GucSource::ConfigFile {
@@ -23689,7 +23791,12 @@ impl PgHandler {
                 name.replace('"', "\"\""),
                 value.replace('\'', "''")
             );
-            match self.run_typed_inner(&sql, &[], &[], 0).await {
+            self.privileged_set
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let applied = self.run_typed_inner(&sql, &[], &[], 0).await;
+            self.privileged_set
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            match applied {
                 Ok(_) => self.mark_source(name, *source),
                 Err(e) => {
                     eprintln!("secantusd-pg: database default {name} = {value} not applied: {e:?}")
@@ -26654,6 +26761,9 @@ impl PgHandler {
         ) {
             return self.has_object_privilege_call(name, args);
         }
+        if name == "has_parameter_privilege" {
+            return self.has_parameter_privilege_call(args);
+        }
         if name.starts_with("lo") && largeobjects::is_sql_function(name) {
             return self.lo_sql_call(name, args);
         }
@@ -28767,6 +28877,7 @@ impl PgHandler {
             ConstCol::Value(v) => Ok(v.clone()),
             ConstCol::CurrentSetting { name, missing_ok } => {
                 let key = canonical_setting(name);
+                let derived = self.read_setting(&key)?;
                 let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
                 // `pg_trgm`'s thresholds exist once the extension does.
                 let trgm_default = match key.as_str() {
@@ -28779,9 +28890,8 @@ impl PgHandler {
                     self.type_catalog_docs(Self::EXTENSION_COLLECTION)
                         .is_ok_and(|d| d.iter().any(|e| e.get_str("_id") == Ok("pg_trgm")))
                 });
-                match settings
-                    .get(&key)
-                    .cloned()
+                match derived
+                    .or_else(|| settings.get(&key).cloned())
                     .or(trgm_default.map(str::to_string))
                 {
                     Some(v) => Ok(Bson::String(v)),
@@ -28833,6 +28943,7 @@ impl PgHandler {
                     // psycopg builds a timestamptz's tzinfo from that report,
                     // so without it a session-zone change was invisible to
                     // the client's loader).
+                    self.check_set_privilege(&key)?;
                     let text = self.canonical_setting_value(&key, &text)?;
                     // `is_local` outside a block lasts only for the
                     // statement's own implicit transaction: nothing stays.
@@ -36884,12 +36995,37 @@ impl PgHandler {
             Statement::Grant {
                 is_grant,
                 privileges,
+                kind,
+                objects,
+                grantees,
+                grant_option,
+                cascade,
+                ..
+            } if kind == "parameter" => {
+                self.grant_parameter(
+                    is_grant,
+                    &privileges,
+                    &objects,
+                    &grantees,
+                    grant_option,
+                    cascade,
+                )?;
+                Ok(vec![Response::Execution(Tag::new(if is_grant {
+                    "GRANT"
+                } else {
+                    "REVOKE"
+                }))])
+            }
+            Statement::Grant {
+                is_grant,
+                privileges,
                 column_privileges,
                 kind,
                 objects,
                 all_in_schema,
                 grantees,
                 grant_option,
+                ..
             } => {
                 self.grant(
                     is_grant,
@@ -37241,41 +37377,16 @@ impl PgHandler {
 
             Statement::Show(name) => {
                 let key = canonical_setting(&name);
-                // Release the settings lock BEFORE building the field:
+                // The settings lock is released BEFORE building the field:
                 // `field` reads `client_encoding` from the same (non-reentrant)
                 // mutex to transcode the column name.
-                let stored = self
-                    .settings
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(&key)
-                    .cloned();
-                // Two hidden parameters PostgreSQL derives from the roles:
-                // `is_superuser` follows the effective role (`SET ROLE`),
-                // `session_authorization` the session user.
-                let value = stored
-                    .or_else(|| match key.as_str() {
-                        "is_superuser" => {
-                            let role = self.current_role_name();
-                            Some(
-                                if self.is_superuser(&role) {
-                                    "on"
-                                } else {
-                                    "off"
-                                }
-                                .into(),
-                            )
-                        }
-                        "session_authorization" => Some(self.session_user_name()),
-                        _ => None,
-                    })
-                    .ok_or_else(|| {
-                        PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "ERROR".into(),
-                            "42704".into(), // undefined_object
-                            format!("unrecognized configuration parameter \"{name}\""),
-                        )))
-                    })?;
+                let value = self.read_setting(&key)?.ok_or_else(|| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42704".into(), // undefined_object
+                        format!("unrecognized configuration parameter \"{name}\""),
+                    )))
+                })?;
                 let schema = Arc::new(vec![self.field(key, Type::TEXT)]);
                 let schema_ref = schema.clone();
                 let rows = stream::iter(std::iter::once(value)).map(move |v| {
@@ -37684,6 +37795,7 @@ impl PgHandler {
                 // is back after COMMIT).
                 self.check_setting_known(&name)?;
                 let key = canonical_setting(&name);
+                self.check_set_privilege(&key)?;
                 self.warn_reset_transaction(&key);
                 // `SET ROLE` has no stored default: it is NONE.
                 let (value, source) = self.reset_entry(&key).unwrap_or_else(|| {
@@ -37709,8 +37821,10 @@ impl PgHandler {
             }
             Statement::SetLocal { name, value } => {
                 if !self.set_local_allowed() {
-                    // The WARNING first, then the name is looked up.
+                    // The WARNING first, then the name is looked up and the
+                    // privilege asked for.
                     self.check_setting_known(&name)?;
+                    self.check_set_privilege(&canonical_setting(&name))?;
                     return Ok(vec![Response::Execution(Tag::new("SET"))]);
                 }
                 let key = canonical_setting(&name);
@@ -37726,6 +37840,7 @@ impl PgHandler {
                 if let Some(msg) = setting_change_refusal(&key) {
                     return Err(Self::user_error("55P02", msg));
                 }
+                self.check_set_privilege(&key)?;
                 if key == "role" {
                     // `SET ROLE r`: r must exist, and a non-superuser may take
                     // only a role it is a member of.
@@ -38025,13 +38140,24 @@ impl PgHandler {
                     for (k, v) in client {
                         fresh.set_from(&k, v, GucSource::Client);
                     }
-                    *self.settings.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
+                    let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+                    // What only a restart changes keeps its value.
+                    let kept: Vec<(String, String, GucSource)> = settings
+                        .iter()
+                        .filter(|(k, _)| alter_system::restart_only(k))
+                        .map(|(k, v)| (k.clone(), v.clone(), settings.source_of(k)))
+                        .collect();
+                    for (k, v, source) in kept {
+                        fresh.set_from(&k, v, source);
+                    }
+                    *settings = fresh;
                 } else {
                     self.check_setting_known(&name)?;
                     let key = canonical_setting(&name);
                     if let Some(msg) = setting_change_refusal(&key) {
                         return Err(Self::user_error("55P02", msg));
                     }
+                    self.check_set_privilege(&key)?;
                     self.warn_reset_transaction(&key);
                     // RESET restores the reset value, which is not the same
                     // as removing the setting: a client reading it back

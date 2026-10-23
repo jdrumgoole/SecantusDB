@@ -376,7 +376,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ------------------------------ RP-162 parameters SHOW does not answer
     "every parameter answers SHOW": (
         "RP-162",
-        True,
+        False,
         [
             "select current_setting('is_superuser')",
             "select current_setting('default_with_oids')",
@@ -424,7 +424,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # --------------------------------------- RP-164 GRANT ... ON PARAMETER
     "GRANT SET and ALTER SYSTEM ON PARAMETER": (
         "RP-164",
-        True,
+        False,
         [
             "create role rp33_p login",
             "grant set on parameter log_min_duration_statement to rp33_p",
