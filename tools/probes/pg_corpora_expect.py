@@ -46,6 +46,17 @@ CLOCK_OR_PROCESS = re.compile(
     re.IGNORECASE,
 )
 
+#: `pg_timezone_names`' abbreviation, offset and DST flag are each zone's
+#: rule in force TODAY: a recording made in one season is not the answer in
+#: another (Europe/London is BST in October and GMT in November, and
+#: Palestine's zones change on a date set each year).
+TODAYS_ZONE_RULES = re.compile(
+    r"\bpg_timezone_names\b.*\b(abbrev|utc_offset|is_dst)\b"
+    r"|\b(abbrev|utc_offset|is_dst)\b.*\bpg_timezone_names\b"
+    r"|select\s+\*\s+from\s+pg_timezone_names\b",
+    re.IGNORECASE,
+)
+
 
 def _same(x: list, y: list) -> bool:
     """Two recordings of one check agree. A user type's oid (>= 16384) is the
@@ -87,6 +98,8 @@ def main(argv: list[str]) -> int:
                 volatile[str(i)] = "PostgreSQL answered differently in two recordings"
             elif CLOCK_OR_PROCESS.search(x[0]):
                 volatile[str(i)] = "reads the clock or the server process"
+            elif TODAYS_ZONE_RULES.search(x[0]):
+                volatile[str(i)] = "reads the time zone rules in force today"
         lines = ",\n".join(json.dumps(c, ensure_ascii=False) for c in a["checks"])
         (EXPECTED / f"{name}.json").write_text(
             f'{{"reference": {json.dumps(a["reference"])},\n'
