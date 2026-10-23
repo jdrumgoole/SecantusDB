@@ -44,6 +44,14 @@ token, and the `delete ... where ctid = ...` idiom, work.
   never recorded them, so `pg_class.reloptions` was NULL. They are now the
   table's, as `ALTER TABLE ... SET` makes them.
 
+- A table the PostgreSQL server wrote still reads, through the Rust MongoDB
+  server, as its columns alone: that server leaves out the hidden
+  `__sys_*` fields each row now carries, in any collection the SQL catalog
+  lists (Joe, 2026-10-23; `secantus-storage-adapter`, the MongoDB server's
+  storage bridge). The SQL-to-MongoDB hand-off test pins it
+  (`tests/test_rust_pgserver_slice.py::test_a_mongodb_client_reads_a_table_the_rust_sql_server_wrote`),
+  along with a MongoDB collection that keeps a field sharing the prefix.
+
 #### Known
 
 - RP-192, filed: a sequential scan reads rows in insertion order, not ctid

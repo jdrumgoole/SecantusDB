@@ -40,6 +40,49 @@ pub struct StorageAdapter {
     index_use: Mutex<HashMap<(String, String, String), IndexUse>>,
 }
 
+/// The fields the PostgreSQL server stamps on a SQL table's row for its
+/// system columns (`ctid`, `xmin`, ...): that server's alone. The MongoDB
+/// server shows the row without them, so a table written over the
+/// PostgreSQL wire reads as its columns (Joe, 2026-10-23).
+const SQL_SYSTEM_PREFIX: &str = "__sys_";
+
+/// Might `blob` hold a SQL system field? (Every document a MongoDB client
+/// wrote is answered by this scan alone.)
+fn may_hold_sql_system_fields(blob: &[u8]) -> bool {
+    let needle = SQL_SYSTEM_PREFIX.as_bytes();
+    blob.windows(needle.len()).any(|w| w == needle)
+}
+
+/// `blob` without the SQL system fields.
+fn without_sql_system_fields(blob: Vec<u8>) -> Vec<u8> {
+    let Ok(raw) = bson::RawDocument::from_bytes(&blob) else {
+        return blob;
+    };
+    let mut out = bson::RawDocumentBuf::new();
+    for item in raw {
+        let Ok((key, value)) = item else {
+            return blob;
+        };
+        if !key.starts_with(SQL_SYSTEM_PREFIX) {
+            out.append(key, value.to_raw_bson());
+        }
+    }
+    out.into_bytes()
+}
+
+/// A document without the SQL system fields (see [`SQL_SYSTEM_PREFIX`]).
+fn doc_without_sql_system_fields(mut doc: Document) -> Document {
+    let keys: Vec<String> = doc
+        .keys()
+        .filter(|k| k.starts_with(SQL_SYSTEM_PREFIX))
+        .cloned()
+        .collect();
+    for k in keys {
+        doc.remove(&k);
+    }
+    doc
+}
+
 /// The table a namespace is kept in.
 enum Stored {
     /// The collection registry.
@@ -55,6 +98,45 @@ struct IndexUse {
 }
 
 impl StorageAdapter {
+    /// A row of `db.coll` as the MongoDB server shows it: a SQL table's
+    /// (one the PostgreSQL server's catalog lists) without the SQL system
+    /// fields, any other unchanged. The catalog is asked once per `view`,
+    /// and only when a row holds the prefix at all.
+    fn sql_view<'a>(&'a self, db: &'a str, coll: &'a str) -> impl FnMut(Vec<u8>) -> Vec<u8> + 'a {
+        let mut sql_table: Option<bool> = None;
+        move |blob: Vec<u8>| {
+            if !may_hold_sql_system_fields(&blob) {
+                return blob;
+            }
+            let is_sql = *sql_table.get_or_insert_with(|| {
+                self.inner
+                    .find_matching(db, "__sql_catalog__", &bson::doc! {"_id": coll})
+                    .is_ok_and(|rows| !rows.is_empty())
+            });
+            if is_sql {
+                without_sql_system_fields(blob)
+            } else {
+                blob
+            }
+        }
+    }
+
+    /// [`Self::sql_view`] for a decoded document (a post-image).
+    fn sql_doc_view(&self, db: &str, coll: &str, doc: Document) -> Document {
+        if !doc.keys().any(|k| k.starts_with(SQL_SYSTEM_PREFIX)) {
+            return doc;
+        }
+        let is_sql = self
+            .inner
+            .find_matching(db, "__sql_catalog__", &bson::doc! {"_id": coll})
+            .is_ok_and(|rows| !rows.is_empty());
+        if is_sql {
+            doc_without_sql_system_fields(doc)
+        } else {
+            doc
+        }
+    }
+
     pub fn new(inner: Arc<WtStorage>) -> Self {
         StorageAdapter {
             inner,
@@ -414,7 +496,7 @@ impl CmdStorage for StorageAdapter {
             matched: o.matched,
             modified: o.modified,
             upserted_id: o.upserted_id,
-            post_image: o.post_image,
+            post_image: o.post_image.map(|d| self.sql_doc_view(db, coll, d)),
         })
     }
 
@@ -455,7 +537,7 @@ impl CmdStorage for StorageAdapter {
             matched: o.matched,
             modified: o.modified,
             upserted_id: o.upserted_id,
-            post_image: o.post_image,
+            post_image: o.post_image.map(|d| self.sql_doc_view(db, coll, d)),
         })
     }
 
@@ -494,7 +576,7 @@ impl CmdStorage for StorageAdapter {
             matched: o.matched,
             modified: o.modified,
             upserted_id: o.upserted_id,
-            post_image: o.post_image,
+            post_image: o.post_image.map(|d| self.sql_doc_view(db, coll, d)),
         })
     }
 
@@ -535,7 +617,7 @@ impl CmdStorage for StorageAdapter {
             matched: o.matched,
             modified: o.modified,
             upserted_id: o.upserted_id,
-            post_image: o.post_image,
+            post_image: o.post_image.map(|d| self.sql_doc_view(db, coll, d)),
         })
     }
 
@@ -632,6 +714,7 @@ impl CmdStorage for StorageAdapter {
                 None,
                 &Document::new(),
             )
+            .map(|docs| docs.into_iter().map(self.sql_view(db, coll)).collect())
             .map_err(map_err)
     }
 
@@ -657,6 +740,7 @@ impl CmdStorage for StorageAdapter {
                 collation,
                 let_vars,
             )
+            .map(|docs| docs.into_iter().map(self.sql_view(db, coll)).collect())
             .map_err(map_err)
     }
 
@@ -754,7 +838,10 @@ impl CmdStorage for StorageAdapter {
             .matching_rows(db, coll, filter, resolved.as_ref(), collation, let_vars)
             .map(|found| {
                 found.map(|m| MatchedRows {
-                    rows: m.rows,
+                    rows: {
+                        let mut view = self.sql_view(db, coll);
+                        m.rows.into_iter().map(|(r, d)| (r, view(d))).collect()
+                    },
                     via: m.via,
                 })
             })
@@ -780,6 +867,12 @@ impl CmdStorage for StorageAdapter {
     ) -> Result<Option<Vec<(i64, Vec<u8>)>>, StorageError> {
         self.inner
             .collection_at_most(db, coll, cap)
+            .map(|rows| {
+                rows.map(|rows| {
+                    let mut view = self.sql_view(db, coll);
+                    rows.into_iter().map(|(r, d)| (r, view(d))).collect()
+                })
+            })
             .map_err(map_err)
     }
 
@@ -1127,6 +1220,10 @@ impl CmdStorage for StorageAdapter {
     ) -> Result<IdKeyRows, StorageError> {
         self.inner
             .scan_docs_after_id_key(db, coll, after)
+            .map(|rows| {
+                let mut view = self.sql_view(db, coll);
+                rows.into_iter().map(|(k, d)| (k, view(d))).collect()
+            })
             .map_err(map_err)
     }
 
@@ -1142,6 +1239,10 @@ impl CmdStorage for StorageAdapter {
     ) -> Result<Vec<(i64, Vec<u8>)>, StorageError> {
         self.inner
             .scan_docs_after_recordid(db, coll, after)
+            .map(|rows| {
+                let mut view = self.sql_view(db, coll);
+                rows.into_iter().map(|(r, d)| (r, view(d))).collect()
+            })
             .map_err(map_err)
     }
 

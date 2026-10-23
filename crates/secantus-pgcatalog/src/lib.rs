@@ -507,7 +507,8 @@ pub struct TableDef {
     /// verbatim, as `Column::extra` does for columns. They used to be written
     /// back as NULLs, so a Rust rewrite of a table erased what the Python
     /// server recorded (a `COMMENT ON TABLE`, a named primary key).
-    pub extra: Document,    /// The system columns a stored table answers besides its own --
+    pub extra: Document,
+    /// The system columns a stored table answers besides its own --
     /// `ctid`, `xmin`, `cmin`, `xmax`, `cmax` -- each read from a hidden
     /// field the writer stamps on every row ([`SYSTEM_FIELDS`]). Found by
     /// name ([`TableDef::column`]), never listed with `columns`.
@@ -535,7 +536,6 @@ pub fn system_columns() -> Vec<Column> {
         })
         .collect()
 }
-
 
 impl TableDef {
     /// `extra`'s record of each column's attnum, kept once a column has
@@ -681,7 +681,10 @@ impl TableDef {
     /// Is `name` one of the system columns PostgreSQL gives every table
     /// (`ctid`, `xmin`, `cmin`, `xmax`, `cmax`, `tableoid`)?
     pub fn is_system_column_name(name: &str) -> bool {
-        matches!(name, "ctid" | "xmin" | "cmin" | "xmax" | "cmax" | "tableoid")
+        matches!(
+            name,
+            "ctid" | "xmin" | "cmin" | "xmax" | "cmax" | "tableoid"
+        )
     }
 
     pub fn column(&self, name: &str) -> Option<&Column> {

@@ -11386,11 +11386,18 @@ def test_a_mongodb_client_reads_a_table_the_rust_sql_server_wrote(home: Path) ->
         client = pymongo.MongoClient(f"mongodb://{host}:{port}", serverSelectionTimeoutMS=15_000)
         try:
             assert "widgets" in client["postgres"].list_collection_names()
+            # The PostgreSQL server's system-column fields (`__sys_ctid` and
+            # the rest, RP-069) are its own: a MongoDB client sees the
+            # columns (Joe, 2026-10-23).
             docs = sorted(client["postgres"]["widgets"].find({}), key=lambda d: d["_id"])
             assert docs == [
                 {"_id": 1, "name": "bolt", "qty": 40},
                 {"_id": 2, "name": "nut", "qty": 75},
             ]
+            # ... in a SQL table only: a collection of its own keeps a field
+            # that happens to share the prefix.
+            client["postgres"]["mine"].insert_one({"_id": 1, "__sys_note": "kept"})
+            assert list(client["postgres"]["mine"].find({})) == [{"_id": 1, "__sys_note": "kept"}]
         finally:
             client.close()
 
