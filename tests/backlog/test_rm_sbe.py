@@ -488,12 +488,12 @@ def test_classic_ties_keep_the_first(rust_mongo: Any, mongod: Any) -> None:
     assert _diverging(rust_mongo, mongod, shapes) == []
 
 
-@pytest.mark.backlog("RM-290")
+@pytest.mark.backlog_fixed("RM-290")
 def test_constant_timezone_refused_before_any_document(rust_mongo: Any, mongod: Any) -> None:
     """mongod's optimizer refuses a constant timezone a date operator cannot
     use -- 40485 for an unknown zone, 40517 for one that is not a string --
     before it reads anything, so a collection that does not exist fails too
-    (measured 8.2.11, 2026-10-23). This server finds it only on a document."""
+    (measured 8.2.11, 2026-10-23). This server found it only on a document."""
     out = []
     for label, expr in [
         ("$year", {"$year": {"date": "$t", "timezone": "Mars"}}),
@@ -514,6 +514,164 @@ def test_constant_timezone_refused_before_any_document(rust_mongo: Any, mongod: 
             )
         if answers[0] != answers[1]:
             out.append(f"{label}:\n  mongod {answers[0]!r}\n  rust   {answers[1]!r}")
+    assert out == []
+
+
+def _missing_and_one(rust_mongo: Any, mongod: Any, exprs: list) -> list:
+    """Each expression in a `$project` over a collection that does not exist
+    and over one holding a single document, on both servers."""
+    out = []
+    one = {"_id": 1, "t": datetime.datetime(2020, 1, 1), "s": "x"}
+    for label, expr in exprs:
+        pipeline = [{"$project": {"_id": 0, "z": expr}}]
+        for coll, docs in (("missing", []), ("one", [one])):
+            answers = []
+            for client in (mongod, rust_mongo):
+                client[_DB][coll].drop()
+                if docs:
+                    client[_DB][coll].insert_many(docs)
+                answers.append(
+                    mongo_answer(lambda c=client[_DB][coll], p=pipeline: list(c.aggregate(p)))
+                )
+            if answers[0] != answers[1]:
+                out.append(f"{label} ({coll}):\n  mongod {answers[0]!r}\n  rust   {answers[1]!r}")
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-290")
+def test_date_arguments_checked_in_the_optimizers_order(rust_mongo: Any, mongod: Any) -> None:
+    """mongod's optimizer reads a date operator's CONSTANT arguments in the
+    order `unit`, `startOfWeek`, `timezone`, `binSize`, before any document:
+    a bad one fails, and a null one makes the whole expression null, so
+    nothing after it is checked (measured 8.2.11, 2026-10-23). This server
+    checked `binSize` first and the timezone before `unit`, raised them only
+    on a document, and answered a null `unit` beside a bad timezone with the
+    timezone's error. A `$let` variable bound to a constant is a constant
+    there; one read from the document hides it. `$dateSubtract`'s amount of
+    -2^63 is found per document, after a null start (it was an optimizer
+    error)."""
+    trunc = {"date": "$t", "unit": "bogus", "startOfWeek": "x", "timezone": "Mars", "binSize": 0}
+    exprs = []
+    for null in trunc:
+        if null != "date":
+            exprs.append((f"$dateTrunc null {null}", {"$dateTrunc": {**trunc, null: None}}))
+    diff = {"startDate": "$t", "endDate": "$t", "unit": "week", "startOfWeek": "x"}
+    exprs += [
+        ("$dateTrunc unit, binSize", {"$dateTrunc": {"date": "$t", "unit": "x", "binSize": 0}}),
+        ("$dateTrunc binSize, tz", {"$dateTrunc": {**trunc, "unit": "day", "startOfWeek": None}}),
+        ("$dateTrunc binSize", {"$dateTrunc": {"date": "$t", "unit": "day", "binSize": "a"}}),
+        ("$dateTrunc unit type", {"$dateTrunc": {"date": "$t", "unit": 5}}),
+        ("$dateDiff startOfWeek, tz", {"$dateDiff": {**diff, "timezone": "Mars"}}),
+        ("$dateDiff tz", {"$dateDiff": {**diff, "startOfWeek": "mon", "timezone": 5}}),
+        (
+            "$dateAdd unit, tz",
+            {"$dateAdd": {"startDate": "$t", "unit": "x", "amount": 1, "timezone": "Mars"}},
+        ),
+        (
+            "$dateAdd null unit",
+            {"$dateAdd": {"startDate": "$t", "unit": None, "amount": 1, "timezone": "Mars"}},
+        ),
+        (
+            "$dateSubtract -2^63",
+            {"$dateSubtract": {"startDate": "$t", "unit": "day", "amount": Int64(-(2**63))}},
+        ),
+        (
+            "$dateSubtract -2^63 string start",
+            {"$dateSubtract": {"startDate": "$s", "unit": "day", "amount": Int64(-(2**63))}},
+        ),
+        ("$dateToParts", {"$dateToParts": {"date": "$t", "timezone": "Mars"}}),
+        ("$dateFromParts", {"$dateFromParts": {"year": "$t", "timezone": 5}}),
+        ("in $add", {"$add": [1, {"$hour": {"date": "$t", "timezone": ""}}]}),
+        (
+            "$let",
+            {"$let": {"vars": {"z": "Mars"}, "in": {"$year": {"date": "$t", "timezone": "$$z"}}}},
+        ),
+        (
+            "$let beside a field",
+            {
+                "$let": {
+                    "vars": {"z": "Mars", "w": "$s"},
+                    "in": {"$year": {"date": "$t", "timezone": "$$z"}},
+                }
+            },
+        ),
+        (
+            "$let shadowed",
+            {
+                "$let": {
+                    "vars": {"z": "Mars"},
+                    "in": {
+                        "$map": {
+                            "input": [],
+                            "as": "z",
+                            "in": {"$year": {"date": "$t", "timezone": "$$z"}},
+                        }
+                    },
+                }
+            },
+        ),
+        ("$literal zone", {"$year": {"date": "$t", "timezone": {"$literal": "Mars"}}}),
+    ]
+    assert _missing_and_one(rust_mongo, mongod, exprs) == []
+
+
+@pytest.mark.backlog("RM-293")
+def test_a_variable_bound_from_input_is_not_constant(rust_mongo: Any, mongod: Any) -> None:
+    """An error raised through a variable mongod binds from the input --
+    `$map`'s `$$this`, a `$let` variable read from a field -- is a per-document
+    error, "Executor error during ..." (measured 8.2.11, 2026-10-23). This
+    server counts every bound variable as a constant, so it answers "Failed
+    to optimize pipeline", and in `find` raises it on an empty collection."""
+    one = {"_id": 1, "t": datetime.datetime(2020, 1, 1), "s": "x"}
+    year = {"$year": {"date": "$t", "timezone": "$$this"}}
+    out = []
+    for coll, docs in (("missing", []), ("one", [one])):
+        answers = []
+        for client in (mongod, rust_mongo):
+            c = client[_DB][coll]
+            c.drop()
+            if docs:
+                c.insert_many(docs)
+            answers.append(
+                [
+                    mongo_answer(
+                        lambda c=c: list(
+                            c.aggregate(
+                                [{"$project": {"z": {"$map": {"input": ["Mars"], "in": year}}}}]
+                            )
+                        )
+                    ),
+                    mongo_answer(
+                        lambda c=c: list(
+                            c.find(
+                                {"$expr": {"$eq": [{"$map": {"input": ["Mars"], "in": year}}, 1]}}
+                            )
+                        )
+                    ),
+                    mongo_answer(
+                        lambda c=c: list(
+                            c.aggregate(
+                                [
+                                    {
+                                        "$project": {
+                                            "z": {
+                                                "$let": {
+                                                    "vars": {"z": "$s"},
+                                                    "in": {
+                                                        "$year": {"date": "$t", "timezone": "$$z"}
+                                                    },
+                                                }
+                                            }
+                                        }
+                                    }
+                                ]
+                            )
+                        )
+                    ),
+                ]
+            )
+        if answers[0] != answers[1]:
+            out.append(f"{coll}:\n  mongod {answers[0]!r}\n  rust   {answers[1]!r}")
     assert out == []
 
 

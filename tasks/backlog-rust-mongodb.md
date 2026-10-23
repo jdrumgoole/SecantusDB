@@ -573,23 +573,29 @@ leave only differences listed here or in other items. Regression tests:
   equal values survive, and their order, is the C++ library's. The Linux
   build (libstdc++) is the exemplar and is what this server follows; the
   macOS build (libc++) breaks those ties its own way, so
-  `test_n_accumulator_ties_follow_the_heap` runs on Linux only. A libc++
-  model reproduced the macOS mongod 8.2.11 on 1,500 of 1,500 cases.
+  `test_n_accumulator_ties_follow_the_heap` compares with mongod on Linux and
+  with a model of libstdc++'s heap elsewhere. A libc++ model reproduced the
+  macOS mongod 8.2.11 on 1,500 of 1,500 cases.
 - **Scope decision — a `$dateFromString` message that is not UTF-8.** On a
   string with multi-byte characters mongod's "Error parsing date string"
   message splits them byte by byte and sends bytes that are not UTF-8, which
   pymongo cannot decode; this server sends the same text as valid UTF-8.
 
-- [ ] **A constant timezone a date operator cannot use is refused only on a
-  document.** mongod's optimizer evaluates a constant `timezone` of `$year`
-  and the other date parts, `$dateToString`, `$dateFromString`, `$dateAdd`,
-  `$dateTrunc` and the rest before it reads anything: an unknown zone is
-  40485 and a non-string 40517 under "Failed to optimize pipeline", on a
-  collection that does not exist too. This server checks it when it
-  evaluates the operator, so with no document it answers `[]`. Found
-  2026-10-23 with RM-280.
-  Backlog-ID: RM-290
-  Verify: tests/backlog/test_rm_sbe.py::test_constant_timezone_refused_before_any_document
+- [ ] **An error raised through a variable bound from the input is reported
+  as the optimizer's.** mongod binds `$map`'s and `$filter`'s `$$this`,
+  `$reduce`'s `$$value`, and a `$let` variable read from a field, per
+  document, so an error through one -- `{$map: {input: ["Mars"], in:
+  {$year: {date: "$t", timezone: "$$this"}}}}` -- is "Executor error during
+  ...", and `find` with it in `$expr` answers `[]` on an empty collection
+  (measured 8.2.11, 2026-10-23). This server decides the wrapper by counting
+  every variable in scope as a constant (`is_constant_expression` called with
+  `ctx.vars`' names), so it answers "Failed to optimize pipeline" / "Failed
+  to optimize expression", and `find` raises it on an empty collection
+  through its empty-document check. The evaluator's context does not know
+  which variables are constant: the command's `let` and `$$NOW` are, a
+  `$lookup`'s `let` and these bindings are not. Found 2026-10-23 with RM-290.
+  Backlog-ID: RM-293
+  Verify: tests/backlog/test_rm_sbe.py::test_a_variable_bound_from_input_is_not_constant
 
 ### 7.090 `$group` code no test had executed, against mongod -- 2026-10-22
 
