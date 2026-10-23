@@ -146,7 +146,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ----------------------------------------- RP-192 a scan's order is ctid
     "a scan reads rows in ctid order": (
         "RP-192",
-        True,
+        False,
         [
             "create table rp46_q (a int, t text)",
             "insert into rp46_q values (1, 'x'), (2, 'y'), (3, 'z')",

@@ -214,10 +214,14 @@ pub(crate) fn tuple_len(def: &TableDef, doc: &Document) -> usize {
 }
 
 /// One table's pages: `(free bytes, line pointers used)`, and the space a
-/// new tuple must leave free on a page (`fillfactor`).
+/// new tuple must leave free on a page (`fillfactor`). `disordered` once a
+/// tuple's place no longer follows the rows' stored order -- an UPDATE's new
+/// version, a rewrite -- so that a sequential scan must sort by ctid
+/// (RP-192); until then the stored order is the heap's.
 struct Heap {
     pages: Vec<(u32, u32)>,
     reserve: u32,
+    disordered: bool,
 }
 
 impl Heap {
@@ -252,6 +256,7 @@ impl Heap {
 
     /// A new version of the tuple at `old`: its own page while it fits.
     fn update(&mut self, old: Option<i64>, need: u32) -> i64 {
+        self.disordered = true;
         if let Some(block) = old
             .filter(|t| *t >= 0)
             .and_then(|t| usize::try_from(t / 65536).ok())
@@ -296,18 +301,26 @@ impl PgHandler {
 
     /// A table's pages as its stored rows show them: each live tuple's
     /// length on its block, the block's line pointers up to the highest
-    /// offset in use. What a process knows from the rows when it first
-    /// touches a table (after a restart: a dead tuple's space is then free,
-    /// as after a VACUUM).
-    fn derive_heap(&self, table: &str) -> Vec<(u32, u32)> {
+    /// offset in use, and whether the places follow the stored order. What
+    /// a process knows from the rows when it first touches a table (after a
+    /// restart: a dead tuple's space is then free, as after a VACUUM).
+    fn derive_heap(&self, table: &str) -> (Vec<(u32, u32)>, bool) {
         let Some(def) = self.lookup(table) else {
-            return Vec::new();
+            return (Vec::new(), false);
         };
+        let raw = self
+            .storage
+            .find_matching(self.db(), table, &Document::new())
+            .unwrap_or_default();
         let mut pages: Vec<(u32, u32)> = Vec::new();
-        for row in self.table_docs(table).unwrap_or_default() {
+        let mut last = -1;
+        let mut disordered = false;
+        for row in raw.iter().filter_map(|b| crate::decode_doc(b).ok()) {
             let Some(ctid) = ctid_of(&row) else {
                 continue;
             };
+            disordered |= ctid < last;
+            last = ctid;
             let (block, offset) = ((ctid / 65536) as usize, (ctid % 65536) as u32);
             if pages.len() <= block {
                 pages.resize(block + 1, (PAGE_SPACE, 0));
@@ -317,7 +330,7 @@ impl PgHandler {
             page.0 = page.0.saturating_sub(need);
             page.1 = page.1.max(offset);
         }
-        pages
+        (pages, disordered)
     }
 
     /// `BLCKSZ * (100 - fillfactor) / 100`: the bytes an INSERT leaves free
@@ -348,7 +361,7 @@ impl PgHandler {
     /// REPEATABLE READ snapshot). One writer at a time, as a page's buffer
     /// lock makes it.
     fn with_heap<T>(&self, table: &str, f: impl FnOnce(&mut Heap) -> T) -> PgWireResult<T> {
-        type Heaps = std::collections::HashMap<(usize, String), Vec<(u32, u32)>>;
+        type Heaps = std::collections::HashMap<(usize, String), (Vec<(u32, u32)>, bool)>;
         static HEAPS: std::sync::OnceLock<std::sync::Mutex<Heaps>> = std::sync::OnceLock::new();
         let key = (
             std::sync::Arc::as_ptr(&self.storage) as usize,
@@ -366,21 +379,40 @@ impl PgHandler {
             .get_or_init(Default::default)
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let pages = all
+        let state = all
             .entry(key)
             .or_insert_with(|| derived.unwrap_or_default());
         let mut heap = Heap {
-            pages: std::mem::take(pages),
+            pages: std::mem::take(&mut state.0),
             reserve,
+            disordered: state.1,
         };
         let out = f(&mut heap);
-        *pages = heap.pages;
+        *state = (heap.pages, heap.disordered);
         Ok(out)
     }
 
-    /// A TRUNCATE (or a table rewrite) starts the heap again.
+    /// A TRUNCATE starts the heap again.
     pub(crate) fn reset_heap(&self, table: &str) -> PgWireResult<()> {
-        self.with_heap(table, |h| h.pages.clear())
+        self.with_heap(table, |h| {
+            h.pages.clear();
+            h.disordered = false;
+        })
+    }
+
+    /// Must a sequential scan of `table` sort its stored rows by ctid to
+    /// read them in heap order? Only once a tuple has moved (see `Heap`). A
+    /// partitioned table's rows are in its leaves' heaps, each with places
+    /// of its own, so a ctid does not order them across leaves.
+    pub(crate) fn heap_scan_disordered(&self, table: &str) -> bool {
+        if table.starts_with("__") || Self::virtual_table(table).is_some() {
+            return false;
+        }
+        match self.lookup(table) {
+            Some(def) if !crate::partition::is_partitioned(&def) => {}
+            _ => return false,
+        }
+        self.with_heap(table, |h| h.disordered).unwrap_or(false)
     }
 
     fn pid(&self) -> i32 {
@@ -500,6 +532,8 @@ impl PgHandler {
                 .collect();
             let ctids = self.with_heap(&heap_table, |heap| {
                 heap.pages.clear();
+                // CLUSTER's order is an index's, not the stored one.
+                heap.disordered = true;
                 needs.iter().map(|n| heap.insert(*n)).collect::<Vec<_>>()
             })?;
             for (i, ctid) in idx.into_iter().zip(ctids) {
@@ -573,6 +607,30 @@ pub(crate) fn stamp(doc: &mut Document, xmin: i64, cid: i64, ctid: i64) {
     doc.insert("__sys_ctid", Bson::Int64(ctid));
 }
 
+/// Stored rows in heap order, as a sequential scan reads them: by ctid,
+/// a row without one (written before ctids were kept) first.
+pub(crate) fn in_ctid_order(mut rows: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    rows.sort_by_cached_key(|b| {
+        bson::RawDocument::from_bytes(b)
+            .ok()
+            .and_then(|d| d.get_i64("__sys_ctid").ok())
+            .unwrap_or(-1)
+    });
+    rows
+}
+
+/// The sort key that reads rows in heap order (`in_ctid_order`), for a
+/// streamed scan's bounded-memory sort.
+pub(crate) fn ctid_order_key() -> secantus_pgplan::OrderKey {
+    secantus_pgplan::OrderKey {
+        field: "__sys_ctid".to_string(),
+        ascending: true,
+        nulls: secantus_pgplan::Nulls::First,
+        jsonb: false,
+        expr: None,
+    }
+}
+
 /// A stored row's ctid, if it was stamped.
 pub(crate) fn ctid_of(doc: &Document) -> Option<i64> {
     match doc.get("__sys_ctid")? {
@@ -603,6 +661,7 @@ mod tests {
         let mut heap = Heap {
             pages: Vec::new(),
             reserve: 0,
+            disordered: false,
         };
         let ctids: Vec<i64> = (1..=200).map(|_| heap.insert(need)).collect();
         let tid = |b: i64, o: i64| b * 65536 + o;
@@ -617,5 +676,30 @@ mod tests {
         assert_eq!(tuple_len(&def, &bson::doc! {"a": 1}), 32);
         assert_eq!(numeric_bytes("1.50"), 6);
         assert_eq!(numeric_bytes("0"), 2);
+    }
+
+    /// An UPDATE moves a tuple out of the stored order; a scan then sorts
+    /// by ctid, a row without one first.
+    #[test]
+    fn an_update_disorders_the_heap() {
+        let mut heap = Heap {
+            pages: Vec::new(),
+            reserve: 0,
+            disordered: false,
+        };
+        let first = heap.insert(32);
+        heap.insert(32);
+        assert!(!heap.disordered);
+        assert_eq!(heap.update(Some(first), 32), 3);
+        assert!(heap.disordered);
+        let row = |ctid: Option<i64>| {
+            let mut d = bson::doc! {"a": 1};
+            if let Some(c) = ctid {
+                d.insert("__sys_ctid", c);
+            }
+            bson::to_vec(&d).unwrap()
+        };
+        let sorted = in_ctid_order(vec![row(Some(3)), row(Some(2)), row(None)]);
+        assert_eq!(sorted, vec![row(None), row(Some(2)), row(Some(3))]);
     }
 }

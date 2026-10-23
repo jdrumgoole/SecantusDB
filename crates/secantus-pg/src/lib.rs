@@ -6276,7 +6276,8 @@ impl PgHandler {
             .storage
             .find_matching(self.db(), table, &Document::new())
             .map_err(|e| Self::storage_err("could not read", e))?;
-        raw.iter()
+        self.in_scan_order(table, &Document::new(), raw)
+            .iter()
             .map(|b| decode_doc(b).map_err(|e| Self::storage_err("could not decode a row", e)))
             .collect()
     }
@@ -6309,12 +6310,32 @@ impl PgHandler {
                 },
             );
             if let Some(rows) = rows {
-                return Ok(rows);
+                return Ok(self.in_scan_order(table, filter, rows));
             }
         }
-        self.storage
+        let rows = self
+            .storage
             .find_matching(self.db(), table, filter)
-            .map_err(|e| Self::storage_err("could not read", e))
+            .map_err(|e| Self::storage_err("could not read", e))?;
+        Ok(self.in_scan_order(table, filter, rows))
+    }
+
+    /// `rows` in the order PostgreSQL's scan returns them: a sequential
+    /// scan reads the heap in ctid order (RP-192); an index scan keeps the
+    /// index's.
+    fn in_scan_order(&self, table: &str, filter: &Document, rows: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        if self.heap_scan_disordered(table) && self.collection_scan(table, filter) {
+            return heap::in_ctid_order(rows);
+        }
+        rows
+    }
+
+    /// Does the storage answer `filter` over `table` by a collection scan?
+    pub(crate) fn collection_scan(&self, table: &str, filter: &Document) -> bool {
+        matches!(
+            self.storage.explain_plan(self.db(), table, filter),
+            Ok(secantus_storage::ExplainPlan::CollScan)
+        )
     }
 
     /// Materialise a joined subquery's rows, keyed by its OUTPUT names.
@@ -47560,31 +47581,19 @@ impl PgHandler {
             }
             true
         };
-        let scanned = if let Some(feed) = join {
+        // The table a batch at a time, in heap order (`table_batches`).
+        let scanned: PgWireResult<()> = if let Some(feed) = join {
             self.run_join_feed(feed, &mut sink)?;
             Ok(())
-        } else if self.storage.in_user_txn() {
-            let mut after = None;
-            loop {
-                let (blobs, next) = self
-                    .storage
-                    .scan_batch_after(self.db(), &agg.table, &agg.filter, after, 256)
-                    .map_err(|e| Self::storage_err("could not read", e))?;
-                if !sink(stream_join::RowBatch::Blobs(blobs)) || next.is_none() {
-                    break Ok(());
-                }
-                after = next;
-            }
         } else {
-            self.storage
-                .scan_routed_batches(self.db(), &agg.table, &agg.filter, 256, |b| {
-                    sink(stream_join::RowBatch::Blobs(b))
-                })
+            self.table_batches(&agg.table, &agg.filter, &mut |b| {
+                Ok(sink(stream_join::RowBatch::Blobs(b)))
+            })
         };
         if let Some(e) = stopped.or(failed) {
             return Err(e);
         }
-        scanned.map_err(|e| Self::storage_err("could not read", e))?;
+        scanned?;
         // The last (or only) chunk; an empty input still runs once, so each
         // aggregate answers its empty-input value.
         if !chunk.is_empty() || folds.get() == 0 {
@@ -47938,34 +47947,22 @@ impl PgHandler {
                 }
             }
         };
-        let scanned = if join {
+        // The table a batch at a time, in heap order (`table_batches`).
+        let scanned: PgWireResult<()> = if join {
             let Some(mut feed) = self.join_aggregate_source(agg)? else {
                 return Ok(None);
             };
             self.run_join_feed(&mut feed, &mut sink)?;
             Ok(())
-        } else if self.storage.in_user_txn() {
-            let mut after = None;
-            loop {
-                let (blobs, next) = self
-                    .storage
-                    .scan_batch_after(self.db(), &agg.table, &agg.filter, after, 256)
-                    .map_err(|e| Self::storage_err("could not read", e))?;
-                if !sink(stream_join::RowBatch::Blobs(blobs)) || next.is_none() {
-                    break Ok(());
-                }
-                after = next;
-            }
         } else {
-            self.storage
-                .scan_routed_batches(self.db(), &agg.table, &agg.filter, 256, |b| {
-                    sink(stream_join::RowBatch::Blobs(b))
-                })
+            self.table_batches(&agg.table, &agg.filter, &mut |b| {
+                Ok(sink(stream_join::RowBatch::Blobs(b)))
+            })
         };
         if let Some(e) = stopped {
             return Err(e);
         }
-        scanned.map_err(|e| Self::storage_err("could not read", e))?;
+        scanned?;
         if hashing && !hash_over && !hchunk.is_empty() {
             fold_hash(std::mem::take(&mut hchunk), &mut hashed, &mut hash_bytes)?;
         }
@@ -48265,32 +48262,19 @@ impl PgHandler {
                 }
             }
         };
-        let scanned = if let Some(feed) = join {
+        // The table a batch at a time, in heap order (`table_batches`).
+        let scanned: PgWireResult<()> = if let Some(feed) = join {
             self.run_join_feed(feed, &mut sink)?;
             Ok(())
-        } else if self.storage.in_user_txn() {
-            // Through the block's transaction, a batch at a time.
-            let mut after = None;
-            loop {
-                let (blobs, next) = self
-                    .storage
-                    .scan_batch_after(self.db(), &agg.table, &agg.filter, after, 256)
-                    .map_err(|e| Self::storage_err("could not read", e))?;
-                if !sink(stream_join::RowBatch::Blobs(blobs)) || next.is_none() {
-                    break Ok(());
-                }
-                after = next;
-            }
         } else {
-            self.storage
-                .scan_routed_batches(self.db(), &agg.table, &agg.filter, 256, |b| {
-                    sink(stream_join::RowBatch::Blobs(b))
-                })
+            self.table_batches(&agg.table, &agg.filter, &mut |b| {
+                Ok(sink(stream_join::RowBatch::Blobs(b)))
+            })
         };
         if let Some(e) = stopped.or(failed) {
             return Err(e);
         }
-        scanned.map_err(|e| Self::storage_err("could not read", e))?;
+        scanned?;
         if let Some(e) = sort_err {
             return Err(Self::user_error("XX000", format!("could not sort: {e}")));
         }

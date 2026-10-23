@@ -770,20 +770,10 @@ fixed in the same batch; their tests there are regression tests.
 
 Found while building the system columns (RP-069). The gap tests are
 scenarios in `tests/backlog/test_rp_batch46.py`, measured on a private 15.19
-cluster. RP-194 was found and fixed in the same batch; its test there is a
-regression test.
+cluster. RP-194 was found and fixed in the same batch, and RP-192 in batch
+47; their tests there are regression tests. RP-193's HOT scenario is in
+`tests/backlog/test_rp_batch47.py`.
 
-- [ ] **A scan does not read rows in ctid order.** Each row now carries
-      PostgreSQL's `ctid` (`crates/secantus-pg/src/heap.rs`), but a
-      sequential scan here returns rows in the order they were inserted,
-      where PostgreSQL's returns them in heap (ctid) order. After `update t
-      set ... where a = 2` over rows 1, 2, 3, PostgreSQL reads 1, 3, 2 (the
-      new version is the page's last tuple) and this server 1, 2, 3. The
-      fix is the table scan ordered by `__sys_ctid`; it moves the input
-      order every order-dependent answer (an unordered SELECT, `LIMIT`
-      without `ORDER BY`, the HashAggregate model) is computed over.
-      Backlog-ID: RP-192
-      Verify: tests/backlog/test_rp_batch46.py::test_scenario[a scan reads rows in ctid order]
 - [ ] **VACUUM frees no tuple's place.** A plain VACUUM here records its
       statistics but leaves a dead tuple's space and line pointer taken, so
       the next INSERT goes after it; PostgreSQL 15.19's VACUUM frees both,
@@ -793,9 +783,13 @@ regression test.
       restart: the heap's free space is kept in the server process
       (`heap.rs`) and derived from the live rows' ctids when a process first
       touches a table, so a dead tuple's space is free again after a
-      restart, where PostgreSQL keeps it until VACUUM.
+      restart, where PostgreSQL keeps it until VACUUM. A HOT update's new
+      version is reached through its chain's root, so a bitmap heap scan
+      (PostgreSQL's plan for a primary-key range) reads it at the root's
+      place: rows 3, 1, 2 at (0,1), (0,2) -> (0,4), (0,3) come back 3, 1, 2,
+      where this server, reading in ctid order, returns 3, 2, 1.
       Backlog-ID: RP-193
-      Verify: tests/backlog/test_rp_batch46.py::test_scenario[VACUUM frees a dead tuple's place]
+      Verify: tests/backlog/test_rp_batch46.py::test_scenario[VACUUM frees a dead tuple's place], tests/backlog/test_rp_batch47.py::test_scenario[a bitmap heap scan reads a HOT-updated row at its root]
 
 ## Found by batch 34 (2026-10-23)
 
