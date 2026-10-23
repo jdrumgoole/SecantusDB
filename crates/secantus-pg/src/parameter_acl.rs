@@ -151,7 +151,7 @@ impl PgHandler {
     }
 
     /// The bootstrap superuser, who owns every parameter.
-    fn bootstrap_role_name() -> String {
+    pub(crate) fn bootstrap_role_name() -> String {
         RoleInfo::bootstrap().name
     }
 

@@ -37,9 +37,22 @@ pub(crate) fn rows(name: &str, def: &TableDef) -> Vec<Document> {
     let Some(catalog) = secantus_pgplan::ts_catalog::catalog(name) else {
         return Vec::new();
     };
+    // A built-in configuration the database changed or dropped: its own
+    // row (among the user rows) stands for it, or nothing does.
+    let config_column = match name {
+        "pg_ts_config" => catalog.columns.iter().position(|c| *c == "oid"),
+        "pg_ts_config_map" => catalog.columns.iter().position(|c| *c == "mapcfg"),
+        _ => None,
+    };
     catalog
         .rows
         .iter()
+        .filter(|row| {
+            config_column
+                .and_then(|i| row.get(i).copied().flatten())
+                .and_then(|v| v.parse::<i64>().ok())
+                .is_none_or(|oid| !secantus_pgplan::ts_catalog::builtin_hidden(oid))
+        })
         .map(|row| {
             let mut d = Document::new();
             for (column, value) in catalog.columns.iter().zip(row) {

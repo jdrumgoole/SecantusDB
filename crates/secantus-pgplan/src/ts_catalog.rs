@@ -67,11 +67,40 @@ pub struct UserConfig {
 
 thread_local! {
     static USER_CONFIGS: RefCell<Rc<Vec<UserConfig>>> = RefCell::new(Rc::new(Vec::new()));
+    static DROPPED_BUILTINS: RefCell<Rc<Vec<i64>>> = RefCell::new(Rc::new(Vec::new()));
 }
 
 /// Install the database's configurations for the statements that follow.
+/// A built-in one a statement changed is among them under its own oid,
+/// and hides the dumped row; `dropped` lists the built-in ones a DROP took.
 pub fn set_user_configs(configs: Vec<UserConfig>) {
     USER_CONFIGS.with(|c| *c.borrow_mut() = Rc::new(configs));
+}
+
+/// Install the built-in configurations the database has dropped.
+pub fn set_dropped_builtins(dropped: Vec<i64>) {
+    DROPPED_BUILTINS.with(|c| *c.borrow_mut() = Rc::new(dropped));
+}
+
+/// Is the built-in configuration `oid` no longer the dumped row: changed
+/// (the database's own row stands for it) or dropped?
+pub fn builtin_hidden(oid: i64) -> bool {
+    user_configs().iter().any(|c| c.oid == oid)
+        || DROPPED_BUILTINS.with(|d| d.borrow().contains(&oid))
+}
+
+/// Is `oid` one of `initdb`'s configurations?
+pub fn is_builtin_config(oid: i64) -> bool {
+    builtin_names(false).iter().any(|(o, _)| *o == oid)
+}
+
+/// A built-in configuration's dumped row: `(name, map)`.
+pub fn builtin_config(oid: i64) -> Option<(String, ConfigMap)> {
+    let (_, name) = builtin_names(false).iter().find(|(o, _)| *o == oid)?;
+    Some((
+        (*name).to_string(),
+        builtin_maps().get(&oid).cloned().unwrap_or_default(),
+    ))
 }
 
 /// The installed configurations.
@@ -143,16 +172,19 @@ fn builtin_maps() -> &'static HashMap<i64, ConfigMap> {
 /// A configuration's map: `(token type, seqno, dictionary)`, or `None` for
 /// no configuration.
 pub fn map_of(oid: i64) -> Option<Vec<(i32, i32, i64)>> {
+    if let Some(c) = user_configs().iter().find(|c| c.oid == oid) {
+        return Some(c.map.clone());
+    }
+    if builtin_hidden(oid) {
+        return None;
+    }
     if let Some(m) = builtin_maps().get(&oid) {
         return Some(m.clone());
     }
-    if builtin_names(false).iter().any(|(o, _)| *o == oid) {
-        return Some(Vec::new());
-    }
-    user_configs()
+    builtin_names(false)
         .iter()
-        .find(|c| c.oid == oid)
-        .map(|c| c.map.clone())
+        .any(|(o, _)| *o == oid)
+        .then(Vec::new)
 }
 
 /// The dictionaries a configuration offers a token of type `toktype`, in
@@ -171,16 +203,18 @@ pub fn dictionaries_for(cfg: i64, toktype: i32) -> Vec<i64> {
 /// A configuration's (or, with `dict`, a dictionary's) schema and name by
 /// oid.
 pub fn schema_and_name(oid: i64, dict: bool) -> Option<(String, String)> {
-    if let Some((_, n)) = builtin_names(dict).iter().find(|(o, _)| *o == oid) {
-        return Some(("pg_catalog".into(), (*n).to_string()));
+    if !dict {
+        if let Some(c) = user_configs().iter().find(|c| c.oid == oid) {
+            return Some((c.schema.clone(), c.name.clone()));
+        }
+        if builtin_hidden(oid) {
+            return None;
+        }
     }
-    if dict {
-        return None;
-    }
-    user_configs()
+    builtin_names(dict)
         .iter()
-        .find(|c| c.oid == oid)
-        .map(|c| (c.schema.clone(), c.name.clone()))
+        .find(|(o, _)| *o == oid)
+        .map(|(_, n)| ("pg_catalog".into(), (*n).to_string()))
 }
 
 /// A configuration's (or dictionary's) name by oid.
@@ -254,7 +288,10 @@ fn name_parts(input: &str) -> Vec<String> {
 /// The configuration (or dictionary) `name` in `schema`.
 pub fn oid_in(schema: &str, name: &str, dict: bool) -> Option<i64> {
     if schema == "pg_catalog" {
-        if let Some((o, _)) = builtin_names(dict).iter().find(|(_, n)| *n == name) {
+        if let Some((o, _)) = builtin_names(dict)
+            .iter()
+            .find(|(o, n)| *n == name && (dict || !builtin_hidden(*o)))
+        {
             return Some(*o);
         }
     }
