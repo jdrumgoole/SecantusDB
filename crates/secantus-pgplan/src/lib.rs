@@ -3571,6 +3571,16 @@ fn extension_of_function(name: &str) -> Option<&'static str> {
 /// that schema, qualified only with it (`pg_catalog.similarity` is 42883).
 /// PostgreSQL 15.19 measured.
 fn refuse_invisible_extension_functions(node: &N) -> Result<()> {
+    // A walk of the whole statement, so only when an extension that brings
+    // functions is installed -- and a cancellation point first, as between
+    // every pass (a 200,000-item `IN` list walks for a while).
+    if !["pg_trgm", "pgcrypto", "hstore", "postgis", "citext"]
+        .iter()
+        .any(|e| extension_installed(e))
+    {
+        return Ok(());
+    }
+    cancel::check()?;
     for (n, _, _, _) in node.nodes() {
         let pg_query::NodeRef::FuncCall(f) = n else {
             continue;
