@@ -87,7 +87,7 @@ impl PgHandler {
                 let coll = if collatable { DEFAULT_COLLATION } else { 0 };
                 let mut d = Document::new();
                 d.insert(f("starelid"), Bson::Int64(rel));
-                d.insert(f("staattnum"), Bson::Int32(i as i32 + 1));
+                d.insert(f("staattnum"), Bson::Int32(i32::from(t.attnum(i))));
                 d.insert(f("stainherit"), false);
                 d.insert(
                     f("stanullfrac"),

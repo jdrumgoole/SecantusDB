@@ -4502,6 +4502,22 @@ fn plan_query_node(
     cancel::check()?;
     materialize_recursive_ctes(&mut node, lookup, &mut params, run)?;
     cancel::check()?;
+    // Which FROM subqueries are views is the statement's own: an earlier
+    // statement's view alias names nothing here. (A subquery this
+    // statement plans comes back through here, nested, and keeps them.)
+    thread_local! {
+        static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    struct Nested;
+    impl Drop for Nested {
+        fn drop(&mut self) {
+            DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        }
+    }
+    if DEPTH.with(|d| d.replace(d.get() + 1)) == 0 {
+        EXPANDED_VIEWS.with(|e| e.borrow_mut().clear());
+    }
+    let _nested = Nested;
     // Views expand BEFORE subqueries resolve: a view's body may hold a
     // (correlated) subquery, which the resolver has to see.
     if let Some(N::SelectStmt(s)) = node.node.as_mut() {
@@ -7708,11 +7724,13 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
         }
         AlterTableAction::AddColumn { column, .. } => {
             if def.column(&column.name).is_none() {
-                def.columns.push(column.clone());
+                def.push_column(column.clone());
             }
         }
         AlterTableAction::DropColumn { name, .. } => {
-            def.columns.retain(|c| c.name != *name);
+            if let Some(i) = def.columns.iter().position(|c| c.name == *name) {
+                def.drop_column_at(i);
+            }
             // A constraint over the dropped column goes with it, which is what
             // PostgreSQL does for a CHECK naming only that column.
             def.check_constraints
@@ -33442,6 +33460,17 @@ fn whole_row_rewrite(
                         slot.clone_from(&sv.sval);
                     }
                 }
+            }
+            // A view expanded to this subquery: its row type is the view's.
+            let view = EXPANDED_VIEWS.with(|e| {
+                e.borrow()
+                    .iter()
+                    .rev()
+                    .find(|(a, _)| *a == alias)
+                    .map(|(_, v)| v.clone())
+            });
+            if let Some(view) = view.filter(|v| user_composite(v).is_some()) {
+                rowtype = Some(view);
             }
             (alias, cols)
         }
