@@ -59,6 +59,7 @@ mod event_triggers;
 mod explain;
 mod expr_index;
 mod external_sort;
+mod extstats;
 mod fdw;
 mod fsm;
 mod grace_join;
@@ -5142,6 +5143,7 @@ impl PgHandler {
         secantus_pgplan::set_view_defs_marked(self.view_defs_as(2));
         secantus_pgplan::set_index_defs(self.index_defs());
         secantus_pgplan::set_trigger_defs(self.trigger_defs());
+        secantus_pgplan::set_statistics_defs(self.statistics_defs());
         let mut sigs = self.function_sigs();
         // A range's constructors, as `\df` prints them.
         for (oid, _, args, ret, _, _, variadic) in self.range_constructors() {
@@ -14403,7 +14405,6 @@ impl PgHandler {
     /// unmodelled entirely (`statistics`). An empty table keeps the
     /// statistics it had, as ANALYZE computes none from no rows.
     fn record_analyze(&self, table: &str, columns: &[String]) -> PgWireResult<()> {
-        use secantus_pgplan::hashagg;
         let Some(def) = self.lookup(table) else {
             return Ok(());
         };
@@ -14415,6 +14416,11 @@ impl PgHandler {
             .get("default_statistics_target")
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(100);
+        // The extended statistics on the table (RP-099), over the whole
+        // table while it fits ANALYZE's sample, whatever its columns' types.
+        if docs.len() as u64 <= 300 * target {
+            self.build_extended_statistics(table, &def, &docs, columns, target as usize)?;
+        }
         if self.heap_pages(table, &def).is_none() {
             return self.record_relstats(table, true);
         }
@@ -14435,51 +14441,9 @@ impl PgHandler {
                 if !columns.is_empty() && !columns.iter().any(|n| n == &c.name) {
                     continue;
                 }
-                let typlen = secantus_pgplan::pgtypes::oid_of_name(&c.pg_type)
-                    .and_then(|oid| pg_type_facts::builtin(oid, "typlen"))
-                    .and_then(|v| match v {
-                        Bson::Int32(n) => Some(i64::from(n)),
-                        Bson::Int64(n) => Some(n),
-                        _ => None,
-                    })
-                    .unwrap_or(-1);
                 let field = c.field();
-                let values: Option<Vec<hashagg::Sampled>> = docs
-                    .iter()
-                    .map(|d| Self::analyze_sample(c, d.get(&field)))
-                    .collect();
-                let mut entry = bson::doc! {"name": &c.name, "type": &c.pg_type};
-                match values {
-                    Some(values) => {
-                        let s = hashagg::analyze_column(&values, typlen);
-                        entry.insert("null_frac", f64::from(s.null_frac));
-                        entry.insert("distinct", f64::from(s.distinct));
-                        entry.insert("width", s.width);
-                        let slots =
-                            secantus_pgplan::colstats::scalar_slots(&values, target as usize);
-                        let bin = |k: &[u8]| {
-                            Bson::Binary(bson::Binary {
-                                subtype: bson::spec::BinarySubtype::Generic,
-                                bytes: k.to_vec(),
-                            })
-                        };
-                        let mcv: Vec<Bson> = slots
-                            .mcv
-                            .iter()
-                            .map(|(k, f)| Bson::Array(vec![bin(k), Bson::Double(f64::from(*f))]))
-                            .collect();
-                        entry.insert("mcv", mcv);
-                        entry.insert("mcv_complete", slots.mcv_complete);
-                        let hist: Vec<Bson> = slots.histogram.iter().map(|k| bin(k)).collect();
-                        entry.insert("histogram", hist);
-                        if let Some(c) = slots.correlation {
-                            entry.insert("correlation", f64::from(c));
-                        }
-                    }
-                    None => {
-                        entry.insert("unmodelled", true);
-                    }
-                }
+                let values: Vec<Option<&Bson>> = docs.iter().map(|d| d.get(&field)).collect();
+                let entry = Self::stats_entry(c, &values, target as usize, false);
                 stats.insert(field, entry);
             }
         }
@@ -14497,6 +14461,65 @@ impl PgHandler {
             doc.insert("statistics", true);
         }
         self.put_comment_doc(Self::RELSTATS_COLLECTION, table, Some(doc))
+    }
+
+    /// What ANALYZE records of one column's (or expression's) sampled
+    /// `values` (`compute_scalar_stats`): its null fraction, distinct
+    /// count, width, most common values, histogram and correlation, or
+    /// `unmodelled` when its type's equality is not modelled here.
+    /// `computed` values are an expression's, each varlena with a 4-byte
+    /// header, where a stored one up to 126 bytes has a 1-byte one.
+    pub(crate) fn stats_entry(
+        c: &secantus_pgcatalog::Column,
+        values: &[Option<&Bson>],
+        target: usize,
+        computed: bool,
+    ) -> Document {
+        use secantus_pgplan::hashagg;
+        let typlen = secantus_pgplan::pgtypes::oid_of_name(&c.pg_type)
+            .and_then(|oid| pg_type_facts::builtin(oid, "typlen"))
+            .and_then(|v| match v {
+                Bson::Int32(n) => Some(i64::from(n)),
+                Bson::Int64(n) => Some(n),
+                _ => None,
+            })
+            .unwrap_or(-1);
+        let values: Option<Vec<hashagg::Sampled>> = values
+            .iter()
+            .map(|v| Self::analyze_sample(c, *v, computed))
+            .collect();
+        let mut entry = bson::doc! {"name": &c.name, "type": &c.pg_type};
+        match values {
+            Some(values) => {
+                let s = hashagg::analyze_column(&values, typlen);
+                entry.insert("null_frac", f64::from(s.null_frac));
+                entry.insert("distinct", f64::from(s.distinct));
+                entry.insert("width", s.width);
+                let slots = secantus_pgplan::colstats::scalar_slots(&values, target);
+                let bin = |k: &[u8]| {
+                    Bson::Binary(bson::Binary {
+                        subtype: bson::spec::BinarySubtype::Generic,
+                        bytes: k.to_vec(),
+                    })
+                };
+                let mcv: Vec<Bson> = slots
+                    .mcv
+                    .iter()
+                    .map(|(k, f)| Bson::Array(vec![bin(k), Bson::Double(f64::from(*f))]))
+                    .collect();
+                entry.insert("mcv", mcv);
+                entry.insert("mcv_complete", slots.mcv_complete);
+                let hist: Vec<Bson> = slots.histogram.iter().map(|k| bin(k)).collect();
+                entry.insert("histogram", hist);
+                if let Some(c) = slots.correlation {
+                    entry.insert("correlation", f64::from(c));
+                }
+            }
+            None => {
+                entry.insert("unmodelled", true);
+            }
+        }
+        entry
     }
 
     /// The most common values, histogram and correlation `record_analyze`
@@ -14539,13 +14562,18 @@ impl PgHandler {
     fn analyze_sample(
         c: &secantus_pgcatalog::Column,
         v: Option<&Bson>,
+        computed: bool,
     ) -> Option<secantus_pgplan::hashagg::Sampled> {
         let v = match v {
             None | Some(Bson::Null) => return Some(None),
             Some(v) => v,
         };
         let varlena = |bytes: &[u8], len: usize| {
-            let size = if len < 127 { len + 1 } else { len + 4 };
+            let size = if len < 127 && !computed {
+                len + 1
+            } else {
+                len + 4
+            };
             (len + 4 <= 1024).then(|| Some((bytes.to_vec(), size)))
         };
         match (c.pg_type.trim_start_matches("pg_catalog."), v) {
@@ -31489,7 +31517,7 @@ impl PgHandler {
     }
 
     /// Raise a WARNING for the statement in flight (sent as `notice` is).
-    fn warning(&self, sqlstate: &str, message: String) {
+    pub(crate) fn warning(&self, sqlstate: &str, message: String) {
         self.pending_notices
             .lock()
             .unwrap_or_else(|e| e.into_inner())

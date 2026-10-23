@@ -95,6 +95,7 @@ mod enum_order;
 mod errpos;
 pub mod escape_strings;
 pub mod event_triggers;
+pub mod extstats;
 pub mod fdw;
 pub mod formatting;
 pub mod fts;
@@ -8940,6 +8941,21 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// `(statistics object oid, pg_get_statisticsobjdef text, its column and
+/// expression list, its expressions)`.
+pub type StatisticsDef = (i64, String, String, Vec<String>);
+
+thread_local! {
+    /// Each statistics object's definition, published with the catalog.
+    static STATISTICS_DEFS: std::cell::RefCell<Vec<StatisticsDef>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install what `pg_get_statisticsobjdef` and its siblings answer from.
+pub fn set_statistics_defs(defs: Vec<StatisticsDef>) {
+    STATISTICS_DEFS.with(|d| *d.borrow_mut() = defs);
+}
+
 thread_local! {
     /// `(trigger oid, pg_get_triggerdef text)`, published with the catalog.
     static TRIGGER_DEFS: std::cell::RefCell<Vec<(i64, String)>> =
@@ -12470,6 +12486,7 @@ pub(crate) fn simplify_exists(s: &mut pg_query::protobuf::SelectStmt) {
         "pg_get_keywords",
         "aclexplode",
         "pg_options_to_table",
+        "pg_mcv_list_items",
         "txid_snapshot_xip",
         "pg_snapshot_xip",
         "pg_listening_channels",
@@ -13814,6 +13831,28 @@ fn srf_rows(
                 ],
                 vec!["oid".into(), "oid".into(), "text".into(), "bool".into()],
                 rows,
+            )));
+        }
+        // `pg_mcv_list_items(pg_mcv_list)`: an MCV list's items
+        // (`extstats::mcv_list_rows`).
+        "pg_mcv_list_items" => {
+            let a = args(1)?;
+            return Ok(Some((
+                vec![
+                    "index".into(),
+                    "values".into(),
+                    "nulls".into(),
+                    "frequency".into(),
+                    "base_frequency".into(),
+                ],
+                vec![
+                    "int4".into(),
+                    "text[]".into(),
+                    "bool[]".into(),
+                    "float8".into(),
+                    "float8".into(),
+                ],
+                extstats::mcv_list_rows(&a[0])?,
             )));
         }
         // `pg_options_to_table(text[])`: each `name=value` split at its
@@ -24450,6 +24489,11 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
             "int4".to_string()
         }
         Some(N::FuncCall(f))
+            if func_name(f).as_deref() == Some("pg_get_statisticsobjdef_expressions") =>
+        {
+            "text[]".to_string()
+        }
+        Some(N::FuncCall(f))
             if matches!(
                 func_name(f).as_deref(),
                 Some(
@@ -24458,6 +24502,8 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                         | "pg_get_indexdef"
                         | "pg_get_triggerdef"
                         | "pg_get_partkeydef"
+                        | "pg_get_statisticsobjdef"
+                        | "pg_get_statisticsobjdef_columns"
                         | "pg_get_function_arguments"
                         | "pg_get_function_identity_arguments"
                         | "pg_get_function_result"
@@ -26241,6 +26287,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     || name == "pg_get_indexdef"
                     || name == "pg_get_triggerdef"
                     || name == "pg_get_partkeydef"
+                    || name.starts_with("pg_get_statisticsobjdef")
                     || name == "pg_get_function_arguments"
                     || name == "pg_get_function_identity_arguments"
                     || name == "pg_get_function_result"
@@ -30320,6 +30367,15 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
                     prev = Some(target);
                     continue;
                 }
+                // `float4out`: a real is printed as the single precision value
+                // it is, not as the double it is kept in (RP-198).
+                if let Some(real @ ("float4" | "real" | "float4[]" | "real[]")) = from.as_deref() {
+                    if is_string_type(target) && v != Bson::Null {
+                        v = cast_value(Bson::String(typeout::cast_text(&v, real)), target)?;
+                        prev = Some(target);
+                        continue;
+                    }
+                }
                 // `array_out` prints an inet / cidr element with `inet_out`.
                 if let Some(net @ ("inet[]" | "cidr[]")) = from.as_deref() {
                     if is_string_type(target) && matches!(v, Bson::Array(_)) {
@@ -31971,6 +32027,9 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
     ) {
         return match value {
             Bson::Null => Ok(Bson::Null),
+            // An MCV list read from `pg_statistic_ext_data` is one already
+            // (its bytes); no literal is.
+            v @ Bson::Binary(_) if target == "pg_mcv_list" => Ok(v),
             _ => Err(Error::FeatureNotSupported(format!(
                 "cannot accept a value of type {target}"
             ))),
@@ -38625,6 +38684,38 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                     })
                     .map_or(Bson::Null, Bson::String)
             }));
+        }
+        // `pg_get_statisticsobjdef(oid)` and its `_columns` /
+        // `_expressions` siblings: the CREATE STATISTICS, its column and
+        // expression list, its expressions (NULL with none); NULL for an
+        // oid no statistics object has.
+        if let Some(which) = func_name(f).as_deref().and_then(|n| {
+            n.strip_prefix("pg_get_statisticsobjdef")
+                .filter(|w| matches!(*w, "" | "_columns" | "_expressions"))
+                .map(str::to_string)
+        }) {
+            if f.args.len() == 1
+                && !correlated::user_function_named(&format!("pg_get_statisticsobjdef{which}"))
+            {
+                let oid = match const_value(&f.args[0], params)? {
+                    Bson::Int32(i) => i64::from(i),
+                    Bson::Int64(i) => i,
+                    Bson::Null => return Ok(Bson::Null),
+                    Bson::String(t) => t.trim().parse().unwrap_or(-1),
+                    _ => -1,
+                };
+                return Ok(STATISTICS_DEFS.with(|d| {
+                    d.borrow().iter().find(|(o, ..)| *o == oid).map_or(
+                        Bson::Null,
+                        |(_, def, cols, exprs)| match which.as_str() {
+                            "" => Bson::String(def.clone()),
+                            "_columns" => Bson::String(cols.clone()),
+                            _ if exprs.is_empty() => Bson::Null,
+                            _ => Bson::Array(exprs.iter().cloned().map(Bson::String).collect()),
+                        },
+                    )
+                }));
+            }
         }
         // `pg_get_partkeydef(table)`: `LIST (k)`, `RANGE (a, b)`; NULL for a
         // table that is not partitioned.

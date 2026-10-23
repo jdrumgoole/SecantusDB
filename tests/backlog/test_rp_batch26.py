@@ -539,7 +539,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "ANALYZE computes extended statistics": (
         "RP-099",
-        True,
+        False,
         [
             "create table rp30_e (a int, b int)",
             "insert into rp30_e select g % 4, g % 2 from generate_series(1, 40) g",

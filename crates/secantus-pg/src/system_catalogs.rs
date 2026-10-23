@@ -81,6 +81,9 @@ const STATEFUL: &[&str] = &[
     "pg_parameter_acl",
     "pg_config",
     "pg_statistic",
+    "pg_statistic_ext_data",
+    "pg_stats_ext",
+    "pg_stats_ext_exprs",
 ];
 
 /// The extensions `CREATE EXTENSION` installs here, with their control files'
@@ -286,6 +289,9 @@ impl PgHandler {
             "pg_ident_file_mappings" => self.ident_file_mapping_rows(def),
             "pg_config" => self.pg_config_rows(def),
             "pg_statistic" => self.pg_statistic_rows(def),
+            "pg_statistic_ext_data" => self.statistic_ext_data_rows(def),
+            "pg_stats_ext" => self.stats_ext_rows(def),
+            "pg_stats_ext_exprs" => self.stats_ext_exprs_rows(def),
             "pg_file_settings" => self.file_setting_rows(def),
             "pg_parameter_acl" => self.parameter_acl_rows(def),
             // Recovery conflicts arise only on a standby: every database's

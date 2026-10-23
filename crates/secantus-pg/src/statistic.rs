@@ -19,7 +19,7 @@ const DEFAULT_COLLATION: i64 = 100;
 
 /// A type's `=` and `<` operators (its default B-tree opclass), and
 /// whether it is collatable.
-fn operators(pg_type: &str) -> Option<(i64, i64, bool)> {
+pub(crate) fn operators(pg_type: &str) -> Option<(i64, i64, bool)> {
     Some(match pg_type.trim_start_matches("pg_catalog.") {
         "int2" => (94, 95, false),
         "int4" => (96, 97, false),
@@ -34,7 +34,7 @@ fn operators(pg_type: &str) -> Option<(i64, i64, bool)> {
 }
 
 /// A key `analyze_sample` made, as the column's value again.
-fn value_of(key: &[u8], c: &secantus_pgcatalog::Column) -> Option<Bson> {
+pub(crate) fn value_of(key: &[u8], c: &secantus_pgcatalog::Column) -> Option<Bson> {
     Some(match c.pg_type.trim_start_matches("pg_catalog.") {
         "int2" | "int4" => Bson::Int32(secantus_pgplan::colstats::int_of_key(key)? as i32),
         "int8" => Bson::Int64(secantus_pgplan::colstats::int_of_key(key)?),

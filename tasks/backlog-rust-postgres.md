@@ -768,6 +768,14 @@ fixed in the same batch; their tests there are regression tests.
       Backlog-ID: RP-137
       Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order], tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]
 
+## Found by batch 50 (2026-10-23)
+
+Found while building extended statistics (RP-099). RP-197
+(`pg_get_statisticsobjdef` and its siblings were refused) and RP-198 (a
+`real` cast to text printed as the double it is kept in) were found and
+fixed in the same batch; their tests in `tests/backlog/test_rp_batch50.py`
+are regression tests.
+
 ## Found by batch 48 (2026-10-23)
 
 Found while building VACUUM and the free space map (RP-193). The gap tests
@@ -835,15 +843,21 @@ as they do against PostgreSQL 15.19 (RP-070, RP-071). The gap tests are
 scenarios in `tests/backlog/test_rp_batch26.py`, measured on a private 15.19
 cluster.
 
-- [ ] **ANALYZE computes no extended statistics**, so
-      `pg_statistic_ext_data`, `pg_stats_ext` and `pg_stats_ext_exprs` are
-      refused by name (0A000). `CREATE STATISTICS` is recorded, but ANALYZE
-      does not build its `ndistinct`, `dependencies` or `mcv` objects as
-      PostgreSQL's `BuildRelationExtStatistics` does. (Column statistics --
-      `pg_statistic`, `pg_stats` -- are served, for the types ANALYZE
-      samples here.)
+- [ ] **Extended statistics: timestamps, and tables past ANALYZE's
+      sample.** ANALYZE builds every kind of statistics object as PostgreSQL
+      15.19 does (batch 50: ndistinct, dependencies, MCV lists, expression
+      statistics, inherited ones), and `pg_statistic_ext_data`,
+      `pg_stats_ext` and `pg_stats_ext_exprs` show them. What is left:
+      - An MCV list over a `timestamp` or `timestamptz` column has no bytes
+        (`stxdmcv` is NULL, where PostgreSQL writes its datums). A
+        timestamp's microseconds are kept in a hidden companion field, which
+        the statistics' values do not carry, so two timestamps a fraction of
+        a millisecond apart also count as one value.
+      - A table of more rows than ANALYZE samples (300 times the statistics
+        target) has no extended statistics here: PostgreSQL builds them from
+        its random sample (as for `pg_statistic`, which is not built either).
       Backlog-ID: RP-099
-      Verify: tests/backlog/test_rp_batch26.py::test_scenario[ANALYZE computes extended statistics]
+      Verify: tests/backlog/test_rp_batch50.py::test_scenario[an MCV list's bytes over timestamps], tests/backlog/test_rp_batch50.py::test_scenario[a table past ANALYZE's sample has extended statistics]
 - [ ] **The progress views are refused by name** (0A000):
       `pg_stat_progress_vacuum`, `_analyze`, `_cluster`, `_copy`,
       `_create_index`, `_basebackup`. PostgreSQL reports a row per backend

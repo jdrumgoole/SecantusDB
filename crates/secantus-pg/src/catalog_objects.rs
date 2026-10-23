@@ -62,7 +62,7 @@ fn pub_tables_bson(tables: &[PubTable]) -> Vec<Bson> {
 }
 
 impl PgHandler {
-    fn catalog_docs(&self, collection: &'static str) -> Vec<Document> {
+    pub(crate) fn catalog_docs(&self, collection: &'static str) -> Vec<Document> {
         self.type_catalog_docs(collection)
             .map(|d| d.to_vec())
             .unwrap_or_default()
@@ -212,7 +212,9 @@ impl PgHandler {
         self.clear_relstats(table)?;
         for d in self.catalog_docs(STATISTICS_COLLECTION) {
             if d.get_str("table") == Ok(table) {
-                self.delete_type_doc(STATISTICS_COLLECTION, d.get_str("_id").unwrap_or_default())?;
+                let name = d.get_str("_id").unwrap_or_default();
+                self.delete_type_doc(STATISTICS_COLLECTION, name)?;
+                self.forget_statext_data(name, None)?;
             }
         }
         for mut d in self.catalog_docs(PUBLICATION_COLLECTION) {
@@ -266,6 +268,14 @@ impl PgHandler {
                     }
                     return Err(Self::user_error("42710", msg));
                 }
+                // Its place in creation order, which ANALYZE builds in.
+                let seq = self
+                    .catalog_docs(STATISTICS_COLLECTION)
+                    .iter()
+                    .filter_map(|d| d.get_i64("seq").ok())
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
                 let doc = bson::doc! {
                     "_id": &name,
                     "table": &table,
@@ -273,6 +283,7 @@ impl PgHandler {
                     "exprs": exprs,
                     "kinds": kinds,
                     "owner": self.current_role_name(),
+                    "seq": seq,
                 };
                 self.put(STATISTICS_COLLECTION, &name, doc)?;
                 done()
@@ -302,6 +313,7 @@ impl PgHandler {
                     self.delete_type_doc(STATISTICS_COLLECTION, &name)?;
                     doc.insert("_id", &to);
                     self.put(STATISTICS_COLLECTION, &to, doc)?;
+                    self.forget_statext_data(&name, Some(&to))?;
                 }
                 done()
             }
@@ -327,6 +339,7 @@ impl PgHandler {
                         return Err(Self::user_error("42704", format!("{what} does not exist")));
                     }
                     self.delete_type_doc(STATISTICS_COLLECTION, name)?;
+                    self.forget_statext_data(name, None)?;
                 }
                 done()
             }
