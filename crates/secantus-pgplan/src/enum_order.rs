@@ -1539,7 +1539,7 @@ fn int_const(v: i64) -> pg_query::protobuf::Node {
 }
 
 /// The expression of `SELECT <expr>`.
-fn parse_expr(sql: &str) -> Option<pg_query::protobuf::Node> {
+pub(crate) fn parse_expr(sql: &str) -> Option<pg_query::protobuf::Node> {
     let parsed = pg_query::parse(sql).ok()?;
     let stmt = parsed.protobuf.stmts.first()?.stmt.clone()?;
     let Some(N::SelectStmt(sel)) = stmt.node else {

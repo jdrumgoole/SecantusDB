@@ -450,6 +450,19 @@ impl PgHandler {
                 c.method,
             ));
         }
+        // A range's cast to its multirange, by `m(r)` (explicit, function).
+        for (oid, _, args, ret, _, src, _) in self.range_constructors() {
+            if src == "multirange_constructor1" {
+                rows.push(row(
+                    Self::index_oid(&format!("rangecast:{oid}")),
+                    args[0],
+                    ret,
+                    oid,
+                    'e',
+                    'f',
+                ));
+            }
+        }
         rows
     }
 }

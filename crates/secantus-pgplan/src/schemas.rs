@@ -297,14 +297,21 @@ fn hidden_in_public(name: &str, path: &[String]) -> bool {
 /// answers to (`UserFn::answers_to`). A call whose argument types are not
 /// known before planning (a column) is given to the user function, as
 /// every bare call of it was before.
-pub fn resolve_shadowed_calls(node: &mut N, lookup: &dyn Fn(&str) -> Option<TableDef>) {
+pub fn resolve_shadowed_calls(
+    node: &mut N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> crate::Result<()> {
     let user = crate::correlated::user_functions();
     if !user
         .iter()
         .any(|u| crate::funcsig::is_builtin_function_name(&u.name))
     {
-        return;
+        return Ok(());
     }
+    // A walk of the whole statement: a cancellation point first and every
+    // so many nodes, as between every pass (a 200,000-item `IN` list walks
+    // for a while).
+    crate::cancel::check()?;
     let path = search_path();
     // `pg_catalog` is searched first unless the path places it.
     let catalog_at = path.iter().position(|p| p == "pg_catalog");
@@ -331,8 +338,13 @@ pub fn resolve_shadowed_calls(node: &mut N, lookup: &dyn Fn(&str) -> Option<Tabl
     };
     // SAFETY: the pointers `nodes_mut` hands out point into `node`, which
     // outlives the loop and is not otherwise touched while they are used.
+    let nodes = unsafe { node.nodes_mut() };
+    crate::cancel::check()?;
     unsafe {
-        for (n, _, _) in node.nodes_mut() {
+        for (i, (n, _, _)) in nodes.into_iter().enumerate() {
+            if i % 4096 == 0 {
+                crate::cancel::check()?;
+            }
             let pg_query::NodeMut::FuncCall(f) = n else {
                 continue;
             };
@@ -392,6 +404,7 @@ pub fn resolve_shadowed_calls(node: &mut N, lookup: &dyn Fn(&str) -> Option<Tabl
             }
         }
     }
+    Ok(())
 }
 
 /// The catalog key of the user type a statement names by `parts`: a

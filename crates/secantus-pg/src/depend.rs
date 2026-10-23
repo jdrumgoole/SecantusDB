@@ -28,6 +28,8 @@ const PG_POLICY: i64 = 3256;
 const PG_TS_CONFIG: i64 = 3602;
 const PG_TS_DICT: i64 = 3600;
 const PG_TS_PARSER: i64 = 3601;
+const PG_COLLATION: i64 = 3456;
+const PG_EXTENSION: i64 = 3079;
 
 /// PostgreSQL's `IsPinnedObject`: an object `initdb` made below
 /// `FirstUnpinnedObjectId` is depended on by no row, except the `public`
@@ -118,6 +120,22 @@ fn references(nodes: Vec<(pg_query::NodeRef<'_>, i32, pg_query::Context, bool)>)
                 let names: Vec<String> = t.names.iter().filter_map(string).collect();
                 if let Some(last) = names.last() {
                     out.casts.push(last.clone());
+                }
+            }
+            // The walk does not descend into a cast's type name.
+            pg_query::NodeRef::TypeCast(tc) => {
+                if let Some(t) = &tc.type_name {
+                    let names: Vec<String> = t.names.iter().filter_map(string).collect();
+                    let key = match names.as_slice() {
+                        [schema, name] if schema != "pg_catalog" && schema != "public" => {
+                            format!("{schema}.{name}")
+                        }
+                        [.., name] => name.clone(),
+                        [] => continue,
+                    };
+                    if !out.casts.contains(&key) {
+                        out.casts.push(key);
+                    }
                 }
             }
             _ => {}
@@ -228,6 +246,11 @@ impl PgHandler {
                     0,
                     "n",
                 );
+                // And on a collation someone made.
+                let collation = attributes.int(a, "attcollation");
+                if collation >= 16384 {
+                    push(PG_CLASS, rel, num, PG_COLLATION, collation, 0, "n");
+                }
             }
         }
         let attnum = |rel: i64, name: &str| -> Option<i32> {
@@ -346,6 +369,36 @@ impl PgHandler {
             for t in procs.ints(p, "proargtypes") {
                 push(PG_PROC, oid, 0, PG_TYPE, t, 0, "n");
             }
+        }
+
+        // An extension's objects are its members (`e`): here, its types.
+        let extensions = self.extensions().unwrap_or_default();
+        // Each extension lives in its schema (plpgsql's is pinned).
+        for (i, (name, schema)) in self.extension_schemas().into_iter().enumerate() {
+            if name != "plpgsql" {
+                push(
+                    PG_EXTENSION,
+                    13_826 + i as i64,
+                    0,
+                    PG_NAMESPACE,
+                    self.namespace_oid(&schema),
+                    0,
+                    "n",
+                );
+            }
+        }
+        for b in self.base_types().unwrap_or_default() {
+            let Some(ext) = &b.extension else {
+                continue;
+            };
+            if let Some(i) = extensions.iter().position(|(n, _, _)| n == ext) {
+                push(PG_TYPE, b.oid, 0, PG_EXTENSION, 13_826 + i as i64, 0, "e");
+            }
+        }
+
+        // A range's constructors are part of the type they build (`i`).
+        for (oid, _, _, _, owner, _, _) in self.range_constructors() {
+            push(PG_PROC, oid, 0, PG_TYPE, owner, 0, "i");
         }
 
         // Constraints.

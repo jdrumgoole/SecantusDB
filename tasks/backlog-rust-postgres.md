@@ -824,16 +824,17 @@ cluster.
       phases this server's build has.
       Backlog-ID: RP-100
       Verify: tests/backlog/test_rp_batch26.py::test_scenario[progress views]
-- [ ] **`pg_depend` misses a constant's type and a range's functions.**
-      Every object's dependencies are recorded as PostgreSQL 15.19 records
-      them (`crates/secantus-pg/src/depend.rs`), except: the type of a
-      constant an expression holds (an index predicate `b = 'a'` over an
-      enum column depends on the enum, as does a view comparing to one), and
-      a range type's constructor functions and multirange cast, which
-      `pg_proc` / `pg_cast` here do not list at all. Collations, operator
-      classes and extension membership (`e`) are not recorded either.
+- [ ] **An extension's members are not in `pg_depend`.** Every other
+      object's dependencies are recorded as PostgreSQL 15.19 records them
+      (`crates/secantus-pg/src/depend.rs`), an extension's schema and types
+      among them. But an extension's functions, operators, casts and
+      operator classes and families -- citext's 47, 26, 8, 3 and 3 -- are
+      this server's built-ins, with no `pg_proc` / `pg_operator` /
+      `pg_cast` / `pg_opclass` rows of their own, so there is nothing to
+      record their membership (`e`) against. The fix is those rows: each
+      extension's objects as its script creates them, in its schema.
       Backlog-ID: RP-105
-      Verify: tests/backlog/test_rp_batch26.py::test_scenario[dependencies on a constant's type and a range's functions]
+      Verify: tests/backlog/test_rp_batch45.py::test_scenario[an extension's members]
 
 ## Found by batch 28 (2026-10-22)
 
