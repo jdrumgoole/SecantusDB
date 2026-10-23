@@ -35,6 +35,7 @@ mod srf_tlist;
 pub mod systypes;
 pub mod tid;
 pub mod ts_configs;
+pub mod ts_dicts;
 pub mod typed_tables;
 pub mod typeout;
 mod typmod_cast;
@@ -981,6 +982,8 @@ pub enum Statement {
     },
     /// `CREATE / ALTER / DROP TEXT SEARCH CONFIGURATION`.
     TsConfig(ts_configs::TsConfigOp),
+    /// `CREATE / ALTER / DROP TEXT SEARCH DICTIONARY` (RP-169).
+    TsDict(ts_dicts::TsDictOp),
     /// `ALTER MATERIALIZED VIEW m RENAME TO n`.
     RenameMatView {
         matview: String,
@@ -4864,6 +4867,11 @@ fn plan_node(
             ts_configs::plan_rename(&r)
         }
         N::RenameStmt(r)
+            if ObjectType::try_from(r.rename_type) == Ok(ObjectType::ObjectTsdictionary) =>
+        {
+            ts_dicts::plan_rename(&r)
+        }
+        N::RenameStmt(r)
             if ObjectType::try_from(r.rename_type) == Ok(ObjectType::ObjectCollation) =>
         {
             misc_alter::plan_collation_rename(&r)
@@ -5214,6 +5222,20 @@ fn plan_node(
             ts_configs::plan_create(&d)
         }
         N::AlterTsconfigurationStmt(a) => ts_configs::plan_alter(&a),
+        N::DefineStmt(d) if ObjectType::try_from(d.kind) == Ok(ObjectType::ObjectTsdictionary) => {
+            ts_dicts::plan_create(&d)
+        }
+        N::AlterTsdictionaryStmt(a) => ts_dicts::plan_alter(&a),
+        N::AlterOwnerStmt(a)
+            if ObjectType::try_from(a.object_type) == Ok(ObjectType::ObjectTsdictionary) =>
+        {
+            ts_dicts::plan_owner(&a)
+        }
+        N::AlterObjectSchemaStmt(a)
+            if ObjectType::try_from(a.object_type) == Ok(ObjectType::ObjectTsdictionary) =>
+        {
+            ts_dicts::plan_set_schema(&a)
+        }
         N::AlterOwnerStmt(a)
             if ObjectType::try_from(a.object_type) == Ok(ObjectType::ObjectTsconfiguration) =>
         {
@@ -20786,6 +20808,7 @@ fn plan_comment(c: &pg_query::protobuf::CommentStmt) -> Result<Statement> {
         Ok(O::ObjectTrigger) => "trigger",
         Ok(O::ObjectRole) => "role",
         Ok(O::ObjectTsconfiguration) => "text search configuration",
+        Ok(O::ObjectTsdictionary) => "text search dictionary",
         Ok(O::ObjectConversion) => "conversion",
         _ => return Err(Error::Unsupported("COMMENT ON this kind of object".into())),
     };
@@ -35930,6 +35953,9 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
     }
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectTsconfiguration) {
         return ts_configs::plan_drop(d);
+    }
+    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectTsdictionary) {
+        return ts_dicts::plan_drop(d);
     }
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectCollation) {
         return collation::plan_drop(d);

@@ -103,6 +103,7 @@ mod tls;
 mod triggers;
 mod ts_catalogs;
 mod ts_configs;
+mod ts_dicts;
 mod tuplesort;
 mod txn_gucs;
 mod txn_state;
@@ -4928,6 +4929,7 @@ impl PgHandler {
             secantus_pgplan::user_casts::set_user_casts(self.user_casts());
             secantus_pgplan::collation::set_user_collations(self.user_collations());
             secantus_pgplan::ts_catalog::set_user_configs(self.user_ts_configs());
+            secantus_pgplan::ts_catalog::set_user_dicts(self.user_ts_dicts());
             secantus_pgplan::ts_catalog::set_dropped_builtins(self.dropped_builtin_ts_configs());
             secantus_pgplan::collation::set_declared_collations(self.all_table_defs().map_or(
                 true,
@@ -14849,6 +14851,7 @@ impl PgHandler {
             }
             "domain" => self.comment_on_domain(&Self::comment_relation(names), comment),
             "text search configuration" => self.comment_on_ts_config(names, comment),
+            "text search dictionary" => self.comment_on_ts_dict(names, comment),
             "conversion" => self.comment_on_conversion(names, comment),
             "database" | "role" => {
                 self.comment_on_shared(kind, names.last().map_or("", String::as_str), comment)
@@ -17123,6 +17126,11 @@ impl PgHandler {
                 .map(|(oid, c)| (oid, 0, c)),
         );
         out.extend(
+            self.ts_dict_comments()
+                .into_iter()
+                .map(|(oid, c)| (oid, 0, c)),
+        );
+        out.extend(
             self.conversion_comments()
                 .into_iter()
                 .map(|(oid, c)| (oid, 0, c)),
@@ -18215,19 +18223,23 @@ impl PgHandler {
                 rows
             }
             other if secantus_pgplan::ts_catalog::NAMES.contains(&other) => {
+                let role_oid = |r: &str| {
+                    secantus_pgplan::regobj::resolve(
+                        "regrole",
+                        &secantus_pgplan::scalar::quote_identifier(r),
+                    )
+                    .unwrap_or(10)
+                };
                 let mut rows = ts_catalogs::rows(other, &def);
                 rows.extend(ts_catalogs::user_rows(
                     other,
                     &def,
                     &self.user_ts_configs(),
-                    |r| {
-                        secantus_pgplan::regobj::resolve(
-                            "regrole",
-                            &secantus_pgplan::scalar::quote_identifier(r),
-                        )
-                        .unwrap_or(10)
-                    },
+                    role_oid,
                 ));
+                if other == "pg_ts_dict" {
+                    rows.extend(ts_dicts::dict_rows(&def, &self.user_ts_dicts(), role_oid));
+                }
                 rows
             }
             "pg_am" => self.pg_am_rows(&def),
@@ -38865,6 +38877,7 @@ impl PgHandler {
             } => self.alter_database_set(&database, name, value),
             Statement::AlterSystem { name, value } => self.alter_system(name, value),
             Statement::TsConfig(op) => self.ts_config_statement(op),
+            Statement::TsDict(op) => self.ts_dict_statement(op),
             Statement::RenameMatView {
                 matview,
                 to,

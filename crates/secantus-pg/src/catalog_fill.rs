@@ -855,6 +855,11 @@ impl PgHandler {
             .into_iter()
             .map(|(o, _)| o)
             .collect();
+        let ts_dicts: Vec<i64> = self
+            .ts_dict_comments()
+            .into_iter()
+            .map(|(o, _)| o)
+            .collect();
         let conversions: Vec<i64> = self
             .conversion_comments()
             .into_iter()
@@ -866,6 +871,8 @@ impl PgHandler {
                 // The catalog the object lives in, as `pg_description` keys it.
                 let classoid = if ts_configs.contains(&oid) {
                     crate::ts_configs::PG_TS_CONFIG
+                } else if ts_dicts.contains(&oid) {
+                    crate::ts_dicts::PG_TS_DICT
                 } else if conversions.contains(&oid) {
                     2607 // pg_conversion
                 } else if constraints.contains(&oid) {

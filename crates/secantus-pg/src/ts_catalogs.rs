@@ -44,6 +44,11 @@ pub(crate) fn rows(name: &str, def: &TableDef) -> Vec<Document> {
         "pg_ts_config_map" => catalog.columns.iter().position(|c| *c == "mapcfg"),
         _ => None,
     };
+    // A built-in dictionary an ALTER changed: the database's own row.
+    let dict_column = (name == "pg_ts_dict")
+        .then(|| catalog.columns.iter().position(|c| *c == "oid"))
+        .flatten();
+    let user_dicts = secantus_pgplan::ts_catalog::user_dicts();
     catalog
         .rows
         .iter()
@@ -52,6 +57,10 @@ pub(crate) fn rows(name: &str, def: &TableDef) -> Vec<Document> {
                 .and_then(|i| row.get(i).copied().flatten())
                 .and_then(|v| v.parse::<i64>().ok())
                 .is_none_or(|oid| !secantus_pgplan::ts_catalog::builtin_hidden(oid))
+                && dict_column
+                    .and_then(|i| row.get(i).copied().flatten())
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .is_none_or(|oid| !user_dicts.iter().any(|d| d.oid == oid))
         })
         .map(|row| {
             let mut d = Document::new();

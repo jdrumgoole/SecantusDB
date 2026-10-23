@@ -464,6 +464,39 @@ fn lexize(dict: &str, token: &str) -> Option<Vec<String>> {
     Some(stemmed(l.is_stop(&lower), l.stem(&lower)))
 }
 
+/// The words of the stop-word file `name` (`tsearch_data/<name>.stop`),
+/// as PostgreSQL ships them; `None` for a file it does not ship.
+pub(crate) fn stop_words(name: &str) -> Option<Vec<String>> {
+    if name == "english" {
+        return Some(ENGLISH_STOP.iter().map(|w| w.to_string()).collect());
+    }
+    let l = LANGS.iter().find(|l| l.name() == name)?;
+    Some(
+        l.stop_file()?
+            .lines()
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Is there a Snowball stemmer for `language` (lower case)?
+pub(crate) fn stemmer_exists(language: &str) -> bool {
+    language == "english" || LANGS.iter().any(|l| l.name() == language)
+}
+
+/// `word` stemmed by `language`'s Snowball stemmer.
+pub(crate) fn stem_in(language: &str, word: &str) -> String {
+    if language == "english" {
+        return stem(word);
+    }
+    LANGS
+        .iter()
+        .find(|l| l.name() == language)
+        .map_or_else(|| word.to_string(), |l| l.stem(word))
+}
+
 /// The dictionaries `cfg` offers a token of type `toktype`, by name --
 /// `ts_debug`'s `dictionaries`.
 pub(crate) fn debug_dictionaries(cfg: Config, toktype: u8) -> Vec<String> {
@@ -479,9 +512,18 @@ pub(crate) fn debug_dictionaries(cfg: Config, toktype: u8) -> Vec<String> {
 /// recognises it (each this server has always does). `None` for a type the
 /// map gives no dictionary, which takes no position.
 pub(crate) fn debug_lexize(cfg: Config, toktype: u8, token: &str) -> Option<(String, Vec<String>)> {
-    debug_dictionaries(cfg, toktype)
+    crate::ts_catalog::dictionaries_for(cfg.0, i32::from(toktype))
         .into_iter()
-        .find_map(|d| lexize(&d, token).map(|lexemes| (d, lexemes)))
+        .find_map(|oid| {
+            let name = crate::ts_catalog::name_of(oid, true)?;
+            // A user dictionary lexizes by its template; one that does not
+            // recognise the token hands it to the next.
+            let lexemes = match crate::ts_catalog::user_lexize(oid, token) {
+                Some(result) => result.ok().flatten(),
+                None => lexize(&name, token),
+            }?;
+            Some((name, lexemes))
+        })
 }
 
 /// PostgreSQL's longest indexable lexeme, in bytes.
@@ -2458,14 +2500,20 @@ fn call_inner(name: &str, args: &[Bson]) -> Result<Bson> {
                 return Err(wrong(name));
             };
             let name = text_of(dict);
-            let name = crate::ts_catalog::oid_of(&name, true)
-                .and_then(|o| crate::ts_catalog::name_of(o, true))
-                .ok_or_else(|| {
-                    Error::Sqlstate(
-                        "42704",
-                        format!("text search dictionary \"{}\" does not exist", name.trim()),
-                    )
-                })?;
+            let oid = crate::ts_catalog::oid_of(&name, true).ok_or_else(|| {
+                Error::Sqlstate(
+                    "42704",
+                    format!("text search dictionary \"{}\" does not exist", name.trim()),
+                )
+            })?;
+            // A user dictionary: NULL when it does not recognise the token.
+            if let Some(result) = crate::ts_catalog::user_lexize(oid, &text_of(token)) {
+                return Ok(match result? {
+                    Some(lexemes) => Bson::Array(lexemes.into_iter().map(Bson::String).collect()),
+                    None => Bson::Null,
+                });
+            }
+            let name = crate::ts_catalog::name_of(oid, true).unwrap_or_default();
             let lower: String = text_of(token)
                 .chars()
                 .map(crate::scalar::simple_lower)
