@@ -61,3 +61,53 @@ pub(crate) fn rows(name: &str, def: &TableDef) -> Vec<Document> {
         })
         .collect()
 }
+
+/// The rows of `pg_ts_config` and `pg_ts_config_map` for the
+/// configurations `CREATE TEXT SEARCH CONFIGURATION` made.
+pub(crate) fn user_rows(
+    name: &str,
+    def: &TableDef,
+    configs: &[secantus_pgplan::ts_catalog::UserConfig],
+    role_oid: impl Fn(&str) -> i64,
+) -> Vec<Document> {
+    let f = |c: &str| def.field_of(c);
+    let mut out = Vec::new();
+    for c in configs {
+        match name {
+            "pg_ts_config" => {
+                let mut d = Document::new();
+                let ns = secantus_pgplan::regobj::resolve("regnamespace", &c.schema).unwrap_or(0);
+                for (column, value) in [
+                    ("oid", Bson::Int64(c.oid)),
+                    ("cfgname", Bson::String(c.name.clone())),
+                    ("cfgnamespace", Bson::Int64(ns)),
+                    ("cfgowner", Bson::Int64(role_oid(&c.owner))),
+                    ("cfgparser", Bson::Int64(c.parser)),
+                ] {
+                    if let Some(field) = f(column) {
+                        d.insert(field, value);
+                    }
+                }
+                out.push(d);
+            }
+            "pg_ts_config_map" => {
+                for (t, seq, dict) in &c.map {
+                    let mut d = Document::new();
+                    for (column, value) in [
+                        ("mapcfg", Bson::Int64(c.oid)),
+                        ("maptokentype", Bson::Int32(*t)),
+                        ("mapseqno", Bson::Int32(*seq)),
+                        ("mapdict", Bson::Int64(*dict)),
+                    ] {
+                        if let Some(field) = f(column) {
+                            d.insert(field, value);
+                        }
+                    }
+                    out.push(d);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}

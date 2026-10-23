@@ -850,11 +850,18 @@ impl PgHandler {
             .into_iter()
             .map(|(o, _)| o)
             .collect();
+        let ts_configs: Vec<i64> = self
+            .ts_config_comments()
+            .into_iter()
+            .map(|(o, _)| o)
+            .collect();
         self.object_comments()
             .into_iter()
             .map(|(oid, subid, text)| {
                 // The catalog the object lives in, as `pg_description` keys it.
-                let classoid = if constraints.contains(&oid) {
+                let classoid = if ts_configs.contains(&oid) {
+                    crate::ts_configs::PG_TS_CONFIG
+                } else if constraints.contains(&oid) {
                     2606
                 } else if extensions.contains(&oid) {
                     3079

@@ -750,18 +750,6 @@ Not filed:
       for reasons other items record (RP-098 .. RP-101) are left to theirs.
       Backlog-ID: RP-070
       Verify: tests/backlog/test_rp_found_2026_10_20.py::test_catalog_relations_are_queryable
-- [ ] **Statements still refused with 0A000** (`... is not supported yet`),
-      each of which PostgreSQL 15.19 runs:
-      - `CREATE TEXT SEARCH CONFIGURATION`.
-
-      Several appear in `pg_dump` output. Not checked by the test:
-      `ALTER EXTENSION`, `ALTER OPERATOR`, `ALTER COLLATION`, `CREATE
-      CONVERSION / ACCESS METHOD / OPERATOR CLASS / OPERATOR FAMILY /
-      TRANSFORM / LANGUAGE`, `CREATE TEXT SEARCH DICTIONARY`, and
-      subscriptions. CLAUDE.md's old claim that "no statement the earlier
-      surveys listed" is refused no longer held.
-      Backlog-ID: RP-072
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_statements_not_refused
 
 ## Found by batch 30 (2026-10-22)
 
@@ -784,6 +772,45 @@ fixed in the same batch; their tests there are regression tests.
       since nothing records which was made first.
       Backlog-ID: RP-137
       Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order], tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]
+
+## Found by batch 34 (2026-10-23)
+
+Found while building `CREATE TEXT SEARCH CONFIGURATION` (RP-072). The gap
+tests are scenarios in `tests/backlog/test_rp_batch34.py`, measured on a
+private 15.19 cluster. RP-166 and RP-167 were found and fixed in the same
+batch; their tests there are regression tests.
+
+- [ ] **A built-in text-search configuration cannot be changed.**
+      PostgreSQL's built-in configurations (`english`, `danish`, ...) are
+      ordinary rows `initdb` made above the pinned range, so a superuser may
+      `ALTER TEXT SEARCH CONFIGURATION danish RENAME TO ...`, change its
+      mapping, or even DROP it. Here they are served from the dump
+      (`pg_ts_catalog.tsv`) and every change to one is 0A000 ("changing a
+      built-in text search configuration is not supported"). Modelling it
+      means a database's copy of the built-in rows that the change rewrites.
+      Backlog-ID: RP-165
+      Verify: tests/backlog/test_rp_batch34.py::test_scenario[a built-in configuration can be altered]
+- [ ] **A default's literal for an `"any"` argument prints with a type.**
+      `create table t (b text default concat('a', 1))` reads back from
+      `pg_get_expr(adbin, ...)` as `concat('a'::text, 1)`, where PostgreSQL
+      prints `concat('a', 1)`: a variadic `"any"` parameter takes the
+      literal as it is. The default's printer (`ruleutils_default`) finds
+      no overload for the call (`funcsig` resolves no variadic `"any"`) and
+      types every string `text`.
+      Backlog-ID: RP-168
+      Verify: tests/backlog/test_rp_batch34.py::test_scenario[a default's literal for an "any" argument is bare]
+- [ ] **Statements still refused with 0A000**, each of which PostgreSQL
+      15.19 runs (several appear in `pg_dump` output): `ALTER EXTENSION
+      ... UPDATE`, `ALTER OPERATOR ... OWNER TO`, `ALTER COLLATION ...
+      REFRESH VERSION`, `CREATE CONVERSION`, `CREATE ACCESS METHOD`,
+      `CREATE OPERATOR FAMILY / CLASS`, `CREATE TEXT SEARCH DICTIONARY`,
+      `CREATE / ALTER / DROP SUBSCRIPTION` (with `connect = false`) and
+      `CREATE TRANSFORM`. `ALTER COLLATION ... RENAME TO` is a wrong 42601
+      ("RENAME without a relation"). Each refusal names the parse node
+      (`AlterExtensionStmt is not supported yet`). (The statements RP-072
+      listed and its test checked are all served now.)
+      Backlog-ID: RP-169
+      Verify: tests/backlog/test_rp_batch34.py::test_scenario[statements PostgreSQL runs that are refused]
 
 ## Found by batch 33 (2026-10-23)
 

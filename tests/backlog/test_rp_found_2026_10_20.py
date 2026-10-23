@@ -568,7 +568,7 @@ def test_client_tools(rust_pg: Any) -> None:
     assert client_tools(rust_pg.port, "test") == []
 
 
-@pytest.mark.backlog("RP-072")
+@pytest.mark.backlog_fixed("RP-072")
 def test_statements_not_refused(rust_pg: Any) -> None:
     """PostgreSQL 15.19 runs each of these statements; none is 0A000."""
     _check("refused_statements", rust_pg)

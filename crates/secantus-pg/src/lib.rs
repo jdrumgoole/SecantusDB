@@ -95,6 +95,7 @@ mod table_locks;
 mod tls;
 mod triggers;
 mod ts_catalogs;
+mod ts_configs;
 mod tuplesort;
 mod txn_gucs;
 mod txn_state;
@@ -4905,6 +4906,7 @@ impl PgHandler {
             secantus_pgplan::user_ops::set_user_operators(self.user_operators());
             secantus_pgplan::user_casts::set_user_casts(self.user_casts());
             secantus_pgplan::collation::set_user_collations(self.user_collations());
+            secantus_pgplan::ts_catalog::set_user_configs(self.user_ts_configs());
             secantus_pgplan::collation::set_declared_collations(self.all_table_defs().map_or(
                 true,
                 |defs| {
@@ -14390,6 +14392,7 @@ impl PgHandler {
                 self.put_comment_doc(Self::FUNCTION_COLLECTION, &id, Some(doc))
             }
             "domain" => self.comment_on_domain(&Self::comment_relation(names), comment),
+            "text search configuration" => self.comment_on_ts_config(names, comment),
             "database" | "role" => {
                 self.comment_on_shared(kind, names.last().map_or("", String::as_str), comment)
             }
@@ -16653,6 +16656,11 @@ impl PgHandler {
                 out.push((oid, 0, c.to_string()));
             }
         }
+        out.extend(
+            self.ts_config_comments()
+                .into_iter()
+                .map(|(oid, c)| (oid, 0, c)),
+        );
         // COMMENT ON FUNCTION / PROCEDURE, kept on the function's record,
         // under the oid `pg_proc` gives it.
         for d in self.user_function_docs().unwrap_or_default() {
@@ -17741,7 +17749,20 @@ impl PgHandler {
                 rows
             }
             other if secantus_pgplan::ts_catalog::NAMES.contains(&other) => {
-                ts_catalogs::rows(other, &def)
+                let mut rows = ts_catalogs::rows(other, &def);
+                rows.extend(ts_catalogs::user_rows(
+                    other,
+                    &def,
+                    &self.user_ts_configs(),
+                    |r| {
+                        secantus_pgplan::regobj::resolve(
+                            "regrole",
+                            &secantus_pgplan::scalar::quote_identifier(r),
+                        )
+                        .unwrap_or(10)
+                    },
+                ));
+                rows
             }
             "pg_am" => self.pg_am_rows(&def),
             "pg_policy" => self.pg_policy_rows(&def),
@@ -22191,9 +22212,9 @@ impl PgHandler {
             // A configuration by name, kept qualified as PostgreSQL shows it
             // (`German` -> `pg_catalog.german`).
             return match secantus_pgplan::ts_catalog::oid_of(value, false)
-                .and_then(|o| secantus_pgplan::ts_catalog::name_of(o, false))
+                .and_then(secantus_pgplan::ts_catalog::qualified_name_of)
             {
-                Some(name) => Ok(format!("pg_catalog.{name}")),
+                Some(name) => Ok(name),
                 None => Err(Self::user_error(
                     "22023",
                     format!("invalid value for parameter \"{key}\": \"{value}\""),
@@ -34227,6 +34248,21 @@ impl PgHandler {
                             }
                         })
                         .collect();
+                    // Its text-search configurations.
+                    let mut configs = self.ts_configs_in(name);
+                    configs.sort_by_key(|c| c.oid);
+                    for c in configs {
+                        let q = secantus_pgplan::scalar::quote_identifier;
+                        members.push((
+                            ts_configs::TS_CONFIG_COLLECTION,
+                            format!("{}.{}", c.schema, c.name),
+                        ));
+                        descs.push(format!(
+                            "text search configuration {}.{}",
+                            q(&c.schema),
+                            q(&c.name)
+                        ));
+                    }
                     // The routines it holds.
                     let in_schema: HashSet<String> = self
                         .type_catalog_docs(Self::FUNCTION_COLLECTION)?
@@ -37901,6 +37937,7 @@ impl PgHandler {
                 value,
             } => self.alter_database_set(&database, name, value),
             Statement::AlterSystem { name, value } => self.alter_system(name, value),
+            Statement::TsConfig(op) => self.ts_config_statement(op),
             Statement::RenameMatView {
                 matview,
                 to,

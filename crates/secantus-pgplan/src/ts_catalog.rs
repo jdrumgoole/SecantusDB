@@ -1,13 +1,24 @@
 //! PostgreSQL 15's text-search catalogs: `pg_ts_config`, `pg_ts_dict`,
 //! `pg_ts_parser`, `pg_ts_template` and `pg_ts_config_map`, as `initdb`
-//! leaves them (dumped from 15.19, `pg_ts_catalog.tsv`).
+//! leaves them (dumped from 15.19, `pg_ts_catalog.tsv`), and the
+//! configurations `CREATE TEXT SEARCH CONFIGURATION` makes, which the
+//! executor installs per statement ([`set_user_configs`]).
 //!
 //! They name what `regconfig` and `regdictionary` resolve to: `3748` is the
-//! configuration `simple`, `'english'::regconfig::oid` is 13636. The server
-//! has no `CREATE TEXT SEARCH CONFIGURATION`, so these rows are the whole
-//! catalog.
+//! configuration `simple`, `'english'::regconfig::oid` is 13636. A
+//! configuration is its map (`pg_ts_config_map`): for each token type of
+//! its parser, the dictionaries it is offered to, in order. `to_tsvector`
+//! and the rest read it, the built-in ones' as dumped.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::OnceLock;
 
 const DATA: &str = include_str!("pg_ts_catalog.tsv");
+
+/// The default parser, the only one (`pg_ts_parser`).
+pub const DEFAULT_PARSER: i64 = 3722;
 
 /// One catalog: its columns and rows, each value as dumped (`\N` is NULL).
 pub struct Catalog {
@@ -15,7 +26,8 @@ pub struct Catalog {
     pub rows: Vec<Vec<Option<&'static str>>>,
 }
 
-/// The catalog named `name` (`pg_ts_config`, ...), or `None`.
+/// The catalog named `name` (`pg_ts_config`, ...), or `None`: the built-in
+/// rows.
 pub fn catalog(name: &str) -> Option<Catalog> {
     let mut lines = DATA.lines().filter(|l| !l.starts_with('#'));
     let header = lines.by_ref().find(|l| {
@@ -41,38 +53,242 @@ pub const NAMES: [&str; 5] = [
     "pg_ts_config_map",
 ];
 
-/// `(oid, name)` of each row of `pg_ts_config` (`dict` false) or
+/// A configuration `CREATE TEXT SEARCH CONFIGURATION` made.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserConfig {
+    pub oid: i64,
+    pub schema: String,
+    pub name: String,
+    pub owner: String,
+    pub parser: i64,
+    /// `pg_ts_config_map`'s rows: `(token type, seqno, dictionary oid)`.
+    pub map: Vec<(i32, i32, i64)>,
+}
+
+thread_local! {
+    static USER_CONFIGS: RefCell<Rc<Vec<UserConfig>>> = RefCell::new(Rc::new(Vec::new()));
+}
+
+/// Install the database's configurations for the statements that follow.
+pub fn set_user_configs(configs: Vec<UserConfig>) {
+    USER_CONFIGS.with(|c| *c.borrow_mut() = Rc::new(configs));
+}
+
+/// The installed configurations.
+pub fn user_configs() -> Rc<Vec<UserConfig>> {
+    USER_CONFIGS.with(|c| Rc::clone(&c.borrow()))
+}
+
+/// `(oid, name)` of each built-in row of `pg_ts_config` (`dict` false) or
 /// `pg_ts_dict` (`dict` true).
-fn names(dict: bool) -> Vec<(i64, &'static str)> {
-    catalog(if dict { "pg_ts_dict" } else { "pg_ts_config" })
-        .map(|c| {
-            c.rows
-                .iter()
-                .filter_map(|r| Some(((*r.first()?)?.parse().ok()?, (*r.get(1)?)?)))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// A configuration's (or, with `dict`, a dictionary's) name by oid.
-pub fn name_of(oid: i64, dict: bool) -> Option<&'static str> {
-    names(dict)
-        .into_iter()
-        .find(|(o, _)| *o == oid)
-        .map(|(_, n)| n)
-}
-
-/// A configuration's (or dictionary's) oid by name: an identifier, so
-/// unquoted is folded to lower case, and `pg_catalog.` may qualify it.
-pub fn oid_of(input: &str, dict: bool) -> Option<i64> {
-    let t = input.trim();
-    let t = t.strip_prefix("pg_catalog.").unwrap_or(t);
-    let name = match t.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
-        Some(inner) => inner.replace("\"\"", "\""),
-        None => t.to_ascii_lowercase(),
+fn builtin_names(dict: bool) -> &'static [(i64, &'static str)] {
+    static CONFIGS: OnceLock<Vec<(i64, &'static str)>> = OnceLock::new();
+    static DICTS: OnceLock<Vec<(i64, &'static str)>> = OnceLock::new();
+    let load = || {
+        catalog(if dict { "pg_ts_dict" } else { "pg_ts_config" })
+            .map(|c| {
+                c.rows
+                    .iter()
+                    .filter_map(|r| Some(((*r.first()?)?.parse().ok()?, (*r.get(1)?)?)))
+                    .collect()
+            })
+            .unwrap_or_default()
     };
-    names(dict)
+    if dict {
+        DICTS.get_or_init(load)
+    } else {
+        CONFIGS.get_or_init(load)
+    }
+}
+
+/// A configuration's `pg_ts_config_map` rows: `(token type, seqno,
+/// dictionary)`.
+pub type ConfigMap = Vec<(i32, i32, i64)>;
+
+/// The built-in configurations' maps, by configuration oid.
+fn builtin_maps() -> &'static HashMap<i64, ConfigMap> {
+    static MAPS: OnceLock<HashMap<i64, ConfigMap>> = OnceLock::new();
+    MAPS.get_or_init(|| {
+        let mut maps: HashMap<i64, ConfigMap> = HashMap::new();
+        if let Some(c) = catalog("pg_ts_config_map") {
+            let at = |n: &str| c.columns.iter().position(|x| *x == n);
+            let (Some(cfg), Some(ty), Some(seq), Some(dict)) = (
+                at("mapcfg"),
+                at("maptokentype"),
+                at("mapseqno"),
+                at("mapdict"),
+            ) else {
+                return maps;
+            };
+            for r in &c.rows {
+                let num = |i: usize| {
+                    r.get(i)
+                        .copied()
+                        .flatten()
+                        .and_then(|v| v.parse::<i64>().ok())
+                };
+                if let (Some(cfg), Some(ty), Some(seq), Some(dict)) =
+                    (num(cfg), num(ty), num(seq), num(dict))
+                {
+                    maps.entry(cfg)
+                        .or_default()
+                        .push((ty as i32, seq as i32, dict));
+                }
+            }
+        }
+        maps
+    })
+}
+
+/// A configuration's map: `(token type, seqno, dictionary)`, or `None` for
+/// no configuration.
+pub fn map_of(oid: i64) -> Option<Vec<(i32, i32, i64)>> {
+    if let Some(m) = builtin_maps().get(&oid) {
+        return Some(m.clone());
+    }
+    if builtin_names(false).iter().any(|(o, _)| *o == oid) {
+        return Some(Vec::new());
+    }
+    user_configs()
+        .iter()
+        .find(|c| c.oid == oid)
+        .map(|c| c.map.clone())
+}
+
+/// The dictionaries a configuration offers a token of type `toktype`, in
+/// order.
+pub fn dictionaries_for(cfg: i64, toktype: i32) -> Vec<i64> {
+    let mut entries: Vec<(i32, i64)> = map_of(cfg)
+        .unwrap_or_default()
         .into_iter()
-        .find(|(_, n)| *n == name)
-        .map(|(o, _)| o)
+        .filter(|(t, _, _)| *t == toktype)
+        .map(|(_, seq, dict)| (seq, dict))
+        .collect();
+    entries.sort();
+    entries.into_iter().map(|(_, d)| d).collect()
+}
+
+/// A configuration's (or, with `dict`, a dictionary's) schema and name by
+/// oid.
+pub fn schema_and_name(oid: i64, dict: bool) -> Option<(String, String)> {
+    if let Some((_, n)) = builtin_names(dict).iter().find(|(o, _)| *o == oid) {
+        return Some(("pg_catalog".into(), (*n).to_string()));
+    }
+    if dict {
+        return None;
+    }
+    user_configs()
+        .iter()
+        .find(|c| c.oid == oid)
+        .map(|c| (c.schema.clone(), c.name.clone()))
+}
+
+/// A configuration's (or dictionary's) name by oid.
+pub fn name_of(oid: i64, dict: bool) -> Option<String> {
+    schema_and_name(oid, dict).map(|(_, n)| n)
+}
+
+/// `schema.name`, as `default_text_search_config` keeps it.
+pub fn qualified_name_of(oid: i64) -> Option<String> {
+    schema_and_name(oid, false).map(|(s, n)| {
+        format!(
+            "{}.{}",
+            crate::scalar::quote_identifier(&s),
+            crate::scalar::quote_identifier(&n)
+        )
+    })
+}
+
+/// `regconfigout` / `regdictionaryout`: the name, qualified unless the
+/// search path finds this object by it.
+pub fn display_of(oid: i64, dict: bool) -> Option<String> {
+    let (schema, name) = schema_and_name(oid, dict)?;
+    let bare = crate::scalar::quote_identifier(&name);
+    if oid_in_path(&name, dict) == Some(oid) {
+        Some(bare)
+    } else {
+        Some(format!(
+            "{}.{bare}",
+            crate::scalar::quote_identifier(&schema)
+        ))
+    }
+}
+
+/// The parts of a possibly qualified name, each an identifier: unquoted is
+/// folded to lower case.
+fn name_parts(input: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut was_quoted = false;
+    let mut chars = input.trim().chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                cur.push('"');
+                chars.next();
+            }
+            '"' => {
+                quoted = !quoted;
+                was_quoted = true;
+            }
+            '.' if !quoted => {
+                parts.push(if was_quoted {
+                    std::mem::take(&mut cur)
+                } else {
+                    std::mem::take(&mut cur).trim().to_ascii_lowercase()
+                });
+                was_quoted = false;
+            }
+            c => cur.push(c),
+        }
+    }
+    parts.push(if was_quoted {
+        cur
+    } else {
+        cur.trim().to_ascii_lowercase()
+    });
+    parts
+}
+
+/// The configuration (or dictionary) `name` in `schema`.
+pub fn oid_in(schema: &str, name: &str, dict: bool) -> Option<i64> {
+    if schema == "pg_catalog" {
+        if let Some((o, _)) = builtin_names(dict).iter().find(|(_, n)| *n == name) {
+            return Some(*o);
+        }
+    }
+    if dict {
+        return None;
+    }
+    user_configs()
+        .iter()
+        .find(|c| c.schema == schema && c.name == name)
+        .map(|c| c.oid)
+}
+
+/// An unqualified name through the search path: `pg_catalog` first unless
+/// the path places it.
+fn oid_in_path(name: &str, dict: bool) -> Option<i64> {
+    let path = crate::schemas::search_path();
+    let mut schemas: Vec<String> = Vec::new();
+    if !path.iter().any(|s| s == "pg_catalog") {
+        schemas.push("pg_catalog".into());
+    }
+    schemas.extend(path);
+    schemas.iter().find_map(|s| oid_in(s, name, dict))
+}
+
+/// A configuration's (or dictionary's) oid by name -- qualified or through
+/// the search path -- or by its number.
+pub fn oid_of(input: &str, dict: bool) -> Option<i64> {
+    if let Ok(oid) = input.trim().parse::<i64>() {
+        return schema_and_name(oid, dict).map(|_| oid);
+    }
+    match name_parts(input).as_slice() {
+        [name] => oid_in_path(name, dict),
+        [schema, name] => oid_in(schema, name, dict),
+        [_, schema, name] => oid_in(schema, name, dict),
+        _ => None,
+    }
 }
