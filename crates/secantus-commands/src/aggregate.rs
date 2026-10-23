@@ -647,9 +647,36 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     .and_then(Bson::as_document)
                     .and_then(|d| d.get("$geoNear"))
                     .and_then(|spec| geo_near_index_filter(spec, &ctx.db_name, Some(c), storage));
+                // The stages mongod runs in its slot-based engine (RM-280):
+                // the read, when its filter is part of what is pushed down,
+                // and the stages between the markers.
+                let mut sbe_read = false;
                 let (filter, rest) = match geonear_candidate {
                     Some(cand) => (cand, pipeline),
-                    None => lift_leading_match(&crate::explain::hoist::hoist_matches(&pipeline)),
+                    None => {
+                        let hoisted = crate::explain::hoist::hoist_matches(&pipeline);
+                        let (filter, rest) = lift_leading_match(&hoisted);
+                        let is_view = |from: &str| {
+                            storage
+                                .get_collection_options(&ctx.db_name, from)
+                                .is_ok_and(|o| o.get_str("viewOn").is_ok())
+                        };
+                        match secantus_core::sbe::pushdown(&hoisted, &is_view) {
+                            Some(n) => {
+                                // Built before any document is read; a
+                                // collection that does not exist builds
+                                // nothing.
+                                if storage.collection_exists(&ctx.db_name, c).unwrap_or(false) {
+                                    secantus_core::sbe::build_check(&hoisted[..n], &vars)
+                                        .map_err(|f| parse_error(None, &f))?;
+                                }
+                                sbe_read = true;
+                                let end = n - (hoisted.len() - rest.len());
+                                (filter, mark_sbe(rest, end))
+                            }
+                            None => (filter, rest),
+                        }
+                    }
                 };
                 // A `$sort` at the front is still run by the pipeline, which
                 // keeps equal documents in the order they arrive: reading them
@@ -689,6 +716,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                         },
                     )
                 };
+                let engine = secantus_core::sbe::enter(sbe_read);
                 let bytes = match lead.sort.as_ref() {
                     // A sort or filter the read refuses is the pipeline's
                     // to report: read as if neither had been moved.
@@ -702,6 +730,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                         &format!("{}.{c}", ctx.db_name),
                     )
                 })?;
+                drop(engine);
                 // The plan the pipeline's first read runs uses its indexes
                 // once (a `$lookup`'s reads count none: measured 8.2.11).
                 let first_read = crate::explain::order::Ask {
@@ -803,6 +832,9 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .and_then(|a| a.lock().ok())
         .and_then(|g| g.client_metadata.clone());
     let _command = InCommand::enter(&ns);
+    // The pipeline's engine markers switch to SBE and back; whatever they
+    // leave, the command ends in the classic engine.
+    let _engine = secantus_core::sbe::enter(false);
     let result = run_segmented(
         input,
         &working_pipeline,
@@ -2748,9 +2780,28 @@ fn apply_union_with(
         collection_documents(storage, db, from, &Document::new(), collation)?;
     if let Some(sub) = sub_pipeline {
         let _sub = InSubPipeline::enter(SubPipeline::UnionWith);
+        // mongod plans the sub-pipeline as a query of its own, so it has its
+        // own pushdown into SBE (measured 8.2.11: `$mod` by zero in a
+        // `$group` there is SBE's 4848403).
+        let hoisted = crate::explain::hoist::hoist_matches(sub);
+        let is_view = |name: &str| {
+            storage
+                .get_collection_options(db, name)
+                .is_ok_and(|o| o.get_str("viewOn").is_ok())
+        };
+        let sub = match secantus_core::sbe::pushdown(&hoisted, &is_view) {
+            Some(end) => {
+                if storage.collection_exists(db, from).unwrap_or(false) {
+                    secantus_core::sbe::build_check(&hoisted[..end], &Document::new())
+                        .map_err(|f| parse_error(None, &f))?;
+                }
+                mark_sbe(hoisted, end)
+            }
+            None => hoisted,
+        };
         foreign = run_segmented(
             foreign,
-            sub,
+            &sub,
             db,
             Some(from),
             &Document::new(),
@@ -4992,6 +5043,17 @@ fn leading_sort(rest: &[Bson], nothing_lifted: bool) -> LeadingSort {
         out.limit = limit + skip.unwrap_or(0);
     }
     out
+}
+
+/// `rest` with its first `end` stages in SBE. A leading `$sort`, `$skip` or
+/// `$limit` evaluates no expression, and the read before the pipeline takes
+/// them: the marker goes after them, so they are still read that way.
+fn mark_sbe(rest: Vec<Bson>, end: usize) -> Vec<Bson> {
+    let start = rest[..end.min(rest.len())]
+        .iter()
+        .take_while(|s| matches!(stage_name(s), "$sort" | "$skip" | "$limit"))
+        .count();
+    secantus_core::sbe::mark(rest, start, end)
 }
 
 /// If the pipeline starts with `{$match: {...}}`, return its filter and the

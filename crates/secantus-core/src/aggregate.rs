@@ -182,6 +182,11 @@ fn apply_stage(
             let out = apply_stage(inner_name, inner_spec, docs, vars, coll)?;
             crate::hybrid::restore_metadata(out, kept)
         }
+        // Where the caller's pushdown rule moves between mongod's engines.
+        crate::sbe::ENGINE_STAGE => {
+            crate::sbe::set_active(matches!(spec, Bson::Boolean(true)));
+            Ok(docs)
+        }
         "$_secantusFusePrep" => crate::hybrid::fuse_prep_stage(docs, spec),
         "$_secantusFuse" => crate::hybrid::fuse_stage(docs, spec, vars),
         "$unwind" => unwind_stage(docs, spec),
@@ -588,7 +593,9 @@ pub fn is_constant_expression(expr: &Bson, bound: &[String]) -> bool {
             // `$similarity*` expressions 8.2 added: two literal vectors of
             // different sizes are an executor error (probed 2026-10-20). Nor
             // `$zip`, `$setField` or `$unsetField`: a literal input of the
-            // wrong type is an executor error too (probed 2026-10-22).
+            // wrong type is an executor error too (probed 2026-10-22). Nor the
+            // regex operators or `$sortArray`, whose literal input of the wrong
+            // type fails per document, in SBE with SBE's code (2026-10-23).
             if matches!(
                 op.as_str(),
                 "$rand"
@@ -602,6 +609,10 @@ pub fn is_constant_expression(expr: &Bson, bound: &[String]) -> bool {
                     | "$similarityCosine"
                     | "$similarityDotProduct"
                     | "$similarityEuclidean"
+                    | "$regexFind"
+                    | "$regexFindAll"
+                    | "$regexMatch"
+                    | "$sortArray"
             ) {
                 return false;
             }

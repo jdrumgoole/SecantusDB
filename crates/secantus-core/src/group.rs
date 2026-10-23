@@ -694,6 +694,12 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
                             merged.insert(k, val);
                         }
                     }
+                    _ if crate::sbe::active() => {
+                        return Err(Fallback::mongo(
+                            5911200,
+                            "$mergeObjects only supports objects",
+                        ))
+                    }
                     other => {
                         return Err(Fallback::mongo(
                             40400,
@@ -897,12 +903,47 @@ fn group_n(n_expr: &Bson, vars: &Document) -> R<usize> {
             ));
         }
     }
+    if crate::sbe::active() {
+        return sbe_n(n_expr, vars);
+    }
     match eval_or_missing(n_expr, &Document::new(), vars)? {
         Some(v) => validate_n(&v),
         None => Err(Fallback::mongo(
             5787902,
             "Value for 'n' must be of integral type, but found MISSING",
         )),
+    }
+}
+
+/// `n` as SBE takes it: exactly a positive long. A constant `n` is checked
+/// when the stage is built, so its error has no executor wrapper (7548606);
+/// any other is evaluated, against an empty document as the classic engine
+/// does, when a group starts (7548607). Measured 8.2.11, 2026-10-23.
+fn sbe_n(n_expr: &Bson, vars: &Document) -> R<usize> {
+    const MSG: &str = "parameter 'n' must be coercible to a positive 64-bit integer";
+    let constant =
+        crate::aggregate::is_constant_expression(n_expr, &vars.keys().cloned().collect::<Vec<_>>());
+    let n = eval_or_missing(n_expr, &Document::new(), vars)?
+        .and_then(|v| exact_long(&v))
+        .filter(|n| *n > 0);
+    match n {
+        Some(n) => usize::try_from(n).map_err(|_| Fallback::Defer),
+        None if constant => Err(Fallback::mongo(7548606, MSG).bare()),
+        None => Err(Fallback::mongo(7548607, MSG)),
+    }
+}
+
+/// A number that is exactly a long, as SBE converts one.
+fn exact_long(v: &Bson) -> Option<i64> {
+    match v {
+        Bson::Int32(n) => Some(i64::from(*n)),
+        Bson::Int64(n) => Some(*n),
+        Bson::Double(f) => (f.is_finite()
+            && f.trunc() == *f
+            && (-9.223_372_036_854_776e18..9.223_372_036_854_776e18).contains(f))
+        .then_some(*f as i64),
+        Bson::Decimal128(_) => decimal::decimal_to_i64_exact(v),
+        _ => None,
     }
 }
 
@@ -937,49 +978,107 @@ fn no_script_engine() -> Fallback {
 /// `$topN`/`$bottomN` return an array. A sort value outside the sortable subset
 /// defers to Python (its `_SortKey` handles the wider set). Mirrors the pure
 /// `_topn_finalize`.
-fn topn_result(
-    kind: TopNKind,
-    n: usize,
-    dirs: &[bool],
-    mut items: Vec<(Vec<Bson>, Bson)>,
-) -> R<Bson> {
+/// Two documents' sort keys compared under `sortBy`: an array sorts by its
+/// smallest element (its largest, descending), as in every other sort.
+fn pattern_cmp(a: &[Bson], b: &[Bson], dirs: &[bool]) -> Ordering {
+    for (i, desc) in dirs.iter().enumerate() {
+        let ord = match (a.get(i), b.get(i)) {
+            (Some(x), Some(y)) => crate::order::cmp(
+                &crate::order::sort_repr(x.clone(), *desc),
+                &crate::order::sort_repr(y.clone(), *desc),
+            ),
+            _ => Ordering::Equal,
+        };
+        let ord = if *desc { ord.reverse() } else { ord };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
+fn topn_result(kind: TopNKind, n: usize, dirs: &[bool], items: Vec<(Vec<Bson>, Bson)>) -> R<Bson> {
     for (sv, _) in &items {
         if !sv.iter().all(crate::order::is_sortable) {
             return Err(Fallback::Defer);
         }
     }
-    items.sort_by(|a, b| {
-        for (i, desc) in dirs.iter().enumerate() {
-            let (av, bv) = (a.0.get(i), b.0.get(i));
-            // An array sorts by its smallest element (largest, descending),
-            // as in every other sort.
-            let ord = match (av, bv) {
-                (Some(x), Some(y)) => crate::order::cmp(
-                    &crate::order::sort_repr(x.clone(), *desc),
-                    &crate::order::sort_repr(y.clone(), *desc),
-                ),
-                _ => Ordering::Equal,
-            };
-            let ord = if *desc { ord.reverse() } else { ord };
-            if ord != Ordering::Equal {
-                return ord;
+    let n = if matches!(kind, TopNKind::Top | TopNKind::Bottom) {
+        1
+    } else {
+        n
+    };
+    let top = matches!(kind, TopNKind::Top | TopNKind::TopN);
+    let kept = if crate::sbe::active() {
+        sbe_top_bottom_n(items, n, top, dirs)
+    } else {
+        classic_top_bottom_n(items, n, top, dirs)
+    };
+    let outputs: Vec<Bson> = kept.into_iter().map(|(_, o)| o).collect();
+    Ok(match kind {
+        TopNKind::Top | TopNKind::Bottom => outputs.into_iter().next().unwrap_or(Bson::Null),
+        TopNKind::TopN | TopNKind::BottomN => Bson::Array(outputs),
+    })
+}
+
+type Keyed = (Vec<Bson>, Bson);
+
+/// `$topN` / `$bottomN` as the classic engine keeps them
+/// (`AccumulatorTopBottomN`, 8.2.11): a multimap in sort order, a document
+/// placed after those that sort equal to it. A full map takes a document only
+/// when it is strictly better than the worst kept -- for the top the last, for
+/// the bottom the first -- and drops that one. Of documents that sort equal the
+/// first seen stays: `$bottom` over 1, 1.0, 1L is the int (RM-288).
+fn classic_top_bottom_n(items: Vec<Keyed>, n: usize, top: bool, dirs: &[bool]) -> Vec<Keyed> {
+    let mut kept: Vec<Keyed> = Vec::new();
+    for item in items {
+        if kept.len() >= n {
+            if top {
+                if pattern_cmp(&kept[kept.len() - 1].0, &item.0, dirs) != Ordering::Greater {
+                    continue;
+                }
+                kept.pop();
+            } else {
+                if pattern_cmp(&item.0, &kept[0].0, dirs) != Ordering::Greater {
+                    continue;
+                }
+                kept.remove(0);
             }
         }
-        Ordering::Equal
+        let at = kept.partition_point(|k| pattern_cmp(&k.0, &item.0, dirs) != Ordering::Greater);
+        kept.insert(at, item);
+    }
+    kept
+}
+
+/// `$topN` / `$bottomN` as SBE keeps them (`aggTopBottomNAdd` and
+/// `aggTopBottomNFinalize`, 8.2.11): a heap whose root is the worst kept, a
+/// document replacing it when it sorts strictly before it (after it, for the
+/// bottom), and the heap sorted into sort order at the end.
+fn sbe_top_bottom_n(items: Vec<Keyed>, n: usize, top: bool, dirs: &[bool]) -> Vec<Keyed> {
+    let heap_less = |a: &Keyed, b: &Keyed| {
+        let o = pattern_cmp(&a.0, &b.0, dirs);
+        if top {
+            o == Ordering::Less
+        } else {
+            o == Ordering::Greater
+        }
+    };
+    let mut heap: Vec<Keyed> = Vec::new();
+    for item in items {
+        if heap.len() < n {
+            heap.push(item);
+            crate::stl::push_heap(&mut heap, &heap_less);
+        } else if !heap.is_empty() && heap_less(&item, &heap[0]) {
+            crate::stl::pop_heap(&mut heap, &heap_less);
+            *heap.last_mut().expect("full") = item;
+            crate::stl::push_heap(&mut heap, &heap_less);
+        }
+    }
+    crate::stl::sort(&mut heap, &|a: &Keyed, b: &Keyed| {
+        pattern_cmp(&a.0, &b.0, dirs) == Ordering::Less
     });
-    let outputs: Vec<Bson> = items.into_iter().map(|(_, o)| o).collect();
-    Ok(match kind {
-        TopNKind::Top => outputs.into_iter().next().unwrap_or(Bson::Null),
-        TopNKind::Bottom => outputs.into_iter().last().unwrap_or(Bson::Null),
-        TopNKind::TopN => {
-            let k = n.min(outputs.len());
-            Bson::Array(outputs[..k].to_vec())
-        }
-        TopNKind::BottomN => {
-            let k = n.min(outputs.len());
-            Bson::Array(outputs[outputs.len() - k..].to_vec())
-        }
-    })
+    heap
 }
 
 /// Finalize an N-element accumulator to its result list. `$firstN`/`$lastN` keep
@@ -997,22 +1096,95 @@ fn nelem_result(kind: NElemKind, n: usize, vals: Vec<Bson>) -> R<Vec<Bson>> {
             Ok(vals[vals.len() - k..].to_vec())
         }
         NElemKind::Max | NElemKind::Min => {
-            let mut nn: Vec<Bson> = vals.into_iter().filter(|x| !is_null(x)).collect();
+            let nn: Vec<Bson> = vals.into_iter().filter(|x| !is_null(x)).collect();
             if !nn.iter().all(crate::order::is_sortable) {
                 return Err(Fallback::Defer);
             }
             let largest = matches!(kind, NElemKind::Max);
-            nn.sort_by(|a, b| {
-                if largest {
-                    crate::order::cmp(b, a)
-                } else {
-                    crate::order::cmp(a, b)
-                }
-            });
-            let k = n.min(nn.len());
-            Ok(nn[..k].to_vec())
+            if !crate::sbe::active() {
+                return Ok(classic_min_max_n(nn, n, largest));
+            }
+            Ok(sbe_min_max_n(nn, n, largest))
         }
     }
+}
+
+/// `$maxN` / `$minN` as the classic engine keeps them: a multimap of at most
+/// `n` values, equal ones in the order they came. A value enters a full map
+/// only when it is strictly better than the worst kept, which goes; `$maxN`
+/// reads the map from the end, so of equal values the latest comes first
+/// (`[1, 1.0, 1L]` is `[1L, 1.0, 1]`; SBE answers `[1, 1.0, 1L]`; measured
+/// 8.2.11, 2026-10-23).
+fn classic_min_max_n(vals: Vec<Bson>, n: usize, largest: bool) -> Vec<Bson> {
+    let mut kept: Vec<Bson> = Vec::new();
+    for v in vals {
+        if kept.len() >= n {
+            if largest {
+                if crate::order::cmp(&v, &kept[0]) != Ordering::Greater {
+                    continue;
+                }
+                kept.remove(0);
+            } else {
+                if crate::order::cmp(&v, kept.last().expect("full")) != Ordering::Less {
+                    continue;
+                }
+                kept.pop();
+            }
+        }
+        let at = kept.partition_point(|k| crate::order::cmp(k, &v) != Ordering::Greater);
+        kept.insert(at, v);
+    }
+    if largest {
+        kept.reverse();
+    }
+    kept
+}
+
+/// `$maxN` / `$minN` as SBE keeps them (`aggMinMaxN`, 8.2.11): a heap of at
+/// most `n` values whose root is the worst kept; a value replaces the root
+/// when it is strictly better, and the heap is sorted best first at the end.
+fn sbe_min_max_n(vals: Vec<Bson>, n: usize, largest: bool) -> Vec<Bson> {
+    let better = |a: &Bson, b: &Bson| {
+        let o = crate::order::cmp(a, b);
+        if largest {
+            o == Ordering::Greater
+        } else {
+            o == Ordering::Less
+        }
+    };
+    let mut heap: Vec<Bson> = Vec::new();
+    for v in vals {
+        if heap.len() < n {
+            heap.push(v);
+            crate::stl::push_heap(&mut heap, &better);
+        } else if !heap.is_empty() && better(&v, &heap[0]) {
+            crate::stl::pop_heap(&mut heap, &better);
+            *heap.last_mut().expect("full") = v;
+            crate::stl::push_heap(&mut heap, &better);
+        }
+    }
+    crate::stl::sort(&mut heap, &better);
+    heap
+}
+
+/// Population / sample standard deviation as SBE computes it: Welford's
+/// algorithm in doubles, a decimal taken as its nearest double, each step a
+/// separate VM operation, so the `m2` update is a multiply and then an add,
+/// never fused (`vm_arith.cpp`, `aggStdDevImpl`, 8.2.11).
+pub(crate) fn std_dev_sbe(values: &[f64], pop: bool) -> Option<f64> {
+    let n = values.len();
+    if n == 0 || (!pop && n < 2) {
+        return None;
+    }
+    let (mut mean, mut m2) = (0.0f64, 0.0f64);
+    for (i, &x) in values.iter().enumerate() {
+        let delta = x - mean;
+        mean += delta / (i + 1) as f64;
+        let product = delta * (x - mean);
+        m2 += std::hint::black_box(product);
+    }
+    let denom = if pop { n } else { n - 1 } as f64;
+    Some((m2 / denom).sqrt())
 }
 
 /// Population / sample standard deviation as mongod computes it: Welford's
@@ -1052,14 +1224,22 @@ fn update_extreme(cur: &mut Option<Bson>, v: Bson, want: Ordering) -> R<()> {
     match cur {
         None => *cur = Some(v),
         Some(existing) => {
-            // On a tie the LATER value wins: `$min` over int 1, double 1,
-            // long 1 in that order is the long, and reversed is the int
-            // (measured 8.2.11, 2026-10-10; the same for `$max`, and for two
-            // strings a collation calls equal). So a value replaces unless
-            // it is strictly worse.
-            let replace = match want {
-                Ordering::Greater => crate::order::bson_lt(&v, existing).map(|worse| !worse),
-                _ => crate::order::bson_lt(existing, &v).map(|worse| !worse),
+            // On a tie SBE keeps the LATER value and the classic engine the
+            // first: `$min` over int 1, double 1, long 1 in that order is the
+            // long in SBE and the int in classic (measured 8.2.11, 2026-10-23;
+            // the same for `$max`, and for two strings a collation calls
+            // equal). So in SBE a value replaces unless it is strictly worse,
+            // and in classic only when it is strictly better.
+            let replace = if crate::sbe::active() {
+                match want {
+                    Ordering::Greater => crate::order::bson_lt(&v, existing).map(|worse| !worse),
+                    _ => crate::order::bson_lt(existing, &v).map(|worse| !worse),
+                }
+            } else {
+                match want {
+                    Ordering::Greater => crate::order::bson_lt(existing, &v),
+                    _ => crate::order::bson_lt(&v, existing),
+                }
             };
             match replace {
                 Some(true) => *cur = Some(v),
@@ -1121,8 +1301,12 @@ fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
                 // mongod always emits the field, answering `null` when the group
                 // held no numeric value. Omitting it (which the pure code also
                 // did) dropped a key mongod always sends.
-                let v = std_dev(&values, pop).map_or(Bson::Null, Bson::Double);
-                out.insert(field.to_string(), v);
+                let v = if crate::sbe::active() {
+                    std_dev_sbe(&values, pop)
+                } else {
+                    std_dev(&values, pop)
+                };
+                out.insert(field.to_string(), v.map_or(Bson::Null, Bson::Double));
             }
             Acc::Percentile {
                 is_median,
@@ -1300,7 +1484,7 @@ pub fn pipeline_prefix_fields(stages: &[Bson]) -> Option<std::collections::BTree
                 return collect_fields(spec, &mut fields).then_some(fields);
             }
             "$count" => return Some(fields),
-            "$skip" | "$limit" => {}
+            "$skip" | "$limit" | crate::sbe::ENGINE_STAGE => {}
             "$unwind" => {
                 let (path, index) = match spec {
                     Bson::String(p) => (p.as_str(), None),
