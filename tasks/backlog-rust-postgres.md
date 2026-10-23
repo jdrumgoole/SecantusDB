@@ -835,25 +835,6 @@ batch; their tests there are regression tests.
       Backlog-ID: RP-169
       Verify: tests/backlog/test_rp_batch34.py::test_scenario[statements PostgreSQL runs that are refused]
 
-## Found by batch 32 (2026-10-23)
-
-Found while building `ALTER TYPE ... ADD / DROP ATTRIBUTE` (RP-072). The
-gap tests are scenarios in `tests/backlog/test_rp_batch32.py`, measured on
-a private 15.19 cluster. RP-156 and RP-158 were found and fixed in the same
-batch; their tests there are regression tests.
-
-- [ ] **A dropped table column takes its attnum with it.** After `alter
-      table t drop column b` on `(a, b, c)`, PostgreSQL keeps `b`'s slot
-      (`........pg.dropped.2........`, `attisdropped`), so `c` stays attnum
-      3 and `information_schema.columns.ordinal_position` 3. Here the
-      columns are renumbered (`c` is 2). A composite type's dropped
-      attributes keep their slots (`composite_alter.rs`); a table would
-      need the same attnum carried through `pg_attribute`, `pg_index`'s
-      `indkey`, `pg_attrdef`, `pg_constraint`'s `conkey` and
-      `information_schema`.
-      Backlog-ID: RP-157
-      Verify: tests/backlog/test_rp_batch32.py::test_scenario[a dropped table column leaves its attnum]
-
 ## Found by batch 26 (2026-10-22)
 
 Found while making PostgreSQL 15's `pg_dump`, `pg_dumpall` and `psql` answer
@@ -900,16 +881,6 @@ cluster.
 Found while measuring `pg_depend` (RP-105) against PostgreSQL 15.19. The gap
 tests are scenarios in `tests/backlog/test_rp_batch26.py`.
 
-- [ ] **A view's row type is not a type.** `pg_type` lists it and its
-      array, but the planner does not know them: `'v'::regtype` and
-      `'_v'::regtype` are 42704, `typarray::regtype` prints a bare oid,
-      `row(1)::v` and `'(1)'::v` are refused, and a whole-row reference to
-      the view is `record`, where PostgreSQL types it `v`. A view's row type
-      is a composite like a table's; serving it needs the view's column
-      types where the planner registers composites, which today come only
-      from planning the view.
-      Backlog-ID: RP-117
-      Verify: tests/backlog/test_rp_batch26.py::test_scenario[a view's row type is a type]
 - [ ] **The `information_schema` views over every built-in function take
       seconds** (release build, a fresh database): `routines` 3.6 s,
       `parameters` 2.5 s, `data_type_privileges` 6.4 s, `element_types` 52 s,

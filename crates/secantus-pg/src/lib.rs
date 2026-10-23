@@ -5236,6 +5236,32 @@ impl PgHandler {
             // list above keeps it OUT of the enum arm.
             composites.push((resolution, oid, fields));
         }
+        // A view's row type is a composite of its output columns, as a
+        // table's is, under the oid `pg_type` lists it with.
+        for d in self
+            .type_catalog_docs(Self::VIEW_COLLECTION)
+            .unwrap_or_default()
+            .iter()
+        {
+            let (Ok(view), Ok(row)) = (d.get_str("_id"), d.get_array("row_fields")) else {
+                continue;
+            };
+            let fields: secantus_pgplan::CompositeFields = row
+                .iter()
+                .filter_map(|f| {
+                    let f = f.as_array()?;
+                    Some((
+                        f.first()?.as_str()?.to_string(),
+                        f.get(1)?.as_str()?.to_string(),
+                    ))
+                })
+                .collect();
+            let (schema, bare) = secantus_pgplan::schemas::split_key(view);
+            let resolution = Self::type_resolution(&schema, &bare);
+            let oid = Self::view_type_oid(view);
+            types.push((resolution.clone(), oid, Vec::new()));
+            composites.push((resolution, oid, fields));
+        }
         secantus_pgplan::set_user_types(types);
         secantus_pgplan::set_user_composites(composites);
         secantus_pgplan::set_standalone_composites(
@@ -10300,12 +10326,12 @@ impl PgHandler {
                 t.columns
                     .iter()
                     .position(|c| t.field_of(&c.name).as_deref() == Some(field))
-                    .map_or(0, |i| (i + 1) as i32)
+                    .map_or(0, |i| i32::from(t.attnum(i)))
             };
             let pk: Vec<i32> = secantus_pgplan::ordered_pk_columns(&t)
                 .iter()
-                .filter_map(|p| t.columns.iter().position(|c| c.name == p.name))
-                .map(|i| (i + 1) as i32)
+                .filter_map(|p| t.attnum_of(&p.name))
+                .map(i32::from)
                 .collect();
             if !pk.is_empty() {
                 let name = pk_constraint_name(&t);
@@ -10355,10 +10381,7 @@ impl PgHandler {
                                 .strip_prefix('"')
                                 .and_then(|r| r.strip_suffix('"'))
                                 .map_or_else(|| e.clone(), |r| r.replace("\"\"", "\""));
-                            t.columns
-                                .iter()
-                                .position(|c| c.name == bare)
-                                .map_or(0, |i| (i + 1) as i32)
+                            t.attnum_of(&bare).map_or(0, i32::from)
                         })
                         .collect(),
                     None => ix
@@ -10490,8 +10513,9 @@ impl PgHandler {
     fn with_column_sources(def: TableDef, oid: Option<i64>) -> TableDef {
         let Some(oid) = oid else { return def };
         let mut def = def;
-        for (i, column) in def.columns.iter_mut().enumerate() {
-            column.source = i16::try_from(i + 1).ok().map(|attnum| (oid, attnum));
+        let attnums: Vec<i16> = (0..def.columns.len()).map(|i| def.attnum(i)).collect();
+        for (column, attnum) in def.columns.iter_mut().zip(attnums) {
+            column.source = Some((oid, attnum));
         }
         def
     }
@@ -11217,9 +11241,15 @@ impl PgHandler {
         Ok(Some(doc))
     }
 
-    fn replace_view_doc(&self, old_id: &str, doc: Document) -> PgWireResult<()> {
+    fn replace_view_doc(&self, old_id: &str, mut doc: Document) -> PgWireResult<()> {
         self.delete_type_doc(Self::VIEW_COLLECTION, old_id)?;
         let id = doc.get_str("_id").unwrap_or_default().to_string();
+        // Its row type follows its (perhaps renamed) columns.
+        if let Ok(definition) = doc.get_str("definition").map(str::to_string) {
+            if let Ok(Some(fields)) = self.describe_fields(&definition, 0, &[]) {
+                doc.insert("row_fields", Self::view_row_fields(&fields));
+            }
+        }
         self.insert_type_doc(Self::VIEW_COLLECTION, &id, doc)
     }
 
@@ -13765,6 +13795,7 @@ impl PgHandler {
             "definition": &definition,
             "check_option": check,
             "owner": owner,
+            "row_fields": Self::view_row_fields(&fields),
         };
         if existing.is_some() {
             self.storage
@@ -13787,6 +13818,30 @@ impl PgHandler {
         )?;
         self.note_uncommitted_type(Self::VIEW_COLLECTION, &name, Some(doc));
         Ok(vec![Response::Execution(Tag::new("CREATE VIEW"))])
+    }
+
+    /// A view's row type -- its output columns' names and types -- as its
+    /// catalog record keeps it, where the planner registers it as a
+    /// composite as a table's is (`v` and `v[]` are types, `row(1)::v` a
+    /// value of one).
+    fn view_row_fields(fields: &[FieldInfo]) -> Bson {
+        Bson::Array(
+            fields
+                .iter()
+                .map(|f| {
+                    let oid = i64::from(f.datatype().oid());
+                    let ty = secantus_pgplan::pgtypes::name_of_oid(oid).map_or_else(
+                        || {
+                            secantus_pgplan::value_text(&secantus_pgplan::regobj::value(
+                                "regtype", oid,
+                            ))
+                        },
+                        str::to_string,
+                    );
+                    Bson::Array(vec![Bson::String(f.name().to_string()), Bson::String(ty)])
+                })
+                .collect(),
+        )
     }
 
     /// The base type (shell or defined) resolving under `key`
@@ -16629,7 +16684,7 @@ impl PgHandler {
             }
             for (i, col) in def.columns.iter().enumerate() {
                 if let Ok(c) = col.extra.get_str("comment") {
-                    out.push((oid, (i + 1) as i32, c.to_string()));
+                    out.push((oid, i32::from(def.attnum(i)), c.to_string()));
                 }
             }
         }
@@ -17804,7 +17859,7 @@ impl PgHandler {
                         d.insert(f("table_schema"), Self::schema_of(&t));
                         d.insert(f("table_name"), t.name.as_str());
                         d.insert(f("column_name"), c.name.as_str());
-                        d.insert(f("ordinal_position"), Bson::Int32((i + 1) as i32));
+                        d.insert(f("ordinal_position"), Bson::Int32(i32::from(t.attnum(i))));
                         d.insert(f("column_default"), Self::default_expression(c));
                         // A text `YES` / `NO`, not a boolean: this is the SQL
                         // standard's view and PostgreSQL follows it.
@@ -18759,14 +18814,21 @@ impl PgHandler {
                     );
                     d.insert(f("tgnargs"), Bson::Int32(nargs as i32));
                     // `UPDATE OF c, ...`: the columns' numbers.
-                    let columns = self.lookup(table).map(|t| t.columns).unwrap_or_default();
+                    let target = self.lookup(table);
+                    let columns = target
+                        .as_ref()
+                        .map(|t| t.columns.clone())
+                        .unwrap_or_default();
                     let attnums: Vec<Bson> = t
                         .get_array("update_columns")
                         .map(|a| {
                             a.iter()
                                 .filter_map(Bson::as_str)
                                 .filter_map(|c| columns.iter().position(|col| col.name == c))
-                                .map(|i| Bson::Int32(i as i32 + 1))
+                                .map(|i| {
+                                    let n = target.as_ref().map_or(i as i16 + 1, |t| t.attnum(i));
+                                    Bson::Int32(i32::from(n))
+                                })
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -18884,9 +18946,13 @@ impl PgHandler {
                             continue;
                         }
                         let mut d = Document::new();
-                        d.insert(f("oid"), Bson::Int64(Self::attrdef_oid(&t.name, i + 1)));
+                        let adnum = i32::from(t.attnum(i));
+                        d.insert(
+                            f("oid"),
+                            Bson::Int64(Self::attrdef_oid(&t.name, adnum as usize)),
+                        );
                         d.insert(f("adrelid"), Bson::Int64(oid));
-                        d.insert(f("adnum"), Bson::Int32((i + 1) as i32));
+                        d.insert(f("adnum"), Bson::Int32(adnum));
                         // `adbin` is a parse tree in PostgreSQL, read through
                         // `pg_get_expr`. This server stores the rendered text
                         // and `pg_get_expr` hands it straight back, which is
@@ -19931,7 +19997,7 @@ impl PgHandler {
                         );
                         d.insert(
                             def.field_of("attnum").expect("column"),
-                            Bson::Int32((i + 1) as i32),
+                            Bson::Int32(i32::from(t.attnum(i))),
                         );
                         d.insert(
                             def.field_of("attisdropped").expect("column"),
@@ -19967,6 +20033,10 @@ impl PgHandler {
                             if generated { "s" } else { "" },
                         );
                         rows.push(d);
+                    }
+                    // A dropped column keeps its attnum as a dropped slot.
+                    for n in t.dropped_attnums() {
+                        rows.push(Self::dropped_attribute_row(&def, relid, i32::from(n)));
                     }
                 }
                 // A view's and a materialized view's columns are its output
@@ -20090,29 +20160,7 @@ impl PgHandler {
                     }
                     let (attnums, dropped) = slots.get(&oid).cloned().unwrap_or_default();
                     for n in &dropped {
-                        let mut d = Document::new();
-                        d.insert(def.field_of("attrelid").expect("column"), Bson::Int64(oid));
-                        d.insert(
-                            def.field_of("attname").expect("column"),
-                            format!("........pg.dropped.{n}........"),
-                        );
-                        d.insert(def.field_of("atttypid").expect("column"), Bson::Int64(0));
-                        d.insert(def.field_of("attnum").expect("column"), Bson::Int32(*n));
-                        d.insert(
-                            def.field_of("attisdropped").expect("column"),
-                            Bson::Boolean(true),
-                        );
-                        d.insert(
-                            def.field_of("attnotnull").expect("column"),
-                            Bson::Boolean(false),
-                        );
-                        d.insert(def.field_of("atttypmod").expect("column"), Bson::Int32(-1));
-                        d.insert(
-                            def.field_of("atthasdef").expect("column"),
-                            Bson::Boolean(false),
-                        );
-                        d.insert(def.field_of("attgenerated").expect("column"), "");
-                        rows.push(d);
+                        rows.push(Self::dropped_attribute_row(&def, oid, *n));
                     }
                     for (i, (fname, ftype)) in fields.iter().enumerate() {
                         let Some(atttypid) = self.type_oid_by_name(ftype) else {
@@ -20653,12 +20701,7 @@ impl PgHandler {
                         Self::PUBLIC_NAMESPACE_OID
                     };
                     // 1-based attnum, as `conkey` reports it.
-                    let attnum = |col: &str| -> Option<i32> {
-                        t.columns
-                            .iter()
-                            .position(|c| c.name == col)
-                            .map(|i| i as i32 + 1)
-                    };
+                    let attnum = |col: &str| -> Option<i32> { t.attnum_of(col).map(i32::from) };
                     let mut ordinal = 0i64;
                     let mut push = |conname: String,
                                     contype: &str,
@@ -20744,8 +20787,7 @@ impl PgHandler {
                     // PRIMARY KEY, named as PostgreSQL names an implicit one.
                     let pk_cols: Vec<i32> = secantus_pgplan::ordered_pk_columns(t)
                         .iter()
-                        .filter_map(|p| t.columns.iter().position(|c| c.name == p.name))
-                        .map(|i| i as i32 + 1)
+                        .filter_map(|p| attnum(&p.name))
                         .collect();
                     if !pk_cols.is_empty() {
                         push(
@@ -20793,7 +20835,7 @@ impl PgHandler {
                             .enumerate()
                             .filter_map(|(i, c)| {
                                 Self::expression_mentions_at(&ck.expression, &c.name)
-                                    .map(|at| (at, i as i32 + 1))
+                                    .map(|at| (at, i32::from(t.attnum(i))))
                             })
                             .collect();
                         // By first appearance in the predicate, which is the
@@ -20829,12 +20871,7 @@ impl PgHandler {
                             Some(p) => fk
                                 .ref_columns
                                 .iter()
-                                .filter_map(|rc| {
-                                    p.columns
-                                        .iter()
-                                        .position(|c| &c.name == rc)
-                                        .map(|i| i as i32 + 1)
-                                })
+                                .filter_map(|rc| p.attnum_of(rc).map(i32::from))
                                 .collect(),
                             None => Vec::new(),
                         };
@@ -22362,6 +22399,22 @@ impl PgHandler {
             ));
             Self::view_dependents(views, "view", view, seen, out);
         }
+    }
+
+    /// `pg_attribute`'s row for a dropped column's slot, `n`.
+    fn dropped_attribute_row(def: &TableDef, relid: i64, n: i32) -> Document {
+        let f = |c: &str| def.field_of(c).expect("column");
+        let mut d = Document::new();
+        d.insert(f("attrelid"), Bson::Int64(relid));
+        d.insert(f("attname"), format!("........pg.dropped.{n}........"));
+        d.insert(f("atttypid"), Bson::Int64(0));
+        d.insert(f("attnum"), Bson::Int32(n));
+        d.insert(f("attisdropped"), Bson::Boolean(true));
+        d.insert(f("attnotnull"), Bson::Boolean(false));
+        d.insert(f("atttypmod"), Bson::Int32(-1));
+        d.insert(f("atthasdef"), Bson::Boolean(false));
+        d.insert(f("attgenerated"), "");
+        d
     }
 
     /// `key`'s current value came from `source`.

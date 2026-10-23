@@ -511,6 +511,87 @@ pub struct TableDef {
 }
 
 impl TableDef {
+    /// `extra`'s record of each column's attnum, kept once a column has
+    /// been dropped (until then a column's attnum is its place).
+    const ATTNUMS: &'static str = "attnums";
+    /// `extra`'s dropped columns' attnums, the slots `pg_attribute` keeps.
+    const DROPPED_ATTNUMS: &'static str = "dropped_attnums";
+
+    fn ints(&self, key: &str) -> Option<Vec<i16>> {
+        let a = self.extra.get_array(key).ok()?;
+        Some(
+            a.iter()
+                .filter_map(|v| match v {
+                    Bson::Int32(n) => i16::try_from(*n).ok(),
+                    Bson::Int64(n) => i16::try_from(*n).ok(),
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
+
+    /// The attnum of the column at `index`: PostgreSQL numbers a table's
+    /// columns once and for good, so a dropped column leaves its number.
+    pub fn attnum(&self, index: usize) -> i16 {
+        self.ints(Self::ATTNUMS)
+            .and_then(|a| a.get(index).copied())
+            .unwrap_or_else(|| i16::try_from(index + 1).unwrap_or(i16::MAX))
+    }
+
+    /// The attnum of the column named `name`.
+    pub fn attnum_of(&self, name: &str) -> Option<i16> {
+        self.columns
+            .iter()
+            .position(|c| c.name == name)
+            .map(|i| self.attnum(i))
+    }
+
+    /// The dropped columns' attnums, ascending.
+    pub fn dropped_attnums(&self) -> Vec<i16> {
+        let mut d = self.ints(Self::DROPPED_ATTNUMS).unwrap_or_default();
+        d.sort_unstable();
+        d
+    }
+
+    /// Drop the column at `index`, leaving its attnum as a dropped slot.
+    pub fn drop_column_at(&mut self, index: usize) {
+        if index >= self.columns.len() {
+            return;
+        }
+        let mut attnums: Vec<i16> = (0..self.columns.len()).map(|i| self.attnum(i)).collect();
+        let slot = attnums.remove(index);
+        self.columns.remove(index);
+        let mut dropped = self.dropped_attnums();
+        dropped.push(slot);
+        self.extra.insert(
+            Self::ATTNUMS,
+            attnums.into_iter().map(i32::from).collect::<Vec<_>>(),
+        );
+        self.extra.insert(
+            Self::DROPPED_ATTNUMS,
+            dropped.into_iter().map(i32::from).collect::<Vec<_>>(),
+        );
+    }
+
+    /// Add a column, numbered after every attnum the table has used.
+    pub fn push_column(&mut self, column: Column) {
+        if let Some(mut attnums) = self.ints(Self::ATTNUMS) {
+            let next = attnums
+                .iter()
+                .chain(self.dropped_attnums().iter())
+                .max()
+                .copied()
+                .unwrap_or(0)
+                + 1;
+            attnums.push(next);
+            self.extra.insert(
+                Self::ATTNUMS,
+                attnums.into_iter().map(i32::from).collect::<Vec<_>>(),
+            );
+        }
+        self.columns.push(column);
+    }
+
     pub fn new(name: &str, columns: Vec<Column>) -> Self {
         Self {
             name: name.to_string(),

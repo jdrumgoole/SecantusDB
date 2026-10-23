@@ -878,8 +878,8 @@ impl PgHandler {
                     let (table, column) = name.split_once('.').unwrap_or((&name, ""));
                     let attnum = self
                         .lookup(table)
-                        .and_then(|d| d.columns.iter().position(|c| c.name == column))
-                        .map_or(0, |i| i as i32 + 1);
+                        .and_then(|d| d.attnum_of(column))
+                        .map_or(0, i32::from);
                     out.push(DdlCommand {
                         classid: PG_CLASS,
                         objid: self.relation_oid(table).unwrap_or(0),

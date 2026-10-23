@@ -358,7 +358,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "a view's row type is a type": (
         "RP-117",
-        True,
+        False,
         [
             "create view rp28_v as select 1 as one",
             "select typarray::regtype::text from pg_type where typname = 'rp28_v'",

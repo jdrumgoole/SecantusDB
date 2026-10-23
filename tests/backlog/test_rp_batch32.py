@@ -165,7 +165,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ---------------------------------------------------- open: filed here
     "a dropped table column leaves its attnum": (
         "RP-157",
-        True,
+        False,
         [
             "create table rp32_d (a int, b text, c int)",
             "alter table rp32_d drop column b",

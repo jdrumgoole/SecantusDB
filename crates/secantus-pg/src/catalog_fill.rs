@@ -313,7 +313,7 @@ impl PgHandler {
                 continue;
             };
             for (i, c) in t.columns.iter().enumerate() {
-                let attnum = i as i32 + 1;
+                let attnum = i32::from(t.attnum(i));
                 let generated = c.extra.get_str("generated").ok();
                 let expr = match generated {
                     Some(g) => g.to_string(),
