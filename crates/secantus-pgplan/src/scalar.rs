@@ -1970,6 +1970,13 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                 },
                 None => return Ok(Bson::Null),
             };
+            if name == "shobj_description" {
+                let catalog = match args.get(1) {
+                    Some(Bson::String(s)) => s.clone(),
+                    _ => return Ok(Bson::Null),
+                };
+                return Ok(crate::shared_comment(oid, &catalog).map_or(Bson::Null, Bson::String));
+            }
             let subid = if name == "col_description" {
                 match args.get(1) {
                     Some(Bson::Int32(i)) => *i,

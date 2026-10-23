@@ -200,7 +200,7 @@ impl PgHandler {
     }
 
     /// The oid of this connection's database.
-    fn current_database_oid(&self) -> PgWireResult<i64> {
+    pub(crate) fn current_database_oid(&self) -> PgWireResult<i64> {
         Ok(self
             .databases
             .all(&self.storage)?

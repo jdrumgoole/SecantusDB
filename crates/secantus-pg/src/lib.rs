@@ -77,6 +77,7 @@ mod live_notices;
 mod lock_manager;
 mod merge;
 mod object_acl;
+mod opclasses;
 mod owned;
 mod parameter_acl;
 mod partition;
@@ -97,9 +98,11 @@ mod scram_binding;
 mod server;
 mod statistic;
 mod stream_join;
+mod subscriptions;
 mod system_catalogs;
 mod table_locks;
 mod tls;
+mod transforms;
 mod triggers;
 mod ts_catalogs;
 mod ts_configs;
@@ -4930,6 +4933,7 @@ impl PgHandler {
             secantus_pgplan::collation::set_user_collations(self.user_collations());
             secantus_pgplan::ts_catalog::set_user_configs(self.user_ts_configs());
             secantus_pgplan::ts_catalog::set_user_dicts(self.user_ts_dicts());
+            secantus_pgplan::misc_alter::set_user_opclasses(self.user_opclasses());
             secantus_pgplan::ts_catalog::set_dropped_builtins(self.dropped_builtin_ts_configs());
             secantus_pgplan::collation::set_declared_collations(self.all_table_defs().map_or(
                 true,
@@ -5198,6 +5202,7 @@ impl PgHandler {
                 .collect(),
         );
         secantus_pgplan::set_object_comments(self.object_comments());
+        secantus_pgplan::set_shared_comments(self.shared_comments());
         secantus_pgplan::domains::set_user_domains(self.domains().unwrap_or_default());
         secantus_pgplan::user_agg::set_user_aggregates(self.user_aggregates().unwrap_or_default());
         // User-defined functions, so the planner can type and route a call.
@@ -13418,6 +13423,9 @@ impl PgHandler {
             "sqlExpressions": ci.expressions.clone(),
             "sqlKeys": ci.key_sql.clone(),
         };
+        if ci.opclasses.iter().any(|c| *c != 0) {
+            options.insert("sqlOpclasses", ci.opclasses.clone());
+        }
         if ci.unique {
             options.insert("unique", true);
             // `NULLS NOT DISTINCT`: a NULL key is kept, and collides.
@@ -13881,6 +13889,7 @@ impl PgHandler {
                 format!("relation \"{name}\" already exists"),
             ))));
         }
+        self.check_index_classes(&name, &ci.opclasses, ci.unique)?;
         if !ci.expressions.is_empty() {
             return self.create_expression_index(&def, &name, &ci);
         }
@@ -13950,8 +13959,12 @@ impl PgHandler {
                 || k.contains("_ops")
                 || k.contains("::regconfig")
                 || k.contains(" COLLATE ")
-        }) {
+        }) || ci.opclasses.iter().any(|c| *c != 0)
+        {
             options.insert("sqlKeys", ci.key_sql.clone());
+        }
+        if ci.opclasses.iter().any(|c| *c != 0) {
+            options.insert("sqlOpclasses", ci.opclasses.clone());
         }
         options.insert("sqlOid", self.mint_index_oid()?);
         self.storage
@@ -14853,6 +14866,12 @@ impl PgHandler {
             "text search configuration" => self.comment_on_ts_config(names, comment),
             "text search dictionary" => self.comment_on_ts_dict(names, comment),
             "conversion" => self.comment_on_conversion(names, comment),
+            "operator class" => self.comment_on_opclass(true, names, comment),
+            "operator family" => self.comment_on_opclass(false, names, comment),
+            "subscription" => {
+                self.comment_on_subscription(names.last().map_or("", String::as_str), comment)
+            }
+            "transform" => self.comment_on_transform(names, comment),
             "database" | "role" => {
                 self.comment_on_shared(kind, names.last().map_or("", String::as_str), comment)
             }
@@ -17133,6 +17152,17 @@ impl PgHandler {
         out.extend(
             self.conversion_comments()
                 .into_iter()
+                .map(|(oid, c)| (oid, 0, c)),
+        );
+        out.extend(
+            self.opclass_comments()
+                .into_iter()
+                .map(|(_, oid, c)| (oid, 0, c)),
+        );
+        out.extend(
+            self.subscription_comments()
+                .into_iter()
+                .chain(self.transform_comments())
                 .map(|(oid, c)| (oid, 0, c)),
         );
         // COMMENT ON FUNCTION / PROCEDURE, kept on the function's record,
@@ -33648,6 +33678,9 @@ impl PgHandler {
             Statement::CreateExtension { .. } => "CREATE EXTENSION",
             Statement::MiscAlter(op) => op.tag(),
             Statement::Conversion(op) => op.tag(),
+            Statement::OpClass(op) => op.tag(),
+            Statement::Subscription(op) => op.tag(),
+            Statement::Transform(op) => op.tag(),
             Statement::AccessMethod(op) => op.tag(),
             Statement::SetObjectSchema { kind, .. } => match *kind {
                 "extension" => "ALTER EXTENSION",
@@ -36059,6 +36092,19 @@ impl PgHandler {
                     ));
                 }
                 self.drop_function_casts(&target, cascade)?;
+                // An operator class's support function depends on it.
+                self.drop_opclass_members_of(
+                    true,
+                    Self::index_oid(&format!("fn:{}", target.key)),
+                    &format!(
+                        "function {}",
+                        secantus_pgplan::regobj::text(
+                            "regprocedure",
+                            Self::index_oid(&format!("fn:{}", target.key))
+                        )
+                    ),
+                    cascade,
+                )?;
                 // A DEFINED base type depends on its I/O functions; and the
                 // type's other I/O function depends on the type, so it goes
                 // too. (A shell has no such dependency: dropping the function
@@ -38878,6 +38924,9 @@ impl PgHandler {
             Statement::AlterSystem { name, value } => self.alter_system(name, value),
             Statement::TsConfig(op) => self.ts_config_statement(op),
             Statement::TsDict(op) => self.ts_dict_statement(op),
+            Statement::OpClass(op) => self.opclass_statement(op),
+            Statement::Subscription(op) => self.subscription_statement(op),
+            Statement::Transform(op) => self.transform_statement(op),
             Statement::RenameMatView {
                 matview,
                 to,

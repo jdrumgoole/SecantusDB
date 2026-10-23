@@ -255,7 +255,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ------------------------- RP-169 statements still refused with 0A000
     "statements PostgreSQL runs that are refused": (
         "RP-169",
-        True,
+        False,
         [
             "create operator family rp34_of using btree",
             "create operator class rp34_oc for type int using btree as "

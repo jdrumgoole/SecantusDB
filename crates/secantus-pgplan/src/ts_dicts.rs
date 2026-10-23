@@ -433,7 +433,7 @@ pub fn init(template: i64, options: &[(String, String)]) -> Result<Lexer> {
             })
         }
         ISPELL | THESAURUS => Err(Error::FeatureNotSupported(format!(
-            "text search dictionaries of the {} template",
+            "text search dictionaries of the {} template are not supported",
             template_name(template).unwrap_or_default()
         ))),
         _ => Err(Error::Sqlstate(

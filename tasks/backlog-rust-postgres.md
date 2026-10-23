@@ -70,6 +70,16 @@ one beside it.
   0A000: the catalogs are computed from the store, so there is no row to
   change. An UPDATE leaving rows as they are reports them, as pgjdbc's
   updatable-result-set write-back needs.
+- **Scope decision — a subscription never reaches its publisher.**
+  Logical replication between servers is multi-node, which `CLAUDE.md`
+  puts out of scope. `CREATE / ALTER / DROP SUBSCRIPTION` run as
+  PostgreSQL 15.19 runs them up to the point where it would connect, so
+  every check before that answers as PostgreSQL does. What would connect is
+  0A000, named: `CREATE SUBSCRIPTION` with `connect = true` (its default),
+  `REFRESH PUBLICATION` and a refreshing `SET / ADD / DROP PUBLICATION` on
+  an enabled subscription, `ENABLE`, and `DROP` of a subscription that
+  names a slot (outside a block; inside one PostgreSQL's 25001 comes
+  first). PostgreSQL answers 08006 when its publisher cannot be reached.
 - **Not the server — pgjdbc `ConnectionTest::pGStreamSettings`** asserts the
   CLIENT socket's receive buffer and flickers on its own.
 - **Scope decision — the sqllogictest gauge on the Rust server**
@@ -768,6 +778,37 @@ fixed in the same batch; their tests there are regression tests.
       Backlog-ID: RP-137
       Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order], tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]
 
+## Found by batch 51 (2026-10-23)
+
+Found while building operator classes, subscriptions and transforms
+(RP-169). The gap tests are scenarios in `tests/backlog/test_rp_batch51.py`,
+measured on a private 15.19 cluster. RP-201 (`shobj_description` answered
+NULL for a database's or role's comment) was found and fixed in the same
+batch; its test there is a regression test.
+
+- [ ] **`pg_describe_object`, `pg_identify_object`,
+      `pg_identify_object_as_address` and `pg_get_object_address` are
+      refused** (`function pg_describe_object(regclass, regclass, integer)
+      is not supported yet`). PostgreSQL 15.19 describes any object by
+      `(classid, objid, objsubid)`: `table pg_class`, `column relname of
+      table pg_class`, `operator class c for access method btree`. The
+      descriptions exist here for the error and notice texts that name
+      objects (a 2BP01's DETAIL, a CASCADE notice), one kind at a time; the
+      functions need `getObjectDescription`'s switch over every catalog.
+      Backlog-ID: RP-199
+      Verify: tests/backlog/test_rp_batch51.py::test_scenario[pg_describe_object and its siblings]
+- [ ] **Inside a block, `pg_get_indexdef` does not see an index the block
+      created.** It answers NULL until COMMIT, where PostgreSQL 15.19
+      answers the definition; `pg_indexes.indexdef` shows it at once. The
+      planner's published definition tables (index definitions, shared
+      comments for `shobj_description`) are read from the committed
+      catalog at the start of each statement, before the statement takes
+      the transaction's own session. `pg_get_constraintdef` is published
+      the same way and is right only because a constraint's definition
+      lives in the table's own catalog row.
+      Backlog-ID: RP-200
+      Verify: tests/backlog/test_rp_batch51.py::test_scenario[pg_get_indexdef of an index the block created]
+
 ## Found by batch 50 (2026-10-23)
 
 Found while building extended statistics (RP-099). RP-197
@@ -822,19 +863,24 @@ tests are scenarios in `tests/backlog/test_rp_batch34.py`, measured on a
 private 15.19 cluster. RP-166 and RP-167 were found and fixed in the same
 batch; their tests there are regression tests.
 
-- [ ] **Statements still refused with 0A000**, each of which PostgreSQL
-      15.19 runs (several appear in `pg_dump` output): `CREATE OPERATOR
-      FAMILY / CLASS`, `CREATE TEXT SEARCH DICTIONARY`, `CREATE / ALTER /
-      DROP SUBSCRIPTION` (with `connect = false`) and `CREATE TRANSFORM`.
-      Each refusal names the parse node (`CreateOpFamilyStmt is not
-      supported yet`). Each needs its catalog (`pg_opfamily` /
-      `pg_opclass`, `pg_ts_dict`, `pg_subscription`, `pg_transform`) kept
-      as PostgreSQL keeps it. (`ALTER EXTENSION ... UPDATE`, `ALTER
-      OPERATOR ... OWNER TO`, `ALTER COLLATION ... RENAME / REFRESH
-      VERSION`, `CREATE CONVERSION` and `CREATE ACCESS METHOD` are served
-      since batch 40.)
+- [ ] **What is left of the statements once refused with 0A000.** Batch
+      51 built `CREATE / ALTER / DROP OPERATOR FAMILY / CLASS` for the
+      btree and hash methods, text-search dictionaries over the `simple`,
+      `snowball` and `synonym` templates, subscriptions created with
+      `connect = false`, and transforms. Three parts are still refused or
+      differ from PostgreSQL 15.19:
+      - **Operator classes of the GiST, GIN, SP-GiST and BRIN methods**
+        are refused by name. Their `amadjustmembers` rules and support
+        function numbers differ from btree's, and an index over such a
+        class would need its support functions, which are C internals.
+      - **The `ispell` and `thesaurus` dictionary templates** are refused
+        by name: their dictionary and affix file formats are not read here.
+      - **`pg_subscription` lists only the current database's
+        subscriptions.** It is a shared catalog: PostgreSQL lists every
+        database's, each with its `subdbid`. Here they are kept per
+        database.
       Backlog-ID: RP-169
-      Verify: tests/backlog/test_rp_batch34.py::test_scenario[statements PostgreSQL runs that are refused]
+      Verify: tests/backlog/test_rp_batch51.py::test_scenario[a GiST operator class], tests/backlog/test_rp_batch51.py::test_scenario[ispell and thesaurus dictionaries], tests/backlog/test_rp_batch51.py::test_scenario[pg_subscription lists every database's subscriptions]
 
 ## Found by batch 26 (2026-10-22)
 

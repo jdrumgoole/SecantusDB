@@ -528,7 +528,9 @@ impl PgHandler {
                 }
             }
         }
-        if functions.is_empty() && casts.is_empty() {
+        // A transform for the type depends on it (RP-169).
+        let transforms = self.transforms_on_type(oid);
+        if functions.is_empty() && casts.is_empty() && transforms.is_empty() {
             return Ok(());
         }
         if !cascade {
@@ -546,6 +548,11 @@ impl PgHandler {
                     .iter()
                     .map(|(_, c)| format!("{c} depends on type {name}")),
             );
+            lines.extend(
+                transforms
+                    .iter()
+                    .map(|(_, t)| format!("{t} depends on type {name}")),
+            );
             return Err(Self::dependents_error_lines(&format!("type {name}"), lines));
         }
         let mut descs: Vec<String> = functions
@@ -553,7 +560,11 @@ impl PgHandler {
             .map(|f| format!("function {}", self.function_signature(f)))
             .collect();
         descs.extend(casts.iter().map(|(_, c)| c.clone()));
+        descs.extend(transforms.iter().map(|(_, t)| t.clone()));
         self.cascade_notice(&descs);
+        for (key, _) in &transforms {
+            self.drop_transform_key(key)?;
+        }
         for (key, _) in &casts {
             self.drop_cast_key(key)?;
         }

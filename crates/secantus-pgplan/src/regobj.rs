@@ -586,3 +586,37 @@ pub fn collation_names() -> Vec<(String, i64)> {
     );
     out
 }
+
+/// `pg_type`'s name of a type oid, pseudo-types included.
+fn catalog_type_name(oid: i64) -> Option<String> {
+    crate::pgtypes::name_of_oid(oid)
+        .map(str::to_string)
+        .or_else(|| {
+            crate::pgtypes::PSEUDO_TYPES
+                .iter()
+                .find(|(o, _)| *o == oid)
+                .map(|(_, n)| (*n).to_string())
+        })
+}
+
+/// The built-in binary operator `name(left, right)`, exactly those types:
+/// `(oid, result type oid)`.
+pub fn builtin_operator(name: &str, left: i64, right: i64) -> Option<(i64, i64)> {
+    let (l, r) = (crate::regtype_text(left), crate::regtype_text(right));
+    let oid = builtin_operators()
+        .iter()
+        .find(|o| o.1 == name && o.2 == l && o.3 == r)?
+        .0;
+    let result = crate::funcsig::binary_operator_result(
+        name,
+        &catalog_type_name(left)?,
+        &catalog_type_name(right)?,
+    )?;
+    let result = crate::pgtypes::oid_of_name(&result).or_else(|| {
+        crate::pgtypes::PSEUDO_TYPES
+            .iter()
+            .find(|(_, n)| *n == result)
+            .map(|(o, _)| *o)
+    })?;
+    Some((oid, result))
+}

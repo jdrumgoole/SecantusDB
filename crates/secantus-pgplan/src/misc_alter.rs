@@ -302,23 +302,49 @@ pub(crate) fn table_access_method(name: &str) -> Result<Option<String>> {
     }
 }
 
-/// One of PostgreSQL's operator classes (`pg_opclass`).
+/// An operator class (`pg_opclass`): one of PostgreSQL's, or a user's.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpClass {
+    pub oid: i64,
     pub method: i64,
+    pub schema: String,
     pub name: String,
+    pub family: i64,
     pub intype: i64,
     pub default: bool,
 }
 
 static OPCLASSES: std::sync::OnceLock<Vec<OpClass>> = std::sync::OnceLock::new();
 
+thread_local! {
+    static USER_OPCLASSES: std::cell::RefCell<std::rc::Rc<Vec<OpClass>>> =
+        std::cell::RefCell::new(std::rc::Rc::new(Vec::new()));
+}
+
 /// Install PostgreSQL's operator classes, once.
 pub fn install_opclasses(load: impl FnOnce() -> Vec<OpClass>) {
     OPCLASSES.get_or_init(load);
 }
 
-fn method_oid(method: &str) -> Option<i64> {
+/// The database's own operator classes, for the statements that follow.
+pub fn set_user_opclasses(classes: Vec<OpClass>) {
+    USER_OPCLASSES.with(|c| *c.borrow_mut() = std::rc::Rc::new(classes));
+}
+
+/// PostgreSQL's operator classes.
+pub fn builtin_opclasses() -> &'static [OpClass] {
+    OPCLASSES.get().map_or(&[], Vec::as_slice)
+}
+
+/// Every operator class: PostgreSQL's, then the database's.
+pub fn all_opclasses() -> Vec<OpClass> {
+    let mut all = builtin_opclasses().to_vec();
+    USER_OPCLASSES.with(|c| all.extend(c.borrow().iter().cloned()));
+    all
+}
+
+/// An index access method's oid.
+pub fn method_oid(method: &str) -> Option<i64> {
     Some(match method {
         "btree" => 403,
         "hash" => 405,
@@ -330,35 +356,65 @@ fn method_oid(method: &str) -> Option<i64> {
     })
 }
 
-/// Does access method `method` have an operator class named `name`?
-pub(crate) fn opclass_exists(method: &str, name: &str) -> bool {
-    let Some(oid) = method_oid(method) else {
-        return false;
+/// The class `[schema.]name` of `method` names: in that schema, or the
+/// first schema on the search path holding one (`pg_catalog` first).
+pub fn find_opclass(method: &str, parts: &[String]) -> Option<OpClass> {
+    let oid = method_oid(method)?;
+    let all = all_opclasses();
+    let of = |schema: &str, name: &str| {
+        all.iter()
+            .find(|o| o.method == oid && o.schema == schema && o.name == name)
+            .cloned()
     };
-    OPCLASSES
-        .get()
-        .is_some_and(|c| c.iter().any(|o| o.method == oid && o.name == name))
+    match parts {
+        [schema, name] => of(schema, name),
+        [name] => std::iter::once("pg_catalog".to_string())
+            .chain(crate::schemas::search_path())
+            .find_map(|s| of(&s, name)),
+        _ => None,
+    }
+}
+
+/// Does access method `method` have an operator class named `parts`?
+pub(crate) fn opclass_exists(method: &str, parts: &[String]) -> bool {
+    find_opclass(method, parts).is_some()
+}
+
+/// Is the class visible by its bare name (`OpclassIsVisible`)?
+pub fn opclass_visible(o: &OpClass) -> bool {
+    let method = o.method;
+    let all = all_opclasses();
+    std::iter::once("pg_catalog".to_string())
+        .chain(crate::schemas::search_path())
+        .find_map(|s| {
+            all.iter()
+                .find(|c| c.method == method && c.schema == s && c.name == o.name)
+                .map(|c| c.oid)
+        })
+        == Some(o.oid)
 }
 
 /// `opclass` of `method` for a key of `pg_type`, as `ResolveOpClass`
-/// takes an explicit class: `Some(default)` when it accepts the type (its
+/// takes an explicit class: `Some(class)` when it accepts the type (its
 /// input type, `varchar` for `text`'s, or a polymorphic one the type is an
 /// instance of), `None` when it does not.
-pub(crate) fn explicit_opclass(method: &str, name: &str, pg_type: &str) -> Option<bool> {
-    let oid = method_oid(method)?;
-    let ty = pg_type.trim().to_ascii_lowercase();
-    let type_oid = crate::pgtypes::oid_of_name(&ty);
-    let accepts = |intype: i64| -> bool {
-        Some(intype) == type_oid
-            || intype == 25 && matches!(ty.as_str(), "varchar" | "character varying")
-            || intype == 2277 && ty.ends_with("[]")
-            || intype == 3500 && crate::user_enum(&ty).is_some()
-            || intype == 3831 && crate::range::is_range_type(&ty)
-            || intype == 4537 && crate::range::is_multirange_type(&ty)
-            || intype == 2249 && crate::user_composite(&ty).is_some()
+pub(crate) fn explicit_opclass(method: &str, parts: &[String], pg_type: &str) -> Option<OpClass> {
+    let o = find_opclass(method, parts)?;
+    // A domain's key is its base type's (`getBaseType`).
+    let ty = match crate::domains::user_domain(pg_type) {
+        Some(d) => d.base.to_ascii_lowercase(),
+        None => pg_type.trim().to_ascii_lowercase(),
     };
-    OPCLASSES
-        .get()?
-        .iter()
-        .find_map(|o| (o.method == oid && o.name == name && accepts(o.intype)).then_some(o.default))
+    let type_oid = crate::pgtypes::oid_of_name(&ty)
+        .or_else(|| crate::user_enum(&ty).map(|e| e.0))
+        .or_else(|| crate::user_composite_oid(&ty));
+    let intype = o.intype;
+    let accepts = Some(intype) == type_oid
+        || intype == 25 && matches!(ty.as_str(), "varchar" | "character varying")
+        || intype == 2277 && ty.ends_with("[]")
+        || intype == 3500 && crate::user_enum(&ty).is_some()
+        || intype == 3831 && crate::range::is_range_type(&ty)
+        || intype == 4537 && crate::range::is_multirange_type(&ty)
+        || intype == 2249 && crate::user_composite(&ty).is_some();
+    accepts.then_some(o)
 }

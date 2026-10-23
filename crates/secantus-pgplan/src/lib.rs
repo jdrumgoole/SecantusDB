@@ -28,12 +28,15 @@ pub mod joincost;
 mod like_match;
 pub mod misc_alter;
 mod multi_assign;
+pub mod opclasses;
 mod record_fields;
 mod returning_star;
 pub mod schemas;
 mod srf_tlist;
+pub mod subscriptions;
 pub mod systypes;
 pub mod tid;
+pub mod transforms;
 pub mod ts_configs;
 pub mod ts_dicts;
 pub mod typed_tables;
@@ -984,6 +987,12 @@ pub enum Statement {
     TsConfig(ts_configs::TsConfigOp),
     /// `CREATE / ALTER / DROP TEXT SEARCH DICTIONARY` (RP-169).
     TsDict(ts_dicts::TsDictOp),
+    /// `CREATE / ALTER / DROP OPERATOR FAMILY / CLASS` (RP-169).
+    OpClass(opclasses::OpClassOp),
+    /// `CREATE / ALTER / DROP SUBSCRIPTION` (RP-169).
+    Subscription(subscriptions::SubscriptionOp),
+    /// `CREATE / DROP TRANSFORM` (RP-169).
+    Transform(transforms::TransformOp),
     /// `ALTER MATERIALIZED VIEW m RENAME TO n`.
     RenameMatView {
         matview: String,
@@ -3286,6 +3295,9 @@ pub struct CreateIndex {
     /// Each key as `pg_indexes.indexdef` prints it: `a`, `a DESC`,
     /// `a NULLS FIRST`, `lower(b)`.
     pub key_sql: Vec<String>,
+    /// Each key's operator class as `pg_index.indclass` holds it: the
+    /// explicit class's oid, or 0 for the key type's default.
+    pub opclasses: Vec<i64>,
     /// For an EXPRESSION index, every key's expression SQL over the table
     /// (a plain column key is its name); empty for a column index. Such an
     /// index holds no storage entries -- its UNIQUE is enforced by the
@@ -4876,6 +4888,14 @@ fn plan_node(
         {
             misc_alter::plan_collation_rename(&r)
         }
+        N::RenameStmt(r) if opclasses::is_class(r.rename_type).is_some() => {
+            opclasses::plan_rename(&r, opclasses::is_class(r.rename_type) == Some(true))
+        }
+        N::RenameStmt(r)
+            if ObjectType::try_from(r.rename_type) == Ok(ObjectType::ObjectSubscription) =>
+        {
+            subscriptions::plan_rename(&r)
+        }
         N::RenameStmt(r) => plan_rename(&r),
         N::AlterDatabaseStmt(a) => {
             let mut options = Vec::new();
@@ -5226,6 +5246,24 @@ fn plan_node(
             ts_dicts::plan_create(&d)
         }
         N::AlterTsdictionaryStmt(a) => ts_dicts::plan_alter(&a),
+        N::CreateOpFamilyStmt(c) => opclasses::plan_create_family(&c),
+        N::CreateOpClassStmt(c) => opclasses::plan_create_class(&c),
+        N::AlterOpFamilyStmt(a) => opclasses::plan_alter_family(&a),
+        N::AlterOwnerStmt(a) if opclasses::is_class(a.object_type).is_some() => {
+            opclasses::plan_owner(&a, opclasses::is_class(a.object_type) == Some(true))
+        }
+        N::AlterObjectSchemaStmt(a) if opclasses::is_class(a.object_type).is_some() => {
+            opclasses::plan_set_schema(&a, opclasses::is_class(a.object_type) == Some(true))
+        }
+        N::CreateSubscriptionStmt(c) => subscriptions::plan_create(&c),
+        N::AlterSubscriptionStmt(a) => subscriptions::plan_alter(&a),
+        N::DropSubscriptionStmt(d) => subscriptions::plan_drop(&d),
+        N::AlterOwnerStmt(a)
+            if ObjectType::try_from(a.object_type) == Ok(ObjectType::ObjectSubscription) =>
+        {
+            subscriptions::plan_owner(&a)
+        }
+        N::CreateTransformStmt(c) => transforms::plan_create(&c),
         N::AlterOwnerStmt(a)
             if ObjectType::try_from(a.object_type) == Ok(ObjectType::ObjectTsdictionary) =>
         {
@@ -8424,8 +8462,9 @@ pub fn core_default_opclass(method: &str, pg_type: &str) -> bool {
 
 /// An explicit operator class that does not serve the key: 42804 when the
 /// method has one of that name (for another type), else 42704 (15.19).
-fn no_such_opclass(o: &str, method: &str, pg_type: &str) -> Error {
-    if misc_alter::opclass_exists(method, o) {
+fn no_such_opclass(parts: &[String], method: &str, pg_type: &str) -> Error {
+    let o = parts.join(".");
+    if misc_alter::opclass_exists(method, parts) {
         Error::Sqlstate(
             "42804",
             format!(
@@ -8441,7 +8480,13 @@ fn no_such_opclass(o: &str, method: &str, pg_type: &str) -> Error {
     }
 }
 
-fn index_operator_class(method: &str, pg_type: &str, explicit: Option<&str>) -> Result<String> {
+fn index_operator_class(
+    method: &str,
+    pg_type: &str,
+    explicit_parts: Option<&[String]>,
+) -> Result<String> {
+    let explicit = explicit_parts.and_then(|p| p.last()).map(String::as_str);
+    let parts = explicit_parts.unwrap_or_default();
     let ty = pg_type.to_ascii_lowercase();
     let array = ty.ends_with("[]");
     let range = ty.ends_with("range") || ty.ends_with("multirange");
@@ -8514,10 +8559,18 @@ fn index_operator_class(method: &str, pg_type: &str, explicit: Option<&str>) -> 
                 }
                 // A class of the method for the key's type: printed only
                 // when it is not the type's default (`pg_get_indexdef`).
-                Some(o) => match misc_alter::explicit_opclass(method, o, pg_type) {
-                    Some(true) => Ok(String::new()),
-                    Some(false) => Ok(format!(" {o}")),
-                    None => Err(no_such_opclass(o, method, pg_type)),
+                Some(_) => match misc_alter::explicit_opclass(method, parts, pg_type) {
+                    Some(c) if c.default => Ok(String::new()),
+                    // `get_opclass_name`: qualified when not visible.
+                    Some(c) if misc_alter::opclass_visible(&c) => {
+                        Ok(format!(" {}", scalar::quote_identifier(&c.name)))
+                    }
+                    Some(c) => Ok(format!(
+                        " {}.{}",
+                        scalar::quote_identifier(&c.schema),
+                        scalar::quote_identifier(&c.name)
+                    )),
+                    None => Err(no_such_opclass(parts, method, pg_type)),
                 },
             };
         }
@@ -8592,7 +8645,7 @@ fn index_operator_class(method: &str, pg_type: &str, explicit: Option<&str>) -> 
             })
         }
         (Some(o), Some(d)) if o.ends_with(d) || o == d => Ok(String::new()),
-        (Some(o), _) => Err(no_such_opclass(o, method, pg_type)),
+        (Some(_), _) => Err(no_such_opclass(parts, method, pg_type)),
         (None, Some(_)) => Ok(String::new()),
         // btree_gin / btree_gist give GIN / GiST a class for every type a
         // btree orders.
@@ -8688,6 +8741,7 @@ fn plan_create_index(
     let ordered = matches!(method.as_str(), "btree");
     let mut columns = Vec::new();
     let mut key_sql = Vec::new();
+    let mut opclasses = Vec::new();
     let mut expressions = Vec::new();
     let mut any_expression = false;
     for p in &i.index_params {
@@ -8788,6 +8842,7 @@ fn plan_create_index(
                 }
             };
             key_sql.push(format!("{shown}{suffix}"));
+            opclasses.push(0);
             expressions.push(sql);
             // ChooseIndexColumnNames: a function key names the index after
             // the function, any other expression is `expr`.
@@ -8825,15 +8880,23 @@ fn plan_create_index(
             }
             collation::resolve(name)?;
         }
-        let opclass = e
+        let opclass: Vec<String> = e
             .opclass
             .iter()
             .filter_map(|n| match n.node.as_ref() {
                 Some(N::String(s)) => Some(s.sval.clone()),
                 _ => None,
             })
-            .next_back();
-        let opclass_sql = index_operator_class(&method, &column.pg_type, opclass.as_deref())?;
+            .collect();
+        let explicit = (!opclass.is_empty()).then_some(opclass.as_slice());
+        let opclass_sql = index_operator_class(&method, &column.pg_type, explicit)?;
+        // The class `pg_index.indclass` names: the explicit one, or 0 for
+        // the type's default.
+        opclasses.push(
+            explicit
+                .and_then(|p| misc_alter::explicit_opclass(&method, p, &column.pg_type))
+                .map_or(0, |c| c.oid),
+        );
         // A non-default NULLS ordering is recorded, not built: an index is
         // an access path here, and a query's ORDER BY places its NULLs by
         // its own clause whatever the index says.
@@ -8910,6 +8973,7 @@ fn plan_create_index(
         predicate_sql,
         method,
         key_sql,
+        opclasses,
         expressions,
     }))
 }
@@ -8929,6 +8993,34 @@ thread_local! {
 }
 
 /// Install the comments `obj_description` / `col_description` answer from.
+/// `pg_shdescription`'s `(objoid, classoid, description)`, for
+/// `shobj_description`.
+pub fn set_shared_comments(comments: Vec<(i64, i64, String)>) {
+    SHARED_COMMENTS.with(|c| *c.borrow_mut() = comments);
+}
+
+thread_local! {
+    static SHARED_COMMENTS: std::cell::RefCell<Vec<(i64, i64, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `shobj_description(oid, catalog)`: the comment `pg_shdescription` keeps
+/// for that object of that shared catalog.
+pub(crate) fn shared_comment(oid: i64, catalog: &str) -> Option<String> {
+    let class = match catalog {
+        "pg_database" => 1262,
+        "pg_authid" => 1260,
+        "pg_tablespace" => 1213,
+        _ => return None,
+    };
+    SHARED_COMMENTS.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|(o, k, _)| *o == oid && *k == class)
+            .map(|(_, _, t)| t.clone())
+    })
+}
+
 pub fn set_object_comments(comments: Vec<(i64, i32, String)>) {
     OBJECT_COMMENTS.with(|c| *c.borrow_mut() = comments);
 }
@@ -20810,6 +20902,10 @@ fn plan_comment(c: &pg_query::protobuf::CommentStmt) -> Result<Statement> {
         Ok(O::ObjectTsconfiguration) => "text search configuration",
         Ok(O::ObjectTsdictionary) => "text search dictionary",
         Ok(O::ObjectConversion) => "conversion",
+        Ok(O::ObjectOpclass) => "operator class",
+        Ok(O::ObjectOpfamily) => "operator family",
+        Ok(O::ObjectSubscription) => "subscription",
+        Ok(O::ObjectTransform) => "transform",
         _ => return Err(Error::Unsupported("COMMENT ON this kind of object".into())),
     };
     fn strings(n: &pg_query::protobuf::Node, out: &mut Vec<String>) {
@@ -35956,6 +36052,12 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
     }
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectTsdictionary) {
         return ts_dicts::plan_drop(d);
+    }
+    if let Some(class) = opclasses::is_class(d.remove_type) {
+        return opclasses::plan_drop(d, class);
+    }
+    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectTransform) {
+        return transforms::plan_drop(d);
     }
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectCollation) {
         return collation::plan_drop(d);

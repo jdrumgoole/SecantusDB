@@ -33,14 +33,11 @@ const STATIC: &[&str] = &[
 /// Catalogs that stay empty because the statement or function that writes
 /// them is refused here.
 const EMPTY: &[(&str, &str)] = &[
-    ("pg_transform", "CREATE TRANSFORM"),
     ("pg_seclabel", "SECURITY LABEL: no label provider is loaded"),
     (
         "pg_shseclabel",
         "SECURITY LABEL: no label provider is loaded",
     ),
-    ("pg_replication_origin", "pg_replication_origin_create()"),
-    ("pg_subscription", "CREATE SUBSCRIPTION"),
     ("pg_subscription_rel", "CREATE SUBSCRIPTION"),
     // The views over state nothing here can make.
     ("pg_replication_slots", "pg_create_*_replication_slot()"),
@@ -52,8 +49,6 @@ const EMPTY: &[(&str, &str)] = &[
         "pg_replication_origin_status",
         "pg_replication_origin_create()",
     ),
-    ("pg_stat_subscription", "CREATE SUBSCRIPTION"),
-    ("pg_stat_subscription_stats", "CREATE SUBSCRIPTION"),
     (
         "pg_stat_replication",
         "the replication protocol: no WAL sender runs",
@@ -84,6 +79,11 @@ const STATEFUL: &[&str] = &[
     "pg_statistic_ext_data",
     "pg_stats_ext",
     "pg_stats_ext_exprs",
+    "pg_transform",
+    "pg_subscription",
+    "pg_replication_origin",
+    "pg_stat_subscription",
+    "pg_stat_subscription_stats",
 ];
 
 /// The extensions `CREATE EXTENSION` installs here, with their control files'
@@ -162,16 +162,19 @@ pub(crate) fn builtin_conversion_pairs() -> Vec<(i64, i64, i64)> {
         .collect()
 }
 
-/// The built-in operator classes as dumped: `(opcmethod, opcname,
-/// opcintype, opcdefault)`.
+/// The built-in operator classes as dumped (`pg_opclass`: oid, opcmethod,
+/// opcname, opcnamespace, opcowner, opcfamily, opcintype, opcdefault).
 pub(crate) fn builtin_opclasses() -> Vec<secantus_pgplan::misc_alter::OpClass> {
     dumped("pg_opclass")
         .lines()
         .filter_map(|l| {
             let f: Vec<&str> = l.split('\t').collect();
             Some(secantus_pgplan::misc_alter::OpClass {
+                oid: f.first()?.parse().ok()?,
                 method: f.get(1)?.parse().ok()?,
+                schema: "pg_catalog".into(),
                 name: (*f.get(2)?).to_string(),
+                family: f.get(5)?.parse().ok()?,
                 intype: f.get(6)?.parse().ok()?,
                 default: *f.get(7)? == "t",
             })
@@ -179,7 +182,94 @@ pub(crate) fn builtin_opclasses() -> Vec<secantus_pgplan::misc_alter::OpClass> {
         .collect()
 }
 
-fn dumped(name: &str) -> &'static str {
+/// A built-in operator family: `(oid, opfmethod, opfname)`.
+pub(crate) fn builtin_opfamilies() -> &'static [(i64, i64, String)] {
+    static T: std::sync::OnceLock<Vec<(i64, i64, String)>> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        dumped("pg_opfamily")
+            .lines()
+            .filter_map(|l| {
+                let f: Vec<&str> = l.split('\t').collect();
+                Some((
+                    f.first()?.parse().ok()?,
+                    f.get(1)?.parse().ok()?,
+                    (*f.get(2)?).to_string(),
+                ))
+            })
+            .collect()
+    })
+}
+
+/// A built-in `pg_amop` or `pg_amproc` row's key: `(family, left, right,
+/// number)`.
+pub(crate) type MemberKey = (i64, i64, i64, i64);
+
+/// The built-in operators (`is_func` false) or support functions of the
+/// built-in families, by key.
+pub(crate) fn builtin_members(is_func: bool) -> &'static [MemberKey] {
+    static OPS: std::sync::OnceLock<Vec<MemberKey>> = std::sync::OnceLock::new();
+    static PROCS: std::sync::OnceLock<Vec<MemberKey>> = std::sync::OnceLock::new();
+    let (cell, name) = if is_func {
+        (&PROCS, "pg_amproc")
+    } else {
+        (&OPS, "pg_amop")
+    };
+    cell.get_or_init(|| {
+        dumped(name)
+            .lines()
+            .filter_map(|l| {
+                let f: Vec<i64> = l
+                    .split('\t')
+                    .take(5)
+                    .map(|v| v.parse().unwrap_or(0))
+                    .collect();
+                Some((*f.get(1)?, *f.get(2)?, *f.get(3)?, *f.get(4)?))
+            })
+            .collect()
+    })
+}
+
+/// What `opclasscmds.c` and `CreateTransform` check of a built-in function
+/// (`pg_proc`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BuiltinProc {
+    pub oid: i64,
+    pub name: String,
+    pub kind: char,
+    pub retset: bool,
+    pub volatile: char,
+    pub args: Vec<i64>,
+    pub ret: i64,
+}
+
+/// PostgreSQL's functions, as dumped.
+pub(crate) fn builtin_procs() -> &'static [BuiltinProc] {
+    static T: std::sync::OnceLock<Vec<BuiltinProc>> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        dumped("pg_proc")
+            .lines()
+            .filter_map(|l| {
+                let f: Vec<&str> = l.split('\t').collect();
+                let flag = |i: usize| f.get(i).and_then(|v| v.chars().next());
+                Some(BuiltinProc {
+                    oid: f.first()?.parse().ok()?,
+                    name: (*f.get(1)?).to_string(),
+                    kind: flag(9)?,
+                    retset: flag(13)? == 't',
+                    volatile: flag(14)?,
+                    ret: f.get(18)?.parse().ok()?,
+                    args: f
+                        .get(19)?
+                        .split_whitespace()
+                        .filter_map(|a| a.parse().ok())
+                        .collect(),
+                })
+            })
+            .collect()
+    })
+}
+
+pub(crate) fn dumped(name: &str) -> &'static str {
     let key = if name.contains('.') {
         name.to_string()
     } else {
@@ -245,6 +335,9 @@ impl PgHandler {
             if name == "pg_conversion" {
                 rows.extend(self.user_conversion_rows(def));
             }
+            if matches!(name, "pg_opfamily" | "pg_amop" | "pg_amproc") {
+                rows.extend(self.user_opclass_rows(name, def));
+            }
             return rows;
         }
         match name {
@@ -285,6 +378,11 @@ impl PgHandler {
                     .collect()
             }
             "pg_shdepend" => self.shdepend_rows(def),
+            "pg_transform" => self.transform_rows(def),
+            "pg_subscription"
+            | "pg_replication_origin"
+            | "pg_stat_subscription"
+            | "pg_stat_subscription_stats" => self.subscription_rows(name, def),
             "pg_hba_file_rules" => self.hba_file_rule_rows(def),
             "pg_ident_file_mappings" => self.ident_file_mapping_rows(def),
             "pg_config" => self.pg_config_rows(def),
@@ -791,6 +889,21 @@ impl PgHandler {
     /// then the ones COMMENT ON DATABASE / ROLE set, for objects that exist.
     fn shdescription_rows(&self, def: &TableDef) -> Vec<Document> {
         let f = |n: &str| def.field_of(n).expect("column");
+        self.shared_comments()
+            .into_iter()
+            .map(|(oid, class, text)| {
+                let mut d = Document::new();
+                d.insert(f("objoid"), Bson::Int64(oid));
+                d.insert(f("classoid"), Bson::Int64(class));
+                d.insert(f("description"), text);
+                d
+            })
+            .collect()
+    }
+
+    /// `pg_shdescription`: `(objoid, classoid, description)` of each shared
+    /// object's comment, `initdb`'s three databases' among them.
+    pub(crate) fn shared_comments(&self) -> Vec<(i64, i64, String)> {
         let databases = self.databases.all(&self.storage).unwrap_or_default();
         let roles = self.roles().unwrap_or_default();
         let stored = self.shared_comment_docs();
@@ -820,15 +933,6 @@ impl PgHandler {
             }
         }
         comments
-            .into_iter()
-            .map(|(oid, class, text)| {
-                let mut d = Document::new();
-                d.insert(f("objoid"), Bson::Int64(oid));
-                d.insert(f("classoid"), Bson::Int64(class));
-                d.insert(f("description"), text);
-                d
-            })
-            .collect()
     }
 
     fn shared_comment_docs(&self) -> Vec<Document> {
