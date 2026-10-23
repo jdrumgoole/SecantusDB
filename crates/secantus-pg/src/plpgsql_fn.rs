@@ -1126,6 +1126,24 @@ impl Interp<'_> {
                 } else if next != Some("(") {
                     if let Some((v, ty)) = self.scalar(&name) {
                         bound = Some((v, ty, i));
+                    } else if let Some(rec) = self.record(&name) {
+                        // A record as a whole: a value of its row type.
+                        let mut d = bson::Document::new();
+                        d.insert(secantus_pgplan::RECORD_KEY, Bson::Array(rec.values.clone()));
+                        d.insert(
+                            secantus_pgplan::RECORD_TYPES_KEY,
+                            Bson::Array(
+                                rec.columns
+                                    .iter()
+                                    .map(|(_, t)| Bson::String(t.clone()))
+                                    .collect(),
+                            ),
+                        );
+                        bound = Some((Bson::Document(d), "record".into(), i));
+                    } else if self.unassigned_record(&name) {
+                        // Unassigned, it is NULL as a whole (only a field of
+                        // it is 55000).
+                        bound = Some((Bson::Null, "record".into(), i));
                     }
                 }
             }
