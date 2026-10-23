@@ -4918,6 +4918,7 @@ impl PgHandler {
             secantus_pgplan::user_casts::set_user_casts(self.user_casts());
             secantus_pgplan::collation::set_user_collations(self.user_collations());
             secantus_pgplan::ts_catalog::set_user_configs(self.user_ts_configs());
+            secantus_pgplan::ts_catalog::set_dropped_builtins(self.dropped_builtin_ts_configs());
             secantus_pgplan::collation::set_declared_collations(self.all_table_defs().map_or(
                 true,
                 |defs| {

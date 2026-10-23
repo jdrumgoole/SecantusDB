@@ -826,16 +826,6 @@ tests are scenarios in `tests/backlog/test_rp_batch34.py`, measured on a
 private 15.19 cluster. RP-166 and RP-167 were found and fixed in the same
 batch; their tests there are regression tests.
 
-- [ ] **A built-in text-search configuration cannot be changed.**
-      PostgreSQL's built-in configurations (`english`, `danish`, ...) are
-      ordinary rows `initdb` made above the pinned range, so a superuser may
-      `ALTER TEXT SEARCH CONFIGURATION danish RENAME TO ...`, change its
-      mapping, or even DROP it. Here they are served from the dump
-      (`pg_ts_catalog.tsv`) and every change to one is 0A000 ("changing a
-      built-in text search configuration is not supported"). Modelling it
-      means a database's copy of the built-in rows that the change rewrites.
-      Backlog-ID: RP-165
-      Verify: tests/backlog/test_rp_batch34.py::test_scenario[a built-in configuration can be altered]
 - [ ] **Statements still refused with 0A000**, each of which PostgreSQL
       15.19 runs (several appear in `pg_dump` output): `CREATE OPERATOR
       FAMILY / CLASS`, `CREATE TEXT SEARCH DICTIONARY`, `CREATE / ALTER /

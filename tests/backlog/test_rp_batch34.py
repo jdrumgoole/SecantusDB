@@ -244,7 +244,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ------------------------- RP-165 a built-in configuration is changeable
     "a built-in configuration can be altered": (
         "RP-165",
-        True,
+        False,
         [
             "alter text search configuration danish rename to rp34_danish",
             "select 'rp34_danish'::regconfig::text",

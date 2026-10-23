@@ -101,6 +101,20 @@ impl PgHandler {
     /// The rows the planner reads, after a change this statement made.
     fn publish_ts_configs(&self) {
         ts_catalog::set_user_configs(self.user_ts_configs());
+        ts_catalog::set_dropped_builtins(self.dropped_builtin_ts_configs());
+    }
+
+    /// The built-in configurations the database has dropped: each leaves a
+    /// tombstone row, so the dumped one stays hidden.
+    pub(crate) fn dropped_builtin_ts_configs(&self) -> Vec<i64> {
+        self.type_catalog_docs(TS_CONFIG_COLLECTION)
+            .map(|docs| {
+                docs.iter()
+                    .filter(|d| d.get_bool("dropped").unwrap_or(false))
+                    .filter_map(|d| d.get("oid").and_then(bson_i64))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The configuration `name` names, or 42704.
@@ -134,11 +148,30 @@ impl PgHandler {
     /// owns (or a superuser).
     fn changeable_ts_config(&self, name: &QualifiedName) -> PgWireResult<UserConfig> {
         let oid = self.resolve_ts_config(name)?;
-        let Some(c) = self.user_ts_configs().into_iter().find(|c| c.oid == oid) else {
-            return Err(Self::user_error(
-                "0A000",
-                "changing a built-in text search configuration is not supported".into(),
-            ));
+        // A built-in one is an ordinary row `initdb` made, owned by the
+        // bootstrap superuser: changed, the database keeps its own copy of
+        // the row (under the same oid), which hides the dumped one.
+        let c = match self.user_ts_configs().into_iter().find(|c| c.oid == oid) {
+            Some(c) => c,
+            None => {
+                let (bare, map) = ts_catalog::builtin_config(oid).ok_or_else(|| {
+                    Self::user_error(
+                        "42704",
+                        format!(
+                            "text search configuration \"{}\" does not exist",
+                            written(name)
+                        ),
+                    )
+                })?;
+                UserConfig {
+                    oid,
+                    schema: "pg_catalog".into(),
+                    name: bare,
+                    owner: Self::bootstrap_role_name(),
+                    parser: ts_catalog::DEFAULT_PARSER,
+                    map,
+                }
+            }
         };
         let me = self.current_role_name();
         if !self.is_superuser(&me) && !self.role_is_member(&me, &c.owner) {
@@ -458,6 +491,14 @@ impl PgHandler {
                 }
                 for c in &doomed {
                     self.delete_type_doc(TS_CONFIG_COLLECTION, &key_of(&c.schema, &c.name))?;
+                    if ts_catalog::is_builtin_config(c.oid) {
+                        let key = format!("dropped:{}", c.oid);
+                        self.put(
+                            TS_CONFIG_COLLECTION,
+                            &key,
+                            bson::doc! {"_id": &key, "oid": c.oid, "dropped": true},
+                        )?;
+                    }
                 }
                 self.publish_ts_configs();
                 tag("DROP TEXT SEARCH CONFIGURATION")

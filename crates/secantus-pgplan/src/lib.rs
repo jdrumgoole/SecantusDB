@@ -23587,10 +23587,24 @@ fn finish_aggregate(
                         continue;
                     }
                 }
+                // A target that is neither an aggregate nor a grouped
+                // expression: a call of no function is PostgreSQL's 42883
+                // (RP-190), found by lowering it on its own.
                 let idx = group_prints
                     .iter()
                     .position(|p| *p == print)
-                    .ok_or_else(|| Error::Unsupported("this target".into()))?;
+                    .ok_or_else(
+                        || match row_column_expr(val, &[], params, &Document::new()) {
+                            Err(e @ Error::UndefinedFunction(_)) => e,
+                            // The executor answers this one 42883 (`err`).
+                            Err(Error::Unsupported(m))
+                                if m.starts_with("function ") && m.ends_with(')') =>
+                            {
+                                Error::Unsupported(m)
+                            }
+                            _ => Error::Unsupported("this target".into()),
+                        },
+                    )?;
                 let out = if rt.name.is_empty() {
                     group_by[idx].name.clone()
                 } else {
