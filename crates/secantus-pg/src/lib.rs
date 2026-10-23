@@ -5015,6 +5015,34 @@ impl PgHandler {
     /// Its own reads must then see those rows, and what it publishes is its
     /// own. An autocommit statement's marks outlive it until the next
     /// transaction ends, so the block itself is what is asked about.
+    /// `f`, reading through the open block's own transaction when the
+    /// block has written the catalog (RP-200): the planner's tables are
+    /// published before a statement takes the block's session, so a read
+    /// outside it saw the committed catalog alone -- an index the block
+    /// created had no `pg_get_indexdef`. Outside a block, or when the
+    /// session is already held (inside the statement), a plain read.
+    fn read_in_block<T>(&self, f: impl Fn() -> T) -> T {
+        if !self.block_wrote_catalog() || self.storage.in_user_txn() {
+            return f();
+        }
+        let Ok(mut guard) = self.txn.try_lock() else {
+            return f();
+        };
+        match guard.as_mut() {
+            Some(handle) => self
+                .storage
+                .with_user_transaction(handle, &f)
+                .unwrap_or_else(|_| {
+                    drop(guard);
+                    f()
+                }),
+            None => {
+                drop(guard);
+                f()
+            }
+        }
+    }
+
     fn block_wrote_catalog(&self) -> bool {
         self.in_transaction
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -5147,7 +5175,7 @@ impl PgHandler {
         secantus_pgplan::set_view_defs(self.view_defs());
         secantus_pgplan::set_view_defs_pretty(self.view_defs_as(1));
         secantus_pgplan::set_view_defs_marked(self.view_defs_as(2));
-        secantus_pgplan::set_index_defs(self.index_defs());
+        secantus_pgplan::set_index_defs(self.read_in_block(|| self.index_defs()));
         secantus_pgplan::set_trigger_defs(self.trigger_defs());
         secantus_pgplan::set_statistics_defs(self.statistics_defs());
         let mut sigs = self.function_sigs();
@@ -5202,7 +5230,7 @@ impl PgHandler {
                 .collect(),
         );
         secantus_pgplan::set_object_comments(self.object_comments());
-        secantus_pgplan::set_shared_comments(self.shared_comments());
+        secantus_pgplan::set_shared_comments(self.read_in_block(|| self.shared_comments()));
         secantus_pgplan::domains::set_user_domains(self.domains().unwrap_or_default());
         secantus_pgplan::user_agg::set_user_aggregates(self.user_aggregates().unwrap_or_default());
         // User-defined functions, so the planner can type and route a call.

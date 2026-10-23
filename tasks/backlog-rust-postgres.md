@@ -784,7 +784,8 @@ Found while building operator classes, subscriptions and transforms
 (RP-169). The gap tests are scenarios in `tests/backlog/test_rp_batch51.py`,
 measured on a private 15.19 cluster. RP-201 (`shobj_description` answered
 NULL for a database's or role's comment) was found and fixed in the same
-batch; its test there is a regression test.
+batch, and RP-200 (a block's own index definitions) in batch 52; their
+tests there are regression tests.
 
 - [ ] **`pg_describe_object`, `pg_identify_object`,
       `pg_identify_object_as_address` and `pg_get_object_address` are
@@ -797,17 +798,6 @@ batch; its test there is a regression test.
       functions need `getObjectDescription`'s switch over every catalog.
       Backlog-ID: RP-199
       Verify: tests/backlog/test_rp_batch51.py::test_scenario[pg_describe_object and its siblings]
-- [ ] **Inside a block, `pg_get_indexdef` does not see an index the block
-      created.** It answers NULL until COMMIT, where PostgreSQL 15.19
-      answers the definition; `pg_indexes.indexdef` shows it at once. The
-      planner's published definition tables (index definitions, shared
-      comments for `shobj_description`) are read from the committed
-      catalog at the start of each statement, before the statement takes
-      the transaction's own session. `pg_get_constraintdef` is published
-      the same way and is right only because a constraint's definition
-      lives in the table's own catalog row.
-      Backlog-ID: RP-200
-      Verify: tests/backlog/test_rp_batch51.py::test_scenario[pg_get_indexdef of an index the block created]
 - [ ] **A cancel while a huge statement is planned waits for the pass it
       lands in.** Planning a statement with a 200,000-item `IN` list runs
       for about a second in a debug build, as a sequence of passes over the

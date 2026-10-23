@@ -435,7 +435,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ------------------------------- RP-200 a block's own index definitions
     "pg_get_indexdef of an index the block created": (
         "RP-200",
-        True,
+        False,
         [
             "begin",
             "create table rp51_g (a int, b text)",
@@ -498,8 +498,8 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     "shobj_description reads a shared object's comment": (
         "RP-201",
         False,
-        # Committed, then put back: inside a block the comment is not yet
-        # visible to shobj_description here (RP-200).
+        # Committed, then put back (batch 52's scenario reads one inside a
+        # block).
         [
             "comment on database postgres is 'a database'",
             "create role rp51_cr",
