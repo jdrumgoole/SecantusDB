@@ -753,8 +753,7 @@ Not filed:
 - [ ] **Statements still refused with 0A000** (`... is not supported yet`),
       each of which PostgreSQL 15.19 runs:
       - `ALTER SYSTEM` (set and reset);
-      - `ALTER TYPE ... ADD ATTRIBUTE` / `RENAME ATTRIBUTE`, `CREATE TEXT
-        SEARCH CONFIGURATION`.
+      - `CREATE TEXT SEARCH CONFIGURATION`.
 
       Several appear in `pg_dump` output. Not checked by the test:
       `ALTER EXTENSION`, `ALTER OPERATOR`, `ALTER COLLATION`, `CREATE
@@ -786,6 +785,25 @@ fixed in the same batch; their tests there are regression tests.
       since nothing records which was made first.
       Backlog-ID: RP-137
       Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order], tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]
+
+## Found by batch 32 (2026-10-23)
+
+Found while building `ALTER TYPE ... ADD / DROP ATTRIBUTE` (RP-072). The
+gap tests are scenarios in `tests/backlog/test_rp_batch32.py`, measured on
+a private 15.19 cluster. RP-156 and RP-158 were found and fixed in the same
+batch; their tests there are regression tests.
+
+- [ ] **A dropped table column takes its attnum with it.** After `alter
+      table t drop column b` on `(a, b, c)`, PostgreSQL keeps `b`'s slot
+      (`........pg.dropped.2........`, `attisdropped`), so `c` stays attnum
+      3 and `information_schema.columns.ordinal_position` 3. Here the
+      columns are renumbered (`c` is 2). A composite type's dropped
+      attributes keep their slots (`composite_alter.rs`); a table would
+      need the same attnum carried through `pg_attribute`, `pg_index`'s
+      `indkey`, `pg_attrdef`, `pg_constraint`'s `conkey` and
+      `information_schema`.
+      Backlog-ID: RP-157
+      Verify: tests/backlog/test_rp_batch32.py::test_scenario[a dropped table column leaves its attnum]
 
 ## Found by batch 31 (2026-10-23)
 

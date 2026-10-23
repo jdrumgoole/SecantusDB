@@ -506,7 +506,12 @@ impl PgHandler {
     }
 
     /// `ALTER TYPE t RENAME ATTRIBUTE a TO b` on a composite type.
-    fn rename_attribute(&self, target: &str, attr: &str, to: &str) -> PgWireResult<Vec<Response>> {
+    pub(crate) fn rename_attribute(
+        &self,
+        target: &str,
+        attr: &str,
+        to: &str,
+    ) -> PgWireResult<Vec<Response>> {
         if self.lookup(target).is_some() {
             let mut info = ErrorInfo::new(
                 "ERROR".into(),

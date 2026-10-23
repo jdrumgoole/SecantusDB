@@ -39,6 +39,7 @@ mod catalog_meta;
 mod catalog_objects;
 mod catalog_order;
 mod collations;
+mod composite_alter;
 mod config_views;
 mod copy_text;
 mod crl;
@@ -3590,6 +3591,9 @@ pub struct PgHandler {
     /// Set while DROP SCHEMA drops what it holds: what those drops cascade
     /// to is collected here, for the schema's one notice, not sent.
     cascade_capture: Mutex<Option<Vec<String>>>,
+    /// Set while `ALTER TYPE ... CASCADE` changes its typed tables' columns,
+    /// which ALTER TABLE itself refuses.
+    typed_cascade: std::sync::atomic::AtomicBool,
     stream_portal: std::sync::atomic::AtomicU8,
     streamed: AtomicBool,
     /// The portal being allowed to stream is in a transaction block.
@@ -4123,6 +4127,7 @@ impl PgHandler {
             plan_seen: Mutex::new(std::collections::HashSet::new()),
             stream_request: std::sync::atomic::AtomicU8::new(0),
             cascade_capture: Mutex::new(None),
+            typed_cascade: std::sync::atomic::AtomicBool::new(false),
             stream_portal: std::sync::atomic::AtomicU8::new(0),
             streamed: AtomicBool::new(false),
             stream_in_block: AtomicBool::new(false),
@@ -15386,6 +15391,17 @@ impl PgHandler {
         let mut details: Vec<String> = Vec::new();
         let mut drops: Vec<String> = Vec::new();
         let mut columns: Vec<(String, String)> = Vec::new();
+        // A typed table (`CREATE TABLE ... OF type`) depends on its type;
+        // CASCADE drops the table.
+        let typed: Vec<String> = tables
+            .iter()
+            .filter(|t| t.extra.get_str(secantus_pgplan::typed_tables::OF_TYPE_KEY) == Ok(name))
+            .map(|t| t.name.clone())
+            .collect();
+        for t in &typed {
+            details.push(format!("table {t} depends on type {name}"));
+            drops.push(format!("table {t}"));
+        }
         for (ty, shown) in [(array.as_str(), array.as_str()), (name, name)] {
             for def in &tables {
                 for c in def.columns.iter().filter(|c| c.pg_type == ty && direct(c)) {
@@ -15444,6 +15460,12 @@ impl PgHandler {
             return Err(PgWireError::UserError(Box::new(info)));
         }
         self.cascade_notice(&drops);
+        for t in &typed {
+            self.internal_sql(&format!(
+                "DROP TABLE {} CASCADE",
+                secantus_pgplan::scalar::quote_identifier(t)
+            ))?;
+        }
         // One ALTER per table, dropping all of its columns at once.
         let mut by_table: Vec<(String, Vec<String>)> = Vec::new();
         for (table, column) in columns {
@@ -15472,7 +15494,7 @@ impl PgHandler {
             self.delete_type_doc(Self::DOMAIN_COLLECTION, d)?;
         }
         for (composite, field) in fields {
-            let Some(mut doc) = self
+            let Some(doc) = self
                 .type_catalog_docs(Self::COMPOSITE_COLLECTION)?
                 .iter()
                 .find(|d| d.get_str("composite") == Ok(composite.as_str()))
@@ -15481,20 +15503,16 @@ impl PgHandler {
                 continue;
             };
             let id = doc.get_str("_id").unwrap_or(&composite).to_string();
-            if let Ok(items) = doc.get_array("fields") {
-                let keep: Vec<Bson> = items
-                    .iter()
-                    .filter(|f| {
-                        !matches!(f, Bson::Array(p)
-                            if p.first().and_then(Bson::as_str) == Some(field.as_str()))
-                    })
-                    .cloned()
-                    .collect();
-                doc.insert("fields", keep);
-            }
-            doc.remove("widths");
-            self.delete_type_doc(Self::COMPOSITE_COLLECTION, &id)?;
-            self.insert_type_doc(Self::COMPOSITE_COLLECTION, &id, doc)?;
+            // As ALTER TYPE ... DROP ATTRIBUTE: its stored values lose the
+            // field, and its attnum is left as a dropped slot (RP-158).
+            self.alter_type_attributes(
+                &id,
+                vec![secantus_pgplan::typed_tables::AttributeAction::Drop {
+                    name: field,
+                    if_exists: true,
+                    cascade: true,
+                }],
+            )?;
         }
         Ok(())
     }
@@ -18154,6 +18172,16 @@ impl PgHandler {
                     ) {
                         d.insert(field, Bson::Int64(*oid));
                     }
+                    // A typed table's type (`CREATE TABLE ... OF type`).
+                    if let (Some(field), Some(oid)) = (
+                        def.field_of("reloftype"),
+                        t.extra
+                            .get_str(secantus_pgplan::typed_tables::OF_TYPE_KEY)
+                            .ok()
+                            .and_then(|ty| self.type_oid_by_name(ty)),
+                    ) {
+                        d.insert(field, Bson::Int64(oid));
+                    }
                     d.insert(
                         f("relhasindex"),
                         indexes.iter().any(|ix| ix.table.name == t.name),
@@ -19802,14 +19830,57 @@ impl PgHandler {
                     .into_iter()
                     .map(|t| t.name)
                     .collect();
+                // Each composite's attnums and dropped slots (ALTER TYPE ...
+                // DROP ATTRIBUTE keeps the slot), by oid.
+                let slots: HashMap<i64, (Vec<i32>, Vec<i32>)> = self
+                    .type_catalog_docs(Self::COMPOSITE_COLLECTION)
+                    .ok()?
+                    .iter()
+                    .filter_map(|d| {
+                        let oid = d.get("oid").and_then(bson_i64)?;
+                        let ints = |k: &str| -> Vec<i32> {
+                            d.get_array(k)
+                                .map(|a| a.iter().filter_map(bson_i64).map(|n| n as i32).collect())
+                                .unwrap_or_default()
+                        };
+                        Some((oid, (ints("attnums"), ints("dropped"))))
+                    })
+                    .collect();
                 for (cname, oid, fields) in self.composites().ok()? {
                     if table_names.contains(&cname) {
                         continue;
+                    }
+                    let (attnums, dropped) = slots.get(&oid).cloned().unwrap_or_default();
+                    for n in &dropped {
+                        let mut d = Document::new();
+                        d.insert(def.field_of("attrelid").expect("column"), Bson::Int64(oid));
+                        d.insert(
+                            def.field_of("attname").expect("column"),
+                            format!("........pg.dropped.{n}........"),
+                        );
+                        d.insert(def.field_of("atttypid").expect("column"), Bson::Int64(0));
+                        d.insert(def.field_of("attnum").expect("column"), Bson::Int32(*n));
+                        d.insert(
+                            def.field_of("attisdropped").expect("column"),
+                            Bson::Boolean(true),
+                        );
+                        d.insert(
+                            def.field_of("attnotnull").expect("column"),
+                            Bson::Boolean(false),
+                        );
+                        d.insert(def.field_of("atttypmod").expect("column"), Bson::Int32(-1));
+                        d.insert(
+                            def.field_of("atthasdef").expect("column"),
+                            Bson::Boolean(false),
+                        );
+                        d.insert(def.field_of("attgenerated").expect("column"), "");
+                        rows.push(d);
                     }
                     for (i, (fname, ftype)) in fields.iter().enumerate() {
                         let Some(atttypid) = self.type_oid_by_name(ftype) else {
                             continue;
                         };
+                        let attnum = attnums.get(i).copied().unwrap_or((i + 1) as i32);
                         let mut d = Document::new();
                         d.insert(def.field_of("attrelid").expect("column"), Bson::Int64(oid));
                         d.insert(def.field_of("attname").expect("column"), fname.as_str());
@@ -19817,10 +19888,7 @@ impl PgHandler {
                             def.field_of("atttypid").expect("column"),
                             Bson::Int64(atttypid),
                         );
-                        d.insert(
-                            def.field_of("attnum").expect("column"),
-                            Bson::Int32((i + 1) as i32),
-                        );
+                        d.insert(def.field_of("attnum").expect("column"), Bson::Int32(attnum));
                         d.insert(
                             def.field_of("attisdropped").expect("column"),
                             Bson::Boolean(false),
@@ -24298,6 +24366,12 @@ impl PgHandler {
                 Self::SCHEMA_COLLECTION.to_string(),
             ],
             Statement::AlterEnum { .. } => vec![Self::ENUM_COLLECTION.to_string()],
+            // And every table a value of the type is stored in
+            // (`capture_for_savepoints` adds them).
+            Statement::AlterTypeAttributes { .. } => vec![
+                Self::COMPOSITE_COLLECTION.to_string(),
+                CATALOG_COLLECTION.to_string(),
+            ],
             Statement::Policy(_) => vec![Self::POLICY_COLLECTION.to_string()],
             Statement::RefreshMatView { name, .. } => {
                 vec![name.clone(), Self::MATVIEW_COLLECTION.to_string()]
@@ -24416,7 +24490,11 @@ impl PgHandler {
         // A trigger or a user function can write ANY table, and nothing about
         // the statement says which. While either exists, every table is
         // captured -- once per savepoint, so the cost is paid on first touch.
-        if !self.trigger_docs()?.is_empty() || !self.user_function_docs()?.is_empty() {
+        // So can an ALTER TYPE, which rewrites every value of the type.
+        if !self.trigger_docs()?.is_empty()
+            || !self.user_function_docs()?.is_empty()
+            || matches!(stmt, Statement::AlterTypeAttributes { .. })
+        {
             wanted.extend(self.all_table_defs()?.into_iter().map(|t| t.name));
             wanted.sort();
             wanted.dedup();
@@ -24615,7 +24693,9 @@ impl PgHandler {
             A::OwnerTo(role) => {
                 return Ok(Some(A::OwnerTo(self.grantee_name(role)?)));
             }
-            A::SetPersistence(_) | A::RelOptions(_) => return Ok(Some(action.clone())),
+            A::SetPersistence(_) | A::RelOptions(_) | A::OfType(_) => {
+                return Ok(Some(action.clone()))
+            }
             // `ATExecSetStorage`: a fixed-length type is only ever PLAIN.
             A::ColumnStorage { column, storage } => {
                 let Some(c) = def.column(column) else {
@@ -24924,6 +25004,7 @@ impl PgHandler {
             A::RuleEnabled { name, enabled } => self.set_rule_enabled(table, name, *enabled),
             A::ForeignOptions(_)
             | A::SetPersistence(_)
+            | A::OfType(_)
             | A::RelOptions(_)
             | A::ColumnStorage { .. }
             | A::ColumnStatistics { .. } => Ok(()),
@@ -32500,7 +32581,7 @@ impl PgHandler {
             Statement::CreateExtension { .. } => "CREATE EXTENSION",
             Statement::DropExtension { .. } => "DROP EXTENSION",
             Statement::Comment { .. } => "COMMENT",
-            Statement::AlterEnum { .. } => "ALTER TYPE",
+            Statement::AlterEnum { .. } | Statement::AlterTypeAttributes { .. } => "ALTER TYPE",
             Statement::Policy(_) => "POLICY",
             Statement::RefreshMatView { .. } => "REFRESH MATERIALIZED VIEW",
             Statement::DropMatView { .. } => "DROP MATERIALIZED VIEW",
@@ -33992,6 +34073,9 @@ impl PgHandler {
                 Ok(vec![Response::Execution(Tag::new("DROP SCHEMA"))])
             }
 
+            Statement::AlterTypeAttributes { name, actions } => {
+                self.alter_type_attributes(&name, actions)
+            }
             Statement::CreateComposite {
                 name,
                 schema,
@@ -34644,7 +34728,16 @@ impl PgHandler {
                 target,
                 sub,
                 to,
+                cascade,
+                ..
+            } if kind == "attribute" => self.rename_attribute_cascade(&target, &sub, &to, cascade),
+            Statement::RenameObject {
+                kind,
+                target,
+                sub,
+                to,
                 missing_ok,
+                ..
             } => self.rename_object(&kind, &target, &sub, &to, missing_ok),
             Statement::DropFunction {
                 name,
@@ -35264,7 +35357,33 @@ impl PgHandler {
                 // one unit, and a half-applied ALTER would leave the catalog
                 // describing a table the rows no longer match.
                 let mut effective = Vec::new();
+                // A typed table's columns are its type's: only ALTER TYPE
+                // ... CASCADE adds or drops one (42809, as ATPrepCmd says).
+                let typed = def
+                    .extra
+                    .get_str(secantus_pgplan::typed_tables::OF_TYPE_KEY)
+                    .is_ok()
+                    && !self
+                        .typed_cascade
+                        .load(std::sync::atomic::Ordering::Relaxed);
                 for action in &actions {
+                    if typed {
+                        match action {
+                            secantus_pgplan::AlterTableAction::AddColumn { .. } => {
+                                return Err(Self::user_error(
+                                    "42809",
+                                    "cannot add column to typed table".into(),
+                                ))
+                            }
+                            secantus_pgplan::AlterTableAction::DropColumn { .. } => {
+                                return Err(Self::user_error(
+                                    "42809",
+                                    "cannot drop column from typed table".into(),
+                                ))
+                            }
+                            _ => {}
+                        }
+                    }
                     if partition::parent_of(&def).is_some() {
                         Self::refuse_partition_shape_change(action)?;
                     }
@@ -35373,6 +35492,21 @@ impl PgHandler {
                         format!("relation \"{table}\" does not exist"),
                     ))));
                 };
+                // A typed table's columns are its type's: only ALTER TYPE
+                // ... CASCADE renames one.
+                if def
+                    .extra
+                    .get_str(secantus_pgplan::typed_tables::OF_TYPE_KEY)
+                    .is_ok()
+                    && !self
+                        .typed_cascade
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    return Err(Self::user_error(
+                        "42809",
+                        "cannot rename column of typed table".into(),
+                    ));
+                }
                 let Some(old) = def.column(&column).cloned() else {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
