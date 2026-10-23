@@ -167,8 +167,9 @@ impl PgHandler {
     /// An execution error with each quoted `"schema.name"` catalog key shown
     /// as PostgreSQL names the object -- by its bare name (`relation "t"
     /// already exists`, `constraint "t_pkey"`, `table "t" does not exist`
-    /// from a DROP). A `relation ... does not exist` keeps the
-    /// qualification: it echoes the name the statement was written with.
+    /// from a DROP). A `relation ... does not exist` and a `type ... does
+    /// not exist` keep the qualification: each echoes the name the statement
+    /// was written with.
     pub(crate) fn unqualify_error(
         &self,
         e: pgwire::error::PgWireError,
@@ -176,7 +177,9 @@ impl PgHandler {
         let pgwire::error::PgWireError::UserError(mut info) = e else {
             return e;
         };
-        if info.code == "42P01" && info.message.starts_with("relation ") {
+        if info.code == "42P01" && info.message.starts_with("relation ")
+            || info.code == "42704" && info.message.starts_with("type ")
+        {
             return pgwire::error::PgWireError::UserError(info);
         }
         info.message = unqualify_text(&info.message);

@@ -31,6 +31,7 @@ impl PgHandler {
         sub: &str,
         to: &str,
         missing_ok: bool,
+        written: &str,
     ) -> PgWireResult<Vec<Response>> {
         match kind {
             "index" => self.rename_index(target, to, missing_ok),
@@ -38,7 +39,7 @@ impl PgHandler {
             "sequence" => self.rename_sequence(target, to, missing_ok),
             "trigger" => self.rename_trigger(target, sub, to),
             "rule" => self.rename_rule(target, sub, to),
-            _ => self.rename_type_object(kind, target, sub, to, missing_ok),
+            _ => self.rename_type_object(kind, target, sub, to, missing_ok, written),
         }
     }
 
@@ -315,9 +316,10 @@ impl PgHandler {
         sub: &str,
         to: &str,
         missing_ok: bool,
+        written: &str,
     ) -> PgWireResult<Vec<Response>> {
         match kind {
-            "type" | "domain" => self.rename_type(kind, target, to, missing_ok),
+            "type" | "domain" => self.rename_type(kind, target, to, missing_ok, written),
             "attribute" => self.rename_attribute(target, sub, to),
             "domain constraint" => self.rename_domain_constraint(target, sub, to),
             "schema" => self.rename_schema(target, to),
@@ -429,6 +431,7 @@ impl PgHandler {
         target: &str,
         to: &str,
         missing_ok: bool,
+        written: &str,
     ) -> PgWireResult<Vec<Response>> {
         let tag = if kind == "domain" {
             "ALTER DOMAIN"
@@ -457,7 +460,7 @@ impl PgHandler {
                     "00000",
                     format!(
                         "type \"{}\" does not exist, skipping",
-                        secantus_pgplan::pgtypes::user_type_catalog_name(target)
+                        Self::written_type_name(target, written)
                     ),
                     None,
                 );
@@ -467,7 +470,7 @@ impl PgHandler {
                 "42704",
                 format!(
                     "type \"{}\" does not exist",
-                    secantus_pgplan::pgtypes::user_type_catalog_name(target)
+                    Self::written_type_name(target, written)
                 ),
             ));
         };
@@ -514,6 +517,7 @@ impl PgHandler {
         kind: &str,
         target: &str,
         schema: &str,
+        written: &str,
     ) -> PgWireResult<Vec<Response>> {
         if schema != "pg_catalog" && !self.namespaces().iter().any(|(n, _)| n == schema) {
             return Err(error(
@@ -584,9 +588,19 @@ impl PgHandler {
             "42704",
             format!(
                 "type \"{}\" does not exist",
-                target.strip_prefix("public.").unwrap_or(target)
+                Self::written_type_name(target, written)
             ),
         ))
+    }
+
+    /// A missing type as its error names it: as the statement wrote it
+    /// (`public.nosuch`, `s.nosuch`), as PostgreSQL echoes it.
+    fn written_type_name(target: &str, written: &str) -> String {
+        if written.is_empty() {
+            secantus_pgplan::pgtypes::user_type_catalog_name(target).to_string()
+        } else {
+            written.to_string()
+        }
     }
 
     /// Move a user type's catalog row `doc` (of `coll`) into `schema`,

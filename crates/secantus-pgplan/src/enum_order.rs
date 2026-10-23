@@ -156,15 +156,18 @@ fn derived_def(
             if let Some(coll) = collation {
                 c.extra.insert("collation", coll);
             }
-            // A range, multirange or `"char"` column: a row casting to one
-            // types it, so ORDER BY sorts it by `__range_sortkey`.
+            // A range, multirange, `"char"` or citext column: a row casting
+            // to one types it, so ORDER BY sorts it by `__range_sortkey` and
+            // a citext compares as citext (RP-182).
             let ranged = all.iter().find_map(|r| match r.get(i)?.node.as_ref() {
                 Some(N::TypeCast(tc)) => {
                     let t = type_name_of(tc.type_name.as_ref()?);
                     (crate::range::is_range_type(&t)
                         || crate::range::is_multirange_type(&t)
-                        || t == crate::QUOTED_CHAR)
-                        .then_some(t)
+                        || t == crate::QUOTED_CHAR
+                        || tc.type_name.as_ref()?.array_bounds.is_empty()
+                            && crate::collation::is_citext(&t))
+                    .then_some(t)
                 }
                 _ => None,
             });
@@ -585,6 +588,11 @@ impl Rewriter<'_> {
             return None;
         }
         let name = func_name(f)?;
+        // The functions only the extension has, whatever their arguments'
+        // types: PostgreSQL finds no other candidate.
+        if let Some(template) = crate::collation::citext_only_function(&name, f.args.len()) {
+            return Self::substituted(template, &f.args);
+        }
         let first = f.args.first()?;
         let citext = crate::collation::CITEXT;
         if !self.coll_of(first).is_some_and(|(c, x)| !x && c == citext) {
@@ -607,12 +615,35 @@ impl Rewriter<'_> {
                 2,
             ) => format!("{name}(($1)::text, '(?i)' || ($2)::text)"),
             ("regexp_replace", 3) => "regexp_replace(($1)::text, ($2)::text, ($3)::text, 'i')".into(),
+            // With flags: case-insensitive unless they ask for `c`.
+            (
+                "regexp_match" | "regexp_matches" | "regexp_split_to_array"
+                | "regexp_split_to_table",
+                3,
+            ) => format!("{name}(($1)::text, ($2)::text, {})", Self::CITEXT_FLAGS.replace("$f", "$3")),
+            ("regexp_replace", 4) => format!(
+                "regexp_replace(($1)::text, ($2)::text, ($3)::text, {})",
+                Self::CITEXT_FLAGS.replace("$f", "$4")
+            ),
             ("translate", 3) => {
                 "translate(translate(($1)::text, lower(($2)::text), ($3)::text), upper(($2)::text), ($3)::text)"
                     .into()
             }
             _ => return None,
         };
+        Self::substituted(&template, &f.args)
+    }
+
+    /// citext's flags rule for the regexp functions (citext--1.4.sql):
+    /// `$f`, with `i` added unless it holds `c`.
+    const CITEXT_FLAGS: &'static str =
+        "(case when strpos(($f)::text, 'c') = 0 then ($f)::text || 'i' else ($f)::text end)";
+
+    /// `template` parsed, its `$n` replaced by the call's arguments.
+    fn substituted(
+        template: &str,
+        args: &[pg_query::protobuf::Node],
+    ) -> Option<pg_query::protobuf::Node> {
         let mut out = parse_expr(&format!("select {template}"))?;
         fn subst(node: &mut pg_query::protobuf::Node, args: &[pg_query::protobuf::Node]) {
             match node.node.as_mut() {
@@ -626,6 +657,27 @@ impl Rewriter<'_> {
                     }
                 }
                 Some(N::FuncCall(f)) => f.args.iter_mut().for_each(|a| subst(a, args)),
+                Some(N::BoolExpr(b)) => b.args.iter_mut().for_each(|a| subst(a, args)),
+                Some(N::CollateClause(c)) => {
+                    if let Some(a) = c.arg.as_deref_mut() {
+                        subst(a, args);
+                    }
+                }
+                Some(N::CaseExpr(c)) => {
+                    for w in &mut c.args {
+                        if let Some(N::CaseWhen(w)) = w.node.as_mut() {
+                            for part in [w.expr.as_deref_mut(), w.result.as_deref_mut()]
+                                .into_iter()
+                                .flatten()
+                            {
+                                subst(part, args);
+                            }
+                        }
+                    }
+                    if let Some(d) = c.defresult.as_deref_mut() {
+                        subst(d, args);
+                    }
+                }
                 Some(N::AExpr(e)) => {
                     for side in [e.lexpr.as_deref_mut(), e.rexpr.as_deref_mut()]
                         .into_iter()
@@ -654,7 +706,7 @@ impl Rewriter<'_> {
                 _ => {}
             }
         }
-        subst(&mut out, &f.args);
+        subst(&mut out, args);
         Some(out)
     }
 
@@ -1800,8 +1852,34 @@ pub(crate) fn rewrite(
         }
         Ok(())
     }
+    // A function in FROM (`regexp_split_to_table(x::citext, ...)`) is an
+    // expression like any other: `functions` holds `[call, column list]`.
+    fn range_functions(node: &mut pg_query::protobuf::Node, r: &mut Rewriter) -> Result<()> {
+        match node.node.as_mut() {
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
+                    .into_iter()
+                    .flatten()
+                {
+                    range_functions(side, r)?;
+                }
+            }
+            Some(N::RangeFunction(rf)) => {
+                for f in &mut rf.functions {
+                    if let Some(N::List(l)) = f.node.as_mut() {
+                        if let Some(call) = l.items.first_mut() {
+                            r.expr(call)?;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
     for item in &mut out.from_clause {
         join_quals(item, &mut r)?;
+        range_functions(item, &mut r)?;
     }
     for t in &mut out.target_list {
         r.expr(t)?;

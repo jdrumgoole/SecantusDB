@@ -754,6 +754,9 @@ pub enum Statement {
         missing_ok: bool,
         /// `... CASCADE` (`RENAME ATTRIBUTE` carries it to typed tables).
         cascade: bool,
+        /// The object's name as the statement wrote it, schema and all,
+        /// which a missing type's error echoes.
+        written: String,
     },
     /// `ALTER FUNCTION | PROCEDURE | ROUTINE name[(args)] ...`.
     AlterFunction {
@@ -862,6 +865,8 @@ pub enum Statement {
         kind: &'static str,
         target: String,
         schema: String,
+        /// The name as written, which a missing type's error echoes.
+        written: String,
     },
     /// `DROP EXTENSION [IF EXISTS] names [CASCADE]`.
     DropExtension {
@@ -3561,6 +3566,11 @@ fn extension_of_function(name: &str) -> Option<&'static str> {
         || pgp_pub::FUNCTIONS.contains(&name)
     {
         Some("pgcrypto")
+    } else if collation::CITEXT_ONLY_FUNCTIONS
+        .iter()
+        .any(|(n, _, _)| *n == name)
+    {
+        Some("citext")
     } else {
         scalar::extension_of_scalar(name)
     }
@@ -5167,6 +5177,7 @@ fn plan_node(
                 kind,
                 target,
                 schema: a.newschema.clone(),
+                written: parts.join("."),
             })
         }
         N::CreateFunctionStmt(f) => plan_create_function(&f),
@@ -7980,6 +7991,11 @@ fn plan_rename(r: &pg_query::protobuf::RenameStmt) -> Result<Statement> {
         _ => None,
     };
     if let Some(kind) = object_kind {
+        let written = match r.object.as_deref().and_then(|o| o.node.as_ref()) {
+            Some(N::List(l)) => string_list(&l.items).join("."),
+            Some(N::TypeName(t)) => string_list(&t.names).join("."),
+            _ => String::new(),
+        };
         let target = match (
             &r.relation,
             r.object.as_deref().and_then(|o| o.node.as_ref()),
@@ -8019,6 +8035,7 @@ fn plan_rename(r: &pg_query::protobuf::RenameStmt) -> Result<Statement> {
             missing_ok: r.missing_ok,
             cascade: pg_query::protobuf::DropBehavior::try_from(r.behavior)
                 == Ok(pg_query::protobuf::DropBehavior::DropCascade),
+            written,
         });
     }
     if ObjectType::try_from(r.rename_type) == Ok(ObjectType::ObjectPolicy) {
@@ -31833,6 +31850,8 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
                 Some(ext) => extension_canonical(ext, &text).map(Bson::String),
                 None => Ok(Bson::String(text)),
             },
+            // citext 1.6 casts a boolean through `text(boolean)`.
+            Bson::Boolean(b) if collation::is_citext_type(&name) => Ok(Bson::String(b.to_string())),
             other => Err(Error::CannotCoerce(format!(
                 "cannot cast type {} to {}",
                 display_type(inferred_type(&other)),
@@ -37763,8 +37782,10 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         {
             return range_to_multirange(value, &target);
         }
-        // `char(n)` to a text type drops the trailing blanks.
-        let value = if matches!(target.as_str(), "text" | "varchar" | "name")
+        // `char(n)` to a text type drops the trailing blanks -- and to
+        // citext, whose cast from bpchar is `rtrim1` (citext 1.6).
+        let value = if (matches!(target.as_str(), "text" | "varchar" | "name")
+            || collation::is_citext_type(&target))
             && static_type(arg, &value) == "bpchar"
         {
             trim_bpchar(value)
