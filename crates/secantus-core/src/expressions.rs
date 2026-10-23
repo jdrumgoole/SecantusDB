@@ -1372,7 +1372,11 @@ pub fn top_level_unknown_expr_operator(expr: &Bson) -> Option<String> {
         return None;
     }
     let (key, _) = d.iter().next()?;
-    if !key.starts_with('$') || KNOWN_EXPR_OPS.contains(&key.as_str()) {
+    // A DBRef name (`$id`) is a field, not an operator.
+    if !key.starts_with('$')
+        || KNOWN_EXPR_OPS.contains(&key.as_str())
+        || crate::expr_parse::field_name_problem(key).is_none()
+    {
         return None;
     }
     Some(key.clone())

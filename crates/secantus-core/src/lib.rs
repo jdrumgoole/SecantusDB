@@ -25,6 +25,7 @@ pub mod bsondoc;
 pub mod collation;
 pub mod deadline;
 pub mod diff;
+pub mod expr_parse;
 pub mod expressions;
 pub mod fallback;
 pub mod geo;

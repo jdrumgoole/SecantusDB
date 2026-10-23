@@ -262,6 +262,9 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
             );
         }
     }
+    if let Err(f) = crate::aggregate::filter_expr_parse(&query) {
+        return Ok(crate::aggregate::parse_error(None, &f).into_reply());
+    }
     // So is the projection.
     if let Some(Bson::Document(spec)) = doc.get("fields") {
         if return_new && spec.keys().any(|k| k.ends_with(".$")) {
@@ -271,6 +274,12 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                 "cannot use a positional projection and return the new document",
             )
             .into_reply());
+        }
+        if let Err(f) = secantus_core::expr_parse::projection_spec(
+            spec,
+            secantus_core::expr_parse::ProjectionKind::Find,
+        ) {
+            return Ok(crate::aggregate::parse_error(None, &f).into_reply());
         }
         if let Some(problem) = crate::find::projection_name_error(spec)
             .or_else(|| crate::find::projection_mix_error(spec))
@@ -727,7 +736,9 @@ fn pipeline_update_problem(stages: &[Bson]) -> Option<CommandError> {
             errmsg,
         ));
     }
-    crate::aggregate::validate_unknown_exprs(stages).err()
+    crate::aggregate::validate_parse(stages)
+        .and_then(|()| crate::aggregate::validate_unknown_exprs(stages))
+        .err()
 }
 
 fn decode(bytes: &[u8]) -> Result<Document, CommandError> {

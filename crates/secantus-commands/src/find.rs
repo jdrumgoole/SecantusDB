@@ -510,6 +510,11 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
 
     let filter = doc_field(doc, "filter");
+    // Each `$expr` is parsed as mongod parses it: a malformed expression is
+    // refused before any document is read.
+    if let Err(f) = crate::aggregate::filter_expr_parse(&filter) {
+        return Ok(crate::aggregate::parse_error(None, &f).into_reply());
+    }
     // An unrecognized `$expr` expression operator is rejected by mongod at parse
     // time (before any scan), so surface `168 InvalidPipelineOperator` regardless
     // of whether the collection is empty or any doc matches. (The per-doc scan
@@ -558,6 +563,14 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // rejects it at parse with a per-field 31254 / 31253 — the exact wording
     // mongo-node-driver's projection-error tests assert.
     if let Some(spec) = projection {
+        // mongod's projection parser, in its order: names, collisions,
+        // inclusion against exclusion, and every expression inside.
+        if let Err(f) = secantus_core::expr_parse::projection_spec(
+            spec,
+            secantus_core::expr_parse::ProjectionKind::Find,
+        ) {
+            return Ok(crate::aggregate::parse_error(None, &f).into_reply());
+        }
         if let Some(err) = projection_mix_error(spec) {
             return Ok(err.into_reply());
         }

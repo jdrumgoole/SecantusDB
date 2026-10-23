@@ -60,6 +60,7 @@ use crate::util::{
 };
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
 use secantus_core::collation::Collation;
+use secantus_core::fallback::Fallback;
 
 /// Refuse a pipeline that reads or writes a view whose collation is not the
 /// one the command runs under (`crate::views::involved_view_collation_problem`).
@@ -245,6 +246,11 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // A missing REQUIRED argument is a parse error too, and mongod names the
     // stage the same way. Must precede the check below, which only knows about
     // unknown operator names.
+    // Every expression and projection is parsed as mongod parses it, before
+    // any document is read; the checks after this one are narrower.
+    if let Err(e) = validate_parse(&pipeline) {
+        return Ok(e.into_reply());
+    }
     if let Err(e) = validate_stage_expr_args(&pipeline) {
         return Ok(e.into_reply());
     }
@@ -1378,7 +1384,9 @@ fn validate_project_exprs(pipeline: &[Bson]) -> Result<(), CommandError> {
 /// pipeline there is. The Python server hit exactly that; see
 /// `aggregate._expression_problem`.
 pub(crate) fn validate_unknown_exprs(pipeline: &[Bson]) -> Result<(), CommandError> {
-    const WRAPPED: [&str; 3] = ["$project", "$addFields", "$set"];
+    // `$project` is the projection parser's ([`validate_parse`]), where a
+    // single-field `{$id: 1}` is a DBRef path, not an operator.
+    const WRAPPED: [&str; 2] = ["$addFields", "$set"];
     for stage in pipeline {
         let Some(d) = stage.as_document() else {
             continue;
@@ -1412,6 +1420,131 @@ pub(crate) fn validate_unknown_exprs(pipeline: &[Bson]) -> Result<(), CommandErr
         }
     }
     Ok(())
+}
+
+/// mongod's PARSE of every stage's expressions, in pipeline order, before any
+/// document is read (`secantus_core::expr_parse`): a projection's and an
+/// `$addFields`' own structure, then each expression's. Sub-pipelines in
+/// `$lookup`, `$unionWith` and `$facet` are parsed with their stage.
+///
+/// The envelope follows the stage, as measured on 8.2.11 (2026-10-23):
+/// `$project`, `$addFields` and `$set` wrap the message as `Invalid <stage>
+/// :: caused by :: ...`; `$replaceWith`, `$replaceRoot`, `$redact`,
+/// `$match`'s `$expr`, `$lookup`'s `let` and `$setWindowFields` do not.
+pub(crate) fn validate_parse(pipeline: &[Bson]) -> Result<(), CommandError> {
+    use secantus_core::expr_parse::{self, ProjectionKind};
+    for stage in pipeline {
+        let Some(d) = stage.as_document().filter(|d| d.len() == 1) else {
+            continue;
+        };
+        let (name, spec) = d.iter().next().expect("one field");
+        let (wrapped, outcome) = match (name.as_str(), spec) {
+            ("$addFields" | "$set", Bson::Document(s)) => (true, expr_parse::add_fields_spec(s)),
+            ("$project", Bson::Document(s)) => (
+                true,
+                expr_parse::projection_spec(s, ProjectionKind::Aggregation),
+            ),
+            ("$replaceWith" | "$redact", v) => (false, expr_parse::operand(v)),
+            ("$replaceRoot", Bson::Document(s)) => {
+                (false, s.get("newRoot").map_or(Ok(()), expr_parse::operand))
+            }
+            ("$match", Bson::Document(filter)) => (false, filter_expr_parse(filter)),
+            ("$lookup", Bson::Document(s)) => {
+                if let Some(Bson::Document(vars)) = s.get("let") {
+                    if let Err(f) = vars.values().try_for_each(expr_parse::operand) {
+                        return Err(parse_error(None, &f));
+                    }
+                }
+                if let Some(Bson::Array(inner)) = s.get("pipeline") {
+                    validate_parse(inner)?;
+                }
+                continue;
+            }
+            ("$unionWith", Bson::Document(s)) => {
+                if let Some(Bson::Array(inner)) = s.get("pipeline") {
+                    validate_parse(inner)?;
+                }
+                continue;
+            }
+            ("$facet", Bson::Document(s)) => {
+                for inner in s.values() {
+                    if let Bson::Array(inner) = inner {
+                        validate_parse(inner)?;
+                    }
+                }
+                continue;
+            }
+            ("$setWindowFields", Bson::Document(s)) => (false, window_fields_parse(s)),
+            _ => continue,
+        };
+        if let Err(f) = outcome {
+            return Err(parse_error(wrapped.then_some(name.as_str()), &f));
+        }
+    }
+    Ok(())
+}
+
+/// Every `$expr` in a query filter, through `$and` / `$or` / `$nor`.
+pub(crate) fn filter_expr_parse(filter: &Document) -> Result<(), Fallback> {
+    for (k, v) in filter {
+        match (k.as_str(), v) {
+            ("$expr", v) => secantus_core::expr_parse::operand(v)?,
+            ("$and" | "$or" | "$nor", Bson::Array(items)) => {
+                for item in items {
+                    if let Bson::Document(d) = item {
+                        filter_expr_parse(d)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// `$setWindowFields`: `partitionBy` and each window function's argument.
+/// A document argument whose first field is not an operator holds named
+/// arguments (`$shift`'s `output`, `$topN`'s `n`), and a sort spec among
+/// them is not an expression.
+fn window_fields_parse(spec: &Document) -> Result<(), Fallback> {
+    use secantus_core::expr_parse::operand;
+    if let Some(v) = spec.get("partitionBy") {
+        operand(v)?;
+    }
+    let Some(Bson::Document(output)) = spec.get("output") else {
+        return Ok(());
+    };
+    for field in output.values() {
+        let Bson::Document(f) = field else { continue };
+        for (k, arg) in f {
+            if !k.starts_with('$') {
+                continue;
+            }
+            match arg {
+                Bson::Document(named)
+                    if named.keys().next().is_some_and(|k| !k.starts_with('$')) =>
+                {
+                    for (name, v) in named {
+                        if name != "sortBy" {
+                            operand(v)?;
+                        }
+                    }
+                }
+                other => operand(other)?,
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A parse error as the client sees it, under `stage`'s envelope if any.
+pub(crate) fn parse_error(stage: Option<&str>, f: &Fallback) -> CommandError {
+    let (code, message) = f.as_mongo().unwrap_or((2, "invalid expression"));
+    let message = match stage {
+        Some(name) => format!("Invalid {name} :: caused by :: {message}"),
+        None => message.to_string(),
+    };
+    CommandError::new(code, crate::util::error_code_name(code), message)
 }
 
 /// mongod's unknown-expression error, with `stage`'s envelope when it has one.
