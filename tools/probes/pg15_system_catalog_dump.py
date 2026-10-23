@@ -103,6 +103,7 @@ STATIC_TABLES = [
     "pg_catalog.pg_amproc",
     "pg_catalog.pg_conversion",
     "pg_catalog.pg_init_privs",
+    "pg_catalog.pg_opclass",
     "pg_catalog.pg_opfamily",
     # Every built-in function, type and catalog constraint (RP-102); the
     # server lists its users' objects after them.

@@ -158,6 +158,11 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
     }
     let ident_at = |name: &str| toks.iter().position(|t| unquote_ident(t.text) == name);
     let m = message.split('\n').next().unwrap_or("");
+    // A statistics type's input function refuses its literal, there.
+    if sqlstate == "0A000" && m.starts_with("cannot accept a value of type ") {
+        let lit = toks.iter().find(|t| t.text.starts_with('\''))?;
+        return pos(lit.start);
+    }
     // A set operation whose column types cannot be unified points at the
     // RIGHT arm's expression (`select null::text union select 1`, under `1`).
     if sqlstate == "42804" && m.contains(" types ") && m.ends_with("cannot be matched") {

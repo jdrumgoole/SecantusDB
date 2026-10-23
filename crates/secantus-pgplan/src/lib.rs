@@ -8374,6 +8374,25 @@ pub fn core_default_opclass(method: &str, pg_type: &str) -> bool {
     })
 }
 
+/// An explicit operator class that does not serve the key: 42804 when the
+/// method has one of that name (for another type), else 42704 (15.19).
+fn no_such_opclass(o: &str, method: &str, pg_type: &str) -> Error {
+    if misc_alter::opclass_exists(method, o) {
+        Error::Sqlstate(
+            "42804",
+            format!(
+                "operator class \"{o}\" does not accept data type {}",
+                display_type(pg_type)
+            ),
+        )
+    } else {
+        Error::Sqlstate(
+            "42704",
+            format!("operator class \"{o}\" does not exist for access method \"{method}\""),
+        )
+    }
+}
+
 fn index_operator_class(method: &str, pg_type: &str, explicit: Option<&str>) -> Result<String> {
     let ty = pg_type.to_ascii_lowercase();
     let array = ty.ends_with("[]");
@@ -8445,10 +8464,13 @@ fn index_operator_class(method: &str, pg_type: &str, explicit: Option<&str>) -> 
                 {
                     Ok(format!(" {o}"))
                 }
-                Some(o) => Err(Error::Sqlstate(
-                    "42704",
-                    format!("operator class \"{o}\" does not exist for access method \"{method}\""),
-                )),
+                // A class of the method for the key's type: printed only
+                // when it is not the type's default (`pg_get_indexdef`).
+                Some(o) => match misc_alter::explicit_opclass(method, o, pg_type) {
+                    Some(true) => Ok(String::new()),
+                    Some(false) => Ok(format!(" {o}")),
+                    None => Err(no_such_opclass(o, method, pg_type)),
+                },
             };
         }
         "gin" if array => Some("array_ops"),
@@ -8522,10 +8544,7 @@ fn index_operator_class(method: &str, pg_type: &str, explicit: Option<&str>) -> 
             })
         }
         (Some(o), Some(d)) if o.ends_with(d) || o == d => Ok(String::new()),
-        (Some(o), _) => Err(Error::Sqlstate(
-            "42704",
-            format!("operator class \"{o}\" does not exist for access method \"{method}\""),
-        )),
+        (Some(o), _) => Err(no_such_opclass(o, method, pg_type)),
         (None, Some(_)) => Ok(String::new()),
         // btree_gin / btree_gist give GIN / GiST a class for every type a
         // btree orders.
@@ -27926,12 +27945,12 @@ pub fn regtype_text(oid: i64) -> String {
         0 => return "-".to_string(),
         18 => return QUOTED_CHAR.to_string(),
         1002 => return format!("{QUOTED_CHAR}[]"),
-        // The pseudo-types a function signature names.
-        2249 => return "record".to_string(),
-        2278 => return "void".to_string(),
-        2279 => return "trigger".to_string(),
-        3838 => return "event_trigger".to_string(),
         _ => {}
+    }
+    // The pseudo-types, which a function signature or a catalog's
+    // polymorphic column names.
+    if let Some((_, name)) = pgtypes::PSEUDO_TYPES.iter().find(|(o, _)| *o == oid) {
+        return (*name).to_string();
     }
     if let Some(name) = pgtypes::name_of_oid(oid) {
         return display_type(name);
@@ -29851,7 +29870,7 @@ pub const USER_TYPE_ARRAY_OID_OFFSET: i64 = 100_000;
 /// `to_regtype('x')`), read through the grammar as `parseTypeString` reads
 /// it: an unquoted part folds to lower case, a quoted one keeps its case.
 fn text_type_oid(name: &str) -> Option<i64> {
-    if let Some(oid) = pgtypes::oid_of_name(name) {
+    if let Some(oid) = pgtypes::oid_of_name(name).or_else(|| pgtypes::pseudo_type_oid(name)) {
         return Some(oid);
     }
     let Some((parts, array)) = parsed_type_name(name) else {
@@ -29931,6 +29950,14 @@ fn user_type_oid(name: &str) -> Option<i64> {
 /// enum / composite / range / base type / domain, or an array of one.
 fn column_type_exists(name: &str) -> bool {
     let element = name.trim_end_matches("[]");
+    // A built-in with no array type (`typarray` 0) has no `t[]`.
+    if element.len() != name.len()
+        && pgtypes::BUILTIN_TYPES
+            .iter()
+            .any(|(t, _, arr)| *t == element.trim() && *arr == 0)
+    {
+        return false;
+    }
     pgtypes::is_builtin_type(element)
         || user_type_oid(element).is_some()
         || user_composite(element).is_some()
@@ -31786,6 +31813,22 @@ fn float_in(text: &str, type_name: &str) -> Result<f64> {
 }
 
 pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
+    // The statistics types' input functions refuse every value (15.19).
+    if matches!(
+        target,
+        "pg_ndistinct"
+            | "pg_dependencies"
+            | "pg_mcv_list"
+            | "pg_brin_bloom_summary"
+            | "pg_brin_minmax_multi_summary"
+    ) {
+        return match value {
+            Bson::Null => Ok(Bson::Null),
+            _ => Err(Error::FeatureNotSupported(format!(
+                "cannot accept a value of type {target}"
+            ))),
+        };
+    }
     // A domain: the base type's cast, then the domain's constraints.
     if let Some(d) = domains::user_domain(target) {
         let v = cast_value(value, &d.base)?;

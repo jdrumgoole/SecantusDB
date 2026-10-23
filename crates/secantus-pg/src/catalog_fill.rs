@@ -487,7 +487,7 @@ const DEFAULT_OPCLASSES: &[(i64, &str, i64)] = &[
     (3121, "name_ops", 19),
 ];
 
-/// `pg_opclass`: the default btree operator classes.
+/// `pg_opclass`, as PostgreSQL 15.19 declares it.
 pub(crate) fn pg_opclass_def() -> TableDef {
     TableDef::new(
         "pg_opclass",
@@ -963,24 +963,9 @@ impl PgHandler {
             .collect()
     }
 
+    /// `pg_opclass`: PostgreSQL 15.19's operator classes, as dumped.
     pub(crate) fn pg_opclass_rows(&self, def: &TableDef) -> Vec<Document> {
-        let f = |name: &str| def.field_of(name).expect("column");
-        DEFAULT_OPCLASSES
-            .iter()
-            .map(|(oid, name, ty)| {
-                let mut d = Document::new();
-                d.insert(f("oid"), Bson::Int64(*oid));
-                d.insert(f("opcmethod"), Bson::Int64(403));
-                d.insert(f("opcname"), *name);
-                d.insert(f("opcnamespace"), Bson::Int64(11));
-                d.insert(f("opcowner"), Bson::Int64(10));
-                d.insert(f("opcfamily"), Bson::Int64(0));
-                d.insert(f("opcintype"), Bson::Int64(*ty));
-                d.insert(f("opcdefault"), true);
-                d.insert(f("opckeytype"), Bson::Int64(0));
-                d
-            })
-            .collect()
+        self.static_rows("pg_opclass", def)
     }
 
     pub(crate) fn pg_am_rows(&self, def: &TableDef) -> Vec<Document> {

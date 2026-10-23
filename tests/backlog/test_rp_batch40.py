@@ -2,7 +2,8 @@
 part of RP-169 it fixed -- `ALTER EXTENSION ... UPDATE`, `ALTER OPERATOR
 ... OWNER TO`, `ALTER COLLATION ... RENAME TO` / `REFRESH VERSION`, `CREATE
 CONVERSION` and `CREATE ACCESS METHOD` -- and of RP-184 and RP-185, found
-there; and the gap tests of RP-183 and RP-186, found with them.
+there; and the tests of RP-183 and RP-186, found with them and fixed in
+batch 41.
 
 The scenarios run as `test_rp_batch34.py`'s do. The expected answers were
 measured on a private, freshly initdb'd PostgreSQL 15.19 cluster by running
@@ -180,7 +181,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # -------------------------- RP-186 the statistics types as column types
     "the statistics types are types": (
         "RP-186",
-        True,
+        False,
         [
             "create table rp40_st (a pg_ndistinct, b pg_dependencies, c pg_mcv_list,"
             " d pg_brin_bloom_summary, e pg_brin_minmax_multi_summary)",
@@ -192,7 +193,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ------------------- RP-183 an operator class of another type
     "an operator class for another type": (
         "RP-183",
-        True,
+        False,
         [
             "create table rp40_o (a int[])",
             "create index on rp40_o using btree (a jsonb_ops)",
