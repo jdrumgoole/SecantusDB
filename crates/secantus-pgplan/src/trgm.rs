@@ -308,7 +308,7 @@ pub fn call(name: &str, args: &[Bson]) -> crate::Result<Bson> {
 
 /// A `pg_trgm` operator over two texts, when `op` is one.
 pub fn operator(op: &str, a: &str, b: &str) -> Option<Bson> {
-    if !crate::extension_installed("pg_trgm") {
+    if !crate::extension_visible("pg_trgm") {
         return None;
     }
     let f = |v: f32| Bson::Double(f64::from(v));

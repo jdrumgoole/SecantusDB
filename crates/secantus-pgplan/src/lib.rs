@@ -845,12 +845,23 @@ pub enum Statement {
         names: Vec<String>,
         if_exists: bool,
     },
-    /// `CREATE EXTENSION [IF NOT EXISTS] name [...]`. The options (`SCHEMA`,
-    /// `VERSION`, `CASCADE`) are accepted and ignored: the two extensions
-    /// this server carries have one version each and live in `public`.
+    /// `CREATE EXTENSION [IF NOT EXISTS] name [SCHEMA s] [...]`. `VERSION`
+    /// and `CASCADE` are accepted and ignored: the extensions this server
+    /// carries have one version each and require no other.
     CreateExtension {
         name: String,
         if_not_exists: bool,
+        /// `SCHEMA s`: where the extension's objects go (else the creation
+        /// schema).
+        schema: Option<String>,
+    },
+    /// `ALTER TYPE | DOMAIN | EXTENSION name SET SCHEMA s`: `kind` is
+    /// `type`, `domain` or `extension`; `target` a type's catalog key (as
+    /// RENAME's), or the extension's name.
+    SetObjectSchema {
+        kind: &'static str,
+        target: String,
+        schema: String,
     },
     /// `DROP EXTENSION [IF EXISTS] names [CASCADE]`.
     DropExtension {
@@ -3513,24 +3524,91 @@ fn refuse_qualified_builtins(node: &N) -> Result<()> {
         {
             continue;
         }
-        let types: Vec<String> = f
-            .args
+        return Err(no_such_call(f, &format!("{schema}.{name}")));
+    }
+    Ok(())
+}
+
+/// 42883 for a call PostgreSQL finds no function for, at the call, its
+/// arguments' types as it prints them (`unknown` for a bare literal).
+fn no_such_call(f: &pg_query::protobuf::FuncCall, written: &str) -> Error {
+    let types: Vec<String> = f
+        .args
+        .iter()
+        .map(|a| match a.node.as_ref() {
+            Some(N::AConst(c))
+                if c.isnull || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
+            {
+                "unknown".to_string()
+            }
+            _ => display_type(&static_type(a, &Bson::Null)),
+        })
+        .collect();
+    set_error_location(f.location);
+    Error::UndefinedFunction(format!(
+        "function {written}({}) does not exist",
+        types.join(", ")
+    ))
+}
+
+/// The extension a function of this server's belongs to, by its bare name.
+fn extension_of_function(name: &str) -> Option<&'static str> {
+    if trgm::FUNCTIONS.contains(&name) {
+        Some("pg_trgm")
+    } else if pgcrypto::FUNCTIONS.contains(&name)
+        || pgp::FUNCTIONS.contains(&name)
+        || pgcrypto_raw::FUNCTIONS.contains(&name)
+        || pgp_pub::FUNCTIONS.contains(&name)
+    {
+        Some("pgcrypto")
+    } else {
+        scalar::extension_of_scalar(name)
+    }
+}
+
+/// An installed extension's function is its schema's, found as any
+/// schema's function is: unqualified only while the search path reaches
+/// that schema, qualified only with it (`pg_catalog.similarity` is 42883).
+/// PostgreSQL 15.19 measured.
+fn refuse_invisible_extension_functions(node: &N) -> Result<()> {
+    for (n, _, _, _) in node.nodes() {
+        let pg_query::NodeRef::FuncCall(f) = n else {
+            continue;
+        };
+        let parts: Vec<&str> = f
+            .funcname
             .iter()
-            .map(|a| match a.node.as_ref() {
-                Some(N::AConst(c))
-                    if c.isnull
-                        || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
-                {
-                    "unknown".to_string()
-                }
-                _ => display_type(&static_type(a, &Bson::Null)),
+            .filter_map(|n| match n.node.as_ref()? {
+                N::String(st) => Some(st.sval.as_str()),
+                _ => None,
             })
             .collect();
-        set_error_location(f.location);
-        return Err(Error::UndefinedFunction(format!(
-            "function {schema}.{name}({}) does not exist",
-            types.join(", ")
-        )));
+        let (schema, name) = match parts.as_slice() {
+            [name] => (None, *name),
+            [.., schema, name] => (Some(*schema), *name),
+            [] => continue,
+        };
+        let Some(home) = extension_of_function(name).and_then(extension_schema) else {
+            continue;
+        };
+        let written = schemas::routine_name(parts.iter().copied());
+        if written
+            .as_deref()
+            .is_some_and(correlated::user_function_named)
+        {
+            continue;
+        }
+        let found = match schema {
+            Some(s) => s == home,
+            None => home == "pg_catalog" || schemas::search_path().contains(&home),
+        };
+        if !found {
+            let shown = match schema {
+                Some(s) => format!("{s}.{name}"),
+                None => name.to_string(),
+            };
+            return Err(no_such_call(f, &shown));
+        }
     }
     Ok(())
 }
@@ -4264,6 +4342,7 @@ fn qualify_type_error(e: Error, node: &pg_query::protobuf::Node) -> Error {
 /// planned.
 fn rewrite_statement(node: &mut N) -> Result<()> {
     check_type_schemas(node)?;
+    schemas::resolve_type_names(node)?;
     func_cast::check_variadic_arity(node)?;
     func_cast::spread_variadic(node);
     func_cast::rewrite(node);
@@ -4596,6 +4675,7 @@ fn plan_node(
     params: &[Bson],
 ) -> Result<Statement> {
     refuse_qualified_builtins(&node)?;
+    refuse_invisible_extension_functions(&node)?;
     if let Some(st) = fdw::plan(&node, lookup, params)? {
         return Ok(st);
     }
@@ -5051,6 +5131,34 @@ fn plan_node(
         {
             ts_configs::plan_set_schema(&a)
         }
+        N::AlterObjectSchemaStmt(a)
+            if matches!(
+                ObjectType::try_from(a.object_type),
+                Ok(ObjectType::ObjectType | ObjectType::ObjectDomain | ObjectType::ObjectExtension)
+            ) =>
+        {
+            let kind = match ObjectType::try_from(a.object_type) {
+                Ok(ObjectType::ObjectExtension) => "extension",
+                Ok(ObjectType::ObjectDomain) => "domain",
+                _ => "type",
+            };
+            let parts: Vec<String> = match a.object.as_deref().and_then(|o| o.node.as_ref()) {
+                Some(N::String(s)) => vec![s.sval.clone()],
+                Some(N::List(l)) => string_list(&l.items),
+                Some(N::TypeName(t)) => string_list(&t.names),
+                _ => return Err(Error::Parse("SET SCHEMA without an object".into())),
+            };
+            let target = if kind == "extension" {
+                parts.join(".")
+            } else {
+                schemas::type_key(&parts)
+            };
+            Ok(Statement::SetObjectSchema {
+                kind,
+                target,
+                schema: a.newschema.clone(),
+            })
+        }
         N::CreateFunctionStmt(f) => plan_create_function(&f),
         N::CallStmt(c) => plan_call(&c, params),
         N::AlterFunctionStmt(a) => alter_routine::plan_alter(&a),
@@ -5131,6 +5239,15 @@ fn plan_node(
         N::CreateExtensionStmt(c) => Ok(Statement::CreateExtension {
             name: c.extname.clone(),
             if_not_exists: c.if_not_exists,
+            schema: c.options.iter().find_map(|o| match o.node.as_ref() {
+                Some(N::DefElem(e)) if e.defname == "schema" => {
+                    match e.arg.as_deref()?.node.as_ref()? {
+                        N::String(s) => Some(s.sval.clone()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }),
         }),
         N::DeclareCursorStmt(d) => {
             let inner = match d.query.as_ref().and_then(|q| q.node.as_ref()) {
@@ -23785,7 +23902,7 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("pg_blocking_pids") => {
             return "int4[]".to_string();
         }
-        Some(N::AExpr(e)) if extension_installed("pg_trgm") => {
+        Some(N::AExpr(e)) if extension_visible("pg_trgm") => {
             let op = e.name.last().and_then(|n| match n.node.as_ref() {
                 Some(N::String(s)) => Some(s.sval.as_str()),
                 _ => None,
@@ -29310,18 +29427,39 @@ thread_local! {
 }
 
 thread_local! {
-    /// The installed extensions, by name.
-    static PLAN_EXTENSIONS: std::cell::RefCell<Vec<String>> =
+    /// The installed extensions: `(name, the schema holding its objects)`.
+    static PLAN_EXTENSIONS: std::cell::RefCell<Vec<(String, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Install the names of the installed extensions.
-pub fn set_installed_extensions(names: Vec<String>) {
-    PLAN_EXTENSIONS.with(|t| *t.borrow_mut() = names);
+/// Install the installed extensions, each with its schema
+/// (`pg_extension.extnamespace`).
+pub fn set_installed_extensions(extensions: Vec<(String, String)>) {
+    PLAN_EXTENSIONS.with(|t| *t.borrow_mut() = extensions);
 }
 
+/// Is the extension installed, in whatever schema?
 pub(crate) fn extension_installed(name: &str) -> bool {
-    PLAN_EXTENSIONS.with(|t| t.borrow().iter().any(|n| n == name))
+    extension_schema(name).is_some()
+}
+
+/// The schema an installed extension's objects live in.
+pub(crate) fn extension_schema(name: &str) -> Option<String> {
+    PLAN_EXTENSIONS.with(|t| {
+        t.borrow()
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, s)| s.clone())
+    })
+}
+
+/// Is the extension installed in a schema the search path reaches, so
+/// that its unqualified functions and its operators resolve? PostgreSQL
+/// finds an extension's objects as any schema's: `CREATE EXTENSION citext
+/// SCHEMA s` leaves `=` on two citexts the text one until `s` is on the
+/// path.
+pub(crate) fn extension_visible(name: &str) -> bool {
+    extension_schema(name).is_some_and(|s| s == "pg_catalog" || schemas::search_path().contains(&s))
 }
 
 /// The base types owned by installed extensions, by resolution name.
@@ -29375,7 +29513,7 @@ fn user_defined_base_source(arg: &pg_query::protobuf::Node, value: &Bson) -> Opt
     let (name, _, defined) = user_base_type(&t)?;
     // citext is text to every operator and function that does not
     // define its own: it casts implicitly to text.
-    (defined && extension_type(&t).is_none() && !collation::is_citext(&name)).then_some(name)
+    (defined && extension_type(&t).is_none() && !collation::is_citext_type(&name)).then_some(name)
 }
 
 /// A base type's resolution NAME by oid -- the reverse door, for rendering

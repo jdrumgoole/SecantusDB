@@ -92,7 +92,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ----------------------- RP-172 CREATE EXTENSION ... SCHEMA is ignored
     "an extension installed in a schema": (
         "RP-172",
-        True,
+        False,
         [
             "create schema rp36_e",
             "create extension citext schema rp36_e",

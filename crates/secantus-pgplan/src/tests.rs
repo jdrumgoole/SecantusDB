@@ -3398,10 +3398,16 @@ fn extension_statements_plan() {
         Statement::CreateExtension {
             name,
             if_not_exists,
+            schema,
         } => {
             assert_eq!(name, "hstore");
             assert!(if_not_exists);
+            assert_eq!(schema, None);
         }
+        other => panic!("{other:?}"),
+    }
+    match plan_ok("CREATE EXTENSION citext WITH SCHEMA s VERSION '1.6'") {
+        Statement::CreateExtension { schema, .. } => assert_eq!(schema.as_deref(), Some("s")),
         other => panic!("{other:?}"),
     }
     match plan_ok("DROP EXTENSION postgis CASCADE") {
@@ -3454,7 +3460,7 @@ fn citext_column_collation_needs_the_extension() {
     let col = Column::new("name", "citext", false);
     set_installed_extensions(vec![]);
     assert_eq!(collation::column_collation(&col), None);
-    set_installed_extensions(vec!["citext".into()]);
+    set_installed_extensions(vec![("citext".into(), "public".into())]);
     assert_eq!(
         collation::column_collation(&col).as_deref(),
         Some(collation::CITEXT)

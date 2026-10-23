@@ -5325,13 +5325,7 @@ impl PgHandler {
             .map(|b| Self::type_resolution(&b.schema, &b.name))
             .collect();
         secantus_pgplan::set_extension_types(extension_types);
-        secantus_pgplan::set_installed_extensions(
-            self.extensions()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(n, _, _)| n)
-                .collect(),
-        );
+        secantus_pgplan::set_installed_extensions(self.extension_schemas());
         secantus_pgplan::schemas::set_user_schemas(
             self.namespaces()
                 .into_iter()
@@ -10615,6 +10609,24 @@ impl PgHandler {
         Ok(out)
     }
 
+    /// Each installed extension's schema, `pg_extension.extnamespace`:
+    /// `plpgsql`'s is `pg_catalog`, the rest where `CREATE EXTENSION` put
+    /// them (`public` for one installed before the schema was recorded).
+    pub(crate) fn extension_schemas(&self) -> Vec<(String, String)> {
+        let mut out = vec![("plpgsql".to_string(), "pg_catalog".to_string())];
+        for d in self
+            .type_catalog_docs(Self::EXTENSION_COLLECTION)
+            .unwrap_or_default()
+            .iter()
+        {
+            out.push((
+                d.get_str("_id").unwrap_or_default().to_string(),
+                d.get_str("schema").unwrap_or("public").to_string(),
+            ));
+        }
+        out
+    }
+
     /// What `CREATE EXTENSION name` installs: `(version, relocatable, the
     /// base types it brings)`. Anything else is PostgreSQL's 0A000 `is not
     /// available`. Versions are the ones measured on 16 (hstore 1.8, PostGIS
@@ -10843,7 +10855,10 @@ impl PgHandler {
             }
         }
         if let Ok(bs) = self.base_types() {
-            if let Some(b) = bs.iter().find(|b| b.name == name) {
+            if let Some(b) = bs
+                .iter()
+                .find(|b| Self::type_resolution(&b.schema, &b.name) == name)
+            {
                 return Some(b.oid);
             }
         }
@@ -10873,21 +10888,17 @@ impl PgHandler {
                 return Some(*oid);
             }
         }
-        // A user composite's / enum's ARRAY (`custom[]`): its typarray, the
+        // A user type's ARRAY (`custom[]`, `s.custom[]`): its typarray, the
         // element's oid + 100_000 (a column of one was missing from
-        // `pg_attribute` altogether).
+        // `pg_attribute` altogether). A built-in's array is `oid_of_name`'s
+        // above, and a domain has none here.
         if let Some(element) = name.strip_suffix("[]") {
-            let user = self
-                .composites()
-                .ok()
-                .and_then(|cs| cs.iter().find(|(n, _, _)| n == element).map(|c| c.1))
-                .or_else(|| {
-                    self.enums()
-                        .ok()
-                        .and_then(|es| es.iter().find(|(n, _, _)| n == element).map(|e| e.1))
-                });
-            if let Some(oid) = user {
-                return Some(oid + Self::USER_TYPE_ARRAY_OID_OFFSET);
+            if secantus_pgplan::pgtypes::oid_of_name(element).is_none()
+                && secantus_pgplan::domains::user_domain(element).is_none()
+            {
+                if let Some(oid) = self.type_oid_by_name(element) {
+                    return Some(oid + Self::USER_TYPE_ARRAY_OID_OFFSET);
+                }
             }
         }
         None
@@ -19225,7 +19236,11 @@ impl PgHandler {
                 // in that schema's namespace, as its catalog doc records.
                 let namespaces = self.namespaces();
                 let mut type_namespace: HashMap<i64, i64> = HashMap::new();
-                for collection in [Self::COMPOSITE_COLLECTION, Self::ENUM_COLLECTION] {
+                for collection in [
+                    Self::COMPOSITE_COLLECTION,
+                    Self::ENUM_COLLECTION,
+                    Self::BASE_TYPE_COLLECTION,
+                ] {
                     for doc in self.type_catalog_docs(collection).ok()?.iter() {
                         let (Ok(schema), Some(oid)) =
                             (doc.get_str("schema"), doc.get("oid").and_then(bson_i64))
@@ -24843,6 +24858,17 @@ impl PgHandler {
                 Self::DOMAIN_COLLECTION.to_string(),
                 Self::BASE_TYPE_COLLECTION.to_string(),
                 Self::SCHEMA_COLLECTION.to_string(),
+            ],
+            // A type moved rewrites its catalog row and every reference.
+            Statement::SetObjectSchema { .. } => vec![
+                CATALOG_COLLECTION.to_string(),
+                Self::ENUM_COLLECTION.to_string(),
+                Self::COMPOSITE_COLLECTION.to_string(),
+                Self::RANGE_COLLECTION.to_string(),
+                Self::DOMAIN_COLLECTION.to_string(),
+                Self::BASE_TYPE_COLLECTION.to_string(),
+                Self::EXTENSION_COLLECTION.to_string(),
+                Self::FUNCTION_COLLECTION.to_string(),
             ],
             Statement::AlterEnum { .. } => vec![Self::ENUM_COLLECTION.to_string()],
             // And every table a value of the type is stored in
@@ -33055,6 +33081,11 @@ impl PgHandler {
             Statement::ReassignOwned { .. } => "REASSIGN OWNED",
             Statement::DropOwned { .. } => "DROP OWNED",
             Statement::CreateExtension { .. } => "CREATE EXTENSION",
+            Statement::SetObjectSchema { kind, .. } => match *kind {
+                "extension" => "ALTER EXTENSION",
+                "domain" => "ALTER DOMAIN",
+                _ => "ALTER TYPE",
+            },
             Statement::DropExtension { .. } => "DROP EXTENSION",
             Statement::Comment { .. } => "COMMENT",
             Statement::AlterEnum { .. } | Statement::AlterTypeAttributes { .. } => "ALTER TYPE",
@@ -34419,18 +34450,29 @@ impl PgHandler {
                 let mut held: Vec<(&String, Held)> = Vec::new();
                 for name in present.iter().rev() {
                     let name: &String = name;
+                    // Its types, domains among them (whose key is their
+                    // schema's prefix), grouped by kind (RP-137).
                     let mut members: Vec<(&'static str, String)> = Vec::new();
+                    let prefix = format!("{name}.");
                     for coll in [
                         Self::ENUM_COLLECTION,
                         Self::COMPOSITE_COLLECTION,
                         Self::RANGE_COLLECTION,
                         Self::BASE_TYPE_COLLECTION,
+                        Self::DOMAIN_COLLECTION,
                     ] {
                         for d in self.type_catalog_docs(coll)?.iter() {
-                            if d.get_str("schema") == Ok(name.as_str()) {
-                                if let Ok(id) = d.get_str("_id") {
-                                    members.push((coll, id.to_string()));
+                            let Ok(id) = d.get_str("_id") else {
+                                continue;
+                            };
+                            let mine = match d.get_str("schema") {
+                                Ok(s) => s == name.as_str(),
+                                Err(_) => {
+                                    coll == Self::DOMAIN_COLLECTION && id.starts_with(&prefix)
                                 }
+                            };
+                            if mine {
+                                members.push((coll, id.to_string()));
                             }
                         }
                     }
@@ -36914,6 +36956,7 @@ impl PgHandler {
             Statement::CreateExtension {
                 name,
                 if_not_exists,
+                schema,
             } => {
                 // Only the extensions this server carries an implementation
                 // of can be installed; the rest are PostgreSQL's 0A000 `is
@@ -36953,11 +36996,33 @@ impl PgHandler {
                         format!("extension \"{name}\" already exists"),
                     ))));
                 }
+                // Its objects go in `SCHEMA s` (3F000 when there is none),
+                // else the schema an unqualified CREATE lands in.
+                let schema = match schema {
+                    Some(s) => {
+                        if !self.namespaces().iter().any(|(n, _)| *n == s) {
+                            return Err(Self::user_error(
+                                "3F000",
+                                format!("schema \"{s}\" does not exist"),
+                            ));
+                        }
+                        s
+                    }
+                    None => {
+                        secantus_pgplan::schemas::creation_schema().map_err(|e| Self::err(&e))?
+                    }
+                };
                 // The extension's types must not collide with anything the
                 // user already made: PostgreSQL's script fails on the first
                 // `CREATE TYPE` with the ordinary 42710.
                 for ty in types {
-                    if self.type_name_taken(ty)? {
+                    let taken = if schema == "public" {
+                        self.type_name_taken(ty)?
+                    } else {
+                        self.base_type_named(&Self::type_resolution(&schema, ty))?
+                            .is_some()
+                    };
+                    if taken {
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".into(),
                             "42710".into(), // duplicate_object
@@ -36972,10 +37037,11 @@ impl PgHandler {
                 self.ensure_collection(Self::BASE_TYPE_COLLECTION)?;
                 for ty in types {
                     let oid = self.mint_base_type_oid()?;
+                    let key = Self::type_resolution(&schema, ty);
                     let mut doc = bson::doc! {
-                        "_id": *ty,
+                        "_id": &key,
                         "base": *ty,
-                        "schema": "public",
+                        "schema": &schema,
                         "oid": oid,
                         "defined": true,
                         "input": format!("{ty}_in"),
@@ -36995,16 +37061,23 @@ impl PgHandler {
                             "typispreferred": false,
                         });
                     }
-                    self.insert_type_doc(Self::BASE_TYPE_COLLECTION, ty, doc)?;
+                    self.insert_type_doc(Self::BASE_TYPE_COLLECTION, &key, doc)?;
                 }
                 let doc = bson::doc! {
                     "_id": &name,
                     "version": version,
                     "relocatable": relocatable,
+                    "schema": &schema,
                 };
                 self.insert_type_doc(Self::EXTENSION_COLLECTION, &name, doc)?;
                 Ok(vec![Response::Execution(Tag::new("CREATE EXTENSION"))])
             }
+
+            Statement::SetObjectSchema {
+                kind,
+                target,
+                schema,
+            } => self.set_object_schema(kind, &target, &schema),
 
             Statement::InsteadOf(io) => self.run_instead_of(io),
             Statement::SetConstraints { names, deferred } => {

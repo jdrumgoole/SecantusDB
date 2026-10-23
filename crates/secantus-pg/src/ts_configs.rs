@@ -171,7 +171,7 @@ impl PgHandler {
         Err(PgWireError::UserError(Box::new(info)))
     }
 
-    fn namespace_oid(&self, schema: &str) -> i64 {
+    pub(crate) fn namespace_oid(&self, schema: &str) -> i64 {
         if schema == "pg_catalog" {
             return 11;
         }

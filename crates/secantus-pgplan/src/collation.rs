@@ -103,11 +103,25 @@ pub fn column_collation(column: &Column) -> Option<String> {
         .or_else(|| is_citext(&column.pg_type).then(|| CITEXT.to_string()))
 }
 
-/// Is `ty` citext (with the extension installed)?
+/// Is `ty` citext, with the extension's operators on the search path? A
+/// citext whose schema the path does not reach compares as text, as on
+/// PostgreSQL, where its `=` is then not found.
 pub fn is_citext(ty: &str) -> bool {
+    is_citext_type(ty) && crate::extension_visible("citext")
+}
+
+/// Is `ty` the citext extension's type, wherever it is installed? Such a
+/// value is text to every operator and function citext does not define.
+pub fn is_citext_type(ty: &str) -> bool {
+    let Some(schema) = crate::extension_schema("citext") else {
+        return false;
+    };
     let t = ty.trim();
-    let t = t.strip_prefix("public.").unwrap_or(t);
-    t.eq_ignore_ascii_case("citext") && crate::extension_installed("citext")
+    let t = t
+        .strip_prefix("public.")
+        .or_else(|| t.strip_prefix(&format!("{schema}.")))
+        .unwrap_or(t);
+    t.eq_ignore_ascii_case("citext")
 }
 
 impl Resolved {
