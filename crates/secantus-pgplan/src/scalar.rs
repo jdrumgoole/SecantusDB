@@ -125,18 +125,32 @@ const CATALOG_NAMES: &[&str] = &[
 /// installed. Without the extension PostgreSQL has no such function, and
 /// neither does this server.
 fn extension_scalar(name: &str) -> Option<crate::ExtensionType> {
-    let owner = match name {
+    let owner = scalar_owner(name)?;
+    let extension = match owner {
+        crate::ExtensionType::Geometry => "postgis",
+        crate::ExtensionType::Hstore => "hstore",
+    };
+    // In whatever schema: whether the call reaches it is the search path's
+    // question, asked before planning (`refuse_invisible_extension_functions`).
+    crate::extension_installed(extension).then_some(owner)
+}
+
+fn scalar_owner(name: &str) -> Option<crate::ExtensionType> {
+    Some(match name {
         "st_geomfromgeojson" | "st_srid" | "st_astext" | "st_asewkt" | "st_geomfromtext"
         | "st_geomfromewkt" => crate::ExtensionType::Geometry,
         "hstore" | "akeys" | "avals" | "skeys" | "svals" | "exist" | "defined"
         | "hstore_to_json" | "hstore_to_jsonb" | "delete" => crate::ExtensionType::Hstore,
         _ => return None,
-    };
-    let installed = match owner {
-        crate::ExtensionType::Geometry => crate::extension_type("geometry"),
-        crate::ExtensionType::Hstore => crate::extension_type("hstore"),
-    };
-    installed.filter(|i| *i == owner)
+    })
+}
+
+/// The extension a scalar function of an extension type belongs to.
+pub(crate) fn extension_of_scalar(name: &str) -> Option<&'static str> {
+    scalar_owner(name).map(|o| match o {
+        crate::ExtensionType::Geometry => "postgis",
+        crate::ExtensionType::Hstore => "hstore",
+    })
 }
 
 const SCALAR_NAMES: &[&str] = &[

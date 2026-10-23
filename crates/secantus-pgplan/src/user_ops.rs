@@ -48,7 +48,7 @@ pub fn is_builtin(op: &str) -> bool {
         || (matches!(
             op,
             "<%" | "%>" | "<<%" | "%>>" | "<<->" | "<->>" | "<<<->" | "<->>>"
-        ) && crate::extension_installed("pg_trgm"))
+        ) && crate::extension_visible("pg_trgm"))
 }
 
 /// The ordinary operator a built-in operator FUNCTION implements.

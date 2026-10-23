@@ -773,22 +773,39 @@ fixed in the same batch; their tests there are regression tests.
       Backlog-ID: RP-137
       Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order], tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]
 
+## Found by batch 38 (2026-10-23)
+
+Found while fixing RP-172 (an extension's objects are its schema's). The
+gap tests are scenarios in `tests/backlog/test_rp_batch38.py`, measured on a
+private 15.19 cluster. RP-176, RP-177, RP-179 and RP-181 were found and
+fixed in the same batch; their tests there are regression tests.
+
+- [ ] **citext's own functions, and its operators named by schema.** The
+      extension's functions -- `citext(text)`, `citext(boolean)`,
+      `citext(inet)`, the case-insensitive `regexp_match(citext, ...)`,
+      `strpos`, `replace`, `split_part` and the rest -- are 42883 here,
+      where PostgreSQL 15.19 has them in the extension's schema. And an
+      operator named by that schema, `'A'::s.citext OPERATOR(s.=)
+      'a'::s.citext`, is `false` here (text's `=`) and `true` there: this
+      server applies citext's comparison only while the schema is on the
+      search path, and has no notion of a qualified operator reaching it.
+      Backlog-ID: RP-178
+      Verify: tests/backlog/test_rp_batch38.py::test_scenario[citext's functions and an operator named by its schema]
+- [ ] **A missing type named with its schema loses the schema.** `ALTER
+      TYPE s.nosuch SET SCHEMA public` and `ALTER TYPE s.nosuch RENAME TO
+      x` say `type "nosuch" does not exist` and point at the name;
+      PostgreSQL says `type "s.nosuch" does not exist` (`public.nosuch` for
+      `public.nosuch`), with no position.
+      Backlog-ID: RP-180
+      Verify: tests/backlog/test_rp_batch38.py::test_scenario[a missing type named with its schema]
+
 ## Found by batch 36 (2026-10-23)
 
 Found while fixing RP-149, RP-150 and RP-154. The gap tests are scenarios in
 `tests/backlog/test_rp_batch36.py`, measured on a private 15.19 cluster.
-RP-174 was found and fixed in the same batch; its test there is a
-regression test.
+RP-172 and RP-174 were found there and are fixed; their tests there are
+regression tests.
 
-- [ ] **`CREATE EXTENSION ... SCHEMA s` installs in `public`.** The
-      statement succeeds, but `pg_extension.extnamespace` and the
-      extension's types (`citext`) are `public`, and `'A'::s.citext` is
-      42704. PostgreSQL puts the extension's objects in `s`. The
-      extension's functions are this server's built-ins; reaching them
-      through `s` (and not through `public`) needs each extension's schema
-      known to the call's resolution (`func_name`).
-      Backlog-ID: RP-172
-      Verify: tests/backlog/test_rp_batch36.py::test_scenario[an extension installed in a schema]
 - [ ] **A user function named like a built-in shadows it.** With
       `create function public.lower(int)`, `lower('Q')` and even
       `pg_catalog.lower('Q')` call the user function (1), and `abs(-3)`

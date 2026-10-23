@@ -290,6 +290,121 @@ fn hidden_in_public(name: &str, path: &[String]) -> bool {
         && resolve_unqualified(name) == name
 }
 
+/// The catalog key of the user type a statement names by `parts`: a
+/// qualified name's own, an unqualified one's through the search path (the
+/// first schema holding it, else `public`'s).
+pub fn type_key(parts: &[String]) -> String {
+    match parts {
+        [bare] => {
+            let key = crate::pgtypes::user_type_key(bare);
+            search_path()
+                .iter()
+                .filter(|s| *s != "pg_catalog")
+                .map(|s| relation_key(s, &key))
+                .find(|k| crate::column_type_exists(k))
+                .unwrap_or(key)
+        }
+        [schema, bare] if schema == "public" => crate::pgtypes::user_type_key(bare),
+        _ => parts.join("."),
+    }
+}
+
+/// Resolve each unqualified user type name through the search path, as
+/// PostgreSQL's `TypenameGetTypid` does: `mood` is the first schema's on
+/// the path that has one (`pg_catalog`'s built-ins first), so it is
+/// rewritten to `s.mood` when that is another schema's than `public`; and a
+/// `public` type the path does not reach is 42704, as a client wrote it.
+pub fn resolve_type_names(node: &mut N) -> Result<()> {
+    let path = search_path();
+    let public_on_path = path.iter().any(|s| s == "public");
+    if public_on_path && path.iter().all(|s| !is_user_schema(s)) {
+        return Ok(());
+    }
+    let resolve = |tn: &mut pg_query::protobuf::TypeName| -> Result<()> {
+        if tn.names.len() != 1 || tn.pct_type {
+            return Ok(());
+        }
+        let Some(N::String(name)) = tn.names[0].node.as_ref() else {
+            return Ok(());
+        };
+        let name = name.sval.clone();
+        if crate::pgtypes::is_builtin_type(&name) {
+            return Ok(());
+        }
+        for schema in &path {
+            if schema == "pg_catalog" || schema.starts_with("pg_temp") {
+                continue;
+            }
+            if crate::column_type_exists(&relation_key(schema, &name)) {
+                if schema != "public" {
+                    tn.names.insert(
+                        0,
+                        pg_query::protobuf::Node {
+                            node: Some(N::String(pg_query::protobuf::String {
+                                sval: schema.clone(),
+                            })),
+                        },
+                    );
+                }
+                return Ok(());
+            }
+        }
+        if !public_on_path && AS_SENT.with(std::cell::Cell::get) && crate::column_type_exists(&name)
+        {
+            crate::set_error_location(tn.location);
+            return Err(Error::UndefinedObject(format!(
+                "type \"{name}\" does not exist"
+            )));
+        }
+        Ok(())
+    };
+    // The walk does not reach a CREATE / ALTER TABLE's own columns.
+    let columns = |elts: &mut [pg_query::protobuf::Node]| -> Result<()> {
+        for e in elts {
+            if let Some(N::ColumnDef(cd)) = e.node.as_mut() {
+                if let Some(tn) = cd.type_name.as_mut() {
+                    resolve(tn)?;
+                }
+            }
+        }
+        Ok(())
+    };
+    match node {
+        N::CreateStmt(c) => columns(&mut c.table_elts)?,
+        N::AlterTableStmt(a) => {
+            for cmd in &mut a.cmds {
+                if let Some(N::AlterTableCmd(c)) = cmd.node.as_mut() {
+                    if let Some(def) = c.def.as_deref_mut() {
+                        columns(std::slice::from_mut(def))?;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    // SAFETY: the pointers `nodes_mut` hands out point into `node`, which
+    // outlives the loop and is not otherwise touched while they are used.
+    unsafe {
+        for (n, _, _) in node.nodes_mut() {
+            match n {
+                pg_query::NodeMut::TypeName(tn) => resolve(&mut *tn)?,
+                pg_query::NodeMut::TypeCast(tc) => {
+                    if let Some(tn) = (*tc).type_name.as_mut() {
+                        resolve(tn)?;
+                    }
+                }
+                pg_query::NodeMut::ColumnDef(cd) => {
+                    if let Some(tn) = (*cd).type_name.as_mut() {
+                        resolve(tn)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A bare relation name in a string literal the statement turns into a
 /// `regclass`: a `::regclass` cast of one, or the first argument of the
 /// sequence functions, which take a regclass. With its location.

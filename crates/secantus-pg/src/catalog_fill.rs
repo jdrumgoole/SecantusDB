@@ -1486,12 +1486,16 @@ impl PgHandler {
                     ("pg_extension", c) => match c {
                         "extowner" => Bson::Int64(10),
                         // plpgsql lives in pg_catalog, an installed extension
-                        // in the schema it was created in (public).
-                        "extnamespace" => Bson::Int64(if text(get(row, "extname")) == "plpgsql" {
-                            11
-                        } else {
-                            2200
-                        }),
+                        // in the schema it was created in.
+                        "extnamespace" => {
+                            let name = text(get(row, "extname"));
+                            let schema = self
+                                .extension_schemas()
+                                .into_iter()
+                                .find(|(n, _)| *n == name)
+                                .map_or_else(|| "public".to_string(), |(_, s)| s);
+                            Bson::Int64(self.namespace_oid(&schema))
+                        }
                         _ => Bson::Null,
                     },
                     _ => continue,

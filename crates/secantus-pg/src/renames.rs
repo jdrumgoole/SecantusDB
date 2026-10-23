@@ -505,6 +505,143 @@ impl PgHandler {
         done(tag)
     }
 
+    /// `ALTER TYPE | DOMAIN t SET SCHEMA s` and `ALTER EXTENSION e SET
+    /// SCHEMA s`. A type moves under its new key and every reference with
+    /// it, as a rename moves it; an extension moves its types and records
+    /// the schema. Messages measured on PostgreSQL 15.19.
+    pub(crate) fn set_object_schema(
+        &self,
+        kind: &str,
+        target: &str,
+        schema: &str,
+    ) -> PgWireResult<Vec<Response>> {
+        if schema != "pg_catalog" && !self.namespaces().iter().any(|(n, _)| n == schema) {
+            return Err(error(
+                "3F000",
+                format!("schema \"{schema}\" does not exist"),
+            ));
+        }
+        if kind == "extension" {
+            let Some(mut ext) = self
+                .type_catalog_docs(Self::EXTENSION_COLLECTION)?
+                .iter()
+                .find(|d| d.get_str("_id") == Ok(target))
+                .cloned()
+            else {
+                if target == "plpgsql" {
+                    return Err(error(
+                        "0A000",
+                        format!("extension \"{target}\" does not support SET SCHEMA"),
+                    ));
+                }
+                return Err(error(
+                    "42704",
+                    format!("extension \"{target}\" does not exist"),
+                ));
+            };
+            if !ext.get_bool("relocatable").unwrap_or(false) {
+                return Err(error(
+                    "0A000",
+                    format!("extension \"{target}\" does not support SET SCHEMA"),
+                ));
+            }
+            let owned: Vec<Document> = self
+                .type_catalog_docs(Self::BASE_TYPE_COLLECTION)?
+                .iter()
+                .filter(|d| d.get_str("extension") == Ok(target))
+                .cloned()
+                .collect();
+            for doc in owned {
+                self.move_type(Self::BASE_TYPE_COLLECTION, doc, schema)?;
+            }
+            ext.insert("schema", schema);
+            self.delete_type_doc(Self::EXTENSION_COLLECTION, target)?;
+            self.insert_type_doc(Self::EXTENSION_COLLECTION, target, ext)?;
+            return done("ALTER EXTENSION");
+        }
+        let tag = if kind == "domain" {
+            "ALTER DOMAIN"
+        } else {
+            "ALTER TYPE"
+        };
+        let collections: Vec<&'static str> = if kind == "domain" {
+            vec![Self::DOMAIN_COLLECTION]
+        } else {
+            Self::type_collections().to_vec()
+        };
+        for coll in collections {
+            if let Some(d) = self
+                .type_catalog_docs(coll)?
+                .iter()
+                .find(|d| d.get_str("_id") == Ok(target))
+                .cloned()
+            {
+                self.move_type(coll, d, schema)?;
+                return done(tag);
+            }
+        }
+        Err(error(
+            "42704",
+            format!(
+                "type \"{}\" does not exist",
+                target.strip_prefix("public.").unwrap_or(target)
+            ),
+        ))
+    }
+
+    /// Move a user type's catalog row `doc` (of `coll`) into `schema`,
+    /// retargeting every reference to its new key. A move to the schema it
+    /// is in does nothing, as on PostgreSQL.
+    fn move_type(&self, coll: &'static str, mut doc: Document, schema: &str) -> PgWireResult<()> {
+        let old_key = doc.get_str("_id").unwrap_or_default().to_string();
+        // An enum's or base type's row records its schema; a domain's is
+        // the prefix of its key.
+        let old_schema = doc
+            .get_str("schema")
+            .map(str::to_string)
+            .unwrap_or_else(|_| {
+                old_key
+                    .rsplit_once('.')
+                    .filter(|(s, _)| self.namespaces().iter().any(|(n, _)| n == s))
+                    .map_or_else(|| "public".to_string(), |(s, _)| s.to_string())
+            });
+        let bare = old_key
+            .strip_prefix(&format!("{old_schema}."))
+            .unwrap_or(&old_key)
+            .to_string();
+        let new_key = Self::type_resolution(schema, &bare);
+        if new_key == old_key {
+            return Ok(());
+        }
+        let taken = Self::type_collections().iter().any(|c| {
+            self.type_catalog_docs(c).is_ok_and(|docs| {
+                docs.iter()
+                    .any(|d| d.get_str("_id") == Ok(new_key.as_str()))
+            })
+        });
+        if taken {
+            return Err(error(
+                "42710",
+                format!(
+                    "type \"{}\" already exists in schema \"{schema}\"",
+                    secantus_pgplan::pgtypes::user_type_catalog_name(&bare)
+                ),
+            ));
+        }
+        doc.insert("_id", new_key.as_str());
+        if doc.contains_key("schema") {
+            doc.insert("schema", schema);
+        }
+        for key in ["enum", "composite", "range", "domain", "name", "type"] {
+            if doc.get_str(key) == Ok(old_key.as_str()) {
+                doc.insert(key, new_key.as_str());
+            }
+        }
+        self.delete_type_doc(coll, &old_key)?;
+        self.insert_type_doc(coll, &new_key, doc)?;
+        self.retarget_type_references(&old_key, &new_key)
+    }
+
     /// `ALTER TYPE t RENAME ATTRIBUTE a TO b` on a composite type.
     pub(crate) fn rename_attribute(
         &self,
