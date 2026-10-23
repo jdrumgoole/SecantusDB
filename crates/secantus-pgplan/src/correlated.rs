@@ -1147,6 +1147,13 @@ impl UserFn {
         if self.name.starts_with("pg_temp.") || name.starts_with("pg_temp.") {
             return (self.name == name).then_some(0);
         }
+        // A function named like a built-in is reached by its qualified name:
+        // a bare call of it is resolved before planning, against the
+        // built-in, and rewritten to that name where the user function
+        // wins (`schemas::resolve_shadowed_calls`, RP-173).
+        if !name.contains('.') && crate::funcsig::is_builtin_function_name(&self.name) {
+            return None;
+        }
         crate::schemas::routine_rank(name, &self.schema, &self.name, path)
     }
 }

@@ -755,6 +755,60 @@ pub(crate) fn has_exact(name: &str, args: &[String]) -> bool {
     })
 }
 
+/// Does a built-in overload of `name` win a call of `args` over a user
+/// function of that name with `user` parameters? PostgreSQL considers both
+/// (`func_select_candidate`): the candidate with more exact matches among
+/// the known arguments wins, then the one with more string parameters for
+/// the unknown literals, and on a tie the earlier schema on the path
+/// (`catalog_first`: `pg_catalog` unless the path puts the user
+/// function's schema before it). A user function that cannot take the
+/// arguments never wins; one the built-ins cannot take always does.
+pub(crate) fn builtin_beats(
+    name: &str,
+    args: &[String],
+    user: &[String],
+    catalog_first: bool,
+) -> bool {
+    let Some(overloads) = sigs().get(name) else {
+        return false;
+    };
+    let fitting: Vec<&Sig> = overloads.iter().filter(|s| sig_accepts(s, args)).collect();
+    if fitting.is_empty() {
+        return false;
+    }
+    if user.len() != args.len() || !user.iter().zip(args).all(|(p, a)| accepts(p, a)) {
+        return true;
+    }
+    let unknown = |a: &str| a.is_empty() || a == "unknown";
+    let exact = |params: &[String]| {
+        params
+            .iter()
+            .zip(args)
+            .filter(|(p, a)| !unknown(a) && p == a)
+            .count()
+    };
+    let stringy = |params: &[String]| {
+        params
+            .iter()
+            .zip(args)
+            .filter(|(p, a)| {
+                unknown(a) && matches!(p.as_str(), "text" | "varchar" | "bpchar" | "name")
+            })
+            .count()
+    };
+    let best =
+        |f: &dyn Fn(&[String]) -> usize| fitting.iter().map(|s| f(&s.args)).max().unwrap_or(0);
+    let (b, u) = (best(&exact), exact(user));
+    if b != u {
+        return b > u;
+    }
+    let (bs, us) = (best(&stringy), stringy(user));
+    if bs != us {
+        return bs > us;
+    }
+    catalog_first
+}
+
 /// Several overloads take `args` equally well: 42725 `is not unique`.
 pub(crate) fn ambiguous(name: &str, args: &[String]) -> bool {
     select_candidates(name, args).is_some_and(|c| c.len() > 1)

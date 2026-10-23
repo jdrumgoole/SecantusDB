@@ -796,29 +796,6 @@ are regression tests.
       Backlog-ID: RP-178
       Verify: tests/backlog/test_rp_batch38.py::test_scenario[citext's pattern operators and an operator named by its schema]
 
-## Found by batch 36 (2026-10-23)
-
-Found while fixing RP-149, RP-150 and RP-154. The gap tests are scenarios in
-`tests/backlog/test_rp_batch36.py`, measured on a private 15.19 cluster.
-RP-172 and RP-174 were found there and are fixed; their tests there are
-regression tests.
-
-- [ ] **A user function named like a built-in shadows it.** With
-      `create function public.lower(int)`, `lower('Q')` and even
-      `pg_catalog.lower('Q')` call the user function (1), and `abs(-3)`
-      calls a user `public.abs(int)` (99). PostgreSQL resolves an
-      unqualified call over every candidate on the search path, with
-      `pg_catalog` first: `lower('Q')` takes `lower(text)` (an untyped
-      literal prefers a string), `abs(-3)` the built-in with the same
-      argument types, and a `pg_catalog.` call never reaches a user
-      function. Here about twenty planner sites ask
-      `correlated::user_function_named(name)` -- by name alone -- whether a
-      user function owns a call, so the choice cannot be made per call; it
-      needs a user function that shadows a built-in name kept apart from
-      the built-in (its own key) and the call resolved to one or the other.
-      Backlog-ID: RP-173
-      Verify: tests/backlog/test_rp_batch36.py::test_scenario[a user function of a built-in's name]
-
 ## Found by batch 34 (2026-10-23)
 
 Found while building `CREATE TEXT SEARCH CONFIGURATION` (RP-072). The gap

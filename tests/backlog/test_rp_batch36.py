@@ -106,7 +106,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ---------------- RP-173 a user function of a built-in's name hides it
     "a user function of a built-in's name": (
         "RP-173",
-        True,
+        False,
         [
             "create function public.lower(int) returns int language sql as 'select 1'",
             "create function public.abs(int) returns int language sql as 'select 99'",

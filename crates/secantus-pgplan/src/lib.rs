@@ -4709,6 +4709,8 @@ fn plan_node(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
 ) -> Result<Statement> {
+    let mut node = node;
+    schemas::resolve_shadowed_calls(&mut node, lookup);
     refuse_qualified_builtins(&node)?;
     refuse_invisible_extension_functions(&node)?;
     if let Some(st) = fdw::plan(&node, lookup, params)? {
