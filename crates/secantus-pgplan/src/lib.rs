@@ -21,6 +21,7 @@ pub mod colstats;
 pub mod costsize;
 mod expr_where;
 mod filter_sublink;
+mod guc_args;
 pub mod hashagg;
 mod hashfn;
 pub mod joincost;
@@ -939,6 +940,13 @@ pub enum Statement {
     },
     /// `RESET name` / `RESET ALL`.
     Reset(String),
+    /// `ALTER SYSTEM SET name = value` (`value` `None` for `RESET name` /
+    /// `TO DEFAULT`; `name` `None` for `RESET ALL`): an entry of the
+    /// server's `postgresql.auto.conf`.
+    AlterSystem {
+        name: Option<String>,
+        value: Option<String>,
+    },
     /// `ALTER MATERIALIZED VIEW m RENAME TO n`.
     RenameMatView {
         matview: String,
@@ -5228,6 +5236,7 @@ fn plan_node(
             })
         }
         N::VariableSetStmt(v) => plan_set(&v),
+        N::AlterSystemStmt(a) => plan_alter_system(&a),
         // `ALTER DATABASE d SET name = value` / `RESET name` / `RESET ALL`:
         // a GUC default for every NEW session of d.
         N::AlterDatabaseSetStmt(a) => {
@@ -35155,38 +35164,40 @@ fn plan_set(v: &pg_query::protobuf::VariableSetStmt) -> Result<Statement> {
         }
         _ => return Err(Error::Unsupported("this SET form".into())),
     }
-    // The value is one or more A_Const / TypeName items; render them as the
-    // text PostgreSQL stores, joined by commas (`SET DateStyle = 'ISO','MDY'`).
-    let mut parts = Vec::new();
-    for a in &v.args {
-        // A numeric literal is kept as written (`0.6`, not a decimal's form).
-        if let Some(N::AConst(c)) = a.node.as_ref() {
-            if let Some(pg_query::protobuf::a_const::Val::Fval(f)) = c.val.as_ref() {
-                parts.push(f.fval.clone());
-                continue;
-            }
-        }
-        let text = match const_value(a, &[])? {
-            Bson::String(s) => s,
-            Bson::Int32(i) => i.to_string(),
-            Bson::Int64(i) => i.to_string(),
-            Bson::Double(d) => d.to_string(),
-            Bson::Boolean(b) => (if b { "on" } else { "off" }).to_string(),
-            Bson::Null => "".to_string(),
-            other => value_text(&other),
-        };
-        parts.push(text);
-    }
+    // The value is one or more A_Const / TypeName items, as the one text
+    // PostgreSQL stores (`SET DateStyle = 'ISO','MDY'`).
+    let value = guc_args::flatten(&v.name, &v.args)?;
     if v.is_local {
         return Ok(Statement::SetLocal {
             name: v.name.clone(),
-            value: parts.join(", "),
+            value,
         });
     }
     Ok(Statement::Set {
         name: v.name.clone(),
-        value: parts.join(", "),
+        value,
     })
+}
+
+/// `ALTER SYSTEM SET name = value` / `TO DEFAULT` / `RESET name` / `RESET
+/// ALL`.
+fn plan_alter_system(a: &pg_query::protobuf::AlterSystemStmt) -> Result<Statement> {
+    let v = a
+        .setstmt
+        .as_ref()
+        .ok_or_else(|| Error::Parse("ALTER SYSTEM without a setting".into()))?;
+    let (name, value) = match VariableSetKind::try_from(v.kind) {
+        Ok(VariableSetKind::VarSetValue) => (
+            Some(v.name.clone()),
+            Some(guc_args::flatten(&v.name, &v.args)?),
+        ),
+        Ok(VariableSetKind::VarSetDefault | VariableSetKind::VarReset) => {
+            (Some(v.name.clone()), None)
+        }
+        Ok(VariableSetKind::VarResetAll) => (None, None),
+        _ => return Err(Error::Unsupported("this ALTER SYSTEM form".into())),
+    };
+    Ok(Statement::AlterSystem { name, value })
 }
 
 fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {

@@ -250,9 +250,7 @@ impl PgHandler {
             "pg_ident_file_mappings" => self.ident_file_mapping_rows(def),
             "pg_config" => self.pg_config_rows(def),
             "pg_statistic" => self.pg_statistic_rows(def),
-            // No `postgresql.conf` is read: the settings come from the
-            // command line and the defaults.
-            "pg_file_settings" => Vec::new(),
+            "pg_file_settings" => self.file_setting_rows(def),
             // Recovery conflicts arise only on a standby: every database's
             // counts are zero on a primary.
             "pg_stat_database_conflicts" => {

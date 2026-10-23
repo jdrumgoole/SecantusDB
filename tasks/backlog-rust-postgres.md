@@ -752,7 +752,6 @@ Not filed:
       Verify: tests/backlog/test_rp_found_2026_10_20.py::test_catalog_relations_are_queryable
 - [ ] **Statements still refused with 0A000** (`... is not supported yet`),
       each of which PostgreSQL 15.19 runs:
-      - `ALTER SYSTEM` (set and reset);
       - `CREATE TEXT SEARCH CONFIGURATION`.
 
       Several appear in `pg_dump` output. Not checked by the test:
@@ -785,6 +784,37 @@ fixed in the same batch; their tests there are regression tests.
       since nothing records which was made first.
       Backlog-ID: RP-137
       Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order], tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]
+
+## Found by batch 33 (2026-10-23)
+
+Found while building `ALTER SYSTEM` (RP-072). The gap tests are scenarios in
+`tests/backlog/test_rp_batch33.py`, measured on a private 15.19 cluster.
+RP-159 .. RP-161 and RP-163 were found and fixed in the same batch; their
+tests there are regression tests.
+
+- [ ] **Ten parameters do not answer SHOW.** `current_setting()` / `SHOW`
+      of `is_superuser`, `default_with_oids`, `ssl_renegotiation_limit`,
+      `data_directory`, `config_file`, `hba_file`, `ident_file`, `port`,
+      `unix_socket_directories` and `log_timezone` is 42704 here, where
+      PostgreSQL answers each (`on` for a superuser's `is_superuser`, the
+      data directory's absolute path, ...). Each is known to SET (55P02),
+      so the names are there; the values are not. `data_directory` is the
+      store's directory (`alter_system::path` already resolves it for
+      `pg_settings.sourcefile`); `config_file`, `hba_file` and `ident_file`
+      name files PostgreSQL always has and this server has only when it was
+      started with them, which is what to measure first.
+      Backlog-ID: RP-162
+      Verify: tests/backlog/test_rp_batch33.py::test_scenario[every parameter answers SHOW]
+- [ ] **`GRANT ... ON PARAMETER` is refused (0A000).** PostgreSQL 15's
+      `GRANT SET ON PARAMETER p TO r` lets r SET a `superuser` parameter,
+      and `GRANT ALTER SYSTEM ON PARAMETER p TO r` lets r run ALTER SYSTEM
+      on it; both are recorded in `pg_parameter_acl` and answered by
+      `has_parameter_privilege`. Here GRANT and REVOKE are "GRANT on this
+      kind of object is not supported yet", `pg_parameter_acl` stays empty,
+      and ALTER SYSTEM is a superuser's alone (with PostgreSQL's wording for
+      a role without the grant, 42501 `permission denied to set parameter`).
+      Backlog-ID: RP-164
+      Verify: tests/backlog/test_rp_batch33.py::test_scenario[GRANT SET and ALTER SYSTEM ON PARAMETER]
 
 ## Found by batch 32 (2026-10-23)
 

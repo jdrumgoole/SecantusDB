@@ -18,19 +18,11 @@ impl PgHandler {
     pub(crate) const ROLE_SETTINGS_COLLECTION: &'static str = "__sql_role_settings__";
 
     /// The defaults a NEW session of this database and login role starts
-    /// with, by GUC name: `process_settings`' order, each overriding the one
-    /// before -- every role's, the database's, the role's, the role's in
-    /// this database.
-    pub(crate) fn db_setting_defaults(&self) -> Vec<(String, String)> {
-        self.db_setting_layers()
-            .into_iter()
-            .map(|(name, value, _)| (name, value))
-            .collect()
-    }
-
-    /// [`Self::db_setting_defaults`], each with the `pg_settings.source`
-    /// of the layer it came from.
-    pub(crate) fn db_setting_layers(&self) -> Vec<(String, String, &'static str)> {
+    /// with, by GUC name, each overriding the one before and each with the
+    /// source of its layer: the configuration file's (as this session last
+    /// read it), then `process_settings`' order -- every role's, the
+    /// database's, the role's, the role's in this database.
+    pub(crate) fn db_setting_layers(&self) -> Vec<(String, String, GucSource)> {
         let role = self.session_user_name();
         let db = self.db().to_string();
         let roles = self.role_setting_docs();
@@ -41,13 +33,19 @@ impl PgHandler {
                 .map(|(_, _, n, v)| (n.clone(), v.clone()))
                 .collect()
         };
-        let mut out: std::collections::BTreeMap<String, (String, &'static str)> =
+        let file: Vec<(String, String)> = self
+            .file_settings_in_force()
+            .into_iter()
+            .map(|e| (canonical_setting(&e.name), e.value))
+            .collect();
+        let mut out: std::collections::BTreeMap<String, (String, GucSource)> =
             std::collections::BTreeMap::new();
         for (layer, source) in [
-            (of("", ""), "global"),
-            (self.db_setting_defaults_of(&db), "database"),
-            (of(&role, ""), "user"),
-            (of(&role, &db), "database user"),
+            (file, GucSource::ConfigFile),
+            (of("", ""), GucSource::Global),
+            (self.db_setting_defaults_of(&db), GucSource::Database),
+            (of(&role, ""), GucSource::User),
+            (of(&role, &db), GucSource::DatabaseUser),
         ] {
             for (name, value) in layer {
                 out.insert(name, (value, source));
@@ -275,26 +273,75 @@ impl PgHandler {
         Ok(vec![Response::Execution(Tag::new("ALTER DATABASE"))])
     }
 
-    /// The value `RESET name` returns to: the database's default when it
-    /// has one, else the server's.
-    pub(crate) fn reset_value(&self, key: &str) -> Option<String> {
-        self.db_setting_defaults()
-            .into_iter()
+    /// The value `RESET name` returns to, and its source (PostgreSQL's
+    /// `reset_val` and `reset_source`): what the startup packet set, else
+    /// the highest default layer's, else the built-in default.
+    pub(crate) fn reset_entry(&self, key: &str) -> Option<(String, GucSource)> {
+        // The server's own: its boot value, from where it set it.
+        if TRANSACTION_GUCS.contains(&key) {
+            return self
+                .server_defaults()
+                .get(key)
+                .map(|v| (v.clone(), GucSource::Override));
+        }
+        // One a restart alone changes resets to what it runs with.
+        if matches!(alter_system::context_of(key), "postmaster" | "internal") {
+            if let Some(entry) = self
+                .settings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry_of(key)
+            {
+                return Some(entry);
+            }
+        }
+        let client = self
+            .client_settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
             .find(|(k, _)| k == key)
-            .map(|(_, v)| v)
-            .or_else(|| self.server_defaults().get(key).cloned())
+            .map(|(_, v)| v.clone());
+        if let Some(v) = client {
+            return Some((v, GucSource::Client));
+        }
+        if let Some((_, v, source)) = self
+            .db_setting_layers()
+            .into_iter()
+            .find(|(k, _, _)| k == key)
+        {
+            let v = self.canonical_setting_value(key, &v).unwrap_or(v);
+            return Some((v, source));
+        }
+        self.server_defaults()
+            .get(key)
+            .map(|v| (v.clone(), GucSource::Default))
+    }
+
+    /// The value `RESET name` returns to.
+    pub(crate) fn reset_value(&self, key: &str) -> Option<String> {
+        self.reset_entry(key).map(|(v, _)| v)
     }
 
     /// `pg_settings`: one row per setting this session knows.
     pub(crate) fn pg_settings_rows(&self, def: &TableDef) -> Vec<Document> {
         let field = |c: &str| def.field_of(c).expect("column");
         let defaults = self.server_defaults();
-        let db_defaults = self.db_setting_layers();
         let settings = self
             .settings
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let pending = self
+            .pending_restart
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        // `sourcefile` and `sourceline` are a superuser's, or a member's of
+        // pg_read_all_settings.
+        let me = self.current_role_name();
+        let sees_files = self.is_superuser(&me) || self.role_is_member(&me, "pg_read_all_settings");
+        let file = alter_system::path(&self.storage).display().to_string();
         let mut names: Vec<&String> = defaults.keys().chain(settings.keys()).collect();
         names.sort_by_key(|n| n.to_ascii_lowercase());
         names.dedup();
@@ -308,16 +355,7 @@ impl PgHandler {
                     .cloned()
                     .unwrap_or_default();
                 let boot = defaults.get(name).cloned();
-                let layer = db_defaults.iter().find(|(k, _, _)| k == name);
-                let source = if let Some((_, _, source)) = layer.filter(|(_, v, _)| *v == setting) {
-                    *source
-                } else if layer.is_some() {
-                    "session"
-                } else if boot.as_deref() == Some(setting.as_str()) {
-                    "default"
-                } else {
-                    "session"
-                };
+                let source = settings.source_of(name);
                 // PostgreSQL 15's row, where it has one: a value still at
                 // its default reads in the row's own unit (`work_mem` is
                 // `4096` kB, where SHOW says `4MB`).
@@ -332,7 +370,13 @@ impl PgHandler {
                 let mut d = Document::new();
                 d.insert(field("name"), name.as_str());
                 d.insert(field("setting"), raw(&setting));
-                d.insert(field("source"), source);
+                d.insert(field("source"), source.name());
+                if source == GucSource::ConfigFile && sees_files {
+                    d.insert(field("sourcefile"), file.as_str());
+                    if let Some(line) = self.config_line_of(name) {
+                        d.insert(field("sourceline"), line);
+                    }
+                }
                 let internal = is_internal_setting(name);
                 match pg {
                     Some(p) => {
@@ -383,7 +427,7 @@ impl PgHandler {
                 if let Some(r) = self.reset_value(name) {
                     d.insert(field("reset_val"), raw(&r));
                 }
-                d.insert(field("pending_restart"), Bson::Boolean(false));
+                d.insert(field("pending_restart"), pending.contains(name.as_str()));
                 d
             })
             .collect()
