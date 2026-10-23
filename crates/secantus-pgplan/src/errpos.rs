@@ -305,6 +305,19 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
                 }
             }
         }
+        // `CALL nosuch.p()`: at the schema, the name's first part.
+        "3F000"
+            if m.starts_with("schema ")
+                && toks
+                    .first()
+                    .is_some_and(|t| t.text.eq_ignore_ascii_case("call")) =>
+        {
+            let name = m.split_once('"')?.1.split_once('"')?.0;
+            let i = toks.iter().enumerate().position(|(i, t)| {
+                unquote_ident(t.text) == name && toks.get(i + 1).is_some_and(|n| n.text == ".")
+            })?;
+            pos(toks[i].start)
+        }
         // An object a `reg*` type's input reads from a string
         // (`'nope'::regconfig`, `to_tsvector('nope', ...)`, `'x'::regrole`,
         // `'s'::regnamespace`): at the literal, as on PostgreSQL 15.19.
@@ -373,6 +386,12 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
             let i = toks.iter().enumerate().position(|(i, t)| {
                 unquote_ident(t.text) == name && toks.get(i + 1).is_some_and(|n| n.text == "(")
             })?;
+            // A qualified name: at its schema.
+            let i = if i >= 2 && toks[i - 1].text == "." {
+                i - 2
+            } else {
+                i
+            };
             pos(toks[i].start)
         }
         // `CALL f()` over a FUNCTION: at the name, as a missing procedure.
@@ -387,6 +406,12 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
             let i = toks.iter().enumerate().position(|(i, t)| {
                 unquote_ident(t.text) == name && toks.get(i + 1).is_some_and(|n| n.text == "(")
             })?;
+            // A qualified name: at its schema.
+            let i = if i >= 2 && toks[i - 1].text == "." {
+                i - 2
+            } else {
+                i
+            };
             pos(toks[i].start)
         }
         // A name read from a string by a `reg*` type's input

@@ -156,6 +156,23 @@ pub trait Host {
             "INSERT / UPDATE / DELETE ... RETURNING INTO",
         ))
     }
+    /// `FETCH` / `MOVE` on the portal `name`: one step as a SQL `FETCH`
+    /// takes it, answering how many rows it moved over and, for a FETCH,
+    /// the row the cursor then sits on (none past either end).
+    fn fetch_cursor(
+        &self,
+        name: &str,
+        direction: secantus_pgplan::FetchDirection,
+        count: i64,
+    ) -> Result<(u64, QueryOut), PlError> {
+        let _ = (name, direction, count);
+        Err(PlError::unsupported("FETCH"))
+    }
+    /// `CLOSE` the portal `name`.
+    fn close_cursor(&self, name: &str) -> Result<(), PlError> {
+        let _ = name;
+        Err(PlError::unsupported("CLOSE"))
+    }
 }
 
 /// A record value: its columns (name, type) and their values, or NULL.
@@ -269,6 +286,8 @@ struct Interp<'a> {
     handling: Option<PlError>,
     /// Bound cursors' queries, by datum number (`open_cursor`).
     cursor_exprs: HashMap<usize, String>,
+    /// A bound cursor's declared options (`SCROLL` / `NO SCROLL`), by datum.
+    cursor_options: HashMap<usize, u64>,
     /// How CONTEXT names this function: `f(integer)`, or
     /// `inline_code_block` for a DO block.
     label: String,
@@ -714,6 +733,7 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
         found_no,
         handling: None,
         cursor_exprs: open_cursor::cursor_exprs(&f),
+        cursor_options: open_cursor::cursor_options(&f),
         label: function_label(create_sql),
         dyn_text: None,
     };
@@ -881,6 +901,17 @@ fn stmt_typename(kind: &str, body: &Value) -> &'static str {
 /// its own: `fails` evaluates such a subexpression (`SELECT <it>`) and
 /// answers whether it raised the error's SQLSTATE. Measured against PostgreSQL 15.19 over 60
 /// shapes (batch 64).
+/// The frame an error binding the expression `text` takes: what
+/// PostgreSQL names the expression by (`expr_frame`'s names), always, since
+/// the expression is where it was raised.
+fn bind_frame(text: &str, mode: u64) -> Option<String> {
+    Some(match mode {
+        3..=5 => format!("PL/pgSQL assignment \"{text}\""),
+        2 => format!("SQL expression \"{text}\""),
+        _ => format!("SQL statement \"{text}\""),
+    })
+}
+
 fn expr_frame(
     text: &str,
     mode: u64,
@@ -1076,6 +1107,20 @@ impl Interp<'_> {
                             // OLD in an INSERT trigger (NEW in a DELETE one)
                             // is NULL, and so is each of its fields.
                             bound = Some((Bson::Null, ty, i + 2));
+                        } else if self.unassigned_record(&name) {
+                            // A field of a record nothing has filled: its
+                            // row type is not known yet (55000, raised by
+                            // the expression, as PostgreSQL frames it).
+                            let mut e = PlError::new(
+                                "55000",
+                                format!("record \"{name}\" is not assigned yet"),
+                            );
+                            e.detail = Some(
+                                "The tuple structure of a not-yet-assigned record is indeterminate."
+                                    .into(),
+                            );
+                            e.from_sql = true;
+                            return Err(e);
                         }
                     }
                 } else if next != Some("(") {
@@ -1110,6 +1155,18 @@ impl Interp<'_> {
                 out.push_str(&format!("(${}::{})[1 + ", params.len(), sql_type(ty)));
                 cursor = tokens[i + 1].end as usize;
                 i += 2;
+                continue;
+            }
+            // `WHERE CURRENT OF c` names the portal the cursor variable
+            // holds, as PL/pgSQL passes it.
+            let current_of = i >= 2
+                && tok(i - 2).is_some_and(|w| w.eq_ignore_ascii_case("current"))
+                && tok(i - 1).is_some_and(|w| w.eq_ignore_ascii_case("of"));
+            if let (Some((Bson::String(portal), _, last)), true) = (bound.as_ref(), current_of) {
+                out.push_str(&text[cursor..t.start as usize]);
+                out.push_str(&secantus_pgplan::scalar::quote_identifier(portal));
+                cursor = tokens[*last].end as usize;
+                i = last + 1;
                 continue;
             }
             if let Some((value, ty, last)) = bound {
@@ -1194,6 +1251,17 @@ impl Interp<'_> {
         other.get(field).map(|(_, ty)| ty.to_string())
     }
 
+    /// Is `name` a record variable that nothing has assigned (the
+    /// innermost one of that name)?
+    fn unassigned_record(&self, name: &str) -> bool {
+        self.trigger.is_none()
+            && self.datums.iter().rev().find_map(|d| match d {
+                Datum::Rec { name: n, rec } if n == name => Some(rec.is_none()),
+                Datum::Var { name: n, .. } if n == name => Some(false),
+                _ => None,
+            }) == Some(true)
+    }
+
     fn record_field(&self, name: &str, field: &str) -> Option<(Bson, String)> {
         let rec = self.record(name)?;
         let (v, ty) = rec.get(field)?;
@@ -1218,7 +1286,9 @@ impl Interp<'_> {
             format!("SELECT {body}")
         };
         let raw = sql.clone();
-        let (sql, params, types) = self.bind(&sql)?;
+        let (sql, params, types) = self
+            .bind(&sql)
+            .map_err(|e| e.with_sql_frame(|| bind_frame(text, mode)))?;
         let out = self.host.query(&sql, &params, &types).map_err(|e| {
             let fails = |q: &str| {
                 self.host
@@ -1264,7 +1334,9 @@ impl Interp<'_> {
             None => format!("SELECT {body}"),
         };
         let raw = sql.clone();
-        let (sql, params, types) = self.bind(&sql)?;
+        let (sql, params, types) = self
+            .bind(&sql)
+            .map_err(|e| e.with_sql_frame(|| bind_frame(text, mode)))?;
         let out = self.host.query(&sql, &params, &types).map_err(|e| {
             let fails = |q: &str| {
                 self.host
@@ -1326,6 +1398,37 @@ impl Interp<'_> {
     }
 
     /// Assign one result row to an INTO / FOR target (a record or a row).
+    /// The datum an `INTO` fills: a record or row variable by number, or an
+    /// anonymous row of the variables listed.
+    pub(super) fn target_datum(&mut self, body: &Value) -> Result<usize, PlError> {
+        let target = body
+            .get("target")
+            .and_then(|t| t.as_object())
+            .and_then(|o| o.values().next())
+            .and_then(|v| v.get("dno").and_then(Value::as_u64))
+            .map(|n| n as usize);
+        Ok(match target {
+            Some(t) => t,
+            None => {
+                // An anonymous row of variables.
+                let fields: Vec<usize> = body
+                    .get("target")
+                    .and_then(|t| t.get("PLpgSQL_row"))
+                    .and_then(|r| r.get("fields"))
+                    .and_then(Value::as_array)
+                    .map(|fs| {
+                        fs.iter()
+                            .filter_map(|x| x.get("varno").and_then(Value::as_u64))
+                            .map(|n| n as usize)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.datums.push(Datum::Row { fields });
+                self.datums.len() - 1
+            }
+        })
+    }
+
     fn assign_row(
         &mut self,
         target: usize,
@@ -1334,9 +1437,11 @@ impl Interp<'_> {
     ) -> Result<(), PlError> {
         match self.datums.get(target) {
             Some(Datum::Rec { .. }) => {
-                let rec = row.map(|r| Record {
+                // No row still gives the record the query's row type, every
+                // field NULL (`exec_move_row` over a NULL tuple).
+                let rec = Some(Record {
                     columns: columns.to_vec(),
-                    values: r.to_vec(),
+                    values: row.map_or_else(|| vec![Bson::Null; columns.len()], <[Bson]>::to_vec),
                 });
                 if let Some(Datum::Rec { rec: slot, .. }) = self.datums.get_mut(target) {
                     *slot = rec;
@@ -1783,6 +1888,8 @@ impl Interp<'_> {
             }
             "PLpgSQL_stmt_raise" => self.raise(body),
             "PLpgSQL_stmt_open" => self.open_cursor(body),
+            "PLpgSQL_stmt_fetch" => self.fetch_cursor(body),
+            "PLpgSQL_stmt_close" => self.close_cursor(body),
             "PLpgSQL_stmt_perform" => {
                 let (text, _) = expr_query(body.get("expr").unwrap_or(&Value::Null))
                     .ok_or_else(|| PlError::new("XX000", "PERFORM without a query"))?;
@@ -1816,32 +1923,7 @@ impl Interp<'_> {
                     if strict && out.rows.len() > 1 {
                         return Err(PlError::new("P0003", "query returned more than one row"));
                     }
-                    let target = body
-                        .get("target")
-                        .and_then(|t| t.as_object())
-                        .and_then(|o| o.values().next())
-                        .and_then(|v| v.get("dno").and_then(Value::as_u64))
-                        .map(|n| n as usize);
-                    let target = match target {
-                        Some(t) => t,
-                        None => {
-                            // An anonymous row of variables.
-                            let fields: Vec<usize> = body
-                                .get("target")
-                                .and_then(|t| t.get("PLpgSQL_row"))
-                                .and_then(|r| r.get("fields"))
-                                .and_then(Value::as_array)
-                                .map(|fs| {
-                                    fs.iter()
-                                        .filter_map(|x| x.get("varno").and_then(Value::as_u64))
-                                        .map(|n| n as usize)
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            self.datums.push(Datum::Row { fields });
-                            self.datums.len() - 1
-                        }
-                    };
+                    let target = self.target_datum(body)?;
                     let first = out.rows.first().map(|r| r.as_slice());
                     self.assign_row(target, &out.columns, first)?;
                     self.set_found(!out.rows.is_empty());
@@ -2053,8 +2135,11 @@ impl Interp<'_> {
             .unwrap_or_default()
             .iter()
             .map(|p| {
+                // As the type's output function writes it: `boolout`'s
+                // `t` / `f`, not a text cast's `true`.
                 self.eval(p).map(|v| match v {
                     Bson::Null => "<NULL>".to_string(),
+                    Bson::Boolean(b) => if b { "t" } else { "f" }.to_string(),
                     other => secantus_pgplan::value_text(&other),
                 })
             })

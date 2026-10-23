@@ -31,17 +31,18 @@ fn kind_of(t: i32) -> Option<&'static str> {
     }
 }
 
-/// The routine an ObjectWithArgs names: its (last) name and, unless left
+/// The routine an ObjectWithArgs names: its name (`schemas::routine_name`) and, unless left
 /// off, its argument types.
 fn target(o: &pg_query::protobuf::ObjectWithArgs) -> Result<(String, Option<Vec<String>>)> {
-    let name = o
+    let parts: Vec<&str> = o
         .objname
         .iter()
         .filter_map(|n| match n.node.as_ref()? {
-            N::String(s) => Some(s.sval.clone()),
+            N::String(s) => Some(s.sval.as_str()),
             _ => None,
         })
-        .next_back()
+        .collect();
+    let name = crate::schemas::routine_name(parts.into_iter())
         .ok_or_else(|| Error::Parse("a routine without a name".into()))?;
     let args = (!o.args_unspecified).then(|| {
         o.objargs

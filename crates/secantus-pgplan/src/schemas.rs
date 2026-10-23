@@ -176,6 +176,43 @@ pub fn relation_key(schema: &str, name: &str) -> String {
     }
 }
 
+/// A routine named by its parts (`[schema.]name`): `schema.name` as
+/// written -- `public`, a user schema, or one that does not exist (3F000
+/// once looked up) -- and the bare name for `pg_catalog` and
+/// `information_schema`, which hold only built-ins (RP-143).
+pub fn routine_name<'a>(parts: impl DoubleEndedIterator<Item = &'a str>) -> Option<String> {
+    let mut parts = parts.rev();
+    let name = parts.next()?;
+    Some(match parts.next() {
+        Some(schema) if !matches!(schema, "pg_catalog" | "information_schema") => {
+            format!("{schema}.{name}")
+        }
+        _ => name.to_string(),
+    })
+}
+
+/// A routine name as `routine_name` writes it, split: the schema it is
+/// qualified with, if any, and the bare name.
+pub fn split_routine_name(name: &str) -> (Option<&str>, &str) {
+    match name.split_once('.') {
+        Some((s, n)) => (Some(s), n),
+        None => (None, name),
+    }
+}
+
+/// Whether a routine `bare` in `schema` answers to `written` (a name as
+/// `routine_name` writes it), and how early: 0 for a qualified match, else
+/// its schema's place on `path` (the search path) -- PostgreSQL's
+/// `FuncnameGetCandidates`, where an earlier schema's routine hides a later
+/// one's of the same signature.
+pub fn routine_rank(written: &str, schema: &str, bare: &str, path: &[String]) -> Option<usize> {
+    match split_routine_name(written) {
+        (Some(s), n) => (s == schema && n == bare).then_some(0),
+        (None, n) if n == bare => path.iter().position(|p| p == schema),
+        _ => None,
+    }
+}
+
 /// Split a catalog key into `(schema, name)`: `schema.name` when the prefix
 /// is a user schema, else `public`.
 pub fn split_key(key: &str) -> (String, String) {

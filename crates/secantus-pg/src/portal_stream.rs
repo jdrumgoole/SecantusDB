@@ -993,11 +993,7 @@ pub(crate) fn trim_cursor(cursor: &mut CursorState) {
     let drop_to = behind.saturating_sub(KEEP_BEHIND);
     if drop_to > cursor.base {
         let n = (drop_to - cursor.base).min(cursor.rows.len());
-        cursor.rows.drain(..n);
-        if let Some(t) = cursor.typed_rows.as_mut() {
-            t.drain(..n.min(t.len()));
-        }
-        cursor.base += n;
+        cursor.drain_front(n);
     }
 }
 
@@ -1044,6 +1040,14 @@ impl PgHandler {
             creation_time: bson::DateTime::now(),
             typed_rows: Some(Vec::new()),
             tz,
+            current_of: self.simply_updatable(sel).then(|| CurrentOf {
+                table: sel.table.clone(),
+                ids: Vec::new(),
+            }),
+            held: holdable
+                && !self
+                    .in_transaction
+                    .load(std::sync::atomic::Ordering::Relaxed),
             tail: Some(CursorTail {
                 exhausted: false,
                 scan: first,
@@ -1099,6 +1103,12 @@ impl PgHandler {
         tail.exhausted = tail.scan.done && tail.scan.pending.is_empty();
         let exhausted = tail.exhausted;
         if !docs.is_empty() {
+            if let Some(c) = cursor.current_of.as_mut() {
+                c.ids.extend(
+                    docs.iter()
+                        .map(|d| d.get("_id").cloned().unwrap_or(Bson::Null)),
+                );
+            }
             let tail = cursor.tail.as_ref().expect("checked");
             let (rows, typed) = self.encode_cursor_docs(tail, docs)?;
             cursor.rows.extend(rows);
@@ -1148,9 +1158,7 @@ impl PgHandler {
             if let Some(tail) = cursor.tail.as_mut() {
                 tail.scan = tail.start.clone();
                 tail.exhausted = false;
-                cursor.rows.clear();
-                cursor.typed_rows = Some(Vec::new());
-                cursor.base = 0;
+                cursor.clear_window();
             }
         }
         loop {
@@ -1167,11 +1175,7 @@ impl PgHandler {
                 );
                 if keep_from > cursor.base {
                     let n = (keep_from - cursor.base).min(cursor.rows.len());
-                    cursor.rows.drain(..n);
-                    if let Some(t) = cursor.typed_rows.as_mut() {
-                        t.drain(..n.min(t.len()));
-                    }
-                    cursor.base += n;
+                    cursor.drain_front(n);
                 }
             }
             if !self.pull_cursor(cursor)? {
@@ -1297,9 +1301,7 @@ impl PgHandler {
                 };
                 tail.scan = tail.start.clone();
                 tail.exhausted = false;
-                cursor.rows.clear();
-                cursor.typed_rows = Some(Vec::new());
-                cursor.base = 0;
+                cursor.clear_window();
                 while self.pull_cursor(cursor)? {}
             }
             Ok(())

@@ -724,6 +724,9 @@ pub enum Statement {
         cascade: bool,
         /// `function`, `procedure` or `routine` (either).
         kind: String,
+        /// The argument types as written, `TypeNameListToString`'s form
+        /// (`pg_catalog.int4,text`), for IF EXISTS's notice.
+        written_args: Option<String>,
     },
     /// `ALTER INDEX | SEQUENCE | TYPE | DOMAIN | SCHEMA | TRIGGER | RULE ...
     /// RENAME`, `ALTER TABLE ... RENAME CONSTRAINT`, `ALTER TYPE ... RENAME
@@ -3470,7 +3473,49 @@ pub(crate) fn func_name(f: &pg_query::protobuf::FuncCall) -> Option<String> {
     if parts.len() >= 2 && is_pg_temp_schema(parts[parts.len() - 2]) {
         return Some(format!("pg_temp.{name}"));
     }
+    // A call qualified with a schema reaches only that schema's user
+    // function (RP-143), when a user function of the name exists at all:
+    // a built-in or a user aggregate reached through a schema is found by
+    // its bare name, as before.
+    if parts.len() >= 2 {
+        let qualified = schemas::routine_name(parts[parts.len() - 2..].iter().copied())?;
+        if qualified != *name
+            && (correlated::user_function_named(&qualified)
+                || (!funcsig::is_builtin_function_name(name)
+                    && correlated::user_function_bare_named(name)))
+        {
+            return Some(qualified);
+        }
+    }
     Some(name.to_string())
+}
+
+/// A type name as PostgreSQL's `TypeNameToString` writes it: the name
+/// parts as the grammar left them (`int` is `pg_catalog.int4`), `%TYPE`,
+/// `[]` for an array, and no type modifiers.
+pub(crate) fn type_name_to_string(tn: &pg_query::protobuf::TypeName) -> String {
+    let mut out = if tn.setof {
+        "SETOF ".to_string()
+    } else {
+        String::new()
+    };
+    out.push_str(
+        &tn.names
+            .iter()
+            .filter_map(|n| match n.node.as_ref()? {
+                N::String(s) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("."),
+    );
+    if tn.pct_type {
+        out.push_str("%TYPE");
+    }
+    if !tn.array_bounds.is_empty() {
+        out.push_str("[]");
+    }
+    out
 }
 
 /// `pg_temp`, or a session's own `pg_temp_N`.
@@ -5822,7 +5867,23 @@ fn plan_call(c: &pg_query::protobuf::CallStmt, params: &[Bson]) -> Result<Statem
         .funccall
         .as_ref()
         .ok_or_else(|| Error::Parse("CALL without a procedure".into()))?;
-    let name = func_name(f).ok_or_else(|| Error::Parse("CALL without a name".into()))?;
+    // A procedure keeps the schema it is qualified with (RP-143); only
+    // `pg_temp` takes `func_name`'s form.
+    let name = func_name(f)
+        .filter(|n| n.starts_with("pg_temp."))
+        .or_else(|| {
+            schemas::routine_name(
+                f.funcname
+                    .iter()
+                    .filter_map(|n| match n.node.as_ref()? {
+                        N::String(s) => Some(s.sval.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            )
+        })
+        .ok_or_else(|| Error::Parse("CALL without a name".into()))?;
     let mut args = Vec::with_capacity(f.args.len());
     let mut arg_types = Vec::with_capacity(f.args.len());
     for a in &f.args {
@@ -5853,9 +5914,22 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
             _ => None,
         })
         .collect();
-    let schema = (name_parts.len() > 1)
-        .then(|| name_parts[name_parts.len() - 2].clone())
-        .filter(|s| s != "public");
+    // Unqualified, it lands in the first schema on the search path
+    // (RP-143); a named schema must exist.
+    let schema = match name_parts.len() {
+        0 | 1 => Some(schemas::creation_schema()?),
+        n => {
+            let s = name_parts[n - 2].clone();
+            if !is_pg_temp_schema(&s) && !schemas::schema_exists(&s) {
+                return Err(Error::Sqlstate(
+                    "3F000",
+                    format!("schema \"{s}\" does not exist"),
+                ));
+            }
+            Some(s)
+        }
+    }
+    .filter(|s| s != "public");
     let name = f
         .funcname
         .iter()
@@ -19787,27 +19861,30 @@ fn plan_grant(g: &pg_query::protobuf::GrantStmt) -> Result<Statement> {
             Some(N::String(st)) => Some(st.sval.clone()),
             // A routine keeps its signature, `f(int4,text)` (bare `f` when
             // the GRANT left it off): its privileges are per overload.
-            Some(N::ObjectWithArgs(ow)) => ow
-                .objname
-                .last()
-                .and_then(|n| match n.node.as_ref() {
-                    Some(N::String(st)) => Some(st.sval.clone()),
-                    _ => None,
-                })
-                .map(|name| {
-                    if ow.args_unspecified {
-                        return name;
-                    }
-                    let args: Vec<String> = ow
-                        .objargs
-                        .iter()
-                        .filter_map(|n| match n.node.as_ref()? {
-                            N::TypeName(tn) => Some(type_name_of(tn)),
-                            _ => None,
-                        })
-                        .collect();
-                    format!("{name}({})", args.join(","))
-                }),
+            Some(N::ObjectWithArgs(ow)) => schemas::routine_name(
+                ow.objname
+                    .iter()
+                    .filter_map(|n| match n.node.as_ref()? {
+                        N::String(st) => Some(st.sval.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            )
+            .map(|name| {
+                if ow.args_unspecified {
+                    return name;
+                }
+                let args: Vec<String> = ow
+                    .objargs
+                    .iter()
+                    .filter_map(|n| match n.node.as_ref()? {
+                        N::TypeName(tn) => Some(type_name_of(tn)),
+                        _ => None,
+                    })
+                    .collect();
+                format!("{name}({})", args.join(","))
+            }),
             Some(N::TypeName(t)) => t.names.last().and_then(|n| match n.node.as_ref() {
                 Some(N::String(st)) => Some(st.sval.clone()),
                 _ => None,
@@ -35384,14 +35461,15 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
         let Some(N::ObjectWithArgs(o)) = d.objects.first().and_then(|o| o.node.as_ref()) else {
             return Err(Error::Unsupported("this DROP FUNCTION target".into()));
         };
-        let name = o
+        let parts: Vec<&str> = o
             .objname
             .iter()
             .filter_map(|n| match n.node.as_ref()? {
-                N::String(s) => Some(s.sval.clone()),
+                N::String(s) => Some(s.sval.as_str()),
                 _ => None,
             })
-            .next_back()
+            .collect();
+        let name = schemas::routine_name(parts.into_iter())
             .ok_or_else(|| Error::Parse("DROP FUNCTION without a name".into()))?;
         let arg_types = if o.args_unspecified {
             None
@@ -35406,12 +35484,23 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
                     .collect(),
             )
         };
+        let written_args = (!o.args_unspecified).then(|| {
+            o.objargs
+                .iter()
+                .filter_map(|n| match n.node.as_ref()? {
+                    N::TypeName(tn) => Some(type_name_to_string(tn)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        });
         return Ok(Statement::DropFunction {
             name,
             arg_types,
             if_exists: d.missing_ok,
             cascade: DropBehavior::try_from(d.behavior) == Ok(DropBehavior::DropCascade),
             kind: kind.to_string(),
+            written_args,
         });
     }
     // `DROP TRIGGER name ON table`: the object is the list
@@ -35893,7 +35982,10 @@ fn plan_update(
     }
     let (filter, residual) = match u.where_clause.as_ref() {
         None => (Document::new(), None),
-        Some(w) => lower_where_or_residual(w, &def, params)?,
+        Some(w) => match current_of(w)? {
+            Some(marker) => (marker, None),
+            None => lower_where_or_residual(w, &def, params)?,
+        },
     };
     let returning = if u.returning_list.is_empty() {
         None
@@ -36295,7 +36387,10 @@ fn plan_delete(
     let def = lookup(&table).ok_or_else(|| write_target_missing(&table, "DELETE from"))?;
     let (filter, residual) = match d.where_clause.as_ref() {
         None => (Document::new(), None),
-        Some(w) => lower_where_or_residual(w, &def, params)?,
+        Some(w) => match current_of(w)? {
+            Some(marker) => (marker, None),
+            None => lower_where_or_residual(w, &def, params)?,
+        },
     };
     let returning = if d.returning_list.is_empty() {
         None
@@ -36310,6 +36405,23 @@ fn plan_delete(
         residual,
         returning,
     }))
+}
+
+/// The filter key that marks `WHERE CURRENT OF cursor`: the executor
+/// replaces the filter with the id of the row the cursor sits on.
+pub const CURRENT_OF_KEY: &str = "\u{1}current_of";
+
+/// `WHERE CURRENT OF c` as its marker filter, or `None` for any other WHERE.
+fn current_of(w: &pg_query::protobuf::Node) -> Result<Option<Document>> {
+    let Some(N::CurrentOfExpr(c)) = w.node.as_ref() else {
+        return Ok(None);
+    };
+    if c.cursor_name.is_empty() {
+        return Err(Error::Unsupported(
+            "WHERE CURRENT OF a cursor parameter".into(),
+        ));
+    }
+    Ok(Some(bson::doc! {CURRENT_OF_KEY: &c.cursor_name}))
 }
 
 fn plan_truncate(
