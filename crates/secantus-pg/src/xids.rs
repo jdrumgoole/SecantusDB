@@ -52,6 +52,9 @@ struct Cluster {
     reserved: u64,
     latest_completed: u64,
     running: HashMap<i32, u64>,
+    /// Each running transaction's command counter: `(current command id,
+    /// whether a row write used it)`. PostgreSQL's `currentCommandId`.
+    commands: HashMap<i32, (u32, bool)>,
 }
 
 /// The clusters by their store's address.
@@ -136,6 +139,7 @@ pub fn install(storage: &Arc<Storage>) -> Result<(), String> {
             reserved: next + BLOCK,
             latest_completed: next - 1,
             running: HashMap::new(),
+            commands: HashMap::new(),
         },
     );
     secantus_pgplan::snapshots::set_xid_hook(answer);
@@ -198,6 +202,7 @@ pub fn end(storage: &Arc<Storage>, pid: i32) {
         if let Some(xid) = c.running.remove(&pid) {
             c.latest_completed = c.latest_completed.max(xid);
         }
+        c.commands.remove(&pid);
     }
 }
 
@@ -212,4 +217,30 @@ pub fn running() -> Vec<(i32, u64)> {
         .unwrap_or_default();
     out.sort_unstable();
     out
+}
+
+/// The command id a row write of `pid`'s transaction stamps (`cmin`): its
+/// transaction's current one, marked used.
+pub fn command_id(storage: &Arc<Storage>, pid: i32) -> u32 {
+    let mut all = clusters().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(c) = all.get_mut(&key(storage)) else {
+        return 0;
+    };
+    let entry = c.commands.entry(pid).or_insert((0, false));
+    entry.1 = true;
+    entry.0
+}
+
+/// A statement of `pid`'s transaction ended, having consumed `n` command
+/// ids (`CommandCounterIncrement`): a row write the one it used.
+pub fn advance_command(storage: &Arc<Storage>, pid: i32, n: u32) {
+    if n == 0 {
+        return;
+    }
+    let mut all = clusters().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = all.get_mut(&key(storage)) {
+        let entry = c.commands.entry(pid).or_insert((0, false));
+        entry.0 += n;
+        entry.1 = false;
+    }
 }

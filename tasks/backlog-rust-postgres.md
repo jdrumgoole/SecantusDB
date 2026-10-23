@@ -727,13 +727,6 @@ Not filed:
       its own slice.
       Backlog-ID: RP-064
       Verify: tests/backlog/test_rp064_encoding.py::test_latin1_database_behaves_as_latin1
-- [ ] **System columns are missing.** `ctid`, `xmin`, `xmax`, `cmin` and
-      `cmax` are 42703 (`tableoid` works). That breaks EF Core / Npgsql's
-      `xmin` concurrency token, the `delete ... where ctid = ...`
-      de-duplication idiom, and catalog queries that read them. `xmin`
-      has a model to build on (`xids.rs`).
-      Backlog-ID: RP-069
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_system_columns
 - [ ] **The cumulative statistics views cannot be queried** (42P01): the 21
       `pg_stat_*_tables` / `_indexes` / `_functions`, `pg_stat_xact_*`,
       `pg_stat_database` and `pg_statio_*` views. Every other relation in
@@ -772,6 +765,37 @@ fixed in the same batch; their tests there are regression tests.
       since nothing records which was made first.
       Backlog-ID: RP-137
       Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order], tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]
+
+## Found by batch 46 (2026-10-23)
+
+Found while building the system columns (RP-069). The gap tests are
+scenarios in `tests/backlog/test_rp_batch46.py`, measured on a private 15.19
+cluster. RP-194 was found and fixed in the same batch; its test there is a
+regression test.
+
+- [ ] **A scan does not read rows in ctid order.** Each row now carries
+      PostgreSQL's `ctid` (`crates/secantus-pg/src/heap.rs`), but a
+      sequential scan here returns rows in the order they were inserted,
+      where PostgreSQL's returns them in heap (ctid) order. After `update t
+      set ... where a = 2` over rows 1, 2, 3, PostgreSQL reads 1, 3, 2 (the
+      new version is the page's last tuple) and this server 1, 2, 3. The
+      fix is the table scan ordered by `__sys_ctid`; it moves the input
+      order every order-dependent answer (an unordered SELECT, `LIMIT`
+      without `ORDER BY`, the HashAggregate model) is computed over.
+      Backlog-ID: RP-192
+      Verify: tests/backlog/test_rp_batch46.py::test_scenario[a scan reads rows in ctid order]
+- [ ] **VACUUM frees no tuple's place.** A plain VACUUM here records its
+      statistics but leaves a dead tuple's space and line pointer taken, so
+      the next INSERT goes after it; PostgreSQL 15.19's VACUUM frees both,
+      and the next row takes `(0,1)` again (the free space map, line pointer
+      reuse). HOT pruning, which reclaims a page's dead tuples when it fills
+      during an UPDATE, is not modelled either. And the reverse after a
+      restart: the heap's free space is kept in the server process
+      (`heap.rs`) and derived from the live rows' ctids when a process first
+      touches a table, so a dead tuple's space is free again after a
+      restart, where PostgreSQL keeps it until VACUUM.
+      Backlog-ID: RP-193
+      Verify: tests/backlog/test_rp_batch46.py::test_scenario[VACUUM frees a dead tuple's place]
 
 ## Found by batch 34 (2026-10-23)
 

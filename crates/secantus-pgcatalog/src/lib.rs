@@ -507,8 +507,35 @@ pub struct TableDef {
     /// verbatim, as `Column::extra` does for columns. They used to be written
     /// back as NULLs, so a Rust rewrite of a table erased what the Python
     /// server recorded (a `COMMENT ON TABLE`, a named primary key).
-    pub extra: Document,
+    pub extra: Document,    /// The system columns a stored table answers besides its own --
+    /// `ctid`, `xmin`, `cmin`, `xmax`, `cmax` -- each read from a hidden
+    /// field the writer stamps on every row ([`SYSTEM_FIELDS`]). Found by
+    /// name ([`TableDef::column`]), never listed with `columns`.
+    pub system_columns: Vec<Column>,
 }
+
+/// The hidden fields behind a stored table's system columns:
+/// `(column, field, type)`. `xmax` has none: a live row's is 0.
+pub const SYSTEM_FIELDS: [(&str, &str, &str); 5] = [
+    ("ctid", "__sys_ctid", "tid"),
+    ("xmin", "__sys_xmin", "xid"),
+    ("cmin", "__sys_cid", "cid"),
+    ("xmax", "__sys_xmax", "xid"),
+    ("cmax", "__sys_cid", "cid"),
+];
+
+/// The system columns, as [`TableDef::system_columns`] holds them.
+pub fn system_columns() -> Vec<Column> {
+    SYSTEM_FIELDS
+        .iter()
+        .map(|(name, field, ty)| {
+            let mut c = Column::new(name, ty, false);
+            c.field_override = Some((*field).to_string());
+            c
+        })
+        .collect()
+}
+
 
 impl TableDef {
     /// `extra`'s record of each column's attnum, kept once a column has
@@ -601,6 +628,7 @@ impl TableDef {
             foreign_keys: Vec::new(),
             unique_constraints: Vec::new(),
             extra: Document::new(),
+            system_columns: Vec::new(),
         }
     }
 
@@ -644,8 +672,23 @@ impl TableDef {
         }
     }
 
-    pub fn column(&self, name: &str) -> Option<&Column> {
+    /// One of the table's own columns, never a system column: what an
+    /// INSERT or UPDATE may name as a target.
+    pub fn user_column(&self, name: &str) -> Option<&Column> {
         self.columns.iter().find(|c| c.name == name)
+    }
+
+    /// Is `name` one of the system columns PostgreSQL gives every table
+    /// (`ctid`, `xmin`, `cmin`, `xmax`, `cmax`, `tableoid`)?
+    pub fn is_system_column_name(name: &str) -> bool {
+        matches!(name, "ctid" | "xmin" | "cmin" | "xmax" | "cmax" | "tableoid")
+    }
+
+    pub fn column(&self, name: &str) -> Option<&Column> {
+        self.columns
+            .iter()
+            .find(|c| c.name == name)
+            .or_else(|| self.system_columns.iter().find(|c| c.name == name))
     }
 
     /// The stored field for a column name, for lowering a predicate: the PK
@@ -743,6 +786,7 @@ impl TableDef {
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect()
             },
+            system_columns: system_columns(),
         })
     }
 }

@@ -10189,6 +10189,28 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     if let Some(am) = misc_alter::table_access_method(&c.access_method)? {
         def.extra.insert("access_method", am);
     }
+    // `WITH (fillfactor = 50, ...)`: checked as ALTER TABLE ... SET checks
+    // them, and kept as `pg_class.reloptions` keeps them (a TOAST table's
+    // aside, which this server does not keep apart).
+    let mut reloptions: Vec<Bson> = Vec::new();
+    for item in &c.options {
+        let Some(N::DefElem(e)) = item.node.as_ref() else {
+            continue;
+        };
+        let toast = e.defnamespace == "toast";
+        let value = e.arg.as_deref().map(reloption_value_text);
+        check_reloption(&e.defname, value.as_deref(), toast)?;
+        if !toast {
+            reloptions.push(Bson::String(format!(
+                "{}={}",
+                e.defname,
+                value.unwrap_or_else(|| "true".into())
+            )));
+        }
+    }
+    if !reloptions.is_empty() {
+        def.extra.insert("reloptions", reloptions);
+    }
     if let Some(action) = on_commit.filter(|a| *a != "preserve") {
         def.extra.insert("on_commit", action);
     }
@@ -10553,6 +10575,8 @@ pub fn plan_check_expression(expression: &str, def: &TableDef) -> Result<ColumnE
     let fields: Vec<RowField> = def
         .columns
         .iter()
+        // A stored table's system columns are columns to an expression.
+        .chain(def.system_columns.iter())
         .map(|c| {
             note_bpchar_width(c);
             (c.name.clone(), c.field(), c.pg_type.clone())
@@ -10901,7 +10925,7 @@ fn plan_insert(
             .collect()
     };
     for t in &targets {
-        if def.column(t).is_none() {
+        if def.user_column(t).is_none() {
             return Err(no_column_of(t, &table));
         }
     }
@@ -11379,7 +11403,7 @@ pub fn insert_row_typed(
     let mut d = Document::new();
     for (i, (col, value)) in targets.iter().zip(values).enumerate() {
         let column = def
-            .column(col)
+            .user_column(col)
             .ok_or_else(|| no_column_of(col, &def.name))?;
         let already_stored = types.get(i).is_some_and(|t| {
             *t == column.pg_type && (range::is_range_type(t) || range::is_multirange_type(t))
@@ -11771,6 +11795,8 @@ fn window_sort_key(
     let fields: Vec<RowField> = def
         .columns
         .iter()
+        // A stored table's system columns are columns to an expression.
+        .chain(def.system_columns.iter())
         .map(|c| {
             note_bpchar_width(c);
             (c.name.clone(), c.field(), c.pg_type.clone())
@@ -12061,6 +12087,8 @@ fn plan_window_call(
             let fields: Vec<RowField> = def
                 .columns
                 .iter()
+                // A stored table's system columns are columns to an expression.
+                .chain(def.system_columns.iter())
                 .map(|c| {
                     note_bpchar_width(c);
                     (c.name.clone(), c.field(), c.pg_type.clone())
@@ -12195,6 +12223,8 @@ fn plan_window_args(
     let fields: Vec<RowField> = def
         .columns
         .iter()
+        // A stored table's system columns are columns to an expression.
+        .chain(def.system_columns.iter())
         .map(|c| {
             note_bpchar_width(c);
             (c.name.clone(), c.field(), c.pg_type.clone())
@@ -15387,6 +15417,8 @@ fn plan_table_targets(
                 let fields: Vec<RowField> = def
                     .columns
                     .iter()
+                    // A stored table's system columns are columns to an expression.
+                    .chain(def.system_columns.iter())
                     .map(|c| {
                         note_bpchar_width(c);
                         (c.name.clone(), c.field(), c.pg_type.clone())
@@ -15950,6 +15982,8 @@ fn plan_aggregate_item(
     let fields: Vec<RowField> = def
         .columns
         .iter()
+        // A stored table's system columns are columns to an expression.
+        .chain(def.system_columns.iter())
         .map(|c| {
             note_bpchar_width(c);
             (c.name.clone(), c.field(), c.pg_type.clone())
@@ -16629,6 +16663,8 @@ fn plan_aggregate_order(
                 let fields: Vec<RowField> = def
                     .columns
                     .iter()
+                    // A stored table's system columns are columns to an expression.
+                    .chain(def.system_columns.iter())
                     .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
                     .collect();
                 let mut sample = Document::new();
@@ -22025,6 +22061,8 @@ fn plan_select_rest(
                 let fields: Vec<RowField> = def
                     .columns
                     .iter()
+                    // A stored table's system columns are columns to an expression.
+                    .chain(def.system_columns.iter())
                     .map(|c| {
                         note_bpchar_width(c);
                         (c.name.clone(), c.field(), c.pg_type.clone())
@@ -23368,6 +23406,8 @@ fn finish_aggregate(
     let fields: Vec<RowField> = def
         .columns
         .iter()
+        // A stored table's system columns are columns to an expression.
+        .chain(def.system_columns.iter())
         .map(|c| {
             note_bpchar_width(c);
             (c.name.clone(), c.field(), c.pg_type.clone())
@@ -30047,6 +30087,11 @@ fn column_type_exists(name: &str) -> bool {
 }
 
 /// A user ENUM's `(oid, labels)` by name, compared exactly.
+/// Is `name` one of the database's enum types?
+pub fn is_user_enum(name: &str) -> bool {
+    user_enum(name).is_some()
+}
+
 fn user_enum(name: &str) -> Option<(i64, Vec<String>)> {
     let trimmed = name.trim();
     // A type named like grammar is registered under its quoted spelling
@@ -36466,6 +36511,8 @@ fn plan_update(
         let fields: Vec<RowField> = def
             .columns
             .iter()
+            // A stored table's system columns are columns to an expression.
+            .chain(def.system_columns.iter())
             .map(|c| {
                 note_bpchar_width(c);
                 (c.name.clone(), c.field(), c.pg_type.clone())
@@ -36481,6 +36528,14 @@ fn plan_update(
         let Some(N::ResTarget(rt)) = t.node.as_ref() else {
             return Err(Error::Unsupported("this SET target".into()));
         };
+        // A system column is not a target (`transformUpdateTargetList`).
+        if def.user_column(&rt.name).is_none() && def.column(&rt.name).is_some() {
+            set_error_location(rt.location);
+            return Err(Error::FeatureNotSupported(format!(
+                "cannot assign to system column \"{}\"",
+                rt.name
+            )));
+        }
         let column = def
             .column(&rt.name)
             .ok_or_else(|| no_column_of(&rt.name, &table))?;
@@ -40250,6 +40305,7 @@ fn needs_numeric_filter(def: &TableDef, field: &str, value: &Bson) -> bool {
 fn field_type<'a>(def: &'a TableDef, field: &str) -> Option<&'a str> {
     def.columns
         .iter()
+        .chain(def.system_columns.iter())
         .find(|c| c.field() == field || c.name == field)
         .map(|c| c.pg_type.as_str())
 }
@@ -40930,6 +40986,8 @@ fn lower_where_or_residual(
             let fields: Vec<RowField> = def
                 .columns
                 .iter()
+                // A stored table's system columns are columns to an expression.
+                .chain(def.system_columns.iter())
                 .map(|c| {
                     note_bpchar_width(c);
                     (c.name.clone(), c.field(), c.pg_type.clone())

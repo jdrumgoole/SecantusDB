@@ -546,7 +546,7 @@ def test_output_settings(rust_pg: Any) -> None:
     _check("output_settings", rust_pg)
 
 
-@pytest.mark.backlog("RP-069")
+@pytest.mark.backlog_fixed("RP-069")
 def test_system_columns(rust_pg: Any) -> None:
     """PostgreSQL 15.19 answers ctid, xmin, xmax, cmin, cmax and tableoid."""
     _check("system_columns", rust_pg)
