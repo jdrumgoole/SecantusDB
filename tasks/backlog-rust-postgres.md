@@ -773,29 +773,6 @@ fixed in the same batch; their tests there are regression tests.
       Backlog-ID: RP-137
       Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order], tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]
 
-## Found by batch 38 (2026-10-23)
-
-Found while fixing RP-172 (an extension's objects are its schema's). The
-gap tests are scenarios in `tests/backlog/test_rp_batch38.py`, measured on a
-private 15.19 cluster. RP-176, RP-177, RP-179 and RP-181 were found and
-fixed in the same batch, and RP-180 and part of RP-178 in batch 39 (whose
-tests are in `test_rp_batch39.py`, with RP-182's, found there); their tests
-are regression tests.
-
-- [ ] **citext's byte-order operators, and its operators named by schema.**
-      `'a'::citext ~<~ 'B'::citext` (and `~<=~`, `~>=~`, `~>~`) is 42804
-      `collations are not supported by type citext` here; PostgreSQL 15.19
-      compares the lowered strings bytewise (`citext_pattern_lt`). This
-      server rewrites the four operators to `COLLATE "C"` comparisons before
-      it knows an operand's type, and citext takes no COLLATE here, where in
-      1.6 it is collatable. And an operator named by the extension's schema,
-      `'A'::s.citext OPERATOR(s.=) 'a'::s.citext`, is `false` here (text's
-      `=`) and `true` there: citext's comparison applies only while the
-      schema is on the search path, and a qualified operator does not reach
-      it.
-      Backlog-ID: RP-178
-      Verify: tests/backlog/test_rp_batch38.py::test_scenario[citext's pattern operators and an operator named by its schema]
-
 ## Found by batch 34 (2026-10-23)
 
 Found while building `CREATE TEXT SEARCH CONFIGURATION` (RP-072). The gap

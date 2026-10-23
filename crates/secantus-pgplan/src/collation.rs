@@ -755,6 +755,129 @@ pub(crate) fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
     })
 }
 
+/// citext's operators where the planner's own passes cannot see them, run
+/// on a statement with its tables known (RP-178):
+///
+/// - the byte-order comparisons (`~<~` and the rest) arrive here as `<`
+///   over operands `pattern_ops` wrapped in `COLLATE "C"` (location -1):
+///   over a citext operand they compare the lowered strings, as
+///   `citext_pattern_lt` does;
+/// - `OPERATOR(s.=)` (or `<`, ...) named with citext's schema is citext's
+///   comparison of the lowered strings whether or not the path reaches
+///   `s`; named with `pg_catalog` it is text's.
+pub fn citext_operators(node: &mut N, lookup: &dyn Fn(&str) -> Option<TableDef>) {
+    let Some(schema) = crate::extension_schema("citext") else {
+        return;
+    };
+    let tables: Vec<TableDef> = node
+        .nodes()
+        .into_iter()
+        .filter_map(|(n, _, _, _)| match n {
+            pg_query::NodeRef::RangeVar(r) => lookup(&r.relname),
+            _ => None,
+        })
+        .collect();
+    let citext_operand = |n: &pg_query::protobuf::Node| -> bool {
+        match n.node.as_ref() {
+            Some(N::TypeCast(tc)) => tc.type_name.as_ref().is_some_and(|t| {
+                t.array_bounds.is_empty() && is_citext_type(&crate::type_name_of(t))
+            }),
+            Some(N::ColumnRef(c)) => {
+                let Some(N::String(name)) = c.fields.last().and_then(|f| f.node.as_ref()) else {
+                    return false;
+                };
+                let mut types = tables
+                    .iter()
+                    .filter_map(|t| t.columns.iter().find(|col| col.name == name.sval))
+                    .map(|col| is_citext_type(&col.pg_type));
+                types.next().is_some_and(|first| first && types.all(|t| t))
+            }
+            _ => false,
+        }
+    };
+    // SAFETY: the pointers `nodes_mut` hands out point into `node`, which
+    // outlives the loop; each AExpr is changed in place, never replaced.
+    unsafe {
+        for (n, _, _) in node.nodes_mut() {
+            let pg_query::NodeMut::AExpr(e) = n else {
+                continue;
+            };
+            let e = &mut *e;
+            let parts: Vec<String> = e
+                .name
+                .iter()
+                .filter_map(|n| match n.node.as_ref()? {
+                    N::String(s) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .collect();
+            let comparison = |op: &str| matches!(op, "=" | "<>" | "<" | "<=" | ">" | ">=");
+            match parts.as_slice() {
+                // `pattern_ops`'s `COLLATE "C"` over a citext operand.
+                [op] if comparison(op) => {
+                    for side in [&mut e.lexpr, &mut e.rexpr] {
+                        let Some(N::CollateClause(cc)) =
+                            side.as_deref_mut().and_then(|n| n.node.as_mut())
+                        else {
+                            continue;
+                        };
+                        if cc.location != -1 {
+                            continue;
+                        }
+                        if let Some(arg) = cc.arg.take() {
+                            cc.arg = Some(Box::new(if citext_operand(&arg) {
+                                lowered_fn(*arg)
+                            } else {
+                                *arg
+                            }));
+                        }
+                    }
+                }
+                [s, op] if comparison(op) && (*s == schema || s == "pg_catalog") => {
+                    let citext = [e.lexpr.as_deref(), e.rexpr.as_deref()]
+                        .into_iter()
+                        .flatten()
+                        .any(&citext_operand);
+                    if !citext {
+                        continue;
+                    }
+                    let to: fn(pg_query::protobuf::Node) -> pg_query::protobuf::Node =
+                        if *s == schema { lowered_fn } else { as_text_fn };
+                    for side in [&mut e.lexpr, &mut e.rexpr] {
+                        if let Some(arg) = side.take() {
+                            *side = Some(Box::new(to(*arg)));
+                        }
+                    }
+                    e.name = vec![crate::string_node(op)];
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn as_text_fn(arg: pg_query::protobuf::Node) -> pg_query::protobuf::Node {
+    pg_query::protobuf::Node {
+        node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+            arg: Some(Box::new(arg)),
+            type_name: Some(crate::type_name_node("text")),
+            location: -1,
+        }))),
+    }
+}
+
+fn lowered_fn(arg: pg_query::protobuf::Node) -> pg_query::protobuf::Node {
+    pg_query::protobuf::Node {
+        node: Some(N::FuncCall(Box::new(pg_query::protobuf::FuncCall {
+            funcname: vec![crate::string_node("lower")],
+            args: vec![as_text_fn(arg)],
+            funcformat: pg_query::protobuf::CoercionForm::CoerceExplicitCall as i32,
+            location: -1,
+            ..Default::default()
+        }))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4711,6 +4711,7 @@ fn plan_node(
 ) -> Result<Statement> {
     let mut node = node;
     schemas::resolve_shadowed_calls(&mut node, lookup);
+    collation::citext_operators(&mut node, lookup);
     refuse_qualified_builtins(&node)?;
     refuse_invisible_extension_functions(&node)?;
     if let Some(st) = fdw::plan(&node, lookup, params)? {

@@ -198,7 +198,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ------------------- RP-178 citext's own functions and qualified operators
     "citext's pattern operators and an operator named by its schema": (
         "RP-178",
-        True,
+        False,
         [
             "create schema rp38_c",
             "create extension citext schema rp38_c",
