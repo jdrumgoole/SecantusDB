@@ -21194,6 +21194,24 @@ impl PgHandler {
     /// position PostgreSQL would point at when the statement names it.
     fn positioned(mut e: PgWireError, sql: &str) -> PgWireError {
         if let PgWireError::UserError(info) = &mut e {
+            // The type an ALTER TYPE / ALTER DOMAIN names is looked up
+            // without a location, so its 42704 has no position (15.19).
+            let words: Vec<String> = sql
+                .split_whitespace()
+                .take(2)
+                .map(str::to_ascii_lowercase)
+                .collect();
+            let alter_type = matches!(
+                words
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                ["alter", "type" | "domain"]
+            );
+            if alter_type && info.code == "42704" && info.message.starts_with("type ") {
+                return e;
+            }
             if info.position.is_none() && info.severity == "ERROR" {
                 info.position = secantus_pgplan::error_position(sql, &info.code, &info.message)
                     .map(|p| p.to_string());
@@ -35280,8 +35298,9 @@ impl PgHandler {
                 sub,
                 to,
                 missing_ok,
+                written,
                 ..
-            } => self.rename_object(&kind, &target, &sub, &to, missing_ok),
+            } => self.rename_object(&kind, &target, &sub, &to, missing_ok, &written),
             Statement::DropFunction {
                 name,
                 arg_types,
@@ -37077,7 +37096,8 @@ impl PgHandler {
                 kind,
                 target,
                 schema,
-            } => self.set_object_schema(kind, &target, &schema),
+                written,
+            } => self.set_object_schema(kind, &target, &schema, &written),
 
             Statement::InsteadOf(io) => self.run_instead_of(io),
             Statement::SetConstraints { names, deferred } => {

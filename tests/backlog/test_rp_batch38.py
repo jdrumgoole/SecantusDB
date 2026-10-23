@@ -2,10 +2,10 @@
 what it fixed -- RP-172 (an extension's objects are its schema's), and,
 found beside it, RP-176 (a user type's unqualified name is found through
 the search path), RP-177 (`ALTER TYPE / DOMAIN / EXTENSION ... SET
-SCHEMA`), RP-179 (DROP SCHEMA CASCADE left its domains) and RP-181 (a
+SCHEMA`), RP-179 (DROP SCHEMA CASCADE left its domains), RP-181 (a
 column of an array of another schema's type was missing from
-`pg_attribute`) -- and the gap
-tests of RP-178 and RP-180, found with them.
+`pg_attribute`) and RP-180 (a missing type lost its schema in the error) --
+and the gap test of RP-178, found with them.
 
 The scenarios run as `test_rp_batch34.py`'s do. The expected answers were
 measured on a private, freshly initdb'd PostgreSQL 15.19 cluster by running
@@ -21,6 +21,7 @@ from __future__ import annotations
 import sys
 from typing import Any
 
+import psycopg
 import pytest
 
 from tests.backlog.test_rp_batch26 import _dsn, _marked
@@ -185,7 +186,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ------------------------ RP-180 a missing qualified type is named in full
     "a missing type named with its schema": (
         "RP-180",
-        True,
+        False,
         [
             "create schema rp38_v",
             "alter type rp38_v.nosuch set schema public",
@@ -195,15 +196,16 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
         ],
     ),
     # ------------------- RP-178 citext's own functions and qualified operators
-    "citext's functions and an operator named by its schema": (
+    "citext's pattern operators and an operator named by its schema": (
         "RP-178",
         True,
         [
             "create schema rp38_c",
             "create extension citext schema rp38_c",
             "select 'A'::rp38_c.citext operator(rp38_c.=) 'a'::rp38_c.citext",
-            "select rp38_c.citext('X')::text, pg_typeof(rp38_c.citext('X'))::text",
-            "select rp38_c.citext(true)::text",
+            "set search_path = rp38_c, public",
+            "select 'a'::citext ~<~ 'B'::citext, 'a'::citext ~>=~ 'B'::citext",
+            "reset search_path",
             "drop extension citext",
             "drop schema rp38_c",
         ],
@@ -358,12 +360,13 @@ EXPECTED: dict[str, Any] = {
         ("ERR", "3F000", 'schema "rp38_nosuch" does not exist', None),
         "DROP SCHEMA",
     ],
-    "citext's functions and an operator named by its schema": [
+    "citext's pattern operators and an operator named by its schema": [
         "CREATE SCHEMA",
         "CREATE EXTENSION",
         [("True",)],
-        [("X", "rp38_c.citext")],
-        [("true",)],
+        "SET",
+        [("True", "False")],
+        "RESET",
         "DROP EXTENSION",
         "DROP SCHEMA",
     ],
@@ -380,6 +383,29 @@ EXPECTED: dict[str, Any] = {
 def test_scenario(name: str, rust_pg: Any) -> None:
     got = run_scenario(_dsn(rust_pg) + " dbname=postgres", SCENARIOS[name][2])
     assert got == EXPECTED[name]
+
+
+@pytest.mark.backlog_fixed("RP-180")
+def test_missing_altered_type_has_no_position(rust_pg: Any) -> None:
+    """PostgreSQL 15.19 looks up the type ALTER TYPE / ALTER DOMAIN names
+    without a location: its 42704 has no position (where a cast's does)."""
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as conn:
+        got = []
+        for sql in (
+            "alter type public.rp38_nosuch rename to x",
+            "alter domain rp38_nosuch set schema public",
+            "select 'a'::rp38_nosuch",
+        ):
+            try:
+                conn.execute(sql)
+                got.append(None)
+            except psycopg.Error as e:
+                got.append((e.sqlstate, e.diag.message_primary, e.diag.statement_position))
+    assert got == [
+        ("42704", 'type "public.rp38_nosuch" does not exist', None),
+        ("42704", 'type "rp38_nosuch" does not exist', None),
+        ("42704", 'type "rp38_nosuch" does not exist', "13"),
+    ]
 
 
 if __name__ == "__main__":

@@ -110,6 +110,87 @@ pub fn is_citext(ty: &str) -> bool {
     is_citext_type(ty) && crate::extension_visible("citext")
 }
 
+/// The functions the citext extension adds that no other type has, by
+/// name, as `(name, arguments, the SQL they compute)` -- `$n` an argument.
+/// Each is the extension's C function's rule (citext.c, 1.6): compare the
+/// lowered strings, by the database's collation or (`pattern`) bytewise.
+pub const CITEXT_ONLY_FUNCTIONS: &[(&str, usize, &str)] = &[
+    ("citext", 1, "(($1)::text)::citext"),
+    ("citext_eq", 2, "(lower(($1)::text) = lower(($2)::text))"),
+    ("citext_ne", 2, "(lower(($1)::text) <> lower(($2)::text))"),
+    ("citext_lt", 2, "(lower(($1)::text) < lower(($2)::text))"),
+    ("citext_le", 2, "(lower(($1)::text) <= lower(($2)::text))"),
+    ("citext_gt", 2, "(lower(($1)::text) > lower(($2)::text))"),
+    ("citext_ge", 2, "(lower(($1)::text) >= lower(($2)::text))"),
+    (
+        "citext_cmp",
+        2,
+        "(case when lower(($1)::text) < lower(($2)::text) then -1 \
+         when lower(($1)::text) = lower(($2)::text) then 0 else 1 end)",
+    ),
+    (
+        "citext_larger",
+        2,
+        "((case when lower(($1)::text) > lower(($2)::text) then ($1)::text \
+         else ($2)::text end)::citext)",
+    ),
+    (
+        "citext_smaller",
+        2,
+        "((case when lower(($1)::text) < lower(($2)::text) then ($1)::text \
+         else ($2)::text end)::citext)",
+    ),
+    ("citext_hash", 1, "hashtext(lower(($1)::text))"),
+    (
+        "citext_hash_extended",
+        2,
+        "hashtextextended(lower(($1)::text), $2)",
+    ),
+    (
+        "citext_pattern_lt",
+        2,
+        "(lower(($1)::text) collate \"C\" < lower(($2)::text) collate \"C\")",
+    ),
+    (
+        "citext_pattern_le",
+        2,
+        "(lower(($1)::text) collate \"C\" <= lower(($2)::text) collate \"C\")",
+    ),
+    (
+        "citext_pattern_gt",
+        2,
+        "(lower(($1)::text) collate \"C\" > lower(($2)::text) collate \"C\")",
+    ),
+    (
+        "citext_pattern_ge",
+        2,
+        "(lower(($1)::text) collate \"C\" >= lower(($2)::text) collate \"C\")",
+    ),
+    (
+        "citext_pattern_cmp",
+        2,
+        "(case when lower(($1)::text) collate \"C\" < lower(($2)::text) collate \"C\" then -1 \
+         when lower(($1)::text) = lower(($2)::text) then 0 else 1 end)",
+    ),
+    ("texticlike", 2, "(($1)::text ilike ($2)::text)"),
+    ("texticnlike", 2, "(($1)::text not ilike ($2)::text)"),
+    ("texticregexeq", 2, "(($1)::text ~* ($2)::text)"),
+    ("texticregexne", 2, "(($1)::text !~* ($2)::text)"),
+];
+
+/// The SQL a citext-only function computes, when the extension is
+/// installed (whether the call reaches it is the search path's question,
+/// asked before planning).
+pub fn citext_only_function(name: &str, args: usize) -> Option<&'static str> {
+    if !crate::extension_installed("citext") {
+        return None;
+    }
+    CITEXT_ONLY_FUNCTIONS
+        .iter()
+        .find(|(n, a, _)| *n == name && *a == args)
+        .map(|(_, _, sql)| *sql)
+}
+
 /// Is `ty` the citext extension's type, wherever it is installed? Such a
 /// value is text to every operator and function citext does not define.
 pub fn is_citext_type(ty: &str) -> bool {

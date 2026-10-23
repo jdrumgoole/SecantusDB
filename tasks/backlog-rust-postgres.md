@@ -778,26 +778,23 @@ fixed in the same batch; their tests there are regression tests.
 Found while fixing RP-172 (an extension's objects are its schema's). The
 gap tests are scenarios in `tests/backlog/test_rp_batch38.py`, measured on a
 private 15.19 cluster. RP-176, RP-177, RP-179 and RP-181 were found and
-fixed in the same batch; their tests there are regression tests.
+fixed in the same batch, and RP-180 and part of RP-178 in batch 39 (whose
+tests are in `test_rp_batch39.py`, with RP-182's, found there); their tests
+are regression tests.
 
-- [ ] **citext's own functions, and its operators named by schema.** The
-      extension's functions -- `citext(text)`, `citext(boolean)`,
-      `citext(inet)`, the case-insensitive `regexp_match(citext, ...)`,
-      `strpos`, `replace`, `split_part` and the rest -- are 42883 here,
-      where PostgreSQL 15.19 has them in the extension's schema. And an
-      operator named by that schema, `'A'::s.citext OPERATOR(s.=)
-      'a'::s.citext`, is `false` here (text's `=`) and `true` there: this
-      server applies citext's comparison only while the schema is on the
-      search path, and has no notion of a qualified operator reaching it.
+- [ ] **citext's byte-order operators, and its operators named by schema.**
+      `'a'::citext ~<~ 'B'::citext` (and `~<=~`, `~>=~`, `~>~`) is 42804
+      `collations are not supported by type citext` here; PostgreSQL 15.19
+      compares the lowered strings bytewise (`citext_pattern_lt`). This
+      server rewrites the four operators to `COLLATE "C"` comparisons before
+      it knows an operand's type, and citext takes no COLLATE here, where in
+      1.6 it is collatable. And an operator named by the extension's schema,
+      `'A'::s.citext OPERATOR(s.=) 'a'::s.citext`, is `false` here (text's
+      `=`) and `true` there: citext's comparison applies only while the
+      schema is on the search path, and a qualified operator does not reach
+      it.
       Backlog-ID: RP-178
-      Verify: tests/backlog/test_rp_batch38.py::test_scenario[citext's functions and an operator named by its schema]
-- [ ] **A missing type named with its schema loses the schema.** `ALTER
-      TYPE s.nosuch SET SCHEMA public` and `ALTER TYPE s.nosuch RENAME TO
-      x` say `type "nosuch" does not exist` and point at the name;
-      PostgreSQL says `type "s.nosuch" does not exist` (`public.nosuch` for
-      `public.nosuch`), with no position.
-      Backlog-ID: RP-180
-      Verify: tests/backlog/test_rp_batch38.py::test_scenario[a missing type named with its schema]
+      Verify: tests/backlog/test_rp_batch38.py::test_scenario[citext's pattern operators and an operator named by its schema]
 
 ## Found by batch 36 (2026-10-23)
 
