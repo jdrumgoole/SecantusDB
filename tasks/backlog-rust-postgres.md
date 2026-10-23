@@ -775,15 +775,15 @@ are scenarios in `tests/backlog/test_rp_batch48.py`, measured on a private
 15.19 cluster. RP-195 (`pg_relation_size`) was found and fixed in the same
 batch; its test there is a regression test.
 
-- [ ] **`pg_class` shows no page or tuple counts.** `relpages`,
-      `reltuples` and `relallvisible` read 0, -1 and 0 for every table,
-      whatever VACUUM, ANALYZE or CREATE INDEX recorded
-      (`catalog_fill.rs`). PostgreSQL 15.19 shows what they measured: 200
-      rows of 140 bytes vacuumed are `4 | 200 | 4`, and after half are
-      deleted and vacuumed again `4 | 100`. What VACUUM counts is now the
-      heap's own (`heap_page.rs`): its pages and live tuples.
+- [ ] **`pg_class` shows no page or tuple counts for an index.** A table's
+      `relpages`, `reltuples` and `relallvisible` are what VACUUM, ANALYZE
+      and CREATE INDEX recorded (batch 49). An index's row still reads 0 and
+      -1, where PostgreSQL 15.19 shows its own pages and entries: an index
+      on 200 integers is `2 | 200` after CREATE INDEX. The pages need a
+      model of the B-tree as inserts split it; `costsize::btree_size`
+      estimates a freshly built one only.
       Backlog-ID: RP-196
-      Verify: tests/backlog/test_rp_batch48.py::test_scenario[pg_class shows what VACUUM counted]
+      Verify: tests/backlog/test_rp_batch49.py::test_scenario[pg_class shows an index's size]
 
 ## Found by batch 46 (2026-10-23)
 

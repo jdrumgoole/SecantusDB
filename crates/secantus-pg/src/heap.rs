@@ -351,13 +351,23 @@ impl PgHandler {
         let Some(def) = self.lookup(table) else {
             return heap;
         };
-        let raw = self
-            .storage
-            .find_matching(self.db(), table, &Document::new())
-            .unwrap_or_default();
+        // A partition's rows are in its tree's root, under the root's fields.
+        let (def, rows) = match self.partition_rows(&def) {
+            Ok(Some((root, rows))) => (root, rows),
+            _ => {
+                let rows = self
+                    .storage
+                    .find_matching(self.db(), table, &Document::new())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|b| crate::decode_doc(b).ok())
+                    .collect();
+                (def, rows)
+            }
+        };
         let mut last = -1;
         let mut held: std::collections::HashMap<u32, Vec<u16>> = Default::default();
-        for row in raw.iter().filter_map(|b| crate::decode_doc(b).ok()) {
+        for row in rows {
             let Some((block, off)) = ctid_of(&row).and_then(untid) else {
                 continue;
             };
@@ -855,11 +865,7 @@ impl PgHandler {
             return Ok(());
         };
         let heaps: Vec<String> = if crate::partition::is_partitioned(&def) {
-            self.partitions_of(table)?
-                .into_iter()
-                .filter(|p| !crate::partition::is_partitioned(p))
-                .map(|p| p.name)
-                .collect()
+            self.leaf_partitions(table)?
         } else if self.has_heap(table) {
             vec![table.to_string()]
         } else {
@@ -911,6 +917,23 @@ impl PgHandler {
             })?;
         }
         Ok(())
+    }
+
+    /// The partitions of `table` that hold rows, at any depth.
+    pub(crate) fn leaf_partitions(&self, table: &str) -> PgWireResult<Vec<String>> {
+        let mut out = Vec::new();
+        let mut todo = vec![table.to_string()];
+        while let Some(t) = todo.pop() {
+            for p in self.partitions_of(&t)? {
+                if crate::partition::is_partitioned(&p) {
+                    todo.push(p.name);
+                } else {
+                    out.push(p.name);
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
     }
 
     /// The pages `table`'s heap has (`RelationGetNumberOfBlocks`).

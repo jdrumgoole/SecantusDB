@@ -195,7 +195,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # -------------------------------------- RP-196 pg_class's page counts
     "pg_class shows what VACUUM counted": (
         "RP-196",
-        True,
+        False,
         [
             f"create table rp48_c (a int, t text) {_NOAV}",
             "insert into rp48_c select g, repeat('x', 100) from generate_series(1, 200) g",

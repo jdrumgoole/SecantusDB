@@ -7291,7 +7291,8 @@ impl PgHandler {
         let (pages, tuples) = hashagg::table_size(
             width,
             table_count as u64,
-            self.heap_pages(table, &def),
+            self.heap_pages(table, &def)
+                .and_then(|_| self.measured_pages(table, &def)),
             measured,
         );
         // `table_block_relation_estimate_size`: `relallvisible` as it is,
@@ -7895,6 +7896,16 @@ impl PgHandler {
     /// The pages PostgreSQL's heap would hold `table`'s rows in, freshly
     /// inserted (`hashagg::heap_pages`); `None` when a column's type is one
     /// whose stored size is not modelled (numeric, arrays, json).
+    /// The pages VACUUM, ANALYZE and CREATE INDEX record of `table`: its
+    /// heap's (`heap.rs`), or the rows' estimate for one without a heap of
+    /// its own.
+    fn measured_pages(&self, table: &str, def: &secantus_pgcatalog::TableDef) -> Option<u64> {
+        if self.has_heap(table) {
+            return self.heap_blocks(table).ok().map(u64::from);
+        }
+        self.heap_pages(table, def)
+    }
+
     fn heap_pages(&self, table: &str, def: &secantus_pgcatalog::TableDef) -> Option<u64> {
         let spaces = self.heap_spaces(table, def)?;
         Some(secantus_pgplan::hashagg::heap_pages(spaces.into_iter()))
@@ -8039,18 +8050,27 @@ impl PgHandler {
         let Some(def) = self.lookup(table) else {
             return Ok(());
         };
-        let rows = self.table_docs(table)?.len();
+        // A partition's rows are read from its tree's root.
+        let rows = match self.partition_rows(&def)? {
+            Some((_, rows)) => rows.len(),
+            None => self.table_docs(table)?.len(),
+        };
         let previous = self.relstats(table);
         let shrunk = previous
             .as_ref()
             .and_then(|d| d.get_i64("vacuum_rows").ok())
             .is_some_and(|v| (rows as i64) < v);
-        let Some(pages) = self.heap_pages(table, &def).filter(|_| !shrunk) else {
+        let Some(pages) = self.measured_pages(table, &def) else {
             return self.record_relstats(table, true);
         };
-        let statistics = previous
-            .as_ref()
-            .is_some_and(|d| d.get_bool("statistics").unwrap_or(false));
+        // What the planner's model cannot price -- rows it does not size,
+        // a heap rows have left -- it declines; `pg_class` still shows the
+        // counts (RP-196).
+        let statistics = shrunk
+            || self.heap_pages(table, &def).is_none()
+            || previous
+                .as_ref()
+                .is_some_and(|d| d.get_bool("statistics").unwrap_or(false));
         let mut doc = bson::doc! {
             "_id": table,
             "reltuples": rows as i64,
@@ -14282,6 +14302,40 @@ impl PgHandler {
     const RELSTATS_COLLECTION: &'static str = "__sql_relstats__";
 
     /// `table`'s row of `RELSTATS_COLLECTION`.
+    /// What VACUUM, ANALYZE and CREATE INDEX recorded of each table:
+    /// `(relpages, reltuples, relallvisible)` by name, as `pg_class` shows
+    /// them (RP-196).
+    pub(crate) fn recorded_sizes(&self) -> std::collections::HashMap<String, (i32, f64, i32)> {
+        self.storage
+            .find_matching(self.db(), Self::RELSTATS_COLLECTION, &Document::new())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|b| decode_doc(b).ok())
+            .filter_map(|d| {
+                let name = d.get_str("_id").ok()?.to_string();
+                let int = |k: &str| match d.get(k) {
+                    Some(Bson::Int64(n)) => i32::try_from(*n).ok(),
+                    Some(Bson::Int32(n)) => Some(*n),
+                    _ => None,
+                };
+                let tuples = match d.get("reltuples") {
+                    Some(Bson::Int64(n)) => *n as f64,
+                    Some(Bson::Int32(n)) => f64::from(*n),
+                    Some(Bson::Double(f)) => *f,
+                    _ => -1.0,
+                };
+                Some((
+                    name,
+                    (
+                        int("relpages").unwrap_or(0),
+                        tuples,
+                        int("relallvisible").unwrap_or(0),
+                    ),
+                ))
+            })
+            .collect()
+    }
+
     fn relstats(&self, table: &str) -> Option<Document> {
         self.storage
             .find_matching(
@@ -14311,14 +14365,14 @@ impl PgHandler {
                 .as_ref()
                 .is_some_and(|d| d.get_bool("statistics").unwrap_or(false));
         let mut doc = bson::doc! {"_id": table, "reltuples": rows as i64, "statistics": statistics};
-        match self.heap_pages(table, &def) {
-            Some(pages) => {
-                doc.insert("relpages", pages as i64);
-            }
-            // A heap whose size is not modelled is not priced at all.
-            None => {
-                doc.insert("statistics", true);
-            }
+        // The heap's pages, as `RelationGetNumberOfBlocks` counts them
+        // (RP-196). A table whose rows' widths the planner does not model
+        // is not priced at all.
+        if self.heap_pages(table, &def).is_none() {
+            doc.insert("statistics", true);
+        }
+        if let Some(pages) = self.measured_pages(table, &def) {
+            doc.insert("relpages", pages as i64);
         }
         // `pg_statistic` is ANALYZE's alone: what it stored stays.
         if let Some(columns) = previous
@@ -14361,7 +14415,10 @@ impl PgHandler {
             .get("default_statistics_target")
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(100);
-        let Some(pages) = self.heap_pages(table, &def) else {
+        if self.heap_pages(table, &def).is_none() {
+            return self.record_relstats(table, true);
+        }
+        let Some(pages) = self.measured_pages(table, &def) else {
             return self.record_relstats(table, true);
         };
         if docs.len() as u64 > 300 * target {
@@ -14576,6 +14633,11 @@ impl PgHandler {
             let bytes =
                 encode_doc(&d).map_err(|e| Self::storage_err("could not encode the comment", e))?;
             self.insert_checked(collection, vec![bytes], "could not record the comment")?;
+        }
+        // `pg_class` shows what is recorded of a table's size (RP-196): a
+        // listing cached before is stale now.
+        if collection == Self::RELSTATS_COLLECTION {
+            bump_catalog_version();
         }
         Ok(())
     }
@@ -18743,6 +18805,7 @@ impl PgHandler {
                     .into_iter()
                     .map(|(n, _, _)| n)
                     .collect();
+                let sizes = self.recorded_sizes();
                 for t in self.all_table_defs().ok()? {
                     let mut d = Document::new();
                     d.insert(
@@ -18750,6 +18813,11 @@ impl PgHandler {
                         Bson::Int64(self.relation_oid(&t.name).unwrap_or(0)),
                     );
                     d.insert(f("relname"), t.name.as_str());
+                    // What VACUUM, ANALYZE or CREATE INDEX last counted.
+                    let (pages, tuples, visible) =
+                        sizes.get(&t.name).copied().unwrap_or((0, -1.0, 0));
+                    d.insert(f("relpages"), Bson::Int32(pages));
+                    d.insert(f("relallvisible"), Bson::Int32(visible));
                     d.insert(f("relnamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
                     d.insert(
                         f("relkind"),
@@ -18791,7 +18859,7 @@ impl PgHandler {
                         f("relhasindex"),
                         indexes.iter().any(|ix| ix.table.name == t.name),
                     );
-                    d.insert(f("reltuples"), Bson::Double(-1.0));
+                    d.insert(f("reltuples"), Bson::Double(tuples));
                     d.insert(
                         f("relowner"),
                         Bson::Int64(owner_oid(t.extra.get_str("owner").ok())),
@@ -38236,9 +38304,18 @@ impl PgHandler {
                             continue;
                         }
                         if command == "VACUUM" {
-                            // The heap's dead tuples removed (RP-193).
+                            // The heap's dead tuples removed (RP-193). A
+                            // partitioned table is its leaves: they are
+                            // counted, it is not (RP-196).
                             self.vacuum_heap(t)?;
-                            self.record_vacuum(t)?;
+                            match self.lookup(t) {
+                                Some(d) if partition::is_partitioned(&d) => {
+                                    for leaf in self.leaf_partitions(t)? {
+                                        self.record_vacuum(&leaf)?;
+                                    }
+                                }
+                                _ => self.record_vacuum(t)?,
+                            }
                         }
                         if analyze {
                             self.record_analyze(t, columns)?;
