@@ -140,8 +140,14 @@ fn the_primary_key_column_is_stored_as_id() {
 
 #[test]
 fn round_trips_through_its_own_document() {
+    // The document does not carry the system columns: every stored table
+    // answers them, so loading one supplies them.
     let t = t_table();
-    assert_eq!(TableDef::from_document(&t.to_document()), Some(t));
+    let loaded = TableDef {
+        system_columns: crate::system_columns(),
+        ..t.clone()
+    };
+    assert_eq!(TableDef::from_document(&t.to_document()), Some(loaded));
 }
 
 #[test]
