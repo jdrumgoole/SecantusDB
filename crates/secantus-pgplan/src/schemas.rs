@@ -290,6 +290,110 @@ fn hidden_in_public(name: &str, path: &[String]) -> bool {
         && resolve_unqualified(name) == name
 }
 
+/// Resolve each bare call of a built-in's name that a user function of
+/// the same name could also answer, as PostgreSQL resolves it over every
+/// candidate on the path (`pg_catalog` first): a call the user function
+/// wins is rewritten to its qualified name, which is the only one it
+/// answers to (`UserFn::answers_to`). A call whose argument types are not
+/// known before planning (a column) is given to the user function, as
+/// every bare call of it was before.
+pub fn resolve_shadowed_calls(node: &mut N, lookup: &dyn Fn(&str) -> Option<TableDef>) {
+    let user = crate::correlated::user_functions();
+    if !user
+        .iter()
+        .any(|u| crate::funcsig::is_builtin_function_name(&u.name))
+    {
+        return;
+    }
+    let path = search_path();
+    // `pg_catalog` is searched first unless the path places it.
+    let catalog_at = path.iter().position(|p| p == "pg_catalog");
+    // The tables the statement reads, for a column argument's type.
+    let tables: Vec<TableDef> = node
+        .nodes()
+        .into_iter()
+        .filter_map(|(n, _, _, _)| match n {
+            pg_query::NodeRef::RangeVar(r) => lookup(&r.relname),
+            _ => None,
+        })
+        .collect();
+    let column_type = |c: &pg_query::protobuf::ColumnRef| -> Option<String> {
+        let name = match c.fields.last()?.node.as_ref()? {
+            N::String(s) => s.sval.clone(),
+            _ => return None,
+        };
+        let mut types = tables
+            .iter()
+            .filter_map(|t| t.columns.iter().find(|col| col.name == name))
+            .map(|col| col.pg_type.clone());
+        let first = types.next()?;
+        types.all(|t| t == first).then_some(first)
+    };
+    // SAFETY: the pointers `nodes_mut` hands out point into `node`, which
+    // outlives the loop and is not otherwise touched while they are used.
+    unsafe {
+        for (n, _, _) in node.nodes_mut() {
+            let pg_query::NodeMut::FuncCall(f) = n else {
+                continue;
+            };
+            let f = &mut *f;
+            let [only] = f.funcname.as_slice() else {
+                continue;
+            };
+            let Some(N::String(name)) = only.node.as_ref() else {
+                continue;
+            };
+            let name = name.sval.clone();
+            if !crate::funcsig::is_builtin_function_name(&name) {
+                continue;
+            }
+            // The user functions of the name, earliest schema on the path.
+            let mut candidates: Vec<&crate::correlated::UserFn> = user
+                .iter()
+                .filter(|u| u.name == name && path.contains(&u.schema))
+                .collect();
+            candidates.sort_by_key(|u| path.iter().position(|p| *p == u.schema));
+            let Some(u) = candidates
+                .iter()
+                .find(|u| u.arg_types.len() == f.args.len() || u.variadic)
+            else {
+                continue;
+            };
+            let args: Option<Vec<String>> = f
+                .args
+                .iter()
+                .map(|a| match a.node.as_ref() {
+                    Some(N::AConst(c))
+                        if c.isnull
+                            || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
+                    {
+                        Some("unknown".to_string())
+                    }
+                    Some(N::ColumnRef(c)) => column_type(c),
+                    Some(N::ParamRef(_)) => None,
+                    _ => {
+                        let t = crate::static_type(a, &bson::Bson::Null);
+                        (!t.is_empty() && t != "unknown").then_some(t)
+                    }
+                })
+                .collect();
+            let catalog_first = match (catalog_at, path.iter().position(|p| *p == u.schema)) {
+                (Some(c), Some(s)) => c < s,
+                _ => true,
+            };
+            let user_wins = match &args {
+                Some(args) => {
+                    !crate::funcsig::builtin_beats(&name, args, &u.arg_types, catalog_first)
+                }
+                None => true,
+            };
+            if user_wins {
+                f.funcname.insert(0, string_node(u.schema.clone()));
+            }
+        }
+    }
+}
+
 /// The catalog key of the user type a statement names by `parts`: a
 /// qualified name's own, an unqualified one's through the search path (the
 /// first schema holding it, else `public`'s).
