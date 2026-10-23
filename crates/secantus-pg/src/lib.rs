@@ -2798,6 +2798,10 @@ impl RoleInfo {
     }
 }
 
+/// A range constructor function: `(oid, name, argument type oids, return
+/// type oid, owning type oid, prosrc, variadic)` (`range_constructors`).
+pub(crate) type RangeConstructor = (i64, String, Vec<i64>, i64, i64, &'static str, bool);
+
 impl PgHandler {
     /// Where the `CREATE ROLE` records live: the cluster-wide namespace.
     const ROLE_COLLECTION: &'static str = "roles";
@@ -4727,6 +4731,8 @@ impl PgHandler {
     /// Range oids live in the 69_000 band, their arrays at +100_000, so
     /// +200_000 (multirange) and +300_000 (multirange array) never collide.
     const MULTIRANGE_TYPE_OID_OFFSET: i64 = 200_000;
+    /// Where a range's constructor functions' oids start (five a range).
+    const RANGE_CONSTRUCTOR_OID_BASE: i64 = 900_000_000;
 
     /// Hand the planner this database's user types, at the current catalog
     /// version. The planner's type tables are thread-local, so this runs
@@ -5084,6 +5090,19 @@ impl PgHandler {
                         args.join(","),
                     )
                 })
+                // A range's constructors are functions too.
+                .chain(self.range_constructors().into_iter().map(
+                    |(oid, name, args, _, _, _, _)| {
+                        (
+                            name,
+                            oid,
+                            args.iter()
+                                .map(|a| self.range_constructor_type_name(*a))
+                                .collect::<Vec<_>>()
+                                .join(","),
+                        )
+                    },
+                ))
                 .collect(),
         );
         secantus_pgplan::instead_of::set_instead_of_triggers(
@@ -5120,7 +5139,30 @@ impl PgHandler {
         secantus_pgplan::set_view_defs_marked(self.view_defs_as(2));
         secantus_pgplan::set_index_defs(self.index_defs());
         secantus_pgplan::set_trigger_defs(self.trigger_defs());
-        secantus_pgplan::set_function_sigs(self.function_sigs());
+        let mut sigs = self.function_sigs();
+        // A range's constructors, as `\df` prints them.
+        for (oid, _, args, ret, _, _, variadic) in self.range_constructors() {
+            let shown: Vec<String> = args
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    let t = self.range_constructor_type_name(*a);
+                    if variadic && i + 1 == args.len() {
+                        format!("VARIADIC {t}")
+                    } else {
+                        t
+                    }
+                })
+                .collect();
+            let text = shown.join(", ");
+            sigs.push((
+                oid,
+                text.clone(),
+                text,
+                self.range_constructor_type_name(ret),
+            ));
+        }
+        secantus_pgplan::set_function_sigs(sigs);
         let mut arg_defaults = self.function_arg_defaults();
         static BUILTIN_ARG_DEFAULTS: OnceLock<Vec<(i64, Vec<Option<String>>)>> = OnceLock::new();
         arg_defaults.extend(
@@ -10941,6 +10983,152 @@ impl PgHandler {
             }
         }
         None
+    }
+
+    /// A user range's constructor functions, as `CREATE TYPE ... AS RANGE`
+    /// makes them (15.19): `(oid, name, argument type oids, return type
+    /// oid, owning type oid, prosrc, variadic)` -- the range's own two
+    /// (`r(sub, sub)`, `r(sub, sub, text)`) and its multirange's three
+    /// (`m()`, `m(r)`, `m(VARIADIC r[])`).
+    pub(crate) fn range_constructors(&self) -> Vec<RangeConstructor> {
+        let mut out = Vec::new();
+        for (_, name, oid, subtype) in self.ranges_with_schema().unwrap_or_default() {
+            let sub = secantus_pgplan::pgtypes::oid_of_name(&subtype)
+                .or_else(|| self.type_oid_by_name(&subtype))
+                .unwrap_or(0);
+            let multi = oid + Self::MULTIRANGE_TYPE_OID_OFFSET;
+            let multi_name = secantus_pgplan::range::multirange_name_for(&name);
+            // Consecutive, in the order PostgreSQL makes them (an ORDER BY
+            // a regprocedure is by oid), in a band of their own.
+            let fn_oid = |n: usize| {
+                Self::RANGE_CONSTRUCTOR_OID_BASE + (oid - Self::RANGE_TYPE_OID_BASE) * 5 + n as i64
+            };
+            out.push((
+                fn_oid(0),
+                name.clone(),
+                vec![sub, sub],
+                oid,
+                oid,
+                "range_constructor2",
+                false,
+            ));
+            out.push((
+                fn_oid(1),
+                name.clone(),
+                vec![sub, sub, 25],
+                oid,
+                oid,
+                "range_constructor3",
+                false,
+            ));
+            out.push((
+                fn_oid(2),
+                multi_name.clone(),
+                vec![],
+                multi,
+                multi,
+                "multirange_constructor0",
+                false,
+            ));
+            out.push((
+                fn_oid(3),
+                multi_name.clone(),
+                vec![oid],
+                multi,
+                multi,
+                "multirange_constructor1",
+                false,
+            ));
+            out.push((
+                fn_oid(4),
+                multi_name,
+                vec![oid + Self::USER_TYPE_ARRAY_OID_OFFSET],
+                multi,
+                multi,
+                "multirange_constructor2",
+                true,
+            ));
+        }
+        out
+    }
+
+    /// A type a range constructor names, as `regtype` prints it: the
+    /// range, its multirange or its array by their visible names, a
+    /// built-in subtype by its own.
+    pub(crate) fn range_constructor_type_name(&self, oid: i64) -> String {
+        for (schema, name, r, _) in self.ranges_with_schema().unwrap_or_default() {
+            let shown = |n: &str| {
+                secantus_pgplan::schemas::visible_name(&Self::type_resolution(&schema, n))
+            };
+            if oid == r {
+                return shown(&name);
+            }
+            if oid == r + Self::MULTIRANGE_TYPE_OID_OFFSET {
+                return shown(&secantus_pgplan::range::multirange_name_for(&name));
+            }
+            if oid == r + Self::USER_TYPE_ARRAY_OID_OFFSET {
+                return format!("{}[]", shown(&name));
+            }
+        }
+        secantus_pgplan::regtype_text(oid)
+    }
+
+    /// The constructors as `pg_proc` rows: internal, immutable, the
+    /// multirange's strict.
+    fn range_constructor_rows(&self, def: &TableDef) -> Vec<Document> {
+        let field = |n: &str| def.field_of(n);
+        let namespaces = self.namespaces();
+        let ranges = self.ranges_with_schema().unwrap_or_default();
+        self.range_constructors()
+            .into_iter()
+            .map(|(oid, name, args, ret, owner, src, variadic)| {
+                let schema = ranges
+                    .iter()
+                    .find(|(_, _, o, _)| {
+                        *o == owner || *o + Self::MULTIRANGE_TYPE_OID_OFFSET == owner
+                    })
+                    .map(|(s, _, _, _)| s.clone())
+                    .unwrap_or_else(|| "public".into());
+                let ns = namespaces
+                    .iter()
+                    .find(|(n, _)| *n == schema)
+                    .map_or(Self::PUBLIC_NAMESPACE_OID, |(_, o)| *o);
+                let multirange = src.starts_with("multirange");
+                let mut d = Document::new();
+                let mut put = |k: &str, v: Bson| {
+                    if let Some(f) = field(k) {
+                        d.insert(f, v);
+                    }
+                };
+                put("oid", Bson::Int64(oid));
+                put("proname", Bson::String(name));
+                put("pronamespace", Bson::Int64(ns));
+                put("proowner", Bson::Int64(10));
+                put("prolang", Bson::Int64(12));
+                put("prokind", Bson::String("f".into()));
+                put("prosecdef", Bson::Boolean(false));
+                put("proisstrict", Bson::Boolean(multirange));
+                put("proretset", Bson::Boolean(false));
+                put("provolatile", Bson::String("i".into()));
+                put("pronargs", Bson::Int32(args.len() as i32));
+                put("prorettype", Bson::Int64(ret));
+                put(
+                    "proargtypes",
+                    Bson::Array(args.iter().map(|a| Bson::Int64(*a)).collect()),
+                );
+                put(
+                    "provariadic",
+                    Bson::Int64(if variadic {
+                        owner - Self::MULTIRANGE_TYPE_OID_OFFSET
+                    } else {
+                        0
+                    }),
+                );
+                put("proargnames", Bson::Null);
+                put("prosrc", Bson::String(src.into()));
+                d
+            })
+            .collect()
     }
 
     /// Mint the next base-type oid -- the range minting rule, base 71000.
@@ -19769,6 +19957,7 @@ impl PgHandler {
                         row.insert(f("prosrc"), "aggregate_dummy");
                         row
                     }))
+                    .chain(self.range_constructor_rows(&def))
                     .collect()
             }
             "pg_inherits" => {

@@ -443,7 +443,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "dependencies on a constant's type and a range's functions": (
         "RP-105",
-        True,
+        False,
         [
             "create type rp28_e as enum ('a', 'b')",
             "create table rp28_d (a int, b rp28_e)",

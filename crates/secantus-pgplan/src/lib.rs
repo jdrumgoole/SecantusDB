@@ -9143,20 +9143,83 @@ fn render_index_predicate(node: &pg_query::protobuf::Node, def: &TableDef) -> Op
                     }
                 }
                 Val::Boolval(v) => v.boolval.to_string(),
-                Val::Sval(v) => {
-                    let cast = match ty.as_str() {
-                        "text" => "text",
-                        "varchar" => "character varying",
-                        _ => return None,
-                    };
-                    format!("'{}'::{cast}", v.sval.replace('\'', "''"))
-                }
+                Val::Sval(v) => predicate_string_literal(&v.sval, &ty)?,
                 _ => return None,
             };
             Some(format!("({col} {op} {lit})"))
         }
+        // `col IN (...)` / `col NOT IN (...)`: an array comparison, as the
+        // parser rewrites it (`= ANY (ARRAY[...])`, `<> ALL (...)`).
+        N::AExpr(a) if a.kind == pg_query::protobuf::AExprKind::AexprIn as i32 => {
+            let op = match a.name.last()?.node.as_ref()? {
+                N::String(s) => s.sval.clone(),
+                _ => return None,
+            };
+            let col = column(a.lexpr.as_deref()?)?;
+            let ty = def.column(&col)?.pg_type.clone();
+            let N::List(items) = a.rexpr.as_deref()?.node.as_ref()? else {
+                return None;
+            };
+            let lits: Option<Vec<String>> = items
+                .items
+                .iter()
+                .map(|i| match i.node.as_ref()? {
+                    N::AConst(c) => match c.val.as_ref()? {
+                        Val::Sval(v) => predicate_string_literal(&v.sval, &ty),
+                        Val::Ival(v) if ty == "int4" => Some(v.ival.to_string()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            let (cmp, quant) = if op == "=" {
+                ("=", "ANY")
+            } else {
+                ("<>", "ALL")
+            };
+            let lits = lits?;
+            // One value is a plain comparison (`transformAExprIn`).
+            if let [one] = lits.as_slice() {
+                return Some(format!("({col} {cmp} {one})"));
+            }
+            Some(format!(
+                "({col} {cmp} {quant} (ARRAY[{}]))",
+                lits.join(", ")
+            ))
+        }
         _ => None,
     }
+}
+
+/// A string literal compared with a column of `ty`, as ruleutils prints the
+/// constant the parser made of it (`get_const_expr`, 15.19): an `int4` or
+/// a `numeric` bare (`5`, `1.50`), a boolean as `true` / `false`, anything
+/// else as its output text cast to the type (`'2020-01-01'::date`,
+/// `'ab'::bpchar`, `'a'::mood`).
+fn predicate_string_literal(text: &str, ty: &str) -> Option<String> {
+    let quoted = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let out = || -> Option<String> {
+        let node = enum_order::parse_expr(&format!("select ({})::{ty}::text", quoted(text)))?;
+        match const_value(&node, &[]).ok()? {
+            Bson::String(s) => Some(s),
+            _ => None,
+        }
+    };
+    Some(match ty {
+        "text" => format!("{}::text", quoted(text)),
+        "varchar" => format!("{}::character varying", quoted(text)),
+        "int4" | "numeric" => {
+            let v = out()?;
+            if v.starts_with('-') {
+                format!("{}::{}", quoted(&v), display_type(ty))
+            } else {
+                v
+            }
+        }
+        "bool" => out()?,
+        "bpchar" => format!("{}::bpchar", quoted(&out()?)),
+        _ => format!("{}::{}", quoted(&out()?), display_type(ty)),
+    })
 }
 
 /// `EXPLAIN`. The statement is planned as it would run; the server renders
