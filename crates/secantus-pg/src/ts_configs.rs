@@ -120,7 +120,7 @@ impl PgHandler {
         })
     }
 
-    fn require_schema(&self, schema: &str) -> PgWireResult<()> {
+    pub(crate) fn require_schema(&self, schema: &str) -> PgWireResult<()> {
         if schema == "pg_catalog" || secantus_pgplan::schemas::schema_exists(schema) {
             return Ok(());
         }

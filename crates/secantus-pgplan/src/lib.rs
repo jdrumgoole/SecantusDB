@@ -26,6 +26,7 @@ pub mod hashagg;
 mod hashfn;
 pub mod joincost;
 mod like_match;
+pub mod misc_alter;
 mod multi_assign;
 mod record_fields;
 mod returning_star;
@@ -376,6 +377,11 @@ impl Error {
             }
             Error::Sqlstate("42809", m) if m.ends_with(" is a procedure") => {
                 Some("To call a procedure, use CALL.")
+            }
+            Error::Sqlstate("42704", m)
+                if m.starts_with("data type ") && m.contains(" has no default operator class ") =>
+            {
+                Some("You must specify an operator class for the index or define a default operator class for the data type.")
             }
             // A PREFIX operator (`- oid`) has one argument, and its hint says so.
             Error::UndefinedFunction(m)
@@ -868,6 +874,12 @@ pub enum Statement {
         /// The name as written, which a missing type's error echoes.
         written: String,
     },
+    /// A small ALTER of an extension, operator or collation.
+    MiscAlter(misc_alter::MiscAlter),
+    /// `CREATE / DROP / ALTER CONVERSION`.
+    Conversion(misc_alter::ConversionOp),
+    /// `CREATE / DROP ACCESS METHOD`.
+    AccessMethod(misc_alter::AccessMethodOp),
     /// `DROP EXTENSION [IF EXISTS] names [CASCADE]`.
     DropExtension {
         names: Vec<String>,
@@ -1159,6 +1171,9 @@ pub enum Statement {
         /// `CREATE MATERIALIZED VIEW`: the query's SQL, kept so `REFRESH`
         /// can run it again.
         matview_sql: Option<String>,
+        /// `USING am`: one of the database's own table access methods
+        /// (`heap` is `None`).
+        access_method: Option<String>,
     },
     /// `REFRESH MATERIALIZED VIEW name [WITH [NO] DATA]`.
     RefreshMatView {
@@ -4757,6 +4772,33 @@ fn plan_node(
         N::ViewStmt(v) => plan_create_view(&v),
         N::ExplainStmt(e) => plan_explain(&e, lookup, params),
         N::AlterSeqStmt(a) => plan_alter_sequence(&a),
+        N::CreateAmStmt(c) => misc_alter::plan_create_am(&c),
+        N::DropStmt(d)
+            if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectAccessMethod) =>
+        {
+            misc_alter::plan_drop_am(&d)
+        }
+        N::CreateConversionStmt(c) => misc_alter::plan_create_conversion(&c),
+        N::DropStmt(d)
+            if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectConversion) =>
+        {
+            misc_alter::plan_drop_conversion(&d)
+        }
+        N::RenameStmt(r)
+            if ObjectType::try_from(r.rename_type) == Ok(ObjectType::ObjectConversion) =>
+        {
+            misc_alter::plan_rename_conversion(&r)
+        }
+        N::AlterOwnerStmt(a)
+            if ObjectType::try_from(a.object_type) == Ok(ObjectType::ObjectConversion) =>
+        {
+            misc_alter::plan_conversion_owner(&a)
+        }
+        N::AlterObjectSchemaStmt(a)
+            if ObjectType::try_from(a.object_type) == Ok(ObjectType::ObjectConversion) =>
+        {
+            misc_alter::plan_conversion_schema(&a)
+        }
         N::RenameStmt(r)
             if ObjectType::try_from(r.rename_type) == Ok(ObjectType::ObjectStatisticExt) =>
         {
@@ -4794,6 +4836,11 @@ fn plan_node(
             if ObjectType::try_from(r.rename_type) == Ok(ObjectType::ObjectTsconfiguration) =>
         {
             ts_configs::plan_rename(&r)
+        }
+        N::RenameStmt(r)
+            if ObjectType::try_from(r.rename_type) == Ok(ObjectType::ObjectCollation) =>
+        {
+            misc_alter::plan_collation_rename(&r)
         }
         N::RenameStmt(r) => plan_rename(&r),
         N::AlterDatabaseStmt(a) => {
@@ -5150,6 +5197,13 @@ fn plan_node(
             if ObjectType::try_from(a.object_type) == Ok(ObjectType::ObjectTsconfiguration) =>
         {
             ts_configs::plan_set_schema(&a)
+        }
+        N::AlterExtensionStmt(a) => misc_alter::plan_extension_update(&a),
+        N::AlterCollationStmt(a) => misc_alter::plan_collation_refresh(&a),
+        N::AlterOwnerStmt(a)
+            if ObjectType::try_from(a.object_type) == Ok(ObjectType::ObjectOperator) =>
+        {
+            misc_alter::plan_operator_owner(&a)
         }
         N::AlterObjectSchemaStmt(a)
             if matches!(
@@ -6675,6 +6729,7 @@ fn plan_create_table_as(
         query: Box::new(query),
         with_data: !into.skip_data,
         matview_sql,
+        access_method: misc_alter::table_access_method(&into.access_method)?,
     })
 }
 
@@ -8323,9 +8378,64 @@ fn index_operator_class(method: &str, pg_type: &str, explicit: Option<&str>) -> 
     let ty = pg_type.to_ascii_lowercase();
     let array = ty.ends_with("[]");
     let range = ty.ends_with("range") || ty.ends_with("multirange");
+    // The built-in types btree / hash have no default class for (15.19,
+    // measured over every `pg_catalog` base type).
+    const NO_BTREE: &[&str] = &[
+        "aclitem",
+        "box",
+        "cid",
+        "circle",
+        "gtsvector",
+        "json",
+        "jsonpath",
+        "line",
+        "lseg",
+        "path",
+        "pg_snapshot",
+        "point",
+        "polygon",
+        "refcursor",
+        "txid_snapshot",
+        "xid",
+        "xml",
+        "pg_brin_bloom_summary",
+        "pg_brin_minmax_multi_summary",
+    ];
+    const NO_HASH: &[&str] = &[
+        "bit",
+        "varbit",
+        "bit varying",
+        "box",
+        "circle",
+        "gtsvector",
+        "json",
+        "jsonpath",
+        "line",
+        "lseg",
+        "money",
+        "path",
+        "pg_snapshot",
+        "point",
+        "polygon",
+        "refcursor",
+        "tsquery",
+        "tsvector",
+        "txid_snapshot",
+        "xml",
+        "pg_brin_bloom_summary",
+        "pg_brin_minmax_multi_summary",
+    ];
     let default: Option<&str> = match method {
         "btree" | "hash" => {
+            let missing = if method == "btree" { NO_BTREE } else { NO_HASH };
             return match explicit {
+                None if missing.contains(&ty.as_str()) => Err(Error::Sqlstate(
+                    "42704",
+                    format!(
+                        "data type {} has no default operator class for access method \"{method}\"",
+                        display_type(pg_type)
+                    ),
+                )),
                 None => Ok(String::new()),
                 Some(o)
                     if matches!(
@@ -8339,7 +8449,7 @@ fn index_operator_class(method: &str, pg_type: &str, explicit: Option<&str>) -> 
                     "42704",
                     format!("operator class \"{o}\" does not exist for access method \"{method}\""),
                 )),
-            }
+            };
         }
         "gin" if array => Some("array_ops"),
         "gin" if ty == "jsonb" => Some("jsonb_ops"),
@@ -8482,6 +8592,24 @@ fn plan_create_index(
                     "access method \"{method}\" does not support included columns"
                 )));
             }
+        }
+        // A table access method's handler returns no index routine.
+        "heap" => {
+            return Err(Error::Sqlstate(
+                "XX000",
+                "index access method handler function 3 did not return an IndexAmRoutine struct"
+                    .into(),
+            ))
+        }
+        // A user index method has no operator class here: each key's
+        // class resolution refuses it, as PostgreSQL's does.
+        other if misc_alter::user_access_method(other) == Some('i') => {}
+        other if misc_alter::user_access_method(other) == Some('t') => {
+            return Err(Error::Sqlstate(
+                "XX000",
+                "index access method handler function 3 did not return an IndexAmRoutine struct"
+                    .into(),
+            ))
         }
         other => {
             return Err(Error::Sqlstate(
@@ -9973,6 +10101,9 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
         def.extra.insert("pk_column_order", table_pk.clone());
     }
     def.temp = temp;
+    if let Some(am) = misc_alter::table_access_method(&c.access_method)? {
+        def.extra.insert("access_method", am);
+    }
     if let Some(action) = on_commit.filter(|a| *a != "preserve") {
         def.extra.insert("on_commit", action);
     }
@@ -20473,6 +20604,7 @@ fn plan_comment(c: &pg_query::protobuf::CommentStmt) -> Result<Statement> {
         Ok(O::ObjectTrigger) => "trigger",
         Ok(O::ObjectRole) => "role",
         Ok(O::ObjectTsconfiguration) => "text search configuration",
+        Ok(O::ObjectConversion) => "conversion",
         _ => return Err(Error::Unsupported("COMMENT ON this kind of object".into())),
     };
     fn strings(n: &pg_query::protobuf::Node, out: &mut Vec<String>) {

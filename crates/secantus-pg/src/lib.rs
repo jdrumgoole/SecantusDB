@@ -30,6 +30,7 @@
 //! fallback into it: a construct the planner cannot lower becomes a real
 //! PostgreSQL SQLSTATE, never a wrong row.
 
+mod access_methods;
 mod advisory;
 mod aggregates;
 mod alter_system;
@@ -42,6 +43,7 @@ mod catalog_order;
 mod collations;
 mod composite_alter;
 mod config_views;
+mod conversions;
 mod copy_text;
 mod crl;
 mod current_of;
@@ -5326,6 +5328,12 @@ impl PgHandler {
             .collect();
         secantus_pgplan::set_extension_types(extension_types);
         secantus_pgplan::set_installed_extensions(self.extension_schemas());
+        secantus_pgplan::misc_alter::set_user_access_methods(
+            self.user_access_methods()
+                .into_iter()
+                .map(|a| (a.name, a.kind))
+                .collect(),
+        );
         secantus_pgplan::schemas::set_user_schemas(
             self.namespaces()
                 .into_iter()
@@ -10609,6 +10617,35 @@ impl PgHandler {
         Ok(out)
     }
 
+    /// `ALTER EXTENSION name UPDATE [TO version]`: each extension here has
+    /// one version, so there is no update to make, and none to another.
+    fn update_extension(&self, name: &str, version: Option<&str>) -> PgWireResult<Vec<Response>> {
+        let Some((_, installed, _)) = self.extensions()?.into_iter().find(|(n, _, _)| n == name)
+        else {
+            return Err(Self::user_error(
+                "42704",
+                format!("extension \"{name}\" does not exist"),
+            ));
+        };
+        match version {
+            Some(v) if v != installed => Err(Self::user_error(
+                "22023",
+                format!(
+                    "extension \"{name}\" has no update path from version \"{installed}\" \
+                     to version \"{v}\""
+                ),
+            )),
+            _ => {
+                self.notice(
+                    "00000",
+                    format!("version \"{installed}\" of extension \"{name}\" is already installed"),
+                    None,
+                );
+                Ok(vec![Response::Execution(Tag::new("ALTER EXTENSION"))])
+            }
+        }
+    }
+
     /// Each installed extension's schema, `pg_extension.extnamespace`:
     /// `plpgsql`'s is `pg_catalog`, the rest where `CREATE EXTENSION` put
     /// them (`public` for one installed before the schema was recorded).
@@ -14468,6 +14505,7 @@ impl PgHandler {
             }
             "domain" => self.comment_on_domain(&Self::comment_relation(names), comment),
             "text search configuration" => self.comment_on_ts_config(names, comment),
+            "conversion" => self.comment_on_conversion(names, comment),
             "database" | "role" => {
                 self.comment_on_shared(kind, names.last().map_or("", String::as_str), comment)
             }
@@ -16733,6 +16771,11 @@ impl PgHandler {
         }
         out.extend(
             self.ts_config_comments()
+                .into_iter()
+                .map(|(oid, c)| (oid, 0, c)),
+        );
+        out.extend(
+            self.conversion_comments()
                 .into_iter()
                 .map(|(oid, c)| (oid, 0, c)),
         );
@@ -21194,8 +21237,9 @@ impl PgHandler {
     /// position PostgreSQL would point at when the statement names it.
     fn positioned(mut e: PgWireError, sql: &str) -> PgWireError {
         if let PgWireError::UserError(info) = &mut e {
-            // The type an ALTER TYPE / ALTER DOMAIN names is looked up
-            // without a location, so its 42704 has no position (15.19).
+            // The type an ALTER TYPE / ALTER DOMAIN names, and the operator
+            // an ALTER OPERATOR does, are looked up without a location, so
+            // their 42704 / 42883 has no position (15.19).
             let words: Vec<String> = sql
                 .split_whitespace()
                 .take(2)
@@ -21210,6 +21254,14 @@ impl PgHandler {
                 ["alter", "type" | "domain"]
             );
             if alter_type && info.code == "42704" && info.message.starts_with("type ") {
+                return e;
+            }
+            let alter_operator = words.first().map(String::as_str) == Some("alter")
+                && words.get(1).map(String::as_str) == Some("operator");
+            if alter_operator
+                && info.code == "42883"
+                && info.message.starts_with("operator does not exist")
+            {
                 return e;
             }
             if info.position.is_none() && info.severity == "ERROR" {
@@ -24876,6 +24928,17 @@ impl PgHandler {
                 Self::DOMAIN_COLLECTION.to_string(),
                 Self::BASE_TYPE_COLLECTION.to_string(),
                 Self::SCHEMA_COLLECTION.to_string(),
+            ],
+            Statement::Conversion(_) => vec![conversions::CONVERSION_COLLECTION.to_string()],
+            Statement::AccessMethod(_) => vec![
+                access_methods::ACCESS_METHOD_COLLECTION.to_string(),
+                CATALOG_COLLECTION.to_string(),
+                Self::MATVIEW_COLLECTION.to_string(),
+            ],
+            Statement::MiscAlter(_) => vec![
+                CATALOG_COLLECTION.to_string(),
+                collations::COLLATION_COLLECTION.to_string(),
+                catalog_objects::OPERATOR_COLLECTION.to_string(),
             ],
             // A type moved rewrites its catalog row and every reference.
             Statement::SetObjectSchema { .. } => vec![
@@ -33099,6 +33162,9 @@ impl PgHandler {
             Statement::ReassignOwned { .. } => "REASSIGN OWNED",
             Statement::DropOwned { .. } => "DROP OWNED",
             Statement::CreateExtension { .. } => "CREATE EXTENSION",
+            Statement::MiscAlter(op) => op.tag(),
+            Statement::Conversion(op) => op.tag(),
+            Statement::AccessMethod(op) => op.tag(),
             Statement::SetObjectSchema { kind, .. } => match *kind {
                 "extension" => "ALTER EXTENSION",
                 "domain" => "ALTER DOMAIN",
@@ -34005,6 +34071,7 @@ impl PgHandler {
                 query,
                 with_data,
                 matview_sql,
+                access_method,
             } => {
                 if self.lookup(&table).is_some() {
                     if if_not_exists {
@@ -34056,6 +34123,9 @@ impl PgHandler {
                     .collect::<PgWireResult<Vec<_>>>()?;
                 let mut def = TableDef::new(&table, columns);
                 def.temp = temp;
+                if let Some(am) = &access_method {
+                    def.extra.insert("access_method", am);
+                }
                 let targets: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
                 // The rows are read BEFORE the table exists so a query that
                 // fails leaves nothing behind, as PostgreSQL's single
@@ -37098,6 +37168,25 @@ impl PgHandler {
                 schema,
                 written,
             } => self.set_object_schema(kind, &target, &schema, &written),
+
+            Statement::Conversion(op) => self.execute_conversion(op),
+            Statement::AccessMethod(op) => self.execute_access_method(op),
+            Statement::MiscAlter(op) => {
+                use secantus_pgplan::misc_alter::MiscAlter as M;
+                match op {
+                    M::ExtensionUpdate { name, version } => {
+                        self.update_extension(&name, version.as_deref())
+                    }
+                    M::OperatorOwner {
+                        name,
+                        left,
+                        right,
+                        owner,
+                    } => self.alter_operator_owner(&name, left.as_deref(), &right, &owner),
+                    M::CollationRename { name, to } => self.rename_collation(&name, &to),
+                    M::CollationRefresh { name } => self.refresh_collation(&name),
+                }
+            }
 
             Statement::InsteadOf(io) => self.run_instead_of(io),
             Statement::SetConstraints { names, deferred } => {

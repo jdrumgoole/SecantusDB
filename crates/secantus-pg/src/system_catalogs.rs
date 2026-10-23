@@ -143,6 +143,22 @@ fn type_name(oid: i64) -> String {
 }
 
 /// The dumped COPY text of one relation.
+/// The built-in conversions as dumped: `(conforencoding, contoencoding,
+/// conproc)`, each conversion function's pairs.
+pub(crate) fn builtin_conversion_pairs() -> Vec<(i64, i64, i64)> {
+    dumped("pg_conversion")
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            Some((
+                f.get(4)?.parse().ok()?,
+                f.get(5)?.parse().ok()?,
+                f.get(6)?.parse().ok()?,
+            ))
+        })
+        .collect()
+}
+
 fn dumped(name: &str) -> &'static str {
     let key = if name.contains('.') {
         name.to_string()
@@ -205,6 +221,9 @@ impl PgHandler {
             let mut rows = self.static_rows(name, def);
             if name == "pg_aggregate" {
                 rows.extend(self.user_aggregate_rows(def));
+            }
+            if name == "pg_conversion" {
+                rows.extend(self.user_conversion_rows(def));
             }
             return rows;
         }

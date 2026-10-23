@@ -126,6 +126,36 @@ impl PgHandler {
         Ok(vec![Response::Execution(Tag::new("CREATE OPERATOR"))])
     }
 
+    /// `ALTER OPERATOR name (left, right) OWNER TO role`.
+    pub(crate) fn alter_operator_owner(
+        &self,
+        name: &str,
+        left: Option<&str>,
+        right: &str,
+        owner: &str,
+    ) -> PgWireResult<Vec<Response>> {
+        let key = Self::operator_key(name, left, right);
+        let Some(mut doc) = self.catalog_doc(OPERATOR_COLLECTION, &key) else {
+            return Err(Self::user_error(
+                "42883",
+                format!(
+                    "operator does not exist: {}",
+                    self.operator_signature(name, left, right)
+                ),
+            ));
+        };
+        let owner = self.grantee_name(owner)?;
+        if self.role(&owner)?.is_none() && owner != self.session_user_name() {
+            return Err(Self::user_error(
+                "42704",
+                format!("role \"{owner}\" does not exist"),
+            ));
+        }
+        doc.insert("owner", owner);
+        self.put(OPERATOR_COLLECTION, &key, doc)?;
+        Ok(vec![Response::Execution(Tag::new("ALTER OPERATOR"))])
+    }
+
     pub(crate) fn drop_operator(
         &self,
         name: &str,
