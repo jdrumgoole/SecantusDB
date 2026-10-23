@@ -267,54 +267,9 @@ fn positional_predicate(
 /// error cases (>1 positional / exclusion / array field not in the query) — the
 /// find handler surfaces it as `BadValue`, and the pure-Python oracle raises the
 /// exact Location code (31276 / 31395 / 51246).
-/// mongod's refusal when one projected path is an ancestor of another.
-///
-/// `{a: 1, "a.x": 1}` is not a narrowing of `a`; mongod rejects the pair, and
-/// WHICH code depends on the order (measured 8.2.11, 2026-09-09):
-///
-/// ```text
-///     {a: 1, "a.x": 1}       31249  Path collision at a.x remaining portion x
-///     {"a.x": 1, a: 1}       31250  Path collision at a
-///     {"a.x": 1, "a.x.y": 1} 31249  Path collision at a.x.y remaining portion x.y
-///     {a: 0, "a.x": 0}       31249  (exclusion collides too)
-/// ```
-///
-/// Siblings, a shared string prefix that is not a path component, and the same
-/// path twice are NOT collisions. Mirrors `projection._path_collision_error`.
-fn path_collision(spec: &Document) -> Option<Fallback> {
-    let mut seen: Vec<&str> = Vec::new();
-    for (key, value) in spec {
-        if key.ends_with(".$") || meta_spec(value).is_some() {
-            continue;
-        }
-        let parts: Vec<&str> = key.split('.').collect();
-        for earlier in &seen {
-            let e_parts: Vec<&str> = earlier.split('.').collect();
-            if e_parts == parts {
-                continue;
-            }
-            if parts.len() > e_parts.len() && parts[..e_parts.len()] == e_parts[..] {
-                return Some(Fallback::mongo(
-                    31249,
-                    format!(
-                        "Path collision at {key} remaining portion {}",
-                        parts[1..].join(".")
-                    ),
-                ));
-            }
-            if e_parts.len() > parts.len() && e_parts[..parts.len()] == parts[..] {
-                return Some(Fallback::mongo(31250, format!("Path collision at {key}")));
-            }
-        }
-        seen.push(key);
-    }
-    None
-}
-
 pub fn validate_projection(spec: &Document, query: Option<&Document>) -> R<()> {
-    if let Some(err) = path_collision(spec) {
-        return Err(err);
-    }
+    // Path collisions are the projection parser's (`expr_parse::projection_spec`),
+    // which runs before this and walks the tree as mongod does.
     let positional: Vec<&String> = spec.keys().filter(|k| k.ends_with(".$")).collect();
     if positional.is_empty() {
         return Ok(());
@@ -512,7 +467,7 @@ pub fn is_flag_value(v: &Bson) -> bool {
 /// Truthiness of a flag value. A `Decimal128` needs its own zero test -- it is
 /// an object, so a plain "is it falsy" check calls every decimal truthy.
 /// NaN is NOT zero, so it includes. Mirrors `projection.py::_flag_truthy`.
-fn flag_truthy(v: &Bson) -> bool {
+pub(crate) fn flag_truthy(v: &Bson) -> bool {
     spec_truthy(v).unwrap_or(true)
 }
 
@@ -554,7 +509,7 @@ pub fn is_computed_spec(v: &Bson) -> bool {
 /// sub-document cannot be classified as a whole. An empty sub-document at any
 /// depth is its own error (51270). Mirrors
 /// `projection.py::_flatten_projection_spec`.
-fn flatten_projection_spec(spec: &Document) -> R<Vec<(String, Bson)>> {
+pub(crate) fn flatten_projection_spec(spec: &Document) -> R<Vec<(String, Bson)>> {
     let mut out: Vec<(String, Bson)> = Vec::new();
     for (k, v) in spec {
         flatten_entry(k, v, &mut out)?;
@@ -571,7 +526,10 @@ fn flatten_entry(key: &str, value: &Bson, out: &mut Vec<(String, Bson)>) -> R<()
                 format!("Invalid empty sub-projection: {leaf}"),
             ));
         }
-        let first_is_op = d.keys().next().map(|k| k.starts_with('$')).unwrap_or(false);
+        // `$id` / `$ref` / `$db` are DBRef field names, not operators.
+        let first_is_op = d.keys().next().is_some_and(|k| {
+            crate::expr_parse::field_name_problem(k).is_some() && k.starts_with('$')
+        });
         if first_is_op {
             out.push((key.to_string(), value.clone()));
             return Ok(());
@@ -696,6 +654,14 @@ pub fn apply_projection(doc: &Document, spec: &Document, query: Option<&Document
             };
             with_computed(&mut result, doc, &computed)?;
             return Ok(result);
+        }
+        // A sub-document is a sub-projection, one leaf per field: `{a: {b: 1}}`
+        // is `{"a.b": 1}` (mongod 8.2.11, 2026-10-23). It used to be refused.
+        if flattened.len() != spec.len()
+            || flattened.iter().zip(spec.keys()).any(|((k, _), s)| k != s)
+        {
+            let flat: Document = flattened.into_iter().collect();
+            return apply_projection(doc, &flat, query);
         }
     }
 

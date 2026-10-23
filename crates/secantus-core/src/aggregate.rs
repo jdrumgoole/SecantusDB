@@ -1374,27 +1374,27 @@ fn expression_field_paths(expr: &Bson, out: &mut Vec<String>) -> Option<()> {
 
 // --- $project (mirrors aggregate._project_one) --------------------------
 
-fn is_one(v: &Bson) -> bool {
-    matches!(v, Bson::Int32(1) | Bson::Int64(1) | Bson::Boolean(true))
-        || matches!(v, Bson::Double(d) if *d == 1.0)
-}
-
-fn is_zero(v: &Bson) -> bool {
-    matches!(v, Bson::Int32(0) | Bson::Int64(0) | Bson::Boolean(false))
-        || matches!(v, Bson::Double(d) if *d == 0.0)
-}
-
 fn project_one(doc: &Document, spec: &Document, vars: &Document) -> R<Document> {
+    // A sub-document is a sub-projection, classified leaf by leaf:
+    // `{a: {b: 1}}` includes `a.b`, `{a: {b: 0}}` excludes it, and
+    // `{a: {z: "$x"}}` computes `a.z` (mongod 8.2.11, 2026-10-23). It used to
+    // be computed as a literal document, so `{a: {b: 1}}` returned `b: 1`
+    // whatever the stored value was.
+    let flat = crate::projection::flatten_projection_spec(spec)?;
     let mut inclusions: Vec<&str> = Vec::new();
     let mut exclusions: Vec<&str> = Vec::new();
     let mut computed: Vec<(&str, &Bson)> = Vec::new();
     let mut id_handling: Option<i32> = None;
 
-    for (key, value) in spec {
+    // Any number or bool is a flag: nonzero includes, zero excludes.
+    let is_flag = crate::projection::is_flag_value;
+    let truthy = crate::projection::flag_truthy;
+    for (key, value) in &flat {
+        let key = key.as_str();
         if key == "_id" {
-            if is_zero(value) {
+            if is_flag(value) && !truthy(value) {
                 id_handling = Some(0);
-            } else if is_one(value) {
+            } else if is_flag(value) {
                 id_handling = Some(1);
             } else {
                 computed.push(("_id", value));
@@ -1402,9 +1402,9 @@ fn project_one(doc: &Document, spec: &Document, vars: &Document) -> R<Document> 
             }
             continue;
         }
-        if is_one(value) {
+        if is_flag(value) && truthy(value) {
             inclusions.push(key);
-        } else if is_zero(value) {
+        } else if is_flag(value) {
             exclusions.push(key);
         } else {
             computed.push((key, value));

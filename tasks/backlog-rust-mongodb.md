@@ -553,7 +553,7 @@ unexecuted: the accumulators' corners, `$median` / `$percentile`,
 `tools/probes/group_shapes.py` was written against them. On `main`, 43 of
 its first 245 cases differed from mongod 8.2.11. The batch that wrote it fixed
 five causes (RM-275 to RM-279, regression tests in
-`tests/backlog/test_rm_group_shapes.py`); the two below remain. Of the
+`tests/backlog/test_rm_group_shapes.py`), and the next closed RM-281. Of the
 probe's 282 cases, 9 differ: eight are RM-280, and one is `$accumulator`,
 which a mongod with scripting runs and this server refuses by design (Scope
 decision, above).
@@ -575,20 +575,46 @@ server returns is one mongod gives, and the probe compares them as sets.
   | `$mergeObjects` of a non-object | 5911200 "only supports objects" | 40400 |
   | `$ln` of a string in the key | 7157705 | 28765 |
 
-  The Rust server answers the classic codes everywhere. The faithful fix is
-  mongod's SBE-eligibility rule plus SBE's messages for each expression;
-  measured only for `$group` so far.
+  The Rust server answers the classic codes everywhere.
+
+  SBE is a second expression engine, not a set of renamed codes. Each of
+  the 3,360 shapes in `tools/probes/expression_shapes.py`, put in `{$group:
+  {_id: null, v: {$first: <expr>}}}` on mongod 8.2.11, answers differently
+  with and without an `$addFields` in front in 248 cases: 221 by error code
+  (`$mod` by zero 4848403 / 16610, `$sortArray` of a non-array 7158001 /
+  2942504, the `$arrayToObject` family 5153200-5153214 / 40386-40398, ...),
+  and 27 by value or by error against no error (`$substr` with a double
+  index is `null` in SBE and `"bc"` classic; `$regexMatch` with no regex
+  `null` and `false`; `$arrayToObject` of `[{v, k}]` an error and `{a: 1}`).
+
+  **Decided (Joe, 2026-10-23): model SBE fully.** Port mongod's pushdown
+  rule (`src/mongo/db/pipeline/sbe_pushdown.cpp`,
+  `findSbeCompatibleStagesForPushdown`, under the default
+  `trySbeRestricted` framework control: which leading stages join the
+  find layer, which `$group` / `$lookup` and which expressions SBE
+  compiles), then give the evaluator an SBE mode with SBE's answer --
+  code, message and value -- wherever it differs, probed operator by
+  operator.
   Backlog-ID: RM-280
   Verify: tests/backlog/test_rm_group_shapes.py::test_group_in_sbe_error_codes
-- [ ] **An expression object with two operator fields is read as a literal
-  document.** mongod refuses `{$add: [1], $b: 2}` wherever it parses an
-  expression: 15983 "An object representing an expression must have exactly
-  one field" in `$addFields`, `$set`, `$expr` and `$group`, and 16410 in
-  `$project`. The `$group` / `$bucket` / `$bucketAuto` / `$sortByCount`
-  positions are fixed (RM-275); everywhere else the Rust server returns the
-  object as a value.
-  Backlog-ID: RM-281
-  Verify: tests/backlog/test_rm_group_shapes.py::test_expression_object_with_two_operators
+- [ ] **`$meta` beside an exclusion in `$project` is "not supported".**
+  `{$project: {a: 0, b: {$meta: "textScore"}}}` is a valid exclusion
+  projection (`$meta` is the one expression one may hold); with no text
+  query behind it mongod answers 40218 "query requires text score metadata,
+  but it is not available". The Rust `$project` cannot run an exclusion with
+  a computed field and answers code 2. Found 2026-10-23 with RM-281.
+  Backlog-ID: RM-286
+  Verify: tests/backlog/test_rm_expression_parse.py::test_meta_in_exclusion_project
+- [ ] **`find`'s own projection operators at their edges.** `{y: {$slice:
+  ["$a", 1]}}` is not find's `[skip, limit]` (the first element is not a
+  number), so mongod parses it as the aggregation `$slice` and fails per
+  document (28724 "First argument to $slice must be an array"); the Rust
+  server returns the document unprojected. `{"a.$": 1}` with an empty filter
+  over a document whose `a` is not an array returns `a` on mongod; the Rust
+  server refuses it with code 2 "invalid positional projection". Found
+  2026-10-23 with RM-281.
+  Backlog-ID: RM-287
+  Verify: tests/backlog/test_rm_expression_parse.py::test_find_only_projection_operators
 
 ### 7.088 Expression code no test had executed, against mongod -- 2026-10-21
 

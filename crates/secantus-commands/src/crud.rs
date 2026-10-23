@@ -2205,7 +2205,8 @@ pub(crate) fn update_in(
             // reported against the statement.
             if refused.is_none() {
                 refused = argtypes::stage_spec_error(stages).or_else(|| {
-                    crate::aggregate::validate_unknown_exprs(stages)
+                    crate::aggregate::validate_parse(stages)
+                        .and_then(|()| crate::aggregate::validate_unknown_exprs(stages))
                         .err()
                         .map(|e| (e.code, e.errmsg.clone()))
                 });

@@ -547,7 +547,7 @@ CASES: list[tuple] = [
 #: The same mistakes where mongod runs the `$group` in its CLASSIC engine (a
 #: stage it cannot push down comes first): those codes are the ones this server
 #: gives. Where the `$group` comes first mongod runs it in SBE, whose codes
-#: differ (RM-283).
+#: differ (RM-280).
 _CLASSIC = [{"$addFields": {"zz": 1}}]
 CASES += [
     ("classic mergeObjects not object", _CLASSIC + _gg(m={"$mergeObjects": "$o"})),

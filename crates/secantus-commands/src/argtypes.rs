@@ -3531,7 +3531,9 @@ fn stage_group_problem(spec: &Bson) -> Option<(i32, String)> {
     // An `_id` document's own fields are expressions, and a bare number or
     // bool there reads as a projection's `field: 1`. Measured 8.2.11,
     // 2026-10-10: `{_id: {n: 1}}`, `{n: 0}` and `{n: true}` are refused;
-    // `{n: "x"}`, `{k: {n: 1}}` and `{n: {$literal: 1}}` are accepted.
+    // `{n: "x"}`, `{k: {n: 1}}` and `{n: {$literal: 1}}` are accepted. Only
+    // the FIRST field decides whether `_id` is an operator: `{a: 1, $b: 2}`
+    // is an object literal, refused here too (2026-10-23).
     if let Some(Bson::Document(id)) = d.get("_id") {
         let inclusion = |v: &Bson| {
             matches!(
@@ -3543,7 +3545,7 @@ fn stage_group_problem(spec: &Bson) -> Option<(i32, String)> {
                     | Bson::Boolean(_)
             )
         };
-        if !id.keys().any(|k| k.starts_with('$')) && id.values().any(inclusion) {
+        if !id.keys().next().is_some_and(|k| k.starts_with('$')) && id.values().any(inclusion) {
             return Some((
                 17390,
                 "$group does not support inclusion-style expressions".to_string(),

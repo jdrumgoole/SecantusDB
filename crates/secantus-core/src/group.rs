@@ -1664,26 +1664,12 @@ fn check_accumulator_argument(op: &str, arg: &Bson) -> R<()> {
     Ok(())
 }
 
-/// `Expression::parseObject`'s first rule: an object whose first field names
-/// an operator is that one operator, and has no other field (15983). Walked
-/// through operator arguments, arrays and object expressions; a `$literal` is
-/// a value and is not looked into.
+/// mongod's expression parse of a `$group` argument
+/// ([`crate::expr_parse::operand`]): one operator per object (15983), known
+/// operators, valid object-literal field names. A `$literal` is a value and
+/// is not looked into.
 fn expression_object_check(expr: &Bson) -> R<()> {
-    match expr {
-        Bson::Array(a) => a.iter().try_for_each(expression_object_check),
-        Bson::Document(d) => match d.iter().next() {
-            Some((k, _)) if k.starts_with('$') && d.len() > 1 => Err(parse_error(
-                15983,
-                format!(
-                    "An object representing an expression must have exactly one field: {}",
-                    crate::query::bson_value_repr(expr)
-                ),
-            )),
-            Some((k, _)) if k == "$literal" || k == "$const" => Ok(()),
-            _ => d.values().try_for_each(expression_object_check),
-        },
-        _ => Ok(()),
-    }
+    crate::expr_parse::operand(expr)
 }
 
 /// Compile the accumulator specs (each must be a single-op doc) and run the

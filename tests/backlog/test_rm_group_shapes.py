@@ -230,12 +230,13 @@ def test_group_in_sbe_error_codes(rust_mongo: Any, mongod: Any) -> None:
     assert _diverging(rust_mongo, mongod, shapes) == []
 
 
-@pytest.mark.backlog("RM-281")
+@pytest.mark.backlog_fixed("RM-281")
 def test_expression_object_with_two_operators(rust_mongo: Any, mongod: Any) -> None:
     """An expression object whose first field names an operator may have no
-    other field: 15983 in `$addFields`, `$set` and `$expr`, 16410 in
-    `$project`. The Rust server reads such an object as a literal document
-    (measured 8.2.11, 2026-10-22)."""
+    other field. mongod refuses it at parse time: 40181 in `$addFields`, 16410
+    in `$project`, 15983 in `$expr`. The Rust server read such an object as a
+    literal document (measured 8.2.11, 2026-10-22). The full set of positions
+    is in `test_rm_expression_parse.py`."""
     docs = _vals([1])
     two = {"$add": [1], "$b": 2}
     shapes = [
