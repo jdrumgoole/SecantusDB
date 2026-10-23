@@ -57,3 +57,5 @@ their catalog rows as PostgreSQL keeps them.
   refused.
 - RP-200: inside a block, `pg_get_indexdef` answers NULL for an index the
   block created.
+- RP-202: a cancel that lands inside a planning pass over a huge statement
+  waits for the pass to end (up to 0.2 s in a debug build).

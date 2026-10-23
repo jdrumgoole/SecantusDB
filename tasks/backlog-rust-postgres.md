@@ -808,6 +808,17 @@ batch; its test there is a regression test.
       lives in the table's own catalog row.
       Backlog-ID: RP-200
       Verify: tests/backlog/test_rp_batch51.py::test_scenario[pg_get_indexdef of an index the block created]
+- [ ] **A cancel while a huge statement is planned waits for the pass it
+      lands in.** Planning a statement with a 200,000-item `IN` list runs
+      for about a second in a debug build, as a sequence of passes over the
+      whole tree with a cancellation point between each. A cancel that lands
+      inside one is answered when it ends: up to 0.2 s late here, where
+      PostgreSQL 15.19 answers in 0.015 s. The longest is the clone of the
+      memoised parse tree each plan starts from (about 0.35 s for that
+      statement). Batch 46's follow-up closed the windows outside planning
+      that were 0.8 s long.
+      Backlog-ID: RP-202
+      Verify: none -- a latency budget; every answer is PostgreSQL's 57014, only later
 
 ## Found by batch 50 (2026-10-23)
 
