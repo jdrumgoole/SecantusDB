@@ -62,8 +62,10 @@ use secantus_pgplan::{ColumnExpr, Statement};
 /// checks each relation is a plain stored table -- a view, a rule or a
 /// row-security policy can bring a function the text does not show.)
 pub(crate) fn eligible_sql(sql: &str) -> Option<Vec<String>> {
-    let parsed = pg_query::parse(sql).ok()?;
-    let stmts = &parsed.protobuf.stmts;
+    // The planner's memo: a plain parse of a statement it has just planned
+    // took 0.8 s for a 200,000-item IN list, where no cancel is seen.
+    let parsed = secantus_pgplan::memoised_parse(sql)?;
+    let stmts = &parsed.stmts;
     if stmts.len() != 1 {
         return None;
     }
@@ -77,7 +79,7 @@ pub(crate) fn eligible_sql(sql: &str) -> Option<Vec<String>> {
         )
     );
     let plain = shape_ok
-        && !parsed.protobuf.nodes().iter().any(|(n, ..)| {
+        && !parsed.nodes().iter().any(|(n, ..)| {
             matches!(
                 n,
                 pg_query::NodeRef::FuncCall(_)
@@ -92,7 +94,8 @@ pub(crate) fn eligible_sql(sql: &str) -> Option<Vec<String>> {
             )
         });
     let stmt = stmts[0].stmt.as_ref()?.node.as_ref()?;
-    (plain && params_stand_alone(sql, stmt)).then(|| parsed.tables())
+    (plain && params_stand_alone(sql, stmt))
+        .then(|| pg_query::ParseResult::new((*parsed).clone(), String::new()).tables())
 }
 
 type Node = pg_query::protobuf::Node;
@@ -300,6 +303,11 @@ pub(crate) fn literal_family(sql: &str) -> Option<Family> {
                 }
                 text.push_str(&sql[copied..start]);
                 values.push(Bson::String(content));
+                // Past the limit the answer is `None` whatever follows: stop
+                // here, not after reading a 200,000-item IN list.
+                if values.len() > MAX_FAMILY_VALUES {
+                    return None;
+                }
                 text.push_str(&format!("${}", values.len()));
                 spans.push(start..i);
                 copied = i;
@@ -343,6 +351,9 @@ pub(crate) fn literal_family(sql: &str) -> Option<Family> {
                     Ok(_) => Bson::Int32(n as i32),
                     Err(_) => Bson::Int64(n),
                 });
+                if values.len() > MAX_FAMILY_VALUES {
+                    return None;
+                }
                 text.push_str(&sql[copied..start]);
                 text.push_str(&format!("${}", values.len()));
                 spans.push(start..i);

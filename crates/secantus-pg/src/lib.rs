@@ -28286,14 +28286,20 @@ impl PgHandler {
         };
         self.collect_planner_warnings();
         if !reused && planned.is_ok() {
-            if let Some(key) = plan_key.filter(|k| self.planned_before(k)) {
-                self.learn_plan_template(key, params, param_types, &tz, None);
-            } else if let Some(family) = family {
-                let key = Self::family_key(&family);
-                if self.planned_before(&key) {
-                    self.learn_plan_template(key, &[], &[], &tz, Some((sql, &family)));
+            // Learning plans the statement again: a cancel stops it as it
+            // stops planning, and is taken here (a failed learn is only a
+            // plan not cached).
+            self.with_cancel_hook(|| {
+                if let Some(key) = plan_key.filter(|k| self.planned_before(k)) {
+                    self.learn_plan_template(key, params, param_types, &tz, None);
+                } else if let Some(family) = family {
+                    let key = Self::family_key(&family);
+                    if self.planned_before(&key) {
+                        self.learn_plan_template(key, &[], &[], &tz, Some((sql, &family)));
+                    }
                 }
-            }
+            });
+            self.check_cancel()?;
         }
         if self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) {
             let ends_the_block = matches!(
@@ -30338,14 +30344,38 @@ impl PgHandler {
         if names.idents.is_empty() && names.others.is_empty() {
             return false;
         }
-        let text = sql.to_ascii_lowercase();
         // A call names its function as a whole identifier, never inside a
-        // longer one.
-        !names.idents.is_empty()
-            && text
-                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || !c.is_ascii()))
-                .any(|word| names.idents.contains(word))
-            || names.others.iter().any(|n| text.contains(n.as_str()))
+        // longer one. Read byte by byte, lowercasing only the words that may
+        // be one: a word that starts with a digit is a number unless some
+        // function's name does too (a 200,000-item `IN` list is 200,000 of
+        // them, and this runs before planning, where no cancel is seen).
+        let digit_names = names
+            .idents
+            .iter()
+            .any(|n| n.as_bytes().first().is_some_and(u8::is_ascii_digit));
+        let b = sql.as_bytes();
+        let mut i = 0;
+        while !names.idents.is_empty() && i < b.len() {
+            if !ident_byte(b[i]) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < b.len() && ident_byte(b[i]) {
+                i += 1;
+            }
+            if b[start].is_ascii_digit() && !digit_names {
+                continue;
+            }
+            if names.idents.contains(&sql[start..i].to_ascii_lowercase()) {
+                return true;
+            }
+        }
+        if names.others.is_empty() {
+            return false;
+        }
+        let text = sql.to_ascii_lowercase();
+        names.others.iter().any(|n| text.contains(n.as_str()))
     }
 
     /// Roll back a planning transaction nothing took (the statement failed,

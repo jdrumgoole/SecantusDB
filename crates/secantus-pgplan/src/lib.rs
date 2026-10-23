@@ -4100,6 +4100,13 @@ pub fn split_statements(sql: &str) -> Result<Vec<String>> {
 /// text is the whole input to the parser, so the tree is a pure function of
 /// it. Bounded by wholesale clearing: statement text in a loop repeats, and
 /// a rebuilt memo costs one parse per distinct text.
+/// `sql`'s parse tree from the planner's memo (`parse_tree`), or `None`
+/// when it does not parse: a statement the planner has just planned is not
+/// parsed again.
+pub fn memoised_parse(sql: &str) -> Option<std::sync::Arc<pg_query::protobuf::ParseResult>> {
+    parse_tree(sql).ok()
+}
+
 fn parse_tree(sql: &str) -> Result<std::sync::Arc<pg_query::protobuf::ParseResult>> {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -4534,10 +4541,25 @@ pub fn plan_with_subqueries(
         node: Some(parse_one_as_sent(sql)?),
     };
     cancel::check()?;
-    let original = node.clone();
     cancel::check()?;
-    plan_with_subqueries_parsed(sql, node, lookup, params, run)
-        .map_err(|e| qualify_type_error(e, &original))
+    // The statement as written, for a type error's qualified name: from the
+    // memo again when one is raised, not cloned for every plan (a clone of a
+    // 200,000-item IN list is a fifth of a second in which no cancel is
+    // seen).
+    plan_with_subqueries_parsed(sql, node, lookup, params, run).map_err(|e| {
+        if !matches!(&e, Error::UndefinedObject(m) if m.starts_with("type \"")) {
+            return e;
+        }
+        match parse_one_as_sent(sql) {
+            Ok(original) => qualify_type_error(
+                e,
+                &pg_query::protobuf::Node {
+                    node: Some(original),
+                },
+            ),
+            Err(_) => e,
+        }
+    })
 }
 
 fn plan_with_subqueries_parsed(

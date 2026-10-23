@@ -52,6 +52,14 @@ token, and the `delete ... where ctid = ...` idiom, work.
   (`tests/test_rust_pgserver_slice.py::test_a_mongodb_client_reads_a_table_the_rust_sql_server_wrote`),
   along with a MongoDB collection that keeps a field sharing the prefix.
 
+- RP-002's cancel during a parse, with user code in the database, was still
+  answered up to 0.3 s late on CI
+  (`tests/backlog/test_rp_triage.py::test_cancel_during_parse_is_honoured_with_user_code_present`).
+  Passes that read the statement's text before and after planning had no
+  cancellation point: the user-function scan, the plan cache's literal scan,
+  and its template learning, which parsed a 200,000-item `IN` list again
+  (0.8 s). They are now fast or under the cancel hook.
+
 #### Known
 
 - RP-192, filed: a sequential scan reads rows in insertion order, not ctid
