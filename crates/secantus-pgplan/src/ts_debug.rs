@@ -152,13 +152,18 @@ pub(crate) fn debug(args: &[Bson]) -> Result<Rows> {
         .into_iter()
         .map(|(ty, tok)| {
             let (alias, descr) = wparser::TOKEN_TYPES[usize::from(ty) - 1];
-            let (dicts, dict, lexemes) = match fts::debug_lexize(cfg, ty, &tok) {
+            let dicts = Bson::Array(
+                fts::debug_dictionaries(cfg, ty)
+                    .into_iter()
+                    .map(Bson::String)
+                    .collect(),
+            );
+            let (dict, lexemes) = match fts::debug_lexize(cfg, ty, &tok) {
                 Some((dict, lexemes)) => (
-                    Bson::Array(vec![Bson::String(dict.clone())]),
                     Bson::String(dict),
                     Bson::Array(lexemes.into_iter().map(Bson::String).collect()),
                 ),
-                None => (Bson::Array(Vec::new()), Bson::Null, Bson::Null),
+                None => (Bson::Null, Bson::Null),
             };
             vec![
                 Bson::String(alias.into()),

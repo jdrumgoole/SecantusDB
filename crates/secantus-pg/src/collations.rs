@@ -136,15 +136,37 @@ impl PgHandler {
                         Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
                     return Err(PgWireError::UserError(Box::new(info)));
                 }
+                // A table's columns in reverse order, the tables in order
+                // (measured on 15.19), each table's in one ALTER TABLE, as
+                // one statement changes a table's definition.
+                let mut by_table: Vec<(String, Vec<String>)> = Vec::new();
                 for (t, c) in dependents {
+                    match by_table.iter_mut().find(|(n, _)| *n == t.name) {
+                        Some((_, cols)) => cols.insert(0, c),
+                        None => by_table.push((t.name.clone(), vec![c])),
+                    }
+                }
+                let descs: Vec<String> = by_table
+                    .iter()
+                    .flat_map(|(t, cols)| {
+                        let shown = secantus_pgplan::schemas::visible_name(t);
+                        cols.iter()
+                            .map(move |c| format!("column {c} of table {shown}"))
+                    })
+                    .collect();
+                self.cascade_notice(&descs);
+                for (table, cols) in by_table {
                     self.execute_inner(
                         secantus_pgplan::Statement::AlterTable {
-                            table: t.name.clone(),
+                            table,
                             missing_ok: false,
-                            actions: vec![secantus_pgplan::AlterTableAction::DropColumn {
-                                name: c,
-                                if_exists: true,
-                            }],
+                            actions: cols
+                                .into_iter()
+                                .map(|name| secantus_pgplan::AlterTableAction::DropColumn {
+                                    name,
+                                    if_exists: true,
+                                })
+                                .collect(),
                         },
                         0,
                     )?;

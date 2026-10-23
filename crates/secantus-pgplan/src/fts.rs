@@ -33,14 +33,14 @@ use bson::Bson;
 // Configurations
 // ------------------------------------------------------------------------
 
-/// A text-search configuration this server implements.
+/// A text-search configuration: its oid in `pg_ts_config`, built-in or
+/// made by `CREATE TEXT SEARCH CONFIGURATION`. What it does with a token is
+/// its map (`ts_catalog::dictionaries_for`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Config {
-    English,
-    Simple,
-    /// One of PostgreSQL's other Snowball configurations (`french`, ...).
-    Snowball(Lang),
-}
+pub struct Config(pub i64);
+
+/// `english`'s oid.
+pub const ENGLISH: Config = Config(13636);
 
 /// The Snowball languages PostgreSQL ships a configuration for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,33 +236,25 @@ impl Lang {
 
 impl Config {
     /// The configuration's name, as `regconfig` prints it.
-    pub fn name(self) -> &'static str {
-        match self {
-            Config::English => "english",
-            Config::Simple => "simple",
-            Config::Snowball(l) => l.name(),
-        }
+    pub fn name(self) -> String {
+        crate::ts_catalog::display_of(self.0, false).unwrap_or_else(|| self.0.to_string())
     }
 }
 
-/// Resolve a configuration name (`english`, `pg_catalog.simple`, ...).
+/// Resolve a configuration name (`english`, `pg_catalog.simple`, `s.c`,
+/// ...).
 pub fn config(name: &str) -> Result<Config> {
-    let n = name.trim().trim_matches('"').to_ascii_lowercase();
-    let n = n.strip_prefix("pg_catalog.").unwrap_or(&n);
-    if let Some(l) = LANGS.iter().find(|l| l.name() == n) {
-        return Ok(Config::Snowball(*l));
-    }
-    match n {
-        "english" => Ok(Config::English),
-        "simple" => Ok(Config::Simple),
-        _ => Err(Error::Sqlstate(
-            "42704",
-            format!(
-                "text search configuration \"{}\" does not exist",
-                name.trim()
-            ),
-        )),
-    }
+    crate::ts_catalog::oid_of(name, false)
+        .map(Config)
+        .ok_or_else(|| {
+            Error::Sqlstate(
+                "42704",
+                format!(
+                    "text search configuration \"{}\" does not exist",
+                    name.trim()
+                ),
+            )
+        })
 }
 
 /// The configuration a call without one uses: the session's
@@ -270,7 +262,7 @@ pub fn config(name: &str) -> Result<Config> {
 pub fn default_config() -> Config {
     crate::session_setting("default_text_search_config")
         .and_then(|n| config(&n).ok())
-        .unwrap_or(Config::English)
+        .unwrap_or(ENGLISH)
 }
 
 thread_local! {
@@ -452,34 +444,44 @@ fn word_char(c: char) -> bool {
     c.is_ascii_digit() || letter_char(c)
 }
 
-/// The dictionary a built-in configuration maps a parser token type to, and
-/// that dictionary's `ts_lexize` of `token` -- `ts_debug`'s `dictionary` and
-/// `lexemes` (`[]` for a stop-word). `None` for the types no configuration
-/// maps (blank, tag, protocol, entity). Every built-in configuration has the
-/// same map (`pg_ts_config_map`, dumped from PostgreSQL 15): the six word
-/// types go to the language's Snowball stemmer, except that `russian` and
-/// `hindi` send the three ASCII ones to `english_stem`; every other type
-/// goes to `simple`.
-pub(crate) fn debug_lexize(cfg: Config, toktype: u8, token: &str) -> Option<(String, Vec<String>)> {
-    use crate::wparser as w;
-    let ascii = matches!(toktype, w::ASCIIWORD | w::ASCIIPARTHWORD | w::ASCIIHWORD);
-    let word = ascii || matches!(toktype, w::WORD_T | w::PARTHWORD | w::HWORD);
-    if matches!(toktype, w::SPACE | w::TAG_T | w::PROTOCOL | w::XMLENTITY) {
-        return None;
-    }
+/// `ts_lexize` of `token` by the dictionary `dict` this server has: `simple`
+/// (lower-cased) or a Snowball stemmer (`english_stem`, `french_stem`, ...),
+/// a stop-word giving no lexeme. `None` for a dictionary it does not have.
+fn lexize(dict: &str, token: &str) -> Option<Vec<String>> {
     let lower: String = token.chars().map(crate::scalar::simple_lower).collect();
+    if dict == "simple" {
+        return Some(vec![lower]);
+    }
+    let lang = dict.strip_suffix("_stem")?;
     let stemmed = |stop: bool, stem: String| if stop { Vec::new() } else { vec![stem] };
-    Some(match cfg {
-        Config::Snowball(l) if word && !(ascii && matches!(l, Lang::Russian | Lang::Hindi)) => (
-            format!("{}_stem", l.name()),
-            stemmed(l.is_stop(&lower), l.stem(&lower)),
-        ),
-        Config::English | Config::Snowball(_) if word => (
-            "english_stem".into(),
-            stemmed(ENGLISH_STOP.contains(&lower.as_str()), stem(&lower)),
-        ),
-        _ => ("simple".into(), vec![lower]),
-    })
+    if lang == "english" {
+        return Some(stemmed(
+            ENGLISH_STOP.contains(&lower.as_str()),
+            stem(&lower),
+        ));
+    }
+    let l = LANGS.iter().find(|l| l.name() == lang)?;
+    Some(stemmed(l.is_stop(&lower), l.stem(&lower)))
+}
+
+/// The dictionaries `cfg` offers a token of type `toktype`, by name --
+/// `ts_debug`'s `dictionaries`.
+pub(crate) fn debug_dictionaries(cfg: Config, toktype: u8) -> Vec<String> {
+    crate::ts_catalog::dictionaries_for(cfg.0, i32::from(toktype))
+        .into_iter()
+        .filter_map(|d| crate::ts_catalog::name_of(d, true))
+        .collect()
+}
+
+/// The dictionary that takes `token` (type `toktype`) under `cfg`, and its
+/// lexemes -- `ts_debug`'s `dictionary` and `lexemes` (`[]` for a
+/// stop-word): the first of the map's dictionaries for the type that
+/// recognises it (each this server has always does). `None` for a type the
+/// map gives no dictionary, which takes no position.
+pub(crate) fn debug_lexize(cfg: Config, toktype: u8, token: &str) -> Option<(String, Vec<String>)> {
+    debug_dictionaries(cfg, toktype)
+        .into_iter()
+        .find_map(|d| lexize(&d, token).map(|lexemes| (d, lexemes)))
 }
 
 /// PostgreSQL's longest indexable lexeme, in bytes.
@@ -2541,11 +2543,7 @@ fn call_inner(name: &str, args: &[Bson]) -> Result<Bson> {
                 &opts,
             )))
         }
-        "get_current_ts_config" => Ok(crate::ts_catalog::oid_of(default_config().name(), false)
-            .map_or_else(
-                || Bson::String(default_config().name().into()),
-                |oid| crate::regobj::value("regconfig", oid),
-            )),
+        "get_current_ts_config" => Ok(crate::regobj::value("regconfig", default_config().0)),
         "ts_rank" => rank_call(args, false),
         "ts_rank_cd" => rank_call(args, true),
         _ => Err(wrong(name)),
@@ -3240,11 +3238,11 @@ mod tests {
 
     #[test]
     fn renders_like_postgresql() {
-        let q = to_tsquery(Config::English, "fox <-> the <-> quick").unwrap();
+        let q = to_tsquery(ENGLISH, "fox <-> the <-> quick").unwrap();
         assert_eq!(render_query(&q), "'fox' <2> 'quick'");
-        let q = to_tsquery(Config::English, "(fox | quick) & brown").unwrap();
+        let q = to_tsquery(ENGLISH, "(fox | quick) & brown").unwrap();
         assert_eq!(render_query(&q), "( 'fox' | 'quick' ) & 'brown'");
-        let v = to_tsvector(Config::English, "foo-bar abc123 42 -7 3.14 don't café 2x");
+        let v = to_tsvector(ENGLISH, "foo-bar abc123 42 -7 3.14 don't café 2x");
         assert_eq!(
             render_vector(&v),
             "'-7':6 '2x':11 '3.14':7 '42':5 'abc123':4 'bar':3 'café':10 'foo':2 'foo-bar':1"

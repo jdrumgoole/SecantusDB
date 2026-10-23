@@ -25,6 +25,9 @@ const PG_CONSTRAINT: i64 = 2606;
 const PG_TRIGGER: i64 = 2620;
 const PG_REWRITE: i64 = 2618;
 const PG_POLICY: i64 = 3256;
+const PG_TS_CONFIG: i64 = 3602;
+const PG_TS_DICT: i64 = 3600;
+const PG_TS_PARSER: i64 = 3601;
 
 /// PostgreSQL's `IsPinnedObject`: an object `initdb` made below
 /// `FirstUnpinnedObjectId` is depended on by no row, except the `public`
@@ -567,6 +570,20 @@ impl PgHandler {
             }
             for t in refs.casts.iter().filter_map(|t| cast_type(t)) {
                 push(PG_REWRITE, oid, 0, PG_TYPE, t, 0, "n");
+            }
+        }
+        // A text-search configuration depends on its schema, its parser and
+        // each dictionary its map names (`makeConfigurationDependencies`).
+        for c in self.user_ts_configs() {
+            let ns = secantus_pgplan::regobj::resolve(
+                "regnamespace",
+                &secantus_pgplan::scalar::quote_identifier(&c.schema),
+            )
+            .unwrap_or(0);
+            push(PG_TS_CONFIG, c.oid, 0, PG_NAMESPACE, ns, 0, "n");
+            push(PG_TS_CONFIG, c.oid, 0, PG_TS_PARSER, c.parser, 0, "n");
+            for (_, _, dict) in &c.map {
+                push(PG_TS_CONFIG, c.oid, 0, PG_TS_DICT, *dict, 0, "n");
             }
         }
         out

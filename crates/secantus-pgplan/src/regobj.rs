@@ -282,10 +282,8 @@ pub fn text(kind: &str, oid: i64) -> String {
             .into_iter()
             .find(|(_, o)| *o == oid)
             .map(|(n, _)| crate::scalar::quote_identifier(&n)),
-        "regconfig" => crate::ts_catalog::name_of(oid, false).map(crate::scalar::quote_identifier),
-        "regdictionary" => {
-            crate::ts_catalog::name_of(oid, true).map(crate::scalar::quote_identifier)
-        }
+        "regconfig" => crate::ts_catalog::display_of(oid, false),
+        "regdictionary" => crate::ts_catalog::display_of(oid, true),
         // `regprocout`: each part of the name quoted as an identifier needs
         // (`"RI_FKey_check_ins"`).
         "regproc" => PROCS

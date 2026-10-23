@@ -33,6 +33,7 @@ pub mod schemas;
 mod srf_tlist;
 pub mod systypes;
 pub mod tid;
+pub mod ts_configs;
 pub mod typed_tables;
 pub mod typeout;
 mod typmod_cast;
@@ -947,6 +948,8 @@ pub enum Statement {
         name: Option<String>,
         value: Option<String>,
     },
+    /// `CREATE / ALTER / DROP TEXT SEARCH CONFIGURATION`.
+    TsConfig(ts_configs::TsConfigOp),
     /// `ALTER MATERIALIZED VIEW m RENAME TO n`.
     RenameMatView {
         matview: String,
@@ -4613,6 +4616,11 @@ fn plan_node(
                 owner: None,
             })
         }
+        N::RenameStmt(r)
+            if ObjectType::try_from(r.rename_type) == Ok(ObjectType::ObjectTsconfiguration) =>
+        {
+            ts_configs::plan_rename(&r)
+        }
         N::RenameStmt(r) => plan_rename(&r),
         N::AlterDatabaseStmt(a) => {
             let mut options = Vec::new();
@@ -4952,6 +4960,22 @@ fn plan_node(
         }
         N::DefineStmt(d) if ObjectType::try_from(d.kind) == Ok(ObjectType::ObjectCollation) => {
             collation::plan_create(&d)
+        }
+        N::DefineStmt(d)
+            if ObjectType::try_from(d.kind) == Ok(ObjectType::ObjectTsconfiguration) =>
+        {
+            ts_configs::plan_create(&d)
+        }
+        N::AlterTsconfigurationStmt(a) => ts_configs::plan_alter(&a),
+        N::AlterOwnerStmt(a)
+            if ObjectType::try_from(a.object_type) == Ok(ObjectType::ObjectTsconfiguration) =>
+        {
+            ts_configs::plan_owner(&a)
+        }
+        N::AlterObjectSchemaStmt(a)
+            if ObjectType::try_from(a.object_type) == Ok(ObjectType::ObjectTsconfiguration) =>
+        {
+            ts_configs::plan_set_schema(&a)
         }
         N::CreateFunctionStmt(f) => plan_create_function(&f),
         N::CallStmt(c) => plan_call(&c, params),
@@ -7408,8 +7432,68 @@ fn ruleutils_default(node: &pg_query::protobuf::Node) -> Option<String> {
                 }
             }
             N::FuncCall(f) => {
-                let args: Option<Vec<String>> = f.args.iter().map(render).collect();
-                Some(format!("{}({})", func_name(f)?, args?.join(", ")))
+                // An untyped string takes the type of the parameter the
+                // chosen overload declares (`to_tsvector('english'::regconfig,
+                // 'x'::text)`), as the analysed call carries it.
+                let name = func_name(f)?;
+                let types: Option<Vec<String>> = f
+                    .args
+                    .iter()
+                    .map(|a| match a.node.as_ref()? {
+                        N::AConst(c) => Some(
+                            match c.val.as_ref()? {
+                                Val::Sval(_) => "unknown",
+                                Val::Ival(_) => "int4",
+                                Val::Fval(_) => "numeric",
+                                Val::Boolval(_) => "bool",
+                                _ => return None,
+                            }
+                            .to_string(),
+                        ),
+                        _ => None,
+                    })
+                    .collect();
+                let declared = types
+                    .filter(|t| !crate::funcsig::has_exact(&name, t))
+                    .and_then(|t| {
+                        crate::funcsig::selected_args(&name, &t)
+                            .or_else(|| crate::funcsig::resolved_args(&name, &t))
+                    });
+                let args: Option<Vec<String>> = f
+                    .args
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| {
+                        let want = declared.as_ref().and_then(|d| d.get(i));
+                        match (a.node.as_ref(), want) {
+                            // `"any"` takes it as it is, printed bare.
+                            (Some(N::AConst(c)), Some(want))
+                                if want == "any"
+                                    && matches!(c.val.as_ref(), Some(Val::Sval(_))) =>
+                            {
+                                let Some(Val::Sval(s)) = c.val.as_ref() else {
+                                    return None;
+                                };
+                                Some(format!("'{}'", s.sval.replace('\'', "''")))
+                            }
+                            (Some(N::AConst(c)), Some(want))
+                                if !want.starts_with("any")
+                                    && matches!(c.val.as_ref(), Some(Val::Sval(_))) =>
+                            {
+                                let Some(Val::Sval(s)) = c.val.as_ref() else {
+                                    return None;
+                                };
+                                Some(format!(
+                                    "'{}'::{}",
+                                    s.sval.replace('\'', "''"),
+                                    display_type(want)
+                                ))
+                            }
+                            _ => render(a),
+                        }
+                    })
+                    .collect();
+                Some(format!("{name}({})", args?.join(", ")))
             }
             N::ColumnRef(c) => column_ref_name(c),
             // ruleutils prints these as the SQL keywords they are.
@@ -20164,6 +20248,7 @@ fn plan_comment(c: &pg_query::protobuf::CommentStmt) -> Result<Statement> {
         Ok(O::ObjectExtension) => "extension",
         Ok(O::ObjectTrigger) => "trigger",
         Ok(O::ObjectRole) => "role",
+        Ok(O::ObjectTsconfiguration) => "text search configuration",
         _ => return Err(Error::Unsupported("COMMENT ON this kind of object".into())),
     };
     fn strings(n: &pg_query::protobuf::Node, out: &mut Vec<String>) {
@@ -35203,6 +35288,9 @@ fn plan_alter_system(a: &pg_query::protobuf::AlterSystemStmt) -> Result<Statemen
 fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectCast) {
         return user_casts::plan_drop(d);
+    }
+    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectTsconfiguration) {
+        return ts_configs::plan_drop(d);
     }
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectCollation) {
         return collation::plan_drop(d);
