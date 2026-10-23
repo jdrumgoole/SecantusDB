@@ -57,6 +57,8 @@ type R = Result<Bson, Fallback>;
 /// Mirrors `expressions.py::_Eval`.
 type Ret = fn(&Bson, &Ctx) -> R;
 
+mod sbe_ops;
+
 struct Ctx<'a> {
     doc: &'a Document,
     vars: &'a Document,
@@ -244,7 +246,7 @@ fn eval(expr: &Bson, ctx: &Ctx) -> R {
                     // and is still an executor error (probed 8.2.11). Only the
                     // innermost frame decides -- an outer one finds it already
                     // set and leaves it.
-                    return apply_op(key, val, ctx).map_err(|f| stamp_folded(f, val, ctx));
+                    return apply_op(key, val, ctx).map_err(|f| stamp_folded(f, expr, ctx));
                 }
             }
             // A document *literal*. Each member is in field-value position, so
@@ -988,6 +990,24 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
     // evaluating anything, so a missing field is an error even when the rest of
     // the expression would not have run.
     check_required_fields(op, arg)?;
+    // In mongod's slot-based engine an operator answers by SBE's rules,
+    // except where the optimizer already folded it to a constant, which the
+    // classic code does before either engine runs (RM-280).
+    if crate::sbe::active()
+        && !crate::aggregate::is_constant_expression(
+            &Bson::Document(bson::doc! { op: arg.clone() }),
+            &ctx.vars.keys().cloned().collect::<Vec<_>>(),
+        )
+    {
+        if let Some(answer) = sbe_ops::apply(op, arg, ctx) {
+            return answer;
+        }
+    }
+    apply_classic(op, arg, ctx)
+}
+
+/// An operator by the classic engine's rules, its argument already unwrapped.
+fn apply_classic(op: &str, arg: &Bson, ctx: &Ctx) -> R {
     match op {
         // `$const` is the name mongod itself gives a literal, and takes one.
         "$literal" | "$const" => Ok(arg.clone()),
@@ -1910,8 +1930,10 @@ fn op_switch(arg: &Bson, ctx: &Ctx, ret: Ret) -> R {
         )
         .with_folded(true))
     } else {
+        // SBE fails its own way (RM-280).
+        let code = if crate::sbe::active() { 7158303 } else { 40066 };
         Err(Fallback::mongo(
-            40066,
+            code,
             "$switch could not find a matching branch for an input, and no default was specified.",
         )
         .with_folded(false))
@@ -4256,7 +4278,7 @@ enum SetOperandStyle {
 /// was an error on the standalone server where mongod answers null.
 fn set_operand_rules(op: &str) -> (SetOperandStyle, bool) {
     match op {
-        "$setEquals" => (SetOperandStyle::Indexed(5887502), false),
+        "$setEquals" => (SetOperandStyle::Indexed(17044), false),
         "$setUnion" => (SetOperandStyle::Anonymous(17043), true),
         "$setIntersection" => (SetOperandStyle::Anonymous(17047), true),
         "$setDifference" => (SetOperandStyle::Positional(17048, 17049), true),
@@ -4273,7 +4295,15 @@ fn set_arrays(
     n: Option<usize>,
     op: &str,
 ) -> Result<Option<Vec<Vec<Bson>>>, Fallback> {
-    let vals = eval_args(arg, ctx)?;
+    set_optimize_check(op, arg, ctx)?;
+    // A missing operand stays missing, for the error to name it so.
+    let vals: Vec<Bson> = match arg {
+        Bson::Array(items) => items
+            .iter()
+            .map(|e| eval_field_value(e, ctx))
+            .collect::<Result<_, _>>()?,
+        other => vec![eval_field_value(other, ctx)?],
+    };
     if n.is_some_and(|k| vals.len() != k) {
         return Err(Fallback::Defer);
     }
@@ -4284,7 +4314,11 @@ fn set_arrays(
             return Ok(None);
         }
         let Bson::Array(a) = v else {
-            let ty = crate::query::bson_type_name(v);
+            let ty = if matches!(v, Bson::Undefined) {
+                "missing"
+            } else {
+                crate::query::bson_type_name(v)
+            };
             let (code, message) = match style {
                 SetOperandStyle::Indexed(code) => (
                     code,
@@ -4313,6 +4347,57 @@ fn set_arrays(
         out.push(a.clone());
     }
     Ok(Some(out))
+}
+
+/// The operands mongod's optimizer checks before either engine runs: every
+/// constant operand of `$setEquals` (5887502) and the constant second
+/// operand of `$setIsSubset` (17311, unless the whole expression is
+/// constant) must be an array, null included
+/// (measured 8.2.11, 2026-10-23). A field operand fails per document, as
+/// 17044 / 17046 / 17042.
+fn set_optimize_check(op: &str, arg: &Bson, ctx: &Ctx) -> Result<(), Fallback> {
+    let Bson::Array(items) = arg else {
+        return Ok(());
+    };
+    let bound: Vec<String> = ctx.vars.keys().cloned().collect();
+    // A wholly constant `$setIsSubset` is folded instead, and fails with the
+    // run-time codes under the optimizer's wrapper.
+    if op == "$setIsSubset" && crate::aggregate::is_constant_expression(arg, &bound) {
+        return Ok(());
+    }
+    for (i, e) in items.iter().enumerate() {
+        let checked = match op {
+            "$setEquals" => true,
+            "$setIsSubset" => i == 1,
+            _ => false,
+        };
+        if !checked || !crate::aggregate::is_constant_expression(e, &bound) {
+            continue;
+        }
+        let v = eval(e, ctx)?;
+        if matches!(v, Bson::Array(_)) {
+            continue;
+        }
+        let ty = crate::query::bson_type_name(&v);
+        let (code, message) = if op == "$setEquals" {
+            (
+                5887502,
+                format!(
+                    "All operands of $setEquals must be arrays. {}-th argument is of type: {ty}",
+                    i + 1
+                ),
+            )
+        } else {
+            (
+                17311,
+                format!(
+                    "both operands of $setIsSubset must be arrays. Second argument is of type: {ty}"
+                ),
+            )
+        };
+        return Err(Fallback::mongo(code, message).with_folded(true));
+    }
+    Ok(())
 }
 
 fn set_eq(a: &Bson, b: &Bson) -> bool {
@@ -5431,6 +5516,12 @@ fn sunday_week(days: i64, year: i64) -> i64 {
 
 fn render_date(millis: i64, fmt: &str) -> Result<String, Fallback> {
     render_date_at(millis, fmt, 0)
+}
+
+/// The error `$dateToString` gives for `fmt` before rendering any date
+/// (`TimeZone::validateToStringFormat`).
+pub(crate) fn to_string_format_error(fmt: &str) -> Option<Fallback> {
+    render_date_at(0, fmt, 0).err()
 }
 
 /// `$dateToString`'s format language, which is NOT `strftime`. mongod accepts
@@ -9551,11 +9642,27 @@ fn op_replace(arg: &Bson, ctx: &Ctx, all: bool) -> R {
         return Err(Fallback::Defer);
     };
     let (iv, fv, rv) = (eval(ie, ctx)?, eval(fe, ctx)?, eval(re, ctx)?);
-    if matches!(iv, Bson::Null) || matches!(fv, Bson::Null) || matches!(rv, Bson::Null) {
-        return Ok(Bson::Null);
+    // Each argument's type in turn, a null one let by, and only then a null
+    // answer: `{input: "$nope", find: 1}` is the `find` error (measured
+    // 8.2.11, 2026-10-23). A non-string here answered "not supported".
+    let op = if all { "$replaceAll" } else { "$replaceOne" };
+    for (v, name, code) in [
+        (&iv, "input", 10503904),
+        (&fv, "find", 10503901),
+        (&rv, "replacement", 10503902),
+    ] {
+        if !matches!(v, Bson::Null | Bson::Undefined | Bson::String(_)) {
+            return Err(Fallback::mongo(
+                code,
+                format!(
+                    "{op} requires that '{name}' be a string, found: {}",
+                    crate::aggregate::render_value_compact(v)
+                ),
+            ));
+        }
     }
     let (Bson::String(input), Bson::String(find), Bson::String(rep)) = (iv, fv, rv) else {
-        return Err(Fallback::Defer); // non-string -> Python raises
+        return Ok(Bson::Null);
     };
     let out = if all {
         input.replace(&find, &rep)
@@ -9603,7 +9710,11 @@ fn range_int(b: &Bson, which: &str, numeric_code: i32, repr_code: i32) -> Result
             numeric_code,
             format!(
                 "$range requires a numeric {which} value, found value of type:{sep}{}",
-                crate::query::bson_type_name(b)
+                if matches!(b, Bson::Undefined) {
+                    "missing"
+                } else {
+                    crate::query::bson_type_name(b)
+                }
             ),
         ));
     }
@@ -9637,10 +9748,11 @@ fn op_range(arg: &Bson, ctx: &Ctx) -> R {
     // mongod validates all three for TYPE first, then all three for
     // representability -- so `{$range: ["x", 5.5]}` reports the string, not the
     // 5.5. Matching that order is why the two checks are separate codes here.
-    let start_v = eval(&a[0], ctx)?;
-    let end_v = eval(&a[1], ctx)?;
+    // A missing operand is named "missing" in the error, as mongod names it.
+    let start_v = eval_field_value(&a[0], ctx)?;
+    let end_v = eval_field_value(&a[1], ctx)?;
     let step_v = if a.len() == 3 {
-        eval(&a[2], ctx)?
+        eval_field_value(&a[2], ctx)?
     } else {
         Bson::Int32(1)
     };

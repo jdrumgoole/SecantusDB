@@ -215,7 +215,7 @@ def test_accumulators_new_and_refusing(rust_mongo: Any, mongod: Any) -> None:
     assert _diverging(rust_mongo, mongod, shapes) == []
 
 
-@pytest.mark.backlog("RM-280")
+@pytest.mark.backlog_fixed("RM-280")
 def test_group_in_sbe_error_codes(rust_mongo: Any, mongod: Any) -> None:
     """A `$group` mongod pushes into its SBE engine -- one after only
     `$match` / `$sort` / `$limit` / `$project` -- fails with SBE's codes:

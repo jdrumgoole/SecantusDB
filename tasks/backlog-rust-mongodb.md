@@ -545,6 +545,52 @@ These are explicit non-goals. Don't add them without a reason.
   the reference does.
   Backlog-ID: RM-274
   Verify: none -- an instability in the reference measurement under parallel load, reproduced only by the full regression run on a loaded Mac
+### 7.091 mongod's slot-based engine (SBE) -- 2026-10-23
+
+mongod 8.2 runs the front of a pipeline in its slot-based engine when it can
+push a `$group` or `$lookup` down, and SBE answers its own way. The Rust
+server follows it (RM-280, closed 2026-10-23): `secantus-core/src/sbe.rs`
+ports the pushdown rule of `sbe_pushdown.cpp` under `trySbeRestricted` and
+the stage builder's build-time checks, `expressions/sbe_ops.rs` gives each
+operator SBE compiles SBE's checks, codes, messages and values
+(`gen_expression.cpp` and the VM builtins), and `group.rs` keeps the
+N-accumulators as SBE and the classic engine each keep them (`stl.rs` is
+libstdc++'s heap and sort). Probes: `tools/probes/expression_shapes.py --sbe`
+(3,360 shapes) and its `expression_shapes_sbe.py` corpus (3,614 more); both
+leave only differences listed here or in other items. Regression tests:
+`tests/backlog/test_rm_sbe.py`.
+
+- **Scope decision — the order of SBE's set expressions.** `$setUnion`,
+  `$setIntersection` and `$setDifference` in SBE return their elements in
+  the order of an `absl` hash set, which mongod seeds per process: the same
+  expression over the same document gave `[3, 'x', 2, 5, 4, 1]` and
+  `['x', 2, 4, 1, 3, 5]` on one mongod 8.2.11 (2026-10-23). No fixed order
+  can match it; this server keeps the classic engine's sorted order, which
+  is one SBE can give. The same holds for the accumulators (section 7.090).
+- **Scope decision — ties in SBE's heaps are libstdc++'s.** SBE keeps
+  `$topN`, `$bottomN`, `$maxN` and `$minN` in a `std::push_heap` /
+  `std::pop_heap` heap and sorts it with `std::sort`, so which of several
+  equal values survive, and their order, is the C++ library's. The Linux
+  build (libstdc++) is the exemplar and is what this server follows; the
+  macOS build (libc++) breaks those ties its own way, so
+  `test_n_accumulator_ties_follow_the_heap` runs on Linux only. A libc++
+  model reproduced the macOS mongod 8.2.11 on 1,500 of 1,500 cases.
+- **Scope decision — a `$dateFromString` message that is not UTF-8.** On a
+  string with multi-byte characters mongod's "Error parsing date string"
+  message splits them byte by byte and sends bytes that are not UTF-8, which
+  pymongo cannot decode; this server sends the same text as valid UTF-8.
+
+- [ ] **A constant timezone a date operator cannot use is refused only on a
+  document.** mongod's optimizer evaluates a constant `timezone` of `$year`
+  and the other date parts, `$dateToString`, `$dateFromString`, `$dateAdd`,
+  `$dateTrunc` and the rest before it reads anything: an unknown zone is
+  40485 and a non-string 40517 under "Failed to optimize pipeline", on a
+  collection that does not exist too. This server checks it when it
+  evaluates the operator, so with no document it answers `[]`. Found
+  2026-10-23 with RM-280.
+  Backlog-ID: RM-290
+  Verify: tests/backlog/test_rm_sbe.py::test_constant_timezone_refused_before_any_document
+
 ### 7.090 `$group` code no test had executed, against mongod -- 2026-10-22
 
 The 2026-10-21 coverage run left 455 lines of `secantus-core/src/group.rs`
@@ -553,10 +599,10 @@ unexecuted: the accumulators' corners, `$median` / `$percentile`,
 `tools/probes/group_shapes.py` was written against them. On `main`, 43 of
 its first 245 cases differed from mongod 8.2.11. The batch that wrote it fixed
 five causes (RM-275 to RM-279, regression tests in
-`tests/backlog/test_rm_group_shapes.py`), and the next closed RM-281. Of the
-probe's 282 cases, 9 differ: eight are RM-280, and one is `$accumulator`,
-which a mongod with scripting runs and this server refuses by design (Scope
-decision, above).
+`tests/backlog/test_rm_group_shapes.py`), the next closed RM-281, and the one
+after that RM-280 (section 7.091). Of the probe's 282 cases, one differs:
+`$accumulator`, which a mongod with scripting runs and this server refuses by
+design (Scope decision, above).
 
 Not a divergence: the ORDER of `$addToSet` / `$setUnion` elements, and of
 equal counts after `$sortByCount`. mongod takes them from a hash table and
@@ -564,39 +610,6 @@ does not fix it: the same pipeline on the same mongod gave each of two
 orders, 9 and 11 times in 20 runs (8.2.11, 2026-10-23). The order this
 server returns is one mongod gives, and the probe compares them as sets.
 
-- [ ] **A `$group` mongod runs in SBE fails with SBE's error codes.** mongod
-  pushes a `$group` into its slot-based engine when only `$match`, `$sort`,
-  `$limit` or `$project` come before it. After `$addFields` or `$unwind` it
-  runs the classic engine. The errors differ:
-
-  | error | SBE | classic |
-  | --- | --- | --- |
-  | bad `n` | 7548606 (constant) / 7548607 | 5787902 / 5787903 / 5787908 |
-  | `$mergeObjects` of a non-object | 5911200 "only supports objects" | 40400 |
-  | `$ln` of a string in the key | 7157705 | 28765 |
-
-  The Rust server answers the classic codes everywhere.
-
-  SBE is a second expression engine, not a set of renamed codes. Each of
-  the 3,360 shapes in `tools/probes/expression_shapes.py`, put in `{$group:
-  {_id: null, v: {$first: <expr>}}}` on mongod 8.2.11, answers differently
-  with and without an `$addFields` in front in 248 cases: 221 by error code
-  (`$mod` by zero 4848403 / 16610, `$sortArray` of a non-array 7158001 /
-  2942504, the `$arrayToObject` family 5153200-5153214 / 40386-40398, ...),
-  and 27 by value or by error against no error (`$substr` with a double
-  index is `null` in SBE and `"bc"` classic; `$regexMatch` with no regex
-  `null` and `false`; `$arrayToObject` of `[{v, k}]` an error and `{a: 1}`).
-
-  **Decided (Joe, 2026-10-23): model SBE fully.** Port mongod's pushdown
-  rule (`src/mongo/db/pipeline/sbe_pushdown.cpp`,
-  `findSbeCompatibleStagesForPushdown`, under the default
-  `trySbeRestricted` framework control: which leading stages join the
-  find layer, which `$group` / `$lookup` and which expressions SBE
-  compiles), then give the evaluator an SBE mode with SBE's answer --
-  code, message and value -- wherever it differs, probed operator by
-  operator.
-  Backlog-ID: RM-280
-  Verify: tests/backlog/test_rm_group_shapes.py::test_group_in_sbe_error_codes
 - [ ] **`$meta` beside an exclusion in `$project` is "not supported".**
   `{$project: {a: 0, b: {$meta: "textScore"}}}` is a valid exclusion
   projection (`$meta` is the one expression one may hold); with no text

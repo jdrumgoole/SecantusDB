@@ -25,7 +25,10 @@ keeps the cases whose label contains it; ``--cases FILE`` adds the ``CASES`` of
 another file, for iterating on new ones before they move in here; ``--match`` also
 runs each case that agreed inside ``$match: {$expr}`` and compares the outcome (an
 error's code, or success); ``PROBE_DB``
-names the database (default ``exprshapes``), so two runs can share the servers.
+names the database (default ``exprshapes``), so two runs can share the servers;
+``--sbe`` evaluates each case in a ``$group`` mongod runs in its slot-based engine
+(``[{$group: {_id: null, z: {$first: <expr>}}}]`` over the document stored in the
+collection), where SBE's answers differ from the classic engine's (RM-280).
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ import os
 import runpy
 import sys
 
+import bson.errors
 import pymongo
 from bson import Binary, Decimal128, Int64, MaxKey, MinKey, ObjectId, Regex, Timestamp
 from expression_shapes_dates import CASES as _DATE_CASES
@@ -87,6 +91,8 @@ _NEVER = "\x00never"
 
 
 def run(cli, expr, doc, in_match: bool = False) -> tuple:
+    if "--sbe" in sys.argv:
+        return run_sbe(cli, expr, doc)
     if in_match:
         last = {"$match": {"$expr": {"$eq": [expr, _NEVER]}}}
     else:
@@ -103,6 +109,26 @@ def run(cli, expr, doc, in_match: bool = False) -> tuple:
         d = getattr(e, "details", None)
         msg = d.get("errmsg", "") if isinstance(d, dict) else str(e)
         return (getattr(e, "code", None), msg[:200])
+    except (TypeError, ValueError, OverflowError, RecursionError) as e:
+        return ("CLIENT", type(e).__name__)
+
+
+def run_sbe(cli, expr, doc) -> tuple:
+    """`expr` in a `$group` that leads the pipeline, which mongod pushes into SBE
+    when every operator in it is one SBE compiles."""
+    coll = cli[DB].sbe
+    coll.drop()
+    coll.insert_one(doc)
+    try:
+        out = list(coll.aggregate([{"$group": {"_id": None, "z": {"$first": expr}}}]))
+        return ("OK", repr(out[0].get("z", "MISSING")))
+    except pymongo.errors.PyMongoError as e:
+        d = getattr(e, "details", None)
+        msg = d.get("errmsg", "") if isinstance(d, dict) else str(e)
+        return (getattr(e, "code", None), msg[:200])
+    except bson.errors.InvalidBSON:
+        # A reply the driver cannot decode, such as a string that is not UTF-8.
+        return ("INVALID BSON", None)
     except (TypeError, ValueError, OverflowError, RecursionError) as e:
         return ("CLIENT", type(e).__name__)
 

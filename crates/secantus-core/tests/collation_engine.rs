@@ -107,8 +107,10 @@ fn group_keys_and_sorts_follow_the_collation() {
 }
 
 #[test]
-fn a_tie_in_min_and_max_goes_to_the_later_value() {
-    // Equal is not identical: int 1, double 1, long 1.
+fn a_tie_in_min_and_max_goes_by_the_engine() {
+    // Equal is not identical: int 1, double 1, long 1. The classic engine
+    // keeps the FIRST of equal values and SBE the LATER (measured 8.2.11,
+    // 2026-10-23; RM-280, RM-289).
     let docs = || {
         vec![
             doc! {"_id": 0, "x": 1i32},
@@ -118,19 +120,25 @@ fn a_tie_in_min_and_max_goes_to_the_later_value() {
     };
     let group = doc! {"$group": {"_id": null, "lo": {"$min": "$x"}, "hi": {"$max": "$x"}}};
     let out = run(docs(), vec![group.clone()], None);
-    assert_eq!(out[0].get("lo"), Some(&Bson::Int64(1)));
-    assert_eq!(out[0].get("hi"), Some(&Bson::Int64(1)));
+    assert_eq!(out[0].get("lo"), Some(&Bson::Int32(1)));
+    assert_eq!(out[0].get("hi"), Some(&Bson::Int32(1)));
+    {
+        let _sbe = secantus_core::sbe::enter(true);
+        let out = run(docs(), vec![group.clone()], None);
+        assert_eq!(out[0].get("lo"), Some(&Bson::Int64(1)));
+        assert_eq!(out[0].get("hi"), Some(&Bson::Int64(1)));
+    }
     let mut reversed = docs();
     reversed.reverse();
     let out = run(reversed, vec![group], None);
-    assert_eq!(out[0].get("lo"), Some(&Bson::Int32(1)));
+    assert_eq!(out[0].get("lo"), Some(&Bson::Int64(1)));
 
     let s2 = strength(2);
-    let out = run(
-        letters(),
-        vec![doc! {"$group": {"_id": null, "lo": {"$min": "$s"}}}],
-        Some(&s2),
-    );
+    let min_s = || vec![doc! {"$group": {"_id": null, "lo": {"$min": "$s"}}}];
+    let out = run(letters(), min_s(), Some(&s2));
+    assert_eq!(out[0].get_str("lo").ok(), Some("b"));
+    let _sbe = secantus_core::sbe::enter(true);
+    let out = run(letters(), min_s(), Some(&s2));
     assert_eq!(out[0].get_str("lo").ok(), Some("B"));
 }
 

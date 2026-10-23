@@ -38,7 +38,9 @@ pub mod oid;
 pub mod projection;
 pub mod query;
 pub mod s2legacy;
+pub mod sbe;
 pub mod sortkey;
+mod stl;
 pub(crate) mod timelib;
 pub mod update;
 
