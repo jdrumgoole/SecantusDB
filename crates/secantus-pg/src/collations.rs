@@ -73,6 +73,60 @@ impl PgHandler {
         tag()
     }
 
+    /// A built-in collation (`pg_catalog`'s): `C`, `POSIX`, `default`,
+    /// `ucs_basic` and the ICU ones.
+    fn builtin_collation(name: &str) -> bool {
+        matches!(name, "C" | "POSIX" | "ucs_basic" | "default")
+            || secantus_pgplan::collation::icu_collations().any(|(_, n, _)| n == name)
+    }
+
+    fn no_such_collation(name: &str) -> PgWireError {
+        Self::user_error(
+            "42704",
+            format!("collation \"{name}\" for encoding \"UTF8\" does not exist"),
+        )
+    }
+
+    /// `ALTER COLLATION name RENAME TO new`: the collation keeps its oid,
+    /// and every column that names it follows.
+    pub(crate) fn rename_collation(&self, name: &str, to: &str) -> PgWireResult<Vec<Response>> {
+        let Some(mut doc) = self
+            .type_catalog_docs(COLLATION_COLLECTION)?
+            .iter()
+            .find(|d| d.get_str("_id") == Ok(name))
+            .cloned()
+        else {
+            return Err(Self::no_such_collation(name));
+        };
+        if Self::builtin_collation(to) || self.user_collations().iter().any(|c| c.name == to) {
+            return Err(Self::user_error(
+                "42710",
+                format!("collation \"{to}\" already exists in schema \"public\""),
+            ));
+        }
+        for (mut def, column) in self.collation_columns(name)? {
+            if let Some(c) = def.columns.iter_mut().find(|c| c.name == column) {
+                c.extra.insert("collation", to);
+            }
+            self.rewrite_catalog(&def.name.clone(), &def)?;
+        }
+        doc.insert("_id", to);
+        self.delete_type_doc(COLLATION_COLLECTION, name)?;
+        self.put(COLLATION_COLLECTION, to, doc)?;
+        Ok(vec![Response::Execution(Tag::new("ALTER COLLATION"))])
+    }
+
+    /// `ALTER COLLATION name REFRESH VERSION`: the collation library here
+    /// is the one it was created under, so its version has not changed.
+    pub(crate) fn refresh_collation(&self, name: &str) -> PgWireResult<Vec<Response>> {
+        if !Self::builtin_collation(name) && !self.user_collations().iter().any(|c| c.name == name)
+        {
+            return Err(Self::no_such_collation(name));
+        }
+        self.notice("00000", "version has not changed".into(), None);
+        Ok(vec![Response::Execution(Tag::new("ALTER COLLATION"))])
+    }
+
     /// The columns that name collation `name`: `(table, column)`.
     fn collation_columns(&self, name: &str) -> PgWireResult<Vec<(TableDef, String)>> {
         Ok(self

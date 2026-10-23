@@ -773,6 +773,32 @@ fixed in the same batch; their tests there are regression tests.
       Backlog-ID: RP-137
       Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order], tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]
 
+## Found by batch 40 (2026-10-23)
+
+Found while serving `CREATE ACCESS METHOD` (part of RP-169). The gap tests
+are scenarios in `tests/backlog/test_rp_batch40.py`, measured on a private
+15.19 cluster. RP-184 and RP-185 were found and fixed in the same batch;
+their tests there are regression tests.
+
+- [ ] **An operator class of another type is said not to exist.** `create
+      index on t using btree (a jsonb_ops)` over an `int[]` column is 42704
+      `operator class "jsonb_ops" does not exist for access method "btree"`
+      here; PostgreSQL 15.19 finds btree's `jsonb_ops` and answers 42804
+      `operator class "jsonb_ops" does not accept data type integer[]`.
+      This server knows each method's DEFAULT classes by type, not the
+      classes `pg_opclass` lists for each method; the fix is that list
+      (dumped from 15.19) and PostgreSQL's input-type check against it.
+      Backlog-ID: RP-183
+      Verify: tests/backlog/test_rp_batch40.py::test_scenario[an operator class for another type]
+- [ ] **The statistics types cannot be column types.** `pg_ndistinct`,
+      `pg_dependencies`, `pg_mcv_list`, `pg_brin_bloom_summary` and
+      `pg_brin_minmax_multi_summary` are 42704 `type "..." does not exist`
+      here. PostgreSQL 15.19 has them in `pg_type` and lets a table hold
+      one (their input functions refuse every value, so such a column only
+      ever holds NULL).
+      Backlog-ID: RP-186
+      Verify: tests/backlog/test_rp_batch40.py::test_scenario[the statistics types are types]
+
 ## Found by batch 38 (2026-10-23)
 
 Found while fixing RP-172 (an extension's objects are its schema's). The
@@ -837,15 +863,16 @@ batch; their tests there are regression tests.
       Backlog-ID: RP-165
       Verify: tests/backlog/test_rp_batch34.py::test_scenario[a built-in configuration can be altered]
 - [ ] **Statements still refused with 0A000**, each of which PostgreSQL
-      15.19 runs (several appear in `pg_dump` output): `ALTER EXTENSION
-      ... UPDATE`, `ALTER OPERATOR ... OWNER TO`, `ALTER COLLATION ...
-      REFRESH VERSION`, `CREATE CONVERSION`, `CREATE ACCESS METHOD`,
-      `CREATE OPERATOR FAMILY / CLASS`, `CREATE TEXT SEARCH DICTIONARY`,
-      `CREATE / ALTER / DROP SUBSCRIPTION` (with `connect = false`) and
-      `CREATE TRANSFORM`. `ALTER COLLATION ... RENAME TO` is a wrong 42601
-      ("RENAME without a relation"). Each refusal names the parse node
-      (`AlterExtensionStmt is not supported yet`). (The statements RP-072
-      listed and its test checked are all served now.)
+      15.19 runs (several appear in `pg_dump` output): `CREATE OPERATOR
+      FAMILY / CLASS`, `CREATE TEXT SEARCH DICTIONARY`, `CREATE / ALTER /
+      DROP SUBSCRIPTION` (with `connect = false`) and `CREATE TRANSFORM`.
+      Each refusal names the parse node (`CreateOpFamilyStmt is not
+      supported yet`). Each needs its catalog (`pg_opfamily` /
+      `pg_opclass`, `pg_ts_dict`, `pg_subscription`, `pg_transform`) kept
+      as PostgreSQL keeps it. (`ALTER EXTENSION ... UPDATE`, `ALTER
+      OPERATOR ... OWNER TO`, `ALTER COLLATION ... RENAME / REFRESH
+      VERSION`, `CREATE CONVERSION` and `CREATE ACCESS METHOD` are served
+      since batch 40.)
       Backlog-ID: RP-169
       Verify: tests/backlog/test_rp_batch34.py::test_scenario[statements PostgreSQL runs that are refused]
 

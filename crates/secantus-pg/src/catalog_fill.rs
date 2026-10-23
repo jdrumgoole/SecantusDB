@@ -855,12 +855,19 @@ impl PgHandler {
             .into_iter()
             .map(|(o, _)| o)
             .collect();
+        let conversions: Vec<i64> = self
+            .conversion_comments()
+            .into_iter()
+            .map(|(o, _)| o)
+            .collect();
         self.object_comments()
             .into_iter()
             .map(|(oid, subid, text)| {
                 // The catalog the object lives in, as `pg_description` keys it.
                 let classoid = if ts_configs.contains(&oid) {
                     crate::ts_configs::PG_TS_CONFIG
+                } else if conversions.contains(&oid) {
+                    2607 // pg_conversion
                 } else if constraints.contains(&oid) {
                     2606
                 } else if extensions.contains(&oid) {
@@ -996,6 +1003,7 @@ impl PgHandler {
             d.insert(f("amtype"), kind);
             d
         })
+        .chain(self.user_access_method_rows(def))
         .collect()
     }
 
@@ -1152,7 +1160,8 @@ impl PgHandler {
                         let table = table_by_oid(oid);
                         match c {
                             "relam" => Bson::Int64(match kind.as_str() {
-                                "r" | "m" | "t" => 2,
+                                "r" | "m" => self.table_relam(table),
+                                "t" => 2,
                                 "i" | "I" => 403,
                                 _ => 0,
                             }),
