@@ -44,6 +44,13 @@ pub const BUILTIN_TYPES: &[(&str, i64, i64)] = &[
     ("regclass", 2205, 2210),
     // A catalog's stored expression tree; it has no array type.
     ("pg_node_tree", 194, 0),
+    // The extended-statistics and BRIN summary types: a column may be one,
+    // but no value is ever accepted for one (their input functions refuse).
+    ("pg_ndistinct", 3361, 0),
+    ("pg_dependencies", 3402, 0),
+    ("pg_brin_bloom_summary", 4600, 0),
+    ("pg_brin_minmax_multi_summary", 4601, 0),
+    ("pg_mcv_list", 5017, 0),
     ("regprocedure", 2202, 2207),
     ("regoper", 2203, 2208),
     ("regoperator", 2204, 2209),
@@ -205,6 +212,48 @@ pub fn type_name_of_oid(oid: i64) -> Option<String> {
 }
 
 /// The internal name for an oid, or `None`.
+/// PostgreSQL 15.19's pseudo-types (`typtype` `p`), as `regtype` prints
+/// them (`"any"` quoted, `_record` as `record[]`).
+pub const PSEUDO_TYPES: &[(i64, &str)] = &[
+    (32, "pg_ddl_command"),
+    (269, "table_am_handler"),
+    (325, "index_am_handler"),
+    (705, "unknown"),
+    (2249, "record"),
+    (2275, "cstring"),
+    (2276, "\"any\""),
+    (2277, "anyarray"),
+    (2278, "void"),
+    (2279, "trigger"),
+    (2280, "language_handler"),
+    (2281, "internal"),
+    (2283, "anyelement"),
+    (2287, "record[]"),
+    (2776, "anynonarray"),
+    (3115, "fdw_handler"),
+    (3310, "tsm_handler"),
+    (3500, "anyenum"),
+    (3831, "anyrange"),
+    (3838, "event_trigger"),
+    (4537, "anymultirange"),
+    (4538, "anycompatiblemultirange"),
+    (5077, "anycompatible"),
+    (5078, "anycompatiblearray"),
+    (5079, "anycompatiblenonarray"),
+    (5080, "anycompatiblerange"),
+];
+
+/// A pseudo-type's oid by name (`pg_catalog.` allowed).
+pub fn pseudo_type_oid(name: &str) -> Option<i64> {
+    let n = name.trim();
+    let n = n.strip_prefix("pg_catalog.").unwrap_or(n);
+    let lower = n.to_ascii_lowercase();
+    PSEUDO_TYPES
+        .iter()
+        .find(|(_, t)| *t == lower || *t == n)
+        .map(|(o, _)| *o)
+}
+
 pub fn name_of_oid(oid: i64) -> Option<&'static str> {
     BUILTIN_TYPES
         .iter()

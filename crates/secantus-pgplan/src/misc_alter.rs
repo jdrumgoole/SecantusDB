@@ -301,3 +301,64 @@ pub(crate) fn table_access_method(name: &str) -> Result<Option<String>> {
         )),
     }
 }
+
+/// One of PostgreSQL's operator classes (`pg_opclass`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpClass {
+    pub method: i64,
+    pub name: String,
+    pub intype: i64,
+    pub default: bool,
+}
+
+static OPCLASSES: std::sync::OnceLock<Vec<OpClass>> = std::sync::OnceLock::new();
+
+/// Install PostgreSQL's operator classes, once.
+pub fn install_opclasses(load: impl FnOnce() -> Vec<OpClass>) {
+    OPCLASSES.get_or_init(load);
+}
+
+fn method_oid(method: &str) -> Option<i64> {
+    Some(match method {
+        "btree" => 403,
+        "hash" => 405,
+        "gist" => 783,
+        "gin" => 2742,
+        "spgist" => 4000,
+        "brin" => 3580,
+        _ => return None,
+    })
+}
+
+/// Does access method `method` have an operator class named `name`?
+pub(crate) fn opclass_exists(method: &str, name: &str) -> bool {
+    let Some(oid) = method_oid(method) else {
+        return false;
+    };
+    OPCLASSES
+        .get()
+        .is_some_and(|c| c.iter().any(|o| o.method == oid && o.name == name))
+}
+
+/// `opclass` of `method` for a key of `pg_type`, as `ResolveOpClass`
+/// takes an explicit class: `Some(default)` when it accepts the type (its
+/// input type, `varchar` for `text`'s, or a polymorphic one the type is an
+/// instance of), `None` when it does not.
+pub(crate) fn explicit_opclass(method: &str, name: &str, pg_type: &str) -> Option<bool> {
+    let oid = method_oid(method)?;
+    let ty = pg_type.trim().to_ascii_lowercase();
+    let type_oid = crate::pgtypes::oid_of_name(&ty);
+    let accepts = |intype: i64| -> bool {
+        Some(intype) == type_oid
+            || intype == 25 && matches!(ty.as_str(), "varchar" | "character varying")
+            || intype == 2277 && ty.ends_with("[]")
+            || intype == 3500 && crate::user_enum(&ty).is_some()
+            || intype == 3831 && crate::range::is_range_type(&ty)
+            || intype == 4537 && crate::range::is_multirange_type(&ty)
+            || intype == 2249 && crate::user_composite(&ty).is_some()
+    };
+    OPCLASSES
+        .get()?
+        .iter()
+        .find_map(|o| (o.method == oid && o.name == name && accepts(o.intype)).then_some(o.default))
+}

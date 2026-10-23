@@ -5328,6 +5328,7 @@ impl PgHandler {
             .collect();
         secantus_pgplan::set_extension_types(extension_types);
         secantus_pgplan::set_installed_extensions(self.extension_schemas());
+        secantus_pgplan::misc_alter::install_opclasses(system_catalogs::builtin_opclasses);
         secantus_pgplan::misc_alter::set_user_access_methods(
             self.user_access_methods()
                 .into_iter()

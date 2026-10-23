@@ -159,6 +159,23 @@ pub(crate) fn builtin_conversion_pairs() -> Vec<(i64, i64, i64)> {
         .collect()
 }
 
+/// The built-in operator classes as dumped: `(opcmethod, opcname,
+/// opcintype, opcdefault)`.
+pub(crate) fn builtin_opclasses() -> Vec<secantus_pgplan::misc_alter::OpClass> {
+    dumped("pg_opclass")
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            Some(secantus_pgplan::misc_alter::OpClass {
+                method: f.get(1)?.parse().ok()?,
+                name: (*f.get(2)?).to_string(),
+                intype: f.get(6)?.parse().ok()?,
+                default: *f.get(7)? == "t",
+            })
+        })
+        .collect()
+}
+
 fn dumped(name: &str) -> &'static str {
     let key = if name.contains('.') {
         name.to_string()

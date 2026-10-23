@@ -773,32 +773,6 @@ fixed in the same batch; their tests there are regression tests.
       Backlog-ID: RP-137
       Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order], tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]
 
-## Found by batch 40 (2026-10-23)
-
-Found while serving `CREATE ACCESS METHOD` (part of RP-169). The gap tests
-are scenarios in `tests/backlog/test_rp_batch40.py`, measured on a private
-15.19 cluster. RP-184 and RP-185 were found and fixed in the same batch;
-their tests there are regression tests.
-
-- [ ] **An operator class of another type is said not to exist.** `create
-      index on t using btree (a jsonb_ops)` over an `int[]` column is 42704
-      `operator class "jsonb_ops" does not exist for access method "btree"`
-      here; PostgreSQL 15.19 finds btree's `jsonb_ops` and answers 42804
-      `operator class "jsonb_ops" does not accept data type integer[]`.
-      This server knows each method's DEFAULT classes by type, not the
-      classes `pg_opclass` lists for each method; the fix is that list
-      (dumped from 15.19) and PostgreSQL's input-type check against it.
-      Backlog-ID: RP-183
-      Verify: tests/backlog/test_rp_batch40.py::test_scenario[an operator class for another type]
-- [ ] **The statistics types cannot be column types.** `pg_ndistinct`,
-      `pg_dependencies`, `pg_mcv_list`, `pg_brin_bloom_summary` and
-      `pg_brin_minmax_multi_summary` are 42704 `type "..." does not exist`
-      here. PostgreSQL 15.19 has them in `pg_type` and lets a table hold
-      one (their input functions refuse every value, so such a column only
-      ever holds NULL).
-      Backlog-ID: RP-186
-      Verify: tests/backlog/test_rp_batch40.py::test_scenario[the statistics types are types]
-
 ## Found by batch 38 (2026-10-23)
 
 Found while fixing RP-172 (an extension's objects are its schema's). The
