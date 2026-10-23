@@ -101,6 +101,23 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
     if head == "create cast" || head == "drop cast" {
         return None;
     }
+    // `ALTER TYPE t ... ATTRIBUTE a`: the type and the attribute are found
+    // as a relation and its column, with no position.
+    if head == "alter type" && matches!(sqlstate, "42P01" | "42703" | "42701" | "42809") {
+        return None;
+    }
+    // `CREATE TABLE t OF type (...)`: the type and its `WITH OPTIONS`
+    // columns are looked up outside any expression, with no position.
+    if head == "create table" && matches!(sqlstate, "42704" | "42703" | "42809") {
+        let words: Vec<String> = sql
+            .split_whitespace()
+            .take(7)
+            .map(str::to_ascii_lowercase)
+            .collect();
+        if words.get(3).is_some_and(|w| w == "of") || words.get(6).is_some_and(|w| w == "of") {
+            return None;
+        }
+    }
     // An unterminated string, identifier or comment runs to the end of the
     // text, which then has no tokens to look among: the message quotes it
     // from where it opens.

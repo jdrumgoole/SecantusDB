@@ -32,6 +32,7 @@ pub mod schemas;
 mod srf_tlist;
 pub mod systypes;
 pub mod tid;
+pub mod typed_tables;
 pub mod typeout;
 mod typmod_cast;
 pub use expr_where::with_expr_index_hook;
@@ -474,6 +475,12 @@ pub enum Statement {
         missing_ok: bool,
         actions: Vec<AlterTableAction>,
     },
+    /// `ALTER TYPE t ADD | DROP | ALTER ATTRIBUTE ...` on a composite type,
+    /// named by its resolution name.
+    AlterTypeAttributes {
+        name: String,
+        actions: Vec<typed_tables::AttributeAction>,
+    },
     /// `CREATE SEQUENCE`.
     CreateSequence {
         name: String,
@@ -743,6 +750,8 @@ pub enum Statement {
         sub: String,
         to: String,
         missing_ok: bool,
+        /// `... CASCADE` (`RENAME ATTRIBUTE` carries it to typed tables).
+        cascade: bool,
     },
     /// `ALTER FUNCTION | PROCEDURE | ROUTINE name[(args)] ...`.
     AlterFunction {
@@ -2102,6 +2111,9 @@ fn output_lock_targets(
 /// do not match, which is the worst failure this server can have.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterTableAction {
+    /// `OF type` (`Some`, the type's resolution name) / `NOT OF` (`None`):
+    /// the type a typed table records (`typed_tables`).
+    OfType(Option<String>),
     /// `SET LOGGED` / `SET UNLOGGED`: the relation's `relpersistence`.
     SetPersistence(char),
     /// `SET (...)` / `RESET (...)`: the table's `reloptions` after the edit,
@@ -4531,10 +4543,21 @@ fn plan_node(
             if !parents.is_empty() {
                 c.inh_relations.clear();
             }
+            // `OF type`: the type's attributes are the columns.
+            let of_type = match typed_tables::lower(&c)? {
+                Some((typed, ty)) => {
+                    c = typed;
+                    Some(ty)
+                }
+                None => None,
+            };
             let (c, extra, column_options) = partitions::lower_create(&c, lookup)?;
             let mut st = plan_create(&expand_table_like(&c, lookup)?)?;
             if let Statement::CreateTable(def, _) = &mut st {
                 def.extra.extend(extra);
+                if let Some(ty) = of_type {
+                    def.extra.insert(typed_tables::OF_TYPE_KEY, ty);
+                }
                 partitions::apply_column_options(def, &column_options)?;
                 if !parents.is_empty() {
                     inherit::merge_parents(def, &parents, lookup)?;
@@ -6459,6 +6482,9 @@ fn plan_alter_table(
             });
         }
     }
+    if a.objtype == ObjectType::ObjectType as i32 {
+        return typed_tables::plan_alter_type(a, relation);
+    }
     if a.objtype != ObjectType::ObjectTable as i32 {
         return Err(Error::Unsupported(format!(
             "ALTER {}",
@@ -6904,6 +6930,8 @@ fn plan_alter_action(
             name: cmd.name.clone(),
             if_exists: cmd.missing_ok,
         }),
+        Ok(AT::AtAddOf) => typed_tables::plan_add_of(cmd, def),
+        Ok(AT::AtDropOf) => typed_tables::plan_drop_of(table, def),
         Ok(AT::AtSetLogged) => Ok(AlterTableAction::SetPersistence('p')),
         Ok(AT::AtSetUnLogged) => Ok(AlterTableAction::SetPersistence('u')),
         Ok(kind @ (AT::AtSetRelOptions | AT::AtResetRelOptions)) => {
@@ -7446,6 +7474,14 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
         AlterTableAction::SetPersistence(p) => {
             def.extra.insert("relpersistence", p.to_string());
         }
+        AlterTableAction::OfType(of) => match of {
+            Some(ty) => {
+                def.extra.insert(typed_tables::OF_TYPE_KEY, ty.as_str());
+            }
+            None => {
+                def.extra.remove(typed_tables::OF_TYPE_KEY);
+            }
+        },
         AlterTableAction::RelOptions(options) => {
             if options.is_empty() {
                 def.extra.remove("reloptions");
@@ -7684,6 +7720,8 @@ fn plan_rename(r: &pg_query::protobuf::RenameStmt) -> Result<Statement> {
             sub,
             to,
             missing_ok: r.missing_ok,
+            cascade: pg_query::protobuf::DropBehavior::try_from(r.behavior)
+                == Ok(pg_query::protobuf::DropBehavior::DropCascade),
         });
     }
     if ObjectType::try_from(r.rename_type) == Ok(ObjectType::ObjectPolicy) {
