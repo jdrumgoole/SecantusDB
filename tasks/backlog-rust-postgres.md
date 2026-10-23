@@ -786,8 +786,9 @@ tests are scenarios in `tests/backlog/test_rp_batch52.py` and
 RP-204 (an executor-answered function in a PL/pgSQL expression), RP-206 (a
 view over another schema's table had no rule dependency), RP-207 (an index
 in another schema was listed in `public`), RP-208 (a built-in row type
-printed as its oid) and RP-209 (`plpgsql`'s extension oid) were found and
-fixed in the same batch; their tests are regression tests.
+printed as its oid), RP-209 (`plpgsql`'s extension oid) and RP-210 (the
+visibility functions) were found and fixed in the same batch; their tests
+are regression tests.
 
 - [ ] **`pg_rewrite` lists no rule of a system view.** PostgreSQL 15.19 has
       142 (`_RETURN` on `pg_roles`, `pg_shadow`, ...); here a user view's
@@ -801,13 +802,6 @@ fixed in the same batch; their tests are regression tests.
       relation (`type t[]` appears among what depends on table `t`).
       Backlog-ID: RP-205
       Verify: tests/backlog/test_rp_batch52.py::test_scenario[pg_depend of a table, its view and its row type]
-- [ ] **The `pg_*_is_visible` functions answer true for an oid that names
-      nothing.** `pg_type_is_visible(1)`, `pg_function_is_visible(1)` and
-      eleven more are `t` here, NULL on PostgreSQL 15.19
-      (`pg_table_is_visible` is already NULL). They answer true for every
-      oid rather than looking the object up on the search path.
-      Backlog-ID: RP-210
-      Verify: tests/backlog/test_rp_batch52.py::test_scenario[the visibility functions of an oid that names nothing]
 
 ## Found by batch 51 (2026-10-23)
 

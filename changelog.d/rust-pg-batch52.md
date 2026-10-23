@@ -54,6 +54,13 @@ commented. Six divergences found on the way are fixed: they are listed below.
 - Fixes RP-209
   (`tests/backlog/test_rp_batch52.py::test_scenario[plpgsql's extension oid]`):
   `plpgsql`'s extension oid was 13826. It is 14031, as `initdb` leaves it.
+- Fixes RP-210
+  (`tests/backlog/test_rp_batch52.py::test_scenario[the visibility functions of an oid that names nothing]`):
+  `pg_type_is_visible`, `pg_function_is_visible` and ten more answered
+  true for every oid, one that names nothing included (PostgreSQL: NULL),
+  and for an object an earlier schema on the path hides. They now look the
+  object up: its bare name, with its argument types for a function or an
+  operator, must find it.
 
 #### Known
 
@@ -61,5 +68,3 @@ commented. Six divergences found on the way are fixed: they are listed below.
   and `pg_get_object_address` are refused.
 - RP-203: `pg_rewrite` lists no system view's rule.
 - RP-205: a table's row type has the table's oid.
-- RP-210: the `pg_*_is_visible` functions answer true for an oid that names
-  nothing.

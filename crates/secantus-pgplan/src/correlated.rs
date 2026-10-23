@@ -989,8 +989,21 @@ pub(crate) const SEQUENCE_FUNCTIONS: &[&str] = &[
     "set_config",
     "pg_my_temp_schema",
     "pg_get_serial_sequence",
-    // An object's description reads every catalog (RP-199).
+    // An object's description reads every catalog (RP-199), and so does
+    // whether a name finds it (RP-210).
     "pg_describe_object",
+    "pg_type_is_visible",
+    "pg_function_is_visible",
+    "pg_operator_is_visible",
+    "pg_opclass_is_visible",
+    "pg_opfamily_is_visible",
+    "pg_collation_is_visible",
+    "pg_conversion_is_visible",
+    "pg_statistics_obj_is_visible",
+    "pg_ts_config_is_visible",
+    "pg_ts_dict_is_visible",
+    "pg_ts_parser_is_visible",
+    "pg_ts_template_is_visible",
     "nextval",
     "currval",
     "setval",
@@ -1056,6 +1069,7 @@ pub fn executor_function_type(name: &str) -> Option<&'static str> {
         }
         n if n.contains("advisory") => "void",
         "pg_has_role" => "bool",
+        n if n.starts_with("pg_") && n.ends_with("_is_visible") => "bool",
         "set_limit" => "float4",
         "set_config" => "text",
         "pg_my_temp_schema" => "oid",

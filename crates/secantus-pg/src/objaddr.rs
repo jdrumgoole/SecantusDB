@@ -6,6 +6,8 @@
 //! `pg_proc` and the rest list. An object that does not exist is NULL, as
 //! with PostgreSQL's `missing_ok`; a class that is no catalog is XX000.
 
+use std::collections::HashMap;
+
 use bson::Bson;
 use pgwire::error::PgWireResult;
 
@@ -31,6 +33,22 @@ fn int(v: Option<&Bson>) -> i64 {
 }
 
 impl PgHandler {
+    /// An oid argument as the executor hook passes it: a number, a `reg*`
+    /// value, or -- for anything that reads as a `regclass` -- that
+    /// relation's text, which may be the oid itself.
+    fn oid_arg(&self, v: Option<&Bson>) -> i64 {
+        match v {
+            Some(Bson::String(name)) => name.trim().parse().unwrap_or_else(|_| {
+                self.object_row(&format!(
+                    "select {}::regclass::oid::int8",
+                    secantus_pgplan::scalar::quote_literal(name)
+                ))
+                .map_or(0, |r| int(r.first()))
+            }),
+            other => int(other),
+        }
+    }
+
     /// The first row of `sql`, or `None` (no row, or a catalog this server
     /// does not serve).
     fn object_row(&self, sql: &str) -> Option<Vec<Bson>> {
@@ -432,25 +450,163 @@ impl PgHandler {
         if args.iter().any(|a| matches!(a, Bson::Null)) {
             return Ok(Bson::Null);
         }
-        let regclass = |name: &str| {
-            self.object_row(&format!(
-                "select {}::regclass::oid::int8",
-                secantus_pgplan::scalar::quote_literal(name)
-            ))
-            .map_or(0, |r| int(r.first()))
-        };
-        let classid = match args.first() {
-            Some(Bson::String(name)) => regclass(name),
-            other => int(other),
-        };
+        let classid = self.oid_arg(args.first());
         // A `regclass` objid arrives as its name too.
-        let objid = match args.get(1) {
-            Some(Bson::String(name)) => regclass(name),
-            other => int(other),
-        };
+        let objid = self.oid_arg(args.get(1));
         let subid = int(args.get(2));
         Ok(self
             .describe_object(classid, objid, subid)?
             .map_or(Bson::Null, Bson::String))
+    }
+}
+
+/// `pg_X_is_visible`'s catalog: `(catalog, name column, namespace column,
+/// the columns an earlier object must share to hide this one)`.
+fn visibility_catalog(
+    function: &str,
+) -> Option<(
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+)> {
+    Some(match function {
+        "pg_type_is_visible" => ("pg_type", "typname", "typnamespace", &[]),
+        "pg_function_is_visible" => ("pg_proc", "proname", "pronamespace", &["proargtypes"]),
+        "pg_operator_is_visible" => (
+            "pg_operator",
+            "oprname",
+            "oprnamespace",
+            &["oprleft", "oprright"],
+        ),
+        "pg_opclass_is_visible" => ("pg_opclass", "opcname", "opcnamespace", &["opcmethod"]),
+        "pg_opfamily_is_visible" => ("pg_opfamily", "opfname", "opfnamespace", &["opfmethod"]),
+        "pg_collation_is_visible" => ("pg_collation", "collname", "collnamespace", &[]),
+        "pg_conversion_is_visible" => ("pg_conversion", "conname", "connamespace", &[]),
+        "pg_statistics_obj_is_visible" => ("pg_statistic_ext", "stxname", "stxnamespace", &[]),
+        "pg_ts_parser_is_visible" => ("pg_ts_parser", "prsname", "prsnamespace", &[]),
+        "pg_ts_dict_is_visible" => ("pg_ts_dict", "dictname", "dictnamespace", &[]),
+        "pg_ts_template_is_visible" => ("pg_ts_template", "tmplname", "tmplnamespace", &[]),
+        "pg_ts_config_is_visible" => ("pg_ts_config", "cfgname", "cfgnamespace", &[]),
+        _ => return None,
+    })
+}
+
+/// The visibility functions this server answers by looking the object up.
+pub(crate) const VISIBILITY_FUNCTIONS: &[&str] = &[
+    "pg_type_is_visible",
+    "pg_function_is_visible",
+    "pg_operator_is_visible",
+    "pg_opclass_is_visible",
+    "pg_opfamily_is_visible",
+    "pg_collation_is_visible",
+    "pg_conversion_is_visible",
+    "pg_statistics_obj_is_visible",
+    "pg_ts_parser_is_visible",
+    "pg_ts_dict_is_visible",
+    "pg_ts_template_is_visible",
+    "pg_ts_config_is_visible",
+];
+
+/// One catalog's objects for the visibility functions: by oid, `(name,
+/// schema, the columns that must match)`, and by name the schemas holding
+/// one with those columns.
+struct Visibility {
+    by_oid: HashMap<i64, (String, String, String)>,
+    by_name: HashMap<(String, String), Vec<String>>,
+}
+
+type VisibilityKey = (&'static str, u64, String, u64);
+
+thread_local! {
+    /// Read once per catalog version, search path and session: a
+    /// visibility test over every row of `pg_proc` (psql's `\df`) asked the
+    /// catalog once per row.
+    static VISIBILITY: std::cell::RefCell<Option<(VisibilityKey, std::rc::Rc<Visibility>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl PgHandler {
+    fn visibility_table(
+        &self,
+        catalog: &'static str,
+        name_col: &str,
+        ns_col: &str,
+        extra: &[&str],
+    ) -> std::rc::Rc<Visibility> {
+        let key: VisibilityKey = (
+            catalog,
+            crate::catalog_cache()
+                .version
+                .load(std::sync::atomic::Ordering::SeqCst),
+            secantus_pgplan::schemas::search_path().join(","),
+            if self.block_wrote_catalog() {
+                self.session_serial
+            } else {
+                0
+            },
+        );
+        if let Some(t) = VISIBILITY.with(|v| {
+            v.borrow()
+                .as_ref()
+                .filter(|(k, _)| *k == key)
+                .map(|(_, t)| std::rc::Rc::clone(t))
+        }) {
+            return t;
+        }
+        // The raw columns, no join and no casts: a text cast of every
+        // `proargtypes` cost most of a second.
+        let extra_sel: String = extra.iter().map(|c| format!(", o.{c}")).collect();
+        let rows = self.within_block(|| {
+            self.run_sql_rows(
+                &format!(
+                    "select o.oid, o.{name_col}, o.{ns_col}{extra_sel} from pg_catalog.{catalog} o"
+                ),
+                &[],
+            )
+            .unwrap_or_default()
+        });
+        let schemas: HashMap<i64, String> =
+            self.namespaces().into_iter().map(|(n, o)| (o, n)).collect();
+        let mut table = Visibility {
+            by_oid: HashMap::new(),
+            by_name: HashMap::new(),
+        };
+        for r in rows {
+            let (oid, name) = (int(r.first()), text(r.get(1)));
+            let schema = schemas.get(&int(r.get(2))).cloned().unwrap_or_default();
+            let same = format!("{:?}", &r[3.min(r.len())..]);
+            table
+                .by_name
+                .entry((name.clone(), same.clone()))
+                .or_default()
+                .push(schema.clone());
+            table.by_oid.insert(oid, (name, schema, same));
+        }
+        let table = std::rc::Rc::new(table);
+        VISIBILITY.with(|v| *v.borrow_mut() = Some((key, std::rc::Rc::clone(&table))));
+        table
+    }
+
+    /// `pg_type_is_visible(oid)` and its siblings (RP-210): NULL for an oid
+    /// that names nothing; else whether the object's bare name -- with its
+    /// argument types, for a function or an operator -- finds it on the
+    /// search path.
+    pub(crate) fn is_visible_call(&self, function: &str, args: &[Bson]) -> PgWireResult<Bson> {
+        let Some((catalog, name_col, ns_col, extra)) = visibility_catalog(function) else {
+            return Ok(Bson::Null);
+        };
+        if matches!(args.first(), None | Some(Bson::Null)) {
+            return Ok(Bson::Null);
+        }
+        let oid = self.oid_arg(args.first());
+        let table = self.visibility_table(catalog, name_col, ns_col, extra);
+        let Some((name, schema, same)) = table.by_oid.get(&oid) else {
+            return Ok(Bson::Null);
+        };
+        let holders = table.by_name.get(&(name.clone(), same.clone()));
+        Ok(Bson::Boolean(self.object_visible(schema, |s| {
+            holders.is_some_and(|h| h.iter().any(|x| x == s))
+        })))
     }
 }

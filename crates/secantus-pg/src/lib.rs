@@ -27448,6 +27448,9 @@ impl PgHandler {
         if name == "pg_describe_object" {
             return self.within_block(|| self.describe_object_call(args));
         }
+        if objaddr::VISIBILITY_FUNCTIONS.contains(&name) {
+            return self.is_visible_call(name, args);
+        }
         if name == "pg_blocking_pids" {
             // PostgreSQL 15: the int4[] of sessions holding what the given
             // backend waits on — empty for an idle one. Read off the shared

@@ -130,7 +130,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "the visibility functions of an oid that names nothing": (
         "RP-210",
-        True,
+        False,
         [
             "select pg_table_is_visible(1), pg_type_is_visible(1), pg_function_is_visible(1), "
             "pg_operator_is_visible(1), pg_opclass_is_visible(1), pg_opfamily_is_visible(1), "
