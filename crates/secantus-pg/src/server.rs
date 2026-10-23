@@ -503,7 +503,30 @@ impl ServerOptions {
 
     /// The `pg_hba.conf` and what it needs, checked against the options it
     /// replaces.
-    fn hba_files(&self) -> io::Result<Option<crate::hba::HbaFiles>> {
+    fn hba_files(&self, data_dir: &std::path::Path) -> io::Result<Option<crate::hba::HbaFiles>> {
+        // Without `--hba-file`, the data directory's `pg_hba.conf` and
+        // `pg_ident.conf` when the store has them, as PostgreSQL reads them
+        // by default (Joe, 2026-10-23); without either, the options' rules.
+        let default_hba = data_dir.join("pg_hba.conf");
+        let default_ident = data_dir.join("pg_ident.conf");
+        let defaulted;
+        let options = if self.hba_file.is_none() && default_hba.exists() {
+            defaulted = ServerOptions {
+                hba_file: Some(default_hba),
+                ident_file: self
+                    .ident_file
+                    .clone()
+                    .or_else(|| default_ident.exists().then_some(default_ident)),
+                ..self.clone()
+            };
+            &defaulted
+        } else {
+            self
+        };
+        options.hba_files_given()
+    }
+
+    fn hba_files_given(&self) -> io::Result<Option<crate::hba::HbaFiles>> {
         let Some(hba_file) = &self.hba_file else {
             if self.ident_file.is_some() {
                 return Err(io::Error::new(
@@ -560,7 +583,7 @@ pub fn bind_with(
     // The server's start, as `pg_postmaster_start_time()` reports it.
     secantus_pgplan::scalar::postmaster_start();
     let live = Arc::new(crate::live::Live {
-        hba: match options.hba_files()? {
+        hba: match options.hba_files(&crate::alter_system::data_directory(&storage))? {
             Some(files) => Some(crate::hba::LiveHba::new(files)?),
             None => None,
         },

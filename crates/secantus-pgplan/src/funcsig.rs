@@ -434,6 +434,36 @@ fn select_candidates<'a>(name: &str, args: &[String]) -> Option<Vec<&'a Sig>> {
 /// [`select_candidates`] does; then each unknown position takes the string
 /// category if any candidate offers it there, else the one category every
 /// candidate agrees on, keeping a preferred type where one is offered.
+/// The declared types of an `n`-argument call of a function whose one
+/// variadic overload ends in `"any"` (`concat`, `concat_ws`, `format`): the
+/// fixed parameters' types, then `any` for each variadic argument. `None`
+/// for any other function.
+pub(crate) fn variadic_any_args(name: &str, n: usize) -> Option<Vec<String>> {
+    let mut candidates = sigs()
+        .get(name)?
+        .iter()
+        .filter(|s| s.variadic && s.args.last().is_some_and(|a| a == "any"));
+    let s = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    let fixed = s.args.len() - 1;
+    if n < fixed {
+        return None;
+    }
+    Some(
+        (0..n)
+            .map(|i| {
+                if i < fixed {
+                    s.args[i].clone()
+                } else {
+                    "any".into()
+                }
+            })
+            .collect(),
+    )
+}
+
 /// `None` unless exactly one non-variadic, non-polymorphic overload is left.
 /// The concrete parameter types of the one polymorphic overload a call of
 /// constants reaches, the polymorphic ones fixed by its typed arguments

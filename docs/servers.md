@@ -140,7 +140,7 @@ reload.
 
 A password login over TLS is offered SCRAM channel binding
 (`SCRAM-SHA-256-PLUS`), so a client with `channel_binding=require` connects.
-Three more options stand in for the `pg_hba.conf` this server does not have.
+Three more options stand in for a `pg_hba.conf`, for a server that has none.
 Channel binding and these options are in 0.1.0-beta.10 and later.
 
 | Option | What it does | PostgreSQL's equivalent |
@@ -248,6 +248,16 @@ With a file, a role that has no password cannot pass a `scram-sha-256` line,
 and a user name with no role is refused, both as on PostgreSQL. The file is
 read again on SIGHUP and on `select pg_reload_conf()`; one that cannot be
 read leaves the old one in force.
+
+Without `--hba-file`, a `pg_hba.conf` in the data directory (the store's
+directory) is read in its place, with the `pg_ident.conf` beside it, as
+PostgreSQL reads its default files; `SHOW hba_file` and `ident_file` name
+them. A store with no such file is served by the options above.
+
+The data directory's `postgresql.conf`, when it has one, is read too, with
+what its `include`, `include_if_exists` and `include_dir` lines name, below
+the `postgresql.auto.conf` that `ALTER SYSTEM` writes. `pg_file_settings`
+lists both, and `select pg_reload_conf()` puts a change in force.
 
 A line this server cannot apply stops it from starting, with the line's
 number, so that no rule is silently skipped: a method that needs a service

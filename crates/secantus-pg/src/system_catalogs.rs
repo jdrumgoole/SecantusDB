@@ -39,7 +39,6 @@ const EMPTY: &[(&str, &str)] = &[
         "pg_shseclabel",
         "SECURITY LABEL: no label provider is loaded",
     ),
-    ("pg_parameter_acl", "GRANT ... ON PARAMETER"),
     ("pg_replication_origin", "pg_replication_origin_create()"),
     ("pg_subscription", "CREATE SUBSCRIPTION"),
     ("pg_subscription_rel", "CREATE SUBSCRIPTION"),
@@ -79,6 +78,7 @@ const STATEFUL: &[&str] = &[
     "pg_hba_file_rules",
     "pg_ident_file_mappings",
     "pg_file_settings",
+    "pg_parameter_acl",
     "pg_config",
     "pg_statistic",
 ];
@@ -251,6 +251,7 @@ impl PgHandler {
             "pg_config" => self.pg_config_rows(def),
             "pg_statistic" => self.pg_statistic_rows(def),
             "pg_file_settings" => self.file_setting_rows(def),
+            "pg_parameter_acl" => self.parameter_acl_rows(def),
             // Recovery conflicts arise only on a standby: every database's
             // counts are zero on a primary.
             "pg_stat_database_conflicts" => {
@@ -512,6 +513,16 @@ impl PgHandler {
                 .flatten()
             {
                 push(0, 1262, db.oid, o, "o");
+            }
+        }
+        // A parameter's grants name their grantees and grantors.
+        let mut seen = Vec::new();
+        for (oid, _, role) in self.parameter_acl_roles() {
+            if let Some(o) = role_oid(&role) {
+                if !seen.contains(&(oid, o)) {
+                    seen.push((oid, o));
+                    push(0, parameter_acl::PG_PARAMETER_ACL, oid, o, "a");
+                }
             }
         }
         // pg_shdepend is shared: every database's objects, each read as a

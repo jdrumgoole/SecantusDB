@@ -59,13 +59,113 @@ pub(crate) fn pg15_settings() -> &'static [Pg15Setting] {
     })
 }
 
+/// The rows the dump leaves out because their values are the machine's
+/// (the paths, the port and the log zone), as PostgreSQL 15.19 describes
+/// them; their values are the server's own (measured on a fresh cluster).
+const UNDUMPED: [Pg15Setting; 7] = [
+    file_location("config_file", "Sets the server's main configuration file."),
+    file_location("data_directory", "Sets the server's data directory."),
+    file_location("hba_file", "Sets the server's \"hba\" configuration file."),
+    file_location(
+        "ident_file",
+        "Sets the server's \"ident\" configuration file.",
+    ),
+    Pg15Setting {
+        name: "log_timezone",
+        show: "GMT",
+        setting: "GMT",
+        unit: "",
+        category: "Reporting and Logging / What to Log",
+        short_desc: "Sets the time zone to use in log messages.",
+        context: "sighup",
+        vartype: "string",
+        min_val: "",
+        max_val: "",
+        boot_val: "GMT",
+        enumvals: "",
+    },
+    Pg15Setting {
+        name: "port",
+        show: "5432",
+        setting: "5432",
+        unit: "",
+        category: "Connections and Authentication / Connection Settings",
+        short_desc: "Sets the TCP port the server listens on.",
+        context: "postmaster",
+        vartype: "integer",
+        min_val: "1",
+        max_val: "65535",
+        boot_val: "5432",
+        enumvals: "",
+    },
+    Pg15Setting {
+        name: "unix_socket_directories",
+        show: "/tmp",
+        setting: "/tmp",
+        unit: "",
+        category: "Connections and Authentication / Connection Settings",
+        short_desc: "Sets the directories where Unix-domain sockets will be created.",
+        context: "postmaster",
+        vartype: "string",
+        min_val: "",
+        max_val: "",
+        boot_val: "/tmp",
+        enumvals: "",
+    },
+];
+
+/// A `File Locations` row: a postmaster string with no boot value.
+const fn file_location(name: &'static str, short_desc: &'static str) -> Pg15Setting {
+    Pg15Setting {
+        name,
+        show: "",
+        setting: "",
+        unit: "",
+        category: "File Locations",
+        short_desc,
+        context: "postmaster",
+        vartype: "string",
+        min_val: "",
+        max_val: "",
+        boot_val: "",
+        enumvals: "",
+    }
+}
+
 /// The PostgreSQL 15 row for `name` (settings are keyed as `canonical_setting`
 /// spells them; the dump's names compare case-insensitively).
 pub(crate) fn pg15_setting(name: &str) -> Option<&'static Pg15Setting> {
     pg15_settings()
         .iter()
+        .chain(UNDUMPED.iter())
         .find(|s| s.name.eq_ignore_ascii_case(name))
 }
+
+/// The parameters only a superuser or a member of `pg_read_all_settings`
+/// may read (`GUC_SUPERUSER_ONLY`; measured on 15.19).
+pub(crate) const SUPERUSER_ONLY: [&str; 21] = [
+    "config_file",
+    "data_directory",
+    "dynamic_library_path",
+    "external_pid_file",
+    "hba_file",
+    "ident_file",
+    "jit_provider",
+    "krb_server_keyfile",
+    "log_directory",
+    "log_filename",
+    "output_plugin_libraries",
+    "primary_conninfo",
+    "session_preload_libraries",
+    "shared_preload_libraries",
+    "ssl_ciphers",
+    "ssl_dh_params_file",
+    "ssl_ecdh_curve",
+    "ssl_max_protocol_version",
+    "ssl_min_protocol_version",
+    "ssl_passphrase_command",
+    "unix_socket_directories",
+];
 
 #[cfg(test)]
 mod tests {

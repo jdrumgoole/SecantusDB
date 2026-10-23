@@ -895,6 +895,8 @@ pub enum Statement {
         all_in_schema: bool,
         grantees: Vec<String>,
         grant_option: bool,
+        /// `REVOKE ... CASCADE`: what the grantees granted on goes too.
+        cascade: bool,
     },
     /// `GRANT role TO member` / `REVOKE role FROM member`.
     GrantRole {
@@ -7458,6 +7460,7 @@ fn ruleutils_default(node: &pg_query::protobuf::Node) -> Option<String> {
                     .and_then(|t| {
                         crate::funcsig::selected_args(&name, &t)
                             .or_else(|| crate::funcsig::resolved_args(&name, &t))
+                            .or_else(|| crate::funcsig::variadic_any_args(&name, t.len()))
                     });
                 let args: Option<Vec<String>> = f
                     .args
@@ -19977,6 +19980,7 @@ fn plan_grant(g: &pg_query::protobuf::GrantStmt) -> Result<Statement> {
         Ok(O::ObjectForeignServer) => "foreign server",
         Ok(O::ObjectFdw) => "foreign data wrapper",
         Ok(O::ObjectLargeobject) => "large object",
+        Ok(O::ObjectParameterAcl) => "parameter",
         _ => return Err(Error::Unsupported("GRANT on this kind of object".into())),
     };
     let all_in_schema = T::try_from(g.targtype) == Ok(T::AclTargetAllInSchema);
@@ -20065,6 +20069,8 @@ fn plan_grant(g: &pg_query::protobuf::GrantStmt) -> Result<Statement> {
         all_in_schema,
         grantees,
         grant_option: g.grant_option,
+        cascade: pg_query::protobuf::DropBehavior::try_from(g.behavior)
+            == Ok(pg_query::protobuf::DropBehavior::DropCascade),
     })
 }
 
@@ -38287,7 +38293,10 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 }
             } else if matches!(
                 name.as_str(),
-                "has_schema_privilege" | "has_sequence_privilege" | "has_function_privilege"
+                "has_schema_privilege"
+                    | "has_sequence_privilege"
+                    | "has_function_privilege"
+                    | "has_parameter_privilege"
             ) && correlated::executor_hook_installed()
             {
                 // Schemas, sequences and functions carry ACLs the executor

@@ -6,7 +6,8 @@ building it -- and the gap tests of what it filed open (RP-165, RP-168).
 
 A scenario is a list of statements, each run in a named autocommit
 connection: `a` unless the statement starts `@name `; `@open name k=v`
-opens connection `name` with those options. An answer is a statement's
+opens connection `name` with those options, and `@sleep` waits for a
+reload to reach every PostgreSQL backend. An answer is a statement's
 rows, its command tag, or `("ERR", sqlstate, message, hint)`; a statement
 prefixed `!` adds its error's DETAIL, and one prefixed `~` is answered with
 the notices it raised (message, then DETAIL). The expected answers were
@@ -23,6 +24,7 @@ server starts elsewhere (RP-137).
 from __future__ import annotations
 
 import sys
+import time
 from typing import Any
 
 import psycopg
@@ -61,6 +63,9 @@ def run_scenario(dsn: str, statements: list[str]) -> list[Any]:
     out: list[Any] = []
     try:
         for s in statements:
+            if s == "@sleep":
+                time.sleep(0.5)
+                continue
             if s.startswith("@open "):
                 _, name, *options = s.split(" ", 2)
                 conn(name, " ".join(options))
@@ -289,7 +294,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # --------------------------------- RP-168 an "any" argument's literal
     'a default\'s literal for an "any" argument is bare': (
         "RP-168",
-        True,
+        False,
         [
             "create table rp34_y (b text default concat('a', 1))",
             "select pg_get_expr(adbin, adrelid) from pg_attrdef where adrelid = 'rp34_y'::regclass",

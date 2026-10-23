@@ -85,7 +85,9 @@ is, and a connection no line matches is refused. It reads `host`,
 `hostssl` and `hostnossl`; the `trust`, `reject`, `scram-sha-256`, `md5`,
 `password` and `cert` methods; `clientcert=`, `clientname=` and `map=` (with
 `--ident-file`). A line it cannot apply, such as an `ldap` method, stops
-the server from starting.
+the server from starting. Without `--hba-file`, a `pg_hba.conf` (and
+`pg_ident.conf`) in the data directory is read instead, as PostgreSQL reads
+its default files.
 
 A user name there is no role for is refused, as PostgreSQL refuses a role
 that does not exist: it is asked for a password and none it gives is right.

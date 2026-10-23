@@ -174,6 +174,17 @@ impl PgHandler {
                 },
             );
         }
+        for acl in self.parameter_acls() {
+            out.insert(
+                (parameter_acl::PG_PARAMETER_ACL, acl.oid),
+                ObjectName {
+                    description: format!("parameter {}", acl.name),
+                    keyword: "PARAMETER",
+                    sql: acl.name.clone(),
+                    drop_rank: 0,
+                },
+            );
+        }
         for db in self.databases.all(&self.storage)? {
             out.insert(
                 (PG_DATABASE, db.oid),
