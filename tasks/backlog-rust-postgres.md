@@ -406,9 +406,11 @@ one beside it.
   - A table whose rows are not text, bytea or fixed width (numeric, arrays,
     json): its heap pages are taken at the estimated density.
   - DISTINCT ON, and a citext DISTINCT, which PostgreSQL sorts.
-  - The heap's order after UPDATE or DELETE (rows the hash table reads in
-    another order). The size CREATE INDEX records and what ANALYZE
-    stores are modelled (`__sql_relstats__`), but not REINDEX's,
+  - A bitmap heap scan's order after a HOT UPDATE: PostgreSQL reaches the
+    new version through its chain's root and reads it at the root's place
+    (`select id from t where id > 0` over a primary key reads rows 3, 1, 2
+    where this server, reading in ctid order, returns 3, 2, 1). The size
+    CREATE INDEX records and what ANALYZE stores are modelled (`__sql_relstats__`), but not REINDEX's,
     CLUSTER's or an ALTER TABLE that builds an index, nor across RENAME.
     Declined over an analysed table, keeping the old order: a range over
     a column that is not an integer (a text histogram is in the
@@ -530,7 +532,7 @@ one beside it.
     than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_left_join_whose_nullable_side_holds_a_left_join_is_searched
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_left_join_whose_nullable_side_holds_a_left_join_is_searched, tests/backlog/test_rp_batch47.py::test_scenario[a bitmap heap scan reads a HOT-updated row at its root]
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
@@ -766,30 +768,44 @@ fixed in the same batch; their tests there are regression tests.
       Backlog-ID: RP-137
       Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order], tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]
 
+## Found by batch 48 (2026-10-23)
+
+Found while building VACUUM and the free space map (RP-193). The gap tests
+are scenarios in `tests/backlog/test_rp_batch48.py`, measured on a private
+15.19 cluster. RP-195 (`pg_relation_size`) was found and fixed in the same
+batch; its test there is a regression test.
+
+- [ ] **`pg_class` shows no page or tuple counts.** `relpages`,
+      `reltuples` and `relallvisible` read 0, -1 and 0 for every table,
+      whatever VACUUM, ANALYZE or CREATE INDEX recorded
+      (`catalog_fill.rs`). PostgreSQL 15.19 shows what they measured: 200
+      rows of 140 bytes vacuumed are `4 | 200 | 4`, and after half are
+      deleted and vacuumed again `4 | 100`. What VACUUM counts is now the
+      heap's own (`heap_page.rs`): its pages and live tuples.
+      Backlog-ID: RP-196
+      Verify: tests/backlog/test_rp_batch48.py::test_scenario[pg_class shows what VACUUM counted]
+
 ## Found by batch 46 (2026-10-23)
 
 Found while building the system columns (RP-069). The gap tests are
 scenarios in `tests/backlog/test_rp_batch46.py`, measured on a private 15.19
-cluster. RP-194 was found and fixed in the same batch, and RP-192 in batch
-47; their tests there are regression tests. RP-193's HOT scenario is in
-`tests/backlog/test_rp_batch47.py`.
+cluster. RP-194 was found and fixed in the same batch, RP-192 in batch 47
+and most of RP-193 in batch 48; their tests there are regression tests.
 
-- [ ] **VACUUM frees no tuple's place.** A plain VACUUM here records its
-      statistics but leaves a dead tuple's space and line pointer taken, so
-      the next INSERT goes after it; PostgreSQL 15.19's VACUUM frees both,
-      and the next row takes `(0,1)` again (the free space map, line pointer
-      reuse). HOT pruning, which reclaims a page's dead tuples when it fills
-      during an UPDATE, is not modelled either. And the reverse after a
-      restart: the heap's free space is kept in the server process
-      (`heap.rs`) and derived from the live rows' ctids when a process first
-      touches a table, so a dead tuple's space is free again after a
-      restart, where PostgreSQL keeps it until VACUUM. A HOT update's new
-      version is reached through its chain's root, so a bitmap heap scan
-      (PostgreSQL's plan for a primary-key range) reads it at the root's
-      place: rows 3, 1, 2 at (0,1), (0,2) -> (0,4), (0,3) come back 3, 1, 2,
-      where this server, reading in ctid order, returns 3, 2, 1.
+- [ ] **A heap's dead tuples, free space map and target blocks are lost
+      on a restart.** The heap is modelled as PostgreSQL 15.19 keeps it
+      (`crates/secantus-pg/src/heap_page.rs`, `fsm.rs`; batch 48): HOT
+      chains, on-access pruning, VACUUM's passes, the free space map and
+      each backend's target block. But it is kept in the server process,
+      and after a restart it is derived from the live rows' ctids. Every
+      place no row holds is then a dead line pointer with no storage: a HOT
+      chain's dead root, which PostgreSQL's VACUUM leaves a redirect, is
+      made unused and reused; a dead tuple's space is free before any
+      VACUUM; and the free space map is empty. PostgreSQL keeps all three
+      on disk. The fix is persisting the heap (and FSM) state beside the
+      rows.
       Backlog-ID: RP-193
-      Verify: tests/backlog/test_rp_batch46.py::test_scenario[VACUUM frees a dead tuple's place], tests/backlog/test_rp_batch47.py::test_scenario[a bitmap heap scan reads a HOT-updated row at its root]
+      Verify: tests/backlog/test_rp_batch48.py::test_a_dead_tuple_outlives_a_restart
 
 ## Found by batch 34 (2026-10-23)
 

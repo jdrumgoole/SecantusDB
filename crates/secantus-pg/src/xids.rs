@@ -55,6 +55,10 @@ struct Cluster {
     /// Each running transaction's command counter: `(current command id,
     /// whether a row write used it)`. PostgreSQL's `currentCommandId`.
     commands: HashMap<i32, (u32, bool)>,
+    /// The xmin of the snapshot a REPEATABLE READ or SERIALIZABLE
+    /// transaction keeps (`MyProc->xmin`), by backend: what it may still
+    /// read holds back the removal horizon.
+    snapshots: HashMap<i32, u64>,
 }
 
 /// The clusters by their store's address.
@@ -140,6 +144,7 @@ pub fn install(storage: &Arc<Storage>) -> Result<(), String> {
             latest_completed: next - 1,
             running: HashMap::new(),
             commands: HashMap::new(),
+            snapshots: HashMap::new(),
         },
     );
     secantus_pgplan::snapshots::set_xid_hook(answer);
@@ -203,6 +208,7 @@ pub fn end(storage: &Arc<Storage>, pid: i32) {
             c.latest_completed = c.latest_completed.max(xid);
         }
         c.commands.remove(&pid);
+        c.snapshots.remove(&pid);
     }
 }
 
@@ -217,6 +223,42 @@ pub fn running() -> Vec<(i32, u64)> {
         .unwrap_or_default();
     out.sort_unstable();
     out
+}
+
+/// `pid`'s transaction keeps the snapshot it is taking now (REPEATABLE
+/// READ, SERIALIZABLE): its xmin -- the oldest xid another session still
+/// runs, or one past the latest completed -- is held until the transaction
+/// ends. A snapshot already held is kept.
+pub fn hold_snapshot(storage: &Arc<Storage>, pid: i32) {
+    let mut all = clusters().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = all.get_mut(&key(storage)) {
+        let xmin = c
+            .running
+            .iter()
+            .filter(|(p, _)| **p != pid)
+            .map(|(_, x)| *x)
+            .min()
+            .unwrap_or(c.latest_completed + 1);
+        c.snapshots.entry(pid).or_insert(xmin);
+    }
+}
+
+/// The removal horizon (`GlobalVisState`'s): the oldest xid a running
+/// transaction holds, or a kept snapshot's xmin, or else one past the
+/// latest completed. A tuple deleted by a transaction before it no running
+/// transaction can see.
+pub fn horizon() -> u64 {
+    let all = clusters().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(c) = all.get(&CURRENT.with(Cell::get)) else {
+        return u64::from(FROZEN_XID) + 1;
+    };
+    c.running
+        .values()
+        .chain(c.snapshots.values())
+        .copied()
+        .min()
+        .unwrap_or(c.latest_completed + 1)
+        .min(c.latest_completed + 1)
 }
 
 /// The command id a row write of `pid`'s transaction stamps (`cmin`): its

@@ -476,10 +476,12 @@ impl PgHandler {
         // An unordered scan of a heap whose tuples have moved reads them in
         // ctid order, as a sequential scan does (RP-192): sorted in bounded
         // memory like any ORDER BY.
-        if order.is_empty()
-            && self.heap_scan_disordered(&sel.table)
-            && self.collection_scan(&sel.table, &sel.filter)
-        {
+        let seq = self.collection_scan(&sel.table, &sel.filter);
+        // A sequential scan prunes the pages it reads (RP-193).
+        if seq && !in_block {
+            self.prune_pages(&sel.table, None)?;
+        }
+        if order.is_empty() && seq && self.heap_scan_disordered(&sel.table) {
             order.push(crate::heap::ctid_order_key());
         }
         let source: futures::stream::BoxStream<'static, PgWireResult<Vec<Document>>> = if in_block {

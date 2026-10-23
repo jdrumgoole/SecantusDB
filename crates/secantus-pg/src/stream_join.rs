@@ -360,9 +360,14 @@ impl PgHandler {
         filter: &Document,
         sink: &mut dyn FnMut(Vec<Vec<u8>>) -> PgWireResult<bool>,
     ) -> PgWireResult<()> {
+        let seq = self.collection_scan(table, filter);
+        // A sequential scan prunes the pages it reads (RP-193).
+        if seq {
+            self.prune_pages(table, None)?;
+        }
         // A heap whose tuples have moved is read in ctid order, as a
         // sequential scan reads it (RP-192): sorted in bounded memory.
-        if self.heap_scan_disordered(table) && self.collection_scan(table, filter) {
+        if seq && self.heap_scan_disordered(table) {
             let mut failed: Option<PgWireError> = None;
             let sorted = crate::external_sort::sort_runs_with(
                 |sorter| {

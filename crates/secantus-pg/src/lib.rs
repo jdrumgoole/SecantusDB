@@ -60,10 +60,12 @@ mod explain;
 mod expr_index;
 mod external_sort;
 mod fdw;
+mod fsm;
 mod grace_join;
 mod guc_values;
 mod hba;
 mod heap;
+mod heap_page;
 mod ident;
 mod info_columns;
 mod join_order;
@@ -6276,7 +6278,7 @@ impl PgHandler {
             .storage
             .find_matching(self.db(), table, &Document::new())
             .map_err(|e| Self::storage_err("could not read", e))?;
-        self.in_scan_order(table, &Document::new(), raw)
+        self.in_scan_order(table, &Document::new(), raw)?
             .iter()
             .map(|b| decode_doc(b).map_err(|e| Self::storage_err("could not decode a row", e)))
             .collect()
@@ -6310,24 +6312,48 @@ impl PgHandler {
                 },
             );
             if let Some(rows) = rows {
-                return Ok(self.in_scan_order(table, filter, rows));
+                return self.in_scan_order(table, filter, rows);
             }
         }
         let rows = self
             .storage
             .find_matching(self.db(), table, filter)
             .map_err(|e| Self::storage_err("could not read", e))?;
-        Ok(self.in_scan_order(table, filter, rows))
+        self.in_scan_order(table, filter, rows)
     }
 
     /// `rows` in the order PostgreSQL's scan returns them: a sequential
     /// scan reads the heap in ctid order (RP-192); an index scan keeps the
     /// index's.
-    fn in_scan_order(&self, table: &str, filter: &Document, rows: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
-        if self.heap_scan_disordered(table) && self.collection_scan(table, filter) {
-            return heap::in_ctid_order(rows);
+    fn in_scan_order(
+        &self,
+        table: &str,
+        filter: &Document,
+        rows: Vec<Vec<u8>>,
+    ) -> PgWireResult<Vec<Vec<u8>>> {
+        let seq = self.collection_scan(table, filter);
+        // The pages the scan met are pruned as it reads them (RP-193): a
+        // sequential scan's every page, an index scan's rows' pages.
+        if seq {
+            self.prune_pages(table, None)?;
+        } else if self.has_heap(table) {
+            let ctids: Vec<i64> = rows
+                .iter()
+                .filter_map(|b| {
+                    bson::RawDocument::from_bytes(b)
+                        .ok()?
+                        .get_i64("__sys_ctid")
+                        .ok()
+                })
+                .collect();
+            if !ctids.is_empty() {
+                self.prune_pages(table, Some(&ctids))?;
+            }
         }
-        rows
+        if seq && self.heap_scan_disordered(table) {
+            return Ok(heap::in_ctid_order(rows));
+        }
+        Ok(rows)
     }
 
     /// Does the storage answer `filter` over `table` by a collection scan?
@@ -16751,9 +16777,11 @@ impl PgHandler {
         }
     }
 
-    /// The storage-size functions. Sizes are this store's, not PostgreSQL's
-    /// page arithmetic: a relation's rows' encoded bytes rounded up to 8 kB
-    /// pages (0 when empty), each index one page per 8 kB of its table.
+    /// The storage-size functions. A table's main fork is its heap's pages
+    /// (`heap.rs`, RP-195), as PostgreSQL's is; an index is one page per
+    /// 16 kB of its table's rows' encoded bytes, and a database the sum of
+    /// its tables' encoded bytes in 8 kB pages, neither of which follows
+    /// PostgreSQL's page arithmetic.
     fn size_call(&self, name: &str, args: &[Bson]) -> PgWireResult<Bson> {
         const PAGE: i64 = 8192;
         let pages = |bytes: i64| (bytes + PAGE - 1) / PAGE * PAGE;
@@ -16803,17 +16831,19 @@ impl PgHandler {
         let Some(rel) = relation(args.first().unwrap_or(&Bson::Null))? else {
             return Ok(Bson::Null);
         };
-        let heap = if self.lookup(&rel).is_some() && Self::virtual_table(&rel).is_none() {
-            pages(table_bytes(&rel)?)
+        let stored = self.lookup(&rel).is_some() && Self::virtual_table(&rel).is_none();
+        let heap = if self.has_heap(&rel) {
+            i64::from(self.heap_blocks(&rel)?) * PAGE
         } else {
             0
         };
+        let encoded = if stored { pages(table_bytes(&rel)?) } else { 0 };
         let index_count = self
             .index_relations()
             .iter()
             .filter(|ix| ix.table.name == rel)
             .count() as i64;
-        let indexes = index_count * pages(heap.max(PAGE) / 2);
+        let indexes = index_count * pages(encoded.max(PAGE) / 2);
         // A table with a TOASTable column has a TOAST table, whose index is
         // one page even when empty; `pg_table_size` counts it.
         let toast = match self.lookup(&rel) {
@@ -24276,6 +24306,7 @@ impl Drop for PgHandler {
         table_locks::release(pid);
         row_waits::forget(pid);
         xids::end(&self.storage, pid);
+        heap::forget_backend(pid);
         if pid != 0 {
             backend_registry()
                 .lock()
@@ -26209,8 +26240,9 @@ impl PgHandler {
     /// never written. Inside a block the block's transaction already covers it.
     fn replace_table_rows(&self, table: &str, rows: Vec<Vec<u8>>) -> PgWireResult<()> {
         let run = || -> PgWireResult<()> {
-            self.storage
-                .delete_matching(
+            // The old heap's rows, not dead tuples of the new one.
+            heap::without_dead_tuples(|| {
+                self.storage.delete_matching(
                     self.db(),
                     table,
                     &Document::new(),
@@ -26218,7 +26250,8 @@ impl PgHandler {
                     &Document::new(),
                     None,
                 )
-                .map_err(|e| Self::storage_err("could not clear the table", e))?;
+            })
+            .map_err(|e| Self::storage_err("could not clear the table", e))?;
             if !rows.is_empty() {
                 self.insert_checked(table, rows.clone(), "could not rewrite the table")?;
             }
@@ -29791,6 +29824,14 @@ impl PgHandler {
                 .map(String::as_str),
             None | Some("read committed" | "read uncommitted")
         );
+        if !read_committed {
+            // The snapshot the first statement takes is the transaction's,
+            // and holds back what VACUUM may remove (RP-193).
+            xids::hold_snapshot(
+                &self.storage,
+                self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        }
         if read_committed {
             let refreshed = self
                 .storage
@@ -33895,6 +33936,24 @@ impl PgHandler {
             _ => None,
         };
         let command_ids = heap::command_ids(&stmt);
+        // The heap a row write reads and leaves (RP-069, RP-193): the pages
+        // a sequential scan meets are pruned as it reads them, and the rows
+        // a delete removes are its dead tuples.
+        let (scanned, delete_target) = match &stmt {
+            Statement::Update(u) => (Some((u.table.clone(), u.filter.clone())), None),
+            Statement::Delete(d) => (
+                Some((d.table.clone(), d.filter.clone())),
+                Some(d.table.clone()),
+            ),
+            Statement::Merge(m) => (None, Some(m.target.clone())),
+            _ => (None, None),
+        };
+        if let Some((table, filter)) = &scanned {
+            if self.collection_scan(table, filter) {
+                self.prune_pages(table, None)?;
+            }
+        }
+        let delete_mark = self.watch_deletes(delete_target.as_deref());
         let mut out = {
             struct Running<'a>(Option<&'a std::sync::atomic::AtomicUsize>);
             impl Drop for Running<'_> {
@@ -33911,6 +33970,11 @@ impl PgHandler {
             }));
             self.with_event_triggers(stmt, |stmt| self.execute_inner(stmt, max_rows))
         };
+        match self.note_deleted(delete_mark) {
+            Err(e) if out.is_ok() => out = Err(e),
+            Err(e) => eprintln!("secantusd-pg: recording a failed statement's deletes: {e:?}"),
+            Ok(()) => {}
+        }
         // The command ids it consumed (`cmin` / `cmax`, RP-069).
         if out.is_ok() {
             xids::advance_command(
@@ -38172,10 +38236,13 @@ impl PgHandler {
                             continue;
                         }
                         if command == "VACUUM" {
+                            // The heap's dead tuples removed (RP-193).
+                            self.vacuum_heap(t)?;
                             self.record_vacuum(t)?;
                         }
                         if analyze {
                             self.record_analyze(t, columns)?;
+                            self.heap_invalidate(t)?;
                         }
                     }
                 }
@@ -39381,15 +39448,16 @@ impl PgHandler {
                 }
                 for table in &tables {
                     // A partition's rows are in its tree's root.
+                    // A new relation file: the rows are not dead tuples.
                     if let Some(def) = self
                         .lookup(table)
                         .filter(|d| partition::parent_of(d).is_some())
                     {
-                        self.delete_partition_rows(&def)?;
+                        heap::without_dead_tuples(|| self.delete_partition_rows(&def))?;
                         continue;
                     }
-                    self.storage
-                        .delete_matching(
+                    heap::without_dead_tuples(|| {
+                        self.storage.delete_matching(
                             self.db(),
                             table,
                             &Document::new(),
@@ -39397,7 +39465,8 @@ impl PgHandler {
                             &Document::new(),
                             None,
                         )
-                        .map_err(|e| Self::storage_err("could not truncate", e))?;
+                    })
+                    .map_err(|e| Self::storage_err("could not truncate", e))?;
                 }
                 if restart_identity {
                     self.restart_owned_sequences(&tables)?;
@@ -39530,14 +39599,14 @@ impl PgHandler {
         if !has_expr && !versioned {
             return self.update_rows_raw(table, filter, set, unset);
         }
-        let before: Vec<(Bson, Option<i64>)> = self
+        let before: Vec<(Bson, Document)> = self
             .storage
             .find_matching(self.db(), table, filter)
             .map_err(|e| Self::storage_err("could not read", e))?
             .iter()
             .filter_map(|raw| {
                 let d = decode_doc(raw).ok()?;
-                Some((d.get("_id").cloned()?, heap::ctid_of(&d)))
+                Some((d.get("_id").cloned()?, d))
             })
             .collect();
         let matched = self.update_rows_raw(table, filter, set, unset)?;
@@ -39555,12 +39624,12 @@ impl PgHandler {
     }
 
     /// Updated rows' new versions: each one's xid, command and place, from
-    /// its old place (`before`: `(_id, old ctid)`).
+    /// its old version (`before`: `(_id, old row)`).
     fn restamp_updated(
         &self,
         table: &str,
         def: &TableDef,
-        before: &[(Bson, Option<i64>)],
+        before: &[(Bson, Document)],
     ) -> PgWireResult<()> {
         let ids: Vec<Bson> = before.iter().map(|(id, _)| id.clone()).collect();
         let rows: Vec<Document> = self
@@ -39571,12 +39640,12 @@ impl PgHandler {
             .filter_map(|raw| decode_doc(raw).ok())
             .collect();
         // In the order the update met them.
-        let mut versions: Vec<(Option<i64>, Document)> = before
+        let mut versions: Vec<(Option<Document>, Document)> = before
             .iter()
             .filter_map(|(id, old)| {
                 rows.iter()
                     .find(|r| r.get("_id") == Some(id))
-                    .map(|r| (*old, r.clone()))
+                    .map(|r| (Some(old.clone()), r.clone()))
             })
             .collect();
         self.stamp_updated(table, def, &mut versions)?;
@@ -40006,7 +40075,7 @@ impl PgHandler {
                 )
                 .map_err(|e| Self::storage_err("could not update", e))?;
             // The new version's place, from the old one's (RP-069).
-            let mut versions = vec![(heap::ctid_of(old), new.clone())];
+            let mut versions = vec![(Some(old.clone()), new.clone())];
             self.stamp_updated(table, def, &mut versions)?;
             let new = &versions[0].1;
             let bytes =

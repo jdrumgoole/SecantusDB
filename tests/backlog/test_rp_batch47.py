@@ -1,8 +1,9 @@
 """Batch 47 of the Rust PG server (2026-10-23): the regression tests of
 RP-192 (a sequential scan reads rows in ctid order; its first test is
 `test_rp_batch46.py::test_scenario[a scan reads rows in ctid order]`), and
-a gap test of RP-193 found with them: a bitmap heap scan over a HOT-updated
-row reads it at its chain's root.
+a gap test found with them: a bitmap heap scan over a HOT-updated row reads
+it at its chain's root (filed under RP-193, now RP-028's: the order of the
+plan PostgreSQL picks).
 
 The scenarios run as `test_rp_batch34.py`'s do. The expected answers were
 measured on a private, freshly initdb'd PostgreSQL 15.19 cluster by running
@@ -81,9 +82,9 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
             "drop table rp47_t",
         ],
     ),
-    # ------------------------- RP-193 a HOT chain is read at its root's place
+    # ------------------------- RP-028 a HOT chain is read at its root's place
     "a bitmap heap scan reads a HOT-updated row at its root": (
-        "RP-193",
+        "RP-028",
         True,
         [
             "create table rp47_h (id int primary key, v text)",

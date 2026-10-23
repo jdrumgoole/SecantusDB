@@ -12,29 +12,31 @@
 //! with a 24-byte header, each tuple taking its MAXALIGNed length
 //! (`heap_compute_data_size`: a 23-byte header plus null bitmap, then each
 //! attribute at its type's alignment, a varlena of up to 126 bytes with a
-//! one-byte header and no alignment) and a 4-byte line pointer. An INSERT
-//! goes on the last page while it fits, else a new one; an UPDATE's new
-//! version on its old page while it fits there, else the same way. Space a
-//! DELETE or UPDATE leaves is not reused (no VACUUM runs here), and a
-//! TRUNCATE starts the heap again. Each table's pages -- free bytes and next
-//! line pointer -- are kept in this process, keyed by the store and the
+//! one-byte header and no alignment) and a 4-byte line pointer. The pages,
+//! the free space map and their rules are [`crate::heap_page`] and
+//! [`crate::fsm`] (RP-193): a new tuple goes where `RelationGetBufferForTuple`
+//! puts it, an UPDATE's new version on its old page while it fits there (a
+//! heap-only tuple when no indexed field changed), a page is pruned when a
+//! scan meets it short of space, and VACUUM removes what no snapshot can
+//! see. Deleted rows reach the heap through the store's delete observer;
+//! whether their deleter committed is settled from the store once it is
+//! older than every snapshot still held. A TRUNCATE starts the heap again.
+//! Each table's heap is kept in this process, keyed by the store and the
 //! table's oid (which a rename keeps and a new table never reuses), and
-//! derived from the rows' ctids when a process first touches the table.
+//! derived from the rows' ctids when a process first touches the table --
+//! so a restart loses the dead tuples, the free space map and the target
+//! blocks, which PostgreSQL keeps (RP-193).
 //!
 //! What is not modelled: TOAST (a tuple over 2 kB has its largest values
-//! moved out of line here, where PostgreSQL first compresses them), HOT
-//! pruning, and a fillfactor below 100.
+//! moved out of line here, where PostgreSQL first compresses them).
 
 use bson::{Bson, Document};
 use pgwire::error::PgWireResult;
 use secantus_pgcatalog::TableDef;
 
+use crate::heap_page::{tid, untid, Heap, Lp, Page, LINE_POINTER, PAGE_SPACE};
 use crate::PgHandler;
 
-const PAGE_SPACE: u32 = 8192 - 24;
-const LINE_POINTER: u32 = 4;
-/// `MaxHeapTuplesPerPage` for 8 kB pages.
-const MAX_TUPLES: u32 = 291;
 /// `TOAST_TUPLE_THRESHOLD`.
 const TOAST_THRESHOLD: usize = 2032;
 /// An out-of-line value's pointer (`TOAST_POINTER_SIZE`, short header).
@@ -213,62 +215,6 @@ pub(crate) fn tuple_len(def: &TableDef, doc: &Document) -> usize {
     maxalign(total)
 }
 
-/// One table's pages: `(free bytes, line pointers used)`, and the space a
-/// new tuple must leave free on a page (`fillfactor`). `disordered` once a
-/// tuple's place no longer follows the rows' stored order -- an UPDATE's new
-/// version, a rewrite -- so that a sequential scan must sort by ctid
-/// (RP-192); until then the stored order is the heap's.
-struct Heap {
-    pages: Vec<(u32, u32)>,
-    reserve: u32,
-    disordered: bool,
-}
-
-impl Heap {
-    fn fits(page: (u32, u32), need: u32) -> bool {
-        page.0 >= need + LINE_POINTER && page.1 < MAX_TUPLES
-    }
-
-    /// An INSERT's test: room for the tuple and the fillfactor's reserve
-    /// (`RelationGetBufferForTuple`'s `saveFreeSpace`).
-    fn fits_new(&self, page: (u32, u32), need: u32) -> bool {
-        page.0 >= need + LINE_POINTER + self.reserve && page.1 < MAX_TUPLES
-    }
-
-    fn put(&mut self, block: usize, need: u32) -> i64 {
-        let page = &mut self.pages[block];
-        page.0 -= need + LINE_POINTER;
-        page.1 += 1;
-        (block as i64) * 65536 + i64::from(page.1)
-    }
-
-    /// A new tuple: the last page while it fits, else a new one.
-    fn insert(&mut self, need: u32) -> i64 {
-        let last = self.pages.len().checked_sub(1);
-        match last {
-            Some(b) if self.fits_new(self.pages[b], need) => self.put(b, need),
-            _ => {
-                self.pages.push((PAGE_SPACE, 0));
-                self.put(self.pages.len() - 1, need)
-            }
-        }
-    }
-
-    /// A new version of the tuple at `old`: its own page while it fits.
-    fn update(&mut self, old: Option<i64>, need: u32) -> i64 {
-        self.disordered = true;
-        if let Some(block) = old
-            .filter(|t| *t >= 0)
-            .and_then(|t| usize::try_from(t / 65536).ok())
-        {
-            if block < self.pages.len() && Self::fits(self.pages[block], need) {
-                return self.put(block, need);
-            }
-        }
-        self.insert(need)
-    }
-}
-
 /// How many command ids a statement other than a row write consumes in
 /// PostgreSQL 15.19, measured inside a transaction block: the catalog
 /// changes a DDL statement makes advance the command counter as many times
@@ -294,110 +240,201 @@ fn ddl_command_ids(stmt: &secantus_pgplan::Statement) -> u32 {
     }
 }
 
+/// A row a DELETE removed, as the store's delete path reported it: its
+/// table, place, `_id` and tuple length (or the row, when the length needs
+/// a definition the statement did not name).
+struct Deleted {
+    table: String,
+    ctid: i64,
+    id: Bson,
+    len: Option<u32>,
+    row: Option<Document>,
+}
+
+thread_local! {
+    /// What this thread's deletes removed since the statement began.
+    static DELETED: std::cell::RefCell<Vec<Deleted>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The definitions a delete's length is computed by, the statement's
+    /// own table's among them.
+    static DELETE_DEFS: std::cell::RefCell<std::collections::HashMap<String, TableDef>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Nonzero while a table's rows are replaced wholesale (a rewrite, a
+    /// TRUNCATE): those removals are the old heap's, not dead tuples.
+    static DELETES_SUPPRESSED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The store's delete observer (installed once per thread).
+fn observe_delete(_db: &str, coll: &str, blob: &[u8]) {
+    if coll.starts_with("__") || DELETES_SUPPRESSED.with(std::cell::Cell::get) > 0 {
+        return;
+    }
+    let Ok(doc) = crate::decode_doc(blob) else {
+        return;
+    };
+    let Some(ctid) = ctid_of(&doc) else {
+        return;
+    };
+    let id = doc.get("_id").cloned().unwrap_or(Bson::Null);
+    let def = DELETE_DEFS.with(|d| d.borrow().get(coll).cloned());
+    let (len, row) = match def {
+        Some(def) if !crate::partition::is_partitioned(&def) => {
+            (Some(tuple_len(&def, &doc) as u32), None)
+        }
+        _ => (None, Some(doc)),
+    };
+    DELETED.with(|d| {
+        d.borrow_mut().push(Deleted {
+            table: coll.to_string(),
+            ctid,
+            id,
+            len,
+            row,
+        })
+    });
+}
+
+/// Run `f` with the deletes it makes not taken as dead tuples.
+pub(crate) fn without_dead_tuples<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DELETES_SUPPRESSED.with(|c| c.set(c.get() - 1));
+        }
+    }
+    DELETES_SUPPRESSED.with(|c| c.set(c.get() + 1));
+    let _restore = Restore;
+    f()
+}
+
+type Heaps = std::collections::HashMap<(usize, String), Heap>;
+
+fn heaps() -> &'static std::sync::Mutex<Heaps> {
+    static HEAPS: std::sync::OnceLock<std::sync::Mutex<Heaps>> = std::sync::OnceLock::new();
+    HEAPS.get_or_init(Default::default)
+}
+
+/// The xids still running, and the removal horizon (`GlobalVisState`): no
+/// tuple a transaction from it on deleted may be removed yet.
+fn visibility() -> (std::collections::HashSet<u64>, u64) {
+    let running: std::collections::HashSet<u64> =
+        crate::xids::running().into_iter().map(|(_, x)| x).collect();
+    (running, crate::xids::horizon())
+}
+
+/// Forget backend `pid`'s target blocks (its session ended).
+pub(crate) fn forget_backend(pid: i32) {
+    for heap in heaps()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values_mut()
+    {
+        heap.targets.remove(&pid);
+    }
+}
+
 impl PgHandler {
-    fn heap_key(&self, table: &str) -> String {
-        format!("heap:{}", self.relation_oid(table).unwrap_or(0))
+    fn heap_key(&self, table: &str) -> (usize, String) {
+        (
+            std::sync::Arc::as_ptr(&self.storage) as usize,
+            format!("heap:{}", self.relation_oid(table).unwrap_or(0)),
+        )
     }
 
-    /// A table's pages as its stored rows show them: each live tuple's
-    /// length on its block, the block's line pointers up to the highest
-    /// offset in use, and whether the places follow the stored order. What
-    /// a process knows from the rows when it first touches a table (after a
-    /// restart: a dead tuple's space is then free, as after a VACUUM).
-    fn derive_heap(&self, table: &str) -> (Vec<(u32, u32)>, bool) {
+    /// A table's heap as its stored rows show it, what a process knows when
+    /// it first touches a table: each live tuple's length on its block, the
+    /// line pointers up to the highest offset in use -- one between them
+    /// that no row holds being dead -- and whether the places follow the
+    /// stored order. (After a restart, then, a dead tuple's space is free,
+    /// its line pointer not, and the free space map is empty.)
+    fn derive_heap(&self, table: &str) -> Heap {
+        let mut heap = Heap::default();
         let Some(def) = self.lookup(table) else {
-            return (Vec::new(), false);
+            return heap;
         };
         let raw = self
             .storage
             .find_matching(self.db(), table, &Document::new())
             .unwrap_or_default();
-        let mut pages: Vec<(u32, u32)> = Vec::new();
         let mut last = -1;
-        let mut disordered = false;
+        let mut held: std::collections::HashMap<u32, Vec<u16>> = Default::default();
         for row in raw.iter().filter_map(|b| crate::decode_doc(b).ok()) {
-            let Some(ctid) = ctid_of(&row) else {
+            let Some((block, off)) = ctid_of(&row).and_then(untid) else {
                 continue;
             };
-            disordered |= ctid < last;
+            let ctid = tid(block, off);
+            heap.disordered |= ctid < last;
             last = ctid;
-            let (block, offset) = ((ctid / 65536) as usize, (ctid % 65536) as u32);
-            if pages.len() <= block {
-                pages.resize(block + 1, (PAGE_SPACE, 0));
+            if heap.pages.len() <= block as usize {
+                heap.pages.resize(block as usize + 1, Page::default());
             }
-            let need = tuple_len(&def, &row) as u32 + LINE_POINTER;
-            let page = &mut pages[block];
-            page.0 = page.0.saturating_sub(need);
-            page.1 = page.1.max(offset);
+            let page = &mut heap.pages[block as usize];
+            page.free += tuple_len(&def, &row) as u32;
+            page.nlp = page.nlp.max(off);
+            held.entry(block).or_default().push(off);
         }
-        (pages, disordered)
+        for (b, page) in heap.pages.iter_mut().enumerate() {
+            let used = page.free;
+            page.free = PAGE_SPACE.saturating_sub(used + u32::from(page.nlp) * LINE_POINTER);
+            let have = held.remove(&(b as u32)).unwrap_or_default();
+            for off in 1..=page.nlp {
+                if !have.contains(&off) {
+                    page.lps.insert(off, Lp::Dead);
+                }
+            }
+        }
+        heap
     }
 
     /// `BLCKSZ * (100 - fillfactor) / 100`: the bytes an INSERT leaves free
     /// on a page of `table`.
     fn heap_reserve(&self, table: &str) -> u32 {
         let ff = self
-            .lookup(table)
-            .and_then(|d| {
-                d.extra.get_array("reloptions").ok().and_then(|a| {
-                    a.iter().find_map(|v| {
-                        v.as_str()?
-                            .strip_prefix("fillfactor=")
-                            .and_then(|n| n.trim().parse::<u32>().ok())
-                    })
-                })
-            })
+            .reloption(table, "fillfactor")
+            .and_then(|n| n.trim().parse::<u32>().ok())
             .unwrap_or(100)
             .clamp(10, 100);
         8192 * (100 - ff) / 100
     }
 
-    /// Place tuples in `table`'s heap: `f` gets the heap and returns the
-    /// places. The heap's free space is not transactional in PostgreSQL --
-    /// a rolled-back row's place stays taken, an aborted tuple still on its
-    /// page, and ROLLBACK TO leaves it so too -- so it is kept outside any
-    /// transaction: in this process, per store and table, never committed
-    /// to the store (a commit there would be another session's commit to a
-    /// REPEATABLE READ snapshot). One writer at a time, as a page's buffer
-    /// lock makes it.
+    /// A table's storage parameter, as `WITH (...)` set it.
+    fn reloption(&self, table: &str, name: &str) -> Option<String> {
+        let def = self.lookup(table)?;
+        let opts = def.extra.get_array("reloptions").ok()?;
+        opts.iter().find_map(|v| {
+            let (k, val) = v.as_str()?.split_once('=')?;
+            (k.trim() == name).then(|| val.trim().to_string())
+        })
+    }
+
+    /// Work on `table`'s heap. The heap is not transactional in PostgreSQL
+    /// -- a rolled-back row's place stays taken, an aborted tuple still on
+    /// its page, and ROLLBACK TO leaves it so too -- so it is kept outside
+    /// any transaction: in this process, per store and table, never
+    /// committed to the store (a commit there would be another session's
+    /// commit to a REPEATABLE READ snapshot). One writer at a time, as a
+    /// page's buffer lock makes it.
     fn with_heap<T>(&self, table: &str, f: impl FnOnce(&mut Heap) -> T) -> PgWireResult<T> {
-        type Heaps = std::collections::HashMap<(usize, String), (Vec<(u32, u32)>, bool)>;
-        static HEAPS: std::sync::OnceLock<std::sync::Mutex<Heaps>> = std::sync::OnceLock::new();
-        let key = (
-            std::sync::Arc::as_ptr(&self.storage) as usize,
-            self.heap_key(table),
-        );
+        let key = self.heap_key(table);
         let reserve = self.heap_reserve(table);
-        let known = HEAPS
-            .get_or_init(Default::default)
+        let known = heaps()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(&key);
         // Read before the lock is taken: deriving reads the store.
         let derived = (!known).then(|| self.derive_heap(table));
-        let mut all = HEAPS
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let state = all
+        let (running, _) = visibility();
+        let mut all = heaps().lock().unwrap_or_else(|e| e.into_inner());
+        let heap = all
             .entry(key)
             .or_insert_with(|| derived.unwrap_or_default());
-        let mut heap = Heap {
-            pages: std::mem::take(&mut state.0),
-            reserve,
-            disordered: state.1,
-        };
-        let out = f(&mut heap);
-        *state = (heap.pages, heap.disordered);
-        Ok(out)
+        heap.reserve = reserve;
+        heap.forget_ended(&|x| running.contains(&x));
+        Ok(f(heap))
     }
 
-    /// A TRUNCATE starts the heap again.
+    /// A new relation file (a TRUNCATE): an empty heap and free space map.
     pub(crate) fn reset_heap(&self, table: &str) -> PgWireResult<()> {
-        self.with_heap(table, |h| {
-            h.pages.clear();
-            h.disordered = false;
-        })
+        self.with_heap(table, |h| *h = Heap::default())
     }
 
     /// Must a sequential scan of `table` sort its stored rows by ctid to
@@ -405,31 +442,35 @@ impl PgHandler {
     /// partitioned table's rows are in its leaves' heaps, each with places
     /// of its own, so a ctid does not order them across leaves.
     pub(crate) fn heap_scan_disordered(&self, table: &str) -> bool {
+        if !self.has_heap(table) {
+            return false;
+        }
+        self.with_heap(table, |h| h.disordered).unwrap_or(false)
+    }
+
+    /// A stored table with a heap of its own (not a catalog, a view or a
+    /// partitioned parent).
+    pub(crate) fn has_heap(&self, table: &str) -> bool {
         if table.starts_with("__") || Self::virtual_table(table).is_some() {
             return false;
         }
-        match self.lookup(table) {
-            Some(def) if !crate::partition::is_partitioned(&def) => {}
-            _ => return false,
-        }
-        self.with_heap(table, |h| h.disordered).unwrap_or(false)
+        matches!(self.lookup(table), Some(def) if !crate::partition::is_partitioned(&def))
     }
 
     fn pid(&self) -> i32 {
         self.backend_pid.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// The writing transaction's xid (assigned now, as PostgreSQL assigns
+    /// The writing transaction's xid8 (assigned now, as PostgreSQL assigns
     /// it at the first write) and the command's id.
-    fn writer(&self) -> (i64, i64) {
+    fn writer(&self) -> (u64, i64) {
         let pid = self.pid();
         let xid =
             secantus_pgplan::snapshots::ask_pid(pid, secantus_pgplan::snapshots::XidOp::Assign)
                 .and_then(|x| x.parse::<u64>().ok())
                 .unwrap_or(u64::from(crate::xids::FROZEN_XID));
         let cid = crate::xids::command_id(&self.storage, pid);
-        // An xid is 32 bits (the low half of the xid8).
-        ((xid & 0xFFFF_FFFF) as i64, i64::from(cid))
+        (xid, i64::from(cid))
     }
 
     /// The heap a row of `table` lives in: a partitioned table's rows are
@@ -444,15 +485,66 @@ impl PgHandler {
         Ok(table.to_string())
     }
 
+    /// The fields an index of `table` reads -- its keys, an expression's
+    /// columns, a partial index's predicate -- which an UPDATE must leave
+    /// unchanged to be HOT (`INDEX_ATTR_BITMAP_ALL`).
+    fn indexed_fields(&self, table: &str, def: &TableDef) -> Vec<String> {
+        let Ok(indexes) = self.storage.list_indexes(self.db(), table) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = Vec::new();
+        let mut add = |f: &str| {
+            if !out.iter().any(|o| o == f) {
+                out.push(f.to_string());
+            }
+        };
+        for ix in &indexes {
+            if let Ok(key) = ix.get_document("key") {
+                for (f, _) in key {
+                    add(f);
+                }
+            }
+            if let Ok(partial) = ix.get_document("partialFilterExpression") {
+                let mut stack = vec![Bson::Document(partial.clone())];
+                while let Some(v) = stack.pop() {
+                    match v {
+                        Bson::Document(d) => {
+                            for (k, v) in d {
+                                if !k.starts_with('$') {
+                                    add(&k);
+                                }
+                                stack.push(v);
+                            }
+                        }
+                        Bson::Array(a) => stack.extend(a),
+                        _ => {}
+                    }
+                }
+            }
+            if let Some((exprs, _)) = Self::index_expressions(ix) {
+                for c in &def.columns {
+                    let named = exprs.iter().any(|e| {
+                        e.split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                            .any(|w| w.eq_ignore_ascii_case(&c.name))
+                    });
+                    if named {
+                        add(&c.field());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Stamp new rows of `table`: this transaction's xid and command, and
-    /// each tuple's place at the end of its heap.
+    /// each tuple's place, as `RelationGetBufferForTuple` finds it.
     pub(crate) fn stamp_inserted(
         &self,
         table: &str,
         def: &TableDef,
         rows: &mut [Document],
     ) -> PgWireResult<()> {
-        let mut versions: Vec<(Option<i64>, Document)> =
+        let mut versions: Vec<(Option<Document>, Document)> =
             rows.iter().map(|r| (None, r.clone())).collect();
         self.stamp_versions(table, def, &mut versions)?;
         for (r, (_, v)) in rows.iter_mut().zip(versions) {
@@ -461,19 +553,37 @@ impl PgHandler {
         Ok(())
     }
 
-    /// Stamp row versions: `(old ctid, row)`, a new row with no old one
-    /// going to the end of its heap, a new version of an updated one on its
-    /// old page while it fits.
+    /// Stamp new versions of updated rows: `(old row, new row)` each, the
+    /// old row as it was stored (its place, its values).
+    pub(crate) fn stamp_updated(
+        &self,
+        table: &str,
+        def: &TableDef,
+        rows: &mut [(Option<Document>, Document)],
+    ) -> PgWireResult<()> {
+        self.stamp_versions(table, def, rows)
+    }
+
+    /// Stamp row versions: `(old row, row)`. A new row (no old one) goes
+    /// where an INSERT's would; a new version of an updated one on its old
+    /// page while it fits, as a heap-only tuple when no indexed field
+    /// changed.
     fn stamp_versions(
         &self,
         table: &str,
         def: &TableDef,
-        rows: &mut [(Option<i64>, Document)],
+        rows: &mut [(Option<Document>, Document)],
     ) -> PgWireResult<()> {
         if rows.is_empty() || table.starts_with("__") {
             return Ok(());
         }
-        let (xmin, cid) = self.writer();
+        let (xid, cid) = self.writer();
+        let pid = self.pid();
+        let indexed = if rows.iter().any(|(old, _)| old.is_some()) {
+            self.indexed_fields(table, def)
+        } else {
+            Vec::new()
+        };
         // By heap, in the rows' order within each.
         let mut heaps: Vec<(String, Vec<usize>)> = Vec::new();
         for (i, (_, r)) in rows.iter().enumerate() {
@@ -484,29 +594,58 @@ impl PgHandler {
             }
         }
         for (heap_table, idx) in heaps {
-            let needs: Vec<(Option<i64>, u32)> = idx
+            struct Version {
+                old: Option<(Option<i64>, u32, bool, Bson)>,
+                len: u32,
+            }
+            let versions: Vec<Version> = idx
                 .iter()
-                .map(|i| (rows[*i].0, tuple_len(def, &rows[*i].1) as u32))
+                .map(|i| {
+                    let (old, new) = &rows[*i];
+                    let len = tuple_len(def, new) as u32;
+                    let old = old.as_ref().map(|o| {
+                        let hot = indexed.iter().all(|f| o.get(f) == new.get(f));
+                        (
+                            ctid_of(o),
+                            tuple_len(def, o) as u32,
+                            hot,
+                            o.get("_id").cloned().unwrap_or(Bson::Null),
+                        )
+                    });
+                    Version { old, len }
+                })
                 .collect();
+            // The UPDATE's scan read the old rows' pages first.
+            let pages: Vec<i64> = versions
+                .iter()
+                .filter_map(|v| v.old.as_ref().and_then(|o| o.0))
+                .collect();
+            if !pages.is_empty() {
+                self.prune_pages(&heap_table, Some(&pages))?;
+            }
             let ctids = self.with_heap(&heap_table, |heap| {
-                needs
-                    .iter()
-                    .map(|(old, n)| match old {
-                        Some(_) => heap.update(*old, *n),
-                        None => heap.insert(*n),
+                versions
+                    .into_iter()
+                    .map(|v| match v.old {
+                        Some((old, old_len, hot, id)) => {
+                            heap.update(pid, old, old_len, v.len, hot, xid, id)
+                        }
+                        None => heap.insert(pid, xid, v.len),
                     })
                     .collect::<Vec<_>>()
             })?;
             for (i, ctid) in idx.into_iter().zip(ctids) {
-                stamp(&mut rows[i].1, xmin, cid, ctid);
+                // An xid is 32 bits (the low half of the xid8).
+                stamp(&mut rows[i].1, (xid & 0xFFFF_FFFF) as i64, cid, ctid);
             }
         }
         Ok(())
     }
 
     /// `VACUUM FULL` / `CLUSTER`: the rows, in `rows`' order, copied to a
-    /// new heap (`rewrite_heap_tuple`): each keeps its xmin and command, and
-    /// takes the next place.
+    /// new heap (`rewrite_heap_tuple`, which fills each page in turn and
+    /// keeps no free space map): each keeps its xmin and command, and takes
+    /// the next place.
     pub(crate) fn rewrite_heap(
         &self,
         table: &str,
@@ -531,10 +670,21 @@ impl PgHandler {
                 .map(|i| tuple_len(def, &rows[*i]) as u32)
                 .collect();
             let ctids = self.with_heap(&heap_table, |heap| {
-                heap.pages.clear();
+                *heap = Heap {
+                    reserve: heap.reserve,
+                    ..Heap::default()
+                };
                 // CLUSTER's order is an index's, not the stored one.
                 heap.disordered = true;
-                needs.iter().map(|n| heap.insert(*n)).collect::<Vec<_>>()
+                let ctids = needs
+                    .iter()
+                    .map(|n| {
+                        let (b, o) = heap.place(i32::MIN, *n, false);
+                        tid(b, o)
+                    })
+                    .collect::<Vec<_>>();
+                heap.targets.clear();
+                ctids
             })?;
             for (i, ctid) in idx.into_iter().zip(ctids) {
                 rows[i].insert("__sys_ctid", Bson::Int64(ctid));
@@ -555,36 +705,226 @@ impl PgHandler {
         let Some(ctid) = ctid_of(row) else {
             return Ok(());
         };
-        let need = tuple_len(def, row) as u32;
-        let (block, offset) = ((ctid / 65536) as usize, (ctid % 65536) as u32);
+        let len = tuple_len(def, row) as u32;
         let heap_table = self.heap_of(table, def, row)?;
-        self.with_heap(&heap_table, |heap| {
-            if block + 1 == heap.pages.len() && heap.pages[block].1 == offset {
-                let page = &mut heap.pages[block];
-                page.0 += need + LINE_POINTER;
-                page.1 -= 1;
-                if page.1 == 0 {
-                    heap.pages.pop();
+        self.with_heap(&heap_table, |heap| heap.release(ctid, len))
+    }
+
+    /// The rows the statement's deletes removed (since `mark`, what
+    /// [`Self::watch_deletes`] returned) are dead tuples of its
+    /// transaction's: each page pruned first, as the DELETE's scan read it.
+    pub(crate) fn note_deleted(&self, mark: usize) -> PgWireResult<()> {
+        let deleted: Vec<Deleted> = DELETED.with(|d| {
+            let mut d = d.borrow_mut();
+            let from = mark.min(d.len());
+            d.drain(from..).collect()
+        });
+        if deleted.is_empty() {
+            return Ok(());
+        }
+        let (xid, _) = self.writer();
+        // Each heap's dead tuples: `(ctid, length, _id)`.
+        type Dead = Vec<(i64, u32, Bson)>;
+        let mut by_heap: Vec<(String, Dead)> = Vec::new();
+        for d in deleted {
+            let Some(def) = self.lookup(&d.table) else {
+                continue;
+            };
+            let (heap_table, len) = match (d.len, &d.row) {
+                (Some(len), _) => (d.table.clone(), len),
+                (None, Some(row)) => (
+                    self.heap_of(&d.table, &def, row)?,
+                    tuple_len(&def, row) as u32,
+                ),
+                (None, None) => continue,
+            };
+            match by_heap.iter_mut().find(|(t, _)| *t == heap_table) {
+                Some((_, v)) => v.push((d.ctid, len, d.id)),
+                None => by_heap.push((heap_table, vec![(d.ctid, len, d.id)])),
+            }
+        }
+        for (heap_table, tuples) in by_heap {
+            let ctids: Vec<i64> = tuples.iter().map(|(c, _, _)| *c).collect();
+            self.prune_pages(&heap_table, Some(&ctids))?;
+            self.with_heap(&heap_table, |heap| {
+                for (ctid, len, id) in tuples {
+                    heap.delete(ctid, len, xid, id);
                 }
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Before a statement: the store reports its deletes here, with the
+    /// definition of the table it names. Returns the mark
+    /// [`Self::note_deleted`] takes (a statement a trigger runs is inside
+    /// another's).
+    pub(crate) fn watch_deletes(&self, table: Option<&str>) -> usize {
+        thread_local! {
+            static ON_THIS_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        if !ON_THIS_THREAD.with(std::cell::Cell::get) {
+            secantus_storage::set_delete_observer(Some(Box::new(observe_delete)));
+            ON_THIS_THREAD.with(|c| c.set(true));
+        }
+        let mark = DELETED.with(|d| d.borrow().len());
+        // The outermost statement: definitions an earlier one held may have
+        // changed since.
+        if mark == 0 {
+            DELETE_DEFS.with(|defs| defs.borrow_mut().clear());
+        }
+        if let Some(t) = table.filter(|t| self.has_heap(t)) {
+            if let Some(def) = self.lookup(t) {
+                DELETE_DEFS.with(|defs| defs.borrow_mut().insert(t.to_string(), def));
+            }
+        }
+        mark
+    }
+
+    /// `heap_page_prune_opt` on the pages a read of `table` met: every
+    /// page (a sequential scan, `ctids` None) or the given rows' pages.
+    /// A tuple whose deleter has ended is settled first -- committed if its
+    /// row is gone from the store or has moved, rolled back if it is still
+    /// here. Only a deleter older than the removal horizon is settled: it
+    /// ended before any snapshot still held was taken, this statement's
+    /// own among them, so the store's answer here is its outcome.
+    pub(crate) fn prune_pages(&self, table: &str, ctids: Option<&[i64]>) -> PgWireResult<()> {
+        if !self.has_heap(table) {
+            return Ok(());
+        }
+        let (running, horizon) = visibility();
+        let is_running = |x: u64| running.contains(&x);
+        // The pages a prune could act on, and their unsettled tuples.
+        let candidates: Vec<(u32, Vec<(u16, Bson)>)> = self.with_heap(table, |heap| {
+            let blocks: Vec<u32> = match ctids {
+                None => heap.prunable_blocks(),
+                Some(c) => {
+                    let mut b: Vec<u32> = c.iter().filter_map(|c| untid(*c).map(|t| t.0)).collect();
+                    b.sort_unstable();
+                    b.dedup();
+                    b
+                }
+            };
+            blocks
+                .into_iter()
+                .filter(|b| heap.may_prune(*b, horizon))
+                .map(|b| (b, heap.unsettled(b, horizon, &is_running)))
+                .collect()
+        })?;
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<Bson> = candidates
+            .iter()
+            .flat_map(|(_, u)| u.iter().map(|(_, id)| id.clone()))
+            .collect();
+        let present: std::collections::HashMap<String, i64> = if ids.is_empty() {
+            Default::default()
+        } else {
+            self.storage
+                .find_matching(self.db(), table, &bson::doc! { "_id": { "$in": ids } })
+                .map_err(|e| Self::storage_err("could not read", e))?
+                .iter()
+                .filter_map(|raw| {
+                    let d = crate::decode_doc(raw).ok()?;
+                    Some((d.get("_id")?.to_string(), ctid_of(&d)?))
+                })
+                .collect()
+        };
+        self.with_heap(table, |heap| {
+            for (block, unsettled) in candidates {
+                let outcome: Vec<(u16, bool)> = unsettled
+                    .iter()
+                    .map(|(off, id)| {
+                        let here = present.get(&id.to_string()) == Some(&tid(block, *off));
+                        (*off, !here)
+                    })
+                    .collect();
+                heap.settle(block, &outcome);
+                heap.prune_opt(block, horizon, &is_running);
             }
         })
     }
 
-    /// Stamp new versions of updated rows: `(old ctid, new row)` each.
-    pub(crate) fn stamp_updated(
-        &self,
-        table: &str,
-        def: &TableDef,
-        rows: &mut [(Option<i64>, Document)],
-    ) -> PgWireResult<()> {
-        // A row whose old place is unknown (written before ctids were kept)
-        // is placed as a new one is.
-        for (old, _) in rows.iter_mut() {
-            if old.is_none() {
-                *old = Some(-1);
-            }
+    /// Plain VACUUM of `table`'s heap (`heap_vacuum_rel`): each page
+    /// pruned, its dead tuples removed, its free space recorded, the empty
+    /// pages at the end truncated away. Its scan reads every row, which
+    /// settles every deleter.
+    pub(crate) fn vacuum_heap(&self, table: &str) -> PgWireResult<()> {
+        let Some(def) = self.lookup(table) else {
+            return Ok(());
+        };
+        let heaps: Vec<String> = if crate::partition::is_partitioned(&def) {
+            self.partitions_of(table)?
+                .into_iter()
+                .filter(|p| !crate::partition::is_partitioned(p))
+                .map(|p| p.name)
+                .collect()
+        } else if self.has_heap(table) {
+            vec![table.to_string()]
+        } else {
+            Vec::new()
+        };
+        if heaps.is_empty() {
+            return Ok(());
         }
-        self.stamp_versions(table, def, rows)
+        let rows: Vec<Document> = self
+            .storage
+            .find_matching(self.db(), table, &Document::new())
+            .map_err(|e| Self::storage_err("could not read", e))?
+            .iter()
+            .filter_map(|raw| crate::decode_doc(raw).ok())
+            .collect();
+        // A table without a primary key has no index the row id's `_id_`
+        // stands for.
+        let has_indexes = def.columns.iter().any(|c| c.pk)
+            || self
+                .storage
+                .list_indexes(self.db(), table)
+                .is_ok_and(|ix| ix.iter().any(|i| i.get_str("name") != Ok("_id_")));
+        let truncate = self.reloption(table, "vacuum_truncate").is_none_or(|v| {
+            !matches!(
+                v.to_ascii_lowercase().as_str(),
+                "false" | "off" | "no" | "0"
+            )
+        });
+        let (running, horizon) = visibility();
+        for heap_table in heaps {
+            let mut live: std::collections::HashMap<i64, u32> = Default::default();
+            for row in &rows {
+                if self.heap_of(table, &def, row)? != heap_table {
+                    continue;
+                }
+                if let Some(ctid) = ctid_of(row) {
+                    live.insert(ctid, tuple_len(&def, row) as u32);
+                }
+            }
+            self.with_heap(&heap_table, |heap| {
+                heap.settle_all(&|c| live.contains_key(&c), &|x| running.contains(&x));
+                heap.vacuum(
+                    horizon,
+                    &|x| running.contains(&x),
+                    &live,
+                    has_indexes,
+                    truncate,
+                );
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The pages `table`'s heap has (`RelationGetNumberOfBlocks`).
+    pub(crate) fn heap_blocks(&self, table: &str) -> PgWireResult<u32> {
+        self.with_heap(table, |h| h.nblocks())
+    }
+
+    /// ANALYZE updates the relation's statistics in place, which
+    /// invalidates every backend's target block.
+    pub(crate) fn heap_invalidate(&self, table: &str) -> PgWireResult<()> {
+        if !self.has_heap(table) {
+            return Ok(());
+        }
+        self.with_heap(table, |h| h.targets.clear())
     }
 }
 
@@ -658,13 +998,8 @@ mod tests {
         );
         let doc = bson::doc! {"a": 1, "b": "x".repeat(100)};
         let need = tuple_len(&def, &doc) as u32;
-        let mut heap = Heap {
-            pages: Vec::new(),
-            reserve: 0,
-            disordered: false,
-        };
-        let ctids: Vec<i64> = (1..=200).map(|_| heap.insert(need)).collect();
-        let tid = |b: i64, o: i64| b * 65536 + o;
+        let mut heap = Heap::default();
+        let ctids: Vec<i64> = (1..=200).map(|_| heap.insert(1, 800, need)).collect();
         assert_eq!(ctids[69], tid(1, 12));
         assert_eq!(ctids[199], tid(3, 26));
     }
@@ -682,15 +1017,14 @@ mod tests {
     /// by ctid, a row without one first.
     #[test]
     fn an_update_disorders_the_heap() {
-        let mut heap = Heap {
-            pages: Vec::new(),
-            reserve: 0,
-            disordered: false,
-        };
-        let first = heap.insert(32);
-        heap.insert(32);
+        let mut heap = Heap::default();
+        let first = heap.insert(1, 800, 32);
+        heap.insert(1, 800, 32);
         assert!(!heap.disordered);
-        assert_eq!(heap.update(Some(first), 32), 3);
+        assert_eq!(
+            heap.update(1, Some(first), 32, 32, true, 800, Bson::Int32(1)),
+            3
+        );
         assert!(heap.disordered);
         let row = |ctid: Option<i64>| {
             let mut d = bson::doc! {"a": 1};
