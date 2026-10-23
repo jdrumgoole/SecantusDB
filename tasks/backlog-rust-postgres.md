@@ -778,6 +778,37 @@ fixed in the same batch; their tests there are regression tests.
       Backlog-ID: RP-137
       Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order], tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]
 
+## Found by batch 52 (2026-10-24)
+
+Found while building `pg_describe_object` (RP-199) and RP-200. The gap
+tests are scenarios in `tests/backlog/test_rp_batch52.py` and
+`tests/backlog/test_rp_batch51.py`, measured on a private 15.19 cluster.
+RP-204 (an executor-answered function in a PL/pgSQL expression), RP-206 (a
+view over another schema's table had no rule dependency), RP-207 (an index
+in another schema was listed in `public`), RP-208 (a built-in row type
+printed as its oid) and RP-209 (`plpgsql`'s extension oid) were found and
+fixed in the same batch; their tests are regression tests.
+
+- [ ] **`pg_rewrite` lists no rule of a system view.** PostgreSQL 15.19 has
+      142 (`_RETURN` on `pg_roles`, `pg_shadow`, ...); here a user view's
+      rule is listed and the system views' are not. Their rows need the
+      views' `ev_action` node trees as PostgreSQL stores them.
+      Backlog-ID: RP-203
+      Verify: tests/backlog/test_rp_batch51.py::test_scenario[pg_rewrite lists the system views' rules]
+- [ ] **A table's row type has the table's oid.** PostgreSQL 15.19 gives
+      the row type an oid of its own (`pg_class.reltype`); here they are
+      one number, so `pg_depend` rows about the type read as rows about the
+      relation (`type t[]` appears among what depends on table `t`).
+      Backlog-ID: RP-205
+      Verify: tests/backlog/test_rp_batch52.py::test_scenario[pg_depend of a table, its view and its row type]
+- [ ] **The `pg_*_is_visible` functions answer true for an oid that names
+      nothing.** `pg_type_is_visible(1)`, `pg_function_is_visible(1)` and
+      eleven more are `t` here, NULL on PostgreSQL 15.19
+      (`pg_table_is_visible` is already NULL). They answer true for every
+      oid rather than looking the object up on the search path.
+      Backlog-ID: RP-210
+      Verify: tests/backlog/test_rp_batch52.py::test_scenario[the visibility functions of an oid that names nothing]
+
 ## Found by batch 51 (2026-10-23)
 
 Found while building operator classes, subscriptions and transforms
@@ -787,17 +818,18 @@ NULL for a database's or role's comment) was found and fixed in the same
 batch, and RP-200 (a block's own index definitions) in batch 52; their
 tests there are regression tests.
 
-- [ ] **`pg_describe_object`, `pg_identify_object`,
-      `pg_identify_object_as_address` and `pg_get_object_address` are
-      refused** (`function pg_describe_object(regclass, regclass, integer)
-      is not supported yet`). PostgreSQL 15.19 describes any object by
-      `(classid, objid, objsubid)`: `table pg_class`, `column relname of
-      table pg_class`, `operator class c for access method btree`. The
-      descriptions exist here for the error and notice texts that name
-      objects (a 2BP01's DETAIL, a CASCADE notice), one kind at a time; the
-      functions need `getObjectDescription`'s switch over every catalog.
+- [ ] **`pg_identify_object`, `pg_identify_object_as_address` and
+      `pg_get_object_address` are refused** (`function
+      pg_identify_object(regclass, regclass, integer) is not supported
+      yet`). PostgreSQL 15.19 identifies any object by `(classid, objid,
+      objsubid)` as a record (`(table,pg_catalog,pg_class,pg_catalog.pg_class)`)
+      and resolves `(type, names, args)` back to one. `pg_describe_object` is
+      served since batch 52 (`objaddr.rs`); these need
+      `getObjectTypeDescription`, `getObjectIdentityParts` and
+      `get_object_address`, each a switch over every catalog, and their
+      record results.
       Backlog-ID: RP-199
-      Verify: tests/backlog/test_rp_batch51.py::test_scenario[pg_describe_object and its siblings]
+      Verify: tests/backlog/test_rp_batch51.py::test_scenario[pg_identify_object and its siblings]
 - [ ] **A cancel while a huge statement is planned waits for the pass it
       lands in.** Planning a statement with a 200,000-item `IN` list runs
       for about a second in a debug build, as a sequence of passes over the

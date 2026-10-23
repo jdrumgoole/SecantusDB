@@ -201,6 +201,7 @@ impl PgHandler {
         // Each user relation: (oid, relkind, its columns' names by attnum).
         let mut relkind: HashMap<i64, String> = HashMap::new();
         let mut relname: HashMap<i64, String> = HashMap::new();
+        let namespaces = self.namespaces();
         for r in &classes.rows {
             let oid = classes.int(r, "oid");
             if oid < 16384 {
@@ -220,7 +221,22 @@ impl PgHandler {
                     "n",
                 );
             }
-            relname.insert(oid, classes.text(r, "relname"));
+            // By the key a query names it with: `schema.name` outside
+            // `public` (a view over `s.t` reads `s.t`).
+            let ns = classes.int(r, "relnamespace");
+            let name = classes.text(r, "relname");
+            let schema = namespaces
+                .iter()
+                .find(|(_, o)| *o == ns)
+                .map_or("public", |(n, _)| n.as_str());
+            relname.insert(
+                oid,
+                if schema == "public" {
+                    name
+                } else {
+                    format!("{schema}.{name}")
+                },
+            );
             relkind.insert(oid, kind);
         }
         let mut columns: HashMap<i64, Vec<(i32, String)>> = HashMap::new();
@@ -378,7 +394,7 @@ impl PgHandler {
             if name != "plpgsql" {
                 push(
                     PG_EXTENSION,
-                    13_826 + i as i64,
+                    crate::extension_oid(i),
                     0,
                     PG_NAMESPACE,
                     self.namespace_oid(&schema),
@@ -392,7 +408,15 @@ impl PgHandler {
                 continue;
             };
             if let Some(i) = extensions.iter().position(|(n, _, _)| n == ext) {
-                push(PG_TYPE, b.oid, 0, PG_EXTENSION, 13_826 + i as i64, 0, "e");
+                push(
+                    PG_TYPE,
+                    b.oid,
+                    0,
+                    PG_EXTENSION,
+                    crate::extension_oid(i),
+                    0,
+                    "e",
+                );
             }
         }
 

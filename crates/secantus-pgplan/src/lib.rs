@@ -28291,6 +28291,11 @@ pub fn regtype_text(oid: i64) -> String {
     if let Some(name) = user_name(oid - USER_TYPE_ARRAY_OID_OFFSET) {
         return format!("{}[]", quote_type_path(&name));
     }
+    // A system catalog's or view's row type (`pg_type`,
+    // `information_schema.tables`), or its array.
+    if let Some(name) = pgtypes::catalog_composite_name(oid) {
+        return name;
+    }
     oid.to_string()
 }
 
@@ -30184,6 +30189,10 @@ fn text_type_oid(name: &str) -> Option<i64> {
     let Some((parts, array)) = parsed_type_name(name) else {
         return user_type_or_array_oid(name);
     };
+    // A built-in row type (`pg_type`, `information_schema.tables`).
+    if let Some(oid) = pgtypes::catalog_composite_oid(&parts, array) {
+        return Some(oid);
+    }
     // A bare name finds a `public` type only while `public` is on the search
     // path (`TypenameGetTypid`): pg_dump sets it empty, and `'mood'::regtype`
     // is then 42704, `to_regtype('mood')` NULL.

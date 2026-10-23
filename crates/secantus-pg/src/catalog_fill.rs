@@ -837,7 +837,7 @@ impl PgHandler {
     pub(crate) fn pg_description_rows(&self, def: &TableDef) -> Vec<Document> {
         let f = |name: &str| def.field_of(name).expect("column");
         let extensions: Vec<i64> = (0..self.extensions().unwrap_or_default().len())
-            .map(|i| 13_826 + i as i64)
+            .map(crate::extension_oid)
             .collect();
         let relations: Vec<i64> = self.relations().into_iter().map(|(_, o, _)| o).collect();
         let functions: Vec<i64> = self

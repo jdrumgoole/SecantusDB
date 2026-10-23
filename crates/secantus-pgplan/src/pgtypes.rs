@@ -389,3 +389,48 @@ pub fn is_builtin_type(name: &str) -> bool {
         || matches!(base, "bit varying" | "serial" | "bigserial" | "smallserial")
         || oid_of_name(base).is_some()
 }
+
+/// PostgreSQL 15.19's built-in types, the system catalogs' and views' row
+/// types among them: `(oid, schema, name, array oid)`.
+static CATALOG_COMPOSITES: std::sync::OnceLock<Vec<(i64, String, String, i64)>> =
+    std::sync::OnceLock::new();
+
+/// Install the built-in composite types, once.
+pub fn install_catalog_composites(load: impl FnOnce() -> Vec<(i64, String, String, i64)>) {
+    CATALOG_COMPOSITES.get_or_init(load);
+}
+
+/// A built-in composite type (or its array) as `regtypeout` prints it:
+/// bare in `pg_catalog`, qualified elsewhere unless the path reaches it.
+pub(crate) fn catalog_composite_name(oid: i64) -> Option<String> {
+    let all = CATALOG_COMPOSITES.get()?;
+    let shown = |schema: &str, name: &str| {
+        let q = crate::scalar::quote_identifier;
+        if schema == "pg_catalog" || crate::schemas::search_path().iter().any(|s| s == schema) {
+            q(name)
+        } else {
+            format!("{}.{}", q(schema), q(name))
+        }
+    };
+    // An array first: its own row is named `_elem`, printed `elem[]`.
+    if let Some((_, schema, name, _)) = all.iter().find(|(.., arr)| *arr == oid) {
+        return Some(format!("{}[]", shown(schema, name)));
+    }
+    all.iter()
+        .find(|(o, ..)| *o == oid)
+        .map(|(_, schema, name, _)| shown(schema, name))
+}
+
+/// The built-in type `[schema.]name` names (`[]` for its array): a bare
+/// name in `pg_catalog`, or in a schema on the path.
+pub(crate) fn catalog_composite_oid(parts: &[String], array: bool) -> Option<i64> {
+    let all = CATALOG_COMPOSITES.get()?;
+    let found = match parts {
+        [schema, name] => all.iter().find(|(_, s, n, _)| s == schema && n == name),
+        [name] => all.iter().find(|(_, s, n, _)| {
+            n == name && (s == "pg_catalog" || crate::schemas::search_path().iter().any(|p| p == s))
+        }),
+        _ => None,
+    }?;
+    Some(if array { found.3 } else { found.0 })
+}

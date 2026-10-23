@@ -989,6 +989,8 @@ pub(crate) const SEQUENCE_FUNCTIONS: &[&str] = &[
     "set_config",
     "pg_my_temp_schema",
     "pg_get_serial_sequence",
+    // An object's description reads every catalog (RP-199).
+    "pg_describe_object",
     "nextval",
     "currval",
     "setval",
@@ -1057,7 +1059,7 @@ pub fn executor_function_type(name: &str) -> Option<&'static str> {
         "set_limit" => "float4",
         "set_config" => "text",
         "pg_my_temp_schema" => "oid",
-        "pg_get_serial_sequence" => "text",
+        "pg_get_serial_sequence" | "pg_describe_object" => "text",
         "lo_creat" | "lo_create" | "lo_from_bytea" => "oid",
         "lo_unlink" | "lo_open" | "lo_close" | "lowrite" | "lo_lseek" | "lo_tell"
         | "lo_truncate" | "lo_truncate64" => "int4",

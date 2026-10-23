@@ -401,9 +401,9 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
         ],
     ),
     # ------------------------------------- RP-199 the object-address functions
-    "pg_describe_object and its siblings": (
+    "pg_describe_object": (
         "RP-199",
-        True,
+        False,
         [
             "begin",
             "select pg_describe_object('pg_class'::regclass, 'pg_class'::regclass, 0), "
@@ -411,9 +411,6 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
             "pg_describe_object('pg_type'::regclass, 'int4'::regtype, 0), "
             "pg_describe_object('pg_proc'::regclass, 'now'::regproc, 0), "
             "pg_describe_object('pg_namespace'::regclass, 'public'::regnamespace, 0)",
-            "select pg_identify_object('pg_class'::regclass, 'pg_class'::regclass, 0)::text, "
-            "pg_identify_object_as_address('pg_class'::regclass, 'pg_class'::regclass, 0)::text",
-            "select * from pg_get_object_address('table', '{pg_class}', '{}')",
             "create operator family rp51_f using btree",
             "create operator class rp51_c for type int using btree family rp51_f as "
             "operator 1 <, function 1 btint4cmp(int, int)",
@@ -429,7 +426,51 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
             "select pg_describe_object('pg_transform'::regclass, oid, 0) from pg_transform",
             "create subscription rp51_s connection 'dbname=x' publication p with (connect = false)",
             "select pg_describe_object('pg_subscription'::regclass, oid, 0) from pg_subscription",
+            "create schema rp51_ds",
+            "create table rp51_ds.t (a int default 1, constraint c check (a > 0))",
+            "create view rp51_ds.v as select a from rp51_ds.t",
+            "create sequence rp51_ds.s",
+            "create index rp51_di on rp51_ds.t (a)",
+            "select pg_describe_object('pg_attrdef'::regclass, oid, 0) from pg_attrdef "
+            "where adrelid = 'rp51_ds.t'::regclass",
+            "select pg_describe_object('pg_constraint'::regclass, oid, 0) from pg_constraint "
+            "where conrelid = 'rp51_ds.t'::regclass",
+            "select pg_describe_object('pg_rewrite'::regclass, oid, 0) from pg_rewrite "
+            "where ev_class = 'rp51_ds.v'::regclass",
+            "select pg_describe_object('pg_class'::regclass, 'rp51_ds.t'::regclass, 1), "
+            "pg_describe_object('pg_type'::regclass, 'rp51_ds.t'::regtype, 0)",
+            "select pg_describe_object('pg_class'::regclass, oid, 0) from pg_class "
+            "where relnamespace = 'rp51_ds'::regnamespace order by 1",
+            *_guarded("select pg_describe_object(0, 1, 0)"),
+            *_guarded("select pg_describe_object('pg_roles'::regclass, 1, 0)"),
+            "select pg_describe_object('pg_class'::regclass, 1, 0)",
+            "select pg_describe_object(1255, oid, 0) from pg_proc where proname = 'btint4cmp'",
+            "select pg_describe_object(2605, oid, 0) from pg_cast "
+            "where castsource = 'int4'::regtype and casttarget = 'int8'::regtype",
+            "select pg_describe_object(1262, oid, 0) from pg_database where datname = 'postgres'",
+            "select pg_describe_object(3079, oid, 0) from pg_extension",
+            "select 71::regtype::text, format_type(210, null), 1263::regtype::text",
             "rollback",
+        ],
+    ),
+    "pg_identify_object and its siblings": (
+        "RP-199",
+        True,
+        [
+            "select pg_identify_object('pg_class'::regclass, 'pg_class'::regclass, 0)::text, "
+            "pg_identify_object_as_address('pg_class'::regclass, 'pg_class'::regclass, 0)::text",
+            "select * from pg_get_object_address('table', '{pg_class}', '{}')",
+        ],
+    ),
+    # ----------------------------------- RP-203 the system views' rules
+    "pg_rewrite lists the system views' rules": (
+        "RP-203",
+        True,
+        [
+            "select count(*) from pg_rewrite where ev_class = 'pg_roles'::regclass",
+            "select pg_describe_object('pg_rewrite'::regclass, oid, 0) from pg_rewrite "
+            "where ev_class = 'pg_roles'::regclass",
+            "select count(*) from pg_rewrite",
         ],
     ),
     # ------------------------------- RP-200 a block's own index definitions
@@ -1402,7 +1443,7 @@ EXPECTED: dict[str, Any] = {
         [("['1']",)],
         "ROLLBACK",
     ],
-    "pg_describe_object and its siblings": [
+    "pg_describe_object": [
         "BEGIN",
         [
             (
@@ -1413,29 +1454,53 @@ EXPECTED: dict[str, Any] = {
                 "schema public",
             )
         ],
-        [("(table,pg_catalog,pg_class,pg_catalog.pg_class)", '(table,"{pg_catalog,pg_class}",{})')],
-        [("1259", "1259", "0")],
         "CREATE OPERATOR FAMILY",
         "CREATE OPERATOR CLASS",
         [("operator class rp51_c for access method btree",)],
         [("operator family rp51_f for access method btree",)],
         [
             (
-                "operator 1 (integer, integer) of operator family "
-                "rp51_f for access method btree: <(integer,integer)",
+                "operator 1 (integer, integer) of operator family rp51_f for access "
+                "method btree: <(integer,integer)",
             )
         ],
         [
             (
-                "function 1 (integer, integer) of operator family "
-                "rp51_f for access method btree: "
-                "btint4cmp(integer,integer)",
+                "function 1 (integer, integer) of operator family rp51_f for access "
+                "method btree: btint4cmp(integer,integer)",
             )
         ],
         "CREATE TRANSFORM",
         [("transform for integer language sql",)],
         "CREATE SUBSCRIPTION",
         [("subscription rp51_s",)],
+        "CREATE SCHEMA",
+        "CREATE TABLE",
+        "CREATE VIEW",
+        "CREATE SEQUENCE",
+        "CREATE INDEX",
+        [("default value for column a of table rp51_ds.t",)],
+        [("constraint c on table rp51_ds.t",)],
+        [("rule _RETURN on view rp51_ds.v",)],
+        [("column a of table rp51_ds.t", "type rp51_ds.t")],
+        [
+            ("index rp51_ds.rp51_di",),
+            ("sequence rp51_ds.s",),
+            ("table rp51_ds.t",),
+            ("view rp51_ds.v",),
+        ],
+        "SAVEPOINT",
+        ("ERR", "XX000", "unrecognized object class: 0", None),
+        "ROLLBACK",
+        "SAVEPOINT",
+        ("ERR", "XX000", "unrecognized object class: 12000", None),
+        "ROLLBACK",
+        [("None",)],
+        [("function btint4cmp(integer,integer)",)],
+        [("cast from integer to bigint",)],
+        [("database postgres",)],
+        [("extension plpgsql",)],
+        [("pg_type", "pg_type[]", "cstring[]")],
         "ROLLBACK",
     ],
     "pg_get_indexdef of an index the block created": [
@@ -1446,6 +1511,15 @@ EXPECTED: dict[str, Any] = {
         [("CREATE INDEX rp51_gi ON public.rp51_g USING btree (a)", "a")],
         [("CHECK ((a > 0))",)],
         "ROLLBACK",
+    ],
+    "pg_identify_object and its siblings": [
+        [("(table,pg_catalog,pg_class,pg_catalog.pg_class)", '(table,"{pg_catalog,pg_class}",{})')],
+        [("1259", "1259", "0")],
+    ],
+    "pg_rewrite lists the system views' rules": [
+        [("1",)],
+        [("rule _RETURN on view pg_roles",)],
+        [("142",)],
     ],
     "pg_subscription lists every database's subscriptions": [
         "DROP DATABASE",

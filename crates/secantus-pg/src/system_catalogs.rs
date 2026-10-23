@@ -182,6 +182,27 @@ pub(crate) fn builtin_opclasses() -> Vec<secantus_pgplan::misc_alter::OpClass> {
         .collect()
 }
 
+/// PostgreSQL 15.19's types as dumped (`pg_type`): `(oid, schema, name,
+/// array)`, the catalogs' and system views' row types among them.
+pub(crate) fn builtin_composites() -> Vec<(i64, String, String, i64)> {
+    dumped("pg_type")
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            let schema = match *f.get(2)? {
+                "11" => "pg_catalog",
+                _ => "information_schema",
+            };
+            Some((
+                f.first()?.parse().ok()?,
+                schema.to_string(),
+                (*f.get(1)?).to_string(),
+                f.get(14)?.parse().ok()?,
+            ))
+        })
+        .collect()
+}
+
 /// A built-in operator family: `(oid, opfmethod, opfname)`.
 pub(crate) fn builtin_opfamilies() -> &'static [(i64, i64, String)] {
     static T: std::sync::OnceLock<Vec<(i64, i64, String)>> = std::sync::OnceLock::new();

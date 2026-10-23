@@ -1,7 +1,8 @@
 """Batch 52 of the Rust PG server (2026-10-24): the regression tests of
-RP-200 -- a block reads its own index definitions and shared comments
+RP-200 (a block reads its own index definitions and shared comments
 through `pg_get_indexdef` and `shobj_description`, and another session
-does not.
+does not) and of RP-204 and RP-206 to RP-209, found while building
+`pg_describe_object`; and the gap tests of RP-205 and RP-210.
 
 The scenarios run as `test_rp_batch34.py`'s do. The expected answers were
 measured on a private, freshly initdb'd PostgreSQL 15.19 cluster by running
@@ -9,8 +10,8 @@ this file as a script:
 
     PYTHONPATH=. python tests/backlog/test_rp_batch52.py "host=127.0.0.1 port=5499 user=postgres"
 
-which prints `EXPECTED` for pasting back. Every scenario runs in
-transactions it rolls back.
+which prints `EXPECTED` for pasting back. Every scenario that changes
+anything runs in transactions it rolls back.
 """
 
 from __future__ import annotations
@@ -45,6 +46,100 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
             "select count(*) from pg_indexes where indexname = 'rp52_i'",
         ],
     ),
+    "an executor function in a PL/pgSQL expression": (
+        "RP-204",
+        False,
+        [
+            "begin",
+            "create sequence rp52_s",
+            "~do $$ declare x bigint; begin x := nextval('rp52_s'); x := nextval('rp52_s'); "
+            "raise notice 'got %', x; end $$",
+            "savepoint e",
+            "do $$ declare x bigint; begin x := nextval('rp52_nosuch'); end $$",
+            "rollback to savepoint e",
+            "savepoint e",
+            "do $$ declare x text; begin x := pg_describe_object(99, 1, 0); end $$",
+            "rollback to savepoint e",
+            "~do $$ declare x text; begin "
+            "x := pg_describe_object('pg_class'::regclass, 'pg_class'::regclass, 0); "
+            "raise notice '%', x; end $$",
+            "rollback",
+        ],
+    ),
+    "a view over another schema's table depends on it": (
+        "RP-206",
+        False,
+        [
+            "begin",
+            "create schema rp52_s",
+            "create table rp52_s.t (a int, b int)",
+            "create view rp52_s.v as select a from rp52_s.t",
+            "create view rp52_pv as select t.b from rp52_s.t t",
+            "select pg_describe_object(classid, objid, objsubid), refobjsubid, deptype "
+            "from pg_depend where refobjid = 'rp52_s.t'::regclass "
+            "and classid = 'pg_rewrite'::regclass order by 1, 2",
+            "rollback",
+        ],
+    ),
+    "pg_depend of a table, its view and its row type": (
+        "RP-205",
+        True,
+        [
+            "begin",
+            "create table rp52_d (a int default 1, constraint rp52_dc check (a > 0))",
+            "create view rp52_dv as select a from rp52_d",
+            "create index rp52_di on rp52_d (a)",
+            "select 'rp52_d'::regclass::oid <> 'rp52_d'::regtype::oid, "
+            "(select reltype from pg_class where oid = 'rp52_d'::regclass) = 'rp52_d'::regtype",
+            "select pg_describe_object(classid, objid, objsubid), refobjsubid, deptype "
+            "from pg_depend where refobjid = 'rp52_d'::regclass order by 1, 2",
+            "select pg_describe_object(classid, objid, objsubid), "
+            "pg_describe_object(refclassid, refobjid, refobjsubid), deptype from pg_depend "
+            "where objid = (select typarray from pg_type where oid = 'rp52_d'::regtype)",
+            "rollback",
+        ],
+    ),
+    "an index in another schema is listed in it": (
+        "RP-207",
+        False,
+        [
+            "begin",
+            "create schema rp52_x",
+            "create table rp52_x.t (a int)",
+            "create index rp52_xi on rp52_x.t (a)",
+            "select relname, relnamespace::regnamespace::text from pg_class "
+            "where relname in ('t', 'rp52_xi') and relnamespace = 'rp52_x'::regnamespace "
+            "order by 1",
+            "rollback",
+        ],
+    ),
+    "a built-in row type's name": (
+        "RP-208",
+        False,
+        [
+            "select 71::regtype::text, format_type(210, null), 1263::regtype::text, "
+            "'information_schema.tables'::regtype::oid::regtype::text",
+        ],
+    ),
+    "plpgsql's extension oid": (
+        "RP-209",
+        False,
+        [
+            "select oid::int, extname from pg_extension where extname = 'plpgsql'",
+        ],
+    ),
+    "the visibility functions of an oid that names nothing": (
+        "RP-210",
+        True,
+        [
+            "select pg_table_is_visible(1), pg_type_is_visible(1), pg_function_is_visible(1), "
+            "pg_operator_is_visible(1), pg_opclass_is_visible(1), pg_opfamily_is_visible(1), "
+            "pg_collation_is_visible(1), pg_conversion_is_visible(1)",
+            "select pg_statistics_obj_is_visible(1), pg_ts_parser_is_visible(1), "
+            "pg_ts_dict_is_visible(1), pg_ts_template_is_visible(1), pg_ts_config_is_visible(1)",
+            "select pg_type_is_visible('int4'::regtype), pg_function_is_visible('now'::regproc)",
+        ],
+    ),
 }
 
 EXPECTED: dict[str, Any] = {
@@ -60,7 +155,63 @@ EXPECTED: dict[str, Any] = {
         "ROLLBACK",
         [("default administrative connection database",)],
         [("0",)],
-    ]
+    ],
+    "a built-in row type's name": [
+        [("pg_type", "pg_type[]", "cstring[]", "information_schema.tables")]
+    ],
+    "a view over another schema's table depends on it": [
+        "BEGIN",
+        "CREATE SCHEMA",
+        "CREATE TABLE",
+        "CREATE VIEW",
+        "CREATE VIEW",
+        [("rule _RETURN on view rp52_pv", "2", "n"), ("rule _RETURN on view rp52_s.v", "1", "n")],
+        "ROLLBACK",
+    ],
+    "an executor function in a PL/pgSQL expression": [
+        "BEGIN",
+        "CREATE SEQUENCE",
+        ("DO", ["got 2"]),
+        "SAVEPOINT",
+        ("ERR", "42P01", 'relation "rp52_nosuch" does not exist', None),
+        "ROLLBACK",
+        "SAVEPOINT",
+        ("ERR", "XX000", "unrecognized object class: 99", None),
+        "ROLLBACK",
+        ("DO", ["table pg_class"]),
+        "ROLLBACK",
+    ],
+    "an index in another schema is listed in it": [
+        "BEGIN",
+        "CREATE SCHEMA",
+        "CREATE TABLE",
+        "CREATE INDEX",
+        [("rp52_xi", "rp52_x"), ("t", "rp52_x")],
+        "ROLLBACK",
+    ],
+    "pg_depend of a table, its view and its row type": [
+        "BEGIN",
+        "CREATE TABLE",
+        "CREATE VIEW",
+        "CREATE INDEX",
+        [("True", "True")],
+        [
+            ("constraint rp52_dc on table rp52_d", "1", "a"),
+            ("constraint rp52_dc on table rp52_d", "1", "n"),
+            ("default value for column a of table rp52_d", "1", "a"),
+            ("index rp52_di", "1", "a"),
+            ("rule _RETURN on view rp52_dv", "1", "n"),
+            ("type rp52_d", "0", "i"),
+        ],
+        [("type rp52_d[]", "type rp52_d", "i")],
+        "ROLLBACK",
+    ],
+    "plpgsql's extension oid": [[("14031", "plpgsql")]],
+    "the visibility functions of an oid that names nothing": [
+        [("None", "None", "None", "None", "None", "None", "None", "None")],
+        [("None", "None", "None", "None", "None")],
+        [("True", "True")],
+    ],
 }
 
 

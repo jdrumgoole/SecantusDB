@@ -76,6 +76,7 @@ mod live;
 mod live_notices;
 mod lock_manager;
 mod merge;
+mod objaddr;
 mod object_acl;
 mod opclasses;
 mod owned;
@@ -1507,17 +1508,24 @@ impl PlHost<'_> {
         self.h.check_sql_privileges(sql).map_err(|e| pl_error(&e))?;
         let run = |stmt: &Statement| self.h.subquery_rows(stmt);
         let declared: Vec<Option<String>> = types.iter().map(|t| Some(t.clone())).collect();
-        secantus_pgplan::planning_to_execute(|| {
-            secantus_pgplan::plan_with_session_types_and_subqueries(
-                sql,
-                &|n| self.h.lookup(n),
-                params,
-                &declared,
-                &tz,
-                Some(&run),
-            )
-        })
-        .map_err(|e| pl_error(&PgHandler::err(&e)))
+        // With the executor's hooks, as a top-level statement plans: a body
+        // runs while its CALLER executes, after that statement's hooks are
+        // gone, and without them `x := nextval('nosuch')` folded to NULL
+        // where PostgreSQL raises 42P01.
+        self.h
+            .with_executor_hooks(|| {
+                secantus_pgplan::planning_to_execute(|| {
+                    secantus_pgplan::plan_with_session_types_and_subqueries(
+                        sql,
+                        &|n| self.h.lookup(n),
+                        params,
+                        &declared,
+                        &tz,
+                        Some(&run),
+                    )
+                })
+            })
+            .map_err(|e| pl_error(&PgHandler::err(&e)))
     }
 }
 
@@ -2059,6 +2067,17 @@ impl plpgsql_fn::Host for PlHost<'_> {
         // Out at once, as PostgreSQL sends a RAISE: a function that then
         // runs on (a loop, a long query) does not hold it back.
         self.h.send_live_notices();
+    }
+}
+
+/// The oid of the `i`th extension `extensions()` lists: `plpgsql`'s is
+/// 14031, as `initdb` leaves it in PostgreSQL 15.19; the others follow the
+/// built-in band.
+pub(crate) fn extension_oid(i: usize) -> i64 {
+    if i == 0 {
+        14_031
+    } else {
+        13_826 + i as i64
     }
 }
 
@@ -5412,6 +5431,7 @@ impl PgHandler {
         secantus_pgplan::set_extension_types(extension_types);
         secantus_pgplan::set_installed_extensions(self.extension_schemas());
         secantus_pgplan::misc_alter::install_opclasses(system_catalogs::builtin_opclasses);
+        secantus_pgplan::pgtypes::install_catalog_composites(system_catalogs::builtin_composites);
         secantus_pgplan::misc_alter::set_user_access_methods(
             self.user_access_methods()
                 .into_iter()
@@ -17119,7 +17139,7 @@ impl PgHandler {
             .enumerate()
         {
             if let Some(c) = catalog_fill::extension_description(&name) {
-                out.push((13_826 + i as i64, 0, c.to_string()));
+                out.push((crate::extension_oid(i), 0, c.to_string()));
             }
         }
         for def in self.all_table_defs().unwrap_or_default() {
@@ -18988,7 +19008,15 @@ impl PgHandler {
                 for ix in &indexes {
                     let mut d = Document::new();
                     d.insert(f("oid"), Bson::Int64(ix.oid));
-                    d.insert(f("relname"), ix.name.as_str());
+                    // In its table's schema: the `schema.name` key that
+                    // `schema_qualify_rows` splits, as a table's is.
+                    let schema = secantus_pgplan::schemas::split_key(&ix.table.name).0;
+                    let key = if schema == "public" {
+                        ix.name.clone()
+                    } else {
+                        format!("{schema}.{}", ix.name)
+                    };
+                    d.insert(f("relname"), key.as_str());
                     d.insert(f("relnamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
                     d.insert(
                         f("relkind"),
@@ -20374,7 +20402,7 @@ impl PgHandler {
                     let mut d = Document::new();
                     d.insert(
                         def.field_of("oid").expect("column"),
-                        Bson::Int64(13_826 + i as i64),
+                        Bson::Int64(crate::extension_oid(i)),
                     );
                     d.insert(def.field_of("extname").expect("column"), name);
                     d.insert(def.field_of("extversion").expect("column"), version);
@@ -27416,6 +27444,9 @@ impl PgHandler {
         }
         if name == "pg_has_role" {
             return self.has_role_call(args);
+        }
+        if name == "pg_describe_object" {
+            return self.within_block(|| self.describe_object_call(args));
         }
         if name == "pg_blocking_pids" {
             // PostgreSQL 15: the int4[] of sessions holding what the given
