@@ -12635,6 +12635,9 @@ impl PgHandler {
         }
         let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
         let relations = secantus_pgplan::privileges::sql_relations(sql);
+        // A cancel that cut the parse short is taken here: the passes below
+        // would each parse the statement again (RP-002).
+        self.check_cancel()?;
         // PostgreSQL assigns a transaction its xid at its first write; the
         // granted transactionid row `pg_locks` shows comes from that
         // assignment. Re-assignments return the same xid.
@@ -28137,6 +28140,8 @@ impl PgHandler {
             // between them, as through PostgreSQL's parse analysis.
             self.check_cancel()?;
             self.with_cancel_hook(|| self.wait_for_table_locks(sql))?;
+            // The lock pass swallows a parse a cancel cut short: take it.
+            self.check_cancel()?;
             self.isolate_for_planning(sql)?;
         }
         // Whatever path the statement takes, a planning transaction it left

@@ -765,10 +765,16 @@ pub(crate) fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
 /// - `OPERATOR(s.=)` (or `<`, ...) named with citext's schema is citext's
 ///   comparison of the lowered strings whether or not the path reaches
 ///   `s`; named with `pg_catalog` it is text's.
-pub fn citext_operators(node: &mut N, lookup: &dyn Fn(&str) -> Option<TableDef>) {
+pub fn citext_operators(
+    node: &mut N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> crate::Result<()> {
     let Some(schema) = crate::extension_schema("citext") else {
-        return;
+        return Ok(());
     };
+    // A walk of the whole statement: a cancellation point first and every
+    // so many nodes, as between every pass.
+    crate::cancel::check()?;
     let tables: Vec<TableDef> = node
         .nodes()
         .into_iter()
@@ -798,7 +804,12 @@ pub fn citext_operators(node: &mut N, lookup: &dyn Fn(&str) -> Option<TableDef>)
     // SAFETY: the pointers `nodes_mut` hands out point into `node`, which
     // outlives the loop; each AExpr is changed in place, never replaced.
     unsafe {
-        for (n, _, _) in node.nodes_mut() {
+        let nodes = node.nodes_mut();
+        crate::cancel::check()?;
+        for (i, (n, _, _)) in nodes.into_iter().enumerate() {
+            if i % 4096 == 0 {
+                crate::cancel::check()?;
+            }
             let pg_query::NodeMut::AExpr(e) = n else {
                 continue;
             };
@@ -854,6 +865,7 @@ pub fn citext_operators(node: &mut N, lookup: &dyn Fn(&str) -> Option<TableDef>)
             }
         }
     }
+    Ok(())
 }
 
 fn as_text_fn(arg: pg_query::protobuf::Node) -> pg_query::protobuf::Node {

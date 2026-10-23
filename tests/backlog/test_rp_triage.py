@@ -38,6 +38,35 @@ def test_cancel_during_parse_is_honoured_at_once(pg: Any) -> None:
     assert elapsed - delay < 0.5, f"cancel honoured {elapsed - delay:.2f} s after it was sent"
 
 
+@pytest.mark.backlog_fixed("RP-002")
+def test_cancel_during_parse_is_honoured_with_user_code_present(pg: Any) -> None:
+    """As `test_cancel_during_parse_is_honoured_at_once`, with a user function
+    that shadows a built-in in the database. A statement that may run user
+    code is one transaction, so the lock pass parses it first: that pass
+    swallowed the cut-short parse, the passes after it parsed the statement
+    again, and the cancel waited about 0.3 s on a developer machine and 0.6 s
+    on CI (PR #2125)."""
+    pg.execute("create function rp002_upper(int) returns int language sql as 'select 1'")
+    pg.execute("create function upper(int) returns int language sql as 'select 1'")
+    try:
+        sql = "select pg_sleep(3), 1 in (" + ",".join(str(i) for i in range(200_000)) + ")"
+        delay = 0.5
+        timer = threading.Timer(delay, pg.cancel)
+        t0 = time.monotonic()
+        timer.start()
+        answer = pg_answer(pg, sql)
+        elapsed = time.monotonic() - t0
+        timer.join()
+        assert answer[:2] == ("err", "57014")
+        # PostgreSQL 15.19 answers 0.015 s after the cancel. The budget is
+        # tighter than the test above's so the shape fails here without the
+        # fix (0.27 s on a developer machine), not only on CI.
+        assert elapsed - delay < 0.25, f"cancel honoured {elapsed - delay:.2f} s after it was sent"
+    finally:
+        pg.execute("drop function rp002_upper(int)")
+        pg.execute("drop function upper(int)")
+
+
 @pytest.mark.backlog_fixed("RP-003")
 def test_national_literal_under_nonconforming_strings(pg: Any) -> None:
     """PostgreSQL 15.19: with `standard_conforming_strings = off`, `N'a\\\\b'`

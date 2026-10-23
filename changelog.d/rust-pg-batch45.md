@@ -29,6 +29,18 @@ constants with their types.
   - **Lists:** `IN` as `= ANY (ARRAY[...])` and `NOT IN` as `<> ALL`, one
     value as a plain comparison.
 
+- A cancel during a large statement's parse waited 0.3 to 0.7 s once the
+  database held a user function. Such a statement is run as one
+  transaction, so the table-lock pass parses it first; that pass swallows a
+  parse a cancel cut short, and the passes after it parsed the statement
+  again before anything took the cancel. The lock pass now takes it at
+  once, and the planner's passes from batches 43 and 44 (a user function
+  named like a built-in, citext's operators) poll for it as they walk
+  (RP-002's regression,
+  `tests/backlog/test_rp_triage.py::test_cancel_during_parse_is_honoured_with_user_code_present`,
+  and `test_cancel_during_parse_is_honoured_at_once`, which CI failed on
+  PRs #2124 and #2125).
+
 #### Known
 
 - RP-105, what is left: an extension's functions, operators, casts and
