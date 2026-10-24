@@ -529,20 +529,16 @@ These are explicit non-goals. Don't add them without a reason.
       Backlog-ID: RM-023
       Verify: tests/backlog/test_rm_001_028.py::test_slow_query_line_says_where_the_time_went
 
-- [ ] **A slow operation's log line takes no global lock.** mongod logs an
-  operation slower than `slowms` (100 ms) and takes the global lock in IS to
-  read its storage statistics for the `Slow query` line: one more global IS
-  in `serverStatus.locks` for each operation it logs, each upsert a `$merge`
-  makes included. With `slowms` 0, `$merge` creating its target reads 8
-  global IS where it reads 2 with nothing logged, and a `find` 2 where it
-  reads 1 (measured 8.2.11, 2026-10-24). The Rust server writes the `Slow
-  query` line for the command (`secantus-server/src/lib.rs`) but counts no
-  lock for it, and logs no line for a `$merge`'s writes. Found 2026-10-24
-  as the cause of RM-274's lock-count flake: under disk load a collection
-  create crosses 100 ms. The RM-185 tests now set `slowms` out of reach on
-  both servers.
-  Backlog-ID: RM-299
-  Verify: tests/backlog/test_rm_185_locks.py::test_a_slow_operation_takes_the_global_lock_to_log
+- [ ] **`getLog` lines are text, mongod's are its structured log.** mongod
+  8.2.11 answers `getLog` with its structured log: one JSON document per
+  line, `{"t": {"$date": ...}, "s": "I", "c": "COMMAND", "id": 51803,
+  "ctx": "conn12", "msg": "Slow query", "attr": {...}}`. This server's
+  lines are `<date> I COMMAND Slow query {...}` (`logbuf.rs`), with no `id`
+  or `ctx` field and the attributes after the message. A tool that parses
+  the log as mongod writes it reads none of them. Found 2026-10-24 with
+  RM-299.
+  Backlog-ID: RM-302
+  Verify: tests/backlog/test_rm_001_028.py::test_get_log_lines_are_structured_json
 ### 7.091 mongod's slot-based engine (SBE) -- 2026-10-23
 
 mongod 8.2 runs the front of a pipeline in its slot-based engine when it can
@@ -1002,30 +998,41 @@ Still different:
       in memory answers 115 with this server's own text, because mongod's
       in-memory engine is Enterprise-only and its message could not be
       measured.
-- [ ] **`serverStatus.locks`: `$merge`'s retries, the transaction commands,
-      and the commands not measured.** The lock manager (`lock_manager.rs`,
-      RM-034) takes, outside a transaction, the rounds mongod 8.2.11 takes
-      (`statement_rounds`, measured per command): reads, the write commands,
-      `findAndModify`, `create` / `drop` / `dropDatabase`, index builds,
-      `dropIndexes`, `$out`, `dbStats`, and `$merge`, which takes a write
-      round per document as it writes (`write_rounds`, two more when it
-      creates its target), all count as mongod's (the regression tests in
-      `tests/backlog/test_rm_185_locks.py`). An index build's count of the
-      global IS is not fixed on mongod: its build runs on a thread of its
-      own and the command takes the IS each time it looks at it, 1 to 4
+- [ ] **`serverStatus.locks`: locks taken before a command parses, the
+      transaction commands, and the commands not measured.** The lock
+      manager (`lock_manager.rs`, RM-034) takes, outside a transaction, the
+      rounds mongod 8.2.11 takes (`statement_rounds`, measured per command):
+      reads, the write commands, `findAndModify`, `create` / `drop` /
+      `dropDatabase`, index builds, `dropIndexes`, `$out`, `dbStats`, and
+      `$merge`, which takes a write round per document as it writes
+      (`write_rounds`, two more when it creates its target, and with
+      `whenMatched: "fail"` mongod's retries after a duplicate). Since
+      2026-10-24 also the commands that read no data (none), `rolesInfo` /
+      `usersInfo`, `dataSize` / `filemd5` / the plan-cache commands,
+      `explain`, `dbHash` and `listDatabases` (one more global IS per
+      database whose size it reads), and the global IS of a slow
+      operation's log line (RM-299). All count as mongod's (the regression
+      tests in `tests/backlog/test_rm_185_locks.py`). An index build's count
+      of the global IS is not fixed on mongod: its build runs on a thread of
+      its own and the command takes the IS each time it looks at it, 1 to 4
       times in one shape measured; this server takes the least mongod was
       seen to, and the tests compare that count as a floor. Still different:
-      `$merge` with `whenMatched: "fail"` that meets a duplicate retries its
-      batch on mongod, taking more rounds (3 for 4 documents with one
-      duplicate, 4 with two) where this server takes the batch's one; the
+      mongod takes a command's locks inside it, after it parses, so a
+      malformed one (`{explain: 1}`, `{dataSize: 1}`) takes none, where this
+      server takes the command's chain before running it;
+      `validateDBMetadata` reads each collection (8 global IS for a
+      database of two), which this server gives the generic chain; the
       transaction commands, which need a replica set, were measured on a
       one-member mongod 8.2.11 set (2026-10-17) cannot be pinned the same
       way: its replication threads take the global IS about twice in any
       window, and its writes take rounds for the oplog and the session table
       too (a plain insert three where a standalone takes one; a one-insert
       transaction with its commit 3 collection IX, 2 global IX and 8 on the
-      state transition lock), machinery this server does not run; and no
-      other command was measured, so each still takes the generic chain. mongod's internal resources
+      state transition lock), machinery this server does not run; and the
+      commands neither measured on 2026-10-24 (a sweep of the 115 both
+      servers list, in valid forms) nor named above still take the generic
+      chain -- those that write, wait, change the server or need a replica
+      set were left out of the sweep. mongod's internal resources
       (`Metadata`, `oplog`, `Mutex`, `MultiDocumentTransactionsBarrier`) are
       locked by its background threads only and are absent here.
       **Time-based plan yields** (measured 2026-10-21): mongod's executor
@@ -1035,17 +1042,11 @@ Still different:
       loaded Mac; with the period off, macOS reads 7 too. So this server
       takes Linux's 7, and the regression tests' reference mongod runs with
       the period off, which gives Linux's counts on any machine and stops
-      them moving with load. Still unexplained: at 12 test workers on a
-      12-core Mac, `$merge creating its target` read 4 global IS (2 idle) in
-      all five reference runs, with yielding off as well; at CI's 4 workers
-      it reads 2. Four coverage runs on 2026-10-21 (backlog verifier at 4
-      workers, against an instrumented debug build of this server) reported
-      RM-185 REGRESSED twice: once `test_lock_counts_of_merge`, once
-      `test_lock_counts_of_index_build_and_out_shapes`, where the yield-off
-      reference mongod itself read 8 global IS for `$out again` in one of
-      its five runs and 7 in the others -- drift on mongod's side.
+      them moving with load. The counts that still moved under load were
+      mongod's slow-operation log (RM-274, closed 2026-10-24): the tests set
+      `slowms` out of reach on both servers.
       Backlog-ID: RM-185
-      Verify: tests/backlog/test_rm_185_locks.py::test_lock_counts_of_merge_fail_with_duplicates
+      Verify: tests/backlog/test_rm_185_locks.py::test_lock_counts_before_a_command_parses
 - **Scope decision — `replSetReconfig` takes one member, this server**
   (2026-10-20, under "Explicitly out of scope: real replica sets"). mongod
   8.2.11 accepts a configuration that adds a member it cannot reach and

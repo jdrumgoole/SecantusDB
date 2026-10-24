@@ -653,6 +653,34 @@ enum StatementOutcome {
 }
 
 impl Statement {
+    /// The statement's `Slow query` line, before its duration: mongod's
+    /// attributes for a write statement, in its order (measured 8.2.11,
+    /// 2026-10-24), as far as this server keeps them (RM-023).
+    fn log_attributes(&self) -> Document {
+        let mut attr =
+            doc! { "type": self.op, "ns": self.ns.clone(), "command": self.command.clone() };
+        match &self.outcome {
+            StatementOutcome::Updated {
+                matched,
+                modified,
+                upserted,
+            } => {
+                attr.insert("nMatched", *matched);
+                attr.insert("nModified", *modified);
+                attr.insert("nUpserted", *upserted);
+            }
+            StatementOutcome::Deleted(n) => {
+                attr.insert("ndeleted", *n);
+            }
+            StatementOutcome::Failed(error) => {
+                attr.insert("ok", 0_i32);
+                attr.insert("errCode", error.get_i32("code").unwrap_or(0));
+            }
+        }
+        attr.insert("numYields", 0_i32);
+        attr
+    }
+
     fn entry(&self, who: &Who) -> Document {
         let mut entry =
             doc! { "op": self.op, "ns": self.ns.clone(), "command": abbreviated(&self.command) };
@@ -692,6 +720,8 @@ impl Statement {
 /// is not profiled, as on mongod) and closed by the next one or the end.
 pub(crate) struct Statements {
     armed: bool,
+    /// The command is profiled, so each statement gets an entry.
+    profiled: bool,
     open: Option<Open>,
 }
 
@@ -709,8 +739,12 @@ struct Open {
 
 impl Statements {
     pub(crate) fn start() -> Self {
+        let profiled = STATEMENTS.with(|s| s.borrow().is_some());
         Statements {
-            armed: STATEMENTS.with(|s| s.borrow().is_some()),
+            // A statement is timed when it is profiled or may be logged as
+            // slow (`slowop::statement`).
+            armed: profiled || crate::slowop::armed(),
+            profiled,
             open: None,
         }
     }
@@ -783,19 +817,23 @@ impl Statements {
                 upserted,
             }
         };
+        let worked = open.start.elapsed();
         let statement = Statement {
             ns: format!("{}.{}", open.db, open.coll),
             db: open.db,
             op: open.op,
             command: open.command,
             outcome,
-            millis: open.start.elapsed().as_millis() as i64,
+            millis: worked.as_millis() as i64,
         };
-        STATEMENTS.with(|s| {
-            if let Some(list) = s.borrow_mut().as_mut() {
-                list.push(statement);
-            }
-        });
+        crate::slowop::statement("WRITE", statement.log_attributes(), worked);
+        if self.profiled {
+            STATEMENTS.with(|s| {
+                if let Some(list) = s.borrow_mut().as_mut() {
+                    list.push(statement);
+                }
+            });
+        }
     }
 }
 

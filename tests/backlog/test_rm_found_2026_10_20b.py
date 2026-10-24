@@ -747,6 +747,29 @@ def test_short_admin_commands_answer_as_mongod(rust_mongo: Any, mongod_rs: Any) 
     assert _short_admin_replies(rust_mongo) == _short_admin_replies(mongod_rs)
 
 
+@pytest.mark.backlog_fixed("RM-303")
+def test_filemd5_of_no_chunks_collection(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """`filemd5` over a `<root>.chunks` that does not exist needs no plan:
+    mongod answers no chunks and the MD5 of nothing, `notablescan` or not
+    (measured 8.2.11, 2026-10-24). This server refused it with 291, the
+    planner error mongod gives only when chunks exist without an index."""
+
+    def run(client: Any) -> list:
+        db = client.rm300
+        db.drop_collection("none.chunks")
+        noise = ("$clusterTime", "operationTime")
+        return [
+            answer(
+                lambda r=r: {
+                    k: v for k, v in db.command("filemd5", 1, root=r).items() if k not in noise
+                }
+            )
+            for r in ("none", "absent")
+        ]
+
+    assert run(rust_mongo) == run(mongod_rs)
+
+
 # ------------------------------------------------------ RM-220 fsync lock --
 
 

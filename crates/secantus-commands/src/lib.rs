@@ -2004,6 +2004,8 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
         }
     };
     let _current = lock_manager::enter(ctx.locks.as_ref());
+    // The command's write statements log themselves when slow, as mongod's do.
+    let _slow = slowop::enter(ctx);
     match handler(doc, ctx) {
         Ok(reply) => {
             if budget > 0 {

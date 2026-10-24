@@ -373,6 +373,31 @@ def test_slow_query_line_says_where_the_time_went(rust_mongo: Any, mongod: Any) 
     assert answers["rust"] == answers["mongod"]
 
 
+def _log_shape(client: Any) -> list:
+    """The shape of each `getLog` line: whether it is JSON, and its fields."""
+    client.admin.command("ping")
+    out = []
+    for line in client.admin.command("getLog", "global")["log"][-5:]:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            out.append(("not JSON", line.split(" ", 3)[:3]))
+            continue
+        out.append(("JSON", sorted(k for k in entry if k in ("t", "s", "c", "id", "ctx", "msg"))))
+    return out
+
+
+@pytest.mark.backlog("RM-302")
+def test_get_log_lines_are_structured_json(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11's `getLog` lines are its structured log, one JSON
+    document each with `t`, `s`, `c`, `id`, `ctx` and `msg` (measured
+    2026-10-24). This server's are text: `<date> <severity> <component>
+    <message>`."""
+    want = [("JSON", ["c", "ctx", "id", "msg", "s", "t"])] * 5
+    assert _log_shape(mongod) == want
+    assert _log_shape(rust_mongo) == want
+
+
 @pytest.mark.backlog_fixed("RM-025")
 def test_fcv_80_refuses_a_feature_82_added(rust_mongo: Any) -> None:
     """mongod 8.2.11 at FCV 8.0 refuses `$sigmoid` (added in 8.2) with 224

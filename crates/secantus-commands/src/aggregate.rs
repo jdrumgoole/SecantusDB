@@ -4450,12 +4450,21 @@ fn apply_merge(
             if encoded.is_empty() {
                 continue;
             }
-            // One round for the batch (mongod 8.2.11, when it inserts
-            // cleanly; its retries after a duplicate are not reproduced).
-            let _round = crate::lock_manager::write_rounds(&merge.db, &merge.coll, 1);
+            let batch = encoded.len();
+            let round = crate::lock_manager::write_rounds(&merge.db, &merge.coll, 1);
             let (_, errors) = storage
                 .insert(&merge.db, &merge.coll, encoded, false)
                 .map_err(command_error)?;
+            drop(round);
+            let failed: Vec<usize> = errors
+                .iter()
+                .filter_map(|e| usize::try_from(crate::util::as_i64_field(e, "index")).ok())
+                .collect();
+            drop(crate::lock_manager::write_rounds(
+                &merge.db,
+                &merge.coll,
+                merge_fail_rounds(batch, &failed).saturating_sub(1),
+            ));
             if let Some(error) = errors.into_iter().next() {
                 let mut e = write_error_of(&error);
                 if e.code == 11000 {
@@ -4586,6 +4595,66 @@ fn apply_merge(
 /// The most statements one write command takes, which is as many as mongod
 /// puts in one of the stage's batches.
 const MERGE_BATCH: usize = 100_000;
+
+/// The write rounds mongod 8.2.11 takes inserting a `whenMatched: "fail"`
+/// batch of `batch` documents, unordered, of which those at `failed` are
+/// duplicates (measured 2026-10-24, 27 shapes). It tries the whole batch at
+/// once, and a duplicate rolls that back -- a round, not taken for a batch
+/// of one. Then it inserts again from the start of what is left: each try
+/// commits up to the next duplicate and ends there, a round each, and the
+/// run after the last duplicate is one more. One round when nothing fails.
+fn merge_fail_rounds(batch: usize, failed: &[usize]) -> usize {
+    let Some(&last) = failed.iter().max() else {
+        return 1;
+    };
+    let whole = usize::from(batch > 1);
+    let mut positions: Vec<usize> = failed.to_vec();
+    positions.sort_unstable();
+    positions.dedup();
+    whole + positions.len() + usize::from(last + 1 < batch)
+}
+
+#[cfg(test)]
+mod merge_fail_rounds_tests {
+    use super::merge_fail_rounds;
+
+    /// mongod 8.2.11's global IX count for each shape, 2026-10-24.
+    #[test]
+    fn matches_mongod() {
+        let measured: &[(usize, &[usize], usize)] = &[
+            (1, &[0], 1),
+            (2, &[0], 3),
+            (2, &[1], 2),
+            (3, &[0], 3),
+            (3, &[1], 3),
+            (3, &[2], 2),
+            (4, &[0, 2], 4),
+            (4, &[1], 3),
+            (4, &[3], 2),
+            (4, &[0, 1, 2, 3], 5),
+            (6, &[0], 3),
+            (6, &[5], 2),
+            (6, &[2, 4], 4),
+            (8, &[0], 3),
+            (8, &[6], 3),
+            (8, &[7], 2),
+            (8, &[1, 2], 4),
+            (8, &[1, 5], 4),
+            (8, &[0, 7], 3),
+            (8, &[3, 4, 5], 5),
+            (5, &[0, 1, 2, 3, 4], 6),
+            (3, &[0, 1], 4),
+            (4, &[], 1),
+        ];
+        for (batch, failed, rounds) in measured {
+            assert_eq!(
+                merge_fail_rounds(*batch, failed),
+                *rounds,
+                "{batch} {failed:?}"
+            );
+        }
+    }
+}
 
 /// A write error, or a failed reply, as the error a stage raises: its code
 /// and message, and whatever else it carried (`keyPattern`, `errInfo`).

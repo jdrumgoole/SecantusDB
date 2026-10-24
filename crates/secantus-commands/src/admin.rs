@@ -2114,6 +2114,14 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     // The indexes this request has built so far: mongod builds a request's
     // indexes together, so one that fails leaves none of them.
     let mut built_here: Vec<Document> = Vec::new();
+    // Over documents mongod builds on a thread of its own, which logs its
+    // own `Slow query` line when slow (below).
+    // (`Some(0)` is empty; `None` means more than none.)
+    let scans = !matches!(
+        storage.collection_count_at_most(&ctx.db_name, &coll, 0),
+        Ok(Some(0))
+    );
+    let build_started = std::time::Instant::now();
     for spec in &specs {
         let Bson::Document(s) = spec else { continue };
         if let Some(e) = ts_fields
@@ -2477,6 +2485,20 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         }
         any_created |= created;
         any_existed |= !created;
+    }
+    // The build thread's line: type `none`, not from a user connection,
+    // once for a request's indexes, with the global IS it takes (measured
+    // 8.2.11, 2026-10-24; RM-299). An empty collection builds in the
+    // command, which logs alone.
+    if any_created && scans {
+        let attr = doc! {
+            "type": "none",
+            "isFromUserConnection": false,
+            "ns": format!("{}.{coll}", ctx.db_name),
+            "command": doc.clone(),
+            "numYields": 0_i32,
+        };
+        crate::slowop::statement("STORAGE", attr, build_started.elapsed());
     }
 
     let after = storage

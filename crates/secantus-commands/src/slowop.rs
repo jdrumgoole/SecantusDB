@@ -62,6 +62,72 @@ impl SlowOpSettings {
     }
 }
 
+/// Where the statements of the running command log themselves: the server's
+/// settings, its log and its locks. mongod logs each update and delete
+/// statement on a `Slow query` line of its own, component `WRITE`, beside the
+/// command's, a `$merge`'s writes included (measured 8.2.11, 2026-10-24).
+struct Sink {
+    settings: std::sync::Arc<SlowOpSettings>,
+    logs: Option<std::sync::Arc<crate::logbuf::LogBuffer>>,
+    locks: Option<std::sync::Arc<crate::lock_manager::LockManager>>,
+}
+
+thread_local! {
+    static SINK: std::cell::RefCell<Option<Sink>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Makes the command's slow-operation sink current until dropped.
+pub struct SinkScope(Option<Sink>);
+
+/// Enter a command: its statements log through `ctx`'s settings.
+pub fn enter(ctx: &CommandContext) -> SinkScope {
+    let sink = ctx.slow_ops.as_ref().map(|settings| Sink {
+        settings: settings.clone(),
+        logs: ctx.logs.clone(),
+        locks: ctx.locks.clone(),
+    });
+    SinkScope(SINK.with(|s| s.replace(sink)))
+}
+
+impl Drop for SinkScope {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        SINK.with(|s| *s.borrow_mut() = previous);
+    }
+}
+
+/// Whether a statement of the running command can be logged at all.
+pub(crate) fn armed() -> bool {
+    SINK.with(|s| s.borrow().is_some())
+}
+
+/// Log one statement of the running command that ran for `worked`, if that
+/// is slow: a `Slow query` line under `component`, and the global IS mongod
+/// takes for it (`lock_manager::log_lock`). `attr` is the line's attributes
+/// before its durations.
+pub(crate) fn statement(component: &str, mut attr: Document, worked: Duration) {
+    SINK.with(|s| {
+        let sink = s.borrow();
+        let Some(sink) = sink.as_ref() else {
+            return;
+        };
+        if !sink.settings.should_log(worked, rand::random::<f64>()) {
+            return;
+        }
+        if let Some(lm) = &sink.locks {
+            crate::lock_manager::log_lock(lm);
+        }
+        attr.insert("durationMillis", worked.as_millis() as i64);
+        let line = bson::Bson::Document(attr)
+            .into_relaxed_extjson()
+            .to_string();
+        log::info!("Slow query {line}");
+        if let Some(logs) = &sink.logs {
+            logs.append("I", component, format!("Slow query {line}"));
+        }
+    });
+}
+
 /// The reply fields worth a place on the line: what the operation did, or how
 /// it failed. Names follow mongod's `Slow query` attributes.
 fn outcome(name: &str, reply: &Document, out: &mut Document) {

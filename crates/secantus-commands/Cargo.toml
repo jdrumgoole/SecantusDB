@@ -22,6 +22,8 @@ crate-type = ["rlib"]
 
 [dependencies]
 bson = { workspace = true }
+# The server's own log, where a statement's `Slow query` line goes too.
+log = "0.4"
 secantus-wire = { version = "=0.5.3-beta.196", path = "../secantus-wire" }
 # The pure-Rust operator engines — `find` applies projections via
 # `secantus_core::projection`. Pure Rust, no WT, already in the workspace.
