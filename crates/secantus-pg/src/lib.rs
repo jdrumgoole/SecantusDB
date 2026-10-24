@@ -4703,7 +4703,6 @@ impl PgHandler {
     const COMPOSITE_TYPE_OID_BASE: i64 = 67_000;
     const ENUM_COLLECTION: &'static str = "__sql_enums__";
     const ENUM_META_COLLECTION: &'static str = "__sql_enum_meta__";
-    const ENUM_TYPE_OID_BASE: i64 = 65_000;
     const RANGE_COLLECTION: &'static str = "__sql_ranges__";
     const RANGE_TYPE_OID_BASE: i64 = 69_000;
     /// Base types (`CREATE TYPE name` shells and the `(input = ..., output =
@@ -5178,7 +5177,7 @@ impl PgHandler {
                     };
                     (
                         name,
-                        Self::index_oid(&format!("fn:{}", f.key)),
+                        self.function_oid(&f.key),
                         // `regprocedure` prints `f(integer,text)`, no spaces.
                         args.join(","),
                     )
@@ -5304,8 +5303,7 @@ impl PgHandler {
             routines
                 .iter()
                 .map(|d| {
-                    let oid =
-                        Self::index_oid(&format!("fn:{}", d.get_str("_id").unwrap_or_default()));
+                    let oid = self.function_oid(d.get_str("_id").unwrap_or_default());
                     let lang = match d.get_str("language").unwrap_or_default() {
                         "sql" => 14i64,
                         "plpgsql" => 14035,
@@ -5405,7 +5403,7 @@ impl PgHandler {
                 .collect();
             let (schema, bare) = secantus_pgplan::schemas::split_key(view);
             let resolution = Self::type_resolution(&schema, &bare);
-            let oid = Self::view_type_oid(view);
+            let oid = self.view_type_relid(view);
             types.push((resolution.clone(), oid, Vec::new()));
             composites.push((resolution, oid, fields));
         }
@@ -10386,7 +10384,8 @@ impl PgHandler {
                         }
                     }
                 }
-                // A view has no stored row type; its oid is derived.
+                // A view's oid is the one its CREATE drew (RP-137), else
+                // derived from its name.
                 for d in views.iter() {
                     let Ok(n) = d.get_str("view").or_else(|_| d.get_str("_id")) else {
                         continue;
@@ -10394,7 +10393,10 @@ impl PgHandler {
                     if d.get_str("definition").is_ok() {
                         let entry = map.entry(n.to_string()).or_insert(i64::MIN);
                         if *entry == i64::MIN {
-                            *entry = Self::view_oid(n);
+                            *entry = d
+                                .get("oid")
+                                .and_then(bson_i64)
+                                .unwrap_or_else(|| Self::view_oid(n));
                         }
                     }
                 }
@@ -10446,14 +10448,14 @@ impl PgHandler {
                     .unwrap_or_default()
                     .into_iter()
                     .map(|(name, _)| {
-                        let oid = Self::view_oid(&name);
+                        let oid = self.view_relid(&name);
                         (name, oid, false)
                     }),
             )
             // A sequence is a relation too: `'s'::regclass` names it --
             // including one this open transaction created or dropped.
             .chain(self.sequence_names().into_iter().map(|name| {
-                let oid = Self::sequence_oid(&name);
+                let oid = self.sequence_relid(&name);
                 (name, oid, false)
             }))
             .collect()
@@ -10491,10 +10493,45 @@ impl PgHandler {
         names.into_iter().collect()
     }
 
-    /// A sequence's relation oid: stable for its name, in its own band.
+    /// A user function's oid: the one its CREATE drew (RP-137), else -- a
+    /// function made before oids were drawn -- the one its key hashes to.
+    pub(crate) fn function_oid(&self, key: &str) -> i64 {
+        self.type_catalog_docs(Self::FUNCTION_COLLECTION)
+            .ok()
+            .and_then(|docs| {
+                docs.iter()
+                    .find(|d| d.get_str("_id") == Ok(key))
+                    .and_then(|d| d.get("oid").and_then(bson_i64))
+            })
+            .unwrap_or_else(|| Self::index_oid(&format!("fn:{key}")))
+    }
+
     /// A column default's `pg_attrdef` oid, stable for the column.
     pub(crate) fn attrdef_oid(table: &str, attnum: usize) -> i64 {
         Self::index_oid(&format!("attrdef:{table}:{attnum}"))
+    }
+
+    /// A sequence's relation oid: the one its CREATE drew (RP-137), else --
+    /// a sequence made before oids were drawn -- the one its name hashes to.
+    /// A sequence's relation oid: the one its CREATE drew (RP-137) -- read
+    /// from this transaction's uncommitted create first, which planning,
+    /// reading outside the transaction, would not find -- else, for one
+    /// made before oids were drawn, the one its name hashes to.
+    pub(crate) fn sequence_relid(&self, name: &str) -> i64 {
+        let pending = self
+            .pending
+            .types()
+            .get(&(SEQUENCE_COLLECTION, name.to_string()))
+            .and_then(|d| d.as_ref())
+            .and_then(|d| d.get("oid").and_then(bson_i64));
+        pending
+            .or_else(|| {
+                self.sequence_doc(name)
+                    .ok()
+                    .flatten()
+                    .and_then(|d| d.get("oid").and_then(bson_i64))
+            })
+            .unwrap_or_else(|| Self::sequence_oid(name))
     }
 
     pub(crate) fn sequence_oid(name: &str) -> i64 {
@@ -10507,6 +10544,36 @@ impl PgHandler {
         Self::index_oid(&format!("view:{name}")) | 0x2000_0000
     }
 
+    /// A view's stored `(relation, row type, rule)` oids, when its CREATE
+    /// drew them (RP-137).
+    fn view_oids(&self, name: &str) -> Option<(i64, i64, i64)> {
+        let docs = self.type_catalog_docs(Self::VIEW_COLLECTION).ok()?;
+        let d = docs.iter().find(|d| d.get_str("_id") == Ok(name))?;
+        Some((
+            d.get("oid").and_then(bson_i64)?,
+            d.get("type_oid").and_then(bson_i64)?,
+            d.get("rule_oid").and_then(bson_i64)?,
+        ))
+    }
+
+    /// A view's relation oid: drawn, else derived from its name.
+    pub(crate) fn view_relid(&self, name: &str) -> i64 {
+        self.view_oids(name)
+            .map_or_else(|| Self::view_oid(name), |o| o.0)
+    }
+
+    /// A view's row type's oid.
+    pub(crate) fn view_type_relid(&self, name: &str) -> i64 {
+        self.view_oids(name)
+            .map_or_else(|| Self::view_type_oid(name), |o| o.1)
+    }
+
+    /// A view's `_RETURN` rule's oid.
+    pub(crate) fn view_rule_relid(&self, name: &str) -> i64 {
+        self.view_oids(name)
+            .map_or_else(|| Self::view_rule_oid(name), |o| o.2)
+    }
+
     /// A view's row type (every relation has one), and its `_RETURN` rule.
     pub(crate) fn view_type_oid(name: &str) -> i64 {
         Self::index_oid(&format!("viewtype:{name}")) | 0x1000_0000
@@ -10515,13 +10582,11 @@ impl PgHandler {
         Self::index_oid(&format!("viewrule:{name}")) | 0x1000_0000
     }
 
-    /// Index oids live in their own band so they never meet a type or table
-    /// oid. Within it, a table's own indexes follow the table's oid `T`:
-    /// `T*16 + 1` is its primary key and `T*16 + 2 + i` its i-th UNIQUE /
-    /// EXCLUDE constraint, while a CREATE INDEX mints `C*16` from the shared
-    /// oid counter (`sqlOid` in the index's options). The counter only
-    /// grows, so an index created after the table sorts after its key, and
-    /// `ORDER BY indexrelid` is creation order as it is on PostgreSQL.
+    /// An index draws its oid from the one counter when it is made, as
+    /// PostgreSQL's do (RP-137): `sqlOid` in a CREATE INDEX's options, the
+    /// table's `pk_oid`, a UNIQUE / EXCLUDE constraint's `oid`. An index
+    /// recorded before that has one in this band, after its table's oid `T`:
+    /// `T*16 + 1` its primary key, `T*16 + 2 + i` its i-th constraint.
     const INDEX_OID_BAND: i64 = 0x1000_0000;
 
     /// The fallback oid for an index with no table oid or minted oid (one
@@ -10539,7 +10604,33 @@ impl PgHandler {
     /// The oid a CREATE INDEX records for itself, minted from the counter
     /// tables and types share.
     fn mint_index_oid(&self) -> PgWireResult<i64> {
-        Ok(Self::INDEX_OID_BAND + self.mint_composite_oid()? * 16)
+        self.mint_global_oids(1)
+    }
+
+    /// Draw an oid for each constraint index `def` holds that `old` (the
+    /// table as it stood) did not have: its primary key's, then each UNIQUE
+    /// / EXCLUDE constraint's in order, as PostgreSQL builds them after the
+    /// table (RP-137). A new constraint draws one even if it carries an oid:
+    /// one copied from another table (LIKE, a partition's) carries that
+    /// table's. Whether any was drawn.
+    fn assign_index_oids(&self, def: &mut TableDef, old: Option<&TableDef>) -> PgWireResult<bool> {
+        let mut drew = false;
+        let had_pk = old.is_some_and(|o| !secantus_pgplan::ordered_pk_columns(o).is_empty());
+        if secantus_pgplan::ordered_pk_columns(def).is_empty() {
+            def.extra.remove("pk_oid");
+        } else if !had_pk {
+            def.extra.insert("pk_oid", self.mint_index_oid()?);
+            drew = true;
+        }
+        for i in 0..def.unique_constraints.len() {
+            let name = def.unique_constraints[i].name.clone();
+            let known = old.is_some_and(|o| o.unique_constraints.iter().any(|u| u.name == name));
+            if !known {
+                def.unique_constraints[i].oid = Some(self.mint_index_oid()?);
+                drew = true;
+            }
+        }
+        Ok(drew)
     }
 
     /// Every index relation, as PostgreSQL's `pg_index` lists them: a table's
@@ -10591,7 +10682,10 @@ impl PgHandler {
                     })
                     .unwrap_or_default();
                 out.push(IndexRelation {
-                    oid: derived(1, &name),
+                    oid: t
+                        .extra
+                        .get_i64("pk_oid")
+                        .unwrap_or_else(|_| derived(1, &name)),
                     name,
                     table: t.clone(),
                     keys: pk,
@@ -10641,7 +10735,9 @@ impl PgHandler {
                 let slot = t.unique_constraints.iter().position(|u| u.name == name);
                 let oid = match (ix.get_i64("sqlOid"), slot) {
                     (Ok(oid), _) => oid,
-                    (_, Some(i)) => derived(2 + i as i64, name),
+                    (_, Some(i)) => t.unique_constraints[i]
+                        .oid
+                        .unwrap_or_else(|| derived(2 + i as i64, name)),
                     _ => Self::index_oid(name),
                 };
                 let include: Vec<i32> = ix
@@ -10674,7 +10770,7 @@ impl PgHandler {
                     })
                     .collect();
                 out.push(IndexRelation {
-                    oid: derived(2 + i as i64, &u.name),
+                    oid: u.oid.unwrap_or_else(|| derived(2 + i as i64, &u.name)),
                     name: u.name.clone(),
                     table: t.clone(),
                     keys,
@@ -11329,15 +11425,7 @@ impl PgHandler {
 
     /// Mint the next base-type oid -- the range minting rule, base 71000.
     fn mint_base_type_oid(&self) -> PgWireResult<i64> {
-        self.mint_oid_outside_transaction(|| {
-            let existing = self.base_types()?;
-            Ok(match existing.iter().map(|b| b.oid).max() {
-                Some(taken) => {
-                    (Self::BASE_TYPE_OID_BASE + existing.len() as i64 - 1).max(taken) + 1
-                }
-                None => Self::BASE_TYPE_OID_BASE,
-            })
-        })
+        self.mint_global_oids(1)
     }
 
     /// Does a built-in type name keep a new `public` type from taking it?
@@ -11608,6 +11696,15 @@ impl PgHandler {
             .type_catalog_docs(Self::FUNCTION_COLLECTION)?
             .iter()
             .any(|d| d.get_str("_id") == Ok(key.as_str()));
+        // Its oid, drawn as `ProcedureCreate` draws it; `CREATE OR REPLACE`
+        // keeps the one it had (RP-137).
+        let mut doc = doc;
+        let oid = if exists {
+            self.function_oid(&key)
+        } else {
+            self.mint_global_oids(1)?
+        };
+        doc.insert("oid", oid);
         if exists {
             if !def.replace {
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -12151,7 +12248,7 @@ impl PgHandler {
             inner
         });
         self.stat_function_call(
-            Self::index_oid(&format!("fn:{key}")),
+            self.function_oid(&key),
             doc.get_str("language").unwrap_or_default(),
             total,
             (total - inner).max(0),
@@ -13386,7 +13483,7 @@ impl PgHandler {
             .map(|(name, definition)| {
                 let oid = self
                     .relation_oid(&name)
-                    .unwrap_or_else(|| Self::view_oid(&name));
+                    .unwrap_or_else(|| self.view_relid(&name));
                 // As ruleutils prints the analysed query; the definition as
                 // written for a shape the printer does not reproduce.
                 let text = match mode {
@@ -14270,6 +14367,16 @@ impl PgHandler {
         let owner = self
             .view_owner(&name)
             .unwrap_or_else(|| self.current_role_name());
+        // Its oids: the relation, its array type, its row type and its
+        // `_RETURN` rule, drawn in that order as `DefineView` draws them
+        // (RP-137); `CREATE OR REPLACE` keeps them.
+        let (relid, type_oid, rule_oid) = match self.view_oids(&name) {
+            Some(kept) => kept,
+            None => {
+                let first = self.mint_global_oids(4)?;
+                (first, first + 2, first + 3)
+            }
+        };
         let doc = bson::doc! {
             "_id": &name,
             "view": &name,
@@ -14277,6 +14384,9 @@ impl PgHandler {
             "check_option": check,
             "owner": owner,
             "row_fields": Self::view_row_fields(&fields),
+            "oid": relid,
+            "type_oid": type_oid,
+            "rule_oid": rule_oid,
         };
         if existing.is_some() {
             self.storage
@@ -17355,7 +17465,7 @@ impl PgHandler {
         for d in self.user_function_docs().unwrap_or_default() {
             if let Ok(c) = d.get_str("comment") {
                 let key = d.get_str("_id").unwrap_or_default();
-                out.push((Self::index_oid(&format!("fn:{key}")), 0, c.to_string()));
+                out.push((self.function_oid(key), 0, c.to_string()));
             }
         }
         for d in self
@@ -17393,25 +17503,105 @@ impl PgHandler {
     }
 
     fn mint_enum_oid(&self) -> PgWireResult<i64> {
-        self.mint_oid_outside_transaction(|| self.mint_enum_oid_in_session())
+        self.mint_global_oids(1)
     }
 
     fn mint_composite_oid(&self) -> PgWireResult<i64> {
-        // The counter row lives in the enum meta collection, which a fresh
-        // store has not created yet (CREATE DOMAIN / CREATE INDEX can be the
-        // first thing to mint).
-        self.ensure_collection(Self::ENUM_META_COLLECTION)?;
-        self.mint_oid_outside_transaction(|| self.mint_composite_oid_in_session())
+        self.mint_global_oids(1)
     }
 
-    /// Mint the next range-type oid -- the enum minting rule, base 69000.
     fn mint_range_oid(&self) -> PgWireResult<i64> {
-        let existing = self.ranges()?;
-        let oid = match existing.iter().map(|(_, o, _)| *o).max() {
-            Some(taken) => (Self::RANGE_TYPE_OID_BASE + existing.len() as i64 - 1).max(taken) + 1,
-            None => Self::RANGE_TYPE_OID_BASE,
-        };
-        Ok(oid)
+        self.mint_global_oids(1)
+    }
+
+    /// Where the store's one oid counter is kept (RP-137).
+    const OID_COUNTER_NAMESPACE: &'static str = "__secantus_pg__";
+    const OID_COUNTER_COLLECTION: &'static str = "oid_counter";
+
+    /// Mint `n` consecutive oids, the first returned, from the one counter
+    /// every database's objects draw from -- PostgreSQL's
+    /// `GetNewObjectId`, so oids rise in creation order across the cluster
+    /// and no two objects share one (RP-137). Each kind of object once drew
+    /// from a band of its own, per database: the counter starts above every
+    /// oid those handed out.
+    pub(crate) fn mint_global_oids(&self, n: usize) -> PgWireResult<i64> {
+        let ns = Self::OID_COUNTER_NAMESPACE;
+        let coll = Self::OID_COUNTER_COLLECTION;
+        self.mint_oid_outside_transaction(|| {
+            let err = |e| Self::storage_err("could not advance the oid counter", e);
+            if !self.storage.collection_exists(ns, coll).map_err(err)? {
+                self.storage.create_collection(ns, coll).map_err(err)?;
+            }
+            let found = self
+                .storage
+                .find_matching(ns, coll, &bson::doc! {"_id": "next"})
+                .map_err(err)?;
+            let oid = match found.first() {
+                Some(bytes) => decode_doc(bytes)
+                    .ok()
+                    .and_then(|d| d.get("next").and_then(bson_i64))
+                    .unwrap_or(Self::COMPOSITE_TYPE_OID_BASE),
+                None => self.highest_banded_oid() + 1,
+            };
+            self.storage
+                .delete_matching(
+                    ns,
+                    coll,
+                    &bson::doc! {"_id": "next"},
+                    0,
+                    &Document::new(),
+                    None,
+                )
+                .map_err(err)?;
+            let doc = bson::doc! {"_id": "next", "next": oid + n.max(1) as i64};
+            let bytes = encode_doc(&doc)
+                .map_err(|e| Self::storage_err("could not encode the oid counter", e))?;
+            self.storage
+                .insert(ns, coll, vec![bytes], true)
+                .map_err(err)?;
+            Ok(oid)
+        })
+    }
+
+    /// The highest oid any database's per-kind counter or band has handed
+    /// out: where the one counter starts.
+    fn highest_banded_oid(&self) -> i64 {
+        let mut top = Self::COMPOSITE_TYPE_OID_BASE - 1;
+        let names: Vec<String> = self
+            .databases
+            .all(&self.storage)
+            .map(|v| v.into_iter().map(|d| d.name).collect())
+            .unwrap_or_default();
+        for db in names {
+            for coll in [
+                Self::ENUM_META_COLLECTION,
+                Self::COMPOSITE_COLLECTION,
+                Self::ENUM_COLLECTION,
+                Self::RANGE_COLLECTION,
+                Self::BASE_TYPE_COLLECTION,
+                Self::DOMAIN_COLLECTION,
+            ] {
+                for bytes in self
+                    .storage
+                    .find_matching(&db, coll, &Document::new())
+                    .unwrap_or_default()
+                {
+                    let Ok(d) = decode_doc(&bytes) else { continue };
+                    // A counter's next, or an object's own oid (and relid).
+                    for key in ["next", "oid", "relid"] {
+                        if let Some(v) = d.get(key).and_then(bson_i64) {
+                            let used = if key == "next" { v - 1 } else { v };
+                            // Only the counted bands: an index's or a hashed
+                            // oid lives far above them.
+                            if used < Self::INDEX_OID_BAND {
+                                top = top.max(used);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        top
     }
 
     /// Mint `n` consecutive oids from the counter tables and types share,
@@ -17420,60 +17610,7 @@ impl PgHandler {
         if n == 0 {
             return Ok(0);
         }
-        let first = self.mint_composite_oid()?;
-        // The counter is the next free oid: advance it past the block.
-        for _ in 1..n {
-            self.mint_composite_oid()?;
-        }
-        Ok(first)
-    }
-
-    /// Mint the next composite oid -- the enum minting rule, own counter and
-    /// base 67000, monotonic and never reused.
-    fn mint_composite_oid_in_session(&self) -> PgWireResult<i64> {
-        let key = "composite_oid_counter";
-        let counter = self
-            .storage
-            .find_matching(
-                self.db(),
-                Self::ENUM_META_COLLECTION,
-                &bson::doc! {"_id": key},
-            )
-            .map_err(|e| Self::storage_err("could not read the oid counter", e))?;
-        let oid = if let Some(bytes) = counter.first() {
-            let d: Document = decode_doc(bytes)
-                .map_err(|e| Self::storage_err("could not decode the oid counter", e))?;
-            d.get_i64("next")
-                .or_else(|_| d.get_i32("next").map(i64::from))
-                .unwrap_or(Self::COMPOSITE_TYPE_OID_BASE)
-        } else {
-            let existing = self.composites()?;
-            match existing.iter().map(|(_, o, _)| *o).max() {
-                Some(taken) => {
-                    (Self::COMPOSITE_TYPE_OID_BASE + existing.len() as i64 - 1).max(taken) + 1
-                }
-                None => Self::COMPOSITE_TYPE_OID_BASE,
-            }
-        };
-        self.storage
-            .delete_matching(
-                self.db(),
-                Self::ENUM_META_COLLECTION,
-                &bson::doc! {"_id": key},
-                0,
-                &Document::new(),
-                None,
-            )
-            .map_err(|e| Self::storage_err("could not advance the oid counter", e))?;
-        let doc = bson::doc! {"_id": key, "next": oid + 1};
-        let bytes = encode_doc(&doc)
-            .map_err(|e| Self::storage_err("could not encode the oid counter", e))?;
-        self.insert_checked(
-            Self::ENUM_META_COLLECTION,
-            vec![bytes],
-            "could not advance the oid counter",
-        )?;
-        Ok(oid)
+        self.mint_global_oids(n)
     }
 
     /// Every enum type: `(name, oid, labels)`, name-sorted for stable output.
@@ -17527,55 +17664,6 @@ impl PgHandler {
         }
         out.sort();
         Ok(out)
-    }
-
-    /// Mint the next enum oid, exactly as the Python server does: read the
-    /// counter, else start above everything already taken; rewrite the counter
-    /// as `next = oid + 1`. Monotonic and never reused -- positional minting
-    /// would renumber types under a client that registered loaders by oid.
-    fn mint_enum_oid_in_session(&self) -> PgWireResult<i64> {
-        let counter = self
-            .storage
-            .find_matching(
-                self.db(),
-                Self::ENUM_META_COLLECTION,
-                &bson::doc! {"_id": "oid_counter"},
-            )
-            .map_err(|e| Self::storage_err("could not read the oid counter", e))?;
-        let oid = if let Some(bytes) = counter.first() {
-            let d: Document = decode_doc(bytes)
-                .map_err(|e| Self::storage_err("could not decode the oid counter", e))?;
-            d.get_i64("next")
-                .or_else(|_| d.get_i32("next").map(i64::from))
-                .unwrap_or(Self::ENUM_TYPE_OID_BASE)
-        } else {
-            let existing = self.enums()?;
-            match existing.iter().map(|(_, o, _)| *o).max() {
-                Some(taken) => {
-                    (Self::ENUM_TYPE_OID_BASE + existing.len() as i64 - 1).max(taken) + 1
-                }
-                None => Self::ENUM_TYPE_OID_BASE,
-            }
-        };
-        self.storage
-            .delete_matching(
-                self.db(),
-                Self::ENUM_META_COLLECTION,
-                &bson::doc! {"_id": "oid_counter"},
-                0,
-                &Document::new(),
-                None,
-            )
-            .map_err(|e| Self::storage_err("could not advance the oid counter", e))?;
-        let doc = bson::doc! {"_id": "oid_counter", "next": oid + 1};
-        let bytes = encode_doc(&doc)
-            .map_err(|e| Self::storage_err("could not encode the oid counter", e))?;
-        self.insert_checked(
-            Self::ENUM_META_COLLECTION,
-            vec![bytes],
-            "could not advance the oid counter",
-        )?;
-        Ok(oid)
     }
 
     /// The virtual catalog tables: a definition and rows COMPUTED on read,
@@ -19204,12 +19292,12 @@ impl PgHandler {
                         .map(|(cols, _)| cols.len())
                         .unwrap_or(0);
                     let mut d = Document::new();
-                    d.insert(f("oid"), Bson::Int64(Self::view_oid(&name)));
+                    d.insert(f("oid"), Bson::Int64(self.view_relid(&name)));
                     d.insert(f("relname"), name.as_str());
                     d.insert(f("relnamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
                     d.insert(f("relkind"), "v");
                     if let Some(field) = def.field_of("reltype") {
-                        d.insert(field, Bson::Int64(Self::view_type_oid(&name)));
+                        d.insert(field, Bson::Int64(self.view_type_relid(&name)));
                     }
                     d.insert(f("relnatts"), Bson::Int32(natts as i32));
                     d.insert(f("relhasindex"), false);
@@ -19236,7 +19324,7 @@ impl PgHandler {
                 for s in self.all_sequence_docs().ok()? {
                     let name = s.get_str("_id").unwrap_or_default().to_string();
                     let mut d = Document::new();
-                    d.insert(f("oid"), Bson::Int64(Self::sequence_oid(&name)));
+                    d.insert(f("oid"), Bson::Int64(self.sequence_relid(&name)));
                     d.insert(f("relname"), name.as_str());
                     d.insert(f("relnamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
                     d.insert(f("relkind"), "S");
@@ -19437,7 +19525,7 @@ impl PgHandler {
                             functions
                                 .iter()
                                 .find(|u| u.name == function && u.param_types.is_empty())
-                                .map_or(0, |u| Self::index_oid(&format!("fn:{}", u.key))),
+                                .map_or(0, |u| self.function_oid(&u.key)),
                         ),
                     );
                     d.insert(f("tgtype"), Bson::Int32(ty));
@@ -19971,7 +20059,7 @@ impl PgHandler {
                 };
                 // A view's row type: every relation has one.
                 for (view, _) in self.views().unwrap_or_default() {
-                    let oid = Self::view_type_oid(&view);
+                    let oid = self.view_type_relid(&view);
                     let mut d = Document::new();
                     d.insert(f("typname"), view.as_str());
                     d.insert(f("oid"), Bson::Int64(oid));
@@ -19980,7 +20068,7 @@ impl PgHandler {
                         Bson::Int64(oid + Self::USER_TYPE_ARRAY_OID_OFFSET),
                     );
                     common(&mut d, "c");
-                    d.insert(f("typrelid"), Bson::Int64(Self::view_oid(&view)));
+                    d.insert(f("typrelid"), Bson::Int64(self.view_relid(&view)));
                     rows.push(d);
                 }
                 // Every user type's ARRAY type, `_name`, as PostgreSQL makes
@@ -20226,10 +20314,7 @@ impl PgHandler {
                         let mut row = Document::new();
                         row.insert(
                             f("oid"),
-                            Bson::Int64(Self::index_oid(&format!(
-                                "fn:{}",
-                                d.get_str("_id").unwrap_or_default()
-                            ))),
+                            Bson::Int64(self.function_oid(d.get_str("_id").unwrap_or_default())),
                         );
                         row.insert(f("proname"), d.get_str("name").unwrap_or_default());
                         let namespace = d
@@ -20747,7 +20832,7 @@ impl PgHandler {
                     .views()
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|(n, _)| (Self::view_oid(&n), n))
+                    .map(|(n, _)| (self.view_relid(&n), n))
                     .chain(
                         self.matviews()
                             .unwrap_or_default()
@@ -21708,9 +21793,9 @@ impl PgHandler {
         // its one row changes on every `nextval`.
         // Planning runs with the open block's transaction unbound, so a
         // sequence the block wrote is read through that transaction.
+        let mut written_here = false;
         if def.is_none() {
-            let written_here =
-                !self.storage.in_user_txn() && self.pending.sequences().contains(name);
+            written_here = !self.storage.in_user_txn() && self.pending.sequences().contains(name);
             let found = if written_here {
                 match self.txn.try_lock() {
                     Ok(mut guard) => match guard.as_mut() {
@@ -21730,7 +21815,11 @@ impl PgHandler {
                 return Some(Self::sequence_table_def(name));
             }
         }
-        if self.may_fill_catalog_cache(version) {
+        // A miss for a sequence the block wrote is no absence: the
+        // transaction was busy (a statement's read set is judged while it
+        // holds it), and a cached miss would hide the sequence from the
+        // block's next statement.
+        if self.may_fill_catalog_cache(version) && !written_here {
             let entry = Arc::new(def.clone());
             cache
                 .tables
@@ -26263,6 +26352,7 @@ impl PgHandler {
                 o.data_type = Some(ty);
                 self.ensure_collection(SEQUENCE_COLLECTION)?;
                 let mut doc = Self::new_sequence_doc(&seq, &o)?;
+                doc.insert("oid", self.mint_global_oids(1)?);
                 doc.insert("owner", self.current_role_name());
                 let bytes = encode_doc(&doc)
                     .map_err(|e| Self::storage_err("could not encode the sequence", e))?;
@@ -26895,6 +26985,11 @@ impl PgHandler {
     /// that adds, drops or retypes one changes what `'(...)'::t` reads.
     fn rewrite_catalog(&self, name: &str, def: &TableDef) -> PgWireResult<()> {
         self.ensure_collection(CATALOG_COLLECTION)?;
+        // A constraint the ALTER added draws its index's oid now.
+        let mut def = def.clone();
+        let old = self.lookup(name);
+        self.assign_index_oids(&mut def, old.as_ref())?;
+        let def = &def;
         self.delete_catalog(name)?;
         let bytes = encode_doc(&def.to_document())
             .map_err(|e| Self::storage_err("could not encode the catalog entry", e))?;
@@ -34597,10 +34692,7 @@ impl PgHandler {
             .into_iter()
             .find(|f| f.name == name)
         {
-            return secantus_pgplan::regobj::value(
-                "regproc",
-                Self::index_oid(&format!("fn:{}", f.key)),
-            );
+            return secantus_pgplan::regobj::value("regproc", self.function_oid(&f.key));
         }
         Bson::String(name.to_string())
     }
@@ -34870,6 +34962,9 @@ impl PgHandler {
                                     _ => "int4",
                                 },
                             );
+                            // Drawn before the table's, as PostgreSQL makes
+                            // a serial's sequence first (RP-137).
+                            doc.insert("oid", self.mint_global_oids(1)?);
                             return encode_doc(&doc)
                                 .map_err(|e| Self::storage_err("could not encode a sequence", e));
                         };
@@ -34904,7 +34999,8 @@ impl PgHandler {
                             ),
                             cache: None,
                         };
-                        let doc = Self::new_sequence_doc(seq, &options)?;
+                        let mut doc = Self::new_sequence_doc(seq, &options)?;
+                        doc.insert("oid", self.mint_global_oids(1)?);
                         encode_doc(&doc)
                             .map_err(|e| Self::storage_err("could not encode a sequence", e))
                     })
@@ -34960,6 +35056,18 @@ impl PgHandler {
                     "could not record the row type",
                 )?;
                 self.note_uncommitted_type(Self::COMPOSITE_COLLECTION, &def.name, Some(row_type));
+                // Its constraints' indexes draw their oids after the table's
+                // (RP-137), and the catalog row records them.
+                if self.assign_index_oids(&mut def, None)? {
+                    self.delete_catalog(&def.name)?;
+                    let bytes = encode_doc(&def.to_document())
+                        .map_err(|e| Self::storage_err("could not encode the catalog entry", e))?;
+                    self.insert_checked(
+                        CATALOG_COLLECTION,
+                        vec![bytes],
+                        "could not record the table",
+                    )?;
+                }
                 // Remember it for the rest of this transaction: the catalog row
                 // above is not committed yet, so a plain read cannot see it.
                 let name = def.name.clone();
@@ -35498,7 +35606,9 @@ impl PgHandler {
                     // Its text-search configurations.
                     let mut configs = self.ts_configs_in(name);
                     configs.sort_by_key(|c| c.oid);
+                    let mut config_oids: Vec<i64> = Vec::new();
                     for c in configs {
+                        config_oids.push(c.oid);
                         let q = secantus_pgplan::scalar::quote_identifier;
                         members.push((
                             ts_configs::TS_CONFIG_COLLECTION,
@@ -35536,6 +35646,32 @@ impl PgHandler {
                     // The relations it holds, stored as `schema.name`.
                     let relations = self.schema_relations(name)?;
                     descs.extend(relations.iter().map(|(kind, key)| format!("{kind} {key}")));
+                    // PostgreSQL lists them in the order pg_depend holds
+                    // them, which is the order they were made: by oid, one
+                    // counter for every kind (RP-137, measured on 15.19).
+                    let mut oids: Vec<i64> = Vec::with_capacity(descs.len());
+                    for (coll, id) in members
+                        .iter()
+                        .filter(|(c, _)| *c != ts_configs::TS_CONFIG_COLLECTION)
+                    {
+                        oids.push(
+                            self.type_catalog_docs(coll)?
+                                .iter()
+                                .find(|d| d.get_str("_id") == Ok(id.as_str()))
+                                .and_then(|d| d.get("oid").and_then(bson_i64))
+                                .unwrap_or(i64::MAX),
+                        );
+                    }
+                    oids.extend(config_oids);
+                    oids.extend(routines.iter().map(|f| self.function_oid(&f.key)));
+                    oids.extend(relations.iter().map(|(kind, key)| match *kind {
+                        "view" => self.view_relid(key),
+                        "sequence" => self.sequence_relid(key),
+                        _ => self.relation_oid(key).unwrap_or(i64::MAX),
+                    }));
+                    let mut order: Vec<(i64, String)> = oids.into_iter().zip(descs).collect();
+                    order.sort_by_key(|(o, _)| *o);
+                    let descs: Vec<String> = order.into_iter().map(|(_, d)| d).collect();
                     held.push((
                         name,
                         Held {
@@ -36155,6 +36291,7 @@ impl PgHandler {
                 {
                     doc.insert("call_sql", sql);
                 }
+                doc.insert("oid", self.mint_global_oids(1)?);
                 self.insert_type_doc(Self::FUNCTION_COLLECTION, &id_key, doc)?;
                 Ok(vec![Response::Execution(Tag::new("CREATE FUNCTION"))])
             }
@@ -36458,12 +36595,12 @@ impl PgHandler {
                 // An operator class's support function depends on it.
                 self.drop_opclass_members_of(
                     true,
-                    Self::index_oid(&format!("fn:{}", target.key)),
+                    self.function_oid(&target.key),
                     &format!(
                         "function {}",
                         secantus_pgplan::regobj::text(
                             "regprocedure",
-                            Self::index_oid(&format!("fn:{}", target.key))
+                            self.function_oid(&target.key)
                         )
                     ),
                     cascade,
@@ -37148,6 +37285,7 @@ impl PgHandler {
                 }
                 let _ = temp;
                 let mut doc = Self::new_sequence_doc(&name, &options)?;
+                doc.insert("oid", self.mint_global_oids(1)?);
                 doc.insert("owner", self.current_role_name());
                 let bytes = encode_doc(&doc)
                     .map_err(|e| Self::storage_err("could not encode the sequence", e))?;

@@ -755,20 +755,21 @@ tests are scenarios in `tests/backlog/test_rp_batch30.py`, measured on a
 private 15.19 cluster. RP-133 .. RP-136 and RP-138 .. RP-142 were found and
 fixed in the same batch; their tests there are regression tests.
 
-- [ ] **A relation's oid is not its place in creation order.** PostgreSQL
-      draws every oid from one counter, so oids rise as objects are made,
-      and DROP ROLE's DETAIL lists the role's objects in oid order
-      (`shared_dependency_comparator`): a sequence made before a table is
-      listed first. Here a sequence's, a view's and an index's oid is a
-      hash of its name in a band of its own (`sequence_oid`, `view_oid`,
-      `index_oid`), so the DETAIL -- which this server sorts by oid as
-      PostgreSQL does -- and any `ORDER BY oid` come out in another order.
-      DROP SCHEMA ... CASCADE's notice lists a schema's members in the same
-      creation order (`table s.t`, `function s.f()`, `view s.v`); here they
-      come grouped by kind -- types, routines, views, tables, sequences --
-      since nothing records which was made first.
-      Backlog-ID: RP-137
-      Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order], tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]
+## Found by batch 59 (2026-10-24)
+
+Found while drawing every oid from one counter (RP-137). The gap test is a
+scenario in `tests/backlog/test_rp_batch59.py`, measured on a private 15.19
+cluster.
+
+- [ ] **A primary key cannot be dropped.** `alter table t drop constraint
+      t_pkey` answers 42704 `constraint "t_pkey" of relation "t" does not
+      exist`; PostgreSQL 15.19 drops it, the key's values may then repeat,
+      and `pg_constraint` holds nothing for the table. The key is storage's
+      `_id`, so dropping it re-keys every row as a table without a key is
+      keyed (a rewrite, as `ADD PRIMARY KEY` is), and the constraint's
+      name, its index and `pk_oid` go with it.
+      Backlog-ID: RP-234
+      Verify: tests/backlog/test_rp_batch59.py::test_scenario[a primary key can be dropped]
 
 ## Found by batch 58 (2026-10-24)
 

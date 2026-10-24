@@ -440,7 +440,7 @@ impl PgHandler {
                 .function
                 .as_ref()
                 .and_then(|(n, _)| functions.iter().find(|u| &u.name == n))
-                .map_or(0, |u| Self::index_oid(&format!("fn:{}", u.key)));
+                .map_or(0, |u| self.function_oid(&u.key));
             rows.push(row(
                 c.oid,
                 c.source_oid,

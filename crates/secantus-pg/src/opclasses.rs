@@ -401,7 +401,7 @@ impl PgHandler {
                     _ => 'v',
                 };
                 found.push(Proc {
-                    oid: Self::index_oid(&format!("fn:{}", u.key)),
+                    oid: self.function_oid(&u.key),
                     args: types,
                     ret: self.any_type_oid(&u.return_type).unwrap_or(0),
                     kind: if d.get_bool("is_procedure").unwrap_or(false) {

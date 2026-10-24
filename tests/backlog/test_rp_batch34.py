@@ -17,8 +17,8 @@ this file as a script:
     PYTHONPATH=. python tests/backlog/test_rp_batch34.py "host=127.0.0.1 port=5499 user=postgres"
 
 which prints `EXPECTED` for pasting back. Every scenario drops what it
-made. No scenario prints an oid, which PostgreSQL draws from a counter this
-server starts elsewhere (RP-137).
+made. No scenario prints an oid: both draw them from one counter now (RP-137),
+but this server's starts elsewhere.
 """
 
 from __future__ import annotations

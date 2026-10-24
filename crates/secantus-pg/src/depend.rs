@@ -600,7 +600,7 @@ impl PgHandler {
             .views()
             .unwrap_or_default()
             .into_iter()
-            .map(|(n, sql)| (Self::view_oid(&n), sql))
+            .map(|(n, sql)| (self.view_relid(&n), sql))
             .chain(
                 self.matviews()
                     .unwrap_or_default()
