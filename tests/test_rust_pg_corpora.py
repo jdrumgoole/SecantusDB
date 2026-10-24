@@ -14,7 +14,8 @@ Each corpus runs on a server of its own, so corpora cannot see each other's
 objects (the reason the live sweep must run serially does not apply here).
 
 A check whose answer PostgreSQL itself does not repeat -- the clock, the
-process, or a difference between two recordings -- is marked volatile in its
+process, the time zone rules in force today, or a difference between two
+recordings -- is marked volatile in its
 record and compared on status and column types only. Every other check is
 compared exactly. A divergence the server has today is listed in
 `KNOWN_DIVERGENCES` with the backlog item that owns it, and the test fails

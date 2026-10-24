@@ -801,7 +801,7 @@ impl PgHandler {
     }
 
     /// The leaf partition a row of the partitioned table `def` lands in.
-    fn leaf_for(&self, def: &TableDef, row: &Document) -> PgWireResult<Option<String>> {
+    pub(crate) fn leaf_for(&self, def: &TableDef, row: &Document) -> PgWireResult<Option<String>> {
         let mut level = def.clone();
         for _ in 0..64 {
             if !is_partitioned(&level) {

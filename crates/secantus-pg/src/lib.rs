@@ -63,6 +63,7 @@ mod fdw;
 mod grace_join;
 mod guc_values;
 mod hba;
+mod heap;
 mod ident;
 mod info_columns;
 mod join_order;
@@ -12616,6 +12617,15 @@ impl PgHandler {
         Ok(n)
     }
 
+    /// 42701 for a column named like a system column
+    /// (`CheckAttributeNamesTypes`).
+    fn system_column_collision(name: &str) -> PgWireError {
+        Self::user_error(
+            "42701",
+            format!("column name \"{name}\" conflicts with a system column name"),
+        )
+    }
+
     /// 42P01 for a relation that does not exist.
     fn relation_missing(name: &str) -> PgWireError {
         Self::user_error("42P01", format!("relation \"{name}\" does not exist"))
@@ -12855,6 +12865,10 @@ impl PgHandler {
             }
         }
         if !docs.is_empty() {
+            // A new heap, in the index's order (RP-069).
+            if let Some(def) = self.lookup(table) {
+                self.rewrite_heap(table, &def, &mut docs)?;
+            }
             let out = docs
                 .iter()
                 .map(|d| encode_doc(d).map_err(|e| Self::storage_err("could not encode a row", e)))
@@ -21496,7 +21510,8 @@ impl PgHandler {
             Some(name) => Some((Self::expression_index_field(&name), self.expr_indexes(def)?)),
             None => None,
         };
-        for row in rows {
+        for mut row in rows {
+            self.stamp_inserted(table, def, std::slice::from_mut(&mut row))?;
             let bytes =
                 encode_doc(&row).map_err(|e| Self::storage_err("could not encode a row", e))?;
             let bytes = self.with_expr_fields(table, vec![bytes])?;
@@ -21517,6 +21532,7 @@ impl PgHandler {
             if !is_dup {
                 return Err(Self::write_error(table, def, err));
             }
+            self.release_inserted(table, def, &row)?;
             let empty = Document::new();
             let reported = err.get_document("keyValue").unwrap_or(&empty).clone();
             // WHICH row the clause arbitrates on is decided by its TARGET, not
@@ -25658,6 +25674,11 @@ impl PgHandler {
                 column,
                 if_not_exists,
             } => {
+                // `check_for_column_name_collision`: a system column's name,
+                // IF NOT EXISTS or not.
+                if TableDef::is_system_column_name(&column.name) {
+                    return Err(Self::system_column_collision(&column.name));
+                }
                 if def.column(&column.name).is_some() {
                     if *if_not_exists {
                         return Ok(None);
@@ -25914,7 +25935,8 @@ impl PgHandler {
                     )?;
                     let field = column.field();
                     let wide = column.pg_type == "int8";
-                    return self.rewrite_rows(table, |d| {
+                    // A volatile default rewrites the table (RP-069).
+                    return self.rewrite_rows_heap(table, def, |d| {
                         let n = self.nextval(seq, 1)?.first().copied().unwrap_or(0);
                         d.insert(
                             field.clone(),
@@ -25970,7 +25992,7 @@ impl PgHandler {
                     .map_err(|e| Self::err(&e))?;
                 let ty = pg_type.clone();
                 let tz = self.session_timezone();
-                self.rewrite_rows(table, move |d| {
+                self.rewrite_rows_heap(table, def, move |d| {
                     let v = secantus_pgplan::apply_row_expr(&expr, d).map_err(|e| Self::err(&e))?;
                     let v = if v == Bson::Null {
                         v
@@ -25992,7 +26014,16 @@ impl PgHandler {
                     .unwrap_or_else(|| column.clone());
                 let ty = pg_type.clone();
                 let tz = self.session_timezone();
-                self.rewrite_rows(table, move |d| {
+                // A change between binary-coercible types (`varchar` and
+                // `text`) is a catalog change only; any other rewrites the
+                // table (`ATColumnChangeRequiresRewrite`, RP-069).
+                let old_ty = before
+                    .user_column(column)
+                    .map(|c| c.pg_type.clone())
+                    .unwrap_or_default();
+                let stringy = |t: &str| matches!(t, "text" | "varchar");
+                let rewrite = !(stringy(&old_ty) && stringy(&ty));
+                let change = move |d: &mut Document| -> PgWireResult<()> {
                     let Some(v) = d.get(&field).cloned() else {
                         return Ok(());
                     };
@@ -26006,7 +26037,12 @@ impl PgHandler {
                         .map_err(|e| PgHandler::err(&e))?;
                     d.insert(field.clone(), cast);
                     Ok(())
-                })
+                };
+                if rewrite {
+                    self.rewrite_rows_heap(table, def, change)
+                } else {
+                    self.rewrite_rows(table, change)
+                }
             }
             // PostgreSQL VALIDATES a new CHECK against the rows already there,
             // and refuses the ALTER when one fails it.
@@ -26090,6 +26126,58 @@ impl PgHandler {
             f(&mut d)?;
             out.push(encode_doc(&d).map_err(|e| Self::storage_err("could not encode a row", e))?);
         }
+        self.replace_table_rows(table, out)
+    }
+
+    /// `VACUUM FULL table`: its rows copied, in scan (ctid) order, to a new
+    /// heap, so dead tuples' space is gone (RP-069).
+    fn vacuum_full(&self, table: &str) -> PgWireResult<()> {
+        let Some(def) = self.lookup(table) else {
+            return Ok(());
+        };
+        let mut docs = self.table_docs(table)?;
+        if docs.is_empty() {
+            return self.reset_heap(table);
+        }
+        docs.sort_by_key(|d| heap::ctid_of(d).unwrap_or(i64::MAX));
+        self.rewrite_heap(table, &def, &mut docs)?;
+        let out = docs
+            .iter()
+            .map(encode_doc)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Self::storage_err("could not encode a row", e))?;
+        self.replace_table_rows(table, out)
+    }
+
+    /// `rewrite_rows` for an ALTER PostgreSQL makes a new heap for
+    /// (`ATRewriteTable`): the rows are copied in their scan (ctid) order to
+    /// a fresh heap, each a new tuple of this transaction and command.
+    fn rewrite_rows_heap(
+        &self,
+        table: &str,
+        def: &TableDef,
+        mut f: impl FnMut(&mut Document) -> PgWireResult<()>,
+    ) -> PgWireResult<()> {
+        let mut docs = self.table_docs(table)?;
+        if docs.is_empty() {
+            return Ok(());
+        }
+        docs.sort_by_key(|d| heap::ctid_of(d).unwrap_or(i64::MAX));
+        for d in docs.iter_mut() {
+            f(d)?;
+        }
+        self.reset_heap(table)?;
+        if crate::partition::is_partitioned(def) {
+            for p in self.partitions_of(table)? {
+                self.reset_heap(&p.name)?;
+            }
+        }
+        self.stamp_inserted(table, def, &mut docs)?;
+        let out = docs
+            .iter()
+            .map(encode_doc)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Self::storage_err("could not encode a row", e))?;
         self.replace_table_rows(table, out)
     }
 
@@ -28198,14 +28286,20 @@ impl PgHandler {
         };
         self.collect_planner_warnings();
         if !reused && planned.is_ok() {
-            if let Some(key) = plan_key.filter(|k| self.planned_before(k)) {
-                self.learn_plan_template(key, params, param_types, &tz, None);
-            } else if let Some(family) = family {
-                let key = Self::family_key(&family);
-                if self.planned_before(&key) {
-                    self.learn_plan_template(key, &[], &[], &tz, Some((sql, &family)));
+            // Learning plans the statement again: a cancel stops it as it
+            // stops planning, and is taken here (a failed learn is only a
+            // plan not cached).
+            self.with_cancel_hook(|| {
+                if let Some(key) = plan_key.filter(|k| self.planned_before(k)) {
+                    self.learn_plan_template(key, params, param_types, &tz, None);
+                } else if let Some(family) = family {
+                    let key = Self::family_key(&family);
+                    if self.planned_before(&key) {
+                        self.learn_plan_template(key, &[], &[], &tz, Some((sql, &family)));
+                    }
                 }
-            }
+            });
+            self.check_cancel()?;
         }
         if self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) {
             let ends_the_block = matches!(
@@ -30250,14 +30344,38 @@ impl PgHandler {
         if names.idents.is_empty() && names.others.is_empty() {
             return false;
         }
-        let text = sql.to_ascii_lowercase();
         // A call names its function as a whole identifier, never inside a
-        // longer one.
-        !names.idents.is_empty()
-            && text
-                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || !c.is_ascii()))
-                .any(|word| names.idents.contains(word))
-            || names.others.iter().any(|n| text.contains(n.as_str()))
+        // longer one. Read byte by byte, lowercasing only the words that may
+        // be one: a word that starts with a digit is a number unless some
+        // function's name does too (a 200,000-item `IN` list is 200,000 of
+        // them, and this runs before planning, where no cancel is seen).
+        let digit_names = names
+            .idents
+            .iter()
+            .any(|n| n.as_bytes().first().is_some_and(u8::is_ascii_digit));
+        let b = sql.as_bytes();
+        let mut i = 0;
+        while !names.idents.is_empty() && i < b.len() {
+            if !ident_byte(b[i]) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < b.len() && ident_byte(b[i]) {
+                i += 1;
+            }
+            if b[start].is_ascii_digit() && !digit_names {
+                continue;
+            }
+            if names.idents.contains(&sql[start..i].to_ascii_lowercase()) {
+                return true;
+            }
+        }
+        if names.others.is_empty() {
+            return false;
+        }
+        let text = sql.to_ascii_lowercase();
+        names.others.iter().any(|n| text.contains(n.as_str()))
     }
 
     /// Roll back a planning transaction nothing took (the statement failed,
@@ -33755,6 +33873,7 @@ impl PgHandler {
             } => Some(table.clone()),
             _ => None,
         };
+        let command_ids = heap::command_ids(&stmt);
         let mut out = {
             struct Running<'a>(Option<&'a std::sync::atomic::AtomicUsize>);
             impl Drop for Running<'_> {
@@ -33771,6 +33890,14 @@ impl PgHandler {
             }));
             self.with_event_triggers(stmt, |stmt| self.execute_inner(stmt, max_rows))
         };
+        // The command ids it consumed (`cmin` / `cmax`, RP-069).
+        if out.is_ok() {
+            xids::advance_command(
+                &self.storage,
+                self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
+                command_ids,
+            );
+        }
         if let (Some(table), Ok(_)) = (&written, &out) {
             if let Err(e) = self.check_deferrable_uniques(table) {
                 out = Err(e);
@@ -34013,6 +34140,13 @@ impl PgHandler {
             }
             Statement::RuleRewrite(p) => self.run_rule_plan(p, max_rows),
             Statement::CreateTable(mut def, if_not_exists) => {
+                if let Some(c) = def
+                    .columns
+                    .iter()
+                    .find(|c| TableDef::is_system_column_name(&c.name))
+                {
+                    return Err(Self::system_column_collision(&c.name));
+                }
                 self.note_fresh_in_block(&def.name);
                 // An identity column's sequence options: taken out of the
                 // column so they are not stored with the table.
@@ -34485,6 +34619,7 @@ impl PgHandler {
                 let (written, ins_rows) = if let Some(oc) = ins.on_conflict.take() {
                     self.insert_on_conflict(&ins.table, &def, ins.rows, &oc)?
                 } else {
+                    self.stamp_inserted(&ins.table, &def, &mut ins.rows)?;
                     let docs = ins
                         .rows
                         .iter()
@@ -36335,13 +36470,22 @@ impl PgHandler {
                         "cannot rename column of typed table".into(),
                     ));
                 }
-                let Some(old) = def.column(&column).cloned() else {
+                if TableDef::is_system_column_name(&column) {
+                    return Err(Self::user_error(
+                        "0A000",
+                        format!("cannot rename system column \"{column}\""),
+                    ));
+                }
+                let Some(old) = def.user_column(&column).cloned() else {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
                         "42703".into(), // undefined_column
                         format!("column \"{column}\" does not exist"),
                     ))));
                 };
+                if TableDef::is_system_column_name(&to) {
+                    return Err(Self::system_column_collision(&to));
+                }
                 if def.column(&to).is_some() {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -38002,6 +38146,7 @@ impl PgHandler {
                         // modelled; `VACUUM (ANALYZE)` vacuums, then
                         // analyses.
                         if full {
+                            self.vacuum_full(t)?;
                             self.record_relstats(t, true)?;
                             continue;
                         }
@@ -38929,6 +39074,9 @@ impl PgHandler {
                                     .filter(|k| {
                                         *k != "_id"
                                             && !k.starts_with("_id.")
+                                            // A row version's system fields
+                                            // are not the trigger's to drop.
+                                            && !k.starts_with("__sys_")
                                             && !after.contains_key(k)
                                     })
                                     .cloned()
@@ -39235,6 +39383,8 @@ impl PgHandler {
                 }
                 for table in &tables {
                     self.clear_relstats(table)?;
+                    // A truncated table starts a new heap (RP-069).
+                    self.reset_heap(table)?;
                 }
                 for table in &tables {
                     self.fire_statement_triggers(table, "AFTER", "TRUNCATE")?;
@@ -39347,26 +39497,95 @@ impl PgHandler {
         // A table with expression indexes recomputes the updated rows'
         // index fields: found BEFORE the update, which may move them out of
         // `filter`.
-        let has_expr = self
-            .lookup(table)
-            .map(|def| self.expr_indexes(&def))
+        let def = self.lookup(table);
+        let has_expr = def
+            .as_ref()
+            .map(|def| self.expr_indexes(def))
             .transpose()?
             .is_some_and(|ix| !ix.is_empty());
-        if !has_expr {
+        // A user table's rows get new versions (RP-069): their old places
+        // are read before the update.
+        let versioned = def.is_some() && !table.starts_with("__");
+        if !has_expr && !versioned {
             return self.update_rows_raw(table, filter, set, unset);
         }
-        let ids: Vec<Bson> = self
+        let before: Vec<(Bson, Option<i64>)> = self
             .storage
             .find_matching(self.db(), table, filter)
             .map_err(|e| Self::storage_err("could not read", e))?
             .iter()
-            .filter_map(|raw| decode_doc(raw).ok()?.get("_id").cloned())
+            .filter_map(|raw| {
+                let d = decode_doc(raw).ok()?;
+                Some((d.get("_id").cloned()?, heap::ctid_of(&d)))
+            })
             .collect();
         let matched = self.update_rows_raw(table, filter, set, unset)?;
-        if !ids.is_empty() {
+        if before.is_empty() {
+            return Ok(matched);
+        }
+        let ids: Vec<Bson> = before.iter().map(|(id, _)| id.clone()).collect();
+        if let (true, Some(def)) = (versioned, &def) {
+            self.restamp_updated(table, def, &before)?;
+        }
+        if has_expr {
             self.refresh_expr_fields(table, &bson::doc! { "_id": { "$in": ids } })?;
         }
         Ok(matched)
+    }
+
+    /// Updated rows' new versions: each one's xid, command and place, from
+    /// its old place (`before`: `(_id, old ctid)`).
+    fn restamp_updated(
+        &self,
+        table: &str,
+        def: &TableDef,
+        before: &[(Bson, Option<i64>)],
+    ) -> PgWireResult<()> {
+        let ids: Vec<Bson> = before.iter().map(|(id, _)| id.clone()).collect();
+        let rows: Vec<Document> = self
+            .storage
+            .find_matching(self.db(), table, &bson::doc! { "_id": { "$in": ids } })
+            .map_err(|e| Self::storage_err("could not read", e))?
+            .iter()
+            .filter_map(|raw| decode_doc(raw).ok())
+            .collect();
+        // In the order the update met them.
+        let mut versions: Vec<(Option<i64>, Document)> = before
+            .iter()
+            .filter_map(|(id, old)| {
+                rows.iter()
+                    .find(|r| r.get("_id") == Some(id))
+                    .map(|r| (*old, r.clone()))
+            })
+            .collect();
+        self.stamp_updated(table, def, &mut versions)?;
+        for (_, row) in &versions {
+            let Some(id) = row.get("_id") else {
+                continue;
+            };
+            let mut set = Document::new();
+            for f in ["__sys_xmin", "__sys_cid", "__sys_xmax", "__sys_ctid"] {
+                if let Some(v) = row.get(f) {
+                    set.insert(f, v.clone());
+                }
+            }
+            self.storage
+                .update_matching(
+                    self.db(),
+                    table,
+                    &bson::doc! { "_id": { "$eq": id.clone() } },
+                    &bson::doc! { "$set": set },
+                    false,
+                    false,
+                    &[],
+                    &Document::new(),
+                    None,
+                    None,
+                    false,
+                )
+                .map_err(|e| Self::storage_err("could not update", e))?;
+        }
+        Ok(())
     }
 
     /// `update_rows` without the expression index upkeep.
@@ -39765,6 +39984,10 @@ impl PgHandler {
                     None,
                 )
                 .map_err(|e| Self::storage_err("could not update", e))?;
+            // The new version's place, from the old one's (RP-069).
+            let mut versions = vec![(heap::ctid_of(old), new.clone())];
+            self.stamp_updated(table, def, &mut versions)?;
+            let new = &versions[0].1;
             let bytes =
                 encode_doc(new).map_err(|e| Self::storage_err("could not encode a row", e))?;
             let bytes = self.with_expr_fields(table, vec![bytes])?;
@@ -46870,7 +47093,8 @@ impl CopyHandler for PgHandler {
                 self.apply_expression_defaults(&def, &mut rows)?;
                 apply_column_defaults(&def, &mut rows)?;
                 self.apply_generated(&def, &mut rows)?;
-                let (table, _, rows) = self.copy_target(&def, rows)?;
+                let (table, _, mut rows) = self.copy_target(&def, rows)?;
+                self.stamp_inserted(&table, &def, &mut rows)?;
                 let docs = rows
                     .iter()
                     .map(encode_doc)
