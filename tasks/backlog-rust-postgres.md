@@ -786,22 +786,43 @@ tests are scenarios in `tests/backlog/test_rp_batch52.py` and
 RP-204 (an executor-answered function in a PL/pgSQL expression), RP-206 (a
 view over another schema's table had no rule dependency), RP-207 (an index
 in another schema was listed in `public`), RP-208 (a built-in row type
-printed as its oid), RP-209 (`plpgsql`'s extension oid) and RP-210 (the
-visibility functions) were found and fixed in the same batch; their tests
-are regression tests.
+printed as its oid), RP-209 (`plpgsql`'s extension oid), RP-210 (the
+visibility functions) and RP-211 (`pg_operator` and `pg_rewrite` listed
+none of PostgreSQL's rows) were found and fixed in the same batch; their
+tests are regression tests.
 
-- [ ] **`pg_rewrite` lists no rule of a system view.** PostgreSQL 15.19 has
-      142 (`_RETURN` on `pg_roles`, `pg_shadow`, ...); here a user view's
-      rule is listed and the system views' are not. Their rows need the
-      views' `ev_action` node trees as PostgreSQL stores them.
+- [ ] **A rule's `ev_qual` and `ev_action` are NULL.** PostgreSQL 15.19
+      stores each rule's qualification and actions as node trees (`<>` for
+      no qualification, `({QUERY :commandType 1 ...})`); here both columns
+      are NULL, for the system views' rules (listed since batch 52, as
+      `initdb` leaves them) and for the database's own. The trees are
+      PostgreSQL's `nodeToString` of its analysed query, which this server
+      does not build.
       Backlog-ID: RP-203
-      Verify: tests/backlog/test_rp_batch51.py::test_scenario[pg_rewrite lists the system views' rules]
+      Verify: tests/backlog/test_rp_batch51.py::test_scenario[a rule's node trees]
 - [ ] **A table's row type has the table's oid.** PostgreSQL 15.19 gives
       the row type an oid of its own (`pg_class.reltype`); here they are
       one number, so `pg_depend` rows about the type read as rows about the
       relation (`type t[]` appears among what depends on table `t`).
       Backlog-ID: RP-205
       Verify: tests/backlog/test_rp_batch52.py::test_scenario[pg_depend of a table, its view and its row type]
+- [ ] **A function the executor answers is NULL or refused inside an
+      aggregate.** `select sum(pg_relation_size(oid)) >= 0 from pg_class`
+      is NULL here, `t` on PostgreSQL 15.19; in a FILTER
+      (`count(*) filter (where pg_type_is_visible(oid))`) the argument is
+      typed as text and the call refused (`function pg_type_is_visible(text)
+      is not supported yet`). The same calls in a select list or a WHERE
+      are answered.
+      Backlog-ID: RP-212
+      Verify: tests/backlog/test_rp_batch52.py::test_scenario[an executor function in an aggregate]
+- [ ] **A `reg*` column against a constant in WHERE matches nothing.**
+      `select count(*) from pg_operator where oprcode = 'int4eq'::regproc`
+      is 0 here, 1 on PostgreSQL 15.19; so is `typinput = 'int4in'::regproc`
+      over `pg_type`, and `aggfnoid = 2108` over `pg_aggregate`. The same
+      comparison in a select list is right, and `oid = 'now'::regproc`
+      over `pg_proc` matches.
+      Backlog-ID: RP-213
+      Verify: tests/backlog/test_rp_batch52.py::test_scenario[a reg* column against a constant in WHERE]
 
 ## Found by batch 51 (2026-10-23)
 

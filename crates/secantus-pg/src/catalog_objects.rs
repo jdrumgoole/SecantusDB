@@ -674,42 +674,48 @@ impl PgHandler {
                     r
                 })
                 .collect(),
-            "pg_operator" => self
-                .catalog_docs(OPERATOR_COLLECTION)
-                .iter()
-                .map(|d| {
-                    let type_oid = |t: &str| {
-                        secantus_pgplan::pgtypes::oid_of_name(t)
-                            .or_else(|| self.relation_oid(t))
-                            .unwrap_or(0)
-                    };
-                    let left = d.get_str("left").ok();
-                    let mut r = Document::new();
-                    r.insert(f("oid"), oid("opr", d.get_str("_id").unwrap_or_default()));
-                    r.insert(f("oprname"), d.get_str("name").unwrap_or_default());
-                    r.insert(f("oprnamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
-                    r.insert(
-                        f("oprowner"),
-                        Bson::Int64(self.role_oid_of(d.get_str("owner").unwrap_or_default())),
-                    );
-                    r.insert(f("oprkind"), if left.is_some() { "b" } else { "l" });
-                    r.insert(f("oprcanmerge"), false);
-                    r.insert(f("oprcanhash"), false);
-                    r.insert(f("oprleft"), Bson::Int64(left.map_or(0, type_oid)));
-                    r.insert(
-                        f("oprright"),
-                        Bson::Int64(type_oid(d.get_str("right").unwrap_or_default())),
-                    );
-                    r.insert(
-                        f("oprresult"),
-                        Bson::Int64(type_oid(d.get_str("result").unwrap_or_default())),
-                    );
-                    r.insert(f("oprcom"), Bson::Int64(0));
-                    r.insert(f("oprnegate"), Bson::Int64(0));
-                    r.insert(f("oprcode"), d.get_str("function").unwrap_or_default());
-                    r
-                })
-                .collect(),
+            // PostgreSQL's operators (RP-211), then the database's.
+            "pg_operator" => {
+                let mut rows = self.static_rows("pg_operator", def);
+                let user: Vec<Document> = self
+                    .catalog_docs(OPERATOR_COLLECTION)
+                    .iter()
+                    .map(|d| {
+                        let type_oid = |t: &str| {
+                            secantus_pgplan::pgtypes::oid_of_name(t)
+                                .or_else(|| self.relation_oid(t))
+                                .unwrap_or(0)
+                        };
+                        let left = d.get_str("left").ok();
+                        let mut r = Document::new();
+                        r.insert(f("oid"), oid("opr", d.get_str("_id").unwrap_or_default()));
+                        r.insert(f("oprname"), d.get_str("name").unwrap_or_default());
+                        r.insert(f("oprnamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
+                        r.insert(
+                            f("oprowner"),
+                            Bson::Int64(self.role_oid_of(d.get_str("owner").unwrap_or_default())),
+                        );
+                        r.insert(f("oprkind"), if left.is_some() { "b" } else { "l" });
+                        r.insert(f("oprcanmerge"), false);
+                        r.insert(f("oprcanhash"), false);
+                        r.insert(f("oprleft"), Bson::Int64(left.map_or(0, type_oid)));
+                        r.insert(
+                            f("oprright"),
+                            Bson::Int64(type_oid(d.get_str("right").unwrap_or_default())),
+                        );
+                        r.insert(
+                            f("oprresult"),
+                            Bson::Int64(type_oid(d.get_str("result").unwrap_or_default())),
+                        );
+                        r.insert(f("oprcom"), Bson::Int64(0));
+                        r.insert(f("oprnegate"), Bson::Int64(0));
+                        r.insert(f("oprcode"), d.get_str("function").unwrap_or_default());
+                        r
+                    })
+                    .collect();
+                rows.extend(user);
+                rows
+            }
             "pg_tablespace" => {
                 let mut rows = Vec::new();
                 for (o, n) in [(PG_DEFAULT_OID, "pg_default"), (PG_GLOBAL_OID, "pg_global")] {

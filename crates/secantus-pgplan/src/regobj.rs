@@ -262,8 +262,14 @@ pub fn from_bson(v: &Bson) -> Option<(&'static str, i64)> {
 /// The name an oid of `kind` renders as; an oid naming nothing prints as
 /// the number, and 0 as `-`.
 pub fn text(kind: &str, oid: i64) -> String {
+    // `regoperout` and `regoperatorout` print an oid of 0 as `0`; every
+    // other kind as `-`.
     if oid == 0 {
-        return "-".into();
+        return if matches!(kind, "regoper" | "regoperator") {
+            "0".into()
+        } else {
+            "-".into()
+        };
     }
     let found = match kind {
         "regnamespace" => NAMESPACES.with(|t| {
@@ -305,7 +311,24 @@ pub fn text(kind: &str, oid: i64) -> String {
                         }
                     })
             })
-            .or_else(|| builtin_proc_name(oid).map(crate::scalar::quote_identifier)),
+            // `regprocout`: the bare name when it alone finds this one
+            // function, else qualified (`pg_catalog.jsonb_delete`, which has
+            // three overloads).
+            .or_else(|| {
+                builtin_proc_name(oid).map(|name| {
+                    let user = PROCS.with(|t| {
+                        t.borrow()
+                            .iter()
+                            .filter(|(n, _, _)| crate::schemas::split_key(n).1 == name)
+                            .count()
+                    });
+                    if builtin_proc_oids(name).len() + user > 1 {
+                        format!("pg_catalog.{}", crate::scalar::quote_identifier(name))
+                    } else {
+                        crate::scalar::quote_identifier(name)
+                    }
+                })
+            }),
         // `regoperout`: the bare name when it alone finds this operator,
         // else qualified (`551::regoper` is `pg_catalog.+`).
         "regoper" => builtin_operators().iter().find(|o| o.0 == oid).map(|o| {

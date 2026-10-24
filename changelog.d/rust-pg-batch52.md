@@ -62,9 +62,23 @@ commented. Six divergences found on the way are fixed: they are listed below.
   object up: its bare name, with its argument types for a function or an
   operator, must find it.
 
+- Fixes RP-211
+  (`tests/backlog/test_rp_batch52.py::test_scenario[pg_operator lists PostgreSQL's operators]`,
+  `tests/backlog/test_rp_batch51.py::test_scenario[pg_rewrite lists the system views' rules]`):
+  `pg_operator` listed only the database's own operators, and `pg_rewrite`
+  only its own rules. Both now list PostgreSQL 15.19's rows first (799
+  operators, 142 system view rules), dumped by
+  `tools/probes/pg15_system_catalog_dump.py`. With them, `regproc` text
+  qualifies a name that alone finds more than one function
+  (`pg_catalog.jsonb_delete`), and a `regoper` / `regoperator` of 0 prints
+  as `0`, as PostgreSQL prints them.
+
 #### Known
 
 - RP-199, what is left: `pg_identify_object`, `pg_identify_object_as_address`
   and `pg_get_object_address` are refused.
-- RP-203: `pg_rewrite` lists no system view's rule.
+- RP-203: a rule's `ev_qual` and `ev_action` are NULL.
 - RP-205: a table's row type has the table's oid.
+- RP-212: a function the executor answers is NULL or refused inside an
+  aggregate.
+- RP-213: a `reg*` column against a constant in WHERE matches nothing.

@@ -140,6 +140,38 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
             "select pg_type_is_visible('int4'::regtype), pg_function_is_visible('now'::regproc)",
         ],
     ),
+    "pg_operator lists PostgreSQL's operators": (
+        "RP-211",
+        False,
+        [
+            "select count(*) from pg_operator",
+            "select count(*) from pg_operator where pg_operator_is_visible(oid)",
+            "select oprname, oprkind, oprleft::regtype::text, oprright::regtype::text, "
+            "oprresult::regtype::text, oprcom::regoperator::text, oprnegate::regoperator::text, "
+            "oprcode::text, oprrest::text, oprjoin::text from pg_operator "
+            "where oid in (96, 3285, 3898) order by oid",
+            "select pg_describe_object('pg_operator'::regclass, '+(int4,int4)'::regoperator, 0)",
+        ],
+    ),
+    "an executor function in an aggregate": (
+        "RP-212",
+        True,
+        [
+            "select sum(pg_relation_size(oid)) >= 0 from pg_class",
+            "select count(*) filter (where pg_type_is_visible(oid)) from pg_type",
+            "select count(*) filter (where pg_relation_size(oid) >= 0) from pg_class",
+        ],
+    ),
+    "a reg* column against a constant in WHERE": (
+        "RP-213",
+        True,
+        [
+            "select count(*) from pg_operator where oprcode = 'int4eq'::regproc",
+            "select count(*) from pg_type where typinput = 'int4in'::regproc",
+            "select aggtransfn::text from pg_aggregate where aggfnoid = 'sum(int4)'::regprocedure",
+            "select count(*) from pg_aggregate where aggfnoid = 2108",
+        ],
+    ),
 }
 
 EXPECTED: dict[str, Any] = {
@@ -159,6 +191,7 @@ EXPECTED: dict[str, Any] = {
     "a built-in row type's name": [
         [("pg_type", "pg_type[]", "cstring[]", "information_schema.tables")]
     ],
+    "a reg* column against a constant in WHERE": [[("1",)], [("1",)], [("int4_sum",)], [("1",)]],
     "a view over another schema's table depends on it": [
         "BEGIN",
         "CREATE SCHEMA",
@@ -181,6 +214,7 @@ EXPECTED: dict[str, Any] = {
         ("DO", ["table pg_class"]),
         "ROLLBACK",
     ],
+    "an executor function in an aggregate": [[("True",)], [("463",)], [("410",)]],
     "an index in another schema is listed in it": [
         "BEGIN",
         "CREATE SCHEMA",
@@ -205,6 +239,38 @@ EXPECTED: dict[str, Any] = {
         ],
         [("type rp52_d[]", "type rp52_d", "i")],
         "ROLLBACK",
+    ],
+    "pg_operator lists PostgreSQL's operators": [
+        [("799",)],
+        [("799",)],
+        [
+            (
+                "=",
+                "b",
+                "integer",
+                "integer",
+                "boolean",
+                "=(integer,integer)",
+                "<>(integer,integer)",
+                "int4eq",
+                "eqsel",
+                "eqjoinsel",
+            ),
+            ("-", "b", "jsonb", "text", "jsonb", "0", "0", "pg_catalog.jsonb_delete", "-", "-"),
+            (
+                "+",
+                "b",
+                "anyrange",
+                "anyrange",
+                "anyrange",
+                "+(anyrange,anyrange)",
+                "0",
+                "range_union",
+                "-",
+                "-",
+            ),
+        ],
+        [("operator +(integer,integer)",)],
     ],
     "plpgsql's extension oid": [[("14031", "plpgsql")]],
     "the visibility functions of an oid that names nothing": [
