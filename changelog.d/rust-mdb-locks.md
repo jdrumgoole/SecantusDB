@@ -73,3 +73,11 @@ Rust server, where mongod takes no lock at all.
   chain here, where mongod takes none before it parses. `validateDBMetadata`
   still takes the generic chain. The transaction commands remain, and so do
   the commands outside the sweep.
+
+#### Security
+
+- `ctutils` 0.4.2 -> 0.4.5 in the `secantusdb`, `secantus-server-py` and
+  `secantus-pg` lock files: RUSTSEC-2026-0385 (published 2026-10-23,
+  non-constant-time mask generation and `u128` comparisons), which the
+  `cargo audit` job reported on this change's lock files. A lock-file
+  change only; the PostgreSQL server's lock file is among them.
