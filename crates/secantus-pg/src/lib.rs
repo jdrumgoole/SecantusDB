@@ -58,6 +58,7 @@ mod encoding;
 mod event_triggers;
 mod explain;
 mod expr_index;
+mod ext_members;
 mod external_sort;
 mod extstats;
 mod fdw;
@@ -5181,6 +5182,8 @@ impl PgHandler {
                         args.join(","),
                     )
                 })
+                // An extension's functions (RP-105).
+                .chain(self.extension_procs())
                 // A range's constructors are functions too.
                 .chain(self.range_constructors().into_iter().map(
                     |(oid, name, args, _, _, _, _)| {
@@ -5254,6 +5257,8 @@ impl PgHandler {
                 self.range_constructor_type_name(ret),
             ));
         }
+        // An extension's functions (RP-228).
+        sigs.extend(self.extension_function_sigs());
         secantus_pgplan::set_function_sigs(sigs);
         let mut arg_defaults = self.function_arg_defaults();
         static BUILTIN_ARG_DEFAULTS: OnceLock<Vec<(i64, Vec<Option<String>>)>> = OnceLock::new();
@@ -5264,7 +5269,10 @@ impl PgHandler {
                 .cloned(),
         );
         secantus_pgplan::set_function_arg_defaults(arg_defaults);
-        secantus_pgplan::set_function_defs(self.function_defs());
+        let mut defs = self.function_defs();
+        // An extension's functions (RP-229).
+        defs.extend(self.extension_function_defs());
+        secantus_pgplan::set_function_defs(defs);
         secantus_pgplan::set_partkey_defs(
             self.all_table_defs()
                 .unwrap_or_default()
@@ -5451,6 +5459,12 @@ impl PgHandler {
             .unwrap_or_default()
             .into_iter()
             .map(|b| (Self::type_resolution(&b.schema, &b.name), b.oid, b.defined))
+            // An extension's own internal types (RP-105).
+            .chain(
+                self.extension_new_types()
+                    .into_iter()
+                    .map(|(n, o)| (n, o, true)),
+            )
             .collect();
         secantus_pgplan::set_user_base_types(base_types);
         // The extension types among them (`hstore`, `geometry`): the planner
@@ -17399,6 +17413,20 @@ impl PgHandler {
         Ok(oid)
     }
 
+    /// Mint `n` consecutive oids from the counter tables and types share,
+    /// the first returned (an extension's objects, RP-105).
+    pub(crate) fn mint_composite_oids(&self, n: usize) -> PgWireResult<i64> {
+        if n == 0 {
+            return Ok(0);
+        }
+        let first = self.mint_composite_oid()?;
+        // The counter is the next free oid: advance it past the block.
+        for _ in 1..n {
+            self.mint_composite_oid()?;
+        }
+        Ok(first)
+    }
+
     /// Mint the next composite oid -- the enum minting rule, own counter and
     /// base 67000, monotonic and never reused.
     fn mint_composite_oid_in_session(&self) -> PgWireResult<i64> {
@@ -21559,6 +21587,18 @@ impl PgHandler {
                 .collect();
             all.append(&mut rows);
             rows = all;
+        }
+        // The installed extensions' objects (RP-105), after the rest.
+        if ext_members::CATALOGS.contains(&name) {
+            let oid_field = def.field_of("oid");
+            let oid_of =
+                |d: &Document| oid_field.as_ref().and_then(|f| d.get(f)).and_then(bson_i64);
+            let have: HashSet<i64> = rows.iter().filter_map(oid_of).collect();
+            rows.extend(
+                self.extension_member_rows(name, &def)
+                    .into_iter()
+                    .filter(|d| oid_of(d).is_none_or(|o| !have.contains(&o))),
+            );
         }
         let empty = Document::new();
         // Large scalar `$in` / `$nin` lists hashed once for these rows.
@@ -38052,6 +38092,7 @@ impl PgHandler {
                 }
                 self.ensure_collection(Self::EXTENSION_COLLECTION)?;
                 self.ensure_collection(Self::BASE_TYPE_COLLECTION)?;
+                let mut made: Vec<(String, i64)> = Vec::new();
                 for ty in types {
                     let oid = self.mint_base_type_oid()?;
                     let key = Self::type_resolution(&schema, ty);
@@ -38079,7 +38120,10 @@ impl PgHandler {
                         });
                     }
                     self.insert_type_doc(Self::BASE_TYPE_COLLECTION, &key, doc)?;
+                    made.push((ty.to_string(), oid));
                 }
+                // The rest of what its script makes (RP-105).
+                self.install_extension_members(&name, &schema, &made)?;
                 let doc = bson::doc! {
                     "_id": &name,
                     "version": version,
@@ -38451,6 +38495,7 @@ impl PgHandler {
                                 let key = Self::type_resolution(&b.schema, &b.name);
                                 self.delete_type_doc(Self::BASE_TYPE_COLLECTION, &key)?;
                             }
+                            self.drop_extension_members(name)?;
                             self.delete_type_doc(Self::EXTENSION_COLLECTION, name)?;
                             continue;
                         }
@@ -38477,6 +38522,7 @@ impl PgHandler {
                         let key = Self::type_resolution(&b.schema, &b.name);
                         self.delete_type_doc(Self::BASE_TYPE_COLLECTION, &key)?;
                     }
+                    self.drop_extension_members(name)?;
                     self.delete_type_doc(Self::EXTENSION_COLLECTION, name)?;
                 }
                 Ok(vec![Response::Execution(Tag::new("DROP EXTENSION"))])

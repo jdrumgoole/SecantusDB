@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 
 const VIEWS: &str = include_str!("pg15_system_views.tsv");
 
-fn unescape(s: &str) -> String {
+pub(crate) fn unescape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {

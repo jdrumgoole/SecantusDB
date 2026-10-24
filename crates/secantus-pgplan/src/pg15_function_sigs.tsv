@@ -1,0 +1,3244 @@
+3	internal	internal	table_am_handler
+31	bytea	bytea	cstring
+33	"char"	"char"	cstring
+34	cstring	cstring	name
+35	name	name	cstring
+38	cstring	cstring	smallint
+39	smallint	smallint	cstring
+40	cstring	cstring	int2vector
+41	int2vector	int2vector	cstring
+42	cstring	cstring	integer
+43	integer	integer	cstring
+44	cstring	cstring	regproc
+45	regproc	regproc	cstring
+46	cstring	cstring	text
+47	text	text	cstring
+48	cstring	cstring	tid
+49	tid	tid	cstring
+50	cstring	cstring	xid
+51	xid	xid	cstring
+52	cstring	cstring	cid
+53	cid	cid	cstring
+54	cstring	cstring	oidvector
+55	oidvector	oidvector	cstring
+56	boolean, boolean	boolean, boolean	boolean
+57	boolean, boolean	boolean, boolean	boolean
+60	boolean, boolean	boolean, boolean	boolean
+61	"char", "char"	"char", "char"	boolean
+62	name, name	name, name	boolean
+63	smallint, smallint	smallint, smallint	boolean
+64	smallint, smallint	smallint, smallint	boolean
+65	integer, integer	integer, integer	boolean
+66	integer, integer	integer, integer	boolean
+67	text, text	text, text	boolean
+68	xid, xid	xid, xid	boolean
+69	cid, cid	cid, cid	boolean
+70	"char", "char"	"char", "char"	boolean
+72	"char", "char"	"char", "char"	boolean
+73	"char", "char"	"char", "char"	boolean
+74	"char", "char"	"char", "char"	boolean
+77	"char"	"char"	integer
+78	integer	integer	"char"
+79	name, text	name, text	boolean
+84	boolean, boolean	boolean, boolean	boolean
+86	cstring	cstring	pg_ddl_command
+87	pg_ddl_command	pg_ddl_command	cstring
+88	internal	internal	pg_ddl_command
+89			text
+90	pg_ddl_command	pg_ddl_command	bytea
+101	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+102	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+103	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+104	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+105	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+106	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+107	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+108	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+109	cstring	cstring	unknown
+110	unknown	unknown	cstring
+115	box, box	box, box	boolean
+116	box, box	box, box	boolean
+117	cstring	cstring	point
+118	point	point	cstring
+119	cstring	cstring	lseg
+120	lseg	lseg	cstring
+121	cstring	cstring	path
+122	path	path	cstring
+123	cstring	cstring	box
+124	box	box	cstring
+125	box, box	box, box	boolean
+126	box, box	box, box	boolean
+127	box, box	box, box	boolean
+128	box, box	box, box	boolean
+129	box, box	box, box	boolean
+130	box, box	box, box	boolean
+131	point, point	point, point	boolean
+132	point, point	point, point	boolean
+133	point, point	point, point	boolean
+134	point, point	point, point	boolean
+135	point, point	point, point	boolean
+136	point, box	point, box	boolean
+137	point, path	point, path	boolean
+138	box	box	point
+139	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+140	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+141	integer, integer	integer, integer	integer
+144	integer, integer	integer, integer	boolean
+145	smallint, smallint	smallint, smallint	boolean
+146	smallint, smallint	smallint, smallint	boolean
+147	integer, integer	integer, integer	boolean
+148	smallint, smallint	smallint, smallint	boolean
+149	integer, integer	integer, integer	boolean
+150	integer, integer	integer, integer	boolean
+151	smallint, smallint	smallint, smallint	boolean
+152	smallint, smallint	smallint, smallint	smallint
+153	smallint, smallint	smallint, smallint	smallint
+154	integer, integer	integer, integer	integer
+155	smallint, smallint	smallint, smallint	smallint
+156	integer, integer	integer, integer	integer
+157	text, text	text, text	boolean
+158	smallint, integer	smallint, integer	boolean
+159	integer, smallint	integer, smallint	boolean
+160	smallint, integer	smallint, integer	boolean
+161	integer, smallint	integer, smallint	boolean
+162	smallint, integer	smallint, integer	boolean
+163	integer, smallint	integer, smallint	boolean
+164	smallint, integer	smallint, integer	boolean
+165	integer, smallint	integer, smallint	boolean
+166	smallint, integer	smallint, integer	boolean
+167	integer, smallint	integer, smallint	boolean
+168	smallint, integer	smallint, integer	boolean
+169	integer, smallint	integer, smallint	boolean
+170	smallint, integer	smallint, integer	integer
+171	integer, smallint	integer, smallint	integer
+172	smallint, integer	smallint, integer	integer
+173	integer, smallint	integer, smallint	integer
+176	smallint, smallint	smallint, smallint	smallint
+177	integer, integer	integer, integer	integer
+178	smallint, integer	smallint, integer	integer
+179	integer, smallint	integer, smallint	integer
+180	smallint, smallint	smallint, smallint	smallint
+181	integer, integer	integer, integer	integer
+182	smallint, integer	smallint, integer	integer
+183	integer, smallint	integer, smallint	integer
+184	oid, oid	oid, oid	boolean
+185	oid, oid	oid, oid	boolean
+186	box, box	box, box	boolean
+187	box, box	box, box	boolean
+188	box, box	box, box	boolean
+189	box, box	box, box	boolean
+190	box, box	box, box	boolean
+191	box, box	box, box	boolean
+192	box, box	box, box	boolean
+193	box, point	box, point	boolean
+195	cstring	cstring	pg_node_tree
+196	pg_node_tree	pg_node_tree	cstring
+197	internal	internal	pg_node_tree
+198	pg_node_tree	pg_node_tree	bytea
+200	cstring	cstring	real
+201	real	real	cstring
+202	real, real	real, real	real
+203	real, real	real, real	real
+204	real, real	real, real	real
+205	real, real	real, real	real
+206	real	real	real
+207	real	real	real
+208	double precision[], real	double precision[], real	double precision[]
+209	real, real	real, real	real
+211	real, real	real, real	real
+212	integer	integer	integer
+213	smallint	smallint	smallint
+214	cstring	cstring	double precision
+215	double precision	double precision	cstring
+216	double precision, double precision	double precision, double precision	double precision
+217	double precision, double precision	double precision, double precision	double precision
+218	double precision, double precision	double precision, double precision	double precision
+219	double precision, double precision	double precision, double precision	double precision
+220	double precision	double precision	double precision
+221	double precision	double precision	double precision
+222	double precision[], double precision	double precision[], double precision	double precision[]
+223	double precision, double precision	double precision, double precision	double precision
+224	double precision, double precision	double precision, double precision	double precision
+225	lseg	lseg	point
+227	polygon	polygon	point
+228	double precision	double precision	double precision
+229	double precision	double precision	double precision
+230	double precision	double precision	double precision
+231	double precision	double precision	double precision
+232	double precision, double precision	double precision, double precision	double precision
+233	double precision	double precision	double precision
+234	double precision	double precision	double precision
+235	smallint	smallint	double precision
+236	smallint	smallint	real
+237	double precision	double precision	smallint
+238	real	real	smallint
+239	line, line	line, line	double precision
+240	name, text	name, text	boolean
+241	name, text	name, text	boolean
+242	name, text	name, text	boolean
+243	name, text	name, text	boolean
+244	name, text	name, text	boolean
+245	name, text	name, text	boolean
+246	name, text	name, text	integer
+247	text, name	text, name	boolean
+248	text, name	text, name	boolean
+249	text, name	text, name	boolean
+250	text, name	text, name	boolean
+251	text, name	text, name	boolean
+252	text, name	text, name	boolean
+253	text, name	text, name	integer
+266	name, oid	name, oid	name
+267	cstring	cstring	table_am_handler
+268	table_am_handler	table_am_handler	cstring
+274			text
+275	regclass, name, regclass	regclass, name, regclass	oid
+276	double precision[], double precision[]	double precision[], double precision[]	double precision[]
+277	lseg, line	lseg, line	boolean
+278	line, box	line, box	boolean
+279	real, double precision	real, double precision	double precision
+280	real, double precision	real, double precision	double precision
+281	real, double precision	real, double precision	double precision
+282	real, double precision	real, double precision	double precision
+283	double precision, real	double precision, real	double precision
+284	double precision, real	double precision, real	double precision
+285	double precision, real	double precision, real	double precision
+286	double precision, real	double precision, real	double precision
+287	real, real	real, real	boolean
+288	real, real	real, real	boolean
+289	real, real	real, real	boolean
+290	real, real	real, real	boolean
+291	real, real	real, real	boolean
+292	real, real	real, real	boolean
+293	double precision, double precision	double precision, double precision	boolean
+294	double precision, double precision	double precision, double precision	boolean
+295	double precision, double precision	double precision, double precision	boolean
+296	double precision, double precision	double precision, double precision	boolean
+297	double precision, double precision	double precision, double precision	boolean
+298	double precision, double precision	double precision, double precision	boolean
+299	real, double precision	real, double precision	boolean
+300	real, double precision	real, double precision	boolean
+301	real, double precision	real, double precision	boolean
+302	real, double precision	real, double precision	boolean
+303	real, double precision	real, double precision	boolean
+304	real, double precision	real, double precision	boolean
+305	double precision, real	double precision, real	boolean
+306	double precision, real	double precision, real	boolean
+307	double precision, real	double precision, real	boolean
+308	double precision, real	double precision, real	boolean
+309	double precision, real	double precision, real	boolean
+310	double precision, real	double precision, real	boolean
+311	real	real	double precision
+312	double precision	double precision	real
+313	smallint	smallint	integer
+314	integer	integer	smallint
+315			boolean
+316	integer	integer	double precision
+317	double precision	double precision	integer
+318	integer	integer	real
+319	real	real	integer
+320	double precision, double precision, double precision, integer	double precision, double precision, double precision, integer	integer
+321	cstring	cstring	json
+322	json	json	cstring
+323	internal	internal	json
+324	json	json	bytea
+326	cstring	cstring	index_am_handler
+327	index_am_handler	index_am_handler	cstring
+328	macaddr8	macaddr8	integer
+329	aclitem	aclitem	integer
+330	internal	internal	index_am_handler
+331	internal	internal	index_am_handler
+332	internal	internal	index_am_handler
+333	internal	internal	index_am_handler
+334	internal	internal	index_am_handler
+335	internal	internal	index_am_handler
+336	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+337	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+338	oid	oid	boolean
+339	polygon, polygon	polygon, polygon	boolean
+340	polygon, polygon	polygon, polygon	boolean
+341	polygon, polygon	polygon, polygon	boolean
+342	polygon, polygon	polygon, polygon	boolean
+343	polygon, polygon	polygon, polygon	boolean
+344	polygon, polygon	polygon, polygon	boolean
+345	polygon, polygon	polygon, polygon	boolean
+346	polygon, polygon	polygon, polygon	boolean
+347	cstring	cstring	polygon
+348	polygon	polygon	cstring
+350	smallint, smallint	smallint, smallint	integer
+351	integer, integer	integer, integer	integer
+354	real, real	real, real	integer
+355	double precision, double precision	double precision, double precision	integer
+356	oid, oid	oid, oid	integer
+357	box, point	box, point	double precision
+358	"char", "char"	"char", "char"	integer
+359	name, name	name, name	integer
+360	text, text	text, text	integer
+361	lseg, lseg	lseg, lseg	double precision
+362	lseg, lseg	lseg, lseg	point
+363	point, lseg	point, lseg	double precision
+364	point, box	point, box	double precision
+365	lseg, box	lseg, box	double precision
+366	point, lseg	point, lseg	point
+367	point, box	point, box	point
+368	lseg, box	lseg, box	point
+369	point, lseg	point, lseg	boolean
+370	path, path	path, path	double precision
+371	point, path	point, path	double precision
+372	lseg, box	lseg, box	boolean
+373	lseg, box	lseg, box	boolean
+376	text, text, text	text, text, text	text[]
+377	money, money	money, money	integer
+378	anycompatiblearray, anycompatible	anycompatiblearray, anycompatible	anycompatiblearray
+379	anycompatible, anycompatiblearray	anycompatible, anycompatiblearray	anycompatiblearray
+380	lseg, point	lseg, point	double precision
+381	box, lseg	box, lseg	double precision
+382	anyarray, anyarray	anyarray, anyarray	integer
+383	anycompatiblearray, anycompatiblearray	anycompatiblearray, anycompatiblearray	anycompatiblearray
+384	anyarray, text, text	anyarray, text, text	text
+386	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+390	anyarray, anyarray	anyarray, anyarray	boolean
+391	anyarray, anyarray	anyarray, anyarray	boolean
+392	anyarray, anyarray	anyarray, anyarray	boolean
+393	anyarray, anyarray	anyarray, anyarray	boolean
+394	text, text	text, text	text[]
+395	anyarray, text	anyarray, text	text
+396	anyarray, anyarray	anyarray, anyarray	boolean
+398	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+399	macaddr	macaddr	integer
+400	text	text	integer
+401	character	character	text
+404	oidvector, oidvector	oidvector, oidvector	integer
+406	name	name	text
+407	text	text	name
+408	name	name	character
+409	character	character	name
+421	path, point	path, point	double precision
+422	inet	inet	integer
+425	integer, bigint	integer, bigint	bigint
+432	numeric	numeric	integer
+436	cstring	cstring	macaddr
+437	macaddr	macaddr	cstring
+438	VARIADIC "any"	VARIADIC "any"	integer
+440	VARIADIC "any"	VARIADIC "any"	integer
+441	smallint, bigint	smallint, bigint	bigint
+442	bigint, bigint	bigint, bigint	bigint
+443	real, bigint	real, bigint	bigint
+444	double precision, bigint	double precision, bigint	bigint
+445	oid, bigint	oid, bigint	bigint
+446	"char", bigint	"char", bigint	bigint
+447	name, bigint	name, bigint	bigint
+448	text, bigint	text, bigint	bigint
+449	smallint	smallint	integer
+450	integer	integer	integer
+451	real	real	integer
+452	double precision	double precision	integer
+453	oid	oid	integer
+454	"char"	"char"	integer
+455	name	name	integer
+456	internal	internal	integer
+457	oidvector	oidvector	integer
+458	text, text	text, text	text
+459	text, text	text, text	text
+460	cstring	cstring	bigint
+461	bigint	bigint	cstring
+462	bigint	bigint	bigint
+463	bigint, bigint	bigint, bigint	bigint
+464	bigint, bigint	bigint, bigint	bigint
+465	bigint, bigint	bigint, bigint	bigint
+466	bigint, bigint	bigint, bigint	bigint
+467	bigint, bigint	bigint, bigint	boolean
+468	bigint, bigint	bigint, bigint	boolean
+469	bigint, bigint	bigint, bigint	boolean
+470	bigint, bigint	bigint, bigint	boolean
+471	bigint, bigint	bigint, bigint	boolean
+472	bigint, bigint	bigint, bigint	boolean
+474	bigint, integer	bigint, integer	boolean
+475	bigint, integer	bigint, integer	boolean
+476	bigint, integer	bigint, integer	boolean
+477	bigint, integer	bigint, integer	boolean
+478	bigint, integer	bigint, integer	boolean
+479	bigint, integer	bigint, integer	boolean
+480	bigint	bigint	integer
+481	integer	integer	bigint
+482	bigint	bigint	double precision
+483	double precision	double precision	bigint
+515	anyarray, anyarray	anyarray, anyarray	anyarray
+516	anyarray, anyarray	anyarray, anyarray	anyarray
+598	inet	inet	text
+599	cidr	cidr	text
+605	inet, integer	inet, integer	inet
+619	oidvector, oidvector	oidvector, oidvector	boolean
+626	anyarray	anyarray	integer
+635	cidr, integer	cidr, integer	cidr
+636	oid, text	oid, text	boolean
+637	regclass, text	regclass, text	boolean
+638	regclass, integer, text	regclass, integer, text	boolean
+652	bigint	bigint	real
+653	real	real	bigint
+655	name, name	name, name	boolean
+656	name, name	name, name	boolean
+657	name, name	name, name	boolean
+658	name, name	name, name	boolean
+659	name, name	name, name	boolean
+668	character, integer, boolean	character, integer, boolean	character
+669	character varying, integer, boolean	character varying, integer, boolean	character varying
+676	oid, bigint	oid, bigint	text
+677	oidvector, oidvector	oidvector, oidvector	boolean
+678	oidvector, oidvector	oidvector, oidvector	boolean
+679	oidvector, oidvector	oidvector, oidvector	boolean
+680	oidvector, oidvector	oidvector, oidvector	boolean
+681	oidvector, oidvector	oidvector, oidvector	boolean
+683	inet	inet	cidr
+696	inet	inet	inet
+697	inet	inet	integer
+698	inet	inet	inet
+699	inet	inet	text
+702	line, point	line, point	double precision
+704	line, lseg	line, lseg	double precision
+710			name
+711	inet	inet	integer
+714	bigint	bigint	smallint
+715	oid	oid	oid
+716	oid, oid	oid, oid	boolean
+717	oid, oid	oid, oid	boolean
+720	bytea	bytea	integer
+721	bytea, integer	bytea, integer	integer
+722	bytea, integer, integer	bytea, integer, integer	bytea
+723	bytea, bigint	bytea, bigint	integer
+724	bytea, bigint, integer	bytea, bigint, integer	bytea
+725	point, line	point, line	double precision
+727	lseg, line	lseg, line	double precision
+728	circle, polygon	circle, polygon	double precision
+729	polygon, polygon	polygon, polygon	double precision
+730	inet	inet	text
+740	text, text	text, text	boolean
+741	text, text	text, text	boolean
+742	text, text	text, text	boolean
+743	text, text	text, text	boolean
+744	anyarray, anyarray	anyarray, anyarray	boolean
+745			name
+746			name
+747	anyarray	anyarray	text
+748	anyarray	anyarray	integer
+749	bytea, bytea, integer, integer	bytea, bytea, integer, integer	bytea
+750	cstring, oid, integer	cstring, oid, integer	anyarray
+751	anyarray	anyarray	cstring
+752	bytea, bytea, integer	bytea, bytea, integer	bytea
+753	macaddr	macaddr	macaddr
+754	smallint	smallint	bigint
+764	text	text	oid
+765	oid, text	oid, text	integer
+766	integer	integer	integer
+767	text, oid	text, oid	oid
+768	integer, integer	integer, integer	integer
+769	integer, integer	integer, integer	integer
+770	smallint, smallint	smallint, smallint	smallint
+771	smallint, smallint	smallint, smallint	smallint
+772	internal, bigint	internal, bigint	bigint
+776	oidvector, bigint	oidvector, bigint	bigint
+777	aclitem, bigint	aclitem, bigint	bigint
+778	macaddr, bigint	macaddr, bigint	bigint
+779	inet, bigint	inet, bigint	bigint
+780	numeric, bigint	numeric, bigint	bigint
+781	macaddr8, bigint	macaddr8, bigint	bigint
+782	anyarray, bigint	anyarray, bigint	bigint
+785	polygon, circle	polygon, circle	double precision
+810			name
+817			text
+830	macaddr, macaddr	macaddr, macaddr	boolean
+831	macaddr, macaddr	macaddr, macaddr	boolean
+832	macaddr, macaddr	macaddr, macaddr	boolean
+833	macaddr, macaddr	macaddr, macaddr	boolean
+834	macaddr, macaddr	macaddr, macaddr	boolean
+835	macaddr, macaddr	macaddr, macaddr	boolean
+836	macaddr, macaddr	macaddr, macaddr	integer
+837	bigint, smallint	bigint, smallint	bigint
+838	bigint, smallint	bigint, smallint	bigint
+839	bigint, smallint	bigint, smallint	bigint
+840	bigint, smallint	bigint, smallint	bigint
+841	smallint, bigint	smallint, bigint	bigint
+842	bigint, bigint	bigint, bigint	integer
+846	money, real	money, real	money
+847	money, real	money, real	money
+848	real, money	real, money	money
+849	text, text	text, text	integer
+850	text, text	text, text	boolean
+851	text, text	text, text	boolean
+852	integer, bigint	integer, bigint	boolean
+853	integer, bigint	integer, bigint	boolean
+854	integer, bigint	integer, bigint	boolean
+855	integer, bigint	integer, bigint	boolean
+856	integer, bigint	integer, bigint	boolean
+857	integer, bigint	integer, bigint	boolean
+858	name, text	name, text	boolean
+859	name, text	name, text	boolean
+860	"char"	"char"	character
+861			name
+862	integer, money	integer, money	money
+863	smallint, money	smallint, money	money
+864	money, integer	money, integer	money
+865	money, integer	money, integer	money
+866	money, smallint	money, smallint	money
+867	money, smallint	money, smallint	money
+868	text, text	text, text	integer
+870	text	text	text
+871	text	text	text
+872	text	text	text
+873	text, integer, text	text, integer, text	text
+874	text, integer, text	text, integer, text	text
+875	text, text	text, text	text
+876	text, text	text, text	text
+877	text, integer, integer	text, integer, integer	text
+878	text, text, text	text, text, text	text
+879	text, integer	text, integer	text
+880	text, integer	text, integer	text
+881	text	text	text
+882	text	text	text
+883	text, integer	text, integer	text
+884	text, text	text, text	text
+885	text	text	text
+886	cstring	cstring	money
+887	money	money	cstring
+888	money, money	money, money	boolean
+889	money, money	money, money	boolean
+890	money, money	money, money	boolean
+891	money, money	money, money	boolean
+892	money, money	money, money	boolean
+893	money, money	money, money	boolean
+894	money, money	money, money	money
+895	money, money	money, money	money
+896	money, double precision	money, double precision	money
+897	money, double precision	money, double precision	money
+898	money, money	money, money	money
+899	money, money	money, money	money
+910	cstring	cstring	inet
+911	inet	inet	cstring
+919	double precision, money	double precision, money	money
+920	inet, inet	inet, inet	boolean
+921	inet, inet	inet, inet	boolean
+922	inet, inet	inet, inet	boolean
+923	inet, inet	inet, inet	boolean
+924	inet, inet	inet, inet	boolean
+925	inet, inet	inet, inet	boolean
+926	inet, inet	inet, inet	integer
+927	inet, inet	inet, inet	boolean
+928	inet, inet	inet, inet	boolean
+929	inet, inet	inet, inet	boolean
+930	inet, inet	inet, inet	boolean
+935	money	money	text
+936	text, integer, integer	text, integer, integer	text
+937	text, integer	text, integer	text
+938	timestamp without time zone, timestamp without time zone, interval	timestamp without time zone, timestamp without time zone, interval	SETOF timestamp without time zone
+939	timestamp with time zone, timestamp with time zone, interval	timestamp with time zone, timestamp with time zone, interval	SETOF timestamp with time zone
+940	smallint, smallint	smallint, smallint	smallint
+941	integer, integer	integer, integer	integer
+942	smallint, bigint	smallint, bigint	bigint
+943	smallint, bigint	smallint, bigint	bigint
+944	text	text	"char"
+945	bigint, bigint	bigint, bigint	bigint
+946	"char"	"char"	text
+947	bigint, bigint	bigint, bigint	bigint
+948	smallint, bigint	smallint, bigint	bigint
+949	bigint	bigint	integer
+952	oid, integer	oid, integer	integer
+953	integer	integer	integer
+954	integer, integer	integer, integer	bytea
+955	integer, bytea	integer, bytea	integer
+956	integer, integer, integer	integer, integer, integer	integer
+957	integer	integer	oid
+958	integer	integer	integer
+959	point, line	point, line	boolean
+960	lseg, line	lseg, line	boolean
+961	point, line	point, line	point
+964	oid	oid	integer
+972	character, bigint	character, bigint	bigint
+973	path, path	path, path	boolean
+975	box	box	double precision
+976	box	box	double precision
+977	box	box	double precision
+978	box, box	box, box	double precision
+979	path	path	double precision
+980	box, box	box, box	box
+981	box	box	lseg
+982	path, path	path, path	boolean
+983	path, path	path, path	boolean
+984	path, path	path, path	boolean
+985	path, path	path, path	boolean
+986	path, path	path, path	boolean
+987	path	path	double precision
+988	point, point	point, point	boolean
+989	point, point	point, point	boolean
+990	point, point	point, point	boolean
+991	point, point	point, point	double precision
+992	point, point	point, point	double precision
+993	point, point	point, point	lseg
+994	lseg, lseg	lseg, lseg	boolean
+995	lseg, lseg	lseg, lseg	boolean
+996	lseg, lseg	lseg, lseg	boolean
+997	lseg	lseg	boolean
+998	lseg	lseg	boolean
+999	lseg, lseg	lseg, lseg	boolean
+1004	integer, integer	integer, integer	integer
+1023	internal	internal	internal
+1024	internal	internal	internal
+1025	internal	internal	internal
+1026	interval, timestamp with time zone	interval, timestamp with time zone	timestamp without time zone
+1030	internal	internal	internal
+1031	cstring	cstring	aclitem
+1032	aclitem	aclitem	cstring
+1035	aclitem[], aclitem	aclitem[], aclitem	aclitem[]
+1036	aclitem[], aclitem	aclitem[], aclitem	aclitem[]
+1037	aclitem[], aclitem	aclitem[], aclitem	boolean
+1039			name
+1044	cstring, oid, integer	cstring, oid, integer	character
+1045	character	character	cstring
+1046	cstring, oid, integer	cstring, oid, integer	character varying
+1047	character varying	character varying	cstring
+1048	character, character	character, character	boolean
+1049	character, character	character, character	boolean
+1050	character, character	character, character	boolean
+1051	character, character	character, character	boolean
+1052	character, character	character, character	boolean
+1053	character, character	character, character	boolean
+1062	aclitem, aclitem	aclitem, aclitem	boolean
+1063	character, character	character, character	character
+1064	character, character	character, character	character
+1065	OUT transaction xid, OUT gid text, OUT prepared timestamp with time zone, OUT ownerid oid, OUT dbid oid	OUT transaction xid, OUT gid text, OUT prepared timestamp with time zone, OUT ownerid oid, OUT dbid oid	SETOF record
+1066	integer, integer, integer	integer, integer, integer	SETOF integer
+1067	integer, integer	integer, integer	SETOF integer
+1068	bigint, bigint, bigint	bigint, bigint, bigint	SETOF bigint
+1069	bigint, bigint	bigint, bigint	SETOF bigint
+1078	character, character	character, character	integer
+1079	text	text	regclass
+1080	character	character	integer
+1081	oid, integer	oid, integer	text
+1084	cstring	cstring	date
+1085	date	date	cstring
+1086	date, date	date, date	boolean
+1087	date, date	date, date	boolean
+1088	date, date	date, date	boolean
+1089	date, date	date, date	boolean
+1090	date, date	date, date	boolean
+1091	date, date	date, date	boolean
+1092	date, date	date, date	integer
+1102	time without time zone, time without time zone	time without time zone, time without time zone	boolean
+1103	time without time zone, time without time zone	time without time zone, time without time zone	boolean
+1104	time without time zone, time without time zone	time without time zone, time without time zone	boolean
+1105	time without time zone, time without time zone	time without time zone, time without time zone	boolean
+1106	time without time zone, time without time zone	time without time zone, time without time zone	boolean
+1107	time without time zone, time without time zone	time without time zone, time without time zone	integer
+1136	OUT wal_records bigint, OUT wal_fpi bigint, OUT wal_bytes numeric, OUT wal_buffers_full bigint, OUT wal_write bigint, OUT wal_sync bigint, OUT wal_write_time double precision, OUT wal_sync_time double precision, OUT stats_reset timestamp with time zone	OUT wal_records bigint, OUT wal_fpi bigint, OUT wal_bytes numeric, OUT wal_buffers_full bigint, OUT wal_write bigint, OUT wal_sync bigint, OUT wal_write_time double precision, OUT wal_sync_time double precision, OUT stats_reset timestamp with time zone	record
+1137			text
+1138	date, date	date, date	date
+1139	date, date	date, date	date
+1140	date, date	date, date	integer
+1141	date, integer	date, integer	date
+1142	date, integer	date, integer	date
+1143	cstring, oid, integer	cstring, oid, integer	time without time zone
+1144	time without time zone	time without time zone	cstring
+1145	time without time zone, time without time zone	time without time zone, time without time zone	boolean
+1146	circle, point	circle, point	circle
+1147	circle, point	circle, point	circle
+1148	circle, point	circle, point	circle
+1149	circle, point	circle, point	circle
+1150	cstring, oid, integer	cstring, oid, integer	timestamp with time zone
+1151	timestamp with time zone	timestamp with time zone	cstring
+1152	timestamp with time zone, timestamp with time zone	timestamp with time zone, timestamp with time zone	boolean
+1153	timestamp with time zone, timestamp with time zone	timestamp with time zone, timestamp with time zone	boolean
+1154	timestamp with time zone, timestamp with time zone	timestamp with time zone, timestamp with time zone	boolean
+1155	timestamp with time zone, timestamp with time zone	timestamp with time zone, timestamp with time zone	boolean
+1156	timestamp with time zone, timestamp with time zone	timestamp with time zone, timestamp with time zone	boolean
+1157	timestamp with time zone, timestamp with time zone	timestamp with time zone, timestamp with time zone	boolean
+1158	double precision	double precision	timestamp with time zone
+1159	text, timestamp with time zone	text, timestamp with time zone	timestamp without time zone
+1160	cstring, oid, integer	cstring, oid, integer	interval
+1161	interval	interval	cstring
+1162	interval, interval	interval, interval	boolean
+1163	interval, interval	interval, interval	boolean
+1164	interval, interval	interval, interval	boolean
+1165	interval, interval	interval, interval	boolean
+1166	interval, interval	interval, interval	boolean
+1167	interval, interval	interval, interval	boolean
+1168	interval	interval	interval
+1169	interval, interval	interval, interval	interval
+1170	interval, interval	interval, interval	interval
+1171	text, timestamp with time zone	text, timestamp with time zone	double precision
+1172	text, interval	text, interval	double precision
+1173	internal	internal	internal
+1174	date	date	timestamp with time zone
+1175	interval	interval	interval
+1176	date, time without time zone	date, time without time zone	timestamp with time zone
+1177	target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false	target jsonb, path jsonpath, vars jsonb, silent boolean	boolean
+1178	timestamp with time zone	timestamp with time zone	date
+1179	target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false	target jsonb, path jsonpath, vars jsonb, silent boolean	SETOF jsonb
+1180	target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false	target jsonb, path jsonpath, vars jsonb, silent boolean	jsonb
+1181	xid	xid	integer
+1188	timestamp with time zone, timestamp with time zone	timestamp with time zone, timestamp with time zone	interval
+1189	timestamp with time zone, interval	timestamp with time zone, interval	timestamp with time zone
+1190	timestamp with time zone, interval	timestamp with time zone, interval	timestamp with time zone
+1191	anyarray, integer, boolean	anyarray, integer, boolean	SETOF integer
+1192	anyarray, integer	anyarray, integer	SETOF integer
+1193	anyelement, integer[]	anyelement, integer[]	anyarray
+1194	double precision	double precision	double precision
+1195	timestamp with time zone, timestamp with time zone	timestamp with time zone, timestamp with time zone	timestamp with time zone
+1196	timestamp with time zone, timestamp with time zone	timestamp with time zone, timestamp with time zone	timestamp with time zone
+1197	interval, interval	interval, interval	interval
+1198	interval, interval	interval, interval	interval
+1199	timestamp with time zone, timestamp with time zone	timestamp with time zone, timestamp with time zone	interval
+1200	interval, integer	interval, integer	interval
+1215	oid, name	oid, name	text
+1216	oid, integer	oid, integer	text
+1217	text, timestamp with time zone	text, timestamp with time zone	timestamp with time zone
+1218	text, interval	text, interval	interval
+1219	bigint	bigint	bigint
+1230	bigint	bigint	bigint
+1236	bigint, bigint	bigint, bigint	bigint
+1237	bigint, bigint	bigint, bigint	bigint
+1238	text, text	text, text	boolean
+1239	text, text	text, text	boolean
+1240	name, text	name, text	boolean
+1241	name, text	name, text	boolean
+1242	cstring	cstring	boolean
+1243	boolean	boolean	cstring
+1244	cstring	cstring	bytea
+1245	cstring	cstring	"char"
+1246	"char", "char"	"char", "char"	boolean
+1250			trigger
+1251	integer	integer	integer
+1252	name, text	name, text	boolean
+1253	smallint	smallint	smallint
+1254	text, text	text, text	boolean
+1256	text, text	text, text	boolean
+1257	text	text	integer
+1258	text, text	text, text	text
+1264	name	name	integer
+1265	tid, tid	tid, tid	boolean
+1267	cstring	cstring	cidr
+1268	str text, strict boolean DEFAULT true	str text, strict boolean	text[]
+1269	"any"	"any"	integer
+1271	time with time zone, time with time zone, time with time zone, time with time zone	time with time zone, time with time zone, time with time zone, time with time zone	boolean
+1272	date, time without time zone	date, time without time zone	timestamp without time zone
+1273	text, time with time zone	text, time with time zone	double precision
+1274	bigint, integer	bigint, integer	bigint
+1275	bigint, integer	bigint, integer	bigint
+1276	bigint, integer	bigint, integer	bigint
+1277	bigint, integer	bigint, integer	bigint
+1278	integer, bigint	integer, bigint	bigint
+1279	integer, bigint	integer, bigint	bigint
+1280	integer, bigint	integer, bigint	bigint
+1281	integer, bigint	integer, bigint	bigint
+1282	text	text	text
+1283	text	text	text
+1284	text, timestamp with time zone, text	text, timestamp with time zone, text	timestamp with time zone
+1285	anyelement	anyelement	text
+1286	anyelement, integer[], integer[]	anyelement, integer[], integer[]	anyarray
+1287	bigint	bigint	oid
+1288	oid	oid	bigint
+1289	text	text	text
+1290	anyelement	anyelement	text
+1291			trigger
+1292	tid, tid	tid, tid	boolean
+1293	anymultirange	anymultirange	SETOF anyrange
+1294	text, tid	text, tid	tid
+1295	interval	interval	interval
+1296	time without time zone, date	time without time zone, date	timestamp without time zone
+1297	date, time with time zone	date, time with time zone	timestamp with time zone
+1298	time with time zone, date	time with time zone, date	timestamp with time zone
+1299			timestamp with time zone
+1300	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+1301	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+1302	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+1303	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+1304	timestamp with time zone, timestamp with time zone, timestamp with time zone, timestamp with time zone	timestamp with time zone, timestamp with time zone, timestamp with time zone, timestamp with time zone	boolean
+1305	timestamp with time zone, interval, timestamp with time zone, interval	timestamp with time zone, interval, timestamp with time zone, interval	boolean
+1306	timestamp with time zone, timestamp with time zone, timestamp with time zone, interval	timestamp with time zone, timestamp with time zone, timestamp with time zone, interval	boolean
+1307	timestamp with time zone, interval, timestamp with time zone, timestamp with time zone	timestamp with time zone, interval, timestamp with time zone, timestamp with time zone	boolean
+1308	time without time zone, time without time zone, time without time zone, time without time zone	time without time zone, time without time zone, time without time zone, time without time zone	boolean
+1309	time without time zone, interval, time without time zone, interval	time without time zone, interval, time without time zone, interval	boolean
+1310	time without time zone, time without time zone, time without time zone, interval	time without time zone, time without time zone, time without time zone, interval	boolean
+1311	time without time zone, interval, time without time zone, time without time zone	time without time zone, interval, time without time zone, time without time zone	boolean
+1312	cstring, oid, integer	cstring, oid, integer	timestamp without time zone
+1313	timestamp without time zone	timestamp without time zone	cstring
+1314	timestamp with time zone, timestamp with time zone	timestamp with time zone, timestamp with time zone	integer
+1315	interval, interval	interval, interval	integer
+1316	timestamp without time zone	timestamp without time zone	time without time zone
+1317	text	text	integer
+1318	character	character	integer
+1319	xid, integer	xid, integer	boolean
+1326	interval, double precision	interval, double precision	interval
+1339	double precision	double precision	double precision
+1340	double precision	double precision	double precision
+1341	double precision	double precision	double precision
+1342	double precision	double precision	double precision
+1343	double precision	double precision	double precision
+1344	double precision	double precision	double precision
+1345	double precision	double precision	double precision
+1346	double precision, double precision	double precision, double precision	double precision
+1347	double precision	double precision	double precision
+1348	oid	oid	text
+1349	oidvector	oidvector	text
+1350	cstring, oid, integer	cstring, oid, integer	time with time zone
+1351	time with time zone	time with time zone	cstring
+1352	time with time zone, time with time zone	time with time zone, time with time zone	boolean
+1353	time with time zone, time with time zone	time with time zone, time with time zone	boolean
+1354	time with time zone, time with time zone	time with time zone, time with time zone	boolean
+1355	time with time zone, time with time zone	time with time zone, time with time zone	boolean
+1356	time with time zone, time with time zone	time with time zone, time with time zone	boolean
+1357	time with time zone, time with time zone	time with time zone, time with time zone	boolean
+1358	time with time zone, time with time zone	time with time zone, time with time zone	integer
+1359	date, time with time zone	date, time with time zone	timestamp with time zone
+1362	inet	inet	inet
+1364	internal	internal	internal
+1365	oid, oid, text, boolean	oid, oid, text, boolean	aclitem
+1367	character	character	integer
+1368	double precision, double precision	double precision, double precision	double precision
+1369	text	text	integer
+1370	time without time zone	time without time zone	interval
+1371	OUT locktype text, OUT database oid, OUT relation oid, OUT page integer, OUT tuple smallint, OUT virtualxid text, OUT transactionid xid, OUT classid oid, OUT objid oid, OUT objsubid smallint, OUT virtualtransaction text, OUT pid integer, OUT mode text, OUT granted boolean, OUT fastpath boolean, OUT waitstart timestamp with time zone	OUT locktype text, OUT database oid, OUT relation oid, OUT page integer, OUT tuple smallint, OUT virtualxid text, OUT transactionid xid, OUT classid oid, OUT objid oid, OUT objsubid smallint, OUT virtualtransaction text, OUT pid integer, OUT mode text, OUT granted boolean, OUT fastpath boolean, OUT waitstart timestamp with time zone	SETOF record
+1372	character	character	integer
+1373	date	date	boolean
+1374	text	text	integer
+1375	character	character	integer
+1376	bigint	bigint	numeric
+1377	time without time zone, time without time zone	time without time zone, time without time zone	time without time zone
+1378	time without time zone, time without time zone	time without time zone, time without time zone	time without time zone
+1379	time with time zone, time with time zone	time with time zone, time with time zone	time with time zone
+1380	time with time zone, time with time zone	time with time zone, time with time zone	time with time zone
+1381	text	text	integer
+1384	text, date	text, date	double precision
+1385	text, time without time zone	text, time without time zone	double precision
+1386	timestamp with time zone	timestamp with time zone	interval
+1387	oid	oid	text
+1388	timestamp with time zone	timestamp with time zone	time with time zone
+1389	timestamp with time zone	timestamp with time zone	boolean
+1390	interval	interval	boolean
+1391	integer	integer	timestamp with time zone
+1392	integer	integer	inet
+1393	integer	integer	integer
+1394	real	real	real
+1395	double precision	double precision	double precision
+1396	bigint	bigint	bigint
+1397	integer	integer	integer
+1398	smallint	smallint	smallint
+1400	character varying	character varying	name
+1401	name	name	character varying
+1402			name
+1403	boolean	boolean	name[]
+1404	text, text, integer, integer	text, text, integer, integer	text
+1405	text, text, integer	text, text, integer	text
+1406	point, point	point, point	boolean
+1407	point, point	point, point	boolean
+1408	lseg, lseg	lseg, lseg	boolean
+1409	lseg, lseg	lseg, lseg	boolean
+1410	lseg	lseg	boolean
+1411	lseg	lseg	boolean
+1412	line, line	line, line	boolean
+1413	line, line	line, line	boolean
+1414	line	line	boolean
+1415	line	line	boolean
+1416	circle	circle	point
+1419	interval	interval	time without time zone
+1421	point, point	point, point	box
+1422	box, point	box, point	box
+1423	box, point	box, point	box
+1424	box, point	box, point	box
+1425	box, point	box, point	box
+1426	path, point	path, point	boolean
+1427	cidr	cidr	cstring
+1428	polygon, point	polygon, point	boolean
+1429	point, polygon	point, polygon	boolean
+1430	path	path	boolean
+1431	path	path	boolean
+1432	path	path	integer
+1433	path	path	path
+1434	path	path	path
+1435	path, path	path, path	path
+1436	path, point	path, point	path
+1437	path, point	path, point	path
+1438	path, point	path, point	path
+1439	path, point	path, point	path
+1440	double precision, double precision	double precision, double precision	point
+1441	point, point	point, point	point
+1442	point, point	point, point	point
+1443	point, point	point, point	point
+1444	point, point	point, point	point
+1445	polygon	polygon	integer
+1446	polygon	polygon	box
+1447	polygon	polygon	path
+1448	box	box	polygon
+1449	path	path	polygon
+1450	cstring	cstring	circle
+1451	circle	circle	cstring
+1452	circle, circle	circle, circle	boolean
+1453	circle, circle	circle, circle	boolean
+1454	circle, circle	circle, circle	boolean
+1455	circle, circle	circle, circle	boolean
+1456	circle, circle	circle, circle	boolean
+1457	circle, circle	circle, circle	boolean
+1458	circle, circle	circle, circle	boolean
+1459	circle, circle	circle, circle	boolean
+1460	circle, circle	circle, circle	boolean
+1461	circle, circle	circle, circle	boolean
+1462	circle, circle	circle, circle	boolean
+1463	circle, circle	circle, circle	boolean
+1464	circle, circle	circle, circle	boolean
+1465	circle, circle	circle, circle	boolean
+1466	circle, circle	circle, circle	boolean
+1467	circle, circle	circle, circle	boolean
+1468	circle	circle	double precision
+1469	circle	circle	double precision
+1470	circle	circle	double precision
+1471	circle, circle	circle, circle	double precision
+1472	circle	circle	point
+1473	point, double precision	point, double precision	circle
+1474	polygon	polygon	circle
+1475	integer, circle	integer, circle	polygon
+1476	point, circle	point, circle	double precision
+1477	circle, point	circle, point	boolean
+1478	point, circle	point, circle	boolean
+1479	box	box	circle
+1480	circle	circle	box
+1481	numeric	numeric	numeric
+1482	lseg, lseg	lseg, lseg	boolean
+1483	lseg, lseg	lseg, lseg	boolean
+1484	lseg, lseg	lseg, lseg	boolean
+1485	lseg, lseg	lseg, lseg	boolean
+1486	lseg, lseg	lseg, lseg	boolean
+1487	lseg	lseg	double precision
+1488	line, lseg	line, lseg	point
+1489	lseg, lseg	lseg, lseg	point
+1490	cstring	cstring	line
+1491	line	line	cstring
+1492	line, line	line, line	boolean
+1493	point, point	point, point	line
+1494	line, line	line, line	point
+1495	line, line	line, line	boolean
+1496	line, line	line, line	boolean
+1497	line, line	line, line	boolean
+1498	line	line	boolean
+1499	line	line	boolean
+1530	lseg	lseg	double precision
+1531	path	path	double precision
+1532	lseg	lseg	point
+1534	box	box	point
+1540	polygon	polygon	point
+1541	box	box	lseg
+1542	box	box	point
+1543	circle	circle	point
+1544	circle	circle	polygon
+1545	path	path	integer
+1556	polygon	polygon	integer
+1564	cstring, oid, integer	cstring, oid, integer	bit
+1565	bit	bit	cstring
+1569	text, text	text, text	boolean
+1570	text, text	text, text	boolean
+1571	name, text	name, text	boolean
+1572	name, text	name, text	boolean
+1573	oid	oid	text
+1574	regclass	regclass	bigint
+1575	regclass	regclass	bigint
+1576	regclass, bigint	regclass, bigint	bigint
+1579	cstring, oid, integer	cstring, oid, integer	bit varying
+1580	bit varying	bit varying	cstring
+1581	bit, bit	bit, bit	boolean
+1582	bit, bit	bit, bit	boolean
+1592	bit, bit	bit, bit	boolean
+1593	bit, bit	bit, bit	boolean
+1594	bit, bit	bit, bit	boolean
+1595	bit, bit	bit, bit	boolean
+1596	bit, bit	bit, bit	integer
+1597	integer	integer	name
+1598			double precision
+1599	double precision	double precision	void
+1600	double precision	double precision	double precision
+1601	double precision	double precision	double precision
+1602	double precision	double precision	double precision
+1603	double precision, double precision	double precision, double precision	double precision
+1604	double precision	double precision	double precision
+1605	double precision	double precision	double precision
+1606	double precision	double precision	double precision
+1607	double precision	double precision	double precision
+1608	double precision	double precision	double precision
+1609	double precision	double precision	double precision
+1610			double precision
+1618	interval, double precision	interval, double precision	interval
+1619	"any"	"any"	regtype
+1620	text	text	integer
+1621	integer	integer	text
+1622	text, integer	text, integer	text
+1623	text, text	text, text	text
+1624	double precision, interval	double precision, interval	interval
+1631	character, text	character, text	boolean
+1632	character, text	character, text	boolean
+1633	text, text	text, text	boolean
+1634	text, text	text, text	boolean
+1635	name, text	name, text	boolean
+1636	name, text	name, text	boolean
+1637	text, text	text, text	text
+1638	oid, oid	oid, oid	boolean
+1639	oid, oid	oid, oid	boolean
+1640	text	text	text
+1641	oid	oid	text
+1642	oid	oid	name
+1643	oid	oid	text
+1644			trigger
+1645			trigger
+1646			trigger
+1647			trigger
+1648			trigger
+1649			trigger
+1650			trigger
+1651			trigger
+1652			trigger
+1653			trigger
+1654			trigger
+1655			trigger
+1656	character, text	character, text	boolean
+1657	character, text	character, text	boolean
+1658	character, text	character, text	boolean
+1659	character, text	character, text	boolean
+1660	character, text	character, text	boolean
+1661	character, text	character, text	boolean
+1662	oid	oid	text
+1665	text, text	text, text	text
+1666	bit varying, bit varying	bit varying, bit varying	boolean
+1667	bit varying, bit varying	bit varying, bit varying	boolean
+1668	bit varying, bit varying	bit varying, bit varying	boolean
+1669	bit varying, bit varying	bit varying, bit varying	boolean
+1670	bit varying, bit varying	bit varying, bit varying	boolean
+1671	bit varying, bit varying	bit varying, bit varying	boolean
+1672	bit varying, bit varying	bit varying, bit varying	integer
+1673	bit, bit	bit, bit	bit
+1674	bit, bit	bit, bit	bit
+1675	bit, bit	bit, bit	bit
+1676	bit	bit	bit
+1677	bit, integer	bit, integer	bit
+1678	bit, integer	bit, integer	bit
+1679	bit varying, bit varying	bit varying, bit varying	bit varying
+1680	bit, integer, integer	bit, integer, integer	bit
+1681	bit	bit	integer
+1682	bit	bit	integer
+1683	integer, integer	integer, integer	bit
+1684	bit	bit	integer
+1685	bit, integer, boolean	bit, integer, boolean	bit
+1686	OUT word text, OUT catcode "char", OUT barelabel boolean, OUT catdesc text, OUT baredesc text	OUT word text, OUT catcode "char", OUT barelabel boolean, OUT catdesc text, OUT baredesc text	SETOF record
+1687	bit varying, integer, boolean	bit varying, integer, boolean	bit varying
+1688	time without time zone	time without time zone	integer
+1689	acl aclitem[], OUT grantor oid, OUT grantee oid, OUT privilege_type text, OUT is_grantable boolean	acl aclitem[], OUT grantor oid, OUT grantee oid, OUT privilege_type text, OUT is_grantable boolean	SETOF record
+1690	time without time zone, time without time zone	time without time zone, time without time zone	interval
+1691	boolean, boolean	boolean, boolean	boolean
+1692	boolean, boolean	boolean, boolean	boolean
+1693	boolean, boolean	boolean, boolean	integer
+1696	time with time zone	time with time zone	integer
+1697	interval	interval	integer
+1698	bit, bit	bit, bit	integer
+1699	bit, integer	bit, integer	bit
+1701	cstring, oid, integer	cstring, oid, integer	numeric
+1702	numeric	numeric	cstring
+1703	numeric, integer	numeric, integer	numeric
+1704	numeric	numeric	numeric
+1705	numeric	numeric	numeric
+1706	numeric	numeric	numeric
+1707	numeric, integer	numeric, integer	numeric
+1708	numeric	numeric	numeric
+1709	numeric, integer	numeric, integer	numeric
+1710	numeric	numeric	numeric
+1711	numeric	numeric	numeric
+1712	numeric	numeric	numeric
+1713	bytea, name	bytea, name	integer
+1714	bytea, name	bytea, name	text
+1715	inet	inet	cidr
+1716	pg_node_tree, oid	pg_node_tree, oid	text
+1717	text, name	text, name	bytea
+1718	numeric, numeric	numeric, numeric	boolean
+1719	numeric, numeric	numeric, numeric	boolean
+1720	numeric, numeric	numeric, numeric	boolean
+1721	numeric, numeric	numeric, numeric	boolean
+1722	numeric, numeric	numeric, numeric	boolean
+1723	numeric, numeric	numeric, numeric	boolean
+1724	numeric, numeric	numeric, numeric	numeric
+1725	numeric, numeric	numeric, numeric	numeric
+1726	numeric, numeric	numeric, numeric	numeric
+1727	numeric, numeric	numeric, numeric	numeric
+1728	numeric, numeric	numeric, numeric	numeric
+1729	numeric, numeric	numeric, numeric	numeric
+1730	numeric	numeric	numeric
+1731	numeric	numeric	numeric
+1732	numeric	numeric	numeric
+1733	numeric	numeric	numeric
+1734	numeric	numeric	numeric
+1735	numeric	numeric	numeric
+1736	numeric, numeric	numeric, numeric	numeric
+1737	numeric, numeric	numeric, numeric	numeric
+1738	numeric, numeric	numeric, numeric	numeric
+1739	numeric, numeric	numeric, numeric	numeric
+1740	integer	integer	numeric
+1741	numeric	numeric	numeric
+1742	real	real	numeric
+1743	double precision	double precision	numeric
+1744	numeric	numeric	integer
+1745	numeric	numeric	real
+1746	numeric	numeric	double precision
+1747	time without time zone, interval	time without time zone, interval	time without time zone
+1748	time without time zone, interval	time without time zone, interval	time without time zone
+1749	time with time zone, interval	time with time zone, interval	time with time zone
+1750	time with time zone, interval	time with time zone, interval	time with time zone
+1764	numeric	numeric	numeric
+1765	regclass, bigint, boolean	regclass, bigint, boolean	bigint
+1766	numeric, numeric	numeric, numeric	numeric
+1767	numeric, numeric	numeric, numeric	numeric
+1768	interval, text	interval, text	text
+1769	numeric, numeric	numeric, numeric	integer
+1770	timestamp with time zone, text	timestamp with time zone, text	text
+1771	numeric	numeric	numeric
+1772	numeric, text	numeric, text	text
+1773	integer, text	integer, text	text
+1774	bigint, text	bigint, text	text
+1775	real, text	real, text	text
+1776	double precision, text	double precision, text	text
+1777	text, text	text, text	numeric
+1778	text, text	text, text	timestamp with time zone
+1779	numeric	numeric	bigint
+1780	text, text	text, text	date
+1781	bigint	bigint	numeric
+1782	smallint	smallint	numeric
+1783	numeric	numeric	smallint
+1798	cstring	cstring	oid
+1799	oid	oid	cstring
+1810	bytea	bytea	integer
+1811	text	text	integer
+1812	bit	bit	integer
+1813	bytea, name, name	bytea, name, name	bytea
+1814	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+1815	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+1816	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+1817	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+1818	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+1819	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+1820	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+1821	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+1822	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+1823	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+1824	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+1825	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+1826	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+1827	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+1828	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+1829	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+1830	double precision[]	double precision[]	double precision
+1831	double precision[]	double precision[]	double precision
+1832	double precision[]	double precision[]	double precision
+1833	internal, numeric	internal, numeric	internal
+1834	internal, smallint	internal, smallint	internal
+1835	internal, integer	internal, integer	internal
+1836	internal, bigint	internal, bigint	internal
+1837	internal	internal	numeric
+1838	internal	internal	numeric
+1839	internal	internal	numeric
+1840	bigint, smallint	bigint, smallint	bigint
+1841	bigint, integer	bigint, integer	bigint
+1842	numeric, bigint	numeric, bigint	numeric
+1843	interval[], interval	interval[], interval	interval[]
+1844	interval[]	interval[]	interval
+1845	text	text	text
+1846	text, integer	text, integer	text
+1847	text, name	text, name	text
+1848	interval, time without time zone	interval, time without time zone	time without time zone
+1850	smallint, bigint	smallint, bigint	boolean
+1851	smallint, bigint	smallint, bigint	boolean
+1852	smallint, bigint	smallint, bigint	boolean
+1853	smallint, bigint	smallint, bigint	boolean
+1854	smallint, bigint	smallint, bigint	boolean
+1855	smallint, bigint	smallint, bigint	boolean
+1856	bigint, smallint	bigint, smallint	boolean
+1857	bigint, smallint	bigint, smallint	boolean
+1858	bigint, smallint	bigint, smallint	boolean
+1859	bigint, smallint	bigint, smallint	boolean
+1860	bigint, smallint	bigint, smallint	boolean
+1861	bigint, smallint	bigint, smallint	boolean
+1892	smallint, smallint	smallint, smallint	smallint
+1893	smallint, smallint	smallint, smallint	smallint
+1894	smallint, smallint	smallint, smallint	smallint
+1895	smallint	smallint	smallint
+1896	smallint, integer	smallint, integer	smallint
+1897	smallint, integer	smallint, integer	smallint
+1898	integer, integer	integer, integer	integer
+1899	integer, integer	integer, integer	integer
+1900	integer, integer	integer, integer	integer
+1901	integer	integer	integer
+1902	integer, integer	integer, integer	integer
+1903	integer, integer	integer, integer	integer
+1904	bigint, bigint	bigint, bigint	bigint
+1905	bigint, bigint	bigint, bigint	bigint
+1906	bigint, bigint	bigint, bigint	bigint
+1907	bigint	bigint	bigint
+1908	bigint, integer	bigint, integer	bigint
+1909	bigint, integer	bigint, integer	bigint
+1910	bigint	bigint	bigint
+1911	smallint	smallint	smallint
+1912	integer	integer	integer
+1913	real	real	real
+1914	double precision	double precision	double precision
+1915	numeric	numeric	numeric
+1922	name, text, text	name, text, text	boolean
+1923	name, oid, text	name, oid, text	boolean
+1924	oid, text, text	oid, text, text	boolean
+1925	oid, oid, text	oid, oid, text	boolean
+1926	text, text	text, text	boolean
+1927	oid, text	oid, text	boolean
+1928	oid	oid	bigint
+1929	oid	oid	bigint
+1930	oid	oid	bigint
+1931	oid	oid	bigint
+1932	oid	oid	bigint
+1933	oid	oid	bigint
+1934	oid	oid	bigint
+1935	oid	oid	bigint
+1936			SETOF integer
+1937	integer	integer	integer
+1938	integer	integer	oid
+1939	integer	integer	oid
+1940	integer	integer	text
+1941	oid	oid	integer
+1942	oid	oid	bigint
+1943	oid	oid	bigint
+1944	oid	oid	bigint
+1945	oid	oid	bigint
+1946	bytea, text	bytea, text	text
+1947	text, text	text, text	bytea
+1948	bytea, bytea	bytea, bytea	boolean
+1949	bytea, bytea	bytea, bytea	boolean
+1950	bytea, bytea	bytea, bytea	boolean
+1951	bytea, bytea	bytea, bytea	boolean
+1952	bytea, bytea	bytea, bytea	boolean
+1953	bytea, bytea	bytea, bytea	boolean
+1954	bytea, bytea	bytea, bytea	integer
+1961	timestamp without time zone, integer	timestamp without time zone, integer	timestamp without time zone
+1962	bigint[], smallint	bigint[], smallint	bigint[]
+1963	bigint[], integer	bigint[], integer	bigint[]
+1964	bigint[]	bigint[]	numeric
+1965	oid, oid	oid, oid	oid
+1966	oid, oid	oid, oid	oid
+1967	timestamp with time zone, integer	timestamp with time zone, integer	timestamp with time zone
+1968	time without time zone, integer	time without time zone, integer	time without time zone
+1969	time with time zone, integer	time with time zone, integer	time with time zone
+1972	oid	oid	bigint
+1973	numeric, numeric	numeric, numeric	numeric
+1980	numeric, numeric	numeric, numeric	numeric
+1986	text, text	text, text	text
+1987	text	text	text
+1993	oid, name	oid, name	text
+2003	text, anynonarray	text, anynonarray	text
+2004	anynonarray, text	anynonarray, text	text
+2005	bytea, bytea	bytea, bytea	boolean
+2006	bytea, bytea	bytea, bytea	boolean
+2007	bytea, bytea	bytea, bytea	boolean
+2008	bytea, bytea	bytea, bytea	boolean
+2009	bytea, bytea	bytea, bytea	bytea
+2010	bytea	bytea	integer
+2011	bytea, bytea	bytea, bytea	bytea
+2012	bytea, integer, integer	bytea, integer, integer	bytea
+2013	bytea, integer	bytea, integer	bytea
+2014	bytea, bytea	bytea, bytea	integer
+2015	bytea, bytea	bytea, bytea	bytea
+2019	timestamp with time zone	timestamp with time zone	time without time zone
+2020	text, timestamp without time zone	text, timestamp without time zone	timestamp without time zone
+2021	text, timestamp without time zone	text, timestamp without time zone	double precision
+2022	pid integer, OUT datid oid, OUT pid integer, OUT usesysid oid, OUT application_name text, OUT state text, OUT query text, OUT wait_event_type text, OUT wait_event text, OUT xact_start timestamp with time zone, OUT query_start timestamp with time zone, OUT backend_start timestamp with time zone, OUT state_change timestamp with time zone, OUT client_addr inet, OUT client_hostname text, OUT client_port integer, OUT backend_xid xid, OUT backend_xmin xid, OUT backend_type text, OUT ssl boolean, OUT sslversion text, OUT sslcipher text, OUT sslbits integer, OUT ssl_client_dn text, OUT ssl_client_serial numeric, OUT ssl_issuer_dn text, OUT gss_auth boolean, OUT gss_princ text, OUT gss_enc boolean, OUT leader_pid integer, OUT query_id bigint	pid integer, OUT datid oid, OUT pid integer, OUT usesysid oid, OUT application_name text, OUT state text, OUT query text, OUT wait_event_type text, OUT wait_event text, OUT xact_start timestamp with time zone, OUT query_start timestamp with time zone, OUT backend_start timestamp with time zone, OUT state_change timestamp with time zone, OUT client_addr inet, OUT client_hostname text, OUT client_port integer, OUT backend_xid xid, OUT backend_xmin xid, OUT backend_type text, OUT ssl boolean, OUT sslversion text, OUT sslcipher text, OUT sslbits integer, OUT ssl_client_dn text, OUT ssl_client_serial numeric, OUT ssl_issuer_dn text, OUT gss_auth boolean, OUT gss_princ text, OUT gss_enc boolean, OUT leader_pid integer, OUT query_id bigint	SETOF record
+2023	target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false	target jsonb, path jsonpath, vars jsonb, silent boolean	jsonb
+2024	date	date	timestamp without time zone
+2025	date, time without time zone	date, time without time zone	timestamp without time zone
+2026			integer
+2027	timestamp with time zone	timestamp with time zone	timestamp without time zone
+2028	timestamp without time zone	timestamp without time zone	timestamp with time zone
+2029	timestamp without time zone	timestamp without time zone	date
+2030	target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false	target jsonb, path jsonpath, vars jsonb, silent boolean	boolean
+2031	timestamp without time zone, timestamp without time zone	timestamp without time zone, timestamp without time zone	interval
+2032	timestamp without time zone, interval	timestamp without time zone, interval	timestamp without time zone
+2033	timestamp without time zone, interval	timestamp without time zone, interval	timestamp without time zone
+2034			timestamp with time zone
+2035	timestamp without time zone, timestamp without time zone	timestamp without time zone, timestamp without time zone	timestamp without time zone
+2036	timestamp without time zone, timestamp without time zone	timestamp without time zone, timestamp without time zone	timestamp without time zone
+2037	text, time with time zone	text, time with time zone	time with time zone
+2038	interval, time with time zone	interval, time with time zone	time with time zone
+2039	timestamp without time zone	timestamp without time zone	integer
+2041	timestamp without time zone, timestamp without time zone, timestamp without time zone, timestamp without time zone	timestamp without time zone, timestamp without time zone, timestamp without time zone, timestamp without time zone	boolean
+2042	timestamp without time zone, interval, timestamp without time zone, interval	timestamp without time zone, interval, timestamp without time zone, interval	boolean
+2043	timestamp without time zone, timestamp without time zone, timestamp without time zone, interval	timestamp without time zone, timestamp without time zone, timestamp without time zone, interval	boolean
+2044	timestamp without time zone, interval, timestamp without time zone, timestamp without time zone	timestamp without time zone, interval, timestamp without time zone, timestamp without time zone	boolean
+2045	timestamp without time zone, timestamp without time zone	timestamp without time zone, timestamp without time zone	integer
+2046	time with time zone	time with time zone	time without time zone
+2047	time without time zone	time without time zone	time with time zone
+2048	timestamp without time zone	timestamp without time zone	boolean
+2049	timestamp without time zone, text	timestamp without time zone, text	text
+2050	anyarray	anyarray	anyarray
+2051	anyarray	anyarray	anyarray
+2052	timestamp without time zone, timestamp without time zone	timestamp without time zone, timestamp without time zone	boolean
+2053	timestamp without time zone, timestamp without time zone	timestamp without time zone, timestamp without time zone	boolean
+2054	timestamp without time zone, timestamp without time zone	timestamp without time zone, timestamp without time zone	boolean
+2055	timestamp without time zone, timestamp without time zone	timestamp without time zone, timestamp without time zone	boolean
+2056	timestamp without time zone, timestamp without time zone	timestamp without time zone, timestamp without time zone	boolean
+2057	timestamp without time zone, timestamp without time zone	timestamp without time zone, timestamp without time zone	boolean
+2058	timestamp without time zone, timestamp without time zone	timestamp without time zone, timestamp without time zone	interval
+2059	timestamp without time zone	timestamp without time zone	interval
+2069	text, timestamp without time zone	text, timestamp without time zone	timestamp with time zone
+2070	interval, timestamp without time zone	interval, timestamp without time zone	timestamp with time zone
+2071	date, interval	date, interval	timestamp without time zone
+2072	date, interval	date, interval	timestamp without time zone
+2073	text, text	text, text	text
+2074	text, text, text	text, text, text	text
+2075	bigint, integer	bigint, integer	bit
+2076	bit	bit	bigint
+2077	text	text	text
+2078	text, text, boolean	text, text, boolean	text
+2079	oid	oid	boolean
+2080	oid	oid	boolean
+2081	oid	oid	boolean
+2082	oid	oid	boolean
+2083	oid	oid	boolean
+2084	OUT name text, OUT setting text, OUT unit text, OUT category text, OUT short_desc text, OUT extra_desc text, OUT context text, OUT vartype text, OUT source text, OUT min_val text, OUT max_val text, OUT enumvals text[], OUT boot_val text, OUT reset_val text, OUT sourcefile text, OUT sourceline integer, OUT pending_restart boolean	OUT name text, OUT setting text, OUT unit text, OUT category text, OUT short_desc text, OUT extra_desc text, OUT context text, OUT vartype text, OUT source text, OUT min_val text, OUT max_val text, OUT enumvals text[], OUT boot_val text, OUT reset_val text, OUT sourcefile text, OUT sourceline integer, OUT pending_restart boolean	SETOF record
+2085	bytea, integer, integer	bytea, integer, integer	bytea
+2086	bytea, integer	bytea, integer	bytea
+2087	text, text, text	text, text, text	text
+2088	text, text, integer	text, text, integer	text
+2089	integer	integer	text
+2090	bigint	bigint	text
+2091	anyarray, integer	anyarray, integer	integer
+2092	anyarray, integer	anyarray, integer	integer
+2093	oid	oid	boolean
+2094	integer	integer	timestamp with time zone
+2096	pid integer, timeout bigint DEFAULT 0	pid integer, timeout bigint	boolean
+2098	oid	oid	text
+2100	bigint	bigint	numeric
+2101	integer	integer	numeric
+2102	smallint	smallint	numeric
+2103	numeric	numeric	numeric
+2104	real	real	double precision
+2105	double precision	double precision	double precision
+2106	interval	interval	interval
+2107	bigint	bigint	numeric
+2108	integer	integer	bigint
+2109	smallint	smallint	bigint
+2110	real	real	real
+2111	double precision	double precision	double precision
+2112	money	money	money
+2113	interval	interval	interval
+2114	numeric	numeric	numeric
+2115	bigint	bigint	bigint
+2116	integer	integer	integer
+2117	smallint	smallint	smallint
+2118	oid	oid	oid
+2119	real	real	real
+2120	double precision	double precision	double precision
+2121	"any"	"any"	text
+2122	date	date	date
+2123	time without time zone	time without time zone	time without time zone
+2124	time with time zone	time with time zone	time with time zone
+2125	money	money	money
+2126	timestamp without time zone	timestamp without time zone	timestamp without time zone
+2127	timestamp with time zone	timestamp with time zone	timestamp with time zone
+2128	interval	interval	interval
+2129	text	text	text
+2130	numeric	numeric	numeric
+2131	bigint	bigint	bigint
+2132	integer	integer	integer
+2133	smallint	smallint	smallint
+2134	oid	oid	oid
+2135	real	real	real
+2136	double precision	double precision	double precision
+2137			void
+2138	date	date	date
+2139	time without time zone	time without time zone	time without time zone
+2140	time with time zone	time with time zone	time with time zone
+2141	money	money	money
+2142	timestamp without time zone	timestamp without time zone	timestamp without time zone
+2143	timestamp with time zone	timestamp with time zone	timestamp with time zone
+2144	interval	interval	interval
+2145	text	text	text
+2146	numeric	numeric	numeric
+2147	"any"	"any"	bigint
+2148	bigint	bigint	numeric
+2149	integer	integer	numeric
+2150	smallint	smallint	numeric
+2151	real	real	double precision
+2152	double precision	double precision	double precision
+2153	numeric	numeric	numeric
+2154	bigint	bigint	numeric
+2155	integer	integer	numeric
+2156	smallint	smallint	numeric
+2157	real	real	double precision
+2158	double precision	double precision	double precision
+2159	numeric	numeric	numeric
+2160	text, text	text, text	boolean
+2161	text, text	text, text	boolean
+2162	oid	oid	text
+2163	text, text	text, text	boolean
+2164	text, text	text, text	boolean
+2165	oid	oid	text
+2166	text, text	text, text	integer
+2167	numeric	numeric	numeric
+2168	name	name	bigint
+2169	numeric, numeric	numeric, numeric	numeric
+2170	numeric, numeric, numeric, integer	numeric, numeric, numeric, integer	integer
+2171	integer	integer	boolean
+2172	label text, fast boolean DEFAULT false	label text, fast boolean	pg_lsn
+2174	character, character	character, character	boolean
+2175	character, character	character, character	boolean
+2176	anyarray, integer	anyarray, integer	integer
+2177	character, character	character, character	boolean
+2178	character, character	character, character	boolean
+2179	internal, point, smallint, oid, internal	internal, point, smallint, oid, internal	boolean
+2180	character, character	character, character	integer
+2181	name, text, text	name, text, text	boolean
+2182	name, oid, text	name, oid, text	boolean
+2183	oid, text, text	oid, text, text	boolean
+2184	oid, oid, text	oid, oid, text	boolean
+2185	text, text	text, text	boolean
+2186	oid, text	oid, text	boolean
+2188	integer, bigint	integer, bigint	integer
+2189	bigint, integer	bigint, integer	integer
+2190	smallint, integer	smallint, integer	integer
+2191	integer, smallint	integer, smallint	integer
+2192	smallint, bigint	smallint, bigint	integer
+2193	bigint, smallint	bigint, smallint	integer
+2194	real, double precision	real, double precision	integer
+2195	double precision, real	double precision, real	integer
+2196			inet
+2197			integer
+2198			inet
+2199			integer
+2212	cstring	cstring	regprocedure
+2213	regprocedure	regprocedure	cstring
+2214	cstring	cstring	regoper
+2215	regoper	regoper	cstring
+2216	cstring	cstring	regoperator
+2217	regoperator	regoperator	cstring
+2218	cstring	cstring	regclass
+2219	regclass	regclass	cstring
+2220	cstring	cstring	regtype
+2221	regtype	regtype	cstring
+2230			void
+2232	oid	oid	text
+2233	tid	tid	integer
+2234	tid, bigint	tid, bigint	bigint
+2236	smallint	smallint	smallint
+2237	smallint	smallint	smallint
+2238	integer	integer	integer
+2239	integer	integer	integer
+2240	bigint	bigint	bigint
+2241	bigint	bigint	bigint
+2242	bit	bit	bit
+2243	bit	bit	bit
+2244	character	character	character
+2245	character	character	character
+2246	oid	oid	void
+2247	oid	oid	void
+2248	oid	oid	void
+2250	name, text, text	name, text, text	boolean
+2251	name, oid, text	name, oid, text	boolean
+2252	oid, text, text	oid, text, text	boolean
+2253	oid, oid, text	oid, oid, text	boolean
+2254	text, text	text, text	boolean
+2255	oid, text	oid, text	boolean
+2256	name, text, text	name, text, text	boolean
+2257	name, oid, text	name, oid, text	boolean
+2258	oid, text, text	oid, text, text	boolean
+2259	oid, oid, text	oid, oid, text	boolean
+2260	text, text	text, text	boolean
+2261	oid, text	oid, text	boolean
+2262	name, text, text	name, text, text	boolean
+2263	name, oid, text	name, oid, text	boolean
+2264	oid, text, text	oid, text, text	boolean
+2265	oid, oid, text	oid, oid, text	boolean
+2266	text, text	text, text	boolean
+2267	oid, text	oid, text	boolean
+2268	name, text, text	name, text, text	boolean
+2269	name, oid, text	name, oid, text	boolean
+2270	oid, text, text	oid, text, text	boolean
+2271	oid, oid, text	oid, oid, text	boolean
+2272	text, text	text, text	boolean
+2273	oid, text	oid, text	boolean
+2274			void
+2282	OUT name text, OUT ident text, OUT parent text, OUT level integer, OUT total_bytes bigint, OUT total_nblocks bigint, OUT free_bytes bigint, OUT free_chunks bigint, OUT used_bytes bigint	OUT name text, OUT ident text, OUT parent text, OUT level integer, OUT total_bytes bigint, OUT total_nblocks bigint, OUT free_bytes bigint, OUT free_chunks bigint, OUT used_bytes bigint	SETOF record
+2284	text, text, text	text, text, text	text
+2285	text, text, text, text	text, text, text, text	text
+2286	regclass	regclass	bigint
+2288	bigint	bigint	text
+2289	options_array text[], OUT option_name text, OUT option_value text	options_array text[], OUT option_name text, OUT option_value text	SETOF record
+2290	cstring, oid, integer	cstring, oid, integer	record
+2291	record	record	cstring
+2292	cstring	cstring	cstring
+2293	cstring	cstring	cstring
+2294	cstring	cstring	"any"
+2295	"any"	"any"	cstring
+2296	cstring	cstring	anyarray
+2297	anyarray	anyarray	cstring
+2298	cstring	cstring	void
+2299	void	void	cstring
+2300	cstring	cstring	trigger
+2301	trigger	trigger	cstring
+2302	cstring	cstring	language_handler
+2303	language_handler	language_handler	cstring
+2304	cstring	cstring	internal
+2305	internal	internal	cstring
+2306	OUT name text, OUT blks_zeroed bigint, OUT blks_hit bigint, OUT blks_read bigint, OUT blks_written bigint, OUT blks_exists bigint, OUT flushes bigint, OUT truncates bigint, OUT stats_reset timestamp with time zone	OUT name text, OUT blks_zeroed bigint, OUT blks_hit bigint, OUT blks_read bigint, OUT blks_written bigint, OUT blks_exists bigint, OUT flushes bigint, OUT truncates bigint, OUT stats_reset timestamp with time zone	SETOF record
+2307	text	text	void
+2308	double precision	double precision	double precision
+2309	double precision	double precision	double precision
+2310	double precision	double precision	double precision
+2311	text	text	text
+2312	cstring	cstring	anyelement
+2313	anyelement	anyelement	cstring
+2316	text[], oid	text[], oid	boolean
+2319	integer	integer	integer
+2320	double precision	double precision	double precision
+2321	bytea	bytea	text
+2322	oid	oid	bigint
+2323	name	name	bigint
+2324	oid	oid	bigint
+2325	regclass	regclass	bigint
+2331	anyarray	anyarray	SETOF anyelement
+2332	regclass, text	regclass, text	bigint
+2333	internal, anynonarray	internal, anynonarray	internal
+2334	internal, anynonarray	internal, anynonarray	anyarray
+2335	anynonarray	anynonarray	anyarray
+2338	date, timestamp without time zone	date, timestamp without time zone	boolean
+2339	date, timestamp without time zone	date, timestamp without time zone	boolean
+2340	date, timestamp without time zone	date, timestamp without time zone	boolean
+2341	date, timestamp without time zone	date, timestamp without time zone	boolean
+2342	date, timestamp without time zone	date, timestamp without time zone	boolean
+2343	date, timestamp without time zone	date, timestamp without time zone	boolean
+2344	date, timestamp without time zone	date, timestamp without time zone	integer
+2351	date, timestamp with time zone	date, timestamp with time zone	boolean
+2352	date, timestamp with time zone	date, timestamp with time zone	boolean
+2353	date, timestamp with time zone	date, timestamp with time zone	boolean
+2354	date, timestamp with time zone	date, timestamp with time zone	boolean
+2355	date, timestamp with time zone	date, timestamp with time zone	boolean
+2356	date, timestamp with time zone	date, timestamp with time zone	boolean
+2357	date, timestamp with time zone	date, timestamp with time zone	integer
+2364	timestamp without time zone, date	timestamp without time zone, date	boolean
+2365	timestamp without time zone, date	timestamp without time zone, date	boolean
+2366	timestamp without time zone, date	timestamp without time zone, date	boolean
+2367	timestamp without time zone, date	timestamp without time zone, date	boolean
+2368	timestamp without time zone, date	timestamp without time zone, date	boolean
+2369	timestamp without time zone, date	timestamp without time zone, date	boolean
+2370	timestamp without time zone, date	timestamp without time zone, date	integer
+2377	timestamp with time zone, date	timestamp with time zone, date	boolean
+2378	timestamp with time zone, date	timestamp with time zone, date	boolean
+2379	timestamp with time zone, date	timestamp with time zone, date	boolean
+2380	timestamp with time zone, date	timestamp with time zone, date	boolean
+2381	timestamp with time zone, date	timestamp with time zone, date	boolean
+2382	timestamp with time zone, date	timestamp with time zone, date	boolean
+2383	timestamp with time zone, date	timestamp with time zone, date	integer
+2390	name, text, text	name, text, text	boolean
+2391	name, oid, text	name, oid, text	boolean
+2392	oid, text, text	oid, text, text	boolean
+2393	oid, oid, text	oid, oid, text	boolean
+2394	text, text	text, text	boolean
+2395	oid, text	oid, text	boolean
+2398	cstring	cstring	void
+2399	void	void	cstring
+2400	internal, oid, integer	internal, oid, integer	anyarray
+2401	anyarray	anyarray	bytea
+2402	internal, oid, integer	internal, oid, integer	record
+2403	record	record	bytea
+2404	internal	internal	smallint
+2405	smallint	smallint	bytea
+2406	internal	internal	integer
+2407	integer	integer	bytea
+2408	internal	internal	bigint
+2409	bigint	bigint	bytea
+2410	internal	internal	int2vector
+2411	int2vector	int2vector	bytea
+2412	internal	internal	bytea
+2413	bytea	bytea	bytea
+2414	internal	internal	text
+2415	text	text	bytea
+2416	internal	internal	unknown
+2417	unknown	unknown	bytea
+2418	internal	internal	oid
+2419	oid	oid	bytea
+2420	internal	internal	oidvector
+2421	oidvector	oidvector	bytea
+2422	internal	internal	name
+2423	name	name	bytea
+2424	internal	internal	real
+2425	real	real	bytea
+2426	internal	internal	double precision
+2427	double precision	double precision	bytea
+2428	internal	internal	point
+2429	point	point	bytea
+2430	internal, oid, integer	internal, oid, integer	character
+2431	character	character	bytea
+2432	internal, oid, integer	internal, oid, integer	character varying
+2433	character varying	character varying	bytea
+2434	internal	internal	"char"
+2435	"char"	"char"	bytea
+2436	internal	internal	boolean
+2437	boolean	boolean	bytea
+2438	internal	internal	tid
+2439	tid	tid	bytea
+2440	internal	internal	xid
+2441	xid	xid	bytea
+2442	internal	internal	cid
+2443	cid	cid	bytea
+2444	internal	internal	regproc
+2445	regproc	regproc	bytea
+2446	internal	internal	regprocedure
+2447	regprocedure	regprocedure	bytea
+2448	internal	internal	regoper
+2449	regoper	regoper	bytea
+2450	internal	internal	regoperator
+2451	regoperator	regoperator	bytea
+2452	internal	internal	regclass
+2453	regclass	regclass	bytea
+2454	internal	internal	regtype
+2455	regtype	regtype	bytea
+2456	internal, oid, integer	internal, oid, integer	bit
+2457	bit	bit	bytea
+2458	internal, oid, integer	internal, oid, integer	bit varying
+2459	bit varying	bit varying	bytea
+2460	internal, oid, integer	internal, oid, integer	numeric
+2461	numeric	numeric	bytea
+2462	double precision	double precision	double precision
+2463	double precision	double precision	double precision
+2464	double precision	double precision	double precision
+2465	double precision	double precision	double precision
+2466	double precision	double precision	double precision
+2467	double precision	double precision	double precision
+2468	internal	internal	date
+2469	date	date	bytea
+2470	internal, oid, integer	internal, oid, integer	time without time zone
+2471	time without time zone	time without time zone	bytea
+2472	internal, oid, integer	internal, oid, integer	time with time zone
+2473	time with time zone	time with time zone	bytea
+2474	internal, oid, integer	internal, oid, integer	timestamp without time zone
+2475	timestamp without time zone	timestamp without time zone	bytea
+2476	internal, oid, integer	internal, oid, integer	timestamp with time zone
+2477	timestamp with time zone	timestamp with time zone	bytea
+2478	internal, oid, integer	internal, oid, integer	interval
+2479	interval	interval	bytea
+2480	internal	internal	lseg
+2481	lseg	lseg	bytea
+2482	internal	internal	path
+2483	path	path	bytea
+2484	internal	internal	box
+2485	box	box	bytea
+2486	internal	internal	polygon
+2487	polygon	polygon	bytea
+2488	internal	internal	line
+2489	line	line	bytea
+2490	internal	internal	circle
+2491	circle	circle	bytea
+2492	internal	internal	money
+2493	money	money	bytea
+2494	internal	internal	macaddr
+2495	macaddr	macaddr	bytea
+2496	internal	internal	inet
+2497	inet	inet	bytea
+2498	internal	internal	cidr
+2499	cidr	cidr	bytea
+2500	internal	internal	cstring
+2501	cstring	cstring	bytea
+2502	internal	internal	anyarray
+2503	anyarray	anyarray	bytea
+2504	oid, boolean	oid, boolean	text
+2505	text, boolean	text, boolean	text
+2506	oid, boolean	oid, boolean	text
+2507	oid, integer, boolean	oid, integer, boolean	text
+2508	oid, boolean	oid, boolean	text
+2509	pg_node_tree, oid, boolean	pg_node_tree, oid, boolean	text
+2510	OUT name text, OUT statement text, OUT prepare_time timestamp with time zone, OUT parameter_types regtype[], OUT from_sql boolean, OUT generic_plans bigint, OUT custom_plans bigint	OUT name text, OUT statement text, OUT prepare_time timestamp with time zone, OUT parameter_types regtype[], OUT from_sql boolean, OUT generic_plans bigint, OUT custom_plans bigint	SETOF record
+2511	OUT name text, OUT statement text, OUT is_holdable boolean, OUT is_binary boolean, OUT is_scrollable boolean, OUT creation_time timestamp with time zone	OUT name text, OUT statement text, OUT is_holdable boolean, OUT is_binary boolean, OUT is_scrollable boolean, OUT creation_time timestamp with time zone	SETOF record
+2512	double precision[]	double precision[]	double precision
+2513	double precision[]	double precision[]	double precision
+2514	internal	internal	numeric
+2515	boolean, boolean	boolean, boolean	boolean
+2516	boolean, boolean	boolean, boolean	boolean
+2517	boolean	boolean	boolean
+2518	boolean	boolean	boolean
+2519	boolean	boolean	boolean
+2520	timestamp without time zone, timestamp with time zone	timestamp without time zone, timestamp with time zone	boolean
+2521	timestamp without time zone, timestamp with time zone	timestamp without time zone, timestamp with time zone	boolean
+2522	timestamp without time zone, timestamp with time zone	timestamp without time zone, timestamp with time zone	boolean
+2523	timestamp without time zone, timestamp with time zone	timestamp without time zone, timestamp with time zone	boolean
+2524	timestamp without time zone, timestamp with time zone	timestamp without time zone, timestamp with time zone	boolean
+2525	timestamp without time zone, timestamp with time zone	timestamp without time zone, timestamp with time zone	boolean
+2526	timestamp without time zone, timestamp with time zone	timestamp without time zone, timestamp with time zone	integer
+2527	timestamp with time zone, timestamp without time zone	timestamp with time zone, timestamp without time zone	boolean
+2528	timestamp with time zone, timestamp without time zone	timestamp with time zone, timestamp without time zone	boolean
+2529	timestamp with time zone, timestamp without time zone	timestamp with time zone, timestamp without time zone	boolean
+2530	timestamp with time zone, timestamp without time zone	timestamp with time zone, timestamp without time zone	boolean
+2531	timestamp with time zone, timestamp without time zone	timestamp with time zone, timestamp without time zone	boolean
+2532	timestamp with time zone, timestamp without time zone	timestamp with time zone, timestamp without time zone	boolean
+2533	timestamp with time zone, timestamp without time zone	timestamp with time zone, timestamp without time zone	integer
+2546	interval, date	interval, date	timestamp without time zone
+2547	interval, time with time zone	interval, time with time zone	time with time zone
+2548	interval, timestamp without time zone	interval, timestamp without time zone	timestamp without time zone
+2549	interval, timestamp with time zone	interval, timestamp with time zone	timestamp with time zone
+2550	integer, date	integer, date	date
+2556	oid	oid	SETOF oid
+2557	integer	integer	boolean
+2558	boolean	boolean	integer
+2559			bigint
+2560			timestamp with time zone
+2561	integer	integer	integer[]
+2562	box, box	box, box	boolean
+2563	box, box	box, box	boolean
+2564	box, box	box, box	boolean
+2565	box, box	box, box	boolean
+2566	polygon, polygon	polygon, polygon	boolean
+2567	polygon, polygon	polygon, polygon	boolean
+2568	polygon, polygon	polygon, polygon	boolean
+2569	polygon, polygon	polygon, polygon	boolean
+2578	internal, box, smallint, oid, internal	internal, box, smallint, oid, internal	boolean
+2580	jsonb	jsonb	double precision
+2581	internal, internal, internal	internal, internal, internal	internal
+2582	internal, internal	internal, internal	internal
+2583	internal, internal	internal, internal	box
+2584	box, box, internal	box, box, internal	internal
+2585	internal, polygon, smallint, oid, internal	internal, polygon, smallint, oid, internal	boolean
+2586	internal	internal	internal
+2587	circle, circle	circle, circle	boolean
+2588	circle, circle	circle, circle	boolean
+2591	internal, circle, smallint, oid, internal	internal, circle, smallint, oid, internal	boolean
+2592	internal	internal	internal
+2596	internal	internal	numeric
+2597	cstring, oid, integer	cstring, oid, integer	"any"
+2598	internal, oid, integer	internal, oid, integer	"any"
+2599	OUT abbrev text, OUT utc_offset interval, OUT is_dst boolean	OUT abbrev text, OUT utc_offset interval, OUT is_dst boolean	SETOF record
+2614	text, xml	text, xml	boolean
+2621			boolean
+2622			boolean
+2623	filename text, OUT size bigint, OUT access timestamp with time zone, OUT modification timestamp with time zone, OUT change timestamp with time zone, OUT creation timestamp with time zone, OUT isdir boolean	filename text, OUT size bigint, OUT access timestamp with time zone, OUT modification timestamp with time zone, OUT change timestamp with time zone, OUT creation timestamp with time zone, OUT isdir boolean	record
+2624	text, bigint, bigint	text, bigint, bigint	text
+2625	text	text	SETOF text
+2626	double precision	double precision	void
+2627	inet	inet	inet
+2628	inet, inet	inet, inet	inet
+2629	inet, inet	inet, inet	inet
+2630	inet, bigint	inet, bigint	inet
+2631	bigint, inet	bigint, inet	inet
+2632	inet, bigint	inet, bigint	inet
+2633	inet, inet	inet, inet	bigint
+2641	bigint	bigint	numeric
+2642	integer	integer	numeric
+2643	smallint	smallint	numeric
+2644	real	real	double precision
+2645	double precision	double precision	double precision
+2646	numeric	numeric	numeric
+2647			timestamp with time zone
+2648			timestamp with time zone
+2649			timestamp with time zone
+2700	text, text, smallint, internal	text, text, smallint, internal	integer
+2705	name, name, text	name, name, text	boolean
+2706	name, oid, text	name, oid, text	boolean
+2707	oid, name, text	oid, name, text	boolean
+2708	oid, oid, text	oid, oid, text	boolean
+2709	name, text	name, text	boolean
+2710	oid, text	oid, text	boolean
+2711	interval	interval	interval
+2712	bigint	bigint	numeric
+2713	integer	integer	numeric
+2714	smallint	smallint	numeric
+2715	real	real	double precision
+2716	double precision	double precision	double precision
+2717	numeric	numeric	numeric
+2718	bigint	bigint	numeric
+2719	integer	integer	numeric
+2720	smallint	smallint	numeric
+2721	real	real	double precision
+2722	double precision	double precision	double precision
+2723	numeric	numeric	numeric
+2724	bigint	bigint	numeric
+2725	integer	integer	numeric
+2726	smallint	smallint	numeric
+2727	real	real	double precision
+2728	double precision	double precision	double precision
+2729	numeric	numeric	numeric
+2730	oid, boolean	oid, boolean	text
+2731	double precision	double precision	double precision
+2732	double precision	double precision	double precision
+2733	double precision	double precision	double precision
+2734	double precision, double precision	double precision, double precision	double precision
+2735	double precision	double precision	double precision
+2736	double precision	double precision	double precision
+2737	double precision	double precision	double precision
+2738	double precision	double precision	double precision
+2739	wait_for_archive boolean DEFAULT true, OUT lsn pg_lsn, OUT labelfile text, OUT spcmapfile text	wait_for_archive boolean, OUT lsn pg_lsn, OUT labelfile text, OUT spcmapfile text	record
+2740	internal	internal	bytea
+2741	bytea, internal	bytea, internal	internal
+2743	anyarray, internal, internal	anyarray, internal, internal	internal
+2744	internal, smallint, anyarray, integer, internal, internal, internal, internal	internal, smallint, anyarray, integer, internal, internal, internal, internal	boolean
+2746	internal, bigint	internal, bigint	internal
+2747	anyarray, anyarray	anyarray, anyarray	boolean
+2748	anyarray, anyarray	anyarray, anyarray	boolean
+2749	anyarray, anyarray	anyarray, anyarray	boolean
+2758	oid	oid	bigint
+2759	oid	oid	bigint
+2760	oid	oid	bigint
+2761	oid	oid	bigint
+2762	oid	oid	bigint
+2763	text, text	text, text	SETOF text[]
+2764	text, text, text	text, text, text	SETOF text[]
+2765	text, text	text, text	SETOF text
+2766	text, text, text	text, text, text	SETOF text
+2767	text, text	text, text	text[]
+2768	text, text, text	text, text, text	text[]
+2769			bigint
+2770			bigint
+2771			bigint
+2772			bigint
+2773			bigint
+2774	anyarray, internal, smallint, internal, internal, internal, internal	anyarray, internal, smallint, internal, internal, internal, internal	internal
+2775			bigint
+2777	cstring	cstring	anynonarray
+2778	anynonarray	anynonarray	cstring
+2781	oid	oid	timestamp with time zone
+2782	oid	oid	timestamp with time zone
+2783	oid	oid	timestamp with time zone
+2784	oid	oid	timestamp with time zone
+2785	internal, internal	internal, internal	internal
+2786	internal	internal	bytea
+2787	bytea, internal	bytea, internal	internal
+2788	integer	integer	text
+2790	tid, tid	tid, tid	boolean
+2791	tid, tid	tid, tid	boolean
+2792	tid, tid	tid, tid	boolean
+2793	tid, tid	tid, tid	boolean
+2794	tid, tid	tid, tid	integer
+2795	tid, tid	tid, tid	tid
+2796	tid, tid	tid, tid	tid
+2797	tid	tid	tid
+2798	tid	tid	tid
+2803			bigint
+2804	bigint, "any"	bigint, "any"	bigint
+2805	bigint, double precision, double precision	bigint, double precision, double precision	bigint
+2806	double precision[], double precision, double precision	double precision[], double precision, double precision	double precision[]
+2807	double precision[]	double precision[]	double precision
+2808	double precision[]	double precision[]	double precision
+2809	double precision[]	double precision[]	double precision
+2810	double precision[]	double precision[]	double precision
+2811	double precision[]	double precision[]	double precision
+2812	double precision[]	double precision[]	double precision
+2813	double precision[]	double precision[]	double precision
+2814	double precision[]	double precision[]	double precision
+2815	double precision[]	double precision[]	double precision
+2816	double precision[]	double precision[]	double precision
+2817	double precision[]	double precision[]	double precision
+2818	double precision, double precision	double precision, double precision	bigint
+2819	double precision, double precision	double precision, double precision	double precision
+2820	double precision, double precision	double precision, double precision	double precision
+2821	double precision, double precision	double precision, double precision	double precision
+2822	double precision, double precision	double precision, double precision	double precision
+2823	double precision, double precision	double precision, double precision	double precision
+2824	double precision, double precision	double precision, double precision	double precision
+2825	double precision, double precision	double precision, double precision	double precision
+2826	double precision, double precision	double precision, double precision	double precision
+2827	double precision, double precision	double precision, double precision	double precision
+2828	double precision, double precision	double precision, double precision	double precision
+2829	double precision, double precision	double precision, double precision	double precision
+2844	oid	oid	double precision
+2845	oid	oid	double precision
+2848			pg_lsn
+2849			pg_lsn
+2850	lsn pg_lsn, OUT file_name text, OUT file_offset integer	lsn pg_lsn, OUT file_name text, OUT file_offset integer	record
+2851	pg_lsn	pg_lsn	text
+2852			pg_lsn
+2853	integer	integer	text
+2854			oid
+2855	oid	oid	boolean
+2856	OUT name text, OUT abbrev text, OUT utc_offset interval, OUT is_dst boolean	OUT name text, OUT abbrev text, OUT utc_offset interval, OUT is_dst boolean	SETOF record
+2857	integer	integer	timestamp with time zone
+2858	internal, numeric	internal, numeric	internal
+2859			bigint
+2878	oid	oid	bigint
+2879	oid	oid	bigint
+2880	bigint	bigint	void
+2881	bigint	bigint	void
+2882	bigint	bigint	boolean
+2883	bigint	bigint	boolean
+2884	bigint	bigint	boolean
+2885	bigint	bigint	boolean
+2886	integer, integer	integer, integer	void
+2887	integer, integer	integer, integer	void
+2888	integer, integer	integer, integer	boolean
+2889	integer, integer	integer, integer	boolean
+2890	integer, integer	integer, integer	boolean
+2891	integer, integer	integer, integer	boolean
+2892			void
+2893	cstring	cstring	xml
+2894	xml	xml	cstring
+2895	text	text	xml
+2896	text	text	xml
+2897	xml, text	xml, text	boolean
+2898	internal	internal	xml
+2899	xml	xml	bytea
+2900	xml, xml	xml, xml	xml
+2901	xml	xml	xml
+2902	cstring[]	cstring[]	integer
+2903	cstring[]	cstring[]	integer
+2904	integer	integer	cstring
+2905	cstring[]	cstring[]	integer
+2906	integer	integer	cstring
+2907	cstring[]	cstring[]	integer
+2908	integer	integer	cstring
+2909	cstring[]	cstring[]	integer
+2910	integer	integer	cstring
+2911	cstring[]	cstring[]	integer
+2912	integer	integer	cstring
+2913	cstring[]	cstring[]	integer
+2914	integer	integer	cstring
+2915	cstring[]	cstring[]	integer
+2916	integer	integer	cstring
+2917	cstring[]	cstring[]	integer
+2918	integer	integer	cstring
+2919	cstring[]	cstring[]	integer
+2920	integer	integer	cstring
+2921	integer	integer	cstring
+2922	xml	xml	text
+2923	tbl regclass, nulls boolean, tableforest boolean, targetns text	tbl regclass, nulls boolean, tableforest boolean, targetns text	xml
+2924	query text, nulls boolean, tableforest boolean, targetns text	query text, nulls boolean, tableforest boolean, targetns text	xml
+2925	cursor refcursor, count integer, nulls boolean, tableforest boolean, targetns text	cursor refcursor, count integer, nulls boolean, tableforest boolean, targetns text	xml
+2926	tbl regclass, nulls boolean, tableforest boolean, targetns text	tbl regclass, nulls boolean, tableforest boolean, targetns text	xml
+2927	query text, nulls boolean, tableforest boolean, targetns text	query text, nulls boolean, tableforest boolean, targetns text	xml
+2928	cursor refcursor, nulls boolean, tableforest boolean, targetns text	cursor refcursor, nulls boolean, tableforest boolean, targetns text	xml
+2929	tbl regclass, nulls boolean, tableforest boolean, targetns text	tbl regclass, nulls boolean, tableforest boolean, targetns text	xml
+2930	query text, nulls boolean, tableforest boolean, targetns text	query text, nulls boolean, tableforest boolean, targetns text	xml
+2931	text, xml, text[]	text, xml, text[]	xml[]
+2932	text, xml	text, xml	xml[]
+2933	schema name, nulls boolean, tableforest boolean, targetns text	schema name, nulls boolean, tableforest boolean, targetns text	xml
+2934	schema name, nulls boolean, tableforest boolean, targetns text	schema name, nulls boolean, tableforest boolean, targetns text	xml
+2935	schema name, nulls boolean, tableforest boolean, targetns text	schema name, nulls boolean, tableforest boolean, targetns text	xml
+2936	nulls boolean, tableforest boolean, targetns text	nulls boolean, tableforest boolean, targetns text	xml
+2937	nulls boolean, tableforest boolean, targetns text	nulls boolean, tableforest boolean, targetns text	xml
+2938	nulls boolean, tableforest boolean, targetns text	nulls boolean, tableforest boolean, targetns text	xml
+2939	cstring	cstring	txid_snapshot
+2940	txid_snapshot	txid_snapshot	cstring
+2941	internal	internal	txid_snapshot
+2942	txid_snapshot	txid_snapshot	bytea
+2943			bigint
+2944			txid_snapshot
+2945	txid_snapshot	txid_snapshot	bigint
+2946	txid_snapshot	txid_snapshot	bigint
+2947	txid_snapshot	txid_snapshot	SETOF bigint
+2948	bigint, txid_snapshot	bigint, txid_snapshot	boolean
+2952	cstring	cstring	uuid
+2953	uuid	uuid	cstring
+2954	uuid, uuid	uuid, uuid	boolean
+2955	uuid, uuid	uuid, uuid	boolean
+2956	uuid, uuid	uuid, uuid	boolean
+2957	uuid, uuid	uuid, uuid	boolean
+2958	uuid, uuid	uuid, uuid	boolean
+2959	uuid, uuid	uuid, uuid	boolean
+2960	uuid, uuid	uuid, uuid	integer
+2961	internal	internal	uuid
+2962	uuid	uuid	bytea
+2963	uuid	uuid	integer
+2971	boolean	boolean	text
+2978	oid	oid	bigint
+2979	oid	oid	double precision
+2980	oid	oid	double precision
+2981	record, record	record, record	boolean
+2982	record, record	record, record	boolean
+2983	record, record	record, record	boolean
+2984	record, record	record, record	boolean
+2985	record, record	record, record	boolean
+2986	record, record	record, record	boolean
+2987	record, record	record, record	integer
+2997	regclass	regclass	bigint
+2998	regclass	regclass	bigint
+2999	regclass	regclass	oid
+3000	name, text, text	name, text, text	boolean
+3001	name, oid, text	name, oid, text	boolean
+3002	oid, text, text	oid, text, text	boolean
+3003	oid, oid, text	oid, oid, text	boolean
+3004	text, text	text, text	boolean
+3005	oid, text	oid, text	boolean
+3006	name, text, text	name, text, text	boolean
+3007	name, oid, text	name, oid, text	boolean
+3008	oid, text, text	oid, text, text	boolean
+3009	oid, oid, text	oid, oid, text	boolean
+3010	text, text	text, text	boolean
+3011	oid, text	oid, text	boolean
+3012	name, text, text, text	name, text, text, text	boolean
+3013	name, text, smallint, text	name, text, smallint, text	boolean
+3014	name, oid, text, text	name, oid, text, text	boolean
+3015	name, oid, smallint, text	name, oid, smallint, text	boolean
+3016	oid, text, text, text	oid, text, text, text	boolean
+3017	oid, text, smallint, text	oid, text, smallint, text	boolean
+3018	oid, oid, text, text	oid, oid, text, text	boolean
+3019	oid, oid, smallint, text	oid, oid, smallint, text	boolean
+3020	text, text, text	text, text, text	boolean
+3021	text, smallint, text	text, smallint, text	boolean
+3022	oid, text, text	oid, text, text	boolean
+3023	oid, smallint, text	oid, smallint, text	boolean
+3024	name, text, text	name, text, text	boolean
+3025	name, oid, text	name, oid, text	boolean
+3026	oid, text, text	oid, text, text	boolean
+3027	oid, oid, text	oid, oid, text	boolean
+3028	text, text	text, text	boolean
+3029	oid, text	oid, text	boolean
+3030	bit, bit, integer, integer	bit, bit, integer, integer	bit
+3031	bit, bit, integer	bit, bit, integer	bit
+3032	bit, integer	bit, integer	integer
+3033	bit, integer, integer	bit, integer, integer	bit
+3034	regclass	regclass	text
+3035			SETOF text
+3036	text, text	text, text	void
+3037	oid	oid	bigint
+3038	oid	oid	bigint
+3039	oid	oid	bigint
+3040	oid	oid	bigint
+3041	oid	oid	bigint
+3042	oid	oid	bigint
+3043	oid	oid	bigint
+3044	oid	oid	bigint
+3045	oid	oid	bigint
+3046	oid	oid	bigint
+3047	oid	oid	double precision
+3048	oid	oid	double precision
+3049	text, xml, text[]	text, xml, text[]	boolean
+3050	text, xml	text, xml	boolean
+3051	text	text	boolean
+3052	text	text	boolean
+3053	text	text	boolean
+3054	oid	oid	bigint
+3055	oid	oid	bigint
+3056	oid	oid	bigint
+3057	oid	oid	bigint
+3058	VARIADIC "any"	VARIADIC "any"	text
+3059	text, VARIADIC "any"	text, VARIADIC "any"	text
+3060	text, integer	text, integer	text
+3061	text, integer	text, integer	text
+3062	text	text	text
+3063			bigint
+3064	internal, point, smallint, oid, internal	internal, point, smallint, oid, internal	double precision
+3065	oid	oid	bigint
+3066	oid	oid	bigint
+3067	oid	oid	bigint
+3068	oid	oid	bigint
+3069	oid	oid	bigint
+3070	oid	oid	bigint
+3071			void
+3072			void
+3073			boolean
+3074	oid	oid	timestamp with time zone
+3075			timestamp with time zone
+3076	anyarray, internal	anyarray, internal	internal
+3077	tsvector, internal	tsvector, internal	internal
+3078	sequence_oid oid, OUT start_value bigint, OUT minimum_value bigint, OUT maximum_value bigint, OUT increment bigint, OUT cycle_option boolean, OUT cache_size bigint, OUT data_type oid	sequence_oid oid, OUT start_value bigint, OUT minimum_value bigint, OUT maximum_value bigint, OUT increment bigint, OUT cycle_option boolean, OUT cache_size bigint, OUT data_type oid	record
+3082	OUT name name, OUT default_version text, OUT comment text	OUT name name, OUT default_version text, OUT comment text	SETOF record
+3083	OUT name name, OUT version text, OUT superuser boolean, OUT trusted boolean, OUT relocatable boolean, OUT schema name, OUT requires name[], OUT comment text	OUT name name, OUT version text, OUT superuser boolean, OUT trusted boolean, OUT relocatable boolean, OUT schema name, OUT requires name[], OUT comment text	SETOF record
+3084	name name, OUT source text, OUT target text, OUT path text	name name, OUT source text, OUT target text, OUT path text	SETOF record
+3086	regclass, text	regclass, text	void
+3087	tsquery, internal, smallint, internal, internal	tsquery, internal, smallint, internal, internal	internal
+3088	internal, smallint, tsquery, integer, internal, internal	internal, smallint, tsquery, integer, internal, internal	boolean
+3089	bigint	bigint	void
+3090	bigint	bigint	void
+3091	bigint	bigint	boolean
+3092	bigint	bigint	boolean
+3093	integer, integer	integer, integer	void
+3094	integer, integer	integer, integer	void
+3095	integer, integer	integer, integer	boolean
+3096	integer, integer	integer, integer	boolean
+3097	internal	internal	internal
+3098	text	text	pg_lsn
+3099	OUT pid integer, OUT state text, OUT sent_lsn pg_lsn, OUT write_lsn pg_lsn, OUT flush_lsn pg_lsn, OUT replay_lsn pg_lsn, OUT write_lag interval, OUT flush_lag interval, OUT replay_lag interval, OUT sync_priority integer, OUT sync_state text, OUT reply_time timestamp with time zone	OUT pid integer, OUT state text, OUT sent_lsn pg_lsn, OUT write_lsn pg_lsn, OUT flush_lsn pg_lsn, OUT replay_lsn pg_lsn, OUT write_lag interval, OUT flush_lag interval, OUT replay_lag interval, OUT sync_priority integer, OUT sync_state text, OUT reply_time timestamp with time zone	SETOF record
+3100			bigint
+3101			bigint
+3102			bigint
+3103			double precision
+3104			double precision
+3105	integer	integer	integer
+3106	anyelement	anyelement	anyelement
+3107	anyelement, integer	anyelement, integer	anyelement
+3108	anycompatible, integer, anycompatible	anycompatible, integer, anycompatible	anycompatible
+3109	anyelement	anyelement	anyelement
+3110	anyelement, integer	anyelement, integer	anyelement
+3111	anycompatible, integer, anycompatible	anycompatible, integer, anycompatible	anycompatible
+3112	anyelement	anyelement	anyelement
+3113	anyelement	anyelement	anyelement
+3114	anyelement, integer	anyelement, integer	anyelement
+3116	cstring	cstring	fdw_handler
+3117	fdw_handler	fdw_handler	cstring
+3120	internal	internal	void
+3121	void	void	bytea
+3129	internal	internal	void
+3130	internal	internal	void
+3131	internal	internal	void
+3132	internal	internal	void
+3133	internal	internal	void
+3134	internal	internal	void
+3135	internal	internal	void
+3136	internal	internal	void
+3137	internal	internal	void
+3138	name, text, text	name, text, text	boolean
+3139	name, oid, text	name, oid, text	boolean
+3140	oid, text, text	oid, text, text	boolean
+3141	oid, oid, text	oid, oid, text	boolean
+3142	text, text	text, text	boolean
+3143	oid, text	oid, text	boolean
+3144	macaddr	macaddr	macaddr
+3145	macaddr, macaddr	macaddr, macaddr	macaddr
+3146	macaddr, macaddr	macaddr, macaddr	macaddr
+3150	oid	oid	bigint
+3151	oid	oid	bigint
+3152	oid	oid	bigint
+3153	anyarray	anyarray	json
+3154	anyarray, boolean	anyarray, boolean	json
+3155	record	record	json
+3156	record, boolean	record, boolean	json
+3157	internal	internal	internal
+3158	internal	internal	internal
+3159	oid, integer	oid, integer	text
+3160			double precision
+3161			double precision
+3162	"any"	"any"	text
+3163			integer
+3165	pg_lsn, pg_lsn	pg_lsn, pg_lsn	numeric
+3166	numeric	numeric	text
+3167	anycompatiblearray, anycompatible	anycompatiblearray, anycompatible	anycompatiblearray
+3168	anycompatiblearray, anycompatible, anycompatible	anycompatiblearray, anycompatible, anycompatible	anycompatiblearray
+3169	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+3170	integer, bigint, integer	integer, bigint, integer	bigint
+3171	integer	integer	bigint
+3172	integer, bigint	integer, bigint	integer
+3173	internal, anyelement	internal, anyelement	internal
+3174	internal	internal	json
+3175	anyelement	anyelement	json
+3176	anyelement	anyelement	json
+3177	oid	oid	bigint
+3178	internal	internal	numeric
+3179	anyarray	anyarray	integer
+3180	internal, "any", "any"	internal, "any", "any"	internal
+3181	record, record	record, record	boolean
+3182	record, record	record, record	boolean
+3183	record, record	record, record	boolean
+3184	record, record	record, record	boolean
+3185	record, record	record, record	boolean
+3186	record, record	record, record	boolean
+3187	record, record	record, record	integer
+3195	OUT archived_count bigint, OUT last_archived_wal text, OUT last_archived_time timestamp with time zone, OUT failed_count bigint, OUT last_failed_wal text, OUT last_failed_time timestamp with time zone, OUT stats_reset timestamp with time zone	OUT archived_count bigint, OUT last_archived_wal text, OUT last_archived_time timestamp with time zone, OUT failed_count bigint, OUT last_failed_wal text, OUT last_failed_time timestamp with time zone, OUT stats_reset timestamp with time zone	record
+3196	internal	internal	json
+3197	"any", "any"	"any", "any"	json
+3198	VARIADIC "any"	VARIADIC "any"	json
+3199			json
+3200	VARIADIC "any"	VARIADIC "any"	json
+3201			json
+3202	text[]	text[]	json
+3203	text[], text[]	text[], text[]	json
+3204	json	json	record
+3205	json	json	SETOF record
+3207	jsonb	jsonb	integer
+3208	from_json jsonb, OUT key text, OUT value jsonb	from_json jsonb, OUT key text, OUT value jsonb	SETOF record
+3209	anyelement, jsonb	anyelement, jsonb	anyelement
+3210	jsonb	jsonb	text
+3214	from_json jsonb, field_name text	from_json jsonb, field_name text	text
+3215	from_json jsonb, element_index integer	from_json jsonb, element_index integer	jsonb
+3216	from_json jsonb, element_index integer	from_json jsonb, element_index integer	text
+3217	from_json jsonb, VARIADIC path_elems text[]	from_json jsonb, VARIADIC path_elems text[]	jsonb
+3218	anycompatible, anycompatiblearray	anycompatible, anycompatiblearray	integer
+3219	from_json jsonb, OUT value jsonb	from_json jsonb, OUT value jsonb	SETOF jsonb
+3229	cstring	cstring	pg_lsn
+3230	pg_lsn	pg_lsn	cstring
+3231	pg_lsn, pg_lsn	pg_lsn, pg_lsn	boolean
+3232	pg_lsn, pg_lsn	pg_lsn, pg_lsn	boolean
+3233	pg_lsn, pg_lsn	pg_lsn, pg_lsn	boolean
+3234	pg_lsn, pg_lsn	pg_lsn, pg_lsn	boolean
+3235	pg_lsn, pg_lsn	pg_lsn, pg_lsn	boolean
+3236	pg_lsn, pg_lsn	pg_lsn, pg_lsn	boolean
+3237	pg_lsn, pg_lsn	pg_lsn, pg_lsn	numeric
+3238	internal	internal	pg_lsn
+3239	pg_lsn	pg_lsn	bytea
+3251	pg_lsn, pg_lsn	pg_lsn, pg_lsn	integer
+3252	pg_lsn	pg_lsn	integer
+3255	internal	internal	void
+3259	numeric, numeric, numeric	numeric, numeric, numeric	SETOF numeric
+3260	numeric, numeric	numeric, numeric	SETOF numeric
+3261	json	json	json
+3262	jsonb	jsonb	jsonb
+3263	text[]	text[]	jsonb
+3264	text[], text[]	text[], text[]	jsonb
+3265	internal, anyelement	internal, anyelement	internal
+3266	internal	internal	jsonb
+3267	anyelement	anyelement	jsonb
+3268	internal, "any", "any"	internal, "any", "any"	internal
+3269	internal	internal	jsonb
+3270	"any", "any"	"any", "any"	jsonb
+3271	VARIADIC "any"	VARIADIC "any"	jsonb
+3272			jsonb
+3273	VARIADIC "any"	VARIADIC "any"	jsonb
+3274			jsonb
+3275	point, polygon	point, polygon	double precision
+3277	anycompatiblearray, anycompatible	anycompatiblearray, anycompatible	integer
+3278	anycompatiblearray, anycompatible, integer	anycompatiblearray, anycompatible, integer	integer
+3279	anycompatiblearray, anycompatible	anycompatiblearray, anycompatible	integer[]
+3280	internal, circle, smallint, oid, internal	internal, circle, smallint, oid, internal	double precision
+3281	numeric	numeric	integer
+3282	internal	internal	internal
+3283	internal	internal	void
+3288	internal, polygon, smallint, oid, internal	internal, polygon, smallint, oid, internal	double precision
+3290	circle, point	circle, point	double precision
+3292	polygon, point	polygon, point	double precision
+3293	text, bigint, bigint, boolean	text, bigint, bigint, boolean	text
+3294	text, boolean	text, boolean	text
+3295	text, bigint, bigint, boolean	text, bigint, bigint, boolean	bytea
+3296			double precision
+3297	text, boolean, boolean	text, boolean, boolean	SETOF text
+3298	oid	oid	boolean
+3299	text	text	boolean
+3300	internal	internal	void
+3301	jsonb, jsonb	jsonb, jsonb	jsonb
+3302	jsonb, text	jsonb, text	jsonb
+3303	jsonb, integer	jsonb, integer	jsonb
+3304	jsonb, text[]	jsonb, text[]	jsonb
+3305	jsonb_in jsonb, path text[], replacement jsonb, create_if_missing boolean DEFAULT true	jsonb_in jsonb, path text[], replacement jsonb, create_if_missing boolean	jsonb
+3306	jsonb	jsonb	text
+3307	filename text, missing_ok boolean, OUT size bigint, OUT access timestamp with time zone, OUT modification timestamp with time zone, OUT change timestamp with time zone, OUT creation timestamp with time zone, OUT isdir boolean	filename text, missing_ok boolean, OUT size bigint, OUT access timestamp with time zone, OUT modification timestamp with time zone, OUT change timestamp with time zone, OUT creation timestamp with time zone, OUT isdir boolean	record
+3308	xid, xid	xid, xid	boolean
+3309	xid, integer	xid, integer	boolean
+3311	cstring	cstring	tsm_handler
+3312	tsm_handler	tsm_handler	cstring
+3313	internal	internal	tsm_handler
+3314	internal	internal	tsm_handler
+3317	OUT pid integer, OUT status text, OUT receive_start_lsn pg_lsn, OUT receive_start_tli integer, OUT written_lsn pg_lsn, OUT flushed_lsn pg_lsn, OUT received_tli integer, OUT last_msg_send_time timestamp with time zone, OUT last_msg_receipt_time timestamp with time zone, OUT latest_end_lsn pg_lsn, OUT latest_end_time timestamp with time zone, OUT slot_name text, OUT sender_host text, OUT sender_port integer, OUT conninfo text	OUT pid integer, OUT status text, OUT receive_start_lsn pg_lsn, OUT receive_start_tli integer, OUT written_lsn pg_lsn, OUT flushed_lsn pg_lsn, OUT received_tli integer, OUT last_msg_send_time timestamp with time zone, OUT last_msg_receipt_time timestamp with time zone, OUT latest_end_lsn pg_lsn, OUT latest_end_time timestamp with time zone, OUT slot_name text, OUT sender_host text, OUT sender_port integer, OUT conninfo text	record
+3318	cmdtype text, OUT pid integer, OUT datid oid, OUT relid oid, OUT param1 bigint, OUT param2 bigint, OUT param3 bigint, OUT param4 bigint, OUT param5 bigint, OUT param6 bigint, OUT param7 bigint, OUT param8 bigint, OUT param9 bigint, OUT param10 bigint, OUT param11 bigint, OUT param12 bigint, OUT param13 bigint, OUT param14 bigint, OUT param15 bigint, OUT param16 bigint, OUT param17 bigint, OUT param18 bigint, OUT param19 bigint, OUT param20 bigint	cmdtype text, OUT pid integer, OUT datid oid, OUT relid oid, OUT param1 bigint, OUT param2 bigint, OUT param3 bigint, OUT param4 bigint, OUT param5 bigint, OUT param6 bigint, OUT param7 bigint, OUT param8 bigint, OUT param9 bigint, OUT param10 bigint, OUT param11 bigint, OUT param12 bigint, OUT param13 bigint, OUT param14 bigint, OUT param15 bigint, OUT param16 bigint, OUT param17 bigint, OUT param18 bigint, OUT param19 bigint, OUT param20 bigint	SETOF record
+3319	tsvector, "char"[]	tsvector, "char"[]	tsvector
+3320	tsvector, "char", text[]	tsvector, "char", text[]	tsvector
+3321	tsvector, text	tsvector, text	tsvector
+3322	tsvector tsvector, OUT lexeme text, OUT positions smallint[], OUT weights text[]	tsvector tsvector, OUT lexeme text, OUT positions smallint[], OUT weights text[]	SETOF record
+3323	tsvector, text[]	tsvector, text[]	tsvector
+3324	bigint[], bigint[]	bigint[], bigint[]	bigint[]
+3325	interval[], interval[]	interval[], interval[]	interval[]
+3326	tsvector	tsvector	text[]
+3327	text[]	text[]	tsvector
+3328	internal	internal	void
+3329	OUT sourcefile text, OUT sourceline integer, OUT seqno integer, OUT name text, OUT setting text, OUT applied boolean, OUT error text	OUT sourcefile text, OUT sourceline integer, OUT seqno integer, OUT name text, OUT setting text, OUT applied boolean, OUT error text	SETOF record
+3330			pg_lsn
+3331	internal	internal	void
+3332	internal	internal	void
+3333	internal	internal	void
+3334	text	text	bigint
+3335	internal	internal	bytea
+3336	bytea, internal	bytea, internal	internal
+3337	internal, internal	internal, internal	internal
+3338	internal, internal	internal, internal	internal
+3339	internal	internal	bytea
+3340	bytea, internal	bytea, internal	internal
+3341	internal, internal	internal, internal	internal
+3342	double precision[], double precision[]	double precision[], double precision[]	double precision[]
+3343	from_json jsonb, VARIADIC path_elems text[]	from_json jsonb, VARIADIC path_elems text[]	jsonb
+3344	money, bigint	money, bigint	money
+3345	money, bigint	money, bigint	money
+3348			bigint
+3352	oid	oid	text
+3353	OUT name text, OUT size bigint, OUT modification timestamp with time zone	OUT name text, OUT size bigint, OUT modification timestamp with time zone	SETOF record
+3354	OUT name text, OUT size bigint, OUT modification timestamp with time zone	OUT name text, OUT size bigint, OUT modification timestamp with time zone	SETOF record
+3355	cstring	cstring	pg_ndistinct
+3356	pg_ndistinct	pg_ndistinct	cstring
+3357	internal	internal	pg_ndistinct
+3358	pg_ndistinct	pg_ndistinct	bytea
+3359	internal	internal	void
+3360	bigint	bigint	text
+3376	integer	integer	integer[]
+3378	integer, integer[]	integer, integer[]	boolean
+3382	classid oid, objid oid, objsubid integer, OUT type text, OUT object_names text[], OUT object_args text[]	classid oid, objid oid, objsubid integer, OUT type text, OUT object_names text[], OUT object_args text[]	record
+3383	internal	internal	internal
+3384	internal, internal, internal, internal	internal, internal, internal, internal	boolean
+3385	internal, internal, internal	internal, internal, internal	boolean
+3386	internal, internal, internal	internal, internal, internal	boolean
+3387	internal, bigint	internal, bigint	internal
+3388	internal	internal	numeric
+3389	internal	internal	numeric
+3390	internal	internal	numeric
+3391	internal	internal	numeric
+3392	internal	internal	numeric
+3393	internal	internal	numeric
+3396	text, text	text, text	text[]
+3397	text, text, text	text, text, text	text[]
+3399	bigint, money	bigint, money	money
+3400	OUT name text, OUT setting text	OUT name text, OUT setting text	SETOF record
+3401	OUT line_number integer, OUT type text, OUT database text[], OUT user_name text[], OUT address text, OUT netmask text, OUT auth_method text, OUT options text[], OUT error text	OUT line_number integer, OUT type text, OUT database text[], OUT user_name text[], OUT address text, OUT netmask text, OUT auth_method text, OUT options text[], OUT error text	SETOF record
+3403	oid	oid	boolean
+3404	cstring	cstring	pg_dependencies
+3405	pg_dependencies	pg_dependencies	cstring
+3406	internal	internal	pg_dependencies
+3407	pg_dependencies	pg_dependencies	bytea
+3408	oid	oid	text
+3409	time without time zone, bigint	time without time zone, bigint	bigint
+3410	time with time zone, bigint	time with time zone, bigint	bigint
+3411	timestamp without time zone, bigint	timestamp without time zone, bigint	bigint
+3412	uuid, bigint	uuid, bigint	bigint
+3413	pg_lsn, bigint	pg_lsn, bigint	bigint
+3414	anyenum, bigint	anyenum, bigint	bigint
+3415	oid	oid	text
+3416	jsonb, bigint	jsonb, bigint	bigint
+3417	anyrange, bigint	anyrange, bigint	bigint
+3418	interval, bigint	interval, bigint	bigint
+3419	bytea	bytea	bytea
+3420	bytea	bytea	bytea
+3421	bytea	bytea	bytea
+3422	bytea	bytea	bytea
+3423	rootrelid regclass, OUT relid regclass, OUT parentrelid regclass, OUT isleaf boolean, OUT level integer	rootrelid regclass, OUT relid regclass, OUT parentrelid regclass, OUT isleaf boolean, OUT level integer	SETOF record
+3424	regclass	regclass	regclass
+3425	partitionid regclass, OUT relid regclass	partitionid regclass, OUT relid regclass	SETOF regclass
+3426	oid	oid	bigint
+3427	mcv_list pg_mcv_list, OUT index integer, OUT "values" text[], OUT nulls boolean[], OUT frequency double precision, OUT base_frequency double precision	mcv_list pg_mcv_list, OUT index integer, OUT "values" text[], OUT nulls boolean[], OUT frequency double precision, OUT base_frequency double precision	SETOF record
+3428	oid	oid	timestamp with time zone
+3432			uuid
+3434	internal	internal	void
+3435	internal	internal	void
+3436	wait boolean DEFAULT true, wait_seconds integer DEFAULT 60	wait boolean, wait_seconds integer	boolean
+3437	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+3438	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+3441	OUT pg_control_version integer, OUT catalog_version_no integer, OUT system_identifier bigint, OUT pg_control_last_modified timestamp with time zone	OUT pg_control_version integer, OUT catalog_version_no integer, OUT system_identifier bigint, OUT pg_control_last_modified timestamp with time zone	record
+3442	OUT checkpoint_lsn pg_lsn, OUT redo_lsn pg_lsn, OUT redo_wal_file text, OUT timeline_id integer, OUT prev_timeline_id integer, OUT full_page_writes boolean, OUT next_xid text, OUT next_oid oid, OUT next_multixact_id xid, OUT next_multi_offset xid, OUT oldest_xid xid, OUT oldest_xid_dbid oid, OUT oldest_active_xid xid, OUT oldest_multi_xid xid, OUT oldest_multi_dbid oid, OUT oldest_commit_ts_xid xid, OUT newest_commit_ts_xid xid, OUT checkpoint_time timestamp with time zone	OUT checkpoint_lsn pg_lsn, OUT redo_lsn pg_lsn, OUT redo_wal_file text, OUT timeline_id integer, OUT prev_timeline_id integer, OUT full_page_writes boolean, OUT next_xid text, OUT next_oid oid, OUT next_multixact_id xid, OUT next_multi_offset xid, OUT oldest_xid xid, OUT oldest_xid_dbid oid, OUT oldest_active_xid xid, OUT oldest_multi_xid xid, OUT oldest_multi_dbid oid, OUT oldest_commit_ts_xid xid, OUT newest_commit_ts_xid xid, OUT checkpoint_time timestamp with time zone	record
+3443	OUT min_recovery_end_lsn pg_lsn, OUT min_recovery_end_timeline integer, OUT backup_start_lsn pg_lsn, OUT backup_end_lsn pg_lsn, OUT end_of_backup_record_required boolean	OUT min_recovery_end_lsn pg_lsn, OUT min_recovery_end_timeline integer, OUT backup_start_lsn pg_lsn, OUT backup_end_lsn pg_lsn, OUT end_of_backup_record_required boolean	record
+3444	OUT max_data_alignment integer, OUT database_block_size integer, OUT blocks_per_segment integer, OUT wal_block_size integer, OUT bytes_per_wal_segment integer, OUT max_identifier_length integer, OUT max_index_columns integer, OUT max_toast_chunk_size integer, OUT large_object_chunk_size integer, OUT float8_pass_by_value boolean, OUT data_page_checksum_version integer	OUT max_data_alignment integer, OUT database_block_size integer, OUT blocks_per_segment integer, OUT wal_block_size integer, OUT bytes_per_wal_segment integer, OUT max_identifier_length integer, OUT max_index_columns integer, OUT max_toast_chunk_size integer, OUT large_object_chunk_size integer, OUT float8_pass_by_value boolean, OUT data_page_checksum_version integer	record
+3445	regnamespace	regnamespace	integer
+3446	internal	internal	macaddr8
+3447	macaddr8	macaddr8	bytea
+3448	oid	oid	text
+3449	jsonb	jsonb	numeric
+3450	jsonb	jsonb	smallint
+3451	jsonb	jsonb	integer
+3452	jsonb	jsonb	bigint
+3453	jsonb	jsonb	real
+3454	oid, oid	oid, oid	regclass
+3457	oid, bytea	oid, bytea	oid
+3458	oid	oid	bytea
+3459	oid, bigint, integer	oid, bigint, integer	bytea
+3460	oid, bigint, bytea	oid, bigint, bytea	void
+3461	year integer, month integer, mday integer, hour integer, min integer, sec double precision	year integer, month integer, mday integer, hour integer, min integer, sec double precision	timestamp without time zone
+3462	year integer, month integer, mday integer, hour integer, min integer, sec double precision	year integer, month integer, mday integer, hour integer, min integer, sec double precision	timestamp with time zone
+3463	year integer, month integer, mday integer, hour integer, min integer, sec double precision, timezone text	year integer, month integer, mday integer, hour integer, min integer, sec double precision, timezone text	timestamp with time zone
+3464	years integer DEFAULT 0, months integer DEFAULT 0, weeks integer DEFAULT 0, days integer DEFAULT 0, hours integer DEFAULT 0, mins integer DEFAULT 0, secs double precision DEFAULT 0.0	years integer, months integer, weeks integer, days integer, hours integer, mins integer, secs double precision	interval
+3465	from_json jsonb, OUT value text	from_json jsonb, OUT value text	SETOF text
+3469	internal, internal	internal, internal	void
+3470	internal, internal	internal, internal	void
+3471	internal, internal	internal, internal	void
+3472	internal, internal	internal, internal	void
+3473	internal, internal	internal, internal	boolean
+3475	anyelement, jsonb	anyelement, jsonb	SETOF anyelement
+3476	text	text	regoperator
+3478	from_json jsonb, field_name text	from_json jsonb, field_name text	jsonb
+3479	text	text	regprocedure
+3480	text, text	text, text	integer
+3482	jsonb, internal, internal	jsonb, internal, internal	internal
+3483	jsonb, internal, smallint, internal, internal, internal, internal	jsonb, internal, smallint, internal, internal, internal, internal	internal
+3484	internal, smallint, jsonb, integer, internal, internal, internal, internal	internal, smallint, jsonb, integer, internal, internal, internal, internal	boolean
+3485	jsonb, internal, internal	jsonb, internal, internal	internal
+3486	jsonb, internal, smallint, internal, internal, internal, internal	jsonb, internal, smallint, internal, internal, internal, internal	internal
+3487	internal, smallint, jsonb, integer, internal, internal, internal, internal	internal, smallint, jsonb, integer, internal, internal, internal, internal	boolean
+3488	internal, smallint, jsonb, integer, internal, internal, internal	internal, smallint, jsonb, integer, internal, internal, internal	"char"
+3489	internal, smallint, jsonb, integer, internal, internal, internal	internal, smallint, jsonb, integer, internal, internal, internal	"char"
+3490	jsonb	jsonb	record
+3491	jsonb	jsonb	SETOF record
+3492	text	text	regoper
+3493	text	text	regtype
+3494	text	text	regproc
+3495	text	text	regclass
+3496	internal, boolean	internal, boolean	internal
+3497	internal, boolean	internal, boolean	internal
+3498	internal	internal	boolean
+3499	internal	internal	boolean
+3504	cstring	cstring	anyenum
+3505	anyenum	anyenum	cstring
+3506	cstring, oid	cstring, oid	anyenum
+3507	anyenum	anyenum	cstring
+3508	anyenum, anyenum	anyenum, anyenum	boolean
+3509	anyenum, anyenum	anyenum, anyenum	boolean
+3510	anyenum, anyenum	anyenum, anyenum	boolean
+3511	anyenum, anyenum	anyenum, anyenum	boolean
+3512	anyenum, anyenum	anyenum, anyenum	boolean
+3513	anyenum, anyenum	anyenum, anyenum	boolean
+3514	anyenum, anyenum	anyenum, anyenum	integer
+3515	anyenum	anyenum	integer
+3524	anyenum, anyenum	anyenum, anyenum	anyenum
+3525	anyenum, anyenum	anyenum, anyenum	anyenum
+3526	anyenum	anyenum	anyenum
+3527	anyenum	anyenum	anyenum
+3528	anyenum	anyenum	anyenum
+3529	anyenum	anyenum	anyenum
+3530	anyenum, anyenum	anyenum, anyenum	anyarray
+3531	anyenum	anyenum	anyarray
+3532	internal, oid	internal, oid	anyenum
+3533	anyenum	anyenum	bytea
+3535	internal, text, text	internal, text, text	internal
+3536	internal	internal	text
+3537	oid, oid, integer	oid, oid, integer	text
+3538	text, text	text, text	text
+3539	text, VARIADIC "any"	text, VARIADIC "any"	text
+3540	text	text	text
+3543	internal, bytea, bytea	internal, bytea, bytea	internal
+3544	internal	internal	bytea
+3545	bytea, bytea	bytea, bytea	bytea
+3546	bigint	bigint	bigint
+3547	bigint, "any"	bigint, "any"	bigint
+3548	internal, numeric	internal, numeric	internal
+3549	interval[], interval	interval[], interval	interval[]
+3551	inet, inet	inet, inet	boolean
+3553	internal, inet, smallint, oid, internal	internal, inet, smallint, oid, internal	boolean
+3554	internal, internal	internal, internal	inet
+3555	internal	internal	internal
+3556	jsonb	jsonb	boolean
+3557	internal, internal, internal	internal, internal, internal	internal
+3558	internal, internal	internal, internal	internal
+3559	inet, inet, internal	inet, inet, internal	internal
+3560	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+3561	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+3562	inet, inet	inet, inet	inet
+3563	inet, inet	inet, inet	inet
+3564	inet	inet	inet
+3565	inet	inet	inet
+3566	OUT classid oid, OUT objid oid, OUT objsubid integer, OUT original boolean, OUT normal boolean, OUT is_temporary boolean, OUT object_type text, OUT schema_name text, OUT object_name text, OUT object_identity text, OUT address_names text[], OUT address_args text[]	OUT classid oid, OUT objid oid, OUT objsubid integer, OUT original boolean, OUT normal boolean, OUT is_temporary boolean, OUT object_type text, OUT schema_name text, OUT object_name text, OUT object_identity text, OUT address_names text[], OUT address_args text[]	SETOF record
+3567	internal, smallint	internal, smallint	internal
+3568	internal, integer	internal, integer	internal
+3569	internal, bigint	internal, bigint	internal
+3570	bigint[], smallint	bigint[], smallint	bigint[]
+3571	bigint[], integer	bigint[], integer	bigint[]
+3572	bigint[]	bigint[]	bigint
+3573	internal	internal	internal
+3577	boolean, text, text	boolean, text, text	pg_lsn
+3578	boolean, text, bytea	boolean, text, bytea	pg_lsn
+3579	jsonb_in jsonb, path text[], replacement jsonb, insert_after boolean DEFAULT false	jsonb_in jsonb, path text[], replacement jsonb, insert_after boolean	jsonb
+3581	xid	xid	timestamp with time zone
+3582	oid	oid	void
+3583	OUT xid xid, OUT "timestamp" timestamp with time zone, OUT roident oid	OUT xid xid, OUT "timestamp" timestamp with time zone, OUT roident oid	record
+3584	oid	oid	void
+3586	oid	oid	void
+3587	oid	oid	void
+3588	oid	oid	void
+3589	oid	oid	void
+3590	oid	oid	void
+3591	text, text, boolean, text, oid[], text[], text[]	text, text, boolean, text, oid[], text[], text[]	void
+3594	cstring	cstring	event_trigger
+3595	event_trigger	event_trigger	cstring
+3610	cstring	cstring	tsvector
+3611	tsvector	tsvector	cstring
+3612	cstring	cstring	tsquery
+3613	tsquery	tsquery	cstring
+3616	tsvector, tsvector	tsvector, tsvector	boolean
+3617	tsvector, tsvector	tsvector, tsvector	boolean
+3618	tsvector, tsvector	tsvector, tsvector	boolean
+3619	tsvector, tsvector	tsvector, tsvector	boolean
+3620	tsvector, tsvector	tsvector, tsvector	boolean
+3621	tsvector, tsvector	tsvector, tsvector	boolean
+3622	tsvector, tsvector	tsvector, tsvector	integer
+3623	tsvector	tsvector	tsvector
+3624	tsvector, "char"	tsvector, "char"	tsvector
+3625	tsvector, tsvector	tsvector, tsvector	tsvector
+3634	tsvector, tsquery	tsvector, tsquery	boolean
+3635	tsquery, tsvector	tsquery, tsvector	boolean
+3638	tsvector	tsvector	bytea
+3639	internal	internal	tsvector
+3640	tsquery	tsquery	bytea
+3641	internal	internal	tsquery
+3646	cstring	cstring	gtsvector
+3647	gtsvector	gtsvector	cstring
+3648	internal	internal	internal
+3649	internal	internal	internal
+3650	internal, internal	internal, internal	internal
+3651	internal, internal	internal, internal	gtsvector
+3652	gtsvector, gtsvector, internal	gtsvector, gtsvector, internal	internal
+3653	internal, internal, internal	internal, internal, internal	internal
+3654	internal, tsvector, smallint, oid, internal	internal, tsvector, smallint, oid, internal	boolean
+3656	tsvector, internal, internal	tsvector, internal, internal	internal
+3657	tsvector, internal, smallint, internal, internal, internal, internal	tsvector, internal, smallint, internal, internal, internal, internal	internal
+3658	internal, smallint, tsvector, integer, internal, internal, internal, internal	internal, smallint, tsvector, integer, internal, internal, internal, internal	boolean
+3662	tsquery, tsquery	tsquery, tsquery	boolean
+3663	tsquery, tsquery	tsquery, tsquery	boolean
+3664	tsquery, tsquery	tsquery, tsquery	boolean
+3665	tsquery, tsquery	tsquery, tsquery	boolean
+3666	tsquery, tsquery	tsquery, tsquery	boolean
+3667	tsquery, tsquery	tsquery, tsquery	boolean
+3668	tsquery, tsquery	tsquery, tsquery	integer
+3669	tsquery, tsquery	tsquery, tsquery	tsquery
+3670	tsquery, tsquery	tsquery, tsquery	tsquery
+3671	tsquery	tsquery	tsquery
+3672	tsquery	tsquery	integer
+3673	tsquery	tsquery	text
+3684	tsquery, tsquery, tsquery	tsquery, tsquery, tsquery	tsquery
+3685	tsquery, text	tsquery, text	tsquery
+3686	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+3687	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+3688	internal	internal	boolean
+3689	query text, OUT word text, OUT ndoc integer, OUT nentry integer	query text, OUT word text, OUT ndoc integer, OUT nentry integer	SETOF record
+3690	query text, weights text, OUT word text, OUT ndoc integer, OUT nentry integer	query text, weights text, OUT word text, OUT ndoc integer, OUT nentry integer	SETOF record
+3691	tsquery, tsquery	tsquery, tsquery	boolean
+3692	tsquery, tsquery	tsquery, tsquery	boolean
+3695	internal	internal	internal
+3696	text, text	text, text	boolean
+3697	internal, internal	internal, internal	internal
+3698	internal, internal	internal, internal	bigint
+3699	bigint, bigint, internal	bigint, bigint, internal	internal
+3700	internal, internal, internal	internal, internal, internal	internal
+3701	internal, tsquery, smallint, oid, internal	internal, tsquery, smallint, oid, internal	boolean
+3703	real[], tsvector, tsquery, integer	real[], tsvector, tsquery, integer	real
+3704	real[], tsvector, tsquery	real[], tsvector, tsquery	real
+3705	tsvector, tsquery, integer	tsvector, tsquery, integer	real
+3706	tsvector, tsquery	tsvector, tsquery	real
+3707	real[], tsvector, tsquery, integer	real[], tsvector, tsquery, integer	real
+3708	real[], tsvector, tsquery	real[], tsvector, tsquery	real
+3709	tsvector, tsquery, integer	tsvector, tsquery, integer	real
+3710	tsvector, tsquery	tsvector, tsquery	real
+3711	tsvector	tsvector	integer
+3713	parser_oid oid, OUT tokid integer, OUT alias text, OUT description text	parser_oid oid, OUT tokid integer, OUT alias text, OUT description text	SETOF record
+3714	parser_name text, OUT tokid integer, OUT alias text, OUT description text	parser_name text, OUT tokid integer, OUT alias text, OUT description text	SETOF record
+3715	parser_oid oid, txt text, OUT tokid integer, OUT token text	parser_oid oid, txt text, OUT tokid integer, OUT token text	SETOF record
+3716	parser_name text, txt text, OUT tokid integer, OUT token text	parser_name text, txt text, OUT tokid integer, OUT token text	SETOF record
+3717	internal, integer	internal, integer	internal
+3718	internal, internal, internal	internal, internal, internal	internal
+3719	internal	internal	void
+3720	internal, internal, tsquery	internal, internal, tsquery	internal
+3721	internal	internal	internal
+3723	regdictionary, text	regdictionary, text	text[]
+3724	text, text	text, text	integer
+3725	internal	internal	internal
+3726	internal, internal, internal, internal	internal, internal, internal, internal	internal
+3728	internal	internal	internal
+3729	internal, internal, internal, internal	internal, internal, internal, internal	internal
+3731	internal	internal	internal
+3732	internal, internal, internal, internal	internal, internal, internal, internal	internal
+3736	cstring	cstring	regconfig
+3737	regconfig	regconfig	cstring
+3738	internal	internal	regconfig
+3739	regconfig	regconfig	bytea
+3740	internal	internal	internal
+3741	internal, internal, internal, internal	internal, internal, internal, internal	internal
+3743	regconfig, text, tsquery, text	regconfig, text, tsquery, text	text
+3744	regconfig, text, tsquery	regconfig, text, tsquery	text
+3745	regconfig, text	regconfig, text	tsvector
+3746	regconfig, text	regconfig, text	tsquery
+3747	regconfig, text	regconfig, text	tsquery
+3749	text	text	tsvector
+3750	text	text	tsquery
+3751	text	text	tsquery
+3752			trigger
+3753			trigger
+3754	text, tsquery, text	text, tsquery, text	text
+3755	text, tsquery	text, tsquery	text
+3756	oid	oid	boolean
+3757	oid	oid	boolean
+3758	oid	oid	boolean
+3759			regconfig
+3760	text, text	text, text	boolean
+3761	text, tsquery	text, tsquery	boolean
+3768	oid	oid	boolean
+3771	cstring	cstring	regdictionary
+3772	regdictionary	regdictionary	cstring
+3773	internal	internal	regdictionary
+3774	regdictionary	regdictionary	bytea
+3775	text	text	void
+3776	oid	oid	void
+3777	oid	oid	void
+3778	oid	oid	text
+3779	slot_name name, immediately_reserve boolean DEFAULT false, temporary boolean DEFAULT false, OUT slot_name name, OUT lsn pg_lsn	slot_name name, immediately_reserve boolean, temporary boolean, OUT slot_name name, OUT lsn pg_lsn	record
+3780	name	name	void
+3781	OUT slot_name name, OUT plugin name, OUT slot_type text, OUT datoid oid, OUT temporary boolean, OUT active boolean, OUT active_pid integer, OUT xmin xid, OUT catalog_xmin xid, OUT restart_lsn pg_lsn, OUT confirmed_flush_lsn pg_lsn, OUT wal_status text, OUT safe_wal_size bigint, OUT two_phase boolean	OUT slot_name name, OUT plugin name, OUT slot_type text, OUT datoid oid, OUT temporary boolean, OUT active boolean, OUT active_pid integer, OUT xmin xid, OUT catalog_xmin xid, OUT restart_lsn pg_lsn, OUT confirmed_flush_lsn pg_lsn, OUT wal_status text, OUT safe_wal_size bigint, OUT two_phase boolean	SETOF record
+3782	slot_name name, upto_lsn pg_lsn, upto_nchanges integer, VARIADIC options text[] DEFAULT '{}'::text[], OUT lsn pg_lsn, OUT xid xid, OUT data text	slot_name name, upto_lsn pg_lsn, upto_nchanges integer, VARIADIC options text[], OUT lsn pg_lsn, OUT xid xid, OUT data text	SETOF record
+3783	slot_name name, upto_lsn pg_lsn, upto_nchanges integer, VARIADIC options text[] DEFAULT '{}'::text[], OUT lsn pg_lsn, OUT xid xid, OUT data bytea	slot_name name, upto_lsn pg_lsn, upto_nchanges integer, VARIADIC options text[], OUT lsn pg_lsn, OUT xid xid, OUT data bytea	SETOF record
+3784	slot_name name, upto_lsn pg_lsn, upto_nchanges integer, VARIADIC options text[] DEFAULT '{}'::text[], OUT lsn pg_lsn, OUT xid xid, OUT data text	slot_name name, upto_lsn pg_lsn, upto_nchanges integer, VARIADIC options text[], OUT lsn pg_lsn, OUT xid xid, OUT data text	SETOF record
+3785	slot_name name, upto_lsn pg_lsn, upto_nchanges integer, VARIADIC options text[] DEFAULT '{}'::text[], OUT lsn pg_lsn, OUT xid xid, OUT data bytea	slot_name name, upto_lsn pg_lsn, upto_nchanges integer, VARIADIC options text[], OUT lsn pg_lsn, OUT xid xid, OUT data bytea	SETOF record
+3786	slot_name name, plugin name, temporary boolean DEFAULT false, twophase boolean DEFAULT false, OUT slot_name name, OUT lsn pg_lsn	slot_name name, plugin name, temporary boolean, twophase boolean, OUT slot_name name, OUT lsn pg_lsn	record
+3787	anyelement	anyelement	jsonb
+3788			timestamp with time zone
+3789	regclass	regclass	bigint
+3790	internal, gtsvector, integer, oid, internal	internal, gtsvector, integer, oid, internal	boolean
+3791	tsquery, internal, smallint, internal, internal, internal, internal	tsquery, internal, smallint, internal, internal, internal, internal	internal
+3792	internal, smallint, tsquery, integer, internal, internal, internal, internal	internal, smallint, tsquery, integer, internal, internal, internal, internal	boolean
+3793	internal, internal, integer, oid, internal	internal, internal, integer, oid, internal	boolean
+3795	internal, internal	internal, internal	void
+3796	internal, internal	internal, internal	void
+3797	internal, internal	internal, internal	void
+3798	internal, internal	internal, internal	void
+3799	internal, internal	internal, internal	boolean
+3800			text
+3801	text	text	text
+3803	jsonb	jsonb	bytea
+3804	jsonb	jsonb	cstring
+3805	internal	internal	jsonb
+3806	cstring	cstring	jsonb
+3808	oid, integer	oid, integer	text
+3809			text
+3810			boolean
+3811	integer	integer	money
+3812	bigint	bigint	money
+3815	oid	oid	boolean
+3816	internal	internal	boolean
+3817	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+3818	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+3819	multixid xid, OUT xid xid, OUT mode text	multixid xid, OUT xid xid, OUT mode text	SETOF record
+3820			pg_lsn
+3821			pg_lsn
+3822	money, money	money, money	double precision
+3823	money	money	numeric
+3824	numeric	numeric	money
+3826	text	text	text
+3827	text, bigint, bigint	text, bigint, bigint	bytea
+3828	text	text	bytea
+3829	oid	oid	boolean
+3830			timestamp with time zone
+3832	cstring, oid, integer	cstring, oid, integer	anyrange
+3833	anyrange	anyrange	cstring
+3834	cstring, oid, integer	cstring, oid, integer	anyrange
+3835	anyrange	anyrange	cstring
+3836	internal, oid, integer	internal, oid, integer	anyrange
+3837	anyrange	anyrange	bytea
+3839	classid oid, objid oid, objsubid integer, OUT type text, OUT schema text, OUT name text, OUT identity text	classid oid, objid oid, objsubid integer, OUT type text, OUT schema text, OUT name text, OUT identity text	record
+3840	integer, integer	integer, integer	int4range
+3841	integer, integer, text	integer, integer, text	int4range
+3842	regclass, boolean	regclass, boolean	integer
+3843	regclass, smallint, boolean	regclass, smallint, boolean	boolean
+3844	numeric, numeric	numeric, numeric	numrange
+3845	numeric, numeric, text	numeric, numeric, text	numrange
+3846	year integer, month integer, day integer	year integer, month integer, day integer	date
+3847	hour integer, min integer, sec double precision	hour integer, min integer, sec double precision	time without time zone
+3848	anyrange	anyrange	anyelement
+3849	anyrange	anyrange	anyelement
+3850	anyrange	anyrange	boolean
+3851	anyrange	anyrange	boolean
+3852	anyrange	anyrange	boolean
+3853	anyrange	anyrange	boolean
+3854	anyrange	anyrange	boolean
+3855	anyrange, anyrange	anyrange, anyrange	boolean
+3856	anyrange, anyrange	anyrange, anyrange	boolean
+3857	anyrange, anyrange	anyrange, anyrange	boolean
+3858	anyrange, anyelement	anyrange, anyelement	boolean
+3859	anyrange, anyrange	anyrange, anyrange	boolean
+3860	anyelement, anyrange	anyelement, anyrange	boolean
+3861	anyrange, anyrange	anyrange, anyrange	boolean
+3862	anyrange, anyrange	anyrange, anyrange	boolean
+3863	anyrange, anyrange	anyrange, anyrange	boolean
+3864	anyrange, anyrange	anyrange, anyrange	boolean
+3865	anyrange, anyrange	anyrange, anyrange	boolean
+3866	anyrange, anyrange	anyrange, anyrange	boolean
+3867	anyrange, anyrange	anyrange, anyrange	anyrange
+3868	anyrange, anyrange	anyrange, anyrange	anyrange
+3869	anyrange, anyrange	anyrange, anyrange	anyrange
+3870	anyrange, anyrange	anyrange, anyrange	integer
+3871	anyrange, anyrange	anyrange, anyrange	boolean
+3872	anyrange, anyrange	anyrange, anyrange	boolean
+3873	anyrange, anyrange	anyrange, anyrange	boolean
+3874	anyrange, anyrange	anyrange, anyrange	boolean
+3875	internal, anyrange, smallint, oid, internal	internal, anyrange, smallint, oid, internal	boolean
+3876	internal, internal	internal, internal	anyrange
+3878	slot_name name, upto_lsn pg_lsn, OUT slot_name name, OUT end_lsn pg_lsn	slot_name name, upto_lsn pg_lsn, OUT slot_name name, OUT end_lsn pg_lsn	record
+3879	internal, internal, internal	internal, internal, internal	internal
+3880	internal, internal	internal, internal	internal
+3881	anyrange, anyrange, internal	anyrange, anyrange, internal	internal
+3902	anyrange	anyrange	integer
+3914	int4range	int4range	int4range
+3915	daterange	daterange	daterange
+3916	internal	internal	boolean
+3917	internal	internal	internal
+3918	internal	internal	internal
+3920	internal, smallint, anyarray, integer, internal, internal, internal	internal, smallint, anyarray, integer, internal, internal, internal	"char"
+3921	internal, smallint, tsvector, integer, internal, internal, internal	internal, smallint, tsvector, integer, internal, internal, internal	"char"
+3922	integer, integer	integer, integer	double precision
+3923	bigint, bigint	bigint, bigint	double precision
+3924	numeric, numeric	numeric, numeric	double precision
+3925	date, date	date, date	double precision
+3928	int8range	int8range	int8range
+3929	timestamp without time zone, timestamp without time zone	timestamp without time zone, timestamp without time zone	double precision
+3930	timestamp with time zone, timestamp with time zone	timestamp with time zone, timestamp with time zone	double precision
+3931	jsonb	jsonb	SETOF text
+3932	from_json jsonb, OUT key text, OUT value text	from_json jsonb, OUT key text, OUT value text	SETOF record
+3933	timestamp without time zone, timestamp without time zone	timestamp without time zone, timestamp without time zone	tsrange
+3934	timestamp without time zone, timestamp without time zone, text	timestamp without time zone, timestamp without time zone, text	tsrange
+3935	interval	interval	void
+3936	timestamp with time zone	timestamp with time zone	void
+3937	timestamp with time zone, timestamp with time zone	timestamp with time zone, timestamp with time zone	tstzrange
+3938	timestamp with time zone, timestamp with time zone, text	timestamp with time zone, timestamp with time zone, text	tstzrange
+3939	xid	xid	integer
+3940	from_json jsonb, VARIADIC path_elems text[]	from_json jsonb, VARIADIC path_elems text[]	text
+3941	date, date	date, date	daterange
+3942	date, date, text	date, date, text	daterange
+3943	"char", oid	"char", oid	aclitem[]
+3944	internal	internal	internal
+3945	bigint, bigint	bigint, bigint	int8range
+3946	bigint, bigint, text	bigint, bigint, text	int8range
+3947	from_json json, field_name text	from_json json, field_name text	json
+3948	from_json json, field_name text	from_json json, field_name text	text
+3949	from_json json, element_index integer	from_json json, element_index integer	json
+3950	from_json json, element_index integer	from_json json, element_index integer	text
+3951	from_json json, VARIADIC path_elems text[]	from_json json, VARIADIC path_elems text[]	json
+3952	regclass	regclass	integer
+3953	from_json json, VARIADIC path_elems text[]	from_json json, VARIADIC path_elems text[]	text
+3954	type text, object_names text[], object_args text[], OUT classid oid, OUT objid oid, OUT objsubid integer	type text, object_names text[], object_args text[], OUT classid oid, OUT objid oid, OUT objsubid integer	record
+3955	from_json json, OUT value json	from_json json, OUT value json	SETOF json
+3956	json	json	integer
+3957	json	json	SETOF text
+3958	from_json json, OUT key text, OUT value json	from_json json, OUT key text, OUT value json	SETOF record
+3959	from_json json, OUT key text, OUT value text	from_json json, OUT key text, OUT value text	SETOF record
+3960	base anyelement, from_json json, use_json_as_text boolean DEFAULT false	base anyelement, from_json json, use_json_as_text boolean	anyelement
+3961	base anyelement, from_json json, use_json_as_text boolean DEFAULT false	base anyelement, from_json json, use_json_as_text boolean	SETOF anyelement
+3968	json	json	text
+3969	from_json json, OUT value text	from_json json, OUT value text	SETOF text
+3970	internal, "any"	internal, "any"	internal
+3971	internal, VARIADIC "any"	internal, VARIADIC "any"	internal
+3972	double precision ORDER BY anyelement	double precision ORDER BY anyelement	anyelement
+3973	internal, double precision, anyelement	internal, double precision, anyelement	anyelement
+3974	double precision ORDER BY double precision	double precision ORDER BY double precision	double precision
+3975	internal, double precision	internal, double precision	double precision
+3976	double precision ORDER BY interval	double precision ORDER BY interval	interval
+3977	internal, double precision	internal, double precision	interval
+3978	double precision[] ORDER BY anyelement	double precision[] ORDER BY anyelement	anyarray
+3979	internal, double precision[], anyelement	internal, double precision[], anyelement	anyarray
+3980	double precision[] ORDER BY double precision	double precision[] ORDER BY double precision	double precision[]
+3981	internal, double precision[]	internal, double precision[]	double precision[]
+3982	double precision[] ORDER BY interval	double precision[] ORDER BY interval	interval[]
+3983	internal, double precision[]	internal, double precision[]	interval[]
+3984	ORDER BY anyelement	ORDER BY anyelement	anyelement
+3985	internal, anyelement	internal, anyelement	anyelement
+3986	VARIADIC "any" ORDER BY VARIADIC "any"	VARIADIC "any" ORDER BY VARIADIC "any"	bigint
+3987	internal, VARIADIC "any"	internal, VARIADIC "any"	bigint
+3988	VARIADIC "any" ORDER BY VARIADIC "any"	VARIADIC "any" ORDER BY VARIADIC "any"	double precision
+3989	internal, VARIADIC "any"	internal, VARIADIC "any"	double precision
+3990	VARIADIC "any" ORDER BY VARIADIC "any"	VARIADIC "any" ORDER BY VARIADIC "any"	double precision
+3991	internal, VARIADIC "any"	internal, VARIADIC "any"	double precision
+3992	VARIADIC "any" ORDER BY VARIADIC "any"	VARIADIC "any" ORDER BY VARIADIC "any"	bigint
+3993	internal, VARIADIC "any"	internal, VARIADIC "any"	bigint
+3994	internal	internal	internal
+3995	internal	internal	internal
+3996	internal	internal	internal
+3998	internal, box, smallint, oid, internal	internal, box, smallint, oid, internal	double precision
+3999	regclass, bigint	regclass, bigint	integer
+4001	cstring	cstring	jsonpath
+4002	internal	internal	jsonpath
+4003	jsonpath	jsonpath	cstring
+4004	jsonpath	jsonpath	bytea
+4005	target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false	target jsonb, path jsonpath, vars jsonb, silent boolean	boolean
+4006	target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false	target jsonb, path jsonpath, vars jsonb, silent boolean	SETOF jsonb
+4007	target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false	target jsonb, path jsonpath, vars jsonb, silent boolean	jsonb
+4008	target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false	target jsonb, path jsonpath, vars jsonb, silent boolean	jsonb
+4009	target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false	target jsonb, path jsonpath, vars jsonb, silent boolean	boolean
+4010	jsonb, jsonpath	jsonb, jsonpath	boolean
+4011	jsonb, jsonpath	jsonb, jsonpath	boolean
+4014	regclass, bigint	regclass, bigint	void
+4018	internal, internal	internal, internal	void
+4019	internal, internal	internal, internal	void
+4020	internal, internal	internal, internal	void
+4021	internal, internal	internal, internal	void
+4022	internal, internal	internal, internal	boolean
+4023	internal, internal	internal, internal	void
+4024	internal, internal	internal, internal	void
+4025	internal, internal	internal, internal	void
+4026	internal, internal	internal, internal	void
+4027	internal, internal	internal, internal	void
+4028	internal, internal	internal, internal	void
+4029	internal, internal	internal, internal	void
+4030	internal, internal	internal, internal	void
+4031	internal, internal	internal, internal	boolean
+4032	regclass	regclass	bigint
+4038	jsonb, jsonb	jsonb, jsonb	boolean
+4039	jsonb, jsonb	jsonb, jsonb	boolean
+4040	jsonb, jsonb	jsonb, jsonb	boolean
+4041	jsonb, jsonb	jsonb, jsonb	boolean
+4042	jsonb, jsonb	jsonb, jsonb	boolean
+4043	jsonb, jsonb	jsonb, jsonb	boolean
+4044	jsonb, jsonb	jsonb, jsonb	integer
+4045	jsonb	jsonb	integer
+4046	jsonb, jsonb	jsonb, jsonb	boolean
+4047	jsonb, text	jsonb, text	boolean
+4048	jsonb, text[]	jsonb, text[]	boolean
+4049	jsonb, text[]	jsonb, text[]	boolean
+4050	jsonb, jsonb	jsonb, jsonb	boolean
+4051	internal, anyarray	internal, anyarray	internal
+4052	internal, anyarray	internal, anyarray	anyarray
+4053	anyarray	anyarray	anyarray
+4057	anyrange, anyrange	anyrange, anyrange	anyrange
+4063	inet, inet	inet, inet	cidr
+4067	box, box	box, box	box
+4071	inet, inet	inet, inet	boolean
+4083	boolean	boolean	void
+4084	cstring	cstring	regnamespace
+4085	regnamespace	regnamespace	cstring
+4086	text	text	regnamespace
+4087	internal	internal	regnamespace
+4088	regnamespace	regnamespace	bytea
+4091	point	point	box
+4092	regrole	regrole	cstring
+4093	text	text	regrole
+4094	internal	internal	regrole
+4095	regrole	regrole	bytea
+4098	cstring	cstring	regrole
+4099			boolean
+4100	text, bigint, bigint	text, bigint, bigint	text
+4101	oid, text, text	oid, text, text	void
+4105	internal	internal	internal
+4106	internal, internal, internal, internal	internal, internal, internal, internal	boolean
+4107	internal, internal, internal	internal, internal, internal	boolean
+4108	internal, internal, internal	internal, internal, internal	boolean
+4110	cstring	cstring	macaddr8
+4111	macaddr8	macaddr8	cstring
+4112	macaddr8	macaddr8	macaddr8
+4113	macaddr8, macaddr8	macaddr8, macaddr8	boolean
+4114	macaddr8, macaddr8	macaddr8, macaddr8	boolean
+4115	macaddr8, macaddr8	macaddr8, macaddr8	boolean
+4116	macaddr8, macaddr8	macaddr8, macaddr8	boolean
+4117	macaddr8, macaddr8	macaddr8, macaddr8	boolean
+4118	macaddr8, macaddr8	macaddr8, macaddr8	boolean
+4119	macaddr8, macaddr8	macaddr8, macaddr8	integer
+4120	macaddr8	macaddr8	macaddr8
+4121	macaddr8, macaddr8	macaddr8, macaddr8	macaddr8
+4122	macaddr8, macaddr8	macaddr8, macaddr8	macaddr8
+4123	macaddr	macaddr	macaddr8
+4124	macaddr8	macaddr8	macaddr
+4125	macaddr8	macaddr8	macaddr8
+4126	bigint, bigint, bigint, boolean, boolean	bigint, bigint, bigint, boolean, boolean	boolean
+4127	integer, integer, bigint, boolean, boolean	integer, integer, bigint, boolean, boolean	boolean
+4128	integer, integer, integer, boolean, boolean	integer, integer, integer, boolean, boolean	boolean
+4129	integer, integer, smallint, boolean, boolean	integer, integer, smallint, boolean, boolean	boolean
+4130	smallint, smallint, bigint, boolean, boolean	smallint, smallint, bigint, boolean, boolean	boolean
+4131	smallint, smallint, integer, boolean, boolean	smallint, smallint, integer, boolean, boolean	boolean
+4132	smallint, smallint, smallint, boolean, boolean	smallint, smallint, smallint, boolean, boolean	boolean
+4133	date, date, interval, boolean, boolean	date, date, interval, boolean, boolean	boolean
+4134	timestamp without time zone, timestamp without time zone, interval, boolean, boolean	timestamp without time zone, timestamp without time zone, interval, boolean, boolean	boolean
+4135	timestamp with time zone, timestamp with time zone, interval, boolean, boolean	timestamp with time zone, timestamp with time zone, interval, boolean, boolean	boolean
+4136	interval, interval, interval, boolean, boolean	interval, interval, interval, boolean, boolean	boolean
+4137	time without time zone, time without time zone, interval, boolean, boolean	time without time zone, time without time zone, interval, boolean, boolean	boolean
+4138	time with time zone, time with time zone, interval, boolean, boolean	time with time zone, time with time zone, interval, boolean, boolean	boolean
+4139	double precision, double precision, double precision, boolean, boolean	double precision, double precision, double precision, boolean, boolean	boolean
+4140	real, real, double precision, boolean, boolean	real, real, double precision, boolean, boolean	boolean
+4141	numeric, numeric, numeric, boolean, boolean	numeric, numeric, numeric, boolean, boolean	boolean
+4187	pg_lsn, pg_lsn	pg_lsn, pg_lsn	pg_lsn
+4188	pg_lsn, pg_lsn	pg_lsn, pg_lsn	pg_lsn
+4189	pg_lsn	pg_lsn	pg_lsn
+4190	pg_lsn	pg_lsn	pg_lsn
+4193	cstring	cstring	regcollation
+4194	regcollation	regcollation	cstring
+4195	text	text	regcollation
+4196	internal	internal	regcollation
+4197	regcollation	regcollation	bytea
+4201	regconfig, jsonb, tsquery, text	regconfig, jsonb, tsquery, text	jsonb
+4202	regconfig, jsonb, tsquery	regconfig, jsonb, tsquery	jsonb
+4203	jsonb, tsquery, text	jsonb, tsquery, text	jsonb
+4204	jsonb, tsquery	jsonb, tsquery	jsonb
+4205	regconfig, json, tsquery, text	regconfig, json, tsquery, text	json
+4206	regconfig, json, tsquery	regconfig, json, tsquery	json
+4207	json, tsquery, text	json, tsquery, text	json
+4208	json, tsquery	json, tsquery	json
+4209	jsonb	jsonb	tsvector
+4210	json	json	tsvector
+4211	regconfig, jsonb	regconfig, jsonb	tsvector
+4212	regconfig, json	regconfig, json	tsvector
+4213	jsonb, jsonb	jsonb, jsonb	tsvector
+4214	regconfig, jsonb, jsonb	regconfig, jsonb, jsonb	tsvector
+4215	json, jsonb	json, jsonb	tsvector
+4216	regconfig, json, jsonb	regconfig, json, jsonb	tsvector
+4220	src_slot_name name, dst_slot_name name, temporary boolean, OUT slot_name name, OUT lsn pg_lsn	src_slot_name name, dst_slot_name name, temporary boolean, OUT slot_name name, OUT lsn pg_lsn	record
+4221	src_slot_name name, dst_slot_name name, OUT slot_name name, OUT lsn pg_lsn	src_slot_name name, dst_slot_name name, OUT slot_name name, OUT lsn pg_lsn	record
+4222	src_slot_name name, dst_slot_name name, temporary boolean, plugin name, OUT slot_name name, OUT lsn pg_lsn	src_slot_name name, dst_slot_name name, temporary boolean, plugin name, OUT slot_name name, OUT lsn pg_lsn	record
+4223	src_slot_name name, dst_slot_name name, temporary boolean, OUT slot_name name, OUT lsn pg_lsn	src_slot_name name, dst_slot_name name, temporary boolean, OUT slot_name name, OUT lsn pg_lsn	record
+4224	src_slot_name name, dst_slot_name name, OUT slot_name name, OUT lsn pg_lsn	src_slot_name name, dst_slot_name name, OUT slot_name name, OUT lsn pg_lsn	record
+4226	cstring, oid, integer	cstring, oid, integer	anycompatiblemultirange
+4227	anycompatiblemultirange	anycompatiblemultirange	cstring
+4228	anymultirange	anymultirange	anyrange
+4229	cstring, oid, integer	cstring, oid, integer	anymultirange
+4230	anymultirange	anymultirange	cstring
+4231	cstring, oid, integer	cstring, oid, integer	anymultirange
+4232	anymultirange	anymultirange	cstring
+4233	internal, oid, integer	internal, oid, integer	anymultirange
+4234	anymultirange	anymultirange	bytea
+4235	anymultirange	anymultirange	anyelement
+4236	anymultirange	anymultirange	anyelement
+4237	anymultirange	anymultirange	boolean
+4238	anymultirange	anymultirange	boolean
+4239	anymultirange	anymultirange	boolean
+4240	anymultirange	anymultirange	boolean
+4241	anymultirange	anymultirange	boolean
+4242	internal	internal	boolean
+4243	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+4244	anymultirange, anymultirange	anymultirange, anymultirange	boolean
+4245	anymultirange, anymultirange	anymultirange, anymultirange	boolean
+4246	anyrange, anymultirange	anyrange, anymultirange	boolean
+4247	anymultirange, anyrange	anymultirange, anyrange	boolean
+4248	anymultirange, anymultirange	anymultirange, anymultirange	boolean
+4249	anymultirange, anyelement	anymultirange, anyelement	boolean
+4250	anymultirange, anyrange	anymultirange, anyrange	boolean
+4251	anymultirange, anymultirange	anymultirange, anymultirange	boolean
+4252	anyelement, anymultirange	anyelement, anymultirange	boolean
+4253	anyrange, anymultirange	anyrange, anymultirange	boolean
+4254	anymultirange, anymultirange	anymultirange, anymultirange	boolean
+4255	anyrange, anymultirange	anyrange, anymultirange	boolean
+4256	anymultirange, anymultirange	anymultirange, anymultirange	boolean
+4257	anymultirange, anyrange	anymultirange, anyrange	boolean
+4258	anyrange, anymultirange	anyrange, anymultirange	boolean
+4259	anymultirange, anyrange	anymultirange, anyrange	boolean
+4260	anymultirange, anymultirange	anymultirange, anymultirange	boolean
+4261	anyrange, anymultirange	anyrange, anymultirange	boolean
+4262	anymultirange, anyrange	anymultirange, anyrange	boolean
+4263	anymultirange, anymultirange	anymultirange, anymultirange	boolean
+4264	anyrange, anymultirange	anyrange, anymultirange	boolean
+4265	anymultirange, anyrange	anymultirange, anyrange	boolean
+4266	anymultirange, anymultirange	anymultirange, anymultirange	boolean
+4267	anyrange, anymultirange	anyrange, anymultirange	boolean
+4268	anymultirange, anyrange	anymultirange, anyrange	boolean
+4269	anymultirange, anymultirange	anymultirange, anymultirange	boolean
+4270	anymultirange, anymultirange	anymultirange, anymultirange	anymultirange
+4271	anymultirange, anymultirange	anymultirange, anymultirange	anymultirange
+4272	anymultirange, anymultirange	anymultirange, anymultirange	anymultirange
+4273	anymultirange, anymultirange	anymultirange, anymultirange	integer
+4274	anymultirange, anymultirange	anymultirange, anymultirange	boolean
+4275	anymultirange, anymultirange	anymultirange, anymultirange	boolean
+4276	anymultirange, anymultirange	anymultirange, anymultirange	boolean
+4277	anymultirange, anymultirange	anymultirange, anymultirange	boolean
+4278	anymultirange	anymultirange	integer
+4279	anymultirange, bigint	anymultirange, bigint	bigint
+4280			int4multirange
+4281	int4range	int4range	int4multirange
+4282	VARIADIC int4range[]	VARIADIC int4range[]	int4multirange
+4283			nummultirange
+4284	numrange	numrange	nummultirange
+4285	VARIADIC numrange[]	VARIADIC numrange[]	nummultirange
+4286			tsmultirange
+4287	tsrange	tsrange	tsmultirange
+4288	VARIADIC tsrange[]	VARIADIC tsrange[]	tsmultirange
+4289			tstzmultirange
+4290	tstzrange	tstzrange	tstzmultirange
+4291	VARIADIC tstzrange[]	VARIADIC tstzrange[]	tstzmultirange
+4292			datemultirange
+4293	daterange	daterange	datemultirange
+4294	VARIADIC daterange[]	VARIADIC daterange[]	datemultirange
+4295			int8multirange
+4296	int8range	int8range	int8multirange
+4297	VARIADIC int8range[]	VARIADIC int8range[]	int8multirange
+4298	anyrange	anyrange	anymultirange
+4299	internal, anyrange	internal, anyrange	internal
+4300	internal, anyrange	internal, anyrange	anymultirange
+4301	anyrange	anyrange	anymultirange
+4302	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4303	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4304	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4305	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4306	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4307	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4308	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4309	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4310	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4311	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4312	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4313	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4314	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4315	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4316	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4317	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4318	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4319	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4320	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4321	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4322	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4323	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4324	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4325	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4326	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4327	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4328	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4329	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4330	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4331	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4332	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4333	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4334	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4335	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4336	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4337	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4338	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4339	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4340	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4341	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4342	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4343	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4344	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4345	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4346	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4347	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4348	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4349	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4350	text, text DEFAULT 'NFC'::text	text, text	text
+4351	text, text DEFAULT 'NFC'::text	text, text	boolean
+4352	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4353	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4354	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4355	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4356	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4357	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4358	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4359	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4360	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4361	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4362	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4363	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4364	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4365	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4366	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4367	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4368	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4369	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4370	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4371	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4372	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4373	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4374	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4375	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4376	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4377	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4378	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4379	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4380	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4381	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4382	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4383	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4384	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4385	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4386	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4387	integer, integer, cstring, internal, integer, boolean	integer, integer, cstring, internal, integer, boolean	integer
+4388	anymultirange, anymultirange	anymultirange, anymultirange	anymultirange
+4389	anymultirange	anymultirange	anymultirange
+4390	oid	oid	void
+4391	oid	oid	void
+4401	anyrange, anyrange	anyrange, anyrange	anyrange
+4450	anyrange	anyrange	anyrange
+4541	anyrange, anymultirange	anyrange, anymultirange	boolean
+4542	anymultirange, anyrange	anymultirange, anyrange	boolean
+4543	integer	integer	boolean
+4545	oid	oid	void
+4546	oid	oid	void
+4547	oid	oid	void
+4548	oid	oid	void
+4566	OUT oid oid	OUT oid oid	oid
+4567			integer
+4568	OUT classid oid, OUT objid oid, OUT objsubid integer, OUT command_tag text, OUT object_type text, OUT schema_name text, OUT object_identity text, OUT in_extension boolean, OUT command pg_ddl_command	OUT classid oid, OUT objid oid, OUT objsubid integer, OUT command_tag text, OUT object_type text, OUT schema_name text, OUT object_identity text, OUT in_extension boolean, OUT command pg_ddl_command	SETOF record
+4591	internal	internal	internal
+4592	internal, internal, internal, internal	internal, internal, internal, internal	boolean
+4593	internal, internal, internal, integer	internal, internal, internal, integer	boolean
+4594	internal, internal, internal	internal, internal, internal	boolean
+4595	internal	internal	void
+4596	cstring	cstring	pg_brin_bloom_summary
+4597	pg_brin_bloom_summary	pg_brin_bloom_summary	cstring
+4598	internal	internal	pg_brin_bloom_summary
+4599	pg_brin_bloom_summary	pg_brin_bloom_summary	bytea
+4616	internal	internal	internal
+4617	internal, internal, internal, internal	internal, internal, internal, internal	boolean
+4618	internal, internal, internal, integer	internal, internal, internal, integer	boolean
+4619	internal, internal, internal	internal, internal, internal	boolean
+4620	internal	internal	void
+4621	internal, internal	internal, internal	double precision
+4622	internal, internal	internal, internal	double precision
+4623	internal, internal	internal, internal	double precision
+4624	internal, internal	internal, internal	double precision
+4625	internal, internal	internal, internal	double precision
+4626	internal, internal	internal, internal	double precision
+4627	internal, internal	internal, internal	double precision
+4628	internal, internal	internal, internal	double precision
+4629	internal, internal	internal, internal	double precision
+4630	internal, internal	internal, internal	double precision
+4631	internal, internal	internal, internal	double precision
+4632	internal, internal	internal, internal	double precision
+4633	internal, internal	internal, internal	double precision
+4634	internal, internal	internal, internal	double precision
+4635	internal, internal	internal, internal	double precision
+4636	internal, internal	internal, internal	double precision
+4637	internal, internal	internal, internal	double precision
+4638	cstring	cstring	pg_brin_minmax_multi_summary
+4639	pg_brin_minmax_multi_summary	pg_brin_minmax_multi_summary	cstring
+4640	internal	internal	pg_brin_minmax_multi_summary
+4641	pg_brin_minmax_multi_summary	pg_brin_minmax_multi_summary	bytea
+5001	text	text	tsquery
+5003	tsquery, tsquery	tsquery, tsquery	tsquery
+5004	tsquery, tsquery, integer	tsquery, tsquery, integer	tsquery
+5006	regconfig, text	regconfig, text	tsquery
+5007	regconfig, text	regconfig, text	tsquery
+5009	text	text	tsquery
+5010	internal, internal	internal, internal	void
+5011	polygon	polygon	box
+5012	internal, internal	internal, internal	void
+5013	internal, internal	internal, internal	void
+5014	internal, internal	internal, internal	void
+5015	internal, internal	internal, internal	void
+5016	internal, internal	internal, internal	boolean
+5018	cstring	cstring	pg_mcv_list
+5019	pg_mcv_list	pg_mcv_list	cstring
+5020	internal	internal	pg_mcv_list
+5021	pg_mcv_list	pg_mcv_list	bytea
+5022	pg_lsn, numeric	pg_lsn, numeric	pg_lsn
+5023	numeric, pg_lsn	numeric, pg_lsn	pg_lsn
+5024	pg_lsn, numeric	pg_lsn, numeric	pg_lsn
+5028	oid, integer, integer, VARIADIC "any"	oid, integer, integer, VARIADIC "any"	boolean
+5029	OUT name text, OUT size bigint, OUT modification timestamp with time zone	OUT name text, OUT size bigint, OUT modification timestamp with time zone	SETOF record
+5030	tablespace oid, OUT name text, OUT size bigint, OUT modification timestamp with time zone	tablespace oid, OUT name text, OUT size bigint, OUT modification timestamp with time zone	SETOF record
+5031	OUT name text, OUT size bigint, OUT modification timestamp with time zone	OUT name text, OUT size bigint, OUT modification timestamp with time zone	SETOF record
+5033	internal	internal	void
+5034	xid8, xid8	xid8, xid8	boolean
+5035	xid8, xid8	xid8, xid8	boolean
+5036	xid8, xid8	xid8, xid8	boolean
+5037	xid8, xid8	xid8, xid8	boolean
+5040	internal, oid, internal, integer	internal, oid, internal, integer	double precision
+5041	internal, oid, internal, smallint, internal	internal, oid, internal, smallint, internal	double precision
+5042	numeric	numeric	integer
+5043	numeric	numeric	numeric
+5044	integer, integer	integer, integer	integer
+5045	bigint, bigint	bigint, bigint	bigint
+5046	integer, integer	integer, integer	integer
+5047	bigint, bigint	bigint, bigint	bigint
+5048	numeric, numeric	numeric, numeric	numeric
+5049	numeric, numeric	numeric, numeric	numeric
+5050	oid	oid	boolean
+5051	oid	oid	boolean
+5052	OUT name text, OUT off bigint, OUT size bigint, OUT allocated_size bigint	OUT name text, OUT off bigint, OUT size bigint, OUT allocated_size bigint	SETOF record
+5053	oid	oid	bigint
+5054	jsonb_in jsonb, path text[], replacement jsonb, create_if_missing boolean DEFAULT true, null_value_treatment text DEFAULT 'use_json_null'::text	jsonb_in jsonb, path text[], replacement jsonb, create_if_missing boolean, null_value_treatment text	jsonb
+5055	cstring	cstring	pg_snapshot
+5056	pg_snapshot	pg_snapshot	cstring
+5057	internal	internal	pg_snapshot
+5058	pg_snapshot	pg_snapshot	bytea
+5059			xid8
+5060			xid8
+5061			pg_snapshot
+5062	pg_snapshot	pg_snapshot	xid8
+5063	pg_snapshot	pg_snapshot	xid8
+5064	pg_snapshot	pg_snapshot	SETOF xid8
+5065	xid8, pg_snapshot	xid8, pg_snapshot	boolean
+5066	xid8	xid8	text
+5070	cstring	cstring	xid8
+5071	xid8	xid8	xid
+5081	xid8	xid8	cstring
+5082	internal	internal	xid8
+5083	xid8	xid8	bytea
+5084	xid8, xid8	xid8, xid8	boolean
+5085	xid8, xid8	xid8, xid8	boolean
+5086	cstring	cstring	anycompatible
+5087	anycompatible	anycompatible	cstring
+5088	cstring	cstring	anycompatiblearray
+5089	anycompatiblearray	anycompatiblearray	cstring
+5090	internal	internal	anycompatiblearray
+5091	anycompatiblearray	anycompatiblearray	bytea
+5092	cstring	cstring	anycompatiblenonarray
+5093	anycompatiblenonarray	anycompatiblenonarray	cstring
+5094	cstring, oid, integer	cstring, oid, integer	anycompatiblerange
+5095	anycompatiblerange	anycompatiblerange	cstring
+5096	xid8, xid8	xid8, xid8	integer
+5097	xid8, xid8	xid8, xid8	xid8
+5098	xid8, xid8	xid8, xid8	xid8
+5099	xid8	xid8	xid8
+5100	xid8	xid8	xid8
+6003	text	text	oid
+6004	text	text	void
+6005	text	text	oid
+6006	text	text	void
+6007			void
+6008			boolean
+6009	boolean	boolean	pg_lsn
+6010	pg_lsn, timestamp with time zone	pg_lsn, timestamp with time zone	void
+6011			void
+6012	text, pg_lsn	text, pg_lsn	void
+6013	text, boolean	text, boolean	pg_lsn
+6014	OUT local_id oid, OUT external_id text, OUT remote_lsn pg_lsn, OUT local_lsn pg_lsn	OUT local_id oid, OUT external_id text, OUT remote_lsn pg_lsn, OUT local_lsn pg_lsn	SETOF record
+6098	internal	internal	internal
+6103	numeric	numeric	pg_lsn
+6118	subid oid, OUT subid oid, OUT relid oid, OUT pid integer, OUT received_lsn pg_lsn, OUT last_msg_send_time timestamp with time zone, OUT last_msg_receipt_time timestamp with time zone, OUT latest_end_lsn pg_lsn, OUT latest_end_time timestamp with time zone	subid oid, OUT subid oid, OUT relid oid, OUT pid integer, OUT received_lsn pg_lsn, OUT last_msg_send_time timestamp with time zone, OUT last_msg_receipt_time timestamp with time zone, OUT latest_end_lsn pg_lsn, OUT latest_end_time timestamp with time zone	SETOF record
+6119	pubname text, OUT relid oid, OUT attrs int2vector, OUT qual pg_node_tree	pubname text, OUT relid oid, OUT attrs int2vector, OUT qual pg_node_tree	SETOF record
+6120	regclass	regclass	regclass
+6121	regclass	regclass	boolean
+6154	internal, anymultirange, smallint, oid, internal	internal, anymultirange, smallint, oid, internal	boolean
+6156	internal	internal	internal
+6159	OUT fktable regclass, OUT fkcols text[], OUT pktable regclass, OUT pkcols text[], OUT is_array boolean, OUT is_opt boolean	OUT fktable regclass, OUT fkcols text[], OUT pktable regclass, OUT pkcols text[], OUT is_array boolean, OUT is_opt boolean	SETOF record
+6160	text, text	text, text	SETOF text
+6161	text, text, text	text, text, text	SETOF text
+6162	bit	bit	bigint
+6163	bytea	bytea	bigint
+6164	smallint	smallint	smallint
+6165	integer	integer	integer
+6166	bigint	bigint	bigint
+6167	bit	bit	bit
+6168	xid xid, OUT "timestamp" timestamp with time zone, OUT roident oid	xid xid, OUT "timestamp" timestamp with time zone, OUT roident oid	record
+6169	slot_name text, OUT slot_name text, OUT spill_txns bigint, OUT spill_count bigint, OUT spill_bytes bigint, OUT stream_txns bigint, OUT stream_count bigint, OUT stream_bytes bigint, OUT total_txns bigint, OUT total_bytes bigint, OUT stats_reset timestamp with time zone	slot_name text, OUT slot_name text, OUT spill_txns bigint, OUT spill_count bigint, OUT spill_bytes bigint, OUT stream_txns bigint, OUT stream_count bigint, OUT stream_bytes bigint, OUT total_txns bigint, OUT total_bytes bigint, OUT stats_reset timestamp with time zone	record
+6170	text	text	void
+6172	anyarray, integer	anyarray, integer	anyarray
+6173	oid	oid	text[]
+6174	oid	oid	text
+6177	interval, timestamp without time zone, timestamp without time zone	interval, timestamp without time zone, timestamp without time zone	timestamp without time zone
+6178	interval, timestamp with time zone, timestamp with time zone	interval, timestamp with time zone, timestamp with time zone	timestamp with time zone
+6179	internal	internal	internal
+6180	internal	internal	internal
+6183	config regconfig, document text, OUT alias text, OUT description text, OUT token text, OUT dictionaries regdictionary[], OUT dictionary regdictionary, OUT lexemes text[]	config regconfig, document text, OUT alias text, OUT description text, OUT token text, OUT dictionaries regdictionary[], OUT dictionary regdictionary, OUT lexemes text[]	SETOF record
+6184	document text, OUT alias text, OUT description text, OUT token text, OUT dictionaries regdictionary[], OUT dictionary regdictionary, OUT lexemes text[]	document text, OUT alias text, OUT description text, OUT token text, OUT dictionaries regdictionary[], OUT dictionary regdictionary, OUT lexemes text[]	SETOF record
+6185	oid	oid	double precision
+6186	oid	oid	double precision
+6187	oid	oid	double precision
+6188	oid	oid	bigint
+6189	oid	oid	bigint
+6190	oid	oid	bigint
+6191	oid	oid	bigint
+6192	record	record	integer
+6193	record, bigint	record, bigint	bigint
+6195	bytea, bytea	bytea, bytea	bytea
+6196	bytea, bytea	bytea, bytea	bytea
+6197	oid	oid	text
+6198	text	text	text
+6199	text, date	text, date	numeric
+6200	text, time without time zone	text, time without time zone	numeric
+6201	text, time with time zone	text, time with time zone	numeric
+6202	text, timestamp without time zone	text, timestamp without time zone	numeric
+6203	text, timestamp with time zone	text, timestamp with time zone	numeric
+6204	text, interval	text, interval	numeric
+6205	name, text, text	name, text, text	boolean
+6206	oid, text, text	oid, text, text	boolean
+6207	text, text	text, text	boolean
+6224	OUT rm_id integer, OUT rm_name text, OUT rm_builtin boolean	OUT rm_id integer, OUT rm_name text, OUT rm_builtin boolean	SETOF record
+6225	internal, anymultirange	internal, anymultirange	internal
+6226	internal, anymultirange	internal, anymultirange	anymultirange
+6227	anymultirange	anymultirange	anymultirange
+6230	text, oid, oid	text, oid, oid	boolean
+6231	subid oid, OUT subid oid, OUT apply_error_count bigint, OUT sync_error_count bigint, OUT stats_reset timestamp with time zone	subid oid, OUT subid oid, OUT apply_error_count bigint, OUT sync_error_count bigint, OUT stats_reset timestamp with time zone	record
+6232	oid	oid	void
+6233	internal	internal	internal
+6234	internal	internal	internal
+6235	internal	internal	internal
+6236	internal	internal	internal
+6240	text	text	text[]
+6241			void
+6242	internal	internal	internal
+6248	OUT stats_reset timestamp with time zone, OUT prefetch bigint, OUT hit bigint, OUT skip_init bigint, OUT skip_new bigint, OUT skip_fpw bigint, OUT skip_rep bigint, OUT wal_distance integer, OUT block_distance integer, OUT io_depth integer	OUT stats_reset timestamp with time zone, OUT prefetch bigint, OUT hit bigint, OUT skip_init bigint, OUT skip_new bigint, OUT skip_fpw bigint, OUT skip_rep bigint, OUT wal_distance integer, OUT block_distance integer, OUT io_depth integer	SETOF record
+6249	oid	oid	text
+6250	OUT line_number integer, OUT map_name text, OUT sys_name text, OUT pg_username text, OUT error text	OUT line_number integer, OUT map_name text, OUT sys_name text, OUT pg_username text, OUT error text	SETOF record
+6251	text, text, text, integer, integer, text	text, text, text, integer, integer, text	text
+6252	text, text, text, integer, integer	text, text, text, integer, integer	text
+6253	text, text, text, integer	text, text, text, integer	text
+6254	text, text	text, text	integer
+6255	text, text, integer	text, text, integer	integer
+6256	text, text, integer, text	text, text, integer, text	integer
+6257	text, text	text, text	integer
+6258	text, text, integer	text, text, integer	integer
+6259	text, text, integer, integer	text, text, integer, integer	integer
+6260	text, text, integer, integer, integer	text, text, integer, integer, integer	integer
+6261	text, text, integer, integer, integer, text	text, text, integer, integer, integer, text	integer
+6262	text, text, integer, integer, integer, text, integer	text, text, integer, integer, integer, text, integer	integer
+6263	text, text	text, text	boolean
+6264	text, text, text	text, text, text	boolean
+6265	text, text	text, text	text
+6266	text, text, integer	text, text, integer	text
+6267	text, text, integer, integer	text, text, integer, integer	text
+6268	text, text, integer, integer, text	text, text, integer, integer, text	text
+6269	text, text, integer, integer, text, integer	text, text, integer, integer, text, integer	text
+6270	OUT name text, OUT size bigint, OUT modification timestamp with time zone	OUT name text, OUT size bigint, OUT modification timestamp with time zone	SETOF record
+6271	OUT name text, OUT size bigint, OUT modification timestamp with time zone	OUT name text, OUT size bigint, OUT modification timestamp with time zone	SETOF record
+6272	slot_name text, OUT name text, OUT size bigint, OUT modification timestamp with time zone	slot_name text, OUT name text, OUT size bigint, OUT modification timestamp with time zone	SETOF record
+13620	internal	internal	internal
+13621	internal, internal, internal, internal	internal, internal, internal, internal	internal
+13680	anyarray, OUT x anyelement, OUT n integer	anyarray, OUT x anyelement, OUT n integer	SETOF record
+13681	oid, smallint	oid, smallint	integer
+13682	pg_attribute, pg_type	pg_attribute, pg_type	oid
+13683	pg_attribute, pg_type	pg_attribute, pg_type	integer
+13684	typid oid, typmod integer	typid oid, typmod integer	integer
+13685	typid oid, typmod integer	typid oid, typmod integer	integer
+13687	typid oid, typmod integer	typid oid, typmod integer	integer
+13688	typid oid, typmod integer	typid oid, typmod integer	integer
+13689	typid oid, typmod integer	typid oid, typmod integer	integer
+13690	typid oid, typmod integer	typid oid, typmod integer	integer
+13691	typid oid, mod integer	typid oid, mod integer	text
+14032			language_handler
+14033	internal	internal	void
+14034	oid	oid	void

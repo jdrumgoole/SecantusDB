@@ -420,6 +420,39 @@ impl PgHandler {
             }
         }
 
+        // plpgsql's members, as a fresh 15.19 database records them: its
+        // handler, inline handler and validator, and the language.
+        for oid in [14032, 14033, 14034] {
+            push(
+                PG_PROC,
+                oid,
+                0,
+                PG_EXTENSION,
+                crate::extension_oid(0),
+                0,
+                "e",
+            );
+        }
+        push(
+            PG_LANGUAGE,
+            14035,
+            0,
+            PG_EXTENSION,
+            crate::extension_oid(0),
+            0,
+            "e",
+        );
+
+        // The rest of each extension's members (RP-105).
+        for (ext, members) in self.extension_members() {
+            if let Some(i) = extensions.iter().position(|(n, _, _)| *n == ext) {
+                // Its types this server makes itself are listed above.
+                for (class, oid) in members {
+                    push(class, oid, 0, PG_EXTENSION, crate::extension_oid(i), 0, "e");
+                }
+            }
+        }
+
         // A range's constructors are part of the type they build (`i`).
         for (oid, _, _, _, owner, _, _) in self.range_constructors() {
             push(PG_PROC, oid, 0, PG_TYPE, owner, 0, "i");

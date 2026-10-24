@@ -199,6 +199,18 @@ fn display_arg(a: &str) -> String {
     crate::display_type(&canonical)
 }
 
+/// Is `word`, alone, one of the grammar's fully reserved keywords?
+fn is_reserved_keyword(word: &str) -> bool {
+    use pg_query::protobuf::KeywordKind;
+    let Ok(scanned) = pg_query::scan(word) else {
+        return false;
+    };
+    matches!(
+        scanned.tokens.as_slice(),
+        [tok] if KeywordKind::try_from(tok.keyword_kind) == Ok(KeywordKind::ReservedKeyword)
+    )
+}
+
 /// `name(args)` split as `parseNameAndArgTypes` reads it: PostgreSQL's
 /// 22P02 `expected a left parenthesis` / `expected a right parenthesis`.
 fn name_and_args(input: &str) -> Result<(String, Vec<String>)> {
@@ -210,6 +222,15 @@ fn name_and_args(input: &str) -> Result<(String, Vec<String>)> {
         .trim_end()
         .strip_suffix(')')
         .ok_or_else(|| Error::Sqlstate("22P02", "expected a right parenthesis".into()))?;
+    // Each argument is a type name, as `parseTypeString` reads it: a fully
+    // reserved word left unquoted (`any`, `table`) is a syntax error there
+    // (RP-232).
+    for a in args.split(',') {
+        let a = a.trim();
+        if !a.starts_with('"') && is_reserved_keyword(a) {
+            return Err(Error::Parse(format!("syntax error at or near \"{a}\"")));
+        }
+    }
     let args = args
         .split(',')
         .map(display_arg)
@@ -354,7 +375,23 @@ pub fn text(kind: &str, oid: i64) -> String {
                 t.borrow()
                     .iter()
                     .find(|(_, o, _)| *o == oid)
-                    .map(|(n, _, args)| format!("{n}({args})"))
+                    .map(|(n, _, args)| {
+                        // `pg_catalog` is searched first: a built-in of the same
+                        // name and arguments hides a public function, which then
+                        // prints qualified (`public.gen_random_uuid()`).
+                        let wanted: Vec<&str> = args.split(',').filter(|a| !a.is_empty()).collect();
+                        let hidden = !n.contains('.')
+                            && builtin_proc_oids(n).iter().any(|b| {
+                                builtin_regprocedures()
+                                    .get(b)
+                                    .is_some_and(|p| p.2.iter().copied().eq(wanted.iter().copied()))
+                            });
+                        if hidden {
+                            format!("public.{n}({args})")
+                        } else {
+                            format!("{n}({args})")
+                        }
+                    })
             })
             .or_else(|| builtin_regprocedures().get(&oid).map(|p| p.0.to_string())),
     };

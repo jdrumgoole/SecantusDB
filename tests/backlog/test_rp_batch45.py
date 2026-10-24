@@ -61,7 +61,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "an extension's members": (
         "RP-105",
-        True,
+        False,
         [
             "create extension citext",
             "select classid::regclass::text, count(*) from pg_depend"
