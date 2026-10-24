@@ -15055,11 +15055,9 @@ impl PgHandler {
             .get("default_statistics_target")
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(100);
-        // The extended statistics on the table (RP-099), over the whole
-        // table while it fits ANALYZE's sample, whatever its columns' types.
-        if docs.len() as u64 <= 300 * target {
-            self.build_extended_statistics(table, &def, &docs, columns, target as usize)?;
-        }
+        // The extended statistics on the table (RP-099), over ANALYZE's
+        // sample of it, whatever its columns' types.
+        self.build_extended_statistics(table, &def, &docs, columns, target as usize)?;
         if !Self::heap_pages_modelled(&def) {
             return self.record_relstats(table, true);
         }
