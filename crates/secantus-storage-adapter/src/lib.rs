@@ -1246,6 +1246,54 @@ impl CmdStorage for StorageAdapter {
             .map_err(map_err)
     }
 
+    fn can_stream(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
+        self.inner.can_stream(db, coll).map_err(map_err)
+    }
+
+    fn records_after(
+        &self,
+        db: &str,
+        coll: &str,
+        after: Option<i64>,
+        max: usize,
+    ) -> Result<Option<secantus_commands::storage::Records>, StorageError> {
+        let rows = self
+            .inner
+            .records_after(db, coll, after, max)
+            .map_err(map_err)?;
+        let mut view = self.sql_view(db, coll);
+        Ok(Some(rows.into_iter().map(|(r, d)| (r, view(d))).collect()))
+    }
+
+    fn records_by_id(
+        &self,
+        db: &str,
+        coll: &str,
+        recordids: &[i64],
+    ) -> Result<Option<Vec<Option<Vec<u8>>>>, StorageError> {
+        let rows = self
+            .inner
+            .records_by_id(db, coll, recordids)
+            .map_err(map_err)?;
+        let mut view = self.sql_view(db, coll);
+        Ok(Some(rows.into_iter().map(|d| d.map(&mut view)).collect()))
+    }
+
+    fn index_entries_from(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+        from: &[u8],
+        after: Option<i64>,
+        max: usize,
+    ) -> Result<Option<secantus_commands::storage::IndexEntries>, StorageError> {
+        self.inner
+            .index_entries_from(db, coll, name, from, after, max)
+            .map(Some)
+            .map_err(map_err)
+    }
+
     fn collection_min_recordid(&self, db: &str, coll: &str) -> Result<Option<i64>, StorageError> {
         self.inner
             .collection_min_recordid(db, coll)

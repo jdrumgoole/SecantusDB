@@ -267,9 +267,9 @@ pub(crate) fn distinct_entries(ix: &IxScan, width: usize, env: &Env) -> Vec<(usi
 }
 
 /// One field's intervals in scan order: `(low, inclusive, high, inclusive)`.
-type Ranges = Vec<(Vec<u8>, bool, Vec<u8>, bool)>;
+pub(crate) type Ranges = Vec<(Vec<u8>, bool, Vec<u8>, bool)>;
 
-fn ranges(list: &[Interval], reversed: bool, collation: Option<&Collation>) -> Ranges {
+pub(crate) fn ranges(list: &[Interval], reversed: bool, collation: Option<&Collation>) -> Ranges {
     let mut out: Ranges = list
         .iter()
         .map(|i| {
@@ -391,22 +391,7 @@ impl Scan {
                 })
                 .collect()
         };
-        // Points, then one interval, then everything: a single run of keys.
-        let mut contiguous = true;
-        let mut open = false;
-        for list in &ix.bounds {
-            let [one] = list.as_slice() else {
-                contiguous = false;
-                break;
-            };
-            if open && !one.is_all() {
-                contiguous = false;
-                break;
-            }
-            if !one.is_point() {
-                open = true;
-            }
-        }
+        let contiguous = contiguous(&ix.bounds);
         // A single run of keys examines none outside it, so only the run's
         // entries are kept (and sorted); whether a key follows the run is
         // all that is asked of the rest.
@@ -463,9 +448,27 @@ impl Scan {
     }
 }
 
+/// Whether `bounds` are one contiguous run of keys -- points, then one
+/// interval, then everything -- so that a scan examines no key outside it.
+pub(crate) fn contiguous(bounds: &[Vec<Interval>]) -> bool {
+    let mut open = false;
+    for list in bounds {
+        let [one] = list.as_slice() else {
+            return false;
+        };
+        if open && !one.is_all() {
+            return false;
+        }
+        if !one.is_point() {
+            open = true;
+        }
+    }
+    true
+}
+
 /// The first field whose key is outside `ranges`, and whether a later
 /// interval of that field could still be reached.
-fn outside_of(ranges: &[Ranges], key: &[Vec<u8>]) -> Option<(usize, bool)> {
+pub(crate) fn outside_of(ranges: &[Ranges], key: &[Vec<u8>]) -> Option<(usize, bool)> {
     for (f, (part, list)) in key.iter().zip(ranges).enumerate() {
         if list.iter().any(|r| inside(part, r)) {
             continue;

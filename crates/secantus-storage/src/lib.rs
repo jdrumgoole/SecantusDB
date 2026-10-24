@@ -3001,6 +3001,21 @@ fn escape_kb(kb: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The inverse of [`escape_kb`]: `00 ff` back to `00`.
+fn unescape_kb(esc: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(esc.len());
+    let mut i = 0;
+    while i < esc.len() {
+        out.push(esc[i]);
+        i += if esc[i] == 0 && esc.get(i + 1) == Some(&0xff) {
+            2
+        } else {
+            1
+        };
+    }
+    out
+}
+
 /// On-disk index-ENTRY format version, recorded per index as
 /// `options.entryFormat` in the index catalog:
 ///
@@ -16619,6 +16634,155 @@ impl Storage {
         Ok((out, None))
     }
 
+    /// Whether a read of `db.coll` can stream: an ordinary collection's
+    /// documents in RecordId order and its indexes' entries, the rows
+    /// `records_after` / `index_entries_from` read. Not the oplog, a table a
+    /// read overlay covers, a time-series or a clustered collection -- the
+    /// ones [`Self::matching_rows`] does not offer either.
+    pub fn can_stream(&self, db: &str, coll: &str) -> Result<bool> {
+        if self.is_oplog_rs(db, coll) || overlay_for(db, coll).is_some() {
+            return Ok(false);
+        }
+        let session = self.op_session()?;
+        Ok(!self.is_timeseries(&session, db, coll)? && !is_clustered(&session, db, coll)?)
+    }
+
+    /// Up to `max` documents of `db.coll` after RecordId `after` (from the
+    /// start when `None`), in RecordId order, with their RecordIds: a
+    /// collection scan resumed where the last batch left it, on this call's
+    /// snapshot (a transaction's, inside one). For the MongoDB server's
+    /// streaming cursors, which count every document they examine and so
+    /// read them unfiltered.
+    pub fn records_after(
+        &self,
+        db: &str,
+        coll: &str,
+        after: Option<i64>,
+        max: usize,
+    ) -> Result<Vec<(i64, Vec<u8>)>> {
+        let session = self.op_session()?;
+        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+            Ok(c) => c,
+            Err(e) if e.is_missing_table() => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::with_capacity(max.min(1024));
+        if after == Some(i64::MAX) {
+            return Ok(out);
+        }
+        cur.set_key_ssq(db, coll, after.map_or(i64::MIN, |a| a + 1));
+        let mut more = match cur.search_near() {
+            Ok(cmp) => cmp >= 0 || cur.next()?,
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        while more && out.len() < max {
+            // The streamed reads poll the `maxTimeMS` budget and `killOp`
+            // where the whole-collection scan does.
+            if deadline::check().is_err() {
+                return Err(StorageError::MaxTimeExpired);
+            }
+            let (d, c, recordid) = cur.get_key_ssq()?;
+            if d != db || c != coll {
+                break;
+            }
+            let value = cur.get_value_u()?;
+            let (_idk, blob) = unframe_doc_value(&value)?;
+            out.push((recordid, blob.to_vec()));
+            more = cur.next()?;
+        }
+        Ok(out)
+    }
+
+    /// The documents with these RecordIds as they are now, `None` for one no
+    /// longer there: a FETCH of the entries an index scan returned.
+    pub fn records_by_id(
+        &self,
+        db: &str,
+        coll: &str,
+        recordids: &[i64],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        let session = self.op_session()?;
+        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+            Ok(c) => c,
+            Err(e) if e.is_missing_table() => return Ok(vec![None; recordids.len()]),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::with_capacity(recordids.len());
+        for &recordid in recordids {
+            // The streamed reads poll the `maxTimeMS` budget and `killOp`
+            // where the whole-collection scan does.
+            if deadline::check().is_err() {
+                return Err(StorageError::MaxTimeExpired);
+            }
+            cur.reset()?;
+            cur.set_key_ssq(db, coll, recordid);
+            match cur.search() {
+                Ok(()) => {
+                    let value = cur.get_value_u()?;
+                    let (_idk, blob) = unframe_doc_value(&value)?;
+                    out.push(Some(blob.to_vec()));
+                }
+                Err(e) if e.is_not_found() => out.push(None),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Up to `max` entries of index `name` from key `from` on, in the
+    /// index's order, as `(key, RecordId)` with the key unescaped (the
+    /// fields' encodings joined by `COMPOUND_SEP`). With `after`, the scan
+    /// resumes strictly after the entry `(from, after)`: where a streaming
+    /// cursor's last batch left it, on this call's snapshot.
+    pub fn index_entries_from(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+        from: &[u8],
+        after: Option<i64>,
+        max: usize,
+    ) -> Result<Vec<(Vec<u8>, i64)>> {
+        let session = self.op_session()?;
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let mut seed = escape_kb(from);
+        if let Some(rid) = after {
+            if rid == i64::MAX {
+                // Nothing of this key is left: start past all of it.
+                seed.extend_from_slice(ENTRY_SEP);
+                seed.extend_from_slice(&[0xff; 9]);
+            } else {
+                seed.extend_from_slice(ENTRY_SEP);
+                seed.extend_from_slice(&(rid + 1).to_be_bytes());
+            }
+        }
+        cur.set_key_sssu(db, coll, name, &seed);
+        let mut out = Vec::with_capacity(max.min(1024));
+        let mut more = match cur.search_near() {
+            Ok(cmp) => cmp >= 0 || cur.next()?,
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        while more && out.len() < max {
+            // The streamed reads poll the `maxTimeMS` budget and `killOp`
+            // where the whole-collection scan does.
+            if deadline::check().is_err() {
+                return Err(StorageError::MaxTimeExpired);
+            }
+            let (d, c, n, packed) = cur.get_key_sssu()?;
+            if d != db || c != coll || n != name {
+                break;
+            }
+            let (esc, rid) = unpack_entry(&packed);
+            if let Some(rid) = rid {
+                out.push((unescape_kb(esc), rid));
+            }
+            more = cur.next()?;
+        }
+        Ok(out)
+    }
+
     /// [`Self::scan_batch_after`] with a block's rows laid over the snapshot.
     /// The resume point is the RecordId of the last row handed out, whether
     /// it came from the snapshot or from the overlay.
@@ -24806,6 +24970,19 @@ mod tests {
         assert_eq!(got[0].0, 1);
         assert_eq!(got[1].2, Some(doc! {"_id": 2i32, "old": true}));
         assert!(pitr_archive::is_archive_dir(archive));
+    }
+
+    #[test]
+    fn unescape_kb_undoes_escape_kb() {
+        for kb in [
+            &b""[..],
+            b"abc",
+            b"\x01\x00\x02",
+            b"\x00\x00",
+            b"\x00\xff\x00",
+        ] {
+            assert_eq!(unescape_kb(&escape_kb(kb)), kb.to_vec());
+        }
     }
 
     #[test]

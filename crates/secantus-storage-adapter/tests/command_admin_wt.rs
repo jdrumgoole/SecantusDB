@@ -1082,14 +1082,18 @@ fn a_write_to_a_capped_collection_inside_a_transaction_is_refused() {
         let (reply, commit) = in_txn(c, doc! {"insert": "plain", "documents": [{"_id": 2}]});
         assert_eq!(reply.get_i32("n").unwrap(), 1, "{reply}");
         assert_eq!(commit, None);
-        let left = dispatch(&doc! {"find": "tx", "projection": {"_id": 1, "a": 1}}, c);
-        assert_eq!(
-            left.get_document("cursor")
-                .unwrap()
-                .get_array("firstBatch")
-                .unwrap(),
-            &vec![Bson::Document(doc! {"_id": 1, "a": 1})]
-        );
+        dispatch(&doc! {"find": "tx", "projection": {"_id": 1, "a": 1}}, c);
+        // A streamed `find` hands its batch to the server as encoded
+        // documents (`pending_batch`), not as `firstBatch`.
+        let left: Vec<Document> = c
+            .pending_batch
+            .as_ref()
+            .unwrap()
+            .batch
+            .iter()
+            .map(|b| Document::from_reader(&mut &b[..]).unwrap())
+            .collect();
+        assert_eq!(left, vec![doc! {"_id": 1, "a": 1}]);
     });
 }
 

@@ -45,6 +45,33 @@ pub enum CursorError {
     /// Could not mint a unique id within the attempt budget (astronomically
     /// unlikely; surfaced rather than panicked).
     MintFailed,
+    /// Another `getMore` is reading this cursor right now.
+    InUse(i64),
+}
+
+/// A cursor that reads on as `getMore` asks (`explain::stream`): each batch
+/// is read in the call that asks for it, from where the last one stopped.
+pub trait StreamCursor: Send {
+    /// Up to `want` documents (0: as many as fit) within `max_bytes`.
+    fn next_batch(
+        &mut self,
+        storage: &dyn crate::storage::Storage,
+        want: usize,
+        max_bytes: usize,
+    ) -> Result<StreamedBatch, crate::CommandError>;
+    /// The plan's summary, which mongod repeats on every batch's line.
+    fn plan_summary(&self) -> Option<String>;
+    /// The command that opened the cursor (a `getMore` line's
+    /// `originatingCommand`).
+    fn originating_command(&self) -> Document;
+}
+
+/// One streamed batch, and what reading it examined.
+pub struct StreamedBatch {
+    pub docs: Vec<Vec<u8>>,
+    pub exhausted: bool,
+    pub keys_examined: i64,
+    pub docs_examined: i64,
 }
 
 /// Produces newly-available encoded event documents for a tailable cursor.
@@ -138,6 +165,11 @@ struct Entry {
     /// The `(db, user)` principals authenticated when the cursor was
     /// opened: only a session of the same users may read or kill it.
     users: Vec<(String, String)>,
+    /// A streaming cursor's read: taken out while a `getMore` reads it
+    /// (`stream_busy`), put back after.
+    stream: Option<Box<dyn StreamCursor>>,
+    streaming: bool,
+    stream_busy: bool,
 }
 
 /// The session a cursor was opened in, and the transaction number when it was
@@ -231,6 +263,8 @@ pub struct CursorInfo {
     pub invalidated: bool,
     pub has_remaining: bool,
     pub change_stream: bool,
+    /// A streaming cursor (`register_stream`).
+    pub streaming: bool,
 }
 
 /// A `currentOp`-style description of a live cursor (no mutable state leaked).
@@ -340,6 +374,9 @@ impl CursorRegistry {
                 time_limited: false,
                 owner: current_owner(),
                 users: current_users(),
+                stream: None,
+                streaming: false,
+                stream_busy: false,
             },
         );
         Ok(id)
@@ -383,6 +420,9 @@ impl CursorRegistry {
                 time_limited: false,
                 owner: current_owner(),
                 users: current_users(),
+                stream: None,
+                streaming: false,
+                stream_busy: false,
             },
         );
         Ok(id)
@@ -406,7 +446,63 @@ impl CursorRegistry {
             invalidated: e.invalidated,
             has_remaining: !e.remaining.is_empty(),
             change_stream: e.change_stream,
+            streaming: e.streaming,
         })
+    }
+
+    /// Register a streaming cursor over `stream`'s read; returns its id.
+    pub fn register_stream(
+        &self,
+        namespace: &str,
+        stream: Box<dyn StreamCursor>,
+    ) -> Result<i64, CursorError> {
+        let id = self.register_bounded(namespace, Vec::new(), false)?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = inner.cursors.get_mut(&id) {
+            e.stream = Some(stream);
+            e.streaming = true;
+        }
+        Ok(id)
+    }
+
+    /// Take a streaming cursor's read out for a `getMore` to run outside the
+    /// registry's lock; `None` for a cursor that does not stream.
+    pub fn take_stream(
+        &self,
+        cursor_id: i64,
+    ) -> Result<Option<Box<dyn StreamCursor>>, CursorError> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.prune_locked(&mut inner);
+        let now = (self.clock)();
+        let e = inner
+            .cursors
+            .get_mut(&cursor_id)
+            .ok_or(CursorError::NotFound(cursor_id))?;
+        if !e.streaming {
+            return Ok(None);
+        }
+        if e.stream_busy {
+            return Err(CursorError::InUse(cursor_id));
+        }
+        e.last_access = now;
+        e.stream_busy = true;
+        Ok(e.stream.take())
+    }
+
+    /// Put a streaming cursor's read back after a batch, or close the cursor
+    /// when the read is exhausted. A cursor killed meanwhile stays gone.
+    pub fn return_stream(&self, cursor_id: i64, stream: Box<dyn StreamCursor>, exhausted: bool) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now = (self.clock)();
+        if exhausted {
+            inner.cursors.remove(&cursor_id);
+            return;
+        }
+        if let Some(e) = inner.cursors.get_mut(&cursor_id) {
+            e.stream = Some(stream);
+            e.stream_busy = false;
+            e.last_access = now;
+        }
     }
 
     /// Drain up to `batch_size` documents (`<= 0` ⇒ all remaining), never more
@@ -909,6 +1005,9 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         cursors.kill(&[cursor_id]);
         return Ok(CommandError::new(175, "QueryPlanKilled", reason).into_reply());
     }
+    if info.streaming {
+        return stream_get_more(cursor_id, batch_size, &ns, ctx);
+    }
     if info.tailable {
         let storage = ctx.storage()?;
         // awaitData: block until an event arrives or maxTimeMS elapses, instead
@@ -1058,6 +1157,67 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! {
         "cursor": {
             "id": Bson::Int64(if exhausted { 0 } else { cursor_id }),
+            "ns": ns,
+        },
+        "ok": 1.0,
+    })
+}
+
+/// A `getMore` on a streaming cursor: the next batch read now, from where
+/// the last one stopped, outside the registry's lock.
+fn stream_get_more(
+    cursor_id: i64,
+    batch_size: Option<i64>,
+    ns: &str,
+    ctx: &mut CommandContext,
+) -> HandlerResult {
+    let cursors = ctx
+        .cursors
+        .clone()
+        .ok_or_else(|| CommandError::new(1, "InternalError", "cursor registry not configured"))?;
+    let mut stream = match cursors.take_stream(cursor_id) {
+        Ok(Some(s)) => s,
+        Ok(None) | Err(CursorError::NotFound(_)) => return Ok(cursor_not_found(cursor_id)),
+        Err(_) => {
+            return Ok(CommandError::new(
+                292,
+                "CursorInUse",
+                format!("Cursor already in use (namespace: '{ns}', id: {cursor_id})."),
+            )
+            .into_reply())
+        }
+    };
+    let storage = ctx
+        .storage
+        .clone()
+        .ok_or_else(|| CommandError::new(1, "InternalError", "no storage configured"))?;
+    let want = batch_size.unwrap_or(0).max(0) as usize;
+    let batch = match stream.next_batch(storage.as_ref(), want, MAX_GETMORE_BATCH_BYTES) {
+        Ok(b) => b,
+        Err(e) => {
+            // A read that failed ends the cursor, as on mongod.
+            cursors.return_stream(cursor_id, stream, true);
+            return Err(e);
+        }
+    };
+    let open = !batch.exhausted;
+    ctx.exec_stats = Some(crate::ExecStats {
+        keys_examined: batch.keys_examined,
+        docs_examined: batch.docs_examined,
+        // mongod names the cursor on every getMore line, the last one too.
+        cursor_id,
+        exhausted: batch.exhausted,
+        plan_summary: stream.plan_summary(),
+        originating_command: Some(stream.originating_command()),
+    });
+    cursors.return_stream(cursor_id, stream, batch.exhausted);
+    ctx.pending_batch = Some(crate::PendingBatch {
+        batch_field: "nextBatch",
+        batch: batch.docs,
+    });
+    Ok(doc! {
+        "cursor": {
+            "id": Bson::Int64(if open { cursor_id } else { 0 }),
             "ns": ns,
         },
         "ok": 1.0,

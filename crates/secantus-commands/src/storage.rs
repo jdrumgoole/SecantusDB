@@ -39,6 +39,12 @@ pub struct MatchedRows {
 /// tailable-find producer polls (`scan_docs_after_id_key`).
 pub type IdKeyRows = Vec<(Vec<u8>, Vec<u8>)>;
 
+/// An index's entries as `(key, RecordId)`, the key unescaped.
+pub type IndexEntries = Vec<(Vec<u8>, i64)>;
+
+/// A collection's documents as `(RecordId, BSON)`, in RecordId order.
+pub type Records = Vec<(i64, Vec<u8>)>;
+
 /// The outcome of an `update` operation (mirrors
 /// `secantus_storage::UpdateOutcome`).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -1011,6 +1017,55 @@ pub trait Storage: Send + Sync {
         _after: Option<i64>,
     ) -> Result<Vec<(i64, Vec<u8>)>, StorageError> {
         Ok(Vec::new())
+    }
+
+    /// Whether a read of `db.coll` can stream through [`Self::records_after`]
+    /// and [`Self::index_entries_from`]. `false` when the store cannot.
+    fn can_stream(&self, _db: &str, _coll: &str) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+
+    /// Up to `max` documents after RecordId `after` (from the start when
+    /// `None`), in RecordId order, with their RecordIds, on this call's
+    /// snapshot: a collection scan a streaming cursor resumes batch by batch.
+    /// `None` when the store cannot read this way.
+    fn records_after(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _after: Option<i64>,
+        _max: usize,
+    ) -> Result<Option<Records>, StorageError> {
+        Ok(None)
+    }
+
+    /// The documents with these RecordIds as they are now (`None` for one no
+    /// longer there): a streaming FETCH. `None` when the store cannot read
+    /// this way.
+    fn records_by_id(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _recordids: &[i64],
+    ) -> Result<Option<Vec<Option<Vec<u8>>>>, StorageError> {
+        Ok(None)
+    }
+
+    /// Up to `max` entries of index `name` from key `from` on (strictly
+    /// after `(from, after)` when `after` is given), in the index's order,
+    /// as `(key, RecordId)` with the key the fields' `sortkey` encodings
+    /// joined by `COMPOUND_SEP`: an index scan a streaming cursor resumes.
+    /// `None` when the store cannot read this way.
+    fn index_entries_from(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _name: &str,
+        _from: &[u8],
+        _after: Option<i64>,
+        _max: usize,
+    ) -> Result<Option<IndexEntries>, StorageError> {
+        Ok(None)
     }
 
     /// The smallest **RecordId** currently in the collection (`None` if empty) —

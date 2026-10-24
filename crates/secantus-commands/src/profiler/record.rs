@@ -4,9 +4,10 @@
 //! was (`op`, `ns`, `command`), what it did (cursor, counts, error), how long
 //! it took, how big its reply was, and who asked. mongod's `locks`,
 //! `flowControl`, `storage`, `readConcern` / `writeConcern` provenance, query
-//! hashes, `keysExamined` / `docsExamined` / `planSummary` / `execStats`, and
-//! `keysInserted` / `keysDeleted` describe machinery this server does not
-//! have, and are left out rather than made up.
+//! hashes, `execStats`, and `keysInserted` / `keysDeleted` describe machinery
+//! this server does not have, and are left out rather than made up.
+//! `keysExamined`, `docsExamined` and `planSummary` are given for a streamed
+//! read, which counts them as it reads.
 //!
 //! Which commands are profiled was measured, one by one: a command mongod
 //! never gives a namespace (`ping`, `listCollections`, `validate`, the user
@@ -273,10 +274,24 @@ pub(crate) fn finish(
             "ns": pending.ns.clone(),
             "command": abbreviated(doc),
         };
+        let ok = reply.get_f64("ok").unwrap_or(0.0) == 1.0;
+        let exec = ctx.exec_stats.as_ref().filter(|_| ok);
+        // A cursor's `getMore` names the command that opened it, and repeats
+        // its plan (RM-023; measured 8.2.11, 2026-10-24).
+        if let Some(command) = exec.and_then(|e| e.originating_command.as_ref()) {
+            entry.insert("originatingCommand", abbreviated(command));
+        }
         outcome(name, doc, inner_n, modified, reply, ctx, &mut entry);
         entry.insert("responseLength", response_length(reply, ctx));
         entry.insert("protocol", if ctx.op_query { "op_query" } else { "op_msg" });
         entry.insert("millis", int32(millis));
+        let summary = exec.and_then(|e| e.plan_summary.clone()).or_else(|| {
+            ok.then(|| crate::explain::summary::plan_summary(doc, ctx))
+                .flatten()
+        });
+        if let Some(summary) = summary {
+            entry.insert("planSummary", summary);
+        }
         who.append(&mut entry);
         logged |= decide(&pending.db, settings, &entry, millis, ctx);
     }
@@ -431,6 +446,11 @@ fn outcome(
                 };
                 if name == "getMore" || id != 0 {
                     entry.insert("cursorid", requested);
+                }
+                // What a streamed read examined for this batch.
+                if let Some(e) = &ctx.exec_stats {
+                    entry.insert("keysExamined", e.keys_examined);
+                    entry.insert("docsExamined", e.docs_examined);
                 }
                 if name != "aggregate" {
                     entry.insert("nBatches", 1_i32);

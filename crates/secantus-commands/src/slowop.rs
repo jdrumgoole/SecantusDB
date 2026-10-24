@@ -176,17 +176,40 @@ fn outcome(name: &str, reply: &Document, out: &mut Document) {
 
 /// What the line says about a read (RM-023): the `planSummary`, how many
 /// documents went back (`nreturned`) and the size of the reply (`reslen`),
-/// in mongod's order. Measured 8.2.11, 2026-10-16. `keysExamined`,
-/// `docsExamined` and the storage wait times are not given: they count the
-/// plan's own work, which only a read of the collection would reproduce.
+/// in mongod's order. Measured 8.2.11, 2026-10-16. A streamed read adds
+/// what its batch examined (`keysExamined`, `docsExamined`) and, on a
+/// `getMore`, the command that opened the cursor (2026-10-24). The storage
+/// wait times are not given (RM-023).
 pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContext) -> Document {
     let name = request.keys().next().map(String::as_str).unwrap_or("");
     let mut out = Document::new();
     if reply.get_f64("ok").unwrap_or(1.0) != 1.0 {
         return out;
     }
-    if let Some(summary) = crate::explain::summary::plan_summary(request, ctx) {
+    let exec = ctx.exec_stats.as_ref();
+    // A cursor's `getMore` names the command that opened it, and repeats its
+    // plan (RM-023).
+    if let Some(command) = exec.and_then(|e| e.originating_command.clone()) {
+        out.insert("originatingCommand", command_shown(&command));
+    }
+    let summary = exec
+        .and_then(|e| e.plan_summary.clone())
+        .or_else(|| crate::explain::summary::plan_summary(request, ctx));
+    if let Some(summary) = summary {
         out.insert("planSummary", summary);
+    }
+    // What a streamed read examined for this batch, in mongod's order.
+    if let Some(e) = exec {
+        if e.cursor_id != 0 {
+            out.insert("cursorid", e.cursor_id);
+        }
+        out.insert("keysExamined", e.keys_examined);
+        out.insert("docsExamined", e.docs_examined);
+        out.insert("nBatches", 1_i64);
+        if e.exhausted {
+            out.insert("cursorExhausted", true);
+        }
+        out.insert("numYields", 0_i64);
     }
     let batch = || -> Option<i64> {
         if let Some(pending) = &ctx.pending_batch {
@@ -268,6 +291,9 @@ pub fn attributes(
     attr.insert("ns", ns);
     attr.insert("command", command_shown(request));
     let mut read = read;
+    if let Some(command) = read.remove("originatingCommand") {
+        attr.insert("originatingCommand", command);
+    }
     if let Some(summary) = read.remove("planSummary") {
         attr.insert("planSummary", summary);
     }
