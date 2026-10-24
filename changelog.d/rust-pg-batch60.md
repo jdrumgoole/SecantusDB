@@ -23,9 +23,9 @@ pages PostgreSQL 15's nbtree would have, kept across a restart.
     - a VACUUM that ran its index pass records the TIDs left;
     - ANALYZE records the rows each index covers;
     - TRUNCATE records 0 pages and -1 tuples.
-  - **Across a restart** the pages are written with the heap's (RP-193),
-    at most once a second and at a clean shutdown. A row placed after the
-    last write is added when the index is next touched.
+  - **Across a restart** the pages a checkpoint changed are written every
+    30 seconds and at a clean shutdown, beside the heap's (RP-193). A row
+    placed after the last write is added when the index is next touched.
   - **What is left.** PostgreSQL 14's bottom-up deletion is not modelled,
     nor deletion of tuples scans marked dead. So repeated UPDATEs that
     leave a key unchanged grow its index more here.

@@ -1367,8 +1367,8 @@ pub(crate) fn flush_store(storage: &std::sync::Arc<secantus_storage::Storage>, f
             }
         }
     }
-    // The indexes' pages go with the heaps' (RP-196).
-    crate::btree::flush_store(storage);
+    // The indexes' pages, on a checkpoint of their own (RP-196).
+    crate::btree::flush_store(storage, force);
 }
 
 #[cfg(test)]

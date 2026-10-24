@@ -687,12 +687,46 @@ impl PgHandler {
 /// tree, each tagged with its index's oid.
 pub(crate) const COLLECTION: &str = "__sql_btree_pages__";
 
-/// Write `storage`'s changed models, outside any user transaction, as the
-/// heap's checkpoint does (`heap::flush_store` decides when). A write that
-/// fails is reported and the model left marked, for the next checkpoint.
-pub(crate) fn flush_store(storage: &Arc<secantus_storage::Storage>) {
+/// One index's checkpoint: its model's key, the documents to write, and
+/// the ids they replace (`None`: every document of the index).
+type Changes = ((usize, String, i64), Vec<Document>, Option<Vec<String>>);
+
+/// How often the indexes' changed pages are written. They are many more
+/// documents than the heaps', each write durable, so less often than the
+/// heaps' second -- PostgreSQL's own `checkpoint_timeout` is five minutes.
+/// A crash loses at most this much of the indexes' growth: the next touch
+/// adds back every live row's tuple (`reconcile_btree`), not the splits
+/// in between.
+const INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Is it time for `store`'s indexes to be written? (Now, when `force`.)
+fn due(store: usize, force: bool) -> bool {
+    static LAST: OnceLock<Mutex<HashMap<usize, std::time::Instant>>> = OnceLock::new();
+    let mut last = LAST
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    if !force
+        && last
+            .get(&store)
+            .is_some_and(|t| now.duration_since(*t) < INTERVAL)
+    {
+        return false;
+    }
+    last.insert(store, now);
+    true
+}
+
+/// Write `storage`'s changed models, outside any user transaction, when
+/// `due` says so (every one at a clean shutdown). A write that fails is
+/// reported and the model left marked, for the next checkpoint.
+pub(crate) fn flush_store(storage: &Arc<secantus_storage::Storage>, force: bool) {
     let store = Arc::as_ptr(storage) as usize;
-    let changed: Vec<((usize, String, i64), Vec<Document>, Option<Vec<String>>)> = {
+    if !due(store, force) {
+        return;
+    }
+    let changed: Vec<Changes> = {
         let mut all = models().lock().unwrap_or_else(|e| e.into_inner());
         all.iter_mut()
             .filter(|((s, _, _), t)| *s == store && t.dirty)

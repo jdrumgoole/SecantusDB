@@ -1580,7 +1580,7 @@ mod tests {
         let shape = Int { unique: false };
         let mut t = BTree::build(&shape, keys(1..=500));
         let mut store: std::collections::BTreeMap<String, bson::Document> = Default::default();
-        let mut save =
+        let save =
             |t: &mut BTree, store: &mut std::collections::BTreeMap<String, bson::Document>| {
                 let (docs, ids) = t.take_changes(7);
                 match ids {

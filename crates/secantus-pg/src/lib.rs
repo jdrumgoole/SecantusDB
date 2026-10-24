@@ -14644,7 +14644,7 @@ impl PgHandler {
         } else {
             self.storage
                 .count_matching(self.db(), table, &Document::new(), None)
-                .map_err(|e| Self::storage_err("could not count the rows", e))? as usize
+                .map_err(|e| Self::storage_err("could not count the rows", e))?
         };
         let previous = self.relstats(table);
         if rows == 0 && !statistics && previous.is_none() {
