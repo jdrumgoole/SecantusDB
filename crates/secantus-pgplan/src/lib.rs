@@ -16132,6 +16132,10 @@ fn plan_aggregate_item(
             sublink_filter = Some(node);
             None
         }
+        Some(node) if correlated::calls_executor_function(node) => {
+            sublink_filter = Some(node);
+            None
+        }
         Some(node) => match lower_where(node, def, params) {
             Ok(d) => Some(d),
             Err(_) if correlated::has_correlated_call(node) => {
@@ -40630,6 +40634,20 @@ fn coerce_to_column(def: &TableDef, field: &str, value: Bson) -> Result<Bson> {
             ))
         }
         _ => {}
+    }
+    // A `reg*` column is stored as its kind's value: a constant of another
+    // kind (`aggfnoid = 'sum(int4)'::regprocedure`) or a plain number
+    // (`prosupport = 0`) is compared by its oid, as PostgreSQL compares
+    // them (RP-213).
+    if let Some(ty) = field_type(def, field).filter(|t| regobj::is_kind(t)) {
+        let oid = match &value {
+            Bson::Int32(i) => Some(i64::from(*i)),
+            Bson::Int64(i) => Some(*i),
+            other => regobj::from_bson(other).map(|(_, o)| o),
+        };
+        if let Some(oid) = oid {
+            return Ok(regobj::value(ty, oid));
+        }
     }
     let Bson::String(_) = &value else {
         return Ok(value);

@@ -806,6 +806,21 @@ pub(crate) fn has_correlated_call(node: &pg_query::protobuf::Node) -> bool {
     found
 }
 
+/// Does `node` call a function the executor answers (`SEQUENCE_FUNCTIONS`:
+/// `pg_relation_size`, `pg_type_is_visible`, ...)? No filter can hold one;
+/// it is evaluated per row (RP-212).
+pub(crate) fn calls_executor_function(node: &pg_query::protobuf::Node) -> bool {
+    let mut copy = node.clone();
+    let mut found = false;
+    let _ = walk_expr(&mut copy, &mut |n| {
+        if let Some(N::FuncCall(f)) = n.node.as_ref() {
+            found |= func_name(f).is_some_and(|name| SEQUENCE_FUNCTIONS.contains(&name.as_str()));
+        }
+        Ok(())
+    });
+    found
+}
+
 /// The static type of a correlated call, when `f` is one.
 pub(crate) fn correlated_type(f: &pg_query::protobuf::FuncCall) -> Option<String> {
     if !is_correlated(f) {

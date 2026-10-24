@@ -153,13 +153,24 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
             "select pg_describe_object('pg_operator'::regclass, '+(int4,int4)'::regoperator, 0)",
         ],
     ),
-    "an executor function in an aggregate": (
+    "an executor function in an aggregate's FILTER": (
         "RP-212",
+        False,
+        [
+            "select count(*) filter (where pg_type_is_visible(oid)) from pg_type",
+            "select count(*) filter (where pg_function_is_visible(oid)), count(*) from pg_proc",
+            "select array_agg(typname) filter (where pg_type_is_visible(oid) "
+            "and typname = 'int4') from pg_type",
+            "select sum(1) filter (where pg_type_is_visible(oid)) from pg_type",
+        ],
+    ),
+    "a system catalog's size": (
+        "RP-214",
         True,
         [
-            "select sum(pg_relation_size(oid)) >= 0 from pg_class",
-            "select count(*) filter (where pg_type_is_visible(oid)) from pg_type",
-            "select count(*) filter (where pg_relation_size(oid) >= 0) from pg_class",
+            "select pg_relation_size(1259) is not null, pg_relation_size('pg_class') > 0, "
+            "pg_total_relation_size('pg_class') > 0",
+            "select count(*) from pg_class where pg_relation_size(oid) is null",
         ],
     ),
     "a reg* column against a constant in WHERE": (
@@ -192,6 +203,7 @@ EXPECTED: dict[str, Any] = {
         [("pg_type", "pg_type[]", "cstring[]", "information_schema.tables")]
     ],
     "a reg* column against a constant in WHERE": [[("1",)], [("1",)], [("int4_sum",)], [("1",)]],
+    "a system catalog's size": [[("True", "True", "True")], [("0",)]],
     "a view over another schema's table depends on it": [
         "BEGIN",
         "CREATE SCHEMA",
@@ -214,7 +226,12 @@ EXPECTED: dict[str, Any] = {
         ("DO", ["table pg_class"]),
         "ROLLBACK",
     ],
-    "an executor function in an aggregate": [[("True",)], [("463",)], [("410",)]],
+    "an executor function in an aggregate's FILTER": [
+        [("463",)],
+        [("3233", "3244")],
+        [("['int4']",)],
+        [("463",)],
+    ],
     "an index in another schema is listed in it": [
         "BEGIN",
         "CREATE SCHEMA",

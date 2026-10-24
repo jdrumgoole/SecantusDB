@@ -806,23 +806,21 @@ tests are regression tests.
       relation (`type t[]` appears among what depends on table `t`).
       Backlog-ID: RP-205
       Verify: tests/backlog/test_rp_batch52.py::test_scenario[pg_depend of a table and its row type]
-- [ ] **A function the executor answers is NULL or refused inside an
-      aggregate.** `select sum(pg_relation_size(oid)) >= 0 from pg_class`
-      is NULL here, `t` on PostgreSQL 15.19; in a FILTER
-      (`count(*) filter (where pg_type_is_visible(oid))`) the argument is
-      typed as text and the call refused (`function pg_type_is_visible(text)
-      is not supported yet`). The same calls in a select list or a WHERE
-      are answered.
-      Backlog-ID: RP-212
-      Verify: tests/backlog/test_rp_batch52.py::test_scenario[an executor function in an aggregate]
-- [ ] **A `reg*` column against a constant in WHERE matches nothing.**
-      `select count(*) from pg_operator where oprcode = 'int4eq'::regproc`
-      is 0 here, 1 on PostgreSQL 15.19; so is `typinput = 'int4in'::regproc`
-      over `pg_type`, and `aggfnoid = 2108` over `pg_aggregate`. The same
-      comparison in a select list is right, and `oid = 'now'::regproc`
-      over `pg_proc` matches.
-      Backlog-ID: RP-213
-      Verify: tests/backlog/test_rp_batch52.py::test_scenario[a reg* column against a constant in WHERE]
+- [ ] **A system catalog has no size.** `pg_relation_size(1259)` is NULL
+      here and `pg_relation_size('pg_class')` 0; PostgreSQL 15.19 answers
+      each catalog's heap size (114688 for `pg_class` on the private 15.19
+      reference cluster), `pg_total_relation_size` with its indexes and TOAST. A user
+      table's size comes from the heap model (batch 48); a catalog here is
+      computed from the store, with no heap to measure.
+      **Decision needed (2026-10-24):** PostgreSQL's numbers depend on each
+      cluster's churn (dead tuples, the catalog's own updates), so no rule
+      reproduces them. Options: (a) measure each catalog's rows through the
+      heap model as a fresh `initdb` would lay them out -- the mechanism,
+      but not PostgreSQL's bytes; (b) a fresh 15.19 cluster's sizes, dumped,
+      for the catalogs a database's own objects do not grow, and (a) for
+      the rest; (c) leave NULL, which reads as "no such relation".
+      Backlog-ID: RP-214
+      Verify: tests/backlog/test_rp_batch52.py::test_scenario[a system catalog's size]
 
 ## Found by batch 51 (2026-10-23)
 

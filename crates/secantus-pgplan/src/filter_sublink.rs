@@ -67,7 +67,9 @@ fn rewrite_call(n: &mut pg_query::protobuf::Node) -> Result<()> {
     let Some(filter) = f.agg_filter.as_deref() else {
         return Ok(());
     };
-    if !has_sublink(filter) {
+    // A call the executor answers (`pg_type_is_visible(oid)`) is no filter
+    // either: it is evaluated per row, as a subquery is (RP-212).
+    if !has_sublink(filter) && !correlated::calls_executor_function(filter) {
         return Ok(());
     }
     let name = match f.funcname.last().and_then(|p| p.node.as_ref()) {
