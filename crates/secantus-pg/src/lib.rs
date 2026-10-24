@@ -5992,14 +5992,16 @@ impl PgHandler {
         if is_empty_query(sql.trim().trim_end_matches(';').trim()) {
             return Ok(());
         }
-        let analysed = match pg_query::parse(sql) {
-            Ok(parsed) => {
-                parsed.protobuf.stmts.len() == 1
+        // Through the planner's memo, which Execute's planning reuses, and
+        // under the cancel hook: a plain parse of a 200,000-item IN list was
+        // most of a second in which no cancel was seen.
+        let parsed = self.with_cancel_hook(|| secantus_pgplan::memoised_parse(sql));
+        self.check_cancel()?;
+        let analysed = match parsed {
+            Some(parsed) => {
+                parsed.stmts.len() == 1
                     && matches!(
-                        parsed.protobuf.stmts[0]
-                            .stmt
-                            .as_ref()
-                            .and_then(|s| s.node.as_ref()),
+                        parsed.stmts[0].stmt.as_ref().and_then(|s| s.node.as_ref()),
                         Some(
                             N::SelectStmt(_)
                                 | N::InsertStmt(_)
@@ -6010,7 +6012,7 @@ impl PgHandler {
                     )
             }
             // The describe pass reports a syntax error as Describe would.
-            Err(_) => true,
+            None => true,
         };
         if !analysed {
             return Ok(());
@@ -6035,7 +6037,13 @@ impl PgHandler {
             .enumerate()
             .map(|(i, d)| d.clone().or_else(|| inferred.get(i).cloned().flatten()))
             .collect();
-        match self.describe_fields(sql, param_types.len(), &param_types) {
+        // Under the cancel hook, and a cancellation point after it: the
+        // Parse is a message cycle of its own (psycopg's `prepare`), and a
+        // cancel left pending when it answered was cleared as stale at the
+        // next message -- the statement then ran to its end.
+        let described = self.describe_fields(sql, param_types.len(), &param_types);
+        self.check_cancel()?;
+        match described {
             Ok(_) => Ok(()),
             // Only what analysis itself raises: the names and types (class
             // 42) and a literal that does not read as its type (22P02).
@@ -6051,7 +6059,15 @@ impl PgHandler {
                     map.as_ref(),
                 ))
             }
-            Err(_) => Ok(()),
+            // A cancel (or a terminate) is the statement's answer, at once:
+            // swallowed here, it was taken and lost, and the statement ran to
+            // its end.
+            Err(PgWireError::UserError(info))
+                if matches!(info.code.as_str(), "57014" | "57P01") =>
+            {
+                Err(PgWireError::UserError(info))
+            }
+            Err(_) => self.check_cancel(),
         }
     }
 
@@ -46333,7 +46349,19 @@ impl PgHandler {
     ///
     /// Planned against NULL placeholders: `Describe` arrives before `Bind`, so
     /// no values exist yet, and the result SHAPE does not depend on them.
+    /// The statement's result columns, planned under the cancel hook: a
+    /// Parse, Bind or Describe of a statement slow to plan is as
+    /// cancellable as its Execute.
     fn describe_fields(
+        &self,
+        sql: &str,
+        n_params: usize,
+        param_types: &[Option<String>],
+    ) -> PgWireResult<Option<Vec<FieldInfo>>> {
+        self.with_cancel_hook(|| self.describe_fields_inner(sql, n_params, param_types))
+    }
+
+    fn describe_fields_inner(
         &self,
         sql: &str,
         n_params: usize,

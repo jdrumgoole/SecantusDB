@@ -4130,6 +4130,7 @@ fn parse_tree(sql: &str) -> Result<std::sync::Arc<pg_query::protobuf::ParseResul
     static MEMO: OnceLock<Mutex<HashMap<String, Arc<pg_query::protobuf::ParseResult>>>> =
         OnceLock::new();
     let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    cancel::check()?;
     if let Some(tree) = memo.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
         return Ok(Arc::clone(tree));
     }
@@ -4142,8 +4143,17 @@ fn parse_tree(sql: &str) -> Result<std::sync::Arc<pg_query::protobuf::ParseResul
     if sql.len() > TOO_SHORT_TO_NEST {
         check_depth(&tree)?;
     }
+    // Bounded by text too: a tree costs about 160 bytes per byte of text
+    // (a 1.2 MB statement holds 200 MB), so a count alone let a few large
+    // statements pin gigabytes (measured: +200 MB resident per distinct
+    // 200,000-item IN list, never released).
+    const MAX_TEXT_BYTES: usize = 2 << 20;
+    if sql.len() > MAX_TEXT_BYTES {
+        return Ok(tree);
+    }
     let mut guard = memo.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.len() >= MAX_ENTRIES {
+    let held: usize = guard.keys().map(String::len).sum();
+    if guard.len() >= MAX_ENTRIES || held + sql.len() > MAX_TEXT_BYTES {
         guard.clear();
     }
     guard.insert(sql.to_string(), Arc::clone(&tree));
@@ -4264,6 +4274,10 @@ fn check_depth(tree: &pg_query::protobuf::ParseResult) -> Result<()> {
 }
 
 fn parse_one(sql: &str) -> Result<N> {
+    // A cancel stops a statement at its next parse, before the tree is
+    // cloned: a pass the cancel stopped is retried by a fallback that parses
+    // again, and each retry cloned a 200,000-item IN list's tree first.
+    cancel::check()?;
     // `information_schema`'s SQL helpers are inlined, as PostgreSQL inlines
     // a SQL function's call.
     let inlined = schema_functions::inline(sql);
@@ -39645,10 +39659,18 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                     _ => return Err(Error::Unsupported("this IN list".into())),
                 };
             let mut saw_null = false;
-            for item in items {
-                let mut eq = e.clone();
-                eq.kind = AExprKind::AexprOp as i32;
-                eq.name = vec![string_node("=")];
+            // The comparison without its list, cloned once: cloning `e` per
+            // item cloned the whole list each time, quadratic in its length
+            // (a 200,000-item list matching at its 780th item took 24 s).
+            let mut base = e.clone();
+            base.rexpr = None;
+            base.kind = AExprKind::AexprOp as i32;
+            base.name = vec![string_node("=")];
+            for (i, item) in items.into_iter().enumerate() {
+                if i % 1024 == 1023 {
+                    cancel::check()?;
+                }
+                let mut eq = base.clone();
                 eq.rexpr = Some(Box::new(item));
                 match const_value(
                     &pg_query::protobuf::Node {
