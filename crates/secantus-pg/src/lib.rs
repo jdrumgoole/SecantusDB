@@ -10325,10 +10325,7 @@ impl PgHandler {
                     let Ok(id) = d.get_str("_id") else {
                         continue;
                     };
-                    let oid = d
-                        .get_i64("oid")
-                        .or_else(|_| d.get_i32("oid").map(i64::from))
-                        .ok();
+                    let oid = Self::composite_relid(d);
                     // The first document of a name decides, found or not.
                     if !map.contains_key(id) {
                         if let Some(oid) = oid {
@@ -10377,10 +10374,7 @@ impl PgHandler {
         docs.iter()
             .filter_map(|d| {
                 let name = d.get_str("_id").ok()?.to_string();
-                let oid = d
-                    .get_i64("oid")
-                    .or_else(|_| d.get_i32("oid").map(i64::from))
-                    .ok()?;
+                let oid = Self::composite_relid(d)?;
                 let temp = temps.contains(&name);
                 Some((name, oid, temp))
             })
@@ -10412,6 +10406,16 @@ impl PgHandler {
                 (name, oid, false)
             }))
             .collect()
+    }
+
+    /// A composite's RELATION oid (`pg_class.oid`, `pg_type.typrelid`). A
+    /// relation and its row type draw separate oids from the counter, the
+    /// relation's first, as `heap_create_with_catalog` does (RP-205); a
+    /// composite recorded before that has one oid for both.
+    pub(crate) fn composite_relid(d: &Document) -> Option<i64> {
+        d.get("relid")
+            .and_then(bson_i64)
+            .or_else(|| d.get("oid").and_then(bson_i64))
     }
 
     /// Every sequence's name, with this transaction's uncommitted creates and
@@ -19580,6 +19584,14 @@ impl PgHandler {
                 // Composites likewise. `typrelid` is the composite's OWN oid
                 // here -- pg_attribute keys its fields on it, and this query
                 // needs no separate pg_class row.
+                let relids: HashMap<i64, i64> = self
+                    .type_catalog_docs(Self::COMPOSITE_COLLECTION)
+                    .ok()?
+                    .iter()
+                    .filter_map(|d| {
+                        Some((d.get("oid").and_then(bson_i64)?, Self::composite_relid(d)?))
+                    })
+                    .collect();
                 for (name, oid, _) in self.composites().ok()? {
                     let mut d = Document::new();
                     d.insert(def.field_of("typname").expect("column"), name);
@@ -19590,7 +19602,7 @@ impl PgHandler {
                     );
                     d.insert(def.field_of("typdelim").expect("column"), ",");
                     if let Some(f) = def.field_of("typrelid") {
-                        d.insert(f, Bson::Int64(oid));
+                        d.insert(f, Bson::Int64(relids.get(&oid).copied().unwrap_or(oid)));
                     }
                     rows.push(d);
                 }
@@ -34708,6 +34720,7 @@ impl PgHandler {
                 // `relation` so DROP TYPE refuses it and DROP TABLE takes it.
                 self.ensure_collection(Self::COMPOSITE_COLLECTION)?;
                 self.ensure_collection(Self::ENUM_META_COLLECTION)?;
+                let relid = self.mint_composite_oid()?;
                 let oid = self.mint_composite_oid()?;
                 let (field_docs, widths) = Self::row_type_fields(&def);
                 let row_type = bson::doc! {
@@ -34717,6 +34730,7 @@ impl PgHandler {
                     "fields": field_docs,
                     "widths": widths,
                     "oid": oid,
+                    "relid": relid,
                     "relation": true,
                 };
                 let bytes = encode_doc(&row_type)
@@ -34730,7 +34744,7 @@ impl PgHandler {
                 // Remember it for the rest of this transaction: the catalog row
                 // above is not committed yet, so a plain read cannot see it.
                 let name = def.name.clone();
-                self.note_uncommitted(&name, Some(Self::with_column_sources(def, Some(oid))));
+                self.note_uncommitted(&name, Some(Self::with_column_sources(def, Some(relid))));
                 Ok(vec![Response::Execution(Tag::new("CREATE TABLE"))])
             }
 

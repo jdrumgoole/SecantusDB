@@ -83,7 +83,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "pg_depend of a table and its row type": (
         "RP-205",
-        True,
+        False,
         [
             "begin",
             "create table rp52_d (a int default 1, constraint rp52_dc check (a > 0))",

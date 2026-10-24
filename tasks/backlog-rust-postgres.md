@@ -800,12 +800,6 @@ tests are regression tests.
       does not build.
       Backlog-ID: RP-203
       Verify: tests/backlog/test_rp_batch51.py::test_scenario[a rule's node trees]
-- [ ] **A table's row type has the table's oid.** PostgreSQL 15.19 gives
-      the row type an oid of its own (`pg_class.reltype`); here they are
-      one number, so `pg_depend` rows about the type read as rows about the
-      relation (`type t[]` appears among what depends on table `t`).
-      Backlog-ID: RP-205
-      Verify: tests/backlog/test_rp_batch52.py::test_scenario[pg_depend of a table and its row type]
 
 ## Found by batch 51 (2026-10-23)
 
