@@ -769,7 +769,7 @@ fn regex(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         None => None,
         Some(o) => Some(eval_field_value(o, ctx)?),
     };
-    let bound: Vec<String> = ctx.vars.keys().cloned().collect();
+    let bound: Vec<String> = ctx.constant_vars();
     let options_constant = spec
         .get("options")
         .is_none_or(|o| crate::aggregate::is_constant_expression(o, &bound));
@@ -1210,12 +1210,9 @@ impl Named {
     }
 
     fn constant(&self, k: &str, ctx: &Ctx) -> bool {
-        self.spec.get(k).is_none_or(|e| {
-            crate::aggregate::is_constant_expression(
-                e,
-                &ctx.vars.keys().cloned().collect::<Vec<_>>(),
-            )
-        })
+        self.spec
+            .get(k)
+            .is_none_or(|e| crate::aggregate::is_constant_expression(e, &ctx.constant_vars()))
     }
 
     fn classic(&self, op: &str, ctx: &Ctx) -> R {

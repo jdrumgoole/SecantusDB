@@ -100,8 +100,10 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
             Some(Bson::Document(d)) => d.keys().cloned().collect(),
             _ => Vec::new(),
         };
+        let vars = crate::util::command_let_vars(doc.get("let"), ctx);
         if let Some(Bson::Document(q)) = doc.get("query") {
-            if let Some((code, msg)) = argtypes::expression_problem_in_filter(q, &bound) {
+            if let Some((code, msg)) = argtypes::expression_problem_in_filter_with(q, &bound, &vars)
+            {
                 return Err(CommandError::new(
                     code,
                     crate::util::error_code_name(code),

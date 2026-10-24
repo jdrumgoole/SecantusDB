@@ -301,6 +301,8 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     let mut pipeline = pipeline;
     argtypes::normalise_pipeline_sorts(&mut pipeline);
+    // The command's `let`, which mongod substitutes before it folds.
+    let fold_vars = crate::util::command_let_vars(doc.get("let"), ctx);
     // An operator the query language does not have is a parse error, whether
     // or not the collection has a document to test it on.
     for stage in pipeline.iter().filter_map(Bson::as_document) {
@@ -314,7 +316,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             }
             // So is a constant `$expr` sub-expression that fails (RM-176).
             if let Some((code, msg)) =
-                secantus_core::expr_rewrite::constant_expr_error_in_filter(filter)
+                secantus_core::expr_rewrite::constant_expr_error_in_filter_with(filter, &fold_vars)
             {
                 return Err(CommandError::new(
                     code,
@@ -328,7 +330,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // collection too: `{$switch: {branches: [{case: false, then: 1}]}}`
         // is 40069 (RM-242), `{$cond: [true, 1, {$divide: [1, 0]}]}` is 2
         // (RM-251).
-        if let Some((code, msg)) = stage_fold_error(stage) {
+        if let Some((code, msg)) = stage_fold_error(stage, &fold_vars) {
             return Err(CommandError::new(
                 code,
                 crate::util::error_code_name(code),
@@ -2223,7 +2225,7 @@ fn apply_storage_stage(
                 .and_then(Bson::as_document)
                 .and_then(|l| l.get("pipeline"));
             if let (Some(sub), false) = (sub, docs.is_empty()) {
-                if let Some((code, msg)) = pipeline_fold_error(sub) {
+                if let Some((code, msg)) = pipeline_fold_error(sub, &Document::new()) {
                     return Err(CommandError::new(
                         code,
                         crate::util::error_code_name(code),
@@ -5317,10 +5319,10 @@ mod geo_near_candidate_tests {
 /// `$unionWith` holds, whose own optimizer adds its own prefix (measured
 /// 8.2.11, 2026-10-22). A `$lookup`'s pipeline is optimized per outer
 /// document, at run time, so it is not checked here.
-fn stage_fold_error(stage: &bson::Document) -> Option<(i32, String)> {
+fn stage_fold_error(stage: &bson::Document, vars: &Document) -> Option<(i32, String)> {
     let (name, spec) = stage.iter().next()?;
     let nested = |pipeline: &Bson| {
-        pipeline_fold_error(pipeline).map(|(c, m)| {
+        pipeline_fold_error(pipeline, vars).map(|(c, m)| {
             (
                 c,
                 format!("Failed to optimize pipeline :: caused by :: {m}"),
@@ -5331,31 +5333,33 @@ fn stage_fold_error(stage: &bson::Document) -> Option<(i32, String)> {
         ("$facet", Bson::Document(d)) => return d.values().find_map(nested),
         ("$unionWith", Bson::Document(d)) => return d.get("pipeline").and_then(nested),
         ("$project" | "$addFields" | "$set", Bson::Document(d)) => {
-            d.values().find_map(expression_fault)
+            d.values().find_map(|e| expression_fault(e, vars))
         }
         ("$group", Bson::Document(d)) => d.iter().find_map(|(k, v)| {
             if k == "_id" {
-                expression_fault(v)
+                expression_fault(v, vars)
             } else {
-                accumulator_fault(v)
+                accumulator_fault(v, vars)
             }
         }),
         ("$bucket" | "$bucketAuto", Bson::Document(d)) => d
             .get("groupBy")
-            .and_then(expression_fault)
+            .and_then(|e| expression_fault(e, vars))
             .or_else(|| match d.get("output") {
-                Some(Bson::Document(out)) => out.values().find_map(accumulator_fault),
+                Some(Bson::Document(out)) => out.values().find_map(|a| accumulator_fault(a, vars)),
                 _ => None,
             }),
         ("$setWindowFields", Bson::Document(d)) => d
             .get("partitionBy")
-            .and_then(expression_fault)
+            .and_then(|e| expression_fault(e, vars))
             .or_else(|| match d.get("output") {
-                Some(Bson::Document(out)) => out.values().find_map(accumulator_fault),
+                Some(Bson::Document(out)) => out.values().find_map(|a| accumulator_fault(a, vars)),
                 _ => None,
             }),
-        ("$replaceRoot", Bson::Document(d)) => d.get("newRoot").and_then(expression_fault),
-        ("$redact" | "$sortByCount" | "$replaceWith", e) => expression_fault(e),
+        ("$replaceRoot", Bson::Document(d)) => {
+            d.get("newRoot").and_then(|e| expression_fault(e, vars))
+        }
+        ("$redact" | "$sortByCount" | "$replaceWith", e) => expression_fault(e, vars),
         _ => None,
     };
     fault
@@ -5366,18 +5370,18 @@ fn stage_fold_error(stage: &bson::Document) -> Option<(i32, String)> {
 
 /// [`stage_fold_error`] over a whole pipeline, `$match` filters included:
 /// the first stage's error, without the optimizer's own prefix.
-fn pipeline_fold_error(pipeline: &Bson) -> Option<(i32, String)> {
+fn pipeline_fold_error(pipeline: &Bson, vars: &Document) -> Option<(i32, String)> {
     let Bson::Array(stages) = pipeline else {
         return None;
     };
     stages.iter().filter_map(Bson::as_document).find_map(|s| {
         let in_filter = match s.get("$match") {
             Some(Bson::Document(filter)) => {
-                secantus_core::expr_rewrite::constant_expr_error_in_filter(filter)
+                secantus_core::expr_rewrite::constant_expr_error_in_filter_with(filter, vars)
             }
             _ => None,
         };
-        in_filter.or_else(|| stage_fold_error(s))
+        in_filter.or_else(|| stage_fold_error(s, vars))
     })
 }
 
@@ -5396,8 +5400,8 @@ fn filter_has_text(filter: &Document) -> bool {
 /// [`secantus_core::expr_rewrite::constant_expr_fault`], less an error the
 /// evaluator marks as per-document: that is not mongod's to raise while
 /// optimizing, constant arguments or not.
-fn expression_fault(e: &Bson) -> Option<secantus_core::fallback::Fallback> {
-    secantus_core::expr_rewrite::constant_expr_fault(e)
+fn expression_fault(e: &Bson, vars: &Document) -> Option<secantus_core::fallback::Fallback> {
+    secantus_core::expr_rewrite::constant_expr_fault_with(e, vars)
         .filter(|f| f.folded_verdict() != Some(false))
 }
 
@@ -5405,7 +5409,7 @@ fn expression_fault(e: &Bson) -> Option<secantus_core::fallback::Fallback> {
 /// sortBy, output}}`, a window function beside its `window`): the
 /// accumulator itself is not an expression, and neither is a `sortBy` or a
 /// `window` spec.
-fn accumulator_fault(v: &Bson) -> Option<secantus_core::fallback::Fallback> {
+fn accumulator_fault(v: &Bson, vars: &Document) -> Option<secantus_core::fallback::Fallback> {
     let Bson::Document(d) = v else {
         return None;
     };
@@ -5416,8 +5420,8 @@ fn accumulator_fault(v: &Bson) -> Option<secantus_core::fallback::Fallback> {
                 named
                     .iter()
                     .filter(|(k, _)| k.as_str() != "sortBy")
-                    .find_map(|(_, a)| expression_fault(a))
+                    .find_map(|(_, a)| expression_fault(a, vars))
             }
-            other => expression_fault(other),
+            other => expression_fault(other, vars),
         })
 }
