@@ -228,6 +228,17 @@ pub fn from_text_element(text: &str, element: &str, discrete: bool) -> Result<Ra
 /// Build from constructor arguments: `int4range(lo, hi)` and its three-argument
 /// form, where the third names the bounds as one of `[]`, `[)`, `(]`, `()`.
 pub fn from_args(args: &[Bson], type_name: &str, null_flags_is_error: bool) -> Result<Range> {
+    from_typed_args(args, &[], type_name, null_flags_is_error)
+}
+
+/// `from_args` knowing each argument's static type: a `timestamptz` bound
+/// is an instant, and a `timestamp` one the session zone's wall clock.
+pub fn from_typed_args(
+    args: &[Bson],
+    types: &[String],
+    type_name: &str,
+    null_flags_is_error: bool,
+) -> Result<Range> {
     let (element, discrete) = range_element(type_name)
         .ok_or_else(|| Error::Unsupported(format!("the {type_name} type")))?;
     if args.is_empty() || args.len() > 3 {
@@ -269,14 +280,28 @@ pub fn from_args(args: &[Bson], type_name: &str, null_flags_is_error: bool) -> R
             return Err(Error::Parse("invalid range bound flags".into()));
         }
     };
-    let text_of = |v: Option<&Bson>| match v {
+    // A `timestamptz` argument is an instant, rendered as UTC: it is marked
+    // so, or the bound's cast would read that text in the session's zone
+    // and shift the instant by its offset (RP-240).
+    let text_of = |i: usize| match args.get(i) {
         None | Some(Bson::Null) => None,
-        Some(other) => Some(crate::render_value_text(other)),
+        Some(other) => {
+            let text = crate::render_value_text(other);
+            let is_instant = element == "timestamptz"
+                && types.get(i).is_some_and(|t| t == "timestamptz")
+                && (matches!(other, Bson::DateTime(_))
+                    || matches!(other, Bson::Document(d) if d.contains_key(crate::COMPOSITE_DATE)));
+            Some(if is_instant && !text.ends_with(" BC") {
+                format!("{text}+00")
+            } else {
+                text
+            })
+        }
     };
     let r = Range {
         empty: false,
-        lower: text_of(args.first()),
-        upper: text_of(args.get(1)),
+        lower: text_of(0),
+        upper: text_of(1),
         lower_inc,
         upper_inc,
     };

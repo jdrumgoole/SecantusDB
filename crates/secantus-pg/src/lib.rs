@@ -25666,15 +25666,21 @@ impl PgHandler {
     /// row is read -- an empty source included (`transformAssignedExpr`,
     /// measured on PostgreSQL 15). An untyped literal or NULL takes the
     /// column's type instead. The source is described, not run.
+    ///
+    /// Returns each target's source type (empty where untyped or unknown),
+    /// which decides how a value is assigned: a `timestamptz`'s instant is
+    /// kept, where a value of no known type is read as a `timestamp` in the
+    /// session's zone (RP-240).
     fn check_insert_select_types(
         &self,
         def: &TableDef,
         ins: &secantus_pgplan::Insert,
         source: &Statement,
-    ) -> PgWireResult<()> {
+    ) -> PgWireResult<Vec<String>> {
         let Ok(fields) = self.copy_query_fields(source) else {
-            return Ok(());
+            return Ok(Vec::new());
         };
+        let mut types: Vec<String> = Vec::with_capacity(fields.len());
         // Expand a `*` to the columns it stands for.
         let named = ins.source_targets.iter().filter(|t| !t.star).count();
         let mut per_column: Vec<Option<&secantus_pgplan::SourceTarget>> = Vec::new();
@@ -25689,8 +25695,22 @@ impl PgHandler {
         for (i, (field, target)) in fields.iter().zip(&ins.targets).enumerate() {
             let entry = per_column.get(i).copied().flatten();
             if entry.is_some_and(|t| t.untyped) {
+                types.push(String::new());
                 continue;
             }
+            let oid = i64::from(field.datatype().oid());
+            types.push(
+                secantus_pgplan::pgtypes::name_of_oid(oid)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        secantus_pgplan::pgtypes::BUILTIN_TYPES
+                            .iter()
+                            .find(|(_, _, arr)| *arr == oid)
+                            .and_then(|(_, el, _)| secantus_pgplan::pgtypes::name_of_oid(*el))
+                            .map(|n| format!("{n}[]"))
+                    })
+                    .unwrap_or_default(),
+            );
             let Some(col) = def.column(target) else {
                 continue;
             };
@@ -25727,7 +25747,7 @@ impl PgHandler {
                 entry.map_or(-1, |t| t.location),
             )));
         }
-        Ok(())
+        Ok(types)
     }
 
     /// The output columns of a `COPY (query) TO STDOUT`, from the same code
@@ -35784,7 +35804,7 @@ impl PgHandler {
                 // `INSERT ... SELECT`: read the query's rows first, then write
                 // them exactly as a VALUES list would be written.
                 if let Some(source) = ins.source.take() {
-                    self.check_insert_select_types(&def, &ins, &source)?;
+                    let mut source_types = self.check_insert_select_types(&def, &ins, &source)?;
                     // With user casts installed, the source's column types
                     // decide whether an assignment cast converts a value.
                     let (schema, rows) = if secantus_pgplan::user_casts::any() {
@@ -35812,14 +35832,19 @@ impl PgHandler {
                                         .map_err(|e| Self::err(&e))?
                                 {
                                     *v = out;
+                                    // Assigned already: the column's type now.
+                                    if let Some(t) = source_types.get_mut(i) {
+                                        *t = col.pg_type.clone();
+                                    }
                                 }
                             }
                         }
-                        let row = secantus_pgplan::insert_row(
+                        let row = secantus_pgplan::insert_row_typed(
                             &def,
                             &ins.targets,
                             ins.explicit_columns,
                             values,
+                            &source_types,
                         )
                         .map_err(|e| Self::err(&e))?;
                         ins.rows.push(row);

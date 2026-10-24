@@ -26690,7 +26690,14 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         f.args.get(2).and_then(|a| a.node.as_ref()),
                         Some(N::ParamRef(_))
                     );
-                    let value = range::render(&range::from_args(&args, &type_name, literal_flags)?);
+                    let types: Vec<String> =
+                        f.args.iter().zip(&args).map(|(a, v)| static_type(a, v)).collect();
+                    let value = range::render(&range::from_typed_args(
+                        &args,
+                        &types,
+                        &type_name,
+                        literal_flags,
+                    )?);
                     columns.push((
                         if rt.name.is_empty() {
                             name.clone()
@@ -39408,8 +39415,15 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                     f.args.get(2).and_then(|a| a.node.as_ref()),
                     Some(N::ParamRef(_))
                 );
-                return Ok(Bson::String(range::render(&range::from_args(
+                let types: Vec<String> = f
+                    .args
+                    .iter()
+                    .zip(&args)
+                    .map(|(a, v)| static_type(a, v))
+                    .collect();
+                return Ok(Bson::String(range::render(&range::from_typed_args(
                     &args,
+                    &types,
                     &type_name,
                     literal_flags,
                 )?)));

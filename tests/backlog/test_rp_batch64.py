@@ -1,5 +1,6 @@
 """Batch 64 of the Rust PG server (2026-10-24): `pg_subscription` is one
-catalog for the cluster (RP-169).
+catalog for the cluster (RP-169), an MCV list's timestamps (RP-099), and a
+`timestamptz` assigned or bounded under a session's zone (RP-240).
 
 Each scenario runs the same statements against a private, freshly
 initdb'd PostgreSQL 15.19 cluster and this server; the literals are 15.19's
@@ -24,6 +25,70 @@ from tests.backlog.test_rp_batch34 import run_scenario
 _SUB = "connection 'dbname=x' publication p with (connect = false, slot_name = none)"
 
 SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
+    # --------------------------------------- RP-099 a timestamp's MCV datums
+    "an MCV list over timestamps keeps their microseconds": (
+        "RP-099",
+        False,
+        [
+            "begin",
+            "set local timezone = 'America/New_York'",
+            "create table rp64_m (t timestamp, z timestamptz, a int)",
+            "insert into rp64_m select"
+            " timestamp '2020-01-01 10:00' + (g % 3) * interval '1.0003 sec',"
+            " timestamptz '2021-06-01 00:00+02' + (g % 2) * interval '5 microseconds', g % 3"
+            " from generate_series(1, 30) g",
+            "create statistics rp64_ms (mcv) on t, z, a from rp64_m",
+            "analyze rp64_m",
+            "select d.stxdmcv::text from pg_statistic_ext s join pg_statistic_ext_data d"
+            " on d.stxoid = s.oid where s.stxname = 'rp64_ms'",
+            "select m.index, m.values, m.frequency from pg_statistic_ext s"
+            " join pg_statistic_ext_data d on d.stxoid = s.oid, pg_mcv_list_items(d.stxdmcv) m"
+            " where s.stxname = 'rp64_ms' order by 1",
+            "rollback",
+        ],
+    ),
+    # ------------------------- RP-240 a timestamptz under a session's zone
+    "INSERT ... SELECT keeps a timestamptz's instant": (
+        "RP-240",
+        False,
+        [
+            "begin",
+            "set local timezone = 'America/New_York'",
+            "create table rp64_z (k text, z timestamptz, t timestamp, d date, r tstzrange,"
+            " a timestamptz[])",
+            "insert into rp64_z select 'tz', timestamptz '2021-06-01 00:00+02',"
+            " timestamptz '2021-06-01 00:00+02', timestamptz '2021-06-01 00:00+02',"
+            " tstzrange(timestamptz '2021-06-01 00:00+02', null),"
+            " array[timestamptz '2021-06-01 00:00+02']",
+            "insert into rp64_z select 'ts', timestamp '2021-06-01 00:00',"
+            " timestamp '2021-06-01 00:00',"
+            " timestamp '2021-06-01 00:00', tstzrange(timestamp '2021-06-01 00:00', null),"
+            " array[timestamp '2021-06-01 00:00']",
+            "insert into rp64_z select 'plus', z + interval '5 microseconds', t, d, r, a"
+            " from rp64_z where k = 'tz'",
+            "insert into rp64_z select 'copy', z, t, d, r, a from rp64_z where k = 'plus'",
+            "select k, z, t, d, r, a, extract(epoch from z) from rp64_z order by k",
+            "rollback",
+        ],
+    ),
+    "a tstzrange of timestamptz bounds keeps their instants": (
+        "RP-240",
+        False,
+        [
+            "begin",
+            "set local timezone = 'America/New_York'",
+            "select tstzrange(timestamptz '2021-06-01 00:00+02', null),"
+            " tstzrange(timestamp '2021-06-01 00:00', timestamp '2021-06-02 00:00'),"
+            " tstzrange('2021-06-01 00:00', '2021-06-02 00:00+02', '[]'),"
+            " tstzrange(timestamptz '2021-06-01 00:00:00.000005+02', null)",
+            "create table rp64_r (z timestamptz, t timestamp)",
+            "insert into rp64_r values ('2021-06-01 00:00+02', '2021-06-01 00:00'),"
+            " ('2021-06-01 00:00:00.5+02', '2021-06-01 00:00:00.25')",
+            "select tstzrange(z, z + interval '1 hour'), tstzrange(t, t + interval '1 hour')"
+            " from rp64_r order by z",
+            "rollback",
+        ],
+    ),
     "each database names its own subscriptions": (
         "RP-169",
         False,
@@ -76,6 +141,129 @@ def test_scenario(name: str, rust_pg: Any) -> None:
 
 
 EXPECTED: dict[str, Any] = {
+    "an MCV list over timestamps keeps their microseconds": [
+        "BEGIN",
+        "SET",
+        "CREATE TABLE",
+        "INSERT 0 30",
+        "CREATE STATISTICS",
+        "ANALYZE",
+        [
+            (
+                "\\xc251a6e1010000000600000003005a040000a00400001700000003000000180000000000000008000000010000000200000010000000000000000800000001000000030000000c00000000000000040000000100000000c886e80f3e02006c0b96e80f3e0200d84ea5e80f3e020000f88f1da666020005f88f1da6660200000000000100000002000000000000555555555555c53f1cc7711cc771ac3f000000000000000000555555555555c53f1cc7711cc771ac3f000001000000000000555555555555c53f1cc7711cc771ac3f010000000100000000555555555555c53f1cc7711cc771ac3f010001000100000000555555555555c53f1cc7711cc771ac3f020000000200000000555555555555c53f1cc7711cc771ac3f020001000200",
+            )
+        ],
+        [
+            ("0", "['2020-01-01 10:00:00', '2021-05-31 18:00:00-04', '0']", "0.16666666666666666"),
+            (
+                "1",
+                "['2020-01-01 10:00:00', '2021-05-31 18:00:00.000005-04', '0']",
+                "0.16666666666666666",
+            ),
+            (
+                "2",
+                "['2020-01-01 10:00:01.0003', '2021-05-31 18:00:00-04', '1']",
+                "0.16666666666666666",
+            ),
+            (
+                "3",
+                "['2020-01-01 10:00:01.0003', '2021-05-31 18:00:00.000005-04', '1']",
+                "0.16666666666666666",
+            ),
+            (
+                "4",
+                "['2020-01-01 10:00:02.0006', '2021-05-31 18:00:00-04', '2']",
+                "0.16666666666666666",
+            ),
+            (
+                "5",
+                "['2020-01-01 10:00:02.0006', '2021-05-31 18:00:00.000005-04', '2']",
+                "0.16666666666666666",
+            ),
+        ],
+        "ROLLBACK",
+    ],
+    "INSERT ... SELECT keeps a timestamptz's instant": [
+        "BEGIN",
+        "SET",
+        "CREATE TABLE",
+        "INSERT 0 1",
+        "INSERT 0 1",
+        "INSERT 0 1",
+        "INSERT 0 1",
+        [
+            (
+                "copy",
+                "2021-05-31 18:00:00.000005-04:00",
+                "2021-05-31 18:00:00",
+                "2021-05-31",
+                "[2021-05-31 18:00:00-04:00, None)",
+                "[datetime.datetime(2021, 5, "
+                "31, 18, 0, "
+                "tzinfo=zoneinfo.ZoneInfo(key='America/New_York'))]",
+                "1622498400.000005",
+            ),
+            (
+                "plus",
+                "2021-05-31 18:00:00.000005-04:00",
+                "2021-05-31 18:00:00",
+                "2021-05-31",
+                "[2021-05-31 18:00:00-04:00, None)",
+                "[datetime.datetime(2021, 5, "
+                "31, 18, 0, "
+                "tzinfo=zoneinfo.ZoneInfo(key='America/New_York'))]",
+                "1622498400.000005",
+            ),
+            (
+                "ts",
+                "2021-06-01 00:00:00-04:00",
+                "2021-06-01 00:00:00",
+                "2021-06-01",
+                "[2021-06-01 00:00:00-04:00, None)",
+                "[datetime.datetime(2021, 6, 1, "
+                "0, 0, "
+                "tzinfo=zoneinfo.ZoneInfo(key='America/New_York'))]",
+                "1622520000.000000",
+            ),
+            (
+                "tz",
+                "2021-05-31 18:00:00-04:00",
+                "2021-05-31 18:00:00",
+                "2021-05-31",
+                "[2021-05-31 18:00:00-04:00, None)",
+                "[datetime.datetime(2021, 5, "
+                "31, 18, 0, "
+                "tzinfo=zoneinfo.ZoneInfo(key='America/New_York'))]",
+                "1622498400.000000",
+            ),
+        ],
+        "ROLLBACK",
+    ],
+    "a tstzrange of timestamptz bounds keeps their instants": [
+        "BEGIN",
+        "SET",
+        [
+            (
+                "[2021-05-31 18:00:00-04:00, None)",
+                "[2021-06-01 00:00:00-04:00, 2021-06-02 00:00:00-04:00)",
+                "[2021-06-01 00:00:00-04:00, 2021-06-01 18:00:00-04:00]",
+                "[2021-05-31 18:00:00.000005-04:00, None)",
+            )
+        ],
+        "CREATE TABLE",
+        "INSERT 0 2",
+        [
+            (
+                "[2021-05-31 18:00:00-04:00, 2021-05-31 19:00:00-04:00)",
+                "[2021-06-01 00:00:00-04:00, 2021-06-01 01:00:00-04:00)",
+            ),
+            (
+                "[2021-05-31 18:00:00.500000-04:00, 2021-05-31 19:00:00.500000-04:00)",
+                "[2021-06-01 00:00:00.250000-04:00, 2021-06-01 01:00:00.250000-04:00)",
+            ),
+        ],
+        "ROLLBACK",
+    ],
     "each database names its own subscriptions": [
         "DROP DATABASE",
         "DROP DATABASE",
@@ -113,7 +301,7 @@ EXPECTED: dict[str, Any] = {
         "DROP SUBSCRIPTION",
         [("1",)],
         [("0",)],
-    ]
+    ],
 }
 
 

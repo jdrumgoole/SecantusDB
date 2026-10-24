@@ -397,7 +397,11 @@ impl PgHandler {
                         let field = c.field();
                         let values: Vec<Option<Bson>> = docs
                             .iter()
-                            .map(|d| d.get(&field).filter(|v| !matches!(v, Bson::Null)).cloned())
+                            // A timestamp with its hidden microseconds folded in.
+                            .map(|d| {
+                                Some(secantus_pgplan::field_value(d, &field))
+                                    .filter(|v| !matches!(v, Bson::Null))
+                            })
                             .collect();
                         Dim {
                             attnum: *attnum,
