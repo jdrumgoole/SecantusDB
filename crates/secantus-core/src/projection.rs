@@ -120,15 +120,79 @@ pub const META_KEYWORDS: &[&str] = &[
     "searchSequenceToken",
 ];
 
+/// The argument of a FIND `$slice`: `{$slice: n}` or `{$slice: [skip,
+/// limit]}`. Any other `$slice` is the aggregation expression, a computed
+/// field (mongod 8.2.11, 2026-10-24: `{y: {$slice: ["$arr", 1]}}` computes
+/// `y`).
 fn slice_spec(v: &Bson) -> Option<&Bson> {
     if let Bson::Document(d) = v {
         if d.len() == 1 {
             if let Some(arg) = d.get("$slice") {
-                return Some(arg);
+                return find_slice_problem(arg).is_none().then_some(arg);
             }
         }
     }
     None
+}
+
+fn is_number(v: &Bson) -> bool {
+    matches!(
+        v,
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+    )
+}
+
+/// Why `arg` is not find's `$slice` syntax, as mongod's parser says it
+/// (measured 8.2.11, 2026-10-24); None when it is.
+pub fn find_slice_problem(arg: &Bson) -> Option<(i32, String)> {
+    let Bson::Array(args) = arg else {
+        return (!is_number(arg)).then(|| {
+            (
+                31273,
+                "$slice only supports numbers and [skip, limit] arrays".to_string(),
+            )
+        });
+    };
+    let [skip, limit] = args.as_slice() else {
+        return Some((
+            31272,
+            "$slice array argument should be of form [skip, limit]".to_string(),
+        ));
+    };
+    if !is_number(skip) {
+        return Some((
+            31257,
+            format!(
+                "$slice expects the skip argument to be a number, got {}",
+                crate::query::bson_type_name(skip)
+            ),
+        ));
+    }
+    if !is_number(limit) {
+        return Some((
+            31258,
+            format!(
+                "$slice expects the limit argument to be a number, got {}",
+                crate::query::bson_type_name(limit)
+            ),
+        ));
+    }
+    let positive = match limit {
+        Bson::Int32(n) => *n > 0,
+        Bson::Int64(n) => *n > 0,
+        Bson::Double(d) => *d > 0.0,
+        Bson::Decimal128(d) => d.to_string().parse::<f64>().is_ok_and(|l| l > 0.0),
+        _ => false,
+    };
+    (!positive).then(|| {
+        (
+            31259,
+            format!(
+                "$slice limit must be positive, got {}",
+                crate::query::bson_value_repr(limit)
+            ),
+        )
+    })
 }
 
 /// Truthiness of an inclusion/exclusion spec value. Only the literal 0/1 /
@@ -223,50 +287,11 @@ fn apply_slice(value: Bson, slice_arg: &Bson) -> R<Bson> {
     Ok(Bson::Array(out))
 }
 
-/// Build the per-element predicate a positional `arr.$` projects against, from the
-/// query's clauses on `array_path`. Returns `(doc_pred, value_pred)` — a
-/// sub-document match (from `arr.sub` clauses and an `arr: {$elemMatch: E}` clause)
-/// and an optional direct value/operator predicate (from `arr: <value|ops>`). None
-/// when the query has no clause on `array_path` (mongod errors Location51246).
-/// Mirrors `projection._positional_element_predicate`.
-fn positional_predicate(
-    query: Option<&Document>,
-    array_path: &str,
-) -> Option<(Document, Option<Bson>)> {
-    let query = query?;
-    let mut doc_pred = Document::new();
-    let mut value_pred: Option<Bson> = None;
-    let prefix = format!("{array_path}.");
-    let mut found = false;
-    for (key, val) in query {
-        if key == array_path {
-            found = true;
-            match val {
-                Bson::Document(d) if d.len() == 1 && d.contains_key("$elemMatch") => {
-                    if let Some(Bson::Document(em)) = d.get("$elemMatch") {
-                        for (k, v) in em {
-                            doc_pred.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-                other => value_pred = Some(other.clone()),
-            }
-        } else if let Some(sub) = key.strip_prefix(&prefix) {
-            found = true;
-            doc_pred.insert(sub.to_string(), val.clone());
-        }
-    }
-    if !found {
-        return None;
-    }
-    Some((doc_pred, value_pred))
-}
-
-/// Validate a positional projection up-front (mongod validates at parse time, so
-/// an invalid `arr.$` errors even when nothing matches). `Err(Fallback::Defer)` for the
-/// error cases (>1 positional / exclusion / array field not in the query) — the
-/// find handler surfaces it as `BadValue`, and the pure-Python oracle raises the
-/// exact Location code (31276 / 31395 / 51246).
+/// A positional projection's parse-time checks (mongod 8.2.11, 2026-10-24):
+/// one per query (31276), never an exclusion (31395), and no `$expr` in the
+/// filter beside it (224). Whether the filter names the array is not one of
+/// them: the position is whatever the query's match recorded
+/// (`elem_match_key`), and none is an error per document (51246).
 pub fn validate_projection(spec: &Document, query: Option<&Document>) -> R<()> {
     // Path collisions are the projection parser's (`expr_parse::projection_spec`),
     // which runs before this and walks the tree as mongod does.
@@ -275,50 +300,75 @@ pub fn validate_projection(spec: &Document, query: Option<&Document>) -> R<()> {
         return Ok(());
     }
     if positional.len() > 1 {
-        return Err(Fallback::Defer);
+        return Err(Fallback::mongo(
+            31276,
+            "Cannot specify more than one positional projection per query.",
+        )
+        .bare());
     }
-    let key = positional[0];
-    if !spec_truthy(&spec[key])? {
-        return Err(Fallback::Defer);
+    if !spec_truthy(&spec[positional[0]])? {
+        return Err(
+            Fallback::mongo(31395, "positional projection cannot be used with exclusion").bare(),
+        );
     }
-    let array_path = &key[..key.len() - 2];
-    if positional_predicate(query, array_path).is_none() {
-        return Err(Fallback::Defer);
+    if query.is_some_and(filter_has_expr) {
+        return Err(Fallback::mongo(224, "$expr is not allowed in this context").bare());
     }
     Ok(())
 }
 
-/// First element of `arr` matching the positional predicate, or `Ok(None)`.
-fn positional_first(
-    arr: Option<&Bson>,
-    doc_pred: &Document,
-    value_pred: Option<&Bson>,
-) -> R<Option<Bson>> {
-    let Some(Bson::Array(arr)) = arr else {
-        return Ok(None);
-    };
-    let empty = Document::new();
-    for elem in arr {
-        if !doc_pred.is_empty() {
-            match elem {
-                Bson::Document(ed) => {
-                    if !query::matches(ed, doc_pred, &empty, None)? {
-                        continue;
+fn filter_has_expr(filter: &Document) -> bool {
+    filter.iter().any(|(k, v)| match (k.as_str(), v) {
+        ("$expr", _) => true,
+        ("$and" | "$or" | "$nor", Bson::Array(subs)) => subs
+            .iter()
+            .any(|s| matches!(s, Bson::Document(d) if filter_has_expr(d))),
+        _ => false,
+    })
+}
+
+/// The field a positional `path.$` projects, as `(the path to set, its
+/// value)`: the element at `key` of the first array on `path`, the rest of
+/// the path projected within it; a value no array holds, as it is; nothing
+/// for a missing one. An array with no recorded position is 51246, and one
+/// too short for it 51247 (mongod 8.2.11, 2026-10-24).
+fn positional_field(doc: &Document, path: &str, key: Option<usize>) -> R<Option<(String, Bson)>> {
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut cur = doc;
+    for (i, part) in parts.iter().enumerate() {
+        let Some(value) = cur.get(*part) else {
+            return Ok(None);
+        };
+        let last = i + 1 == parts.len();
+        match value {
+            Bson::Array(a) => {
+                let key = key.ok_or_else(|| {
+                    Fallback::mongo(
+                        51246,
+                        "positional operator '.$' couldn't find a matching element in the array",
+                    )
+                })?;
+                let element = a.get(key).ok_or_else(|| {
+                    Fallback::mongo(51247, "positional operator '.$' element mismatch")
+                })?;
+                let at = parts[..=i].join(".");
+                let projected = if last {
+                    element.clone()
+                } else {
+                    match element {
+                        Bson::Document(ed) => {
+                            let rest = parts[i + 1..].join(".");
+                            Bson::Document(include_doc(ed, &spec_tree(&[rest.as_str()])))
+                        }
+                        _ => return Ok(Some((at, Bson::Array(Vec::new())))),
                     }
-                }
-                _ => continue,
+                };
+                return Ok(Some((at, Bson::Array(vec![projected]))));
             }
+            _ if last => return Ok(Some((path.to_string(), value.clone()))),
+            Bson::Document(d) => cur = d,
+            _ => return Ok(None),
         }
-        if let Some(vp) = value_pred {
-            let mut wrapper = Document::new();
-            wrapper.insert("_".to_string(), elem.clone());
-            let mut q = Document::new();
-            q.insert("_".to_string(), vp.clone());
-            if !query::matches(&wrapper, &q, &empty, None)? {
-                continue;
-            }
-        }
-        return Ok(Some(elem.clone()));
     }
     Ok(None)
 }
@@ -330,8 +380,7 @@ fn apply_positional(
     spec_main: &[(&str, &Bson)],
     slice_specs: &[(&str, &Bson)],
     array_path: &str,
-    doc_pred: &Document,
-    value_pred: Option<Bson>,
+    key: Option<usize>,
 ) -> R<Document> {
     let mut result = Document::new();
     let id_spec = spec_main.iter().find(|(k, _)| *k == "_id").map(|(_, v)| *v);
@@ -375,12 +424,8 @@ fn apply_positional(
             }
         }
     }
-    if let Some(first) = positional_first(
-        paths::get_path(doc, array_path),
-        doc_pred,
-        value_pred.as_ref(),
-    )? {
-        set(&mut result, array_path, Bson::Array(vec![first]))?;
+    if let Some((at, value)) = positional_field(doc, array_path, key)? {
+        set(&mut result, &at, value)?;
     }
     for (path, slice_arg) in slice_specs {
         if !paths::has_path(&result, path) {
@@ -555,10 +600,14 @@ fn flatten_entry(key: &str, value: &Bson, out: &mut Vec<(String, Bson)>) -> R<()
 /// `evaluate_or_missing` is the field-value evaluator that draws exactly that
 /// line. A dotted output key builds the nesting via `set`, never a key with a
 /// literal dot in it. Mirrors `projection.py::_with_computed`.
-fn with_computed(result: &mut Document, doc: &Document, computed: &[(String, Bson)]) -> R<()> {
-    let vars = Document::new();
+fn with_computed(
+    result: &mut Document,
+    doc: &Document,
+    computed: &[(String, Bson)],
+    vars: &Document,
+) -> R<()> {
     for (key, expr) in computed {
-        let value = crate::expressions::evaluate_or_missing(doc, expr, &vars)?;
+        let value = crate::expressions::evaluate_or_missing(doc, expr, vars)?;
         if matches!(value, Bson::Undefined) {
             continue; // the bare-reference case: leave the field out entirely
         }
@@ -570,6 +619,17 @@ fn with_computed(result: &mut Document, doc: &Document, computed: &[(String, Bso
 /// Apply a projection spec to a document. `Err(Fallback::Defer)` => defer to the
 /// pure-Python `apply_projection` (which also raises the mixed-mode error).
 pub fn apply_projection(doc: &Document, spec: &Document, query: Option<&Document>) -> R<Document> {
+    apply_projection_with(doc, spec, query, &Document::new())
+}
+
+/// [`apply_projection`] with the command's variables (its `let`, `$$NOW`),
+/// which a computed field may read.
+pub fn apply_projection_with(
+    doc: &Document,
+    spec: &Document,
+    query: Option<&Document>,
+    vars: &Document,
+) -> R<Document> {
     if spec.is_empty() {
         return Ok(doc.clone());
     }
@@ -597,7 +657,7 @@ pub fn apply_projection(doc: &Document, spec: &Document, query: Option<&Document
                 stripped.insert(k.clone(), v.clone());
             }
         }
-        return apply_projection(doc, &stripped, query);
+        return apply_projection_with(doc, &stripped, query, vars);
     }
 
     // COMPUTED fields (`{x: "$a"}`, `{x: {$add: [...]}}`, a literal constant).
@@ -650,9 +710,9 @@ pub fn apply_projection(doc: &Document, spec: &Document, query: Option<&Document
                 }
                 only_id
             } else {
-                apply_projection(doc, &flags, query)?
+                apply_projection_with(doc, &flags, query, vars)?
             };
-            with_computed(&mut result, doc, &computed)?;
+            with_computed(&mut result, doc, &computed, vars)?;
             return Ok(result);
         }
         // A sub-document is a sub-projection, one leaf per field: `{a: {b: 1}}`
@@ -661,7 +721,7 @@ pub fn apply_projection(doc: &Document, spec: &Document, query: Option<&Document
             || flattened.iter().zip(spec.keys()).any(|((k, _), s)| k != s)
         {
             let flat: Document = flattened.into_iter().collect();
-            return apply_projection(doc, &flat, query);
+            return apply_projection_with(doc, &flat, query, vars);
         }
     }
 
@@ -681,9 +741,8 @@ pub fn apply_projection(doc: &Document, spec: &Document, query: Option<&Document
     }
 
     if !positional.is_empty() {
-        // >1 positional, an exclusion positional, or a positional whose array field
-        // isn't in the query all error in mongod — defer to Python for the exact
-        // Location code (31276 / 31395 / 51246).
+        // More than one, or an exclusion, is refused while parsing
+        // (`validate_projection`).
         if positional.len() > 1 {
             return Err(Fallback::Defer);
         }
@@ -692,17 +751,12 @@ pub fn apply_projection(doc: &Document, spec: &Document, query: Option<&Document
             return Err(Fallback::Defer);
         }
         let array_path = &pos_key[..pos_key.len() - 2]; // strip ".$"
-        let Some((doc_pred, value_pred)) = positional_predicate(query, array_path) else {
-            return Err(Fallback::Defer); // no query clause on the array -> 51246
+        let key = match query {
+            Some(q) => crate::elem_match_key::elem_match_key(doc, q, vars)?,
+            None => None,
         };
-        return apply_positional(
-            doc,
-            &spec_main,
-            &slice_specs,
-            array_path,
-            &doc_pred,
-            value_pred,
-        );
+        return apply_positional(doc, &spec_main, &slice_specs, array_path, key)
+            .map(|result| in_document_order(result, doc));
     }
 
     let id_spec: Option<&Bson> = spec_main.iter().find(|(k, _)| *k == "_id").map(|(_, v)| *v);

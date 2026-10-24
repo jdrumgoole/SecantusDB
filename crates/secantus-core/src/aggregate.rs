@@ -1385,6 +1385,13 @@ fn expression_field_paths(expr: &Bson, out: &mut Vec<String>) -> Option<()> {
 
 // --- $project (mirrors aggregate._project_one) --------------------------
 
+/// A `{$meta: ...}`, or the read of a field the command layer put in its
+/// place (`agg_meta`'s `__secantus_meta_recordId` / `__secantus_meta_indexKey`).
+fn is_metadata(v: &Bson) -> bool {
+    crate::projection::meta_spec(v).is_some()
+        || matches!(v, Bson::String(s) if s.starts_with("$__secantus_meta_"))
+}
+
 fn project_one(doc: &Document, spec: &Document, vars: &Document) -> R<Document> {
     // A sub-document is a sub-projection, classified leaf by leaf:
     // `{a: {b: 1}}` includes `a.b`, `{a: {b: 0}}` excludes it, and
@@ -1423,6 +1430,16 @@ fn project_one(doc: &Document, spec: &Document, vars: &Document) -> R<Document> 
     }
 
     let has_exclusion = !exclusions.is_empty();
+    // `$meta` is the one expression an exclusion may hold: the excluded
+    // document gains the metadata field, or nothing where there is none
+    // (`textScore` with no text query is 40218; measured 8.2.11, 2026-10-24).
+    let mut metas: Vec<(&str, &Bson)> = Vec::new();
+    if has_exclusion
+        && !computed.is_empty()
+        && computed.iter().all(|(k, v)| *k != "_id" && is_metadata(v))
+    {
+        metas = std::mem::take(&mut computed);
+    }
     // `{_id: 1}` on its own is an INCLUSION projection: mongod returns only
     // `_id` (measured 8.2.11, 2026-09-30). With nothing else included it fell
     // through to exclusion mode here, excluded nothing, and returned the whole
@@ -1482,6 +1499,12 @@ fn project_one(doc: &Document, spec: &Document, vars: &Document) -> R<Document> 
     }
     if id_handling == Some(0) {
         result.remove("_id");
+    }
+    for (key, expr) in metas {
+        let v = evaluate_or_missing(expr, doc, vars)?;
+        if !matches!(v, Bson::Undefined) {
+            paths::set_path(&mut result, key, v).map_err(|_| Fallback::Defer)?;
+        }
     }
     Ok(result)
 }

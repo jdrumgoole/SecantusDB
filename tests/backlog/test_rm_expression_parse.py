@@ -252,18 +252,23 @@ def test_nested_sub_projection(rust_mongo: Any, mongod: Any) -> None:
     assert _diverging(rust_mongo, mongod, shapes) == []
 
 
-@pytest.mark.backlog("RM-286")
+@pytest.mark.backlog_fixed("RM-286")
 def test_meta_in_exclusion_project(rust_mongo: Any, mongod: Any) -> None:
     """`$meta` is the one expression an exclusion `$project` may hold; with
-    no text query behind it, mongod answers 40218. The Rust server answers
-    "not supported" (measured 8.2.11, 2026-10-23)."""
+    no text query behind it, mongod answers 40218, and metadata the
+    document does not have leaves the field out. The Rust server answered
+    "not supported" (measured 8.2.11, 2026-10-23 and 2026-10-24)."""
     shapes = [
         ("exclusion then $meta", "agg", [{"$project": {"a": 0, "b": {"$meta": "textScore"}}}]),
+        ("$meta then exclusion", "agg", [{"$project": {"b": {"$meta": "textScore"}, "a": 0}}]),
     ]
+    for meta in ("indexKey", "recordId", "randVal", "searchScore"):
+        spec = {"a": 0, "b": {"$meta": meta}}
+        shapes.append((f"exclusion and {meta}", "agg", [{"$project": spec}]))
     assert _diverging(rust_mongo, mongod, shapes) == []
 
 
-@pytest.mark.backlog("RM-287")
+@pytest.mark.backlog_fixed("RM-287")
 def test_find_only_projection_operators(rust_mongo: Any, mongod: Any) -> None:
     """`find`'s own projection forms at their edges. `{$slice: [<path>, n]}`
     is not find's `[skip, limit]`, so mongod parses it as the expression
@@ -276,3 +281,139 @@ def test_find_only_projection_operators(rust_mongo: Any, mongod: Any) -> None:
         ("positional, empty filter", "find", [{}, {"a.$": 1}]),
     ]
     assert _diverging(rust_mongo, mongod, shapes) == []
+
+
+_POSITIONAL_DOCS = [
+    {
+        "_id": 1,
+        "arr": [10, 20, 30],
+        "o": [{"k": 1, "j": 9}, {"k": 2, "j": 8}, {"k": 3, "j": 7}],
+        "m": [[1, 2], [3, 4]],
+        "s": "x",
+        "a": {"b": 5},
+        "n": {"arr": [4, 5]},
+        "short": [1, 2],
+    },
+    {"_id": 2, "s": "y"},
+    {"_id": 3, "arr": 7, "a": [{"b": 5}, {"b": 6}]},
+]
+
+
+def _finds(client: Any, docs: list, calls: list) -> list:
+    db = client.rm_expression_parse
+    db.pp.drop()
+    db.pp.insert_many(docs)
+    out = []
+    for args in calls:
+        got = mongo_answer(lambda args=args: list(db.pp.find(*args).sort("_id", 1)))
+        if got[0] == "ok":
+            got = ("ok", json_util.dumps(got[1], json_options=_CANON))
+        out.append(got)
+    return out
+
+
+def _diverging_finds(rust_mongo: Any, mongod: Any, docs: list, calls: list) -> list:
+    ours, theirs = _finds(rust_mongo, docs, calls), _finds(mongod, docs, calls)
+    return [
+        f"{args}:\n  mongod {t!r}\n  rust   {o!r}"
+        for args, o, t in zip(calls, ours, theirs, strict=True)
+        if o != t
+    ]
+
+
+@pytest.mark.backlog_fixed("RM-287")
+def test_positional_reads_the_position_the_match_recorded(rust_mongo: Any, mongod: Any) -> None:
+    """A positional `path.$` reads the element at the position mongod's match
+    recorded (`MatchDetails::elemMatchKey`): the first matching element of
+    the first array on a leaf's path, the last leaf to record one winning in
+    the optimizer's order (match type, then path), so it may come from
+    another array. `$or`, `$nor` and the negations record nothing. With no
+    position over an array, 51246; past its end, 51247; a value no array
+    holds is returned as it is. More than one positional is 31276, an
+    exclusion 31395, and `$expr` beside one 224. The Rust server re-matched
+    the filter's clauses on the projected array, and refused every filter
+    that did not name it (measured 8.2.11, 2026-10-24)."""
+    calls = [
+        ({"_id": 2}, {"arr.$": 1}),
+        ({"_id": 3}, {"arr.$": 1}),
+        ({"_id": 1}, {"s.$": 1}),
+        ({"_id": 1}, {"arr.$": 1}),
+        ({}, {"arr.$": 1}),
+        ({"s": "x"}, {"s.$": 1}),
+        ({"a.b": 5}, {"a.$": 1}),
+        ({"arr": {"$gt": 15}}, {"arr.$": 1}),
+        ({"n.arr": 5}, {"n.arr.$": 1}),
+        ({"_id": 1}, {"n.$": 1}),
+        ({"_id": 1, "arr": 20}, {"arr.$": 1, "s": 1}),
+        ({"_id": {"$in": [1, 2]}}, {"s.$": 1}),
+        ({"o.k": 2, "_id": 1}, {"arr.$": 1}),
+        ({"o.k": 3, "arr": 10}, {"arr.$": 1}),
+        ({"$and": [{"arr": 30}, {"o.k": 1}]}, {"arr.$": 1}),
+        ({"$or": [{"arr": 30}, {"o.k": 1}]}, {"arr.$": 1}),
+        ({"$or": [{"o.k": 2}]}, {"o.$": 1}),
+        ({"$nor": [{"arr": 99}], "_id": 1}, {"arr.$": 1}),
+        ({"arr": {"$elemMatch": {"$gt": 15}}}, {"arr.$": 1}),
+        ({"o": {"$elemMatch": {"k": 3}}}, {"arr.$": 1}),
+        ({"arr": {"$in": [30, 20]}}, {"arr.$": 1}),
+        ({"arr": {"$all": [30, 20]}}, {"arr.$": 1}),
+        ({"arr": {"$size": 3}}, {"arr.$": 1}),
+        ({"arr": {"$exists": True}, "_id": 1}, {"arr.$": 1}),
+        ({"arr": {"$ne": 5}, "_id": 1}, {"arr.$": 1}),
+        ({"arr": {"$gt": 15, "$lt": 25}}, {"arr.$": 1}),
+        ({"arr": {"$gt": 25}, "o.k": {"$gte": 1}}, {"arr.$": 1}),
+        ({"arr": {"$type": "int"}, "o.k": 3}, {"o.$": 1}),
+        ({"m": [3, 4]}, {"m.$": 1}),
+        ({"arr": [10, 20, 30]}, {"arr.$": 1}),
+        ({"arr.1": 20}, {"arr.$": 1}),
+        ({"o.k": 3}, {"short.$": 1}),
+        ({"o.k": 3}, {"o.k.$": 1}),
+        ({"o.k": 3}, {"o.j.$": 1}),
+        ({"o.k": 2}, {"o.$": 1, "arr": 1}),
+        ({"_id": 1}, {"arr.$": 0}),
+        ({"_id": 1}, {"arr.$": 1, "s.$": 1}),
+        ({"$expr": {"$eq": [1, 1]}}, {"arr.$": 1}),
+    ]
+    assert _diverging_finds(rust_mongo, mongod, _POSITIONAL_DOCS, calls) == []
+
+
+@pytest.mark.backlog_fixed("RM-287")
+def test_slice_is_find_syntax_or_the_expression(rust_mongo: Any, mongod: Any) -> None:
+    """A find projection's `$slice` is find's syntax when it is a number or a
+    `[skip, limit]` of numbers with a positive limit, and the aggregation
+    `$slice` expression otherwise -- a computed field, so per-document
+    errors carry the executor's wrapper, and a constant one is folded while
+    parsing. Neither is 28667 (31252 in an exclusion) naming both reasons.
+    The expression reads its first two arguments, null winning, before it
+    checks their types. The Rust server took every `$slice` for find's own
+    and ignored or refused the rest (measured 8.2.11, 2026-10-24)."""
+    docs = [{"_id": 1, "arr": [1, 2, 3], "x": 5, "n": None}, {"_id": 2, "arr": "str"}]
+    args: list = [
+        [1, 0],
+        [1, "a"],
+        ["$arr"],
+        [[5, 6, 7], 1],
+        ["$arr", -1],
+        ["$arr", 1, 1],
+        "$arr",
+        1.5,
+        [1.5, 1],
+        ["$x", 1],
+        [{"$literal": [1, 2]}, 1],
+        [1, 2, 3, 4],
+        [],
+        None,
+        [None, 1],
+        [1, None],
+        ["$x", "$n"],
+        ["$x", "$n", 1],
+        ["$x", 1, "$n"],
+        ["$arr", "$n", True],
+        ["$arr", True, "$n"],
+    ]
+    calls = []
+    for arg in args:
+        calls.append(({}, {"y": {"$slice": arg}}))
+        calls.append(({}, {"x": 0, "arr": {"$slice": arg}}))
+    calls.append(({}, {"y": {"$slice": ["$arr", 1]}, "x": 1}))
+    calls.append(({}, {"x": 0, "arr": {"$slice": [1, 1]}}))
+    assert _diverging_finds(rust_mongo, mongod, docs, calls) == []

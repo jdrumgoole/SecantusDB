@@ -285,6 +285,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
         }
         if let Some(problem) = crate::find::projection_name_error(spec)
             .or_else(|| crate::find::projection_mix_error(spec))
+            .or_else(|| crate::find::projection_expression_error(spec, doc.get("let"), ctx))
         {
             return Ok(problem.into_reply());
         }
@@ -525,7 +526,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                     match outcome.post_image {
                         // The upserted doc, from the write itself — a re-`find`
                         // here races concurrent writers to the same doc.
-                        Some(post) => project_value(post, fields, &query)?,
+                        Some(post) => project_value(post, fields, &query, &let_vars)?,
                         None => Bson::Null,
                     }
                 } else {
@@ -590,7 +591,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                 continue;
             }
             crate::transactions::note_statement(0, crate::transactions::StmtRecord::Delete);
-            let value = project_value(matched_doc, fields, &query)?;
+            let value = project_value(matched_doc, fields, &query, &let_vars)?;
             // No `updatedExisting`: mongod reports it only for an UPDATE, and
             // drivers read `lastErrorObject` field by field.
             return Ok(doc! {
@@ -686,11 +687,11 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
             match outcome.post_image {
                 // The post-image the write itself produced, captured under the
                 // storage lock — never a re-`find` a concurrent writer can beat.
-                Some(post) => project_value(post, fields, &query)?,
+                Some(post) => project_value(post, fields, &query, &let_vars)?,
                 None => Bson::Null,
             }
         } else {
-            project_value(matched_doc, fields, &query)?
+            project_value(matched_doc, fields, &query, &let_vars)?
         };
         return Ok(doc! {
             "lastErrorObject": { "n": 1, "updatedExisting": true },
@@ -753,22 +754,28 @@ fn project_value(
     value: Document,
     fields: Option<&Document>,
     query: &Document,
+    vars: &Document,
 ) -> Result<Bson, CommandError> {
     let q = if query.is_empty() { None } else { Some(query) };
     match fields {
         Some(spec) if !spec.is_empty() => {
-            secantus_core::projection::apply_projection(&value, spec, q)
+            secantus_core::projection::apply_projection_with(&value, spec, q, vars)
                 .map(Bson::Document)
                 .map_err(|f| {
-                    // A Fallback carrying a mongod code is a real server error
-                    // (51270 empty sub-projection, 31254 mix) and is surfaced
-                    // verbatim; only a bare Defer becomes the generic refusal.
-                    // Same treatment as `find` -- these two share the engine, so
-                    // a projection fix in one is a fix in both.
+                    // A Fallback carrying a mongod code is a real server error,
+                    // raised on the document: mongod's plan executor error
+                    // (measured 8.2.11, 2026-10-24). Only a bare Defer becomes
+                    // the generic refusal. Same treatment as `find` -- these
+                    // two share the engine, so a projection fix in one is a
+                    // fix in both.
                     match f.as_mongo() {
-                        Some((code, msg)) => {
-                            CommandError::new(code, crate::util::error_code_name(code), msg)
-                        }
+                        Some((code, msg)) => CommandError::new(
+                            code,
+                            crate::util::error_code_name(code),
+                            format!(
+                                "Plan executor error during findAndModify :: caused by :: {msg}"
+                            ),
+                        ),
                         None => CommandError::new(
                             2,
                             "BadValue",

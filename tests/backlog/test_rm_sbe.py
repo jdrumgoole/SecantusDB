@@ -778,40 +778,97 @@ def test_a_command_let_variable_is_folded_while_optimizing(rust_mongo: Any, mong
     assert out == []
 
 
-@pytest.mark.backlog("RM-296")
+@pytest.mark.backlog_fixed("RM-296")
 def test_find_projection_error_carries_the_executor_wrapper(rust_mongo: Any, mongod: Any) -> None:
     """An error a `find` projection raises on a document is "Executor error
-    during find command: <ns> :: caused by :: ...", as in the filter
-    (measured 8.2.11, 2026-10-24); this server sends the bare message."""
+    during find command: <ns> :: caused by :: ...", as in the filter, and
+    `findAndModify`'s is "Plan executor error during findAndModify :: caused
+    by :: ..." (measured 8.2.11, 2026-10-24); this server sent the bare
+    message."""
     one = {"_id": 1, "t": datetime.datetime(2020, 1, 1), "s": "x"}
     projections = [
         {"v": {"$year": {"date": "$t", "timezone": "$s"}}},
         {"v": {"$map": {"input": ["Mars"], "in": {"$year": {"date": "$t", "timezone": "$$this"}}}}},
+        {"v": {"$toUpper": "$t"}, "w": 1},
     ]
     answers = []
     for client in (mongod, rust_mongo):
         c = client[_DB]["one"]
         c.drop()
         c.insert_one(one)
-        answers.append([mongo_answer(lambda c=c, p=p: list(c.find({}, p))) for p in projections])
+        got = [mongo_answer(lambda c=c, p=p: list(c.find({}, p))) for p in projections]
+        # findAndModify's wrapper is the plan executor's.
+        got.append(
+            mongo_answer(
+                lambda c=c: c.find_one_and_update(
+                    {},
+                    {"$set": {"q": 1}},
+                    projection={
+                        "v": {
+                            "$divide": [
+                                1,
+                                0,
+                            ]
+                        },
+                        "w": "$s",
+                    },
+                )
+            )
+        )
+        got.append(
+            mongo_answer(
+                lambda c=c: c.find_one_and_update(
+                    {}, {"$set": {"q": 1}}, projection={"v": {"$toUpper": "$t"}}
+                )
+            )
+        )
+        answers.append(got)
     assert answers[1] == answers[0]
 
 
-@pytest.mark.backlog("RM-297")
+@pytest.mark.backlog_fixed("RM-297")
 def test_find_projection_reads_the_command_let(rust_mongo: Any, mongod: Any) -> None:
-    """A `find` projection may read the command's `let`: `{v: {$toUpper:
-    "$$cz"}}` with `let: {cz: "Mars"}` gives `v: "MARS"` (measured 8.2.11,
-    2026-10-24). This server refuses it with code 2, "projection is not
-    supported by the Rust server"."""
+    """A `find` (and `findAndModify`) projection may read the command's
+    `let` and `$$NOW`: `{v: {$toUpper: "$$cz"}}` with `let: {cz: "Mars"}`
+    gives `v: "MARS"`, and an undefined variable is 17276 (measured 8.2.11,
+    2026-10-24). This server refused every one with code 2, "projection is
+    not supported by the Rust server"."""
+    let = {"cz": "Mars", "k": 10}
     answers = []
     for client in (mongod, rust_mongo):
         c = client[_DB]["one"]
         c.drop()
         c.insert_one({"_id": 1})
         answers.append(
-            mongo_answer(
-                lambda c=c: list(c.find({}, {"v": {"$toUpper": "$$cz"}}, let={"cz": "Mars"}))
-            )
+            [
+                mongo_answer(lambda c=c: list(c.find({}, {"v": {"$toUpper": "$$cz"}}, let=let))),
+                mongo_answer(
+                    lambda c=c: list(
+                        c.find(
+                            {},
+                            {
+                                "_id": 0,
+                                "v": {"$map": {"input": [1], "in": {"$add": ["$$this", "$$k"]}}},
+                            },
+                            let=let,
+                        )
+                    )
+                ),
+                mongo_answer(lambda c=c: list(c.find({}, {"_id": 0, "v": "$$nope"}))),
+                mongo_answer(
+                    lambda c=c: [
+                        type(d["v"]).__name__ for d in c.find({}, {"_id": 0, "v": "$$NOW"})
+                    ]
+                ),
+                mongo_answer(
+                    lambda c=c: c.find_one_and_update(
+                        {},
+                        {"$set": {"q": 1}},
+                        projection={"_id": 0, "v": {"$toUpper": "$$cz"}},
+                        let=let,
+                    )
+                ),
+            ]
         )
     assert answers[1] == answers[0]
 

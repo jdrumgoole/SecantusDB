@@ -25,6 +25,7 @@ pub mod bsondoc;
 pub mod collation;
 pub mod deadline;
 pub mod diff;
+mod elem_match_key;
 pub mod expr_parse;
 pub mod expressions;
 pub mod fallback;
