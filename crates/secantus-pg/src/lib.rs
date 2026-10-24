@@ -16986,7 +16986,27 @@ impl PgHandler {
                 .relations()
                 .into_iter()
                 .find(|(_, o, _)| *o == oid)
-                .map(|(n, _, _)| n))
+                .map(|(n, _, _)| n)
+                .or_else(|| {
+                    // A built-in relation, by its oid (RP-214).
+                    (oid < 16384)
+                        .then(|| {
+                            self.run_sql_rows(
+                                &format!(
+                                    "select relname::text from pg_catalog.pg_class where oid = {oid}"
+                                ),
+                                &[],
+                            )
+                            .ok()?
+                            .into_iter()
+                            .next()?
+                            .into_iter()
+                            .next()?
+                            .as_str()
+                            .map(str::to_string)
+                        })
+                        .flatten()
+                }))
         };
         let table_bytes = |t: &str| -> PgWireResult<i64> {
             Ok(self
@@ -17008,7 +17028,24 @@ impl PgHandler {
             return Ok(Bson::Null);
         };
         let stored = self.lookup(&rel).is_some() && Self::virtual_table(&rel).is_none();
-        let heap = if self.has_heap(&rel) {
+        // A system catalog: its rows as `initdb` would lay them out (RP-214;
+        // a view has no storage, 0 as PostgreSQL answers).
+        let catalog = match Self::virtual_table(&rel) {
+            Some(def) => match system_catalog_kind(self, &rel) {
+                Some((kind, oid)) if kind == "r" => {
+                    let rows = self
+                        .virtual_rows(&rel, &Document::new())
+                        .unwrap_or_default();
+                    Some((i64::from(heap::fresh_blocks(&def, &rows)), oid))
+                }
+                _ => None,
+            },
+            None => None,
+        };
+        let catalog_blocks = catalog.map(|(blocks, _)| blocks);
+        let heap = if let Some(blocks) = catalog_blocks {
+            blocks * PAGE
+        } else if self.has_heap(&rel) {
             i64::from(self.heap_blocks(&rel)?) * PAGE
         } else {
             0
@@ -17019,6 +17056,12 @@ impl PgHandler {
             .iter()
             .filter(|ix| ix.table.name == rel)
             .count() as i64;
+        // A catalog's own indexes (`pg_index_system.tsv`), estimated as a
+        // user table's are.
+        let index_count = catalog.map_or(index_count, |(_, oid)| {
+            catalog_meta::system_index_count(oid)
+        });
+        let encoded = catalog_blocks.map_or(encoded, |b| b * PAGE);
         let indexes = index_count * pages(encoded.max(PAGE) / 2);
         // A table with a TOASTable column has a TOAST table, whose index is
         // one page even when empty; `pg_table_size` counts it.
@@ -48899,4 +48942,28 @@ fn split_top_level_commas(text: &str) -> Vec<String> {
         out.push(current.trim().to_string());
     }
     out
+}
+
+/// A built-in relation's `relkind`, from this server's `pg_class`: `r` for a
+/// catalog table, `v` for a system view.
+fn system_catalog_kind(h: &PgHandler, name: &str) -> Option<(String, i64)> {
+    let row = h
+        .run_sql_rows(
+            &format!(
+                "select relkind::text, oid::int8 from pg_catalog.pg_class where relname = {} \
+                 and relnamespace in (11, 13679) and oid < 16384",
+                secantus_pgplan::scalar::quote_literal(name)
+            ),
+            &[],
+        )
+        .ok()?
+        .into_iter()
+        .next()?;
+    let kind = row.first()?.as_str()?.to_string();
+    let oid = match row.get(1)? {
+        Bson::Int64(v) => *v,
+        Bson::Int32(v) => i64::from(*v),
+        _ => return None,
+    };
+    Some((kind, oid))
 }

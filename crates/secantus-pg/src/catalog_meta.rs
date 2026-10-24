@@ -259,6 +259,15 @@ const INDEXES: &str = include_str!("pg_index_system.tsv");
 /// `pg_class_system.tsv` lists): indexrelid, indrelid, indnatts,
 /// indnkeyatts, the ten flags in catalog order, indkey, indcollation,
 /// indclass, indoption.
+/// How many of PostgreSQL's own indexes are on relation `oid`.
+pub(crate) fn system_index_count(oid: i64) -> i64 {
+    let key = oid.to_string();
+    INDEXES
+        .lines()
+        .filter(|l| l.split('\t').nth(1) == Some(key.as_str()))
+        .count() as i64
+}
+
 pub(crate) fn index_rows(def: &TableDef) -> Vec<Document> {
     let f = |name: &str| def.field_of(name);
     let mut out = Vec::new();

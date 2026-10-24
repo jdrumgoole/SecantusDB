@@ -806,21 +806,6 @@ tests are regression tests.
       relation (`type t[]` appears among what depends on table `t`).
       Backlog-ID: RP-205
       Verify: tests/backlog/test_rp_batch52.py::test_scenario[pg_depend of a table and its row type]
-- [ ] **A system catalog has no size.** `pg_relation_size(1259)` is NULL
-      here and `pg_relation_size('pg_class')` 0; PostgreSQL 15.19 answers
-      each catalog's heap size (114688 for `pg_class` on the private 15.19
-      reference cluster), `pg_total_relation_size` with its indexes and TOAST. A user
-      table's size comes from the heap model (batch 48); a catalog here is
-      computed from the store, with no heap to measure.
-      **Decision needed (2026-10-24):** PostgreSQL's numbers depend on each
-      cluster's churn (dead tuples, the catalog's own updates), so no rule
-      reproduces them. Options: (a) measure each catalog's rows through the
-      heap model as a fresh `initdb` would lay them out -- the mechanism,
-      but not PostgreSQL's bytes; (b) a fresh 15.19 cluster's sizes, dumped,
-      for the catalogs a database's own objects do not grow, and (a) for
-      the rest; (c) leave NULL, which reads as "no such relation".
-      Backlog-ID: RP-214
-      Verify: tests/backlog/test_rp_batch52.py::test_scenario[a system catalog's size]
 
 ## Found by batch 51 (2026-10-23)
 
