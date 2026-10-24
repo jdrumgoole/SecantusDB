@@ -68,6 +68,7 @@ mod guc_values;
 mod hba;
 mod heap;
 mod heap_page;
+mod heap_store;
 mod ident;
 mod info_columns;
 mod join_order;
@@ -28619,6 +28620,9 @@ impl PgHandler {
         }
         stats.report(in_block);
         stats.set_state(false, in_block);
+        // The heaps that changed go to the store, at most once a second
+        // (RP-193).
+        self.checkpoint_heaps(false);
     }
 
     /// A cancellation point: `57014` if a `CancelRequest` for this backend
@@ -35352,6 +35356,8 @@ impl PgHandler {
                     ))));
                 }
                 self.databases.remove(&self.storage, &info.name)?;
+                // Its tables' heaps go with it (RP-233).
+                heap::forget_database(&self.storage, &info.name);
                 // `DropSetting`: every `ALTER ROLE ... IN DATABASE` of it.
                 self.drop_role_settings(bson::doc! {"database": &info.name})?;
                 Ok(vec![Response::Execution(Tag::new("DROP DATABASE"))])
@@ -37678,6 +37684,7 @@ impl PgHandler {
                     // fails midway, a table whose catalog row survived is
                     // recoverable, whereas a catalog row pointing at a
                     // collection that no longer exists is not.
+                    self.forget_heap(table);
                     self.storage
                         .drop_collection(self.db(), table)
                         .map_err(|e| Self::storage_err("could not drop the table", e))?;

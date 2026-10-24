@@ -357,6 +357,8 @@ impl Teardown {
             runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
         }
         if let Some(storage) = self.storage.take() {
+            // The heaps' last changes reach the store (RP-193).
+            crate::heap::flush_store(&storage, true);
             // The cumulative statistics survive a clean shutdown (RP-070).
             if let Err(e) = crate::pgstat::save_store(&storage) {
                 eprintln!("secantusd-pg: could not write the statistics: {e}");

@@ -366,7 +366,7 @@ EXPECTED: dict[str, Any] = {
 }
 
 
-@pytest.mark.backlog("RP-193")
+@pytest.mark.backlog_fixed("RP-193")
 def test_a_dead_tuple_outlives_a_restart(tmp_path: Any) -> None:
     """PostgreSQL 15.19 keeps a heap's dead tuples on their pages across a
     restart, until VACUUM: 60 rows of 140 bytes, row 1 deleted, row 2

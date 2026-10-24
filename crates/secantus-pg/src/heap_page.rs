@@ -184,6 +184,8 @@ pub(crate) struct Heap {
     pub prunable: std::collections::BTreeSet<u32>,
     /// The tuples' places no longer follow the rows' stored order (RP-192).
     pub disordered: bool,
+    /// Changed since it was last written to the store (RP-193).
+    pub dirty: bool,
 }
 
 pub(crate) fn tid(block: u32, off: u16) -> i64 {
