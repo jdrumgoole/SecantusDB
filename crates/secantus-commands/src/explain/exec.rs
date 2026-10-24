@@ -147,8 +147,14 @@ pub(crate) fn directed(v: &Bson, reversed: bool, collation: Option<&Collation>) 
     if !reversed {
         return bytes;
     }
+    reversed_key(&bytes)
+}
+
+/// A key whose byte order is the reverse of `bytes`': inverted, with each
+/// zero escaped and a terminator, so no reversed key starts another.
+pub(crate) fn reversed_key(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() + 2);
-    for b in bytes {
+    for &b in bytes {
         out.push(!b);
         if b == 0 {
             out.push(0x00);

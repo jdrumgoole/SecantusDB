@@ -1256,10 +1256,11 @@ impl CmdStorage for StorageAdapter {
         coll: &str,
         after: Option<i64>,
         max: usize,
+        backward: bool,
     ) -> Result<Option<secantus_commands::storage::Records>, StorageError> {
         let rows = self
             .inner
-            .records_after(db, coll, after, max)
+            .records_after(db, coll, after, max, backward)
             .map_err(map_err)?;
         let mut view = self.sql_view(db, coll);
         Ok(Some(rows.into_iter().map(|(r, d)| (r, view(d))).collect()))
@@ -1279,6 +1280,7 @@ impl CmdStorage for StorageAdapter {
         Ok(Some(rows.into_iter().map(|d| d.map(&mut view)).collect()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn index_entries_from(
         &self,
         db: &str,
@@ -1287,9 +1289,10 @@ impl CmdStorage for StorageAdapter {
         from: &[u8],
         after: Option<i64>,
         max: usize,
+        backward: bool,
     ) -> Result<Option<secantus_commands::storage::IndexEntries>, StorageError> {
         self.inner
-            .index_entries_from(db, coll, name, from, after, max)
+            .index_entries_from(db, coll, name, from, after, max, backward)
             .map(Some)
             .map_err(map_err)
     }

@@ -515,9 +515,11 @@ These are explicit non-goals. Don't add them without a reason.
       `isFromUserConnection` and `collectionType`, which mongod writes after
       `type`; and `keysExamined` / `docsExamined` for a read that does not
       stream yet (`tasks/streaming-cursors-plan.md` phases 2 and 3: an
-      `aggregate`, a blocking sort, a descending or collated index, `count`,
-      `distinct`, the writes). A streamed `find` counts each batch's own work
-      as mongod does since 2026-10-24, on the line and in its profile entry.
+      `aggregate`, a blocking sort, a descending, collated or multikey index,
+      an OR plan, `count`, `distinct`, the writes). A streamed `find` counts
+      each batch's own work as mongod does since 2026-10-24, on the line and
+      in its profile entry: collection scans either way, ascending indexes
+      either way, the `_id` index, covered plans.
       **Decided 2026-10-16 (Joe):** count keys and documents examined during
       execution (with the streaming cursors), and keep the originating
       command on a cursor, so the `Slow query` line and `system.profile`
@@ -1467,16 +1469,23 @@ differs on 5 scenarios. What is left:
       read every matching document and keep the rest for `getMore`. mongod
       reads on as the cursor is read, so its `getMore` sees a document
       inserted, changed or deleted since (measured: an insert appears, a
-      delete disappears). Since 2026-10-24 a `find` streams over a forward
-      collection scan or an ascending, uncollated, non-multikey index other
-      than `_id_`, with skip, limit and projection; the rest is
-      `tasks/streaming-cursors-plan.md` phases 2 and 3 (an `_id` sort, a
-      descending or collated or multikey index, OR plans, covered plans,
-      `$natural` backward, `min` / `max`, `returnKey` / `showRecordId`, and
-      every `aggregate`). Tests that write between batches see the
-      difference; so does memory, for a large result.
+      delete disappears). Since 2026-10-24 a `find` streams over a
+      collection scan either way (`$natural: -1` too), and over an
+      ascending, uncollated, non-multikey index either way, the `_id` index
+      included, with skip, limit, projection and covered plans. What is left
+      is `tasks/streaming-cursors-plan.md` phases 2 and 3: a descending,
+      collated or multikey index (this store's keys for a descending string
+      field and for a collated string are not in mongod's order, so walking
+      them would return the wrong order: an entry-format change), OR plans
+      and SORT_MERGE, `min` / `max`, `returnKey` / `showRecordId`, blocking
+      sorts, and every `aggregate`. An `_id` walk is not used for a
+      collection holding an `_id` whose key keeps entry format 4's encoding
+      (a document, BinData, JavaScript, MaxKey); one inserted after the
+      cursor opened is returned where its key falls, which among several
+      such `_id`s need not be mongod's order. Tests that write between
+      batches see the difference; so does memory, for a large result.
       Backlog-ID: RM-080
-      Verify: tests/backlog/test_rm_057_084.py::test_aggregate_get_more_sees_writes_made_since_the_command, tests/backlog/test_rm_057_084.py::test_id_sorted_get_more_sees_writes_made_since_the_find
+      Verify: tests/backlog/test_rm_057_084.py::test_aggregate_get_more_sees_writes_made_since_the_command, tests/backlog/test_rm_057_084.py::test_descending_index_get_more_sees_writes_made_since_the_find
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
   `$meta: "textScore"` sorts, an `explain: true` aggregate. Every
   `{$meta}` shape measured on 8.2.11 matches since 2026-10-17, except a

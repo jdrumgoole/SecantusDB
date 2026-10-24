@@ -257,11 +257,14 @@ fn level_two_writes_each_operation_in_mongods_shape() {
             head.iter().chain(common.iter()).copied().collect()
         };
         let find = &profiled[0];
-        // mongod 8.2.11 writes the plan after `millis` (2026-10-24).
+        // mongod 8.2.11 writes the plan after `millis` (2026-10-24), and
+        // the counts of a read that streams (an `_id` scan) after the command.
         let mut want = with(&[
             "op",
             "ns",
             "command",
+            "keysExamined",
+            "docsExamined",
             "nBatches",
             "cursorExhausted",
             "numYield",
