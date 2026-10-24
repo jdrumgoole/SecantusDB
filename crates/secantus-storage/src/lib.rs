@@ -3099,6 +3099,51 @@ fn is_whole_array_key(escaped_key: &[u8], idx_dir: i32) -> bool {
     }
 }
 
+/// [`Storage::index_entries_from`] over the `_id` index: up to `max`
+/// `(id_key, RecordId)` of `db.coll` from `from` on (past it when `past`),
+/// in `id_key` order, or descending from `from` down when `backward`.
+fn id_entries_from(
+    session: &Session,
+    db: &str,
+    coll: &str,
+    from: &[u8],
+    past: bool,
+    max: usize,
+    backward: bool,
+) -> Result<Vec<(Vec<u8>, i64)>> {
+    let cur = session.open_cursor(NAT_SEQ_TABLE, None)?;
+    let kc = key_coll(db, coll);
+    cur.set_key_ssu(db, &kc, from);
+    let mut more = match cur.search_near() {
+        Ok(0) if past => {
+            if backward {
+                cur.prev()?
+            } else {
+                cur.next()?
+            }
+        }
+        Ok(cmp) if backward => cmp <= 0 || cur.prev()?,
+        Ok(cmp) => cmp >= 0 || cur.next()?,
+        Err(e) if e.is_not_found() => false,
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = Vec::with_capacity(max.min(1024));
+    while more && out.len() < max {
+        // The streamed reads poll the `maxTimeMS` budget and `killOp`
+        // where the whole-collection scan does.
+        if deadline::check().is_err() {
+            return Err(StorageError::MaxTimeExpired);
+        }
+        let (d, c, id_key) = cur.get_key_ssu()?;
+        if d != db || c != kc.as_ref() {
+            break;
+        }
+        out.push((id_key, cur.get_value_q()?));
+        more = if backward { cur.prev()? } else { cur.next()? };
+    }
+    Ok(out)
+}
+
 fn unpack_entry(packed: &[u8]) -> (&[u8], Option<i64>) {
     match packed.windows(2).position(|w| w == ENTRY_SEP) {
         Some(i) => {
@@ -16650,15 +16695,17 @@ impl Storage {
     /// Up to `max` documents of `db.coll` after RecordId `after` (from the
     /// start when `None`), in RecordId order, with their RecordIds: a
     /// collection scan resumed where the last batch left it, on this call's
-    /// snapshot (a transaction's, inside one). For the MongoDB server's
-    /// streaming cursors, which count every document they examine and so
-    /// read them unfiltered.
+    /// snapshot (a transaction's, inside one). `backward`: in descending
+    /// RecordId order, before `after` (from the end when `None`), as
+    /// `$natural: -1` reads. For the MongoDB server's streaming cursors,
+    /// which count every document they examine and so read them unfiltered.
     pub fn records_after(
         &self,
         db: &str,
         coll: &str,
         after: Option<i64>,
         max: usize,
+        backward: bool,
     ) -> Result<Vec<(i64, Vec<u8>)>> {
         let session = self.op_session()?;
         let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
@@ -16667,14 +16714,24 @@ impl Storage {
             Err(e) => return Err(e.into()),
         };
         let mut out = Vec::with_capacity(max.min(1024));
-        if after == Some(i64::MAX) {
+        let edge = if backward { i64::MIN } else { i64::MAX };
+        if after == Some(edge) {
             return Ok(out);
         }
-        cur.set_key_ssq(db, coll, after.map_or(i64::MIN, |a| a + 1));
-        let mut more = match cur.search_near() {
-            Ok(cmp) => cmp >= 0 || cur.next()?,
-            Err(e) if e.is_not_found() => false,
-            Err(e) => return Err(e.into()),
+        let mut more = if backward {
+            cur.set_key_ssq(db, coll, after.map_or(i64::MAX, |a| a - 1));
+            match cur.search_near() {
+                Ok(cmp) => cmp <= 0 || cur.prev()?,
+                Err(e) if e.is_not_found() => false,
+                Err(e) => return Err(e.into()),
+            }
+        } else {
+            cur.set_key_ssq(db, coll, after.map_or(i64::MIN, |a| a + 1));
+            match cur.search_near() {
+                Ok(cmp) => cmp >= 0 || cur.next()?,
+                Err(e) if e.is_not_found() => false,
+                Err(e) => return Err(e.into()),
+            }
         };
         while more && out.len() < max {
             // The streamed reads poll the `maxTimeMS` budget and `killOp`
@@ -16689,7 +16746,7 @@ impl Storage {
             let value = cur.get_value_u()?;
             let (_idk, blob) = unframe_doc_value(&value)?;
             out.push((recordid, blob.to_vec()));
-            more = cur.next()?;
+            more = if backward { cur.prev()? } else { cur.next()? };
         }
         Ok(out)
     }
@@ -16735,6 +16792,15 @@ impl Storage {
     /// fields' encodings joined by `COMPOUND_SEP`). With `after`, the scan
     /// resumes strictly after the entry `(from, after)`: where a streaming
     /// cursor's last batch left it, on this call's snapshot.
+    ///
+    /// `backward`: in descending order, from the last entry whose key is no
+    /// greater than `from` (strictly before `(from, after)` with `after`).
+    ///
+    /// The `_id` index (`_id_`) is the `_id` keys every document row holds,
+    /// read in their own order: each entry is a document's `id_key` (not a
+    /// compound key), and with `after` the scan resumes past that key, which
+    /// no other document shares.
+    #[allow(clippy::too_many_arguments)]
     pub fn index_entries_from(
         &self,
         db: &str,
@@ -16743,23 +16809,35 @@ impl Storage {
         from: &[u8],
         after: Option<i64>,
         max: usize,
+        backward: bool,
     ) -> Result<Vec<(Vec<u8>, i64)>> {
         let session = self.op_session()?;
+        if name == ID_INDEX_NAME {
+            return id_entries_from(&session, db, coll, from, after.is_some(), max, backward);
+        }
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         let mut seed = escape_kb(from);
-        if let Some(rid) = after {
-            if rid == i64::MAX {
-                // Nothing of this key is left: start past all of it.
+        match (after, backward) {
+            // Past every entry of this key.
+            (None, true) | (Some(i64::MAX), false) => {
                 seed.extend_from_slice(ENTRY_SEP);
                 seed.extend_from_slice(&[0xff; 9]);
-            } else {
+            }
+            (Some(rid), false) => {
                 seed.extend_from_slice(ENTRY_SEP);
                 seed.extend_from_slice(&(rid + 1).to_be_bytes());
             }
+            // The entry itself: the walk starts before it.
+            (Some(rid), true) => {
+                seed.extend_from_slice(ENTRY_SEP);
+                seed.extend_from_slice(&rid.to_be_bytes());
+            }
+            (None, false) => {}
         }
         cur.set_key_sssu(db, coll, name, &seed);
         let mut out = Vec::with_capacity(max.min(1024));
         let mut more = match cur.search_near() {
+            Ok(cmp) if backward => (cmp < 0 || (cmp == 0 && after.is_none())) || cur.prev()?,
             Ok(cmp) => cmp >= 0 || cur.next()?,
             Err(e) if e.is_not_found() => false,
             Err(e) => return Err(e.into()),
@@ -16778,7 +16856,7 @@ impl Storage {
             if let Some(rid) = rid {
                 out.push((unescape_kb(esc), rid));
             }
-            more = cur.next()?;
+            more = if backward { cur.prev()? } else { cur.next()? };
         }
         Ok(out)
     }

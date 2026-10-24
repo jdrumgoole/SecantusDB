@@ -701,8 +701,9 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             p.values()
                 .any(|v| secantus_core::projection::meta_spec(v).is_some())
         })
-        && !matches!(doc.get("sort"), Some(Bson::Document(given))
-            if !given.is_empty() && !crate::explain::order::plain_sort(given));
+        && (natural_hint.is_some()
+            || !matches!(doc.get("sort"), Some(Bson::Document(given))
+                if !given.is_empty() && !crate::explain::order::plain_sort(given)));
     if streamable {
         let asked = StreamAsk {
             coll: &coll,
@@ -1261,12 +1262,15 @@ fn stream_find(
         return Ok(None);
     };
     let Some(stream) = crate::explain::stream::Stream::of_plan(
+        storage.as_ref(),
         &plan,
         &ctx.db_name,
         asked.coll,
         asked.filter,
         asked.let_vars,
-    ) else {
+    )
+    .map_err(read_error)?
+    else {
         return Ok(None);
     };
     let mut cursor = FindStream {

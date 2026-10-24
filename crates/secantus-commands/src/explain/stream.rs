@@ -16,22 +16,27 @@
 //! saved position. Each batch reads in the call that asks for it, through
 //! the store's per-call session -- a transaction's, inside one.
 //!
-//! What streams: a COLLSCAN, and a FETCH over an IXSCAN of an ascending,
-//! uncollated index that is not multikey and not `_id_` (whose keys are the
-//! documents' own `id_key`s, not index-table entries), under SKIP, LIMIT and a
-//! projection. An index that is not multikey holds exactly mongod's keys
-//! (this store also writes whole-array keys for an array, and keys an empty
-//! array by the array where mongod keys `undefined`); a descending field's
-//! inverted bytes do not reverse string prefixes; a collated index keys
-//! strings its own way. Those, sorts that block, and every other plan read
-//! as before ([`super::order`]).
+//! What streams: a COLLSCAN either way, and a FETCH over an IXSCAN, either
+//! way, of an ascending, uncollated index that is not multikey, under SKIP,
+//! LIMIT and a projection. A backward scan walks the entries last first and
+//! compares each field's key reversed ([`super::exec::reversed_key`]), as
+//! [`super::exec`] does. The `_id` index is the documents' own `id_key`s,
+//! whose order is mongod's for every type but those whose `_id` keys keep an
+//! older encoding (a document, BinData, JavaScript, MaxKey): a collection
+//! holding one is read as before. An index that is not multikey holds
+//! exactly mongod's keys (this store also writes whole-array keys for an
+//! array, and keys an empty array by the array where mongod keys
+//! `undefined`); a descending field's inverted bytes do not reverse string
+//! prefixes; a collated index keys strings its own way. Those, sorts that
+//! block, and every other plan read as before ([`super::order`]).
 
 use std::collections::VecDeque;
 
 use bson::Document;
 use secantus_core::sortkey::{split_compound, COMPOUND_SEP};
 
-use super::exec::{contiguous, outside_of, ranges, Ranges};
+use super::bounds::sort_key;
+use super::exec::{contiguous, outside_of, ranges, reversed_key, Ranges};
 use super::node::{IxScan, Node};
 use crate::storage::{Storage, StorageError};
 
@@ -84,9 +89,10 @@ pub(crate) struct Stream {
 }
 
 enum Access {
-    /// A collection scan, after this RecordId.
+    /// A collection scan, after this RecordId (before it, backward).
     Coll {
         after: Option<i64>,
+        backward: bool,
     },
     Index(IndexScan),
 }
@@ -95,15 +101,68 @@ enum Access {
 struct IndexScan {
     name: String,
     width: usize,
+    /// Last entry first, each field's key compared reversed.
+    backward: bool,
+    /// The `_id` index: each entry one `id_key`, not a compound key.
+    id: bool,
     ranges: Vec<Ranges>,
     contiguous: bool,
-    /// Where the scan starts: the low ends of the first intervals.
+    /// Where the scan starts: the low ends of the first intervals (the high
+    /// ends of the last, backward), as the entries hold them.
     start: Vec<u8>,
     done: bool,
     /// The last entry the scan consumed: where the next read resumes.
     last: Option<(Vec<u8>, i64)>,
     /// Entries still to skip before any is fetched (a SKIP below the FETCH).
     key_skip: i64,
+    /// A covered plan: the documents read to project are not examined.
+    covered: bool,
+}
+
+/// An index scan of `ix` from its start, when one streams.
+fn index_scan(
+    storage: &dyn Storage,
+    ix: &IxScan,
+    db: &str,
+    coll: &str,
+) -> Result<Option<IndexScan>, StorageError> {
+    let id = ix.index.name == "_id_";
+    if id && foreign_ids(storage, db, coll)? {
+        return Ok(None);
+    }
+    let ranges: Vec<Ranges> = ix
+        .bounds
+        .iter()
+        .map(|list| ranges(list, ix.backward, None))
+        .collect();
+    // The entries' own bytes: each field's lowest key, or its highest for a
+    // scan that walks down from it.
+    let mut start = Vec::new();
+    for (i, list) in ix.bounds.iter().enumerate() {
+        if i > 0 {
+            start.extend_from_slice(COMPOUND_SEP);
+        }
+        let end = if ix.backward {
+            list.iter().map(|iv| sort_key(&iv.hi)).max()
+        } else {
+            list.iter().map(|iv| sort_key(&iv.lo)).min()
+        };
+        start.extend(end.unwrap_or_default());
+    }
+    let done = ranges.iter().any(Vec::is_empty);
+    Ok(Some(IndexScan {
+        name: ix.index.name.clone(),
+        width: ix.index.key.len(),
+        backward: ix.backward,
+        id,
+        contiguous: contiguous(&ix.bounds),
+        ranges,
+        start,
+        done,
+        last: None,
+        key_skip: 0,
+        covered: false,
+    }))
 }
 
 /// An entry of the index, split into its fields' keys.
@@ -146,6 +205,7 @@ impl Source<'_> {
             &from,
             after,
             CHUNK,
+            self.scan.backward,
         )?
         else {
             return Err(StorageError::Internal(
@@ -156,19 +216,27 @@ impl Source<'_> {
             self.end = true;
         }
         for (raw, rid) in rows {
-            let parts: Vec<Vec<u8>> = split_compound(&raw, self.scan.width)
-                .ok_or_else(|| {
-                    StorageError::Internal(format!(
-                        "index {} holds an entry this server cannot read",
-                        self.scan.name
-                    ))
-                })?
-                .into_iter()
-                .map(<[u8]>::to_vec)
-                .collect();
-            let foreign = parts
-                .iter()
-                .any(|p| p.first() == Some(&secantus_core::sortkey::RANK_ARRAY));
+            let mut parts: Vec<Vec<u8>> = if self.scan.id {
+                vec![raw.clone()]
+            } else {
+                split_compound(&raw, self.scan.width)
+                    .ok_or_else(|| {
+                        StorageError::Internal(format!(
+                            "index {} holds an entry this server cannot read",
+                            self.scan.name
+                        ))
+                    })?
+                    .into_iter()
+                    .map(<[u8]>::to_vec)
+                    .collect()
+            };
+            let foreign = !self.scan.id
+                && parts
+                    .iter()
+                    .any(|p| p.first() == Some(&secantus_core::sortkey::RANK_ARRAY));
+            if self.scan.backward {
+                parts = parts.iter().map(|p| reversed_key(p)).collect();
+            }
             self.buf.push_back(Entry {
                 parts,
                 raw,
@@ -260,16 +328,36 @@ fn work_entry(src: &mut Source, keys: &mut i64) -> Result<Step, StorageError> {
 
 /// Whether an index scan can stream (see the module's doc).
 fn streams(ix: &IxScan) -> bool {
-    // The `_id` index is the `id_key` each document row holds, not entries
-    // of the index table this reads.
-    ix.index.name != "_id_"
-        && !ix.no_bounds
+    !ix.no_bounds
         && ix.filter.is_none()
-        && !ix.backward
         && ix.index.plain
         && ix.index.collation.is_none()
         && !ix.index.is_multikey()
         && ix.index.fields().iter().all(|(_, dir)| *dir == 1)
+}
+
+/// The `_id` key ranks whose order is not mongod's: `sortkey::encode_id_key`
+/// keeps entry format 4's bytes for a document, BinData, JavaScript with a
+/// scope (which shares plain JavaScript's rank there) and MaxKey, so that
+/// stored documents keep the keys they were written with.
+const FOREIGN_ID_RANKS: [u8; 4] = [5, 7, 13, 14];
+
+/// Whether `db.coll` holds an `_id` of a type whose key order is not
+/// mongod's, so that a walk of the `_id` index would not be mongod's order.
+fn foreign_ids(storage: &dyn Storage, db: &str, coll: &str) -> Result<bool, StorageError> {
+    for rank in FOREIGN_ID_RANKS {
+        let Some(first) = storage.index_entries_from(db, coll, "_id_", &[rank], None, 1, false)?
+        else {
+            return Ok(true);
+        };
+        if first
+            .first()
+            .is_some_and(|(key, _)| key.first() == Some(&rank))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 impl Stream {
@@ -279,33 +367,41 @@ impl Stream {
     /// command's is what a `find` answers and validates (an index's bounds
     /// only narrow which documents are fetched, so the counts are the same).
     pub(crate) fn of_plan(
+        storage: &dyn Storage,
         plan: &Node,
         db: &str,
         coll: &str,
         filter: &Document,
         vars: &Document,
-    ) -> Option<Stream> {
+    ) -> Result<Option<Stream>, StorageError> {
+        // A LIMIT over a SKIP, and the projection at any level of them (a
+        // covered plan's is below its LIMIT): the caller projects each batch.
         let mut node = plan;
-        // The caller projects each batch.
-        if let Node::Projection { input, .. } = node {
-            node = input;
+        let mut covered = false;
+        let (mut limit, mut skip) = (None, 0);
+        loop {
+            match node {
+                Node::Projection { name, input, .. } => {
+                    covered = *name == "PROJECTION_COVERED";
+                    node = input;
+                }
+                Node::Limit(n, input) if limit.is_none() && skip == 0 => {
+                    limit = Some(*n);
+                    node = input;
+                }
+                Node::Skip(n, input) if skip == 0 => {
+                    skip = *n;
+                    node = input;
+                }
+                _ => break,
+            }
         }
-        let mut limit = None;
-        if let Node::Limit(n, input) = node {
-            limit = Some(*n);
-            node = input;
-        }
-        let mut skip = 0;
-        if let Node::Skip(n, input) = node {
-            skip = *n;
-            node = input;
-        }
-        let (access, _plan_filter) = match node {
-            Node::CollScan {
-                filter,
-                backward: false,
-            } => (Access::Coll { after: None }, filter.clone()),
-            Node::Fetch { filter, input } => {
+        let access = match node {
+            Node::CollScan { backward, .. } => Access::Coll {
+                after: None,
+                backward: *backward,
+            },
+            Node::Fetch { input, .. } => {
                 // mongod skips index entries below the FETCH when nothing is
                 // filtered after it: the skipped keys are examined, their
                 // documents never read (`FETCH <- SKIP <- IXSCAN`).
@@ -314,42 +410,29 @@ impl Stream {
                     other => (0, other),
                 };
                 match input {
-                    Node::IxScan(ix) if streams(ix) => {
-                        let ranges: Vec<Ranges> = ix
-                            .bounds
-                            .iter()
-                            .map(|list| ranges(list, false, None))
-                            .collect();
-                        let mut start = Vec::new();
-                        for (i, list) in ranges.iter().enumerate() {
-                            if i > 0 {
-                                start.extend_from_slice(COMPOUND_SEP);
-                            }
-                            start.extend_from_slice(
-                                list.first().map_or(&[][..], |r| r.0.as_slice()),
-                            );
-                        }
-                        let done = ranges.iter().any(Vec::is_empty);
-                        (
-                            Access::Index(IndexScan {
-                                name: ix.index.name.clone(),
-                                width: ix.index.key.len(),
-                                contiguous: contiguous(&ix.bounds),
-                                ranges,
-                                start,
-                                done,
-                                last: None,
-                                key_skip,
-                            }),
-                            filter.clone(),
-                        )
-                    }
-                    _ => return None,
+                    Node::IxScan(ix) if streams(ix) => match index_scan(storage, ix, db, coll)? {
+                        Some(scan) => Access::Index(IndexScan { key_skip, ..scan }),
+                        None => return Ok(None),
+                    },
+                    _ => return Ok(None),
                 }
             }
-            _ => return None,
+            // A covered plan (`PROJECTION_COVERED <- IXSCAN`) answers from the
+            // keys and examines no document. This store's keys are not the
+            // values they stand for, so each document is read to project it,
+            // and not counted.
+            Node::IxScan(ix) if covered && streams(ix) => {
+                match index_scan(storage, ix, db, coll)? {
+                    Some(scan) => Access::Index(IndexScan {
+                        covered: true,
+                        ..scan
+                    }),
+                    None => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
         };
-        Some(Stream {
+        Ok(Some(Stream {
             db: db.to_string(),
             coll: coll.to_string(),
             access,
@@ -361,7 +444,7 @@ impl Stream {
             done: false,
             keys: 0,
             docs: 0,
-        })
+        }))
     }
 
     /// Up to `want` documents that pass the filter (`want` 0: no count
@@ -370,9 +453,10 @@ impl Stream {
         let mut out = Vec::new();
         let full = |out: &Vec<Vec<u8>>| want > 0 && out.len() >= want;
         match &mut self.access {
-            Access::Coll { after } => {
+            Access::Coll { after, backward } => {
                 while !full(&out) {
-                    let Some(rows) = storage.records_after(&self.db, &self.coll, *after, CHUNK)?
+                    let Some(rows) =
+                        storage.records_after(&self.db, &self.coll, *after, CHUNK, *backward)?
                     else {
                         return Err(StorageError::Internal("this store cannot stream".into()));
                     };
@@ -440,7 +524,9 @@ impl Stream {
                         return Err(StorageError::Internal("this store cannot stream".into()));
                     };
                     for blob in found.into_iter().flatten() {
-                        self.docs += 1;
+                        if !src.scan.covered {
+                            self.docs += 1;
+                        }
                         let keep = match &self.filter {
                             None => true,
                             Some(f) => {

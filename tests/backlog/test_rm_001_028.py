@@ -387,7 +387,35 @@ _BATCH_ATTRS = (
 )
 
 
-def _batch_counts(name: str, db: Any) -> list:
+_FORWARD_READS = [
+    lambda c: c.find({"x": {"$gte": 2}}).batch_size(3),
+    lambda c: c.find({"x": {"$lt": 4}}).batch_size(2),
+    lambda c: c.find({"y": 1}).batch_size(2),
+    lambda c: c.find({"y": 1, "z": {"$gte": 0}}).batch_size(1),
+    lambda c: c.find({"x": {"$gt": 3}, "z": 0}).batch_size(2),
+    lambda c: c.find({"x": {"$gte": 0}}).skip(2).limit(3).batch_size(2),
+    lambda c: c.find({"x": {"$in": [1, 5, 9, 99]}}).batch_size(2),
+    lambda c: c.find({"x": {"$gte": 9}}, {"x": 1}).batch_size(2),
+]
+
+# Backward scans, the `_id` index, a backward collection scan, covered plans.
+_MORE_READS = [
+    lambda c: c.find({"x": {"$gte": 2}}).sort("x", -1).batch_size(3),
+    lambda c: c.find().sort("_id", 1).batch_size(4),
+    lambda c: c.find({"_id": {"$gte": 3}}).batch_size(2),
+    lambda c: c.find({"_id": {"$in": [1, 4, 7, 99]}}).sort("_id", -1).batch_size(1),
+    lambda c: c.find().sort("$natural", -1).batch_size(5),
+    lambda c: c.find({"z": 1}).hint([("$natural", -1)]).batch_size(2),
+    lambda c: c.find({"x": {"$lt": 9}}).sort("x", -1).skip(1).limit(4).batch_size(2),
+    lambda c: c.find({"y": {"$in": [0, 2]}}).sort([("y", -1), ("z", -1)]).batch_size(3),
+    # Covered: answered from the keys, no document examined.
+    lambda c: c.find({"x": {"$gte": 3}}, {"_id": 0, "x": 1}).batch_size(2),
+    lambda c: c.find({"x": {"$lt": 8}}, {"_id": 0, "x": 1}).sort("x", -1).skip(1).batch_size(3),
+    lambda c: c.find({"y": 2}, {"_id": 0, "y": 1, "z": 1}).limit(3).batch_size(1),
+]
+
+
+def _batch_counts(name: str, db: Any, reads: list = _FORWARD_READS) -> list:
     """For a few `find`s read in small batches, each `find` and `getMore`
     line's counts, in the order the line has them (`cursorid` as present or
     not, since its value is the server's own). Each read has a collection of
@@ -395,16 +423,6 @@ def _batch_counts(name: str, db: Any) -> list:
     own lines can be identical to the millisecond, which defeats a window
     that starts after the last line before the read."""
     client = db.client
-    reads = [
-        lambda c: c.find({"x": {"$gte": 2}}).batch_size(3),
-        lambda c: c.find({"x": {"$lt": 4}}).batch_size(2),
-        lambda c: c.find({"y": 1}).batch_size(2),
-        lambda c: c.find({"y": 1, "z": {"$gte": 0}}).batch_size(1),
-        lambda c: c.find({"x": {"$gt": 3}, "z": 0}).batch_size(2),
-        lambda c: c.find({"x": {"$gte": 0}}).skip(2).limit(3).batch_size(2),
-        lambda c: c.find({"x": {"$in": [1, 5, 9, 99]}}).batch_size(2),
-        lambda c: c.find({"x": {"$gte": 9}}, {"x": 1}).batch_size(2),
-    ]
     out = []
     for i, read in enumerate(reads):
         coll = db[f"s{i}"]
@@ -443,6 +461,20 @@ def test_slow_query_lines_count_each_batch(rust_mongo: Any, mongod: Any) -> None
     Every `getMore` line repeats the cursor's `planSummary` and names the
     command that opened it."""
     got = {name: _batch_counts(name, db) for name, db in _both(rust_mongo, mongod, "rm023b")}
+    assert got["rust"] == got["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-023")
+def test_slow_query_lines_count_each_batch_of_backward_and_id_scans(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """mongod 8.2.11 counts each batch as it reads it on a backward index
+    scan, an `_id` index scan and a backward collection scan too, and a
+    covered plan examines no document."""
+    got = {
+        name: _batch_counts(name, db, _MORE_READS)
+        for name, db in _both(rust_mongo, mongod, "rm023c")
+    }
     assert got["rust"] == got["mongod"]
 
 

@@ -1037,11 +1037,128 @@ def _id_sorted_sees_writes(client: Any) -> list:
     return [first] + [d["_id"] for d in cur]
 
 
-@pytest.mark.backlog("RM-080")
+@pytest.mark.backlog_fixed("RM-080")
 def test_id_sorted_get_more_sees_writes_made_since_the_find(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 walks the `_id` index for an `_id` sort, so a document
     inserted after the first batch is returned."""
     assert _id_sorted_sees_writes(rust_mongo) == _id_sorted_sees_writes(mongod)
+
+
+def _backward_index_scan_sees_writes(client: Any, descending: bool = False) -> list:
+    """A scan down an ascending index (or forward along a descending one)
+    read two at a time, with writes between the batches."""
+    c = client["rm080"][_name()]
+    c.insert_many([{"_id": i, "x": i} for i in range(1, 7)])
+    if descending:
+        c.create_index([("x", -1)])
+        cur = c.find({"x": {"$gte": 0}}).batch_size(2)
+    else:
+        c.create_index("x")
+        cur = c.find({"x": {"$gte": 0}}).sort("x", -1).batch_size(2)
+    first = [next(cur)["_id"], next(cur)["_id"]]
+    c.delete_one({"_id": 4})
+    c.update_one({"_id": 6}, {"$set": {"x": 0.5}})
+    c.insert_one({"_id": 7, "x": 3.5})
+    return first + [d["_id"] for d in cur]
+
+
+@pytest.mark.backlog_fixed("RM-080")
+def test_backward_index_scan_get_more_sees_writes_made_since_the_find(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """mongod 8.2.11 resumes a backward index scan before its (key,
+    RecordId): a document deleted ahead does not appear, one inserted ahead
+    does, and one whose key moved ahead comes back a second time."""
+    got, want = (
+        _backward_index_scan_sees_writes(rust_mongo),
+        _backward_index_scan_sees_writes(mongod),
+    )
+    assert want == [6, 5, 7, 3, 2, 1, 6]
+    assert got == want
+
+
+@pytest.mark.backlog("RM-080")
+def test_descending_index_get_more_sees_writes_made_since_the_find(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """mongod 8.2.11 reads a descending index as it reads any other: on
+    from the position, seeing writes made since the last batch."""
+    got = _backward_index_scan_sees_writes(rust_mongo, descending=True)
+    want = _backward_index_scan_sees_writes(mongod, descending=True)
+    assert want == [6, 5, 7, 3, 2, 1, 6]
+    assert got == want
+
+
+def _id_scans_see_writes(client: Any) -> list:
+    out = []
+    for read in (
+        lambda c: c.find({"_id": {"$gte": 2}}).batch_size(1),
+        lambda c: c.find().sort("_id", -1).batch_size(1),
+    ):
+        c = client["rm080"][_name()]
+        c.insert_many([{"_id": i} for i in range(1, 5)])
+        cur = read(c)
+        first = next(cur)["_id"]
+        c.delete_one({"_id": 3})
+        c.insert_many([{"_id": 0}, {"_id": 5}])
+        out.append([first] + [d["_id"] for d in cur])
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-080")
+def test_id_index_get_more_sees_writes_made_since_the_find(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 walks the `_id` index either way, resuming after its
+    key: of two documents inserted after the first batch, the one ahead of
+    the position is returned and the one behind it is not."""
+    got, want = _id_scans_see_writes(rust_mongo), _id_scans_see_writes(mongod)
+    assert want == [[2, 4, 5], [4, 2, 1, 0]]
+    assert got == want
+
+
+def _natural_backward_sees_writes(client: Any) -> list:
+    c = client["rm080"][_name()]
+    c.insert_many([{"_id": i} for i in range(1, 7)])
+    cur = c.find().sort("$natural", -1).batch_size(2)
+    first = [next(cur)["_id"], next(cur)["_id"]]
+    c.delete_one({"_id": 3})
+    c.insert_one({"_id": 7})
+    return first + [d["_id"] for d in cur]
+
+
+@pytest.mark.backlog_fixed("RM-080")
+def test_natural_backward_get_more_sees_writes_made_since_the_find(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """mongod 8.2.11 reads `$natural: -1` back from the position: a document
+    deleted ahead does not appear, and one inserted since lands behind it."""
+    got, want = _natural_backward_sees_writes(rust_mongo), _natural_backward_sees_writes(mongod)
+    assert want == [6, 5, 4, 2, 1]
+    assert got == want
+
+
+def _foreign_ids_in_order(client: Any) -> list:
+    """An `_id` sort over `_id`s whose keys keep an older encoding: read as
+    before, in mongod's order."""
+    c = client["rm080"][_name()]
+    c.insert_many(
+        [
+            {"_id": {"b": 1}},
+            {"_id": {"a": 2, "b": 1}},
+            {"_id": {"a": [1]}},
+            {"_id": {"a": 1}},
+            {"_id": 3},
+            {"_id": "s"},
+        ]
+    )
+    return [d["_id"] for d in c.find().sort("_id", 1).batch_size(2)]
+
+
+@pytest.mark.backlog_fixed("RM-080")
+def test_id_sort_over_document_ids_is_in_mongods_order(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 orders document `_id`s field by field; this server's
+    `_id` keys for documents keep an older encoding, so such a collection is
+    not read by walking them."""
+    assert _foreign_ids_in_order(rust_mongo) == _foreign_ids_in_order(mongod)
 
 
 def _index_order(client: Any) -> list:

@@ -1028,6 +1028,7 @@ pub trait Storage: Send + Sync {
     /// Up to `max` documents after RecordId `after` (from the start when
     /// `None`), in RecordId order, with their RecordIds, on this call's
     /// snapshot: a collection scan a streaming cursor resumes batch by batch.
+    /// `backward`: descending, before `after` (from the end when `None`).
     /// `None` when the store cannot read this way.
     fn records_after(
         &self,
@@ -1035,6 +1036,7 @@ pub trait Storage: Send + Sync {
         _coll: &str,
         _after: Option<i64>,
         _max: usize,
+        _backward: bool,
     ) -> Result<Option<Records>, StorageError> {
         Ok(None)
     }
@@ -1055,7 +1057,11 @@ pub trait Storage: Send + Sync {
     /// after `(from, after)` when `after` is given), in the index's order,
     /// as `(key, RecordId)` with the key the fields' `sortkey` encodings
     /// joined by `COMPOUND_SEP`: an index scan a streaming cursor resumes.
-    /// `None` when the store cannot read this way.
+    /// `backward`: descending, from the last entry no greater than `from`
+    /// (strictly before `(from, after)`). The `_id` index's entries are the
+    /// documents' `_id` keys, one per document. `None` when the store cannot
+    /// read this way.
+    #[allow(clippy::too_many_arguments)]
     fn index_entries_from(
         &self,
         _db: &str,
@@ -1064,6 +1070,7 @@ pub trait Storage: Send + Sync {
         _from: &[u8],
         _after: Option<i64>,
         _max: usize,
+        _backward: bool,
     ) -> Result<Option<IndexEntries>, StorageError> {
         Ok(None)
     }

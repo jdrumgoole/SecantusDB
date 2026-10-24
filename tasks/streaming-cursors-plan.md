@@ -61,10 +61,22 @@ connection thread; no WT cursor may outlive its call):
    outside the registry lock; per-batch `keysExamined` / `docsExamined`,
    `getMore`'s `planSummary` and `cursorExhausted` on the slow line and
    profile entries. Fixes RM-080's gap test.
-2. **The rest of `find`.** Descending and collated indexes, OR plans,
-   SORT_MERGE, covered plans (PROJECTION_COVERED), `$natural` backward,
-   `min`/`max`, `returnKey` / `showRecordId`, blocking sorts (read all for
-   the first batch, counted as read).
+2. **The rest of `find`.**
+   - Done 2026-10-24 (branch `rust-mdb-stream2`): backward index scans
+     (each field's key compared reversed, `exec::reversed_key`), `$natural`
+     backward, the `_id` index (the documents' `id_key`s, walked in
+     `NAT_SEQ_TABLE`; not for a collection holding an `_id` whose key keeps
+     entry format 4's bytes), covered plans (documents read to project,
+     not counted), a LIMIT above the projection.
+   - Left: descending and collated indexes (their stored order is not
+     mongod's: a descending string field's inverted bytes leave `"a"` before
+     `"ab"`, and a collated string keys by a one-level fold -- an
+     entry-format change, which needs its own decision), multikey (the
+     RecordId set across batches; this store also writes whole-array keys,
+     and an element that is an array cannot be told from one), OR plans,
+     SORT_MERGE, `min`/`max`, `returnKey` / `showRecordId`, blocking sorts
+     (read all for the first batch, counted as read; the sort is the store's
+     comparator, private to `secantus-storage`).
 3. **`aggregate`.** A streaming source for pipelines whose prefix does not
    block; counts for `count`, `distinct`, write statements and
    `findAndModify` from their reads.
