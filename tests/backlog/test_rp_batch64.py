@@ -1,6 +1,7 @@
 """Batch 64 of the Rust PG server (2026-10-24): `pg_subscription` is one
-catalog for the cluster (RP-169), an MCV list's timestamps (RP-099), and a
-`timestamptz` assigned or bounded under a session's zone (RP-240).
+catalog for the cluster (RP-169), an MCV list's timestamps (RP-099), a
+`timestamptz` assigned or bounded under a session's zone (RP-240), and a
+statement trigger's NEW (RP-243).
 
 Each scenario runs the same statements against a private, freshly
 initdb'd PostgreSQL 15.19 cluster and this server; the literals are 15.19's
@@ -86,6 +87,27 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
             " ('2021-06-01 00:00:00.5+02', '2021-06-01 00:00:00.25')",
             "select tstzrange(z, z + interval '1 hour'), tstzrange(t, t + interval '1 hour')"
             " from rp64_r order by z",
+            "rollback",
+        ],
+    ),
+    # --------------------------- RP-243 NEW in a statement-level trigger
+    "a statement trigger's NEW is a NULL row": (
+        "RP-243",
+        False,
+        [
+            "begin",
+            "create table rp64_t (d int, e text)",
+            "create table rp64_tl (n text)",
+            "create function rp64_tf() returns trigger language plpgsql as $$ begin"
+            " insert into rp64_tl values (tg_level || ' ' || coalesce(new.d::text, '-')"
+            " || ' ' || coalesce(old.e, '-') || ' ' || pg_typeof(new.d)::text);"
+            " return new; end $$",
+            "create trigger rp64_tb before insert on rp64_t for each row"
+            " execute function rp64_tf()",
+            "create trigger rp64_ts before insert on rp64_t for each statement"
+            " execute function rp64_tf()",
+            "insert into rp64_t values (1, 'x')",
+            "select n from rp64_tl",
             "rollback",
         ],
     ),
@@ -262,6 +284,17 @@ EXPECTED: dict[str, Any] = {
                 "[2021-06-01 00:00:00.250000-04:00, 2021-06-01 01:00:00.250000-04:00)",
             ),
         ],
+        "ROLLBACK",
+    ],
+    "a statement trigger's NEW is a NULL row": [
+        "BEGIN",
+        "CREATE TABLE",
+        "CREATE TABLE",
+        "CREATE FUNCTION",
+        "CREATE TRIGGER",
+        "CREATE TRIGGER",
+        "INSERT 0 1",
+        [("STATEMENT - - integer",), ("ROW 1 - integer",)],
         "ROLLBACK",
     ],
     "each database names its own subscriptions": [

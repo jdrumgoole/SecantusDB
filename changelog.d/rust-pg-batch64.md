@@ -1,13 +1,33 @@
-### Rust PostgreSQL server: one pg_subscription for the cluster, timestamps in MCV lists and timestamptz under a session zone
+### Rust PostgreSQL server: COPY FROM checks its rows and loads faster, one pg_subscription for the cluster, and timestamptz under a session zone
 
-`pg_subscription` lists every database's subscriptions, as PostgreSQL
-15.19's shared catalog does. An MCV list over timestamps has its datums.
-Under a session time zone other than UTC, a `timestamptz` that an
-`INSERT ... SELECT` computes, or that bounds a `tstzrange`, keeps its
-instant.
+COPY FROM now checks each row's constraints and fires its triggers, as an
+INSERT does, and buffers rows as PostgreSQL 15.19 does: `pgbench -i`
+takes 42% less time. `pg_subscription` lists every database's
+subscriptions. An MCV list over timestamps has its datums. Under a session
+time zone other than UTC, a `timestamptz` that an `INSERT ... SELECT`
+computes, or that bounds a `tstzrange`, keeps its instant.
 
 #### Fixed
 
+- COPY FROM checked no NOT NULL, CHECK or foreign key constraint and fired
+  no trigger, so it could store rows an INSERT refuses (RP-241). Each row
+  now goes through what an INSERT's does, in PostgreSQL's order:
+  - BEFORE ROW triggers, then NOT NULL and CHECK, as each row is read;
+  - the unique and exclusion checks the storage indexes do not make, when
+    the buffered rows are inserted;
+  - foreign keys and AFTER ROW triggers at the end of the COPY;
+  - BEFORE and AFTER STATEMENT triggers once each.
+  So the error reported is the one PostgreSQL meets first. A CHECK on line
+  2 wins over a bad value on line 3, and a bad value on line 3 wins over a
+  duplicate key or a missing foreign key earlier on.
+
+  Fixes RP-241 (tests/backlog/test_rp_batch64_copy.py::test_scenario[COPY FROM checks NOT NULL CHECK and foreign keys],
+  tests/backlog/test_rp_batch64_copy.py::test_scenario[COPY FROM reports the error PostgreSQL meets first],
+  tests/backlog/test_rp_batch64_copy.py::test_scenario[COPY FROM fires row and statement triggers]).
+- In a statement-level trigger, `new.d` and `old.e` read a NULL of the
+  column's type, where they were 0A000 `ColumnRef is not supported yet`.
+
+  Fixes RP-243 (tests/backlog/test_rp_batch64.py::test_scenario[a statement trigger's NEW is a NULL row]).
 - Subscriptions are kept once for the cluster, beside the databases,
   where each database kept its own (part of RP-169).
   - **Every database's rows.** `pg_subscription`, `pg_replication_origin`,
@@ -51,3 +71,23 @@ instant.
 
   Fixes RP-240 (tests/backlog/test_rp_batch64.py::test_scenario[INSERT ... SELECT keeps a timestamptz's instant],
   tests/backlog/test_rp_batch64.py::test_scenario[a tstzrange of timestamptz bounds keeps their instants]).
+
+#### Changed
+
+- COPY FROM buffers its rows as PostgreSQL's `CopyMultiInsertBuffer` does,
+  inserting them 1,000 rows or 64 kB at a time. Before, it loaded each
+  CopyData message, which `pgbench` and `psql` send one per row. A table
+  with triggers still loads each message as it comes, as PostgreSQL inserts
+  row by row there. `pg_stat_progress_copy` still counts each row as it is
+  read. With two smaller savings, `pgbench -i -s 1` takes 24 s where it
+  took 42 s (a debug build on an M-series Mac):
+  - **The session's settings** are installed once per COPY, not once per
+    message.
+  - **A unique index's build** reads only the key's fields of each row.
+  - **VACUUM's and ANALYZE's** live-tuple count is a count, not every row
+    decoded.
+
+#### Known gaps
+
+- A COPY error carries no CONTEXT naming its line (`COPY t, line 2,
+  column a: "x"`) (RP-242, open).

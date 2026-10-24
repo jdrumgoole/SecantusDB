@@ -433,6 +433,19 @@ impl PgHandler {
             .find(|d| d.get_str("name") == Ok(function) && d.get_i32("nargs") == Ok(0))
             .ok_or_else(|| user_error("42883", format!("function {function}() does not exist")))?;
         let source = crate::plpgsql_create_sql(&doc);
+        let table = trg.get_str("table").unwrap_or_default();
+        let row_type = if new.is_none() && old.is_none() {
+            self.lookup(table)
+                .map(|def| {
+                    def.columns
+                        .iter()
+                        .map(|c| (c.name.clone(), c.pg_type.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let data = TriggerData {
             new,
             old,
@@ -442,6 +455,7 @@ impl PgHandler {
             when: trg.get_str("timing").unwrap_or_default().to_string(),
             level: trg.get_str("level").unwrap_or("ROW").to_string(),
             args: strings(trg, "args"),
+            row_type,
         };
         let outcome = self.with_transition_tables(trg, || {
             self.with_call_depth(|| {
@@ -495,6 +509,7 @@ impl PgHandler {
             when: trg.get_str("timing").unwrap_or_default().to_string(),
             level: "ROW".to_string(),
             args: Vec::new(),
+            row_type: Vec::new(),
         };
         let outcome = plpgsql_fn::run(
             &sql,

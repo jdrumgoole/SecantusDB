@@ -757,12 +757,31 @@ fixed in the same batch; their tests there are regression tests.
 
 ## Found by batch 64 (2026-10-24)
 
-Found while giving an MCV list over timestamps its datums (RP-099), and
-fixed in the same batch; its tests in `tests/backlog/test_rp_batch64.py`
-are regression tests. RP-240: under a session zone other than UTC, a
-`timestamptz` an `INSERT ... SELECT` computed (`select timestamptz '...'`,
-`z + interval`) or copied as a `timestamptz[]` was stored shifted by the
-zone's offset, and so was each bound of `tstzrange(timestamptz, ...)`.
+Found while giving an MCV list over timestamps its datums (RP-099) and
+while speeding up `pgbench -i`'s COPY. RP-240, RP-241 and RP-243 were fixed
+in the same batch; their tests in `tests/backlog/test_rp_batch64.py` and
+`tests/backlog/test_rp_batch64_copy.py` are regression tests.
+
+- RP-240: under a session zone other than UTC, a `timestamptz` that an
+  `INSERT ... SELECT` computed (`select timestamptz '...'`,
+  `z + interval`), or copied as a `timestamptz[]`, was stored shifted by
+  the zone's offset. So was each bound of `tstzrange(timestamptz, ...)`.
+- RP-241: COPY FROM checked no NOT NULL, CHECK or foreign key constraint,
+  and fired no trigger.
+- RP-243: `new.d` in a statement-level trigger was 0A000, where PostgreSQL
+  reads a NULL of the column's type.
+
+- [ ] **A COPY error does not say where it is.** PostgreSQL 15.19's
+      `CopyFromErrorCallback` adds a CONTEXT naming the COPY's table and
+      line. It is `COPY t, line 2, column a: "x"` for a value that does not
+      parse, `COPY t, line 2: "7\t1"` for a row a constraint refuses, and
+      `COPY t, line 2` for a unique index's duplicate. Here the error has
+      no CONTEXT. PostgreSQL also checks NOT NULL and CHECK on each row as
+      it reads it. Here a bad value later in the same CopyData message as
+      such a row is reported first, because a message is parsed whole.
+      Both need the parser to keep each row's line number and text.
+      Backlog-ID: RP-242
+      Verify: tests/backlog/test_rp_batch64_copy.py::test_scenario[a COPY error names its line]
 
 ## Found by batch 63 (2026-10-24)
 

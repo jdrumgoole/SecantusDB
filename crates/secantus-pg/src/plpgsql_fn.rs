@@ -206,6 +206,9 @@ pub struct TriggerData {
     pub level: String,
     /// `TG_ARGV`: the literal arguments CREATE TRIGGER named.
     pub args: Vec<String>,
+    /// The table's columns and types, for a statement-level trigger, whose
+    /// NEW and OLD are both NULL records of the table's row type.
+    pub row_type: Vec<(String, String)>,
 }
 
 /// One call.
@@ -1261,12 +1264,27 @@ impl Interp<'_> {
     /// leaves unassigned, read off the one it does assign.
     fn unassigned_trigger_field(&self, name: &str, field: &str) -> Option<String> {
         let t = self.trigger.as_ref()?;
-        let other = match name {
-            "new" if t.new.is_none() => t.old.as_ref(),
-            "old" if t.old.is_none() => t.new.as_ref(),
-            _ => None,
-        }?;
-        other.get(field).map(|(_, ty)| ty.to_string())
+        let unassigned = match name {
+            "new" => t.new.is_none(),
+            "old" => t.old.is_none(),
+            _ => false,
+        };
+        if !unassigned {
+            return None;
+        }
+        let other = if name == "new" {
+            t.old.as_ref()
+        } else {
+            t.new.as_ref()
+        };
+        match other {
+            Some(other) => other.get(field).map(|(_, ty)| ty.to_string()),
+            None => t
+                .row_type
+                .iter()
+                .find(|(c, _)| c == field)
+                .map(|(_, ty)| ty.clone()),
+        }
     }
 
     /// Is `name` a record variable that nothing has assigned (the

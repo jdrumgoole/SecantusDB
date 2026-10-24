@@ -455,6 +455,7 @@ impl PgHandler {
                 when: event.to_string(),
                 level: plpgsql_fn::EVENT_LEVEL.to_string(),
                 args: Vec::new(),
+                row_type: Vec::new(),
             };
             self.with_call_depth(|| {
                 plpgsql_fn::run(

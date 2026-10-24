@@ -382,7 +382,12 @@ impl PgHandler {
         if !self.tracking() || !self.has_heap(table) {
             return Ok(());
         }
-        let live = self.table_docs(table)?.len() as i64;
+        // A count, not the rows: decoding every row to count them was half
+        // of a VACUUM of a large table.
+        let live = self
+            .storage
+            .count_matching(self.db(), table, &bson::Document::new(), None)
+            .map_err(|e| Self::storage_err("could not read", e))? as i64;
         let dead = self.dead_tuple_count(table);
         let rel = self.relation_oid(table).unwrap_or(0);
         let s = self.stats();
