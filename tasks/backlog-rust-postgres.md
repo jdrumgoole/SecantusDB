@@ -755,6 +755,21 @@ tests are scenarios in `tests/backlog/test_rp_batch30.py`, measured on a
 private 15.19 cluster. RP-133 .. RP-136 and RP-138 .. RP-142 were found and
 fixed in the same batch; their tests there are regression tests.
 
+## Found by batch 60 (2026-10-24)
+
+Found while modelling the B-trees' pages (RP-196). The gap test is a
+scenario in `tests/backlog/test_rp_batch60.py`, measured on a private 15.19
+cluster.
+
+- [ ] **A partial index whose predicate computes refuses to be made.**
+      `create index on t (a) where a % 2 = 0` answers 0A000 `AExpr is not
+      supported yet`; PostgreSQL 15.19 makes it, and a query with the same
+      WHERE runs here. The predicate is kept as a storage filter, which an
+      operator over a column's value does not lower to; it needs the
+      expression form the executor evaluates.
+      Backlog-ID: RP-236
+      Verify: tests/backlog/test_rp_batch60.py::test_scenario[a partial index over an expression's value]
+
 ## Found by batch 59 (2026-10-24)
 
 Found while drawing every oid from one counter (RP-137), and fixed in the
@@ -898,15 +913,20 @@ are scenarios in `tests/backlog/test_rp_batch48.py`, measured on a private
 15.19 cluster. RP-195 (`pg_relation_size`) was found and fixed in the same
 batch; its test there is a regression test.
 
-- [ ] **`pg_class` shows no page or tuple counts for an index.** A table's
-      `relpages`, `reltuples` and `relallvisible` are what VACUUM, ANALYZE
-      and CREATE INDEX recorded (batch 49). An index's row still reads 0 and
-      -1, where PostgreSQL 15.19 shows its own pages and entries: an index
-      on 200 integers is `2 | 200` after CREATE INDEX. The pages need a
-      model of the B-tree as inserts split it; `costsize::btree_size`
-      estimates a freshly built one only.
+- [ ] **A B-tree index never deletes the dead tuples a leaf holds before
+      it splits.** Each B-tree's pages are modelled since batch 60
+      (`btree_model.rs`): CREATE INDEX's build, inserts that deduplicate and
+      split, VACUUM's index pass. What the model lacks is PostgreSQL 14's
+      bottom-up deletion -- an UPDATE that leaves an index's key unchanged,
+      finding the leaf full, asks the heap which of the key's older
+      versions are dead and removes them instead of splitting -- and simple
+      deletion of the tuples index scans marked LP_DEAD. Both need the
+      model to consult the heap's visibility per TID. So five UPDATEs of
+      every row of a 2,000-row table leave its primary key 24 pages here
+      and 17 on PostgreSQL 15.19. Also left: REINDEX SCHEMA rebuilds no
+      index (the statement names no table here).
       Backlog-ID: RP-196
-      Verify: tests/backlog/test_rp_batch49.py::test_scenario[pg_class shows an index's size]
+      Verify: tests/backlog/test_rp_batch60.py::test_scenario[bottom-up deletion keeps an unchanged key's index small]
 
 ## Found by batch 46 (2026-10-23)
 

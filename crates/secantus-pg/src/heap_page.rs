@@ -686,6 +686,8 @@ impl Heap {
     /// (the bypass) -- the free space recorded, trailing empty pages
     /// truncated away when `truncate` allows. `live` gives each visible
     /// row's length by ctid; every page's free space is recounted from it.
+    /// Returns the TIDs the index pass removes from the indexes, `None`
+    /// when no index pass ran (no dead tuples, no indexes, or the bypass).
     pub(crate) fn vacuum(
         &mut self,
         horizon: u64,
@@ -693,7 +695,7 @@ impl Heap {
         live: &HashMap<i64, u32>,
         has_indexes: bool,
         truncate: bool,
-    ) {
+    ) -> Option<Vec<i64>> {
         let absent = |c: i64| !live.contains_key(&c);
         let rel_pages = self.nblocks();
         let mut deferred: Vec<u32> = Vec::new();
@@ -719,10 +721,22 @@ impl Heap {
                 self.fsm.record(block, free);
             }
         }
+        let mut index_pass = None;
         if !deferred.is_empty() {
             let threshold = (f64::from(rel_pages) * BYPASS_THRESHOLD_PAGES) as usize;
             let bypass = deferred.len() < threshold && lpdead_items < 32 * 1024 * 1024 / 6;
             if !bypass {
+                let mut dead: Vec<i64> = Vec::new();
+                for block in &deferred {
+                    let page = &self.pages[*block as usize];
+                    dead.extend(
+                        page.lps
+                            .iter()
+                            .filter(|(_, l)| matches!(l, Lp::Dead))
+                            .map(|(o, _)| tid(*block, *o)),
+                    );
+                }
+                index_pass = Some(dead);
                 for block in deferred {
                     self.vacuum_page(block);
                     let free = self.pages[block as usize].heap_free();
@@ -753,6 +767,7 @@ impl Heap {
         // The relation's statistics are updated in place, which invalidates
         // every backend's cached target block.
         self.targets.clear();
+        index_pass
     }
 
     /// `lazy_vacuum_heap_page`: dead line pointers made unused, the

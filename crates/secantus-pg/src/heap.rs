@@ -215,6 +215,76 @@ pub(crate) fn tuple_len(def: &TableDef, doc: &Document) -> usize {
     maxalign(total)
 }
 
+/// A column's type as a tuple lays it out: its name and typmod, and its
+/// `(typlen, typalign)`, looked up once.
+#[derive(Debug, Clone)]
+pub(crate) struct Laid {
+    pub(crate) pg_type: String,
+    typmod: i32,
+    len: i64,
+    align: char,
+}
+
+impl Laid {
+    pub(crate) fn of(pg_type: &str, typmod: i32) -> Self {
+        let (len, align) = layout(pg_type);
+        Laid {
+            pg_type: pg_type.to_string(),
+            typmod,
+            len,
+            align,
+        }
+    }
+}
+
+/// The length `index_form_tuple` gives an index tuple of these
+/// attributes, `types` each one's layout (`None` for an expression's,
+/// sized by its value): an 8-byte header, 16 with a null bitmap, then each
+/// attribute aligned as its type is.
+pub(crate) fn index_tuple_len(types: &[Option<Laid>], values: &[Bson]) -> usize {
+    let has_nulls = values.iter().any(|v| matches!(v, Bson::Null));
+    let hoff = if has_nulls { maxalign(8 + 4) } else { 8 };
+    let mut off = 0usize;
+    for (t, v) in types.iter().zip(values) {
+        if matches!(v, Bson::Null) {
+            continue;
+        }
+        let guessed;
+        let l = match t {
+            Some(l) => l,
+            None => {
+                guessed = Laid::of(value_type(v), -1);
+                &guessed
+            }
+        };
+        if l.len > 0 {
+            off = align(off, l.align) + l.len as usize;
+        } else if l.len == -2 {
+            off += text_of(v).len() + 1;
+        } else {
+            let data = varlena_data(&l.pg_type, l.typmod, v);
+            if data < 127 {
+                off += 1 + data;
+            } else {
+                off = align(off, l.align) + 4 + data;
+            }
+        }
+    }
+    maxalign(hoff + off)
+}
+
+/// The type an expression's stored value has, for its index tuple's size.
+fn value_type(v: &Bson) -> &'static str {
+    match v {
+        Bson::Int32(_) => "int4",
+        Bson::Int64(_) => "int8",
+        Bson::Double(_) => "float8",
+        Bson::Boolean(_) => "bool",
+        Bson::DateTime(_) => "timestamptz",
+        _ => "text",
+    }
+}
+
 /// How many command ids a statement other than a row write consumes in
 /// PostgreSQL 15.19, measured inside a transaction block: the catalog
 /// changes a DDL statement makes advance the command counter as many times
@@ -694,6 +764,20 @@ impl PgHandler {
             }
             self.stat_pages(&heap_table, ctids.iter().map(|c| c / 65536));
             self.stat_writes(&heap_table, inserted, updated, hot);
+            // Every version that is not heap-only takes a tuple in each of
+            // the table's B-trees (RP-196).
+            let indexed: Vec<(&Document, i64)> = idx
+                .iter()
+                .zip(olds.iter().zip(&ctids))
+                .filter(|(_, (old, ctid))| match old {
+                    None => true,
+                    Some((old_ctid, same)) => {
+                        !(*same && old_ctid.is_some_and(|o| o / 65536 == **ctid / 65536))
+                    }
+                })
+                .map(|(i, (_, ctid))| (&rows[*i].1, *ctid))
+                .collect();
+            self.btree_insert_versions(&heap_table, &indexed)?;
             for (i, ctid) in idx.into_iter().zip(ctids) {
                 // An xid is 32 bits (the low half of the xid8).
                 stamp(&mut rows[i].1, (xid & 0xFFFF_FFFF) as i64, cid, ctid);
@@ -956,7 +1040,7 @@ impl PgHandler {
                     live.insert(ctid, tuple_len(&def, row) as u32);
                 }
             }
-            self.with_heap(&heap_table, |heap| {
+            let index_pass = self.with_heap(&heap_table, |heap| {
                 heap.settle_all(&|c| live.contains_key(&c), &|x| running.contains(&x));
                 heap.vacuum(
                     horizon,
@@ -964,8 +1048,20 @@ impl PgHandler {
                     &live,
                     has_indexes,
                     truncate,
-                );
+                )
             })?;
+            // The index pass: each B-tree loses the dead TIDs, and records
+            // its pages and the TIDs left (`btvacuumcleanup`, RP-196).
+            let visited = match index_pass {
+                Some(dead) => {
+                    let dead: std::collections::HashSet<i64> = dead.into_iter().collect();
+                    self.btree_bulk_delete(&heap_table, &dead)?
+                }
+                None => self.btree_cleanup(&heap_table)?,
+            };
+            for (index, pages, tuples) in visited {
+                self.record_index_size(&heap_table, &index, pages, tuples as f64)?;
+            }
         }
         Ok(())
     }
@@ -1019,6 +1115,26 @@ impl PgHandler {
                 .count() as i64
         })
         .unwrap_or(0)
+    }
+
+    /// The heap's heap-only tuples, which no index points at.
+    pub(crate) fn heap_only_tids(&self, table: &str) -> std::collections::HashSet<i64> {
+        if !self.has_heap(table) {
+            return Default::default();
+        }
+        self.with_heap_read(table, |heap| {
+            heap.pages
+                .iter()
+                .enumerate()
+                .flat_map(|(b, p)| {
+                    p.lps.iter().filter_map(move |(o, lp)| match lp {
+                        Lp::Normal(t) if t.heap_only => Some(tid(b as u32, *o)),
+                        _ => None,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
     }
 
     pub(crate) fn heap_blocks(&self, table: &str) -> PgWireResult<u32> {
@@ -1251,6 +1367,8 @@ pub(crate) fn flush_store(storage: &std::sync::Arc<secantus_storage::Storage>, f
             }
         }
     }
+    // The indexes' pages, on a checkpoint of their own (RP-196).
+    crate::btree::flush_store(storage, force);
 }
 
 #[cfg(test)]

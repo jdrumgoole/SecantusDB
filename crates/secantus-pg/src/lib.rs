@@ -35,6 +35,8 @@ mod advisory;
 mod aggregates;
 mod alter_system;
 mod binary_recv;
+mod btree;
+mod btree_model;
 mod casts;
 mod catalog_fill;
 mod catalog_meta;
@@ -8033,16 +8035,21 @@ impl PgHandler {
         Some(secantus_pgplan::hashagg::heap_pages(spaces.into_iter()))
     }
 
-    /// The space each of `table`'s rows takes on a heap page, in heap order
-    /// (`hashagg::heap_tuple_space`); `None` as for `heap_pages`.
-    fn heap_spaces(&self, table: &str, def: &secantus_pgcatalog::TableDef) -> Option<Vec<usize>> {
-        use secantus_pgplan::hashagg::{self, ColumnLayout};
+    /// Whether `heap_pages` sizes `def`'s rows: every column's type is one
+    /// whose width it models. Its answer without reading a row.
+    fn heap_pages_modelled(def: &secantus_pgcatalog::TableDef) -> bool {
+        Self::heap_layouts(def).is_some()
+    }
+
+    fn heap_layouts(
+        def: &secantus_pgcatalog::TableDef,
+    ) -> Option<Vec<secantus_pgplan::hashagg::ColumnLayout>> {
+        use secantus_pgplan::hashagg::ColumnLayout;
         let fact = |c: &secantus_pgcatalog::Column, name: &str| {
             secantus_pgplan::pgtypes::oid_of_name(&c.pg_type)
                 .and_then(|oid| pg_type_facts::builtin(oid, name))
         };
-        let layouts: Vec<ColumnLayout> = def
-            .columns
+        def.columns
             .iter()
             .map(|c| {
                 let typlen = match fact(c, "typlen")? {
@@ -8069,7 +8076,14 @@ impl PgHandler {
                         == Some(true),
                 })
             })
-            .collect::<Option<_>>()?;
+            .collect::<Option<_>>()
+    }
+
+    /// The space each of `table`'s rows takes on a heap page, in heap order
+    /// (`hashagg::heap_tuple_space`); `None` as for `heap_pages`.
+    fn heap_spaces(&self, table: &str, def: &secantus_pgcatalog::TableDef) -> Option<Vec<usize>> {
+        use secantus_pgplan::hashagg;
+        let layouts = Self::heap_layouts(def)?;
         let docs = self.table_docs(table).ok()?;
         let mut spaces = Vec::with_capacity(docs.len());
         for d in &docs {
@@ -8189,7 +8203,7 @@ impl PgHandler {
         // a heap rows have left -- it declines; `pg_class` still shows the
         // counts (RP-196).
         let statistics = shrunk
-            || self.heap_pages(table, &def).is_none()
+            || !Self::heap_pages_modelled(&def)
             || previous
                 .as_ref()
                 .is_some_and(|d| d.get_bool("statistics").unwrap_or(false));
@@ -14624,7 +14638,14 @@ impl PgHandler {
         let Some(def) = self.lookup(table) else {
             return Ok(());
         };
-        let rows = self.table_docs(table)?.len();
+        // Counted, not read: a partitioned table's rows are its leaves'.
+        let rows = if partition::is_partitioned(&def) {
+            self.table_docs(table)?.len()
+        } else {
+            self.storage
+                .count_matching(self.db(), table, &Document::new(), None)
+                .map_err(|e| Self::storage_err("could not count the rows", e))?
+        };
         let previous = self.relstats(table);
         if rows == 0 && !statistics && previous.is_none() {
             return Ok(());
@@ -14637,7 +14658,7 @@ impl PgHandler {
         // The heap's pages, as `RelationGetNumberOfBlocks` counts them
         // (RP-196). A table whose rows' widths the planner does not model
         // is not priced at all.
-        if self.heap_pages(table, &def).is_none() {
+        if !Self::heap_pages_modelled(&def) {
             doc.insert("statistics", true);
         }
         if let Some(pages) = self.measured_pages(table, &def) {
@@ -14688,7 +14709,7 @@ impl PgHandler {
         if docs.len() as u64 <= 300 * target {
             self.build_extended_statistics(table, &def, &docs, columns, target as usize)?;
         }
-        if self.heap_pages(table, &def).is_none() {
+        if !Self::heap_pages_modelled(&def) {
             return self.record_relstats(table, true);
         }
         let Some(pages) = self.measured_pages(table, &def) else {
@@ -17142,9 +17163,10 @@ impl PgHandler {
     }
 
     /// The storage-size functions. A table's main fork is its heap's pages
-    /// (`heap.rs`, RP-195), as PostgreSQL's is; an index is one page per
-    /// 16 kB of its table's rows' encoded bytes, and a database the sum of
-    /// its tables' encoded bytes in 8 kB pages, neither of which follows
+    /// (`heap.rs`, RP-195), and a B-tree index its pages (`btree.rs`,
+    /// RP-196), as PostgreSQL's are; another index is one page per 16 kB of
+    /// its table's rows' encoded bytes, and a database the sum of its
+    /// tables' encoded bytes in 8 kB pages, neither of which follows
     /// PostgreSQL's page arithmetic.
     fn size_call(&self, name: &str, args: &[Bson]) -> PgWireResult<Bson> {
         const PAGE: i64 = 8192;
@@ -17158,7 +17180,9 @@ impl PgHandler {
                     Some(o) => o,
                     None => {
                         let name = secantus_pgplan::value_text(other);
-                        return if self.lookup(&name).is_some() {
+                        let known = self.lookup(&name).is_some()
+                            || self.relations().iter().any(|(n, _, _)| *n == name);
+                        return if known {
                             Ok(Some(name))
                         } else {
                             Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -17215,6 +17239,20 @@ impl PgHandler {
         let Some(rel) = relation(args.first().unwrap_or(&Bson::Null))? else {
             return Ok(Bson::Null);
         };
+        // A B-tree index: its pages as the model has them (RP-196).
+        let index = self
+            .index_relations()
+            .into_iter()
+            .find(|ix| Self::index_relstats_key(&ix.table.name, &ix.name) == rel);
+        if let Some(ix) = index {
+            let bytes = self
+                .btree_size(&ix.table.name, &ix.name)?
+                .map_or(0, |(p, _, _)| i64::from(p) * PAGE);
+            return Ok(Bson::Int64(match name {
+                "pg_indexes_size" => 0,
+                _ => bytes,
+            }));
+        }
         let stored = self.lookup(&rel).is_some() && Self::virtual_table(&rel).is_none();
         // A system catalog: its rows as `initdb` would lay them out (RP-214;
         // a view has no storage, 0 as PostgreSQL answers).
@@ -17250,7 +17288,18 @@ impl PgHandler {
             catalog_meta::system_index_count(oid)
         });
         let encoded = catalog_blocks.map_or(encoded, |b| b * PAGE);
-        let indexes = index_count * pages(encoded.max(PAGE) / 2);
+        // A B-tree is the model's pages; another index an estimate.
+        let btrees = if catalog.is_none() {
+            self.btree_names(&rel)
+        } else {
+            Vec::new()
+        };
+        let mut indexes = (index_count - btrees.len() as i64).max(0) * pages(encoded.max(PAGE) / 2);
+        for b in &btrees {
+            if let Some((p, _, _)) = self.btree_size(&rel, b)? {
+                indexes += i64::from(p) * PAGE;
+            }
+        }
         // A table with a TOASTable column has a TOAST table, whose index is
         // one page even when empty; `pg_table_size` counts it.
         let toast = match self.lookup(&rel) {
@@ -19267,7 +19316,11 @@ impl PgHandler {
                     );
                     d.insert(f("relnatts"), Bson::Int32(ix.keys.len() as i32));
                     d.insert(f("relhasindex"), false);
-                    d.insert(f("reltuples"), Bson::Double(-1.0));
+                    // What its build, VACUUM or ANALYZE last recorded
+                    // (RP-196).
+                    let (pages, tuples, _) = sizes.get(&key).copied().unwrap_or((0, -1.0, 0));
+                    d.insert(f("relpages"), Bson::Int32(pages));
+                    d.insert(f("reltuples"), Bson::Double(tuples));
                     // An index is its table's owner's.
                     d.insert(
                         f("relowner"),
@@ -26759,13 +26812,14 @@ impl PgHandler {
                 self.reset_heap(&p.name)?;
             }
         }
-        self.stamp_inserted(table, def, &mut docs)?;
+        btree::rewriting(|| self.stamp_inserted(table, def, &mut docs))?;
         let out = docs
             .iter()
             .map(encode_doc)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| Self::storage_err("could not encode a row", e))?;
-        self.replace_table_rows(table, out)
+        self.replace_table_rows(table, out)?;
+        self.btree_rebuild_models(table)
     }
 
     /// Replace every row of `table` with `rows`, ATOMICALLY: the rewrite is a
@@ -35261,6 +35315,8 @@ impl PgHandler {
                 for _ in 0..built {
                     self.stats().seq_scan(relid, 0);
                 }
+                // Its constraints' indexes, built over no rows (RP-196).
+                self.btree_built(&name, &[])?;
                 Ok(vec![Response::Execution(Tag::new("CREATE TABLE"))])
             }
 
@@ -35648,6 +35704,7 @@ impl PgHandler {
                 self.databases.remove(&self.storage, &info.name)?;
                 // Its tables' heaps go with it (RP-233).
                 heap::forget_database(&self.storage, &info.name);
+                btree::forget_database(&self.storage, &info.name);
                 // `DropSetting`: every `ALTER ROLE ... IN DATABASE` of it.
                 self.drop_role_settings(bson::doc! {"database": &info.name})?;
                 Ok(vec![Response::Execution(Tag::new("DROP DATABASE"))])
@@ -37277,6 +37334,8 @@ impl PgHandler {
                     }
                 }
                 let before = self.lookup(&table).unwrap_or_else(|| def.clone());
+                let indexes_before = self.btree_names(&table);
+                btree::take_rewrote();
                 for action in &effective {
                     self.apply_alter_rows(&table, &def, action, &before)?;
                 }
@@ -37310,6 +37369,13 @@ impl PgHandler {
                 self.rewrite_catalog(&table, &def)?;
                 if partition::is_partitioned(&def) {
                     self.sync_partition_columns(&def)?;
+                }
+                // A rewrite reindexes the table; otherwise the indexes the
+                // statement made are built (RP-196).
+                if btree::take_rewrote() {
+                    self.btree_reindex(&table)?;
+                } else {
+                    self.btree_built(&table, &indexes_before)?;
                 }
                 Ok(vec![Response::Execution(Tag::new("ALTER TABLE"))])
             }
@@ -37665,8 +37731,10 @@ impl PgHandler {
                 );
                 slot.set(0, 1);
                 slot.set(9, 2);
+                let before = self.btree_names(&table);
                 let out = self.create_index(ci)?;
                 self.record_relstats(&table, false)?;
+                self.btree_built(&table, &before)?;
                 // The build read the heap: a sequential scan (RP-070).
                 let rows = self
                     .storage
@@ -38005,6 +38073,7 @@ impl PgHandler {
                     // recoverable, whereas a catalog row pointing at a
                     // collection that no longer exists is not.
                     self.forget_heap(table);
+                    self.btree_forget(table);
                     self.storage
                         .drop_collection(self.db(), table)
                         .map_err(|e| Self::storage_err("could not drop the table", e))?;
@@ -39093,6 +39162,29 @@ impl PgHandler {
                         return Err(Self::relation_missing(index));
                     }
                 }
+                // REINDEX rebuilds each B-tree from the rows, as a build
+                // records it (RP-196). REINDEX SYSTEM's are the catalogs';
+                // REINDEX SCHEMA names no table here, so changes none.
+                if command == "REINDEX" || command == "REINDEX DATABASE" {
+                    let named: Vec<String> = if tables.is_empty() && indexes.is_empty() {
+                        self.all_table_defs()?.into_iter().map(|d| d.name).collect()
+                    } else {
+                        tables.iter().map(|(t, _)| t.clone()).collect()
+                    };
+                    for t in &named {
+                        self.btree_reindex(t)?;
+                    }
+                    for index in &indexes {
+                        let owner = self
+                            .index_relations()
+                            .into_iter()
+                            .find(|ix| ix.name == *index)
+                            .map(|ix| ix.table.name);
+                        if let Some(t) = owner {
+                            self.btree_reindex_one(&t, index)?;
+                        }
+                    }
+                }
                 if command == "VACUUM" || command == "ANALYZE" {
                     let named: Vec<(String, Vec<String>)> = if tables.is_empty() {
                         self.all_table_defs()?
@@ -39121,6 +39213,7 @@ impl PgHandler {
                             slot.set(1, 4);
                             self.vacuum_full(t)?;
                             self.record_relstats(t, true)?;
+                            self.btree_reindex(t)?;
                             continue;
                         }
                         if command == "VACUUM" {
@@ -39163,6 +39256,11 @@ impl PgHandler {
                             slot.set(0, 1);
                             slot.set(1, i64::from(self.heap_blocks(t).unwrap_or(0)));
                             self.record_analyze(t, columns)?;
+                            // A plain ANALYZE records its indexes too; after
+                            // a VACUUM, the VACUUM did (RP-196).
+                            if command != "VACUUM" {
+                                self.btree_analyzed(t)?;
+                            }
                             self.heap_invalidate(t)?;
                             self.stat_maintained(t, true)?;
                         }
@@ -39209,6 +39307,7 @@ impl PgHandler {
                     slot.set(0, 1);
                     slot.set(1, 2);
                     self.cluster_table(&t, &i)?;
+                    self.btree_reindex(&t)?;
                 }
                 Ok(vec![Response::Execution(Tag::new("CLUSTER"))])
             }
@@ -40416,6 +40515,7 @@ impl PgHandler {
                     // A truncated table starts a new heap (RP-069), and its
                     // live and dead tuples count from nothing (RP-070).
                     self.reset_heap(table)?;
+                    self.btree_truncated(table)?;
                     self.stat_truncated(table);
                     if self
                         .lookup(table)
