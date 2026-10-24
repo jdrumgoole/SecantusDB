@@ -41795,7 +41795,8 @@ fn extension_of_type(ty: &Type) -> Option<secantus_pgplan::ExtensionType> {
     if !matches!(ty.kind(), postgres_types::Kind::Simple) {
         return None;
     }
-    if i64::from(ty.oid()) < PgHandler::BASE_TYPE_OID_BASE {
+    // A user oid: the one counter starts at the lowest band (RP-137).
+    if i64::from(ty.oid()) < PgHandler::COMPOSITE_TYPE_OID_BASE {
         return None;
     }
     secantus_pgplan::extension_type(ty.name())
