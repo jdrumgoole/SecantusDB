@@ -357,6 +357,10 @@ impl Teardown {
             runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
         }
         if let Some(storage) = self.storage.take() {
+            // The cumulative statistics survive a clean shutdown (RP-070).
+            if let Err(e) = crate::pgstat::save_store(&storage) {
+                eprintln!("secantusd-pg: could not write the statistics: {e}");
+            }
             match Arc::try_unwrap(storage) {
                 // The close-checkpoint runs here, in `Storage::drop`.
                 Ok(storage) => {
@@ -618,6 +622,8 @@ pub fn bind_with(
     let storage = Arc::new(storage);
     // Transaction ids run on from the store's last reservation.
     crate::xids::install(&storage).map_err(std::io::Error::other)?;
+    // The cumulative statistics a clean shutdown kept (RP-070).
+    crate::pgstat::restore_store(&storage).map_err(std::io::Error::other)?;
     // Expression indexes keep a computed field on every row; rows another
     // writer left are brought up to date before any client connects.
     for info in databases.all(&storage).unwrap_or_default() {

@@ -650,6 +650,11 @@ pub trait PgWireServerHandlers: 'static {
     fn idle_event(&self) -> Option<IdleEventFuture<'_>> {
         None
     }
+
+    /// The client went away without a Terminate (SecantusDB local patch):
+    /// the end of its stream, or a read error. PostgreSQL counts such a
+    /// session as abandoned (`DISCONNECT_CLIENT_EOF`).
+    fn client_gone(&self) {}
 }
 
 /// What an [`PgWireServerHandlers::idle_event`] future resolves to.
@@ -699,6 +704,10 @@ where
 
     fn idle_event(&self) -> Option<IdleEventFuture<'_>> {
         (**self).idle_event()
+    }
+
+    fn client_gone(&self) {
+        (**self).client_gone()
     }
 }
 

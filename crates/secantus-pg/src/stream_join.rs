@@ -432,6 +432,8 @@ impl PgHandler {
             }
         }
         let mut failed: Option<PgWireError> = None;
+        let scan_stat = self.scan_stat(table, filter);
+        let mut scanned_rows = 0i64;
         let scanned =
             self.storage
                 .scan_routed_batches(self.db(), table, filter, JOIN_BATCH, |blobs| {
@@ -439,6 +441,7 @@ impl PgHandler {
                         failed = Some(e);
                         return false;
                     }
+                    scanned_rows += blobs.len() as i64;
                     match sink(blobs) {
                         Ok(go) => go,
                         Err(e) => {
@@ -447,6 +450,9 @@ impl PgHandler {
                         }
                     }
                 });
+        if let Some(s) = scan_stat {
+            s.finish(scanned_rows);
+        }
         if let Some(e) = failed {
             return Err(e);
         }

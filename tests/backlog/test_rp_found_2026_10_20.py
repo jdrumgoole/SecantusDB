@@ -552,7 +552,7 @@ def test_system_columns(rust_pg: Any) -> None:
     _check("system_columns", rust_pg)
 
 
-@pytest.mark.backlog("RP-070")
+@pytest.mark.backlog_fixed("RP-070")
 def test_catalog_relations_are_queryable(rust_pg: Any) -> None:
     """Every pg_catalog / information_schema table and view in PostgreSQL
     15.19's pg_class (rp070_catalog_relations.txt) can be selected from, but

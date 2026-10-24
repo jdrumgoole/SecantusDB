@@ -739,22 +739,6 @@ Not filed:
       its own slice.
       Backlog-ID: RP-064
       Verify: tests/backlog/test_rp064_encoding.py::test_latin1_database_behaves_as_latin1
-- [ ] **The cumulative statistics views cannot be queried** (42P01): the 21
-      `pg_stat_*_tables` / `_indexes` / `_functions`, `pg_stat_xact_*`,
-      `pg_stat_database` and `pg_statio_*` views. Every other relation in
-      PostgreSQL 15.19's `pg_class` (`tests/backlog/rp070_catalog_relations.txt`)
-      now answers, as PostgreSQL's own view definition over this server's
-      catalogs, from PostgreSQL's built-in rows, or from this server's state.
-      **Decided (Joe, 2026-10-22): model the counters, refuse the
-      internals** -- PostgreSQL's cumulative-statistics model (per-table,
-      per-index and per-function counters, the database's counters,
-      persisted across restarts) behind those views; the server's internals
-      (`pg_backend_memory_contexts`, `pg_shmem_allocations`,
-      `pg_stat_bgwriter`, `pg_stat_wal`, `pg_stat_slru`, `pg_stat_archiver`)
-      refused by name, 0A000, which the gap test expects. Relations refused
-      for reasons other items record (RP-098 .. RP-101) are left to theirs.
-      Backlog-ID: RP-070
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_catalog_relations_are_queryable
 
 ## Found by batch 30 (2026-10-22)
 
@@ -777,6 +761,45 @@ fixed in the same batch; their tests there are regression tests.
       since nothing records which was made first.
       Backlog-ID: RP-137
       Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order], tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]
+
+## Found by batch 55 (2026-10-24)
+
+Found while building the cumulative statistics (RP-070). The gap tests are
+in `tests/backlog/test_rp_batch55.py`, measured on a private 15.19 cluster.
+RP-227 (`pg_stat_database` did not count a session whose client went away
+without a Terminate, and counted a terminated one only once its client
+closed the socket) was found and fixed in the same batch; its test there is
+a regression test.
+
+- [ ] **A sequential scan under LIMIT counts every tuple.** PostgreSQL
+      15.19 stops a scan once its LIMIT is met: `select * from t limit 1`
+      reads one tuple (`seq_tup_read` 1), `select g from t where g = 10
+      limit 1` ten. Here every scan reports the table's visible tuples, as
+      the storage reads them all. Counting where PostgreSQL would stop needs
+      the position in heap order of the last row the plan returned, after
+      the residual filter, and not where DISTINCT, a window or an ORDER BY
+      read every row first.
+      Backlog-ID: RP-224
+      Verify: tests/backlog/test_rp_batch55.py::test_scenario[a sequential scan under LIMIT reads only what it returns]
+- [ ] **The system catalogs' counters stay at zero.** `pg_stat_sys_tables`
+      and `pg_statio_sys_*` list every catalog, but this server's catalogs
+      are computed, not scanned, so nothing counts a read of `pg_class`;
+      PostgreSQL 15.19 counts every catalog scan a statement or a new
+      session's cache makes (`pg_class` rose by 13 for one new session that
+      ran one query). Modelling them means counting the catalog lookups
+      PostgreSQL's syscache and relcache make, which follow its own caching.
+      Backlog-ID: RP-225
+      Verify: tests/backlog/test_rp_batch55.py::test_scenario[a new session's catalog reads are counted]
+- [ ] **Autovacuum is not modelled.** PostgreSQL 15.19 analyses and
+      vacuums a table in the background once its changes pass
+      `autovacuum_*_threshold` plus the scale factor, checking every
+      `autovacuum_naptime` (a minute): `last_autoanalyze`,
+      `autoanalyze_count`, `last_autovacuum` and `autovacuum_count` move,
+      and `n_mod_since_analyze` / `n_dead_tup` drop, with no statement asking.
+      Here they stay NULL and 0, and only a VACUUM or ANALYZE resets the
+      counts.
+      Backlog-ID: RP-226
+      Verify: none -- autovacuum runs on its own schedule (a 60 s naptime, a worker launched when the launcher wakes); measured with a 1 s naptime, PostgreSQL 15.19 had not yet run within 4 s, so no bounded check pins it on either server
 
 ## Found by batch 54 (2026-10-24)
 

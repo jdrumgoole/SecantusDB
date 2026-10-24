@@ -84,6 +84,8 @@ mod parameter_acl;
 mod partition;
 mod pg15_settings;
 mod pg_type_facts;
+mod pgstat;
+mod pgstat_sql;
 mod plan_cache;
 mod plpgsql_do;
 mod plpgsql_fn;
@@ -3850,6 +3852,19 @@ pub struct PgHandler {
     /// captured contents back. Capturing lazily is what keeps it affordable --
     /// a savepoint nobody writes through costs nothing.
     savepoints: Mutex<Vec<Savepoint>>,
+    /// The session's database oid, for the cumulative statistics (RP-070).
+    stat_db_oid: std::sync::OnceLock<i64>,
+    /// When the session began, for `pg_stat_database.session_time`.
+    stat_session_start: std::time::Instant,
+    /// The session's implicit transaction (a message cycle's statements
+    /// outside any block) has begun, and whether it failed: its end is the
+    /// statistics' transaction end.
+    stat_implicit: Mutex<Option<bool>>,
+    /// The session's statistics have ended (a terminate ends them before the
+    /// connection is torn down), and whether its client went away without a
+    /// Terminate.
+    stat_ended: AtomicBool,
+    stat_abandoned: AtomicBool,
     /// Typed row capture for a `DECLARE CURSOR`, armed only around the inner
     /// query's execution.
     ///
@@ -4334,6 +4349,11 @@ impl PgHandler {
             ensured_catalog: Mutex::new(HashSet::new()),
             catalogs_ensured: AtomicBool::new(false),
             savepoints: Mutex::new(Vec::new()),
+            stat_db_oid: std::sync::OnceLock::new(),
+            stat_session_start: std::time::Instant::now(),
+            stat_implicit: Mutex::new(None),
+            stat_ended: AtomicBool::new(false),
+            stat_abandoned: AtomicBool::new(false),
             cursor_capture: std::sync::Arc::new(Mutex::new(None)),
             cursor_ids: std::sync::Arc::new(Mutex::new(None)),
             session_serial: {
@@ -6385,6 +6405,7 @@ impl PgHandler {
                 },
             );
             if let Some(rows) = rows {
+                self.stat_scan(table, filter, &rows);
                 return self.in_scan_order(table, filter, rows);
             }
         }
@@ -6392,6 +6413,7 @@ impl PgHandler {
             .storage
             .find_matching(self.db(), table, filter)
             .map_err(|e| Self::storage_err("could not read", e))?;
+        self.stat_scan(table, filter, &rows);
         self.in_scan_order(table, filter, rows)
     }
 
@@ -12082,7 +12104,30 @@ impl PgHandler {
             })?;
         self.check_function_execute(&key, &u.name)?;
         let _settings = RoutineSettings::enter(self, &doc);
-        let out = self.with_call_depth(|| self.run_user_function(&doc, u, args))?;
+        // The call's time, and its own share of it, for
+        // `pg_stat_user_functions` (RP-070): nested calls' time is theirs.
+        thread_local! {
+            static NESTED: std::cell::RefCell<Vec<i64>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let started = std::time::Instant::now();
+        NESTED.with(|n| n.borrow_mut().push(0));
+        let out = self.with_call_depth(|| self.run_user_function(&doc, u, args));
+        let total = started.elapsed().as_micros() as i64;
+        let inner = NESTED.with(|n| {
+            let mut n = n.borrow_mut();
+            let inner = n.pop().unwrap_or(0);
+            if let Some(parent) = n.last_mut() {
+                *parent += total;
+            }
+            inner
+        });
+        self.stat_function_call(
+            Self::index_oid(&format!("fn:{key}")),
+            doc.get_str("language").unwrap_or_default(),
+            total,
+            (total - inner).max(0),
+        );
+        let out = out?;
         // The value comes back in the declared return type: `RETURN 1` from a
         // `RETURNS numeric` function is numeric 1, so `n * f(n - 1)` is
         // numeric arithmetic and does not overflow an integer.
@@ -24383,6 +24428,8 @@ impl PgHandler {
             *self.session_user.lock().unwrap_or_else(|e| e.into_inner()) = user.clone();
         }
         self.install_reload_hook();
+        // A session begins (`pgstat_report_connect`).
+        self.stats().connect();
         // ErrorResponse / NoticeResponse fields leave in the session's
         // `client_encoding`, like every other text the server sends: a LATIN9
         // client reading an `ERROR: ... \u{20ac}` expects the single byte 0xA4,
@@ -24562,6 +24609,9 @@ impl Drop for PgHandler {
         // Deregister so the map never signals a PID this connection has left
         // behind. `0` means startup never ran, so there is nothing to remove.
         let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
+        let in_block = self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed);
         // A session's temporary tables die with it. Its open transaction (a
         // client that disconnected mid-block) is abandoned first, so the
         // drop is not written into a transaction nobody will commit.
@@ -24581,6 +24631,7 @@ impl Drop for PgHandler {
         xids::end(&self.storage, pid);
         heap::forget_backend(pid);
         if pid != 0 {
+            self.stat_end_session(in_block);
             backend_registry()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -27527,6 +27578,9 @@ impl PgHandler {
         if name == "pg_describe_object" {
             return self.within_block(|| self.describe_object_call(args));
         }
+        if name.starts_with("pg_stat_") {
+            return self.pgstat_call(name, args);
+        }
         if name == "pg_identify_object" {
             return self.within_block(|| self.identify_object_call(args));
         }
@@ -28313,9 +28367,40 @@ impl PgHandler {
             self.note_failure();
         }
         self.note_activity("active", Some(query));
+        // Outside a block the statement is in the message cycle's implicit
+        // transaction, which the statistics end with the cycle (RP-070).
+        let outside = !self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if outside {
+            self.stat_implicit
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert(false);
+        }
+        self.stats().set_state(true, !outside);
         let result = self
             .run_typed_inner(query, params, param_types, max_rows)
             .await;
+        if let Err(PgWireError::UserError(info)) = &result {
+            if info.code == "40P01" {
+                self.stats().deadlock();
+            }
+        }
+        if result.is_err()
+            && !self
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Some(failed) = self
+                .stat_implicit
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+            {
+                *failed = true;
+            }
+        }
         // A statement outside any transaction (block or extended-protocol
         // group) is its own: an xid it was given is complete now.
         if !self
@@ -28447,6 +28532,9 @@ impl PgHandler {
         if !self.cycle_open.swap(true, Relaxed) {
             self.backend.cancel.store(false, Relaxed);
             self.message_cycle.fetch_add(1, Relaxed);
+            if self.backend_pid.load(Relaxed) != 0 {
+                self.stats().wake();
+            }
         }
         // A reload is taken between messages, as a backend takes the
         // postmaster's SIGHUP.
@@ -28457,6 +28545,26 @@ impl PgHandler {
     fn end_message_cycle(&self) {
         self.cycle_open
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        if self.backend_pid.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return;
+        }
+        // The cycle's implicit transaction ends with it -- unless a BEGIN
+        // made it a block, which goes on -- and the backend goes idle,
+        // reporting its counts (RP-070).
+        let in_block = self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let implicit = self
+            .stat_implicit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let stats = self.stats();
+        if let (Some(failed), false) = (implicit, in_block) {
+            stats.end_xact(!failed);
+        }
+        stats.report(in_block);
+        stats.set_state(false, in_block);
     }
 
     /// A cancellation point: `57014` if a `CancelRequest` for this backend
@@ -29417,7 +29525,9 @@ impl PgHandler {
         let mut delay = std::time::Duration::from_millis(2);
         let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
         let mut handle = self.open_transaction_handle()?;
+        let counted = self.stats().checkpoint();
         let out = loop {
+            self.stats().rewind(counted.clone());
             let out = self
                 .storage
                 .with_user_transaction(&mut handle, || self.execute(stmt.clone(), max_rows))
@@ -31288,6 +31398,26 @@ impl PgHandler {
     /// A savepoint statement, the block check already made; PL/pgSQL's
     /// EXCEPTION blocks use it for their subtransactions.
     fn savepoint_op(&self, control: &TransactionControl) -> PgWireResult<Vec<Response>> {
+        let out = self.savepoint_op_inner(control)?;
+        // The statistics' transaction levels follow the savepoints (RP-070):
+        // the top level, then one per savepoint still open.
+        let depth = self
+            .savepoints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+            + 1;
+        let stats = self.stats();
+        match control {
+            TransactionControl::Savepoint(_) => stats.sub_begin(),
+            TransactionControl::Release(_) => stats.sub_end(depth, true),
+            TransactionControl::RollbackTo(_) => stats.sub_end(depth, false),
+            _ => {}
+        }
+        Ok(out)
+    }
+
+    fn savepoint_op_inner(&self, control: &TransactionControl) -> PgWireResult<Vec<Response>> {
         let name = match control {
             TransactionControl::Savepoint(n)
             | TransactionControl::Release(n)
@@ -31628,6 +31758,7 @@ impl PgHandler {
                             .map_err(|e| Self::storage_err("could not roll back", e))?;
                         self.commit_failed
                             .store(true, std::sync::atomic::Ordering::Relaxed);
+                        self.stats().end_xact(false);
                         return Err(e);
                     }
                     self.storage
@@ -31635,6 +31766,7 @@ impl PgHandler {
                         .map_err(|e| Self::storage_err("could not commit", e))?;
                 }
                 self.settle_notifies(true);
+                self.stats().end_xact(true);
                 ("COMMIT", chain)
             }
             TransactionControl::Rollback { chain } => {
@@ -31655,6 +31787,7 @@ impl PgHandler {
                         .map_err(|e| Self::storage_err("could not roll back", e))?;
                 }
                 self.settle_notifies(false);
+                self.stats().end_xact(false);
                 ("ROLLBACK", chain)
             }
             TransactionControl::Prepare(gid) => {
@@ -31680,8 +31813,10 @@ impl PgHandler {
                     self.settle_notifies(false);
                     self.commit_failed
                         .store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.stats().end_xact(false);
                     return Err(e);
                 }
+                self.stats().prepare(&gid);
                 ("PREPARE TRANSACTION", false)
             }
             // Handled before this, in `run`: they are statements INSIDE a
@@ -31841,7 +31976,10 @@ impl PgHandler {
             self.storage.rollback_prepared(gid)
         };
         match done {
-            Ok(()) => Ok(vec![Response::TransactionEnd(Tag::new(word))]),
+            Ok(()) => {
+                self.stats().finish_prepared(gid, commit);
+                Ok(vec![Response::TransactionEnd(Tag::new(word))])
+            }
             Err(StorageError::PreparedTransactionNotFound(gid)) => Err(Self::user_error(
                 "42704", // undefined_object
                 format!("prepared transaction with identifier \"{gid}\" does not exist"),
@@ -34767,7 +34905,14 @@ impl PgHandler {
                 // Remember it for the rest of this transaction: the catalog row
                 // above is not committed yet, so a plain read cannot see it.
                 let name = def.name.clone();
+                // Each index the table's constraints build scans its empty
+                // heap, a sequential scan as CREATE INDEX's is (RP-070).
+                let built = usize::from(!secantus_pgplan::ordered_pk_columns(&def).is_empty())
+                    + def.unique_constraints.len();
                 self.note_uncommitted(&name, Some(Self::with_column_sources(def, Some(relid))));
+                for _ in 0..built {
+                    self.stats().seq_scan(relid, 0);
+                }
                 Ok(vec![Response::Execution(Tag::new("CREATE TABLE"))])
             }
 
@@ -37132,6 +37277,12 @@ impl PgHandler {
                 let table = ci.table.clone();
                 let out = self.create_index(ci)?;
                 self.record_relstats(&table, false)?;
+                // The build read the heap: a sequential scan (RP-070).
+                let rows = self
+                    .storage
+                    .count_matching(self.db(), &table, &Document::new(), None)
+                    .unwrap_or(0);
+                self.stat_seq_scan(&table, rows as i64);
                 Ok(out)
             }
 
@@ -38556,14 +38707,19 @@ impl PgHandler {
                                 Some(d) if partition::is_partitioned(&d) => {
                                     for leaf in self.leaf_partitions(t)? {
                                         self.record_vacuum(&leaf)?;
+                                        self.stat_maintained(&leaf, false)?;
                                     }
                                 }
-                                _ => self.record_vacuum(t)?,
+                                _ => {
+                                    self.record_vacuum(t)?;
+                                    self.stat_maintained(t, false)?;
+                                }
                             }
                         }
                         if analyze {
                             self.record_analyze(t, columns)?;
                             self.heap_invalidate(t)?;
+                            self.stat_maintained(t, true)?;
                         }
                     }
                 }
@@ -39374,6 +39530,8 @@ impl PgHandler {
                     )]);
                 }
                 let view_checks = std::mem::take(&mut upd.view_checks);
+                // The UPDATE's scan, as planned (RP-070).
+                self.stat_scan_filter(&upd.table, &upd.filter);
                 upd.filter =
                     self.narrow_by_residual(&upd.table, &upd.filter, upd.residual.take())?;
                 let def = self.lookup(&upd.table);
@@ -39652,6 +39810,8 @@ impl PgHandler {
                     }
                     return Ok(vec![Response::Execution(Tag::new("DELETE").with_rows(0))]);
                 }
+                // The DELETE's scan, as planned (RP-070).
+                self.stat_scan_filter(&del.table, &del.filter);
                 del.filter =
                     self.narrow_by_residual(&del.table, &del.filter, del.residual.take())?;
                 if let Some(def) = self.lookup(&del.table) {
@@ -39798,8 +39958,18 @@ impl PgHandler {
                 }
                 for table in &tables {
                     self.clear_relstats(table)?;
-                    // A truncated table starts a new heap (RP-069).
+                    // A truncated table starts a new heap (RP-069), and its
+                    // live and dead tuples count from nothing (RP-070).
                     self.reset_heap(table)?;
+                    self.stat_truncated(table);
+                    if self
+                        .lookup(table)
+                        .is_some_and(|d| partition::is_partitioned(&d))
+                    {
+                        for leaf in self.leaf_partitions(table)? {
+                            self.stat_truncated(&leaf);
+                        }
+                    }
                 }
                 for table in &tables {
                     self.fire_statement_triggers(table, "AFTER", "TRUNCATE")?;
@@ -47605,6 +47775,12 @@ impl PgWireServerHandlers for HandlerFactory {
         self.0.idle_timeout()
     }
 
+    fn client_gone(&self) {
+        self.0
+            .stat_abandoned
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn idle_event(&self) -> Option<pgwire::api::IdleEventFuture<'_>> {
         let handler = &self.0;
         Some(Box::pin(async move {
@@ -47614,6 +47790,14 @@ impl PgWireServerHandlers for HandlerFactory {
                     .terminate
                     .load(std::sync::atomic::Ordering::Relaxed)
                 {
+                    // The backend ends here, as PostgreSQL's exits on the
+                    // signal: its statistics with it, whenever the client
+                    // closes its end.
+                    handler.stat_end_session(
+                        handler
+                            .in_transaction
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    );
                     let info: ErrorInfo = PgHandler::admin_shutdown().into();
                     return pgwire::api::IdleEvent::Fatal(Box::new(info));
                 }
