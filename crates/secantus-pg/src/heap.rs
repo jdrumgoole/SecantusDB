@@ -572,6 +572,18 @@ impl PgHandler {
 
     /// The writing transaction's xid8 (assigned now, as PostgreSQL assigns
     /// it at the first write) and the command's id.
+    /// Whether `row` is a version the running command wrote: its xmin is
+    /// this transaction's xid and its cmin this command's.
+    pub(crate) fn written_by_this_command(&self, row: &Document) -> bool {
+        let (xid, cid) = self.writer();
+        let field = |k: &str| match row.get(k) {
+            Some(Bson::Int64(v)) => Some(*v),
+            Some(Bson::Int32(v)) => Some(i64::from(*v)),
+            _ => None,
+        };
+        field("__sys_xmin") == Some((xid & 0xFFFF_FFFF) as i64) && field("__sys_cid") == Some(cid)
+    }
+
     fn writer(&self) -> (u64, i64) {
         let pid = self.pid();
         let xid =

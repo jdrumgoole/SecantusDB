@@ -67,7 +67,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "ON CONFLICT over a computed unique index": (
         "RP-236",
-        True,
+        False,
         [
             "create table rp61_c (a int, b int)",
             "create unique index rp61_c_b on rp61_c (b) where a % 3 = 0",
