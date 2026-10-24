@@ -528,7 +528,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "pg_subscription lists every database's subscriptions": (
         "RP-169",
-        True,
+        False,
         # Committed, then dropped: CREATE DATABASE cannot run in a block.
         [
             "drop database if exists rp51_db",

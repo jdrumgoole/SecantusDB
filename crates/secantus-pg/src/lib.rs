@@ -36028,6 +36028,24 @@ impl PgHandler {
                         "cannot drop the currently open database".into(),
                     ))));
                 }
+                // `CountDBSubscriptions`: a subscription keeps its database.
+                let subscriptions = self.database_subscription_count(info.oid);
+                if subscriptions > 0 {
+                    let mut e = ErrorInfo::new(
+                        "ERROR".into(),
+                        "55006".into(), // object_in_use
+                        format!(
+                            "database \"{}\" is being used by logical replication subscription",
+                            info.name
+                        ),
+                    );
+                    e.detail = Some(if subscriptions == 1 {
+                        "There is 1 subscription.".into()
+                    } else {
+                        format!("There are {subscriptions} subscriptions.")
+                    });
+                    return Err(PgWireError::UserError(Box::new(e)));
+                }
                 self.databases.remove(&self.storage, &info.name)?;
                 // Its tables' heaps go with it (RP-233).
                 heap::forget_database(&self.storage, &info.name);

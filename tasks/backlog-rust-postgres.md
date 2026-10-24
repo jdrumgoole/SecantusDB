@@ -958,20 +958,16 @@ batch; their tests there are regression tests.
       51 built `CREATE / ALTER / DROP OPERATOR FAMILY / CLASS` for the
       btree and hash methods, text-search dictionaries over the `simple`,
       `snowball` and `synonym` templates, subscriptions created with
-      `connect = false`, and transforms. Three parts are still refused or
-      differ from PostgreSQL 15.19:
+      `connect = false`, and transforms; batch 64 made `pg_subscription`
+      one catalog for the cluster. Two parts are still refused:
       - **Operator classes of the GiST, GIN, SP-GiST and BRIN methods**
         are refused by name. Their `amadjustmembers` rules and support
         function numbers differ from btree's, and an index over such a
         class would need its support functions, which are C internals.
       - **The `ispell` and `thesaurus` dictionary templates** are refused
         by name: their dictionary and affix file formats are not read here.
-      - **`pg_subscription` lists only the current database's
-        subscriptions.** It is a shared catalog: PostgreSQL lists every
-        database's, each with its `subdbid`. Here they are kept per
-        database.
       Backlog-ID: RP-169
-      Verify: tests/backlog/test_rp_batch51.py::test_scenario[a GiST operator class], tests/backlog/test_rp_batch51.py::test_scenario[ispell and thesaurus dictionaries], tests/backlog/test_rp_batch51.py::test_scenario[pg_subscription lists every database's subscriptions]
+      Verify: tests/backlog/test_rp_batch51.py::test_scenario[a GiST operator class], tests/backlog/test_rp_batch51.py::test_scenario[ispell and thesaurus dictionaries]
 
 ## Found by batch 26 (2026-10-22)
 
