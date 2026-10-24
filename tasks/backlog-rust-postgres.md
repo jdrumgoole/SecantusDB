@@ -755,6 +755,17 @@ tests are scenarios in `tests/backlog/test_rp_batch30.py`, measured on a
 private 15.19 cluster. RP-133 .. RP-136 and RP-138 .. RP-142 were found and
 fixed in the same batch; their tests there are regression tests.
 
+## Found by batch 66 (2026-10-24)
+
+RP-245: a heap checkpoint ran at the end of a message cycle, before the
+statement's answer was sent, so its durable writes held that answer back.
+That included a cancelled statement's, which CI's cancel-latency
+regression tests caught at 0.56 to 0.72 s against their 0.5 s budget. It
+now runs on a thread of its own, as PostgreSQL's checkpointer is a process
+of its own. It is found by those regression tests in
+`tests/backlog/test_rp_triage.py` and `tests/backlog/test_rp_batch53.py`;
+a latency budget has no gap test of its own.
+
 ## Found by batch 65 (2026-10-24)
 
 Found while giving a COPY error its CONTEXT (RP-242), and fixed in the same
@@ -1003,16 +1014,22 @@ as they do against PostgreSQL 15.19 (RP-070, RP-071). The gap tests are
 scenarios in `tests/backlog/test_rp_batch26.py`, measured on a private 15.19
 cluster.
 
-- [ ] **Extended statistics: tables past ANALYZE's sample.** ANALYZE builds every kind of statistics object as PostgreSQL
+- [ ] **Column statistics: tables past ANALYZE's sample.** ANALYZE builds every kind of statistics object as PostgreSQL
       15.19 does (batch 50: ndistinct, dependencies, MCV lists, expression
       statistics, inherited ones), and `pg_statistic_ext_data`,
-      `pg_stats_ext` and `pg_stats_ext_exprs` show them, an MCV list over
-      timestamps with their datums since batch 64. What is left: a table of
-      more rows than ANALYZE samples (300 times the statistics target) has
-      no extended statistics here: PostgreSQL builds them from its random
-      sample (as for `pg_statistic`, which is not built either).
+      `pg_stats_ext` and `pg_stats_ext_exprs` show them. Since batch 66 they
+      are built from ANALYZE's sample of a table past 300 times the
+      statistics target, drawn as `acquire_sample_rows` draws it. What is
+      left: such a table has no `pg_statistic` rows here, so `pg_stats`
+      lists none of its columns. PostgreSQL computes them from the same
+      sample. That needs `compute_scalar_stats`' handling of a sample
+      smaller than the table: the distinct count scaled by the rows
+      estimated, and `analyze_mcv_list`'s choice of which common values to
+      keep. An inheritance tree past the sample has no extended statistics
+      either: `acquire_inherited_sample_rows` samples each child in
+      proportion to its size.
       Backlog-ID: RP-099
-      Verify: tests/backlog/test_rp_batch50.py::test_scenario[a table past ANALYZE's sample has extended statistics]
+      Verify: tests/backlog/test_rp_batch50.py::test_scenario[a table past ANALYZE's sample has column statistics]
 
 ## Found by batch 28 (2026-10-22)
 

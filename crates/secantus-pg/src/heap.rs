@@ -1300,8 +1300,36 @@ impl PgHandler {
 
     /// Write this store's changed heaps (RP-193): at most once a second
     /// from the end of a message cycle, every one at a clean shutdown.
+    ///
+    /// On a thread of its own, as PostgreSQL's checkpointer is a process of
+    /// its own: run in the message cycle, its writes -- durable, and slow on
+    /// a disk that syncs -- held back the answer of whichever statement came
+    /// due, a cancelled one's included (0.7 s on CI).
     pub(crate) fn checkpoint_heaps(&self, force: bool) {
-        flush_store(&self.storage, force);
+        if force {
+            flush_store(&self.storage, true);
+            return;
+        }
+        let store = std::sync::Arc::as_ptr(&self.storage) as usize;
+        if !crate::heap_store::due(store, false) {
+            return;
+        }
+        let storage = self.storage.clone();
+        CHECKPOINTS_LIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let spawned = std::thread::Builder::new()
+            .name("secantusd-pg checkpointer".into())
+            .spawn(move || {
+                let running = CHECKPOINTER.lock().unwrap_or_else(|e| e.into_inner());
+                flush_changed(&storage, false);
+                // The store's last handle may be waiting at shutdown.
+                drop(storage);
+                drop(running);
+                CHECKPOINTS_LIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            });
+        if let Err(e) = spawned {
+            CHECKPOINTS_LIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            eprintln!("secantusd-pg: could not start a checkpoint: {e}");
+        }
     }
 
     /// A table is dropped: its heap leaves this process. The saved copy
@@ -1330,10 +1358,30 @@ pub(crate) fn forget_database(storage: &std::sync::Arc<secantus_storage::Storage
 /// collection, outside any user transaction. A write that fails is reported
 /// and the heap left marked, for the next checkpoint.
 pub(crate) fn flush_store(storage: &std::sync::Arc<secantus_storage::Storage>, force: bool) {
+    // A clean shutdown's: after every background checkpoint has ended and
+    // let go of the store, which then closes.
+    if force {
+        while CHECKPOINTS_LIVE.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    // After a checkpoint still running, whose writes this one follows.
+    let _running = CHECKPOINTER.lock().unwrap_or_else(|e| e.into_inner());
     let store = std::sync::Arc::as_ptr(storage) as usize;
     if !crate::heap_store::due(store, force) {
         return;
     }
+    flush_changed(storage, force);
+}
+
+/// One checkpoint at a time: a background one, or the clean shutdown's.
+static CHECKPOINTER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Background checkpoints started and not yet ended.
+static CHECKPOINTS_LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `flush_store`'s writes, once due.
+fn flush_changed(storage: &std::sync::Arc<secantus_storage::Storage>, force: bool) {
+    let store = std::sync::Arc::as_ptr(storage) as usize;
     // `(key, database, oid, document)` of every changed heap.
     let changed: Vec<((usize, String), String, i64, Document)> = {
         let mut all = heaps().lock().unwrap_or_else(|e| e.into_inner());

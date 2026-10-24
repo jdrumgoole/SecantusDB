@@ -237,7 +237,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "a table past ANALYZE's sample has extended statistics": (
         "RP-099",
-        True,
+        False,
         [
             "begin",
             "create table rp50_b (a int, b int)",
@@ -245,6 +245,22 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
             "create statistics rp50_bs (ndistinct) on a, b from rp50_b",
             "analyze rp50_b",
             "select n_distinct::text from pg_stats_ext where tablename = 'rp50_b'",
+            "rollback",
+        ],
+    ),
+    # The sample is random, so its most common values' order (by their
+    # sampled counts) is too: they are compared as a set.
+    "a table past ANALYZE's sample has column statistics": (
+        "RP-099",
+        True,
+        [
+            "begin",
+            "create table rp50_c (a int, b int)",
+            "insert into rp50_c select g % 4, g % 2 from generate_series(1, 31000) g",
+            "analyze rp50_c",
+            "select attname, null_frac, n_distinct, (select array_agg(v order by v)"
+            " from unnest(most_common_vals::text::int[]) v)::text"
+            " from pg_stats where tablename = 'rp50_c' order by 1",
             "rollback",
         ],
     ),
@@ -433,6 +449,14 @@ EXPECTED: dict[str, Any] = {
         "CREATE STATISTICS",
         "ANALYZE",
         [('{"1, 2": 4}',)],
+        "ROLLBACK",
+    ],
+    "a table past ANALYZE's sample has column statistics": [
+        "BEGIN",
+        "CREATE TABLE",
+        "INSERT 0 31000",
+        "ANALYZE",
+        [("a", "0.0", "4.0", "{0,1,2,3}"), ("b", "0.0", "2.0", "{0,1}")],
         "ROLLBACK",
     ],
     "an MCV list's bytes over numeric and dates": [

@@ -313,6 +313,66 @@ impl PgHandler {
     /// each statistics object on it built and recorded. With `columns`
     /// (`ANALYZE t (a, b)`), an object over a column not analysed is not
     /// built, with PostgreSQL's warning.
+    /// `acquire_sample_rows`: `targrows` of `table`'s rows (`docs`, in
+    /// heap order), as ANALYZE samples them, with the table's rows
+    /// estimated from them. Knuth's Algorithm S picks up to `targrows` of
+    /// the heap's blocks (`BlockSampler`), and a reservoir keeps `targrows`
+    /// of the rows they hold, in heap order again once it has replaced any.
+    /// The rows are `liverows / blocks read * blocks`. Every block is read
+    /// while the heap has no more blocks than `targrows`, so then the
+    /// count is exact; PostgreSQL's draws are random, and so are these.
+    fn acquire_sample_rows(
+        &self,
+        table: &str,
+        docs: &[Document],
+        targrows: usize,
+    ) -> (Vec<Document>, f64) {
+        let block_of = |d: &Document| crate::heap::ctid_of(d).map_or(0, |c| c / 65536);
+        let totalblocks = self
+            .heap_blocks(table)
+            .map(i64::from)
+            .unwrap_or_else(|_| docs.iter().map(block_of).max().map_or(0, |b| b + 1))
+            .max(docs.iter().map(block_of).max().map_or(0, |b| b + 1));
+        if docs.len() <= targrows && totalblocks <= targrows as i64 {
+            return (docs.to_vec(), docs.len() as f64);
+        }
+        // Algorithm S: each block in turn, kept with probability
+        // (still wanted) / (still to visit).
+        let wanted = (targrows as i64).min(totalblocks);
+        let mut chosen = std::collections::HashSet::new();
+        for b in 0..totalblocks {
+            let left = totalblocks - b;
+            let need = wanted - chosen.len() as i64;
+            if need <= 0 {
+                break;
+            }
+            if (rand::random::<f64>() * left as f64) < need as f64 {
+                chosen.insert(b);
+            }
+        }
+        let mut sample: Vec<Document> = Vec::with_capacity(targrows);
+        let mut liverows = 0usize;
+        let mut replaced = false;
+        for d in docs.iter().filter(|d| chosen.contains(&block_of(d))) {
+            liverows += 1;
+            if sample.len() < targrows {
+                sample.push(d.clone());
+            } else {
+                let k = (rand::random::<f64>() * liverows as f64) as usize;
+                if k < targrows {
+                    sample[k] = d.clone();
+                    replaced = true;
+                }
+            }
+        }
+        if replaced {
+            sample.sort_by_key(|d| crate::heap::ctid_of(d).unwrap_or(0));
+        }
+        let read = chosen.len().max(1) as f64;
+        let totalrows = (liverows as f64 / read * totalblocks as f64 + 0.5).floor();
+        (sample, totalrows)
+    }
+
     pub(crate) fn build_extended_statistics(
         &self,
         table: &str,
@@ -386,6 +446,19 @@ impl PgHandler {
                 variants.push((all, true, format!("{name}\u{1}inh")));
             }
             for (rows, inherited, key) in variants {
+                // The table's own rows are ANALYZE's sample of them
+                // (`acquire_sample_rows`); a tree past the sample is not
+                // measured, as `acquire_inherited_sample_rows` samples each
+                // child in proportion.
+                let (rows, totalrows) = if inherited && !partitioned {
+                    if rows.len() > 300 * target {
+                        continue;
+                    }
+                    let n = rows.len() as f64;
+                    (rows, n)
+                } else {
+                    self.acquire_sample_rows(table, &rows, 300 * target)
+                };
                 let docs: &[Document] = &rows;
                 let numrows = docs.len();
                 if numrows == 0 {
@@ -437,7 +510,7 @@ impl PgHandler {
                     });
                     types.push(ty);
                 }
-                let totalrows = numrows as f64;
+
                 let mut data = bson::doc! {
                     "_id": &key,
                     "object": &name,
