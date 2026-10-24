@@ -2291,6 +2291,8 @@ pub enum AlterTableAction {
     DropConstraint {
         name: String,
         if_exists: bool,
+        /// `CASCADE`: a foreign key over the dropped key goes with it.
+        cascade: bool,
     },
 }
 
@@ -7329,6 +7331,8 @@ fn plan_alter_action(
         Ok(AT::AtDropConstraint) => Ok(AlterTableAction::DropConstraint {
             name: cmd.name.clone(),
             if_exists: cmd.missing_ok,
+            cascade: pg_query::protobuf::DropBehavior::try_from(cmd.behavior)
+                == Ok(pg_query::protobuf::DropBehavior::DropCascade),
         }),
         Ok(AT::AtAddOf) => typed_tables::plan_add_of(cmd, def),
         Ok(AT::AtDropOf) => typed_tables::plan_drop_of(table, def),
@@ -8094,12 +8098,70 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             }
         }
         AlterTableAction::AddForeignKey { fk, .. } => def.foreign_keys.push(fk.clone()),
-        AlterTableAction::DropConstraint { name, .. } => {
+        AlterTableAction::DropConstraint { name, cascade, .. } => {
+            // The key columns a dropped PRIMARY KEY or UNIQUE held, which a
+            // foreign key of the table's own may reference.
+            let key = keyed_constraint_columns(def, name);
+            if is_pk_constraint(def, name) {
+                // Its columns keep NOT NULL, as on PostgreSQL 15, and go
+                // back to fields of their own (RP-234). The executor moves
+                // every stored row's values to match.
+                for c in def.columns.iter_mut().filter(|c| c.pk) {
+                    c.pk = false;
+                    c.field_override = None;
+                }
+                for k in ["pk_name", "pk_include", "pk_oid", "pk_column_order"] {
+                    def.extra.remove(k);
+                }
+            }
             def.check_constraints.retain(|c| c.name != *name);
             def.unique_constraints.retain(|u| u.name != *name);
             def.foreign_keys.retain(|f| f.name != *name);
+            if let (true, Some(cols)) = (*cascade, key) {
+                let table = def.name.clone();
+                def.foreign_keys
+                    .retain(|f| !(f.ref_table == table && same_columns(&f.ref_columns, &cols)));
+            }
         }
     }
+}
+
+/// Does `name` name `def`'s PRIMARY KEY constraint? Its recorded name, else
+/// `<table>_pkey` (the table's bare name for one in a schema).
+pub fn is_pk_constraint(def: &TableDef, name: &str) -> bool {
+    if !def.columns.iter().any(|c| c.pk) {
+        return false;
+    }
+    match def.extra.get_str("pk_name") {
+        Ok(n) => n == name,
+        Err(_) => {
+            let bare = def.name.rsplit('.').next().unwrap_or(&def.name);
+            name == format!("{bare}_pkey") || name == format!("{}_pkey", def.name)
+        }
+    }
+}
+
+/// The columns of `def`'s PRIMARY KEY or UNIQUE constraint `name` -- what a
+/// foreign key referencing it names -- or `None` for any other constraint.
+pub fn keyed_constraint_columns(def: &TableDef, name: &str) -> Option<Vec<String>> {
+    if is_pk_constraint(def, name) {
+        return Some(
+            ordered_pk_columns(def)
+                .iter()
+                .map(|c| c.name.clone())
+                .collect(),
+        );
+    }
+    def.unique_constraints
+        .iter()
+        .find(|u| u.name == name && !u.exclusion)
+        .map(|u| u.columns.clone())
+}
+
+/// The same columns, in any order: a foreign key references a key by its
+/// column set.
+pub fn same_columns(a: &[String], b: &[String]) -> bool {
+    a.len() == b.len() && a.iter().all(|c| b.contains(c))
 }
 
 /// Whether a CHECK's SQL text names `column`, as a whole identifier.

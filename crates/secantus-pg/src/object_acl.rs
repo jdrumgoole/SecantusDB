@@ -984,7 +984,7 @@ impl PgHandler {
                         .functions()
                         .unwrap_or_default()
                         .into_iter()
-                        .find(|f| Self::index_oid(&format!("fn:{}", f.key)) == oid);
+                        .find(|f| self.function_oid(&f.key) == oid);
                     match user {
                         Some(f) => written = format!("{}({})", f.name, f.param_types.join(",")),
                         // A built-in: EXECUTE is PUBLIC's from initdb.

@@ -414,7 +414,7 @@ impl PgHandler {
             .iter()
             .find(|d| d.get_str("name") == Ok(name))
             .map_or(0, |d| {
-                Self::index_oid(&format!("fn:{}", d.get_str("_id").unwrap_or_default()))
+                self.function_oid(d.get_str("_id").unwrap_or_default())
             })
     }
 
@@ -493,11 +493,11 @@ impl PgHandler {
                     if !views.iter().any(|(n, _)| n == v) {
                         continue;
                     }
-                    out.push(Dropped::relation("view", Self::view_oid(v), v, true));
-                    out.extend(Dropped::row_types(Self::view_type_oid(v), v));
+                    out.push(Dropped::relation("view", self.view_relid(v), v, true));
+                    out.extend(Dropped::row_types(self.view_type_relid(v), v));
                     out.push(Dropped {
                         classid: PG_REWRITE,
-                        objid: Self::view_rule_oid(v),
+                        objid: self.view_rule_relid(v),
                         original: false,
                         normal: true,
                         object_type: "rule",
@@ -522,7 +522,7 @@ impl PgHandler {
                     if self.sequence_doc(s).ok().flatten().is_some() {
                         out.push(Dropped::relation(
                             "sequence",
-                            Self::sequence_oid(s),
+                            self.sequence_relid(s),
                             s,
                             true,
                         ));
@@ -583,10 +583,7 @@ impl PgHandler {
                         .unwrap_or_default();
                     out.push(Dropped {
                         classid: PG_PROC,
-                        objid: Self::index_oid(&format!(
-                            "fn:{}",
-                            f.get_str("_id").unwrap_or_default()
-                        )),
+                        objid: self.function_oid(f.get_str("_id").unwrap_or_default()),
                         original: true,
                         normal: false,
                         object_type: "function",
@@ -617,7 +614,7 @@ impl PgHandler {
             if let Some(seq) = &c.sequence {
                 out.push(Dropped::relation(
                     "sequence",
-                    Self::sequence_oid(seq),
+                    self.sequence_relid(seq),
                     seq,
                     false,
                 ));
@@ -836,10 +833,7 @@ impl PgHandler {
                         let schema = d.get_str("schema").unwrap_or("public").to_string();
                         out.push(DdlCommand {
                             classid: PG_PROC,
-                            objid: Self::index_oid(&format!(
-                                "fn:{}",
-                                d.get_str("_id").unwrap_or_default()
-                            )),
+                            objid: self.function_oid(d.get_str("_id").unwrap_or_default()),
                             objsubid: 0,
                             tag: tag.to_string(),
                             object_type: if d.get_bool("is_procedure").unwrap_or(false) {

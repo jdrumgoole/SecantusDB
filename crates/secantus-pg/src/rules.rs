@@ -413,9 +413,9 @@ impl PgHandler {
                         .into_iter()
                         .map(|(view, _)| {
                             let mut d = Document::new();
-                            d.insert(f("oid"), Bson::Int64(Self::view_rule_oid(&view)));
+                            d.insert(f("oid"), Bson::Int64(self.view_rule_relid(&view)));
                             d.insert(f("rulename"), "_RETURN");
-                            d.insert(f("ev_class"), Bson::Int64(Self::view_oid(&view)));
+                            d.insert(f("ev_class"), Bson::Int64(self.view_relid(&view)));
                             d.insert(f("ev_type"), "1");
                             d.insert(f("ev_enabled"), "O");
                             d.insert(f("is_instead"), true);
@@ -426,7 +426,7 @@ impl PgHandler {
                 .chain(self.matviews().unwrap_or_default().into_iter().filter_map(
                     |(name, _, _)| {
                         let mut d = Document::new();
-                        d.insert(f("oid"), Bson::Int64(Self::view_rule_oid(&name)));
+                        d.insert(f("oid"), Bson::Int64(self.view_rule_relid(&name)));
                         d.insert(f("rulename"), "_RETURN");
                         d.insert(f("ev_class"), Bson::Int64(self.relation_oid(&name)?));
                         d.insert(f("ev_type"), "1");

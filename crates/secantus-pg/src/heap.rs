@@ -333,10 +333,17 @@ pub(crate) fn forget_backend(pid: i32) {
 }
 
 impl PgHandler {
+    /// A heap's key: its store, then its database and table oid (each
+    /// database draws its oids from a counter of its own, so an oid alone
+    /// names a table in every database at once -- RP-233).
     fn heap_key(&self, table: &str) -> (usize, String) {
         (
             std::sync::Arc::as_ptr(&self.storage) as usize,
-            format!("heap:{}", self.relation_oid(table).unwrap_or(0)),
+            format!(
+                "heap:{}:{}",
+                self.db(),
+                self.relation_oid(table).unwrap_or(0)
+            ),
         )
     }
 
@@ -347,6 +354,11 @@ impl PgHandler {
     /// stored order. (After a restart, then, a dead tuple's space is free,
     /// its line pointer not, and the free space map is empty.)
     fn derive_heap(&self, table: &str) -> Heap {
+        // A heap a checkpoint wrote, made true to the rows (RP-193).
+        if let Some(saved) = self.saved_heap(table) {
+            let rows = self.heap_row_places(table);
+            return crate::heap_store::reconcile(saved, &rows);
+        }
         let mut heap = Heap::default();
         let Some(def) = self.lookup(table) else {
             return heap;
@@ -424,6 +436,21 @@ impl PgHandler {
     /// commit to a REPEATABLE READ snapshot). One writer at a time, as a
     /// page's buffer lock makes it.
     fn with_heap<T>(&self, table: &str, f: impl FnOnce(&mut Heap) -> T) -> PgWireResult<T> {
+        self.heap_access(table, true, f)
+    }
+
+    /// [`Self::with_heap`] for a look that changes nothing: the heap is not
+    /// marked for the next checkpoint.
+    fn with_heap_read<T>(&self, table: &str, f: impl FnOnce(&mut Heap) -> T) -> PgWireResult<T> {
+        self.heap_access(table, false, f)
+    }
+
+    fn heap_access<T>(
+        &self,
+        table: &str,
+        writes: bool,
+        f: impl FnOnce(&mut Heap) -> T,
+    ) -> PgWireResult<T> {
         let key = self.heap_key(table);
         let reserve = self.heap_reserve(table);
         let known = heaps()
@@ -439,6 +466,7 @@ impl PgHandler {
             .or_insert_with(|| derived.unwrap_or_default());
         heap.reserve = reserve;
         heap.forget_ended(&|x| running.contains(&x));
+        heap.dirty |= writes;
         Ok(f(heap))
     }
 
@@ -455,7 +483,8 @@ impl PgHandler {
         if !self.has_heap(table) {
             return false;
         }
-        self.with_heap(table, |h| h.disordered).unwrap_or(false)
+        self.with_heap_read(table, |h| h.disordered)
+            .unwrap_or(false)
     }
 
     /// A stored table with a heap of its own (not a catalog, a view or a
@@ -966,7 +995,7 @@ impl PgHandler {
         if !self.has_heap(table) {
             return 0;
         }
-        self.with_heap(table, |heap| {
+        self.with_heap_read(table, |heap| {
             heap.pages
                 .iter()
                 .flat_map(|p| p.lps.values())
@@ -982,7 +1011,7 @@ impl PgHandler {
         if !self.has_heap(table) {
             return 0;
         }
-        self.with_heap(table, |heap| {
+        self.with_heap_read(table, |heap| {
             heap.pages
                 .iter()
                 .flat_map(|p| p.lps.values())
@@ -993,7 +1022,7 @@ impl PgHandler {
     }
 
     pub(crate) fn heap_blocks(&self, table: &str) -> PgWireResult<u32> {
-        self.with_heap(table, |h| h.nblocks())
+        self.with_heap_read(table, |h| h.nblocks())
     }
 
     /// ANALYZE updates the relation's statistics in place, which
@@ -1080,6 +1109,148 @@ pub(crate) fn fresh_blocks(def: &TableDef, rows: &[Document]) -> u32 {
         on_page += 1;
     }
     blocks
+}
+
+impl PgHandler {
+    /// The heap the last checkpoint wrote for `table`, if any (RP-193).
+    fn saved_heap(&self, table: &str) -> Option<Heap> {
+        let oid = self.relation_oid(table)?;
+        let docs = self
+            .storage
+            .find_matching(
+                self.db(),
+                crate::heap_store::COLLECTION,
+                &bson::doc! { "_id": oid.to_string() },
+            )
+            .ok()?;
+        let d = crate::decode_doc(docs.first()?).ok()?;
+        Some(crate::heap_store::heap_from(&d))
+    }
+
+    /// Each stored row of `table`'s place and length, `(block, offset,
+    /// length)`.
+    fn heap_row_places(&self, table: &str) -> Vec<(u32, u16, u32)> {
+        let Some(def) = self.lookup(table) else {
+            return Vec::new();
+        };
+        let (def, rows) = match self.partition_rows(&def) {
+            Ok(Some((root, rows))) => (root, rows),
+            _ => {
+                let rows = self
+                    .storage
+                    .find_matching(self.db(), table, &Document::new())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|b| crate::decode_doc(b).ok())
+                    .collect();
+                (def, rows)
+            }
+        };
+        rows.iter()
+            .filter_map(|row| {
+                let (b, o) = ctid_of(row).and_then(untid)?;
+                Some((b, o, tuple_len(&def, row) as u32))
+            })
+            .collect()
+    }
+
+    /// Write this store's changed heaps (RP-193): at most once a second
+    /// from the end of a message cycle, every one at a clean shutdown.
+    pub(crate) fn checkpoint_heaps(&self, force: bool) {
+        flush_store(&self.storage, force);
+    }
+
+    /// A table is dropped: its heap leaves this process. The saved copy
+    /// stays -- a DROP rolled back reads it back -- and an oid is never
+    /// drawn twice in a database, so nothing else finds it.
+    pub(crate) fn forget_heap(&self, table: &str) {
+        let key = self.heap_key(table);
+        heaps()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+    }
+}
+
+/// A database is gone (DROP DATABASE): every heap of its tables (RP-233).
+pub(crate) fn forget_database(storage: &std::sync::Arc<secantus_storage::Storage>, db: &str) {
+    let store = std::sync::Arc::as_ptr(storage) as usize;
+    let prefix = format!("heap:{db}:");
+    heaps()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(s, k), _| !(*s == store && k.starts_with(&prefix)));
+}
+
+/// Write `storage`'s changed heaps, each in its database's saved-heap
+/// collection, outside any user transaction. A write that fails is reported
+/// and the heap left marked, for the next checkpoint.
+pub(crate) fn flush_store(storage: &std::sync::Arc<secantus_storage::Storage>, force: bool) {
+    let store = std::sync::Arc::as_ptr(storage) as usize;
+    if !crate::heap_store::due(store, force) {
+        return;
+    }
+    // `(key, database, oid, document)` of every changed heap.
+    let changed: Vec<((usize, String), String, i64, Document)> = {
+        let mut all = heaps().lock().unwrap_or_else(|e| e.into_inner());
+        all.iter_mut()
+            .filter(|((s, _), h)| *s == store && h.dirty)
+            .filter_map(|(key, h)| {
+                let rest = key.1.strip_prefix("heap:")?;
+                let (db, oid) = rest.rsplit_once(':')?;
+                let oid: i64 = oid.parse().ok()?;
+                h.dirty = false;
+                Some((
+                    key.clone(),
+                    db.to_string(),
+                    oid,
+                    crate::heap_store::heap_doc(oid, h),
+                ))
+            })
+            .collect()
+    };
+    for (key, db, oid, d) in changed {
+        if oid == 0 {
+            continue;
+        }
+        let bytes = match crate::encode_doc(&d) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("secantusd-pg: could not encode the heap of table {oid} in {db}: {e}");
+                continue;
+            }
+        };
+        let written = storage.outside_user_transaction(|| -> secantus_storage::Result<()> {
+            if !storage.collection_exists(&db, crate::heap_store::COLLECTION)? {
+                storage.create_collection(&db, crate::heap_store::COLLECTION)?;
+            }
+            storage.delete_matching(
+                &db,
+                crate::heap_store::COLLECTION,
+                &bson::doc! { "_id": oid.to_string() },
+                0,
+                &Document::new(),
+                None,
+            )?;
+            storage.insert(
+                &db,
+                crate::heap_store::COLLECTION,
+                vec![bytes.clone()],
+                true,
+            )?;
+            Ok(())
+        });
+        if let Err(e) = written {
+            eprintln!("secantusd-pg: could not write the heap of table {oid} in {db}: {e}");
+            if let Some(h) = heaps()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&key)
+            {
+                h.dirty = true;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -298,7 +298,7 @@ impl PgHandler {
             let identity = t.columns[pos].identity.is_some();
             if let Some(to) = self.relation_oid(&t.name) {
                 out.push(row(
-                    Self::sequence_oid(seq),
+                    self.sequence_relid(seq),
                     to,
                     pos as i32 + 1,
                     if identity { "i" } else { "a" },
@@ -364,7 +364,7 @@ impl PgHandler {
                             .iter()
                             .any(|s| s.get_str("_id") == Ok(name.as_str()))
                         {
-                            push(PG_CLASS, Self::sequence_oid(&name), 0, "n");
+                            push(PG_CLASS, self.sequence_relid(&name), 0, "n");
                         }
                     }
                     if ident && k > 0 && text(k - 1) == "::" {
@@ -649,7 +649,7 @@ impl PgHandler {
                     }
                 };
                 let mut d = Document::new();
-                d.insert(f("seqrelid"), Bson::Int64(Self::sequence_oid(name)));
+                d.insert(f("seqrelid"), Bson::Int64(self.sequence_relid(name)));
                 d.insert(f("seqtypid"), Bson::Int64(typ));
                 d.insert(f("seqstart"), Bson::Int64(int("start", 1)));
                 d.insert(f("seqincrement"), Bson::Int64(int("increment", 1)));
@@ -791,7 +791,7 @@ impl PgHandler {
                 } else {
                     self.display_type_name(ret)
                 };
-                let oid = Self::index_oid(&format!("fn:{}", d.get_str("_id").unwrap_or_default()));
+                let oid = self.function_oid(d.get_str("_id").unwrap_or_default());
                 (oid, args.join(", "), identity.join(", "), result)
             })
             .collect()
@@ -828,7 +828,7 @@ impl PgHandler {
                             .map(|sql| default_text(sql, &ty))
                     })
                     .collect();
-                let oid = Self::index_oid(&format!("fn:{}", d.get_str("_id").unwrap_or_default()));
+                let oid = self.function_oid(d.get_str("_id").unwrap_or_default());
                 (oid, texts)
             })
             .collect()
@@ -963,7 +963,7 @@ impl PgHandler {
             .unwrap_or_default()
             .iter()
             .filter_map(|d| {
-                let oid = Self::index_oid(&format!("fn:{}", d.get_str("_id").unwrap_or_default()));
+                let oid = self.function_oid(d.get_str("_id").unwrap_or_default());
                 let (_, args, _, result) = sigs.iter().find(|(o, ..)| *o == oid)?;
                 let mut text = format!(
                     "CREATE OR REPLACE FUNCTION public.{}({args})\n RETURNS {result}\n LANGUAGE {}\n",

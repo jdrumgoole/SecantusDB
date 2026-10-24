@@ -755,20 +755,20 @@ tests are scenarios in `tests/backlog/test_rp_batch30.py`, measured on a
 private 15.19 cluster. RP-133 .. RP-136 and RP-138 .. RP-142 were found and
 fixed in the same batch; their tests there are regression tests.
 
-- [ ] **A relation's oid is not its place in creation order.** PostgreSQL
-      draws every oid from one counter, so oids rise as objects are made,
-      and DROP ROLE's DETAIL lists the role's objects in oid order
-      (`shared_dependency_comparator`): a sequence made before a table is
-      listed first. Here a sequence's, a view's and an index's oid is a
-      hash of its name in a band of its own (`sequence_oid`, `view_oid`,
-      `index_oid`), so the DETAIL -- which this server sorts by oid as
-      PostgreSQL does -- and any `ORDER BY oid` come out in another order.
-      DROP SCHEMA ... CASCADE's notice lists a schema's members in the same
-      creation order (`table s.t`, `function s.f()`, `view s.v`); here they
-      come grouped by kind -- types, routines, views, tables, sequences --
-      since nothing records which was made first.
-      Backlog-ID: RP-137
-      Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order], tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]
+## Found by batch 59 (2026-10-24)
+
+Found while drawing every oid from one counter (RP-137), and fixed in the
+same batch; their tests in `tests/backlog/test_rp_batch59.py` are
+regression tests. RP-234: a primary key could not be dropped (42704).
+RP-235: a table made in an open block had no system columns (`ctid`,
+`xmin` ... were 42703 until the block committed).
+
+## Found by batch 58 (2026-10-24)
+
+Found while building the heap's persistence (RP-193). RP-233 (two
+databases' tables shared one heap model, their oids each database's own;
+a dropped database's heaps outlived it) was found and fixed in the same
+batch; its test in `tests/backlog/test_rp_batch58.py` is a regression test.
 
 ## Found by batch 57 (2026-10-24)
 
@@ -915,20 +915,6 @@ scenarios in `tests/backlog/test_rp_batch46.py`, measured on a private 15.19
 cluster. RP-194 was found and fixed in the same batch, RP-192 in batch 47
 and most of RP-193 in batch 48; their tests there are regression tests.
 
-- [ ] **A heap's dead tuples, free space map and target blocks are lost
-      on a restart.** The heap is modelled as PostgreSQL 15.19 keeps it
-      (`crates/secantus-pg/src/heap_page.rs`, `fsm.rs`; batch 48): HOT
-      chains, on-access pruning, VACUUM's passes, the free space map and
-      each backend's target block. But it is kept in the server process,
-      and after a restart it is derived from the live rows' ctids. Every
-      place no row holds is then a dead line pointer with no storage: a HOT
-      chain's dead root, which PostgreSQL's VACUUM leaves a redirect, is
-      made unused and reused; a dead tuple's space is free before any
-      VACUUM; and the free space map is empty. PostgreSQL keeps all three
-      on disk. The fix is persisting the heap (and FSM) state beside the
-      rows.
-      Backlog-ID: RP-193
-      Verify: tests/backlog/test_rp_batch48.py::test_a_dead_tuple_outlives_a_restart
 
 ## Found by batch 34 (2026-10-23)
 

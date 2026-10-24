@@ -409,7 +409,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "DROP SCHEMA lists its members in creation order": (
         "RP-137",
-        True,
+        False,
         [
             "create schema rp31_p",
             "create table rp31_p.t (a int)",

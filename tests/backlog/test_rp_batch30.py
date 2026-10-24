@@ -265,7 +265,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # --------------------------------------------- RP-137 oids in order
     "DROP ROLE lists dependents in creation order": (
         "RP-137",
-        True,
+        False,
         [
             "create role rp30_c",
             "create sequence rp30_cq",

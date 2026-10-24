@@ -198,6 +198,57 @@ pub(crate) struct Fsm {
     nblocks: u32,
 }
 
+impl Fsm {
+    /// The fork as a document, for a heap kept across a restart (RP-193).
+    pub(crate) fn to_doc(&self) -> bson::Document {
+        let mut pages: Vec<(&u32, &FsmPage)> = self.pages.iter().collect();
+        pages.sort_by_key(|(b, _)| **b);
+        bson::doc! {
+            "nblocks": i64::from(self.nblocks),
+            "pages": pages
+                .into_iter()
+                .map(|(b, p)| {
+                    bson::Bson::Document(bson::doc! {
+                        "block": i64::from(*b),
+                        "next": p.next_slot,
+                        "nodes": bson::Binary {
+                            subtype: bson::spec::BinarySubtype::Generic,
+                            bytes: p.nodes.clone(),
+                        },
+                    })
+                })
+                .collect::<Vec<_>>(),
+        }
+    }
+
+    /// The fork [`Fsm::to_doc`] wrote; a page of the wrong size is left out
+    /// (it reads as empty).
+    pub(crate) fn from_doc(d: &bson::Document) -> Fsm {
+        let mut fsm = Fsm {
+            pages: HashMap::new(),
+            nblocks: d.get_i64("nblocks").unwrap_or(0).try_into().unwrap_or(0),
+        };
+        for p in d.get_array("pages").map(|a| a.as_slice()).unwrap_or(&[]) {
+            let bson::Bson::Document(p) = p else { continue };
+            let Ok(nodes) = p.get_binary_generic("nodes") else {
+                continue;
+            };
+            if nodes.len() != NODES_PER_PAGE {
+                continue;
+            }
+            let block: u32 = p.get_i64("block").unwrap_or(0).try_into().unwrap_or(0);
+            fsm.pages.insert(
+                block,
+                FsmPage {
+                    nodes: nodes.clone(),
+                    next_slot: p.get_i32("next").unwrap_or(0),
+                },
+            );
+        }
+        fsm
+    }
+}
+
 /// `fsm_logical_to_physical`.
 fn physical(addr: Addr) -> u32 {
     let mut leafno = addr.logpageno;
