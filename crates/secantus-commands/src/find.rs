@@ -483,7 +483,7 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         return crate::aggregate::aggregate(&agg, ctx);
     }
     let storage = ctx.storage()?;
-    let cursors = ctx.cursors()?;
+    ctx.cursors()?;
     // mongod answers a `find` on a time-series collection with an
     // aggregation over its buckets, which takes none of these three.
     if storage
@@ -688,6 +688,41 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     read.check_hint(storage, &ctx.db_name)?;
     crate::notablescan::check(ctx, &read)?;
 
+    // A read that streams: its cursor reads on as `getMore` asks, from where
+    // the last batch stopped (RM-080). The rest read whole, as before.
+    let streamable = !tailable
+        && exists
+        && collation.is_none()
+        && !doc.contains_key("min")
+        && !doc.contains_key("max")
+        && !bool_field(doc, "returnKey", false)
+        && !bool_field(doc, "showRecordId", false)
+        && !doc.get_document("projection").is_ok_and(|p| {
+            p.values()
+                .any(|v| secantus_core::projection::meta_spec(v).is_some())
+        })
+        && !matches!(doc.get("sort"), Some(Bson::Document(given))
+            if !given.is_empty() && !crate::explain::order::plain_sort(given));
+    if streamable {
+        let asked = StreamAsk {
+            coll: &coll,
+            filter: &filter,
+            sort,
+            hint,
+            skip,
+            limit,
+            batch_size,
+            single_batch,
+            let_vars: &let_vars,
+            ns: &ns,
+        };
+        if let Some(reply) = stream_find(ctx, doc, &asked)? {
+            return Ok(reply);
+        }
+    }
+    let storage = ctx.storage()?;
+    let cursors = ctx.cursors()?;
+
     // `min` and `max` cut the hinted index's scan at a key and fix its
     // direction: that read keeps the order the store gives it. So does a
     // sort by a value that is not 1 or -1 (`-1.5`): mongod sorts by it and
@@ -735,32 +770,9 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // measurement with its time and meta fields first.
     let mut docs = crate::ts_buckets::as_read(storage, &ctx.db_name, &coll, docs, sort.is_some())?;
 
-    // Validate the filter even when nothing matched: against a non-empty
-    // collection the storage scan evaluates the filter per doc and an
-    // invalid/unsupported one surfaces `BadValue`; on an empty result the scan
-    // never runs, so an invalid filter would otherwise return an empty cursor
-    // instead of the error. Re-run the matcher once against an empty document
-    // (operator recognition is doc-independent) to surface the same `BadValue`.
-    //
-    // Except an error the expression evaluator raises per document, which
-    // the empty document provokes and no stored one did; a constant one is
-    // mongod's optimizer failure (measured 8.2.11, 2026-10-16).
-    if docs.is_empty() && !filter.is_empty() {
-        if let Err(fault) =
-            secantus_core::query::matches(&Document::new(), &filter, &let_vars, collation.as_ref())
-        {
-            match (fault.folded_verdict(), fault.as_mongo()) {
-                (Some(false), _) => {}
-                (Some(true), Some((code, errmsg))) => {
-                    return Err(CommandError::new(
-                        code,
-                        crate::util::error_code_name(code),
-                        format!("Failed to optimize expression :: caused by :: {errmsg}"),
-                    ))
-                }
-                _ => return Err(query_filter_error(&filter)),
-            }
-        }
+    // A scan that matched nothing never ran the filter: check it now.
+    if docs.is_empty() {
+        validate_empty_result(&filter, &let_vars, collation.as_ref())?;
     }
 
     // Cursor `min` / `max` index bounds (inclusive lower / exclusive upper),
@@ -1103,6 +1115,213 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             })
         }
     }
+}
+
+/// The filter's errors a read that matched nothing never met: mongod parses
+/// the whole filter, so an invalid one fails over an empty result too. The
+/// matcher run once against an empty document (operator recognition does not
+/// depend on the document) surfaces it -- except an error the evaluator
+/// raises per document, which the empty document provokes and no stored one
+/// did; a constant one is mongod's optimizer failure (measured 8.2.11,
+/// 2026-10-16).
+fn validate_empty_result(
+    filter: &Document,
+    let_vars: &Document,
+    collation: Option<&secantus_core::collation::Collation>,
+) -> Result<(), CommandError> {
+    if filter.is_empty() {
+        return Ok(());
+    }
+    if let Err(fault) = secantus_core::query::matches(&Document::new(), filter, let_vars, collation)
+    {
+        match (fault.folded_verdict(), fault.as_mongo()) {
+            (Some(false), _) => {}
+            (Some(true), Some((code, errmsg))) => {
+                return Err(CommandError::new(
+                    code,
+                    crate::util::error_code_name(code),
+                    format!("Failed to optimize expression :: caused by :: {errmsg}"),
+                ))
+            }
+            _ => return Err(query_filter_error(filter)),
+        }
+    }
+    Ok(())
+}
+
+/// What a streamed `find` reads.
+struct StreamAsk<'a> {
+    coll: &'a str,
+    filter: &'a Document,
+    sort: Option<&'a Document>,
+    hint: Option<&'a Bson>,
+    skip: usize,
+    limit: usize,
+    batch_size: i64,
+    single_batch: bool,
+    let_vars: &'a Document,
+    ns: &'a str,
+}
+
+/// A `find` cursor that reads on as `getMore` asks: the plan's read
+/// (`explain::stream`), each batch projected as it is read.
+struct FindStream {
+    stream: crate::explain::stream::Stream,
+    projection: Option<Document>,
+    filter: Document,
+    vars: Document,
+    ns: String,
+    summary: Option<String>,
+    command: Document,
+}
+
+impl crate::cursors::StreamCursor for FindStream {
+    fn next_batch(
+        &mut self,
+        storage: &dyn Storage,
+        want: usize,
+        max_bytes: usize,
+    ) -> Result<crate::cursors::StreamedBatch, CommandError> {
+        let batch = self
+            .stream
+            .next_batch(storage, want, max_bytes)
+            .map_err(|e| crate::util::read_exec_error(e, "find", &self.ns))?;
+        let docs = match &self.projection {
+            Some(spec) => crate::util::encode_docs(project_to_docs(
+                batch.docs,
+                spec,
+                &self.filter,
+                &self.vars,
+                &self.ns,
+            )?)?,
+            None => batch.docs,
+        };
+        Ok(crate::cursors::StreamedBatch {
+            docs,
+            exhausted: batch.exhausted,
+            keys_examined: batch.keys_examined,
+            docs_examined: batch.docs_examined,
+        })
+    }
+
+    fn plan_summary(&self) -> Option<String> {
+        self.summary.clone()
+    }
+
+    fn originating_command(&self) -> Document {
+        self.command.clone()
+    }
+}
+
+/// A `find` read through a streaming cursor: its first batch now, the rest
+/// as `getMore` asks. `None` when its plan does not stream.
+fn stream_find(
+    ctx: &mut CommandContext,
+    doc: &Document,
+    asked: &StreamAsk,
+) -> Result<Option<Document>, CommandError> {
+    use crate::cursors::StreamCursor;
+    let storage = ctx
+        .storage
+        .clone()
+        .ok_or_else(|| CommandError::new(1, "InternalError", "no storage configured"))?;
+    let projection = doc
+        .get_document("projection")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .cloned();
+    let (skip, limit) = (asked.skip as i64, asked.limit as i64);
+    let ask = crate::explain::order::Ask {
+        db: &ctx.db_name,
+        coll: asked.coll,
+        filter: asked.filter,
+        sort: asked.sort,
+        hint: asked.hint,
+        collation: None,
+        vars: asked.let_vars,
+        limit: if limit > 0 { skip + limit } else { 0 },
+        asked: crate::near::Asked {
+            skip,
+            limit,
+            sort: asked.sort,
+            projection: projection.as_ref(),
+        },
+    };
+    let read_error = |e| crate::util::read_exec_error(e, "find", asked.ns);
+    let Some(plan) = crate::explain::order::stream_plan(
+        storage.as_ref(),
+        &ask,
+        skip,
+        limit,
+        projection.as_ref(),
+        doc.contains_key("batchSize"),
+    )
+    .map_err(read_error)?
+    else {
+        return Ok(None);
+    };
+    let Some(stream) = crate::explain::stream::Stream::of_plan(
+        &plan,
+        &ctx.db_name,
+        asked.coll,
+        asked.filter,
+        asked.let_vars,
+    ) else {
+        return Ok(None);
+    };
+    let mut cursor = FindStream {
+        stream,
+        projection,
+        filter: asked.filter.clone(),
+        vars: asked.let_vars.clone(),
+        ns: asked.ns.to_string(),
+        summary: crate::explain::summary::plan_summary(doc, ctx),
+        command: doc.clone(),
+    };
+    // `batchSize: 0` asks for the cursor and no documents.
+    let batch = if asked.batch_size == 0 {
+        crate::cursors::StreamedBatch {
+            docs: Vec::new(),
+            exhausted: false,
+            keys_examined: 0,
+            docs_examined: 0,
+        }
+    } else {
+        cursor.next_batch(
+            storage.as_ref(),
+            asked.batch_size.max(0) as usize,
+            MAX_GETMORE_BATCH_BYTES,
+        )?
+    };
+    if batch.docs.is_empty() && batch.exhausted {
+        validate_empty_result(asked.filter, asked.let_vars, None)?;
+    }
+    let cursor_id = if batch.exhausted || asked.single_batch {
+        0
+    } else {
+        ctx.cursors()?
+            .register_stream(asked.ns, Box::new(cursor))
+            .map_err(|e| CommandError::new(1, "InternalError", format!("cursor registry: {e:?}")))?
+    };
+    ctx.exec_stats = Some(crate::ExecStats {
+        keys_examined: batch.keys_examined,
+        docs_examined: batch.docs_examined,
+        cursor_id,
+        exhausted: batch.exhausted,
+        plan_summary: None,
+        originating_command: None,
+    });
+    ctx.pending_batch = Some(crate::PendingBatch {
+        batch_field: "firstBatch",
+        batch: batch.docs,
+    });
+    Ok(Some(doc! {
+        "cursor": {
+            "id": Bson::Int64(cursor_id),
+            "ns": asked.ns,
+        },
+        "ok": 1.0,
+    }))
 }
 
 /// Register a cursor over `remaining`, whatever it holds.

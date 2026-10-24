@@ -511,18 +511,13 @@ These are explicit non-goals. Don't add them without a reason.
       lock) and bytes written by the operation; ours has only the duration.
       WiredTiger keeps these per session (`statistics:session`), but the
       storage layer opens a session per operation and exposes none of it.
-      Also not on the line: `keysExamined` and `docsExamined`; on a write
-      statement's line (RM-299), `isFromUserConnection` and
-      `collectionType`, which mongod writes after `type`. Those count
-      the plan's own work; `explain` derives them only by reading the whole
-      collection, which a log line must not do, so they need counters from
-      the read itself, and PER BATCH: mongod 8.2.11 counts each `find` /
-      `getMore` batch's own work (2, 2, 2, then 0 for a `batchSize: 2` read
-      of 6 documents), so a whole-query `explain` total would be wrong.
-      A `getMore` line also lacks the cursor's `planSummary` (mongod repeats
-      it on every batch) and `cursorExhausted: true` on the last one.
-      (The command document, `planSummary` on the opening command,
-      per-batch `nreturned` and `reslen` are on the line since 2026-10-16.)
+      Also not on the line: on a write statement's line (RM-299),
+      `isFromUserConnection` and `collectionType`, which mongod writes after
+      `type`; and `keysExamined` / `docsExamined` for a read that does not
+      stream yet (`tasks/streaming-cursors-plan.md` phases 2 and 3: an
+      `aggregate`, a blocking sort, a descending or collated index, `count`,
+      `distinct`, the writes). A streamed `find` counts each batch's own work
+      as mongod does since 2026-10-24, on the line and in its profile entry.
       **Decided 2026-10-16 (Joe):** count keys and documents examined during
       execution (with the streaming cursors), and keep the originating
       command on a cursor, so the `Slow query` line and `system.profile`
@@ -1467,15 +1462,21 @@ cursor options, `getMore`, `killCursors`, the cursors of `aggregate` and the
 listing commands, tailable cursors, `count`, `distinct`). The Rust server
 differs on 5 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: a cursor is the result as it was when the
-      command ran.** `find` and `aggregate` read every matching document and
-      keep the rest for `getMore`. mongod reads on as the cursor is read, so
-      its `getMore` sees a document inserted, changed or deleted since
-      (measured: an insert appears, a delete disappears). Tests that write
-      between batches see the difference; so does memory, for a large
-      result. One scenario.
+- [ ] **RUST MongoDB server: an `aggregate` cursor, and a `find` that does
+      not stream yet, is the result as it was when the command ran.** They
+      read every matching document and keep the rest for `getMore`. mongod
+      reads on as the cursor is read, so its `getMore` sees a document
+      inserted, changed or deleted since (measured: an insert appears, a
+      delete disappears). Since 2026-10-24 a `find` streams over a forward
+      collection scan or an ascending, uncollated, non-multikey index other
+      than `_id_`, with skip, limit and projection; the rest is
+      `tasks/streaming-cursors-plan.md` phases 2 and 3 (an `_id` sort, a
+      descending or collated or multikey index, OR plans, covered plans,
+      `$natural` backward, `min` / `max`, `returnKey` / `showRecordId`, and
+      every `aggregate`). Tests that write between batches see the
+      difference; so does memory, for a large result.
       Backlog-ID: RM-080
-      Verify: tests/backlog/test_rm_057_084.py::test_get_more_sees_writes_made_since_the_find
+      Verify: tests/backlog/test_rm_057_084.py::test_aggregate_get_more_sees_writes_made_since_the_command, tests/backlog/test_rm_057_084.py::test_id_sorted_get_more_sees_writes_made_since_the_find
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
   `$meta: "textScore"` sorts, an `explain: true` aggregate. Every
   `{$meta}` shape measured on 8.2.11 matches since 2026-10-17, except a

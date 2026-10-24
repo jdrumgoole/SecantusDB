@@ -981,11 +981,67 @@ def _cursor_sees_writes(client: Any) -> list:
     return [first] + [d["_id"] for d in cur]
 
 
-@pytest.mark.backlog("RM-080")
+@pytest.mark.backlog_fixed("RM-080")
 def test_get_more_sees_writes_made_since_the_find(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 reads on as the cursor is read: a document deleted
     after the first batch does not appear, one inserted does."""
     assert _cursor_sees_writes(rust_mongo) == _cursor_sees_writes(mongod)
+
+
+def _index_scan_sees_writes(client: Any) -> list:
+    c = client["rm080"][_name()]
+    c.insert_many([{"_id": i, "x": i} for i in range(1, 7)])
+    c.create_index("x")
+    cur = c.find({"x": {"$gte": 0}}).batch_size(2)
+    first = [next(cur)["_id"], next(cur)["_id"]]
+    c.delete_one({"_id": 4})
+    c.update_one({"_id": 1}, {"$set": {"x": 10}})
+    c.insert_one({"_id": 7, "x": 3.5})
+    return first + [d["_id"] for d in cur]
+
+
+@pytest.mark.backlog_fixed("RM-080")
+def test_index_scan_get_more_sees_writes_made_since_the_find(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 resumes an index scan after its (key, RecordId): a
+    document deleted ahead does not appear, one inserted ahead does, and
+    one whose key moved ahead of the position comes back a second time."""
+    got, want = _index_scan_sees_writes(rust_mongo), _index_scan_sees_writes(mongod)
+    assert want == [1, 2, 3, 7, 5, 6, 1]
+    assert got == want
+
+
+def _aggregate_sees_writes(client: Any) -> list:
+    c = client["rm080"][_name()]
+    c.insert_many([{"_id": i} for i in range(1, 5)])
+    cur = c.aggregate([{"$match": {"_id": {"$gte": 0}}}], batchSize=1)
+    first = next(cur)["_id"]
+    c.delete_one({"_id": 4})
+    c.insert_one({"_id": 5})
+    return [first] + [d["_id"] for d in cur]
+
+
+@pytest.mark.backlog("RM-080")
+def test_aggregate_get_more_sees_writes_made_since_the_command(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """mongod 8.2.11 streams a `$match` pipeline as it streams a `find`."""
+    assert _aggregate_sees_writes(rust_mongo) == _aggregate_sees_writes(mongod)
+
+
+def _id_sorted_sees_writes(client: Any) -> list:
+    c = client["rm080"][_name()]
+    c.insert_many([{"_id": i} for i in range(1, 5)])
+    cur = c.find().sort("_id", 1).batch_size(1)
+    first = next(cur)["_id"]
+    c.insert_one({"_id": 5})
+    return [first] + [d["_id"] for d in cur]
+
+
+@pytest.mark.backlog("RM-080")
+def test_id_sorted_get_more_sees_writes_made_since_the_find(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 walks the `_id` index for an `_id` sort, so a document
+    inserted after the first batch is returned."""
+    assert _id_sorted_sees_writes(rust_mongo) == _id_sorted_sees_writes(mongod)
 
 
 def _index_order(client: Any) -> list:

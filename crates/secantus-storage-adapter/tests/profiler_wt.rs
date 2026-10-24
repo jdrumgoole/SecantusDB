@@ -257,18 +257,22 @@ fn level_two_writes_each_operation_in_mongods_shape() {
             head.iter().chain(common.iter()).copied().collect()
         };
         let find = &profiled[0];
-        assert_eq!(
-            keys(find),
-            with(&[
-                "op",
-                "ns",
-                "command",
-                "nBatches",
-                "cursorExhausted",
-                "numYield",
-                "nreturned"
-            ])
+        // mongod 8.2.11 writes the plan after `millis` (2026-10-24).
+        let mut want = with(&[
+            "op",
+            "ns",
+            "command",
+            "nBatches",
+            "cursorExhausted",
+            "numYield",
+            "nreturned",
+        ]);
+        want.insert(
+            want.iter().position(|k| *k == "millis").unwrap() + 1,
+            "planSummary",
         );
+        assert_eq!(keys(find), want);
+        assert_eq!(find.get_str("planSummary"), Ok("IXSCAN { _id: 1 }"));
         assert_eq!(
             (
                 find.get_str("ns"),

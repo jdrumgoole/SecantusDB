@@ -28,6 +28,7 @@ pub(crate) mod order;
 mod parsed;
 mod plan;
 mod shape;
+pub(crate) mod stream;
 pub(crate) mod summary;
 mod trial;
 

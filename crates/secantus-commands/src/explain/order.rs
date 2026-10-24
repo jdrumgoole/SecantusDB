@@ -399,6 +399,73 @@ pub(crate) fn plain_sort(sort: &Document) -> bool {
         })
 }
 
+/// The plan mongod runs for a `find` that a streaming cursor can read
+/// (`stream::Stream`), or `None` to read it as before: a collection that
+/// streams, no collation, no geo predicate or `$near`, a plan nothing
+/// contests (choosing among several needs mongod's trial over the
+/// collection) and no in-memory sort.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stream_plan(
+    storage: &dyn Storage,
+    ask: &Ask,
+    skip: i64,
+    limit: i64,
+    projection: Option<&Document>,
+    batch_size: bool,
+) -> Result<Option<Node>, StorageError> {
+    if ask.collation.is_some() || !storage.can_stream(ask.db, ask.coll)? {
+        return Ok(None);
+    }
+    if ask.sort.is_some_and(|s| !plain_sort(s)) {
+        return Ok(None);
+    }
+    if crate::near::find_near(ask.filter)?.is_some()
+        || geo::hinted_geo(storage, ask.db, ask.coll, ask.hint)?.is_some()
+    {
+        return Ok(None);
+    }
+    let catalog = ask_catalog(storage, ask)?;
+    let canonical = parsed::parsed_query(ask.filter);
+    let implied = |partial: &Document| storage.query_implies_partial(ask.filter, partial);
+    let Ok(hint) = resolve_hint(ask.hint, &catalog) else {
+        return Ok(None);
+    };
+    let query = Query {
+        canonical: &canonical,
+        sort: ask.sort,
+        projection,
+        skip,
+        limit,
+        hint,
+        collation: None,
+        min_max: false,
+        return_key: false,
+        show_record_id: false,
+        batch_size,
+        keys_only: false,
+        wanted: None,
+        pipeline: false,
+        implies: &implied,
+        trial: None,
+    };
+    if plan::contested(&query, &catalog) {
+        return Ok(None);
+    }
+    let plan = plan::plan(&query, &catalog);
+    if has_sort(&plan) {
+        return Ok(None);
+    }
+    // A geo index that would order a scan of the collection.
+    let elsewhere = !matches!(access(&plan), Node::CollScan { .. })
+        || ask
+            .hint
+            .is_some_and(|h| !matches!(h, Bson::Document(d) if d.is_empty()));
+    if geo::scan(storage, ask.db, ask.coll, ask.filter, None, elsewhere)?.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(plan))
+}
+
 /// The documents `ask` matches with their RecordIds, in mongod's order.
 /// `None`: the store does not offer the matched set for this collection, or
 /// the sort is one this does not read; the caller reads as it did before.

@@ -259,6 +259,9 @@ pub struct CommandContext {
     /// reply document would cost (`tasks/rust-perf-findings.md`, Phase 1).
     /// Out-of-band like `close_connection`. `None` for every non-cursor reply.
     pub pending_batch: Option<PendingBatch>,
+    /// What a streamed read examined for this command's batch, for its
+    /// `Slow query` line (RM-023).
+    pub exec_stats: Option<ExecStats>,
     /// The raw BSON byte slices of an `insert`'s kind-1 `documents` sequence,
     /// handed in by the server **un-decoded** so the insert handler can store the
     /// client's bytes verbatim (the raw-BSON write path) instead of paying a
@@ -283,6 +286,19 @@ pub struct CommandContext {
 /// A cursor reply's document batch as pre-encoded BSON blobs, plus which field
 /// (`"firstBatch"` for `find`, `"nextBatch"` for `getMore`) it splices into
 /// `cursor`. See `CommandContext::pending_batch`.
+/// One batch of a streamed read, as its `Slow query` line reports it.
+#[derive(Clone, Debug, Default)]
+pub struct ExecStats {
+    pub keys_examined: i64,
+    pub docs_examined: i64,
+    /// The cursor still open after the batch (0: none).
+    pub cursor_id: i64,
+    pub exhausted: bool,
+    /// A `getMore`'s plan summary and the command that opened its cursor.
+    pub plan_summary: Option<String>,
+    pub originating_command: Option<Document>,
+}
+
 #[derive(Clone)]
 pub struct PendingBatch {
     pub batch_field: &'static str,
@@ -325,6 +341,7 @@ impl CommandContext {
             slow_log: None,
             awaited: std::cell::Cell::new(std::time::Duration::ZERO),
             pending_batch: None,
+            exec_stats: None,
             raw_insert_documents: None,
             locks: None,
             txn_locks: false,

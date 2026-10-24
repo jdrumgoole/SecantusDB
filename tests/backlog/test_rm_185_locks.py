@@ -498,6 +498,13 @@ def _slow_lines(client: Any) -> list:
                     continue
                 if first != "getLog" or label == "getLog":
                     lines.append((entry["c"], entry["attr"].get("type"), first))
+            # An index build's line is written on its build thread, which
+            # races the command's own line: mongod 8.2.11 writes the build's
+            # first nearly always and the command's first under load (seen
+            # 2026-10-24). Which lines a build writes is the measurement, so
+            # those two are compared without their order.
+            if label == "createIndex":
+                lines.sort()
             out.append((label, lines))
     finally:
         client.admin.command("profile", 0, slowms=_NEVER_SLOW)

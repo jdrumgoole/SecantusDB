@@ -375,6 +375,121 @@ def test_slow_query_line_says_where_the_time_went(rust_mongo: Any, mongod: Any) 
     assert answers["rust"] == answers["mongod"]
 
 
+_BATCH_ATTRS = (
+    "planSummary",
+    "cursorid",
+    "keysExamined",
+    "docsExamined",
+    "nBatches",
+    "cursorExhausted",
+    "nreturned",
+)
+
+
+def _batch_counts(name: str, db: Any) -> list:
+    """For a few `find`s read in small batches, each `find` and `getMore`
+    line's counts, in the order the line has them (`cursorid` as present or
+    not, since its value is the server's own). Each read has a collection of
+    its own, so its lines are told apart by namespace: two of the profiler's
+    own lines can be identical to the millisecond, which defeats a window
+    that starts after the last line before the read."""
+    client = db.client
+    reads = [
+        lambda c: c.find({"x": {"$gte": 2}}).batch_size(3),
+        lambda c: c.find({"x": {"$lt": 4}}).batch_size(2),
+        lambda c: c.find({"y": 1}).batch_size(2),
+        lambda c: c.find({"y": 1, "z": {"$gte": 0}}).batch_size(1),
+        lambda c: c.find({"x": {"$gt": 3}, "z": 0}).batch_size(2),
+        lambda c: c.find({"x": {"$gte": 0}}).skip(2).limit(3).batch_size(2),
+        lambda c: c.find({"x": {"$in": [1, 5, 9, 99]}}).batch_size(2),
+        lambda c: c.find({"x": {"$gte": 9}}, {"x": 1}).batch_size(2),
+    ]
+    out = []
+    for i, read in enumerate(reads):
+        coll = db[f"s{i}"]
+        coll.insert_many([{"_id": n, "x": n, "y": n % 3, "z": n % 2} for n in range(12)])
+        coll.create_index("x")
+        coll.create_index([("y", 1), ("z", 1)])
+        db.command("profile", 0, slowms=-1 if name == "mongod" else 0)
+        try:
+            list(read(coll))
+        finally:
+            db.command("profile", 0, slowms=100)
+        log = client.admin.command("getLog", "global")["log"]
+        lines = []
+        for attr in (_slow_query_attr(line) for line in log):
+            if attr is None or attr.get("ns") != coll.full_name:
+                continue
+            first = next(iter(attr.get("command", {})), "")
+            if first not in ("find", "getMore"):
+                continue
+            lines.append(
+                (
+                    first,
+                    [(k, "id" if k == "cursorid" else attr[k]) for k in attr if k in _BATCH_ATTRS],
+                    "originatingCommand" in attr,
+                )
+            )
+        out.append(lines)
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-023")
+def test_slow_query_lines_count_each_batch(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 counts the keys and documents each batch examined, with
+    no lookahead: an index scan of 10 read 3 at a time examines 3, 3, 3,
+    then 1 on the `getMore` that finds the end (`cursorExhausted: true`).
+    Every `getMore` line repeats the cursor's `planSummary` and names the
+    command that opened it."""
+    got = {name: _batch_counts(name, db) for name, db in _both(rust_mongo, mongod, "rm023b")}
+    assert got["rust"] == got["mongod"]
+
+
+_PROFILE_ATTRS = (
+    "op",
+    "originatingCommand",
+    "cursorid",
+    "keysExamined",
+    "docsExamined",
+    "nBatches",
+    "cursorExhausted",
+    "nreturned",
+    "planSummary",
+)
+
+
+def _profile_counts(db: Any) -> list:
+    """Each `query` / `getmore` profile entry of three reads: its fields of
+    `_PROFILE_ATTRS` in the entry's order, with the values that do not name
+    a cursor."""
+    db.s.insert_many([{"_id": i, "x": i} for i in range(6)])
+    db.s.create_index("x")
+    db.command("profile", 2)
+    try:
+        list(db.s.find({"x": {"$gte": 1}}).batch_size(2))
+        list(db.s.find({"x": 99}))
+        list(db.s.find({}).batch_size(4))
+    finally:
+        db.command("profile", 0)
+    return [
+        [
+            (k, "-" if k in ("cursorid", "originatingCommand") else e[k])
+            for k in e
+            if k in _PROFILE_ATTRS
+        ]
+        for e in db.system.profile.find({"op": {"$in": ["query", "getmore"]}})
+    ]
+
+
+@pytest.mark.backlog_fixed("RM-023")
+def test_profile_entries_count_each_batch(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11's profile entry for a `find` or `getMore` carries the
+    keys and documents its batch examined, the cursor's plan, and on a
+    `getMore` the command that opened the cursor."""
+    got = {name: _profile_counts(db) for name, db in _both(rust_mongo, mongod, "rm023p")}
+    assert got["rust"] == got["mongod"]
+
+
 def _log_shape(client: Any) -> list:
     """The shape of each `getLog` line: whether it is JSON, and its fields."""
     client.admin.command("ping")

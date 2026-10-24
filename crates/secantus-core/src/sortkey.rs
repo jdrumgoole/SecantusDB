@@ -590,10 +590,239 @@ pub fn encode_value_directed(
     Ok(if direction == -1 { invert_bytes(&e) } else { e })
 }
 
+/// The length of the one encoded value at the start of `key`, an
+/// [`encode_value`] output (ascending, in number-key format 2), or `None` if
+/// `key` does not start with one. Every encoding is self-delimiting: a rank
+/// byte, then a body of fixed width, or escaped (so it holds no `00 00`) up
+/// to the next separator or the end, or with its own terminator. So a
+/// compound key -- values joined by [`COMPOUND_SEP`] -- can be split, which
+/// splitting at the separator cannot do: a negative number's digit pair 99
+/// encodes as `0x00`, and a positive number ends in one.
+pub fn value_len(key: &[u8]) -> Option<usize> {
+    let rank = *key.first()?;
+    let body = &key[1..];
+    let len = match rank {
+        // Index entries are entry format 5, where 14 is JavaScript with a
+        // scope (format 4's MaxKey, kept only by `_id` keys).
+        RANK_MINKEY | RANK_NULL | RANK_MAXKEY => 0,
+        RANK_NUMBER => number_len(body)?,
+        RANK_STRING | RANK_JAVASCRIPT => escaped_len(body),
+        RANK_JAVASCRIPT_SCOPE => {
+            let code = escaped_len(body);
+            let rest = body.get(code..)?.strip_prefix(COMPOUND_SEP)?;
+            code + 2 + elements_len(rest, true)?
+        }
+        RANK_DOCUMENT => elements_len(body, true)?,
+        RANK_ARRAY => elements_len(body, false)?,
+        RANK_BINDATA => {
+            let n = u32::from_be_bytes(body.get(..4)?.try_into().ok()?) as usize;
+            // Length, subtype, then `n` bytes escaped.
+            let mut at = 5;
+            for _ in 0..n {
+                let b = *body.get(at)?;
+                at += if b == 0 { 2 } else { 1 };
+            }
+            if at > body.len() {
+                return None;
+            }
+            at
+        }
+        RANK_OBJECTID => 12,
+        RANK_BOOL => 1,
+        RANK_DATE | RANK_TIMESTAMP => 8,
+        RANK_REGEX => {
+            let pattern = escaped_len(body);
+            let rest = body.get(pattern..)?.strip_prefix(COMPOUND_SEP)?;
+            pattern + 2 + escaped_len(rest)
+        }
+        _ => return None,
+    };
+    (len <= body.len()).then_some(1 + len)
+}
+
+/// Escaped bytes run to the next `00 00` or the end: an escaped `0x00` is
+/// always followed by `0xff`.
+fn escaped_len(body: &[u8]) -> usize {
+    body.windows(2)
+        .position(|w| w == COMPOUND_SEP)
+        .unwrap_or(body.len())
+}
+
+/// A number's body: one byte for NaN, the infinities and zero; otherwise
+/// sign, two exponent bytes, digit pairs and a terminator that no pair
+/// takes (`0x00` after a positive's pairs, `0xff` after a negative's).
+fn number_len(body: &[u8]) -> Option<usize> {
+    match *body.first()? {
+        NUM_NAN | NUM_NEG_INF | NUM_ZERO | NUM_POS_INF => Some(1),
+        NUM_POS => Some(3 + body.get(3..)?.iter().position(|&b| b == 0x00)? + 1),
+        NUM_NEG => Some(3 + body.get(3..)?.iter().position(|&b| b == 0xff)? + 1),
+        _ => None,
+    }
+}
+
+/// A document's or array's elements, to and with [`ELEMENTS_END`]. Each
+/// element is its rank byte, (a document's) escaped name and a separator,
+/// then its value's escaped body and a separator.
+fn elements_len(body: &[u8], named: bool) -> Option<usize> {
+    let mut at = 0;
+    loop {
+        let rank = *body.get(at)?;
+        at += 1;
+        if rank == ELEMENTS_END {
+            return Some(at);
+        }
+        if named {
+            at += escaped_len(body.get(at..)?);
+            at += 2;
+        }
+        at += escaped_len(body.get(at..)?);
+        at += 2;
+        if at > body.len() {
+            return None;
+        }
+    }
+}
+
+/// The values of a compound key, `fields` of them joined by
+/// [`COMPOUND_SEP`], each an ascending [`encode_value`] output. `None` when
+/// `key` is not that.
+pub fn split_compound(key: &[u8], fields: usize) -> Option<Vec<&[u8]>> {
+    let mut out = Vec::with_capacity(fields);
+    let mut rest = key;
+    for i in 0..fields {
+        let n = value_len(rest)?;
+        out.push(&rest[..n]);
+        rest = &rest[n..];
+        if i + 1 < fields {
+            rest = rest.strip_prefix(COMPOUND_SEP)?;
+        }
+    }
+    rest.is_empty().then_some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bson::Bson;
+
+    /// Every kind of value, alone and joined into compound keys, splits back
+    /// into exactly its parts: the separator alone cannot split them.
+    #[test]
+    fn compound_keys_split_into_their_values() {
+        use bson::spec::BinarySubtype;
+        use bson::{doc, Binary, JavaScriptCodeWithScope, Regex, Timestamp};
+        let values = vec![
+            Bson::MinKey,
+            Bson::Null,
+            Bson::MaxKey,
+            Bson::Int32(0),
+            Bson::Int32(1),
+            Bson::Int32(-1),
+            Bson::Int64(-9999),
+            Bson::Int64(-99_9999),
+            Bson::Int64(1_000_001),
+            Bson::Double(-0.0099),
+            Bson::Double(f64::NAN),
+            Bson::Double(f64::INFINITY),
+            Bson::Double(f64::NEG_INFINITY),
+            Bson::Double(123.456),
+            Bson::String(String::new()),
+            Bson::String("a\0b\0\0".into()),
+            Bson::String("plain".into()),
+            Bson::JavaScriptCode("x\0".into()),
+            Bson::JavaScriptCodeWithScope(JavaScriptCodeWithScope {
+                code: "f\0".into(),
+                scope: doc! {"a": -99, "b": ""},
+            }),
+            Bson::Document(doc! {}),
+            Bson::Document(doc! {"a": -99, "b\0": {"c": [1, "x\0", null]}, "": ""}),
+            Bson::Array(vec![]),
+            Bson::Array(vec![
+                Bson::Int32(-99),
+                Bson::Array(vec![]),
+                Bson::String("\0".into()),
+            ]),
+            Bson::Binary(Binary {
+                subtype: BinarySubtype::Generic,
+                bytes: vec![0, 0, 0, 1, 0],
+            }),
+            Bson::Binary(Binary {
+                subtype: BinarySubtype::Uuid,
+                bytes: vec![0; 16],
+            }),
+            Bson::ObjectId(bson::oid::ObjectId::from_bytes([0; 12])),
+            Bson::Boolean(false),
+            Bson::Boolean(true),
+            Bson::DateTime(bson::DateTime::from_millis(0)),
+            Bson::DateTime(bson::DateTime::from_millis(-1)),
+            Bson::Timestamp(Timestamp {
+                time: 0,
+                increment: 0,
+            }),
+            Bson::RegularExpression(Regex {
+                pattern: "a\0".into(),
+                options: "i".into(),
+            }),
+            Bson::RegularExpression(Regex {
+                pattern: String::new(),
+                options: String::new(),
+            }),
+        ];
+        let keys: Vec<Vec<u8>> = values
+            .iter()
+            .map(|v| encode_value(v, None).unwrap())
+            .collect();
+        for k in &keys {
+            assert_eq!(value_len(k), Some(k.len()), "{k:?}");
+        }
+        // Every ordered pair and triple.
+        for a in &keys {
+            for b in &keys {
+                let mut joined = a.clone();
+                joined.extend_from_slice(COMPOUND_SEP);
+                joined.extend_from_slice(b);
+                assert_eq!(
+                    split_compound(&joined, 2),
+                    Some(vec![&a[..], &b[..]]),
+                    "{a:?} {b:?}"
+                );
+                for c in keys.iter().step_by(3) {
+                    let mut three = joined.clone();
+                    three.extend_from_slice(COMPOUND_SEP);
+                    three.extend_from_slice(c);
+                    assert_eq!(
+                        split_compound(&three, 3),
+                        Some(vec![&a[..], &b[..], &c[..]]),
+                        "{a:?} {b:?} {c:?}"
+                    );
+                }
+            }
+        }
+        // A random sweep of numbers, the encoding most likely to hold zeros.
+        let mut seed: u64 = 0x5eed;
+        for _ in 0..20_000 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let n = (seed >> 1) as i64 % 10_000_000_000 - 5_000_000_000;
+            let d = f64::from_bits(seed);
+            for v in [
+                Bson::Int64(n),
+                Bson::Double(if d.is_finite() { d } else { 0.5 }),
+            ] {
+                let k = encode_value(&v, None).unwrap();
+                let mut joined = k.clone();
+                joined.extend_from_slice(COMPOUND_SEP);
+                joined.extend_from_slice(&k);
+                assert_eq!(
+                    split_compound(&joined, 2),
+                    Some(vec![&k[..], &k[..]]),
+                    "{v:?}"
+                );
+            }
+        }
+        assert_eq!(split_compound(&keys[3], 2), None);
+    }
 
     fn ev(v: Bson) -> Vec<u8> {
         encode_value(&v, None).unwrap()
