@@ -13335,6 +13335,25 @@ fn srf_rows(
         }
         return Ok(Some(one(chain, "regclass")));
     }
+    // A function the executor answers with a record of OUT parameters
+    // (`pg_identify_object`): one row of its fields, all NULL when a NULL
+    // argument makes the strict call NULL.
+    if let Some(columns) = correlated::executor_record_columns(name).filter(|_| expand) {
+        let a: Vec<Bson> = call
+            .args
+            .iter()
+            .map(|x| const_value(x, params))
+            .collect::<Result<_>>()?;
+        let value = correlated::call_sequence(name, &a)?;
+        let row = record_values(&value)
+            .cloned()
+            .unwrap_or_else(|| vec![Bson::Null; columns.len()]);
+        return Ok(Some((
+            columns.iter().map(|(n, _)| (*n).to_string()).collect(),
+            columns.iter().map(|(_, t)| (*t).to_string()).collect(),
+            vec![row],
+        )));
+    }
     // A user-defined set-returning function: the executor runs it.
     // A user function in FROM: a set-returning one yields its rows, and one
     // returning a COMPOSITE yields that type's fields as columns -- one row
@@ -13986,7 +14005,12 @@ fn srf_rows(
         // `pg_options_to_table(text[])`: each `name=value` split at its
         // first `=`; an option with none has a NULL value.
         "pg_options_to_table" => {
-            let a = args(1)?;
+            let mut a = args(1)?;
+            // An untyped literal (`'{a=1,b=2}'`) is the `text[]` it reads as
+            // (RP-223): it listed no options.
+            if let Bson::String(text) = &a[0] {
+                a[0] = cast_value(Bson::String(text.clone()), "text[]")?;
+            }
             let rows = match arrays::strip(&a[0]) {
                 Bson::Array(items) if items.contains(&Bson::Null) => {
                     return Err(Error::Sqlstate(
@@ -15556,7 +15580,14 @@ fn plan_table_targets(
             }
             Some(N::ColumnRef(c)) => {
                 let first = c.fields.first().and_then(|f| f.node.as_ref());
-                if matches!(first, Some(N::AStar(_))) {
+                // `*`, or `x.*` with `x` the source's name.
+                let qualified_star = match (c.fields.as_slice(), first) {
+                    ([_, star], Some(N::String(q))) => {
+                        matches!(star.node.as_ref(), Some(N::AStar(_))) && q.sval == def.name
+                    }
+                    _ => false,
+                };
+                if qualified_star || matches!(first, Some(N::AStar(_))) {
                     for col in &def.columns {
                         columns.push((col.name.clone(), col.field()));
                         casts.push(None);
@@ -19099,6 +19130,32 @@ pub fn planning_to_execute<R>(f: impl FnOnce() -> R) -> R {
     out
 }
 
+/// The first whole word `word` (any case) after the word `after`, as the
+/// statement spells it -- the token a syntax error quotes.
+fn written_word(sql: &str, word: &str, after: &str) -> Option<String> {
+    let mut words = Vec::new();
+    let mut start = None;
+    for (i, c) in sql.char_indices() {
+        let part = c.is_alphanumeric() || c == '_';
+        match (part, start) {
+            (true, None) => start = Some(i),
+            (false, Some(b)) => {
+                words.push(&sql[b..i]);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(b) = start {
+        words.push(&sql[b..]);
+    }
+    let from = words.iter().position(|w| w.eq_ignore_ascii_case(after))?;
+    words[from + 1..]
+        .iter()
+        .find(|w| w.eq_ignore_ascii_case(word))
+        .map(|w| (*w).to_string())
+}
+
 /// The SQL/JSON syntax PostgreSQL 16 and 17 added, which the parser (17's
 /// grammar) accepts and PostgreSQL 15 -- what this server reports -- does
 /// not: answered as 15 answers it. The constructors and query functions that
@@ -19142,10 +19199,20 @@ fn sql_json_absent(node: &pg_query::protobuf::Node, sql: &str, params: &[Bson]) 
     };
     let syntax = |at: &str| Some(Error::Parse(format!("syntax error at or near \"{at}\"")));
     let inner = node.node.as_ref()?;
+    // A statistics object without a name is 16's; 15 stops at the ON that
+    // follows `CREATE STATISTICS [IF NOT EXISTS]` (RP-222).
+    if let N::CreateStatsStmt(st) = inner {
+        if st.defnames.is_empty() {
+            return syntax(&written_word(sql, "on", "statistics").unwrap_or_else(|| "on".into()));
+        }
+    }
     for (n, _, _, _) in inner.nodes() {
         use pg_query::NodeRef as R;
         let out = match n {
-            R::JsonIsPredicate(_) => syntax("JSON"),
+            // The token as written: 15 quotes `json`, not `JSON` (RP-222).
+            R::JsonIsPredicate(_) => {
+                syntax(&written_word(sql, "json", "is").unwrap_or_else(|| "JSON".into()))
+            }
             // `merge_action()` is 17's; 15 reads it as a call to nothing.
             R::MergeSupportFunc(_) => absent("merge_action", vec![]),
             R::JsonTable(_) => syntax("COLUMNS"),

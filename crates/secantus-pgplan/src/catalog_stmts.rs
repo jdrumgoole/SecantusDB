@@ -28,6 +28,9 @@ pub enum PubAction {
 pub enum CatalogOp {
     CreateStatistics {
         name: String,
+        /// The schema it is created in: the one its name gives, else the
+        /// table's when it has no name, else the creation schema.
+        schema: String,
         table: String,
         columns: Vec<String>,
         exprs: Vec<String>,
@@ -195,17 +198,32 @@ pub(crate) fn plan_create_statistics(
     if !exprs.is_empty() {
         kinds.push("e".into());
     }
+    let (table_schema, table_bare) = crate::schemas::split_key(&table);
     let name = if s.defnames.is_empty() {
         let mut parts: Vec<String> = columns.clone();
         if !exprs.is_empty() {
             parts.push("expr".into());
         }
-        format!("{table}_{}_stat", parts.join("_"))
+        format!("{table_bare}_{}_stat", parts.join("_"))
     } else {
         last_name(&s.defnames)
     };
+    let written: Vec<String> = s
+        .defnames
+        .iter()
+        .filter_map(|n| match n.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect();
+    let schema = match written.as_slice() {
+        [] => table_schema,
+        [_] => crate::schemas::creation_schema()?,
+        [.., schema, _] => schema.clone(),
+    };
     Ok(Statement::Catalog(CatalogOp::CreateStatistics {
         name,
+        schema,
         table,
         columns,
         exprs,

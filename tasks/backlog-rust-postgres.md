@@ -778,6 +778,22 @@ fixed in the same batch; their tests there are regression tests.
       Backlog-ID: RP-137
       Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order], tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]
 
+## Found by batch 54 (2026-10-24)
+
+Found while building `pg_identify_object` and its siblings (RP-199), and
+fixed in the same batch; their tests in `tests/backlog/test_rp_batch54.py`
+are regression tests. RP-217: `CREATE POLICY`, `ALTER POLICY`, `CREATE
+STATISTICS` and `CREATE` / `ALTER PUBLICATION` read a table in another
+schema as `public`'s (42P01), and a statistics object was always in
+`public`. RP-218: a `regprocedure` with a schema-qualified argument type
+(`textlen(pg_catalog.text)`) was 42883. RP-219: `to_regoper` and
+`to_regoperator` were refused. RP-220: `x.*` over a function in FROM was
+refused. RP-221: a domain constraint's `connamespace` was `public`'s.
+RP-222: an unnamed `CREATE STATISTICS` (PostgreSQL 16's) was accepted, and
+`IS JSON`'s syntax error did not quote the token as written. RP-223:
+`pg_options_to_table('{a=1,b=2}')`, an untyped array literal, listed no
+options.
+
 ## Found by batch 52 (2026-10-24)
 
 Found while building `pg_describe_object` (RP-199) and RP-200. The gap
@@ -810,18 +826,6 @@ NULL for a database's or role's comment) was found and fixed in the same
 batch, and RP-200 (a block's own index definitions) in batch 52; their
 tests there are regression tests.
 
-- [ ] **`pg_identify_object`, `pg_identify_object_as_address` and
-      `pg_get_object_address` are refused** (`function
-      pg_identify_object(regclass, regclass, integer) is not supported
-      yet`). PostgreSQL 15.19 identifies any object by `(classid, objid,
-      objsubid)` as a record (`(table,pg_catalog,pg_class,pg_catalog.pg_class)`)
-      and resolves `(type, names, args)` back to one. `pg_describe_object` is
-      served since batch 52 (`objaddr.rs`); these need
-      `getObjectTypeDescription`, `getObjectIdentityParts` and
-      `get_object_address`, each a switch over every catalog, and their
-      record results.
-      Backlog-ID: RP-199
-      Verify: tests/backlog/test_rp_batch51.py::test_scenario[pg_identify_object and its siblings]
 - [ ] **A cancel while a huge statement is planned waits for the pass it
       lands in.** Planning a statement with a 200,000-item `IN` list runs
       for about a second in a debug build, as a sequence of passes over the

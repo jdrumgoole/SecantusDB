@@ -455,7 +455,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "pg_identify_object and its siblings": (
         "RP-199",
-        True,
+        False,
         [
             "select pg_identify_object('pg_class'::regclass, 'pg_class'::regclass, 0)::text, "
             "pg_identify_object_as_address('pg_class'::regclass, 'pg_class'::regclass, 0)::text",

@@ -183,6 +183,12 @@ fn builtin_operators() -> &'static [BuiltinOperator] {
 /// prints it: `int` and `integer` are both `integer`.
 fn display_arg(a: &str) -> String {
     let a = a.trim();
+    // A built-in type may be named in its schema (`pg_catalog.text`, as
+    // `format_type_be_qualified` writes it): the same type.
+    let a = a
+        .strip_prefix("pg_catalog.")
+        .or_else(|| a.strip_prefix("\"pg_catalog\"."))
+        .unwrap_or(a);
     // The quoted `"char"` is the one-byte type, a bare `char` is `character`.
     if a.trim_end_matches("[]") == crate::QUOTED_CHAR {
         return a.to_string();
@@ -375,6 +381,8 @@ pub fn to_reg_kind(function: &str) -> Option<&'static str> {
         "to_regcollation" => "regcollation",
         "to_regproc" => "regproc",
         "to_regprocedure" => "regprocedure",
+        "to_regoper" => "regoper",
+        "to_regoperator" => "regoperator",
         _ => return None,
     })
 }

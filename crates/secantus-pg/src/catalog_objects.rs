@@ -254,6 +254,7 @@ impl PgHandler {
         match op {
             CatalogOp::CreateStatistics {
                 name,
+                schema,
                 table,
                 columns,
                 exprs,
@@ -278,6 +279,7 @@ impl PgHandler {
                     + 1;
                 let doc = bson::doc! {
                     "_id": &name,
+                    "schema": &schema,
                     "table": &table,
                     "columns": columns,
                     "exprs": exprs,
@@ -629,51 +631,64 @@ impl PgHandler {
         let f = |n: &str| def.field_of(n).expect("column");
         let oid = |kind: &str, id: &str| Bson::Int64(Self::index_oid(&format!("{kind}:{id}")));
         let rows = match name {
-            "pg_statistic_ext" => self
-                .catalog_docs(STATISTICS_COLLECTION)
-                .iter()
-                .map(|d| {
-                    let id = d.get_str("_id").unwrap_or_default();
-                    let table = d.get_str("table").unwrap_or_default();
-                    let tdef = self.lookup(table);
-                    let keys: Vec<Bson> = strings(d, "columns")
-                        .iter()
-                        .filter_map(|c| {
-                            tdef.as_ref()
-                                .and_then(|t| t.columns.iter().position(|x| &x.name == c))
-                                .map(|p| Bson::Int32(p as i32 + 1))
-                        })
-                        .collect();
-                    let exprs = strings(d, "exprs");
-                    let mut r = Document::new();
-                    r.insert(f("oid"), oid("stx", id));
-                    r.insert(
-                        f("stxrelid"),
-                        Bson::Int64(self.relation_oid(table).unwrap_or(0)),
-                    );
-                    r.insert(f("stxname"), id);
-                    r.insert(f("stxnamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
-                    r.insert(
-                        f("stxowner"),
-                        Bson::Int64(self.role_oid_of(d.get_str("owner").unwrap_or_default())),
-                    );
-                    r.insert(f("stxstattarget"), Bson::Int32(-1));
-                    r.insert(f("stxkeys"), Bson::Array(keys));
-                    r.insert(
-                        f("stxkind"),
-                        Bson::Array(strings(d, "kinds").into_iter().map(Bson::String).collect()),
-                    );
-                    r.insert(
-                        f("stxexprs"),
-                        if exprs.is_empty() {
-                            Bson::Null
-                        } else {
-                            Bson::String(exprs.join(", "))
-                        },
-                    );
-                    r
-                })
-                .collect(),
+            "pg_statistic_ext" => {
+                let spaces = self.namespaces();
+                self.catalog_docs(STATISTICS_COLLECTION)
+                    .iter()
+                    .map(|d| {
+                        let id = d.get_str("_id").unwrap_or_default();
+                        let table = d.get_str("table").unwrap_or_default();
+                        let tdef = self.lookup(table);
+                        let keys: Vec<Bson> = strings(d, "columns")
+                            .iter()
+                            .filter_map(|c| {
+                                tdef.as_ref()
+                                    .and_then(|t| t.columns.iter().position(|x| &x.name == c))
+                                    .map(|p| Bson::Int32(p as i32 + 1))
+                            })
+                            .collect();
+                        let exprs = strings(d, "exprs");
+                        let mut r = Document::new();
+                        r.insert(f("oid"), oid("stx", id));
+                        r.insert(
+                            f("stxrelid"),
+                            Bson::Int64(self.relation_oid(table).unwrap_or(0)),
+                        );
+                        r.insert(f("stxname"), id);
+                        let schema = d.get_str("schema").unwrap_or("public");
+                        r.insert(
+                            f("stxnamespace"),
+                            Bson::Int64(
+                                spaces
+                                    .iter()
+                                    .find(|(n, _)| n == schema)
+                                    .map_or(Self::PUBLIC_NAMESPACE_OID, |(_, o)| *o),
+                            ),
+                        );
+                        r.insert(
+                            f("stxowner"),
+                            Bson::Int64(self.role_oid_of(d.get_str("owner").unwrap_or_default())),
+                        );
+                        r.insert(f("stxstattarget"), Bson::Int32(-1));
+                        r.insert(f("stxkeys"), Bson::Array(keys));
+                        r.insert(
+                            f("stxkind"),
+                            Bson::Array(
+                                strings(d, "kinds").into_iter().map(Bson::String).collect(),
+                            ),
+                        );
+                        r.insert(
+                            f("stxexprs"),
+                            if exprs.is_empty() {
+                                Bson::Null
+                            } else {
+                                Bson::String(exprs.join(", "))
+                            },
+                        );
+                        r
+                    })
+                    .collect()
+            }
             // PostgreSQL's operators (RP-211), then the database's.
             "pg_operator" => {
                 let mut rows = self.static_rows("pg_operator", def);

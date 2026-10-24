@@ -996,6 +996,28 @@ pub fn with_sequence_hook<R>(hook: &SequenceHook<'_>, f: impl FnOnce() -> R) -> 
 }
 
 /// The sequence functions.
+/// The executor-answered functions that return a record of OUT parameters,
+/// with those parameters' names and types (PostgreSQL 15.19's `pg_proc`).
+pub(crate) fn executor_record_columns(
+    name: &str,
+) -> Option<&'static [(&'static str, &'static str)]> {
+    Some(match name {
+        "pg_identify_object" => &[
+            ("type", "text"),
+            ("schema", "text"),
+            ("name", "text"),
+            ("identity", "text"),
+        ],
+        "pg_identify_object_as_address" => &[
+            ("type", "text"),
+            ("object_names", "text[]"),
+            ("object_args", "text[]"),
+        ],
+        "pg_get_object_address" => &[("classid", "oid"), ("objid", "oid"), ("objsubid", "int4")],
+        _ => return None,
+    })
+}
+
 pub(crate) const SEQUENCE_FUNCTIONS: &[&str] = &[
     // `pg_trgm`'s `set_limit` writes the session's threshold.
     "set_limit",
@@ -1007,6 +1029,9 @@ pub(crate) const SEQUENCE_FUNCTIONS: &[&str] = &[
     // An object's description reads every catalog (RP-199), and so does
     // whether a name finds it (RP-210).
     "pg_describe_object",
+    "pg_identify_object",
+    "pg_identify_object_as_address",
+    "pg_get_object_address",
     "pg_type_is_visible",
     "pg_function_is_visible",
     "pg_operator_is_visible",
@@ -1089,6 +1114,9 @@ pub fn executor_function_type(name: &str) -> Option<&'static str> {
         "set_config" => "text",
         "pg_my_temp_schema" => "oid",
         "pg_get_serial_sequence" | "pg_describe_object" => "text",
+        "pg_identify_object" | "pg_identify_object_as_address" | "pg_get_object_address" => {
+            "record"
+        }
         "lo_creat" | "lo_create" | "lo_from_bytea" => "oid",
         "lo_unlink" | "lo_open" | "lo_close" | "lowrite" | "lo_lseek" | "lo_tell"
         | "lo_truncate" | "lo_truncate64" => "int4",

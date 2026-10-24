@@ -21242,13 +21242,21 @@ impl PgHandler {
                 let mut rows: Vec<Document> = Vec::new();
                 // A domain's CHECKs: `contypid` names the domain, `conrelid`
                 // is 0.
-                for (oid, conname, type_oid, _, text) in self.domain_constraints() {
+                // Its namespace is its domain's (RP-221).
+                let spaces = self.namespaces();
+                for (oid, conname, type_oid, domain, text) in self.domain_constraints() {
+                    let (schema, _) = secantus_pgplan::schemas::split_key(&domain);
                     let mut d = Document::new();
                     d.insert(field("oid"), Bson::Int64(oid));
                     d.insert(field("conname"), conname);
                     d.insert(
                         field("connamespace"),
-                        Bson::Int64(Self::PUBLIC_NAMESPACE_OID),
+                        Bson::Int64(
+                            spaces
+                                .iter()
+                                .find(|(n, _)| *n == schema)
+                                .map_or(Self::PUBLIC_NAMESPACE_OID, |(_, o)| *o),
+                        ),
                     );
                     d.insert(field("contype"), "c");
                     d.insert(field("condeferrable"), Bson::Boolean(false));
@@ -27519,6 +27527,15 @@ impl PgHandler {
         if name == "pg_describe_object" {
             return self.within_block(|| self.describe_object_call(args));
         }
+        if name == "pg_identify_object" {
+            return self.within_block(|| self.identify_object_call(args));
+        }
+        if name == "pg_identify_object_as_address" {
+            return self.within_block(|| self.identify_object_as_address_call(args));
+        }
+        if name == "pg_get_object_address" {
+            return self.within_block(|| self.object_address_call(args));
+        }
         if objaddr::VISIBILITY_FUNCTIONS.contains(&name) {
             return self.is_visible_call(name, args);
         }
@@ -27699,16 +27716,22 @@ impl PgHandler {
     /// the planner makes into the executor.
     fn to_plan_error(e: PgWireError) -> PlanError {
         match e {
-            // A CONTEXT stack (an error raised inside a PL/pgSQL body)
-            // rides after the message, as DETAIL / HINT lines do, and
-            // `err` splits it back out.
-            PgWireError::UserError(info) => PlanError::Sqlstate(
-                Box::leak(info.code.clone().into_boxed_str()),
-                match &info.where_context {
-                    Some(c) => format!("{}\nContext: {c}", info.message),
-                    None => info.message.clone(),
-                },
-            ),
+            // Its DETAIL, HINT and CONTEXT (an error raised inside a
+            // PL/pgSQL body) ride after the message, and `err` splits them
+            // back out.
+            PgWireError::UserError(info) => {
+                let mut text = info.message.clone();
+                if let Some(d) = &info.detail {
+                    text.push_str(&format!("\nDetail: {d}"));
+                }
+                if let Some(h) = &info.hint {
+                    text.push_str(&format!("\nHint: {h}"));
+                }
+                if let Some(c) = &info.where_context {
+                    text.push_str(&format!("\nContext: {c}"));
+                }
+                PlanError::Sqlstate(Box::leak(info.code.clone().into_boxed_str()), text)
+            }
             other => PlanError::Internal(other.to_string()),
         }
     }
