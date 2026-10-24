@@ -68,7 +68,7 @@ impl PgHandler {
             .unwrap_or_default()
     }
 
-    fn catalog_doc(&self, collection: &'static str, id: &str) -> Option<Document> {
+    pub(crate) fn catalog_doc(&self, collection: &'static str, id: &str) -> Option<Document> {
         self.catalog_docs(collection)
             .into_iter()
             .find(|d| d.get_str("_id") == Ok(id))

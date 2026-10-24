@@ -111,6 +111,13 @@ VIEWS = [
     "pg_catalog.pg_statio_user_indexes",
     "pg_catalog.pg_statio_user_sequences",
     "pg_catalog.pg_statio_user_tables",
+    # The progress views, over the backends' progress slots (RP-100).
+    "pg_catalog.pg_stat_progress_analyze",
+    "pg_catalog.pg_stat_progress_basebackup",
+    "pg_catalog.pg_stat_progress_cluster",
+    "pg_catalog.pg_stat_progress_copy",
+    "pg_catalog.pg_stat_progress_create_index",
+    "pg_catalog.pg_stat_progress_vacuum",
 ]
 
 # Tables whose rows are PostgreSQL's built-in objects and nothing else on a
