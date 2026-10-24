@@ -630,6 +630,22 @@ impl PgHandler {
                     }
                 }
             }
+            // A predicate kept as SQL (RP-236) reads the columns it names.
+            let predicate_sql = ix.get_str("sqlPredicate").ok().or_else(|| {
+                ix.get_document("options")
+                    .ok()
+                    .and_then(|o| o.get_str("sqlPredicate").ok())
+            });
+            if let Some(sql) = predicate_sql {
+                for c in &def.columns {
+                    if sql
+                        .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                        .any(|w| w.eq_ignore_ascii_case(&c.name))
+                    {
+                        add(&c.field());
+                    }
+                }
+            }
             if let Some((exprs, _)) = Self::index_expressions(ix) {
                 for c in &def.columns {
                     let named = exprs.iter().any(|e| {

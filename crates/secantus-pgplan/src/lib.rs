@@ -9029,11 +9029,23 @@ fn plan_create_index(
     let (predicate, predicate_sql) = match i.where_clause.as_deref() {
         None => (None, None),
         Some(w) => {
-            let filter = lower_where(w, &def, params)?;
             let sql = render_index_predicate(w, &def)
                 .or_else(|| deparse_expr(w).ok().map(|s| format!("({s})")))
                 .unwrap_or_default();
-            (Some(filter), Some(sql))
+            // A predicate no storage filter expresses (`a % 2 = 0`) is kept
+            // as its SQL alone, evaluated per row as a CHECK is (RP-236):
+            // the storage index holds every row, which answers any scan of
+            // it correctly, and a UNIQUE one is enforced among the matching
+            // rows by the executor.
+            let filter = match lower_where(w, &def, params) {
+                Ok(f) => Some(f),
+                Err(Error::Unsupported(_)) => {
+                    plan_check_expression(&sql, &def)?;
+                    None
+                }
+                Err(e) => return Err(e),
+            };
+            (filter, Some(sql))
         }
     };
     let name = (!i.idxname.is_empty()).then(|| i.idxname.clone());

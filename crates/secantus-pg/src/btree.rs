@@ -73,6 +73,9 @@ pub(crate) struct IndexShape {
     dedup: bool,
     /// A partial index's predicate, as a storage filter.
     predicate: Option<Document>,
+    /// One no storage filter expresses (`a % 2 = 0`), evaluated per row
+    /// (RP-236).
+    computed: Option<secantus_pgplan::ColumnExpr>,
 }
 
 impl Shape for IndexShape {
@@ -136,6 +139,14 @@ impl IndexShape {
         if let Some(p) = &self.predicate {
             let empty = Document::new();
             if !secantus_core::query::matches(doc, p, &empty, None).unwrap_or(false) {
+                return None;
+            }
+        }
+        if let Some(e) = &self.computed {
+            if !matches!(
+                secantus_pgplan::apply_row_expr(e, doc),
+                Ok(Bson::Boolean(true))
+            ) {
                 return None;
             }
         }
@@ -271,6 +282,7 @@ impl PgHandler {
         let (mut fields, mut desc, mut nulls_first) = (Vec::new(), Vec::new(), Vec::new());
         let mut include: Vec<String> = Vec::new();
         let mut predicate = None;
+        let mut computed = None;
         let mut unique = ix.unique;
         if ix.primary {
             for c in secantus_pgplan::ordered_pk_columns(def) {
@@ -346,6 +358,11 @@ impl PgHandler {
             }
             // The SQL predicate, not the clauses that keep a unique
             // index's NULLs distinct in storage.
+            if let (Some(Bson::String(sql)), None) =
+                (opt("sqlPredicate"), opt("partialFilterExpression"))
+            {
+                computed = secantus_pgplan::plan_check_expression(&sql, def).ok();
+            }
             if opt("sqlPredicate").is_some() {
                 if let Some(Bson::Document(p)) = opt("partialFilterExpression") {
                     let pred = if opt("sqlNullsDistinct").is_some() {
@@ -384,6 +401,7 @@ impl PgHandler {
             unique,
             dedup,
             predicate,
+            computed,
         })
     }
 

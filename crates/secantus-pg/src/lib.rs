@@ -10744,7 +10744,8 @@ impl PgHandler {
                     .ok()
                     .and_then(|o| o.get_bool("unique").ok())
                     .or_else(|| ix.get_bool("unique").ok())
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    || Self::computed_unique(&ix);
                 names.insert(name.to_string());
                 let slot = t.unique_constraints.iter().position(|u| u.name == name);
                 let oid = match (ix.get_i64("sqlOid"), slot) {
@@ -11550,7 +11551,7 @@ impl PgHandler {
         if let Some(keys) = recorded {
             cols = keys;
         }
-        let unique = if ix.get_bool("unique").unwrap_or(false) {
+        let unique = if ix.get_bool("unique").unwrap_or(false) || Self::computed_unique(ix) {
             "UNIQUE "
         } else {
             ""
@@ -14077,6 +14078,141 @@ impl PgHandler {
         Ok(())
     }
 
+    /// A storage index that stands for a UNIQUE index over a predicate kept
+    /// as SQL (RP-236), whose uniqueness the executor enforces.
+    fn computed_unique(ix: &Document) -> bool {
+        ix.get_bool("sqlUnique").unwrap_or(false)
+            || ix
+                .get_document("options")
+                .is_ok_and(|o| o.get_bool("sqlUnique").unwrap_or(false))
+    }
+
+    /// Enforce each UNIQUE index whose predicate is kept as SQL: no two rows
+    /// the predicate admits -- the new ones against each other and against
+    /// the stored rows other than `replacing` -- may share a key (NULLs are
+    /// distinct unless NULLS NOT DISTINCT). PostgreSQL's 23505.
+    fn check_computed_uniques(
+        &self,
+        def: &TableDef,
+        rows: &[Document],
+        replacing: &[Bson],
+    ) -> PgWireResult<()> {
+        let indexes: Vec<Document> = self
+            .storage
+            .list_indexes(self.db(), &def.name)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(Self::computed_unique)
+            .collect();
+        if indexes.is_empty() || rows.is_empty() {
+            return Ok(());
+        }
+        let stored: Vec<Document> = self
+            .storage
+            .find_matching(self.db(), &def.name, &Document::new())
+            .map_err(|e| Self::storage_err("could not read", e))?
+            .into_iter()
+            .filter_map(|raw| secantus_core::bsondoc::from_bytes(&raw).ok())
+            .filter(|d| !d.get("_id").is_some_and(|id| replacing.contains(id)))
+            .collect();
+        for ix in indexes {
+            if let Some((name, key_text, value)) =
+                self.computed_unique_clash(def, &ix, &stored, rows)?
+            {
+                return Err(Self::constraint_error(
+                    "23505",
+                    format!("duplicate key value violates unique constraint \"{name}\""),
+                    format!("Key ({key_text})=({value}) already exists."),
+                    def,
+                    Some(&name),
+                    None,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The first of `rows` whose key a row before it (in `stored`, then in
+    /// `rows`) the predicate of `ix` also admits already has: the index's
+    /// name, its key columns, and the key.
+    fn computed_unique_clash(
+        &self,
+        def: &TableDef,
+        ix: &Document,
+        stored: &[Document],
+        rows: &[Document],
+    ) -> PgWireResult<Option<(String, String, String)>> {
+        let opt = |k: &str| {
+            ix.get(k).cloned().or_else(|| {
+                ix.get_document("options")
+                    .ok()
+                    .and_then(|o| o.get(k).cloned())
+            })
+        };
+        let Some(Bson::String(sql)) = opt("sqlPredicate") else {
+            return Ok(None);
+        };
+        let predicate =
+            secantus_pgplan::plan_check_expression(&sql, def).map_err(|e| Self::err(&e))?;
+        let nulls_equal = opt("sqlNullsNotDistinct").is_some();
+        let fields: Vec<String> = ix
+            .get_document("key")
+            .map(|k| k.keys().cloned().collect())
+            .unwrap_or_default();
+        let admits = |row: &Document| {
+            matches!(
+                secantus_pgplan::apply_row_expr(&predicate, row),
+                Ok(Bson::Boolean(true))
+            )
+        };
+        let key = |row: &Document| -> Option<Vec<Bson>> {
+            let k: Vec<Bson> = fields
+                .iter()
+                .map(|f| row.get(f).cloned().unwrap_or(Bson::Null))
+                .collect();
+            (nulls_equal || !k.iter().any(|v| matches!(v, Bson::Null))).then_some(k)
+        };
+        let same = |a: &[Bson], b: &[Bson]| {
+            a.iter()
+                .zip(b)
+                .all(|(x, y)| compare_values(x, y) == Ordering::Equal)
+        };
+        let mut seen: Vec<Vec<Bson>> = stored
+            .iter()
+            .filter(|r| admits(r))
+            .filter_map(&key)
+            .collect();
+        for row in rows {
+            if !admits(row) {
+                continue;
+            }
+            let Some(k) = key(row) else { continue };
+            if seen.iter().any(|s| same(s, &k)) {
+                let name = ix.get_str("name").unwrap_or_default().to_string();
+                let columns: Vec<String> = fields
+                    .iter()
+                    .map(|f| {
+                        def.columns
+                            .iter()
+                            .find(|c| c.field() == *f)
+                            .map_or_else(|| f.clone(), |c| c.name.clone())
+                    })
+                    .collect();
+                let value = k
+                    .iter()
+                    .map(|v| match v {
+                        Bson::Null => "null".to_string(),
+                        v => secantus_pgplan::value_text(v),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Ok(Some((name, columns.join(", "), value)));
+            }
+            seen.push(k);
+        }
+        Ok(None)
+    }
+
     /// The UNIQUE expression indexes on `table`.
     fn unique_expression_indexes(&self, table: &str) -> PgWireResult<Vec<Document>> {
         Ok(self
@@ -14169,7 +14305,16 @@ impl PgHandler {
         }
         let mut options = Document::new();
         let mut clauses: Vec<Bson> = Vec::new();
-        if ci.unique {
+        // UNIQUE over a predicate kept as SQL (RP-236): no storage index can
+        // enforce it among the matching rows only, so the executor does,
+        // and the storage index is a plain one.
+        let computed_unique = ci.unique && ci.predicate.is_none() && ci.predicate_sql.is_some();
+        if computed_unique {
+            options.insert("sqlUnique", true);
+            if ci.nulls_not_distinct {
+                options.insert("sqlNullsNotDistinct", true);
+            }
+        } else if ci.unique {
             options.insert("unique", true);
             // SQL NULLs are DISTINCT, while a storage unique index collides
             // them: excluding NULL from every key column reproduces the SQL
@@ -14220,6 +14365,21 @@ impl PgHandler {
             options.insert("sqlOpclasses", ci.opclasses.clone());
         }
         options.insert("sqlOid", self.mint_index_oid()?);
+        if computed_unique {
+            let mut ix = options.clone();
+            ix.insert("name", name.as_str());
+            ix.insert("key", key_spec.clone());
+            let rows = self.table_docs(&def.name)?;
+            if let Some((_, columns, value)) = self.computed_unique_clash(&def, &ix, &[], &rows)? {
+                let mut info = ErrorInfo::new(
+                    "ERROR".into(),
+                    "23505".into(),
+                    format!("could not create unique index \"{name}\""),
+                );
+                info.detail = Some(format!("Key ({columns})=({value}) is duplicated."));
+                return Err(PgWireError::UserError(Box::new(info)));
+            }
+        }
         self.storage
             .create_index(self.db(), &def.name, &name, &key_spec, &options)
             .map_err(|e| match e {
@@ -22217,7 +22377,8 @@ impl PgHandler {
             let options = ix.get_document("options").ok();
             let unique = ix.get_bool("unique").unwrap_or(false)
                 || options.is_some_and(|o| o.get_bool("unique").unwrap_or(false));
-            if !unique {
+            let computed = Self::computed_unique(&ix);
+            if !unique && !computed {
                 continue;
             }
             let Ok(key) = ix.get_document("key") else {
@@ -22227,6 +22388,15 @@ impl PgHandler {
             have.sort();
             if have != want {
                 continue;
+            }
+            // Its conflicting row is found by the predicate's SQL, which
+            // the arbiter's storage lookup cannot evaluate (RP-236).
+            if computed {
+                return Err(Self::user_error(
+                    "0A000",
+                    "ON CONFLICT over a unique index whose predicate is computed is not supported"
+                        .into(),
+                ));
             }
             let lookup = |k: &str| {
                 ix.get(k)
@@ -35530,6 +35700,7 @@ impl PgHandler {
                 self.check_expression_unique(&def, &ins.rows, &[])?;
                 self.check_partition_unique(&def, &ins.rows, &[])?;
                 self.check_exclusions(&def, &ins.rows, &[])?;
+                self.check_computed_uniques(&def, &ins.rows, &[])?;
                 if let Some(dup) =
                     self.wide_numeric_pk_conflict(&ins.table, &def, &ins.rows, &[])?
                 {
@@ -40104,6 +40275,11 @@ impl PgHandler {
                             .iter()
                             .any(|u| !u.exclusion_ops.is_empty())
                     })
+                    // A UNIQUE index over a predicate kept as SQL (RP-236).
+                    || self
+                        .storage
+                        .list_indexes(self.db(), &upd.table)
+                        .is_ok_and(|ix| ix.iter().any(Self::computed_unique))
                     || def.as_ref().is_some_and(value_unique);
                 // The columns the SET list assigns, for `UPDATE OF` triggers.
                 let targets: Vec<String> = match (&def, triggered) {
@@ -40278,6 +40454,7 @@ impl PgHandler {
                         self.check_expression_unique(def, &new_rows, &replacing)?;
                         self.check_partition_unique(def, &new_rows, &replacing)?;
                         self.check_exclusions(def, &new_rows, &replacing)?;
+                        self.check_computed_uniques(def, &new_rows, &replacing)?;
                         // A wide numeric key is stored by its text, so the
                         // storage index cannot see `1e41` equal `1e41.0`.
                         if let Some(dup) =
