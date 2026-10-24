@@ -44,6 +44,9 @@ pub(crate) struct Shape {
     pub optimized_pipeline: bool,
     /// The aggregate stages the planner did not take.
     pub rest: Vec<Document>,
+    /// The `$project` (or `$unset`) stage the planner took as the
+    /// projection, as written, rather than the fields the stages it left read.
+    pub projection_stage: Option<Document>,
     /// The pipeline came from a view definition or an aggregate command.
     pub pipeline: bool,
 }
@@ -70,6 +73,7 @@ impl Shape {
             batch_size: false,
             optimized_pipeline: false,
             rest: vec![],
+            projection_stage: None,
             pipeline: false,
         }
     }
@@ -363,6 +367,7 @@ pub(crate) fn absorb(shape: &mut Shape, pipeline: &[Document]) {
                     break;
                 }
                 shape.projection = Some(p.clone());
+                shape.projection_stage = Some(stage.clone());
                 taken = i + 1;
                 break;
             }

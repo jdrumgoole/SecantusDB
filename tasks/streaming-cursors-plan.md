@@ -77,9 +77,26 @@ connection thread; no WT cursor may outlive its call):
      SORT_MERGE, `min`/`max`, `returnKey` / `showRecordId`, blocking sorts
      (read all for the first batch, counted as read; the sort is the store's
      comparator, private to `secantus-storage`).
-3. **`aggregate`.** A streaming source for pipelines whose prefix does not
-   block; counts for `count`, `distinct`, write statements and
-   `findAndModify` from their reads.
+3. **`aggregate`.**
+   - Done (2026-10-24, branch `rust-mdb-stream3`, `agg_stream.rs`): a
+     pipeline of `$match`, `$project`, `$unset`, `$addFields` / `$set`,
+     `$replaceRoot` / `$replaceWith`, `$unwind`, `$redact`, `$skip`,
+     `$limit`, `$lookup` and an in-order `$sort` streams. mongod reads it
+     batch by batch when its planner takes the pipeline whole or SBE takes
+     the rest (`$lookup`), else through the cursor stage's buffer: 32
+     documents, doubling at each refill, a refill ending at the document
+     that brings it to 4 MB (`Stream::next_buffer`); the stages run on each
+     buffered document only as the cursor reaches it, so an error in a later
+     one is the `getMore`'s. `explain`'s match hoist now moves a `$match`
+     ahead of a `$project` / `$unset` that keeps its fields and ahead of a
+     `$sort` (RM-307), which is what makes `[$project, $match]` a
+     whole-pipeline read.
+   - Left: a collation, a view, a time-series collection, `$meta`,
+     `$geoNear`, `notablescan`, `$group` on `_id` (mongod drops it),
+     `$unionWith`, a first batch of none (mongod runs nothing until the
+     `getMore`); `keysExamined` / `docsExamined` on the `aggregate`
+     command's own line; counts for `count`, `distinct`, write statements
+     and `findAndModify` from their reads.
 4. **`storage` on the line.** WiredTiger's per-session statistics
    (`timeWaitingMicros`, bytes read and written) for the operation (the last
    part of RM-023).

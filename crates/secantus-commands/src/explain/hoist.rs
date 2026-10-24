@@ -82,17 +82,113 @@ fn as_match(stage: &Bson) -> Option<&Document> {
         .ok()
 }
 
-/// The paths an `$addFields` / `$set` writes, or an `$unwind` replaces.
-fn set_paths(stage: &Bson) -> Option<Vec<String>> {
+/// What a stage a `$match` can move ahead of does to the fields.
+enum Reshape {
+    /// It writes or removes these paths and leaves the rest.
+    Writes(Vec<String>),
+    /// It keeps only these paths (an inclusion `$project`), and names these
+    /// fields for others (`{w: "$x"}`: `w` is `x`).
+    Keeps {
+        kept: Vec<String>,
+        renamed: Vec<(String, String)>,
+    },
+}
+
+fn reshapes(stage: &Bson) -> Option<Reshape> {
     let d = stage.as_document().filter(|d| d.len() == 1)?;
     if let Some(unwind) = d.get("$unwind") {
-        return unwind_paths(unwind);
+        return unwind_paths(unwind).map(Reshape::Writes);
     }
-    let spec = d
+    if let Ok(spec) = d
         .get_document("$addFields")
         .or_else(|_| d.get_document("$set"))
+    {
+        return Some(Reshape::Writes(spec.keys().cloned().collect()));
+    }
+    match d.get("$unset")? {
+        Bson::String(p) => return Some(Reshape::Writes(vec![p.clone()])),
+        Bson::Array(ps) => {
+            return ps
+                .iter()
+                .map(|p| p.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()
+                .map(Reshape::Writes)
+        }
+        _ => {}
+    }
+    None
+}
+
+/// A `$project`'s effect on the fields (measured 8.2.11 by `explain`: a
+/// `$match` moves ahead of one that keeps every field it reads, and onto
+/// the field a rename names).
+fn projects(stage: &Bson) -> Option<Reshape> {
+    let spec = stage
+        .as_document()
+        .filter(|d| d.len() == 1)?
+        .get_document("$project")
         .ok()?;
-    Some(spec.keys().cloned().collect())
+    let flag = |v: &Bson| match v {
+        Bson::Boolean(b) => Some(*b),
+        Bson::Int32(n) => Some(*n != 0),
+        Bson::Int64(n) => Some(*n != 0),
+        Bson::Double(n) => Some(*n != 0.0),
+        _ => None,
+    };
+    let excluding = spec
+        .iter()
+        .filter(|(k, _)| k.as_str() != "_id")
+        .all(|(_, v)| flag(v) == Some(false));
+    if excluding {
+        let removed = spec
+            .iter()
+            .filter(|(_, v)| flag(v) == Some(false))
+            .map(|(k, _)| k.clone())
+            .collect();
+        return Some(Reshape::Writes(removed));
+    }
+    let mut kept = Vec::new();
+    let mut renamed = Vec::new();
+    // `_id` is kept unless the projection drops it.
+    if !spec.contains_key("_id") {
+        kept.push("_id".to_string());
+    }
+    for (k, v) in spec {
+        match (flag(v), v) {
+            (Some(true), _) => kept.push(k.clone()),
+            (Some(false), _) => {}
+            (None, Bson::String(path)) if path.starts_with('$') && !path.starts_with("$$") => {
+                renamed.push((k.clone(), path[1..].to_string()));
+            }
+            // A computed field is the stage's own.
+            _ => {}
+        }
+    }
+    Some(Reshape::Keeps { kept, renamed })
+}
+
+/// `clause` as it reads ahead of a stage that keeps `kept` and renames
+/// `renamed`, or `None` when it reads something the stage does not keep.
+fn through_projection(
+    key: &str,
+    value: &Bson,
+    kept: &[String],
+    renamed: &[(String, String)],
+) -> Option<Document> {
+    let within = |r: &str, p: &str| r == p || r.starts_with(&format!("{p}."));
+    if !key.starts_with('$') {
+        if kept.iter().any(|p| within(key, p)) {
+            return Some(doc! { key: value.clone() });
+        }
+        // A rename: the clause reads the field it names.
+        let (new, old) = renamed.iter().find(|(new, _)| within(key, new))?;
+        return Some(doc! { format!("{old}{}", &key[new.len()..]): value.clone() });
+    }
+    let mut read = Vec::new();
+    clause_paths(key, value, &mut read)?;
+    read.iter()
+        .all(|r| kept.iter().any(|p| within(r, p)))
+        .then(|| doc! { key: value.clone() })
 }
 
 /// The pipeline as mongod reorders its front: a `$match` behind an
@@ -103,8 +199,12 @@ fn set_paths(stage: &Bson) -> Option<Vec<String>> {
 /// `{z: 1}` behind the stage).
 pub(crate) fn hoist_matches(pipeline: &[Bson]) -> Vec<Bson> {
     let mut out = pipeline.to_vec();
-    let leading =
-        |s: &Bson| as_match(s).is_some() || set_paths(s).is_some() || as_sort(s).is_some();
+    let leading = |s: &Bson| {
+        as_match(s).is_some()
+            || reshapes(s).is_some()
+            || projects(s).is_some()
+            || as_sort(s).is_some()
+    };
     'again: loop {
         for at in 1..out.len() {
             if !out[..at].iter().all(leading) {
@@ -127,29 +227,62 @@ pub(crate) fn hoist_matches(pipeline: &[Bson]) -> Vec<Bson> {
                     continue 'again;
                 }
             }
-            let (Some(written), Some(m)) = (set_paths(&out[at - 1]), as_match(&out[at])) else {
+            let Some(m) = as_match(&out[at]) else {
+                continue;
+            };
+            // A `$match` behind a `$sort` goes ahead of it (measured 8.2.11:
+            // `[{$project: {x: 1}}, {$sort: {x: 1}}, {$match: {x: 1}}]`
+            // reads `{x: 1}`).
+            if as_sort(&out[at - 1]).is_some() {
+                out.swap(at - 1, at);
+                continue 'again;
+            }
+            let Some(reshape) = reshapes(&out[at - 1]).or_else(|| projects(&out[at - 1])) else {
                 continue;
             };
             let mut moved = Vec::new();
             let mut kept = Vec::new();
             for (k, v) in m {
-                let mut read = Vec::new();
-                let free = clause_paths(k, v, &mut read).is_some()
-                    && !read
-                        .iter()
-                        .any(|r| written.iter().any(|w| paths_overlap(r, w)));
-                if free { &mut moved } else { &mut kept }.push(doc! { k.clone(): v.clone() });
+                let ahead = match &reshape {
+                    Reshape::Writes(written) => {
+                        let mut read = Vec::new();
+                        (clause_paths(k, v, &mut read).is_some()
+                            && !read
+                                .iter()
+                                .any(|r| written.iter().any(|w| paths_overlap(r, w))))
+                        .then(|| doc! { k.clone(): v.clone() })
+                    }
+                    Reshape::Keeps {
+                        kept: names,
+                        renamed,
+                    } => through_projection(k, v, names, renamed),
+                };
+                match ahead {
+                    Some(clause) => moved.push(clause),
+                    None => kept.push(doc! { k.clone(): v.clone() }),
+                }
             }
             if moved.is_empty() {
                 continue;
             }
+            // Every clause moved: one filter, as the `$match` wrote it (a
+            // rename that names a field twice stays a conjunction).
+            let flat = |parts: Vec<Document>| {
+                let mut one = Document::new();
+                for (k, v) in parts.iter().flatten() {
+                    if one.insert(k.clone(), v.clone()).is_some() {
+                        return doc! { "$and": parts.iter().cloned().map(Bson::Document).collect::<Vec<_>>() };
+                    }
+                }
+                one
+            };
             let joined = |mut parts: Vec<Document>| match parts.len() {
                 1 => parts.remove(0),
                 _ => doc! { "$and": parts.into_iter().map(Bson::Document).collect::<Vec<_>>() },
             };
             let mut replaced = vec![
                 Bson::Document(
-                    doc! { "$match": if kept.is_empty() { m.clone() } else { joined(moved) } },
+                    doc! { "$match": if kept.is_empty() { flat(moved) } else { joined(moved) } },
                 ),
                 out[at - 1].clone(),
             ];

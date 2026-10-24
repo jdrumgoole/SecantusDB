@@ -1456,7 +1456,7 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         if let Some(hint) = argtypes::given_hint(doc) {
             agg.insert("hint", hint.clone());
         }
-        let reply = crate::aggregate::aggregate(&agg, ctx)?;
+        let reply = crate::aggregate::aggregate_inline(&agg, ctx)?;
         reply
             .get_document("cursor")
             .ok()

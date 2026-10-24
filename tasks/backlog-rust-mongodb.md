@@ -1414,6 +1414,12 @@ What is left, all on the RUST MongoDB server:
       **Decided 2026-10-16 (Joe):** as RM-071, transcribe and execute.
       Backlog-ID: RM-072
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view
+- [ ] **`explain` of `[$project, $limit, $match]` leaves the `$project`
+      out of the stages after the read.** mongod 8.2.11 moves the `$limit`
+      into the query and lists `$match` then `$project` behind it; this
+      server lists the `$match` alone (found 2026-10-24).
+      Backlog-ID: RM-308
+      Verify: tests/backlog/test_rm_found_2026_10_24.py::test_explain_lists_the_projection_a_limit_moved_past
 
 ### 7.074 Change streams, command by command -- 2026-10-11
 
@@ -1464,28 +1470,38 @@ cursor options, `getMore`, `killCursors`, the cursors of `aggregate` and the
 listing commands, tailable cursors, `count`, `distinct`). The Rust server
 differs on 5 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: an `aggregate` cursor, and a `find` that does
-      not stream yet, is the result as it was when the command ran.** They
-      read every matching document and keep the rest for `getMore`. mongod
-      reads on as the cursor is read, so its `getMore` sees a document
-      inserted, changed or deleted since (measured: an insert appears, a
-      delete disappears). Since 2026-10-24 a `find` streams over a
-      collection scan either way (`$natural: -1` too), and over an
-      ascending, uncollated, non-multikey index either way, the `_id` index
-      included, with skip, limit, projection and covered plans. What is left
-      is `tasks/streaming-cursors-plan.md` phases 2 and 3: a descending,
-      collated or multikey index (this store's keys for a descending string
-      field and for a collated string are not in mongod's order, so walking
-      them would return the wrong order: an entry-format change), OR plans
-      and SORT_MERGE, `min` / `max`, `returnKey` / `showRecordId`, blocking
-      sorts, and every `aggregate`. An `_id` walk is not used for a
-      collection holding an `_id` whose key keeps entry format 4's encoding
-      (a document, BinData, JavaScript, MaxKey); one inserted after the
-      cursor opened is returned where its key falls, which among several
-      such `_id`s need not be mongod's order. Tests that write between
-      batches see the difference; so does memory, for a large result.
+- [ ] **RUST MongoDB server: a cursor that does not stream yet is the
+      result as it was when the command ran.** It reads every matching
+      document and keeps the rest for `getMore`. mongod reads on as the
+      cursor is read, so its `getMore` sees a document inserted, changed or
+      deleted since. Since 2026-10-24 a `find` streams over a collection
+      scan either way (`$natural: -1` too), and over an ascending,
+      uncollated, non-multikey index either way, the `_id` index included,
+      with skip, limit, projection and covered plans; an `aggregate` streams
+      when its stages are `$match`, `$project`, `$unset`, `$addFields` /
+      `$set`, `$replaceRoot` / `$replaceWith`, `$unwind`, `$redact`, `$skip`,
+      `$limit`, `$lookup` and a `$sort` the plan reads in order, batch by
+      batch where mongod's planner takes the pipeline whole (or pushes it
+      into SBE), else through mongod's cursor-stage buffer (32 documents,
+      doubling, up to 4 MB). What is left (`tasks/streaming-cursors-plan.md`
+      phases 2 and 3): a descending, collated or multikey index (this
+      store's keys for a descending string field and for a collated string
+      are not in mongod's order, so walking them would return the wrong
+      order: an entry-format change), OR plans and SORT_MERGE, `min` /
+      `max`, `returnKey` / `showRecordId`, blocking sorts; and in
+      `aggregate`, a collation, a view, a time-series collection, `$meta`,
+      `$geoNear`, `notablescan`, a `$group` on `_id` (mongod drops the
+      group and buffers), `$unionWith` (buffered on mongod), and a first
+      batch of none, for which mongod runs nothing until the `getMore` (a
+      blocking `$group` asked for `batchSize: 0` here reads everything at
+      the command). An `_id` walk is not used for a collection holding an
+      `_id` whose key keeps entry format 4's encoding (a document, BinData,
+      JavaScript, MaxKey); one inserted after the cursor opened is returned
+      where its key falls, which among several such `_id`s need not be
+      mongod's order. Tests that write between batches see the difference;
+      so does memory, for a large result.
       Backlog-ID: RM-080
-      Verify: tests/backlog/test_rm_057_084.py::test_aggregate_get_more_sees_writes_made_since_the_command, tests/backlog/test_rm_057_084.py::test_descending_index_get_more_sees_writes_made_since_the_find
+      Verify: tests/backlog/test_rm_057_084.py::test_aggregate_group_on_id_union_with_and_empty_first_batch_read_on, tests/backlog/test_rm_057_084.py::test_descending_index_get_more_sees_writes_made_since_the_find
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
   `$meta: "textScore"` sorts, an `explain: true` aggregate. Every
   `{$meta}` shape measured on 8.2.11 matches since 2026-10-17, except a

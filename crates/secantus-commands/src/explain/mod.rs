@@ -96,6 +96,8 @@ fn validate(
     ctx: &mut CommandContext,
 ) -> Result<(), CommandError> {
     let reply = order::uncounted(|| handler(inner, ctx))?;
+    // A streamed first batch is the dry run's, not the reply's.
+    ctx.pending_batch = None;
     if let Ok(cursor) = reply.get_document("cursor") {
         if let Some(id) = cursor.get("id").and_then(as_i64).filter(|id| *id != 0) {
             if let Ok(cursors) = ctx.cursors() {
@@ -322,6 +324,11 @@ pub(crate) struct PipelineQuery {
     pub projection: Option<Document>,
     pub skip: i64,
     pub limit: i64,
+    /// The stages it did not take, in the order they run.
+    pub rest: Vec<Bson>,
+    /// The `$project` (or `$unset`) stage it took as the projection, as
+    /// written; `None` when the projection is the fields `rest` reads.
+    pub projection_stage: Option<Bson>,
 }
 
 pub(crate) fn pipeline_canonical(coll: &str, pipeline: &[Bson]) -> PipelineQuery {
@@ -336,6 +343,8 @@ pub(crate) fn pipeline_canonical(coll: &str, pipeline: &[Bson]) -> PipelineQuery
             projection: None,
             skip: 0,
             limit: 0,
+            rest: pipeline.to_vec(),
+            projection_stage: None,
         };
     };
     shape::absorb(&mut s, &stages);
@@ -345,6 +354,8 @@ pub(crate) fn pipeline_canonical(coll: &str, pipeline: &[Bson]) -> PipelineQuery
         projection: s.projection,
         skip: s.skip,
         limit: s.limit,
+        rest: s.rest.into_iter().map(Bson::Document).collect(),
+        projection_stage: s.projection_stage.map(Bson::Document),
     }
 }
 
@@ -895,7 +906,7 @@ fn count_through(
     if let Some(c) = options.get("collation") {
         cmd.insert("collation", c.clone());
     }
-    let Ok(reply) = order::uncounted(|| crate::aggregate::aggregate(&cmd, ctx)) else {
+    let Ok(reply) = order::uncounted(|| crate::aggregate::aggregate_inline(&cmd, ctx)) else {
         return 0;
     };
     let Ok(cursor) = reply.get_document("cursor") else {

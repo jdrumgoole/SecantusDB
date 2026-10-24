@@ -117,6 +117,9 @@ struct IndexScan {
     key_skip: i64,
     /// A covered plan: the documents read to project are not examined.
     covered: bool,
+    /// Entries the scan has passed whose documents a batch that filled
+    /// did not fetch: the next read fetches them first.
+    unfetched: VecDeque<i64>,
 }
 
 /// An index scan of `ix` from its start, when one streams.
@@ -162,6 +165,7 @@ fn index_scan(
         last: None,
         key_skip: 0,
         covered: false,
+        unfetched: VecDeque::new(),
     }))
 }
 
@@ -448,13 +452,22 @@ impl Stream {
     }
 
     /// Up to `want` documents that pass the filter (`want` 0: no count
-    /// limit), read on from where the last batch stopped.
-    fn read(&mut self, storage: &dyn Storage, want: usize) -> Result<Vec<Vec<u8>>, StorageError> {
+    /// limit), and none past the one that brings them to `budget` bytes,
+    /// read on from where the last batch stopped.
+    fn read(
+        &mut self,
+        storage: &dyn Storage,
+        want: usize,
+        budget: Option<usize>,
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
         let mut out = Vec::new();
-        let full = |out: &Vec<Vec<u8>>| want > 0 && out.len() >= want;
+        let mut bytes = 0usize;
+        let full = |out: &Vec<Vec<u8>>, bytes: usize| {
+            (want > 0 && out.len() >= want) || budget.is_some_and(|b| bytes >= b)
+        };
         match &mut self.access {
             Access::Coll { after, backward } => {
-                while !full(&out) {
+                while !full(&out, bytes) {
                     let Some(rows) =
                         storage.records_after(&self.db, &self.coll, *after, CHUNK, *backward)?
                     else {
@@ -477,8 +490,9 @@ impl Stream {
                             }
                         };
                         if keep {
+                            bytes += blob.len();
                             out.push(blob);
-                            if full(&out) {
+                            if full(&out, bytes) {
                                 stopped = true;
                                 break;
                             }
@@ -499,7 +513,7 @@ impl Stream {
                     buf: VecDeque::new(),
                     end: false,
                 };
-                'batch: while !full(&out) {
+                'batch: while !full(&out, bytes) {
                     // The entries this batch is sure to fetch: no more than it
                     // can still take, so none is read and lost.
                     let room = if want == 0 {
@@ -509,6 +523,10 @@ impl Stream {
                     };
                     let mut rids = Vec::with_capacity(room);
                     while rids.len() < room {
+                        if let Some(rid) = src.scan.unfetched.pop_front() {
+                            rids.push(rid);
+                            continue;
+                        }
                         match work_entry(&mut src, &mut self.keys)? {
                             Step::Entry(_) if src.scan.key_skip > 0 => src.scan.key_skip -= 1,
                             Step::Entry(rid) => rids.push(rid),
@@ -523,7 +541,8 @@ impl Stream {
                     let Some(found) = storage.records_by_id(&self.db, &self.coll, &rids)? else {
                         return Err(StorageError::Internal("this store cannot stream".into()));
                     };
-                    for blob in found.into_iter().flatten() {
+                    for (i, blob) in found.into_iter().enumerate() {
+                        let Some(blob) = blob else { continue };
                         if !src.scan.covered {
                             self.docs += 1;
                         }
@@ -538,8 +557,12 @@ impl Stream {
                             }
                         };
                         if keep {
+                            bytes += blob.len();
                             out.push(blob);
-                            if full(&out) {
+                            if full(&out, bytes) {
+                                for rid in rids[i + 1..].iter().rev() {
+                                    src.scan.unfetched.push_front(*rid);
+                                }
                                 break 'batch;
                             }
                         }
@@ -557,6 +580,28 @@ impl Stream {
         storage: &dyn Storage,
         want: usize,
         max_bytes: usize,
+    ) -> Result<Batch, StorageError> {
+        self.batch(storage, want, max_bytes, false)
+    }
+
+    /// What an aggregate's cursor stage buffers: up to `want` results, and
+    /// no more once they hold `max_bytes` (the document that reaches it is
+    /// kept, where a batch stops short of it: measured 8.2.11).
+    pub(crate) fn next_buffer(
+        &mut self,
+        storage: &dyn Storage,
+        want: usize,
+        max_bytes: usize,
+    ) -> Result<Batch, StorageError> {
+        self.batch(storage, want, max_bytes, true)
+    }
+
+    fn batch(
+        &mut self,
+        storage: &dyn Storage,
+        want: usize,
+        max_bytes: usize,
+        reaching: bool,
     ) -> Result<Batch, StorageError> {
         self.keys = 0;
         self.docs = 0;
@@ -591,7 +636,9 @@ impl Stream {
                     0 => CHUNK,
                     n => n + self.skip.max(0) as usize,
                 };
-                fresh = self.read(storage, ask)?.into();
+                // A buffer stops reading at the document that fills it.
+                let budget = (reaching && self.skip <= 0).then(|| max_bytes.saturating_sub(bytes));
+                fresh = self.read(storage, ask, budget)?.into();
                 if fresh.is_empty() {
                     self.done = true;
                     break;
@@ -602,7 +649,7 @@ impl Stream {
                     self.skip -= 1;
                     continue;
                 }
-                if !out.is_empty() && bytes + blob.len() > max_bytes {
+                if !reaching && !out.is_empty() && bytes + blob.len() > max_bytes {
                     fresh.push_front(blob);
                     self.stashed = fresh;
                     break 'fill;
@@ -617,7 +664,7 @@ impl Stream {
                         break 'fill;
                     }
                 }
-                if want > 0 && out.len() >= want {
+                if (want > 0 && out.len() >= want) || (reaching && bytes >= max_bytes) {
                     self.stashed = fresh;
                     break 'fill;
                 }
