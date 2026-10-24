@@ -187,7 +187,10 @@ fn models() -> &'static Mutex<Models> {
     MODELS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-type ShapeMemo = HashMap<(usize, String), (u64, Arc<HashMap<String, Vec<Arc<IndexShape>>>>)>;
+/// By store, database and -- for a block that changed the catalog, whose
+/// shapes are its own -- the backend.
+type ShapeMemo =
+    HashMap<(usize, String, Option<i32>), (u64, Arc<HashMap<String, Vec<Arc<IndexShape>>>>)>;
 
 fn shape_memo() -> &'static Mutex<ShapeMemo> {
     static MEMO: OnceLock<Mutex<ShapeMemo>> = OnceLock::new();
@@ -205,16 +208,19 @@ impl PgHandler {
         let version = crate::catalog_cache()
             .version
             .load(std::sync::atomic::Ordering::SeqCst);
-        let key = (self.store_id(), self.db().to_string());
         // Not while a statement changes the catalog, whose version moves
-        // only at its end, nor in a block that changed it, whose changes are
-        // its own.
-        let in_txn = self.block_wrote_catalog()
-            || self
-                .catalog_statements
-                .load(std::sync::atomic::Ordering::Relaxed)
-                > 0;
-        if !in_txn {
+        // only at its end. A block that changed it keeps a memo of its own:
+        // every catalog-changing statement moves the version, its own
+        // uncommitted ones too.
+        let mid_ddl = self
+            .catalog_statements
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0;
+        let own = self
+            .block_wrote_catalog()
+            .then(|| self.backend_pid.load(std::sync::atomic::Ordering::Relaxed));
+        let key = (self.store_id(), self.db().to_string(), own);
+        if !mid_ddl {
             if let Some((v, m)) = shape_memo()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -235,7 +241,7 @@ impl PgHandler {
             }
         }
         let m = Arc::new(by_table);
-        if !in_txn {
+        if !mid_ddl {
             shape_memo()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
