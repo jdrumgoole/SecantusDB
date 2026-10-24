@@ -511,7 +511,9 @@ These are explicit non-goals. Don't add them without a reason.
       lock) and bytes written by the operation; ours has only the duration.
       WiredTiger keeps these per session (`statistics:session`), but the
       storage layer opens a session per operation and exposes none of it.
-      Also not on the line: `keysExamined` and `docsExamined`. Those count
+      Also not on the line: `keysExamined` and `docsExamined`; on a write
+      statement's line (RM-299), `isFromUserConnection` and
+      `collectionType`, which mongod writes after `type`. Those count
       the plan's own work; `explain` derives them only by reading the whole
       collection, which a log line must not do, so they need counters from
       the read itself, and PER BATCH: mongod 8.2.11 counts each `find` /
@@ -529,16 +531,18 @@ These are explicit non-goals. Don't add them without a reason.
       Backlog-ID: RM-023
       Verify: tests/backlog/test_rm_001_028.py::test_slow_query_line_says_where_the_time_went
 
-- [ ] **`getLog` lines are text, mongod's are its structured log.** mongod
-  8.2.11 answers `getLog` with its structured log: one JSON document per
-  line, `{"t": {"$date": ...}, "s": "I", "c": "COMMAND", "id": 51803,
-  "ctx": "conn12", "msg": "Slow query", "attr": {...}}`. This server's
-  lines are `<date> I COMMAND Slow query {...}` (`logbuf.rs`), with no `id`
-  or `ctx` field and the attributes after the message. A tool that parses
-  the log as mongod writes it reads none of them. Found 2026-10-24 with
-  RM-299.
-  Backlog-ID: RM-302
-  Verify: tests/backlog/test_rm_001_028.py::test_get_log_lines_are_structured_json
+- [ ] **mongod's connection lines this server does not write.** Since
+  RM-302 the log is mongod's structured log, and the lines this server
+  writes -- `MongoDB starting`, `Waiting for connections`, `Connection
+  accepted` / `ended`, every `Slow query` -- carry mongod's ids, threads
+  and connection attributes. mongod 8.2.11 also writes, per connection,
+  `client metadata` (NETWORK, 51800, the driver's `hello` document, on the
+  first `hello`) and `Received first command on ingress connection ...`
+  (6788700), and at startup about eighty more lines (build and OS
+  information, options, storage engine settings); this server writes none
+  of them (measured 2026-10-24). Found with RM-302.
+  Backlog-ID: RM-305
+  Verify: tests/backlog/test_rm_001_028.py::test_client_metadata_is_logged
 ### 7.091 mongod's slot-based engine (SBE) -- 2026-10-23
 
 mongod 8.2 runs the front of a pipeline in its slot-based engine when it can

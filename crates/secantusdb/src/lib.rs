@@ -361,6 +361,7 @@ impl Builder {
             require_auth: self.auth,
             tls: self.tls.clone(),
             enable_test_commands: self.test_commands,
+            db_path: self.storage_path.as_ref().map(|p| p.display().to_string()),
             ..ServerConfig::default()
         };
         let addr = format!("{}:{}", self.host, self.port);

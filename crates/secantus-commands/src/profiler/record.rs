@@ -299,10 +299,9 @@ fn decide(
     // and says why in the log.
     let matched = settings.filter.as_ref().map(|f| {
         f.matches(entry).unwrap_or_else(|e| {
-            warn(
-                ctx,
-                format!("The profile filter could not be evaluated: {e}"),
-            );
+            // mongod writes no line for a filter that throws, at its default
+            // verbosity (measured 8.2.11, 2026-10-24).
+            log::debug!("The profile filter could not be evaluated: {e}");
             false
         })
     });
@@ -351,18 +350,33 @@ fn write(ctx: &CommandContext, db: &str, entry: &Document) {
         }
     })();
     if let Err(e) = result {
-        warn(
-            ctx,
-            format!("Failed to write a profile entry to {db}.{PROFILE_COLLECTION}: {e}"),
-        );
+        warn(ctx, entry, &e);
     }
 }
 
-/// A warning in the server's log.
-fn warn(ctx: &CommandContext, msg: String) {
+/// mongod's warning when an operation's profile entry cannot be written:
+/// component `-`, id 20703, with the operation's namespace and the failure
+/// (measured 8.2.11, 2026-10-24, through its `forceLockTimeoutForProfiler`
+/// fail point).
+fn warn(ctx: &CommandContext, entry: &Document, failure: &str) {
+    let msg = "Caught Assertion while trying to profile operation";
+    let attr = doc! {
+        "operation": "msg",
+        "namespace": entry.get_str("ns").unwrap_or_default(),
+        "assertion": failure,
+    };
     match &ctx.logs {
-        Some(logs) => logs.append("W", "COMMAND", msg),
-        None => eprintln!("{msg}"),
+        Some(logs) => logs.log(
+            crate::logbuf::LogEntry::new(
+                "W",
+                "-",
+                20703,
+                format!("conn{}", ctx.connection_id),
+                msg,
+            )
+            .attr(attr),
+        ),
+        None => eprintln!("{msg}: {failure}"),
     }
 }
 

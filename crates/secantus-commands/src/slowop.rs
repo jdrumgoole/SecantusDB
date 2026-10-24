@@ -68,6 +68,8 @@ impl SlowOpSettings {
 /// command's, a `$merge`'s writes included (measured 8.2.11, 2026-10-24).
 struct Sink {
     settings: std::sync::Arc<SlowOpSettings>,
+    /// The connection the command came in on: the lines' `ctx`.
+    connection_id: i64,
     logs: Option<std::sync::Arc<crate::logbuf::LogBuffer>>,
     locks: Option<std::sync::Arc<crate::lock_manager::LockManager>>,
 }
@@ -83,6 +85,7 @@ pub struct SinkScope(Option<Sink>);
 pub fn enter(ctx: &CommandContext) -> SinkScope {
     let sink = ctx.slow_ops.as_ref().map(|settings| Sink {
         settings: settings.clone(),
+        connection_id: ctx.connection_id,
         logs: ctx.logs.clone(),
         locks: ctx.locks.clone(),
     });
@@ -101,11 +104,14 @@ pub(crate) fn armed() -> bool {
     SINK.with(|s| s.borrow().is_some())
 }
 
+/// mongod's id for a `Slow query` line, whoever writes it.
+pub const SLOW_QUERY_ID: i32 = 51803;
+
 /// Log one statement of the running command that ran for `worked`, if that
 /// is slow: a `Slow query` line under `component`, and the global IS mongod
 /// takes for it (`lock_manager::log_lock`). `attr` is the line's attributes
-/// before its durations.
-pub(crate) fn statement(component: &str, mut attr: Document, worked: Duration) {
+/// before its durations. An index build's line is its build thread's.
+pub(crate) fn statement(component: &'static str, mut attr: Document, worked: Duration) {
     SINK.with(|s| {
         let sink = s.borrow();
         let Some(sink) = sink.as_ref() else {
@@ -118,12 +124,17 @@ pub(crate) fn statement(component: &str, mut attr: Document, worked: Duration) {
             crate::lock_manager::log_lock(lm);
         }
         attr.insert("durationMillis", worked.as_millis() as i64);
-        let line = bson::Bson::Document(attr)
-            .into_relaxed_extjson()
-            .to_string();
-        log::info!("Slow query {line}");
+        let thread = if component == "STORAGE" {
+            "IndexBuildsCoordinatorMongod-0".to_string()
+        } else {
+            format!("conn{}", sink.connection_id)
+        };
+        let entry =
+            crate::logbuf::LogEntry::new("I", component, SLOW_QUERY_ID, thread, "Slow query")
+                .attr(attr);
+        log::info!("{}", entry.render());
         if let Some(logs) = &sink.logs {
-            logs.append("I", component, format!("Slow query {line}"));
+            logs.log(entry);
         }
     });
 }
@@ -229,18 +240,17 @@ fn command_shown(request: &Document) -> Document {
         .collect()
 }
 
-/// The attributes of one `Slow query` line, as relaxed Extended JSON. `ns` is
-/// `db.collection` for a command that names a collection and `db.$cmd`
-/// otherwise, as mongod has it. `read` is [`read_attributes`]' part.
+/// The attributes of one `Slow query` line. `ns` is `db.collection` for a
+/// command that names a collection and `db.$cmd` otherwise, as mongod has
+/// it. `read` is [`read_attributes`]' part.
 pub fn attributes(
     request: &Document,
     reply: &Document,
     read: Document,
     db: &str,
-    conn_id: i64,
     worked: Duration,
     total: Duration,
-) -> String {
+) -> Document {
     let name = request.keys().next().map(String::as_str).unwrap_or("");
     // `getMore` names its collection in `collection`; its own value is the
     // cursor id.
@@ -257,7 +267,6 @@ pub fn attributes(
     attr.insert("type", "command");
     attr.insert("ns", ns);
     attr.insert("command", command_shown(request));
-    attr.insert("ctx", format!("conn{conn_id}"));
     let mut read = read;
     if let Some(summary) = read.remove("planSummary") {
         attr.insert("planSummary", summary);
@@ -266,14 +275,18 @@ pub fn attributes(
     attr.extend(read);
     attr.insert("workingMillis", worked.as_millis() as i64);
     attr.insert("durationMillis", total.as_millis() as i64);
-    bson::Bson::Document(attr)
-        .into_relaxed_extjson()
-        .to_string()
+    attr
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn json(attr: Document) -> String {
+        bson::Bson::Document(attr)
+            .into_relaxed_extjson()
+            .to_string()
+    }
     use bson::doc;
 
     #[test]
@@ -301,32 +314,30 @@ mod tests {
 
     #[test]
     fn an_insert_line_names_the_collection_and_the_count() {
-        let line = attributes(
+        let line = json(attributes(
             &doc! {"insert": "t", "documents": [{"payload": "x"}], "$db": "a"},
             &doc! {"n": 100_i32, "ok": 1.0},
             Document::new(),
             "a",
-            7,
             Duration::from_millis(4140),
             Duration::from_millis(4140),
-        );
+        ));
         assert_eq!(
             line,
-            r#"{"type":"command","ns":"a.t","command":{"insert":"t","$db":"a"},"ctx":"conn7","ninserted":100,"workingMillis":4140,"durationMillis":4140}"#
+            r#"{"type":"command","ns":"a.t","command":{"insert":"t","$db":"a"},"ninserted":100,"workingMillis":4140,"durationMillis":4140}"#
         );
     }
 
     #[test]
     fn a_get_more_is_attributed_to_its_collection() {
-        let line = attributes(
+        let line = json(attributes(
             &doc! {"getMore": 7_i64, "collection": "t", "$db": "a"},
             &doc! {"ok": 1.0},
             Document::new(),
             "a",
-            2,
             Duration::from_millis(120),
             Duration::from_millis(1120),
-        );
+        ));
         assert!(
             line.contains(r#""ns":"a.t","command":{"getMore":7,"collection":"t","$db":"a"}"#),
             "{line}"
@@ -341,35 +352,33 @@ mod tests {
     /// after the outcome, the times last.
     #[test]
     fn a_read_names_its_plan_and_what_it_returned() {
-        let line = attributes(
+        let line = json(attributes(
             &doc! {"find": "t", "filter": {"x": {"$gt": 1}}, "$db": "a"},
             &doc! {"ok": 1.0},
             doc! {"planSummary": "IXSCAN { x: 1 }", "nreturned": 3_i64, "reslen": 195_i64},
             "a",
-            4,
             Duration::from_millis(101),
             Duration::from_millis(101),
-        );
+        ));
         assert_eq!(
             line,
-            r#"{"type":"command","ns":"a.t","command":{"find":"t","filter":{"x":{"$gt":1}},"$db":"a"},"ctx":"conn4","planSummary":"IXSCAN { x: 1 }","nreturned":3,"reslen":195,"workingMillis":101,"durationMillis":101}"#
+            r#"{"type":"command","ns":"a.t","command":{"find":"t","filter":{"x":{"$gt":1}},"$db":"a"},"planSummary":"IXSCAN { x: 1 }","nreturned":3,"reslen":195,"workingMillis":101,"durationMillis":101}"#
         );
     }
 
     #[test]
     fn a_failure_carries_its_code_and_a_collectionless_command_uses_cmd() {
-        let line = attributes(
+        let line = json(attributes(
             &doc! {"ping": 1_i32, "$db": "a"},
             &doc! {"ok": 0.0, "code": 2_i32, "codeName": "BadValue", "errmsg": "x"},
             Document::new(),
             "a",
-            1,
             Duration::from_millis(150),
             Duration::from_millis(1150),
-        );
+        ));
         assert_eq!(
             line,
-            r#"{"type":"command","ns":"a.$cmd","command":{"ping":1,"$db":"a"},"ctx":"conn1","ok":0,"errCode":2,"errName":"BadValue","workingMillis":150,"durationMillis":1150}"#
+            r#"{"type":"command","ns":"a.$cmd","command":{"ping":1,"$db":"a"},"ok":0,"errCode":2,"errName":"BadValue","workingMillis":150,"durationMillis":1150}"#
         );
     }
 }

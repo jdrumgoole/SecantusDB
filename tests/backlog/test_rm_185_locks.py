@@ -457,15 +457,9 @@ def test_a_slow_operation_takes_the_global_lock_to_log(rust_mongo: Any, mongod: 
 
 
 def _log_line(line: str) -> dict:
-    """A `getLog` line as `{c, msg, attr}`: mongod's are JSON; this server's
-    are `<date> <severity> <component> <message>` (RM-302)."""
-    try:
-        return json.loads(line)
-    except ValueError:
-        _date, _severity, component, message = line.split(" ", 3)
-        if message.startswith("Slow query "):
-            return {"c": component, "msg": "Slow query", "attr": json.loads(message[11:])}
-        return {"c": component, "msg": message}
+    """A `getLog` line: mongod's structured log, one JSON document each
+    (this server's too since RM-302)."""
+    return json.loads(line)
 
 
 def _lines_after(client: Any, last: str | None) -> list:
@@ -498,7 +492,10 @@ def _slow_lines(client: Any) -> list:
                     continue
                 command = entry["attr"].get("command", {})
                 first = next(iter(command), "")
-                # The `getLog` that reads the log is logged in its window.
+                # The `getLog` that reads the log is logged in its window,
+                # and the driver's monitor sends `hello` whenever it likes.
+                if first in ("hello", "isMaster", "ismaster"):
+                    continue
                 if first != "getLog" or label == "getLog":
                     lines.append((entry["c"], entry["attr"].get("type"), first))
             out.append((label, lines))

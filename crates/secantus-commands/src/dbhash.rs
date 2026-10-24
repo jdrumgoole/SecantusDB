@@ -31,7 +31,7 @@ use md5::{Digest, Md5};
 use crate::{CommandContext, CommandError, HandlerResult};
 
 /// The machine's host name, as mongod reports it in `host`.
-pub(crate) fn host_name() -> String {
+pub fn host_name() -> String {
     #[cfg(unix)]
     {
         let mut buf = [0u8; 256];
