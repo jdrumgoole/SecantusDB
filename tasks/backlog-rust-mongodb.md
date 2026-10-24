@@ -581,21 +581,23 @@ leave only differences listed here or in other items. Regression tests:
   message splits them byte by byte and sends bytes that are not UTF-8, which
   pymongo cannot decode; this server sends the same text as valid UTF-8.
 
-- [ ] **An error raised through a variable bound from the input is reported
-  as the optimizer's.** mongod binds `$map`'s and `$filter`'s `$$this`,
-  `$reduce`'s `$$value`, and a `$let` variable read from a field, per
-  document, so an error through one -- `{$map: {input: ["Mars"], in:
-  {$year: {date: "$t", timezone: "$$this"}}}}` -- is "Executor error during
-  ...", and `find` with it in `$expr` answers `[]` on an empty collection
-  (measured 8.2.11, 2026-10-23). This server decides the wrapper by counting
-  every variable in scope as a constant (`is_constant_expression` called with
-  `ctx.vars`' names), so it answers "Failed to optimize pipeline" / "Failed
-  to optimize expression", and `find` raises it on an empty collection
-  through its empty-document check. The evaluator's context does not know
-  which variables are constant: the command's `let` and `$$NOW` are, a
-  `$lookup`'s `let` and these bindings are not. Found 2026-10-23 with RM-290.
-  Backlog-ID: RM-293
-  Verify: tests/backlog/test_rm_sbe.py::test_a_variable_bound_from_input_is_not_constant
+- [ ] **A `find` projection's per-document error has no executor wrapper.**
+  mongod reports an error a computed projection field raises on a document
+  as "Executor error during find command: <db>.<coll> :: caused by :: ...",
+  the same wrapper as the filter's: `{v: {$year: {date: "$t", timezone:
+  "$s"}}}` over `{s: "x"}` is 40485 under it (measured 8.2.11, 2026-10-24).
+  This server sends the bare message (`find.rs`, the `apply_projection`
+  error). A constant one is folded while the projection is parsed and stays
+  bare, on both servers (RM-251). Found 2026-10-24 with RM-293.
+  Backlog-ID: RM-296
+  Verify: tests/backlog/test_rm_sbe.py::test_find_projection_error_carries_the_executor_wrapper
+- [ ] **A `find` projection cannot read the command's `let`.** `find({},
+  {v: {$toUpper: "$$cz"}}, let: {cz: "Mars"})` gives `v: "MARS"` on mongod
+  8.2.11; this server refuses it with code 2 "projection is not supported by
+  the Rust server", because `projection::apply_projection` evaluates
+  computed fields with no variables. Found 2026-10-24 with RM-293.
+  Backlog-ID: RM-297
+  Verify: tests/backlog/test_rm_sbe.py::test_find_projection_reads_the_command_let
 
 ### 7.090 `$group` code no test had executed, against mongod -- 2026-10-22
 

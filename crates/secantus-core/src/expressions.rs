@@ -62,18 +62,48 @@ mod sbe_ops;
 struct Ctx<'a> {
     doc: &'a Document,
     vars: &'a Document,
+    /// The variables in `vars` that are bound per document: `$map`'s and
+    /// `$filter`'s `as`, `$reduce`'s `this` and `value`, and a `$let`
+    /// variable that is not constant. mongod folds the rest while optimizing,
+    /// so they decide which wrapper an error carries (RM-293).
+    per_doc: &'a [String],
+}
+
+impl Ctx<'_> {
+    /// The names `aggregate::is_constant_expression` may treat as constant.
+    fn constant_vars(&self) -> Vec<String> {
+        self.vars
+            .keys()
+            .filter(|k| !self.per_doc.contains(k))
+            .cloned()
+            .collect()
+    }
 }
 
 /// Evaluate an aggregation expression against `doc` with the given user vars.
 pub fn evaluate(doc: &Document, expr: &Bson, vars: &Document) -> R {
-    eval(expr, &Ctx { doc, vars })
+    eval(
+        expr,
+        &Ctx {
+            doc,
+            vars,
+            per_doc: &[],
+        },
+    )
 }
 
 /// [`evaluate`] in *field-value* position — an absent field path yields the
 /// missing marker (`Bson::Undefined`) so `$project` / `$addFields` omit the key
 /// instead of writing null. Mirrors `expressions.py::evaluate_or_missing`.
 pub fn evaluate_or_missing(doc: &Document, expr: &Bson, vars: &Document) -> R {
-    eval_field_value(expr, &Ctx { doc, vars })
+    eval_field_value(
+        expr,
+        &Ctx {
+            doc,
+            vars,
+            per_doc: &[],
+        },
+    )
 }
 
 /// MongoDB truthiness (`secantus.expressions._bool` / `query._truthy`): null is
@@ -295,7 +325,7 @@ fn stamp_folded(fault: Fallback, arg: &Bson, ctx: &Ctx) -> Fallback {
             message,
             folded: Some(crate::aggregate::is_constant_expression(
                 arg,
-                &ctx.vars.keys().cloned().collect::<Vec<_>>(),
+                &ctx.constant_vars(),
             )),
             exec,
             bare,
@@ -996,7 +1026,7 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
     if crate::sbe::active()
         && !crate::aggregate::is_constant_expression(
             &Bson::Document(bson::doc! { op: arg.clone() }),
-            &ctx.vars.keys().cloned().collect::<Vec<_>>(),
+            &ctx.constant_vars(),
         )
     {
         if let Some(answer) = sbe_ops::apply(op, arg, ctx) {
@@ -1910,10 +1940,7 @@ fn op_switch(arg: &Bson, ctx: &Ctx, ret: Ret) -> R {
         if truthy(&eval(case, ctx)?) {
             return ret(then, ctx);
         }
-        constant &= crate::aggregate::is_constant_expression(
-            case,
-            &ctx.vars.keys().cloned().collect::<Vec<_>>(),
-        );
+        constant &= crate::aggregate::is_constant_expression(case, &ctx.constant_vars());
     }
     if let Some(def) = d.get("default") {
         return ret(def, ctx);
@@ -4077,14 +4104,17 @@ fn op_object_to_array(arg: &Bson, ctx: &Ctx) -> R {
 /// bare `$field` paths) is unchanged — only the var scope grows.
 fn eval_with_vars(expr: &Bson, ctx: &Ctx, extra: &[(&str, Bson)]) -> R {
     let mut vars = ctx.vars.clone();
+    let mut per_doc = ctx.per_doc.to_vec();
     for (name, value) in extra {
         vars.insert((*name).to_string(), value.clone());
+        per_doc.push((*name).to_string());
     }
     eval(
         expr,
         &Ctx {
             doc: ctx.doc,
             vars: &vars,
+            per_doc: &per_doc,
         },
     )
 }
@@ -4109,18 +4139,28 @@ fn op_let(arg: &Bson, ctx: &Ctx, ret: Ret) -> R {
     // Each binding is evaluated against the *original* scope (bindings don't see
     // each other), then all are layered for the `in` expression.
     let mut vars = ctx.vars.clone();
+    let constant = ctx.constant_vars();
+    let mut per_doc = ctx.per_doc.to_vec();
     for (name, vexpr) in bindings {
         // FIELD-VALUE position, so a var bound from an absent field stays
         // missing rather than collapsing to null: mongod's `$eq: ["$$v", null]`
         // is false when `$$v` came from a field the document does not have.
         let v = eval_field_value(vexpr, ctx)?;
         vars.insert(name.clone(), v);
+        // A constant definition is inlined by mongod's optimizer; any other
+        // is bound per document, and hides an outer constant of that name.
+        let folded = crate::aggregate::is_constant_expression(vexpr, &constant);
+        per_doc.retain(|n| n != name);
+        if !folded {
+            per_doc.push(name.clone());
+        }
     }
     ret(
         in_expr,
         &Ctx {
             doc: ctx.doc,
             vars: &vars,
+            per_doc: &per_doc,
         },
     )
 }
@@ -4359,7 +4399,7 @@ fn set_optimize_check(op: &str, arg: &Bson, ctx: &Ctx) -> Result<(), Fallback> {
     let Bson::Array(items) = arg else {
         return Ok(());
     };
-    let bound: Vec<String> = ctx.vars.keys().cloned().collect();
+    let bound: Vec<String> = ctx.constant_vars();
     // A wholly constant `$setIsSubset` is folded instead, and fails with the
     // run-time codes under the optimizer's wrapper.
     if op == "$setIsSubset" && crate::aggregate::is_constant_expression(arg, &bound) {
@@ -5691,7 +5731,7 @@ impl TzArg {
 /// `{$hour: {date: "$n", timezone: 5}}` fails for a null `n`, while
 /// `{$hour: {date: "$n", timezone: "$tz"}}` answers null).
 fn timezone_is_constant(expr: &Bson, ctx: &Ctx) -> bool {
-    crate::aggregate::is_constant_expression(expr, &ctx.vars.keys().cloned().collect::<Vec<_>>())
+    crate::aggregate::is_constant_expression(expr, &ctx.constant_vars())
 }
 
 /// Evaluate and check a `timezone` argument: mongod's `makeTimeZone`. A
@@ -5896,7 +5936,7 @@ const DATE_ADD_LIMITS: &[(&str, i64)] = &[
 ///
 /// `Ok(true)`: the expression is null whatever the document.
 fn optimize_date_args(op: &str, arg: &Bson, d: &Document, ctx: &Ctx) -> Result<bool, Fallback> {
-    let bound: Vec<String> = ctx.vars.keys().cloned().collect();
+    let bound: Vec<String> = ctx.constant_vars();
     if crate::aggregate::is_constant_expression(arg, &bound) {
         return Ok(false);
     }
@@ -5958,7 +5998,11 @@ pub fn optimize_date_fault(expr: &Bson, vars: &Document) -> Option<Fallback> {
         return None;
     }
     let empty = Document::new();
-    let ctx = Ctx { doc: &empty, vars };
+    let ctx = Ctx {
+        doc: &empty,
+        vars,
+        per_doc: &[],
+    };
     let bound: Vec<String> = vars.keys().cloned().collect();
     if crate::aggregate::is_constant_expression(expr, &bound) {
         return None;
@@ -6289,7 +6333,7 @@ fn start_of_week_arg(
         return Ok(StartOfWeek::Absent);
     };
     if unit != "week" {
-        let bound: Vec<String> = ctx.vars.keys().cloned().collect();
+        let bound: Vec<String> = ctx.constant_vars();
         let parsed_while_optimizing = crate::aggregate::is_constant_expression(e, &bound)
             && !crate::aggregate::is_constant_expression(arg, &bound);
         if parsed_while_optimizing && is_null(&eval(e, ctx)?) {
@@ -8024,7 +8068,7 @@ fn compile_regex(
         // mongod compiles a CONSTANT regex while it optimizes the pipeline,
         // whatever the input is, so the refusal is reported under "Failed to
         // optimize pipeline" rather than the executor's wrapper.
-        let vars: Vec<String> = ctx.vars.keys().cloned().collect();
+        let vars: Vec<String> = ctx.constant_vars();
         let constant = ["regex", "options"].iter().all(|k| {
             spec.get(*k)
                 .is_none_or(|e| crate::aggregate::is_constant_expression(e, &vars))
@@ -8045,7 +8089,7 @@ fn compile_regex(
 /// while the pipeline is optimized. `Ok(false)` when `regex` is null: the
 /// operator's empty result. Measured 2026-10-22.
 fn check_regex_args(spec: &Document, ctx: &Ctx, op: &str) -> Result<bool, Fallback> {
-    let vars: Vec<String> = ctx.vars.keys().cloned().collect();
+    let vars: Vec<String> = ctx.constant_vars();
     let constant = ["regex", "options"].iter().all(|k| {
         spec.get(*k)
             .is_none_or(|e| crate::aggregate::is_constant_expression(e, &vars))

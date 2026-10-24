@@ -442,8 +442,10 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             Some(Bson::Document(d)) => d.keys().cloned().collect(),
             _ => Vec::new(),
         };
+        let vars = crate::util::command_let_vars(doc.get("let"), ctx);
         if let Some(Bson::Document(f)) = doc.get("filter") {
-            if let Some((code, msg)) = argtypes::expression_problem_in_filter(f, &bound) {
+            if let Some((code, msg)) = argtypes::expression_problem_in_filter_with(f, &bound, &vars)
+            {
                 return Err(CommandError::new(
                     code,
                     crate::util::error_code_name(code),
@@ -584,14 +586,16 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // A computed field's constant sub-expressions are folded while the
         // projection is parsed, so one that fails is refused bare, over an
         // empty collection too (mongod 8.2.11, 2026-10-22; RM-251). The
-        // projection operators are not expressions.
+        // projection operators are not expressions. The command's `let` is
+        // substituted first.
+        let fold_vars = crate::util::command_let_vars(doc.get("let"), ctx);
         let fault = spec
             .values()
             .filter(|v| {
                 !matches!(v, Bson::Document(d) if d.len() == 1
                     && d.keys().all(|k| matches!(k.as_str(), "$slice" | "$elemMatch" | "$meta")))
             })
-            .filter_map(secantus_core::expr_rewrite::constant_expr_fault)
+            .filter_map(|v| secantus_core::expr_rewrite::constant_expr_fault_with(v, &fold_vars))
             .find(|f| f.folded_verdict() != Some(false));
         if let Some((code, msg)) = fault.as_ref().and_then(|f| f.as_mongo()) {
             return Err(CommandError::new(

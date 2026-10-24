@@ -128,6 +128,31 @@ fn is_constant(e: &Bson) -> bool {
     }
 }
 
+/// [`is_constant`] where the variables in `vars` are constants too: mongod
+/// substitutes a command's `let`, `$$NOW` and a constant `$let` binding
+/// before it folds, so `{$divide: [1, "$$z"]}` with `z` bound to 0 fails
+/// while optimizing (measured 8.2.11, 2026-10-24).
+fn is_constant_in(e: &Bson, vars: &Document) -> bool {
+    match e {
+        Bson::String(s) => match s.strip_prefix("$$") {
+            Some(var) => vars.contains_key(var.split('.').next().unwrap_or(var)),
+            None => !s.starts_with('$'),
+        },
+        Bson::Array(a) => a.iter().all(|e| is_constant_in(e, vars)),
+        Bson::Document(d) => match d.iter().next() {
+            Some((k, _)) if d.len() == 1 && k == "$literal" => true,
+            _ => d.values().all(|e| is_constant_in(e, vars)),
+        },
+        _ => true,
+    }
+}
+
+/// Whether mongod folds `e` while optimizing, `vars` substituted.
+fn folds(e: &Bson, vars: &Document) -> bool {
+    is_constant_in(e, vars)
+        && crate::aggregate::is_constant_expression(e, &vars.keys().cloned().collect::<Vec<_>>())
+}
+
 fn evaluate_constant(e: &Bson) -> Option<Bson> {
     crate::expressions::evaluate(&Document::new(), e, &Document::new()).ok()
 }
@@ -148,6 +173,13 @@ fn evaluate_constant(e: &Bson) -> Option<Bson> {
 /// `$switch` folds its own way (`switch_fault`).
 pub fn constant_expr_fault(arg: &Bson) -> Option<crate::fallback::Fallback> {
     fault_in(arg, &Document::new())
+}
+
+/// [`constant_expr_fault`] under a command's `let`: mongod substitutes those
+/// variables while it optimizes, so `{$divide: [1, "$$z"]}` with `let: {z:
+/// 0}` fails before any document is read (measured 8.2.11, 2026-10-24).
+pub fn constant_expr_fault_with(arg: &Bson, vars: &Document) -> Option<crate::fallback::Fallback> {
+    fault_in(arg, vars)
 }
 
 /// [`constant_expr_fault`] with `vars` the constant variables in scope: a
@@ -202,8 +234,8 @@ fn fault_in(arg: &Bson, vars: &Document) -> Option<crate::fallback::Fallback> {
     }
     // Constant AND one mongod folds: some operators it never evaluates while
     // optimizing, whatever their arguments (`aggregate::is_constant_expression`).
-    if is_constant(arg) && crate::aggregate::is_constant_expression(arg, &[]) {
-        return crate::expressions::evaluate(&Document::new(), arg, &Document::new())
+    if folds(arg, vars) {
+        return crate::expressions::evaluate(&Document::new(), arg, vars)
             .err()
             // A PARSE error (a missing required argument) is reported bare,
             // and by the command's own checks, not as an optimizer failure.
@@ -239,8 +271,8 @@ fn switch_fault(spec: &Bson, vars: &Document) -> Option<crate::fallback::Fallbac
             return Some(fault);
         }
         let constant_case = case
-            .filter(|c| is_constant(c) && crate::aggregate::is_constant_expression(c, &[]))
-            .and_then(evaluate_constant);
+            .filter(|c| folds(c, vars))
+            .and_then(|c| crate::expressions::evaluate(&Document::new(), c, vars).ok());
         match constant_case {
             Some(v) if crate::expressions::truthy(&v) => return then.and_then(constant_expr_fault),
             Some(_) => continue,
@@ -282,9 +314,18 @@ fn let_fault(spec: &Document, vars: &Document) -> Option<crate::fallback::Fallba
 /// [`constant_expr_fault`] over every `$expr` in a query filter, as mongod's
 /// `(code, message)`.
 pub fn constant_expr_error_in_filter(filter: &Document) -> Option<(i32, String)> {
+    constant_expr_error_in_filter_with(filter, &Document::new())
+}
+
+/// [`constant_expr_error_in_filter`] under a command's `let`
+/// ([`constant_expr_fault_with`]).
+pub fn constant_expr_error_in_filter_with(
+    filter: &Document,
+    vars: &Document,
+) -> Option<(i32, String)> {
     for (key, value) in filter {
         let found = match (key.as_str(), value) {
-            ("$expr", arg) => constant_expr_fault(arg).and_then(|f| {
+            ("$expr", arg) => fault_in(arg, vars).and_then(|f| {
                 f.as_mongo().map(|(c, m)| {
                     (
                         c,
@@ -295,7 +336,7 @@ pub fn constant_expr_error_in_filter(filter: &Document) -> Option<(i32, String)>
             ("$and" | "$or" | "$nor", Bson::Array(subs)) => subs
                 .iter()
                 .filter_map(Bson::as_document)
-                .find_map(constant_expr_error_in_filter),
+                .find_map(|d| constant_expr_error_in_filter_with(d, vars)),
             _ => None,
         };
         if found.is_some() {

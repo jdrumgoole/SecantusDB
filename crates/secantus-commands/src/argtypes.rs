@@ -1744,6 +1744,19 @@ pub fn unknown_operator_in_filter(filter: &Document) -> Option<(i32, String)> {
 }
 
 pub fn expression_problem_in_filter(filter: &Document, bound: &[String]) -> Option<(i32, String)> {
+    expression_problem_in_filter_with(filter, bound, &Document::new())
+}
+
+/// [`expression_problem_in_filter`] with the values of the command's `let`,
+/// for the commands whose optimizer substitutes them -- `find` and
+/// `findAndModify`; `update` and `delete` do not (measured 8.2.11,
+/// 2026-10-24: `{$divide: [1, "$$z"]}` with `let: {z: 0}` is refused by the
+/// first two on an empty collection, and the last two answer `n: 0`).
+pub fn expression_problem_in_filter_with(
+    filter: &Document,
+    bound: &[String],
+    vars: &Document,
+) -> Option<(i32, String)> {
     if let Some(found) = unknown_operator_in_filter(filter) {
         return Some(found);
     }
@@ -1765,7 +1778,7 @@ pub fn expression_problem_in_filter(filter: &Document, bound: &[String]) -> Opti
                 let mut alone = Document::new();
                 alone.insert("$expr", value.clone());
                 if let Some(found) =
-                    secantus_core::expr_rewrite::constant_expr_error_in_filter(&alone)
+                    secantus_core::expr_rewrite::constant_expr_error_in_filter_with(&alone, vars)
                 {
                     return Some(found);
                 }
@@ -1774,7 +1787,7 @@ pub fn expression_problem_in_filter(filter: &Document, bound: &[String]) -> Opti
                 if let Bson::Array(subs) = value {
                     for sub in subs {
                         if let Bson::Document(d) = sub {
-                            if let Some(found) = expression_problem_in_filter(d, bound) {
+                            if let Some(found) = expression_problem_in_filter_with(d, bound, vars) {
                                 return Some(found);
                             }
                         }

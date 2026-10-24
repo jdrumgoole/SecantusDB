@@ -615,7 +615,7 @@ def test_date_arguments_checked_in_the_optimizers_order(rust_mongo: Any, mongod:
     assert _missing_and_one(rust_mongo, mongod, exprs) == []
 
 
-@pytest.mark.backlog("RM-293")
+@pytest.mark.backlog_fixed("RM-293")
 def test_a_variable_bound_from_input_is_not_constant(rust_mongo: Any, mongod: Any) -> None:
     """An error raised through a variable mongod binds from the input --
     `$map`'s `$$this`, a `$let` variable read from a field -- is a per-document
@@ -673,6 +673,147 @@ def test_a_variable_bound_from_input_is_not_constant(rust_mongo: Any, mongod: An
         if answers[0] != answers[1]:
             out.append(f"{coll}:\n  mongod {answers[0]!r}\n  rust   {answers[1]!r}")
     assert out == []
+
+
+@pytest.mark.backlog_fixed("RM-293")
+def test_a_command_let_variable_is_folded_while_optimizing(rust_mongo: Any, mongod: Any) -> None:
+    """mongod substitutes a command's `let`, `$$NOW` and a constant `$let`
+    binding before it folds, so `{$divide: [1, "$$z"]}` with `let: {z: 0}`
+    fails under the optimizer's wrapper before any document is read: in
+    `aggregate` (in `$match`, `$project`, `$unionWith` and `$facet`), `find`
+    (filter and projection) and `findAndModify`, while `update` and `delete`
+    answer `n: 0` (measured 8.2.11, 2026-10-24). This server folded none of
+    them, so each answered as though the collection were simply empty."""
+    zero = {"$divide": [1, "$$z"]}
+    now_zero = {"$subtract": [{"$toLong": "$$NOW"}, {"$toLong": "$$NOW"}]}
+    expr = {"$expr": {"$eq": [zero, "$a"]}}
+    proj = {"v": zero}
+    let = {"z": 0, "o": {"z": 0}, "e": {"$subtract": [1, 1]}, "tz": "Mars"}
+    year = {"$year": {"date": "$t", "timezone": "$$tz"}}
+    commands = {
+        "aggregate $match": {"aggregate": "c", "pipeline": [{"$match": expr}], "cursor": {}},
+        "aggregate $project": {"aggregate": "c", "pipeline": [{"$project": proj}], "cursor": {}},
+        "aggregate $unionWith": {
+            "aggregate": "c",
+            "pipeline": [{"$unionWith": {"coll": "c", "pipeline": [{"$project": proj}]}}],
+            "cursor": {},
+        },
+        "aggregate $facet": {
+            "aggregate": "c",
+            "pipeline": [{"$facet": {"f": [{"$project": proj}]}}],
+            "cursor": {},
+        },
+        "aggregate $group zone": {
+            "aggregate": "c",
+            "pipeline": [{"$group": {"_id": None, "v": {"$max": year}}}],
+            "cursor": {},
+        },
+        "aggregate $$NOW": {
+            "aggregate": "c",
+            "pipeline": [{"$project": {"v": {"$divide": [1, now_zero]}}}],
+            "cursor": {},
+        },
+        "aggregate $let": {
+            "aggregate": "c",
+            "pipeline": [
+                {
+                    "$project": {
+                        "v": {
+                            "$let": {
+                                "vars": {"y": 0},
+                                "in": {"$add": ["$a", {"$divide": [1, "$$y"]}]},
+                            }
+                        }
+                    }
+                }
+            ],
+            "cursor": {},
+        },
+        "aggregate let path": {
+            "aggregate": "c",
+            "pipeline": [{"$project": {"v": {"$add": ["$a", {"$divide": [1, "$$o.z"]}]}}}],
+            "cursor": {},
+        },
+        "aggregate let expression": {
+            "aggregate": "c",
+            "pipeline": [{"$project": {"v": {"$add": ["$a", {"$divide": [1, "$$e"]}]}}}],
+            "cursor": {},
+        },
+        "aggregate let in $map": {
+            "aggregate": "c",
+            "pipeline": [{"$project": {"v": {"$map": {"input": "$a", "in": zero}}}}],
+            "cursor": {},
+        },
+        "find filter": {"find": "c", "filter": expr},
+        "find filter zone": {"find": "c", "filter": {"$expr": {"$eq": [year, 1]}}},
+        "find projection": {"find": "c", "projection": proj},
+        "findAndModify": {"findAndModify": "c", "query": expr, "update": {"$set": {"b": 1}}},
+        "update": {"update": "c", "updates": [{"q": expr, "u": {"$set": {"b": 1}}}]},
+        "delete": {"delete": "c", "deletes": [{"q": expr, "limit": 0}]},
+    }
+    one = {"_id": 1, "t": datetime.datetime(2020, 1, 1), "a": 1}
+    out = []
+    for docs in ([], [one]):
+        answers = []
+        for client in (mongod, rust_mongo):
+            db = client[_DB]
+            db.c.drop()
+            if docs:
+                db.c.insert_many(docs)
+            got = {}
+            for label, cmd in commands.items():
+                if docs and label.startswith(("update", "delete", "findAndModify")):
+                    continue
+                reply = mongo_answer(lambda db=db, cmd=cmd: db.command({**cmd, "let": let}))
+                if reply[0] == "ok":
+                    reply = ("ok", {k: reply[1][k] for k in ("n", "nModified") if k in reply[1]})
+                got[label] = reply
+            answers.append(got)
+        for label in answers[0]:
+            if answers[0][label] != answers[1][label]:
+                out.append(
+                    f"{label} ({len(docs)} docs):\n  mongod {answers[0][label]!r}\n"
+                    f"  rust   {answers[1][label]!r}"
+                )
+    assert out == []
+
+
+@pytest.mark.backlog("RM-296")
+def test_find_projection_error_carries_the_executor_wrapper(rust_mongo: Any, mongod: Any) -> None:
+    """An error a `find` projection raises on a document is "Executor error
+    during find command: <ns> :: caused by :: ...", as in the filter
+    (measured 8.2.11, 2026-10-24); this server sends the bare message."""
+    one = {"_id": 1, "t": datetime.datetime(2020, 1, 1), "s": "x"}
+    projections = [
+        {"v": {"$year": {"date": "$t", "timezone": "$s"}}},
+        {"v": {"$map": {"input": ["Mars"], "in": {"$year": {"date": "$t", "timezone": "$$this"}}}}},
+    ]
+    answers = []
+    for client in (mongod, rust_mongo):
+        c = client[_DB]["one"]
+        c.drop()
+        c.insert_one(one)
+        answers.append([mongo_answer(lambda c=c, p=p: list(c.find({}, p))) for p in projections])
+    assert answers[1] == answers[0]
+
+
+@pytest.mark.backlog("RM-297")
+def test_find_projection_reads_the_command_let(rust_mongo: Any, mongod: Any) -> None:
+    """A `find` projection may read the command's `let`: `{v: {$toUpper:
+    "$$cz"}}` with `let: {cz: "Mars"}` gives `v: "MARS"` (measured 8.2.11,
+    2026-10-24). This server refuses it with code 2, "projection is not
+    supported by the Rust server"."""
+    answers = []
+    for client in (mongod, rust_mongo):
+        c = client[_DB]["one"]
+        c.drop()
+        c.insert_one({"_id": 1})
+        answers.append(
+            mongo_answer(
+                lambda c=c: list(c.find({}, {"v": {"$toUpper": "$$cz"}}, let={"cz": "Mars"}))
+            )
+        )
+    assert answers[1] == answers[0]
 
 
 @pytest.mark.backlog_fixed("RM-291")
