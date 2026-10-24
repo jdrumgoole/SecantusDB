@@ -755,6 +755,28 @@ tests are scenarios in `tests/backlog/test_rp_batch30.py`, measured on a
 private 15.19 cluster. RP-133 .. RP-136 and RP-138 .. RP-142 were found and
 fixed in the same batch; their tests there are regression tests.
 
+## Found by batch 63 (2026-10-24)
+
+Found while counting a sequential scan a LIMIT stops (RP-224). The gap
+tests are scenarios in `tests/backlog/test_rp_batch63.py`, measured on a
+private 15.19 cluster. RP-238 (a scan streamed in a transaction block,
+`begin; select g from t`, was not counted in `pg_stat_user_tables` at all)
+was found and fixed in the same batch; its test there is a regression
+test.
+
+- [ ] **A write counts one heap buffer access per row.** PostgreSQL 15.19
+      counts what `heap_insert` reads through the buffer manager: CREATE
+      TABLE AS writes through a bulk-write ring, one access per page (35
+      for 2,000 rows of 104 bytes), and an INSERT reads its target page per
+      row plus the full page, the free space map's answer and the new page
+      each time the heap extends (2,137 for 2,000 more rows). Here every
+      row written counts one access (2,000 and 4,000), so
+      `pg_statio_user_tables.heap_blks_hit` drifts from PostgreSQL's after
+      any write. Modelling it means following `RelationGetBufferForTuple`
+      and the bulk-insert state per write path.
+      Backlog-ID: RP-239
+      Verify: tests/backlog/test_rp_batch63.py::test_scenario[a write counts the heap pages PostgreSQL's buffer accesses do]
+
 ## Found by batch 62 (2026-10-24)
 
 Found while letting ON CONFLICT arbitrate on a unique index whose predicate
@@ -807,16 +829,6 @@ without a Terminate, and counted a terminated one only once its client
 closed the socket) was found and fixed in the same batch; its test there is
 a regression test.
 
-- [ ] **A sequential scan under LIMIT counts every tuple.** PostgreSQL
-      15.19 stops a scan once its LIMIT is met: `select * from t limit 1`
-      reads one tuple (`seq_tup_read` 1), `select g from t where g = 10
-      limit 1` ten. Here every scan reports the table's visible tuples, as
-      the storage reads them all. Counting where PostgreSQL would stop needs
-      the position in heap order of the last row the plan returned, after
-      the residual filter, and not where DISTINCT, a window or an ORDER BY
-      read every row first.
-      Backlog-ID: RP-224
-      Verify: tests/backlog/test_rp_batch55.py::test_scenario[a sequential scan under LIMIT reads only what it returns]
 - [ ] **The system catalogs' counters stay at zero.** `pg_stat_sys_tables`
       and `pg_statio_sys_*` list every catalog, but this server's catalogs
       are computed, not scanned, so nothing counts a read of `pg_class`;

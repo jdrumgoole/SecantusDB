@@ -33190,6 +33190,18 @@ impl PgHandler {
     ) -> PgWireResult<(Vec<Document>, TableDef)> {
         // `FOR UPDATE` over the stored table: the rows returned are locked.
         let mut row_lock: Option<secantus_pgplan::RowLock> = None;
+        // A LIMIT straight over a scan of the table, nothing between them
+        // that reads every row first: PostgreSQL's sequential scan stops
+        // once the LIMIT has its rows, and counts only what it read
+        // (RP-224). Its count waits for the rows the WHERE keeps.
+        let limit_stops_scan = sel.limit.is_some()
+            && sel.order.is_empty()
+            && sel.distinct == secantus_pgplan::Distinct::None
+            && sel.windows.is_empty()
+            && !sel.with_ties
+            && sel.lock.is_none()
+            && sel.lock_clauses.is_empty();
+        let mut deferred_seq: Option<(String, i64)> = None;
         // A generated source stands in for the table. Everything after
         // this point -- ORDER BY, OFFSET, LIMIT, the encoder -- works
         // on documents and does not care where they came from, which is
@@ -33300,7 +33312,15 @@ impl PgHandler {
                 (vec![d], Self::sequence_table_def(&sel.table))
             }
             (None, _) => {
-                let raw = self.scan_table(&sel.table, &sel.filter, sel.lock.is_none())?;
+                let raw = if limit_stops_scan {
+                    let (raw, held) = self.deferring_seq_scan(|| {
+                        self.scan_table(&sel.table, &sel.filter, sel.lock.is_none())
+                    });
+                    deferred_seq = held;
+                    raw?
+                } else {
+                    self.scan_table(&sel.table, &sel.filter, sel.lock.is_none())?
+                };
                 let def = self
                     .lookup(&sel.table)
                     .ok_or_else(|| Self::err(&PlanError::UndefinedTable(sel.table.clone())))?;
@@ -33352,6 +33372,16 @@ impl PgHandler {
                 }
             }
             docs = kept;
+        }
+        // The scan stopped at the row that completed OFFSET + LIMIT, in heap
+        // order; a LIMIT 0 never starts it.
+        if let Some((table, total)) = deferred_seq.take() {
+            let needed = usize::try_from(sel.offset.max(0) + sel.limit.unwrap_or(0).max(0))
+                .unwrap_or(usize::MAX);
+            if needed > 0 {
+                let last = docs.get(needed - 1).and_then(crate::heap::ctid_of);
+                self.stat_seq_scan_to(&table, total, last);
+            }
         }
         // The order the windows' last Sort left the rows in: PostgreSQL
         // plans no Sort for an ORDER BY that order already satisfies.
