@@ -1,7 +1,8 @@
 """Batch 59 of the Rust PG server (2026-10-24): every oid drawn from one
 counter, so oids rise in creation order (RP-137) -- a sequence's, a view's,
 a function's, and an index's, a constraint's among them -- and what was
-found building it (RP-234).
+found building it: a primary key could not be dropped (RP-234), and a
+table made in an open block had no system columns (RP-235).
 
 Each scenario runs the same statements against a private, freshly
 initdb'd PostgreSQL 15.19 cluster and this server; the literals are 15.19's
@@ -71,7 +72,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ------------------------------------------- RP-234 dropping the key
     "a primary key can be dropped": (
         "RP-234",
-        True,
+        False,
         [
             "create table rp59_k (a int primary key)",
             "insert into rp59_k values (1)",
@@ -80,6 +81,78 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
             "select a from rp59_k order by a",
             "select count(*) from pg_constraint where conrelid = 'rp59_k'::regclass",
             "drop table rp59_k",
+        ],
+    ),
+    "a foreign key over the key refuses its drop": (
+        "RP-234",
+        False,
+        [
+            "begin",
+            "create table rp59_fp (a int primary key, b int unique)",
+            "create table rp59_fc (x int references rp59_fp, y int references rp59_fp (b))",
+            "savepoint s",
+            "!alter table rp59_fp drop constraint rp59_fp_pkey",
+            "rollback to s",
+            "!alter table rp59_fp drop constraint rp59_fp_b_key",
+            "rollback to s",
+            "~alter table rp59_fp drop constraint rp59_fp_pkey cascade",
+            "select conname from pg_constraint"
+            " where conrelid in ('rp59_fp'::regclass, 'rp59_fc'::regclass) order by 1",
+            "insert into rp59_fc values (5, null)",
+            "select attname, attnotnull from pg_attribute"
+            " where attrelid = 'rp59_fp'::regclass and attnum > 0 order by attnum",
+            "rollback",
+        ],
+    ),
+    "a composite key dropped and its rows kept": (
+        "RP-234",
+        False,
+        [
+            "begin",
+            "create schema rp59_s",
+            "create table rp59_s.t (a int, b int, c text, primary key (a, b))",
+            "create index rp59_sx on rp59_s.t (a, c)",
+            "insert into rp59_s.t values (1, 2, 'x'), (1, 3, 'y')",
+            "alter table rp59_s.t drop constraint t_pkey",
+            "insert into rp59_s.t values (1, 2, 'z')",
+            "select a, b, c from rp59_s.t order by a, b, c",
+            "select a, b, c from rp59_s.t where a = 1 and c = 'z'",
+            "update rp59_s.t set b = 9 where c = 'y'",
+            "select a, b, c from rp59_s.t order by a, b, c",
+            "savepoint s",
+            "!alter table rp59_s.t add primary key (a, b)",
+            "rollback to s",
+            "delete from rp59_s.t where c = 'z'",
+            "alter table rp59_s.t add primary key (a, b)",
+            "select a, b, c from rp59_s.t order by a, b",
+            "rollback",
+        ],
+    ),
+    "a dropped key leaves the rows where they were": (
+        "RP-234",
+        False,
+        [
+            "begin",
+            "create table rp59_w (a int primary key, b int)",
+            "insert into rp59_w select g, g from generate_series(1, 5) g",
+            "delete from rp59_w where a = 2",
+            "alter table rp59_w drop constraint rp59_w_pkey",
+            "select ctid::text, a from rp59_w order by a",
+            "insert into rp59_w values (9, 9)",
+            "select ctid::text, a from rp59_w where a = 9",
+            "rollback",
+        ],
+    ),
+    # ----------------------------------- RP-235 a block's table's system columns
+    "a table made in the block answers its system columns": (
+        "RP-235",
+        False,
+        [
+            "begin",
+            "create table rp59_y (a int)",
+            "insert into rp59_y values (1), (2)",
+            "select ctid::text, cmin::text, xmax::text, a from rp59_y order by a",
+            "rollback",
         ],
     ),
 }
@@ -153,6 +226,79 @@ EXPECTED: dict[str, Any] = {
         [("1",), ("1",)],
         [("0",)],
         "DROP TABLE",
+    ],
+    "a foreign key over the key refuses its drop": [
+        "BEGIN",
+        "CREATE TABLE",
+        "CREATE TABLE",
+        "SAVEPOINT",
+        (
+            "ERR",
+            "2BP01",
+            "cannot drop constraint rp59_fp_pkey on table "
+            "rp59_fp because other objects depend on it",
+            "Use DROP ... CASCADE to drop the dependent objects too.",
+            "constraint rp59_fc_x_fkey on table rp59_fc depends on index rp59_fp_pkey",
+        ),
+        "ROLLBACK",
+        (
+            "ERR",
+            "2BP01",
+            "cannot drop constraint rp59_fp_b_key on table "
+            "rp59_fp because other objects depend on it",
+            "Use DROP ... CASCADE to drop the dependent objects too.",
+            "constraint rp59_fc_y_fkey on table rp59_fc depends on index rp59_fp_b_key",
+        ),
+        "ROLLBACK",
+        ("ALTER TABLE", ["drop cascades to constraint rp59_fc_x_fkey on table rp59_fc"]),
+        [("rp59_fc_y_fkey",), ("rp59_fp_b_key",)],
+        "INSERT 0 1",
+        [("a", "True"), ("b", "False")],
+        "ROLLBACK",
+    ],
+    "a composite key dropped and its rows kept": [
+        "BEGIN",
+        "CREATE SCHEMA",
+        "CREATE TABLE",
+        "CREATE INDEX",
+        "INSERT 0 2",
+        "ALTER TABLE",
+        "INSERT 0 1",
+        [("1", "2", "x"), ("1", "2", "z"), ("1", "3", "y")],
+        [("1", "2", "z")],
+        "UPDATE 1",
+        [("1", "2", "x"), ("1", "2", "z"), ("1", "9", "y")],
+        "SAVEPOINT",
+        (
+            "ERR",
+            "23505",
+            'could not create unique index "t_pkey"',
+            None,
+            "Key (a, b)=(1, 2) is duplicated.",
+        ),
+        "ROLLBACK",
+        "DELETE 1",
+        "ALTER TABLE",
+        [("1", "2", "x"), ("1", "9", "y")],
+        "ROLLBACK",
+    ],
+    "a dropped key leaves the rows where they were": [
+        "BEGIN",
+        "CREATE TABLE",
+        "INSERT 0 5",
+        "DELETE 1",
+        "ALTER TABLE",
+        [("(0,1)", "1"), ("(0,3)", "3"), ("(0,4)", "4"), ("(0,5)", "5")],
+        "INSERT 0 1",
+        [("(0,6)", "9")],
+        "ROLLBACK",
+    ],
+    "a table made in the block answers its system columns": [
+        "BEGIN",
+        "CREATE TABLE",
+        "INSERT 0 2",
+        [("(0,1)", "1", "0", "1"), ("(0,2)", "1", "0", "2")],
+        "ROLLBACK",
     ],
 }
 

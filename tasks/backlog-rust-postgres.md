@@ -757,19 +757,11 @@ fixed in the same batch; their tests there are regression tests.
 
 ## Found by batch 59 (2026-10-24)
 
-Found while drawing every oid from one counter (RP-137). The gap test is a
-scenario in `tests/backlog/test_rp_batch59.py`, measured on a private 15.19
-cluster.
-
-- [ ] **A primary key cannot be dropped.** `alter table t drop constraint
-      t_pkey` answers 42704 `constraint "t_pkey" of relation "t" does not
-      exist`; PostgreSQL 15.19 drops it, the key's values may then repeat,
-      and `pg_constraint` holds nothing for the table. The key is storage's
-      `_id`, so dropping it re-keys every row as a table without a key is
-      keyed (a rewrite, as `ADD PRIMARY KEY` is), and the constraint's
-      name, its index and `pk_oid` go with it.
-      Backlog-ID: RP-234
-      Verify: tests/backlog/test_rp_batch59.py::test_scenario[a primary key can be dropped]
+Found while drawing every oid from one counter (RP-137), and fixed in the
+same batch; their tests in `tests/backlog/test_rp_batch59.py` are
+regression tests. RP-234: a primary key could not be dropped (42704).
+RP-235: a table made in an open block had no system columns (`ctid`,
+`xmin` ... were 42703 until the block committed).
 
 ## Found by batch 58 (2026-10-24)
 

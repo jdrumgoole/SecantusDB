@@ -29,3 +29,20 @@ PostgreSQL's are, so oids rise in the order objects are made.
   while the block's transaction was busy. That lookup cached the miss for
   the whole server, so a following `ALTER TABLE s OWNER TO` answered 42P01.
   Pinned by tests/backlog/test_rp_batch59.py::test_scenario[a sequence read in the block it was made in stays a relation].
+- A primary key can be dropped (`ALTER TABLE t DROP CONSTRAINT t_pkey`),
+  as on PostgreSQL 15.19. Before, it answered 42704.
+  - **The rows.** Each row's key values go back to fields of their own and
+    the rows keep their ctids. The columns keep NOT NULL, and the key's
+    values may repeat afterwards.
+  - **Foreign keys.** One that references the key refuses the drop with
+    PostgreSQL's 2BP01 and DETAIL. With CASCADE it goes too, with
+    PostgreSQL's notice. Dropping a UNIQUE constraint a foreign key
+    references now does the same.
+
+  Fixes RP-234 (tests/backlog/test_rp_batch59.py::test_scenario[a primary key can be dropped],
+  tests/backlog/test_rp_batch59.py::test_scenario[a foreign key over the key refuses its drop],
+  tests/backlog/test_rp_batch59.py::test_scenario[a composite key dropped and its rows kept],
+  tests/backlog/test_rp_batch59.py::test_scenario[a dropped key leaves the rows where they were]).
+- A table made in an open block answers its system columns (`ctid`, `xmin`,
+  `cmin`, `xmax`, `cmax`). Before, they were 42703 until the block
+  committed. Fixes RP-235 (tests/backlog/test_rp_batch59.py::test_scenario[a table made in the block answers its system columns]).

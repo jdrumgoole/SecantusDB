@@ -623,6 +623,7 @@ impl PgHandler {
                             AlterTableAction::DropConstraint {
                                 name: k.name.clone(),
                                 if_exists: true,
+                                cascade: false,
                             },
                         ),
                     ));

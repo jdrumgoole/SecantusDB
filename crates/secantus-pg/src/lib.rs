@@ -4711,11 +4711,10 @@ impl PgHandler {
     /// the bare name (`pg_type.typname`), `defined` false while it is a shell,
     /// `input` / `output` the I/O function names once defined. Rust-server
     /// only: the Python server has no base-type support and does not read
-    /// this collection. Oids in their own band; `typarray` derived as
+    /// this collection. Oids from the one counter (RP-137); `typarray` derived as
     /// `oid + 100_000` like every other user type, and 0 while a shell
     /// (PostgreSQL mints the array type only at completion).
     const BASE_TYPE_COLLECTION: &'static str = "__sql_base_types__";
-    const BASE_TYPE_OID_BASE: i64 = 71_000;
     /// Installed extensions: `{_id: name, version, relocatable}` per
     /// `CREATE EXTENSION`. The two this server can install (`hstore`,
     /// `postgis`) each bring one base type, recorded in
@@ -4790,8 +4789,9 @@ impl PgHandler {
     const USER_TYPE_ARRAY_OID_OFFSET: i64 = secantus_pgplan::USER_TYPE_ARRAY_OID_OFFSET;
     /// A custom range's auto-created multirange type gets `range_oid + this`,
     /// and the multirange's own array type `multirange_oid + array offset`.
-    /// Range oids live in the 69_000 band, their arrays at +100_000, so
-    /// +200_000 (multirange) and +300_000 (multirange array) never collide.
+    /// User oids are counted from 67_000 (RP-137), their arrays at
+    /// +100_000, so +200_000 (multirange) and +300_000 (multirange array)
+    /// collide with nothing until the counter passes 167_000.
     const MULTIRANGE_TYPE_OID_OFFSET: i64 = 200_000;
     /// Where a range's constructor functions' oids start (five a range).
     const RANGE_CONSTRUCTOR_OID_BASE: i64 = 900_000_000;
@@ -11423,7 +11423,7 @@ impl PgHandler {
             .collect()
     }
 
-    /// Mint the next base-type oid -- the range minting rule, base 71000.
+    /// Mint the next base-type oid, from the one counter (RP-137).
     fn mint_base_type_oid(&self) -> PgWireResult<i64> {
         self.mint_global_oids(1)
     }
@@ -26277,10 +26277,15 @@ impl PgHandler {
                     ))));
                 }
             }
-            A::DropConstraint { name, if_exists } => {
+            A::DropConstraint {
+                name,
+                if_exists,
+                cascade,
+            } => {
                 let known = def.check_constraints.iter().any(|c| c.name == *name)
                     || def.unique_constraints.iter().any(|u| u.name == *name)
-                    || def.foreign_keys.iter().any(|f| f.name == *name);
+                    || def.foreign_keys.iter().any(|f| f.name == *name)
+                    || secantus_pgplan::is_pk_constraint(def, name);
                 if !known {
                     if *if_exists {
                         return Ok(None);
@@ -26290,6 +26295,34 @@ impl PgHandler {
                         "42704".into(), // undefined_object
                         format!("constraint \"{name}\" of relation \"{table}\" does not exist"),
                     ))));
+                }
+                // A foreign key over the key depends on its index
+                // (`reportDependentObjects`, 15.19).
+                let dependents = self.key_dependents(table, def, name)?;
+                if !dependents.is_empty() && !*cascade {
+                    let shown = secantus_pgplan::schemas::visible_name(table);
+                    let mut info = ErrorInfo::new(
+                        "ERROR".into(),
+                        "2BP01".into(),
+                        format!(
+                            "cannot drop constraint {name} on table {shown} because other objects depend on it"
+                        ),
+                    );
+                    info.detail = Some(
+                        dependents
+                            .iter()
+                            .map(|(fk, t)| {
+                                format!(
+                                    "constraint {fk} on table {} depends on index {name}",
+                                    secantus_pgplan::schemas::visible_name(t)
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    );
+                    info.hint =
+                        Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
+                    return Err(PgWireError::UserError(Box::new(info)));
                 }
             }
         }
@@ -26615,11 +26648,44 @@ impl PgHandler {
             // catalog-only: no row changes meaning.
             // A UNIQUE constraint's index goes with it (the other kinds have
             // none; a missing index is nothing to drop).
-            A::DropConstraint { name, .. } => {
+            A::DropConstraint { name, cascade, .. } => {
+                // The foreign keys over the key go first, each from its own
+                // table (this table's own went with the catalog change).
+                if *cascade {
+                    let dependents = self.key_dependents(table, before, name)?;
+                    self.cascade_notice(
+                        &dependents
+                            .iter()
+                            .map(|(fk, t)| {
+                                format!(
+                                    "constraint {fk} on table {}",
+                                    secantus_pgplan::schemas::visible_name(t)
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    for (fk, t) in dependents.into_iter().filter(|(_, t)| t != table) {
+                        self.execute_inner(
+                            Statement::AlterTable {
+                                table: t,
+                                missing_ok: false,
+                                actions: vec![secantus_pgplan::AlterTableAction::DropConstraint {
+                                    name: fk,
+                                    if_exists: true,
+                                    cascade: false,
+                                }],
+                            },
+                            0,
+                        )?;
+                    }
+                }
                 if before.unique_constraints.iter().any(|u| u.name == *name) {
                     self.storage
                         .drop_index(self.db(), table, name)
                         .map_err(|e| Self::storage_err("could not drop the index", e))?;
+                }
+                if secantus_pgplan::is_pk_constraint(before, name) {
+                    self.drop_primary_key(table, def, before)?;
                 }
                 Ok(())
             }
@@ -26895,6 +26961,114 @@ impl PgHandler {
                 )
             })
             .collect();
+        for ix in self
+            .storage
+            .list_indexes(self.db(), table)
+            .unwrap_or_default()
+        {
+            let Ok(ix_name) = ix.get_str("name") else {
+                continue;
+            };
+            if ix_name == "_id_" {
+                continue;
+            }
+            let Ok(key) = ix.get_document("key") else {
+                continue;
+            };
+            if !key.keys().any(|k| moved.iter().any(|(from, _)| from == k)) {
+                continue;
+            }
+            let rename = |k: &str| -> String {
+                moved
+                    .iter()
+                    .find(|(from, _)| from == k)
+                    .map_or_else(|| k.to_string(), |(_, to)| to.clone())
+            };
+            let mut new_key = Document::new();
+            for (k, v) in key {
+                new_key.insert(rename(k), v.clone());
+            }
+            let mut options = Document::new();
+            for (k, v) in &ix {
+                if matches!(k.as_str(), "name" | "key" | "v" | "ns") {
+                    continue;
+                }
+                options.insert(k.clone(), rename_filter_fields(v, &rename));
+            }
+            let ix_name = ix_name.to_string();
+            self.storage
+                .drop_index(self.db(), table, &ix_name)
+                .map_err(|e| Self::storage_err("could not rebuild an index", e))?;
+            self.storage
+                .create_index(self.db(), table, &ix_name, &new_key, &options)
+                .map_err(|e| Self::storage_err("could not rebuild an index", e))?;
+        }
+        Ok(())
+    }
+
+    /// The foreign keys, `(name, table)`, that reference `def`'s PRIMARY KEY
+    /// or UNIQUE constraint `name` -- by its column set -- other than the
+    /// constraint itself.
+    fn key_dependents(
+        &self,
+        table: &str,
+        def: &TableDef,
+        name: &str,
+    ) -> PgWireResult<Vec<(String, String)>> {
+        let Some(cols) = secantus_pgplan::keyed_constraint_columns(def, name) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for t in self.all_table_defs()? {
+            let t = if t.name == table { def.clone() } else { t };
+            for fk in &t.foreign_keys {
+                if fk.ref_table == table && secantus_pgplan::same_columns(&fk.ref_columns, &cols) {
+                    out.push((fk.name.clone(), t.name.clone()));
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// `DROP CONSTRAINT t_pkey`: each row's key values go back to fields of
+    /// their own and the row takes a new `_id`, as a table without a key
+    /// keeps its rows (RP-234). Its ctid is the row's own, so the heap does
+    /// not move, as PostgreSQL's drop rewrites nothing.
+    fn drop_primary_key(&self, table: &str, def: &TableDef, before: &TableDef) -> PgWireResult<()> {
+        let keyed: Vec<(String, String)> = secantus_pgplan::ordered_pk_columns(before)
+            .iter()
+            .map(|c| {
+                (
+                    c.field(),
+                    def.field_of(&c.name).unwrap_or_else(|| c.name.clone()),
+                )
+            })
+            .collect();
+        let docs = self.table_docs(table)?;
+        let mut out = Vec::with_capacity(docs.len());
+        for mut d in docs {
+            // A composite key's columns come back as `_id.<column>` fields
+            // (`table_docs` flattens the key), a single key's as `_id`.
+            let mut values = Vec::with_capacity(keyed.len());
+            for (from, _) in &keyed {
+                let nested = from
+                    .strip_prefix("_id.")
+                    .and_then(|sub| match d.get("_id") {
+                        Some(Bson::Document(k)) => k.get(sub).cloned(),
+                        _ => None,
+                    });
+                values.push(d.remove(from).or(nested).unwrap_or(Bson::Null));
+            }
+            d.remove("_id");
+            for ((_, to), v) in keyed.iter().zip(values) {
+                d.insert(to.clone(), v);
+            }
+            out.push(encode_doc(&d).map_err(|e| Self::storage_err("could not encode a row", e))?);
+        }
+        self.replace_table_rows(table, out)?;
+        // Indexes over a key column read it at its own field now.
+        let moved: Vec<(String, String)> = keyed;
         for ix in self
             .storage
             .list_indexes(self.db(), table)
@@ -28054,6 +28228,14 @@ impl PgHandler {
         if !self.transaction_handle_open() {
             return;
         }
+        // As a catalog read of it would: a table made in the block answers
+        // `ctid`, `xmin` and the rest too (RP-235).
+        let def = def.map(|mut d| {
+            if d.system_columns.is_empty() {
+                d.system_columns = secantus_pgcatalog::system_columns();
+            }
+            d
+        });
         self.pending.tables().insert(name.to_string(), def);
     }
 
