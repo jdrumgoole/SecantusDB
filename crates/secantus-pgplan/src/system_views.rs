@@ -85,31 +85,6 @@ const REFUSED: &[(&str, &str)] = &[
     ("pg_stat_wal", "this server writes no PostgreSQL WAL"),
     ("pg_stat_slru", "this server has no SLRU caches"),
     ("pg_stat_archiver", "this server has no WAL archiver"),
-    // No command reports its progress.
-    (
-        "pg_stat_progress_analyze",
-        "commands do not report their progress on this server",
-    ),
-    (
-        "pg_stat_progress_basebackup",
-        "commands do not report their progress on this server",
-    ),
-    (
-        "pg_stat_progress_cluster",
-        "commands do not report their progress on this server",
-    ),
-    (
-        "pg_stat_progress_copy",
-        "commands do not report their progress on this server",
-    ),
-    (
-        "pg_stat_progress_create_index",
-        "commands do not report their progress on this server",
-    ),
-    (
-        "pg_stat_progress_vacuum",
-        "commands do not report their progress on this server",
-    ),
 ];
 
 /// 0A000 for a system relation refused by name.

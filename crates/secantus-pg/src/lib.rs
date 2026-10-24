@@ -92,6 +92,7 @@ mod plpgsql_fn;
 mod plpgsql_portals;
 mod portal_stream;
 mod procedures;
+mod progress;
 mod renames;
 mod row_waits;
 mod rules;
@@ -4287,8 +4288,6 @@ enum TypeKind {
 
 struct CopyInState {
     format: secantus_pgplan::CopyFormat,
-    /// `HEADER`: the first line is column names, skipped.
-    header: bool,
     /// DELIMITER, NULL, QUOTE, ESCAPE and ENCODING (RP-073).
     options: secantus_pgplan::copy_opts::CopyOptions,
     /// FORCE_NOT_NULL / FORCE_NULL, per target column.
@@ -4299,7 +4298,22 @@ struct CopyInState {
     fields: Vec<String>,
     /// The declared PostgreSQL type of each target column, for parsing.
     types: Vec<String>,
+    /// The bytes received that do not yet make a whole row.
     buffer: Vec<u8>,
+    /// `HEADER`: the first line is column names, skipped -- still to come.
+    header_left: bool,
+    /// A binary COPY's header, read from its first chunk.
+    binary_header: Option<Vec<u8>>,
+    /// A `\.` line or a binary trailer ended the data: what follows is
+    /// ignored.
+    ended: bool,
+    /// The rows loaded so far.
+    loaded: usize,
+    /// Outside a block, the COPY's own transaction, held from its first
+    /// rows to CopyDone.
+    handle: Option<UserTransactionHandle>,
+    /// `pg_stat_progress_copy`'s slot (RP-100).
+    progress: progress::Progress,
 }
 
 impl PgHandler {
@@ -37275,6 +37289,16 @@ impl PgHandler {
             }
             Statement::CreateIndex(ci) => {
                 let table = ci.table.clone();
+                // `pg_stat_progress_create_index`: CREATE INDEX (param1 1),
+                // building the index (phase 2).
+                let slot = progress::Running::start(
+                    self.progress(),
+                    progress::Command::CreateIndex,
+                    self.stats().db,
+                    self.relation_oid(&table).unwrap_or(0),
+                );
+                slot.set(0, 1);
+                slot.set(9, 2);
                 let out = self.create_index(ci)?;
                 self.record_relstats(&table, false)?;
                 // The build read the heap: a sequential scan (RP-070).
@@ -37670,7 +37694,6 @@ impl PgHandler {
                 self.check_copy_freeze(&cf)?;
                 *self.copy_in.lock().unwrap_or_else(|e| e.into_inner()) = Some(CopyInState {
                     format: cf.format,
-                    header: cf.header,
                     options: cf.options.clone(),
                     force_not_null: flags(&cf.options.force_not_null),
                     force_null: flags(&cf.options.force_null),
@@ -37678,6 +37701,23 @@ impl PgHandler {
                     fields: cols.iter().map(|c| c.field()).collect(),
                     types: cols.iter().map(|c| c.pg_type.clone()).collect(),
                     buffer: Vec::new(),
+                    header_left: cf.header,
+                    binary_header: None,
+                    ended: false,
+                    loaded: 0,
+                    handle: None,
+                    progress: {
+                        // COPY FROM (param5 1), from the client (PIPE, param6 3).
+                        let slot = self.progress();
+                        slot.start(
+                            progress::Command::Copy,
+                            self.stats().db,
+                            self.relation_oid(&cf.table).unwrap_or(0),
+                        );
+                        slot.set(4, 1);
+                        slot.set(5, 3);
+                        slot
+                    },
                 });
                 // The format code must match what the client will send: 1 for
                 // binary, 0 for the textual formats.
@@ -38693,12 +38733,34 @@ impl PgHandler {
                         // VACUUM FULL rewrites the table, which is not
                         // modelled; `VACUUM (ANALYZE)` vacuums, then
                         // analyses.
+                        let rel = self.relation_oid(t).unwrap_or(0);
+                        let db = self.stats().db;
                         if full {
+                            // `pg_stat_progress_cluster`: VACUUM FULL
+                            // (param1 2), writing the new heap (phase 4).
+                            let slot = progress::Running::start(
+                                self.progress(),
+                                progress::Command::Cluster,
+                                db,
+                                rel,
+                            );
+                            slot.set(0, 2);
+                            slot.set(1, 4);
                             self.vacuum_full(t)?;
                             self.record_relstats(t, true)?;
                             continue;
                         }
                         if command == "VACUUM" {
+                            // `pg_stat_progress_vacuum`: scanning the heap
+                            // (phase 1), its blocks the total.
+                            let slot = progress::Running::start(
+                                self.progress(),
+                                progress::Command::Vacuum,
+                                db,
+                                rel,
+                            );
+                            slot.set(0, 1);
+                            slot.set(1, i64::from(self.heap_blocks(t).unwrap_or(0)));
                             // The heap's dead tuples removed (RP-193). A
                             // partitioned table is its leaves: they are
                             // counted, it is not (RP-196).
@@ -38717,6 +38779,16 @@ impl PgHandler {
                             }
                         }
                         if analyze {
+                            // `pg_stat_progress_analyze`: acquiring sample
+                            // rows (phase 1).
+                            let slot = progress::Running::start(
+                                self.progress(),
+                                progress::Command::Analyze,
+                                db,
+                                rel,
+                            );
+                            slot.set(0, 1);
+                            slot.set(1, i64::from(self.heap_blocks(t).unwrap_or(0)));
                             self.record_analyze(t, columns)?;
                             self.heap_invalidate(t)?;
                             self.stat_maintained(t, true)?;
@@ -38753,6 +38825,16 @@ impl PgHandler {
                     }
                 };
                 for (t, i) in tables {
+                    // `pg_stat_progress_cluster`: CLUSTER (param1 1),
+                    // scanning the heap through its index (phase 2).
+                    let slot = progress::Running::start(
+                        self.progress(),
+                        progress::Command::Cluster,
+                        self.stats().db,
+                        self.relation_oid(&t).unwrap_or(0),
+                    );
+                    slot.set(0, 1);
+                    slot.set(1, 2);
                     self.cluster_table(&t, &i)?;
                 }
                 Ok(vec![Response::Execution(Tag::new("CLUSTER"))])
@@ -47544,16 +47626,32 @@ impl CopyHandler for PgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let mut guard = self.copy_in.lock().unwrap_or_else(|e| e.into_inner());
-        // A chunk may split a row anywhere, so buffer and parse only at Done.
-        match guard.as_mut() {
-            Some(state) => state.buffer.extend_from_slice(&data.data),
-            None => {
-                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".into(),
-                    "57014".into(),
-                    "COPY data arrived with no COPY in progress".into(),
-                ))))
-            }
+        let Some(state) = guard.as_mut() else {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "57014".into(),
+                "COPY data arrived with no COPY in progress".into(),
+            ))));
+        };
+        // The rows load as their data arrives, as PostgreSQL's `CopyFrom`
+        // reads them (RP-100): each chunk's whole rows now, a row split
+        // across chunks when its end comes.
+        state.progress.add(0, data.data.len() as i64);
+        if state.ended {
+            return Ok(());
+        }
+        state.buffer.extend_from_slice(&data.data);
+        let cut = Self::copy_cut(state);
+        if cut == 0 {
+            return Ok(());
+        }
+        let chunk: Vec<u8> = state.buffer.drain(..cut).collect();
+        if let Err(e) = self.copy_chunk(state, &chunk) {
+            let state = guard.take();
+            drop(guard);
+            self.copy_abort(state);
+            self.note_failure();
+            return Err(e);
         }
         Ok(())
     }
@@ -47564,7 +47662,7 @@ impl CopyHandler for PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let state = match self
+        let mut state = match self
             .copy_in
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -47573,16 +47671,80 @@ impl CopyHandler for PgHandler {
             Some(s) => s,
             None => return Ok(()),
         };
-        // The rows are parsed by type here, on whichever worker this
-        // message landed: the session's user types first.
-        self.install_user_types();
+        // What is left: the last row, which needs no newline.
+        let rest = if state.ended {
+            Vec::new()
+        } else {
+            std::mem::take(&mut state.buffer)
+        };
+        let finished =
+            self.copy_chunk(&mut state, &rest)
+                .and_then(|()| match state.handle.take() {
+                    Some(mut handle) => self
+                        .storage
+                        .commit_user_transaction(&mut handle)
+                        .map_err(|e| Self::storage_err("could not commit a transaction", e)),
+                    None => Ok(()),
+                });
+        if let Err(e) = finished {
+            self.copy_abort(Some(state));
+            self.note_failure();
+            return Err(e);
+        }
+        state.progress.end();
+        let written = state.loaded;
 
+        // pgwire sends ReadyForQuery after this, but NOT CommandComplete --
+        // without it the client waits for a result that never comes and
+        // psycopg fails with "not enough values to unpack".
+        client
+            .feed(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+                format!("COPY {written}"),
+            )))
+            .await?;
+        client.flush().await.map_err(PgWireError::from)?;
+        Ok(())
+    }
+
+    async fn on_copy_fail<C>(&self, _c: &mut C, fail: CopyFail) -> PgWireError
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        // The client abandoned the COPY: the rows it loaded are rolled back
+        // with its transaction.
+        let state = self
+            .copy_in
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        self.copy_abort(state);
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            "57014".into(), // query_canceled
+            format!("COPY from stdin failed: {}", fail.message),
+        )))
+    }
+}
+
+/// COPY FROM, a chunk at a time (RP-100).
+impl PgHandler {
+    /// A COPY FROM chunk's rows, by its format: rows of optional values,
+    /// `None` being that format's NULL. `header`: the chunk opens with the
+    /// HEADER line.
+    fn copy_parse(
+        &self,
+        state: &CopyInState,
+        bytes: &[u8],
+        header: bool,
+    ) -> PgWireResult<Vec<Vec<Option<Bson>>>> {
         use secantus_pgplan::CopyFormat;
         // Every format is parsed into the same shape -- rows of optional
         // values, where `None` is that format's NULL -- so the insert below is
         // written once.
         let rows: Vec<Vec<Option<Bson>>> = match state.format {
-            CopyFormat::Binary => self.parse_binary_copy(&state.buffer, &state.types)?,
+            CopyFormat::Binary => self.parse_binary_copy(bytes, &state.types)?,
             format => {
                 // COPY's text arrives in the client encoding, and PostgreSQL
                 // converts it as it does a query's (22021 / 22P05 by name).
@@ -47592,13 +47754,12 @@ impl CopyHandler for PgHandler {
                     .as_deref()
                     .map_or_else(|| self.client_encoding(), encoding::client_encoding);
                 let text = if cenc.transcodes() {
-                    encoding::decode(cenc, &state.buffer)
-                        .map_err(|e| encoding::undecodable(cenc, e))?
+                    encoding::decode(cenc, bytes).map_err(|e| encoding::undecodable(cenc, e))?
                 } else {
-                    String::from_utf8(state.buffer.clone()).map_err(|e| {
+                    String::from_utf8(bytes.to_vec()).map_err(|e| {
                         // `report_invalid_encoding`: the bad character's
                         // bytes, as many as its lead byte says it has.
-                        let bad = &state.buffer[e.utf8_error().valid_up_to()..];
+                        let bad = &bytes[e.utf8_error().valid_up_to()..];
                         let len = match bad.first() {
                             Some(0xc0..=0xdf) => 2,
                             Some(0xe0..=0xef) => 3,
@@ -47624,7 +47785,8 @@ impl CopyHandler for PgHandler {
                     &state.force_not_null,
                     &state.force_null,
                 );
-                if state.header && !parsed.is_empty() {
+                // The HEADER line is the first chunk's first row.
+                if header && !parsed.is_empty() {
                     parsed.remove(0);
                 }
                 let tz = self.session_timezone();
@@ -47646,7 +47808,16 @@ impl CopyHandler for PgHandler {
                 out
             }
         };
+        Ok(rows)
+    }
 
+    /// Load a chunk's parsed rows into the COPY's table, inside the open
+    /// block or the COPY's own transaction. Returns how many it wrote.
+    fn copy_load(
+        &self,
+        state: &mut CopyInState,
+        rows: Vec<Vec<Option<Bson>>>,
+    ) -> PgWireResult<usize> {
         let mut parsed_rows = Vec::with_capacity(rows.len());
         for raw in rows {
             if raw.len() != state.fields.len() {
@@ -47703,53 +47874,171 @@ impl CopyHandler for PgHandler {
                     .map_err(|e| Self::storage_err("could not insert COPY rows", e))
             };
             let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
-            // Outside a block the COPY is its own transaction: a row refused
-            // midway must not leave the rows before it loaded.
+            // Outside a block the COPY is its own transaction, held across
+            // its CopyData messages and committed at CopyDone: a row refused
+            // midway leaves none of the rows before it loaded.
             let (_, errors) = match guard.as_mut() {
                 Some(handle) => self
                     .storage
                     .with_user_transaction(self.with_isolation(handle)?, load)
-                    .map_err(|e| Self::storage_err("transaction failed", e))?,
-                None => self.atomically(|| {
-                    let (n, errors) = load()?;
-                    if let Some(first) = errors.first() {
-                        return Err(Self::write_error(&state.table, &def, first));
+                    .map_err(|e| Self::storage_err("transaction failed", e))??,
+                None => {
+                    if state.handle.is_none() {
+                        state.handle = Some(self.open_transaction_handle()?);
                     }
-                    Ok((n, errors))
-                }),
-            }?;
+                    let handle = state.handle.as_mut().expect("opened");
+                    self.storage
+                        .with_user_transaction(handle, load)
+                        .map_err(|e| Self::storage_err("transaction failed", e))??
+                }
+            };
             drop(guard);
             if let Some(first) = errors.first() {
                 return Err(Self::write_error(&state.table, &def, first));
             }
         }
+        Ok(written)
+    }
 
-        // pgwire sends ReadyForQuery after this, but NOT CommandComplete --
-        // without it the client waits for a result that never comes and
-        // psycopg fails with "not enough values to unpack".
-        client
-            .feed(PgWireBackendMessage::CommandComplete(CommandComplete::new(
-                format!("COPY {written}"),
-            )))
-            .await?;
-        client.flush().await.map_err(PgWireError::from)?;
+    /// The bytes at the front of the COPY's buffer that hold whole rows:
+    /// up to the last complete line (outside a CSV quote), or the last
+    /// whole binary tuple after the header. A `\.` line, or a binary
+    /// trailer, ends the data: the cut stops after it and `ended` is set.
+    fn copy_cut(state: &mut CopyInState) -> usize {
+        let buf = &state.buffer;
+        if state.format == secantus_pgplan::CopyFormat::Binary {
+            let be = |i: usize, n: usize| -> Option<i64> {
+                let s = buf.get(i..i + n)?;
+                Some(if n == 2 {
+                    i64::from(i16::from_be_bytes([s[0], s[1]]))
+                } else {
+                    i64::from(i32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+                })
+            };
+            let mut pos = 0;
+            if state.binary_header.is_none() {
+                let Some(ext) = be(15, 4) else {
+                    return 0;
+                };
+                pos = 19 + usize::try_from(ext.max(0)).unwrap_or(0);
+                if buf.len() < pos {
+                    return 0;
+                }
+            }
+            let mut cut = pos;
+            while let Some(count) = be(pos, 2) {
+                if count == -1 {
+                    state.ended = true;
+                    cut = pos + 2;
+                    break;
+                }
+                let mut p = pos + 2;
+                let mut whole = true;
+                for _ in 0..count.max(0) {
+                    match be(p, 4) {
+                        Some(len) => {
+                            p += 4 + usize::try_from(len.max(0)).unwrap_or(0);
+                            if p > buf.len() {
+                                whole = false;
+                                break;
+                            }
+                        }
+                        None => {
+                            whole = false;
+                            break;
+                        }
+                    }
+                }
+                if !whole {
+                    break;
+                }
+                pos = p;
+                cut = p;
+            }
+            return cut;
+        }
+        let csv = state.format == secantus_pgplan::CopyFormat::Csv;
+        // QUOTE and ESCAPE are one single-byte character each (PostgreSQL
+        // refuses any other).
+        let quote = u8::try_from(state.options.quote).unwrap_or(b'"');
+        let escape = u8::try_from(state.options.escape).unwrap_or(quote);
+        let (mut in_quotes, mut line_start, mut cut) = (false, 0, 0);
+        let mut i = 0;
+        while i < buf.len() {
+            let b = buf[i];
+            if csv && in_quotes && b == escape && escape != quote && buf.get(i + 1) == Some(&quote)
+            {
+                i += 2;
+                continue;
+            }
+            if csv && b == quote {
+                in_quotes = !in_quotes;
+            } else if b == b'\n' && !in_quotes {
+                let line = &buf[line_start..i];
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                cut = i + 1;
+                line_start = i + 1;
+                if line == b"\\." {
+                    state.ended = true;
+                    break;
+                }
+            }
+            i += 1;
+        }
+        cut
+    }
+
+    /// Parse and load the chunk `bytes` of a COPY FROM, and report it in the
+    /// COPY's progress slot.
+    fn copy_chunk(&self, state: &mut CopyInState, bytes: &[u8]) -> PgWireResult<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.install_user_types();
+        let rows = if state.format == secantus_pgplan::CopyFormat::Binary {
+            let header = match &state.binary_header {
+                Some(h) => h.clone(),
+                None => {
+                    let ext = bytes
+                        .get(15..19)
+                        .map_or(0, |s| i32::from_be_bytes([s[0], s[1], s[2], s[3]]));
+                    let len = (19 + usize::try_from(ext.max(0)).unwrap_or(0)).min(bytes.len());
+                    let h = bytes[..len].to_vec();
+                    state.binary_header = Some(h.clone());
+                    let mut all = h;
+                    all.extend_from_slice(&bytes[len..]);
+                    let rows = self.copy_parse(state, &all, false)?;
+                    let n = self.copy_load(state, rows)?;
+                    state.loaded += n;
+                    state.progress.set(2, state.loaded as i64);
+                    return Ok(());
+                }
+            };
+            let mut all = header;
+            all.extend_from_slice(bytes);
+            self.copy_parse(state, &all, false)?
+        } else {
+            let header = std::mem::take(&mut state.header_left);
+            self.copy_parse(state, bytes, header)?
+        };
+        let n = self.copy_load(state, rows)?;
+        state.loaded += n;
+        state.progress.set(2, state.loaded as i64);
         Ok(())
     }
 
-    async fn on_copy_fail<C>(&self, _c: &mut C, fail: CopyFail) -> PgWireError
-    where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
-        C::Error: std::fmt::Debug,
-        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
-    {
-        // The client abandoned the COPY: drop everything buffered rather than
-        // insert a partial load.
-        *self.copy_in.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        PgWireError::UserError(Box::new(ErrorInfo::new(
-            "ERROR".into(),
-            "57014".into(), // query_canceled
-            format!("COPY from stdin failed: {}", fail.message),
-        )))
+    /// A COPY FROM ended without its rows: its own transaction rolled back,
+    /// its progress slot cleared.
+    fn copy_abort(&self, state: Option<CopyInState>) {
+        let Some(mut state) = state else {
+            return;
+        };
+        state.progress.end();
+        if let Some(mut handle) = state.handle.take() {
+            if let Err(e) = self.storage.rollback_user_transaction(&mut handle) {
+                eprintln!("secantusd-pg: rolling back a failed COPY: {e}");
+            }
+        }
     }
 }
 

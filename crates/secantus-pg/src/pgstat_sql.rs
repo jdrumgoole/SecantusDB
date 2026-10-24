@@ -23,6 +23,14 @@ fn time(t: Option<std::time::SystemTime>) -> Bson {
 }
 
 impl PgHandler {
+    /// This session's progress slot (RP-100).
+    pub(crate) fn progress(&self) -> crate::progress::Progress {
+        crate::progress::Progress {
+            store: std::sync::Arc::as_ptr(&self.storage) as usize,
+            pid: self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
     /// This session's handle on its store's statistics.
     pub(crate) fn stats(&self) -> Stats {
         let db = *self.stat_db_oid.get_or_init(|| {
@@ -396,6 +404,40 @@ impl PgHandler {
                 return Ok(VOID);
             }
             "pg_stat_get_snapshot_timestamp" => return Ok(time(s.snapshot_timestamp())),
+            // A record per backend running the command (RP-100).
+            "pg_stat_get_progress_info" => {
+                let cmd = match args.first() {
+                    Some(Bson::String(c)) => c.clone(),
+                    _ => return Ok(Bson::Array(Vec::new())),
+                };
+                let rows = crate::progress::info(s.store, &cmd)
+                    .map_err(|m| Self::user_error("22023", m))?;
+                let names: Vec<String> = ["pid", "datid", "relid"]
+                    .iter()
+                    .map(|n| (*n).to_string())
+                    .chain((1..=20).map(|i| format!("param{i}")))
+                    .collect();
+                let types: Vec<&str> = ["int4", "oid", "oid"]
+                    .into_iter()
+                    .chain(std::iter::repeat_n("int8", 20))
+                    .collect();
+                let strings =
+                    |v: Vec<String>| Bson::Array(v.into_iter().map(Bson::String).collect());
+                return Ok(Bson::Array(
+                    rows.into_iter()
+                        .map(|fields| {
+                            let mut d = bson::Document::new();
+                            d.insert(secantus_pgplan::RECORD_KEY, Bson::Array(fields));
+                            d.insert(
+                                secantus_pgplan::RECORD_TYPES_KEY,
+                                strings(types.iter().map(|t| (*t).to_string()).collect()),
+                            );
+                            d.insert(secantus_pgplan::RECORD_NAMES_KEY, strings(names.clone()));
+                            Bson::Document(d)
+                        })
+                        .collect(),
+                ));
+            }
             "pg_stat_reset" => {
                 s.reset_database();
                 return Ok(VOID);

@@ -564,7 +564,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "progress views": (
         "RP-100",
-        True,
+        False,
         [
             "select count(*) from pg_stat_progress_vacuum",
             "select count(*) from pg_stat_progress_copy",

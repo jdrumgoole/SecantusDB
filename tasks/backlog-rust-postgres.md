@@ -956,20 +956,6 @@ cluster.
         its random sample (as for `pg_statistic`, which is not built either).
       Backlog-ID: RP-099
       Verify: tests/backlog/test_rp_batch50.py::test_scenario[an MCV list's bytes over timestamps], tests/backlog/test_rp_batch50.py::test_scenario[a table past ANALYZE's sample has extended statistics]
-- [ ] **The progress views are refused by name** (0A000):
-      `pg_stat_progress_vacuum`, `_analyze`, `_cluster`, `_copy`,
-      `_create_index`, `_basebackup`. PostgreSQL reports a row per backend
-      running that command, which a COPY or CREATE INDEX here never
-      publishes.
-      **Decided (Joe, 2026-10-22): stream COPY, slots for every command.**
-      COPY FROM parses and inserts rows as CopyData arrives, as PostgreSQL
-      does (it buffers to CopyDone today), so `pg_stat_progress_copy`'s
-      counters move as PostgreSQL's do; every command keeps a per-backend
-      progress slot read through `pg_stat_get_progress_info` and
-      PostgreSQL's own six view definitions; CREATE INDEX reports the
-      phases this server's build has.
-      Backlog-ID: RP-100
-      Verify: tests/backlog/test_rp_batch26.py::test_scenario[progress views]
 - [ ] **An extension's members are not in `pg_depend`.** Every other
       object's dependencies are recorded as PostgreSQL 15.19 records them
       (`crates/secantus-pg/src/depend.rs`), an extension's schema and types

@@ -1013,6 +1013,32 @@ pub(crate) fn executor_record_columns(
             ("object_args", "text[]"),
         ],
         "pg_get_object_address" => &[("classid", "oid"), ("objid", "oid"), ("objsubid", "int4")],
+        // A row per backend running the command (RP-100).
+        "pg_stat_get_progress_info" => &[
+            ("pid", "int4"),
+            ("datid", "oid"),
+            ("relid", "oid"),
+            ("param1", "int8"),
+            ("param2", "int8"),
+            ("param3", "int8"),
+            ("param4", "int8"),
+            ("param5", "int8"),
+            ("param6", "int8"),
+            ("param7", "int8"),
+            ("param8", "int8"),
+            ("param9", "int8"),
+            ("param10", "int8"),
+            ("param11", "int8"),
+            ("param12", "int8"),
+            ("param13", "int8"),
+            ("param14", "int8"),
+            ("param15", "int8"),
+            ("param16", "int8"),
+            ("param17", "int8"),
+            ("param18", "int8"),
+            ("param19", "int8"),
+            ("param20", "int8"),
+        ],
         _ => return None,
     })
 }
@@ -1031,6 +1057,7 @@ fn pgstat_function_type(name: &str) -> &'static str {
         | "pg_stat_reset_single_table_counters"
         | "pg_stat_reset_single_function_counters" => "void",
         "pg_stat_get_db_numbackends" => "int4",
+        "pg_stat_get_progress_info" => "record",
         "pg_stat_get_snapshot_timestamp"
         | "pg_stat_get_db_stat_reset_time"
         | "pg_stat_get_db_checksum_last_failure" => "timestamptz",
@@ -1111,6 +1138,7 @@ pub(crate) const PGSTAT_FUNCTIONS: &[&str] = &[
     "pg_stat_reset",
     "pg_stat_reset_single_table_counters",
     "pg_stat_reset_single_function_counters",
+    "pg_stat_get_progress_info",
 ];
 
 pub(crate) const SEQUENCE_FUNCTIONS: &[&str] = &[

@@ -13345,13 +13345,24 @@ fn srf_rows(
             .map(|x| const_value(x, params))
             .collect::<Result<_>>()?;
         let value = correlated::call_sequence(name, &a)?;
-        let row = record_values(&value)
-            .cloned()
-            .unwrap_or_else(|| vec![Bson::Null; columns.len()]);
+        // A set-returning one answers an array of records, a row each.
+        let rows = match &value {
+            Bson::Array(records) => records
+                .iter()
+                .map(|r| {
+                    record_values(r)
+                        .cloned()
+                        .unwrap_or_else(|| vec![Bson::Null; columns.len()])
+                })
+                .collect(),
+            _ => vec![record_values(&value)
+                .cloned()
+                .unwrap_or_else(|| vec![Bson::Null; columns.len()])],
+        };
         return Ok(Some((
             columns.iter().map(|(n, _)| (*n).to_string()).collect(),
             columns.iter().map(|(_, t)| (*t).to_string()).collect(),
-            vec![row],
+            rows,
         )));
     }
     // A user-defined set-returning function: the executor runs it.
