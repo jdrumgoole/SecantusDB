@@ -4297,6 +4297,41 @@ thread_local! {
     static COPY_INSTALLED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// `limit_printout_length`: a COPY CONTEXT quotes at most 100 bytes of a
+/// line or value, cut at a character, then `...`.
+fn copy_printout(text: &str) -> String {
+    const MAX: usize = 100;
+    if text.len() <= MAX {
+        return text.to_string();
+    }
+    let mut end = MAX;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
+/// `e` with `context` as its outermost CONTEXT line, after any its own
+/// frames (a trigger's PL/pgSQL lines) already carry.
+fn with_where_context(e: PgWireError, context: String) -> PgWireError {
+    match e {
+        PgWireError::UserError(mut info) => {
+            info.where_context = Some(match info.where_context.take() {
+                Some(inner) => format!("{inner}\n{context}"),
+                None => context,
+            });
+            PgWireError::UserError(info)
+        }
+        other => other,
+    }
+}
+
+/// A COPY row: its values, and where it came from -- its line number
+/// (PostgreSQL's `cur_lineno`, the header line counted) and, in text and
+/// CSV, the line itself -- for the CONTEXT of an error it meets (RP-242).
+type CopyRow = (Vec<Option<Bson>>, CopyLine);
+type CopyLine = (u64, Option<String>);
+
 /// What `copy_load` does with its rows.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CopyLoad {
@@ -4334,8 +4369,12 @@ struct CopyInState {
     loaded: usize,
     /// Rows parsed and not yet loaded, and their bytes: PostgreSQL's
     /// `CopyMultiInsertBuffer`, flushed at 1,000 rows or 64 kB.
-    pending: Vec<Vec<Option<Bson>>>,
+    pending: Vec<CopyRow>,
     pending_bytes: usize,
+    /// The lines read so far (PostgreSQL's `cur_lineno`).
+    lineno: u64,
+    /// The target columns' names, for an error's CONTEXT.
+    names: Vec<String>,
     /// This COPY, among every COPY the process runs: the session state its
     /// parsing reads is installed once per thread for it.
     serial: u64,
@@ -38582,6 +38621,8 @@ impl PgHandler {
                     loaded: 0,
                     pending: Vec::new(),
                     pending_bytes: 0,
+                    lineno: 0,
+                    names: cols.iter().map(|c| c.name.clone()).collect(),
                     serial: COPY_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     statement_fired: false,
                     fk_rows: Vec::new(),
@@ -48507,12 +48548,13 @@ fn copy_field(
         )))
     };
     Ok(match pg_type {
-        "int2" | "int4" | "integer" | "int" | "smallint" => {
-            Bson::Int32(text.trim().parse().map_err(|_| bad("integer"))?)
-        }
-        "int8" | "bigint" => Bson::Int64(text.trim().parse().map_err(|_| bad("bigint"))?),
-        "float4" | "float8" | "real" => {
-            Bson::Double(text.trim().parse().map_err(|_| bad("double precision"))?)
+        // The integers and floats by their input functions, as a literal's
+        // cast reads them: a value past the type's range is 22003 `value
+        // "..." is out of range for type integer`, not 22P02, and a float's
+        // `Infinity` / `NaN` / `1e400` are the type's own.
+        "int2" | "int4" | "integer" | "int" | "smallint" | "int8" | "bigint" | "float4"
+        | "float8" | "real" => {
+            secantus_pgplan::cast_text_to(&text, pg_type, tz).map_err(|e| PgHandler::err(&e))?
         }
         // A numeric is exact: `9223372036854775807` through an f64 came back
         // as `9.223372036854776E+18`.
@@ -48661,16 +48703,23 @@ impl PgHandler {
     /// HEADER line.
     fn copy_parse(
         &self,
-        state: &CopyInState,
+        state: &mut CopyInState,
         bytes: &[u8],
         header: bool,
-    ) -> PgWireResult<Vec<Vec<Option<Bson>>>> {
+    ) -> PgWireResult<(Vec<CopyRow>, Option<PgWireError>)> {
         use secantus_pgplan::CopyFormat;
         // Every format is parsed into the same shape -- rows of optional
         // values, where `None` is that format's NULL -- so the insert below is
         // written once.
-        let rows: Vec<Vec<Option<Bson>>> = match state.format {
-            CopyFormat::Binary => self.parse_binary_copy(bytes, &state.types)?,
+        let rows: Vec<CopyRow> = match state.format {
+            CopyFormat::Binary => self
+                .parse_binary_copy(bytes, &state.types)?
+                .into_iter()
+                .map(|row| {
+                    state.lineno += 1;
+                    (row, (state.lineno, None))
+                })
+                .collect(),
             format => {
                 // COPY's text arrives in the client encoding, and PostgreSQL
                 // converts it as it does a query's (22021 / 22P05 by name).
@@ -48704,20 +48753,25 @@ impl PgHandler {
                         )))
                     })?
                 };
-                let mut parsed = copy_text::parse(
+                let mut parsed = copy_text::parse_lines(
                     &text,
                     format == CopyFormat::Csv,
                     &state.options,
                     &state.force_not_null,
                     &state.force_null,
                 );
-                // The HEADER line is the first chunk's first row.
+                // The HEADER line is the first chunk's first row, and line 1.
                 if header && !parsed.is_empty() {
                     parsed.remove(0);
+                    state.lineno += 1;
                 }
                 let tz = self.session_timezone();
+                let table = secantus_pgplan::schemas::split_key(&state.table)
+                    .1
+                    .to_string();
                 let mut out = Vec::with_capacity(parsed.len());
-                for raw in parsed {
+                for (raw, line) in parsed {
+                    state.lineno += 1;
                     let mut row = Vec::with_capacity(raw.len());
                     for (i, value) in raw.into_iter().enumerate() {
                         row.push(match value {
@@ -48725,16 +48779,28 @@ impl PgHandler {
                             Some(text) => {
                                 let ty = state.types.get(i).map(String::as_str).unwrap_or("text");
                                 let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
-                                Some(copy_field(&text, ty, &wire, &tz)?)
+                                match copy_field(&text, ty, &wire, &tz) {
+                                    Ok(v) => Some(v),
+                                    Err(e) => {
+                                        let column =
+                                            state.names.get(i).cloned().unwrap_or_default();
+                                        let context = format!(
+                                            "COPY {table}, line {}, column {column}: \"{}\"",
+                                            state.lineno,
+                                            copy_printout(&text)
+                                        );
+                                        return Ok((out, Some(with_where_context(e, context))));
+                                    }
+                                }
                             }
                         });
                     }
-                    out.push(row);
+                    out.push((row, (state.lineno, Some(line))));
                 }
                 out
             }
         };
-        Ok(rows)
+        Ok((rows, None))
     }
 
     /// Load a chunk's parsed rows into the COPY's table, inside the open
@@ -48742,15 +48808,31 @@ impl PgHandler {
     fn copy_load(
         &self,
         state: &mut CopyInState,
-        rows: Vec<Vec<Option<Bson>>>,
+        rows: Vec<CopyRow>,
         mode: CopyLoad,
     ) -> PgWireResult<usize> {
         let last = mode == CopyLoad::Last;
         let check_only = mode == CopyLoad::CheckOnly;
+        let table_name = secantus_pgplan::schemas::split_key(&state.table)
+            .1
+            .to_string();
+        // The CONTEXT of an error a row meets: its line, and the line's text
+        // while it is being read (`line_buf_valid`); a buffered row's insert
+        // names only its line.
+        let row_context = |line: &CopyLine| match &line.1 {
+            Some(text) => format!(
+                "COPY {table_name}, line {}: \"{}\"",
+                line.0,
+                copy_printout(text)
+            ),
+            None => format!("COPY {table_name}, line {}", line.0),
+        };
+        let flush_context = |line: &CopyLine| format!("COPY {table_name}, line {}", line.0);
         let mut parsed_rows = Vec::with_capacity(rows.len());
-        for raw in rows {
+        let mut lines: Vec<CopyLine> = Vec::with_capacity(rows.len());
+        for (raw, line) in rows {
             if raw.len() != state.fields.len() {
-                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                let e = PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".into(),
                     "22P04".into(), // bad_copy_file_format
                     format!(
@@ -48758,13 +48840,15 @@ impl PgHandler {
                         state.fields.len(),
                         raw.len()
                     ),
-                ))));
+                )));
+                return Err(with_where_context(e, row_context(&line)));
             }
             let mut doc = Document::new();
             for (field, value) in state.fields.iter().zip(raw) {
                 doc.insert(field.clone(), value.unwrap_or(Bson::Null));
             }
             parsed_rows.push(doc);
+            lines.push(line);
         }
         let written = parsed_rows.len();
         if !parsed_rows.is_empty() || last {
@@ -48814,15 +48898,31 @@ impl PgHandler {
                 self.apply_expression_defaults(&def, &mut rows)?;
                 apply_column_defaults(&def, &mut rows)?;
                 self.apply_generated(&def, &mut rows)?;
+                // Each row's BEFORE ROW triggers, then its NOT NULL and CHECK,
+                // as PostgreSQL meets them reading the row.
+                let mut kept_lines: Vec<CopyLine> = Vec::with_capacity(lines.len());
                 if triggered && !rows.is_empty() {
-                    rows = self.before_insert_rows(&def, rows)?;
+                    let mut kept = Vec::with_capacity(rows.len());
+                    for (row, line) in rows.into_iter().zip(&lines) {
+                        for r in self
+                            .before_insert_rows(&def, vec![row])
+                            .map_err(|e| with_where_context(e, row_context(line)))?
+                        {
+                            kept.push(r);
+                            kept_lines.push(line.clone());
+                        }
+                    }
+                    rows = kept;
+                } else {
+                    kept_lines = lines.clone();
                 }
-                for row in &rows {
-                    self.check_row_constraints(&def, row)?;
-                    self.check_partition_route(&def, row)?;
+                for (row, line) in rows.iter().zip(&kept_lines) {
+                    self.check_row_constraints(&def, row)
+                        .and_then(|()| self.check_partition_route(&def, row))
+                        .map_err(|e| with_where_context(e, row_context(line)))?;
                 }
                 if check_only {
-                    return Ok((0, Vec::new()));
+                    return Ok((0, Vec::new(), Vec::new()));
                 }
                 self.check_expression_unique(&def, &rows, &[])?;
                 self.check_partition_unique(&def, &rows, &[])?;
@@ -48860,13 +48960,13 @@ impl PgHandler {
                         after_stash.extend(rows);
                     }
                 }
-                Ok(out)
+                Ok((out.0, out.1, kept_lines))
             };
             let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
             // Outside a block the COPY is its own transaction, held across
             // its CopyData messages and committed at CopyDone: a row refused
             // midway leaves none of the rows before it loaded.
-            let (_, errors) = match guard.as_mut() {
+            let (_, errors, inserted_lines) = match guard.as_mut() {
                 Some(handle) => self
                     .storage
                     .with_user_transaction(self.with_isolation(handle)?, load)
@@ -48883,7 +48983,17 @@ impl PgHandler {
             };
             drop(guard);
             if let Some(first) = errors.first() {
-                return Err(Self::write_error(&state.table, &def, first));
+                let e = Self::write_error(&state.table, &def, first);
+                // The row the storage refused, by its place in the batch.
+                let line = first
+                    .get("index")
+                    .and_then(bson_i64)
+                    .and_then(|i| usize::try_from(i).ok())
+                    .and_then(|i| inserted_lines.get(i));
+                return Err(match line {
+                    Some(line) => with_where_context(e, flush_context(line)),
+                    None => e,
+                });
             }
             state.fk_rows.extend(stash);
             state.after_rows.extend(after_stash);
@@ -49004,28 +49114,36 @@ impl PgHandler {
                     state.binary_header = Some(h.clone());
                     let mut all = h;
                     all.extend_from_slice(&bytes[len..]);
-                    let rows = self.copy_parse(state, &all, false)?;
-                    return self.copy_buffer(state, rows, bytes.len());
+                    let parsed = self.copy_parse(state, &all, false)?;
+                    return self.copy_parsed(state, parsed, bytes.len());
                 }
             };
             let mut all = header;
             all.extend_from_slice(bytes);
-            self.copy_parse(state, &all, false)
+            self.copy_parse(state, &all, false)?
         } else {
             let header = std::mem::take(&mut state.header_left);
-            self.copy_parse(state, bytes, header)
+            self.copy_parse(state, bytes, header)?
         };
-        // A bad row stops the COPY there: the rows read before it are
-        // checked first, as PostgreSQL checks each row when it reads it.
-        let rows = match rows {
-            Ok(rows) => rows,
-            Err(e) => {
-                let rows = std::mem::take(&mut state.pending);
-                self.copy_load(state, rows, CopyLoad::CheckOnly)?;
-                return Err(e);
-            }
+        self.copy_parsed(state, rows, bytes.len())
+    }
+
+    /// A chunk's rows, and the error of a row that did not parse. A bad row
+    /// stops the COPY there: the rows read before it are checked first, as
+    /// PostgreSQL checks each row when it reads it.
+    fn copy_parsed(
+        &self,
+        state: &mut CopyInState,
+        (rows, bad): (Vec<CopyRow>, Option<PgWireError>),
+        bytes: usize,
+    ) -> PgWireResult<()> {
+        let Some(e) = bad else {
+            return self.copy_buffer(state, rows, bytes);
         };
-        self.copy_buffer(state, rows, bytes.len())
+        let mut rows_before = std::mem::take(&mut state.pending);
+        rows_before.extend(rows);
+        self.copy_load(state, rows_before, CopyLoad::CheckOnly)?;
+        Err(e)
     }
 
     /// Buffer a chunk's parsed rows, as `CopyFrom` adds each to its
@@ -49037,7 +49155,7 @@ impl PgHandler {
     fn copy_buffer(
         &self,
         state: &mut CopyInState,
-        rows: Vec<Vec<Option<Bson>>>,
+        rows: Vec<CopyRow>,
         bytes: usize,
     ) -> PgWireResult<()> {
         state.pending.extend(rows);
