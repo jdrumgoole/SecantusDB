@@ -16,7 +16,15 @@ from tests.backlog.test_rm_057_084 import mongod_rs  # noqa: F401 - fixture
 
 def _run(client: Any, cmd: dict) -> tuple[list, list]:
     """The command entries and health-log records one `dbCheck` leaves.
-    mongod runs it in the background, so this waits for its stop entry."""
+    mongod runs it in the background, so this waits for its stop entry, and
+    writes the health log through a deferred writer, after the oplog: so
+    this waits for the log's `dbCheckStop` record too (a loaded machine read
+    it empty, two of twenty-four concurrent runs, 2026-10-24).
+
+    Only `dbCheck`'s own entries: a new primary creates
+    `config.sampledQueriesDiff` and its TTL index in the background, and on
+    a loaded machine those land in the window (three of twelve concurrent
+    runs, 2026-10-24) -- a feature of mongod's this server does not have."""
     oplog = client.local["oplog.rs"]
     start = oplog.find_one(sort=[("$natural", -1)])["ts"]
     skip = client.local["system.healthlog"].count_documents({})
@@ -25,16 +33,20 @@ def _run(client: Any, cmd: dict) -> tuple[list, list]:
     while not oplog.find_one({"ts": {"$gt": start}, "op": "c", "o.type": "stop"}):
         assert time.monotonic() < deadline, "dbCheck did not finish"
         time.sleep(0.1)
+    health = client.local["system.healthlog"]
+    while not any(r.get("operation") == "dbCheckStop" for r in health.find().skip(skip)):
+        assert time.monotonic() < deadline, "dbCheck's health log did not finish"
+        time.sleep(0.1)
     entries = [
         (
             e["ns"],
             {k: v for k, v in e["o"].items() if k not in ("batchId", "readTimestamp", "uuid")},
         )
-        for e in oplog.find({"ts": {"$gt": start}, "op": "c"})
+        for e in oplog.find({"ts": {"$gt": start}, "op": "c", "o.dbCheck": {"$exists": True}})
     ]
     records = [
         {k: v for k, v in r.items() if k not in ("_id", "timestamp", "collectionUUID")}
-        for r in client.local["system.healthlog"].find().skip(skip)
+        for r in health.find().skip(skip)
     ]
     return entries, records
 

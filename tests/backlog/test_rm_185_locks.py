@@ -23,8 +23,9 @@ def mongod() -> Iterator[Any]:
     re-take counts. Its builds differ here: on Linux x86-64 (8.2.12, CI, the
     exemplar build: Joe, 2026-10-21) `$out` reads 7 global IS, on macOS
     arm64 8 idle and 9 on a loaded machine; with the period off, macOS reads
-    7 as Linux does. So the period is off: the counts are the Linux build's
-    on any machine, and do not move with load."""
+    7 as Linux does. So the period is off, and the counts are the Linux
+    build's on any machine. Load moved them another way as well, through
+    slow-operation logging, which `_no_slow_operations` turns off."""
     from tests.mongod_reference import MONGOD, _start_mongod, _stop_mongod
 
     assert MONGOD, "no mongod on PATH: the reference server is required"
@@ -37,6 +38,35 @@ def mongod() -> Iterator[Any]:
     finally:
         client.close()
         _stop_mongod(proc, dbpath)
+
+
+#: A `slowms` no operation reaches.
+_NEVER_SLOW = 86_400_000
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _no_slow_operations(rust_mongo: Any, mongod: Any) -> Iterator[None]:
+    """Slow-operation logging off, on both servers.
+
+    mongod takes the global lock in IS for each operation it logs as slow
+    (to read the storage statistics for the `Slow query` line), so an
+    operation that crosses `slowms` (100 ms) counts one more global IS for
+    itself and one for each write inside it. On a loaded machine creating a
+    collection crosses it: `$out` replacing its target read 8 global IS
+    instead of 7, and `$merge` creating its target 4 instead of 2, in all
+    five reference runs (RM-274; reproduced 2026-10-24 by twelve reference
+    mongods at once, and by one beside fsync-heavy disk load, but not by CPU
+    load; with `slowms` out of reach, 120 of 120 runs read 7 and 2). The
+    counts would then measure the machine. The lock itself is a divergence
+    of its own (RM-299, `test_a_slow_operation_takes_the_global_lock_to_log`).
+    The same `profile` command goes to both servers, so neither logs."""
+    saved = []
+    for client in (rust_mongo, mongod):
+        saved.append((client, client.admin.command("profile", -1)["slowms"]))
+        client.admin.command("profile", 0, slowms=_NEVER_SLOW)
+    yield
+    for client, slowms in saved:
+        client.admin.command("profile", 0, slowms=slowms)
 
 
 # Internal resources mongod's background threads lock; this server has none.
@@ -338,3 +368,34 @@ def test_lock_counts_of_merge_fail_with_duplicates(rust_mongo: Any, mongod: Any)
     duplicate, taking more write rounds (4 for 4 documents with two
     duplicates, 3 with one); this server takes the batch's one."""
     assert _merge_fail_duplicates(rust_mongo) == _reference(_merge_fail_duplicates, mongod)
+
+
+def _slow(client: Any) -> list:
+    """`_merge`'s shapes and a `find` with every operation logged as slow."""
+    client.admin.command("profile", 0, slowms=0)
+    try:
+        db = client[_fresh("rm185slow")]
+        db.c.insert_many([{"_id": i} for i in range(5)])
+        return _deltas(
+            client,
+            [
+                ("find", lambda: db.c.find_one({"_id": 1})),
+                (
+                    "$merge creating its target",
+                    lambda: list(db.c.aggregate([{"$merge": {"into": "m"}}])),
+                ),
+            ],
+        )
+    finally:
+        client.admin.command("profile", 0, slowms=_NEVER_SLOW)
+
+
+@pytest.mark.backlog("RM-299")
+def test_a_slow_operation_takes_the_global_lock_to_log(rust_mongo: Any, mongod: Any) -> None:
+    """mongod logs an operation slower than `slowms` and takes the global lock
+    in IS to read its storage statistics for the line: one more global IS for
+    each operation logged, each upsert a `$merge` makes included (measured
+    8.2.11, 2026-10-24: with `slowms` 0, `$merge` creating its target reads 8
+    global IS where it reads 2 with nothing logged). This server writes the
+    `Slow query` line for the command and takes no lock for it."""
+    assert _slow(rust_mongo) == _reference(_slow, mongod)
