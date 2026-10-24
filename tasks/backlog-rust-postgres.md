@@ -755,6 +755,56 @@ tests are scenarios in `tests/backlog/test_rp_batch30.py`, measured on a
 private 15.19 cluster. RP-133 .. RP-136 and RP-138 .. RP-142 were found and
 fixed in the same batch; their tests there are regression tests.
 
+## Found by batch 64 (2026-10-24)
+
+Found while giving an MCV list over timestamps its datums (RP-099) and
+while speeding up `pgbench -i`'s COPY. RP-240, RP-241 and RP-243 were fixed
+in the same batch; their tests in `tests/backlog/test_rp_batch64.py` and
+`tests/backlog/test_rp_batch64_copy.py` are regression tests.
+
+- RP-240: under a session zone other than UTC, a `timestamptz` that an
+  `INSERT ... SELECT` computed (`select timestamptz '...'`,
+  `z + interval`), or copied as a `timestamptz[]`, was stored shifted by
+  the zone's offset. So was each bound of `tstzrange(timestamptz, ...)`.
+- RP-241: COPY FROM checked no NOT NULL, CHECK or foreign key constraint,
+  and fired no trigger.
+- RP-243: `new.d` in a statement-level trigger was 0A000, where PostgreSQL
+  reads a NULL of the column's type.
+
+- [ ] **A COPY error does not say where it is.** PostgreSQL 15.19's
+      `CopyFromErrorCallback` adds a CONTEXT naming the COPY's table and
+      line. It is `COPY t, line 2, column a: "x"` for a value that does not
+      parse, `COPY t, line 2: "7\t1"` for a row a constraint refuses, and
+      `COPY t, line 2` for a unique index's duplicate. Here the error has
+      no CONTEXT. PostgreSQL also checks NOT NULL and CHECK on each row as
+      it reads it. Here a bad value later in the same CopyData message as
+      such a row is reported first, because a message is parsed whole.
+      Both need the parser to keep each row's line number and text.
+      Backlog-ID: RP-242
+      Verify: tests/backlog/test_rp_batch64_copy.py::test_scenario[a COPY error names its line]
+
+## Found by batch 63 (2026-10-24)
+
+Found while counting a sequential scan a LIMIT stops (RP-224). The gap
+tests are scenarios in `tests/backlog/test_rp_batch63.py`, measured on a
+private 15.19 cluster. RP-238 (a scan streamed in a transaction block,
+`begin; select g from t`, was not counted in `pg_stat_user_tables` at all)
+was found and fixed in the same batch; its test there is a regression
+test.
+
+- [ ] **A write counts one heap buffer access per row.** PostgreSQL 15.19
+      counts what `heap_insert` reads through the buffer manager: CREATE
+      TABLE AS writes through a bulk-write ring, one access per page (35
+      for 2,000 rows of 104 bytes), and an INSERT reads its target page per
+      row plus the full page, the free space map's answer and the new page
+      each time the heap extends (2,137 for 2,000 more rows). Here every
+      row written counts one access (2,000 and 4,000), so
+      `pg_statio_user_tables.heap_blks_hit` drifts from PostgreSQL's after
+      any write. Modelling it means following `RelationGetBufferForTuple`
+      and the bulk-insert state per write path.
+      Backlog-ID: RP-239
+      Verify: tests/backlog/test_rp_batch63.py::test_scenario[a write counts the heap pages PostgreSQL's buffer accesses do]
+
 ## Found by batch 62 (2026-10-24)
 
 Found while letting ON CONFLICT arbitrate on a unique index whose predicate
@@ -807,16 +857,6 @@ without a Terminate, and counted a terminated one only once its client
 closed the socket) was found and fixed in the same batch; its test there is
 a regression test.
 
-- [ ] **A sequential scan under LIMIT counts every tuple.** PostgreSQL
-      15.19 stops a scan once its LIMIT is met: `select * from t limit 1`
-      reads one tuple (`seq_tup_read` 1), `select g from t where g = 10
-      limit 1` ten. Here every scan reports the table's visible tuples, as
-      the storage reads them all. Counting where PostgreSQL would stop needs
-      the position in heap order of the last row the plan returned, after
-      the residual filter, and not where DISTINCT, a window or an ORDER BY
-      read every row first.
-      Backlog-ID: RP-224
-      Verify: tests/backlog/test_rp_batch55.py::test_scenario[a sequential scan under LIMIT reads only what it returns]
 - [ ] **The system catalogs' counters stay at zero.** `pg_stat_sys_tables`
       and `pg_statio_sys_*` list every catalog, but this server's catalogs
       are computed, not scanned, so nothing counts a read of `pg_class`;
@@ -946,20 +986,16 @@ batch; their tests there are regression tests.
       51 built `CREATE / ALTER / DROP OPERATOR FAMILY / CLASS` for the
       btree and hash methods, text-search dictionaries over the `simple`,
       `snowball` and `synonym` templates, subscriptions created with
-      `connect = false`, and transforms. Three parts are still refused or
-      differ from PostgreSQL 15.19:
+      `connect = false`, and transforms; batch 64 made `pg_subscription`
+      one catalog for the cluster. Two parts are still refused:
       - **Operator classes of the GiST, GIN, SP-GiST and BRIN methods**
         are refused by name. Their `amadjustmembers` rules and support
         function numbers differ from btree's, and an index over such a
         class would need its support functions, which are C internals.
       - **The `ispell` and `thesaurus` dictionary templates** are refused
         by name: their dictionary and affix file formats are not read here.
-      - **`pg_subscription` lists only the current database's
-        subscriptions.** It is a shared catalog: PostgreSQL lists every
-        database's, each with its `subdbid`. Here they are kept per
-        database.
       Backlog-ID: RP-169
-      Verify: tests/backlog/test_rp_batch51.py::test_scenario[a GiST operator class], tests/backlog/test_rp_batch51.py::test_scenario[ispell and thesaurus dictionaries], tests/backlog/test_rp_batch51.py::test_scenario[pg_subscription lists every database's subscriptions]
+      Verify: tests/backlog/test_rp_batch51.py::test_scenario[a GiST operator class], tests/backlog/test_rp_batch51.py::test_scenario[ispell and thesaurus dictionaries]
 
 ## Found by batch 26 (2026-10-22)
 
@@ -968,21 +1004,16 @@ as they do against PostgreSQL 15.19 (RP-070, RP-071). The gap tests are
 scenarios in `tests/backlog/test_rp_batch26.py`, measured on a private 15.19
 cluster.
 
-- [ ] **Extended statistics: timestamps, and tables past ANALYZE's
-      sample.** ANALYZE builds every kind of statistics object as PostgreSQL
+- [ ] **Extended statistics: tables past ANALYZE's sample.** ANALYZE builds every kind of statistics object as PostgreSQL
       15.19 does (batch 50: ndistinct, dependencies, MCV lists, expression
       statistics, inherited ones), and `pg_statistic_ext_data`,
-      `pg_stats_ext` and `pg_stats_ext_exprs` show them. What is left:
-      - An MCV list over a `timestamp` or `timestamptz` column has no bytes
-        (`stxdmcv` is NULL, where PostgreSQL writes its datums). A
-        timestamp's microseconds are kept in a hidden companion field, which
-        the statistics' values do not carry, so two timestamps a fraction of
-        a millisecond apart also count as one value.
-      - A table of more rows than ANALYZE samples (300 times the statistics
-        target) has no extended statistics here: PostgreSQL builds them from
-        its random sample (as for `pg_statistic`, which is not built either).
+      `pg_stats_ext` and `pg_stats_ext_exprs` show them, an MCV list over
+      timestamps with their datums since batch 64. What is left: a table of
+      more rows than ANALYZE samples (300 times the statistics target) has
+      no extended statistics here: PostgreSQL builds them from its random
+      sample (as for `pg_statistic`, which is not built either).
       Backlog-ID: RP-099
-      Verify: tests/backlog/test_rp_batch50.py::test_scenario[an MCV list's bytes over timestamps], tests/backlog/test_rp_batch50.py::test_scenario[a table past ANALYZE's sample has extended statistics]
+      Verify: tests/backlog/test_rp_batch50.py::test_scenario[a table past ANALYZE's sample has extended statistics]
 
 ## Found by batch 28 (2026-10-22)
 

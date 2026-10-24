@@ -20,6 +20,10 @@ use secantus_pgplan::subscriptions::{AlterKind, OptArg, RawOpt, SubscriptionOp};
 use crate::{bson_i64, PgHandler};
 
 pub(crate) const SUBSCRIPTION_COLLECTION: &str = "__sql_subscriptions__";
+/// The open block's own writes to the shared subscriptions, in the
+/// uncommitted-catalog overlay (`note_uncommitted_type`), keyed apart from
+/// a database's own catalog of the same name.
+const SHARED_SUBSCRIPTIONS: &str = "__shared_subscriptions__";
 pub(crate) const PG_SUBSCRIPTION: i64 = 6100;
 
 const SUBOPT_CONNECT: u32 = 0x0001;
@@ -444,10 +448,156 @@ fn needs_publisher(what: &str) -> PgWireError {
 }
 
 impl PgHandler {
-    fn subscription_docs(&self) -> Vec<Document> {
+    /// Every database's subscriptions: `pg_subscription` is a shared
+    /// catalog, each row naming its database (`subdbid`). Each is kept
+    /// once, beside the databases, keyed by its database's oid and its
+    /// name; one an earlier build kept in its database is read as that
+    /// database's (RP-169). Each document's `_id` is the name and `db` its
+    /// database's oid.
+    fn all_subscription_docs(&self) -> Vec<Document> {
+        let ns = crate::DatabaseRegistry::NAMESPACE;
+        let mut shared: std::collections::BTreeMap<String, Document> =
+            std::collections::BTreeMap::new();
+        if let Ok(true) = self.storage.collection_exists(ns, SUBSCRIPTION_COLLECTION) {
+            for b in self
+                .storage
+                .find_matching(ns, SUBSCRIPTION_COLLECTION, &Document::new())
+                .unwrap_or_default()
+            {
+                if let Ok(d) = crate::decode_doc(&b) {
+                    shared.insert(d.get_str("_id").unwrap_or_default().to_string(), d);
+                }
+            }
+        }
+        // What the open block wrote, which a read outside its transaction
+        // does not see.
+        for ((coll, id), doc) in self.pending.types().iter() {
+            if *coll == SHARED_SUBSCRIPTIONS {
+                match doc {
+                    Some(d) => shared.insert(id.clone(), d.clone()),
+                    None => shared.remove(id),
+                };
+            }
+        }
+        let mut docs: Vec<Document> = shared
+            .into_values()
+            .map(|mut d| {
+                let name = d.get_str("name").unwrap_or_default().to_string();
+                d.insert("_id", name);
+                d.remove("name");
+                d
+            })
+            .collect();
+        let here = self.current_database_oid().unwrap_or(0);
+        for mut d in self.legacy_subscription_docs() {
+            let name = d.get_str("_id").unwrap_or_default().to_string();
+            let shadowed = docs.iter().any(|s| {
+                s.get("db").and_then(bson_i64) == Some(here) && s.get_str("_id") == Ok(&name)
+            });
+            if !shadowed {
+                d.insert("db", here);
+                docs.push(d);
+            }
+        }
+        docs.sort_by_key(|d| d.get("oid").and_then(bson_i64).unwrap_or(0));
+        docs
+    }
+
+    /// The subscriptions an earlier build kept in this database's catalog.
+    fn legacy_subscription_docs(&self) -> Vec<Document> {
+        if !matches!(
+            self.storage
+                .collection_exists(self.db(), SUBSCRIPTION_COLLECTION),
+            Ok(true)
+        ) {
+            return Vec::new();
+        }
         self.type_catalog_docs(SUBSCRIPTION_COLLECTION)
             .map(|d| d.to_vec())
             .unwrap_or_default()
+    }
+
+    /// This database's subscriptions, which a name resolves among
+    /// (`get_subscription_oid` looks in `MyDatabaseId`'s).
+    fn subscription_docs(&self) -> Vec<Document> {
+        let here = self.current_database_oid().unwrap_or(0);
+        self.all_subscription_docs()
+            .into_iter()
+            .filter(|d| d.get("db").and_then(bson_i64) == Some(here))
+            .collect()
+    }
+
+    /// How many subscriptions database `oid` has (`CountDBSubscriptions`).
+    pub(crate) fn database_subscription_count(&self, oid: i64) -> usize {
+        self.all_subscription_docs()
+            .iter()
+            .filter(|d| d.get("db").and_then(bson_i64) == Some(oid))
+            .count()
+    }
+
+    fn shared_subscription_key(db: i64, name: &str) -> String {
+        format!("{db}:{name}")
+    }
+
+    /// Write this database's subscription `name` as `doc` (whose `_id` is
+    /// its name).
+    fn put_subscription(&self, name: &str, mut doc: Document) -> PgWireResult<()> {
+        self.delete_subscription(name)?;
+        let ns = crate::DatabaseRegistry::NAMESPACE;
+        let err = |e| Self::storage_err("could not record the subscription", e);
+        if !self
+            .storage
+            .collection_exists(ns, SUBSCRIPTION_COLLECTION)
+            .map_err(err)?
+        {
+            self.storage
+                .create_collection(ns, SUBSCRIPTION_COLLECTION)
+                .map_err(err)?;
+        }
+        let db = self.current_database_oid()?;
+        let key = Self::shared_subscription_key(db, name);
+        doc.insert("_id", &key);
+        doc.insert("name", name);
+        doc.insert("db", db);
+        let bytes = crate::encode_doc(&doc)
+            .map_err(|e| Self::storage_err("could not encode the subscription", e))?;
+        self.storage
+            .insert(ns, SUBSCRIPTION_COLLECTION, vec![bytes], true)
+            .map_err(err)?;
+        self.note_uncommitted_type(SHARED_SUBSCRIPTIONS, &key, Some(doc));
+        Ok(())
+    }
+
+    /// Remove this database's subscription `name`, wherever it is kept.
+    fn delete_subscription(&self, name: &str) -> PgWireResult<()> {
+        let ns = crate::DatabaseRegistry::NAMESPACE;
+        let err = |e| Self::storage_err("could not drop the subscription", e);
+        if self
+            .storage
+            .collection_exists(ns, SUBSCRIPTION_COLLECTION)
+            .map_err(err)?
+        {
+            let key = Self::shared_subscription_key(self.current_database_oid()?, name);
+            self.storage
+                .delete_matching(
+                    ns,
+                    SUBSCRIPTION_COLLECTION,
+                    &bson::doc! {"_id": &key},
+                    0,
+                    &Document::new(),
+                    None,
+                )
+                .map_err(err)?;
+            self.note_uncommitted_type(SHARED_SUBSCRIPTIONS, &key, None);
+        }
+        if self
+            .legacy_subscription_docs()
+            .iter()
+            .any(|d| d.get_str("_id") == Ok(name))
+        {
+            self.delete_type_doc(SUBSCRIPTION_COLLECTION, name)?;
+        }
+        Ok(())
     }
 
     fn subscription_doc(&self, name: &str) -> Option<Document> {
@@ -530,14 +680,14 @@ impl PgHandler {
                 }
                 // `replorigin_create`: the lowest free origin id.
                 let used: Vec<i64> = self
-                    .subscription_docs()
+                    .all_subscription_docs()
                     .iter()
                     .filter_map(|d| d.get("roident").and_then(bson_i64))
                     .collect();
                 let roident = (1..).find(|i| !used.contains(i)).unwrap_or(1);
                 let mut doc = bson::doc! {
                     "_id": &name,
-                    "oid": Self::index_oid(&format!("sub:{}:{name}", self.db())),
+                    "oid": self.mint_global_oids(1)?,
                     "owner": self.current_role_name(),
                     "enabled": opts.enabled,
                     "binary": opts.binary,
@@ -553,7 +703,7 @@ impl PgHandler {
                 if let Some(s) = &slot {
                     doc.insert("slot", s);
                 }
-                self.put(SUBSCRIPTION_COLLECTION, &name, doc)?;
+                self.put_subscription(&name, doc)?;
                 self.warning(
                     "01000",
                     "tables were not subscribed, you will have to run ALTER SUBSCRIPTION ... \
@@ -740,7 +890,7 @@ impl PgHandler {
                         d.insert("skiplsn", o.lsn as i64);
                     }
                 }
-                self.put(SUBSCRIPTION_COLLECTION, &name, d)?;
+                self.put_subscription(&name, d)?;
             }
             SubscriptionOp::Drop { name, if_exists } => {
                 let Some(d) = self.subscription_doc(&name) else {
@@ -765,7 +915,7 @@ impl PgHandler {
                         "DROP SUBSCRIPTION of a subscription with a replication slot",
                     ));
                 }
-                self.delete_type_doc(SUBSCRIPTION_COLLECTION, &name)?;
+                self.delete_subscription(&name)?;
             }
             SubscriptionOp::Rename { name, to } => {
                 let mut d = self.found_subscription(&name)?;
@@ -778,8 +928,8 @@ impl PgHandler {
                 }
                 self.subscription_owner_check(&d, &name)?;
                 d.insert("_id", &to);
-                self.delete_type_doc(SUBSCRIPTION_COLLECTION, &name)?;
-                self.put(SUBSCRIPTION_COLLECTION, &to, d)?;
+                self.delete_subscription(&name)?;
+                self.put_subscription(&to, d)?;
             }
             SubscriptionOp::Owner { name, owner } => {
                 let mut d = self.found_subscription(&name)?;
@@ -801,7 +951,7 @@ impl PgHandler {
                         ));
                     }
                     d.insert("owner", owner);
-                    self.put(SUBSCRIPTION_COLLECTION, &name, d)?;
+                    self.put_subscription(&name, d)?;
                 }
             }
         }
@@ -820,7 +970,7 @@ impl PgHandler {
             Some(c) => d.insert("comment", c),
             None => d.remove("comment"),
         };
-        self.put(SUBSCRIPTION_COLLECTION, name, d)
+        self.put_subscription(name, d)
     }
 
     /// `(oid, comment)` of each subscription with one.
@@ -839,8 +989,7 @@ impl PgHandler {
     /// `pg_subscription`, `pg_replication_origin`, `pg_stat_subscription`
     /// or `pg_stat_subscription_stats`.
     pub(crate) fn subscription_rows(&self, name: &str, def: &TableDef) -> Vec<Document> {
-        let db_oid = self.current_database_oid().unwrap_or(0);
-        self.subscription_docs()
+        self.all_subscription_docs()
             .iter()
             .map(|s| {
                 let mut d = Document::new();
@@ -855,7 +1004,10 @@ impl PgHandler {
                 match name {
                     "pg_subscription" => {
                         put("oid", Bson::Int64(oid));
-                        put("subdbid", Bson::Int64(db_oid));
+                        put(
+                            "subdbid",
+                            Bson::Int64(s.get("db").and_then(bson_i64).unwrap_or(0)),
+                        );
                         put(
                             "subskiplsn",
                             Bson::String(secantus_pgplan::systypes::render_lsn(

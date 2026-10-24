@@ -10,6 +10,33 @@ use pgwire::error::PgWireResult;
 use crate::pgstat::{Consistency, Disconnect, Stats};
 use crate::PgHandler;
 
+thread_local! {
+    /// While a LIMIT may stop a sequential scan early (RP-224): `Some` once
+    /// armed, holding the scan's table and its visible tuples once it ran,
+    /// counted when the LIMIT is known instead of when the rows are read.
+    static DEFERRED_SEQ: std::cell::RefCell<Option<Option<(String, i64)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The visible tuples of `table` up to and including the one at `ctid`, in
+/// heap order: what a sequential scan stopped there has read. A row
+/// written before ctids were kept reads first.
+pub(crate) fn tuples_through(
+    storage: &secantus_storage::Storage,
+    db: &str,
+    table: &str,
+    ctid: i64,
+) -> Option<i64> {
+    let filter = bson::doc! { "$or": [
+        { "__sys_ctid": { "$lte": ctid } },
+        { "__sys_ctid": { "$exists": false } },
+    ] };
+    storage
+        .count_matching(db, table, &filter, None)
+        .ok()
+        .map(|n| n as i64)
+}
+
 /// A `void` function's value: the empty string, not NULL.
 const VOID: Bson = Bson::String(String::new());
 
@@ -220,7 +247,16 @@ impl PgHandler {
                         .count_matching(self.db(), table, &bson::Document::new(), None)
                         .unwrap_or(rows.len())
                 };
-                self.stat_seq_scan(table, total as i64);
+                let deferred = DEFERRED_SEQ.with(|d| match d.borrow_mut().as_mut() {
+                    Some(slot @ None) => {
+                        *slot = Some((table.to_string(), total as i64));
+                        true
+                    }
+                    _ => false,
+                });
+                if !deferred {
+                    self.stat_seq_scan(table, total as i64);
+                }
             }
         }
     }
@@ -282,6 +318,38 @@ impl PgHandler {
         self.stat_scan(table, filter, &rows);
     }
 
+    /// Run `scan` with its sequential scan's count held back: the scan's
+    /// table and visible tuples, if it ran one, for `stat_seq_scan_to` once
+    /// the LIMIT over it is known (RP-224).
+    pub(crate) fn deferring_seq_scan<T>(
+        &self,
+        scan: impl FnOnce() -> T,
+    ) -> (T, Option<(String, i64)>) {
+        DEFERRED_SEQ.with(|d| *d.borrow_mut() = Some(None));
+        let out = scan();
+        let held = DEFERRED_SEQ.with(|d| d.borrow_mut().take().flatten());
+        (out, held)
+    }
+
+    /// A sequential scan of `table` (`total` visible tuples) that a LIMIT
+    /// stopped once it returned the tuple at `last` -- or, `None`, read to
+    /// the end: the tuples and pages up to there (RP-224).
+    pub(crate) fn stat_seq_scan_to(&self, table: &str, total: i64, last: Option<i64>) {
+        if !self.tracking() || table.starts_with("__") {
+            return;
+        }
+        let Some(ctid) = last else {
+            self.stat_seq_scan(table, total);
+            return;
+        };
+        let tuples = tuples_through(&self.storage, self.db(), table, ctid).unwrap_or(total);
+        let rel = self.relation_oid(table).unwrap_or(0);
+        self.stats().seq_scan(rel, tuples);
+        if self.has_heap(table) {
+            self.stat_pages(table, 0..=ctid / 65536);
+        }
+    }
+
     pub(crate) fn stat_seq_scan(&self, table: &str, tuples: i64) {
         if !self.tracking() || table.starts_with("__") {
             return;
@@ -314,7 +382,12 @@ impl PgHandler {
         if !self.tracking() || !self.has_heap(table) {
             return Ok(());
         }
-        let live = self.table_docs(table)?.len() as i64;
+        // A count, not the rows: decoding every row to count them was half
+        // of a VACUUM of a large table.
+        let live = self
+            .storage
+            .count_matching(self.db(), table, &bson::Document::new(), None)
+            .map_err(|e| Self::storage_err("could not read", e))? as i64;
         let dead = self.dead_tuple_count(table);
         let rel = self.relation_oid(table).unwrap_or(0);
         let s = self.stats();
@@ -579,6 +652,18 @@ impl ScanStat {
     /// read the heap's visible tuples and every page; an index scan
     /// returned its entries through the index's descent.
     pub(crate) fn finish(&self, returned: i64) {
+        self.finish_at(returned, None);
+    }
+
+    /// As `finish`, for a scan a LIMIT stopped once it returned the tuple
+    /// at `last`, the `tuples` up to it (`tuples_through`): a sequential
+    /// scan read the heap up to there (RP-224).
+    pub(crate) fn finish_at(&self, returned: i64, last: Option<(i64, i64)>) {
+        if let (None, Some((ctid, tuples))) = (self.index, last) {
+            self.stats.seq_scan(self.rel, tuples);
+            self.stats.pages(self.rel, 0..=ctid / 65536, self.capacity);
+            return;
+        }
         match self.index {
             Some(ix) => {
                 self.stats.index_scan(ix, returned, returned);

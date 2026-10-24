@@ -662,6 +662,9 @@ impl PgHandler {
                     !stopped.get()
                 };
                 let scanned_rows = std::cell::Cell::new(0i64);
+                // A heap read in ctid order stops where a LIMIT is met.
+                let mut limit_left = left.filter(|_| ctid_order_only(&order));
+                let mut stopped_at: Option<i64> = None;
                 let sorted = crate::external_sort::sort_runs_with(
                     |sink| {
                         storage
@@ -680,6 +683,12 @@ impl PgHandler {
                 )
                 .and_then(|mut sorted| loop {
                     let docs = sorted.next_batch()?;
+                    if let Some(n) = limit_left.as_mut() {
+                        *n = n.saturating_sub(docs.len());
+                        if *n == 0 && !docs.is_empty() {
+                            stopped_at = docs.last().and_then(crate::heap::ctid_of);
+                        }
+                    }
                     if docs.is_empty() || !tick() {
                         return Ok(());
                     }
@@ -690,7 +699,10 @@ impl PgHandler {
                     since.set(std::time::Instant::now());
                 });
                 if let Some(s) = scan_stat {
-                    s.finish(scanned_rows.get());
+                    let last = stopped_at.and_then(|c| {
+                        crate::pgstat_sql::tuples_through(&storage, &db, &table, c).map(|n| (c, n))
+                    });
+                    s.finish_at(scanned_rows.get(), last);
                 }
                 if let Err(e) = sorted {
                     if !stopped.get() {
@@ -700,6 +712,8 @@ impl PgHandler {
                 return;
             }
             let mut scanned_rows = 0i64;
+            // The tuple that completed the LIMIT, where the scan stopped.
+            let mut stopped_at: Option<i64> = None;
             let scanned = storage.scan_routed_batches(&db, &table, &filter, BATCH, |blobs| {
                 scanned_rows += blobs.len() as i64;
                 worked += since.elapsed();
@@ -726,6 +740,7 @@ impl PgHandler {
                     if let Some(n) = left.as_mut() {
                         *n -= 1;
                         if *n == 0 {
+                            stopped_at = docs.last().and_then(crate::heap::ctid_of);
                             break;
                         }
                     }
@@ -740,7 +755,10 @@ impl PgHandler {
                 left != Some(0)
             });
             if let Some(s) = scan_stat {
-                s.finish(scanned_rows);
+                let last = stopped_at.and_then(|c| {
+                    crate::pgstat_sql::tuples_through(&storage, &db, &table, c).map(|n| (c, n))
+                });
+                s.finish_at(scanned_rows, last);
             }
             if let Err(e) = scanned {
                 let _sent = tx.blocking_send(Err(PgHandler::storage_err("could not read", e)));
@@ -785,6 +803,18 @@ pub(crate) struct BlockScan {
     sorted: Option<Arc<Mutex<crate::external_sort::Sorted>>>,
     /// A DISTINCT's fields (`stream_order`).
     dedup: Option<Vec<String>>,
+    /// A portal's scan, counted once it ends (cursors' are not set).
+    stat: Option<crate::pgstat_sql::ScanStat>,
+    /// The stored rows read, and the ctid of the row that completed the
+    /// LIMIT (RP-224).
+    scanned: i64,
+    stopped_at: Option<i64>,
+}
+
+/// Whether `order` is only a heap's ctid order (`ctid_order_key`), which a
+/// sequential scan returns without sorting, so a LIMIT stops it.
+fn ctid_order_only(order: &[OrderKey]) -> bool {
+    matches!(order, [k] if k.field == "__sys_ctid" && k.expr.is_none())
 }
 
 /// Compute each ORDER BY expression into its synthetic field, as the
@@ -867,6 +897,7 @@ impl BlockScan {
                 .scan_batch_after(&self.db, &self.table, &self.filter, self.after, BATCH)
                 .map_err(|e| PgHandler::storage_err("could not read", e))?;
             self.after = next;
+            self.scanned += blobs.len() as i64;
             if next.is_none() {
                 self.done = true;
             }
@@ -882,11 +913,15 @@ impl BlockScan {
                 if let Some(n) = self.left.as_mut() {
                     *n -= 1;
                     if *n == 0 {
+                        self.stopped_at = docs.last().and_then(crate::heap::ctid_of);
                         self.done = true;
                         break;
                     }
                 }
             }
+        }
+        if self.done {
+            self.count_scan(storage);
         }
         Ok(docs)
     }
@@ -911,9 +946,18 @@ impl BlockScan {
             .unwrap_or_else(|e| e.into_inner())
             .next_batch()
             .map_err(|e| PgHandler::user_error("XX000", e))?;
+        if ctid_order_only(&self.order) {
+            if let Some(n) = self.left.as_mut() {
+                *n = n.saturating_sub(docs.len());
+                if *n == 0 && !docs.is_empty() {
+                    self.stopped_at = docs.last().and_then(crate::heap::ctid_of);
+                }
+            }
+        }
         if docs.is_empty() {
             self.done = true;
             self.sorted = None;
+            self.count_scan(storage);
         }
         Ok(docs)
     }
@@ -939,6 +983,7 @@ impl BlockScan {
                         let (blobs, next) = storage
                             .scan_batch_after(&self.db, &self.table, &self.filter, after, BATCH)
                             .map_err(|e| e.to_string())?;
+                        self.scanned += blobs.len() as i64;
                         if !sink(blobs) || next.is_none() {
                             return Ok(());
                         }
@@ -985,7 +1030,21 @@ impl BlockScan {
             order,
             sorted: None,
             dedup,
+            stat: None,
+            scanned: 0,
+            stopped_at: None,
         }
+    }
+
+    /// The scan ended: count it, once (RP-224).
+    fn count_scan(&mut self, storage: &Storage) {
+        let Some(stat) = self.stat.take() else {
+            return;
+        };
+        let last = self.stopped_at.and_then(|c| {
+            crate::pgstat_sql::tuples_through(storage, &self.db, &self.table, c).map(|n| (c, n))
+        });
+        stat.finish_at(self.scanned, last);
     }
 }
 
@@ -1222,6 +1281,9 @@ impl PgHandler {
     ) -> PgWireResult<futures::stream::BoxStream<'static, PgWireResult<Vec<Document>>>> {
         let primed = order.iter().any(|k| k.expr.is_some());
         let mut first = BlockScan::of(self.db(), sel, order, dedup);
+        if !first.done {
+            first.stat = self.scan_stat(&sel.table, &sel.filter);
+        }
         // An ORDER BY expression needs this statement's thread (see
         // `declare_streamed`): sorted now, through the block.
         if primed {

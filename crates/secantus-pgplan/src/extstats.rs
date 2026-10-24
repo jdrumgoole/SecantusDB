@@ -129,7 +129,12 @@ fn datum_layout(pg_type: &str) -> Option<(i32, bool)> {
         "bool" => (1, true),
         "int2" => (2, true),
         "int4" | "oid" | "float4" | "date" => (4, true),
-        "int8" | "float8" => (8, true),
+        "int8"
+        | "float8"
+        | "timestamp"
+        | "timestamptz"
+        | "timestamp without time zone"
+        | "timestamp with time zone" => (8, true),
         "text" | "varchar" | "character varying" | "bpchar" | "character" | "numeric" => {
             (-1, false)
         }
@@ -288,9 +293,20 @@ fn datum_bytes(pg_type: &str, v: &Bson) -> Option<Vec<u8>> {
             Bson::String(t) => date_days(t)?.to_le_bytes().to_vec(),
             _ => return None,
         },
+        // Microseconds since 2000-01-01 (`Timestamp`), from the stored
+        // instant and its hidden microseconds.
+        "timestamp"
+        | "timestamptz"
+        | "timestamp without time zone"
+        | "timestamp with time zone" => (crate::instant_micros_pub(v)? - POSTGRES_EPOCH_MICROS)
+            .to_le_bytes()
+            .to_vec(),
         _ => return None,
     })
 }
+
+/// 2000-01-01 00:00:00 UTC in microseconds since the Unix epoch.
+const POSTGRES_EPOCH_MICROS: i64 = 946_684_800_000_000;
 
 /// A datum written by [`datum_bytes`], as the value again.
 fn datum_value(pg_type: &str, b: &[u8]) -> Option<Bson> {
@@ -303,6 +319,12 @@ fn datum_value(pg_type: &str, b: &[u8]) -> Option<Bson> {
         "float8" => Bson::Double(f64::from_le_bytes(b.try_into().ok()?)),
         "numeric" => Bson::String(numeric_text(b)?),
         "date" => Bson::String(date_text(i32::from_le_bytes(b.try_into().ok()?))),
+        "timestamp"
+        | "timestamptz"
+        | "timestamp without time zone"
+        | "timestamp with time zone" => {
+            crate::instant_value(i64::from_le_bytes(b.try_into().ok()?) + POSTGRES_EPOCH_MICROS)
+        }
         _ => Bson::String(String::from_utf8(b.to_vec()).ok()?),
     })
 }

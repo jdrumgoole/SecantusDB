@@ -250,7 +250,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ------------------------------------ RP-224 a LIMIT stops a scan early
     "a sequential scan under LIMIT reads only what it returns": (
         "RP-224",
-        True,
+        False,
         [
             "create table rp55_l as select g from generate_series(1, 1000) g",
             _FLUSH,

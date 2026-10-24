@@ -206,7 +206,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ----------------------------------------------- RP-099 what is left
     "an MCV list's bytes over timestamps": (
         "RP-099",
-        True,
+        False,
         [
             "begin",
             "create table rp50_s (t timestamp, a int)",

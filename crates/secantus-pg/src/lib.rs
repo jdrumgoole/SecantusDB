@@ -4290,6 +4290,25 @@ enum TypeKind {
     Defined,
 }
 
+/// Each COPY FROM's serial (`CopyInState::serial`), and the one this thread
+/// last installed the session state for.
+static COPY_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+thread_local! {
+    static COPY_INSTALLED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// What `copy_load` does with its rows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CopyLoad {
+    /// Load them.
+    Rows,
+    /// Load them, the data having ended: the statement's end runs too.
+    Last,
+    /// Only what PostgreSQL checks as it reads each row (NOT NULL, CHECK):
+    /// a later row is bad, and the rows before it are not inserted.
+    CheckOnly,
+}
+
 struct CopyInState {
     format: secantus_pgplan::CopyFormat,
     /// DELIMITER, NULL, QUOTE, ESCAPE and ENCODING (RP-073).
@@ -4313,6 +4332,21 @@ struct CopyInState {
     ended: bool,
     /// The rows loaded so far.
     loaded: usize,
+    /// Rows parsed and not yet loaded, and their bytes: PostgreSQL's
+    /// `CopyMultiInsertBuffer`, flushed at 1,000 rows or 64 kB.
+    pending: Vec<Vec<Option<Bson>>>,
+    pending_bytes: usize,
+    /// This COPY, among every COPY the process runs: the session state its
+    /// parsing reads is installed once per thread for it.
+    serial: u64,
+    /// Its BEFORE STATEMENT triggers have fired.
+    statement_fired: bool,
+    /// The rows loaded so far into a table with foreign keys, checked when
+    /// the data ends: PostgreSQL's RI triggers run at the statement's end.
+    fk_rows: Vec<Document>,
+    /// The rows loaded so far into a table with triggers, for its AFTER
+    /// ROW triggers: queued, as PostgreSQL's are, to the statement's end.
+    after_rows: Vec<Document>,
     /// Outside a block, the COPY's own transaction, held from its first
     /// rows to CopyDone.
     handle: Option<UserTransactionHandle>,
@@ -4872,6 +4906,9 @@ impl PgHandler {
     }
 
     fn install_user_types(&self) {
+        // Whichever COPY this thread installed for no longer has the
+        // thread's state: another session's statement may be installing.
+        COPY_INSTALLED.with(|c| c.set(0));
         // Whose transaction a `txid_current()` planned on this thread asks
         // about.
         secantus_pgplan::snapshots::set_session_pid(
@@ -12861,15 +12898,47 @@ impl PgHandler {
                 .find(|o| o.is_ne())
                 .unwrap_or(std::cmp::Ordering::Equal)
         };
-        let mut keys: Vec<Vec<Bson>> = self
-            .table_docs(table)?
-            .iter()
-            .map(|d| {
-                fields
-                    .iter()
-                    .map(|f| d.get(f).cloned().unwrap_or(Bson::Null))
-                    .collect::<Vec<Bson>>()
-            })
+        // Only the key's fields, read from each stored row's bytes: the
+        // keys are sorted, so the rows' order does not matter.
+        let stored =
+            Self::virtual_table(table).is_none() && !fields.iter().any(|f| f.contains('.'));
+        let keys: Vec<Vec<Bson>> = if stored {
+            let raw = self
+                .storage
+                .find_matching(self.db(), table, &Document::new())
+                .map_err(|e| Self::storage_err("could not read", e))?;
+            let mut keys = Vec::with_capacity(raw.len());
+            for b in &raw {
+                let doc = bson::RawDocument::from_bytes(b)
+                    .map_err(|e| Self::storage_err("could not decode a row", e))?;
+                let mut key = Vec::with_capacity(fields.len());
+                for f in &fields {
+                    let v = match doc
+                        .get(f)
+                        .map_err(|e| Self::storage_err("could not decode a row", e))?
+                    {
+                        Some(v) => Bson::try_from(v.to_raw_bson())
+                            .map_err(|e| Self::storage_err("could not decode a row", e))?,
+                        None => Bson::Null,
+                    };
+                    key.push(v);
+                }
+                keys.push(key);
+            }
+            keys
+        } else {
+            self.table_docs(table)?
+                .iter()
+                .map(|d| {
+                    fields
+                        .iter()
+                        .map(|f| d.get(f).cloned().unwrap_or(Bson::Null))
+                        .collect::<Vec<Bson>>()
+                })
+                .collect()
+        };
+        let mut keys: Vec<Vec<Bson>> = keys
+            .into_iter()
             .filter(|key| nulls_not_distinct || !key.contains(&Bson::Null))
             .collect();
         keys.sort_by(cmp_key);
@@ -25666,15 +25735,21 @@ impl PgHandler {
     /// row is read -- an empty source included (`transformAssignedExpr`,
     /// measured on PostgreSQL 15). An untyped literal or NULL takes the
     /// column's type instead. The source is described, not run.
+    ///
+    /// Returns each target's source type (empty where untyped or unknown),
+    /// which decides how a value is assigned: a `timestamptz`'s instant is
+    /// kept, where a value of no known type is read as a `timestamp` in the
+    /// session's zone (RP-240).
     fn check_insert_select_types(
         &self,
         def: &TableDef,
         ins: &secantus_pgplan::Insert,
         source: &Statement,
-    ) -> PgWireResult<()> {
+    ) -> PgWireResult<Vec<String>> {
         let Ok(fields) = self.copy_query_fields(source) else {
-            return Ok(());
+            return Ok(Vec::new());
         };
+        let mut types: Vec<String> = Vec::with_capacity(fields.len());
         // Expand a `*` to the columns it stands for.
         let named = ins.source_targets.iter().filter(|t| !t.star).count();
         let mut per_column: Vec<Option<&secantus_pgplan::SourceTarget>> = Vec::new();
@@ -25689,8 +25764,22 @@ impl PgHandler {
         for (i, (field, target)) in fields.iter().zip(&ins.targets).enumerate() {
             let entry = per_column.get(i).copied().flatten();
             if entry.is_some_and(|t| t.untyped) {
+                types.push(String::new());
                 continue;
             }
+            let oid = i64::from(field.datatype().oid());
+            types.push(
+                secantus_pgplan::pgtypes::name_of_oid(oid)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        secantus_pgplan::pgtypes::BUILTIN_TYPES
+                            .iter()
+                            .find(|(_, _, arr)| *arr == oid)
+                            .and_then(|(_, el, _)| secantus_pgplan::pgtypes::name_of_oid(*el))
+                            .map(|n| format!("{n}[]"))
+                    })
+                    .unwrap_or_default(),
+            );
             let Some(col) = def.column(target) else {
                 continue;
             };
@@ -25727,7 +25816,7 @@ impl PgHandler {
                 entry.map_or(-1, |t| t.location),
             )));
         }
-        Ok(())
+        Ok(types)
     }
 
     /// The output columns of a `COPY (query) TO STDOUT`, from the same code
@@ -33190,6 +33279,18 @@ impl PgHandler {
     ) -> PgWireResult<(Vec<Document>, TableDef)> {
         // `FOR UPDATE` over the stored table: the rows returned are locked.
         let mut row_lock: Option<secantus_pgplan::RowLock> = None;
+        // A LIMIT straight over a scan of the table, nothing between them
+        // that reads every row first: PostgreSQL's sequential scan stops
+        // once the LIMIT has its rows, and counts only what it read
+        // (RP-224). Its count waits for the rows the WHERE keeps.
+        let limit_stops_scan = sel.limit.is_some()
+            && sel.order.is_empty()
+            && sel.distinct == secantus_pgplan::Distinct::None
+            && sel.windows.is_empty()
+            && !sel.with_ties
+            && sel.lock.is_none()
+            && sel.lock_clauses.is_empty();
+        let mut deferred_seq: Option<(String, i64)> = None;
         // A generated source stands in for the table. Everything after
         // this point -- ORDER BY, OFFSET, LIMIT, the encoder -- works
         // on documents and does not care where they came from, which is
@@ -33300,7 +33401,15 @@ impl PgHandler {
                 (vec![d], Self::sequence_table_def(&sel.table))
             }
             (None, _) => {
-                let raw = self.scan_table(&sel.table, &sel.filter, sel.lock.is_none())?;
+                let raw = if limit_stops_scan {
+                    let (raw, held) = self.deferring_seq_scan(|| {
+                        self.scan_table(&sel.table, &sel.filter, sel.lock.is_none())
+                    });
+                    deferred_seq = held;
+                    raw?
+                } else {
+                    self.scan_table(&sel.table, &sel.filter, sel.lock.is_none())?
+                };
                 let def = self
                     .lookup(&sel.table)
                     .ok_or_else(|| Self::err(&PlanError::UndefinedTable(sel.table.clone())))?;
@@ -33352,6 +33461,16 @@ impl PgHandler {
                 }
             }
             docs = kept;
+        }
+        // The scan stopped at the row that completed OFFSET + LIMIT, in heap
+        // order; a LIMIT 0 never starts it.
+        if let Some((table, total)) = deferred_seq.take() {
+            let needed = usize::try_from(sel.offset.max(0) + sel.limit.unwrap_or(0).max(0))
+                .unwrap_or(usize::MAX);
+            if needed > 0 {
+                let last = docs.get(needed - 1).and_then(crate::heap::ctid_of);
+                self.stat_seq_scan_to(&table, total, last);
+            }
         }
         // The order the windows' last Sort left the rows in: PostgreSQL
         // plans no Sort for an ORDER BY that order already satisfies.
@@ -35754,7 +35873,7 @@ impl PgHandler {
                 // `INSERT ... SELECT`: read the query's rows first, then write
                 // them exactly as a VALUES list would be written.
                 if let Some(source) = ins.source.take() {
-                    self.check_insert_select_types(&def, &ins, &source)?;
+                    let mut source_types = self.check_insert_select_types(&def, &ins, &source)?;
                     // With user casts installed, the source's column types
                     // decide whether an assignment cast converts a value.
                     let (schema, rows) = if secantus_pgplan::user_casts::any() {
@@ -35782,14 +35901,19 @@ impl PgHandler {
                                         .map_err(|e| Self::err(&e))?
                                 {
                                     *v = out;
+                                    // Assigned already: the column's type now.
+                                    if let Some(t) = source_types.get_mut(i) {
+                                        *t = col.pg_type.clone();
+                                    }
                                 }
                             }
                         }
-                        let row = secantus_pgplan::insert_row(
+                        let row = secantus_pgplan::insert_row_typed(
                             &def,
                             &ins.targets,
                             ins.explicit_columns,
                             values,
+                            &source_types,
                         )
                         .map_err(|e| Self::err(&e))?;
                         ins.rows.push(row);
@@ -35997,6 +36121,24 @@ impl PgHandler {
                         "55006".into(), // object_in_use
                         "cannot drop the currently open database".into(),
                     ))));
+                }
+                // `CountDBSubscriptions`: a subscription keeps its database.
+                let subscriptions = self.database_subscription_count(info.oid);
+                if subscriptions > 0 {
+                    let mut e = ErrorInfo::new(
+                        "ERROR".into(),
+                        "55006".into(), // object_in_use
+                        format!(
+                            "database \"{}\" is being used by logical replication subscription",
+                            info.name
+                        ),
+                    );
+                    e.detail = Some(if subscriptions == 1 {
+                        "There is 1 subscription.".into()
+                    } else {
+                        format!("There are {subscriptions} subscriptions.")
+                    });
+                    return Err(PgWireError::UserError(Box::new(e)));
                 }
                 self.databases.remove(&self.storage, &info.name)?;
                 // Its tables' heaps go with it (RP-233).
@@ -38438,6 +38580,12 @@ impl PgHandler {
                     binary_header: None,
                     ended: false,
                     loaded: 0,
+                    pending: Vec::new(),
+                    pending_bytes: 0,
+                    serial: COPY_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    statement_fired: false,
+                    fk_rows: Vec::new(),
+                    after_rows: Vec::new(),
                     handle: None,
                     progress: {
                         // COPY FROM (param5 1), from the client (PIPE, param6 3).
@@ -48454,15 +48602,16 @@ impl CopyHandler for PgHandler {
         } else {
             std::mem::take(&mut state.buffer)
         };
-        let finished =
-            self.copy_chunk(&mut state, &rest)
-                .and_then(|()| match state.handle.take() {
-                    Some(mut handle) => self
-                        .storage
-                        .commit_user_transaction(&mut handle)
-                        .map_err(|e| Self::storage_err("could not commit a transaction", e)),
-                    None => Ok(()),
-                });
+        let finished = self
+            .copy_chunk(&mut state, &rest)
+            .and_then(|()| self.copy_flush(&mut state, true))
+            .and_then(|()| match state.handle.take() {
+                Some(mut handle) => self
+                    .storage
+                    .commit_user_transaction(&mut handle)
+                    .map_err(|e| Self::storage_err("could not commit a transaction", e)),
+                None => Ok(()),
+            });
         if let Err(e) = finished {
             self.copy_abort(Some(state));
             self.note_failure();
@@ -48594,7 +48743,10 @@ impl PgHandler {
         &self,
         state: &mut CopyInState,
         rows: Vec<Vec<Option<Bson>>>,
+        mode: CopyLoad,
     ) -> PgWireResult<usize> {
+        let last = mode == CopyLoad::Last;
+        let check_only = mode == CopyLoad::CheckOnly;
         let mut parsed_rows = Vec::with_capacity(rows.len());
         for raw in rows {
             if raw.len() != state.fields.len() {
@@ -48615,7 +48767,7 @@ impl PgHandler {
             parsed_rows.push(doc);
         }
         let written = parsed_rows.len();
-        if !parsed_rows.is_empty() {
+        if !parsed_rows.is_empty() || last {
             let def = self
                 .lookup(&state.table)
                 .ok_or_else(|| Self::err(&PlanError::UndefinedTable(state.table.clone())))?;
@@ -48632,23 +48784,83 @@ impl PgHandler {
             // sequence is a write. Done outside the transaction it conflicted
             // with the transaction's own earlier `nextval` and spun on the
             // write-conflict retry until the client gave up.
+            // Each row goes through what an INSERT's does (RP-241): BEFORE
+            // ROW triggers, NOT NULL and CHECK, the unique and exclusion
+            // checks the storage indexes do not make, foreign keys, and
+            // AFTER ROW triggers; the statement's triggers fire once, at its
+            // first rows and at its end, as `CopyFrom` fires them.
+            let triggered = self.has_triggers(&state.table)?;
+            let fire_before = triggered && !state.statement_fired;
+            state.statement_fired = true;
+            let has_fks = !def.foreign_keys.is_empty();
+            let mut fk_rows = if last {
+                std::mem::take(&mut state.fk_rows)
+            } else {
+                Vec::new()
+            };
+            let mut stash: Vec<Document> = Vec::new();
+            let mut after_rows = if last {
+                std::mem::take(&mut state.after_rows)
+            } else {
+                Vec::new()
+            };
+            let mut after_stash: Vec<Document> = Vec::new();
             let load = || -> PgWireResult<_> {
+                if fire_before {
+                    self.fire_statement_triggers(&def.name, "BEFORE", "INSERT")?;
+                }
                 let mut rows = parsed_rows;
                 self.apply_serial_defaults(&def, &mut rows)?;
                 self.apply_expression_defaults(&def, &mut rows)?;
                 apply_column_defaults(&def, &mut rows)?;
                 self.apply_generated(&def, &mut rows)?;
-                let (table, _, mut rows) = self.copy_target(&def, rows)?;
-                self.stamp_inserted(&table, &def, &mut rows)?;
-                let docs = rows
-                    .iter()
-                    .map(encode_doc)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| Self::storage_err("could not encode a COPY row", e))?;
-                let docs = self.with_expr_fields(&table, docs)?;
-                self.storage
-                    .insert(self.db(), &table, docs, true)
-                    .map_err(|e| Self::storage_err("could not insert COPY rows", e))
+                if triggered && !rows.is_empty() {
+                    rows = self.before_insert_rows(&def, rows)?;
+                }
+                for row in &rows {
+                    self.check_row_constraints(&def, row)?;
+                    self.check_partition_route(&def, row)?;
+                }
+                if check_only {
+                    return Ok((0, Vec::new()));
+                }
+                self.check_expression_unique(&def, &rows, &[])?;
+                self.check_partition_unique(&def, &rows, &[])?;
+                self.check_exclusions(&def, &rows, &[])?;
+                self.check_computed_uniques(&def, &rows, &[])?;
+                if has_fks {
+                    if last {
+                        fk_rows.extend(rows.iter().cloned());
+                        self.check_foreign_keys(&def, &fk_rows)?;
+                    } else {
+                        stash.extend(rows.iter().cloned());
+                    }
+                }
+                let mut out = (0, Vec::new());
+                if !rows.is_empty() {
+                    let (table, _, mut rows) = self.copy_target(&def, rows.clone())?;
+                    self.stamp_inserted(&table, &def, &mut rows)?;
+                    let docs = rows
+                        .iter()
+                        .map(encode_doc)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| Self::storage_err("could not encode a COPY row", e))?;
+                    let docs = self.with_expr_fields(&table, docs)?;
+                    out = self
+                        .storage
+                        .insert(self.db(), &table, docs, true)
+                        .map_err(|e| Self::storage_err("could not insert COPY rows", e))?;
+                }
+                if triggered && out.1.is_empty() {
+                    if last {
+                        after_rows.extend(rows);
+                        self.after_insert_rows(&def, &after_rows)?;
+                        self.fire_statement_triggers(&def.name, "AFTER", "INSERT")?;
+                    } else {
+                        after_stash.extend(rows);
+                    }
+                }
+                Ok(out)
             };
             let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
             // Outside a block the COPY is its own transaction, held across
@@ -48673,6 +48885,8 @@ impl PgHandler {
             if let Some(first) = errors.first() {
                 return Err(Self::write_error(&state.table, &def, first));
             }
+            state.fk_rows.extend(stash);
+            state.after_rows.extend(after_stash);
         }
         Ok(written)
     }
@@ -48771,7 +48985,13 @@ impl PgHandler {
         if bytes.is_empty() {
             return Ok(());
         }
-        self.install_user_types();
+        // The session's state cannot change while its COPY runs: installed
+        // once per thread, not once per message (a client may send a
+        // message per row).
+        if COPY_INSTALLED.with(|c| c.get()) != state.serial {
+            self.install_user_types();
+            COPY_INSTALLED.with(|c| c.set(state.serial));
+        }
         let rows = if state.format == secantus_pgplan::CopyFormat::Binary {
             let header = match &state.binary_header {
                 Some(h) => h.clone(),
@@ -48785,20 +49005,66 @@ impl PgHandler {
                     let mut all = h;
                     all.extend_from_slice(&bytes[len..]);
                     let rows = self.copy_parse(state, &all, false)?;
-                    let n = self.copy_load(state, rows)?;
-                    state.loaded += n;
-                    state.progress.set(2, state.loaded as i64);
-                    return Ok(());
+                    return self.copy_buffer(state, rows, bytes.len());
                 }
             };
             let mut all = header;
             all.extend_from_slice(bytes);
-            self.copy_parse(state, &all, false)?
+            self.copy_parse(state, &all, false)
         } else {
             let header = std::mem::take(&mut state.header_left);
-            self.copy_parse(state, bytes, header)?
+            self.copy_parse(state, bytes, header)
         };
-        let n = self.copy_load(state, rows)?;
+        // A bad row stops the COPY there: the rows read before it are
+        // checked first, as PostgreSQL checks each row when it reads it.
+        let rows = match rows {
+            Ok(rows) => rows,
+            Err(e) => {
+                let rows = std::mem::take(&mut state.pending);
+                self.copy_load(state, rows, CopyLoad::CheckOnly)?;
+                return Err(e);
+            }
+        };
+        self.copy_buffer(state, rows, bytes.len())
+    }
+
+    /// Buffer a chunk's parsed rows, as `CopyFrom` adds each to its
+    /// multi-insert buffer, and load them once the buffer is full: 1,000
+    /// rows or 64 kB (`MAX_BUFFERED_TUPLES`, `MAX_BUFFERED_BYTES`). A table
+    /// with triggers loads each chunk now, as PostgreSQL inserts row by row
+    /// there (`CIM_SINGLE`): a trigger may read the table. The progress
+    /// counts each row when it is buffered.
+    fn copy_buffer(
+        &self,
+        state: &mut CopyInState,
+        rows: Vec<Vec<Option<Bson>>>,
+        bytes: usize,
+    ) -> PgWireResult<()> {
+        state.pending.extend(rows);
+        state.pending_bytes += bytes;
+        state
+            .progress
+            .set(2, (state.loaded + state.pending.len()) as i64);
+        let full = state.pending.len() >= 1000 || state.pending_bytes >= 65_535;
+        if full || self.has_triggers(&state.table)? {
+            self.copy_flush(state, false)?;
+        }
+        Ok(())
+    }
+
+    /// Load the buffered rows; `last` once the data has ended, which fires
+    /// the AFTER STATEMENT triggers.
+    fn copy_flush(&self, state: &mut CopyInState, last: bool) -> PgWireResult<()> {
+        let rows = std::mem::take(&mut state.pending);
+        state.pending_bytes = 0;
+        if rows.is_empty() && !last {
+            return Ok(());
+        }
+        let n = self.copy_load(
+            state,
+            rows,
+            if last { CopyLoad::Last } else { CopyLoad::Rows },
+        )?;
         state.loaded += n;
         state.progress.set(2, state.loaded as i64);
         Ok(())
