@@ -31,6 +31,19 @@ _PROGRESS = (
 )
 
 
+def _settled(b: Any, pid: int, before: Any) -> Any:
+    """What `b` reads of `pid`'s COPY once it has moved past `before`: the
+    data a write sends reaches the server when the network and the
+    server's scheduler let it, so a fixed pause can read too soon (a CI
+    runner read nothing 0.3 s after a write)."""
+    deadline = time.monotonic() + 10
+    while True:
+        got = b.execute(_PROGRESS, (pid,)).fetchall()
+        if got != before or time.monotonic() > deadline:
+            return got
+        time.sleep(0.05)
+
+
 def copy_progress(dsn: str) -> list[Any]:
     """What another session reads of a COPY FROM as its data arrives."""
     out: list[Any] = []
@@ -43,17 +56,21 @@ def copy_progress(dsn: str) -> list[Any]:
             pid = a.execute("select pg_backend_pid()").fetchone()[0]
             with a.cursor().copy("copy rp56_c from stdin") as cp:
                 # The third row is split between two messages.
+                started = [("COPY FROM", "PIPE", 0, 0, 0, 0, "rp56_c", "postgres", True)]
                 cp.write("1\tone\n2\ttwo\n3\tth")
-                time.sleep(0.3)
-                out.append(b.execute(_PROGRESS, (pid,)).fetchall())
+                out.append(_settled(b, pid, started))
                 cp.write("ree\n")
-                time.sleep(0.3)
-                out.append(b.execute(_PROGRESS, (pid,)).fetchall())
+                out.append(_settled(b, pid, out[-1]))
             out.append(b.execute(_PROGRESS, (pid,)).fetchall())
             with a.cursor().copy("copy rp56_c (x) from stdin with (format csv, header)") as cp:
                 cp.write("x\n7\n")
-                time.sleep(0.3)
-                out.append(b.execute(_PROGRESS, (pid,)).fetchall())
+                out.append(
+                    _settled(
+                        b,
+                        pid,
+                        [("COPY FROM", "PIPE", 0, 0, 0, 0, "rp56_c", "postgres", True)],
+                    )
+                )
             out.append(a.execute("select x, t from rp56_c order by x").fetchall())
         finally:
             a.execute("drop table rp56_c")
