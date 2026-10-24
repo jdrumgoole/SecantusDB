@@ -1014,22 +1014,6 @@ as they do against PostgreSQL 15.19 (RP-070, RP-071). The gap tests are
 scenarios in `tests/backlog/test_rp_batch26.py`, measured on a private 15.19
 cluster.
 
-- [ ] **Column statistics: tables past ANALYZE's sample.** ANALYZE builds every kind of statistics object as PostgreSQL
-      15.19 does (batch 50: ndistinct, dependencies, MCV lists, expression
-      statistics, inherited ones), and `pg_statistic_ext_data`,
-      `pg_stats_ext` and `pg_stats_ext_exprs` show them. Since batch 66 they
-      are built from ANALYZE's sample of a table past 300 times the
-      statistics target, drawn as `acquire_sample_rows` draws it. What is
-      left: such a table has no `pg_statistic` rows here, so `pg_stats`
-      lists none of its columns. PostgreSQL computes them from the same
-      sample. That needs `compute_scalar_stats`' handling of a sample
-      smaller than the table: the distinct count scaled by the rows
-      estimated, and `analyze_mcv_list`'s choice of which common values to
-      keep. An inheritance tree past the sample has no extended statistics
-      either: `acquire_inherited_sample_rows` samples each child in
-      proportion to its size.
-      Backlog-ID: RP-099
-      Verify: tests/backlog/test_rp_batch50.py::test_scenario[a table past ANALYZE's sample has column statistics]
 
 ## Found by batch 28 (2026-10-22)
 
