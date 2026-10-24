@@ -504,17 +504,25 @@ pub fn get_log(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             ));
         }
     };
+    // mongod's structured log, its latest lines: `startupWarnings` is the
+    // lines tagged for it (measured 8.2.11, 2026-10-24).
     let entries = ctx.logs.as_ref().map(|l| l.tail(None)).unwrap_or_default();
-    let formatted: Vec<Bson> = entries
+    let selected: Vec<&crate::logbuf::LogEntry> = entries
         .iter()
-        .filter(|e| !warnings_only || e.level == "W")
-        .map(|e| {
-            let ts = e.ts.try_to_rfc3339_string().unwrap_or_default();
-            Bson::String(format!("{ts} {} {} {}", e.level, e.component, e.msg))
-        })
+        .filter(|e| !warnings_only || e.tags.contains(&"startupWarnings"))
+        .collect();
+    let total = if warnings_only {
+        selected.len() as u64
+    } else {
+        ctx.logs.as_ref().map_or(0, |l| l.total_written())
+    };
+    let from = selected.len().saturating_sub(crate::logbuf::GET_LOG_LINES);
+    let formatted: Vec<Bson> = selected[from..]
+        .iter()
+        .map(|e| Bson::String(e.render()))
         .collect();
     Ok(doc! {
-        "totalLinesWritten": formatted.len() as i32,
+        "totalLinesWritten": i32::try_from(total).unwrap_or(i32::MAX),
         "log": formatted,
         "ok": 1.0,
     })

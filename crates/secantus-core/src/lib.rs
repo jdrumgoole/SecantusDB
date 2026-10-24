@@ -35,6 +35,7 @@ pub mod geoorder;
 pub mod geoshape;
 pub mod heap;
 pub mod hybrid;
+pub mod logtime;
 pub mod oid;
 pub mod projection;
 pub mod query;

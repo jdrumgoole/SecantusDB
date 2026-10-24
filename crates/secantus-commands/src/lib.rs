@@ -52,7 +52,7 @@ pub mod cluster_params;
 pub mod crud;
 pub mod cursors;
 mod db_check;
-mod dbhash;
+pub mod dbhash;
 mod ddl_checks;
 pub mod diagnostics;
 pub mod distinct;

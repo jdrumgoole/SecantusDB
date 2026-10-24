@@ -438,17 +438,31 @@ mod tests {
     #[test]
     fn get_log_returns_buffered_lines_formatted() {
         let logs = std::sync::Arc::new(crate::logbuf::LogBuffer::new());
-        logs.append("I", "NETWORK", "connection accepted #1");
-        logs.append("I", "CONTROL", "started");
+        logs.log(crate::logbuf::LogEntry::new(
+            "I",
+            "NETWORK",
+            22943,
+            "listener",
+            "Connection accepted",
+        ));
+        logs.log(crate::logbuf::LogEntry::new(
+            "I",
+            "CONTROL",
+            4615611,
+            "initandlisten",
+            "MongoDB starting",
+        ));
         let mut c = ctx().with_logs(logs);
         let reply = dispatch(&doc! {"getLog": "global"}, &mut c);
         assert_eq!(reply.get_i32("totalLinesWritten").unwrap(), 2);
         let log = reply.get_array("log").unwrap();
         assert_eq!(log.len(), 2);
-        // Format is "<ts> <level> <component> <msg>".
+        // mongod's structured log: one JSON document per line.
         let line0 = log[0].as_str().unwrap();
         assert!(
-            line0.contains("I NETWORK connection accepted #1"),
+            line0.contains(
+                r#""c":"NETWORK",  "id":22943,   "ctx":"listener","msg":"Connection accepted"}"#
+            ),
             "unexpected log line: {line0}"
         );
     }
