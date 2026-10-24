@@ -662,8 +662,8 @@ impl PgHandler {
                         }
                     }
                 }
-                self.stat_page(&heap_table, ctid / 65536);
             }
+            self.stat_pages(&heap_table, ctids.iter().map(|c| c / 65536));
             self.stat_writes(&heap_table, inserted, updated, hot);
             for (i, ctid) in idx.into_iter().zip(ctids) {
                 // An xid is 32 bits (the low half of the xid8).
@@ -971,6 +971,22 @@ impl PgHandler {
                 .iter()
                 .flat_map(|p| p.lps.values())
                 .filter(|lp| matches!(lp, Lp::Normal(t) if t.xmax.is_some() || t.xmin_aborted))
+                .count() as i64
+        })
+        .unwrap_or(0)
+    }
+
+    /// The tuples on the heap's pages, live or dead: what a B-tree over
+    /// the table holds an entry for until VACUUM.
+    pub(crate) fn heap_tuple_count(&self, table: &str) -> i64 {
+        if !self.has_heap(table) {
+            return 0;
+        }
+        self.with_heap(table, |heap| {
+            heap.pages
+                .iter()
+                .flat_map(|p| p.lps.values())
+                .filter(|lp| matches!(lp, Lp::Normal(_)))
                 .count() as i64
         })
         .unwrap_or(0)

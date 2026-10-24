@@ -2,6 +2,8 @@
 //! [`crate::pgstat`], the hooks the executor calls, and the
 //! `pg_stat_get_*` functions the statistics views are defined over.
 
+use std::collections::HashMap;
+
 use bson::Bson;
 use pgwire::error::PgWireResult;
 
@@ -103,13 +105,14 @@ impl PgHandler {
         self.stats().deleted(rel, n);
     }
 
-    /// A page of `table` is touched (a read or a hit, as the pool holds it).
-    pub(crate) fn stat_page(&self, table: &str, block: i64) {
+    /// Pages of `table` touched (each a read or a hit, as the pool holds
+    /// it).
+    pub(crate) fn stat_pages(&self, table: &str, blocks: impl IntoIterator<Item = i64>) {
         if !self.tracking() || table.starts_with("__") {
             return;
         }
         let rel = self.relation_oid(table).unwrap_or(0);
-        self.stats().page(rel, block, self.buffer_pages());
+        self.stats().pages(rel, blocks, self.buffer_pages());
     }
 
     /// Every page of `table`'s heap is touched by a sequential scan.
@@ -118,12 +121,73 @@ impl PgHandler {
             return;
         }
         let blocks = self.heap_blocks(table).unwrap_or(0);
-        let rel = self.relation_oid(table).unwrap_or(0);
-        let s = self.stats();
-        let capacity = self.buffer_pages();
-        for b in 0..i64::from(blocks) {
-            s.page(rel, b, capacity);
+        self.stat_pages(table, 0..i64::from(blocks));
+    }
+
+    /// The oid of `table`'s index `index` (the storage's `_id_` is its
+    /// primary key), read once per catalog version.
+    fn stat_index_oid(&self, table: &str, index: &str) -> i64 {
+        type Key = (u64, u64, String, String);
+        thread_local! {
+            static MEMO: std::cell::RefCell<HashMap<Key, i64>> = std::cell::RefCell::new(HashMap::new());
         }
+        let name = if index == "_id_" {
+            format!("{}_pkey", secantus_pgplan::schemas::split_key(table).1)
+        } else {
+            index.to_string()
+        };
+        let key: Key = (
+            crate::catalog_cache()
+                .version
+                .load(std::sync::atomic::Ordering::SeqCst),
+            if self.block_wrote_catalog() {
+                self.session_serial
+            } else {
+                0
+            },
+            table.to_string(),
+            name.clone(),
+        );
+        if let Some(o) = MEMO.with(|m| m.borrow().get(&key).copied()) {
+            return o;
+        }
+        let oid = self
+            .index_relations()
+            .iter()
+            .find(|ix| {
+                ix.table.name == table && secantus_pgplan::schemas::split_key(&ix.name).1 == name
+            })
+            .map_or(0, |ix| ix.oid);
+        MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            if m.len() > 4096 {
+                m.clear();
+            }
+            m.insert(key, oid);
+        });
+        oid
+    }
+
+    /// The B-tree levels above the leaves of an index on `table`, from the
+    /// heap's tuples, recounted when the heap grows a page.
+    fn stat_btree_levels(&self, table: &str) -> i64 {
+        thread_local! {
+            static MEMO: std::cell::RefCell<HashMap<(String, u32), i64>> = std::cell::RefCell::new(HashMap::new());
+        }
+        let blocks = self.heap_blocks(table).unwrap_or(0);
+        let key = (table.to_string(), blocks);
+        if let Some(l) = MEMO.with(|m| m.borrow().get(&key).copied()) {
+            return l;
+        }
+        let levels = btree_levels(self.heap_tuple_count(table) as f64);
+        MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            if m.len() > 4096 {
+                m.clear();
+            }
+            m.insert(key, levels);
+        });
+        levels
     }
 
     /// A query's scan of `table` under `filter` returned `rows`: a
@@ -136,24 +200,8 @@ impl PgHandler {
         }
         match self.storage.explain_plan(self.db(), table, filter) {
             Ok(secantus_storage::ExplainPlan::IxScan { index_name, .. }) => {
-                let index = if index_name == "_id_" {
-                    format!("{}_pkey", secantus_pgplan::schemas::split_key(table).1)
-                } else {
-                    index_name
-                };
-                let oid = self
-                    .index_relations()
-                    .iter()
-                    .find(|ix| {
-                        ix.table.name == table
-                            && secantus_pgplan::schemas::split_key(&ix.name).1 == index
-                    })
-                    .map_or(0, |ix| ix.oid);
-                let ctids: Vec<i64> = rows
-                    .iter()
-                    .filter_map(|b| crate::decode_doc(b).ok())
-                    .filter_map(|d| crate::heap::ctid_of(&d))
-                    .collect();
+                let oid = self.stat_index_oid(table, &index_name);
+                let ctids: Vec<i64> = rows.iter().filter_map(|b| raw_ctid(b)).collect();
                 self.stat_index_scan(table, oid, &ctids);
             }
             _ => {
@@ -178,41 +226,45 @@ impl PgHandler {
         let rel = self.relation_oid(table).unwrap_or(0);
         let index = match self.storage.explain_plan(self.db(), table, filter) {
             Ok(secantus_storage::ExplainPlan::IxScan { index_name, .. }) => {
-                let name = if index_name == "_id_" {
-                    format!("{}_pkey", secantus_pgplan::schemas::split_key(table).1)
-                } else {
-                    index_name
-                };
-                Some(
-                    self.index_relations()
-                        .iter()
-                        .find(|ix| {
-                            ix.table.name == table
-                                && secantus_pgplan::schemas::split_key(&ix.name).1 == name
-                        })
-                        .map_or(0, |ix| ix.oid),
-                )
+                Some(self.stat_index_oid(table, &index_name))
             }
             _ => None,
         };
-        let total = self
-            .storage
-            .count_matching(self.db(), table, &bson::Document::new(), None)
-            .unwrap_or(0) as i64;
+        let total = if index.is_some() {
+            0
+        } else {
+            self.storage
+                .count_matching(self.db(), table, &bson::Document::new(), None)
+                .unwrap_or(0) as i64
+        };
         Some(ScanStat {
             stats: self.stats(),
             rel,
             index,
             blocks: self.heap_blocks(table).unwrap_or(0),
             capacity: self.buffer_pages(),
-            levels: btree_levels(total as f64),
+            levels: if index.is_some() {
+                self.stat_btree_levels(table)
+            } else {
+                0
+            },
             total,
         })
     }
 
-    /// A write's scan of `table` under `filter`, its rows not in hand.
+    /// A write's scan of `table` under `filter`, its rows not in hand: a
+    /// sequential one needs only the table's size, an index one the rows it
+    /// reaches.
     pub(crate) fn stat_scan_filter(&self, table: &str, filter: &bson::Document) {
         if !self.tracking() || table.starts_with("__") || !self.has_heap(table) {
+            return;
+        }
+        if self.collection_scan(table, filter) {
+            let total = self
+                .storage
+                .count_matching(self.db(), table, &bson::Document::new(), None)
+                .unwrap_or(0);
+            self.stat_seq_scan(table, total as i64);
             return;
         }
         let rows = self
@@ -242,20 +294,10 @@ impl PgHandler {
         s.index_scan(index_oid, n, n);
         let capacity = self.buffer_pages();
         // The descent: the metapage, then a page a level down to the leaf.
-        let rows = self
-            .recorded_sizes()
-            .get(table)
-            .map_or(0.0, |(_, t, _)| t.max(0.0));
-        let levels = btree_levels(rows);
-        for level in 0..=levels {
-            s.page(index_oid, level, capacity);
-        }
-        let rel = self.relation_oid(table).unwrap_or(0);
-        let mut blocks: Vec<i64> = ctids.iter().map(|c| c >> 16).collect();
+        s.pages(index_oid, 0..=self.stat_btree_levels(table), capacity);
+        let mut blocks: Vec<i64> = ctids.iter().map(|c| c / 65536).collect();
         blocks.dedup();
-        for b in blocks {
-            s.page(rel, b, capacity);
-        }
+        self.stat_pages(table, blocks);
     }
 
     /// A VACUUM (`analyze` false) or ANALYZE of `table` reports what it
@@ -316,7 +358,10 @@ impl PgHandler {
         } else {
             Disconnect::Normal
         };
-        s.disconnect(self.stat_session_start.elapsed().as_secs_f64() * 1000.0, how);
+        s.disconnect(
+            self.stat_session_start.elapsed().as_secs_f64() * 1000.0,
+            how,
+        );
     }
 
     // ------------------------------------------------------------ the SQL
@@ -495,16 +540,26 @@ impl ScanStat {
         match self.index {
             Some(ix) => {
                 self.stats.index_scan(ix, returned, returned);
-                for level in 0..=self.levels {
-                    self.stats.page(ix, level, self.capacity);
-                }
+                self.stats.pages(ix, 0..=self.levels, self.capacity);
             }
             None => {
                 self.stats.seq_scan(self.rel, self.total);
-                for b in 0..i64::from(self.blocks) {
-                    self.stats.page(self.rel, b, self.capacity);
-                }
+                self.stats
+                    .pages(self.rel, 0..i64::from(self.blocks), self.capacity);
             }
         }
+    }
+}
+
+/// A stored row's ctid, read from its bytes without decoding the row.
+fn raw_ctid(bytes: &[u8]) -> Option<i64> {
+    match bson::RawDocument::from_bytes(bytes)
+        .ok()?
+        .get("__sys_ctid")
+        .ok()??
+    {
+        bson::RawBsonRef::Int64(v) => Some(v),
+        bson::RawBsonRef::Int32(v) => Some(i64::from(v)),
+        _ => None,
     }
 }

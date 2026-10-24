@@ -200,7 +200,9 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
             "select d.xact_commit - b.c, d.xact_rollback - b.r, d.tup_inserted - b.i, "
             "d.tup_deleted - b.d from pg_stat_database d, rp55_before b "
             "where d.datname = current_database()",
-            "select numbackends > 0, stats_reset is null, checksum_failures is null "
+            # `stats_reset` is left out: it holds the last reset of the
+            # database's counters, whatever earlier ran on the server.
+            "select numbackends > 0, checksum_failures is null "
             "from pg_stat_database where datname = current_database()",
             "drop table rp55_before",
             "drop table rp55_d",
@@ -368,7 +370,7 @@ EXPECTED: dict[str, Any] = {
         "ROLLBACK",
         [("",)],
         [("3", "1", "4", "3")],
-        [("True", "False", "True")],
+        [("True", "True")],
         "DROP TABLE",
         "DROP TABLE",
     ],

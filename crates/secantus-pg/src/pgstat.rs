@@ -530,18 +530,32 @@ impl Stats {
         self.with(|s| s.buffers.drop_relation(rel));
     }
 
-    /// A page of `rel` is read or hit (`pgstat_count_buffer_read` /
-    /// `_hit`), as the shared buffer pool holds it.
-    pub(crate) fn page(&self, rel: i64, block: i64, capacity: usize) {
+    /// Pages `blocks` of `rel` touched (`pgstat_count_buffer_read` /
+    /// `_hit`), as the shared buffer pool holds them: under one lock, a
+    /// scan's or a statement's batch.
+    pub(crate) fn pages(&self, rel: i64, blocks: impl IntoIterator<Item = i64>, capacity: usize) {
         if rel == 0 {
             return;
         }
-        let hit = self.with(|s| s.buffers.touch((rel, block), capacity));
-        self.rel(rel, |c| {
-            c.blocks_fetched += 1;
-            if hit {
-                c.blocks_hit += 1;
+        let (pid, db) = (self.pid, self.db);
+        self.with(|s| {
+            let (mut fetched, mut hit) = (0, 0);
+            for b in blocks {
+                fetched += 1;
+                if s.buffers.touch((rel, b), capacity) {
+                    hit += 1;
+                }
             }
+            if fetched == 0 {
+                return;
+            }
+            let be = backend(s, pid, db);
+            if be.pending_since.is_none() {
+                be.pending_since = Some(Instant::now());
+            }
+            let c = be.rels.entry(rel).or_default();
+            c.blocks_fetched += fetched;
+            c.blocks_hit += hit;
         });
     }
 
@@ -1253,9 +1267,7 @@ mod tests {
     #[test]
     fn the_buffer_pool_reads_once_then_hits() {
         let s = stats(0xA4);
-        for _ in 0..3 {
-            s.page(100, 0, 16);
-        }
+        s.pages(100, [0, 0, 0], 16);
         s.force_next_flush();
         s.report(false);
         let e = s.rel_entry(Consistency::None, 100).expect("an entry");
