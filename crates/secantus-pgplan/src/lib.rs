@@ -32950,18 +32950,36 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
             Bson::Boolean(_) => Err(Error::CannotCoerce(
                 "cannot cast type boolean to bigint".to_string(),
             )),
-            Bson::Double(d) => Ok(Bson::Int64(d.round_ties_even() as i64)),
+            // `dtoi8`: out of range (or NaN) is 22003, where `as` would
+            // saturate.
+            Bson::Double(d) => {
+                let r = d.round_ties_even();
+                if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&r) {
+                    Ok(Bson::Int64(r as i64))
+                } else {
+                    Err(Error::NumericOutOfRange("bigint out of range".to_string()))
+                }
+            }
             v if is_numeric(v) => decimal_to_integer(v)
                 .and_then(|n| i64::try_from(n).ok())
                 .map(Bson::Int64)
                 .ok_or_else(|| {
                     Error::NumericOutOfRange(format!("bigint out of range: \"{}\"", as_text(v)))
                 }),
-            Bson::String(s) => s
-                .trim()
-                .parse::<i64>()
-                .map(Bson::Int64)
-                .map_err(|_| bad("bigint", &value)),
+            Bson::String(s) => {
+                let t = s.trim();
+                t.parse::<i64>().map(Bson::Int64).map_err(|_| {
+                    // Digits that do not fit are out of range, not bad syntax.
+                    let digits = t.strip_prefix(['-', '+']).unwrap_or(t);
+                    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                        Error::NumericOutOfRange(format!(
+                            "value \"{s}\" is out of range for type bigint"
+                        ))
+                    } else {
+                        bad("bigint", &value)
+                    }
+                })
+            }
             _ => Err(bad("bigint", &value)),
         },
         // `numeric` is its own type, not a float: it keeps scale and does not

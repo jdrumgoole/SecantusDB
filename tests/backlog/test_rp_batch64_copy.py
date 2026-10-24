@@ -1,6 +1,6 @@
-"""Batch 64 of the Rust PG server (2026-10-24): COPY FROM checks each row
-as an INSERT does (RP-241), in PostgreSQL's order, and says where a row
-failed (RP-242).
+"""Batches 64 and 65 of the Rust PG server (2026-10-24): COPY FROM checks
+each row as an INSERT does (RP-241), in PostgreSQL's order, says where a
+row failed (RP-242), and reads numbers by their input functions (RP-244).
 
 Each scenario runs the same steps against a private, freshly initdb'd
 PostgreSQL 15.19 cluster and this server; the literals are 15.19's answers,
@@ -26,7 +26,7 @@ import pytest
 
 from tests.backlog.test_rp_batch26 import _dsn, _marked
 
-Step = str | tuple[str, str]
+Step = str | tuple[str, str] | tuple[str, str, bool]
 
 _SETUP = [
     "drop table if exists rp64c_a, rp64c_p, rp64c_l cascade",
@@ -102,14 +102,35 @@ SCENARIOS: dict[str, tuple[str, bool, bool, list[Step]]] = {
     ),
     "a COPY error names its line": (
         "RP-242",
-        True,
+        False,
         True,
         [
             *_SETUP,
             (_COPY, "1\t1\t1\t1\nx\t1\t2\t1\n"),
             (_COPY, "1\t1\t1\t1\n7\t1\t2\t1\n"),
             (_COPY, "1\t1\t3\t1\n1\t1\t13\t1\n"),
+            # A value past 100 bytes is cut, and a NULL refused names its row.
+            (_COPY, "1\t1\t1\t" + "x" * 120 + "\n"),
+            (_COPY, "\\N\t1\t1\t1\n"),
+            # In one message: the CHECK on line 2 before the bad value on 3.
+            (_COPY, "1\t1\t1\t1\n7\t1\t2\t1\nx\t1\t3\t1\n", True),
+            ("copy rp64c_a from stdin (format csv, header)", "a,b,c,d\n1,1,1,1\n1,x,2,1\n"),
             _DROP,
+        ],
+    ),
+    "COPY FROM reads numbers by their input functions": (
+        "RP-244",
+        False,
+        True,
+        [
+            "create table rp64c_n (a int2, b int4, f float8, d int8)",
+            ("copy rp64c_n from stdin", "1\t-2147483648\tInfinity\t 7 \n"),
+            ("copy rp64c_n from stdin", "99999\t1\t1\t1\n"),
+            ("copy rp64c_n from stdin", "1\t99999999999\t1\t1\n"),
+            ("copy rp64c_n from stdin", "1\t1\t1e400\t1\n"),
+            ("copy rp64c_n from stdin", "1\t1\t1\t99999999999999999999\n"),
+            "select * from rp64c_n",
+            "drop table rp64c_n",
         ],
     ),
 }
@@ -122,10 +143,12 @@ def _step(conn: Any, step: Step, context: bool) -> Any:
             if cur.description is None:
                 return cur.statusmessage
             return [tuple(str(v) for v in row) for row in cur.fetchall()]
-        sql, data = step
+        sql, data = step[0], step[1]
+        # `(sql, data, True)` sends the data as one message.
+        whole = len(step) > 2 and step[2]
         cur = conn.cursor()
         with cur.copy(sql) as copy:
-            for line in data.splitlines(keepends=True):
+            for line in [data] if whole else data.splitlines(keepends=True):
                 copy.write(line)
         return cur.statusmessage
     except psycopg.Error as e:
@@ -265,6 +288,70 @@ EXPECTED: dict[str, Any] = {
             "Key ((c % 10))=(3) already exists.",
             "COPY rp64c_a, line 2",
         ),
+        (
+            "ERR",
+            "22P02",
+            "invalid input syntax for type integer: "
+            '"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"',
+            None,
+            "COPY rp64c_a, line 1, column d: "
+            '"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx..."',
+        ),
+        (
+            "ERR",
+            "23502",
+            'null value in column "a" of relation "rp64c_a" violates not-null constraint',
+            "Failing row contains (null, 1, 1, 1).",
+            'COPY rp64c_a, line 1: "\\N\t1\t1\t1"',
+        ),
+        (
+            "ERR",
+            "23514",
+            'new row for relation "rp64c_a" violates check constraint "rp64c_a_a_check"',
+            "Failing row contains (7, 1, 2, 1).",
+            'COPY rp64c_a, line 2: "7\t1\t2\t1"',
+        ),
+        (
+            "ERR",
+            "22P02",
+            'invalid input syntax for type integer: "x"',
+            None,
+            'COPY rp64c_a, line 3, column b: "x"',
+        ),
+        "DROP TABLE",
+    ],
+    "COPY FROM reads numbers by their input functions": [
+        "CREATE TABLE",
+        "COPY 1",
+        (
+            "ERR",
+            "22003",
+            'value "99999" is out of range for type smallint',
+            None,
+            'COPY rp64c_n, line 1, column a: "99999"',
+        ),
+        (
+            "ERR",
+            "22003",
+            'value "99999999999" is out of range for type integer',
+            None,
+            'COPY rp64c_n, line 1, column b: "99999999999"',
+        ),
+        (
+            "ERR",
+            "22003",
+            '"1e400" is out of range for type double precision',
+            None,
+            'COPY rp64c_n, line 1, column f: "1e400"',
+        ),
+        (
+            "ERR",
+            "22003",
+            'value "99999999999999999999" is out of range for type bigint',
+            None,
+            'COPY rp64c_n, line 1, column d: "99999999999999999999"',
+        ),
+        [("1", "-2147483648", "inf", "7")],
         "DROP TABLE",
     ],
 }

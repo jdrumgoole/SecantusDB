@@ -80,13 +80,28 @@ pub(crate) fn parse(
     force_not_null: &[bool],
     force_null: &[bool],
 ) -> Vec<Vec<Option<String>>> {
+    parse_lines(text, csv, opts, force_not_null, force_null)
+        .into_iter()
+        .map(|(row, _)| row)
+        .collect()
+}
+
+/// `parse`, each row with its line as it arrived (without the newline): what
+/// a COPY error's CONTEXT quotes.
+pub(crate) fn parse_lines(
+    text: &str,
+    csv: bool,
+    opts: &CopyOptions,
+    force_not_null: &[bool],
+    force_null: &[bool],
+) -> Vec<(Vec<Option<String>>, String)> {
     let mut rows = if csv {
         parse_csv(text, opts)
     } else {
         parse_text(text, opts)
     };
     if csv {
-        for row in &mut rows {
+        for (row, _) in &mut rows {
             for (i, field) in row.iter_mut().enumerate() {
                 if field.is_none() && force_not_null.get(i).copied().unwrap_or(false) {
                     *field = Some(opts.null.clone());
@@ -101,7 +116,7 @@ pub(crate) fn parse(
     rows
 }
 
-fn parse_text(text: &str, opts: &CopyOptions) -> Vec<Vec<Option<String>>> {
+fn parse_text(text: &str, opts: &CopyOptions) -> Vec<(Vec<Option<String>>, String)> {
     let delim = opts.delimiter as u8;
     let mut rows = Vec::new();
     for line in text.split('\n') {
@@ -139,14 +154,14 @@ fn parse_text(text: &str, opts: &CopyOptions) -> Vec<Vec<Option<String>>> {
             i += if bytes[i] == b'\\' { 2 } else { 1 };
             i = i.min(bytes.len());
         }
-        rows.push(fields);
+        rows.push((fields, line.trim_end_matches('\r').to_string()));
     }
     rows
 }
 
 /// CSV, where a newline inside quotes is DATA rather than a row separator --
 /// so the rows cannot be found by splitting on newlines first.
-fn parse_csv(text: &str, opts: &CopyOptions) -> Vec<Vec<Option<String>>> {
+fn parse_csv(text: &str, opts: &CopyOptions) -> Vec<(Vec<Option<String>>, String)> {
     let (delim, quote, escape) = (opts.delimiter, opts.quote, opts.escape);
     let mut rows = Vec::new();
     let mut row: Vec<Option<String>> = Vec::new();
@@ -160,14 +175,21 @@ fn parse_csv(text: &str, opts: &CopyOptions) -> Vec<Vec<Option<String>>> {
         *saw_quote = false;
         (!null).then_some(value)
     };
+    // Where the row being read starts in `text`, for its line.
+    let mut row_start = 0usize;
+    let line_of = |start: usize, end: usize| text[start..end].trim_end_matches('\r').to_string();
+    let mut consumed = 0usize;
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
+        let pos = consumed;
+        consumed += c.len_utf8();
         if in_quote {
             if c == escape && escape != quote {
                 if let Some(&next) = chars.peek() {
                     if next == quote || next == escape {
                         field.push(next);
                         chars.next();
+                        consumed += next.len_utf8();
                         continue;
                     }
                 }
@@ -177,6 +199,7 @@ fn parse_csv(text: &str, opts: &CopyOptions) -> Vec<Vec<Option<String>>> {
                 if escape == quote && chars.peek() == Some(&quote) {
                     field.push(quote);
                     chars.next();
+                    consumed += quote.len_utf8();
                 } else {
                     in_quote = false;
                 }
@@ -201,7 +224,8 @@ fn parse_csv(text: &str, opts: &CopyOptions) -> Vec<Vec<Option<String>>> {
             row.push(finish(&mut field, &mut saw_quote));
         } else if c == '\n' {
             row.push(finish(&mut field, &mut saw_quote));
-            rows.push(std::mem::take(&mut row));
+            rows.push((std::mem::take(&mut row), line_of(row_start, pos)));
+            row_start = consumed;
             line_start = true;
         } else if c == '\r' {
             // `\r\n` ends a line as `\n` does.
@@ -211,7 +235,7 @@ fn parse_csv(text: &str, opts: &CopyOptions) -> Vec<Vec<Option<String>>> {
     }
     if !field.is_empty() || saw_quote || !row.is_empty() {
         row.push(finish(&mut field, &mut saw_quote));
-        rows.push(row);
+        rows.push((row, line_of(row_start, text.len())));
     }
     rows
 }
