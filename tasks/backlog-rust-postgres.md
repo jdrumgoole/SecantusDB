@@ -761,14 +761,17 @@ Found while modelling the B-trees' pages (RP-196). The gap test is a
 scenario in `tests/backlog/test_rp_batch60.py`, measured on a private 15.19
 cluster.
 
-- [ ] **A partial index whose predicate computes refuses to be made.**
-      `create index on t (a) where a % 2 = 0` answers 0A000 `AExpr is not
-      supported yet`; PostgreSQL 15.19 makes it, and a query with the same
-      WHERE runs here. The predicate is kept as a storage filter, which an
-      operator over a column's value does not lower to; it needs the
-      expression form the executor evaluates.
+- [ ] **ON CONFLICT cannot use a unique index whose predicate computes.**
+      A partial index whose predicate no storage filter expresses
+      (`where a % 3 = 0`) is kept as its SQL since batch 61, its UNIQUE form
+      enforced by the executor among the rows it admits. An `ON CONFLICT
+      (b) WHERE a % 3 = 0` naming one refuses with 0A000, and a conflicting
+      row reaches the uniqueness check first (23505). PostgreSQL 15.19
+      arbitrates on the index. The arbiter finds the conflicting row by the
+      index's storage filter, which this predicate has none of; it needs
+      the lookup to evaluate the predicate per row.
       Backlog-ID: RP-236
-      Verify: tests/backlog/test_rp_batch60.py::test_scenario[a partial index over an expression's value]
+      Verify: tests/backlog/test_rp_batch61.py::test_scenario[ON CONFLICT over a computed unique index]
 
 ## Found by batch 59 (2026-10-24)
 

@@ -195,7 +195,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ------------------------------------- RP-236 a partial index's predicate
     "a partial index over an expression's value": (
         "RP-236",
-        True,
+        False,
         [
             "create table rp60_e (a int)",
             "create index rp60_e_a on rp60_e (a) where a % 2 = 0",
