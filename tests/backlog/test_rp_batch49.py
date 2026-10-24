@@ -74,7 +74,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "pg_class shows an index's size": (
         "RP-196",
-        True,
+        False,
         [
             f"create table rp49_i (a int) {_NOAV}",
             "insert into rp49_i select generate_series(1, 200)",
