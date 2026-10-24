@@ -96,16 +96,29 @@ impl PgHandler {
     /// namespace column)`: qualified when an earlier schema on the path
     /// holds one of the name.
     fn named_in_schema(&self, catalog: &str, cols: (&str, &str, &str), oid: i64) -> Option<String> {
+        // An operator class or family hides another only within its access
+        // method (`OpclassIsVisible`, `OpfamilyIsVisible`).
+        let same: &[&str] = match catalog {
+            "pg_opclass" => &["opcmethod"],
+            "pg_opfamily" => &["opfmethod"],
+            _ => &[],
+        };
         let (oid_col, name_col, ns_col) = cols;
+        let extra: String = same.iter().map(|c| format!(", o.{c}::int8")).collect();
         let row = self.object_row(&format!(
-            "select o.{name_col}::text, n.nspname::text from pg_catalog.{catalog} o \
+            "select o.{name_col}::text, n.nspname::text{extra} from pg_catalog.{catalog} o \
              join pg_catalog.pg_namespace n on n.oid = o.{ns_col} where o.{oid_col} = {oid}"
         ))?;
         let (name, schema) = (text(row.first()), text(row.get(1)));
+        let matching: String = same
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!(" and o.{c} = {}", int(row.get(2 + i))))
+            .collect();
         let visible = self.object_visible(&schema, |s| {
             self.object_row(&format!(
                 "select 1 from pg_catalog.{catalog} o join pg_catalog.pg_namespace n \
-                 on n.oid = o.{ns_col} where o.{name_col}::text = {} and n.nspname = {}",
+                 on n.oid = o.{ns_col} where o.{name_col}::text = {} and n.nspname = {}{matching}",
                 secantus_pgplan::scalar::quote_literal(&name),
                 secantus_pgplan::scalar::quote_literal(s)
             ))

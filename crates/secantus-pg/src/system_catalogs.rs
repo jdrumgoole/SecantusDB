@@ -469,10 +469,16 @@ impl PgHandler {
     /// gives it (found by name: a catalog the server declares itself may
     /// order its columns differently).
     pub(crate) fn static_rows(&self, name: &str, def: &TableDef) -> Vec<Document> {
+        self.static_rows_of(name, def, dumped(name))
+    }
+
+    /// Rows of the relation `name` dumped as `text`, as [`Self::static_rows`]
+    /// reads them.
+    pub(crate) fn static_rows_of(&self, name: &str, def: &TableDef, text: &str) -> Vec<Document> {
         let columns = catalog_meta::system_relation_columns(name).unwrap_or_default();
         let tz = self.session_timezone();
         let rows = copy_text::parse(
-            dumped(name),
+            text,
             false,
             &secantus_pgplan::copy_opts::CopyOptions::default(),
             &[],

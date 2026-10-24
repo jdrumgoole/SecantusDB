@@ -612,6 +612,14 @@ one beside it.
         39321598460, PR #2030's tree) every NOTIFY test passed in the
         clear and over TLS**, where the 2026-10-18 run of main failed
         seven; only `test_type_error_shadow` still hit 20 s.
+      - **Measured 2026-10-24: inserts slowed about 30% since
+        2026-10-22**, and the test failed in both transports again on PR
+        #2142's run. Three connections inserting 10,000 UUID-keyed rows
+        each, debug builds on the development Mac: 1.70 s at `5a5634cd`
+        (2026-10-22), 2.20 s at `d0b2135b` (batch 54), 2.27 s with the
+        cumulative statistics (batch 55, about 3% of it). Not yet bisected
+        within batches 26 to 54; a profile shows the server mostly waiting
+        rather than computing.
       - **`test_type_error_shadow` is throughput**: 150,000 prepared
         UUID-keyed INSERTs from three connections (8 s on PostgreSQL here).
         Profiled 2026-10-19, debug build: every Describe and Execute
@@ -761,6 +769,20 @@ fixed in the same batch; their tests there are regression tests.
       since nothing records which was made first.
       Backlog-ID: RP-137
       Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order], tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]
+
+## Found by batch 57 (2026-10-24)
+
+Found while building the extensions' members (RP-105), and fixed in the
+same batch; their tests in `tests/backlog/test_rp_batch57.py` are
+regression tests. RP-228: `pg_get_function_arguments`,
+`pg_get_function_identity_arguments` and `pg_get_function_result` of a
+built-in function were NULL. RP-229: `pg_get_functiondef` of a built-in
+was NULL, and of an aggregate not PostgreSQL's 42809. RP-230: an operator
+class or family hid one of its name in another access method, so
+`pg_describe_object` qualified it. RP-231: a public function a built-in of
+its name and arguments hides printed unqualified as a `regprocedure`.
+RP-232: a reserved word as a `regprocedure`'s argument type (`count(any)`)
+was 42883 where PostgreSQL's grammar answers 42601.
 
 ## Found by batch 55 (2026-10-24)
 
@@ -956,31 +978,6 @@ cluster.
         its random sample (as for `pg_statistic`, which is not built either).
       Backlog-ID: RP-099
       Verify: tests/backlog/test_rp_batch50.py::test_scenario[an MCV list's bytes over timestamps], tests/backlog/test_rp_batch50.py::test_scenario[a table past ANALYZE's sample has extended statistics]
-- [ ] **The progress views are refused by name** (0A000):
-      `pg_stat_progress_vacuum`, `_analyze`, `_cluster`, `_copy`,
-      `_create_index`, `_basebackup`. PostgreSQL reports a row per backend
-      running that command, which a COPY or CREATE INDEX here never
-      publishes.
-      **Decided (Joe, 2026-10-22): stream COPY, slots for every command.**
-      COPY FROM parses and inserts rows as CopyData arrives, as PostgreSQL
-      does (it buffers to CopyDone today), so `pg_stat_progress_copy`'s
-      counters move as PostgreSQL's do; every command keeps a per-backend
-      progress slot read through `pg_stat_get_progress_info` and
-      PostgreSQL's own six view definitions; CREATE INDEX reports the
-      phases this server's build has.
-      Backlog-ID: RP-100
-      Verify: tests/backlog/test_rp_batch26.py::test_scenario[progress views]
-- [ ] **An extension's members are not in `pg_depend`.** Every other
-      object's dependencies are recorded as PostgreSQL 15.19 records them
-      (`crates/secantus-pg/src/depend.rs`), an extension's schema and types
-      among them. But an extension's functions, operators, casts and
-      operator classes and families -- citext's 47, 26, 8, 3 and 3 -- are
-      this server's built-ins, with no `pg_proc` / `pg_operator` /
-      `pg_cast` / `pg_opclass` rows of their own, so there is nothing to
-      record their membership (`e`) against. The fix is those rows: each
-      extension's objects as its script creates them, in its schema.
-      Backlog-ID: RP-105
-      Verify: tests/backlog/test_rp_batch45.py::test_scenario[an extension's members]
 
 ## Found by batch 28 (2026-10-22)
 

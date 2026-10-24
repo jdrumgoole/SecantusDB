@@ -9120,6 +9120,49 @@ pub fn set_function_defs(defs: Vec<(i64, String)>) {
 }
 
 /// Install what `pg_get_function_arguments` / `_result` answer from.
+/// A built-in function's `pg_get_functiondef`, as PostgreSQL 15.19 writes
+/// it; an aggregate's as `!` and its name (RP-229; `pg15_function_defs.tsv`,
+/// written by `tools/probes/pg15_function_sigs_dump.py`).
+fn builtin_function_def(oid: i64) -> Option<&'static str> {
+    static DEFS: std::sync::OnceLock<std::collections::HashMap<i64, String>> =
+        std::sync::OnceLock::new();
+    DEFS.get_or_init(|| {
+        include_str!("pg15_function_defs.tsv")
+            .lines()
+            .filter_map(|l| {
+                let (o, d) = l.split_once('\t')?;
+                Some((o.parse().ok()?, system_views::unescape(d)))
+            })
+            .collect()
+    })
+    .get(&oid)
+    .map(String::as_str)
+}
+
+/// A built-in function's `(arguments, identity arguments, result)`, as
+/// PostgreSQL 15.19's `pg_get_function_*` print them (RP-228;
+/// `pg15_function_sigs.tsv`, written by
+/// `tools/probes/pg15_function_sigs_dump.py`).
+fn builtin_function_sig(oid: i64) -> Option<(&'static str, &'static str, &'static str)> {
+    type Sigs = std::collections::HashMap<i64, (String, String, String)>;
+    static SIGS: std::sync::OnceLock<Sigs> = std::sync::OnceLock::new();
+    let sigs = SIGS.get_or_init(|| {
+        let unescape = system_views::unescape;
+        include_str!("pg15_function_sigs.tsv")
+            .lines()
+            .filter_map(|l| {
+                let f: Vec<&str> = l.split('\t').collect();
+                let [o, a, i, r] = f.as_slice() else {
+                    return None;
+                };
+                Some((o.parse().ok()?, (unescape(a), unescape(i), unescape(r))))
+            })
+            .collect()
+    });
+    sigs.get(&oid)
+        .map(|(a, i, r)| (a.as_str(), i.as_str(), r.as_str()))
+}
+
 pub fn set_function_sigs(sigs: Vec<(i64, String, String, String)>) {
     FUNCTION_SIGS.with(|d| *d.borrow_mut() = sigs);
 }
@@ -13345,13 +13388,24 @@ fn srf_rows(
             .map(|x| const_value(x, params))
             .collect::<Result<_>>()?;
         let value = correlated::call_sequence(name, &a)?;
-        let row = record_values(&value)
-            .cloned()
-            .unwrap_or_else(|| vec![Bson::Null; columns.len()]);
+        // A set-returning one answers an array of records, a row each.
+        let rows = match &value {
+            Bson::Array(records) => records
+                .iter()
+                .map(|r| {
+                    record_values(r)
+                        .cloned()
+                        .unwrap_or_else(|| vec![Bson::Null; columns.len()])
+                })
+                .collect(),
+            _ => vec![record_values(&value)
+                .cloned()
+                .unwrap_or_else(|| vec![Bson::Null; columns.len()])],
+        };
         return Ok(Some((
             columns.iter().map(|(n, _)| (*n).to_string()).collect(),
             columns.iter().map(|(_, t)| (*t).to_string()).collect(),
-            vec![row],
+            rows,
         )));
     }
     // A user-defined set-returning function: the executor runs it.
@@ -38853,24 +38907,47 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                     other => regobj::from_bson(&other).map_or(-1, |(_, o)| o),
                 };
                 if which == 4 {
-                    return Ok(FUNCTION_DEFS.with(|d| {
+                    let user = FUNCTION_DEFS.with(|d| {
                         d.borrow()
                             .iter()
                             .find(|(o, _)| *o == oid)
-                            .map_or(Bson::Null, |(_, t)| Bson::String(t.clone()))
-                    }));
+                            .map(|(_, t)| t.clone())
+                    });
+                    // A built-in's, as PostgreSQL 15.19 writes it (RP-229).
+                    let def = user.or_else(|| builtin_function_def(oid).map(str::to_string));
+                    return match def {
+                        // An aggregate has no CREATE FUNCTION to show.
+                        Some(t) if t.starts_with('!') => Err(Error::Sqlstate(
+                            "42809",
+                            format!("\"{}\" is an aggregate function", &t[1..]),
+                        )),
+                        Some(t) => Ok(Bson::String(t)),
+                        None => Ok(Bson::Null),
+                    };
                 }
-                return Ok(FUNCTION_SIGS.with(|d| {
-                    d.borrow().iter().find(|(o, _, _, _)| *o == oid).map_or(
-                        Bson::Null,
-                        |(_, a, i, r)| {
-                            Bson::String(match which {
-                                1 => a.clone(),
-                                2 => i.clone(),
-                                _ => r.clone(),
-                            })
-                        },
-                    )
+                let pick = |a: &str, i: &str, r: &str| {
+                    Bson::String(match which {
+                        1 => a.to_string(),
+                        2 => i.to_string(),
+                        _ => r.to_string(),
+                    })
+                };
+                let user = FUNCTION_SIGS.with(|d| {
+                    d.borrow()
+                        .iter()
+                        .find(|(o, _, _, _)| *o == oid)
+                        .map(|(_, a, i, r)| pick(a, i, r))
+                });
+                // A built-in's, as PostgreSQL 15.19 prints it (RP-228).
+                return Ok(user.unwrap_or_else(|| {
+                    builtin_function_sig(oid).map_or(Bson::Null, |(a, i, r)| {
+                        // `pg_get_function_result` of a procedure is NULL.
+                        if which == 3 && r.is_empty() {
+                            Bson::Null
+                        } else {
+                            pick(a, i, r)
+                        }
+                    })
                 }));
             }
         }
