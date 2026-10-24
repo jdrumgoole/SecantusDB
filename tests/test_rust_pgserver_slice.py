@@ -1619,9 +1619,10 @@ def test_regtype_names_a_type(home: Path) -> None:
 def test_regclass_names_a_relation(home: Path) -> None:
     """`'t'::regclass` is the relation's oid, printed as its name.
 
-    Measured against PostgreSQL 16: the oid is `pg_class.oid` -- the same
-    number `pg_type.oid` carries for the table's row type and `pg_attribute
-    .attrelid` keys on -- so `'t1'::regclass::oid` equals both; `::text`
+    Measured against PostgreSQL 16: the oid is `pg_class.oid` -- the number
+    the table's row type names in `pg_type.typrelid` and `pg_attribute
+    .attrelid` keys on -- so `'t1'::regclass::oid` equals both. The row type
+    has an oid of its own (`pg_class.reltype`; 15.19, RP-205); `::text`
     renders the name (quoted when it needs quoting); a catalog relation has
     its fixed oid (`pg_class` is 1259); an unknown name is 42P01 with the
     PARSED name, a malformed one 42602, and a cast to `regtype` 42846.
@@ -1635,8 +1636,8 @@ def test_regclass_names_a_relation(home: Path) -> None:
         name, oid, qualified = cur.fetchone()
         assert (name, qualified) == ("t1", "t1")
         assert isinstance(oid, int) and oid > 0
-        cur.execute("select oid from pg_type where typname = 't1'")
-        assert cur.fetchone()[0] == oid
+        cur.execute("select typrelid, oid <> typrelid from pg_type where typname = 't1'")
+        assert cur.fetchone() == (oid, True)
         cur.execute("select attname from pg_attribute where attrelid = 't1'::regclass")
         assert cur.fetchall() == [("f1",)]
         cur.execute("select 't1'::regclass = 't1'::regclass::oid, %s::regclass::oid", (str(oid),))
