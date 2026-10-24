@@ -14142,41 +14142,13 @@ impl PgHandler {
         stored: &[Document],
         rows: &[Document],
     ) -> PgWireResult<Option<(String, String, String)>> {
-        let opt = |k: &str| {
-            ix.get(k).cloned().or_else(|| {
-                ix.get_document("options")
-                    .ok()
-                    .and_then(|o| o.get(k).cloned())
-            })
-        };
-        let Some(Bson::String(sql)) = opt("sqlPredicate") else {
+        let Some(cu) = self.computed_unique_index(def, ix)? else {
             return Ok(None);
         };
-        let predicate =
-            secantus_pgplan::plan_check_expression(&sql, def).map_err(|e| Self::err(&e))?;
-        let nulls_equal = opt("sqlNullsNotDistinct").is_some();
-        let fields: Vec<String> = ix
-            .get_document("key")
-            .map(|k| k.keys().cloned().collect())
-            .unwrap_or_default();
-        let admits = |row: &Document| {
-            matches!(
-                secantus_pgplan::apply_row_expr(&predicate, row),
-                Ok(Bson::Boolean(true))
-            )
-        };
-        let key = |row: &Document| -> Option<Vec<Bson>> {
-            let k: Vec<Bson> = fields
-                .iter()
-                .map(|f| row.get(f).cloned().unwrap_or(Bson::Null))
-                .collect();
-            (nulls_equal || !k.iter().any(|v| matches!(v, Bson::Null))).then_some(k)
-        };
-        let same = |a: &[Bson], b: &[Bson]| {
-            a.iter()
-                .zip(b)
-                .all(|(x, y)| compare_values(x, y) == Ordering::Equal)
-        };
+        let fields = &cu.fields;
+        let admits = |row: &Document| cu.admits(row);
+        let key = |row: &Document| cu.key(row);
+        let same = |a: &[Bson], b: &[Bson]| ComputedUnique::same(a, b);
         let mut seen: Vec<Vec<Bson>> = stored
             .iter()
             .filter(|r| admits(r))
@@ -14211,6 +14183,117 @@ impl PgHandler {
             seen.push(k);
         }
         Ok(None)
+    }
+
+    /// A UNIQUE index whose predicate is kept as SQL, ready to evaluate;
+    /// `None` for an index without one.
+    fn computed_unique_index(
+        &self,
+        def: &TableDef,
+        ix: &Document,
+    ) -> PgWireResult<Option<ComputedUnique>> {
+        let opt = |k: &str| {
+            ix.get(k).cloned().or_else(|| {
+                ix.get_document("options")
+                    .ok()
+                    .and_then(|o| o.get(k).cloned())
+            })
+        };
+        let Some(Bson::String(sql)) = opt("sqlPredicate") else {
+            return Ok(None);
+        };
+        Ok(Some(ComputedUnique {
+            predicate: secantus_pgplan::plan_check_expression(&sql, def)
+                .map_err(|e| Self::err(&e))?,
+            nulls_equal: opt("sqlNullsNotDistinct").is_some(),
+            fields: ix
+                .get_document("key")
+                .map(|k| k.keys().cloned().collect())
+                .unwrap_or_default(),
+        }))
+    }
+
+    /// The stored row of `table` that `ix` admits and that holds `row`'s
+    /// key, when `ix` admits `row`: what an ON CONFLICT naming `ix`
+    /// arbitrates on.
+    fn computed_unique_holder(
+        &self,
+        table: &str,
+        ix: &Option<ComputedUnique>,
+        row: &Document,
+    ) -> PgWireResult<Option<Document>> {
+        let Some(cu) = ix else {
+            return Ok(None);
+        };
+        Ok(self
+            .computed_unique_holders(table, cu, row)?
+            .into_iter()
+            .next())
+    }
+
+    /// The stored rows of `table` that `cu` admits and that hold `row`'s
+    /// key, when `cu` admits `row`.
+    fn computed_unique_holders(
+        &self,
+        table: &str,
+        cu: &ComputedUnique,
+        row: &Document,
+    ) -> PgWireResult<Vec<Document>> {
+        let Some(k) = cu.admits(row).then(|| cu.key(row)).flatten() else {
+            return Ok(Vec::new());
+        };
+        let probe: Document = cu
+            .fields
+            .iter()
+            .zip(&k)
+            .map(|(f, v)| (f.clone(), bson::bson!({ "$eq": v.clone() })))
+            .collect();
+        Ok(self
+            .storage
+            .find_matching(self.db(), table, &probe)
+            .map_err(|e| Self::storage_err("could not read", e))?
+            .into_iter()
+            .filter_map(|raw| secantus_core::bsondoc::from_bytes(&raw).ok())
+            .filter(|d| cu.admits(d) && cu.key(d).is_some_and(|dk| ComputedUnique::same(&dk, &k)))
+            .collect())
+    }
+
+    /// After `row` is stored: no other stored row that a UNIQUE index whose
+    /// predicate is kept as SQL admits may hold its key (23505).
+    fn check_stored_computed_uniques(
+        &self,
+        table: &str,
+        def: &TableDef,
+        row: &Document,
+    ) -> PgWireResult<()> {
+        for ix in self
+            .storage
+            .list_indexes(self.db(), &def.name)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(Self::computed_unique)
+        {
+            let Some(cu) = self.computed_unique_index(def, &ix)? else {
+                continue;
+            };
+            let holders = self.computed_unique_holders(table, &cu, row)?;
+            if holders.len() < 2 {
+                continue;
+            }
+            if let Some((name, key_text, value)) =
+                self.computed_unique_clash(def, &ix, &holders[..1], &holders[1..])?
+            {
+                return Err(Self::constraint_error(
+                    "23505",
+                    format!("duplicate key value violates unique constraint \"{name}\""),
+                    format!("Key ({key_text})=({value}) already exists."),
+                    def,
+                    Some(&name),
+                    None,
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The UNIQUE expression indexes on `table`.
@@ -22225,10 +22308,13 @@ impl PgHandler {
         // A column target naming a unique INDEX: resolved here, before any
         // row is written, to that index's own filter (a partial index holds
         // only the rows its predicate admits, so only those can conflict).
-        let index_filter = if oc.index_arbiter {
-            Some(self.resolve_index_arbiter(table, def, oc)?)
+        let (index_filter, computed) = if oc.index_arbiter {
+            match self.resolve_index_arbiter(table, def, oc)? {
+                IndexArbiter::Filter(f) => (Some(f), None),
+                IndexArbiter::Computed(ix) => (None, Some(self.computed_unique_index(def, &ix)?)),
+            }
         } else {
-            None
+            (None, None)
         };
         // An expression target's index: its computed field, and the planned
         // indexes to compute it with.
@@ -22237,73 +22323,94 @@ impl PgHandler {
             None => None,
         };
         for mut row in rows {
-            self.stamp_inserted(table, def, std::slice::from_mut(&mut row))?;
-            let bytes =
-                encode_doc(&row).map_err(|e| Self::storage_err("could not encode a row", e))?;
-            let bytes = self.with_expr_fields(table, vec![bytes])?;
-            let (n, errors) = self
-                .storage
-                .insert(self.db(), table, bytes, true)
-                .map_err(|e| Self::storage_err("could not insert", e))?;
-            let Some(err) = errors.first() else {
-                written += n;
-                affected.push(row);
-                continue;
+            // A computed predicate's arbiter: the stored row it admits that
+            // holds the proposed row's key, found before the insert (RP-236).
+            let conflicting = match &computed {
+                Some(ix) => self.computed_unique_holder(table, ix, &row)?,
+                None => None,
             };
-            let is_dup = err.get_i32("code").unwrap_or(0) == 11000
-                || err
-                    .get_str("errmsg")
-                    .unwrap_or_default()
-                    .starts_with("E11000");
-            if !is_dup {
-                return Err(Self::write_error(table, def, err));
-            }
-            self.release_inserted(table, def, &row)?;
-            let empty = Document::new();
-            let reported = err.get_document("keyValue").unwrap_or(&empty).clone();
-            // WHICH row the clause arbitrates on is decided by its TARGET, not
-            // by whichever index the storage layer happened to report first.
-            // Measured on PostgreSQL 14.13: a row colliding on BOTH the PK and
-            // a UNIQUE constraint is upserted by `on conflict (id)` and by
-            // `on conflict (tag)` alike, while a row colliding ONLY on the
-            // non-target constraint is 23505. Comparing the REPORTED index
-            // against the target would raise 23505 for the first case whenever
-            // storage reported the other index -- which is what the first
-            // version of this did, and what the tests caught.
-            let probe = match &expr_arbiter {
-                // An expression arbiter: the existing row holding the proposed
-                // row's computed key.
-                Some((field, indexes)) => {
-                    let mut filled = row.clone();
-                    Self::fill_expr_fields(indexes, &mut filled)?;
-                    match filled.get(field) {
-                        Some(v) => bson::doc! { field.clone(): v.clone() },
-                        None => return Err(Self::write_error(table, def, err)),
+            let existing = match conflicting {
+                Some(existing) => existing,
+                None => {
+                    self.stamp_inserted(table, def, std::slice::from_mut(&mut row))?;
+                    let bytes = encode_doc(&row)
+                        .map_err(|e| Self::storage_err("could not encode a row", e))?;
+                    let bytes = self.with_expr_fields(table, vec![bytes])?;
+                    let (n, errors) = self
+                        .storage
+                        .insert(self.db(), table, bytes, true)
+                        .map_err(|e| Self::storage_err("could not insert", e))?;
+                    let Some(err) = errors.first() else {
+                        self.check_stored_computed_uniques(table, def, &row)?;
+                        written += n;
+                        affected.push(row);
+                        continue;
+                    };
+                    if computed.is_some() {
+                        // The arbiter found no row, so the duplicate was on
+                        // another constraint.
+                        return Err(Self::write_error(table, def, err));
                     }
+                    let is_dup = err.get_i32("code").unwrap_or(0) == 11000
+                        || err
+                            .get_str("errmsg")
+                            .unwrap_or_default()
+                            .starts_with("E11000");
+                    if !is_dup {
+                        return Err(Self::write_error(table, def, err));
+                    }
+                    self.release_inserted(table, def, &row)?;
+                    let empty = Document::new();
+                    let reported = err.get_document("keyValue").unwrap_or(&empty).clone();
+                    // WHICH row the clause arbitrates on is decided by its TARGET, not
+                    // by whichever index the storage layer happened to report first.
+                    // Measured on PostgreSQL 14.13: a row colliding on BOTH the PK and
+                    // a UNIQUE constraint is upserted by `on conflict (id)` and by
+                    // `on conflict (tag)` alike, while a row colliding ONLY on the
+                    // non-target constraint is 23505. Comparing the REPORTED index
+                    // against the target would raise 23505 for the first case whenever
+                    // storage reported the other index -- which is what the first
+                    // version of this did, and what the tests caught.
+                    let probe = match &expr_arbiter {
+                        // An expression arbiter: the existing row holding the proposed
+                        // row's computed key.
+                        Some((field, indexes)) => {
+                            let mut filled = row.clone();
+                            Self::fill_expr_fields(indexes, &mut filled)?;
+                            match filled.get(field) {
+                                Some(v) => bson::doc! { field.clone(): v.clone() },
+                                None => return Err(Self::write_error(table, def, err)),
+                            }
+                        }
+                        None => match Self::arbiter_key(def, oc.target.as_ref(), &row, &reported) {
+                            Some(p) => p,
+                            None => return Err(Self::write_error(table, def, err)),
+                        },
+                    };
+                    let probe = match &index_filter {
+                        Some(Some(partial)) => bson::doc! { "$and": [probe, partial.clone()] },
+                        _ => probe,
+                    };
+                    let existing = self
+                        .storage
+                        .find_matching(self.db(), table, &probe)
+                        .map_err(|e| Self::storage_err("could not read", e))?;
+                    let Some(bytes) = existing.first() else {
+                        // Nothing holds the ARBITER key, so the duplicate was on a
+                        // different constraint: PostgreSQL raises it.
+                        return Err(Self::write_error(table, def, err));
+                    };
+                    decode_doc(bytes).map_err(|e| Self::storage_err("could not decode a row", e))?
                 }
-                None => match Self::arbiter_key(def, oc.target.as_ref(), &row, &reported) {
-                    Some(p) => p,
-                    None => return Err(Self::write_error(table, def, err)),
-                },
-            };
-            let probe = match &index_filter {
-                Some(Some(partial)) => bson::doc! { "$and": [probe, partial.clone()] },
-                _ => probe,
-            };
-            let existing = self
-                .storage
-                .find_matching(self.db(), table, &probe)
-                .map_err(|e| Self::storage_err("could not read", e))?;
-            let Some(bytes) = existing.first() else {
-                // Nothing holds the ARBITER key, so the duplicate was on a
-                // different constraint: PostgreSQL raises it.
-                return Err(Self::write_error(table, def, err));
             };
             let secantus_pgplan::ConflictAction::Update { set_exprs, filter } = &oc.action else {
                 continue; // DO NOTHING: skipped, and not counted.
             };
-            let existing: Document =
-                decode_doc(bytes).map_err(|e| Self::storage_err("could not decode a row", e))?;
+            // A row this command inserted or updated: PostgreSQL refuses
+            // when it locks the row, before the WHERE.
+            if self.written_by_this_command(&existing) {
+                return Err(Self::on_conflict_twice());
+            }
             let env = secantus_pgplan::on_conflict_row(&existing, &row);
             if let Some(f) = filter {
                 if !secantus_pgplan::on_conflict_filter_passes(f, &env)
@@ -22322,6 +22429,7 @@ impl PgHandler {
                 after.remove(k);
             }
             self.check_row_constraints(def, &after)?;
+            self.check_computed_uniques(def, std::slice::from_ref(&after), &[row_id(&existing)])?;
             self.check_foreign_keys(def, std::slice::from_ref(&after))?;
             let id = row_id(&existing);
             if row_id(&after) != id {
@@ -22340,6 +22448,20 @@ impl PgHandler {
         Ok((written, affected))
     }
 
+    fn on_conflict_twice() -> PgWireError {
+        let mut info = ErrorInfo::new(
+            "ERROR".into(),
+            "21000".into(),
+            "ON CONFLICT DO UPDATE command cannot affect row a second time".into(),
+        );
+        info.hint = Some(
+            "Ensure that no rows proposed for insertion within the same command have duplicate \
+             constrained values."
+                .into(),
+        );
+        PgWireError::UserError(Box::new(info))
+    }
+
     /// The unique index an `ON CONFLICT (cols) [WHERE pred]` target infers,
     /// as its partial filter (`None` for a full index): an index on exactly
     /// those columns, whose predicate -- if it has one -- the target's WHERE
@@ -22349,7 +22471,7 @@ impl PgHandler {
         table: &str,
         def: &TableDef,
         oc: &secantus_pgplan::OnConflict,
-    ) -> PgWireResult<Option<Document>> {
+    ) -> PgWireResult<IndexArbiter> {
         let no_arbiter = || {
             Self::err(&PlanError::NoArbiter(
                 "there is no unique or exclusion constraint matching the ON CONFLICT \
@@ -22365,7 +22487,9 @@ impl PgHandler {
         // computed field.
         if let Some(name) = self.expression_arbiter(table, oc)? {
             let field = Self::expression_index_field(&name);
-            return Ok(Some(bson::doc! { field: { "$exists": true } }));
+            return Ok(IndexArbiter::Filter(Some(
+                bson::doc! { field: { "$exists": true } },
+            )));
         }
         let mut want: Vec<String> = cols.iter().filter_map(|c| def.field_of(c)).collect();
         want.sort();
@@ -22389,15 +22513,6 @@ impl PgHandler {
             if have != want {
                 continue;
             }
-            // Its conflicting row is found by the predicate's SQL, which
-            // the arbiter's storage lookup cannot evaluate (RP-236).
-            if computed {
-                return Err(Self::user_error(
-                    "0A000",
-                    "ON CONFLICT over a unique index whose predicate is computed is not supported"
-                        .into(),
-                ));
-            }
             let lookup = |k: &str| {
                 ix.get(k)
                     .or_else(|| options.and_then(|o| o.get(k)))
@@ -22409,8 +22524,15 @@ impl PgHandler {
                 (Some(p), Some(w)) => secantus_pgplan::predicate_implied(w, p),
                 (Some(_), None) => false,
             };
+            if usable && computed {
+                // Its conflicting row is found by evaluating the predicate's
+                // SQL (RP-236).
+                return Ok(IndexArbiter::Computed(ix.clone()));
+            }
             if usable {
-                return Ok(lookup("partialFilterExpression").and_then(|f| f.as_document().cloned()));
+                return Ok(IndexArbiter::Filter(
+                    lookup("partialFilterExpression").and_then(|f| f.as_document().cloned()),
+                ));
             }
         }
         Err(no_arbiter())
@@ -35700,7 +35822,11 @@ impl PgHandler {
                 self.check_expression_unique(&def, &ins.rows, &[])?;
                 self.check_partition_unique(&def, &ins.rows, &[])?;
                 self.check_exclusions(&def, &ins.rows, &[])?;
-                self.check_computed_uniques(&def, &ins.rows, &[])?;
+                // Under ON CONFLICT a row the arbiter skips is never checked
+                // against the other indexes, so they are checked row by row.
+                if ins.on_conflict.is_none() {
+                    self.check_computed_uniques(&def, &ins.rows, &[])?;
+                }
                 if let Some(dup) =
                     self.wide_numeric_pk_conflict(&ins.table, &def, &ins.rows, &[])?
                 {
@@ -50127,4 +50253,45 @@ fn system_catalog_kind(h: &PgHandler, name: &str) -> Option<(String, i64)> {
         _ => return None,
     };
     Some((kind, oid))
+}
+
+/// The unique index an `ON CONFLICT` column target resolved to.
+enum IndexArbiter {
+    /// Arbitrated by the storage layer: the index's partial filter, if any.
+    Filter(Option<Document>),
+    /// A UNIQUE index whose predicate is kept as SQL (RP-236).
+    Computed(Document),
+}
+
+/// A UNIQUE index whose predicate is kept as SQL (RP-236): which rows it
+/// admits, and each one's key.
+struct ComputedUnique {
+    predicate: secantus_pgplan::ColumnExpr,
+    nulls_equal: bool,
+    fields: Vec<String>,
+}
+
+impl ComputedUnique {
+    fn admits(&self, row: &Document) -> bool {
+        matches!(
+            secantus_pgplan::apply_row_expr(&self.predicate, row),
+            Ok(Bson::Boolean(true))
+        )
+    }
+
+    /// `row`'s key, or `None` when a NULL in it makes it distinct.
+    fn key(&self, row: &Document) -> Option<Vec<Bson>> {
+        let k: Vec<Bson> = self
+            .fields
+            .iter()
+            .map(|f| row.get(f).cloned().unwrap_or(Bson::Null))
+            .collect();
+        (self.nulls_equal || !k.iter().any(|v| matches!(v, Bson::Null))).then_some(k)
+    }
+
+    fn same(a: &[Bson], b: &[Bson]) -> bool {
+        a.iter()
+            .zip(b)
+            .all(|(x, y)| compare_values(x, y) == Ordering::Equal)
+    }
 }

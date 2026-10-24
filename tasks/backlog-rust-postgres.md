@@ -755,23 +755,19 @@ tests are scenarios in `tests/backlog/test_rp_batch30.py`, measured on a
 private 15.19 cluster. RP-133 .. RP-136 and RP-138 .. RP-142 were found and
 fixed in the same batch; their tests there are regression tests.
 
+## Found by batch 62 (2026-10-24)
+
+Found while letting ON CONFLICT arbitrate on a unique index whose predicate
+computes (RP-236), and fixed in the same batch; its test in
+`tests/backlog/test_rp_batch62.py` is a regression test. RP-237: an
+`ON CONFLICT DO UPDATE` whose proposed rows met one row twice (two rows of
+one key, or a row and the one it had just inserted) updated it twice,
+where PostgreSQL refuses with 21000.
+
 ## Found by batch 60 (2026-10-24)
 
-Found while modelling the B-trees' pages (RP-196). The gap test is a
-scenario in `tests/backlog/test_rp_batch60.py`, measured on a private 15.19
-cluster.
-
-- [ ] **ON CONFLICT cannot use a unique index whose predicate computes.**
-      A partial index whose predicate no storage filter expresses
-      (`where a % 3 = 0`) is kept as its SQL since batch 61, its UNIQUE form
-      enforced by the executor among the rows it admits. An `ON CONFLICT
-      (b) WHERE a % 3 = 0` naming one refuses with 0A000, and a conflicting
-      row reaches the uniqueness check first (23505). PostgreSQL 15.19
-      arbitrates on the index. The arbiter finds the conflicting row by the
-      index's storage filter, which this predicate has none of; it needs
-      the lookup to evaluate the predicate per row.
-      Backlog-ID: RP-236
-      Verify: tests/backlog/test_rp_batch61.py::test_scenario[ON CONFLICT over a computed unique index]
+Found while modelling the B-trees' pages (RP-196). RP-236 (a partial index
+over a computed predicate) was closed by batches 61 and 62.
 
 ## Found by batch 59 (2026-10-24)
 
