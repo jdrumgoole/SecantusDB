@@ -692,17 +692,17 @@ pub(crate) const COLLECTION: &str = "__sql_btree_pages__";
 /// fails is reported and the model left marked, for the next checkpoint.
 pub(crate) fn flush_store(storage: &Arc<secantus_storage::Storage>) {
     let store = Arc::as_ptr(storage) as usize;
-    let changed: Vec<((usize, String, i64), Vec<Document>)> = {
+    let changed: Vec<((usize, String, i64), Vec<Document>, Option<Vec<String>>)> = {
         let mut all = models().lock().unwrap_or_else(|e| e.into_inner());
         all.iter_mut()
             .filter(|((s, _, _), t)| *s == store && t.dirty)
             .map(|(key, t)| {
-                t.dirty = false;
-                (key.clone(), t.to_docs(key.2))
+                let (docs, ids) = t.take_changes(key.2);
+                (key.clone(), docs, ids)
             })
             .collect()
     };
-    for ((s, db, oid), docs) in changed {
+    for ((s, db, oid), docs, ids) in changed {
         let written = storage.outside_user_transaction(|| -> Result<(), String> {
             let encoded = docs
                 .iter()
@@ -713,15 +713,13 @@ pub(crate) fn flush_store(storage: &Arc<secantus_storage::Storage>) {
             if !storage.collection_exists(&db, COLLECTION).map_err(err)? {
                 storage.create_collection(&db, COLLECTION).map_err(err)?;
             }
+            // The changed pages' documents, or every one of the index's.
+            let which = match &ids {
+                None => bson::doc! { "index": oid },
+                Some(ids) => bson::doc! { "_id": { "$in": ids.clone() } },
+            };
             storage
-                .delete_matching(
-                    &db,
-                    COLLECTION,
-                    &bson::doc! { "index": oid },
-                    0,
-                    &Document::new(),
-                    None,
-                )
+                .delete_matching(&db, COLLECTION, &which, 0, &Document::new(), None)
                 .map_err(err)?;
             storage
                 .insert(&db, COLLECTION, encoded, true)
@@ -735,7 +733,7 @@ pub(crate) fn flush_store(storage: &Arc<secantus_storage::Storage>) {
                 .unwrap_or_else(|e| e.into_inner())
                 .get_mut(&(s, db, oid))
             {
-                t.dirty = true;
+                t.rewrite_all();
             }
         }
     }

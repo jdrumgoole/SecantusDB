@@ -128,6 +128,10 @@ pub(crate) struct BTree {
     pub(crate) pending: Vec<u32>,
     /// Changed since it was last saved.
     pub(crate) dirty: bool,
+    /// Every page changed since (a build, a VACUUM); else only `touched`
+    /// and the tree's own document are written.
+    full: bool,
+    touched: std::collections::BTreeSet<u32>,
     /// Each leaf's bytes in use (tuples and line pointers), by block, as
     /// the insert path keeps it; -1 or absent when it must be recounted.
     used: Vec<i64>,
@@ -575,6 +579,8 @@ impl BTree {
             free: Vec::new(),
             pending: Vec::new(),
             dirty: true,
+            full: true,
+            touched: Default::default(),
             used: Vec::new(),
         };
         if entries.is_empty() {
@@ -656,6 +662,7 @@ impl BTree {
         if let Some(u) = self.used.get_mut(b as usize) {
             *u = -1;
         }
+        self.touched.insert(b);
         b
     }
 
@@ -675,6 +682,7 @@ impl BTree {
             return;
         }
         let (leaf, path) = self.descend(shape, &key, tid);
+        self.touched.insert(leaf);
         let cached = self.used.get(leaf as usize).copied().filter(|u| *u >= 0);
         let Page::Leaf { items, high, right } = &mut self.pages[leaf as usize] else {
             return;
@@ -824,6 +832,7 @@ impl BTree {
             self.root = Some(root);
             return;
         };
+        self.touched.insert(parent);
         let Page::Internal { items, high, right } = &mut self.pages[parent as usize] else {
             return;
         };
@@ -883,6 +892,7 @@ impl BTree {
     pub(crate) fn bulk_delete(&mut self, shape: &dyn Shape, dead: &dyn Fn(i64) -> bool) -> bool {
         // The scan recycles what the last VACUUM deleted.
         self.dirty = true;
+        self.full = true;
         self.used.clear();
         self.free.append(&mut self.pending);
         let mut removed = false;
@@ -1250,15 +1260,25 @@ impl BTree {
     /// The model as documents, one a page (`_id` "oid:block") and one for
     /// the tree (`_id` "oid"), each tagged with the index's oid.
     pub(crate) fn to_docs(&self, oid: i64) -> Vec<bson::Document> {
-        let mut out = vec![bson::doc! {
+        let mut out = vec![self.tree_doc(oid)];
+        out.extend((0..self.pages.len()).map(|b| self.page_doc(oid, b)));
+        out
+    }
+
+    fn tree_doc(&self, oid: i64) -> bson::Document {
+        bson::doc! {
             "_id": oid.to_string(),
             "index": oid,
             "root": self.root.map_or(Bson::Null, |r| Bson::Int64(i64::from(r))),
             "free": ints(&self.free),
             "pending": ints(&self.pending),
             "npages": self.pages.len() as i64,
-        }];
-        for (b, page) in self.pages.iter().enumerate() {
+        }
+    }
+
+    fn page_doc(&self, oid: i64, b: usize) -> bson::Document {
+        let page = &self.pages[b];
+        {
             let mut d = bson::doc! { "_id": format!("{oid}:{b}"), "index": oid, "block": b as i64 };
             let link = |r: &Option<u32>| r.map_or(Bson::Null, |r| Bson::Int64(i64::from(r)));
             match page {
@@ -1300,9 +1320,39 @@ impl BTree {
                     d.insert("right", link(right))
                 }
             };
-            out.push(d);
+            d
         }
-        out
+    }
+
+    /// What a checkpoint writes: the documents of the pages changed since
+    /// the last, and the tree's; with the ids to replace, or `None` to
+    /// replace every document of the index.
+    pub(crate) fn take_changes(&mut self, oid: i64) -> (Vec<bson::Document>, Option<Vec<String>>) {
+        self.dirty = false;
+        if std::mem::take(&mut self.full) {
+            self.touched.clear();
+            return (self.to_docs(oid), None);
+        }
+        let touched = std::mem::take(&mut self.touched);
+        let mut docs = vec![self.tree_doc(oid)];
+        docs.extend(
+            touched
+                .iter()
+                .map(|b| *b as usize)
+                .filter(|b| *b < self.pages.len())
+                .map(|b| self.page_doc(oid, b)),
+        );
+        let ids = docs
+            .iter()
+            .filter_map(|d| d.get_str("_id").ok().map(str::to_string))
+            .collect();
+        (docs, Some(ids))
+    }
+
+    /// A write that failed: everything is written again next time.
+    pub(crate) fn rewrite_all(&mut self) {
+        self.dirty = true;
+        self.full = true;
     }
 
     /// The model [`Self::to_docs`] wrote, or `None` when a page is missing.
@@ -1373,6 +1423,8 @@ impl BTree {
             free: from_ints(tree.get("free")),
             pending: from_ints(tree.get("pending")),
             dirty: false,
+            full: false,
+            touched: Default::default(),
             used: Vec::new(),
         })
     }
@@ -1520,6 +1572,38 @@ mod tests {
         let t = grown(&shape, (1..=3000).map(|g| (g * 7919) % 10007));
         let back = BTree::from_docs(&t.to_docs(16384)).expect("a model");
         assert_eq!((back.pages, back.root), (t.pages.clone(), t.root));
+    }
+
+    #[test]
+    fn checkpoints_of_changed_pages_add_up_to_the_model() {
+        // A store of the saved documents, written as `flush_store` does.
+        let shape = Int { unique: false };
+        let mut t = BTree::build(&shape, keys(1..=500));
+        let mut store: std::collections::BTreeMap<String, bson::Document> = Default::default();
+        let mut save =
+            |t: &mut BTree, store: &mut std::collections::BTreeMap<String, bson::Document>| {
+                let (docs, ids) = t.take_changes(7);
+                match ids {
+                    None => store.clear(),
+                    Some(ids) => ids.iter().for_each(|i| {
+                        store.remove(i);
+                    }),
+                }
+                for d in docs {
+                    store.insert(d.get_str("_id").unwrap().to_string(), d);
+                }
+            };
+        save(&mut t, &mut store);
+        for round in 0..3 {
+            for i in 0..2000 {
+                let k = ((i * 7919 + round * 13) % 10007) as i32;
+                t.insert(&shape, vec![Bson::Int32(k)], tid(500 + round * 2000 + i));
+            }
+            save(&mut t, &mut store);
+            let back =
+                BTree::from_docs(&store.values().cloned().collect::<Vec<_>>()).expect("a model");
+            assert_eq!((back.pages, back.root), (t.pages.clone(), t.root));
+        }
     }
 
     #[test]

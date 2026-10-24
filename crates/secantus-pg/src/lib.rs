@@ -8035,16 +8035,21 @@ impl PgHandler {
         Some(secantus_pgplan::hashagg::heap_pages(spaces.into_iter()))
     }
 
-    /// The space each of `table`'s rows takes on a heap page, in heap order
-    /// (`hashagg::heap_tuple_space`); `None` as for `heap_pages`.
-    fn heap_spaces(&self, table: &str, def: &secantus_pgcatalog::TableDef) -> Option<Vec<usize>> {
-        use secantus_pgplan::hashagg::{self, ColumnLayout};
+    /// Whether `heap_pages` sizes `def`'s rows: every column's type is one
+    /// whose width it models. Its answer without reading a row.
+    fn heap_pages_modelled(def: &secantus_pgcatalog::TableDef) -> bool {
+        Self::heap_layouts(def).is_some()
+    }
+
+    fn heap_layouts(
+        def: &secantus_pgcatalog::TableDef,
+    ) -> Option<Vec<secantus_pgplan::hashagg::ColumnLayout>> {
+        use secantus_pgplan::hashagg::ColumnLayout;
         let fact = |c: &secantus_pgcatalog::Column, name: &str| {
             secantus_pgplan::pgtypes::oid_of_name(&c.pg_type)
                 .and_then(|oid| pg_type_facts::builtin(oid, name))
         };
-        let layouts: Vec<ColumnLayout> = def
-            .columns
+        def.columns
             .iter()
             .map(|c| {
                 let typlen = match fact(c, "typlen")? {
@@ -8071,7 +8076,14 @@ impl PgHandler {
                         == Some(true),
                 })
             })
-            .collect::<Option<_>>()?;
+            .collect::<Option<_>>()
+    }
+
+    /// The space each of `table`'s rows takes on a heap page, in heap order
+    /// (`hashagg::heap_tuple_space`); `None` as for `heap_pages`.
+    fn heap_spaces(&self, table: &str, def: &secantus_pgcatalog::TableDef) -> Option<Vec<usize>> {
+        use secantus_pgplan::hashagg;
+        let layouts = Self::heap_layouts(def)?;
         let docs = self.table_docs(table).ok()?;
         let mut spaces = Vec::with_capacity(docs.len());
         for d in &docs {
@@ -8191,7 +8203,7 @@ impl PgHandler {
         // a heap rows have left -- it declines; `pg_class` still shows the
         // counts (RP-196).
         let statistics = shrunk
-            || self.heap_pages(table, &def).is_none()
+            || !Self::heap_pages_modelled(&def)
             || previous
                 .as_ref()
                 .is_some_and(|d| d.get_bool("statistics").unwrap_or(false));
@@ -14626,7 +14638,14 @@ impl PgHandler {
         let Some(def) = self.lookup(table) else {
             return Ok(());
         };
-        let rows = self.table_docs(table)?.len();
+        // Counted, not read: a partitioned table's rows are its leaves'.
+        let rows = if partition::is_partitioned(&def) {
+            self.table_docs(table)?.len()
+        } else {
+            self.storage
+                .count_matching(self.db(), table, &Document::new(), None)
+                .map_err(|e| Self::storage_err("could not count the rows", e))? as usize
+        };
         let previous = self.relstats(table);
         if rows == 0 && !statistics && previous.is_none() {
             return Ok(());
@@ -14639,7 +14658,7 @@ impl PgHandler {
         // The heap's pages, as `RelationGetNumberOfBlocks` counts them
         // (RP-196). A table whose rows' widths the planner does not model
         // is not priced at all.
-        if self.heap_pages(table, &def).is_none() {
+        if !Self::heap_pages_modelled(&def) {
             doc.insert("statistics", true);
         }
         if let Some(pages) = self.measured_pages(table, &def) {
@@ -14690,7 +14709,7 @@ impl PgHandler {
         if docs.len() as u64 <= 300 * target {
             self.build_extended_statistics(table, &def, &docs, columns, target as usize)?;
         }
-        if self.heap_pages(table, &def).is_none() {
+        if !Self::heap_pages_modelled(&def) {
             return self.record_relstats(table, true);
         }
         let Some(pages) = self.measured_pages(table, &def) else {
