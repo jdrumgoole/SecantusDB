@@ -31,6 +31,14 @@ _PROGRESS = (
 )
 
 
+def _send(a: Any, cp: Any, data: str) -> None:
+    """Write `data` to `a`'s COPY and send it now: psycopg leaves a small
+    write in libpq's buffer except on macOS (`PREFER_FLUSH`), so a Linux
+    runner's server read nothing until the COPY ended."""
+    cp.write(data)
+    a.pgconn.flush()
+
+
 def _settled(b: Any, pid: int, before: Any) -> Any:
     """What `b` reads of `pid`'s COPY once it has moved past `before`: the
     data a write sends reaches the server when the network and the
@@ -57,13 +65,13 @@ def copy_progress(dsn: str) -> list[Any]:
             with a.cursor().copy("copy rp56_c from stdin") as cp:
                 # The third row is split between two messages.
                 started = [("COPY FROM", "PIPE", 0, 0, 0, 0, "rp56_c", "postgres", True)]
-                cp.write("1\tone\n2\ttwo\n3\tth")
+                _send(a, cp, "1\tone\n2\ttwo\n3\tth")
                 out.append(_settled(b, pid, started))
-                cp.write("ree\n")
+                _send(a, cp, "ree\n")
                 out.append(_settled(b, pid, out[-1]))
             out.append(b.execute(_PROGRESS, (pid,)).fetchall())
             with a.cursor().copy("copy rp56_c (x) from stdin with (format csv, header)") as cp:
-                cp.write("x\n7\n")
+                _send(a, cp, "x\n7\n")
                 out.append(
                     _settled(
                         b,
