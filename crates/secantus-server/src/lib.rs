@@ -32,7 +32,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use bson::{doc, Bson, Document};
-use secantus_commands::logbuf::LogBuffer;
+use secantus_commands::logbuf::{LogBuffer, LogEntry};
 use secantus_commands::{
     dispatch, CommandContext, ConnectionAuth, ConnectionKiller, CursorRegistry, PendingBatch,
     Storage,
@@ -148,11 +148,15 @@ pub struct ServerConfig {
     /// (which mongod never closes on its own) is untouched, preserving the
     /// conformance contract. Defaults to 10 minutes via [`Default`].
     pub message_read_timeout: Option<Duration>,
+    /// The store's directory, as mongod's `MongoDB starting` line names it
+    /// (`dbPath`); left out when the embedder does not say.
+    pub db_path: Option<String>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            db_path: None,
             replica_set_name: None,
             require_auth: false,
             enable_test_commands: false,
@@ -238,14 +242,30 @@ impl ConnectionKiller for ConnRegistry {
 struct ConnEntryGuard {
     conns: Arc<Mutex<HashMap<i64, TcpStream>>>,
     conn_id: i64,
+    logs: Arc<LogBuffer>,
+    /// The connection's attributes for its `Connection ended` line.
+    connection: Document,
 }
 
 impl Drop for ConnEntryGuard {
     fn drop(&mut self) {
-        self.conns
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.conn_id);
+        let left = {
+            let mut conns = self.conns.lock().unwrap_or_else(|e| e.into_inner());
+            conns.remove(&self.conn_id);
+            conns.len() as i64
+        };
+        let mut ended = std::mem::take(&mut self.connection);
+        ended.insert("connectionCount", left);
+        self.logs.log(
+            LogEntry::new(
+                "I",
+                "NETWORK",
+                22944,
+                format!("conn{}", self.conn_id),
+                "Connection ended",
+            )
+            .attr(ended),
+        );
     }
 }
 
@@ -411,10 +431,25 @@ pub fn bind(
         conns: conns.clone(),
     });
     let logs = Arc::new(LogBuffer::new());
-    logs.append(
-        "I",
-        "CONTROL",
-        format!("SecantusDB (rust) {VERSION} started"),
+    // mongod's first lines (measured 8.2.11, 2026-10-24): what it is starting
+    // on, and the port it then waits on.
+    let mut starting = doc! {
+        "pid": i64::from(std::process::id()),
+        "port": i32::from(address.port()),
+    };
+    if let Some(path) = &config.db_path {
+        starting.insert("dbPath", path.clone());
+    }
+    starting.insert("architecture", "64-bit");
+    starting.insert("host", secantus_commands::dbhash::host_name());
+    logs.log(
+        LogEntry::new("I", "CONTROL", 4615611, "initandlisten", "MongoDB starting").attr(starting),
+    );
+    logs.log(
+        LogEntry::new("I", "NETWORK", 23016, "listener", "Waiting for connections").attr(doc! {
+            "port": i32::from(address.port()),
+            "ssl": if config.tls.is_some() { "on" } else { "off" },
+        }),
     );
     let failpoints = config
         .enable_test_commands
@@ -548,21 +583,35 @@ fn handle_connection(tcp: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
             .unwrap_or_else(|e| e.into_inner())
             .insert(conn_id, kill_handle);
     }
-    let _conn_entry = ConnEntryGuard {
-        conns: shared.conns.clone(),
-        conn_id,
-    };
-    // Record the accept in the getLog ring buffer (mirrors the Python server's
-    // "connection accepted" NETWORK line).
+    // The accept, and on the way out the end, as mongod logs them (measured
+    // 8.2.11, 2026-10-24): the peer, a UUID for the connection, its id and
+    // how many are open.
     let peer = tcp
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".to_string());
-    shared.logs.append(
-        "I",
-        "NETWORK",
-        format!("connection accepted from {peer} #{conn_id}"),
+    let connection = doc! {
+        "remote": peer,
+        "isLoadBalanced": false,
+        "uuid": {"uuid": bson::Binary {
+            subtype: bson::spec::BinarySubtype::Uuid,
+            bytes: bson::uuid::Uuid::new().bytes().to_vec(),
+        }},
+        "connectionId": conn_id,
+    };
+    let open =
+        |conns: &Mutex<HashMap<i64, TcpStream>>| conns.lock().map(|c| c.len() as i64).unwrap_or(0);
+    let mut accepted = connection.clone();
+    accepted.insert("connectionCount", open(&shared.conns));
+    shared.logs.log(
+        LogEntry::new("I", "NETWORK", 22943, "listener", "Connection accepted").attr(accepted),
     );
+    let _conn_entry = ConnEntryGuard {
+        conns: shared.conns.clone(),
+        conn_id,
+        logs: shared.logs.clone(),
+        connection,
+    };
     // Per-connection auth state, shared across every request on this socket so a
     // SCRAM conversation (saslStart → saslContinue) and the authenticated
     // principals persist for the connection's lifetime.
@@ -1157,7 +1206,6 @@ fn run_dispatch(
             &reply,
             read,
             &ctx.db_name,
-            conn_id,
             worked,
             total,
         );
@@ -1167,10 +1215,16 @@ fn run_dispatch(
         if secantus_commands::lock_manager::took_global() {
             secantus_commands::lock_manager::log_lock(&shared.locks);
         }
-        log::info!("Slow query {attr}");
-        shared
-            .logs
-            .append("I", "COMMAND", format!("Slow query {attr}"));
+        let entry = LogEntry::new(
+            "I",
+            "COMMAND",
+            secantus_commands::slowop::SLOW_QUERY_ID,
+            format!("conn{conn_id}"),
+            "Slow query",
+        )
+        .attr(attr);
+        log::info!("{}", entry.render());
+        shared.logs.log(entry);
     }
     // `pending_batch` is set by `find` / `getMore` to hand the reply's document
     // batch to the wire as pre-encoded blobs (spliced by `write_op_msg` /

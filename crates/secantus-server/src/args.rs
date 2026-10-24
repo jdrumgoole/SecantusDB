@@ -129,6 +129,7 @@ impl CliArgs {
     /// The `ServerConfig` for `bind`.
     pub fn server_config(&self) -> ServerConfig {
         ServerConfig {
+            db_path: Some(self.storage_path.clone()),
             replica_set_name: self.replica_set_name.clone(),
             require_auth: self.require_auth,
             enable_test_commands: self.enable_test_commands,

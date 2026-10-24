@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 from typing import Any
 
+import pymongo
 import pytest
 
 from tests.backlog.conftest import mongo_answer
@@ -300,8 +302,8 @@ _SLOW_LINE_ATTRS = (
 
 
 def _slow_query_attr(line: str) -> dict | None:
-    """The attributes of a `Slow query` line: mongod's lines are JSON
-    with an `attr`; the Rust server's are `<ts> I COMMAND Slow query {...}`."""
+    """The attributes of a `Slow query` line: a JSON document with an
+    `attr`, on both servers since RM-302."""
     if "Slow query" not in line:
         return None
     if line.startswith("{"):
@@ -387,15 +389,115 @@ def _log_shape(client: Any) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-302")
+def _log_kinds(client: Any) -> dict:
+    """What `getLog` says about one find, an update of two statements, an
+    index build and a connection opened and closed: for each kind of line --
+    `(s, c, id, msg)` -- the threads that wrote it (digits as `N`), whether
+    every one is padded as mongod's formatter pads, and its attribute names."""
+    db = client.rm302
+    db.drop_collection("c")
+    db.c.insert_many([{"_id": i} for i in range(3)])
+    # Only this case's lines: the window starts after the last line before
+    # it, since mongod's `getLog` keeps its latest 1023 only.
+    log = client.admin.command("getLog", "global")["log"]
+    last = log[-1] if log else None
+    client.admin.command("profile", 0, slowms=0)
+    try:
+        db.c.find_one({"_id": 1})
+        db.command(
+            "update",
+            "c",
+            updates=[{"q": {"_id": i}, "u": {"$set": {"a": 1}}} for i in (1, 2)],
+        )
+        db.c.create_index("x")
+    finally:
+        client.admin.command("profile", 0, slowms=100)
+    host, port = client.address
+    other = pymongo.MongoClient(host=host, port=port)
+    other.admin.command("ping")
+    other.close()
+    log = client.admin.command("getLog", "global")["log"]
+    if last in log:
+        log = log[len(log) - log[::-1].index(last) :]
+    kinds: dict = {}
+    for line in log:
+        e = json.loads(line)
+        key = (e["s"], e["c"], e["id"], e["msg"])
+        if key not in _LINE_KINDS:
+            continue
+        head = re.sub(r'^\{"t":\{"\$date":"[^"]+"\},', "", line).split('"ctx"')[0]
+        padded = head == (
+            f'"s":"{e["s"]}",'.ljust(10)
+            + f'"c":"{e["c"]}",'.ljust(16)
+            + f'"id":{e["id"]},'.ljust(14)
+        )
+        got = kinds.setdefault(key, (set(), set(), set()))
+        got[0].add(re.sub(r"\d+", "N", e["ctx"]))
+        got[1].add(padded)
+        if key[3] != "Slow query":
+            got[2].update(e.get("attr", {}))
+    return kinds
+
+
+_LINE_KINDS = {
+    ("I", "NETWORK", 22943, "Connection accepted"),
+    ("I", "NETWORK", 22944, "Connection ended"),
+    ("I", "COMMAND", 51803, "Slow query"),
+    ("I", "WRITE", 51803, "Slow query"),
+    ("I", "STORAGE", 51803, "Slow query"),
+}
+
+#: The reference mongod runs `--quiet`, which leaves out its connection lines;
+#: a default mongod 8.2.11 writes these (measured 2026-10-24).
+_CONNECTION = {"connectionCount", "connectionId", "isLoadBalanced", "remote", "uuid"}
+_CONNECTION_KINDS = {
+    ("I", "NETWORK", 22943, "Connection accepted"): ({"listener"}, {True}, _CONNECTION),
+    ("I", "NETWORK", 22944, "Connection ended"): ({"connN"}, {True}, _CONNECTION),
+}
+
+
+@pytest.mark.backlog_fixed("RM-302")
 def test_get_log_lines_are_structured_json(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `getLog` lines are its structured log, one JSON
-    document each with `t`, `s`, `c`, `id`, `ctx` and `msg` (measured
-    2026-10-24). This server's are text: `<date> <severity> <component>
+    document each with `t`, `s`, `c`, `id`, `ctx` and `msg`, padded into
+    columns, with mongod's id for each message and the thread that wrote it
+    (`listener`, `connN`, `IndexBuildsCoordinatorMongod-0`); a connection's
+    lines name its peer, a UUID, its id and how many are open (measured
+    2026-10-24). This server's were text: `<date> <severity> <component>
     <message>`."""
     want = [("JSON", ["c", "ctx", "id", "msg", "s", "t"])] * 5
     assert _log_shape(mongod) == want
     assert _log_shape(rust_mongo) == want
+    ours, theirs = _log_kinds(rust_mongo), _log_kinds(mongod)
+    connection = {k: ours.pop(k, None) for k in _CONNECTION_KINDS}
+    assert connection == _CONNECTION_KINDS
+    assert ours == {k: v for k, v in theirs.items() if k not in _CONNECTION_KINDS}
+
+
+def _client_metadata(client: Any) -> list:
+    """The `client metadata` lines a new connection's first `hello` writes."""
+    host, port = client.address
+    other = pymongo.MongoClient(host=host, port=port, appname="rm-client-metadata")
+    try:
+        other.admin.command("ping")
+    finally:
+        other.close()
+    out = []
+    for line in client.admin.command("getLog", "global")["log"]:
+        e = json.loads(line)
+        if e["msg"] == "client metadata" and "rm-client-metadata" in line:
+            out.append((e["s"], e["c"], e["id"], sorted(e["attr"])))
+    return out[-1:]
+
+
+@pytest.mark.backlog("RM-305")
+def test_client_metadata_is_logged(rust_mongo: Any) -> None:
+    """mongod 8.2.11 logs a connection's first `hello` as `client metadata`
+    (NETWORK, 51800) with the driver's document (measured 2026-10-24 on a
+    default mongod; the reference runs `--quiet`, which leaves the line
+    out). This server writes no such line."""
+    want = [("I", "NETWORK", 51800, ["client", "doc", "negotiatedCompressors", "remote"])]
+    assert _client_metadata(rust_mongo) == want
 
 
 @pytest.mark.backlog_fixed("RM-025")

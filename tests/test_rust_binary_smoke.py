@@ -238,8 +238,10 @@ def test_slow_operations_are_logged_and_the_threshold_is_server_wide(
     assert daemon.wait(timeout=15) == 0
     assert daemon.stderr is not None
     stderr = daemon.stderr.read()
+    # mongod's structured log line, on standard error as in `getLog`.
     assert (
-        'Slow query {"type":"command","ns":"smoke.things","command":{"insert":"things"' in stderr
+        '"msg":"Slow query","attr":{"type":"command","ns":"smoke.things",'
+        '"command":{"insert":"things"' in stderr
     ), stderr
 
 

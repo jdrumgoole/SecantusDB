@@ -222,6 +222,7 @@ impl RustServer {
         let adapter: Arc<dyn CmdStorage> = Arc::new(StorageAdapter::new(storage.clone()));
         let cursors = Arc::new(CursorRegistry::new());
         let config = ServerConfig {
+            db_path: Some(storage_path.to_string()),
             replica_set_name,
             require_auth,
             tls,

@@ -20,6 +20,7 @@ dev sandbox / the default `rust` CI job.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import time
@@ -657,7 +658,8 @@ def test_kill_op_acts_on_an_operation_id(tmp_path) -> None:
 
 def test_get_log_returns_connection_lines(tmp_path) -> None:
     """getLog surfaces the server's in-memory log ring buffer, including the
-    connection-accept line (issue #163)."""
+    connection-accept line (issue #163), as mongod's structured log: one JSON
+    document per line (RM-302)."""
     srv = _server.RustServer(str(tmp_path / "wt"), 0)
     try:
         client = _client(srv)
@@ -665,7 +667,10 @@ def test_get_log_returns_connection_lines(tmp_path) -> None:
         res = client.admin.command({"getLog": "global"})
         assert res["ok"] == 1.0
         assert res["totalLinesWritten"] >= 1
-        assert any("connection accepted" in line for line in res["log"])
+        lines = [json.loads(line) for line in res["log"]]
+        assert any(
+            (e["c"], e["id"], e["msg"]) == ("NETWORK", 22943, "Connection accepted") for e in lines
+        ), res["log"]
     finally:
         srv.stop()
 
