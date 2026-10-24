@@ -89,6 +89,28 @@ VIEWS = [
     "pg_catalog.pg_seclabels",
     "pg_catalog.pg_shadow",
     "pg_catalog.pg_stats",
+    # The cumulative statistics views, over the server's counters (RP-070).
+    "pg_catalog.pg_stat_all_indexes",
+    "pg_catalog.pg_stat_all_tables",
+    "pg_catalog.pg_stat_database",
+    "pg_catalog.pg_stat_sys_indexes",
+    "pg_catalog.pg_stat_sys_tables",
+    "pg_catalog.pg_stat_user_functions",
+    "pg_catalog.pg_stat_user_indexes",
+    "pg_catalog.pg_stat_user_tables",
+    "pg_catalog.pg_stat_xact_all_tables",
+    "pg_catalog.pg_stat_xact_sys_tables",
+    "pg_catalog.pg_stat_xact_user_functions",
+    "pg_catalog.pg_stat_xact_user_tables",
+    "pg_catalog.pg_statio_all_indexes",
+    "pg_catalog.pg_statio_all_sequences",
+    "pg_catalog.pg_statio_all_tables",
+    "pg_catalog.pg_statio_sys_indexes",
+    "pg_catalog.pg_statio_sys_sequences",
+    "pg_catalog.pg_statio_sys_tables",
+    "pg_catalog.pg_statio_user_indexes",
+    "pg_catalog.pg_statio_user_sequences",
+    "pg_catalog.pg_statio_user_tables",
 ]
 
 # Tables whose rows are PostgreSQL's built-in objects and nothing else on a

@@ -822,6 +822,7 @@ macro_rules! process_socket_messages {
                     process_error(socket, e, is_extended_query).await?;
                 }
             } else {
+                $handlers.client_gone();
                 break;
             }
         }

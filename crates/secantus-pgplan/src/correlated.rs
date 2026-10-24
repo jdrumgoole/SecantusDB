@@ -814,7 +814,7 @@ pub(crate) fn calls_executor_function(node: &pg_query::protobuf::Node) -> bool {
     let mut found = false;
     let _ = walk_expr(&mut copy, &mut |n| {
         if let Some(N::FuncCall(f)) = n.node.as_ref() {
-            found |= func_name(f).is_some_and(|name| SEQUENCE_FUNCTIONS.contains(&name.as_str()));
+            found |= func_name(f).is_some_and(|name| executor_answers(name.as_str()));
         }
         Ok(())
     });
@@ -934,8 +934,7 @@ pub fn has_correlated(expr: &ColumnExpr) -> bool {
             // function all run through the EXECUTOR's hooks.
             found |= is_correlated(f)
                 || func_name(f).is_some_and(|name| {
-                    SEQUENCE_FUNCTIONS.contains(&name.as_str())
-                        || user_function_for(&name, &f.args).is_some()
+                    executor_answers(name.as_str()) || user_function_for(&name, &f.args).is_some()
                 });
         }
         // So does a cast that may take a user cast's function.
@@ -1017,6 +1016,102 @@ pub(crate) fn executor_record_columns(
         _ => return None,
     })
 }
+
+/// Is `name` a function the executor answers?
+pub(crate) fn executor_answers(name: &str) -> bool {
+    SEQUENCE_FUNCTIONS.contains(&name) || PGSTAT_FUNCTIONS.contains(&name)
+}
+
+/// A statistics function's result type, as `pg_proc` declares it.
+fn pgstat_function_type(name: &str) -> &'static str {
+    match name {
+        "pg_stat_force_next_flush"
+        | "pg_stat_clear_snapshot"
+        | "pg_stat_reset"
+        | "pg_stat_reset_single_table_counters"
+        | "pg_stat_reset_single_function_counters" => "void",
+        "pg_stat_get_db_numbackends" => "int4",
+        "pg_stat_get_snapshot_timestamp"
+        | "pg_stat_get_db_stat_reset_time"
+        | "pg_stat_get_db_checksum_last_failure" => "timestamptz",
+        n if n.starts_with("pg_stat_get_last_") => "timestamptz",
+        n if n.ends_with("_time") => "float8",
+        _ => "int8",
+    }
+}
+
+/// The cumulative statistics' functions (RP-070): the counters live in the
+/// executor.
+pub(crate) const PGSTAT_FUNCTIONS: &[&str] = &[
+    "pg_stat_get_analyze_count",
+    "pg_stat_get_autoanalyze_count",
+    "pg_stat_get_autovacuum_count",
+    "pg_stat_get_blocks_fetched",
+    "pg_stat_get_blocks_hit",
+    "pg_stat_get_db_active_time",
+    "pg_stat_get_db_blk_read_time",
+    "pg_stat_get_db_blk_write_time",
+    "pg_stat_get_db_blocks_fetched",
+    "pg_stat_get_db_blocks_hit",
+    "pg_stat_get_db_checksum_failures",
+    "pg_stat_get_db_checksum_last_failure",
+    "pg_stat_get_db_conflict_all",
+    "pg_stat_get_db_deadlocks",
+    "pg_stat_get_db_idle_in_transaction_time",
+    "pg_stat_get_db_numbackends",
+    "pg_stat_get_db_session_time",
+    "pg_stat_get_db_sessions",
+    "pg_stat_get_db_sessions_abandoned",
+    "pg_stat_get_db_sessions_fatal",
+    "pg_stat_get_db_sessions_killed",
+    "pg_stat_get_db_stat_reset_time",
+    "pg_stat_get_db_temp_bytes",
+    "pg_stat_get_db_temp_files",
+    "pg_stat_get_db_tuples_deleted",
+    "pg_stat_get_db_tuples_fetched",
+    "pg_stat_get_db_tuples_inserted",
+    "pg_stat_get_db_tuples_returned",
+    "pg_stat_get_db_tuples_updated",
+    "pg_stat_get_db_xact_commit",
+    "pg_stat_get_db_xact_rollback",
+    "pg_stat_get_dead_tuples",
+    "pg_stat_get_function_calls",
+    "pg_stat_get_function_self_time",
+    "pg_stat_get_function_total_time",
+    "pg_stat_get_ins_since_vacuum",
+    "pg_stat_get_last_analyze_time",
+    "pg_stat_get_last_autoanalyze_time",
+    "pg_stat_get_last_autovacuum_time",
+    "pg_stat_get_last_vacuum_time",
+    "pg_stat_get_live_tuples",
+    "pg_stat_get_mod_since_analyze",
+    "pg_stat_get_numscans",
+    "pg_stat_get_tuples_deleted",
+    "pg_stat_get_tuples_fetched",
+    "pg_stat_get_tuples_hot_updated",
+    "pg_stat_get_tuples_inserted",
+    "pg_stat_get_tuples_returned",
+    "pg_stat_get_tuples_updated",
+    "pg_stat_get_vacuum_count",
+    "pg_stat_get_xact_function_calls",
+    "pg_stat_get_xact_function_self_time",
+    "pg_stat_get_xact_function_total_time",
+    "pg_stat_get_xact_numscans",
+    "pg_stat_get_xact_tuples_deleted",
+    "pg_stat_get_xact_tuples_fetched",
+    "pg_stat_get_xact_tuples_hot_updated",
+    "pg_stat_get_xact_tuples_inserted",
+    "pg_stat_get_xact_tuples_returned",
+    "pg_stat_get_xact_tuples_updated",
+    "pg_stat_get_xact_blocks_fetched",
+    "pg_stat_get_xact_blocks_hit",
+    "pg_stat_get_snapshot_timestamp",
+    "pg_stat_force_next_flush",
+    "pg_stat_clear_snapshot",
+    "pg_stat_reset",
+    "pg_stat_reset_single_table_counters",
+    "pg_stat_reset_single_function_counters",
+];
 
 pub(crate) const SEQUENCE_FUNCTIONS: &[&str] = &[
     // `pg_trgm`'s `set_limit` writes the session's threshold.
@@ -1100,6 +1195,9 @@ pub(crate) const SEQUENCE_FUNCTIONS: &[&str] = &[
 /// The result type of an executor-answered function other than the
 /// sequence ones.
 pub fn executor_function_type(name: &str) -> Option<&'static str> {
+    if PGSTAT_FUNCTIONS.contains(&name) {
+        return Some(pgstat_function_type(name));
+    }
     Some(match name {
         n if n.starts_with("pg_") && n.ends_with("_size") => "int8",
         n if n.starts_with("pg_try_advisory")

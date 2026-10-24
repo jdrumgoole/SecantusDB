@@ -24577,8 +24577,7 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
             _ => inferred_type(value).to_string(),
         },
         Some(N::FuncCall(f))
-            if func_name(f)
-                .is_some_and(|n| correlated::SEQUENCE_FUNCTIONS.contains(&n.as_str())) =>
+            if func_name(f).is_some_and(|n| correlated::executor_answers(n.as_str())) =>
         {
             func_name(f)
                 .and_then(|n| correlated::executor_function_type(&n))
@@ -26822,7 +26821,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 // The storage-size and advisory-lock functions, answered by
                 // the executor.
                 if let Some(ty) = correlated::executor_function_type(&name)
-                    .filter(|_| correlated::SEQUENCE_FUNCTIONS.contains(&name.as_str()))
+                    .filter(|_| correlated::executor_answers(name.as_str()))
                 {
                     let out = if rt.name.is_empty() {
                         name.clone()
@@ -38698,9 +38697,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 correlated::FnResult::Rows(..) => Ok(Bson::Null),
             };
         }
-        if let Some(name) =
-            func_name(f).filter(|n| correlated::SEQUENCE_FUNCTIONS.contains(&n.as_str()))
-        {
+        if let Some(name) = func_name(f).filter(|n| correlated::executor_answers(n.as_str())) {
             let args = f
                 .args
                 .iter()

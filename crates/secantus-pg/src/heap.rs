@@ -633,6 +633,13 @@ impl PgHandler {
             if !pages.is_empty() {
                 self.prune_pages(&heap_table, Some(&pages))?;
             }
+            // What each version is, for the statistics (RP-070): an
+            // insert, or an update -- heap-only when it stayed on its page
+            // with no indexed field changed.
+            let olds: Vec<Option<(Option<i64>, bool)>> = versions
+                .iter()
+                .map(|v| v.old.as_ref().map(|o| (o.0, o.2)))
+                .collect();
             let ctids = self.with_heap(&heap_table, |heap| {
                 versions
                     .into_iter()
@@ -644,6 +651,20 @@ impl PgHandler {
                     })
                     .collect::<Vec<_>>()
             })?;
+            let (mut inserted, mut updated, mut hot) = (0, 0, 0);
+            for (old, ctid) in olds.iter().zip(&ctids) {
+                match old {
+                    None => inserted += 1,
+                    Some((old_ctid, indexed_same)) => {
+                        updated += 1;
+                        if *indexed_same && old_ctid.is_some_and(|o| o / 65536 == ctid / 65536) {
+                            hot += 1;
+                        }
+                    }
+                }
+            }
+            self.stat_pages(&heap_table, ctids.iter().map(|c| c / 65536));
+            self.stat_writes(&heap_table, inserted, updated, hot);
             for (i, ctid) in idx.into_iter().zip(ctids) {
                 // An xid is 32 bits (the low half of the xid8).
                 stamp(&mut rows[i].1, (xid & 0xFFFF_FFFF) as i64, cid, ctid);
@@ -756,6 +777,7 @@ impl PgHandler {
         for (heap_table, tuples) in by_heap {
             let ctids: Vec<i64> = tuples.iter().map(|(c, _, _)| *c).collect();
             self.prune_pages(&heap_table, Some(&ctids))?;
+            self.stat_deletes(&heap_table, tuples.len() as i64);
             self.with_heap(&heap_table, |heap| {
                 for (ctid, len, id) in tuples {
                     heap.delete(ctid, len, xid, id);
@@ -937,6 +959,39 @@ impl PgHandler {
     }
 
     /// The pages `table`'s heap has (`RelationGetNumberOfBlocks`).
+    /// The heap's tuples a VACUUM or ANALYZE counts dead: deleted (by a
+    /// committed or a running transaction) or inserted by one that rolled
+    /// back, still on their pages.
+    pub(crate) fn dead_tuple_count(&self, table: &str) -> i64 {
+        if !self.has_heap(table) {
+            return 0;
+        }
+        self.with_heap(table, |heap| {
+            heap.pages
+                .iter()
+                .flat_map(|p| p.lps.values())
+                .filter(|lp| matches!(lp, Lp::Normal(t) if t.xmax.is_some() || t.xmin_aborted))
+                .count() as i64
+        })
+        .unwrap_or(0)
+    }
+
+    /// The tuples on the heap's pages, live or dead: what a B-tree over
+    /// the table holds an entry for until VACUUM.
+    pub(crate) fn heap_tuple_count(&self, table: &str) -> i64 {
+        if !self.has_heap(table) {
+            return 0;
+        }
+        self.with_heap(table, |heap| {
+            heap.pages
+                .iter()
+                .flat_map(|p| p.lps.values())
+                .filter(|lp| matches!(lp, Lp::Normal(_)))
+                .count() as i64
+        })
+        .unwrap_or(0)
+    }
+
     pub(crate) fn heap_blocks(&self, table: &str) -> PgWireResult<u32> {
         self.with_heap(table, |h| h.nblocks())
     }

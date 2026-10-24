@@ -529,6 +529,8 @@ impl PgHandler {
         let mut stopped: Option<PgWireError> = None;
         let mut failed: Option<PgWireError> = None;
         let keys = order.clone();
+        let scan_stat = self.scan_stat(&sel.table, &sel.filter);
+        let mut scanned_rows = 0i64;
         let sorted = crate::external_sort::sort_runs_with(
             |sink| {
                 self.storage
@@ -537,6 +539,7 @@ impl PgHandler {
                             stopped = Some(e);
                             return false;
                         }
+                        scanned_rows += blobs.len() as i64;
                         sink(blobs)
                     })
                     .map_err(|e| e.to_string())
@@ -548,6 +551,9 @@ impl PgHandler {
             dedup,
             &mut |d| compute_order_keys(&keys, d, &mut failed),
         );
+        if let Some(s) = scan_stat {
+            s.finish(scanned_rows);
+        }
         if let Some(e) = stopped.or(failed) {
             return Err(e);
         }
@@ -605,6 +611,7 @@ impl PgHandler {
             .limit
             .map(|l| usize::try_from(l.max(0)).unwrap_or(usize::MAX));
         let backend = self.backend.clone();
+        let scan_stat = self.scan_stat(&table, &filter);
         // `statement_timeout` counts the time the statement WORKS, not the
         // time the client takes between two Executes of a suspended portal
         // (PostgreSQL times each Execute): the reader's budget is what is left
@@ -654,10 +661,12 @@ impl PgHandler {
                     }
                     !stopped.get()
                 };
+                let scanned_rows = std::cell::Cell::new(0i64);
                 let sorted = crate::external_sort::sort_runs_with(
                     |sink| {
                         storage
                             .scan_routed_batches(&db, &table, &filter, BATCH, |blobs| {
+                                scanned_rows.set(scanned_rows.get() + blobs.len() as i64);
                                 tick() && sink(blobs)
                             })
                             .map_err(|e| e.to_string())
@@ -680,6 +689,9 @@ impl PgHandler {
                     // Waiting for the client to fetch is not work.
                     since.set(std::time::Instant::now());
                 });
+                if let Some(s) = scan_stat {
+                    s.finish(scanned_rows.get());
+                }
                 if let Err(e) = sorted {
                     if !stopped.get() {
                         let _sent = tx.blocking_send(Err(PgHandler::user_error("XX000", e)));
@@ -687,7 +699,9 @@ impl PgHandler {
                 }
                 return;
             }
+            let mut scanned_rows = 0i64;
             let scanned = storage.scan_routed_batches(&db, &table, &filter, BATCH, |blobs| {
+                scanned_rows += blobs.len() as i64;
                 worked += since.elapsed();
                 since = std::time::Instant::now();
                 if stop(&tx, worked).is_some() {
@@ -725,6 +739,9 @@ impl PgHandler {
                 since = std::time::Instant::now();
                 left != Some(0)
             });
+            if let Some(s) = scan_stat {
+                s.finish(scanned_rows);
+            }
             if let Err(e) = scanned {
                 let _sent = tx.blocking_send(Err(PgHandler::storage_err("could not read", e)));
             }
