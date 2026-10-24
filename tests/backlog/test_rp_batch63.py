@@ -62,7 +62,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ------------------------------- RP-239 a write's heap buffer accesses
     "a write counts the heap pages PostgreSQL's buffer accesses do": (
         "RP-239",
-        True,
+        False,
         [
             "create table rp63_w with (autovacuum_enabled = false) as"
             " select g, repeat('x', 100) p from generate_series(1, 2000) g",

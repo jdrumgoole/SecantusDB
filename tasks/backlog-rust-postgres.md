@@ -755,6 +755,27 @@ tests are scenarios in `tests/backlog/test_rp_batch30.py`, measured on a
 private 15.19 cluster. RP-133 .. RP-136 and RP-138 .. RP-142 were found and
 fixed in the same batch; their tests there are regression tests.
 
+## Found by batch 68 (2026-10-25)
+
+Found while counting the heap buffers each write reads (RP-239). The gap
+tests are scenarios in `tests/backlog/test_rp_batch68.py`, measured on a
+private 15.19 cluster. RP-246 (`SELECT ... INTO t` answered its rows and
+made no table, and an UNLOGGED CREATE TABLE AS made a logged one) was
+found and fixed in the same batch; its test there is a regression test.
+
+- [ ] **An UPDATE of every row places them in storage order.** After one
+      row of a full table moves to the next page (`update t set g = -g
+      where g = 1`), an `update t set g = g + 1000` here moves the rows in
+      the order the store holds them, so the moved row goes first. PostgreSQL
+      15.19 updates them in heap order, reading page 0 first. Its scan
+      prunes page 0's dead version as it reads it, and the space freed
+      takes row 2's new version at `(0,59)`. So every new version after the
+      first stands one place apart from PostgreSQL's, and so do the
+      statement's buffer counts. The UPDATE's rows need to be applied in
+      the scan's ctid order, each page pruned as the scan reaches it.
+      Backlog-ID: RP-247
+      Verify: tests/backlog/test_rp_batch68.py::test_scenario[an UPDATE after a row moved places rows as PostgreSQL does]
+
 ## Found by batch 66 (2026-10-24)
 
 RP-245: a heap checkpoint ran at the end of a message cycle, before the
@@ -802,18 +823,6 @@ private 15.19 cluster. RP-238 (a scan streamed in a transaction block,
 was found and fixed in the same batch; its test there is a regression
 test.
 
-- [ ] **A write counts one heap buffer access per row.** PostgreSQL 15.19
-      counts what `heap_insert` reads through the buffer manager: CREATE
-      TABLE AS writes through a bulk-write ring, one access per page (35
-      for 2,000 rows of 104 bytes), and an INSERT reads its target page per
-      row plus the full page, the free space map's answer and the new page
-      each time the heap extends (2,137 for 2,000 more rows). Here every
-      row written counts one access (2,000 and 4,000), so
-      `pg_statio_user_tables.heap_blks_hit` drifts from PostgreSQL's after
-      any write. Modelling it means following `RelationGetBufferForTuple`
-      and the bulk-insert state per write path.
-      Backlog-ID: RP-239
-      Verify: tests/backlog/test_rp_batch63.py::test_scenario[a write counts the heap pages PostgreSQL's buffer accesses do]
 
 ## Found by batch 62 (2026-10-24)
 

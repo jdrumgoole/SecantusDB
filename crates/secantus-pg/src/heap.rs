@@ -767,8 +767,8 @@ impl PgHandler {
                 .iter()
                 .map(|v| v.old.as_ref().map(|o| (o.0, o.2)))
                 .collect();
-            let ctids = self.with_heap(&heap_table, |heap| {
-                versions
+            let (ctids, accessed) = self.with_heap(&heap_table, |heap| {
+                let ctids = versions
                     .into_iter()
                     .map(|v| match v.old {
                         Some((old, old_len, hot, id)) => {
@@ -776,7 +776,8 @@ impl PgHandler {
                         }
                         None => heap.insert(pid, xid, v.len),
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                (ctids, std::mem::take(&mut heap.accessed))
             })?;
             let (mut inserted, mut updated, mut hot) = (0, 0, 0);
             for (old, ctid) in olds.iter().zip(&ctids) {
@@ -790,7 +791,9 @@ impl PgHandler {
                     }
                 }
             }
-            self.stat_pages(&heap_table, ctids.iter().map(|c| c / 65536));
+            // The buffers the writes read, as `RelationGetBufferForTuple`,
+            // `heap_update` and the free space map read them (RP-239).
+            self.stat_pages(&heap_table, accessed);
             self.stat_writes(&heap_table, inserted, updated, hot);
             // Every version that is not heap-only takes a tuple in each of
             // the table's B-trees (RP-196).
@@ -856,6 +859,9 @@ impl PgHandler {
                     })
                     .collect::<Vec<_>>();
                 heap.targets.clear();
+                // A rewrite writes its new heap past the buffers.
+                heap.accessed.clear();
+                heap.fsm.touched.clear();
                 ctids
             })?;
             for (i, ctid) in idx.into_iter().zip(ctids) {
@@ -919,6 +925,8 @@ impl PgHandler {
             let ctids: Vec<i64> = tuples.iter().map(|(c, _, _)| *c).collect();
             self.prune_pages(&heap_table, Some(&ctids))?;
             self.stat_deletes(&heap_table, tuples.len() as i64);
+            // `heap_delete` reads each row's page (RP-239).
+            self.stat_pages(&heap_table, ctids.iter().map(|c| c / 65536));
             self.with_heap(&heap_table, |heap| {
                 for (ctid, len, id) in tuples {
                     heap.delete(ctid, len, xid, id);
@@ -1296,6 +1304,31 @@ impl PgHandler {
                 Some((b, o, tuple_len(&def, row) as u32))
             })
             .collect()
+    }
+
+    /// Start (`Some(use_fsm)`) or end (`None`) this backend's bulk insert
+    /// into `table`'s heap (`GetBulkInsertState`, RP-239): COPY keeps the
+    /// free space map, CREATE TABLE AS does not (`TABLE_INSERT_SKIP_FSM`),
+    /// and each holds the page it writes, which it does not read again.
+    pub(crate) fn bulk_insert(&self, table: &str, use_fsm: Option<bool>) {
+        if table.starts_with("__") || !self.has_heap(table) {
+            return;
+        }
+        let pid = self.pid();
+        let _ = self.with_heap(table, |heap| match use_fsm {
+            Some(use_fsm) => {
+                heap.bulk.insert(
+                    pid,
+                    crate::heap_page::Bulk {
+                        use_fsm,
+                        current: None,
+                    },
+                );
+            }
+            None => {
+                heap.bulk.remove(&pid);
+            }
+        });
     }
 
     /// Write this store's changed heaps (RP-193): at most once a second

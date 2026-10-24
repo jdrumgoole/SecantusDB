@@ -35788,6 +35788,7 @@ impl PgHandler {
                 table,
                 if_not_exists,
                 temp,
+                unlogged,
                 column_names,
                 query,
                 with_data,
@@ -35844,6 +35845,9 @@ impl PgHandler {
                     .collect::<PgWireResult<Vec<_>>>()?;
                 let mut def = TableDef::new(&table, columns);
                 def.temp = temp;
+                if unlogged {
+                    def.extra.insert("unlogged", true);
+                }
                 if let Some(am) = &access_method {
                     def.extra.insert("access_method", am);
                 }
@@ -35881,7 +35885,10 @@ impl PgHandler {
                 }
                 let written = rows.len();
                 if written > 0 {
-                    self.execute(
+                    // Through a bulk insert that skips the free space map,
+                    // as `intorel_startup` writes (RP-239).
+                    self.bulk_insert(&table, Some(false));
+                    let filled = self.execute(
                         Statement::Insert(secantus_pgplan::Insert {
                             table: table.clone(),
                             view_checks: Vec::new(),
@@ -35897,7 +35904,9 @@ impl PgHandler {
                             source_targets: Vec::new(),
                         }),
                         max_rows,
-                    )?;
+                    );
+                    self.bulk_insert(&table, None);
+                    filled?;
                 }
                 // Recorded after the fill: the rows go in through the INSERT
                 // path, which refuses a materialized view.
@@ -38614,6 +38623,10 @@ impl PgHandler {
                     cols.iter().map(|c| list.contains(&c.name)).collect()
                 };
                 self.check_copy_freeze(&cf)?;
+                // `CopyFrom`'s bulk insert (RP-239), which keeps the free
+                // space map unless the table is new in this transaction.
+                let created_here = self.pending.tables().contains_key(&cf.table);
+                self.bulk_insert(&cf.table, Some(!created_here));
                 *self.copy_in.lock().unwrap_or_else(|e| e.into_inner()) = Some(CopyInState {
                     format: cf.format,
                     options: cf.options.clone(),
@@ -48667,6 +48680,7 @@ impl CopyHandler for PgHandler {
             self.note_failure();
             return Err(e);
         }
+        self.bulk_insert(&state.table, None);
         state.progress.end();
         let written = state.loaded;
 
@@ -49202,6 +49216,7 @@ impl PgHandler {
         let Some(mut state) = state else {
             return;
         };
+        self.bulk_insert(&state.table, None);
         state.progress.end();
         if let Some(mut handle) = state.handle.take() {
             if let Err(e) = self.storage.rollback_user_transaction(&mut handle) {
