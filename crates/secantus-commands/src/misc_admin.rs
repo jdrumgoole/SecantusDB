@@ -152,7 +152,10 @@ pub fn filemd5(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 Some("files_id" | "n")
             )
         });
-    if !indexed {
+    // A collection that is not there needs no plan: mongod answers no
+    // chunks (measured 8.2.11, 2026-10-24).
+    let exists = storage.collection_exists(&db, &chunks).unwrap_or(true);
+    if !indexed && exists {
         return Err(CommandError::new(
             291,
             "NoQueryExecutionPlans",

@@ -1108,6 +1108,7 @@ fn run_dispatch(
     // unwind the connection thread and drop the socket with no reply — matching
     // the Python server's dispatch-level catch-all.
     let started = std::time::Instant::now();
+    secantus_commands::lock_manager::begin_operation();
     let reply =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(request, &mut ctx)))
             .unwrap_or_else(|_| {
@@ -1160,6 +1161,12 @@ fn run_dispatch(
             worked,
             total,
         );
+        // mongod reads the operation's storage statistics for the line
+        // under the global lock in IS, when the operation took the global
+        // lock at all (RM-299).
+        if secantus_commands::lock_manager::took_global() {
+            secantus_commands::lock_manager::log_lock(&shared.locks);
+        }
         log::info!("Slow query {attr}");
         shared
             .logs

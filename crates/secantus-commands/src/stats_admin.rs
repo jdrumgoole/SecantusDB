@@ -550,6 +550,12 @@ pub fn list_databases(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     };
     let mut listed: Vec<Document> = Vec::new();
     let mut total: i64 = 0;
+    // mongod applies a filter on `name` alone before it reads any size, and
+    // takes the global lock in IS for each size it reads (measured 8.2.11,
+    // 2026-10-24: one more per database listed, all of them for a filter on
+    // anything else, none with `nameOnly`).
+    let name_leaf = filter.filter(|f| f.len() == 1 && f.contains_key("name"));
+    let mut sized = 0;
     for name in storage.list_databases().map_err(command_error)? {
         if visible
             .as_ref()
@@ -560,6 +566,13 @@ pub fn list_databases(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         let entry = if name_only {
             doc! { "name": name }
         } else {
+            if name_leaf.is_some_and(|f| {
+                !secantus_core::query::matches(&doc! { "name": &name }, f, &Document::new(), None)
+                    .unwrap_or(false)
+            }) {
+                continue;
+            }
+            sized += 1;
             let t = totals(ctx, &name)?;
             doc! {
                 "name": name,
@@ -576,6 +589,7 @@ pub fn list_databases(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             listed.push(entry);
         }
     }
+    crate::lock_manager::global_reads(sized);
     let mut out = doc! { "databases": listed.into_iter().map(Bson::Document).collect::<Vec<_>>() };
     if !name_only {
         out.insert("totalSize", Bson::Int64(total));

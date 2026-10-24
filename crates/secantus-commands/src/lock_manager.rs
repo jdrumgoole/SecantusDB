@@ -304,6 +304,7 @@ impl LockManager {
                 head.holders.push((owner, mode));
                 drop(inner);
                 self.count(resource, mode, None);
+                note_taken(resource);
                 return Ok(());
             }
         }
@@ -331,6 +332,7 @@ impl LockManager {
                 // Those queued behind may now be grantable beside it.
                 self.changed.notify_all();
                 self.count(resource, mode, Some(began.elapsed()));
+                note_taken(resource);
                 return Ok(());
             }
             if secantus_core::deadline::expired() {
@@ -621,8 +623,89 @@ pub fn statement_rounds(
         // `fsync` and `fsyncUnlock` manage the global lock themselves.
         "hello" | "isMaster" | "ismaster" | "ping" | "serverStatus" | "killCursors" | "fsync"
         | "fsyncUnlock" => Some(Vec::new()),
+        // The server's own state, no data: no lock at all (measured 8.2.11,
+        // 2026-10-24, in valid forms).
+        "buildInfo"
+        | "buildinfo"
+        | "connPoolStats"
+        | "connectionStatus"
+        | "dropConnections"
+        | "features"
+        | "getClusterParameter"
+        | "getCmdLineOpts"
+        | "getDefaultRWConcern"
+        | "getLog"
+        | "getParameter"
+        | "hostInfo"
+        | "listCommands"
+        | "top"
+        | "whatsmyuri" => Some(Vec::new()),
+        // `listDatabases` takes one more global IS for each database whose
+        // size it reads, as it reads it (`global_reads`).
         "find" | "getMore" | "count" | "distinct" | "listCollections" | "listIndexes"
-        | "listDatabases" | "collStats" => read(),
+        | "listDatabases" | "collStats" | "rolesInfo" | "usersInfo" => read(),
+        // The older read path: the replication state transition lock first.
+        "dataSize"
+        | "planCacheClear"
+        | "planCacheClearFilters"
+        | "planCacheListFilters"
+        | "planCacheSetFilter" => {
+            let ns = if name == "dataSize" {
+                coll.map(str::to_string)
+            } else {
+                coll.map(|c| format!("{db}.{c}"))
+            };
+            let mut round = vec![
+                (Resource::ReplicationStateTransition, Ix),
+                (Resource::Global, Is),
+            ];
+            if let Some(ns) = ns {
+                let in_db = ns.split('.').next().unwrap_or(db).to_string();
+                round.push((Resource::Database(in_db), Is));
+                round.push((Resource::Collection(ns), Is));
+            }
+            Some(vec![round])
+        }
+        // `filemd5` reads `<root>.chunks` the same way.
+        "filemd5" => {
+            let root = doc.get_str("root").unwrap_or("fs");
+            Some(vec![vec![
+                (Resource::ReplicationStateTransition, Ix),
+                (Resource::Global, Is),
+                (Resource::Database(db.to_string()), Is),
+                (Resource::Collection(format!("{db}.{root}.chunks")), Is),
+            ]])
+        }
+        // What the explained command reads with, or one write round for a
+        // write, which is planned and not run.
+        "explain" => {
+            let inner = doc.get_document("explain").ok()?;
+            let verb = inner.keys().next().map(String::as_str)?;
+            let target = inner.get_str(verb).ok().filter(|s| !s.is_empty());
+            match verb {
+                "update" | "delete" | "findAndModify" | "findandmodify" => {
+                    Some(vec![write_round(target)])
+                }
+                _ => read(),
+            }
+        }
+        // Twice the transition and global locks, then the database in S
+        // with each of its collections in IS.
+        "dbHash" => {
+            let opening = vec![
+                (Resource::ReplicationStateTransition, Ix),
+                (Resource::Global, Is),
+            ];
+            let mut hashing = opening.clone();
+            hashing.push((Resource::Database(db.to_string()), S));
+            hashing.extend(
+                facts
+                    .collections()
+                    .into_iter()
+                    .map(|c| (Resource::Collection(format!("{db}.{c}")), Is)),
+            );
+            Some(vec![opening, hashing])
+        }
         "aggregate" => {
             let writes = matches!(doc.get("pipeline"), Some(bson::Bson::Array(stages))
             if stages.iter().any(|s| s.as_document().is_some_and(|d| {
@@ -788,6 +871,43 @@ fn out_rounds(
 }
 
 thread_local! {
+    /// Whether the operation this thread runs has been granted the global
+    /// lock, in any mode: mongod's `Locker::wasGlobalLockTaken`.
+    static TOOK_GLOBAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn note_taken(resource: &Resource) {
+    if matches!(resource, Resource::Global) {
+        TOOK_GLOBAL.with(|t| t.set(true));
+    }
+}
+
+/// An operation starts on this thread: it has taken no global lock yet.
+pub fn begin_operation() {
+    TOOK_GLOBAL.with(|t| t.set(false));
+}
+
+/// Whether the operation this thread runs has taken the global lock.
+pub fn took_global() -> bool {
+    TOOK_GLOBAL.with(std::cell::Cell::get)
+}
+
+/// The global lock in IS that mongod takes to read an operation's storage
+/// statistics for its `Slow query` line (`CurOp::completeAndLogOperation`),
+/// for an operation that took the global lock: taken and let go, one more
+/// global IS in `serverStatus.locks` per line (measured 8.2.11, 2026-10-24;
+/// RM-299).
+pub fn log_lock(lm: &LockManager) {
+    let owner = lm.statement_owner();
+    // Refused only by a spent deadline behind a conflicting holder; mongod
+    // likewise gives up on this lock (after 500 ms) and writes the line
+    // without the statistics, so there is nothing to report.
+    if lm.acquire(owner, &Resource::Global, Mode::Is).is_ok() {
+        lm.release(owner);
+    }
+}
+
+thread_local! {
     /// The lock manager of the statement this thread is running, for the
     /// writes a statement makes partway through (`$merge`'s, a round per
     /// document), which the rounds taken before it runs cannot know.
@@ -808,6 +928,26 @@ impl Drop for CurrentScope {
         let previous = self.0.take();
         CURRENT.with(|c| *c.borrow_mut() = previous);
     }
+}
+
+/// `n` global IS from the running statement's lock manager, each taken and
+/// let go: what `listDatabases` takes reading each database's size.
+pub fn global_reads(n: usize) {
+    let Some(lm) = CURRENT.with(|c| c.borrow().clone()) else {
+        return;
+    };
+    for _ in 0..n {
+        let owner = lm.statement_owner();
+        if lm.acquire(owner, &Resource::Global, Mode::Is).is_err() {
+            return;
+        }
+        lm.release(owner);
+    }
+}
+
+/// The running statement's lock manager, if one is wired.
+pub fn current() -> Option<std::sync::Arc<LockManager>> {
+    CURRENT.with(|c| c.borrow().clone())
 }
 
 /// `n` write rounds on `db.coll` from the running statement's lock manager,

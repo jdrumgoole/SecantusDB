@@ -1223,6 +1223,7 @@ dependencies = [
  "base64",
  "bson",
  "libc",
+ "log",
  "md-5",
  "rand",
  "secantus-auth",

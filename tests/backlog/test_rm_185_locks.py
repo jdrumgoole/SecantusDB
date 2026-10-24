@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
+import json
 import uuid
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -57,8 +58,9 @@ def _no_slow_operations(rust_mongo: Any, mongod: Any) -> Iterator[None]:
     five reference runs (RM-274; reproduced 2026-10-24 by twelve reference
     mongods at once, and by one beside fsync-heavy disk load, but not by CPU
     load; with `slowms` out of reach, 120 of 120 runs read 7 and 2). The
-    counts would then measure the machine. The lock itself is a divergence
-    of its own (RM-299, `test_a_slow_operation_takes_the_global_lock_to_log`).
+    counts would then measure the machine. Both servers take that lock
+    (RM-299, `test_a_slow_operation_takes_the_global_lock_to_log`), so the
+    same `slowms` keeps both counts the machine's own.
     The same `profile` command goes to both servers, so neither logs."""
     saved = []
     for client in (rust_mongo, mongod):
@@ -362,40 +364,254 @@ def _merge_fail_duplicates(client: Any) -> list:
     )
 
 
-@pytest.mark.backlog("RM-185")
+def _merge_fail_shapes(client: Any) -> list:
+    cases = []
+    for n, dups in [
+        (1, [0]),
+        (2, [0]),
+        (2, [1]),
+        (4, [1]),
+        (4, [3]),
+        (4, [0, 1, 2, 3]),
+        (8, [3, 4, 5]),
+    ]:
+        db = client[_fresh("rm185df")]
+        db.c.insert_many([{"_id": i} for i in range(n)])
+        db.t.insert_many([{"_id": d} for d in dups])
+        spec = {"into": "t", "whenMatched": "fail"}
+        cases.append(
+            (
+                f"$merge fail, {n} documents, duplicates at {dups}",
+                lambda db=db, spec=spec: list(db.c.aggregate([{"$merge": spec}])),
+            )
+        )
+    return _deltas(client, cases)
+
+
+@pytest.mark.backlog_fixed("RM-185")
 def test_lock_counts_of_merge_fail_with_duplicates(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11's `whenMatched: "fail"` retries a batch that met a
-    duplicate, taking more write rounds (4 for 4 documents with two
-    duplicates, 3 with one); this server takes the batch's one."""
+    """mongod 8.2.11's `whenMatched: "fail"` meets a duplicate and retries:
+    the whole batch at once (rolled back; a round, not taken for one
+    document), then a try from the start of what is left that commits up to
+    the next duplicate, a round each, and one for the run after the last
+    duplicate (measured 2026-10-24). This server took the batch's one."""
     assert _merge_fail_duplicates(rust_mongo) == _reference(_merge_fail_duplicates, mongod)
+    assert _merge_fail_shapes(rust_mongo) == _reference(_merge_fail_shapes, mongod)
+
+
+def _slow_cases(client: Any) -> list:
+    db = client[_fresh("rm185slow")]
+    db.c.insert_many([{"_id": i, "x": i} for i in range(5)])
+    db.t.insert_one({"_id": 0})
+    return [
+        ("ping", lambda: db.command("ping")),
+        ("getLog", lambda: client.admin.command("getLog", "global")),
+        ("find", lambda: db.c.find_one({"_id": 1})),
+        ("find and getMore", lambda: list(db.c.find().batch_size(2))),
+        ("insert of two", lambda: db.c.insert_many([{}, {}])),
+        (
+            "update of two statements",
+            lambda: db.command(
+                "update",
+                "c",
+                updates=[
+                    {"q": {"_id": 1}, "u": {"$set": {"a": 1}}},
+                    {"q": {"_id": 2}, "u": {"$set": {"a": 1}}},
+                ],
+            ),
+        ),
+        ("delete", lambda: db.c.delete_one({"_id": 3})),
+        ("findAndModify", lambda: db.c.find_one_and_update({"_id": 4}, {"$set": {"y": 1}})),
+        ("$merge into a target", lambda: list(db.c.aggregate([{"$merge": {"into": "t"}}]))),
+        (
+            "$merge creating its target",
+            lambda: list(db.c.aggregate([{"$merge": {"into": "m"}}])),
+        ),
+        ("$out", lambda: list(db.c.aggregate([{"$out": "o"}]))),
+        ("createIndex", lambda: db.c.create_index("x")),
+        ("createIndex of one that exists", lambda: db.c.create_index("x")),
+        ("drop", lambda: db.command("drop", "o")),
+    ]
 
 
 def _slow(client: Any) -> list:
-    """`_merge`'s shapes and a `find` with every operation logged as slow."""
+    """`_slow_cases` with every operation logged as slow."""
     client.admin.command("profile", 0, slowms=0)
     try:
-        db = client[_fresh("rm185slow")]
-        db.c.insert_many([{"_id": i} for i in range(5)])
-        return _deltas(
-            client,
-            [
-                ("find", lambda: db.c.find_one({"_id": 1})),
-                (
-                    "$merge creating its target",
-                    lambda: list(db.c.aggregate([{"$merge": {"into": "m"}}])),
-                ),
-            ],
-        )
+        return _deltas(client, _slow_cases(client))
     finally:
         client.admin.command("profile", 0, slowms=_NEVER_SLOW)
 
 
-@pytest.mark.backlog("RM-299")
+@pytest.mark.backlog_fixed("RM-299")
 def test_a_slow_operation_takes_the_global_lock_to_log(rust_mongo: Any, mongod: Any) -> None:
-    """mongod logs an operation slower than `slowms` and takes the global lock
-    in IS to read its storage statistics for the line: one more global IS for
-    each operation logged, each upsert a `$merge` makes included (measured
-    8.2.11, 2026-10-24: with `slowms` 0, `$merge` creating its target reads 8
-    global IS where it reads 2 with nothing logged). This server writes the
-    `Slow query` line for the command and takes no lock for it."""
+    """mongod logs an operation slower than `slowms` and, when the operation
+    took the global lock at all, takes it again in IS to read its storage
+    statistics for the line: one more global IS for each operation logged
+    -- each `getMore`, each update and delete statement, each write a
+    `$merge` makes, an index build's own thread -- and none for `ping`
+    (measured 8.2.11, 2026-10-24: with `slowms` 0, `$merge` creating its
+    target reads 8 global IS where it reads 2 with nothing logged). This
+    server wrote the command's line and took no lock for it."""
     assert _slow(rust_mongo) == _reference(_slow, mongod)
+
+
+def _log_line(line: str) -> dict:
+    """A `getLog` line as `{c, msg, attr}`: mongod's are JSON; this server's
+    are `<date> <severity> <component> <message>` (RM-302)."""
+    try:
+        return json.loads(line)
+    except ValueError:
+        _date, _severity, component, message = line.split(" ", 3)
+        if message.startswith("Slow query "):
+            return {"c": component, "msg": "Slow query", "attr": json.loads(message[11:])}
+        return {"c": component, "msg": message}
+
+
+def _lines_after(client: Any, last: str | None) -> list:
+    """The `getLog` lines after `last`. mongod returns only the latest 1024,
+    so once its log is full the count stops growing: the window is found by
+    the line it starts after, not by a position."""
+    log = client.admin.command("getLog", "global")["log"]
+    if last is None:
+        return log
+    for i in range(len(log) - 1, -1, -1):
+        if log[i] == last:
+            return log[i + 1 :]
+    return log
+
+
+def _slow_lines(client: Any) -> list:
+    """Each case's `Slow query` lines, as (component, type, the command's
+    first field), with every operation logged as slow."""
+    cases = _slow_cases(client)
+    client.admin.command("profile", 0, slowms=0)
+    out = []
+    try:
+        for label, fn in cases:
+            log = client.admin.command("getLog", "global")["log"]
+            last = log[-1] if log else None
+            _quiet(fn)
+            lines = []
+            for entry in map(_log_line, _lines_after(client, last)):
+                if entry.get("msg") != "Slow query":
+                    continue
+                command = entry["attr"].get("command", {})
+                first = next(iter(command), "")
+                # The `getLog` that reads the log is logged in its window.
+                if first != "getLog" or label == "getLog":
+                    lines.append((entry["c"], entry["attr"].get("type"), first))
+            out.append((label, lines))
+    finally:
+        client.admin.command("profile", 0, slowms=_NEVER_SLOW)
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-299")
+def test_a_write_statement_logs_a_line_of_its_own(rust_mongo: Any, mongod: Any) -> None:
+    """mongod writes a `Slow query` line, component `WRITE`, for each update
+    and delete statement before the command's own -- a `$merge`'s writes are
+    update statements -- and an index build over documents logs one on its
+    thread (component `STORAGE`, type `none`) (measured 8.2.11, 2026-10-24).
+    This server logged the command alone."""
+    assert _slow_lines(rust_mongo) == _slow_lines(mongod)
+
+
+def _admin_commands(client: Any) -> list:
+    db = client[_fresh("rm185a")]
+    db.x.insert_many([{"a": i} for i in range(3)])
+    db.y.insert_one({})
+    admin = client.admin
+    find = {"find": "x", "filter": {"a": 1}}
+    update = {"update": "x", "updates": [{"q": {"a": 1}, "u": {"$set": {"b": 1}}}]}
+    return _deltas(
+        client,
+        [
+            *[
+                (name, lambda name=name, arg=arg: admin.command(name, arg))
+                for name, arg in [
+                    ("buildInfo", 1),
+                    ("connPoolStats", 1),
+                    ("connectionStatus", 1),
+                    ("features", 1),
+                    ("getClusterParameter", "*"),
+                    ("getCmdLineOpts", 1),
+                    ("getLog", "global"),
+                    ("getParameter", "*"),
+                    ("hostInfo", 1),
+                    ("listCommands", 1),
+                    ("top", 1),
+                    ("whatsmyuri", 1),
+                ]
+            ],
+            ("dropConnections", lambda: admin.command("dropConnections", hostAndPort=[])),
+            ("rolesInfo", lambda: db.command("rolesInfo", 1)),
+            ("usersInfo", lambda: db.command("usersInfo", 1)),
+            ("dataSize", lambda: db.command("dataSize", f"{db.name}.x")),
+            ("planCacheClear", lambda: db.command("planCacheClear", "x")),
+            ("planCacheListFilters", lambda: db.command("planCacheListFilters", "x")),
+            ("planCacheClearFilters", lambda: db.command("planCacheClearFilters", "x")),
+            (
+                "planCacheSetFilter",
+                lambda: db.command("planCacheSetFilter", "x", query={"a": 1}, indexes=[{"_id": 1}]),
+            ),
+            ("explain find", lambda: db.command("explain", find)),
+            (
+                "explain aggregate",
+                lambda: db.command("explain", {"aggregate": "x", "pipeline": [], "cursor": {}}),
+            ),
+            ("explain update", lambda: db.command("explain", update)),
+            (
+                "explain delete",
+                lambda: db.command("explain", {"delete": "x", "deletes": [{"q": {}, "limit": 1}]}),
+            ),
+            ("dbHash", lambda: db.command("dbHash")),
+            ("filemd5 of no chunks", lambda: db.command("filemd5", 1, root="fs")),
+            (
+                "listDatabases by name",
+                lambda: admin.command("listDatabases", filter={"name": db.name}),
+            ),
+            ("listDatabases of names", lambda: admin.command("listDatabases", nameOnly=True)),
+        ],
+    )
+
+
+@pytest.mark.backlog_fixed("RM-185")
+def test_lock_counts_of_admin_commands(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11's locks for the commands that read no data (none at
+    all), `rolesInfo` / `usersInfo` (a global IS), the older read path of
+    `dataSize`, `filemd5` and the plan-cache commands (the replication state
+    transition lock first), `explain` (the explained command's read, or one
+    write round), `dbHash` (the database in S) and `listDatabases` (a global
+    IS more for each database whose size it reads) -- measured 2026-10-24.
+    This server took a write chain for most of them."""
+    assert _admin_commands(rust_mongo) == _reference(_admin_commands, mongod)
+
+
+def _before_parsing(client: Any) -> list:
+    db = client[_fresh("rm185p")]
+    db.x.insert_one({})
+    return _deltas(
+        client,
+        [
+            ("explain of nothing", lambda: db.command("explain", 1)),
+            ("dataSize of nothing", lambda: db.command("dataSize", 1)),
+            ("planCacheClear of nothing", lambda: db.command("planCacheClear", 1)),
+            (
+                "validateDBMetadata",
+                lambda: db.command(
+                    "validateDBMetadata", apiParameters={"version": "1", "strict": True}
+                ),
+            ),
+        ],
+    )
+
+
+@pytest.mark.backlog("RM-185")
+def test_lock_counts_before_a_command_parses(rust_mongo: Any, mongod: Any) -> None:
+    """mongod takes a command's locks inside the command, after it parses, so
+    one refused as malformed takes none; and `validateDBMetadata` reads each
+    collection (8 global IS for one database of two collections; measured
+    8.2.11, 2026-10-24). This server takes a command's chain before running
+    it, and gives `validateDBMetadata` the generic one."""
+    assert _before_parsing(rust_mongo) == _reference(_before_parsing, mongod)

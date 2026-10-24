@@ -2310,6 +2310,7 @@ dependencies = [
  "base64",
  "bson",
  "libc",
+ "log",
  "md-5 0.10.6",
  "rand 0.9.4",
  "secantus-auth",
