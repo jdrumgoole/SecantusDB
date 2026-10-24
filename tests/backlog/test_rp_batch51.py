@@ -482,6 +482,83 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
             "where ev_class = 'pg_roles'::regclass",
         ],
     ),
+    "pg_get_indexdef of an index the block created": (
+        "RP-200",
+        False,
+        [
+            "begin",
+            "create table rp51_g (a int, b text)",
+            "create index rp51_gi on rp51_g (a)",
+            "alter table rp51_g add constraint rp51_gc check (a > 0)",
+            "select pg_get_indexdef('rp51_gi'::regclass), "
+            "pg_get_indexdef('rp51_gi'::regclass, 1, false)",
+            "select pg_get_constraintdef(oid) from pg_constraint where conname = 'rp51_gc'",
+            "rollback",
+        ],
+    ),
+    "a GiST operator class": (
+        "RP-169",
+        True,
+        [
+            "begin",
+            "create operator class rp51_gb for type box using gist as operator 3 &&, "
+            "function 1 gist_box_consistent(internal, box, smallint, oid, internal), "
+            "function 2 gist_box_union(internal, internal), "
+            "function 5 gist_box_penalty(internal, internal, internal), "
+            "function 6 gist_box_picksplit(internal, internal), "
+            "function 7 gist_box_same(box, box, internal)",
+            "select opcname, opcmethod::int, opcintype::regtype::text from pg_opclass "
+            "where opcname = 'rp51_gb'",
+            "rollback",
+        ],
+    ),
+    "ispell and thesaurus dictionaries": (
+        "RP-169",
+        True,
+        [
+            "begin",
+            "create text search dictionary rp51_is "
+            "(template = ispell, dictfile = ispell_sample, afffile = ispell_sample)",
+            "select ts_lexize('rp51_is', 'skies'), ts_lexize('rp51_is', 'bookings')",
+            "create text search dictionary rp51_th "
+            "(template = thesaurus, dictfile = thesaurus_sample, dictionary = english_stem)",
+            "select ts_lexize('rp51_th', 'one')",
+            "rollback",
+        ],
+    ),
+    "pg_subscription lists every database's subscriptions": (
+        "RP-169",
+        True,
+        # Committed, then dropped: CREATE DATABASE cannot run in a block.
+        [
+            "drop database if exists rp51_db",
+            "create database rp51_db",
+            "@open b dbname=rp51_db",
+            "@b create subscription rp51_other connection 'dbname=x' publication p "
+            "with (connect = false, slot_name = none)",
+            "select subname, subdbid = (select oid from pg_database where datname = 'rp51_db') "
+            "from pg_subscription",
+            "@b drop subscription rp51_other",
+            "@b select 1",
+        ],
+    ),
+    "shobj_description reads a shared object's comment": (
+        "RP-201",
+        False,
+        # Committed, then put back (batch 52's scenario reads one inside a
+        # block).
+        [
+            "comment on database postgres is 'a database'",
+            "create role rp51_cr",
+            "comment on role rp51_cr is 'a role'",
+            "select shobj_description(oid, 'pg_database'), obj_description(oid, 'pg_database') "
+            "from pg_database where datname = 'postgres'",
+            "select shobj_description(oid, 'pg_authid'), shobj_description(oid, 'pg_database') "
+            "from pg_roles where rolname = 'rp51_cr'",
+            "drop role rp51_cr",
+            "comment on database postgres is 'default administrative connection database'",
+        ],
+    ),
     # ------------------------------------------------------- subscriptions
     "a subscription created without connecting": (
         "RP-169",
@@ -715,6 +792,12 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
 }
 
 EXPECTED: dict[str, Any] = {
+    "a GiST operator class": [
+        "BEGIN",
+        "CREATE OPERATOR CLASS",
+        [("rp51_gb", "783", "box")],
+        "ROLLBACK",
+    ],
     "a built-in dictionary changed": [
         "BEGIN",
         "ALTER TEXT SEARCH DICTIONARY",
@@ -1359,6 +1442,14 @@ EXPECTED: dict[str, Any] = {
         [("1",)],
         "ROLLBACK",
     ],
+    "ispell and thesaurus dictionaries": [
+        "BEGIN",
+        "CREATE TEXT SEARCH DICTIONARY",
+        [("['sky']", "['booking', 'book']")],
+        "CREATE TEXT SEARCH DICTIONARY",
+        [("['1']",)],
+        "ROLLBACK",
+    ],
     "pg_describe_object": [
         "BEGIN",
         [
@@ -1419,6 +1510,15 @@ EXPECTED: dict[str, Any] = {
         [("pg_type", "pg_type[]", "cstring[]")],
         "ROLLBACK",
     ],
+    "pg_get_indexdef of an index the block created": [
+        "BEGIN",
+        "CREATE TABLE",
+        "CREATE INDEX",
+        "ALTER TABLE",
+        [("CREATE INDEX rp51_gi ON public.rp51_g USING btree (a)", "a")],
+        [("CHECK ((a > 0))",)],
+        "ROLLBACK",
+    ],
     "pg_identify_object and its siblings": [
         [("(table,pg_catalog,pg_class,pg_catalog.pg_class)", '(table,"{pg_catalog,pg_class}",{})')],
         [("1259", "1259", "0")],
@@ -1427,6 +1527,14 @@ EXPECTED: dict[str, Any] = {
         [("1",)],
         [("rule _RETURN on view pg_roles",)],
         [("142",)],
+    ],
+    "pg_subscription lists every database's subscriptions": [
+        "DROP DATABASE",
+        "CREATE DATABASE",
+        "CREATE SUBSCRIPTION",
+        [("rp51_other", "True")],
+        "DROP SUBSCRIPTION",
+        [("1",)],
     ],
     "rename, owner, schema and comment": [
         "BEGIN",
@@ -1540,6 +1648,15 @@ EXPECTED: dict[str, Any] = {
         ),
         "ROLLBACK",
         "ROLLBACK",
+    ],
+    "shobj_description reads a shared object's comment": [
+        "COMMENT",
+        "CREATE ROLE",
+        "COMMENT",
+        [("a database", "None")],
+        [("a role", "None")],
+        "DROP ROLE",
+        "COMMENT",
     ],
 }
 

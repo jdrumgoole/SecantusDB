@@ -805,7 +805,7 @@ tests are regression tests.
       one number, so `pg_depend` rows about the type read as rows about the
       relation (`type t[]` appears among what depends on table `t`).
       Backlog-ID: RP-205
-      Verify: tests/backlog/test_rp_batch52.py::test_scenario[pg_depend of a table, its view and its row type]
+      Verify: tests/backlog/test_rp_batch52.py::test_scenario[pg_depend of a table and its row type]
 - [ ] **A function the executor answers is NULL or refused inside an
       aggregate.** `select sum(pg_relation_size(oid)) >= 0 from pg_class`
       is NULL here, `t` on PostgreSQL 15.19; in a FILTER

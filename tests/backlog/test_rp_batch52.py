@@ -81,7 +81,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
             "rollback",
         ],
     ),
-    "pg_depend of a table, its view and its row type": (
+    "pg_depend of a table and its row type": (
         "RP-205",
         True,
         [
@@ -223,7 +223,7 @@ EXPECTED: dict[str, Any] = {
         [("rp52_xi", "rp52_x"), ("t", "rp52_x")],
         "ROLLBACK",
     ],
-    "pg_depend of a table, its view and its row type": [
+    "pg_depend of a table and its row type": [
         "BEGIN",
         "CREATE TABLE",
         "CREATE VIEW",
