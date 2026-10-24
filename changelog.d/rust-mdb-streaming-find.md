@@ -56,3 +56,8 @@ nothing counted them.
   compares an index build's two `Slow query` lines without their order.
   mongod writes the build's line on its build thread, and under load it
   came after the command's.
+- `tests/backlog/test_rm_001_028.py::test_get_log_lines_are_structured_json`
+  waits, bounded, for mongod's index-build line while every operation is
+  still logged. The build thread could write it after `createIndexes`
+  answered and the profiler was reset, so the line went missing (seen in
+  CI on 2026-10-24).

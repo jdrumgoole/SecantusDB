@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime
 import json
 import re
+import time
 from typing import Any
 
 import pymongo
@@ -525,6 +526,17 @@ def _log_kinds(client: Any) -> dict:
             updates=[{"q": {"_id": i}, "u": {"$set": {"a": 1}}} for i in (1, 2)],
         )
         db.c.create_index("x")
+        # mongod writes the build's line on its build thread, which can run
+        # after `createIndexes` has answered: wait for it (a bounded wait)
+        # while every operation is still logged, or it is never written.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            window = client.admin.command("getLog", "global")["log"]
+            if last in window:
+                window = window[len(window) - window[::-1].index(last) :]
+            if any('"c":"STORAGE"' in line and "Slow query" in line for line in window):
+                break
+            time.sleep(0.05)
     finally:
         client.admin.command("profile", 0, slowms=100)
     host, port = client.address
