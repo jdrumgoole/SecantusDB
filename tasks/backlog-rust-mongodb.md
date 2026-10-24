@@ -581,23 +581,6 @@ leave only differences listed here or in other items. Regression tests:
   message splits them byte by byte and sends bytes that are not UTF-8, which
   pymongo cannot decode; this server sends the same text as valid UTF-8.
 
-- [ ] **A `find` projection's per-document error has no executor wrapper.**
-  mongod reports an error a computed projection field raises on a document
-  as "Executor error during find command: <db>.<coll> :: caused by :: ...",
-  the same wrapper as the filter's: `{v: {$year: {date: "$t", timezone:
-  "$s"}}}` over `{s: "x"}` is 40485 under it (measured 8.2.11, 2026-10-24).
-  This server sends the bare message (`find.rs`, the `apply_projection`
-  error). A constant one is folded while the projection is parsed and stays
-  bare, on both servers (RM-251). Found 2026-10-24 with RM-293.
-  Backlog-ID: RM-296
-  Verify: tests/backlog/test_rm_sbe.py::test_find_projection_error_carries_the_executor_wrapper
-- [ ] **A `find` projection cannot read the command's `let`.** `find({},
-  {v: {$toUpper: "$$cz"}}, let: {cz: "Mars"})` gives `v: "MARS"` on mongod
-  8.2.11; this server refuses it with code 2 "projection is not supported by
-  the Rust server", because `projection::apply_projection` evaluates
-  computed fields with no variables. Found 2026-10-24 with RM-293.
-  Backlog-ID: RM-297
-  Verify: tests/backlog/test_rm_sbe.py::test_find_projection_reads_the_command_let
 
 ### 7.090 `$group` code no test had executed, against mongod -- 2026-10-22
 
@@ -618,24 +601,6 @@ does not fix it: the same pipeline on the same mongod gave each of two
 orders, 9 and 11 times in 20 runs (8.2.11, 2026-10-23). The order this
 server returns is one mongod gives, and the probe compares them as sets.
 
-- [ ] **`$meta` beside an exclusion in `$project` is "not supported".**
-  `{$project: {a: 0, b: {$meta: "textScore"}}}` is a valid exclusion
-  projection (`$meta` is the one expression one may hold); with no text
-  query behind it mongod answers 40218 "query requires text score metadata,
-  but it is not available". The Rust `$project` cannot run an exclusion with
-  a computed field and answers code 2. Found 2026-10-23 with RM-281.
-  Backlog-ID: RM-286
-  Verify: tests/backlog/test_rm_expression_parse.py::test_meta_in_exclusion_project
-- [ ] **`find`'s own projection operators at their edges.** `{y: {$slice:
-  ["$a", 1]}}` is not find's `[skip, limit]` (the first element is not a
-  number), so mongod parses it as the aggregation `$slice` and fails per
-  document (28724 "First argument to $slice must be an array"); the Rust
-  server returns the document unprojected. `{"a.$": 1}` with an empty filter
-  over a document whose `a` is not an array returns `a` on mongod; the Rust
-  server refuses it with code 2 "invalid positional projection". Found
-  2026-10-23 with RM-281.
-  Backlog-ID: RM-287
-  Verify: tests/backlog/test_rm_expression_parse.py::test_find_only_projection_operators
 
 ### 7.088 Expression code no test had executed, against mongod -- 2026-10-21
 

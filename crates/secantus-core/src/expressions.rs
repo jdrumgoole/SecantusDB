@@ -2886,9 +2886,18 @@ fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
     if a.len() != 2 && a.len() != 3 {
         return Err(Fallback::Defer);
     }
-    let arr = match eval(&a[0], ctx)? {
+    // mongod reads the first two arguments, and a nullish one is null, before
+    // it checks either's type; a third is read after (measured 8.2.11,
+    // 2026-10-24: `["$a", "$n", true]` is null, `["$x", 1, "$n"]` 28724).
+    let first = eval(&a[0], ctx)?;
+    let second = eval(&a[1], ctx)?;
+    if matches!(first, Bson::Null | Bson::Undefined)
+        || matches!(second, Bson::Null | Bson::Undefined)
+    {
+        return Ok(Bson::Null);
+    }
+    let arr = match first {
         Bson::Array(v) => v,
-        Bson::Null => return Ok(Bson::Null),
         other => {
             return Err(wrong_type(
                 28724,
@@ -2901,7 +2910,7 @@ fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
     };
     let len = arr.len() as i64;
     let (start, stop) = if a.len() == 2 {
-        let n_v = eval(&a[1], ctx)?;
+        let n_v = second;
         if matches!(n_v, Bson::Boolean(_)) {
             return Err(Fallback::mongo(28725, SLICE_SECOND_BOOL));
         }
@@ -2916,16 +2925,9 @@ fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
             (n, len)
         }
     } else {
-        let pos_v = eval(&a[1], ctx)?;
-        let n_v = eval(&a[2], ctx)?;
+        let pos_v = second;
         if matches!(pos_v, Bson::Boolean(_)) {
             return Err(Fallback::mongo(28725, SLICE_SECOND_BOOL));
-        }
-        if matches!(n_v, Bson::Boolean(_)) {
-            return Err(Fallback::mongo(
-                28727,
-                "Third argument to $slice must be numeric, but is of type: bool",
-            ));
         }
         let pos = match coerce_index(&pos_v) {
             IdxCoerce::Int(p) if fits_i32(p) => p,
@@ -2934,6 +2936,16 @@ fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
             }
             IdxCoerce::NotNumber => return slice_not_numeric(&pos_v, SLICE_SECOND_TYPE),
         };
+        let n_v = eval(&a[2], ctx)?;
+        if matches!(n_v, Bson::Null | Bson::Undefined) {
+            return Ok(Bson::Null);
+        }
+        if matches!(n_v, Bson::Boolean(_)) {
+            return Err(Fallback::mongo(
+                28727,
+                "Third argument to $slice must be numeric, but is of type: bool",
+            ));
+        }
         let n = match coerce_index(&n_v) {
             IdxCoerce::Int(n) if fits_i32(n) => n,
             IdxCoerce::Int(_) | IdxCoerce::Fractional => return Err(slice_third_not_32bit(&n_v)),

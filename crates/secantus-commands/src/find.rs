@@ -110,9 +110,13 @@ impl CursorProducer for TailableFindProducer {
                     match &self.projection {
                         None => out.push(blob),
                         Some(spec) => {
-                            if let Ok(mut projected) =
-                                project_to_docs(vec![blob], spec, &self.filter)
-                            {
+                            if let Ok(mut projected) = project_to_docs(
+                                vec![blob],
+                                spec,
+                                &self.filter,
+                                &self.let_vars,
+                                &format!("{}.{}", self.db, self.coll),
+                            ) {
                                 if let Some(p) = projected.pop() {
                                     if let Ok(mut enc) = crate::util::encode_docs(vec![p]) {
                                         out.append(&mut enc);
@@ -583,26 +587,8 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         if let Some(err) = projection_meta_error(spec, &filter) {
             return Ok(err.into_reply());
         }
-        // A computed field's constant sub-expressions are folded while the
-        // projection is parsed, so one that fails is refused bare, over an
-        // empty collection too (mongod 8.2.11, 2026-10-22; RM-251). The
-        // projection operators are not expressions. The command's `let` is
-        // substituted first.
-        let fold_vars = crate::util::command_let_vars(doc.get("let"), ctx);
-        let fault = spec
-            .values()
-            .filter(|v| {
-                !matches!(v, Bson::Document(d) if d.len() == 1
-                    && d.keys().all(|k| matches!(k.as_str(), "$slice" | "$elemMatch" | "$meta")))
-            })
-            .filter_map(|v| secantus_core::expr_rewrite::constant_expr_fault_with(v, &fold_vars))
-            .find(|f| f.folded_verdict() != Some(false));
-        if let Some((code, msg)) = fault.as_ref().and_then(|f| f.as_mongo()) {
-            return Err(CommandError::new(
-                code,
-                crate::util::error_code_name(code),
-                msg.to_string(),
-            ));
+        if let Some(e) = projection_expression_error(spec, doc.get("let"), ctx) {
+            return Err(e);
         }
         // Projection validation is parse-time in mongod, so an invalid spec
         // errors even when nothing matches.
@@ -833,7 +819,7 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
         // The projection applies to every batch, this one and the producer's.
         if let Some(spec) = projection {
-            docs = crate::util::encode_docs(project_to_docs(docs, spec, &filter)?)?;
+            docs = crate::util::encode_docs(project_to_docs(docs, spec, &filter, &let_vars, &ns)?)?;
         }
         let bs = batch_size.max(0) as usize;
         let split = bs.min(docs.len());
@@ -966,15 +952,20 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     record_ids.as_deref(),
                     index_keys.as_deref(),
                 );
-                let mut out =
-                    project_to_docs(crate::util::encode_docs(originals)?, rewritten, &filter)?;
+                let mut out = project_to_docs(
+                    crate::util::encode_docs(originals)?,
+                    rewritten,
+                    &filter,
+                    &let_vars,
+                    &ns,
+                )?;
                 for d in out.iter_mut() {
                     d.remove(crate::agg_meta::RECORD_ID);
                     d.remove(crate::agg_meta::INDEX_KEY);
                 }
                 out
             }
-            None => project_to_docs(docs, spec, &filter)?,
+            None => project_to_docs(docs, spec, &filter, &let_vars, &ns)?,
         };
         for (i, out) in projected.iter_mut().enumerate() {
             for (field, meta) in &metas {
@@ -1011,7 +1002,13 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // `showRecordId` adds to the projected document; only `returnKey`
         // replaces it.
         let projected_first = match projection {
-            Some(spec) if !return_key => Some(project_to_docs(docs.clone(), spec, &filter)?),
+            Some(spec) if !return_key => Some(project_to_docs(
+                docs.clone(),
+                spec,
+                &filter,
+                &let_vars,
+                &ns,
+            )?),
             _ => None,
         };
         let mut rewritten: Vec<Document> = Vec::with_capacity(docs.len());
@@ -1058,7 +1055,7 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // is ever re-encoded.
     match projection {
         Some(spec) => {
-            let projected = project_to_docs(docs, spec, &filter)?;
+            let projected = project_to_docs(docs, spec, &filter, &let_vars, &ns)?;
             let (first_batch, cursor_id): (Vec<Bson>, i64) = if single_batch {
                 let mut projected = projected;
                 projected.truncate(batch_size.max(0) as usize);
@@ -1623,6 +1620,56 @@ fn projection_meta_error(spec: &Document, filter: &Document) -> Option<CommandEr
     None
 }
 
+/// What mongod's projection parser refuses inside a computed field, for
+/// `find` and `findAndModify`: an undefined `$$variable` (17276), then a
+/// constant sub-expression that fails, folded with the command's `let`
+/// substituted -- bare, over an empty collection too (mongod 8.2.11,
+/// 2026-10-22 and 2026-10-24; RM-251). find's own operators are not
+/// expressions; a `$slice` that is not find's `[skip, limit]` is one.
+pub(crate) fn projection_expression_error(
+    spec: &Document,
+    let_field: Option<&Bson>,
+    ctx: &CommandContext,
+) -> Option<CommandError> {
+    let is_find_operator = |v: &&Bson| match v {
+        Bson::Document(d) if d.len() == 1 => match d.iter().next() {
+            Some((k, arg)) if k == "$slice" => {
+                secantus_core::projection::find_slice_problem(arg).is_none()
+            }
+            Some((k, _)) => matches!(k.as_str(), "$elemMatch" | "$meta"),
+            None => false,
+        },
+        _ => false,
+    };
+    let bound: Vec<String> = match let_field {
+        Some(Bson::Document(d)) => d.keys().cloned().collect(),
+        _ => Vec::new(),
+    };
+    if let Some((code, msg)) = spec
+        .values()
+        .filter(|v| !is_find_operator(v))
+        .find_map(|v| argtypes::expression_problem(v, &bound))
+    {
+        return Some(CommandError::new(
+            code,
+            crate::util::error_code_name(code),
+            msg,
+        ));
+    }
+    let fold_vars = crate::util::command_let_vars(let_field, ctx);
+    let fault = spec
+        .values()
+        .filter(|v| !is_find_operator(v))
+        .filter_map(|v| secantus_core::expr_rewrite::constant_expr_fault_with(v, &fold_vars))
+        .find(|f| f.folded_verdict() != Some(false))?;
+    let (code, msg) = fault.as_mongo()?;
+    Some(CommandError::new(
+        code,
+        crate::util::error_code_name(code),
+        msg.to_string(),
+    ))
+}
+
 /// Apply a projection spec to each result doc via `secantus_core::projection`.
 /// A `Fallback` (a projection the Rust engine can't reproduce exactly) surfaces
 /// as `BadValue` — the Rust server only ships what the Rust engine supports.
@@ -1630,6 +1677,8 @@ fn project_to_docs(
     docs: Vec<Vec<u8>>,
     spec: &Document,
     filter: &Document,
+    vars: &Document,
+    ns: &str,
 ) -> Result<Vec<Document>, CommandError> {
     let query = if filter.is_empty() {
         None
@@ -1655,16 +1704,19 @@ fn project_to_docs(
                     format!("failed to decode document: {e}"),
                 )
             })?;
-            secantus_core::projection::apply_projection(&d, spec, query).map_err(|f| {
-                // A Fallback carrying a mongod code is a real server error
-                // (e.g. 51270 empty sub-projection, 31254 mix) and must be
-                // surfaced verbatim -- flattening it to BadValue lost both the
-                // code and the message. Only a bare Defer, which has no Python
-                // behind it here, becomes the generic refusal.
+            secantus_core::projection::apply_projection_with(&d, spec, query, vars).map_err(|f| {
+                // A Fallback carrying a mongod code is a real server error and
+                // must be surfaced with it. The spec was parsed before any
+                // document was read, so what fails here fails on a document:
+                // mongod's executor error (measured 8.2.11, 2026-10-24).
+                // Only a bare Defer, which has no Python behind it here,
+                // becomes the generic refusal.
                 match f.as_mongo() {
-                    Some((code, msg)) => {
-                        CommandError::new(code, crate::util::error_code_name(code), msg)
-                    }
+                    Some((code, msg)) => CommandError::new(
+                        code,
+                        crate::util::error_code_name(code),
+                        format!("Executor error during find command: {ns} :: caused by :: {msg}"),
+                    ),
                     None => CommandError::new(
                         2,
                         "BadValue",

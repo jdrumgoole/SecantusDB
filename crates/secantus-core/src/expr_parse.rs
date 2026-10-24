@@ -489,6 +489,56 @@ impl ProjectionParse {
         }
     }
 
+    /// A `$slice` in a find projection: find's own `[skip, limit]` syntax if
+    /// it is that, else the aggregation expression, a computed field. When
+    /// it is neither, mongod's error names both reasons (measured 8.2.11,
+    /// 2026-10-24).
+    fn find_slice(&mut self, name: &str, d: &Document, parent: &mut Node) -> R {
+        let arg = d.get("$slice").unwrap_or(&Bson::Null);
+        let Some((code, why)) = crate::projection::find_slice_problem(arg) else {
+            return add_node(parent, name, Node::Leaf);
+        };
+        let passed = match arg {
+            Bson::Array(a) => a.len(),
+            _ => 1,
+        };
+        let as_expression = if self.ty == Some(ProjectType::Exclusion) {
+            Err(Fallback::mongo(
+                31252,
+                "Cannot use expression other than $meta in exclusion projection",
+            ))
+        } else if !(2..=3).contains(&passed) {
+            Err(Fallback::mongo(
+                28667,
+                format!(
+                    "Expression $slice takes at least 2 arguments, and at most 3, but {passed} \
+                     were passed in."
+                ),
+            ))
+        } else {
+            operator(d)
+        };
+        if let Err(e) = as_expression {
+            let Some((inner, message)) = e.as_mongo() else {
+                return Err(e);
+            };
+            return Err(Fallback::mongo(
+                inner,
+                format!(
+                    "Invalid $slice syntax. The given syntax {} did not match the find() \
+                     syntax because :: Location{code}: {why} :: The given syntax did not \
+                     match the expression $slice syntax. :: caused by :: {message}",
+                    crate::query::bson_value_repr(&Bson::Document(d.clone()))
+                ),
+            )
+            .bare());
+        }
+        if self.ty.is_none() {
+            self.ty = Some(ProjectType::Inclusion);
+        }
+        add_node(parent, name, Node::Leaf)
+    }
+
     fn sub_object(&mut self, name: &str, d: &Document, parent: &mut Node) -> R {
         if d.is_empty() {
             return Err(
@@ -501,8 +551,9 @@ impl ProjectionParse {
         if let (1, Some(first)) = (d.len(), d.keys().next()) {
             if first.starts_with('$') {
                 match (self.kind, first.as_str()) {
-                    // find's own operators, checked by the find path.
-                    (ProjectionKind::Find, "$slice" | "$elemMatch") => {
+                    (ProjectionKind::Find, "$slice") => return self.find_slice(name, d, parent),
+                    // find's own operator, checked by the find path.
+                    (ProjectionKind::Find, "$elemMatch") => {
                         return add_node(parent, name, Node::Leaf)
                     }
                     (ProjectionKind::Aggregation, "$elemMatch") => {
