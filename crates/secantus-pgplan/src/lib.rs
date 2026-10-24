@@ -28,13 +28,17 @@ pub mod joincost;
 mod like_match;
 pub mod misc_alter;
 mod multi_assign;
+pub mod opclasses;
 mod record_fields;
 mod returning_star;
 pub mod schemas;
 mod srf_tlist;
+pub mod subscriptions;
 pub mod systypes;
 pub mod tid;
+pub mod transforms;
 pub mod ts_configs;
+pub mod ts_dicts;
 pub mod typed_tables;
 pub mod typeout;
 mod typmod_cast;
@@ -95,6 +99,7 @@ mod enum_order;
 mod errpos;
 pub mod escape_strings;
 pub mod event_triggers;
+pub mod extstats;
 pub mod fdw;
 pub mod formatting;
 pub mod fts;
@@ -980,6 +985,14 @@ pub enum Statement {
     },
     /// `CREATE / ALTER / DROP TEXT SEARCH CONFIGURATION`.
     TsConfig(ts_configs::TsConfigOp),
+    /// `CREATE / ALTER / DROP TEXT SEARCH DICTIONARY` (RP-169).
+    TsDict(ts_dicts::TsDictOp),
+    /// `CREATE / ALTER / DROP OPERATOR FAMILY / CLASS` (RP-169).
+    OpClass(opclasses::OpClassOp),
+    /// `CREATE / ALTER / DROP SUBSCRIPTION` (RP-169).
+    Subscription(subscriptions::SubscriptionOp),
+    /// `CREATE / DROP TRANSFORM` (RP-169).
+    Transform(transforms::TransformOp),
     /// `ALTER MATERIALIZED VIEW m RENAME TO n`.
     RenameMatView {
         matview: String,
@@ -3282,6 +3295,9 @@ pub struct CreateIndex {
     /// Each key as `pg_indexes.indexdef` prints it: `a`, `a DESC`,
     /// `a NULLS FIRST`, `lower(b)`.
     pub key_sql: Vec<String>,
+    /// Each key's operator class as `pg_index.indclass` holds it: the
+    /// explicit class's oid, or 0 for the key type's default.
+    pub opclasses: Vec<i64>,
     /// For an EXPRESSION index, every key's expression SQL over the table
     /// (a plain column key is its name); empty for a column index. Such an
     /// index holds no storage entries -- its UNIQUE is enforced by the
@@ -4114,6 +4130,7 @@ fn parse_tree(sql: &str) -> Result<std::sync::Arc<pg_query::protobuf::ParseResul
     static MEMO: OnceLock<Mutex<HashMap<String, Arc<pg_query::protobuf::ParseResult>>>> =
         OnceLock::new();
     let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    cancel::check()?;
     if let Some(tree) = memo.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
         return Ok(Arc::clone(tree));
     }
@@ -4126,8 +4143,17 @@ fn parse_tree(sql: &str) -> Result<std::sync::Arc<pg_query::protobuf::ParseResul
     if sql.len() > TOO_SHORT_TO_NEST {
         check_depth(&tree)?;
     }
+    // Bounded by text too: a tree costs about 160 bytes per byte of text
+    // (a 1.2 MB statement holds 200 MB), so a count alone let a few large
+    // statements pin gigabytes (measured: +200 MB resident per distinct
+    // 200,000-item IN list, never released).
+    const MAX_TEXT_BYTES: usize = 2 << 20;
+    if sql.len() > MAX_TEXT_BYTES {
+        return Ok(tree);
+    }
     let mut guard = memo.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.len() >= MAX_ENTRIES {
+    let held: usize = guard.keys().map(String::len).sum();
+    if guard.len() >= MAX_ENTRIES || held + sql.len() > MAX_TEXT_BYTES {
         guard.clear();
     }
     guard.insert(sql.to_string(), Arc::clone(&tree));
@@ -4248,6 +4274,10 @@ fn check_depth(tree: &pg_query::protobuf::ParseResult) -> Result<()> {
 }
 
 fn parse_one(sql: &str) -> Result<N> {
+    // A cancel stops a statement at its next parse, before the tree is
+    // cloned: a pass the cancel stopped is retried by a fallback that parses
+    // again, and each retry cloned a 200,000-item IN list's tree first.
+    cancel::check()?;
     // `information_schema`'s SQL helpers are inlined, as PostgreSQL inlines
     // a SQL function's call.
     let inlined = schema_functions::inline(sql);
@@ -4863,9 +4893,22 @@ fn plan_node(
             ts_configs::plan_rename(&r)
         }
         N::RenameStmt(r)
+            if ObjectType::try_from(r.rename_type) == Ok(ObjectType::ObjectTsdictionary) =>
+        {
+            ts_dicts::plan_rename(&r)
+        }
+        N::RenameStmt(r)
             if ObjectType::try_from(r.rename_type) == Ok(ObjectType::ObjectCollation) =>
         {
             misc_alter::plan_collation_rename(&r)
+        }
+        N::RenameStmt(r) if opclasses::is_class(r.rename_type).is_some() => {
+            opclasses::plan_rename(&r, opclasses::is_class(r.rename_type) == Some(true))
+        }
+        N::RenameStmt(r)
+            if ObjectType::try_from(r.rename_type) == Ok(ObjectType::ObjectSubscription) =>
+        {
+            subscriptions::plan_rename(&r)
         }
         N::RenameStmt(r) => plan_rename(&r),
         N::AlterDatabaseStmt(a) => {
@@ -5213,6 +5256,38 @@ fn plan_node(
             ts_configs::plan_create(&d)
         }
         N::AlterTsconfigurationStmt(a) => ts_configs::plan_alter(&a),
+        N::DefineStmt(d) if ObjectType::try_from(d.kind) == Ok(ObjectType::ObjectTsdictionary) => {
+            ts_dicts::plan_create(&d)
+        }
+        N::AlterTsdictionaryStmt(a) => ts_dicts::plan_alter(&a),
+        N::CreateOpFamilyStmt(c) => opclasses::plan_create_family(&c),
+        N::CreateOpClassStmt(c) => opclasses::plan_create_class(&c),
+        N::AlterOpFamilyStmt(a) => opclasses::plan_alter_family(&a),
+        N::AlterOwnerStmt(a) if opclasses::is_class(a.object_type).is_some() => {
+            opclasses::plan_owner(&a, opclasses::is_class(a.object_type) == Some(true))
+        }
+        N::AlterObjectSchemaStmt(a) if opclasses::is_class(a.object_type).is_some() => {
+            opclasses::plan_set_schema(&a, opclasses::is_class(a.object_type) == Some(true))
+        }
+        N::CreateSubscriptionStmt(c) => subscriptions::plan_create(&c),
+        N::AlterSubscriptionStmt(a) => subscriptions::plan_alter(&a),
+        N::DropSubscriptionStmt(d) => subscriptions::plan_drop(&d),
+        N::AlterOwnerStmt(a)
+            if ObjectType::try_from(a.object_type) == Ok(ObjectType::ObjectSubscription) =>
+        {
+            subscriptions::plan_owner(&a)
+        }
+        N::CreateTransformStmt(c) => transforms::plan_create(&c),
+        N::AlterOwnerStmt(a)
+            if ObjectType::try_from(a.object_type) == Ok(ObjectType::ObjectTsdictionary) =>
+        {
+            ts_dicts::plan_owner(&a)
+        }
+        N::AlterObjectSchemaStmt(a)
+            if ObjectType::try_from(a.object_type) == Ok(ObjectType::ObjectTsdictionary) =>
+        {
+            ts_dicts::plan_set_schema(&a)
+        }
         N::AlterOwnerStmt(a)
             if ObjectType::try_from(a.object_type) == Ok(ObjectType::ObjectTsconfiguration) =>
         {
@@ -8401,8 +8476,9 @@ pub fn core_default_opclass(method: &str, pg_type: &str) -> bool {
 
 /// An explicit operator class that does not serve the key: 42804 when the
 /// method has one of that name (for another type), else 42704 (15.19).
-fn no_such_opclass(o: &str, method: &str, pg_type: &str) -> Error {
-    if misc_alter::opclass_exists(method, o) {
+fn no_such_opclass(parts: &[String], method: &str, pg_type: &str) -> Error {
+    let o = parts.join(".");
+    if misc_alter::opclass_exists(method, parts) {
         Error::Sqlstate(
             "42804",
             format!(
@@ -8418,7 +8494,13 @@ fn no_such_opclass(o: &str, method: &str, pg_type: &str) -> Error {
     }
 }
 
-fn index_operator_class(method: &str, pg_type: &str, explicit: Option<&str>) -> Result<String> {
+fn index_operator_class(
+    method: &str,
+    pg_type: &str,
+    explicit_parts: Option<&[String]>,
+) -> Result<String> {
+    let explicit = explicit_parts.and_then(|p| p.last()).map(String::as_str);
+    let parts = explicit_parts.unwrap_or_default();
     let ty = pg_type.to_ascii_lowercase();
     let array = ty.ends_with("[]");
     let range = ty.ends_with("range") || ty.ends_with("multirange");
@@ -8491,10 +8573,18 @@ fn index_operator_class(method: &str, pg_type: &str, explicit: Option<&str>) -> 
                 }
                 // A class of the method for the key's type: printed only
                 // when it is not the type's default (`pg_get_indexdef`).
-                Some(o) => match misc_alter::explicit_opclass(method, o, pg_type) {
-                    Some(true) => Ok(String::new()),
-                    Some(false) => Ok(format!(" {o}")),
-                    None => Err(no_such_opclass(o, method, pg_type)),
+                Some(_) => match misc_alter::explicit_opclass(method, parts, pg_type) {
+                    Some(c) if c.default => Ok(String::new()),
+                    // `get_opclass_name`: qualified when not visible.
+                    Some(c) if misc_alter::opclass_visible(&c) => {
+                        Ok(format!(" {}", scalar::quote_identifier(&c.name)))
+                    }
+                    Some(c) => Ok(format!(
+                        " {}.{}",
+                        scalar::quote_identifier(&c.schema),
+                        scalar::quote_identifier(&c.name)
+                    )),
+                    None => Err(no_such_opclass(parts, method, pg_type)),
                 },
             };
         }
@@ -8569,7 +8659,7 @@ fn index_operator_class(method: &str, pg_type: &str, explicit: Option<&str>) -> 
             })
         }
         (Some(o), Some(d)) if o.ends_with(d) || o == d => Ok(String::new()),
-        (Some(o), _) => Err(no_such_opclass(o, method, pg_type)),
+        (Some(_), _) => Err(no_such_opclass(parts, method, pg_type)),
         (None, Some(_)) => Ok(String::new()),
         // btree_gin / btree_gist give GIN / GiST a class for every type a
         // btree orders.
@@ -8665,6 +8755,7 @@ fn plan_create_index(
     let ordered = matches!(method.as_str(), "btree");
     let mut columns = Vec::new();
     let mut key_sql = Vec::new();
+    let mut opclasses = Vec::new();
     let mut expressions = Vec::new();
     let mut any_expression = false;
     for p in &i.index_params {
@@ -8765,6 +8856,7 @@ fn plan_create_index(
                 }
             };
             key_sql.push(format!("{shown}{suffix}"));
+            opclasses.push(0);
             expressions.push(sql);
             // ChooseIndexColumnNames: a function key names the index after
             // the function, any other expression is `expr`.
@@ -8802,15 +8894,23 @@ fn plan_create_index(
             }
             collation::resolve(name)?;
         }
-        let opclass = e
+        let opclass: Vec<String> = e
             .opclass
             .iter()
             .filter_map(|n| match n.node.as_ref() {
                 Some(N::String(s)) => Some(s.sval.clone()),
                 _ => None,
             })
-            .next_back();
-        let opclass_sql = index_operator_class(&method, &column.pg_type, opclass.as_deref())?;
+            .collect();
+        let explicit = (!opclass.is_empty()).then_some(opclass.as_slice());
+        let opclass_sql = index_operator_class(&method, &column.pg_type, explicit)?;
+        // The class `pg_index.indclass` names: the explicit one, or 0 for
+        // the type's default.
+        opclasses.push(
+            explicit
+                .and_then(|p| misc_alter::explicit_opclass(&method, p, &column.pg_type))
+                .map_or(0, |c| c.oid),
+        );
         // A non-default NULLS ordering is recorded, not built: an index is
         // an access path here, and a query's ORDER BY places its NULLs by
         // its own clause whatever the index says.
@@ -8887,6 +8987,7 @@ fn plan_create_index(
         predicate_sql,
         method,
         key_sql,
+        opclasses,
         expressions,
     }))
 }
@@ -8906,6 +9007,34 @@ thread_local! {
 }
 
 /// Install the comments `obj_description` / `col_description` answer from.
+/// `pg_shdescription`'s `(objoid, classoid, description)`, for
+/// `shobj_description`.
+pub fn set_shared_comments(comments: Vec<(i64, i64, String)>) {
+    SHARED_COMMENTS.with(|c| *c.borrow_mut() = comments);
+}
+
+thread_local! {
+    static SHARED_COMMENTS: std::cell::RefCell<Vec<(i64, i64, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `shobj_description(oid, catalog)`: the comment `pg_shdescription` keeps
+/// for that object of that shared catalog.
+pub(crate) fn shared_comment(oid: i64, catalog: &str) -> Option<String> {
+    let class = match catalog {
+        "pg_database" => 1262,
+        "pg_authid" => 1260,
+        "pg_tablespace" => 1213,
+        _ => return None,
+    };
+    SHARED_COMMENTS.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|(o, k, _)| *o == oid && *k == class)
+            .map(|(_, _, t)| t.clone())
+    })
+}
+
 pub fn set_object_comments(comments: Vec<(i64, i32, String)>) {
     OBJECT_COMMENTS.with(|c| *c.borrow_mut() = comments);
 }
@@ -8938,6 +9067,21 @@ thread_local! {
     /// `(index oid, pg_get_indexdef text)`, published with the catalog.
     static INDEX_DEFS: std::cell::RefCell<Vec<(i64, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `(statistics object oid, pg_get_statisticsobjdef text, its column and
+/// expression list, its expressions)`.
+pub type StatisticsDef = (i64, String, String, Vec<String>);
+
+thread_local! {
+    /// Each statistics object's definition, published with the catalog.
+    static STATISTICS_DEFS: std::cell::RefCell<Vec<StatisticsDef>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install what `pg_get_statisticsobjdef` and its siblings answer from.
+pub fn set_statistics_defs(defs: Vec<StatisticsDef>) {
+    STATISTICS_DEFS.with(|d| *d.borrow_mut() = defs);
 }
 
 thread_local! {
@@ -12470,6 +12614,7 @@ pub(crate) fn simplify_exists(s: &mut pg_query::protobuf::SelectStmt) {
         "pg_get_keywords",
         "aclexplode",
         "pg_options_to_table",
+        "pg_mcv_list_items",
         "txid_snapshot_xip",
         "pg_snapshot_xip",
         "pg_listening_channels",
@@ -13814,6 +13959,28 @@ fn srf_rows(
                 ],
                 vec!["oid".into(), "oid".into(), "text".into(), "bool".into()],
                 rows,
+            )));
+        }
+        // `pg_mcv_list_items(pg_mcv_list)`: an MCV list's items
+        // (`extstats::mcv_list_rows`).
+        "pg_mcv_list_items" => {
+            let a = args(1)?;
+            return Ok(Some((
+                vec![
+                    "index".into(),
+                    "values".into(),
+                    "nulls".into(),
+                    "frequency".into(),
+                    "base_frequency".into(),
+                ],
+                vec![
+                    "int4".into(),
+                    "text[]".into(),
+                    "bool[]".into(),
+                    "float8".into(),
+                    "float8".into(),
+                ],
+                extstats::mcv_list_rows(&a[0])?,
             )));
         }
         // `pg_options_to_table(text[])`: each `name=value` split at its
@@ -15976,6 +16143,10 @@ fn plan_aggregate_item(
     let filter = match f.agg_filter.as_deref() {
         None => None,
         Some(node) if filter_sublink::has_sublink(node) => {
+            sublink_filter = Some(node);
+            None
+        }
+        Some(node) if correlated::calls_executor_function(node) => {
             sublink_filter = Some(node);
             None
         }
@@ -20747,7 +20918,12 @@ fn plan_comment(c: &pg_query::protobuf::CommentStmt) -> Result<Statement> {
         Ok(O::ObjectTrigger) => "trigger",
         Ok(O::ObjectRole) => "role",
         Ok(O::ObjectTsconfiguration) => "text search configuration",
+        Ok(O::ObjectTsdictionary) => "text search dictionary",
         Ok(O::ObjectConversion) => "conversion",
+        Ok(O::ObjectOpclass) => "operator class",
+        Ok(O::ObjectOpfamily) => "operator family",
+        Ok(O::ObjectSubscription) => "subscription",
+        Ok(O::ObjectTransform) => "transform",
         _ => return Err(Error::Unsupported("COMMENT ON this kind of object".into())),
     };
     fn strings(n: &pg_query::protobuf::Node, out: &mut Vec<String>) {
@@ -24450,6 +24626,11 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
             "int4".to_string()
         }
         Some(N::FuncCall(f))
+            if func_name(f).as_deref() == Some("pg_get_statisticsobjdef_expressions") =>
+        {
+            "text[]".to_string()
+        }
+        Some(N::FuncCall(f))
             if matches!(
                 func_name(f).as_deref(),
                 Some(
@@ -24458,6 +24639,8 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                         | "pg_get_indexdef"
                         | "pg_get_triggerdef"
                         | "pg_get_partkeydef"
+                        | "pg_get_statisticsobjdef"
+                        | "pg_get_statisticsobjdef_columns"
                         | "pg_get_function_arguments"
                         | "pg_get_function_identity_arguments"
                         | "pg_get_function_result"
@@ -26241,6 +26424,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     || name == "pg_get_indexdef"
                     || name == "pg_get_triggerdef"
                     || name == "pg_get_partkeydef"
+                    || name.starts_with("pg_get_statisticsobjdef")
                     || name == "pg_get_function_arguments"
                     || name == "pg_get_function_identity_arguments"
                     || name == "pg_get_function_result"
@@ -28124,6 +28308,11 @@ pub fn regtype_text(oid: i64) -> String {
     // A user type's array: `mood[]`, the element rendered as above.
     if let Some(name) = user_name(oid - USER_TYPE_ARRAY_OID_OFFSET) {
         return format!("{}[]", quote_type_path(&name));
+    }
+    // A system catalog's or view's row type (`pg_type`,
+    // `information_schema.tables`), or its array.
+    if let Some(name) = pgtypes::catalog_composite_name(oid) {
+        return name;
     }
     oid.to_string()
 }
@@ -30018,6 +30207,10 @@ fn text_type_oid(name: &str) -> Option<i64> {
     let Some((parts, array)) = parsed_type_name(name) else {
         return user_type_or_array_oid(name);
     };
+    // A built-in row type (`pg_type`, `information_schema.tables`).
+    if let Some(oid) = pgtypes::catalog_composite_oid(&parts, array) {
+        return Some(oid);
+    }
     // A bare name finds a `public` type only while `public` is on the search
     // path (`TypenameGetTypid`): pg_dump sets it empty, and `'mood'::regtype`
     // is then 42704, `to_regtype('mood')` NULL.
@@ -30319,6 +30512,15 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
                     }
                     prev = Some(target);
                     continue;
+                }
+                // `float4out`: a real is printed as the single precision value
+                // it is, not as the double it is kept in (RP-198).
+                if let Some(real @ ("float4" | "real" | "float4[]" | "real[]")) = from.as_deref() {
+                    if is_string_type(target) && v != Bson::Null {
+                        v = cast_value(Bson::String(typeout::cast_text(&v, real)), target)?;
+                        prev = Some(target);
+                        continue;
+                    }
                 }
                 // `array_out` prints an inet / cidr element with `inet_out`.
                 if let Some(net @ ("inet[]" | "cidr[]")) = from.as_deref() {
@@ -31971,6 +32173,9 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
     ) {
         return match value {
             Bson::Null => Ok(Bson::Null),
+            // An MCV list read from `pg_statistic_ext_data` is one already
+            // (its bytes); no literal is.
+            v @ Bson::Binary(_) if target == "pg_mcv_list" => Ok(v),
             _ => Err(Error::FeatureNotSupported(format!(
                 "cannot accept a value of type {target}"
             ))),
@@ -35872,6 +36077,15 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectTsconfiguration) {
         return ts_configs::plan_drop(d);
     }
+    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectTsdictionary) {
+        return ts_dicts::plan_drop(d);
+    }
+    if let Some(class) = opclasses::is_class(d.remove_type) {
+        return opclasses::plan_drop(d, class);
+    }
+    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectTransform) {
+        return transforms::plan_drop(d);
+    }
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectCollation) {
         return collation::plan_drop(d);
     }
@@ -38626,6 +38840,38 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                     .map_or(Bson::Null, Bson::String)
             }));
         }
+        // `pg_get_statisticsobjdef(oid)` and its `_columns` /
+        // `_expressions` siblings: the CREATE STATISTICS, its column and
+        // expression list, its expressions (NULL with none); NULL for an
+        // oid no statistics object has.
+        if let Some(which) = func_name(f).as_deref().and_then(|n| {
+            n.strip_prefix("pg_get_statisticsobjdef")
+                .filter(|w| matches!(*w, "" | "_columns" | "_expressions"))
+                .map(str::to_string)
+        }) {
+            if f.args.len() == 1
+                && !correlated::user_function_named(&format!("pg_get_statisticsobjdef{which}"))
+            {
+                let oid = match const_value(&f.args[0], params)? {
+                    Bson::Int32(i) => i64::from(i),
+                    Bson::Int64(i) => i,
+                    Bson::Null => return Ok(Bson::Null),
+                    Bson::String(t) => t.trim().parse().unwrap_or(-1),
+                    _ => -1,
+                };
+                return Ok(STATISTICS_DEFS.with(|d| {
+                    d.borrow().iter().find(|(o, ..)| *o == oid).map_or(
+                        Bson::Null,
+                        |(_, def, cols, exprs)| match which.as_str() {
+                            "" => Bson::String(def.clone()),
+                            "_columns" => Bson::String(cols.clone()),
+                            _ if exprs.is_empty() => Bson::Null,
+                            _ => Bson::Array(exprs.iter().cloned().map(Bson::String).collect()),
+                        },
+                    )
+                }));
+            }
+        }
         // `pg_get_partkeydef(table)`: `LIST (k)`, `RANGE (a, b)`; NULL for a
         // table that is not partitioned.
         if func_name(f).as_deref() == Some("pg_get_partkeydef")
@@ -39413,10 +39659,18 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                     _ => return Err(Error::Unsupported("this IN list".into())),
                 };
             let mut saw_null = false;
-            for item in items {
-                let mut eq = e.clone();
-                eq.kind = AExprKind::AexprOp as i32;
-                eq.name = vec![string_node("=")];
+            // The comparison without its list, cloned once: cloning `e` per
+            // item cloned the whole list each time, quadratic in its length
+            // (a 200,000-item list matching at its 780th item took 24 s).
+            let mut base = e.clone();
+            base.rexpr = None;
+            base.kind = AExprKind::AexprOp as i32;
+            base.name = vec![string_node("=")];
+            for (i, item) in items.into_iter().enumerate() {
+                if i % 1024 == 1023 {
+                    cancel::check()?;
+                }
+                let mut eq = base.clone();
                 eq.rexpr = Some(Box::new(item));
                 match const_value(
                     &pg_query::protobuf::Node {
@@ -40402,6 +40656,20 @@ fn coerce_to_column(def: &TableDef, field: &str, value: Bson) -> Result<Bson> {
             ))
         }
         _ => {}
+    }
+    // A `reg*` column is stored as its kind's value: a constant of another
+    // kind (`aggfnoid = 'sum(int4)'::regprocedure`) or a plain number
+    // (`prosupport = 0`) is compared by its oid, as PostgreSQL compares
+    // them (RP-213).
+    if let Some(ty) = field_type(def, field).filter(|t| regobj::is_kind(t)) {
+        let oid = match &value {
+            Bson::Int32(i) => Some(i64::from(*i)),
+            Bson::Int64(i) => Some(*i),
+            other => regobj::from_bson(other).map(|(_, o)| o),
+        };
+        if let Some(oid) = oid {
+            return Ok(regobj::value(ty, oid));
+        }
     }
     let Bson::String(_) = &value else {
         return Ok(value);

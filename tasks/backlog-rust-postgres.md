@@ -70,6 +70,16 @@ one beside it.
   0A000: the catalogs are computed from the store, so there is no row to
   change. An UPDATE leaving rows as they are reports them, as pgjdbc's
   updatable-result-set write-back needs.
+- **Scope decision — a subscription never reaches its publisher.**
+  Logical replication between servers is multi-node, which `CLAUDE.md`
+  puts out of scope. `CREATE / ALTER / DROP SUBSCRIPTION` run as
+  PostgreSQL 15.19 runs them up to the point where it would connect, so
+  every check before that answers as PostgreSQL does. What would connect is
+  0A000, named: `CREATE SUBSCRIPTION` with `connect = true` (its default),
+  `REFRESH PUBLICATION` and a refreshing `SET / ADD / DROP PUBLICATION` on
+  an enabled subscription, `ENABLE`, and `DROP` of a subscription that
+  names a slot (outside a block; inside one PostgreSQL's 25001 comes
+  first). PostgreSQL answers 08006 when its publisher cannot be reached.
 - **Not the server — pgjdbc `ConnectionTest::pGStreamSettings`** asserts the
   CLIENT socket's receive buffer and flickers on its own.
 - **Scope decision — the sqllogictest gauge on the Rust server**
@@ -406,9 +416,11 @@ one beside it.
   - A table whose rows are not text, bytea or fixed width (numeric, arrays,
     json): its heap pages are taken at the estimated density.
   - DISTINCT ON, and a citext DISTINCT, which PostgreSQL sorts.
-  - The heap's order after UPDATE or DELETE (rows the hash table reads in
-    another order). The size CREATE INDEX records and what ANALYZE
-    stores are modelled (`__sql_relstats__`), but not REINDEX's,
+  - A bitmap heap scan's order after a HOT UPDATE: PostgreSQL reaches the
+    new version through its chain's root and reads it at the root's place
+    (`select id from t where id > 0` over a primary key reads rows 3, 1, 2
+    where this server, reading in ctid order, returns 3, 2, 1). The size
+    CREATE INDEX records and what ANALYZE stores are modelled (`__sql_relstats__`), but not REINDEX's,
     CLUSTER's or an ALTER TABLE that builds an index, nor across RENAME.
     Declined over an analysed table, keeping the old order: a range over
     a column that is not an integer (a text histogram is in the
@@ -530,7 +542,7 @@ one beside it.
     than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_left_join_whose_nullable_side_holds_a_left_join_is_searched
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_left_join_whose_nullable_side_holds_a_left_join_is_searched, tests/backlog/test_rp_batch47.py::test_scenario[a bitmap heap scan reads a HOT-updated row at its root]
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
@@ -766,36 +778,129 @@ fixed in the same batch; their tests there are regression tests.
       Backlog-ID: RP-137
       Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order], tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]
 
+## Found by batch 52 (2026-10-24)
+
+Found while building `pg_describe_object` (RP-199) and RP-200. The gap
+tests are scenarios in `tests/backlog/test_rp_batch52.py` and
+`tests/backlog/test_rp_batch51.py`, measured on a private 15.19 cluster.
+RP-204 (an executor-answered function in a PL/pgSQL expression), RP-206 (a
+view over another schema's table had no rule dependency), RP-207 (an index
+in another schema was listed in `public`), RP-208 (a built-in row type
+printed as its oid), RP-209 (`plpgsql`'s extension oid), RP-210 (the
+visibility functions) and RP-211 (`pg_operator` and `pg_rewrite` listed
+none of PostgreSQL's rows) were found and fixed in the same batch; their
+tests are regression tests.
+
+- [ ] **A rule's `ev_qual` and `ev_action` are NULL.** PostgreSQL 15.19
+      stores each rule's qualification and actions as node trees (`<>` for
+      no qualification, `({QUERY :commandType 1 ...})`); here both columns
+      are NULL, for the system views' rules (listed since batch 52, as
+      `initdb` leaves them) and for the database's own. The trees are
+      PostgreSQL's `nodeToString` of its analysed query, which this server
+      does not build.
+      Backlog-ID: RP-203
+      Verify: tests/backlog/test_rp_batch51.py::test_scenario[a rule's node trees]
+- [ ] **A table's row type has the table's oid.** PostgreSQL 15.19 gives
+      the row type an oid of its own (`pg_class.reltype`); here they are
+      one number, so `pg_depend` rows about the type read as rows about the
+      relation (`type t[]` appears among what depends on table `t`).
+      Backlog-ID: RP-205
+      Verify: tests/backlog/test_rp_batch52.py::test_scenario[pg_depend of a table and its row type]
+- [ ] **A system catalog has no size.** `pg_relation_size(1259)` is NULL
+      here and `pg_relation_size('pg_class')` 0; PostgreSQL 15.19 answers
+      each catalog's heap size (114688 for `pg_class` on the private 15.19
+      reference cluster), `pg_total_relation_size` with its indexes and TOAST. A user
+      table's size comes from the heap model (batch 48); a catalog here is
+      computed from the store, with no heap to measure.
+      **Decision needed (2026-10-24):** PostgreSQL's numbers depend on each
+      cluster's churn (dead tuples, the catalog's own updates), so no rule
+      reproduces them. Options: (a) measure each catalog's rows through the
+      heap model as a fresh `initdb` would lay them out -- the mechanism,
+      but not PostgreSQL's bytes; (b) a fresh 15.19 cluster's sizes, dumped,
+      for the catalogs a database's own objects do not grow, and (a) for
+      the rest; (c) leave NULL, which reads as "no such relation".
+      Backlog-ID: RP-214
+      Verify: tests/backlog/test_rp_batch52.py::test_scenario[a system catalog's size]
+
+## Found by batch 51 (2026-10-23)
+
+Found while building operator classes, subscriptions and transforms
+(RP-169). The gap tests are scenarios in `tests/backlog/test_rp_batch51.py`,
+measured on a private 15.19 cluster. RP-201 (`shobj_description` answered
+NULL for a database's or role's comment) was found and fixed in the same
+batch, and RP-200 (a block's own index definitions) in batch 52; their
+tests there are regression tests.
+
+- [ ] **`pg_identify_object`, `pg_identify_object_as_address` and
+      `pg_get_object_address` are refused** (`function
+      pg_identify_object(regclass, regclass, integer) is not supported
+      yet`). PostgreSQL 15.19 identifies any object by `(classid, objid,
+      objsubid)` as a record (`(table,pg_catalog,pg_class,pg_catalog.pg_class)`)
+      and resolves `(type, names, args)` back to one. `pg_describe_object` is
+      served since batch 52 (`objaddr.rs`); these need
+      `getObjectTypeDescription`, `getObjectIdentityParts` and
+      `get_object_address`, each a switch over every catalog, and their
+      record results.
+      Backlog-ID: RP-199
+      Verify: tests/backlog/test_rp_batch51.py::test_scenario[pg_identify_object and its siblings]
+- [ ] **A cancel while a huge statement is planned waits for the pass it
+      lands in.** Planning a statement with a 200,000-item `IN` list runs
+      for about a second in a debug build, as a sequence of passes over the
+      whole tree with a cancellation point between each. A cancel that lands
+      inside one is answered when it ends: up to 0.2 s late here, where
+      PostgreSQL 15.19 answers in 0.015 s. The longest is the clone of the
+      memoised parse tree each plan starts from (about 0.35 s for that
+      statement). Batch 46's follow-up closed the windows outside planning
+      that were 0.8 s long.
+      Backlog-ID: RP-202
+      Verify: none -- a latency budget; every answer is PostgreSQL's 57014, only later
+
+## Found by batch 50 (2026-10-23)
+
+Found while building extended statistics (RP-099). RP-197
+(`pg_get_statisticsobjdef` and its siblings were refused) and RP-198 (a
+`real` cast to text printed as the double it is kept in) were found and
+fixed in the same batch; their tests in `tests/backlog/test_rp_batch50.py`
+are regression tests.
+
+## Found by batch 48 (2026-10-23)
+
+Found while building VACUUM and the free space map (RP-193). The gap tests
+are scenarios in `tests/backlog/test_rp_batch48.py`, measured on a private
+15.19 cluster. RP-195 (`pg_relation_size`) was found and fixed in the same
+batch; its test there is a regression test.
+
+- [ ] **`pg_class` shows no page or tuple counts for an index.** A table's
+      `relpages`, `reltuples` and `relallvisible` are what VACUUM, ANALYZE
+      and CREATE INDEX recorded (batch 49). An index's row still reads 0 and
+      -1, where PostgreSQL 15.19 shows its own pages and entries: an index
+      on 200 integers is `2 | 200` after CREATE INDEX. The pages need a
+      model of the B-tree as inserts split it; `costsize::btree_size`
+      estimates a freshly built one only.
+      Backlog-ID: RP-196
+      Verify: tests/backlog/test_rp_batch49.py::test_scenario[pg_class shows an index's size]
+
 ## Found by batch 46 (2026-10-23)
 
 Found while building the system columns (RP-069). The gap tests are
 scenarios in `tests/backlog/test_rp_batch46.py`, measured on a private 15.19
-cluster. RP-194 was found and fixed in the same batch; its test there is a
-regression test.
+cluster. RP-194 was found and fixed in the same batch, RP-192 in batch 47
+and most of RP-193 in batch 48; their tests there are regression tests.
 
-- [ ] **A scan does not read rows in ctid order.** Each row now carries
-      PostgreSQL's `ctid` (`crates/secantus-pg/src/heap.rs`), but a
-      sequential scan here returns rows in the order they were inserted,
-      where PostgreSQL's returns them in heap (ctid) order. After `update t
-      set ... where a = 2` over rows 1, 2, 3, PostgreSQL reads 1, 3, 2 (the
-      new version is the page's last tuple) and this server 1, 2, 3. The
-      fix is the table scan ordered by `__sys_ctid`; it moves the input
-      order every order-dependent answer (an unordered SELECT, `LIMIT`
-      without `ORDER BY`, the HashAggregate model) is computed over.
-      Backlog-ID: RP-192
-      Verify: tests/backlog/test_rp_batch46.py::test_scenario[a scan reads rows in ctid order]
-- [ ] **VACUUM frees no tuple's place.** A plain VACUUM here records its
-      statistics but leaves a dead tuple's space and line pointer taken, so
-      the next INSERT goes after it; PostgreSQL 15.19's VACUUM frees both,
-      and the next row takes `(0,1)` again (the free space map, line pointer
-      reuse). HOT pruning, which reclaims a page's dead tuples when it fills
-      during an UPDATE, is not modelled either. And the reverse after a
-      restart: the heap's free space is kept in the server process
-      (`heap.rs`) and derived from the live rows' ctids when a process first
-      touches a table, so a dead tuple's space is free again after a
-      restart, where PostgreSQL keeps it until VACUUM.
+- [ ] **A heap's dead tuples, free space map and target blocks are lost
+      on a restart.** The heap is modelled as PostgreSQL 15.19 keeps it
+      (`crates/secantus-pg/src/heap_page.rs`, `fsm.rs`; batch 48): HOT
+      chains, on-access pruning, VACUUM's passes, the free space map and
+      each backend's target block. But it is kept in the server process,
+      and after a restart it is derived from the live rows' ctids. Every
+      place no row holds is then a dead line pointer with no storage: a HOT
+      chain's dead root, which PostgreSQL's VACUUM leaves a redirect, is
+      made unused and reused; a dead tuple's space is free before any
+      VACUUM; and the free space map is empty. PostgreSQL keeps all three
+      on disk. The fix is persisting the heap (and FSM) state beside the
+      rows.
       Backlog-ID: RP-193
-      Verify: tests/backlog/test_rp_batch46.py::test_scenario[VACUUM frees a dead tuple's place]
+      Verify: tests/backlog/test_rp_batch48.py::test_a_dead_tuple_outlives_a_restart
 
 ## Found by batch 34 (2026-10-23)
 
@@ -804,19 +909,24 @@ tests are scenarios in `tests/backlog/test_rp_batch34.py`, measured on a
 private 15.19 cluster. RP-166 and RP-167 were found and fixed in the same
 batch; their tests there are regression tests.
 
-- [ ] **Statements still refused with 0A000**, each of which PostgreSQL
-      15.19 runs (several appear in `pg_dump` output): `CREATE OPERATOR
-      FAMILY / CLASS`, `CREATE TEXT SEARCH DICTIONARY`, `CREATE / ALTER /
-      DROP SUBSCRIPTION` (with `connect = false`) and `CREATE TRANSFORM`.
-      Each refusal names the parse node (`CreateOpFamilyStmt is not
-      supported yet`). Each needs its catalog (`pg_opfamily` /
-      `pg_opclass`, `pg_ts_dict`, `pg_subscription`, `pg_transform`) kept
-      as PostgreSQL keeps it. (`ALTER EXTENSION ... UPDATE`, `ALTER
-      OPERATOR ... OWNER TO`, `ALTER COLLATION ... RENAME / REFRESH
-      VERSION`, `CREATE CONVERSION` and `CREATE ACCESS METHOD` are served
-      since batch 40.)
+- [ ] **What is left of the statements once refused with 0A000.** Batch
+      51 built `CREATE / ALTER / DROP OPERATOR FAMILY / CLASS` for the
+      btree and hash methods, text-search dictionaries over the `simple`,
+      `snowball` and `synonym` templates, subscriptions created with
+      `connect = false`, and transforms. Three parts are still refused or
+      differ from PostgreSQL 15.19:
+      - **Operator classes of the GiST, GIN, SP-GiST and BRIN methods**
+        are refused by name. Their `amadjustmembers` rules and support
+        function numbers differ from btree's, and an index over such a
+        class would need its support functions, which are C internals.
+      - **The `ispell` and `thesaurus` dictionary templates** are refused
+        by name: their dictionary and affix file formats are not read here.
+      - **`pg_subscription` lists only the current database's
+        subscriptions.** It is a shared catalog: PostgreSQL lists every
+        database's, each with its `subdbid`. Here they are kept per
+        database.
       Backlog-ID: RP-169
-      Verify: tests/backlog/test_rp_batch34.py::test_scenario[statements PostgreSQL runs that are refused]
+      Verify: tests/backlog/test_rp_batch51.py::test_scenario[a GiST operator class], tests/backlog/test_rp_batch51.py::test_scenario[ispell and thesaurus dictionaries], tests/backlog/test_rp_batch51.py::test_scenario[pg_subscription lists every database's subscriptions]
 
 ## Found by batch 26 (2026-10-22)
 
@@ -825,15 +935,21 @@ as they do against PostgreSQL 15.19 (RP-070, RP-071). The gap tests are
 scenarios in `tests/backlog/test_rp_batch26.py`, measured on a private 15.19
 cluster.
 
-- [ ] **ANALYZE computes no extended statistics**, so
-      `pg_statistic_ext_data`, `pg_stats_ext` and `pg_stats_ext_exprs` are
-      refused by name (0A000). `CREATE STATISTICS` is recorded, but ANALYZE
-      does not build its `ndistinct`, `dependencies` or `mcv` objects as
-      PostgreSQL's `BuildRelationExtStatistics` does. (Column statistics --
-      `pg_statistic`, `pg_stats` -- are served, for the types ANALYZE
-      samples here.)
+- [ ] **Extended statistics: timestamps, and tables past ANALYZE's
+      sample.** ANALYZE builds every kind of statistics object as PostgreSQL
+      15.19 does (batch 50: ndistinct, dependencies, MCV lists, expression
+      statistics, inherited ones), and `pg_statistic_ext_data`,
+      `pg_stats_ext` and `pg_stats_ext_exprs` show them. What is left:
+      - An MCV list over a `timestamp` or `timestamptz` column has no bytes
+        (`stxdmcv` is NULL, where PostgreSQL writes its datums). A
+        timestamp's microseconds are kept in a hidden companion field, which
+        the statistics' values do not carry, so two timestamps a fraction of
+        a millisecond apart also count as one value.
+      - A table of more rows than ANALYZE samples (300 times the statistics
+        target) has no extended statistics here: PostgreSQL builds them from
+        its random sample (as for `pg_statistic`, which is not built either).
       Backlog-ID: RP-099
-      Verify: tests/backlog/test_rp_batch26.py::test_scenario[ANALYZE computes extended statistics]
+      Verify: tests/backlog/test_rp_batch50.py::test_scenario[an MCV list's bytes over timestamps], tests/backlog/test_rp_batch50.py::test_scenario[a table past ANALYZE's sample has extended statistics]
 - [ ] **The progress views are refused by name** (0A000):
       `pg_stat_progress_vacuum`, `_analyze`, `_cluster`, `_copy`,
       `_create_index`, `_basebackup`. PostgreSQL reports a row per backend

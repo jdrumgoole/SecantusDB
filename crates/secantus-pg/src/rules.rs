@@ -378,52 +378,53 @@ impl PgHandler {
     /// `pg_rewrite`'s rows for the user rules.
     pub(crate) fn pg_rewrite_rows(&self, def: &TableDef) -> Vec<Document> {
         let f = |name: &str| def.field_of(name).expect("column");
-        self.rule_docs()
-            .iter()
-            .map(rule_of)
-            .map(|(r, enabled, oid)| {
-                let mut d = Document::new();
-                d.insert(f("oid"), Bson::Int64(oid));
-                d.insert(f("rulename"), r.name.as_str());
-                d.insert(
-                    f("ev_class"),
-                    Bson::Int64(self.relation_oid(&r.table).unwrap_or(0)),
-                );
-                d.insert(
-                    f("ev_type"),
-                    match r.event.as_str() {
-                        "UPDATE" => "2",
-                        "INSERT" => "3",
-                        "DELETE" => "4",
-                        _ => "1",
-                    },
-                );
-                d.insert(f("ev_enabled"), if enabled { "O" } else { "D" });
-                d.insert(f("is_instead"), r.instead);
-                d
-            })
-            // A view IS its `_RETURN` rule, as PostgreSQL records it.
-            .chain(
-                self.views()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(view, _)| {
-                        let mut d = Document::new();
-                        d.insert(f("oid"), Bson::Int64(Self::view_rule_oid(&view)));
-                        d.insert(f("rulename"), "_RETURN");
-                        d.insert(f("ev_class"), Bson::Int64(Self::view_oid(&view)));
-                        d.insert(f("ev_type"), "1");
-                        d.insert(f("ev_enabled"), "O");
-                        d.insert(f("is_instead"), true);
-                        d
-                    }),
-            )
-            // So is a materialized view.
-            .chain(
-                self.matviews()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|(name, _, _)| {
+        // The system views' rules as `initdb` leaves them (RP-203), then the
+        // database's.
+        let mut rows = self.static_rows("pg_rewrite", def);
+        let user: Vec<Document> =
+            self.rule_docs()
+                .iter()
+                .map(rule_of)
+                .map(|(r, enabled, oid)| {
+                    let mut d = Document::new();
+                    d.insert(f("oid"), Bson::Int64(oid));
+                    d.insert(f("rulename"), r.name.as_str());
+                    d.insert(
+                        f("ev_class"),
+                        Bson::Int64(self.relation_oid(&r.table).unwrap_or(0)),
+                    );
+                    d.insert(
+                        f("ev_type"),
+                        match r.event.as_str() {
+                            "UPDATE" => "2",
+                            "INSERT" => "3",
+                            "DELETE" => "4",
+                            _ => "1",
+                        },
+                    );
+                    d.insert(f("ev_enabled"), if enabled { "O" } else { "D" });
+                    d.insert(f("is_instead"), r.instead);
+                    d
+                })
+                // A view IS its `_RETURN` rule, as PostgreSQL records it.
+                .chain(
+                    self.views()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(view, _)| {
+                            let mut d = Document::new();
+                            d.insert(f("oid"), Bson::Int64(Self::view_rule_oid(&view)));
+                            d.insert(f("rulename"), "_RETURN");
+                            d.insert(f("ev_class"), Bson::Int64(Self::view_oid(&view)));
+                            d.insert(f("ev_type"), "1");
+                            d.insert(f("ev_enabled"), "O");
+                            d.insert(f("is_instead"), true);
+                            d
+                        }),
+                )
+                // So is a materialized view.
+                .chain(self.matviews().unwrap_or_default().into_iter().filter_map(
+                    |(name, _, _)| {
                         let mut d = Document::new();
                         d.insert(f("oid"), Bson::Int64(Self::view_rule_oid(&name)));
                         d.insert(f("rulename"), "_RETURN");
@@ -432,9 +433,11 @@ impl PgHandler {
                         d.insert(f("ev_enabled"), "O");
                         d.insert(f("is_instead"), true);
                         Some(d)
-                    }),
-            )
-            .collect()
+                    },
+                ))
+                .collect();
+        rows.extend(user);
+        rows
     }
 
     /// `pg_rules`: each rule's definition as ruleutils prints it.

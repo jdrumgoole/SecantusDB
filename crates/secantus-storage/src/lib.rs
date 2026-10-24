@@ -3489,6 +3489,33 @@ fn wide_read_allowed(broad: bool) -> bool {
     true
 }
 
+/// What a delete on this thread reports each removed document to:
+/// `(db, collection, the document's bytes)`.
+pub type DeleteObserver = Box<dyn FnMut(&str, &str, &[u8])>;
+
+thread_local! {
+    /// The observer this thread's deletes report to (`set_delete_observer`).
+    /// The PostgreSQL server sets one to learn which rows' heap places a
+    /// delete leaves dead; nothing else does, and unset it costs nothing.
+    static DELETE_OBSERVER: RefCell<Option<DeleteObserver>> = const { RefCell::new(None) };
+}
+
+/// Set (or clear) the observer this thread's deletes report each removed
+/// document to, returning the one it replaces. A delete that is retried
+/// after a write conflict reports its documents again, and one that fails
+/// reports what it removed before failing; the observer must take both.
+pub fn set_delete_observer(observer: Option<DeleteObserver>) -> Option<DeleteObserver> {
+    DELETE_OBSERVER.with(|o| std::mem::replace(&mut *o.borrow_mut(), observer))
+}
+
+fn note_deleted(db: &str, coll: &str, blob: &[u8]) {
+    DELETE_OBSERVER.with(|o| {
+        if let Some(f) = o.borrow_mut().as_mut() {
+            f(db, coll, blob);
+        }
+    });
+}
+
 thread_local! {
     /// The rows a write on this thread tests, in the order it tests them
     /// (`with_candidate_order`). `None`: the router's own candidates.
@@ -11113,6 +11140,7 @@ impl Storage {
                     Err(e) => return Err(e.into()),
                 };
                 cur.remove()?;
+                note_deleted(db, coll, &old_blob);
                 let old_doc = decode_doc(&old_blob)?;
                 let descs = self.index_descs(&session, db, coll)?;
                 // `delete_by_id` is a bare-`_id` path (not used for timeseries).
@@ -19042,6 +19070,7 @@ impl Storage {
             note_row(db, coll, recordid)?;
             cur.set_key_ssq(db, coll, recordid);
             cur.remove()?;
+            note_deleted(db, coll, &blob);
             self.delete_index_entries(session, db, coll, &doc, &descs, recordid)?;
             self.delete_nat_entry(session, db, coll, &id_k)?;
             deleted += 1;
@@ -19127,6 +19156,7 @@ impl Storage {
                     note_row(db, coll, recordid)?;
                     cur.set_key_ssq(db, coll, recordid);
                     cur.remove()?;
+                    note_deleted(db, coll, &blob);
                     self.delete_index_entries(&session, db, coll, &doc, &descs, recordid)?;
                     self.delete_nat_entry(&session, db, coll, &id_k)?;
                     deleted += 1;

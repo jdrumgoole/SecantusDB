@@ -3954,6 +3954,67 @@ pub fn expr_def(sql: &str, def: &TableDef) -> Option<String> {
     Some(p.buf)
 }
 
+/// A statistics object's expression as `pg_get_statisticsobjdef_expressions`
+/// prints it: as `pg_get_expr` does, an operator expression in its own
+/// parentheses (`(a + (b * (c)::integer))`), a call bare (`lower(c)`).
+/// PostgreSQL 15.19 measured.
+pub fn statistics_expr_def(sql: &str, def: &TableDef) -> Option<String> {
+    expr_def(sql, def)
+}
+
+/// The same expression as `pg_get_statisticsobjdef` and its `_columns`
+/// print it (`pg_get_statisticsobj_worker`): pretty, and in parentheses
+/// unless it looks like a function call (`(a + b * c::integer)`,
+/// `lower(c)`).
+pub fn statistics_expr_def_pretty(sql: &str, def: &TableDef) -> Option<String> {
+    let node = parse_select(&format!("SELECT {sql}"))?;
+    let Some(N::SelectStmt(s)) = node.node.as_ref() else {
+        return None;
+    };
+    let [target] = s.target_list.as_slice() else {
+        return None;
+    };
+    let Some(N::ResTarget(rt)) = target.node.as_ref() else {
+        return None;
+    };
+    let expr = rt.val.as_deref()?;
+    let none_lookup = |_: &str| None;
+    let none_views = |_: &str| None;
+    let cat = Catalog {
+        lookup: &none_lookup,
+        view_sql: &none_views,
+    };
+    let mut p = Printer::new(&cat, 0);
+    p.unqualified = true;
+    p.pretty = true;
+    p.scopes.push(vec![Rte {
+        refname: def.name.clone(),
+        name: def.name.clone(),
+        columns: def
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), base_type(&c.pg_type)))
+            .collect(),
+        qualified_only: false,
+    }]);
+    p.expr(expr)?;
+    let function_like = matches!(
+        expr.node.as_ref(),
+        Some(
+            N::FuncCall(_)
+                | N::CoalesceExpr(_)
+                | N::MinMaxExpr(_)
+                | N::SqlvalueFunction(_)
+                | N::XmlExpr(_)
+        )
+    );
+    Some(if function_like {
+        p.buf
+    } else {
+        format!("({})", p.buf)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -107,18 +107,6 @@ const CATALOG_NAMES: &[&str] = &[
     "pg_settings_get_flags",
     "pg_get_userbyid",
     "pg_get_function_sqlbody",
-    "pg_type_is_visible",
-    "pg_function_is_visible",
-    "pg_operator_is_visible",
-    "pg_opclass_is_visible",
-    "pg_opfamily_is_visible",
-    "pg_collation_is_visible",
-    "pg_conversion_is_visible",
-    "pg_statistics_obj_is_visible",
-    "pg_ts_config_is_visible",
-    "pg_ts_dict_is_visible",
-    "pg_ts_parser_is_visible",
-    "pg_ts_template_is_visible",
 ];
 
 /// The extension a function belongs to, when that extension's type is
@@ -1970,6 +1958,13 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                 },
                 None => return Ok(Bson::Null),
             };
+            if name == "shobj_description" {
+                let catalog = match args.get(1) {
+                    Some(Bson::String(s)) => s.clone(),
+                    _ => return Ok(Bson::Null),
+                };
+                return Ok(crate::shared_comment(oid, &catalog).map_or(Bson::Null, Bson::String));
+            }
             let subid = if name == "col_description" {
                 match args.get(1) {
                     Some(Bson::Int32(i)) => *i,

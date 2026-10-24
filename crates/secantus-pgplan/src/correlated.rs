@@ -806,6 +806,21 @@ pub(crate) fn has_correlated_call(node: &pg_query::protobuf::Node) -> bool {
     found
 }
 
+/// Does `node` call a function the executor answers (`SEQUENCE_FUNCTIONS`:
+/// `pg_relation_size`, `pg_type_is_visible`, ...)? No filter can hold one;
+/// it is evaluated per row (RP-212).
+pub(crate) fn calls_executor_function(node: &pg_query::protobuf::Node) -> bool {
+    let mut copy = node.clone();
+    let mut found = false;
+    let _ = walk_expr(&mut copy, &mut |n| {
+        if let Some(N::FuncCall(f)) = n.node.as_ref() {
+            found |= func_name(f).is_some_and(|name| SEQUENCE_FUNCTIONS.contains(&name.as_str()));
+        }
+        Ok(())
+    });
+    found
+}
+
 /// The static type of a correlated call, when `f` is one.
 pub(crate) fn correlated_type(f: &pg_query::protobuf::FuncCall) -> Option<String> {
     if !is_correlated(f) {
@@ -989,6 +1004,21 @@ pub(crate) const SEQUENCE_FUNCTIONS: &[&str] = &[
     "set_config",
     "pg_my_temp_schema",
     "pg_get_serial_sequence",
+    // An object's description reads every catalog (RP-199), and so does
+    // whether a name finds it (RP-210).
+    "pg_describe_object",
+    "pg_type_is_visible",
+    "pg_function_is_visible",
+    "pg_operator_is_visible",
+    "pg_opclass_is_visible",
+    "pg_opfamily_is_visible",
+    "pg_collation_is_visible",
+    "pg_conversion_is_visible",
+    "pg_statistics_obj_is_visible",
+    "pg_ts_config_is_visible",
+    "pg_ts_dict_is_visible",
+    "pg_ts_parser_is_visible",
+    "pg_ts_template_is_visible",
     "nextval",
     "currval",
     "setval",
@@ -1054,10 +1084,11 @@ pub fn executor_function_type(name: &str) -> Option<&'static str> {
         }
         n if n.contains("advisory") => "void",
         "pg_has_role" => "bool",
+        n if n.starts_with("pg_") && n.ends_with("_is_visible") => "bool",
         "set_limit" => "float4",
         "set_config" => "text",
         "pg_my_temp_schema" => "oid",
-        "pg_get_serial_sequence" => "text",
+        "pg_get_serial_sequence" | "pg_describe_object" => "text",
         "lo_creat" | "lo_create" | "lo_from_bytea" => "oid",
         "lo_unlink" | "lo_open" | "lo_close" | "lowrite" | "lo_lseek" | "lo_tell"
         | "lo_truncate" | "lo_truncate64" => "int4",

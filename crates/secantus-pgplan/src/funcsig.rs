@@ -901,3 +901,14 @@ pub(crate) fn always_returns_set(name: &str) -> bool {
 pub fn is_builtin_function_name(name: &str) -> bool {
     sigs().contains_key(name)
 }
+
+/// The result type of the built-in binary operator `op` over exactly `l`
+/// and `r`, each as `pg_type` names it.
+pub fn binary_operator_result(op: &str, l: &str, r: &str) -> Option<String> {
+    OPERATORS.lines().find_map(|line| {
+        let mut it = line.split('\t');
+        (it.next()? == op && it.next()? == l && it.next()? == r)
+            .then(|| it.next().map(planner_type))
+            .flatten()
+    })
+}

@@ -837,7 +837,7 @@ impl PgHandler {
     pub(crate) fn pg_description_rows(&self, def: &TableDef) -> Vec<Document> {
         let f = |name: &str| def.field_of(name).expect("column");
         let extensions: Vec<i64> = (0..self.extensions().unwrap_or_default().len())
-            .map(|i| 13_826 + i as i64)
+            .map(crate::extension_oid)
             .collect();
         let relations: Vec<i64> = self.relations().into_iter().map(|(_, o, _)| o).collect();
         let functions: Vec<i64> = self
@@ -855,10 +855,30 @@ impl PgHandler {
             .into_iter()
             .map(|(o, _)| o)
             .collect();
+        let ts_dicts: Vec<i64> = self
+            .ts_dict_comments()
+            .into_iter()
+            .map(|(o, _)| o)
+            .collect();
         let conversions: Vec<i64> = self
             .conversion_comments()
             .into_iter()
             .map(|(o, _)| o)
+            .collect();
+        // Operator classes and families, subscriptions and transforms.
+        let rp169: Vec<(i64, i64, String)> = self
+            .opclass_comments()
+            .into_iter()
+            .chain(
+                self.subscription_comments()
+                    .into_iter()
+                    .map(|(o, c)| (crate::subscriptions::PG_SUBSCRIPTION, o, c)),
+            )
+            .chain(
+                self.transform_comments()
+                    .into_iter()
+                    .map(|(o, c)| (crate::transforms::PG_TRANSFORM, o, c)),
+            )
             .collect();
         self.object_comments()
             .into_iter()
@@ -866,8 +886,12 @@ impl PgHandler {
                 // The catalog the object lives in, as `pg_description` keys it.
                 let classoid = if ts_configs.contains(&oid) {
                     crate::ts_configs::PG_TS_CONFIG
+                } else if ts_dicts.contains(&oid) {
+                    crate::ts_dicts::PG_TS_DICT
                 } else if conversions.contains(&oid) {
                     2607 // pg_conversion
+                } else if let Some((c, _, _)) = rp169.iter().find(|(_, o, _)| *o == oid) {
+                    *c
                 } else if constraints.contains(&oid) {
                     2606
                 } else if extensions.contains(&oid) {
@@ -963,9 +987,12 @@ impl PgHandler {
             .collect()
     }
 
-    /// `pg_opclass`: PostgreSQL 15.19's operator classes, as dumped.
+    /// `pg_opclass`: PostgreSQL 15.19's operator classes, as dumped, then
+    /// the database's.
     pub(crate) fn pg_opclass_rows(&self, def: &TableDef) -> Vec<Document> {
-        self.static_rows("pg_opclass", def)
+        let mut rows = self.static_rows("pg_opclass", def);
+        rows.extend(self.user_opclass_rows("pg_opclass", def));
+        rows
     }
 
     pub(crate) fn pg_am_rows(&self, def: &TableDef) -> Vec<Document> {
@@ -1033,7 +1060,9 @@ impl PgHandler {
             Vec::new()
         };
         // Per index: each key's type oid and whether it sorts DESC.
-        let index_keys: Vec<(i64, Vec<(i64, bool)>)> = if name == "pg_index" {
+        // Per index, each key's `(type, descending, explicit class)`.
+        type IndexKeys = Vec<(i64, Vec<(i64, bool, i64)>)>;
+        let index_keys: IndexKeys = if name == "pg_index" {
             self.index_relations()
                 .into_iter()
                 .map(|ix| {
@@ -1043,6 +1072,13 @@ impl PgHandler {
                         .unwrap_or_default()
                         .into_iter()
                         .find(|d| d.get_str("name") == Ok(ix.name.as_str()));
+                    // Each key's explicit operator class (0: the type's
+                    // default).
+                    let classes: Vec<i64> = stored
+                        .as_ref()
+                        .and_then(|d| d.get_array("sqlOpclasses").ok())
+                        .map(|a| a.iter().map(|v| crate::bson_i64(v).unwrap_or(0)).collect())
+                        .unwrap_or_default();
                     let directions: Vec<bool> = stored
                         .and_then(|d| d.get_document("key").ok().cloned())
                         .map(|k| {
@@ -1062,7 +1098,11 @@ impl PgHandler {
                                 .and_then(|k| ix.table.columns.get(k - 1))
                                 .and_then(|c| secantus_pgplan::pgtypes::oid_of_name(&c.pg_type))
                                 .unwrap_or(0);
-                            (ty, directions.get(i).copied().unwrap_or(false))
+                            (
+                                ty,
+                                directions.get(i).copied().unwrap_or(false),
+                                classes.get(i).copied().unwrap_or(0),
+                            )
                         })
                         .collect();
                     (ix.oid, keys)
@@ -1212,7 +1252,8 @@ impl PgHandler {
                                 .unwrap_or_default();
                             Bson::Array(
                                 keys.iter()
-                                    .map(|(ty, desc)| match c {
+                                    .map(|(ty, desc, class)| match c {
+                                        "indclass" if *class != 0 => Bson::Int64(*class),
                                         "indclass" => Bson::Int64(default_opclass(*ty)),
                                         // DESC implies NULLS FIRST: both bits.
                                         "indoption" => Bson::Int32(if *desc { 3 } else { 0 }),

@@ -354,7 +354,64 @@ impl PgHandler {
     /// transaction (a block, or a statement run apart from one) the rows
     /// are read on the current session, so they see its snapshot and its
     /// own writes (`scan_batch_after`).
-    fn table_batches(
+    pub(crate) fn table_batches(
+        &self,
+        table: &str,
+        filter: &Document,
+        sink: &mut dyn FnMut(Vec<Vec<u8>>) -> PgWireResult<bool>,
+    ) -> PgWireResult<()> {
+        let seq = self.collection_scan(table, filter);
+        // A sequential scan prunes the pages it reads (RP-193).
+        if seq {
+            self.prune_pages(table, None)?;
+        }
+        // A heap whose tuples have moved is read in ctid order, as a
+        // sequential scan reads it (RP-192): sorted in bounded memory.
+        if seq && self.heap_scan_disordered(table) {
+            let mut failed: Option<PgWireError> = None;
+            let sorted = crate::external_sort::sort_runs_with(
+                |sorter| {
+                    self.stored_batches(table, filter, &mut |blobs| Ok(sorter(blobs)))
+                        .map_err(|e| {
+                            let text = e.to_string();
+                            failed = Some(e);
+                            text
+                        })
+                },
+                &[crate::heap::ctid_order_key()],
+                0,
+                None,
+                JOIN_BATCH,
+                None,
+                &mut |_| Ok(()),
+            );
+            if let Some(e) = failed {
+                return Err(e);
+            }
+            let mut sorted =
+                sorted.map_err(|e| Self::user_error("XX000", format!("could not sort: {e}")))?;
+            loop {
+                let docs = sorted
+                    .next_batch()
+                    .map_err(|e| Self::user_error("XX000", e))?;
+                if docs.is_empty() {
+                    return Ok(());
+                }
+                let blobs = docs
+                    .iter()
+                    .map(bson::to_vec)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| Self::user_error("XX000", e.to_string()))?;
+                if !sink(blobs)? {
+                    return Ok(());
+                }
+            }
+        }
+        self.stored_batches(table, filter, sink)
+    }
+
+    /// `table_batches` in the order the store holds the rows.
+    fn stored_batches(
         &self,
         table: &str,
         filter: &Document,

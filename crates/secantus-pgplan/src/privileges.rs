@@ -633,6 +633,22 @@ pub fn sql_creation_schemas(sql: &str) -> Vec<String> {
                     String::new()
                 })
             }
+            N::CreateOpClassStmt(c) => {
+                let names = names_of(&c.opclassname);
+                Some(if names.len() > 1 {
+                    names[names.len() - 2].clone()
+                } else {
+                    String::new()
+                })
+            }
+            N::CreateOpFamilyStmt(c) => {
+                let names = names_of(&c.opfamilyname);
+                Some(if names.len() > 1 {
+                    names[names.len() - 2].clone()
+                } else {
+                    String::new()
+                })
+            }
             N::CreateEnumStmt(e) => {
                 let names = names_of(&e.type_name);
                 Some(if names.len() > 1 {

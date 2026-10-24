@@ -110,6 +110,9 @@ STATIC_TABLES = [
     "pg_catalog.pg_proc",
     "pg_catalog.pg_type",
     "pg_catalog.pg_constraint",
+    # Every built-in operator, and the system views' rules (RP-211, RP-203).
+    "pg_catalog.pg_operator",
+    "pg_catalog.pg_rewrite",
 ]
 
 
@@ -161,6 +164,8 @@ def main(dsn: str) -> None:
                 " then quote_ident(attname) || '::oid'"
                 " when atttypid = 'pg_node_tree'::regtype then"
                 " case attname when 'conbin' then 'pg_get_expr(conbin, conrelid)'"
+                # A rule's node trees are not kept here (RP-203).
+                " when 'ev_qual' then 'NULL' when 'ev_action' then 'NULL'"
                 " when 'prosqlbody' then 'pg_get_function_sqlbody(oid)'"
                 " else 'pg_get_expr(' || quote_ident(attname) || ', 0)' end"
                 " else quote_ident(attname) end"

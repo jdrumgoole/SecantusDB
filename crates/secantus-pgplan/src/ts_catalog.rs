@@ -65,6 +65,69 @@ pub struct UserConfig {
     pub map: Vec<(i32, i32, i64)>,
 }
 
+/// A dictionary `CREATE TEXT SEARCH DICTIONARY` made, or a built-in one an
+/// ALTER changed (under its own oid, hiding the dumped row).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserDict {
+    pub oid: i64,
+    pub schema: String,
+    pub name: String,
+    pub owner: String,
+    pub template: i64,
+    /// `dictinitoption`'s options, in order.
+    pub options: Vec<(String, String)>,
+}
+
+thread_local! {
+    static USER_DICTS: RefCell<Rc<Vec<UserDict>>> = RefCell::new(Rc::new(Vec::new()));
+}
+
+/// Install the database's dictionaries for the statements that follow.
+pub fn set_user_dicts(dicts: Vec<UserDict>) {
+    USER_DICTS.with(|c| *c.borrow_mut() = Rc::new(dicts));
+}
+
+/// The installed dictionaries.
+pub fn user_dicts() -> Rc<Vec<UserDict>> {
+    USER_DICTS.with(|c| Rc::clone(&c.borrow()))
+}
+
+/// A built-in dictionary's dumped row: `(name, template, options)`.
+/// A dictionary's `(name, template, options)`.
+pub type DictRow = (String, i64, Vec<(String, String)>);
+
+pub fn builtin_dict(oid: i64) -> Option<DictRow> {
+    let cat = catalog("pg_ts_dict")?;
+    let row = cat
+        .rows
+        .iter()
+        .find(|r| r.first().copied().flatten().and_then(|o| o.parse().ok()) == Some(oid))?;
+    let at = |c: &str| cat.columns.iter().position(|x| *x == c);
+    let name = row.get(at("dictname")?).copied().flatten()?.to_string();
+    let template = row
+        .get(at("dicttemplate")?)
+        .copied()
+        .flatten()?
+        .parse()
+        .ok()?;
+    let options = row
+        .get(at("dictinitoption")?)
+        .copied()
+        .flatten()
+        .map(crate::ts_dicts::parse_options_text)
+        .unwrap_or_default();
+    Some((name, template, options))
+}
+
+/// What dictionary `oid` does with a token, when it is a user dictionary
+/// (a built-in one keeps `fts`'s own lexing): `Some(None)` when it does not
+/// recognise the token.
+pub fn user_lexize(oid: i64, token: &str) -> Option<crate::Result<Option<Vec<String>>>> {
+    let dicts = user_dicts();
+    let d = dicts.iter().find(|d| d.oid == oid)?;
+    Some(crate::ts_dicts::init(d.template, &d.options).map(|l| crate::ts_dicts::lexize(&l, token)))
+}
+
 thread_local! {
     static USER_CONFIGS: RefCell<Rc<Vec<UserConfig>>> = RefCell::new(Rc::new(Vec::new()));
     static DROPPED_BUILTINS: RefCell<Rc<Vec<i64>>> = RefCell::new(Rc::new(Vec::new()));
@@ -203,6 +266,11 @@ pub fn dictionaries_for(cfg: i64, toktype: i32) -> Vec<i64> {
 /// A configuration's (or, with `dict`, a dictionary's) schema and name by
 /// oid.
 pub fn schema_and_name(oid: i64, dict: bool) -> Option<(String, String)> {
+    if dict {
+        if let Some(d) = user_dicts().iter().find(|d| d.oid == oid) {
+            return Some((d.schema.clone(), d.name.clone()));
+        }
+    }
     if !dict {
         if let Some(c) = user_configs().iter().find(|c| c.oid == oid) {
             return Some((c.schema.clone(), c.name.clone()));
@@ -287,10 +355,25 @@ fn name_parts(input: &str) -> Vec<String> {
 
 /// The configuration (or dictionary) `name` in `schema`.
 pub fn oid_in(schema: &str, name: &str, dict: bool) -> Option<i64> {
+    if dict {
+        if let Some(d) = user_dicts()
+            .iter()
+            .find(|d| d.schema == schema && d.name == name)
+        {
+            return Some(d.oid);
+        }
+    }
     if schema == "pg_catalog" {
+        let hidden = |o: i64| {
+            if dict {
+                user_dicts().iter().any(|d| d.oid == o)
+            } else {
+                builtin_hidden(o)
+            }
+        };
         if let Some((o, _)) = builtin_names(dict)
             .iter()
-            .find(|(o, n)| *n == name && (dict || !builtin_hidden(*o)))
+            .find(|(o, n)| *n == name && !hidden(*o))
         {
             return Some(*o);
         }

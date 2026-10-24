@@ -3,7 +3,8 @@ RP-069 (the system columns `ctid`, `xmin`, `cmin`, `xmax`, `cmax`, kept as
 PostgreSQL keeps them; its first test is
 `test_rp_found_2026_10_20.py::test_system_columns`) and of RP-194 (CREATE
 TABLE's `WITH (...)` options were not recorded, found while fixing
-RP-069), and the gap tests of RP-192 and RP-193, found with them.
+RP-069), and the gap tests of RP-192 and RP-193, found with them (both
+since fixed: their tests are regression tests).
 
 The scenarios run as `test_rp_batch34.py`'s do. The expected answers were
 measured on a private, freshly initdb'd PostgreSQL 15.19 cluster by running
@@ -146,7 +147,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ----------------------------------------- RP-192 a scan's order is ctid
     "a scan reads rows in ctid order": (
         "RP-192",
-        True,
+        False,
         [
             "create table rp46_q (a int, t text)",
             "insert into rp46_q values (1, 'x'), (2, 'y'), (3, 'z')",
@@ -158,7 +159,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ---------------------------------- RP-193 VACUUM frees a dead tuple
     "VACUUM frees a dead tuple's place": (
         "RP-193",
-        True,
+        False,
         [
             "create table rp46_d (a int)",
             "insert into rp46_d values (1), (2), (3)",

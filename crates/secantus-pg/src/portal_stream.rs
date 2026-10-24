@@ -470,9 +470,20 @@ impl PgHandler {
         let in_block = self
             .stream_in_block
             .swap(false, std::sync::atomic::Ordering::Relaxed);
-        let Some((order, dedup)) = self.stream_order(sel, def) else {
+        let Some((mut order, dedup)) = self.stream_order(sel, def) else {
             return Ok(None);
         };
+        // An unordered scan of a heap whose tuples have moved reads them in
+        // ctid order, as a sequential scan does (RP-192): sorted in bounded
+        // memory like any ORDER BY.
+        let seq = self.collection_scan(&sel.table, &sel.filter);
+        // A sequential scan prunes the pages it reads (RP-193).
+        if seq && !in_block {
+            self.prune_pages(&sel.table, None)?;
+        }
+        if order.is_empty() && seq && self.heap_scan_disordered(&sel.table) {
+            order.push(crate::heap::ctid_order_key());
+        }
         let source: futures::stream::BoxStream<'static, PgWireResult<Vec<Document>>> = if in_block {
             self.block_scan_stream(sel, order, dedup)?
         } else if order.iter().any(|k| k.expr.is_some()) {

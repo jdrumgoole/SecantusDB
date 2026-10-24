@@ -59,11 +59,14 @@ mod event_triggers;
 mod explain;
 mod expr_index;
 mod external_sort;
+mod extstats;
 mod fdw;
+mod fsm;
 mod grace_join;
 mod guc_values;
 mod hba;
 mod heap;
+mod heap_page;
 mod ident;
 mod info_columns;
 mod join_order;
@@ -73,7 +76,9 @@ mod live;
 mod live_notices;
 mod lock_manager;
 mod merge;
+mod objaddr;
 mod object_acl;
+mod opclasses;
 mod owned;
 mod parameter_acl;
 mod partition;
@@ -94,12 +99,15 @@ mod scram_binding;
 mod server;
 mod statistic;
 mod stream_join;
+mod subscriptions;
 mod system_catalogs;
 mod table_locks;
 mod tls;
+mod transforms;
 mod triggers;
 mod ts_catalogs;
 mod ts_configs;
+mod ts_dicts;
 mod tuplesort;
 mod txn_gucs;
 mod txn_state;
@@ -1500,17 +1508,24 @@ impl PlHost<'_> {
         self.h.check_sql_privileges(sql).map_err(|e| pl_error(&e))?;
         let run = |stmt: &Statement| self.h.subquery_rows(stmt);
         let declared: Vec<Option<String>> = types.iter().map(|t| Some(t.clone())).collect();
-        secantus_pgplan::planning_to_execute(|| {
-            secantus_pgplan::plan_with_session_types_and_subqueries(
-                sql,
-                &|n| self.h.lookup(n),
-                params,
-                &declared,
-                &tz,
-                Some(&run),
-            )
-        })
-        .map_err(|e| pl_error(&PgHandler::err(&e)))
+        // With the executor's hooks, as a top-level statement plans: a body
+        // runs while its CALLER executes, after that statement's hooks are
+        // gone, and without them `x := nextval('nosuch')` folded to NULL
+        // where PostgreSQL raises 42P01.
+        self.h
+            .with_executor_hooks(|| {
+                secantus_pgplan::planning_to_execute(|| {
+                    secantus_pgplan::plan_with_session_types_and_subqueries(
+                        sql,
+                        &|n| self.h.lookup(n),
+                        params,
+                        &declared,
+                        &tz,
+                        Some(&run),
+                    )
+                })
+            })
+            .map_err(|e| pl_error(&PgHandler::err(&e)))
     }
 }
 
@@ -2052,6 +2067,17 @@ impl plpgsql_fn::Host for PlHost<'_> {
         // Out at once, as PostgreSQL sends a RAISE: a function that then
         // runs on (a loop, a long query) does not hold it back.
         self.h.send_live_notices();
+    }
+}
+
+/// The oid of the `i`th extension `extensions()` lists: `plpgsql`'s is
+/// 14031, as `initdb` leaves it in PostgreSQL 15.19; the others follow the
+/// built-in band.
+pub(crate) fn extension_oid(i: usize) -> i64 {
+    if i == 0 {
+        14_031
+    } else {
+        13_826 + i as i64
     }
 }
 
@@ -4925,6 +4951,8 @@ impl PgHandler {
             secantus_pgplan::user_casts::set_user_casts(self.user_casts());
             secantus_pgplan::collation::set_user_collations(self.user_collations());
             secantus_pgplan::ts_catalog::set_user_configs(self.user_ts_configs());
+            secantus_pgplan::ts_catalog::set_user_dicts(self.user_ts_dicts());
+            secantus_pgplan::misc_alter::set_user_opclasses(self.user_opclasses());
             secantus_pgplan::ts_catalog::set_dropped_builtins(self.dropped_builtin_ts_configs());
             secantus_pgplan::collation::set_declared_collations(self.all_table_defs().map_or(
                 true,
@@ -5006,6 +5034,34 @@ impl PgHandler {
     /// Its own reads must then see those rows, and what it publishes is its
     /// own. An autocommit statement's marks outlive it until the next
     /// transaction ends, so the block itself is what is asked about.
+    /// `f`, reading through the open block's own transaction when the
+    /// block has written the catalog (RP-200): the planner's tables are
+    /// published before a statement takes the block's session, so a read
+    /// outside it saw the committed catalog alone -- an index the block
+    /// created had no `pg_get_indexdef`. Outside a block, or when the
+    /// session is already held (inside the statement), a plain read.
+    fn read_in_block<T>(&self, f: impl Fn() -> T) -> T {
+        if !self.block_wrote_catalog() || self.storage.in_user_txn() {
+            return f();
+        }
+        let Ok(mut guard) = self.txn.try_lock() else {
+            return f();
+        };
+        match guard.as_mut() {
+            Some(handle) => self
+                .storage
+                .with_user_transaction(handle, &f)
+                .unwrap_or_else(|_| {
+                    drop(guard);
+                    f()
+                }),
+            None => {
+                drop(guard);
+                f()
+            }
+        }
+    }
+
     fn block_wrote_catalog(&self) -> bool {
         self.in_transaction
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -5138,8 +5194,9 @@ impl PgHandler {
         secantus_pgplan::set_view_defs(self.view_defs());
         secantus_pgplan::set_view_defs_pretty(self.view_defs_as(1));
         secantus_pgplan::set_view_defs_marked(self.view_defs_as(2));
-        secantus_pgplan::set_index_defs(self.index_defs());
+        secantus_pgplan::set_index_defs(self.read_in_block(|| self.index_defs()));
         secantus_pgplan::set_trigger_defs(self.trigger_defs());
+        secantus_pgplan::set_statistics_defs(self.statistics_defs());
         let mut sigs = self.function_sigs();
         // A range's constructors, as `\df` prints them.
         for (oid, _, args, ret, _, _, variadic) in self.range_constructors() {
@@ -5192,6 +5249,7 @@ impl PgHandler {
                 .collect(),
         );
         secantus_pgplan::set_object_comments(self.object_comments());
+        secantus_pgplan::set_shared_comments(self.read_in_block(|| self.shared_comments()));
         secantus_pgplan::domains::set_user_domains(self.domains().unwrap_or_default());
         secantus_pgplan::user_agg::set_user_aggregates(self.user_aggregates().unwrap_or_default());
         // User-defined functions, so the planner can type and route a call.
@@ -5373,6 +5431,7 @@ impl PgHandler {
         secantus_pgplan::set_extension_types(extension_types);
         secantus_pgplan::set_installed_extensions(self.extension_schemas());
         secantus_pgplan::misc_alter::install_opclasses(system_catalogs::builtin_opclasses);
+        secantus_pgplan::pgtypes::install_catalog_composites(system_catalogs::builtin_composites);
         secantus_pgplan::misc_alter::set_user_access_methods(
             self.user_access_methods()
                 .into_iter()
@@ -5933,14 +5992,16 @@ impl PgHandler {
         if is_empty_query(sql.trim().trim_end_matches(';').trim()) {
             return Ok(());
         }
-        let analysed = match pg_query::parse(sql) {
-            Ok(parsed) => {
-                parsed.protobuf.stmts.len() == 1
+        // Through the planner's memo, which Execute's planning reuses, and
+        // under the cancel hook: a plain parse of a 200,000-item IN list was
+        // most of a second in which no cancel was seen.
+        let parsed = self.with_cancel_hook(|| secantus_pgplan::memoised_parse(sql));
+        self.check_cancel()?;
+        let analysed = match parsed {
+            Some(parsed) => {
+                parsed.stmts.len() == 1
                     && matches!(
-                        parsed.protobuf.stmts[0]
-                            .stmt
-                            .as_ref()
-                            .and_then(|s| s.node.as_ref()),
+                        parsed.stmts[0].stmt.as_ref().and_then(|s| s.node.as_ref()),
                         Some(
                             N::SelectStmt(_)
                                 | N::InsertStmt(_)
@@ -5951,7 +6012,7 @@ impl PgHandler {
                     )
             }
             // The describe pass reports a syntax error as Describe would.
-            Err(_) => true,
+            None => true,
         };
         if !analysed {
             return Ok(());
@@ -5976,7 +6037,13 @@ impl PgHandler {
             .enumerate()
             .map(|(i, d)| d.clone().or_else(|| inferred.get(i).cloned().flatten()))
             .collect();
-        match self.describe_fields(sql, param_types.len(), &param_types) {
+        // Under the cancel hook, and a cancellation point after it: the
+        // Parse is a message cycle of its own (psycopg's `prepare`), and a
+        // cancel left pending when it answered was cleared as stale at the
+        // next message -- the statement then ran to its end.
+        let described = self.describe_fields(sql, param_types.len(), &param_types);
+        self.check_cancel()?;
+        match described {
             Ok(_) => Ok(()),
             // Only what analysis itself raises: the names and types (class
             // 42) and a literal that does not read as its type (22P02).
@@ -5992,7 +6059,15 @@ impl PgHandler {
                     map.as_ref(),
                 ))
             }
-            Err(_) => Ok(()),
+            // A cancel (or a terminate) is the statement's answer, at once:
+            // swallowed here, it was taken and lost, and the statement ran to
+            // its end.
+            Err(PgWireError::UserError(info))
+                if matches!(info.code.as_str(), "57014" | "57P01") =>
+            {
+                Err(PgWireError::UserError(info))
+            }
+            Err(_) => self.check_cancel(),
         }
     }
 
@@ -6276,7 +6351,8 @@ impl PgHandler {
             .storage
             .find_matching(self.db(), table, &Document::new())
             .map_err(|e| Self::storage_err("could not read", e))?;
-        raw.iter()
+        self.in_scan_order(table, &Document::new(), raw)?
+            .iter()
             .map(|b| decode_doc(b).map_err(|e| Self::storage_err("could not decode a row", e)))
             .collect()
     }
@@ -6309,12 +6385,56 @@ impl PgHandler {
                 },
             );
             if let Some(rows) = rows {
-                return Ok(rows);
+                return self.in_scan_order(table, filter, rows);
             }
         }
-        self.storage
+        let rows = self
+            .storage
             .find_matching(self.db(), table, filter)
-            .map_err(|e| Self::storage_err("could not read", e))
+            .map_err(|e| Self::storage_err("could not read", e))?;
+        self.in_scan_order(table, filter, rows)
+    }
+
+    /// `rows` in the order PostgreSQL's scan returns them: a sequential
+    /// scan reads the heap in ctid order (RP-192); an index scan keeps the
+    /// index's.
+    fn in_scan_order(
+        &self,
+        table: &str,
+        filter: &Document,
+        rows: Vec<Vec<u8>>,
+    ) -> PgWireResult<Vec<Vec<u8>>> {
+        let seq = self.collection_scan(table, filter);
+        // The pages the scan met are pruned as it reads them (RP-193): a
+        // sequential scan's every page, an index scan's rows' pages.
+        if seq {
+            self.prune_pages(table, None)?;
+        } else if self.has_heap(table) {
+            let ctids: Vec<i64> = rows
+                .iter()
+                .filter_map(|b| {
+                    bson::RawDocument::from_bytes(b)
+                        .ok()?
+                        .get_i64("__sys_ctid")
+                        .ok()
+                })
+                .collect();
+            if !ctids.is_empty() {
+                self.prune_pages(table, Some(&ctids))?;
+            }
+        }
+        if seq && self.heap_scan_disordered(table) {
+            return Ok(heap::in_ctid_order(rows));
+        }
+        Ok(rows)
+    }
+
+    /// Does the storage answer `filter` over `table` by a collection scan?
+    pub(crate) fn collection_scan(&self, table: &str, filter: &Document) -> bool {
+        matches!(
+            self.storage.explain_plan(self.db(), table, filter),
+            Ok(secantus_storage::ExplainPlan::CollScan)
+        )
     }
 
     /// Materialise a joined subquery's rows, keyed by its OUTPUT names.
@@ -7244,7 +7364,8 @@ impl PgHandler {
         let (pages, tuples) = hashagg::table_size(
             width,
             table_count as u64,
-            self.heap_pages(table, &def),
+            self.heap_pages(table, &def)
+                .and_then(|_| self.measured_pages(table, &def)),
             measured,
         );
         // `table_block_relation_estimate_size`: `relallvisible` as it is,
@@ -7848,6 +7969,16 @@ impl PgHandler {
     /// The pages PostgreSQL's heap would hold `table`'s rows in, freshly
     /// inserted (`hashagg::heap_pages`); `None` when a column's type is one
     /// whose stored size is not modelled (numeric, arrays, json).
+    /// The pages VACUUM, ANALYZE and CREATE INDEX record of `table`: its
+    /// heap's (`heap.rs`), or the rows' estimate for one without a heap of
+    /// its own.
+    fn measured_pages(&self, table: &str, def: &secantus_pgcatalog::TableDef) -> Option<u64> {
+        if self.has_heap(table) {
+            return self.heap_blocks(table).ok().map(u64::from);
+        }
+        self.heap_pages(table, def)
+    }
+
     fn heap_pages(&self, table: &str, def: &secantus_pgcatalog::TableDef) -> Option<u64> {
         let spaces = self.heap_spaces(table, def)?;
         Some(secantus_pgplan::hashagg::heap_pages(spaces.into_iter()))
@@ -7992,18 +8123,27 @@ impl PgHandler {
         let Some(def) = self.lookup(table) else {
             return Ok(());
         };
-        let rows = self.table_docs(table)?.len();
+        // A partition's rows are read from its tree's root.
+        let rows = match self.partition_rows(&def)? {
+            Some((_, rows)) => rows.len(),
+            None => self.table_docs(table)?.len(),
+        };
         let previous = self.relstats(table);
         let shrunk = previous
             .as_ref()
             .and_then(|d| d.get_i64("vacuum_rows").ok())
             .is_some_and(|v| (rows as i64) < v);
-        let Some(pages) = self.heap_pages(table, &def).filter(|_| !shrunk) else {
+        let Some(pages) = self.measured_pages(table, &def) else {
             return self.record_relstats(table, true);
         };
-        let statistics = previous
-            .as_ref()
-            .is_some_and(|d| d.get_bool("statistics").unwrap_or(false));
+        // What the planner's model cannot price -- rows it does not size,
+        // a heap rows have left -- it declines; `pg_class` still shows the
+        // counts (RP-196).
+        let statistics = shrunk
+            || self.heap_pages(table, &def).is_none()
+            || previous
+                .as_ref()
+                .is_some_and(|d| d.get_bool("statistics").unwrap_or(false));
         let mut doc = bson::doc! {
             "_id": table,
             "reltuples": rows as i64,
@@ -13347,6 +13487,9 @@ impl PgHandler {
             "sqlExpressions": ci.expressions.clone(),
             "sqlKeys": ci.key_sql.clone(),
         };
+        if ci.opclasses.iter().any(|c| *c != 0) {
+            options.insert("sqlOpclasses", ci.opclasses.clone());
+        }
         if ci.unique {
             options.insert("unique", true);
             // `NULLS NOT DISTINCT`: a NULL key is kept, and collides.
@@ -13810,6 +13953,7 @@ impl PgHandler {
                 format!("relation \"{name}\" already exists"),
             ))));
         }
+        self.check_index_classes(&name, &ci.opclasses, ci.unique)?;
         if !ci.expressions.is_empty() {
             return self.create_expression_index(&def, &name, &ci);
         }
@@ -13879,8 +14023,12 @@ impl PgHandler {
                 || k.contains("_ops")
                 || k.contains("::regconfig")
                 || k.contains(" COLLATE ")
-        }) {
+        }) || ci.opclasses.iter().any(|c| *c != 0)
+        {
             options.insert("sqlKeys", ci.key_sql.clone());
+        }
+        if ci.opclasses.iter().any(|c| *c != 0) {
+            options.insert("sqlOpclasses", ci.opclasses.clone());
         }
         options.insert("sqlOid", self.mint_index_oid()?);
         self.storage
@@ -14235,6 +14383,40 @@ impl PgHandler {
     const RELSTATS_COLLECTION: &'static str = "__sql_relstats__";
 
     /// `table`'s row of `RELSTATS_COLLECTION`.
+    /// What VACUUM, ANALYZE and CREATE INDEX recorded of each table:
+    /// `(relpages, reltuples, relallvisible)` by name, as `pg_class` shows
+    /// them (RP-196).
+    pub(crate) fn recorded_sizes(&self) -> std::collections::HashMap<String, (i32, f64, i32)> {
+        self.storage
+            .find_matching(self.db(), Self::RELSTATS_COLLECTION, &Document::new())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|b| decode_doc(b).ok())
+            .filter_map(|d| {
+                let name = d.get_str("_id").ok()?.to_string();
+                let int = |k: &str| match d.get(k) {
+                    Some(Bson::Int64(n)) => i32::try_from(*n).ok(),
+                    Some(Bson::Int32(n)) => Some(*n),
+                    _ => None,
+                };
+                let tuples = match d.get("reltuples") {
+                    Some(Bson::Int64(n)) => *n as f64,
+                    Some(Bson::Int32(n)) => f64::from(*n),
+                    Some(Bson::Double(f)) => *f,
+                    _ => -1.0,
+                };
+                Some((
+                    name,
+                    (
+                        int("relpages").unwrap_or(0),
+                        tuples,
+                        int("relallvisible").unwrap_or(0),
+                    ),
+                ))
+            })
+            .collect()
+    }
+
     fn relstats(&self, table: &str) -> Option<Document> {
         self.storage
             .find_matching(
@@ -14264,14 +14446,14 @@ impl PgHandler {
                 .as_ref()
                 .is_some_and(|d| d.get_bool("statistics").unwrap_or(false));
         let mut doc = bson::doc! {"_id": table, "reltuples": rows as i64, "statistics": statistics};
-        match self.heap_pages(table, &def) {
-            Some(pages) => {
-                doc.insert("relpages", pages as i64);
-            }
-            // A heap whose size is not modelled is not priced at all.
-            None => {
-                doc.insert("statistics", true);
-            }
+        // The heap's pages, as `RelationGetNumberOfBlocks` counts them
+        // (RP-196). A table whose rows' widths the planner does not model
+        // is not priced at all.
+        if self.heap_pages(table, &def).is_none() {
+            doc.insert("statistics", true);
+        }
+        if let Some(pages) = self.measured_pages(table, &def) {
+            doc.insert("relpages", pages as i64);
         }
         // `pg_statistic` is ANALYZE's alone: what it stored stays.
         if let Some(columns) = previous
@@ -14302,7 +14484,6 @@ impl PgHandler {
     /// unmodelled entirely (`statistics`). An empty table keeps the
     /// statistics it had, as ANALYZE computes none from no rows.
     fn record_analyze(&self, table: &str, columns: &[String]) -> PgWireResult<()> {
-        use secantus_pgplan::hashagg;
         let Some(def) = self.lookup(table) else {
             return Ok(());
         };
@@ -14314,7 +14495,15 @@ impl PgHandler {
             .get("default_statistics_target")
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(100);
-        let Some(pages) = self.heap_pages(table, &def) else {
+        // The extended statistics on the table (RP-099), over the whole
+        // table while it fits ANALYZE's sample, whatever its columns' types.
+        if docs.len() as u64 <= 300 * target {
+            self.build_extended_statistics(table, &def, &docs, columns, target as usize)?;
+        }
+        if self.heap_pages(table, &def).is_none() {
+            return self.record_relstats(table, true);
+        }
+        let Some(pages) = self.measured_pages(table, &def) else {
             return self.record_relstats(table, true);
         };
         if docs.len() as u64 > 300 * target {
@@ -14331,51 +14520,9 @@ impl PgHandler {
                 if !columns.is_empty() && !columns.iter().any(|n| n == &c.name) {
                     continue;
                 }
-                let typlen = secantus_pgplan::pgtypes::oid_of_name(&c.pg_type)
-                    .and_then(|oid| pg_type_facts::builtin(oid, "typlen"))
-                    .and_then(|v| match v {
-                        Bson::Int32(n) => Some(i64::from(n)),
-                        Bson::Int64(n) => Some(n),
-                        _ => None,
-                    })
-                    .unwrap_or(-1);
                 let field = c.field();
-                let values: Option<Vec<hashagg::Sampled>> = docs
-                    .iter()
-                    .map(|d| Self::analyze_sample(c, d.get(&field)))
-                    .collect();
-                let mut entry = bson::doc! {"name": &c.name, "type": &c.pg_type};
-                match values {
-                    Some(values) => {
-                        let s = hashagg::analyze_column(&values, typlen);
-                        entry.insert("null_frac", f64::from(s.null_frac));
-                        entry.insert("distinct", f64::from(s.distinct));
-                        entry.insert("width", s.width);
-                        let slots =
-                            secantus_pgplan::colstats::scalar_slots(&values, target as usize);
-                        let bin = |k: &[u8]| {
-                            Bson::Binary(bson::Binary {
-                                subtype: bson::spec::BinarySubtype::Generic,
-                                bytes: k.to_vec(),
-                            })
-                        };
-                        let mcv: Vec<Bson> = slots
-                            .mcv
-                            .iter()
-                            .map(|(k, f)| Bson::Array(vec![bin(k), Bson::Double(f64::from(*f))]))
-                            .collect();
-                        entry.insert("mcv", mcv);
-                        entry.insert("mcv_complete", slots.mcv_complete);
-                        let hist: Vec<Bson> = slots.histogram.iter().map(|k| bin(k)).collect();
-                        entry.insert("histogram", hist);
-                        if let Some(c) = slots.correlation {
-                            entry.insert("correlation", f64::from(c));
-                        }
-                    }
-                    None => {
-                        entry.insert("unmodelled", true);
-                    }
-                }
+                let values: Vec<Option<&Bson>> = docs.iter().map(|d| d.get(&field)).collect();
+                let entry = Self::stats_entry(c, &values, target as usize, false);
                 stats.insert(field, entry);
             }
         }
@@ -14393,6 +14540,65 @@ impl PgHandler {
             doc.insert("statistics", true);
         }
         self.put_comment_doc(Self::RELSTATS_COLLECTION, table, Some(doc))
+    }
+
+    /// What ANALYZE records of one column's (or expression's) sampled
+    /// `values` (`compute_scalar_stats`): its null fraction, distinct
+    /// count, width, most common values, histogram and correlation, or
+    /// `unmodelled` when its type's equality is not modelled here.
+    /// `computed` values are an expression's, each varlena with a 4-byte
+    /// header, where a stored one up to 126 bytes has a 1-byte one.
+    pub(crate) fn stats_entry(
+        c: &secantus_pgcatalog::Column,
+        values: &[Option<&Bson>],
+        target: usize,
+        computed: bool,
+    ) -> Document {
+        use secantus_pgplan::hashagg;
+        let typlen = secantus_pgplan::pgtypes::oid_of_name(&c.pg_type)
+            .and_then(|oid| pg_type_facts::builtin(oid, "typlen"))
+            .and_then(|v| match v {
+                Bson::Int32(n) => Some(i64::from(n)),
+                Bson::Int64(n) => Some(n),
+                _ => None,
+            })
+            .unwrap_or(-1);
+        let values: Option<Vec<hashagg::Sampled>> = values
+            .iter()
+            .map(|v| Self::analyze_sample(c, *v, computed))
+            .collect();
+        let mut entry = bson::doc! {"name": &c.name, "type": &c.pg_type};
+        match values {
+            Some(values) => {
+                let s = hashagg::analyze_column(&values, typlen);
+                entry.insert("null_frac", f64::from(s.null_frac));
+                entry.insert("distinct", f64::from(s.distinct));
+                entry.insert("width", s.width);
+                let slots = secantus_pgplan::colstats::scalar_slots(&values, target);
+                let bin = |k: &[u8]| {
+                    Bson::Binary(bson::Binary {
+                        subtype: bson::spec::BinarySubtype::Generic,
+                        bytes: k.to_vec(),
+                    })
+                };
+                let mcv: Vec<Bson> = slots
+                    .mcv
+                    .iter()
+                    .map(|(k, f)| Bson::Array(vec![bin(k), Bson::Double(f64::from(*f))]))
+                    .collect();
+                entry.insert("mcv", mcv);
+                entry.insert("mcv_complete", slots.mcv_complete);
+                let hist: Vec<Bson> = slots.histogram.iter().map(|k| bin(k)).collect();
+                entry.insert("histogram", hist);
+                if let Some(c) = slots.correlation {
+                    entry.insert("correlation", f64::from(c));
+                }
+            }
+            None => {
+                entry.insert("unmodelled", true);
+            }
+        }
+        entry
     }
 
     /// The most common values, histogram and correlation `record_analyze`
@@ -14435,13 +14641,18 @@ impl PgHandler {
     fn analyze_sample(
         c: &secantus_pgcatalog::Column,
         v: Option<&Bson>,
+        computed: bool,
     ) -> Option<secantus_pgplan::hashagg::Sampled> {
         let v = match v {
             None | Some(Bson::Null) => return Some(None),
             Some(v) => v,
         };
         let varlena = |bytes: &[u8], len: usize| {
-            let size = if len < 127 { len + 1 } else { len + 4 };
+            let size = if len < 127 && !computed {
+                len + 1
+            } else {
+                len + 4
+            };
             (len + 4 <= 1024).then(|| Some((bytes.to_vec(), size)))
         };
         match (c.pg_type.trim_start_matches("pg_catalog."), v) {
@@ -14529,6 +14740,11 @@ impl PgHandler {
             let bytes =
                 encode_doc(&d).map_err(|e| Self::storage_err("could not encode the comment", e))?;
             self.insert_checked(collection, vec![bytes], "could not record the comment")?;
+        }
+        // `pg_class` shows what is recorded of a table's size (RP-196): a
+        // listing cached before is stale now.
+        if collection == Self::RELSTATS_COLLECTION {
+            bump_catalog_version();
         }
         Ok(())
     }
@@ -14712,7 +14928,14 @@ impl PgHandler {
             }
             "domain" => self.comment_on_domain(&Self::comment_relation(names), comment),
             "text search configuration" => self.comment_on_ts_config(names, comment),
+            "text search dictionary" => self.comment_on_ts_dict(names, comment),
             "conversion" => self.comment_on_conversion(names, comment),
+            "operator class" => self.comment_on_opclass(true, names, comment),
+            "operator family" => self.comment_on_opclass(false, names, comment),
+            "subscription" => {
+                self.comment_on_subscription(names.last().map_or("", String::as_str), comment)
+            }
+            "transform" => self.comment_on_transform(names, comment),
             "database" | "role" => {
                 self.comment_on_shared(kind, names.last().map_or("", String::as_str), comment)
             }
@@ -16730,9 +16953,11 @@ impl PgHandler {
         }
     }
 
-    /// The storage-size functions. Sizes are this store's, not PostgreSQL's
-    /// page arithmetic: a relation's rows' encoded bytes rounded up to 8 kB
-    /// pages (0 when empty), each index one page per 8 kB of its table.
+    /// The storage-size functions. A table's main fork is its heap's pages
+    /// (`heap.rs`, RP-195), as PostgreSQL's is; an index is one page per
+    /// 16 kB of its table's rows' encoded bytes, and a database the sum of
+    /// its tables' encoded bytes in 8 kB pages, neither of which follows
+    /// PostgreSQL's page arithmetic.
     fn size_call(&self, name: &str, args: &[Bson]) -> PgWireResult<Bson> {
         const PAGE: i64 = 8192;
         let pages = |bytes: i64| (bytes + PAGE - 1) / PAGE * PAGE;
@@ -16782,17 +17007,19 @@ impl PgHandler {
         let Some(rel) = relation(args.first().unwrap_or(&Bson::Null))? else {
             return Ok(Bson::Null);
         };
-        let heap = if self.lookup(&rel).is_some() && Self::virtual_table(&rel).is_none() {
-            pages(table_bytes(&rel)?)
+        let stored = self.lookup(&rel).is_some() && Self::virtual_table(&rel).is_none();
+        let heap = if self.has_heap(&rel) {
+            i64::from(self.heap_blocks(&rel)?) * PAGE
         } else {
             0
         };
+        let encoded = if stored { pages(table_bytes(&rel)?) } else { 0 };
         let index_count = self
             .index_relations()
             .iter()
             .filter(|ix| ix.table.name == rel)
             .count() as i64;
-        let indexes = index_count * pages(heap.max(PAGE) / 2);
+        let indexes = index_count * pages(encoded.max(PAGE) / 2);
         // A table with a TOASTable column has a TOAST table, whose index is
         // one page even when empty; `pg_table_size` counts it.
         let toast = match self.lookup(&rel) {
@@ -16928,7 +17155,7 @@ impl PgHandler {
             .enumerate()
         {
             if let Some(c) = catalog_fill::extension_description(&name) {
-                out.push((13_826 + i as i64, 0, c.to_string()));
+                out.push((crate::extension_oid(i), 0, c.to_string()));
             }
         }
         for def in self.all_table_defs().unwrap_or_default() {
@@ -16982,8 +17209,24 @@ impl PgHandler {
                 .map(|(oid, c)| (oid, 0, c)),
         );
         out.extend(
+            self.ts_dict_comments()
+                .into_iter()
+                .map(|(oid, c)| (oid, 0, c)),
+        );
+        out.extend(
             self.conversion_comments()
                 .into_iter()
+                .map(|(oid, c)| (oid, 0, c)),
+        );
+        out.extend(
+            self.opclass_comments()
+                .into_iter()
+                .map(|(_, oid, c)| (oid, 0, c)),
+        );
+        out.extend(
+            self.subscription_comments()
+                .into_iter()
+                .chain(self.transform_comments())
                 .map(|(oid, c)| (oid, 0, c)),
         );
         // COMMENT ON FUNCTION / PROCEDURE, kept on the function's record,
@@ -18074,19 +18317,23 @@ impl PgHandler {
                 rows
             }
             other if secantus_pgplan::ts_catalog::NAMES.contains(&other) => {
+                let role_oid = |r: &str| {
+                    secantus_pgplan::regobj::resolve(
+                        "regrole",
+                        &secantus_pgplan::scalar::quote_identifier(r),
+                    )
+                    .unwrap_or(10)
+                };
                 let mut rows = ts_catalogs::rows(other, &def);
                 rows.extend(ts_catalogs::user_rows(
                     other,
                     &def,
                     &self.user_ts_configs(),
-                    |r| {
-                        secantus_pgplan::regobj::resolve(
-                            "regrole",
-                            &secantus_pgplan::scalar::quote_identifier(r),
-                        )
-                        .unwrap_or(10)
-                    },
+                    role_oid,
                 ));
+                if other == "pg_ts_dict" {
+                    rows.extend(ts_dicts::dict_rows(&def, &self.user_ts_dicts(), role_oid));
+                }
                 rows
             }
             "pg_am" => self.pg_am_rows(&def),
@@ -18692,6 +18939,7 @@ impl PgHandler {
                     .into_iter()
                     .map(|(n, _, _)| n)
                     .collect();
+                let sizes = self.recorded_sizes();
                 for t in self.all_table_defs().ok()? {
                     let mut d = Document::new();
                     d.insert(
@@ -18699,6 +18947,11 @@ impl PgHandler {
                         Bson::Int64(self.relation_oid(&t.name).unwrap_or(0)),
                     );
                     d.insert(f("relname"), t.name.as_str());
+                    // What VACUUM, ANALYZE or CREATE INDEX last counted.
+                    let (pages, tuples, visible) =
+                        sizes.get(&t.name).copied().unwrap_or((0, -1.0, 0));
+                    d.insert(f("relpages"), Bson::Int32(pages));
+                    d.insert(f("relallvisible"), Bson::Int32(visible));
                     d.insert(f("relnamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
                     d.insert(
                         f("relkind"),
@@ -18740,7 +18993,7 @@ impl PgHandler {
                         f("relhasindex"),
                         indexes.iter().any(|ix| ix.table.name == t.name),
                     );
-                    d.insert(f("reltuples"), Bson::Double(-1.0));
+                    d.insert(f("reltuples"), Bson::Double(tuples));
                     d.insert(
                         f("relowner"),
                         Bson::Int64(owner_oid(t.extra.get_str("owner").ok())),
@@ -18771,7 +19024,15 @@ impl PgHandler {
                 for ix in &indexes {
                     let mut d = Document::new();
                     d.insert(f("oid"), Bson::Int64(ix.oid));
-                    d.insert(f("relname"), ix.name.as_str());
+                    // In its table's schema: the `schema.name` key that
+                    // `schema_qualify_rows` splits, as a table's is.
+                    let schema = secantus_pgplan::schemas::split_key(&ix.table.name).0;
+                    let key = if schema == "public" {
+                        ix.name.clone()
+                    } else {
+                        format!("{schema}.{}", ix.name)
+                    };
+                    d.insert(f("relname"), key.as_str());
                     d.insert(f("relnamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
                     d.insert(
                         f("relkind"),
@@ -20157,7 +20418,7 @@ impl PgHandler {
                     let mut d = Document::new();
                     d.insert(
                         def.field_of("oid").expect("column"),
-                        Bson::Int64(13_826 + i as i64),
+                        Bson::Int64(crate::extension_oid(i)),
                     );
                     d.insert(def.field_of("extname").expect("column"), name);
                     d.insert(def.field_of("extversion").expect("column"), version);
@@ -24255,6 +24516,7 @@ impl Drop for PgHandler {
         table_locks::release(pid);
         row_waits::forget(pid);
         xids::end(&self.storage, pid);
+        heap::forget_backend(pid);
         if pid != 0 {
             backend_registry()
                 .lock()
@@ -26188,8 +26450,9 @@ impl PgHandler {
     /// never written. Inside a block the block's transaction already covers it.
     fn replace_table_rows(&self, table: &str, rows: Vec<Vec<u8>>) -> PgWireResult<()> {
         let run = || -> PgWireResult<()> {
-            self.storage
-                .delete_matching(
+            // The old heap's rows, not dead tuples of the new one.
+            heap::without_dead_tuples(|| {
+                self.storage.delete_matching(
                     self.db(),
                     table,
                     &Document::new(),
@@ -26197,7 +26460,8 @@ impl PgHandler {
                     &Document::new(),
                     None,
                 )
-                .map_err(|e| Self::storage_err("could not clear the table", e))?;
+            })
+            .map_err(|e| Self::storage_err("could not clear the table", e))?;
             if !rows.is_empty() {
                 self.insert_checked(table, rows.clone(), "could not rewrite the table")?;
             }
@@ -27196,6 +27460,12 @@ impl PgHandler {
         }
         if name == "pg_has_role" {
             return self.has_role_call(args);
+        }
+        if name == "pg_describe_object" {
+            return self.within_block(|| self.describe_object_call(args));
+        }
+        if objaddr::VISIBILITY_FUNCTIONS.contains(&name) {
+            return self.is_visible_call(name, args);
         }
         if name == "pg_blocking_pids" {
             // PostgreSQL 15: the int4[] of sessions holding what the given
@@ -29770,6 +30040,14 @@ impl PgHandler {
                 .map(String::as_str),
             None | Some("read committed" | "read uncommitted")
         );
+        if !read_committed {
+            // The snapshot the first statement takes is the transaction's,
+            // and holds back what VACUUM may remove (RP-193).
+            xids::hold_snapshot(
+                &self.storage,
+                self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        }
         if read_committed {
             let refreshed = self
                 .storage
@@ -31359,7 +31637,7 @@ impl PgHandler {
     }
 
     /// Raise a WARNING for the statement in flight (sent as `notice` is).
-    fn warning(&self, sqlstate: &str, message: String) {
+    pub(crate) fn warning(&self, sqlstate: &str, message: String) {
         self.pending_notices
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -33478,6 +33756,9 @@ impl PgHandler {
             Statement::CreateExtension { .. } => "CREATE EXTENSION",
             Statement::MiscAlter(op) => op.tag(),
             Statement::Conversion(op) => op.tag(),
+            Statement::OpClass(op) => op.tag(),
+            Statement::Subscription(op) => op.tag(),
+            Statement::Transform(op) => op.tag(),
             Statement::AccessMethod(op) => op.tag(),
             Statement::SetObjectSchema { kind, .. } => match *kind {
                 "extension" => "ALTER EXTENSION",
@@ -33874,6 +34155,24 @@ impl PgHandler {
             _ => None,
         };
         let command_ids = heap::command_ids(&stmt);
+        // The heap a row write reads and leaves (RP-069, RP-193): the pages
+        // a sequential scan meets are pruned as it reads them, and the rows
+        // a delete removes are its dead tuples.
+        let (scanned, delete_target) = match &stmt {
+            Statement::Update(u) => (Some((u.table.clone(), u.filter.clone())), None),
+            Statement::Delete(d) => (
+                Some((d.table.clone(), d.filter.clone())),
+                Some(d.table.clone()),
+            ),
+            Statement::Merge(m) => (None, Some(m.target.clone())),
+            _ => (None, None),
+        };
+        if let Some((table, filter)) = &scanned {
+            if self.collection_scan(table, filter) {
+                self.prune_pages(table, None)?;
+            }
+        }
+        let delete_mark = self.watch_deletes(delete_target.as_deref());
         let mut out = {
             struct Running<'a>(Option<&'a std::sync::atomic::AtomicUsize>);
             impl Drop for Running<'_> {
@@ -33890,6 +34189,11 @@ impl PgHandler {
             }));
             self.with_event_triggers(stmt, |stmt| self.execute_inner(stmt, max_rows))
         };
+        match self.note_deleted(delete_mark) {
+            Err(e) if out.is_ok() => out = Err(e),
+            Err(e) => eprintln!("secantusd-pg: recording a failed statement's deletes: {e:?}"),
+            Ok(()) => {}
+        }
         // The command ids it consumed (`cmin` / `cmax`, RP-069).
         if out.is_ok() {
             xids::advance_command(
@@ -35866,6 +36170,19 @@ impl PgHandler {
                     ));
                 }
                 self.drop_function_casts(&target, cascade)?;
+                // An operator class's support function depends on it.
+                self.drop_opclass_members_of(
+                    true,
+                    Self::index_oid(&format!("fn:{}", target.key)),
+                    &format!(
+                        "function {}",
+                        secantus_pgplan::regobj::text(
+                            "regprocedure",
+                            Self::index_oid(&format!("fn:{}", target.key))
+                        )
+                    ),
+                    cascade,
+                )?;
                 // A DEFINED base type depends on its I/O functions; and the
                 // type's other I/O function depends on the type, so it goes
                 // too. (A shell has no such dependency: dropping the function
@@ -38151,10 +38468,22 @@ impl PgHandler {
                             continue;
                         }
                         if command == "VACUUM" {
-                            self.record_vacuum(t)?;
+                            // The heap's dead tuples removed (RP-193). A
+                            // partitioned table is its leaves: they are
+                            // counted, it is not (RP-196).
+                            self.vacuum_heap(t)?;
+                            match self.lookup(t) {
+                                Some(d) if partition::is_partitioned(&d) => {
+                                    for leaf in self.leaf_partitions(t)? {
+                                        self.record_vacuum(&leaf)?;
+                                    }
+                                }
+                                _ => self.record_vacuum(t)?,
+                            }
                         }
                         if analyze {
                             self.record_analyze(t, columns)?;
+                            self.heap_invalidate(t)?;
                         }
                     }
                 }
@@ -38672,6 +39001,10 @@ impl PgHandler {
             } => self.alter_database_set(&database, name, value),
             Statement::AlterSystem { name, value } => self.alter_system(name, value),
             Statement::TsConfig(op) => self.ts_config_statement(op),
+            Statement::TsDict(op) => self.ts_dict_statement(op),
+            Statement::OpClass(op) => self.opclass_statement(op),
+            Statement::Subscription(op) => self.subscription_statement(op),
+            Statement::Transform(op) => self.transform_statement(op),
             Statement::RenameMatView {
                 matview,
                 to,
@@ -39360,15 +39693,16 @@ impl PgHandler {
                 }
                 for table in &tables {
                     // A partition's rows are in its tree's root.
+                    // A new relation file: the rows are not dead tuples.
                     if let Some(def) = self
                         .lookup(table)
                         .filter(|d| partition::parent_of(d).is_some())
                     {
-                        self.delete_partition_rows(&def)?;
+                        heap::without_dead_tuples(|| self.delete_partition_rows(&def))?;
                         continue;
                     }
-                    self.storage
-                        .delete_matching(
+                    heap::without_dead_tuples(|| {
+                        self.storage.delete_matching(
                             self.db(),
                             table,
                             &Document::new(),
@@ -39376,7 +39710,8 @@ impl PgHandler {
                             &Document::new(),
                             None,
                         )
-                        .map_err(|e| Self::storage_err("could not truncate", e))?;
+                    })
+                    .map_err(|e| Self::storage_err("could not truncate", e))?;
                 }
                 if restart_identity {
                     self.restart_owned_sequences(&tables)?;
@@ -39509,14 +39844,14 @@ impl PgHandler {
         if !has_expr && !versioned {
             return self.update_rows_raw(table, filter, set, unset);
         }
-        let before: Vec<(Bson, Option<i64>)> = self
+        let before: Vec<(Bson, Document)> = self
             .storage
             .find_matching(self.db(), table, filter)
             .map_err(|e| Self::storage_err("could not read", e))?
             .iter()
             .filter_map(|raw| {
                 let d = decode_doc(raw).ok()?;
-                Some((d.get("_id").cloned()?, heap::ctid_of(&d)))
+                Some((d.get("_id").cloned()?, d))
             })
             .collect();
         let matched = self.update_rows_raw(table, filter, set, unset)?;
@@ -39534,12 +39869,12 @@ impl PgHandler {
     }
 
     /// Updated rows' new versions: each one's xid, command and place, from
-    /// its old place (`before`: `(_id, old ctid)`).
+    /// its old version (`before`: `(_id, old row)`).
     fn restamp_updated(
         &self,
         table: &str,
         def: &TableDef,
-        before: &[(Bson, Option<i64>)],
+        before: &[(Bson, Document)],
     ) -> PgWireResult<()> {
         let ids: Vec<Bson> = before.iter().map(|(id, _)| id.clone()).collect();
         let rows: Vec<Document> = self
@@ -39550,12 +39885,12 @@ impl PgHandler {
             .filter_map(|raw| decode_doc(raw).ok())
             .collect();
         // In the order the update met them.
-        let mut versions: Vec<(Option<i64>, Document)> = before
+        let mut versions: Vec<(Option<Document>, Document)> = before
             .iter()
             .filter_map(|(id, old)| {
                 rows.iter()
                     .find(|r| r.get("_id") == Some(id))
-                    .map(|r| (*old, r.clone()))
+                    .map(|r| (Some(old.clone()), r.clone()))
             })
             .collect();
         self.stamp_updated(table, def, &mut versions)?;
@@ -39985,7 +40320,7 @@ impl PgHandler {
                 )
                 .map_err(|e| Self::storage_err("could not update", e))?;
             // The new version's place, from the old one's (RP-069).
-            let mut versions = vec![(heap::ctid_of(old), new.clone())];
+            let mut versions = vec![(Some(old.clone()), new.clone())];
             self.stamp_updated(table, def, &mut versions)?;
             let new = &versions[0].1;
             let bytes =
@@ -46014,7 +46349,19 @@ impl PgHandler {
     ///
     /// Planned against NULL placeholders: `Describe` arrives before `Bind`, so
     /// no values exist yet, and the result SHAPE does not depend on them.
+    /// The statement's result columns, planned under the cancel hook: a
+    /// Parse, Bind or Describe of a statement slow to plan is as
+    /// cancellable as its Execute.
     fn describe_fields(
+        &self,
+        sql: &str,
+        n_params: usize,
+        param_types: &[Option<String>],
+    ) -> PgWireResult<Option<Vec<FieldInfo>>> {
+        self.with_cancel_hook(|| self.describe_fields_inner(sql, n_params, param_types))
+    }
+
+    fn describe_fields_inner(
         &self,
         sql: &str,
         n_params: usize,
@@ -47560,31 +47907,19 @@ impl PgHandler {
             }
             true
         };
-        let scanned = if let Some(feed) = join {
+        // The table a batch at a time, in heap order (`table_batches`).
+        let scanned: PgWireResult<()> = if let Some(feed) = join {
             self.run_join_feed(feed, &mut sink)?;
             Ok(())
-        } else if self.storage.in_user_txn() {
-            let mut after = None;
-            loop {
-                let (blobs, next) = self
-                    .storage
-                    .scan_batch_after(self.db(), &agg.table, &agg.filter, after, 256)
-                    .map_err(|e| Self::storage_err("could not read", e))?;
-                if !sink(stream_join::RowBatch::Blobs(blobs)) || next.is_none() {
-                    break Ok(());
-                }
-                after = next;
-            }
         } else {
-            self.storage
-                .scan_routed_batches(self.db(), &agg.table, &agg.filter, 256, |b| {
-                    sink(stream_join::RowBatch::Blobs(b))
-                })
+            self.table_batches(&agg.table, &agg.filter, &mut |b| {
+                Ok(sink(stream_join::RowBatch::Blobs(b)))
+            })
         };
         if let Some(e) = stopped.or(failed) {
             return Err(e);
         }
-        scanned.map_err(|e| Self::storage_err("could not read", e))?;
+        scanned?;
         // The last (or only) chunk; an empty input still runs once, so each
         // aggregate answers its empty-input value.
         if !chunk.is_empty() || folds.get() == 0 {
@@ -47938,34 +48273,22 @@ impl PgHandler {
                 }
             }
         };
-        let scanned = if join {
+        // The table a batch at a time, in heap order (`table_batches`).
+        let scanned: PgWireResult<()> = if join {
             let Some(mut feed) = self.join_aggregate_source(agg)? else {
                 return Ok(None);
             };
             self.run_join_feed(&mut feed, &mut sink)?;
             Ok(())
-        } else if self.storage.in_user_txn() {
-            let mut after = None;
-            loop {
-                let (blobs, next) = self
-                    .storage
-                    .scan_batch_after(self.db(), &agg.table, &agg.filter, after, 256)
-                    .map_err(|e| Self::storage_err("could not read", e))?;
-                if !sink(stream_join::RowBatch::Blobs(blobs)) || next.is_none() {
-                    break Ok(());
-                }
-                after = next;
-            }
         } else {
-            self.storage
-                .scan_routed_batches(self.db(), &agg.table, &agg.filter, 256, |b| {
-                    sink(stream_join::RowBatch::Blobs(b))
-                })
+            self.table_batches(&agg.table, &agg.filter, &mut |b| {
+                Ok(sink(stream_join::RowBatch::Blobs(b)))
+            })
         };
         if let Some(e) = stopped {
             return Err(e);
         }
-        scanned.map_err(|e| Self::storage_err("could not read", e))?;
+        scanned?;
         if hashing && !hash_over && !hchunk.is_empty() {
             fold_hash(std::mem::take(&mut hchunk), &mut hashed, &mut hash_bytes)?;
         }
@@ -48265,32 +48588,19 @@ impl PgHandler {
                 }
             }
         };
-        let scanned = if let Some(feed) = join {
+        // The table a batch at a time, in heap order (`table_batches`).
+        let scanned: PgWireResult<()> = if let Some(feed) = join {
             self.run_join_feed(feed, &mut sink)?;
             Ok(())
-        } else if self.storage.in_user_txn() {
-            // Through the block's transaction, a batch at a time.
-            let mut after = None;
-            loop {
-                let (blobs, next) = self
-                    .storage
-                    .scan_batch_after(self.db(), &agg.table, &agg.filter, after, 256)
-                    .map_err(|e| Self::storage_err("could not read", e))?;
-                if !sink(stream_join::RowBatch::Blobs(blobs)) || next.is_none() {
-                    break Ok(());
-                }
-                after = next;
-            }
         } else {
-            self.storage
-                .scan_routed_batches(self.db(), &agg.table, &agg.filter, 256, |b| {
-                    sink(stream_join::RowBatch::Blobs(b))
-                })
+            self.table_batches(&agg.table, &agg.filter, &mut |b| {
+                Ok(sink(stream_join::RowBatch::Blobs(b)))
+            })
         };
         if let Some(e) = stopped.or(failed) {
             return Err(e);
         }
-        scanned.map_err(|e| Self::storage_err("could not read", e))?;
+        scanned?;
         if let Some(e) = sort_err {
             return Err(Self::user_error("XX000", format!("could not sort: {e}")));
         }
