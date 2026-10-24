@@ -1003,6 +1003,30 @@ pub(crate) fn ctid_of(doc: &Document) -> Option<i64> {
     }
 }
 
+/// The blocks `rows` of `def` fill when inserted one after another into an
+/// empty heap, as `initdb` lays out a catalog (RP-214, Joe 2026-10-24):
+/// each tuple takes its MAXALIGNed length and a 4-byte line pointer on a
+/// page whose header is 24 bytes, a catalog's fillfactor being 100, and at
+/// most `MaxHeapTuplesPerPage` (291) tuples go on a page.
+pub(crate) fn fresh_blocks(def: &TableDef, rows: &[Document]) -> u32 {
+    const PAGE: usize = 8192;
+    const HEADER: usize = 24;
+    const MAX_TUPLES: usize = 291;
+    let mut blocks = 0u32;
+    let (mut free, mut on_page) = (0usize, MAX_TUPLES);
+    for r in rows {
+        let need = maxalign(tuple_len(def, r)) + 4;
+        if on_page == MAX_TUPLES || need > free {
+            blocks += 1;
+            free = PAGE - HEADER;
+            on_page = 0;
+        }
+        free -= need.min(free);
+        on_page += 1;
+    }
+    blocks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

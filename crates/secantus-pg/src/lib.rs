@@ -10325,10 +10325,7 @@ impl PgHandler {
                     let Ok(id) = d.get_str("_id") else {
                         continue;
                     };
-                    let oid = d
-                        .get_i64("oid")
-                        .or_else(|_| d.get_i32("oid").map(i64::from))
-                        .ok();
+                    let oid = Self::composite_relid(d);
                     // The first document of a name decides, found or not.
                     if !map.contains_key(id) {
                         if let Some(oid) = oid {
@@ -10377,10 +10374,7 @@ impl PgHandler {
         docs.iter()
             .filter_map(|d| {
                 let name = d.get_str("_id").ok()?.to_string();
-                let oid = d
-                    .get_i64("oid")
-                    .or_else(|_| d.get_i32("oid").map(i64::from))
-                    .ok()?;
+                let oid = Self::composite_relid(d)?;
                 let temp = temps.contains(&name);
                 Some((name, oid, temp))
             })
@@ -10412,6 +10406,16 @@ impl PgHandler {
                 (name, oid, false)
             }))
             .collect()
+    }
+
+    /// A composite's RELATION oid (`pg_class.oid`, `pg_type.typrelid`). A
+    /// relation and its row type draw separate oids from the counter, the
+    /// relation's first, as `heap_create_with_catalog` does (RP-205); a
+    /// composite recorded before that has one oid for both.
+    pub(crate) fn composite_relid(d: &Document) -> Option<i64> {
+        d.get("relid")
+            .and_then(bson_i64)
+            .or_else(|| d.get("oid").and_then(bson_i64))
     }
 
     /// Every sequence's name, with this transaction's uncommitted creates and
@@ -16986,7 +16990,27 @@ impl PgHandler {
                 .relations()
                 .into_iter()
                 .find(|(_, o, _)| *o == oid)
-                .map(|(n, _, _)| n))
+                .map(|(n, _, _)| n)
+                .or_else(|| {
+                    // A built-in relation, by its oid (RP-214).
+                    (oid < 16384)
+                        .then(|| {
+                            self.run_sql_rows(
+                                &format!(
+                                    "select relname::text from pg_catalog.pg_class where oid = {oid}"
+                                ),
+                                &[],
+                            )
+                            .ok()?
+                            .into_iter()
+                            .next()?
+                            .into_iter()
+                            .next()?
+                            .as_str()
+                            .map(str::to_string)
+                        })
+                        .flatten()
+                }))
         };
         let table_bytes = |t: &str| -> PgWireResult<i64> {
             Ok(self
@@ -17008,7 +17032,24 @@ impl PgHandler {
             return Ok(Bson::Null);
         };
         let stored = self.lookup(&rel).is_some() && Self::virtual_table(&rel).is_none();
-        let heap = if self.has_heap(&rel) {
+        // A system catalog: its rows as `initdb` would lay them out (RP-214;
+        // a view has no storage, 0 as PostgreSQL answers).
+        let catalog = match Self::virtual_table(&rel) {
+            Some(def) => match system_catalog_kind(self, &rel) {
+                Some((kind, oid)) if kind == "r" => {
+                    let rows = self
+                        .virtual_rows(&rel, &Document::new())
+                        .unwrap_or_default();
+                    Some((i64::from(heap::fresh_blocks(&def, &rows)), oid))
+                }
+                _ => None,
+            },
+            None => None,
+        };
+        let catalog_blocks = catalog.map(|(blocks, _)| blocks);
+        let heap = if let Some(blocks) = catalog_blocks {
+            blocks * PAGE
+        } else if self.has_heap(&rel) {
             i64::from(self.heap_blocks(&rel)?) * PAGE
         } else {
             0
@@ -17019,6 +17060,12 @@ impl PgHandler {
             .iter()
             .filter(|ix| ix.table.name == rel)
             .count() as i64;
+        // A catalog's own indexes (`pg_index_system.tsv`), estimated as a
+        // user table's are.
+        let index_count = catalog.map_or(index_count, |(_, oid)| {
+            catalog_meta::system_index_count(oid)
+        });
+        let encoded = catalog_blocks.map_or(encoded, |b| b * PAGE);
         let indexes = index_count * pages(encoded.max(PAGE) / 2);
         // A table with a TOASTable column has a TOAST table, whose index is
         // one page even when empty; `pg_table_size` counts it.
@@ -19537,6 +19584,14 @@ impl PgHandler {
                 // Composites likewise. `typrelid` is the composite's OWN oid
                 // here -- pg_attribute keys its fields on it, and this query
                 // needs no separate pg_class row.
+                let relids: HashMap<i64, i64> = self
+                    .type_catalog_docs(Self::COMPOSITE_COLLECTION)
+                    .ok()?
+                    .iter()
+                    .filter_map(|d| {
+                        Some((d.get("oid").and_then(bson_i64)?, Self::composite_relid(d)?))
+                    })
+                    .collect();
                 for (name, oid, _) in self.composites().ok()? {
                     let mut d = Document::new();
                     d.insert(def.field_of("typname").expect("column"), name);
@@ -19547,7 +19602,7 @@ impl PgHandler {
                     );
                     d.insert(def.field_of("typdelim").expect("column"), ",");
                     if let Some(f) = def.field_of("typrelid") {
-                        d.insert(f, Bson::Int64(oid));
+                        d.insert(f, Bson::Int64(relids.get(&oid).copied().unwrap_or(oid)));
                     }
                     rows.push(d);
                 }
@@ -21187,13 +21242,21 @@ impl PgHandler {
                 let mut rows: Vec<Document> = Vec::new();
                 // A domain's CHECKs: `contypid` names the domain, `conrelid`
                 // is 0.
-                for (oid, conname, type_oid, _, text) in self.domain_constraints() {
+                // Its namespace is its domain's (RP-221).
+                let spaces = self.namespaces();
+                for (oid, conname, type_oid, domain, text) in self.domain_constraints() {
+                    let (schema, _) = secantus_pgplan::schemas::split_key(&domain);
                     let mut d = Document::new();
                     d.insert(field("oid"), Bson::Int64(oid));
                     d.insert(field("conname"), conname);
                     d.insert(
                         field("connamespace"),
-                        Bson::Int64(Self::PUBLIC_NAMESPACE_OID),
+                        Bson::Int64(
+                            spaces
+                                .iter()
+                                .find(|(n, _)| *n == schema)
+                                .map_or(Self::PUBLIC_NAMESPACE_OID, |(_, o)| *o),
+                        ),
                     );
                     d.insert(field("contype"), "c");
                     d.insert(field("condeferrable"), Bson::Boolean(false));
@@ -27464,6 +27527,15 @@ impl PgHandler {
         if name == "pg_describe_object" {
             return self.within_block(|| self.describe_object_call(args));
         }
+        if name == "pg_identify_object" {
+            return self.within_block(|| self.identify_object_call(args));
+        }
+        if name == "pg_identify_object_as_address" {
+            return self.within_block(|| self.identify_object_as_address_call(args));
+        }
+        if name == "pg_get_object_address" {
+            return self.within_block(|| self.object_address_call(args));
+        }
         if objaddr::VISIBILITY_FUNCTIONS.contains(&name) {
             return self.is_visible_call(name, args);
         }
@@ -27644,16 +27716,22 @@ impl PgHandler {
     /// the planner makes into the executor.
     fn to_plan_error(e: PgWireError) -> PlanError {
         match e {
-            // A CONTEXT stack (an error raised inside a PL/pgSQL body)
-            // rides after the message, as DETAIL / HINT lines do, and
-            // `err` splits it back out.
-            PgWireError::UserError(info) => PlanError::Sqlstate(
-                Box::leak(info.code.clone().into_boxed_str()),
-                match &info.where_context {
-                    Some(c) => format!("{}\nContext: {c}", info.message),
-                    None => info.message.clone(),
-                },
-            ),
+            // Its DETAIL, HINT and CONTEXT (an error raised inside a
+            // PL/pgSQL body) ride after the message, and `err` splits them
+            // back out.
+            PgWireError::UserError(info) => {
+                let mut text = info.message.clone();
+                if let Some(d) = &info.detail {
+                    text.push_str(&format!("\nDetail: {d}"));
+                }
+                if let Some(h) = &info.hint {
+                    text.push_str(&format!("\nHint: {h}"));
+                }
+                if let Some(c) = &info.where_context {
+                    text.push_str(&format!("\nContext: {c}"));
+                }
+                PlanError::Sqlstate(Box::leak(info.code.clone().into_boxed_str()), text)
+            }
             other => PlanError::Internal(other.to_string()),
         }
     }
@@ -34665,6 +34743,7 @@ impl PgHandler {
                 // `relation` so DROP TYPE refuses it and DROP TABLE takes it.
                 self.ensure_collection(Self::COMPOSITE_COLLECTION)?;
                 self.ensure_collection(Self::ENUM_META_COLLECTION)?;
+                let relid = self.mint_composite_oid()?;
                 let oid = self.mint_composite_oid()?;
                 let (field_docs, widths) = Self::row_type_fields(&def);
                 let row_type = bson::doc! {
@@ -34674,6 +34753,7 @@ impl PgHandler {
                     "fields": field_docs,
                     "widths": widths,
                     "oid": oid,
+                    "relid": relid,
                     "relation": true,
                 };
                 let bytes = encode_doc(&row_type)
@@ -34687,7 +34767,7 @@ impl PgHandler {
                 // Remember it for the rest of this transaction: the catalog row
                 // above is not committed yet, so a plain read cannot see it.
                 let name = def.name.clone();
-                self.note_uncommitted(&name, Some(Self::with_column_sources(def, Some(oid))));
+                self.note_uncommitted(&name, Some(Self::with_column_sources(def, Some(relid))));
                 Ok(vec![Response::Execution(Tag::new("CREATE TABLE"))])
             }
 
@@ -48899,4 +48979,28 @@ fn split_top_level_commas(text: &str) -> Vec<String> {
         out.push(current.trim().to_string());
     }
     out
+}
+
+/// A built-in relation's `relkind`, from this server's `pg_class`: `r` for a
+/// catalog table, `v` for a system view.
+fn system_catalog_kind(h: &PgHandler, name: &str) -> Option<(String, i64)> {
+    let row = h
+        .run_sql_rows(
+            &format!(
+                "select relkind::text, oid::int8 from pg_catalog.pg_class where relname = {} \
+                 and relnamespace in (11, 13679) and oid < 16384",
+                secantus_pgplan::scalar::quote_literal(name)
+            ),
+            &[],
+        )
+        .ok()?
+        .into_iter()
+        .next()?;
+    let kind = row.first()?.as_str()?.to_string();
+    let oid = match row.get(1)? {
+        Bson::Int64(v) => *v,
+        Bson::Int32(v) => i64::from(*v),
+        _ => return None,
+    };
+    Some((kind, oid))
 }

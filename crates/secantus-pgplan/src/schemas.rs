@@ -824,6 +824,22 @@ fn qualify_elts(elts: &mut [pg_query::protobuf::Node], ctes: &[String], trivial:
     }
 }
 
+/// The tables a `CREATE` / `ALTER PUBLICATION` names.
+fn qualify_publication_tables(
+    objects: &mut [pg_query::protobuf::Node],
+    ctes: &[String],
+    trivial: bool,
+) {
+    for o in objects {
+        if let Some(N::PublicationObjSpec(spec)) = o.node.as_mut() {
+            if let Some(r) = spec.pubtable.as_mut().and_then(|t| t.relation.as_mut()) {
+                qualify_reference(r, ctes, trivial);
+                drop_added_alias(r);
+            }
+        }
+    }
+}
+
 /// Strip an explicit no-alias marker we added on a target that takes none.
 fn drop_added_alias(r: &mut RangeVar) {
     if r.alias
@@ -986,6 +1002,34 @@ pub fn qualify(node: &mut N) -> Result<()> {
             if let Some(r) = i.relation.as_mut() {
                 drop_added_alias(r);
             }
+        }
+        // A policy's, a statistics object's and a publication's table: the
+        // walk does not reach them, and a bare name searched only `public`.
+        N::CreatePolicyStmt(c) => {
+            if let Some(r) = c.table.as_mut() {
+                qualify_reference(r, &ctes, trivial);
+                drop_added_alias(r);
+            }
+        }
+        N::AlterPolicyStmt(a) => {
+            if let Some(r) = a.table.as_mut() {
+                qualify_reference(r, &ctes, trivial);
+                drop_added_alias(r);
+            }
+        }
+        N::CreateStatsStmt(st) => {
+            for r in &mut st.relations {
+                if let Some(N::RangeVar(r)) = r.node.as_mut() {
+                    qualify_reference(r, &ctes, trivial);
+                    drop_added_alias(r);
+                }
+            }
+        }
+        N::CreatePublicationStmt(pb) => {
+            qualify_publication_tables(&mut pb.pubobjects, &ctes, trivial)
+        }
+        N::AlterPublicationStmt(pb) => {
+            qualify_publication_tables(&mut pb.pubobjects, &ctes, trivial)
         }
         N::TruncateStmt(t) => {
             for r in &mut t.relations {
@@ -1151,7 +1195,12 @@ fn node_mentions_schema(node: &N) -> bool {
         | N::CreateSeqStmt(_)
         | N::ViewStmt(_)
         | N::CreateTableAsStmt(_) => true,
-        N::AlterTableStmt(_) => true,
+        N::AlterTableStmt(_)
+        | N::CreatePolicyStmt(_)
+        | N::AlterPolicyStmt(_)
+        | N::CreateStatsStmt(_)
+        | N::CreatePublicationStmt(_)
+        | N::AlterPublicationStmt(_) => true,
         _ => false,
     }
 }

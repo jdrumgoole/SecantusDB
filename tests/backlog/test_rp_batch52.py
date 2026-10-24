@@ -83,7 +83,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "pg_depend of a table and its row type": (
         "RP-205",
-        True,
+        False,
         [
             "begin",
             "create table rp52_d (a int default 1, constraint rp52_dc check (a > 0))",
@@ -166,7 +166,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "a system catalog's size": (
         "RP-214",
-        True,
+        False,
         [
             "select pg_relation_size(1259) is not null, pg_relation_size('pg_class') > 0, "
             "pg_total_relation_size('pg_class') > 0",

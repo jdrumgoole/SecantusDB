@@ -39,9 +39,3 @@ during an extended-protocol Parse is no longer lost.
   parse tree holds about 160 bytes per byte of text, and each distinct
   200,000-item `IN` list left 200 MB resident, never released (measured:
   1.3 GB to 2.2 GB over five statements). It now stays near 930 MB.
-
-#### Known
-
-- RP-214, filed: a system catalog's `pg_relation_size` is NULL by oid and
-  0 by name. PostgreSQL answers its heap size. Which model to use is a
-  decision.

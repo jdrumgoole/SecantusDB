@@ -76,6 +76,16 @@ const BUILTIN_RECORD_SRFS: &[(&str, &[&str])] = &[
         "pg_get_keywords",
         &["word", "catcode", "barelabel", "catdesc", "baredesc"],
     ),
+    // One record each, answered by the executor (`(f(...)).*` is its row).
+    (
+        "pg_identify_object",
+        &["type", "schema", "name", "identity"],
+    ),
+    (
+        "pg_identify_object_as_address",
+        &["type", "object_names", "object_args"],
+    ),
+    ("pg_get_object_address", &["classid", "objid", "objsubid"]),
 ];
 
 fn srf_kind(n: &Node) -> Option<Kind> {

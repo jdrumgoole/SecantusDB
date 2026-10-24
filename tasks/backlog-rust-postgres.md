@@ -778,6 +778,22 @@ fixed in the same batch; their tests there are regression tests.
       Backlog-ID: RP-137
       Verify: tests/backlog/test_rp_batch30.py::test_scenario[DROP ROLE lists dependents in creation order], tests/backlog/test_rp_batch31.py::test_scenario[DROP SCHEMA lists its members in creation order]
 
+## Found by batch 54 (2026-10-24)
+
+Found while building `pg_identify_object` and its siblings (RP-199), and
+fixed in the same batch; their tests in `tests/backlog/test_rp_batch54.py`
+are regression tests. RP-217: `CREATE POLICY`, `ALTER POLICY`, `CREATE
+STATISTICS` and `CREATE` / `ALTER PUBLICATION` read a table in another
+schema as `public`'s (42P01), and a statistics object was always in
+`public`. RP-218: a `regprocedure` with a schema-qualified argument type
+(`textlen(pg_catalog.text)`) was 42883. RP-219: `to_regoper` and
+`to_regoperator` were refused. RP-220: `x.*` over a function in FROM was
+refused. RP-221: a domain constraint's `connamespace` was `public`'s.
+RP-222: an unnamed `CREATE STATISTICS` (PostgreSQL 16's) was accepted, and
+`IS JSON`'s syntax error did not quote the token as written. RP-223:
+`pg_options_to_table('{a=1,b=2}')`, an untyped array literal, listed no
+options.
+
 ## Found by batch 52 (2026-10-24)
 
 Found while building `pg_describe_object` (RP-199) and RP-200. The gap
@@ -800,27 +816,6 @@ tests are regression tests.
       does not build.
       Backlog-ID: RP-203
       Verify: tests/backlog/test_rp_batch51.py::test_scenario[a rule's node trees]
-- [ ] **A table's row type has the table's oid.** PostgreSQL 15.19 gives
-      the row type an oid of its own (`pg_class.reltype`); here they are
-      one number, so `pg_depend` rows about the type read as rows about the
-      relation (`type t[]` appears among what depends on table `t`).
-      Backlog-ID: RP-205
-      Verify: tests/backlog/test_rp_batch52.py::test_scenario[pg_depend of a table and its row type]
-- [ ] **A system catalog has no size.** `pg_relation_size(1259)` is NULL
-      here and `pg_relation_size('pg_class')` 0; PostgreSQL 15.19 answers
-      each catalog's heap size (114688 for `pg_class` on the private 15.19
-      reference cluster), `pg_total_relation_size` with its indexes and TOAST. A user
-      table's size comes from the heap model (batch 48); a catalog here is
-      computed from the store, with no heap to measure.
-      **Decision needed (2026-10-24):** PostgreSQL's numbers depend on each
-      cluster's churn (dead tuples, the catalog's own updates), so no rule
-      reproduces them. Options: (a) measure each catalog's rows through the
-      heap model as a fresh `initdb` would lay them out -- the mechanism,
-      but not PostgreSQL's bytes; (b) a fresh 15.19 cluster's sizes, dumped,
-      for the catalogs a database's own objects do not grow, and (a) for
-      the rest; (c) leave NULL, which reads as "no such relation".
-      Backlog-ID: RP-214
-      Verify: tests/backlog/test_rp_batch52.py::test_scenario[a system catalog's size]
 
 ## Found by batch 51 (2026-10-23)
 
@@ -831,18 +826,6 @@ NULL for a database's or role's comment) was found and fixed in the same
 batch, and RP-200 (a block's own index definitions) in batch 52; their
 tests there are regression tests.
 
-- [ ] **`pg_identify_object`, `pg_identify_object_as_address` and
-      `pg_get_object_address` are refused** (`function
-      pg_identify_object(regclass, regclass, integer) is not supported
-      yet`). PostgreSQL 15.19 identifies any object by `(classid, objid,
-      objsubid)` as a record (`(table,pg_catalog,pg_class,pg_catalog.pg_class)`)
-      and resolves `(type, names, args)` back to one. `pg_describe_object` is
-      served since batch 52 (`objaddr.rs`); these need
-      `getObjectTypeDescription`, `getObjectIdentityParts` and
-      `get_object_address`, each a switch over every catalog, and their
-      record results.
-      Backlog-ID: RP-199
-      Verify: tests/backlog/test_rp_batch51.py::test_scenario[pg_identify_object and its siblings]
 - [ ] **A cancel while a huge statement is planned waits for the pass it
       lands in.** Planning a statement with a 200,000-item `IN` list runs
       for about a second in a debug build, as a sequence of passes over the

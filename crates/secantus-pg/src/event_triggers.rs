@@ -709,8 +709,12 @@ impl PgHandler {
             }
             Statement::Catalog(secantus_pgplan::catalog_stmts::CatalogOp::CreateStatistics {
                 name,
+                schema,
                 ..
-            }) => vec![("statistics object", format!("public.{}", ident(name)))],
+            }) => vec![(
+                "statistics object",
+                format!("{}.{}", ident(schema), ident(name)),
+            )],
             Statement::Catalog(secantus_pgplan::catalog_stmts::CatalogOp::CreatePublication {
                 name,
                 ..
