@@ -834,6 +834,7 @@ impl PgHandler {
                 .map(|(i, (_, ctid))| (&rows[*i].1, rows[*i].0.as_ref(), *ctid))
                 .collect();
             self.btree_insert_versions(&heap_table, &indexed)?;
+            self.hash_insert_versions(&heap_table, &indexed)?;
             // The versions this transaction made, for others' conflicts
             // out: each new one, and each old one it deleted.
             for (i, ctid) in idx.iter().zip(&ctids) {

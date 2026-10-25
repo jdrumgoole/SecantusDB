@@ -142,6 +142,15 @@ impl IndexShape {
 
     /// Is it partial, or over an expression? (A scan of it the SSI model
     /// does not follow.)
+    /// A partial index's predicate as a storage filter, when it is no more
+    /// than that (no computed part, and every field typed).
+    pub(crate) fn plain_predicate(&self) -> Option<&Document> {
+        if self.computed.is_some() || !self.types.iter().all(Option::is_some) {
+            return None;
+        }
+        self.predicate.as_ref()
+    }
+
     pub(crate) fn is_plain(&self) -> bool {
         self.predicate.is_none()
             && self.computed.is_none()
@@ -645,6 +654,15 @@ impl PgHandler {
     /// built over the rows and recorded: CREATE INDEX, CREATE TABLE's and
     /// ALTER TABLE's constraints.
     pub(crate) fn btree_built(&self, table: &str, before: &[String]) -> PgWireResult<()> {
+        let new_hash: Vec<String> = self
+            .hash_shapes(table)
+            .into_iter()
+            .map(|s| s.name)
+            .filter(|n| !before.contains(n))
+            .collect();
+        if !new_hash.is_empty() {
+            self.hash_built(table, Some(&new_hash));
+        }
         let new: Vec<String> = self
             .btree_names(table)
             .into_iter()
@@ -656,14 +674,24 @@ impl PgHandler {
         self.btree_build_record(table, Some(&new))
     }
 
+    /// The indexes of `table` with a page model: its B-trees, then its
+    /// hash indexes (`btree_built`'s `before`).
+    pub(crate) fn index_model_names(&self, table: &str) -> Vec<String> {
+        let mut names = self.btree_names(table);
+        names.extend(self.hash_shapes(table).into_iter().map(|s| s.name));
+        names
+    }
+
     /// Every B-tree of `table` rebuilt and recorded: a rewrite of its heap
     /// (VACUUM FULL, CLUSTER, an ALTER that rewrites) reindexes it.
     pub(crate) fn btree_reindex(&self, table: &str) -> PgWireResult<()> {
+        self.hash_built(table, None);
         self.btree_build_record(table, None)
     }
 
     /// REINDEX INDEX: that B-tree rebuilt and recorded.
     pub(crate) fn btree_reindex_one(&self, table: &str, index: &str) -> PgWireResult<()> {
+        self.hash_built(table, Some(&[index.to_string()]));
         self.btree_build_record(table, Some(&[index.to_string()]))
     }
 
@@ -671,6 +699,7 @@ impl PgHandler {
     /// recording nothing: its heap was rewritten, so the saved pages and the
     /// ones in memory are both of the old one.
     pub(crate) fn btree_rebuild_models(&self, table: &str) -> PgWireResult<()> {
+        self.hash_built(table, None);
         for shape in self.btree_shapes(table) {
             let built = BTree::build(&*shape, self.btree_entries(table, &shape)?);
             models()
@@ -685,6 +714,7 @@ impl PgHandler {
     /// (0 pages, -1 tuples, measured on 15.19).
     pub(crate) fn btree_truncated(&self, table: &str) -> PgWireResult<()> {
         self.btree_rebuild_models(table)?;
+        self.hash_truncated(table);
         for name in self.btree_names(table) {
             self.record_index_size(table, &name, 0, -1.0)?;
         }
@@ -726,6 +756,7 @@ impl PgHandler {
         if dead.is_empty() {
             return Ok(out);
         }
+        self.hash_bulk_delete(table);
         for shape in self.btree_shapes(table) {
             let (pages, tuples) = self.with_btree(table, &shape, |t| {
                 t.bulk_delete(&*shape, &|c| dead.contains(&c));

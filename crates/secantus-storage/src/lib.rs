@@ -13503,7 +13503,9 @@ impl Storage {
         // then the collection lock — see `lock`'s ordering rules).
         let ns_lock = self.coll_lock(db, coll);
         let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let session = self.conn.open_session()?;
+        // Inside a user transaction it is that transaction's write, undone
+        // with it (the PostgreSQL server's ALTER INDEX ... SET).
+        let session = self.op_session()?;
         let cur = session.open_cursor(IDX_TABLE, None)?;
         cur.set_key_sss(db, coll, name);
         match cur.search() {

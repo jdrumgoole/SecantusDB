@@ -88,22 +88,30 @@ def test_ssi_spec(name: str, rust_pg: Any) -> None:
     _check(name, rust_pg)
 
 
-@pytest.mark.backlog("RP-253")
+@pytest.mark.backlog_fixed("RP-253")
 def test_ssi_partial_index(rust_pg: Any) -> None:
     """PostgreSQL 15.19 reads `val2 = 1` through a partial index's bitmap
     scan and `id = 10` through its index scan, so SSI locks those index
-    pages, not the whole table: three permutations commit here that fail
-    there, or the reverse."""
+    pages, not the whole table: a transaction is doomed as it is there,
+    at its read rather than at the other's commit."""
     _check("partial-index", rust_pg)
 
 
 @pytest.mark.backlog("RP-254")
-@pytest.mark.parametrize("name", ["predicate-gin", "predicate-gist", "predicate-hash"])
+@pytest.mark.parametrize("name", ["predicate-gin", "predicate-gist"])
 def test_ssi_index_access_methods(name: str, rust_pg: Any) -> None:
-    """PostgreSQL 15.19's GIN, GiST and hash indexes take SIREAD locks on
-    the index pages a scan reads, so two transactions writing far apart in
-    the index both commit."""
+    """PostgreSQL 15.19's GIN and GiST indexes take SIREAD locks on the
+    index pages a scan reads, so two transactions writing far apart in the
+    index both commit."""
     _check(name, rust_pg)
+
+
+@pytest.mark.backlog_fixed("RP-254")
+def test_ssi_hash_index(rust_pg: Any) -> None:
+    """PostgreSQL 15.19's hash index locks the primary page of each bucket
+    a scan reads and checks it on insert, so transactions on keys in other
+    buckets both commit (`predicate-hash`)."""
+    _check("predicate-hash", rust_pg)
 
 
 @pytest.mark.backlog_fixed("RP-255")

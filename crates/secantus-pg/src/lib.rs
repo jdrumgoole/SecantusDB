@@ -67,6 +67,7 @@ mod fdw;
 mod fsm;
 mod grace_join;
 mod guc_values;
+mod hash_index;
 mod hba;
 mod heap;
 mod heap_page;
@@ -725,7 +726,7 @@ type CompositeFields = Vec<(String, String)>;
 type EnumWithSchema = (String, String, i64, Vec<String>);
 
 /// A table as the planner estimates it (`PgHandler::planner_table`).
-struct PlannerTable {
+pub(crate) struct PlannerTable {
     def: secantus_pgcatalog::TableDef,
     /// The stored fields unique on their own.
     unique: Vec<String>,
@@ -4117,6 +4118,10 @@ struct Savepoint {
     /// Table -> its documents when this savepoint was established, or `None`
     /// when the table did not exist then (so rolling back DROPS it).
     tables: HashMap<String, Option<Vec<Vec<u8>>>>,
+    /// Table -> its storage indexes' definitions (`list_indexes`) when this
+    /// savepoint was established: what a ROLLBACK TO puts back, as the
+    /// subtransaction's abort undoes an index's CREATE, DROP or ALTER.
+    indexes: HashMap<String, Vec<Document>>,
     /// The uncommitted-DDL map as it was, so a table created after this
     /// savepoint stops being visible when it is rolled back.
     uncommitted: HashMap<String, Option<TableDef>>,
@@ -8339,30 +8344,46 @@ impl PgHandler {
     /// The B-tree indexes PostgreSQL would have on `table`, for the cost
     /// model: the primary key, each UNIQUE constraint and each index, by
     /// leading column, sized for `entries` rows (`costsize::btree_size`).
+    /// A column's average width as the planner takes it
+    /// (`get_attavgwidth` with no statistics: `get_typavgwidth`).
+    pub(crate) fn column_width(def: &secantus_pgcatalog::TableDef, field: &str) -> i64 {
+        def.columns
+            .iter()
+            .find(|c| c.field() == field)
+            .map(|c| {
+                let typlen = secantus_pgplan::pgtypes::oid_of_name(&c.pg_type)
+                    .and_then(|oid| pg_type_facts::builtin(oid, "typlen"))
+                    .and_then(|v| match v {
+                        Bson::Int32(n) => Some(i64::from(n)),
+                        Bson::Int64(n) => Some(n),
+                        _ => None,
+                    })
+                    .unwrap_or(-1);
+                secantus_pgplan::hashagg::type_avg_width(&c.pg_type, c.typmod, typlen)
+            })
+            .unwrap_or(32)
+    }
+
     fn cost_indexes(
         &self,
         table: &str,
         def: &secantus_pgcatalog::TableDef,
         entries: u64,
     ) -> Vec<secantus_pgplan::costsize::Index> {
+        self.cost_indexes_with(table, def, entries, true)
+    }
+
+    /// [`Self::cost_indexes`], leaving out the partial indexes (an SQL
+    /// predicate's) unless `partial`.
+    pub(crate) fn cost_indexes_with(
+        &self,
+        table: &str,
+        def: &secantus_pgcatalog::TableDef,
+        entries: u64,
+        partial: bool,
+    ) -> Vec<secantus_pgplan::costsize::Index> {
         use secantus_pgplan::costsize;
-        let width = |field: &str| {
-            def.columns
-                .iter()
-                .find(|c| c.field() == field)
-                .map(|c| {
-                    let typlen = secantus_pgplan::pgtypes::oid_of_name(&c.pg_type)
-                        .and_then(|oid| pg_type_facts::builtin(oid, "typlen"))
-                        .and_then(|v| match v {
-                            Bson::Int32(n) => Some(i64::from(n)),
-                            Bson::Int64(n) => Some(n),
-                            _ => None,
-                        })
-                        .unwrap_or(-1);
-                    secantus_pgplan::hashagg::type_avg_width(&c.pg_type, c.typmod, typlen)
-                })
-                .unwrap_or(32)
-        };
+        let width = |field: &str| Self::column_width(def, field);
         let mut out: Vec<costsize::Index> = Vec::new();
         let mut add = |fields: Vec<String>, unique: bool| {
             let Some(first) = fields.first().cloned() else {
@@ -8378,6 +8399,9 @@ impl PgHandler {
                 columns: fields.clone(),
                 correlation: 0.0,
                 visible: 0.0,
+                tuples: None,
+                predicate: None,
+                hash: false,
             });
         };
         let pk: Vec<String> = def
@@ -8406,6 +8430,20 @@ impl PgHandler {
                 .and_then(|o| o.get_bool("unique").ok())
                 .or_else(|| ix.get_bool("unique").ok())
                 .unwrap_or(false);
+            let sql_predicate = ix.contains_key("sqlPredicate")
+                || ix
+                    .get_document("options")
+                    .is_ok_and(|o| o.contains_key("sqlPredicate"));
+            // Without `partial` (SSI's scan choice), only full B-trees: the
+            // other kinds are costed as what they are by the caller.
+            let method = ix.get_str("sqlMethod").ok().or_else(|| {
+                ix.get_document("options")
+                    .ok()
+                    .and_then(|o| o.get_str("sqlMethod").ok())
+            });
+            if !partial && (sql_predicate || method.is_some_and(|m| m != "btree")) {
+                continue;
+            }
             if let Ok(key) = ix.get_document("key") {
                 add(key.keys().cloned().collect(), unique);
             }
@@ -11690,10 +11728,55 @@ impl PgHandler {
         if ix.get_bool("sqlNullsNotDistinct").unwrap_or(false) {
             out.push_str(" NULLS NOT DISTINCT");
         }
+        if let Some(with) = Self::reloptions_clause(ix) {
+            out.push_str(&with);
+        }
         if let Ok(pred) = ix.get_str("sqlPredicate") {
             out.push_str(&format!(" WHERE {pred}"));
         }
         Some(out)
+    }
+
+    /// An index's ` WITH (...)` as `flatten_reloptions` prints it: a value
+    /// is bare when `quote_identifier` would leave it so, else a literal.
+    fn reloptions_clause(ix: &Document) -> Option<String> {
+        let options = ix.get_array("sqlReloptions").ok().or_else(|| {
+            ix.get_document("options")
+                .ok()?
+                .get_array("sqlReloptions")
+                .ok()
+        })?;
+        let parts: Vec<String> = options
+            .iter()
+            .filter_map(Bson::as_str)
+            .map(|o| {
+                let (name, value) = o.split_once('=').unwrap_or((o, ""));
+                let quoted = secantus_pgplan::scalar::quote_identifier(value);
+                let value = if quoted == value {
+                    value.to_string()
+                } else {
+                    format!("'{}'", value.replace('\'', "''"))
+                };
+                format!(
+                    "{}={value}",
+                    secantus_pgplan::scalar::quote_identifier(name)
+                )
+            })
+            .collect();
+        (!parts.is_empty()).then(|| format!(" WITH ({})", parts.join(", ")))
+    }
+
+    /// An index's `pg_class.reloptions`, NULL when it has none.
+    fn index_reloptions(ix: &Document) -> Bson {
+        let options = ix.get_array("sqlReloptions").ok().or_else(|| {
+            ix.get_document("options")
+                .ok()
+                .and_then(|o| o.get_array("sqlReloptions").ok())
+        });
+        match options {
+            Some(a) if !a.is_empty() => Bson::Array(a.clone()),
+            _ => Bson::Null,
+        }
     }
 
     /// The stored `LANGUAGE sql` / `plpgsql` function documents.
@@ -13849,6 +13932,9 @@ impl PgHandler {
         if ci.method != "btree" {
             options.insert("sqlMethod", ci.method.as_str());
         }
+        if !ci.options.is_empty() {
+            options.insert("sqlReloptions", ci.options.clone());
+        }
         if !ci.include.is_empty() {
             options.insert("include", ci.include.clone());
         }
@@ -14590,6 +14676,9 @@ impl PgHandler {
         }
         if ci.method != "btree" {
             options.insert("sqlMethod", ci.method.as_str());
+        }
+        if !ci.options.is_empty() {
+            options.insert("sqlReloptions", ci.options.clone());
         }
         if ci.key_sql.iter().any(|k| {
             k.contains(" NULLS ")
@@ -19700,6 +19789,7 @@ impl PgHandler {
                     }
                     rows.push(d);
                 }
+                let mut stored_indexes: HashMap<String, Vec<Document>> = HashMap::new();
                 for ix in &indexes {
                     let mut d = Document::new();
                     d.insert(f("oid"), Bson::Int64(ix.oid));
@@ -19738,6 +19828,23 @@ impl PgHandler {
                     d.insert(f("relforcerowsecurity"), false);
                     d.insert(f("relispartition"), false);
                     d.insert(f("relpartbound"), Bson::Null);
+                    // `WITH (...)` / `ALTER INDEX ... SET (...)`'s options.
+                    if let Some(field) = def.field_of("reloptions") {
+                        let stored =
+                            stored_indexes
+                                .entry(ix.table.name.clone())
+                                .or_insert_with(|| {
+                                    self.storage
+                                        .list_indexes(self.db(), &ix.table.name)
+                                        .unwrap_or_default()
+                                });
+                        if let Some(sd) = stored
+                            .iter()
+                            .find(|d| d.get_str("name") == Ok(ix.name.as_str()))
+                        {
+                            d.insert(field, Self::index_reloptions(sd));
+                        }
+                    }
                     rows.push(d);
                 }
                 // A sequence is a relation too, and `relkind` is how a client
@@ -22390,7 +22497,11 @@ impl PgHandler {
             let pos = match e {
                 PlanError::UndefinedTable(name) => {
                     let _ = secantus_pgplan::take_error_location();
-                    secantus_pgplan::identifier_position(sql, name)
+                    if secantus_pgplan::alter_finds_relation_by_name(sql) {
+                        None
+                    } else {
+                        secantus_pgplan::identifier_position(sql, name)
+                    }
                 }
                 _ => secantus_pgplan::error_position(sql, e.sqlstate(), &e.to_string()),
             };
@@ -26389,6 +26500,43 @@ impl PgHandler {
             wanted.sort();
             wanted.dedup();
         }
+        // The indexes of every table written, and of the table an index's
+        // own DDL names (which `written_tables` cannot resolve).
+        let mut index_tables = wanted.clone();
+        // Inside the block: an index it made itself is found too.
+        index_tables.extend(self.in_open_transaction(|| Ok(self.index_ddl_tables(stmt)))?);
+        index_tables.sort();
+        index_tables.dedup();
+        let index_wanted = {
+            let savepoints = self.savepoints.lock().unwrap_or_else(|e| e.into_inner());
+            index_tables
+                .into_iter()
+                .filter(|t| savepoints.iter().any(|sp| !sp.indexes.contains_key(t)))
+                .collect::<Vec<_>>()
+        };
+        let mut index_captured: Vec<(String, Vec<Document>)> = Vec::new();
+        if !index_wanted.is_empty() {
+            self.in_open_transaction(|| {
+                for table in index_wanted {
+                    if !table.starts_with("__") {
+                        let docs = self
+                            .storage
+                            .list_indexes(self.db(), &table)
+                            .unwrap_or_default();
+                        index_captured.push((table, docs));
+                    }
+                }
+                Ok(())
+            })?;
+            let mut savepoints = self.savepoints.lock().unwrap_or_else(|e| e.into_inner());
+            for (table, docs) in &index_captured {
+                for sp in savepoints.iter_mut() {
+                    sp.indexes
+                        .entry(table.clone())
+                        .or_insert_with(|| docs.clone());
+                }
+            }
+        }
         let tables = {
             let savepoints = self.savepoints.lock().unwrap_or_else(|e| e.into_inner());
             // Read what is missing WITHOUT holding the savepoint lock, because
@@ -26423,6 +26571,86 @@ impl PgHandler {
                     .entry(table.clone())
                     .or_insert_with(|| docs.clone());
             }
+        }
+        Ok(())
+    }
+
+    /// The table an index statement's index belongs to (`CREATE INDEX`,
+    /// `DROP INDEX`, `ALTER INDEX ... SET` / `RENAME`), which a savepoint
+    /// captures the index definitions of.
+    fn index_ddl_tables(&self, stmt: &Statement) -> Vec<String> {
+        let of_index = |name: &str| -> Option<String> {
+            let bare = secantus_pgplan::schemas::split_key(name).1;
+            self.index_relations()
+                .into_iter()
+                .find(|ix| ix.name == bare)
+                .map(|ix| ix.table.name)
+        };
+        match stmt {
+            Statement::Sequence(_, stmts) => stmts
+                .iter()
+                .flat_map(|s| self.index_ddl_tables(s))
+                .collect(),
+            Statement::CreateIndex(ci) => vec![ci.table.clone()],
+            Statement::DropIndex { names, .. } => {
+                names.iter().filter_map(|n| of_index(n)).collect()
+            }
+            Statement::AlterIndexOptions { index, .. } => of_index(index).into_iter().collect(),
+            Statement::RenameObject { kind, target, .. } if kind == "index" => {
+                of_index(target).into_iter().collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Put `table`'s storage indexes back to `saved`: drop the ones made
+    /// since, make again the ones dropped since, and remake one whose
+    /// definition changed. Each is built over the rows as they are now,
+    /// which the rows' own restore has put back first.
+    fn restore_indexes(&self, table: &str, saved: &[Document]) -> PgWireResult<()> {
+        if !self
+            .storage
+            .collection_exists(self.db(), table)
+            .map_err(|e| Self::storage_err("could not check a table", e))?
+        {
+            return Ok(());
+        }
+        let current = self
+            .storage
+            .list_indexes(self.db(), table)
+            .map_err(|e| Self::storage_err("could not read the indexes", e))?;
+        let name_of = |d: &Document| d.get_str("name").unwrap_or_default().to_string();
+        let mut changed = false;
+        for c in &current {
+            let name = name_of(c);
+            if name == "_id_" {
+                continue;
+            }
+            if saved.iter().find(|s| name_of(s) == name) != Some(c) {
+                self.storage
+                    .drop_index(self.db(), table, &name)
+                    .map_err(|e| Self::storage_err("could not roll back an index", e))?;
+                changed = true;
+            }
+        }
+        for s in saved {
+            let name = name_of(s);
+            if name == "_id_" || current.iter().any(|c| c == s) {
+                continue;
+            }
+            let key = s.get_document("key").cloned().unwrap_or_default();
+            let mut options = s.clone();
+            for k in ["name", "key", "v", "ns"] {
+                options.remove(k);
+            }
+            self.storage
+                .create_index(self.db(), table, &name, &key, &options)
+                .map_err(|e| Self::storage_err("could not roll back an index", e))?;
+            changed = true;
+        }
+        if changed {
+            bump_catalog_version();
+            self.btree_rebuild_models(table)?;
         }
         Ok(())
     }
@@ -32518,6 +32746,7 @@ impl PgHandler {
                     .push(Savepoint {
                         name,
                         tables: HashMap::new(),
+                        indexes: HashMap::new(),
                         uncommitted,
                         uncommitted_types,
                         settings: self
@@ -32551,6 +32780,9 @@ impl PgHandler {
                         for (table, docs) in sp.tables {
                             outer.tables.entry(table).or_insert(docs);
                         }
+                        for (table, docs) in sp.indexes {
+                            outer.indexes.entry(table).or_insert(docs);
+                        }
                     }
                 }
                 Ok(vec![Response::Execution(Tag::new("RELEASE"))])
@@ -32560,7 +32792,7 @@ impl PgHandler {
                 // savepoint and the ones nested inside it: that is the state at
                 // the named savepoint, whichever frame happened to capture it.
                 let (
-                    restore,
+                    (restore, restore_indexes),
                     uncommitted,
                     uncommitted_types,
                     saved_settings,
@@ -32583,16 +32815,23 @@ impl PgHandler {
                     let dropped: Vec<Savepoint> = savepoints.split_off(idx + 1);
                     let mut restore: HashMap<String, Option<Vec<Vec<u8>>>> =
                         savepoints[idx].tables.clone();
+                    let mut restore_indexes = savepoints[idx].indexes.clone();
                     for sp in &dropped {
                         for (table, docs) in &sp.tables {
                             restore.entry(table.clone()).or_insert_with(|| docs.clone());
+                        }
+                        for (table, docs) in &sp.indexes {
+                            restore_indexes
+                                .entry(table.clone())
+                                .or_insert_with(|| docs.clone());
                         }
                     }
                     // The savepoint itself stays open, and starts capturing
                     // again from the state just restored.
                     savepoints[idx].tables.clear();
+                    savepoints[idx].indexes.clear();
                     (
-                        restore,
+                        (restore, restore_indexes),
                         uncommitted,
                         uncommitted_types,
                         saved_settings,
@@ -32613,6 +32852,14 @@ impl PgHandler {
                                 continue;
                             }
                             self.restore_table(table, docs.as_ref())?;
+                        }
+                        Ok(())
+                    })?;
+                }
+                if !restore_indexes.is_empty() {
+                    self.in_open_transaction(|| {
+                        for (table, saved) in &restore_indexes {
+                            self.restore_indexes(table, saved)?;
                         }
                         Ok(())
                     })?;
@@ -35025,6 +35272,7 @@ impl PgHandler {
                 "routine" => "ALTER ROUTINE",
                 _ => "ALTER FUNCTION",
             },
+            Statement::AlterIndexOptions { .. } => "ALTER INDEX",
             Statement::RenameObject { kind, .. } => match kind.as_str() {
                 "index" => "ALTER INDEX",
                 "constraint" => "ALTER TABLE",
@@ -37428,6 +37676,11 @@ impl PgHandler {
                 written,
                 ..
             } => self.rename_object(&kind, &target, &sub, &to, missing_ok, &written),
+            Statement::AlterIndexOptions {
+                index,
+                changes,
+                missing_ok,
+            } => self.alter_index_options(&index, &changes, missing_ok),
             Statement::DropFunction {
                 name,
                 arg_types,
@@ -38095,7 +38348,7 @@ impl PgHandler {
                     }
                 }
                 let before = self.lookup(&table).unwrap_or_else(|| def.clone());
-                let indexes_before = self.btree_names(&table);
+                let indexes_before = self.index_model_names(&table);
                 btree::take_rewrote();
                 for action in &effective {
                     self.apply_alter_rows(&table, &def, action, &before)?;
@@ -38492,7 +38745,7 @@ impl PgHandler {
                 );
                 slot.set(0, 1);
                 slot.set(9, 2);
-                let before = self.btree_names(&table);
+                let before = self.index_model_names(&table);
                 let out = self.create_index(ci)?;
                 self.record_relstats(&table, false)?;
                 self.btree_built(&table, &before)?;

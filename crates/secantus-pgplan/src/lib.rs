@@ -127,7 +127,7 @@ pub use funcsig::is_builtin_function_name as is_known_function;
 mod optype;
 mod semijoin;
 mod semijoin_hash;
-pub use errpos::error_position;
+pub use errpos::{alter_finds_relation_by_name, error_position};
 pub use semijoin_hash::{with_fresh_subquery_cache, with_scan_cache, ScanCache};
 pub mod alter_routine;
 pub mod collation;
@@ -757,6 +757,14 @@ pub enum Statement {
         /// The argument types as written, `TypeNameListToString`'s form
         /// (`pg_catalog.int4,text`), for IF EXISTS's notice.
         written_args: Option<String>,
+    },
+    /// `ALTER INDEX [IF EXISTS] i SET (...)` / `RESET (...)`: each change as
+    /// `(reset, name, value)`. The executor checks a value against the
+    /// index's access method once it has found the index.
+    AlterIndexOptions {
+        index: String,
+        changes: Vec<(bool, String, Option<String>)>,
+        missing_ok: bool,
     },
     /// `ALTER INDEX | SEQUENCE | TYPE | DOMAIN | SCHEMA | TRIGGER | RULE ...
     /// RENAME`, `ALTER TABLE ... RENAME CONSTRAINT`, `ALTER TYPE ... RENAME
@@ -3319,6 +3327,10 @@ pub struct CreateIndex {
     /// index holds no storage entries -- its UNIQUE is enforced by the
     /// executor evaluating these.
     pub expressions: Vec<String>,
+    /// `WITH (fillfactor = 70, ...)`: the access method's storage
+    /// parameters, checked, as `pg_class.reloptions` keeps them
+    /// (`name=value`).
+    pub options: Vec<String>,
 }
 
 /// A user-defined function as CREATE FUNCTION declares it.
@@ -6952,6 +6964,54 @@ fn plan_alter_table(
     if a.objtype == ObjectType::ObjectType as i32 {
         return typed_tables::plan_alter_type(a, relation);
     }
+    // `ALTER INDEX ... SET (...)` / `RESET (...)`; its other forms are
+    // refused below.
+    if a.objtype == ObjectType::ObjectIndex as i32 {
+        use pg_query::protobuf::AlterTableType as AT;
+        let mut changes = Vec::new();
+        let mut all_options = !a.cmds.is_empty();
+        for c in &a.cmds {
+            let Some(N::AlterTableCmd(cmd)) = c.node.as_ref() else {
+                all_options = false;
+                break;
+            };
+            let reset = match AT::try_from(cmd.subtype) {
+                Ok(AT::AtSetRelOptions) => false,
+                Ok(AT::AtResetRelOptions) => true,
+                _ => {
+                    all_options = false;
+                    break;
+                }
+            };
+            let Some(N::List(l)) = cmd.def.as_deref().and_then(|d| d.node.as_ref()) else {
+                return Err(Error::Parse("SET without options".into()));
+            };
+            let mut seen: Vec<(String, String)> = Vec::new();
+            for item in &l.items {
+                let Some(N::DefElem(e)) = item.node.as_ref() else {
+                    continue;
+                };
+                if !e.defnamespace.is_empty() {
+                    return Err(Error::InvalidParameter(format!(
+                        "unrecognized parameter namespace \"{}\"",
+                        e.defnamespace
+                    )));
+                }
+                if !reset {
+                    once_each(&mut seen, e)?;
+                }
+                let value = e.arg.as_deref().map(reloption_value_text);
+                changes.push((reset, e.defname.clone(), value));
+            }
+        }
+        if all_options {
+            return Ok(Statement::AlterIndexOptions {
+                index: relation_name(relation),
+                changes,
+                missing_ok: a.missing_ok,
+            });
+        }
+    }
     if a.objtype != ObjectType::ObjectTable as i32 {
         return Err(Error::Unsupported(format!(
             "ALTER {}",
@@ -7417,6 +7477,7 @@ fn plan_alter_action(
                         .collect()
                 })
                 .unwrap_or_default();
+            let mut seen: Vec<(String, String)> = Vec::new();
             for item in &l.items {
                 let Some(N::DefElem(e)) = item.node.as_ref() else {
                     continue;
@@ -7427,6 +7488,7 @@ fn plan_alter_action(
                 let value = e.arg.as_deref().map(reloption_value_text);
                 if !reset {
                     check_reloption(&e.defname, value.as_deref(), toast)?;
+                    once_each(&mut seen, e)?;
                 }
                 if toast {
                     continue;
@@ -7508,6 +7570,115 @@ fn reloption_value_text(n: &pg_query::protobuf::Node) -> String {
     }
 }
 
+/// `parse_one_reloption`'s "specified more than once", per namespace.
+fn once_each(seen: &mut Vec<(String, String)>, e: &pg_query::protobuf::DefElem) -> Result<()> {
+    let key = (e.defnamespace.clone(), e.defname.clone());
+    if seen.contains(&key) {
+        return Err(Error::InvalidParameter(format!(
+            "parameter \"{}\" specified more than once",
+            e.defname
+        )));
+    }
+    seen.push(key);
+    Ok(())
+}
+
+/// An index's `WITH (...)` as `pg_class.reloptions` keeps it, each option
+/// checked against its access method's (`index_reloptions`). An option
+/// with a namespace is refused (`transformRelOptions` allows none for an
+/// index), as is one given twice. A user-defined access method's options
+/// are kept unchecked.
+pub fn index_reloptions(method: &str, items: &[pg_query::protobuf::Node]) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for item in items {
+        let Some(N::DefElem(e)) = item.node.as_ref() else {
+            continue;
+        };
+        if !e.defnamespace.is_empty() {
+            return Err(Error::InvalidParameter(format!(
+                "unrecognized parameter namespace \"{}\"",
+                e.defnamespace
+            )));
+        }
+        let value = e.arg.as_deref().map(reloption_value_text);
+        check_index_reloption(method, &e.defname, value.as_deref())?;
+        once_each(&mut seen, e)?;
+        out.push(format!(
+            "{}={}",
+            e.defname,
+            value.unwrap_or_else(|| "true".into())
+        ));
+    }
+    Ok(out)
+}
+
+/// One storage parameter of an index of access method `method`, as
+/// PostgreSQL 15's `reloptions.c` defines them: B-tree `fillfactor` and
+/// `deduplicate_items`; hash and SP-GiST `fillfactor`; GiST `fillfactor`
+/// and `buffering`; GIN `fastupdate` and `gin_pending_list_limit`; BRIN
+/// `pages_per_range` and `autosummarize`. A bare name is the value `true`.
+pub fn check_index_reloption(method: &str, name: &str, value: Option<&str>) -> Result<()> {
+    let known: &[(&str, char, f64, f64)] = match method {
+        "btree" => &[
+            ("fillfactor", 'i', 10.0, 100.0),
+            ("deduplicate_items", 'b', 0.0, 0.0),
+        ],
+        "hash" | "spgist" => &[("fillfactor", 'i', 10.0, 100.0)],
+        "gist" => &[
+            ("fillfactor", 'i', 10.0, 100.0),
+            ("buffering", 'e', 0.0, 0.0),
+        ],
+        "gin" => &[
+            ("fastupdate", 'b', 0.0, 0.0),
+            ("gin_pending_list_limit", 'i', 64.0, 2147483647.0),
+        ],
+        "brin" => &[
+            ("pages_per_range", 'i', 1.0, 131072.0),
+            ("autosummarize", 'b', 0.0, 0.0),
+        ],
+        _ => return Ok(()),
+    };
+    let Some(&(_, kind, low, high)) = known.iter().find(|(n, ..)| *n == name) else {
+        return Err(Error::InvalidParameter(format!(
+            "unrecognized parameter \"{name}\""
+        )));
+    };
+    let v = value.unwrap_or("true");
+    match kind {
+        'b' => {
+            if !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "t" | "true" | "y" | "yes" | "on" | "1" | "f" | "false" | "n" | "no" | "off" | "0"
+            ) {
+                return Err(Error::InvalidParameter(format!(
+                    "invalid value for boolean option \"{name}\": {v}"
+                )));
+            }
+        }
+        'e' => {
+            if !matches!(v.to_ascii_lowercase().as_str(), "on" | "off" | "auto") {
+                return Err(Error::InvalidParameter(format!(
+                    "invalid value for enum option \"{name}\": {v}\nDetail: Valid values are \"on\", \"off\", and \"auto\"."
+                )));
+            }
+        }
+        _ => {
+            let Some(n) = v.trim().parse::<i64>().ok() else {
+                return Err(Error::InvalidParameter(format!(
+                    "invalid value for integer option \"{name}\": {v}"
+                )));
+            };
+            if (n as f64) < low || (n as f64) > high {
+                return Err(Error::InvalidParameter(format!(
+                    "value {v} out of bounds for option \"{name}\"\nDetail: Valid values are between \"{low}\" and \"{high}\"."
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `parseRelOptions` over a heap's (or its TOAST table's) options: the
 /// name must be one PostgreSQL 15 knows for that kind, and the value of its
 /// type and within its bounds.
@@ -7574,16 +7745,9 @@ fn check_reloption(name: &str, value: Option<&str>, toast: bool) -> Result<()> {
     if toast && HEAP_ONLY.contains(&name) {
         return Err(unknown());
     }
-    let Some(v) = value else {
-        // A bare name is `true` for a boolean, and needs a value otherwise.
-        return if kind == 'b' {
-            Ok(())
-        } else {
-            Err(Error::InvalidParameter(format!(
-                "parameter \"{name}\" specified more than once"
-            )))
-        };
-    };
+    // A bare name is the value `true`, which only a boolean (or the enum
+    // that takes it) accepts.
+    let v = value.unwrap_or("true");
     match kind {
         'b' => {
             if !matches!(
@@ -7601,7 +7765,7 @@ fn check_reloption(name: &str, value: Option<&str>, toast: bool) -> Result<()> {
                 "auto" | "on" | "off" | "true" | "false" | "yes" | "no" | "1" | "0"
             ) {
                 return Err(Error::InvalidParameter(format!(
-                    "invalid value for enum option \"{name}\": {v}"
+                    "invalid value for enum option \"{name}\": {v}\nDetail: Valid values are \"on\", \"off\", and \"auto\"."
                 )));
             }
         }
@@ -7621,10 +7785,14 @@ fn check_reloption(name: &str, value: Option<&str>, toast: bool) -> Result<()> {
                     }
                 )));
             };
-            // (PostgreSQL adds the bounds as a DETAIL.)
             if n < low || n > high {
+                let (lo, hi) = if kind == 'i' {
+                    (format!("{low}"), format!("{high}"))
+                } else {
+                    (format!("{low:.6}"), format!("{high:.6}"))
+                };
                 return Err(Error::InvalidParameter(format!(
-                    "value {v} out of bounds for option \"{name}\""
+                    "value {v} out of bounds for option \"{name}\"\nDetail: Valid values are between \"{lo}\" and \"{hi}\"."
                 )));
             }
         }
@@ -8879,6 +9047,9 @@ fn plan_create_index(
             ))
         }
     }
+    // `DefineIndex`: the access method's options, before any key is
+    // resolved (`transformRelOptions`, then `index_reloptions`).
+    let options = index_reloptions(&method, &i.options)?;
     let ordered = matches!(method.as_str(), "btree");
     let mut columns = Vec::new();
     let mut key_sql = Vec::new();
@@ -9128,6 +9299,7 @@ fn plan_create_index(
         key_sql,
         opclasses,
         expressions,
+        options,
     }))
 }
 
@@ -10541,6 +10713,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     // them, and kept as `pg_class.reloptions` keeps them (a TOAST table's
     // aside, which this server does not keep apart).
     let mut reloptions: Vec<Bson> = Vec::new();
+    let mut seen: Vec<(String, String)> = Vec::new();
     for item in &c.options {
         let Some(N::DefElem(e)) = item.node.as_ref() else {
             continue;
@@ -10548,6 +10721,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
         let toast = e.defnamespace == "toast";
         let value = e.arg.as_deref().map(reloption_value_text);
         check_reloption(&e.defname, value.as_deref(), toast)?;
+        once_each(&mut seen, e)?;
         if !toast {
             reloptions.push(Bson::String(format!(
                 "{}={}",

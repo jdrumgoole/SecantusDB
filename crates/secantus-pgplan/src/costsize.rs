@@ -217,6 +217,17 @@ pub struct Index {
     /// statement reads), the heap's all-visible fraction, whose pages it
     /// does not fetch (`cost_index`); 0 otherwise.
     pub visible: f64,
+    /// `IndexOptInfo.tuples` of a partial index, its own `estimate_rel_size`
+    /// (at most the relation's); `None` is the relation's tuples.
+    pub tuples: Option<f64>,
+    /// A partial index whose predicate the query implies (`predOK`): the
+    /// selectivity of the predicate's clauses its index quals do not imply
+    /// (`add_predicate_to_index_quals`). Such an index serves a scan with
+    /// no index qual at all. `None` for a full index.
+    pub predicate: Option<f64>,
+    /// A hash index (`hashcostestimate`, which is `genericcostestimate`):
+    /// only `=` and `IN` serve it, and it has no B-tree descent to cost.
+    pub hash: bool,
 }
 
 /// How the quals on an index's leading column are estimated: with no
@@ -262,13 +273,21 @@ fn index_cost(
 ) -> Option<(f64, f64, f64)> {
     let iq: Vec<&Qual> = quals
         .iter()
-        .filter(|(f, q)| f == &index.field && q.indexable())
+        .filter(|(f, q)| {
+            f == &index.field
+                && if index.hash {
+                    matches!(q, Qual::Eq | Qual::In(_))
+                } else {
+                    q.indexable()
+                }
+        })
         .map(|(_, q)| q)
         .collect();
-    if iq.is_empty() && !full {
+    if iq.is_empty() && !full && index.predicate.is_none() {
         return None;
     }
-    let sel = colsel.of(&iq);
+    let sel = colsel.of(&iq) * index.predicate.unwrap_or(1.0);
+    let itup = index.tuples.unwrap_or(rel.tuples);
     let mut num_sa = 1.0;
     for q in &iq {
         if let Qual::In(n) = q {
@@ -278,15 +297,16 @@ fn index_cost(
         }
     }
     let saop = iq.iter().any(|q| matches!(q, Qual::In(_)));
-    let unique_eq = index.unique && !saop && iq.iter().any(|q| matches!(q, Qual::Eq));
+    let unique_eq =
+        index.unique && !index.hash && !saop && iq.iter().any(|q| matches!(q, Qual::Eq));
     let mut nit = if unique_eq {
         1.0
     } else {
         (sel * rel.tuples / num_sa).round()
     };
-    nit = nit.min(rel.tuples).max(1.0);
-    let index_pages = if index.pages > 1.0 && rel.tuples > 1.0 {
-        (nit * index.pages / rel.tuples).ceil()
+    nit = nit.min(itup).max(1.0);
+    let index_pages = if index.pages > 1.0 && itup > 1.0 {
+        (nit * index.pages / itup).ceil()
     } else {
         1.0
     };
@@ -298,8 +318,11 @@ fn index_cost(
     let qual_op = CPU_OPERATOR_COST * iq.len() as f64;
     total += nit * num_sa * (CPU_INDEX_TUPLE_COST + qual_op);
     let mut startup = 0.0;
-    if rel.tuples > 1.0 {
-        let descent = rel.tuples.log2().ceil() * CPU_OPERATOR_COST;
+    if index.hash {
+        return Some((startup, total, sel));
+    }
+    if itup > 1.0 {
+        let descent = itup.log2().ceil() * CPU_OPERATOR_COST;
         startup += descent;
         total += descent * num_sa;
     }
@@ -903,10 +926,54 @@ mod tests {
             columns: vec!["k".into()],
             correlation: 0.0,
             visible: 0.0,
+            tuples: None,
+            predicate: None,
+            hash: false,
         }
     }
     fn q(filter: Document) -> Vec<(String, Qual)> {
         conjuncts(&filter).unwrap()
+    }
+
+    /// PostgreSQL 15.19, `partial-index`'s table without ANALYZE: 55 pages
+    /// at 6,600 estimated tuples, and `test_idx on test_t (id) where val2 =
+    /// 1` estimated at 255 tuples over 2 pages (`estimate_rel_size` from its
+    /// widths). `where val2 = 1`: Bitmap Index Scan (0.00..4.31 rows=33),
+    /// Bitmap Heap Scan (4.32..55.10); `where val2 = 1 and id = 10`: Index
+    /// Scan (0.14..8.16 rows=1).
+    #[test]
+    fn a_partial_index_costs_as_postgres_does() {
+        let rel = Rel {
+            pages: 55.0,
+            tuples: 6600.0,
+        };
+        let ix = Index {
+            field: "id".into(),
+            unique: false,
+            columns: vec!["id".into()],
+            pages: 2.0,
+            tuples: Some(255.0),
+            predicate: Some(0.005),
+            ..pkey()
+        };
+        let nd = |_: &str| ColSel::Ndistinct(200.0);
+        let by_val2 = q(bson::doc! {"val2": 1});
+        // Its startup is the descent, which a Bitmap Index Scan's node
+        // reports as 0.
+        let (_, t, sel) = index_cost(&rel, &ix, &by_val2, nd("id"), false).unwrap();
+        assert!(close(t, 4.31) && close(sel * rel.tuples, 33.0), "{t} {sel}");
+        let (s, t) = bitmap_heap_cost(&rel, &ix, &by_val2, nd("id"), 33.0).unwrap();
+        assert!(close(s, 4.32) && close(t, 55.10), "{s} {t}");
+        let both = q(bson::doc! {"val2": 1, "id": 10});
+        let (s, t) = index_scan_cost(&rel, &ix, &both, nd("id")).unwrap();
+        assert!(close(s, 0.14) && close(t, 8.16), "{s} {t}");
+        // A full index serves no scan without a qual of its own.
+        let full = Index {
+            predicate: None,
+            tuples: None,
+            ..ix
+        };
+        assert!(index_cost(&rel, &full, &by_val2, nd("id"), false).is_none());
     }
 
     #[test]
