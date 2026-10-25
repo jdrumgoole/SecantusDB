@@ -9135,12 +9135,10 @@ impl PgHandler {
                 // swapped, so the loop below walks the outer side's rows; a
                 // hash right join keeps the (now right) rows nothing
                 // matched, as a RIGHT join does.
-                // A FULL join whose ON filters its merge or hash past the
-                // equality is not modelled.
-                let full_filtered = *kind == secantus_pgplan::joins::JoinKind::Full && *on_other;
-                let order = if merged.is_empty() && !full_filtered {
+                let order = if merged.is_empty() {
                     self.order_general_join_inputs(
                         *kind,
+                        *on_other,
                         left,
                         right,
                         equi,
@@ -9814,6 +9812,7 @@ impl PgHandler {
     fn order_general_join_inputs(
         &self,
         kind: secantus_pgplan::joins::JoinKind,
+        on_other: bool,
         left: &secantus_pgplan::joins::JoinNode,
         right: &secantus_pgplan::joins::JoinNode,
         equi: &[(String, String)],
@@ -9830,9 +9829,16 @@ impl PgHandler {
             (equi, &[][..])
         };
         use secantus_pgplan::joincost::JoinMethod;
-        if let Some((method, lk, rk, a_rows, b_rows)) =
-            self.general_join_method(kind, left, right, column_equi, expr_keys, ec, limit)
-        {
+        if let Some((method, lk, rk, a_rows, b_rows)) = self.general_join_method(
+            kind,
+            on_other,
+            left,
+            right,
+            column_equi,
+            expr_keys,
+            ec,
+            limit,
+        ) {
             // A hash full join: the probes' matches and the hashed rows
             // nothing matched both in the hash table's order.
             if method == JoinMethod::HashFullA {
@@ -9886,6 +9892,7 @@ impl PgHandler {
     pub(crate) fn general_join_method(
         &self,
         kind: secantus_pgplan::joins::JoinKind,
+        on_other: bool,
         left: &secantus_pgplan::joins::JoinNode,
         right: &secantus_pgplan::joins::JoinNode,
         equi: &[(String, String)],
@@ -9961,7 +9968,7 @@ impl PgHandler {
         };
         let limit = limit.map(|n| n as f64);
         let method = if full {
-            secantus_pgplan::joincost::cheapest_full_join(&a, &b, limit)
+            secantus_pgplan::joincost::cheapest_full_join(&a, &b, limit, !on_other)
         } else if cross {
             secantus_pgplan::joincost::cheapest_cross_join(&a, &b, limit)
         } else {
@@ -51580,7 +51587,7 @@ pub(crate) enum GeneralOrder {
 /// past every outer key come after them; an inner one once the outer key
 /// passes `inner_max`, the inner side's greatest key (all of them first
 /// when it has none), else at the end.
-fn merge_full_place(
+pub(crate) fn merge_full_place(
     main: Vec<Document>,
     tail: Vec<Document>,
     outer_key: &str,

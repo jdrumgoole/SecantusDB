@@ -1082,12 +1082,69 @@ fn build_join(
         .rarg
         .as_deref()
         .ok_or_else(|| Error::Parse("JOIN without a right side".into()))?;
-    let (left, lscope) = build(larg, lookup, params, aliases, outer_left)?;
+    // `reduce_outer_joins` passes down what this join's ON proves non-NULL
+    // (a qualified column a strict conjunct reads): an inner join's to both
+    // its sides, a LEFT join's to its nullable side and a RIGHT join's to
+    // its own, a FULL join's to neither. A NULL-extended row there never
+    // passes the ON, so an outer join below with that table on its
+    // nullable side is reduced too.
+    // The kind this join is reduced to by what is proven above it, which
+    // decides what it passes down (as `reduce_outer_joins_pass2` decides
+    // before it recurses).
+    let saved = NONNULLABLE.with(|n| n.borrow().clone());
+    let proven = |side: &pg_query::protobuf::Node| {
+        let mut names = Vec::new();
+        subtree_aliases(side, &mut names);
+        names.iter().any(|a| saved.contains(a))
+    };
+    let reduced = match kind {
+        JoinKind::Left if proven(rarg) => JoinKind::Inner,
+        JoinKind::Right if proven(larg) => JoinKind::Inner,
+        JoinKind::Full => match (proven(larg), proven(rarg)) {
+            (true, true) => JoinKind::Inner,
+            (true, false) => JoinKind::Left,
+            (false, true) => JoinKind::Right,
+            (false, false) => JoinKind::Full,
+        },
+        k => k,
+    };
+    let local: Vec<String> = match (&reduced, j.quals.as_deref()) {
+        (JoinKind::Full, _) | (_, None) => Vec::new(),
+        (_, Some(q)) => {
+            let mut conjuncts = Vec::new();
+            split_and(q, &mut conjuncts);
+            conjuncts
+                .iter()
+                .flat_map(|c| strict_aliases(c, &|_| None))
+                .collect()
+        }
+    };
+    let with_local = |on_side: bool| {
+        NONNULLABLE.with(|n| {
+            let mut n = n.borrow_mut();
+            *n = saved.clone();
+            if on_side {
+                n.extend(local.iter().cloned());
+            }
+        })
+    };
+    with_local(matches!(reduced, JoinKind::Inner | JoinKind::Right));
+    let left = build(larg, lookup, params, aliases, outer_left);
+    let (left, lscope) = match left {
+        Ok(l) => l,
+        Err(e) => {
+            NONNULLABLE.with(|n| *n.borrow_mut() = saved);
+            return Err(e);
+        }
+    };
     // The right side may be LATERAL over everything to its left.
     let mut visible = outer_left.cloned().unwrap_or_default();
     visible.cols.extend(lscope.cols.iter().cloned());
     visible.aliases.extend(lscope.aliases.iter().cloned());
-    let (right, rscope) = build(rarg, lookup, params, aliases, Some(&visible))?;
+    with_local(matches!(reduced, JoinKind::Inner | JoinKind::Left));
+    let right = build(rarg, lookup, params, aliases, Some(&visible));
+    NONNULLABLE.with(|n| *n.borrow_mut() = saved);
+    let (right, rscope) = right?;
     // `reduce_outer_joins`: a WHERE that cannot hold for a NULL-extended row
     // makes a LEFT join an inner one, which PostgreSQL then plans as such.
     // A RIGHT join likewise, by its left side; a FULL join is a LEFT join
@@ -2086,6 +2143,36 @@ fn strict_aliases(
     }
 }
 
+/// The aliases of the FROM items below `item`: tables and subqueries, through
+/// its joins.
+fn subtree_aliases(item: &pg_query::protobuf::Node, out: &mut Vec<String>) {
+    match item.node.as_ref() {
+        Some(N::RangeVar(r)) => out.push(
+            r.alias
+                .as_ref()
+                .map(|a| a.aliasname.clone())
+                .filter(|a| !a.is_empty())
+                .unwrap_or_else(|| r.relname.clone()),
+        ),
+        Some(N::RangeSubselect(r)) => {
+            if let Some(a) = &r.alias {
+                out.push(a.aliasname.clone());
+            }
+        }
+        Some(N::RangeFunction(r)) => {
+            if let Some(a) = &r.alias {
+                out.push(a.aliasname.clone());
+            }
+        }
+        Some(N::JoinExpr(j)) => {
+            for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                subtree_aliases(side, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Each stored table below `item`, by alias, with its definition; `false`
 /// when anything else is there.
 fn stored_tables(
@@ -2178,6 +2265,21 @@ fn preserved_aliases(
                         table_aliases(larg, &mut below);
                     }
                     (!below.iter().any(|a| nonnullable.contains(a)), false)
+                }
+                // A FULL join's side stays nullable unless the WHERE proves
+                // it non-null (`reduce_outer_joins` leaves a LEFT, RIGHT or
+                // inner join, whose preserved sides those are).
+                Ok(JoinType::JoinFull) => {
+                    let proven = |side: Option<&pg_query::protobuf::Node>| {
+                        let mut below = Vec::new();
+                        if let Some(side) = side {
+                            table_aliases(side, &mut below);
+                        }
+                        below.iter().any(|a| nonnullable.contains(a))
+                    };
+                    let (l_proven, r_proven) =
+                        (proven(j.larg.as_deref()), proven(j.rarg.as_deref()));
+                    (!l_proven, !r_proven)
                 }
                 _ => (true, true),
             };

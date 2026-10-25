@@ -848,6 +848,7 @@ impl PgHandler {
         }
         if let secantus_pgplan::joins::JoinNode::Join {
             kind,
+            on_other,
             left,
             right,
             equi,
@@ -857,7 +858,16 @@ impl PgHandler {
         } = &join.tree
         {
             if self
-                .general_join_method(*kind, left, right, equi, expr_keys, ec.as_ref(), None)
+                .general_join_method(
+                    *kind,
+                    *on_other,
+                    left,
+                    right,
+                    equi,
+                    expr_keys,
+                    ec.as_ref(),
+                    None,
+                )
                 .is_some_and(|(m, _, _, _, _)| {
                     !matches!(
                         m,

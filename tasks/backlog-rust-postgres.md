@@ -557,11 +557,27 @@ one beside it.
     RIGHT or inner join (`reduce_outer_joins`), and an ALTER TABLE that
     builds an index records the table's size as CREATE INDEX does
     (`index_update_stats`). 56 of 56 shapes at 20 to 3,000 rows a side,
-    with and without a primary key and NULL keys (none before). Not yet
-    for FULL joins: one inside a join of three or more tables, which the
-    search declines; one under a WHERE (the general path does not push
-    the WHERE to the scans); one whose ON holds more than its equality;
-    one over an analysed table. Not yet: two classes spanning both sides (two join keys); an
+    with and without a primary key and NULL keys (none before). A join's
+    ON reduces the outer joins below it as `reduce_outer_joins` does
+    (2026-10-25): an inner join's strict ON passes the tables it reads to
+    both its sides, a LEFT join's to its nullable side, so a FULL, LEFT or
+    RIGHT join there whose nullable side holds one is made LEFT or inner
+    before the search; 22 of 24 three- and four-table shapes (10 before),
+    the two left a FULL join nothing reduces. A FULL join that stays FULL
+    in a chain of three tables is searched too (2026-10-25): a FULL join's
+    minimum sides are its whole ones, so its pair joins first, priced and
+    run as two tables' FULL joins are; 48 of 48 shapes at 20 to 3,000
+    rows, with and without NULL keys (6 before); so is one in four to
+    eight tables, whose search carries a FULL join's `SpecialJoinInfo`
+    and never commutes it (`join_is_legal`); 36 of 36 shapes of four and
+    five tables (4 before). A WHERE that makes one side of a FULL join
+    non-null is pushed to that side's scan, which `reduce_outer_joins`
+    has made preserved; a FULL join whose ON holds more than its equality
+    is a Hash Full Join only, as `select_mergejoin_clauses` allows no
+    merge join a join filter (20 of 20 two-table variants: WHERE, LIMIT,
+    ORDER BY, USING, ON filter). A FULL join over an analysed table is
+    declined with the other joins over measured columns (below). Not yet:
+    two classes spanning both sides (two join keys); an
     expression in a class; a LEFT join's class through the general path;
     a class of text or other non-integer keys, or with a LEFT join; three
     tables with a WHERE over two of them or a LIMIT; four or more tables
@@ -571,7 +587,7 @@ one beside it.
     than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_full_join_under_an_inner_join_is_searched
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_left_join_over_an_inner_class_is_searched
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

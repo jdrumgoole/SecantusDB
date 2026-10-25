@@ -532,9 +532,16 @@ pub fn cheapest_join(a: &JoinSide, b: &JoinSide, left: bool, limit: Option<f64>)
 
 /// `JoinMethod` for `a FULL JOIN b` on one equality: a merge or hash full
 /// join, either side outer (a FULL join is never a nested loop).
-pub fn cheapest_full_join(a: &JoinSide, b: &JoinSide, limit: Option<f64>) -> JoinMethod {
+/// `mergeable`: the ON holds nothing but the equality; a merge full join
+/// cannot apply a join filter (`select_mergejoin_clauses`).
+pub fn cheapest_full_join(
+    a: &JoinSide,
+    b: &JoinSide,
+    limit: Option<f64>,
+    mergeable: bool,
+) -> JoinMethod {
     let mut rel = JoinRel::new(limit.is_some());
-    rel.add_full_paths(0, a, b);
+    rel.add_full_paths(0, a, b, mergeable);
     rel.cheapest(limit, full_join_rows(a, b))
         .expect("a join has paths")
         .method
@@ -757,7 +764,9 @@ impl JoinRel {
     /// (`match_unsorted_outer`, whose nested loops a FULL join cannot
     /// use), then hash joins. A merge full join's output is in no order an
     /// upper join can use: its NULL-extended rows break the key's order.
-    pub fn add_full_paths(&mut self, combo: usize, a: &JoinSide, b: &JoinSide) {
+    /// `mergeable` false (a join filter besides the equality) leaves only
+    /// the hash joins (`select_mergejoin_clauses`).
+    pub fn add_full_paths(&mut self, combo: usize, a: &JoinSide, b: &JoinSide, mergeable: bool) {
         let startup_counts = self.startup_counts;
         let paths = &mut self.paths;
         let mut consider = |(startup, total): (f64, f64), method: JoinMethod| {
@@ -790,8 +799,10 @@ impl JoinRel {
                 }
             };
             let (os, is) = (outer.scan_ordered, inner.scan_ordered);
-            if let Some(cost) = merge_join(outer, inner, os, is) {
-                consider(cost, merge(os, is));
+            if mergeable {
+                if let Some(cost) = merge_join(outer, inner, os, is) {
+                    consider(cost, merge(os, is));
+                }
             }
             let startup_outer =
                 (startup_counts && outer.startup_scan != outer.scan).then_some(JoinSide {
@@ -802,6 +813,9 @@ impl JoinRel {
                 .chain(startup_outer.as_ref())
                 .collect();
             for (oi, ii) in [(true, false), (true, true)] {
+                if !mergeable {
+                    break;
+                }
                 if let Some(cost) = merge_join(outer, inner, oi, ii) {
                     consider(cost, merge(oi, ii));
                 }
