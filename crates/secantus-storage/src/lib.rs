@@ -5113,6 +5113,27 @@ pub const ID_KEY_ROW_SUFFIX: &str = "\u{0}_id";
 static COMMITS_STARTED: AtomicU64 = AtomicU64::new(0);
 static COMMITS_DONE: AtomicU64 = AtomicU64::new(0);
 
+thread_local! {
+    /// Set by [`without_commit_count`].
+    static UNCOUNTED_COMMITS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `f` with its commits left out of the commit counters, so that
+/// [`Storage::no_commit_since`] still holds across them. Only for writes no
+/// transaction's snapshot reads: the PostgreSQL server's checkpointer,
+/// which saves its page models outside any user transaction and reads them
+/// back only at startup.
+pub fn without_commit_count<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            UNCOUNTED_COMMITS.with(|u| u.set(self.0));
+        }
+    }
+    let _reset = Reset(UNCOUNTED_COMMITS.with(|u| u.replace(true)));
+    f()
+}
+
 /// How a statement reads a collection ([`Storage::no_commit_touching_since`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NsRead {
@@ -5133,6 +5154,9 @@ pub type WrittenNs = (String, String, bool);
 /// `written` names the collections the commit wrote ([`NS_COMMITS`]),
 /// `None` when that is not known -- which counts as having changed every one.
 fn counted_commit<T>(written: Option<&[WrittenNs]>, commit: impl FnOnce() -> T) -> T {
+    if UNCOUNTED_COMMITS.with(Cell::get) {
+        return commit();
+    }
     let keys: Vec<WrittenNs> = match written {
         Some(w) if !w.is_empty() => w.to_vec(),
         _ => vec![(String::new(), String::new(), true)],

@@ -4018,6 +4018,9 @@ pub struct PgHandler {
     /// This transaction has registered with SSI, or found it need not
     /// (`serializable.rs`).
     ssi_registered: AtomicBool,
+    /// A unique index's insert-time SSI checks, `(index, leaf)`, held to
+    /// the statement's end (`ssi_flush_unique`).
+    ssi_unique_pending: Mutex<Vec<(i64, u32)>>,
     /// The statement running takes no snapshot (`SET`, `SHOW`, ...): a
     /// REPEATABLE READ or SERIALIZABLE block that has none yet does not
     /// take one for it.
@@ -4503,6 +4506,7 @@ impl PgHandler {
             sole_implicit: AtomicBool::new(false),
             rc_apart: AtomicBool::new(false),
             ssi_registered: AtomicBool::new(false),
+            ssi_unique_pending: Mutex::new(Vec::new()),
             no_snapshot_stmt: AtomicBool::new(false),
             rc_overlay: Mutex::new(None),
             plan_apart: Mutex::new(None),
@@ -30136,8 +30140,18 @@ impl PgHandler {
                     } else {
                         self.with_isolation_for(handle, Some((&stmt, sql)))?
                     };
-                    let fresh = Self::row_write(&stmt) && !handle.has_written();
-                    let rebase = Self::row_write(&stmt) && !fresh;
+                    // A SELECT, CALL or DO writes through the functions it
+                    // runs, and waits for a row as their INSERT would.
+                    let writes = Self::row_write(&stmt)
+                        || matches!(
+                            stmt,
+                            Statement::Select(_)
+                                | Statement::SelectConstant(_)
+                                | Statement::Call { .. }
+                                | Statement::Do { .. }
+                        );
+                    let fresh = writes && !handle.has_written();
+                    let rebase = writes && !fresh;
                     // Where this statement's writes start in the block's write
                     // set: a re-run must not replay what the failed attempt
                     // wrote before it collided.
@@ -30198,10 +30212,38 @@ impl PgHandler {
                                     // committed at all since the snapshot)
                                     // does the statement go on, on a snapshot
                                     // that sees the same rows.
-                                    if !(waited && self.move_snapshot(handle, 0)?) {
+                                    //
+                                    // A key another transaction committed is
+                                    // PostgreSQL's 23505 whatever the
+                                    // snapshot (`_bt_check_unique` reads it
+                                    // dirty): the statement runs once more on
+                                    // the moved snapshot for that answer. Its
+                                    // error ends the block, so the newer
+                                    // snapshot is never read; any other
+                                    // outcome keeps the 40001.
+                                    let key_row = target.as_ref().is_some_and(|t| {
+                                        t.1.ends_with(secantus_storage::ID_KEY_ROW_SUFFIX)
+                                    });
+                                    if !(waited || key_row) {
                                         break out;
                                     }
-                                    continue;
+                                    if self.move_snapshot(handle, 0)? {
+                                        continue;
+                                    }
+                                    if !key_row {
+                                        break out;
+                                    }
+                                    let again = self
+                                        .storage
+                                        .with_user_transaction(handle, || {
+                                            self.execute(stmt.clone(), max_rows)
+                                        })
+                                        .map_err(|e| Self::storage_err("transaction failed", e))
+                                        .and_then(|r| r);
+                                    match again {
+                                        Err(e) if !Self::is_write_conflict(&e) => break Err(e),
+                                        _ => break Err(Self::serialization_failure()),
+                                    }
                                 }
                                 self.storage
                                     .rollback_user_transaction(handle)
@@ -30476,7 +30518,10 @@ impl PgHandler {
 
     /// Is `e` the serialization failure a write conflict surfaces as?
     fn is_write_conflict(e: &PgWireError) -> bool {
-        matches!(e, PgWireError::UserError(info) if info.code == "40001")
+        // SSI's 40001 is the transaction's answer, never a write to wait
+        // out and run again.
+        matches!(e, PgWireError::UserError(info)
+            if info.code == "40001" && info.message != crate::ssi::Failure::MESSAGE)
     }
 
     /// Run an autocommit row write in a transaction of its own, as
@@ -35103,6 +35148,11 @@ impl PgHandler {
     /// it, and that INSERT's lookup must not find the "no such table" the
     /// CTAS itself cached a moment earlier (see `CatalogCache`).
     fn execute(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
+        let out = self.execute_unflushed(stmt, max_rows);
+        self.ssi_flush_unique(out)
+    }
+
+    fn execute_unflushed(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
         if self.key_strength_write(&stmt) {
             // A DELETE, or an UPDATE of a key column, takes PostgreSQL's FOR
             // UPDATE row lock: it waits for a FOR KEY SHARE holder too.
@@ -36252,6 +36302,12 @@ impl PgHandler {
                         .insert(self.db(), &ins.table, docs, true)
                         .map_err(|e| Self::storage_err("could not insert", e))?;
                     if let Some(first) = errors.first() {
+                        if first.get_i32("code").unwrap_or(0) == 11000 {
+                            let at = first.get_i32("index").unwrap_or(0).max(0) as usize;
+                            if let Some(row) = ins.rows.get(at) {
+                                self.ssi_duplicate(&ins.table, row)?;
+                            }
+                        }
                         let err = Self::write_error(&ins.table, &def, first);
                         return Err(self.relabel_partition_error(&def, &ins.rows, err));
                     }

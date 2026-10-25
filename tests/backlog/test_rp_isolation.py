@@ -12,6 +12,11 @@ The SSI specs (RP-061) are the serializable ones PostgreSQL 15's own suite
 runs; the specs listed against an open item still diverge.
 `insert-conflict-serializable` is not here: it is not in 15.19's suite (it
 came later), and 15.19 itself commits the write skew it tests for.
+`multiple-row-versions` is vendored but not run. Its setup inserts a million
+rows and then adds a primary key in the same transaction, which re-keys
+every stored row. That is past the transaction size WiredTiger's cache holds
+(RP-256's scope decision), so what is lost is its one SSI permutation, a
+pivot over four transactions that `total-cash` and `two-ids` also reach.
 """
 
 from __future__ import annotations
@@ -101,18 +106,12 @@ def test_ssi_index_access_methods(name: str, rust_pg: Any) -> None:
     _check(name, rust_pg)
 
 
-@pytest.mark.backlog("RP-255")
+@pytest.mark.backlog_fixed("RP-255")
 @pytest.mark.parametrize(
     "name",
-    [
-        "read-write-unique",
-        "read-write-unique-2",
-        "read-write-unique-3",
-        "read-write-unique-4",
-        "unique-insert-wait",
-    ],
+    ["read-write-unique", "read-write-unique-2", "read-write-unique-4", "unique-insert-wait"],
 )
-def test_unique_insert_waits_under_serializable(name: str, rust_pg: Any) -> None:
+def test_unique_insert_waits(name: str, rust_pg: Any) -> None:
     """PostgreSQL 15.19 makes an insert of a key another transaction has
     inserted and not committed wait. When that transaction rolls back, the
     insert goes on. When it commits, the insert fails 23505 under
@@ -121,12 +120,31 @@ def test_unique_insert_waits_under_serializable(name: str, rust_pg: Any) -> None
     _check(name, rust_pg)
 
 
-@pytest.mark.backlog("RP-256")
+@pytest.mark.backlog("RP-255")
+def test_unique_insert_in_a_function_waits(rust_pg: Any) -> None:
+    """PostgreSQL 15.19 makes the INSERT of an SQL function that a SELECT
+    calls wait for an uncommitted inserter of its key, then fail with SSI's
+    reason code (`read-write-unique-3`)."""
+    _check("read-write-unique-3", rust_pg)
+
+
+@pytest.mark.backlog_fixed("RP-256")
 def test_million_row_transaction(rust_pg: Any) -> None:
-    """PostgreSQL 15.19 inserts a million rows in one transaction (the
-    spec's setup), where this server fails XX000 "Transaction is too large
-    and will not fit in the storage engine cache"."""
-    _check("multiple-row-versions", rust_pg)
+    """PostgreSQL 15.19 inserts a million rows in one transaction, as
+    `multiple-row-versions`'s setup does. The rest of that setup is out of
+    scope (see the module docstring)."""
+    with rust_pg.connect() as conn:
+        got = [
+            conn.execute(sql).statusmessage
+            for sql in (
+                "BEGIN",
+                "CREATE TABLE big (id int NOT NULL, txt text) WITH (fillfactor=50)",
+                "INSERT INTO big (id) SELECT x FROM generate_series(1, 1000000) x",
+                "COMMIT",
+                "DROP TABLE big",
+            )
+        ]
+    assert got == ["BEGIN", "CREATE TABLE", "INSERT 0 1000000", "COMMIT", "DROP TABLE"]
 
 
 @pytest.mark.backlog_fixed("RP-257")

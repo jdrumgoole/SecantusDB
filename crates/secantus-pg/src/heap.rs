@@ -1544,25 +1544,29 @@ fn flush_changed(storage: &std::sync::Arc<secantus_storage::Storage>, force: boo
                 continue;
             }
         };
-        let written = storage.outside_user_transaction(|| -> secantus_storage::Result<()> {
-            if !storage.collection_exists(&db, crate::heap_store::COLLECTION)? {
-                storage.create_collection(&db, crate::heap_store::COLLECTION)?;
-            }
-            storage.delete_matching(
-                &db,
-                crate::heap_store::COLLECTION,
-                &bson::doc! { "_id": oid.to_string() },
-                0,
-                &Document::new(),
-                None,
-            )?;
-            storage.insert(
-                &db,
-                crate::heap_store::COLLECTION,
-                vec![bytes.clone()],
-                true,
-            )?;
-            Ok(())
+        // The checkpointer's write, which no snapshot reads: not a commit
+        // a REPEATABLE READ transaction must see (`without_commit_count`).
+        let written = secantus_storage::without_commit_count(|| {
+            storage.outside_user_transaction(|| -> secantus_storage::Result<()> {
+                if !storage.collection_exists(&db, crate::heap_store::COLLECTION)? {
+                    storage.create_collection(&db, crate::heap_store::COLLECTION)?;
+                }
+                storage.delete_matching(
+                    &db,
+                    crate::heap_store::COLLECTION,
+                    &bson::doc! { "_id": oid.to_string() },
+                    0,
+                    &Document::new(),
+                    None,
+                )?;
+                storage.insert(
+                    &db,
+                    crate::heap_store::COLLECTION,
+                    vec![bytes.clone()],
+                    true,
+                )?;
+                Ok(())
+            })
         });
         if let Err(e) = written {
             eprintln!("secantusd-pg: could not write the heap of table {oid} in {db}: {e}");

@@ -138,6 +138,20 @@ pub fn zero_filled_log(config: &str, synced: bool) -> String {
     }
 }
 
+/// WiredTiger's eviction triggers raised for this server (RP-256; Joe,
+/// 2026-10-25): a transaction's uncommitted writes stay in the cache, and
+/// the defaults (20% dirty, 10% updates) roll back one of about 500,000
+/// small rows at 4G, where PostgreSQL has no limit. At 50% the limit is
+/// about twice that; no setting removes it (a scope decision). Inserted
+/// before any `SECANTUS_WT_CONFIG_EXTRA`, which still overrides it.
+fn large_transactions(config: &str) -> String {
+    config.replacen(
+        "statistics=(fast)",
+        "statistics=(fast),eviction_dirty_trigger=50,eviction_updates_trigger=50",
+        1,
+    )
+}
+
 /// Open the store the PostgreSQL server serves, with a per-commit log sync in
 /// durable mode (see [`sync_on_commit`]).
 ///
@@ -165,7 +179,12 @@ pub fn open_storage_with_cache(home: &str, cache_size: &str) -> secantus_storage
         "128MB"
     };
     let config = zero_filled_log(
-        &commit_sync_method(&wt_config(cache_size, 1000, synced, log_file_max)),
+        &commit_sync_method(&large_transactions(&wt_config(
+            cache_size,
+            1000,
+            synced,
+            log_file_max,
+        ))),
         synced,
     );
     // Opening can rebuild an outdated index (`rebuild_outdated_indexes`); one
@@ -803,8 +822,22 @@ pub(crate) fn mark_bytea_order() {
 #[cfg(test)]
 mod sync_tests {
     use super::{
-        commit_sync_method, sync_on_commit, wt_config, zero_filled_log, ZERO_FILL_SYNCED_LOG,
+        commit_sync_method, large_transactions, sync_on_commit, wt_config, zero_filled_log,
+        ZERO_FILL_SYNCED_LOG,
     };
+
+    /// The raised eviction triggers reach the config (RP-256), ahead of
+    /// anything `SECANTUS_WT_CONFIG_EXTRA` appends after them.
+    #[test]
+    fn large_transactions_raises_the_eviction_triggers() {
+        let cfg = large_transactions("create,statistics=(fast),cache_size=1G");
+        assert_eq!(
+            cfg,
+            "create,statistics=(fast),eviction_dirty_trigger=50,eviction_updates_trigger=50,cache_size=1G"
+        );
+        assert!(large_transactions(&wt_config("4G", 1000, true, "128MB"))
+            .contains("eviction_dirty_trigger=50,eviction_updates_trigger=50"));
+    }
 
     /// Durable (the shipped default) syncs per commit; the test suite's fast
     /// mode does not; `SECANTUS_FORCE_DURABLE=1` wins over fast mode.
