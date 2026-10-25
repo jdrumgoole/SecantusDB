@@ -707,6 +707,27 @@ one beside it.
       Backlog-ID: RP-014
       Verify: none -- CI-runner timing flakes in psycopg's own suite on Linux
 
+- [ ] **OPEN — RUST pgserver on WINDOWS: a COPY between two connections
+      once failed 40001 (2026-10-25).** In the Windows psycopg gauge of
+      PR #2175 (run 40217508289, attempt 1), all three variants of
+      `tests/test_copy_async.py::test_copy_table_across` failed at once
+      with `SerializationFailure: could not serialize access due to
+      concurrent update`. The test creates a table with a serial primary
+      key and 20 random columns in each of two open transactions, then
+      copies one into the other. PostgreSQL never fails it, since the two
+      transactions write nothing in common. Every WiredTiger write conflict
+      reaches the client as this 40001 (`storage_err`), including a
+      transaction WiredTiger rolls back to relieve its cache. Batch 79's
+      run passed the test, and so did attempt 2 of the same commit (4846
+      passed). It did not reproduce locally on macOS: the test alone 90
+      times, under 60 seeds, with autovacuum waking every second, the whole
+      file under eight random orders, and a 4-thread stress of the same
+      pattern. The next step is the server's log from a failing Windows run:
+      since batch 81 the gauge keeps it
+      (`.validation/psycopg-raw-rust.server.log`, in the job's artifact).
+      Backlog-ID: RP-268
+      Verify: none -- not reproduced outside one Windows CI run; no test fails on demand
+
 ## Open from the 2026-09-30 batch
 
 - [ ] **Rust PG server: a SAVEPOINT captures whole tables, so its cost is
@@ -1065,16 +1086,18 @@ batch; its test there is a regression test.
       - bottom-up deletion runs for an UPDATE that left the key unchanged,
         within its six-block budget.
       Since batch 74 every step of a long run of updates matches too.
-      What is left is index scans. An index scan marks LP_DEAD the entries
-      whose heap versions it finds dead (`kill_prior_tuple`), and this
-      server's reads mark none. With an ordered read of the primary key
-      between updates of a 2,000-row table, PostgreSQL keeps the index at
-      13, 13, 13 and 14 pages, against 13, 14, 14 and 16 here. PostgreSQL
-      reads it with an Index Only Scan chosen by cost; this server reads by
-      a seq scan and a sort and does not cost the choice, so modelling the
-      marking waits on the planner (RP-028).
+      Since batch 81 an index scan marks LP_DEAD the entries whose heap
+      versions it finds dead to all (`kill_prior_tuple`, `_bt_killitems`):
+      a read the planner prices as an index scan, and an ORDER BY with no
+      WHERE it reads in a B-tree's order rather than sorting (54 of 54
+      shapes of reads between updates, 48 before). What is left is a read
+      that returns one row, which is not priced (the price counts the
+      table's rows, too dear for every primary-key lookup), so a lookup by
+      the primary key marks nothing: after 2,000 of them between each of
+      three updates PostgreSQL keeps the index at 13, 13 and 13 pages,
+      against 13, 14 and 14 here.
       Backlog-ID: RP-196
-      Verify: tests/backlog/test_rp_batch71.py::test_scenario[an index scan marks the dead versions it passes]
+      Verify: tests/backlog/test_rp_batch81.py::test_primary_key_lookups_mark_the_dead_versions
 
 ## Found by batch 46 (2026-10-23)
 

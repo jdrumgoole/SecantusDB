@@ -250,7 +250,14 @@ def main() -> int:
             storage_dir,
         ]
 
-    daemon = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # The server's own output, kept beside the raw report: a failure that
+    # does not reproduce elsewhere (RP-268) needs what the server said. A
+    # file, never a pipe, which a server writing past 64 KiB would block on.
+    server_log = raw_out.with_suffix(".server.log")
+    server_log.parent.mkdir(parents=True, exist_ok=True)
+    log_file = server_log.open("wb")
+    daemon = subprocess.Popen(argv, stdout=log_file, stderr=subprocess.STDOUT)
+    log_file.close()
     try:
         _wait_for_listener(host, port)
         _verify_secantus_identity(host, port, tls_env)
