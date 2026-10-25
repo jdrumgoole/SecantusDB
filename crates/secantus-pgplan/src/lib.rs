@@ -39,6 +39,8 @@ pub mod tid;
 pub mod transforms;
 pub mod ts_configs;
 pub mod ts_dicts;
+mod ts_ispell;
+mod ts_thesaurus;
 pub mod typed_tables;
 pub mod typeout;
 mod typmod_cast;
@@ -175,6 +177,7 @@ pub mod numeric;
 pub mod numeric_math;
 pub mod output_style;
 pub mod pg_casts;
+pub mod pg_qsort;
 pub mod pgtypes;
 pub mod range;
 pub mod range_ops;
@@ -383,6 +386,12 @@ impl Error {
             }
             Error::Sqlstate("42809", m) if m.ends_with(" is a procedure") => {
                 Some("To call a procedure, use CALL.")
+            }
+            // `compileTheLexeme` (dict_thesaurus.c).
+            Error::Sqlstate("F0000", m)
+                if m.starts_with("thesaurus sample word ") && m.contains(" is a stop word (rule ") =>
+            {
+                Some("Use \"?\" to represent a stop word within a sample phrase.")
             }
             Error::Sqlstate("42704", m)
                 if m.starts_with("data type ") && m.contains(" has no default operator class ") =>
@@ -34984,12 +34993,12 @@ fn fts_operator(e: &AExpr, op: &str, lhs: &Bson, rhs: &Bson) -> Option<Result<Bs
         let vector = if dt == "tsvector" {
             fts::parse_vector(&fts::text_of(doc))?
         } else {
-            fts::to_tsvector(fts::default_config(), &fts::text_of(doc))
+            fts::to_tsvector(fts::default_config(), &fts::text_of(doc))?
         };
         let q = if qt == "tsquery" {
             fts::parse_query(&fts::text_of(query))?
         } else {
-            fts::plainto_tsquery(fts::default_config(), &fts::text_of(query))
+            fts::plainto_tsquery(fts::default_config(), &fts::text_of(query))?
         };
         Ok(Bson::Boolean(fts::matches(&vector, &q)))
     })())

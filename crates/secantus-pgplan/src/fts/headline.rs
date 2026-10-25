@@ -154,6 +154,30 @@ fn operands(q: &Query, ops: &mut Vec<(String, bool)>) -> Query {
     }
 }
 
+/// `hlfinditem`: each operand `lex` matches; the first marks word `last`,
+/// each further one a repeated copy of it.
+fn hl_find_item(words: &mut Vec<Word>, last: usize, ops: &[(String, bool)], pos: u32, lex: &str) {
+    words[last].pos = u16::try_from(pos.min(u32::from(MAX_POS))).unwrap_or(MAX_POS);
+    for (k, (op, prefix)) in ops.iter().enumerate() {
+        let hit = if *prefix {
+            lex.starts_with(op.as_str())
+        } else {
+            lex == *op
+        };
+        if !hit {
+            continue;
+        }
+        if words[last].item.is_some() {
+            let mut copy = words[last].clone();
+            copy.item = Some(k);
+            copy.repeated = true;
+            words.push(copy);
+        } else {
+            words[last].item = Some(k);
+        }
+    }
+}
+
 struct Prs {
     words: Vec<Word>,
     query: Option<Query>,
@@ -161,52 +185,61 @@ struct Prs {
 }
 
 impl Prs {
-    /// `hlparsetext`.
-    fn parse(cfg: Config, doc: &str, q: &Option<Query>) -> Prs {
+    /// `hlparsetext`: the tokens through the configuration's dictionaries
+    /// (`lexize::Lexizer`), each token a word, every token a dictionary
+    /// used for one result matched against the result's lexemes.
+    fn parse(cfg: Config, doc: &str, q: &Option<Query>) -> Result<Prs> {
         let mut ops = Vec::new();
         let query = q.as_ref().map(|q| operands(q, &mut ops));
         let mut words: Vec<Word> = Vec::new();
-        let mut vectorpos: u16 = 0;
-        for (ty, tok) in w::parse(doc) {
-            words.push(Word {
-                text: tok.clone(),
-                ty,
-                ..Default::default()
-            });
-            let Some((_, lexemes)) = debug_lexize(cfg, ty, &tok) else {
+        let mut vectorpos: u32 = 0;
+        let mut lx = lexize::Lexizer::new(cfg);
+        for (ty, tok) in w::parse(doc).into_iter().chain([(0, String::new())]) {
+            if ty > 0 && tok.len() >= MAX_LEXEME {
+                notice("word is too long to be indexed");
                 continue;
-            };
-            vectorpos = (vectorpos + 1).min(MAX_POS);
-            for lex in lexemes {
-                // `hlfinditem`: each operand the lexeme matches; the first
-                // marks the word, each further one a repeated copy.
-                let last = words.len() - 1;
-                words[last].pos = vectorpos;
-                for (k, (op, prefix)) in ops.iter().enumerate() {
-                    let hit = if *prefix {
-                        lex.starts_with(op.as_str())
-                    } else {
-                        lex == *op
-                    };
-                    if !hit {
-                        continue;
+            }
+            lx.add(ty, tok);
+            loop {
+                let (norms, lexs) = lx.exec()?;
+                if norms.is_some() {
+                    vectorpos += 1;
+                }
+                // `addHLParsedLex`.
+                for l in lexs {
+                    if l.ty > 0 {
+                        words.push(Word {
+                            text: l.lemm,
+                            ty: l.ty,
+                            ..Default::default()
+                        });
                     }
-                    if words[last].item.is_some() {
-                        let mut copy = words[last].clone();
-                        copy.item = Some(k);
-                        copy.repeated = true;
-                        words.push(copy);
-                    } else {
-                        words[last].item = Some(k);
+                    let mut savedpos = vectorpos;
+                    for lex in norms.iter().flatten() {
+                        if lex.flags & crate::ts_dicts::TSL_ADDPOS != 0 {
+                            savedpos += 1;
+                        }
+                        let Some(last) = words.len().checked_sub(1) else {
+                            continue;
+                        };
+                        hl_find_item(&mut words, last, &ops, savedpos, &lex.lexeme);
+                    }
+                }
+                let Some(norms) = norms else {
+                    break;
+                };
+                for lex in &norms {
+                    if lex.flags & crate::ts_dicts::TSL_ADDPOS != 0 {
+                        vectorpos += 1;
                     }
                 }
             }
         }
-        Prs {
+        Ok(Prs {
             words,
             query,
             short_word: 0,
-        }
+        })
     }
 
     fn interesting(&self, j: usize) -> bool {
@@ -581,8 +614,8 @@ fn mark_hl_fragments(prs: &mut Prs, o: &HeadlineOptions, max_cover: usize) {
 }
 
 /// `ts_headline(config, document, query, options)`.
-pub fn headline(cfg: Config, doc: &str, q: &Option<Query>, o: &HeadlineOptions) -> String {
-    let mut prs = Prs::parse(cfg, doc, q);
+pub fn headline(cfg: Config, doc: &str, q: &Option<Query>, o: &HeadlineOptions) -> Result<String> {
+    let mut prs = Prs::parse(cfg, doc, q)?;
     prs.short_word = o.short_word;
     let mut max_cover = (o.max_words.saturating_mul(10)).max(100);
     if o.max_fragments > 0 {
@@ -621,5 +654,5 @@ pub fn headline(cfg: Config, doc: &str, q: &Option<Query>, o: &HeadlineOptions) 
             infrag = false;
         }
     }
-    out
+    Ok(out)
 }

@@ -514,7 +514,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "ispell and thesaurus dictionaries": (
         "RP-169",
-        True,
+        False,
         [
             "begin",
             "create text search dictionary rp51_is "

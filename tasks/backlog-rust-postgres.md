@@ -1000,18 +1000,6 @@ tests are scenarios in `tests/backlog/test_rp_batch34.py`, measured on a
 private 15.19 cluster. RP-166 and RP-167 were found and fixed in the same
 batch; their tests there are regression tests.
 
-- [ ] **What is left of the statements once refused with 0A000.** Batch
-      51 built `CREATE / ALTER / DROP OPERATOR FAMILY / CLASS` for the
-      btree and hash methods, text-search dictionaries over the `simple`,
-      `snowball` and `synonym` templates, subscriptions created with
-      `connect = false`, and transforms; batch 64 made `pg_subscription`
-      one catalog for the cluster, and batch 72 took operator classes of
-      the GiST, GIN, SP-GiST and BRIN methods. One part is still refused:
-      - **The `ispell` and `thesaurus` dictionary templates** are refused
-        by name: their dictionary and affix file formats are not read here.
-      Backlog-ID: RP-169
-      Verify: tests/backlog/test_rp_batch51.py::test_scenario[ispell and thesaurus dictionaries]
-
 ## Found by batch 26 (2026-10-22)
 
 Found while making PostgreSQL 15's `pg_dump`, `pg_dumpall` and `psql` answer
