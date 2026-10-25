@@ -901,29 +901,42 @@ impl Stats {
 
     // -------------------------------------------- VACUUM, ANALYZE, resets
 
-    /// `pgstat_report_vacuum`: straight to the shared counts.
+    /// `pgstat_report_vacuum`: straight to the shared counts, an
+    /// autovacuum worker's under its own times and count.
     pub(crate) fn report_vacuum(&self, rel: i64, live: i64, dead: i64) {
         let db = self.db;
+        let auto = crate::autovacuum::in_worker();
         self.with(|s| {
             let e = s.rels.entry((db, rel)).or_default();
             e.live_tuples = live;
             e.dead_tuples = dead;
             e.inserts_since_vacuum = 0;
-            e.vacuum_timestamp = Some(SystemTime::now());
-            e.vacuum_count += 1;
+            if auto {
+                e.autovac_vacuum_timestamp = Some(SystemTime::now());
+                e.autovac_vacuum_count += 1;
+            } else {
+                e.vacuum_timestamp = Some(SystemTime::now());
+                e.vacuum_count += 1;
+            }
         });
     }
 
     /// `pgstat_report_analyze`.
     pub(crate) fn report_analyze(&self, rel: i64, live: i64, dead: i64) {
         let db = self.db;
+        let auto = crate::autovacuum::in_worker();
         self.with(|s| {
             let e = s.rels.entry((db, rel)).or_default();
             e.live_tuples = live;
             e.dead_tuples = dead;
             e.changes_since_analyze = 0;
-            e.analyze_timestamp = Some(SystemTime::now());
-            e.analyze_count += 1;
+            if auto {
+                e.autovac_analyze_timestamp = Some(SystemTime::now());
+                e.autovac_analyze_count += 1;
+            } else {
+                e.analyze_timestamp = Some(SystemTime::now());
+                e.analyze_count += 1;
+            }
         });
     }
 

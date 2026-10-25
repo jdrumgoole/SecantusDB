@@ -570,6 +570,16 @@ impl PgHandler {
             .unwrap_or(false)
     }
 
+    /// Does `table`'s heap hold a HOT chain?
+    pub(crate) fn heap_has_hot(&self, table: &str) -> bool {
+        self.has_heap(table) && self.with_heap_read(table, |h| h.has_hot()).unwrap_or(false)
+    }
+
+    /// The HOT chain root of each of `ctids` (`Heap::hot_root`).
+    pub(crate) fn hot_roots(&self, table: &str, ctids: &[i64]) -> PgWireResult<Vec<i64>> {
+        self.with_heap_read(table, |h| ctids.iter().map(|c| h.hot_root(*c)).collect())
+    }
+
     /// A stored table with a heap of its own (not a catalog, a view or a
     /// partitioned parent).
     pub(crate) fn has_heap(&self, table: &str) -> bool {

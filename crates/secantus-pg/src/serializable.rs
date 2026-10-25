@@ -145,8 +145,15 @@ fn nested(doc: &Document) -> Document {
 /// One end of an index range: the key, and whether it is included.
 type Bound = Option<(bson::Bson, bool)>;
 
+/// The scan the planner picks for a table's WHERE (`priced_scan`).
+pub(crate) enum PricedScan {
+    Seq,
+    Bitmap(ScanIndex),
+    Index(ScanIndex),
+}
+
 /// The index a SERIALIZABLE scan reads, as the planner chose it.
-enum ScanIndex {
+pub(crate) enum ScanIndex {
     Btree(std::sync::Arc<crate::btree::IndexShape>),
     Hash(crate::hash_index::HashShape),
 }
@@ -396,9 +403,21 @@ impl PgHandler {
     /// The index PostgreSQL's cheapest path for `filter` over `table`
     /// reads, or `None` for a sequential scan.
     fn ssi_scan_index(&self, table: &str, filter: &Document) -> Option<ScanIndex> {
+        match self.priced_scan(table, filter)? {
+            PricedScan::Seq => None,
+            PricedScan::Bitmap(ix) | PricedScan::Index(ix) => Some(ix),
+        }
+    }
+
+    /// The scan PostgreSQL's planner picks for `filter` over `table`
+    /// (`create_index_paths` / `set_plain_rel_pathlist`'s cheapest path):
+    /// a sequential scan, a bitmap heap scan or a plain index scan, and the
+    /// index the latter two read. `None` when the costs cannot be priced
+    /// (`filter` holds what the model does not estimate).
+    pub(crate) fn priced_scan(&self, table: &str, filter: &Document) -> Option<PricedScan> {
         use secantus_pgplan::{costsize, hashagg};
         if filter.is_empty() {
-            return None;
+            return Some(PricedScan::Seq);
         }
         let count = self
             .storage
@@ -492,26 +511,33 @@ impl PgHandler {
                 best = Some((kind, (startup, total)));
             }
         }
-        let (costsize::ScanKind::Bitmap(i) | costsize::ScanKind::Index(i)) = best?.0 else {
-            return None;
+        let (bitmap, i) = match best?.0 {
+            costsize::ScanKind::Seq => return Some(PricedScan::Seq),
+            costsize::ScanKind::Bitmap(i) => (true, i),
+            costsize::ScanKind::Index(i) => (false, i),
         };
-        if i >= full + partial.len() {
-            return hashes
+        let ix = if i >= full + partial.len() {
+            hashes
                 .into_iter()
                 .nth(i - full - partial.len())
-                .map(ScanIndex::Hash);
-        }
-        if i >= full {
-            return partial
+                .map(ScanIndex::Hash)
+        } else if i >= full {
+            partial
                 .into_iter()
                 .nth(i - full)
-                .map(|(_, shape)| ScanIndex::Btree(shape));
-        }
-        let columns = &indexes.get(i)?.columns;
-        self.btree_shapes(table)
-            .into_iter()
-            .find(|s| s.is_plain() && s.key_fields() == columns.as_slice())
-            .map(ScanIndex::Btree)
+                .map(|(_, shape)| ScanIndex::Btree(shape))
+        } else {
+            let columns = &indexes.get(i)?.columns;
+            self.btree_shapes(table)
+                .into_iter()
+                .find(|s| s.is_plain() && s.key_fields() == columns.as_slice())
+                .map(ScanIndex::Btree)
+        }?;
+        Some(if bitmap {
+            PricedScan::Bitmap(ix)
+        } else {
+            PricedScan::Index(ix)
+        })
     }
 
     /// `table`'s partial B-trees whose predicate `filter` implies

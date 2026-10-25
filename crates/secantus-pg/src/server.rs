@@ -250,6 +250,8 @@ pub struct RunningPgServer {
     active: Arc<AtomicUsize>,
     /// The last `Arc` to the store. `stop` drops it — that is the checkpoint.
     storage: Option<Arc<Storage>>,
+    /// The autovacuum launcher, joined before the store closes.
+    autovacuum: Option<std::thread::JoinHandle<()>>,
     /// Set by `stop` once the store is known to be closed (its last reference
     /// dropped, so the close-checkpoint ran).
     store_closed: bool,
@@ -308,6 +310,11 @@ impl RunningPgServer {
             return;
         }
         self.stop_flag.store(true, Ordering::SeqCst);
+        // The launcher sees the flag within its next 50 ms nap, or once the
+        // table its worker is on is done.
+        if let Some(launcher) = self.autovacuum.take() {
+            let _ = launcher.join();
+        }
         // Tell the accept loop and every live connection to finish. Ignore a
         // send error: it only means every receiver is already gone.
         let _ = self.shutdown.send(true);
@@ -668,6 +675,7 @@ pub fn bind_with(
     let active = Arc::new(AtomicUsize::new(0));
     let (shutdown, shutdown_rx) = watch::channel(false);
 
+    let databases_for_autovacuum = databases.clone();
     let accept = {
         let storage = storage.clone();
         let stop_flag = stop_flag.clone();
@@ -686,10 +694,13 @@ pub fn bind_with(
         ))
     };
 
+    let autovacuum =
+        crate::autovacuum::launch(&storage, databases_for_autovacuum, stop_flag.clone());
     Ok(RunningPgServer {
         address,
         runtime: Some(runtime),
         accept: Some(accept),
+        autovacuum,
         stop_flag,
         shutdown,
         active,

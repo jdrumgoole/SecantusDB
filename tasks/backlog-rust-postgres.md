@@ -430,10 +430,7 @@ one beside it.
   - A table whose rows are not text, bytea or fixed width (numeric, arrays,
     json): its heap pages are taken at the estimated density.
   - DISTINCT ON, and a citext DISTINCT, which PostgreSQL sorts.
-  - A bitmap heap scan's order after a HOT UPDATE: PostgreSQL reaches the
-    new version through its chain's root and reads it at the root's place
-    (`select id from t where id > 0` over a primary key reads rows 3, 1, 2
-    where this server, reading in ctid order, returns 3, 2, 1). The size
+  - The size
     CREATE INDEX records and what ANALYZE stores are modelled (`__sql_relstats__`), but not REINDEX's,
     CLUSTER's or an ALTER TABLE that builds an index, nor across RENAME.
     Declined over an analysed table, keeping the old order: a range over
@@ -556,7 +553,7 @@ one beside it.
     than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_left_join_whose_nullable_side_holds_a_left_join_is_searched, tests/backlog/test_rp_batch47.py::test_scenario[a bitmap heap scan reads a HOT-updated row at its root]
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_left_join_whose_nullable_side_holds_a_left_join_is_searched
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
@@ -948,16 +945,6 @@ a regression test.
       PostgreSQL's syscache and relcache make, which follow its own caching.
       Backlog-ID: RP-225
       Verify: tests/backlog/test_rp_batch55.py::test_scenario[a new session's catalog reads are counted]
-- [ ] **Autovacuum is not modelled.** PostgreSQL 15.19 analyses and
-      vacuums a table in the background once its changes pass
-      `autovacuum_*_threshold` plus the scale factor, checking every
-      `autovacuum_naptime` (a minute): `last_autoanalyze`,
-      `autoanalyze_count`, `last_autovacuum` and `autovacuum_count` move,
-      and `n_mod_since_analyze` / `n_dead_tup` drop, with no statement asking.
-      Here they stay NULL and 0, and only a VACUUM or ANALYZE resets the
-      counts.
-      Backlog-ID: RP-226
-      Verify: none -- autovacuum runs on its own schedule (a 60 s naptime, a worker launched when the launcher wakes); measured with a 1 s naptime, PostgreSQL 15.19 had not yet run within 4 s, so no bounded check pins it on either server
 
 ## Found by batch 54 (2026-10-24)
 
