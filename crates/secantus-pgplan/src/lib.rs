@@ -4306,11 +4306,27 @@ fn parse_one(sql: &str) -> Result<N> {
     if stmts.is_empty() {
         return Err(Error::Parse("empty statement".into()));
     }
-    let mut node = stmts[0]
-        .stmt
-        .as_ref()
-        .and_then(|s| s.node.clone())
-        .ok_or_else(|| Error::Parse("empty statement".into()))?;
+    let empty = || Error::Parse("empty statement".into());
+    // A large statement's tree is copied out of the memo on a thread of its
+    // own, under the cancel hook: the copy of a 200,000-item IN list is a
+    // fifth of a second in which no cancel is seen (RP-202).
+    const COPY_APART_BYTES: usize = 64 << 10;
+    let mut node = if sql.len() > COPY_APART_BYTES {
+        let tree = std::sync::Arc::clone(&parsed);
+        cancel::interruptible(1 << 30, move || {
+            tree.stmts[0]
+                .stmt
+                .as_ref()
+                .and_then(|s| s.node.clone())
+                .ok_or_else(empty)
+        })?
+    } else {
+        stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|s| s.node.clone())
+            .ok_or_else(empty)?
+    };
     // pg_query's node walk does not descend into a DECLARE's query, so the
     // rewrites run on that query itself: without it a cursor over a temp
     // table never reached the table's `pg_temp_N` key (42P01).
@@ -4429,16 +4445,29 @@ fn qualify_type_error(e: Error, node: &pg_query::protobuf::Node) -> Error {
 /// The analysis-time rewrites every statement passes through before it is
 /// planned.
 fn rewrite_statement(node: &mut N) -> Result<()> {
+    // Each pass walks the whole tree: a cancellation point between them
+    // (RP-202; together they are a sixth of a second for a 200,000-item
+    // IN list).
     check_type_schemas(node)?;
+    cancel::check()?;
     schemas::resolve_type_names(node)?;
+    cancel::check()?;
     func_cast::check_variadic_arity(node)?;
+    cancel::check()?;
     func_cast::spread_variadic(node);
+    cancel::check()?;
     func_cast::rewrite(node);
+    cancel::check()?;
     pattern_ops(node);
+    cancel::check()?;
     unknown_args::check_ambiguous(node)?;
+    cancel::check()?;
     unknown_args::rewrite(node);
+    cancel::check()?;
     srf_place::check(node)?;
+    cancel::check()?;
     collation::check_clauses(node)?;
+    cancel::check()?;
     schemas::qualify(node)
 }
 
@@ -4668,11 +4697,14 @@ fn plan_query_node(
     cancel::check()?;
     if let Some(inner) = node.node.as_ref() {
         func_cast::refuse_unresolved(inner)?;
+        cancel::check()?;
         optype::check(inner, lookup)?;
+        cancel::check()?;
         if let N::SelectStmt(sel) = inner {
             order_by_ambiguity(sel)?;
         }
     }
+    cancel::check()?;
     if let Some(inner) = node.node.as_mut() {
         optype::using_to_direction(inner);
     }
@@ -33857,7 +33889,19 @@ pub fn max_param_number(sql: &str) -> usize {
     if let Some(n) = memo.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
         return *n;
     }
-    let n = scan_max_param_number(sql);
+    // A large statement is scanned on a thread of its own, under the cancel
+    // hook (RP-202). A cancelled scan is not remembered; the statement's
+    // next cancellation point raises the cancel.
+    const SCAN_APART_BYTES: usize = 64 << 10;
+    let n = if sql.len() > SCAN_APART_BYTES {
+        let owned = sql.to_string();
+        match cancel::interruptible(8 << 20, move || Ok(scan_max_param_number(&owned))) {
+            Ok(n) => n,
+            Err(_) => return 0,
+        }
+    } else {
+        scan_max_param_number(sql)
+    };
     let mut guard = memo.lock().unwrap_or_else(|e| e.into_inner());
     if guard.len() >= MAX_ENTRIES {
         guard.clear();

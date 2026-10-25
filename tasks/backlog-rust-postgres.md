@@ -938,11 +938,17 @@ tests there are regression tests.
       lands in.** Planning a statement with a 200,000-item `IN` list runs
       for about a second in a debug build, as a sequence of passes over the
       whole tree with a cancellation point between each. A cancel that lands
-      inside one is answered when it ends: up to 0.2 s late here, where
-      PostgreSQL 15.19 answers in 0.015 s. The longest is the clone of the
-      memoised parse tree each plan starts from (about 0.35 s for that
-      statement). Batch 46's follow-up closed the windows outside planning
-      that were 0.8 s long.
+      inside one is answered when it ends: up to 0.09 s late here (measured
+      over 28 cancel times through Parse, Describe, Bind and Execute), where
+      PostgreSQL 15.19 answers in 0.015 s. The longest windows left, about
+      0.12 s each, are walks that collect the whole tree through
+      `pg_query`'s `nodes()` before looking at it: the privilege pass at
+      Execute, and the end of `plan_select`. Batch 74 split or moved apart
+      the ones of 0.2 s: the copy of the memoised tree and the scan for its
+      parameters now run on a thread of their own under the cancel hook,
+      and the typing of an `IN` list and each rewrite pass have a
+      cancellation point. Batch 46's follow-up closed the windows outside
+      planning that were 0.8 s long.
       Backlog-ID: RP-202
       Verify: none -- a latency budget; every answer is PostgreSQL's 57014, only later
 

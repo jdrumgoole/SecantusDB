@@ -15,3 +15,11 @@ run of updates.
   updates of every row of a 2,000-row table, the index's pages now match
   PostgreSQL 15.19's at every step (13, 14, 14, 16, 17, 18, 18, 18).
   Fixes part of RP-196 (tests/backlog/test_rp_batch71.py::test_scenario[every step of eight updates of a primary key]).
+- A cancel during the planning of a very large statement is answered
+  sooner. With a 200,000-item `IN` list it was up to 0.15 s late here,
+  and up to 0.57 s on a CI runner, which failed RP-215's regression test.
+  It is now at most 0.09 s late. The copy of the memoised parse tree and
+  the scan of the text for its parameters now run on a thread of their own
+  under the cancel hook. The typing of the `IN` list and each of the
+  statement rewrite passes now have a cancellation point. Part of RP-202,
+  which keeps the 0.12 s walks that are left.
