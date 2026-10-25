@@ -557,8 +557,14 @@ one beside it.
     RIGHT or inner join (`reduce_outer_joins`), and an ALTER TABLE that
     builds an index records the table's size as CREATE INDEX does
     (`index_update_stats`). 56 of 56 shapes at 20 to 3,000 rows a side,
-    with and without a primary key and NULL keys (none before). Not yet
-    for FULL joins: one inside a join of three or more tables, which the
+    with and without a primary key and NULL keys (none before). A join's
+    ON reduces the outer joins below it as `reduce_outer_joins` does
+    (2026-10-25): an inner join's strict ON passes the tables it reads to
+    both its sides, a LEFT join's to its nullable side, so a FULL, LEFT or
+    RIGHT join there whose nullable side holds one is made LEFT or inner
+    before the search; 22 of 24 three- and four-table shapes (10 before),
+    the two left a FULL join nothing reduces. Not yet for FULL joins: one
+    that stays FULL inside a join of three or more tables, which the
     search declines; one under a WHERE (the general path does not push
     the WHERE to the scans); one whose ON holds more than its equality;
     one over an analysed table. Not yet: two classes spanning both sides (two join keys); an
@@ -571,7 +577,7 @@ one beside it.
     than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_full_join_under_an_inner_join_is_searched
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_full_join_below_a_left_join_is_searched
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
