@@ -51580,7 +51580,7 @@ pub(crate) enum GeneralOrder {
 /// past every outer key come after them; an inner one once the outer key
 /// passes `inner_max`, the inner side's greatest key (all of them first
 /// when it has none), else at the end.
-fn merge_full_place(
+pub(crate) fn merge_full_place(
     main: Vec<Document>,
     tail: Vec<Document>,
     outer_key: &str,

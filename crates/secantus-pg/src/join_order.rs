@@ -827,16 +827,15 @@ impl PgHandler {
             a_key: a_key.clone(),
             b_key: b_key.clone(),
             a_rows,
+            b_rows: rows_of(built.b, clause.b_table, &b_key),
             on: None,
             filters: Vec::new(),
             batches,
         };
-        let a_type = chain
-            .leaves
-            .iter()
-            .find_map(|n| leaf_key_type(n, &step.a_key));
+        let type_of = |key: &str| chain.leaves.iter().find_map(|n| leaf_key_type(n, key));
+        let (a_type, b_type) = (type_of(&step.a_key), type_of(&step.b_key));
         let on = clause.on.and_then(|i| chain.ons[i]);
-        self.run_step(&step, a, b, a_type, on)
+        self.run_step(&step, a, b, a_type, b_type, on)
     }
 
     /// Whether `node` is a chain of four to eight tables whose join order is

@@ -2083,13 +2083,12 @@ def test_a_full_join_under_an_inner_join_is_searched(pg: Any) -> None:
     assert " ".join(":".join(str(v) for v in r) for r in got[1][:12]) == want
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_full_join_below_a_left_join_is_searched(pg: Any) -> None:
     """PostgreSQL 15.19, three 20-row tables never analysed: `f0 FULL JOIN
     f1 ON f0.b = f1.a LEFT JOIN f2 ON f1.b = f2.a`. Nothing above the FULL
     join proves either side non-NULL, so it stays FULL: a Merge Right Join
-    of f2 with the Merge Full Join sorted on f1.b. The join search does not
-    take a FULL join, so the rows come out in the general path's order."""
+    of f2 with the Merge Full Join sorted on f1.b."""
     pg.execute("begin")
     try:
         for t, m in enumerate([7, 5, 3]):
@@ -2105,6 +2104,37 @@ def test_a_full_join_below_a_left_join_is_searched(pg: Any) -> None:
     want = (
         "None:10:None 19:5:None 5:5:None 12:5:None None:20:None None:15:None"
         " 6:6:1 15:1:1 8:1:1 1:1:1 20:6:1 13:6:1"
+    )
+    assert got[0] == "ok"
+    assert len(got[1]) == 34
+    assert " ".join(":".join(str(v) for v in r) for r in got[1][:12]) == want
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_full_join_in_four_tables_is_searched(pg: Any) -> None:
+    """PostgreSQL 15.19, four 20-row tables never analysed: `f0 FULL JOIN f1
+    ON f0.b = f1.a LEFT JOIN f2 ON f1.b = f2.a LEFT JOIN f3 ON f2.c = f3.a`.
+    The LEFT joins' ONs read only their nullable sides, so the FULL join
+    stays FULL. The four-table join search does not take a FULL join, so
+    the rows come out in the general path's order."""
+    pg.execute("begin")
+    try:
+        for t, (mb, mc) in enumerate([(7, 5), (5, 3), (3, 4), (4, 7)]):
+            pg.execute(f"create table rp028_f{t} (a int, b int, c int)")
+            pg.execute(
+                f"insert into rp028_f{t} select i, i % {mb}, i % {mc} from generate_series(1, 20) i"
+            )
+        got = pg_answer(
+            pg,
+            "select rp028_f0.a, rp028_f1.a, rp028_f2.a, rp028_f3.a from rp028_f0 full join"
+            " rp028_f1 on rp028_f0.b = rp028_f1.a left join rp028_f2 on rp028_f1.b = rp028_f2.a"
+            " left join rp028_f3 on rp028_f2.c = rp028_f3.a",
+        )
+    finally:
+        pg.execute("rollback")
+    want = (
+        "18:4:4:None None:9:4:None None:19:4:None None:14:4:None 11:4:4:None 4:4:4:None"
+        " 6:6:1:1 15:1:1:1 8:1:1:1 1:1:1:1 20:6:1:1 13:6:1:1"
     )
     assert got[0] == "ok"
     assert len(got[1]) == 34

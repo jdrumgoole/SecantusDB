@@ -563,9 +563,13 @@ one beside it.
     both its sides, a LEFT join's to its nullable side, so a FULL, LEFT or
     RIGHT join there whose nullable side holds one is made LEFT or inner
     before the search; 22 of 24 three- and four-table shapes (10 before),
-    the two left a FULL join nothing reduces. Not yet for FULL joins: one
-    that stays FULL inside a join of three or more tables, which the
-    search declines; one under a WHERE (the general path does not push
+    the two left a FULL join nothing reduces. A FULL join that stays FULL
+    in a chain of three tables is searched too (2026-10-25): a FULL join's
+    minimum sides are its whole ones, so its pair joins first, priced and
+    run as two tables' FULL joins are; 48 of 48 shapes at 20 to 3,000
+    rows, with and without NULL keys (6 before). Not yet for FULL joins:
+    one in four or more tables, which that search declines; one under a
+    WHERE (the general path does not push
     the WHERE to the scans); one whose ON holds more than its equality;
     one over an analysed table. Not yet: two classes spanning both sides (two join keys); an
     expression in a class; a LEFT join's class through the general path;
@@ -577,7 +581,7 @@ one beside it.
     than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_full_join_below_a_left_join_is_searched
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_full_join_in_four_tables_is_searched
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

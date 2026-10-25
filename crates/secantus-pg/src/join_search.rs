@@ -74,8 +74,9 @@ pub(crate) struct Step {
     pub(crate) a_key: String,
     pub(crate) b_key: String,
     /// The estimated rows of `a`, which a hash right join's table is sized
-    /// by.
+    /// by, and of `b`, which a hash full join with `a` outer sizes its by.
     pub(crate) a_rows: f64,
+    pub(crate) b_rows: f64,
     /// The ON (1 or 2) the join evaluates, if one reads only its inputs,
     /// and the ONs it checks its rows against after (an equivalence
     /// class's derived clause stood in for them below).
@@ -160,6 +161,8 @@ struct Pair {
     a_key: String,
     b_key: String,
     left: bool,
+    /// A FULL join (`left` false).
+    full: bool,
     on: Option<usize>,
 }
 
@@ -180,6 +183,8 @@ struct Combo {
     pair_key: String,
     base_key: String,
     left: bool,
+    /// A FULL join (`left` false).
+    full: bool,
     pair_first: bool,
 }
 
@@ -219,7 +224,8 @@ impl PgHandler {
         else {
             return None;
         };
-        let modelled = |k: &JoinKind| matches!(k, JoinKind::Inner | JoinKind::Left);
+        let modelled =
+            |k: &JoinKind| matches!(k, JoinKind::Inner | JoinKind::Left | JoinKind::Full);
         if !modelled(k1)
             || !modelled(k2)
             || !m1.is_empty()
@@ -295,6 +301,7 @@ impl PgHandler {
         };
         let left1 = k1 == JoinKind::Left;
         let left2 = k2 == JoinKind::Left;
+        let (full1, full2) = (k1 == JoinKind::Full, k2 == JoinKind::Full);
         let shared = wk == xk || wk == yk;
         let side = |i: usize, key: &str| {
             let b = &bases[i];
@@ -308,7 +315,7 @@ impl PgHandler {
         // clauses are matched by their keys' hash alone, so only for
         // integer keys, where that is equality; the ONs still decide every
         // row at the top.
-        let ec = shared && !left1 && !left2;
+        let ec = shared && !left1 && !left2 && !full1 && !full2;
         let (pairs, combos) = if ec {
             let types: Vec<Option<String>> = [(0, xk), (1, yk), (2, zk)]
                 .iter()
@@ -334,6 +341,7 @@ impl PgHandler {
                 a_key: ak.clone(),
                 b_key: bk.clone(),
                 left: false,
+                full: false,
                 on: on_of(a, b),
             };
             let pairs = vec![pair(0, 1, xk, yk), pair(0, 2, xk, zk), pair(1, 2, yk, zk)];
@@ -343,6 +351,7 @@ impl PgHandler {
                 pair_key: pk.clone(),
                 base_key: bk.clone(),
                 left: false,
+                full: false,
                 pair_first: true,
             };
             let combos = vec![
@@ -360,6 +369,7 @@ impl PgHandler {
                     a_key: xk.clone(),
                     b_key: yk.clone(),
                     left: left1,
+                    full: full1,
                     on: Some(1),
                 },
                 Pair {
@@ -368,6 +378,7 @@ impl PgHandler {
                     a_key: wk.clone(),
                     b_key: zk.clone(),
                     left: left2,
+                    full: full2,
                     on: Some(2),
                 },
             ];
@@ -377,13 +388,14 @@ impl PgHandler {
             // x) is.
             let v = 1 - w;
             let (v_key, wz_key) = if v == 0 { (xk, yk) } else { (yk, xk) };
-            let combos = vec![
+            let mut combos = vec![
                 Combo {
                     pair: 0,
                     base: 2,
                     pair_key: wk.clone(),
                     base_key: zk.clone(),
                     left: left2,
+                    full: full2,
                     pair_first: true,
                 },
                 Combo {
@@ -392,9 +404,16 @@ impl PgHandler {
                     pair_key: wz_key.clone(),
                     base_key: v_key.clone(),
                     left: left1,
+                    full: full1,
                     pair_first: !(left1 && v == 0),
                 },
             ];
+            // A FULL join's minimum sides are its whole syntactic ones
+            // (`make_outerjoininfo`), so with one in the chain x-y is
+            // joined first, then z (`join_is_legal`).
+            if full1 || full2 {
+                combos.truncate(1);
+            }
             (pairs, combos)
         };
         // Level 2, in `join_search_one_level`'s order.
@@ -402,8 +421,13 @@ impl PgHandler {
         for p in &pairs {
             let (a, b) = (side(p.a, &p.a_key)?, side(p.b, &p.b_key)?);
             let mut rel = JoinRel::new(false);
-            rel.add_paths(0, &a, &b, p.left, true);
-            let rows = join_rows(&a, &b, p.left);
+            let rows = if p.full {
+                rel.add_full_paths(0, &a, &b);
+                secantus_pgplan::joincost::full_join_rows(&a, &b)
+            } else {
+                rel.add_paths(0, &a, &b, p.left, true);
+                join_rows(&a, &b, p.left)
+            };
             rels.push(PairRel {
                 rows,
                 total: rel.cheapest(None, rows)?,
@@ -437,8 +461,13 @@ impl PgHandler {
             } else {
                 (base_side, pair_side)
             };
-            top.add_paths(i, &a, &b, c.left, true);
-            rows3.get_or_insert(join_rows(&a, &b, c.left));
+            if c.full {
+                top.add_full_paths(i, &a, &b);
+                rows3.get_or_insert(secantus_pgplan::joincost::full_join_rows(&a, &b));
+            } else {
+                top.add_paths(i, &a, &b, c.left, true);
+                rows3.get_or_insert(join_rows(&a, &b, c.left));
+            }
             sides.push((a, b));
         }
         let choice = top.cheapest(None, rows3?)?;
@@ -489,6 +518,7 @@ impl PgHandler {
                 a_key: p.a_key.clone(),
                 b_key: p.b_key.clone(),
                 a_rows: side(p.a, &p.a_key)?.rows,
+                b_rows: side(p.b, &p.b_key)?.rows,
                 on: p.on,
                 filters: Vec::new(),
                 batches: None,
@@ -500,6 +530,7 @@ impl PgHandler {
                 a_key,
                 b_key,
                 a_rows: a.rows,
+                b_rows: sides[choice.combo].1.rows,
                 on: top_on,
                 filters: rest,
                 batches: None,
@@ -556,32 +587,38 @@ impl PgHandler {
         let a = inputs[fa].take().expect("each table read once");
         let b = inputs[fb].take().expect("each table read once");
         let a_type = leaf_key_type(nodes[fa], &plan.first_step.a_key);
-        let Some(joined) = self.run_step(&plan.first_step, a, b, a_type, on(plan.first_step.on))?
+        let b_type = leaf_key_type(nodes[fb], &plan.first_step.b_key);
+        let Some(joined) = self.run_step(
+            &plan.first_step,
+            a,
+            b,
+            a_type,
+            b_type,
+            on(plan.first_step.on),
+        )?
         else {
             return Ok(None);
         };
         let third = inputs.into_iter().flatten().next().expect("one table left");
-        let third_node = nodes
-            .iter()
-            .enumerate()
-            .find(|(i, _)| *i != fa && *i != fb)
-            .map(|(_, n)| *n)
-            .expect("one table left");
-        let (a, b, a_type) = if plan.joinrel_first {
-            // The key's type is its base table's.
-            let ty = nodes
-                .iter()
-                .find_map(|n| leaf_key_type(n, &plan.second_step.a_key));
-            (joined, third, ty)
+        // A key's type is its base table's.
+        let type_of = |key: &str| nodes.iter().find_map(|n| leaf_key_type(n, key));
+        let (a_type, b_type) = (
+            type_of(&plan.second_step.a_key),
+            type_of(&plan.second_step.b_key),
+        );
+        let (a, b) = if plan.joinrel_first {
+            (joined, third)
         } else {
-            (
-                third,
-                joined,
-                leaf_key_type(third_node, &plan.second_step.a_key),
-            )
+            (third, joined)
         };
-        let Some(joined) =
-            self.run_step(&plan.second_step, a, b, a_type, on(plan.second_step.on))?
+        let Some(joined) = self.run_step(
+            &plan.second_step,
+            a,
+            b,
+            a_type,
+            b_type,
+            on(plan.second_step.on),
+        )?
         else {
             return Ok(None);
         };
@@ -614,11 +651,51 @@ impl PgHandler {
         mut a: Input,
         mut b: Input,
         a_type: Option<String>,
+        b_type: Option<String>,
         on: Option<&secantus_pgplan::ColumnExpr>,
     ) -> PgWireResult<Option<Input>> {
         let a_first = (step.a_key.clone(), step.b_key.clone());
         let b_first = (step.b_key.clone(), step.a_key.clone());
         let (outer, inner, kind, (outer_key, inner_key)) = match step.method {
+            // A FULL join: a hash full join's hashed side in its table's
+            // order, which its probes' matches and the rows nothing matched
+            // both keep; a merge full join's sides in key order.
+            JoinMethod::HashFullA => {
+                let ordered = b_type
+                    .is_some_and(|ty| hash_table_order(&mut b.rows, &step.b_key, &ty, step.b_rows));
+                if !ordered {
+                    return Ok(None);
+                }
+                (a, b, JoinKind::Full, a_first)
+            }
+            JoinMethod::HashFullB => {
+                let ordered = a_type
+                    .is_some_and(|ty| hash_table_order(&mut a.rows, &step.a_key, &ty, step.a_rows));
+                if !ordered {
+                    return Ok(None);
+                }
+                (b, a, JoinKind::Full, b_first)
+            }
+            JoinMethod::MergeFullA { .. } => {
+                reorder_join_inputs(
+                    step.method,
+                    &mut a.rows,
+                    &step.a_key,
+                    &mut b.rows,
+                    &step.b_key,
+                );
+                (a, b, JoinKind::Full, a_first)
+            }
+            JoinMethod::MergeFullB { .. } => {
+                reorder_join_inputs(
+                    step.method,
+                    &mut a.rows,
+                    &step.a_key,
+                    &mut b.rows,
+                    &step.b_key,
+                );
+                (b, a, JoinKind::Full, b_first)
+            }
             JoinMethod::MergeRightB {
                 a_by_index,
                 b_by_index,
@@ -689,8 +766,26 @@ impl PgHandler {
                 _ => {}
             }
         }
+        let merge_full = matches!(
+            step.method,
+            JoinMethod::MergeFullA { .. } | JoinMethod::MergeFullB { .. }
+        );
+        let inner_max = if merge_full {
+            inner
+                .rows
+                .iter()
+                .filter_map(|r| r.get(&inner_key).filter(|v| **v != Bson::Null))
+                .max_by(|p, q| secantus_pgplan::compare_values(p, q).unwrap_or(Ordering::Equal))
+                .cloned()
+        } else {
+            None
+        };
+        let (fill_outer, fill_inner) = (outer_key.clone(), inner_key.clone());
         let mut outer_rows = Some(outer.rows);
         let mut out = Vec::new();
+        // Where the last batch begins: a FULL join's last is the inner rows
+        // nothing matched.
+        let mut last = 0;
         self.join_rows_core(
             kind,
             on,
@@ -706,10 +801,15 @@ impl PgHandler {
             },
             inner.rows,
             &mut |docs| {
+                last = out.len();
                 out.extend(docs);
                 Ok(true)
             },
         )?;
+        if merge_full {
+            let tail = out.split_off(last);
+            out = crate::merge_full_place(out, tail, &fill_outer, &fill_inner, inner_max.as_ref());
+        }
         if matches!(step.method, JoinMethod::MergeRightB { .. }) {
             out = merge_right_fill(out, &step.b_key, &step.a_key);
         }
