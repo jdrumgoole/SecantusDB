@@ -484,6 +484,60 @@ impl Heap {
         }
     }
 
+    /// The TIDs an index may point at whose whole HOT chain is dead to
+    /// every snapshot (`heap_hot_search_buffer` under
+    /// `SnapshotNonVacuumable` finding nothing), as bottom-up index
+    /// deletion asks the heap (RP-196). Only settled deleters count.
+    pub(crate) fn vacuumable_tids(
+        &self,
+        horizon: u64,
+        running: &dyn Fn(u64) -> bool,
+    ) -> std::collections::HashSet<i64> {
+        let mut out = std::collections::HashSet::new();
+        for (b, page) in self.pages.iter().enumerate() {
+            let b = b as u32;
+            for (&o, lp) in &page.lps {
+                let root = match lp {
+                    Lp::Normal(t) => !t.heap_only,
+                    _ => true,
+                };
+                if root && self.chain_vacuumable(page, b, o, horizon, running) {
+                    out.insert(tid(b, o));
+                }
+            }
+        }
+        out
+    }
+
+    fn chain_vacuumable(
+        &self,
+        page: &Page,
+        block: u32,
+        mut off: u16,
+        horizon: u64,
+        running: &dyn Fn(u64) -> bool,
+    ) -> bool {
+        for _ in 0..=page.nlp {
+            match page.lps.get(&off) {
+                // An ordinary live tuple, kept out of the map.
+                None => return false,
+                Some(Lp::Dead | Lp::Unused) => return true,
+                Some(Lp::Redirect(n)) => off = *n,
+                Some(lp @ Lp::Normal(t)) => {
+                    let state = self.htsv(tid(block, off), Some(lp), horizon, running, &|_| false);
+                    if state != Htsv::Dead {
+                        return false;
+                    }
+                    match t.hot_next {
+                        Some(n) => off = n,
+                        None => return true,
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// The marked tuples on `block` whose deleter ended before `horizon`
     /// but is not yet settled: `(offset, _id)`, for the caller to look up.
     pub(crate) fn unsettled(

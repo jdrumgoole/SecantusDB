@@ -1105,6 +1105,8 @@ pub enum Statement {
         outside_block: bool,
         analyze: bool,
         full: bool,
+        /// `REINDEX SCHEMA s`: the schema whose tables are rebuilt.
+        schema: Option<String>,
     },
     /// `CLUSTER [table [USING index]]`: the table's rows rewritten in the
     /// index's order, which an unordered scan then shows.
@@ -5514,6 +5516,7 @@ fn plan_node(
                 outside_block: v.is_vacuumcmd,
                 analyze,
                 full,
+                schema: None,
             })
         }
         N::CheckPointStmt(_) => Ok(Statement::Maintenance {
@@ -5523,6 +5526,7 @@ fn plan_node(
             outside_block: false,
             analyze: false,
             full: false,
+            schema: None,
         }),
         N::ReindexStmt(r) => {
             use pg_query::protobuf::ReindexObjectType as R;
@@ -5548,6 +5552,7 @@ fn plan_node(
                 outside_block: whole.is_some(),
                 analyze: false,
                 full: false,
+                schema: (whole == Some("SCHEMA")).then(|| r.name.clone()),
             })
         }
         N::ClusterStmt(c) => Ok(Statement::Cluster {
@@ -7296,7 +7301,7 @@ fn plan_alter_action(
                         } else if let Some(ix) = &using_index {
                             ix.clone()
                         } else {
-                            format!("{table}_pkey")
+                            format!("{}_pkey", schemas::split_key(table).1)
                         },
                         columns: string_list(&k.keys),
                         using_index,
@@ -10555,7 +10560,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     }
     let mut check_names: Vec<String> = fks.iter().map(|f| f.name.clone()).collect();
     if def.columns.iter().any(|c| c.pk) {
-        check_names.push(format!("{table}_pkey"));
+        check_names.push(format!("{}_pkey", schemas::split_key(&table).1));
     }
     for (conname, raw) in checks {
         // The predicate's SQL text is the catalog record (`(a > 0)`);

@@ -179,7 +179,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ------------------------------------------------- RP-196's remainder
     "bottom-up deletion keeps an unchanged key's index small": (
         "RP-196",
-        True,
+        False,
         [
             f"create table rp60_k (a int primary key, b int) {_NOAV}",
             "insert into rp60_k select g, 0 from generate_series(1, 2000) g",

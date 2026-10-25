@@ -590,6 +590,11 @@ impl PgHandler {
         field("__sys_xmin") == Some((xid & 0xFFFF_FFFF) as i64) && field("__sys_cid") == Some(cid)
     }
 
+    /// The running command's `(xid, command id)`.
+    pub(crate) fn command_writer(&self) -> (u64, i64) {
+        self.writer()
+    }
+
     fn writer(&self) -> (u64, i64) {
         let pid = self.pid();
         let xid =
@@ -803,7 +808,9 @@ impl PgHandler {
             self.stat_writes(&heap_table, inserted, updated, hot);
             // Every version that is not heap-only takes a tuple in each of
             // the table's B-trees (RP-196).
-            let indexed: Vec<(&Document, i64)> = idx
+            // With the old version, so an index can tell its key was left
+            // unchanged (`indexUnchanged`, which allows bottom-up deletion).
+            let indexed: Vec<(&Document, Option<&Document>, i64)> = idx
                 .iter()
                 .zip(olds.iter().zip(&ctids))
                 .filter(|(_, (old, ctid))| match old {
@@ -812,7 +819,7 @@ impl PgHandler {
                         !(*same && old_ctid.is_some_and(|o| o / 65536 == **ctid / 65536))
                     }
                 })
-                .map(|(i, (_, ctid))| (&rows[*i].1, *ctid))
+                .map(|(i, (_, ctid))| (&rows[*i].1, rows[*i].0.as_ref(), *ctid))
                 .collect();
             self.btree_insert_versions(&heap_table, &indexed)?;
             for (i, ctid) in idx.into_iter().zip(ctids) {
@@ -966,6 +973,58 @@ impl PgHandler {
             }
         }
         mark
+    }
+
+    /// The TIDs of `table`'s heap whose HOT chains are dead to every
+    /// snapshot, for bottom-up index deletion (RP-196): each ended deleter
+    /// settled first, as [`Self::prune_pages`] settles them, without a
+    /// prune. Taken before the indexes are written, so no B-tree is held
+    /// while the heap is read.
+    pub(crate) fn dead_index_tids(
+        &self,
+        table: &str,
+    ) -> PgWireResult<std::collections::HashSet<i64>> {
+        if !self.has_heap(table) {
+            return Ok(Default::default());
+        }
+        let (running, horizon) = visibility();
+        let is_running = |x: u64| running.contains(&x);
+        let candidates: Vec<(u32, Vec<(u16, Bson)>)> = self.with_heap(table, |heap| {
+            (0..heap.nblocks())
+                .map(|b| (b, heap.unsettled(b, horizon, &is_running)))
+                .filter(|(_, u)| !u.is_empty())
+                .collect()
+        })?;
+        let ids: Vec<Bson> = candidates
+            .iter()
+            .flat_map(|(_, u)| u.iter().map(|(_, id)| id.clone()))
+            .collect();
+        let present: std::collections::HashMap<String, i64> = if ids.is_empty() {
+            Default::default()
+        } else {
+            self.storage
+                .find_matching(self.db(), table, &bson::doc! { "_id": { "$in": ids } })
+                .map_err(|e| Self::storage_err("could not read", e))?
+                .iter()
+                .filter_map(|raw| {
+                    let d = crate::decode_doc(raw).ok()?;
+                    Some((d.get("_id")?.to_string(), ctid_of(&d)?))
+                })
+                .collect()
+        };
+        self.with_heap(table, |heap| {
+            for (block, unsettled) in candidates {
+                let outcome: Vec<(u16, bool)> = unsettled
+                    .iter()
+                    .map(|(off, id)| {
+                        let here = present.get(&id.to_string()) == Some(&tid(block, *off));
+                        (*off, !here)
+                    })
+                    .collect();
+                heap.settle(block, &outcome);
+            }
+            heap.vacuumable_tids(horizon, &is_running)
+        })
     }
 
     /// `heap_page_prune_opt` on the pages a read of `table` met: every

@@ -1223,7 +1223,12 @@ pub(crate) fn pk_constraint_name(def: &TableDef) -> String {
     def.extra
         .get_str("pk_name")
         .map(str::to_string)
-        .unwrap_or_else(|_| format!("{}_pkey", def.name))
+        .unwrap_or_else(|_| {
+            // Named after the table's own name, not its schema-qualified key:
+            // `create table s.t (... primary key)` makes `s.t_pkey`, an index
+            // `t_pkey` in schema `s`.
+            format!("{}_pkey", secantus_pgplan::schemas::split_key(&def.name).1)
+        })
 }
 
 /// A call's input arguments spread over every declared parameter position
@@ -26681,7 +26686,7 @@ impl PgHandler {
                 let exists = def.check_constraints.iter().any(|c| c.name == *name)
                     || def.foreign_keys.iter().any(|f| f.name == *name)
                     || def.unique_constraints.iter().any(|u| u.name == *name)
-                    || *name == format!("{table}_pkey");
+                    || *name == format!("{}_pkey", secantus_pgplan::schemas::split_key(table).1);
                 if !exists {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -38210,7 +38215,7 @@ impl PgHandler {
                     match self.storage.explain_plan(&db, table, filter).ok()? {
                         secantus_storage::ExplainPlan::IxScan { index_name, .. } => {
                             Some(if index_name == "_id_" {
-                                format!("{table}_pkey")
+                                format!("{}_pkey", secantus_pgplan::schemas::split_key(table).1)
                             } else {
                                 index_name
                             })
@@ -39725,6 +39730,7 @@ impl PgHandler {
                 outside_block,
                 analyze,
                 full,
+                schema,
             } => {
                 if outside_block {
                     self.refuse_in_transaction_block(&command)?;
@@ -39742,14 +39748,42 @@ impl PgHandler {
                         }
                     }
                 }
+                // An index named by its key: `name` in `public`, `s.name` in
+                // schema `s` (the index's own name, its table's schema).
+                let names_index = |ix: &IndexRelation, key: &str| {
+                    let (schema, bare) = secantus_pgplan::schemas::split_key(key);
+                    ix.name == bare
+                        && secantus_pgplan::schemas::split_key(&ix.table.name).0 == schema
+                };
                 for index in &indexes {
-                    if !self.index_relations().iter().any(|ix| ix.name == *index) {
+                    if !self
+                        .index_relations()
+                        .iter()
+                        .any(|ix| names_index(ix, index))
+                    {
                         return Err(Self::relation_missing(index));
                     }
                 }
                 // REINDEX rebuilds each B-tree from the rows, as a build
-                // records it (RP-196). REINDEX SYSTEM's are the catalogs';
-                // REINDEX SCHEMA names no table here, so changes none.
+                // records it (RP-196); REINDEX SCHEMA each of the schema's
+                // tables'. REINDEX SYSTEM's are the catalogs'.
+                if let (Some(schema), "REINDEX SCHEMA") = (&schema, command.as_str()) {
+                    if !secantus_pgplan::schemas::schema_exists(schema) {
+                        return Err(Self::user_error(
+                            "3F000",
+                            format!("schema \"{schema}\" does not exist"),
+                        ));
+                    }
+                    let named: Vec<String> = self
+                        .all_table_defs()?
+                        .into_iter()
+                        .map(|d| d.name)
+                        .filter(|n| secantus_pgplan::schemas::split_key(n).0 == *schema)
+                        .collect();
+                    for t in &named {
+                        self.btree_reindex(t)?;
+                    }
+                }
                 if command == "REINDEX" || command == "REINDEX DATABASE" {
                     let named: Vec<String> = if tables.is_empty() && indexes.is_empty() {
                         self.all_table_defs()?.into_iter().map(|d| d.name).collect()
@@ -39763,10 +39797,10 @@ impl PgHandler {
                         let owner = self
                             .index_relations()
                             .into_iter()
-                            .find(|ix| ix.name == *index)
-                            .map(|ix| ix.table.name);
-                        if let Some(t) = owner {
-                            self.btree_reindex_one(&t, index)?;
+                            .find(|ix| names_index(ix, index))
+                            .map(|ix| (ix.table.name, ix.name));
+                        if let Some((t, name)) = owner {
+                            self.btree_reindex_one(&t, &name)?;
                         }
                     }
                 }

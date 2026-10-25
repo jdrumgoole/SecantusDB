@@ -1003,6 +1003,13 @@ pub fn qualify(node: &mut N) -> Result<()> {
                 drop_added_alias(r);
             }
         }
+        // REINDEX TABLE / INDEX's relation, which the walk does not reach.
+        N::ReindexStmt(r) => {
+            if let Some(r) = r.relation.as_mut() {
+                qualify_reference(r, &ctes, trivial);
+                drop_added_alias(r);
+            }
+        }
         // A policy's, a statistics object's and a publication's table: the
         // walk does not reach them, and a bare name searched only `public`.
         N::CreatePolicyStmt(c) => {
@@ -1194,7 +1201,8 @@ fn node_mentions_schema(node: &N) -> bool {
         | N::CreateStmt(_)
         | N::CreateSeqStmt(_)
         | N::ViewStmt(_)
-        | N::CreateTableAsStmt(_) => true,
+        | N::CreateTableAsStmt(_)
+        | N::ReindexStmt(_) => true,
         N::AlterTableStmt(_)
         | N::CreatePolicyStmt(_)
         | N::AlterPolicyStmt(_)
