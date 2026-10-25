@@ -96,7 +96,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # What is still left of RP-196.
     "every step of eight updates of a primary key": (
         "RP-196",
-        True,
+        False,
         [
             f"create table rp71_e (a int primary key, b int) {_NOAV}",
             "insert into rp71_e select g, 0 from generate_series(1, 2000) g",

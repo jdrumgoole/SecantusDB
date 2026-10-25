@@ -1,13 +1,17 @@
 //! `CREATE / ALTER / DROP TEXT SEARCH DICTIONARY` (RP-169), and what a
 //! dictionary does with a token, as PostgreSQL 15.19's templates do it
-//! (`dict_simple.c`, `dict_snowball.c`, `dict_synonym.c`): its options
-//! checked as the template's `init` checks them, and its `lexize`. The
-//! executor keeps the `pg_ts_dict` rows (`secantus-pg`'s `ts_dicts.rs`);
-//! `ts_catalog` serves them, and `ts_lexize`, `to_tsvector` and the rest
-//! lexize through them.
+//! (`dict_simple.c`, `dict_snowball.c`, `dict_synonym.c`, `dict_ispell.c`
+//! with `spell.c` in `ts_ispell`, `dict_thesaurus.c` in `ts_thesaurus`):
+//! its options checked as the template's `init` checks them, and its
+//! `lexize`. The executor keeps the `pg_ts_dict` rows (`secantus-pg`'s
+//! `ts_dicts.rs`); `ts_catalog` serves them, and `ts_lexize`, `to_tsvector`
+//! and the rest lexize through them.
 //!
-//! The `ispell` and `thesaurus` templates are refused by name: their
-//! dictionary files' formats are not read here.
+//! A dictionary file is one of the samples PostgreSQL installs in
+//! `$SHAREDIR/tsearch_data`, the only files this server has: any other
+//! name is missing, as a file not installed is.
+
+use std::rc::Rc;
 
 use super::*;
 use crate::ts_configs::QualifiedName;
@@ -16,15 +20,18 @@ use crate::ts_configs::QualifiedName;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TsDictOp {
     /// `CREATE TEXT SEARCH DICTIONARY name (option = value, ...)`: the
-    /// options as written, `template` among them.
+    /// options as written, `template` among them; `numeric` names those
+    /// written as a number.
     Create {
         name: QualifiedName,
         options: Vec<(String, Option<String>)>,
+        numeric: Vec<String>,
     },
     /// `ALTER TEXT SEARCH DICTIONARY name (option [= value], ...)`.
     Alter {
         name: QualifiedName,
         options: Vec<(String, Option<String>)>,
+        numeric: Vec<String>,
     },
     Drop {
         names: Vec<QualifiedName>,
@@ -66,6 +73,29 @@ fn options(defs: &[pg_query::protobuf::Node]) -> Vec<(String, Option<String>)> {
         .collect()
 }
 
+/// The options whose value is written as a number (an `Integer` or `Float`
+/// node), which `serialize_deflist` writes unquoted.
+fn numeric_options(defs: &[pg_query::protobuf::Node]) -> Vec<String> {
+    defs.iter()
+        .filter_map(|e| match e.node.as_ref() {
+            Some(N::DefElem(e)) => match e.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                Some(N::Integer(_)) | Some(N::Float(_)) => Some(e.defname.clone()),
+                Some(N::AConst(c))
+                    if matches!(
+                        c.val,
+                        Some(pg_query::protobuf::a_const::Val::Ival(_))
+                            | Some(pg_query::protobuf::a_const::Val::Fval(_))
+                    ) =>
+                {
+                    Some(e.defname.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
 /// `defGetString`: a value's text, a name's parts dotted.
 fn def_text(n: &pg_query::protobuf::Node) -> String {
     match n.node.as_ref() {
@@ -89,6 +119,7 @@ pub(crate) fn plan_create(d: &pg_query::protobuf::DefineStmt) -> Result<Statemen
     Ok(Statement::TsDict(TsDictOp::Create {
         name: d.defnames.iter().flat_map(parts).collect(),
         options: options(&d.definition),
+        numeric: numeric_options(&d.definition),
     }))
 }
 
@@ -97,6 +128,7 @@ pub(crate) fn plan_alter(a: &pg_query::protobuf::AlterTsDictionaryStmt) -> Resul
     Ok(Statement::TsDict(TsDictOp::Alter {
         name: a.dictname.iter().flat_map(parts).collect(),
         options: options(&a.options),
+        numeric: numeric_options(&a.options),
     }))
 }
 
@@ -131,15 +163,27 @@ pub(crate) fn plan_set_schema(a: &pg_query::protobuf::AlterObjectSchemaStmt) -> 
     }))
 }
 
-/// `serialize_deflist`: `dictinitoption`'s text, `name = 'value'` each.
-pub fn options_text(options: &[(String, String)]) -> Option<String> {
+/// `serialize_deflist`: `dictinitoption`'s text, `name = 'value'` each,
+/// but a number (one of `numeric`) unquoted and a value with a backslash
+/// in `E''` syntax.
+pub fn options_text(options: &[(String, String)], numeric: &[String]) -> Option<String> {
     if options.is_empty() {
         return None;
     }
     Some(
         options
             .iter()
-            .map(|(k, v)| format!("{k} = '{}'", v.replace('\'', "''")))
+            .map(|(name, v)| {
+                let k = crate::scalar::quote_identifier(name);
+                if numeric.contains(name) {
+                    // A number, unquoted, so that it reads back as one.
+                    format!("{k} = {v}")
+                } else if v.contains('\\') {
+                    format!("{k} = E'{}'", v.replace('\\', "\\\\").replace('\'', "''"))
+                } else {
+                    format!("{k} = '{}'", v.replace('\'', "''"))
+                }
+            })
             .collect::<Vec<_>>()
             .join(", "),
     )
@@ -217,6 +261,44 @@ pub fn template_name(oid: i64) -> Option<&'static str> {
     })
 }
 
+/// `TSL_ADDPOS` (`ts_public.h`): this lexeme starts a new position.
+pub const TSL_ADDPOS: u16 = 0x01;
+/// `TSL_PREFIX`: this lexeme matches as a prefix.
+pub const TSL_PREFIX: u16 = 0x02;
+/// `TSL_FILTER`: this lexeme replaces the token for the next dictionary.
+pub const TSL_FILTER: u16 = 0x04;
+
+/// `TSLexeme`: a lexeme, the variant of the token's normal forms it
+/// belongs to, and its `TSL_*` flags.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TsLexeme {
+    pub lexeme: String,
+    pub nvariant: u16,
+    pub flags: u16,
+}
+
+impl TsLexeme {
+    fn plain(lexeme: String) -> TsLexeme {
+        TsLexeme {
+            lexeme,
+            nvariant: 0,
+            flags: 0,
+        }
+    }
+}
+
+/// `DictSubState`: what a multi-word dictionary (a thesaurus) keeps
+/// between the tokens of a phrase.
+#[derive(Debug, Default)]
+pub struct DictState {
+    /// No more tokens: say what the phrase so far gives.
+    pub isend: bool,
+    /// The dictionary wants the next token.
+    pub getnext: bool,
+    /// The thesaurus's rules still matching.
+    pub(crate) private: Vec<usize>,
+}
+
 /// What a dictionary does with a token, its options read.
 #[derive(Debug, Clone)]
 pub enum Lexer {
@@ -233,6 +315,11 @@ pub enum Lexer {
         entries: Vec<(String, String, bool)>,
         case_sensitive: bool,
     },
+    Ispell {
+        dict: Rc<crate::ts_ispell::IspellDict>,
+        stop: Option<Vec<String>>,
+    },
+    Thesaurus(Rc<crate::ts_thesaurus::Thesaurus>),
 }
 
 /// The share directory a missing dictionary file's message names: a
@@ -294,6 +381,41 @@ fn boolean(name: &str, v: Option<&str>) -> Result<bool> {
 
 /// The sample synonym file PostgreSQL ships (`synonym_sample.syn`).
 const SYNONYM_SAMPLE: &str = include_str!("tsearch_data/synonym_sample.syn");
+
+/// The dictionary files PostgreSQL installs in `tsearch_data`, by name and
+/// extension.
+fn tsearch_file(name: &str, ext: &str) -> Option<&'static str> {
+    Some(match (name, ext) {
+        ("synonym_sample", "syn") => SYNONYM_SAMPLE,
+        ("ispell_sample", "dict") => include_str!("tsearch_data/ispell_sample.dict"),
+        ("ispell_sample", "affix") => include_str!("tsearch_data/ispell_sample.affix"),
+        ("hunspell_sample", "affix") => include_str!("tsearch_data/hunspell_sample.affix"),
+        ("hunspell_sample_long", "affix") => {
+            include_str!("tsearch_data/hunspell_sample_long.affix")
+        }
+        ("hunspell_sample_long", "dict") => include_str!("tsearch_data/hunspell_sample_long.dict"),
+        ("hunspell_sample_num", "affix") => include_str!("tsearch_data/hunspell_sample_num.affix"),
+        ("hunspell_sample_num", "dict") => include_str!("tsearch_data/hunspell_sample_num.dict"),
+        ("thesaurus_sample", "ths") => include_str!("tsearch_data/thesaurus_sample.ths"),
+        _ => return None,
+    })
+}
+
+/// `get_tsearch_config_filename` then `tsearch_readline_begin`: the file
+/// `name.ext`, or the error a template raises when it cannot open it
+/// (`what` names the file's kind in the message).
+fn config_file(name: &str, ext: &str, what: &str) -> Result<&'static str> {
+    config_file_name(name)?;
+    tsearch_file(name, ext).ok_or_else(|| {
+        Error::Sqlstate(
+            "F0000",
+            format!(
+                "could not open {what} file \"{}\": No such file or directory",
+                tsearch_data_path(&format!("{name}.{ext}"))
+            ),
+        )
+    })
+}
 
 /// A template's `init`: its options checked and read.
 pub fn init(template: i64, options: &[(String, String)]) -> Result<Lexer> {
@@ -393,19 +515,7 @@ pub fn init(template: i64, options: &[(String, String)]) -> Result<Lexer> {
             }
             let file =
                 file.ok_or_else(|| Error::Sqlstate("22023", "missing Synonyms parameter".into()))?;
-            config_file_name(&file)?;
-            let text = match file.as_str() {
-                "synonym_sample" => SYNONYM_SAMPLE,
-                _ => {
-                    return Err(Error::Sqlstate(
-                        "F0000",
-                        format!(
-                            "could not open synonym file \"{}\": No such file or directory",
-                            tsearch_data_path(&format!("{file}.syn"))
-                        ),
-                    ))
-                }
-            };
+            let text = config_file(&file, "syn", "synonym")?;
             let lower = |s: &str| -> String {
                 if case_sensitive {
                     s.to_string()
@@ -432,10 +542,106 @@ pub fn init(template: i64, options: &[(String, String)]) -> Result<Lexer> {
                 case_sensitive,
             })
         }
-        ISPELL | THESAURUS => Err(Error::FeatureNotSupported(format!(
-            "text search dictionaries of the {} template are not supported",
-            template_name(template).unwrap_or_default()
-        ))),
+        ISPELL => {
+            // `dispell_init`: each file read as its option comes.
+            let mut b = crate::ts_ispell::IspellBuilder::new();
+            let (mut dict, mut aff, mut stop) = (false, false, None);
+            let multiple =
+                |what: &str| Error::Sqlstate("22023", format!("multiple {what} parameters"));
+            for (k, v) in options {
+                match k.as_str() {
+                    "dictfile" => {
+                        if dict {
+                            return Err(multiple("DictFile"));
+                        }
+                        b.import_dictionary(config_file(v, "dict", "dictionary")?);
+                        dict = true;
+                    }
+                    "afffile" => {
+                        if aff {
+                            return Err(multiple("AffFile"));
+                        }
+                        b.import_affixes(config_file(v, "affix", "affix")?)?;
+                        aff = true;
+                    }
+                    "stopwords" => {
+                        if stop.is_some() {
+                            return Err(multiple("StopWords"));
+                        }
+                        stop = Some(stop_list(v)?);
+                    }
+                    other => {
+                        return Err(Error::Sqlstate(
+                            "22023",
+                            format!("unrecognized Ispell parameter: \"{other}\""),
+                        ))
+                    }
+                }
+            }
+            if !aff {
+                return Err(Error::Sqlstate("22023", "missing AffFile parameter".into()));
+            }
+            if !dict {
+                return Err(Error::Sqlstate(
+                    "22023",
+                    "missing DictFile parameter".into(),
+                ));
+            }
+            Ok(Lexer::Ispell {
+                dict: Rc::new(b.finish()?),
+                stop,
+            })
+        }
+        THESAURUS => {
+            // `thesaurus_init`: the file read as its option comes, compiled
+            // once the subdictionary is known.
+            let mut file = None;
+            let mut subdict: Option<&str> = None;
+            for (k, v) in options {
+                match k.as_str() {
+                    "dictfile" => {
+                        if file.is_some() {
+                            return Err(Error::Sqlstate(
+                                "22023",
+                                "multiple DictFile parameters".into(),
+                            ));
+                        }
+                        file = Some(config_file(v, "ths", "thesaurus")?);
+                    }
+                    "dictionary" => {
+                        if subdict.is_some() {
+                            return Err(Error::Sqlstate(
+                                "22023",
+                                "multiple Dictionary parameters".into(),
+                            ));
+                        }
+                        subdict = Some(v);
+                    }
+                    other => {
+                        return Err(Error::Sqlstate(
+                            "22023",
+                            format!("unrecognized Thesaurus parameter: \"{other}\""),
+                        ))
+                    }
+                }
+            }
+            let file =
+                file.ok_or_else(|| Error::Sqlstate("22023", "missing DictFile parameter".into()))?;
+            let subdict = subdict
+                .ok_or_else(|| Error::Sqlstate("22023", "missing Dictionary parameter".into()))?;
+            let oid = crate::ts_catalog::oid_of(subdict, true).ok_or_else(|| {
+                Error::Sqlstate(
+                    "42704",
+                    format!(
+                        "text search dictionary \"{}\" does not exist",
+                        crate::ts_catalog::name_parts(subdict).join(".")
+                    ),
+                )
+            })?;
+            Ok(Lexer::Thesaurus(Rc::new(
+                crate::ts_thesaurus::Thesaurus::build(file, oid)?,
+            )))
+        }
         _ => Err(Error::Sqlstate(
             "42704",
             format!("text search template {template} does not exist"),
@@ -444,48 +650,119 @@ pub fn init(template: i64, options: &[(String, String)]) -> Result<Lexer> {
 }
 
 /// A template's `lexize`: the lexemes (an empty list for a stop word), or
-/// `None` when the dictionary does not recognise the token.
-pub fn lexize(lexer: &Lexer, token: &str) -> Option<Vec<String>> {
+/// `None` when the dictionary does not recognise the token. `state` is a
+/// multi-word dictionary's (`None` where PostgreSQL passes NULL, which a
+/// thesaurus refuses).
+pub fn lexize(
+    lexer: &Lexer,
+    token: &str,
+    state: Option<&mut DictState>,
+) -> Result<Option<Vec<TsLexeme>>> {
     let lower = || -> String { token.chars().map(crate::scalar::simple_lower).collect() };
     match lexer {
         Lexer::Simple { stop, accept } => {
             let txt = lower();
-            if txt.is_empty() || stop.as_ref().is_some_and(|s| s.contains(&txt)) {
-                Some(Vec::new())
-            } else if *accept {
-                Some(vec![txt])
-            } else {
-                None
-            }
+            Ok(
+                if txt.is_empty() || stop.as_ref().is_some_and(|s| s.contains(&txt)) {
+                    Some(Vec::new())
+                } else if *accept {
+                    Some(vec![TsLexeme::plain(txt)])
+                } else {
+                    None
+                },
+            )
         }
         Lexer::Snowball { language, stop } => {
             let txt = lower();
             if token.len() > 1000 {
-                return Some(vec![txt]);
+                return Ok(Some(vec![TsLexeme::plain(txt)]));
             }
             if txt.is_empty() || stop.as_ref().is_some_and(|s| s.contains(&txt)) {
-                return Some(Vec::new());
+                return Ok(Some(Vec::new()));
             }
-            Some(vec![crate::fts::stem_in(language, &txt)])
+            Ok(Some(vec![TsLexeme::plain(crate::fts::stem_in(
+                language, &txt,
+            ))]))
         }
         Lexer::Synonym {
             entries,
             case_sensitive,
         } => {
             if token.is_empty() || entries.is_empty() {
-                return None;
+                return Ok(None);
             }
             let key = if *case_sensitive {
                 token.to_string()
             } else {
                 lower()
             };
-            entries
+            Ok(entries
                 .binary_search_by(|e| e.0.as_bytes().cmp(key.as_bytes()))
                 .ok()
-                .map(|i| vec![entries[i].1.clone()])
+                .map(|i| {
+                    vec![TsLexeme {
+                        lexeme: entries[i].1.clone(),
+                        nvariant: 0,
+                        flags: if entries[i].2 { TSL_PREFIX } else { 0 },
+                    }]
+                }))
+        }
+        Lexer::Ispell { dict, stop } => {
+            // `dispell_lexize`: the normal forms, but the stop words.
+            if token.is_empty() {
+                return Ok(None);
+            }
+            let Some(forms) = dict.normalize_word(lower().as_bytes())? else {
+                return Ok(None);
+            };
+            Ok(Some(
+                forms
+                    .into_iter()
+                    .filter(|(l, _)| !stop.as_ref().is_some_and(|s| s.contains(l)))
+                    .map(|(lexeme, nvariant)| TsLexeme {
+                        lexeme,
+                        nvariant,
+                        flags: 0,
+                    })
+                    .collect(),
+            ))
+        }
+        Lexer::Thesaurus(t) => match state {
+            Some(state) => t.lexize(token, state),
+            None => Err(Error::Internal(
+                "forbidden call of thesaurus or nested call".into(),
+            )),
+        },
+    }
+}
+
+/// What dictionary `oid` -- a user one by its template, a built-in one as
+/// `fts` lexes -- does with `token`.
+pub fn lexize_oid(
+    oid: i64,
+    token: &str,
+    state: Option<&mut DictState>,
+) -> Result<Option<Vec<TsLexeme>>> {
+    if let Some(lexer) = crate::ts_catalog::user_lexer(oid) {
+        return lexize(&*lexer?, token, state);
+    }
+    let name = crate::ts_catalog::name_of(oid, true).unwrap_or_default();
+    Ok(crate::fts::builtin_lexize(&name, token)
+        .map(|v| v.into_iter().map(TsLexeme::plain).collect()))
+}
+
+/// `ts_lexize(dict, token)`: one token, and when the dictionary wants the
+/// next, a second call telling it there is none.
+pub fn ts_lexize(oid: i64, token: &str) -> Result<Option<Vec<TsLexeme>>> {
+    let mut state = DictState::default();
+    let mut res = lexize_oid(oid, token, Some(&mut state))?;
+    if state.getnext {
+        state.isend = true;
+        if let Some(r) = lexize_oid(oid, token, Some(&mut state))? {
+            res = Some(r);
         }
     }
+    Ok(res)
 }
 
 #[cfg(test)]
@@ -498,7 +775,7 @@ mod tests {
             ("stopwords".to_string(), "english".to_string()),
             ("accept".to_string(), "it's".to_string()),
         ];
-        let text = options_text(&opts).unwrap();
+        let text = options_text(&opts, &[]).unwrap();
         assert_eq!(text, "stopwords = 'english', accept = 'it''s'");
         assert_eq!(parse_options_text(&text), opts);
     }
@@ -506,8 +783,18 @@ mod tests {
     #[test]
     fn synonym_sample() {
         let l = init(SYNONYM, &[("synonyms".into(), "synonym_sample".into())]).unwrap();
-        assert_eq!(lexize(&l, "Postgres"), Some(vec!["pgsql".to_string()]));
-        assert_eq!(lexize(&l, "indices"), Some(vec!["index".to_string()]));
-        assert_eq!(lexize(&l, "nothing"), None);
+        let words = |t: &str| {
+            lexize(&l, t, None).unwrap().map(|v| {
+                v.into_iter()
+                    .map(|l| (l.lexeme, l.flags))
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(words("Postgres"), Some(vec![("pgsql".to_string(), 0)]));
+        assert_eq!(
+            words("indices"),
+            Some(vec![("index".to_string(), TSL_PREFIX)])
+        );
+        assert_eq!(words("nothing"), None);
     }
 }

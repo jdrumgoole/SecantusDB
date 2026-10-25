@@ -214,20 +214,24 @@ impl PgHandler {
             .map_or(0, |(_, o)| o)
     }
 
-    /// The token types of the default parser named, by number, or 22023.
-    fn token_types(tokens: &[String]) -> PgWireResult<Vec<i32>> {
-        tokens
-            .iter()
-            .map(|t| {
-                secantus_pgplan::wparser::TOKEN_TYPES
-                    .iter()
-                    .position(|(alias, _)| alias == t)
-                    .map(|i| i as i32 + 1)
-                    .ok_or_else(|| {
-                        Self::user_error("22023", format!("token type \"{t}\" does not exist"))
-                    })
-            })
-            .collect()
+    /// `getTokenTypes`: the token types of the default parser named, by
+    /// number, a name written twice taken once, or 22023.
+    fn token_types(tokens: &[String]) -> PgWireResult<Vec<(i32, String)>> {
+        let mut out: Vec<(i32, String)> = Vec::new();
+        for t in tokens {
+            if out.iter().any(|(_, n)| n == t) {
+                continue;
+            }
+            let num = secantus_pgplan::wparser::TOKEN_TYPES
+                .iter()
+                .position(|(alias, _)| alias == t)
+                .map(|i| i as i32 + 1)
+                .ok_or_else(|| {
+                    Self::user_error("22023", format!("token type \"{t}\" does not exist"))
+                })?;
+            out.push((num, t.clone()));
+        }
+        Ok(out)
     }
 
     fn dictionary(name: &QualifiedName) -> PgWireResult<i64> {
@@ -307,7 +311,10 @@ impl PgHandler {
                 let comment = self.ts_config_comment(c.oid);
                 match action {
                     MapAction::Add { tokens, dicts } => {
-                        let types = Self::token_types(&tokens)?;
+                        let types: Vec<i32> = Self::token_types(&tokens)?
+                            .into_iter()
+                            .map(|(t, _)| t)
+                            .collect();
                         let dicts: Vec<i64> = dicts
                             .iter()
                             .map(Self::dictionary)
@@ -332,7 +339,10 @@ impl PgHandler {
                         }
                     }
                     MapAction::AlterFor { tokens, dicts } => {
-                        let types = Self::token_types(&tokens)?;
+                        let types: Vec<i32> = Self::token_types(&tokens)?
+                            .into_iter()
+                            .map(|(t, _)| t)
+                            .collect();
                         let dicts: Vec<i64> = dicts
                             .iter()
                             .map(Self::dictionary)
@@ -345,7 +355,10 @@ impl PgHandler {
                         }
                     }
                     MapAction::Replace { tokens, old, new } => {
-                        let types = Self::token_types(&tokens)?;
+                        let types: Vec<i32> = Self::token_types(&tokens)?
+                            .into_iter()
+                            .map(|(t, _)| t)
+                            .collect();
                         let (old, new) = (Self::dictionary(&old)?, Self::dictionary(&new)?);
                         for (t, _, d) in &mut c.map {
                             if *d == old && (types.is_empty() || types.contains(t)) {
@@ -355,7 +368,7 @@ impl PgHandler {
                     }
                     MapAction::Drop { tokens, missing_ok } => {
                         let types = Self::token_types(&tokens)?;
-                        for (t, alias) in types.iter().zip(&tokens) {
+                        for (t, alias) in &types {
                             if !c.map.iter().any(|(mt, _, _)| mt == t) {
                                 let msg =
                                     format!("mapping for token type \"{alias}\" does not exist");

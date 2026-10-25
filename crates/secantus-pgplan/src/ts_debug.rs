@@ -150,7 +150,7 @@ pub(crate) fn debug(args: &[Bson]) -> Result<Rows> {
     }
     let rows = wparser::parse(&value_text(doc))
         .into_iter()
-        .map(|(ty, tok)| {
+        .map(|(ty, tok)| -> Result<Vec<Bson>> {
             let (alias, descr) = wparser::TOKEN_TYPES[usize::from(ty) - 1];
             let dicts = Bson::Array(
                 fts::debug_dictionaries(cfg, ty)
@@ -158,22 +158,22 @@ pub(crate) fn debug(args: &[Bson]) -> Result<Rows> {
                     .map(Bson::String)
                     .collect(),
             );
-            let (dict, lexemes) = match fts::debug_lexize(cfg, ty, &tok) {
+            let (dict, lexemes) = match fts::debug_lexize(cfg, ty, &tok)? {
                 Some((dict, lexemes)) => (
                     Bson::String(dict),
                     Bson::Array(lexemes.into_iter().map(Bson::String).collect()),
                 ),
                 None => (Bson::Null, Bson::Null),
             };
-            vec![
+            Ok(vec![
                 Bson::String(alias.into()),
                 Bson::String(descr.into()),
                 Bson::String(tok),
                 dicts,
                 dict,
                 lexemes,
-            ]
+            ])
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     Ok((names, types, rows))
 }

@@ -1079,7 +1079,12 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             let Some(N::List(items)) = e.rexpr.as_deref().and_then(|n| n.node.as_ref()) else {
                 return Ok(());
             };
-            for item in &items.items {
+            for (i, item) in items.items.iter().enumerate() {
+                // A cancellation point every so often: a 200,000-item list
+                // is typed here for a fifth of a second (RP-202).
+                if i % 1024 == 1023 {
+                    crate::cancel::check()?;
+                }
                 if let Some(r) = operand_type(item, scope) {
                     if category(&r).is_some_and(|rc| rc != lc) {
                         return Err(mismatch(&op, &l, &r, e.location));
@@ -1126,6 +1131,9 @@ struct Cx<'a> {
 /// Walk an expression; a subquery is checked in a scope of its own whose
 /// parent is this one.
 fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
+    // A cancellation point per node: a 200,000-item IN list is walked
+    // here for a fifth of a second (RP-202).
+    crate::cancel::check()?;
     let Some(node) = n.node.as_ref() else {
         return Ok(());
     };

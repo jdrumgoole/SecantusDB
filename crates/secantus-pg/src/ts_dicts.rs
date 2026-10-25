@@ -58,6 +58,14 @@ fn dict_of_doc(d: &Document) -> Option<UserDict> {
                     .collect()
             })
             .unwrap_or_default(),
+        numeric: d
+            .get_array("numeric")
+            .map(|a| {
+                a.iter()
+                    .filter_map(|n| n.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -92,6 +100,7 @@ impl PgHandler {
             "oid": d.oid,
             "template": d.template,
             "options": options,
+            "numeric": d.numeric.clone(),
         };
         if let Some(text) = comment {
             doc.insert("comment", text);
@@ -147,6 +156,7 @@ impl PgHandler {
                     owner: Self::bootstrap_role_name(),
                     template,
                     options,
+                    numeric: Vec::new(),
                 }
             }
         };
@@ -225,7 +235,11 @@ impl PgHandler {
     pub(crate) fn ts_dict_statement(&self, op: TsDictOp) -> PgWireResult<Vec<Response>> {
         let tag = |t: &str| Ok(vec![Response::Execution(Tag::new(t))]);
         match op {
-            TsDictOp::Create { name, options } => {
+            TsDictOp::Create {
+                name,
+                options,
+                numeric,
+            } => {
                 let (schema, bare) = match name.as_slice() {
                     [bare] => (
                         secantus_pgplan::schemas::creation_schema()
@@ -283,19 +297,31 @@ impl PgHandler {
                     name: bare,
                     owner: self.current_role_name(),
                     template,
+                    numeric: numeric
+                        .into_iter()
+                        .filter(|n| rest.iter().any(|(k, _)| k == n))
+                        .collect(),
                     options: rest,
                 };
                 self.write_ts_dict(&dict, None)?;
                 tag("CREATE TEXT SEARCH DICTIONARY")
             }
-            TsDictOp::Alter { name, options } => {
+            TsDictOp::Alter {
+                name,
+                options,
+                numeric,
+            } => {
                 let mut d = self.changeable_ts_dict(&name)?;
                 let comment = self.ts_dict_comment(d.oid);
                 // AlterTSDictionary: each option named replaces the one it
                 // names, moved to the end; one with no value is removed.
                 for (k, v) in options {
                     d.options.retain(|(o, _)| *o != k);
+                    d.numeric.retain(|o| *o != k);
                     if let Some(v) = v {
+                        if numeric.contains(&k) {
+                            d.numeric.push(k.clone());
+                        }
                         d.options.push((k, v));
                     }
                 }
@@ -534,7 +560,7 @@ pub(crate) fn dict_rows(
                 ("dicttemplate", Bson::Int64(d.template)),
                 (
                     "dictinitoption",
-                    ts_dicts::options_text(&d.options).map_or(Bson::Null, Bson::String),
+                    ts_dicts::options_text(&d.options, &d.numeric).map_or(Bson::Null, Bson::String),
                 ),
             ] {
                 if let Some(field) = f(column) {

@@ -498,7 +498,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "a GiST operator class": (
         "RP-169",
-        True,
+        False,
         [
             "begin",
             "create operator class rp51_gb for type box using gist as operator 3 &&, "
@@ -514,7 +514,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "ispell and thesaurus dictionaries": (
         "RP-169",
-        True,
+        False,
         [
             "begin",
             "create text search dictionary rp51_is "

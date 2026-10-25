@@ -11,8 +11,8 @@
 //!
 //! Not recorded (a remainder of RP-105): the type of a constant an
 //! expression holds (`b = 'a'` against an enum column records the enum),
-//! range types' constructor functions and casts, collations and operator
-//! classes, and extension membership.
+//! range types' constructor functions and casts, collations, and extension
+//! membership.
 
 use super::*;
 
@@ -30,6 +30,11 @@ const PG_TS_DICT: i64 = 3600;
 const PG_TS_PARSER: i64 = 3601;
 const PG_COLLATION: i64 = 3456;
 const PG_EXTENSION: i64 = 3079;
+const PG_OPCLASS: i64 = 2616;
+const PG_OPFAMILY: i64 = 2753;
+const PG_AMOP: i64 = 2602;
+const PG_AMPROC: i64 = 2603;
+const PG_OPERATOR: i64 = 2617;
 
 /// PostgreSQL's `IsPinnedObject`: an object `initdb` made below
 /// `FirstUnpinnedObjectId` is depended on by no row, except the `public`
@@ -694,6 +699,52 @@ impl PgHandler {
             push(PG_TS_CONFIG, c.oid, 0, PG_TS_PARSER, c.parser, 0, "n");
             for (_, _, dict) in &c.map {
                 push(PG_TS_CONFIG, c.oid, 0, PG_TS_DICT, *dict, 0, "n");
+            }
+        }
+        // The database's operator families and classes and their members
+        // (`CreateOpFamily`, `DefineOpClass`, `storeOperators`,
+        // `storeProcedures`): a family and a class live in their schema, a
+        // class in its family ('a'); a member is its class's ('i') when hard,
+        // its family's ('a') when soft, and depends on its operator or
+        // function.
+        let ns_of = |schema: &str| {
+            namespaces
+                .iter()
+                .find(|(n, _)| n == schema)
+                .map_or(0, |(_, o)| *o)
+        };
+        for f in self.opfamilies().into_iter().filter(|f| !f.builtin) {
+            push(
+                PG_OPFAMILY,
+                f.oid,
+                0,
+                PG_NAMESPACE,
+                ns_of(&f.schema),
+                0,
+                "n",
+            );
+        }
+        for c in secantus_pgplan::misc_alter::all_opclasses()
+            .iter()
+            .filter(|c| c.oid >= 16384)
+        {
+            push(PG_OPCLASS, c.oid, 0, PG_NAMESPACE, ns_of(&c.schema), 0, "n");
+            push(PG_OPCLASS, c.oid, 0, PG_TYPE, c.intype, 0, "n");
+            push(PG_OPCLASS, c.oid, 0, PG_OPFAMILY, c.family, 0, "a");
+        }
+        for (is_func, class_of_member, object_class) in
+            [(false, PG_AMOP, PG_OPERATOR), (true, PG_AMPROC, PG_PROC)]
+        {
+            for m in self.opclass_members(is_func) {
+                if m.class != 0 {
+                    push(class_of_member, m.oid, 0, PG_OPCLASS, m.class, 0, "i");
+                } else {
+                    push(class_of_member, m.oid, 0, PG_OPFAMILY, m.family, 0, "a");
+                }
+                push(class_of_member, m.oid, 0, object_class, m.object, 0, "n");
+                if !is_func && m.sortfamily != 0 {
+                    push(class_of_member, m.oid, 0, PG_OPFAMILY, m.sortfamily, 0, "n");
+                }
             }
         }
         out

@@ -23,9 +23,11 @@
 use std::cell::RefCell;
 
 mod headline;
+mod lexize;
 pub use headline::{headline, headline_options, HeadlineOptions};
 use std::collections::BTreeMap;
 
+use crate::ts_dicts::TsLexeme;
 use crate::{Error, Result};
 use bson::Bson;
 
@@ -447,7 +449,7 @@ fn word_char(c: char) -> bool {
 /// `ts_lexize` of `token` by the dictionary `dict` this server has: `simple`
 /// (lower-cased) or a Snowball stemmer (`english_stem`, `french_stem`, ...),
 /// a stop-word giving no lexeme. `None` for a dictionary it does not have.
-fn lexize(dict: &str, token: &str) -> Option<Vec<String>> {
+pub(crate) fn builtin_lexize(dict: &str, token: &str) -> Option<Vec<String>> {
     let lower: String = token.chars().map(crate::scalar::simple_lower).collect();
     if dict == "simple" {
         return Some(vec![lower]);
@@ -508,22 +510,26 @@ pub(crate) fn debug_dictionaries(cfg: Config, toktype: u8) -> Vec<String> {
 
 /// The dictionary that takes `token` (type `toktype`) under `cfg`, and its
 /// lexemes -- `ts_debug`'s `dictionary` and `lexemes` (`[]` for a
-/// stop-word): the first of the map's dictionaries for the type that
-/// recognises it (each this server has always does). `None` for a type the
-/// map gives no dictionary, which takes no position.
-pub(crate) fn debug_lexize(cfg: Config, toktype: u8, token: &str) -> Option<(String, Vec<String>)> {
-    crate::ts_catalog::dictionaries_for(cfg.0, i32::from(toktype))
-        .into_iter()
-        .find_map(|oid| {
-            let name = crate::ts_catalog::name_of(oid, true)?;
-            // A user dictionary lexizes by its template; one that does not
-            // recognise the token hands it to the next.
-            let lexemes = match crate::ts_catalog::user_lexize(oid, token) {
-                Some(result) => result.ok().flatten(),
-                None => lexize(&name, token),
-            }?;
-            Some((name, lexemes))
-        })
+/// stop-word): the first of the map's dictionaries for the type whose
+/// `ts_lexize` recognises it. `None` when none does, or for a type the map
+/// gives no dictionary.
+pub(crate) fn debug_lexize(
+    cfg: Config,
+    toktype: u8,
+    token: &str,
+) -> Result<Option<(String, Vec<String>)>> {
+    for oid in crate::ts_catalog::dictionaries_for(cfg.0, i32::from(toktype)) {
+        let Some(name) = crate::ts_catalog::name_of(oid, true) else {
+            continue;
+        };
+        if let Some(lexemes) = crate::ts_dicts::ts_lexize(oid, token)? {
+            return Ok(Some((
+                name,
+                lexemes.into_iter().map(|l| l.lexeme).collect(),
+            )));
+        }
+    }
+    Ok(None)
 }
 
 /// PostgreSQL's longest indexable lexeme, in bytes.
@@ -531,27 +537,46 @@ const MAX_LEXEME: usize = 2047;
 /// The largest position; later ones are clamped to it.
 const MAX_POS: u16 = 16383;
 
-/// `(position, lexeme)` for every indexed token; a stop-word yields a
-/// position with no lexeme. The tokens are the default parser's
-/// (`wparser.rs`), each through the dictionary its type maps to; a type no
-/// dictionary takes (a blank, a tag) takes no position.
-fn parse_document(text: &str, cfg: Config) -> Vec<(u16, Option<String>)> {
+/// `parsetext`: `(position, lexeme)` for every lexeme the document gives,
+/// several at one position when a dictionary gives several; a stop-word
+/// yields a position with no lexeme. The tokens are the default parser's
+/// (`wparser.rs`), through the configuration's dictionaries
+/// (`lexize::Lexizer`); a type no dictionary takes (a blank, a tag) takes
+/// no position.
+fn parse_document(text: &str, cfg: Config) -> Result<Vec<(u16, Option<TsLexeme>)>> {
     let mut out = Vec::new();
-    let mut pos: u16 = 0;
-    for (ty, tok) in crate::wparser::parse(text) {
-        // `parsetext`'s `lenlemm >= MAXSTRLEN`: a token of 2047 bytes is
-        // already too long (measured), whatever its type.
-        if tok.len() >= MAX_LEXEME {
+    let mut pos: u32 = 0;
+    let at = |pos: u32| u16::try_from(pos.min(u32::from(MAX_POS))).unwrap_or(MAX_POS);
+    let mut lx = lexize::Lexizer::new(cfg);
+    let tokens = crate::wparser::parse(text);
+    for (ty, tok) in tokens.into_iter().chain([(0, String::new())]) {
+        // `lenlemm > MAXSTRLEN`: a token of 2047 bytes is already too long
+        // (measured), whatever its type.
+        if ty > 0 && tok.len() >= MAX_LEXEME {
             notice("word is too long to be indexed");
             continue;
         }
-        let Some((_, lexemes)) = debug_lexize(cfg, ty, &tok) else {
-            continue;
-        };
-        pos = (pos + 1).min(MAX_POS);
-        out.push((pos, lexemes.into_iter().next()));
+        lx.add(ty, tok);
+        while let (Some(norms), _) = lx.exec()? {
+            pos += 1;
+            let mut any = false;
+            for l in norms {
+                if l.lexeme.len() > MAX_LEXEME {
+                    notice("word is too long to be indexed");
+                    continue;
+                }
+                if l.flags & crate::ts_dicts::TSL_ADDPOS != 0 {
+                    pos += 1;
+                }
+                any = true;
+                out.push((at(pos), Some(l)));
+            }
+            if !any {
+                out.push((at(pos), None));
+            }
+        }
     }
-    out
+    Ok(out)
 }
 
 // ------------------------------------------------------------------------
@@ -748,14 +773,14 @@ pub fn parse_vector(text: &str) -> Result<TsVector> {
 }
 
 /// `to_tsvector(config, text)`.
-pub fn to_tsvector(cfg: Config, text: &str) -> TsVector {
+pub fn to_tsvector(cfg: Config, text: &str) -> Result<TsVector> {
     let mut map: BTreeMap<String, Vec<(u16, Weight)>> = BTreeMap::new();
-    for (pos, lex) in parse_document(text, cfg) {
+    for (pos, lex) in parse_document(text, cfg)? {
         if let Some(lex) = lex {
-            map.entry(lex).or_default().push((pos, 0));
+            map.entry(lex.lexeme).or_default().push((pos, 0));
         }
     }
-    TsVector(map).normalise()
+    Ok(TsVector(map).normalise())
 }
 
 /// Which of a JSON document's values `json[b]_to_tsvector` indexes
@@ -850,12 +875,12 @@ fn json_values_vector(cfg: Config, doc: &Bson, flags: u8) -> Result<Bson> {
     for value in &values {
         let mut last = 0;
         let mut added = false;
-        for (pos, lex) in parse_document(value, cfg) {
+        for (pos, lex) in parse_document(value, cfg)? {
             let at = offset + u32::from(pos);
             last = last.max(u32::from(pos));
             if let Some(lex) = lex {
                 added = true;
-                map.entry(lex)
+                map.entry(lex.lexeme)
                     .or_default()
                     .push((u16::try_from(at.min(16383)).unwrap_or(16383), 0));
             }
@@ -1121,24 +1146,49 @@ impl QueryParser<'_> {
                 prefix,
                 weight,
             },
-            Morph::Config(cfg) => morph(&word, cfg, prefix, weight, true),
+            Morph::Config(cfg) => morph(&word, cfg, prefix, weight, true)?,
         })
     }
 }
 
-/// An operand's text through the configuration: its lexemes joined by
-/// `<->` (or `&` for `plainto_tsquery`) at their position distances, or a
-/// stop-word placeholder when it has none -- PostgreSQL's `pushval_morph`.
-fn morph(text: &str, cfg: Config, prefix: bool, weight: u8, phrase: bool) -> Query {
+/// An operand's text through the configuration: each position's lexemes
+/// -- a variant's ANDed, the variants ORed -- joined by `<->` (or `&` for
+/// `plainto_tsquery`) at their position distances, or a stop-word
+/// placeholder when it has none -- PostgreSQL's `pushval_morph`.
+fn morph(text: &str, cfg: Config, prefix: bool, weight: u8, phrase: bool) -> Result<Query> {
+    let words: Vec<(u16, TsLexeme)> = parse_document(text, cfg)?
+        .into_iter()
+        .filter_map(|(pos, lex)| lex.map(|l| (pos, l)))
+        .collect();
     let mut out: Option<Query> = None;
     let mut prev: u16 = 0;
-    for (pos, lex) in parse_document(text, cfg) {
-        let Some(lex) = lex else { continue };
-        let v = Query::Val {
-            lex,
-            prefix,
-            weight,
-        };
+    let mut k = 0;
+    while k < words.len() {
+        let pos = words[k].0;
+        let mut group: Option<Query> = None;
+        while k < words.len() && words[k].0 == pos {
+            let variant = words[k].1.nvariant;
+            let mut conj: Option<Query> = None;
+            while k < words.len() && words[k].0 == pos && words[k].1.nvariant == variant {
+                let l = &words[k].1;
+                let v = Query::Val {
+                    lex: l.lexeme.clone(),
+                    prefix: prefix || l.flags & crate::ts_dicts::TSL_PREFIX != 0,
+                    weight,
+                };
+                conj = Some(match conj {
+                    None => v,
+                    Some(c) => Query::And(Box::new(c), Box::new(v)),
+                });
+                k += 1;
+            }
+            let conj = conj.expect("one lexeme");
+            group = Some(match group {
+                None => conj,
+                Some(g) => Query::Or(Box::new(g), Box::new(conj)),
+            });
+        }
+        let v = group.expect("one variant");
         out = Some(match out {
             None => v,
             Some(l) if phrase => Query::Phrase(Box::new(l), Box::new(v), pos - prev),
@@ -1146,7 +1196,7 @@ fn morph(text: &str, cfg: Config, prefix: bool, weight: u8, phrase: bool) -> Que
         });
         prev = pos;
     }
-    out.unwrap_or(Query::Stop)
+    Ok(out.unwrap_or(Query::Stop))
 }
 
 /// Remove stop-word placeholders, widening the phrases around them --
@@ -1248,18 +1298,18 @@ pub fn to_tsquery(cfg: Config, text: &str) -> Result<Option<Query>> {
 }
 
 /// `plainto_tsquery`.
-pub fn plainto_tsquery(cfg: Config, text: &str) -> Option<Query> {
-    finish(morph(text, cfg, false, 0, false))
+pub fn plainto_tsquery(cfg: Config, text: &str) -> Result<Option<Query>> {
+    Ok(finish(morph(text, cfg, false, 0, false)?))
 }
 
 /// `phraseto_tsquery`.
-pub fn phraseto_tsquery(cfg: Config, text: &str) -> Option<Query> {
-    finish(morph(text, cfg, false, 0, true))
+pub fn phraseto_tsquery(cfg: Config, text: &str) -> Result<Option<Query>> {
+    Ok(finish(morph(text, cfg, false, 0, true)?))
 }
 
 /// `websearch_to_tsquery`: words AND together, `"..."` is a phrase, a
 /// leading `-` negates, and the word `or` separates alternatives.
-pub fn websearch_to_tsquery(cfg: Config, text: &str) -> Option<Query> {
+pub fn websearch_to_tsquery(cfg: Config, text: &str) -> Result<Option<Query>> {
     enum Item {
         Term(Query),
         Or,
@@ -1288,7 +1338,7 @@ pub fn websearch_to_tsquery(cfg: Config, text: &str) -> Option<Query> {
             }
             let phrase: String = chars[start..k].iter().collect();
             i = (k + 1).min(n);
-            let q = morph(&phrase, cfg, false, 0, true);
+            let q = morph(&phrase, cfg, false, 0, true)?;
             items.push(Item::Term(if negate { Query::Not(Box::new(q)) } else { q }));
             continue;
         }
@@ -1306,7 +1356,7 @@ pub fn websearch_to_tsquery(cfg: Config, text: &str) -> Option<Query> {
         if word.is_empty() {
             continue;
         }
-        let q = morph(&word, cfg, false, 0, true);
+        let q = morph(&word, cfg, false, 0, true)?;
         if q == Query::Stop && !word.chars().any(word_char) {
             continue;
         }
@@ -1334,13 +1384,13 @@ pub fn websearch_to_tsquery(cfg: Config, text: &str) -> Option<Query> {
             Some(o) => Query::Or(Box::new(o), Box::new(and)),
         });
     }
-    match out {
+    Ok(match out {
         Some(q) => finish(q),
         None => {
             notice("text-search query doesn't contain lexemes: \"\"");
             None
         }
-    }
+    })
 }
 
 // ------------------------------------------------------------------------
@@ -1850,17 +1900,24 @@ pub(crate) fn json_headline(args: &[Bson], doc_at: usize, jsonb: bool) -> Result
     let query = query_arg(q)?;
     let mut json = crate::json::parse(&text_of(doc))
         .map_err(|_| Error::InvalidText("invalid input syntax for type json".into()))?;
-    fn walk(v: &mut crate::json::Json, f: &dyn Fn(&str) -> String) {
+    fn walk(v: &mut crate::json::Json, f: &dyn Fn(&str) -> Result<String>) -> Result<()> {
         match v {
-            crate::json::Json::Str(s) => *s = f(s),
-            crate::json::Json::Array(items) => items.iter_mut().for_each(|i| walk(i, f)),
+            crate::json::Json::Str(s) => *s = f(s)?,
+            crate::json::Json::Array(items) => {
+                for i in items.iter_mut() {
+                    walk(i, f)?;
+                }
+            }
             crate::json::Json::Object(members) => {
-                members.iter_mut().for_each(|(_, m)| walk(m, f));
+                for (_, m) in members.iter_mut() {
+                    walk(m, f)?;
+                }
             }
             _ => {}
         }
+        Ok(())
     }
-    walk(&mut json, &|s| headline(cfg, s, &query, &opts));
+    walk(&mut json, &|s| headline(cfg, s, &query, &opts))?;
     Ok(Bson::String(if jsonb {
         crate::json::render_jsonb(&json)
     } else {
@@ -2391,7 +2448,7 @@ fn call_inner(name: &str, args: &[Bson]) -> Result<Bson> {
         "to_tsvector" => {
             let (cfg, rest) = split_config(args, 1)?;
             let [doc] = rest else { return Err(wrong(name)) };
-            Ok(vector_out(&to_tsvector(cfg, &text_of(doc))))
+            Ok(vector_out(&to_tsvector(cfg, &text_of(doc))?))
         }
         "to_tsquery" | "plainto_tsquery" | "phraseto_tsquery" | "websearch_to_tsquery" => {
             let (cfg, rest) = split_config(args, 1)?;
@@ -2401,9 +2458,9 @@ fn call_inner(name: &str, args: &[Bson]) -> Result<Bson> {
             let text = text_of(text);
             let q = match name {
                 "to_tsquery" => to_tsquery(cfg, &text)?,
-                "plainto_tsquery" => plainto_tsquery(cfg, &text),
-                "phraseto_tsquery" => phraseto_tsquery(cfg, &text),
-                _ => websearch_to_tsquery(cfg, &text),
+                "plainto_tsquery" => plainto_tsquery(cfg, &text)?,
+                "phraseto_tsquery" => phraseto_tsquery(cfg, &text)?,
+                _ => websearch_to_tsquery(cfg, &text)?,
             };
             Ok(query_out(&q))
         }
@@ -2507,9 +2564,14 @@ fn call_inner(name: &str, args: &[Bson]) -> Result<Bson> {
                 )
             })?;
             // A user dictionary: NULL when it does not recognise the token.
-            if let Some(result) = crate::ts_catalog::user_lexize(oid, &text_of(token)) {
-                return Ok(match result? {
-                    Some(lexemes) => Bson::Array(lexemes.into_iter().map(Bson::String).collect()),
+            if crate::ts_catalog::user_lexer(oid).is_some() {
+                return Ok(match crate::ts_dicts::ts_lexize(oid, &text_of(token))? {
+                    Some(lexemes) => Bson::Array(
+                        lexemes
+                            .into_iter()
+                            .map(|l| Bson::String(l.lexeme))
+                            .collect(),
+                    ),
                     None => Bson::Null,
                 });
             }
@@ -2589,7 +2651,7 @@ fn call_inner(name: &str, args: &[Bson]) -> Result<Bson> {
                 &text_of(doc),
                 &query_arg(q)?,
                 &opts,
-            )))
+            )?))
         }
         "get_current_ts_config" => Ok(crate::regobj::value("regconfig", default_config().0)),
         "ts_rank" => rank_call(args, false),
@@ -3290,7 +3352,7 @@ mod tests {
         assert_eq!(render_query(&q), "'fox' <2> 'quick'");
         let q = to_tsquery(ENGLISH, "(fox | quick) & brown").unwrap();
         assert_eq!(render_query(&q), "( 'fox' | 'quick' ) & 'brown'");
-        let v = to_tsvector(ENGLISH, "foo-bar abc123 42 -7 3.14 don't café 2x");
+        let v = to_tsvector(ENGLISH, "foo-bar abc123 42 -7 3.14 don't café 2x").unwrap();
         assert_eq!(
             render_vector(&v),
             "'-7':6 '2x':11 '3.14':7 '42':5 'abc123':4 'bar':3 'café':10 'foo':2 'foo-bar':1"

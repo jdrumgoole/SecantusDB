@@ -938,11 +938,17 @@ tests there are regression tests.
       lands in.** Planning a statement with a 200,000-item `IN` list runs
       for about a second in a debug build, as a sequence of passes over the
       whole tree with a cancellation point between each. A cancel that lands
-      inside one is answered when it ends: up to 0.2 s late here, where
-      PostgreSQL 15.19 answers in 0.015 s. The longest is the clone of the
-      memoised parse tree each plan starts from (about 0.35 s for that
-      statement). Batch 46's follow-up closed the windows outside planning
-      that were 0.8 s long.
+      inside one is answered when it ends: up to 0.09 s late here (measured
+      over 28 cancel times through Parse, Describe, Bind and Execute), where
+      PostgreSQL 15.19 answers in 0.015 s. The longest windows left, about
+      0.12 s each, are walks that collect the whole tree through
+      `pg_query`'s `nodes()` before looking at it: the privilege pass at
+      Execute, and the end of `plan_select`. Batch 74 split or moved apart
+      the ones of 0.2 s: the copy of the memoised tree and the scan for its
+      parameters now run on a thread of their own under the cancel hook,
+      and the typing of an `IN` list and each rewrite pass have a
+      cancellation point. Batch 46's follow-up closed the windows outside
+      planning that were 0.8 s long.
       Backlog-ID: RP-202
       Verify: none -- a latency budget; every answer is PostgreSQL's 57014, only later
 
@@ -961,29 +967,27 @@ are scenarios in `tests/backlog/test_rp_batch48.py`, measured on a private
 15.19 cluster. RP-195 (`pg_relation_size`) was found and fixed in the same
 batch; its test there is a regression test.
 
-- [ ] **A B-tree's dead entries: what index scans mark, and one step of
-      a long run of updates.** Each B-tree's pages are modelled
-      (`btree_model.rs`). Since batch 71 a full leaf deletes before it
-      splits, as PostgreSQL 15.19's `_bt_delete_or_dedup_one_page` does:
+- [ ] **A B-tree's dead entries: what index scans mark.** Each B-tree's
+      pages are modelled (`btree_model.rs`). Since batch 71 a full leaf
+      deletes before it splits, as PostgreSQL 15.19's
+      `_bt_delete_or_dedup_one_page` does:
       - `_bt_check_unique` marks LP_DEAD the equal keys whose heap
         versions are dead to all;
       - simple deletion removes those, and the dead TIDs of their heap
         blocks;
       - bottom-up deletion runs for an UPDATE that left the key unchanged,
         within its six-block budget.
-      Two things are still left.
-      - **Index scans.** An index scan marks LP_DEAD the entries whose heap
-        versions it finds dead (`kill_prior_tuple`), and this server's reads
-        mark none. With an ordered read of the primary key between updates
-        of a 2,000-row table, PostgreSQL keeps the index at 13, 13, 13 and
-        14 pages, against 14, 15, 15 and 16 here. Modelling it means
-        marking where PostgreSQL's plan is an index scan.
-      - **One step of a run of updates.** In eight updates of every row of
-        a 2,000-row table, the index's pages match PostgreSQL's but for the
-        third, which is 15 here and 14 there, although every heap ctid
-        matches.
+      Since batch 74 every step of a long run of updates matches too.
+      What is left is index scans. An index scan marks LP_DEAD the entries
+      whose heap versions it finds dead (`kill_prior_tuple`), and this
+      server's reads mark none. With an ordered read of the primary key
+      between updates of a 2,000-row table, PostgreSQL keeps the index at
+      13, 13, 13 and 14 pages, against 13, 14, 14 and 16 here. PostgreSQL
+      reads it with an Index Only Scan chosen by cost; this server reads by
+      a seq scan and a sort and does not cost the choice, so modelling the
+      marking waits on the planner (RP-028).
       Backlog-ID: RP-196
-      Verify: tests/backlog/test_rp_batch71.py::test_scenario[every step of eight updates of a primary key], tests/backlog/test_rp_batch71.py::test_scenario[an index scan marks the dead versions it passes]
+      Verify: tests/backlog/test_rp_batch71.py::test_scenario[an index scan marks the dead versions it passes]
 
 ## Found by batch 46 (2026-10-23)
 
@@ -999,21 +1003,6 @@ Found while building `CREATE TEXT SEARCH CONFIGURATION` (RP-072). The gap
 tests are scenarios in `tests/backlog/test_rp_batch34.py`, measured on a
 private 15.19 cluster. RP-166 and RP-167 were found and fixed in the same
 batch; their tests there are regression tests.
-
-- [ ] **What is left of the statements once refused with 0A000.** Batch
-      51 built `CREATE / ALTER / DROP OPERATOR FAMILY / CLASS` for the
-      btree and hash methods, text-search dictionaries over the `simple`,
-      `snowball` and `synonym` templates, subscriptions created with
-      `connect = false`, and transforms; batch 64 made `pg_subscription`
-      one catalog for the cluster. Two parts are still refused:
-      - **Operator classes of the GiST, GIN, SP-GiST and BRIN methods**
-        are refused by name. Their `amadjustmembers` rules and support
-        function numbers differ from btree's, and an index over such a
-        class would need its support functions, which are C internals.
-      - **The `ispell` and `thesaurus` dictionary templates** are refused
-        by name: their dictionary and affix file formats are not read here.
-      Backlog-ID: RP-169
-      Verify: tests/backlog/test_rp_batch51.py::test_scenario[a GiST operator class], tests/backlog/test_rp_batch51.py::test_scenario[ispell and thesaurus dictionaries]
 
 ## Found by batch 26 (2026-10-22)
 

@@ -6156,7 +6156,10 @@ impl PgHandler {
         // Each undeclared parameter takes the type its first typed use gives
         // it, as `parse_analyze_varparams` fixes it: `$1::int` makes `$1` an
         // integer for every other use, so `lower($1)` beside it is 42883.
-        let declared = self.param_type_names(stmt);
+        // Under the cancel hook: the first count of a large statement's
+        // parameters scans its text apart (RP-202).
+        let declared = self.with_cancel_hook(|| self.param_type_names(stmt));
+        self.check_cancel()?;
         let column_type = |table: &str, column: secantus_pgplan::ColumnRef<'_>| {
             self.lookup(table).and_then(|def| {
                 let col = match column {
@@ -6166,7 +6169,12 @@ impl PgHandler {
                 col.map(|c| c.pg_type.clone())
             })
         };
-        let inferred = secantus_pgplan::catalog_param_types_opt(sql, &declared, &column_type);
+        // Under the cancel hook too: a large statement's scan for its
+        // parameters runs apart, and answers a cancel while it does.
+        let inferred = self.with_cancel_hook(|| {
+            secantus_pgplan::catalog_param_types_opt(sql, &declared, &column_type)
+        });
+        self.check_cancel()?;
         let param_types: Vec<Option<String>> = declared
             .iter()
             .enumerate()

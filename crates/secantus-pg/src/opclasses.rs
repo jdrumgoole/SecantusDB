@@ -6,12 +6,12 @@
 //! `hashadjustmembers` gives it: a "hard" member belongs to its class and
 //! goes with it, a "soft" one to the family.
 //!
-//! Classes of the btree and hash methods are served. An index over a key
-//! with a user class is kept as any index is: its order and equality are
-//! the type's own, so a UNIQUE index whose class's equality is not the
-//! type's default is refused by name. The GiST, GIN, SP-GiST and BRIN
-//! methods' classes (whose support functions are C internals) are refused
-//! by name.
+//! Classes of the btree, hash, GiST, GIN, SP-GiST and BRIN methods are
+//! kept, each method's members checked and made hard or soft as its
+//! `amadjustmembers` does. An index over a key with a user class is kept
+//! as any index is: its order and equality are the type's own, so a UNIQUE
+//! index whose class's equality is not the type's default is refused by
+//! name.
 
 use bson::{Bson, Document};
 use pgwire::api::results::{Response, Tag};
@@ -33,17 +33,55 @@ pub(crate) const PG_OPFAMILY: i64 = 2753;
 
 const BTREE: i64 = 403;
 const HASH: i64 = 405;
+const GIST: i64 = 783;
+const GIN: i64 = 2742;
+const SPGIST: i64 = 4000;
+const BRIN: i64 = 3580;
 const BOOL: i64 = 16;
 const INT8: i64 = 20;
 const INT4: i64 = 23;
 const VOID: i64 = 2278;
 const INTERNAL: i64 = 2281;
 
-/// `(amstrategies, amsupport, amoptsprocnum)` of the methods served.
+/// `(amstrategies, amsupport, amoptsprocnum)` of the methods served, a
+/// method with no fixed strategies taking any number up to `SHRT_MAX`.
 fn am_limits(method: i64) -> Option<(i32, i32, i32)> {
     match method {
         BTREE => Some((5, 5, 5)),
         HASH => Some((1, 3, 3)),
+        GIST => Some((i32::from(i16::MAX), 11, 10)),
+        GIN => Some((i32::from(i16::MAX), 7, 7)),
+        SPGIST => Some((i32::from(i16::MAX), 7, 7)),
+        BRIN => Some((i32::from(i16::MAX), 15, 5)),
+        _ => None,
+    }
+}
+
+/// `amcanorderbyop`: the methods an ORDER BY operator may be a member of.
+fn am_orders_by_op(method: i64) -> bool {
+    matches!(method, GIST | SPGIST)
+}
+
+/// `amstorage`: the methods whose index may store another type than the
+/// class's input (the STORAGE clause).
+fn am_storage(method: i64) -> bool {
+    matches!(method, GIST | GIN | SPGIST | BRIN)
+}
+
+/// The support functions a method's `amadjustmembers` requires (hard
+/// members of the class), and those it knows at all; `None` for a method
+/// with no `amadjustmembers` (BRIN), whose members all stay the class's.
+fn am_support(method: i64) -> Option<(&'static [i64], &'static [i64])> {
+    match method {
+        // GIST_CONSISTENT, UNION, PENALTY, PICKSPLIT, EQUAL; and COMPRESS,
+        // DECOMPRESS, DISTANCE, FETCH, OPTIONS, SORTSUPPORT.
+        GIST => Some((&[1, 2, 5, 6, 7], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])),
+        // GIN_COMPARE, EXTRACTVALUE, EXTRACTQUERY; and CONSISTENT,
+        // COMPARE_PARTIAL, TRICONSISTENT, OPTIONS.
+        GIN => Some((&[1, 2, 3], &[1, 2, 3, 4, 5, 6, 7])),
+        // SPGIST_CONFIG, CHOOSE, PICKSPLIT, INNER_CONSISTENT,
+        // LEAF_CONSISTENT; and COMPRESS, OPTIONS.
+        SPGIST => Some((&[1, 2, 3, 4, 5], &[1, 2, 3, 4, 5, 6, 7])),
         _ => None,
     }
 }
@@ -481,12 +519,13 @@ impl PgHandler {
             return Err(invalid("index operators must be binary"));
         }
         if p.sortfamily != 0 {
-            return Err(invalid(format!(
-                "access method \"{}\" does not support ordering operators",
-                am_name(method)
-            )));
-        }
-        if result != BOOL {
+            if !am_orders_by_op(method) {
+                return Err(invalid(format!(
+                    "access method \"{}\" does not support ordering operators",
+                    am_name(method)
+                )));
+            }
+        } else if result != BOOL {
             return Err(invalid("index search operators must return boolean"));
         }
         Ok(())
@@ -817,8 +856,55 @@ impl PgHandler {
             .map_or(0, |c| c.oid)
     }
 
-    /// `btadjustmembers` / `hashadjustmembers`: which members are hard.
-    fn adjust_members(&self, family: i64, class: i64, intype: i64, members: &mut [Pending]) {
+    /// `btadjustmembers` / `hashadjustmembers` (and GiST's, GIN's and
+    /// SP-GiST's): which members are hard. `class` is 0 in ALTER OPERATOR
+    /// FAMILY.
+    fn adjust_members(
+        &self,
+        method: i64,
+        family: i64,
+        class: i64,
+        intype: i64,
+        members: &mut [Pending],
+    ) -> PgWireResult<()> {
+        if method != BTREE && method != HASH {
+            let Some((required, known)) = am_support(method) else {
+                // No `amadjustmembers`: every member the class's.
+                for m in members.iter_mut() {
+                    m.class = class;
+                }
+                return Ok(());
+            };
+            for m in members.iter_mut() {
+                // An operator is always the family's (soft); a function is
+                // the class's when the method requires it.
+                if !m.is_func {
+                    m.class = 0;
+                    continue;
+                }
+                if !known.contains(&m.number) {
+                    return Err(Self::user_error(
+                        "22023",
+                        format!(
+                            "support function number {} is invalid for access method {}",
+                            m.number,
+                            am_name(method)
+                        ),
+                    ));
+                }
+                m.class = if required.contains(&m.number) {
+                    class
+                } else {
+                    0
+                };
+            }
+            return Ok(());
+        }
+        self.adjust_btree_members(family, class, intype, members);
+        Ok(())
+    }
+
+    fn adjust_btree_members(&self, family: i64, class: i64, intype: i64, members: &mut [Pending]) {
         let standard = 1;
         let mut cached = (intype, class);
         for m in members.iter_mut() {
@@ -1323,7 +1409,7 @@ impl PgHandler {
                 let (mut operators, mut procedures, storage) =
                     self.resolve_items(&items, m, limits, typeoid, false)?;
                 let storage = if storage == typeoid { 0 } else { storage };
-                if storage != 0 {
+                if storage != 0 && !am_storage(m) {
                     return Err(invalid(format!(
                         "storage type cannot be different from data type for access method \
                          \"{method}\""
@@ -1379,8 +1465,8 @@ impl PgHandler {
                     },
                 )?;
                 self.publish_opclasses();
-                self.adjust_members(family.oid, oid, typeoid, &mut operators);
-                self.adjust_members(family.oid, oid, typeoid, &mut procedures);
+                self.adjust_members(m, family.oid, oid, typeoid, &mut operators)?;
+                self.adjust_members(m, family.oid, oid, typeoid, &mut procedures)?;
                 let written = vec![family.name.clone()];
                 self.store_members(&family, &written, &operators, false)?;
                 self.store_members(&family, &written, &procedures, false)?;
@@ -1458,8 +1544,8 @@ impl PgHandler {
                 } else {
                     let (mut operators, mut procedures, _) =
                         self.resolve_items(&items, m, limits, 0, true)?;
-                    self.adjust_members(family.oid, 0, 0, &mut operators);
-                    self.adjust_members(family.oid, 0, 0, &mut procedures);
+                    self.adjust_members(m, family.oid, 0, 0, &mut operators)?;
+                    self.adjust_members(m, family.oid, 0, 0, &mut procedures)?;
                     self.store_members(&family, &name, &operators, true)?;
                     self.store_members(&family, &name, &procedures, true)?;
                 }

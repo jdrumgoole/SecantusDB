@@ -76,15 +76,23 @@ pub struct UserDict {
     pub template: i64,
     /// `dictinitoption`'s options, in order.
     pub options: Vec<(String, String)>,
+    /// The options written as a number.
+    pub numeric: Vec<String>,
 }
 
 thread_local! {
     static USER_DICTS: RefCell<Rc<Vec<UserDict>>> = RefCell::new(Rc::new(Vec::new()));
+    /// Each installed dictionary's template state, built on first use --
+    /// PostgreSQL's dictionary cache (`lookup_ts_dictionary_cache`), which
+    /// a change to any dictionary empties.
+    static LEXERS: RefCell<std::collections::HashMap<i64, Rc<crate::ts_dicts::Lexer>>> =
+        RefCell::new(std::collections::HashMap::new());
 }
 
 /// Install the database's dictionaries for the statements that follow.
 pub fn set_user_dicts(dicts: Vec<UserDict>) {
     USER_DICTS.with(|c| *c.borrow_mut() = Rc::new(dicts));
+    LEXERS.with(|c| c.borrow_mut().clear());
 }
 
 /// The installed dictionaries.
@@ -119,13 +127,20 @@ pub fn builtin_dict(oid: i64) -> Option<DictRow> {
     Some((name, template, options))
 }
 
-/// What dictionary `oid` does with a token, when it is a user dictionary
-/// (a built-in one keeps `fts`'s own lexing): `Some(None)` when it does not
-/// recognise the token.
-pub fn user_lexize(oid: i64, token: &str) -> Option<crate::Result<Option<Vec<String>>>> {
+/// User dictionary `oid`'s template state, its options read (a built-in
+/// one keeps `fts`'s own lexing): `None` for a dictionary that is not a
+/// user one.
+pub fn user_lexer(oid: i64) -> Option<crate::Result<Rc<crate::ts_dicts::Lexer>>> {
+    if let Some(l) = LEXERS.with(|c| c.borrow().get(&oid).cloned()) {
+        return Some(Ok(l));
+    }
     let dicts = user_dicts();
     let d = dicts.iter().find(|d| d.oid == oid)?;
-    Some(crate::ts_dicts::init(d.template, &d.options).map(|l| crate::ts_dicts::lexize(&l, token)))
+    Some(crate::ts_dicts::init(d.template, &d.options).map(|l| {
+        let l = Rc::new(l);
+        LEXERS.with(|c| c.borrow_mut().insert(oid, Rc::clone(&l)));
+        l
+    }))
 }
 
 thread_local! {
@@ -318,7 +333,7 @@ pub fn display_of(oid: i64, dict: bool) -> Option<String> {
 
 /// The parts of a possibly qualified name, each an identifier: unquoted is
 /// folded to lower case.
-fn name_parts(input: &str) -> Vec<String> {
+pub(crate) fn name_parts(input: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut cur = String::new();
     let mut quoted = false;
