@@ -1,0 +1,3 @@
+{
+"s1r s2r1 s1c s2r2 s2c": [["setup", [["ok", "SELECT 100"], ["ok", "CREATE INDEX"], ["ok", "ALTER TABLE"]]], ["s1 setup", [["ok", "BEGIN"]]], ["s2 setup", [["ok", "BEGIN"], ["ok", "SET"], ["ok", "SET"], ["ok", "SET"], ["ok", "SET"], ["ok", "SET"]]], ["s1r", [["rows", [["100"]]]]], ["s2r1", [["rows", [["100"]]]]], ["s1c", [["ok", "COMMIT"]]], ["s2r2", [["rows", [["100"]]]]], ["s2c", [["ok", "COMMIT"]]]]
+}

@@ -530,6 +530,7 @@ impl PgHandler {
         let mut failed: Option<PgWireError> = None;
         let keys = order.clone();
         let scan_stat = self.scan_stat(&sel.table, &sel.filter);
+        self.ssi_scan(&sel.table, &sel.filter)?;
         let mut scanned_rows = 0i64;
         let sorted = crate::external_sort::sort_runs_with(
             |sink| {
@@ -612,6 +613,7 @@ impl PgHandler {
             .map(|l| usize::try_from(l.max(0)).unwrap_or(usize::MAX));
         let backend = self.backend.clone();
         let scan_stat = self.scan_stat(&table, &filter);
+        self.ssi_scan(&table, &filter)?;
         // `statement_timeout` counts the time the statement WORKS, not the
         // time the client takes between two Executes of a suspended portal
         // (PostgreSQL times each Execute): the reader's budget is what is left
@@ -1283,6 +1285,7 @@ impl PgHandler {
         let mut first = BlockScan::of(self.db(), sel, order, dedup);
         if !first.done {
             first.stat = self.scan_stat(&sel.table, &sel.filter);
+            self.ssi_scan(&sel.table, &sel.filter)?;
         }
         // An ORDER BY expression needs this statement's thread (see
         // `declare_streamed`): sorted now, through the block.

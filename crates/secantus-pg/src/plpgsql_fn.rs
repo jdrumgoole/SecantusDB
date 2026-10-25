@@ -2195,18 +2195,27 @@ impl Interp<'_> {
                 text.push(c);
             }
         }
-        let mut err = PlError::new(if level >= 21 { "P0001" } else { "00000" }, text);
-        if level == 19 {
-            err.sqlstate = "01000".into();
-        }
+        // `exec_stmt_raise`: the condition, then the options, each given
+        // once; a condition's name is the message when nothing else is.
+        let already = |name: &str| {
+            Err(PlError::new(
+                "42601",
+                format!("RAISE option already specified: {name}"),
+            ))
+        };
+        let mut err_code: Option<String> = None;
+        let mut condname: Option<String> = None;
+        let mut err_message = message.map(|_| text);
         if let Some(cond) = body.get("condname").and_then(Value::as_str) {
-            if let Some(code) = condition_sqlstate(&cond.to_ascii_lowercase()) {
-                err.sqlstate = code.into();
-                if message.is_none() {
-                    err.message = cond.to_string();
-                }
-            }
+            // `RAISE SQLSTATE '23503'` stores the code itself, which
+            // `plpgsql_recognize_err_condition` takes as one.
+            err_code = condition_sqlstate(&cond.to_ascii_lowercase())
+                .map(str::to_string)
+                .or_else(|| is_sqlstate_text(cond).then(|| cond.to_string()));
+            condname = Some(cond.to_string());
         }
+        let mut detail = None;
+        let mut hint = None;
         for o in body
             .get("options")
             .and_then(Value::as_array)
@@ -2220,16 +2229,49 @@ impl Interp<'_> {
             let v = secantus_pgplan::value_text(&self.eval(o.get("expr").unwrap_or(&Value::Null))?);
             match o.get("opt_type").and_then(Value::as_u64).unwrap_or(0) {
                 0 => {
-                    err.sqlstate = condition_sqlstate(&v.to_ascii_lowercase())
-                        .map(str::to_string)
-                        .unwrap_or(v)
+                    if err_code.is_some() {
+                        return already("ERRCODE");
+                    }
+                    if is_sqlstate_text(&v) {
+                        err_code = Some(v);
+                    } else {
+                        err_code = Some(
+                            condition_sqlstate(&v.to_ascii_lowercase())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| v.clone()),
+                        );
+                        condname = Some(v);
+                    }
                 }
-                1 => err.message = v,
-                2 => err.detail = Some(v),
-                3 => err.hint = Some(v),
+                1 => {
+                    if err_message.is_some() {
+                        return already("MESSAGE");
+                    }
+                    err_message = Some(v);
+                }
+                2 => {
+                    if detail.is_some() {
+                        return already("DETAIL");
+                    }
+                    detail = Some(v);
+                }
+                3 => {
+                    if hint.is_some() {
+                        return already("HINT");
+                    }
+                    hint = Some(v);
+                }
                 _ => {}
             }
         }
+        let code = err_code.unwrap_or_else(|| if level >= 21 { "P0001" } else { "00000" }.into());
+        let message = err_message.or(condname).unwrap_or_else(|| code.clone());
+        let mut err = PlError::new(&code, message);
+        if level == 19 && err.sqlstate == "00000" {
+            err.sqlstate = "01000".into();
+        }
+        err.detail = detail;
+        err.hint = hint;
         if level >= 21 {
             return Err(err);
         }
@@ -2242,6 +2284,13 @@ impl Interp<'_> {
         self.host.notice(severity, &err.sqlstate, err.message);
         Ok(Flow::Next)
     }
+}
+
+/// Five digits or upper-case letters: an SQLSTATE written as itself.
+fn is_sqlstate_text(s: &str) -> bool {
+    s.len() == 5
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
 }
 
 /// A type name as a cast can write it: an array type keeps its brackets, and

@@ -139,6 +139,16 @@ pub(crate) struct BTree {
     /// Each leaf's bytes in use (tuples and line pointers), by block, as
     /// the insert path keeps it; -1 or absent when it must be recounted.
     used: Vec<i64>,
+    /// What the inserts since it was last taken told SSI (RP-061): the
+    /// leaf each landed on, and each split `(page, its new right half)`.
+    pub(crate) ssi_events: Vec<SsiEvent>,
+}
+
+/// An insert's report to SSI (`_bt_doinsert`, `_bt_split`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum SsiEvent {
+    Landed(u32),
+    Split(u32, u32),
 }
 
 /// An item's key against a TID-bearing search key, PostgreSQL's
@@ -765,6 +775,93 @@ fn interval_edges(splits: &[Split]) -> (Split, Split) {
 }
 
 impl BTree {
+    /// The leaf pages an index scan reads (`_bt_first`, `_bt_readpage`,
+    /// `_bt_readnextpage`), each of which it predicate-locks: from where
+    /// the lower bound on the leading column puts it (the leftmost leaf
+    /// without one), rightward until an item or a page's high key is past
+    /// the upper bound. `None` for an empty index, which a scan locks
+    /// whole.
+    pub(crate) fn scan_pages(
+        &self,
+        shape: &dyn Shape,
+        lower: Option<(&Bson, bool)>,
+        upper: Option<(&Bson, bool)>,
+    ) -> Option<Vec<u32>> {
+        let root = self.root?;
+        let past = |k: &Bson| match upper {
+            Some((u, inclusive)) => match shape.cmp_attr(0, k, u) {
+                Ordering::Greater => true,
+                Ordering::Equal => !inclusive,
+                Ordering::Less => false,
+            },
+            None => false,
+        };
+        let (mut at, start_key) = match lower {
+            Some((k, inclusive)) => {
+                let tid = if inclusive { i64::MIN } else { i64::MAX };
+                (
+                    self.descend(shape, std::slice::from_ref(k), tid).0,
+                    Some((k, inclusive)),
+                )
+            }
+            None => {
+                let mut at = root;
+                while let Page::Internal { items, .. } = &self.pages[at as usize] {
+                    at = items[0].child;
+                }
+                (at, None)
+            }
+        };
+        let mut pages = Vec::new();
+        let mut first = true;
+        loop {
+            match &self.pages[at as usize] {
+                Page::Leaf { items, high, right } => {
+                    pages.push(at);
+                    let mut stop = false;
+                    for it in items {
+                        let Some(k) = it.key.first() else { continue };
+                        if first {
+                            // `_bt_binsrch`: the scan starts at the first
+                            // item past the lower bound.
+                            if let Some((lk, inclusive)) = start_key {
+                                match shape.cmp_attr(0, k, lk) {
+                                    Ordering::Less => continue,
+                                    Ordering::Equal if !inclusive => continue,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if past(k) {
+                            stop = true;
+                            break;
+                        }
+                    }
+                    first = false;
+                    if stop {
+                        return Some(pages);
+                    }
+                    let Some(next) = right else {
+                        return Some(pages);
+                    };
+                    // The high key says whether the next page can hold more.
+                    if let Some(h) = high.as_ref().and_then(|h| h.key.first()) {
+                        if past(h) {
+                            return Some(pages);
+                        }
+                    }
+                    at = *next;
+                }
+                Page::Deleted => {
+                    // A deleted page passes its scan right; it has no link
+                    // here, so the scan ends.
+                    return Some(pages);
+                }
+                _ => return Some(pages),
+            }
+        }
+    }
+
     /// The pages it occupies, the metapage and deleted pages among them.
     pub(crate) fn pages(&self) -> u32 {
         self.pages.len().max(1) as u32
@@ -809,6 +906,7 @@ impl BTree {
             full: true,
             touched: Default::default(),
             used: Vec::new(),
+            ssi_events: Vec::new(),
         };
         if entries.is_empty() {
             return tree;
@@ -960,12 +1058,22 @@ impl BTree {
                 right: None,
             });
             self.root = Some(root);
+            // `_bt_getroot` made the root the insert lands on.
+            self.ssi_events.push(SsiEvent::Landed(root));
             return;
         }
         if shape.unique() {
             self.check_unique(shape, &key, dead);
         }
         let (leaf, path) = self.descend(shape, &key, tid);
+        // The page `_bt_search` lands on, which SSI checks: without the heap
+        // TID for a unique index (the first the key could be on).
+        let landed = if shape.unique() {
+            self.descend(shape, &key, i64::MIN).0
+        } else {
+            leaf
+        };
+        self.ssi_events.push(SsiEvent::Landed(landed));
         self.touched.insert(leaf);
         let cached = self.used.get(leaf as usize).copied().filter(|u| *u >= 0);
         let Page::Leaf { items, high, right } = &mut self.pages[leaf as usize] else {
@@ -1106,6 +1214,7 @@ impl BTree {
             high: old_high,
             right: old_right,
         });
+        self.ssi_events.push(SsiEvent::Split(leaf, new_block));
         if let Page::Leaf { items, high, right } = &mut self.pages[leaf as usize] {
             *items = all;
             *high = Some(pivot.clone());
@@ -1743,6 +1852,7 @@ impl BTree {
             full: false,
             touched: Default::default(),
             used: Vec::new(),
+            ssi_events: Vec::new(),
         })
     }
 

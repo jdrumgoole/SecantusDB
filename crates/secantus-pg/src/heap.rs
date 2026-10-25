@@ -325,6 +325,9 @@ struct Deleted {
     id: Bson,
     len: Option<u32>,
     row: Option<Document>,
+    /// The row, kept while a serializable transaction runs here: SSI
+    /// tracks the version for other transactions' conflicts out.
+    ssi: Option<Document>,
 }
 
 thread_local! {
@@ -352,6 +355,9 @@ fn observe_delete(_db: &str, coll: &str, blob: &[u8]) {
     };
     let id = doc.get("_id").cloned().unwrap_or(Bson::Null);
     let def = DELETE_DEFS.with(|d| d.borrow().get(coll).cloned());
+    let ssi = crate::serializable::SSI_CAPTURE
+        .with(std::cell::Cell::get)
+        .then(|| doc.clone());
     let (len, row) = match def {
         Some(def) if !crate::partition::is_partitioned(&def) => {
             (Some(tuple_len(&def, &doc) as u32), None)
@@ -365,6 +371,7 @@ fn observe_delete(_db: &str, coll: &str, blob: &[u8]) {
             id,
             len,
             row,
+            ssi,
         })
     });
 }
@@ -778,6 +785,11 @@ impl PgHandler {
                 .iter()
                 .map(|v| v.old.as_ref().map(|o| (o.0, o.2)))
                 .collect();
+            // SSI's check of each write, before it is made: an insert
+            // against the table, an update against its old version too.
+            for v in &versions {
+                self.ssi_write(&heap_table, v.old.as_ref().and_then(|o| o.0))?;
+            }
             let (ctids, accessed) = self.with_heap(&heap_table, |heap| {
                 let ctids = versions
                     .into_iter()
@@ -822,6 +834,17 @@ impl PgHandler {
                 .map(|(i, (_, ctid))| (&rows[*i].1, rows[*i].0.as_ref(), *ctid))
                 .collect();
             self.btree_insert_versions(&heap_table, &indexed)?;
+            // The versions this transaction made, for others' conflicts
+            // out: each new one, and each old one it deleted.
+            for (i, ctid) in idx.iter().zip(&ctids) {
+                let (old, new) = &rows[*i];
+                if let Some(old) = old {
+                    if let Some(c) = ctid_of(old) {
+                        self.ssi_version(&heap_table, c, false, Some(old));
+                    }
+                }
+                self.ssi_version(&heap_table, *ctid, true, Some(new));
+            }
             for (i, ctid) in idx.into_iter().zip(ctids) {
                 // An xid is 32 bits (the low half of the xid8).
                 stamp(&mut rows[i].1, (xid & 0xFFFF_FFFF) as i64, cid, ctid);
@@ -904,7 +927,9 @@ impl PgHandler {
     /// The rows the statement's deletes removed (since `mark`, what
     /// [`Self::watch_deletes`] returned) are dead tuples of its
     /// transaction's: each page pruned first, as the DELETE's scan read it.
-    pub(crate) fn note_deleted(&self, mark: usize) -> PgWireResult<()> {
+    /// `checked`: the statement succeeded, so SSI checks its deletes (a
+    /// failed one's are rolled back).
+    pub(crate) fn note_deleted(&self, mark: usize, checked: bool) -> PgWireResult<()> {
         let deleted: Vec<Deleted> = DELETED.with(|d| {
             let mut d = d.borrow_mut();
             let from = mark.min(d.len());
@@ -917,6 +942,8 @@ impl PgHandler {
         // Each heap's dead tuples: `(ctid, length, _id)`.
         type Dead = Vec<(i64, u32, Bson)>;
         let mut by_heap: Vec<(String, Dead)> = Vec::new();
+        // SSI's check of each delete, and the version it leaves.
+        let mut ssi_deleted: Vec<(String, i64, Option<Document>)> = Vec::new();
         for d in deleted {
             let Some(def) = self.lookup(&d.table) else {
                 continue;
@@ -929,10 +956,17 @@ impl PgHandler {
                 ),
                 (None, None) => continue,
             };
+            if checked && d.ssi.is_some() {
+                ssi_deleted.push((heap_table.clone(), d.ctid, d.ssi.clone()));
+            }
             match by_heap.iter_mut().find(|(t, _)| *t == heap_table) {
                 Some((_, v)) => v.push((d.ctid, len, d.id)),
                 None => by_heap.push((heap_table, vec![(d.ctid, len, d.id)])),
             }
+        }
+        for (table, ctid, doc) in &ssi_deleted {
+            self.ssi_write(table, Some(*ctid))?;
+            self.ssi_version(table, *ctid, false, doc.as_ref());
         }
         for (heap_table, tuples) in by_heap {
             let ctids: Vec<i64> = tuples.iter().map(|(c, _, _)| *c).collect();

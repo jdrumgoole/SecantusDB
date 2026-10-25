@@ -624,6 +624,9 @@ pub fn bind_with(
     let storage = Arc::new(storage);
     // Transaction ids run on from the store's last reservation.
     crate::xids::install(&storage).map_err(std::io::Error::other)?;
+    // A store starts with no serializable transaction (one closed before at
+    // the same address left its state behind).
+    crate::ssi::forget(std::sync::Arc::as_ptr(&storage) as usize);
     // The cumulative statistics a clean shutdown kept (RP-070).
     crate::pgstat::restore_store(&storage).map_err(std::io::Error::other)?;
     // Expression indexes keep a computed field on every row; rows another

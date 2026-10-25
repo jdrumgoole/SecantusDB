@@ -103,7 +103,9 @@ mod rules;
 mod scan_partitions;
 mod schema_rows;
 mod scram_binding;
+mod serializable;
 mod server;
+mod ssi;
 mod statistic;
 mod stream_join;
 mod subscriptions;
@@ -4013,6 +4015,13 @@ pub struct PgHandler {
     /// read-only transaction ([`PgHandler::rc_reads_apart`]) instead of the
     /// block being moved onto a new snapshot.
     rc_apart: AtomicBool,
+    /// This transaction has registered with SSI, or found it need not
+    /// (`serializable.rs`).
+    ssi_registered: AtomicBool,
+    /// The statement running takes no snapshot (`SET`, `SHOW`, ...): a
+    /// REPEATABLE READ or SERIALIZABLE block that has none yet does not
+    /// take one for it.
+    no_snapshot_stmt: AtomicBool,
     /// Set with `rc_apart` when the read-apart statement reads tables the
     /// block HAS written: the block's own rows of each, laid over the fresh
     /// snapshot (`secantus_storage::with_read_overlay`) instead of the block
@@ -4493,6 +4502,8 @@ impl PgHandler {
             txn_control: AtomicBool::new(false),
             sole_implicit: AtomicBool::new(false),
             rc_apart: AtomicBool::new(false),
+            ssi_registered: AtomicBool::new(false),
+            no_snapshot_stmt: AtomicBool::new(false),
             rc_overlay: Mutex::new(None),
             plan_apart: Mutex::new(None),
             subtxn_seq: std::sync::atomic::AtomicU64::new(0),
@@ -5170,7 +5181,7 @@ impl PgHandler {
         let Ok(mut guard) = self.txn.try_lock() else {
             return f();
         };
-        match guard.as_mut() {
+        match guard.as_mut().filter(|h| !self.snapshot_deferred(h)) {
             Some(handle) => self
                 .storage
                 .with_user_transaction(handle, &f)
@@ -6529,6 +6540,7 @@ impl PgHandler {
             );
             if let Some(rows) = rows {
                 self.stat_scan(table, filter, &rows);
+                self.ssi_scan(table, filter)?;
                 return self.in_scan_order(table, filter, rows);
             }
         }
@@ -6537,6 +6549,7 @@ impl PgHandler {
             .find_matching(self.db(), table, filter)
             .map_err(|e| Self::storage_err("could not read", e))?;
         self.stat_scan(table, filter, &rows);
+        self.ssi_scan(table, filter)?;
         self.in_scan_order(table, filter, rows)
     }
 
@@ -8704,10 +8717,18 @@ impl PgHandler {
         }
         let rows = match self.txn.try_lock() {
             Ok(mut guard) => match guard.as_mut() {
-                Some(handle) => self
-                    .storage
-                    .with_user_transaction(handle, read)
-                    .map_err(|e| PlanError::Internal(format!("could not read a subquery: {e}")))?,
+                Some(handle) => {
+                    // A read while planning takes the transaction's snapshot
+                    // as its execution would: a serializable transaction
+                    // registers first, or the read takes no SIREAD lock.
+                    self.ssi_begin_reading(handle)
+                        .map_err(Self::plan_error_of)?;
+                    self.storage
+                        .with_user_transaction(handle, read)
+                        .map_err(|e| {
+                            PlanError::Internal(format!("could not read a subquery: {e}"))
+                        })?
+                }
                 None => read(),
             },
             Err(_) => read(),
@@ -12367,10 +12388,15 @@ impl PgHandler {
         // `RETURNS numeric` function is numeric 1, so `n * f(n - 1)` is
         // numeric arithmetic and does not overflow an integer.
         Ok(match out {
-            // `void` is the empty string, not NULL (`select f() is null` is
-            // false for a void function).
+            // `void` is the empty string from PL/pgSQL (`select f() is null`
+            // is false), and NULL from an SQL function, whose result
+            // `fmgr_sql` discards.
             secantus_pgplan::FnResult::Value(_) if !u.returns_set && u.return_type == "void" => {
-                secantus_pgplan::FnResult::Value(Bson::String(String::new()))
+                secantus_pgplan::FnResult::Value(if doc.get_str("language") == Ok("sql") {
+                    Bson::Null
+                } else {
+                    Bson::String(String::new())
+                })
             }
             secantus_pgplan::FnResult::Value(v)
                 if !u.returns_set
@@ -22550,6 +22576,21 @@ impl PgHandler {
             if self.written_by_this_command(&existing) {
                 return Err(Self::on_conflict_twice());
             }
+            // `ExecOnConflictUpdate` locks the row before it tests the
+            // WHERE, so a row the WHERE rejects is still held to the end of
+            // the transaction. The update locks the row it writes itself.
+            if filter.is_some() {
+                let strength = if secantus_storage::share_locks::key_write_now() {
+                    secantus_pgplan::RowLockStrength::Update
+                } else {
+                    secantus_pgplan::RowLockStrength::NoKeyUpdate
+                };
+                let lock = secantus_pgplan::RowLock {
+                    wait: secantus_pgplan::RowLockWait::Block,
+                    strength,
+                };
+                self.lock_selected_rows(table, std::slice::from_ref(&existing), lock)?;
+            }
             let env = secantus_pgplan::on_conflict_row(&existing, &row);
             if let Some(f) = filter {
                 if !secantus_pgplan::on_conflict_filter_passes(f, &env)
@@ -25276,6 +25317,7 @@ impl Drop for PgHandler {
         advisory::release_session(pid);
         table_locks::release(pid);
         row_waits::forget(pid);
+        self.ssi_end(false);
         xids::end(&self.storage, pid);
         heap::forget_backend(pid);
         if pid != 0 {
@@ -25610,6 +25652,7 @@ impl PgHandler {
         advisory::release_xact(pid);
         table_locks::release(pid);
         row_waits::forget(pid);
+        self.ssi_end(false);
         xids::end(&self.storage, pid);
     }
 
@@ -29108,12 +29151,14 @@ impl PgHandler {
             advisory::release_xact(pid);
             table_locks::release(pid);
             row_waits::forget(pid);
+            self.ssi_end(false);
             xids::end(&self.storage, pid);
             return out;
         }
         advisory::release_xact(pid);
         table_locks::release(pid);
         row_waits::forget(pid);
+        self.ssi_end(false);
         xids::end(&self.storage, pid);
         self.end_txn_gucs(false);
         self.lo_close_all();
@@ -29320,6 +29365,7 @@ impl PgHandler {
                 .implicit_extended
                 .load(std::sync::atomic::Ordering::Relaxed)
         {
+            self.ssi_end(false);
             xids::end(
                 &self.storage,
                 self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
@@ -29581,6 +29627,17 @@ impl PgHandler {
         if is_empty_query(sql) {
             return Ok(vec![Response::EmptyQuery]);
         }
+        struct Snapshotless<'a>(&'a AtomicBool);
+        impl Drop for Snapshotless<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        self.no_snapshot_stmt.store(
+            sql_takes_no_snapshot(sql),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let _snapshotless = Snapshotless(&self.no_snapshot_stmt);
 
         // The failed-block gate comes BEFORE the planner's answer, because
         // PostgreSQL's does: in an aborted block `select nosuchcolumn` is
@@ -29783,6 +29840,7 @@ impl PgHandler {
                         advisory::release_xact(pid);
                         table_locks::release(pid);
                         row_waits::forget(pid);
+                        self.ssi_end(false);
                         xids::end(&self.storage, pid);
                         self.marks.end();
                         // After the COMMIT's checks ran, or the ROLLBACK.
@@ -30108,12 +30166,21 @@ impl PgHandler {
                                     Self::serialization_failure()
                                 })?;
                             }
-                            self.storage
-                                .with_user_transaction(handle, || {
-                                    self.execute(stmt.clone(), max_rows)
-                                })
-                                .map_err(|e| Self::storage_err("transaction failed", e))
-                                .and_then(|r| r)
+                            // One that takes no snapshot runs before the block
+                            // has one, and leaves it to the next statement.
+                            if !cursor_op
+                                && Self::takes_no_snapshot(&stmt)
+                                && self.snapshot_deferred(handle)
+                            {
+                                self.execute(stmt.clone(), max_rows)
+                            } else {
+                                self.storage
+                                    .with_user_transaction(handle, || {
+                                        self.execute(stmt.clone(), max_rows)
+                                    })
+                                    .map_err(|e| Self::storage_err("transaction failed", e))
+                                    .and_then(|r| r)
+                            }
                         };
                         match (&out, poll.as_mut()) {
                             (Err(e), Some(poll)) if Self::is_write_conflict(e) => {
@@ -30307,6 +30374,30 @@ impl PgHandler {
                 other => return other,
             }
         }
+    }
+
+    /// A statement that takes no snapshot (`PlannedStmtRequiresSnapshot`):
+    /// transaction control, LOCK, SET, SHOW, SET CONSTRAINTS, FETCH and
+    /// LISTEN / NOTIFY / UNLISTEN. A REPEATABLE READ or SERIALIZABLE block
+    /// takes its snapshot at the first statement that is not one of these.
+    fn takes_no_snapshot(stmt: &Statement) -> bool {
+        matches!(
+            stmt,
+            Statement::Transaction(_)
+                | Statement::LockTable { .. }
+                | Statement::Set { .. }
+                | Statement::SetLocal { .. }
+                | Statement::SetDefault { .. }
+                | Statement::SetSessionCharacteristics { .. }
+                | Statement::SetTransaction { .. }
+                | Statement::Reset(_)
+                | Statement::Show(_)
+                | Statement::SetConstraints { .. }
+                | Statement::Fetch { .. }
+                | Statement::Listen(_)
+                | Statement::Notify { .. }
+                | Statement::Unlisten(_)
+        )
     }
 
     /// PostgreSQL's answer to a write that collided under REPEATABLE READ.
@@ -30503,6 +30594,7 @@ impl PgHandler {
             .rollback_user_transaction(&mut handle)
             .map_err(|re| eprintln!("secantusd-pg: rolling back a failed statement: {re}"));
         row_waits::forget(pid);
+        self.ssi_end(false);
         xids::end(&self.storage, pid);
         out
     }
@@ -31073,7 +31165,7 @@ impl PgHandler {
         }
         let mut f = Some(f);
         if let Ok(mut guard) = self.txn.try_lock() {
-            if let Some(handle) = guard.as_mut() {
+            if let Some(handle) = guard.as_mut().filter(|h| !self.snapshot_deferred(h)) {
                 if let Ok(out) = self
                     .storage
                     .with_user_transaction(handle, || (f.take().expect("called once"))())
@@ -31148,6 +31240,13 @@ impl PgHandler {
                 &self.storage,
                 self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
             );
+            // A serializable transaction registers at the first statement
+            // that takes a snapshot (`PlannedStmtRequiresSnapshot`):
+            // transaction control, LOCK, SET, SHOW, SET CONSTRAINTS, FETCH
+            // and LISTEN / NOTIFY / UNLISTEN take none.
+            if !stmt.is_some_and(Self::takes_no_snapshot) {
+                self.ssi_begin(handle)?;
+            }
         }
         if read_committed {
             let refreshed = self
@@ -31853,13 +31952,23 @@ impl PgHandler {
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return f(),
         };
-        match guard.as_mut() {
+        match guard.as_mut().filter(|h| !self.snapshot_deferred(h)) {
             Some(handle) => self
                 .storage
                 .with_user_transaction(handle, f)
                 .map_err(|e| Self::storage_err("transaction failed", e))?,
             None => f(),
         }
+    }
+
+    /// Is the running statement one that takes no snapshot, in a block that
+    /// has none yet? Then it reads outside the block, which keeps its
+    /// snapshot for the first statement that takes one.
+    fn snapshot_deferred(&self, handle: &UserTransactionHandle) -> bool {
+        !handle.began()
+            && self
+                .no_snapshot_stmt
+                .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Is this CALL / DO in PostgreSQL's non-atomic context -- outside a
@@ -31914,6 +32023,7 @@ impl PgHandler {
         advisory::release_xact(pid);
         table_locks::release(pid);
         row_waits::forget(pid);
+        self.ssi_end(false);
         xids::end(&self.storage, pid);
         bump_catalog_version();
         let handle = self.open_transaction_handle()?;
@@ -32660,11 +32770,14 @@ impl PgHandler {
                     // INITIALLY DEFERRED constraints are checked now, inside
                     // the transaction; a violation rolls it back and the
                     // error is the COMMIT's answer, with the connection IDLE.
+                    // Then SSI's check at commit (`CommitTransaction` runs
+                    // it after the deferred triggers).
                     let checked = self
                         .storage
                         .with_user_transaction(&mut handle, || self.run_deferred_checks())
                         .map_err(|e| Self::storage_err("transaction failed", e))
-                        .and_then(|r| r);
+                        .and_then(|r| r)
+                        .and_then(|()| self.ssi_pre_commit());
                     if let Err(e) = checked {
                         self.storage
                             .rollback_user_transaction(&mut handle)
@@ -32677,6 +32790,7 @@ impl PgHandler {
                     self.storage
                         .commit_user_transaction(&mut handle)
                         .map_err(|e| Self::storage_err("could not commit", e))?;
+                    self.ssi_end(true);
                 }
                 self.settle_notifies(true);
                 self.stats().end_xact(true);
@@ -35348,7 +35462,7 @@ impl PgHandler {
             }));
             self.with_event_triggers(stmt, |stmt| self.execute_inner(stmt, max_rows))
         };
-        match self.note_deleted(delete_mark) {
+        match self.note_deleted(delete_mark, out.is_ok()) {
             Err(e) if out.is_ok() => out = Err(e),
             Err(e) => eprintln!("secantusd-pg: recording a failed statement's deletes: {e:?}"),
             Ok(()) => {}
@@ -38470,6 +38584,8 @@ impl PgHandler {
                     if let Some(def) = self.lookup(table) {
                         fdw::check_drop_table(&def)?;
                     }
+                    // `heap_drop_with_catalog`: as a TRUNCATE does.
+                    self.ssi_table_write(table)?;
                     if self.views()?.iter().any(|(n, _)| n == table) {
                         let mut info = ErrorInfo::new(
                             "ERROR".into(),
@@ -40718,6 +40834,7 @@ impl PgHandler {
                 let view_checks = std::mem::take(&mut upd.view_checks);
                 // The UPDATE's scan, as planned (RP-070).
                 self.stat_scan_filter(&upd.table, &upd.filter);
+                self.ssi_scan(&upd.table, &upd.filter)?;
                 upd.filter =
                     self.narrow_by_residual(&upd.table, &upd.filter, upd.residual.take())?;
                 let def = self.lookup(&upd.table);
@@ -41035,6 +41152,7 @@ impl PgHandler {
                 }
                 // The DELETE's scan, as planned (RP-070).
                 self.stat_scan_filter(&del.table, &del.filter);
+                self.ssi_scan(&del.table, &del.filter)?;
                 del.filter =
                     self.narrow_by_residual(&del.table, &del.filter, del.residual.take())?;
                 if let Some(def) = self.lookup(&del.table) {
@@ -41153,6 +41271,11 @@ impl PgHandler {
                 for table in &tables {
                     self.fire_statement_triggers(table, "BEFORE", "TRUNCATE")?;
                     self.note_fresh_in_block(table);
+                }
+                // `ExecuteTruncateGuts`: a serializable transaction's
+                // TRUNCATE conflicts with every predicate lock on the table.
+                for table in &tables {
+                    self.ssi_table_write(table)?;
                 }
                 for table in &tables {
                     // A partition's rows are in its tree's root.
@@ -48635,6 +48758,38 @@ impl ExtendedQueryHandler for PgHandler {
 /// Is `sql` a statement with nothing in it -- blank, or only comments
 /// (`--SELECT ?`, which pgjdbc sends as the last piece of a split query)?
 /// PostgreSQL answers that with EmptyQueryResponse, not an error.
+/// Does `sql` begin with a statement that takes no snapshot
+/// (`PlannedStmtRequiresSnapshot`)? Read off its first word, before it is
+/// planned: what runs ahead of planning (the privilege check) must not
+/// take the block's snapshot for it either.
+fn sql_takes_no_snapshot(sql: &str) -> bool {
+    let first: String = sql
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    matches!(
+        first.as_str(),
+        "set"
+            | "show"
+            | "reset"
+            | "lock"
+            | "listen"
+            | "notify"
+            | "unlisten"
+            | "begin"
+            | "start"
+            | "commit"
+            | "end"
+            | "rollback"
+            | "abort"
+            | "savepoint"
+            | "release"
+            | "checkpoint"
+    )
+}
+
 fn is_empty_query(sql: &str) -> bool {
     let sql = sql.trim();
     sql.is_empty()

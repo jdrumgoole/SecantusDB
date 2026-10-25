@@ -376,6 +376,11 @@ impl UserTransactionHandle {
         self.minted_total
     }
 
+    /// Has the transaction begun in WiredTiger -- taken its snapshot?
+    pub fn began(&self) -> bool {
+        self.began
+    }
+
     pub fn has_written(&self) -> bool {
         // Any evidence counts: the sticky flag a snapshot refresh sets, or
         // what this transaction's statements have already emitted.
