@@ -29996,9 +29996,8 @@ impl PgHandler {
         // `literal_family` reads every literal in the text.
         self.check_cancel()?;
         let reused = templated.is_some();
-        let planned = match templated {
-            Some(stmt) => Ok(stmt),
-            None => self.with_executor_hooks(|| {
+        let plan_now = || {
+            self.with_executor_hooks(|| {
                 secantus_pgplan::planning_to_execute(|| {
                     secantus_pgplan::plan_with_session_types_and_subqueries(
                         sql,
@@ -30009,8 +30008,32 @@ impl PgHandler {
                         Some(&run),
                     )
                 })
-            }),
+            })
         };
+        // Where the block's writes stood before planning, which can run a
+        // function's writes (`select f()` folds the call).
+        let written_before = self
+            .txn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|h| h.write_set_len());
+        let mut planned = match templated {
+            Some(stmt) => Ok(stmt),
+            None => plan_now(),
+        };
+        // A write that collided while planning waits for the row's holder
+        // and is planned again, as the same write would at execution.
+        if let Some(start) = written_before {
+            let mut tries = 0;
+            while matches!(&planned, Err(e) if Self::plan_write_conflict(e)) && tries < 1000 {
+                tries += 1;
+                if !self.replan_after_conflict(start)? {
+                    break;
+                }
+                planned = plan_now();
+            }
+        }
         self.collect_planner_warnings();
         if !reused && planned.is_ok() {
             // Learning plans the statement again: a cancel stops it as it
@@ -30737,6 +30760,53 @@ impl PgHandler {
                 | Statement::Notify { .. }
                 | Statement::Unlisten(_)
         )
+    }
+
+    /// A planning error that is a write's collision: a function's INSERT
+    /// folded while planning met a row another transaction holds.
+    fn plan_write_conflict(e: &PlanError) -> bool {
+        e.sqlstate() == "40001"
+            && e.to_string()
+                .starts_with("could not serialize access due to concurrent update")
+    }
+
+    /// A block's statement whose planning collided with another
+    /// transaction's write: wait for the holder (holding nothing of this
+    /// session, since planning takes the transaction itself), then move the
+    /// block onto a fresh snapshot keeping its writes from before the
+    /// statement (`start`), as `rerun_after_conflict` does at execution.
+    /// `true` to plan again: at READ COMMITTED always; under REPEATABLE
+    /// READ when nothing committed since the snapshot, or when the
+    /// collision was on a key the holder committed (PostgreSQL's 23505, or
+    /// SSI's failure, whatever the snapshot). `false` keeps the 40001.
+    fn replan_after_conflict(&self, start: usize) -> PgWireResult<bool> {
+        let read_committed = self.read_committed_now();
+        let target = secantus_storage::last_row_written();
+        {
+            let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(handle) = guard.as_mut() else {
+                return Ok(false);
+            };
+            if let Some(t) = &target {
+                handle.release_row(t);
+            }
+        }
+        let waited = {
+            let mut poll = self.lock_wait_poll();
+            self.wait_for_row_holder(target.as_ref(), &mut poll)?
+        };
+        let key_row = target
+            .as_ref()
+            .is_some_and(|t| t.1.ends_with(secantus_storage::ID_KEY_ROW_SUFFIX));
+        if !waited && !key_row && !read_committed {
+            return Ok(false);
+        }
+        let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(handle) = guard.as_mut() else {
+            return Ok(false);
+        };
+        let unseen = self.move_snapshot(handle, start)?;
+        Ok(read_committed || unseen || key_row)
     }
 
     /// PostgreSQL's answer to a write that collided under REPEATABLE READ.
@@ -33432,10 +33502,12 @@ impl PgHandler {
         if self.pending.sequences().contains(name) {
             return self.nextval_in_scope(name, count);
         }
-        match self
-            .storage
-            .outside_user_transaction(|| self.nextval_in_scope(name, count))
-        {
+        // Not a commit a snapshot misses, either: no snapshot reads a
+        // sequence's advance (`without_commit_count`).
+        match secantus_storage::without_commit_count(|| {
+            self.storage
+                .outside_user_transaction(|| self.nextval_in_scope(name, count))
+        }) {
             Err(PgWireError::UserError(info)) if info.code == "42P01" => {
                 self.nextval_in_scope(name, count)
             }
@@ -40508,7 +40580,10 @@ impl PgHandler {
                 declared.resize(n, None);
                 // Planned now, as PostgreSQL analyses it at PREPARE: a
                 // missing table is this statement's error, not EXECUTE's.
-                let fields = self.describe_fields(&query, n, &declared)?;
+                // Nothing in it runs until EXECUTE.
+                let fields = secantus_pgplan::planning_without_running(|| {
+                    self.describe_fields(&query, n, &declared)
+                })?;
                 let column_type = |table: &str, column: secantus_pgplan::ColumnRef<'_>| {
                     self.lookup(table).and_then(|def| {
                         let col = match column {

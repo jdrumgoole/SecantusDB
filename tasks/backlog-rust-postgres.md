@@ -745,6 +745,18 @@ tests are scenarios in `tests/backlog/test_rp_batch30.py`, measured on a
 private 15.19 cluster. RP-133 .. RP-136 and RP-138 .. RP-142 were found and
 fixed in the same batch; their tests there are regression tests.
 
+## Found by batch 78 (2026-10-25)
+
+Found while working RP-255, which planning folded a function call around,
+and fixed in the same batch; their tests in `tests/backlog/test_rp_batch78.py`
+are regression tests:
+- RP-266: an EXPLAIN without ANALYZE, and a PREPARE, ran a volatile
+  function's side effects: they folded the call while planning, which only
+  the plan that executes may do.
+- RP-267: EXPLAIN's TIMING and SUMMARY options were ignored (and TIMING
+  without ANALYZE was not refused), and its JSON lacked the actual times
+  and the `Triggers` group.
+
 ## Found by batch 77 (2026-10-25)
 
 Found while modelling hash indexes for SERIALIZABLE (RP-254): a hash index's
@@ -799,19 +811,6 @@ batch, their tests regression tests:
       Backlog-ID: RP-254
       Verify: tests/backlog/test_rp_isolation.py::test_ssi_index_access_methods
 
-- [ ] **An INSERT inside a function a constant SELECT calls does not wait
-      for an uncommitted inserter of its key.** `SELECT insert_unique(1,
-      '2')` (`read-write-unique-3`) folds the call while it is planned, so
-      the function's INSERT runs before the statement's conflict wait: a
-      key another open transaction inserted is 40001 "concurrent update" at
-      once. PostgreSQL 15.19 waits, then fails with SSI's "identification
-      as a pivot, during write". Since batch 76 every other duplicate-key
-      insert waits as PostgreSQL does: it goes on when the other
-      transaction rolls back, and is 23505 (REPEATABLE READ) or SSI's
-      reason code (SERIALIZABLE) when it commits. The fix is not to run a
-      volatile function while planning.
-      Backlog-ID: RP-255
-      Verify: tests/backlog/test_rp_isolation.py::test_unique_insert_in_a_function_waits
 
 
 ## Found by batch 71 (2026-10-25)

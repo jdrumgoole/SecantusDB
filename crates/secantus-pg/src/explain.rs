@@ -266,7 +266,11 @@ pub(crate) fn render_text(
             header.push_str(ZERO_COSTS);
         }
         if let Some(rows) = actual {
-            header.push_str(&format!(" (actual time=0.000..0.000 rows={rows} loops=1)"));
+            if options.timing {
+                header.push_str(&format!(" (actual time=0.000..0.000 rows={rows} loops=1)"));
+            } else {
+                header.push_str(&format!(" (actual rows={rows} loops=1)"));
+            }
         }
         out.push(header);
         for (label, value) in &n.details {
@@ -277,9 +281,11 @@ pub(crate) fn render_text(
         }
     }
     walk(root, 0, options, actual_rows, &mut out);
-    if actual_rows.is_some() {
+    if options.summary {
         out.push("Planning Time: 0.000 ms".into());
-        out.push("Execution Time: 0.000 ms".into());
+        if actual_rows.is_some() {
+            out.push("Execution Time: 0.000 ms".into());
+        }
     }
     out
 }
@@ -348,6 +354,10 @@ fn structured(
             }
         }
         if let Some(rows) = actual {
+            if options.timing {
+                fields.push(("Actual Startup Time".into(), Value::Num("0.000".into())));
+                fields.push(("Actual Total Time".into(), Value::Num("0.000".into())));
+            }
             fields.push(("Actual Rows".into(), Value::Num(rows.to_string())));
             fields.push(("Actual Loops".into(), Value::Num("1".into())));
         }
@@ -374,9 +384,14 @@ fn structured(
         Value::Obj(fields)
     }
     let mut top = vec![("Plan".to_string(), node(root, options, actual_rows, None))];
-    if actual_rows.is_some() {
+    if options.summary {
         top.push(("Planning Time".into(), Value::Num("0.000".into())));
-        top.push(("Execution Time".into(), Value::Num("0.000".into())));
+    }
+    if actual_rows.is_some() {
+        top.push(("Triggers".into(), Value::Arr(Vec::new())));
+        if options.summary {
+            top.push(("Execution Time".into(), Value::Num("0.000".into())));
+        }
     }
     Value::Arr(vec![Value::Obj(top)])
 }
@@ -528,7 +543,10 @@ mod serde_json_lite {
             match self {
                 Value::Str(s) => quote(s),
                 Value::Num(n) => n.clone(),
-                Value::Arr(items) if items.is_empty() => "[]".into(),
+                // An empty group (`Triggers`), opened and closed on lines
+                // of their own as `ExplainOpenGroup` / `ExplainCloseGroup`
+                // write it; no property list here is ever empty.
+                Value::Arr(items) if items.is_empty() => format!("[\n{pad}]"),
                 Value::Arr(items)
                     if items
                         .iter()

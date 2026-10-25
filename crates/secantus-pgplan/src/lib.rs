@@ -3416,6 +3416,11 @@ pub struct ExplainOptions {
     pub analyze: bool,
     pub verbose: bool,
     pub costs: bool,
+    /// `TIMING`: a node's actual times, under ANALYZE (on by default there).
+    pub timing: bool,
+    /// `SUMMARY`: the planning time, and under ANALYZE the execution time
+    /// (on by default with ANALYZE, off without).
+    pub summary: bool,
     /// `text` or `json`.
     pub format: String,
     /// A single-relation statement's WHERE, as the scan's `Index Cond` /
@@ -9764,11 +9769,14 @@ fn plan_explain(
         analyze: false,
         verbose: false,
         costs: true,
+        timing: false,
+        summary: false,
         format: "text".into(),
         scan_quals: Vec::new(),
         join_conds: Vec::new(),
         join_where: Vec::new(),
     };
+    let (mut timing, mut summary) = (None, None);
     for o in &e.options {
         let Some(N::DefElem(d)) = o.node.as_ref() else {
             continue;
@@ -9793,7 +9801,9 @@ fn plan_explain(
             "analyze" => options.analyze = flag()?,
             "verbose" => options.verbose = flag()?,
             "costs" => options.costs = flag()?,
-            "buffers" | "timing" | "summary" | "settings" | "wal" => {
+            "timing" => timing = Some(flag()?),
+            "summary" => summary = Some(flag()?),
+            "buffers" | "settings" | "wal" => {
                 flag()?;
             }
             "format" => match text.as_deref() {
@@ -9816,6 +9826,15 @@ fn plan_explain(
             }
         }
     }
+    // `ExplainQuery`'s checks and defaults.
+    if timing == Some(true) && !options.analyze {
+        return Err(Error::Sqlstate(
+            "22023",
+            "EXPLAIN option TIMING requires ANALYZE".into(),
+        ));
+    }
+    options.timing = options.analyze && timing.unwrap_or(true);
+    options.summary = summary.unwrap_or(options.analyze);
     let query = e
         .query
         .as_deref()
@@ -9840,7 +9859,12 @@ fn plan_explain(
         }
         _ => Vec::new(),
     };
-    let inner = plan_node(query, lookup, params)?;
+    // Without ANALYZE the statement is planned and not run.
+    let inner = if options.analyze {
+        plan_node(query, lookup, params)?
+    } else {
+        planning_without_running(|| plan_node(query, lookup, params))?
+    };
     options.scan_quals = scan_quals;
     options.join_conds = join_conds;
     if !matches!(
@@ -19512,6 +19536,17 @@ thread_local! {
 pub fn planning_to_execute<R>(f: impl FnOnce() -> R) -> R {
     let previous = PLANNING_TO_EXECUTE.with(|p| p.replace(true));
     let out = f();
+    PLANNING_TO_EXECUTE.with(|p| p.set(previous));
+    out
+}
+
+/// Plan inside `f` for a statement that does not run what it plans: an
+/// EXPLAIN without ANALYZE, a PREPARE. No user function is called, no
+/// sequence drawn and no volatile subquery run, even inside a plan that
+/// executes (PostgreSQL runs a volatile function only in the executor).
+pub fn planning_without_running<R>(f: impl FnOnce() -> R) -> R {
+    let previous = PLANNING_TO_EXECUTE.with(|p| p.replace(false));
+    let out = correlated::without_calls(f);
     PLANNING_TO_EXECUTE.with(|p| p.set(previous));
     out
 }

@@ -117,23 +117,23 @@ def test_ssi_hash_index(rust_pg: Any) -> None:
 @pytest.mark.backlog_fixed("RP-255")
 @pytest.mark.parametrize(
     "name",
-    ["read-write-unique", "read-write-unique-2", "read-write-unique-4", "unique-insert-wait"],
+    [
+        "read-write-unique",
+        "read-write-unique-2",
+        "read-write-unique-3",
+        "read-write-unique-4",
+        "unique-insert-wait",
+        "unique-column-insert-wait",
+    ],
 )
 def test_unique_insert_waits(name: str, rust_pg: Any) -> None:
     """PostgreSQL 15.19 makes an insert of a key another transaction has
-    inserted and not committed wait. When that transaction rolls back, the
-    insert goes on. When it commits, the insert fails 23505 under
-    REPEATABLE READ, and with SSI's reason code under SERIALIZABLE, not
-    40001 "concurrent update"."""
+    inserted and not committed wait -- a primary key's or a UNIQUE column's,
+    and an INSERT inside a function a constant SELECT calls too. When that
+    transaction rolls back, the insert goes on. When it commits, the insert
+    fails 23505 under READ COMMITTED and REPEATABLE READ, and with SSI's
+    reason code under SERIALIZABLE, not 40001 "concurrent update"."""
     _check(name, rust_pg)
-
-
-@pytest.mark.backlog("RP-255")
-def test_unique_insert_in_a_function_waits(rust_pg: Any) -> None:
-    """PostgreSQL 15.19 makes the INSERT of an SQL function that a SELECT
-    calls wait for an uncommitted inserter of its key, then fail with SSI's
-    reason code (`read-write-unique-3`)."""
-    _check("read-write-unique-3", rust_pg)
 
 
 @pytest.mark.backlog_fixed("RP-256")

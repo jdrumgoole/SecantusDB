@@ -1,9 +1,9 @@
 # Isolation specs
 
 `*.spec` are PostgreSQL's isolation tests, from `src/test/isolation/specs`
-at tag `REL_15_19`, unchanged, except the three whose header says they were
+at tag `REL_15_19`, unchanged, except the four whose header says they were
 written for SecantusDB (`on-conflict-where-lock`, `snapshot-at-first-query`,
-`unique-insert-wait`).
+`unique-insert-wait`, `unique-column-insert-wait`).
 PostgreSQL is Copyright (c) 1996-2022, The PostgreSQL Global Development
 Group, and Portions Copyright (c) 1994, The Regents of the University of
 California, under the PostgreSQL License.
