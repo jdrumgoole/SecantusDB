@@ -610,6 +610,39 @@ impl PgHandler {
             .map_err(failure)
     }
 
+    /// [`Self::ssi_index_insert`] of a unique index, held until the
+    /// statement ends. `_bt_doinsert` checks the leaf only once
+    /// `_bt_check_unique` has passed, after waiting out an inserter of the
+    /// same key, which here is the write conflict the statement ends in.
+    pub(crate) fn ssi_defer_unique(&self, index: i64, leaf: u32) {
+        if self.ssi_tracking() {
+            self.ssi_unique_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((index, leaf));
+        }
+    }
+
+    /// The statement's end for [`Self::ssi_defer_unique`]: a write conflict
+    /// drops the checks (the statement waits and runs again, and makes them
+    /// anew); any other outcome makes them, and their failure is the
+    /// statement's.
+    pub(crate) fn ssi_flush_unique<T>(&self, out: PgWireResult<T>) -> PgWireResult<T> {
+        let pending = std::mem::take(
+            &mut *self
+                .ssi_unique_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        if pending.is_empty() || matches!(&out, Err(e) if Self::is_write_conflict(e)) {
+            return out;
+        }
+        for (index, leaf) in pending {
+            self.ssi_index_insert(index, leaf)?;
+        }
+        out
+    }
+
     /// `PredicateLockPageSplit`: page `old` of index `index` split, its
     /// right half on `new` -- whatever the isolation of the splitter.
     pub(crate) fn ssi_page_split(&self, index: i64, old: u32, new: u32) {

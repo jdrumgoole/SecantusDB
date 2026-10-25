@@ -544,10 +544,38 @@ impl PgHandler {
                     crate::btree_model::SsiEvent::Split(old, new) => {
                         self.ssi_page_split(shape.oid, old, new)
                     }
+                    // A unique index checks after its uniqueness is
+                    // decided, which a write conflict leaves undecided.
+                    crate::btree_model::SsiEvent::Landed(leaf) if shape.unique() => {
+                        self.ssi_defer_unique(shape.oid, leaf)
+                    }
                     crate::btree_model::SsiEvent::Landed(leaf) => {
                         self.ssi_index_insert(shape.oid, leaf)?
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// `_bt_check_unique` before it raises a duplicate of `row`: an SSI
+    /// conflict-in on the leaf each unique index would put its key on, so a
+    /// SERIALIZABLE failure is not masked by the 23505. Every unique index
+    /// is checked, where PostgreSQL stops at the violated one; the stored
+    /// error names the index only by its storage name.
+    pub(crate) fn ssi_duplicate(&self, table: &str, row: &Document) -> PgWireResult<()> {
+        if !self.ssi_tracking() {
+            return Ok(());
+        }
+        for shape in self.btree_shapes(table) {
+            if !shape.unique() {
+                continue;
+            }
+            let Some(key) = shape.key_of(row) else {
+                continue;
+            };
+            if let Some(leaf) = self.with_btree(table, &shape, |t| t.unique_leaf(&*shape, &key))? {
+                self.ssi_index_insert(shape.oid, leaf)?;
             }
         }
         Ok(())
@@ -829,28 +857,32 @@ pub(crate) fn flush_store(storage: &Arc<secantus_storage::Storage>, force: bool)
             .collect()
     };
     for ((s, db, oid), docs, ids) in changed {
-        let written = storage.outside_user_transaction(|| -> Result<(), String> {
-            let encoded = docs
-                .iter()
-                .map(crate::encode_doc)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?;
-            let err = |e: secantus_storage::StorageError| e.to_string();
-            if !storage.collection_exists(&db, COLLECTION).map_err(err)? {
-                storage.create_collection(&db, COLLECTION).map_err(err)?;
-            }
-            // The changed pages' documents, or every one of the index's.
-            let which = match &ids {
-                None => bson::doc! { "index": oid },
-                Some(ids) => bson::doc! { "_id": { "$in": ids.clone() } },
-            };
-            storage
-                .delete_matching(&db, COLLECTION, &which, 0, &Document::new(), None)
-                .map_err(err)?;
-            storage
-                .insert(&db, COLLECTION, encoded, true)
-                .map_err(err)?;
-            Ok(())
+        // The checkpointer's write, which no snapshot reads: not a commit
+        // a REPEATABLE READ transaction must see (`without_commit_count`).
+        let written = secantus_storage::without_commit_count(|| {
+            storage.outside_user_transaction(|| -> Result<(), String> {
+                let encoded = docs
+                    .iter()
+                    .map(crate::encode_doc)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?;
+                let err = |e: secantus_storage::StorageError| e.to_string();
+                if !storage.collection_exists(&db, COLLECTION).map_err(err)? {
+                    storage.create_collection(&db, COLLECTION).map_err(err)?;
+                }
+                // The changed pages' documents, or every one of the index's.
+                let which = match &ids {
+                    None => bson::doc! { "index": oid },
+                    Some(ids) => bson::doc! { "_id": { "$in": ids.clone() } },
+                };
+                storage
+                    .delete_matching(&db, COLLECTION, &which, 0, &Document::new(), None)
+                    .map_err(err)?;
+                storage
+                    .insert(&db, COLLECTION, encoded, true)
+                    .map_err(err)?;
+                Ok(())
+            })
         });
         if let Err(e) = written {
             eprintln!("secantusd-pg: could not write the pages of index {oid} in {db}: {e}");

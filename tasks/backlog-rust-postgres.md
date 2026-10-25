@@ -139,6 +139,16 @@ one beside it.
   be made sound (one value has unboundedly many spellings: `1`, `1.0`,
   `1e0`), and a value-keyed index is an on-disk format change for both PG
   servers. The costs stay as they are, correct.
+- **Scope decision — a transaction is limited by WiredTiger's cache** (Joe,
+  2026-10-25, RP-256). A transaction's uncommitted writes stay in the cache
+  until it commits, where PostgreSQL's heap and WAL take any size to disk.
+  The PG server raises the eviction triggers to 50%, so one transaction
+  holds about 1,000,000 small rows at the 4G cache (2,000,000 fail). Past
+  that it fails XX000 "Transaction is too large and will not fit in the
+  storage engine cache". `ALTER TABLE ... ADD PRIMARY KEY` re-keys every
+  stored row, so it counts each row again. Removing the limit means
+  spilling a transaction's writes outside WiredTiger, a large project in
+  the shared storage.
 - **Scope decision — REPEATABLE READ answers 40001 after a wait when ANY
   transaction committed since its snapshot**, where PostgreSQL goes on unless
   the ROW changed. WiredTiger cannot continue a transaction after a conflict,
@@ -146,7 +156,11 @@ one beside it.
   only when nothing it could read later committed -- unknowable for the rest
   of the transaction. Narrowing to the conflicting table would let a later
   read see rows committed after the snapshot: a wrong answer, worse than a
-  40001 every client must retry anyway.
+  40001 every client must retry anyway. Two things are not counted as
+  commits (batch 76): the checkpointer's saves of the page models, which no
+  snapshot reads, and a duplicate key. A key another transaction committed
+  is PostgreSQL's 23505 whatever the snapshot, and that error ends the
+  block, so the moved snapshot is never read.
 
 ## 3. Deferred work (skipped from a slice, ready to come back)
 
@@ -775,32 +789,20 @@ batch, their tests regression tests:
       Backlog-ID: RP-254
       Verify: tests/backlog/test_rp_isolation.py::test_ssi_index_access_methods
 
-- [ ] **A duplicate key under REPEATABLE READ or SERIALIZABLE is 40001,
-      even after the other inserter rolls back.** Take a transaction that
-      inserts a key another open transaction has inserted. It waits, as in
-      PostgreSQL, and then fails with 40001 "could not serialize access due
-      to concurrent update" whether the other transaction committed or
-      rolled back. Inside an SQL function (`read-write-unique-3`) it does
-      not wait at all. PostgreSQL 15.19 waits, then:
-      - if the other transaction rolled back, the insert goes on;
-      - under REPEATABLE READ, if it committed, the insert fails 23505
-        (`unique-insert-wait`);
-      - under SERIALIZABLE, it fails with SSI's reason code: in
-        `read-write-unique` and `-2`, "identification as a pivot, during
-        conflict in checking"; in `-3` and `-4`, "during write".
+- [ ] **An INSERT inside a function a constant SELECT calls does not wait
+      for an uncommitted inserter of its key.** `SELECT insert_unique(1,
+      '2')` (`read-write-unique-3`) folds the call while it is planned, so
+      the function's INSERT runs before the statement's conflict wait: a
+      key another open transaction inserted is 40001 "concurrent update" at
+      once. PostgreSQL 15.19 waits, then fails with SSI's "identification
+      as a pivot, during write". Since batch 76 every other duplicate-key
+      insert waits as PostgreSQL does: it goes on when the other
+      transaction rolls back, and is 23505 (REPEATABLE READ) or SSI's
+      reason code (SERIALIZABLE) when it commits. The fix is not to run a
+      volatile function while planning.
       Backlog-ID: RP-255
-      Verify: tests/backlog/test_rp_isolation.py::test_unique_insert_waits_under_serializable
+      Verify: tests/backlog/test_rp_isolation.py::test_unique_insert_in_a_function_waits
 
-- [ ] **A transaction of a million inserted rows fails XX000.**
-      `multiple-row-versions`'s setup inserts 1,000,000 rows in one
-      implicit transaction. It fails with "could not insert: Transaction is
-      too large and will not fit in the storage engine cache". 400,000 rows
-      fit and 600,000 do not. PostgreSQL 15.19 has no such limit.
-      WiredTiger keeps a transaction's updates in its cache until commit,
-      so the fix lies in the cache size or eviction configuration that
-      both Rust servers share.
-      Backlog-ID: RP-256
-      Verify: tests/backlog/test_rp_isolation.py::test_million_row_transaction
 
 ## Found by batch 71 (2026-10-25)
 

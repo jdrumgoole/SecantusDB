@@ -956,6 +956,15 @@ impl BTree {
         tree
     }
 
+    /// The leaf `_bt_search` puts a unique index's key on without its heap
+    /// TID (the first page the key could be on), which `_bt_check_unique`
+    /// checks for an SSI conflict before it raises a duplicate. `None` for
+    /// an empty index.
+    pub(crate) fn unique_leaf(&self, shape: &dyn Shape, key: &[Bson]) -> Option<u32> {
+        self.root?;
+        Some(self.descend(shape, key, i64::MIN).0)
+    }
+
     /// The leaf an item of `key` and `tid` belongs on, and the internal
     /// pages above it, root first.
     fn descend(&self, shape: &dyn Shape, key: &[Bson], tid: i64) -> (u32, Vec<u32>) {
