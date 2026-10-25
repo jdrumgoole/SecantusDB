@@ -85,7 +85,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ------------------------- RP-028 a HOT chain is read at its root's place
     "a bitmap heap scan reads a HOT-updated row at its root": (
         "RP-028",
-        True,
+        False,
         [
             "create table rp47_h (id int primary key, v text)",
             "insert into rp47_h values (3, 'c'), (1, 'a'), (2, 'b')",

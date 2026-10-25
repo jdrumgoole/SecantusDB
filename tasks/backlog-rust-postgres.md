@@ -430,10 +430,7 @@ one beside it.
   - A table whose rows are not text, bytea or fixed width (numeric, arrays,
     json): its heap pages are taken at the estimated density.
   - DISTINCT ON, and a citext DISTINCT, which PostgreSQL sorts.
-  - A bitmap heap scan's order after a HOT UPDATE: PostgreSQL reaches the
-    new version through its chain's root and reads it at the root's place
-    (`select id from t where id > 0` over a primary key reads rows 3, 1, 2
-    where this server, reading in ctid order, returns 3, 2, 1). The size
+  - The size
     CREATE INDEX records and what ANALYZE stores are modelled (`__sql_relstats__`), but not REINDEX's,
     CLUSTER's or an ALTER TABLE that builds an index, nor across RENAME.
     Declined over an analysed table, keeping the old order: a range over
@@ -556,7 +553,7 @@ one beside it.
     than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_left_join_whose_nullable_side_holds_a_left_join_is_searched, tests/backlog/test_rp_batch47.py::test_scenario[a bitmap heap scan reads a HOT-updated row at its root]
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_left_join_whose_nullable_side_holds_a_left_join_is_searched
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
