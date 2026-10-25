@@ -143,6 +143,105 @@ impl PgHandler {
         done("ALTER INDEX")
     }
 
+    /// `ALTER INDEX [IF EXISTS] i SET (...)` / `RESET (...)`: the index's
+    /// `pg_class.reloptions`, each value checked against its access method
+    /// (`index_reloptions`). Kept with the storage index, inside the user's
+    /// transaction. It changes no index already built, as in PostgreSQL,
+    /// where only a REINDEX reads them.
+    pub(crate) fn alter_index_options(
+        &self,
+        index: &str,
+        changes: &[(bool, String, Option<String>)],
+        missing_ok: bool,
+    ) -> PgWireResult<Vec<Response>> {
+        let (schema, bare) = secantus_pgplan::schemas::split_key(index);
+        let qualified = index.contains('.');
+        let found = self.index_relations().into_iter().find(|ix| {
+            ix.name == bare
+                && (!qualified || secantus_pgplan::schemas::split_key(&ix.table.name).0 == schema)
+        });
+        let Some(ix) = found else {
+            if self.lookup(index).is_some() {
+                return Err(error("42809", format!("\"{bare}\" is not an index")));
+            }
+            if missing_ok {
+                self.notice(
+                    "00000",
+                    format!("relation \"{bare}\" does not exist, skipping"),
+                    None,
+                );
+                return done("ALTER INDEX");
+            }
+            return Err(error(
+                "42P01",
+                format!("relation \"{bare}\" does not exist"),
+            ));
+        };
+        let table = ix.table.name.clone();
+        let constraint = ix.primary
+            || ix
+                .table
+                .unique_constraints
+                .iter()
+                .any(|u| u.name == ix.name);
+        let stored = (!constraint)
+            .then(|| {
+                self.storage
+                    .list_indexes(self.db(), &table)
+                    .ok()?
+                    .into_iter()
+                    .find(|d| d.get_str("name") == Ok(ix.name.as_str()))
+            })
+            .flatten();
+        let Some(stored) = stored else {
+            return Err(error(
+                "0A000",
+                "ALTER INDEX ... SET or RESET of a constraint's index is not supported".into(),
+            ));
+        };
+        let opt = |k: &str| {
+            stored.get(k).cloned().or_else(|| {
+                stored
+                    .get_document("options")
+                    .ok()
+                    .and_then(|o| o.get(k).cloned())
+            })
+        };
+        let method = opt("sqlMethod")
+            .and_then(|m| m.as_str().map(str::to_string))
+            .unwrap_or_else(|| "btree".into());
+        let mut options: Vec<String> = match opt("sqlReloptions") {
+            Some(Bson::Array(a)) => a
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        };
+        for (reset, name, value) in changes {
+            if !reset {
+                secantus_pgplan::check_index_reloption(&method, name, value.as_deref())
+                    .map_err(|e| Self::err(&e))?;
+            }
+            options.retain(|o| o.split('=').next() != Some(name.as_str()));
+            if !reset {
+                options.push(format!(
+                    "{name}={}",
+                    value.clone().unwrap_or_else(|| "true".into())
+                ));
+            }
+        }
+        let list: Vec<Bson> = options.into_iter().map(Bson::String).collect();
+        self.storage
+            .set_index_options(
+                self.db(),
+                &table,
+                &ix.name,
+                &bson::doc! { "sqlReloptions": list },
+            )
+            .map_err(|e| Self::storage_err("could not alter the index", e))?;
+        done("ALTER INDEX")
+    }
+
     /// `ALTER TABLE t RENAME CONSTRAINT c TO d`: a CHECK, FOREIGN KEY, UNIQUE
     /// or PRIMARY KEY (whose index takes the new name as well).
     fn rename_constraint(&self, table: &str, name: &str, to: &str) -> PgWireResult<Vec<Response>> {

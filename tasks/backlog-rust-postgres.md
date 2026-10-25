@@ -745,6 +745,35 @@ tests are scenarios in `tests/backlog/test_rp_batch30.py`, measured on a
 private 15.19 cluster. RP-133 .. RP-136 and RP-138 .. RP-142 were found and
 fixed in the same batch; their tests there are regression tests.
 
+## Found by batch 77 (2026-10-25)
+
+Found while modelling hash indexes for SERIALIZABLE (RP-254): a hash index's
+fill factor is a storage parameter, which this server dropped. The tests are
+scenarios in `tests/backlog/test_rp_batch77.py`, measured on a private 15.19
+cluster. Fixed in the same batch, their tests regression tests:
+- RP-261: an index's `WITH (...)` was ignored: not checked against its
+  access method, not in `pg_class.reloptions`, not printed by
+  `pg_get_indexdef`. `ALTER INDEX ... SET` / `RESET` were refused.
+- RP-262: `ROLLBACK TO SAVEPOINT` did not undo an index's CREATE, DROP,
+  RENAME or ALTER. Undoing a DROP TABLE lost the table's indexes, and the
+  COMMIT kept them lost.
+- RP-263: a table's storage parameter given bare (`WITH (fillfactor)`) was
+  "specified more than once", and one given twice was accepted. An
+  out-of-bounds or enum value's error had no DETAIL.
+- RP-264: a missing relation in `ALTER TABLE`, `INDEX`, `VIEW`, `SEQUENCE`
+  or `MATERIALIZED VIEW` was reported with a position.
+
+- [ ] **A constraint's index loses its storage parameters.** `PRIMARY KEY
+      WITH (fillfactor = 60)` and `UNIQUE (b) WITH (fillfactor = 70)` are
+      accepted, but `pg_class.reloptions` is NULL for the constraints'
+      indexes and `pg_get_indexdef` prints no `WITH`. `ALTER INDEX t_pkey
+      SET (...)` is refused with 0A000. PostgreSQL 15.19 keeps and prints
+      them as it does for any index. A constraint's index is described by
+      the table's catalog entry rather than by a storage index of its own,
+      so its options would be kept with the constraint.
+      Backlog-ID: RP-265
+      Verify: tests/backlog/test_rp_batch77.py::test_scenario[a constraint's index keeps its storage parameters]
+
 ## Found by batch 75 (2026-10-25)
 
 Found while building serializable snapshot isolation (RP-061), a port of
@@ -764,28 +793,17 @@ batch, their tests regression tests:
 - RP-260: a REPEATABLE READ transaction took its snapshot at a SET, SHOW
   or LOCK. PostgreSQL takes it at the first statement that needs one.
 
-- [ ] **SERIALIZABLE reads through a partial index lock the whole table.**
-      The SIREAD locks follow the scan the planner prices (seq, bitmap or
-      B-tree index, `costsize::scan_paths`). A partial index is not priced,
-      so a scan its predicate covers locks the relation. PostgreSQL 15.19
-      reads `val2 = 1` by a bitmap scan of the partial index and `id = 10`
-      by an index scan. In `partial-index`'s `rxy1 wx1 wy2 c1 rxy2 c2` and
-      two other permutations, s2 is doomed when s1 commits ("identification
-      as a pivot, during conflict out checking"). In PostgreSQL it fails
-      later, at its read ("conflict out to pivot, during read").
-      Backlog-ID: RP-253
-      Verify: tests/backlog/test_rp_isolation.py::test_ssi_partial_index
-
-- [ ] **SERIALIZABLE scans of GIN, GiST and hash indexes lock the whole
-      table.** Only B-tree index scans take page and tuple SIREAD locks
-      here. PostgreSQL 15.19's GIN, GiST and hash access methods lock the
-      index pages a scan reads (`PredicateLockPage` in `ginget.c`,
-      `gistget.c`, `hashsearch.c`). They check conflicts in on the pages
-      an insert touches. So two transactions working on far-apart keys both
-      commit there and fail here: 16 of `predicate-gin`'s 31 permutations
-      agree, and 22 of 40 for `predicate-gist` and `predicate-hash`. It
-      needs page models of the three access methods, as `btree_model.rs`
-      is for B-trees.
+- [ ] **SERIALIZABLE scans of GIN and GiST indexes lock the whole table.**
+      B-tree and (since batch 77) hash index scans take PostgreSQL's page
+      and tuple SIREAD locks here. GIN and GiST indexes are not modelled,
+      so a scan of one is priced as a sequential scan and locks the
+      relation. PostgreSQL 15.19's `ginget.c` and `gistget.c` lock the
+      index pages a scan reads, and an insert checks the pages it touches.
+      So two transactions working on far-apart keys both commit there and
+      fail here: 16 of `predicate-gin`'s 31 permutations agree, and 22 of
+      `predicate-gist`'s 40. It needs page models of the two access
+      methods, as `btree_model.rs` is for B-trees and `hash_index.rs` for
+      hash indexes.
       Backlog-ID: RP-254
       Verify: tests/backlog/test_rp_isolation.py::test_ssi_index_access_methods
 

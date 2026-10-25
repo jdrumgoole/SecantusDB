@@ -80,6 +80,26 @@ fn element_literal(toks: &[Tok], value: &str) -> Option<usize> {
     hits.next().is_none().then_some(i)
 }
 
+/// `ALTER TABLE | INDEX | VIEW | SEQUENCE | MATERIALIZED VIEW | FOREIGN
+/// TABLE`, whose missing relation PostgreSQL reports without a position.
+pub fn alter_finds_relation_by_name(sql: &str) -> bool {
+    let head: String = sql
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    matches!(
+        head.as_str(),
+        "alter table"
+            | "alter index"
+            | "alter view"
+            | "alter sequence"
+            | "alter materialized"
+            | "alter foreign"
+    )
+}
+
 /// The position in `sql` of an error with this SQLSTATE and primary
 /// message, when it can be found.
 pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize> {
@@ -99,6 +119,12 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
         .join(" ")
         .to_ascii_lowercase();
     if head == "create cast" || head == "drop cast" {
+        return None;
+    }
+    // `ALTER TABLE | INDEX | VIEW | SEQUENCE | MATERIALIZED VIEW | FOREIGN
+    // TABLE` find their relation by name, outside any expression
+    // (`RangeVarGetRelidExtended`), and a missing one has no position.
+    if sqlstate == "42P01" && alter_finds_relation_by_name(sql) {
         return None;
     }
     // `ALTER TYPE t ... ATTRIBUTE a`: the type and the attribute are found

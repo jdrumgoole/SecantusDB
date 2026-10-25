@@ -156,7 +156,18 @@ fn int_of(v: &Bson) -> Option<i64> {
 /// One key value's extended hash, by its column's type; `None` for a type
 /// whose hash this does not reproduce.
 fn hash_value(v: &Bson, ty: &str) -> Option<u64> {
-    let seed = HASH_PARTITION_SEED;
+    hash_value_seeded(v, ty, HASH_PARTITION_SEED)
+}
+
+/// One value's standard hash by its type (the hash opclass's support
+/// function 1, as a hash index keys it): the low 32 bits of the extended
+/// hash with seed 0, which PostgreSQL requires them to be. `None` for a
+/// type whose hash this does not reproduce.
+pub fn standard_hash(v: &Bson, ty: &str) -> Option<u32> {
+    hash_value_seeded(v, ty, 0).map(|h| h as u32)
+}
+
+fn hash_value_seeded(v: &Bson, ty: &str, seed: u64) -> Option<u64> {
     Some(match ty {
         "int2" | "int4" | "int8" | "smallint" | "integer" | "bigint" => hash_int8(int_of(v)?, seed),
         "oid" => hash_uint32_extended(int_of(v)? as u32, seed),
@@ -261,6 +272,33 @@ pub fn satisfies(args: &[Bson]) -> crate::Result<Bson> {
 
 #[cfg(test)]
 mod tests {
+
+    /// PostgreSQL 15.19: `hashint4(10)`, `(20)`, `(30)`, `(40)`, `(-7)`,
+    /// `(0)`, `hashint8(5000000000)` and `hashtext('abc')`.
+    #[test]
+    fn standard_hash_is_postgres_hash_function() {
+        let i = |n: i32| standard_hash(&Bson::Int32(n), "int4").map(|h| h as i32);
+        assert_eq!(
+            [i(10), i(20), i(30), i(40), i(-7), i(0)],
+            [
+                Some(-1547814713),
+                Some(-2014641093),
+                Some(1660582443),
+                Some(-241967824),
+                Some(-82204417),
+                Some(-272711505)
+            ]
+        );
+        assert_eq!(
+            standard_hash(&Bson::Int64(5_000_000_000), "int8").map(|h| h as i32),
+            Some(-694934712)
+        );
+        assert_eq!(
+            standard_hash(&Bson::String("abc".into()), "text").map(|h| h as i32),
+            Some(-785388649)
+        );
+    }
+
     use super::*;
 
     #[test]

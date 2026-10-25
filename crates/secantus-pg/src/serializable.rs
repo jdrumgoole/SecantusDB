@@ -145,6 +145,12 @@ fn nested(doc: &Document) -> Document {
 /// One end of an index range: the key, and whether it is included.
 type Bound = Option<(bson::Bson, bool)>;
 
+/// The index a SERIALIZABLE scan reads, as the planner chose it.
+enum ScanIndex {
+    Btree(std::sync::Arc<crate::btree::IndexShape>),
+    Hash(crate::hash_index::HashShape),
+}
+
 impl PgHandler {
     fn ssi_key(&self) -> usize {
         std::sync::Arc::as_ptr(&self.storage) as usize
@@ -307,20 +313,89 @@ impl PgHandler {
         let Some(rel) = self.ssi_relation(table) else {
             return Ok(());
         };
-        let path = self.ssi_scan_index(table, filter);
-        match path {
-            Some(shape) => self.ssi_index_scan(table, rel, &shape, filter),
+        match self.ssi_scan_index(table, filter) {
+            Some(ScanIndex::Btree(shape)) => self.ssi_index_scan(table, rel, &shape, filter),
+            Some(ScanIndex::Hash(shape)) => self.ssi_hash_scan(table, rel, &shape, filter),
             None => self.ssi_seq_scan(table),
         }
     }
 
-    /// The index PostgreSQL's cheapest path for `filter` over `table`
-    /// reads, or `None` for a sequential scan.
-    fn ssi_scan_index(
+    /// A hash index scan of `table` through `shape` (`_hash_first`): the
+    /// primary page of each key's bucket, locked; then each heap tuple of
+    /// those keys, as an index scan fetches them.
+    fn ssi_hash_scan(
         &self,
         table: &str,
+        rel: i64,
+        shape: &crate::hash_index::HashShape,
         filter: &Document,
-    ) -> Option<std::sync::Arc<crate::btree::IndexShape>> {
+    ) -> PgWireResult<()> {
+        let pid = self.ssi_pid();
+        let db = self.ssi_db();
+        let conds = flat_conditions(filter).unwrap_or_default();
+        let mut values: Vec<bson::Bson> = Vec::new();
+        for (k, v) in &conds {
+            if k != &shape.field {
+                continue;
+            }
+            match v {
+                bson::Bson::Document(ops) if ops.keys().all(|o| o.starts_with('$')) => {
+                    if let Some(x) = ops.get("$eq") {
+                        values.push(x.clone());
+                    }
+                    if let Some(bson::Bson::Array(xs)) = ops.get("$in") {
+                        values.extend(xs.iter().cloned());
+                    }
+                }
+                other => values.push(other.clone()),
+            }
+        }
+        let buckets: Vec<u32> = values
+            .iter()
+            .filter_map(|v| shape.hash_value(v))
+            .map(|h| self.with_hash_meta(table, shape, |m| m.bucket(h)))
+            .collect();
+        let index_filter = bson::doc! { shape.field.clone(): { "$in": values } };
+        let rows = self
+            .storage
+            .find_matching(self.db(), table, &index_filter)
+            .map_err(|e| Self::storage_err("could not read", e))?;
+        let mut tuples: Vec<(i64, Option<u64>)> = rows
+            .iter()
+            .filter_map(|b| {
+                let d = crate::decode_doc(b).ok()?;
+                let ctid = crate::heap::ctid_of(&d)?;
+                let xmin = d
+                    .get("__sys_xmin")
+                    .and_then(crate::bson_i64)
+                    .map(|x| x as u64);
+                Some((ctid, xmin))
+            })
+            .collect();
+        tuples.sort_unstable();
+        let empty = Document::new();
+        let examined = |_: i64, doc: Option<&Document>| {
+            doc.is_some_and(|d| {
+                secantus_core::query::matches(d, &index_filter, &empty, None).unwrap_or(false)
+            })
+        };
+        self.ssi(|s| {
+            for b in &buckets {
+                s.lock_page(pid, db, shape.oid, crate::hash_index::bucket_page(*b));
+            }
+            let any = !tuples.is_empty() || s.has_versions(db, rel, &examined);
+            s.scan_conflicts_out(pid, db, rel, &examined, any)?;
+            for (ctid, xmin) in &tuples {
+                s.lock_tuple(pid, db, rel, *ctid, *xmin);
+            }
+            Ok(())
+        })
+        .map_err(failure)
+    }
+
+    /// The index PostgreSQL's cheapest path for `filter` over `table`
+    /// reads, or `None` for a sequential scan.
+    fn ssi_scan_index(&self, table: &str, filter: &Document) -> Option<ScanIndex> {
         use secantus_pgplan::{costsize, hashagg};
         if filter.is_empty() {
             return None;
@@ -373,7 +448,26 @@ impl PgHandler {
         let rows = (pt.tuples * hashagg::filter_selectivity(&flat, &nd)?)
             .round()
             .max(1.0);
-        let indexes = self.cost_indexes(table, &pt.def, count as u64);
+        let mut indexes = self.cost_indexes_with(table, &pt.def, count as u64, false);
+        let full = indexes.len();
+        let partial = self.ssi_partial_indexes(table, &pt, filter, &nd);
+        indexes.extend(partial.iter().map(|(ix, _)| ix.clone()));
+        let hashes = self.hash_shapes(table);
+        for h in &hashes {
+            let pages = self.with_hash_meta(table, h, |m| m.pages());
+            indexes.push(costsize::Index {
+                field: h.field.clone(),
+                unique: false,
+                pages,
+                height: 0,
+                columns: vec![h.field.clone()],
+                correlation: 0.0,
+                visible: 0.0,
+                tuples: None,
+                predicate: None,
+                hash: true,
+            });
+        }
         // `disable_cost`, added to a path's startup when its kind is off.
         const DISABLE_COST: f64 = 1.0e10;
         let off = |name: &str| self.setting_is(name, "off");
@@ -401,10 +495,123 @@ impl PgHandler {
         let (costsize::ScanKind::Bitmap(i) | costsize::ScanKind::Index(i)) = best?.0 else {
             return None;
         };
+        if i >= full + partial.len() {
+            return hashes
+                .into_iter()
+                .nth(i - full - partial.len())
+                .map(ScanIndex::Hash);
+        }
+        if i >= full {
+            return partial
+                .into_iter()
+                .nth(i - full)
+                .map(|(_, shape)| ScanIndex::Btree(shape));
+        }
         let columns = &indexes.get(i)?.columns;
         self.btree_shapes(table)
             .into_iter()
             .find(|s| s.is_plain() && s.key_fields() == columns.as_slice())
+            .map(ScanIndex::Btree)
+    }
+
+    /// `table`'s partial B-trees whose predicate `filter` implies
+    /// (`check_index_predicates`: each of its conjuncts is one of the
+    /// filter's, which is sound and not complete), costed as `plancat`
+    /// sees them: `estimate_rel_size` of the index (its pages, and its
+    /// tuples from `pg_class` at that density, or from its columns' widths
+    /// when `pg_class` has none past the metapage), and the selectivity of
+    /// the predicate's conjuncts its leading column's quals do not imply.
+    fn ssi_partial_indexes(
+        &self,
+        table: &str,
+        pt: &crate::PlannerTable,
+        filter: &Document,
+        nd: &dyn Fn(&str) -> f64,
+    ) -> Vec<(
+        secantus_pgplan::costsize::Index,
+        std::sync::Arc<crate::btree::IndexShape>,
+    )> {
+        use secantus_pgplan::{costsize, hashagg};
+        let Some(conds) = flat_conditions(filter) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for shape in self.btree_shapes(table) {
+            let Some(pred) = shape.plain_predicate() else {
+                continue;
+            };
+            let Some(pred) = flat_conditions(pred) else {
+                continue;
+            };
+            if pred.is_empty() || !pred.iter().all(|p| conds.contains(p)) {
+                continue;
+            }
+            let columns = shape.key_fields().to_vec();
+            let Some(lead) = columns.first().cloned() else {
+                continue;
+            };
+            let Ok(Some((pages, height))) =
+                self.with_btree(table, &shape, |t| t.root.map(|_| (t.pages(), t.height())))
+            else {
+                continue;
+            };
+            let stats = self.relstats(&Self::index_relstats_key(table, &shape.name));
+            let relpages = stats
+                .as_ref()
+                .and_then(|d| d.get("relpages"))
+                .and_then(crate::bson_i64)
+                .unwrap_or(0);
+            let reltuples = stats
+                .as_ref()
+                .and_then(|d| d.get("reltuples"))
+                .and_then(bson::Bson::as_f64)
+                .unwrap_or(-1.0);
+            // The metapage is discounted from both.
+            let cur = f64::from(pages.saturating_sub(1));
+            let relpages = (relpages - 1).max(0);
+            let density = if reltuples >= 0.0 && relpages > 0 {
+                reltuples / relpages as f64
+            } else {
+                let width: i64 = columns
+                    .iter()
+                    .map(|f| Self::column_width(&pt.def, f))
+                    .sum::<i64>()
+                    + 24
+                    + 4;
+                ((8192 - 24) / width.max(1)) as f64
+            };
+            let tuples = (density * cur).round().min(pt.tuples);
+            let rest: Document = pred
+                .iter()
+                .filter(|(f, _)| f != &lead)
+                .map(|(f, v)| (f.clone(), v.clone()))
+                .collect();
+            let selectivity = if rest.is_empty() {
+                1.0
+            } else {
+                match hashagg::filter_selectivity(&rest, nd) {
+                    Some(s) => s,
+                    None => continue,
+                }
+            };
+            let unique = shape.unique() && columns.len() == 1;
+            out.push((
+                costsize::Index {
+                    field: lead,
+                    unique,
+                    pages: f64::from(pages),
+                    height,
+                    columns,
+                    correlation: 0.0,
+                    visible: 0.0,
+                    tuples: Some(tuples),
+                    predicate: Some(selectivity),
+                    hash: false,
+                },
+                shape,
+            ));
+        }
+        out
     }
 
     /// An index scan of `table` through `shape` (`_bt_first` onwards): the
