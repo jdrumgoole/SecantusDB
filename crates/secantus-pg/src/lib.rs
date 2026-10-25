@@ -10285,8 +10285,13 @@ impl PgHandler {
     /// conflict (`create schema s; create type e as enum (...)` on a fresh
     /// store did exactly that). The rows are server bookkeeping, not
     /// something a `ROLLBACK` should undo, so they belong before the block.
-    const CATALOG_COLLECTIONS: [&'static str; 9] = [
+    ///
+    /// `__sql_relstats__` too: the first CREATE TABLE of each of several
+    /// sessions records its table's size there, and on a fresh store they
+    /// raced to register it (RP-269).
+    const CATALOG_COLLECTIONS: [&'static str; 10] = [
         CATALOG_COLLECTION,
+        Self::RELSTATS_COLLECTION,
         Self::DOMAIN_COLLECTION,
         Self::VIEW_COLLECTION,
         SEQUENCE_COLLECTION,

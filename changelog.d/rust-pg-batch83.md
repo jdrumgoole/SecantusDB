@@ -36,7 +36,17 @@ concurrent update".
 - `secantus-pg`: a CREATE TEMPORARY TABLE is never treated as colliding
   with another session's table of the same name. A temp table is in its
   session's own schema, and mapping its write conflicts to 23505 turned an
-  unrelated conflict into a duplicate key. Found by a stress test, which is
-  now RP-269's gap test
-  (`tests/backlog/test_rp_batch82.py::test_sessions_create_their_own_temp_tables_side_by_side`):
-  sessions creating temp tables side by side still fail 40001 now and then.
+  unrelated conflict into a duplicate key. Found by a stress test.
+- `secantus-pg`: sessions creating tables side by side on a fresh store no
+  longer fail 40001. Each session's first CREATE recorded its table's size
+  in `__sql_relstats__`, which nothing had registered yet. Every one of
+  those transactions tried to register it, and WiredTiger let only one
+  through. It is now registered with the other catalog collections, before
+  any transaction's snapshot, as PostgreSQL's catalogs exist from `initdb`.
+  Sixteen sessions creating, filling and updating their own temp tables
+  forty times each now fail none of 640, against about one in four before.
+  Fixes RP-269
+  (`tests/backlog/test_rp_batch82.py::test_sessions_create_their_own_temp_tables_side_by_side`).
+  It may also be what hung
+  `test_rust_pgserver_slice.py::test_parallel_sessions_resolve_their_own_new_temp_table`
+  in CI, which runs the same pattern; that is not proven.

@@ -83,15 +83,15 @@ def test_a_second_create_table_waits_then_goes_on(rust_pg: Any, autocommit: bool
     assert _race(rust_pg, "rollback", autocommit) == ("ok", True)
 
 
-@pytest.mark.backlog("RP-269")
+@pytest.mark.backlog_fixed("RP-269")
 def test_sessions_create_their_own_temp_tables_side_by_side(rust_pg: Any) -> None:
     """PostgreSQL 15.19: sixteen sessions, each forty times on a fresh
     connection creating its own TEMP table `t` and filling it in one
     implicit transaction, then updating and reading it back. Every session's temp schema
-    is its own, so none of them fails and each reads only its own rows. This
-    server fails some of these sessions with 40001: their catalog writes
-    collide on another session's temp table's catalog rows. Now and then a
-    session's next statement does not find its own `t` (42P01)."""
+    is its own, so none of them fails and each reads only its own rows.
+    This server failed some with 40001: on a fresh store, each session's
+    first CREATE registered `__sql_relstats__` inside its own transaction,
+    and WiredTiger refused all but one of those registrations."""
     problems: list[str] = []
     lock = threading.Lock()
 
