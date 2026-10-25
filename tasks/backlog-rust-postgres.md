@@ -740,6 +740,15 @@ tests are scenarios in `tests/backlog/test_rp_batch30.py`, measured on a
 private 15.19 cluster. RP-133 .. RP-136 and RP-138 .. RP-142 were found and
 fixed in the same batch; their tests there are regression tests.
 
+## Found by batch 71 (2026-10-25)
+
+Found while building REINDEX SCHEMA (RP-196), and fixed in the same batch;
+its test in `tests/backlog/test_rp_batch71.py` is a regression test.
+RP-249: a table outside `public` named its primary key after its
+schema-qualified key (`rxs.t_pkey`, where PostgreSQL makes `t_pkey` in
+schema `rxs`), so `pg_relation_size('rxs.t_pkey')` was 0. `REINDEX TABLE
+rxs.t` was also 42P01, its relation never qualified.
+
 ## Found by batch 69 (2026-10-25)
 
 Found while applying an UPDATE in its scan's order (RP-247), and fixed in
@@ -952,20 +961,29 @@ are scenarios in `tests/backlog/test_rp_batch48.py`, measured on a private
 15.19 cluster. RP-195 (`pg_relation_size`) was found and fixed in the same
 batch; its test there is a regression test.
 
-- [ ] **A B-tree index never deletes the dead tuples a leaf holds before
-      it splits.** Each B-tree's pages are modelled since batch 60
-      (`btree_model.rs`): CREATE INDEX's build, inserts that deduplicate and
-      split, VACUUM's index pass. What the model lacks is PostgreSQL 14's
-      bottom-up deletion -- an UPDATE that leaves an index's key unchanged,
-      finding the leaf full, asks the heap which of the key's older
-      versions are dead and removes them instead of splitting -- and simple
-      deletion of the tuples index scans marked LP_DEAD. Both need the
-      model to consult the heap's visibility per TID. So five UPDATEs of
-      every row of a 2,000-row table leave its primary key 24 pages here
-      and 17 on PostgreSQL 15.19. Also left: REINDEX SCHEMA rebuilds no
-      index (the statement names no table here).
+- [ ] **A B-tree's dead entries: what index scans mark, and one step of
+      a long run of updates.** Each B-tree's pages are modelled
+      (`btree_model.rs`). Since batch 71 a full leaf deletes before it
+      splits, as PostgreSQL 15.19's `_bt_delete_or_dedup_one_page` does:
+      - `_bt_check_unique` marks LP_DEAD the equal keys whose heap
+        versions are dead to all;
+      - simple deletion removes those, and the dead TIDs of their heap
+        blocks;
+      - bottom-up deletion runs for an UPDATE that left the key unchanged,
+        within its six-block budget.
+      Two things are still left.
+      - **Index scans.** An index scan marks LP_DEAD the entries whose heap
+        versions it finds dead (`kill_prior_tuple`), and this server's reads
+        mark none. With an ordered read of the primary key between updates
+        of a 2,000-row table, PostgreSQL keeps the index at 13, 13, 13 and
+        14 pages, against 14, 15, 15 and 16 here. Modelling it means
+        marking where PostgreSQL's plan is an index scan.
+      - **One step of a run of updates.** In eight updates of every row of
+        a 2,000-row table, the index's pages match PostgreSQL's but for the
+        third, which is 15 here and 14 there, although every heap ctid
+        matches.
       Backlog-ID: RP-196
-      Verify: tests/backlog/test_rp_batch60.py::test_scenario[bottom-up deletion keeps an unchanged key's index small]
+      Verify: tests/backlog/test_rp_batch71.py::test_scenario[every step of eight updates of a primary key], tests/backlog/test_rp_batch71.py::test_scenario[an index scan marks the dead versions it passes]
 
 ## Found by batch 46 (2026-10-23)
 

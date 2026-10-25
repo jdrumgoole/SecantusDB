@@ -71,6 +71,10 @@ pub(crate) struct Item {
     pub(crate) tids: Vec<i64>,
     /// MAXALIGNed, its line pointer aside.
     pub(crate) size: i64,
+    /// `LP_DEAD`: a unique check found every heap version it points at
+    /// dead to all, so the next insert that finds the page full deletes it
+    /// (RP-196).
+    pub(crate) dead: bool,
 }
 
 /// A pivot: a page's high key, or a downlink's separator. `key` holds the
@@ -216,7 +220,230 @@ fn item(shape: &dyn Shape, key: Vec<Bson>, tids: Vec<i64>) -> Item {
     } else {
         base
     };
-    Item { key, tids, size }
+    Item {
+        key,
+        tids,
+        size,
+        dead: false,
+    }
+}
+
+/// `_bt_simpledel_pass`: the LP_DEAD tuples go, and so does every other TID
+/// in one of their heap blocks whose HOT chain is dead (`dead`), which the
+/// heap checks while it visits those blocks anyway.
+fn simple_pass(shape: &dyn Shape, items: &mut Vec<Item>, newtid: i64, dead: &dyn Fn(i64) -> bool) {
+    // `_bt_deadblocks`: the new tuple's heap block first, the one block
+    // checked that holds no LP_DEAD tuple's version.
+    let mut blocks: std::collections::HashSet<i64> = items
+        .iter()
+        .filter(|i| i.dead)
+        .flat_map(|i| i.tids.iter().map(|t| t / 65536))
+        .collect();
+    blocks.insert(newtid / 65536);
+    let mut kept = Vec::with_capacity(items.len());
+    for it in std::mem::take(items) {
+        if it.dead {
+            continue;
+        }
+        let left: Vec<i64> = it
+            .tids
+            .iter()
+            .copied()
+            .filter(|t| !(blocks.contains(&(t / 65536)) && dead(*t)))
+            .collect();
+        if left.len() == it.tids.len() {
+            kept.push(it);
+        } else if !left.is_empty() {
+            kept.push(item(shape, it.key, left));
+        }
+    }
+    *items = kept;
+}
+
+/// `_bt_bottomupdel_pass` and the heap's half of it,
+/// `heap_index_delete_tuples` for a bottom-up caller (PostgreSQL 15.19): the
+/// leaf's TIDs are offered to the heap, those in runs of equal keys marked
+/// promising (a posting list's first or last TID, when its heap block
+/// predominates); the heap visits at most six of their blocks, the most
+/// promising first, and every TID whose HOT chain is dead (`dead`) goes.
+/// True when no deduplication pass should follow: the page now has room
+/// for a while.
+fn bottomup_pass(
+    shape: &dyn Shape,
+    items: &mut Vec<Item>,
+    high: &Option<Pivot>,
+    newitemsz: i64,
+    dead: &dyn Fn(i64) -> bool,
+) -> bool {
+    /// `BOTTOMUP_MAX_NBLOCKS`, `BOTTOMUP_TOLERANCE_NBLOCKS`.
+    const MAX_NBLOCKS: usize = 6;
+    const TOLERANCE: i64 = 3;
+    struct Deltid {
+        tid: i64,
+        item: usize,
+        promising: bool,
+        freespace: i64,
+    }
+    let mut deltids: Vec<Deltid> = Vec::new();
+    let mut nintervals = 0;
+    let mut start = 0;
+    while start < items.len() {
+        let mut end = start + 1;
+        while end < items.len()
+            && cmp_keys(shape, &items[start].key, &items[end].key) == Ordering::Equal
+        {
+            end += 1;
+        }
+        let dupinterval = end - start > 1;
+        if dupinterval {
+            nintervals += 1;
+        }
+        for (i, it) in items.iter().enumerate().take(end).skip(start) {
+            if it.tids.len() == 1 {
+                deltids.push(Deltid {
+                    tid: it.tids[0],
+                    item: i,
+                    promising: dupinterval,
+                    freespace: it.size + LP,
+                });
+                continue;
+            }
+            let n = it.tids.len();
+            let (mut first, mut last) = (false, false);
+            if dupinterval {
+                let block = |t: i64| t / 65536;
+                let (min, mid, max) = (
+                    block(it.tids[0]),
+                    block(it.tids[n / 2]),
+                    block(it.tids[n - 1]),
+                );
+                first = min == mid;
+                last = !first && mid == max;
+            }
+            for (p, t) in it.tids.iter().enumerate() {
+                deltids.push(Deltid {
+                    tid: *t,
+                    item: i,
+                    promising: (first && p == 0) || (last && p == n - 1),
+                    freespace: TID,
+                });
+            }
+        }
+        start = end;
+    }
+    if nintervals == 0 {
+        return false;
+    }
+    // `index_delete_sort`, then `bottomup_sort_and_shrink`'s block groups.
+    deltids.sort_by_key(|d| d.tid);
+    struct Group {
+        first: usize,
+        ntids: usize,
+        promising: u32,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    for (i, d) in deltids.iter().enumerate() {
+        match groups.last_mut() {
+            Some(g) if deltids[g.first].tid / 65536 == d.tid / 65536 => {
+                g.ntids += 1;
+                g.promising += u32::from(d.promising);
+            }
+            _ => groups.push(Group {
+                first: i,
+                ntids: 1,
+                promising: u32::from(d.promising),
+            }),
+        }
+    }
+    for g in &mut groups {
+        g.promising = if g.promising <= 4 {
+            4
+        } else {
+            g.promising.next_power_of_two()
+        };
+    }
+    groups.sort_by(|a, b| {
+        b.promising
+            .cmp(&a.promising)
+            .then_with(|| {
+                if a.ntids == b.ntids {
+                    Ordering::Equal
+                } else {
+                    (b.ntids as u32)
+                        .next_power_of_two()
+                        .cmp(&(a.ntids as u32).next_power_of_two())
+                }
+            })
+            .then(a.first.cmp(&b.first))
+    });
+    groups.truncate(MAX_NBLOCKS);
+    // `bottomup_nblocksfavorable`: the leading blocks near one another.
+    let mut favorable = 0usize;
+    let mut lastblock = -1i64;
+    for g in &groups {
+        let block = deltids[g.first].tid / 65536;
+        if lastblock != -1 && (block < lastblock - TOLERANCE || block > lastblock + TOLERANCE) {
+            break;
+        }
+        favorable += 1;
+        lastblock = block;
+    }
+    let mut target = (8192 / 16).max(newitemsz);
+    let (mut actual, mut last) = (0i64, 0i64);
+    let mut final_block = false;
+    let mut deletable: Vec<(usize, i64)> = Vec::new();
+    for (accessed, g) in groups.iter().enumerate() {
+        if final_block {
+            break;
+        }
+        if accessed >= 1 && actual == last {
+            break;
+        }
+        last = actual;
+        if favorable > 0 {
+            favorable -= 1;
+        } else {
+            target /= 2;
+        }
+        for d in &deltids[g.first..g.first + g.ntids] {
+            if dead(d.tid) {
+                deletable.push((d.item, d.tid));
+                actual += d.freespace;
+                if actual >= target {
+                    final_block = true;
+                }
+            }
+        }
+    }
+    if !deletable.is_empty() {
+        // `_bt_delitems_delete`: a plain tuple goes, a posting list loses
+        // its dead TIDs (and goes with the last).
+        let mut gone: std::collections::HashMap<usize, Vec<i64>> = Default::default();
+        for (i, t) in deletable {
+            gone.entry(i).or_default().push(t);
+        }
+        let mut kept = Vec::with_capacity(items.len());
+        for (i, it) in std::mem::take(items).into_iter().enumerate() {
+            match gone.get(&i) {
+                None => kept.push(it),
+                Some(ts) => {
+                    let left: Vec<i64> = it
+                        .tids
+                        .iter()
+                        .copied()
+                        .filter(|t| !ts.contains(t))
+                        .collect();
+                    if !left.is_empty() {
+                        kept.push(item(shape, it.key, left));
+                    }
+                }
+            }
+        }
+        *items = kept;
+    }
+    // `PageGetExactFreeSpace >= Max(BLCKSZ / 24, newitemsz)`.
+    let exact = leaf_free(items, high) + LP;
+    exact >= (8192 / 24).max(newitemsz)
 }
 
 fn leaf_free(items: &[Item], high: &Option<Pivot>) -> i64 {
@@ -607,6 +834,7 @@ impl BTree {
                 key,
                 tids: vec![tid],
                 size: 0,
+                dead: false,
             });
         }
         for i in items.iter_mut() {
@@ -651,6 +879,45 @@ impl BTree {
         }
     }
 
+    /// `_bt_check_unique`'s pass over the key's equal tuples, from the
+    /// leftmost leaf it can be on (a search without the heap TID) rightward
+    /// while they go on: each whose every heap version is dead to all is
+    /// marked LP_DEAD as the check passes it.
+    fn check_unique(&mut self, shape: &dyn Shape, key: &[Bson], dead: &dyn Fn(i64) -> bool) {
+        let (mut page, _) = self.descend(shape, key, i64::MIN);
+        loop {
+            let Page::Leaf { items, right, .. } = &mut self.pages[page as usize] else {
+                return;
+            };
+            let mut marked = false;
+            let mut last_equal = false;
+            for it in items.iter_mut() {
+                match cmp_keys(shape, &it.key, key) {
+                    Ordering::Less => continue,
+                    Ordering::Greater => {
+                        last_equal = false;
+                        break;
+                    }
+                    Ordering::Equal => {
+                        last_equal = true;
+                        if !it.dead && it.tids.iter().all(|t| dead(*t)) {
+                            it.dead = true;
+                            marked = true;
+                        }
+                    }
+                }
+            }
+            let next = *right;
+            if marked {
+                self.touched.insert(page);
+            }
+            match next {
+                Some(r) if last_equal => page = r,
+                _ => return,
+            }
+        }
+    }
+
     fn new_page(&mut self, page: Page) -> u32 {
         let b = if let Some(b) = self.free.pop() {
             self.pages[b as usize] = page;
@@ -670,6 +937,20 @@ impl BTree {
     /// A unique index deduplicates a page only when an equal key is already
     /// there (an older version of the row).
     pub(crate) fn insert(&mut self, shape: &dyn Shape, key: Vec<Bson>, tid: i64) {
+        self.insert_deleting(shape, key, tid, false, &|_| false);
+    }
+
+    /// `insert`, with the executor's hint that the UPDATE left this index's
+    /// key unchanged (`indexUnchanged`) and the heap's answer to which TIDs
+    /// are dead to every snapshot (`dead`), for bottom-up deletion (RP-196).
+    pub(crate) fn insert_deleting(
+        &mut self,
+        shape: &dyn Shape,
+        key: Vec<Bson>,
+        tid: i64,
+        unchanged: bool,
+        dead: &dyn Fn(i64) -> bool,
+    ) {
         self.dirty = true;
         if self.root.is_none() {
             let new = item(shape, key, vec![tid]);
@@ -680,6 +961,9 @@ impl BTree {
             });
             self.root = Some(root);
             return;
+        }
+        if shape.unique() {
+            self.check_unique(shape, &key, dead);
         }
         let (leaf, path) = self.descend(shape, &key, tid);
         self.touched.insert(leaf);
@@ -693,19 +977,41 @@ impl BTree {
             Some(used) => USABLE - used - high.as_ref().map_or(0, |h| h.size + LP) - LP,
             None => leaf_free(items, high),
         };
-        if free < need && shape.dedup() {
-            // A unique index deduplicates only around an equal key.
-            let uniquedup = shape.unique() && {
-                let at =
-                    items.partition_point(|i| cmp_keys(shape, &i.key, &new.key) == Ordering::Less);
-                items
-                    .get(at)
-                    .is_some_and(|i| cmp_keys(shape, &i.key, &new.key) == Ordering::Equal)
-            };
+        // `_bt_delete_or_dedup_one_page`, for a leaf too full for the new
+        // tuple. A unique index goes on only around an equal key
+        // (`uniquedup`); then bottom-up deletion when the UPDATE left the key
+        // unchanged or the key is already there, and deduplication when that
+        // did not free enough.
+        // `_bt_simpledel_pass` first: the LP_DEAD tuples, and any other
+        // dead TID in one of their heap blocks.
+        let mut simple_ran = false;
+        if free < need && items.iter().any(|i| i.dead) {
+            simple_ran = true;
+            simple_pass(shape, items, tid, dead);
+            free = leaf_free(items, high);
+        }
+        if free < need {
+            let uniquedup = shape.unique()
+                && (simple_ran || {
+                    let at = items
+                        .partition_point(|i| cmp_keys(shape, &i.key, &new.key) == Ordering::Less);
+                    items
+                        .get(at)
+                        .is_some_and(|i| cmp_keys(shape, &i.key, &new.key) == Ordering::Equal)
+                });
             if !shape.unique() || uniquedup {
-                let rightmost = right.is_none();
-                dedup_pass(shape, items, high, &new, rightmost);
-                free = leaf_free(items, high);
+                let mut deduplicate = shape.dedup();
+                if unchanged || uniquedup {
+                    let done = bottomup_pass(shape, items, high, new.size, dead);
+                    free = leaf_free(items, high);
+                    // `_bt_bottomupdel_pass`' "success": no deduplication.
+                    deduplicate = deduplicate && !done;
+                }
+                if deduplicate && free < need {
+                    let rightmost = right.is_none();
+                    dedup_pass(shape, items, high, &new, rightmost);
+                    free = leaf_free(items, high);
+                }
             }
         }
         let Page::Leaf { items, high, .. } = &mut self.pages[leaf as usize] else {
@@ -1291,11 +1597,15 @@ impl BTree {
                         items
                             .iter()
                             .map(|i| {
-                                Bson::Array(vec![
+                                let mut a = vec![
                                     Bson::Array(i.key.clone()),
                                     Bson::Array(i.tids.iter().map(|t| Bson::Int64(*t)).collect()),
                                     Bson::Int64(i.size),
-                                ])
+                                ];
+                                if i.dead {
+                                    a.push(Bson::Boolean(true));
+                                }
+                                Bson::Array(a)
                             })
                             .collect::<Vec<_>>(),
                     );
@@ -1390,6 +1700,7 @@ impl BTree {
                                     .filter_map(crate::bson_i64)
                                     .collect(),
                                 size: a.get(2).and_then(crate::bson_i64)?,
+                                dead: a.get(3).and_then(Bson::as_bool).unwrap_or(false),
                             })
                         })
                         .collect::<Option<Vec<_>>>()?,

@@ -486,15 +486,30 @@ impl PgHandler {
     pub(crate) fn btree_insert_versions(
         &self,
         table: &str,
-        versions: &[(&Document, i64)],
+        versions: &[(&Document, Option<&Document>, i64)],
     ) -> PgWireResult<()> {
         if versions.is_empty() || REWRITING.with(|r| r.get()) {
             return Ok(());
         }
-        for shape in self.btree_shapes(table) {
-            let keys: Vec<(Vec<Bson>, i64)> = versions
+        let shapes = self.btree_shapes(table);
+        if shapes.is_empty() {
+            return Ok(());
+        }
+        // What bottom-up deletion may remove: read from the heap now, before
+        // any B-tree is held (RP-196), once per command -- within one, only
+        // deleters that ended before it are dead to every snapshot, and the
+        // command's row-by-row writes would otherwise read the heap per row.
+        let dead = self.command_dead_tids(table)?;
+        for shape in shapes {
+            // Each new tuple, and whether the UPDATE left this index's key as
+            // it was (the executor's `indexUnchanged` hint).
+            let keys: Vec<(Vec<Bson>, bool, i64)> = versions
                 .iter()
-                .filter_map(|(d, ctid)| Some((shape.key_of(d)?, *ctid)))
+                .filter_map(|(d, old, ctid)| {
+                    let key = shape.key_of(d)?;
+                    let unchanged = old.and_then(|o| shape.key_of(o)).is_some_and(|k| k == key);
+                    Some((key, unchanged, *ctid))
+                })
                 .collect();
             if keys.is_empty() {
                 continue;
@@ -502,12 +517,43 @@ impl PgHandler {
             // A model built here is of the rows already stored, which these
             // versions are not yet among.
             self.with_btree(table, &shape, |t| {
-                for (key, ctid) in keys {
-                    t.insert(&*shape, key, ctid);
+                for (key, unchanged, ctid) in keys {
+                    t.insert_deleting(&*shape, key, ctid, unchanged, &|t| dead.contains(&t));
                 }
             })?;
         }
         Ok(())
+    }
+
+    /// [`Self::dead_index_tids`] of `table`, kept for the running command.
+    fn command_dead_tids(
+        &self,
+        table: &str,
+    ) -> PgWireResult<std::sync::Arc<std::collections::HashSet<i64>>> {
+        type Key = (usize, String, String, u64, i64);
+        thread_local! {
+            static MEMO: std::cell::RefCell<Option<(Key, std::sync::Arc<std::collections::HashSet<i64>>)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let (xid, cid) = self.command_writer();
+        let key: Key = (
+            self.store_id(),
+            self.db().to_string(),
+            table.to_string(),
+            xid,
+            cid,
+        );
+        if let Some(hit) = MEMO.with(|m| {
+            m.borrow()
+                .as_ref()
+                .filter(|(k, _)| *k == key)
+                .map(|(_, v)| v.clone())
+        }) {
+            return Ok(hit);
+        }
+        let dead = std::sync::Arc::new(self.dead_index_tids(table)?);
+        MEMO.with(|m| *m.borrow_mut() = Some((key, dead.clone())));
+        Ok(dead)
     }
 
     /// The names of `table`'s B-trees.

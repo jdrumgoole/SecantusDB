@@ -165,7 +165,7 @@ impl PgHandler {
             .extra
             .get_str("pk_name")
             .map(str::to_string)
-            .unwrap_or_else(|_| format!("{table}_pkey"));
+            .unwrap_or_else(|_| format!("{}_pkey", secantus_pgplan::schemas::split_key(table).1));
         if let Some(c) = def.check_constraints.iter_mut().find(|c| c.name == name) {
             c.name = to.to_string();
         } else if let Some(f) = def.foreign_keys.iter_mut().find(|f| f.name == name) {
