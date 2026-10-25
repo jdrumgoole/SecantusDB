@@ -205,6 +205,7 @@ impl PgHandler {
             expr_keys: x2,
             ec: ec2,
             on_aliases: on2,
+            on_other: other2,
             ..
         } = node
         else {
@@ -219,11 +220,17 @@ impl PgHandler {
             expr_keys: x1,
             ec: ec1,
             on_aliases: on1,
+            on_other: other1,
             ..
         } = lower.as_ref()
         else {
             return None;
         };
+        // A FULL join with a join filter is a hash full join only, which
+        // the search does not weigh alone.
+        if (*k1 == JoinKind::Full && *other1) || (*k2 == JoinKind::Full && *other2) {
+            return None;
+        }
         let modelled =
             |k: &JoinKind| matches!(k, JoinKind::Inner | JoinKind::Left | JoinKind::Full);
         if !modelled(k1)
@@ -422,7 +429,7 @@ impl PgHandler {
             let (a, b) = (side(p.a, &p.a_key)?, side(p.b, &p.b_key)?);
             let mut rel = JoinRel::new(false);
             let rows = if p.full {
-                rel.add_full_paths(0, &a, &b);
+                rel.add_full_paths(0, &a, &b, true);
                 secantus_pgplan::joincost::full_join_rows(&a, &b)
             } else {
                 rel.add_paths(0, &a, &b, p.left, true);
@@ -462,7 +469,7 @@ impl PgHandler {
                 (base_side, pair_side)
             };
             if c.full {
-                top.add_full_paths(i, &a, &b);
+                top.add_full_paths(i, &a, &b, true);
                 rows3.get_or_insert(secantus_pgplan::joincost::full_join_rows(&a, &b));
             } else {
                 top.add_paths(i, &a, &b, c.left, true);
@@ -740,8 +747,8 @@ impl PgHandler {
         // batch: batch 0's as the outer side is read, every later batch's
         // after it, in the order they were read (`ExecHashJoinNewBatch`). A
         // NULL key matches nothing and is not saved (a LEFT join's row comes
-        // out where it is read). A right join's unmatched rows would come
-        // out batch by batch too, which is not modelled.
+        // out where it is read). A right or full join's unmatched rows would
+        // come out batch by batch too, which is not modelled.
         let mut outer = outer;
         if let Some((nbuckets, nbatch, ty)) = &step.batches {
             match step.method {
@@ -762,7 +769,9 @@ impl PgHandler {
                     tagged.sort_by_key(|(b, _)| *b);
                     outer.rows = tagged.into_iter().map(|(_, d)| d).collect();
                 }
-                JoinMethod::HashRightB => return Ok(None),
+                JoinMethod::HashRightB | JoinMethod::HashFullA | JoinMethod::HashFullB => {
+                    return Ok(None)
+                }
                 _ => {}
             }
         }

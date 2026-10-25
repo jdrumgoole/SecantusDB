@@ -2266,6 +2266,21 @@ fn preserved_aliases(
                     }
                     (!below.iter().any(|a| nonnullable.contains(a)), false)
                 }
+                // A FULL join's side stays nullable unless the WHERE proves
+                // it non-null (`reduce_outer_joins` leaves a LEFT, RIGHT or
+                // inner join, whose preserved sides those are).
+                Ok(JoinType::JoinFull) => {
+                    let proven = |side: Option<&pg_query::protobuf::Node>| {
+                        let mut below = Vec::new();
+                        if let Some(side) = side {
+                            table_aliases(side, &mut below);
+                        }
+                        below.iter().any(|a| nonnullable.contains(a))
+                    };
+                    let (l_proven, r_proven) =
+                        (proven(j.larg.as_deref()), proven(j.rarg.as_deref()));
+                    (!l_proven, !r_proven)
+                }
                 _ => (true, true),
             };
             if let Some(larg) = j.larg.as_deref() {

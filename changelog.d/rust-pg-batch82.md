@@ -1,4 +1,4 @@
-### The Rust PostgreSQL server: FULL joins inside three-table joins, and outer joins reduced by an ON
+### The Rust PostgreSQL server: FULL joins in every join the search takes, and outer joins reduced by an ON
 
 `a FULL JOIN b ON ... JOIN c ON b.x = c.y` now returns its rows in the order
 PostgreSQL 15.19 does. The inner join's ON can never pass a row where `b` is
@@ -26,5 +26,25 @@ this server now.
   without NULL keys (6 before). Part of RP-028
   (`tests/backlog/test_rust_postgres_gaps.py::test_a_full_join_below_a_left_join_is_searched`).
 
-RP-028 stays open. A FULL join in four or more tables is its new gap test
-(`tests/backlog/test_rust_postgres_gaps.py::test_a_full_join_in_four_tables_is_searched`).
+- `secantus-pg`: a FULL join in four to eight tables goes through the join
+  order search. Its `SpecialJoinInfo` keeps both its sides whole, a join
+  over it that overlaps either side takes both, and `join_is_legal` never
+  commutes it. 36 of 36 shapes of four and five tables match 15.19 at 20
+  and 300 rows, with and without NULL keys (4 before). A hash full join
+  split into batches is declined, since its unmatched rows come out batch
+  by batch, which is not modelled. Part of RP-028
+  (`tests/backlog/test_rust_postgres_gaps.py::test_a_full_join_in_four_tables_is_searched`).
+- `secantus-pgplan`: a WHERE that makes one side of a FULL join non-null is
+  pushed to that side's scan, which the reduction has made a preserved
+  side, so its rows are filtered before they are sorted, as in
+  PostgreSQL.
+- `secantus-pg`: a FULL join whose ON holds more than its equality is
+  planned as a Hash Full Join only, since `select_mergejoin_clauses`
+  allows no merge full join with a join filter. The rows the filter
+  rejects come out where PostgreSQL's hash full join puts them. 20 of 20
+  two-table variants match: WHERE, LIMIT, ORDER BY, USING, and an ON
+  filter.
+
+RP-028 stays open. A LEFT join over an inner join's equivalence class is
+its new gap test
+(`tests/backlog/test_rust_postgres_gaps.py::test_a_left_join_over_an_inner_class_is_searched`).

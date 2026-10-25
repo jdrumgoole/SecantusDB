@@ -117,7 +117,9 @@ struct Search {
     /// adds nothing to its min_lefthand): its left is its clause's table,
     /// and its right is its nullable side -- one table, or the tables an
     /// inner join under it joins, which `min_righthand` takes whole.
-    outer: Vec<(u8, u8)>,
+    /// A FULL join's are its whole sides, and it never commutes: the third
+    /// field.
+    outer: Vec<(u8, u8, bool)>,
     /// The equivalence class the clauses sharing a column make: its members
     /// `(table, key)` in `ec_members` order. Its clauses are not `edges`.
     class: Vec<(usize, String)>,
@@ -215,12 +217,13 @@ impl Search {
 
     /// `join_is_legal` for joining relations `a` and `b`: `None` when the
     /// join would break an outer join; else whether it performs one, and
-    /// if so whether `b` holds its preserved side (`reversed`).
-    fn join_is_legal(&self, a: u8, b: u8) -> Option<Option<bool>> {
+    /// if so whether `b` holds its left side (`reversed`) and whether it is
+    /// a FULL join.
+    fn join_is_legal(&self, a: u8, b: u8) -> Option<Option<(bool, bool)>> {
         let joined = a | b;
-        let mut matched: Option<bool> = None;
+        let mut matched: Option<(bool, bool)> = None;
         let mut must_be_left = false;
-        for &(lhs, rhs) in &self.outer {
+        for &(lhs, rhs, full) in &self.outer {
             let sub = |x: u8, y: u8| x & !y == 0;
             if rhs & joined == 0 || sub(joined, rhs) {
                 continue;
@@ -232,17 +235,18 @@ impl Search {
                 if matched.is_some() {
                     return None;
                 }
-                matched = Some(false);
+                matched = Some((false, full));
             } else if sub(lhs, b) && sub(rhs, a) {
                 if matched.is_some() {
                     return None;
                 }
-                matched = Some(true);
+                matched = Some((true, full));
             } else {
                 if a & rhs != 0 && b & rhs != 0 {
                     continue;
                 }
-                if joined & lhs != 0 {
+                // Only a LEFT join's right side takes another join in.
+                if full || joined & lhs != 0 {
                     return None;
                 }
                 must_be_left = true;
@@ -342,12 +346,17 @@ impl PgHandler {
                 expr_keys,
                 ec,
                 on_aliases,
+                on_other,
                 ..
             } = w.node
             else {
                 return None;
             };
-            if !matches!(kind, JoinKind::Inner | JoinKind::Left)
+            // A FULL join with a join filter is a hash full join only.
+            if *kind == JoinKind::Full && *on_other {
+                return None;
+            }
+            if !matches!(kind, JoinKind::Inner | JoinKind::Left | JoinKind::Full)
                 || !merged.is_empty()
                 || !expr_keys.is_empty()
                 || ec.is_some()
@@ -397,10 +406,11 @@ impl PgHandler {
                 kinds[i] = JoinKind::Inner;
             }
             let local = (1u8 << edges[i].u) | (1u8 << edges[i].v);
-            let (to_left, to_right) = if kinds[i] == JoinKind::Inner {
-                (upper | local, upper | local)
-            } else {
-                (upper, local)
+            let (to_left, to_right) = match kinds[i] {
+                JoinKind::Inner => (upper | local, upper | local),
+                // A FULL join passes nothing down.
+                JoinKind::Full => (0, 0),
+                _ => (upper, local),
             };
             if let Some(l) = w.left_join {
                 reduce(l, to_left, joins, edges, kinds);
@@ -429,9 +439,15 @@ impl PgHandler {
                 below
             });
         }
-        // `(min_lefthand, min_righthand, syn_lefthand, syn_righthand)`.
-        let mut specials: Vec<(u8, u8, u8, u8)> = Vec::new();
+        // `(min_lefthand, min_righthand, syn_lefthand, syn_righthand,
+        // FULL)`. A FULL join's minimum sides are its syntactic ones, and a
+        // join over one that overlaps either of its sides takes both whole.
+        let mut specials: Vec<(u8, u8, u8, u8, bool)> = Vec::new();
         for (i, w) in joins.iter().enumerate() {
+            if kinds[i] == JoinKind::Full {
+                specials.push((w.left, w.right, w.left, w.right, true));
+                continue;
+            }
             if kinds[i] != JoinKind::Left {
                 continue;
             }
@@ -439,7 +455,17 @@ impl PgHandler {
             let right_inner = w.right_join.map_or(0, |j| inner_rels[j]);
             let mut min_l = clause & w.left;
             let mut min_r = (clause | right_inner) & w.right;
-            for &(o_min_l, o_min_r, o_syn_l, o_syn_r) in &specials {
+            for &(o_min_l, o_min_r, o_syn_l, o_syn_r, o_full) in &specials {
+                if o_full {
+                    let both = o_syn_l | o_syn_r;
+                    if w.left & both != 0 {
+                        min_l |= both;
+                    }
+                    if w.right & both != 0 {
+                        min_r |= both;
+                    }
+                    continue;
+                }
                 if w.left & o_syn_r != 0 && clause & o_syn_r != 0 && clause & o_min_r == 0 {
                     min_l |= o_syn_l | o_syn_r;
                 }
@@ -453,9 +479,9 @@ impl PgHandler {
             if min_r == 0 {
                 min_r = w.right;
             }
-            specials.push((min_l, min_r, w.left, w.right));
+            specials.push((min_l, min_r, w.left, w.right, false));
         }
-        let outer = specials.iter().map(|&(l, r, _, _)| (l, r)).collect();
+        let outer = specials.iter().map(|&(l, r, _, _, f)| (l, r, f)).collect();
         // A column in two clauses: the equivalence class they make.
         let (class, class_ons) = Self::chain_class(&mut edges, &reversed)?;
         if !class.is_empty() && kinds.iter().any(|k| *k != JoinKind::Inner) {
@@ -635,9 +661,14 @@ impl PgHandler {
             return Some(());
         };
         // A LEFT join's preserved side first (`make_join_rel` swaps a
-        // reversed pair).
-        let (a, b) = if outer == Some(true) { (b, a) } else { (a, b) };
-        let left = outer.is_some();
+        // reversed pair), a FULL join's left.
+        let (a, b) = if matches!(outer, Some((true, _))) {
+            (b, a)
+        } else {
+            (a, b)
+        };
+        let full = matches!(outer, Some((_, true)));
+        let left = outer.is_some() && !full;
         let (sa, sb) = (search.rels[a].set, search.rels[b].set);
         let clause = search.clause_between(sa, sb)?;
         let side_a = self.search_side(search, a, &clause.a_key, clause.a_table, clause.class)?;
@@ -648,7 +679,11 @@ impl PgHandler {
             None => {
                 search.rels.push(Rel {
                     set,
-                    rows: join_rows(&side_a, &side_b, left),
+                    rows: if full {
+                        secantus_pgplan::joincost::full_join_rows(&side_a, &side_b)
+                    } else {
+                        join_rows(&side_a, &side_b, left)
+                    },
                     paths: JoinRel::new(false),
                     built: Vec::new(),
                     best: None,
@@ -671,8 +706,12 @@ impl PgHandler {
         let rel = &mut search.rels[idx];
         let combo = rel.built.len();
         rel.built.push(Built { a, b, clause, left });
-        rel.paths
-            .add_paths_on(combo, key_class, &side_a, &side_b, left, true);
+        if full {
+            rel.paths.add_full_paths(combo, &side_a, &side_b, true);
+        } else {
+            rel.paths
+                .add_paths_on(combo, key_class, &side_a, &side_b, left, true);
+        }
         Some(())
     }
 
@@ -809,7 +848,12 @@ impl PgHandler {
             JoinMethod::HashOuterA => {
                 Some((built.b, rows_of(built.b, clause.b_table, &b_key), &a_key))
             }
-            JoinMethod::HashOuterB | JoinMethod::HashRightB => Some((built.a, a_rows, &b_key)),
+            JoinMethod::HashOuterB | JoinMethod::HashRightB | JoinMethod::HashFullB => {
+                Some((built.a, a_rows, &b_key))
+            }
+            JoinMethod::HashFullA => {
+                Some((built.b, rows_of(built.b, clause.b_table, &b_key), &a_key))
+            }
             _ => None,
         };
         let batches = hashed.and_then(|(rel, rows, outer_key)| {

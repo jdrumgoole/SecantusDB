@@ -567,11 +567,17 @@ one beside it.
     in a chain of three tables is searched too (2026-10-25): a FULL join's
     minimum sides are its whole ones, so its pair joins first, priced and
     run as two tables' FULL joins are; 48 of 48 shapes at 20 to 3,000
-    rows, with and without NULL keys (6 before). Not yet for FULL joins:
-    one in four or more tables, which that search declines; one under a
-    WHERE (the general path does not push
-    the WHERE to the scans); one whose ON holds more than its equality;
-    one over an analysed table. Not yet: two classes spanning both sides (two join keys); an
+    rows, with and without NULL keys (6 before); so is one in four to
+    eight tables, whose search carries a FULL join's `SpecialJoinInfo`
+    and never commutes it (`join_is_legal`); 36 of 36 shapes of four and
+    five tables (4 before). A WHERE that makes one side of a FULL join
+    non-null is pushed to that side's scan, which `reduce_outer_joins`
+    has made preserved; a FULL join whose ON holds more than its equality
+    is a Hash Full Join only, as `select_mergejoin_clauses` allows no
+    merge join a join filter (20 of 20 two-table variants: WHERE, LIMIT,
+    ORDER BY, USING, ON filter). A FULL join over an analysed table is
+    declined with the other joins over measured columns (below). Not yet:
+    two classes spanning both sides (two join keys); an
     expression in a class; a LEFT join's class through the general path;
     a class of text or other non-integer keys, or with a LEFT join; three
     tables with a WHERE over two of them or a LIMIT; four or more tables
@@ -581,7 +587,7 @@ one beside it.
     than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_full_join_in_four_tables_is_searched
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_left_join_over_an_inner_class_is_searched
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
