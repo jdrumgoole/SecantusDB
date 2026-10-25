@@ -21883,7 +21883,12 @@ impl PgHandler {
                     let namespace_oid = if t.temp {
                         0i64
                     } else {
-                        Self::PUBLIC_NAMESPACE_OID
+                        // The table's schema's (RP-249).
+                        let (schema, _) = secantus_pgplan::schemas::split_key(&t.name);
+                        spaces
+                            .iter()
+                            .find(|(n, _)| *n == schema)
+                            .map_or(Self::PUBLIC_NAMESPACE_OID, |(_, o)| *o)
                     };
                     // 1-based attnum, as `conkey` reports it.
                     let attnum = |col: &str| -> Option<i32> { t.attnum_of(col).map(i32::from) };
