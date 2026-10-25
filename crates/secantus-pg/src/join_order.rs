@@ -138,13 +138,11 @@ struct Chain<'a> {
 }
 
 /// One join of the tree as `four_table_chain` walks it: the tables (a bit
-/// each) on its two sides, whether its right side is joined by inner joins
-/// only, and the joins (by index) that are its two sides.
+/// each) on its two sides, and the joins (by index) that are its two sides.
 struct Walked<'a> {
     node: &'a JoinNode,
     left: u8,
     right: u8,
-    right_inner: bool,
     left_join: Option<usize>,
     right_join: Option<usize>,
 }
@@ -175,7 +173,6 @@ fn walk_tree<'a>(
                 node: n,
                 left: l,
                 right: r,
-                right_inner: r_inner,
                 left_join: l_join,
                 right_join: r_join,
             });
@@ -357,11 +354,6 @@ impl PgHandler {
             {
                 return None;
             }
-            // A LEFT join's nullable side is a table, or a join of tables
-            // by inner joins only (its `min_righthand` is then all of it).
-            if *kind == JoinKind::Left && w.right.count_ones() > 1 && !w.right_inner {
-                return None;
-            }
             let [(lk, rk)] = equi.as_slice() else {
                 return None;
             };
@@ -416,16 +408,52 @@ impl PgHandler {
             }
         }
         reduce(joins.len() - 1, 0, &joins, &edges, &mut kinds);
-        // Each LEFT join's `SpecialJoinInfo`: its clause's table on the
-        // left, and its whole nullable side (`make_outerjoininfo` adds the
-        // inner-joined tables under it to `min_righthand`).
-        let outer = edges
-            .iter()
-            .zip(&kinds)
-            .zip(&joins)
-            .filter(|((_, k), _)| **k == JoinKind::Left)
-            .map(|((e, _), w)| (1u8 << e.u, w.right))
-            .collect();
+        // Each LEFT join's `SpecialJoinInfo` (`make_outerjoininfo`), bottom
+        // up. Its minimum sides start as the tables its clause reads, with
+        // the tables inner-joined in its nullable side
+        // (`deconstruct_recurse`'s `inner_join_rels`). A lower LEFT join
+        // then adds its whole syntactic sides to them when the two cannot
+        // commute: one in our left side whose nullable side our clause
+        // reads, not strictly; one in our right side whose nullable side
+        // our clause reads, or whose left side it does not. A clause is an
+        // equality, strict for the tables it reads.
+        let mut inner_rels: Vec<u8> = Vec::with_capacity(joins.len());
+        for (i, w) in joins.iter().enumerate() {
+            let below = w.left_join.map_or(0, |j| inner_rels[j])
+                | w.right_join.map_or(0, |j| inner_rels[j]);
+            inner_rels.push(if kinds[i] == JoinKind::Inner {
+                w.left | w.right
+            } else {
+                below
+            });
+        }
+        // `(min_lefthand, min_righthand, syn_lefthand, syn_righthand)`.
+        let mut specials: Vec<(u8, u8, u8, u8)> = Vec::new();
+        for (i, w) in joins.iter().enumerate() {
+            if kinds[i] != JoinKind::Left {
+                continue;
+            }
+            let clause = (1u8 << edges[i].u) | (1u8 << edges[i].v);
+            let right_inner = w.right_join.map_or(0, |j| inner_rels[j]);
+            let mut min_l = clause & w.left;
+            let mut min_r = (clause | right_inner) & w.right;
+            for &(o_min_l, o_min_r, o_syn_l, o_syn_r) in &specials {
+                if w.left & o_syn_r != 0 && clause & o_syn_r != 0 && clause & o_min_r == 0 {
+                    min_l |= o_syn_l | o_syn_r;
+                }
+                if w.right & o_syn_r != 0 && (clause & o_syn_r != 0 || clause & o_min_l == 0) {
+                    min_r |= o_syn_l | o_syn_r;
+                }
+            }
+            if min_l == 0 {
+                min_l = w.left;
+            }
+            if min_r == 0 {
+                min_r = w.right;
+            }
+            specials.push((min_l, min_r, w.left, w.right));
+        }
+        let outer = specials.iter().map(|&(l, r, _, _)| (l, r)).collect();
         // A column in two clauses: the equivalence class they make.
         let (class, class_ons) = Self::chain_class(&mut edges, &reversed)?;
         if !class.is_empty() && kinds.iter().any(|k| *k != JoinKind::Inner) {
