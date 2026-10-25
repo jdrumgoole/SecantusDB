@@ -57,6 +57,10 @@ pub(crate) struct Ask<'a> {
     pub vars: &'a Document,
     pub batch_size: i64,
     pub command: &'a Document,
+    /// The command's collation (a view's own, through a view).
+    pub collation: Option<&'a secantus_core::collation::Collation>,
+    /// The cursor names the collection it reads, not a view over it.
+    pub direct: bool,
 }
 
 /// An opened cursor: the reply, and the first batch that goes in it.
@@ -106,6 +110,9 @@ pub(crate) fn open(ctx: &CommandContext, ask: &Ask) -> Result<Option<Opened>, Co
             .map_err(|e| {
                 CommandError::new(1, "InternalError", format!("cursor registry: {e:?}"))
             })?;
+        if !ask.direct {
+            cursors.set_reads(id, &format!("{}.{}", ask.db, ask.coll));
+        }
         if reading && !indexes.is_empty() {
             cursors.set_plan_indexes(id, indexes);
         }
@@ -136,7 +143,9 @@ fn build(
         return Ok(None);
     }
     let read_error = |e| crate::util::read_error_on_namespace(e, "aggregate", ask.ns);
-    if !buffered {
+    // A collation leaves no DISTINCT_SCAN over an uncollated index, and
+    // this store's collated index is not in mongod's order (RM-309).
+    if !buffered && ask.collation.is_none() {
         let grouped = crate::explain::distinct_group_read(storage, ask.db, ask.coll, ask.pipeline)
             .map_err(read_error)?;
         if let Some(read) = grouped {
@@ -173,7 +182,7 @@ fn build(
         filter: &query.filter,
         sort: query.sort.as_ref(),
         hint: ask.hint,
-        collation: None,
+        collation: ask.collation,
         vars: ask.vars,
         limit: if limit > 0 { query.skip + limit } else { 0 },
         asked: Default::default(),
@@ -321,6 +330,11 @@ struct AggStream {
     /// A stage blocks: every document is read, then run through the stages
     /// at once.
     whole: bool,
+    /// The command's collation, which every batch reads and runs under.
+    collation: Option<secantus_core::collation::Collation>,
+    /// The collection or an index the read needs was dropped: mongod's 175
+    /// message, met when the cursor next reads.
+    gone: Option<String>,
 }
 
 fn stage_name(s: &Bson) -> &str {
@@ -362,6 +376,8 @@ impl AggStream {
             summary: None,
             sbe: false,
             whole: false,
+            collation: ask.collation.cloned(),
+            gone: None,
         }
     }
 
@@ -419,6 +435,8 @@ impl AggStream {
                 vars: &Document::new(),
                 batch_size: 0,
                 command: &self.command,
+                collation: self.collation.as_ref(),
+                direct: false,
             };
             if let Some((mut inner, _)) = build(storage, &ask, true)? {
                 inner.summary = None;
@@ -434,7 +452,7 @@ impl AggStream {
             Some(&self.coll),
             &self.vars,
             storage,
-            None,
+            self.collation.as_ref(),
             &self.command,
             None,
         )?;
@@ -449,6 +467,12 @@ impl AggStream {
         left: usize,
         max_bytes: usize,
     ) -> Result<StreamedBatch, CommandError> {
+        // What the cursor stage holds is returned; the next read fails
+        // (measured 8.2.11, 2026-10-25: 31 more documents of a buffer of 32,
+        // then 175, the whole `getMore`).
+        if let Some(reason) = &self.gone {
+            return Err(CommandError::new(175, "QueryPlanKilled", reason.clone()));
+        }
         let ns = self.ns.clone();
         let read_error = |e| crate::util::read_error_on_namespace(e, "aggregate", &ns);
         match &mut self.feed {
@@ -530,7 +554,7 @@ impl AggStream {
             Some(&self.coll),
             &self.vars,
             storage,
-            None,
+            self.collation.as_ref(),
             &self.command,
             None,
         )
@@ -544,6 +568,7 @@ impl StreamCursor for AggStream {
         want: usize,
         max_bytes: usize,
     ) -> Result<StreamedBatch, CommandError> {
+        let _active = secantus_core::collation::activate(self.collation.as_ref());
         let (mut keys, mut examined) = (0, 0);
         let mut out: Vec<Vec<u8>> = Vec::new();
         let mut bytes = 0usize;
@@ -639,6 +664,15 @@ impl StreamCursor for AggStream {
 
     fn originating_command(&self) -> Document {
         self.command.clone()
+    }
+
+    fn source_gone(&mut self, reason: &str) -> bool {
+        // A plan executor's read has nothing buffered.
+        if self.buffer.is_none() {
+            return false;
+        }
+        self.gone = Some(reason.to_string());
+        true
     }
 }
 

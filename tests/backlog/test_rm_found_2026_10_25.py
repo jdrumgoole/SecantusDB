@@ -137,11 +137,28 @@ def _unstreamed_distinct_groups(client: Any) -> dict:
 def test_a_distinct_scan_group_this_server_does_not_stream_keeps_the_scans_order(
     rust_mongo: Any, mongod: Any
 ) -> None:
-    """mongod 8.2.11 returns the groups in the DISTINCT_SCAN's order however
-    the scan is reached: down a descending index, along a collated one, or
-    through a view."""
-    got, want = _unstreamed_distinct_groups(rust_mongo), _unstreamed_distinct_groups(mongod)
+    """mongod 8.2.11 returns the groups in the DISTINCT_SCAN's order down a
+    descending index and along a collated one."""
+    keep = ("descending first", "descending last", "collated first", "collated last")
+
+    def groups(client: Any) -> dict:
+        found = _unstreamed_distinct_groups(client)
+        return {k: found[k] for k in keep}
+
+    got, want = groups(rust_mongo), groups(mongod)
     assert [d["_id"] for d in want["descending first"]] == [3, 2, 1, 0]
+    assert got == want
+
+
+@pytest.mark.backlog_fixed("RM-309")
+def test_a_distinct_scan_group_through_a_view_keeps_the_scans_order(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """mongod 8.2.11 reads a view's `$group` from the DISTINCT_SCAN of the
+    collection beneath it, the groups in the scan's order."""
+    got = _unstreamed_distinct_groups(rust_mongo)["view first"]
+    want = _unstreamed_distinct_groups(mongod)["view first"]
+    assert [d["_id"] for d in want] == [0, 1, 2, 3]
     assert got == want
 
 
@@ -356,3 +373,181 @@ def test_explain_moves_a_match_on_the_group_key_ahead_of_the_group(
     assert want["on_the_key"][0] == {"x": {"$gt": 1}}
     assert want["on_the_key"][2] == ["$groupByDistinctScan"]
     assert got == want
+
+
+_STRENGTH_2 = {"locale": "en", "strength": 2}
+
+
+def _read_before_emptied(client: Any, shape: str) -> int:
+    """How many documents a cursor returns, a document at a time, when its
+    collection is emptied after the first batch: what it had read by then."""
+    db = client["rm_found_1025"]
+    options = {"collation": _STRENGTH_2} if shape.startswith("default collation") else {}
+    c = db["c" + uuid.uuid4().hex[:10]]
+    db.create_collection(c.name, **options)
+    c.insert_many(
+        [{"_id": i, "x": i % 7, "s": ("A" if i % 2 else "a") + str(i % 5)} for i in range(1, 201)]
+    )
+    view = "v" + uuid.uuid4().hex[:8]
+    command: dict
+    if shape == "find on a view":
+        db.command("create", view, viewOn=c.name, pipeline=[{"$match": {"x": {"$gte": 0}}}])
+        command = {"find": view, "filter": {}, "batchSize": 1}
+    elif shape == "aggregate on a view":
+        db.command("create", view, viewOn=c.name, pipeline=[])
+        command = {"aggregate": view, "pipeline": [], "cursor": {"batchSize": 1}}
+    elif shape == "a view's $addFields":
+        db.command("create", view, viewOn=c.name, pipeline=[{"$addFields": {"q": 1}}])
+        command = {"aggregate": view, "pipeline": [], "cursor": {"batchSize": 1}}
+    elif shape == "a collated view":
+        db.command(
+            "create", view, viewOn=c.name, pipeline=[{"$match": {"s": "a1"}}], collation=_STRENGTH_2
+        )
+        command = {"aggregate": view, "pipeline": [], "cursor": {"batchSize": 1}}
+    elif shape == "find with a collation":
+        command = {"find": c.name, "filter": {"s": "a1"}, "batchSize": 1, "collation": _STRENGTH_2}
+    elif shape == "aggregate with a collation":
+        command = {
+            "aggregate": c.name,
+            "pipeline": [{"$addFields": {"q": {"$eq": ["$s", "A1"]}}}],
+            "cursor": {"batchSize": 1},
+            "collation": _STRENGTH_2,
+        }
+    elif shape == "default collation, an index on a number":
+        c.create_index("x")
+        command = {
+            "aggregate": c.name,
+            "pipeline": [{"$match": {"x": {"$gte": 0}}}],
+            "cursor": {"batchSize": 1},
+        }
+    else:  # a collated index on a string
+        c.create_index("s", collation=_STRENGTH_2)
+        command = {
+            "aggregate": c.name,
+            "pipeline": [{"$match": {"s": "a1"}}],
+            "cursor": {"batchSize": 1},
+            "collation": _STRENGTH_2,
+        }
+    name = command.get("find") or command.get("aggregate")
+    reply = db.command(command)
+    got, cursor = len(reply["cursor"]["firstBatch"]), reply["cursor"]["id"]
+    c.delete_many({})
+    while cursor:
+        reply = db.command("getMore", cursor, collection=name, batchSize=1000)
+        got += len(reply["cursor"]["nextBatch"])
+        cursor = reply["cursor"]["id"]
+    return got
+
+
+_STREAMED_SHAPES = (
+    "find on a view",
+    "aggregate on a view",
+    "a view's $addFields",
+    "a collated view",
+    "find with a collation",
+    "aggregate with a collation",
+    "default collation, an index on a number",
+)
+
+
+@pytest.mark.backlog_fixed("RM-080")
+def test_a_cursor_through_a_view_or_under_a_collation_reads_on(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """mongod 8.2.11 reads through a view, and under a collation, as it reads
+    a collection: batch by batch where its planner takes the read whole, 32
+    documents first through the cursor stage."""
+    got = {s: _read_before_emptied(rust_mongo, s) for s in _STREAMED_SHAPES}
+    want = {s: _read_before_emptied(mongod, s) for s in _STREAMED_SHAPES}
+    assert want["aggregate on a view"] == 1
+    assert want["a view's $addFields"] == 32
+    assert got == want
+
+
+@pytest.mark.backlog("RM-080")
+def test_a_cursor_over_a_collated_index_of_strings_reads_on(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 reads a collated index's strings batch by batch, as any
+    index; this store's collated keys are not in mongod's order, and the
+    cursor reads every document at the command."""
+    shape = "a collated index on a string"
+    assert _read_before_emptied(mongod, shape) == 1
+    assert _read_before_emptied(rust_mongo, shape) == _read_before_emptied(mongod, shape)
+
+
+def _dropped_under(client: Any, through_view: bool, pipeline: list, drop: str) -> tuple:
+    """A cursor read five at a time after its collection, one of its
+    indexes, or the view it reads through is dropped: how many documents it
+    returned, and how it ended."""
+    db = client["rm_found_1025"]
+    c = _coll(client)
+    c.insert_many([{"_id": i, "x": i} for i in range(1, 201)])
+    c.create_index("x")
+    name = c.name
+    if through_view:
+        name = "v" + uuid.uuid4().hex[:8]
+        db.command("create", name, viewOn=c.name, pipeline=[])
+    reply = db.command("aggregate", name, pipeline=pipeline, cursor={"batchSize": 1})
+    if drop == "collection":
+        c.drop()
+    elif drop == "index":
+        c.drop_index("x_1")
+    else:
+        db.drop_collection(name)
+    got, cursor = 1, reply["cursor"]["id"]
+    while cursor:
+        more = mongo_answer(
+            lambda cursor=cursor: db.command("getMore", cursor, collection=name, batchSize=5)
+        )
+        if more[0] == "err":
+            return got, more[1]
+        got += len(more[1]["cursor"]["nextBatch"])
+        cursor = more[1]["cursor"]["id"]
+    return got, "end"
+
+
+@pytest.mark.backlog_fixed("RM-080")
+def test_a_cursor_returns_what_it_buffered_when_its_collection_is_dropped(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """mongod 8.2.11 ends a cursor whose collection, or an index its plan
+    reads, is dropped: a plan executor's read at the next `getMore`, one
+    through the cursor stage at the first `getMore` that needs more than it
+    buffered (175).
+    Through a view it is the collection beneath that counts: dropping the
+    view leaves the cursor reading."""
+    match = [{"$match": {"x": {"$gte": 0}}}]
+    buffered = [*match, {"$addFields": {"q": 1}}]
+    shapes = {
+        f"{where} {name} {drop}": (where == "view", pipeline, drop)
+        for where in ("collection", "view")
+        for name, pipeline in (("planned", match), ("buffered", buffered))
+        for drop in ("collection", "index")
+    }
+    shapes["view planned view"] = (True, match, "view")
+    got = {k: _dropped_under(rust_mongo, *v) for k, v in shapes.items()}
+    want = {k: _dropped_under(mongod, *v) for k, v in shapes.items()}
+    assert want["collection buffered collection"] == (31, 175)
+    assert want["view planned index"] == (1, 175)
+    assert want["view planned view"] == (200, "end")
+    assert got == want
+
+
+def _sorted_ties(client: Any) -> dict:
+    """The order of documents a blocking sort leaves equal."""
+    c = _coll(client)
+    c.insert_many([{"_id": i, "s": ("A" if i % 2 else "a") + str(i % 5)} for i in range(1, 201)])
+    return {
+        "simple": [d["_id"] for d in c.find({}, sort=[("s", 1)])][:20],
+        "collated": [d["_id"] for d in c.find({}, sort=[("s", 1)], collation=_STRENGTH_2)][:20],
+    }
+
+
+@pytest.mark.backlog("RM-312")
+def test_a_blocking_sort_leaves_ties_as_mongods_sort_does(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 sorts a blocking sort's documents with an unstable sort:
+    of 200 documents in 10 runs of 20 equal keys, the first is not the first
+    inserted, and two mongod processes agree. This server keeps equal
+    documents in the order it reads them."""
+    want = _sorted_ties(mongod)
+    assert want["simple"][:2] != [5, 15]
+    assert _sorted_ties(rust_mongo) == want

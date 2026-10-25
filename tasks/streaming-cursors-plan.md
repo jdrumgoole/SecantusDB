@@ -103,12 +103,20 @@ connection thread; no WT cursor may outlive its call):
      nothing: the cursor holds the command and its first `getMore` runs
      it (`agg_stream::Deferred`, `cursors::deferred_get_more`). A batch
      that fills exactly leaves a cursor-stage cursor open, as on mongod.
-   - Left: a collation, a view, a time-series collection, `$meta`,
-     `$geoNear`, `notablescan`; a DISTINCT_SCAN `$group` down a descending
-     or along a collated index, or through a view (RM-309); `keysExamined`
-     / `docsExamined` on the `aggregate`
-     command's own line; counts for `count`, `distinct`, write statements
-     and `findAndModify` from their reads.
+   - Done (2026-10-25, branch `rust-mdb-stream5`): a `find` or an
+     `aggregate` through a view or under a collation streams as over a
+     collection (the collation made active for every batch), and a collated
+     index streams when its bounds hold only numbers or dates. A view's
+     cursor is killed by drops of the collection beneath it
+     (`CursorRegistry::set_reads`), not of the view; a cursor-stage cursor
+     whose collection or index is dropped returns what it buffered and
+     fails at the next read (`StreamCursor::source_gone`), as on mongod.
+   - Left: a time-series collection, `$meta`, `$geoNear`, `notablescan`; a
+     collated index bounded on strings; a DISTINCT_SCAN `$group` down a
+     descending or along a collated index (RM-309); `keysExamined` /
+     `docsExamined` on the `aggregate` command's own line; counts for
+     `count`, `distinct`, write statements and `findAndModify` from their
+     reads.
 4. **`storage` on the line.** WiredTiger's per-session statistics
    (`timeWaitingMicros`, bytes read and written) for the operation (the last
    part of RM-023).

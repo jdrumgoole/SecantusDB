@@ -32,7 +32,7 @@
 
 use std::collections::VecDeque;
 
-use bson::Document;
+use bson::{Bson, Document};
 use secantus_core::sortkey::{split_compound, COMPOUND_SEP};
 
 use super::bounds::sort_key;
@@ -350,9 +350,23 @@ fn streams(ix: &IxScan) -> bool {
     !ix.no_bounds
         && ix.filter.is_none()
         && ix.index.plain
-        && ix.index.collation.is_none()
+        && (ix.index.collation.is_none() || ix.bounds.iter().all(|list| uncollated(list)))
         && !ix.index.is_multikey()
         && ix.index.fields().iter().all(|(_, dir)| *dir == 1)
+}
+
+/// Bounds that hold no string, so a collated index keeps their entries as
+/// an uncollated one does: each interval between two numbers, or two dates.
+fn uncollated(list: &[super::bounds::Interval]) -> bool {
+    let number = |v: &Bson| {
+        matches!(
+            v,
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+        )
+    };
+    let date = |v: &Bson| matches!(v, Bson::DateTime(_));
+    list.iter()
+        .all(|iv| (number(&iv.lo) && number(&iv.hi)) || (date(&iv.lo) && date(&iv.hi)))
 }
 
 /// The `_id` key ranks whose order is not mongod's: `sortkey::encode_id_key`

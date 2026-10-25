@@ -69,6 +69,13 @@ pub trait StreamCursor: Send {
     fn deferred(&self) -> Option<Document> {
         None
     }
+    /// The collection the cursor reads was dropped, or an index its plan
+    /// reads (`reason`, mongod's 175 message). True: the cursor still
+    /// returns what it has read, and fails when it next needs to read
+    /// more; false: it ends now.
+    fn source_gone(&mut self, _reason: &str) -> bool {
+        false
+    }
 }
 
 /// One streamed batch, and what reading it examined.
@@ -145,6 +152,9 @@ struct Entry {
     /// The indexes the plan behind this cursor reads (`set_plan_indexes`).
     /// Dropping one kills the cursor, as it kills mongod's plan.
     plan_indexes: Vec<String>,
+    /// The collection the cursor reads, when it is not the one it names (a
+    /// view's): its drops, and its indexes', are the ones that kill it.
+    reads: Option<String>,
     // The tailable fields below are written by `register_tailable` but only read
     // by the change-stream getMore slice (deferred), so they're allow(dead_code)
     // until that lands.
@@ -367,6 +377,7 @@ impl CursorRegistry {
                 change_stream: false,
                 dropped: None,
                 plan_indexes: Vec::new(),
+                reads: None,
                 await_data: false,
                 no_cursor_timeout: false,
                 producer: None,
@@ -413,6 +424,7 @@ impl CursorRegistry {
                 change_stream: opts.change_stream,
                 dropped: None,
                 plan_indexes: Vec::new(),
+                reads: None,
                 await_data: opts.await_data,
                 no_cursor_timeout: opts.no_cursor_timeout,
                 producer: Some(producer),
@@ -673,6 +685,16 @@ impl CursorRegistry {
         }
     }
 
+    /// The cursor reads `namespace`, not the view it names: dropping that
+    /// collection or one of the plan's indexes kills it, and dropping the
+    /// view does not (measured 8.2.11, 2026-10-25).
+    pub fn set_reads(&self, cursor_id: i64, namespace: &str) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = inner.cursors.get_mut(&cursor_id) {
+            e.reads = Some(namespace.to_string());
+        }
+    }
+
     /// Kill every cursor on `namespace` whose plan reads index `index`, which
     /// was dropped: the next `getMore` is mongod's `175 query plan killed ::
     /// index '<name>' dropped` (measured 8.2.11, 2026-10-14). A cursor on a
@@ -682,7 +704,9 @@ impl CursorRegistry {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut affected = 0;
         for e in inner.cursors.values_mut() {
-            if e.namespace == namespace && e.plan_indexes.iter().any(|i| i == index) {
+            if e.reads.as_deref().unwrap_or(&e.namespace) == namespace
+                && e.plan_indexes.iter().any(|i| i == index)
+            {
                 e.dropped = Some(format!("query plan killed :: index '{index}' dropped"));
                 e.remaining.clear();
                 affected += 1;
@@ -713,7 +737,7 @@ impl CursorRegistry {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut affected = 0;
         for e in inner.cursors.values_mut() {
-            if e.namespace == namespace && !e.change_stream {
+            if e.reads.as_deref().unwrap_or(&e.namespace) == namespace && !e.change_stream {
                 e.dropped = Some(reason.to_string());
                 e.remaining.clear();
                 affected += 1;
@@ -1025,12 +1049,13 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // mongo-php-driver's `cursor-tailable_error-001` asserts the message
     // mentions "collection dropped" rather than a bare CursorNotFound, which
     // wouldn't tell a tailing client why its tail ended.
-    if let Some(reason) = cursors.was_dropped(cursor_id) {
+    let dropped = cursors.was_dropped(cursor_id);
+    if info.streaming {
+        return stream_get_more(cursor_id, batch_size, &ns, dropped, ctx);
+    }
+    if let Some(reason) = dropped {
         cursors.kill(&[cursor_id]);
         return Ok(CommandError::new(175, "QueryPlanKilled", reason).into_reply());
-    }
-    if info.streaming {
-        return stream_get_more(cursor_id, batch_size, &ns, ctx);
     }
     if info.tailable {
         let storage = ctx.storage()?;
@@ -1193,6 +1218,7 @@ fn stream_get_more(
     cursor_id: i64,
     batch_size: Option<i64>,
     ns: &str,
+    dropped: Option<String>,
     ctx: &mut CommandContext,
 ) -> HandlerResult {
     let cursors = ctx
@@ -1211,6 +1237,13 @@ fn stream_get_more(
             .into_reply())
         }
     };
+    // Dropped under it: a cursor stage still returns what it buffered.
+    if let Some(reason) = dropped {
+        if !stream.source_gone(&reason) {
+            cursors.return_stream(cursor_id, stream, true);
+            return Ok(CommandError::new(175, "QueryPlanKilled", reason).into_reply());
+        }
+    }
     if let Some(command) = stream.deferred() {
         return deferred_get_more(cursor_id, batch_size, ns, command, stream, &cursors, ctx);
     }

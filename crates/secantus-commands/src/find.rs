@@ -692,7 +692,6 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // the last batch stopped (RM-080). The rest read whole, as before.
     let streamable = !tailable
         && exists
-        && collation.is_none()
         && !doc.contains_key("min")
         && !doc.contains_key("max")
         && !bool_field(doc, "returnKey", false)
@@ -716,6 +715,7 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             single_batch,
             let_vars: &let_vars,
             ns: &ns,
+            collation: collation.as_ref(),
         };
         if let Some(reply) = stream_find(ctx, doc, &asked)? {
             return Ok(reply);
@@ -1162,6 +1162,7 @@ struct StreamAsk<'a> {
     single_batch: bool,
     let_vars: &'a Document,
     ns: &'a str,
+    collation: Option<&'a secantus_core::collation::Collation>,
 }
 
 /// A `find` cursor that reads on as `getMore` asks: the plan's read
@@ -1174,6 +1175,8 @@ struct FindStream {
     ns: String,
     summary: Option<String>,
     command: Document,
+    /// The command's collation, which every batch reads under.
+    collation: Option<secantus_core::collation::Collation>,
 }
 
 impl crate::cursors::StreamCursor for FindStream {
@@ -1183,6 +1186,7 @@ impl crate::cursors::StreamCursor for FindStream {
         want: usize,
         max_bytes: usize,
     ) -> Result<crate::cursors::StreamedBatch, CommandError> {
+        let _active = secantus_core::collation::activate(self.collation.as_ref());
         let batch = self
             .stream
             .next_batch(storage, want, max_bytes)
@@ -1238,7 +1242,7 @@ fn stream_find(
         filter: asked.filter,
         sort: asked.sort,
         hint: asked.hint,
-        collation: None,
+        collation: asked.collation,
         vars: asked.let_vars,
         limit: if limit > 0 { skip + limit } else { 0 },
         asked: crate::near::Asked {
@@ -1281,6 +1285,7 @@ fn stream_find(
         ns: asked.ns.to_string(),
         summary: crate::explain::summary::plan_summary(doc, ctx),
         command: doc.clone(),
+        collation: asked.collation.cloned(),
     };
     // `batchSize: 0` asks for the cursor and no documents.
     let batch = if asked.batch_size == 0 {
@@ -1298,7 +1303,7 @@ fn stream_find(
         )?
     };
     if batch.docs.is_empty() && batch.exhausted {
-        validate_empty_result(asked.filter, asked.let_vars, None)?;
+        validate_empty_result(asked.filter, asked.let_vars, asked.collation)?;
     }
     let cursor_id = if batch.exhausted || asked.single_batch {
         0
