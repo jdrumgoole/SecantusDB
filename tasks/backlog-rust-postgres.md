@@ -758,6 +758,24 @@ one beside it.
       Backlog-ID: RP-268
       Verify: none -- not reproduced outside one Windows CI run; no test fails on demand
 
+- [ ] **OPEN — RUST pgserver: sessions creating TEMP tables side by side
+      fail 40001 (found 2026-10-25).** Sixteen sessions, each forty times
+      on a fresh connection, run `create temporary table t (...); insert
+      into t ...` (one implicit transaction), a prepared `update t`, and a
+      read. PostgreSQL 15.19 never fails one, since every session's temp
+      schema is its own. Here about one in forty fails with "could not
+      serialize access due to concurrent update". A trace shows the CREATE
+      colliding with a WiredTiger write on `__sql_catalog__` records that
+      other sessions' temp tables were just given. Separately, about one
+      session in three hundred then cannot find its own `t` (42P01): the
+      relation keys a statement resolves names by are cached per catalog
+      version, which moves before the DDL commits. It may be the cause of
+      the CI hang in `test_rust_pgserver_slice.py::test_parallel_sessions_
+      resolve_their_own_new_temp_table`, seen on batch 72's, 77's and 81's
+      runs.
+      Backlog-ID: RP-269
+      Verify: tests/backlog/test_rp_batch82.py::test_sessions_create_their_own_temp_tables_side_by_side
+
 ## Open from the 2026-09-30 batch
 
 - [ ] **Rust PG server: a SAVEPOINT captures whole tables, so its cost is

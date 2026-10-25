@@ -81,3 +81,46 @@ def test_a_second_create_table_waits_then_goes_on(rust_pg: Any, autocommit: bool
     """PostgreSQL 15.19: the second CREATE TABLE waits, then (the first
     rolled back) creates the table."""
     assert _race(rust_pg, "rollback", autocommit) == ("ok", True)
+
+
+@pytest.mark.backlog("RP-269")
+def test_sessions_create_their_own_temp_tables_side_by_side(rust_pg: Any) -> None:
+    """PostgreSQL 15.19: sixteen sessions, each forty times on a fresh
+    connection creating its own TEMP table `t` and filling it in one
+    implicit transaction, then updating and reading it back. Every session's temp schema
+    is its own, so none of them fails and each reads only its own rows. This
+    server fails some of these sessions with 40001: their catalog writes
+    collide on another session's temp table's catalog rows. Now and then a
+    session's next statement does not find its own `t` (42P01)."""
+    problems: list[str] = []
+    lock = threading.Lock()
+
+    def work(w: int) -> None:
+        for i in range(40):
+            try:
+                with rust_pg.connect() as c:
+                    c.execute(
+                        "create temporary table t (id text primary key, n int); "
+                        f"insert into t values ('{w}-{i}-a', {w}), ('{w}-{i}-b', {w})",
+                        prepare=False,
+                    )
+                    c.execute(
+                        "update t set n = n + %s where id = %s",
+                        (1, f"{w}-{i}-b"),
+                        prepare=True,
+                    )
+                    rows = c.execute("select n from t").fetchall()
+                    if sorted(r[0] for r in rows) != [w, w + 1]:
+                        with lock:
+                            problems.append(f"session {w} read {rows}")
+            except Exception as e:  # noqa: BLE001 - the error is the answer
+                with lock:
+                    problems.append(f"{type(e).__name__}: {e}")
+
+    threads = [threading.Thread(target=work, args=(w,)) for w in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(300)
+    assert not any(t.is_alive() for t in threads)
+    assert problems == []

@@ -33,3 +33,10 @@ concurrent update".
   `::test_a_left_join_on_a_class_member_is_in_the_class_order`). RP-028 stays
   open; a join on two equalities is its new gap test
   (`::test_a_join_on_two_equalities_is_planned`).
+- `secantus-pg`: a CREATE TEMPORARY TABLE is never treated as colliding
+  with another session's table of the same name. A temp table is in its
+  session's own schema, and mapping its write conflicts to 23505 turned an
+  unrelated conflict into a duplicate key. Found by a stress test, which is
+  now RP-269's gap test
+  (`tests/backlog/test_rp_batch82.py::test_sessions_create_their_own_temp_tables_side_by_side`):
+  sessions creating temp tables side by side still fail 40001 now and then.

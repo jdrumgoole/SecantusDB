@@ -30885,8 +30885,10 @@ impl PgHandler {
     /// transaction of its own for (`run_autocommit_write`).
     /// A statement that creates a relation, and so writes its catalog rows
     /// under the names other transactions may be creating too.
+    /// A temporary table is in its session's own namespace, which no other
+    /// session writes, so it is never one.
     fn creates_relation(stmt: &Statement) -> bool {
-        matches!(stmt, Statement::CreateTable(..))
+        matches!(stmt, Statement::CreateTable(def, _) if !def.temp)
     }
 
     /// A CREATE TABLE that collided with another transaction creating the
@@ -30904,6 +30906,9 @@ impl PgHandler {
         let Statement::CreateTable(def, _) = stmt else {
             return out;
         };
+        if def.temp {
+            return out;
+        }
         let already = matches!(
             &out,
             Err(PgWireError::UserError(info)) if info.code == "42P07"
