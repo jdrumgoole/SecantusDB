@@ -77,6 +77,12 @@ struct Clause {
     on: Option<usize>,
     /// The class's derived clause rather than an edge.
     class: bool,
+    /// An edge (an outer join's clause) whose `a` or `b` key is a member of
+    /// the class: that side, merged on the class, is in its order, and a
+    /// LEFT join's merge on its preserved `a` side comes out in it
+    /// (`initialize_mergeclause_eclasses` finds the member's class).
+    a_in_class: bool,
+    b_in_class: bool,
     /// The equivalence class it is in, for `JoinRel::add_paths_on`: 0 for
     /// every clause when the chain has no class (as before there was
     /// one), else 1 for the class and 2 + its index for an edge.
@@ -124,7 +130,7 @@ struct Search {
     /// `(table, key)` in `ec_members` order. Its clauses are not `edges`.
     class: Vec<(usize, String)>,
     /// The ONs the class stands in for, checked on every row at the end.
-    class_ons: Vec<usize>,
+    class_ons: Vec<(usize, u8)>,
     /// Each table's columns, by joined-row key, with their widths
     /// (`get_typavgwidth`), and the keys the query reads above the join;
     /// `None` when that is not known, and then no width is.
@@ -276,7 +282,11 @@ impl Search {
                 return None;
             }
             let (a_key, a_table, b_key, b_table) = clause;
+            let member =
+                |t: usize, k: &String| self.class.iter().any(|(ct, ck)| *ct == t && ck == k);
             found = Some(Clause {
+                a_in_class: member(a_table, &a_key),
+                b_in_class: member(b_table, &b_key),
                 a_key,
                 a_table,
                 b_key,
@@ -299,6 +309,8 @@ impl Search {
                 b_table: *bt,
                 on: None,
                 class: true,
+                a_in_class: true,
+                b_in_class: true,
                 key_class: 1,
             });
         }
@@ -482,11 +494,11 @@ impl PgHandler {
             specials.push((min_l, min_r, w.left, w.right, false));
         }
         let outer = specials.iter().map(|&(l, r, _, _, f)| (l, r, f)).collect();
-        // A column in two clauses: the equivalence class they make.
-        let (class, class_ons) = Self::chain_class(&mut edges, &reversed)?;
-        if !class.is_empty() && kinds.iter().any(|k| *k != JoinKind::Inner) {
-            return None;
-        }
+        // A column in two inner joins' clauses: the equivalence class they
+        // make. An outer join's clause is not one of its members'
+        // equalities (`distribute_qual_to_rels` delays it), and stays an
+        // edge.
+        let (class, class_ons) = Self::chain_class(&mut edges, &reversed, &kinds)?;
         for leaf in &leaves {
             let (table, filter) = plain_leaf_table(leaf)?;
             if !self.join_small_enough(&table) {
@@ -563,10 +575,15 @@ impl PgHandler {
     fn chain_class(
         edges: &mut Vec<Edge>,
         reversed: &[bool],
-    ) -> Option<(Vec<(usize, String)>, Vec<usize>)> {
+        kinds: &[JoinKind],
+    ) -> Option<(Vec<(usize, String)>, Vec<(usize, u8)>)> {
         let mut classes: Vec<Vec<(usize, String)>> = Vec::new();
         let mut class_of_edge = Vec::new();
         for (e, rev) in edges.iter().zip(reversed) {
+            if kinds[e.on] != JoinKind::Inner {
+                class_of_edge.push(usize::MAX);
+                continue;
+            }
             let (l, r) = ((e.u, e.u_key.clone()), (e.v, e.v_key.clone()));
             let (item1, item2) = if *rev { (r, l) } else { (l, r) };
             let find = |c: &Vec<Vec<(usize, String)>>, m: &(usize, String)| {
@@ -577,7 +594,7 @@ impl PgHandler {
                 (Some(i), Some(j)) => {
                     let moved = classes.remove(j);
                     let i = if j < i { i - 1 } else { i };
-                    for c in class_of_edge.iter_mut() {
+                    for c in class_of_edge.iter_mut().filter(|c| **c != usize::MAX) {
                         if *c == j {
                             *c = i;
                         } else if *c > j {
@@ -618,7 +635,7 @@ impl PgHandler {
         let mut kept = Vec::new();
         for (e, c) in std::mem::take(edges).into_iter().zip(class_of_edge) {
             if c == *class_at {
-                class_ons.push(e.on);
+                class_ons.push((e.on, (1u8 << e.u) | (1u8 << e.v)));
             } else {
                 kept.push(e);
             }
@@ -671,8 +688,10 @@ impl PgHandler {
         let left = outer.is_some() && !full;
         let (sa, sb) = (search.rels[a].set, search.rels[b].set);
         let clause = search.clause_between(sa, sb)?;
-        let side_a = self.search_side(search, a, &clause.a_key, clause.a_table, clause.class)?;
-        let side_b = self.search_side(search, b, &clause.b_key, clause.b_table, clause.class)?;
+        let side_a =
+            self.search_side(search, a, &clause.a_key, clause.a_table, clause.a_in_class)?;
+        let side_b =
+            self.search_side(search, b, &clause.b_key, clause.b_table, clause.b_in_class)?;
         let set = sa | sb;
         let idx = match search.rels.iter().position(|r| r.set == set) {
             Some(i) => i,
@@ -697,9 +716,16 @@ impl PgHandler {
         // class is a member outside the relation; an edge's own clause is
         // inside it now. (The search runs with no LIMIT, and an ORDER BY is
         // applied after it, so no query order is there to serve.)
-        let useful = clause.class && search.class.iter().any(|(t, _)| set & (1 << *t) == 0);
+        // A LEFT join merged on its preserved side's class member comes out
+        // in the class's order.
+        let in_class = clause.class || (left && clause.a_in_class);
+        let useful = in_class && search.class.iter().any(|(t, _)| set & (1 << *t) == 0);
         let key_class = if useful {
-            clause.key_class
+            if clause.class {
+                clause.key_class
+            } else {
+                1
+            }
         } else {
             secantus_pgplan::joincost::USELESS_KEYS
         };
@@ -825,8 +851,8 @@ impl PgHandler {
             _ => (false, false),
         };
         let (Some(a), Some(b)) = (
-            self.run_searched(search, chain, built.a, clause.class && a_sorted)?,
-            self.run_searched(search, chain, built.b, clause.class && b_sorted)?,
+            self.run_searched(search, chain, built.a, clause.a_in_class && a_sorted)?,
+            self.run_searched(search, chain, built.b, clause.b_in_class && b_sorted)?,
         ) else {
             return Ok(None);
         };
@@ -879,7 +905,33 @@ impl PgHandler {
         let type_of = |key: &str| chain.leaves.iter().find_map(|n| leaf_key_type(n, key));
         let (a_type, b_type) = (type_of(&step.a_key), type_of(&step.b_key));
         let on = clause.on.and_then(|i| chain.ons[i]);
-        self.run_step(&step, a, b, a_type, b_type, on)
+        let Some(mut joined) = self.run_step(&step, a, b, a_type, b_type, on)? else {
+            return Ok(None);
+        };
+        // The ONs the class's derived clauses stood in for, each where its
+        // two tables first meet: an inner join's ON is its own join's
+        // qual, below any outer join that could NULL-extend its tables.
+        let (sa, sb) = (search.rels[built.a].set, search.rels[built.b].set);
+        for &(i, tables) in &search.class_ons {
+            let completes = tables & !(sa | sb) == 0 && tables & !sa != 0 && tables & !sb != 0;
+            if !completes {
+                continue;
+            }
+            if let Some(expr) = chain.ons[i] {
+                let mut kept = Vec::with_capacity(joined.rows.len());
+                for d in joined.rows {
+                    let keep = matches!(
+                        secantus_pgplan::apply_row_expr(expr, &d).map_err(|e| Self::err(&e))?,
+                        Bson::Boolean(true)
+                    );
+                    if keep {
+                        kept.push(d);
+                    }
+                }
+                joined.rows = kept;
+            }
+        }
+        Ok(Some(joined))
     }
 
     /// Whether `node` is a chain of four to eight tables whose join order is
@@ -913,23 +965,6 @@ impl PgHandler {
         let Some(joined) = self.run_searched(&search, &chain, top, false)? else {
             return Ok(None);
         };
-        // The ONs the class's derived clauses stood in for decide every row.
-        let mut rows = joined.rows;
-        for &i in &search.class_ons {
-            if let Some(expr) = chain.ons[i] {
-                let mut kept = Vec::with_capacity(rows.len());
-                for d in rows {
-                    let keep = matches!(
-                        secantus_pgplan::apply_row_expr(expr, &d).map_err(|e| Self::err(&e))?,
-                        Bson::Boolean(true)
-                    );
-                    if keep {
-                        kept.push(d);
-                    }
-                }
-                rows = kept;
-            }
-        }
-        Ok(Some(rows))
+        Ok(Some(joined.rows))
     }
 }

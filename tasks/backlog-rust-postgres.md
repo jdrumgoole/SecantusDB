@@ -576,10 +576,18 @@ one beside it.
     is a Hash Full Join only, as `select_mergejoin_clauses` allows no
     merge join a join filter (20 of 20 two-table variants: WHERE, LIMIT,
     ORDER BY, USING, ON filter). A FULL join over an analysed table is
-    declined with the other joins over measured columns (below). Not yet:
-    two classes spanning both sides (two join keys); an
+    declined with the other joins over measured columns (below). A class
+    beside outer joins is searched too (2026-10-25): only inner joins'
+    equalities make the class (an outer join's clause is delayed,
+    `distribute_qual_to_rels`), each inner ON the class stands in for is
+    checked where its tables meet, below any outer join that could
+    NULL-extend them, and an outer join's key that is a class member reads
+    a side merged on the class unsorted, a LEFT join merged on its
+    preserved member coming out in the class's order; 18 of 18 shapes of
+    four and five tables (none before), nested LEFT joins 20 of 20 (18).
+    Not yet: two classes spanning both sides (two join keys); an
     expression in a class; a LEFT join's class through the general path;
-    a class of text or other non-integer keys, or with a LEFT join; three
+    a class of text or other non-integer keys; three
     tables with a WHERE over two of them or a LIMIT; four or more tables
     with a WHERE over two of them or a LIMIT; more than eight tables; an expression key with a function
     call or a cast that costs; parameterized nested loops (an index scan inner); a LIMIT with
@@ -587,7 +595,7 @@ one beside it.
     than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_left_join_over_an_inner_class_is_searched
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_join_on_two_equalities_is_planned
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

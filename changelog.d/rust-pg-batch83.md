@@ -1,4 +1,4 @@
-### The Rust PostgreSQL server: two transactions creating one table name
+### The Rust PostgreSQL server: two transactions creating one table name, and classes beside outer joins
 
 A second CREATE TABLE of a name another open transaction is creating now
 behaves as in PostgreSQL 15.19. It waits for the other transaction. If that
@@ -16,3 +16,20 @@ concurrent update".
   the catalog gives. Found while chasing RP-268
   (`tests/backlog/test_rp_batch82.py`); RP-268 itself stays open, since the
   Windows failure it records creates two different names.
+- `secantus-pg`: an equivalence class beside outer joins goes through the
+  join order search.
+  - Only inner joins' equalities make the class; an outer join's clause is
+    delayed (`distribute_qual_to_rels`).
+  - Each inner ON the class stands in for is checked where its tables
+    meet, below any outer join that could NULL-extend them (it was checked
+    on every row at the end).
+  - An outer join's key that is a class member reads a side merged on the
+    class unsorted, and a LEFT join merged on its preserved member comes
+    out in the class's order.
+
+  18 of 18 shapes of four and five tables match 15.19 (none before), and
+  nested LEFT joins 20 of 20 (18 before). Part of RP-028
+  (`tests/backlog/test_rust_postgres_gaps.py::test_a_left_join_over_an_inner_class_is_searched`,
+  `::test_a_left_join_on_a_class_member_is_in_the_class_order`). RP-028 stays
+  open; a join on two equalities is its new gap test
+  (`::test_a_join_on_two_equalities_is_planned`).
