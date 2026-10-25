@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import itertools
 import json
+import time
 import uuid
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -486,24 +487,37 @@ def _slow_lines(client: Any) -> list:
             log = client.admin.command("getLog", "global")["log"]
             last = log[-1] if log else None
             _quiet(fn)
-            lines = []
-            for entry in map(_log_line, _lines_after(client, last)):
-                if entry.get("msg") != "Slow query":
-                    continue
-                command = entry["attr"].get("command", {})
-                first = next(iter(command), "")
-                # The `getLog` that reads the log is logged in its window,
-                # and the driver's monitor sends `hello` whenever it likes.
-                if first in ("hello", "isMaster", "ismaster"):
-                    continue
-                if first != "getLog" or label == "getLog":
-                    lines.append((entry["c"], entry["attr"].get("type"), first))
+
+            def read(label: str = label, last: str | None = last) -> list:
+                lines = []
+                for entry in map(_log_line, _lines_after(client, last)):
+                    if entry.get("msg") != "Slow query":
+                        continue
+                    command = entry["attr"].get("command", {})
+                    first = next(iter(command), "")
+                    # The `getLog` that reads the log is logged in its
+                    # window, and the driver's monitor sends `hello`
+                    # whenever it likes.
+                    if first in ("hello", "isMaster", "ismaster"):
+                        continue
+                    if first != "getLog" or label == "getLog":
+                        lines.append((entry["c"], entry["attr"].get("type"), first))
+                return lines
+
+            lines = read()
             # An index build's line is written on its build thread, which
             # races the command's own line: mongod 8.2.11 writes the build's
-            # first nearly always and the command's first under load (seen
-            # 2026-10-24). Which lines a build writes is the measurement, so
-            # those two are compared without their order.
+            # first nearly always, the command's first under load (seen
+            # 2026-10-24), and under load in CI the build's after the
+            # command has returned (2026-10-25). Which lines a build writes
+            # is the measurement, so the log is read until the build's line
+            # is in it (a few seconds at most), and the two are compared
+            # without their order.
             if label == "createIndex":
+                deadline = time.monotonic() + 5
+                while not any(c == "STORAGE" for c, _, _ in lines) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                    lines = read()
                 lines.sort()
             out.append((label, lines))
     finally:
