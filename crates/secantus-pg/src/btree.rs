@@ -534,6 +534,37 @@ impl PgHandler {
             .collect())
     }
 
+    /// An index scan of `table` through `shape` for `filter` (an
+    /// index-only one too, while the heap is not all-visible): it marks the
+    /// entries it passes whose heap versions are dead to all
+    /// (`kill_prior_tuple`, `_bt_killitems`), which a later insert into a
+    /// full leaf then deletes before it splits (RP-196).
+    pub(crate) fn btree_index_scanned(
+        &self,
+        table: &str,
+        shape: &IndexShape,
+        filter: &Document,
+    ) -> PgWireResult<()> {
+        if REWRITING.with(|r| r.get()) {
+            return Ok(());
+        }
+        let dead = self.dead_index_tids(table)?;
+        if dead.is_empty() {
+            return Ok(());
+        }
+        let ranges = crate::serializable::index_scan_ranges(shape, filter);
+        self.with_btree(table, shape, |t| {
+            for (lo, hi) in &ranges {
+                t.kill_items(
+                    shape,
+                    lo.as_ref().map(|(v, i)| (v, *i)),
+                    hi.as_ref().map(|(v, i)| (v, *i)),
+                    &|x| dead.contains(&x),
+                );
+            }
+        })
+    }
+
     /// New tuple versions of `table` that are not heap-only: each B-tree
     /// takes an index tuple for each (`ExecInsertIndexTuples`).
     pub(crate) fn btree_insert_versions(

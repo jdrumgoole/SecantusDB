@@ -667,48 +667,7 @@ impl PgHandler {
         } else {
             bson::doc! { "$and": on_index }
         };
-        // Each primitive scan's bounds on the leading column: an IN list's
-        // values each, a comparison's range.
-        let lead = keys.first();
-        let mut lo: Option<(bson::Bson, bool)> = None;
-        let mut hi: Option<(bson::Bson, bool)> = None;
-        let mut list: Option<Vec<bson::Bson>> = None;
-        for (k, v) in &conds {
-            if Some(k) != lead {
-                continue;
-            }
-            match v {
-                bson::Bson::Document(ops) if ops.keys().all(|o| o.starts_with('$')) => {
-                    for (op, x) in ops {
-                        match op.as_str() {
-                            "$eq" => {
-                                lo = Some((x.clone(), true));
-                                hi = Some((x.clone(), true));
-                            }
-                            "$gt" => lo = Some((x.clone(), false)),
-                            "$gte" => lo = Some((x.clone(), true)),
-                            "$lt" => hi = Some((x.clone(), false)),
-                            "$lte" => hi = Some((x.clone(), true)),
-                            "$in" => list = x.as_array().cloned(),
-                            _ => {}
-                        }
-                    }
-                }
-                other => {
-                    lo = Some((other.clone(), true));
-                    hi = Some((other.clone(), true));
-                }
-            }
-        }
-        let ranges: Vec<(Bound, Bound)> = match list {
-            Some(mut vals) => {
-                vals.sort_by(|a, b| shape.cmp_attr(0, a, b));
-                vals.into_iter()
-                    .map(|v| (Some((v.clone(), true)), Some((v, true))))
-                    .collect()
-            }
-            None => vec![(lo, hi)],
-        };
+        let ranges = index_scan_ranges(shape, filter);
         let pages: Vec<Option<Vec<u32>>> = self.with_btree(table, shape, |t| {
             ranges
                 .iter()
@@ -895,5 +854,56 @@ impl PgHandler {
         let db = self.ssi_db();
         self.ssi(|s| s.table_conflict_in(pid, db, rel))
             .map_err(failure)
+    }
+}
+
+/// An index scan's ranges over `shape`'s leading column for `filter`
+/// (`_bt_first`'s bounds): one a value of an IN list, else the range its
+/// comparisons give (unbounded where they give none).
+pub(crate) fn index_scan_ranges(
+    shape: &crate::btree::IndexShape,
+    filter: &Document,
+) -> Vec<(Bound, Bound)> {
+    let keys = shape.key_fields();
+    let conds = flat_conditions(filter).unwrap_or_default();
+    let lead = keys.first();
+    let mut lo: Option<(bson::Bson, bool)> = None;
+    let mut hi: Option<(bson::Bson, bool)> = None;
+    let mut list: Option<Vec<bson::Bson>> = None;
+    for (k, v) in &conds {
+        if Some(k) != lead {
+            continue;
+        }
+        match v {
+            bson::Bson::Document(ops) if ops.keys().all(|o| o.starts_with('$')) => {
+                for (op, x) in ops {
+                    match op.as_str() {
+                        "$eq" => {
+                            lo = Some((x.clone(), true));
+                            hi = Some((x.clone(), true));
+                        }
+                        "$gt" => lo = Some((x.clone(), false)),
+                        "$gte" => lo = Some((x.clone(), true)),
+                        "$lt" => hi = Some((x.clone(), false)),
+                        "$lte" => hi = Some((x.clone(), true)),
+                        "$in" => list = x.as_array().cloned(),
+                        _ => {}
+                    }
+                }
+            }
+            other => {
+                lo = Some((other.clone(), true));
+                hi = Some((other.clone(), true));
+            }
+        }
+    }
+    match list {
+        Some(mut vals) => {
+            vals.sort_by(|a, b| shape.cmp_attr(0, a, b));
+            vals.into_iter()
+                .map(|v| (Some((v.clone(), true)), Some((v, true))))
+                .collect()
+        }
+        None => vec![(lo, hi)],
     }
 }

@@ -511,6 +511,33 @@ pub fn scan_path<'a>(
     best
 }
 
+/// Whether an ORDER BY over `index`'s columns is read by an index scan in
+/// its order rather than by the cheapest scan under a Sort
+/// (`create_ordered_paths` keeping the cheaper of the two, both with the
+/// ORDER BY's pathkeys): their totals compared within `add_path`'s fuzz,
+/// a tie going to the cheaper startup. `rows` is the scan's output.
+pub fn index_order_beats_sort(
+    rel: &Rel,
+    indexes: &[Index],
+    index: &Index,
+    quals: &[(String, Qual)],
+    ndistinct: &dyn Fn(&str) -> f64,
+    rows: f64,
+) -> bool {
+    let (_, input) = cheapest_scan_path(rel, indexes, quals, ndistinct, rows);
+    let n = rows.max(2.0);
+    let sort_startup = input + 2.0 * CPU_OPERATOR_COST * n * n.log2();
+    let sort_total = sort_startup + CPU_OPERATOR_COST * rows;
+    let (startup, total) = ordered_index_scan(rel, index, quals, ndistinct(&index.field));
+    if total * STD_FUZZ_FACTOR < sort_total {
+        true
+    } else if sort_total * STD_FUZZ_FACTOR < total {
+        false
+    } else {
+        startup < sort_startup
+    }
+}
+
 /// How a table is read.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScanKind {

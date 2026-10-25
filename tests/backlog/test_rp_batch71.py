@@ -93,7 +93,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
             "drop table rp71_t",
         ],
     ),
-    # What is still left of RP-196.
+    # Fixed later: batch 74 (every step), batch 81 (index scans).
     "every step of eight updates of a primary key": (
         "RP-196",
         False,
@@ -106,7 +106,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "an index scan marks the dead versions it passes": (
         "RP-196",
-        True,
+        False,
         [
             f"create table rp71_s (a int primary key, b int) {_NOAV}",
             "insert into rp71_s select g, 0 from generate_series(1, 2000) g",

@@ -1065,16 +1065,18 @@ batch; its test there is a regression test.
       - bottom-up deletion runs for an UPDATE that left the key unchanged,
         within its six-block budget.
       Since batch 74 every step of a long run of updates matches too.
-      What is left is index scans. An index scan marks LP_DEAD the entries
-      whose heap versions it finds dead (`kill_prior_tuple`), and this
-      server's reads mark none. With an ordered read of the primary key
-      between updates of a 2,000-row table, PostgreSQL keeps the index at
-      13, 13, 13 and 14 pages, against 13, 14, 14 and 16 here. PostgreSQL
-      reads it with an Index Only Scan chosen by cost; this server reads by
-      a seq scan and a sort and does not cost the choice, so modelling the
-      marking waits on the planner (RP-028).
+      Since batch 81 an index scan marks LP_DEAD the entries whose heap
+      versions it finds dead to all (`kill_prior_tuple`, `_bt_killitems`):
+      a read the planner prices as an index scan, and an ORDER BY with no
+      WHERE it reads in a B-tree's order rather than sorting (54 of 54
+      shapes of reads between updates, 48 before). What is left is a read
+      that returns one row, which is not priced (the price counts the
+      table's rows, too dear for every primary-key lookup), so a lookup by
+      the primary key marks nothing: after 2,000 of them between each of
+      three updates PostgreSQL keeps the index at 13, 13 and 13 pages,
+      against 13, 14 and 14 here.
       Backlog-ID: RP-196
-      Verify: tests/backlog/test_rp_batch71.py::test_scenario[an index scan marks the dead versions it passes]
+      Verify: tests/backlog/test_rp_batch81.py::test_primary_key_lookups_mark_the_dead_versions
 
 ## Found by batch 46 (2026-10-23)
 

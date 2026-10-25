@@ -6602,7 +6602,8 @@ impl PgHandler {
                 Some(PricedScan::Seq) => return Ok(heap::in_ctid_order(rows)),
                 Some(PricedScan::Bitmap(_)) => return self.in_root_order(table, rows),
                 Some(PricedScan::Index(ScanIndex::Btree(shape))) => {
-                    return self.in_index_order(table, &shape, rows)
+                    self.btree_index_scanned(table, &shape, filter)?;
+                    return self.in_index_order(table, &shape, rows);
                 }
                 Some(PricedScan::Index(ScanIndex::Hash(_))) | None => {}
             }
@@ -6611,6 +6612,77 @@ impl PgHandler {
             return Ok(heap::in_ctid_order(rows));
         }
         Ok(rows)
+    }
+
+    /// A read of `table` with no WHERE whose ORDER BY leads a B-tree, which
+    /// PostgreSQL may read through that index in its order instead of
+    /// sorting (`create_ordered_paths`; forward for ascending NULLS LAST,
+    /// backward for descending NULLS FIRST): when the index scan is the
+    /// cheaper, it marks the dead entries it passes (RP-196).
+    fn ordered_index_read(
+        &self,
+        table: &str,
+        order: &[secantus_pgplan::OrderKey],
+    ) -> PgWireResult<()> {
+        use secantus_pgplan::{costsize, Nulls};
+        if order.is_empty() || !self.has_heap(table) {
+            return Ok(());
+        }
+        let plain = |k: &secantus_pgplan::OrderKey| k.expr.is_none() && !k.jsonb;
+        let forward = order
+            .iter()
+            .all(|k| plain(k) && k.ascending && k.nulls == Nulls::Last);
+        let backward = order
+            .iter()
+            .all(|k| plain(k) && !k.ascending && k.nulls == Nulls::First);
+        if !forward && !backward {
+            return Ok(());
+        }
+        let Some(shape) = self.btree_shapes(table).into_iter().find(|s| {
+            s.is_plain()
+                && s.key_fields().len() >= order.len()
+                && s.key_fields().iter().zip(order).all(|(f, k)| *f == k.field)
+        }) else {
+            return Ok(());
+        };
+        let Ok(count) = self
+            .storage
+            .count_matching(self.db(), table, &Document::new(), None)
+        else {
+            return Ok(());
+        };
+        let Some(pt) = self.planner_table(table, count) else {
+            return Ok(());
+        };
+        let indexes = self.cost_indexes(table, &pt.def, count as u64);
+        let Some(ix) = indexes
+            .iter()
+            .find(|ix| ix.predicate.is_none() && ix.columns == shape.key_fields())
+        else {
+            return Ok(());
+        };
+        let rel = costsize::Rel {
+            pages: pt.pages,
+            tuples: pt.tuples,
+        };
+        let nd = |f: &str| {
+            if pt.unique.iter().any(|u| u == f) {
+                pt.tuples
+            } else if pt
+                .def
+                .columns
+                .iter()
+                .any(|c| c.field() == f && c.pg_type == "bool")
+            {
+                2.0
+            } else {
+                pt.tuples.min(200.0)
+            }
+        };
+        if costsize::index_order_beats_sort(&rel, &indexes, ix, &[], &nd, pt.tuples) {
+            self.btree_index_scanned(table, &shape, &Document::new())?;
+        }
+        Ok(())
     }
 
     /// `rows` in the order of their HOT chains' roots: a bitmap heap
@@ -34243,6 +34315,13 @@ impl PgHandler {
                 let def = self
                     .lookup(&sel.table)
                     .ok_or_else(|| Self::err(&PlanError::UndefinedTable(sel.table.clone())))?;
+                if sel.filter.is_empty()
+                    && sel.residual.is_none()
+                    && sel.limit.is_none()
+                    && sel.windows.is_empty()
+                {
+                    self.ordered_index_read(&sel.table, &sel.order)?;
+                }
                 // Decode once: ORDER BY, OFFSET and LIMIT all need the
                 // values, and re-decoding per comparison is quadratic.
                 let mut docs: Vec<Document> = raw

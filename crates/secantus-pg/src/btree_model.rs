@@ -862,6 +862,56 @@ impl BTree {
         }
     }
 
+    /// `_bt_killitems`: an index scan between `lower` and `upper` on the
+    /// leading column marks LP_DEAD each item it returned whose every heap
+    /// version it found dead to all (`kill_prior_tuple`; a posting list
+    /// only when each of its TIDs is). Whether any item was marked.
+    pub(crate) fn kill_items(
+        &mut self,
+        shape: &dyn Shape,
+        lower: Option<(&Bson, bool)>,
+        upper: Option<(&Bson, bool)>,
+        dead: &dyn Fn(i64) -> bool,
+    ) -> bool {
+        let Some(pages) = self.scan_pages(shape, lower, upper) else {
+            return false;
+        };
+        let within = |k: &Bson| {
+            let above = lower.is_none_or(|(l, inclusive)| match shape.cmp_attr(0, k, l) {
+                Ordering::Greater => true,
+                Ordering::Equal => inclusive,
+                Ordering::Less => false,
+            });
+            let below = upper.is_none_or(|(u, inclusive)| match shape.cmp_attr(0, k, u) {
+                Ordering::Less => true,
+                Ordering::Equal => inclusive,
+                Ordering::Greater => false,
+            });
+            above && below
+        };
+        let mut any = false;
+        for p in pages {
+            let Page::Leaf { items, .. } = &mut self.pages[p as usize] else {
+                continue;
+            };
+            let mut marked = false;
+            for it in items.iter_mut() {
+                if it.dead || it.tids.is_empty() || !it.key.first().is_some_and(within) {
+                    continue;
+                }
+                if it.tids.iter().all(|t| dead(*t)) {
+                    it.dead = true;
+                    marked = true;
+                }
+            }
+            if marked {
+                self.touched.insert(p);
+                any = true;
+            }
+        }
+        any
+    }
+
     /// The pages it occupies, the metapage and deleted pages among them.
     pub(crate) fn pages(&self) -> u32 {
         self.pages.len().max(1) as u32
