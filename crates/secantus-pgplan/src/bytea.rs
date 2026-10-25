@@ -64,7 +64,9 @@ fn parse_hex(s: &str) -> Result<Vec<u8>> {
 
 /// Escape form: printable bytes verbatim, `\\` → one 0x5C, `\ooo` octal.
 fn parse_escape(s: &str) -> Result<Vec<u8>> {
-    let bytes = s.as_bytes();
+    // `byteain` reads the literal's bytes in the server encoding (RP-064).
+    let encoded = crate::server_encoding::bytes(s);
+    let bytes: &[u8] = &encoded;
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {

@@ -68,7 +68,7 @@ EXPECTED: list[Any] = [
 ]
 
 
-@pytest.mark.backlog("RP-064")
+@pytest.mark.backlog_fixed("RP-064")
 def test_latin1_database_behaves_as_latin1(rust_pg: Any) -> None:
     assert latin1_database(rust_pg.port) == EXPECTED
 

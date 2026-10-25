@@ -146,17 +146,23 @@ fn varlena_data(pg_type: &str, typmod: i32, v: &Bson) -> usize {
             let s = text_of(v);
             let n = usize::try_from(typmod - 4).unwrap_or(0);
             let chars = s.chars().count();
-            s.len() + n.saturating_sub(chars)
+            server_len(&s) + n.saturating_sub(chars)
         }
         (_, Bson::Array(items)) => {
             // ARR_OVERHEAD for one dimension, then 4-byte-headed elements.
             24 + items
                 .iter()
-                .map(|i| align(4 + text_of(i).len(), 'i'))
+                .map(|i| align(4 + server_len(&text_of(i)), 'i'))
                 .sum::<usize>()
         }
-        (_, v) => text_of(v).len(),
+        (_, v) => server_len(&text_of(v)),
     }
+}
+
+/// A text's length in the server encoding's bytes, as the tuple holds it
+/// (RP-064).
+fn server_len(s: &str) -> usize {
+    secantus_pgplan::server_encoding::bytes(s).len()
 }
 
 /// The length `heap_form_tuple` gives a row of `def`: header and null

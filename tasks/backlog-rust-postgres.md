@@ -732,21 +732,6 @@ Not filed:
       above is a different question.
       Backlog-ID: RP-061
       Verify: tests/backlog/test_rp_found_2026_10_20.py::test_serializable_write_skew
-- [ ] **A database created with a non-UTF8 `ENCODING` still behaves as
-      UTF8.** `CREATE DATABASE ... ENCODING 'LATIN1'` is recorded (and
-      `pg_database` shows it), and TEMPLATE, OWNER, CONNECTION LIMIT,
-      IS_TEMPLATE, ALLOW_CONNECTIONS and ALTER DATABASE are PostgreSQL's
-      (2026-10-22). Inside such a database PostgreSQL 15.19 reports
-      `server_encoding` as LATIN1, defaults `client_encoding` to it, refuses a
-      character LATIN1 lacks on the way from the client (22P05), and its byte
-      functions count LATIN1 bytes: `octet_length('é')` is 1, `convert_to`
-      and `::bytea` give `\xe9`, `chr(8364)` is 54000. Here every database is
-      UTF8 inside. **Decided (Joe, 2026-10-22): emulate the encoding** --
-      PostgreSQL's model, the server encoding per database with the
-      client-to-server conversion and the byte functions honouring it -- as
-      its own slice.
-      Backlog-ID: RP-064
-      Verify: tests/backlog/test_rp064_encoding.py::test_latin1_database_behaves_as_latin1
 
 ## Found by batch 30 (2026-10-22)
 
