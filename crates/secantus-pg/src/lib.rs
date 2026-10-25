@@ -34,6 +34,7 @@ mod access_methods;
 mod advisory;
 mod aggregates;
 mod alter_system;
+mod autovacuum;
 mod binary_recv;
 mod btree;
 mod btree_model;
