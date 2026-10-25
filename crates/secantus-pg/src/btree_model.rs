@@ -972,7 +972,10 @@ impl BTree {
             return;
         };
         let new = item(shape, key, vec![tid]);
-        let need = new.size + LP;
+        // `insertstate->itemsz`: the tuple's MAXALIGNed size, its line
+        // pointer aside -- `PageGetFreeSpace` (`leaf_free`) has already
+        // set one aside.
+        let need = new.size;
         let mut free = match cached {
             Some(used) => USABLE - used - high.as_ref().map_or(0, |h| h.size + LP) - LP,
             None => leaf_free(items, high),
@@ -991,8 +994,10 @@ impl BTree {
             free = leaf_free(items, high);
         }
         if free < need {
+            // `_bt_findinsertloc` starts from the executor's hint
+            // (`uniquedup = indexUnchanged`).
             let uniquedup = shape.unique()
-                && (simple_ran || {
+                && (unchanged || simple_ran || {
                     let at = items
                         .partition_point(|i| cmp_keys(shape, &i.key, &new.key) == Ordering::Less);
                     items
@@ -1044,7 +1049,7 @@ impl BTree {
             }
         }
         // A posting list split keeps every size, so the space is as it was.
-        if free >= new.size + LP {
+        if free >= need {
             let grown = new.size + LP;
             items.insert(pos, new);
             let used = USABLE - free - high.as_ref().map_or(0, |h| h.size + LP) - LP + grown;
@@ -1150,7 +1155,8 @@ impl BTree {
             pivot,
             child: right_block,
         };
-        if internal_free(items, high) >= link.pivot.size + LP {
+        // `PageGetFreeSpace(page) < itemsz`, as for a leaf.
+        if internal_free(items, high) >= link.pivot.size {
             items.insert(at, link);
             return;
         }

@@ -961,29 +961,27 @@ are scenarios in `tests/backlog/test_rp_batch48.py`, measured on a private
 15.19 cluster. RP-195 (`pg_relation_size`) was found and fixed in the same
 batch; its test there is a regression test.
 
-- [ ] **A B-tree's dead entries: what index scans mark, and one step of
-      a long run of updates.** Each B-tree's pages are modelled
-      (`btree_model.rs`). Since batch 71 a full leaf deletes before it
-      splits, as PostgreSQL 15.19's `_bt_delete_or_dedup_one_page` does:
+- [ ] **A B-tree's dead entries: what index scans mark.** Each B-tree's
+      pages are modelled (`btree_model.rs`). Since batch 71 a full leaf
+      deletes before it splits, as PostgreSQL 15.19's
+      `_bt_delete_or_dedup_one_page` does:
       - `_bt_check_unique` marks LP_DEAD the equal keys whose heap
         versions are dead to all;
       - simple deletion removes those, and the dead TIDs of their heap
         blocks;
       - bottom-up deletion runs for an UPDATE that left the key unchanged,
         within its six-block budget.
-      Two things are still left.
-      - **Index scans.** An index scan marks LP_DEAD the entries whose heap
-        versions it finds dead (`kill_prior_tuple`), and this server's reads
-        mark none. With an ordered read of the primary key between updates
-        of a 2,000-row table, PostgreSQL keeps the index at 13, 13, 13 and
-        14 pages, against 14, 15, 15 and 16 here. Modelling it means
-        marking where PostgreSQL's plan is an index scan.
-      - **One step of a run of updates.** In eight updates of every row of
-        a 2,000-row table, the index's pages match PostgreSQL's but for the
-        third, which is 15 here and 14 there, although every heap ctid
-        matches.
+      Since batch 74 every step of a long run of updates matches too.
+      What is left is index scans. An index scan marks LP_DEAD the entries
+      whose heap versions it finds dead (`kill_prior_tuple`), and this
+      server's reads mark none. With an ordered read of the primary key
+      between updates of a 2,000-row table, PostgreSQL keeps the index at
+      13, 13, 13 and 14 pages, against 13, 14, 14 and 16 here. PostgreSQL
+      reads it with an Index Only Scan chosen by cost; this server reads by
+      a seq scan and a sort and does not cost the choice, so modelling the
+      marking waits on the planner (RP-028).
       Backlog-ID: RP-196
-      Verify: tests/backlog/test_rp_batch71.py::test_scenario[every step of eight updates of a primary key], tests/backlog/test_rp_batch71.py::test_scenario[an index scan marks the dead versions it passes]
+      Verify: tests/backlog/test_rp_batch71.py::test_scenario[an index scan marks the dead versions it passes]
 
 ## Found by batch 46 (2026-10-23)
 
