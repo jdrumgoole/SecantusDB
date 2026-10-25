@@ -722,6 +722,22 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                         return Ok(opened.reply);
                     }
                 }
+                // Asked for a first batch of none, mongod runs nothing until
+                // the first `getMore` (measured 8.2.11, 2026-10-25).
+                if batch_size == 0 {
+                    let deferred = crate::agg_stream::Deferred {
+                        command: doc.clone(),
+                    };
+                    let id = cursors
+                        .register_stream(&ns, Box::new(deferred))
+                        .map_err(|e| {
+                            CommandError::new(1, "InternalError", format!("cursor registry: {e:?}"))
+                        })?;
+                    return Ok(doc! {
+                        "cursor": { "firstBatch": [], "id": Bson::Int64(id), "ns": ns },
+                        "ok": 1.0,
+                    });
+                }
                 let lead = leading_sort(&rest, filter.is_empty());
                 let read = |sort: Option<&Document>, limit: i64| {
                     let moved = lead.filter.as_ref().filter(|_| sort.is_some());

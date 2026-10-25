@@ -64,6 +64,11 @@ pub trait StreamCursor: Send {
     /// The command that opened the cursor (a `getMore` line's
     /// `originatingCommand`).
     fn originating_command(&self) -> Document;
+    /// The command a cursor opened with a first batch of none runs at its
+    /// first `getMore`, when it has run nothing yet.
+    fn deferred(&self) -> Option<Document> {
+        None
+    }
 }
 
 /// One streamed batch, and what reading it examined.
@@ -503,6 +508,25 @@ impl CursorRegistry {
             e.stream_busy = false;
             e.last_access = now;
         }
+    }
+
+    /// Put cursor `from` under the id `into`, in place of what `into` held,
+    /// keeping `into`'s owner: a deferred cursor's pipeline, run at its first
+    /// `getMore`, reads on under the id the client holds. False (and `from`
+    /// closed) when `into` was killed meanwhile.
+    pub fn adopt(&self, from: i64, into: i64) -> bool {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mut e) = inner.cursors.remove(&from) else {
+            return false;
+        };
+        let Some(old) = inner.cursors.remove(&into) else {
+            return false;
+        };
+        e.owner = old.owner;
+        e.users = old.users;
+        e.time_limited = old.time_limited;
+        inner.cursors.insert(into, e);
+        true
     }
 
     /// Drain up to `batch_size` documents (`<= 0` ⇒ all remaining), never more
@@ -1187,6 +1211,9 @@ fn stream_get_more(
             .into_reply())
         }
     };
+    if let Some(command) = stream.deferred() {
+        return deferred_get_more(cursor_id, batch_size, ns, command, stream, &cursors, ctx);
+    }
     let storage = ctx
         .storage
         .clone()
@@ -1194,19 +1221,10 @@ fn stream_get_more(
     let want = batch_size.unwrap_or(0).max(0) as usize;
     let batch = match stream.next_batch(storage.as_ref(), want, MAX_GETMORE_BATCH_BYTES) {
         Ok(b) => b,
-        Err(mut e) => {
-            // A read that failed ends the cursor, as on mongod, which names
-            // the `getMore` rather than the command that opened the cursor
-            // (measured 8.2.11, 2026-10-24).
+        Err(e) => {
+            // A read that failed ends the cursor, as on mongod.
             cursors.return_stream(cursor_id, stream, true);
-            if let Some((_, cause)) = e
-                .errmsg
-                .strip_prefix("Executor error during ")
-                .and_then(|m| m.split_once(" :: caused by :: "))
-            {
-                e.errmsg = format!("Executor error during getMore :: caused by :: {cause}");
-            }
-            return Err(e);
+            return Err(get_more_error(e));
         }
     };
     let open = !batch.exhausted;
@@ -1231,6 +1249,84 @@ fn stream_get_more(
         },
         "ok": 1.0,
     })
+}
+
+/// An executor's error met by a `getMore`, which mongod names rather than
+/// the command that opened the cursor (measured 8.2.11, 2026-10-24).
+fn get_more_error(mut e: CommandError) -> CommandError {
+    if let Some((_, cause)) = e
+        .errmsg
+        .strip_prefix("Executor error during ")
+        .and_then(|m| m.split_once(" :: caused by :: "))
+    {
+        e.errmsg = format!("Executor error during getMore :: caused by :: {cause}");
+    }
+    e
+}
+
+/// The first `getMore` of an `aggregate` asked for a first batch of none,
+/// which mongod runs nothing of until now (measured 8.2.11, 2026-10-25):
+/// the pipeline runs here, its first batch is this `getMore`'s, and what it
+/// leaves reads on under the id the client holds.
+fn deferred_get_more(
+    cursor_id: i64,
+    batch_size: Option<i64>,
+    ns: &str,
+    command: Document,
+    stream: Box<dyn StreamCursor>,
+    cursors: &CursorRegistry,
+    ctx: &mut CommandContext,
+) -> HandlerResult {
+    let mut run = command.clone();
+    let mut cursor = run.get_document("cursor").cloned().unwrap_or_default();
+    // A `getMore` with no batch size takes what fits.
+    let size = batch_size.filter(|n| *n > 0).unwrap_or(i64::MAX);
+    cursor.insert("batchSize", Bson::Int64(size));
+    run.insert("cursor", cursor);
+    let reply = match crate::aggregate::aggregate(&run, ctx) {
+        Ok(reply) if reply.get_f64("ok") != Ok(0.0) => reply,
+        Ok(reply) => {
+            cursors.return_stream(cursor_id, stream, true);
+            return Ok(reply);
+        }
+        Err(e) => {
+            cursors.return_stream(cursor_id, stream, true);
+            return Err(get_more_error(e));
+        }
+    };
+    let opened = reply
+        .get_document("cursor")
+        .ok()
+        .and_then(|c| c.get_i64("id").ok())
+        .unwrap_or(0);
+    if opened == 0 {
+        cursors.return_stream(cursor_id, stream, true);
+    } else if !cursors.adopt(opened, cursor_id) {
+        // Killed while its pipeline ran.
+        cursors.return_stream(cursor_id, stream, true);
+        return Ok(cursor_not_found(cursor_id));
+    }
+    ctx.exec_stats = Some(crate::ExecStats {
+        keys_examined: 0,
+        docs_examined: 0,
+        cursor_id,
+        exhausted: opened == 0,
+        plan_summary: None,
+        originating_command: Some(command),
+    });
+    let id = Bson::Int64(if opened == 0 { 0 } else { cursor_id });
+    // A batch the pipeline streamed rides beside the reply.
+    if let Some(pending) = ctx.pending_batch.as_mut() {
+        pending.batch_field = "nextBatch";
+        return Ok(doc! { "cursor": { "id": id, "ns": ns }, "ok": 1.0 });
+    }
+    let batch = reply
+        .get_document("cursor")
+        .ok()
+        .and_then(|c| c.get_array("firstBatch").ok())
+        .cloned()
+        .unwrap_or_default();
+    Ok(doc! { "cursor": { "nextBatch": batch, "id": id, "ns": ns }, "ok": 1.0 })
 }
 
 /// `killCursors` — explicitly close cursors.

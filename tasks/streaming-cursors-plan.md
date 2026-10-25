@@ -91,10 +91,22 @@ connection thread; no WT cursor may outlive its call):
      ahead of a `$project` / `$unset` that keeps its fields and ahead of a
      `$sort` (RM-307), which is what makes `[$project, $match]` a
      whole-pipeline read.
+   - Done (2026-10-25, branch `rust-mdb-stream4`): `$unionWith` passes the
+     collection's documents on, then opens its own collection when the
+     cursor reaches it and reads it through a cursor stage of its own
+     (`Feed::Union`; a view, collated or time-series target is read whole
+     at that point). A `$group` mongod answers from a DISTINCT_SCAN
+     (`$groupByDistinctScan`) streams over the scan (`IndexScan::distinct`),
+     its groups in the scan's order, after `explain`'s rule was corrected
+     (RM-309: all `$first` or all `$last`, `$last` flips the scan, the
+     covering index with the fewest fields). A first batch of none runs
+     nothing: the cursor holds the command and its first `getMore` runs
+     it (`agg_stream::Deferred`, `cursors::deferred_get_more`). A batch
+     that fills exactly leaves a cursor-stage cursor open, as on mongod.
    - Left: a collation, a view, a time-series collection, `$meta`,
-     `$geoNear`, `notablescan`, `$group` on `_id` (mongod drops it),
-     `$unionWith`, a first batch of none (mongod runs nothing until the
-     `getMore`); `keysExamined` / `docsExamined` on the `aggregate`
+     `$geoNear`, `notablescan`; a DISTINCT_SCAN `$group` down a descending
+     or along a collated index, or through a view (RM-309); `keysExamined`
+     / `docsExamined` on the `aggregate`
      command's own line; counts for `count`, `distinct`, write statements
      and `findAndModify` from their reads.
 4. **`storage` on the line.** WiredTiger's per-session statistics
