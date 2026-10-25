@@ -540,10 +540,16 @@ one beside it.
     `min_righthand`), and `reduce_outer_joins` runs top down over the tree
     (three tables when bushy, four to eight in any shape). Bushy trees of
     three to five tables: 21 of 24 probes at 20 and 300 rows (none
-    before); RIGHT joins 27 of 33. What is left is a LEFT join whose
-    nullable side holds another LEFT join -- `make_outerjoininfo` widens
-    its sides by the lower join's, which is not modelled, so the search
-    declines it -- and FULL joins. Not yet: two classes spanning both sides (two join keys); an
+    before); RIGHT joins 27 of 33. A LEFT join whose nullable side holds
+    another LEFT join is searched too (2026-10-25): `make_outerjoininfo`
+    widens its `min_lefthand` / `min_righthand` by the lower outer join's
+    when the clause reads its nullable side, and a LEFT join's ON makes
+    the tables it reads non-null inside its nullable side
+    (`reduce_outer_joins`): 18 of 20 nested shapes of three and four
+    tables at 20 and 300 rows, the two left a class with a LEFT join
+    (below). What is left of the join tree is FULL joins,
+    which the search declines (a Merge or Hash Full Join, and the rows
+    nothing matched). Not yet: two classes spanning both sides (two join keys); an
     expression in a class; a LEFT join's class through the general path;
     a class of text or other non-integer keys, or with a LEFT join; three
     tables with a WHERE over two of them or a LIMIT; four or more tables
@@ -553,7 +559,7 @@ one beside it.
     than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_left_join_whose_nullable_side_holds_a_left_join_is_searched
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_full_join_is_planned
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

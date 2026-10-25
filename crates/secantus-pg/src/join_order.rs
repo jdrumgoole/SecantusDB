@@ -381,8 +381,10 @@ impl PgHandler {
         }
         // `reduce_outer_joins`, top down: an inner join's strict clause
         // makes the tables it reads non-null on both sides below it, a LEFT
-        // join passes what is non-null above it to its left side only, and
-        // a LEFT join whose nullable side holds such a table is inner.
+        // join passes what is non-null above it to its left side and its
+        // own clause's tables to its right side (a NULL-extended row of
+        // the right side never passes the ON), and a LEFT join whose
+        // nullable side holds such a table is inner.
         fn reduce(
             i: usize,
             upper: u8,
@@ -398,7 +400,7 @@ impl PgHandler {
             let (to_left, to_right) = if kinds[i] == JoinKind::Inner {
                 (upper | local, upper | local)
             } else {
-                (upper, 0)
+                (upper, local)
             };
             if let Some(l) = w.left_join {
                 reduce(l, to_left, joins, edges, kinds);
