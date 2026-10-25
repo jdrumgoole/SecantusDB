@@ -2302,6 +2302,8 @@ pub enum AlterTableAction {
         /// The INCLUDE columns of that index, which the key's index keeps
         /// (`indkey` lists them after the key columns).
         include: Vec<String>,
+        /// Its index's storage parameters (`... PRIMARY KEY (a) WITH (...)`).
+        reloptions: Vec<String>,
     },
     /// `ADD [CONSTRAINT n] FOREIGN KEY ...`: checked against the rows already
     /// there, then enforced on every write. `named` when the statement gave
@@ -7390,6 +7392,7 @@ fn plan_alter_action(
                     uq.deferrable = k.deferrable;
                     uq.initially_deferred = k.initdeferred;
                     uq.nulls_not_distinct = k.nulls_not_distinct;
+                    uq.reloptions = index_reloptions("btree", &k.options)?;
                     return Ok(AlterTableAction::AddUnique(uq));
                 }
                 Ok(CT::ConstrPrimary) => {
@@ -7407,6 +7410,7 @@ fn plan_alter_action(
                         columns: string_list(&k.keys),
                         using_index,
                         include: string_list(&k.including),
+                        reloptions: index_reloptions("btree", &k.options)?,
                     });
                 }
                 Ok(CT::ConstrForeign) => {
@@ -8307,8 +8311,14 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             columns,
             name,
             include,
+            reloptions,
             ..
         } => {
+            if reloptions.is_empty() {
+                def.extra.remove("pk_reloptions");
+            } else {
+                def.extra.insert("pk_reloptions", reloptions.clone());
+            }
             // A name the statement gave is the constraint's (and its
             // index's), as `CONSTRAINT x PRIMARY KEY` in CREATE TABLE is.
             if *name != format!("{}_pkey", def.name) {
@@ -10353,6 +10363,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     let mut table_pk: Vec<String> = Vec::new();
     // `CONSTRAINT name PRIMARY KEY`: the key's name, when it was given one.
     let mut pk_name: Option<String> = None;
+    let mut pk_reloptions: Vec<String> = Vec::new();
     for el in &c.table_elts {
         match el.node.as_ref() {
             Some(N::ColumnDef(cd)) => {
@@ -10431,6 +10442,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                             if !k.conname.is_empty() {
                                 pk_name = Some(k.conname.clone());
                             }
+                            pk_reloptions = index_reloptions("btree", &k.options)?;
                         }
                         Ok(CT::ConstrNotnull) => column.nullable = false,
                         Ok(CT::ConstrNull) => column.nullable = !pk,
@@ -10514,6 +10526,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                             };
                             let mut uq = UniqueConstraint::new(&name, vec![cd.colname.clone()]);
                             uq.nulls_not_distinct = k.nulls_not_distinct;
+                            uq.reloptions = index_reloptions("btree", &k.options)?;
                             uniques.push(uq);
                             last_deferrable = Some(DeferTarget::Unique);
                         }
@@ -10596,6 +10609,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                     uq.deferrable = k.deferrable;
                     uq.initially_deferred = k.initdeferred;
                     uq.nulls_not_distinct = k.nulls_not_distinct;
+                    uq.reloptions = index_reloptions("btree", &k.options)?;
                     uniques.push(uq);
                 }
                 Ok(CT::ConstrPrimary) => {
@@ -10603,6 +10617,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                     if !k.conname.is_empty() {
                         pk_name = Some(k.conname.clone());
                     }
+                    pk_reloptions = index_reloptions("btree", &k.options)?;
                 }
                 // `EXCLUDE [USING m] (col WITH op, ...)`: each exclusion is a
                 // `[IndexElem, [op]]` pair. An all-`=` one is a UNIQUE (the
@@ -10656,6 +10671,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                     } else {
                         k.access_method.clone()
                     };
+                    uq.reloptions = index_reloptions(&method, &k.options)?;
                     if ops.iter().any(|o| o != "=") || method != "btree" {
                         uq.exclusion_ops = ops;
                         uq.exclusion_method = Some(method);
@@ -10698,6 +10714,9 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     let mut def = TableDef::new(&table, columns);
     if let Some(name) = pk_name {
         def.extra.insert("pk_name", name);
+    }
+    if !pk_reloptions.is_empty() {
+        def.extra.insert("pk_reloptions", pk_reloptions);
     }
     // A table-level PRIMARY KEY keeps its declared column order for the
     // catalog (`conkey`, `indkey`, `pg_get_constraintdef`), as the Python

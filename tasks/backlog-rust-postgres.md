@@ -762,17 +762,9 @@ cluster. Fixed in the same batch, their tests regression tests:
   out-of-bounds or enum value's error had no DETAIL.
 - RP-264: a missing relation in `ALTER TABLE`, `INDEX`, `VIEW`, `SEQUENCE`
   or `MATERIALIZED VIEW` was reported with a position.
-
-- [ ] **A constraint's index loses its storage parameters.** `PRIMARY KEY
-      WITH (fillfactor = 60)` and `UNIQUE (b) WITH (fillfactor = 70)` are
-      accepted, but `pg_class.reloptions` is NULL for the constraints'
-      indexes and `pg_get_indexdef` prints no `WITH`. `ALTER INDEX t_pkey
-      SET (...)` is refused with 0A000. PostgreSQL 15.19 keeps and prints
-      them as it does for any index. A constraint's index is described by
-      the table's catalog entry rather than by a storage index of its own,
-      so its options would be kept with the constraint.
-      Backlog-ID: RP-265
-      Verify: tests/backlog/test_rp_batch77.py::test_scenario[a constraint's index keeps its storage parameters]
+- RP-265 (batch 78): a constraint's index (`PRIMARY KEY` / `UNIQUE ...
+  WITH (...)`, `ADD PRIMARY KEY USING INDEX`) lost its storage parameters,
+  and `ALTER INDEX` on one was refused.
 
 ## Found by batch 75 (2026-10-25)
 

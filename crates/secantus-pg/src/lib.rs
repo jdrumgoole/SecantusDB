@@ -11746,9 +11746,19 @@ impl PgHandler {
                 .get_array("sqlReloptions")
                 .ok()
         })?;
-        let parts: Vec<String> = options
+        let options: Vec<String> = options
             .iter()
             .filter_map(Bson::as_str)
+            .map(str::to_string)
+            .collect();
+        Self::with_clause(&options)
+    }
+
+    /// `name=value` options as `pg_get_indexdef`'s ` WITH (...)`: a value
+    /// is bare when `quote_identifier` would leave it so, else a literal.
+    fn with_clause(options: &[String]) -> Option<String> {
+        let parts: Vec<String> = options
+            .iter()
             .map(|o| {
                 let (name, value) = o.split_once('=').unwrap_or((o, ""));
                 let quoted = secantus_pgplan::scalar::quote_identifier(value);
@@ -11764,6 +11774,31 @@ impl PgHandler {
             })
             .collect();
         (!parts.is_empty()).then(|| format!(" WITH ({})", parts.join(", ")))
+    }
+
+    /// The storage parameters of a constraint's index: the primary key's,
+    /// or a UNIQUE / EXCLUDE constraint's. `None` for any other index.
+    fn constraint_index_reloptions(
+        def: &TableDef,
+        index: &str,
+        primary: bool,
+    ) -> Option<Vec<String>> {
+        if primary {
+            return Some(
+                def.extra
+                    .get_array("pk_reloptions")
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            );
+        }
+        def.unique_constraints
+            .iter()
+            .find(|u| u.name == index)
+            .map(|u| u.reloptions.clone())
     }
 
     /// An index's `pg_class.reloptions`, NULL when it has none.
@@ -19828,8 +19863,22 @@ impl PgHandler {
                     d.insert(f("relforcerowsecurity"), false);
                     d.insert(f("relispartition"), false);
                     d.insert(f("relpartbound"), Bson::Null);
-                    // `WITH (...)` / `ALTER INDEX ... SET (...)`'s options.
-                    if let Some(field) = def.field_of("reloptions") {
+                    // `WITH (...)` / `ALTER INDEX ... SET (...)`'s options: a
+                    // constraint's index keeps them with the constraint.
+                    let constraint_options =
+                        Self::constraint_index_reloptions(&ix.table, &ix.name, ix.primary);
+                    if let (Some(field), Some(options)) =
+                        (def.field_of("reloptions"), constraint_options)
+                    {
+                        d.insert(
+                            field,
+                            if options.is_empty() {
+                                Bson::Null
+                            } else {
+                                Bson::Array(options.into_iter().map(Bson::String).collect())
+                            },
+                        );
+                    } else if let Some(field) = def.field_of("reloptions") {
                         let stored =
                             stored_indexes
                                 .entry(ix.table.name.clone())
@@ -20201,6 +20250,11 @@ impl PgHandler {
                             if !include.is_empty() {
                                 def.push_str(&format!(" INCLUDE ({})", include.join(", ")));
                             }
+                            if let Some(with) = Self::constraint_index_reloptions(&t, "", true)
+                                .and_then(|o| Self::with_clause(&o))
+                            {
+                                def.push_str(&with);
+                            }
                             def
                         });
                         rows.push(d);
@@ -20226,7 +20280,7 @@ impl PgHandler {
                         d.insert(
                             f("indexdef"),
                             format!(
-                                "CREATE UNIQUE INDEX {} ON {schema}.{} USING btree ({}){}",
+                                "CREATE UNIQUE INDEX {} ON {schema}.{} USING btree ({}){}{}",
                                 u.name,
                                 t.name,
                                 u.columns.join(", "),
@@ -20234,7 +20288,8 @@ impl PgHandler {
                                     " NULLS NOT DISTINCT"
                                 } else {
                                     ""
-                                }
+                                },
+                                Self::with_clause(&u.reloptions).unwrap_or_default()
                             ),
                         );
                         rows.push(d);
@@ -26918,11 +26973,25 @@ impl PgHandler {
                 }
                 if let Some(ix) = using_index {
                     let (columns, include) = self.unique_index_columns(table, def, ix)?;
+                    // The key takes the index over, its storage parameters
+                    // with it.
+                    let reloptions = self
+                        .storage
+                        .list_indexes(self.db(), table)
+                        .unwrap_or_default()
+                        .iter()
+                        .find(|d| d.get_str("name") == Ok(ix.as_str()))
+                        .and_then(|d| d.get_array("sqlReloptions").ok().cloned())
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect();
                     return Ok(Some(A::AddPrimaryKey {
                         name: name.clone(),
                         columns,
                         using_index: Some(ix.clone()),
                         include,
+                        reloptions,
                     }));
                 }
                 for c in columns {
