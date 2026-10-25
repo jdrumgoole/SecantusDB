@@ -137,22 +137,31 @@ def test_unique_insert_in_a_function_waits(rust_pg: Any) -> None:
 
 
 @pytest.mark.backlog_fixed("RP-256")
-def test_million_row_transaction(rust_pg: Any) -> None:
+def test_large_transaction(tmp_path: Path) -> None:
     """PostgreSQL 15.19 inserts a million rows in one transaction, as
-    `multiple-row-versions`'s setup does. The rest of that setup is out of
-    scope (see the module docstring)."""
-    with rust_pg.connect() as conn:
+    `multiple-row-versions`'s setup does; this server, a cache-sized share
+    of them (RP-256's scope decision). Measured on a 1G cache, a quarter of
+    the 4G the server runs with, so the test's own server stays near 1 GB
+    (the 4G one peaked at 4.9 GB, too much beside a CI runner's other
+    workers): 250,000 rows commit with the raised eviction triggers, and
+    with WiredTiger's defaults (20% dirty, 10% updates) 200,000 already
+    roll back."""
+    from tests.test_rust_pgserver_slice import _Server
+
+    with (
+        _Server(tmp_path, env={"SECANTUS_WT_CONFIG_EXTRA": "cache_size=1G"}) as server,
+        server.connect() as conn,
+    ):
         got = [
             conn.execute(sql).statusmessage
             for sql in (
                 "BEGIN",
                 "CREATE TABLE big (id int NOT NULL, txt text) WITH (fillfactor=50)",
-                "INSERT INTO big (id) SELECT x FROM generate_series(1, 1000000) x",
+                "INSERT INTO big (id) SELECT x FROM generate_series(1, 250000) x",
                 "COMMIT",
-                "DROP TABLE big",
             )
         ]
-    assert got == ["BEGIN", "CREATE TABLE", "INSERT 0 1000000", "COMMIT", "DROP TABLE"]
+    assert got == ["BEGIN", "CREATE TABLE", "INSERT 0 250000", "COMMIT"]
 
 
 @pytest.mark.backlog_fixed("RP-257")

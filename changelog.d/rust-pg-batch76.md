@@ -31,7 +31,7 @@ INSERT now commits.
 - `secantus-pg`: WiredTiger's eviction triggers are raised to 50% for the PG
   server, so one transaction holds about 1,000,000 small rows at the 4G
   cache instead of 500,000. Fixes RP-256
-  (`tests/backlog/test_rp_isolation.py::test_million_row_transaction`). The
+  (`tests/backlog/test_rp_isolation.py::test_large_transaction`). The
   remaining limit is a scope decision (Joe, 2026-10-25).
 - `secantus-storage` (shared with the MongoDB server):
   `without_commit_count` runs writes that no snapshot reads without counting
