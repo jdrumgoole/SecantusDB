@@ -419,6 +419,33 @@ pub struct TransactionRegistry {
     /// Started, committed, aborted, and the microseconds the ended ones ran:
     /// `serverStatus.transactions` and `opLatencies.transactions`.
     counts: [std::sync::atomic::AtomicI64; 4],
+    /// The sessions a command has checked out, and the thread running it:
+    /// mongod runs one command with a `txnNumber` on a session at a time, and
+    /// the next waits for it to check the session back in.
+    checked_out: Mutex<HashMap<Vec<u8>, std::thread::ThreadId>>,
+    checked_in: std::sync::Condvar,
+}
+
+/// A session checked out by [`TransactionRegistry::check_out`]; dropping it
+/// checks the session back in and wakes the commands waiting for it.
+pub struct SessionCheckout {
+    registry: Arc<TransactionRegistry>,
+    /// `None` when this thread already held the session (a nested dispatch).
+    lsid: Option<Vec<u8>>,
+}
+
+impl Drop for SessionCheckout {
+    fn drop(&mut self) {
+        if let Some(lsid) = self.lsid.take() {
+            let mut held = self
+                .registry
+                .checked_out
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            held.remove(&lsid);
+            self.registry.checked_in.notify_all();
+        }
+    }
 }
 
 /// `serverStatus.transactions`' counts, measured as mongod 8.2.11 keeps them:
@@ -453,6 +480,48 @@ impl TransactionRegistry {
             lifetime: std::sync::atomic::AtomicU64::new(lifetime_seconds.to_bits()),
             clock,
             counts: Default::default(),
+            checked_out: Mutex::new(HashMap::new()),
+            checked_in: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Check the session out for one command, waiting while another command
+    /// has it (mongod 8.2.11: a retryable write retried while its first
+    /// attempt runs waits, then is answered from the first's result).
+    /// `interrupted` is asked every 100 ms; `None` means it said yes.
+    pub fn check_out(
+        self: &Arc<Self>,
+        lsid: &[u8],
+        interrupted: impl Fn() -> bool,
+    ) -> Option<SessionCheckout> {
+        let me = std::thread::current().id();
+        let mut held = self.checked_out.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            match held.get(lsid) {
+                None => {
+                    held.insert(lsid.to_vec(), me);
+                    return Some(SessionCheckout {
+                        registry: Arc::clone(self),
+                        lsid: Some(lsid.to_vec()),
+                    });
+                }
+                Some(holder) if *holder == me => {
+                    return Some(SessionCheckout {
+                        registry: Arc::clone(self),
+                        lsid: None,
+                    });
+                }
+                Some(_) => {
+                    if interrupted() {
+                        return None;
+                    }
+                    held = self
+                        .checked_in
+                        .wait_timeout(held, std::time::Duration::from_millis(100))
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+                }
+            }
         }
     }
 
