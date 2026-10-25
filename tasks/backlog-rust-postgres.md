@@ -995,6 +995,15 @@ tests are regression tests.
       `initdb` leaves them) and for the database's own. The trees are
       PostgreSQL's `nodeToString` of its analysed query, which this server
       does not build.
+      Measured 2026-10-25: `initdb` leaves 142 system-view rules whose trees
+      are 2.85 MB of text (the largest, `information_schema.columns`, 177 KB),
+      embedding catalog oids, attribute numbers and source offsets.
+      **Decided (Joe, 2026-10-25): build `nodeToString`.** Emit
+      PostgreSQL's analysed `Query` tree for every rule, the system views'
+      and the database's own: range table entries, target lists, `Var` /
+      `OpExpr` / `FuncExpr` nodes with their oids, and source locations, as
+      `outfuncs.c` writes them. Neither baked `initdb` trees nor a scope
+      decision.
       Backlog-ID: RP-203
       Verify: tests/backlog/test_rp_batch51.py::test_scenario[a rule's node trees]
 
