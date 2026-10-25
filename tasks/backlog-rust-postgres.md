@@ -707,6 +707,27 @@ one beside it.
       Backlog-ID: RP-014
       Verify: none -- CI-runner timing flakes in psycopg's own suite on Linux
 
+- [ ] **OPEN — RUST pgserver on WINDOWS: a COPY between two connections
+      once failed 40001 (2026-10-25).** In the Windows psycopg gauge of
+      PR #2175 (run 40217508289, attempt 1), all three variants of
+      `tests/test_copy_async.py::test_copy_table_across` failed at once
+      with `SerializationFailure: could not serialize access due to
+      concurrent update`. The test creates a table with a serial primary
+      key and 20 random columns in each of two open transactions, then
+      copies one into the other. PostgreSQL never fails it, since the two
+      transactions write nothing in common. Every WiredTiger write conflict
+      reaches the client as this 40001 (`storage_err`), including a
+      transaction WiredTiger rolls back to relieve its cache. Batch 79's
+      run passed the test, and so did attempt 2 of the same commit (4846
+      passed). It did not reproduce locally on macOS: the test alone 90
+      times, under 60 seeds, with autovacuum waking every second, the whole
+      file under eight random orders, and a 4-thread stress of the same
+      pattern. The next step is the server's log from a failing Windows run:
+      since batch 81 the gauge keeps it
+      (`.validation/psycopg-raw-rust.server.log`, in the job's artifact).
+      Backlog-ID: RP-268
+      Verify: none -- not reproduced outside one Windows CI run; no test fails on demand
+
 ## Open from the 2026-09-30 batch
 
 - [ ] **Rust PG server: a SAVEPOINT captures whole tables, so its cost is

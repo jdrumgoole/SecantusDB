@@ -22,3 +22,10 @@ updates keeps the index the size PostgreSQL keeps it.
 RP-196 stays open for a read that returns one row, which is not priced, so
 a primary-key lookup marks nothing
 (`tests/backlog/test_rp_batch81.py::test_primary_key_lookups_mark_the_dead_versions`).
+
+#### Changed
+
+- The psycopg gauge keeps the server's output in
+  `.validation/psycopg-raw-<server>.server.log`, and the Windows job uploads
+  it with the raw report. It was discarded, and RP-268 (an intermittent
+  40001 seen once in that job) needs it.

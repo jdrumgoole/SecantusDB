@@ -223,5 +223,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: psycopg-raw-rust-windows
-          path: .validation/psycopg-raw-rust.json
+          # The server's output too (`runner.py`), for a failure that does
+          # not reproduce elsewhere (RP-268).
+          path: |
+            .validation/psycopg-raw-rust.json
+            .validation/psycopg-raw-rust.server.log
           if-no-files-found: warn
