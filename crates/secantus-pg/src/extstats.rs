@@ -321,7 +321,7 @@ impl PgHandler {
     /// The rows are `liverows / blocks read * blocks`. Every block is read
     /// while the heap has no more blocks than `targrows`, so then the
     /// count is exact; PostgreSQL's draws are random, and so are these.
-    fn acquire_sample_rows(
+    pub(crate) fn acquire_sample_rows(
         &self,
         table: &str,
         docs: &[Document],
@@ -423,42 +423,65 @@ impl PgHandler {
             // tree's, built as inherited statistics. A partitioned table has
             // no rows of its own: its statistics are its tree's.
             let partitioned = crate::partition::is_partitioned(def);
-            let mut variants: Vec<(Vec<Document>, bool, String)> =
-                vec![(docs.to_vec(), partitioned, name.clone())];
+            // ANALYZE's sample (`acquire_sample_rows`) of the table's own
+            // rows, with the rows it estimates the table holds.
+            let own = self.acquire_sample_rows(table, docs, 300 * target);
+            let mut variants: Vec<((Vec<Document>, f64), bool, String)> =
+                vec![(own, partitioned, name.clone())];
             let descendants = secantus_pgplan::inherit::descendants(table);
             if !partitioned && !descendants.is_empty() {
-                let mut all = docs.to_vec();
+                // `acquire_inherited_sample_rows`: each member of the tree
+                // sampled in proportion to its blocks, its rows estimated
+                // as its own sample's.
+                let mut members: Vec<(String, Vec<Document>)> =
+                    vec![(table.to_string(), docs.to_vec())];
                 for child in &descendants {
                     let Some(cdef) = self.lookup(child) else {
                         continue;
                     };
+                    let mut rows = Vec::new();
                     for row in self.table_docs(child)? {
-                        // The child's values under the parent's fields.
+                        // The child's values under the parent's fields, and
+                        // its place in the child's heap.
                         let mut mapped = Document::new();
                         for c in &def.columns {
                             if let Some(v) = cdef.field_of(&c.name).and_then(|f| row.get(&f)) {
                                 mapped.insert(c.field(), v.clone());
                             }
                         }
-                        all.push(mapped);
+                        if let Some(ctid) = row.get("__sys_ctid") {
+                            mapped.insert("__sys_ctid", ctid.clone());
+                        }
+                        rows.push(mapped);
                     }
+                    members.push((child.clone(), rows));
                 }
-                variants.push((all, true, format!("{name}\u{1}inh")));
-            }
-            for (rows, inherited, key) in variants {
-                // The table's own rows are ANALYZE's sample of them
-                // (`acquire_sample_rows`); a tree past the sample is not
-                // measured, as `acquire_inherited_sample_rows` samples each
-                // child in proportion.
-                let (rows, totalrows) = if inherited && !partitioned {
-                    if rows.len() > 300 * target {
+                let blocks: Vec<f64> = members
+                    .iter()
+                    .map(|(t, rows)| self.heap_blocks(t).map_or(rows.len() as f64, f64::from))
+                    .collect();
+                let totalblocks: f64 = blocks.iter().sum();
+                let mut all = Vec::new();
+                let mut totalrows = 0.0;
+                for ((t, rows), b) in members.iter().zip(&blocks) {
+                    if rows.is_empty() {
                         continue;
                     }
-                    let n = rows.len() as f64;
-                    (rows, n)
-                } else {
-                    self.acquire_sample_rows(table, &rows, 300 * target)
-                };
+                    // `rint(targrows * childblocks / totalblocks)`, at
+                    // least one row and at most the whole sample.
+                    let targ = if totalblocks > 0.0 {
+                        ((300.0 * target as f64 * b / totalblocks).round_ties_even() as usize)
+                            .clamp(1, 300 * target)
+                    } else {
+                        300 * target
+                    };
+                    let (sample, rowsest) = self.acquire_sample_rows(t, rows, targ);
+                    all.extend(sample);
+                    totalrows += rowsest;
+                }
+                variants.push(((all, totalrows), true, format!("{name}\u{1}inh")));
+            }
+            for ((rows, totalrows), inherited, key) in variants {
                 let docs: &[Document] = &rows;
                 let numrows = docs.len();
                 if numrows == 0 {
@@ -498,7 +521,7 @@ impl PgHandler {
                     if kinds.iter().any(|k| k == "e") {
                         let col = secantus_pgcatalog::Column::new("expr", &ty, false);
                         let refs: Vec<Option<&Bson>> = values.iter().map(Option::as_ref).collect();
-                        let mut entry = Self::stats_entry(&col, &refs, target, true);
+                        let mut entry = Self::stats_entry(&col, &refs, target, true, totalrows);
                         entry.insert("type", &ty);
                         entry.insert("inherited", inherited);
                         expr_entries.push(Bson::Document(entry));

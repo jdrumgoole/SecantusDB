@@ -196,6 +196,9 @@ impl FsmPage {
 pub(crate) struct Fsm {
     pages: HashMap<u32, FsmPage>,
     nblocks: u32,
+    /// The pages read since the heap last took them (`fsm_readbuf`), each a
+    /// buffer access PostgreSQL counts against the relation (RP-239).
+    pub(crate) touched: Vec<u32>,
 }
 
 impl Fsm {
@@ -227,6 +230,7 @@ impl Fsm {
         let mut fsm = Fsm {
             pages: HashMap::new(),
             nblocks: d.get_i64("nblocks").unwrap_or(0).try_into().unwrap_or(0),
+            touched: Vec::new(),
         };
         for p in d.get_array("pages").map(|a| a.as_slice()).unwrap_or(&[]) {
             let bson::Bson::Document(p) = p else { continue };
@@ -305,6 +309,7 @@ impl Fsm {
             }
             self.nblocks = blkno + 1;
         }
+        self.touched.push(blkno);
         Some(self.pages.entry(blkno).or_insert_with(FsmPage::new))
     }
 

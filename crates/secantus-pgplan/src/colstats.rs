@@ -55,6 +55,67 @@ pub struct Slots {
 /// the remaining values at even steps, first and last included, when at
 /// least two distinct values remain.
 pub fn scalar_slots(values: &[Sampled], target: usize) -> Slots {
+    scalar_slots_of(values, target, None)
+}
+
+/// What `analyze_mcv_list` needs of a sample smaller than its table: the
+/// column's estimated distinct count (`stadistinct`), its null fraction,
+/// and the table's rows.
+#[derive(Debug, Clone, Copy)]
+pub struct Sample {
+    pub stadistinct: f64,
+    pub null_frac: f64,
+    pub totalrows: f64,
+}
+
+/// `analyze_mcv_list` (PostgreSQL 15.19's `analyze.c`): how many of the
+/// `counts` (most common first) stay most common values. The least common
+/// is dropped while it is not significantly more common than the values
+/// left out of the list would be: its count must pass the selectivity
+/// they would share plus two standard deviations of the hypergeometric
+/// sampling, plus a half for continuity.
+fn analyze_mcv_list(counts: &[usize], samplerows: f64, s: Sample) -> usize {
+    let mut num_mcv = counts.len();
+    if samplerows == s.totalrows || s.totalrows <= 1.0 {
+        return num_mcv;
+    }
+    let ndistinct_table = if s.stadistinct < 0.0 {
+        -s.stadistinct * s.totalrows
+    } else {
+        s.stadistinct
+    };
+    let mut sumcount: f64 = counts
+        .iter()
+        .take(num_mcv.saturating_sub(1))
+        .map(|&c| c as f64)
+        .sum();
+    while num_mcv > 0 {
+        let mut selec = (1.0 - sumcount / samplerows - s.null_frac).clamp(0.0, 1.0);
+        let otherdistinct = ndistinct_table - (num_mcv - 1) as f64;
+        if otherdistinct > 1.0 {
+            selec /= otherdistinct;
+        }
+        let (big_n, n) = (s.totalrows, samplerows);
+        let count = counts[num_mcv - 1] as f64;
+        let k = big_n * count / n;
+        let variance = n * k * (big_n - k) * (big_n - n) / (big_n * big_n * (big_n - 1.0));
+        let stddev = variance.sqrt();
+        if count > selec * samplerows + 2.0 * stddev + 0.5 {
+            break;
+        }
+        num_mcv -= 1;
+        if num_mcv == 0 {
+            break;
+        }
+        sumcount -= counts[num_mcv - 1] as f64;
+    }
+    num_mcv
+}
+
+/// `scalar_slots` over a sample smaller than its table (`sample`): the
+/// most common values are those `analyze_mcv_list` keeps, unless every
+/// distinct value was seen more than once and fits the list.
+pub fn scalar_slots_of(values: &[Sampled], target: usize, sample: Option<Sample>) -> Slots {
     let samplerows = values.len() as f64;
     let mut items: Vec<(&[u8], usize)> = values
         .iter()
@@ -97,6 +158,16 @@ pub fn scalar_slots(values: &[Sampled], target: usize) -> Slots {
         i = j;
     }
     slots.mcv_complete = nmultiple <= target;
+    // `compute_scalar_stats`: every value kept when all were seen twice or
+    // more and fit; otherwise those `analyze_mcv_list` keeps.
+    if let Some(sample) = sample {
+        let keep_all =
+            track.len() == ndistinct && sample.stadistinct > 0.0 && track.len() <= target;
+        if !keep_all {
+            let counts: Vec<usize> = track.iter().map(|t| t.0).collect();
+            track.truncate(analyze_mcv_list(&counts, samplerows, sample));
+        }
+    }
     slots.mcv = track
         .iter()
         .map(|&(count, first)| (items[first].0.to_vec(), (count as f64 / samplerows) as f32))

@@ -15064,9 +15064,11 @@ impl PgHandler {
         let Some(pages) = self.measured_pages(table, &def) else {
             return self.record_relstats(table, true);
         };
-        if docs.len() as u64 > 300 * target {
-            return self.record_relstats(table, true);
-        }
+        // ANALYZE's sample of the table (`acquire_sample_rows`), and the
+        // rows it estimates the table holds: the whole table while it
+        // fits the sample.
+        let (sample, totalrows) = self.acquire_sample_rows(table, &docs, 300 * target as usize);
+        let docs = sample;
         let previous = self.relstats(table);
         let mut stats = previous
             .as_ref()
@@ -15080,7 +15082,7 @@ impl PgHandler {
                 }
                 let field = c.field();
                 let values: Vec<Option<&Bson>> = docs.iter().map(|d| d.get(&field)).collect();
-                let entry = Self::stats_entry(c, &values, target as usize, false);
+                let entry = Self::stats_entry(c, &values, target as usize, false, totalrows);
                 stats.insert(field, entry);
             }
         }
@@ -15089,12 +15091,12 @@ impl PgHandler {
             .is_some_and(|d| d.get_bool("statistics").unwrap_or(false));
         let mut doc = bson::doc! {
             "_id": table,
-            "reltuples": docs.len() as i64,
+            "reltuples": totalrows as i64,
             "relpages": pages as i64,
             "statistics": statistics,
             "columns": stats,
         };
-        if !self.carry_visibility(table, &def, previous.as_ref(), docs.len(), &mut doc) {
+        if !self.carry_visibility(table, &def, previous.as_ref(), totalrows as usize, &mut doc) {
             doc.insert("statistics", true);
         }
         self.put_comment_doc(Self::RELSTATS_COLLECTION, table, Some(doc))
@@ -15111,6 +15113,7 @@ impl PgHandler {
         values: &[Option<&Bson>],
         target: usize,
         computed: bool,
+        totalrows: f64,
     ) -> Document {
         use secantus_pgplan::hashagg;
         let typlen = secantus_pgplan::pgtypes::oid_of_name(&c.pg_type)
@@ -15128,11 +15131,18 @@ impl PgHandler {
         let mut entry = bson::doc! {"name": &c.name, "type": &c.pg_type};
         match values {
             Some(values) => {
-                let s = hashagg::analyze_column(&values, typlen);
+                let s = hashagg::analyze_column_of(&values, typlen, totalrows);
                 entry.insert("null_frac", f64::from(s.null_frac));
                 entry.insert("distinct", f64::from(s.distinct));
                 entry.insert("width", s.width);
-                let slots = secantus_pgplan::colstats::scalar_slots(&values, target);
+                let sample = (values.len() as f64 != totalrows).then_some(
+                    secantus_pgplan::colstats::Sample {
+                        stadistinct: f64::from(s.distinct),
+                        null_frac: f64::from(s.null_frac),
+                        totalrows,
+                    },
+                );
+                let slots = secantus_pgplan::colstats::scalar_slots_of(&values, target, sample);
                 let bin = |k: &[u8]| {
                     Bson::Binary(bson::Binary {
                         subtype: bson::spec::BinarySubtype::Generic,
@@ -35778,6 +35788,7 @@ impl PgHandler {
                 table,
                 if_not_exists,
                 temp,
+                unlogged,
                 column_names,
                 query,
                 with_data,
@@ -35834,6 +35845,9 @@ impl PgHandler {
                     .collect::<PgWireResult<Vec<_>>>()?;
                 let mut def = TableDef::new(&table, columns);
                 def.temp = temp;
+                if unlogged {
+                    def.extra.insert("unlogged", true);
+                }
                 if let Some(am) = &access_method {
                     def.extra.insert("access_method", am);
                 }
@@ -35871,7 +35885,10 @@ impl PgHandler {
                 }
                 let written = rows.len();
                 if written > 0 {
-                    self.execute(
+                    // Through a bulk insert that skips the free space map,
+                    // as `intorel_startup` writes (RP-239).
+                    self.bulk_insert(&table, Some(false));
+                    let filled = self.execute(
                         Statement::Insert(secantus_pgplan::Insert {
                             table: table.clone(),
                             view_checks: Vec::new(),
@@ -35887,7 +35904,9 @@ impl PgHandler {
                             source_targets: Vec::new(),
                         }),
                         max_rows,
-                    )?;
+                    );
+                    self.bulk_insert(&table, None);
+                    filled?;
                 }
                 // Recorded after the fill: the rows go in through the INSERT
                 // path, which refuses a materialized view.
@@ -38604,6 +38623,10 @@ impl PgHandler {
                     cols.iter().map(|c| list.contains(&c.name)).collect()
                 };
                 self.check_copy_freeze(&cf)?;
+                // `CopyFrom`'s bulk insert (RP-239), which keeps the free
+                // space map unless the table is new in this transaction.
+                let created_here = self.pending.tables().contains_key(&cf.table);
+                self.bulk_insert(&cf.table, Some(!created_here));
                 *self.copy_in.lock().unwrap_or_else(|e| e.into_inner()) = Some(CopyInState {
                     format: cf.format,
                     options: cf.options.clone(),
@@ -48657,6 +48680,7 @@ impl CopyHandler for PgHandler {
             self.note_failure();
             return Err(e);
         }
+        self.bulk_insert(&state.table, None);
         state.progress.end();
         let written = state.loaded;
 
@@ -49192,6 +49216,7 @@ impl PgHandler {
         let Some(mut state) = state else {
             return;
         };
+        self.bulk_insert(&state.table, None);
         state.progress.end();
         if let Some(mut handle) = state.handle.take() {
             if let Err(e) = self.storage.rollback_user_transaction(&mut handle) {

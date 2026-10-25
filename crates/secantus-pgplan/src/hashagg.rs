@@ -278,8 +278,14 @@ pub type Sampled = Option<(Vec<u8>, usize)>;
 /// repeats; above a tenth of the rows it is stored as a negative fraction,
 /// so that it scales with the table.
 pub fn analyze_column(values: &[Sampled], typlen: i64) -> ColumnStats {
+    analyze_column_of(values, typlen, values.len() as f64)
+}
+
+/// `analyze_column` over a sample of a table of `totalrows` rows: the
+/// distinct count is estimated for the table (Duj1's `N`), and scaled by
+/// it past a tenth of the table.
+pub fn analyze_column_of(values: &[Sampled], typlen: i64, totalrows: f64) -> ColumnStats {
     let samplerows = values.len() as f64;
-    let totalrows = samplerows;
     let mut counts: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::new();
     let mut null_cnt = 0usize;
     let mut total_width = 0f64;

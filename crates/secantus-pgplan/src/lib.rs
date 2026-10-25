@@ -1176,6 +1176,8 @@ pub enum Statement {
         table: String,
         if_not_exists: bool,
         temp: bool,
+        /// `CREATE UNLOGGED TABLE ... AS`, `SELECT ... INTO UNLOGGED`.
+        unlogged: bool,
         column_names: Vec<String>,
         query: Box<Statement>,
         /// `WITH NO DATA` creates the table empty and tags `CREATE TABLE AS`;
@@ -4987,6 +4989,21 @@ fn plan_node(
         N::AlterPublicationStmt(p) => catalog_stmts::plan_alter_publication(&p, lookup),
         N::CreateTableAsStmt(c) => plan_create_table_as(&c, lookup, params),
         N::InsertStmt(i) => plan_insert(&i, lookup, params),
+        // `SELECT ... INTO t` is `CREATE TABLE t AS SELECT ...`, as the
+        // grammar makes it (`is_select_into`), not a query returning rows.
+        N::SelectStmt(mut s) if s.into_clause.is_some() => {
+            let into = s.into_clause.take().map(|i| *i);
+            let c = pg_query::protobuf::CreateTableAsStmt {
+                query: Some(Box::new(pg_query::protobuf::Node {
+                    node: Some(N::SelectStmt(s)),
+                })),
+                into: into.map(Box::new),
+                objtype: pg_query::protobuf::ObjectType::ObjectTable as i32,
+                is_select_into: true,
+                if_not_exists: false,
+            };
+            plan_create_table_as(&c, lookup, params)
+        }
         N::SelectStmt(s) => plan_select(&s, lookup, params),
         N::DropStmt(d) => plan_drop(&d),
         N::CommentStmt(c) => plan_comment(&c),
@@ -6827,6 +6844,7 @@ fn plan_create_table_as(
         table: rel.relname.clone(),
         if_not_exists: c.if_not_exists,
         temp: rel.relpersistence == "t",
+        unlogged: rel.relpersistence == "u",
         column_names: string_list(&into.col_names),
         query: Box::new(query),
         with_data: !into.skip_data,

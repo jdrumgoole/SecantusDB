@@ -186,6 +186,21 @@ pub(crate) struct Heap {
     pub disordered: bool,
     /// Changed since it was last written to the store (RP-193).
     pub dirty: bool,
+    /// The buffers the writes since they were last taken read, in order
+    /// (RP-239): a heap block as itself, a free space map block `b` as
+    /// `-1 - b`, apart from the heap's in the buffer cache.
+    pub accessed: Vec<i64>,
+    /// Each backend's bulk-insert state (`BulkInsertState`), while a COPY
+    /// or a CREATE TABLE AS writes: the page it holds, and whether it
+    /// keeps the free space map (CREATE TABLE AS does not).
+    pub bulk: HashMap<i32, Bulk>,
+}
+
+/// A backend's `BulkInsertState`.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Bulk {
+    pub use_fsm: bool,
+    pub current: Option<u32>,
 }
 
 pub(crate) fn tid(block: u32, off: u16) -> i64 {
@@ -211,20 +226,47 @@ impl Heap {
     /// from backend `pid`, with the page `other` (an UPDATE's old one)
     /// already tried. Returns the new tuple's place.
     pub(crate) fn place(&mut self, pid: i32, len: u32, use_fsm: bool) -> (u32, u16) {
+        self.place_beside(pid, len, use_fsm, None)
+    }
+
+    /// `place`, with `pinned` (an UPDATE's old page) already held: reading
+    /// it again takes no buffer. Each page read is noted in `accessed`.
+    pub(crate) fn place_beside(
+        &mut self,
+        pid: i32,
+        len: u32,
+        use_fsm: bool,
+        pinned: Option<u32>,
+    ) -> (u32, u16) {
         let target_free = if len + self.reserve > NEARLY_EMPTY {
             len.max(NEARLY_EMPTY)
         } else {
             len + self.reserve
         };
+        // What a VACUUM read of the map was counted with it.
+        self.fsm.touched.clear();
+        let bulk = self.bulk.get(&pid).copied();
+        let use_fsm = use_fsm && bulk.is_none_or(|b| b.use_fsm);
         let nblocks = self.nblocks();
-        let mut target = self.targets.get(&pid).copied().filter(|b| *b < nblocks);
+        // A bulk insert goes on with the page it holds.
+        let mut target = bulk
+            .and_then(|b| b.current)
+            .or_else(|| self.targets.get(&pid).copied())
+            .filter(|b| *b < nblocks);
         if target.is_none() && use_fsm {
             target = self.fsm.get_page(target_free, nblocks);
+            self.take_fsm_reads();
         }
         if target.is_none() && nblocks > 0 {
             target = Some(nblocks - 1);
         }
         while let Some(b) = target {
+            // `ReadBufferBI`: the page held is not read again.
+            let held = pinned == Some(b) || bulk.and_then(|x| x.current) == Some(b);
+            if !held {
+                self.accessed.push(i64::from(b));
+            }
+            self.hold(pid, b);
             let page_free = self.pages[b as usize].heap_free();
             if target_free <= page_free {
                 self.targets.insert(pid, b);
@@ -235,12 +277,30 @@ impl Heap {
                 break;
             }
             target = self.fsm.record_and_get(b, page_free, target_free, nblocks);
+            self.take_fsm_reads();
         }
         self.pages.push(Page::new());
         let b = self.nblocks() - 1;
+        // The new page, read as it is added (`ReadBuffer(P_NEW)`).
+        self.accessed.push(i64::from(b));
+        self.hold(pid, b);
         self.targets.insert(pid, b);
         let off = self.pages[b as usize].add(len);
         (b, off)
+    }
+
+    /// The free space map's pages read, as buffer accesses.
+    fn take_fsm_reads(&mut self) {
+        for b in std::mem::take(&mut self.fsm.touched) {
+            self.accessed.push(-1 - i64::from(b));
+        }
+    }
+
+    /// A bulk insert now holds page `b`.
+    fn hold(&mut self, pid: i32, b: u32) {
+        if let Some(bulk) = self.bulk.get_mut(&pid) {
+            bulk.current = Some(b);
+        }
     }
 
     /// A new tuple of a transaction `xid`: placed, and remembered as being
@@ -342,13 +402,18 @@ impl Heap {
             return self.insert(pid, xid, len);
         };
         self.delete(tid(ob, ooff), old_len, xid, id);
+        // The old version fetched for the new one to be formed from
+        // (`table_tuple_fetch_row_version`), then its page read by
+        // `heap_update`.
+        self.accessed.push(i64::from(ob));
+        self.accessed.push(i64::from(ob));
         let same_page = len <= self.pages[ob as usize].heap_free();
         let (nb, noff) = if same_page {
             let off = self.pages[ob as usize].add(len);
             (ob, off)
         } else {
             self.pages[ob as usize].full = true;
-            self.place(pid, len, true)
+            self.place_beside(pid, len, true, Some(ob))
         };
         let ctid = tid(nb, noff);
         if same_page && hot {

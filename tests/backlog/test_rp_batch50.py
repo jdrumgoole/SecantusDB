@@ -248,11 +248,27 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
             "rollback",
         ],
     ),
+    "an inheritance tree past ANALYZE's sample has extended statistics": (
+        "RP-099",
+        False,
+        [
+            "begin",
+            "create table rp50_t (a int, b int)",
+            "create table rp50_tc () inherits (rp50_t)",
+            "insert into rp50_t select g % 4, g % 2 from generate_series(1, 20000) g",
+            "insert into rp50_tc select g % 4, g % 2 from generate_series(1, 20000) g",
+            "create statistics rp50_ts (ndistinct) on a, b from rp50_t",
+            "analyze rp50_t",
+            "select inherited, n_distinct::text from pg_stats_ext"
+            " where tablename = 'rp50_t' order by 1",
+            "rollback",
+        ],
+    ),
     # The sample is random, so its most common values' order (by their
     # sampled counts) is too: they are compared as a set.
     "a table past ANALYZE's sample has column statistics": (
         "RP-099",
-        True,
+        False,
         [
             "begin",
             "create table rp50_c (a int, b int)",
@@ -457,6 +473,17 @@ EXPECTED: dict[str, Any] = {
         "INSERT 0 31000",
         "ANALYZE",
         [("a", "0.0", "4.0", "{0,1,2,3}"), ("b", "0.0", "2.0", "{0,1}")],
+        "ROLLBACK",
+    ],
+    "an inheritance tree past ANALYZE's sample has extended statistics": [
+        "BEGIN",
+        "CREATE TABLE",
+        "CREATE TABLE",
+        "INSERT 0 20000",
+        "INSERT 0 20000",
+        "CREATE STATISTICS",
+        "ANALYZE",
+        [("False", '{"1, 2": 4}'), ("True", '{"1, 2": 4}')],
         "ROLLBACK",
     ],
     "an MCV list's bytes over numeric and dates": [
