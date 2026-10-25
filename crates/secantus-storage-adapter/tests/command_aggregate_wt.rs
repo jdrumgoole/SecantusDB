@@ -31,11 +31,11 @@ fn seed(c: &mut CommandContext, coll: &str, docs: Vec<Document>) {
     );
 }
 
-/// The cursor batch as decoded docs. A no-projection `find` hands its batch to
-/// the server as pre-encoded blobs via `ctx.pending_batch` (the raw-BSON reply
-/// fast path) rather than a `firstBatch` array in the reply document; aggregate
-/// and projected-find replies still carry `firstBatch` inline. Read whichever
-/// the handler produced.
+/// The cursor batch as decoded docs. A streamed read (a no-projection `find`,
+/// an `aggregate` whose pipeline streams) hands its batch to the server as
+/// pre-encoded blobs via `ctx.pending_batch` (the raw-BSON reply fast path)
+/// rather than a `firstBatch` array in the reply document; other replies
+/// still carry `firstBatch` inline. Read whichever the handler produced.
 fn batch_docs(reply: &Document, c: &CommandContext) -> Vec<Document> {
     match &c.pending_batch {
         Some(pb) => pb
@@ -111,9 +111,9 @@ fn aggregate_sort_then_limit() {
             &doc! {"aggregate": "c", "pipeline": [{"$sort": {"_id": -1}}, {"$limit": 2}], "cursor": {}},
             c,
         );
-        let ids: Vec<i32> = first_batch(&reply)
+        let ids: Vec<i32> = batch_docs(&reply, c)
             .iter()
-            .map(|b| b.as_document().unwrap().get_i32("_id").unwrap())
+            .map(|d| d.get_i32("_id").unwrap())
             .collect();
         assert_eq!(ids, vec![4, 3]);
     });
@@ -349,7 +349,7 @@ fn lookup_pipeline_form_with_let_binding() {
             ], "cursor": {}},
             c,
         );
-        let out = docs_of(&reply);
+        let out = batch_docs(&reply, c);
         let j = out[0].get_array("j").unwrap();
         assert_eq!(j.len(), 1);
         assert_eq!(j[0].as_document().unwrap().get_i32("n").unwrap(), 9);
@@ -732,7 +732,7 @@ fn redact_prunes_and_descends() {
             ], "cursor": {}},
             c,
         );
-        let out = docs_of(&r);
+        let out = batch_docs(&r, c);
         assert_eq!(out.len(), 1);
         // secret (level 5) pruned; public (level 1) kept; scalars retained.
         assert!(out[0].get("secret").is_none());
@@ -750,7 +750,7 @@ fn aggregate_batches_into_cursor() {
             c,
         );
         let cursor = reply.get_document("cursor").unwrap();
-        assert_eq!(cursor.get_array("firstBatch").unwrap().len(), 2);
+        assert_eq!(batch_docs(&reply, c).len(), 2);
         assert_ne!(cursor.get_i64("id").unwrap(), 0, "remaining ⇒ live cursor");
     });
 }

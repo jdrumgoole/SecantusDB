@@ -653,6 +653,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 // the read, when its filter is part of what is pushed down,
                 // and the stages between the markers.
                 let mut sbe_read = false;
+                let geonear_candidate_none = geonear_candidate.is_none();
                 let (filter, rest) = match geonear_candidate {
                     Some(cand) => (cand, pipeline),
                     None => {
@@ -699,6 +700,27 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                          https://dochub.mongodb.org/core/nearSphere-sort-operationfor more \
                          details.",
                     ));
+                }
+                // A pipeline whose stages pass documents on as they arrive
+                // reads on as `getMore` asks (RM-080), as mongod's does.
+                if c == asked && collation.is_none() && geonear_candidate_none {
+                    let ask = crate::agg_stream::Ask {
+                        db: &ctx.db_name,
+                        coll: c,
+                        ns: &ns,
+                        pipeline: &read_pipeline,
+                        hint,
+                        vars: &vars,
+                        batch_size,
+                        command: doc,
+                    };
+                    if let Some(opened) = crate::agg_stream::open(ctx, &ask)? {
+                        ctx.pending_batch = Some(crate::PendingBatch {
+                            batch_field: "firstBatch",
+                            batch: opened.batch,
+                        });
+                        return Ok(opened.reply);
+                    }
                 }
                 let lead = leading_sort(&rest, filter.is_empty());
                 let read = |sort: Option<&Document>, limit: i64| {
@@ -906,6 +928,22 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         },
         "ok": 1.0,
     })
+}
+
+/// `aggregate` run for its first batch inside another command: a streamed
+/// batch, which the reply would carry beside it, put back in the reply.
+pub(crate) fn aggregate_inline(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let mut reply = aggregate(doc, ctx)?;
+    if let Some(pending) = ctx.pending_batch.take() {
+        let batch: Vec<Bson> = decode_docs(pending.batch)?
+            .into_iter()
+            .map(Bson::Document)
+            .collect();
+        if let Ok(cursor) = reply.get_document_mut("cursor") {
+            cursor.insert(pending.batch_field, batch);
+        }
+    }
+    Ok(reply)
 }
 
 /// Stages handled at the command layer (they read/write storage or need a
@@ -1880,7 +1918,7 @@ fn stage_name(stage: &Bson) -> &str {
 /// is the Rust analogue of `commands.py`'s `_aggregate`, where every stage —
 /// storage-free or not — dispatches through the same `apply_pipeline`.
 #[allow(clippy::too_many_arguments)]
-fn run_segmented(
+pub(crate) fn run_segmented(
     input: Vec<Document>,
     pipeline: &[Bson],
     db: &str,
@@ -2167,10 +2205,10 @@ impl Drop for InSubPipeline {
 }
 
 /// While alive, the `aggregate` command on `ns` is running.
-struct InCommand(Option<String>);
+pub(crate) struct InCommand(Option<String>);
 
 impl InCommand {
-    fn enter(ns: &str) -> Self {
+    pub(crate) fn enter(ns: &str) -> Self {
         InCommand(COMMAND_NS.with(|n| n.borrow_mut().replace(ns.to_string())))
     }
 }

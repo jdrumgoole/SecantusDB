@@ -1020,12 +1020,174 @@ def _aggregate_sees_writes(client: Any) -> list:
     return [first] + [d["_id"] for d in cur]
 
 
-@pytest.mark.backlog("RM-080")
+@pytest.mark.backlog_fixed("RM-080")
 def test_aggregate_get_more_sees_writes_made_since_the_command(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """mongod 8.2.11 streams a `$match` pipeline as it streams a `find`."""
     assert _aggregate_sees_writes(rust_mongo) == _aggregate_sees_writes(mongod)
+
+
+# Pipelines by how mongod reads them: whole in the query, its stages pushed
+# into SBE with the read, or through its cursor stage's buffer.
+_STREAMED_PIPELINES = {
+    "project": [{"$project": {"x": 1}}],
+    "project_match": [{"$project": {"x": 1}}, {"$match": {"x": {"$gte": 0}}}],
+    "limit": [{"$limit": 1000}],
+    "sort_id": [{"$sort": {"_id": 1}}],
+    "lookup": [{"$lookup": {"from": "none", "localField": "x", "foreignField": "x", "as": "j"}}],
+    "addFields": [{"$addFields": {"y": {"$add": ["$x", 1]}}}],
+    "unwind": [{"$unwind": "$a"}],
+    "redact": [{"$redact": "$$KEEP"}],
+    "addFields_match": [{"$addFields": {"y": "$x"}}, {"$match": {"y": {"$gte": 0}}}],
+    "sort_unindexed": [{"$sort": {"x": 1}}],
+}
+
+
+def _pipelines_see_writes(client: Any) -> dict:
+    """Which writes made after the first document each pipeline's cursor
+    returns: deleting `_id` 3 and 199, changing `_id` 2, inserting 201."""
+    out = {}
+    for name, pipeline in _STREAMED_PIPELINES.items():
+        c = client["rm080"][_name()]
+        c.insert_many([{"_id": i, "x": i, "a": [i, -i]} for i in range(1, 201)])
+        cur = c.aggregate(pipeline, batchSize=1)
+        docs = [next(cur)]
+        c.delete_one({"_id": 3})
+        c.delete_one({"_id": 199})
+        c.update_one({"_id": 2}, {"$set": {"x": 1000}})
+        c.insert_one({"_id": 201, "x": 201, "a": [0]})
+        docs += list(cur)
+        ids = [d["_id"] for d in docs]
+        out[name] = [
+            3 not in ids,
+            199 not in ids,
+            any(d["_id"] == 2 and d.get("x") == 1000 for d in docs),
+            201 in ids,
+        ]
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-080")
+def test_aggregate_pipelines_read_on_as_mongod_reads_them(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 reads a pipeline its planner takes whole, or one whose
+    `$lookup` it pushes into SBE, batch by batch: every write shows. Other
+    stages read through a buffer filled ahead of them, so only writes past
+    it show; an unindexed `$sort` reads everything first."""
+    got, want = _pipelines_see_writes(rust_mongo), _pipelines_see_writes(mongod)
+    assert want["project_match"] == [True, True, True, True]
+    assert want["addFields"] == [False, True, False, True]
+    assert want["sort_unindexed"] == [False, False, False, False]
+    assert got == want
+
+
+def _buffered(client: Any, n: int, batch: int, more: int = 0, pad: int = 0) -> int:
+    """How many documents an `$addFields` pipeline returns from a collection
+    of `n` emptied after its first batch (and a `getMore` of `more`): what its
+    cursor stage had read by then."""
+    db = client["rm080"]
+    c = db[_name()]
+    c.insert_many([{"_id": i, "p": "x" * pad} for i in range(1, n + 1)])
+    reply = db.command(
+        "aggregate", c.name, pipeline=[{"$addFields": {"y": 1}}], cursor={"batchSize": batch}
+    )
+    got = len(reply["cursor"]["firstBatch"])
+    cursor = reply["cursor"]["id"]
+    if more:
+        reply = db.command("getMore", cursor, collection=c.name, batchSize=more)
+        got += len(reply["cursor"]["nextBatch"])
+        cursor = reply["cursor"]["id"]
+    c.delete_many({})
+    while cursor:
+        reply = db.command("getMore", cursor, collection=c.name)
+        got += len(reply["cursor"]["nextBatch"])
+        cursor = reply["cursor"]["id"]
+    return got
+
+
+def _buffers(client: Any) -> list:
+    return [
+        _buffered(client, 300, 1),
+        _buffered(client, 300, 0),
+        _buffered(client, 1000, 101),
+        _buffered(client, 300, 1, more=40),
+        _buffered(client, 40, 1, pad=200_000),
+    ]
+
+
+@pytest.mark.backlog_fixed("RM-080")
+def test_aggregate_cursor_stage_buffers_as_mongod_does(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11's cursor stage reads 32 documents, then twice as many at
+    each refill (32 + 64 + 128 for a first batch of 101), stopping at the
+    document that brings a buffer to 4 MB; `batchSize: 0` reads none."""
+    got, want = _buffers(rust_mongo), _buffers(mongod)
+    assert want == [32, 0, 224, 96, 21]
+    assert got == want
+
+
+def _aggregate_error_batch(client: Any) -> tuple:
+    """Where an error in the second document of a buffered pipeline lands."""
+    db = client["rm080"]
+    c = db[_name()]
+    c.insert_many([{"_id": i, "s": "bad" if i == 2 else str(i)} for i in range(1, 50)])
+    reply = db.command(
+        "aggregate",
+        c.name,
+        pipeline=[{"$addFields": {"n": {"$toInt": "$s"}}}],
+        cursor={"batchSize": 1},
+    )
+    first = [d["_id"] for d in reply["cursor"]["firstBatch"]]
+    more = mongo_answer(
+        lambda: db.command("getMore", reply["cursor"]["id"], collection=c.name, batchSize=2)
+    )
+    return first, code_of(more)
+
+
+@pytest.mark.backlog_fixed("RM-080")
+def test_aggregate_stages_run_as_the_cursor_is_read(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 runs a buffered document through the stages only when
+    the cursor reaches it: the error in the second is the `getMore`'s."""
+    got, want = _aggregate_error_batch(rust_mongo), _aggregate_error_batch(mongod)
+    assert want == ([1], ("err", 241))
+    assert got == want
+
+
+def _unstreamed_see_writes(client: Any) -> dict:
+    """The pipelines mongod reads on that this server does not yet: a
+    `$group` on `_id` (no group at all to mongod), a `$unionWith`, and any
+    pipeline asked for a first batch of none."""
+    out = {}
+    for name, pipeline, batch in (
+        ("group_id", [{"$group": {"_id": "$_id"}}], 1),
+        ("union_with", [{"$unionWith": "none"}], 1),
+        ("group_x_batch_0", [{"$group": {"_id": "$x"}}], 0),
+    ):
+        db = client["rm080"]
+        c = db[_name()]
+        c.insert_many([{"_id": i, "x": i} for i in range(1, 201)])
+        reply = db.command("aggregate", c.name, pipeline=pipeline, cursor={"batchSize": batch})
+        got = len(reply["cursor"]["firstBatch"])
+        cursor = reply["cursor"]["id"]
+        c.delete_many({})
+        while cursor:
+            reply = db.command("getMore", cursor, collection=c.name)
+            got += len(reply["cursor"]["nextBatch"])
+            cursor = reply["cursor"]["id"]
+        out[name] = got
+    return out
+
+
+@pytest.mark.backlog("RM-080")
+def test_aggregate_group_on_id_union_with_and_empty_first_batch_read_on(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """mongod 8.2.11 buffers a `$group` on `_id` and a `$unionWith`'s first
+    collection as it buffers any streaming stage, and runs nothing for a
+    first batch of none: emptied after the command, each returns what it
+    had read by then."""
+    got, want = _unstreamed_see_writes(rust_mongo), _unstreamed_see_writes(mongod)
+    assert want == {"group_id": 32, "union_with": 32, "group_x_batch_0": 0}
+    assert got == want
 
 
 def _id_sorted_sees_writes(client: Any) -> list:

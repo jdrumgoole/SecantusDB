@@ -1194,9 +1194,18 @@ fn stream_get_more(
     let want = batch_size.unwrap_or(0).max(0) as usize;
     let batch = match stream.next_batch(storage.as_ref(), want, MAX_GETMORE_BATCH_BYTES) {
         Ok(b) => b,
-        Err(e) => {
-            // A read that failed ends the cursor, as on mongod.
+        Err(mut e) => {
+            // A read that failed ends the cursor, as on mongod, which names
+            // the `getMore` rather than the command that opened the cursor
+            // (measured 8.2.11, 2026-10-24).
             cursors.return_stream(cursor_id, stream, true);
+            if let Some((_, cause)) = e
+                .errmsg
+                .strip_prefix("Executor error during ")
+                .and_then(|m| m.split_once(" :: caused by :: "))
+            {
+                e.errmsg = format!("Executor error during getMore :: caused by :: {cause}");
+            }
             return Err(e);
         }
     };

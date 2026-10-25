@@ -200,7 +200,7 @@ pub(crate) fn holds_executor(
         }
     }
     let Ok(reply) =
-        crate::explain::order::uncounted(|| crate::aggregate::aggregate(&count_cmd, ctx))
+        crate::explain::order::uncounted(|| crate::aggregate::aggregate_inline(&count_cmd, ctx))
     else {
         return true;
     };

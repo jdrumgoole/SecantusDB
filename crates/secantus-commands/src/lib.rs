@@ -37,6 +37,7 @@ pub use secantus_core::bsondoc;
 pub mod admin;
 mod agg_executor;
 mod agg_meta;
+mod agg_stream;
 pub mod aggregate;
 mod apply_ops;
 pub mod argtypes;
