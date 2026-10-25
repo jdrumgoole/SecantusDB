@@ -40668,6 +40668,10 @@ impl PgHandler {
                         .storage
                         .find_matching(self.db(), &upd.table, &upd.filter)
                         .map_err(|e| Self::storage_err("could not read", e))?;
+                    // In the order the UPDATE's scan reads them, which is the
+                    // order the new versions are placed, the triggers fire
+                    // and RETURNING lists them (RP-247).
+                    let raw = self.in_scan_order(&upd.table, &upd.filter, raw)?;
                     let mut writes = Vec::with_capacity(raw.len());
                     let mut new_rows = Vec::with_capacity(raw.len());
                     // Rows whose PRIMARY KEY changes: (old row, new row).
@@ -40824,6 +40828,33 @@ impl PgHandler {
                             &set,
                             &unset,
                         )?;
+                    }
+                    // RETURNING shows each row's new version: its system
+                    // columns (`ctid`, `xmin`, ...) as the write stamped
+                    // them (RP-248).
+                    if upd.returning.is_some() && !new_rows.is_empty() {
+                        let ids: Vec<Bson> = new_rows.iter().map(row_id).collect();
+                        let stored: Vec<Document> = self
+                            .storage
+                            .find_matching(
+                                self.db(),
+                                &upd.table,
+                                &bson::doc! { "_id": { "$in": ids } },
+                            )
+                            .map_err(|e| Self::storage_err("could not read", e))?
+                            .iter()
+                            .filter_map(|b| decode_doc(b).ok())
+                            .collect();
+                        for row in &mut new_rows {
+                            let id = row_id(row);
+                            if let Some(s) = stored.iter().find(|s| row_id(s) == id) {
+                                for f in ["__sys_xmin", "__sys_cid", "__sys_xmax", "__sys_ctid"] {
+                                    if let Some(v) = s.get(f) {
+                                        row.insert(f, v.clone());
+                                    }
+                                }
+                            }
+                        }
                     }
                     returned = new_rows;
                     matched
@@ -41162,10 +41193,15 @@ impl PgHandler {
         if !has_expr && !versioned {
             return self.update_rows_raw(table, filter, set, unset);
         }
-        let before: Vec<(Bson, Document)> = self
+        // In the order the UPDATE's scan reads them -- a sequential one in
+        // heap order, an index one in the index's -- which is the order
+        // their new versions are placed in (RP-247).
+        let found = self
             .storage
             .find_matching(self.db(), table, filter)
-            .map_err(|e| Self::storage_err("could not read", e))?
+            .map_err(|e| Self::storage_err("could not read", e))?;
+        let before: Vec<(Bson, Document)> = self
+            .in_scan_order(table, filter, found)?
             .iter()
             .filter_map(|raw| {
                 let d = decode_doc(raw).ok()?;

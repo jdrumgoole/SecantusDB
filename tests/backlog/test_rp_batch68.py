@@ -74,7 +74,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[Step]]] = {
     # ---------------------------------- RP-247 an UPDATE's rows' new places
     "an UPDATE after a row moved places rows as PostgreSQL does": (
         "RP-247",
-        True,
+        False,
         [
             _FULL,
             "update rp68_t set g = -g where g = 1",
