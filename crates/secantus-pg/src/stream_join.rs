@@ -858,7 +858,7 @@ impl PgHandler {
         {
             if self
                 .general_join_method(*kind, left, right, equi, expr_keys, ec.as_ref(), None)
-                .is_some_and(|(m, _, _, _)| {
+                .is_some_and(|(m, _, _, _, _)| {
                     !matches!(
                         m,
                         secantus_pgplan::joincost::JoinMethod::Other

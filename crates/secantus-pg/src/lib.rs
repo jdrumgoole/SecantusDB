@@ -8995,6 +8995,7 @@ impl PgHandler {
                 left,
                 right,
                 on,
+                on_other,
                 equi,
                 merged,
                 expr_keys,
@@ -9062,7 +9063,10 @@ impl PgHandler {
                 // swapped, so the loop below walks the outer side's rows; a
                 // hash right join keeps the (now right) rows nothing
                 // matched, as a RIGHT join does.
-                let order = if merged.is_empty() {
+                // A FULL join whose ON filters its merge or hash past the
+                // equality is not modelled.
+                let full_filtered = *kind == secantus_pgplan::joins::JoinKind::Full && *on_other;
+                let order = if merged.is_empty() && !full_filtered {
                     self.order_general_join_inputs(
                         *kind,
                         left,
@@ -9077,10 +9081,11 @@ impl PgHandler {
                 } else {
                     GeneralOrder::Keep
                 };
-                let (kind, swap) = match order {
+                let (kind, swap) = match &order {
                     GeneralOrder::Keep => (*kind, false),
                     GeneralOrder::Swap => (*kind, true),
                     GeneralOrder::SwapRight => (secantus_pgplan::joins::JoinKind::Right, true),
+                    GeneralOrder::MergeFull { swap, .. } => (*kind, *swap),
                 };
                 let swapped_equi: Vec<(String, String)>;
                 let (equi, left_keys, right_keys) = if swap {
@@ -9090,8 +9095,22 @@ impl PgHandler {
                 } else {
                     (equi, left_keys, right_keys)
                 };
+                // A merge full join's inner side's greatest key.
+                let inner_max = match &order {
+                    GeneralOrder::MergeFull { inner_key, .. } => rrows
+                        .iter()
+                        .filter_map(|r| r.get(inner_key).filter(|v| **v != Bson::Null))
+                        .max_by(|p, q| {
+                            secantus_pgplan::compare_values(p, q).unwrap_or(Ordering::Equal)
+                        })
+                        .cloned(),
+                    _ => None,
+                };
                 let mut lrows = Some(lrows);
                 let mut out = Vec::new();
+                // Where the last batch begins: a FULL join's last is the
+                // inner rows nothing matched.
+                let mut last = 0;
                 self.join_rows_core(
                     kind,
                     on.as_ref(),
@@ -9107,10 +9126,20 @@ impl PgHandler {
                     },
                     rrows,
                     &mut |docs| {
+                        last = out.len();
                         out.extend(docs);
                         Ok(true)
                     },
                 )?;
+                if let GeneralOrder::MergeFull {
+                    outer_key,
+                    inner_key,
+                    ..
+                } = &order
+                {
+                    let tail = out.split_off(last);
+                    out = merge_full_place(out, tail, outer_key, inner_key, inner_max.as_ref());
+                }
                 Ok(out)
             }
         }
@@ -9729,9 +9758,35 @@ impl PgHandler {
             (equi, &[][..])
         };
         use secantus_pgplan::joincost::JoinMethod;
-        if let Some((method, lk, rk, a_rows)) =
+        if let Some((method, lk, rk, a_rows, b_rows)) =
             self.general_join_method(kind, left, right, column_equi, expr_keys, ec, limit)
         {
+            // A hash full join: the probes' matches and the hashed rows
+            // nothing matched both in the hash table's order.
+            if method == JoinMethod::HashFullA {
+                if let Some(ty) = leaf_key_type(right, &rk) {
+                    hash_table_order(rrows, &rk, &ty, b_rows);
+                }
+                return GeneralOrder::Keep;
+            }
+            if method == JoinMethod::HashFullB {
+                if let Some(ty) = leaf_key_type(left, &lk) {
+                    hash_table_order(lrows, &lk, &ty, a_rows);
+                }
+                return GeneralOrder::Swap;
+            }
+            if let JoinMethod::MergeFullA { .. } | JoinMethod::MergeFullB { .. } = method {
+                reorder_join_inputs(method, lrows, &lk, rrows, &rk);
+                return GeneralOrder::MergeFull {
+                    swap: joincost_outer_is_b(method),
+                    outer_key: if joincost_outer_is_b(method) {
+                        rk.clone()
+                    } else {
+                        lk.clone()
+                    },
+                    inner_key: if joincost_outer_is_b(method) { lk } else { rk },
+                };
+            }
             if method == JoinMethod::HashRightB {
                 // The left rows nothing matches come last, in the hash
                 // table's order: known only for a key type hashed here.
@@ -9765,9 +9820,20 @@ impl PgHandler {
         expr_keys: &[secantus_pgplan::joins::ExprEquality],
         ec: Option<&secantus_pgplan::joins::JoinEc>,
         limit: Option<usize>,
-    ) -> Option<(secantus_pgplan::joincost::JoinMethod, String, String, f64)> {
+    ) -> Option<(
+        secantus_pgplan::joincost::JoinMethod,
+        String,
+        String,
+        f64,
+        f64,
+    )> {
         use secantus_pgplan::joins::{JoinKind, SEP};
-        if !matches!(kind, JoinKind::Inner | JoinKind::Left) {
+        let full = kind == JoinKind::Full;
+        // A FULL join on one column equality: its ON is its join clause,
+        // which PostgreSQL merges or hashes on (RP-028).
+        if !(matches!(kind, JoinKind::Inner | JoinKind::Left)
+            || (full && ec.is_none() && expr_keys.is_empty() && equi.len() == 1))
+        {
             return None;
         }
         // One join key: a column equality, or one over an expression; or,
@@ -9822,12 +9888,14 @@ impl PgHandler {
             return None;
         };
         let limit = limit.map(|n| n as f64);
-        let method = if cross {
+        let method = if full {
+            secantus_pgplan::joincost::cheapest_full_join(&a, &b, limit)
+        } else if cross {
             secantus_pgplan::joincost::cheapest_cross_join(&a, &b, limit)
         } else {
             secantus_pgplan::joincost::cheapest_join(&a, &b, matches!(kind, JoinKind::Left), limit)
         };
-        Some((method, order.0, order.1, a.rows))
+        Some((method, order.0, order.1, a.rows, b.rows))
     }
 
     /// A table small enough to hold whole for its join's plan order: past
@@ -38599,10 +38667,20 @@ impl PgHandler {
                 }
                 // A rewrite reindexes the table; otherwise the indexes the
                 // statement made are built (RP-196).
-                if btree::take_rewrote() {
+                let indexes_after = self.index_model_names(&table);
+                let rewrote = btree::take_rewrote();
+                if rewrote {
                     self.btree_reindex(&table)?;
                 } else {
                     self.btree_built(&table, &indexes_before)?;
+                }
+                // Building an index records the heap's size, as CREATE
+                // INDEX does (`index_update_stats`): an index the statement
+                // added, or every index a rewrite rebuilt (RP-028).
+                if (rewrote && !indexes_after.is_empty())
+                    || indexes_after.iter().any(|ix| !indexes_before.contains(ix))
+                {
+                    self.record_relstats(&table, false)?;
                 }
                 Ok(vec![Response::Execution(Tag::new("ALTER TABLE"))])
             }
@@ -51325,6 +51403,14 @@ fn reorder_join_inputs(
         JoinMethod::MergeOuterB {
             a_by_index,
             b_by_index,
+        }
+        | JoinMethod::MergeFullA {
+            a_by_index,
+            b_by_index,
+        }
+        | JoinMethod::MergeFullB {
+            a_by_index,
+            b_by_index,
         } => {
             in_key_order(left, lf, a_by_index);
             in_key_order(right, rf, b_by_index);
@@ -51336,7 +51422,9 @@ fn reorder_join_inputs(
         JoinMethod::NestOuterB
         | JoinMethod::Other
         | JoinMethod::HashRightB
-        | JoinMethod::MergeRightB { .. } => {}
+        | JoinMethod::MergeRightB { .. }
+        | JoinMethod::HashFullA
+        | JoinMethod::HashFullB => {}
     }
 }
 
@@ -51384,7 +51472,7 @@ fn retain_equal_columns(rows: &mut Vec<Document>, pairs: &[(String, String)]) {
 }
 
 /// How a general join's inputs run after `order_general_join_inputs`.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(crate) enum GeneralOrder {
     /// As they are, the left side outer.
     Keep,
@@ -51392,6 +51480,67 @@ pub(crate) enum GeneralOrder {
     Swap,
     /// The right side outer of a RIGHT join: a LEFT join's hash right join.
     SwapRight,
+    /// A merge full join, the right side outer when `swap`: both sides in
+    /// key order, and the inner rows nothing matched put in their key's
+    /// place (`merge_full_place`). The keys are the joined rows' fields of
+    /// the outer and inner side's join key.
+    MergeFull {
+        swap: bool,
+        outer_key: String,
+        inner_key: String,
+    },
+}
+
+/// A merge full join's rows from a FULL join run over both sides in key
+/// order: `main`, each outer row with its matches (or NULL-extended), and
+/// `tail`, the inner rows nothing matched, in key order. `ExecMergeJoin`
+/// emits an inner row nothing matched when the outer side's key passes
+/// it, so before the first outer row whose key is greater. A row with a
+/// NULL key matches nothing and is emitted as soon as its scan reaches
+/// it: an outer one after the outer rows with keys, so the inner rows
+/// past every outer key come after them; an inner one once the outer key
+/// passes `inner_max`, the inner side's greatest key (all of them first
+/// when it has none), else at the end.
+fn merge_full_place(
+    main: Vec<Document>,
+    tail: Vec<Document>,
+    outer_key: &str,
+    inner_key: &str,
+    inner_max: Option<&Bson>,
+) -> Vec<Document> {
+    let key = |d: &Document, k: &str| d.get(k).filter(|v| **v != Bson::Null).cloned();
+    let mut out = Vec::with_capacity(main.len() + tail.len());
+    let mut nulls = Vec::new();
+    let mut main = main.into_iter().peekable();
+    for t in tail {
+        let Some(k) = key(&t, inner_key) else {
+            nulls.push(t);
+            continue;
+        };
+        while let Some(m) = main.peek() {
+            if key(m, outer_key).is_some_and(|mk| {
+                secantus_pgplan::compare_values(&mk, &k) == Some(Ordering::Greater)
+            }) {
+                break;
+            }
+            out.extend(main.next());
+        }
+        out.push(t);
+    }
+    for m in main {
+        if !nulls.is_empty()
+            && key(&m, outer_key).is_some_and(|mk| {
+                inner_max.is_none_or(|k| {
+                    secantus_pgplan::compare_values(&mk, k) == Some(Ordering::Greater)
+                })
+            })
+        {
+            out.append(&mut nulls);
+        }
+        out.push(m);
+    }
+    out.extend(nulls);
+    out
 }
 
 /// A general join leaf that is a plain stored table: its name and filter.
@@ -51458,7 +51607,11 @@ fn joincost_outer_is_b(method: secantus_pgplan::joincost::JoinMethod) -> bool {
     use secantus_pgplan::joincost::JoinMethod;
     matches!(
         method,
-        JoinMethod::HashOuterB | JoinMethod::MergeOuterB { .. } | JoinMethod::NestOuterB
+        JoinMethod::HashOuterB
+            | JoinMethod::MergeOuterB { .. }
+            | JoinMethod::NestOuterB
+            | JoinMethod::HashFullB
+            | JoinMethod::MergeFullB { .. }
     )
 }
 

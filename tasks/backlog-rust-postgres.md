@@ -431,8 +431,9 @@ one beside it.
     json): its heap pages are taken at the estimated density.
   - DISTINCT ON, and a citext DISTINCT, which PostgreSQL sorts.
   - The size
-    CREATE INDEX records and what ANALYZE stores are modelled (`__sql_relstats__`), but not REINDEX's,
-    CLUSTER's or an ALTER TABLE that builds an index, nor across RENAME.
+    CREATE INDEX and an ALTER TABLE that builds an index record and what
+    ANALYZE stores are modelled (`__sql_relstats__`), but not REINDEX's
+    or CLUSTER's, nor across RENAME.
     Declined over an analysed table, keeping the old order: a range over
     a column that is not an integer (a text histogram is in the
     reference's locale: `select g from t3 where t > 'x2' group by g`), or
@@ -547,9 +548,20 @@ one beside it.
     the tables it reads non-null inside its nullable side
     (`reduce_outer_joins`): 18 of 20 nested shapes of three and four
     tables at 20 and 300 rows, the two left a class with a LEFT join
-    (below). What is left of the join tree is FULL joins,
-    which the search declines (a Merge or Hash Full Join, and the rows
-    nothing matched). Not yet: two classes spanning both sides (two join keys); an
+    (below). A FULL join of two stored tables on one column
+    equality is planned too (2026-10-25): a Merge or Hash Full Join,
+    either side outer (`add_paths_to_joinrel` with no nested loop), the
+    hashed side's rows nothing matched last in its hash table's order, a
+    merge's in their key's place (a NULL key's when its scan reaches it);
+    a WHERE that cannot hold for a NULL-extended side makes it a LEFT,
+    RIGHT or inner join (`reduce_outer_joins`), and an ALTER TABLE that
+    builds an index records the table's size as CREATE INDEX does
+    (`index_update_stats`). 56 of 56 shapes at 20 to 3,000 rows a side,
+    with and without a primary key and NULL keys (none before). Not yet
+    for FULL joins: one inside a join of three or more tables, which the
+    search declines; one under a WHERE (the general path does not push
+    the WHERE to the scans); one whose ON holds more than its equality;
+    one over an analysed table. Not yet: two classes spanning both sides (two join keys); an
     expression in a class; a LEFT join's class through the general path;
     a class of text or other non-integer keys, or with a LEFT join; three
     tables with a WHERE over two of them or a LIMIT; four or more tables
@@ -559,7 +571,7 @@ one beside it.
     than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_full_join_is_planned
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_full_join_under_an_inner_join_is_searched
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

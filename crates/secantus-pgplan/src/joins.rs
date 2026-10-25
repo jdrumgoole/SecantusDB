@@ -66,6 +66,10 @@ pub enum JoinNode {
         on: Option<ColumnExpr>,
         /// The table aliases the ON reads, in no particular order.
         on_aliases: Vec<String>,
+        /// Whether the ON holds a conjunct that is not one of its
+        /// equalities (`equi`, `expr_keys`): a FULL join's merge or hash
+        /// then checks it as a join filter, which is not modelled.
+        on_other: bool,
         /// `(left key, right key)` column equalities that are conjuncts of
         /// the ON: candidates are found by hashing on them, and `on` still
         /// decides each pair.
@@ -392,6 +396,7 @@ fn build_tree(
                 right: Box::new(node),
                 on: None,
                 on_aliases: Vec::new(),
+                on_other: false,
                 // The WHERE still decides every row; these only narrow the
                 // candidates a left row is paired with.
                 equi: crate::join_order::pairs_between(&equalities, &joined, i),
@@ -1085,7 +1090,9 @@ fn build_join(
     let (right, rscope) = build(rarg, lookup, params, aliases, Some(&visible))?;
     // `reduce_outer_joins`: a WHERE that cannot hold for a NULL-extended row
     // makes a LEFT join an inner one, which PostgreSQL then plans as such.
-    // A RIGHT join likewise, by its left side.
+    // A RIGHT join likewise, by its left side; a FULL join is a LEFT join
+    // when only its left side cannot be NULL-extended, a RIGHT one when
+    // only its right, and inner when both.
     let nonnullable = |scope: &Scope| {
         NONNULLABLE.with(|n| {
             let n = n.borrow();
@@ -1095,6 +1102,12 @@ fn build_join(
     let kind = match kind {
         JoinKind::Left if nonnullable(&rscope) => JoinKind::Inner,
         JoinKind::Right if nonnullable(&lscope) => JoinKind::Inner,
+        JoinKind::Full => match (nonnullable(&lscope), nonnullable(&rscope)) {
+            (true, true) => JoinKind::Inner,
+            (true, false) => JoinKind::Left,
+            (false, true) => JoinKind::Right,
+            (false, false) => JoinKind::Full,
+        },
         kind => kind,
     };
     if matches!(right, JoinNode::Lateral { .. }) && matches!(kind, JoinKind::Right | JoinKind::Full)
@@ -1202,6 +1215,7 @@ fn build_join(
     let mut equi_reversed = vec![false; equi.len()];
     let mut expr_keys = Vec::new();
     let mut on_aliases = Vec::new();
+    let mut on_other = false;
     let on = match j.quals.as_deref() {
         None if merged.is_empty() => None,
         None => {
@@ -1252,6 +1266,15 @@ fn build_join(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let conjuncts = match q.node.as_ref() {
+                Some(N::BoolExpr(b))
+                    if b.boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 =>
+                {
+                    b.args.len()
+                }
+                _ => 1,
+            };
+            on_other = conjuncts > equi.len() - merged.len() + expr_keys.len();
             Some(on_expr(&q, &side_scope, params)?)
         }
     };
@@ -1298,6 +1321,7 @@ fn build_join(
             merged,
             expr_keys,
             on_aliases,
+            on_other,
             left_keys,
             right_keys,
         },
