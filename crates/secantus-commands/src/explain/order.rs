@@ -413,7 +413,9 @@ pub(crate) fn stream_plan(
     projection: Option<&Document>,
     batch_size: bool,
 ) -> Result<Option<Node>, StorageError> {
-    if ask.collation.is_some() || !storage.can_stream(ask.db, ask.coll)? {
+    // Under a collation the plan is the collated one; a scan of a collated
+    // index streams only over bounds without strings (`stream::streams`).
+    if !storage.can_stream(ask.db, ask.coll)? {
         return Ok(None);
     }
     if ask.sort.is_some_and(|s| !plain_sort(s)) {
@@ -437,7 +439,7 @@ pub(crate) fn stream_plan(
         skip,
         limit,
         hint,
-        collation: None,
+        collation: ask.collation,
         min_max: false,
         return_key: false,
         show_record_id: false,

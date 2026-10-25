@@ -1424,9 +1424,10 @@ What is left, all on the RUST MongoDB server:
       returns its groups in first-seen order.** mongod 8.2.11 returns the
       groups of a `$groupByDistinctScan` in the scan's order. This server
       streams the scan over an ascending, uncollated index of the
-      collection the command names (2026-10-25); down a descending index,
-      along a collated one with the command's collation, or through a
-      view, it groups the documents in the order they arrive: `{x: -1}`
+      collection the command names, or of the collection beneath a view
+      (2026-10-25); down a descending index, or along a collated one with
+      the command's collation, it groups the documents in the order they
+      arrive: `{x: -1}`
       gives `1, 2, 3, 0` where mongod gives `3, 2, 1, 0`, and the `$first`
       of each group is the first document read, not the first the scan
       reaches (found 2026-10-25).
@@ -1449,6 +1450,27 @@ What is left, all on the RUST MongoDB server:
       every key; the documents are the same (found 2026-10-25).
       Backlog-ID: RM-311
       Verify: tests/backlog/test_rm_found_2026_10_25.py::test_explain_moves_a_match_on_the_group_key_ahead_of_the_group
+- [ ] **A blocking sort keeps equal documents in the order it read them;
+      mongod's sort does not.** Over 200 documents in runs of equal keys,
+      mongod 8.2.11's `find().sort({s: 1})` and `$sort` (with a collation
+      or without) return the equal documents in an order two mongod
+      processes agree on and that is not their arrival order (`25, 105, 95,
+      115, 5, ...` where they arrive `5, 15, 25, ...`): an unstable sort,
+      by its shape the C++ library's `std::sort` (not confirmed in the
+      source). This server's sort (`Storage::sort_permutation`) is stable.
+      `tools/probes/find_order.py`'s collections are small and show no
+      difference. A sort with a limit is the scope decision on its heap
+      (section 7.075).
+      **Decision needed (2026-10-25):** the order is the C++ library's, and
+      the exemplar (Linux) links libstdc++ while the macOS mongod measured
+      here links libc++. `secantus-core/src/stl.rs` already models
+      libstdc++'s `std::sort` for SBE's heaps; following it here would
+      match a Linux mongod (unmeasured on this box) and not the macOS one.
+      Options: (1) sort as libstdc++'s `std::sort` does, as for SBE's heaps;
+      (2) keep the stable order and record the difference as a scope
+      decision, as for the sort with a limit.
+      Backlog-ID: RM-312
+      Verify: tests/backlog/test_rm_found_2026_10_25.py::test_a_blocking_sort_leaves_ties_as_mongods_sort_does
 
 ### 7.074 Change streams, command by command -- 2026-10-11
 
@@ -1514,14 +1536,16 @@ differs on 5 scenarios. What is left:
       (or pushes it into SBE), else through mongod's cursor-stage buffer (32
       documents, doubling, up to 4 MB), and when it opens with a `$group`
       mongod reads from a DISTINCT_SCAN; one asked for a first batch of none
-      runs at its first `getMore` (2026-10-25). What is left
-      (`tasks/streaming-cursors-plan.md` phases 2 and 3): a descending,
-      collated or multikey index (this store's keys for a descending string
-      field and for a collated string are not in mongod's order, so walking
-      them would return the wrong order: an entry-format change), OR plans
-      and SORT_MERGE, `min` / `max`, `returnKey` / `showRecordId`, blocking
-      sorts; and in `aggregate`, a collation, a view, a time-series
-      collection, `$meta`, `$geoNear` and `notablescan`. An `_id` walk is
+      runs at its first `getMore` (2026-10-25). Both read on through a view
+      and under a collation (2026-10-25), a collated index too when its
+      bounds hold only numbers or dates. What is left
+      (`tasks/streaming-cursors-plan.md` phases 2 and 3): a descending or
+      multikey index, and a collated one bounded on strings (this store's
+      keys for a descending string field and for a collated string are not
+      in mongod's order, so walking them would return the wrong order: an
+      entry-format change), OR plans and SORT_MERGE, `min` / `max`,
+      `returnKey` / `showRecordId`, blocking sorts; and in `aggregate`, a
+      time-series collection, `$meta`, `$geoNear` and `notablescan`. An `_id` walk is
       not used for a collection holding an `_id` whose key keeps entry
       format 4's encoding (a document, BinData, JavaScript, MaxKey); one
       inserted after the cursor opened is returned
@@ -1529,7 +1553,7 @@ differs on 5 scenarios. What is left:
       mongod's order. Tests that write between batches see the difference;
       so does memory, for a large result.
       Backlog-ID: RM-080
-      Verify: tests/backlog/test_rm_057_084.py::test_descending_index_get_more_sees_writes_made_since_the_find
+      Verify: tests/backlog/test_rm_057_084.py::test_descending_index_get_more_sees_writes_made_since_the_find, tests/backlog/test_rm_found_2026_10_25.py::test_a_cursor_over_a_collated_index_of_strings_reads_on
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
   `$meta: "textScore"` sorts, an `explain: true` aggregate. Every
   `{$meta}` shape measured on 8.2.11 matches since 2026-10-17, except a

@@ -702,8 +702,9 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     ));
                 }
                 // A pipeline whose stages pass documents on as they arrive
-                // reads on as `getMore` asks (RM-080), as mongod's does.
-                if c == asked && collation.is_none() && geonear_candidate_none {
+                // reads on as `getMore` asks (RM-080), as mongod's does,
+                // through a view and under a collation too.
+                if geonear_candidate_none {
                     let ask = crate::agg_stream::Ask {
                         db: &ctx.db_name,
                         coll: c,
@@ -713,6 +714,8 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                         vars: &vars,
                         batch_size,
                         command: doc,
+                        collation: collation.as_ref(),
+                        direct: c == asked,
                     };
                     if let Some(opened) = crate::agg_stream::open(ctx, &ask)? {
                         ctx.pending_batch = Some(crate::PendingBatch {
