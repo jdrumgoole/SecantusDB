@@ -212,6 +212,16 @@ throughput / concurrency work to `crates/`.
   the real mechanism is out of reach, refuse by name (0A000) and put it in
   the backlog; a plausible stand-in is a decision for Joe, never the
   default.
+- **Always the most faithful PostgreSQL implementation** (Joe,
+  2026-10-25). When there is more than one way to close a gap, build the one
+  closest to what PostgreSQL itself does -- its algorithm, its data
+  structures, its order of checks and its messages -- even when a cheaper
+  approximation would pass today's test. Size and cost are reasons to
+  sequence the work, never to settle for less. When a decision goes to Joe,
+  put the most faithful option first and recommend it; his answer has been
+  the faithful one every time (SSI ported from `predicate.c`, the B-tree and
+  hash page models, `nodeToString` for `pg_rewrite` rather than baked
+  trees).
 - **Wire-protocol fidelity over feature completeness.** Prefer returning a faithful "command not supported" error over a half-implemented feature that silently diverges from real server behaviour.
 - **Ease of use for the beginning programmer:** starting a server in a test should be one or two lines, with no external processes to manage.
 
