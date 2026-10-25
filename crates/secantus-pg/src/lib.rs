@@ -7785,6 +7785,7 @@ impl PgHandler {
             default_ndistinct,
             key_ops,
             width: None,
+            extra: joincost::ExtraKeys::default(),
         })
     }
 
@@ -9829,7 +9830,14 @@ impl PgHandler {
             (equi, &[][..])
         };
         use secantus_pgplan::joincost::JoinMethod;
-        if let Some((method, lk, rk, a_rows, b_rows)) = self.general_join_method(
+        if let Some(GeneralJoinMethod {
+            method,
+            a_key: lk,
+            b_key: rk,
+            a_rows,
+            b_rows,
+            more,
+        }) = self.general_join_method(
             kind,
             on_other,
             left,
@@ -9865,17 +9873,26 @@ impl PgHandler {
                     inner_key: if joincost_outer_is_b(method) { lk } else { rk },
                 };
             }
+            // Each side's keys in clause order.
+            let lks: Vec<String> = std::iter::once(lk.clone())
+                .chain(more.iter().map(|(l, _)| l.clone()))
+                .collect();
+            let rks: Vec<String> = std::iter::once(rk.clone())
+                .chain(more.iter().map(|(_, r)| r.clone()))
+                .collect();
             if method == JoinMethod::HashRightB {
                 // The left rows nothing matches come last, in the hash
-                // table's order: known only for a key type hashed here.
-                return match leaf_key_type(left, &lk) {
-                    Some(ty) if hash_table_order(lrows, &lk, &ty, a_rows) => {
+                // table's order: known only for key types hashed here.
+                let types: Option<Vec<String>> =
+                    lks.iter().map(|k| leaf_key_type(left, k)).collect();
+                return match types {
+                    Some(tys) if hash_table_order_on(lrows, &lks, &tys, a_rows) => {
                         GeneralOrder::SwapRight
                     }
                     _ => GeneralOrder::Keep,
                 };
             }
-            reorder_join_inputs(method, lrows, &lk, rrows, &rk);
+            reorder_join_inputs_on(method, lrows, &lks, rrows, &rks);
             if joincost_outer_is_b(method) {
                 return GeneralOrder::Swap;
             }
@@ -9899,15 +9916,25 @@ impl PgHandler {
         expr_keys: &[secantus_pgplan::joins::ExprEquality],
         ec: Option<&secantus_pgplan::joins::JoinEc>,
         limit: Option<usize>,
-    ) -> Option<(
-        secantus_pgplan::joincost::JoinMethod,
-        String,
-        String,
-        f64,
-        f64,
-    )> {
+    ) -> Option<GeneralJoinMethod> {
         use secantus_pgplan::joins::{JoinKind, SEP};
         let full = kind == JoinKind::Full;
+        // A join on several column equalities (INNER or LEFT): the first is
+        // its key, the rest priced as further clauses and sorted or hashed
+        // on with it.
+        type Pairs<'a> = &'a [(String, String)];
+        let (equi, mut more): (Pairs<'_>, Pairs<'_>) = match equi {
+            [first, rest @ ..]
+                if !rest.is_empty()
+                    && rest.len() <= 3
+                    && ec.is_none()
+                    && expr_keys.is_empty()
+                    && matches!(kind, JoinKind::Inner | JoinKind::Left) =>
+            {
+                (std::slice::from_ref(first), rest)
+            }
+            _ => (equi, &[]),
+        };
         // A FULL join on one column equality: its ON is its join clause,
         // which PostgreSQL merges or hashes on (RP-028).
         if !(matches!(kind, JoinKind::Inner | JoinKind::Left)
@@ -9929,6 +9956,12 @@ impl PgHandler {
                 match ec.join_keys.as_slice() {
                     [] => (Err(0), Err(0), None),
                     [(lk, rk)] => (column(lk).map(Ok)?, column(rk).map(Ok)?, Some((lk, rk))),
+                    // Two or more classes spanning both sides: a clause each
+                    // (`generate_join_implied_equalities`), the first the key.
+                    [(lk, rk), rest @ ..] if rest.len() <= 3 && !full => {
+                        more = rest;
+                        (column(lk).map(Ok)?, column(rk).map(Ok)?, Some((lk, rk)))
+                    }
                     _ => return None,
                 }
             }
@@ -9960,12 +9993,35 @@ impl PgHandler {
                 Err(ops) => JoinKey::Expr(*ops),
             }
         }
-        let (Some(a), Some(b)) = (
+        let (Some(mut a), Some(mut b)) = (
             self.join_side(&lt, key(&lkey), &lfilter, restrict.0),
             self.join_side(&rt, key(&rkey), &rfilter, restrict.1),
         ) else {
             return None;
         };
+        // The further clauses' keys, each side's distinct counts.
+        if !more.is_empty() {
+            let mut extras = (Vec::new(), Vec::new());
+            for (lk, rk) in more {
+                let (lc, rc) = (column(lk)?, column(rk)?);
+                let ls = self.join_side(&lt, JoinKey::Column(&lc), &lfilter, restrict.0)?;
+                let rs = self.join_side(&rt, JoinKey::Column(&rc), &rfilter, restrict.1)?;
+                extras
+                    .0
+                    .push((ls.ndistinct, ls.default_ndistinct, ls.unique));
+                extras
+                    .1
+                    .push((rs.ndistinct, rs.default_ndistinct, rs.unique));
+            }
+            a.extra = secantus_pgplan::joincost::ExtraKeys::of(&extras.0)?;
+            b.extra = secantus_pgplan::joincost::ExtraKeys::of(&extras.1)?;
+            // `innerrel_is_unique`: the clauses' keys cover a unique one.
+            a.unique |= extras.0.iter().any(|e| e.2);
+            b.unique |= extras.1.iter().any(|e| e.2);
+            // An index in the first key's order is not one in all of theirs.
+            a.ordered = None;
+            b.ordered = None;
+        }
         let limit = limit.map(|n| n as f64);
         let method = if full {
             secantus_pgplan::joincost::cheapest_full_join(&a, &b, limit, !on_other)
@@ -9974,7 +10030,14 @@ impl PgHandler {
         } else {
             secantus_pgplan::joincost::cheapest_join(&a, &b, matches!(kind, JoinKind::Left), limit)
         };
-        Some((method, order.0, order.1, a.rows, b.rows))
+        Some(GeneralJoinMethod {
+            method,
+            a_key: order.0,
+            b_key: order.1,
+            a_rows: a.rows,
+            b_rows: b.rows,
+            more: more.to_vec(),
+        })
     }
 
     /// A table small enough to hold whole for its join's plan order: past
@@ -51534,20 +51597,43 @@ fn reorder_join_inputs(
     right: &mut Vec<Document>,
     rf: &str,
 ) {
+    reorder_join_inputs_on(method, left, &[lf.to_string()], right, &[rf.to_string()]);
+}
+
+/// `reorder_join_inputs` for a join on several clauses: each side sorted on
+/// its keys in clause order (a merge join's Sort keys), each ascending with
+/// NULLs last.
+fn reorder_join_inputs_on(
+    method: secantus_pgplan::joincost::JoinMethod,
+    left: &mut Vec<Document>,
+    lf: &[String],
+    right: &mut Vec<Document>,
+    rf: &[String],
+) {
     use secantus_pgplan::joincost::JoinMethod;
-    let by_key = |field: &str| {
-        let field = field.to_string();
-        move |x: &Document, y: &Document| match (
-            x.get(&field).filter(|v| **v != Bson::Null),
-            y.get(&field).filter(|v| **v != Bson::Null),
-        ) {
-            (None, None) => Ordering::Equal,
-            (None, Some(_)) => Ordering::Greater,
-            (Some(_), None) => Ordering::Less,
-            (Some(p), Some(q)) => secantus_pgplan::compare_values(p, q).unwrap_or(Ordering::Equal),
+    let by_key = |fields: &[String]| {
+        let fields = fields.to_vec();
+        move |x: &Document, y: &Document| {
+            for field in &fields {
+                let o = match (
+                    x.get(field).filter(|v| **v != Bson::Null),
+                    y.get(field).filter(|v| **v != Bson::Null),
+                ) {
+                    (None, None) => Ordering::Equal,
+                    (None, Some(_)) => Ordering::Greater,
+                    (Some(_), None) => Ordering::Less,
+                    (Some(p), Some(q)) => {
+                        secantus_pgplan::compare_values(p, q).unwrap_or(Ordering::Equal)
+                    }
+                };
+                if o != Ordering::Equal {
+                    return o;
+                }
+            }
+            Ordering::Equal
         }
     };
-    let in_key_order = |rows: &mut Vec<Document>, field: &str, by_index: bool| {
+    let in_key_order = |rows: &mut Vec<Document>, field: &[String], by_index: bool| {
         let cmp = by_key(field);
         if by_index {
             rows.sort_by(&cmp);
@@ -51632,6 +51718,18 @@ fn retain_equal_columns(rows: &mut Vec<Document>, pairs: &[(String, String)]) {
             }
         })
     });
+}
+
+/// The plan `general_join_method` picks: its method, each side's (first)
+/// key, each side's estimated rows, and the join's further clauses' keys
+/// (`a`, `b`) after the first.
+pub(crate) struct GeneralJoinMethod {
+    pub(crate) method: secantus_pgplan::joincost::JoinMethod,
+    pub(crate) a_key: String,
+    pub(crate) b_key: String,
+    pub(crate) a_rows: f64,
+    pub(crate) b_rows: f64,
+    pub(crate) more: Vec<(String, String)>,
 }
 
 /// How a general join's inputs run after `order_general_join_inputs`.
@@ -51745,17 +51843,37 @@ pub(crate) fn leaf_key_type(n: &secantus_pgplan::joins::JoinNode, key: &str) -> 
 /// the rows untouched, when a key's type is not hashed here or the rows
 /// outgrow the buckets (the table would grow and rebuild its chains).
 fn hash_table_order(rows: &mut Vec<Document>, key: &str, ty: &str, rows_estimate: f64) -> bool {
+    hash_table_order_on(rows, &[key.to_string()], &[ty.to_string()], rows_estimate)
+}
+
+/// `hash_table_order` for a hash join on several clauses: a row's hash is
+/// its keys' combined as `ExecHashGetHashValue` does -- rotated left a bit
+/// before each key's is XORed in, a NULL (a right join keeps it) adding
+/// nothing.
+fn hash_table_order_on(
+    rows: &mut Vec<Document>,
+    keys: &[String],
+    types: &[String],
+    rows_estimate: f64,
+) -> bool {
     let nbuckets = secantus_pgplan::joincost::hash_buckets(rows_estimate);
-    if rows.len() > nbuckets {
+    if rows.len() > nbuckets || keys.len() != types.len() {
         return false;
     }
     let mut buckets = Vec::with_capacity(rows.len());
     for row in rows.iter() {
-        let v = row.get(key).cloned().unwrap_or(Bson::Null);
-        match secantus_pgplan::joincost::hash_bucket(&v, ty, nbuckets) {
-            Some(b) => buckets.push(b),
-            None => return false,
+        let mut hash: u32 = 0;
+        for (key, ty) in keys.iter().zip(types) {
+            hash = hash.rotate_left(1);
+            match row.get(key).unwrap_or(&Bson::Null) {
+                Bson::Null => {}
+                v => match secantus_pgplan::joincost::hash_value(v, ty) {
+                    Some(h) => hash ^= h,
+                    None => return false,
+                },
+            }
         }
+        buckets.push(hash as usize & (nbuckets - 1));
     }
     let mut tagged: Vec<(usize, Document)> = buckets.into_iter().zip(rows.drain(..)).collect();
     tagged.reverse();

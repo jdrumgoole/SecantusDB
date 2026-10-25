@@ -585,8 +585,14 @@ one beside it.
     a side merged on the class unsorted, a LEFT join merged on its
     preserved member coming out in the class's order; 18 of 18 shapes of
     four and five tables (none before), nested LEFT joins 20 of 20 (18).
-    Not yet: two classes spanning both sides (two join keys); an
-    expression in a class; a LEFT join's class through the general path;
+    A join of two tables on two to four column equalities is priced and
+    run too (2026-10-25), INNER (two or more classes spanning both sides)
+    or LEFT: each clause's selectivity multiplied, each `=` costed, the
+    smallest hash bucket of the clauses, both sides sorted on every key,
+    and a hashed side in its table's order by the keys' combined hash
+    (`ExecHashGetHashValue`); 54 of 54 shapes at 20 to 3,000 rows, with a
+    primary key and with NULL keys (14 before). Not yet: such a join in
+    three or more tables, or FULL; an expression in a class; a LEFT join's class through the general path;
     a class of text or other non-integer keys; three
     tables with a WHERE over two of them or a LIMIT; four or more tables
     with a WHERE over two of them or a LIMIT; more than eight tables; an expression key with a function
@@ -595,7 +601,7 @@ one beside it.
     than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_join_on_two_equalities_is_planned
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_where_over_two_of_three_tables_is_planned
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

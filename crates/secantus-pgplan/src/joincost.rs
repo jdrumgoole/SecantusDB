@@ -50,6 +50,39 @@ pub struct JoinSide {
     /// above it. `None` where it is not known, which prices a hash join on
     /// it as one batch, as before widths were modelled.
     pub width: Option<i64>,
+    /// The join's further clauses' keys on this side, in clause order
+    /// (`a.x = b.y AND a.z = b.w`: z here when this is `a`); none for a
+    /// join on one clause.
+    pub extra: ExtraKeys,
+}
+
+/// Up to three more join keys of a side, each its distinct count, whether
+/// that is the 200 default, and whether the key is unique on its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ExtraKeys {
+    pub n: usize,
+    pub ndistinct: [f64; 3],
+    pub default_ndistinct: [bool; 3],
+    pub unique: [bool; 3],
+}
+
+impl ExtraKeys {
+    /// The keys after the first: `(ndistinct, default, unique)` each.
+    pub fn of(keys: &[(f64, bool, bool)]) -> Option<ExtraKeys> {
+        if keys.len() > 3 {
+            return None;
+        }
+        let mut e = ExtraKeys {
+            n: keys.len(),
+            ..ExtraKeys::default()
+        };
+        for (i, &(nd, default, unique)) in keys.iter().enumerate() {
+            e.ndistinct[i] = nd;
+            e.default_ndistinct[i] = default;
+            e.unique[i] = unique;
+        }
+        Some(e)
+    }
 }
 
 impl JoinSide {
@@ -76,14 +109,22 @@ fn sort_cost(input_total: f64, rows: f64) -> (f64, f64) {
 /// The join clause's cost a tuple (`cost_qual_eval`): its `=` and each
 /// side's own operators.
 fn clause_cost(outer: &JoinSide, inner: &JoinSide) -> f64 {
-    CPU_OPERATOR_COST * (1.0 + outer.key_ops + inner.key_ops)
+    CPU_OPERATOR_COST * (1.0 + outer.extra.n as f64 + outer.key_ops + inner.key_ops)
 }
 
-/// `eqjoinsel` with no statistics: `1 / max(nd1, nd2)`. A plain or LEFT
-/// join's semi-join factors use this too (the special join info's type is
-/// not SEMI).
+/// `eqjoinsel` with no statistics: `1 / max(nd1, nd2)`, a clause each, the
+/// clauses' selectivities multiplied (`clauselist_selectivity`). A plain
+/// or LEFT join's semi-join factors use this too (the special join info's
+/// type is not SEMI).
 fn join_selectivity(outer: &JoinSide, inner: &JoinSide) -> f64 {
-    1.0 / outer.ndistinct.max(inner.ndistinct).max(1.0)
+    let mut sel = 1.0 / outer.ndistinct.max(inner.ndistinct).max(1.0);
+    for i in 0..outer.extra.n.min(inner.extra.n) {
+        sel *= 1.0
+            / outer.extra.ndistinct[i]
+                .max(inner.extra.ndistinct[i])
+                .max(1.0);
+    }
+    sel
 }
 
 /// The join's estimated rows (`calc_joinrel_size_estimate`); a LEFT join
@@ -223,11 +264,13 @@ pub fn hash_join(outer: &JoinSide, inner: &JoinSide) -> (f64, f64) {
     }
     // `final_cost_hashjoin`'s virtual buckets: every batch's.
     let buckets = nbuckets as f64 * nbatch as f64;
-    // estimate_hash_bucket_stats: 0.1 for a default distinct count.
-    let bucketsize = if inner.default_ndistinct {
-        0.1
-    } else {
-        let mut nd = inner.ndistinct;
+    // estimate_hash_bucket_stats: 0.1 for a default distinct count; of
+    // several hash clauses the smallest bucket (`final_cost_hashjoin`).
+    let bucket_of = |nd: f64, default: bool| {
+        if default {
+            return 0.1;
+        }
+        let mut nd = nd;
         if inner.tuples > 0.0 {
             nd = clamp_row_est(nd * inner.rel_rows / inner.tuples);
         }
@@ -238,6 +281,13 @@ pub fn hash_join(outer: &JoinSide, inner: &JoinSide) -> (f64, f64) {
         };
         f.clamp(1.0e-6, 1.0)
     };
+    let mut bucketsize = bucket_of(inner.ndistinct, inner.default_ndistinct);
+    for i in 0..inner.extra.n {
+        bucketsize = bucketsize.min(bucket_of(
+            inner.extra.ndistinct[i],
+            inner.extra.default_ndistinct[i],
+        ));
+    }
     let sel = join_selectivity(outer, inner);
     let tuples = if inner.unique {
         let match_frac = sel;
@@ -916,6 +966,7 @@ mod tests {
             key_ops: 0.0,
             rel_rows: 2260.0,
             width: None,
+            extra: ExtraKeys::default(),
         }
     }
     fn plain() -> JoinSide {

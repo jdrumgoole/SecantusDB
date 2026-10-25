@@ -868,9 +868,9 @@ impl PgHandler {
                     ec.as_ref(),
                     None,
                 )
-                .is_some_and(|(m, _, _, _, _)| {
+                .is_some_and(|g| {
                     !matches!(
-                        m,
+                        g.method,
                         secantus_pgplan::joincost::JoinMethod::Other
                             | secantus_pgplan::joincost::JoinMethod::MergeRightB { .. }
                     )
