@@ -481,7 +481,41 @@ impl PgHandler {
         if seq && !in_block {
             self.prune_pages(&sel.table, None)?;
         }
-        if order.is_empty() && seq && self.heap_scan_disordered(&sel.table) {
+        // The order the scan PostgreSQL's planner picks reads them in
+        // (RP-028), as in `in_scan_order`: a sequential or bitmap heap
+        // scan's is the heap's -- a bitmap's reaches a HOT-updated row at
+        // its chain's root, which only the materialised read reorders --
+        // and a B-tree index scan's is the index's, ties in heap order.
+        let mut priced = false;
+        if order.is_empty() && !sel.filter.is_empty() && self.has_heap(&sel.table) {
+            use crate::serializable::{PricedScan, ScanIndex};
+            match self.priced_scan(&sel.table, &sel.filter) {
+                Some(PricedScan::Seq) => {
+                    priced = true;
+                    if !seq || self.heap_scan_disordered(&sel.table) {
+                        order.push(crate::heap::ctid_order_key());
+                    }
+                }
+                Some(PricedScan::Bitmap(_)) => {
+                    if self.heap_has_hot(&sel.table) {
+                        return Ok(None);
+                    }
+                    priced = true;
+                    if !seq || self.heap_scan_disordered(&sel.table) {
+                        order.push(crate::heap::ctid_order_key());
+                    }
+                }
+                Some(PricedScan::Index(ScanIndex::Btree(shape))) => {
+                    if let Some(keys) = shape.order_keys(def) {
+                        priced = true;
+                        order.extend(keys);
+                        order.push(crate::heap::ctid_order_key());
+                    }
+                }
+                Some(PricedScan::Index(ScanIndex::Hash(_))) | None => {}
+            }
+        }
+        if !priced && order.is_empty() && seq && self.heap_scan_disordered(&sel.table) {
             order.push(crate::heap::ctid_order_key());
         }
         let source: futures::stream::BoxStream<'static, PgWireResult<Vec<Document>>> = if in_block {

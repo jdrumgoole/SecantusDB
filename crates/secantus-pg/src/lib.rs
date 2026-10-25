@@ -6591,10 +6591,81 @@ impl PgHandler {
                 self.prune_pages(table, Some(&ctids))?;
             }
         }
+        // The order the scan PostgreSQL's planner picks reads them in
+        // (RP-028): a sequential scan's is the heap's; a bitmap heap
+        // scan's is the TIDs its index holds, each a HOT chain's root
+        // (where a scan reaches a version an update left on the page); a
+        // B-tree index scan's is the index's, ties in their roots' order.
+        if rows.len() > 1 && !filter.is_empty() && self.has_heap(table) {
+            use serializable::{PricedScan, ScanIndex};
+            match self.priced_scan(table, filter) {
+                Some(PricedScan::Seq) => return Ok(heap::in_ctid_order(rows)),
+                Some(PricedScan::Bitmap(_)) => return self.in_root_order(table, rows),
+                Some(PricedScan::Index(ScanIndex::Btree(shape))) => {
+                    return self.in_index_order(table, &shape, rows)
+                }
+                Some(PricedScan::Index(ScanIndex::Hash(_))) | None => {}
+            }
+        }
         if seq && self.heap_scan_disordered(table) {
             return Ok(heap::in_ctid_order(rows));
         }
         Ok(rows)
+    }
+
+    /// `rows` in the order of their HOT chains' roots: a bitmap heap
+    /// scan's.
+    fn in_root_order(&self, table: &str, rows: Vec<Vec<u8>>) -> PgWireResult<Vec<Vec<u8>>> {
+        let ctids = Self::row_ctids(&rows);
+        let roots = self.hot_roots(table, &ctids)?;
+        let mut keyed: Vec<(i64, Vec<u8>)> = roots.into_iter().zip(rows).collect();
+        keyed.sort_by_key(|(root, _)| *root);
+        Ok(keyed.into_iter().map(|(_, r)| r).collect())
+    }
+
+    /// `rows` in `shape`'s order: its key, then the heap TID the index
+    /// holds (the HOT chain's root), as a B-tree keeps duplicates.
+    fn in_index_order(
+        &self,
+        table: &str,
+        shape: &crate::btree::IndexShape,
+        rows: Vec<Vec<u8>>,
+    ) -> PgWireResult<Vec<Vec<u8>>> {
+        use crate::btree_model::Shape;
+        let ctids = Self::row_ctids(&rows);
+        let roots = self.hot_roots(table, &ctids)?;
+        let mut keyed: Vec<(Vec<Bson>, i64, Vec<u8>)> = Vec::with_capacity(rows.len());
+        for (row, root) in rows.into_iter().zip(roots) {
+            let Some(key) = decode_doc(&row).ok().and_then(|d| shape.key_of(&d)) else {
+                // A row the index does not hold: the order is not the
+                // index's after all.
+                return Ok(heap::in_ctid_order(
+                    keyed.into_iter().map(|(_, _, r)| r).chain([row]).collect(),
+                ));
+            };
+            keyed.push((key, root, row));
+        }
+        keyed.sort_by(|a, b| {
+            for attr in 0..a.0.len().min(b.0.len()) {
+                match shape.cmp_attr(attr, &a.0[attr], &b.0[attr]) {
+                    std::cmp::Ordering::Equal => continue,
+                    other => return other,
+                }
+            }
+            a.1.cmp(&b.1)
+        });
+        Ok(keyed.into_iter().map(|(_, _, r)| r).collect())
+    }
+
+    fn row_ctids(rows: &[Vec<u8>]) -> Vec<i64> {
+        rows.iter()
+            .map(|b| {
+                bson::RawDocument::from_bytes(b)
+                    .ok()
+                    .and_then(|d| d.get_i64("__sys_ctid").ok())
+                    .unwrap_or(-1)
+            })
+            .collect()
     }
 
     /// Does the storage answer `filter` over `table` by a collection scan?

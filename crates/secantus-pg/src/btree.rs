@@ -151,13 +151,44 @@ impl IndexShape {
         self.predicate.as_ref()
     }
 
+    /// The order a forward scan of this index reads its keys in, as sort
+    /// keys over the stored fields; `None` for an index that is not plain.
+    pub(crate) fn order_keys(
+        &self,
+        def: &secantus_pgcatalog::TableDef,
+    ) -> Option<Vec<secantus_pgplan::OrderKey>> {
+        if !self.is_plain() {
+            return None;
+        }
+        Some(
+            self.key_fields()
+                .iter()
+                .enumerate()
+                .map(|(i, f)| secantus_pgplan::OrderKey {
+                    field: f.clone(),
+                    ascending: !self.desc.get(i).copied().unwrap_or(false),
+                    nulls: if self.nulls_first.get(i).copied().unwrap_or(false) {
+                        secantus_pgplan::Nulls::First
+                    } else {
+                        secantus_pgplan::Nulls::Last
+                    },
+                    jsonb: def
+                        .columns
+                        .iter()
+                        .any(|c| &c.field() == f && c.pg_type == "jsonb"),
+                    expr: None,
+                })
+                .collect(),
+        )
+    }
+
     pub(crate) fn is_plain(&self) -> bool {
         self.predicate.is_none()
             && self.computed.is_none()
             && self.types.iter().all(Option::is_some)
     }
 
-    fn key_of(&self, doc: &Document) -> Option<Vec<Bson>> {
+    pub(crate) fn key_of(&self, doc: &Document) -> Option<Vec<Bson>> {
         if let Some(p) = &self.predicate {
             let empty = Document::new();
             if !secantus_core::query::matches(doc, p, &empty, None).unwrap_or(false) {

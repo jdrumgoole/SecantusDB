@@ -218,6 +218,52 @@ pub(crate) fn untid(ctid: i64) -> Option<(u32, u16)> {
 }
 
 impl Heap {
+    /// The root of the HOT chain `ctid` is on: the line pointer the
+    /// table's indexes point at (a redirect, or the chain's first tuple),
+    /// which is where an index or bitmap scan reaches it. `ctid` itself
+    /// when it heads its own chain or is not modelled.
+    /// Does any page hold a HOT chain (a heap-only tuple or a redirect)?
+    pub(crate) fn has_hot(&self) -> bool {
+        self.pages.iter().any(|p| {
+            p.lps.values().any(|lp| match lp {
+                Lp::Normal(t) => t.heap_only,
+                Lp::Redirect(_) => true,
+                _ => false,
+            })
+        })
+    }
+
+    pub(crate) fn hot_root(&self, ctid: i64) -> i64 {
+        let Some((blk, off)) = untid(ctid) else {
+            return ctid;
+        };
+        let Some(page) = self.pages.get(blk as usize) else {
+            return ctid;
+        };
+        for (&root, lp) in &page.lps {
+            let mut cur = match lp {
+                Lp::Normal(t) if !t.heap_only => Some(root),
+                Lp::Redirect(to) => Some(*to),
+                _ => None,
+            };
+            let mut steps = 0;
+            while let Some(c) = cur {
+                if c == off {
+                    return tid(blk, root);
+                }
+                steps += 1;
+                if steps > MAX_TUPLES {
+                    break;
+                }
+                cur = match page.lps.get(&c) {
+                    Some(Lp::Normal(t)) => t.hot_next.filter(|_| steps == 1 || t.heap_only),
+                    _ => None,
+                };
+            }
+        }
+        ctid
+    }
+
     pub(crate) fn nblocks(&self) -> u32 {
         self.pages.len() as u32
     }
