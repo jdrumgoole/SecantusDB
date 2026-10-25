@@ -738,8 +738,14 @@ one beside it.
       passed). It did not reproduce locally on macOS: the test alone 90
       times, under 60 seeds, with autovacuum waking every second, the whole
       file under eight random orders, and a 4-thread stress of the same
-      pattern. The next step is the server's log from a failing Windows run:
-      since batch 81 the gauge keeps it
+      pattern. One way this server raised that 40001 where PostgreSQL does
+      not was found and fixed in batch 82. A CREATE TABLE of a name another
+      open transaction was creating failed at once. PostgreSQL waits for the
+      other, then raises 23505 on `pg_type_typname_nsp_index` or goes on
+      (`tests/backlog/test_rp_batch82.py`). The test's two connections
+      create different names, though, so that does not explain this run.
+      The next step is the server's log from a failing Windows run: since
+      batch 81 the gauge keeps it
       (`.validation/psycopg-raw-rust.server.log`, in the job's artifact).
       Backlog-ID: RP-268
       Verify: none -- not reproduced outside one Windows CI run; no test fails on demand
