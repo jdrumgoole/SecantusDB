@@ -948,16 +948,6 @@ a regression test.
       PostgreSQL's syscache and relcache make, which follow its own caching.
       Backlog-ID: RP-225
       Verify: tests/backlog/test_rp_batch55.py::test_scenario[a new session's catalog reads are counted]
-- [ ] **Autovacuum is not modelled.** PostgreSQL 15.19 analyses and
-      vacuums a table in the background once its changes pass
-      `autovacuum_*_threshold` plus the scale factor, checking every
-      `autovacuum_naptime` (a minute): `last_autoanalyze`,
-      `autoanalyze_count`, `last_autovacuum` and `autovacuum_count` move,
-      and `n_mod_since_analyze` / `n_dead_tup` drop, with no statement asking.
-      Here they stay NULL and 0, and only a VACUUM or ANALYZE resets the
-      counts.
-      Backlog-ID: RP-226
-      Verify: none -- autovacuum runs on its own schedule (a 60 s naptime, a worker launched when the launcher wakes); measured with a 1 s naptime, PostgreSQL 15.19 had not yet run within 4 s, so no bounded check pins it on either server
 
 ## Found by batch 54 (2026-10-24)
 
