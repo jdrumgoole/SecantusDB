@@ -1420,6 +1420,35 @@ What is left, all on the RUST MongoDB server:
       server lists the `$match` alone (found 2026-10-24).
       Backlog-ID: RM-308
       Verify: tests/backlog/test_rm_found_2026_10_24.py::test_explain_lists_the_projection_a_limit_moved_past
+- [ ] **A `$group` read from a DISTINCT_SCAN this server does not stream
+      returns its groups in first-seen order.** mongod 8.2.11 returns the
+      groups of a `$groupByDistinctScan` in the scan's order. This server
+      streams the scan over an ascending, uncollated index of the
+      collection the command names (2026-10-25); down a descending index,
+      along a collated one with the command's collation, or through a
+      view, it groups the documents in the order they arrive: `{x: -1}`
+      gives `1, 2, 3, 0` where mongod gives `3, 2, 1, 0`, and the `$first`
+      of each group is the first document read, not the first the scan
+      reaches (found 2026-10-25).
+      Backlog-ID: RM-309
+      Verify: tests/backlog/test_rm_found_2026_10_25.py::test_a_distinct_scan_group_this_server_does_not_stream_keeps_the_scans_order
+- [ ] **`explain` of a sorted or filtered DISTINCT_SCAN `$group` lists no
+      `rejectedPlans`.** mongod 8.2.11 tries each index that could answer
+      it (with `$first` of `y` over `x_1`, `x_1_y_1` and `x_1_z_1`, after a
+      `$sort {x: 1}` or a `$match` on `x`) and lists the two it did not
+      pick; unsorted and unfiltered, it tries none. This server picks the
+      same index and lists none (found 2026-10-25).
+      Backlog-ID: RM-310
+      Verify: tests/backlog/test_rm_found_2026_10_25.py::test_explain_lists_the_distinct_scans_a_group_tried
+- [ ] **`explain` leaves a `$match` on a `$group`'s key behind the
+      group.** mongod 8.2.11 moves `[{$group: {_id: "$x", ...}}, {$match:
+      {_id: {$gt: 1}}}]`'s `$match` ahead of the group, onto `x` (and
+      `{_id: {k: "$x"}}`'s `_id.k` onto `x`), so the query reads it: the
+      DISTINCT_SCAN's bounds are `(1, inf]`. One on an accumulator stays
+      behind. This server lists the `$match` after the group and scans
+      every key; the documents are the same (found 2026-10-25).
+      Backlog-ID: RM-311
+      Verify: tests/backlog/test_rm_found_2026_10_25.py::test_explain_moves_a_match_on_the_group_key_ahead_of_the_group
 
 ### 7.074 Change streams, command by command -- 2026-10-11
 
@@ -1480,28 +1509,27 @@ differs on 5 scenarios. What is left:
       with skip, limit, projection and covered plans; an `aggregate` streams
       when its stages are `$match`, `$project`, `$unset`, `$addFields` /
       `$set`, `$replaceRoot` / `$replaceWith`, `$unwind`, `$redact`, `$skip`,
-      `$limit`, `$lookup` and a `$sort` the plan reads in order, batch by
-      batch where mongod's planner takes the pipeline whole (or pushes it
-      into SBE), else through mongod's cursor-stage buffer (32 documents,
-      doubling, up to 4 MB). What is left (`tasks/streaming-cursors-plan.md`
-      phases 2 and 3): a descending, collated or multikey index (this
-      store's keys for a descending string field and for a collated string
-      are not in mongod's order, so walking them would return the wrong
-      order: an entry-format change), OR plans and SORT_MERGE, `min` /
-      `max`, `returnKey` / `showRecordId`, blocking sorts; and in
-      `aggregate`, a collation, a view, a time-series collection, `$meta`,
-      `$geoNear`, `notablescan`, a `$group` on `_id` (mongod drops the
-      group and buffers), `$unionWith` (buffered on mongod), and a first
-      batch of none, for which mongod runs nothing until the `getMore` (a
-      blocking `$group` asked for `batchSize: 0` here reads everything at
-      the command). An `_id` walk is not used for a collection holding an
-      `_id` whose key keeps entry format 4's encoding (a document, BinData,
-      JavaScript, MaxKey); one inserted after the cursor opened is returned
+      `$limit`, `$lookup`, `$unionWith` and a `$sort` the plan reads in
+      order, batch by batch where mongod's planner takes the pipeline whole
+      (or pushes it into SBE), else through mongod's cursor-stage buffer (32
+      documents, doubling, up to 4 MB), and when it opens with a `$group`
+      mongod reads from a DISTINCT_SCAN; one asked for a first batch of none
+      runs at its first `getMore` (2026-10-25). What is left
+      (`tasks/streaming-cursors-plan.md` phases 2 and 3): a descending,
+      collated or multikey index (this store's keys for a descending string
+      field and for a collated string are not in mongod's order, so walking
+      them would return the wrong order: an entry-format change), OR plans
+      and SORT_MERGE, `min` / `max`, `returnKey` / `showRecordId`, blocking
+      sorts; and in `aggregate`, a collation, a view, a time-series
+      collection, `$meta`, `$geoNear` and `notablescan`. An `_id` walk is
+      not used for a collection holding an `_id` whose key keeps entry
+      format 4's encoding (a document, BinData, JavaScript, MaxKey); one
+      inserted after the cursor opened is returned
       where its key falls, which among several such `_id`s need not be
       mongod's order. Tests that write between batches see the difference;
       so does memory, for a large result.
       Backlog-ID: RM-080
-      Verify: tests/backlog/test_rm_057_084.py::test_aggregate_group_on_id_union_with_and_empty_first_batch_read_on, tests/backlog/test_rm_057_084.py::test_descending_index_get_more_sees_writes_made_since_the_find
+      Verify: tests/backlog/test_rm_057_084.py::test_descending_index_get_more_sees_writes_made_since_the_find
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
   `$meta: "textScore"` sorts, an `explain: true` aggregate. Every
   `{$meta}` shape measured on 8.2.11 matches since 2026-10-17, except a

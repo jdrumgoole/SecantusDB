@@ -685,8 +685,8 @@ fn union_with_concatenates_collections() {
             "b",
             vec![doc! {"_id": 10, "n": 5}, doc! {"_id": 11, "n": 1}],
         );
-        let ids = |r: &Document| -> Vec<i32> {
-            docs_of(r)
+        let ids = |r: &Document, c: &CommandContext| -> Vec<i32> {
+            batch_docs(r, c)
                 .iter()
                 .map(|d| d.get_i32("_id").unwrap())
                 .collect()
@@ -696,7 +696,7 @@ fn union_with_concatenates_collections() {
             &doc! {"aggregate": "a", "pipeline": [{"$unionWith": "b"}], "cursor": {}},
             c,
         );
-        assert_eq!(ids(&r), vec![1, 2, 10, 11], "{r:?}");
+        assert_eq!(ids(&r, c), vec![1, 2, 10, 11], "{r:?}");
         // {coll, pipeline} form: b filtered by a sub-pipeline.
         let r = dispatch(
             &doc! {"aggregate": "a", "pipeline": [
@@ -704,7 +704,7 @@ fn union_with_concatenates_collections() {
             ], "cursor": {}},
             c,
         );
-        assert_eq!(ids(&r), vec![1, 2, 10], "filtered union {r:?}");
+        assert_eq!(ids(&r, c), vec![1, 2, 10], "filtered union {r:?}");
     });
 }
 
@@ -952,12 +952,14 @@ fn count_over_no_input_emits_nothing() {
         seed(c, "a", (0..3).map(|i| doc! {"_id": i, "g": i}).collect());
         seed(c, "b", (0..3).map(|i| doc! {"_id": i, "g": 1}).collect());
         let run = |c: &mut CommandContext, coll: &str, pipeline: Vec<Document>| {
+            // The server sends each streamed batch with its reply.
+            c.pending_batch = None;
             let reply = dispatch(
                 &doc! {"aggregate": coll, "pipeline": pipeline, "cursor": {}},
                 c,
             );
             assert_eq!(reply.get_f64("ok").unwrap(), 1.0, "{reply}");
-            docs_of(&reply)
+            batch_docs(&reply, c)
         };
         assert!(run(
             c,

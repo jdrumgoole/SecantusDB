@@ -1177,7 +1177,7 @@ def _unstreamed_see_writes(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-080")
+@pytest.mark.backlog_fixed("RM-080")
 def test_aggregate_group_on_id_union_with_and_empty_first_batch_read_on(
     rust_mongo: Any, mongod: Any
 ) -> None:

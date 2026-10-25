@@ -120,6 +120,10 @@ struct IndexScan {
     /// Entries the scan has passed whose documents a batch that filled
     /// did not fetch: the next read fetches them first.
     unfetched: VecDeque<i64>,
+    /// A DISTINCT_SCAN: the first entry of each run of this many leading
+    /// keys, and the last such run returned.
+    distinct: Option<usize>,
+    run: Option<Vec<Vec<u8>>>,
 }
 
 /// An index scan of `ix` from its start, when one streams.
@@ -166,6 +170,8 @@ fn index_scan(
         key_skip: 0,
         covered: false,
         unfetched: VecDeque::new(),
+        distinct: None,
+        run: None,
     }))
 }
 
@@ -287,6 +293,15 @@ fn work_entry(src: &mut Source, keys: &mut i64) -> Result<Step, StorageError> {
             continue;
         }
         let Some((field, ahead)) = outside else {
+            // A DISTINCT_SCAN seeks past the rest of the run it returned.
+            if let Some(width) = src.scan.distinct {
+                let run = &src.buf[0].parts[..width.min(src.buf[0].parts.len())];
+                if src.scan.run.as_deref() == Some(run) {
+                    src.pop();
+                    continue;
+                }
+                src.scan.run = Some(run.to_vec());
+            }
             *keys += 1;
             let rid = src.pop().unwrap_or_default();
             return Ok(Step::Entry(rid));
@@ -429,6 +444,18 @@ impl Stream {
                 match index_scan(storage, ix, db, coll)? {
                     Some(scan) => Access::Index(IndexScan {
                         covered: true,
+                        ..scan
+                    }),
+                    None => return Ok(None),
+                }
+            }
+            // The first document of each key a `$group` answers from
+            // (`$groupByDistinctScan`), covered or fetched.
+            Node::DistinctScan(ix, width, _) if streams(ix) => {
+                match index_scan(storage, ix, db, coll)? {
+                    Some(scan) => Access::Index(IndexScan {
+                        covered,
+                        distinct: Some(*width),
                         ..scan
                     }),
                     None => return Ok(None),
