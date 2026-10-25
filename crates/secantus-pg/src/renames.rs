@@ -178,25 +178,66 @@ impl PgHandler {
             ));
         };
         let table = ix.table.name.clone();
-        let constraint = ix.primary
-            || ix
-                .table
-                .unique_constraints
-                .iter()
-                .any(|u| u.name == ix.name);
-        let stored = (!constraint)
-            .then(|| {
-                self.storage
-                    .list_indexes(self.db(), &table)
-                    .ok()?
-                    .into_iter()
+        let apply = |method: &str, mut options: Vec<String>| -> PgWireResult<Vec<String>> {
+            for (reset, name, value) in changes {
+                if !reset {
+                    secantus_pgplan::check_index_reloption(method, name, value.as_deref())
+                        .map_err(|e| Self::err(&e))?;
+                }
+                options.retain(|o| o.split('=').next() != Some(name.as_str()));
+                if !reset {
+                    options.push(format!(
+                        "{name}={}",
+                        value.clone().unwrap_or_else(|| "true".into())
+                    ));
+                }
+            }
+            Ok(options)
+        };
+        // A constraint's index keeps its options with the constraint, in
+        // the table's catalog entry.
+        let mut def = ix.table.clone();
+        if ix.primary {
+            let current = def
+                .extra
+                .get_array("pk_reloptions")
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let options = apply("btree", current)?;
+            if options.is_empty() {
+                def.extra.remove("pk_reloptions");
+            } else {
+                def.extra.insert("pk_reloptions", options);
+            }
+            self.rewrite_catalog(&table, &def)?;
+            return done("ALTER INDEX");
+        }
+        if let Some(u) = def
+            .unique_constraints
+            .iter_mut()
+            .find(|u| u.name == ix.name)
+        {
+            let method = u.exclusion_method.clone().unwrap_or_else(|| "btree".into());
+            u.reloptions = apply(&method, std::mem::take(&mut u.reloptions))?;
+            self.rewrite_catalog(&table, &def)?;
+            return done("ALTER INDEX");
+        }
+        let stored = self
+            .storage
+            .list_indexes(self.db(), &table)
+            .ok()
+            .and_then(|l| {
+                l.into_iter()
                     .find(|d| d.get_str("name") == Ok(ix.name.as_str()))
-            })
-            .flatten();
+            });
         let Some(stored) = stored else {
             return Err(error(
-                "0A000",
-                "ALTER INDEX ... SET or RESET of a constraint's index is not supported".into(),
+                "42P01",
+                format!("relation \"{bare}\" does not exist"),
             ));
         };
         let opt = |k: &str| {
@@ -210,26 +251,14 @@ impl PgHandler {
         let method = opt("sqlMethod")
             .and_then(|m| m.as_str().map(str::to_string))
             .unwrap_or_else(|| "btree".into());
-        let mut options: Vec<String> = match opt("sqlReloptions") {
+        let current: Vec<String> = match opt("sqlReloptions") {
             Some(Bson::Array(a)) => a
                 .iter()
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect(),
             _ => Vec::new(),
         };
-        for (reset, name, value) in changes {
-            if !reset {
-                secantus_pgplan::check_index_reloption(&method, name, value.as_deref())
-                    .map_err(|e| Self::err(&e))?;
-            }
-            options.retain(|o| o.split('=').next() != Some(name.as_str()));
-            if !reset {
-                options.push(format!(
-                    "{name}={}",
-                    value.clone().unwrap_or_else(|| "true".into())
-                ));
-            }
-        }
+        let options = apply(&method, current)?;
         let list: Vec<Bson> = options.into_iter().map(Bson::String).collect();
         self.storage
             .set_index_options(

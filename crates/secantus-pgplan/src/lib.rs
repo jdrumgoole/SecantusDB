@@ -2302,6 +2302,8 @@ pub enum AlterTableAction {
         /// The INCLUDE columns of that index, which the key's index keeps
         /// (`indkey` lists them after the key columns).
         include: Vec<String>,
+        /// Its index's storage parameters (`... PRIMARY KEY (a) WITH (...)`).
+        reloptions: Vec<String>,
     },
     /// `ADD [CONSTRAINT n] FOREIGN KEY ...`: checked against the rows already
     /// there, then enforced on every write. `named` when the statement gave
@@ -3414,6 +3416,11 @@ pub struct ExplainOptions {
     pub analyze: bool,
     pub verbose: bool,
     pub costs: bool,
+    /// `TIMING`: a node's actual times, under ANALYZE (on by default there).
+    pub timing: bool,
+    /// `SUMMARY`: the planning time, and under ANALYZE the execution time
+    /// (on by default with ANALYZE, off without).
+    pub summary: bool,
     /// `text` or `json`.
     pub format: String,
     /// A single-relation statement's WHERE, as the scan's `Index Cond` /
@@ -7390,6 +7397,7 @@ fn plan_alter_action(
                     uq.deferrable = k.deferrable;
                     uq.initially_deferred = k.initdeferred;
                     uq.nulls_not_distinct = k.nulls_not_distinct;
+                    uq.reloptions = index_reloptions("btree", &k.options)?;
                     return Ok(AlterTableAction::AddUnique(uq));
                 }
                 Ok(CT::ConstrPrimary) => {
@@ -7407,6 +7415,7 @@ fn plan_alter_action(
                         columns: string_list(&k.keys),
                         using_index,
                         include: string_list(&k.including),
+                        reloptions: index_reloptions("btree", &k.options)?,
                     });
                 }
                 Ok(CT::ConstrForeign) => {
@@ -8307,8 +8316,14 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             columns,
             name,
             include,
+            reloptions,
             ..
         } => {
+            if reloptions.is_empty() {
+                def.extra.remove("pk_reloptions");
+            } else {
+                def.extra.insert("pk_reloptions", reloptions.clone());
+            }
             // A name the statement gave is the constraint's (and its
             // index's), as `CONSTRAINT x PRIMARY KEY` in CREATE TABLE is.
             if *name != format!("{}_pkey", def.name) {
@@ -9754,11 +9769,14 @@ fn plan_explain(
         analyze: false,
         verbose: false,
         costs: true,
+        timing: false,
+        summary: false,
         format: "text".into(),
         scan_quals: Vec::new(),
         join_conds: Vec::new(),
         join_where: Vec::new(),
     };
+    let (mut timing, mut summary) = (None, None);
     for o in &e.options {
         let Some(N::DefElem(d)) = o.node.as_ref() else {
             continue;
@@ -9783,7 +9801,9 @@ fn plan_explain(
             "analyze" => options.analyze = flag()?,
             "verbose" => options.verbose = flag()?,
             "costs" => options.costs = flag()?,
-            "buffers" | "timing" | "summary" | "settings" | "wal" => {
+            "timing" => timing = Some(flag()?),
+            "summary" => summary = Some(flag()?),
+            "buffers" | "settings" | "wal" => {
                 flag()?;
             }
             "format" => match text.as_deref() {
@@ -9806,6 +9826,15 @@ fn plan_explain(
             }
         }
     }
+    // `ExplainQuery`'s checks and defaults.
+    if timing == Some(true) && !options.analyze {
+        return Err(Error::Sqlstate(
+            "22023",
+            "EXPLAIN option TIMING requires ANALYZE".into(),
+        ));
+    }
+    options.timing = options.analyze && timing.unwrap_or(true);
+    options.summary = summary.unwrap_or(options.analyze);
     let query = e
         .query
         .as_deref()
@@ -9830,7 +9859,12 @@ fn plan_explain(
         }
         _ => Vec::new(),
     };
-    let inner = plan_node(query, lookup, params)?;
+    // Without ANALYZE the statement is planned and not run.
+    let inner = if options.analyze {
+        plan_node(query, lookup, params)?
+    } else {
+        planning_without_running(|| plan_node(query, lookup, params))?
+    };
     options.scan_quals = scan_quals;
     options.join_conds = join_conds;
     if !matches!(
@@ -10353,6 +10387,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     let mut table_pk: Vec<String> = Vec::new();
     // `CONSTRAINT name PRIMARY KEY`: the key's name, when it was given one.
     let mut pk_name: Option<String> = None;
+    let mut pk_reloptions: Vec<String> = Vec::new();
     for el in &c.table_elts {
         match el.node.as_ref() {
             Some(N::ColumnDef(cd)) => {
@@ -10431,6 +10466,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                             if !k.conname.is_empty() {
                                 pk_name = Some(k.conname.clone());
                             }
+                            pk_reloptions = index_reloptions("btree", &k.options)?;
                         }
                         Ok(CT::ConstrNotnull) => column.nullable = false,
                         Ok(CT::ConstrNull) => column.nullable = !pk,
@@ -10514,6 +10550,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                             };
                             let mut uq = UniqueConstraint::new(&name, vec![cd.colname.clone()]);
                             uq.nulls_not_distinct = k.nulls_not_distinct;
+                            uq.reloptions = index_reloptions("btree", &k.options)?;
                             uniques.push(uq);
                             last_deferrable = Some(DeferTarget::Unique);
                         }
@@ -10596,6 +10633,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                     uq.deferrable = k.deferrable;
                     uq.initially_deferred = k.initdeferred;
                     uq.nulls_not_distinct = k.nulls_not_distinct;
+                    uq.reloptions = index_reloptions("btree", &k.options)?;
                     uniques.push(uq);
                 }
                 Ok(CT::ConstrPrimary) => {
@@ -10603,6 +10641,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                     if !k.conname.is_empty() {
                         pk_name = Some(k.conname.clone());
                     }
+                    pk_reloptions = index_reloptions("btree", &k.options)?;
                 }
                 // `EXCLUDE [USING m] (col WITH op, ...)`: each exclusion is a
                 // `[IndexElem, [op]]` pair. An all-`=` one is a UNIQUE (the
@@ -10656,6 +10695,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                     } else {
                         k.access_method.clone()
                     };
+                    uq.reloptions = index_reloptions(&method, &k.options)?;
                     if ops.iter().any(|o| o != "=") || method != "btree" {
                         uq.exclusion_ops = ops;
                         uq.exclusion_method = Some(method);
@@ -10698,6 +10738,9 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     let mut def = TableDef::new(&table, columns);
     if let Some(name) = pk_name {
         def.extra.insert("pk_name", name);
+    }
+    if !pk_reloptions.is_empty() {
+        def.extra.insert("pk_reloptions", pk_reloptions);
     }
     // A table-level PRIMARY KEY keeps its declared column order for the
     // catalog (`conkey`, `indkey`, `pg_get_constraintdef`), as the Python
@@ -19493,6 +19536,17 @@ thread_local! {
 pub fn planning_to_execute<R>(f: impl FnOnce() -> R) -> R {
     let previous = PLANNING_TO_EXECUTE.with(|p| p.replace(true));
     let out = f();
+    PLANNING_TO_EXECUTE.with(|p| p.set(previous));
+    out
+}
+
+/// Plan inside `f` for a statement that does not run what it plans: an
+/// EXPLAIN without ANALYZE, a PREPARE. No user function is called, no
+/// sequence drawn and no volatile subquery run, even inside a plan that
+/// executes (PostgreSQL runs a volatile function only in the executor).
+pub fn planning_without_running<R>(f: impl FnOnce() -> R) -> R {
+    let previous = PLANNING_TO_EXECUTE.with(|p| p.replace(false));
+    let out = correlated::without_calls(f);
     PLANNING_TO_EXECUTE.with(|p| p.set(previous));
     out
 }

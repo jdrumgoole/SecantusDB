@@ -1262,11 +1262,13 @@ pub fn executor_function_type(name: &str) -> Option<&'static str> {
 /// Is the executor's hook installed -- will an executor-answered call be
 /// answered, rather than read as NULL?
 pub(crate) fn executor_hook_installed() -> bool {
-    !SUPPRESSED.with(|s| s.get()) && SEQUENCE_HOOK.with(|r| r.get()).is_some()
+    !SUPPRESSED.with(|s| s.get())
+        && !NO_CALLS.with(|s| s.get())
+        && SEQUENCE_HOOK.with(|r| r.get()).is_some()
 }
 
 pub(crate) fn call_sequence(name: &str, args: &[Bson]) -> Result<Bson> {
-    if SUPPRESSED.with(|s| s.get()) {
+    if SUPPRESSED.with(|s| s.get()) || NO_CALLS.with(|s| s.get()) {
         return Ok(Bson::Null);
     }
     // A `regclass` argument (`nextval('s'::regclass)`) names the sequence
@@ -1289,6 +1291,21 @@ thread_local! {
     /// Set while an expression is evaluated only to learn its TYPE (a row
     /// expression's sample row): nothing may be drawn or run then.
     static SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// Set while a statement is planned and not run (an EXPLAIN without
+    /// ANALYZE, a PREPARE): no user function is called and no sequence is
+    /// drawn, each read as NULL, as with no executor hook installed.
+    static NO_CALLS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with user function calls and sequence draws switched off.
+pub(crate) fn without_calls<R>(f: impl FnOnce() -> R) -> R {
+    let previous = NO_CALLS.with(|s| s.replace(true));
+    let out = f();
+    NO_CALLS.with(|s| s.set(previous));
+    out
 }
 
 /// Run `f` with sequence draws and correlated subqueries switched off.
@@ -1588,7 +1605,7 @@ pub(crate) fn call_args_kind(args: &[pg_query::protobuf::Node]) -> CallArgs {
 /// Call a user function. With no hook installed (a Describe), or while only
 /// a TYPE is wanted, nothing runs and the answer is NULL.
 pub(crate) fn call_user_function(u: &UserFn, args: &[Bson]) -> Result<FnResult> {
-    if SUPPRESSED.with(|s| s.get()) {
+    if SUPPRESSED.with(|s| s.get()) || NO_CALLS.with(|s| s.get()) {
         return Ok(FnResult::Value(Bson::Null));
     }
     // Parameters the call left out take their DEFAULT, evaluated now and

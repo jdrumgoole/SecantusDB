@@ -5333,6 +5333,18 @@ fn note_id_key(db: &str, coll: &str, id_key: &[u8]) -> Result<()> {
     note_row(db, &format!("{coll}{ID_KEY_ROW_SUFFIX}"), h.finish() as i64)
 }
 
+/// Record that this thread is claiming (or releasing) the value `esc` of
+/// unique index `index` of `(db, coll)`: a key row as an `_id` claim is
+/// (see [`WrittenRow`]), so a writer that collides on the value can find the
+/// transaction holding it and wait for it.
+fn note_unique_claim(db: &str, coll: &str, index: &str, esc: &[u8]) -> Result<()> {
+    let mut key = Vec::with_capacity(index.len() + 1 + esc.len());
+    key.extend_from_slice(index.as_bytes());
+    key.push(0);
+    key.extend_from_slice(esc);
+    note_id_key(db, coll, &key)
+}
+
 /// Record that this thread is writing the document row `(db, coll,
 /// recordid)`: always as the last row written (see [`last_row_written`]), and
 /// inside a user transaction into its write set ([`UserTransactionHandle::held_rows`]).
@@ -14569,6 +14581,7 @@ impl Storage {
             }
             for kb in desc.key_variants(doc, desc.sparse)? {
                 let esc = escape_kb(&kb);
+                note_unique_claim(db, coll, &desc.name, &esc)?;
                 claims.reset()?;
                 claims.set_key_sssu(db, &key_coll(db, coll), &desc.name, &esc);
                 claims.set_value_q(recordid);
@@ -14664,6 +14677,7 @@ impl Storage {
                     match claims.search() {
                         Ok(()) => {
                             if claims.get_value_q().ok() == Some(recordid) {
+                                note_unique_claim(db, coll, &desc.name, &escape_kb(&kb))?;
                                 match claims.remove() {
                                     Ok(()) => {}
                                     Err(e) if e.is_not_found() => {}

@@ -5,8 +5,8 @@ ignored, and `ALTER INDEX ... SET` / `RESET` refused), RP-262 (`ROLLBACK
 TO SAVEPOINT` did not undo an index's CREATE, DROP, RENAME or ALTER, and
 lost the indexes of a table whose DROP it undid), RP-263 (a table's
 storage parameter given bare or twice) and RP-264 (a missing relation in
-`ALTER TABLE` and its kin was reported with a position). Filed open:
-RP-265, a constraint's index's storage parameters.
+`ALTER TABLE` and its kin was reported with a position), and in batch 78
+RP-265 (a constraint's index's storage parameters).
 
 Each scenario runs the same statements against a private, freshly
 initdb'd PostgreSQL 15.19 cluster and this server; the literals are 15.19's
@@ -147,7 +147,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ------------------------------- RP-265 a constraint's index's options
     "a constraint's index keeps its storage parameters": (
         "RP-265",
-        True,
+        False,
         [
             "create table rp77 (a int primary key with (fillfactor = 60), b int, "
             "constraint rp77_b_key unique (b) with (fillfactor = 70))",
@@ -155,6 +155,28 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
             "select indexdef from pg_indexes where tablename = 'rp77' order by indexname",
             "alter index rp77_pkey set (fillfactor = 50)",
             _RELOPTIONS,
+            "drop table rp77",
+        ],
+    ),
+    "a constraint's storage parameters through ALTER TABLE": (
+        "RP-265",
+        False,
+        [
+            "create table rp77 (a int not null, b int, c int)",
+            "alter table rp77 add constraint rp77_b_key unique (b) with (fillfactor = 55)",
+            "create unique index rp77_a_idx on rp77 (a) with (fillfactor = 65)",
+            "alter table rp77 add primary key using index rp77_a_idx",
+            _RELOPTIONS,
+            "select indexdef from pg_indexes where tablename = 'rp77' order by indexname",
+            "alter table rp77 rename constraint rp77_b_key to rp77_b_uq",
+            "alter index rp77_b_uq set (deduplicate_items = off)",
+            _RELOPTIONS,
+            "alter index rp77_a_idx reset (fillfactor)",
+            "begin",
+            "alter index rp77_b_uq set (fillfactor = 20)",
+            "rollback",
+            _RELOPTIONS,
+            "!alter table rp77 add constraint rp77_c_key unique (c) with (bogus = 1)",
             "drop table rp77",
         ],
     ),
@@ -382,8 +404,46 @@ EXPECTED: dict[str, Any] = {
         [("rp77", "None"), ("rp77_b_key", "['fillfactor=70']"), ("rp77_pkey", "['fillfactor=50']")],
         "DROP TABLE",
     ],
+    "a constraint's storage parameters through ALTER TABLE": [
+        "CREATE TABLE",
+        "ALTER TABLE",
+        "CREATE INDEX",
+        "ALTER TABLE",
+        [
+            ("rp77", "None"),
+            ("rp77_a_idx", "['fillfactor=65']"),
+            ("rp77_b_key", "['fillfactor=55']"),
+        ],
+        [
+            (
+                "CREATE UNIQUE INDEX rp77_a_idx ON public.rp77 "
+                "USING btree (a) WITH (fillfactor='65')",
+            ),
+            (
+                "CREATE UNIQUE INDEX rp77_b_key ON public.rp77 "
+                "USING btree (b) WITH (fillfactor='55')",
+            ),
+        ],
+        "ALTER TABLE",
+        "ALTER INDEX",
+        [
+            ("rp77", "None"),
+            ("rp77_a_idx", "['fillfactor=65']"),
+            ("rp77_b_uq", "['fillfactor=55', 'deduplicate_items=off']"),
+        ],
+        "ALTER INDEX",
+        "BEGIN",
+        "ALTER INDEX",
+        "ROLLBACK",
+        [
+            ("rp77", "None"),
+            ("rp77_a_idx", "None"),
+            ("rp77_b_uq", "['fillfactor=55', 'deduplicate_items=off']"),
+        ],
+        ("ERR", "22023", 'unrecognized parameter "bogus"', None, None),
+        "DROP TABLE",
+    ],
 }
-
 
 if __name__ == "__main__":
     dsn = sys.argv[1] + " dbname=postgres"

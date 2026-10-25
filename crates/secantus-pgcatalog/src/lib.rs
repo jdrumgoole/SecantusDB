@@ -342,6 +342,10 @@ pub struct UniqueConstraint {
     /// one counter, so an index's oid is its place in creation order.
     /// `None` for a constraint recorded before oids were drawn.
     pub oid: Option<i64>,
+    /// Its index's storage parameters (`UNIQUE (b) WITH (fillfactor = 70)`,
+    /// `ALTER INDEX ... SET`), as `pg_class.reloptions` keeps them.
+    /// Recorded only when set.
+    pub reloptions: Vec<String>,
 }
 
 impl UniqueConstraint {
@@ -357,6 +361,7 @@ impl UniqueConstraint {
             exclusion_method: None,
             nulls_not_distinct: false,
             oid: None,
+            reloptions: Vec::new(),
         }
     }
 
@@ -381,6 +386,9 @@ impl UniqueConstraint {
         }
         if let Some(oid) = self.oid {
             d.insert("oid", oid);
+        }
+        if !self.reloptions.is_empty() {
+            d.insert("reloptions", self.reloptions.clone());
         }
         d
     }
@@ -409,6 +417,14 @@ impl UniqueConstraint {
             exclusion_method: d.get_str("exclusion_method").ok().map(str::to_string),
             nulls_not_distinct: d.get_bool("nulls_not_distinct").unwrap_or(false),
             oid: d.get_i64("oid").ok(),
+            reloptions: d
+                .get_array("reloptions")
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|b| b.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 }
