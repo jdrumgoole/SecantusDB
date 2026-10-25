@@ -93,6 +93,13 @@ pub fn join_rows(outer: &JoinSide, inner: &JoinSide, left: bool) -> f64 {
     clamp_row_est(if left { n.max(outer.rows) } else { n })
 }
 
+/// A FULL join's estimated rows (`calc_joinrel_size_estimate`): at least
+/// every row of either side.
+pub fn full_join_rows(a: &JoinSide, b: &JoinSide) -> f64 {
+    let n = a.rows * b.rows * join_selectivity(a, b);
+    clamp_row_est(n.max(a.rows).max(b.rows))
+}
+
 /// `ExecChooseHashTableSize`'s buckets for a hashed side estimated at
 /// `rows`: a power of two at least the rows, at least 1,024.
 pub fn hash_buckets(rows: f64) -> usize {
@@ -404,6 +411,18 @@ pub enum JoinMethod {
     /// order, the `a` rows nothing matched in their key's place
     /// (`ExecMergeJoin`'s inner fill).
     MergeRightB { a_by_index: bool, b_by_index: bool },
+    /// A FULL join: a hash full join probing with `a`'s rows in scan
+    /// order, `b` hashed, each `a` row nothing matched in its place and the
+    /// `b` rows nothing matched last, in the hash table's order.
+    HashFullA,
+    /// A FULL join: a hash full join probing with `b`'s rows, `a` hashed.
+    HashFullB,
+    /// A FULL join: a merge full join with `a` outer, each side in key
+    /// order and the rows of either side nothing matched in their key's
+    /// place (`ExecMergeJoin`'s outer and inner fill).
+    MergeFullA { a_by_index: bool, b_by_index: bool },
+    /// A FULL join: a merge full join with `b` outer.
+    MergeFullB { a_by_index: bool, b_by_index: bool },
     /// A plan whose rows come in both sides' scan order, `a` outer: a
     /// nested loop, or a hash join on a unique `b`.
     Other,
@@ -509,6 +528,16 @@ fn add_path(paths: &mut Vec<JoinPath>, new: JoinPath, startup_counts: bool) {
 /// (`get_cheapest_fractional_path`); `None` for the whole result.
 pub fn cheapest_join(a: &JoinSide, b: &JoinSide, left: bool, limit: Option<f64>) -> JoinMethod {
     choose_join(a, b, left, limit, true)
+}
+
+/// `JoinMethod` for `a FULL JOIN b` on one equality: a merge or hash full
+/// join, either side outer (a FULL join is never a nested loop).
+pub fn cheapest_full_join(a: &JoinSide, b: &JoinSide, limit: Option<f64>) -> JoinMethod {
+    let mut rel = JoinRel::new(limit.is_some());
+    rel.add_full_paths(0, a, b);
+    rel.cheapest(limit, full_join_rows(a, b))
+        .expect("a join has paths")
+        .method
 }
 
 /// `cheapest_join` for an inner join left with no join clause, every
@@ -718,6 +747,72 @@ impl JoinRel {
             };
             for o in &outers {
                 consider(hash_join(o, inner), false, hash);
+            }
+        }
+    }
+
+    /// `add_paths_to_joinrel` for `a FULL JOIN b` on its one equality, each
+    /// side outer in turn: merge joins over two Sorts
+    /// (`sort_inner_and_outer`), merge joins over an outer already in order
+    /// (`match_unsorted_outer`, whose nested loops a FULL join cannot
+    /// use), then hash joins. A merge full join's output is in no order an
+    /// upper join can use: its NULL-extended rows break the key's order.
+    pub fn add_full_paths(&mut self, combo: usize, a: &JoinSide, b: &JoinSide) {
+        let startup_counts = self.startup_counts;
+        let paths = &mut self.paths;
+        let mut consider = |(startup, total): (f64, f64), method: JoinMethod| {
+            add_path(
+                paths,
+                JoinPath {
+                    startup,
+                    total,
+                    keyed: false,
+                    class: USELESS_KEYS,
+                    method,
+                    combo,
+                },
+                startup_counts,
+            );
+        };
+        for b_outer in [false, true] {
+            let (outer, inner) = if b_outer { (b, a) } else { (a, b) };
+            let merge = |oi: bool, ii: bool| {
+                if b_outer {
+                    JoinMethod::MergeFullB {
+                        a_by_index: ii,
+                        b_by_index: oi,
+                    }
+                } else {
+                    JoinMethod::MergeFullA {
+                        a_by_index: oi,
+                        b_by_index: ii,
+                    }
+                }
+            };
+            let (os, is) = (outer.scan_ordered, inner.scan_ordered);
+            if let Some(cost) = merge_join(outer, inner, os, is) {
+                consider(cost, merge(os, is));
+            }
+            let startup_outer =
+                (startup_counts && outer.startup_scan != outer.scan).then_some(JoinSide {
+                    scan: outer.startup_scan,
+                    ..*outer
+                });
+            let outers: Vec<&JoinSide> = std::iter::once(outer)
+                .chain(startup_outer.as_ref())
+                .collect();
+            for (oi, ii) in [(true, false), (true, true)] {
+                if let Some(cost) = merge_join(outer, inner, oi, ii) {
+                    consider(cost, merge(oi, ii));
+                }
+            }
+            let hash = if b_outer {
+                JoinMethod::HashFullB
+            } else {
+                JoinMethod::HashFullA
+            };
+            for o in &outers {
+                consider(hash_join(o, inner), hash);
             }
         }
     }

@@ -2004,15 +2004,13 @@ def test_a_right_join_over_a_join_is_searched_as_its_left_join(pg: Any) -> None:
     assert " ".join(":".join(str(v) for v in r) for r in got[1][:12]) == want
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_left_join_whose_nullable_side_holds_a_left_join_is_searched(pg: Any) -> None:
     """PostgreSQL 15.19, four 20-row tables never analysed: `l0 LEFT JOIN
     (l1 LEFT JOIN l2) JOIN l3` is searched like any four tables, under
     `make_outerjoininfo`'s rules for an outer join inside another's
     nullable side -- here a Merge Left Join of l0-l3's merge, sorted on
-    l0.b, with l1-l2. The join order search takes a LEFT join's nullable
-    side only when it is a table or an inner join of tables, so the rows
-    come out in the general path's order."""
+    l0.b, with l1-l2."""
     pg.execute("begin")
     try:
         for t, (mb, mc) in enumerate([(7, 5), (5, 3), (3, 4), (4, 7)]):
@@ -2034,6 +2032,55 @@ def test_a_left_join_whose_nullable_side_holds_a_left_join_is_searched(pg: Any) 
     )
     assert got[0] == "ok"
     assert len(got[1]) == 135
+    assert " ".join(":".join(str(v) for v in r) for r in got[1][:12]) == want
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_a_full_join_is_planned(pg: Any) -> None:
+    """PostgreSQL 15.19, two 20-row tables never analysed: `f0 FULL JOIN f1
+    ON f0.b = f1.a` is a Merge Full Join of both sides sorted on the key,
+    ties as quicksort leaves them, then the rows of f1 nothing matched."""
+    pg.execute("begin")
+    try:
+        for t, m in enumerate([7, 5]):
+            pg.execute(f"create table rp028_f{t} (a int, b int)")
+            pg.execute(f"insert into rp028_f{t} select i, i % {m} from generate_series(1, 20) i")
+        got = pg_answer(
+            pg,
+            "select rp028_f0.a, rp028_f1.a from rp028_f0 full join rp028_f1"
+            " on rp028_f0.b = rp028_f1.a",
+        )
+    finally:
+        pg.execute("rollback")
+    want = "7:None 14:None 15:1 8:1 1:1 16:2 9:2 2:2 3:3 10:3 17:3 11:4"
+    assert got[0] == "ok"
+    assert len(got[1]) == 34
+    assert " ".join(":".join(str(v) for v in r) for r in got[1][:12]) == want
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_full_join_under_an_inner_join_is_searched(pg: Any) -> None:
+    """PostgreSQL 15.19, three 20-row tables never analysed: `f0 FULL JOIN
+    f1 ON f0.b = f1.a JOIN f2 ON f1.b = f2.a`. The inner join's clause makes
+    f1 non-null, so `reduce_outer_joins` leaves `f1 LEFT JOIN f0`, and the
+    join search makes it a Merge Join of f2 with that Merge Left Join sorted
+    on f1.b. The search does not take a FULL join, so the rows come out in
+    the general path's order."""
+    pg.execute("begin")
+    try:
+        for t, m in enumerate([7, 5, 3]):
+            pg.execute(f"create table rp028_f{t} (a int, b int)")
+            pg.execute(f"insert into rp028_f{t} select i, i % {m} from generate_series(1, 20) i")
+        got = pg_answer(
+            pg,
+            "select rp028_f0.a, rp028_f1.a, rp028_f2.a from rp028_f0 full join rp028_f1"
+            " on rp028_f0.b = rp028_f1.a join rp028_f2 on rp028_f1.b = rp028_f2.a",
+        )
+    finally:
+        pg.execute("rollback")
+    want = "20:6:1 8:1:1 1:1:1 6:6:1 15:1:1 13:6:1 None:11:1 None:16:1 9:2:2 2:2:2 None:12:2 16:2:2"
+    assert got[0] == "ok"
+    assert len(got[1]) == 26
     assert " ".join(":".join(str(v) for v in r) for r in got[1][:12]) == want
 
 
