@@ -30,6 +30,12 @@ thread_local! {
     /// Set while a join source whose query's WHERE spans tables
     /// (`JoinRows::where_spans`) is read: its join order is not searched.
     static WHERE_SPANS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// One of those conjuncts is an equality between tables
+    /// (`JoinRows::where_spans_equality`).
+    static WHERE_SPANS_EQUALITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The tables each spanning conjunct reads (`JoinRows::where_span_aliases`).
+    static WHERE_SPAN_ALIASES: std::cell::RefCell<Vec<Vec<String>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// The joined-row keys the query reads above the join source being
     /// read (`JoinRows::needed`); `None` outside one.
     static NEEDED: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
@@ -52,9 +58,13 @@ pub(crate) fn with_join_where<T>(
     f: impl FnOnce() -> T,
 ) -> T {
     let outer = WHERE_SPANS.with(|c| c.replace(join.where_spans));
+    let outer_eq = WHERE_SPANS_EQUALITY.with(|c| c.replace(join.where_spans_equality));
+    let outer_aliases = WHERE_SPAN_ALIASES.with(|c| c.replace(join.where_span_aliases.clone()));
     let outer_needed = NEEDED.with(|n| n.replace(Some(join.needed.clone())));
     let out = f();
     WHERE_SPANS.with(|c| c.set(outer));
+    WHERE_SPANS_EQUALITY.with(|c| c.set(outer_eq));
+    WHERE_SPAN_ALIASES.with(|c| *c.borrow_mut() = outer_aliases);
     NEEDED.with(|n| *n.borrow_mut() = outer_needed);
     out
 }
@@ -193,7 +203,12 @@ impl PgHandler {
     /// on two column equalities; `None` for any other join.
     pub(crate) fn three_table_plan(&self, node: &JoinNode) -> Option<ThreePlan> {
         use secantus_pgplan::joincost::join_rows;
-        if WHERE_SPANS.with(|c| c.get()) || LOCK_ROW_IDS.with(|c| c.get()) {
+        // A WHERE over two of the three tables that is no equality is a
+        // join filter of the top join, where it is first evaluable, and its
+        // rows' estimate and cost are the same for every order the search
+        // compares; the WHERE runs over the joined rows above, in their
+        // order. An equality would join a class and change the clauses.
+        if WHERE_SPANS_EQUALITY.with(|c| c.get()) || LOCK_ROW_IDS.with(|c| c.get()) {
             return None;
         }
         let JoinNode::Join {
@@ -278,6 +293,18 @@ impl PgHandler {
             return None;
         };
         let w_alias = &bases[w].alias;
+        // A spanning conjunct over a pair the search may join first is that
+        // join's filter, below the top: not modelled. One over x and z (or
+        // y and z, past the pair) is the top join's.
+        let below_top = |set: &[String]| {
+            let within = |a: &str, b: &str| set.iter().all(|t| t == a || t == b);
+            !set.iter().all(|t| bases.iter().any(|b| b.alias == *t))
+                || within(&x.alias, &y.alias)
+                || within(w_alias, &z.alias)
+        };
+        if WHERE_SPAN_ALIASES.with(|c| c.borrow().iter().any(|s| below_top(s))) {
+            return None;
+        }
         if on1.iter().any(|a| *a != x.alias && *a != y.alias)
             || on2.iter().any(|a| a != w_alias && *a != z.alias)
         {

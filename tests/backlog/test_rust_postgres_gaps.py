@@ -2228,13 +2228,11 @@ def test_a_join_on_two_equalities_is_planned(pg: Any) -> None:
     assert " ".join(":".join(str(v) for v in r) for r in got[1][:12]) == want
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_where_over_two_of_three_tables_is_planned(pg: Any) -> None:
     """PostgreSQL 15.19, three 20-row tables never analysed: `w0 JOIN w1 ON
     w0.b = w1.a JOIN w2 ON w1.b = w2.a WHERE w0.c < w2.c`. The WHERE is a
-    join qual of whichever join first holds w0 and w2, which the join order
-    search does not take, so the rows come out in the general path's
-    order."""
+    join filter of the top join, the first that holds w0 and w2."""
     pg.execute("begin")
     try:
         for t, (mb, mc) in enumerate([(7, 5), (5, 3), (3, 4)]):
@@ -2251,6 +2249,33 @@ def test_a_where_over_two_of_three_tables_is_planned(pg: Any) -> None:
     finally:
         pg.execute("rollback")
     assert got == ("ok", [(15, 1, 1), (20, 6, 1), (16, 2, 2), (17, 3, 3), (10, 3, 3)])
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_where_over_a_pair_joined_first_is_planned(pg: Any) -> None:
+    """PostgreSQL 15.19, three 20-row tables never analysed: `w0 JOIN w1 ON
+    w0.b = w1.a JOIN w2 ON w1.b = w2.a WHERE w0.c > w1.c AND w1.c < w2.c`.
+    `w0.c > w1.c` is a join filter of the w0-w1 join, below the top: it
+    filters that join's rows (DEFAULT_INEQ_SEL in its estimate) before
+    they are sorted for the join above. The search declines a conjunct
+    below its top join, so the rows come out in the general path's
+    order."""
+    pg.execute("begin")
+    try:
+        for t, (mb, mc) in enumerate([(7, 5), (5, 3), (3, 4)]):
+            pg.execute(f"create table rp028_w{t} (a int, b int, c int)")
+            pg.execute(
+                f"insert into rp028_w{t} select i, i % {mb}, i % {mc} from generate_series(1, 20) i"
+            )
+        got = pg_answer(
+            pg,
+            "select rp028_w0.a, rp028_w1.a, rp028_w2.a from rp028_w0 join rp028_w1"
+            " on rp028_w0.b = rp028_w1.a join rp028_w2 on rp028_w1.b = rp028_w2.a"
+            " where rp028_w0.c > rp028_w1.c and rp028_w1.c < rp028_w2.c",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == ("ok", [(6, 6, 1), (13, 6, 1), (3, 3, 3), (17, 3, 3)])
 
 
 # RP-047: the lock manager. Each test needs two sessions on one server, so

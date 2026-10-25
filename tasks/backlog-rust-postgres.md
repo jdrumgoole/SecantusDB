@@ -593,15 +593,19 @@ one beside it.
     (`ExecHashGetHashValue`); 54 of 54 shapes at 20 to 3,000 rows, with a
     primary key and with NULL keys (14 before). Not yet: such a join in
     three or more tables, or FULL; an expression in a class; a LEFT join's class through the general path;
-    a class of text or other non-integer keys; three
-    tables with a WHERE over two of them or a LIMIT; four or more tables
+    a class of text or other non-integer keys; three tables with a WHERE
+    conjunct over a pair the search may join first (its join filter,
+    whose selectivity -- `DEFAULT_INEQ_SEL`, `neqjoinsel`, an OR's -- is
+    not modelled; one over the top join's tables is searched since
+    2026-10-25, 33 of 54 shapes against 3 before), or an equality over
+    two of them, or a LIMIT; four or more tables
     with a WHERE over two of them or a LIMIT; more than eight tables; an expression key with a function
     call or a cast that costs; parameterized nested loops (an index scan inner); a LIMIT with
     an ORDER BY, or with a WHERE over the general path; a join of more
     than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_where_over_two_of_three_tables_is_planned
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_where_over_a_pair_joined_first_is_planned
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
