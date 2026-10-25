@@ -211,6 +211,9 @@ impl PgHandler {
         } = raise;
         let mut message: Option<String> = None;
         let mut sqlstate: Option<String> = None;
+        // A condition's name is the message only when no MESSAGE option
+        // gives one (`exec_stmt_raise`); a format string conflicts with it.
+        let mut condname: Option<String> = None;
         match what {
             RaiseWhat::Format { text, args } => {
                 let mut values = Vec::with_capacity(args.len());
@@ -226,13 +229,13 @@ impl PgHandler {
                 let code = pl::condition_sqlstate(&name)
                     .ok_or_else(|| Self::unknown_condition(&name, line, true))?;
                 sqlstate = Some(code.to_string());
-                message = Some(name);
+                condname = Some(name);
             }
             RaiseWhat::Sqlstate(code) => {
                 if !pl::is_sqlstate(&code) {
                     return Err(Self::unknown_condition(&code, line, false));
                 }
-                message = Some(code.clone());
+                condname = Some(code.clone());
                 sqlstate = Some(code);
             }
             RaiseWhat::Nothing => {}
@@ -246,7 +249,10 @@ impl PgHandler {
         let mut schema = None;
         let mut seen: Vec<String> = Vec::new();
         for (name, expr) in options {
-            if seen.contains(&name) || (name == "MESSAGE" && message.is_some()) {
+            if seen.contains(&name)
+                || (name == "MESSAGE" && message.is_some())
+                || (name == "ERRCODE" && sqlstate.is_some())
+            {
                 let mut info = ErrorInfo::new(
                     "ERROR".into(),
                     "42601".into(),
@@ -281,11 +287,15 @@ impl PgHandler {
                         let code = pl::condition_sqlstate(&value)
                             .ok_or_else(|| Self::unknown_condition(&value, line, false))?;
                         sqlstate = Some(code.to_string());
+                        condname = Some(value);
                     }
                 }
                 _ => unreachable!("the parser admits only known options"),
             }
             seen.push(name);
+        }
+        if message.is_none() {
+            message = condname;
         }
         if message.is_none()
             && sqlstate.is_none()

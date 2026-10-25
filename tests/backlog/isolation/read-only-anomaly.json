@@ -1,0 +1,3 @@
+{
+"s2rx s2ry s1ry s1wy s1c s3r s2wx s2c s3c": [["setup", [["ok", "CREATE TABLE"], ["ok", "INSERT 0 2"]]], ["s1 setup", [["ok", "BEGIN"]]], ["s2 setup", [["ok", "BEGIN"]]], ["s3 setup", [["ok", "BEGIN"]]], ["s2rx", [["rows", [["0"]]]]], ["s2ry", [["rows", [["0"]]]]], ["s1ry", [["rows", [["0"]]]]], ["s1wy", [["ok", "UPDATE 1"]]], ["s1c", [["ok", "COMMIT"]]], ["s3r", [["rows", [["X", "0"], ["Y", "20"]]]]], ["s2wx", [["ok", "UPDATE 1"]]], ["s2c", [["ok", "COMMIT"]]], ["s3c", [["ok", "COMMIT"]]]]
+}

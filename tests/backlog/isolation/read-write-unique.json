@@ -1,0 +1,4 @@
+{
+"r1 r2 w1 w2 c1 c2": [["setup", [["ok", "CREATE TABLE"]]], ["s1 setup", [["ok", "BEGIN"]]], ["s2 setup", [["ok", "BEGIN"]]], ["r1", [["rows", []]]], ["r2", [["rows", []]]], ["w1", [["ok", "INSERT 0 1"]]], ["w2", "waiting"], ["c1", [["ok", "COMMIT"]]], ["w2 completed", [["ERROR", "40001", "could not serialize access due to read/write dependencies among transactions", "Reason code: Canceled on identification as a pivot, during conflict in checking."]]], ["c2", [["ok", "ROLLBACK"]]]],
+"r1 w1 c1 r2 w2 c2": [["setup", [["ok", "CREATE TABLE"]]], ["s1 setup", [["ok", "BEGIN"]]], ["s2 setup", [["ok", "BEGIN"]]], ["r1", [["rows", []]]], ["w1", [["ok", "INSERT 0 1"]]], ["c1", [["ok", "COMMIT"]]], ["r2", [["rows", [["42"]]]]], ["w2", [["ERROR", "23505", "duplicate key value violates unique constraint \"test_pkey\"", "Key (i)=(42) already exists."]]], ["c2", [["ok", "ROLLBACK"]]]]
+}

@@ -360,6 +360,8 @@ impl PgHandler {
         filter: &Document,
         sink: &mut dyn FnMut(Vec<Vec<u8>>) -> PgWireResult<bool>,
     ) -> PgWireResult<()> {
+        // SSI's view of the scan (RP-061), whichever way it reads.
+        self.ssi_scan(table, filter)?;
         let seq = self.collection_scan(table, filter);
         // A sequential scan prunes the pages it reads (RP-193).
         if seq {

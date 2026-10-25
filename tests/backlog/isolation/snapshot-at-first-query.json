@@ -1,0 +1,6 @@
+{
+"set1 ins2 sel1 c1": [["setup", [["ok", "CREATE TABLE"]]], ["s1 setup", [["ok", "BEGIN"]]], ["set1", [["ok", "SET"]]], ["ins2", [["ok", "INSERT 0 1"]]], ["sel1", [["rows", [["1"]]]]], ["c1", [["ok", "COMMIT"]]]],
+"show1 ins2 sel1 c1": [["setup", [["ok", "CREATE TABLE"]]], ["s1 setup", [["ok", "BEGIN"]]], ["show1", [["rows", [["4MB"]]]]], ["ins2", [["ok", "INSERT 0 1"]]], ["sel1", [["rows", [["1"]]]]], ["c1", [["ok", "COMMIT"]]]],
+"lock1 ins2 sel1 c1": [["setup", [["ok", "CREATE TABLE"]]], ["s1 setup", [["ok", "BEGIN"]]], ["lock1", [["ok", "LOCK TABLE"]]], ["ins2", [["ok", "INSERT 0 1"]]], ["sel1", [["rows", [["1"]]]]], ["c1", [["ok", "COMMIT"]]]],
+"sel1 ins2 sel1 c1": [["setup", [["ok", "CREATE TABLE"]]], ["s1 setup", [["ok", "BEGIN"]]], ["sel1", [["rows", [["0"]]]]], ["ins2", [["ok", "INSERT 0 1"]]], ["sel1", [["rows", [["0"]]]]], ["c1", [["ok", "COMMIT"]]]]
+}

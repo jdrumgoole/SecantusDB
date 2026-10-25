@@ -488,6 +488,40 @@ pub fn scan_path<'a>(
     best
 }
 
+/// How a table is read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScanKind {
+    Seq,
+    /// A bitmap heap scan over the index at this position.
+    Bitmap(usize),
+    /// A plain index scan of the index at this position.
+    Index(usize),
+}
+
+/// Every path `scan_path` weighs, with its `(startup, total)`: the
+/// sequential scan, then each index's bitmap heap scan and index scan, in
+/// that order -- so a caller can add `disable_cost` to the ones an
+/// `enable_*` setting turns off before taking the cheapest.
+pub fn scan_paths(
+    rel: &Rel,
+    indexes: &[Index],
+    quals: &[(String, Qual)],
+    colsel: &dyn Fn(&str) -> ColSel,
+    rows: f64,
+) -> Vec<(ScanKind, (f64, f64))> {
+    let mut out = vec![(ScanKind::Seq, seq_scan_path(rel, quals))];
+    for (i, index) in indexes.iter().enumerate() {
+        let cs = colsel(&index.field);
+        if let Some(c) = bitmap_heap_cost(rel, index, quals, cs, rows) {
+            out.push((ScanKind::Bitmap(i), c));
+        }
+        if let Some(c) = index_scan_cost(rel, index, quals, cs) {
+            out.push((ScanKind::Index(i), c));
+        }
+    }
+    out
+}
+
 /// The scans of a table with statistics: the sequential scan, each index's
 /// plain index scan, and the one bitmap heap scan `create_index_paths`
 /// makes, over `choose_bitmap_and`'s pick of every bitmap path (`bitmap`).

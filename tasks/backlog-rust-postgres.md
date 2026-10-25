@@ -723,15 +723,6 @@ Not filed:
   questions.
 - The slow 1M-row block cursor needs a release-build measurement first.
 
-- [ ] **SERIALIZABLE is snapshot isolation: write skew commits.** Two
-      SERIALIZABLE transactions each read both on-call rows and set their
-      own to false; both commit here, leaving nobody on call. PostgreSQL
-      15.19 fails one with 40001. `secantus-pg` treats SERIALIZABLE as
-      REPEATABLE READ. PostgreSQL's mechanism is SSI: predicate (SIREAD)
-      locks and rw-conflict tracking. The REPEATABLE READ scope decision
-      above is a different question.
-      Backlog-ID: RP-061
-      Verify: tests/backlog/test_rp_found_2026_10_20.py::test_serializable_write_skew
 
 ## Found by batch 30 (2026-10-22)
 
@@ -739,6 +730,77 @@ Found while building `REASSIGN OWNED` and `DROP OWNED` (RP-072). The gap
 tests are scenarios in `tests/backlog/test_rp_batch30.py`, measured on a
 private 15.19 cluster. RP-133 .. RP-136 and RP-138 .. RP-142 were found and
 fixed in the same batch; their tests there are regression tests.
+
+## Found by batch 75 (2026-10-25)
+
+Found while building serializable snapshot isolation (RP-061), a port of
+PostgreSQL 15.19's `predicate.c` checked against its own isolation specs
+(`tests/backlog/test_rp_isolation.py`, traces recorded on a private 15.19
+cluster). The open items' specs are gap tests there. Fixed in the same
+batch, their tests regression tests:
+- RP-257: `INSERT ... ON CONFLICT DO UPDATE ... WHERE` left the
+  conflicting row unlocked when the WHERE rejected it. PostgreSQL locks it
+  first, so a concurrent UPDATE waits.
+- RP-258: a void SQL function answered the empty string, where PostgreSQL
+  answers NULL. Only a void PL/pgSQL function answers the empty string.
+- RP-259: `RAISE SQLSTATE 'P1234' USING MESSAGE = 'x'` was 42601 in a DO
+  block. A second ERRCODE, MESSAGE after a format string, or a repeated
+  HINT or DETAIL was accepted in a function. `USING ERRCODE` alone gave an
+  empty message (`tests/backlog/test_rp_batch75.py`).
+- RP-260: a REPEATABLE READ transaction took its snapshot at a SET, SHOW
+  or LOCK. PostgreSQL takes it at the first statement that needs one.
+
+- [ ] **SERIALIZABLE reads through a partial index lock the whole table.**
+      The SIREAD locks follow the scan the planner prices (seq, bitmap or
+      B-tree index, `costsize::scan_paths`). A partial index is not priced,
+      so a scan its predicate covers locks the relation. PostgreSQL 15.19
+      reads `val2 = 1` by a bitmap scan of the partial index and `id = 10`
+      by an index scan. In `partial-index`'s `rxy1 wx1 wy2 c1 rxy2 c2` and
+      two other permutations, s2 is doomed when s1 commits ("identification
+      as a pivot, during conflict out checking"). In PostgreSQL it fails
+      later, at its read ("conflict out to pivot, during read").
+      Backlog-ID: RP-253
+      Verify: tests/backlog/test_rp_isolation.py::test_ssi_partial_index
+
+- [ ] **SERIALIZABLE scans of GIN, GiST and hash indexes lock the whole
+      table.** Only B-tree index scans take page and tuple SIREAD locks
+      here. PostgreSQL 15.19's GIN, GiST and hash access methods lock the
+      index pages a scan reads (`PredicateLockPage` in `ginget.c`,
+      `gistget.c`, `hashsearch.c`). They check conflicts in on the pages
+      an insert touches. So two transactions working on far-apart keys both
+      commit there and fail here: 16 of `predicate-gin`'s 31 permutations
+      agree, and 22 of 40 for `predicate-gist` and `predicate-hash`. It
+      needs page models of the three access methods, as `btree_model.rs`
+      is for B-trees.
+      Backlog-ID: RP-254
+      Verify: tests/backlog/test_rp_isolation.py::test_ssi_index_access_methods
+
+- [ ] **A duplicate key under REPEATABLE READ or SERIALIZABLE is 40001,
+      even after the other inserter rolls back.** Take a transaction that
+      inserts a key another open transaction has inserted. It waits, as in
+      PostgreSQL, and then fails with 40001 "could not serialize access due
+      to concurrent update" whether the other transaction committed or
+      rolled back. Inside an SQL function (`read-write-unique-3`) it does
+      not wait at all. PostgreSQL 15.19 waits, then:
+      - if the other transaction rolled back, the insert goes on;
+      - under REPEATABLE READ, if it committed, the insert fails 23505
+        (`unique-insert-wait`);
+      - under SERIALIZABLE, it fails with SSI's reason code: in
+        `read-write-unique` and `-2`, "identification as a pivot, during
+        conflict in checking"; in `-3` and `-4`, "during write".
+      Backlog-ID: RP-255
+      Verify: tests/backlog/test_rp_isolation.py::test_unique_insert_waits_under_serializable
+
+- [ ] **A transaction of a million inserted rows fails XX000.**
+      `multiple-row-versions`'s setup inserts 1,000,000 rows in one
+      implicit transaction. It fails with "could not insert: Transaction is
+      too large and will not fit in the storage engine cache". 400,000 rows
+      fit and 600,000 do not. PostgreSQL 15.19 has no such limit.
+      WiredTiger keeps a transaction's updates in its cache until commit,
+      so the fix lies in the cache size or eviction configuration that
+      both Rust servers share.
+      Backlog-ID: RP-256
+      Verify: tests/backlog/test_rp_isolation.py::test_million_row_transaction
 
 ## Found by batch 71 (2026-10-25)
 

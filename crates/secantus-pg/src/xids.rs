@@ -286,3 +286,46 @@ pub fn advance_command(storage: &Arc<Storage>, pid: i32, n: u32) {
         entry.1 = false;
     }
 }
+
+/// `pid`'s snapshot as `GetSnapshotData` would take it now: `(xmin, xmax,
+/// xip)`, the session's own xid not among them.
+pub fn snapshot_of(storage: &Arc<Storage>, pid: i32) -> (u64, u64, Vec<u64>) {
+    let all = clusters().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(c) = all.get(&key(storage)) else {
+        return (0, 0, Vec::new());
+    };
+    let xmax = c.latest_completed + 1;
+    let mut xip: Vec<u64> = c
+        .running
+        .iter()
+        .filter(|(p, x)| **p != pid && **x < xmax)
+        .map(|(_, x)| *x)
+        .collect();
+    xip.sort_unstable();
+    let xmin = xip.first().copied().unwrap_or(xmax);
+    (xmin, xmax, xip)
+}
+
+/// The cluster's next xid (`ShmemVariableCache->nextXid`).
+pub fn next_xid(storage: &Arc<Storage>) -> u64 {
+    let all = clusters().lock().unwrap_or_else(|e| e.into_inner());
+    all.get(&key(storage)).map_or(0, |c| c.next)
+}
+
+/// `pid`'s transaction's xid, if it has been given one.
+pub fn xid_of(storage: &Arc<Storage>, pid: i32) -> Option<u64> {
+    let all = clusters().lock().unwrap_or_else(|e| e.into_inner());
+    all.get(&key(storage))?.running.get(&pid).copied()
+}
+
+/// `pid`'s transaction takes a new snapshot (a DEFERRABLE transaction's
+/// retry): the xmin it holds is the new one's.
+pub fn rehold_snapshot(storage: &Arc<Storage>, pid: i32) {
+    {
+        let mut all = clusters().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = all.get_mut(&key(storage)) {
+            c.snapshots.remove(&pid);
+        }
+    }
+    hold_snapshot(storage, pid);
+}

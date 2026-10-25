@@ -486,7 +486,7 @@ def test_infinite_timestamps(rust_pg: Any) -> None:
     _check("infinite_timestamps", rust_pg)
 
 
-@pytest.mark.backlog("RP-061")
+@pytest.mark.backlog_fixed("RP-061")
 def test_serializable_write_skew(rust_pg: Any) -> None:
     """PostgreSQL 15.19 fails one of two SERIALIZABLE transactions that each
     read both rows and write one (40001), so one row stays on call."""

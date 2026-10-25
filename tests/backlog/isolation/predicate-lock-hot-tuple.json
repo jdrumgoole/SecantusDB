@@ -1,0 +1,3 @@
+{
+"b1 b2 r1 r2 w1 w2 c1 c2": [["setup", [["ok", "CREATE TABLE"], ["ok", "INSERT 0 3"], ["ok", "UPDATE 1"]]], ["b1", [["ok", "BEGIN"]]], ["b2", [["ok", "BEGIN"]]], ["r1", [["rows", [["5", "apple"], ["7", "pear_hot_updated"]]]]], ["r2", [["rows", [["5", "apple"], ["7", "pear_hot_updated"]]]]], ["w1", [["ok", "UPDATE 1"]]], ["w2", [["ok", "UPDATE 1"]]], ["c1", [["ok", "COMMIT"]]], ["c2", [["ERROR", "40001", "could not serialize access due to read/write dependencies among transactions", "Reason code: Canceled on identification as a pivot, during commit attempt."]]]]
+}

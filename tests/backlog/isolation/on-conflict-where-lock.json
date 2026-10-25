@@ -1,0 +1,4 @@
+{
+"ins1 upd2 c1 sel2": [["setup", [["ok", "CREATE TABLE"], ["ok", "INSERT 0 1"]]], ["s1 setup", [["ok", "BEGIN"]]], ["ins1", [["ok", "INSERT 0 0"]]], ["upd2", "waiting"], ["c1", [["ok", "COMMIT"]]], ["upd2 completed", [["ok", "UPDATE 1"]]], ["sel2", [["rows", [["1", "1"]]]]]],
+"ins1 upd2 a1 sel2": [["setup", [["ok", "CREATE TABLE"], ["ok", "INSERT 0 1"]]], ["s1 setup", [["ok", "BEGIN"]]], ["ins1", [["ok", "INSERT 0 0"]]], ["upd2", "waiting"], ["a1", [["ok", "ROLLBACK"]]], ["upd2 completed", [["ok", "UPDATE 1"]]], ["sel2", [["rows", [["1", "1"]]]]]]
+}

@@ -135,6 +135,19 @@ impl Shape for IndexShape {
 impl IndexShape {
     /// A row's index tuple key, or `None` when a partial index's predicate
     /// leaves the row out.
+    /// Its key columns' stored fields.
+    pub(crate) fn key_fields(&self) -> &[String] {
+        &self.fields[..self.nkey.min(self.fields.len())]
+    }
+
+    /// Is it partial, or over an expression? (A scan of it the SSI model
+    /// does not follow.)
+    pub(crate) fn is_plain(&self) -> bool {
+        self.predicate.is_none()
+            && self.computed.is_none()
+            && self.types.iter().all(Option::is_some)
+    }
+
     fn key_of(&self, doc: &Document) -> Option<Vec<Bson>> {
         if let Some(p) = &self.predicate {
             let empty = Document::new();
@@ -407,7 +420,7 @@ impl PgHandler {
 
     /// The model of `shape`, built from `table`'s rows as CREATE INDEX
     /// would when there is none yet.
-    fn with_btree<T>(
+    pub(crate) fn with_btree<T>(
         &self,
         table: &str,
         shape: &IndexShape,
@@ -516,11 +529,26 @@ impl PgHandler {
             }
             // A model built here is of the rows already stored, which these
             // versions are not yet among.
-            self.with_btree(table, &shape, |t| {
+            let events = self.with_btree(table, &shape, |t| {
+                t.ssi_events.clear();
                 for (key, unchanged, ctid) in keys {
                     t.insert_deleting(&*shape, key, ctid, unchanged, &|t| dead.contains(&t));
                 }
+                std::mem::take(&mut t.ssi_events)
             })?;
+            // What SSI hears of the inserts (`_bt_doinsert`, `_bt_split`):
+            // a split moves its page's locks to the new half too, whoever
+            // splits, and each insert checks the page it landed on.
+            for e in events {
+                match e {
+                    crate::btree_model::SsiEvent::Split(old, new) => {
+                        self.ssi_page_split(shape.oid, old, new)
+                    }
+                    crate::btree_model::SsiEvent::Landed(leaf) => {
+                        self.ssi_index_insert(shape.oid, leaf)?
+                    }
+                }
+            }
         }
         Ok(())
     }
