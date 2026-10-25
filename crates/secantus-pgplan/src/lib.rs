@@ -108,6 +108,7 @@ mod funcsig;
 mod named_args;
 mod schema_functions;
 mod search_cycle;
+pub mod server_encoding;
 mod strict_fold;
 mod system_views;
 pub mod timezones;

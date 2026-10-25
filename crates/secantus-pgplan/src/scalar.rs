@@ -1161,14 +1161,19 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             if let Bson::Binary(b) = &arg(0) {
                 return Ok(Bson::Int32(b.bytes.len() as i32));
             }
-            Ok(Bson::Int32(s(0).len() as i32))
+            // The text's bytes in the server encoding (RP-064).
+            Ok(Bson::Int32(
+                crate::server_encoding::bytes(&s(0)).len() as i32
+            ))
         }
         "bit_length" => {
             need(1)?;
             if let Bson::Binary(b) = &arg(0) {
                 return Ok(Bson::Int32((b.bytes.len() * 8) as i32));
             }
-            Ok(Bson::Int32((s(0).len() * 8) as i32))
+            Ok(Bson::Int32(
+                (crate::server_encoding::bytes(&s(0)).len() * 8) as i32,
+            ))
         }
         "get_byte" => {
             need(2)?;
@@ -1320,7 +1325,7 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         }
         "md5" => {
             need(1)?;
-            Ok(Bson::String(md5_hex(s(0).as_bytes())))
+            Ok(Bson::String(md5_hex(&crate::server_encoding::bytes(&s(0)))))
         }
         "quote_ident" => {
             need(1)?;
@@ -1340,6 +1345,29 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         "chr" => {
             need(1)?;
             let n = as_i64(&arg(0)).ok_or_else(|| wrong_args(name))?;
+            let too_large = || {
+                Error::Sqlstate(
+                    "54000",
+                    format!("requested character too large for encoding: {n}"),
+                )
+            };
+            // `pg_chr` outside UTF8: the argument is a byte of the server
+            // encoding, past 127 only in a single-byte one (RP-064).
+            let enc = crate::server_encoding::server_encoding();
+            if enc != "UTF8" && enc != "SQL_ASCII" {
+                if n == 0 {
+                    return Err(Error::Sqlstate(
+                        "54000",
+                        "null character not permitted".into(),
+                    ));
+                }
+                let byte = u8::try_from(n).map_err(|_| too_large())?;
+                if crate::server_encoding::multi_byte() && byte > 127 {
+                    return Err(too_large());
+                }
+                let c = crate::server_encoding::char_of_byte(byte).ok_or_else(too_large)?;
+                return Ok(Bson::String(c.to_string()));
+            }
             let c = u32::try_from(n)
                 .ok()
                 .filter(|n| *n != 0)
@@ -1366,6 +1394,22 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         }
         "ascii" => {
             need(1)?;
+            // Outside UTF8, the first byte in the server encoding (RP-064).
+            let enc = crate::server_encoding::server_encoding();
+            if enc != "UTF8" && enc != "SQL_ASCII" {
+                let text = s(0);
+                let first = crate::server_encoding::bytes(&text)
+                    .first()
+                    .copied()
+                    .unwrap_or(0);
+                if crate::server_encoding::multi_byte() && first > 127 {
+                    return Err(Error::Sqlstate(
+                        "54000",
+                        "requested character too large".into(),
+                    ));
+                }
+                return Ok(Bson::Int32(i32::from(first)));
+            }
             Ok(Bson::Int32(s(0).chars().next().map_or(0, |c| c as i32)))
         }
         // `split_part(s, sep, n)` -- a NEGATIVE `n` counts from the END
@@ -1674,7 +1718,26 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             // Only LATIN1's octets are their own code points: LATIN2's 0xB1
             // is `ą`, which this used to answer as LATIN1's `±`.
             let (encoding, _) = crate::builtins_text::encoding(&s(1), "source ")?;
-            crate::builtins_text::decode(&bytes, &encoding).map(Bson::String)
+            let text = crate::builtins_text::decode(&bytes, &encoding)?;
+            // The result is the server encoding's text: a character it has
+            // no byte for is 22P05, named in the source's bytes (RP-064).
+            let server = crate::server_encoding::server_encoding();
+            if let Err(c) = crate::server_encoding::encode(&server, &text) {
+                let source = crate::builtins_text::encoding_by_name(&s(1)).unwrap_or("UTF8");
+                let shown: Vec<String> = crate::server_encoding::encode(source, &c.to_string())
+                    .unwrap_or_else(|_| c.to_string().into_bytes())
+                    .iter()
+                    .map(|b| format!("0x{b:02x}"))
+                    .collect();
+                return Err(Error::Sqlstate(
+                    "22P05",
+                    format!(
+                        "character with byte sequence {} in encoding \"{source}\" has no equivalent in encoding \"{server}\"",
+                        shown.join(" ")
+                    ),
+                ));
+            }
+            Ok(Bson::String(text))
         }
         // --- numeric -------------------------------------------------------
         // `abs` gives back the type it was handed, so an exact numeric stays

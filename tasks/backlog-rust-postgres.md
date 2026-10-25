@@ -732,21 +732,6 @@ Not filed:
       above is a different question.
       Backlog-ID: RP-061
       Verify: tests/backlog/test_rp_found_2026_10_20.py::test_serializable_write_skew
-- [ ] **A database created with a non-UTF8 `ENCODING` still behaves as
-      UTF8.** `CREATE DATABASE ... ENCODING 'LATIN1'` is recorded (and
-      `pg_database` shows it), and TEMPLATE, OWNER, CONNECTION LIMIT,
-      IS_TEMPLATE, ALLOW_CONNECTIONS and ALTER DATABASE are PostgreSQL's
-      (2026-10-22). Inside such a database PostgreSQL 15.19 reports
-      `server_encoding` as LATIN1, defaults `client_encoding` to it, refuses a
-      character LATIN1 lacks on the way from the client (22P05), and its byte
-      functions count LATIN1 bytes: `octet_length('é')` is 1, `convert_to`
-      and `::bytea` give `\xe9`, `chr(8364)` is 54000. Here every database is
-      UTF8 inside. **Decided (Joe, 2026-10-22): emulate the encoding** --
-      PostgreSQL's model, the server encoding per database with the
-      client-to-server conversion and the byte functions honouring it -- as
-      its own slice.
-      Backlog-ID: RP-064
-      Verify: tests/backlog/test_rp064_encoding.py::test_latin1_database_behaves_as_latin1
 
 ## Found by batch 30 (2026-10-22)
 
@@ -754,6 +739,14 @@ Found while building `REASSIGN OWNED` and `DROP OWNED` (RP-072). The gap
 tests are scenarios in `tests/backlog/test_rp_batch30.py`, measured on a
 private 15.19 cluster. RP-133 .. RP-136 and RP-138 .. RP-142 were found and
 fixed in the same batch; their tests there are regression tests.
+
+## Found by batch 69 (2026-10-25)
+
+Found while applying an UPDATE in its scan's order (RP-247), and fixed in
+the same batch; its test in `tests/backlog/test_rp_batch69.py` is a
+regression test. RP-248: an UPDATE's RETURNING listed each row's old
+`ctid` (and `xmin`), where PostgreSQL 15.19 returns the new version's, and
+listed the rows in storage order rather than the scan's.
 
 ## Found by batch 68 (2026-10-25)
 
@@ -763,18 +756,6 @@ private 15.19 cluster. RP-246 (`SELECT ... INTO t` answered its rows and
 made no table, and an UNLOGGED CREATE TABLE AS made a logged one) was
 found and fixed in the same batch; its test there is a regression test.
 
-- [ ] **An UPDATE of every row places them in storage order.** After one
-      row of a full table moves to the next page (`update t set g = -g
-      where g = 1`), an `update t set g = g + 1000` here moves the rows in
-      the order the store holds them, so the moved row goes first. PostgreSQL
-      15.19 updates them in heap order, reading page 0 first. Its scan
-      prunes page 0's dead version as it reads it, and the space freed
-      takes row 2's new version at `(0,59)`. So every new version after the
-      first stands one place apart from PostgreSQL's, and so do the
-      statement's buffer counts. The UPDATE's rows need to be applied in
-      the scan's ctid order, each page pruned as the scan reaches it.
-      Backlog-ID: RP-247
-      Verify: tests/backlog/test_rp_batch68.py::test_scenario[an UPDATE after a row moved places rows as PostgreSQL does]
 
 ## Found by batch 66 (2026-10-24)
 

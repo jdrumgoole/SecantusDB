@@ -3687,6 +3687,9 @@ pub struct PgHandler {
     /// A cleartext password asked for and not yet given: the user, and the
     /// stored verifier to check it against.
     cleartext_auth: Mutex<Option<(String, Option<String>)>>,
+    /// The database's encoding, which this session's server side works in
+    /// (RP-064): `UTF8` unless CREATE DATABASE named another.
+    server_encoding: Mutex<String>,
     /// The database a login asked for is not there: said once the login
     /// has been proved, on a server with a `pg_hba.conf`.
     database_error: Mutex<Option<ErrorInfo>>,
@@ -4403,6 +4406,7 @@ impl PgHandler {
             hba: None,
             hba_rule: std::sync::OnceLock::new(),
             cleartext_auth: Mutex::new(None),
+            server_encoding: Mutex::new("UTF8".to_string()),
             database_error: Mutex::new(None),
             trust_unknown_users: false,
             db: OnceLock::new(),
@@ -4954,6 +4958,7 @@ impl PgHandler {
             self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
         );
         crate::xids::set_current(&self.storage);
+        secantus_pgplan::server_encoding::set_server_encoding(&self.server_encoding_name());
         self.install_reload_hook();
         // Session state, so installed per statement -- the gate below is
         // per catalog version, and a SET DateStyle changes no catalog.
@@ -25075,6 +25080,26 @@ impl PgHandler {
         // re-report the CANONICAL name -- the later report wins in libpq, and
         // it is the spelling psycopg matches on (`utf-8` -> `UTF8`). An invalid
         // name fails the connection, as PostgreSQL's does (22023).
+        // The database's encoding is the session's server encoding, and
+        // `client_encoding`'s default when the client named none (RP-064).
+        if let Ok(Some(info)) = self.databases.lookup(&self.storage, self.db()) {
+            if !info.encoding.is_empty() && info.encoding != "UTF8" {
+                let enc = info.encoding.clone();
+                *self
+                    .server_encoding
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = enc.clone();
+                self.settings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert("server_encoding".to_string(), enc.clone());
+                self.note_reportable_guc("server_encoding", &enc);
+                if !_c.metadata().contains_key("client_encoding") {
+                    self.apply_client_encoding(&enc)?;
+                }
+                self.report_pending_params(_c).await?;
+            }
+        }
         if let Some(requested) = _c.metadata().get("client_encoding").cloned() {
             self.apply_client_encoding(&requested)
                 .map_err(|e| match e {
@@ -25279,7 +25304,10 @@ impl SimpleQueryHandler for PgHandler {
         C: ClientInfo,
     {
         let enc = self.client_encoding();
-        encoding::decode(enc, &query.query_raw).map_err(|b| encoding::undecodable(enc, b))
+        let text =
+            encoding::decode(enc, &query.query_raw).map_err(|b| encoding::undecodable(enc, b))?;
+        self.check_server_text(enc, &text)?;
+        Ok(text)
     }
 
     async fn do_query<C>(&self, _c: &mut C, query: &str) -> PgWireResult<Vec<Response>>
@@ -28739,6 +28767,7 @@ impl PgHandler {
             "TimeZone" => (true, value.to_string()),
             "DateStyle" => (true, secantus_pgplan::DateStyle::parse(value).canonical()),
             "client_encoding" => (true, value.to_string()),
+            "server_encoding" => (true, value.to_string()),
             //  - standard_conforming_strings: the statement text is read under
             //    it (`apply_string_syntax`), so libpq's `PQescapeString` may
             //    follow the report -- it switches its own escaping on it.
@@ -28860,6 +28889,55 @@ impl PgHandler {
     /// behaviour. The stored value is always a canonical PostgreSQL name (the
     /// SET / `set_config` paths refuse anything else), so a bare lookup is
     /// enough; an absent value is the UTF8 default.
+    /// The session's server encoding (its database's, RP-064).
+    pub(crate) fn server_encoding_name(&self) -> String {
+        self.server_encoding
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The client's text converted to the server encoding, as PostgreSQL
+    /// converts what it reads: a character the server encoding has no byte
+    /// for is 22P05, naming it as the client sent it (RP-064).
+    fn check_server_text(&self, cenc: ClientEncoding, text: &str) -> PgWireResult<()> {
+        let server = self.server_encoding_name();
+        if matches!(server.as_str(), "UTF8" | "SQL_ASCII") || text.is_ascii() {
+            return Ok(());
+        }
+        let Err(c) = secantus_pgplan::server_encoding::encode(&server, text) else {
+            return Ok(());
+        };
+        let mut buf = [0u8; 4];
+        let utf8 = c.encode_utf8(&mut buf).as_bytes().to_vec();
+        let sent = if cenc.transcodes() {
+            encoding::encode(cenc, &utf8).unwrap_or(utf8)
+        } else {
+            utf8
+        };
+        let shown: Vec<String> = sent.iter().map(|b| format!("0x{b:02x}")).collect();
+        Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            "22P05".into(), // untranslatable_character
+            format!(
+                "character with byte sequence {} in encoding \"{}\" has no equivalent in encoding \"{server}\"",
+                shown.join(" "),
+                cenc.name()
+            ),
+        ))))
+    }
+
+    /// `check_server_text` over a text-format value's bytes.
+    fn check_server_bytes(&self, cenc: ClientEncoding, raw: &[u8]) -> PgWireResult<()> {
+        if raw.is_ascii() || matches!(self.server_encoding_name().as_str(), "UTF8" | "SQL_ASCII") {
+            return Ok(());
+        }
+        match encoding::decode(cenc, raw) {
+            Ok(text) => self.check_server_text(cenc, &text),
+            Err(_) => Ok(()),
+        }
+    }
+
     fn client_encoding(&self) -> ClientEncoding {
         let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
         settings
@@ -40668,6 +40746,10 @@ impl PgHandler {
                         .storage
                         .find_matching(self.db(), &upd.table, &upd.filter)
                         .map_err(|e| Self::storage_err("could not read", e))?;
+                    // In the order the UPDATE's scan reads them, which is the
+                    // order the new versions are placed, the triggers fire
+                    // and RETURNING lists them (RP-247).
+                    let raw = self.in_scan_order(&upd.table, &upd.filter, raw)?;
                     let mut writes = Vec::with_capacity(raw.len());
                     let mut new_rows = Vec::with_capacity(raw.len());
                     // Rows whose PRIMARY KEY changes: (old row, new row).
@@ -40824,6 +40906,33 @@ impl PgHandler {
                             &set,
                             &unset,
                         )?;
+                    }
+                    // RETURNING shows each row's new version: its system
+                    // columns (`ctid`, `xmin`, ...) as the write stamped
+                    // them (RP-248).
+                    if upd.returning.is_some() && !new_rows.is_empty() {
+                        let ids: Vec<Bson> = new_rows.iter().map(row_id).collect();
+                        let stored: Vec<Document> = self
+                            .storage
+                            .find_matching(
+                                self.db(),
+                                &upd.table,
+                                &bson::doc! { "_id": { "$in": ids } },
+                            )
+                            .map_err(|e| Self::storage_err("could not read", e))?
+                            .iter()
+                            .filter_map(|b| decode_doc(b).ok())
+                            .collect();
+                        for row in &mut new_rows {
+                            let id = row_id(row);
+                            if let Some(s) = stored.iter().find(|s| row_id(s) == id) {
+                                for f in ["__sys_xmin", "__sys_cid", "__sys_xmax", "__sys_ctid"] {
+                                    if let Some(v) = s.get(f) {
+                                        row.insert(f, v.clone());
+                                    }
+                                }
+                            }
+                        }
                     }
                     returned = new_rows;
                     matched
@@ -41162,10 +41271,15 @@ impl PgHandler {
         if !has_expr && !versioned {
             return self.update_rows_raw(table, filter, set, unset);
         }
-        let before: Vec<(Bson, Document)> = self
+        // In the order the UPDATE's scan reads them -- a sequential one in
+        // heap order, an index one in the index's -- which is the order
+        // their new versions are placed in (RP-247).
+        let found = self
             .storage
             .find_matching(self.db(), table, filter)
-            .map_err(|e| Self::storage_err("could not read", e))?
+            .map_err(|e| Self::storage_err("could not read", e))?;
+        let before: Vec<(Bson, Document)> = self
+            .in_scan_order(table, filter, found)?
             .iter()
             .filter_map(|raw| {
                 let d = decode_doc(raw).ok()?;
@@ -47381,6 +47495,9 @@ impl PgHandler {
                     Some(_) => None,
                 };
                 let declared_ty = enum_ty.as_ref().or(declared_ty);
+                if let (false, Some(raw)) = (binary, raw.as_ref()) {
+                    self.check_server_bytes(cenc, raw)?;
+                }
                 let value = decode_parameter(raw.as_ref(), declared_ty, binary, &tz, cenc)?;
                 self.check_enum_param(i, oids.get(i).copied(), declared_ty, &value)?;
                 Ok(value)
@@ -47961,7 +48078,10 @@ impl ExtendedQueryHandler for PgHandler {
         C: ClientInfo,
     {
         let enc = self.client_encoding();
-        encoding::decode(enc, &parse.query_raw).map_err(|b| encoding::undecodable(enc, b))
+        let text =
+            encoding::decode(enc, &parse.query_raw).map_err(|b| encoding::undecodable(enc, b))?;
+        self.check_server_text(enc, &text)?;
+        Ok(text)
     }
 
     /// The default `Parse` handling, plus the `pg_prepared_statements` row a
@@ -48775,6 +48895,8 @@ impl PgHandler {
                         )))
                     })?
                 };
+                // Converted to the server encoding as it is read (RP-064).
+                self.check_server_text(cenc, &text)?;
                 let mut parsed = copy_text::parse_lines(
                     &text,
                     format == CopyFormat::Csv,

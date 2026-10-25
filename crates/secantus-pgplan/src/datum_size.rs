@@ -96,7 +96,7 @@ fn jsonb_value(v: &crate::json::Json, offset: usize) -> usize {
     use crate::json::Json as J;
     match v {
         J::Null | J::Bool(_) => 0,
-        J::Str(s) => s.len(),
+        J::Str(s) => crate::server_encoding::bytes(s).len(),
         // A number is a numeric datum, INTALIGNed.
         J::Number(n) => {
             let text = crate::numeric::canonical_numeric_text(n).unwrap_or_else(|_| n.clone());
@@ -151,7 +151,7 @@ fn varlena_data(v: &Bson, ty: &str) -> Option<usize> {
         "inet" | "cidr" => 2 + if value_text(v).contains(':') { 16 } else { 4 },
         "bytea" => match v {
             Bson::Binary(b) => b.bytes.len(),
-            other => value_text(other).len(),
+            other => crate::server_encoding::bytes(&value_text(other)).len(),
         },
         "bpchar" | "character" | "char" => {
             let text = value_text(v);
@@ -159,9 +159,9 @@ fn varlena_data(v: &Bson, ty: &str) -> Option<usize> {
                 .split_once('(')
                 .and_then(|(_, n)| n.trim_end_matches(')').trim().parse::<usize>().ok())
                 .unwrap_or(0);
-            text.len() + width.saturating_sub(text.chars().count())
+            crate::server_encoding::bytes(&text).len() + width.saturating_sub(text.chars().count())
         }
-        _ => value_text(v).len(),
+        _ => crate::server_encoding::bytes(&value_text(v)).len(),
     })
 }
 
@@ -175,7 +175,7 @@ fn in_memory(v: &Bson, ty: &str) -> Option<usize> {
     }
     // `unknown` (and cstring) is a NUL-terminated C string.
     if matches!(ty, "unknown" | "cstring") {
-        return Some(value_text(v).len() + 1);
+        return Some(crate::server_encoding::bytes(&value_text(v)).len() + 1);
     }
     match layout(ty) {
         (-1, _) => Some(4 + varlena_data(v, ty)?),
