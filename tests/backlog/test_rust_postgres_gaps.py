@@ -2194,7 +2194,10 @@ def test_a_left_join_on_a_class_member_is_in_the_class_order(pg: Any) -> None:
         )
     finally:
         pg.execute("rollback")
-    want = "11:10:1:1 11:13:1:1 11:16:1:1 11:7:1:1 11:19:1:1 11:1:1:1 11:4:1:1 6:10:1:1 6:13:1:1 6:16:1:1 6:7:1:1 6:19:1:1"
+    want = (
+        "11:10:1:1 11:13:1:1 11:16:1:1 11:7:1:1 11:19:1:1 11:1:1:1 11:4:1:1"
+        " 6:10:1:1 6:13:1:1 6:16:1:1 6:7:1:1 6:19:1:1"
+    )
     assert got[0] == "ok"
     assert len(got[1]) == 56
     assert " ".join(":".join(str(v) for v in r) for r in got[1][:12]) == want
