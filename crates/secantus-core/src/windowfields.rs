@@ -67,11 +67,42 @@ struct OutField<'a> {
     window: Option<&'a Document>,
 }
 
+/// `$setWindowFields` over `docs`, every output document collected.
 pub fn set_window_fields_stage(
     spec: &Bson,
     docs: Vec<Document>,
     vars: &Document,
 ) -> R<Vec<Document>> {
+    let mut out = Vec::with_capacity(docs.len());
+    set_window_fields_each(spec, docs, vars, None, &mut |d| {
+        out.push(d);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// `$setWindowFields` over `docs`, each output document handed to `sink`
+/// as it is made, partition by partition in `sortBy` order -- so the stages
+/// after it can run on one document at a time, as mongod's do, instead of
+/// every document holding its window's values at once (RM-211: an unbounded
+/// `$push` over 110 MB of documents held 110 copies of it).
+///
+/// `downstream`: the top-level fields the stages after this one read, or
+/// `None` when they need whole documents. With the fields this stage reads
+/// it is what mongod keeps of each document in the partition's cache, which
+/// is held to 100 MiB (`internalDocumentSourceSetWindowFieldsMaxMemoryBytes`):
+/// past it, with `allowDiskUse: false`, mongod refuses with 5643011, and
+/// otherwise spills the cache. Only a window that reads to the end of its
+/// partition is counted -- one with an `"unbounded"` upper bound, or none --
+/// which holds the whole partition; a bounded window holds less, and is not
+/// refused here.
+pub(crate) fn set_window_fields_each(
+    spec: &Bson,
+    docs: Vec<Document>,
+    vars: &Document,
+    downstream: Option<&std::collections::BTreeSet<String>>,
+    sink: &mut dyn FnMut(Document) -> R<()>,
+) -> R<()> {
     let spec = spec.as_document().ok_or(Fallback::Defer)?;
     let partition_by = spec.get("partitionBy");
     let sort_by = match spec.get("sortBy") {
@@ -226,18 +257,23 @@ pub fn set_window_fields_stage(
             .collect();
     }
 
-    let mut out_docs: Vec<Document> = docs.clone();
+    // What of each document the partition cache holds, when a window reads
+    // the whole partition.
+    let cached = if holds_partition(&compiled) && !crate::memlimit::disk_allowed() {
+        Some(cache_fields(spec, &compiled, downstream))
+    } else {
+        None
+    };
+
     // mongod emits PARTITION BY PARTITION, in partition-key order (above),
     // and within each partition in `sortBy` order -- not the input order.
-    // Wrong order is wrong RESULTS as
-    // soon as a `$limit` follows, so this is not cosmetic. `sorted_slots`
-    // already yields exactly that sequence, so recording it costs nothing.
-    // Mirrors `aggregate._stage_set_window_fields`.
-    let mut emit_order: Vec<usize> = Vec::with_capacity(docs.len());
-
+    // Wrong order is wrong RESULTS as soon as a `$limit` follows, so this is
+    // not cosmetic. `sorted_slots` yields exactly that sequence.
     for part in &partitions {
         let slots = sorted_slots(part, &docs, sort_by)?;
-        emit_order.extend(slots.iter().copied());
+        if let Some(fields) = &cached {
+            check_cache(&slots, &docs, fields.as_ref())?;
+        }
         let n = slots.len();
         let ranks = if needs_rank {
             Some(compute_ranks(&slots, &docs, sort_by))
@@ -298,7 +334,12 @@ pub fn set_window_fields_stage(
                 },
             );
         }
+        // The last window each accumulator output was computed over, and its
+        // value: a window that does not move (the whole partition, say) is
+        // computed once, not once per document.
+        let mut last_window: Vec<Option<(i64, i64, Bson)>> = vec![None; compiled.len()];
         for (pos, &orig_i) in slots.iter().enumerate() {
+            let mut out_doc = docs[orig_i].clone();
             for (ci, c) in compiled.iter().enumerate() {
                 let value = if RANK_FUNCS.contains(&c.op) {
                     let r = ranks.as_ref().unwrap();
@@ -352,24 +393,104 @@ pub fn set_window_fields_stage(
                     } else {
                         window_bounds(pos, n, c.window)?
                     };
-                    let mut acc = group::new_acc(c.op)?;
-                    if high >= low {
-                        for &s in &slots[low as usize..=high as usize] {
-                            group::apply_acc(&mut acc, c.arg, &docs[s], vars)?;
+                    match &last_window[ci] {
+                        Some((l, h, v)) if *l == low && *h == high => v.clone(),
+                        _ => {
+                            let mut acc = group::new_acc(c.op)?;
+                            if high >= low {
+                                for &s in &slots[low as usize..=high as usize] {
+                                    group::apply_acc(&mut acc, c.arg, &docs[s], vars)?;
+                                }
+                            }
+                            let v = group::finalize_window_value(acc)?;
+                            last_window[ci] = Some((low, high, v.clone()));
+                            v
                         }
                     }
-                    group::finalize_window_value(acc)?
                 };
-                paths::set_path(&mut out_docs[orig_i], c.field, value)
-                    .map_err(|_| Fallback::Defer)?;
+                paths::set_path(&mut out_doc, c.field, value).map_err(|_| Fallback::Defer)?;
             }
+            sink(out_doc)?;
         }
     }
+    Ok(())
+}
 
-    Ok(emit_order
-        .into_iter()
-        .map(|i| out_docs[i].clone())
-        .collect())
+/// Whether some output reads its partition to the end before it can answer
+/// the first document: an accumulator with no window, or a window whose
+/// upper bound is `"unbounded"`.
+fn holds_partition(compiled: &[OutField]) -> bool {
+    compiled.iter().any(|c| {
+        if RANK_FUNCS.contains(&c.op)
+            || PREFIX_OPS.contains(&c.op)
+            || matches!(c.op, "$shift" | "$derivative")
+        {
+            return false;
+        }
+        let bounds = c
+            .window
+            .and_then(|w| w.get("documents").or_else(|| w.get("range")));
+        match bounds {
+            None => true,
+            Some(Bson::Array(b)) => {
+                b.len() == 2 && matches!(&b[1], Bson::String(s) if s == "unbounded")
+            }
+            Some(_) => false,
+        }
+    })
+}
+
+/// The top-level fields of each document the partition cache keeps (`None`:
+/// whole documents): what this stage reads, and what the stages after it do.
+fn cache_fields(
+    spec: &Document,
+    compiled: &[OutField],
+    downstream: Option<&std::collections::BTreeSet<String>>,
+) -> Option<std::collections::BTreeSet<String>> {
+    let mut fields = downstream?.clone();
+    if let Some(by) = spec.get("partitionBy") {
+        if !group::collect_fields(by, &mut fields) {
+            return None;
+        }
+    }
+    if let Some(Bson::Document(sb)) = spec.get("sortBy") {
+        for k in sb.keys() {
+            fields.insert(k.split('.').next().unwrap_or(k).to_string());
+        }
+    }
+    for c in compiled {
+        if !group::collect_fields(c.arg, &mut fields) {
+            return None;
+        }
+    }
+    Some(fields)
+}
+
+/// mongod's partition cache over `slots`, refused (5643011) once it holds
+/// more than 100 MiB with no disk to spill to.
+fn check_cache(
+    slots: &[usize],
+    docs: &[Document],
+    fields: Option<&std::collections::BTreeSet<String>>,
+) -> R<()> {
+    let mut held = 0usize;
+    for &s in slots {
+        held += match fields {
+            Some(f) => crate::memlimit::fields_size(&docs[s], f),
+            None => crate::memlimit::document_size(&docs[s]),
+        };
+        if held > crate::memlimit::budgets().window_fields {
+            return Err(Fallback::mongo(
+                5643011,
+                format!(
+                    "Exceeded max memory. Current memory: {held} bytes. Max allowed memory: {} \
+                     bytes. Set 'allowDiskUse: true' to spill to disk",
+                    crate::memlimit::budgets().window_fields
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The partition's original indices, reordered by `sortBy` (BSON order, stable,

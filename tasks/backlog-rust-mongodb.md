@@ -707,22 +707,20 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
   246 SnapshotUnavailable, by name, rather than answer as of now; without
   `atClusterTime` it reads the latest data, which is correct. `secantusd-rs`
   creates its stores the other way, mongod's (RM-210).
-- [ ] **Aggregation has no memory limits and nothing spills.** Over 110
-      one-megabyte documents mongod 8.2.11 refuses: `$group` with
-      `allowDiskUse: false` (292 QueryExceededMemoryLimitNoDiskUseAllowed),
-      an array past 100 MB from `$push` or `$addToSet` (146
-      ExceededMemoryLimit), `$setWindowFields` (5643011), a `$lookup`
-      result (4568) and `$facet` (4031700). This server runs every one,
-      holding it all in memory; `allowDiskUse` is only type-checked
-      (`aggregate.rs`). A blocking `$sort` already agrees. mongod's
-      mechanism is per-stage memory accounting with spilling to disk when
-      `allowDiskUse` permits it. **The cost is far past the data's size**
-      (measured 2026-10-21, debug build): the gap test's 110 MB of documents
-      take `secantusd-rs` to a 14.5 GB peak RSS, where mongod peaks at 90 MB
-      refusing them -- enough to kill a 16 GB CI runner, so CI's verifier
-      runs with `--skip RM-211`; run its gap test by hand.
-      Backlog-ID: RM-211
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_aggregation_memory_limits
+- [ ] **A blocking sort has no memory limit.** Since RM-211 the
+      aggregation stages hold mongod's budgets, but a blocking `$sort`,
+      the sort inside `$bucketAuto`, and a `find` sort do not: with
+      `allowDiskUse: false` mongod 8.2.11 refuses one over 100 MiB (292,
+      "Sort exceeded memory limit of 104857600 bytes, but did not opt in to
+      external sorting.") where this server sorts it. mongod counts each
+      key and document through its sorter's memory pool
+      (`sorter_template_defs.h`, `memPool->memUsage()`), whose chunk sizes
+      the source does not fix: measured over `{_id, s: 1 MB}` documents a
+      sort on `{s: 1, _id: 1}` refuses at 52 documents and one on `{_id:
+      -1}` at 104, about 1 % over the documents' own size, so modelling it
+      needs that pool measured first.
+      Backlog-ID: RM-315
+      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_blocking_sort_memory_limit
 - `$convert` to binData subtype 2 (the deprecated "old binary") is
   written with the old format's inner length, as the bson crate writes
   every subtype-2 value. mongod 8.2.11 writes the bytes alone, which is not

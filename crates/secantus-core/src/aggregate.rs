@@ -51,8 +51,9 @@ pub fn apply_pipeline(
     // key, `$sortArray` -- reads the active collation. A pipeline with none
     // leaves whatever its caller set.
     let _active = coll.map(|c| crate::collation::activate(Some(c)));
-    for stage in pipeline {
-        let Bson::Document(s) = stage else {
+    let mut i = 0;
+    while i < pipeline.len() {
+        let Bson::Document(s) = &pipeline[i] else {
             return Err(Fallback::Defer);
         };
         if s.len() != 1 {
@@ -63,7 +64,14 @@ pub fn apply_pipeline(
         // point every stage passes through, including those (a `$sort`) that
         // are a single call with no per-document loop to poll from.
         deadline::check_now()?;
+        if name == "$setWindowFields" {
+            let (out, next) = window_fields_streamed(spec, docs, &pipeline[i + 1..], vars, coll)?;
+            docs = out;
+            i += 1 + next;
+            continue;
+        }
         docs = apply_stage(name, spec, docs, vars, coll)?;
+        i += 1;
     }
     deadline::check_now()?;
     Ok(docs)
@@ -202,6 +210,82 @@ fn apply_stage(
         // storage-backed ($lookup/$geoNear/$out/$merge) / $sample / … -> Python.
         _ => Err(Fallback::Defer),
     }
+}
+
+/// The stages that take one document and give back at most one, which run
+/// on each `$setWindowFields` output as it is made.
+const PER_DOCUMENT: &[&str] = &[
+    "$project",
+    "$addFields",
+    "$set",
+    "$unset",
+    "$replaceRoot",
+    "$replaceWith",
+    "$match",
+];
+
+thread_local! {
+    /// The stages a caller runs after the pipeline `apply_pipeline` is
+    /// given (the command layer splits a pipeline at its storage stages).
+    static DOWNSTREAM: std::cell::RefCell<Vec<Bson>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Puts the previous downstream stages back when dropped.
+pub struct Downstream(Vec<Bson>);
+
+impl Drop for Downstream {
+    fn drop(&mut self) {
+        let previous = std::mem::take(&mut self.0);
+        DOWNSTREAM.with(|d| *d.borrow_mut() = previous);
+    }
+}
+
+/// While the guard lives, `stages` run after whatever pipeline
+/// `apply_pipeline` runs: a stage's dependency analysis reads on into them.
+pub fn downstream(stages: &[Bson]) -> Downstream {
+    Downstream(DOWNSTREAM.with(|d| std::mem::replace(&mut *d.borrow_mut(), stages.to_vec())))
+}
+
+/// `$setWindowFields`, with the per-document stages right after it run on
+/// each output document as it is made (mongod streams them; holding every
+/// output first held every window's values at once -- RM-211). Returns the
+/// documents and how many of `rest` it ran.
+fn window_fields_streamed(
+    spec: &Bson,
+    docs: Vec<Document>,
+    rest: &[Bson],
+    vars: &Document,
+    coll: Option<&Collation>,
+) -> R<(Vec<Document>, usize)> {
+    let fused = rest
+        .iter()
+        .take_while(|s| {
+            s.as_document()
+                .filter(|d| d.len() == 1)
+                .and_then(|d| d.keys().next())
+                .is_some_and(|k| PER_DOCUMENT.contains(&k.as_str()))
+        })
+        .count();
+    let mut after: Vec<Bson> = rest.to_vec();
+    DOWNSTREAM.with(|d| after.extend(d.borrow().iter().cloned()));
+    let fields = group::downstream_fields(&after);
+    let mut out = Vec::new();
+    windowfields::set_window_fields_each(spec, docs, vars, fields.as_ref(), &mut |d| {
+        let mut one = vec![d];
+        for stage in &rest[..fused] {
+            let (name, spec) = stage
+                .as_document()
+                .and_then(|s| s.iter().next())
+                .ok_or(Fallback::Defer)?;
+            one = apply_stage(name, spec, one, vars, coll)?;
+            if one.is_empty() {
+                break;
+            }
+        }
+        out.extend(one);
+        Ok(())
+    })?;
+    Ok((out, fused))
 }
 
 /// `$facet` — run each named sub-pipeline over a copy of the same input docs and
@@ -876,6 +960,8 @@ fn facet_stage(
     }
     let n = s.len();
     let mut out = Document::new();
+    // The output document's size so far (RM-211).
+    let mut used = 0usize;
     for (i, (name, sub)) in s.iter().enumerate() {
         let Bson::Array(sub_pipeline) = sub else {
             return Err(Fallback::Defer); // Python raises 40170 (entry must be an array)
@@ -896,6 +982,9 @@ fn facet_stage(
             docs.clone()
         };
         let result = apply_pipeline(input, sub_pipeline, vars, coll)?;
+        for d in &result {
+            crate::memlimit::facet_add(&mut used, d)?;
+        }
         out.insert(
             name.clone(),
             Bson::Array(result.into_iter().map(Bson::Document).collect()),

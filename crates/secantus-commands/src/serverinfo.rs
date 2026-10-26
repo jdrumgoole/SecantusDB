@@ -589,6 +589,44 @@ fn parameters(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
             true,
             Bson::Int32(i32::MAX),
         ),
+        // The aggregation memory budgets (RM-211), mongod 8.2.11's
+        // defaults and types.
+        (
+            "internalDocumentSourceGroupMaxMemoryBytes",
+            true,
+            Bson::Int64(104_857_600),
+        ),
+        (
+            "internalDocumentSourceSetWindowFieldsMaxMemoryBytes",
+            true,
+            Bson::Int64(104_857_600),
+        ),
+        (
+            "internalLookupStageIntermediateDocumentMaxSizeBytes",
+            true,
+            Bson::Int64(104_857_600),
+        ),
+        (
+            "internalQueryFacetMaxOutputDocSizeBytes",
+            true,
+            Bson::Int64(104_857_600),
+        ),
+        (
+            "internalQueryMaxAddToSetBytes",
+            true,
+            Bson::Int64(104_857_600),
+        ),
+        (
+            "internalQueryMaxConcatArraysBytes",
+            true,
+            Bson::Int64(104_857_600),
+        ),
+        ("internalQueryMaxPushBytes", true, Bson::Int32(104_857_600)),
+        (
+            "internalQueryMaxSetUnionBytes",
+            true,
+            Bson::Int64(104_857_600),
+        ),
         ("localLogicalSessionTimeoutMinutes", true, Bson::Int32(30)),
         ("logLevel", true, Bson::Int32(0)),
         (
