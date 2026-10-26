@@ -2301,7 +2301,7 @@ def test_a_where_equality_over_two_of_three_tables_is_planned(pg: Any) -> None:
     assert got == ("ok", [(6, 6, 1), (1, 1, 1), (2, 2, 2), (3, 3, 3)])
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_limit_over_three_tables_is_planned(pg: Any) -> None:
     """PostgreSQL 15.19, three 20-row tables never analysed: `w0 JOIN w1 ON
     w0.b = w1.a JOIN w2 ON w1.b = w2.a LIMIT 5` is planned for its first five
@@ -2323,6 +2323,41 @@ def test_a_limit_over_three_tables_is_planned(pg: Any) -> None:
     finally:
         pg.execute("rollback")
     assert got == ("ok", [(1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4), (6, 6, 1)])
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_limit_over_left_joins_reads_a_parameterized_join(pg: Any) -> None:
+    """PostgreSQL 15.19, four 300-row tables never analysed, an index on
+    v1.a: `v0 LEFT JOIN v1 ON v0.b = v1.a LEFT JOIN v2 ON v1.b = v2.a LEFT
+    JOIN v3 ON v2.b = v3.a LIMIT 5` is a Nested Loop Left Join whose inner
+    is the join of v1 and v2 parameterized by v0.b (a Hash Right Join over
+    v1's Index Scan with `a = v0.b`), so the rows come in v0's scan order.
+    A join relation parameterized by an outer table (`param_source_rels`,
+    which an outer join's SpecialJoinInfo allows) is not modelled: the
+    LIMIT's search declines, and the join runs as written."""
+    pg.execute("begin")
+    try:
+        mods = [7, 5, 3, 4, 6]
+        for t in range(4):
+            pg.execute(f"create table rp028_v{t} (a int, b int, c int)")
+            pg.execute(
+                f"insert into rp028_v{t} select i, i % {mods[t]}, i % {mods[t + 1]}"
+                " from generate_series(1, 300) i"
+            )
+        pg.execute("create index rp028_v1_a on rp028_v1 (a)")
+        got = pg_answer(
+            pg,
+            "select rp028_v0.a, rp028_v1.a, rp028_v2.a, rp028_v3.a from rp028_v0"
+            " left join rp028_v1 on rp028_v0.b = rp028_v1.a"
+            " left join rp028_v2 on rp028_v1.b = rp028_v2.a"
+            " left join rp028_v3 on rp028_v2.b = rp028_v3.a limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == (
+        "ok",
+        [(1, 1, 1, 1), (2, 2, 2, 2), (3, 3, 3, None), (4, 4, 4, 1), (5, 5, None, None)],
+    )
 
 
 # RP-047: the lock manager. Each test needs two sessions on one server, so
