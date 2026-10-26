@@ -193,6 +193,9 @@ pub struct JoinRows {
     /// Those conjuncts as row expressions over the joined keys, for the
     /// ones the search can place.
     pub where_filters: Vec<JoinFilter>,
+    /// Those that are an equality of two tables' columns, as joined-key
+    /// pairs: each a join clause between its two tables.
+    pub where_equalities: Vec<(String, String)>,
     /// The joined-row keys the query reads above the join -- its select
     /// list, GROUP BY, HAVING, ORDER BY and the rest, not its WHERE, whose
     /// conjuncts each read one table and run at its scan. They make the
@@ -482,6 +485,35 @@ fn finish_join_source(
     // The WHERE's conjuncts over more than one table, as row expressions over
     // the joined keys, for the join order search to apply where PostgreSQL
     // evaluates each: as a join filter of the first join holding its tables.
+    // Its equalities between two tables' columns, as joined-key pairs: each
+    // an equivalence class PostgreSQL joins on, a clause between them.
+    let where_equalities: Vec<(String, String)> = match out.where_clause.as_deref() {
+        Some(w) => {
+            let mut conjuncts = Vec::new();
+            split_and(w, &mut conjuncts);
+            conjuncts
+                .into_iter()
+                .filter_map(|c| {
+                    let Some(N::AExpr(e)) = c.node.as_ref() else {
+                        return None;
+                    };
+                    if e.kind != pg_query::protobuf::AExprKind::AexprOp as i32
+                        || operator_name(e) != Ok("=")
+                    {
+                        return None;
+                    }
+                    let key = |x: Option<&pg_query::protobuf::Node>| match x?.node.as_ref()? {
+                        N::ColumnRef(c) if c.fields.len() == 1 => column_ref_name(c),
+                        _ => None,
+                    };
+                    let (l, r) = (key(e.lexpr.as_deref())?, key(e.rexpr.as_deref())?);
+                    let alias = |k: &str| k.split_once(SEP).map(|(a, _)| a.to_string());
+                    (alias(&l)? != alias(&r)?).then_some((l, r))
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
     let where_filters: Vec<JoinFilter> = match out.where_clause.as_deref() {
         Some(w) => {
             let mut conjuncts = Vec::new();
@@ -540,6 +572,7 @@ fn finish_join_source(
                     where_spans_equality,
                     where_span_aliases,
                     where_filters,
+                    where_equalities,
                     needed,
                 })),
                 def,

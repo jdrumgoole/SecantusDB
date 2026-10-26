@@ -2276,14 +2276,13 @@ def test_a_where_over_a_pair_joined_first_is_planned(pg: Any) -> None:
     assert got == ("ok", [(6, 6, 1), (13, 6, 1), (3, 3, 3), (17, 3, 3)])
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_where_equality_over_two_of_three_tables_is_planned(pg: Any) -> None:
     """PostgreSQL 15.19, three 20-row tables never analysed: `w0 JOIN w1 ON
     w0.b = w1.a JOIN w2 ON w1.b = w2.a WHERE w0.c = w2.c`. The WHERE's
     equality is an equivalence class of its own, so w0 and w2 have a join
-    clause and the search weighs joining them first. A WHERE equality
-    between tables is declined, so the rows come out in the general path's
-    order."""
+    clause and the search weighs joining them first: a Merge Join of w0-w1
+    with w2 on both clauses."""
     pg.execute("begin")
     try:
         for t, (mb, mc) in enumerate([(7, 5), (5, 3), (3, 4)]):
@@ -2300,6 +2299,30 @@ def test_a_where_equality_over_two_of_three_tables_is_planned(pg: Any) -> None:
     finally:
         pg.execute("rollback")
     assert got == ("ok", [(6, 6, 1), (1, 1, 1), (2, 2, 2), (3, 3, 3)])
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_limit_over_three_tables_is_planned(pg: Any) -> None:
+    """PostgreSQL 15.19, three 20-row tables never analysed: `w0 JOIN w1 ON
+    w0.b = w1.a JOIN w2 ON w1.b = w2.a LIMIT 5` is planned for its first five
+    rows (`get_cheapest_fractional_path`), a nested loop that returns them
+    in w0's scan order. The three-table search plans for every row, so the
+    LIMIT takes the first five of a different order."""
+    pg.execute("begin")
+    try:
+        for t, (mb, mc) in enumerate([(7, 5), (5, 3), (3, 4)]):
+            pg.execute(f"create table rp028_w{t} (a int, b int, c int)")
+            pg.execute(
+                f"insert into rp028_w{t} select i, i % {mb}, i % {mc} from generate_series(1, 20) i"
+            )
+        got = pg_answer(
+            pg,
+            "select rp028_w0.a, rp028_w1.a, rp028_w2.a from rp028_w0 join rp028_w1"
+            " on rp028_w0.b = rp028_w1.a join rp028_w2 on rp028_w1.b = rp028_w2.a limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == ("ok", [(1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4), (6, 6, 1)])
 
 
 # RP-047: the lock manager. Each test needs two sessions on one server, so

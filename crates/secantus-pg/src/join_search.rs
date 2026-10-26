@@ -39,6 +39,9 @@ thread_local! {
     /// The tables each spanning conjunct reads (`JoinRows::where_span_aliases`).
     static WHERE_SPAN_ALIASES: std::cell::RefCell<Vec<Vec<String>>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Its equalities between two tables (`JoinRows::where_equalities`).
+    static WHERE_EQUALITIES: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Those conjuncts as join filters (`JoinRows::where_filters`).
     static WHERE_FILTERS: std::cell::RefCell<Vec<secantus_pgplan::joins::JoinFilter>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -52,10 +55,13 @@ pub(crate) fn needed_keys() -> Option<Vec<String>> {
     NEEDED.with(|n| n.borrow().clone())
 }
 
-/// Whether the join source being read has a WHERE over more than one
-/// table (`with_join_where`).
-pub(crate) fn where_spans() -> bool {
-    WHERE_SPANS.with(|c| c.get())
+/// The join source's WHERE equalities between two tables, when every
+/// conjunct of its WHERE over more than one table is one: the join clauses
+/// the search adds to the ONs' (`None` when some other conjunct spans).
+pub(crate) fn where_join_clauses() -> Option<Vec<(String, String)>> {
+    let equalities = WHERE_EQUALITIES.with(|c| c.borrow().clone());
+    let spans = WHERE_SPAN_ALIASES.with(|c| c.borrow().len());
+    (spans == equalities.len()).then_some(equalities)
 }
 
 /// Run `f` with the join source `join`'s WHERE recorded for the search.
@@ -67,12 +73,14 @@ pub(crate) fn with_join_where<T>(
     let outer_eq = WHERE_SPANS_EQUALITY.with(|c| c.replace(join.where_spans_equality));
     let outer_aliases = WHERE_SPAN_ALIASES.with(|c| c.replace(join.where_span_aliases.clone()));
     let outer_filters = WHERE_FILTERS.with(|c| c.replace(join.where_filters.clone()));
+    let outer_equalities = WHERE_EQUALITIES.with(|c| c.replace(join.where_equalities.clone()));
     let outer_needed = NEEDED.with(|n| n.replace(Some(join.needed.clone())));
     let out = f();
     WHERE_SPANS.with(|c| c.set(outer));
     WHERE_SPANS_EQUALITY.with(|c| c.set(outer_eq));
     WHERE_SPAN_ALIASES.with(|c| *c.borrow_mut() = outer_aliases);
     WHERE_FILTERS.with(|c| *c.borrow_mut() = outer_filters);
+    WHERE_EQUALITIES.with(|c| *c.borrow_mut() = outer_equalities);
     NEEDED.with(|n| *n.borrow_mut() = outer_needed);
     out
 }
@@ -104,6 +112,9 @@ pub(crate) struct Step {
     /// batches and its OUTER key's type, whose hash places an outer row
     /// in its batch. `None` for one batch.
     pub(crate) batches: Option<(u64, u64, String)>,
+    /// Further clauses' keys `(a_key, b_key)`, sorted and matched on after
+    /// the first (a join of two relations on several clauses).
+    pub(crate) extra: Vec<(String, String)>,
 }
 
 /// The search's answer: which two tables join first (by index into the
@@ -650,6 +661,7 @@ impl PgHandler {
                 on: p.on,
                 filters: Vec::new(),
                 batches: None,
+                extra: Vec::new(),
             },
             joinrel_first: c.pair_first,
             second_step: Step {
@@ -662,6 +674,7 @@ impl PgHandler {
                 on: top_on,
                 filters: rest,
                 batches: None,
+                extra: Vec::new(),
             },
         };
         Some(plan)
@@ -803,6 +816,11 @@ impl PgHandler {
     ) -> PgWireResult<Option<Input>> {
         let a_first = (step.a_key.clone(), step.b_key.clone());
         let b_first = (step.b_key.clone(), step.a_key.clone());
+        // Several clauses: every key, sorted on in clause order and matched
+        // on. The fills and table orders below are single-key.
+        if !step.extra.is_empty() {
+            return self.run_step_on_keys(step, a, b, on);
+        }
         let (outer, inner, kind, (outer_key, inner_key)) = match step.method {
             // A FULL join: a hash full join's hashed side in its table's
             // order, which its probes' matches and the rows nothing matched
@@ -962,6 +980,70 @@ impl PgHandler {
         if matches!(step.method, JoinMethod::MergeRightB { .. }) {
             out = merge_right_fill(out, &step.b_key, &step.a_key);
         }
+        let keys = outer.keys.into_iter().chain(inner.keys).collect();
+        Ok(Some(Input { rows: out, keys }))
+    }
+}
+
+impl PgHandler {
+    /// [`PgHandler::run_step`] for a join on several clauses (`step.extra`):
+    /// an inner or LEFT merge join with each side sorted on all its keys,
+    /// or an inner hash join; anything else is not modelled (`None`).
+    fn run_step_on_keys(
+        &self,
+        step: &Step,
+        mut a: Input,
+        mut b: Input,
+        on: Option<&secantus_pgplan::ColumnExpr>,
+    ) -> PgWireResult<Option<Input>> {
+        if step.batches.is_some() {
+            return Ok(None);
+        }
+        let a_keys: Vec<String> = std::iter::once(step.a_key.clone())
+            .chain(step.extra.iter().map(|(k, _)| k.clone()))
+            .collect();
+        let b_keys: Vec<String> = std::iter::once(step.b_key.clone())
+            .chain(step.extra.iter().map(|(_, k)| k.clone()))
+            .collect();
+        let kind = if step.left {
+            JoinKind::Left
+        } else {
+            JoinKind::Inner
+        };
+        match step.method {
+            JoinMethod::MergeOuterA { .. } | JoinMethod::HashOuterA | JoinMethod::Other => {}
+            JoinMethod::MergeOuterB { .. } | JoinMethod::HashOuterB | JoinMethod::NestOuterB
+                if !step.left => {}
+            _ => return Ok(None),
+        }
+        crate::reorder_join_inputs_on(step.method, &mut a.rows, &a_keys, &mut b.rows, &b_keys);
+        let (outer, inner, outer_keys, inner_keys) = if joincost_outer_is_b(step.method) {
+            (b, a, b_keys, a_keys)
+        } else {
+            (a, b, a_keys, b_keys)
+        };
+        let equi: Vec<(String, String)> = outer_keys.into_iter().zip(inner_keys).collect();
+        let mut outer_rows = Some(outer.rows);
+        let mut out = Vec::new();
+        self.join_rows_core(
+            kind,
+            on,
+            &equi,
+            &[],
+            &outer.keys,
+            &inner.keys,
+            &mut |sink| {
+                if let Some(rows) = outer_rows.take() {
+                    sink(rows)?;
+                }
+                Ok(())
+            },
+            inner.rows,
+            &mut |docs| {
+                out.extend(docs);
+                Ok(true)
+            },
+        )?;
         let keys = outer.keys.into_iter().chain(inner.keys).collect();
         Ok(Some(Input { rows: out, keys }))
     }
