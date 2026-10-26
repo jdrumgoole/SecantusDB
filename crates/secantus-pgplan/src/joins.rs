@@ -565,7 +565,7 @@ fn finish_join_source(
             name.clone(),
             SubSource {
                 alias: String::new(),
-                plan: Box::new(Statement::JoinRows(JoinRows {
+                plan: Box::new(Statement::JoinRows(Box::new(JoinRows {
                     tree,
                     def: def.clone(),
                     where_spans,
@@ -574,7 +574,7 @@ fn finish_join_source(
                     where_filters,
                     where_equalities,
                     needed,
-                })),
+                }))),
                 def,
             },
         ));
