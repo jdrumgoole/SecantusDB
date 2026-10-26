@@ -4975,6 +4975,264 @@ pub struct Held {
     /// The store the transaction runs in (its `Storage`'s address): the
     /// shared-lock table is process-wide and keys rows by store too.
     pub store: usize,
+    /// The undo journal of the transaction's open savepoints (see
+    /// [`UndoJournal`]). Not emptied by [`Held::clear`]: a move onto a new
+    /// WiredTiger transaction keeps the savepoints, and the journal with them.
+    pub undo: UndoJournal,
+}
+
+/// A savepoint's undo journal: the first write of each document row after
+/// the savepoint records the row as it was (or that it did not exist), and
+/// the first create or drop of a collection whether it existed. Rolling back
+/// to the savepoint puts back those rows only, so a savepoint costs what is
+/// written after it -- PostgreSQL's subtransaction, whose abort makes the
+/// row versions it wrote invisible -- and never the size of the tables
+/// written. Kept only while a server has opened a frame
+/// ([`UndoJournal::open`]); the MongoDB server opens none, so it records
+/// nothing.
+///
+/// A row is recorded in the INNERMOST frame only: a row written after an
+/// inner savepoint and not after the outer one was not written between the
+/// two, so its state at the inner one is its state at the outer one too.
+/// Rolling back to a frame takes the OLDEST record of each row among it and
+/// the frames inside it; releasing one merges it down the same way.
+#[derive(Debug, Default)]
+pub struct UndoJournal {
+    frames: Vec<UndoFrame>,
+    /// While positive nothing is recorded: the writes being made are the
+    /// journal's own undo, or a move's replay of writes already recorded.
+    paused: usize,
+}
+
+/// What one savepoint's frame of the [`UndoJournal`] holds.
+#[derive(Debug, Default, Clone)]
+pub struct UndoFrame {
+    id: u64,
+    seen: HashSet<(String, String, Vec<u8>)>,
+    colls_seen: HashSet<(String, String)>,
+    /// Each row first written since the savepoint, in the order written.
+    pub rows: Vec<UndoRow>,
+    /// Each collection first created or dropped since the savepoint.
+    pub collections: Vec<UndoCollection>,
+}
+
+/// A row as it was when its savepoint was taken.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UndoRow {
+    pub db: String,
+    pub coll: String,
+    /// The row's `_id`.
+    pub id: Bson,
+    /// Its document then; `None` when it did not exist.
+    pub prior: Option<Vec<u8>>,
+}
+
+/// Whether a collection created or dropped since a savepoint existed then.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UndoCollection {
+    pub db: String,
+    pub coll: String,
+    pub existed: bool,
+}
+
+impl UndoFrame {
+    /// Add `other`'s records of rows and collections this frame has not got:
+    /// this frame's are the older.
+    fn absorb(&mut self, other: UndoFrame) {
+        let UndoFrame {
+            rows, collections, ..
+        } = other;
+        for row in rows {
+            let key = (row.db.clone(), row.coll.clone(), undo_id_key(&row.id));
+            if self.seen.insert(key) {
+                self.rows.push(row);
+            }
+        }
+        for c in collections {
+            if self.colls_seen.insert((c.db.clone(), c.coll.clone())) {
+                self.collections.push(c);
+            }
+        }
+    }
+}
+
+/// The key a journal frame knows a row by.
+fn undo_id_key(id: &Bson) -> Vec<u8> {
+    id_key(id).unwrap_or_else(|_| format!("{id:?}").into_bytes())
+}
+
+impl UndoJournal {
+    /// Open a frame for savepoint `id`.
+    pub fn open(&mut self, id: u64) {
+        self.frames.push(UndoFrame {
+            id,
+            ..UndoFrame::default()
+        });
+    }
+
+    /// Forget every frame (no savepoint is open).
+    pub fn reset(&mut self) {
+        self.frames.clear();
+    }
+
+    /// Is a frame open for savepoint `id`?
+    pub fn has_frame(&self, id: u64) -> bool {
+        self.frames.iter().any(|f| f.id == id)
+    }
+
+    /// RELEASE savepoint `id`: its frame and the ones inside it merge into
+    /// the frame enclosing it (whose records are the older), or are dropped
+    /// when there is none -- the writes are then the transaction's own.
+    /// `false` when no frame is open for `id`.
+    pub fn release(&mut self, id: u64) -> bool {
+        let Some(p) = self.frames.iter().position(|f| f.id == id) else {
+            return false;
+        };
+        let dropped = self.frames.split_off(p);
+        if let Some(outer) = self.frames.last_mut() {
+            for f in dropped {
+                outer.absorb(f);
+            }
+        }
+        true
+    }
+
+    /// ROLLBACK TO savepoint `id`: the records to put back -- the oldest of
+    /// each row among its frame and the ones inside it -- leaving its frame
+    /// open and empty, and the frames inside it gone. `None` when no frame
+    /// is open for `id`.
+    pub fn rollback_to(&mut self, id: u64) -> Option<UndoFrame> {
+        let p = self.frames.iter().position(|f| f.id == id)?;
+        let inner = self.frames.split_off(p + 1);
+        let mut merged = std::mem::take(&mut self.frames[p]);
+        self.frames[p].id = id;
+        for f in inner {
+            merged.absorb(f);
+        }
+        Some(merged)
+    }
+
+    /// Stop recording until the matching [`Self::resume`].
+    pub fn pause(&mut self) {
+        self.paused += 1;
+    }
+
+    /// Undo one [`Self::pause`].
+    pub fn resume(&mut self) {
+        self.paused = self.paused.saturating_sub(1);
+    }
+
+    /// Is a row write to be recorded? (A frame is open and not paused.)
+    fn recording(&self) -> bool {
+        self.paused == 0 && !self.frames.is_empty()
+    }
+}
+
+/// Record, for the user transaction running on this thread, the first write
+/// of a document row since its innermost open savepoint (see
+/// [`UndoJournal`]): `prior` is the row as the transaction saw it before the
+/// write (`None` for an insert), `id_src` a document carrying its `_id` (the
+/// new one when there is no prior).
+fn undo_note_row(
+    db: &str,
+    coll: &str,
+    id_k: &[u8],
+    prior: Option<&[u8]>,
+    id_src: &[u8],
+) -> Result<()> {
+    if ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
+        return Ok(());
+    }
+    ACTIVE_ROWS.with(|a| -> Result<()> {
+        let Some(held) = a.borrow().as_ref().map(Arc::clone) else {
+            return Ok(());
+        };
+        let mut h = held.lock().unwrap_or_else(|e| e.into_inner());
+        if !h.undo.recording() {
+            return Ok(());
+        }
+        let key = (db.to_string(), coll.to_string(), id_k.to_vec());
+        let frame = h.undo.frames.last_mut().expect("recording");
+        if frame.seen.contains(&key) {
+            return Ok(());
+        }
+        let src = prior.unwrap_or(id_src);
+        let id: Bson = bson::RawDocument::from_bytes(src)
+            .map_err(|e| StorageError::Bson(e.to_string()))?
+            .get("_id")
+            .map_err(|e| StorageError::Bson(e.to_string()))?
+            .ok_or_else(|| StorageError::Internal("a row without _id".into()))?
+            .to_raw_bson()
+            .try_into()
+            .map_err(|e: bson::raw::Error| StorageError::Bson(e.to_string()))?;
+        // The frame knows rows by the key `undo_id_key` gives their `_id`,
+        // which a merge recomputes: keep the two the same.
+        let key = (key.0, key.1, undo_id_key(&id));
+        if frame.seen.insert(key) {
+            frame.rows.push(UndoRow {
+                db: db.to_string(),
+                coll: coll.to_string(),
+                id,
+                prior: prior.map(<[u8]>::to_vec),
+            });
+        }
+        Ok(())
+    })
+}
+
+/// Record, for the user transaction running on this thread, the first
+/// create or drop of `(db, coll)` since its innermost open savepoint, and
+/// whether it existed before it (see [`UndoJournal`]).
+fn undo_note_collection(db: &str, coll: &str, existed: bool) {
+    if ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
+        return;
+    }
+    ACTIVE_ROWS.with(|a| {
+        if let Some(held) = a.borrow().as_ref() {
+            let mut h = held.lock().unwrap_or_else(|e| e.into_inner());
+            if !h.undo.recording() {
+                return;
+            }
+            let frame = h.undo.frames.last_mut().expect("recording");
+            if frame.colls_seen.insert((db.to_string(), coll.to_string())) {
+                frame.collections.push(UndoCollection {
+                    db: db.to_string(),
+                    coll: coll.to_string(),
+                    existed,
+                });
+            }
+        }
+    });
+}
+
+/// The rows of the user transaction running on this thread (its undo
+/// journal among them); `None` outside one.
+pub fn active_held_rows() -> Option<HeldRows> {
+    if ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
+        return None;
+    }
+    ACTIVE_ROWS.with(|a| a.borrow().as_ref().map(Arc::clone))
+}
+
+/// Pauses the undo journal of `held` while it lives (see
+/// [`UndoJournal::pause`]).
+pub struct UndoPause(HeldRows);
+
+impl UndoPause {
+    pub fn new(held: &HeldRows) -> Self {
+        held.lock().unwrap_or_else(|e| e.into_inner()).undo.pause();
+        UndoPause(Arc::clone(held))
+    }
+}
+
+impl Drop for UndoPause {
+    fn drop(&mut self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .undo
+            .resume();
+    }
 }
 
 impl Held {
@@ -10186,6 +10444,9 @@ impl Storage {
         fresh.deferred_creates = handle.deferred_creates.clone();
         fresh.deferred_keys = handle.deferred_keys.clone();
         let _moving = MoveGuard::new(&handle.held);
+        // The replay rewrites what the journal already recorded (or what
+        // came before its savepoints): it records nothing.
+        let _undo_paused = UndoPause::new(&handle.held);
         self.rollback_user_transaction_inner(handle, false)?;
         // The locks taken by rewriting a row unchanged have no oplog entry:
         // they are taken again after the replay.
@@ -11003,6 +11264,7 @@ impl Storage {
                 // Doc table keyed by the (unique) RecordId.
                 let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                 note_row(db, coll, recordid)?;
+                undo_note_row(db, coll, &key, None, blob)?;
                 cur.set_key_ssq(db, coll, recordid);
                 cur.set_value_u(&frame_doc_value(&key, blob));
                 cur.insert()?;
@@ -11321,6 +11583,7 @@ impl Storage {
                     // Doc table keyed by the (unique) RecordId.
                     doc_cur.reset()?;
                     note_row(db, coll, recordid)?;
+                    undo_note_row(db, coll, &key, None, blob)?;
                     doc_cur.set_key_ssq(db, coll, recordid);
                     doc_cur.set_value_u(&frame_doc_value(&key, blob));
                     doc_cur.insert()?;
@@ -11571,6 +11834,7 @@ impl Storage {
 
                 let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                 note_row(db, coll, recordid)?;
+                undo_note_row(db, coll, &key, Some(&old_blob), &old_blob)?;
                 cur.set_key_ssq(db, coll, recordid);
                 cur.set_value_u(&frame_doc_value(&key, &blob));
                 cur.update()?;
@@ -11642,6 +11906,7 @@ impl Storage {
                     Err(e) if e.is_not_found() => return Ok(false),
                     Err(e) => return Err(e.into()),
                 };
+                undo_note_row(db, coll, &key, Some(&old_blob), &old_blob)?;
                 cur.remove()?;
                 note_deleted(db, coll, &old_blob);
                 let old_doc = decode_doc(&old_blob)?;
@@ -12018,6 +12283,7 @@ impl Storage {
                     match c.search() {
                         Ok(()) => {
                             c.remove()?;
+                            undo_note_collection(db, coll, true);
                             note_coll_table_write();
                         }
                         Err(e) if e.is_not_found() => {}
@@ -12282,6 +12548,7 @@ impl Storage {
                         match rc.search() {
                             Ok(()) => {
                                 rc.remove()?;
+                                undo_note_collection(db, c, true);
                                 note_coll_table_write();
                             }
                             Err(e) if e.is_not_found() => {}
@@ -12682,6 +12949,7 @@ impl Storage {
             match c.search() {
                 Ok(()) => {
                     c.remove()?;
+                    undo_note_collection(dst_db, dst_coll, true);
                     note_coll_table_write();
                 }
                 Err(e) if e.is_not_found() => {}
@@ -12755,6 +13023,7 @@ impl Storage {
         match rc.search() {
             Ok(()) => {
                 rc.remove()?;
+                undo_note_collection(src_db, src_coll, true);
                 note_coll_table_write();
             }
             Err(e) if e.is_not_found() => {}
@@ -16552,9 +16821,10 @@ impl Storage {
         // to purge, so an absent shard is simply skipped.
         match session.open_cursor(&doc_table_for(db, coll), None) {
             Ok(doc_cur) => {
-                for (recordid, _id_k, _blob) in self.scan_docs(session, db, coll)? {
+                for (recordid, id_k, blob) in self.scan_docs(session, db, coll)? {
                     doc_cur.reset()?;
                     note_row(db, coll, recordid)?;
+                    undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
                     doc_cur.set_key_ssq(db, coll, recordid);
                     match doc_cur.remove() {
                         Ok(()) => {}
@@ -19111,6 +19381,7 @@ impl Storage {
             self.insert_index_entries(session, db, coll, &additions)?;
             cur.reset()?;
             note_row(db, coll, recordid)?;
+            undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
             cur.set_key_ssq(db, coll, recordid);
             cur.set_value_u(&frame_doc_value(&id_k, &new_blob));
             cur.update()?;
@@ -19280,6 +19551,7 @@ impl Storage {
                         // the framed value carries the id_key in-band.
                         let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                         note_row(db, coll, recordid)?;
+                        undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
                         cur.set_key_ssq(db, coll, recordid);
                         cur.set_value_u(&frame_doc_value(&id_k, &new_blob));
                         cur.update()?;
@@ -19498,6 +19770,7 @@ impl Storage {
                     };
                     let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                     note_row(db, coll, recordid)?;
+                    undo_note_row(db, coll, &new_id_key, None, &new_blob)?;
                     cur.set_key_ssq(db, coll, recordid);
                     cur.set_value_u(&frame_doc_value(&new_id_key, &new_blob));
                     cur.insert()?;
@@ -19789,6 +20062,7 @@ impl Storage {
             // reader ordering rationale.
             cur.reset()?;
             note_row(db, coll, recordid)?;
+            undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
             cur.set_key_ssq(db, coll, recordid);
             cur.remove()?;
             note_deleted(db, coll, &blob);
@@ -19875,6 +20149,7 @@ impl Storage {
                     // reader ordering rationale.
                     let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                     note_row(db, coll, recordid)?;
+                    undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
                     cur.set_key_ssq(db, coll, recordid);
                     cur.remove()?;
                     note_deleted(db, coll, &blob);
@@ -22051,6 +22326,7 @@ fn ensure_collection(
             cur.set_key_ss(db, coll);
             cur.set_value_u(&opts);
             cur.insert()?;
+            undo_note_collection(db, coll, false);
             note_coll_table_write();
             // Lazy shard creation: make the collection's documents shard on first
             // creation (not all DOC_SHARDS at open). This branch runs only when the

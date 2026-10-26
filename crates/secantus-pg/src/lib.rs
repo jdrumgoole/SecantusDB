@@ -4145,9 +4145,10 @@ fn typed_from_text(
 /// One open savepoint and the table contents it can put back.
 struct Savepoint {
     name: String,
-    /// Table -> its documents when this savepoint was established, or `None`
-    /// when the table did not exist then (so rolling back DROPS it).
-    tables: HashMap<String, Option<Vec<Vec<u8>>>>,
+    /// This savepoint's frame in the transaction's undo journal
+    /// (`secantus_storage::UndoJournal`): the rows written since it, each as
+    /// it was then, which a ROLLBACK TO that cannot move the block puts back.
+    undo_frame: u64,
     /// Table -> its storage indexes' definitions (`list_indexes`) when this
     /// savepoint was established: what a ROLLBACK TO puts back, as the
     /// subtransaction's abort undoes an index's CREATE, DROP or ALTER.
@@ -4181,6 +4182,9 @@ struct Savepoint {
     /// drops its portals (`AtSubAbort_Portals`).
     cursor_mark: u64,
 }
+
+/// A savepoint's frame in the undo journal, unique in the process.
+static NEXT_UNDO_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// A number for a cursor as it is declared, rising: a savepoint records
 /// the next one, and the cursors from it on are the subtransaction's.
@@ -27347,13 +27351,16 @@ impl PgHandler {
         out
     }
 
-    /// Capture, into every open savepoint that has not got it yet, the contents
-    /// of each table a statement is about to write.
+    /// Capture, into every open savepoint that has not got it yet, the
+    /// storage index definitions of each table a statement is about to write
+    /// (or whose index it names): what a ROLLBACK TO puts back, as the
+    /// subtransaction's abort undoes an index's CREATE, DROP or ALTER.
     ///
     /// "Has not got it yet" is what makes a savepoint's view the state at its
-    /// ESTABLISHMENT: the first write to a table after the savepoint captures
-    /// the table as it was before that write, and later writes find the entry
-    /// already there and leave it alone.
+    /// ESTABLISHMENT. The ROWS are not captured here: the storage's undo
+    /// journal records each row's first write since a savepoint as it
+    /// happens (`secantus_storage::UndoJournal`, RP-018), so a savepoint
+    /// costs what is written after it, never the size of the tables written.
     fn capture_for_savepoints(&self, stmt: &Statement) -> PgWireResult<()> {
         if self
             .savepoints
@@ -27364,15 +27371,11 @@ impl PgHandler {
             return Ok(());
         }
         let mut wanted = Self::written_tables(stmt);
-        // Sequences are not transactional (PostgreSQL never rolls a `nextval`
-        // back), and their collection is written OUTSIDE the block, so a
-        // capture restored on ROLLBACK TO would both un-draw values and
-        // conflict with that outside write.
         wanted.retain(|t| t != SEQUENCE_COLLECTION);
         // A trigger or a user function can write ANY table, and nothing about
-        // the statement says which. While either exists, every table is
-        // captured -- once per savepoint, so the cost is paid on first touch.
-        // So can an ALTER TYPE, which rewrites every value of the type.
+        // the statement says which. While either exists, every table's indexes
+        // are captured -- once per savepoint, so the cost is paid on first
+        // touch. So can an ALTER TYPE, which rewrites every value of the type.
         if !self.trigger_docs()?.is_empty()
             || !self.user_function_docs()?.is_empty()
             || matches!(stmt, Statement::AlterTypeAttributes { .. })
@@ -27383,7 +27386,7 @@ impl PgHandler {
         }
         // The indexes of every table written, and of the table an index's
         // own DDL names (which `written_tables` cannot resolve).
-        let mut index_tables = wanted.clone();
+        let mut index_tables = wanted;
         // Inside the block: an index it made itself is found too.
         index_tables.extend(self.in_open_transaction(|| Ok(self.index_ddl_tables(stmt)))?);
         index_tables.sort();
@@ -27395,60 +27398,26 @@ impl PgHandler {
                 .filter(|t| savepoints.iter().any(|sp| !sp.indexes.contains_key(t)))
                 .collect::<Vec<_>>()
         };
-        let mut index_captured: Vec<(String, Vec<Document>)> = Vec::new();
-        if !index_wanted.is_empty() {
-            self.in_open_transaction(|| {
-                for table in index_wanted {
-                    if !table.starts_with("__") {
-                        let docs = self
-                            .storage
-                            .list_indexes(self.db(), &table)
-                            .unwrap_or_default();
-                        index_captured.push((table, docs));
-                    }
-                }
-                Ok(())
-            })?;
-            let mut savepoints = self.savepoints.lock().unwrap_or_else(|e| e.into_inner());
-            for (table, docs) in &index_captured {
-                for sp in savepoints.iter_mut() {
-                    sp.indexes
-                        .entry(table.clone())
-                        .or_insert_with(|| docs.clone());
-                }
-            }
+        if index_wanted.is_empty() {
+            return Ok(());
         }
-        let tables = {
-            let savepoints = self.savepoints.lock().unwrap_or_else(|e| e.into_inner());
-            // Read what is missing WITHOUT holding the savepoint lock, because
-            // reading goes back through storage.
-            wanted
-                .into_iter()
-                .filter(|t| savepoints.iter().any(|sp| !sp.tables.contains_key(t)))
-                .collect::<Vec<_>>()
-        };
-        let mut captured: Vec<(String, Option<Vec<Vec<u8>>>)> = Vec::new();
+        let mut index_captured: Vec<(String, Vec<Document>)> = Vec::new();
         self.in_open_transaction(|| {
-            for table in tables {
-                // A table that does not exist is captured as `None`, which is not
-                // the same as an empty one: rolling back has to DROP it.
-                let docs = match self.storage.collection_exists(self.db(), &table) {
-                    Ok(true) => Some(
-                        self.storage
-                            .find_matching(self.db(), &table, &Document::new())
-                            .map_err(|e| Self::storage_err("could not read for a savepoint", e))?,
-                    ),
-                    Ok(false) => None,
-                    Err(e) => return Err(Self::storage_err("could not read for a savepoint", e)),
-                };
-                captured.push((table, docs));
+            for table in index_wanted {
+                if !table.starts_with("__") {
+                    let docs = self
+                        .storage
+                        .list_indexes(self.db(), &table)
+                        .unwrap_or_default();
+                    index_captured.push((table, docs));
+                }
             }
             Ok(())
         })?;
         let mut savepoints = self.savepoints.lock().unwrap_or_else(|e| e.into_inner());
-        for (table, docs) in captured {
+        for (table, docs) in &index_captured {
             for sp in savepoints.iter_mut() {
-                sp.tables
+                sp.indexes
                     .entry(table.clone())
                     .or_insert_with(|| docs.clone());
             }
@@ -27536,126 +27505,188 @@ impl PgHandler {
         Ok(())
     }
 
-    /// Put one table back to a captured state.
-    fn restore_table(&self, table: &str, docs: Option<&Vec<Vec<u8>>>) -> PgWireResult<()> {
-        let exists = self
-            .storage
-            .collection_exists(self.db(), table)
-            .map_err(|e| Self::storage_err("could not check a table", e))?;
-        match docs {
-            // It did not exist at the savepoint, so rolling back drops it.
-            None => {
-                if exists {
-                    self.storage
-                        .drop_collection(self.db(), table)
-                        .map_err(|e| Self::storage_err("could not drop the table", e))?;
-                }
+    /// The rows of the transaction this connection's writes go to -- the
+    /// statement's own when one is running (a PL/pgSQL EXCEPTION block),
+    /// else the block's -- whose undo journal holds the savepoints' frames.
+    fn undo_held(&self) -> Option<secantus_storage::HeldRows> {
+        if self.storage.in_user_txn() {
+            return secantus_storage::active_held_rows();
+        }
+        let guard = self.txn.try_lock().ok()?;
+        guard.as_ref().map(|h| h.held_rows())
+    }
+
+    /// ROLLBACK TO without a move: put back what the undo journal recorded
+    /// since the savepoint (`frame`, the oldest record of each row among the
+    /// savepoint and the ones inside it), through the same storage writes
+    /// the executor makes, so every index follows. What it costs is the rows
+    /// written since the savepoint, as a subtransaction's abort does; the
+    /// tables' size does not come into it.
+    ///
+    /// A collection created since is dropped. One dropped since is made
+    /// again and given its rows, all of which the drop recorded. Otherwise
+    /// each row is put back as it was, or deleted when it did not exist --
+    /// except a sequence's: `nextval` is not transactional, so an advance is
+    /// kept, and only a sequence created or dropped since is undone.
+    fn apply_undo(&self, frame: &secantus_storage::UndoFrame) -> PgWireResult<()> {
+        // The collections created or dropped since, and whether each was there.
+        let mut existed: HashMap<(&str, &str), bool> = HashMap::new();
+        for c in &frame.collections {
+            existed.insert((c.db.as_str(), c.coll.as_str()), c.existed);
+        }
+        // The rows, by collection, in the order the collections were written.
+        let mut order: Vec<(&str, &str)> = Vec::new();
+        let mut rows: HashMap<(&str, &str), Vec<&secantus_storage::UndoRow>> = HashMap::new();
+        for r in &frame.rows {
+            let key = (r.db.as_str(), r.coll.as_str());
+            rows.entry(key)
+                .or_insert_with(|| {
+                    order.push(key);
+                    Vec::new()
+                })
+                .push(r);
+        }
+        let exists = |db: &str, coll: &str| -> PgWireResult<bool> {
+            self.storage
+                .collection_exists(db, coll)
+                .map_err(|e| Self::storage_err("could not check a table", e))
+        };
+        for c in &frame.collections {
+            let (db, coll) = (c.db.as_str(), c.coll.as_str());
+            if exists(db, coll)? {
+                self.storage
+                    .drop_collection(db, coll)
+                    .map_err(|e| Self::storage_err("could not drop the table", e))?;
             }
-            Some(docs) => {
-                if !exists {
-                    self.storage
-                        .create_collection(self.db(), table)
-                        .map_err(|e| Self::storage_err("could not create the table", e))?;
-                }
-                self.restore_rows(table, docs)?;
+            if !c.existed {
+                continue;
             }
+            self.storage
+                .create_collection(db, coll)
+                .map_err(|e| Self::storage_err("could not create the table", e))?;
+            let docs: Vec<Vec<u8>> = rows
+                .get(&(db, coll))
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r.prior.clone())
+                .collect();
+            self.insert_restored(db, coll, docs)?;
+        }
+        for key in order {
+            if existed.contains_key(&key) {
+                continue;
+            }
+            let (db, coll) = key;
+            self.undo_rows(db, coll, &rows[&key])?;
         }
         Ok(())
     }
 
-    /// Put `table`'s rows back to `saved` by writing only the rows that
-    /// differ: a row changed since is replaced in place, one added since is
-    /// deleted, one deleted since is inserted. Rewriting EVERY row (as this
-    /// once did) wrote rows the block never touched, so a row another
-    /// session committed since the block's snapshot made the ROLLBACK TO
-    /// itself fail 40001 -- a conflict PostgreSQL, which writes nothing on a
-    /// subtransaction abort, cannot have.
-    fn restore_rows(&self, table: &str, saved: &[Vec<u8>]) -> PgWireResult<()> {
-        let id_of = |raw: &[u8]| -> Option<Vec<u8>> {
-            let doc = bson::RawDocument::from_bytes(raw).ok()?;
-            let id: Bson = doc.get("_id").ok()??.to_raw_bson().try_into().ok()?;
-            bson::to_vec(&bson::doc! { "k": id }).ok()
+    /// Put back the rows of `(db, coll)` the journal recorded (see
+    /// `apply_undo`), writing only the ones that differ from what they were.
+    fn undo_rows(
+        &self,
+        db: &str,
+        coll: &str,
+        rows: &[&secantus_storage::UndoRow],
+    ) -> PgWireResult<()> {
+        let sequence = db == self.db() && coll == SEQUENCE_COLLECTION;
+        let key_of = |id: &Bson| -> PgWireResult<Vec<u8>> {
+            bson::to_vec(&bson::doc! { "k": id.clone() })
+                .map_err(|e| Self::storage_err("could not encode a key", e))
         };
-        let current = self
+        if !self
             .storage
-            .find_matching(self.db(), table, &Document::new())
-            .map_err(|e| Self::storage_err("could not read the table", e))?;
-        let mut now: HashMap<Vec<u8>, &[u8]> = HashMap::with_capacity(current.len());
-        let mut unkeyed = false;
-        for raw in &current {
-            match id_of(raw) {
-                Some(k) => {
-                    now.insert(k, raw.as_slice());
-                }
-                None => unkeyed = true,
-            }
-        }
-        let mut was: HashMap<Vec<u8>, &[u8]> = HashMap::with_capacity(saved.len());
-        for raw in saved {
-            match id_of(raw) {
-                Some(k) => {
-                    was.insert(k, raw.as_slice());
-                }
-                None => unkeyed = true,
-            }
-        }
-        if unkeyed {
-            // No `_id` to pair rows by: rewrite the table whole.
+            .collection_exists(db, coll)
+            .map_err(|e| Self::storage_err("could not check a table", e))?
+        {
             self.storage
-                .delete_matching(
-                    self.db(),
-                    table,
-                    &Document::new(),
-                    0,
-                    &Document::new(),
-                    None,
-                )
-                .map_err(|e| Self::storage_err("could not clear the table", e))?;
-            if !saved.is_empty() {
-                self.insert_checked(table, saved.to_vec(), "could not restore the table")?;
-            }
-            return Ok(());
+                .create_collection(db, coll)
+                .map_err(|e| Self::storage_err("could not create the table", e))?;
         }
-        let decode_id = |raw: &[u8]| -> PgWireResult<Bson> {
-            decode_doc(raw)
-                .map_err(|e| Self::storage_err("could not decode a row", e))?
-                .get("_id")
-                .cloned()
-                .ok_or_else(|| Self::err(&PlanError::Internal("a row without _id".into())))
-        };
-        let gone: Vec<Bson> = now
-            .iter()
-            .filter(|(k, _)| !was.contains_key(*k))
-            .map(|(_, raw)| decode_id(raw))
-            .collect::<PgWireResult<_>>()?;
+        // Each row as it is now, by its `_id`: one lookup a row, so the cost
+        // is the rows written, whatever the table holds.
+        let mut now: HashMap<Vec<u8>, Vec<u8>> = HashMap::with_capacity(rows.len());
+        for r in rows {
+            if let Some(raw) = self
+                .storage
+                .find_by_id(db, coll, &r.id)
+                .map_err(|e| Self::storage_err("could not read the table", e))?
+            {
+                now.insert(key_of(&r.id)?, raw);
+            }
+        }
+        let mut gone: Vec<Bson> = Vec::new();
+        let mut changed: Vec<(&Bson, &Vec<u8>)> = Vec::new();
+        let mut missing: Vec<Vec<u8>> = Vec::new();
+        for r in rows {
+            let cur = now.get(&key_of(&r.id)?);
+            match (&r.prior, cur) {
+                (None, Some(_)) => gone.push(r.id.clone()),
+                (None, None) => {}
+                // A sequence's advance is not rolled back.
+                (Some(_), Some(_)) if sequence => {}
+                (Some(was), Some(cur)) if was == cur => {}
+                (Some(was), Some(_)) => changed.push((&r.id, was)),
+                (Some(was), None) => missing.push(was.clone()),
+            }
+        }
         if !gone.is_empty() {
+            self.delete_ids(db, coll, &gone)?;
+        }
+        // In place, where the row can be: a unique value two rows swapped
+        // collides with the other row's until it is put back too, so such a
+        // row is deleted and inserted again once every other one is back.
+        let mut collided: Vec<Bson> = Vec::new();
+        for (id, was) in changed {
+            match self.storage.replace_by_id(db, coll, id, was) {
+                Ok(_) => {}
+                Err(StorageError::DuplicateKey(_)) => {
+                    collided.push(id.clone());
+                    missing.push(was.clone());
+                }
+                Err(e) => return Err(Self::storage_err("could not restore the table", e)),
+            }
+        }
+        if !collided.is_empty() {
+            self.delete_ids(db, coll, &collided)?;
+        }
+        self.insert_restored(db, coll, missing)
+    }
+
+    /// Delete the rows of `(db, coll)` with these `_id`s, one by one.
+    fn delete_ids(&self, db: &str, coll: &str, ids: &[Bson]) -> PgWireResult<()> {
+        for id in ids {
             self.storage
                 .delete_matching(
-                    self.db(),
-                    table,
-                    &bson::doc! { "_id": { "$in": gone } },
-                    0,
+                    db,
+                    coll,
+                    &bson::doc! { "_id": { "$eq": id.clone() } },
+                    1,
                     &Document::new(),
                     None,
                 )
                 .map_err(|e| Self::storage_err("could not restore the table", e))?;
         }
-        let mut missing = Vec::new();
-        for raw in saved {
-            let Some(k) = id_of(raw) else { continue };
-            match now.get(&k) {
-                Some(cur) if *cur == raw.as_slice() => {}
-                Some(_) => {
-                    let id = decode_id(raw)?;
-                    self.storage
-                        .replace_by_id(self.db(), table, &id, raw)
-                        .map_err(|e| Self::storage_err("could not restore the table", e))?;
-                }
-                None => missing.push(raw.clone()),
-            }
+        Ok(())
+    }
+
+    /// Insert rows a ROLLBACK TO puts back, failing on any the storage
+    /// refuses: they were the table's rows at the savepoint, so a refusal is
+    /// a bug, never a constraint to report.
+    fn insert_restored(&self, db: &str, coll: &str, docs: Vec<Vec<u8>>) -> PgWireResult<()> {
+        if docs.is_empty() {
+            return Ok(());
         }
-        if !missing.is_empty() {
-            self.insert_checked(table, missing, "could not restore the table")?;
+        let (_, errors) = self
+            .storage
+            .insert(db, coll, docs, true)
+            .map_err(|e| Self::storage_err("could not restore the table", e))?;
+        if let Some(first) = errors.first() {
+            return Err(Self::storage_err(
+                "could not restore the table",
+                first.get_str("errmsg").unwrap_or("a document was rejected"),
+            ));
         }
         Ok(())
     }
@@ -33792,9 +33823,11 @@ impl PgHandler {
     /// made since the savepoint are undone AND their rows let go, so a
     /// session waiting on one goes on. The block is moved onto a new
     /// WiredTiger transaction that replays its write set without the entries
-    /// after `write_pos` that touch a table being restored (`restore`): the
-    /// state at the savepoint. Rewriting those tables inside the same
-    /// transaction (the fallback, `restore_table`) keeps every row held,
+    /// after `write_pos` -- the state at the savepoint -- save a sequence's
+    /// advance, which PostgreSQL never rolls back (unless the sequence was
+    /// created since, when it goes with the rest). Putting the rows back
+    /// inside the same transaction (the fallback, `apply_undo`) keeps every
+    /// row held,
     /// collides with any row another session committed since the block's
     /// snapshot (40001 on the ROLLBACK TO itself), and cannot heal a
     /// transaction a write conflict has doomed.
@@ -33806,33 +33839,48 @@ impl PgHandler {
     /// (`FOR UPDATE`, an UPDATE that changed nothing) before the savepoint
     /// are taken again, the later ones let go; a table created after the
     /// savepoint is undone with the rest. `false` leaves the fallback
-    /// (`restore_table`) to run.
+    /// (`apply_undo`) to run.
     fn rollback_to_by_move(
         &self,
         write_pos: Option<usize>,
         lock_pos: Option<usize>,
-        restore: &HashMap<String, Option<Vec<Vec<u8>>>>,
     ) -> PgWireResult<bool> {
         let (Some(pos), Some(lock_pos)) = (write_pos, lock_pos) else {
             return Ok(false);
         };
-        let db = self.db();
-        let undone: HashSet<String> = restore
-            .keys()
-            .filter(|t| t.as_str() != SEQUENCE_COLLECTION)
-            .map(|t| format!("{db}.{t}"))
-            .collect();
-        // A command after the savepoint (a CREATE: the move refuses any
-        // other) is undone with the rest.
+        let sequences = format!("{}.{SEQUENCE_COLLECTION}", self.db());
+        // The sequences created since the savepoint, met in write order
+        // (a sequence's insert comes before any advance of it).
+        let created: std::cell::RefCell<HashSet<Vec<u8>>> = Default::default();
+        let id_key = |op: &Document, field: &str| -> Option<Vec<u8>> {
+            let id = op.get_document(field).ok()?.get("_id")?.clone();
+            bson::to_vec(&bson::doc! { "k": id }).ok()
+        };
+        // Everything written since the savepoint is undone -- a command (a
+        // CREATE: the move refuses any other) included -- but a sequence's
+        // advance, unless the sequence is itself one created since.
         let keep = |i: usize, op: &Document| -> bool {
-            i < pos
-                || (op.get_str("op") != Ok("c")
-                    && !op.get_str("ns").is_ok_and(|ns| undone.contains(ns)))
+            if i < pos {
+                return true;
+            }
+            if op.get_str("ns") != Ok(sequences.as_str()) {
+                return false;
+            }
+            match op.get_str("op") {
+                Ok("i") => {
+                    if let Some(k) = id_key(op, "o") {
+                        created.borrow_mut().insert(k);
+                    }
+                    false
+                }
+                Ok("u") => id_key(op, "o2").is_some_and(|k| !created.borrow().contains(&k)),
+                _ => false,
+            }
         };
         if self.storage.in_user_txn() {
             // A PL/pgSQL EXCEPTION block: the statement running it holds
             // the transaction, and moves it in place.
-            if restore.is_empty()
+            if self.storage.active_write_set_len().is_none_or(|n| n <= pos)
                 && self
                     .storage
                     .active_locked_len()
@@ -33861,7 +33909,7 @@ impl PgHandler {
         };
         // Nothing written and no row locked since the savepoint: nothing to
         // undo or let go of.
-        if restore.is_empty() && handle.locked_len() <= lock_pos {
+        if handle.write_set_len() <= pos && handle.locked_len() <= lock_pos {
             return Ok(false);
         }
         // REPEATABLE READ keeps its snapshot: the move is made only while no
@@ -33928,12 +33976,25 @@ impl PgHandler {
                 let shared_pos = self.shared_lock_mark();
                 let uncommitted = self.pending.tables().clone();
                 let uncommitted_types = self.pending.types().clone();
+                let undo_frame = NEXT_UNDO_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let first = self
+                    .savepoints
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty();
+                if let Some(held) = self.undo_held() {
+                    let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
+                    if first {
+                        held.undo.reset();
+                    }
+                    held.undo.open(undo_frame);
+                }
                 self.savepoints
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push(Savepoint {
                         name,
-                        tables: HashMap::new(),
+                        undo_frame,
                         indexes: HashMap::new(),
                         uncommitted,
                         uncommitted_types,
@@ -33954,20 +34015,23 @@ impl PgHandler {
                     });
                 Ok(vec![Response::Execution(Tag::new("SAVEPOINT"))])
             }
-            // RELEASE keeps the writes, so nothing is restored -- but the
-            // pre-images captured by the savepoints being destroyed have to
-            // MERGE DOWN into the enclosing one, or an outer ROLLBACK TO would
-            // no longer be able to undo them. The OLDEST capture wins, which is
-            // the one nearest the enclosing savepoint.
+            // RELEASE keeps the writes, so nothing is restored -- but what
+            // the savepoints being destroyed recorded has to MERGE DOWN into
+            // the enclosing one, or an outer ROLLBACK TO would no longer be
+            // able to undo it. The OLDEST record wins, which is the one
+            // nearest the enclosing savepoint.
             TransactionControl::Release(_) => {
                 let mut savepoints = self.savepoints.lock().unwrap_or_else(|e| e.into_inner());
                 let idx = index(&savepoints).ok_or_else(missing)?;
                 let dropped: Vec<Savepoint> = savepoints.split_off(idx);
+                if let Some(held) = self.undo_held() {
+                    held.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .undo
+                        .release(dropped[0].undo_frame);
+                }
                 if let Some(outer) = savepoints.last_mut() {
                     for sp in dropped {
-                        for (table, docs) in sp.tables {
-                            outer.tables.entry(table).or_insert(docs);
-                        }
                         for (table, docs) in sp.indexes {
                             outer.indexes.entry(table).or_insert(docs);
                         }
@@ -33976,11 +34040,11 @@ impl PgHandler {
                 Ok(vec![Response::Execution(Tag::new("RELEASE"))])
             }
             _ => {
-                // Restore from the OLDEST capture of each table among this
+                // Restore the OLDEST record of each row and index among this
                 // savepoint and the ones nested inside it: that is the state at
-                // the named savepoint, whichever frame happened to capture it.
+                // the named savepoint, whichever frame happened to record it.
                 let (
-                    (restore, restore_indexes),
+                    (undo_frame, restore_indexes),
                     uncommitted,
                     uncommitted_types,
                     saved_settings,
@@ -34001,13 +34065,9 @@ impl PgHandler {
                     let uncommitted = savepoints[idx].uncommitted.clone();
                     let uncommitted_types = savepoints[idx].uncommitted_types.clone();
                     let dropped: Vec<Savepoint> = savepoints.split_off(idx + 1);
-                    let mut restore: HashMap<String, Option<Vec<Vec<u8>>>> =
-                        savepoints[idx].tables.clone();
+                    let undo_frame = savepoints[idx].undo_frame;
                     let mut restore_indexes = savepoints[idx].indexes.clone();
                     for sp in &dropped {
-                        for (table, docs) in &sp.tables {
-                            restore.entry(table.clone()).or_insert_with(|| docs.clone());
-                        }
                         for (table, docs) in &sp.indexes {
                             restore_indexes
                                 .entry(table.clone())
@@ -34016,10 +34076,9 @@ impl PgHandler {
                     }
                     // The savepoint itself stays open, and starts capturing
                     // again from the state just restored.
-                    savepoints[idx].tables.clear();
                     savepoints[idx].indexes.clear();
                     (
-                        (restore, restore_indexes),
+                        (undo_frame, restore_indexes),
                         uncommitted,
                         uncommitted_types,
                         saved_settings,
@@ -34033,16 +34092,34 @@ impl PgHandler {
                 if let Some(pos) = shared_pos {
                     self.release_shared_locks_after(pos);
                 }
-                if !self.rollback_to_by_move(write_pos, lock_pos, &restore)? {
-                    self.in_open_transaction(|| {
-                        for (table, docs) in &restore {
-                            if table == SEQUENCE_COLLECTION {
-                                continue;
-                            }
-                            self.restore_table(table, docs.as_ref())?;
+                // What the journal recorded since the savepoint; its frame
+                // stays open, empty, for the writes from here on.
+                let held = self.undo_held();
+                let frame = held.as_ref().and_then(|h| {
+                    h.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .undo
+                        .rollback_to(undo_frame)
+                });
+                if !self.rollback_to_by_move(write_pos, lock_pos)? {
+                    match (held, frame) {
+                        (Some(held), Some(frame)) => {
+                            let _paused = secantus_storage::UndoPause::new(&held);
+                            self.in_open_transaction(|| self.apply_undo(&frame))?;
                         }
-                        Ok(())
-                    })?;
+                        // Nothing written since the savepoint: nothing to undo.
+                        _ if matches!(
+                            (self.block_write_pos(), write_pos),
+                            (Some(now), Some(then)) if now == then
+                        ) => {}
+                        // No journal frame for the savepoint: what it would
+                        // put back is not known, and pretending is data loss.
+                        _ => {
+                            return Err(Self::err(&PlanError::Internal(format!(
+                                "savepoint \"{name}\" has no undo journal"
+                            ))));
+                        }
+                    }
                 }
                 if !restore_indexes.is_empty() {
                     self.in_open_transaction(|| {
