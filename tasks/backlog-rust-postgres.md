@@ -865,6 +865,27 @@ tests regression tests:
       Backlog-ID: RP-272
       Verify: tests/backlog/test_rp_catalog_identity.py::test_builtin_relations_attributes
 
+- [ ] **GROUP BY a primary key does not cover the table's other columns.**
+      `select id, name from t group by id`, `id` the primary key, is
+      PostgreSQL's functional dependency (`check_functional_grouping`):
+      15.19 answers the rows, this server 42803.
+      Backlog-ID: RP-280
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_column_functionally_dependent_on_the_grouped_key
+- [ ] **`DEFERRABLE` on a primary key is dropped**: `primary key (a, b)
+      deferrable` records `condeferrable` false (15.19: true).
+      Backlog-ID: RP-281
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_deferrable_primary_key_is_deferrable
+- [ ] **Rules and views PostgreSQL's parse analysis refuses are stored**:
+      a RETURNING list in a non-INSTEAD rule (0A000), `INSERT ... SELECT
+      old.*` into a table with fewer columns (42601), a view exposing a
+      SEARCH sequence column of pseudo-type `record[]` (42P16).
+      Backlog-ID: RP-282
+      Verify: tests/backlog/test_rp_top10_found.py::test_rules_and_views_postgres_refuses
+- [ ] **A hypothetical-set aggregate over two columns is refused**:
+      `dense_rank(2, 'x') WITHIN GROUP (ORDER BY a, b)` is 0A000 here.
+      Backlog-ID: RP-283
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_hypothetical_set_aggregate_over_two_columns
+
 ## Found by batch 78 (2026-10-25)
 
 Found while working RP-255, which planning folded a function call around,
@@ -917,19 +938,28 @@ batch, their tests regression tests:
 - RP-260: a REPEATABLE READ transaction took its snapshot at a SET, SHOW
   or LOCK. PostgreSQL takes it at the first statement that needs one.
 
-- [ ] **SERIALIZABLE scans of GIN and GiST indexes lock the whole table.**
-      B-tree and (since batch 77) hash index scans take PostgreSQL's page
-      and tuple SIREAD locks here. GIN and GiST indexes are not modelled,
-      so a scan of one is priced as a sequential scan and locks the
-      relation. PostgreSQL 15.19's `ginget.c` and `gistget.c` lock the
-      index pages a scan reads, and an insert checks the pages it touches.
-      So two transactions working on far-apart keys both commit there and
-      fail here: 16 of `predicate-gin`'s 31 permutations agree, and 22 of
-      `predicate-gist`'s 40. It needs page models of the two access
-      methods, as `btree_model.rs` is for B-trees and `hash_index.rs` for
-      hash indexes.
-      Backlog-ID: RP-254
-      Verify: tests/backlog/test_rp_isolation.py::test_ssi_index_access_methods
+- [ ] **What the GIN and GiST page models do not cover yet.** Since the
+      top-ten batch (2026-10-26) GIN (`gin_index.rs`) and GiST
+      (`gist_index.rs`, `point_ops` and `box_ops`) indexes are modelled page
+      by page, so SERIALIZABLE takes PostgreSQL 15.19's SIREAD page locks
+      on them (`predicate-gin` 31 of 31, `predicate-gist` 40 of 40; was 19
+      and 22, RP-254). Not yet, each falling back to a relation lock as
+      before:
+      - `pg_relation_size` of a GIN or GiST index reads 0 though the model
+        knows its pages;
+      - GIN `=` on arrays, and opclasses other than `array_ops` (jsonb,
+        tsvector, btree_gin); array elements other than ints, floats, bool
+        and C-ordered text; an ANALYZEd array column (MCELEM statistics);
+      - point/box `~=`, polygon and circle containment;
+      - multi-column, partial and expression GIN / GiST indexes;
+      - an UPDATE's or DELETE's scan (only a SELECT passes its residual);
+      - VACUUM deleting emptied GIN posting-tree pages and GiST pages;
+      - GiST's `gistchoose` breaks penalty ties with a per-backend random
+        seed; the model uses a fixed one, so on overlapping `box_ops` data a
+        tuple can land on another page than in a given backend (15.19 gave
+        the same layout on three runs).
+      Backlog-ID: RP-287
+      Verify: tests/backlog/test_rp_top10_found.py::test_gin_and_gist_indexes_have_their_pages
 
 
 
@@ -1098,24 +1128,26 @@ visibility functions) and RP-211 (`pg_operator` and `pg_rewrite` listed
 none of PostgreSQL's rows) were found and fixed in the same batch; their
 tests are regression tests.
 
-- [ ] **A rule's `ev_qual` and `ev_action` are NULL.** PostgreSQL 15.19
-      stores each rule's qualification and actions as node trees (`<>` for
-      no qualification, `({QUERY :commandType 1 ...})`); here both columns
-      are NULL, for the system views' rules (listed since batch 52, as
-      `initdb` leaves them) and for the database's own. The trees are
-      PostgreSQL's `nodeToString` of its analysed query, which this server
-      does not build.
-      Measured 2026-10-25: `initdb` leaves 142 system-view rules whose trees
-      are 2.85 MB of text (the largest, `information_schema.columns`, 177 KB),
-      embedding catalog oids, attribute numbers and source offsets.
-      **Decided (Joe, 2026-10-25): build `nodeToString`.** Emit
-      PostgreSQL's analysed `Query` tree for every rule, the system views'
-      and the database's own: range table entries, target lists, `Var` /
-      `OpExpr` / `FuncExpr` nodes with their oids, and source locations, as
-      `outfuncs.c` writes them. Neither baked `initdb` trees nor a scope
-      decision.
+- [ ] **OPEN — a rule's `ev_qual` / `ev_action` are NULL for the
+      constructs the transcription does not cover.** Since the top-ten
+      batch (2026-10-26) `pg_rewrite` holds PostgreSQL 15.19's
+      `nodeToString` of the analysed query (`secantus-pgplan/src/nodetostring/`,
+      a transcription of `analyze.c`, the `parse_*.c` files and
+      `outfuncs.c`): the 142 system rules match byte for byte, and views,
+      materialized views and CREATE RULE over joins, LATERAL, set
+      operations, WITH [RECURSIVE], windows and frames, grouping sets,
+      ordered-set aggregates, typed literals and the DML actions match too
+      (`tests/test_rust_pg_rule_trees.py`, 39 of 39 scenarios). Still NULL,
+      with a logged reason: `FOR UPDATE` / `FOR SHARE` in a view; a
+      data-modifying statement in WITH; `SEARCH` / `CYCLE`; `ON CONFLICT DO
+      UPDATE` and `ON CONFLICT ON CONSTRAINT`; `SET (a, b) = (SELECT ...)`;
+      an interval literal with a field qualifier (`INTERVAL '1' DAY`); a
+      WITH RECURSIVE whose name an inner WITH also defines; and the views
+      and rules made before this change, until they are replaced. The
+      primary-key `constraintDeps` path is transcribed but not reachable
+      (RP-280), and `Var` collation has no COLLATE-conflict error path.
       Backlog-ID: RP-203
-      Verify: tests/backlog/test_rp_batch51.py::test_scenario[a rule's node trees]
+      Verify: tests/backlog/test_rp_batch51.py::test_scenario[a rule's node trees for what the analysis does not transcribe]
 
 ## Found by batch 51 (2026-10-23)
 

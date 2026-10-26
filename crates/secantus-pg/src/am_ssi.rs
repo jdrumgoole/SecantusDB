@@ -319,6 +319,7 @@ fn residual_quals(residual: &secantus_pgplan::ColumnExpr) -> Option<Vec<OpQual>>
             params: params.clone(),
             result_type: String::new(),
             widths: vec![None; fields.len()],
+            scratch: Default::default(),
         };
         let value = secantus_pgplan::apply_row_expr(&constant, &Document::new()).ok()?;
         out.push(OpQual {
