@@ -1,6 +1,6 @@
 # Cross-Driver Conformance Summary
 
-Generated 2026-10-15 — SecantusDB 0.7.0b3. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the 13 gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
+Generated 2026-10-19 — SecantusDB 0.7.0b3. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the 13 gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
 
 **Failures split into two columns**: *Failed* counts tests that actually need a fix on SecantusDB; *Expected* counts tests with a documented reason for failing (driver-side cascade, out-of-scope feature, single-node-topology assumption, known intermittent flake). The expected list lives in `validation_summary/expected_failures.py` and each entry carries a rationale. Adjusted pass rate = passes ÷ (passes + actual failures).
 
@@ -12,7 +12,7 @@ Generated 2026-10-15 — SecantusDB 0.7.0b3. Each per-driver gauge runs the driv
 | `pymongo (async)` | Python | `f2103a95870a` | 1423 | 1111 | 0 | 6 | 306 | 99.4% | 100.0% |
 | `mongo-java-driver` | Java | `cb45be6bb147` | 900 | 496 | 0 | 0 | 404 | 100.0% | 100.0% |
 | `mongo-kotlin-driver` | Kotlin | `cb45be6bb147` | 538 | 340 | 0 | 0 | 198 | 100.0% | 100.0% |
-| `mongo-go-driver` | Go | `fd85a834c40e` | 659 | 598 | 12 | 0 | 49 | 98.0% | 98.0% |
+| `mongo-go-driver` | Go | `fd85a834c40e` | 659 | 598 | 10 | 2 | 49 | 98.0% | 98.3% |
 | `mongo-node-driver` | Node.js | `7e53685952f2` | 364 | 357 | 0 | 1 | 6 | 99.7% | 100.0% |
 | `mongo-ruby-driver` | Ruby | `f68d676643c1` | 283 | 258 | 0 | 1 | 24 | 99.6% | 100.0% |
 | `mongo-rust-driver` | Rust | `12dd49bf18bb` | 105 | 104 | 1 | 0 | 0 | 99.0% | 99.0% |
@@ -21,7 +21,7 @@ Generated 2026-10-15 — SecantusDB 0.7.0b3. Each per-driver gauge runs the driv
 | `mongo-c-driver` | C | `57dba9c04991` | 841 | 790 | 1 | 2 | 48 | 99.6% | 99.8% |
 | `mongo-cxx-driver` | C++ | `24852b68a3d1` | 901 | 892 | 0 | 0 | 9 | 100.0% | 100.0% |
 | `mongo-csharp-driver` | C# | `8297e62d7f2b` | 228 | 228 | 0 | 0 | 0 | 100.0% | 100.0% |
-| **All drivers** | — | — | **10235** | **8831** | **15** | **15** | **1374** | **99.6%** | **99.8%** |
+| **All drivers** | — | — | **10235** | **8831** | **13** | **17** | **1374** | **99.6%** | **99.8%** |
 
 ## Per-driver scope
 
@@ -59,6 +59,11 @@ These tests fail for documented reasons that have no SecantusDB-side fix (driver
 - **vendor/pymongo-tests/test/asynchronous/test_cursor.py::TestCursor::test_to_list_csot_applied** — Blocked by `$where`, same as `test_maxtime_ms_message`: the test delays the query with `find({'$where': delay(1)})` and asserts the raised error carries `.timeout == True`. `$where` is rejected up front, so the error is a BadValue rather than a timeout. NOTE: CSOT behaviour is therefore unverified by this gauge, not confirmed.
 - **vendor/pymongo-tests/test/asynchronous/test_cursor.py::TestCursor::test_where** — `$where` runs server-side JavaScript and SecantusDB ships no JS runtime, so it is rejected with `BadValue` (2) 'unsupported top-level operator: $where'. Out of scope per tasks/backlog.md §4 — supporting it would mean embedding a JS engine as mongod does.
 - **vendor/pymongo-tests/test/asynchronous/test_read_preferences.py::TestMongosAndReadPreference::test_read_preference_hedge_deprecated** — Async-only, and never reaches the wire: the test constructs `PrimaryPreferred(hedge={'enabled': True})` and asserts a `DeprecationWarning` is raised by the driver's own constructor. Purely client-side pymongo behaviour, dependent on the ambient warning filters — no server can influence the outcome.
+
+### `mongo-go-driver` (2)
+
+- **TestSDAMErrorHandling/after_handshake_completes/network_errors/pool_not_cleared_on_timeout_network_error** — Holds a connection with `$where: sleep(...)`, which needs server-side JavaScript. The Rust server refuses `$where` as `mongod --noscripting` 8.2.11 does (6108304); no JavaScript engine is planned, MongoDB deprecated `$where` in 8.0. Scope decision by Joe 2026-10-16.
+- **TestSDAMErrorHandling/after_handshake_completes/network_errors/pool_not_cleared_on_context_cancellation** — Holds a connection with `$where: sleep(...)`, which needs server-side JavaScript. The Rust server refuses `$where` as `mongod --noscripting` 8.2.11 does (6108304); no JavaScript engine is planned, MongoDB deprecated `$where` in 8.0. Scope decision by Joe 2026-10-16.
 
 ### `mongo-node-driver` (1)
 

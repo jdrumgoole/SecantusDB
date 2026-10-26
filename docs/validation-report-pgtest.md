@@ -2,7 +2,7 @@
 
 - SecantusDB (Python server) 0.7.0b3
 - corpus + runner: cockroachdb/cockroach @ `e3bff5d92ac1` (`pkg/sql/pgwire/testdata/pgtest`, run by `pkg/testutils/pgtest` verbatim)
-- generated: 2026-10-15 22:27 UTC
+- generated: 2026-10-19 06:37 UTC
 
 **47/66 files pass** (12 expected divergences, 2 unexpected failures, 5 skipped).
 
