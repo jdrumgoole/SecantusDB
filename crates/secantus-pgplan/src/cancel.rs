@@ -65,6 +65,50 @@ pub(crate) fn check() -> Result<()> {
     }
 }
 
+thread_local! {
+    /// Whether the expression walks are cancellation points too
+    /// (`with_walk_checks`), and how many nodes they have visited.
+    static WALK_CHECKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static WALK_NODES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `f` -- a top-level plan or Describe, which the caller follows with
+/// its own cancellation point -- with every expression walk a cancellation
+/// point too, one in each 2,048 nodes. Each rewrite pass walks the whole
+/// statement, and over a 200,000-item `IN` list one pass was 50 to 100 ms
+/// in which no cancel was seen (RP-202). A walk a cancel cuts short leaves
+/// its pass working from part of the tree; nothing it decides survives,
+/// because the caller's own check raises the cancel (which a walk only looks
+/// at) before the plan is used. Never on while a statement EXECUTES, where a
+/// value computed from part of a tree could be sent.
+pub fn with_walk_checks<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WALK_CHECKS.with(|w| w.set(self.0));
+        }
+    }
+    let _restore = Restore(WALK_CHECKS.with(|w| w.replace(true)));
+    f()
+}
+
+/// A walk's cancellation point (`with_walk_checks`).
+pub(crate) fn walk_point() -> Result<()> {
+    if !WALK_CHECKS.with(|w| w.get()) {
+        return Ok(());
+    }
+    let n = WALK_NODES.with(|c| {
+        let n = c.get().wrapping_add(1);
+        c.set(n);
+        n
+    });
+    if n.is_multiple_of(2048) {
+        check()
+    } else {
+        Ok(())
+    }
+}
+
 /// Run `work` on its own thread (with `stack` bytes of stack), polling for
 /// a cancel while it runs; a cancel answers 57014 at once and leaves the
 /// thread to finish on its own. With no hook installed, `work` just runs.

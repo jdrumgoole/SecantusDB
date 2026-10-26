@@ -1059,6 +1059,38 @@ impl PgHandler {
         } else {
             Vec::new()
         };
+        // Each index's access method, by its oid: `relam` (RP-285).
+        let index_methods: std::collections::HashMap<i64, i64> = if name == "pg_class" {
+            // Each table's indexes listed once, not once per index.
+            let mut listed: std::collections::HashMap<String, Vec<Document>> =
+                std::collections::HashMap::new();
+            self.index_relations()
+                .into_iter()
+                .filter_map(|ix| {
+                    let stored = listed
+                        .entry(ix.table.name.clone())
+                        .or_insert_with(|| {
+                            self.storage
+                                .list_indexes(self.db(), &ix.table.name)
+                                .unwrap_or_default()
+                        })
+                        .iter()
+                        .find(|d| d.get_str("name") == Ok(ix.name.as_str()))?;
+                    let method = stored.get_str("sqlMethod").ok().or_else(|| {
+                        stored
+                            .get_document("options")
+                            .ok()
+                            .and_then(|o| o.get_str("sqlMethod").ok())
+                    });
+                    Some((
+                        ix.oid,
+                        secantus_pgplan::misc_alter::method_oid(method.unwrap_or("btree"))?,
+                    ))
+                })
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
         // Per index: each key's type oid and whether it sorts DESC.
         // Per index, each key's `(type, descending, explicit class)`.
         type IndexKeys = Vec<(i64, Vec<(i64, bool, i64)>)>;
@@ -1187,7 +1219,7 @@ impl PgHandler {
                             "relam" => Bson::Int64(match kind.as_str() {
                                 "r" | "m" => self.table_relam(table),
                                 "t" => 2,
-                                "i" | "I" => 403,
+                                "i" | "I" => index_methods.get(&oid).copied().unwrap_or(403),
                                 _ => 0,
                             }),
                             "relfilenode" => Bson::Int64(match kind.as_str() {

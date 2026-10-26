@@ -118,3 +118,34 @@ def test_builtin_relations_attributes(pg: Any) -> None:
         " and attname = 'proconfig')",
     )
     assert got == ("ok", [(39, 6, 950, 1)])
+
+
+@pytest.mark.backlog_fixed("RP-285")
+@pytest.mark.parametrize("in_block", [False, True])
+def test_an_index_names_its_access_method_in_relam(pg: Any, in_block: bool) -> None:
+    """`pg_class.relam` is the index's own method (found while modelling
+    GIN and GiST under SERIALIZABLE, RP-254); every index here said `btree`,
+    so a join to `pg_am` named the wrong method."""
+    if in_block:
+        pg.execute("begin")
+    try:
+        pg.execute("create table rp285_t (a int[], p point, b int)")
+        pg.execute("create index rp285_g on rp285_t using gin (a)")
+        pg.execute("create index rp285_s on rp285_t using gist (p)")
+        pg.execute("create index rp285_h on rp285_t using hash (b)")
+        pg.execute("create index rp285_b on rp285_t (b)")
+        got = pg_answer(
+            pg,
+            "select c.relname::text, am.amname::text from pg_class c"
+            " join pg_am am on am.oid = c.relam where c.relname like 'rp285_%'"
+            " and c.relkind = 'i' order by 1",
+        )
+    finally:
+        if in_block:
+            pg.execute("rollback")
+        else:
+            pg.execute("drop table rp285_t")
+    assert got == (
+        "ok",
+        [("rp285_b", "btree"), ("rp285_g", "gin"), ("rp285_h", "hash"), ("rp285_s", "gist")],
+    )

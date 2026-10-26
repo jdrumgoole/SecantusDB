@@ -6205,7 +6205,9 @@ impl PgHandler {
         // Parse is a message cycle of its own (psycopg's `prepare`), and a
         // cancel left pending when it answered was cleared as stale at the
         // next message -- the statement then ran to its end.
-        let described = self.describe_fields(sql, param_types.len(), &param_types);
+        let described = secantus_pgplan::cancel::with_walk_checks(|| {
+            self.describe_fields(sql, param_types.len(), &param_types)
+        });
         self.check_cancel()?;
         match described {
             Ok(_) => Ok(()),
@@ -6352,10 +6354,14 @@ impl PgHandler {
         // cost in an `executemany` (RP-014).
         // A FETCH (or MOVE) returns its cursor's rows, which are no cached
         // plan's: PostgreSQL describes the portal's own columns (RP-046).
-        let is_fetch = pg_query::parse(&stmt.statement.sql).is_ok_and(|p| {
+        // Through the planner's memo and under the cancel hook: a fresh
+        // parse of a 200,000-item `IN` list was 0.2 s in which no cancel was
+        // seen (RP-202). A cancel is taken before anything is recorded.
+        let parsed = self.with_cancel_hook(|| secantus_pgplan::memoised_parse(&stmt.statement.sql));
+        self.check_cancel()?;
+        let is_fetch = parsed.is_some_and(|p| {
             matches!(
-                p.protobuf
-                    .stmts
+                p.stmts
                     .first()
                     .and_then(|s| s.stmt.as_ref())
                     .and_then(|n| n.node.as_ref()),
@@ -10379,16 +10385,7 @@ impl PgHandler {
     /// begins lazily on the first statement, so the rows are committed and
     /// visible before its snapshot is taken.
     fn open_transaction_handle(&self) -> PgWireResult<UserTransactionHandle> {
-        if !self
-            .catalogs_ensured
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            for coll in Self::CATALOG_COLLECTIONS {
-                self.ensure_collection(coll)?;
-            }
-            self.catalogs_ensured
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.ensure_catalog_collections()?;
         let handle = self
             .storage
             .begin_user_transaction()
@@ -10399,6 +10396,24 @@ impl PgHandler {
             handle.held_rows(),
         );
         Ok(handle)
+    }
+
+    /// This database's catalog collections, made if missing -- once a
+    /// connection, and at server start for each database a client may use,
+    /// so a fresh store's first statement does not create ten collections
+    /// in a window in which no cancel is seen (RP-202).
+    pub(crate) fn ensure_catalog_collections(&self) -> PgWireResult<()> {
+        if !self
+            .catalogs_ensured
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            for coll in Self::CATALOG_COLLECTIONS {
+                self.ensure_collection(coll)?;
+            }
+            self.catalogs_ensured
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Make sure a catalog collection exists before writing to it: a delete or
@@ -30343,15 +30358,19 @@ impl PgHandler {
         let reused = templated.is_some();
         let plan_now = || {
             self.with_executor_hooks(|| {
-                secantus_pgplan::planning_to_execute(|| {
-                    secantus_pgplan::plan_with_session_types_and_subqueries(
-                        sql,
-                        &|n| self.lookup(n),
-                        params,
-                        param_types,
-                        &tz,
-                        Some(&run),
-                    )
+                // Every expression walk a cancellation point: the caller's
+                // `check_cancel` below takes a cancel that cut a walk short.
+                secantus_pgplan::cancel::with_walk_checks(|| {
+                    secantus_pgplan::planning_to_execute(|| {
+                        secantus_pgplan::plan_with_session_types_and_subqueries(
+                            sql,
+                            &|n| self.lookup(n),
+                            params,
+                            param_types,
+                            &tz,
+                            Some(&run),
+                        )
+                    })
                 })
             })
         };
@@ -30379,6 +30398,9 @@ impl PgHandler {
                 planned = plan_now();
             }
         }
+        // A cancel that cut one of planning's walks short is taken here,
+        // before anything uses the plan (`with_walk_checks`).
+        self.check_cancel()?;
         self.collect_planner_warnings();
         if !reused && planned.is_ok() {
             // Learning plans the statement again: a cancel stops it as it
@@ -35656,6 +35678,11 @@ impl PgHandler {
         let (row_tz, row_ds, row_cenc) = (env.tz.clone(), env.ds, env.cenc);
         let tz = self.session_timezone();
         let schema_ref = schema.clone();
+        // A row's computed columns are evaluated as it is streamed, after
+        // the statement's own hooks are gone: a cancel (or the statement's
+        // deadline) is still seen there, by a `pg_sleep` in the select list
+        // among others, which slept to its end (RP-202).
+        let backend = self.backend.clone();
         // A `DECLARE CURSOR` over this SELECT arms row capture (see
         // `cursor_capture`); a plain SELECT leaves it disarmed and pays
         // only the `Option` check below -- no lock, no extra clone.
@@ -35692,14 +35719,27 @@ impl PgHandler {
                 // A computed column is applied per row -- the cast
                 // chain or the scalar call the planner recorded.
                 if let Some(expr) = casts.get(i).and_then(|c| c.as_ref()) {
-                    let v = if matches!(expr, secantus_pgplan::ColumnExpr::Row { .. }) {
-                        // An expression over the row sees every
-                        // column, not just the one it is filed under.
-                        secantus_pgplan::apply_row_expr(expr, &d)
-                    } else {
-                        let v = secantus_pgplan::field_value(&d, f);
-                        secantus_pgplan::apply_column_expr(expr, v, &tz)
-                    }
+                    let stop = || -> Option<&'static str> {
+                        if backend.cancelled() {
+                            return Some("canceling statement due to user request");
+                        }
+                        backend
+                            .deadline
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_some_and(|d| std::time::Instant::now() >= d)
+                            .then_some("canceling statement due to statement timeout")
+                    };
+                    let v = secantus_pgplan::cancel::with_cancel_hook(&stop, || {
+                        if matches!(expr, secantus_pgplan::ColumnExpr::Row { .. }) {
+                            // An expression over the row sees every
+                            // column, not just the one it is filed under.
+                            secantus_pgplan::apply_row_expr(expr, &d)
+                        } else {
+                            let v = secantus_pgplan::field_value(&d, f);
+                            secantus_pgplan::apply_column_expr(expr, v, &tz)
+                        }
+                    })
                     .map_err(|e| PgHandler::err(&e))?;
                     encode_field_value(
                         &mut enc,

@@ -4785,7 +4785,9 @@ fn plan_query_node(
     // (correlated) subquery, which the resolver has to see.
     if let Some(N::SelectStmt(s)) = node.node.as_mut() {
         if s.with_clause.is_none() {
-            **s = expand_views(s)?;
+            if let Some(expanded) = expand_views(s)? {
+                **s = expanded;
+            }
         }
     }
     cancel::check()?;
@@ -10057,18 +10059,56 @@ pub fn is_view(name: &str) -> bool {
     view_definition(name).is_some()
 }
 
+/// Whether any node of `s`, at any depth, satisfies `pred` -- read in
+/// place, where wrapping `s` in a node to call `nodes()` on it copied the
+/// whole statement first (RP-202).
+pub(crate) fn select_any_node(
+    s: &pg_query::protobuf::SelectStmt,
+    pred: &dyn Fn(&pg_query::NodeRef<'_>) -> bool,
+) -> bool {
+    let child = |n: &pg_query::protobuf::Node| {
+        n.node
+            .as_ref()
+            .is_some_and(|e| e.nodes().iter().any(|(r, _, _, _)| pred(r)))
+    };
+    let opt = |n: &Option<Box<pg_query::protobuf::Node>>| n.as_deref().is_some_and(child);
+    s.target_list.iter().any(child)
+        || s.from_clause.iter().any(child)
+        || opt(&s.where_clause)
+        || s.group_clause.iter().any(child)
+        || opt(&s.having_clause)
+        || s.window_clause.iter().any(child)
+        || s.values_lists.iter().any(child)
+        || s.sort_clause.iter().any(child)
+        || s.distinct_clause.iter().any(child)
+        || opt(&s.limit_offset)
+        || opt(&s.limit_count)
+        || s.locking_clause.iter().any(child)
+        || s.with_clause
+            .as_ref()
+            .is_some_and(|w| w.ctes.iter().any(child))
+        || s.larg.as_deref().is_some_and(|l| select_any_node(l, pred))
+        || s.rarg.as_deref().is_some_and(|r| select_any_node(r, pred))
+}
+
 /// Replace every FROM reference to a VIEW with the subquery its definition
 /// is -- which is what PostgreSQL's rewriter does with a view, too. Only the
 /// top level of this SELECT is rewritten: a FROM-subquery, a subquery in an
 /// expression and each side of a set operation are all planned through
 /// `plan_select` in their turn, which expands their own references.
-fn expand_views(s: &pg_query::protobuf::SelectStmt) -> Result<pg_query::protobuf::SelectStmt> {
+///
+/// `None` when there is nothing to expand: the statement is not copied, which
+/// for a large one (a 200,000-item `IN` list) was tens of milliseconds in
+/// which no cancel was seen (RP-202).
+fn expand_views(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Result<Option<pg_query::protobuf::SelectStmt>> {
     if PLAN_VIEWS.with(|v| v.borrow().is_empty())
         && !rls::active()
         && !inherit::descendants_any()
         && !system_views::in_from(&s.from_clause)
     {
-        return Ok(s.clone());
+        return Ok(None);
     }
     let mut out = s.clone();
     let previous = inherit::WANT_TABLEOID.with(|w| w.replace(partitions::mentions_tableoid(s)));
@@ -10078,7 +10118,7 @@ fn expand_views(s: &pg_query::protobuf::SelectStmt) -> Result<pg_query::protobuf
         .try_for_each(|item| expand_views_in_from(item, 0));
     inherit::WANT_TABLEOID.with(|w| w.set(previous));
     result?;
-    Ok(out)
+    Ok(Some(out))
 }
 
 fn expand_views_in_from(item: &mut pg_query::protobuf::Node, depth: usize) -> Result<()> {
@@ -12192,27 +12232,16 @@ fn has_window(s: &pg_query::protobuf::SelectStmt) -> bool {
 }
 
 fn node_has_window(node: Option<&pg_query::protobuf::Node>) -> bool {
-    let Some(node) = node.and_then(|n| n.node.as_ref()) else {
+    let Some(wrapped) = node.filter(|n| n.node.is_some()) else {
         return false;
     };
-    if let N::FuncCall(f) = node {
-        if f.over.is_some() {
-            return true;
-        }
-    }
-    // Anywhere else in the expression -- a COALESCE, a CASE, a cast --
-    // through the one walker every expression rewrite shares.
-    let mut probe = pg_query::protobuf::Node {
-        node: Some(node.clone()),
-    };
-    let mut found = false;
-    let _ = walk_expr(&mut probe, &mut |n| {
-        if let Some(N::FuncCall(f)) = n.node.as_ref() {
-            found |= f.over.is_some();
-        }
-        Ok(())
-    });
-    found
+    // Anywhere in the expression -- a COALESCE, a CASE, a cast -- over the
+    // nodes the shared walker visits, read in place (copying the expression
+    // was 20 ms over a 200,000-item `IN` list; RP-202).
+    expr_any(
+        wrapped,
+        &|n| matches!(n.node.as_ref(), Some(N::FuncCall(f)) if f.over.is_some()),
+    )
 }
 
 /// The window functions by name, with the result type PostgreSQL gives them.
@@ -15711,6 +15740,7 @@ pub(crate) fn walk_expr(
     node: &mut pg_query::protobuf::Node,
     visit: &mut dyn FnMut(&mut pg_query::protobuf::Node) -> Result<()>,
 ) -> Result<()> {
+    cancel::walk_point()?;
     visit(node)?;
     let Some(inner) = node.node.as_mut() else {
         return Ok(());
@@ -15837,6 +15867,72 @@ pub(crate) fn walk_expr(
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+/// Whether `pred` holds for any node `walk_expr` would visit under `node`
+/// -- the same nodes, read in place: a pass's guard asks it before copying
+/// a statement it may not change (RP-202). `nodes()` is no stand-in: it
+/// does not descend into an `A_Indirection`'s argument, among others.
+/// Keep the two in step.
+pub(crate) fn expr_any(
+    node: &pg_query::protobuf::Node,
+    pred: &dyn Fn(&pg_query::protobuf::Node) -> bool,
+) -> bool {
+    if pred(node) {
+        return true;
+    }
+    let Some(inner) = node.node.as_ref() else {
+        return false;
+    };
+    let one =
+        |n: &Option<Box<pg_query::protobuf::Node>>| n.as_deref().is_some_and(|a| expr_any(a, pred));
+    let all = |v: &[pg_query::protobuf::Node]| v.iter().any(|a| expr_any(a, pred));
+    let window =
+        |w: &pg_query::protobuf::WindowDef| all(&w.partition_clause) || all(&w.order_clause);
+    match inner {
+        N::TypeCast(tc) => one(&tc.arg),
+        N::AExpr(e) => one(&e.lexpr) || one(&e.rexpr),
+        N::FuncCall(f) => {
+            all(&f.args)
+                || all(&f.agg_order)
+                || one(&f.agg_filter)
+                || f.over.as_deref().is_some_and(window)
+        }
+        N::WindowDef(w) => window(w),
+        N::SortBy(sb) => one(&sb.node),
+        N::ResTarget(rt) => one(&rt.val),
+        N::BooleanTest(t) => one(&t.arg),
+        N::CollateClause(c) => one(&c.arg),
+        N::NamedArgExpr(a) => one(&a.arg),
+        N::GroupingSet(g) => all(&g.content),
+        N::GroupingFunc(g) => all(&g.args),
+        N::List(l) => all(&l.items),
+        N::SubLink(sl) => one(&sl.testexpr),
+        N::BoolExpr(b) => all(&b.args),
+        N::AArrayExpr(a) => all(&a.elements),
+        N::RowExpr(r) => all(&r.args),
+        N::CoalesceExpr(c) => all(&c.args),
+        N::MinMaxExpr(m) => all(&m.args),
+        N::XmlExpr(x) => all(&x.named_args) || all(&x.args),
+        N::XmlSerialize(x) => one(&x.expr),
+        N::NullTest(t) => one(&t.arg),
+        N::CaseExpr(c) => {
+            one(&c.arg)
+                || c.args.iter().any(|w| match w.node.as_ref() {
+                    Some(N::CaseWhen(cw)) => one(&cw.expr) || one(&cw.result),
+                    _ => false,
+                })
+                || one(&c.defresult)
+        }
+        N::AIndirection(a) => {
+            one(&a.arg)
+                || a.indirection.iter().any(|ind| match ind.node.as_ref() {
+                    Some(N::AIndices(idx)) => one(&idx.lidx) || one(&idx.uidx),
+                    _ => false,
+                })
+        }
+        _ => false,
     }
 }
 
@@ -20962,6 +21058,15 @@ fn rewrite_tablesample(
     s: &pg_query::protobuf::SelectStmt,
     params: &[Bson],
 ) -> Result<Option<pg_query::protobuf::SelectStmt>> {
+    // Only a FROM item that samples is rewritten; with none the statement is
+    // not copied (RP-202).
+    if !s
+        .from_clause
+        .iter()
+        .any(|f| matches!(f.node.as_ref(), Some(N::RangeTableSample(_))))
+    {
+        return Ok(None);
+    }
     let mut out = s.clone();
     let mut filters: Vec<pg_query::protobuf::Node> = Vec::new();
     for item in &mut out.from_clause {
@@ -21054,6 +21159,18 @@ fn rewrite_tablesample(
 fn rewrite_xmlagg(
     s: &pg_query::protobuf::SelectStmt,
 ) -> Result<Option<pg_query::protobuf::SelectStmt>> {
+    // No `xmlagg` call where the walk below looks, nothing to rewrite, and
+    // no copy (RP-202).
+    let xmlagg = |n: &pg_query::protobuf::Node| matches!(n.node.as_ref(), Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("xmlagg"));
+    let calls = s
+        .target_list
+        .iter()
+        .chain(s.having_clause.as_deref())
+        .chain(s.sort_clause.iter())
+        .any(|n| expr_any(n, &xmlagg));
+    if !calls {
+        return Ok(None);
+    }
     let mut out = s.clone();
     let mut changed = false;
     let mut visit = |n: &mut pg_query::protobuf::Node| -> Result<()> {
@@ -21973,12 +22090,19 @@ fn column_alias_rewrite(
         }
         Ok(())
     }
-    let mut out = s.clone();
+    // Only the FROM list changes; the statement is copied when it does
+    // (RP-202).
+    let mut from = s.from_clause.clone();
     let mut changed = false;
-    for n in &mut out.from_clause {
+    for n in &mut from {
         item(n, lookup, &mut changed)?;
     }
-    Ok(changed.then_some(out))
+    if !changed {
+        return Ok(None);
+    }
+    let mut out = s.clone();
+    out.from_clause = from;
+    Ok(Some(out))
 }
 
 fn plan_select(
@@ -22007,11 +22131,16 @@ fn plan_select(
     if let Some(rewritten) = partitions::rewrite_tableoid(s)? {
         return plan_select(&rewritten, lookup, params);
     }
-    let expanded = expand_views(s)?;
+    // Each copies the statement only when it changes it (RP-202).
+    let views = expand_views(s)?;
     // A strict operator over a NULL constant is NULL before anything runs
     // (RP-075).
-    let expanded = strict_fold::fold_select(&expanded)?.unwrap_or(expanded);
-    let s = &expanded;
+    let folded = strict_fold::fold_select(views.as_ref().unwrap_or(s))?;
+    let expanded: std::borrow::Cow<'_, pg_query::protobuf::SelectStmt> = match (folded, views) {
+        (Some(f), _) | (None, Some(f)) => std::borrow::Cow::Owned(f),
+        (None, None) => std::borrow::Cow::Borrowed(s),
+    };
+    let s = &*expanded;
     // The locking clauses, checked once per top-level statement, on the
     // statement as written (views expanded): the rewrites below may move
     // the relations a clause names.
@@ -22348,6 +22477,16 @@ fn expand_composite_targets(
         let (_, fields) = user_composite(&composite_type(arg, column_type)?)?;
         Some((arg.clone(), fields))
     };
+    // No `(x).*` target: nothing is copied (RP-202).
+    let star_target = target_list.iter().any(|t| {
+        matches!(t.node.as_ref(), Some(N::ResTarget(rt))
+            if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
+                Some(N::AIndirection(ind)) if matches!(ind.indirection.as_slice(),
+                    [star] if matches!(star.node.as_ref(), Some(N::AStar(_))))))
+    });
+    if !star_target {
+        return None;
+    }
     let mut changed = false;
     let mut targets = Vec::with_capacity(target_list.len());
     for t in target_list {
@@ -34821,30 +34960,31 @@ fn syntactic_output_names(
 /// them) name `alias` alone or as `alias.*`: the references
 /// `whole_row_rewrite` turns into the source's row or columns.
 fn names_alias(s: &pg_query::protobuf::SelectStmt, alias: &str) -> Result<bool> {
-    let mut clauses = pg_query::protobuf::SelectStmt {
-        target_list: s.target_list.clone(),
-        where_clause: s.where_clause.clone(),
-        group_clause: s.group_clause.clone(),
-        having_clause: s.having_clause.clone(),
-        sort_clause: s.sort_clause.clone(),
-        distinct_clause: s.distinct_clause.clone(),
-        window_clause: s.window_clause.clone(),
-        ..Default::default()
-    };
-    let mut found = false;
-    correlated::walk_select(&mut clauses, &mut |n| {
-        if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+    // Read in place (copying the clauses was the cost this check exists to
+    // save, RP-202). A subquery's body is not read here: one counts as a
+    // reference, so the rewrite runs and looks inside it as before.
+    let names = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+        Some(N::SubLink(_)) => true,
+        Some(N::ColumnRef(c)) => {
             let first = matches!(
                 c.fields.first().and_then(|f| f.node.as_ref()),
                 Some(N::String(sv)) if sv.sval == alias
             );
             let star_or_alone = c.fields.len() == 1
                 || (c.fields.len() == 2 && matches!(c.fields[1].node.as_ref(), Some(N::AStar(_))));
-            found |= first && star_or_alone;
+            first && star_or_alone
         }
-        Ok(())
-    })?;
-    Ok(found)
+        _ => false,
+    };
+    Ok(s.target_list
+        .iter()
+        .chain(s.where_clause.as_deref())
+        .chain(s.group_clause.iter())
+        .chain(s.having_clause.as_deref())
+        .chain(s.sort_clause.iter())
+        .chain(s.distinct_clause.iter())
+        .chain(s.window_clause.iter())
+        .any(|n| expr_any(n, &names)))
 }
 
 /// Rewrite whole-row references over a single FROM item into `ROW(...)`
@@ -34872,6 +35012,12 @@ fn whole_row_rewrite(
                 .alias
                 .as_ref()
                 .map_or_else(|| r.relname.clone(), |a| a.aliasname.clone());
+            // A table is never renamed below: with no reference to its
+            // name as a row there is nothing to rewrite, and the statement
+            // is not copied (RP-202).
+            if !names_alias(s, &alias)? {
+                return Ok(None);
+            }
             match lookup(&relation_name(r)) {
                 Some(def) => {
                     // A table named after a built-in type (`tid`) has the
@@ -38562,6 +38708,10 @@ thread_local! {
 /// so a long `a || b || c ...` cost O(n^2) -- 1,000 terms took most of a
 /// minute. `static_type`'s answers are memoised for the evaluation.
 fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson> {
+    // Folding while planning is a cancellation point too (a constant `IN`
+    // list of 200,000 items is that many evaluations); never at execution
+    // (`cancel::with_walk_checks`).
+    cancel::walk_point()?;
     let depth = CONST_DEPTH.with(|d| {
         let v = d.get();
         d.set(v + 1);
@@ -39431,7 +39581,19 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 if correlated::executor_hook_installed() {
                     correlated::call_sequence("pg_sleep", &[Bson::Double(secs)])?;
                 } else {
-                    std::thread::sleep(std::time::Duration::from_secs_f64(secs.min(3600.0)));
+                    // A cancellation point every 5 ms, as `pg_sleep`'s own
+                    // loop is one (a row streamed after the statement's
+                    // hooks are gone still has the cancel hook; RP-202).
+                    let deadline = std::time::Instant::now()
+                        + std::time::Duration::from_secs_f64(secs.min(3600.0));
+                    loop {
+                        cancel::check()?;
+                        let left = deadline.saturating_duration_since(std::time::Instant::now());
+                        if left.is_zero() {
+                            break;
+                        }
+                        std::thread::sleep(left.min(std::time::Duration::from_millis(5)));
+                    }
                 }
             }
             return Ok(Bson::String(String::new()));
@@ -40445,28 +40607,33 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         // anywhere makes the answer NULL.
         if AExprKind::try_from(e.kind) == Ok(AExprKind::AexprIn) {
             let negated = in_is_negated(e);
-            let items: Vec<pg_query::protobuf::Node> =
+            let items: &[pg_query::protobuf::Node] =
                 match e.rexpr.as_deref().and_then(|n| n.node.as_ref()) {
-                    Some(N::List(l)) => l.items.clone(),
+                    Some(N::List(l)) => &l.items,
                     _ => return Err(Error::Unsupported("this IN list".into())),
                 };
             let mut saw_null = false;
-            // The comparison without its list, cloned once: cloning `e` per
+            // The comparison without its list, built once: cloning `e` per
             // item cloned the whole list each time, quadratic in its length
-            // (a 200,000-item list matching at its 780th item took 24 s).
-            let mut base = e.clone();
-            base.rexpr = None;
-            base.kind = AExprKind::AexprOp as i32;
-            base.name = vec![string_node("=")];
-            for (i, item) in items.into_iter().enumerate() {
+            // (a 200,000-item list matching at its 780th item took 24 s), and
+            // cloning it once, or the list, was 40 ms in which no cancel was
+            // seen (RP-202). Each item is copied as it is compared.
+            let base = AExpr {
+                kind: AExprKind::AexprOp as i32,
+                name: vec![string_node("=")],
+                lexpr: e.lexpr.clone(),
+                rexpr: None,
+                location: e.location,
+            };
+            for (i, item) in items.iter().enumerate() {
                 if i % 1024 == 1023 {
                     cancel::check()?;
                 }
                 let mut eq = base.clone();
-                eq.rexpr = Some(Box::new(item));
+                eq.rexpr = Some(Box::new(item.clone()));
                 match const_value(
                     &pg_query::protobuf::Node {
-                        node: Some(N::AExpr(eq)),
+                        node: Some(N::AExpr(Box::new(eq))),
                     },
                     params,
                 )? {

@@ -128,7 +128,7 @@ pub fn sql_relations(sql: &str) -> Vec<(String, &'static str)> {
     }
     // The names are resolved through the search path afterwards: only the
     // parse-tree walk is a function of the text alone.
-    let raw = memoised(&MEMO, sql, sql_relations_uncached);
+    let raw = memoised(&MEMO, sql, |sql| apart(sql, sql_relations_uncached));
     let mut out = Vec::with_capacity(raw.len());
     for (r, p) in raw {
         let (schema, name) = r.split_once('\u{1f}').unwrap_or(("", r.as_str()));
@@ -156,20 +156,22 @@ pub fn sql_catalog_reads(sql: &str) -> Vec<String> {
         static MEMO: std::cell::RefCell<std::collections::HashMap<String, Vec<String>>> =
             std::cell::RefCell::new(std::collections::HashMap::new());
     }
-    memoised(&MEMO, sql, |sql| {
-        let Ok(parsed) = parse_tree(sql) else {
-            return Vec::new();
-        };
-        let mut out: Vec<String> = Vec::new();
-        for (node, _, _, _) in parsed.nodes() {
-            if let pg_query::NodeRef::RangeVar(r) = node {
-                if r.schemaname == "pg_catalog" && !out.contains(&r.relname) {
-                    out.push(r.relname.clone());
-                }
+    memoised(&MEMO, sql, |sql| apart(sql, catalog_reads_uncached))
+}
+
+fn catalog_reads_uncached(sql: &str) -> Vec<String> {
+    let Ok(parsed) = parse_tree(sql) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for (node, _, _, _) in parsed.nodes() {
+        if let pg_query::NodeRef::RangeVar(r) = node {
+            if r.schemaname == "pg_catalog" && !out.contains(&r.relname) {
+                out.push(r.relname.clone());
             }
         }
-        out
-    })
+    }
+    out
 }
 
 /// A relation as written -- `schema<U+001F>name` -- for `sql_relations`'
@@ -180,6 +182,25 @@ fn raw_key(r: &pg_query::protobuf::RangeVar) -> String {
 
 /// `f(sql)`, remembered in `memo` (at most `MEMO_MAX` texts; emptied when
 /// full).
+/// `f(sql)`, a walk of a large statement's whole parse tree (`nodes()`),
+/// on a thread of its own while this one polls for a cancel: a walk of a
+/// 200,000-item `IN` list was 30 to 100 ms in which no cancel was seen
+/// (RP-202). A cancel answers what a cut-short parse does, nothing, which
+/// `memoised` does not keep; anything else that stops the walk (a panic)
+/// runs it again here, to fail as it always did.
+fn apart<V: Default + Send + 'static>(sql: &str, f: fn(&str) -> V) -> V {
+    const APART_BYTES: usize = 64 << 10;
+    if sql.len() <= APART_BYTES {
+        return f(sql);
+    }
+    let owned = sql.to_string();
+    match crate::cancel::interruptible(8 << 20, move || Ok(f(&owned))) {
+        Ok(v) => v,
+        Err(_) if crate::cancel::pending() => V::default(),
+        Err(_) => f(sql),
+    }
+}
+
 fn memoised<V: Clone>(
     memo: &'static std::thread::LocalKey<std::cell::RefCell<std::collections::HashMap<String, V>>>,
     sql: &str,

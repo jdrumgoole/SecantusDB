@@ -842,6 +842,13 @@ tests regression tests:
 - RP-271: `format_type(18, NULL)` was `character` (`"char"` is meant), and a
   modifier on a type with no `typmodout` was dropped (`format_type(25, 7)`
   is `text(7)`).
+- RP-285 (found by RP-254's work): `pg_class.relam` was `btree` for every
+  index, so a join to `pg_am` named a GIN, GiST or hash index's method
+  wrong (`tests/backlog/test_rp_catalog_identity.py`).
+- RP-286 (found by RP-202's): a `pg_sleep` in the select list of a streamed
+  SELECT (`select a, pg_sleep(2) from t`) did not look for a cancel and
+  slept to its end; a row streamed after the statement's hooks are gone
+  is evaluated under a cancel hook now (`tests/backlog/test_rp202_cancel.py`).
 
 - [ ] **The built-in relations' `pg_attribute` rows differ from
       PostgreSQL 15.19's.** Over `attrelid < 16384`: the 648 system-column
@@ -1119,23 +1126,6 @@ NULL for a database's or role's comment) was found and fixed in the same
 batch, and RP-200 (a block's own index definitions) in batch 52; their
 tests there are regression tests.
 
-- [ ] **A cancel while a huge statement is planned waits for the pass it
-      lands in.** Planning a statement with a 200,000-item `IN` list runs
-      for about a second in a debug build, as a sequence of passes over the
-      whole tree with a cancellation point between each. A cancel that lands
-      inside one is answered when it ends: up to 0.09 s late here (measured
-      over 28 cancel times through Parse, Describe, Bind and Execute), where
-      PostgreSQL 15.19 answers in 0.015 s. The longest windows left, about
-      0.12 s each, are walks that collect the whole tree through
-      `pg_query`'s `nodes()` before looking at it: the privilege pass at
-      Execute, and the end of `plan_select`. Batch 74 split or moved apart
-      the ones of 0.2 s: the copy of the memoised tree and the scan for its
-      parameters now run on a thread of their own under the cancel hook,
-      and the typing of an `IN` list and each rewrite pass have a
-      cancellation point. Batch 46's follow-up closed the windows outside
-      planning that were 0.8 s long.
-      Backlog-ID: RP-202
-      Verify: none -- a latency budget; every answer is PostgreSQL's 57014, only later
 
 ## Found by batch 50 (2026-10-23)
 

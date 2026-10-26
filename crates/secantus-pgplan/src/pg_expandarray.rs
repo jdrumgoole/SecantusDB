@@ -115,6 +115,15 @@ fn expand_star(targets: &[pg_query::protobuf::Node]) -> Vec<pg_query::protobuf::
 pub(crate) fn rewrite(
     s: &pg_query::protobuf::SelectStmt,
 ) -> Result<Option<pg_query::protobuf::SelectStmt>> {
+    // No call in the select list (where the walk below looks), nothing to
+    // rewrite: the statement is not copied to find that out (RP-202).
+    let calls = s
+        .target_list
+        .iter()
+        .any(|t| crate::expr_any(t, &|n| is_expandarray(n).is_some()));
+    if !calls {
+        return Ok(None);
+    }
     let mut out = s.clone();
     out.target_list = expand_star(&out.target_list);
     let mut arg: Option<(String, pg_query::protobuf::Node)> = None;

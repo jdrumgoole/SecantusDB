@@ -110,10 +110,10 @@ pub(crate) fn fold_select(
     s: &pg_query::protobuf::SelectStmt,
 ) -> Result<Option<pg_query::protobuf::SelectStmt>> {
     // Cheap test first: no NULL constant, nothing to fold.
-    let has_null = N::SelectStmt(Box::new(s.clone()))
-        .nodes()
-        .iter()
-        .any(|(n, _, _, _)| matches!(n, pg_query::NodeRef::AConst(c) if c.isnull));
+    let has_null = crate::select_any_node(
+        s,
+        &|n| matches!(n, pg_query::NodeRef::AConst(c) if c.isnull),
+    );
     if !has_null {
         return Ok(None);
     }

@@ -361,6 +361,19 @@ pub(crate) fn rewrite(
     s: &pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Result<Option<pg_query::protobuf::SelectStmt>> {
+    // Every case is a field selection, `(x).f` or `(x).*`: with none the
+    // statement is not copied (RP-202).
+    let field_selection =
+        |n: &pg_query::protobuf::Node| matches!(n.node.as_ref(), Some(N::AIndirection(_)));
+    let any = s
+        .target_list
+        .iter()
+        .chain(s.where_clause.as_deref())
+        .chain(s.sort_clause.iter())
+        .any(|n| crate::expr_any(n, &field_selection));
+    if !any {
+        return Ok(None);
+    }
     let origins = origins(s);
     let mut out = s.clone();
     let mut changed = false;
