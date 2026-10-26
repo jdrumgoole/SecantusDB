@@ -1166,29 +1166,6 @@ are scenarios in `tests/backlog/test_rp_batch48.py`, measured on a private
 15.19 cluster. RP-195 (`pg_relation_size`) was found and fixed in the same
 batch; its test there is a regression test.
 
-- [ ] **A B-tree's dead entries: what index scans mark.** Each B-tree's
-      pages are modelled (`btree_model.rs`). Since batch 71 a full leaf
-      deletes before it splits, as PostgreSQL 15.19's
-      `_bt_delete_or_dedup_one_page` does:
-      - `_bt_check_unique` marks LP_DEAD the equal keys whose heap
-        versions are dead to all;
-      - simple deletion removes those, and the dead TIDs of their heap
-        blocks;
-      - bottom-up deletion runs for an UPDATE that left the key unchanged,
-        within its six-block budget.
-      Since batch 74 every step of a long run of updates matches too.
-      Since batch 81 an index scan marks LP_DEAD the entries whose heap
-      versions it finds dead to all (`kill_prior_tuple`, `_bt_killitems`):
-      a read the planner prices as an index scan, and an ORDER BY with no
-      WHERE it reads in a B-tree's order rather than sorting (54 of 54
-      shapes of reads between updates, 48 before). What is left is a read
-      that returns one row, which is not priced (the price counts the
-      table's rows, too dear for every primary-key lookup), so a lookup by
-      the primary key marks nothing: after 2,000 of them between each of
-      three updates PostgreSQL keeps the index at 13, 13 and 13 pages,
-      against 13, 14 and 14 here.
-      Backlog-ID: RP-196
-      Verify: tests/backlog/test_rp_batch81.py::test_primary_key_lookups_mark_the_dead_versions
 
 ## Found by batch 46 (2026-10-23)
 
@@ -1220,8 +1197,8 @@ tests are scenarios in `tests/backlog/test_rp_batch26.py`.
 
 - [ ] **OPEN — the `information_schema` views over every built-in function
       take a second or more** (optimised build without LTO, a fresh
-      database, `count(*)`): `routines` 1.05 s, `parameters` 1.15 s,
-      `data_type_privileges` 2.3 s, `element_types` 15.8 s, where PostgreSQL
+      database, `count(*)`): `routines` 0.9 s, `parameters` 1.0 s,
+      `data_type_privileges` 2.1 s, `element_types` 14.8 s, where PostgreSQL
       15.19 takes 10-50 ms. They answer PostgreSQL's rows since RP-102 listed
       the 3,244 built-ins. The same build took 3.1, 2.2, 5.6 and 62 s before
       the top-ten batch (2026-10-26), which removed: a domain CHECK parsed

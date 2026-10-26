@@ -6621,6 +6621,21 @@ impl PgHandler {
         // scan's is the TIDs its index holds, each a HOT chain's root
         // (where a scan reaches a version an update left on the page); a
         // B-tree index scan's is the index's, ties in their roots' order.
+        // A lookup of one row by a unique key: an index scan whenever the
+        // planner prices it so, which marks the dead versions of that key it
+        // passes (RP-196).
+        if rows.len() <= 1 && !filter.is_empty() && self.has_heap(table) {
+            let live: Vec<i64> = rows
+                .iter()
+                .filter_map(|b| {
+                    bson::RawDocument::from_bytes(b)
+                        .ok()?
+                        .get_i64("__sys_ctid")
+                        .ok()
+                })
+                .collect();
+            self.unique_lookup_scanned(table, filter, &live)?;
+        }
         if rows.len() > 1 && !filter.is_empty() && self.has_heap(table) {
             use serializable::{PricedScan, ScanIndex};
             match self.priced_scan(table, filter) {
@@ -6637,6 +6652,78 @@ impl PgHandler {
             return Ok(heap::in_ctid_order(rows));
         }
         Ok(rows)
+    }
+
+    /// `filter` as an equality on every key column of a unique plain
+    /// B-tree of `table` -- a primary-key lookup -- read through that index
+    /// when PostgreSQL's planner would read it so: its entries for the key
+    /// are passed, and the versions behind them that are dead to every
+    /// snapshot marked (`kill_prior_tuple`, RP-196). Whether the index scan
+    /// beats a sequential one depends on the table's size and definition
+    /// only (no constant's statistics enter a unique equality), so the
+    /// verdict is kept until the heap's page count or the catalog moves.
+    fn unique_lookup_scanned(
+        &self,
+        table: &str,
+        filter: &Document,
+        live: &[i64],
+    ) -> PgWireResult<()> {
+        use serializable::{PricedScan, ScanIndex};
+        let equality = |v: &Bson| match v {
+            Bson::Document(d) => {
+                d.len() == 1
+                    && d.get("$eq")
+                        .is_some_and(|e| !matches!(e, Bson::Document(_)))
+            }
+            _ => true,
+        };
+        if !filter
+            .iter()
+            .all(|(k, v)| !k.starts_with('$') && equality(v))
+        {
+            return Ok(());
+        }
+        let Some(shape) = self.btree_shapes(table).into_iter().find(|s| {
+            s.is_unique()
+                && s.is_plain()
+                && s.key_fields().len() == filter.len()
+                && s.key_fields().iter().all(|f| filter.contains_key(f))
+        }) else {
+            return Ok(());
+        };
+        type Verdicts = Mutex<HashMap<(usize, String, i64), (u32, u64, bool)>>;
+        static VERDICTS: OnceLock<Verdicts> = OnceLock::new();
+        let verdicts = VERDICTS.get_or_init(|| Mutex::new(HashMap::new()));
+        let pages = self.with_heap(table, |h| h.nblocks())?;
+        let version = catalog_cache()
+            .version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let key = (self.store_id(), self.db().to_string(), shape.oid);
+        let known = verdicts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .filter(|(p, v, _)| *p == pages && *v == version)
+            .map(|(_, _, index)| *index);
+        let index = match known {
+            Some(index) => index,
+            None => {
+                let index = matches!(
+                    self.priced_scan(table, filter),
+                    Some(PricedScan::Index(ScanIndex::Btree(s))) if s.oid == shape.oid
+                );
+                let mut v = verdicts.lock().unwrap_or_else(|e| e.into_inner());
+                if v.len() >= 4096 {
+                    v.clear();
+                }
+                v.insert(key, (pages, version, index));
+                index
+            }
+        };
+        if index {
+            self.btree_key_scanned(table, &shape, filter, live)?;
+        }
+        Ok(())
     }
 
     /// A read of `table` with no WHERE whose ORDER BY leads a B-tree, which

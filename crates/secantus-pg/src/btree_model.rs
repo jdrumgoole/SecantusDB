@@ -912,6 +912,44 @@ impl BTree {
         any
     }
 
+    /// The heap TIDs of the entries between `lower` and `upper` not yet
+    /// marked dead: what an index scan of that range passes (RP-196).
+    pub(crate) fn tids_in(
+        &self,
+        shape: &dyn Shape,
+        lower: Option<(&Bson, bool)>,
+        upper: Option<(&Bson, bool)>,
+    ) -> Vec<i64> {
+        let Some(pages) = self.scan_pages(shape, lower, upper) else {
+            return Vec::new();
+        };
+        let within = |k: &Bson| {
+            let above = lower.is_none_or(|(l, inclusive)| match shape.cmp_attr(0, k, l) {
+                Ordering::Greater => true,
+                Ordering::Equal => inclusive,
+                Ordering::Less => false,
+            });
+            let below = upper.is_none_or(|(u, inclusive)| match shape.cmp_attr(0, k, u) {
+                Ordering::Less => true,
+                Ordering::Equal => inclusive,
+                Ordering::Greater => false,
+            });
+            above && below
+        };
+        let mut out = Vec::new();
+        for p in pages {
+            let Page::Leaf { items, .. } = &self.pages[p as usize] else {
+                continue;
+            };
+            for it in items {
+                if !it.dead && it.key.first().is_some_and(within) {
+                    out.extend(it.tids.iter().copied());
+                }
+            }
+        }
+        out
+    }
+
     /// The pages it occupies, the metapage and deleted pages among them.
     pub(crate) fn pages(&self) -> u32 {
         self.pages.len().max(1) as u32

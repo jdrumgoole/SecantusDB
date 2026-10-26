@@ -162,7 +162,7 @@ pub fn check_domain(d: &Domain, value: &Bson) -> Result<()> {
         let Some(node) = check_node(&d.base, expr)? else {
             continue;
         };
-        if const_value(&node, std::slice::from_ref(value))? == Bson::Boolean(false) {
+        if check_fails(&d.base, expr, &node, value)? {
             return Err(Error::Sqlstate(
                 "23514",
                 format!(
@@ -173,6 +173,56 @@ pub fn check_domain(d: &Domain, value: &Bson) -> Result<()> {
         }
     }
     Ok(())
+}
+
+thread_local! {
+    /// The verdicts of CHECKs that read nothing but their value, by base
+    /// type, expression and value: `information_schema`'s columns cast to
+    /// `cardinal_number` once a row each, and evaluating `VALUE >= 0` every
+    /// time was a quarter of a view's time (RP-131).
+    static CHECK_VERDICTS: std::cell::RefCell<std::collections::HashMap<(String, String, i64, u8), bool>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Whether the CHECK `expr` (prepared as `node`) is false for `value`. An
+/// integer, boolean or NULL value of a CHECK built only of operators,
+/// casts and constants -- no function, which may be volatile, and no
+/// subquery -- answers the same every time, under any session setting, and
+/// is remembered.
+fn check_fails(
+    base: &str,
+    expr: &str,
+    node: &pg_query::protobuf::Node,
+    value: &Bson,
+) -> Result<bool> {
+    let key = match value {
+        Bson::Int32(v) => Some((i64::from(*v), 0u8)),
+        Bson::Int64(v) => Some((*v, 1)),
+        Bson::Boolean(b) => Some((i64::from(*b), 2)),
+        Bson::Null => Some((0, 3)),
+        _ => None,
+    }
+    .filter(|_| {
+        !crate::expr_any(node, &|n| {
+            matches!(n.node.as_ref(), Some(N::FuncCall(_) | N::SubLink(_)))
+        })
+    });
+    let Some((v, tag)) = key else {
+        return Ok(const_value(node, std::slice::from_ref(value))? == Bson::Boolean(false));
+    };
+    let k = (base.to_string(), expr.to_string(), v, tag);
+    if let Some(hit) = CHECK_VERDICTS.with(|c| c.borrow().get(&k).copied()) {
+        return Ok(hit);
+    }
+    let fails = const_value(node, std::slice::from_ref(value))? == Bson::Boolean(false);
+    CHECK_VERDICTS.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= 8192 {
+            c.clear();
+        }
+        c.insert(k, fails);
+    });
+    Ok(fails)
 }
 
 /// A domain CHECK's prepared expression (`check_node`).

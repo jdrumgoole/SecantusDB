@@ -136,6 +136,11 @@ impl IndexShape {
     /// A row's index tuple key, or `None` when a partial index's predicate
     /// leaves the row out.
     /// Its key columns' stored fields.
+    /// A UNIQUE (or primary-key) index.
+    pub(crate) fn is_unique(&self) -> bool {
+        self.unique
+    }
+
     pub(crate) fn key_fields(&self) -> &[String] {
         &self.fields[..self.nkey.min(self.fields.len())]
     }
@@ -262,7 +267,7 @@ fn shape_memo() -> &'static Mutex<ShapeMemo> {
 }
 
 impl PgHandler {
-    fn store_id(&self) -> usize {
+    pub(crate) fn store_id(&self) -> usize {
         Arc::as_ptr(&self.storage) as usize
     }
 
@@ -553,6 +558,55 @@ impl PgHandler {
             return Ok(());
         }
         let ranges = crate::serializable::index_scan_ranges(shape, filter);
+        self.with_btree(table, shape, |t| {
+            for (lo, hi) in &ranges {
+                t.kill_items(
+                    shape,
+                    lo.as_ref().map(|(v, i)| (v, *i)),
+                    hi.as_ref().map(|(v, i)| (v, *i)),
+                    &|x| dead.contains(&x),
+                );
+            }
+        })
+    }
+
+    /// [`Self::btree_index_scanned`] for a scan that returns at most one row
+    /// -- a lookup by a unique key -- which learns of the versions behind
+    /// that key's entries only: reading the whole heap's dead versions for
+    /// every primary-key lookup is what kept them unmarked (RP-196).
+    pub(crate) fn btree_key_scanned(
+        &self,
+        table: &str,
+        shape: &IndexShape,
+        filter: &Document,
+        live: &[i64],
+    ) -> PgWireResult<()> {
+        if REWRITING.with(|r| r.get()) {
+            return Ok(());
+        }
+        let ranges = crate::serializable::index_scan_ranges(shape, filter);
+        let tids = self.with_btree(table, shape, |t| {
+            ranges
+                .iter()
+                .flat_map(|(lo, hi)| {
+                    t.tids_in(
+                        shape,
+                        lo.as_ref().map(|(v, i)| (v, *i)),
+                        hi.as_ref().map(|(v, i)| (v, *i)),
+                    )
+                })
+                .collect::<Vec<i64>>()
+        })?;
+        // The entry of the row the lookup returned is live; only the others
+        // can name a dead version, and usually there are none.
+        let others: Vec<i64> = tids.into_iter().filter(|t| !live.contains(t)).collect();
+        if others.is_empty() {
+            return Ok(());
+        }
+        let dead = self.dead_index_tids_among(table, &others)?;
+        if dead.is_empty() {
+            return Ok(());
+        }
         self.with_btree(table, shape, |t| {
             for (lo, hi) in &ranges {
                 t.kill_items(

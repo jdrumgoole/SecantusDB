@@ -582,7 +582,11 @@ impl PgHandler {
     /// committed to the store (a commit there would be another session's
     /// commit to a REPEATABLE READ snapshot). One writer at a time, as a
     /// page's buffer lock makes it.
-    fn with_heap<T>(&self, table: &str, f: impl FnOnce(&mut Heap) -> T) -> PgWireResult<T> {
+    pub(crate) fn with_heap<T>(
+        &self,
+        table: &str,
+        f: impl FnOnce(&mut Heap) -> T,
+    ) -> PgWireResult<T> {
         self.heap_access(table, true, f)
     }
 
@@ -1134,6 +1138,63 @@ impl PgHandler {
                 heap.settle(block, &outcome);
             }
             heap.vacuumable_tids(horizon, &is_running)
+        })
+    }
+
+    /// [`Self::dead_index_tids`] among `roots` only -- the heap TIDs one
+    /// index key's entries hold -- settling only their pages: what a
+    /// primary-key lookup's index scan learns of the versions it passes,
+    /// without reading the whole heap for every lookup (RP-196).
+    pub(crate) fn dead_index_tids_among(
+        &self,
+        table: &str,
+        roots: &[i64],
+    ) -> PgWireResult<std::collections::HashSet<i64>> {
+        if roots.is_empty() || !self.has_heap(table) {
+            return Ok(Default::default());
+        }
+        let (running, horizon) = visibility();
+        let is_running = |x: u64| running.contains(&x);
+        let blocks: std::collections::BTreeSet<u32> = roots
+            .iter()
+            .filter_map(|t| untid(*t).map(|(b, _)| b))
+            .collect();
+        let candidates: Vec<(u32, Vec<(u16, Bson)>)> = self.with_heap(table, |heap| {
+            blocks
+                .iter()
+                .map(|&b| (b, heap.unsettled(b, horizon, &is_running)))
+                .filter(|(_, u)| !u.is_empty())
+                .collect()
+        })?;
+        let ids: Vec<Bson> = candidates
+            .iter()
+            .flat_map(|(_, u)| u.iter().map(|(_, id)| id.clone()))
+            .collect();
+        let present: std::collections::HashMap<String, i64> = if ids.is_empty() {
+            Default::default()
+        } else {
+            self.storage
+                .find_matching(self.db(), table, &bson::doc! { "_id": { "$in": ids } })
+                .map_err(|e| Self::storage_err("could not read", e))?
+                .iter()
+                .filter_map(|raw| {
+                    let d = crate::decode_doc(raw).ok()?;
+                    Some((d.get("_id")?.to_string(), ctid_of(&d)?))
+                })
+                .collect()
+        };
+        self.with_heap(table, |heap| {
+            for (block, unsettled) in candidates {
+                let outcome: Vec<(u16, bool)> = unsettled
+                    .iter()
+                    .map(|(off, id)| {
+                        let here = present.get(&id.to_string()) == Some(&tid(block, *off));
+                        (*off, !here)
+                    })
+                    .collect();
+                heap.settle(block, &outcome);
+            }
+            heap.vacuumable_among(roots, horizon, &is_running)
         })
     }
 
