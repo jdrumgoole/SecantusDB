@@ -41,7 +41,7 @@ mod sys {
 #[cfg(feature = "bundled")]
 extern crate secantus_wiredtiger_sys;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::ptr;
@@ -212,6 +212,8 @@ impl Connection {
         Ok(Session {
             ptr: sptr,
             cursor_config: None,
+            in_txn: Cell::new(false),
+            txn_end: RefCell::new(Vec::new()),
         })
     }
 }
@@ -263,7 +265,18 @@ pub struct Session {
     /// Configuration added to every cursor this session opens (see
     /// [`Session::read_checkpoint`]).
     cursor_config: Option<String>,
+    /// Whether a transaction begun by [`Session::begin_transaction`] is
+    /// running (it ends at its commit or rollback, or when the session
+    /// closes, which rolls it back).
+    in_txn: Cell<bool>,
+    /// What runs when that transaction ends: each callback once, with `true`
+    /// when it committed and `false` when it rolled back. See
+    /// [`Session::on_transaction_end`].
+    txn_end: RefCell<Vec<TxnEndHook>>,
 }
+
+/// A callback run once when a transaction ends: `true` for a commit.
+pub type TxnEndHook = Box<dyn FnOnce(bool) + Send>;
 
 // A `Session` can be **moved** between threads (it owns its `WT_SESSION`), but
 // WiredTiger forbids *concurrent* use from two threads. We mark it `Send` (not
@@ -325,13 +338,54 @@ impl Session {
     }
 
     pub fn begin_transaction(&self, config: Option<&str>) -> Result<()> {
-        self.txn(unsafe { (*self.ptr).begin_transaction }, config)
+        self.txn(unsafe { (*self.ptr).begin_transaction }, config)?;
+        self.in_txn.set(true);
+        Ok(())
     }
+    /// Commit the running transaction. WiredTiger rolls a transaction back
+    /// when its commit fails, so the [`Session::on_transaction_end`]
+    /// callbacks hear `false` then.
     pub fn commit_transaction(&self, config: Option<&str>) -> Result<()> {
-        self.txn(unsafe { (*self.ptr).commit_transaction }, config)
+        let done = self.txn(unsafe { (*self.ptr).commit_transaction }, config);
+        self.end_transaction(done.is_ok());
+        done
     }
+    /// Roll the running transaction back. It is over whatever the call
+    /// answers, so the [`Session::on_transaction_end`] callbacks hear `false`.
     pub fn rollback_transaction(&self, config: Option<&str>) -> Result<()> {
-        self.txn(unsafe { (*self.ptr).rollback_transaction }, config)
+        let done = self.txn(unsafe { (*self.ptr).rollback_transaction }, config);
+        self.end_transaction(false);
+        done
+    }
+
+    /// Whether a transaction begun on this session is running.
+    pub fn in_transaction(&self) -> bool {
+        self.in_txn.get()
+    }
+
+    /// Run `hook` when the running transaction ends, with `true` when it
+    /// commits and `false` when it rolls back (by
+    /// [`Session::rollback_transaction`], a failed commit, or the session
+    /// closing). Outside a transaction a write has already committed, so
+    /// `hook` runs at once with `true`. This is how a change kept outside
+    /// WiredTiger, such as a collection's record count, follows the
+    /// transaction that made it: mongod's `RecoveryUnit::onRollback`.
+    pub fn on_transaction_end(&self, hook: TxnEndHook) {
+        if self.in_txn.get() {
+            self.txn_end.borrow_mut().push(hook);
+        } else {
+            hook(true);
+        }
+    }
+
+    /// The running transaction is over: run its callbacks, in the order
+    /// they were registered.
+    fn end_transaction(&self, committed: bool) {
+        self.in_txn.set(false);
+        let hooks = std::mem::take(&mut *self.txn_end.borrow_mut());
+        for hook in hooks {
+            hook(committed);
+        }
     }
     /// `WT_SESSION::timestamp_transaction`: set a timestamp of the running
     /// transaction, e.g. `"commit_timestamp=1a2b"` (hex).
@@ -404,12 +458,17 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            // Closing a session rolls back the transaction it is running.
+            let running = self.in_txn.get();
             if let Some(close) = unsafe { (*self.ptr).close } {
                 // A drop cannot return the error; it must not vanish (RM-189).
                 let rc = unsafe { close(self.ptr, ptr::null()) };
                 if rc != 0 {
                     eprintln!("secantus-wt: Session close failed: {:?}", check(rc));
                 }
+            }
+            if running {
+                self.end_transaction(false);
             }
             self.ptr = ptr::null_mut();
         }

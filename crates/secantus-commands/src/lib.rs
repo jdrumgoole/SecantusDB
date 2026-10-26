@@ -112,7 +112,7 @@ use bson::{doc, Bson, Document};
 pub use cursors::{CursorError, CursorRegistry};
 use secantus_core::deadline;
 pub use secantus_wire::{MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE};
-pub use storage::{Storage, StorageError, UpdateOutcome};
+pub use storage::{CollectionSizes, Storage, StorageError, UpdateOutcome};
 
 /// Max wire protocol version advertised in `hello` (mongod 8.2).
 ///

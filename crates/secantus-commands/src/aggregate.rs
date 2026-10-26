@@ -3855,9 +3855,13 @@ fn apply_coll_stats(
     };
     let count = match buckets {
         Some(n) => n,
-        None => storage
-            .count_matching(db, coll, &Document::new())
-            .map_err(command_error)? as i64,
+        // The size storer's record count, as mongod's (RM-191).
+        None => {
+            storage
+                .collection_sizes(db, coll)
+                .map_err(command_error)?
+                .records
+        }
     };
     let ns = match buckets {
         Some(_) => format!("{db}.{}{coll}", crate::ts_buckets::BUCKETS_PREFIX),

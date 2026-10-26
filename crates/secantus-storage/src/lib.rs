@@ -56,6 +56,23 @@ pub mod replay;
 pub mod share_locks;
 
 mod scan_bounds;
+mod sizes;
+
+pub use sizes::CollectionSizes;
+use sizes::Delta;
+
+thread_local! {
+    /// How many whole-collection document walks (`Storage::visit_docs`)
+    /// this thread has made: what a test reads to show an answer came
+    /// without one (RM-191).
+    static COLLECTION_WALKS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// [`COLLECTION_WALKS`] on the calling thread, for tests.
+#[doc(hidden)]
+pub fn collection_walks() -> u64 {
+    COLLECTION_WALKS.with(Cell::get)
+}
 
 /// Filename of the advisory PITR manifest embedded in a backup archive.
 pub(crate) const PITR_MANIFEST_NAME: &str = "pitr-manifest.json";
@@ -4784,6 +4801,10 @@ pub struct Storage {
     /// Ids for the groups of inserts mongod logs as one `applyOps`
     /// (`local.oplog.rs` presents each group as that one entry).
     insert_groups: AtomicI64,
+    /// Every collection's record count, data size and index sizes, kept
+    /// current by every write: mongod's size storer (RM-191, see
+    /// [`sizes`]).
+    sizes: sizes::SizeStorer,
 }
 
 /// Strictly-monotonic oplog bookkeeping: the next int64 seq to mint and the last
@@ -6622,6 +6643,17 @@ impl Storage {
         };
         match self.conn.open_session() {
             Ok(session) => {
+                // The committed counts, beside the oplog state they go with:
+                // the next open trusts them only if it finds that state.
+                let fingerprint = [meta.0, meta.1, meta.2];
+                if std::env::var_os("SECANTUS_CHECK_SIZES").is_some() {
+                    if let Err(e) = self.check_sizes_against_walk(&session) {
+                        fail("checking the collection sizes", e);
+                    }
+                }
+                if let Err(e) = self.sizes.persist(&session, &fingerprint) {
+                    fail("persisting the collection sizes", e);
+                }
                 if let Err(e) = self.persist_oplog_meta(&session, meta) {
                     fail("persisting the oplog meta", e);
                 }
@@ -6774,6 +6806,12 @@ impl Storage {
             // reconstruct them by scanning the oplog table.
             load_oplog_meta(&boot)?
         };
+        // The oplog state as the last close left it: the size storer's
+        // counts are trusted only when it is the state they were saved with.
+        // (`next_nat_seq` is not part of it: the open raises it to the
+        // largest RecordId held, so it can differ from what the close saved
+        // with nothing written in between.)
+        let size_fingerprint = [state.next_seq, state.last_ts_secs, state.last_ts_ord];
         // Cluster-time mints are not persisted per call (see
         // `current_cluster_time`), so the recovered (last_ts_secs, last_ts_ord)
         // can lag mints issued right before a crash. Bump one full second past
@@ -6909,7 +6947,11 @@ impl Storage {
             checkpoint_gate: Arc::new(Mutex::new(())),
             user_write_block: std::sync::RwLock::new(None),
             insert_groups: AtomicI64::new(0),
+            sizes: sizes::SizeStorer::default(),
         };
+        // Before the store takes any write -- crash recovery's replay and the
+        // upgrades below write documents, and each write moves the counts.
+        storage.open_size_storer(&size_fingerprint)?;
         // Before anything looks a key up: crash recovery below replays writes
         // by `_id`.
         storage.upgrade_number_keys()?;
@@ -11006,6 +11048,8 @@ impl Storage {
                 cur.set_key_ssq(db, coll, recordid);
                 cur.set_value_u(&frame_doc_value(&key, blob));
                 cur.insert()?;
+                self.sizes
+                    .adjust(&session, db, coll, Delta::insert(key.len(), blob.len()));
                 // Maintain secondary indexes: write this doc's entries (still carrying
                 // id_key as the fetch pointer in step 1; IXSCAN resolves id_key ->
                 // RecordId -> doc), and lazily flag any index this doc makes multikey.
@@ -11324,6 +11368,8 @@ impl Storage {
                     doc_cur.set_key_ssq(db, coll, recordid);
                     doc_cur.set_value_u(&frame_doc_value(&key, blob));
                     doc_cur.insert()?;
+                    self.sizes
+                        .adjust(&session, db, coll, Delta::insert(key.len(), blob.len()));
                     self.write_index_entries(&session, db, coll, &doc, &descs, recordid)?;
                     self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
                     inserted += 1;
@@ -11538,11 +11584,11 @@ impl Storage {
                 };
                 let probe = session.open_cursor(&doc_table_for(db, coll), None)?;
                 probe.set_key_ssq(db, coll, recordid);
-                let old_blob = match probe.search() {
+                let (old_idk_len, old_blob) = match probe.search() {
                     Ok(()) => {
                         let value = probe.get_value_u()?;
-                        let (_idk, blob) = unframe_doc_value(&value)?;
-                        blob.to_vec()
+                        let (idk, blob) = unframe_doc_value(&value)?;
+                        (idk.len(), blob.to_vec())
                     }
                     Err(e) if e.is_not_found() => return Ok(false),
                     Err(e) => return Err(e.into()),
@@ -11574,6 +11620,12 @@ impl Storage {
                 cur.set_key_ssq(db, coll, recordid);
                 cur.set_value_u(&frame_doc_value(&key, &blob));
                 cur.update()?;
+                self.sizes.adjust(
+                    &session,
+                    db,
+                    coll,
+                    Delta::replace((old_idk_len, old_blob.len()), (key.len(), blob.len())),
+                );
 
                 // Maintain secondary indexes as a set diff (additions first, removals
                 // last — see `index_entry_diff` for why lock-free readers need that
@@ -11633,16 +11685,22 @@ impl Storage {
                 let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                 cur.set_key_ssq(db, coll, recordid);
                 // Read the doc first so we can retract its index entries, then remove.
-                let old_blob = match cur.search() {
+                let (old_idk_len, old_blob) = match cur.search() {
                     Ok(()) => {
                         let value = cur.get_value_u()?;
-                        let (_idk, blob) = unframe_doc_value(&value)?;
-                        blob.to_vec()
+                        let (idk, blob) = unframe_doc_value(&value)?;
+                        (idk.len(), blob.to_vec())
                     }
                     Err(e) if e.is_not_found() => return Ok(false),
                     Err(e) => return Err(e.into()),
                 };
                 cur.remove()?;
+                self.sizes.adjust(
+                    &session,
+                    db,
+                    coll,
+                    Delta::remove(old_idk_len, old_blob.len()),
+                );
                 note_deleted(db, coll, &old_blob);
                 let old_doc = decode_doc(&old_blob)?;
                 let descs = self.index_descs(&session, db, coll)?;
@@ -12549,6 +12607,12 @@ impl Storage {
                         dcur.set_key_ssq(dst_db, dst_coll, recordid);
                         dcur.set_value_u(&frame_doc_value(id_k, blob));
                         dcur.insert()?;
+                        self.sizes.adjust(
+                            &session,
+                            dst_db,
+                            dst_coll,
+                            Delta::insert(id_k.len(), blob.len()),
+                        );
                         let doc = decode_doc(blob)?;
                         self.write_index_entries(
                             &session, dst_db, dst_coll, &doc, &dst_descs, recordid,
@@ -12715,6 +12779,12 @@ impl Storage {
             dcur.set_key_ssq(dst_db, dst_coll, recordid);
             dcur.set_value_u(&frame_doc_value(id_k, blob));
             dcur.insert()?;
+            self.sizes.adjust(
+                session,
+                dst_db,
+                dst_coll,
+                Delta::insert(id_k.len(), blob.len()),
+            );
             moved.push((recordid, decode_doc(blob)?));
         }
         let icur = session.open_cursor(IDX_TABLE, None)?;
@@ -12834,6 +12904,107 @@ impl Storage {
         Ok(coll_options(&session, db, coll)?
             .map(|o| o.get_bool("capped").unwrap_or(false))
             .unwrap_or(false))
+    }
+
+    /// `(db, coll)`'s record count, data size and index sizes as the size
+    /// storer keeps them: what mongod answers `count` with no query,
+    /// `collStats`, `dbStats` and an estimated `dataSize` from, without
+    /// reading a document. Like mongod's, it counts what transactions still
+    /// running have written: another transaction's uncommitted insert is in
+    /// it until that transaction aborts (RM-191, RM-087).
+    ///
+    /// `local.oplog.rs` is not a collection here but a view of the oplog
+    /// tables, and is counted by reading them.
+    pub fn collection_sizes(&self, db: &str, coll: &str) -> Result<CollectionSizes> {
+        if self.is_oplog_rs(db, coll) {
+            return Ok(CollectionSizes {
+                records: self.count_matching(db, coll, &Document::new(), None)? as i64,
+                data_size: self.collection_data_size(db, coll)?,
+                ..CollectionSizes::default()
+            });
+        }
+        Ok(self.sizes.get(db, coll))
+    }
+
+    /// `(db, coll)`'s sizes counted by reading every document and index
+    /// entry: what [`Self::collection_sizes`] keeps without reading, for a
+    /// check of the two against each other.
+    pub fn counted_collection_sizes(&self, db: &str, coll: &str) -> Result<CollectionSizes> {
+        let session = self.conn.open_session()?;
+        self.walk_sizes(&session, db, coll)
+    }
+
+    /// How many times this store's sizes were made by reading every table
+    /// (at an open after an unclean shutdown, or of a store that never kept
+    /// them), for tests.
+    #[doc(hidden)]
+    pub fn size_recounts(&self) -> u64 {
+        self.sizes.recounts()
+    }
+
+    fn walk_sizes(&self, session: &Session, db: &str, coll: &str) -> Result<CollectionSizes> {
+        let mut out = CollectionSizes::default();
+        self.visit_docs(session, db, coll, |_, id_k, blob| {
+            out.records += 1;
+            out.data_size += blob.len() as i64;
+            out.id_index_size += id_k.len() as i64;
+            Ok(())
+        })?;
+        self.visit_entry_rows(session, db, coll, |name, packed| {
+            *out.index_sizes.entry(name.to_string()).or_insert(0) += packed.len() as i64;
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Compare every collection's committed kept sizes with a walk of the
+    /// store, for `SECANTUS_CHECK_SIZES` (a test sweep: any write path that
+    /// moves a row without counting it shows up here). Runs at close, when
+    /// nothing else writes.
+    fn check_sizes_against_walk(&self, session: &Session) -> Result<()> {
+        let doc_tables: Vec<String> = (0..DOC_SHARDS).map(doc_shard_name).collect();
+        let walked = sizes::SizeStorer::default();
+        walked.recount(session, &doc_tables, IDX_ENTRIES_TABLE)?;
+        let mut wrong = Vec::new();
+        for (db, coll, sizes) in self.sizes.committed_sizes() {
+            if walked.get(&db, &coll) != sizes {
+                wrong.push(format!(
+                    "{db}.{coll}: kept {sizes:?}, walked {:?}",
+                    walked.get(&db, &coll)
+                ));
+            }
+        }
+        for (db, coll, sizes) in walked.committed_sizes() {
+            if self.sizes.committed_of(&db, &coll) != sizes {
+                wrong.push(format!(
+                    "{db}.{coll}: walked {sizes:?}, kept {:?}",
+                    self.sizes.committed_of(&db, &coll)
+                ));
+            }
+        }
+        if wrong.is_empty() {
+            Ok(())
+        } else {
+            Err(StorageError::Internal(format!(
+                "the kept collection sizes differ from the stored rows: {}",
+                wrong.join("; ")
+            )))
+        }
+    }
+
+    /// Start the size storer at open: the counts a clean close saved, or
+    /// one walk of the store when there are none to trust.
+    fn open_size_storer(&self, fingerprint: &[i64]) -> Result<()> {
+        let session = self.conn.open_session()?;
+        // Logged whatever the data tables are: the clean-close marker must
+        // not roll back with them.
+        session.create(sizes::SIZE_STORER_TABLE, sizes::SIZE_STORER_CFG)?;
+        if !self.sizes.load(&session, fingerprint)? {
+            let doc_tables: Vec<String> = (0..DOC_SHARDS).map(doc_shard_name).collect();
+            self.sizes
+                .recount(&session, &doc_tables, IDX_ENTRIES_TABLE)?;
+        }
+        Ok(())
     }
 
     /// Sum of BSON-encoded document bytes for the collection (the `size` /
@@ -13460,13 +13631,10 @@ impl Storage {
         name: &str,
         entries: &[(Vec<u8>, i64)],
     ) -> Result<()> {
-        let ec = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let ec = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
         for (kb, rid) in entries {
             let packed = pack_entry(kb, *rid);
-            ec.reset()?;
-            ec.set_key_sssu(db, coll, name, &packed);
-            ec.set_value_u(b"");
-            ec.insert()?;
+            self.put_index_entry(session, &ec, db, coll, name, &packed)?;
         }
         Ok(())
     }
@@ -14239,6 +14407,7 @@ impl Storage {
         coll: &str,
         mut f: impl FnMut(i64, &[u8], &[u8]) -> Result<()>,
     ) -> Result<()> {
+        COLLECTION_WALKS.with(|w| w.set(w.get() + 1));
         // Lazy shards: an absent shard (empty / never-created collection) is empty.
         let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
             Ok(c) => c,
@@ -14776,11 +14945,9 @@ impl Storage {
                     doc_cur.reset()?;
                     note_row(db, coll, recordid)?;
                     doc_cur.set_key_ssq(db, coll, recordid);
-                    match doc_cur.remove() {
-                        Ok(()) => {}
-                        Err(e) if e.is_not_found() => {}
-                        Err(e) => return Err(e.into()),
-                    }
+                    doc_cur.remove()?;
+                    self.sizes
+                        .adjust(session, db, coll, Delta::remove(id_k.len(), blob.len()));
                     self.delete_index_entries(session, db, coll, &doc, descs, recordid)?;
                     self.delete_nat_entry(session, db, coll, &id_k)?;
                     total -= blob.len() as i64;
@@ -15035,16 +15202,69 @@ impl Storage {
                 }
             }
         }
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
         for desc in descs {
             for packed in self.packed_entry_keys(doc, desc, recordid)? {
-                cur.reset()?;
-                cur.set_key_sssu(db, coll, &desc.name, &packed);
-                cur.set_value_u(b"");
-                cur.insert()?;
+                self.put_index_entry(session, &cur, db, coll, &desc.name, &packed)?;
             }
         }
         Ok(())
+    }
+
+    /// Write one index entry with `cur` (opened `overwrite=false` on the
+    /// entries table), counting its bytes into the index's size when it is
+    /// new. One a document already has (two geo cells sharing an ancestor,
+    /// an array repeating a value) is there once and counted once.
+    fn put_index_entry(
+        &self,
+        session: &Session,
+        cur: &Cursor,
+        db: &str,
+        coll: &str,
+        name: &str,
+        packed: &[u8],
+    ) -> Result<()> {
+        cur.reset()?;
+        cur.set_key_sssu(db, coll, name, packed);
+        cur.set_value_u(b"");
+        match cur.insert() {
+            Ok(()) => {
+                self.sizes
+                    .adjust(session, db, coll, Delta::entries(name, packed.len() as i64));
+                Ok(())
+            }
+            Err(e) if e.is_duplicate_key() => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Remove one index entry with `cur` (opened `overwrite=false`, so a
+    /// missing entry answers not-found rather than nothing), taking its
+    /// bytes off the index's size when it was there.
+    fn drop_index_entry(
+        &self,
+        session: &Session,
+        cur: &Cursor,
+        db: &str,
+        coll: &str,
+        name: &str,
+        packed: &[u8],
+    ) -> Result<()> {
+        cur.reset()?;
+        cur.set_key_sssu(db, coll, name, packed);
+        match cur.remove() {
+            Ok(()) => {
+                self.sizes.adjust(
+                    session,
+                    db,
+                    coll,
+                    Delta::entries(name, -(packed.len() as i64)),
+                );
+                Ok(())
+            }
+            Err(e) if e.is_not_found() => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Remove `doc`'s index entries for every index in `descs` (recomputes the
@@ -15071,7 +15291,7 @@ impl Storage {
         if descs.is_empty() {
             return Ok(());
         }
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
         // Release the unique claims this RecordId owns. Only its own: a claim
         // the row never held belongs to somebody else, and dropping it would
         // let a genuine duplicate through. The value is the owning RecordId
@@ -15099,13 +15319,7 @@ impl Storage {
                 }
             }
             for packed in self.packed_entry_keys(doc, desc, recordid)? {
-                cur.reset()?;
-                cur.set_key_sssu(db, coll, &desc.name, &packed);
-                match cur.remove() {
-                    Ok(()) => {}
-                    Err(e) if e.is_not_found() => {}
-                    Err(e) => return Err(e.into()),
-                }
+                self.drop_index_entry(session, &cur, db, coll, &desc.name, &packed)?;
             }
         }
         Ok(())
@@ -15164,12 +15378,9 @@ impl Storage {
         if items.is_empty() {
             return Ok(());
         }
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
         for (name, packed) in items {
-            cur.reset()?;
-            cur.set_key_sssu(db, coll, name, packed);
-            cur.set_value_u(b"");
-            cur.insert()?;
+            self.put_index_entry(session, &cur, db, coll, name, packed)?;
         }
         Ok(())
     }
@@ -15184,15 +15395,9 @@ impl Storage {
         if items.is_empty() {
             return Ok(());
         }
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
         for (name, packed) in items {
-            cur.reset()?;
-            cur.set_key_sssu(db, coll, name, packed);
-            match cur.remove() {
-                Ok(()) => {}
-                Err(e) if e.is_not_found() => {}
-                Err(e) => return Err(e.into()),
-            }
+            self.drop_index_entry(session, &cur, db, coll, name, packed)?;
         }
         Ok(())
     }
@@ -15999,6 +16204,12 @@ impl Storage {
                     docs.set_key_ssq(db, coll, *rid);
                     docs.set_value_u(&frame_doc_value(&new, &blob));
                     docs.update()?;
+                    self.sizes.adjust(
+                        session,
+                        db,
+                        coll,
+                        Delta::replace((old.len(), blob.len()), (new.len(), blob.len())),
+                    );
                 }
                 Ok(kept)
             })();
@@ -16270,15 +16481,9 @@ impl Storage {
             packs.push(packed);
             more = scan.next()?;
         }
-        let del = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let del = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
         for p in &packs {
-            del.reset()?;
-            del.set_key_sssu(db, coll, name, p);
-            match del.remove() {
-                Ok(()) => {}
-                Err(e) if e.is_not_found() => {}
-                Err(e) => return Err(e.into()),
-            }
+            self.drop_index_entry(session, &del, db, coll, name, p)?;
         }
         Ok(packs.len())
     }
@@ -16342,24 +16547,26 @@ impl Storage {
             Err(e) if e.is_not_found() => false,
             Err(e) => return Err(e.into()),
         };
-        let mut ids: Vec<i64> = Vec::new();
+        // Each row's RecordId and its `_id`-key and document lengths, for
+        // the collection's sizes.
+        let mut ids: Vec<(i64, usize, usize)> = Vec::new();
         while more && ids.len() < limit {
             let (d, c, recordid) = cur.get_key_ssq()?;
             if d != db || c != coll {
                 break;
             }
-            ids.push(recordid);
+            let value = cur.get_value_u()?;
+            let (idk, blob) = unframe_doc_value(&value)?;
+            ids.push((recordid, idk.len(), blob.len()));
             more = cur.next()?;
         }
-        for recordid in &ids {
+        for &(recordid, idk_len, blob_len) in &ids {
             cur.reset()?;
-            note_row(db, coll, *recordid)?;
-            cur.set_key_ssq(db, coll, *recordid);
-            match cur.remove() {
-                Ok(()) => {}
-                Err(e) if e.is_not_found() => {}
-                Err(e) => return Err(e.into()),
-            }
+            note_row(db, coll, recordid)?;
+            cur.set_key_ssq(db, coll, recordid);
+            cur.remove()?;
+            self.sizes
+                .adjust(session, db, coll, Delta::remove(idk_len, blob_len));
         }
         Ok(ids.len())
     }
@@ -16395,15 +16602,9 @@ impl Storage {
             keys.push((n, packed));
             more = scan.next()?;
         }
-        let del = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let del = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
         for (n, p) in &keys {
-            del.reset()?;
-            del.set_key_sssu(db, coll, n, p);
-            match del.remove() {
-                Ok(()) => {}
-                Err(e) if e.is_not_found() => {}
-                Err(e) => return Err(e.into()),
-            }
+            self.drop_index_entry(session, &del, db, coll, n, p)?;
         }
         Ok(keys.len())
     }
@@ -16552,15 +16753,13 @@ impl Storage {
         // to purge, so an absent shard is simply skipped.
         match session.open_cursor(&doc_table_for(db, coll), None) {
             Ok(doc_cur) => {
-                for (recordid, _id_k, _blob) in self.scan_docs(session, db, coll)? {
+                for (recordid, id_k, blob) in self.scan_docs(session, db, coll)? {
                     doc_cur.reset()?;
                     note_row(db, coll, recordid)?;
                     doc_cur.set_key_ssq(db, coll, recordid);
-                    match doc_cur.remove() {
-                        Ok(()) => {}
-                        Err(e) if e.is_not_found() => {}
-                        Err(e) => return Err(e.into()),
-                    }
+                    doc_cur.remove()?;
+                    self.sizes
+                        .adjust(session, db, coll, Delta::remove(id_k.len(), blob.len()));
                 }
             }
             Err(e) if e.is_missing_table() => {}
@@ -16686,7 +16885,23 @@ impl Storage {
         let ns_lock = self.coll_lock(db, coll);
         let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
-        self.check_collection_in(&session, db, coll)
+        let check = self.check_collection_in(&session, db, coll)?;
+        // A validation that found the collection sound sets its count and
+        // sizes to what it read, as mongod's foreground `validate` does
+        // (`updateStatsAfterRepair`): measured 8.2.11, a standalone killed
+        // before its size storer was saved counted 0 of 1,000 documents
+        // until `validate`, and 1,000 after.
+        let sound = check.get_i64("undecodable").unwrap_or(0) == 0
+            && check.get_array("indexes").is_ok_and(|ixs| {
+                ixs.iter().filter_map(Bson::as_document).all(|ix| {
+                    ix.get_i64("missing").unwrap_or(0) == 0 && ix.get_i64("extra").unwrap_or(0) == 0
+                })
+            });
+        if sound {
+            let walked = self.walk_sizes(&session, db, coll)?;
+            self.sizes.correct(db, coll, walked);
+        }
+        Ok(check)
     }
 
     /// [`Self::check_collection`] as of the last checkpoint: what a
@@ -19114,6 +19329,12 @@ impl Storage {
             cur.set_key_ssq(db, coll, recordid);
             cur.set_value_u(&frame_doc_value(&id_k, &new_blob));
             cur.update()?;
+            self.sizes.adjust(
+                session,
+                db,
+                coll,
+                Delta::replace((id_k.len(), blob.len()), (id_k.len(), new_blob.len())),
+            );
             self.remove_index_entries(session, db, coll, &removals)?;
             self.maybe_mark_multikey(session, db, coll, &new, &descs)?;
             if oplog_on {
@@ -19283,6 +19504,12 @@ impl Storage {
                         cur.set_key_ssq(db, coll, recordid);
                         cur.set_value_u(&frame_doc_value(&id_k, &new_blob));
                         cur.update()?;
+                        self.sizes.adjust(
+                            &session,
+                            db,
+                            coll,
+                            Delta::replace((id_k.len(), blob.len()), (id_k.len(), new_blob.len())),
+                        );
                         self.remove_index_entries(&session, db, coll, &removals)?;
                         self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
                         if oplog_on {
@@ -19501,6 +19728,12 @@ impl Storage {
                     cur.set_key_ssq(db, coll, recordid);
                     cur.set_value_u(&frame_doc_value(&new_id_key, &new_blob));
                     cur.insert()?;
+                    self.sizes.adjust(
+                        &session,
+                        db,
+                        coll,
+                        Delta::insert(new_id_key.len(), new_blob.len()),
+                    );
                     self.write_index_entries(&session, db, coll, &new, &descs, recordid)?;
                     self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
                     if want_post_image {
@@ -19791,6 +20024,8 @@ impl Storage {
             note_row(db, coll, recordid)?;
             cur.set_key_ssq(db, coll, recordid);
             cur.remove()?;
+            self.sizes
+                .adjust(session, db, coll, Delta::remove(id_k.len(), blob.len()));
             note_deleted(db, coll, &blob);
             self.delete_index_entries(session, db, coll, &doc, &descs, recordid)?;
             self.delete_nat_entry(session, db, coll, &id_k)?;
@@ -19877,6 +20112,8 @@ impl Storage {
                     note_row(db, coll, recordid)?;
                     cur.set_key_ssq(db, coll, recordid);
                     cur.remove()?;
+                    self.sizes
+                        .adjust(&session, db, coll, Delta::remove(id_k.len(), blob.len()));
                     note_deleted(db, coll, &blob);
                     self.delete_index_entries(&session, db, coll, &doc, &descs, recordid)?;
                     self.delete_nat_entry(&session, db, coll, &id_k)?;
