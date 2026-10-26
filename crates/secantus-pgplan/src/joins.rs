@@ -183,6 +183,13 @@ pub struct JoinRows {
     /// it could not attribute), which PostgreSQL would attach to a join
     /// and plan the join order with; the executor does not model that.
     pub where_spans: bool,
+    /// One of those conjuncts is an equality, which PostgreSQL would put
+    /// in an equivalence class and so join on; the others it applies as
+    /// join filters, which leave the join order's choices alone where they
+    /// are first evaluated at the top join.
+    pub where_spans_equality: bool,
+    /// The tables (aliases) each of those conjuncts reads.
+    pub where_span_aliases: Vec<Vec<String>>,
     /// The joined-row keys the query reads above the join -- its select
     /// list, GROUP BY, HAVING, ORDER BY and the rest, not its WHERE, whose
     /// conjuncts each read one table and run at its scan. They make the
@@ -416,12 +423,43 @@ fn finish_join_source(
     tree: JoinNode,
     scope: Scope,
 ) -> Result<pg_query::protobuf::SelectStmt> {
-    let where_spans = s.where_clause.as_deref().is_some_and(|w| {
-        let mut conjuncts = Vec::new();
-        split_and(w, &mut conjuncts);
-        conjuncts
-            .iter()
-            .any(|c| single_alias(c, &|_| None).is_none())
+    let spanning: Vec<&pg_query::protobuf::Node> = match s.where_clause.as_deref() {
+        Some(w) => {
+            let mut conjuncts = Vec::new();
+            split_and(w, &mut conjuncts);
+            conjuncts
+                .into_iter()
+                .filter(|c| single_alias(c, &|_| None).is_none())
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    let where_spans = !spanning.is_empty();
+    // Each spanning conjunct's tables (by qualified column reference).
+    let where_span_aliases: Vec<Vec<String>> = spanning
+        .iter()
+        .map(|c| {
+            let mut out: Vec<String> = Vec::new();
+            let mut node = (*c).clone();
+            let _ = walk_expr(&mut node, &mut |x| {
+                if let Some(N::ColumnRef(cr)) = x.node.as_ref() {
+                    if let [q, _] = cr.fields.as_slice() {
+                        if let Some(N::String(q)) = q.node.as_ref() {
+                            if !out.contains(&q.sval) {
+                                out.push(q.sval.clone());
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            });
+            out
+        })
+        .collect();
+    let where_spans_equality = spanning.iter().any(|c| {
+        matches!(c.node.as_ref(), Some(N::AExpr(e))
+            if e.kind == pg_query::protobuf::AExprKind::AexprOp as i32
+                && operator_name(e) == Ok("="))
     });
     let def = TableDef::new(
         "",
@@ -467,6 +505,8 @@ fn finish_join_source(
                     tree,
                     def: def.clone(),
                     where_spans,
+                    where_spans_equality,
+                    where_span_aliases,
                     needed,
                 })),
                 def,
@@ -2114,6 +2154,15 @@ fn strict_aliases(
             }
             Some(N::AConst(_)) | Some(N::ParamRef(_)) => true,
             Some(N::TypeCast(t)) => t.arg.as_deref().is_some_and(|a| column(a, owner, out)),
+            // Arithmetic is strict (`find_nonnullable_rels` descends into a
+            // strict operator's arguments): NULL in, NULL out.
+            Some(N::AExpr(e))
+                if e.kind == AExprKind::AexprOp as i32
+                    && matches!(crate::operator_name(e), Ok("+" | "-" | "*" | "/" | "%")) =>
+            {
+                e.lexpr.as_deref().is_none_or(|l| column(l, owner, out))
+                    && e.rexpr.as_deref().is_some_and(|r| column(r, owner, out))
+            }
             _ => false,
         }
     }

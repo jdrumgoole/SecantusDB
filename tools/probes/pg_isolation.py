@@ -175,6 +175,38 @@ def _ready(conn: psycopg.Connection, wait: float) -> bool:
         time.sleep(0.005)
 
 
+def _settle(
+    conn: psycopg.Connection,
+    ctl: psycopg.Connection,
+    pid: int,
+    others: list[int],
+    cap: float,
+) -> bool:
+    """Wait for `conn`'s step as `isolationtester`'s `try_complete_step`
+    does: until its result is in (`True`), or until the server says the
+    session is blocked by another of the permutation's sessions (`False`),
+    as `pg_isolation_test_session_is_blocked` says: waiting on a lock
+    (`pg_blocking_pids`) or for a safe snapshot
+    (`pg_safe_snapshot_blocking_pids`). A slow step is not a blocked one. `cap` bounds a step
+    that neither finishes nor blocks (`False` too)."""
+    pg = conn.pgconn
+    deadline = time.monotonic() + cap
+    while True:
+        pg.consume_input()
+        if not pg.is_busy():
+            return True
+        blocked = ctl.execute(
+            "select pg_isolation_test_session_is_blocked(%s, %s::int4[])", (pid, others)
+        ).fetchone()[0]
+        if blocked:
+            # Blocked; but it may have just finished as the answer came.
+            pg.consume_input()
+            return not pg.is_busy()
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+
+
 def _run_sql(conn: psycopg.Connection, sql: str, wait: float = 600.0) -> list[Any]:
     conn.pgconn.send_query(sql.encode())
     if not _ready(conn, wait):
@@ -191,15 +223,27 @@ def run_permutation(spec: Spec, perm: list[str], dsn: str, wait: float) -> list[
     try:
         for block in spec.setup:
             trace.append(("setup", _run_sql(ctl, block)))
+        # Each session's backend, asked before its setup runs: a setup that
+        # begins a READ ONLY DEFERRABLE transaction would make the question
+        # wait for a safe snapshot (`isolationtester` reads it at connect).
+        pids: dict[str, int] = {}
         for s in spec.sessions:
             conns[s.name] = psycopg.connect(dsn, autocommit=True)
+            pids[s.name] = conns[s.name].execute("select pg_backend_pid()").fetchone()[0]
             for block in s.setup:
                 trace.append((f"{s.name} setup", _run_sql(conns[s.name], block)))
+
+        def others(name: str) -> list[int]:
+            return [p for n, p in pids.items() if n != name]
+
+        # `wait` caps a step that neither finishes nor blocks.
+        cap = max(wait, 1.0) * 60
         waiting: list[str] = []
         for step in perm:
-            c = conns[owner[step].name]
+            name = owner[step].name
+            c = conns[name]
             c.pgconn.send_query(sql_of[step].encode())
-            if _ready(c, wait):
+            if _settle(c, ctl, pids[name], others(name), cap):
                 trace.append((step, _results(c)))
             else:
                 trace.append((step, "waiting"))
@@ -209,8 +253,9 @@ def run_permutation(spec: Spec, perm: list[str], dsn: str, wait: float) -> list[
             for w in list(waiting):
                 if w == step:
                     continue
-                wc = conns[owner[w].name]
-                if _ready(wc, min(wait, 0.5)):
+                wname = owner[w].name
+                wc = conns[wname]
+                if _settle(wc, ctl, pids[wname], others(wname), cap):
                     trace.append((f"{w} completed", _results(wc)))
                     waiting.remove(w)
         for w in waiting:

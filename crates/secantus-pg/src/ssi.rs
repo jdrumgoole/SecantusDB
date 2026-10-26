@@ -1235,6 +1235,30 @@ impl State {
         Some((s.possible_unsafe.is_empty(), s.is(FLAG_RO_UNSAFE)))
     }
 
+    /// `GetSafeSnapshotBlockingPids`: the backends whose read/write
+    /// transactions backend `pid`'s READ ONLY DEFERRABLE one waits on for
+    /// a safe snapshot, in its `possibleUnsafeConflicts` order; none
+    /// unless it is waiting.
+    pub(crate) fn safe_snapshot_blocking_pids(&self, pid: i32) -> Vec<i32> {
+        let Some(sx) = self.mine(pid) else {
+            return Vec::new();
+        };
+        let s = self.sx(sx);
+        if !s.is(FLAG_DEFERRABLE_WAITING) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for &c in &s.possible_unsafe {
+            let writer = self.conflict(c).out;
+            if let Some((&p, _)) = self.by_pid.iter().find(|(_, &x)| x == writer) {
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
     /// Mark backend `pid`'s read-only transaction as waiting for a safe
     /// snapshot (`GetSafeSnapshot`), or no longer.
     pub(crate) fn set_deferrable_waiting(&mut self, pid: i32, on: bool) {

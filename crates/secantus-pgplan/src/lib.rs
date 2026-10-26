@@ -24883,8 +24883,18 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
         // `pg_blocking_pids(int4)` answers `int4[]`; the hook's value (an
         // array, often empty) would otherwise infer the column's type from
         // the value alone.
-        Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("pg_blocking_pids") => {
+        Some(N::FuncCall(f))
+            if matches!(
+                func_name(f).as_deref(),
+                Some("pg_blocking_pids" | "pg_safe_snapshot_blocking_pids")
+            ) =>
+        {
             return "int4[]".to_string();
+        }
+        Some(N::FuncCall(f))
+            if func_name(f).as_deref() == Some("pg_isolation_test_session_is_blocked") =>
+        {
+            return "bool".to_string();
         }
         Some(N::AExpr(e)) if extension_visible("pg_trgm") => {
             let op = e.name.last().and_then(|n| match n.node.as_ref() {
