@@ -576,10 +576,18 @@ one beside it.
     is a Hash Full Join only, as `select_mergejoin_clauses` allows no
     merge join a join filter (20 of 20 two-table variants: WHERE, LIMIT,
     ORDER BY, USING, ON filter). A FULL join over an analysed table is
-    declined with the other joins over measured columns (below). Not yet:
-    two classes spanning both sides (two join keys); an
+    declined with the other joins over measured columns (below). A class
+    beside outer joins is searched too (2026-10-25): only inner joins'
+    equalities make the class (an outer join's clause is delayed,
+    `distribute_qual_to_rels`), each inner ON the class stands in for is
+    checked where its tables meet, below any outer join that could
+    NULL-extend them, and an outer join's key that is a class member reads
+    a side merged on the class unsorted, a LEFT join merged on its
+    preserved member coming out in the class's order; 18 of 18 shapes of
+    four and five tables (none before), nested LEFT joins 20 of 20 (18).
+    Not yet: two classes spanning both sides (two join keys); an
     expression in a class; a LEFT join's class through the general path;
-    a class of text or other non-integer keys, or with a LEFT join; three
+    a class of text or other non-integer keys; three
     tables with a WHERE over two of them or a LIMIT; four or more tables
     with a WHERE over two of them or a LIMIT; more than eight tables; an expression key with a function
     call or a cast that costs; parameterized nested loops (an index scan inner); a LIMIT with
@@ -587,7 +595,7 @@ one beside it.
     than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_left_join_over_an_inner_class_is_searched
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_join_on_two_equalities_is_planned
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
@@ -738,8 +746,14 @@ one beside it.
       passed). It did not reproduce locally on macOS: the test alone 90
       times, under 60 seeds, with autovacuum waking every second, the whole
       file under eight random orders, and a 4-thread stress of the same
-      pattern. The next step is the server's log from a failing Windows run:
-      since batch 81 the gauge keeps it
+      pattern. One way this server raised that 40001 where PostgreSQL does
+      not was found and fixed in batch 82. A CREATE TABLE of a name another
+      open transaction was creating failed at once. PostgreSQL waits for the
+      other, then raises 23505 on `pg_type_typname_nsp_index` or goes on
+      (`tests/backlog/test_rp_batch82.py`). The test's two connections
+      create different names, though, so that does not explain this run.
+      The next step is the server's log from a failing Windows run: since
+      batch 81 the gauge keeps it
       (`.validation/psycopg-raw-rust.server.log`, in the job's artifact).
       Backlog-ID: RP-268
       Verify: none -- not reproduced outside one Windows CI run; no test fails on demand
@@ -1151,7 +1165,9 @@ tests are scenarios in `tests/backlog/test_rp_batch26.py`.
       FROM function (`_pg_expandarray` becomes `unnest(...) WITH
       ORDINALITY`) re-planned and run as SQL once per left row
       (`PgHandler::lateral_rows`), and per-row expression evaluation over
-      the joins.
+      the joins. Under `LIMIT 0` they ran whole too, until batch 83: on CI's
+      debug build `test_rp_found_2026_10_20.py::test_catalog_relations_are_queryable`
+      passed the 600 s per-test timeout, which ended the xdist worker.
       Backlog-ID: RP-131
       Verify: none -- a performance budget; every answer matches PostgreSQL's
 

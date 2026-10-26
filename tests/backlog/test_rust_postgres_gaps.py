@@ -2140,15 +2140,14 @@ def test_a_full_join_in_four_tables_is_searched(pg: Any) -> None:
     assert " ".join(":".join(str(v) for v in r) for r in got[1][:12]) == want
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_left_join_over_an_inner_class_is_searched(pg: Any) -> None:
     """PostgreSQL 15.19, four 20-row tables never analysed: `l0 LEFT JOIN
     (l1 LEFT JOIN l2 ON l1.a = l2.b JOIN l3 ON l1.c = l3.a) ON l0.b = l1.c`.
     l1.c is in two clauses, but only the inner join's makes an equivalence
     class ({l1.c, l3.a}); the LEFT join's ON is an outer-join clause. So
     PostgreSQL merges l3 with l1-l2 on the class and Merge Left Joins l0 to
-    it. The search declines a class with a LEFT join, so the rows come out
-    in the general path's order."""
+    it."""
     pg.execute("begin")
     try:
         for t, (mb, mc) in enumerate([(7, 5), (5, 3), (3, 4), (4, 7)]):
@@ -2170,6 +2169,63 @@ def test_a_left_join_over_an_inner_class_is_searched(pg: Any) -> None:
     )
     assert got[0] == "ok"
     assert len(got[1]) == 92
+    assert " ".join(":".join(str(v) for v in r) for r in got[1][:12]) == want
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_a_left_join_on_a_class_member_is_in_the_class_order(pg: Any) -> None:
+    """PostgreSQL 15.19, four 20-row tables never analysed: `c0 JOIN c1 ON
+    c0.c = c1.c JOIN c2 ON c1.c = c2.a LEFT JOIN c3 ON c0.c = c3.a`. The
+    LEFT join's outer key c0.c is in the inner joins' class, so a Merge
+    Left Join of c0 with c3 comes out in the class's order, and the Merge
+    Join with c1-c2 above reads it unsorted."""
+    pg.execute("begin")
+    try:
+        for t, (mb, mc) in enumerate([(7, 5), (5, 3), (3, 4), (4, 7)]):
+            pg.execute(f"create table rp028_c{t} (a int, b int, c int)")
+            pg.execute(
+                f"insert into rp028_c{t} select i, i % {mb}, i % {mc} from generate_series(1, 20) i"
+            )
+        got = pg_answer(
+            pg,
+            "select rp028_c0.a, rp028_c1.a, rp028_c2.a, rp028_c3.a from rp028_c0 join rp028_c1"
+            " on rp028_c0.c = rp028_c1.c join rp028_c2 on rp028_c1.c = rp028_c2.a"
+            " left join rp028_c3 on rp028_c0.c = rp028_c3.a",
+        )
+    finally:
+        pg.execute("rollback")
+    want = (
+        "11:10:1:1 11:13:1:1 11:16:1:1 11:7:1:1 11:19:1:1 11:1:1:1 11:4:1:1"
+        " 6:10:1:1 6:13:1:1 6:16:1:1 6:7:1:1 6:19:1:1"
+    )
+    assert got[0] == "ok"
+    assert len(got[1]) == 56
+    assert " ".join(":".join(str(v) for v in r) for r in got[1][:12]) == want
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_join_on_two_equalities_is_planned(pg: Any) -> None:
+    """PostgreSQL 15.19, two 20-row tables never analysed: `k0 JOIN k1 ON
+    k0.b = k1.b AND k0.c = k1.c` is a Merge Join on both keys, each side
+    sorted on (b, c). A join on two equalities is not priced here, so the
+    rows come out in the general path's order."""
+    pg.execute("begin")
+    try:
+        for t, (mb, mc) in enumerate([(7, 5), (5, 3)]):
+            pg.execute(f"create table rp028_k{t} (a int, b int, c int)")
+            pg.execute(
+                f"insert into rp028_k{t} select i, i % {mb}, i % {mc} from generate_series(1, 20) i"
+            )
+        got = pg_answer(
+            pg,
+            "select rp028_k0.a, rp028_k1.a from rp028_k0 join rp028_k1"
+            " on rp028_k0.b = rp028_k1.b and rp028_k0.c = rp028_k1.c",
+        )
+    finally:
+        pg.execute("rollback")
+    want = "7:20 7:5 15:6 1:1 1:16 16:7 2:2 2:17 10:3 10:18 17:8 11:4"
+    assert got[0] == "ok"
+    assert len(got[1]) == 13
     assert " ".join(":".join(str(v) for v in r) for r in got[1][:12]) == want
 
 

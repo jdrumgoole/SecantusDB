@@ -10285,8 +10285,13 @@ impl PgHandler {
     /// conflict (`create schema s; create type e as enum (...)` on a fresh
     /// store did exactly that). The rows are server bookkeeping, not
     /// something a `ROLLBACK` should undo, so they belong before the block.
-    const CATALOG_COLLECTIONS: [&'static str; 9] = [
+    ///
+    /// `__sql_relstats__` too: the first CREATE TABLE of each of several
+    /// sessions records its table's size there, and on a fresh store they
+    /// raced to register it (RP-269).
+    const CATALOG_COLLECTIONS: [&'static str; 10] = [
         CATALOG_COLLECTION,
+        Self::RELSTATS_COLLECTION,
         Self::DOMAIN_COLLECTION,
         Self::VIEW_COLLECTION,
         SEQUENCE_COLLECTION,
@@ -30682,6 +30687,7 @@ impl PgHandler {
                     // A SELECT, CALL or DO writes through the functions it
                     // runs, and waits for a row as their INSERT would.
                     let writes = Self::row_write(&stmt)
+                        || Self::creates_relation(&stmt)
                         || matches!(
                             stmt,
                             Statement::Select(_)
@@ -30697,6 +30703,7 @@ impl PgHandler {
                     let start = handle.write_set_len();
                     let mut poll = fresh.then(|| self.lock_wait_poll());
                     let mut delay = std::time::Duration::from_millis(2);
+                    let mut collided = false;
                     loop {
                         let handle = if cursor_op {
                             &mut *handle
@@ -30744,6 +30751,7 @@ impl PgHandler {
                                 if let Some(t) = &target {
                                     handle.release_row(t);
                                 }
+                                collided = true;
                                 let waited = self.wait_for_row_holder(target.as_ref(), poll)?;
                                 if !self.read_committed_now() {
                                     // REPEATABLE READ: only when the holder
@@ -30795,15 +30803,20 @@ impl PgHandler {
                                 }
                             }
                             (Err(e), None) if rebase && Self::is_write_conflict(e) => {
-                                break self.rerun_after_conflict(handle, &stmt, max_rows, start);
+                                let rerun =
+                                    self.rerun_after_conflict(handle, &stmt, max_rows, start);
+                                break self.after_create_collision(&stmt, rerun);
                             }
+                            _ if collided => break self.after_create_collision(&stmt, out),
                             _ => break out,
                         }
                     }
                 }
                 // Not when a transaction is already active on this thread: a
                 // trigger's or MERGE's own writes join the statement they serve.
-                None if Self::row_write(&stmt) && !self.storage.in_user_txn() => {
+                None if (Self::row_write(&stmt) || Self::creates_relation(&stmt))
+                    && !self.storage.in_user_txn() =>
+                {
                     self.run_autocommit_write(stmt, max_rows)
                 }
                 None => self.execute(stmt, max_rows),
@@ -30875,6 +30888,59 @@ impl PgHandler {
 
     /// An INSERT / UPDATE / DELETE: what an autocommit statement runs in a
     /// transaction of its own for (`run_autocommit_write`).
+    /// A statement that creates a relation, and so writes its catalog rows
+    /// under the names other transactions may be creating too.
+    /// A temporary table is in its session's own namespace, which no other
+    /// session writes, so it is never one.
+    fn creates_relation(stmt: &Statement) -> bool {
+        matches!(stmt, Statement::CreateTable(def, _) if !def.temp)
+    }
+
+    /// A CREATE TABLE that collided with another transaction creating the
+    /// same name, once that one has committed: PostgreSQL's insert of the
+    /// table's row type into `pg_type` waited on the other's index entry
+    /// (`_bt_check_unique`), having already found the name free, so the
+    /// answer is a duplicate key in `pg_type_typname_nsp_index`, not the
+    /// "already exists" a fresh look at the catalog now gives (RP-268).
+    /// `out` unchanged for anything else.
+    fn after_create_collision(
+        &self,
+        stmt: &Statement,
+        out: PgWireResult<Vec<Response>>,
+    ) -> PgWireResult<Vec<Response>> {
+        let Statement::CreateTable(def, _) = stmt else {
+            return out;
+        };
+        if def.temp {
+            return out;
+        }
+        let already = matches!(
+            &out,
+            Err(PgWireError::UserError(info)) if info.code == "42P07"
+        );
+        if !already {
+            return out;
+        }
+        let schema = Self::schema_of(def);
+        let bare = def
+            .name
+            .split_once('.')
+            .map_or(def.name.as_str(), |(_, n)| n);
+        let mut info = ErrorInfo::new(
+            "ERROR".into(),
+            "23505".into(),
+            "duplicate key value violates unique constraint \"pg_type_typname_nsp_index\"".into(),
+        );
+        info.detail = Some(format!(
+            "Key (typname, typnamespace)=({bare}, {}) already exists.",
+            self.namespace_oid(&schema)
+        ));
+        info.schema = Some("pg_catalog".into());
+        info.table = Some("pg_type".into());
+        info.constraint = Some("pg_type_typname_nsp_index".into());
+        Err(PgWireError::UserError(Box::new(info)))
+    }
+
     fn row_write(stmt: &Statement) -> bool {
         matches!(
             stmt,
@@ -30915,7 +30981,8 @@ impl PgHandler {
             if let Some(t) = &target {
                 handle.release_row(t);
             }
-            if !self.wait_for_row_holder(target.as_ref(), &mut poll)? {
+            let waited = self.wait_for_row_holder(target.as_ref(), &mut poll)?;
+            if !waited {
                 if !read_committed {
                     return Err(Self::serialization_failure());
                 }
@@ -31161,6 +31228,7 @@ impl PgHandler {
         let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
         let mut handle = self.open_transaction_handle()?;
         let counted = self.stats().checkpoint();
+        let mut collided = false;
         let out = loop {
             self.stats().rewind(counted.clone());
             let out = self
@@ -31192,6 +31260,7 @@ impl PgHandler {
                 Ok(w) => w,
                 Err(wait_err) => break Err(wait_err),
             };
+            collided = true;
             if !read_committed {
                 // REPEATABLE READ: the statement goes on only when the holder
                 // went away without anything committing since its snapshot.
@@ -31227,6 +31296,9 @@ impl PgHandler {
         row_waits::forget(pid);
         self.ssi_end(false);
         xids::end(&self.storage, pid);
+        if collided {
+            return self.after_create_collision(&stmt, out);
+        }
         out
     }
 
@@ -34205,6 +34277,11 @@ impl PgHandler {
         // on documents and does not care where they came from, which is
         // why the series is a SOURCE rather than its own statement.
         let (mut docs, mut def): (Vec<Document>, TableDef) = match (&sel.series, &sel.join) {
+            // `LIMIT 0`: PostgreSQL's Limit node returns before it asks its
+            // subplan for a row (`ExecLimit`, a count of zero), so nothing
+            // below it runs -- no scan, no view, no lock, no expression.
+            // The columns are still the source's.
+            _ if sel.limit == Some(0) => (Vec::new(), self.select_source_def(sel)?),
             // A FROM-subquery or inlined CTE: run the inner plan, then treat
             // its output columns as the table. Checked first because such a
             // select carries neither a series nor a join.
