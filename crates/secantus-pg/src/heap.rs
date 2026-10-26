@@ -136,8 +136,72 @@ fn numeric_bytes(text: &str) -> usize {
     2 + 2 * groups.len()
 }
 
+/// An array's datum size, its 4-byte header included (`construct_md_array`):
+/// the header (`ARR_OVERHEAD_NONULLS`, or `ARR_OVERHEAD_WITHNULLS` with a
+/// NULL element) and each element at its type's alignment -- a varlena
+/// element with its 4-byte header, never packed. `None` for an element
+/// type whose storage is not modelled (RP-254).
+pub(crate) fn array_datum_len(elem: &str, v: &Bson) -> Option<usize> {
+    let Bson::Array(top) = v else {
+        return None;
+    };
+    // Dimensions: as deep as the first elements nest.
+    let mut ndim = 0usize;
+    let mut probe: Option<&Vec<Bson>> = Some(top);
+    while let Some(a) = probe {
+        if a.is_empty() {
+            break;
+        }
+        ndim += 1;
+        probe = match &a[0] {
+            Bson::Array(inner) => Some(inner),
+            _ => None,
+        };
+    }
+    let mut items: Vec<&Bson> = Vec::new();
+    let mut stack: Vec<&Bson> = top.iter().rev().collect();
+    while let Some(x) = stack.pop() {
+        match x {
+            Bson::Array(inner) => stack.extend(inner.iter().rev()),
+            other => items.push(other),
+        }
+    }
+    let has_nulls = items.iter().any(|x| matches!(x, Bson::Null));
+    let overhead = if has_nulls {
+        maxalign(16 + 8 * ndim + items.len().div_ceil(8))
+    } else {
+        maxalign(16 + 8 * ndim)
+    };
+    let (len, al) = layout(elem);
+    let textual = matches!(
+        elem,
+        "text" | "varchar" | "character varying" | "bpchar" | "character" | "name"
+    );
+    if len <= 0 && !textual {
+        return None;
+    }
+    let mut off = overhead;
+    for x in items {
+        if matches!(x, Bson::Null) {
+            continue;
+        }
+        off = align(off, al);
+        off += if len > 0 {
+            len as usize
+        } else {
+            4 + server_len(&text_of(x))
+        };
+    }
+    Some(off)
+}
+
 /// The bytes a varlena value holds, header aside.
 fn varlena_data(pg_type: &str, typmod: i32, v: &Bson) -> usize {
+    if let Some(elem) = pg_type.strip_suffix("[]") {
+        if let Some(n) = array_datum_len(elem, v) {
+            return n - 4;
+        }
+    }
     match (pg_type, v) {
         (_, Bson::Binary(b)) => b.bytes.len(),
         ("numeric", v) => numeric_bytes(&text_of(v)),
@@ -845,6 +909,7 @@ impl PgHandler {
                 .collect();
             self.btree_insert_versions(&heap_table, &indexed)?;
             self.hash_insert_versions(&heap_table, &indexed)?;
+            self.am_insert_versions(&heap_table, &indexed)?;
             // The versions this transaction made, for others' conflicts
             // out: each new one, and each old one it deleted.
             for (i, ctid) in idx.iter().zip(&ctids) {

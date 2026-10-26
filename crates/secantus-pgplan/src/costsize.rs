@@ -921,6 +921,165 @@ fn grouping_costs(
     ((hash_startup, hash_total), (sort_startup, group_total))
 }
 
+/// `ginGetStats`: the GIN metapage's statistics, as `gincostestimate`
+/// reads them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GinStats {
+    pub pending_pages: f64,
+    pub total_pages: f64,
+    pub entry_pages: f64,
+    pub data_pages: f64,
+    pub entries: f64,
+}
+
+/// What `gincost_pattern` counts of a GIN scan's quals.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GinCounts {
+    pub exact_entries: f64,
+    pub search_entries: f64,
+    /// A qual needs the whole index (`GIN_SEARCH_MODE_ALL`), and no qual
+    /// searches it normally.
+    pub full_scan: bool,
+    /// A qual can match nothing (no keys, default search mode).
+    pub void: bool,
+}
+
+/// `gincostestimate` for a scan of `pages` index pages over `tuples` heap
+/// tuples: `(startup, total)` with `nquals` index quals of selectivity
+/// `sel` (none of them partial-match, one scan, no nested loop).
+pub fn gin_index_cost(
+    pages: f64,
+    tuples: f64,
+    stats: GinStats,
+    counts: GinCounts,
+    sel: f64,
+    nquals: usize,
+) -> (f64, f64) {
+    if counts.void {
+        return (0.0, 0.0);
+    }
+    let mut num_pages = pages;
+    let pending = if stats.pending_pages < num_pages {
+        stats.pending_pages
+    } else {
+        0.0
+    };
+    let (entry_pages, data_pages, mut entries);
+    if num_pages > 0.0
+        && stats.total_pages <= num_pages
+        && stats.total_pages > num_pages / 4.0
+        && stats.entry_pages > 0.0
+        && stats.entries > 0.0
+    {
+        let scale = num_pages / stats.total_pages;
+        let e = (stats.entry_pages * scale).ceil();
+        let d = (stats.data_pages * scale).ceil();
+        entries = (stats.entries * scale).ceil();
+        entry_pages = e.min(num_pages - pending);
+        data_pages = d.min(num_pages - pending - entry_pages);
+    } else {
+        num_pages = num_pages.max(10.0);
+        entry_pages = ((num_pages - pending) * 0.90).floor();
+        data_pages = num_pages - pending - entry_pages;
+        entries = (entry_pages * 100.0).floor();
+    }
+    if entries < 1.0 {
+        entries = 1.0;
+    }
+    let (mut exact, mut search) = (counts.exact_entries, counts.search_entries);
+    if counts.full_scan || nquals == 0 {
+        exact = entries;
+        search = entries;
+    }
+    let entry_fetched = pending + (search * entry_pages.powf(0.15).round_ties_even()).ceil();
+    let startup = entry_fetched * RANDOM_PAGE_COST;
+    let mut data_fetched = (data_pages * exact / entries).ceil();
+    let by_sel = (sel * (tuples / (8192 / 3) as f64)).ceil();
+    if by_sel > data_fetched {
+        data_fetched = by_sel;
+    }
+    let mut total = startup + data_fetched * RANDOM_PAGE_COST;
+    let qual_op = CPU_OPERATOR_COST * nquals as f64;
+    total += (tuples * sel) * (CPU_INDEX_TUPLE_COST + qual_op);
+    (startup, total)
+}
+
+/// `gistcostestimate` over `genericcostestimate`: `(startup, total)` for
+/// `nquals` index quals of selectivity `sel` on an index of `pages`
+/// pages and `tuples` tuples.
+pub fn gist_index_cost(pages: f64, tuples: f64, sel: f64, nquals: usize) -> (f64, f64) {
+    let mut n_tuples = (sel * tuples).round_ties_even();
+    if n_tuples > tuples {
+        n_tuples = tuples;
+    }
+    if n_tuples < 1.0 {
+        n_tuples = 1.0;
+    }
+    let n_pages = if pages > 1.0 && tuples > 1.0 {
+        (n_tuples * pages / tuples).ceil()
+    } else {
+        1.0
+    };
+    let qual_op = CPU_OPERATOR_COST * nquals as f64;
+    let mut startup = 0.0;
+    let mut total = n_pages * RANDOM_PAGE_COST + n_tuples * (CPU_INDEX_TUPLE_COST + qual_op);
+    let height = if pages > 1.0 {
+        (pages.ln() / 100f64.ln()) as i64 as f64
+    } else {
+        0.0
+    };
+    if tuples > 1.0 {
+        let d = tuples.ln().ceil() * CPU_OPERATOR_COST;
+        startup += d;
+        total += d;
+    }
+    let d = (height + 1.0) * PAGE_CPU_MULTIPLIER * CPU_OPERATOR_COST;
+    startup += d;
+    total += d;
+    (startup, total)
+}
+
+/// `cost_bitmap_heap_scan` over one index whose scan costs `index_total`
+/// and selects `sel` of the rows, `rows` the relation's output: every qual
+/// rechecked on each row fetched.
+pub fn bitmap_heap_over(
+    rel: &Rel,
+    index_total: f64,
+    sel: f64,
+    rows: f64,
+    quals: &[(String, Qual)],
+) -> (f64, f64) {
+    bitmap_heap_from(
+        rel,
+        index_total + 0.1 * CPU_OPERATOR_COST * rows,
+        sel,
+        quals,
+    )
+}
+
+/// `cost_index` with no correlation over an index scan costing
+/// `(index_startup, index_total)` that selects `sel`: the heap pages
+/// fetched at random, and `others` (the quals not in the index) on each
+/// row.
+pub fn index_scan_over(
+    rel: &Rel,
+    index_startup: f64,
+    index_total: f64,
+    sel: f64,
+    others: &[(String, Qual)],
+) -> (f64, f64) {
+    let tuples_fetched = clamp_row_est(sel * rel.tuples);
+    let io = index_pages_fetched(tuples_fetched, rel.pages) * RANDOM_PAGE_COST;
+    let qs = qual_startup(others.iter().map(|(_, q)| q));
+    (
+        index_startup + qs,
+        index_total
+            + qs
+            + io
+            + (CPU_TUPLE_COST + qual_cost(others.iter().map(|(_, q)| q))) * tuples_fetched,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1163,5 +1322,72 @@ mod tests {
         let or = bitmap_or_path(&[arm, path(19.79, 0.1, 2)], 0);
         // Three costs PostgreSQL displays to two places, summed.
         assert!((or.cost - 40.92).abs() < 0.01, "{or:?}");
+    }
+
+    fn near(a: f64, b: f64) -> bool {
+        (a - b).abs() < 0.005
+    }
+
+    /// `predicate-gin`'s table and index on PostgreSQL 15.19 (EXPLAIN on a
+    /// private cluster, autovacuum off): `p @> '{2}'` is a Bitmap Index
+    /// Scan of 0.00..8.34 under a Bitmap Heap Scan of 8.35..72.25, rows 45;
+    /// `p @> '{2,3}'` 0.00..12.00 (rows 1).
+    #[test]
+    fn gin_costs_match_postgres() {
+        let rel = Rel {
+            pages: 67.0,
+            tuples: 8991.0,
+        };
+        let stats = GinStats {
+            pending_pages: 0.0,
+            total_pages: 10.0,
+            entry_pages: 6.0,
+            data_pages: 3.0,
+            entries: 800.0,
+        };
+        let one = GinCounts {
+            exact_entries: 1.0,
+            search_entries: 1.0,
+            ..GinCounts::default()
+        };
+        let sel = f64::from(2.0f32 * 0.005f32 / 2.0);
+        let (_, total) = gin_index_cost(10.0, 8991.0, stats, one, sel, 1);
+        assert!(near(total, 8.34), "{total}");
+        let quals = vec![(String::new(), Qual::Filter(1.0))];
+        let (startup, total) = bitmap_heap_over(&rel, total, sel, 45.0, &quals);
+        assert!(
+            near(startup, 8.35) && near(total, 72.25),
+            "{startup} {total}"
+        );
+        let two = GinCounts {
+            exact_entries: 2.0,
+            search_entries: 2.0,
+            ..GinCounts::default()
+        };
+        let (_, total) = gin_index_cost(10.0, 8991.0, stats, two, sel * sel, 1);
+        assert!(near(total, 12.00), "{total}");
+    }
+
+    /// `predicate-gist`'s on PostgreSQL 15.19: `p << point(2500,2500)` is a
+    /// Bitmap Index Scan of 0.00..9.42 under a Bitmap Heap Scan of
+    /// 9.46..21.59, or an Index Scan of 0.14..51.12, against a Seq Scan of
+    /// 31.25 (the never-vacuumed heap taken as 10 pages of 1,700 tuples).
+    #[test]
+    fn gist_costs_match_postgres() {
+        let rel = Rel {
+            pages: 10.0,
+            tuples: 1700.0,
+        };
+        let (startup, total) = gist_index_cost(11.0, 1700.0, 0.1, 1);
+        assert!(
+            near(startup, 0.145) && near(total, 9.42),
+            "{startup} {total}"
+        );
+        let quals = vec![(String::new(), Qual::Filter(1.0))];
+        let (bs, bt) = bitmap_heap_over(&rel, total, 0.1, 170.0, &quals);
+        assert!(near(bs, 9.46) && near(bt, 21.59), "{bs} {bt}");
+        let (is, it) = index_scan_over(&rel, startup, total, 0.1, &[]);
+        assert!(near(is, 0.14) && near(it, 51.12), "{is} {it}");
+        assert!(near(seq_scan(&rel, &quals), 31.25));
     }
 }

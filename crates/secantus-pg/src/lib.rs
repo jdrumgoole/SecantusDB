@@ -34,6 +34,7 @@ mod access_methods;
 mod advisory;
 mod aggregates;
 mod alter_system;
+mod am_ssi;
 mod autovacuum;
 mod binary_recv;
 mod btree;
@@ -66,6 +67,8 @@ mod external_sort;
 mod extstats;
 mod fdw;
 mod fsm;
+mod gin_index;
+mod gist_index;
 mod grace_join;
 mod guc_values;
 mod hash_index;
@@ -6611,7 +6614,7 @@ impl PgHandler {
                     self.btree_index_scanned(table, &shape, filter)?;
                     return self.in_index_order(table, &shape, rows);
                 }
-                Some(PricedScan::Index(ScanIndex::Hash(_))) | None => {}
+                Some(PricedScan::Index(ScanIndex::Hash(_)) | PricedScan::Am(..)) | None => {}
             }
         }
         if seq && self.heap_scan_disordered(table) {
@@ -8319,6 +8322,41 @@ impl PgHandler {
         def.columns
             .iter()
             .map(|c| {
+                // An array of an element type whose storage is modelled
+                // (`heap::array_datum_len`): a varlena aligned as its
+                // elements, which may take the 1-byte header.
+                if let Some(elem) = c.pg_type.strip_suffix("[]") {
+                    let ok = matches!(
+                        elem,
+                        "int2"
+                            | "int4"
+                            | "int8"
+                            | "smallint"
+                            | "integer"
+                            | "bigint"
+                            | "oid"
+                            | "float4"
+                            | "float8"
+                            | "real"
+                            | "double precision"
+                            | "bool"
+                            | "boolean"
+                            | "text"
+                            | "varchar"
+                            | "character varying"
+                    );
+                    let align = if matches!(elem, "int8" | "bigint" | "float8" | "double precision")
+                    {
+                        8
+                    } else {
+                        4
+                    };
+                    return ok.then_some(ColumnLayout {
+                        typlen: -1,
+                        align,
+                        can_short: true,
+                    });
+                }
                 let typlen = match fact(c, "typlen")? {
                     Bson::Int32(n) => i64::from(n),
                     Bson::Int64(n) => n,
@@ -8372,6 +8410,10 @@ impl PgHandler {
                         Some(s.len() + pad)
                     }
                     Some(Bson::Binary(b)) => Some(b.bytes.len()),
+                    Some(a @ Bson::Array(_)) => match c.pg_type.strip_suffix("[]") {
+                        Some(elem) => Some(heap::array_datum_len(elem, a)? - 4),
+                        None => Some(0),
+                    },
                     Some(_) => Some(0),
                 };
                 values.push(v);
@@ -34401,6 +34443,7 @@ impl PgHandler {
         sel: &secantus_pgplan::Select,
         max_rows: usize,
     ) -> PgWireResult<(Vec<Document>, TableDef)> {
+        let _hint = am_ssi::hint_select(sel);
         // `FOR UPDATE` over the stored table: the rows returned are locked.
         let mut row_lock: Option<secantus_pgplan::RowLock> = None;
         // A LIMIT straight over a scan of the table, nothing between them

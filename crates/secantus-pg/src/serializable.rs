@@ -17,7 +17,7 @@ thread_local! {
 }
 
 /// A 40001 with PostgreSQL's message, detail and hint.
-fn failure(f: Failure) -> PgWireError {
+pub(crate) fn failure(f: Failure) -> PgWireError {
     let mut info = ErrorInfo::new("ERROR".into(), "40001".into(), Failure::MESSAGE.into());
     info.detail = Some(f.0);
     info.hint = Some(Failure::HINT.into());
@@ -150,6 +150,9 @@ pub(crate) enum PricedScan {
     Seq,
     Bitmap(ScanIndex),
     Index(ScanIndex),
+    /// A GIN or GiST path of the plan: its position, and whether it is a
+    /// bitmap scan (else a plain index scan).
+    Am(Box<crate::am_ssi::AmPlan>, usize, bool),
 }
 
 /// The index a SERIALIZABLE scan reads, as the planner chose it.
@@ -320,6 +323,9 @@ impl PgHandler {
         let Some(rel) = self.ssi_relation(table) else {
             return Ok(());
         };
+        if let Some(PricedScan::Am(plan, i, bitmap)) = self.priced_scan_am(table, filter, true) {
+            return self.ssi_am_scan(table, rel, filter, &plan, &plan.paths[i], bitmap);
+        }
         match self.ssi_scan_index(table, filter) {
             Some(ScanIndex::Btree(shape)) => self.ssi_index_scan(table, rel, &shape, filter),
             Some(ScanIndex::Hash(shape)) => self.ssi_hash_scan(table, rel, &shape, filter),
@@ -404,7 +410,7 @@ impl PgHandler {
     /// reads, or `None` for a sequential scan.
     fn ssi_scan_index(&self, table: &str, filter: &Document) -> Option<ScanIndex> {
         match self.priced_scan(table, filter)? {
-            PricedScan::Seq => None,
+            PricedScan::Seq | PricedScan::Am(..) => None,
             PricedScan::Bitmap(ix) | PricedScan::Index(ix) => Some(ix),
         }
     }
@@ -415,8 +421,20 @@ impl PgHandler {
     /// index the latter two read. `None` when the costs cannot be priced
     /// (`filter` holds what the model does not estimate).
     pub(crate) fn priced_scan(&self, table: &str, filter: &Document) -> Option<PricedScan> {
+        self.priced_scan_am(table, filter, false)
+    }
+
+    /// [`Self::priced_scan`], with the GIN and GiST paths the reading
+    /// SELECT's residual opens weighed too when `am` (RP-254).
+    pub(crate) fn priced_scan_am(
+        &self,
+        table: &str,
+        filter: &Document,
+        am: bool,
+    ) -> Option<PricedScan> {
         use secantus_pgplan::{costsize, hashagg};
-        if filter.is_empty() {
+        let am = am && !self.am_shapes(table).is_empty();
+        if filter.is_empty() && !am {
             return Some(PricedScan::Seq);
         }
         let count = self
@@ -445,7 +463,7 @@ impl PgHandler {
                     }
                     d
                 });
-        let quals = costsize::conjuncts(&flat)?;
+        let mut quals = costsize::conjuncts(&flat)?;
         let rel = costsize::Rel {
             pages: pt.pages,
             tuples: pt.tuples,
@@ -464,9 +482,25 @@ impl PgHandler {
                 pt.tuples.min(200.0)
             }
         };
-        let rows = (pt.tuples * hashagg::filter_selectivity(&flat, &nd)?)
+        let mut rows = (pt.tuples * hashagg::filter_selectivity(&flat, &nd)?)
             .round()
             .max(1.0);
+        // The residual's quals: filters on every path, and the GIN and
+        // GiST paths they open.
+        let am_plan = if am {
+            let unfiltered = pt.tuples * hashagg::filter_selectivity(&flat, &nd)?;
+            let plan = self.am_plan(table, &pt, &rel, &quals, unfiltered);
+            if let Some(p) = &plan {
+                rows = (unfiltered * p.selectivity).round().max(1.0);
+                quals.extend((0..p.nquals()).map(|_| (String::new(), costsize::Qual::Filter(1.0))));
+            }
+            plan
+        } else {
+            None
+        };
+        if filter.is_empty() && am_plan.as_ref().is_none_or(|p| p.paths.is_empty()) {
+            return Some(PricedScan::Seq);
+        }
         let mut indexes = self.cost_indexes_with(table, &pt.def, count as u64, false);
         let full = indexes.len();
         let partial = self.ssi_partial_indexes(table, &pt, filter, &nd);
@@ -510,6 +544,36 @@ impl PgHandler {
             if best.is_none_or(|(_, (bs, bt))| total < bt || (total == bt && startup < bs)) {
                 best = Some((kind, (startup, total)));
             }
+        }
+        // GIN and GiST: a bitmap heap scan over each, and a plain index
+        // scan over a GiST index (`amgettuple`).
+        let mut am_best: Option<(usize, bool)> = None;
+        if let Some(plan) = &am_plan {
+            for (i, path) in plan.paths.iter().enumerate() {
+                let mut cands = vec![(true, path.bitmap)];
+                if let Some(ix) = path.index {
+                    cands.push((false, ix));
+                }
+                for (bitmap, (mut startup, mut total)) in cands {
+                    let disabled = if bitmap {
+                        off("enable_bitmapscan")
+                    } else {
+                        off("enable_indexscan")
+                    };
+                    if disabled {
+                        startup += DISABLE_COST;
+                        total += DISABLE_COST;
+                    }
+                    if best.is_none_or(|(_, (bs, bt))| total < bt || (total == bt && startup < bs))
+                    {
+                        best = Some((costsize::ScanKind::Seq, (startup, total)));
+                        am_best = Some((i, bitmap));
+                    }
+                }
+            }
+        }
+        if let (Some((i, bitmap)), Some(plan)) = (am_best, am_plan) {
+            return Some(PricedScan::Am(Box::new(plan), i, bitmap));
         }
         let (bitmap, i) = match best?.0 {
             costsize::ScanKind::Seq => return Some(PricedScan::Seq),
