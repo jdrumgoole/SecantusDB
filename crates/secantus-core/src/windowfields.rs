@@ -532,9 +532,10 @@ fn reach(
 enum FunctionMemory {
     Nothing,
     /// A removable function: its own size, and each value in its window --
-    /// once for a value a `Value` holds inline, twice for one on the heap
-    /// (`[-5, 5]` over ints: `$sum` 496, `$push` 512; over 400-byte strings
-    /// `$push` and `$max` hold each about twice its size).
+    /// once for a value a `Value` holds inline, twice for one on the heap,
+    /// and `$push` every value twice (Linux x86-64 8.2.11, five ints in a
+    /// `[-5, 5]` window: `$sum` 376, `$avg` 384, `$push` 320, `$stdDevPop`
+    /// 552; macOS arm64 counts 24 more for `$sum`).
     Removable {
         base: usize,
         sizes: Vec<Option<usize>>,
@@ -558,10 +559,10 @@ impl FunctionMemory {
         if window_removes(c.window) {
             return Ok(FunctionMemory::Removable {
                 base: match c.op {
-                    "$avg" => 328,
-                    "$push" => 336,
-                    "$stdDevPop" | "$stdDevSamp" => 504,
-                    _ => 320,
+                    "$avg" => 304,
+                    "$push" => 160,
+                    "$stdDevPop" | "$stdDevSamp" => 472,
+                    _ => 296,
                 },
                 sizes: Vec::new(),
             });
@@ -599,7 +600,11 @@ impl FunctionMemory {
                                     .unwrap_or(Bson::Null)
                             };
                             let size = crate::memlimit::classic_size(&v);
-                            let s = if size > 16 { 2 * size } else { size };
+                            let s = if size > 16 || c.op == "$push" {
+                                2 * size
+                            } else {
+                                size
+                            };
                             sizes[i] = Some(s);
                             s
                         }

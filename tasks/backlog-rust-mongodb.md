@@ -746,12 +746,14 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       windows.** The partition cache and the functions are counted as mongod
       8.2.11 counts them for whole-partition, `["unbounded", "current"]` and
       `$shift` windows (exact, measured by bisecting the budget), but not
-      quite for others: a removable `[-5, 5]` `$sum` is refused 16 bytes
-      above mongod's limit, `$rank` 5 bytes below it, a partitioned
-      whole-partition window 458 bytes below, and a removable `$push` of
-      400-byte strings 208 bytes above (`5414201` / `5643011` in each case).
-      The function's memory over a window that drops documents is the
-      unmeasured part.
+      quite for others (measured against the macOS arm64 build): a removable
+      `[-5, 5]` `$sum` is refused 16 bytes above mongod's limit, `$rank` 5
+      bytes below it, a partitioned whole-partition window 458 bytes below,
+      and a removable `$push` of 400-byte strings 208 bytes above
+      (`5414201` / `5643011` in each case). The function's memory over a
+      window that drops documents is the part least measured. The sizes this
+      server uses are the Linux x86-64 build's, the exemplar; the macOS
+      build counts some accumulators differently (`$sum` 184, not 176).
       Backlog-ID: RM-318
       Verify: tests/backlog/test_rm_found_2026_10_26.py::test_window_budget_residuals
 - [ ] **`explain` lacks the stages' own memory counters.** The spill

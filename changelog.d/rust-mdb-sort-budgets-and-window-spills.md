@@ -37,8 +37,7 @@ models mongod's partition cache for every window shape and spills it.
 - Reading a document no longer scans all of its bytes for the SQL server's
   system fields, only its top-level field names. That scan took a debug
   build 15 s to read 110 one-megabyte documents through a `$group` on
-  `_id`; it now takes 0.1 s. (This is in `secantus-storage-adapter`, which
-  the PostgreSQL server also links.)
+  `_id`; it now takes 0.1 s (`secantus-storage-adapter`).
 
 #### Added
 

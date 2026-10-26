@@ -335,7 +335,8 @@ def _window_runs(coll: Any, shape: str, budget: int, allow: bool = False) -> tup
 def test_a_window_partition_is_held_to_mongods_budget(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 counts the partition cache the windows need and the
     functions' memory: refused at the same budget, by the same check
-    (5643011 adding a document, 5414201 after answering one)."""
+    (5643011 adding a document, 5414201 after answering one). The sizes are
+    the Linux build's, CI's: a macOS mongod counts `$sum` 8 bytes more."""
     theirs, ours = _windowed(mongod), _windowed(rust_mongo)
     for shape in WINDOWS:
         lo, hi = 1, 400_000
