@@ -1439,6 +1439,13 @@ fn user_fn_of(d: &Document) -> secantus_pgplan::UserFn {
     };
     secantus_pgplan::UserFn {
         name,
+        volatile: !matches!(
+            d.get_str("volatility")
+                .unwrap_or("volatile")
+                .to_ascii_lowercase()
+                .as_str(),
+            "immutable" | "stable"
+        ),
         schema: d.get_str("schema").unwrap_or("public").to_string(),
         arg_types: strings("param_types"),
         return_type: d.get_str("return_tag").unwrap_or("text").to_string(),

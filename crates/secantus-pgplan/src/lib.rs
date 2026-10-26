@@ -23372,7 +23372,10 @@ fn plan_aggregate_direct(
         // `n % 2 = 1`) is evaluated per row by a plain SELECT; aggregate over
         // THAT: `FROM (SELECT * FROM t WHERE cond) t`.
         if let (Some(w), Some(def)) = (s.where_clause.as_deref(), lookup(&r.relname)) {
-            if matches!(lower_where(w, &def, params), Err(Error::Unsupported(_))) {
+            if matches!(
+                lower_where_nonvolatile(w, &def, params),
+                Err(Error::Unsupported(_))
+            ) {
                 let alias = r
                     .alias
                     .clone()
@@ -42220,7 +42223,7 @@ fn lower_where_or_residual(
     def: &TableDef,
     params: &[Bson],
 ) -> Result<(Document, Option<ColumnExpr>)> {
-    match lower_where(w, def, params) {
+    match lower_where_nonvolatile(w, def, params) {
         Ok(f) => Ok((f, None)),
         Err(Error::Unsupported(_)) => {
             // A top-level AND whose conjuncts partly lower: those become the
@@ -42256,6 +42259,22 @@ fn lower_where_or_residual(
     }
 }
 
+/// `lower_where`, refusing a condition that calls a VOLATILE function: a
+/// filter is built once, so lowering one folded the call into a constant
+/// while planning (`nextval` ran once, not once a row), where PostgreSQL
+/// runs it for every row the scan reads (RP-019). Refused, it is evaluated
+/// per row by the residual.
+fn lower_where_nonvolatile(
+    w: &pg_query::protobuf::Node,
+    def: &TableDef,
+    params: &[Bson],
+) -> Result<Document> {
+    if correlated::has_volatile_call(w) {
+        return Err(Error::Unsupported("a volatile function in WHERE".into()));
+    }
+    lower_where(w, def, params)
+}
+
 /// For a top-level `AND`, the conjuncts that lower to an MQL filter (ANDed)
 /// and the rest as one expression -- `None` unless both parts are non-empty
 /// and every conjunct either lowers or is merely `Unsupported` (a real error
@@ -42283,7 +42302,7 @@ fn split_lowerable_conjuncts(
     let mut filters = Vec::new();
     let mut rest = Vec::new();
     for c in conjuncts {
-        match lower_where(&c, def, params) {
+        match lower_where_nonvolatile(&c, def, params) {
             Ok(f) => filters.push(Bson::Document(f)),
             Err(Error::Unsupported(_)) => rest.push(c),
             Err(_) => return None,

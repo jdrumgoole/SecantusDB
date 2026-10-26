@@ -326,7 +326,7 @@ pub(crate) fn plan_join_source(
     params: &[Bson],
 ) -> Result<pg_query::protobuf::SelectStmt> {
     // A nested join (one inside a FROM subquery) plans with its own.
-    let (pushdown, nonnullable, ec) = pushdown_filters(s, lookup);
+    let (pushdown, nonnullable, ec, moved) = pushdown_filters(s, lookup);
     let outer_pushdown = PUSHDOWN.with(|p| p.replace(pushdown));
     let outer_nonnullable = NONNULLABLE.with(|p| p.replace(nonnullable));
     let outer_ec = EC_PLAN.with(|p| p.replace(ec));
@@ -335,7 +335,34 @@ pub(crate) fn plan_join_source(
     NONNULLABLE.with(|p| *p.borrow_mut() = outer_nonnullable);
     EC_PLAN.with(|p| *p.borrow_mut() = outer_ec);
     let (tree, scope) = built?;
-    finish_join_source(s, tree, scope, params)
+    if moved.is_empty() {
+        return finish_join_source(s, tree, scope, params);
+    }
+    // The moved conjuncts ran in their leaves; the WHERE keeps the rest.
+    let mut rest = s.clone();
+    rest.where_clause = s.where_clause.as_deref().and_then(|w| {
+        let mut conjuncts = Vec::new();
+        split_and(w, &mut conjuncts);
+        let kept: Vec<pg_query::protobuf::Node> = conjuncts
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !moved.contains(i))
+            .map(|(_, c)| c.clone())
+            .collect();
+        match kept.len() {
+            0 => None,
+            1 => kept.into_iter().next().map(Box::new),
+            _ => Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
+                    boolop: pg_query::protobuf::BoolExprType::AndExpr as i32,
+                    args: kept,
+                    location: -1,
+                    ..Default::default()
+                }))),
+            })),
+        }
+    });
+    finish_join_source(&rest, tree, scope, params)
 }
 
 fn build_tree(
@@ -1952,7 +1979,10 @@ pub(crate) const SELECT_LIST_SRFS: &[&str] = &[
 /// nullable side before the join would keep the NULL-extended rows
 /// PostgreSQL's WHERE drops. The conjunct also stays in the outer WHERE, so
 /// the answer is the same whether or not the leaf applied it -- the leaf
-/// just reads fewer rows, and can reach an index.
+/// just reads fewer rows, and can reach an index. One that calls a volatile
+/// or stable function, or a user function, is MOVED instead (its positions
+/// among the WHERE's conjuncts are the last value): it runs once a row of
+/// its table, as in PostgreSQL's scan, not again per joined row (RP-019).
 #[allow(clippy::type_complexity)]
 fn pushdown_filters(
     s: &pg_query::protobuf::SelectStmt,
@@ -1961,6 +1991,7 @@ fn pushdown_filters(
     Vec<(String, pg_query::protobuf::Node)>,
     Vec<String>,
     Option<EcPlan>,
+    Vec<usize>,
 ) {
     let empty = pg_query::protobuf::Node::default();
     let w = s.where_clause.as_deref();
@@ -2002,6 +2033,11 @@ fn pushdown_filters(
     } else {
         None
     };
+    let mut filterable = Vec::new();
+    for item in &s.from_clause {
+        filtered_leaves(item, &mut filterable);
+    }
+    let mut moved = Vec::new();
     let mut pushed: Vec<(String, pg_query::protobuf::Node)> = conjuncts
         .iter()
         .enumerate()
@@ -2009,9 +2045,17 @@ fn pushdown_filters(
             ec.as_ref()
                 .is_none_or(|(_, absorbed, _)| !absorbed.contains(i))
         })
-        .filter_map(|(_, c)| {
-            let alias = single_alias(c, &owner)?;
+        .filter_map(|(i, c)| {
+            let (alias, move_it) = movable_alias(c, &owner)?;
+            // Only a stored table's leaf applies a pushed filter (`build`):
+            // a conjunct that is moved, not copied, goes nowhere else.
+            if move_it && !filterable.contains(&alias) {
+                return None;
+            }
             preserved.contains(&alias).then(|| {
+                if move_it {
+                    moved.push(i);
+                }
                 let mut c = (*c).clone();
                 strip_qualifier(&mut c);
                 (alias, c)
@@ -2022,7 +2066,29 @@ fn pushdown_filters(
         pushed.extend(consts);
         plan
     });
-    (pushed, nonnullable, ec)
+    (pushed, nonnullable, ec, moved)
+}
+
+/// The aliases of the FROM's table leaves that take a pushed filter: a
+/// table not renamed column by column (`build`'s `RangeVar` arm).
+fn filtered_leaves(item: &pg_query::protobuf::Node, out: &mut Vec<String>) {
+    match item.node.as_ref() {
+        Some(N::JoinExpr(j)) => {
+            for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                filtered_leaves(side, out);
+            }
+        }
+        Some(N::RangeVar(r)) if r.alias.as_ref().is_none_or(|a| a.colnames.is_empty()) => {
+            out.push(
+                r.alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .filter(|a| !a.is_empty())
+                    .unwrap_or_else(|| r.relname.clone()),
+            );
+        }
+        _ => {}
+    }
 }
 
 /// One side of an equality atom: a table's column, or a constant.
@@ -2517,11 +2583,37 @@ fn single_alias(
     n: &pg_query::protobuf::Node,
     owner: &dyn Fn(&str) -> Option<String>,
 ) -> Option<String> {
+    match alias_of(n, owner, false) {
+        Some((alias, false)) => Some(alias),
+        _ => None,
+    }
+}
+
+/// `single_alias`, also taking a conjunct that calls a volatile or stable
+/// built-in or a user function over its one table: `(alias, true)` for one,
+/// which must be MOVED into the leaf rather than copied -- PostgreSQL runs
+/// a base relation's quals in its scan, once a row of that table (RP-019),
+/// and a copy left in the outer WHERE would run it again per joined row.
+fn movable_alias(
+    n: &pg_query::protobuf::Node,
+    owner: &dyn Fn(&str) -> Option<String>,
+) -> Option<(String, bool)> {
+    alias_of(n, owner, true)
+}
+
+fn alias_of(
+    n: &pg_query::protobuf::Node,
+    owner: &dyn Fn(&str) -> Option<String>,
+    movable: bool,
+) -> Option<(String, bool)> {
     fn walk(
         n: &pg_query::protobuf::Node,
         alias: &mut Option<String>,
+        moved: &std::cell::Cell<bool>,
         owner: &dyn Fn(&str) -> Option<String>,
+        movable: bool,
     ) -> bool {
+        let mut rec = |x: &pg_query::protobuf::Node| walk(x, alias, moved, owner, movable);
         match n.node.as_ref() {
             Some(N::ColumnRef(c)) => {
                 let parts: Option<Vec<&str>> = c
@@ -2549,38 +2641,59 @@ fn single_alias(
                 }
             }
             Some(N::AConst(_)) | Some(N::ParamRef(_)) => true,
-            Some(N::TypeCast(t)) => t.arg.as_deref().is_some_and(|a| walk(a, alias, owner)),
+            Some(N::TypeCast(t)) => t.arg.as_deref().is_some_and(&mut rec),
             Some(N::AExpr(e)) => {
-                e.lexpr.as_deref().is_none_or(|x| walk(x, alias, owner))
-                    && e.rexpr.as_deref().is_none_or(|x| walk(x, alias, owner))
+                e.lexpr.as_deref().is_none_or(&mut rec) && e.rexpr.as_deref().is_none_or(&mut rec)
             }
-            Some(N::BoolExpr(b)) => b.args.iter().all(|a| walk(a, alias, owner)),
-            Some(N::NullTest(t)) => t.arg.as_deref().is_some_and(|a| walk(a, alias, owner)),
-            Some(N::BooleanTest(t)) => t.arg.as_deref().is_some_and(|a| walk(a, alias, owner)),
-            Some(N::List(l)) => l.items.iter().all(|a| walk(a, alias, owner)),
-            Some(N::AArrayExpr(a)) => a.elements.iter().all(|x| walk(x, alias, owner)),
+            Some(N::BoolExpr(b)) => b.args.iter().all(&mut rec),
+            Some(N::NullTest(t)) => t.arg.as_deref().is_some_and(&mut rec),
+            Some(N::BooleanTest(t)) => t.arg.as_deref().is_some_and(&mut rec),
+            Some(N::List(l)) => l.items.iter().all(&mut rec),
+            Some(N::AArrayExpr(a)) => a.elements.iter().all(&mut rec),
             // An IMMUTABLE built-in: the pushed copy and the one left in the
             // outer WHERE give the same answer, so evaluating it twice is
-            // harmless. A volatile or stable one, a user function (which
-            // may shadow the built-in), and an aggregate or window call stay
-            // in the outer WHERE only.
+            // harmless. A volatile or stable one, or a user function (which
+            // may shadow the built-in), is only MOVED (`movable_alias`). An
+            // aggregate or window call, a set-returning one, and a correlated
+            // subquery's call stay in the outer WHERE only.
             Some(N::FuncCall(f)) => {
-                f.over.is_none()
+                let plain = f.over.is_none()
                     && f.agg_filter.is_none()
                     && f.agg_order.is_empty()
                     && !f.agg_star
-                    && !f.agg_distinct
-                    && func_name(f).is_some_and(|name| {
-                        crate::correlated::immutable_builtin(&name, f.args.len())
-                            && crate::correlated::user_function_for(&name, &f.args).is_none()
-                    })
-                    && f.args.iter().all(|a| walk(a, alias, owner))
+                    && !f.agg_distinct;
+                let Some(name) = func_name(f).filter(|_| plain) else {
+                    return false;
+                };
+                let user = crate::correlated::user_function_for(&name, &f.args);
+                let immutable =
+                    user.is_none() && crate::correlated::immutable_builtin(&name, f.args.len());
+                if !immutable {
+                    let callable = match &user {
+                        Some(u) => !u.returns_set,
+                        None => {
+                            crate::funcsig::is_builtin_function_name(&name)
+                                && !crate::funcsig::always_returns_set(&name)
+                                && aggregate_func(&name, false).is_none()
+                                && !crate::correlated::is_correlated_name(&name)
+                        }
+                    };
+                    if !(movable && callable) {
+                        return false;
+                    }
+                    moved.set(true);
+                }
+                f.args.iter().all(&mut rec)
             }
             _ => false,
         }
     }
     let mut alias = None;
-    (walk(n, &mut alias, owner)).then_some(alias).flatten()
+    let moved = std::cell::Cell::new(false);
+    walk(n, &mut alias, &moved, owner, movable)
+        .then_some(alias)
+        .flatten()
+        .map(|a| (a, moved.get()))
 }
 
 /// `a.x` -> `x`, for a conjunct moved into `a`'s own `SELECT * FROM t`.
@@ -2644,7 +2757,7 @@ mod tests {
             };
             Some(TableDef::new(name, cols))
         };
-        let (pushed, _, _) = pushdown_filters(s, &lookup);
+        let (pushed, _, _, _) = pushdown_filters(s, &lookup);
         pushed.into_iter().map(|(alias, _)| alias).collect()
     }
 
@@ -2685,17 +2798,47 @@ mod tests {
         );
     }
 
+    /// The positions among the WHERE's conjuncts of those MOVED to a leaf.
+    fn moved_in(sql: &str) -> Vec<usize> {
+        let parsed = pg_query::parse(sql).unwrap();
+        let stmt = parsed.protobuf.stmts[0].stmt.as_ref().unwrap();
+        let Some(N::SelectStmt(s)) = stmt.node.as_ref() else {
+            panic!("not a SELECT: {sql}");
+        };
+        let lookup = |name: &str| -> Option<TableDef> {
+            let cols = match name {
+                "a" => vec![
+                    Column::new("id", "int4", true),
+                    Column::new("v", "int4", false),
+                ],
+                "b" => vec![
+                    Column::new("id", "int4", false),
+                    Column::new("a_id", "int4", false),
+                ],
+                _ => return None,
+            };
+            Some(TableDef::new(name, cols))
+        };
+        pushdown_filters(s, &lookup).3
+    }
+
     #[test]
-    fn a_call_that_may_not_be_immutable_is_not_pushed() {
-        // Volatile: the pushed copy and the outer WHERE's would differ.
+    fn a_call_that_may_not_be_immutable_is_moved_not_copied() {
+        // Volatile: it runs in a's scan, once a row of a (RP-019), and
+        // leaves the outer WHERE, where it would run again per joined row.
+        let volatile = "select 1 from a join b on b.a_id = a.id where random() < a.v";
+        assert_eq!(pushed_to(volatile), vec!["a"]);
+        assert_eq!(moved_in(volatile), vec![0]);
+        // Stable, not immutable: moved too.
+        let stable = "select 1 from a join b on b.a_id = a.id \
+                      where b.id > 0 and a.v < extract(day from now())";
+        assert_eq!(pushed_to(stable), vec!["b", "a"]);
+        assert_eq!(moved_in(stable), vec![1]);
+        // Only into a leaf that takes a filter: a renamed table does not.
         assert!(
-            pushed_to("select 1 from a join b on b.a_id = a.id where random() < a.v").is_empty()
+            pushed_to("select 1 from a x(i, w) join b on b.a_id = x.i where random() < x.w")
+                .is_empty()
         );
-        // Stable, not immutable.
-        assert!(pushed_to(
-            "select 1 from a join b on b.a_id = a.id where a.v < extract(day from now())"
-        )
-        .is_empty());
         // An aggregate cannot appear in a WHERE, and is never pushed.
         assert!(
             pushed_to("select 1 from a join b on b.a_id = a.id where a.v = count(*)").is_empty()

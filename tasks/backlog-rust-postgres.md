@@ -785,22 +785,6 @@ one beside it.
       would be the fix if the cost ever bites.
       Backlog-ID: RP-018
       Verify: none -- savepoint memory cost design; no answer differs
-- [ ] **Rust PG server: what the general JOIN planner does not push into
-      its table leaves: a subquery.** A WHERE conjunct that reads ONE
-      alias's columns (qualified, or unqualified and in only one table),
-      built of operators, casts, constants, parameters and calls of
-      IMMUTABLE built-ins, is applied inside that leaf (only on the
-      PRESERVED side of every outer join above it); corpus `join_pushdown`,
-      unit tests `joins::tests` (immutable calls since 2026-10-19). Not
-      pushed: a conjunct holding a subquery, which PostgreSQL runs once as
-      an InitPlan beside the scan. The pushed copy also stays in the outer
-      WHERE, so pushing one here would run the subquery twice, and a
-      volatile one would answer differently; it needs the conjunct moved
-      rather than copied. A volatile or stable call, or a user function,
-      stays out for the same reason. (A conjunct over two aliases is a join
-      clause in PostgreSQL too, not a leaf filter.)
-      Backlog-ID: RP-019
-      Verify: none -- predicate pushdown/index use only; answers identical, EXPLAIN costs are a scope decision
 
 ## Found by the 2026-10-20 audit
 
@@ -865,6 +849,14 @@ tests regression tests:
       Backlog-ID: RP-272
       Verify: tests/backlog/test_rp_catalog_identity.py::test_builtin_relations_attributes
 
+- [ ] **In autocommit, a join whose select list calls `nextval` takes one
+      value more than its rows**: `select a.a, nextval('s') from a, b where
+      a.a = b.b` answers 2, 3, 4 and leaves `last_value` at 4 where
+      PostgreSQL 15.19 answers 1, 2, 3; in a transaction block it does not.
+      Found while working RP-019, which made a volatile WHERE condition run
+      once a row of its table as PostgreSQL's scan does.
+      Backlog-ID: RP-288
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_select_list_nextval_in_an_autocommit_join_runs_once_a_row
 - [ ] **GROUP BY a primary key does not cover the table's other columns.**
       `select id, name from t group by id`, `id` the primary key, is
       PostgreSQL's functional dependency (`check_functional_grouping`):

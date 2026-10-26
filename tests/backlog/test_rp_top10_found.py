@@ -121,3 +121,63 @@ def test_gin_and_gist_indexes_have_their_pages(pg: Any) -> None:
         "select pg_relation_size('rp287_g') / 8192, pg_relation_size('rp287_s') / 8192",
     )
     assert got == ("ok", [(4, 18)])
+
+
+_RP019_SETUP = [
+    "create table rp19_a (a int)",
+    "create table rp19_b (b int)",
+    "insert into rp19_a values (1), (2), (3)",
+    "insert into rp19_b values (1), (2), (3)",
+    "create sequence rp19_s",
+]
+
+
+@pytest.mark.backlog_fixed("RP-019")
+def test_a_volatile_condition_runs_once_a_row_of_its_table(pg: Any) -> None:
+    """PostgreSQL 15.19 runs a base relation's quals in its scan: a
+    volatile call over one table runs once for each of its rows, in a join
+    too, and is never folded while planning. Here it ran once (folded), or
+    once per joined row; the counts are the sequence's after each query."""
+    queries = [
+        "select count(*) from rp19_a where rp19_a.a > nextval('rp19_s') * 0",
+        "select last_value from rp19_s",
+        "select count(*) from rp19_a, rp19_b where rp19_a.a > nextval('rp19_s') * 0",
+        "select last_value from rp19_s",
+        "select count(*) from rp19_a join rp19_b on rp19_a.a = rp19_b.b"
+        " where rp19_b.b + nextval('rp19_s') * 0 > 1",
+        "select last_value from rp19_s",
+    ]
+    pg.execute("begin")
+    try:
+        for s in _RP019_SETUP:
+            pg.execute(s)
+        got = [pg_answer(pg, q) for q in queries]
+    finally:
+        pg.execute("rollback")
+    assert got == [
+        ("ok", [(3,)]),
+        ("ok", [(3,)]),
+        ("ok", [(9,)]),
+        ("ok", [(6,)]),
+        ("ok", [(2,)]),
+        ("ok", [(9,)]),
+    ]
+
+
+@pytest.mark.backlog("RP-288")
+def test_a_select_list_nextval_in_an_autocommit_join_runs_once_a_row(rust_pg: Any) -> None:
+    """In autocommit, a join whose select list calls `nextval` took one
+    value more than its rows (in a transaction block it did not)."""
+    with rust_pg.connect() as conn:
+        for s in ["drop table if exists rp19_a, rp19_b", "drop sequence if exists rp19_s"]:
+            conn.execute(s)
+        for s in _RP019_SETUP:
+            conn.execute(s)
+        rows = conn.execute(
+            "select rp19_a.a, nextval('rp19_s') from rp19_a, rp19_b"
+            " where rp19_a.a = rp19_b.b order by 1"
+        ).fetchall()
+        last = conn.execute("select last_value from rp19_s").fetchone()
+        conn.execute("drop table rp19_a, rp19_b")
+        conn.execute("drop sequence rp19_s")
+    assert (rows, last) == ([(1, 1), (2, 2), (3, 3)], (3,))
