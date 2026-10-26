@@ -77,6 +77,17 @@ impl WtError {
     pub fn is_duplicate_key(&self) -> bool {
         self.code == sys::WT_DUPLICATE_KEY
     }
+    /// The database's metadata is damaged and the connection can be opened
+    /// only with `salvage=true` (`WT_TRY_SALVAGE`).
+    pub fn is_try_salvage(&self) -> bool {
+        self.code == sys::WT_TRY_SALVAGE
+    }
+    /// The table is in use by another handle (`EBUSY`): `verify` and
+    /// `salvage` need it to themselves, and `compact` returns it when
+    /// eviction cannot keep up.
+    pub fn is_busy(&self) -> bool {
+        self.code == 16 // EBUSY, the same number on every platform built here
+    }
     /// The transaction must be retried (`WT_ROLLBACK`).
     pub fn is_rollback(&self) -> bool {
         self.code == sys::WT_ROLLBACK
@@ -403,6 +414,54 @@ impl Session {
     }
     pub fn checkpoint(&self, config: Option<&str>) -> Result<()> {
         self.txn(unsafe { (*self.ptr).checkpoint }, config)
+    }
+
+    /// `WT_SESSION::compact`: give a table's free space back to the file
+    /// system, by rewriting the blocks at the end of its file into the free
+    /// space nearer the start and truncating the file, checkpointing as it
+    /// goes. Online: other sessions read and write the table meanwhile. The
+    /// session must not be in a transaction. WiredTiger skips a file it
+    /// cannot shrink by at least 1 MB and a tenth of its size (the space
+    /// available in the first 80% or 90% of the file decides), so a call
+    /// that frees nothing is not an error. `config` takes `timeout=<secs>`
+    /// (0: none; the default is 1200).
+    pub fn compact(&self, uri: &str, config: Option<&str>) -> Result<()> {
+        self.on_object(unsafe { (*self.ptr).compact }, uri, config)
+    }
+
+    /// `WT_SESSION::salvage`: rebuild a damaged table's file from whatever
+    /// of it can still be read, discarding what cannot. Needs the table to
+    /// have no open handle (`EBUSY` otherwise).
+    pub fn salvage(&self, uri: &str, config: Option<&str>) -> Result<()> {
+        self.on_object(unsafe { (*self.ptr).salvage }, uri, config)
+    }
+
+    /// `WT_SESSION::verify`: check a table's file is a well-formed btree
+    /// whose every block reads back. An error is a damaged (or busy) table.
+    /// Needs the table to have no open handle (`EBUSY` otherwise).
+    pub fn verify(&self, uri: &str, config: Option<&str>) -> Result<()> {
+        self.on_object(unsafe { (*self.ptr).verify }, uri, config)
+    }
+
+    fn on_object(
+        &self,
+        f: Option<
+            unsafe extern "C" fn(*mut sys::WT_SESSION, *const c_char, *const c_char) -> c_int,
+        >,
+        uri: &str,
+        config: Option<&str>,
+    ) -> Result<()> {
+        let uri_c = CString::new(uri).map_err(nul_err)?;
+        let cfg_c = match config {
+            Some(c) => Some(CString::new(c).map_err(nul_err)?),
+            None => None,
+        };
+        let cfg_ptr = cfg_c.as_ref().map_or(ptr::null(), |c| c.as_ptr());
+        let f = f.ok_or_else(|| WtError {
+            code: -1,
+            message: "this WiredTiger session method is not available".into(),
+        })?;
+        check(unsafe { f(self.ptr, uri_c.as_ptr(), cfg_ptr) })
     }
 
     /// `WT_SESSION::log_flush`: write the log, and with `sync=on` sync it,

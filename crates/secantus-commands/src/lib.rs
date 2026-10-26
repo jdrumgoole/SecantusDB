@@ -640,6 +640,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "convertToCapped" => capped_admin::convert_to_capped,
         "cloneCollectionAsCapped" => capped_admin::clone_collection_as_capped,
         "compact" => capped_admin::compact,
+        "autoCompact" => capped_admin::auto_compact,
         "reIndex" => capped_admin::re_index,
         "explain" => explain::explain,
         "drop" => admin::drop,
@@ -1470,13 +1471,16 @@ fn collection_name_problem(name: &str, doc: &Document, db: &str) -> Option<Comma
             | "validate"
             | "listIndexes"
             | "killCursors"
+            | "compact"
     ) {
         return None;
     }
     let invalid = |message: String| Some(CommandError::new(73, "InvalidNamespace", message));
     match doc.get(name) {
         Some(Bson::String(coll)) if coll.is_empty() => invalid(match name {
-            "distinct" | "validate" => format!("Invalid namespace specified '{db}'"),
+            "distinct" | "validate" | "compact" => {
+                format!("Invalid namespace specified '{db}'")
+            }
             _ => format!("Invalid namespace specified: {db}"),
         }),
         Some(Bson::String(_)) => None,
@@ -1515,6 +1519,13 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
 
     // An unknown command says so before anything about its fields.
     if lookup(name).is_some() {
+        // `compact` reads its namespace before its other fields (measured
+        // 8.2.11: `{compact: "", bogus: 1}` is InvalidNamespace).
+        if name == "compact" {
+            if let Some(e) = collection_name_problem(name, doc, &ctx.db_name) {
+                return e.into_reply();
+            }
+        }
         if let Err(e) = generic::check(doc, name) {
             return e.into_reply();
         }
@@ -1561,6 +1572,7 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
                 | "abortTransaction"
                 | "commitTransaction"
                 | "getClusterParameter"
+                | "autoCompact"
         )
     {
         return CommandError::new(
@@ -2765,6 +2777,7 @@ const NO_WRITE_CONCERN: &[&str] = &[
     "killOp",
     "fsync",
     "compact",
+    "autoCompact",
     "reIndex",
     "mapReduce",
     // Measured 2026-10-14 (`tools/probes/admin_commands.py`).
