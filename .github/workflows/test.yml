@@ -1492,6 +1492,10 @@ jobs:
           # Until 2026-10-21 the corpora ran on a developer's box and nowhere
           # else, so what they pinned could regress under a green CI.
           files="$files tests/test_rust_pg_corpora.py"
+          # Every rule's pg_rewrite trees (RP-203), held to the sha256 of
+          # PostgreSQL 15.19's (tools/probes/pg_rule_trees.expected.json).
+          # Binary only.
+          files="$files tests/test_rust_pg_rule_trees.py"
           fi
           echo "oracle suites: $files"
           test -n "$files"

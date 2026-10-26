@@ -155,7 +155,10 @@ impl PgHandler {
         let binary = self
             .binary_results
             .swap(false, std::sync::atomic::Ordering::Relaxed);
+        // The statement's own text is its source (RP-203), as SPI parses it.
+        let outer_source = self.enter_statement_source(sql);
         let out = Box::pin(self.run_typed(sql, &[], &[], 0)).await;
+        self.restore_statement_source(outer_source);
         self.binary_results
             .store(binary, std::sync::atomic::Ordering::Relaxed);
         out.map_err(|e| match e {
