@@ -624,6 +624,10 @@ impl PgHandler {
             if rel < 16384 {
                 continue;
             }
+            // The constraints a grouping leans on (`constraintDeps`, RP-280).
+            for con in crate::rule_trees::constraint_deps(&rules.text(r, "ev_action")) {
+                push(PG_REWRITE, oid, 0, PG_CONSTRAINT, con, 0, "n");
+            }
             if rules.text(r, "rulename") != "_RETURN" {
                 push(PG_REWRITE, oid, 0, PG_CLASS, rel, 0, "a");
                 push(PG_REWRITE, oid, 0, PG_CLASS, rel, 0, "n");

@@ -679,9 +679,39 @@ impl Out {
         self.field("ctequery");
         self.query(&c.ctequery);
         self.field("search_clause");
-        self.s.push_str("<>");
+        match &c.search_clause {
+            None => self.s.push_str("<>"),
+            Some(sc) => {
+                self.s.push('{');
+                self.label("CTESEARCHCLAUSE");
+                self.string_list("search_col_list", &sc.search_col_list);
+                self.boolean("search_breadth_first", sc.search_breadth_first);
+                self.string("search_seq_column", Some(&sc.search_seq_column));
+                self.loc("location", sc.location);
+                self.s.push('}');
+            }
+        }
         self.field("cycle_clause");
-        self.s.push_str("<>");
+        match &c.cycle_clause {
+            None => self.s.push_str("<>"),
+            Some(cc) => {
+                self.s.push('{');
+                self.label("CTECYCLECLAUSE");
+                self.string_list("cycle_col_list", &cc.cycle_col_list);
+                self.string("cycle_mark_column", Some(&cc.cycle_mark_column));
+                self.field("cycle_mark_value");
+                self.node(&cc.cycle_mark_value);
+                self.field("cycle_mark_default");
+                self.node(&cc.cycle_mark_default);
+                self.string("cycle_path_column", Some(&cc.cycle_path_column));
+                self.loc("location", cc.location);
+                self.uint("cycle_mark_type", cc.cycle_mark_type);
+                self.int("cycle_mark_typmod", cc.cycle_mark_typmod.into());
+                self.uint("cycle_mark_collation", cc.cycle_mark_collation);
+                self.uint("cycle_mark_neop", cc.cycle_mark_neop);
+                self.s.push('}');
+            }
+        }
         self.loc("location", c.location);
         self.boolean("cterecursive", c.cterecursive);
         self.int("cterefcount", c.cterefcount.into());
@@ -864,13 +894,12 @@ impl Out {
                 });
                 self.opt_node("arbiterWhere", oc.arbiter_where.as_ref());
                 self.uint("constraint", oc.constraint);
-                self.field("onConflictSet");
-                self.s.push_str("<>");
-                self.field("onConflictWhere");
-                self.s.push_str("<>");
-                self.int("exclRelIndex", 0);
-                self.field("exclRelTlist");
-                self.s.push_str("<>");
+                self.list("onConflictSet", &oc.on_conflict_set, |o, t| {
+                    o.target_entry(t)
+                });
+                self.opt_node("onConflictWhere", oc.on_conflict_where.as_ref());
+                self.int("exclRelIndex", oc.excl_rel_index.into());
+                self.list("exclRelTlist", &oc.excl_rel_tlist, |o, t| o.target_entry(t));
                 self.s.push('}');
             }
         }

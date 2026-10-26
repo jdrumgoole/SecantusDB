@@ -3,7 +3,7 @@
 //! created on a PostgreSQL 15.19 cluster (inside a rolled-back
 //! transaction).
 
-use super::datum::{interval_in, numeric_in};
+use super::datum::{interval_in_typmod, numeric_in};
 use super::nodes::*;
 use super::out::out_token;
 use super::{node_to_string, queries_to_string};
@@ -56,7 +56,7 @@ fn interval_literal_is_the_sixteen_byte_struct() {
         16,
         false,
         0,
-        interval_in("1 day 02:00:03").unwrap(),
+        interval_in_typmod("1 day 02:00:03", -1).unwrap(),
         53,
     );
     assert!(node_to_string(Some(&n))

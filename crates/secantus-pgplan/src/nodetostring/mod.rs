@@ -28,6 +28,7 @@ pub mod catalog;
 mod clause;
 mod coerce;
 mod collate;
+mod cte_walk;
 mod datum;
 mod expr;
 mod func;
@@ -47,20 +48,65 @@ mod types;
 pub use catalog::{Catalog, CatalogData};
 pub use out::{node_to_string, queries_to_string};
 
-/// Why an analysis produced no tree.
+/// Why an analysis produced no tree. With a `sqlstate` it is an error
+/// PostgreSQL's parse analysis (or `DefineView` / `DefineQueryRewrite`)
+/// raises, which refuses the statement; without one, the analysis met
+/// something it does not transcribe, or a fact it could not find, and the
+/// statement goes ahead with no tree.
 #[derive(Clone, Debug, PartialEq)]
-pub struct AnalysisError(pub String);
+pub struct AnalysisError {
+    pub message: String,
+    pub sqlstate: Option<&'static str>,
+    pub detail: Option<String>,
+    pub hint: Option<String>,
+}
+
+impl AnalysisError {
+    pub fn new(message: String) -> Self {
+        AnalysisError {
+            message,
+            sqlstate: None,
+            detail: None,
+            hint: None,
+        }
+    }
+
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    /// An `ereport(ERROR)` of PostgreSQL's, with its SQLSTATE.
+    pub fn pg(sqlstate: &'static str, message: impl Into<String>) -> Self {
+        AnalysisError {
+            message: message.into(),
+            sqlstate: Some(sqlstate),
+            detail: None,
+            hint: None,
+        }
+    }
+}
 
 impl std::fmt::Display for AnalysisError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
 pub(crate) type R<T> = Result<T, AnalysisError>;
 
 pub(crate) fn unsupported<T>(what: impl Into<String>) -> R<T> {
-    Err(AnalysisError(what.into()))
+    Err(AnalysisError::new(what.into()))
+}
+
+/// PostgreSQL's error `sqlstate` / `message`.
+pub(crate) fn pg_error<T>(sqlstate: &'static str, message: impl Into<String>) -> R<T> {
+    Err(AnalysisError::pg(sqlstate, message))
 }
 
 /// A rule's stored trees, as `pg_rewrite` holds them.

@@ -1325,6 +1325,100 @@
     "8580d491c87c7ed26617df218580d35e64ff32cd69a0dad9a9782192e1522043"
    ]
   ],
+  "views with FOR UPDATE, FOR SHARE and locking a subquery": [
+   [
+    "rt_v",
+    "_RETURN",
+    "24295a9c545a402da4f2cc833dae7b4f3b80182f7f803516d580ca07c0642b64",
+    "1749b7df2e17605901abe6975db3caf2fe6a4765a7148cb9ba1d2d7c691c1e54"
+   ],
+   [
+    "rt_w",
+    "_RETURN",
+    "24295a9c545a402da4f2cc833dae7b4f3b80182f7f803516d580ca07c0642b64",
+    "71665363ee02ae438ab36ded0164ebb5fe83ed840c32c99e3a556a0b245b38aa"
+   ],
+   [
+    "rt_x",
+    "_RETURN",
+    "24295a9c545a402da4f2cc833dae7b4f3b80182f7f803516d580ca07c0642b64",
+    "3616ce8509b2f6930adf80a744419aaf9e3730b65ec5157afe5099eaa88f37e5"
+   ]
+  ],
+  "a rule whose action has a data-modifying WITH": [
+   [
+    "rt_t",
+    "rt_r",
+    "24295a9c545a402da4f2cc833dae7b4f3b80182f7f803516d580ca07c0642b64",
+    "bc8c64b09706578b02ec8a364be00c68841340ad848c2754e03857e810277efe"
+   ]
+  ],
+  "a view with SEARCH and CYCLE": [
+   [
+    "rt_v",
+    "_RETURN",
+    "24295a9c545a402da4f2cc833dae7b4f3b80182f7f803516d580ca07c0642b64",
+    "bef7220f42cfbfac3b0a6dffc441f156889b8fd966f1f08708def36c479807f4"
+   ],
+   [
+    "rt_v2",
+    "_RETURN",
+    "24295a9c545a402da4f2cc833dae7b4f3b80182f7f803516d580ca07c0642b64",
+    "5c7ab3ecde78bb4ae4fbd70d7681b64edee28def4eb03e5989ae2dace77204f5"
+   ]
+  ],
+  "rules with ON CONFLICT DO UPDATE and ON CONSTRAINT": [
+   [
+    "rt_t",
+    "rt_r1",
+    "24295a9c545a402da4f2cc833dae7b4f3b80182f7f803516d580ca07c0642b64",
+    "86087f7c6a26a17725e293d2a859a7cc2124921831e798386d7c8b7c0fa86174"
+   ],
+   [
+    "rt_t",
+    "rt_r2",
+    "24295a9c545a402da4f2cc833dae7b4f3b80182f7f803516d580ca07c0642b64",
+    "ae857c1947fe2a77df07cb9e211b6f2b5f02d02cdd21b753b800b6d9ab28339f"
+   ],
+   [
+    "rt_t",
+    "rt_r3",
+    "24295a9c545a402da4f2cc833dae7b4f3b80182f7f803516d580ca07c0642b64",
+    "1e23d0d41ff0e3dba2594717c945e83cb1ffd9ed62ae0955bc023b265242911d"
+   ]
+  ],
+  "a rule with SET (a, b) = (SELECT ...)": [
+   [
+    "rt_t",
+    "rt_r",
+    "24295a9c545a402da4f2cc833dae7b4f3b80182f7f803516d580ca07c0642b64",
+    "60b3edb0c182c096f403c7e68df193b7fcd9ec4033ab0b046351d50ba5b527c6"
+   ]
+  ],
+  "views with interval field qualifiers": [
+   [
+    "rt_v",
+    "_RETURN",
+    "24295a9c545a402da4f2cc833dae7b4f3b80182f7f803516d580ca07c0642b64",
+    "ba4705286551e5f351c8e04652c7cb705e7401a21654d4b0b761276180e7e33f"
+   ]
+  ],
+  "a WITH RECURSIVE whose name an inner WITH redefines": [
+   [
+    "rt_v",
+    "_RETURN",
+    "24295a9c545a402da4f2cc833dae7b4f3b80182f7f803516d580ca07c0642b64",
+    "604be4c64e72cf3813d636fbac75198917ef343eb88d9cbe73b54b6fda2772ff"
+   ]
+  ],
+  "a table turned into a view by an ON SELECT rule": [
+   [
+    "rt_v",
+    "_RETURN",
+    "24295a9c545a402da4f2cc833dae7b4f3b80182f7f803516d580ca07c0642b64",
+    "32c447c242e8314e3d16a1285f5337977b8a953d0458d59048d35ecc7b03f5aa"
+   ]
+  ],
   "a view in another schema with search_path": [
    [
     "rt_v",

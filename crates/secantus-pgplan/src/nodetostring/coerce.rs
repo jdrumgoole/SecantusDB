@@ -4,7 +4,7 @@ use super::catalog::*;
 use super::nodefuncs::{expr_collation, expr_type, expr_typmod};
 use super::nodes::*;
 use super::parse::Analyzer;
-use super::{unsupported, AnalysisError, R};
+use super::{pg_error, unsupported, AnalysisError, R};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CoercionPath {
@@ -321,13 +321,13 @@ impl<'a> Analyzer<'a> {
                 let row = self
                     .cat
                     .type_row(base)
-                    .ok_or_else(|| AnalysisError(format!("type {base} does not exist")))?
+                    .ok_or_else(|| AnalysisError::new(format!("type {base} does not exist")))?
                     .clone();
                 let value = match &con.constvalue {
                     None => None,
                     Some(Datum::ByRef(bytes)) => {
                         let s = std::str::from_utf8(&bytes[..bytes.len().saturating_sub(1)])
-                            .map_err(|_| AnalysisError("a literal's encoding".into()))?;
+                            .map_err(|_| AnalysisError::new("a literal's encoding".into()))?;
                         Some(super::datum::type_input(self, base, s, inputmod)?)
                     }
                     Some(_) => return unsupported("an unknown literal's value"),
@@ -544,7 +544,9 @@ impl<'a> Analyzer<'a> {
         let nargs = if funcid != 0 {
             self.cat
                 .proc_row(funcid)
-                .ok_or_else(|| AnalysisError(format!("cache lookup failed for function {funcid}")))?
+                .ok_or_else(|| {
+                    AnalysisError::new(format!("cache lookup failed for function {funcid}"))
+                })?
                 .argtypes
                 .len()
         } else {
@@ -613,7 +615,7 @@ impl<'a> Analyzer<'a> {
                         location,
                     )?
                     .ok_or_else(|| {
-                        AnalysisError("failed to coerce array element type as expected".into())
+                        AnalysisError::new("failed to coerce array element type as expected".into())
                     })?;
                 let resulttypmod = expr_typmod(self.cat, &elemexpr);
                 Ok(Node::ArrayCoerceExpr(Box::new(ArrayCoerceExpr {
@@ -650,7 +652,9 @@ impl<'a> Analyzer<'a> {
                 CoercionForm::ImplicitCast,
                 -1,
             )?
-            .ok_or_else(|| AnalysisError(format!("argument of {construct} must be type boolean")))?
+            .ok_or_else(|| {
+                AnalysisError::new(format!("argument of {construct} must be type boolean"))
+            })?
         } else {
             node
         };
@@ -673,7 +677,9 @@ impl<'a> Analyzer<'a> {
                 CoercionForm::ImplicitCast,
                 -1,
             )?
-            .ok_or_else(|| AnalysisError(format!("argument of {construct} has the wrong type")))?
+            .ok_or_else(|| {
+                AnalysisError::new(format!("argument of {construct} has the wrong type"))
+            })?
         } else {
             node
         };
@@ -723,13 +729,17 @@ impl<'a> Analyzer<'a> {
                     pcat = ncat;
                     ppref = npref;
                 } else if ncat != pcat {
-                    if context.is_none() {
+                    let Some(context) = context else {
                         return Ok((0, pidx));
-                    }
-                    return unsupported(format!(
-                        "{} types cannot be matched",
-                        context.unwrap_or_default()
-                    ));
+                    };
+                    return pg_error(
+                        "42804",
+                        format!(
+                            "{context} types {} and {} cannot be matched",
+                            self.cat.format_type_be(ptype),
+                            self.cat.format_type_be(ntype)
+                        ),
+                    );
                 } else if !ppref
                     && self.can_coerce_type(&[ptype], &[ntype], CoercionContext::Implicit)
                     && !self.can_coerce_type(&[ntype], &[ptype], CoercionContext::Implicit)
@@ -773,7 +783,14 @@ impl<'a> Analyzer<'a> {
                     if noerror {
                         return Ok(0);
                     }
-                    return unsupported("argument types cannot be matched");
+                    return pg_error(
+                        "42804",
+                        format!(
+                            "argument types {} and {} cannot be matched",
+                            self.cat.format_type_be(ptype),
+                            self.cat.format_type_be(ntype)
+                        ),
+                    );
                 } else if !ppref
                     && self.can_coerce_type(&[ptype], &[ntype], CoercionContext::Implicit)
                     && !self.can_coerce_type(&[ntype], &[ptype], CoercionContext::Implicit)
@@ -814,9 +831,14 @@ impl<'a> Analyzer<'a> {
                 -1,
             )
         } else {
-            unsupported(format!(
-                "{context} could not convert type {input} to {target}"
-            ))
+            pg_error(
+                "42846",
+                format!(
+                    "{context} could not convert type {} to {}",
+                    self.cat.format_type_be(input),
+                    self.cat.format_type_be(target)
+                ),
+            )
         }
     }
 

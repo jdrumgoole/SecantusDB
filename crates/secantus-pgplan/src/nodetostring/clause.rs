@@ -105,11 +105,11 @@ impl<'a> Analyzer<'a> {
             .alias
             .as_ref()
             .map(convert_alias)
-            .ok_or_else(|| AnalysisError("subquery in FROM must have an alias".into()))?;
+            .ok_or_else(|| AnalysisError::new("subquery in FROM must have an alias".into()))?;
         let sub = r
             .subquery
             .as_deref()
-            .ok_or_else(|| AnalysisError("a subquery in FROM".into()))?;
+            .ok_or_else(|| AnalysisError::new("a subquery in FROM".into()))?;
         self.ps().expr_kind = ExprKind::FromSubselect;
         self.ps().lateral_active = r.lateral;
         let locked = {
@@ -150,7 +150,7 @@ impl<'a> Analyzer<'a> {
                 let fexpr = l
                     .items
                     .first()
-                    .ok_or_else(|| AnalysisError("a function in FROM".into()))?;
+                    .ok_or_else(|| AnalysisError::new("a function in FROM".into()))?;
                 let coldef: Vec<pb::Node> = match l.items.get(1).and_then(|n| n.node.as_ref()) {
                     Some(N::List(c)) => c.items.clone(),
                     _ => Vec::new(),
@@ -219,11 +219,11 @@ impl<'a> Analyzer<'a> {
         let larg = j
             .larg
             .as_deref()
-            .ok_or_else(|| AnalysisError("a join without its left side".into()))?;
+            .ok_or_else(|| AnalysisError::new("a join without its left side".into()))?;
         let rarg = j
             .rarg
             .as_deref()
-            .ok_or_else(|| AnalysisError("a join without its right side".into()))?;
+            .ok_or_else(|| AnalysisError::new("a join without its right side".into()))?;
         let (lnode, l_ns, mut l_namespace) = self.transform_from_clause_item(larg)?;
         let lateral_ok = jointype == 0 || jointype == 1;
         for n in l_namespace.iter_mut() {
@@ -293,7 +293,7 @@ impl<'a> Analyzer<'a> {
                         }
                     }
                     idx.ok_or_else(|| {
-                        AnalysisError(format!(
+                        AnalysisError::new(format!(
                             "column \"{u}\" specified in USING clause does not exist in {side} table"
                         ))
                     })
@@ -660,7 +660,7 @@ impl<'a> Analyzer<'a> {
             let node = sb
                 .node
                 .as_deref()
-                .ok_or_else(|| AnalysisError("an empty ORDER BY item".into()))?;
+                .ok_or_else(|| AnalysisError::new("an empty ORDER BY item".into()))?;
             let idx = if sql99 {
                 self.find_targetlist_entry_sql99(node, tlist, kind)?
             } else {
@@ -715,7 +715,7 @@ impl<'a> Analyzer<'a> {
                 let (eq, reverse) = self
                     .cat
                     .equality_op_for_ordering_op(op)
-                    .ok_or_else(|| AnalysisError("not a valid ordering operator".into()))?;
+                    .ok_or_else(|| AnalysisError::new("not a valid ordering operator".into()))?;
                 let h = self.cat.op_hashjoinable(eq, restype);
                 (op, eq, h, reverse)
             }
@@ -843,7 +843,7 @@ impl<'a> Analyzer<'a> {
             let idx = tlist
                 .iter()
                 .position(|t| t.ressortgroupref == r)
-                .ok_or_else(|| AnalysisError("a DISTINCT ON target".into()))?;
+                .ok_or_else(|| AnalysisError::new("a DISTINCT ON target".into()))?;
             if target_is_in_sort_list(self.cat, &tlist[idx], 0, &result) {
                 continue;
             }
@@ -907,7 +907,7 @@ impl<'a> Analyzer<'a> {
                 }
             }
             if nfuncs == 0 || nmatches == 0 || (nmatches != 1 && selected_type != preferred) {
-                return Err(AnalysisError(
+                return Err(AnalysisError::new(
                     "RANGE with offset PRECEDING/FOLLOWING is not supported for this type".into(),
                 ));
             }
@@ -928,7 +928,7 @@ impl<'a> Analyzer<'a> {
         };
         // checkExprIsVarFree
         if super::nodefuncs::contain_vars_of_level(&node, 0) {
-            return Err(AnalysisError(format!(
+            return Err(AnalysisError::new(format!(
                 "argument of {construct} must not contain variables"
             )));
         }
@@ -951,7 +951,7 @@ impl<'a> Analyzer<'a> {
                         .find(|c| c.name.as_deref() == Some(w.refname.as_str()))
                         .cloned()
                         .ok_or_else(|| {
-                            AnalysisError(format!("window \"{}\" does not exist", w.refname))
+                            AnalysisError::new(format!("window \"{}\" does not exist", w.refname))
                         })?,
                 )
             } else {
@@ -992,7 +992,7 @@ impl<'a> Analyzer<'a> {
                 && frame_options & (FRAMEOPTION_START_OFFSET | FRAMEOPTION_END_OFFSET) != 0
             {
                 if order_clause.len() != 1 {
-                    return Err(AnalysisError(
+                    return Err(AnalysisError::new(
                         "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column"
                             .into(),
                     ));
@@ -1002,12 +1002,12 @@ impl<'a> Analyzer<'a> {
                     .iter()
                     .find(|t| t.ressortgroupref == sortcl.tle_sort_group_ref)
                     .map(|t| t.expr.clone())
-                    .ok_or_else(|| AnalysisError("a window ORDER BY target".into()))?;
+                    .ok_or_else(|| AnalysisError::new("a window ORDER BY target".into()))?;
                 let (fam, intype, strategy) = self
                     .cat
                     .ordering_op_properties(sortcl.sortop)
                     .ok_or_else(|| {
-                        AnalysisError(format!(
+                        AnalysisError::new(format!(
                             "operator {} is not a valid ordering operator",
                             sortcl.sortop
                         ))
@@ -1019,7 +1019,7 @@ impl<'a> Analyzer<'a> {
                 in_range_nulls_first = sortcl.nulls_first;
             }
             if frame_options & FRAMEOPTION_GROUPS != 0 && order_clause.is_empty() {
-                return Err(AnalysisError(
+                return Err(AnalysisError::new(
                     "GROUPS mode requires an ORDER BY clause".into(),
                 ));
             }

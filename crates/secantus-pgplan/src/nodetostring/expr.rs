@@ -5,7 +5,7 @@ use super::catalog::*;
 use super::nodefuncs::{expr_collation, expr_location, expr_type, expr_typmod};
 use super::nodes::*;
 use super::parse::{Analyzer, ExprKind};
-use super::{unsupported, AnalysisError, R};
+use super::{pg_error, unsupported, AnalysisError, R};
 use pg_query::protobuf as pb;
 use pg_query::protobuf::node::Node as N;
 
@@ -39,7 +39,7 @@ impl<'a> Analyzer<'a> {
                 let arg = na
                     .arg
                     .as_deref()
-                    .ok_or_else(|| AnalysisError("a named argument".into()))?;
+                    .ok_or_else(|| AnalysisError::new("a named argument".into()))?;
                 let arg = self.transform_expr_recurse(arg)?;
                 Ok(Node::NamedArgExpr(Box::new(NamedArgExpr {
                     arg,
@@ -61,7 +61,7 @@ impl<'a> Analyzer<'a> {
                 let arg = t
                     .arg
                     .as_deref()
-                    .ok_or_else(|| AnalysisError("a null test".into()))?;
+                    .ok_or_else(|| AnalysisError::new("a null test".into()))?;
                 let arg = self.transform_expr_recurse(arg)?;
                 let argisrow = self.cat.type_is_rowtype(expr_type(self.cat, &arg));
                 Ok(Node::NullTest(Box::new(NullTest {
@@ -75,7 +75,7 @@ impl<'a> Analyzer<'a> {
                 let arg = b
                     .arg
                     .as_deref()
-                    .ok_or_else(|| AnalysisError("a boolean test".into()))?;
+                    .ok_or_else(|| AnalysisError::new("a boolean test".into()))?;
                 let arg = self.transform_expr_recurse(arg)?;
                 let arg = self.coerce_to_boolean(arg, "IS TRUE")?;
                 Ok(Node::BooleanTest(Box::new(BooleanTest {
@@ -84,7 +84,7 @@ impl<'a> Analyzer<'a> {
                     location: b.location,
                 })))
             }
-            N::SetToDefault(_) => unsupported("DEFAULT is not allowed in this context"),
+            N::SetToDefault(_) => pg_error("42601", "DEFAULT is not allowed in this context"),
             N::MultiAssignRef(m) => self.transform_multi_assign_ref(m),
             _ => unsupported("this expression in a stored rule"),
         }
@@ -94,11 +94,20 @@ impl<'a> Analyzer<'a> {
     /// `SET (a, b) = (x, y)` is its element of the row (a sub-SELECT source,
     /// a MULTIEXPR SubLink, is not transcribed).
     fn transform_multi_assign_ref(&mut self, m: &pb::MultiAssignRef) -> R<Node> {
-        let Some(N::RowExpr(r)) = m.source.as_deref().and_then(|s| s.node.as_ref()) else {
-            return unsupported("a multiple-column UPDATE from a sub-SELECT in a stored rule");
+        let source = m.source.as_deref().and_then(|s| s.node.as_ref());
+        if let Some(N::SubLink(sl)) = source {
+            if sl.sub_link_type == pb::SubLinkType::ExprSublink as i32 {
+                return self.transform_multiexpr_sublink(m, sl);
+            }
+        }
+        let Some(N::RowExpr(r)) = source else {
+            return pg_error(
+                "42601",
+                "source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression",
+            );
         };
         if r.args.len() != m.ncolumns as usize {
-            return Err(AnalysisError(
+            return Err(AnalysisError::new(
                 "number of columns does not match number of values".into(),
             ));
         }
@@ -110,7 +119,7 @@ impl<'a> Analyzer<'a> {
         let e = r
             .args
             .get((m.colno - 1) as usize)
-            .ok_or_else(|| AnalysisError("a multiple-assignment column".into()))?;
+            .ok_or_else(|| AnalysisError::new("a multiple-assignment column".into()))?;
         if let Some(N::SetToDefault(d)) = e.node.as_ref() {
             return Ok(Node::SetToDefault(SetToDefault {
                 type_id: 0,
@@ -120,6 +129,62 @@ impl<'a> Analyzer<'a> {
             }));
         }
         self.transform_expr_recurse(e)
+    }
+
+    /// `transformMultiAssignRef` for a sub-SELECT source: the first column
+    /// relabels the SubLink as MULTIEXPR and parks it; each column is a
+    /// `PARAM_MULTIEXPR` Param for its output of the subquery.
+    fn transform_multiexpr_sublink(&mut self, m: &pb::MultiAssignRef, sl: &pb::SubLink) -> R<Node> {
+        if m.colno == 1 {
+            let mut relabelled = sl.clone();
+            relabelled.sub_link_type = pb::SubLinkType::MultiexprSublink as i32;
+            let node = pb::Node {
+                node: Some(N::SubLink(Box::new(relabelled))),
+            };
+            let mut link = match self.transform_expr_recurse(&node)? {
+                Node::SubLink(l) => l,
+                _ => return unsupported("a multiple-assignment sublink"),
+            };
+            let n = link
+                .subselect
+                .target_list
+                .iter()
+                .filter(|t| !t.resjunk)
+                .count();
+            if n != m.ncolumns as usize {
+                return pg_error("42601", "number of columns does not match number of values");
+            }
+            link.sub_link_id = self.psr().multiassign_exprs.len() as i32 + 1;
+            self.ps().multiassign_exprs.push(TargetEntry {
+                expr: Node::SubLink(link),
+                resno: 0,
+                resname: None,
+                ressortgroupref: 0,
+                resorigtbl: 0,
+                resorigcol: 0,
+                resjunk: true,
+            });
+        }
+        let Some(TargetEntry {
+            expr: Node::SubLink(link),
+            ..
+        }) = self.psr().multiassign_exprs.last()
+        else {
+            return unsupported("a multiple-assignment sublink");
+        };
+        let t = link
+            .subselect
+            .target_list
+            .get((m.colno - 1) as usize)
+            .ok_or_else(|| AnalysisError::new("a multiple-assignment column".into()))?;
+        Ok(Node::Param(Param {
+            paramkind: 3, // PARAM_MULTIEXPR
+            paramid: (link.sub_link_id << 16) | m.colno,
+            paramtype: expr_type(self.cat, &t.expr),
+            paramtypmod: expr_typmod(self.cat, &t.expr),
+            paramcollid: expr_collation(self.cat, &t.expr),
+            location: expr_location(&t.expr),
+        }))
     }
 
     /// `transformColumnRef`.
@@ -136,7 +201,8 @@ impl<'a> Analyzer<'a> {
         let loc = cref.location;
         let node = match fields.len() {
             1 => {
-                let colname = fields[0].ok_or_else(|| AnalysisError("a column name".into()))?;
+                let colname =
+                    fields[0].ok_or_else(|| AnalysisError::new("a column name".into()))?;
                 match self.col_name_to_var(colname, false, loc)? {
                     Some(v) => Some(v),
                     None => match self.refname_namespace_item(None, colname)? {
@@ -156,14 +222,15 @@ impl<'a> Analyzer<'a> {
                         (fields[1], fields[2], 3)
                     }
                 };
-                let rel = rel.ok_or_else(|| AnalysisError("a relation name".into()))?;
+                let rel = rel.ok_or_else(|| AnalysisError::new("a relation name".into()))?;
                 let Some((up, idx)) = self.refname_namespace_item(nsp, rel)? else {
                     return unsupported(format!("missing FROM-clause entry for table \"{rel}\""));
                 };
                 if star(last) {
                     Some(self.transform_whole_row_ref(up, idx, loc)?)
                 } else {
-                    let colname = fields[last].ok_or_else(|| AnalysisError("a column".into()))?;
+                    let colname =
+                        fields[last].ok_or_else(|| AnalysisError::new("a column".into()))?;
                     match self.scan_nsitem_for_column(up, idx, colname, loc)? {
                         Some(v) => Some(v),
                         None => {
@@ -181,7 +248,7 @@ impl<'a> Analyzer<'a> {
             _ => return unsupported("improper qualified name (too many dotted names)"),
         };
         node.ok_or_else(|| {
-            AnalysisError(format!(
+            AnalysisError::new(format!(
                 "column \"{}\" does not exist",
                 fields
                     .iter()
@@ -330,7 +397,7 @@ impl<'a> Analyzer<'a> {
         let arg = ind
             .arg
             .as_deref()
-            .ok_or_else(|| AnalysisError("an indirection".into()))?;
+            .ok_or_else(|| AnalysisError::new("an indirection".into()))?;
         let mut result = self.transform_expr_recurse(arg)?;
         let location = expr_location(&result);
         let mut subscripts: Vec<pb::AIndices> = Vec::new();
@@ -359,7 +426,9 @@ impl<'a> Analyzer<'a> {
                             None,
                             location,
                         )?
-                        .ok_or_else(|| AnalysisError(format!("column \"{name}\" not found")))?;
+                        .ok_or_else(|| {
+                            AnalysisError::new(format!("column \"{name}\" not found"))
+                        })?;
                 }
                 _ => return unsupported("this indirection"),
             }
@@ -391,7 +460,7 @@ impl<'a> Analyzer<'a> {
         let row = self
             .cat
             .type_row(ctype)
-            .ok_or_else(|| AnalysisError("a container type".into()))?;
+            .ok_or_else(|| AnalysisError::new("a container type".into()))?;
         if row.subscript != F_ARRAY_SUBSCRIPT_HANDLER {
             return unsupported("subscripting a non-array type");
         }
@@ -453,7 +522,7 @@ impl<'a> Analyzer<'a> {
             CoercionForm::ImplicitCast,
             -1,
         )?;
-        r.ok_or_else(|| AnalysisError("array subscript must have type integer".into()))
+        r.ok_or_else(|| AnalysisError::new("array subscript must have type integer".into()))
     }
 
     /// `transformAExpr*`.
@@ -492,22 +561,21 @@ impl<'a> Analyzer<'a> {
                     Some(l) => Some(self.transform_expr_recurse(l)?),
                     None => None,
                 };
-                let r = self
-                    .transform_expr_recurse(rexpr.ok_or_else(|| {
-                        AnalysisError("an operator without its argument".into())
-                    })?)?;
+                let r = self.transform_expr_recurse(rexpr.ok_or_else(|| {
+                    AnalysisError::new("an operator without its argument".into())
+                })?)?;
                 self.make_op(&name, l, r, a.location)
             }
             K::AexprOpAny | K::AexprOpAll => {
                 let l = self.transform_expr_recurse(
                     a.lexpr
                         .as_deref()
-                        .ok_or_else(|| AnalysisError("ANY without its left side".into()))?,
+                        .ok_or_else(|| AnalysisError::new("ANY without its left side".into()))?,
                 )?;
                 let r = self.transform_expr_recurse(
                     a.rexpr
                         .as_deref()
-                        .ok_or_else(|| AnalysisError("ANY without its array".into()))?,
+                        .ok_or_else(|| AnalysisError::new("ANY without its array".into()))?,
                 )?;
                 self.make_scalar_array_op(&name, kind == K::AexprOpAny, l, r, a.location)
             }
@@ -516,12 +584,12 @@ impl<'a> Analyzer<'a> {
                 let l = self.transform_expr_recurse(
                     a.lexpr
                         .as_deref()
-                        .ok_or_else(|| AnalysisError("NULLIF".into()))?,
+                        .ok_or_else(|| AnalysisError::new("NULLIF".into()))?,
                 )?;
                 let r = self.transform_expr_recurse(
                     a.rexpr
                         .as_deref()
-                        .ok_or_else(|| AnalysisError("NULLIF".into()))?,
+                        .ok_or_else(|| AnalysisError::new("NULLIF".into()))?,
                 )?;
                 let op = self.make_op(&name, Some(l), r, a.location)?;
                 let Node::OpExpr(mut o) = op else {
@@ -558,15 +626,21 @@ impl<'a> Analyzer<'a> {
             })))
         };
         if is_null_const(rexpr) {
-            return nulltest(self, lexpr.ok_or_else(|| AnalysisError("DISTINCT".into()))?);
+            return nulltest(
+                self,
+                lexpr.ok_or_else(|| AnalysisError::new("DISTINCT".into()))?,
+            );
         }
         if is_null_const(lexpr) {
-            return nulltest(self, rexpr.ok_or_else(|| AnalysisError("DISTINCT".into()))?);
+            return nulltest(
+                self,
+                rexpr.ok_or_else(|| AnalysisError::new("DISTINCT".into()))?,
+            );
         }
-        let l =
-            self.transform_expr_recurse(lexpr.ok_or_else(|| AnalysisError("DISTINCT".into()))?)?;
-        let r =
-            self.transform_expr_recurse(rexpr.ok_or_else(|| AnalysisError("DISTINCT".into()))?)?;
+        let l = self
+            .transform_expr_recurse(lexpr.ok_or_else(|| AnalysisError::new("DISTINCT".into()))?)?;
+        let r = self
+            .transform_expr_recurse(rexpr.ok_or_else(|| AnalysisError::new("DISTINCT".into()))?)?;
         let result = match (l, r) {
             (Node::RowExpr(lr), Node::RowExpr(rr)) => {
                 let mut result: Option<Node> = None;
@@ -620,7 +694,7 @@ impl<'a> Analyzer<'a> {
         let lexpr = self.transform_expr_recurse(
             a.lexpr
                 .as_deref()
-                .ok_or_else(|| AnalysisError("IN without its left side".into()))?,
+                .ok_or_else(|| AnalysisError::new("IN without its left side".into()))?,
         )?;
         let items: Vec<pb::Node> = match a.rexpr.as_deref().and_then(|r| r.node.as_ref()) {
             Some(N::List(l)) => l.items.clone(),
@@ -691,7 +765,7 @@ impl<'a> Analyzer<'a> {
                 })),
             });
         }
-        result.ok_or_else(|| AnalysisError("an empty IN list".into()))
+        result.ok_or_else(|| AnalysisError::new("an empty IN list".into()))
     }
 
     /// `transformAExprBetween`: rebuilt as the comparisons it stands for,
@@ -701,14 +775,14 @@ impl<'a> Analyzer<'a> {
         let aexpr = a
             .lexpr
             .as_deref()
-            .ok_or_else(|| AnalysisError("BETWEEN".into()))?
+            .ok_or_else(|| AnalysisError::new("BETWEEN".into()))?
             .clone();
         let args: Vec<pb::Node> = match a.rexpr.as_deref().and_then(|r| r.node.as_ref()) {
             Some(N::List(l)) => l.items.clone(),
             _ => return unsupported("BETWEEN's bounds"),
         };
         let [bexpr, cexpr] = <[pb::Node; 2]>::try_from(args)
-            .map_err(|_| AnalysisError("BETWEEN's two bounds".into()))?;
+            .map_err(|_| AnalysisError::new("BETWEEN's two bounds".into()))?;
         let op = |name: &str, l: &pb::Node, r: &pb::Node| pb::Node {
             node: Some(N::AExpr(Box::new(pb::AExpr {
                 kind: K::AexprOp as i32,
@@ -823,12 +897,14 @@ impl<'a> Analyzer<'a> {
                 let n = sb
                     .node
                     .as_deref()
-                    .ok_or_else(|| AnalysisError("an ordering".into()))?;
+                    .ok_or_else(|| AnalysisError::new("an ordering".into()))?;
                 targs.push(self.transform_expr(n, ExprKind::OrderBy)?);
             }
         }
         self.parse_func_or_column(&names, targs, Some(f), f.location)?
-            .ok_or_else(|| AnalysisError(format!("function {} does not exist", names.join("."))))
+            .ok_or_else(|| {
+                AnalysisError::new(format!("function {} does not exist", names.join(".")))
+            })
     }
 
     /// `transformSQLValueFunction` (op is PostgreSQL 15's `SQLValueFunctionOp`).
@@ -871,7 +947,7 @@ impl<'a> Analyzer<'a> {
         let sub = s
             .subselect
             .as_deref()
-            .ok_or_else(|| AnalysisError("a sublink".into()))?;
+            .ok_or_else(|| AnalysisError::new("a sublink".into()))?;
         let q = self.sub_analyze(sub, false, true)?;
         if q.command_type != CMD_SELECT {
             return unsupported("a non-SELECT sublink");
@@ -883,6 +959,7 @@ impl<'a> Analyzer<'a> {
             Ok(pb::SubLinkType::RowcompareSublink) => SubLinkType::RowCompare,
             Ok(pb::SubLinkType::ExprSublink) => SubLinkType::Expr,
             Ok(pb::SubLinkType::ArraySublink) => SubLinkType::Array,
+            Ok(pb::SubLinkType::MultiexprSublink) => SubLinkType::MultiExpr,
             _ => return unsupported("this sublink"),
         };
         let mut link = SubLink {
@@ -894,7 +971,7 @@ impl<'a> Analyzer<'a> {
             location: s.location,
         };
         match kind {
-            SubLinkType::Exists => {}
+            SubLinkType::Exists | SubLinkType::MultiExpr => {}
             SubLinkType::Expr | SubLinkType::Array => {
                 if link
                     .subselect
@@ -904,7 +981,7 @@ impl<'a> Analyzer<'a> {
                     .count()
                     != 1
                 {
-                    return unsupported("subquery must return only one column");
+                    return pg_error("42601", "subquery must return only one column");
                 }
             }
             _ => {
@@ -915,7 +992,7 @@ impl<'a> Analyzer<'a> {
                 let test = s
                     .testexpr
                     .as_deref()
-                    .ok_or_else(|| AnalysisError("a sublink test".into()))?;
+                    .ok_or_else(|| AnalysisError::new("a sublink test".into()))?;
                 let lefthand = self.transform_expr_recurse(test)?;
                 let left_list = match lefthand {
                     Node::RowExpr(r) => r.args,
@@ -936,10 +1013,10 @@ impl<'a> Analyzer<'a> {
                     }));
                 }
                 if left_list.len() < right_list.len() {
-                    return unsupported("subquery has too many columns");
+                    return pg_error("42601", "subquery has too many columns");
                 }
                 if left_list.len() > right_list.len() {
-                    return unsupported("subquery has too few columns");
+                    return pg_error("42601", "subquery has too few columns");
                 }
                 link.testexpr =
                     Some(self.make_row_comparison_op(&oper, left_list, right_list, s.location)?);
@@ -1009,7 +1086,7 @@ impl<'a> Analyzer<'a> {
                     CoercionForm::ExplicitCast,
                     -1,
                 )?
-                .ok_or_else(|| AnalysisError("cannot cast an array element".into()))?
+                .ok_or_else(|| AnalysisError::new("cannot cast an array element".into()))?
             } else {
                 self.coerce_to_common_type(e, coerce_type, "ARRAY")?
             };
@@ -1067,7 +1144,7 @@ impl<'a> Analyzer<'a> {
             let warg = w
                 .expr
                 .as_deref()
-                .ok_or_else(|| AnalysisError("a WHEN".into()))?;
+                .ok_or_else(|| AnalysisError::new("a WHEN".into()))?;
             let expr = match &placeholder {
                 Some(p) => {
                     let r = self.transform_expr_recurse(warg)?;
@@ -1084,7 +1161,7 @@ impl<'a> Analyzer<'a> {
             let result = self.transform_expr_recurse(
                 w.result
                     .as_deref()
-                    .ok_or_else(|| AnalysisError("a THEN".into()))?,
+                    .ok_or_else(|| AnalysisError::new("a THEN".into()))?,
             )?;
             whens.push(CaseWhen {
                 expr,
@@ -1169,12 +1246,12 @@ impl<'a> Analyzer<'a> {
         let tn = tc
             .type_name
             .as_ref()
-            .ok_or_else(|| AnalysisError("a cast without a type".into()))?;
+            .ok_or_else(|| AnalysisError::new("a cast without a type".into()))?;
         let (target, typmod) = self.typename_type_id_and_mod(tn)?;
         let arg = tc
             .arg
             .as_deref()
-            .ok_or_else(|| AnalysisError("a cast without an argument".into()))?;
+            .ok_or_else(|| AnalysisError::new("a cast without an argument".into()))?;
         let expr = if let Some(N::AArrayExpr(ae)) = arg.node.as_ref() {
             let mut basemod = typmod;
             let base = self.cat.base_type_and_typmod(target, &mut basemod);
@@ -1205,7 +1282,7 @@ impl<'a> Analyzer<'a> {
             CoercionForm::ExplicitCast,
             location,
         )?
-        .ok_or_else(|| AnalysisError("cannot cast".into()))
+        .ok_or_else(|| AnalysisError::new("cannot cast".into()))
     }
 
     /// `transformCollateClause`.
@@ -1213,7 +1290,7 @@ impl<'a> Analyzer<'a> {
         let arg = self.transform_expr_recurse(
             c.arg
                 .as_deref()
-                .ok_or_else(|| AnalysisError("COLLATE".into()))?,
+                .ok_or_else(|| AnalysisError::new("COLLATE".into()))?,
         )?;
         let t = expr_type(self.cat, &arg);
         if !self.cat.type_is_collatable(t) && t != UNKNOWNOID {
@@ -1241,7 +1318,7 @@ impl<'a> Analyzer<'a> {
             let nspoid = self
                 .cat
                 .namespace_oid(&s)
-                .ok_or_else(|| AnalysisError(format!("schema \"{s}\" does not exist")))?;
+                .ok_or_else(|| AnalysisError::new(format!("schema \"{s}\" does not exist")))?;
             return self
                 .cat
                 .data
@@ -1250,7 +1327,7 @@ impl<'a> Analyzer<'a> {
                 .filter(|c| c.nsp == nspoid && matches(c))
                 .min_by_key(|c| if c.encoding == enc { 0 } else { 1 })
                 .map(|c| c.oid)
-                .ok_or_else(|| AnalysisError(format!("collation \"{name}\" does not exist")));
+                .ok_or_else(|| AnalysisError::new(format!("collation \"{name}\" does not exist")));
         }
         for n in &self.path {
             if let Some(c) = self
@@ -1331,7 +1408,7 @@ impl<'a> Analyzer<'a> {
                 .iter()
                 .find(|(_, s)| *s == rctype)
                 .map(|(f, _)| *f)
-                .ok_or_else(|| AnalysisError("row comparison operator".into()))?;
+                .ok_or_else(|| AnalysisError::new("row comparison operator".into()))?;
             opfamilies.push(f);
         }
         let mut opnos = Vec::new();

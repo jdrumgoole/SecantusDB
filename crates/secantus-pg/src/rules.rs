@@ -61,7 +61,7 @@ fn rule_of(d: &Document) -> (Rule, bool, i64) {
 }
 
 impl PgHandler {
-    fn rule_docs(&self) -> Vec<Document> {
+    pub(crate) fn rule_docs(&self) -> Vec<Document> {
         self.type_catalog_docs(RULE_COLLECTION)
             .map(|d| d.to_vec())
             .unwrap_or_default()
@@ -81,6 +81,17 @@ impl PgHandler {
 
     pub(crate) fn create_rule(&self, rule: Rule, replace: bool) -> PgWireResult<Vec<Response>> {
         let is_view = self.views()?.iter().any(|(n, _)| *n == rule.table);
+        // transformRuleStmt and DefineQueryRewrite's checks come before the
+        // rule's name is looked up (RP-282).
+        let relid = if is_view {
+            Some(self.view_relid(&rule.table))
+        } else {
+            self.relation_oid(&rule.table)
+        };
+        if let Some(r) = relid {
+            let bare = rule.table.rsplit('.').next().unwrap_or(&rule.table);
+            self.statement_rule_refusal('r', bare, &rule.name, r)?;
+        }
         if rule.event == "SELECT" && !is_view {
             return self.convert_table_to_view(&rule);
         }
@@ -126,9 +137,11 @@ impl PgHandler {
             .next()
             .unwrap_or(&rule.table)
             .to_string();
-        if let Some((qual, action)) =
-            relid.and_then(|r| self.statement_rule_trees('r', &bare, &rule.name, r))
-        {
+        let trees = match relid {
+            Some(r) => self.statement_rule_trees('r', &bare, &rule.name, r)?,
+            None => None,
+        };
+        if let Some((qual, action)) = trees {
             doc.insert("ev_qual", qual);
             doc.insert("ev_action", action);
         }
@@ -243,11 +256,37 @@ impl PgHandler {
                 None,
             ));
         }
+        // The relation keeps its oid and row type (DefineQueryRewrite
+        // changes its relkind in place), and its rule's trees are the ON
+        // SELECT rule's, analysed against the table (RP-203).
+        let relid = self.relation_oid(table);
+        let reltype = relid.and_then(|r| {
+            let (_, rows) = self
+                .internal_query(&format!(
+                    "select reltype::int8 from pg_class where oid = {r}"
+                ))
+                .ok()?;
+            rows.first()
+                .and_then(|row| row.first().cloned().flatten())
+                .and_then(|v| crate::bson_i64(&v))
+        });
+        let bare = table.rsplit('.').next().unwrap_or(table).to_string();
+        let trees = match relid {
+            Some(r) => self.statement_rule_trees('r', &bare, &rule.name, r)?,
+            None => None,
+        };
         self.execute(self.plan_internal(&format!("DROP TABLE {quoted}"))?, 0)?;
-        self.execute(
-            self.plan_internal(&format!("CREATE VIEW {quoted} AS {select}"))?,
-            0,
-        )?;
+        // The internal CREATE VIEW is its own source while it runs.
+        let create = format!("CREATE VIEW {quoted} AS {select}");
+        let outer = self.enter_statement_source(&create);
+        let made = self
+            .plan_internal(&create)
+            .and_then(|stmt| self.execute(stmt, 0));
+        self.restore_statement_source(outer);
+        made?;
+        if let (Some(relid), Some(reltype)) = (relid, reltype) {
+            self.keep_converted_view(table, relid, reltype, trees)?;
+        }
         Ok(vec![Response::Execution(Tag::new("CREATE RULE"))])
     }
 

@@ -633,14 +633,17 @@ pub struct SetOperationStmt {
     pub group_clauses: Vec<SortGroupClause>,
 }
 
-/// `OnConflictExpr` of an `ON CONFLICT DO NOTHING` (DO UPDATE's set list
-/// and EXCLUDED entry are not transcribed).
+/// `OnConflictExpr`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OnConflictExpr {
     pub action: i32,
     pub arbiter_elems: Vec<InferenceElem>,
     pub arbiter_where: Option<Node>,
     pub constraint: Oid,
+    pub on_conflict_set: Vec<TargetEntry>,
+    pub on_conflict_where: Option<Node>,
+    pub excl_rel_index: i32,
+    pub excl_rel_tlist: Vec<TargetEntry>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -648,6 +651,30 @@ pub struct InferenceElem {
     pub expr: Node,
     pub infercollid: Oid,
     pub inferopclass: Oid,
+}
+
+/// `CTESearchClause`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CteSearchClause {
+    pub search_col_list: Vec<String>,
+    pub search_breadth_first: bool,
+    pub search_seq_column: String,
+    pub location: i32,
+}
+
+/// `CTECycleClause`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CteCycleClause {
+    pub cycle_col_list: Vec<String>,
+    pub cycle_mark_column: String,
+    pub cycle_mark_value: Node,
+    pub cycle_mark_default: Node,
+    pub cycle_path_column: String,
+    pub location: i32,
+    pub cycle_mark_type: Oid,
+    pub cycle_mark_typmod: i32,
+    pub cycle_mark_collation: Oid,
+    pub cycle_mark_neop: Oid,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -663,6 +690,8 @@ pub struct CommonTableExpr {
     pub ctecoltypes: Vec<Oid>,
     pub ctecoltypmods: Vec<i32>,
     pub ctecolcollations: Vec<Oid>,
+    pub search_clause: Option<CteSearchClause>,
+    pub cycle_clause: Option<CteCycleClause>,
     /// Whether `ctequery` holds the analysed query yet (PostgreSQL tells by
     /// the node's tag); a reference before then is a recursive
     /// self-reference. Not part of the printed node.

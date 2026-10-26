@@ -18,7 +18,7 @@ impl<'a> Analyzer<'a> {
                 let nsp = self
                     .cat
                     .namespace_oid(s)
-                    .ok_or_else(|| AnalysisError(format!("schema \"{s}\" does not exist")))?;
+                    .ok_or_else(|| AnalysisError::new(format!("schema \"{s}\" does not exist")))?;
                 self.cat
                     .types_named(name)
                     .find(|t| t.nsp == nsp)
@@ -31,7 +31,7 @@ impl<'a> Analyzer<'a> {
                     .map(|t| t.oid)
             }),
         };
-        let t = t.ok_or_else(|| AnalysisError(format!("type \"{name}\" does not exist")))?;
+        let t = t.ok_or_else(|| AnalysisError::new(format!("type \"{name}\" does not exist")))?;
         Ok(if array { self.cat.array_type(t) } else { t })
     }
 
@@ -52,7 +52,7 @@ impl<'a> Analyzer<'a> {
         let row = self
             .cat
             .type_row(t)
-            .ok_or_else(|| AnalysisError(format!("type {t} does not exist")))?;
+            .ok_or_else(|| AnalysisError::new(format!("type {t} does not exist")))?;
         if !row.isdefined {
             return unsupported("a shell type");
         }
@@ -88,7 +88,7 @@ impl<'a> Analyzer<'a> {
 
 fn int_arg(s: &str) -> R<i32> {
     s.parse::<i32>()
-        .map_err(|_| AnalysisError("invalid type modifier".into()))
+        .map_err(|_| AnalysisError::new("invalid type modifier".into()))
 }
 
 /// The built-in `typmodin` functions.
