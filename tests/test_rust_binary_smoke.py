@@ -147,9 +147,14 @@ def daemon(tmp_path: pathlib.Path) -> subprocess.Popen[str]:
 
 def _bound_address(proc: subprocess.Popen[str]) -> tuple[str, int]:
     assert proc.stdout is not None
-    line = proc.stdout.readline()
-    m = _BANNER.search(line)
-    assert m, f"no listening banner in first stdout line: {line!r}"
+    # A store that recovers says what it replayed before it listens.
+    line, m = "", None
+    for _ in range(20):
+        line = proc.stdout.readline()
+        m = _BANNER.search(line)
+        if m or not line:
+            break
+    assert m, f"no listening banner in the first stdout lines: {line!r}"
     return m.group(1), int(m.group(2))
 
 

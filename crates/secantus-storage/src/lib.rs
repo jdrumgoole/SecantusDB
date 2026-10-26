@@ -6107,6 +6107,23 @@ fn u64_ts(t: u64) -> bson::Timestamp {
     }
 }
 
+/// Whether an existing store's data tables were created without logging, as
+/// WiredTiger's metadata records the catalog table's file; `None` for a
+/// store that has none yet.
+fn stored_data_logging(session: &Session) -> Result<Option<bool>> {
+    let cur = session.open_cursor("metadata:", None)?;
+    let file = COLL_TABLE.replacen("table:", "file:", 1) + ".wt";
+    cur.set_key_s(&file);
+    match cur.search() {
+        Ok(()) => {
+            let config = cur.get_value_s()?;
+            Ok(Some(config.contains("log=(enabled=false)")))
+        }
+        Err(e) if e.is_not_found() => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Read the Phase-A' stable-checkpoint marker row: `(stable_seq,
 /// data_nonlogged)`, or `None` for a store that has never written one. The
 /// row lives in the (always WAL-logged) oplog-meta table under its own key so
@@ -6709,6 +6726,14 @@ impl Storage {
             .unwrap_or_else(|| std::env::var_os("SECANTUS_OPLOG_ASYNC").is_some());
         let in_memory = config.contains("in_memory=true");
         let conn = Arc::new(Connection::open(home, config)?);
+        // An existing store's mode is the one its tables were created with,
+        // read from WiredTiger's own metadata before anything is created: a
+        // logged store records no mode of its own, and neither does a
+        // non-logged one before its first checkpoint.
+        let stored_mode = {
+            let session = conn.open_session()?;
+            stored_data_logging(&session)?
+        };
         let mut state = {
             let boot = conn.open_session()?;
             for (name, fmt) in BOOTSTRAP {
@@ -6790,10 +6815,7 @@ impl Storage {
         let data_nonlogged = if in_memory {
             false
         } else {
-            match marker {
-                Some((_, mode)) => mode,
-                None => data_create_mode,
-            }
+            stored_mode.unwrap_or(data_create_mode)
         };
         let stable_seq = Arc::new(AtomicI64::new(marker.map(|(s, _)| s).unwrap_or(0)));
         let checkpoint_requested = Arc::new(AtomicBool::new(false));

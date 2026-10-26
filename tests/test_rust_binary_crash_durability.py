@@ -68,8 +68,13 @@ class _Server:
             text=True,
         )
         assert self.proc.stdout is not None
-        line = self.proc.stdout.readline()
-        m = _BANNER.search(line)
+        # A store that recovers says what it replayed before it listens.
+        line, m = "", None
+        for _ in range(20):
+            line = self.proc.stdout.readline()
+            m = _BANNER.search(line)
+            if m or not line:
+                break
         assert m, f"secantusd-rs did not start: {line!r}"
         # Keep draining: an unread pipe fills at 64 KiB and blocks the server.
         out = self.proc.stdout

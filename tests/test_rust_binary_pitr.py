@@ -254,6 +254,10 @@ def test_rust_binary_v2_archive_base_snapshot_and_restore(tmp_path: pathlib.Path
             str(tmp_path / "data"),
             "--oplog-archive-dir",
             str(archive),
+            # The restore and the reads below are the Python server's, which
+            # writes without timestamps: a store whose data tables are not
+            # logged (secantusd-rs's default since RM-210) refuses that.
+            "--data-logged",
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

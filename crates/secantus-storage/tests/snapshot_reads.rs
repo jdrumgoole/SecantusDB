@@ -164,3 +164,31 @@ fn a_logged_store_keeps_no_history() {
     assert!(!st.is_timestamped());
     assert!(st.read_at(st.all_committed_ts(), || ()).is_err());
 }
+
+#[test]
+fn an_existing_store_keeps_the_logging_it_was_created_with() {
+    // A logged store records no mode of its own: what its tables were
+    // created with decides, whatever the opener asks for.
+    let home = temp_home();
+    {
+        let st = open(&home, false);
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "n": 0}))
+            .unwrap();
+        st.close().unwrap();
+    }
+    let st = open(&home, true);
+    assert!(!st.is_timestamped());
+    assert_eq!(rows(&st), vec![(1, 0)]);
+    drop(st);
+    // And a store created without logging stays so.
+    let home = temp_home();
+    {
+        let st = open(&home, true);
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "n": 0}))
+            .unwrap();
+        st.close().unwrap();
+    }
+    let st = open(&home, false);
+    assert!(st.is_timestamped());
+    assert_eq!(rows(&st), vec![(1, 0)]);
+}
