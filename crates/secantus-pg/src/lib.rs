@@ -9426,11 +9426,20 @@ impl PgHandler {
         right_keys: &[String],
     ) -> PgWireResult<Vec<Document>> {
         let mut out = Vec::new();
+        // The statement's own parameters are the same for every left row,
+        // and one may be large (an uncorrelated subquery's rows, resolved
+        // while planning): only those the item's SQL reads are bound, and
+        // the memo is keyed by the left row's values alone (RP-131).
+        let base = lateral_base_params(sql, params);
         for l in lrows {
-            let mut bound = params.to_vec();
-            bound.extend(keys.iter().map(|k| l.get(k).cloned().unwrap_or(Bson::Null)));
-            let memo = format!("{bound:?}");
+            let vals: Vec<Bson> = keys
+                .iter()
+                .map(|k| l.get(k).cloned().unwrap_or(Bson::Null))
+                .collect();
+            let memo = format!("{vals:?}");
             if !cache.contains_key(&memo) {
+                let mut bound = base.clone();
+                bound.extend(vals);
                 let rows = self.run_sql_rows(sql, &bound)?;
                 let docs = rows
                     .into_iter()
@@ -22570,6 +22579,9 @@ impl PgHandler {
             _ => self.catalog_object_rows(name, &def).unwrap_or_default(),
         };
         self.fill_catalog_columns(name, &def, &mut rows);
+        if name == "pg_type" {
+            crate::pg_type_facts::apply_identity(&def, &mut rows);
+        }
         self.schema_qualify_rows(&def, &mut rows);
         // PostgreSQL's own functions, types and catalog constraints, as a
         // fresh 15.19 database lists them, ahead of what this server's users
@@ -43513,6 +43525,38 @@ fn apply_column_defaults(def: &TableDef, rows: &mut [Document]) -> PgWireResult<
 /// companion, or the stored value itself. `None` is SQL NULL. The same three
 /// cases the row encoder (`project_rows`) walks, as a value rather than as
 /// wire bytes.
+/// The statement's parameters as a LATERAL item's SQL is bound with them:
+/// each `$n` its text mentions keeps its value, the rest are NULL. The text
+/// is scanned rather than parsed, so a `$1` inside a literal keeps one too;
+/// a reference is never missed.
+fn lateral_base_params(sql: &str, params: &[Bson]) -> Vec<Bson> {
+    let mut used = vec![false; params.len()];
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if let Ok(n) = sql[start..j].parse::<usize>() {
+                if (1..=params.len()).contains(&n) {
+                    used[n - 1] = true;
+                }
+            }
+            i = j.max(start);
+        } else {
+            i += 1;
+        }
+    }
+    params
+        .iter()
+        .zip(used)
+        .map(|(p, u)| if u { p.clone() } else { Bson::Null })
+        .collect()
+}
+
 fn resolve_cell(
     doc: &Document,
     field: &str,

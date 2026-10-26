@@ -3118,7 +3118,37 @@ pub enum ColumnExpr {
         /// Each field's `char(n)` width, when it has one: the value is
         /// padded to it before evaluation.
         widths: Vec<Option<usize>>,
+        /// The evaluator's argument list kept between rows: `params` copied
+        /// in once, the fields overwritten per row.
+        scratch: RowScratch,
     },
+}
+
+/// `params ++ fields` as `apply_row_expr` last built it for one row
+/// expression. A statement's parameter can be large (an uncorrelated
+/// subquery's rows, resolved while planning, which an `IN` reads), and
+/// copying it for every row was most of an `information_schema` view's time
+/// (RP-131). Not part of the expression: a clone starts empty, and every
+/// two compare equal.
+#[derive(Default)]
+pub struct RowScratch(std::sync::Mutex<Vec<Bson>>);
+
+impl Clone for RowScratch {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for RowScratch {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for RowScratch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RowScratch")
+    }
 }
 
 /// One column of a FROM-less SELECT.
@@ -15451,6 +15481,8 @@ fn row_column_expr(
 ) -> Result<ColumnExpr> {
     let mut expr = node.clone();
     rewrite_column_refs(&mut expr, fields, params.len())?;
+    let pruned = prune_row_fields(&mut expr, fields, params.len());
+    let fields: &[RowField] = pruned.as_deref().unwrap_or(fields);
     let widths = ROW_WIDTHS.with(|w| {
         let w = w.borrow();
         fields
@@ -15467,9 +15499,10 @@ fn row_column_expr(
     let mut out = ColumnExpr::Row {
         expr: Box::new(expr.clone()),
         fields: fields.to_vec(),
-        params: params.to_vec(),
+        params: params_read_by(&expr, params),
         result_type: String::new(),
         widths,
+        scratch: RowScratch::default(),
     };
     // A sample row's value types what the node alone cannot (a scalar call's
     // result); an expression that fails on the sample still gets the node's
@@ -15532,6 +15565,87 @@ fn row_column_expr(
         *t = result_type;
     }
     Ok(out)
+}
+
+/// The row fields an expression reads, its `$n` renumbered to match, when
+/// every reference to the row is a parameter: each evaluation copies its
+/// fields, and over a wide join that copy of columns the expression never
+/// reads was most of the time an `information_schema` view took (RP-131).
+/// `None` (keep them all) when a subquery or an unresolved column could
+/// read the row some other way.
+fn prune_row_fields(
+    expr: &mut pg_query::protobuf::Node,
+    fields: &[RowField],
+    n_params: usize,
+) -> Option<Vec<RowField>> {
+    let mut used = std::collections::BTreeSet::new();
+    let mut opaque = false;
+    let _ = walk_expr(expr, &mut |n| {
+        match n.node.as_ref() {
+            Some(N::SubLink(_)) | Some(N::ColumnRef(_)) => opaque = true,
+            Some(N::ParamRef(p)) if p.number as usize > n_params => {
+                used.insert(p.number as usize - n_params - 1);
+            }
+            _ => {}
+        }
+        Ok(())
+    });
+    if opaque || used.len() == fields.len() || used.iter().any(|&i| i >= fields.len()) {
+        return None;
+    }
+    let renumber: std::collections::HashMap<usize, usize> = used
+        .iter()
+        .enumerate()
+        .map(|(new, &old)| (old, new))
+        .collect();
+    walk_expr(expr, &mut |n| {
+        if let Some(N::ParamRef(p)) = n.node.as_mut() {
+            if p.number as usize > n_params {
+                let old = p.number as usize - n_params - 1;
+                p.number = (n_params + 1 + renumber[&old]) as i32;
+            }
+        }
+        Ok(())
+    })
+    .ok()?;
+    Some(used.iter().map(|&i| fields[i].clone()).collect())
+}
+
+/// The statement's parameters as a row expression keeps them: NULL in place
+/// of each one it never reads. Every evaluation copies them, and one can be
+/// large -- an uncorrelated subquery's rows, resolved while planning -- so a
+/// row's every column copied them all (RP-131). All are kept when a
+/// subquery or an unresolved column could read one some other way.
+fn params_read_by(expr: &pg_query::protobuf::Node, params: &[Bson]) -> Vec<Bson> {
+    if params.is_empty() {
+        return Vec::new();
+    }
+    let mut used = vec![false; params.len()];
+    let mut opaque = false;
+    let mut node = expr.clone();
+    let _ = walk_expr(&mut node, &mut |n| {
+        match n.node.as_ref() {
+            Some(N::SubLink(_)) | Some(N::ColumnRef(_)) => opaque = true,
+            Some(N::ParamRef(p)) => {
+                if let Some(u) = (p.number as usize)
+                    .checked_sub(1)
+                    .and_then(|i| used.get_mut(i))
+                {
+                    *u = true;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    });
+    if opaque {
+        return params.to_vec();
+    }
+    params
+        .iter()
+        .zip(used)
+        .map(|(p, u)| if u { p.clone() } else { Bson::Null })
+        .collect()
 }
 
 /// Replace each `ColumnRef` under `node` with `ParamRef(n_params + 1 + i)`
@@ -15743,26 +15857,53 @@ pub fn apply_row_expr(expr: &ColumnExpr, row: &Document) -> Result<Bson> {
         fields,
         params,
         widths,
+        scratch,
         ..
     } = expr
     else {
         return Err(Error::Unsupported("not a row expression".into()));
     };
-    let mut all = params.clone();
-    all.extend(fields.iter().enumerate().map(|(i, (_, f, _))| {
+    let field_values = fields.iter().enumerate().map(|(i, (_, f, _))| {
         let v = row.get(f).cloned().unwrap_or(Bson::Null);
         // A stored timestamp keeps its sub-millisecond digits in a hidden
         // companion; an expression over the column must see them too.
-        let v = match (&v, row.get(companion_field(f))) {
-            (Bson::DateTime(_), Some(Bson::Int32(us))) if *us != 0 => {
-                Bson::Document(doc! { COMPOSITE_DATE: v.clone(), COMPOSITE_US: *us })
-            }
+        // Only a date has one, so only a date looks (the name is built).
+        let v = match &v {
+            Bson::DateTime(_) => match row.get(companion_field(f)) {
+                Some(Bson::Int32(us)) if *us != 0 => {
+                    Bson::Document(doc! { COMPOSITE_DATE: v.clone(), COMPOSITE_US: *us })
+                }
+                _ => v,
+            },
             _ => v,
         };
         pad_bpchar(v, widths.get(i).copied().flatten())
-    }));
+    });
     let previous = declare_row_fields(params.len(), fields);
-    let out = correlated::with_row_params_from(params.len(), || const_value(expr, &all));
+    let n = params.len();
+    let run = |all: &[Bson]| correlated::with_row_params_from(n, || const_value(expr, all));
+    // The statement's values are copied into the scratch list once; an
+    // evaluation of this expression inside its own (a recursive function)
+    // finds the list busy and builds its own.
+    let out = match scratch.0.try_lock() {
+        Ok(mut all) => {
+            if all.len() != n + fields.len() {
+                all.clear();
+                all.extend(params.iter().cloned());
+                all.extend(field_values);
+            } else {
+                for (slot, v) in all[n..].iter_mut().zip(field_values) {
+                    *slot = v;
+                }
+            }
+            run(&all)
+        }
+        Err(_) => {
+            let mut all = params.clone();
+            all.extend(field_values);
+            run(&all)
+        }
+    };
     PLAN_PARAM_TYPES.with(|t| *t.borrow_mut() = previous);
     out
 }
@@ -32688,7 +32829,7 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
     // A domain: the base type's cast, then the domain's constraints.
     if let Some(d) = domains::user_domain(target) {
         let v = cast_value(value, &d.base)?;
-        domains::domain_check(&d.name, &v)?;
+        domains::check_domain(&d, &v)?;
         return Ok(v);
     }
     let out = cast_value_inner(value, target)?;
@@ -34630,6 +34771,82 @@ fn static_hstore_operand(n: Option<&pg_query::protobuf::Node>, value: &Bson) -> 
     static_type(n, value) == "hstore" && extension_type("hstore") == Some(ExtensionType::Hstore)
 }
 
+/// A FROM subquery's output names as its text gives them -- each target's
+/// own `AS` name or bare column reference, the leftmost arm's for a set
+/// operation, renamed by the alias's column list -- or `None` when a name
+/// needs planning to know (a star, an expression without `AS`, VALUES).
+fn syntactic_output_names(
+    sub: &pg_query::protobuf::SelectStmt,
+    alias: Option<&pg_query::protobuf::Alias>,
+) -> Option<Vec<String>> {
+    fn arm(s: &pg_query::protobuf::SelectStmt) -> Option<Vec<String>> {
+        if let Some(l) = s.larg.as_deref() {
+            return arm(l);
+        }
+        if !s.values_lists.is_empty() {
+            return None;
+        }
+        s.target_list
+            .iter()
+            .map(|t| {
+                let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+                    return None;
+                };
+                if !rt.name.is_empty() {
+                    return Some(rt.name.clone());
+                }
+                match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+                    Some(N::ColumnRef(c)) => match c.fields.last().and_then(|f| f.node.as_ref()) {
+                        Some(N::String(sv)) => Some(sv.sval.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+    let mut names = arm(sub)?;
+    if let Some(a) = alias {
+        for (i, c) in a.colnames.iter().enumerate() {
+            match (c.node.as_ref(), names.get_mut(i)) {
+                (Some(N::String(sv)), Some(slot)) => slot.clone_from(&sv.sval),
+                _ => return None,
+            }
+        }
+    }
+    Some(names)
+}
+
+/// Whether a SELECT's clauses outside its FROM (and the subqueries inside
+/// them) name `alias` alone or as `alias.*`: the references
+/// `whole_row_rewrite` turns into the source's row or columns.
+fn names_alias(s: &pg_query::protobuf::SelectStmt, alias: &str) -> Result<bool> {
+    let mut clauses = pg_query::protobuf::SelectStmt {
+        target_list: s.target_list.clone(),
+        where_clause: s.where_clause.clone(),
+        group_clause: s.group_clause.clone(),
+        having_clause: s.having_clause.clone(),
+        sort_clause: s.sort_clause.clone(),
+        distinct_clause: s.distinct_clause.clone(),
+        window_clause: s.window_clause.clone(),
+        ..Default::default()
+    };
+    let mut found = false;
+    correlated::walk_select(&mut clauses, &mut |n| {
+        if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+            let first = matches!(
+                c.fields.first().and_then(|f| f.node.as_ref()),
+                Some(N::String(sv)) if sv.sval == alias
+            );
+            let star_or_alone = c.fields.len() == 1
+                || (c.fields.len() == 2 && matches!(c.fields[1].node.as_ref(), Some(N::AStar(_))));
+            found |= first && star_or_alone;
+        }
+        Ok(())
+    })?;
+    Ok(found)
+}
+
 /// Rewrite whole-row references over a single FROM item into `ROW(...)`
 /// of its columns, the field NAMES kept in the RowExpr's `colnames` (which
 /// is where PostgreSQL itself keeps them for a whole-row Var).
@@ -34678,6 +34895,19 @@ fn whole_row_rewrite(
             else {
                 return Ok(None);
             };
+            // Nothing to rewrite unless the statement names the alias as a
+            // whole row or the outputs share a name. Both can often be seen
+            // without planning the subquery, which nested FROM subqueries
+            // (the information_schema views) otherwise plan again at every
+            // level (RP-131).
+            if let Some(names) = syntactic_output_names(sub, rs.alias.as_ref()) {
+                let distinct: std::collections::HashSet<&String> = names.iter().collect();
+                if distinct.len() == names.len()
+                    && (names.contains(&alias) || !names_alias(s, &alias)?)
+                {
+                    return Ok(None);
+                }
+            }
             let stmt = plan_select(sub, lookup, params)?;
             let def = sub_plan_def(&stmt, lookup)?;
             let mut cols: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();

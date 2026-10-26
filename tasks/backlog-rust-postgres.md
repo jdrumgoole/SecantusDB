@@ -826,6 +826,38 @@ tests are scenarios in `tests/backlog/test_rp_batch30.py`, measured on a
 private 15.19 cluster. RP-133 .. RP-136 and RP-138 .. RP-142 were found and
 fixed in the same batch; their tests there are regression tests.
 
+## Found by the top-ten batch (2026-10-26)
+
+Found while speeding up the `information_schema` views (RP-131), by
+comparing `routines`, `parameters` and `element_types` with PostgreSQL 15.19
+row for row. The tests are in `tests/backlog/test_rp_catalog_identity.py`,
+measured with read-only queries on 15.19. Fixed in the same batch, their
+tests regression tests:
+- RP-270: 56 built-in `pg_type` rows differed from `initdb`'s: a
+  fixed-length subscriptable type's `typelem` (`name`, `int2vector`,
+  `oidvector`, `point`, `lseg`, `box`, `line`, `_record`), a range array's
+  `typtype`, `_box`'s `typdelim`, ten types' `typcollation`, and NULL
+  `typnotnull` / `typbasetype` / `typtypmod` on 26 pseudo-types. So
+  `information_schema` called `int2vector` a plain type, not `ARRAY`.
+- RP-271: `format_type(18, NULL)` was `character` (`"char"` is meant), and a
+  modifier on a type with no `typmodout` was dropped (`format_type(25, 7)`
+  is `text(7)`).
+
+- [ ] **The built-in relations' `pg_attribute` rows differ from
+      PostgreSQL 15.19's.** Over `attrelid < 16384`: the 648 system-column
+      rows (`attnum < 0`: `ctid`, `xmin` ... of every catalog with storage)
+      are missing; 684 `information_schema` view columns name their domain's
+      base type in `atttypid` where PostgreSQL names the domain
+      (`sql_identifier`, `cardinal_number` ...); 282 `attcollation`s are
+      the default collation or none where a catalog's collatable column is
+      `C` (950); 59 array columns have `attndims` 0, not 1; and 40
+      `attstorage`s differ (a TOAST table's `chunk_data` is `p`). So
+      `element_types` lists the catalogs' text arrays without their
+      collation. Changing `atttypid` is the delicate part: what a client is
+      told a view column's type is follows it.
+      Backlog-ID: RP-272
+      Verify: tests/backlog/test_rp_catalog_identity.py::test_builtin_relations_attributes
+
 ## Found by batch 78 (2026-10-25)
 
 Found while working RP-255, which planning folded a function call around,
@@ -1172,15 +1204,33 @@ cluster.
 Found while measuring `pg_depend` (RP-105) against PostgreSQL 15.19. The gap
 tests are scenarios in `tests/backlog/test_rp_batch26.py`.
 
-- [ ] **The `information_schema` views over every built-in function take
-      seconds** (release build, a fresh database): `routines` 3.6 s,
-      `parameters` 2.5 s, `data_type_privileges` 6.4 s, `element_types` 52 s,
-      where PostgreSQL 15.19 takes 2-47 ms. They answer PostgreSQL's rows
-      since RP-102 listed the 3,244 built-ins. The cost is mostly a LATERAL
-      FROM function (`_pg_expandarray` becomes `unnest(...) WITH
-      ORDINALITY`) re-planned and run as SQL once per left row
-      (`PgHandler::lateral_rows`), and per-row expression evaluation over
-      the joins. Under `LIMIT 0` they ran whole too, until batch 83: on CI's
+- [ ] **OPEN — the `information_schema` views over every built-in function
+      take a second or more** (optimised build without LTO, a fresh
+      database, `count(*)`): `routines` 1.05 s, `parameters` 1.15 s,
+      `data_type_privileges` 2.3 s, `element_types` 15.8 s, where PostgreSQL
+      15.19 takes 10-50 ms. They answer PostgreSQL's rows since RP-102 listed
+      the 3,244 built-ins. The same build took 3.1, 2.2, 5.6 and 62 s before
+      the top-ten batch (2026-10-26), which removed: a domain CHECK parsed
+      again per value; a timestamp companion name built for every field of
+      every row; a row expression copying every column of its source and
+      the statement's parameters -- among them an uncorrelated subquery's
+      rows, resolved while planning -- on every evaluation; the same
+      parameters Debug-printed as a LATERAL item's memo key per left row;
+      and a FROM subquery planned again only to learn its column names
+      (`whole_row_rewrite`) at every level of nesting. What is left:
+      - the evaluator analyses each expression again for every row:
+        `const_value` resolves a cast's target (`type_name_of`,
+        `declared_typmod`, `user_defined_base_source`), `static_type` and
+        the user-cast and composite lookups per value, which PostgreSQL
+        does once at parse analysis. Hoisting that to plan time is the
+        structural fix;
+      - `element_types`' `(a, b, c, d) IN (SELECT ... FROM
+        data_type_privileges)` is an OR over the subquery's 11,734 rows of
+        parameterised equalities (`row_subquery_comparison`), where
+        PostgreSQL runs a hashed SubPlan; and the subquery runs while the
+        statement is planned (2.3 s of its 15.8);
+      - planning `element_types` still takes about 4 s besides that.
+      Under `LIMIT 0` they ran whole too, until batch 83: on CI's
       debug build `test_rp_found_2026_10_20.py::test_catalog_relations_are_queryable`
       passed the 600 s per-test timeout, which ended the xdist worker.
       Backlog-ID: RP-131
