@@ -1542,7 +1542,7 @@ fn filter_kind(n: &pg_query::protobuf::Node) -> FilterKind {
     match n.node.as_ref() {
         Some(N::BoolExpr(b)) if b.boolop == BoolExprType::OrExpr as i32 => {
             let arms: Vec<FilterKind> = b.args.iter().map(filter_kind).collect();
-            if arms.iter().any(|a| *a == FilterKind::Other) {
+            if arms.contains(&FilterKind::Other) {
                 FilterKind::Other
             } else {
                 FilterKind::Or(arms)
