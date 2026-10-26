@@ -29095,6 +29095,52 @@ impl PgHandler {
                     .collect(),
             ));
         }
+        if name == "pg_safe_snapshot_blocking_pids" {
+            // PostgreSQL 15: the sessions whose read/write transactions a
+            // READ ONLY DEFERRABLE one waits on for a safe snapshot.
+            let Some(pid) = args.first().and_then(bson_i64) else {
+                return Ok(Bson::Null);
+            };
+            let pids = self.ssi(|s| s.safe_snapshot_blocking_pids(pid as i32));
+            return Ok(Bson::Array(pids.into_iter().map(Bson::Int32).collect()));
+        }
+        if name == "pg_isolation_test_session_is_blocked" {
+            // PostgreSQL 15: whether the backend waits on one of the given
+            // backends, for a lock (`pg_blocking_pids`) or for a safe
+            // snapshot (`pg_safe_snapshot_blocking_pids`). The isolation
+            // tester asks this after each step.
+            let Some(pid) = args.first().and_then(bson_i64) else {
+                return Ok(Bson::Null);
+            };
+            let interesting: Vec<i64> = match args.get(1) {
+                Some(Bson::Array(a)) => a.iter().filter_map(bson_i64).collect(),
+                // An untyped literal (`'{1,2}'`), taken as the int4[] the
+                // parameter is.
+                Some(Bson::String(t)) => {
+                    let inner = t.trim().trim_start_matches('{').trim_end_matches('}');
+                    let mut out = Vec::new();
+                    for part in inner.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                        match part.parse::<i64>() {
+                            Ok(n) => out.push(n),
+                            Err(_) => {
+                                return Err(Self::user_error(
+                                    "22P02",
+                                    format!("invalid input syntax for type integer: \"{part}\""),
+                                ))
+                            }
+                        }
+                    }
+                    out
+                }
+                _ => return Ok(Bson::Null),
+            };
+            let pid = pid as i32;
+            let blocked = lock_manager::blockers_of(pid)
+                .into_iter()
+                .chain(self.ssi(|s| s.safe_snapshot_blocking_pids(pid)))
+                .any(|b| interesting.contains(&i64::from(b)));
+            return Ok(Bson::Boolean(blocked));
+        }
         if name == "has_table_privilege" {
             return self.within_block(|| self.has_table_privilege_call(args));
         }

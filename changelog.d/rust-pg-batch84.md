@@ -26,3 +26,21 @@ priced, and its rows came out in the general path's order.
 RP-028 stays open. A three-table join whose WHERE reads two of the tables is
 its new gap test
 (`tests/backlog/test_rust_postgres_gaps.py::test_a_where_over_two_of_three_tables_is_planned`).
+
+#### Also
+
+- `secantus-pg`: `pg_isolation_test_session_is_blocked(pid, pids)` and
+  `pg_safe_snapshot_blocking_pids(pid)`, as PostgreSQL 15.19 answers them:
+  whether the backend waits on one of the given backends, for a lock
+  (`pg_blocking_pids`) or for a safe snapshot, and the backends a READ ONLY
+  DEFERRABLE transaction waits on (`GetSafeSnapshotBlockingPids`, from the
+  SSI model's `possibleUnsafeConflicts`).
+- `tools/probes/pg_isolation.py`: a step finishes when its result is in,
+  and is waiting only while `pg_isolation_test_session_is_blocked` says so,
+  as PostgreSQL's `isolationtester` decides. It used to call any step that
+  took two seconds "waiting", so a slow CI runner made a slow step look
+  blocked, and `test_rp_isolation.py::test_ssi_partial_index` failed with
+  "another command is already in progress". Each session's pid is read
+  before its setup, which may begin a DEFERRABLE transaction. All 31
+  vendored specs record against PostgreSQL 15.19 exactly as their stored
+  traces.

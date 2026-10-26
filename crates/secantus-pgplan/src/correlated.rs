@@ -1192,6 +1192,8 @@ pub(crate) const SEQUENCE_FUNCTIONS: &[&str] = &[
     "pg_try_advisory_xact_lock_shared",
     // Who blocks whom lives in the executor's wait-for graph.
     "pg_blocking_pids",
+    "pg_safe_snapshot_blocking_pids",
+    "pg_isolation_test_session_is_blocked",
     // The write-ahead log's position and a relation's file are the store's.
     "pg_current_wal_lsn",
     "pg_current_wal_insert_lsn",
@@ -1252,6 +1254,8 @@ pub fn executor_function_type(name: &str) -> Option<&'static str> {
         "pg_current_wal_lsn" | "pg_current_wal_insert_lsn" | "pg_current_wal_flush_lsn" => "pg_lsn",
         "pg_walfile_name" | "pg_relation_filepath" => "text",
         "pg_wal_lsn_diff" => "numeric",
+        "pg_safe_snapshot_blocking_pids" => "int4[]",
+        "pg_isolation_test_session_is_blocked" => "bool",
         _ => return None,
     })
 }

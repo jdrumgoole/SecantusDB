@@ -175,7 +175,7 @@ impl PgHandler {
         h.finish()
     }
 
-    fn ssi<T>(&self, f: impl FnOnce(&mut ssi::State) -> T) -> T {
+    pub(crate) fn ssi<T>(&self, f: impl FnOnce(&mut ssi::State) -> T) -> T {
         ssi::with(self.ssi_key(), xids::next_xid(&self.storage), f)
     }
 
