@@ -104,6 +104,7 @@ mod procedures;
 mod progress;
 mod renames;
 mod row_waits;
+mod rule_trees;
 mod rules;
 mod scan_partitions;
 mod schema_rows;
@@ -1943,14 +1944,15 @@ impl plpgsql_fn::Host for PlHost<'_> {
         let stmt = self.plan(sql, params, types)?;
         let changes_catalog = PgHandler::may_change_catalog(&stmt);
         let _nested = NestedStatement::enter(self.h);
+        // The statement's own text is its source: a view or rule it creates
+        // records offsets into it, as SPI parses it alone (RP-203).
+        let outer_source = self.h.enter_statement_source(sql);
         // A nested CALL keeps the non-atomic context, and its statements
         // join the transaction themselves (holding the guard across it would
         // deadlock its COMMIT). Everything else is atomic and joins here,
         // captured first for any subtransaction open around it.
         let responses = if matches!(stmt, Statement::Call { .. }) {
-            self.h
-                .execute_statement(stmt, 0)
-                .map_err(|e| pl_error(&e))?
+            self.h.execute_statement(stmt, 0).map_err(|e| pl_error(&e))
         } else {
             self.joined(|| {
                 self.atomic(|| {
@@ -1959,8 +1961,10 @@ impl plpgsql_fn::Host for PlHost<'_> {
                         .and_then(|()| self.h.execute_statement(stmt, 0))
                         .map_err(|e| pl_error(&e))
                 })
-            })?
+            })
         };
+        self.h.restore_statement_source(outer_source);
+        let responses = responses?;
         // The planner's catalog was published for the statement around this
         // one: a DDL here republishes it, so the next statement of the same
         // body sees what this one created or dropped (a DROP VIEW, then a
@@ -3975,6 +3979,10 @@ pub struct PgHandler {
     /// The results a multi-command simple query produced BEFORE the command
     /// that failed: PostgreSQL sends each of them, then the error.
     batch_partial: Mutex<Vec<Response>>,
+    /// The query string the running top-level statement came from, and
+    /// its index among the string's statements (RP-203: a rule's trees
+    /// record source offsets into that string).
+    statement_source: Mutex<Option<(String, usize)>>,
     /// Protocol-level statements a SQL `DEALLOCATE` / `DISCARD ALL` removed,
     /// to drop from the wire layer's statement store at the next message
     /// that can reach it (the executor has no handle on the store).
@@ -4499,6 +4507,7 @@ impl PgHandler {
             catalog_statements: std::sync::atomic::AtomicUsize::new(0),
             nested_statements: std::sync::atomic::AtomicUsize::new(0),
             batch_partial: Mutex::new(Vec::new()),
+            statement_source: Mutex::new(None),
             wire_dealloc: Mutex::new(Vec::new()),
             temp_tables: Mutex::new(Vec::new()),
             holdable_declared: AtomicBool::new(false),
@@ -15267,7 +15276,7 @@ impl PgHandler {
                 (first, first + 2, first + 3)
             }
         };
-        let doc = bson::doc! {
+        let mut doc = bson::doc! {
             "_id": &name,
             "view": &name,
             "definition": &definition,
@@ -15278,6 +15287,13 @@ impl PgHandler {
             "type_oid": type_oid,
             "rule_oid": rule_oid,
         };
+        // Its `_RETURN` rule's trees, analysed now as `DefineView` does
+        // (RP-203).
+        let bare = name.rsplit('.').next().unwrap_or(&name).to_string();
+        if let Some((qual, action)) = self.statement_rule_trees('v', &bare, "_RETURN", relid) {
+            doc.insert("ev_qual", qual);
+            doc.insert("ev_action", action);
+        }
         if existing.is_some() {
             self.storage
                 .delete_matching(
@@ -17454,16 +17470,43 @@ impl PgHandler {
             .collect())
     }
 
-    fn put_matview(&self, name: &str, definition: &str, populated: bool) -> PgWireResult<()> {
+    /// `trees` are its `_RETURN` rule's `(ev_qual, ev_action)` (RP-203).
+    fn put_matview(
+        &self,
+        name: &str,
+        definition: &str,
+        populated: bool,
+        trees: Option<(String, String)>,
+    ) -> PgWireResult<()> {
         self.ensure_collection(Self::MATVIEW_COLLECTION)?;
         if self.matviews()?.iter().any(|(n, _, _)| n == name) {
             self.delete_type_doc(Self::MATVIEW_COLLECTION, name)?;
         }
-        self.insert_type_doc(
-            Self::MATVIEW_COLLECTION,
-            name,
-            bson::doc! {"_id": name, "matview": name, "definition": definition, "populated": populated},
-        )
+        let mut doc = bson::doc! {"_id": name, "matview": name, "definition": definition, "populated": populated};
+        if let Some((qual, action)) = trees {
+            doc.insert("ev_qual", qual);
+            doc.insert("ev_action", action);
+        }
+        self.insert_type_doc(Self::MATVIEW_COLLECTION, name, doc)
+    }
+
+    /// A materialized view's stored `_RETURN` trees, which a refresh or a
+    /// rename keeps: they name the relation by oid.
+    pub(crate) fn matview_trees(&self, name: &str) -> Option<(String, String)> {
+        let docs = self.type_catalog_docs(Self::MATVIEW_COLLECTION).ok()?;
+        let d = docs.iter().find(|d| d.get_str("matview") == Ok(name))?;
+        Some((
+            d.get_str("ev_qual").ok()?.to_string(),
+            d.get_str("ev_action").ok()?.to_string(),
+        ))
+    }
+
+    /// The trees `CREATE MATERIALIZED VIEW` stores for `table`, analysed
+    /// from the running statement as `create_ctas_internal` does.
+    fn new_matview_trees(&self, table: &str) -> Option<(String, String)> {
+        let relid = self.relation_oid(table)?;
+        let bare = table.rsplit('.').next().unwrap_or(table);
+        self.statement_rule_trees('m', bare, "_RETURN", relid)
     }
 
     /// Every domain CHECK as a `pg_constraint` row's pieces: `(constraint
@@ -17734,7 +17777,8 @@ impl PgHandler {
                 PgWireError::UserError(Box::new(info))
             })?;
         }
-        self.put_matview(name, &definition, with_data)
+        let trees = self.matview_trees(name);
+        self.put_matview(name, &definition, with_data, trees)
     }
 
     /// Every recorded policy document.
@@ -25966,6 +26010,7 @@ impl SimpleQueryHandler for PgHandler {
             // A lone SELECT outside any transaction streams its rows as
             // pgwire sends them (`portal_stream`), as an extended portal does.
             self.allow_simple_stream();
+            self.set_statement_source(query, 0);
             let out = self.run(query, &[], 0).await;
             self.stream_request.store(
                 portal_stream::STREAM_NEVER,
@@ -26108,6 +26153,7 @@ impl PgHandler {
                 implicit && stmts.len() == 1,
                 std::sync::atomic::Ordering::Relaxed,
             );
+            self.set_statement_source(whole, i);
             let ran = self.run(sql, &[], 0).await;
             self.sole_implicit
                 .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -37029,7 +37075,8 @@ impl PgHandler {
                 self.execute(Statement::CreateTable(def, false), max_rows)?;
                 if !with_data {
                     if let Some(sql) = &matview_sql {
-                        self.put_matview(&table, sql, false)?;
+                        let trees = self.new_matview_trees(&table);
+                        self.put_matview(&table, sql, false, trees)?;
                     }
                     return Ok(vec![Response::Execution(Tag::new(
                         if matview_sql.is_some() {
@@ -37067,7 +37114,8 @@ impl PgHandler {
                 // Recorded after the fill: the rows go in through the INSERT
                 // path, which refuses a materialized view.
                 if let Some(sql) = &matview_sql {
-                    self.put_matview(&table, sql, true)?;
+                    let trees = self.new_matview_trees(&table);
+                    self.put_matview(&table, sql, true, trees)?;
                 }
                 Ok(vec![Response::Execution(
                     Tag::new("SELECT").with_rows(written),
@@ -41541,8 +41589,9 @@ impl PgHandler {
                     },
                     max_rows,
                 )?;
+                let trees = self.matview_trees(&matview);
                 self.delete_type_doc(Self::MATVIEW_COLLECTION, &matview)?;
-                self.put_matview(&to, &definition, populated)?;
+                self.put_matview(&to, &definition, populated, trees)?;
                 Ok(vec![Response::Execution(Tag::new(
                     "ALTER MATERIALIZED VIEW",
                 ))])
@@ -49711,6 +49760,7 @@ impl ExtendedQueryHandler for PgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.note_result_format(&portal.result_column_format);
+        self.set_statement_source(&portal.statement.statement.sql, 0);
         let mut param_types = secantus_pgplan::infer_param_types(
             &portal.statement.statement.sql,
             &self.param_type_names(portal.statement.as_ref()),

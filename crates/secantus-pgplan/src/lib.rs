@@ -108,6 +108,7 @@ pub mod fts;
 mod func_cast;
 mod funcsig;
 mod named_args;
+pub mod nodetostring;
 mod schema_functions;
 mod search_cycle;
 pub mod server_encoding;

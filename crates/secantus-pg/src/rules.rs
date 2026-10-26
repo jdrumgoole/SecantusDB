@@ -114,6 +114,24 @@ impl PgHandler {
         if let Some(w) = &rule.condition {
             doc.insert("where", w);
         }
+        // Its trees, analysed now as `DefineRule` does (RP-203).
+        let relid = if is_view {
+            Some(self.view_relid(&rule.table))
+        } else {
+            self.relation_oid(&rule.table)
+        };
+        let bare = rule
+            .table
+            .rsplit('.')
+            .next()
+            .unwrap_or(&rule.table)
+            .to_string();
+        if let Some((qual, action)) =
+            relid.and_then(|r| self.statement_rule_trees('r', &bare, &rule.name, r))
+        {
+            doc.insert("ev_qual", qual);
+            doc.insert("ev_action", action);
+        }
         self.put(RULE_COLLECTION, &key, doc)?;
         Ok(vec![Response::Execution(Tag::new("CREATE RULE"))])
     }
@@ -381,12 +399,34 @@ impl PgHandler {
         // The system views' rules as `initdb` leaves them (RP-203), then the
         // database's.
         let mut rows = self.static_rows("pg_rewrite", def);
+        let trees = self.system_rule_trees();
+        for d in rows.iter_mut() {
+            let relid = d.get(f("ev_class")).and_then(crate::bson_i64).unwrap_or(0);
+            let name = d.get_str(f("rulename")).unwrap_or_default().to_string();
+            if let Some((qual, action)) = trees.get(&(relid, name)) {
+                d.insert(f("ev_qual"), qual.as_str());
+                d.insert(f("ev_action"), action.as_str());
+            }
+        }
+        let tree = |doc: &Document, d: &mut Document| {
+            for k in ["ev_qual", "ev_action"] {
+                if let Ok(t) = doc.get_str(k) {
+                    d.insert(f(k), t);
+                }
+            }
+        };
+        let rule_docs = self.rule_docs();
+        let view_docs = self
+            .type_catalog_docs(Self::VIEW_COLLECTION)
+            .map(|d| d.to_vec())
+            .unwrap_or_default();
         let user: Vec<Document> =
-            self.rule_docs()
+            rule_docs
                 .iter()
-                .map(rule_of)
-                .map(|(r, enabled, oid)| {
+                .map(|doc| (doc, rule_of(doc)))
+                .map(|(doc, (r, enabled, oid))| {
                     let mut d = Document::new();
+                    tree(doc, &mut d);
                     d.insert(f("oid"), Bson::Int64(oid));
                     d.insert(f("rulename"), r.name.as_str());
                     d.insert(
@@ -413,6 +453,11 @@ impl PgHandler {
                         .into_iter()
                         .map(|(view, _)| {
                             let mut d = Document::new();
+                            if let Some(doc) = view_docs.iter().find(|v| {
+                                v.get_str("view").or_else(|_| v.get_str("_id")) == Ok(view.as_str())
+                            }) {
+                                tree(doc, &mut d);
+                            }
                             d.insert(f("oid"), Bson::Int64(self.view_rule_relid(&view)));
                             d.insert(f("rulename"), "_RETURN");
                             d.insert(f("ev_class"), Bson::Int64(self.view_relid(&view)));
@@ -426,6 +471,10 @@ impl PgHandler {
                 .chain(self.matviews().unwrap_or_default().into_iter().filter_map(
                     |(name, _, _)| {
                         let mut d = Document::new();
+                        if let Some((qual, action)) = self.matview_trees(&name) {
+                            d.insert(f("ev_qual"), qual);
+                            d.insert(f("ev_action"), action);
+                        }
                         d.insert(f("oid"), Bson::Int64(self.view_rule_relid(&name)));
                         d.insert(f("rulename"), "_RETURN");
                         d.insert(f("ev_class"), Bson::Int64(self.relation_oid(&name)?));
@@ -507,6 +556,8 @@ pub(crate) fn pg_rewrite_def() -> TableDef {
             Column::new("ev_type", secantus_pgplan::QUOTED_CHAR, false),
             Column::new("ev_enabled", secantus_pgplan::QUOTED_CHAR, false),
             Column::new("is_instead", "bool", false),
+            Column::new("ev_qual", "pg_node_tree", false),
+            Column::new("ev_action", "pg_node_tree", false),
         ],
     )
 }
