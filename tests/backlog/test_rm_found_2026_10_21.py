@@ -155,7 +155,7 @@ def test_convert_to_a_target_it_cannot_produce(
     assert ours == theirs
 
 
-@pytest.mark.backlog("RM-229")
+@pytest.mark.backlog_fixed("RM-229")
 @pytest.mark.parametrize("full_document", ["whenAvailable", "required"])
 def test_change_stream_serves_the_stored_post_image(
     rust_mongo: Any, mongod_rs: Any, full_document: str
@@ -190,6 +190,95 @@ def test_change_stream_serves_the_stored_post_image(
     assert answers[0] == answers[1]
 
 
+def _images_left_by_updates(client: Any, full_document: str) -> Any:
+    """Two updates and a delete, then images disabled and one more update,
+    all read back from before the first write."""
+    client.drop_database("rm229b")
+    db = client["rm229b"]
+    db.create_collection("c", changeStreamPreAndPostImages={"enabled": True})
+    start = client.admin.command("ping")["operationTime"]
+    db.c.insert_one({"_id": 1, "a": {"b": 1}, "x": 1})
+    db.c.update_one({"_id": 1}, {"$set": {"a.b": 2, "n": 1}, "$unset": {"x": 1}})
+    db.c.update_one({"_id": 1}, {"$set": {"x": 3}})
+    db.c.delete_one({"_id": 1})
+    db.command("collMod", "c", changeStreamPreAndPostImages={"enabled": False})
+    db.c.insert_one({"_id": 2})
+    db.c.update_one({"_id": 2}, {"$set": {"a": 1}})
+
+    def read() -> list:
+        out = []
+        with db.c.watch(full_document=full_document, start_at_operation_time=start) as stream:
+            while (ev := stream.try_next()) is not None:
+                out.append((ev["operationType"], ev.get("fullDocument", "absent")))
+        return out
+
+    got = mongo_answer(read)
+    if got[0] == "err":
+        # The message names the event's clusterTime, which is each server's own.
+        import re
+
+        got = (got[0], got[1], re.sub(r"Timestamp\(\d+, \d+\)", "Timestamp(t, i)", got[2]))
+    return got
+
+
+@pytest.mark.backlog_fixed("RM-229")
+@pytest.mark.parametrize("full_document", ["whenAvailable", "required"])
+def test_a_post_image_outlives_the_document(
+    rust_mongo: Any, mongod_rs: Any, full_document: str
+) -> None:
+    """mongod 8.2.11 builds the post-image from the pre-image it stored and
+    the update: a later delete leaves both updates' images, a field-order
+    change included (`n` after `a`, `x` re-added last), and an update made
+    while images were disabled has none (null, or 47 for "required"). That
+    images are disabled when the stream is READ does not take away the
+    images stored before."""
+    assert _images_left_by_updates(rust_mongo, full_document) == _images_left_by_updates(
+        mongod_rs, full_document
+    )
+
+
+def _batches_to_a_missing_image(client: Any, batch_size: int) -> list:
+    """The `aggregate` and `getMore`s of a "required" stream whose second
+    event has no post-image, as `(command, event types)` or `(command, code)`."""
+    client.drop_database("rm229c")
+    db = client["rm229c"]
+    db.create_collection("c", changeStreamPreAndPostImages={"enabled": False})
+    start = client.admin.command("ping")["operationTime"]
+    db.c.insert_one({"_id": 1})
+    db.c.update_one({"_id": 1}, {"$set": {"a": 1}})
+    stage = {"$changeStream": {"fullDocument": "required", "startAtOperationTime": start}}
+    try:
+        reply = db.command(
+            {"aggregate": "c", "pipeline": [stage], "cursor": {"batchSize": batch_size}}
+        )
+    except Exception as e:
+        return [("aggregate", getattr(e, "code", None))]
+    out = [("aggregate", [e["operationType"] for e in reply["cursor"]["firstBatch"]])]
+    for _ in range(3):
+        try:
+            more = db.command({"getMore": reply["cursor"]["id"], "collection": "c", "batchSize": 1})
+        except Exception as e:
+            out.append(("getMore", getattr(e, "code", None)))
+            break
+        out.append(("getMore", [e["operationType"] for e in more["cursor"]["nextBatch"]]))
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-229")
+@pytest.mark.parametrize("batch_size", [0, 1, 2, 101])
+def test_a_missing_required_image_fails_the_batch_that_reaches_it(
+    rust_mongo: Any, mongod_rs: Any, batch_size: int
+) -> None:
+    """mongod 8.2.11 fails the whole command whose batch reaches the event
+    with no image: the `aggregate` itself when its first batch does (47,
+    under the aggregate's prefix), and a batch that fills first is returned,
+    leaving the error to the next getMore. The Rust server returned the
+    events before it and failed only the getMore after."""
+    assert _batches_to_a_missing_image(rust_mongo, batch_size) == _batches_to_a_missing_image(
+        mongod_rs, batch_size
+    )
+
+
 def _op_msg(host: str, port: int, command: dict) -> dict:
     """One command as a raw OP_MSG on a connection of its own. A driver
     would replace the `lsid` with a session of its own, and the retry is
@@ -213,11 +302,55 @@ def _op_msg(host: str, port: int, command: dict) -> dict:
     return bson.decode(rest[12 + 4 + 1 :])
 
 
-def _retry_while_running(client: Any, n: int) -> tuple:
-    """Send one retryable insert of `n` documents, and the same command again
-    (same lsid, same txnNumber) on a second connection while the first is
-    still running: what a driver does after a socket timeout. Returns both
-    attempts' `ok`, `n` and first write errors."""
+def _slow_update(host: str, port: int, db: str) -> dict:
+    """An update of `{_id: 0}` whose filter folds `$outer` ranges of
+    `$inner` numbers, with `$outer` set so it runs about two seconds on this
+    server: mongod is a hundred times faster than a debug build, so no one
+    size keeps both busy. The fields stop mongod folding it to a constant."""
+    import time
+
+    _op_msg(host, port, {"dropDatabase": 1, "$db": db})
+    update = {
+        "q": {
+            "_id": 0,
+            "$expr": {
+                "$gte": [
+                    {
+                        "$reduce": {
+                            "input": {"$range": [0, "$outer"]},
+                            "initialValue": 0,
+                            "in": {"$add": ["$$value", {"$size": {"$range": [0, "$inner"]}}]},
+                        }
+                    },
+                    0,
+                ]
+            },
+        },
+        "u": {"$inc": {"n": 1}},
+    }
+    outer = 1_000
+    while True:
+        row = {"_id": 0, "n": 0, "outer": outer, "inner": 1_000}
+        _op_msg(host, port, {"delete": "c", "deletes": [{"q": {}, "limit": 0}], "$db": db})
+        _op_msg(host, port, {"insert": "c", "documents": [row], "$db": db})
+        began = time.monotonic()
+        _op_msg(host, port, {"update": "c", "updates": [update], "$db": db})
+        took = time.monotonic() - began
+        if took > 0.2:
+            break
+        outer *= 10
+    row = {"_id": 0, "n": 0, "outer": int(outer * 2.0 / took), "inner": 1_000}
+    _op_msg(host, port, {"delete": "c", "deletes": [{"q": {}, "limit": 0}], "$db": db})
+    _op_msg(host, port, {"insert": "c", "documents": [row], "$db": db})
+    return update
+
+
+def _retry_while_running(client: Any) -> tuple:
+    """Send one slow retryable update, and the same command again (same
+    lsid, same txnNumber) on a second connection while the first is still
+    running: what a driver does after a socket timeout. Returns both
+    attempts' `ok`, `n`, `nModified` and first write errors, and how many
+    times the update applied."""
     import threading
     import time
     import uuid
@@ -225,46 +358,56 @@ def _retry_while_running(client: Any, n: int) -> tuple:
     from bson import Binary, Int64
 
     host, port = client.address
-    client.drop_database("rm230")
     cmd = {
-        "insert": "c",
-        "documents": [{"_id": i, "s": "p" * 300} for i in range(n)],
+        "update": "c",
+        "updates": [_slow_update(host, port, "rm230")],
         "lsid": {"id": Binary(uuid.uuid4().bytes, 4)},
         "txnNumber": Int64(1),
         "$db": "rm230",
     }
     replies: list = []
-    first = threading.Thread(target=lambda: replies.append(_op_msg(host, port, cmd)), daemon=True)
-    first.start()
-    # 30,000 documents keep the first attempt running well past this; with
-    # few, it could finish first and the second would be a plain (and
-    # correctly answered) retry of a finished write.
+    first_ended: list = []
+
+    def first() -> None:
+        replies.append(_op_msg(host, port, cmd))
+        first_ended.append(time.monotonic())
+
+    thread = threading.Thread(target=first, daemon=True)
+    thread.start()
     time.sleep(0.3)
+    sent = time.monotonic()
     replies.append(_op_msg(host, port, cmd))
-    first.join(timeout=120)
+    thread.join(timeout=120)
     assert len(replies) == 2, "the first attempt never answered"
-    # Both attempts, in either order: which one runs and which is answered
-    # as the retry depends on which reaches the session first.
+    if first_ended[0] <= sent:
+        # Not an assertion: the retry was not concurrent, so this measured
+        # nothing, and the verifier must say BROKEN rather than FIXED.
+        raise RuntimeError("the first attempt finished before the retry was sent")
+    applied = _op_msg(host, port, {"find": "c", "$db": "rm230"})["cursor"]["firstBatch"][0]["n"]
     return sorted(
-        (r.get("ok"), r.get("n"), [(e["index"], e["code"]) for e in r.get("writeErrors", [])][:3])
+        (
+            r.get("ok"),
+            r.get("n"),
+            r.get("nModified"),
+            [(e["index"], e["code"]) for e in r.get("writeErrors", [])][:3],
+        )
         for r in replies
-    )
+    ), applied
 
 
-@pytest.mark.backlog("RM-230")
+@pytest.mark.backlog_fixed("RM-230")
 def test_a_retry_waits_for_the_attempt_still_running(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11: a retry that arrives while its first attempt is still
     running waits for it (the session is checked out), then answers with the
-    first attempt's result -- both answer `{n: 30000}`, no errors. The Rust
-    server runs the two attempts side by side, and whichever comes second
-    answers E11000 on the documents the other has already written: a
-    driver that timed out reports a failed insert that in fact succeeded.
-    Found when RM-187's regression test hit it on CI's slower runner (a 20 s
-    socket timeout, then pymongo's retry)."""
-    ours = _retry_while_running(rust_mongo, 30_000)
-    theirs = _retry_while_running(mongod_rs, 30_000)
-    assert theirs == [(1.0, 30_000, [])] * 2, theirs  # the reference, as measured
-    assert ours == theirs
+    first attempt's result -- both answer `{n: 1, nModified: 1}`, and the
+    update applied once. The Rust server ran the two attempts side by side:
+    a retried insert answered E11000 on the documents the other had
+    written, so a driver that timed out reported a failed insert that had
+    succeeded. Found when RM-187's regression test hit it on CI's slower
+    runner (a 20 s socket timeout, then pymongo's retry)."""
+    theirs = _retry_while_running(mongod_rs)
+    assert theirs == ([(1.0, 1, 1, [])] * 2, 1), theirs  # the reference, as measured
+    assert _retry_while_running(rust_mongo) == theirs
 
 
 @pytest.mark.backlog_fixed("RM-231")

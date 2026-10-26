@@ -516,9 +516,13 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
     let first_batch_bytes = initial;
     let open_position = producer.position();
     // A resume whose token was not found fails the aggregate itself, under
-    // its prefix.
+    // its prefix; so does any other fatal the first batch reaches before it
+    // is full (mongod 8.2.11: a missing `required` image fails the aggregate
+    // with batchSize 2, and is left to the getMore with batchSize 1).
     if let Some(err) = producer.fatal_error() {
-        if err.code == 280 {
+        let reached = remainder.is_empty() && first_batch_bytes.len() < batch_size;
+        if err.code == 280 || reached {
+            let labelled = err.code == 280;
             let mut reply = CommandError::new(
                 err.code,
                 err.code_name.clone(),
@@ -529,7 +533,9 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
                 ),
             )
             .into_reply();
-            crate::transactions::add_label_first(&mut reply, "NonResumableChangeStreamError");
+            if labelled {
+                crate::transactions::add_label_first(&mut reply, "NonResumableChangeStreamError");
+            }
             return Ok(reply);
         }
     }

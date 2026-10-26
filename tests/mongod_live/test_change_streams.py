@@ -106,8 +106,15 @@ CASES = [
         {"full_document_before_change": "whenAvailable"},
     ),
     ("post-images updateLookup", _plain, {"full_document": "updateLookup"}),
-    # Post-images (`fullDocument: "whenAvailable"` / `"required"` on a
-    # collection with changeStreamPreAndPostImages) diverge: RM-229.
+    # The post-image is the stored pre-image with the update applied, not the
+    # document as it is when read (RM-229).
+    ("post-images required", _with_images, {"full_document": "required"}),
+    ("post-images whenAvailable", _with_images, {"full_document": "whenAvailable"}),
+    (
+        "pre- and post-images whenAvailable",
+        _with_images,
+        {"full_document": "whenAvailable", "full_document_before_change": "whenAvailable"},
+    ),
     ("projection", _plain, {"pipeline": [{"$project": {"operationType": 1, "documentKey": 1}}]}),
 ]
 
@@ -160,8 +167,8 @@ def _split(client: Any) -> list:
     _with_images(db)
     big = "x" * (9 * 1024 * 1024)
     pipeline = [{"$changeStreamSplitLargeEvent": {}}]
-    # Pre-images only (post-images are RM-229): the second update's event
-    # carries a 9 MB pre-image AND a 9 MB updateDescription.
+    # Pre-images only: the second update's event carries a 9 MB pre-image
+    # AND a 9 MB updateDescription.
     with db.c.watch(
         pipeline, full_document_before_change="required", max_await_time_ms=200
     ) as stream:

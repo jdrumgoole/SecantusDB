@@ -278,6 +278,27 @@ fn run_checked(
     ctx: &mut CommandContext,
     env: &Envelope,
 ) -> Document {
+    // A command with a `txnNumber` checks its session out for as long as it
+    // runs, and one that finds it out waits (mongod 8.2.11). Commands with
+    // only an `lsid` do not wait, and neither do the commands that kill
+    // sessions, which end the command holding one.
+    let _checkout = match (&env.lsid, env.txn_number, ctx.transactions.clone()) {
+        (Some(lsid), Some(_), Some(registry))
+            if !matches!(
+                name,
+                "killSessions" | "killAllSessions" | "killAllSessionsByPattern"
+            ) =>
+        {
+            match registry.check_out(lsid, crate::ops::current_killed) {
+                Some(out) => Some(out),
+                None => {
+                    return CommandError::new(11601, "Interrupted", "operation was interrupted")
+                        .into_reply()
+                }
+            }
+        }
+        _ => None,
+    };
     if is_ending(name) {
         if let Some(e) = ending_problem(name, doc, ctx, env) {
             return e.into_reply();

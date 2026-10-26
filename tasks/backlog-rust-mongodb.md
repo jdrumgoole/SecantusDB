@@ -663,35 +663,17 @@ about forty such points; these are the ones measured.
       name (`Fallback::mongo(code, msg)`) belongs.
       Backlog-ID: RM-226
       Verify: tests/backlog/test_rm_found_2026_10_21.py::test_window_spec_errors_carry_mongods_codes
-- [ ] **A change stream's post-image is the document now, not as the
-      update left it.** On a collection with `changeStreamPreAndPostImages:
-      {enabled: true}`, `fullDocument: "whenAvailable"` / `"required"` makes
-      mongod 8.2.11 answer each update event with the post-image it stored
-      when that update ran: two updates setting `a` to 2 then 3 read back as
-      `a: 2`, `a: 3`. This server looks the document up when the event is
-      read (`a: 3`, `a: 3`) -- `updateLookup`'s semantics -- so once a later
-      write deletes it, "whenAvailable" answers null and "required" fails
-      the stream (47, post-image not found). A silent wrong answer.
-      Pre-images here already match mongod
-      (`tests/mongod_live/test_change_streams.py`); probe how mongod
-      derives the post-image before building it. Found 2026-10-21.
-      Backlog-ID: RM-229
-      Verify: tests/backlog/test_rm_found_2026_10_21.py::test_change_stream_serves_the_stored_post_image
-- [ ] **A retryable write retried while its first attempt is still running
-      runs twice.** A driver that times out on a slow write retries it with
-      the same `lsid` and `txnNumber`. mongod 8.2.11 makes the second
-      attempt wait for the session the first has checked out, then answers
-      it from the first's result: both answer `{n: 30000}`. This server runs
-      the two side by side, and whichever comes second answers E11000 on the
-      documents the other wrote (`n: 0`), so the driver reports a failed
-      insert that succeeded; an update or delete retried this way could
-      apply twice (not yet measured). Found 2026-10-21 by RM-187's
-      regression test on CI's slower runner, where a 5,000-document insert
-      at an 8 MB cache outlasted pymongo's 20 s socket timeout. Sequential
-      retries (the first attempt finished) are answered correctly
-      (`tests/mongod_live/test_retryable_writes.py`).
-      Backlog-ID: RM-230
-      Verify: tests/backlog/test_rm_found_2026_10_21.py::test_a_retry_waits_for_the_attempt_still_running
+- [ ] **`killSessions` does not interrupt the command holding the session.**
+      mongod 8.2.11 interrupts a retryable update still running on the
+      session it kills: the update answers 11601 "operation was interrupted"
+      and does not apply. This server marks nothing: the update runs to the
+      end and applies. A command's kill flag is only polled between the
+      documents a scan reads, so interrupting one long evaluation, and
+      rolling a write back when it is killed, is the work; `killOp` has the
+      same limit. Found 2026-10-25 while fixing RM-230 (a retry now waits
+      for the attempt holding the session, so this is how a client ends one).
+      Backlog-ID: RM-313
+      Verify: tests/backlog/test_rm_found_2026_10_25.py::test_kill_sessions_interrupts_the_command_holding_the_session
 - [ ] **`$near` returns documents tied at one distance in the macOS build's
       order, not the Linux build's.** mongod's builds disagree: for four
       points at distance 1, Linux x86-64 8.2.12 (CI) answers `[2, 1, 3, 0]`,

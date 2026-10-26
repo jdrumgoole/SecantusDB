@@ -647,9 +647,19 @@ impl CursorRegistry {
         let take = want.min(e.remaining.len());
         let batch: Vec<Vec<u8>> = e.remaining.drain(..take).collect();
         let position = e.position_seq;
-        // A fatal projection error (code 280) ends the stream once any buffered
-        // events have drained; surface it (and drop the cursor) only when empty.
-        let fatal = if e.remaining.is_empty() {
+        // The producer's fatal error sits after every event it buffered,
+        // including those the open reply held back.
+        if e.fatal_error.is_none() {
+            if let Some(err) = e.producer.as_ref().and_then(|p| p.fatal_error()) {
+                e.fatal_error = Some(err);
+            }
+        }
+        // A fatal projection error ends the stream once the buffered events
+        // have drained: a batch that reaches it fails whole, as mongod's
+        // getMore does, but one that fills first is returned and the error
+        // comes with the next getMore (mongod 8.2.11).
+        let full = batch_size > 0 && take == want;
+        let fatal = if e.remaining.is_empty() && !full {
             e.fatal_error.clone()
         } else {
             None

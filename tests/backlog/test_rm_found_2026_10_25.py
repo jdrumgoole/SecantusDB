@@ -551,3 +551,49 @@ def test_a_blocking_sort_leaves_ties_as_mongods_sort_does(rust_mongo: Any, mongo
     want = _sorted_ties(mongod)
     assert want["simple"][:2] != [5, 15]
     assert _sorted_ties(rust_mongo) == want
+
+
+def _killed_while_running(client: Any) -> tuple:
+    """A slow retryable update, and `killSessions` on its session while it
+    runs: both replies' `ok` and `code`, and whether the update applied."""
+    import threading
+    import time
+
+    from bson import Binary, Int64
+
+    from tests.backlog.test_rm_found_2026_10_21 import _op_msg, _slow_update
+
+    host, port = client.address
+    lsid = {"id": Binary(uuid.uuid4().bytes, 4)}
+    cmd = {
+        "update": "c",
+        "updates": [_slow_update(host, port, "rm313")],
+        "lsid": lsid,
+        "txnNumber": Int64(1),
+        "$db": "rm313",
+    }
+    first: list = []
+    thread = threading.Thread(target=lambda: first.append(_op_msg(host, port, cmd)), daemon=True)
+    thread.start()
+    time.sleep(0.3)
+    killed = _op_msg(host, port, {"killSessions": [lsid], "$db": "admin"})
+    thread.join(timeout=120)
+    assert first, "the update never answered"
+    applied = _op_msg(host, port, {"find": "c", "$db": "rm313"})["cursor"]["firstBatch"][0]["n"]
+    return (
+        (first[0].get("ok"), first[0].get("code")),
+        (killed.get("ok"), killed.get("code")),
+        applied,
+    )
+
+
+@pytest.mark.backlog("RM-313")
+def test_kill_sessions_interrupts_the_command_holding_the_session(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11: `killSessions` on a session whose retryable update is
+    running interrupts that update (11601) and it does not apply; the kill
+    answers ok. The Rust server lets the update run to the end."""
+    theirs = _killed_while_running(mongod_rs)
+    assert theirs == ((0.0, 11601), (1.0, None), 0), theirs  # the reference, as measured
+    assert _killed_while_running(rust_mongo) == theirs

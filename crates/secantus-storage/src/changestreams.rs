@@ -188,6 +188,7 @@ fn required_image_message(event: &Document, pre: bool) -> String {
 
 fn attach_full_document(
     event: &mut Document,
+    seq: i64,
     op: &str,
     oplog_entry: &Document,
     storage: &Storage,
@@ -214,30 +215,25 @@ fn attach_full_document(
             || mode == FULL_DOC_REQUIRED
             || mode == FULL_DOC_WHEN_AVAILABLE)
     {
-        let ns = oplog_entry.get_str("ns").unwrap_or("");
-        let (db, coll) = split_ns(ns);
-        // `required` / `whenAvailable` read the stored POST-image (mongod 6.0
-        // semantics): the collection must have changeStreamPreAndPostImages
-        // enabled. With it disabled, `required` errors and `whenAvailable` yields
-        // null. Only the legacy `updateLookup` does a live re-read regardless.
-        if (mode == FULL_DOC_REQUIRED || mode == FULL_DOC_WHEN_AVAILABLE)
-            && !storage.pre_post_images_enabled(&db, &coll)?
-        {
-            if mode == FULL_DOC_REQUIRED {
-                return Err(StorageError::ChangeStreamFatal(required_image_message(
-                    event, false,
-                )));
+        // `required` / `whenAvailable` serve the post-image as the update left
+        // it: mongod 8.2.11 applies the update to the pre-image it stored when
+        // the update ran, so a later write or delete does not change it, and
+        // whether images are enabled when the stream is READ does not matter.
+        // With no stored pre-image, `whenAvailable` is null and `required`
+        // fails the stream (47). Only `updateLookup` reads the document now.
+        let looked_up = if mode == FULL_DOC_UPDATE_LOOKUP {
+            let ns = oplog_entry.get_str("ns").unwrap_or("");
+            let (db, coll) = split_ns(ns);
+            match oplog_entry
+                .get_document("o2")
+                .ok()
+                .and_then(|o2| o2.get("_id"))
+            {
+                Some(id) => do_lookup(storage, &db, &coll, id)?,
+                None => None,
             }
-            event.insert("fullDocument", Bson::Null);
-            return Ok(());
-        }
-        let doc_id = oplog_entry
-            .get_document("o2")
-            .ok()
-            .and_then(|o2| o2.get("_id").cloned());
-        let looked_up = match &doc_id {
-            Some(id) => do_lookup(storage, &db, &coll, id)?,
-            None => None,
+        } else {
+            stored_post_image(seq, oplog_entry, storage)?
         };
         match looked_up {
             Some(d) => {
@@ -254,6 +250,27 @@ fn attach_full_document(
         }
     }
     Ok(())
+}
+
+/// An update's post-image: the pre-image stored under `seq` with the entry's
+/// update description applied, or `None` when no pre-image was stored.
+fn stored_post_image(
+    seq: i64,
+    oplog_entry: &Document,
+    storage: &Storage,
+) -> Result<Option<Document>> {
+    let Some(pre) = storage.read_preimage(seq)? else {
+        return Ok(None);
+    };
+    let Ok(diff) = oplog_entry
+        .get_document("o")
+        .and_then(|o| o.get_document("diff"))
+    else {
+        return Ok(None);
+    };
+    secantus_core::diff::apply_update_description(decode_doc(&pre)?, diff)
+        .map(Some)
+        .map_err(|_| StorageError::Internal("change stream: post-image diff did not apply".into()))
 }
 
 fn attach_full_document_before_change(
@@ -489,7 +506,14 @@ fn project_unordered(
             }
             event.insert("updateDescription", Bson::Document(ud));
         }
-        attach_full_document(&mut event, op, oplog_entry, storage, full_document_mode)?;
+        attach_full_document(
+            &mut event,
+            seq,
+            op,
+            oplog_entry,
+            storage,
+            full_document_mode,
+        )?;
         // An insert has no "before" -- mongod omits `fullDocumentBeforeChange`
         // from insert events in every mode, `required` included (measured
         // 8.2.11, 2026-10-01). This put `fullDocumentBeforeChange: null` on
