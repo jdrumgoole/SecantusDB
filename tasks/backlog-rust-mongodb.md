@@ -721,20 +721,54 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
   246 SnapshotUnavailable, by name, rather than answer as of now; without
   `atClusterTime` it reads the latest data, which is correct. `secantusd-rs`
   creates its stores the other way, mongod's (RM-210).
-- [ ] **A blocking sort has no memory limit.** Since RM-211 the
-      aggregation stages hold mongod's budgets, but a blocking `$sort`,
-      the sort inside `$bucketAuto`, and a `find` sort do not: with
-      `allowDiskUse: false` mongod 8.2.11 refuses one over 100 MiB (292,
-      "Sort exceeded memory limit of 104857600 bytes, but did not opt in to
-      external sorting.") where this server sorts it. mongod counts each
-      key and document through its sorter's memory pool
-      (`sorter_template_defs.h`, `memPool->memUsage()`), whose chunk sizes
-      the source does not fix: measured over `{_id, s: 1 MB}` documents a
-      sort on `{s: 1, _id: 1}` refuses at 52 documents and one on `{_id:
-      -1}` at 104, about 1 % over the documents' own size, so modelling it
-      needs that pool measured first.
-      Backlog-ID: RM-315
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_blocking_sort_memory_limit
+- [ ] **A spill's on-disk size is this server's file, not mongod's.**
+      The memory budgets spill as mongod 8.2.11 does -- the same spills,
+      records and bytes for a sort, a `$group` and a `$setWindowFields`
+      (RM-211, RM-315) -- but `spilledDataStorageSize` (the profile's
+      `sortSpilledDataStorageSize` / `groupSpilledDataStorageSize`, explain,
+      `serverStatus`'s `metrics.query`) is the size of this server's
+      uncompressed spill file. mongod's sorter compresses each run (130545
+      bytes for the 2461200 a 300-document sort spills) and a `$group` or
+      `$setWindowFields` spills to a WiredTiger table (4096 bytes).
+      Backlog-ID: RM-316
+      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_spill_storage_size
+- [ ] **A sort under a cursor stage reports its spills once, not per
+      batch.** When a query-layer sort feeds later stages through
+      mongod's cursor stage, 8.2.11's profile adds the sort's counters
+      again for every batch that stage reads: a `$setWindowFields` over 300
+      documents, whose sort spills 13 times (as its `explain` says), is
+      profiled with `sortSpills: 52` -- four batches of 32, 64, 128 and 256.
+      `metrics.query.sort.spillToDisk` also counts differently from the
+      spills (`+26` for a sort of 29). This server reports each sort once.
+      Backlog-ID: RM-317
+      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_sort_profile_per_batch
+- [ ] **`$setWindowFields` refuses at slightly the wrong budget for some
+      windows.** The partition cache and the functions are counted as mongod
+      8.2.11 counts them for whole-partition, `["unbounded", "current"]` and
+      `$shift` windows (exact, measured by bisecting the budget), but not
+      quite for others: a removable `[-5, 5]` `$sum` is refused 16 bytes
+      above mongod's limit, `$rank` 5 bytes below it, a partitioned
+      whole-partition window 458 bytes below, and a removable `$push` of
+      400-byte strings 208 bytes above (`5414201` / `5643011` in each case).
+      The function's memory over a window that drops documents is the
+      unmeasured part.
+      Backlog-ID: RM-318
+      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_window_budget_residuals
+- [ ] **`explain` lacks the stages' own memory counters.** The spill
+      counters are there (a `SORT`'s, a `$sort`'s, a `$group`'s; RM-315), but
+      mongod 8.2.11 also lists a `$group`'s `maxAccumulatorMemoryUsageBytes`
+      and `totalOutputDataSizeBytes`, and shows `$setWindowFields` as the
+      `$_internalSetWindowFields` it runs, with `maxFunctionMemoryUsageBytes`,
+      `maxTotalMemoryUsageBytes` and its spill counters (with the `$sort` in
+      front of it in the cursor's plan). This server lists neither.
+      Backlog-ID: RM-319
+      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_explain_memory_counters
+- **Scope decision — SBE's `$concatArrays` refusal names a count mongod
+  never set.** Over its budget mongod 8.2.11 says "Concatentating array of
+  2 elements and N bytes with array of 87684434848907256 elements and M
+  bytes": the operand's element count is read from memory it never wrote.
+  This server gives the code and the byte counts as mongod computes them,
+  and the operand's length for that count.
 - `$convert` to binData subtype 2 (the deprecated "old binary") is
   written with the old format's inner length, as the bson crate writes
   every subtype-2 value. mongod 8.2.11 writes the bytes alone, which is not

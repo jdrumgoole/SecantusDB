@@ -581,10 +581,19 @@ impl Capped {
     /// `concatArraysCapped`).
     pub(crate) fn concat(&mut self, values: Vec<Bson>) -> R<()> {
         if crate::sbe::active() {
-            let added: usize = values.iter().map(memlimit::sbe_size).sum();
+            // SBE counts the operand array as one value (measured 8.2.11:
+            // `["x" * 100, 1]` is 129 bytes, nine more than its BSON).
+            let whole = Bson::Array(values);
+            let added = memlimit::sbe_size(&whole);
+            let Bson::Array(values) = whole else {
+                unreachable!("built as an array above")
+            };
             if self.mem + added >= memlimit::budgets().concat_arrays {
                 // mongod names the size of its two-slot state array here,
-                // not of the values (vm_builtin_agg.cpp, 8.2.1).
+                // not of the values (vm_builtin_agg.cpp, 8.2.1). The count
+                // it gives for the operand is a value it never set (8.2.11
+                // printed 87684434848907256); the operand's length stands in
+                // for that.
                 return Err(Fallback::mongo(
                     146,
                     format!(
@@ -2131,6 +2140,13 @@ fn expression_object_check(expr: &Bson) -> R<()> {
 /// mongod is known to keep is counted -- a `$firstN` keeps n values there,
 /// not every one this state collects -- so the estimate errs low, never
 /// refusing a `$group` mongod runs.
+/// [`acc_memory`] as the classic engine counts it, whatever engine is
+/// running (`$setWindowFields` always runs in the classic engine).
+pub(crate) fn acc_memory_classic(acc: &Acc) -> usize {
+    let _classic = crate::sbe::enter(false);
+    acc_memory(acc)
+}
+
 fn acc_memory(acc: &Acc) -> usize {
     let sbe = crate::sbe::active();
     let base = if sbe { 0 } else { classic_base(acc) };

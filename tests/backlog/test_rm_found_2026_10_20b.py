@@ -263,7 +263,7 @@ def _sort_limits(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-315")
+@pytest.mark.backlog_fixed("RM-315")
 def test_blocking_sort_memory_limit(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11, sorting 60 one-megabyte documents by their 1 MB field
     with `allowDiskUse: false`: 292 from `$sort`, `$bucketAuto` and `find`."""

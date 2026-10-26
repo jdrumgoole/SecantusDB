@@ -617,5 +617,81 @@ mod tests {
             ),
             (29, 1200, 649_200)
         );
+        assert_eq!(report.sort_spilled_bytes, 2_461_200);
+    }
+
+    /// The smallest budget a pipeline runs under with `allowDiskUse: false`,
+    /// bisected as the 8.2.11 measurements were.
+    fn least_budget(pipeline: &[Bson], docs: &[Document]) -> usize {
+        // A `$setWindowFields` here sorts by an index: only its own budget
+        // is bisected.
+        let windowed = pipeline.iter().any(|s| {
+            s.as_document()
+                .is_some_and(|d| d.contains_key("$setWindowFields"))
+        });
+        let runs = |budget: usize| {
+            let budgets = memlimit::Budgets {
+                sort: if windowed {
+                    memlimit::MAX_BYTES
+                } else {
+                    budget
+                },
+                window_fields: budget,
+                ..Default::default()
+            };
+            let _b = memlimit::with_budgets(budgets);
+            let _d = memlimit::allow_disk_use(false);
+            crate::aggregate::apply_pipeline(docs.to_vec(), pipeline, &Document::new(), None)
+                .is_ok()
+        };
+        let (mut lo, mut hi) = (1, 100_000_000);
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if runs(mid) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        hi
+    }
+
+    #[test]
+    fn a_sort_after_another_stage_counts_as_mongods_does() {
+        // mongod 8.2.11 over 100 documents `{_id: i, s: 2000 x's}`.
+        let docs: Vec<Document> = (0..100)
+            .map(|i| doc! { "_id": i, "s": "x".repeat(2000) })
+            .collect();
+        let sort = Bson::Document(doc! { "$sort": { "s": 1, "_id": 1 } });
+        let unwound = vec![Bson::Document(doc! { "$unwind": "$s" }), sort.clone()];
+        assert_eq!(least_budget(&unwound, &docs), 485_952);
+        let changed = vec![
+            Bson::Document(doc! { "$addFields": { "z": 1.5 } }),
+            sort.clone(),
+        ];
+        assert_eq!(least_budget(&changed, &docs), 484_080);
+        let read = vec![Bson::Document(doc! { "$limit": 1000 }), sort];
+        assert_eq!(least_budget(&read, &docs), 469_920);
+    }
+
+    #[test]
+    fn a_window_partition_counts_its_cache_and_functions() {
+        // mongod 8.2.11 over `{_id: i, k: i % 7, n: 2i, s: (300 + i) x's}`,
+        // sorted by `n` (an index serves it, so no sort is budgeted).
+        let docs: Vec<Document> = (0..100)
+            .map(|i| doc! { "_id": i, "k": i % 7, "n": i * 2, "s": "x".repeat(300 + i as usize) })
+            .collect();
+        let swf = |output: Document| {
+            vec![Bson::Document(
+                doc! { "$setWindowFields": { "sortBy": { "n": 1 }, "output": { "t": output } } },
+            )]
+        };
+        // The partition and `$sum`'s 184 bytes: 5414201 below.
+        assert_eq!(least_budget(&swf(doc! { "$sum": "$n" }), &docs), 49_134);
+        // The document answered and the next: 5643011 below.
+        let uc = doc! { "$sum": "$n", "window": { "documents": ["unbounded", "current"] } };
+        assert_eq!(least_budget(&swf(uc), &docs), 1_077);
+        let shift = doc! { "$shift": { "output": "$n", "by": 3 } };
+        assert_eq!(least_budget(&swf(shift), &docs), 2_150);
     }
 }

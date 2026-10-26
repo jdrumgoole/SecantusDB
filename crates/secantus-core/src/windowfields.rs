@@ -265,8 +265,12 @@ pub(crate) fn set_window_fields_each(
     // and within each partition in `sortBy` order -- not the input order.
     // Wrong order is wrong RESULTS as soon as a `$limit` follows, so this is
     // not cosmetic. `sorted_slots` yields exactly that sequence.
-    for part in &partitions {
-        let slots = sorted_slots(part, &docs, sort_by)?;
+    let ordered = partitions
+        .iter()
+        .map(|part| sorted_slots(part, &docs, sort_by))
+        .collect::<R<Vec<_>>>()?;
+    for slots in &ordered {
+        let slots = slots.clone();
         let n = slots.len();
         let ranks = if needs_rank {
             Some(compute_ranks(&slots, &docs, sort_by))
@@ -297,6 +301,7 @@ pub(crate) fn set_window_fields_each(
             cached.as_ref(),
             range_vals.as_deref(),
             range_dates.as_deref(),
+            vars,
             &mut spill,
         )?;
         // $expMovingAvg / $locf / $linearFill each produce a per-slot vector —
@@ -446,10 +451,15 @@ fn cache_fields(
     Some(fields)
 }
 
-/// How far ahead of the document being answered, and how far behind it,
-/// mongod's partition iterator keeps documents for `c` at `pos` (of `n`):
-/// the last index a window reads, and the first. A window that is not
-/// over documents reads the partition to its end.
+/// The documents mongod's partition iterator needs for `c` to answer `pos`
+/// (of `n`): the first it must still hold and the last it must have read.
+/// Measured on mongod 8.2.11 (2026-10-26, `maxTotalMemoryUsageBytes` and
+/// the budget bisected over a hundred documents): a window that drops
+/// documents needs the one answered and those its upper end reaches
+/// (`[-5, 5]`: six); `$first` / `$last` and a `range` window hold their
+/// whole window and the document leaving it, and a `range` window reads
+/// one past its end; a window with no upper end reads the partition;
+/// `$rank` reads one ahead, `$shift` back reads two.
 fn reach(
     c: &OutField,
     pos: usize,
@@ -457,12 +467,17 @@ fn reach(
     range_vals: Option<&[f64]>,
     range_dates: Option<&[f64]>,
 ) -> R<(usize, usize)> {
-    let last = n - 1;
-    if RANK_FUNCS.contains(&c.op) || matches!(c.op, "$expMovingAvg" | "$locf") {
+    let last = (n - 1) as i64;
+    let p = pos as i64;
+    let clamp = |i: i64| i.clamp(0, last) as usize;
+    if RANK_FUNCS.contains(&c.op) {
+        return Ok((pos, clamp(p + 2)));
+    }
+    if matches!(c.op, "$expMovingAvg" | "$locf") {
         return Ok((pos, pos));
     }
     if c.op == "$linearFill" {
-        return Ok((pos, last));
+        return Ok((pos, clamp(last)));
     }
     if c.op == "$shift" {
         let by = c
@@ -475,20 +490,133 @@ fn reach(
                 _ => None,
             })
             .unwrap_or(0);
-        let at = (pos as i64 + by).clamp(0, last as i64) as usize;
-        return Ok((pos.min(at), pos.max(at)));
+        return Ok(if by > 0 {
+            (pos, clamp(p + by))
+        } else {
+            (clamp(p + by), clamp(p + 2))
+        });
     }
-    let (lo, hi) = match c.window {
-        None => return Ok((pos, last)),
-        Some(w) if w.contains_key("range") => {
-            range_window_bounds(pos, n, w, range_vals, range_dates)?
-        }
-        Some(w) => window_bounds(pos, n, Some(w))?,
+    let Some(w) = c.window else {
+        return Ok((pos, clamp(last)));
     };
-    // The document answered is held whatever the window; one behind it is
-    // not, as each function keeps the values it must take out again.
-    let _ = lo;
-    Ok((pos, (hi.max(pos as i64) as usize).min(last)))
+    let range = w.contains_key("range");
+    let (lo, hi) = if range {
+        range_window_bounds(pos, n, w, range_vals, range_dates)?
+    } else {
+        window_bounds(pos, n, Some(w))?
+    };
+    let unbounded_hi = w
+        .get("documents")
+        .or_else(|| w.get("range"))
+        .and_then(Bson::as_array)
+        .is_some_and(|b| matches!(b.get(1), Some(Bson::String(s)) if s == "unbounded"));
+    let hi = if unbounded_hi {
+        last
+    } else if range {
+        hi + 1
+    } else {
+        hi
+    };
+    if range || (matches!(c.op, "$first" | "$last") && window_removes(Some(w))) {
+        return Ok((clamp((lo - 1).min(p)), clamp(hi.max(p))));
+    }
+    Ok((pos, clamp(hi.max(p))))
+}
+
+/// What one window function holds while `pos` is answered, as mongod's
+/// tracker counts it (measured 8.2.11, `maxFunctionMemoryUsageBytes`): a
+/// window that drops documents runs a removable function of a fixed size;
+/// one that only grows runs the `$group` accumulator over what it has read,
+/// counted as `$group` counts it; `$first` / `$last` and the position
+/// functions hold nothing of their own.
+enum FunctionMemory {
+    Nothing,
+    /// A removable function: its own size, and each value in its window --
+    /// once for a value a `Value` holds inline, twice for one on the heap
+    /// (`[-5, 5]` over ints: `$sum` 496, `$push` 512; over 400-byte strings
+    /// `$push` and `$max` hold each about twice its size).
+    Removable {
+        base: usize,
+        sizes: Vec<Option<usize>>,
+    },
+    Growing {
+        acc: group::Acc,
+        fed: usize,
+    },
+}
+
+impl FunctionMemory {
+    fn of(c: &OutField) -> R<FunctionMemory> {
+        if matches!(c.op, "$first" | "$last")
+            || RANK_FUNCS.contains(&c.op)
+            || PREFIX_OPS.contains(&c.op)
+            || COVARIANCE_OPS.contains(&c.op)
+            || matches!(c.op, "$shift" | "$derivative" | "$integral")
+        {
+            return Ok(FunctionMemory::Nothing);
+        }
+        if window_removes(c.window) {
+            return Ok(FunctionMemory::Removable {
+                base: match c.op {
+                    "$avg" => 328,
+                    "$push" => 336,
+                    "$stdDevPop" | "$stdDevSamp" => 504,
+                    _ => 320,
+                },
+                sizes: Vec::new(),
+            });
+        }
+        Ok(FunctionMemory::Growing {
+            acc: group::new_acc(c.op)?,
+            fed: 0,
+        })
+    }
+
+    /// The bytes held once the window covers indices `from..=upto` of `slots`.
+    fn held(
+        &mut self,
+        c: &OutField,
+        (from, upto): (usize, usize),
+        slots: &[usize],
+        docs: &[Document],
+        vars: &Document,
+    ) -> R<usize> {
+        Ok(match self {
+            FunctionMemory::Nothing => 0,
+            FunctionMemory::Removable { base, sizes } => {
+                if sizes.is_empty() {
+                    sizes.resize(slots.len(), None);
+                }
+                let mut held = *base;
+                for i in from..=upto.min(slots.len() - 1) {
+                    let size = match sizes[i] {
+                        Some(s) => s,
+                        None => {
+                            let v = if c.op == "$count" {
+                                Bson::Int32(1)
+                            } else {
+                                expressions::evaluate(&docs[slots[i]], c.arg, vars)
+                                    .unwrap_or(Bson::Null)
+                            };
+                            let size = crate::memlimit::classic_size(&v);
+                            let s = if size > 16 { 2 * size } else { size };
+                            sizes[i] = Some(s);
+                            s
+                        }
+                    };
+                    held += size;
+                }
+                held
+            }
+            FunctionMemory::Growing { acc, fed } => {
+                while *fed <= upto && *fed < slots.len() {
+                    group::apply_acc(acc, c.arg, &docs[slots[*fed]], vars)?;
+                    *fed += 1;
+                }
+                group::acc_memory_classic(acc)
+            }
+        })
+    }
 }
 
 /// What spilling the partition cache wrote, across the stage's partitions.
@@ -571,13 +699,16 @@ impl Drop for CacheSpill {
     }
 }
 
-/// mongod's partition cache (`SpillableDeque`) over `slots`: each document
-/// the windows read ahead to is added, counted at its size with only the
-/// fields kept, and dropped once no window needs it. Past the budget it
-/// spills every document it holds -- or, with `allowDiskUse: false`, refuses
-/// (5643011). Measured on mongod 8.2.11 (2026-10-26): a `[-5, 5]` window
-/// holds the document answered and the five after it; an unbounded one, the
-/// partition.
+/// mongod's partition cache (`SpillableDeque`) over `slots`, as
+/// `DocumentSourceInternalSetWindowFields::doGetNext` drives it: for each
+/// document it reads what the windows need, answers, counts its cache and
+/// its functions together -- spilling the cache if that is over the budget,
+/// refusing (5414201) if it still is -- then advances, reading the next
+/// document and dropping those no window needs any more. Each document read
+/// is counted at its size with only the fields kept; past the budget the
+/// cache spills all it holds, or with `allowDiskUse: false` refuses
+/// (5643011).
+#[allow(clippy::too_many_arguments)]
 fn run_cache(
     compiled: &[OutField],
     slots: &[usize],
@@ -585,6 +716,7 @@ fn run_cache(
     fields: Option<&std::collections::BTreeSet<String>>,
     range_vals: Option<&[f64]>,
     range_dates: Option<&[f64]>,
+    vars: &Document,
     spill: &mut CacheSpill,
 ) -> R<()> {
     let n = slots.len();
@@ -596,25 +728,38 @@ fn run_cache(
         Some(f) => crate::memlimit::fields_size(&docs[slots[i]], f),
         None => crate::memlimit::document_size(&docs[slots[i]]),
     };
-    // The documents in memory, oldest first.
-    let mut held: std::collections::VecDeque<(usize, usize)> = std::collections::VecDeque::new();
-    let mut used = 0usize;
-    let mut next = 0usize;
-    for pos in 0..n {
-        let mut ahead = pos;
-        let mut behind = pos;
-        for c in compiled {
-            let (lo, hi) = reach(c, pos, n, range_vals, range_dates)?;
-            ahead = ahead.max(hi);
-            behind = behind.min(lo);
+    let mut functions = compiled
+        .iter()
+        .map(FunctionMemory::of)
+        .collect::<R<Vec<_>>>()?;
+    struct Cache {
+        held: std::collections::VecDeque<(usize, usize)>,
+        used: usize,
+        next: usize,
+    }
+    let mut cache = Cache {
+        held: std::collections::VecDeque::new(),
+        used: 0,
+        next: 0,
+    };
+    let spill_all = |cache: &mut Cache, spill: &mut CacheSpill| -> R<()> {
+        if !cache.held.is_empty() {
+            let out: Vec<&Document> = cache.held.iter().map(|(i, _)| &docs[slots[*i]]).collect();
+            spill.write(&out)?;
+            cache.held.clear();
         }
-        while next <= ahead {
-            let s = size(next);
-            held.push_back((next, s));
-            used += s;
-            next += 1;
-            if used > budget {
+        cache.used = 0;
+        Ok(())
+    };
+    let read_to = |cache: &mut Cache, upto: usize, spill: &mut CacheSpill| -> R<()> {
+        while cache.next <= upto && cache.next < n {
+            let s = size(cache.next);
+            cache.held.push_back((cache.next, s));
+            cache.used += s;
+            cache.next += 1;
+            if cache.used > budget {
                 if !crate::memlimit::disk_allowed() {
+                    let used = cache.used;
                     return Err(Fallback::mongo(
                         5643011,
                         format!(
@@ -623,17 +768,59 @@ fn run_cache(
                         ),
                     ));
                 }
-                let out: Vec<&Document> = held.iter().map(|(i, _)| &docs[slots[*i]]).collect();
-                spill.write(&out)?;
-                held.clear();
-                used = 0;
+                spill_all(cache, spill)?;
             }
         }
-        // What the next document no longer needs leaves memory.
-        let keep_from = behind.min(pos + 1);
-        while held.front().is_some_and(|(i, _)| *i < keep_from) {
-            let (_, s) = held.pop_front().expect("a front");
-            used -= s;
+        Ok(())
+    };
+    for pos in 0..n {
+        let mut ahead = pos;
+        let mut reads = Vec::with_capacity(compiled.len());
+        for c in compiled {
+            ahead = ahead.max(reach(c, pos, n, range_vals, range_dates)?.1);
+            // A function reads its window, not the iterator's look-ahead.
+            let (from, upto) = match c.window {
+                None => (0, n as i64 - 1),
+                Some(w) if w.contains_key("range") => {
+                    range_window_bounds(pos, n, w, range_vals, range_dates)?
+                }
+                Some(w) => window_bounds(pos, n, Some(w))?,
+            };
+            reads.push((from.max(0) as usize, upto.max(0) as usize));
+        }
+        read_to(&mut cache, ahead, spill)?;
+        let mut functions_held = 0usize;
+        for ((f, c), window) in functions.iter_mut().zip(compiled).zip(&reads) {
+            functions_held += f.held(c, *window, slots, docs, vars)?;
+        }
+        if cache.used + functions_held > budget {
+            if crate::memlimit::disk_allowed() {
+                spill_all(&mut cache, spill)?;
+            }
+            // mongod names what its functions hold, the cache being its own
+            // tracker's (measured 8.2.11).
+            if cache.used + functions_held > budget {
+                return Err(Fallback::mongo(
+                    5414201,
+                    format!(
+                        "Exceeded memory limit in DocumentSourceSetWindowFields, used {functions_held} \
+                         bytes but max allowed is {budget}"
+                    ),
+                ));
+            }
+        }
+        // Advance: read the next document, then let go of what the next
+        // answer does not need.
+        if pos + 1 < n {
+            read_to(&mut cache, pos + 1, spill)?;
+            let mut keep = pos + 1;
+            for c in compiled {
+                keep = keep.min(reach(c, pos + 1, n, range_vals, range_dates)?.0);
+            }
+            while cache.held.front().is_some_and(|(i, _)| *i < keep) {
+                let (_, s) = cache.held.pop_front().expect("a front");
+                cache.used -= s;
+            }
         }
     }
     Ok(())
