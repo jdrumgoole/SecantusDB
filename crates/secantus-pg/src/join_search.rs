@@ -30,11 +30,8 @@ const CPU_OPERATOR_COST: f64 = 0.0025;
 use secantus_pgplan::joins::{JoinKind, JoinNode, SEP};
 
 thread_local! {
-    /// Set while a join source whose query's WHERE spans tables
-    /// (`JoinRows::where_spans`) is read: its join order is not searched.
-    static WHERE_SPANS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// One of those conjuncts is an equality between tables
-    /// (`JoinRows::where_spans_equality`).
+    /// One of the WHERE conjuncts over more than one table of the join
+    /// source being read is an equality (`JoinRows::where_spans_equality`).
     static WHERE_SPANS_EQUALITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The tables each spanning conjunct reads (`JoinRows::where_span_aliases`).
     static WHERE_SPAN_ALIASES: std::cell::RefCell<Vec<Vec<String>>> =
@@ -69,14 +66,12 @@ pub(crate) fn with_join_where<T>(
     join: &secantus_pgplan::joins::JoinRows,
     f: impl FnOnce() -> T,
 ) -> T {
-    let outer = WHERE_SPANS.with(|c| c.replace(join.where_spans));
     let outer_eq = WHERE_SPANS_EQUALITY.with(|c| c.replace(join.where_spans_equality));
     let outer_aliases = WHERE_SPAN_ALIASES.with(|c| c.replace(join.where_span_aliases.clone()));
     let outer_filters = WHERE_FILTERS.with(|c| c.replace(join.where_filters.clone()));
     let outer_equalities = WHERE_EQUALITIES.with(|c| c.replace(join.where_equalities.clone()));
     let outer_needed = NEEDED.with(|n| n.replace(Some(join.needed.clone())));
     let out = f();
-    WHERE_SPANS.with(|c| c.set(outer));
     WHERE_SPANS_EQUALITY.with(|c| c.set(outer_eq));
     WHERE_SPAN_ALIASES.with(|c| *c.borrow_mut() = outer_aliases);
     WHERE_FILTERS.with(|c| *c.borrow_mut() = outer_filters);

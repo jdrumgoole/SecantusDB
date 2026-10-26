@@ -179,14 +179,10 @@ impl EcPlan {
 pub struct JoinRows {
     pub tree: JoinNode,
     pub def: TableDef,
-    /// The query's WHERE has a conjunct over more than one table (or one
-    /// it could not attribute), which PostgreSQL would attach to a join
-    /// and plan the join order with; the executor does not model that.
-    pub where_spans: bool,
-    /// One of those conjuncts is an equality, which PostgreSQL would put
-    /// in an equivalence class and so join on; the others it applies as
-    /// join filters, which leave the join order's choices alone where they
-    /// are first evaluated at the top join.
+    /// One of the query's WHERE conjuncts over more than one table is an
+    /// equality, which PostgreSQL would put in an equivalence class and so
+    /// join on; the others it applies as join filters, which leave the join
+    /// order's choices alone where they are first evaluated at the top join.
     pub where_spans_equality: bool,
     /// The tables (aliases) each of those conjuncts reads.
     pub where_span_aliases: Vec<Vec<String>>,
@@ -441,7 +437,6 @@ fn finish_join_source(
         }
         None => Vec::new(),
     };
-    let where_spans = !spanning.is_empty();
     // Each spanning conjunct's tables (by qualified column reference).
     let where_span_aliases: Vec<Vec<String>> = spanning
         .iter()
@@ -568,7 +563,6 @@ fn finish_join_source(
                 plan: Box::new(Statement::JoinRows(Box::new(JoinRows {
                     tree,
                     def: def.clone(),
-                    where_spans,
                     where_spans_equality,
                     where_span_aliases,
                     where_filters,
