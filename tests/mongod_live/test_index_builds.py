@@ -165,8 +165,16 @@ class _Build:
 
         self.thread = threading.Thread(target=run)
         self.thread.start()
+        # Started: its operation is listed -- or, held before its commit,
+        # it has recorded itself ready (mongod lists no build operation
+        # then, and a small build gets there between two looks).
         deadline = time.monotonic() + 30
-        while not self.ops():
+        while not (
+            self.ops()
+            or client.config["system.indexBuilds"].find_one(
+                {"commitReadyMembers": {"$exists": True}}
+            )
+        ):
             assert time.monotonic() < deadline, "the build never started"
             time.sleep(0.02)
 
