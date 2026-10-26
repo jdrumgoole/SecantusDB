@@ -106,6 +106,11 @@ pub enum ParamKind {
     /// A 64-bit whole number of at least the given value
     /// (`internalLookupStageIntermediateDocumentMaxSizeBytes`, 16793600).
     Int64AtLeast(i64),
+    /// `maxIndexBuildMemoryUsageMegabytes`: any number, stored as a double,
+    /// greater than zero and at least 50 (mongod 8.2.11, 2026-10-26: 0 and
+    /// -1 are "must be a positive value", 1 and 49 "Must be above minimum
+    /// of 50 MB", a fraction is kept).
+    BuildMemoryMegabytes,
 }
 
 /// `(name, kind)` for every runtime-settable parameter.
@@ -197,6 +202,12 @@ const SETTABLE: &[(&str, ParamKind)] = &[
         ParamKind::Int32AtLeast(0),
     ),
     ("internalQueryMaxPushBytes", ParamKind::IntAbove(0, true)),
+    // An index build's sorters keep at most this much in memory before
+    // spilling to `<dbpath>/_tmp` (RM-187), read by every build.
+    (
+        "maxIndexBuildMemoryUsageMegabytes",
+        ParamKind::BuildMemoryMegabytes,
+    ),
     (
         "internalQueryMaxSetUnionBytes",
         ParamKind::IntAbove(0, false),
@@ -493,6 +504,10 @@ fn coerce(kind: ParamKind, value: &Bson) -> Option<Bson> {
             Some(d) if d > 0.0 => Some(Bson::Double(d)),
             _ => None,
         },
+        ParamKind::BuildMemoryMegabytes => match double(value) {
+            Some(d) if d >= 50.0 => Some(Bson::Double(d)),
+            _ => None,
+        },
         ParamKind::IntAbove(min, int32) => match integral(value, int32) {
             Ok(n) if n > min && int32 => Some(Bson::Int32(n as i32)),
             Ok(n) if n > min => Some(Bson::Int64(n)),
@@ -595,6 +610,13 @@ fn refusal(kind: ParamKind, name: &str, value: &Bson) -> String {
                 "Invalid value for parameter {name}: {n} is not greater than or equal to {}",
                 min.unwrap_or(1)
             ),
+        };
+    }
+    if kind == ParamKind::BuildMemoryMegabytes {
+        return match double(value) {
+            Some(d) if d <= 0.0 => format!("{name} must be a positive value"),
+            Some(_) => "Must be above minimum of 50 MB".to_string(),
+            None => format!("Failed validating {name}: Unable to coerce value to correct type"),
         };
     }
     if kind == ParamKind::DoubleAboveZero {

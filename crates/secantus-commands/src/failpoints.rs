@@ -84,7 +84,16 @@ pub struct FailPointRegistry {
     /// `maxTimeAlwaysTimeOut`: `None` when off, `Some(-1)` for `alwaysOn`, else
     /// the firings left under `{times: N}`.
     max_time_always: Mutex<Option<i64>>,
+    /// The pause failpoints set, by name: an index build waits at each while
+    /// it is on (`-1`, `alwaysOn`; else the pauses left under `{times: N}`).
+    pauses: Mutex<std::collections::HashMap<String, i64>>,
 }
+
+/// mongod's failpoints that pause an index build while they are set
+/// (`IndexBuildsCoordinator`, 8.2): after it is set up, and before it
+/// commits. Tests use them to write to a collection mid-build.
+pub const INDEX_BUILD_PAUSES: &[&str] =
+    &["hangAfterStartingIndexBuild", "hangIndexBuildBeforeCommit"];
 
 impl FailPointRegistry {
     pub fn new() -> Self {
@@ -96,6 +105,27 @@ impl FailPointRegistry {
     pub fn configure(&self, name: &str, mode: &Bson, data: &Document) {
         if name == "maxTimeAlwaysTimeOut" {
             self.configure_max_time_always(mode);
+            return;
+        }
+        if INDEX_BUILD_PAUSES.contains(&name) {
+            let mut pauses = self.pauses.lock().unwrap_or_else(|e| e.into_inner());
+            pauses.remove(&format!("{name}#held"));
+            match mode {
+                Bson::String(s) if s == "alwaysOn" => {
+                    pauses.insert(name.to_string(), -1);
+                }
+                Bson::Document(m) => match m.get("times").and_then(as_i64) {
+                    Some(n) if n > 0 => {
+                        pauses.insert(name.to_string(), n);
+                    }
+                    _ => {
+                        pauses.remove(name);
+                    }
+                },
+                _ => {
+                    pauses.remove(name);
+                }
+            }
             return;
         }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -192,6 +222,38 @@ impl FailPointRegistry {
             Bson::Document(m) => m.get("times").and_then(as_i64).filter(|n| *n > 0),
             _ => None,
         };
+    }
+
+    /// Wait while the pause failpoint `name` is set, as mongod's
+    /// `pauseWhileSet` does: a `{times: N}` setting counts this pause, and
+    /// the operation's kill flag or budget, or `interrupted`, ends the wait
+    /// (an index build's abort interrupts its pause on mongod).
+    pub fn pause_while_set(&self, name: &str, interrupted: impl Fn() -> bool) {
+        {
+            let mut pauses = self.pauses.lock().unwrap_or_else(|e| e.into_inner());
+            match pauses.get_mut(name) {
+                None => return,
+                Some(n) if *n > 0 => {
+                    *n -= 1;
+                    if *n == 0 {
+                        pauses.remove(name);
+                        // `{times: 1}` pauses once, until switched off.
+                        pauses.insert(format!("{name}#held"), -1);
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        loop {
+            let set = {
+                let pauses = self.pauses.lock().unwrap_or_else(|e| e.into_inner());
+                pauses.contains_key(name) || pauses.contains_key(&format!("{name}#held"))
+            };
+            if !set || secantus_core::deadline::check_now().is_err() || interrupted() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     pub fn max_time_always_armed(&self) -> bool {

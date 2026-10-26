@@ -851,32 +851,21 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       (`o2: {numRecords}`), a rename (`stayTemp`), a one-index
       `createIndexes` and a `dropIndexes` read as mongod 8.2.11 writes them,
       with its `t` and `v`, and a retryable insert, update or delete with
-      its session (`lsid`, `txnNumber`, `stmtId`, `prevOpTime`). Open:
-      - a `bulkWrite` command's writes carry no session (retryable
-        `insert` / `update` / `delete` / `findAndModify` carry theirs, a
-        `findAndModify` its `needsRetryImage` and its image in
-        `config.image_collection`, since 2026-10-20); and an image is never
-        deleted, where mongod deletes a session's image (an oplogged delete)
-        when its logical-session reaper expires the session, which this
-        server does not run;
-      - an index build over documents is one `createIndexes`, where mongod
-        writes, for the whole command's new indexes as ONE build (measured
-        8.2.11): an insert into `config.system.indexBuilds` (`{_id: build
-        uuid, collectionUUID, commitQuorum: "votingMembers", indexNames}`),
-        `startIndexBuild` (`{startIndexBuild: coll, indexBuildUUID,
-        indexes}`, with `ui`), an update adding `commitReadyMembers:
-        ["<host:port>"]`, then `commitIndexBuild` -- or, when the build
-        fails, `abortIndexBuild` with a `cause` (the error document, `ok:
-        false` first) -- and the row's delete. An empty collection, or one
-        the command creates, gets the single `createIndexes`. The commit has
-        to stay atomic with the catalog write (`commit_index`), the
-        handler's per-spec undo has to become one build's abort, and the
-        change-stream projector and replay have to read `commitIndexBuild`
-        as they read `createIndexes` now.
-      A tool that reads the oplog (`mongodump --oplog`, then
-      `mongorestore --oplogReplay`) gets entries mongod would not write.
+      its session (`lsid`, `txnNumber`, `stmtId`, `prevOpTime`). Since
+      2026-10-26 an index build over documents is mongod's two-phase build
+      in the oplog too (`config.system.indexBuilds` rows around
+      `startIndexBuild` and `commitIndexBuild`, or `abortIndexBuild` with
+      its cause; RM-187). Open: a `bulkWrite` command's writes carry no
+      session (retryable `insert` / `update` / `delete` / `findAndModify`
+      carry theirs, a `findAndModify` its `needsRetryImage` and its image in
+      `config.image_collection`, since 2026-10-20); and an image is never
+      deleted, where mongod deletes a session's image (an oplogged delete)
+      when its logical-session reaper expires the session, which this
+      server does not run. A tool that reads the oplog (`mongodump
+      --oplog`, then `mongorestore --oplogReplay`) gets entries mongod
+      would not write.
       Backlog-ID: RM-224
-      Verify: tests/backlog/test_rm_219_apply_ops.py::test_oplog_entries_have_mongods_shape
+      Verify: tests/backlog/test_rm_219_apply_ops.py::test_bulk_write_entries_carry_their_session
 
 ### 7.085 The shared Rust storage, audited -- 2026-10-20
 
@@ -886,19 +875,6 @@ mongod 8.2.11 with a `secantusd-rs` built from tree `af2629ec`; the rest
 were confirmed by reading the code path and need a fault no quick test can
 inject (a panic, a power loss, a failing checkpoint).
 
-- [ ] **An index build holds every write to its collection off until it
-      finishes.** The build is chunked now (fixed 2026-10-20: it had run as
-      one transaction and never returned under a small cache; at 32 MB it
-      builds over 300,000 300-byte documents in 4 s). But it still holds
-      the global storage lock and the collection lock from its first read
-      to its catalog row, so every DDL, and every write to that collection,
-      waits for the whole build. mongod 8.2.11's build lets writes go on: a
-      side table records the writes made while it scans, and they are
-      applied before the index commits, within
-      `maxIndexBuildMemoryUsageMegabytes`. A build that sorted externally
-      would also stop holding all its entries in memory at once.
-      Backlog-ID: RM-187
-      Verify: none -- a concurrency budget (writes during a long build), not an answer
 - **Scope decision — `compact` compacts the files a collection shares**
   (2026-10-26, RM-192). mongod compacts a collection's own table and its
   indexes'; here a collection's documents are rows in one of sixteen
@@ -948,6 +924,28 @@ inject (a panic, a power loss, a failing checkpoint).
       (2026-10-26).
       Backlog-ID: RM-319
       Verify: tests/backlog/test_rm_192_compact.py::test_local_startup_log_records_each_start
+- [ ] **A transaction older than an index writes past it, and the index
+      misses the document.** A transaction whose snapshot was taken before
+      an index committed (on any collection) and that then writes to the
+      index's collection commits here, and the write reads the index list
+      from its snapshot, so the new index gets no entry for it: a query
+      through the index misses the document. mongod 8.2.11 refuses the
+      write: 112 WriteConflict "Unable to write to collection '<ns>' due to
+      catalog changes; please retry the operation", labelled
+      TransientTransactionError. Found 2026-10-26 while building RM-187; it
+      is older than the hybrid build (any `createIndexes`, and a PG `CREATE
+      INDEX` beside a PG transaction, is exposed). The fix is mongod's: a
+      write whose snapshot predates its collection's last catalog change is
+      a write conflict.
+      Backlog-ID: RM-320
+      Verify: tests/backlog/test_rm_index_build_gaps.py::test_a_transaction_older_than_an_index_cannot_write_past_it
+- [ ] **An index being built is not in `collStats` or `$indexStats`.**
+      mongod 8.2.11 counts an index whose build is still running in
+      `collStats` (`nindexes`, `indexSizes`) and lists it in `$indexStats`
+      with `building: true`; this server leaves it out of both until the
+      build commits (`listIndexes` lists it, since RM-187).
+      Backlog-ID: RM-321
+      Verify: tests/backlog/test_rm_index_build_gaps.py::test_a_building_index_counts_in_stats
 
 ### 7.084 What an authenticated user may run -- 2026-10-14
 

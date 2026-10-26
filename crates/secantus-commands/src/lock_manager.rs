@@ -796,13 +796,24 @@ pub fn statement_rounds(
             }
             // A build: the collection in X while it is set up and committed,
             // IX while it runs; an empty collection builds in one step.
-            let (exclusive, intent) = if facts.is_empty(c) { (1, 1) } else { (3, 5) };
             let mut x = write_round(None);
             x.push((Resource::Collection(format!("{db}.{c}")), X));
             let mut rounds = vec![global(), global()];
             rounds.extend((0..2).map(|_| vec![(Resource::ReplicationStateTransition, Ix)]));
-            rounds.extend((0..exclusive).map(|_| x.clone()));
-            rounds.extend((0..intent).map(|_| write_round(Some(c))));
+            if facts.is_empty(c) {
+                rounds.push(x);
+                rounds.push(write_round(Some(c)));
+                return Some(rounds);
+            }
+            // Over documents the build takes its set-up and commit X rounds
+            // itself (`exclusive_round`), and holds no collection lock while
+            // it scans, so the collection takes writes (RM-187): the round
+            // held through the build is the hierarchy above the collection,
+            // its collection IX counted in a round of its own.
+            rounds.push(x);
+            rounds.extend((0..4).map(|_| write_round(Some(c))));
+            rounds.push(vec![(Resource::Collection(format!("{db}.{c}")), Ix)]);
+            rounds.push(write_round(None));
             Some(rounds)
         }
         "dbStats" => {
@@ -977,7 +988,12 @@ pub fn write_rounds(db: &str, coll: &str, n: usize) -> Option<Guard> {
     }
     let owner = lm.statement_owner();
     acquire_chain(&lm, owner, &round).ok()?;
-    Some(Guard { lm, owner })
+    Some(Guard {
+        lm,
+        owner,
+        // Not the statement's own chain: whose the statement is stays as it was.
+        previous_owner: STATEMENT_OWNER.with(std::cell::Cell::get),
+    })
 }
 
 /// Take a chain in order; a link that fails (the deadline spent mid-chain)
@@ -996,11 +1012,82 @@ pub fn acquire_chain(
     Ok(())
 }
 
+thread_local! {
+    /// The owner of the running statement's locks (`Guard::statement`).
+    static STATEMENT_OWNER: std::cell::Cell<Option<Owner>> = const { std::cell::Cell::new(None) };
+}
+
+/// Holds taken by the running statement on top of its own chain, let go
+/// (and only they) on drop.
+pub struct ExtraHold {
+    lm: std::sync::Arc<LockManager>,
+    owner: Owner,
+    chain: Vec<(Resource, Mode)>,
+}
+
+impl Drop for ExtraHold {
+    fn drop(&mut self) {
+        self.lm.release_holds(self.owner, &self.chain);
+    }
+}
+
+/// mongod's exclusive round on `db.coll`, taken by the running statement
+/// on top of its own locks and let go when the hold drops: what an index
+/// build takes to set up and to commit (RM-187), waiting out the writers
+/// and the open transactions that hold the collection. `None` when no
+/// statement lock manager is in place; an error when the deadline spends
+/// while it waits.
+pub fn exclusive_round(
+    db: &str,
+    coll: &str,
+) -> Option<Result<ExtraHold, secantus_core::deadline::MaxTimeMsExpired>> {
+    let lm = CURRENT.with(|c| c.borrow().clone())?;
+    let owner = STATEMENT_OWNER.with(std::cell::Cell::get)?;
+    let chain = vec![
+        (Resource::ReplicationStateTransition, Mode::Ix),
+        (Resource::Global, Mode::Ix),
+        (Resource::Database(db.to_string()), Mode::Ix),
+        (Resource::Collection(format!("{db}.{coll}")), Mode::X),
+    ];
+    for (i, (res, mode)) in chain.iter().enumerate() {
+        if lm.acquire(owner, res, *mode).is_err() {
+            lm.release_holds(owner, &chain[..i]);
+            return Some(Err(secantus_core::deadline::MaxTimeMsExpired));
+        }
+    }
+    Some(Ok(ExtraHold { lm, owner, chain }))
+}
+
+impl LockManager {
+    /// Let go of one hold of each `(resource, mode)` in `chain` by `owner`
+    /// -- the latest taken -- leaving its other holds as they are.
+    pub fn release_holds(&self, owner: Owner, chain: &[(Resource, Mode)]) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for (res, mode) in chain {
+            if let Some(head) = inner.heads.get_mut(res) {
+                if let Some(i) = head
+                    .holders
+                    .iter()
+                    .rposition(|(o, m)| *o == owner && m == mode)
+                {
+                    head.holders.remove(i);
+                }
+            }
+        }
+        inner
+            .heads
+            .retain(|_, h| !h.holders.is_empty() || !h.queue.is_empty());
+        drop(inner);
+        self.changed.notify_all();
+    }
+}
+
 /// A statement's holds, released on drop (the statement's end — every path,
 /// error replies included).
 pub struct Guard {
     lm: std::sync::Arc<LockManager>,
     owner: Owner,
+    previous_owner: Option<Owner>,
 }
 
 impl Guard {
@@ -1030,6 +1117,7 @@ impl Guard {
             Ok(()) => Some(Ok(Self {
                 lm: lm.clone(),
                 owner,
+                previous_owner: STATEMENT_OWNER.with(|o| o.replace(Some(owner))),
             })),
             Err(_) => Some(Err(crate::CommandError::max_time_expired())),
         }
@@ -1038,6 +1126,7 @@ impl Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
+        STATEMENT_OWNER.with(|o| o.set(self.previous_owner));
         self.lm.release(self.owner);
     }
 }
