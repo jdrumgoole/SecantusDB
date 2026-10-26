@@ -197,6 +197,20 @@ pub trait Storage: Send + Sync {
         }
     }
 
+    /// Snapshot reads at a timestamp (RM-210): the newest timestamp at or
+    /// below which every write has committed, and the oldest one history is
+    /// kept back to -- or `None` for a store that keeps no history (its data
+    /// tables are logged, and WiredTiger keeps no timestamps for those).
+    fn snapshot_clock(&self) -> Option<(bson::Timestamp, bson::Timestamp)> {
+        None
+    }
+
+    /// Run `f` with every read it makes at `at`. The default just runs it.
+    fn read_at(&self, _at: bson::Timestamp, f: &mut dyn FnMut()) -> Result<(), StorageError> {
+        f();
+        Ok(())
+    }
+
     /// The next monotonic cluster time, ADVANCING and persisting it — for
     /// `hello`'s `lastWrite.opTime.ts` (mirrors `Storage.current_cluster_time`).
     /// Minting (rather than peeking) keeps the advertised opTime strictly greater

@@ -216,6 +216,27 @@ impl Connection {
     }
 }
 
+impl Connection {
+    /// `WT_CONNECTION::set_timestamp`, e.g. `"oldest_timestamp=1a2b"` (hex).
+    pub fn set_timestamp(&self, config: &str) -> Result<()> {
+        let f = unsafe { (*self.ptr).set_timestamp }.unwrap();
+        let cfg_c = CString::new(config).map_err(nul_err)?;
+        check(unsafe { f(self.ptr, cfg_c.as_ptr()) })
+    }
+
+    /// `WT_CONNECTION::query_timestamp`, e.g. `"get=oldest_timestamp"`: the
+    /// timestamp in hex, "0" when it has not been set.
+    pub fn query_timestamp(&self, config: &str) -> Result<String> {
+        let f = unsafe { (*self.ptr).query_timestamp }.unwrap();
+        let cfg_c = CString::new(config).map_err(nul_err)?;
+        let mut buf = [0 as c_char; 64];
+        check(unsafe { f(self.ptr, buf.as_mut_ptr(), cfg_c.as_ptr()) })?;
+        Ok(unsafe { CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned())
+    }
+}
+
 impl Drop for Connection {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
@@ -311,6 +332,11 @@ impl Session {
     }
     pub fn rollback_transaction(&self, config: Option<&str>) -> Result<()> {
         self.txn(unsafe { (*self.ptr).rollback_transaction }, config)
+    }
+    /// `WT_SESSION::timestamp_transaction`: set a timestamp of the running
+    /// transaction, e.g. `"commit_timestamp=1a2b"` (hex).
+    pub fn timestamp_transaction(&self, config: &str) -> Result<()> {
+        self.txn(unsafe { (*self.ptr).timestamp_transaction }, Some(config))
     }
     /// `WT_SESSION::reset_snapshot`: give a snapshot transaction a fresh
     /// snapshot. Refused (`ENOTSUP`) once the transaction has written.

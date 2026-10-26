@@ -155,6 +155,9 @@ struct Entry {
     /// The collection the cursor reads, when it is not the one it names (a
     /// view's): its drops, and its indexes', are the ones that kill it.
     reads: Option<String>,
+    /// The timestamp a snapshot read opened the cursor at; its getMores read
+    /// at it too (RM-210).
+    read_at: Option<bson::Timestamp>,
     // The tailable fields below are written by `register_tailable` but only read
     // by the change-stream getMore slice (deferred), so they're allow(dead_code)
     // until that lands.
@@ -378,6 +381,7 @@ impl CursorRegistry {
                 dropped: None,
                 plan_indexes: Vec::new(),
                 reads: None,
+                read_at: crate::snapshot::current(),
                 await_data: false,
                 no_cursor_timeout: false,
                 producer: None,
@@ -425,6 +429,7 @@ impl CursorRegistry {
                 dropped: None,
                 plan_indexes: Vec::new(),
                 reads: None,
+                read_at: crate::snapshot::current(),
                 await_data: opts.await_data,
                 no_cursor_timeout: opts.no_cursor_timeout,
                 producer: Some(producer),
@@ -698,6 +703,12 @@ impl CursorRegistry {
     /// The cursor reads `namespace`, not the view it names: dropping that
     /// collection or one of the plan's indexes kills it, and dropping the
     /// view does not (measured 8.2.11, 2026-10-25).
+    /// The timestamp the cursor reads at, if a snapshot read opened it.
+    pub fn read_at(&self, cursor_id: i64) -> Option<bson::Timestamp> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.cursors.get(&cursor_id).and_then(|e| e.read_at)
+    }
+
     pub fn set_reads(&self, cursor_id: i64, namespace: &str) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(e) = inner.cursors.get_mut(&cursor_id) {

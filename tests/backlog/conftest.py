@@ -153,8 +153,13 @@ def rust_mongo(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Any]:
     )
     try:
         assert proc.stdout is not None
-        line = proc.stdout.readline()
-        m = _RS_BANNER.search(line)
+        # A store that recovers says what it replayed before it listens.
+        line, m = "", None
+        for _ in range(20):
+            line = proc.stdout.readline()
+            m = _RS_BANNER.search(line)
+            if m or not line:
+                break
         assert m, f"secantusd-rs did not start: {line!r}"
         drain_output(proc)
         client = pymongo.MongoClient(

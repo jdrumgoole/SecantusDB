@@ -97,11 +97,11 @@ impl RustServer {
     ///   `checkpoint_seconds` — the storage write-path modes, per store:
     ///   background oplog drainer, non-logged oplog tables, and the
     ///   log-only-the-oplog data mode with its stable-checkpoint cadence.
-    ///   `None` (the default) defers to the matching `SECANTUS_*` env var, so
-    ///   env-driven workflows are unchanged; an explicit value wins over the
-    ///   environment for THIS server only. An existing store's recorded
-    ///   data-logging mode always wins over `data_nonlogged` (the table
-    ///   config is create-time-sticky).
+    ///   `None` (the default) defers to the matching `SECANTUS_*` env var,
+    ///   except `data_nonlogged`, which defaults to on as `secantusd-rs` does
+    ///   (RM-210); an explicit value wins over the environment for THIS
+    ///   server only. An existing store's recorded data-logging mode always
+    ///   wins over `data_nonlogged` (the table config is create-time-sticky).
     /// * `ttl_sweep_seconds` — how often the TTL monitor deletes expired
     ///   documents. `None` (the default) starts it switched off, as mongod's
     ///   is with `ttlMonitorEnabled=false`, so a test's documents stay put
@@ -190,8 +190,10 @@ impl RustServer {
                 wt_config: Some(wt_config(&cache_size, session_max, sync_on_commit, "128MB")),
                 oplog_async,
                 oplog_nonlogged,
-                data_nonlogged,
+                // mongod's split by default, as `secantusd-rs` (RM-210).
+                data_nonlogged: Some(data_nonlogged.unwrap_or(true)),
                 checkpoint_seconds,
+                transactions_logged_at_commit: true,
                 ..StorageOptions::default()
             },
         )

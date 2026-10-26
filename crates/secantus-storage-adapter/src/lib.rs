@@ -221,6 +221,18 @@ impl CmdStorage for StorageAdapter {
             })
     }
 
+    fn snapshot_clock(&self) -> Option<(bson::Timestamp, bson::Timestamp)> {
+        if !self.inner.is_timestamped() {
+            return None;
+        }
+        let oldest = self.inner.oldest_ts().ok()?;
+        Some((self.inner.all_committed_ts(), oldest))
+    }
+
+    fn read_at(&self, at: bson::Timestamp, f: &mut dyn FnMut()) -> Result<(), StorageError> {
+        self.inner.read_at(at, f).map_err(map_err)
+    }
+
     fn begin_user_transaction(&self) -> Result<Box<dyn std::any::Any + Send>, StorageError> {
         let mut h = self.inner.begin_user_transaction().map_err(map_err)?;
         // A collection a MongoDB transaction creates is registered when it

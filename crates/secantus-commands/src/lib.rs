@@ -61,6 +61,7 @@ mod explain;
 mod generic;
 mod hybrid;
 mod index_filters;
+mod snapshot;
 pub use generic::db_field_problem;
 pub mod failpoints;
 pub mod find;
@@ -2024,8 +2025,14 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
     let _current = lock_manager::enter(ctx.locks.as_ref());
     // The command's write statements log themselves when slow, as mongod's do.
     let _slow = slowop::enter(ctx);
-    match handler(doc, ctx) {
-        Ok(reply) => {
+    let (result, read_at) = snapshot::run(doc, command_name(doc), ctx, |ctx| handler(doc, ctx));
+    match result {
+        Ok(mut reply) => {
+            // A snapshot read reports the time it read at (a getMore's
+            // cursor was opened at it, and says nothing).
+            if let Some(at) = read_at.filter(|_| command_name(doc) != "getMore") {
+                snapshot::place_at_cluster_time(&mut reply, at);
+            }
             if budget > 0 {
                 if let Some(e) = expired_write_statement(doc, &reply) {
                     return e.into_reply();
@@ -2446,27 +2453,15 @@ fn attach_cluster_time_gossip(req: &Document, reply: &mut Document, ctx: &Comman
     let ok = matches!(reply.get("ok"), Some(Bson::Double(d)) if *d != 0.0)
         || matches!(reply.get("ok"), Some(Bson::Int32(n)) if *n != 0)
         || matches!(reply.get("ok"), Some(Bson::Int64(n)) if *n != 0);
-    if is_snapshot && ok {
-        match reply.get_mut("cursor") {
-            Some(Bson::Document(cur)) => {
-                if !cur.contains_key("atClusterTime") {
-                    cur.insert("atClusterTime", Bson::Timestamp(ts));
-                }
-            }
-            _ => {
-                if !reply.contains_key("atClusterTime") {
-                    // Just before `ok`, where mongod has it.
-                    let mut out = Document::new();
-                    for (k, v) in std::mem::take(reply) {
-                        if k == "ok" {
-                            out.insert("atClusterTime", Bson::Timestamp(ts));
-                        }
-                        out.insert(k, v);
-                    }
-                    *reply = out;
-                }
-            }
-        }
+    // A store that keeps history read at a timestamp, and `run_handler`
+    // reported it (or, as mongod does, chose not to); one that keeps none
+    // read the latest data, which is as of now.
+    let timestamped = ctx
+        .storage
+        .as_ref()
+        .is_some_and(|s| s.snapshot_clock().is_some());
+    if is_snapshot && ok && !timestamped {
+        snapshot::place_at_cluster_time(reply, ts);
     }
 }
 
@@ -2711,26 +2706,7 @@ fn validate_read_concern(
     // (`minSnapshotHistoryWindowInSeconds`); this server keeps none older,
     // so a time before that has no snapshot to read. Said last: a command
     // that takes no snapshot at all says that first.
-    let too_old = || -> Result<(), CommandError> {
-        let Some(Bson::Timestamp(at)) = rc.get("atClusterTime") else {
-            return Ok(());
-        };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        if u64::from(at.time) + 300 < now {
-            return Err(CommandError::new(
-                239,
-                "SnapshotTooOld",
-                format!(
-                    "Read timestamp Timestamp({}, {}) is older than the oldest available \
-                     timestamp.",
-                    at.time, at.increment
-                ),
-            ));
-        }
-        Ok(())
-    };
+    let too_old = || snapshot::check_at(rc, ctx);
     let reason = if !reads {
         // An unknown command is CommandNotFound, whatever it carries.
         if lookup(name).is_none() {

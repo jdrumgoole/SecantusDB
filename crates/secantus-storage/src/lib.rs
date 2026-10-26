@@ -131,6 +131,14 @@ pub struct StorageOptions {
     /// engine. `None` / 0 disables it (the default), preserving today's
     /// behaviour exactly. See [`crate::admission`] for why this exists.
     pub write_tickets: Option<usize>,
+    /// Log a user transaction's writes as mongod does: held to its commit,
+    /// then minted together and committed at their first timestamp, so a
+    /// read at a time before the commit never sees it (RM-210, RM-314).
+    /// Only in a timestamped store; the MongoDB server asks for it. Without
+    /// it each statement mints its own entries as it runs (the PostgreSQL
+    /// server's prepared transactions and read-committed rebases rely on
+    /// that), and its writes commit at the first of them.
+    pub transactions_logged_at_commit: bool,
 }
 
 /// A block's own rows of one table: see [`Storage::block_overlay`].
@@ -420,7 +428,7 @@ impl UserTransactionHandle {
         let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
         self.minted_total = 0;
         for (start, end) in self.minted_ranges.drain(..) {
-            let removed = st.in_flight.remove(&start);
+            let removed = st.in_flight.remove(&start).map(|(e, _)| e);
             debug_assert_eq!(removed, Some(end), "in-flight window out of sync");
         }
         self.oplog_cv.notify_all();
@@ -4734,6 +4742,13 @@ pub struct Storage {
     /// is create-time-sticky, so the env var is only consulted for fresh
     /// stores — and recorded in the marker at first checkpoint.
     data_nonlogged: bool,
+    /// Whether this store's writes carry WiredTiger commit timestamps, so a
+    /// read can be made at a past one (snapshot reads, RM-210). Only a store
+    /// whose data tables are not logged: WiredTiger ignores timestamps on a
+    /// logged table.
+    timestamped: bool,
+    /// See [`StorageOptions::transactions_logged_at_commit`].
+    oplog_at_commit: bool,
     /// Highest oplog seq covered by the last stable checkpoint: the replay
     /// floor after a crash and the prune clamp (entries above it are the
     /// recovery source and must not be pruned). 0 until the first checkpoint.
@@ -4823,7 +4838,13 @@ struct OplogState {
     /// range vanishes and `min` moves on — a permanent seq hole, which the
     /// shard merge already tolerates. Empty in async mode (async mints
     /// post-commit; `written_seq` governs visibility there).
-    in_flight: BTreeMap<i64, i64>,
+    in_flight: BTreeMap<i64, (i64, u64)>,
+    /// Commit timestamps reserved for transactions that mint no oplog entry
+    /// of their own (`reserve_stamp`), each with the next seq when it was
+    /// taken: every entry from that seq on is later in time. They hold the
+    /// all-committed point, and the stable checkpoint's marker, below them
+    /// until their transaction resolves (RM-210).
+    ts_reserved: BTreeMap<u64, i64>,
 }
 
 /// Record that the seq range `[start, start + n)` is durably persisted and advance
@@ -4885,6 +4906,12 @@ thread_local! {
     /// `rollback_user_transaction` deregister at the real resolution point.
     /// Empty (and untouched) in async mode and for bare autocommit emits.
     static PENDING_MINTED: RefCell<Vec<(i64, i64)>> = const { RefCell::new(Vec::new()) };
+    /// While crash recovery replays an oplog entry: that entry's timestamp,
+    /// which the replayed write commits at (RM-210). 0 otherwise.
+    static REPLAY_TS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The commit timestamp reserved for the statement transaction running
+    /// on this thread (`reserve_stamp`), released when it resolves. 0: none.
+    static STMT_RESERVED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Bytes of oplog-entry payload emitted by the current user-transaction
     /// statement — harvested onto the handle by `with_user_transaction` (the
     /// same pattern as `PENDING_MINTED`) to enforce the transaction dirty
@@ -5996,6 +6023,107 @@ fn now_secs() -> i64 {
 /// Recover the oplog counters on open: the persisted meta row clamped UP to
 /// what the tables actually contain, else reconstruct from the newest oplog
 /// row. Mirrors `storage._load_oplog_meta`.
+/// How far back a read at a past timestamp can reach: mongod's
+/// `minSnapshotHistoryWindowInSeconds` default.
+const SNAPSHOT_HISTORY_SECONDS: i64 = 300;
+
+/// Move a timestamped store's WiredTiger clocks on (RM-210): the stable
+/// timestamp to the all-committed point -- what a checkpoint keeps of the
+/// data tables, and the replay floor after a crash -- and the oldest to
+/// `min(now - 300 s, stable)`, below which history is let go. Returns the
+/// oplog seq that matches the stable timestamp: every entry at or below it
+/// is at or below it in time, and committed. Neither clock moves backwards.
+fn advance_timestamps(conn: &Connection, oplog: &Mutex<OplogState>) -> Result<i64> {
+    let (seq, stable) = {
+        let st = oplog.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            Storage::all_committed_seq_locked(&st),
+            Storage::all_committed_ts_locked(&st),
+        )
+    };
+    if stable > 0 {
+        conn.set_timestamp(&format!("stable_timestamp={stable:x}"))?;
+        let floor = ((now_secs() - SNAPSHOT_HISTORY_SECONDS).max(0) as u64) << 32;
+        let oldest = floor.min(stable);
+        if oldest > 0 {
+            conn.set_timestamp(&format!("oldest_timestamp={oldest:x}"))?;
+        }
+    }
+    Ok(seq)
+}
+
+/// Reserve a commit timestamp for a transaction that mints no oplog entry of
+/// its own, with a seq that stays in flight -- holding the all-committed
+/// point below it -- until [`release_stamp`] (RM-210).
+fn reserve_stamp(oplog: &Mutex<OplogState>) -> u64 {
+    let mut st = oplog.lock().unwrap_or_else(|e| e.into_inner());
+    let ts = ts_u64(Storage::mint_ts(&mut st));
+    let floor = st.next_seq;
+    st.ts_reserved.insert(ts, floor);
+    ts
+}
+
+/// The end of a [`reserve_stamp`] reservation: its transaction committed or
+/// rolled back.
+fn release_stamp(oplog: &Mutex<OplogState>, ts: u64) {
+    let mut st = oplog.lock().unwrap_or_else(|e| e.into_inner());
+    st.ts_reserved.remove(&ts);
+}
+
+/// Releases a [`reserve_stamp`] reservation when dropped.
+struct ReleaseStamp<'a>(&'a Mutex<OplogState>, u64);
+
+impl Drop for ReleaseStamp<'_> {
+    fn drop(&mut self) {
+        release_stamp(self.0, self.1);
+    }
+}
+
+/// Commit `session`'s transaction: at a timestamp of its own when the store
+/// is timestamped (WiredTiger refuses a write without one to a key that has
+/// had one), as is when it is not.
+fn commit_stamped(session: &Session, oplog: &Mutex<OplogState>, timestamped: bool) -> Result<()> {
+    if !timestamped {
+        return session.commit_transaction(None).map_err(Into::into);
+    }
+    let ts = reserve_stamp(oplog);
+    let out = session
+        .timestamp_transaction(&format!("commit_timestamp={ts:x}"))
+        .and_then(|()| session.commit_transaction(None));
+    release_stamp(oplog, ts);
+    out.map_err(Into::into)
+}
+
+/// A BSON timestamp as WiredTiger's 64-bit one: seconds high, increment low.
+fn ts_u64(t: bson::Timestamp) -> u64 {
+    ((t.time as u64) << 32) | t.increment as u64
+}
+
+/// The inverse of [`ts_u64`].
+fn u64_ts(t: u64) -> bson::Timestamp {
+    bson::Timestamp {
+        time: (t >> 32) as u32,
+        increment: t as u32,
+    }
+}
+
+/// Whether an existing store's data tables were created without logging, as
+/// WiredTiger's metadata records the catalog table's file; `None` for a
+/// store that has none yet.
+fn stored_data_logging(session: &Session) -> Result<Option<bool>> {
+    let cur = session.open_cursor("metadata:", None)?;
+    let file = COLL_TABLE.replacen("table:", "file:", 1) + ".wt";
+    cur.set_key_s(&file);
+    match cur.search() {
+        Ok(()) => {
+            let config = cur.get_value_s()?;
+            Ok(Some(config.contains("log=(enabled=false)")))
+        }
+        Err(e) if e.is_not_found() => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Read the Phase-A' stable-checkpoint marker row: `(stable_seq,
 /// data_nonlogged)`, or `None` for a store that has never written one. The
 /// row lives in the (always WAL-logged) oplog-meta table under its own key so
@@ -6075,6 +6203,7 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
                     written_seq: 0, // set to next_seq-1 by the caller (open)
                     done_ranges: BTreeMap::new(),
                     in_flight: BTreeMap::new(),
+                    ts_reserved: BTreeMap::new(),
                 });
             }
         }
@@ -6112,6 +6241,7 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
         written_seq: 0, // set to next_seq-1 by the caller (open)
         done_ranges: BTreeMap::new(),
         in_flight: BTreeMap::new(),
+        ts_reserved: BTreeMap::new(),
     })
 }
 
@@ -6596,6 +6726,14 @@ impl Storage {
             .unwrap_or_else(|| std::env::var_os("SECANTUS_OPLOG_ASYNC").is_some());
         let in_memory = config.contains("in_memory=true");
         let conn = Arc::new(Connection::open(home, config)?);
+        // An existing store's mode is the one its tables were created with,
+        // read from WiredTiger's own metadata before anything is created: a
+        // logged store records no mode of its own, and neither does a
+        // non-logged one before its first checkpoint.
+        let stored_mode = {
+            let session = conn.open_session()?;
+            stored_data_logging(&session)?
+        };
         let mut state = {
             let boot = conn.open_session()?;
             for (name, fmt) in BOOTSTRAP {
@@ -6677,10 +6815,7 @@ impl Storage {
         let data_nonlogged = if in_memory {
             false
         } else {
-            match marker {
-                Some((_, mode)) => mode,
-                None => data_create_mode,
-            }
+            stored_mode.unwrap_or(data_create_mode)
         };
         let stable_seq = Arc::new(AtomicI64::new(marker.map(|(s, _)| s).unwrap_or(0)));
         let checkpoint_requested = Arc::new(AtomicBool::new(false));
@@ -6703,7 +6838,16 @@ impl Storage {
         let prune_join = Mutex::new(Some(spawn_oplog_pruner(prune_ctx.clone())));
         // Opt-in: spawn the background drainer pool (option, else
         // SECANTUS_OPLOG_ASYNC). The synchronous, atomic path is the default.
-        let async_oplog = if oplog_async_on {
+        // A timestamped store stamps each write with its oplog timestamp,
+        // which the async drainer mints only after the write commits: it
+        // keeps the synchronous oplog.
+        if oplog_async_on && data_nonlogged {
+            eprintln!(
+                "secantus-storage: the asynchronous oplog is not used on a store whose data \
+                 tables are not logged (its writes carry their oplog timestamps)"
+            );
+        }
+        let async_oplog = if oplog_async_on && !data_nonlogged {
             Some(spawn_oplog_drainer(
                 conn.clone(),
                 oplog.clone(),
@@ -6754,6 +6898,8 @@ impl Storage {
             oplog_nonlogged,
             checkpoint_seconds: opts.checkpoint_seconds,
             data_nonlogged,
+            timestamped: data_nonlogged,
+            oplog_at_commit: data_nonlogged && opts.transactions_logged_at_commit,
             stable_seq,
             checkpoint_stop: Arc::new(AtomicBool::new(false)),
             checkpoint_requested,
@@ -7042,6 +7188,10 @@ impl Storage {
                 IN_SYNC_STMT.with(|f| f.set(false));
                 let ranges = PENDING_MINTED.with(|p| std::mem::take(&mut *p.borrow_mut()));
                 self.0.deregister_in_flight(&ranges);
+                let reserved = STMT_RESERVED.with(|r| r.replace(0));
+                if reserved != 0 {
+                    release_stamp(&self.0.oplog, reserved);
+                }
             }
         }
         let _sync_scope = if async_mode {
@@ -7075,6 +7225,21 @@ impl Storage {
         session.begin_transaction(None)?;
         match f() {
             Ok(v) => {
+                if !async_mode {
+                    let minted = PENDING_MINTED.with(|p| p.borrow().clone());
+                    if let Some((ts, reserved)) = self.commit_stamp(&minted) {
+                        if reserved {
+                            // Released after the commit or rollback below.
+                            STMT_RESERVED.with(|r| r.set(ts));
+                        }
+                        if let Err(e) =
+                            session.timestamp_transaction(&format!("commit_timestamp={ts:x}"))
+                        {
+                            let _ = session.rollback_transaction(None);
+                            return Err(e.into());
+                        }
+                    }
+                }
                 // A write that noted no row (a registry or index change, a
                 // write of no document) is recorded as touching everything.
                 let written = (self.enable_oplog
@@ -7155,11 +7320,143 @@ impl Storage {
         let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
         let start = st.next_seq;
         st.next_seq += n as i64;
-        if track_in_flight {
-            st.in_flight.insert(start, start + n as i64);
-        }
         let ts: Vec<bson::Timestamp> = (0..n).map(|_| Self::mint_ts(&mut st)).collect();
+        if track_in_flight {
+            let first = ts.first().map_or(0, |t| ts_u64(*t));
+            st.in_flight.insert(start, (start + n as i64, first));
+        }
         (start, ts)
+    }
+
+    /// The newest timestamp at or below which every write has committed
+    /// (mongod's all-durable point): just below the oldest write still in
+    /// flight, else the newest timestamp minted. Caller holds the oplog
+    /// mutex.
+    fn all_committed_ts_locked(st: &OplogState) -> u64 {
+        let minted = st.in_flight.values().next().map(|(_, first)| *first);
+        let reserved = st.ts_reserved.keys().next().copied();
+        match minted.into_iter().chain(reserved).min() {
+            Some(first) => first.saturating_sub(1),
+            None => ((st.last_ts_secs as u64) << 32) | st.last_ts_ord as u64,
+        }
+    }
+
+    /// The oplog seq that matches [`Self::all_committed_ts_locked`]: the
+    /// visible tail, and below every entry minted after a timestamp still
+    /// reserved. Caller holds the oplog mutex.
+    fn all_committed_seq_locked(st: &OplogState) -> i64 {
+        let tail = Self::visible_tail(st);
+        match st.ts_reserved.values().min() {
+            Some(floor) => tail.min(floor - 1),
+            None => tail,
+        }
+    }
+
+    /// See [`Self::all_committed_ts_locked`].
+    pub fn all_committed_ts(&self) -> bson::Timestamp {
+        let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+        u64_ts(Self::all_committed_ts_locked(&st))
+    }
+
+    /// Whether this store keeps the history a read at a past timestamp needs.
+    pub fn is_timestamped(&self) -> bool {
+        self.timestamped
+    }
+
+    /// WiredTiger's oldest timestamp: a read below it has no history to read
+    /// (mongod's 239 SnapshotTooOld). Zero before the first one is set.
+    pub fn oldest_ts(&self) -> Result<bson::Timestamp> {
+        let hex = self.conn.query_timestamp("get=oldest_timestamp")?;
+        Ok(u64_ts(u64::from_str_radix(&hex, 16).unwrap_or(0)))
+    }
+
+    /// Run `f` with every read it makes on this thread at `at` (RM-210): in
+    /// one WiredTiger transaction begun with `read_timestamp`, installed as
+    /// the user transactions' sessions are, and rolled back after. The
+    /// catalog is read at `at` too, so a collection created later is not
+    /// there. Inside a user transaction `f` reads in that transaction's own
+    /// snapshot. The caller checks `at` against [`Self::oldest_ts`] and
+    /// [`Self::all_committed_ts`] first; a store that is not timestamped
+    /// keeps no history to read.
+    pub fn read_at<T>(&self, at: bson::Timestamp, f: impl FnOnce() -> T) -> Result<T> {
+        if !ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
+            return Ok(f());
+        }
+        if !self.timestamped {
+            return Err(StorageError::Internal(
+                "a read at a past timestamp on a store that keeps no history".into(),
+            ));
+        }
+        let session = self.conn.open_session()?;
+        session.begin_transaction(Some(&format!("read_timestamp={:x}", ts_u64(at))))?;
+        struct Installed(*const Session, *mut UserTransactionHandle);
+        impl Drop for Installed {
+            fn drop(&mut self) {
+                ACTIVE_TXN_SESSION.with(|c| c.set(self.0));
+                ACTIVE_HANDLE.with(|c| c.set(self.1));
+            }
+        }
+        let out = {
+            let _restore = Installed(
+                ACTIVE_TXN_SESSION.with(|c| c.replace(&session as *const Session)),
+                ACTIVE_HANDLE.with(|c| c.replace(std::ptr::null_mut())),
+            );
+            f()
+        };
+        session.rollback_transaction(None)?;
+        Ok(out)
+    }
+
+    /// Run a write `f` makes on a session of its own outside any statement
+    /// -- a catalog, index-catalog or user-record write. In a timestamped
+    /// store it is a statement transaction, so it commits at a timestamp
+    /// (WiredTiger refuses a write without one to a key that has had one)
+    /// and any oplog entry it emits shares it; elsewhere each of its writes
+    /// commits on its own, as before.
+    fn catalog_write<T>(&self, f: impl FnOnce(&Session) -> Result<T>) -> Result<T> {
+        self.catalog_write_on(OpSession::Fresh(self.conn.open_session()?), f)
+    }
+
+    /// [`Self::catalog_write`] on `op`: on a user transaction's session the
+    /// write is that transaction's, and commits with it.
+    fn catalog_write_on<T>(
+        &self,
+        op: OpSession<'_>,
+        f: impl FnOnce(&Session) -> Result<T>,
+    ) -> Result<T> {
+        if !self.timestamped {
+            return f(&op);
+        }
+        self.with_statement_txn(&op, || f(&op))
+    }
+
+    /// The commit timestamp of a write transaction in a timestamped store
+    /// (RM-210): the earliest timestamp it minted for its oplog entries, so
+    /// all of it becomes visible at once and a stable checkpoint at or after
+    /// that timestamp holds all of it; else a timestamp reserved for it now
+    /// (with a seq of its own, which stays in flight until it resolves --
+    /// returned as the second value, for the caller to deregister); during
+    /// crash recovery, the replayed entry's own. `None` in a store that is
+    /// not timestamped.
+    fn commit_stamp(&self, minted: &[(i64, i64)]) -> Option<(u64, bool)> {
+        if !self.timestamped {
+            return None;
+        }
+        let replay = REPLAY_TS.with(|c| c.get());
+        if replay != 0 {
+            return Some((replay, false));
+        }
+        {
+            let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+            let first = minted
+                .iter()
+                .filter_map(|(start, _)| st.in_flight.get(start).map(|(_, ts)| *ts))
+                .min();
+            if let Some(ts) = first {
+                return Some((ts, false));
+            }
+        }
+        Some((reserve_stamp(&self.oplog), true))
     }
 
     /// The sync-mode visible tail: the largest seq below which nothing can
@@ -7181,7 +7478,7 @@ impl Storage {
         }
         let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
         for (start, end) in ranges {
-            let removed = st.in_flight.remove(start);
+            let removed = st.in_flight.remove(start).map(|(e, _)| e);
             debug_assert_eq!(removed, Some(*end), "in-flight window out of sync");
         }
         self.oplog_cv.notify_all();
@@ -7370,7 +7667,11 @@ impl Storage {
         // `written_seq` run (a stall). So an emit outside a wrapped statement
         // (IN_ASYNC_STMT false — e.g. the noop heartbeat) buffers and drains
         // immediately, treating itself as its own committed unit.
-        if self.async_oplog.is_some() {
+        // A timestamped store holds a user transaction's entries the same way
+        // (`with_user_transaction` sets `IN_ASYNC_STMT` across its statements)
+        // and writes them all at its commit, under one run of timestamps
+        // taken then -- mongod's single `applyOps` at the commit timestamp.
+        if self.async_oplog.is_some() || IN_ASYNC_STMT.with(|f| f.get()) {
             PENDING_OPLOG.with(|p| {
                 let mut p = p.borrow_mut();
                 for pair in entries.into_iter().zip(pre_images) {
@@ -7387,7 +7688,6 @@ impl Storage {
             }
             return Ok(0);
         }
-        let n = entries.len() as i64;
         // Whose commit resolves this mint? Inside a `with_statement_txn` scope
         // or a user transaction the rows commit later — park the range in
         // `PENDING_MINTED` for the transaction's resolution point to
@@ -7395,6 +7695,22 @@ impl Storage {
         // cursor inserts autocommit, so the range deregisters inline below.
         let deferred =
             IN_SYNC_STMT.with(|f| f.get()) || !ACTIVE_TXN_SESSION.with(|c| c.get()).is_null();
+        self.mint_and_write(session, entries, pre_images, deferred)
+    }
+
+    /// Mint `entries` a contiguous run of seqs and timestamps and write them,
+    /// with their pre-images, on `session`. `deferred`: the rows commit with
+    /// a transaction still open, whose resolution deregisters the run (it is
+    /// parked in `PENDING_MINTED`); otherwise each insert committed on its
+    /// own and the run deregisters here.
+    fn mint_and_write(
+        &self,
+        session: &Session,
+        entries: Vec<OplogEntry>,
+        pre_images: Vec<Option<Vec<u8>>>,
+        deferred: bool,
+    ) -> Result<i64> {
+        let n = entries.len() as i64;
         let rw_at = entries.iter().rposition(has_retryable_stamp);
         let (start, ts) = self.mint_seq_and_ts(entries.len(), true);
         if let Some(i) = rw_at {
@@ -7470,7 +7786,7 @@ impl Storage {
         let do_prune = {
             let mut g = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
             if !deferred {
-                let removed = g.in_flight.remove(&start);
+                let removed = g.in_flight.remove(&start).map(|(e, _)| e);
                 debug_assert_eq!(removed, Some(start + n), "in-flight window out of sync");
                 self.oplog_cv.notify_all();
             }
@@ -7943,6 +8259,10 @@ impl Storage {
     /// `Storage` is dropped.
     pub fn checkpoint(&self) -> Result<()> {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        if self.timestamped {
+            // A checkpoint keeps the data tables as of the stable timestamp.
+            advance_timestamps(&self.conn, &self.oplog)?;
+        }
         let session = self.conn.open_session()?;
         session.checkpoint(None)?;
         Ok(())
@@ -8033,7 +8353,11 @@ impl Storage {
         // the crash window leaves the OLD marker: replay covers extra
         // already-applied entries, which `apply_replay_entry_idempotent`
         // exists to absorb. Stale-marker is safe; eager-marker loses data.
-        let stable = self.oplog_visible_tail_seq();
+        let stable = if self.timestamped {
+            advance_timestamps(&self.conn, &self.oplog)?
+        } else {
+            self.oplog_visible_tail_seq()
+        };
         self.checkpoint()?;
         {
             let session = self.conn.open_session()?;
@@ -8062,6 +8386,16 @@ impl Storage {
         let mut next = floor + 1;
         let mut applied = 0u64;
         let mut skipped = 0u64;
+        // A timestamped store's checkpoint holds every write committed at or
+        // below the stable timestamp it was taken at, whatever the marker
+        // says: an entry at or below it is already there, and WiredTiger
+        // would refuse to commit it again that far back.
+        let recovered = if self.timestamped {
+            let hex = self.conn.query_timestamp("get=recovery")?;
+            u64::from_str_radix(&hex, 16).unwrap_or(0)
+        } else {
+            0
+        };
         let result = loop {
             let rows = match self.read_oplog(next, 2000) {
                 Ok(r) => r,
@@ -8080,7 +8414,19 @@ impl Storage {
                         continue;
                     }
                 };
-                match self.apply_replay_entry_idempotent(&entry) {
+                let ts = match entry.get("ts") {
+                    Some(Bson::Timestamp(t)) => ts_u64(*t),
+                    _ => 0,
+                };
+                if self.timestamped && ts <= recovered {
+                    skipped += 1;
+                    continue;
+                }
+                // The replayed write commits at its entry's own timestamp.
+                REPLAY_TS.with(|c| c.set(if self.timestamped { ts } else { 0 }));
+                let outcome = self.apply_replay_entry_idempotent(&entry);
+                REPLAY_TS.with(|c| c.set(0));
+                match outcome {
                     Ok(true) => applied += 1,
                     Ok(false) => skipped += 1,
                     Err(e) => {
@@ -8158,6 +8504,7 @@ impl Storage {
         let oplog = self.oplog.clone();
         let stable_seq = self.stable_seq.clone();
         let gate = self.checkpoint_gate.clone();
+        let timestamped = self.timestamped;
         let handle = thread::Builder::new()
             .name(
                 if stable {
@@ -8177,6 +8524,15 @@ impl Storage {
                     }
                     std::thread::sleep(tick);
                     waited += tick;
+                    if timestamped {
+                        // The oldest timestamp trails the clock by the
+                        // snapshot window, not by a checkpoint interval.
+                        if let Err(e) = advance_timestamps(&conn, &oplog) {
+                            eprintln!(
+                                "secantus-storage: moving the stable timestamp failed: {e:?}"
+                            );
+                        }
+                    }
                     let demanded = requested.swap(false, Ordering::AcqRel);
                     if waited < interval && !demanded {
                         continue;
@@ -8202,13 +8558,17 @@ impl Storage {
                     // recovery trusts a marker above the checkpointed data
                     // and replay skips acked writes. Stale marker = safe
                     // (idempotent over-replay); eager marker = data loss.
-                    let stable = {
-                        let st = oplog.lock().unwrap_or_else(|e| e.into_inner());
-                        if st.in_flight.is_empty() {
-                            st.next_seq - 1
-                        } else {
-                            *st.in_flight.keys().next().unwrap() - 1
+                    let stable = if timestamped {
+                        match advance_timestamps(&conn, &oplog) {
+                            Ok(seq) => seq,
+                            Err(e) => {
+                                eprintln!("secantus-storage: stable checkpoint failed: {e:?}");
+                                continue;
+                            }
                         }
+                    } else {
+                        let st = oplog.lock().unwrap_or_else(|e| e.into_inner());
+                        Storage::visible_tail(&st)
                     };
                     let write = (|| -> Result<()> {
                         let session = conn.open_session()?;
@@ -8259,6 +8619,9 @@ impl Storage {
         // Sync mode: waits out any in-flight mint window (usually a no-op).
         // The drainers never take `self.lock`, so waiting here cannot deadlock.
         self.flush_oplog();
+        if self.timestamped {
+            advance_timestamps(&self.conn, &self.oplog)?;
+        }
         let session = self.conn.open_session()?;
         // Durable, consistent snapshot first; the backup cursor enumerates the
         // files that make it up and WiredTiger holds them stable for the cursor's
@@ -8463,13 +8826,14 @@ impl Storage {
         // then the collection lock — see `lock`'s ordering rules).
         let ns_lock = self.coll_lock(db, coll);
         let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let session = self.conn.open_session()?;
-        ensure_collection(&session, db, coll, self.data_nonlogged)?;
-        let mut current = coll_options(&session, db, coll)?.unwrap_or_default();
-        for (k, v) in opts {
-            current.insert(k.clone(), v.clone());
-        }
-        write_coll_options(&session, db, coll, &current)
+        self.catalog_write(|session| {
+            ensure_collection(session, db, coll, self.data_nonlogged)?;
+            let mut current = coll_options(session, db, coll)?.unwrap_or_default();
+            for (k, v) in opts {
+                current.insert(k.clone(), v.clone());
+            }
+            write_coll_options(session, db, coll, &current)
+        })
     }
 
     /// `collMod`: merge `opts` into the collection's stored options (like
@@ -8499,45 +8863,46 @@ impl Storage {
         // then the collection lock — see `lock`'s ordering rules).
         let ns_lock = self.coll_lock(db, coll);
         let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let session = self.conn.open_session()?;
-        ensure_collection(&session, db, coll, self.data_nonlogged)?;
-        let mut current = coll_options(&session, db, coll)?.unwrap_or_default();
-        // The options BEFORE the merge below: mongod puts these on the `modify`
-        // change event as `stateBeforeChange`, and stores them in the oplog
-        // entry's `o2.collectionOptions_old` (probed 8.2.11).
-        let state_before = current.clone();
-        for (k, v) in opts {
-            current.insert(k.clone(), v.clone());
-        }
-        write_coll_options(&session, db, coll, &current)?;
-        if self.enable_oplog {
-            let ui = collection_uuid(&session, db, coll)?;
-            let mut o = Document::new();
-            o.insert("collMod", coll);
-            for (k, v) in given {
-                o.insert(k.clone(), v.clone());
+        self.catalog_write(|session| {
+            ensure_collection(session, db, coll, self.data_nonlogged)?;
+            let mut current = coll_options(session, db, coll)?.unwrap_or_default();
+            // The options BEFORE the merge below: mongod puts these on the `modify`
+            // change event as `stateBeforeChange`, and stores them in the oplog
+            // entry's `o2.collectionOptions_old` (probed 8.2.11).
+            let state_before = current.clone();
+            for (k, v) in opts {
+                current.insert(k.clone(), v.clone());
             }
-            // `uuid` is set explicitly and any inbound one dropped, so the
-            // stored value is the BSON binary form and leads the document --
-            // mongod's key order.
-            let mut old_opts = Document::new();
-            old_opts.insert("uuid", uuid_binary(&ui));
-            for (k, v) in &state_before {
-                if k != "uuid" {
-                    old_opts.insert(k.clone(), v.clone());
+            write_coll_options(session, db, coll, &current)?;
+            if self.enable_oplog {
+                let ui = collection_uuid(session, db, coll)?;
+                let mut o = Document::new();
+                o.insert("collMod", coll);
+                for (k, v) in given {
+                    o.insert(k.clone(), v.clone());
                 }
+                // `uuid` is set explicitly and any inbound one dropped, so the
+                // stored value is the BSON binary form and leads the document --
+                // mongod's key order.
+                let mut old_opts = Document::new();
+                old_opts.insert("uuid", uuid_binary(&ui));
+                for (k, v) in &state_before {
+                    if k != "uuid" {
+                        old_opts.insert(k.clone(), v.clone());
+                    }
+                }
+                let mut o2 = Document::new();
+                o2.insert("collectionOptions_old", Bson::Document(old_opts));
+                let mut entry = Document::new();
+                entry.insert("op", "c");
+                entry.insert("ns", format!("{db}.$cmd"));
+                entry.insert("ui", uuid_binary(&ui));
+                entry.insert("o", Bson::Document(o));
+                entry.insert("o2", Bson::Document(o2));
+                self.emit_oplog(session, vec![entry], vec![None])?;
             }
-            let mut o2 = Document::new();
-            o2.insert("collectionOptions_old", Bson::Document(old_opts));
-            let mut entry = Document::new();
-            entry.insert("op", "c");
-            entry.insert("ns", format!("{db}.$cmd"));
-            entry.insert("ui", uuid_binary(&ui));
-            entry.insert("o", Bson::Document(o));
-            entry.insert("o2", Bson::Document(o2));
-            self.emit_oplog(&session, vec![entry], vec![None])?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// The collection's 16-byte UUID (minting + persisting one on first use).
@@ -8890,7 +9255,7 @@ fn prune_oplog_sweep(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
             }
             return Err(e);
         }
-        session.commit_transaction(None)?;
+        commit_stamped(&session, &ctx.oplog, ctx.data_nonlogged)?;
         pruned += batch.len();
         // Keep the live-count honest for the next sweep's sizing -- per
         // committed batch, so a later batch's failure leaves it exact.
@@ -9403,7 +9768,9 @@ impl Storage {
         let async_scope = AsyncHarvest {
             handle: hp,
             prev: IN_ASYNC_STMT.with(|f| f.get()),
-            active: self.async_oplog.is_some(),
+            // A store logging transactions at their commit holds its
+            // entries to the commit too.
+            active: self.async_oplog.is_some() || self.oplog_at_commit,
         };
         if async_scope.active {
             IN_ASYNC_STMT.with(|f| f.set(true));
@@ -9506,6 +9873,41 @@ impl Storage {
             let began = handle.began;
             handle.began = false;
             if began {
+                if wrote && self.async_oplog.is_none() && !handle.pending_async.is_empty() {
+                    // A timestamped store's transaction held its entries
+                    // (`emit_oplog_entries`): they are minted now, together,
+                    // and written in the transaction, so its data commits at
+                    // their first timestamp -- later than every read made
+                    // before it commits.
+                    let (entries, pres): (Vec<_>, Vec<_>) =
+                        std::mem::take(&mut handle.pending_async)
+                            .into_iter()
+                            .unzip();
+                    let written = self.mint_and_write(&session, entries, pres, true);
+                    handle
+                        .minted_ranges
+                        .extend(PENDING_MINTED.with(|p| std::mem::take(&mut *p.borrow_mut())));
+                    if let Err(e) = written {
+                        handle.deregister_minted();
+                        return Err(e);
+                    }
+                }
+                let mut _reserved: Option<ReleaseStamp<'_>> = None;
+                if wrote && self.async_oplog.is_none() {
+                    if let Some((ts, reserved)) = self.commit_stamp(&handle.minted_ranges) {
+                        if reserved {
+                            // Released after the commit, whatever its outcome.
+                            _reserved = Some(ReleaseStamp(&self.oplog, ts));
+                        }
+                        if let Err(e) =
+                            session.timestamp_transaction(&format!("commit_timestamp={ts:x}"))
+                        {
+                            handle.deregister_minted();
+                            handle.pending_async.clear();
+                            return Err(e.into());
+                        }
+                    }
+                }
                 // A transaction that wrote nothing (a reader, a FOR SHARE
                 // holder) changes no row: its commit is not counted, so a
                 // waiter that outlived it may carry on its own snapshot
@@ -12634,19 +13036,20 @@ impl Storage {
     /// Give a newly created role the next creation sequence.
     fn stamp_role_seq(&self, db: &str, name: &str) -> Result<()> {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let session = self.conn.open_session()?;
-        let cur = session.open_cursor(ROLE_SEQ_TABLE, None)?;
-        let mut last = 0i64;
-        let mut more = cur.next()?;
-        while more {
-            last = last.max(cur.get_value_q()?);
-            more = cur.next()?;
-        }
-        let put = session.open_cursor(ROLE_SEQ_TABLE, None)?;
-        put.set_key_ss(db, name);
-        put.set_value_q(last + 1);
-        put.insert()?;
-        Ok(())
+        self.catalog_write(|session| {
+            let cur = session.open_cursor(ROLE_SEQ_TABLE, None)?;
+            let mut last = 0i64;
+            let mut more = cur.next()?;
+            while more {
+                last = last.max(cur.get_value_q()?);
+                more = cur.next()?;
+            }
+            let put = session.open_cursor(ROLE_SEQ_TABLE, None)?;
+            put.set_key_ss(db, name);
+            put.set_value_q(last + 1);
+            put.insert()?;
+            Ok(())
+        })
     }
 
     /// Fetch a custom-role record (BSON blob) or `None`. Mirrors
@@ -12762,12 +13165,13 @@ impl Storage {
         doc.insert("sampleRate", sample_rate);
         let blob = encode_doc(&doc)?;
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let session = self.conn.open_session()?;
-        let cur = session.open_cursor(PROFILE_TABLE, None)?;
-        cur.set_key_s(db);
-        cur.set_value_u(&blob);
-        cur.insert()?;
-        Ok(())
+        self.catalog_write(|session| {
+            let cur = session.open_cursor(PROFILE_TABLE, None)?;
+            cur.set_key_s(db);
+            cur.set_value_u(&blob);
+            cur.insert()?;
+            Ok(())
+        })
     }
 
     /// Ensure `<db>.system.profile` exists as a capped collection (default
@@ -12795,22 +13199,23 @@ impl Storage {
         replace: bool,
     ) -> Result<bool> {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let session = self.conn.open_session()?;
-        let probe = session.open_cursor(table, None)?;
-        probe.set_key_ss(db, name);
-        let exists = match probe.search() {
-            Ok(()) => true,
-            Err(e) if e.is_not_found() => false,
-            Err(e) => return Err(e.into()),
-        };
-        if exists && !replace {
-            return Ok(false);
-        }
-        let cur = session.open_cursor(table, None)?;
-        cur.set_key_ss(db, name);
-        cur.set_value_u(record);
-        cur.insert()?;
-        Ok(true)
+        self.catalog_write(|session| {
+            let probe = session.open_cursor(table, None)?;
+            probe.set_key_ss(db, name);
+            let exists = match probe.search() {
+                Ok(()) => true,
+                Err(e) if e.is_not_found() => false,
+                Err(e) => return Err(e.into()),
+            };
+            if exists && !replace {
+                return Ok(false);
+            }
+            let cur = session.open_cursor(table, None)?;
+            cur.set_key_ss(db, name);
+            cur.set_value_u(record);
+            cur.insert()?;
+            Ok(true)
+        })
     }
 
     /// Point-fetch a `(db, name)` blob from an `SS`-keyed table (`None` when
@@ -12834,17 +13239,18 @@ impl Storage {
     /// Delete a `(db, name)` row from an `SS`-keyed table (`false` if absent).
     fn drop_ss_record(&self, table: &str, db: &str, name: &str) -> Result<bool> {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let session = self.conn.open_session()?;
-        let cur = session.open_cursor(table, None)?;
-        cur.set_key_ss(db, name);
-        match cur.search() {
-            Ok(()) => {
-                cur.remove()?;
-                Ok(true)
+        self.catalog_write(|session| {
+            let cur = session.open_cursor(table, None)?;
+            cur.set_key_ss(db, name);
+            match cur.search() {
+                Ok(()) => {
+                    cur.remove()?;
+                    Ok(true)
+                }
+                Err(e) if e.is_not_found() => Ok(false),
+                Err(e) => Err(e.into()),
             }
-            Err(e) if e.is_not_found() => Ok(false),
-            Err(e) => Err(e.into()),
-        }
+        })
     }
 
     /// Paginated walk of an `SS`-keyed table (`db = None` spans all dbs),
@@ -13475,24 +13881,25 @@ impl Storage {
         // then the collection lock — see `lock`'s ordering rules).
         let ns_lock = self.coll_lock(db, coll);
         let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let session = self.conn.open_session()?;
-        let cur = session.open_cursor(IDX_TABLE, None)?;
-        cur.set_key_sss(db, coll, name);
-        match cur.search() {
-            Ok(()) => {}
-            Err(e) if e.is_not_found() => return Ok(false),
-            Err(e) => return Err(e.into()),
-        }
-        let mut payload = decode_doc(&cur.get_value_u()?)?;
-        let mut opts = payload.get_document("options").cloned().unwrap_or_default();
-        opts.insert("expireAfterSeconds", expire_after_seconds);
-        payload.insert("options", Bson::Document(opts));
-        let blob = encode_doc(&payload)?;
-        let wcur = session.open_cursor(IDX_TABLE, None)?;
-        wcur.set_key_sss(db, coll, name);
-        wcur.set_value_u(&blob);
-        wcur.update()?;
-        Ok(true)
+        self.catalog_write(|session| {
+            let cur = session.open_cursor(IDX_TABLE, None)?;
+            cur.set_key_sss(db, coll, name);
+            match cur.search() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => return Ok(false),
+                Err(e) => return Err(e.into()),
+            }
+            let mut payload = decode_doc(&cur.get_value_u()?)?;
+            let mut opts = payload.get_document("options").cloned().unwrap_or_default();
+            opts.insert("expireAfterSeconds", expire_after_seconds);
+            payload.insert("options", Bson::Document(opts));
+            let blob = encode_doc(&payload)?;
+            let wcur = session.open_cursor(IDX_TABLE, None)?;
+            wcur.set_key_sss(db, coll, name);
+            wcur.set_value_u(&blob);
+            wcur.update()?;
+            Ok(true)
+        })
     }
 
     /// Merge `new_opts` into an existing index's stored options blob
@@ -13517,26 +13924,27 @@ impl Storage {
         let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Inside a user transaction it is that transaction's write, undone
         // with it (the PostgreSQL server's ALTER INDEX ... SET).
-        let session = self.op_session()?;
-        let cur = session.open_cursor(IDX_TABLE, None)?;
-        cur.set_key_sss(db, coll, name);
-        match cur.search() {
-            Ok(()) => {}
-            Err(e) if e.is_not_found() => return Ok(false),
-            Err(e) => return Err(e.into()),
-        }
-        let mut payload = decode_doc(&cur.get_value_u()?)?;
-        let mut opts = payload.get_document("options").cloned().unwrap_or_default();
-        for (k, v) in new_opts {
-            opts.insert(k.clone(), v.clone());
-        }
-        payload.insert("options", Bson::Document(opts));
-        let blob = encode_doc(&payload)?;
-        let wcur = session.open_cursor(IDX_TABLE, None)?;
-        wcur.set_key_sss(db, coll, name);
-        wcur.set_value_u(&blob);
-        wcur.update()?;
-        Ok(true)
+        self.catalog_write_on(self.op_session()?, |session| {
+            let cur = session.open_cursor(IDX_TABLE, None)?;
+            cur.set_key_sss(db, coll, name);
+            match cur.search() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => return Ok(false),
+                Err(e) => return Err(e.into()),
+            }
+            let mut payload = decode_doc(&cur.get_value_u()?)?;
+            let mut opts = payload.get_document("options").cloned().unwrap_or_default();
+            for (k, v) in new_opts {
+                opts.insert(k.clone(), v.clone());
+            }
+            payload.insert("options", Bson::Document(opts));
+            let blob = encode_doc(&payload)?;
+            let wcur = session.open_cursor(IDX_TABLE, None)?;
+            wcur.set_key_sss(db, coll, name);
+            wcur.set_value_u(&blob);
+            wcur.update()?;
+            Ok(true)
+        })
     }
 
     /// Group the `_id`s of documents that share the same key on index `name`,
@@ -15163,7 +15571,7 @@ impl Storage {
                 })();
                 match outcome {
                     Ok((_, held)) => {
-                        session.commit_transaction(None)?;
+                        commit_stamped(&session, &self.oplog, self.timestamped)?;
                         duplicates += held;
                     }
                     Err(e) => {
@@ -15173,10 +15581,23 @@ impl Storage {
                 }
             }
         }
-        let marker = session.open_cursor(UNIQ_TABLE, None)?;
-        marker.set_key_sssu("", "", DONE, b"");
-        marker.set_value_q(0);
-        marker.insert()?;
+        // In its own transaction: a timestamped store's purge may have
+        // removed the marker at a timestamp, and the key then takes one.
+        session.begin_transaction(None)?;
+        let written = (|| -> Result<()> {
+            let marker = session.open_cursor(UNIQ_TABLE, None)?;
+            marker.set_key_sssu("", "", DONE, b"");
+            marker.set_value_q(0);
+            marker.insert()?;
+            Ok(())
+        })();
+        match written {
+            Ok(()) => commit_stamped(&session, &self.oplog, self.timestamped)?,
+            Err(e) => {
+                let _ = session.rollback_transaction(None);
+                return Err(e);
+            }
+        }
         // Quiet unless something is wrong: the walk runs again after every
         // hand-over from the Python server, and a server's first line of
         // output is the one a launcher waits for.
@@ -15303,7 +15724,7 @@ impl Storage {
                 })();
                 match outcome {
                     Ok((_, held)) => {
-                        session.commit_transaction(None)?;
+                        commit_stamped(&session, &self.oplog, self.timestamped)?;
                         duplicates += held;
                     }
                     Err(e) => {
@@ -15313,10 +15734,23 @@ impl Storage {
                 }
             }
         }
-        let marker = session.open_cursor(UNIQ_TABLE, None)?;
-        marker.set_key_sssu("", "", DONE, b"");
-        marker.set_value_q(0);
-        marker.insert()?;
+        // In its own transaction: a timestamped store's purge may have
+        // removed the marker at a timestamp, and the key then takes one.
+        session.begin_transaction(None)?;
+        let written = (|| -> Result<()> {
+            let marker = session.open_cursor(UNIQ_TABLE, None)?;
+            marker.set_key_sssu("", "", DONE, b"");
+            marker.set_value_q(0);
+            marker.insert()?;
+            Ok(())
+        })();
+        match written {
+            Ok(()) => commit_stamped(&session, &self.oplog, self.timestamped)?,
+            Err(e) => {
+                let _ = session.rollback_transaction(None);
+                return Err(e);
+            }
+        }
         // Quiet unless something is wrong (see `backfill_document_id_claims`).
         if duplicates > 0 {
             eprintln!(
@@ -15391,7 +15825,7 @@ impl Storage {
                 Ok(())
             })();
             match outcome {
-                Ok(()) => session.commit_transaction(None)?,
+                Ok(()) => commit_stamped(&session, &self.oplog, self.timestamped)?,
                 Err(e) => {
                     let _ = session.rollback_transaction(None);
                     return Err(StorageError::Internal(format!(
@@ -15434,7 +15868,7 @@ impl Storage {
         self.rekey_numeric_ids(&session)?;
         session.begin_transaction(None)?;
         match self.purge_id_claims(&session) {
-            Ok(()) => session.commit_transaction(None)?,
+            Ok(()) => commit_stamped(&session, &self.oplog, self.timestamped)?,
             Err(e) => {
                 let _ = session.rollback_transaction(None);
                 return Err(e);
@@ -15452,7 +15886,7 @@ impl Storage {
             Ok(())
         })();
         match outcome {
-            Ok(()) => session.commit_transaction(None)?,
+            Ok(()) => commit_stamped(&session, &self.oplog, self.timestamped)?,
             Err(e) => {
                 let _ = session.rollback_transaction(None);
                 return Err(e);
@@ -15570,7 +16004,7 @@ impl Storage {
             })();
             match outcome {
                 Ok(n) => {
-                    session.commit_transaction(None)?;
+                    commit_stamped(session, &self.oplog, self.timestamped)?;
                     kept += n;
                 }
                 Err(e) => {
@@ -22638,6 +23072,25 @@ mod tests {
     use super::*;
     use bson::doc;
 
+    /// A fixture's raw writes, as one transaction committed without a
+    /// timestamp when dropped: they stand for a store an older build wrote,
+    /// and a timestamped store refuses a write without one to a key that
+    /// has had one (RM-210).
+    struct Untimestamped<'a>(&'a Session);
+
+    impl Drop for Untimestamped<'_> {
+        fn drop(&mut self) {
+            self.0.commit_transaction(None).unwrap();
+        }
+    }
+
+    fn untimestamped(session: &Session) -> Untimestamped<'_> {
+        session
+            .begin_transaction(Some("no_timestamp=true"))
+            .unwrap();
+        Untimestamped(session)
+    }
+
     /// The rollback-reason classifier that decides whether a `WT_ROLLBACK` was
     /// cache pressure (not retryable — `TransactionTooLargeForCache`) or a
     /// concurrency race (retryable — `WriteConflict`). The strings are the ones
@@ -22701,6 +23154,7 @@ mod tests {
             // Forge the crash-left state: phase 1's effects (registry row
             // removed, tombstone written) without the phase-2 purge.
             let session = st.conn.open_session().unwrap();
+            let _raw = untimestamped(&session);
             let rc = session.open_cursor(COLL_TABLE, None).unwrap();
             rc.set_key_ss("app", "c");
             rc.search().unwrap();
@@ -22724,6 +23178,7 @@ mod tests {
         assert_eq!(st.count_matching("app", "c", &doc! {}, None).unwrap(), 1);
         {
             let session = st.conn.open_session().unwrap();
+            let _raw = untimestamped(&session);
             let t = session.open_cursor(TOMB_TABLE, None).unwrap();
             t.set_key_ss("app", "c");
             assert!(t.search().is_err(), "tombstone must be cleared");
@@ -22825,6 +23280,7 @@ mod tests {
         {
             let conn = Connection::open(home_s, DEFAULT_CONFIG).unwrap();
             let sess = conn.open_session().unwrap();
+            let _raw = untimestamped(&sess);
             let c = sess.open_cursor(IDX_TABLE, None).unwrap();
             c.set_key_sss("app", "c", "x_1");
             c.search().unwrap();
@@ -22852,6 +23308,7 @@ mod tests {
     fn age_index(home: &str, coll: &str, name: &str, edit: impl FnOnce(&mut Document)) {
         let conn = Connection::open(home, DEFAULT_CONFIG).unwrap();
         let sess = conn.open_session().unwrap();
+        let _raw = untimestamped(&sess);
         let c = sess.open_cursor(IDX_TABLE, None).unwrap();
         c.set_key_sss("app", coll, name);
         c.search().unwrap();
@@ -22882,6 +23339,7 @@ mod tests {
     fn forget_number_key_format(home: &str) {
         let conn = Connection::open(home, DEFAULT_CONFIG).unwrap();
         let sess = conn.open_session().unwrap();
+        let _raw = untimestamped(&sess);
         let scan = sess.open_cursor(IDX_TABLE, None).unwrap();
         let mut rows = Vec::new();
         let mut more = scan.next().unwrap();
@@ -23056,6 +23514,7 @@ mod tests {
 
         let st = Storage::open(home).unwrap();
         let session = st.conn.open_session().unwrap();
+        let _raw = untimestamped(&session);
         assert_eq!(
             stored_number_key_format(&session).unwrap(),
             sortkey::NUMBER_KEY_FORMAT
@@ -23107,6 +23566,7 @@ mod tests {
         assert_eq!(again(doc! {"_id": dec("0.1"), "u": 14i32}), 0);
         // The two `_id`s equal by exact value: one holds the key, both stay.
         assert_eq!(again(doc! {"_id": Bson::Int64(1 << 62), "u": 15i32}), 1);
+        drop(_raw);
         drop(session);
         drop(st);
         // Opening again changes nothing.
@@ -23274,6 +23734,7 @@ mod tests {
                 hi: 50.0,
             };
             let session = st.conn.open_session().unwrap();
+            let _raw = untimestamped(&session);
             for (rid, _, blob) in st.scan_docs(&session, "app", "g").unwrap() {
                 let loc = decode_doc(&blob).unwrap().get("loc").cloned().unwrap();
                 let (old, new) = (read_as(26).cell_kbs(&loc), read_as(20).cell_kbs(&loc));
@@ -23290,6 +23751,7 @@ mod tests {
         {
             let conn = Connection::open(home, DEFAULT_CONFIG).unwrap();
             let sess = conn.open_session().unwrap();
+            let _raw = untimestamped(&sess);
             let c = sess.open_cursor(IDX_ENTRIES_TABLE, None).unwrap();
             for packed in &stale {
                 c.set_key_sssu("app", "g", "geo", packed);
@@ -23467,6 +23929,7 @@ mod tests {
         {
             let conn = Connection::open(home, DEFAULT_CONFIG).unwrap();
             let sess = conn.open_session().unwrap();
+            let _raw = untimestamped(&sess);
             let scan = sess.open_cursor(UNIQ_TABLE, None).unwrap();
             let del = sess.open_cursor(UNIQ_TABLE, None).unwrap();
             let mut more = scan.next().unwrap();
@@ -23567,6 +24030,9 @@ mod tests {
         let opts = StorageOptions {
             durable: Some(true),
             oplog_async: Some(true),
+            // The asynchronous oplog needs logged data tables: a store whose
+            // writes carry timestamps keeps the synchronous one.
+            data_nonlogged: Some(false),
             ..StorageOptions::default()
         };
         let st = Storage::open_with_options(dir.path().to_str().unwrap(), &opts).unwrap();
@@ -23675,6 +24141,7 @@ mod tests {
     fn a_stored_document_id_is_claimed_at_open() {
         fn strip_claims(s: &Storage) {
             let session = s.conn.open_session().unwrap();
+            let _raw = untimestamped(&session);
             let cur = session.open_cursor(UNIQ_TABLE, None).unwrap();
             let mut keys = Vec::new();
             let mut more = cur.next().unwrap();
@@ -23690,6 +24157,7 @@ mod tests {
         }
         fn claims(s: &Storage) -> Vec<(String, String, String)> {
             let session = s.conn.open_session().unwrap();
+            let _raw = untimestamped(&session);
             let cur = session.open_cursor(UNIQ_TABLE, None).unwrap();
             let mut out = Vec::new();
             let mut more = cur.next().unwrap();
@@ -23761,6 +24229,7 @@ mod tests {
                 2
             );
             let session = s.conn.open_session().unwrap();
+            let _raw = untimestamped(&session);
             let cur = session.open_cursor(UNIQ_TABLE, None).unwrap();
             let mut more = cur.next().unwrap();
             let mut gone = 0;
@@ -24450,6 +24919,7 @@ mod tests {
             .unwrap();
         {
             let session = s.conn.open_session().unwrap();
+            let _raw = untimestamped(&session);
             let rows = s.collect_entry_rows(&session, "app", "t").unwrap();
             let (name, packed) = rows.first().unwrap().clone();
             let entries = session.open_cursor(IDX_ENTRIES_TABLE, None).unwrap();

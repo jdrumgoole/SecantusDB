@@ -700,18 +700,13 @@ tests are in `tests/backlog/test_rm_found_2026_10_20b.py` and ask mongod
 live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
 `j: true` durability (RM-186), `storageSize` (RM-040).
 
-- [ ] **A snapshot read at a point in time reads the latest data.**
-      `readConcern: {level: "snapshot", atClusterTime: T}` outside a
-      transaction is only checked for being too old (239, §7.078);
-      `T` never chooses what is read (`secantus-commands/src/lib.rs`, the
-      read-concern check). Measured: insert `n: 0`, take the `ping`
-      `operationTime` T, set `n: 9`, then find at T: mongod answers 0, this
-      server 9. A `start_session(snapshot=True)` session is the same: it
-      reads (0, 7) across another client's write, where mongod reads (0, 0).
-      A silent wrong answer. WiredTiger can read at a timestamp
-      (`read_timestamp`), which is mongod's own mechanism.
-      Backlog-ID: RM-210
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_snapshot_read_at_cluster_time,tests/backlog/test_rm_found_2026_10_20b.py::test_snapshot_session_keeps_its_snapshot
+- **Scope decision — a snapshot read at a past time needs a store whose
+  data tables are not logged** (Joe, 2026-10-25). WiredTiger keeps no
+  history for a logged table, so a store created with `--data-logged`, or by
+  the PostgreSQL server, refuses `atClusterTime` before the newest time with
+  246 SnapshotUnavailable, by name, rather than answer as of now; without
+  `atClusterTime` it reads the latest data, which is correct. `secantusd-rs`
+  creates its stores the other way, mongod's (RM-210).
 - [ ] **Aggregation has no memory limits and nothing spills.** Over 110
       one-megabyte documents mongod 8.2.11 refuses: `$group` with
       `allowDiskUse: false` (292 QueryExceededMemoryLimitNoDiskUseAllowed),

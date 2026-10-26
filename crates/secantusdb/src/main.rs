@@ -210,9 +210,12 @@ fn run(cli: CliArgs) -> Result<(), String> {
         wt_config: Some(wt),
         oplog_async: cli.oplog_async,
         oplog_nonlogged: cli.oplog_nonlogged,
-        data_nonlogged: cli.data_nonlogged,
+        // mongod's split, so writes carry the timestamps a snapshot read at a
+        // past time reads by (RM-210); `--data-logged` opts out.
+        data_nonlogged: Some(cli.data_nonlogged.unwrap_or(true)),
         checkpoint_seconds: cli.checkpoint_seconds,
         write_tickets: cli.write_tickets,
+        transactions_logged_at_commit: true,
         ..StorageOptions::default()
     };
     let mut storage = Storage::open_with_options(&cli.storage_path, &opts)

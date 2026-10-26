@@ -303,6 +303,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
             "--oplog-async" => o.oplog_async = Some(true),
             "--oplog-nonlogged" => o.oplog_nonlogged = Some(true),
             "--data-nonlogged" => o.data_nonlogged = Some(true),
+            "--data-logged" => o.data_nonlogged = Some(false),
             "--checkpoint-seconds" => {
                 let raw = take_value("--checkpoint-seconds")?;
                 o.checkpoint_seconds = Some(raw.parse::<u64>().map_err(|_| {
@@ -352,6 +353,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
                     | "--oplog-async"
                     | "--oplog-nonlogged"
                     | "--data-nonlogged"
+                    | "--data-logged"
                     | "--tls-require-client-cert"
                     | "--help"
                     | "--version"
@@ -449,9 +451,13 @@ OPTIONS:
                                  off, or SECANTUS_OPLOG_NONLOGGED)
     --data-nonlogged             mongod's split: WAL-log only the oplog; data
                                  tables recover by oplog replay from the last
-                                 stable checkpoint. Create-time for fresh
-                                 stores; an existing store keeps its recorded
-                                 mode (default: off, or SECANTUS_DATA_NONLOGGED)
+                                 stable checkpoint, and keep the history a
+                                 snapshot read at a past time reads. Create-time
+                                 for fresh stores; an existing store keeps its
+                                 recorded mode (default: on)
+    --data-logged                WAL-log the data tables too: no oplog replay
+                                 on recovery, and no history, so a snapshot
+                                 read at a past time is refused
     --checkpoint-seconds S       Seconds between checkpoints. A checkpoint is
                                  what trims the log, and under --data-nonlogged
                                  what makes the data durable
@@ -606,6 +612,7 @@ mod tests {
         assert_eq!(a.oplog_nonlogged, Some(true));
         assert_eq!(a.data_nonlogged, Some(true));
         assert_eq!(a.checkpoint_seconds, Some(15));
+        assert_eq!(run(&["--data-logged"]).data_nonlogged, Some(false));
     }
 
     #[test]

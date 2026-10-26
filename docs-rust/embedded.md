@@ -78,16 +78,23 @@ RustServer(
     oplog_nonlogged=None,          # oplog tables log=(enabled=false)
     data_nonlogged=None,           # WAL-log only the oplog; data tables
                                    # recover by replay from the last
-                                   # stable checkpoint (mongod's split)
+                                   # stable checkpoint (mongod's split;
+                                   # the default, see below)
     checkpoint_seconds=None,       # stable-checkpoint cadence (default 60)
 )
 ```
 
-The four storage-mode kwargs default to `None` = defer to the matching
+The storage-mode kwargs default to `None` = defer to the matching
 `SECANTUS_*` env var (`SECANTUS_OPLOG_ASYNC`, `SECANTUS_OPLOG_NONLOGGED`,
-`SECANTUS_DATA_NONLOGGED`, `SECANTUS_CHECKPOINT_SECONDS`), so env-driven
-workflows are unchanged; an explicit value wins over the environment for
-this server only. The table-config modes (`oplog_nonlogged`,
+`SECANTUS_CHECKPOINT_SECONDS`), so env-driven workflows are unchanged; an
+explicit value wins over the environment for this server only. The
+exception is `data_nonlogged`, which is on unless set to `False`, as
+`secantusd-rs` creates its stores: data tables that are not logged keep the
+history a snapshot read at a past time (`readConcern: {level: "snapshot",
+atClusterTime: ...}`) reads, which WiredTiger keeps for no logged table. A
+store created with `data_nonlogged=False` refuses such a read (246). It
+also keeps the synchronous oplog, whatever `oplog_async` says: its writes
+carry their oplog timestamps. The table-config modes (`oplog_nonlogged`,
 `data_nonlogged`) are create-time-sticky: they shape fresh stores, and an
 existing store keeps the mode it was created with (`data_nonlogged` is
 recorded in the store and always wins on reopen).

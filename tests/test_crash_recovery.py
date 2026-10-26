@@ -251,3 +251,93 @@ def test_clean_close_reopens_complete_without_replay_gap(tmp_path):
             os.environ.pop("SECANTUS_DATA_NONLOGGED", None)
         else:
             os.environ["SECANTUS_DATA_NONLOGGED"] = env_backup
+
+
+#: The writer for transactions: each batch, and a counter document's update,
+#: commit as one transaction; each acked commit's operationTime is recorded
+#: with the batch, for reads at that time after the crash (RM-210).
+_TXN_WRITER = """
+import sys
+import _secantus_server, pymongo
+
+path, ack_file, port_file = sys.argv[1], sys.argv[2], sys.argv[3]
+srv = _secantus_server.RustServer(
+    path, 0, host="127.0.0.1", replica_set_name="secantus", sync_on_commit=True
+)
+host, port = srv.address
+with open(port_file, "w") as f:
+    f.write(f"{host}:{port}")
+client = pymongo.MongoClient(host, port, directConnection=True)
+coll = client["crashdb"]["c"]
+coll.insert_one({"_id": -1, "n": 0})
+i = 0
+with open(ack_file, "a", buffering=1) as acks:
+    while True:
+        with client.start_session() as s:
+            with s.start_transaction():
+                coll.insert_many([{"_id": i + k, "v": (i + k) * 2} for k in range(50)], session=s)
+                coll.update_one({"_id": -1}, {"$set": {"n": i + 50}}, session=s)
+            t = s.operation_time
+        acks.write(f"{i}:{i + 50}:{t.time}:{t.inc}\\n")
+        i += 50
+"""
+
+
+def test_hard_kill_mid_transactions_keeps_every_acked_commit_and_its_history(tmp_path):
+    """Transactions hard-killed mid-load: every acknowledged commit is
+    present after replay, whole, and a snapshot read at a commit's time sees
+    exactly the commits made by then -- replay restored each write at its
+    own timestamp."""
+    import _secantus_server
+    from bson import Timestamp
+
+    store = tmp_path / "wt"
+    ack_file = tmp_path / "acks.txt"
+    port_file = tmp_path / "port.txt"
+    env = {**os.environ, "SECANTUS_DATA_NONLOGGED": "1", "SECANTUS_CHECKPOINT_SECONDS": "1"}
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _TXN_WRITER, str(store), str(ack_file), str(port_file)],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if ack_file.exists() and ack_file.read_text().count("\n") >= 40:
+                break
+            if proc.poll() is not None:
+                raise AssertionError(f"writer died: {proc.stderr.read().decode()[-2000:]}")
+            time.sleep(0.1)
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+    acks = []
+    for line in ack_file.read_text().splitlines():
+        lo, hi, secs, inc = (int(x) for x in line.split(":"))
+        acks.append((lo, hi, Timestamp(secs, inc)))
+    assert len(acks) >= 5, f"too few commits acked: {proc.stderr.read().decode()[-2000:]}"
+    srv = _open_after_crash(_secantus_server, tmp_path)
+    try:
+        host, port = srv.address
+        client = pymongo.MongoClient(host, port, directConnection=True)
+        db = client["crashdb"]
+        last = acks[-1][1]
+        assert db.c.count_documents({"_id": {"$gte": 0, "$lt": last}}) == last
+        assert db.c.find_one({"_id": -1})["n"] >= last
+        for _, hi, t in acks[:: max(1, len(acks) // 8)]:
+            rc = {"level": "snapshot", "atClusterTime": t}
+            counter = db.command({"find": "c", "filter": {"_id": -1}, "readConcern": rc})
+            assert counter["cursor"]["firstBatch"][0]["n"] == hi, (t, hi)
+            n = db.command(
+                {
+                    "aggregate": "c",
+                    "pipeline": [{"$match": {"_id": {"$gte": 0}}}, {"$count": "n"}],
+                    "cursor": {},
+                    "readConcern": rc,
+                }
+            )["cursor"]["firstBatch"][0]["n"]
+            assert n == hi, (t, hi, n)
+        client.close()
+    finally:
+        srv.stop()

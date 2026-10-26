@@ -29,6 +29,9 @@ fn with_async_db(body: impl FnOnce(&Storage)) {
         home.to_str().unwrap(),
         &StorageOptions {
             oplog_async: Some(true),
+            // The asynchronous oplog needs logged data tables: a store whose
+            // writes carry timestamps keeps the synchronous one.
+            data_nonlogged: Some(false),
             ..StorageOptions::default()
         },
     )
