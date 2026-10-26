@@ -725,6 +725,15 @@ impl PgHandler {
         if !new_hash.is_empty() {
             self.hash_built(table, Some(&new_hash));
         }
+        let new_am: Vec<String> = self
+            .am_shapes(table)
+            .into_iter()
+            .map(|s| s.name().to_string())
+            .filter(|n| !before.contains(n))
+            .collect();
+        if !new_am.is_empty() {
+            self.am_built(table, Some(&new_am));
+        }
         let new: Vec<String> = self
             .btree_names(table)
             .into_iter()
@@ -741,6 +750,11 @@ impl PgHandler {
     pub(crate) fn index_model_names(&self, table: &str) -> Vec<String> {
         let mut names = self.btree_names(table);
         names.extend(self.hash_shapes(table).into_iter().map(|s| s.name));
+        names.extend(
+            self.am_shapes(table)
+                .into_iter()
+                .map(|s| s.name().to_string()),
+        );
         names
     }
 
@@ -748,12 +762,14 @@ impl PgHandler {
     /// (VACUUM FULL, CLUSTER, an ALTER that rewrites) reindexes it.
     pub(crate) fn btree_reindex(&self, table: &str) -> PgWireResult<()> {
         self.hash_built(table, None);
+        self.am_built(table, None);
         self.btree_build_record(table, None)
     }
 
     /// REINDEX INDEX: that B-tree rebuilt and recorded.
     pub(crate) fn btree_reindex_one(&self, table: &str, index: &str) -> PgWireResult<()> {
         self.hash_built(table, Some(&[index.to_string()]));
+        self.am_built(table, Some(&[index.to_string()]));
         self.btree_build_record(table, Some(&[index.to_string()]))
     }
 
@@ -762,6 +778,7 @@ impl PgHandler {
     /// ones in memory are both of the old one.
     pub(crate) fn btree_rebuild_models(&self, table: &str) -> PgWireResult<()> {
         self.hash_built(table, None);
+        self.am_built(table, None);
         for shape in self.btree_shapes(table) {
             let built = BTree::build(&*shape, self.btree_entries(table, &shape)?);
             models()
@@ -777,6 +794,7 @@ impl PgHandler {
     pub(crate) fn btree_truncated(&self, table: &str) -> PgWireResult<()> {
         self.btree_rebuild_models(table)?;
         self.hash_truncated(table);
+        self.am_truncated(table);
         for name in self.btree_names(table) {
             self.record_index_size(table, &name, 0, -1.0)?;
         }
@@ -819,6 +837,7 @@ impl PgHandler {
             return Ok(out);
         }
         self.hash_bulk_delete(table);
+        self.am_bulk_delete(table, dead);
         for shape in self.btree_shapes(table) {
             let (pages, tuples) = self.with_btree(table, &shape, |t| {
                 t.bulk_delete(&*shape, &|c| dead.contains(&c));

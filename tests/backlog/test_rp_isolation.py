@@ -97,11 +97,13 @@ def test_ssi_partial_index(rust_pg: Any) -> None:
     _check("partial-index", rust_pg)
 
 
-@pytest.mark.backlog("RP-254")
+@pytest.mark.backlog_fixed("RP-254")
 @pytest.mark.parametrize("name", ["predicate-gin", "predicate-gist"])
 def test_ssi_index_access_methods(name: str, rust_pg: Any) -> None:
     """PostgreSQL 15.19's GIN and GiST indexes take SIREAD locks on the
-    index pages a scan reads, so two transactions writing far apart in the
+    index pages a scan reads -- a GIN entry leaf or posting tree root and
+    its metapage, every GiST page the scan visits -- and an insert checks
+    the pages it changes, so two transactions writing far apart in the
     index both commit."""
     _check(name, rust_pg)
 
