@@ -47,6 +47,12 @@ concurrent update".
   forty times each now fail none of 640, against about one in four before.
   Fixes RP-269
   (`tests/backlog/test_rp_batch82.py::test_sessions_create_their_own_temp_tables_side_by_side`).
-  It may also be what hung
-  `test_rust_pgserver_slice.py::test_parallel_sessions_resolve_their_own_new_temp_table`
-  in CI, which runs the same pattern; that is not proven.
+- `secantus-pg`: a SELECT with `LIMIT 0` reads nothing below its limit, as
+  PostgreSQL's `ExecLimit` returns before asking its subplan for a row. No
+  scan, view, lock or expression is evaluated; the columns are still the
+  source's. Selecting `LIMIT 0` from every catalog relation took 199 s here
+  (debug build), mostly in `information_schema` views (RP-131), and 7 s now.
+  On CI that test passed the 600 s per-test timeout, which ended its xdist
+  worker; that is the "crashed worker" behind the `pg-oracle (server)`
+  failures of batches 72, 77 and 81. 201 of 201 `LIMIT 0` queries answer as
+  PostgreSQL 15.19 does: columns, types, rows and errors.

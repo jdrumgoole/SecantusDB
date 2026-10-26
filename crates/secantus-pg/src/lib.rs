@@ -34277,6 +34277,11 @@ impl PgHandler {
         // on documents and does not care where they came from, which is
         // why the series is a SOURCE rather than its own statement.
         let (mut docs, mut def): (Vec<Document>, TableDef) = match (&sel.series, &sel.join) {
+            // `LIMIT 0`: PostgreSQL's Limit node returns before it asks its
+            // subplan for a row (`ExecLimit`, a count of zero), so nothing
+            // below it runs -- no scan, no view, no lock, no expression.
+            // The columns are still the source's.
+            _ if sel.limit == Some(0) => (Vec::new(), self.select_source_def(sel)?),
             // A FROM-subquery or inlined CTE: run the inner plan, then treat
             // its output columns as the table. Checked first because such a
             // select carries neither a series nor a join.

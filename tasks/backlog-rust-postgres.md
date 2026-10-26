@@ -1165,7 +1165,9 @@ tests are scenarios in `tests/backlog/test_rp_batch26.py`.
       FROM function (`_pg_expandarray` becomes `unnest(...) WITH
       ORDINALITY`) re-planned and run as SQL once per left row
       (`PgHandler::lateral_rows`), and per-row expression evaluation over
-      the joins.
+      the joins. Under `LIMIT 0` they ran whole too, until batch 83: on CI's
+      debug build `test_rp_found_2026_10_20.py::test_catalog_relations_are_queryable`
+      passed the 600 s per-test timeout, which ended the xdist worker.
       Backlog-ID: RP-131
       Verify: none -- a performance budget; every answer matches PostgreSQL's
 
