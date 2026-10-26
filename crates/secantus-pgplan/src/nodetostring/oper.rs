@@ -40,7 +40,7 @@ impl<'a> Analyzer<'a> {
             Some(s) => Some(
                 self.cat
                     .namespace_oid(s)
-                    .ok_or_else(|| AnalysisError(format!("schema \"{s}\" does not exist")))?,
+                    .ok_or_else(|| AnalysisError::new(format!("schema \"{s}\" does not exist")))?,
             ),
             None => None,
         };
@@ -166,7 +166,7 @@ impl<'a> Analyzer<'a> {
         let o = self
             .cat
             .oper_row(op)
-            .ok_or_else(|| AnalysisError("an operator".into()))?;
+            .ok_or_else(|| AnalysisError::new("an operator".into()))?;
         if super::coerce::is_binary_coercible(self.cat, a1, o.left)
             && super::coerce::is_binary_coercible(self.cat, a2, o.right)
         {
@@ -198,7 +198,7 @@ impl<'a> Analyzer<'a> {
         let o = self
             .cat
             .oper_row(opid)
-            .ok_or_else(|| AnalysisError("an operator".into()))?
+            .ok_or_else(|| AnalysisError::new("an operator".into()))?
             .clone();
         if o.code == 0 {
             return unsupported("operator is only a shell");
@@ -254,7 +254,7 @@ impl<'a> Analyzer<'a> {
         let o = self
             .cat
             .oper_row(opid)
-            .ok_or_else(|| AnalysisError("an operator".into()))?
+            .ok_or_else(|| AnalysisError::new("an operator".into()))?
             .clone();
         if o.code == 0 {
             return unsupported("operator is only a shell");

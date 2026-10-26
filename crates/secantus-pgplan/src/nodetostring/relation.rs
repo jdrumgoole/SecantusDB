@@ -5,7 +5,7 @@ use super::catalog::*;
 use super::nodefuncs::{expr_collation, expr_type, expr_typmod};
 use super::nodes::*;
 use super::parse::{Analyzer, NsColumn, NsItem};
-use super::{unsupported, AnalysisError, R};
+use super::{pg_error, unsupported, AnalysisError, R};
 use pg_query::protobuf as pb;
 
 /// `FirstLowInvalidHeapAttributeNumber`.
@@ -151,7 +151,7 @@ impl<'a> Analyzer<'a> {
         let rel = self
             .cat
             .rel(relid)
-            .ok_or_else(|| AnalysisError(format!("relation {relid} does not exist")))?
+            .ok_or_else(|| AnalysisError::new(format!("relation {relid} does not exist")))?
             .clone();
         let refname = alias
             .as_ref()
@@ -221,7 +221,7 @@ impl<'a> Analyzer<'a> {
         }
         if !rv.schemaname.is_empty() {
             let nsp = self.cat.namespace_oid(&rv.schemaname).ok_or_else(|| {
-                AnalysisError(format!("schema \"{}\" does not exist", rv.schemaname))
+                AnalysisError::new(format!("schema \"{}\" does not exist", rv.schemaname))
             })?;
             return self
                 .cat
@@ -229,7 +229,7 @@ impl<'a> Analyzer<'a> {
                 .find(|r| r.nsp == nsp)
                 .map(|r| r.oid)
                 .ok_or_else(|| {
-                    AnalysisError(format!("relation \"{}\" does not exist", rv.relname))
+                    AnalysisError::new(format!("relation \"{}\" does not exist", rv.relname))
                 });
         }
         for nsp in &self.path {
@@ -305,6 +305,19 @@ impl<'a> Analyzer<'a> {
             cte.cterefcount += 1;
         }
         let cte = cte.clone();
+        // INSERT / UPDATE / DELETE need RETURNING to be read from.
+        if cte.analyzed
+            && cte.ctequery.command_type != CMD_SELECT
+            && cte.ctequery.returning_list.is_empty()
+        {
+            return pg_error(
+                "0A000",
+                format!(
+                    "WITH query \"{}\" does not have a RETURNING clause",
+                    cte.ctename
+                ),
+            );
+        }
         let refname = alias
             .as_ref()
             .map_or_else(|| cte.ctename.clone(), |a| a.aliasname.clone());
@@ -318,9 +331,39 @@ impl<'a> Analyzer<'a> {
             }
         }
         if varattno < numaliases {
-            return Err(AnalysisError(format!(
-                "table \"{refname}\" has {varattno} columns available but {numaliases} columns specified"
-            )));
+            return pg_error(
+                "42P10",
+                format!(
+                    "table \"{refname}\" has {varattno} columns available but {numaliases} columns specified"
+                ),
+            );
+        }
+        let mut coltypes = cte.ctecoltypes.clone();
+        let mut coltypmods = cte.ctecoltypmods.clone();
+        let mut colcollations = cte.ctecolcollations.clone();
+        // SEARCH and CYCLE add their columns.
+        let mut dontexpand = 0;
+        if let Some(sc) = &cte.search_clause {
+            eref.colnames.push(sc.search_seq_column.clone());
+            coltypes.push(if sc.search_breadth_first {
+                RECORDOID
+            } else {
+                RECORDARRAYOID
+            });
+            coltypmods.push(-1);
+            colcollations.push(0);
+            dontexpand += 1;
+        }
+        if let Some(cc) = &cte.cycle_clause {
+            eref.colnames.push(cc.cycle_mark_column.clone());
+            coltypes.push(cc.cycle_mark_type);
+            coltypmods.push(cc.cycle_mark_typmod);
+            colcollations.push(cc.cycle_mark_collation);
+            eref.colnames.push(cc.cycle_path_column.clone());
+            coltypes.push(RECORDARRAYOID);
+            coltypmods.push(-1);
+            colcollations.push(0);
+            dontexpand += 2;
         }
         let mut rte = Self::new_rte(
             alias,
@@ -329,24 +372,27 @@ impl<'a> Analyzer<'a> {
                 ctename: cte.ctename.clone(),
                 ctelevelsup: levelsup as u32,
                 self_reference,
-                coltypes: cte.ctecoltypes.clone(),
-                coltypmods: cte.ctecoltypmods.clone(),
-                colcollations: cte.ctecolcollations.clone(),
+                coltypes: coltypes.clone(),
+                coltypmods: coltypmods.clone(),
+                colcollations: colcollations.clone(),
             },
         );
         rte.in_from_cl = in_from_cl;
         self.ps().rtable.push(rte);
         let rtindex = self.psr().rtable.len() as i32;
-        let types: Vec<(Oid, i32, Oid)> = (0..cte.ctecoltypes.len())
-            .map(|i| {
-                (
-                    cte.ctecoltypes[i],
-                    cte.ctecoltypmods[i],
-                    cte.ctecolcollations[i],
-                )
-            })
+        let types: Vec<(Oid, i32, Oid)> = (0..coltypes.len())
+            .map(|i| (coltypes[i], coltypmods[i], colcollations[i]))
             .collect();
-        Ok(self.nsitem_from_lists(rtindex, &types))
+        let mut ns = self.nsitem_from_lists(rtindex, &types);
+        // Inside the CTE's own query its SEARCH / CYCLE columns are not
+        // part of `*`.
+        if levelsup > 0 {
+            let n = ns.columns.len();
+            for c in ns.columns.iter_mut().skip(n - dontexpand) {
+                c.dontexpand = true;
+            }
+        }
+        Ok(ns)
     }
 
     fn nsitem_from_lists(&self, rtindex: i32, types: &[(Oid, i32, Oid)]) -> NsItem {
@@ -437,7 +483,7 @@ impl<'a> Analyzer<'a> {
                         let tn = cd
                             .type_name
                             .as_ref()
-                            .ok_or_else(|| AnalysisError("a column without a type".into()))?;
+                            .ok_or_else(|| AnalysisError::new("a column without a type".into()))?;
                         let (t, m) = self.typename_type_id_and_mod(tn)?;
                         let coll = self.column_def_collation(cd, t)?;
                         rtfunc.funccolnames.push(cd.colname.clone());
@@ -723,7 +769,7 @@ impl<'a> Analyzer<'a> {
                 .iter()
                 .find(|(_, n, _)| *n == attnum)
                 .copied()
-                .ok_or_else(|| AnalysisError("a system column".into()))?;
+                .ok_or_else(|| AnalysisError::new("a system column".into()))?;
             Var {
                 varno: ns.rtindex,
                 varattno: attnum,
@@ -1139,7 +1185,7 @@ impl<'a> Analyzer<'a> {
             .namespace
             .iter()
             .position(|n| n.rtindex == varno)
-            .ok_or_else(|| AnalysisError("nsitem not found".into()))
+            .ok_or_else(|| AnalysisError::new("nsitem not found".into()))
     }
 
     /// `ColumnDef` collation: the type's, or an explicit COLLATE.

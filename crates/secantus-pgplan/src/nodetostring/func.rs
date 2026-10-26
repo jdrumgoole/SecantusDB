@@ -5,7 +5,7 @@ use super::catalog::*;
 use super::nodefuncs::{expr_location, expr_type};
 use super::nodes::*;
 use super::parse::{Analyzer, ExprKind};
-use super::{unsupported, AnalysisError, R};
+use super::{pg_error, unsupported, AnalysisError, R};
 use pg_query::protobuf as pb;
 use pg_query::protobuf::node::Node as N;
 
@@ -430,7 +430,7 @@ impl<'a> Analyzer<'a> {
             return Ok(none(FuncDetail::NotFound));
         }
         let p = self.cat.proc_row(best.oid).ok_or_else(|| {
-            AnalysisError(format!("cache lookup failed for function {}", best.oid))
+            AnalysisError::new(format!("cache lookup failed for function {}", best.oid))
         })?;
         let mut argdefault_types = Vec::new();
         if best.ndargs > 0 {
@@ -452,7 +452,7 @@ impl<'a> Analyzer<'a> {
                 if super::coerce::is_polymorphic(declared) {
                     let text = defaults
                         .get(pos - first_default)
-                        .ok_or_else(|| AnalysisError("a default argument".into()))?;
+                        .ok_or_else(|| AnalysisError::new("a default argument".into()))?;
                     argdefault_types.push(self.default_expr_type(text)?);
                 } else {
                     argdefault_types.push(declared);
@@ -482,7 +482,7 @@ impl<'a> Analyzer<'a> {
     /// The type of a polymorphic parameter's default expression.
     fn default_expr_type(&self, text: &str) -> R<Oid> {
         let parsed = pg_query::parse(&format!("SELECT {text}"))
-            .map_err(|e| AnalysisError(format!("a default: {e}")))?;
+            .map_err(|e| AnalysisError::new(format!("a default: {e}")))?;
         let Some(N::SelectStmt(s)) = parsed
             .protobuf
             .stmts
@@ -498,10 +498,11 @@ impl<'a> Analyzer<'a> {
         let val = r
             .val
             .as_deref()
-            .ok_or_else(|| AnalysisError("a default".into()))?;
+            .ok_or_else(|| AnalysisError::new("a default".into()))?;
         let ctx = super::parse::AnalysisContext {
             catalog: self.cat,
             search_path: self.path.clone(),
+            allow_system_table_mods: false,
         };
         let mut a = Analyzer::new(&ctx);
         a.levels.push(super::parse::ParseState::new());
@@ -591,20 +592,19 @@ impl<'a> Analyzer<'a> {
                 }
             }
             FuncDetail::Aggregate => {
-                let ag = self
-                    .cat
-                    .aggregate(d.funcid)
-                    .ok_or_else(|| AnalysisError("cache lookup failed for aggregate".into()))?;
+                let ag = self.cat.aggregate(d.funcid).ok_or_else(|| {
+                    AnalysisError::new("cache lookup failed for aggregate".into())
+                })?;
                 aggkind = ag.kind;
                 if aggkind == 'o' || aggkind == 'h' {
                     if !agg_within_group {
-                        return Err(AnalysisError(format!(
+                        return Err(AnalysisError::new(format!(
                             "WITHIN GROUP is required for ordered-set aggregate {}",
                             funcname.join(".")
                         )));
                     }
                     if over.is_some() {
-                        return Err(AnalysisError(format!(
+                        return Err(AnalysisError::new(format!(
                             "OVER is not supported for ordered-set aggregate {}",
                             funcname.join(".")
                         )));
@@ -630,7 +630,7 @@ impl<'a> Analyzer<'a> {
                         }
                     };
                     if !ok {
-                        return Err(AnalysisError(format!(
+                        return Err(AnalysisError::new(format!(
                             "function {} does not exist",
                             funcname.join(".")
                         )));
@@ -644,7 +644,7 @@ impl<'a> Analyzer<'a> {
                         )?;
                     }
                 } else if agg_within_group {
-                    return Err(AnalysisError(format!(
+                    return Err(AnalysisError::new(format!(
                         "{} is not an ordered-set aggregate, so it cannot have WITHIN GROUP",
                         funcname.join(".")
                     )));
@@ -776,7 +776,7 @@ impl<'a> Analyzer<'a> {
                 Node::Aggref(Box::new(agg))
             }
             _ => {
-                let over = over.ok_or_else(|| AnalysisError("OVER".into()))?;
+                let over = over.ok_or_else(|| AnalysisError::new("OVER".into()))?;
                 if agg_distinct {
                     return unsupported("DISTINCT is not implemented for window functions");
                 }
@@ -913,12 +913,12 @@ impl<'a> Analyzer<'a> {
     ) -> R<()> {
         let num_direct = fargs.len() - num_aggregated;
         let num_non_hypothetical = num_direct.checked_sub(num_aggregated).ok_or_else(|| {
-            AnalysisError("incorrect number of arguments to hypothetical-set aggregate".into())
+            AnalysisError::new("incorrect number of arguments to hypothetical-set aggregate".into())
         })?;
         for hargpos in num_non_hypothetical..num_direct {
             let aargpos = num_direct + (hargpos - num_non_hypothetical);
             if declared.get(hargpos) != declared.get(aargpos) {
-                return Err(AnalysisError(
+                return Err(AnalysisError::new(
                     "hypothetical-set aggregate has inconsistent declared argument types".into(),
                 ));
             }
@@ -1076,7 +1076,7 @@ impl<'a> Analyzer<'a> {
             (Some(v), Some(a)) => v.min(a),
         };
         if Some(level) == min_agg {
-            return unsupported("aggregate function calls cannot be nested");
+            return pg_error("42803", "aggregate function calls cannot be nested");
         }
         agg.agglevelsup = level;
         if level as usize >= self.depth() {
@@ -1090,15 +1090,13 @@ impl<'a> Analyzer<'a> {
                 super::nodefuncs::agg_levels(a, 0, &mut dvar, &mut dagg);
             }
             if dvar.is_some_and(|v| v < level) {
-                return Err(AnalysisError(
+                return Err(AnalysisError::new(
                     "outer-level aggregate cannot contain a lower-level variable in its direct arguments"
                         .into(),
                 ));
             }
             if dagg.is_some_and(|a| a <= level) {
-                return Err(AnalysisError(
-                    "aggregate function calls cannot be nested".into(),
-                ));
+                return pg_error("42803", "aggregate function calls cannot be nested");
             }
         }
         let kind = self.level_ref(level as usize).expr_kind;
@@ -1127,7 +1125,9 @@ impl<'a> Analyzer<'a> {
                 .windowdefs
                 .iter()
                 .position(|d| d.name == over.name)
-                .ok_or_else(|| AnalysisError(format!("window \"{}\" does not exist", over.name)))?;
+                .ok_or_else(|| {
+                    AnalysisError::new(format!("window \"{}\" does not exist", over.name))
+                })?;
             w.winref = pos as u32 + 1;
         } else {
             let key = window_def_key(over);

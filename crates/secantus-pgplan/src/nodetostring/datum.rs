@@ -107,14 +107,9 @@ pub(crate) fn type_input(a: &Analyzer<'_>, t: Oid, s: &str, typmod: i32) -> R<Da
         }
         NUMERICOID => numeric_in(s, typmod),
         // interval_in: `Interval {TimeOffset time; int32 day; int32 month}`,
-        // 16 bytes passed by reference. A typmod narrows the value
-        // (AdjustIntervalForTypmod), which is not transcribed.
-        INTERVALOID => {
-            if typmod != -1 {
-                return unsupported("an interval literal with a typmod in a stored rule");
-            }
-            interval_in(s)
-        }
+        // 16 bytes passed by reference; coerce_type passes an interval its
+        // typmod (field qualifier and precision).
+        INTERVALOID => interval_in_typmod(s, typmod),
         1560 | 1562 => bit_in(s, typmod),
         REGCLASSOID => {
             let oid = if let Ok(n) = s.trim().parse::<u32>() {
@@ -150,7 +145,7 @@ pub(crate) fn type_input(a: &Analyzer<'_>, t: Oid, s: &str, typmod: i32) -> R<Da
             } else {
                 let names = parse_qualified_identifier(s)?;
                 cat.namespace_oid(names.last().map_or("", String::as_str))
-                    .ok_or_else(|| AnalysisError(format!("schema \"{s}\" does not exist")))?
+                    .ok_or_else(|| AnalysisError::new(format!("schema \"{s}\" does not exist")))?
             };
             Ok(byval_i64(i64::from(oid), 4))
         }
@@ -164,9 +159,9 @@ pub(crate) fn type_input(a: &Analyzer<'_>, t: Oid, s: &str, typmod: i32) -> R<Da
                     Some(sc) => cat.namespace_oid(sc) == Some(p.nsp),
                     None => a.path.contains(&p.nsp),
                 });
-                let first = found
-                    .next()
-                    .ok_or_else(|| AnalysisError(format!("function \"{s}\" does not exist")))?;
+                let first = found.next().ok_or_else(|| {
+                    AnalysisError::new(format!("function \"{s}\" does not exist"))
+                })?;
                 if found.next().is_some() {
                     return unsupported(format!("more than one function named \"{s}\""));
                 }
@@ -186,7 +181,7 @@ pub(crate) fn type_input(a: &Analyzer<'_>, t: Oid, s: &str, typmod: i32) -> R<Da
 }
 
 fn bad(s: &str, t: &str) -> AnalysisError {
-    AnalysisError(format!("invalid input syntax for type {t}: \"{s}\""))
+    AnalysisError::new(format!("invalid input syntax for type {t}: \"{s}\""))
 }
 
 fn bool_in(s: &str) -> R<bool> {
@@ -336,9 +331,22 @@ fn adjust_time_for_typmod(t: i64, typmod: i32) -> i64 {
     ((t + scale / 2) / scale) * scale
 }
 
-/// `interval_in` without a typmod: the 16-byte `Interval` struct.
-pub(crate) fn interval_in(s: &str) -> R<Datum> {
-    let iv = crate::parse_interval(s).map_err(|_| bad(s, "interval"))?;
+/// `interval_in`: the literal read by its field qualifier
+/// (`DecodeInterval`'s range) and cut to it (`AdjustIntervalForTypmod`).
+pub(crate) fn interval_in_typmod(s: &str, typmod: i32) -> R<Datum> {
+    let range = if typmod >= 0 {
+        typmod >> 16
+    } else {
+        crate::INTERVAL_FULL_RANGE
+    };
+    let mut iv = crate::parse_interval_range(s, range).map_err(|_| bad(s, "interval"))?;
+    if typmod >= 0 {
+        if let Some(adjusted) =
+            crate::Interval::from_bson(&crate::adjust_interval(iv.to_bson(), typmod))
+        {
+            iv = adjusted;
+        }
+    }
     let mut out = Vec::with_capacity(16);
     out.extend_from_slice(&iv.micros.to_le_bytes());
     out.extend_from_slice(&iv.days.to_le_bytes());
@@ -550,7 +558,7 @@ fn array_in(a: &Analyzer<'_>, s: &str, elem: Oid) -> R<Datum> {
     let row = a
         .cat
         .type_row(elem)
-        .ok_or_else(|| AnalysisError("an array element type".into()))?
+        .ok_or_else(|| AnalysisError::new("an array element type".into()))?
         .clone();
     let ndim: i32 = if items.is_empty() { 0 } else { 1 };
     let mut data = Vec::new();

@@ -7,7 +7,7 @@ use super::nodefuncs::children;
 use super::nodes::*;
 use super::out::equal;
 use super::parse::{Analyzer, ExprKind};
-use super::{unsupported, AnalysisError, R};
+use super::{pg_error, unsupported, AnalysisError, R};
 use pg_query::protobuf as pb;
 use pg_query::protobuf::node::Node as N;
 
@@ -447,7 +447,7 @@ impl<'a> Analyzer<'a> {
             }
         }
         if *setkind == GROUPING_SET_CUBE && content.len() > 12 {
-            return Err(AnalysisError("CUBE is limited to 12 elements".into()));
+            return Err(AnalysisError::new("CUBE is limited to 12 elements".into()));
         }
         Ok(GroupingSet {
             kind: *setkind,
@@ -459,7 +459,7 @@ impl<'a> Analyzer<'a> {
     /// `transformGroupingFunc`.
     pub fn transform_grouping_func(&mut self, g: &pb::GroupingFunc) -> R<Node> {
         if g.args.len() > 31 {
-            return Err(AnalysisError(
+            return Err(AnalysisError::new(
                 "GROUPING must have fewer than 32 arguments".into(),
             ));
         }
@@ -487,9 +487,7 @@ impl<'a> Analyzer<'a> {
             (Some(v), Some(a)) => v.min(a),
         };
         if Some(level) == min_agg {
-            return Err(AnalysisError(
-                "aggregate function calls cannot be nested".into(),
-            ));
+            return pg_error("42803", "aggregate function calls cannot be nested");
         }
         if level as usize >= self.depth() {
             return unsupported("a GROUPING's level");
@@ -504,7 +502,7 @@ impl<'a> Analyzer<'a> {
             | ExprKind::GroupBy
             | ExprKind::Limit
             | ExprKind::Offset => {
-                return Err(AnalysisError(
+                return Err(AnalysisError::new(
                     "grouping operations are not allowed here".into(),
                 ));
             }
@@ -523,7 +521,7 @@ impl<'a> Analyzer<'a> {
         if !qry.grouping_sets.is_empty() {
             let gsets = expand_grouping_sets(&qry.grouping_sets, qry.group_distinct, 4096);
             if gsets.is_empty() {
-                return Err(AnalysisError(
+                return Err(AnalysisError::new(
                     "too many grouping sets present (maximum 4096)".into(),
                 ));
             }
@@ -602,6 +600,22 @@ impl<'a> Analyzer<'a> {
             self.check_ungrouped(&ctx, &e, 0, &mut func_grouped, &mut deps)?;
         }
         qry.constraint_deps.extend(deps);
+        // Per spec, aggregates can't appear in a recursive term.
+        let self_ref = rtable.iter().any(|r| {
+            matches!(
+                r.kind,
+                RteKind::Cte {
+                    self_reference: true,
+                    ..
+                }
+            )
+        });
+        if qry.has_aggs && self_ref {
+            return pg_error(
+                "42P19",
+                "aggregate functions are not allowed in a recursive query's recursive term",
+            );
+        }
         Ok(())
     }
 
@@ -652,7 +666,7 @@ impl<'a> Analyzer<'a> {
             let rte = ctx
                 .rtable
                 .get((v.varno - 1) as usize)
-                .ok_or_else(|| AnalysisError("a Var's range table entry".into()))?;
+                .ok_or_else(|| AnalysisError::new("a Var's range table entry".into()))?;
             if let RteKind::Relation { relid, .. } = &rte.kind {
                 if let Some(con) = self.check_functional_grouping(*relid, v.varno, ctx.common_vars)
                 {
@@ -667,7 +681,7 @@ impl<'a> Analyzer<'a> {
                 .get((v.varattno - 1).max(0) as usize)
                 .cloned()
                 .unwrap_or_default();
-            return Err(AnalysisError(if sublevels == 0 {
+            return Err(AnalysisError::new(if sublevels == 0 {
                 format!(
                     "column \"{}.{att}\" must appear in the GROUP BY clause or be used in an aggregate function",
                     rte.eref.aliasname
@@ -766,7 +780,7 @@ impl Ctx<'_> {
                             }
                         }
                         if r == 0 {
-                            return Err(AnalysisError(
+                            return Err(AnalysisError::new(
                                 "arguments to GROUPING must be grouping expressions of the associated query level"
                                     .into(),
                             ));
@@ -828,7 +842,7 @@ pub(crate) fn flatten_join_alias_vars(
                 }
                 let alias = joinaliasvars
                     .get((v.varattno - 1) as usize)
-                    .ok_or_else(|| AnalysisError("a join alias variable".into()))?;
+                    .ok_or_else(|| AnalysisError::new("a join alias variable".into()))?;
                 let mut out = flatten_join_alias_vars(rtable, alias, 0)?;
                 if sublevels > 0 {
                     increment_var_sublevels_up(&mut out, sublevels);

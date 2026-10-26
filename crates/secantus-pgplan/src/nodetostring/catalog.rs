@@ -156,6 +156,8 @@ pub struct AggRow {
 #[derive(Clone, Debug)]
 pub struct OpclassRow {
     pub oid: Oid,
+    pub name: String,
+    pub nsp: Oid,
     pub method: Oid,
     pub family: Oid,
     pub intype: Oid,
@@ -211,11 +213,23 @@ pub struct CollRow {
     pub encoding: i32,
 }
 
+/// A `pg_constraint` row of a relation.
+#[derive(Clone, Debug)]
+pub struct ConRow {
+    pub oid: Oid,
+    pub relid: Oid,
+    pub name: String,
+    pub contype: char,
+    pub conkey: Vec<i16>,
+    pub deferrable: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct RangeRow {
     pub typid: Oid,
     pub subtype: Oid,
     pub multitypid: Oid,
+    pub collation: Oid,
 }
 
 /// The catalog rows, as the server hands them over.
@@ -236,8 +250,8 @@ pub struct CatalogData {
     pub ranges: Vec<RangeRow>,
     /// (child, parent).
     pub inherits: Vec<(Oid, Oid)>,
-    /// Primary keys: (relation, constraint oid, key columns, deferrable).
-    pub pkeys: Vec<(Oid, Oid, Vec<i16>, bool)>,
+    /// Constraints on relations.
+    pub constraints: Vec<ConRow>,
     /// The database's name (`current_database()`, a 4-part name's check).
     pub database: String,
     /// The server encoding's number, for collation lookup.
@@ -343,6 +357,44 @@ impl Catalog {
             c.multiranges.insert(r.multitypid, i);
         }
         c
+    }
+
+    /// `format_type_with_typemod`.
+    pub fn format_type_with_typemod(&self, t: Oid, typmod: i32) -> String {
+        let Some(row) = self.type_row(t) else {
+            return "???".into();
+        };
+        if row.elem != 0 && row.len == -1 && row.subscript == F_ARRAY_SUBSCRIPT_HANDLER {
+            return format!("{}[]", self.format_type_with_typemod(row.elem, typmod));
+        }
+        crate::scalar::format_type_text(&row.name, Some(typmod))
+    }
+
+    /// A collation's name, as error messages print it.
+    pub fn collation_name(&self, c: Oid) -> String {
+        self.data
+            .collations
+            .iter()
+            .find(|r| r.oid == c)
+            .map_or_else(|| "???".into(), |r| r.name.clone())
+    }
+
+    /// `format_type_be`: a type's name as error messages print it (an
+    /// array as its element's name and `[]`; a type outside `pg_catalog`
+    /// and `public` qualified by its schema).
+    pub fn format_type_be(&self, t: Oid) -> String {
+        let Some(row) = self.type_row(t) else {
+            return "???".into();
+        };
+        if row.elem != 0 && row.len == -1 && row.subscript == F_ARRAY_SUBSCRIPT_HANDLER {
+            return format!("{}[]", self.format_type_be(row.elem));
+        }
+        let name = crate::scalar::format_type_text(&row.name, None);
+        if row.nsp == PG_CATALOG_NAMESPACE || self.namespace_name(row.nsp) == Some("public") {
+            name
+        } else {
+            format!("{}.{name}", self.namespace_name(row.nsp).unwrap_or("???"))
+        }
     }
 
     pub fn type_row(&self, oid: Oid) -> Option<&TypeRow> {
@@ -681,11 +733,20 @@ impl Catalog {
     /// key's constraint and columns, none for a deferrable one.
     pub fn primary_key(&self, relid: Oid) -> Option<(Oid, &[i16])> {
         self.data
-            .pkeys
+            .constraints
             .iter()
-            .find(|p| p.0 == relid)
-            .filter(|p| !p.3)
-            .map(|p| (p.1, p.2.as_slice()))
+            .find(|c| c.relid == relid && c.contype == 'p')
+            .filter(|c| !c.deferrable)
+            .map(|c| (c.oid, c.conkey.as_slice()))
+    }
+
+    /// `get_relation_constraint_oid` / `_attnos`: a relation's constraint
+    /// by name.
+    pub fn relation_constraint(&self, relid: Oid, name: &str) -> Option<&ConRow> {
+        self.data
+            .constraints
+            .iter()
+            .find(|c| c.relid == relid && c.name == name)
     }
 
     /// `get_opfamily_proc`.

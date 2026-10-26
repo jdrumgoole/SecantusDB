@@ -15143,6 +15143,12 @@ impl PgHandler {
     /// its output columns are what OR REPLACE is checked against.
     fn create_view(&self, cv: secantus_pgplan::CreateView) -> PgWireResult<Vec<Response>> {
         let name = cv.name.clone();
+        // Parse analysis comes first: what it refuses is refused before the
+        // view's name or its query's columns are looked at (RP-282).
+        {
+            let bare = name.rsplit('.').next().unwrap_or(&name);
+            self.statement_rule_refusal('v', bare, "_RETURN", 0)?;
+        }
         let existing = self
             .views()?
             .into_iter()
@@ -15290,7 +15296,7 @@ impl PgHandler {
         // Its `_RETURN` rule's trees, analysed now as `DefineView` does
         // (RP-203).
         let bare = name.rsplit('.').next().unwrap_or(&name).to_string();
-        if let Some((qual, action)) = self.statement_rule_trees('v', &bare, "_RETURN", relid) {
+        if let Some((qual, action)) = self.statement_rule_trees('v', &bare, "_RETURN", relid)? {
             doc.insert("ev_qual", qual);
             doc.insert("ev_action", action);
         }
@@ -15315,6 +15321,48 @@ impl PgHandler {
         )?;
         self.note_uncommitted_type(Self::VIEW_COLLECTION, &name, Some(doc));
         Ok(vec![Response::Execution(Tag::new("CREATE VIEW"))])
+    }
+
+    /// A table an ON SELECT rule turned into a view keeps its relation and
+    /// row type oids, and its `_RETURN` rule the trees of that rule.
+    pub(crate) fn keep_converted_view(
+        &self,
+        name: &str,
+        relid: i64,
+        reltype: i64,
+        trees: Option<(String, String)>,
+    ) -> PgWireResult<()> {
+        let docs = self.type_catalog_docs(Self::VIEW_COLLECTION)?;
+        let Some(mut doc) = docs.iter().find(|d| d.get_str("_id") == Ok(name)).cloned() else {
+            return Ok(());
+        };
+        doc.insert("oid", relid);
+        doc.insert("type_oid", reltype);
+        doc.remove("ev_qual");
+        doc.remove("ev_action");
+        if let Some((qual, action)) = trees {
+            doc.insert("ev_qual", qual);
+            doc.insert("ev_action", action);
+        }
+        self.storage
+            .delete_matching(
+                self.db(),
+                Self::VIEW_COLLECTION,
+                &bson::doc! { "_id": name },
+                0,
+                &Document::new(),
+                None,
+            )
+            .map_err(|e| Self::storage_err("could not replace the view", e))?;
+        let bytes =
+            encode_doc(&doc).map_err(|e| Self::storage_err("could not encode the view", e))?;
+        self.insert_checked(
+            Self::VIEW_COLLECTION,
+            vec![bytes],
+            "could not record the view",
+        )?;
+        self.note_uncommitted_type(Self::VIEW_COLLECTION, name, Some(doc));
+        Ok(())
     }
 
     /// A view's row type -- its output columns' names and types -- as its
@@ -17506,7 +17554,10 @@ impl PgHandler {
     fn new_matview_trees(&self, table: &str) -> Option<(String, String)> {
         let relid = self.relation_oid(table)?;
         let bare = table.rsplit('.').next().unwrap_or(table);
+        // Refusals were raised before the table was made.
         self.statement_rule_trees('m', bare, "_RETURN", relid)
+            .ok()
+            .flatten()
     }
 
     /// Every domain CHECK as a `pg_constraint` row's pieces: `(constraint
@@ -27572,6 +27623,37 @@ impl PgHandler {
                 // A foreign key over the key depends on its index
                 // (`reportDependentObjects`, 15.19).
                 let dependents = self.key_dependents(table, def, name)?;
+                // A view or rule whose grouping leans on the key depends on
+                // the constraint itself (RP-280).
+                let rule_deps = self.key_rule_dependents(table, name);
+                if !rule_deps.is_empty() && !*cascade {
+                    let shown = secantus_pgplan::schemas::visible_name(table);
+                    let mut info = ErrorInfo::new(
+                        "ERROR".into(),
+                        "2BP01".into(),
+                        format!(
+                            "cannot drop constraint {name} on table {shown} because other objects depend on it"
+                        ),
+                    );
+                    info.detail = Some(
+                        dependents
+                            .iter()
+                            .map(|(fk, t)| {
+                                format!(
+                                    "constraint {fk} on table {} depends on index {name}",
+                                    secantus_pgplan::schemas::visible_name(t)
+                                )
+                            })
+                            .chain(rule_deps.iter().map(|d| {
+                                format!("{d} depends on constraint {name} on table {shown}")
+                            }))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    );
+                    info.hint =
+                        Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
+                    return Err(PgWireError::UserError(Box::new(info)));
+                }
                 if !dependents.is_empty() && !*cascade {
                     let shown = secantus_pgplan::schemas::visible_name(table);
                     let mut info = ErrorInfo::new(
@@ -27922,6 +28004,10 @@ impl PgHandler {
             // A UNIQUE constraint's index goes with it (the other kinds have
             // none; a missing index is nothing to drop).
             A::DropConstraint { name, cascade, .. } => {
+                // The views and rules that lean on the key go with it.
+                if *cascade {
+                    self.drop_key_rule_dependents(table, name)?;
+                }
                 // The foreign keys over the key go first, each from its own
                 // table (this table's own went with the catalog change).
                 if *cascade {
@@ -28303,6 +28389,74 @@ impl PgHandler {
         }
         out.sort();
         Ok(out)
+    }
+
+    /// The constraint `name` on `table`'s oid, as pg_constraint lists it.
+    fn table_constraint_oid(&self, table: &str, name: &str) -> Option<i64> {
+        let rel = self.relation_oid(table)?;
+        let sql = format!(
+            "select oid::int8 from pg_constraint where conrelid = {rel} and conname = {}",
+            secantus_pgplan::scalar::quote_literal(name)
+        );
+        let (_, rows) = self.internal_query(&sql).ok()?;
+        rows.first()
+            .and_then(|r| r.first().cloned().flatten())
+            .and_then(|v| crate::bson_i64(&v))
+    }
+
+    /// The views and rules whose trees depend on the constraint, described
+    /// as `reportDependentObjects` does: `view v`, `rule r on table t`.
+    fn key_rule_dependents(&self, table: &str, name: &str) -> Vec<String> {
+        let Some(con) = self.table_constraint_oid(table, name) else {
+            return Vec::new();
+        };
+        self.constraint_rule_dependents(con)
+            .into_iter()
+            .map(|(kind, n, t)| {
+                let n = secantus_pgplan::schemas::visible_name(&n);
+                if kind == "rule" {
+                    format!(
+                        "rule {n} on table {}",
+                        secantus_pgplan::schemas::visible_name(&t)
+                    )
+                } else {
+                    format!("{kind} {n}")
+                }
+            })
+            .collect()
+    }
+
+    /// `DROP CONSTRAINT ... CASCADE`: the views, materialized views and
+    /// rules whose trees depend on the constraint are dropped first.
+    fn drop_key_rule_dependents(&self, table: &str, name: &str) -> PgWireResult<()> {
+        let Some(con) = self.table_constraint_oid(table, name) else {
+            return Ok(());
+        };
+        let deps = self.constraint_rule_dependents(con);
+        if deps.is_empty() {
+            return Ok(());
+        }
+        self.cascade_notice(&self.key_rule_dependents(table, name));
+        for (kind, n, t) in deps {
+            let q = |x: &str| {
+                x.split('.')
+                    .map(secantus_pgplan::scalar::quote_identifier)
+                    .collect::<Vec<_>>()
+                    .join(".")
+            };
+            let sql = match kind {
+                "rule" => format!(
+                    "drop rule {} on {}",
+                    secantus_pgplan::scalar::quote_identifier(&n),
+                    q(&t)
+                ),
+                "view" => format!("drop view {} cascade", q(&n)),
+                _ => format!("drop materialized view {} cascade", q(&n)),
+            };
+            let stmt = self.plan_internal(&sql)?;
+            self.execute_inner(stmt, 0)?;
+        }
+        Ok(())
     }
 
     /// `DROP CONSTRAINT t_pkey`: each row's key values go back to fields of
@@ -36997,6 +37151,12 @@ impl PgHandler {
                 matview_sql,
                 access_method,
             } => {
+                // What PostgreSQL's analysis of the query refuses, before
+                // anything is made (RP-282).
+                if matview_sql.is_some() {
+                    let bare = table.rsplit('.').next().unwrap_or(&table);
+                    self.statement_rule_refusal('m', bare, "_RETURN", 0)?;
+                }
                 if self.lookup(&table).is_some() {
                     if if_not_exists {
                         return Ok(vec![Response::Execution(Tag::new("CREATE TABLE AS"))]);

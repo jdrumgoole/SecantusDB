@@ -4,7 +4,7 @@ use super::catalog::*;
 use super::nodefuncs::{children_mut, expr_collation, expr_location, expr_type};
 use super::nodes::*;
 use super::parse::Analyzer;
-use super::{unsupported, R};
+use super::{pg_error, R};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Strength {
@@ -51,6 +51,12 @@ impl<'a> Analyzer<'a> {
             if let Some(w) = oc.arbiter_where.as_mut() {
                 self.assign_expr_collations(w)?;
             }
+            for t in oc.on_conflict_set.iter_mut() {
+                self.assign_tle_collations(t)?;
+            }
+            if let Some(w) = oc.on_conflict_where.as_mut() {
+                self.assign_expr_collations(w)?;
+            }
         }
         if let Some(j) = q.jointree.as_mut() {
             for n in j.fromlist.iter_mut() {
@@ -85,9 +91,17 @@ impl<'a> Analyzer<'a> {
         let mut loc = Ctx::new();
         self.walk(&mut t.expr, &mut loc)?;
         if loc.strength == Strength::Conflict && t.ressortgroupref != 0 {
-            return unsupported("collation mismatch between implicit collations");
+            return pg_error(
+                "42P21",
+                format!(
+                    "collation mismatch between implicit collations \"{}\" and \"{}\"",
+                    self.cat.collation_name(loc.collation),
+                    self.cat.collation_name(loc.collation2)
+                ),
+            );
         }
         merge(
+            self.cat,
             loc.collation,
             loc.strength,
             loc.location,
@@ -125,7 +139,14 @@ impl<'a> Analyzer<'a> {
             if none_ok {
                 return Ok(0);
             }
-            return unsupported("collation mismatch between implicit collations");
+            return pg_error(
+                "42P21",
+                format!(
+                    "collation mismatch between implicit collations \"{}\" and \"{}\"",
+                    self.cat.collation_name(ctx.collation),
+                    self.cat.collation_name(ctx.collation2)
+                ),
+            );
         }
         Ok(ctx.collation)
     }
@@ -179,9 +200,14 @@ impl<'a> Analyzer<'a> {
             self.walk(h, &mut pair)?;
             self.walk(&mut s.expr, &mut pair)?;
             if pair.strength == Strength::Conflict {
-                return Err(super::AnalysisError(
-                    "collation mismatch between implicit collations".into(),
-                ));
+                return pg_error(
+                    "42P21",
+                    format!(
+                        "collation mismatch between implicit collations \"{}\" and \"{}\"",
+                        self.cat.collation_name(pair.collation),
+                        self.cat.collation_name(pair.collation2)
+                    ),
+                );
             }
             if pair.collation != 0 && pair.collation != expr_collation(self.cat, &s.expr) {
                 let e = s.expr.clone();
@@ -196,6 +222,7 @@ impl<'a> Analyzer<'a> {
             }
             if merge_sort {
                 merge(
+                    self.cat,
                     pair.collation,
                     pair.strength,
                     pair.location,
@@ -276,7 +303,14 @@ impl<'a> Analyzer<'a> {
             Node::TargetEntry(t) => {
                 self.walk(&mut t.expr, &mut loc)?;
                 if loc.strength == Strength::Conflict && t.ressortgroupref != 0 {
-                    return unsupported("collation mismatch between implicit collations");
+                    return pg_error(
+                        "42P21",
+                        format!(
+                            "collation mismatch between implicit collations \"{}\" and \"{}\"",
+                            self.cat.collation_name(loc.collation),
+                            self.cat.collation_name(loc.collation2)
+                        ),
+                    );
                 }
                 collation = loc.collation;
                 strength = loc.strength;
@@ -295,7 +329,7 @@ impl<'a> Analyzer<'a> {
                     _ => None,
                 };
                 if let Some((c, l)) = qcoll {
-                    merge(c, Strength::Implicit, l, 0, -1, &mut loc)?;
+                    merge(self.cat, c, Strength::Implicit, l, 0, -1, &mut loc)?;
                 }
                 let t = expr_type(self.cat, n);
                 let tc = self.cat.get_typcollation(t);
@@ -399,6 +433,7 @@ impl<'a> Analyzer<'a> {
             }
         }
         merge(
+            self.cat,
             collation,
             strength,
             location,
@@ -423,6 +458,7 @@ impl<'a> Analyzer<'a> {
 
 /// `merge_collation_state`.
 fn merge(
+    cat: &Catalog,
     collation: Oid,
     strength: Strength,
     location: i32,
@@ -455,7 +491,14 @@ fn merge(
             }
             Strength::Explicit => {
                 if collation != ctx.collation {
-                    return unsupported("collation mismatch between explicit collations");
+                    return pg_error(
+                        "42P21",
+                        format!(
+                            "collation mismatch between explicit collations \"{}\" and \"{}\"",
+                            cat.collation_name(ctx.collation),
+                            cat.collation_name(collation)
+                        ),
+                    );
                 }
             }
             _ => {}

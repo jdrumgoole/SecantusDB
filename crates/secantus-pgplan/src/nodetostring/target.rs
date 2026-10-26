@@ -6,7 +6,7 @@ use super::nodefuncs::{expr_collation, expr_location, expr_type, expr_typmod};
 use super::nodes::*;
 use super::parse::{Analyzer, ExprKind};
 use super::relation::{TupDescAttr, FIRST_LOW_INVALID};
-use super::{unsupported, AnalysisError, R};
+use super::{pg_error, unsupported, AnalysisError, R};
 use pg_query::protobuf as pb;
 use pg_query::protobuf::node::Node as N;
 
@@ -26,7 +26,7 @@ impl<'a> Analyzer<'a> {
             let val = res
                 .val
                 .as_deref()
-                .ok_or_else(|| AnalysisError("a target without a value".into()))?;
+                .ok_or_else(|| AnalysisError::new("a target without a value".into()))?;
             if expand_star {
                 if let Some(N::ColumnRef(c)) = val.node.as_ref() {
                     if matches!(
@@ -58,6 +58,8 @@ impl<'a> Analyzer<'a> {
             let name = (!res.name.is_empty()).then(|| res.name.clone());
             out.push(self.transform_target_entry(val, None, kind, name, false)?);
         }
+        // The multiple-assignment sublinks go at the end (UPDATE only).
+        out.append(&mut self.ps().multiassign_exprs);
         Ok(out)
     }
 
@@ -211,12 +213,12 @@ impl<'a> Analyzer<'a> {
                             .iter()
                             .find(|c| &c.ctename == ctename)
                         {
-                            if let Some(ste) = cte
-                                .ctequery
-                                .target_list
-                                .iter()
-                                .find(|s| s.resno == v.varattno)
-                            {
+                            let tl = if cte.ctequery.command_type == CMD_SELECT {
+                                &cte.ctequery.target_list
+                            } else {
+                                &cte.ctequery.returning_list
+                            };
+                            if let Some(ste) = tl.iter().find(|s| s.resno == v.varattno) {
                                 t.resorigtbl = ste.resorigtbl;
                                 t.resorigcol = ste.resorigcol;
                             }
@@ -407,7 +409,7 @@ impl<'a> Analyzer<'a> {
                     .target_list
                     .iter()
                     .find(|t| t.resno == v.varattno && !t.resjunk)
-                    .ok_or_else(|| AnalysisError("subquery attribute".into()))?;
+                    .ok_or_else(|| AnalysisError::new("subquery attribute".into()))?;
                 if let Node::Var(inner) = &ste.expr {
                     // Recurse into the subquery's own range table, whose
                     // parent is the level the subquery RTE belongs to.
@@ -428,7 +430,7 @@ impl<'a> Analyzer<'a> {
             RteKind::Join { joinaliasvars, .. } => {
                 let e = joinaliasvars
                     .get((v.varattno - 1) as usize)
-                    .ok_or_else(|| AnalysisError("join attribute".into()))?;
+                    .ok_or_else(|| AnalysisError::new("join attribute".into()))?;
                 if let Node::Var(inner) = e {
                     return self.expand_record_variable(inner, net);
                 }
@@ -643,13 +645,14 @@ pub(crate) fn transform_insert_stmt(a: &mut Analyzer<'_>, stmt: &pb::InsertStmt)
         ..Default::default()
     };
     a.ps().is_insert = true;
-    if stmt.with_clause.is_some() {
-        return unsupported("WITH in a stored rule");
+    if let Some(w) = &stmt.with_clause {
+        qry.has_recursive = w.recursive;
+        a.transform_with_clause(w)?;
+        qry.has_modifying_cte = a.psr().has_modifying_cte;
     }
     let on_conflict = stmt.on_conflict_clause.as_deref();
-    if on_conflict.is_some_and(|oc| oc.action != pb::OnConflictAction::OnconflictNothing as i32) {
-        return unsupported("ON CONFLICT DO UPDATE in a stored rule");
-    }
+    let is_on_conflict_update =
+        on_conflict.is_some_and(|oc| oc.action == pb::OnConflictAction::OnconflictUpdate as i32);
     qry.override_ = (stmt.r#override - 1).max(0);
     let select = stmt
         .select_stmt
@@ -677,8 +680,10 @@ pub(crate) fn transform_insert_stmt(a: &mut Analyzer<'_>, stmt: &pb::InsertStmt)
     let rel = stmt
         .relation
         .as_ref()
-        .ok_or_else(|| AnalysisError("INSERT without a table".into()))?;
-    qry.result_relation = a.set_target_table(rel, false, false, 1 /* ACL_INSERT */)?;
+        .ok_or_else(|| AnalysisError::new("INSERT without a table".into()))?;
+    // ACL_INSERT, and ACL_UPDATE for ON CONFLICT DO UPDATE.
+    let perms = if is_on_conflict_update { 1 | 4 } else { 1 };
+    qry.result_relation = a.set_target_table(rel, false, false, perms)?;
     let (icolumns, attrnos) = a.check_insert_targets(&stmt.cols)?;
     let target_rt = qry.result_relation;
     let mut expr_list: Vec<Node>;
@@ -796,6 +801,7 @@ pub(crate) fn transform_insert_stmt(a: &mut Analyzer<'_>, stmt: &pb::InsertStmt)
     if !stmt.returning_list.is_empty() {
         qry.returning_list = a.transform_returning_list(&stmt.returning_list)?;
     }
+    qry.cte_list = std::mem::take(&mut a.ps().ctenamespace);
     let ps = a.ps();
     qry.rtable = std::mem::take(&mut ps.rtable);
     qry.jointree = Some(FromExpr {
@@ -814,13 +820,16 @@ pub(crate) fn transform_update_stmt(a: &mut Analyzer<'_>, stmt: &pb::UpdateStmt)
         command_type: CMD_UPDATE,
         ..Default::default()
     };
-    if stmt.with_clause.is_some() {
-        return unsupported("WITH in a stored rule");
+    a.ps().is_insert = false;
+    if let Some(w) = &stmt.with_clause {
+        qry.has_recursive = w.recursive;
+        a.transform_with_clause(w)?;
+        qry.has_modifying_cte = a.psr().has_modifying_cte;
     }
     let rel = stmt
         .relation
         .as_ref()
-        .ok_or_else(|| AnalysisError("UPDATE without a table".into()))?;
+        .ok_or_else(|| AnalysisError::new("UPDATE without a table".into()))?;
     qry.result_relation = a.set_target_table(rel, rel.inh, true, 4 /* ACL_UPDATE */)?;
     let nsidx = a.psr().namespace.len() - 1;
     a.ps().namespace[nsidx].lateral_only = true;
@@ -839,6 +848,7 @@ pub(crate) fn transform_update_stmt(a: &mut Analyzer<'_>, stmt: &pb::UpdateStmt)
     });
     qry.has_target_srfs = ps.has_target_srfs;
     qry.has_sub_links = ps.has_sub_links;
+    qry.cte_list = std::mem::take(&mut ps.ctenamespace);
     a.assign_query_collations(&mut qry)?;
     Ok(qry)
 }
@@ -849,13 +859,15 @@ pub(crate) fn transform_delete_stmt(a: &mut Analyzer<'_>, stmt: &pb::DeleteStmt)
         command_type: CMD_DELETE,
         ..Default::default()
     };
-    if stmt.with_clause.is_some() {
-        return unsupported("WITH in a stored rule");
+    if let Some(w) = &stmt.with_clause {
+        qry.has_recursive = w.recursive;
+        a.transform_with_clause(w)?;
+        qry.has_modifying_cte = a.psr().has_modifying_cte;
     }
     let rel = stmt
         .relation
         .as_ref()
-        .ok_or_else(|| AnalysisError("DELETE without a table".into()))?;
+        .ok_or_else(|| AnalysisError::new("DELETE without a table".into()))?;
     qry.result_relation = a.set_target_table(rel, rel.inh, true, 8 /* ACL_DELETE */)?;
     let nsidx = a.psr().namespace.len() - 1;
     a.ps().namespace[nsidx].lateral_only = true;
@@ -875,6 +887,7 @@ pub(crate) fn transform_delete_stmt(a: &mut Analyzer<'_>, stmt: &pb::DeleteStmt)
     qry.has_window_funcs = ps.has_window_funcs;
     qry.has_target_srfs = ps.has_target_srfs;
     qry.has_aggs = ps.has_aggs;
+    qry.cte_list = std::mem::take(&mut ps.ctenamespace);
     a.assign_query_collations(&mut qry)?;
     Ok(qry)
 }
@@ -904,7 +917,7 @@ impl<'a> Analyzer<'a> {
         let rtindex = self
             .psr()
             .target_rtindex
-            .ok_or_else(|| AnalysisError("no target relation".into()))?;
+            .ok_or_else(|| AnalysisError::new("no target relation".into()))?;
         let rte = &self.psr().rtable[(rtindex - 1) as usize];
         let relid = rte.relid().unwrap_or(0);
         let td = self.relation_tupdesc(relid);
@@ -945,7 +958,7 @@ impl<'a> Analyzer<'a> {
         let rtindex = self
             .psr()
             .target_rtindex
-            .ok_or_else(|| AnalysisError("no target relation".into()))?;
+            .ok_or_else(|| AnalysisError::new("no target relation".into()))?;
         let relid = self.psr().rtable[(rtindex - 1) as usize]
             .relid()
             .unwrap_or(0);
@@ -975,10 +988,13 @@ impl<'a> Analyzer<'a> {
                 .iter()
                 .position(|a| !a.dropped && a.name == r.name)
                 .ok_or_else(|| {
-                    AnalysisError(format!("column \"{}\" of relation does not exist", r.name))
+                    AnalysisError::new(format!("column \"{}\" of relation does not exist", r.name))
                 })?;
             if nums.contains(&(attno as i32 + 1)) {
-                return unsupported(format!("column \"{}\" specified more than once", r.name));
+                return pg_error(
+                    "42701",
+                    format!("column \"{}\" specified more than once", r.name),
+                );
             }
             names.push(r.name.clone());
             nums.push(attno as i32 + 1);
@@ -995,10 +1011,10 @@ impl<'a> Analyzer<'a> {
         attrnos: &[i32],
     ) -> R<Vec<Node>> {
         if exprs.len() > icolumns.len() {
-            return unsupported("INSERT has more expressions than target columns");
+            return pg_error("42601", "INSERT has more expressions than target columns");
         }
         if !stmtcols.is_empty() && exprs.len() < icolumns.len() {
-            return unsupported("INSERT has more target columns than expressions");
+            return pg_error("42601", "INSERT has more target columns than expressions");
         }
         let mut out = Vec::new();
         for ((e, col), attno) in exprs.into_iter().zip(icolumns).zip(attrnos) {
@@ -1025,7 +1041,7 @@ impl<'a> Analyzer<'a> {
         let att = td
             .get((attno - 1) as usize)
             .cloned()
-            .ok_or_else(|| AnalysisError("a target column".into()))?;
+            .ok_or_else(|| AnalysisError::new("a target column".into()))?;
         let expr = match expr {
             Node::SetToDefault(mut d) => {
                 d.type_id = att.typid;
@@ -1047,9 +1063,15 @@ impl<'a> Analyzer<'a> {
         )?;
         self.ps().expr_kind = sv;
         r.ok_or_else(|| {
-            AnalysisError(format!(
-                "column \"{colname}\" is of a type the expression cannot be assigned to"
-            ))
+            AnalysisError::pg(
+                "42804",
+                format!(
+                    "column \"{colname}\" is of type {} but expression is of type {}",
+                    self.cat.format_type_be(att.typid),
+                    self.cat.format_type_be(t)
+                ),
+            )
+            .with_hint("You will need to rewrite or cast the expression.")
         })
     }
 
@@ -1060,14 +1082,25 @@ impl<'a> Analyzer<'a> {
         rtindex: i32,
     ) -> R<Vec<TargetEntry>> {
         let mut tlist = self.transform_target_list(orig, ExprKind::UpdateSource)?;
-        if self.psr().next_resno as usize > 1 {
-            self.ps().next_resno = 1;
-        }
         let relid = self.psr().rtable[(rtindex - 1) as usize]
             .relid()
             .unwrap_or(0);
         let td = self.relation_tupdesc(relid);
-        for (t, o) in tlist.iter_mut().zip(orig) {
+        // Junk entries take result numbers no target column has.
+        if self.psr().next_resno <= td.len() as i32 {
+            self.ps().next_resno = td.len() as i32 + 1;
+        }
+        let mut orig_it = orig.iter();
+        for t in tlist.iter_mut() {
+            if t.resjunk {
+                t.resno = self.psr().next_resno;
+                self.ps().next_resno += 1;
+                t.resname = None;
+                continue;
+            }
+            let Some(o) = orig_it.next() else {
+                return unsupported("an UPDATE target");
+            };
             let Some(N::ResTarget(r)) = o.node.as_ref() else {
                 return unsupported("an UPDATE target");
             };
@@ -1077,8 +1110,9 @@ impl<'a> Analyzer<'a> {
             let attno = td
                 .iter()
                 .position(|a| !a.dropped && a.name == r.name)
-                .ok_or_else(|| AnalysisError(format!("column \"{}\" does not exist", r.name)))?
-                as i32
+                .ok_or_else(|| {
+                    AnalysisError::new(format!("column \"{}\" does not exist", r.name))
+                })? as i32
                 + 1;
             let e = t.expr.clone();
             t.expr = self.transform_assigned_expr(e, ExprKind::UpdateTarget, &r.name, attno)?;
@@ -1092,32 +1126,123 @@ impl<'a> Analyzer<'a> {
     }
 
     /// `transformReturningList`.
-    /// `transformOnConflictClause` for DO NOTHING, with
-    /// `transformOnConflictArbiter`'s inference columns and predicate.
+    /// `transformOnConflictClause`, with `transformOnConflictArbiter`.
     fn transform_on_conflict_clause(&mut self, oc: &pb::OnConflictClause) -> R<OnConflictExpr> {
+        let update = oc.action == pb::OnConflictAction::OnconflictUpdate as i32;
+        let target_rt = self
+            .psr()
+            .target_rtindex
+            .ok_or_else(|| AnalysisError::new("no target relation".into()))?;
+        let relid = self.psr().rtable[(target_rt - 1) as usize]
+            .relid()
+            .unwrap_or(0);
+        // DO UPDATE: the EXCLUDED pseudo relation comes first, so it is in
+        // the range table while the arbiter is processed.
+        let mut excl = None;
+        let mut excl_rel_index = 0;
+        let mut excl_rel_tlist = Vec::new();
+        if update {
+            let ns = self.add_rte_for_relation_oid(
+                relid,
+                Some(Alias::new("excluded")),
+                3,
+                false,
+                false,
+            )?;
+            excl_rel_index = ns.rtindex;
+            let rte = &mut self.ps().rtable[(ns.rtindex - 1) as usize];
+            if let RteKind::Relation { relkind, .. } = &mut rte.kind {
+                *relkind = 'c';
+            }
+            rte.required_perms = 0;
+            // BuildOnConflictExcludedTargetlist
+            let td = self.relation_tupdesc(relid);
+            for (i, att) in td.iter().enumerate() {
+                let attno = i as i32 + 1;
+                let (expr, name) = if att.dropped {
+                    (
+                        Node::Const(Const {
+                            consttype: INT4OID,
+                            consttypmod: -1,
+                            constcollid: 0,
+                            constlen: 4,
+                            constbyval: true,
+                            constvalue: None,
+                            location: -1,
+                        }),
+                        None,
+                    )
+                } else {
+                    (
+                        Node::Var(Var {
+                            varno: excl_rel_index,
+                            varattno: attno,
+                            vartype: att.typid,
+                            vartypmod: att.typmod,
+                            varcollid: att.collation,
+                            varlevelsup: 0,
+                            varnosyn: excl_rel_index as u32,
+                            varattnosyn: attno,
+                            location: -1,
+                        }),
+                        Some(att.name.clone()),
+                    )
+                };
+                excl_rel_tlist.push(TargetEntry {
+                    expr,
+                    resno: attno,
+                    resname: name,
+                    ressortgroupref: 0,
+                    resorigtbl: 0,
+                    resorigcol: 0,
+                    resjunk: false,
+                });
+            }
+            let reltype = self.cat.rel(relid).map_or(0, |r| r.reltype);
+            excl_rel_tlist.push(TargetEntry {
+                expr: Node::Var(Var {
+                    varno: excl_rel_index,
+                    varattno: 0,
+                    vartype: reltype,
+                    vartypmod: -1,
+                    varcollid: 0,
+                    varlevelsup: 0,
+                    varnosyn: excl_rel_index as u32,
+                    varattnosyn: 0,
+                    location: -1,
+                }),
+                resno: 0,
+                resname: None,
+                ressortgroupref: 0,
+                resorigtbl: 0,
+                resorigcol: 0,
+                resjunk: true,
+            });
+            excl = Some(ns);
+        }
+        // transformOnConflictArbiter
         let mut arbiter_elems = Vec::new();
         let mut arbiter_where = None;
+        let mut constraint = 0;
+        if update && oc.infer.is_none() {
+            return Err(AnalysisError::pg(
+                "42601",
+                "ON CONFLICT DO UPDATE requires inference specification or constraint name",
+            )
+            .with_hint("For example, ON CONFLICT (column_name)."));
+        }
         if let Some(infer) = oc.infer.as_deref() {
-            if !infer.conname.is_empty() {
-                return unsupported("ON CONFLICT ON CONSTRAINT in a stored rule");
-            }
             for ie in &infer.index_elems {
                 let Some(N::IndexElem(e)) = ie.node.as_ref() else {
                     return unsupported("an ON CONFLICT inference element");
                 };
                 if e.ordering != pb::SortByDir::SortbyDefault as i32 {
-                    return Err(AnalysisError(
-                        "ASC/DESC is not allowed in ON CONFLICT clause".into(),
-                    ));
+                    return pg_error("42P10", "ASC/DESC is not allowed in ON CONFLICT clause");
                 }
                 if e.nulls_ordering != pb::SortByNulls::SortbyNullsDefault as i32 {
-                    return Err(AnalysisError(
-                        "NULLS FIRST/LAST is not allowed in ON CONFLICT clause".into(),
-                    ));
-                }
-                if !e.collation.is_empty() || !e.opclass.is_empty() {
-                    return unsupported(
-                        "a collation or operator class in ON CONFLICT in a stored rule",
+                    return pg_error(
+                        "42P10",
+                        "NULLS FIRST/LAST is not allowed in ON CONFLICT clause",
                     );
                 }
                 let parse = match e.expr.as_deref() {
@@ -1135,21 +1260,109 @@ impl<'a> Analyzer<'a> {
                     },
                 };
                 let expr = self.transform_expr(&parse, ExprKind::IndexExpression)?;
+                let infercollid = if e.collation.is_empty() {
+                    0
+                } else {
+                    self.lookup_collation(&e.collation)?
+                };
+                let inferopclass = if e.opclass.is_empty() {
+                    0
+                } else {
+                    self.get_opclass_oid(BTREE_AM_OID, &e.opclass)?
+                };
                 arbiter_elems.push(InferenceElem {
                     expr,
-                    infercollid: 0,
-                    inferopclass: 0,
+                    infercollid,
+                    inferopclass,
                 });
             }
             if let Some(w) = infer.where_clause.as_deref() {
                 arbiter_where = Some(self.transform_expr(w, ExprKind::IndexPredicate)?);
             }
+            if !infer.conname.is_empty() {
+                let relname = self
+                    .cat
+                    .rel(relid)
+                    .map_or(String::new(), |r| r.name.clone());
+                let con = self
+                    .cat
+                    .relation_constraint(relid, &infer.conname)
+                    .cloned()
+                    .ok_or_else(|| {
+                        AnalysisError::pg(
+                            "42704",
+                            format!(
+                                "constraint \"{}\" for table \"{relname}\" does not exist",
+                                infer.conname
+                            ),
+                        )
+                    })?;
+                constraint = con.oid;
+                let rte = &mut self.ps().rtable[(target_rt - 1) as usize];
+                rte.required_perms |= 2; // ACL_SELECT
+                for k in &con.conkey {
+                    rte.selected_cols.insert(i32::from(*k) - FIRST_LOW_INVALID);
+                }
+            }
+        }
+        // DO UPDATE's SET list and WHERE, with EXCLUDED in the namespace.
+        let mut on_conflict_set = Vec::new();
+        let mut on_conflict_where = None;
+        if let Some(ns) = excl {
+            self.ps().is_insert = false;
+            self.add_nsitem_to_query(ns, false, true, true);
+            on_conflict_set = self.transform_update_target_list(&oc.target_list, target_rt)?;
+            on_conflict_where =
+                self.transform_where_clause(oc.where_clause.as_deref(), ExprKind::Where)?;
+            self.ps().namespace.pop();
         }
         Ok(OnConflictExpr {
             action: oc.action - 1,
             arbiter_elems,
             arbiter_where,
-            constraint: 0,
+            constraint,
+            on_conflict_set,
+            on_conflict_where,
+            excl_rel_index,
+            excl_rel_tlist,
+        })
+    }
+
+    /// `get_opclass_oid(amID, opclassname, false)`.
+    fn get_opclass_oid(&self, am: Oid, names: &[pb::Node]) -> R<Oid> {
+        let names = super::clause::string_list(names);
+        let (schema, name) = match names.as_slice() {
+            [n] => (None, n.as_str()),
+            [s, n] => (Some(s.as_str()), n.as_str()),
+            _ => return pg_error("42601", "improper qualified name (too many dotted names)"),
+        };
+        let found = match schema {
+            Some(sc) => {
+                let nsp = self.cat.namespace_oid(sc).ok_or_else(|| {
+                    AnalysisError::pg("3F000", format!("schema \"{sc}\" does not exist"))
+                })?;
+                self.cat
+                    .data
+                    .opclasses
+                    .iter()
+                    .find(|o| o.method == am && o.nsp == nsp && o.name == name)
+            }
+            None => self.path.iter().find_map(|nsp| {
+                self.cat
+                    .data
+                    .opclasses
+                    .iter()
+                    .find(|o| o.method == am && o.nsp == *nsp && o.name == name)
+            }),
+        };
+        found.map(|o| o.oid).ok_or_else(|| {
+            AnalysisError::pg(
+                "42704",
+                format!(
+                    "operator class \"{}\" does not exist for access method \"btree\"",
+                    names.join(".")
+                ),
+            )
         })
     }
 

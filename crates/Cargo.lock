@@ -1833,6 +1833,7 @@ dependencies = [
  "regex",
  "rust-stemmers",
  "secantus-pgcatalog",
+ "serde_json",
  "sha1",
  "sha2 0.10.9",
  "snowball_stemmers_rs",

@@ -288,6 +288,71 @@ SCENARIOS: dict[str, list[str]] = {
         "create rule rt_r3 as on update to rt_t do also update rt_l "
         "set (a, b, n) = (new.a, new.b || 'x', default) where a = old.a",
     ],
+    "views with FOR UPDATE, FOR SHARE and locking a subquery": [
+        "create table rt_t (a int, b text)",
+        "create table rt_u (a int, c text)",
+        "create view rt_v as select * from rt_t for update",
+        "create view rt_w as select t.a, s.c from rt_t t, (select * from rt_u) s "
+        "where t.a = s.a for share of t for no key update of s nowait",
+        "create view rt_x as select a from rt_t for key share skip locked",
+    ],
+    "a rule whose action has a data-modifying WITH": [
+        "create table rt_t (a int, b text)",
+        "create table rt_log (a int, note text)",
+        "create table rt_arch (a int)",
+        "create rule rt_r as on delete to rt_t do also "
+        "with moved as (insert into rt_arch values (7) returning a), "
+        "gone as (delete from rt_log where a < 0 returning a, note) "
+        "insert into rt_log select m.a, 'deleted' from moved m, gone g where g.a = old.a",
+    ],
+    "a view with SEARCH and CYCLE": [
+        "create table rt_g (id int, parent int)",
+        "create view rt_v as with recursive w(id, parent) as (select id, parent from rt_g "
+        "union all select g.id, g.parent from rt_g g join w on g.parent = w.id) "
+        "search breadth first by id set seq cycle id set is_cycle using path "
+        "select id, parent from w",
+        "create view rt_v2 as with recursive w(id) as (select id from rt_g union all "
+        "select g.id from rt_g g join w on g.parent = w.id) "
+        "cycle id set mark to 'y' default 'n' using p select id, mark from w",
+    ],
+    "rules with ON CONFLICT DO UPDATE and ON CONSTRAINT": [
+        "create table rt_t (a int primary key, b text, c int)",
+        "create table rt_l (a int primary key, b text, n int default 0)",
+        "create rule rt_r1 as on insert to rt_t do also insert into rt_l (a, b) "
+        "values (new.a, new.b) on conflict (a) do update set b = excluded.b || '!', "
+        "n = rt_l.n + 1 where rt_l.b is distinct from excluded.b",
+        "create rule rt_r2 as on update to rt_t do also insert into rt_l (a, b) "
+        "values (new.a, new.b) on conflict on constraint rt_l_pkey do nothing",
+        "create rule rt_r3 as on delete to rt_t do also insert into rt_l (a) "
+        'values (old.a) on conflict (a collate "C") do update set n = 0',
+    ],
+    "a rule with SET (a, b) = (SELECT ...)": [
+        "create table rt_t (a int, b text)",
+        "create table rt_l (a int, b text, c int)",
+        "create rule rt_r as on update to rt_t do also update rt_l "
+        "set (a, b) = (select new.a, new.b), c = 1, (b, c) = (select 'x', 2) "
+        "where rt_l.a = old.a",
+    ],
+    "views with interval field qualifiers": [
+        "create view rt_v as select interval '1' day as d, interval '2' hour as h, "
+        "interval '1:30' hour to minute as hm, interval '5:30' minute to second as ms, "
+        "interval '1 day 3:04:05.678' day to minute as dm, "
+        "interval '1.234567' second(2) as s2, interval '3' year as y, "
+        "interval '14' month as mo, interval '1-6' year to month as ym, "
+        "'2 days 03:00'::interval day to hour as cast_dh",
+    ],
+    "a WITH RECURSIVE whose name an inner WITH redefines": [
+        "create table rt_g (id int, parent int)",
+        "create view rt_v as with recursive w(id) as (select 1 union all "
+        "select id + 1 from w where id < 3), "
+        "x as (with w as (select 7 as id) select id from w) "
+        "select w.id, x.id as xid from w, x",
+    ],
+    "a table turned into a view by an ON SELECT rule": [
+        "create table rt_src (a int, b text)",
+        "create table rt_v (a int, b text)",
+        'create rule "_RETURN" as on select to rt_v do instead select a, b from rt_src',
+    ],
     "a view in another schema with search_path": [
         "create schema rt_s",
         "create table rt_s.t (a int, b text)",
@@ -342,8 +407,10 @@ def first_difference(a: str | None, b: str | None) -> str:
 OID_FIELDS = re.compile(
     r":(relid|resorigtbl|vartype|consttype|paramtype|funcid|funcresulttype|opno|opfuncid|"
     r"opresulttype|aggfnoid|aggtype|resulttype|casetype|array_typeid|element_typeid|"
-    r"row_typeid|coalescetype|minmaxtype|typeId|refcontainertype|refelemtype|refrestype) (\d+)"
+    r"row_typeid|coalescetype|minmaxtype|typeId|refcontainertype|refelemtype|refrestype|"
+    r"constraint|cycle_mark_type) (\d+)"
 )
+CONSTRAINT_DEPS = re.compile(r":constraintDeps \(o ([\d ]+)\)")
 
 
 def normalise(tree: str | None, names: dict[int, str]) -> str | None:
@@ -356,7 +423,12 @@ def normalise(tree: str | None, names: dict[int, str]) -> str | None:
             return f":{m.group(1)} <{names.get(n, '?')}>"
         return m.group(0)
 
-    return OID_FIELDS.sub(sub, tree)
+    def deps(m: re.Match) -> str:
+        oids = [int(o) for o in m.group(1).split()]
+        shown = [f"<{names.get(o, '?')}>" if o >= 16384 else str(o) for o in oids]
+        return f":constraintDeps (o {' '.join(shown)})"
+
+    return CONSTRAINT_DEPS.sub(deps, OID_FIELDS.sub(sub, tree))
 
 
 def object_names(cur) -> dict[int, str]:
@@ -365,6 +437,7 @@ def object_names(cur) -> dict[int, str]:
         "select oid::int8, 'rel:' || relname from pg_class where oid >= 16384",
         "select oid::int8, 'type:' || typname from pg_type where oid >= 16384",
         "select oid::int8, 'proc:' || proname from pg_proc where oid >= 16384",
+        "select oid::int8, 'con:' || conname from pg_constraint where oid >= 16384",
     ):
         for o, n in cur.execute(sql).fetchall():
             out[int(o)] = n

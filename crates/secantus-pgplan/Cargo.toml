@@ -31,6 +31,10 @@ chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 # reason on the MongoDB side.
 chrono-tz = { version = "0.10", default-features = false }
 pg_query = "6"
+# A generic walk over a raw parse tree (`raw_expression_tree_walker`), for
+# WITH RECURSIVE's dependency graph and recursion checks: the tree, as the
+# JSON its serde derive writes, reaches every field.
+serde_json = "1"
 # pg_query hands its parse tree over as protobuf, and prost refuses a message
 # nested past 100 levels -- a 50-term `a || b || ...` was a 42601 "Error
 # decoding result". PostgreSQL takes 1,000 terms; depth is policed by the

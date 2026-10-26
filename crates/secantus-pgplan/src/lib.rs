@@ -21,6 +21,7 @@ pub mod colstats;
 pub mod costsize;
 mod expr_where;
 mod filter_sublink;
+mod functional_grouping;
 mod guc_args;
 pub mod hashagg;
 mod hashfn;
@@ -22230,6 +22231,11 @@ fn plan_select(
         return plan_select(&rewritten, lookup, params);
     }
     cancel::check()?;
+    // A column of a table whose primary key is grouped by (RP-280).
+    if let Some(rewritten) = functional_grouping::rewrite(s, lookup)? {
+        return plan_select(&rewritten, lookup, params);
+    }
+    cancel::check()?;
     if let Some(rewritten) = distinct_on_over_groups(s) {
         return plan_select(&rewritten, lookup, params);
     }
@@ -29513,6 +29519,19 @@ fn timestamp_precision(tc: &pg_query::protobuf::TypeCast, target: &str, v: Bson)
         return round_time_value(v, p);
     }
     if p >= 0 && target == "interval" {
+        // A literal reads its number by the qualifier (`interval_in`'s
+        // typmod) before the value is cut to it.
+        let literal = match tc.arg.as_deref().and_then(|a| a.node.as_ref()) {
+            Some(N::AConst(c)) => match c.val.as_ref() {
+                Some(pg_query::protobuf::a_const::Val::Sval(t)) => Some(t.sval.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let v = match literal.and_then(|t| parse_interval_range(&t, p >> 16).ok()) {
+            Some(iv) => iv.to_bson(),
+            None => v,
+        };
         return adjust_interval(v, p);
     }
     if !(0..6).contains(&p) || !matches!(target, "timestamp" | "timestamptz") {
@@ -31959,6 +31978,23 @@ pub fn interval_value_text(v: &Bson) -> Option<String> {
 /// combined — `1 day -02:03:04` is a positive day and a negative time, which is
 /// why the components keep independent signs.
 fn parse_interval(text: &str) -> Result<Interval> {
+    parse_interval_range(text, INTERVAL_FULL_RANGE)
+}
+
+/// `INTERVAL_FULL_RANGE`: an interval with no field qualifier.
+pub(crate) const INTERVAL_FULL_RANGE: i32 = 0x7FFF;
+
+/// `interval_in` with a field qualifier: `DecodeInterval` reads a trailing
+/// number with no unit as the qualifier's last field (`interval '1' day` is
+/// one day, not one second), and, under `minute to second`, an `a:b` as
+/// minutes and seconds.
+pub(crate) fn parse_interval_range(text: &str, range: i32) -> Result<Interval> {
+    const YEAR: i32 = 1 << 2;
+    const MONTH: i32 = 1 << 1;
+    const DAY: i32 = 1 << 3;
+    const HOUR: i32 = 1 << 10;
+    const MINUTE: i32 = 1 << 11;
+    const SECOND: i32 = 1 << 12;
     let t = text.trim();
     if t.is_empty() {
         return Err(bad_interval(text));
@@ -31996,21 +32032,40 @@ fn parse_interval(text: &str) -> Result<Interval> {
                 Some(b) => (-1i64, b),
                 None => (1i64, token.strip_prefix('+').unwrap_or(token)),
             };
-            let mut it = body.split(':');
-            let h: i64 = it
-                .next()
-                .and_then(|v| v.parse().ok())
-                .ok_or_else(|| bad_interval(text))?;
-            let m: i64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-            let secs: f64 = it
-                .next()
-                .map_or(Ok(0.0), |v| v.parse::<f64>())
-                .map_err(|_| bad_interval(text))?;
-            if it.next().is_some() {
+            let parts: Vec<&str> = body.split(':').collect();
+            if parts.len() > 3 {
                 return Err(bad_interval(text));
             }
+            let int = |v: &str| v.parse::<i64>().map_err(|_| bad_interval(text));
+            let secs_of = |v: &str| v.parse::<f64>().map_err(|_| bad_interval(text));
+            // `DecodeTimeCommon`: `a:b` is hours and minutes, but minutes
+            // and seconds under `minute to second`; `a:b.c` is always
+            // minutes and seconds.
+            let (h, m, secs) = match parts.as_slice() {
+                [a, b] if b.contains('.') => (0, int(a)?, secs_of(b)?),
+                [a, b] if range == MINUTE | SECOND => (0, int(a)?, secs_of(b)?),
+                [a, b] => (int(a)?, int(b)?, 0.0),
+                [a, b, c] => (int(a)?, int(b)?, secs_of(c)?),
+                [a] => (int(a)?, 0, 0.0),
+                _ => return Err(bad_interval(text)),
+            };
             iv.micros +=
                 sign * (h * 3_600_000_000 + m * 60_000_000 + (secs * 1_000_000.0).round() as i64);
+            saw_any = true;
+            continue;
+        }
+        // SQL's `years-months` (`1-6` is a year and six months).
+        if let Some((y, m)) = years_months(token) {
+            if pending.is_some() {
+                return Err(bad_interval(text));
+            }
+            if !(0..12).contains(&m.abs()) {
+                return Err(Error::DatetimeFieldOverflow(format!(
+                    "interval field value out of range: \"{}\"",
+                    text.trim()
+                )));
+            }
+            iv.months += y * 12 + m;
             saw_any = true;
             continue;
         }
@@ -32042,9 +32097,25 @@ fn parse_interval(text: &str) -> Result<Interval> {
             }
         }
     }
-    // A trailing bare number is seconds: `'1'::interval` is one second.
+    // A trailing bare number is seconds (`'1'::interval` is one second),
+    // or the field qualifier's last field.
     if let Some(n) = pending {
-        iv.micros += (n * 1_000_000.0).round() as i64;
+        let unit = match range {
+            YEAR => "year",
+            MONTH => "month",
+            r if r == YEAR | MONTH => "month",
+            DAY => "day",
+            HOUR => "hour",
+            r if r == DAY | HOUR => "hour",
+            MINUTE => "minute",
+            r if r == HOUR | MINUTE || r == DAY | HOUR | MINUTE => "minute",
+            _ => "",
+        };
+        if unit.is_empty() {
+            iv.micros += (n * 1_000_000.0).round() as i64;
+        } else {
+            apply_interval_unit(&mut iv, n, unit, text)?;
+        }
         saw_any = true;
     }
     if !saw_any {
@@ -32056,6 +32127,25 @@ fn parse_interval(text: &str) -> Result<Interval> {
         iv.micros = -iv.micros;
     }
     Ok(iv)
+}
+
+/// `DecodeInterval`'s SQL years-months field, `[+-]Y-M`: the years and
+/// months, both carrying the sign.
+fn years_months(token: &str) -> Option<(i32, i32)> {
+    let (neg, body) = match token.strip_prefix('-') {
+        Some(b) => (true, b),
+        None => (false, token.strip_prefix('+').unwrap_or(token)),
+    };
+    let (y, m) = body.split_once('-')?;
+    if y.is_empty()
+        || m.is_empty()
+        || !y.bytes().all(|b| b.is_ascii_digit())
+        || !m.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let (y, m): (i32, i32) = (y.parse().ok()?, m.parse().ok()?);
+    Some(if neg { (-y, -m) } else { (y, m) })
 }
 
 /// The unit spellings an interval literal may use, singular form.

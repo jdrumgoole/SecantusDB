@@ -243,11 +243,13 @@ impl PgHandler {
         for r in text_rows(
             self,
             "select oid::text, opcmethod::text, opcfamily::text, opcintype::text, \
-             opcdefault::text from pg_opclass",
+             opcdefault::text, opcname::text, opcnamespace::text from pg_opclass",
         )? {
             if keep(oid(&r[0])) {
                 d.opclasses.push(OpclassRow {
                     oid: oid(&r[0]),
+                    name: string(&r[5]),
+                    nsp: oid(&r[6]),
                     method: oid(&r[1]),
                     family: oid(&r[2]),
                     intype: oid(&r[3]),
@@ -288,11 +290,12 @@ impl PgHandler {
                 });
             }
         }
-        // Primary keys, for a grouped query's functional dependencies.
+        // Relations' constraints: a grouped query's functional dependencies
+        // (primary keys) and ON CONFLICT ON CONSTRAINT.
         for r in text_rows(
             self,
-            "select conrelid::text, oid::text, conkey::text, condeferrable::text \
-             from pg_constraint where contype = 'p'",
+            "select conrelid::text, oid::text, conkey::text, condeferrable::text, \
+             conname::text, contype::text from pg_constraint where conrelid <> 0",
         )? {
             if keep(oid(&r[0])) {
                 let cols = array_items(&r[2])
@@ -300,7 +303,14 @@ impl PgHandler {
                     .iter()
                     .filter_map(|c| c.trim().parse::<i16>().ok())
                     .collect();
-                d.pkeys.push((oid(&r[0]), oid(&r[1]), cols, boolean(&r[3])));
+                d.constraints.push(ConRow {
+                    oid: oid(&r[1]),
+                    relid: oid(&r[0]),
+                    name: string(&r[4]),
+                    contype: chr(&r[5]),
+                    conkey: cols,
+                    deferrable: boolean(&r[3]),
+                });
             }
         }
         for r in text_rows(
@@ -319,13 +329,15 @@ impl PgHandler {
         }
         for r in text_rows(
             self,
-            "select rngtypid::text, rngsubtype::text, rngmultitypid::text from pg_range",
+            "select rngtypid::text, rngsubtype::text, rngmultitypid::text, rngcollation::text \
+             from pg_range",
         )? {
             if keep(oid(&r[0])) {
                 d.ranges.push(RangeRow {
                     typid: oid(&r[0]),
                     subtype: oid(&r[1]),
                     multitypid: oid(&r[2]),
+                    collation: oid(&r[3]),
                 });
             }
         }
@@ -438,18 +450,56 @@ impl PgHandler {
         relname: &str,
         rulename: &str,
         relid: i64,
-    ) -> Option<(String, String)> {
+    ) -> PgWireResult<Option<(String, String)>> {
         match self.statement_rule_trees_inner(kind, relname, rulename, relid) {
-            Ok(t) => Some(t),
-            Err(e) => {
+            Ok(t) => Ok(Some(t)),
+            // An error PostgreSQL's analysis (or DefineView /
+            // DefineQueryRewrite) raises refuses the statement (RP-282).
+            Err(TreeError::Refused(e)) => {
+                let mut info = ErrorInfo::new(
+                    "ERROR".into(),
+                    e.sqlstate.unwrap_or("XX000").into(),
+                    e.message,
+                );
+                info.detail = e.detail;
+                info.hint = e.hint;
+                Err(PgWireError::UserError(Box::new(info)))
+            }
+            Err(TreeError::NoTree(e)) => {
                 // A construct the transcription does not cover leaves the
                 // trees NULL rather than wrong; say so, since pg_rewrite
                 // will not.
                 eprintln!(
                     "secantusd-pg: no pg_rewrite trees recorded for rule \"{rulename}\" of \"{relname}\": {e}"
                 );
-                None
+                Ok(None)
             }
+        }
+    }
+
+    /// What PostgreSQL's parse analysis refuses of the running CREATE VIEW,
+    /// CREATE MATERIALIZED VIEW or CREATE RULE, raised before anything else
+    /// is looked at (its errors come first there too). `NoTree` is not an
+    /// error here: the statement goes ahead, and records no trees later.
+    pub(crate) fn statement_rule_refusal(
+        &self,
+        kind: char,
+        relname: &str,
+        rulename: &str,
+        relid: i64,
+    ) -> PgWireResult<()> {
+        match self.statement_rule_trees_inner(kind, relname, rulename, relid) {
+            Err(TreeError::Refused(e)) => {
+                let mut info = ErrorInfo::new(
+                    "ERROR".into(),
+                    e.sqlstate.unwrap_or("XX000").into(),
+                    e.message,
+                );
+                info.detail = e.detail;
+                info.hint = e.hint;
+                Err(PgWireError::UserError(Box::new(info)))
+            }
+            _ => Ok(()),
         }
     }
 
@@ -459,14 +509,14 @@ impl PgHandler {
         relname: &str,
         rulename: &str,
         relid: i64,
-    ) -> Result<(String, String), String> {
+    ) -> Result<(String, String), TreeError> {
         let (source, index) = self
             .statement_source
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
-            .ok_or("the statement's query string is not known")?;
-        let parsed = pg_query::parse(&source).map_err(|e| e.to_string())?;
+            .ok_or_else(|| TreeError::NoTree("the statement's query string is not known".into()))?;
+        let parsed = pg_query::parse(&source).map_err(|e| TreeError::NoTree(e.to_string()))?;
         let matches = |i: usize| -> bool {
             let Some(n) = parsed
                 .protobuf
@@ -499,23 +549,97 @@ impl PgHandler {
         } else {
             (0..parsed.protobuf.stmts.len())
                 .find(|i| matches(*i))
-                .ok_or("the statement is not in its query string")?
+                .ok_or_else(|| {
+                    TreeError::NoTree("the statement is not in its query string".into())
+                })?
         };
         let data = self
             .rule_catalog_data(false)
-            .map_err(|e| format!("{e:?}"))?;
+            .map_err(|e| TreeError::NoTree(format!("{e:?}")))?;
         let cat = Catalog::new(data);
         let ctx = secantus_pgplan::nodetostring::AnalysisContext {
             catalog: &cat,
             search_path: self.rule_search_path(&cat),
+            allow_system_table_mods: false,
         };
-        let oid = u32::try_from(relid).map_err(|e| e.to_string())?;
+        let oid = u32::try_from(relid).map_err(|e| TreeError::NoTree(e.to_string()))?;
         let trees = match kind {
             'v' => secantus_pgplan::nodetostring::analyze_create_view(&ctx, &source, index, oid),
             'm' => secantus_pgplan::nodetostring::analyze_create_matview(&ctx, &source, index, oid),
             _ => secantus_pgplan::nodetostring::analyze_create_rule(&ctx, &source, index, oid),
         }
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            if e.sqlstate.is_some() {
+                TreeError::Refused(e)
+            } else {
+                TreeError::NoTree(e.message)
+            }
+        })?;
         Ok((trees.ev_qual, trees.ev_action))
     }
+
+    /// The objects whose rule trees record a dependency on the constraint
+    /// `con` (`Query.constraintDeps`, which `recordDependencyOnExpr` turns
+    /// into pg_depend rows): `(kind, name, table)` for each view,
+    /// materialized view and rule, `table` naming a rule's relation.
+    pub(crate) fn constraint_rule_dependents(
+        &self,
+        con: i64,
+    ) -> Vec<(&'static str, String, String)> {
+        let mut out = Vec::new();
+        let lists = |a: &str| constraint_deps(a).contains(&con);
+        for (coll, key, kind) in [
+            (Self::VIEW_COLLECTION, "view", "view"),
+            (Self::MATVIEW_COLLECTION, "matview", "materialized view"),
+        ] {
+            for d in self
+                .type_catalog_docs(coll)
+                .map(|d| d.to_vec())
+                .unwrap_or_default()
+            {
+                if d.get_str("ev_action").is_ok_and(lists) {
+                    let name = d
+                        .get_str(key)
+                        .or_else(|_| d.get_str("_id"))
+                        .unwrap_or_default();
+                    out.push((kind, name.to_string(), String::new()));
+                }
+            }
+        }
+        for d in self.rule_docs() {
+            if d.get_str("ev_action").is_ok_and(lists) {
+                out.push((
+                    "rule",
+                    d.get_str("name").unwrap_or_default().to_string(),
+                    d.get_str("table").unwrap_or_default().to_string(),
+                ));
+            }
+        }
+        out
+    }
+}
+
+/// Every constraint oid a stored tree's queries list in `constraintDeps`.
+pub(crate) fn constraint_deps(tree: &str) -> Vec<i64> {
+    let mut out = Vec::new();
+    let mut rest = tree;
+    while let Some(at) = rest.find(":constraintDeps (o") {
+        rest = &rest[at + ":constraintDeps (o".len()..];
+        let end = rest.find(')').unwrap_or(rest.len());
+        out.extend(
+            rest[..end]
+                .split_whitespace()
+                .filter_map(|n| n.parse::<i64>().ok()),
+        );
+        rest = &rest[end..];
+    }
+    out
+}
+
+/// Why a statement records no trees.
+pub(crate) enum TreeError {
+    /// PostgreSQL refuses the statement.
+    Refused(secantus_pgplan::nodetostring::AnalysisError),
+    /// The trees cannot be built here; the statement goes ahead.
+    NoTree(String),
 }

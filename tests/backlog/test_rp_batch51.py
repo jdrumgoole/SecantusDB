@@ -4,9 +4,9 @@ DICTIONARY` over the `simple`, `snowball` and `synonym` templates, and
 `ts_lexize` and the configurations lexing through them), operator families
 and classes, subscriptions and transforms; RP-201's `shobj_description`;
 and the gap tests of what is left of RP-169, of RP-199 (the object-address
-functions), of RP-200 (a block's own index definitions) and of RP-203 (a
-rule's node trees, for the constructs the analysis does not transcribe;
-its first scenario is a regression test since the trees landed).
+functions) and of RP-200 (a block's own index definitions). RP-203's two
+scenarios (a rule's node trees) are regression tests since the trees
+landed.
 
 The scenarios run as `test_rp_batch34.py`'s do. The expected answers were
 measured on a private, freshly initdb'd PostgreSQL 15.19 cluster by running
@@ -486,7 +486,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "a rule's node trees for what the analysis does not transcribe": (
         "RP-203",
-        True,
+        False,
         [
             "begin",
             "create table rp51_rt (a int primary key, b text)",

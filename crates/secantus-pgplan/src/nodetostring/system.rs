@@ -53,6 +53,7 @@ pub fn system_rule_trees(cat: &Catalog) -> Vec<SystemRule> {
                         let ctx = AnalysisContext {
                             catalog: cat,
                             search_path: path.clone(),
+                            allow_system_table_mods: true,
                         };
                         out.push((
                             relid,
@@ -70,6 +71,7 @@ pub fn system_rule_trees(cat: &Catalog) -> Vec<SystemRule> {
                         let ctx = AnalysisContext {
                             catalog: cat,
                             search_path: path.clone(),
+                            allow_system_table_mods: true,
                         };
                         out.push((
                             relid,
