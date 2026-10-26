@@ -94,6 +94,9 @@ fn async_transaction_dirty_budget_bounds_pending_async() {
         &StorageOptions {
             wt_config: Some(secantus_storage::wt_config("128M", 1000, false, "10MB")),
             oplog_async: Some(true),
+            // The asynchronous oplog needs logged data tables: a store whose
+            // writes carry timestamps keeps the synchronous one.
+            data_nonlogged: Some(false),
             ..StorageOptions::default()
         },
     )

@@ -21,6 +21,9 @@ from pathlib import Path
 import pytest
 
 _server = pytest.importorskip("_secantus_server")
+# The Python server writes without timestamps, which a store whose data
+# tables are not logged (secantusd-rs's default since RM-210) refuses once a
+# key has one: the hand-off is tested on a store created with them logged.
 pymongo = pytest.importorskip("pymongo")
 
 from secantus import oplog_replay  # noqa: E402
@@ -29,7 +32,7 @@ from secantus import oplog_replay  # noqa: E402
 def _cycle(idx: int) -> None:
     with tempfile.TemporaryDirectory(prefix=f"rust-stress-{idx}-") as td:
         data = Path(td) / "rustdata"
-        srv = _server.RustServer(str(data), 0)
+        srv = _server.RustServer(str(data), 0, data_nonlogged=False)
         try:
             host, port = srv.address
             # 30s, not 5s: `RustServer(...)` returns once the listener is

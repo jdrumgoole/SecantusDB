@@ -67,7 +67,7 @@ def _snapshot_at_cluster_time(client: Any) -> tuple:
     )
 
 
-@pytest.mark.backlog("RM-210")
+@pytest.mark.backlog_fixed("RM-210")
 def test_snapshot_read_at_cluster_time(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
     """mongod 8.2.11 answers a `readConcern: {level: "snapshot",
     atClusterTime: T}` find with the document as it was at T (n: 0)."""
@@ -92,11 +92,82 @@ def _snapshot_session(client: Any) -> tuple:
         other.close()
 
 
-@pytest.mark.backlog("RM-210")
+@pytest.mark.backlog_fixed("RM-210")
 def test_snapshot_session_keeps_its_snapshot(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
     """mongod 8.2.11: a `snapshot=True` session reads (0, 0) across another
     client's write between its two reads."""
     assert _snapshot_session(rust_mongo) == _snapshot_session(mongod_rs)
+
+
+def _snapshot_reads(client: Any) -> dict:
+    """What snapshot reads at a time answer: values, errors (code and
+    message, its timestamps blanked: they are each server's own), and
+    whether a reply says when it read."""
+    import re
+
+    db = _db(client, "rm210c")
+    db.c.insert_many([{"_id": i, "n": 0} for i in range(5)])
+    t0 = db.command("ping")["operationTime"]
+    db.c.update_many({}, {"$set": {"n": 9}})
+    db.c.insert_one({"_id": 99, "n": 9})
+    now = db.command("ping")["operationTime"]
+
+    def rc(t: Any) -> dict:
+        return {"level": "snapshot", "atClusterTime": t}
+
+    def run(cmd: dict) -> Any:
+        try:
+            r = db.command(cmd)
+        except pymongo.errors.OperationFailure as e:
+            msg = re.sub(r"Timestamp\(\d+, \d+\)", "T", (e.details or {}).get("errmsg", ""))
+            return ("err", e.code, msg)
+        cur = r.get("cursor")
+        if cur is not None:
+            return ([d.get("n") for d in cur["firstBatch"]], "atClusterTime" in cur)
+        return (r.get("values"), "atClusterTime" in r)
+
+    out = {
+        "find at t0": run({"find": "c", "sort": {"_id": 1}, "readConcern": rc(t0)}),
+        "find at now": run({"find": "c", "sort": {"_id": 1}, "readConcern": rc(now)}),
+        "aggregate at t0": run(
+            {
+                "aggregate": "c",
+                "pipeline": [{"$sort": {"_id": 1}}],
+                "cursor": {},
+                "readConcern": rc(t0),
+            }
+        ),
+        "distinct at t0": run({"distinct": "c", "key": "n", "readConcern": rc(t0)}),
+        "in the future": run({"find": "c", "readConcern": rc(Timestamp(now.time + 3600, 1))}),
+        "null": run({"find": "c", "readConcern": rc(Timestamp(0, 1))}),
+        "too old": run({"find": "c", "readConcern": rc(Timestamp(t0.time - 3600, 1))}),
+        "before the collection": run({"find": "nope", "readConcern": rc(t0)}),
+    }
+    # A getMore reads at the time its cursor was opened at.
+    first = db.command({"find": "c", "sort": {"_id": 1}, "batchSize": 2, "readConcern": rc(t0)})
+    db.c.update_many({}, {"$set": {"n": 7}})
+    more = db.command({"getMore": first["cursor"]["id"], "collection": "c"})
+    out["getMore"] = [d["n"] for d in more["cursor"]["nextBatch"]]
+    # The catalog is read at the time too: an index made after it is not there.
+    db.c.create_index("n")
+    out["index made later"] = run(
+        {"find": "c", "filter": {"n": 0}, "hint": "n_1", "readConcern": rc(t0)}
+    )[:2]
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-210")
+def test_snapshot_reads_at_a_time_match_mongod(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """mongod 8.2.11, outside a transaction: `find`, `aggregate`,
+    `distinct` and a cursor's `getMore`s read as of `atClusterTime`; a time
+    later than any handed out, or a null one, is 72; one older than the
+    five-minute history is 239; a `find` of a collection that did not exist
+    then reads nothing and leaves `atClusterTime` out; and a hint naming an
+    index made later fails (2)."""
+    ours = _snapshot_reads(rust_mongo)
+    theirs = _snapshot_reads(mongod_rs)
+    assert theirs["find at t0"] == ([0, 0, 0, 0, 0], True), theirs  # not vacuous
+    assert ours == theirs
 
 
 # --------------------------------------------- RM-211 aggregation memory --

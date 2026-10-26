@@ -41,6 +41,9 @@ fn oplog_async_option_engages_without_env() {
             home.to_str().unwrap(),
             &StorageOptions {
                 oplog_async: Some(true),
+                // The asynchronous oplog needs logged data tables: a store whose
+                // writes carry timestamps keeps the synchronous one.
+                data_nonlogged: Some(false),
                 ..StorageOptions::default()
             },
         )
@@ -125,6 +128,9 @@ fn oplog_open_seq_covers_acked_writes_in_async_mode() {
             home.to_str().unwrap(),
             &StorageOptions {
                 oplog_async: Some(true),
+                // The asynchronous oplog needs logged data tables: a store whose
+                // writes carry timestamps keeps the synchronous one.
+                data_nonlogged: Some(false),
                 ..StorageOptions::default()
             },
         )

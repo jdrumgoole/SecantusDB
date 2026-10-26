@@ -349,6 +349,9 @@ impl Builder {
                 // The embedded handle's 128MB log: many short-lived stores must
                 // not each carry a large sparse log file.
                 wt_config: Some(wt_config(&self.cache_size, 1000, false, "128MB")),
+                // mongod's split, as `secantusd-rs` creates stores (RM-210).
+                data_nonlogged: Some(true),
+                transactions_logged_at_commit: true,
                 ..StorageOptions::default()
             },
         )

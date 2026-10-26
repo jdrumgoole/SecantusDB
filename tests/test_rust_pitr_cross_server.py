@@ -19,6 +19,9 @@ from typing import Any
 import pytest
 
 _server = pytest.importorskip("_secantus_server")
+# The Python server writes without timestamps, which a store whose data
+# tables are not logged (secantusd-rs's default since RM-210) refuses once a
+# key has one: the hand-off is tested on a store created with them logged.
 pymongo = pytest.importorskip("pymongo")
 
 from secantus import oplog_replay  # noqa: E402
@@ -42,7 +45,7 @@ def test_python_restores_stopped_rust_data_dir(tmp_path: Path) -> None:
     """Write CRUD history through the Rust server, stop it, and rebuild the
     database with the Python restore tool from the stopped data directory."""
     data = tmp_path / "rustdata"
-    srv = _server.RustServer(str(data), 0)
+    srv = _server.RustServer(str(data), 0, data_nonlogged=False)
     try:
         coll = _rust_client(srv)["app"]["c"]
         coll.insert_many([{"_id": 1, "v": 1}, {"_id": 2, "v": 2}])
@@ -64,7 +67,7 @@ def test_python_restores_rust_data_to_a_mark(tmp_path: Path) -> None:
     """A bounded restore of Rust-written history reproduces the exact state at
     the target oplog timestamp."""
     data = tmp_path / "rustdata"
-    srv = _server.RustServer(str(data), 0)
+    srv = _server.RustServer(str(data), 0, data_nonlogged=False)
     try:
         coll = _rust_client(srv)["app"]["c"]
         coll.insert_many([{"_id": 1, "v": 1}, {"_id": 2, "v": 2}])
@@ -91,7 +94,7 @@ def test_python_restores_rust_backup_archive(tmp_path: Path) -> None:
     to the Python one (Phase R, R1)."""
     data = tmp_path / "rustdata"
     archive = tmp_path / "rust-backup.tar.gz"
-    srv = _server.RustServer(str(data), 0)
+    srv = _server.RustServer(str(data), 0, data_nonlogged=False)
     try:
         client = _rust_client(srv)
         coll = client["app"]["c"]
@@ -115,7 +118,7 @@ def test_python_restores_rust_backup_archive(tmp_path: Path) -> None:
 
 def test_rust_backup_archive_requires_output_path(tmp_path: Path) -> None:
     """``backupArchive`` without ``outputPath`` is a clean TypeMismatch error."""
-    srv = _server.RustServer(str(tmp_path / "data"), 0)
+    srv = _server.RustServer(str(tmp_path / "data"), 0, data_nonlogged=False)
     try:
         reply = _rust_client(srv)["admin"].command({"secantusAdmin.backupArchive": 1}, check=False)
         assert reply["ok"] == 0.0
@@ -130,7 +133,7 @@ def test_rust_create_options_survive_restore(tmp_path: Path) -> None:
     server carries collection options in the `create` oplog entry (Phase R, R5a)."""
     data = tmp_path / "rustdata"
     archive = tmp_path / "backup.tar.gz"
-    srv = _server.RustServer(str(data), 0)
+    srv = _server.RustServer(str(data), 0, data_nonlogged=False)
     try:
         db = _rust_client(srv)["app"]
         db.create_collection("events", capped=True, size=8192, max=100, validator={"v": {"$gt": 0}})

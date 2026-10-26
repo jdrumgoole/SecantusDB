@@ -597,3 +597,73 @@ def test_kill_sessions_interrupts_the_command_holding_the_session(
     theirs = _killed_while_running(mongod_rs)
     assert theirs == ((0.0, 11601), (1.0, None), 0), theirs  # the reference, as measured
     assert _killed_while_running(rust_mongo) == theirs
+
+
+def _read_beside_an_open_transaction(client: Any) -> tuple:
+    """A snapshot read at the current time while another session's
+    transaction has written and not committed, with a one-second
+    `maxTimeMS`; then the same read once it has committed."""
+    db = client["rm314"]
+    db.drop_collection("d")
+    db.create_collection("d")
+    db.d.insert_one({"_id": 0})
+    with client.start_session() as s:
+        s.start_transaction()
+        db.d.insert_one({"_id": 1}, session=s)
+        now = client.admin.command("ping")["operationTime"]
+        cmd = {
+            "find": "d",
+            "readConcern": {"level": "snapshot", "atClusterTime": now},
+            "maxTimeMS": 1000,
+        }
+        during = mongo_answer(lambda: [d["_id"] for d in db.command(cmd)["cursor"]["firstBatch"]])
+        s.commit_transaction()
+    after = mongo_answer(lambda: [d["_id"] for d in db.command(cmd)["cursor"]["firstBatch"]])
+    return during[:2], after[:2]
+
+
+@pytest.mark.backlog_fixed("RM-314")
+def test_a_snapshot_read_does_not_wait_for_an_open_transaction(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11 gives a transaction its timestamp when it commits, so a
+    read at the current time beside an open one answers at once, without
+    it, and the same afterwards. This server stamped a transaction with the
+    time its first statement ran: the read waited for it, and once it
+    committed the same read found it."""
+    theirs = _read_beside_an_open_transaction(mongod_rs)
+    assert theirs == (("ok", [0]), ("ok", [0])), theirs  # the reference, as measured
+    assert _read_beside_an_open_transaction(rust_mongo) == theirs
+
+
+def _transaction_in_the_oplog(client: Any) -> list:
+    """The oplog's last three entries after a transaction whose two inserts
+    straddle another client's write: `(op, ns, how many applyOps)`."""
+    db = client["rm314o"]
+    db.drop_collection("d")
+    db.create_collection("d")
+    with client.start_session() as s:
+        s.start_transaction()
+        db.d.insert_one({"_id": 1}, session=s)
+        db.x.insert_one({"_id": 9})
+        db.d.insert_one({"_id": 2}, session=s)
+        s.commit_transaction()
+    # Only this test's entries: a fresh mongod's first transaction also
+    # creates its `config` collections.
+    mine = {"ns": {"$in": ["rm314o.$cmd", "rm314o.x", "rm314o.d", "admin.$cmd"]}}
+    tail = list(client.local.oplog.rs.find(mine).sort("$natural", -1).limit(3))[::-1]
+    return [(e["op"], e["ns"], len(e.get("o", {}).get("applyOps", []))) for e in tail]
+
+
+@pytest.mark.backlog_fixed("RM-314")
+def test_a_transaction_is_one_entry_at_its_commit(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 logs a transaction as one `applyOps` at its commit,
+    after a write another client made while it ran. This server logged each
+    statement when it ran, so the other client's write came between them."""
+    theirs = _transaction_in_the_oplog(mongod_rs)
+    assert theirs == [
+        ("c", "rm314o.$cmd", 0),
+        ("i", "rm314o.x", 0),
+        ("c", "admin.$cmd", 2),
+    ], theirs  # the reference, as measured
+    assert _transaction_in_the_oplog(rust_mongo) == theirs

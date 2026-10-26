@@ -32,7 +32,13 @@ def rust_server(store: Any, *extra: str, socket_timeout_ms: int | None = None) -
     )
     try:
         assert proc.stdout is not None
-        m = _RS_BANNER.search(proc.stdout.readline())
+        # A store that recovers says what it replayed before it listens.
+        m = None
+        for _ in range(20):
+            line = proc.stdout.readline()
+            m = _RS_BANNER.search(line)
+            if m or not line:
+                break
         assert m, "secantusd-rs did not start"
         drain_output(proc)
         client = pymongo.MongoClient(

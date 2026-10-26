@@ -25,6 +25,9 @@ from typing import Any
 import pytest
 
 _server = pytest.importorskip("_secantus_server")
+# The Python server writes without timestamps, which a store whose data
+# tables are not logged (secantusd-rs's default since RM-210) refuses once a
+# key has one: the hand-off is tested on a store created with them logged.
 pymongo = pytest.importorskip("pymongo")
 
 from pymongo.errors import DuplicateKeyError  # noqa: E402
@@ -36,7 +39,7 @@ CI = {"locale": "en", "strength": 2}
 
 class _Rust:
     def __init__(self, path: Path) -> None:
-        self.srv = _server.RustServer(str(path), 0)
+        self.srv = _server.RustServer(str(path), 0, data_nonlogged=False)
 
     def __enter__(self) -> Any:
         host, port = self.srv.address

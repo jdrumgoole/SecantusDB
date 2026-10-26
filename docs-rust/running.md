@@ -23,9 +23,10 @@ Both `--flag value` and `--flag=value` spellings work.
 | `--cache-size SIZE` | WiredTiger cache, unit-suffixed (`256M`, `1G`, `8G`) | `4G` |
 | `--session-max N` | Max concurrent WiredTiger sessions (≈ client connections) | `1000` |
 | `--sync-on-commit` | fsync every commit (closes the `j: true` gap; large throughput cost) | off |
-| `--oplog-async` | Persist oplog entries via a background drainer pool instead of inside each write's commit (higher write throughput; change-stream events surface once drained) | off, or `SECANTUS_OPLOG_ASYNC` |
+| `--oplog-async` | Persist oplog entries via a background drainer pool instead of inside each write's commit (higher write throughput; change-stream events surface once drained). Only for a store created with `--data-logged`: a store whose data tables are not logged keeps the synchronous oplog | off, or `SECANTUS_OPLOG_ASYNC` |
 | `--oplog-nonlogged` | Create oplog tables `log=(enabled=false)` — checkpoint-durable only; a crash can lose the oplog tail | off, or `SECANTUS_OPLOG_NONLOGGED` |
-| `--data-nonlogged` | mongod's split: WAL-log only the oplog; data tables recover by oplog replay from the last stable checkpoint (see [Recovery](recovery.md)) | off, or `SECANTUS_DATA_NONLOGGED` |
+| `--data-nonlogged` | mongod's split: WAL-log only the oplog; data tables recover by oplog replay from the last stable checkpoint (see [Recovery](recovery.md)), and keep the history a snapshot read at a past time (`atClusterTime`) reads. Decided when a store is created; an existing store keeps its mode | on |
+| `--data-logged` | WAL-log the data tables too. No history: a snapshot read at a past time is refused (246) | off |
 | `--checkpoint-seconds N` | Seconds between checkpoints. A checkpoint is what trims the log, and under `--data-nonlogged` what makes the data durable | `60`, or `SECANTUS_CHECKPOINT_SECONDS` |
 | `--auth` | Require SCRAM authentication on every non-handshake command | off |
 | `--standalone` | Advertise a plain standalone `hello` instead of the single-node replica-set persona (disables change-stream topology, matters for drivers that gate on `isReplicaSet`) | off |
