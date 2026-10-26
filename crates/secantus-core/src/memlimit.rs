@@ -59,6 +59,8 @@ const SBE_SMALL_STR: usize = 7;
 /// What a classic accumulator starts at (`sizeof(*this)`; measured for
 /// `$addToSet`, and used for the others, whose size the errors never show).
 pub const ACCUMULATOR_BASE: usize = 144;
+/// `sizeof(AccumulatorPush)` (and `$concatArrays`'s), measured the same way.
+pub const PUSH_BASE: usize = 120;
 
 /// Each budget, in bytes: mongod's runtime-settable knobs, 100 MiB unless
 /// `setParameter` changed one.
@@ -84,6 +86,10 @@ pub struct Budgets {
     pub lookup: usize,
     /// `internalQueryFacetMaxOutputDocSizeBytes`
     pub facet: usize,
+    /// `internalQueryMaxBlockingSortMemoryUsageBytes`: a blocking sort.
+    pub sort: usize,
+    /// `internalDocumentSourceBucketAutoMaxMemoryBytes`: `$bucketAuto`'s sort.
+    pub bucket_auto: usize,
 }
 
 impl Default for Budgets {
@@ -98,13 +104,17 @@ impl Default for Budgets {
             window_fields: MAX_BYTES,
             lookup: MAX_BYTES,
             facet: MAX_BYTES,
+            sort: MAX_BYTES,
+            bucket_auto: MAX_BYTES,
         }
     }
 }
 
 impl Budgets {
     /// The parameter names, each with the field it sets.
-    pub const PARAMETERS: [&'static str; 8] = [
+    pub const PARAMETERS: [&'static str; 10] = [
+        "internalQueryMaxBlockingSortMemoryUsageBytes",
+        "internalDocumentSourceBucketAutoMaxMemoryBytes",
         "internalDocumentSourceGroupMaxMemoryBytes",
         "internalQueryMaxPushBytes",
         "internalQueryMaxAddToSetBytes",
@@ -126,6 +136,8 @@ impl Budgets {
             "internalDocumentSourceSetWindowFieldsMaxMemoryBytes" => &mut self.window_fields,
             "internalLookupStageIntermediateDocumentMaxSizeBytes" => &mut self.lookup,
             "internalQueryFacetMaxOutputDocSizeBytes" => &mut self.facet,
+            "internalQueryMaxBlockingSortMemoryUsageBytes" => &mut self.sort,
+            "internalDocumentSourceBucketAutoMaxMemoryBytes" => &mut self.bucket_auto,
             _ => return false,
         };
         *slot = bytes;
@@ -163,6 +175,8 @@ thread_local! {
         window_fields: MAX_BYTES,
         lookup: MAX_BYTES,
         facet: MAX_BYTES,
+        sort: MAX_BYTES,
+        bucket_auto: MAX_BYTES,
     }) };
     static ALLOW_DISK_USE: Cell<bool> = const { Cell::new(true) };
     static REPORT: RefCell<SpillReport> = RefCell::new(SpillReport::default());
@@ -174,10 +188,140 @@ thread_local! {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SpillReport {
     pub used_disk: bool,
+    /// A blocking sort ran (the profile's `hasSortStage`).
+    pub has_sort_stage: bool,
     pub group_spills: i64,
     pub group_spilled_records: i64,
     pub group_spilled_bytes: i64,
     pub group_spilled_data_storage_size: i64,
+    pub sort_spills: i64,
+    pub sort_spilled_records: i64,
+    pub sort_spilled_bytes: i64,
+    pub sort_spilled_data_storage_size: i64,
+    /// What the sorts counted, spilled or not (`sortTotalDataSizeBytes`).
+    pub sort_total_data_size: i64,
+}
+
+impl SpillReport {
+    /// What `self` spilled beyond `before` (an earlier report of the same
+    /// run, cut shorter).
+    pub fn less(&self, before: &SpillReport) -> SpillReport {
+        SpillReport {
+            used_disk: self.used_disk && !before.used_disk,
+            has_sort_stage: self.has_sort_stage,
+            group_spills: self.group_spills - before.group_spills,
+            group_spilled_records: self.group_spilled_records - before.group_spilled_records,
+            group_spilled_bytes: self.group_spilled_bytes - before.group_spilled_bytes,
+            group_spilled_data_storage_size: self.group_spilled_data_storage_size
+                - before.group_spilled_data_storage_size,
+            sort_spills: self.sort_spills - before.sort_spills,
+            sort_spilled_records: self.sort_spilled_records - before.sort_spilled_records,
+            sort_spilled_bytes: self.sort_spilled_bytes - before.sort_spilled_bytes,
+            sort_spilled_data_storage_size: self.sort_spilled_data_storage_size
+                - before.sort_spilled_data_storage_size,
+            sort_total_data_size: self.sort_total_data_size - before.sort_total_data_size,
+        }
+    }
+}
+
+/// One counter of `serverStatus`'s `metrics.query`, for the life of the
+/// process.
+pub struct Counter(std::sync::atomic::AtomicI64);
+
+impl Counter {
+    const fn new() -> Self {
+        Counter(std::sync::atomic::AtomicI64::new(0))
+    }
+
+    fn add(&self, n: i64) {
+        self.0.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> i64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// `metrics.query.<stage>`'s four spill counters (`group`,
+/// `setWindowFields`, `bucketAuto`).
+pub struct SpillCounters {
+    pub spills: Counter,
+    pub spilled_records: Counter,
+    pub spilled_bytes: Counter,
+    pub spilled_data_storage_size: Counter,
+}
+
+impl SpillCounters {
+    const fn new() -> Self {
+        SpillCounters {
+            spills: Counter::new(),
+            spilled_records: Counter::new(),
+            spilled_bytes: Counter::new(),
+            spilled_data_storage_size: Counter::new(),
+        }
+    }
+
+    fn add(&self, spills: i64, records: i64, bytes: i64, storage: i64) {
+        self.spills.add(spills);
+        self.spilled_records.add(records);
+        self.spilled_bytes.add(bytes);
+        self.spilled_data_storage_size.add(storage);
+    }
+}
+
+/// `metrics.query.sort`.
+pub struct SortCounters {
+    pub spill_to_disk: Counter,
+    pub spill_to_disk_bytes: Counter,
+    pub total_bytes_sorted: Counter,
+    pub total_keys_sorted: Counter,
+}
+
+pub static GROUP_METRICS: SpillCounters = SpillCounters::new();
+pub static WINDOW_METRICS: SpillCounters = SpillCounters::new();
+pub static BUCKET_AUTO_METRICS: SpillCounters = SpillCounters::new();
+pub static SORT_METRICS: SortCounters = SortCounters {
+    spill_to_disk: Counter::new(),
+    spill_to_disk_bytes: Counter::new(),
+    total_bytes_sorted: Counter::new(),
+    total_keys_sorted: Counter::new(),
+};
+
+/// A sort that ran: `keys` documents, `bytes` counted, in memory or not.
+pub(crate) fn record_sort(keys: i64, bytes: i64) {
+    REPORT.with(|r| {
+        let mut r = r.borrow_mut();
+        r.has_sort_stage = true;
+        r.sort_total_data_size += bytes;
+    });
+    SORT_METRICS.total_keys_sorted.add(keys);
+    SORT_METRICS.total_bytes_sorted.add(bytes);
+}
+
+/// A sort wrote a run (a spill, or a merge of runs) of `records`.
+pub(crate) fn record_sort_spill(records: i64, bytes: i64, storage: i64) {
+    REPORT.with(|r| {
+        let mut r = r.borrow_mut();
+        r.used_disk = true;
+        r.sort_spills += 1;
+        r.sort_spilled_records += records;
+        r.sort_spilled_bytes += bytes;
+        r.sort_spilled_data_storage_size += storage;
+    });
+    SORT_METRICS.spill_to_disk.add(1);
+    SORT_METRICS.spill_to_disk_bytes.add(storage);
+}
+
+/// `$bucketAuto`'s sorter wrote a run: counted as the stage's own.
+pub(crate) fn record_bucket_auto_spill(records: i64, bytes: i64, storage: i64) {
+    REPORT.with(|r| r.borrow_mut().used_disk = true);
+    BUCKET_AUTO_METRICS.add(1, records, bytes, storage);
+}
+
+/// `$setWindowFields` spilled its partition cache.
+pub(crate) fn record_window_spill(records: i64, bytes: i64, storage: i64) {
+    REPORT.with(|r| r.borrow_mut().used_disk = true);
+    WINDOW_METRICS.add(1, records, bytes, storage);
 }
 
 /// Restores the previous `allowDiskUse` when dropped.
@@ -209,6 +353,15 @@ pub fn report() -> SpillReport {
     REPORT.with(|r| r.borrow().clone())
 }
 
+/// Run `f` with a report of its own, and hand that back: what an explain
+/// reports for one stage, kept out of the operation's own report.
+pub fn captured<T>(f: impl FnOnce() -> T) -> (T, SpillReport) {
+    let outer = REPORT.with(|r| std::mem::take(&mut *r.borrow_mut()));
+    let out = f();
+    let inner = REPORT.with(|r| std::mem::replace(&mut *r.borrow_mut(), outer));
+    (out, inner)
+}
+
 pub(crate) fn record_group_spill(records: i64, bytes: i64, storage: i64) {
     REPORT.with(|r| {
         let mut r = r.borrow_mut();
@@ -218,6 +371,7 @@ pub(crate) fn record_group_spill(records: i64, bytes: i64, storage: i64) {
         r.group_spilled_bytes += bytes;
         r.group_spilled_data_storage_size += storage;
     });
+    GROUP_METRICS.add(1, records, bytes, storage);
 }
 
 /// Where spill files go (mongod: `<dbpath>/_tmp`). Unset: the system's

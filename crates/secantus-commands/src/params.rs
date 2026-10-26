@@ -165,6 +165,10 @@ const SETTABLE: &[(&str, ParamKind)] = &[
     // on mongod 8.2.11, 2026-10-26: `internalQueryMaxPushBytes` is an int,
     // the rest longs; the `$lookup` result is at least 16793600 bytes.
     (
+        "internalDocumentSourceBucketAutoMaxMemoryBytes",
+        ParamKind::IntAbove(0, false),
+    ),
+    (
         "internalDocumentSourceGroupMaxMemoryBytes",
         ParamKind::IntAbove(0, false),
     ),
@@ -187,6 +191,10 @@ const SETTABLE: &[(&str, ParamKind)] = &[
     (
         "internalQueryMaxConcatArraysBytes",
         ParamKind::IntAbove(0, false),
+    ),
+    (
+        "internalQueryMaxBlockingSortMemoryUsageBytes",
+        ParamKind::Int32AtLeast(0),
     ),
     ("internalQueryMaxPushBytes", ParamKind::IntAbove(0, true)),
     (

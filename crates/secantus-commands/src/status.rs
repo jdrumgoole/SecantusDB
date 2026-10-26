@@ -500,10 +500,41 @@ impl StatusCounters {
             "updateDeleteManyDurationTotalMs",
             "updateManyCount",
         ];
-        names
+        let mut out: Document = names
             .iter()
             .zip(&self.many)
             .map(|(name, n)| (name.to_string(), Bson::Int64(n.load(Relaxed))))
+            .collect();
+        // The spill counters of the stages that hold a memory budget
+        // (RM-211, RM-315), this server's own counts.
+        use secantus_core::memlimit::{
+            SpillCounters, BUCKET_AUTO_METRICS, GROUP_METRICS, SORT_METRICS, WINDOW_METRICS,
+        };
+        let spills = |c: &SpillCounters| {
+            doc! {
+                "spilledBytes": c.spilled_bytes.get(),
+                "spilledDataStorageSize": c.spilled_data_storage_size.get(),
+                "spilledRecords": c.spilled_records.get(),
+                "spills": c.spills.get(),
+            }
+        };
+        out.insert("bucketAuto", spills(&BUCKET_AUTO_METRICS));
+        out.insert("group", spills(&GROUP_METRICS));
+        out.insert("setWindowFields", spills(&WINDOW_METRICS));
+        out.insert(
+            "sort",
+            doc! {
+                "spillToDisk": SORT_METRICS.spill_to_disk.get(),
+                "spillToDiskBytes": SORT_METRICS.spill_to_disk_bytes.get(),
+                "totalBytesSorted": SORT_METRICS.total_bytes_sorted.get(),
+                "totalKeysSorted": SORT_METRICS.total_keys_sorted.get(),
+            },
+        );
+        // In name order, as mongod lists them.
+        let mut keys: Vec<String> = out.keys().cloned().collect();
+        keys.sort();
+        keys.into_iter()
+            .filter_map(|k| out.remove(&k).map(|v| (k, v)))
             .collect()
     }
 

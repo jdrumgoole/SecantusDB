@@ -257,13 +257,9 @@ pub(crate) fn set_window_fields_each(
             .collect();
     }
 
-    // What of each document the partition cache holds, when a window reads
-    // the whole partition.
-    let cached = if holds_partition(&compiled) && !crate::memlimit::disk_allowed() {
-        Some(cache_fields(spec, &compiled, downstream))
-    } else {
-        None
-    };
+    // What of each document the partition cache holds.
+    let cached = cache_fields(spec, &compiled, downstream);
+    let mut spill = CacheSpill::default();
 
     // mongod emits PARTITION BY PARTITION, in partition-key order (above),
     // and within each partition in `sortBy` order -- not the input order.
@@ -271,9 +267,6 @@ pub(crate) fn set_window_fields_each(
     // not cosmetic. `sorted_slots` yields exactly that sequence.
     for part in &partitions {
         let slots = sorted_slots(part, &docs, sort_by)?;
-        if let Some(fields) = &cached {
-            check_cache(&slots, &docs, fields.as_ref())?;
-        }
         let n = slots.len();
         let ranks = if needs_rank {
             Some(compute_ranks(&slots, &docs, sort_by))
@@ -295,6 +288,17 @@ pub(crate) fn set_window_fields_each(
         } else {
             None
         };
+        // mongod's partition cache over this partition: held to its budget,
+        // spilled or refused (RM-211).
+        run_cache(
+            &compiled,
+            &slots,
+            &docs,
+            cached.as_ref(),
+            range_vals.as_deref(),
+            range_dates.as_deref(),
+            &mut spill,
+        )?;
         // $expMovingAvg / $locf / $linearFill each produce a per-slot vector —
         // precompute once per partition per output field (parallel to `compiled`).
         let sort_field = sort_by
@@ -413,31 +417,7 @@ pub(crate) fn set_window_fields_each(
             sink(out_doc)?;
         }
     }
-    Ok(())
-}
-
-/// Whether some output reads its partition to the end before it can answer
-/// the first document: an accumulator with no window, or a window whose
-/// upper bound is `"unbounded"`.
-fn holds_partition(compiled: &[OutField]) -> bool {
-    compiled.iter().any(|c| {
-        if RANK_FUNCS.contains(&c.op)
-            || PREFIX_OPS.contains(&c.op)
-            || matches!(c.op, "$shift" | "$derivative")
-        {
-            return false;
-        }
-        let bounds = c
-            .window
-            .and_then(|w| w.get("documents").or_else(|| w.get("range")));
-        match bounds {
-            None => true,
-            Some(Bson::Array(b)) => {
-                b.len() == 2 && matches!(&b[1], Bson::String(s) if s == "unbounded")
-            }
-            Some(_) => false,
-        }
-    })
+    spill.finish()
 }
 
 /// The top-level fields of each document the partition cache keeps (`None`:
@@ -466,28 +446,194 @@ fn cache_fields(
     Some(fields)
 }
 
-/// mongod's partition cache over `slots`, refused (5643011) once it holds
-/// more than 100 MiB with no disk to spill to.
-fn check_cache(
+/// How far ahead of the document being answered, and how far behind it,
+/// mongod's partition iterator keeps documents for `c` at `pos` (of `n`):
+/// the last index a window reads, and the first. A window that is not
+/// over documents reads the partition to its end.
+fn reach(
+    c: &OutField,
+    pos: usize,
+    n: usize,
+    range_vals: Option<&[f64]>,
+    range_dates: Option<&[f64]>,
+) -> R<(usize, usize)> {
+    let last = n - 1;
+    if RANK_FUNCS.contains(&c.op) || matches!(c.op, "$expMovingAvg" | "$locf") {
+        return Ok((pos, pos));
+    }
+    if c.op == "$linearFill" {
+        return Ok((pos, last));
+    }
+    if c.op == "$shift" {
+        let by = c
+            .arg
+            .as_document()
+            .and_then(|d| d.get("by"))
+            .and_then(|b| match b {
+                Bson::Int32(i) => Some(i64::from(*i)),
+                Bson::Int64(i) => Some(*i),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let at = (pos as i64 + by).clamp(0, last as i64) as usize;
+        return Ok((pos.min(at), pos.max(at)));
+    }
+    let (lo, hi) = match c.window {
+        None => return Ok((pos, last)),
+        Some(w) if w.contains_key("range") => {
+            range_window_bounds(pos, n, w, range_vals, range_dates)?
+        }
+        Some(w) => window_bounds(pos, n, Some(w))?,
+    };
+    // The document answered is held whatever the window; one behind it is
+    // not, as each function keeps the values it must take out again.
+    let _ = lo;
+    Ok((pos, (hi.max(pos as i64) as usize).min(last)))
+}
+
+/// What spilling the partition cache wrote, across the stage's partitions.
+#[derive(Default)]
+struct CacheSpill {
+    file: Option<(std::path::PathBuf, std::io::BufWriter<std::fs::File>)>,
+    /// The spill table's size so far.
+    stored: i64,
+}
+
+impl CacheSpill {
+    /// Write `docs` (each with the 32 bytes of metadata mongod's
+    /// `toBsonWithMetaData` adds for a sorted document; measured 8.2.11) to
+    /// the stage's spill table, a file here.
+    fn write(&mut self, docs: &[&Document]) -> R<()> {
+        use std::io::Write;
+        let io = |what: &str, e: &dyn std::fmt::Display| {
+            Fallback::mongo(
+                1,
+                format!("$setWindowFields could not {what} its spill file: {e}"),
+            )
+        };
+        if self.file.is_none() {
+            let dir = crate::memlimit::spill_dir();
+            std::fs::create_dir_all(&dir).map_err(|e| io("create the directory for", &e))?;
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = dir.join(format!(
+                "secantus-window-{}-{}.bson",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let file = std::fs::File::create(&path).map_err(|e| io("create", &e))?;
+            self.file = Some((path, std::io::BufWriter::new(file)));
+        }
+        let (_, out) = self.file.as_mut().expect("opened above");
+        let mut bytes = 0i64;
+        for d in docs {
+            let mut buf = Vec::new();
+            d.to_writer(&mut buf)
+                .map_err(|e| io("encode a document for", &e))?;
+            out.write_all(&buf).map_err(|e| io("write", &e))?;
+            bytes += buf.len() as i64 + 32;
+        }
+        out.flush().map_err(|e| io("write", &e))?;
+        let stored = out
+            .get_ref()
+            .metadata()
+            .map_err(|e| io("measure", &e))?
+            .len() as i64;
+        crate::memlimit::record_window_spill(docs.len() as i64, bytes, stored - self.stored);
+        self.stored = stored;
+        Ok(())
+    }
+
+    /// Drop the spill table.
+    fn finish(mut self) -> R<()> {
+        if let Some((path, out)) = self.file.take() {
+            drop(out);
+            std::fs::remove_file(&path).map_err(|e| {
+                Fallback::mongo(
+                    1,
+                    format!("$setWindowFields could not remove its spill file: {e}"),
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CacheSpill {
+    fn drop(&mut self) {
+        if let Some((path, _)) = self.file.take() {
+            if let Err(e) = std::fs::remove_file(&path) {
+                eprintln!(
+                    "secantus: could not remove $setWindowFields spill file {}: {e}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// mongod's partition cache (`SpillableDeque`) over `slots`: each document
+/// the windows read ahead to is added, counted at its size with only the
+/// fields kept, and dropped once no window needs it. Past the budget it
+/// spills every document it holds -- or, with `allowDiskUse: false`, refuses
+/// (5643011). Measured on mongod 8.2.11 (2026-10-26): a `[-5, 5]` window
+/// holds the document answered and the five after it; an unbounded one, the
+/// partition.
+fn run_cache(
+    compiled: &[OutField],
     slots: &[usize],
     docs: &[Document],
     fields: Option<&std::collections::BTreeSet<String>>,
+    range_vals: Option<&[f64]>,
+    range_dates: Option<&[f64]>,
+    spill: &mut CacheSpill,
 ) -> R<()> {
-    let mut held = 0usize;
-    for &s in slots {
-        held += match fields {
-            Some(f) => crate::memlimit::fields_size(&docs[s], f),
-            None => crate::memlimit::document_size(&docs[s]),
-        };
-        if held > crate::memlimit::budgets().window_fields {
-            return Err(Fallback::mongo(
-                5643011,
-                format!(
-                    "Exceeded max memory. Current memory: {held} bytes. Max allowed memory: {} \
-                     bytes. Set 'allowDiskUse: true' to spill to disk",
-                    crate::memlimit::budgets().window_fields
-                ),
-            ));
+    let n = slots.len();
+    if n == 0 {
+        return Ok(());
+    }
+    let budget = crate::memlimit::budgets().window_fields;
+    let size = |i: usize| match fields {
+        Some(f) => crate::memlimit::fields_size(&docs[slots[i]], f),
+        None => crate::memlimit::document_size(&docs[slots[i]]),
+    };
+    // The documents in memory, oldest first.
+    let mut held: std::collections::VecDeque<(usize, usize)> = std::collections::VecDeque::new();
+    let mut used = 0usize;
+    let mut next = 0usize;
+    for pos in 0..n {
+        let mut ahead = pos;
+        let mut behind = pos;
+        for c in compiled {
+            let (lo, hi) = reach(c, pos, n, range_vals, range_dates)?;
+            ahead = ahead.max(hi);
+            behind = behind.min(lo);
+        }
+        while next <= ahead {
+            let s = size(next);
+            held.push_back((next, s));
+            used += s;
+            next += 1;
+            if used > budget {
+                if !crate::memlimit::disk_allowed() {
+                    return Err(Fallback::mongo(
+                        5643011,
+                        format!(
+                            "Exceeded max memory. Current memory: {used} bytes. Max allowed \
+                             memory: {budget} bytes. Set 'allowDiskUse: true' to spill to disk"
+                        ),
+                    ));
+                }
+                let out: Vec<&Document> = held.iter().map(|(i, _)| &docs[slots[*i]]).collect();
+                spill.write(&out)?;
+                held.clear();
+                used = 0;
+            }
+        }
+        // What the next document no longer needs leaves memory.
+        let keep_from = behind.min(pos + 1);
+        while held.front().is_some_and(|(i, _)| *i < keep_from) {
+            let (_, s) = held.pop_front().expect("a front");
+            used -= s;
         }
     }
     Ok(())

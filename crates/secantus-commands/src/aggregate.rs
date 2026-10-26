@@ -555,6 +555,8 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mut first_read_of_coll: Option<(Document, Option<Document>, i64)> = None;
     // The stages of the pipeline, a view's in front.
     let mut read_pipeline: Vec<Bson> = Vec::new();
+    // Whether the leading `$sort` blocks, for the pipeline run below.
+    let mut leading_guard: Option<secantus_core::aggregate::LeadingSort> = None;
     // Fetch the input documents + decide the remaining pipeline.
     let (ns, input, working_pipeline): (String, Vec<Document>, Vec<Bson>) = match &coll {
         Some(c) => {
@@ -801,6 +803,30 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     &first_read,
                     crate::explain::order::Uses::Find,
                 );
+                // Whether the pipeline's leading `$sort` is a blocking sort
+                // in mongod's plan, which its budget holds (RM-315).
+                if first_read.sort.is_some() {
+                    leading_guard = Some(secantus_core::aggregate::leading_sort(
+                        crate::explain::order::sorts_in_memory(storage, &first_read),
+                        sbe_read,
+                    ));
+                } else if let Some(sort) = window_sort(&rest) {
+                    // A leading `$setWindowFields` sorts as a leading `$sort`
+                    // would: from an index if one gives the order.
+                    let blocking = match &sort {
+                        None => true,
+                        Some(sort) => crate::explain::order::sorts_in_memory(
+                            storage,
+                            &crate::explain::order::Ask {
+                                sort: Some(sort),
+                                limit: 0,
+                                ..first_read
+                            },
+                        ),
+                    };
+                    leading_guard =
+                        Some(secantus_core::aggregate::leading_sort(blocking, sbe_read));
+                }
                 // A cursor left open over that read is killed when one of its
                 // indexes is dropped, as a `find` cursor is (mongod 8.2.11:
                 // 175 on the `getMore`). Only when the cursor's namespace is
@@ -909,6 +935,8 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // The pipeline result is already decoded `Document`s. Send the `firstBatch`
     // straight to the wire as `Bson` and encode only the cursor remainder for the
     // registry — no encode→decode round-trip on the docs the client gets now.
+    // The pipeline has read its leading-sort verdict, or never will.
+    drop(leading_guard);
     let prefix = format!("Executor error during aggregate command on namespace: {ns}");
     let (first_batch, mut cursor_id) =
         split_docs_into_cursor_checked(result, batch_size, &ns, cursors, false, Some(&prefix))?;
@@ -5189,6 +5217,32 @@ struct LeadingSort {
     filter: Option<Document>,
     /// How many documents the stages after the `$sort` take; 0 is all.
     limit: i64,
+}
+
+/// The `$sort` mongod puts in front of a leading `$setWindowFields`: `None`
+/// when the pipeline does not start with one that sorts, `Some(None)` when
+/// it sorts by a computed partition, else its partition field and `sortBy`.
+fn window_sort(rest: &[Bson]) -> Option<Option<Document>> {
+    let spec = rest
+        .iter()
+        .find(|s| stage_name(s) != secantus_core::sbe::ENGINE_STAGE)?
+        .as_document()?
+        .get_document("$setWindowFields")
+        .ok()?;
+    let mut sort = Document::new();
+    match spec.get("partitionBy") {
+        None => {}
+        Some(Bson::String(p)) if p.starts_with('$') && !p.starts_with("$$") => {
+            sort.insert(p[1..].to_string(), 1);
+        }
+        Some(_) => return Some(None),
+    }
+    if let Ok(by) = spec.get_document("sortBy") {
+        for (k, v) in by {
+            sort.insert(k.clone(), v.clone());
+        }
+    }
+    (!sort.is_empty()).then_some(Some(sort))
 }
 
 fn leading_sort(rest: &[Bson], nothing_lifted: bool) -> LeadingSort {

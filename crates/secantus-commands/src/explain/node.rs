@@ -330,7 +330,9 @@ impl Node {
                 out.insert("stage", "SORT");
                 counted(&mut out);
                 out.insert("sortPattern", pattern.clone());
-                out.insert("memLimit", 104_857_600_i32);
+                // The budget in force (RM-315).
+                let budget = secantus_core::memlimit::budgets().sort;
+                out.insert("memLimit", i32::try_from(budget).unwrap_or(i32::MAX));
                 if let Some(n) = limit {
                     out.insert("limitAmount", num(*n));
                 }

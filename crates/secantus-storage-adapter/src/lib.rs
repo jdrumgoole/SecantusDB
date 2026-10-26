@@ -47,10 +47,19 @@ pub struct StorageAdapter {
 const SQL_SYSTEM_PREFIX: &str = "__sys_";
 
 /// Might `blob` hold a SQL system field? (Every document a MongoDB client
-/// wrote is answered by this scan alone.)
+/// wrote is answered by this check alone.) The fields are top-level, so only
+/// the top-level field names are read, element by element, never the values:
+/// a scan of every byte cost a debug build 15 s over 110 one-megabyte
+/// documents. A document that does not parse answers yes, and the full
+/// path decides.
 fn may_hold_sql_system_fields(blob: &[u8]) -> bool {
-    let needle = SQL_SYSTEM_PREFIX.as_bytes();
-    blob.windows(needle.len()).any(|w| w == needle)
+    let Ok(raw) = bson::RawDocument::from_bytes(blob) else {
+        return true;
+    };
+    raw.into_iter().any(|item| match item {
+        Ok((key, _)) => key.starts_with(SQL_SYSTEM_PREFIX),
+        Err(_) => true,
+    })
 }
 
 /// `blob` without the SQL system fields.
@@ -1685,5 +1694,25 @@ fn map_err(e: WtError) -> StorageError {
         WtError::ChangeStreamFatal(m) | WtError::Internal(m) => StorageError::Internal(m),
         WtError::Wt(err) => StorageError::Internal(format!("WiredTiger error: {err:?}")),
         WtError::Bson(m) => StorageError::Internal(format!("BSON error: {m}")),
+    }
+}
+
+#[cfg(test)]
+mod sql_field_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_top_level_field_name_counts() {
+        let bytes = |d: Document| bson::to_vec(&d).unwrap();
+        assert!(may_hold_sql_system_fields(&bytes(
+            bson::doc! {"a": 1, "__sys_ctid": 2}
+        )));
+        assert!(!may_hold_sql_system_fields(&bytes(
+            bson::doc! {"a": "__sys_x"}
+        )));
+        assert!(!may_hold_sql_system_fields(&bytes(
+            bson::doc! {"a": {"__sys_x": 1}}
+        )));
+        assert!(may_hold_sql_system_fields(b"not bson"));
     }
 }
