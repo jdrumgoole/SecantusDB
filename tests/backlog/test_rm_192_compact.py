@@ -16,6 +16,7 @@ freed are compared as mongod's are only in being given back, not in amount.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -62,6 +63,18 @@ def _bson_type(raw: bytes, name: str) -> int:
     raise AssertionError(f"{name} not in the reply")
 
 
+def _types_as_set(errmsg: str) -> str:
+    """A wrong-type error's expected-type list, sorted: mongod renders it in
+    an order that moves between builds (8.2.11 `[int, decimal, double,
+    long]`, 8.2.12 `[int, double, decimal, long]`), so it is the set that is
+    compared."""
+    return re.sub(
+        r"expected types '\[([^\]]*)\]'",
+        lambda m: "expected types '[" + ", ".join(sorted(m.group(1).split(", "))) + "]'",
+        errmsg,
+    )
+
+
 def reply(db: Any, cmd: dict, **kw: Any) -> tuple:
     """A command's answer: its fields in order (a freed-bytes count as its
     BSON type), or `("err", code, errmsg)`."""
@@ -69,7 +82,7 @@ def reply(db: Any, cmd: dict, **kw: Any) -> tuple:
         raw = db.command(cmd, codec_options=_RAW, **kw).raw
     except PyMongoError as e:
         details = getattr(e, "details", None) or {}
-        return ("err", getattr(e, "code", None), details.get("errmsg", str(e)))
+        return ("err", getattr(e, "code", None), _types_as_set(details.get("errmsg", str(e))))
     out = []
     for k, v in RawBSONDocument(raw).items():
         if k in ("$clusterTime", "operationTime"):

@@ -147,12 +147,16 @@ fn compact_runs_while_another_session_writes() {
         std::thread::spawn(move || {
             let session = conn.open_session().unwrap();
             let cur = session.open_cursor("table:busy", None).unwrap();
+            // Paced, and at most ~2.5 MB: the writer runs through the whole
+            // compaction without outgrowing the ~36 MB it gives back (an
+            // unpaced writer on a fast disk did, on CI's Linux runner).
             let mut k = 1_000_000i64;
-            while !stop.load(Ordering::Acquire) {
+            while !stop.load(Ordering::Acquire) && k < 1_005_000 {
                 cur.set_key_q(k);
                 cur.set_value_u(&noise(k as u64, 500));
                 cur.insert().unwrap();
                 k += 1;
+                std::thread::sleep(std::time::Duration::from_micros(200));
             }
             k - 1_000_000
         })
