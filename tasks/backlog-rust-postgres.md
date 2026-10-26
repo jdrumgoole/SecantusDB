@@ -593,8 +593,7 @@ one beside it.
     (`ExecHashGetHashValue`); 54 of 54 shapes at 20 to 3,000 rows, with a
     primary key and with NULL keys (14 before). Not yet: such a join in
     three or more tables, or FULL; an expression in a class; a LEFT join's class through the general path;
-    a class of text or other non-integer keys; three tables under a LIMIT
-    (a WHERE equality over two tables is a join clause since 2026-10-26,
+    a class of text or other non-integer keys (a WHERE equality over two tables is a join clause since 2026-10-26,
     the join graph a cycle where it closes one, two relations joined on
     every clause between them, a class's clause leading, and an inner
     join's further key pairs edges too: 14 of 14 cyclic shapes of three
@@ -604,13 +603,24 @@ one beside it.
     first, priced with `clause_selectivity`'s defaults -- `DEFAULT_INEQ_SEL`,
     `neqjoinsel`, IS DISTINCT FROM's, `var_eq_const`'s, an OR's -- and an
     operator a row; 117 of 117 shapes, 9 before); four or more tables
-    with a WHERE over two of them or a LIMIT; more than eight tables; an expression key with a function
-    call or a cast that costs; parameterized nested loops (an index scan inner); a LIMIT with
-    an ORDER BY, or with a WHERE over the general path; a join of more
+    with a WHERE over two of them; more than eight tables; an expression key with a function
+    call or a cast that costs; parameterized nested loops outside a LIMIT's search; a join of more
     than 200,000 rows a side, which streams in scan order.
+  - A LIMIT over three to eight tables (and two whose WHERE holds a join
+    filter) is planned for its first rows (2026-10-26): every relation
+    keeps its whole pathlist with startup costs counting, base tables'
+    paths include whole-index scans in a key's order and index and bitmap
+    scans parameterized by a clause's other table (Memoize, inner-unique
+    nested loops), and the plan is the cheapest under a Limit, or with an
+    ORDER BY of one integer column the cheapest of the presorted paths and
+    a bounded Sort; 812 of 843 shapes of three to five tables at 20 to
+    3,000 rows (514 before). Declined: an outer join beside a parameterized
+    scan (PostgreSQL parameterizes a join relation, `param_source_rels`),
+    an index on a key, WHERE or ORDER BY column whose deduplicated size is
+    not modelled, and other ORDER BYs.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_limit_over_three_tables_is_planned
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_limit_over_left_joins_reads_a_parameterized_join
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

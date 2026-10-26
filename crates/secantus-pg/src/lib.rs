@@ -343,9 +343,20 @@ thread_local! {
     /// The rows a LIMIT (and OFFSET) reads from the general join a select
     /// is over, while `select_docs` materialises it: the top join's plan is
     /// then the cheapest for that many rows (RP-028). Taken by the first
-    /// `join_rows` call, so a nested join never sees it.
-    static GENERAL_JOIN_LIMIT: std::cell::Cell<Option<usize>> =
+    /// `join_rows` call, so a nested join never sees it. With it, the
+    /// OFFSET's rows alone, which a Limit's startup cost counts, and
+    /// whether a WHERE over two or more of the join's tables filters it,
+    /// which only the join order search places (`four_table_join`).
+    static GENERAL_JOIN_LIMIT: std::cell::Cell<Option<(usize, usize, bool)>> =
         const { std::cell::Cell::new(None) };
+    /// With `GENERAL_JOIN_LIMIT`, the joined-row key of the ORDER BY over
+    /// the join (one plain column, ascending), which only the join order
+    /// search plans for (`four_table_join`); and, once it has, whether the
+    /// plan it picked returns its rows in that order already, so that the
+    /// select runs no Sort of its own (`create_ordered_paths`).
+    static GENERAL_JOIN_ORDER: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    static GENERAL_JOIN_PRESORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Run `f` with FROM-subquery rows carrying their base row ids.
@@ -7901,6 +7912,265 @@ impl PgHandler {
         })
     }
 
+    /// A base table's paths for a LIMIT's join search, in the order
+    /// `set_plain_rel_pathlist` makes them (RP-028), each with the joined-row
+    /// key an index scan returns its rows in the order of: its sequential
+    /// scan; then, for each index, newest first (`get_relation_info`), its
+    /// index scan through the WHERE's quals on its leading column, or its
+    /// whole scan in a join key's order when it leads with one (an order a
+    /// merge join reads), and its index scan parameterized by each clause
+    /// on that key (`keys`: the clause's class, the key's column, the
+    /// outer table's bit, the outer side's rows -- the scans repeated --
+    /// and its key as a Memoize's cache key), a nested loop's inner; then
+    /// the bitmap heap scan over the WHERE's index quals, and one
+    /// parameterized by each clause's table. `columns` maps the table's
+    /// joined-row keys to its stored fields. `None` when the table or an
+    /// index on a key or a WHERE column is not modelled: an index holding
+    /// a key not first, partial, not a B-tree, with INCLUDE columns or
+    /// descending; a heap with all-visible pages; a WHERE quals of which
+    /// two indexes serve, or one an index on a join key serves.
+    pub(crate) fn limit_base_paths(
+        &self,
+        table: &str,
+        filter: &Document,
+        columns: &[(String, String)],
+        keys: &[(usize, String, u32, f64, secantus_pgplan::joincost::MemoKey)],
+        order_col: Option<(usize, String)>,
+    ) -> Option<Vec<(secantus_pgplan::joincost::InPath, Option<String>)>> {
+        use secantus_pgplan::costsize;
+        use secantus_pgplan::joincost::InPath;
+        let count = self
+            .storage
+            .count_matching(self.db(), table, &Document::new(), None)
+            .ok()?;
+        let pt = self.planner_table(table, count)?;
+        if pt.analyzed.is_some() || pt.allvisfrac > 0.0 {
+            return None;
+        }
+        let key_fields: Vec<String> = keys
+            .iter()
+            .map(|(_, c, ..)| pt.def.field_of(c))
+            .collect::<Option<_>>()?;
+        let quals = costsize::conjuncts(filter)?;
+        let qual_fields: Vec<String> = quals.iter().map(|(f, _)| f.clone()).collect();
+        let order_field = match &order_col {
+            Some((_, c)) => Some(pt.def.field_of(c)?),
+            None => None,
+        };
+        for ix in self
+            .storage
+            .list_indexes(self.db(), table)
+            .unwrap_or_default()
+        {
+            let Ok(ikeys) = ix.get_document("key") else {
+                continue;
+            };
+            let opt = |k: &str| {
+                ix.contains_key(k) || ix.get_document("options").is_ok_and(|o| o.contains_key(k))
+            };
+            let descending = ikeys.values().any(|d| {
+                matches!(d, Bson::Int32(n) if *n < 0) || matches!(d, Bson::Int64(n) if *n < 0)
+            });
+            let plain_btree = ix
+                .get_str("sqlMethod")
+                .ok()
+                .or_else(|| {
+                    ix.get_document("options")
+                        .ok()
+                        .and_then(|o| o.get_str("sqlMethod").ok())
+                })
+                .is_none_or(|m| m == "btree");
+            let reads = |f: &String| ikeys.keys().any(|k| k == f);
+            let touches = key_fields
+                .iter()
+                .chain(&qual_fields)
+                .chain(&order_field)
+                .any(reads);
+            if touches
+                && (descending
+                    || !plain_btree
+                    || opt("sqlPredicate")
+                    || opt("include")
+                    || (opt("partialFilterExpression") && !opt("unique")))
+            {
+                return None;
+            }
+        }
+        let mut indexes = self.cost_indexes(table, &pt.def, count as u64);
+        // `get_relation_info` lists the newest index first.
+        indexes.reverse();
+        // An index a path reads is sized with its repeated keys
+        // deduplicated, where that is modelled.
+        for ix in &mut indexes {
+            if key_fields.contains(&ix.field) || qual_fields.contains(&ix.field) {
+                if let Some((pages, height)) = self.dedup_index_size(table, ix)? {
+                    ix.pages = pages;
+                    ix.height = height;
+                }
+            }
+        }
+        // An index holding a key or a WHERE column anywhere but first is
+        // not modelled; nor one leading with a key a WHERE qual reads.
+        for ix in &indexes {
+            let rest = &ix.columns[1..];
+            if rest.iter().any(|c| {
+                key_fields.contains(c) || qual_fields.contains(c) || order_field.as_ref() == Some(c)
+            }) {
+                return None;
+            }
+            if (key_fields.contains(&ix.field) || order_field.as_ref() == Some(&ix.field))
+                && qual_fields.contains(&ix.field)
+            {
+                return None;
+            }
+        }
+        let column_nd = |f: &str| {
+            if pt.unique.iter().any(|u| u == f) {
+                pt.tuples
+            } else if pt
+                .def
+                .columns
+                .iter()
+                .any(|c| c.field() == f && c.pg_type == "bool")
+            {
+                2.0
+            } else {
+                pt.tuples.min(200.0)
+            }
+        };
+        let sel = if filter.is_empty() {
+            1.0
+        } else {
+            secantus_pgplan::hashagg::filter_selectivity(filter, &column_nd)?
+        };
+        let rows = if filter.is_empty() {
+            pt.tuples
+        } else {
+            (pt.tuples * sel).round().max(1.0)
+        };
+        let rel = costsize::Rel {
+            pages: pt.pages,
+            tuples: pt.tuples,
+        };
+        // A leaf's joined-row keys name its columns by their stored
+        // fields, or by their names (a primary key's field is `_id`).
+        let joined_key = |field: &str| {
+            let name = pt
+                .def
+                .columns
+                .iter()
+                .find(|c| c.field() == field)
+                .map(|c| c.name.clone());
+            columns
+                .iter()
+                .find(|(_, f)| f == field || Some(f) == name.as_ref())
+                .map(|(k, _)| k.clone())
+        };
+        let serving: Vec<&costsize::Index> = indexes
+            .iter()
+            .filter(|ix| qual_fields.contains(&ix.field))
+            .collect();
+        if serving.len() > 1 {
+            return None;
+        }
+        let mut out = vec![(
+            {
+                let (s, t) = costsize::seq_scan_path(&rel, &quals);
+                InPath::scan(s, t, rows, None)
+            },
+            None,
+        )];
+        let mut bitmaps: Vec<(InPath, Option<String>)> = Vec::new();
+        let mut param_bitmaps: Vec<(u32, InPath)> = Vec::new();
+        for ix in &indexes {
+            if qual_fields.contains(&ix.field) {
+                // Its index scan through the WHERE's quals: no order of
+                // use, the rows in the index's.
+                let paths = costsize::scan_paths(
+                    &rel,
+                    std::slice::from_ref(ix),
+                    &quals,
+                    &|f| costsize::ColSel::Ndistinct(column_nd(f)),
+                    rows,
+                );
+                for (kind, (s, t)) in paths {
+                    match kind {
+                        costsize::ScanKind::Index(_) => {
+                            out.push((InPath::scan(s, t, rows, None), Some(joined_key(&ix.field)?)))
+                        }
+                        costsize::ScanKind::Bitmap(_) => {
+                            bitmaps.push((InPath::scan(s, t, rows, None), None))
+                        }
+                        costsize::ScanKind::Seq => {}
+                    }
+                }
+                continue;
+            }
+            // Its whole scan in the ORDER BY's order, a column no clause
+            // reads.
+            if let (Some(f), Some((class, _))) = (&order_field, &order_col) {
+                if *f == ix.field {
+                    let (s, t) = costsize::ordered_index_scan(&rel, ix, &quals, column_nd(f));
+                    out.push((
+                        InPath::scan(s, t, rows, Some(*class)),
+                        Some(joined_key(&ix.field)?),
+                    ));
+                    continue;
+                }
+            }
+            let ends: Vec<&(usize, String, u32, f64, secantus_pgplan::joincost::MemoKey)> = keys
+                .iter()
+                .zip(&key_fields)
+                .filter(|(_, f)| **f == ix.field)
+                .map(|(k, _)| k)
+                .collect();
+            if ends.is_empty() {
+                continue;
+            }
+            let nd = column_nd(&ix.field);
+            // Its whole scan, in the key's order.
+            let (s, t) = costsize::ordered_index_scan(&rel, ix, &quals, nd);
+            out.push((
+                InPath::scan(s, t, rows, Some(ends[0].0)),
+                Some(joined_key(&ix.field)?),
+            ));
+            for (_, _, outer, loop_count, memo_key) in ends {
+                // `get_parameterized_baserel_size`: the WHERE's selectivity
+                // and the clause's (`var_eq_non_const`), at most the rows.
+                let ppi_rows = costsize::clamp_row_est(pt.tuples * sel / nd.max(1.0)).min(rows);
+                let param = |(startup, total): (f64, f64)| InPath {
+                    startup,
+                    total,
+                    class: None,
+                    rows: ppi_rows,
+                    req_outer: *outer,
+                    rescan: (startup, total),
+                    indexed: true,
+                    memo_key: Some(*memo_key),
+                };
+                let scan = costsize::param_index_scan(&rel, ix, &quals, nd, *loop_count)?;
+                out.push((param(scan), None));
+                let bitmap =
+                    costsize::param_bitmap_heap_scan(&rel, ix, &quals, nd, *loop_count, ppi_rows)?;
+                // One bitmap heap scan a parameterization, over the cheapest
+                // of its index paths (`choose_bitmap_and`).
+                match param_bitmaps.iter_mut().find(|(o, _)| o == outer) {
+                    Some((_, b)) if bitmap.1 < b.total => *b = param(bitmap),
+                    Some(_) => {}
+                    None => param_bitmaps.push((*outer, param(bitmap))),
+                }
+            }
+        }
+        // A parameterized bitmap heap scan beside a WHERE's bitmap is a
+        // BitmapAnd `choose_bitmap_and` may make, which is not modelled.
+        if !bitmaps.is_empty() && !param_bitmaps.is_empty() {
+            return None;
+        }
+        out.extend(bitmaps);
+        out.extend(param_bitmaps.into_iter().map(|(_, b)| (b, None)));
+        Some(out)
+    }
+
     /// Whether a cursor over the join `js` can scan backward: not when
     /// PostgreSQL's cheapest plan is a merge join already in the ORDER BY's
     /// order, which is then the plan's top; yes when a Sort goes over the
@@ -9162,7 +9432,14 @@ impl PgHandler {
         node: &secantus_pgplan::joins::JoinNode,
     ) -> PgWireResult<Vec<Document>> {
         use secantus_pgplan::joins::JoinNode;
-        let limit = GENERAL_JOIN_LIMIT.with(|c| c.take());
+        let limit_offset = GENERAL_JOIN_LIMIT.with(|c| c.take());
+        let order = GENERAL_JOIN_ORDER.with(|c| c.borrow_mut().take());
+        // A WHERE over several tables is a join filter only the search
+        // places, and an ORDER BY a Sort only it weighs; any other plan is
+        // made for every row.
+        let limit =
+            limit_offset.and_then(|(rows, _, spans)| (!spans && order.is_none()).then_some(rows));
+        let limit_offset = limit_offset.map(|(rows, offset, _)| (rows, offset));
         match node {
             // A LATERAL item only ever sits on a join's right; alone, with
             // nothing to its left, it was planned as an ordinary leaf.
@@ -9229,10 +9506,12 @@ impl PgHandler {
                 ..
             } => {
                 // Three to eight tables: PostgreSQL's join order search.
-                if let Some(rows) = self.three_table_join(node, limit)? {
+                if let Some(rows) =
+                    self.three_table_join(node, limit_offset.map(|(rows, _)| rows))?
+                {
                     return Ok(rows);
                 }
-                if let Some(rows) = self.four_table_join(node, limit)? {
+                if let Some(rows) = self.four_table_join(node, limit_offset, order.as_deref())? {
                     return Ok(rows);
                 }
                 let lrows = self.join_rows(left)?;
@@ -34602,6 +34881,9 @@ impl PgHandler {
         // this point -- ORDER BY, OFFSET, LIMIT, the encoder -- works
         // on documents and does not care where they came from, which is
         // why the series is a SOURCE rather than its own statement.
+        // The join source's plan already returns its rows in the ORDER BY's
+        // order (RP-028): no Sort over it.
+        let mut presorted = false;
         let (mut docs, mut def): (Vec<Document>, TableDef) = match (&sel.series, &sel.join) {
             // `LIMIT 0`: PostgreSQL's Limit node returns before it asks its
             // subplan for a row (`ExecLimit`, a count of zero), so nothing
@@ -34616,21 +34898,56 @@ impl PgHandler {
                 // A locking select reads its subquery's rows with the stored
                 // row id of each base row along (see `LOCK_ROW_ID`).
                 // A LIMIT straight over a join, nothing between them that
-                // reads more rows than it returns.
-                let join_limit = (matches!(sub.plan.as_ref(), Statement::JoinRows(_))
-                    && sel.order.is_empty()
-                    && sel.filter.is_empty()
-                    && sel.residual.is_none()
-                    && sel.windows.is_empty())
-                .then(|| sort_bound(sel))
-                .flatten();
+                // reads more rows than it returns: no WHERE, or one whose
+                // every conjunct the join's scans and joins evaluate, so
+                // that the join's rows are the ones the LIMIT counts.
+                // With an ORDER BY of one plain column, ascending with its
+                // NULLs last, the search plans the join for the LIMIT and
+                // says whether its plan needs the Sort.
+                let join_order = match sel.order.as_slice() {
+                    [k] if k.ascending
+                        && k.expr.is_none()
+                        && !k.jsonb
+                        && matches!(k.nulls, secantus_pgplan::Nulls::Last)
+                        && sel.distinct == secantus_pgplan::Distinct::None
+                        && !sel.with_ties
+                        && sel.lock_clauses.is_empty() =>
+                    {
+                        Some(k.field.clone())
+                    }
+                    _ => None,
+                };
+                let join_limit = match sub.plan.as_ref() {
+                    Statement::JoinRows(j)
+                        if (sel.order.is_empty() || join_order.is_some())
+                            && sel.windows.is_empty()
+                            && ((sel.filter.is_empty() && sel.residual.is_none())
+                                || j.where_modelled) =>
+                    {
+                        let where_spans = !(sel.filter.is_empty() && sel.residual.is_none())
+                            && !j.where_span_aliases.is_empty();
+                        sort_bound(sel).map(|rows| {
+                            (
+                                rows,
+                                usize::try_from(sel.offset.max(0)).unwrap_or(0),
+                                where_spans,
+                            )
+                        })
+                    }
+                    _ => None,
+                };
                 GENERAL_JOIN_LIMIT.with(|c| c.set(join_limit));
+                GENERAL_JOIN_ORDER
+                    .with(|c| *c.borrow_mut() = join_order.filter(|_| join_limit.is_some()));
+                GENERAL_JOIN_PRESORTED.with(|c| c.set(false));
                 let docs = if !sel.lock_clauses.is_empty() && self.storage.in_user_txn() {
                     with_lock_row_ids(|| self.sub_source_docs(sub, &sel.filter))
                 } else {
                     self.sub_source_docs(sub, &sel.filter)
                 };
                 GENERAL_JOIN_LIMIT.with(|c| c.set(None));
+                GENERAL_JOIN_ORDER.with(|c| *c.borrow_mut() = None);
+                presorted = GENERAL_JOIN_PRESORTED.with(|c| c.replace(false));
                 (docs?, sub.def.clone())
             }
             // A top-level JOIN source: materialise it, treat its
@@ -34899,6 +35216,7 @@ impl PgHandler {
         }
 
         if !sel.order.is_empty()
+            && !presorted
             && !(!sel.windows.is_empty() && window_order::presorted(&sel.order, &window_sorted))
         {
             materialise_order_exprs(&mut docs, &sel.order).map_err(|e| Self::err(&e))?;

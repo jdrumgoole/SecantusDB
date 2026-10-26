@@ -192,6 +192,13 @@ pub struct JoinRows {
     /// Those that are an equality of two tables' columns, as joined-key
     /// pairs: each a join clause between its two tables.
     pub where_equalities: Vec<(String, String)>,
+    /// Every WHERE conjunct is evaluated at or below the join: pushed into
+    /// the scan of the one table it reads, folded into an equivalence
+    /// class, or reading two or more tables (whose join filters and
+    /// clauses the search places). Only then do the join's rows, and its
+    /// planner's estimate of them, number what the WHERE keeps, as a LIMIT
+    /// over the join counts them (`grouping_planner`'s `tuple_fraction`).
+    pub where_modelled: bool,
     /// The joined-row keys the query reads above the join -- its select
     /// list, GROUP BY, HAVING, ORDER BY and the rest, not its WHERE, whose
     /// conjuncts each read one table and run at its scan. They make the
@@ -326,7 +333,7 @@ pub(crate) fn plan_join_source(
     params: &[Bson],
 ) -> Result<pg_query::protobuf::SelectStmt> {
     // A nested join (one inside a FROM subquery) plans with its own.
-    let (pushdown, nonnullable, ec, moved) = pushdown_filters(s, lookup);
+    let (pushdown, nonnullable, ec, placed, moved) = pushdown_filters(s, lookup);
     let outer_pushdown = PUSHDOWN.with(|p| p.replace(pushdown));
     let outer_nonnullable = NONNULLABLE.with(|p| p.replace(nonnullable));
     let outer_ec = EC_PLAN.with(|p| p.replace(ec));
@@ -336,9 +343,10 @@ pub(crate) fn plan_join_source(
     EC_PLAN.with(|p| *p.borrow_mut() = outer_ec);
     let (tree, scope) = built?;
     if moved.is_empty() {
-        return finish_join_source(s, tree, scope, params);
+        return finish_join_source(s, tree, scope, params, &placed);
     }
-    // The moved conjuncts ran in their leaves; the WHERE keeps the rest.
+    // The moved conjuncts ran in their leaves; the WHERE keeps the rest,
+    // and `placed` the rest's marks, in the same order.
     let mut rest = s.clone();
     rest.where_clause = s.where_clause.as_deref().and_then(|w| {
         let mut conjuncts = Vec::new();
@@ -362,7 +370,13 @@ pub(crate) fn plan_join_source(
             })),
         }
     });
-    finish_join_source(&rest, tree, scope, params)
+    let placed: Vec<bool> = placed
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !moved.contains(i))
+        .map(|(_, p)| *p)
+        .collect();
+    finish_join_source(&rest, tree, scope, params, &placed)
 }
 
 fn build_tree(
@@ -452,6 +466,7 @@ fn finish_join_source(
     tree: JoinNode,
     scope: Scope,
     params: &[Bson],
+    placed: &[bool],
 ) -> Result<pg_query::protobuf::SelectStmt> {
     let spanning: Vec<&pg_query::protobuf::Node> = match s.where_clause.as_deref() {
         Some(w) => {
@@ -561,6 +576,20 @@ fn finish_join_source(
         }
         None => Vec::new(),
     };
+    // Each conjunct pushed or folded (`placed`, in WHERE order), or over
+    // two or more tables.
+    let where_modelled = match out.where_clause.as_deref() {
+        Some(w) => {
+            let mut conjuncts = Vec::new();
+            split_and(w, &mut conjuncts);
+            conjuncts.len() == placed.len()
+                && conjuncts
+                    .iter()
+                    .zip(placed)
+                    .all(|(c, p)| *p || key_aliases(c).len() >= 2)
+        }
+        None => true,
+    };
     let needed = {
         let mut above = out.clone();
         above.where_clause = None;
@@ -594,6 +623,7 @@ fn finish_join_source(
                     where_span_aliases,
                     where_filters,
                     where_equalities,
+                    where_modelled,
                     needed,
                 }))),
                 def,
@@ -1991,6 +2021,7 @@ fn pushdown_filters(
     Vec<(String, pg_query::protobuf::Node)>,
     Vec<String>,
     Option<EcPlan>,
+    Vec<bool>,
     Vec<usize>,
 ) {
     let empty = pg_query::protobuf::Node::default();
@@ -2037,36 +2068,42 @@ fn pushdown_filters(
     for item in &s.from_clause {
         filtered_leaves(item, &mut filterable);
     }
+    // Which conjuncts the scans or the classes take (in WHERE order), and
+    // which of them are moved rather than copied.
+    let mut placed = vec![false; conjuncts.len()];
     let mut moved = Vec::new();
-    let mut pushed: Vec<(String, pg_query::protobuf::Node)> = conjuncts
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| {
-            ec.as_ref()
-                .is_none_or(|(_, absorbed, _)| !absorbed.contains(i))
-        })
-        .filter_map(|(i, c)| {
-            let (alias, move_it) = movable_alias(c, &owner)?;
-            // Only a stored table's leaf applies a pushed filter (`build`):
-            // a conjunct that is moved, not copied, goes nowhere else.
-            if move_it && !filterable.contains(&alias) {
-                return None;
+    let mut pushed: Vec<(String, pg_query::protobuf::Node)> = Vec::new();
+    for (i, c) in conjuncts.iter().enumerate() {
+        if ec
+            .as_ref()
+            .is_some_and(|(_, absorbed, _)| absorbed.contains(&i))
+        {
+            placed[i] = true;
+            continue;
+        }
+        let Some((alias, move_it)) = movable_alias(c, &owner) else {
+            continue;
+        };
+        // Only a stored table's leaf applies a pushed filter (`build`): a
+        // conjunct that is moved, not copied, goes nowhere else.
+        if move_it && !filterable.contains(&alias) {
+            continue;
+        }
+        if preserved.contains(&alias) {
+            placed[i] = true;
+            if move_it {
+                moved.push(i);
             }
-            preserved.contains(&alias).then(|| {
-                if move_it {
-                    moved.push(i);
-                }
-                let mut c = (*c).clone();
-                strip_qualifier(&mut c);
-                (alias, c)
-            })
-        })
-        .collect();
+            let mut c = (*c).clone();
+            strip_qualifier(&mut c);
+            pushed.push((alias, c));
+        }
+    }
     let ec = ec.map(|(plan, _, consts)| {
         pushed.extend(consts);
         plan
     });
-    (pushed, nonnullable, ec, moved)
+    (pushed, nonnullable, ec, placed, moved)
 }
 
 /// The aliases of the FROM's table leaves that take a pushed filter: a
@@ -2757,7 +2794,7 @@ mod tests {
             };
             Some(TableDef::new(name, cols))
         };
-        let (pushed, _, _, _) = pushdown_filters(s, &lookup);
+        let (pushed, _, _, _, _) = pushdown_filters(s, &lookup);
         pushed.into_iter().map(|(alias, _)| alias).collect()
     }
 
@@ -2819,7 +2856,7 @@ mod tests {
             };
             Some(TableDef::new(name, cols))
         };
-        pushdown_filters(s, &lookup).3
+        pushdown_filters(s, &lookup).4
     }
 
     #[test]

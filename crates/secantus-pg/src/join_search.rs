@@ -19,8 +19,8 @@
 //! method's order (`reorder_join_inputs`, `hash_table_order`) and joined
 //! by `join_rows_core`, the side the plan reads first outer. Anything else
 //! -- a WHERE over more than one table, a constant on a join key, a key
-//! two clauses share, a LIMIT, a lock -- is declined, and the join runs as
-//! written.
+//! two clauses share, a lock -- is declined, and the join runs as
+//! written. A LIMIT is `join_order`'s search to plan.
 
 use super::*;
 use secantus_pgplan::joincost::{JoinChoice, JoinMethod, JoinRel, JoinSide};
@@ -59,6 +59,65 @@ pub(crate) fn where_join_clauses() -> Option<Vec<(String, String)>> {
     let equalities = WHERE_EQUALITIES.with(|c| c.borrow().clone());
     let spans = WHERE_SPAN_ALIASES.with(|c| c.borrow().len());
     (spans == equalities.len()).then_some(equalities)
+}
+
+/// A WHERE's equalities between two tables and its join filters (by index
+/// in `JoinRows::where_filters`).
+pub(crate) type WhereClauses = (
+    Vec<(String, String)>,
+    Vec<(usize, secantus_pgplan::joins::JoinFilter)>,
+);
+
+/// The join source's WHERE over more than one table, under a LIMIT's
+/// search: its equalities between two tables (join clauses) and its other
+/// conjuncts as join filters, when every one is either; `None` when one
+/// is neither, or a filter's selectivity is not estimated
+/// (`FilterKind::Other`).
+pub(crate) fn where_clauses_and_filters() -> Option<WhereClauses> {
+    use secantus_pgplan::joins::FilterKind;
+    let equalities = WHERE_EQUALITIES.with(|c| c.borrow().clone());
+    let spans = WHERE_SPAN_ALIASES.with(|c| c.borrow().len());
+    let filters: Vec<(usize, secantus_pgplan::joins::JoinFilter)> = WHERE_FILTERS
+        .with(|c| c.borrow().clone())
+        .into_iter()
+        .enumerate()
+        .collect();
+    let estimated: Vec<(usize, secantus_pgplan::joins::JoinFilter)> = filters
+        .into_iter()
+        .filter(|(_, f)| f.kind != FilterKind::Other)
+        .collect();
+    (spans == equalities.len() + estimated.len()).then_some((equalities, estimated))
+}
+
+/// The WHERE's join filter `i` (`JoinRows::where_filters`).
+pub(crate) fn where_filter(i: usize) -> Option<secantus_pgplan::joins::JoinFilter> {
+    WHERE_FILTERS.with(|c| c.borrow().get(i).cloned())
+}
+
+/// A join filter's selectivity with no statistics, as `clause_selectivity`
+/// estimates it; `nd_of` gives a joined key's distinct count.
+pub(crate) fn filter_selectivity(
+    kind: &secantus_pgplan::joins::FilterKind,
+    nd_of: &dyn Fn(&str) -> Option<f64>,
+) -> Option<f64> {
+    use secantus_pgplan::joins::FilterKind;
+    Some(match kind {
+        // `DEFAULT_INEQ_SEL`.
+        FilterKind::Inequality => 1.0 / 3.0,
+        // `neqjoinsel`: one minus `eqjoinsel`.
+        FilterKind::NotEqual(l, r) => 1.0 - 1.0 / nd_of(l)?.max(nd_of(r)?).max(1.0),
+        // `var_eq_const`: one value of the column's distinct ones.
+        FilterKind::EqualsConst(k) => 1.0 / nd_of(k)?.max(1.0),
+        FilterKind::Or(arms) => {
+            let mut s = 0.0;
+            for a in arms {
+                let x = filter_selectivity(a, nd_of)?;
+                s = s + x - s * x;
+            }
+            s
+        }
+        FilterKind::Other => return None,
+    })
 }
 
 /// Run `f` with the join source `join`'s WHERE recorded for the search.
@@ -335,31 +394,6 @@ impl PgHandler {
             self.join_side(&b.table, JoinKey::Column(column_of(key)?), &b.filter, 0)
                 .map(|s| s.ndistinct)
         };
-        // A filter's selectivity with no statistics, as `clause_selectivity`
-        // estimates it.
-        fn selectivity(
-            kind: &secantus_pgplan::joins::FilterKind,
-            nd_of: &dyn Fn(&str) -> Option<f64>,
-        ) -> Option<f64> {
-            use secantus_pgplan::joins::FilterKind;
-            Some(match kind {
-                // `DEFAULT_INEQ_SEL`.
-                FilterKind::Inequality => 1.0 / 3.0,
-                // `neqjoinsel`: one minus `eqjoinsel`.
-                FilterKind::NotEqual(l, r) => 1.0 - 1.0 / nd_of(l)?.max(nd_of(r)?).max(1.0),
-                // `var_eq_const`: one value of the column's distinct ones.
-                FilterKind::EqualsConst(k) => 1.0 / nd_of(k)?.max(1.0),
-                FilterKind::Or(arms) => {
-                    let mut s = 0.0;
-                    for a in arms {
-                        let x = selectivity(a, nd_of)?;
-                        s = s + x - s * x;
-                    }
-                    s
-                }
-                FilterKind::Other => return None,
-            })
-        }
         // `(filter, selectivity)` of each of the two pairs' filters.
         let mut pair_filters: [Vec<(usize, f64)>; 2] = [Vec::new(), Vec::new()];
         for (i, f) in filters.iter().enumerate() {
@@ -371,7 +405,7 @@ impl PgHandler {
                 None
             };
             let Some(place) = place else { continue };
-            pair_filters[place].push((i, selectivity(&f.kind, &nd_of)?));
+            pair_filters[place].push((i, filter_selectivity(&f.kind, &nd_of)?));
         }
         if on1.iter().any(|a| *a != x.alias && *a != y.alias)
             || on2.iter().any(|a| a != w_alias && *a != z.alias)
