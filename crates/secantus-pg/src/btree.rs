@@ -633,11 +633,6 @@ impl PgHandler {
         if shapes.is_empty() {
             return Ok(());
         }
-        // What bottom-up deletion may remove: read from the heap now, before
-        // any B-tree is held (RP-196), once per command -- within one, only
-        // deleters that ended before it are dead to every snapshot, and the
-        // command's row-by-row writes would otherwise read the heap per row.
-        let dead = self.command_dead_tids(table)?;
         for shape in shapes {
             // Each new tuple, and whether the UPDATE left this index's key as
             // it was (the executor's `indexUnchanged` hint).
@@ -652,6 +647,25 @@ impl PgHandler {
             if keys.is_empty() {
                 continue;
             }
+            // What the unique check and simple and bottom-up deletion may
+            // remove: the heap is read, before the tree is changed and with no
+            // B-tree held (RP-196), for the TIDs these inserts can ask about
+            // only -- the whole heap read once per command made a run of
+            // one-row inserts quadratic (RP-014).
+            let pending: i64 = keys
+                .iter()
+                .map(|(key, _, ctid)| BTree::tuple_size(&*shape, key.clone(), *ctid))
+                .sum();
+            let candidates = self.with_btree(table, &shape, |t| {
+                let mut c: Vec<i64> = keys
+                    .iter()
+                    .flat_map(|(key, _, ctid)| t.candidate_tids(&*shape, key, *ctid, pending))
+                    .collect();
+                c.sort_unstable();
+                c.dedup();
+                c
+            })?;
+            let dead = self.dead_index_tids_among(table, &candidates)?;
             // A model built here is of the rows already stored, which these
             // versions are not yet among.
             let events = self.with_btree(table, &shape, |t| {
@@ -704,37 +718,6 @@ impl PgHandler {
             }
         }
         Ok(())
-    }
-
-    /// [`Self::dead_index_tids`] of `table`, kept for the running command.
-    fn command_dead_tids(
-        &self,
-        table: &str,
-    ) -> PgWireResult<std::sync::Arc<std::collections::HashSet<i64>>> {
-        type Key = (usize, String, String, u64, i64);
-        thread_local! {
-            static MEMO: std::cell::RefCell<Option<(Key, std::sync::Arc<std::collections::HashSet<i64>>)>> =
-                const { std::cell::RefCell::new(None) };
-        }
-        let (xid, cid) = self.command_writer();
-        let key: Key = (
-            self.store_id(),
-            self.db().to_string(),
-            table.to_string(),
-            xid,
-            cid,
-        );
-        if let Some(hit) = MEMO.with(|m| {
-            m.borrow()
-                .as_ref()
-                .filter(|(k, _)| *k == key)
-                .map(|(_, v)| v.clone())
-        }) {
-            return Ok(hit);
-        }
-        let dead = std::sync::Arc::new(self.dead_index_tids(table)?);
-        MEMO.with(|m| *m.borrow_mut() = Some((key, dead.clone())));
-        Ok(dead)
     }
 
     /// The names of `table`'s B-trees.

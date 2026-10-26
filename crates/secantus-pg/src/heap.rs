@@ -675,11 +675,6 @@ impl PgHandler {
         field("__sys_xmin") == Some((xid & 0xFFFF_FFFF) as i64) && field("__sys_cid") == Some(cid)
     }
 
-    /// The running command's `(xid, command id)`.
-    pub(crate) fn command_writer(&self) -> (u64, i64) {
-        self.writer()
-    }
-
     fn writer(&self) -> (u64, i64) {
         let pid = self.pid();
         let xid =

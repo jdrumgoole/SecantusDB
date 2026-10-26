@@ -867,22 +867,17 @@ tests regression tests:
       once a row of its table as PostgreSQL's scan does.
       Backlog-ID: RP-288
       Verify: tests/backlog/test_rp_top10_found.py::test_a_select_list_nextval_in_an_autocommit_join_runs_once_a_row
-- [ ] **GROUP BY a primary key does not cover the table's other columns.**
-      `select id, name from t group by id`, `id` the primary key, is
-      PostgreSQL's functional dependency (`check_functional_grouping`):
-      15.19 answers the rows, this server 42803.
-      Backlog-ID: RP-280
-      Verify: tests/backlog/test_rp_top10_found.py::test_a_column_functionally_dependent_on_the_grouped_key
 - [ ] **`DEFERRABLE` on a primary key is dropped**: `primary key (a, b)
       deferrable` records `condeferrable` false (15.19: true).
       Backlog-ID: RP-281
       Verify: tests/backlog/test_rp_top10_found.py::test_a_deferrable_primary_key_is_deferrable
-- [ ] **Rules and views PostgreSQL's parse analysis refuses are stored**:
-      a RETURNING list in a non-INSTEAD rule (0A000), `INSERT ... SELECT
-      old.*` into a table with fewer columns (42601), a view exposing a
-      SEARCH sequence column of pseudo-type `record[]` (42P16).
-      Backlog-ID: RP-282
-      Verify: tests/backlog/test_rp_top10_found.py::test_rules_and_views_postgres_refuses
+- [ ] **A plain SELECT's WITH RECURSIVE is planned without PostgreSQL's
+      checks**: a recursive term of another type, or one holding an
+      aggregate, is answered (and without a LIMIT never ends) where 15.19
+      refuses with 42804 / 42P19. Found while completing RP-203, whose
+      CREATE VIEW now runs those checks first.
+      Backlog-ID: RP-295
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_recursive_query_postgres_refuses
 - [ ] **A hypothetical-set aggregate over two columns is refused**:
       `dense_rank(2, 'x') WITHIN GROUP (ORDER BY a, b)` is 0A000 here.
       Backlog-ID: RP-283
@@ -1130,26 +1125,6 @@ visibility functions) and RP-211 (`pg_operator` and `pg_rewrite` listed
 none of PostgreSQL's rows) were found and fixed in the same batch; their
 tests are regression tests.
 
-- [ ] **OPEN — a rule's `ev_qual` / `ev_action` are NULL for the
-      constructs the transcription does not cover.** Since the top-ten
-      batch (2026-10-26) `pg_rewrite` holds PostgreSQL 15.19's
-      `nodeToString` of the analysed query (`secantus-pgplan/src/nodetostring/`,
-      a transcription of `analyze.c`, the `parse_*.c` files and
-      `outfuncs.c`): the 142 system rules match byte for byte, and views,
-      materialized views and CREATE RULE over joins, LATERAL, set
-      operations, WITH [RECURSIVE], windows and frames, grouping sets,
-      ordered-set aggregates, typed literals and the DML actions match too
-      (`tests/test_rust_pg_rule_trees.py`, 39 of 39 scenarios). Still NULL,
-      with a logged reason: `FOR UPDATE` / `FOR SHARE` in a view; a
-      data-modifying statement in WITH; `SEARCH` / `CYCLE`; `ON CONFLICT DO
-      UPDATE` and `ON CONFLICT ON CONSTRAINT`; `SET (a, b) = (SELECT ...)`;
-      an interval literal with a field qualifier (`INTERVAL '1' DAY`); a
-      WITH RECURSIVE whose name an inner WITH also defines; and the views
-      and rules made before this change, until they are replaced. The
-      primary-key `constraintDeps` path is transcribed but not reachable
-      (RP-280), and `Var` collation has no COLLATE-conflict error path.
-      Backlog-ID: RP-203
-      Verify: tests/backlog/test_rp_batch51.py::test_scenario[a rule's node trees for what the analysis does not transcribe]
 
 ## Found by batch 51 (2026-10-23)
 

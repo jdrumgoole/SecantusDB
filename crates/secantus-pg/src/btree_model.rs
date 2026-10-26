@@ -1074,6 +1074,77 @@ impl BTree {
         }
     }
 
+    /// Every heap TID inserting `key` (with heap `tid`) can ask the heap
+    /// about: the equal tuples `_bt_check_unique` passes (a unique index),
+    /// and every tuple on the leaf the insert lands on, which simple and
+    /// bottom-up deletion read. A superset of what `insert_deleting` asks,
+    /// for the heap to be read for these alone, before the tree is changed
+    /// (RP-014: reading the whole heap for each inserted row made a run of
+    /// inserts quadratic).
+    ///
+    /// The leaf's tuples are asked about only when the leaf cannot take the
+    /// new tuple (`free < need`), and `pending` -- the size of every tuple
+    /// the same command inserts, which may fill the leaf first -- is added
+    /// to the need so the set stays a superset.
+    pub(crate) fn candidate_tids(
+        &self,
+        shape: &dyn Shape,
+        key: &[Bson],
+        tid: i64,
+        pending: i64,
+    ) -> Vec<i64> {
+        let mut out = Vec::new();
+        if self.root.is_none() {
+            return out;
+        }
+        if shape.unique() {
+            let (mut page, _) = self.descend(shape, key, i64::MIN);
+            while let Page::Leaf { items, right, .. } = &self.pages[page as usize] {
+                let mut last_equal = false;
+                // The items are in key order: the equal run starts where the
+                // smaller keys end.
+                let from =
+                    items.partition_point(|it| cmp_keys(shape, &it.key, key) == Ordering::Less);
+                for it in &items[from..] {
+                    match cmp_keys(shape, &it.key, key) {
+                        Ordering::Less => continue,
+                        Ordering::Greater => {
+                            last_equal = false;
+                            break;
+                        }
+                        Ordering::Equal => {
+                            last_equal = true;
+                            out.extend(it.tids.iter().copied());
+                        }
+                    }
+                }
+                match right {
+                    Some(r) if last_equal => page = *r,
+                    _ => break,
+                }
+            }
+        }
+        let (leaf, _) = self.descend(shape, key, tid);
+        let cached = self.used.get(leaf as usize).copied().filter(|u| *u >= 0);
+        if let Page::Leaf { items, high, .. } = &self.pages[leaf as usize] {
+            let free = match cached {
+                Some(used) => USABLE - used - high.as_ref().map_or(0, |h| h.size + LP) - LP,
+                None => leaf_free(items, high),
+            };
+            if free < pending {
+                for it in items {
+                    out.extend(it.tids.iter().copied());
+                }
+            }
+        }
+        out
+    }
+
+    /// The size an index tuple for `key` takes (`insertstate->itemsz`).
+    pub(crate) fn tuple_size(shape: &dyn Shape, key: Vec<Bson>, tid: i64) -> i64 {
+        item(shape, key, vec![tid]).size
+    }
+
     /// `_bt_check_unique`'s pass over the key's equal tuples, from the
     /// leftmost leaf it can be on (a search without the heap TID) rightward
     /// while they go on: each whose every heap version is dead to all is
@@ -1086,7 +1157,10 @@ impl BTree {
             };
             let mut marked = false;
             let mut last_equal = false;
-            for it in items.iter_mut() {
+            // The items are in key order: the equal run starts where the
+            // smaller keys end.
+            let from = items.partition_point(|it| cmp_keys(shape, &it.key, key) == Ordering::Less);
+            for it in items[from..].iter_mut() {
                 match cmp_keys(shape, &it.key, key) {
                     Ordering::Less => continue,
                     Ordering::Greater => {
