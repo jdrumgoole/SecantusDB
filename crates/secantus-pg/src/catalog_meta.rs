@@ -252,6 +252,16 @@ pub(crate) fn install_system_relations() {
     });
 }
 
+/// The lines of `pg_class_system.tsv`.
+pub(crate) fn system_class_lines() -> std::str::Lines<'static> {
+    CLASSES.lines()
+}
+
+/// The lines of `pg_index_system.tsv`.
+pub(crate) fn system_index_lines() -> std::str::Lines<'static> {
+    INDEXES.lines()
+}
+
 const INDEXES: &str = include_str!("pg_index_system.tsv");
 
 /// `pg_index` rows for PostgreSQL 15.19's own indexes (`pg_index_system.tsv`,
