@@ -1341,6 +1341,29 @@ impl CmdStorage for StorageAdapter {
         self.inner.index_sizes(db, coll).map_err(map_err)
     }
 
+    fn collection_sizes(
+        &self,
+        db: &str,
+        coll: &str,
+    ) -> Result<secantus_commands::CollectionSizes, StorageError> {
+        let kept = self.inner.collection_sizes(db, coll).map_err(map_err)?;
+        // The shape `index_sizes` answers: `_id_` first when it holds
+        // anything, then the other indexes by name.
+        let mut index_sizes = Document::new();
+        if kept.id_index_size > 0 {
+            index_sizes.insert("_id_", kept.id_index_size);
+        }
+        for (name, bytes) in kept.index_sizes {
+            let prev = index_sizes.get_i64(&name).unwrap_or(0);
+            index_sizes.insert(name, prev + bytes);
+        }
+        Ok(secantus_commands::CollectionSizes {
+            records: kept.records,
+            data_size: kept.data_size,
+            index_sizes,
+        })
+    }
+
     fn collection_ident(&self, db: &str, coll: &str) -> Option<String> {
         Some(match self.stored_as(db, coll)? {
             Stored::Catalog => secantus_storage::CATALOG_TABLE.to_string(),

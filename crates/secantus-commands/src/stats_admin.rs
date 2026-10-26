@@ -78,13 +78,11 @@ fn totals(ctx: &CommandContext, db: &str) -> Result<Totals, CommandError> {
             continue;
         }
         t.collections += 1;
-        t.objects += storage
-            .count_matching(db, &c, &Document::new())
-            .map_err(command_error)? as i64;
-        t.data_size += storage
-            .collection_data_size(db, &c)
-            .map_err(command_error)?;
-        let sizes = storage.index_sizes(db, &c).map_err(command_error)?;
+        // The size storer's numbers, as mongod adds them up (RM-191).
+        let kept = storage.collection_sizes(db, &c).map_err(command_error)?;
+        t.objects += kept.records;
+        t.data_size += kept.data_size;
+        let sizes = kept.index_sizes;
         t.indexes += storage
             .list_indexes(db, &c)
             .map_or(sizes.len(), |l| l.len()) as i64;
@@ -237,13 +235,12 @@ pub(crate) fn storage_stats(
 ) -> Result<Document, CommandError> {
     let options = storage.get_collection_options(db, coll).unwrap_or_default();
     let exists = storage.collection_exists(db, coll).unwrap_or(false);
-    let count = storage
-        .count_matching(db, coll, &Document::new())
-        .map_err(command_error)? as i64;
-    let size = storage
-        .collection_data_size(db, coll)
-        .map_err(command_error)?;
-    let measured = storage.index_sizes(db, coll).map_err(command_error)?;
+    // The size storer's numbers, read without reading a document, as
+    // mongod's are (RM-191).
+    let kept = storage.collection_sizes(db, coll).map_err(command_error)?;
+    let count = kept.records;
+    let size = kept.data_size;
+    let measured = kept.index_sizes;
     // Every index is listed, one that holds no entry yet included.
     let mut sizes = Document::new();
     for index in storage.list_indexes(db, coll).unwrap_or_default() {
@@ -362,35 +359,61 @@ pub fn data_size(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     };
     let storage = ctx.storage()?;
-    let exists = storage.collection_exists(db, coll).unwrap_or(false);
-    let total = storage
-        .count_matching(db, coll, &Document::new())
-        .map_err(command_error)? as i64;
-    let whole = storage
-        .collection_data_size(db, coll)
-        .map_err(command_error)?;
+    // A time-series collection is a view over its buckets to mongod, and
+    // `dataSize` refuses a view (measured 8.2.11).
+    if storage
+        .get_collection_options(db, coll)
+        .is_ok_and(|o| o.contains_key("timeseries"))
+    {
+        return Err(err(
+            166,
+            "CommandNotSupportedOnView",
+            format!("Namespace {db}.{coll} is a view, not a collection"),
+        ));
+    }
+    // The collection's record count and size as its size storer keeps them
+    // (RM-191). mongod reads them first: a collection they say is empty --
+    // or one that does not exist -- answers zeros with no `estimate`, before
+    // any index is looked for (measured 8.2.11).
+    let kept = storage.collection_sizes(db, coll).map_err(command_error)?;
+    if kept.records == 0 {
+        return Ok(doc! {
+            "size": Bson::Int64(0),
+            "numObjects": Bson::Int64(0),
+            "millis": Bson::Int64(0),
+            "ok": 1.0,
+        });
+    }
     let (size, count) = match bounds {
-        Some(_) if !exists => (0, 0),
         Some((min, max)) => {
             let (size, count) = bounded_size(storage, db, coll, pattern, min, max)?;
-            // An estimate is the average document's size for each one counted.
-            match (estimate, total) {
-                (true, 1..) => ((whole / total) * count, count),
-                _ => (size, count),
+            // An estimate is the average document's size, from the kept
+            // numbers, for each one counted.
+            if estimate {
+                ((kept.data_size / kept.records) * count, count)
+            } else {
+                (size, count)
             }
         }
-        None => (whole, total),
+        // An estimate is the kept numbers themselves; otherwise mongod reads
+        // the collection, so what it answers is what has committed.
+        None if estimate => (kept.data_size, kept.records),
+        None => (
+            storage
+                .collection_data_size(db, coll)
+                .map_err(command_error)?,
+            storage
+                .count_matching(db, coll, &Document::new())
+                .map_err(command_error)? as i64,
+        ),
     };
-    let mut out = doc! {
+    Ok(doc! {
         "size": Bson::Int64(size),
         "numObjects": Bson::Int64(count),
         "millis": Bson::Int64(0),
-    };
-    if exists {
-        out.insert("estimate", estimate);
-    }
-    out.insert("ok", 1.0);
-    Ok(out)
+        "estimate": estimate,
+        "ok": 1.0,
+    })
 }
 
 /// The size and number of the documents whose key is in `[min, max)`, read

@@ -1533,11 +1533,32 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 },
             },
         )?;
-        storage
-            .count_collated(&ctx.db_name, &coll, &filter, collation.as_ref())
-            .map_err(|e| {
-                crate::util::read_error_on_namespace(e, "count", &format!("{}.{coll}", ctx.db_name))
-            })? as i64
+        if filter.is_empty() {
+            // No query and no hint: mongod answers from the collection's
+            // record count (`RECORD_STORE_FAST_COUNT`), read without reading
+            // a document -- and so counting another transaction's
+            // uncommitted insert, as mongod 8.2.11 does (RM-191, RM-087).
+            storage
+                .collection_sizes(&ctx.db_name, &coll)
+                .map_err(|e| {
+                    crate::util::read_error_on_namespace(
+                        e,
+                        "count",
+                        &format!("{}.{coll}", ctx.db_name),
+                    )
+                })?
+                .records
+        } else {
+            storage
+                .count_collated(&ctx.db_name, &coll, &filter, collation.as_ref())
+                .map_err(|e| {
+                    crate::util::read_error_on_namespace(
+                        e,
+                        "count",
+                        &format!("{}.{coll}", ctx.db_name),
+                    )
+                })? as i64
+        }
     };
     if view_on.is_none() {
         crate::explain::order::count_index_use(

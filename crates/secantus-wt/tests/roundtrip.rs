@@ -214,3 +214,53 @@ fn reopen_persists_data() {
     }
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A transaction's end callbacks hear how it ended: `true` on a commit,
+/// `false` on a rollback and on a session closed mid-transaction, and each
+/// only once. Outside a transaction a callback runs at once (the write it
+/// follows has already committed).
+#[test]
+fn transaction_end_callbacks_hear_how_it_ended() {
+    use std::sync::{Arc, Mutex};
+    let home = temp_home();
+    let (conn, session) = open(&home);
+    let heard: Arc<Mutex<Vec<(&'static str, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+    let hook = |name: &'static str| {
+        let heard = heard.clone();
+        Box::new(move |committed: bool| heard.lock().unwrap().push((name, committed)))
+            as secantus_wt::TxnEndHook
+    };
+
+    assert!(!session.in_transaction());
+    session.on_transaction_end(hook("autocommit"));
+
+    session.begin_transaction(None).unwrap();
+    assert!(session.in_transaction());
+    session.on_transaction_end(hook("commit-a"));
+    session.on_transaction_end(hook("commit-b"));
+    session.commit_transaction(None).unwrap();
+    assert!(!session.in_transaction());
+
+    session.begin_transaction(None).unwrap();
+    session.on_transaction_end(hook("rollback"));
+    session.rollback_transaction(None).unwrap();
+
+    let other = conn.open_session().unwrap();
+    other.begin_transaction(None).unwrap();
+    other.on_transaction_end(hook("closed"));
+    drop(other);
+
+    assert_eq!(
+        *heard.lock().unwrap(),
+        vec![
+            ("autocommit", true),
+            ("commit-a", true),
+            ("commit-b", true),
+            ("rollback", false),
+            ("closed", false),
+        ]
+    );
+    drop(session);
+    drop(conn);
+    let _ = std::fs::remove_dir_all(&home);
+}

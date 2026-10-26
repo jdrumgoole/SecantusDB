@@ -45,6 +45,21 @@ pub type IndexEntries = Vec<(Vec<u8>, i64)>;
 /// A collection's documents as `(RecordId, BSON)`, in RecordId order.
 pub type Records = Vec<(i64, Vec<u8>)>;
 
+/// A collection's record count and sizes as mongod keeps them in its size
+/// storer, current with every write (uncommitted ones included) rather than
+/// counted when asked: what `count` with no query, `collStats`, `dbStats`
+/// and an estimated `dataSize` answer from (`Storage::collection_sizes`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CollectionSizes {
+    /// How many documents (mongod's `numRecords`).
+    pub records: i64,
+    /// Their BSON bytes (mongod's `dataSize`).
+    pub data_size: i64,
+    /// Per-index bytes, `{index_name: size}`, as [`Storage::index_sizes`]
+    /// gives them.
+    pub index_sizes: Document,
+}
+
 /// The outcome of an `update` operation (mirrors
 /// `secantus_storage::UpdateOutcome`).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -1159,6 +1174,17 @@ pub trait Storage: Send + Sync {
     /// `dbStats`.
     fn index_sizes(&self, _db: &str, _coll: &str) -> Result<Document, StorageError> {
         Ok(Document::new())
+    }
+
+    /// The collection's record count and sizes as its size storer keeps
+    /// them, read without reading a document ([`CollectionSizes`]). A store
+    /// that keeps none answers by counting.
+    fn collection_sizes(&self, db: &str, coll: &str) -> Result<CollectionSizes, StorageError> {
+        Ok(CollectionSizes {
+            records: self.count_matching(db, coll, &Document::new())? as i64,
+            data_size: self.collection_data_size(db, coll)?,
+            index_sizes: self.index_sizes(db, coll)?,
+        })
     }
 
     /// The WiredTiger table that holds the collection's documents, for

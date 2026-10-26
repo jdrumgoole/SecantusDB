@@ -851,16 +851,6 @@ inject (a panic, a power loss, a failing checkpoint).
       would also stop holding all its entries in memory at once.
       Backlog-ID: RM-187
       Verify: none -- a concurrency budget (writes during a long build), not an answer
-- [ ] **`count({})`, `collStats`, `dataSize` and `dbStats` walk every
-      row.** They stream now, in constant memory (fixed 2026-10-20: each
-      read the whole collection into a `Vec`, and `dbStats` did that three
-      times per collection). But each still takes time proportional to the
-      collection, where mongod answers all of them from its size-and-count
-      metadata (the size storer), kept up to date by every write. RM-080
-      covers `find` / `aggregate` cursors; RM-087 covers fast-count
-      visibility, not its cost.
-      Backlog-ID: RM-191
-      Verify: none -- a time budget, not an answer
 - [ ] **Disk space is never given back, and there is no repair path.**
       `compact` answers `bytesFreed: 0` without doing anything
       (`secantus-commands/src/capped_admin.rs`, "There is never anything to
@@ -1550,9 +1540,7 @@ fields written out (the transaction state rules, what a transaction refuses,
 conflicts, collections made in a transaction, cursors, the session commands,
 retryable writes). The Rust server differs on 11 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: smaller differences.** A `count` with no query
-      does not see another session's uncommitted insert (mongod's fast count
-      does: it answered 3 for 2 committed documents). An error that names
+- [ ] **RUST MongoDB server: smaller differences.** An error that names
       the request or mongod's oplog entry has the code and a shorter text:
       40606 / 40607 / 40608 / 40611 / 40612 on an incompatible
       `findAndModify` retry (which cases refuse is mongod's since
@@ -1563,7 +1551,7 @@ retryable writes). The Rust server differs on 11 scenarios. What is left:
       answers a plain 50, which is what mongod 8.2.11 answered in 12 runs
       of 12; the `writeConcernError` one probe run saw did not recur.)
       Backlog-ID: RM-087
-      Verify: tests/backlog/test_rm_085_112.py::test_fast_count_sees_another_sessions_uncommitted_insert
+      Verify: tests/backlog/test_rm_085_112.py::test_statement_id_count_error_names_the_request
 
 ### 7.071 Time-series collections -- 2026-10-11
 
@@ -1603,6 +1591,10 @@ is left follows from that:
         Its sizes are of the derived buckets, not of compressed ones.
       - **An unsorted read of a time-series collection reads the whole
         collection** to place the measurements, whatever its filter.
+      - **`dbStats` counts a time-series collection's measurements**, not
+        its buckets, and does not count it as a view: mongod 8.2.11
+        answered `views: 2` for a database holding one view and one
+        time-series collection, this server `views: 1`.
       **Decided 2026-10-16 (Joe):** model mongod's server-wide bucket
       catalog, memory accounting across every collection included
       (`getCacheDerivedBucketMaxSize`), so buckets close for size as on
