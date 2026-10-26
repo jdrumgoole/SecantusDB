@@ -28,7 +28,7 @@ Usage::
 ``BROKEN``     a gap test errored, was skipped, or failed on something other
                than an assertion: the check is not measuring the gap. Fix it.
 ``SKIPPED``    ``--skip ID`` named it, so its gap tests did not run; never
-               counted as passing (the caller says why, as CI does for RM-211).
+               counted as passing (the caller says why).
 ``UNCHECKED``  the item has ``Verify: none -- ...`` (by design) or no Verify
                line at all (a defect in the backlog: write one).
 
@@ -300,7 +300,7 @@ def main() -> int:
         default=[],
         metavar="ID",
         help="do not run this item's gap tests; reported SKIPPED, never as passing "
-        "(the caller states why: CI skips RM-211, whose test needs ~15 GB)",
+        "(the caller states why, e.g. a test that needs more memory than it has)",
     )
     args = ap.parse_args()
     if args.cmd == "ids":

@@ -36,6 +36,28 @@ fn two_sum(a: f64, b: f64) -> (f64, f64) {
 }
 
 impl DoubleDoubleSum {
+    /// The running state, as a spilled `$group` writes it.
+    pub(crate) fn parts(&self) -> (f64, f64, f64) {
+        (self.sum, self.addend, self.special)
+    }
+
+    pub(crate) fn from_parts(sum: f64, addend: f64, special: f64) -> Self {
+        DoubleDoubleSum {
+            sum,
+            addend,
+            special,
+        }
+    }
+
+    /// Fold in another partial sum, as mongod merges a spilled `$sum`: its
+    /// sum and then its addend, each as a double.
+    pub(crate) fn merge(&mut self, other: &DoubleDoubleSum) {
+        let special = self.special + other.special;
+        self.add_double(other.sum);
+        self.add_double(other.addend);
+        self.special = special;
+    }
+
     pub(crate) fn add_double(&mut self, x: f64) {
         self.special += x;
         let (x, addend) = fast_2sum(x, self.addend);

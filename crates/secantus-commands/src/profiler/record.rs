@@ -62,6 +62,8 @@ pub(crate) struct Pending {
 /// which decides its slow-query log line too -- or when it is an aggregate
 /// whose `$merge` writes to a profiled database.
 pub(crate) fn begin(name: &str, doc: &Document, ctx: &CommandContext) -> Option<Pending> {
+    // What this operation spills is its own (RM-211).
+    secantus_core::memlimit::reset_report();
     let profiler = ctx.profiler.as_ref()?;
     if profiler.held.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         return None;
@@ -452,6 +454,13 @@ fn outcome(
                     entry.insert("keysExamined", e.keys_examined);
                     entry.insert("docsExamined", e.docs_examined);
                 }
+                // A stage that spilled (RM-211): mongod 8.2.11 puts
+                // `usedDisk` here and its `$group`'s spill counts after
+                // `nreturned`. The counts are this server's own spills.
+                let spilled = secantus_core::memlimit::report();
+                if spilled.used_disk {
+                    entry.insert("usedDisk", true);
+                }
                 if name != "aggregate" {
                     entry.insert("nBatches", 1_i32);
                 }
@@ -460,6 +469,15 @@ fn outcome(
                 }
                 entry.insert("numYield", 0_i32);
                 entry.insert("nreturned", int32(returned()));
+                if spilled.group_spills > 0 {
+                    entry.insert("groupSpills", spilled.group_spills);
+                    entry.insert("groupSpilledBytes", spilled.group_spilled_bytes);
+                    entry.insert("groupSpilledRecords", spilled.group_spilled_records);
+                    entry.insert(
+                        "groupSpilledDataStorageSize",
+                        spilled.group_spilled_data_storage_size,
+                    );
+                }
                 return;
             }
             "insert" => {

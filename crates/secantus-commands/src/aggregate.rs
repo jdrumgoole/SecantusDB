@@ -498,6 +498,11 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let storage = ctx.storage()?;
     let cursors = ctx.cursors()?;
     let hint = doc.get("hint");
+    // Each stage over its memory budget spills, or refuses, as the command
+    // allows; mongod's `allowDiskUseByDefault` is true (RM-211).
+    let _disk_use =
+        secantus_core::memlimit::allow_disk_use(doc.get_bool("allowDiskUse").unwrap_or(true));
+    let _budgets = secantus_core::memlimit::with_budgets(budgets_of(ctx));
     // A standalone has no cluster time for `$$CLUSTER_TIME` to read.
     if let Some(e) =
         crate::util::cluster_time_unavailable(ctx.replica_set_name.is_none(), &pipeline)
@@ -1952,7 +1957,7 @@ pub(crate) fn run_segmented(
     let ns = format!("{db}.{}", coll.unwrap_or(""));
     let mut docs = input;
     let mut buffer: Vec<Bson> = Vec::new();
-    for stage in pipeline {
+    for (at, stage) in pipeline.iter().enumerate() {
         let name = stage_name(stage);
         if name == "$documents" {
             // `$documents: [<expr>, …]` is a source stage: it ignores its input
@@ -2001,6 +2006,8 @@ pub(crate) fn run_segmented(
             };
         } else if is_storage_backed(name) {
             if !buffer.is_empty() {
+                // The stages from this one on run after the buffered ones.
+                let _after = secantus_core::aggregate::downstream(&pipeline[at..]);
                 docs = core_run(docs, &buffer, vars, collation, Some(&ns))?;
                 buffer.clear();
             }
@@ -2022,6 +2029,7 @@ pub(crate) fn run_segmented(
         }
     }
     if !buffer.is_empty() {
+        let _after = secantus_core::aggregate::downstream(&[]);
         docs = core_run(docs, &buffer, vars, collation, Some(&ns))?;
     }
     Ok(docs)
@@ -2259,6 +2267,38 @@ fn bad_value(msg: impl Into<String>) -> CommandError {
     CommandError::new(2, "BadValue", msg)
 }
 
+/// The aggregation memory budgets `setParameter` has left (RM-211).
+pub(crate) fn budgets_of(ctx: &CommandContext) -> secantus_core::memlimit::Budgets {
+    ctx.server_params
+        .as_ref()
+        .map(|p| p.budgets())
+        .unwrap_or_default()
+}
+
+/// A storage-backed stage over a memory budget it cannot spill (RM-211):
+/// mongod's error, under the executor prefix of the command running it.
+fn budget_error(f: secantus_core::fallback::Fallback) -> CommandError {
+    let Some((code, msg)) = f.as_mongo() else {
+        return bad_value("aggregation memory budget exceeded");
+    };
+    let ns = COMMAND_NS.with(|n| n.borrow().clone());
+    CommandError::new(
+        code,
+        crate::util::error_code_name(code),
+        wrap_pipeline_error(msg.to_string(), false, ns.as_deref()),
+    )
+}
+
+/// The documents a `$lookup` joins to one outer document, held to mongod's
+/// 100 MiB for one result (RM-211).
+fn lookup_budget(joined: &[Document], from: &str) -> Result<(), CommandError> {
+    let mut used = 0usize;
+    for (n, d) in joined.iter().enumerate() {
+        secantus_core::memlimit::lookup_add(&mut used, n, d, from).map_err(budget_error)?;
+    }
+    Ok(())
+}
+
 /// Dispatch one storage-backed stage.
 #[allow(clippy::too_many_arguments)]
 fn apply_storage_stage(
@@ -2415,6 +2455,7 @@ fn apply_lookup(
                 for doc in docs {
                     let lv = secantus_core::get_path(&doc, lf).cloned();
                     let joined = index_join_lookup(storage, db, from, ff, lv.as_ref())?;
+                    lookup_budget(&joined, from)?;
                     let mut new = doc;
                     set_field_path(
                         &mut new,
@@ -2503,6 +2544,7 @@ fn apply_lookup(
                 .cloned()
                 .collect()
         };
+        lookup_budget(&joined, from)?;
         let mut new = doc;
         let arr = Bson::Array(joined.into_iter().map(Bson::Document).collect());
         set_field_path(&mut new, as_field, arr);
@@ -2685,6 +2727,8 @@ fn apply_facet(
             )
         })?;
     let mut out = Document::new();
+    // The size of the document being built (RM-211).
+    let mut used = 0usize;
     for (name, sub) in s.iter() {
         let sub_pipeline = sub.as_array().ok_or_else(|| {
             CommandError::new(
@@ -2745,6 +2789,9 @@ fn apply_facet(
             &Document::new(),
             None,
         )?;
+        for d in &res {
+            secantus_core::memlimit::facet_add(&mut used, d).map_err(budget_error)?;
+        }
         out.insert(
             name.clone(),
             Bson::Array(res.into_iter().map(Bson::Document).collect()),
