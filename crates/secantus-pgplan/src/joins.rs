@@ -190,6 +190,9 @@ pub struct JoinRows {
     pub where_spans_equality: bool,
     /// The tables (aliases) each of those conjuncts reads.
     pub where_span_aliases: Vec<Vec<String>>,
+    /// Those conjuncts as row expressions over the joined keys, for the
+    /// ones the search can place.
+    pub where_filters: Vec<JoinFilter>,
     /// The joined-row keys the query reads above the join -- its select
     /// list, GROUP BY, HAVING, ORDER BY and the rest, not its WHERE, whose
     /// conjuncts each read one table and run at its scan. They make the
@@ -333,7 +336,7 @@ pub(crate) fn plan_join_source(
     NONNULLABLE.with(|p| *p.borrow_mut() = outer_nonnullable);
     EC_PLAN.with(|p| *p.borrow_mut() = outer_ec);
     let (tree, scope) = built?;
-    finish_join_source(s, tree, scope)
+    finish_join_source(s, tree, scope, params)
 }
 
 fn build_tree(
@@ -422,6 +425,7 @@ fn finish_join_source(
     s: &pg_query::protobuf::SelectStmt,
     tree: JoinNode,
     scope: Scope,
+    params: &[Bson],
 ) -> Result<pg_query::protobuf::SelectStmt> {
     let spanning: Vec<&pg_query::protobuf::Node> = match s.where_clause.as_deref() {
         Some(w) => {
@@ -475,6 +479,34 @@ fn finish_join_source(
     );
     let mut out = s.clone();
     rewrite_query(&mut out, &scope)?;
+    // The WHERE's conjuncts over more than one table, as row expressions over
+    // the joined keys, for the join order search to apply where PostgreSQL
+    // evaluates each: as a join filter of the first join holding its tables.
+    let where_filters: Vec<JoinFilter> = match out.where_clause.as_deref() {
+        Some(w) => {
+            let mut conjuncts = Vec::new();
+            split_and(w, &mut conjuncts);
+            conjuncts
+                .into_iter()
+                .filter_map(|c| {
+                    let aliases = key_aliases(c);
+                    if aliases.len() < 2 {
+                        return None;
+                    }
+                    let kind = filter_kind(c);
+                    let ops = operator_count(c);
+                    let expr = on_expr(c, &scope, params).ok()?;
+                    Some(JoinFilter {
+                        aliases,
+                        expr,
+                        kind,
+                        ops,
+                    })
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
     let needed = {
         let mut above = out.clone();
         above.where_clause = None;
@@ -507,6 +539,7 @@ fn finish_join_source(
                     where_spans,
                     where_spans_equality,
                     where_span_aliases,
+                    where_filters,
                     needed,
                 })),
                 def,
@@ -1445,6 +1478,102 @@ fn key_aliases(n: &pg_query::protobuf::Node) -> Vec<String> {
         Ok(())
     });
     out
+}
+
+/// A WHERE conjunct over two or more tables, as a join filter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinFilter {
+    /// The tables it reads.
+    pub aliases: Vec<String>,
+    /// It, over the joined keys.
+    pub expr: ColumnExpr,
+    pub kind: FilterKind,
+    /// The operators it evaluates a row (`cost_qual_eval`).
+    pub ops: usize,
+}
+
+/// What a join filter's selectivity is estimated as with no statistics.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FilterKind {
+    /// `<`, `<=`, `>`, `>=` between two columns: `DEFAULT_INEQ_SEL`
+    /// (`scalarineqsel` with no constant to compare against).
+    Inequality,
+    /// `<>` or `IS DISTINCT FROM` between two columns (joined keys):
+    /// `neqjoinsel`, one minus `eqjoinsel`'s `1 / max(nd1, nd2)`
+    /// (`clause_selectivity` takes a DistinctExpr as its `=`, negated).
+    NotEqual(String, String),
+    /// A column equal to a constant: `var_eq_const` with no statistics,
+    /// `1 / nd`.
+    EqualsConst(String),
+    /// An OR of the above: `s1 + s2 - s1 * s2`, arm by arm
+    /// (`clauselist_selectivity_or`).
+    Or(Vec<FilterKind>),
+    /// Anything else, which is not estimated here.
+    Other,
+}
+
+/// The operators `n` evaluates: each operator and IS DISTINCT FROM.
+fn operator_count(n: &pg_query::protobuf::Node) -> usize {
+    let mut count = 0;
+    let mut node = n.clone();
+    let _ = walk_expr(&mut node, &mut |x| {
+        if let Some(N::AExpr(e)) = x.node.as_ref() {
+            if e.kind == pg_query::protobuf::AExprKind::AexprOp as i32
+                || e.kind == pg_query::protobuf::AExprKind::AexprDistinct as i32
+            {
+                count += 1;
+            }
+        }
+        Ok(())
+    });
+    count
+}
+
+/// How `n`, a WHERE conjunct over joined keys, is estimated.
+fn filter_kind(n: &pg_query::protobuf::Node) -> FilterKind {
+    use pg_query::protobuf::{AExprKind, BoolExprType};
+    let key = |x: Option<&pg_query::protobuf::Node>| match x?.node.as_ref()? {
+        N::ColumnRef(c) if c.fields.len() == 1 => column_ref_name(c),
+        _ => None,
+    };
+    let constant = |x: Option<&pg_query::protobuf::Node>| {
+        matches!(x.and_then(|n| n.node.as_ref()), Some(N::AConst(_)))
+    };
+    match n.node.as_ref() {
+        Some(N::BoolExpr(b)) if b.boolop == BoolExprType::OrExpr as i32 => {
+            let arms: Vec<FilterKind> = b.args.iter().map(filter_kind).collect();
+            if arms.contains(&FilterKind::Other) {
+                FilterKind::Other
+            } else {
+                FilterKind::Or(arms)
+            }
+        }
+        Some(N::AExpr(e)) if e.kind == AExprKind::AexprDistinct as i32 => {
+            match (key(e.lexpr.as_deref()), key(e.rexpr.as_deref())) {
+                (Some(l), Some(r)) => FilterKind::NotEqual(l, r),
+                _ => FilterKind::Other,
+            }
+        }
+        Some(N::AExpr(e)) if e.kind == AExprKind::AexprOp as i32 => {
+            let (l, r) = (e.lexpr.as_deref(), e.rexpr.as_deref());
+            match operator_name(e) {
+                // No statistics to compare by, an expression's or a
+                // column's: `DEFAULT_INEQ_SEL`.
+                Ok("<" | "<=" | ">" | ">=") => FilterKind::Inequality,
+                Ok("<>") => match (key(l), key(r)) {
+                    (Some(a), Some(b)) => FilterKind::NotEqual(a, b),
+                    _ => FilterKind::Other,
+                },
+                Ok("=") => match (key(l), key(r)) {
+                    (Some(a), None) if constant(r) => FilterKind::EqualsConst(a),
+                    (None, Some(b)) if constant(l) => FilterKind::EqualsConst(b),
+                    _ => FilterKind::Other,
+                },
+                _ => FilterKind::Other,
+            }
+        }
+        _ => FilterKind::Other,
+    }
 }
 
 /// The ON predicate as a row expression over the joined keys.

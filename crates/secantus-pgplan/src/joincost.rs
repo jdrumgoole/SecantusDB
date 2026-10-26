@@ -664,6 +664,10 @@ pub const USELESS_KEYS: usize = usize::MAX;
 pub struct JoinRel {
     paths: Vec<JoinPath>,
     startup_counts: bool,
+    /// Added to the total of each path added from now on: the join filters
+    /// the join evaluates on each of its rows (`qp_qual_cost`), which are
+    /// the same for every path of one pair of inputs.
+    extra: f64,
 }
 
 impl JoinRel {
@@ -672,7 +676,14 @@ impl JoinRel {
         JoinRel {
             paths: Vec::new(),
             startup_counts,
+            extra: 0.0,
         }
+    }
+
+    /// The join filters' cost the paths added next pay on top of their own
+    /// (`final_cost_*join`'s `qp_qual_cost` over the join's rows).
+    pub fn set_extra_cost(&mut self, extra: f64) {
+        self.extra = extra;
     }
 
     /// `add_paths_to_joinrel` for `a` joined to `b` (`left`: a LEFT join,
@@ -705,6 +716,7 @@ impl JoinRel {
         clause: bool,
     ) {
         let startup_counts = self.startup_counts;
+        let extra = self.extra;
         let paths = &mut self.paths;
         let useful = class != USELESS_KEYS;
         let mut consider = |(startup, total): (f64, f64), keyed: bool, method: JoinMethod| {
@@ -712,7 +724,7 @@ impl JoinRel {
                 paths,
                 JoinPath {
                     startup,
-                    total,
+                    total: total + extra,
                     keyed: keyed && useful,
                     class,
                     method,
@@ -818,13 +830,14 @@ impl JoinRel {
     /// the hash joins (`select_mergejoin_clauses`).
     pub fn add_full_paths(&mut self, combo: usize, a: &JoinSide, b: &JoinSide, mergeable: bool) {
         let startup_counts = self.startup_counts;
+        let extra = self.extra;
         let paths = &mut self.paths;
         let mut consider = |(startup, total): (f64, f64), method: JoinMethod| {
             add_path(
                 paths,
                 JoinPath {
                     startup,
-                    total,
+                    total: total + extra,
                     keyed: false,
                     class: USELESS_KEYS,
                     method,

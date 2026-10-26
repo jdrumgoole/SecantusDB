@@ -24,6 +24,9 @@
 
 use super::*;
 use secantus_pgplan::joincost::{JoinChoice, JoinMethod, JoinRel, JoinSide};
+
+/// `cpu_operator_cost`.
+const CPU_OPERATOR_COST: f64 = 0.0025;
 use secantus_pgplan::joins::{JoinKind, JoinNode, SEP};
 
 thread_local! {
@@ -35,6 +38,9 @@ thread_local! {
     static WHERE_SPANS_EQUALITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The tables each spanning conjunct reads (`JoinRows::where_span_aliases`).
     static WHERE_SPAN_ALIASES: std::cell::RefCell<Vec<Vec<String>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Those conjuncts as join filters (`JoinRows::where_filters`).
+    static WHERE_FILTERS: std::cell::RefCell<Vec<secantus_pgplan::joins::JoinFilter>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// The joined-row keys the query reads above the join source being
     /// read (`JoinRows::needed`); `None` outside one.
@@ -60,11 +66,13 @@ pub(crate) fn with_join_where<T>(
     let outer = WHERE_SPANS.with(|c| c.replace(join.where_spans));
     let outer_eq = WHERE_SPANS_EQUALITY.with(|c| c.replace(join.where_spans_equality));
     let outer_aliases = WHERE_SPAN_ALIASES.with(|c| c.replace(join.where_span_aliases.clone()));
+    let outer_filters = WHERE_FILTERS.with(|c| c.replace(join.where_filters.clone()));
     let outer_needed = NEEDED.with(|n| n.replace(Some(join.needed.clone())));
     let out = f();
     WHERE_SPANS.with(|c| c.set(outer));
     WHERE_SPANS_EQUALITY.with(|c| c.set(outer_eq));
     WHERE_SPAN_ALIASES.with(|c| *c.borrow_mut() = outer_aliases);
+    WHERE_FILTERS.with(|c| *c.borrow_mut() = outer_filters);
     NEEDED.with(|n| *n.borrow_mut() = outer_needed);
     out
 }
@@ -104,6 +112,8 @@ pub(crate) struct Step {
 pub(crate) struct ThreePlan {
     first: (usize, usize),
     first_step: Step,
+    /// The WHERE's join filters (by index) the first join evaluates.
+    first_filters: Vec<usize>,
     joinrel_first: bool,
     second_step: Step,
 }
@@ -293,17 +303,69 @@ impl PgHandler {
             return None;
         };
         let w_alias = &bases[w].alias;
-        // A spanning conjunct over a pair the search may join first is that
-        // join's filter, below the top: not modelled. One over x and z (or
-        // y and z, past the pair) is the top join's.
-        let below_top = |set: &[String]| {
-            let within = |a: &str, b: &str| set.iter().all(|t| t == a || t == b);
-            !set.iter().all(|t| bases.iter().any(|b| b.alias == *t))
-                || within(&x.alias, &y.alias)
-                || within(w_alias, &z.alias)
-        };
-        if WHERE_SPAN_ALIASES.with(|c| c.borrow().iter().any(|s| below_top(s))) {
+        // A spanning conjunct is a join filter of the first join holding
+        // its tables: one over a pair the search may join first (x-y, or
+        // w-z) filters that pair, with its selectivity in the pair's rows
+        // and its cost on each of the pair's rows; one over x and z (or y
+        // and z, past the pair) is the top join's. A conjunct whose
+        // selectivity is not estimated here is declined below the top.
+        if WHERE_SPAN_ALIASES.with(|c| {
+            c.borrow()
+                .iter()
+                .any(|set| !set.iter().all(|t| bases.iter().any(|b| b.alias == *t)))
+        }) {
             return None;
+        }
+        let filters = WHERE_FILTERS.with(|c| c.borrow().clone());
+        let spans = WHERE_SPAN_ALIASES.with(|c| c.borrow().len());
+        if filters.len() != spans {
+            return None;
+        }
+        let within = |f: &secantus_pgplan::joins::JoinFilter, a: &str, b: &str| {
+            f.aliases.iter().all(|t| t == a || t == b)
+        };
+        let nd_of = |key: &str| -> Option<f64> {
+            let b = bases.iter().find(|b| b.alias == alias_of(key))?;
+            self.join_side(&b.table, JoinKey::Column(column_of(key)?), &b.filter, 0)
+                .map(|s| s.ndistinct)
+        };
+        // A filter's selectivity with no statistics, as `clause_selectivity`
+        // estimates it.
+        fn selectivity(
+            kind: &secantus_pgplan::joins::FilterKind,
+            nd_of: &dyn Fn(&str) -> Option<f64>,
+        ) -> Option<f64> {
+            use secantus_pgplan::joins::FilterKind;
+            Some(match kind {
+                // `DEFAULT_INEQ_SEL`.
+                FilterKind::Inequality => 1.0 / 3.0,
+                // `neqjoinsel`: one minus `eqjoinsel`.
+                FilterKind::NotEqual(l, r) => 1.0 - 1.0 / nd_of(l)?.max(nd_of(r)?).max(1.0),
+                // `var_eq_const`: one value of the column's distinct ones.
+                FilterKind::EqualsConst(k) => 1.0 / nd_of(k)?.max(1.0),
+                FilterKind::Or(arms) => {
+                    let mut s = 0.0;
+                    for a in arms {
+                        let x = selectivity(a, nd_of)?;
+                        s = s + x - s * x;
+                    }
+                    s
+                }
+                FilterKind::Other => return None,
+            })
+        }
+        // `(filter, selectivity)` of each of the two pairs' filters.
+        let mut pair_filters: [Vec<(usize, f64)>; 2] = [Vec::new(), Vec::new()];
+        for (i, f) in filters.iter().enumerate() {
+            let place = if within(f, &x.alias, &y.alias) {
+                Some(0)
+            } else if within(f, w_alias, &z.alias) {
+                Some(1)
+            } else {
+                None
+            };
+            let Some(place) = place else { continue };
+            pair_filters[place].push((i, selectivity(&f.kind, &nd_of)?));
         }
         if on1.iter().any(|a| *a != x.alias && *a != y.alias)
             || on2.iter().any(|a| a != w_alias && *a != z.alias)
@@ -350,6 +412,11 @@ impl PgHandler {
         // integer keys, where that is equality; the ONs still decide every
         // row at the top.
         let ec = shared && !left1 && !left2 && !full1 && !full2;
+        // The class's pairs are not the chain's: a filter on one of them is
+        // not placed.
+        if ec && pair_filters.iter().any(|p| !p.is_empty()) {
+            return None;
+        }
         let (pairs, combos) = if ec {
             let types: Vec<Option<String>> = [(0, xk), (1, yk), (2, zk)]
                 .iter()
@@ -452,16 +519,28 @@ impl PgHandler {
         };
         // Level 2, in `join_search_one_level`'s order.
         let mut rels = Vec::new();
-        for p in &pairs {
+        let filters_sel = |list: &[(usize, f64)]| list.iter().map(|(_, s)| s).product::<f64>();
+        // Their operators, each costed on every row the join makes.
+        let filters_ops = |list: &[(usize, f64)]| -> f64 {
+            list.iter().map(|(i, _)| filters[*i].ops as f64).sum()
+        };
+        for (pi, p) in pairs.iter().enumerate() {
             let (a, b) = (side(p.a, &p.a_key)?, side(p.b, &p.b_key)?);
             let mut rel = JoinRel::new(false);
-            let rows = if p.full {
-                rel.add_full_paths(0, &a, &b, true);
+            let own: &[(usize, f64)] = if ec { &[] } else { &pair_filters[pi] };
+            let pre = if p.full {
                 secantus_pgplan::joincost::full_join_rows(&a, &b)
             } else {
-                rel.add_paths(0, &a, &b, p.left, true);
                 join_rows(&a, &b, p.left)
             };
+            // Its join filters: an operator each on every row the join makes.
+            rel.set_extra_cost(CPU_OPERATOR_COST * filters_ops(own) * pre);
+            if p.full {
+                rel.add_full_paths(0, &a, &b, true);
+            } else {
+                rel.add_paths(0, &a, &b, p.left, true);
+            }
+            let rows = secantus_pgplan::costsize::clamp_row_est(pre * filters_sel(own));
             rels.push(PairRel {
                 rows,
                 total: rel.cheapest(None, rows)?,
@@ -495,13 +574,22 @@ impl PgHandler {
             } else {
                 (base_side, pair_side)
             };
+            // The other pair's filters are this combo's top join's.
+            let at_top: &[(usize, f64)] = if ec { &[] } else { &pair_filters[1 - c.pair] };
+            let pre = if c.full {
+                secantus_pgplan::joincost::full_join_rows(&a, &b)
+            } else {
+                join_rows(&a, &b, c.left)
+            };
+            top.set_extra_cost(CPU_OPERATOR_COST * filters_ops(at_top) * pre);
             if c.full {
                 top.add_full_paths(i, &a, &b, true);
-                rows3.get_or_insert(secantus_pgplan::joincost::full_join_rows(&a, &b));
             } else {
                 top.add_paths(i, &a, &b, c.left, true);
-                rows3.get_or_insert(join_rows(&a, &b, c.left));
             }
+            rows3.get_or_insert(secantus_pgplan::costsize::clamp_row_est(
+                pre * filters_sel(at_top),
+            ));
             sides.push((a, b));
         }
         let choice = top.cheapest(None, rows3?)?;
@@ -544,7 +632,13 @@ impl PgHandler {
         } else {
             (c.base_key.clone(), c.pair_key.clone())
         };
+        let first_filters: Vec<usize> = if ec {
+            Vec::new()
+        } else {
+            pair_filters[c.pair].iter().map(|(i, _)| *i).collect()
+        };
         let plan = ThreePlan {
+            first_filters,
             first: (p.a, p.b),
             first_step: Step {
                 method: first.method,
@@ -622,7 +716,7 @@ impl PgHandler {
         let b = inputs[fb].take().expect("each table read once");
         let a_type = leaf_key_type(nodes[fa], &plan.first_step.a_key);
         let b_type = leaf_key_type(nodes[fb], &plan.first_step.b_key);
-        let Some(joined) = self.run_step(
+        let Some(mut joined) = self.run_step(
             &plan.first_step,
             a,
             b,
@@ -633,6 +727,25 @@ impl PgHandler {
         else {
             return Ok(None);
         };
+        // The WHERE's join filters on the first pair, evaluated as it makes
+        // its rows (the WHERE above still decides every row).
+        let filters = WHERE_FILTERS.with(|c| c.borrow().clone());
+        for &i in &plan.first_filters {
+            let Some(f) = filters.get(i) else {
+                return Ok(None);
+            };
+            let mut kept = Vec::with_capacity(joined.rows.len());
+            for d in joined.rows {
+                let keep = matches!(
+                    secantus_pgplan::apply_row_expr(&f.expr, &d).map_err(|e| Self::err(&e))?,
+                    Bson::Boolean(true)
+                );
+                if keep {
+                    kept.push(d);
+                }
+            }
+            joined.rows = kept;
+        }
         let third = inputs.into_iter().flatten().next().expect("one table left");
         // A key's type is its base table's.
         let type_of = |key: &str| nodes.iter().find_map(|n| leaf_key_type(n, key));
