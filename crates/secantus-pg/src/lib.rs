@@ -51649,7 +51649,7 @@ fn reorder_join_inputs(
 /// `reorder_join_inputs` for a join on several clauses: each side sorted on
 /// its keys in clause order (a merge join's Sort keys), each ascending with
 /// NULLs last.
-fn reorder_join_inputs_on(
+pub(crate) fn reorder_join_inputs_on(
     method: secantus_pgplan::joincost::JoinMethod,
     left: &mut Vec<Document>,
     lf: &[String],

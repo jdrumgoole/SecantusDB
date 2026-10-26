@@ -555,7 +555,7 @@ pub enum Statement {
     DropTable(DropTable),
     /// The rows of a general JOIN, planned as a source: only ever the `plan`
     /// of a `SubSource`, never executed on its own.
-    JoinRows(joins::JoinRows),
+    JoinRows(Box<joins::JoinRows>),
     /// `EXPLAIN [ANALYZE] [(options)] <statement>`.
     Explain {
         inner: Box<Statement>,

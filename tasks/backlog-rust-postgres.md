@@ -593,9 +593,13 @@ one beside it.
     (`ExecHashGetHashValue`); 54 of 54 shapes at 20 to 3,000 rows, with a
     primary key and with NULL keys (14 before). Not yet: such a join in
     three or more tables, or FULL; an expression in a class; a LEFT join's class through the general path;
-    a class of text or other non-integer keys; three tables with a WHERE
-    equality over two of them (an equivalence class of its own), or a
-    LIMIT (a WHERE conjunct that is no equality is searched since
+    a class of text or other non-integer keys; three tables under a LIMIT
+    (a WHERE equality over two tables is a join clause since 2026-10-26,
+    the join graph a cycle where it closes one, two relations joined on
+    every clause between them, a class's clause leading, and an inner
+    join's further key pairs edges too: 14 of 14 cyclic shapes of three
+    and four tables, none before; a WHERE conjunct that is no equality is
+    searched since
     2026-10-25: the top join's join filter, or the filter of a pair joined
     first, priced with `clause_selectivity`'s defaults -- `DEFAULT_INEQ_SEL`,
     `neqjoinsel`, IS DISTINCT FROM's, `var_eq_const`'s, an OR's -- and an
@@ -606,7 +610,7 @@ one beside it.
     than 200,000 rows a side, which streams in scan order.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_where_equality_over_two_of_three_tables_is_planned
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_limit_over_three_tables_is_planned
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

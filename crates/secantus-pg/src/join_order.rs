@@ -65,6 +65,9 @@ struct Edge {
     on: usize,
 }
 
+/// An edge's `on` for a WHERE equality: no ON of the tree, an inner clause.
+const ON_WHERE: usize = usize::MAX;
+
 /// The one clause joining two relations: `a_key` of base table `a_table`
 /// in the first, `b_key` of `b_table` in the second, and the ON it is
 /// (`None` for the class's derived clause).
@@ -87,6 +90,10 @@ struct Clause {
     /// every clause when the chain has no class (as before there was
     /// one), else 1 for the class and 2 + its index for an edge.
     key_class: usize,
+    /// The other edges between the two relations, in edge order (the ONs',
+    /// then the WHERE's): `(a_key, a_table, b_key, b_table)` each, joined
+    /// on with the first as further merge or hash keys.
+    extra: Vec<(String, usize, String, usize)>,
 }
 
 /// One way a join relation was built: its two input relations, `a` first,
@@ -264,8 +271,10 @@ impl Search {
         Some(matched)
     }
 
-    /// The one clause between relations `a` and `b`; `None` when there is
-    /// none, or more than one (which the search does not model).
+    /// The clause between relations `a` and `b`, with any further edges
+    /// between them as its extra keys; `None` when there is none, or an
+    /// edge beside the class's derived clause (which the search does not
+    /// model).
     fn clause_between(&self, a: u8, b: u8) -> Option<Clause> {
         let classed = !self.class.is_empty();
         let mut found = None;
@@ -278,13 +287,16 @@ impl Search {
             } else {
                 continue;
             };
-            if found.is_some() {
-                return None;
+            if let Some(f) = found.as_mut() {
+                let f: &mut Clause = f;
+                f.extra.push(clause);
+                continue;
             }
             let (a_key, a_table, b_key, b_table) = clause;
             let member =
                 |t: usize, k: &String| self.class.iter().any(|(ct, ck)| *ct == t && ck == k);
             found = Some(Clause {
+                extra: Vec::new(),
                 a_in_class: member(a_table, &a_key),
                 b_in_class: member(b_table, &b_key),
                 a_key,
@@ -296,12 +308,16 @@ impl Search {
                 key_class: if classed { 2 + i } else { 0 },
             });
         }
-        // The class: its first member each side.
+        // The class: its first member each side, the leading clause, the
+        // edges beside it further keys (`Merge Cond: (class) AND (edge)`).
         let first = |set: u8| self.class.iter().find(|(t, _)| set & (1 << t) != 0);
         if let (Some((at, ak)), Some((bt, bk))) = (first(a), first(b)) {
-            if found.is_some() {
-                return None;
-            }
+            let extra: Vec<(String, usize, String, usize)> = match found.take() {
+                Some(f) => std::iter::once((f.a_key, f.a_table, f.b_key, f.b_table))
+                    .chain(f.extra)
+                    .collect(),
+                None => Vec::new(),
+            };
             found = Some(Clause {
                 a_key: ak.clone(),
                 a_table: *at,
@@ -312,6 +328,7 @@ impl Search {
                 a_in_class: true,
                 b_in_class: true,
                 key_class: 1,
+                extra,
             });
         }
         found
@@ -332,7 +349,13 @@ impl PgHandler {
         // join's right side is a join (a left-deep three is
         // `three_table_plan`'s).
         let bushy = joins.iter().any(|j| j.right.count_ones() > 1);
-        if !(4..=8).contains(&leaves.len()) && !(leaves.len() == 3 && bushy) {
+        // The WHERE's equalities between tables are join clauses too; with
+        // one, three tables' clauses can make a cycle, which only this
+        // search takes.
+        let where_clauses = crate::join_search::where_join_clauses().unwrap_or_default();
+        if !(4..=8).contains(&leaves.len())
+            && !(leaves.len() == 3 && (bushy || !where_clauses.is_empty()))
+        {
             return None;
         }
         let mut ons = Vec::new();
@@ -340,6 +363,7 @@ impl PgHandler {
         let mut edges = Vec::new();
         let mut reversed = Vec::new();
         let mut kinds = Vec::new();
+        let mut further: Vec<(String, String)> = Vec::new();
         let leaf_alias = |n: &JoinNode| match n {
             JoinNode::Leaf { columns, .. } => columns.first().map(|(k, _)| alias_of(k).to_string()),
             _ => None,
@@ -375,9 +399,17 @@ impl PgHandler {
             {
                 return None;
             }
-            let [(lk, rk)] = equi.as_slice() else {
+            // An inner join's further equalities (a comma join's WHERE, or
+            // an ON of several) are clauses too, added as edges below.
+            let [(lk, rk), rest @ ..] = equi.as_slice() else {
                 return None;
             };
+            if !rest.is_empty() {
+                if *kind != JoinKind::Inner || *on_other {
+                    return None;
+                }
+                further.extend(rest.iter().cloned());
+            }
             ons.push(on.as_ref());
             let side = |key: &str, set: u8| {
                 (0..leaves.len()).find(|&t| set & (1 << t) != 0 && aliases[t] == alias_of(key))
@@ -494,6 +526,29 @@ impl PgHandler {
             specials.push((min_l, min_r, w.left, w.right, false));
         }
         let outer = specials.iter().map(|&(l, r, _, _, f)| (l, r, f)).collect();
+        // The WHERE's equalities between two tables, edges of no ON (`ON_WHERE`):
+        // inner joins' clauses, the WHERE above still deciding every row.
+        for (lk, rk) in further.iter().chain(&where_clauses) {
+            let table = |key: &str| (0..leaves.len()).find(|&t| aliases[t] == alias_of(key));
+            let (u, v) = (table(lk)?, table(rk)?);
+            if u == v {
+                return None;
+            }
+            // A comma join's WHERE equality is already its join's edge.
+            let same =
+                |e: &Edge| (e.u_key == *lk && e.v_key == *rk) || (e.u_key == *rk && e.v_key == *lk);
+            if edges.iter().any(same) {
+                continue;
+            }
+            edges.push(Edge {
+                u,
+                u_key: lk.clone(),
+                v,
+                v_key: rk.clone(),
+                on: ON_WHERE,
+            });
+            reversed.push(false);
+        }
         // A column in two inner joins' clauses: the equivalence class they
         // make. An outer join's clause is not one of its members'
         // equalities (`distribute_qual_to_rels` delays it), and stays an
@@ -580,7 +635,7 @@ impl PgHandler {
         let mut classes: Vec<Vec<(usize, String)>> = Vec::new();
         let mut class_of_edge = Vec::new();
         for (e, rev) in edges.iter().zip(reversed) {
-            if kinds[e.on] != JoinKind::Inner {
+            if e.on != ON_WHERE && kinds[e.on] != JoinKind::Inner {
                 class_of_edge.push(usize::MAX);
                 continue;
             }
@@ -688,10 +743,31 @@ impl PgHandler {
         let left = outer.is_some() && !full;
         let (sa, sb) = (search.rels[a].set, search.rels[b].set);
         let clause = search.clause_between(sa, sb)?;
-        let side_a =
+        let mut side_a =
             self.search_side(search, a, &clause.a_key, clause.a_table, clause.a_in_class)?;
-        let side_b =
+        let mut side_b =
             self.search_side(search, b, &clause.b_key, clause.b_table, clause.b_in_class)?;
+        // Further clauses between the two: each side's distinct counts of
+        // their keys (`ExtraKeys`). A side in one key's order is in no
+        // order of all of them, and a merge on several keys is in an order
+        // no clause above reads.
+        if !clause.extra.is_empty() {
+            let mut keys = (Vec::new(), Vec::new());
+            for (ak, at, bk, bt) in &clause.extra {
+                let sa = self.search_side(search, a, ak, *at, false)?;
+                let sb = self.search_side(search, b, bk, *bt, false)?;
+                keys.0.push((sa.ndistinct, sa.default_ndistinct, sa.unique));
+                keys.1.push((sb.ndistinct, sb.default_ndistinct, sb.unique));
+            }
+            side_a.extra = secantus_pgplan::joincost::ExtraKeys::of(&keys.0)?;
+            side_b.extra = secantus_pgplan::joincost::ExtraKeys::of(&keys.1)?;
+            side_a.unique |= keys.0.iter().any(|k| k.2);
+            side_b.unique |= keys.1.iter().any(|k| k.2);
+            for s in [&mut side_a, &mut side_b] {
+                s.ordered = None;
+                s.scan_ordered = false;
+            }
+        }
         let set = sa | sb;
         let idx = match search.rels.iter().position(|r| r.set == set) {
             Some(i) => i,
@@ -719,7 +795,9 @@ impl PgHandler {
         // A LEFT join merged on its preserved side's class member comes out
         // in the class's order.
         let in_class = clause.class || (left && clause.a_in_class);
-        let useful = in_class && search.class.iter().any(|(t, _)| set & (1 << *t) == 0);
+        let useful = in_class
+            && (clause.extra.is_empty() || clause.class)
+            && search.class.iter().any(|(t, _)| set & (1 << *t) == 0);
         let key_class = if useful {
             if clause.class {
                 clause.key_class
@@ -901,10 +979,15 @@ impl PgHandler {
             on: None,
             filters: Vec::new(),
             batches,
+            extra: clause
+                .extra
+                .iter()
+                .map(|(ak, _, bk, _)| (ak.clone(), bk.clone()))
+                .collect(),
         };
         let type_of = |key: &str| chain.leaves.iter().find_map(|n| leaf_key_type(n, key));
         let (a_type, b_type) = (type_of(&step.a_key), type_of(&step.b_key));
-        let on = clause.on.and_then(|i| chain.ons[i]);
+        let on = clause.on.and_then(|i| chain.ons.get(i).copied().flatten());
         let Some(mut joined) = self.run_step(&step, a, b, a_type, b_type, on)? else {
             return Ok(None);
         };
@@ -917,7 +1000,7 @@ impl PgHandler {
             if !completes {
                 continue;
             }
-            if let Some(expr) = chain.ons[i] {
+            if let Some(expr) = chain.ons.get(i).copied().flatten() {
                 let mut kept = Vec::with_capacity(joined.rows.len());
                 for d in joined.rows {
                     let keep = matches!(
@@ -937,7 +1020,7 @@ impl PgHandler {
     /// Whether `node` is a chain of four to eight tables whose join order is
     /// searched.
     pub(crate) fn four_table_plan_applies(&self, node: &JoinNode) -> bool {
-        if crate::join_search::where_spans() || LOCK_ROW_IDS.with(|c| c.get()) {
+        if crate::join_search::where_join_clauses().is_none() || LOCK_ROW_IDS.with(|c| c.get()) {
             return false;
         }
         let Some((_, mut search)) = self.four_table_chain(node) else {
@@ -953,7 +1036,10 @@ impl PgHandler {
         node: &JoinNode,
         limit: Option<usize>,
     ) -> PgWireResult<Option<Vec<Document>>> {
-        if limit.is_some() || crate::join_search::where_spans() || LOCK_ROW_IDS.with(|c| c.get()) {
+        if limit.is_some()
+            || crate::join_search::where_join_clauses().is_none()
+            || LOCK_ROW_IDS.with(|c| c.get())
+        {
             return Ok(None);
         }
         let Some((chain, mut search)) = self.four_table_chain(node) else {
