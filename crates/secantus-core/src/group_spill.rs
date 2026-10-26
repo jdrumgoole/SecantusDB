@@ -17,7 +17,7 @@
 //! what mongod's `getValue(toBeMerged)` / `process(merging)` pair does.
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -157,8 +157,22 @@ impl Reader {
             return Ok(());
         }
         self.left -= 1;
+        // Each record is one BSON document: its length, then the rest.
+        let mut len = [0u8; 4];
+        self.input
+            .read_exact(&mut len)
+            .map_err(|e| io_error("read", &self.path, e))?;
+        let size = usize::try_from(i32::from_le_bytes(len))
+            .ok()
+            .filter(|n| *n >= 5)
+            .ok_or_else(|| io_error("read", &self.path, "a record with a bad length"))?;
+        let mut bytes = vec![0u8; size];
+        bytes[..4].copy_from_slice(&len);
+        self.input
+            .read_exact(&mut bytes[4..])
+            .map_err(|e| io_error("read", &self.path, e))?;
         let record =
-            Document::from_reader(&mut self.input).map_err(|e| io_error("read", &self.path, e))?;
+            crate::bsondoc::from_bytes(&bytes).map_err(|e| io_error("read", &self.path, e))?;
         let id = record
             .get("k")
             .cloned()
