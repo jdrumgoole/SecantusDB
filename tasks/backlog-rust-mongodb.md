@@ -615,8 +615,11 @@ These are explicit non-goals. Don't add them without a reason.
       10-14 points are the statistics read (about 1.5 us per session) and
       the key counting, the rest the count and write paths now running
       mongod's plan through the executor instead of the store's own count
-      or read. Levers that keep the model: read the session statistics
-      without opening a cursor; drop `count`'s third planning; let a
+      or read. Since 2026-10-27 a session keeps its `statistics:session`
+      cursor and refreshes it with a reset, so a read no longer opens one
+      (1.67 us -> 0.47 us per read, release build, `secantus-wt`); the
+      server-level A/B has not been rerun. Levers left that keep the
+      model: drop `count`'s third planning; let a
       one-document write whose plan reads in the store's order take the
       store's read. Counting only while the profiler or a low `slowms` is
       armed would be a stand-in (a slow operation under the default would

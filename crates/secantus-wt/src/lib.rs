@@ -246,6 +246,7 @@ impl Connection {
             in_txn: Cell::new(false),
             txn_end: RefCell::new(Vec::new()),
             stats: self.stats,
+            stats_cursor: RefCell::new(None),
         })
     }
 }
@@ -307,6 +308,10 @@ pub struct Session {
     txn_end: RefCell<Vec<TxnEndHook>>,
     /// Its connection keeps statistics.
     stats: bool,
+    /// Its `statistics:session` cursor, opened by the first read and kept:
+    /// a reset clears the session's statistics and makes the next step copy
+    /// them afresh, so each later read costs no cursor open (RM-365).
+    stats_cursor: RefCell<Option<Cursor>>,
 }
 
 /// A callback run once when a transaction ends: `true` for a commit.
@@ -669,25 +674,30 @@ impl Session {
         if !self.stats {
             return Ok(OperationStats::default());
         }
-        let uri = CString::new("statistics:session").map_err(nul_err)?;
-        let cfg = CString::new(if clear { "statistics=(clear)" } else { "" }).map_err(nul_err)?;
-        let open = unsafe { (*self.ptr).open_cursor }.unwrap();
-        let mut cptr: *mut sys::WT_CURSOR = ptr::null_mut();
-        check(unsafe {
-            open(
-                self.ptr,
-                uri.as_ptr(),
-                ptr::null_mut(),
-                cfg.as_ptr(),
-                &mut cptr,
-            )
-        })?;
-        let cursor = Cursor {
-            ptr: cptr,
-            key_strs_hold: RefCell::new(Vec::new()),
-            key_bytes_hold: RefCell::new(Vec::new()),
-            val_bytes_hold: RefCell::new(Vec::new()),
-        };
+        let mut held = self.stats_cursor.borrow_mut();
+        if held.is_none() {
+            // Opened without `clear`: clearing is the reset below, after the
+            // read, so the open itself loses nothing.
+            let uri = CString::new("statistics:session").map_err(nul_err)?;
+            let open = unsafe { (*self.ptr).open_cursor }.unwrap();
+            let mut cptr: *mut sys::WT_CURSOR = ptr::null_mut();
+            check(unsafe {
+                open(
+                    self.ptr,
+                    uri.as_ptr(),
+                    ptr::null_mut(),
+                    ptr::null(),
+                    &mut cptr,
+                )
+            })?;
+            *held = Some(Cursor {
+                ptr: cptr,
+                key_strs_hold: RefCell::new(Vec::new()),
+                key_bytes_hold: RefCell::new(Vec::new()),
+                val_bytes_hold: RefCell::new(Vec::new()),
+            });
+        }
+        let cursor = held.as_ref().unwrap();
         let mut out = OperationStats::default();
         while cursor.next()? {
             let key = cursor.get_key_i()?;
@@ -703,6 +713,15 @@ impl Session {
                 sys::WT_STAT_SESSION_TXN_BYTES_DIRTY => out.txn_bytes_dirty = value,
                 _ => {}
             }
+        }
+        if clear {
+            // Zeroes the session's statistics and re-reads them at the next
+            // step (`__curstat_reset`).
+            cursor.reset()?;
+        } else {
+            // Positioned at the end, the cursor would answer the next read
+            // from this copy; drop it and open afresh then.
+            drop(held.take());
         }
         Ok(out)
     }
@@ -750,6 +769,8 @@ impl Drop for Session {
                     Err(e) => eprintln!("secantus-wt: reading session statistics failed: {e}"),
                 }
             }
+            // Its cursor closes before the session that owns it.
+            drop(self.stats_cursor.get_mut().take());
             // Closing a session rolls back the transaction it is running.
             let running = self.in_txn.get();
             if let Some(close) = unsafe { (*self.ptr).close } {

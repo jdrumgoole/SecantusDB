@@ -111,3 +111,47 @@ fn a_long_lived_session_gives_each_statement_its_share() {
     drop(conn);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// One session read again and again (a transaction's, statement by
+/// statement) keeps one statistics cursor (RM-365): each read sees what the
+/// session counted since the last, then starts it over.
+#[test]
+fn each_read_of_a_session_counts_from_the_last() {
+    let home = temp_home();
+    let conn = Connection::open(home.to_str().unwrap(), CONFIG).unwrap();
+    let s = conn.open_session().unwrap();
+    s.create("table:t", "key_format=q,value_format=u").unwrap();
+    let c = s.open_cursor("table:t", None).unwrap();
+    let mut wrote = 0;
+    for round in 0..4u64 {
+        for i in 0..1024u64 {
+            let key = round * 1024 + i;
+            c.set_key_q(key as i64);
+            c.set_value_u(&noise(key, 4096));
+            c.insert().unwrap();
+        }
+        let stats = s.statistics(true).unwrap();
+        wrote += u64::from(stats.bytes_written > 0);
+        // Nothing done since: the read before cleared it all.
+        assert_eq!(
+            s.statistics(true).unwrap(),
+            OperationStats::default(),
+            "round {round}"
+        );
+    }
+    // 4 MB through a 1 MB cache each round: the writing session evicts.
+    assert!(wrote >= 3, "{wrote} of 4 rounds counted their writes");
+    // A read that does not clear leaves the counts for the next.
+    for i in 0..1024u64 {
+        c.set_key_q((5000 + i) as i64);
+        c.set_value_u(&noise(i, 4096));
+        c.insert().unwrap();
+    }
+    let kept = s.statistics(false).unwrap();
+    assert!(kept.bytes_written > 0, "{kept:?}");
+    assert_eq!(s.statistics(true).unwrap(), kept);
+    drop(c);
+    drop(s);
+    drop(conn);
+    let _ = std::fs::remove_dir_all(&home);
+}
