@@ -372,3 +372,36 @@ fn a_repair_finishes_an_unfinished_build() {
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A build over documents refuses the index types this engine does not
+/// build, as the one-step build does. It skipped the check, and a text index
+/// over a collection with documents was recorded as built (found
+/// 2026-10-27 while working RM-222).
+#[test]
+fn a_build_over_documents_refuses_a_text_index() {
+    let home = temp_home();
+    let st = Storage::open(home.to_str().unwrap()).unwrap();
+    load(&st, 3);
+    for key in [doc! {"s": "text"}, doc! {"s": "hashed"}] {
+        let refused = st.begin_index_build(
+            "app",
+            "c",
+            [9u8; 16],
+            &[spec("t", key.clone(), doc! {})],
+            "localhost:27017",
+        );
+        assert!(
+            matches!(refused, Err(StorageError::CreateIndexUnsupported(_))),
+            "{key}: {refused:?}"
+        );
+    }
+    let names: Vec<String> = st
+        .list_indexes("app", "c")
+        .unwrap()
+        .iter()
+        .map(|ix| ix.get_str("name").unwrap().to_string())
+        .collect();
+    assert_eq!(names, vec!["_id_".to_string()]);
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}

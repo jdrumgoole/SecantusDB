@@ -1445,6 +1445,24 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
             *e = doc! { "name": name, "type": ty };
         }
     }
+    // A name that is not UTF-8 is listed, and filtered, as the string of
+    // its bytes (RM-222).
+    for e in &mut entries {
+        if let Some(Bson::String(n)) = e.get("name") {
+            if n.contains('\0') {
+                let v = crate::names::name_value(n);
+                e.insert("name", v);
+            }
+        }
+        if let Some(Bson::Document(o)) = e.get_mut("options") {
+            if let Some(Bson::String(n)) = o.get("viewOn") {
+                if n.contains('\0') {
+                    let v = crate::names::name_value(n);
+                    o.insert("viewOn", v);
+                }
+            }
+        }
+    }
     if let Some(f) = filter {
         entries.retain(|e| {
             secantus_core::query::matches(e, f, &Document::new(), None).unwrap_or(false)
@@ -3715,7 +3733,7 @@ fn invalid_collection_name(db: &str, coll: &str) -> Option<CommandError> {
     if coll.is_empty() {
         return err(format!("Invalid namespace specified: {db}"));
     }
-    if coll.contains('\0') {
+    if coll.contains('\0') && crate::bsondoc::key_bytes(coll).is_none() {
         return err("namespaces cannot have embedded null characters".to_string());
     }
     if coll.starts_with('.') {

@@ -130,23 +130,41 @@ pub(crate) struct Parsed {
 /// mongod's message, default a missing time of day, and refuse a string
 /// missing any date or time part. Returns the parsed time, ready for the
 /// caller's zone handling and `update_ts`.
+#[cfg(test)]
 pub(crate) fn mongo_parse(text: &str) -> Result<Time, String> {
-    from_string(text, strtotime(text.as_bytes()))
+    mongo_parse_bytes(text.as_bytes())
+}
+
+/// [`mongo_parse`] over a string's bytes, which may not be UTF-8 (RM-222):
+/// timelib reads bytes, and mongod's message quotes them.
+pub(crate) fn mongo_parse_bytes(text: &[u8]) -> Result<Time, String> {
+    from_string(text, strtotime(text))
 }
 
 /// The same with a `format`: `timelib_parse_from_format_with_map` under
 /// mongod's map, then the same wrapper. The caller has already validated the
 /// format with [`validate_format`].
-pub(crate) fn mongo_parse_format(text: &str, format: &str) -> Result<Time, String> {
-    from_string(
-        text,
-        format::parse_from_format(format.as_bytes(), text.as_bytes()),
-    )
+pub(crate) fn mongo_parse_format(text: &[u8], format: &str) -> Result<Time, String> {
+    from_string(text, format::parse_from_format(format.as_bytes(), text))
 }
 
 /// `TimeZoneDatabase::fromString` after the timelib call.
-fn from_string(text: &str, parsed: Parsed) -> Result<Time, String> {
+///
+/// The message quotes the string and each offending character as mongod
+/// does, byte for byte: when the string is not UTF-8, its bytes and every
+/// byte above ASCII are written escaped (`bsondoc::message_escape`), which the
+/// reply turns back into those bytes (RM-222).
+fn from_string(bytes: &[u8], parsed: Parsed) -> Result<Time, String> {
     if !parsed.errors.is_empty() || !parsed.warnings.is_empty() {
+        let valid = std::str::from_utf8(bytes).is_ok();
+        let text = crate::bsondoc::message_escape(bytes);
+        let character = |c: u8| -> String {
+            if valid || c < 0x80 {
+                (c as char).to_string()
+            } else {
+                crate::bsondoc::message_escape(&[c])
+            }
+        };
         let mut sb = format!("Error parsing date string '{text}'");
         for e in &parsed.errors {
             sb.push_str(&format!("; {}: ", e.position));
@@ -157,12 +175,14 @@ fn from_string(text: &str, parsed: Parsed) -> Result<Time, String> {
             } else {
                 sb.push_str(e.message);
             }
-            sb.push_str(&format!(" '{}'", e.character as char));
+            sb.push_str(&format!(" '{}'", character(e.character)));
         }
         for w in &parsed.warnings {
             sb.push_str(&format!(
                 "; {}: {} '{}'",
-                w.position, w.message, w.character as char
+                w.position,
+                w.message,
+                character(w.character)
             ));
         }
         return Err(sb);
@@ -177,7 +197,8 @@ fn from_string(text: &str, parsed: Parsed) -> Result<Time, String> {
     }
     if [t.y, t.m, t.d, t.h, t.i, t.s].contains(&UNSET) {
         return Err(format!(
-            r#"an incomplete date/time string has been found, with elements missing: "{text}""#
+            r#"an incomplete date/time string has been found, with elements missing: "{}""#,
+            crate::bsondoc::message_escape(bytes)
         ));
     }
     Ok(t)

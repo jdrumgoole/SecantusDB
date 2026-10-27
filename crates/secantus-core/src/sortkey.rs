@@ -427,6 +427,19 @@ pub fn encode_value(v: &Bson, coll: Option<&Collation>) -> Result<Vec<u8>, Unsup
     // orders them. Under a collation it folds as the text with each invalid
     // sequence replaced, which may equal another string's key; the exact
     // match pass rechecks every index candidate.
+    // A text-carrying value whose text is not UTF-8: its type's rank, then
+    // its text (RM-222). A DBPointer has no key, as any other has none.
+    if let Some((t, raw)) = crate::bsondoc::as_raw_text(v) {
+        out.push(match t {
+            0x0B => RANK_REGEX,
+            0x0D => RANK_JAVASCRIPT,
+            0x0E => RANK_STRING,
+            0x0F => RANK_JAVASCRIPT_SCOPE,
+            _ => return Err(UnsupportedValue("a DBPointer".into())),
+        });
+        out.extend(escape(crate::bsondoc::raw_text_bytes(t, raw)));
+        return Ok(out);
+    }
     if let Some(bytes) = crate::bsondoc::as_invalid_utf8(v) {
         out.push(RANK_STRING);
         match coll {
