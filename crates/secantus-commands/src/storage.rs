@@ -422,6 +422,20 @@ pub trait Storage: Send + Sync {
         None
     }
 
+    /// The time of the first entry the transaction this thread last
+    /// committed logged, once; `None` when it logged none.
+    fn take_last_commit_ts(&self) -> Option<bson::Timestamp> {
+        None
+    }
+
+    /// Write this thread's writes without oplog entries while the returned
+    /// guard lives: what mongod keeps beside the oplog rather than in it (a
+    /// `findAndModify`'s retry image, a session's `config.transactions`
+    /// row).
+    fn unreplicated(&self) -> Option<Box<dyn std::any::Any>> {
+        None
+    }
+
     /// A high-water-mark resume token at oplog `seq` and the current cluster
     /// time, encoded as `bson::encode({_data: "<hex>"})`. Returned as the
     /// `postBatchResumeToken` of an empty change-stream batch so the client can

@@ -209,7 +209,21 @@ pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     response.insert("maxMessageSizeBytes", MAX_MESSAGE_SIZE);
     response.insert("maxWriteBatchSize", 100_000_i32);
     response.insert("localTime", now);
-    response.insert("logicalSessionTimeoutMinutes", 30_i32);
+    // `localLogicalSessionTimeoutMinutes`, which the server may have been
+    // started with.
+    let timeout =
+        ctx.server_params
+            .as_ref()
+            .map_or(crate::logical_sessions::DEFAULT_TIMEOUT_MINUTES, |p| {
+                p.number(
+                    "localLogicalSessionTimeoutMinutes",
+                    crate::logical_sessions::DEFAULT_TIMEOUT_MINUTES,
+                )
+            });
+    response.insert(
+        "logicalSessionTimeoutMinutes",
+        i32::try_from(timeout).unwrap_or(i32::MAX),
+    );
     // An int32, as mongod sends it; a driver reads either width.
     response.insert("connectionId", ctx.connection_id as i32);
     response.insert("minWireVersion", 0_i32);

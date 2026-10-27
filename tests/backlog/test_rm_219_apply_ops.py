@@ -375,11 +375,13 @@ def _bulk_write_entries(client: Any) -> list:
     return entries
 
 
-@pytest.mark.backlog("RM-224")
+@pytest.mark.backlog_fixed("RM-224")
 def test_bulk_write_entries_carry_their_session(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
     """mongod 8.2.11 stamps a retryable `bulkWrite`'s entries with its
     session (`lsid`, `txnNumber`, `stmtId`, `prevOpTime`), as it does a
-    retryable insert's or update's; this server writes them bare."""
+    retryable insert's or update's; this server wrote them bare until
+    2026-10-27 (`tests/mongod_live/test_logical_sessions.py` compares more
+    shapes)."""
     assert _bulk_write_entries(rust_mongo) == _bulk_write_entries(mongod_rs)
 
 

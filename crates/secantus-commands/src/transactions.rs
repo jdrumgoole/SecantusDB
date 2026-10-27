@@ -869,6 +869,26 @@ impl TransactionRegistry {
         }
     }
 
+    /// The logical session reaper deleted the session's `config.transactions`
+    /// row: forget what its retryable writes and ended transactions did, as
+    /// mongod's session catalog does when the row goes, so a retry of one
+    /// runs it again (measured 8.2.11, 2026-10-27). A transaction still in
+    /// progress keeps its session.
+    pub fn forget_session(&self, lsid_bytes: &[u8]) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let in_progress = match inner.sessions.get(lsid_bytes) {
+            Some(Session {
+                kind: Kind::Txn(c), ..
+            }) => c
+                .try_lock()
+                .map_or(true, |t| t.state == TxnState::InProgress),
+            _ => false,
+        };
+        if !in_progress {
+            inner.sessions.remove(lsid_bytes);
+        }
+    }
+
     /// `killSessions`: abort the session's in-progress transaction.
     pub fn abort_for_session(&self, lsid_bytes: &[u8]) {
         let txn = match self

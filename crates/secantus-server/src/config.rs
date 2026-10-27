@@ -97,6 +97,9 @@ pub struct ResolvedConfig {
     pub tls_key_file: Option<String>,
     pub tls_ca_file: Option<String>,
     pub tls_require_client_cert: bool,
+
+    /// `--setParameter name=value`, as given (checked by `CliArgs`).
+    pub set_parameters: Vec<String>,
 }
 
 impl Default for ResolvedConfig {
@@ -129,6 +132,7 @@ impl Default for ResolvedConfig {
             tls_key_file: None,
             tls_ca_file: None,
             tls_require_client_cert: false,
+            set_parameters: Vec::new(),
         }
     }
 }
@@ -165,6 +169,7 @@ pub struct ConfigOverrides {
     pub tls_key_file: Option<String>,
     pub tls_ca_file: Option<String>,
     pub tls_require_client_cert: Option<bool>,
+    pub set_parameters: Option<Vec<String>>,
 }
 
 impl ConfigOverrides {
@@ -222,6 +227,9 @@ impl ConfigOverrides {
         }
         if let Some(v) = &self.block_compressor {
             base.block_compressor = Some(v.clone());
+        }
+        if let Some(v) = &self.set_parameters {
+            base.set_parameters.extend(v.iter().cloned());
         }
         if let Some(v) = &self.tls_cert_file {
             base.tls_cert_file = Some(v.clone());

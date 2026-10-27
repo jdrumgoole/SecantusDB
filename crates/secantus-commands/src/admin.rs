@@ -4665,16 +4665,20 @@ fn global_lock(
     }
 }
 
-/// `logicalSessionRecordCache`: the sessions in use (what
-/// `$listLocalSessions` lists) and the sessions holding transaction or
-/// retryable-write state. mongod's other fields time its periodic refresh of
-/// `config.system.sessions`, which this server does not run.
+/// `logicalSessionRecordCache`: the sessions in use since the last refresh
+/// (what `$listLocalSessions` lists), what the cache's refresh and the
+/// transaction reaper last did (`logical_sessions`), and the sessions
+/// holding transaction or retryable-write state.
 fn logical_session_record_cache(ctx: &CommandContext) -> Document {
-    let active = ctx.server_params.as_ref().map_or(0, |p| p.sessions().len());
     let catalog = ctx.transactions.as_ref().map_or(0, |t| t.session_count());
-    doc! {
-        "activeSessionsCount": active as i32,
-        "sessionCatalogSize": catalog as i32,
+    match ctx.server_params.as_ref() {
+        Some(p) => p
+            .logical_sessions()
+            .server_status(p.sessions().len(), catalog),
+        None => doc! {
+            "activeSessionsCount": 0_i32,
+            "sessionCatalogSize": catalog as i32,
+        },
     }
 }
 

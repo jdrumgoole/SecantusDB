@@ -1153,35 +1153,20 @@ fn retryable_write(
         Err(reply) => return reply,
     };
     registry.set_owner(lsid, user_digest(&authenticated(ctx)));
-    // A retryable insert, update or delete names its session and statements
-    // in its oplog entries, as mongod's do (RM-224).
+    // A retryable write names its session and statements in its oplog
+    // entries, as mongod's do (RM-224); a `bulkWrite` names each op's
+    // statement as it runs it (`bulkwrite::bulk_write`).
     let fam = matches!(name, "findAndModify" | "findandmodify");
-    let stamped = fam || matches!(name, "insert" | "update" | "delete");
-    let session = doc! {
-        "id": bson::Binary { subtype: bson::spec::BinarySubtype::Uuid, bytes: lsid.to_vec() },
-        "uid": bson::Binary {
-            subtype: bson::spec::BinarySubtype::Generic,
-            bytes: user_digest(&authenticated(ctx)),
-        },
-    };
-    if stamped {
-        let session = doc! {
-            "id": bson::Binary { subtype: bson::spec::BinarySubtype::Uuid, bytes: lsid.to_vec() },
-            "uid": bson::Binary {
-                subtype: bson::spec::BinarySubtype::Generic,
-                bytes: user_digest(&authenticated(ctx)),
-            },
-        };
-        if let (Some(s), Ok(bytes)) = (ctx.storage.as_ref(), crate::bsondoc::to_vec(&session)) {
-            s.set_statement_position(None);
-            s.set_retryable_session(Some((bytes, txn_number, ids.clone())));
-            if fam {
-                // A `findAndModify` is one statement, and names the image a
-                // retry of it returns.
-                s.set_statement_position(Some(0));
-                s.set_retry_image(Some(doc.get("new").is_some_and(crate::util::truthy)));
-                s.take_last_retryable_ts();
-            }
+    let session = logical_session_id(lsid, &authenticated(ctx));
+    if let (Some(s), Ok(bytes)) = (ctx.storage.as_ref(), crate::bsondoc::to_vec(&session)) {
+        s.set_statement_position(None);
+        s.set_retryable_session(Some((bytes, txn_number, ids.clone())));
+        s.take_last_retryable_ts();
+        if fam {
+            // A `findAndModify` is one statement, and names the image a
+            // retry of it returns.
+            s.set_statement_position(Some(0));
+            s.set_retry_image(Some(doc.get("new").is_some_and(crate::util::truthy)));
         }
     }
     let (mut reply, records) = match name {
@@ -1193,21 +1178,93 @@ fn retryable_write(
         }
         _ => (crate::run_handler(handler, doc, ctx), Vec::new()),
     };
-    if stamped {
-        if let Some(s) = ctx.storage.as_ref() {
-            s.set_retryable_session(None);
-            s.set_statement_position(None);
-            s.set_insert_positions(None);
-            s.set_retry_image(None);
-            if fam {
-                if let Err(e) = keep_retry_image(s.as_ref(), doc, &reply, session, txn_number) {
-                    reply = e.into_reply();
-                }
+    if let Some(s) = ctx.storage.as_ref() {
+        s.set_retryable_session(None);
+        s.set_statement_position(None);
+        s.set_insert_positions(None);
+        s.set_retry_image(None);
+        // The time of the last entry this write logged, if it logged any.
+        if let Some(ts) = s.take_last_retryable_ts() {
+            pin_operation_time(&mut reply, ctx.replica_set_name.is_some(), s.as_ref());
+            let kept = if fam {
+                keep_retry_image(s.as_ref(), doc, &reply, session.clone(), txn_number, ts)
+            } else {
+                Ok(())
+            };
+            let kept = kept.and_then(|()| {
+                record_session_transaction(s.as_ref(), session, txn_number, ts, None)
+            });
+            if let Err(e) = kept {
+                reply = e.into_reply();
             }
         }
     }
     registry.record_statements(lsid, txn_number, records);
     reply
+}
+
+/// Pin a reply's `operationTime` to the cluster time now, before the
+/// command keeps what mongod keeps beside the oplog (a session's row, a
+/// retry image): those writes log nothing, but committing them moves the
+/// clock on, and a client that starts a change stream at the
+/// `operationTime` would miss the command's own write (mongod 8.2.11
+/// answers the time of that write). A member of a replica set only: a
+/// standalone sends no `operationTime`.
+pub(crate) fn pin_operation_time(reply: &mut Document, member: bool, storage: &dyn crate::Storage) {
+    if member && !reply.contains_key("operationTime") {
+        reply.insert("operationTime", storage.peek_cluster_time());
+    }
+}
+
+/// The logical session mongod records a session's writes under: the id the
+/// client sent and the SHA-256 of `user@db` (of the empty string for no
+/// user, mongod 8.2.11).
+pub(crate) fn logical_session_id(id: &[u8], users: &[(String, String)]) -> Document {
+    doc! {
+        "id": bson::Binary { subtype: bson::spec::BinarySubtype::Uuid, bytes: id.to_vec() },
+        "uid": bson::Binary {
+            subtype: bson::spec::BinarySubtype::Generic,
+            bytes: user_digest(users),
+        },
+    }
+}
+
+/// Keep the session's row in `config.transactions`, as mongod 8.2.11 keeps
+/// it once a retryable write or a transaction of the session has logged a
+/// write: `{_id: lsid, txnNum, lastWriteOpTime: {ts, t}, lastWriteDate}`,
+/// and `state: "committed"` for a transaction. The row is written without
+/// an oplog entry (mongod derives it from the entries), and is what the
+/// logical session reaper deletes once the session has expired
+/// (`logical_sessions::reap`). A write that logged nothing leaves the row as
+/// it was.
+pub(crate) fn record_session_transaction(
+    storage: &dyn crate::Storage,
+    lsid: Document,
+    txn_number: i64,
+    ts: bson::Timestamp,
+    state: Option<&str>,
+) -> Result<(), CommandError> {
+    let mut row = doc! {
+        "_id": lsid.clone(),
+        "txnNum": txn_number,
+        "lastWriteOpTime": {"ts": ts, "t": 1_i64},
+        "lastWriteDate": bson::DateTime::now(),
+    };
+    if let Some(state) = state {
+        row.insert("state", state);
+    }
+    let _unreplicated = storage.unreplicated();
+    storage
+        .update_matching(
+            "config",
+            "transactions",
+            &doc! {"_id": lsid},
+            &row,
+            false,
+            true,
+        )
+        .map_err(crate::util::command_error)?;
+    Ok(())
 }
 
 /// Keep a retryable `findAndModify`'s image where mongod 8.2.11 keeps it:
@@ -1221,6 +1278,7 @@ fn keep_retry_image(
     reply: &Document,
     lsid: Document,
     txn_number: i64,
+    ts: bson::Timestamp,
 ) -> Result<(), CommandError> {
     if !ok(reply) {
         return Ok(());
@@ -1229,9 +1287,6 @@ fn keep_retry_image(
         .get_document("lastErrorObject")
         .is_ok_and(|l| l.contains_key("upserted"));
     let Some(Bson::Document(image)) = reply.get("value") else {
-        return Ok(());
-    };
-    let Some(ts) = storage.take_last_retryable_ts() else {
         return Ok(());
     };
     if upserted {
@@ -1248,7 +1303,8 @@ fn keep_retry_image(
         "invalidated": false,
     };
     // mongod writes the image in the command's own unit of work, so a
-    // failure to keep it fails the command.
+    // failure to keep it fails the command; it logs no entry for it.
+    let _unreplicated = storage.unreplicated();
     storage
         .update_matching(
             "config",
