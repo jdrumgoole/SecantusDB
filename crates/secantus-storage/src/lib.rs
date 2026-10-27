@@ -5573,7 +5573,7 @@ fn note_written_entries(entries: &[OplogEntry]) {
     for e in entries {
         let (op, name) = match e {
             OplogEntry::Doc(d) => (d.get_str("op").ok(), d.get_str("ns").ok()),
-            OplogEntry::Raw(r) => (r.get_str("op").ok(), r.get_str("ns").ok()),
+            OplogEntry::Raw(r) => raw_op_ns(r),
         };
         let changed = match op {
             Some("i") => false,
@@ -5612,6 +5612,40 @@ fn note_written_entries(entries: &[OplogEntry]) {
             }
         });
     }
+}
+
+/// A raw entry's `op` and `ns` strings, as `get_str` reads them (the first
+/// field of each name, `None` when it is missing or not a string). The
+/// entries a write builds lead with the two (`oplog_entry_crud`), which are
+/// read here straight off the bytes; an entry that does not -- a non-string
+/// field before both are found -- is read field by field as before (RP-014).
+fn raw_op_ns(r: &bson::RawDocumentBuf) -> (Option<&str>, Option<&str>) {
+    fn leading(b: &[u8]) -> Option<(Option<&str>, Option<&str>)> {
+        let (mut op, mut ns) = (None, None);
+        let mut at = 4usize;
+        while op.is_none() || ns.is_none() {
+            // A string element: its type, its key, its length, its bytes.
+            if *b.get(at)? != 0x02 {
+                return None;
+            }
+            let key_start = at + 1;
+            let key_len = b.get(key_start..)?.iter().position(|c| *c == 0)?;
+            let key = &b[key_start..key_start + key_len];
+            let len_at = key_start + key_len + 1;
+            let len = i32::from_le_bytes(b.get(len_at..len_at + 4)?.try_into().ok()?);
+            let len = usize::try_from(len).ok().filter(|n| *n >= 1)?;
+            let value = b.get(len_at + 4..len_at + 4 + len - 1)?;
+            let value = std::str::from_utf8(value).ok()?;
+            match key {
+                b"op" if op.is_none() => op = Some(value),
+                b"ns" if ns.is_none() => ns = Some(value),
+                _ => {}
+            }
+            at = len_at + 4 + len;
+        }
+        Some((op, ns))
+    }
+    leading(r.as_bytes()).unwrap_or_else(|| (r.get_str("op").ok(), r.get_str("ns").ok()))
 }
 
 /// The collection a [`WrittenRow`]'s collection part names (an `_id` key's
@@ -22527,9 +22561,18 @@ pub fn take_last_retryable_ts() -> Option<bson::Timestamp> {
     LAST_RETRYABLE_TS.with(|t| t.take())
 }
 
+/// Has any entry of this process been given an `rw` stamp? A raw entry gets
+/// one only from [`retryable_stamp`], which sets this first, on the thread
+/// that then appends it; until then no raw entry can hold one, and
+/// [`has_retryable_stamp`] need not read through each entry's fields (the
+/// whole stored document among them) to find none (RP-014).
+static RW_STAMPED: AtomicBool = AtomicBool::new(false);
+
 fn has_retryable_stamp(e: &OplogEntry) -> bool {
     match e {
-        OplogEntry::Raw(buf) => buf.get("rw").ok().flatten().is_some(),
+        OplogEntry::Raw(buf) => {
+            RW_STAMPED.load(Ordering::Relaxed) && buf.get("rw").ok().flatten().is_some()
+        }
         OplogEntry::Doc(d) => d.contains_key("rw"),
     }
 }
@@ -22568,6 +22611,7 @@ fn retryable_stamp(position: usize) -> Option<bson::RawDocumentBuf> {
         let s = s.borrow();
         let (lsid, txn, ids) = s.as_ref()?;
         let id = *ids.get(position)?;
+        RW_STAMPED.store(true, Ordering::Relaxed);
         let mut rw = bson::RawDocumentBuf::new();
         rw.append("lsid", bson::RawDocumentBuf::from_document(lsid).ok()?);
         rw.append("txnNumber", *txn);

@@ -1078,6 +1078,45 @@ impl BTree {
         }
     }
 
+    /// [`Self::descend`] without the heap TID (`i64::MIN`, `_bt_search`
+    /// with no `scantid`, as a unique insert first searches), and whether
+    /// the TID could have taken any other way down: only a pivot whose
+    /// every key attribute equals `key` and which keeps a heap TID compares
+    /// differently for different TIDs, and such pivots sort together right
+    /// where the TID-less search stops on each page. When no page on the way
+    /// has one there, a search WITH any TID lands on the same leaf by the
+    /// same path -- what `_bt_findinsertloc` finds by stepping right from
+    /// the leaf the unique check began at, without a second descent
+    /// (RP-014).
+    fn descend_tidless(&self, shape: &dyn Shape, key: &[Bson]) -> (u32, Vec<u32>, bool) {
+        let n = shape.nkeyatts();
+        let mut path = Vec::new();
+        let mut tid_free = true;
+        let mut at = self.root.expect("a root");
+        loop {
+            match &self.pages[at as usize] {
+                Page::Internal { items, .. } => {
+                    path.push(at);
+                    let after = items[1..].partition_point(|d| {
+                        cmp_pivot(shape, key, i64::MIN, &d.pivot) != Ordering::Less
+                    });
+                    if let Some(next) = items.get(after + 1) {
+                        let p = &next.pivot;
+                        if p.tid.is_some()
+                            && p.key.len() >= n
+                            && key.len() >= n
+                            && (0..n).all(|a| shape.cmp_attr(a, &key[a], &p.key[a]) == Ordering::Equal)
+                        {
+                            tid_free = false;
+                        }
+                    }
+                    at = items[after].child;
+                }
+                _ => return (at, path, tid_free),
+            }
+        }
+    }
+
     /// Every heap TID inserting `key` (with heap `tid`) can ask the heap
     /// about: the equal tuples `_bt_check_unique` passes (a unique index),
     /// and every tuple on the leaf the insert lands on, which simple and
@@ -1101,8 +1140,15 @@ impl BTree {
         if self.root.is_none() {
             return out;
         }
+        // The leaf the insert lands on, when the TID-less search already
+        // found it (`descend_tidless`).
+        let mut landed = None;
         if shape.unique() {
-            let (mut page, _) = self.descend(shape, key, i64::MIN);
+            let (first, _, tid_free) = self.descend_tidless(shape, key);
+            if tid_free {
+                landed = Some(first);
+            }
+            let mut page = first;
             while let Page::Leaf { items, right, .. } = &self.pages[page as usize] {
                 let mut last_equal = false;
                 // The items are in key order: the equal run starts where the
@@ -1128,7 +1174,7 @@ impl BTree {
                 }
             }
         }
-        let (leaf, _) = self.descend(shape, key, tid);
+        let leaf = landed.unwrap_or_else(|| self.descend(shape, key, tid).0);
         let cached = self.used.get(leaf as usize).copied().filter(|u| *u >= 0);
         if let Page::Leaf { items, high, .. } = &self.pages[leaf as usize] {
             let free = match cached {
@@ -1155,12 +1201,22 @@ impl BTree {
     /// marked LP_DEAD as the check passes it. Returns that leftmost leaf:
     /// marking changes no page's place, so it is where a search without the
     /// heap TID still lands.
-    fn check_unique(&mut self, shape: &dyn Shape, key: &[Bson], dead: &dyn Fn(i64) -> bool) -> u32 {
-        let (first, _) = self.descend(shape, key, i64::MIN);
+    ///
+    /// With it, the TID-less search's path and whether a search with any
+    /// heap TID takes the same one (`descend_tidless`): marking changes no
+    /// page's place, so that leaf and path are where the insert goes.
+    fn check_unique(
+        &mut self,
+        shape: &dyn Shape,
+        key: &[Bson],
+        dead: &dyn Fn(i64) -> bool,
+    ) -> (u32, Vec<u32>, bool) {
+        let (first, path, tid_free) = self.descend_tidless(shape, key);
+        let done = (first, path, tid_free);
         let mut page = first;
         loop {
             let Page::Leaf { items, right, .. } = &mut self.pages[page as usize] else {
-                return first;
+                return done;
             };
             let mut marked = false;
             let mut last_equal = false;
@@ -1189,7 +1245,7 @@ impl BTree {
             }
             match next {
                 Some(r) if last_equal => page = r,
-                _ => return first,
+                _ => return done,
             }
         }
     }
@@ -1240,8 +1296,14 @@ impl BTree {
             self.ssi_events.push(SsiEvent::Landed(root));
             return;
         }
-        let unique_first = shape.unique().then(|| self.check_unique(shape, &key, dead));
-        let (leaf, path) = self.descend(shape, &key, tid);
+        let (unique_first, reuse) = match shape.unique().then(|| self.check_unique(shape, &key, dead)) {
+            Some((first, path, tid_free)) => (Some(first), tid_free.then_some((first, path))),
+            None => (None, None),
+        };
+        let (leaf, path) = match reuse {
+            Some(found) => found,
+            None => self.descend(shape, &key, tid),
+        };
         // The page `_bt_search` lands on, which SSI checks: without the heap
         // TID for a unique index (the first the key could be on) -- the
         // leaf the unique check began at, which its marks did not move.

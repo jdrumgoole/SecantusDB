@@ -3874,10 +3874,19 @@ pub struct PgHandler {
     /// portal) is planned once rather than twice. Valid while the catalog
     /// version, the session's settings and its role are what they were.
     describe_cache: Mutex<HashMap<DescribeKey, DescribeEntry>>,
+    /// The `describe_cache` entry last answered from, compared in place:
+    /// a pipeline describes one statement again and again, and building
+    /// and hashing its key copied the whole text each time (RP-014).
+    describe_last: Mutex<Option<(DescribeKey, DescribeEntry)>>,
     /// Plan templates by statement text, parameter types and the BSON types
     /// of the values (see `plan_cache`): an Execute whose statement has one
     /// substitutes its values instead of planning again.
     plan_cache: Mutex<HashMap<PlanKey, PlanEntry>>,
+    /// The `plan_cache` entry last used, compared in place with the next
+    /// Execute's text, types and values (RP-014): building and hashing the
+    /// key copied the whole text each time. Cleared whenever the cache
+    /// changes, so it is always one of its entries.
+    plan_last: Mutex<Option<(PlanKey, PlanEntry)>>,
     /// Hashes of the plan keys this session has planned once. A template is
     /// learned when a key comes round a SECOND time: learning plans the
     /// statement twice more, which a statement sent once never earns back --
@@ -4563,7 +4572,9 @@ impl PgHandler {
             session_lastval: Mutex::new(None),
             session_lastval_seq: Mutex::new(None),
             describe_cache: Mutex::new(HashMap::new()),
+            describe_last: Mutex::new(None),
             plan_cache: Mutex::new(HashMap::new()),
+            plan_last: Mutex::new(None),
             plan_seen: Mutex::new(std::collections::HashSet::new()),
             stream_request: std::sync::atomic::AtomicU8::new(0),
             cascade_capture: Mutex::new(None),
@@ -24453,7 +24464,7 @@ type DescribeKey = (String, usize, Vec<Option<String>>, bool);
 type PlanKey = (String, Vec<Option<String>>, Vec<u8>);
 /// `(catalog version, settings generation, role, the template -- its
 /// stand-in values and plan -- or None when the statement is not templated)`.
-type PlanEntry = (u64, u64, String, Option<(Vec<Bson>, Statement)>);
+type PlanEntry = (u64, u64, String, Option<Arc<(Vec<Bson>, Statement)>>);
 /// `(catalog version, settings generation, role, fields)`.
 type DescribeEntry = (u64, u64, String, Option<Vec<FieldInfo>>);
 
@@ -31252,10 +31263,21 @@ impl PgHandler {
         let _ = secantus_pgplan::take_error_location();
         // A statement run before with values of the same types reuses its
         // plan, the values substituted (`plan_cache`).
-        let plan_key = self.plan_key(sql, params, param_types);
-        let templated = plan_key
-            .as_ref()
-            .and_then(|k| self.templated_plan(k, params));
+        // The template last used first, compared in place (RP-014); the
+        // key is built only when that is not it.
+        let keyable = self.pending.tables().is_empty() && self.pending.types().is_empty();
+        let templated = keyable
+            .then(|| self.templated_plan_last(sql, params, param_types))
+            .flatten();
+        let plan_key = match templated {
+            Some(_) => None,
+            None => self.plan_key(sql, params, param_types),
+        };
+        let templated = templated.or_else(|| {
+            plan_key
+                .as_ref()
+                .and_then(|k| self.templated_plan(k, params))
+        });
         // An unprepared statement carries its values in its text: it is
         // looked up by the text with those taken out.
         let family = match (&plan_key, &templated) {
@@ -49739,12 +49761,66 @@ impl PgHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .generation();
-        let cache = self.plan_cache.lock().unwrap_or_else(|e| e.into_inner());
-        let (v, g, role, template) = cache.get(key)?;
-        if *v != version || *g != generation {
-            return None;
-        }
-        let (stand_ins, plan) = template.as_ref()?;
+        let (role, template) = {
+            let cache = self.plan_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = cache.get(key)?;
+            let (v, g, role, template) = entry;
+            if *v != version || *g != generation {
+                return None;
+            }
+            let template = Arc::clone(template.as_ref()?);
+            *self.plan_last.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((key.clone(), entry.clone()));
+            (role.clone(), template)
+        };
+        self.substitute_template(&role, &template, params)
+    }
+
+    /// [`Self::templated_plan`] for the key of `sql`, `param_types` and
+    /// `params`, answered from `plan_last` -- `None` when that holds
+    /// another key, or no template valid now.
+    fn templated_plan_last(
+        &self,
+        sql: &str,
+        params: &[Bson],
+        param_types: &[Option<String>],
+    ) -> Option<Statement> {
+        let version = catalog_cache()
+            .version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let generation = self
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation();
+        let (role, template) = {
+            let last = self.plan_last.lock().unwrap_or_else(|e| e.into_inner());
+            let ((k_sql, k_types, k_tags), (v, g, role, template)) = last.as_ref()?;
+            let same_key = k_sql == sql
+                && k_types.as_slice() == param_types
+                && k_tags.len() == params.len()
+                && k_tags
+                    .iter()
+                    .zip(params)
+                    .all(|(t, p)| *t == p.element_type() as u8);
+            if !same_key || *v != version || *g != generation {
+                return None;
+            }
+            (role.clone(), Arc::clone(template.as_ref()?))
+        };
+        self.substitute_template(&role, &template, params)
+    }
+
+    /// A valid template's plan with `params` substituted: `None` when they
+    /// do not fit its stand-ins or the role is not the one it was learned
+    /// for.
+    fn substitute_template(
+        &self,
+        role: &str,
+        template: &(Vec<Bson>, Statement),
+        params: &[Bson],
+    ) -> Option<Statement> {
+        let (stand_ins, plan) = template;
         if !plan_cache::fits(params, stand_ins) {
             return None;
         }
@@ -49785,7 +49861,7 @@ impl PgHandler {
         if *v != version || *g != generation || *role != self.current_role_name() {
             return None;
         }
-        let (stand_ins, plan) = template.as_ref()?;
+        let (stand_ins, plan) = &**template.as_ref()?;
         let values = plan_cache::as_kinds_of(&family.values, stand_ins)?;
         plan_cache::substitute(plan, stand_ins, &values)
     }
@@ -49918,9 +49994,10 @@ impl PgHandler {
             if !storable {
                 return None;
             }
-            plan_cache::is_template(&plan_a, &plan_b, &a, &b).then_some((a, plan_a))
+            plan_cache::is_template(&plan_a, &plan_b, &a, &b).then(|| Arc::new((a, plan_a)))
         })();
         let mut cache = self.plan_cache.lock().unwrap_or_else(|e| e.into_inner());
+        *self.plan_last.lock().unwrap_or_else(|e| e.into_inner()) = None;
         if cache.len() >= 256 {
             cache.clear();
         }
@@ -49972,16 +50049,34 @@ impl PgHandler {
         let binary = self
             .binary_results
             .load(std::sync::atomic::Ordering::Relaxed);
+        let valid = |(v, g, r, _): &DescribeEntry| {
+            *v == catalog_version && *g == generation && *r == role
+        };
+        {
+            let last = self.describe_last.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((k, entry)) = last.as_ref() {
+                if k.0 == sql
+                    && k.1 == n_params
+                    && k.2.as_slice() == param_types
+                    && k.3 == binary
+                    && valid(entry)
+                {
+                    return Ok(entry.3.clone());
+                }
+            }
+        }
         let key: DescribeKey = (sql.to_string(), n_params, param_types.to_vec(), binary);
-        if let Some((v, g, r, fields)) = self
+        let hit = self
             .describe_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&key)
-        {
-            if *v == catalog_version && *g == generation && *r == role {
-                return Ok(fields.clone());
-            }
+            .filter(|entry| valid(entry))
+            .cloned();
+        if let Some(entry) = hit {
+            let fields = entry.3.clone();
+            *self.describe_last.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, entry));
+            return Ok(fields);
         }
         let ran_subquery = std::cell::Cell::new(false);
         let params = vec![Bson::Null; n_params];
