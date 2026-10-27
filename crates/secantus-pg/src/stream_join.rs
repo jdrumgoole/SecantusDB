@@ -677,6 +677,7 @@ impl PgHandler {
                     params,
                     keys,
                     columns,
+                    scan,
                 } = right.as_ref()
                 else {
                     return Err(Self::err(&PlanError::Internal("a LATERAL side".into())));
@@ -694,6 +695,7 @@ impl PgHandler {
                         params,
                         keys,
                         columns,
+                        scan.as_deref(),
                         *kind,
                         on.as_ref(),
                         merged,

@@ -991,6 +991,11 @@ pub fn has_correlated(expr: &ColumnExpr) -> bool {
 /// Is `name` a user-defined function at SOME arity? A call at another arity
 /// is then PostgreSQL's 42883, not an unimplemented built-in.
 pub(crate) fn user_function_named(name: &str) -> bool {
+    // With no user function there is nothing to look for, and no search
+    // path to work out (RP-131).
+    if USER_FUNCTIONS.with(|f| f.borrow().is_empty()) {
+        return false;
+    }
     let path = crate::schemas::search_path();
     USER_FUNCTIONS.with(|f| {
         f.borrow()

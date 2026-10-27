@@ -285,7 +285,7 @@ fn prune_inlined_ctes(sel: &mut pg_query::protobuf::SelectStmt, ctx: &Ctx<'_>) {
                                 .iter()
                                 .map(|n| n.as_ref().is_none_or(|n| used.names.contains(n)))
                                 .collect();
-                            prune_checked(body, &keep, ctx);
+                            prune_checked(body, &keep, ctx, false);
                         }
                     }
                 }
@@ -597,7 +597,12 @@ fn prune_one(sel: &mut pg_query::protobuf::SelectStmt, i: usize, ctx: &Ctx<'_>) 
                         false
                     }
                 } else {
-                    prune_checked(inner, &keep, ctx)
+                    // PostgreSQL's own view bodies were analysed when
+                    // `initdb` created them, and parse analysis never runs on
+                    // a view's stored query again: nothing in one waits to be
+                    // raised, so it is not planned alone first (RP-131).
+                    let analysed = crate::is_expanded_system_view(&alias);
+                    prune_checked(inner, &keep, ctx, analysed)
                 };
             }
         }
@@ -656,10 +661,16 @@ fn union_all(s: &pg_query::protobuf::SelectStmt) -> bool {
 }
 
 /// `prune_arms`, applied only when something changes and the body plans
-/// on its own (`plans_alone`).
-fn prune_checked(body: &mut pg_query::protobuf::SelectStmt, keep: &[bool], ctx: &Ctx<'_>) -> bool {
+/// on its own (`plans_alone`), which a body already analysed (`analysed`)
+/// is not asked.
+fn prune_checked(
+    body: &mut pg_query::protobuf::SelectStmt,
+    keep: &[bool],
+    ctx: &Ctx<'_>,
+    analysed: bool,
+) -> bool {
     let mut pruned = body.clone();
-    if !prune_arms(&mut pruned, keep) || !plans_alone(body, ctx) {
+    if !prune_arms(&mut pruned, keep) || !(analysed || plans_alone(body, ctx)) {
         return false;
     }
     *body = pruned;
@@ -754,7 +765,10 @@ fn prune_select(s: &mut pg_query::protobuf::SelectStmt, keep: &[bool]) -> bool {
         if name.is_some_and(|n| names.contains(n)) {
             continue;
         }
-        if is_null(val) || is_count_star(val) || !removable(val) {
+        // A bare NULL already computes nothing; it is only marked unread
+        // (`unread_outputs`), once.
+        let unread = matches!(val.node.as_ref(), Some(N::AConst(a)) if a.location == UNREAD);
+        if (is_null(val) && unread) || is_count_star(val) || !removable(val) {
             continue;
         }
         let mut next = s.target_list[k].clone();
@@ -832,13 +846,41 @@ fn is_null(n: &pg_query::protobuf::Node) -> bool {
     matches!(n.node.as_ref(), Some(N::AConst(a)) if a.isnull)
 }
 
+/// The location a removed output's NULL carries: no text has it, so the
+/// planner can tell the outputs this pass proved unread (`unread_outputs`).
+const UNREAD: i32 = -0x0131;
+
 fn null_const() -> pg_query::protobuf::Node {
     pg_query::protobuf::Node {
         node: Some(N::AConst(pg_query::protobuf::AConst {
             isnull: true,
-            location: -1,
+            location: UNREAD,
             val: None,
         })),
+    }
+}
+
+/// By position, the outputs of a FROM-subquery body that this pass removed
+/// as unread (`remove_unused_subquery_outputs`): nothing outside reads them,
+/// so its materialised rows need not hold them. Read from the leftmost arm,
+/// whose removed outputs every arm shares.
+pub(crate) fn unread_outputs(body: &pg_query::protobuf::SelectStmt) -> Vec<bool> {
+    let Some(first) = first_arm(body) else {
+        return Vec::new();
+    };
+    let unread: Vec<bool> = first
+        .target_list
+        .iter()
+        .map(|t| {
+            matches!(t.node.as_ref(), Some(N::ResTarget(rt))
+                if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
+                    Some(N::AConst(a)) if a.isnull && a.location == UNREAD))
+        })
+        .collect();
+    if unread.iter().any(|u| *u) {
+        unread
+    } else {
+        Vec::new()
     }
 }
 

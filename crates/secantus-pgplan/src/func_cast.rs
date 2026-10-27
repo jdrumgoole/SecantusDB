@@ -487,9 +487,7 @@ pub(crate) fn spread_variadic(node: &mut N) {
 pub(crate) fn refuse_unresolved(node: &N) -> Result<()> {
     let untyped_param = |n: &pg_query::protobuf::Node| -> Option<i32> {
         match n.node.as_ref() {
-            Some(N::ParamRef(p))
-                if declared_param_type(usize::try_from(p.number).unwrap_or(0)).is_none() =>
-            {
+            Some(N::ParamRef(p)) if !param_is_declared(usize::try_from(p.number).unwrap_or(0)) => {
                 Some(p.number)
             }
             _ => None,
