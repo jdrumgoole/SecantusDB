@@ -39,7 +39,7 @@ unchanged (84 of 108).
   dense-allocation chunks are walked newest first and each tuple is pushed
   onto its bucket's head, which decides the order of a key's matches and of
   a right or full join's unmatched rows.
-- `secantus-pg` (RP-290, found here): CREATE INDEX's B-tree model limits a
+- `secantus-pg` (RP-298, found here): CREATE INDEX's B-tree model limits a
   posting list to a tenth of a page, as `_bt_load` does (812 bytes, not the
   1,352 an insert's deduplication allows). It finishes a leaf counting the
   posting list its high key sheds and the heap TID it may gain. Index sizes
@@ -49,6 +49,6 @@ unchanged (84 of 108).
 
 Part of RP-028
 (`tests/backlog/test_rust_postgres_gaps.py::test_a_limit_over_left_joins_reads_a_parameterized_join`).
-RP-291 is filed: an index created in the open transaction is not yet a
+RP-299 is filed: an index created in the open transaction is not yet a
 relation `regclass` finds
 (`tests/backlog/test_rust_postgres_gaps.py::test_an_index_made_in_the_open_transaction_is_a_relation`).

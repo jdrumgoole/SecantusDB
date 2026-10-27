@@ -2325,7 +2325,7 @@ def test_a_limit_over_three_tables_is_planned(pg: Any) -> None:
     assert got == ("ok", [(1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4), (6, 6, 1)])
 
 
-@pytest.mark.backlog_fixed("RP-290")
+@pytest.mark.backlog_fixed("RP-298")
 def test_create_index_packs_posting_lists_as_postgres_builds_them(pg: Any) -> None:
     """PostgreSQL 15.19: CREATE INDEX over many repeated keys limits a
     posting list to a tenth of a page (`_bt_load`'s maxpostingsize, 812
@@ -2334,7 +2334,7 @@ def test_create_index_packs_posting_lists_as_postgres_builds_them(pg: Any) -> No
     and the heap TID it may gain. 10,000 rows of five values make an index
     of 11 pages, 30,000 of 500 values 27; the model built 12 and 29, which
     the planner prices index scans by. (Committed: an index made in the
-    open transaction is RP-291.)"""
+    open transaction is RP-299.)"""
     got = []
     for rows, values in [(10000, 5), (30000, 500), (3000, 7)]:
         name = f"rp290_{values}"
@@ -2351,7 +2351,7 @@ def test_create_index_packs_posting_lists_as_postgres_builds_them(pg: Any) -> No
     assert got == [("ok", [(11,)]), ("ok", [(27,)]), ("ok", [(5,)])]
 
 
-@pytest.mark.backlog("RP-291")
+@pytest.mark.backlog("RP-299")
 def test_an_index_made_in_the_open_transaction_is_a_relation(pg: Any) -> None:
     """PostgreSQL 15.19: inside the transaction that created it, an index
     is a relation `regclass` finds, so `pg_relation_size('t_b')` answers

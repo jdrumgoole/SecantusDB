@@ -33,7 +33,7 @@ const MINUS_INFINITY: i64 = 8;
 const MAX_POSTING: i64 = 1352;
 /// CREATE INDEX's limit on a posting list tuple (`_bt_load`): a tenth of a
 /// page, MAXALIGNed down, less its line pointer -- the space a leaf filled
-/// to fillfactor 90 leaves (RP-290).
+/// to fillfactor 90 leaves (RP-298).
 const BUILD_MAX_POSTING: i64 = (PAGE as i64 * 10 / 100) / 8 * 8 - LP;
 /// `BTREE_NONLEAF_FILLFACTOR`.
 const NONLEAF_FILLFACTOR: i64 = 70;
@@ -1694,7 +1694,7 @@ impl Builder<'_> {
         // `_bt_buildadd`: room for the item and for a heap TID suffix
         // truncation may add to the high key; and the soft fillfactor
         // limit counts the posting list the last item's high key would
-        // shed (`btps_lastextra`, RP-290).
+        // shed (`btps_lastextra`, RP-298).
         let last_extra = lvl.leaf_items.last().map_or(0, |l| {
             if l.tids.len() > 1 {
                 l.size - shape.tuple_size(&l.key)
