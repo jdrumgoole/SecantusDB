@@ -1184,6 +1184,12 @@ fn stored_form(d: &Document) -> Document {
     nest_key(d).unwrap_or_else(|| d.clone())
 }
 
+/// [`stored_form`] of a row that may be held or given: one given is moved,
+/// not copied, when nothing is nested (RP-014).
+fn stored_form_owned(d: std::borrow::Cow<'_, Document>) -> Document {
+    nest_key(&d).unwrap_or_else(|| d.into_owned())
+}
+
 /// Encode a document for storage, nesting a composite key (see `nest_key`).
 fn encode_doc(d: &Document) -> Result<Vec<u8>, bson::ser::Error> {
     match nest_key(d) {
@@ -38285,8 +38291,19 @@ impl PgHandler {
                 } else {
                     self.stamp_inserted(&ins.table, &def, &mut ins.rows)?;
                     // Handed to storage decoded as well as encoded: it
-                    // need not decode what was just encoded (RP-014).
-                    let docs = self.stored_rows(&ins.table, &ins.rows)?;
+                    // need not decode what was just encoded (RP-014). The rows
+                    // are moved there when nothing reads them after: no
+                    // RETURNING, no AFTER trigger, and a duplicate's error
+                    // needs neither its row for SSI nor its partition.
+                    let keep_rows = ins.returning.is_some()
+                        || triggered
+                        || partition::is_partitioned(&def)
+                        || self.ssi_tracking();
+                    let docs = if keep_rows {
+                        self.stored_rows(&ins.table, &ins.rows)?
+                    } else {
+                        self.stored_rows_owned(&ins.table, std::mem::take(&mut ins.rows))?
+                    };
                     let (written, errors) = self
                         .storage
                         .insert_documents(self.db(), &ins.table, docs, true)

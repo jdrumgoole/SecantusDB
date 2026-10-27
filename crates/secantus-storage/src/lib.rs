@@ -2730,9 +2730,34 @@ fn decode_doc(bytes: &[u8]) -> Result<Document> {
 /// Encode a `{_id: <id>}` document — the oplog `o2` for every CRUD op (and the
 /// `o` of a `delete`, which mongod records as just the deleted doc's `_id`).
 fn encode_id_doc(id: &Bson) -> Result<Vec<u8>> {
-    let mut d = Document::new();
-    d.insert("_id", id.clone());
-    encode_doc(&d)
+    // The common `_id`s written straight into their bytes, which encoding a
+    // one-field document gives (every insert makes one, RP-014).
+    let element = |kind: u8, value: &[u8]| {
+        let len = 4 + 1 + 4 + value.len() + 1;
+        let mut b = Vec::with_capacity(len);
+        b.extend_from_slice(&(len as i32).to_le_bytes());
+        b.push(kind);
+        b.extend_from_slice(b"_id\0");
+        b.extend_from_slice(value);
+        b.push(0);
+        b
+    };
+    match id {
+        Bson::String(s) => {
+            let mut v = Vec::with_capacity(4 + s.len() + 1);
+            v.extend_from_slice(&(s.len() as i32 + 1).to_le_bytes());
+            v.extend_from_slice(s.as_bytes());
+            v.push(0);
+            Ok(element(0x02, &v))
+        }
+        Bson::Int32(n) => Ok(element(0x10, &n.to_le_bytes())),
+        Bson::Int64(n) => Ok(element(0x12, &n.to_le_bytes())),
+        _ => {
+            let mut d = Document::new();
+            d.insert("_id", id.clone());
+            encode_doc(&d)
+        }
+    }
 }
 
 /// `id_key = sortkey.encode_id_key(_id)` — the byte-sortable key for the `_id`.
@@ -4603,8 +4628,17 @@ type EntryOps = Vec<(String, Vec<u8>)>;
 /// The per-collection write locks, and the size at which the next new
 /// namespace prunes the unused ones.
 struct CollLocks {
-    map: HashMap<(String, String), Arc<Mutex<()>>>,
+    /// By database, then collection: looked up by borrowed names, with no
+    /// key built for a lock already there (every write asks, RP-014).
+    map: HashMap<String, HashMap<String, Arc<Mutex<()>>>>,
     prune_at: usize,
+}
+
+impl CollLocks {
+    /// How many locks are kept.
+    fn len(&self) -> usize {
+        self.map.values().map(HashMap::len).sum()
+    }
 }
 
 /// The fewest entries at which `coll_lock` prunes.
@@ -7455,20 +7489,24 @@ impl Storage {
     /// `storage._coll_lock`.
     fn coll_lock(&self, db: &str, coll: &str) -> Arc<Mutex<()>> {
         let mut reg = self.coll_locks.lock().unwrap_or_else(|e| e.into_inner());
-        let key = (db.to_string(), coll.to_string());
-        if let Some(lock) = reg.map.get(&key) {
+        if let Some(lock) = reg.map.get(db).and_then(|c| c.get(coll)) {
             return lock.clone();
         }
         // A new namespace: past the threshold, first let go of the locks no
         // one holds, so a server that has seen millions of collections does
         // not keep a mutex for each (RM-194). The threshold doubles past what
         // is still held, which keeps the pruning amortised.
-        if reg.map.len() >= reg.prune_at {
-            reg.map.retain(|_, lock| Arc::strong_count(lock) > 1);
-            reg.prune_at = (reg.map.len() * 2).max(COLL_LOCKS_PRUNE_FLOOR);
+        if reg.len() >= reg.prune_at {
+            for colls in reg.map.values_mut() {
+                colls.retain(|_, lock| Arc::strong_count(lock) > 1);
+            }
+            reg.map.retain(|_, colls| !colls.is_empty());
+            reg.prune_at = (reg.len() * 2).max(COLL_LOCKS_PRUNE_FLOOR);
         }
         reg.map
-            .entry(key)
+            .entry(db.to_string())
+            .or_default()
+            .entry(coll.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
@@ -7479,7 +7517,6 @@ impl Storage {
         self.coll_locks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .map
             .len()
     }
 
@@ -26985,6 +27022,24 @@ mod oplog_entry_bytes_tests {
             }
         }
         assert!(Storage::oplog_entry_crud("i", "db.c", None, b"\x05\0\0\0", &o2).is_err());
+    }
+
+    #[test]
+    fn an_id_document_is_the_encoded_one() {
+        for id in [
+            Bson::String(String::new()),
+            Bson::String("1b4e28ba-2fa1-11d2-883f-0016d3cca427".into()),
+            Bson::String("\u{e9}t\u{e9}\u{0}x".into()),
+            Bson::Int32(-7),
+            Bson::Int32(i32::MAX),
+            Bson::Int64(i64::MIN),
+            Bson::Double(1.5),
+            Bson::Document(bson::doc! {"a": 1, "b": "x"}),
+        ] {
+            let mut d = Document::new();
+            d.insert("_id", id.clone());
+            assert_eq!(encode_id_doc(&id).unwrap(), encode_doc(&d).unwrap(), "{id}");
+        }
     }
 
     #[test]

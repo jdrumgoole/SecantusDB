@@ -167,25 +167,45 @@ impl PgHandler {
         table: &str,
         rows: &[Document],
     ) -> PgWireResult<Vec<(Vec<u8>, Document)>> {
+        self.stored_rows_of(table, rows.iter().map(std::borrow::Cow::Borrowed))
+    }
+
+    /// [`Self::stored_rows`] of rows the caller no longer needs: each is
+    /// moved into its stored form rather than copied (RP-014).
+    pub(crate) fn stored_rows_owned(
+        &self,
+        table: &str,
+        rows: Vec<Document>,
+    ) -> PgWireResult<Vec<(Vec<u8>, Document)>> {
+        self.stored_rows_of(table, rows.into_iter().map(std::borrow::Cow::Owned))
+    }
+
+    fn stored_rows_of<'a>(
+        &self,
+        table: &str,
+        rows: impl Iterator<Item = std::borrow::Cow<'a, Document>>,
+    ) -> PgWireResult<Vec<(Vec<u8>, Document)>> {
         let indexes = match self.lookup_ref(table) {
             Some(def) => self.expr_indexes(&def)?,
             None => Vec::new(),
         };
-        rows.iter()
-            .map(|row| {
+        rows.map(|row| {
                 // With expression indexes, the row as `with_expr_fields`
                 // reads it back from its encoding, and fills.
                 let filled = if indexes.is_empty() {
                     None
                 } else {
-                    let raw = crate::encode_doc(row)
+                    let raw = crate::encode_doc(&row)
                         .map_err(|e| Self::storage_err("could not encode a row", e))?;
                     let mut d = decode_doc(&raw)
                         .map_err(|e| Self::storage_err("could not read a row", e))?;
                     Self::fill_expr_fields(&indexes, &mut d)?;
                     Some(d)
                 };
-                let stored = crate::stored_form(filled.as_ref().unwrap_or(row));
+                let stored = match filled {
+                    Some(d) => crate::stored_form(&d),
+                    None => crate::stored_form_owned(row),
+                };
                 let bytes = bson::to_vec(&stored)
                     .map_err(|e| Self::storage_err("could not encode a row", e))?;
                 Ok((bytes, stored))
