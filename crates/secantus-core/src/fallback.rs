@@ -122,6 +122,15 @@ impl Fallback {
         self
     }
 
+    /// Whether this is an interrupted operation -- `killOp`, a kill of its
+    /// session or a spent `maxTimeMS` -- rather than an error in the input:
+    /// what [`crate::deadline::check`] raises.
+    pub fn is_interruption(&self) -> bool {
+        use crate::deadline::MaxTimeMsExpired as E;
+        matches!(self, Fallback::Mongo { code, message, .. }
+            if *code == E::CODE && message == E::MESSAGE)
+    }
+
     /// The `(code, message)` pair when this is a real server error.
     pub fn as_mongo(&self) -> Option<(i32, &str)> {
         match self {

@@ -335,7 +335,10 @@ impl LockManager {
                 note_taken(resource);
                 return Ok(());
             }
-            if secantus_core::deadline::expired() {
+            // A kill ends the wait as a spent budget does: mongod 8.2.11
+            // interrupts a `drop` or `createIndexes` waiting on a
+            // transaction's lock with 11601 (RM-313).
+            if secantus_core::deadline::expired() || secantus_core::deadline::interrupted() {
                 head.queue.retain(|(t, _, _)| *t != ticket);
                 drop(inner);
                 self.changed.notify_all();

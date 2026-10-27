@@ -68,6 +68,7 @@ pub mod find;
 pub mod findandmodify;
 pub mod handshake;
 mod hostinfo;
+mod interrupt;
 mod list_catalog;
 pub mod lock_manager;
 pub mod logbuf;
@@ -785,6 +786,8 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     let _active = stats
         .as_ref()
         .map(|s| s.status.activate(status::OpKind::of(name)));
+    // Which of this command's interrupt polls fail (RM-313).
+    let _trips = secantus_core::deadline::trip_scope();
     // Listed by `currentOp` and killable by `killOp` while it runs (RM-216).
     let _op = ctx
         .ops
@@ -809,38 +812,10 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     };
     ctx.profiling = profiler::begin(name, doc, ctx);
     let mut reply = dispatch_inner(doc, ctx);
-    // A killed operation's deadline polls fail as a spent budget would; the
-    // operation was interrupted, which mongod reports as 11601, keeping
-    // whatever wrapper the error carries (RM-216).
-    if ops::current_killed() && reply.get_i32("code") == Ok(50) {
-        let message = reply
-            .get_str("errmsg")
-            .unwrap_or("operation exceeded time limit")
-            .replace("operation exceeded time limit", "operation was interrupted");
-        // A kill that lands before execution (in planning) carries no
-        // executor wrapper; mongod reports it under one wherever it lands
-        // (measured 8.2.11: a killed find is "Executor error during find
-        // command: <ns> :: caused by :: operation was interrupted").
-        let message = if message.contains(" :: caused by :: ") {
-            message
-        } else {
-            let ns = |coll: &str| format!("{}.{coll}", ctx.db_name);
-            match (name, doc.get_str(name)) {
-                ("find", Ok(coll)) => {
-                    format!("Executor error during find command: {} :: caused by :: {message}", ns(coll))
-                }
-                ("aggregate" | "count" | "distinct", Ok(coll)) => format!(
-                    "Executor error during {name} command on namespace: {} :: caused by :: {message}",
-                    ns(coll)
-                ),
-                ("getMore", _) => format!("Executor error during getMore :: caused by :: {message}"),
-                _ => message,
-            }
-        };
-        reply.insert("errmsg", message);
-        reply.insert("code", 11601_i32);
-        reply.insert("codeName", "Interrupted");
-    }
+    // An interrupted operation -- killed, or out of `maxTimeMS` -- answers
+    // as mongod does: 11601 for a kill, under the wrapper its command takes,
+    // and a write's interrupted write-concern wait (RM-216, RM-313).
+    interrupt::finish(name, doc, &mut reply, ctx, client_wc, default_wc.as_ref());
     // A journaled write is acknowledged only once the journal holds it:
     // mongod's `waitUntilDurable`. Before this, `j` was echoed and no sync
     // followed, and a SIGKILL lost writes acknowledged with `j: true`.
@@ -1805,6 +1780,12 @@ fn kill_sessions(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if sessions.is_empty() {
         return kill_all_sessions(&doc! {"killAllSessions": []}, ctx);
     }
+    // The sessions' running operations are interrupted first: a
+    // transaction's statement holds its transaction until it ends, so the
+    // abort below waits for it (RM-313).
+    if let Some(ops) = &ctx.ops {
+        ops.kill_sessions(|lsid, _| sessions.iter().any(|s| s == lsid));
+    }
     for lsid in &sessions {
         if let Some(reg) = &ctx.transactions {
             reg.abort_for_session(lsid);
@@ -1966,6 +1947,10 @@ fn kill_all_sessions(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
         selected.push(KillPattern::default());
     }
     let picks = |lsid: &[u8], owner: &[u8]| selected.iter().any(|p| p.matches(lsid, owner));
+    // Their running operations first, as `killSessions` (RM-313).
+    if let Some(ops) = &ctx.ops {
+        ops.kill_sessions(picks);
+    }
     if let Some(reg) = &ctx.transactions {
         reg.abort_matching(&session::user_digest(&[]), picks);
     }
@@ -2033,7 +2018,10 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
             if let Some(at) = read_at.filter(|_| command_name(doc) != "getMore") {
                 snapshot::place_at_cluster_time(&mut reply, at);
             }
-            if budget > 0 {
+            // A statement interrupted at a poll is lifted by `dispatch`,
+            // after a retryable write has kept the statements before it
+            // (`interrupt::finish`); this is for a budget spent elsewhere.
+            if budget > 0 && !deadline::tripped() {
                 if let Some(e) = expired_write_statement(doc, &reply) {
                     return e.into_reply();
                 }

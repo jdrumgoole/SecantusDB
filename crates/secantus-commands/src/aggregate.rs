@@ -4124,6 +4124,8 @@ fn enforce_target_validator(
     if opts.get_str("validationAction").unwrap_or("error") != "error" {
         return Ok(());
     }
+    // A validator no interrupt reaches (RM-313).
+    let _opaque = secantus_core::deadline::opaque();
     for d in docs {
         if !secantus_core::query::matches(d, &validator, &Document::new(), None).unwrap_or(false) {
             // The `errInfo` an insert carries.

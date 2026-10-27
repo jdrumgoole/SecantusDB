@@ -663,17 +663,22 @@ about forty such points; these are the ones measured.
       name (`Fallback::mongo(code, msg)`) belongs.
       Backlog-ID: RM-226
       Verify: tests/backlog/test_rm_found_2026_10_21.py::test_window_spec_errors_carry_mongods_codes
-- [ ] **`killSessions` does not interrupt the command holding the session.**
-      mongod 8.2.11 interrupts a retryable update still running on the
-      session it kills: the update answers 11601 "operation was interrupted"
-      and does not apply. This server marks nothing: the update runs to the
-      end and applies. A command's kill flag is only polled between the
-      documents a scan reads, so interrupting one long evaluation, and
-      rolling a write back when it is killed, is the work; `killOp` has the
-      same limit. Found 2026-10-25 while fixing RM-230 (a retry now waits
-      for the attempt holding the session, so this is how a client ends one).
-      Backlog-ID: RM-313
-      Verify: tests/backlog/test_rm_found_2026_10_25.py::test_kill_sessions_interrupts_the_command_holding_the_session
+- [ ] **A multi-document write interrupted while it reads its candidates
+      writes nothing, where mongod keeps what it wrote.** mongod tests and
+      writes each document as its scan reaches it (a deleteMany a batch of
+      10 at a time), so one killed or out of `maxTimeMS` part-way has
+      written the documents before. This server reads every candidate before
+      it tests or writes one, and on a replica set first works out mongod's
+      order for a deleteMany by testing every document; an interrupt in
+      either leaves nothing written (mongod 8.2.11, 2026-10-27: a deleteMany
+      killed 1.5 s into 100 slow documents had deleted 20, this server 0; an
+      updateMany of 200,000 documents at `maxTimeMS: 5` had updated 1,536,
+      this server 0). An interrupt or a filter error once the documents are
+      read keeps the ones before, as mongod does (RM-313, RM-322). The work
+      is to stream the candidates into the write, and to carry the order's
+      tests into the delete rather than repeat them.
+      Backlog-ID: RM-323
+      Verify: tests/backlog/test_rm_found_2026_10_27.py::test_a_killed_delete_many_keeps_the_batches_it_deleted, tests/backlog/test_rm_found_2026_10_27.py::test_an_update_many_out_of_time_keeps_the_documents_it_updated
 - [ ] **`$near` returns documents tied at one distance in the macOS build's
       order, not the Linux build's.** mongod's builds disagree: for four
       points at distance 1, Linux x86-64 8.2.12 (CI) answers `[2, 1, 3, 0]`,

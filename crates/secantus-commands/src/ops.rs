@@ -32,6 +32,10 @@ pub struct RunningOp {
     /// Set by `killOp`; installed with `deadline` while the operation runs,
     /// so every scan's deadline poll sees it.
     killed: Arc<AtomicBool>,
+    /// The session the operation runs on, if any: its `lsid` id and the
+    /// user who owns it (`uid`), which the kill-session commands match
+    /// (RM-313).
+    session: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl RunningOp {
@@ -135,6 +139,22 @@ impl OpRegistry {
         }
     }
 
+    /// Mark every operation running on a session `picks(lsid, uid)`
+    /// chooses killed: `killSessions`, `killAllSessions` and
+    /// `killAllSessionsByPattern` interrupt the operations of the sessions
+    /// they kill, as mongod 8.2.11 does (RM-313). An operation outside any
+    /// session is left alone (measured: `killAllSessions: []` does not
+    /// interrupt an update sent with no `lsid`).
+    pub fn kill_sessions(&self, picks: impl Fn(&[u8], &[u8]) -> bool) {
+        for op in self.snapshot() {
+            if let Some((lsid, uid)) = &op.session {
+                if picks(lsid, uid) {
+                    op.killed.store(true, Ordering::Release);
+                }
+            }
+        }
+    }
+
     /// Whether a running `getMore` is reading the cursor `id`.
     pub fn cursor_in_use(&self, id: i64) -> bool {
         self.snapshot().iter().any(|op| op.cursor_id() == Some(id))
@@ -206,6 +226,14 @@ pub fn begin(registry: &Arc<OpRegistry>, doc: &Document, ctx: &crate::CommandCon
         .and_then(|a| a.lock().ok())
         .map(|g| (g.peer_address.clone(), g.client_metadata.clone()))
         .unwrap_or_default();
+    let session = doc
+        .get_document("lsid")
+        .ok()
+        .and_then(|lsid| crate::session::session_id(lsid, "lsid").ok())
+        .map(|id| {
+            let uid = crate::session::user_digest(&crate::session::authenticated(ctx));
+            (id, uid)
+        });
     let opid = registry.next_opid.fetch_add(1, Ordering::Relaxed);
     let running = Arc::new(RunningOp {
         opid,
@@ -217,6 +245,7 @@ pub fn begin(registry: &Arc<OpRegistry>, doc: &Document, ctx: &crate::CommandCon
         command: doc.clone(),
         started: Instant::now(),
         killed: Arc::new(AtomicBool::new(false)),
+        session,
     });
     let killed = running.killed.clone();
     registry
