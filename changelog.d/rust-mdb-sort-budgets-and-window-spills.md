@@ -46,7 +46,7 @@ models mongod's partition cache for every window shape and spills it.
   with mongod's types and bounds; `explain`'s `serverParameters` and a
   `SORT`'s `memLimit` show the budgets in force.
 
-Still open: spill files' on-disk sizes (RM-316), mongod's per-batch profile
-accounting of a sort under a cursor stage (RM-317), some
-`$setWindowFields` windows' boundaries (RM-318) and `explain`'s memory
-counters (RM-319).
+Still open: spill files' on-disk sizes (RM-325), mongod's per-batch profile
+accounting of a sort under a cursor stage (RM-326), some
+`$setWindowFields` windows' boundaries (RM-327) and `explain`'s memory
+counters (RM-328).

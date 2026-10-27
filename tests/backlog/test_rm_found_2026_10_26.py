@@ -50,7 +50,7 @@ def _profiled(db: Any, pipeline: list, knobs: dict, comment: str) -> dict:
     return db.system.profile.find_one({"command.comment": comment}) or {}
 
 
-# ------------------------------------------- RM-316 spill storage size --
+# ------------------------------------------- RM-325 spill storage size --
 
 
 def _storage_sizes(client: Any) -> dict:
@@ -73,14 +73,14 @@ def _storage_sizes(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-316")
+@pytest.mark.backlog("RM-325")
 def test_spill_storage_size(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 compresses a sort's runs (130545 bytes for 2461200) and
     spills a `$group` to a WiredTiger table."""
     assert _storage_sizes(rust_mongo) == _storage_sizes(mongod)
 
 
-# --------------------------------------- RM-317 sort stats per batch --
+# --------------------------------------- RM-326 sort stats per batch --
 
 
 def _per_batch(client: Any) -> dict:
@@ -103,14 +103,14 @@ def _per_batch(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-317")
+@pytest.mark.backlog("RM-326")
 def test_sort_profile_per_batch(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 profiles the sort in front of a `$setWindowFields` once
     per cursor-stage batch: `sortSpills: 52` for a sort that spilled 13."""
     assert _per_batch(rust_mongo) == _per_batch(mongod)
 
 
-# ---------------------------------------- RM-318 window budget residuals --
+# ---------------------------------------- RM-327 window budget residuals --
 
 WINDOWS = {
     "[-5, 5] $sum": ({"$sum": "$n", "window": {"documents": [-5, 5]}}, False),
@@ -148,14 +148,14 @@ def _least_budgets(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-318")
+@pytest.mark.backlog("RM-327")
 def test_window_budget_residuals(rust_mongo: Any, mongod: Any) -> None:
     """The least `$setWindowFields` budget each window runs under, mongod
     8.2.11's."""
     assert _least_budgets(rust_mongo) == _least_budgets(mongod)
 
 
-# ------------------------------------------- RM-319 explain's counters --
+# ------------------------------------------- RM-328 explain's counters --
 
 
 def _explained(client: Any) -> dict:
@@ -178,7 +178,7 @@ def _explained(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-319")
+@pytest.mark.backlog("RM-328")
 def test_explain_memory_counters(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `explain` lists a `$group`'s accumulator memory and
     output size, and the `$_internalSetWindowFields` stage it runs with

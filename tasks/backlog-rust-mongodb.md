@@ -730,7 +730,7 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       uncompressed spill file. mongod's sorter compresses each run (130545
       bytes for the 2461200 a 300-document sort spills) and a `$group` or
       `$setWindowFields` spills to a WiredTiger table (4096 bytes).
-      Backlog-ID: RM-316
+      Backlog-ID: RM-325
       Verify: tests/backlog/test_rm_found_2026_10_26.py::test_spill_storage_size
 - [ ] **A sort under a cursor stage reports its spills once, not per
       batch.** When a query-layer sort feeds later stages through
@@ -740,7 +740,7 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       profiled with `sortSpills: 52` -- four batches of 32, 64, 128 and 256.
       `metrics.query.sort.spillToDisk` also counts differently from the
       spills (`+26` for a sort of 29). This server reports each sort once.
-      Backlog-ID: RM-317
+      Backlog-ID: RM-326
       Verify: tests/backlog/test_rm_found_2026_10_26.py::test_sort_profile_per_batch
 - [ ] **`$setWindowFields` refuses at slightly the wrong budget for some
       windows.** The partition cache and the functions are counted as mongod
@@ -754,7 +754,7 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       window that drops documents is the part least measured. The sizes this
       server uses are the Linux x86-64 build's, the exemplar; the macOS
       build counts some accumulators differently (`$sum` 184, not 176).
-      Backlog-ID: RM-318
+      Backlog-ID: RM-327
       Verify: tests/backlog/test_rm_found_2026_10_26.py::test_window_budget_residuals
 - [ ] **`explain` lacks the stages' own memory counters.** The spill
       counters are there (a `SORT`'s, a `$sort`'s, a `$group`'s; RM-315), but
@@ -763,7 +763,7 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       `$_internalSetWindowFields` it runs, with `maxFunctionMemoryUsageBytes`,
       `maxTotalMemoryUsageBytes` and its spill counters (with the `$sort` in
       front of it in the cursor's plan). This server lists neither.
-      Backlog-ID: RM-319
+      Backlog-ID: RM-328
       Verify: tests/backlog/test_rm_found_2026_10_26.py::test_explain_memory_counters
 - **Scope decision — SBE's `$concatArrays` refusal names a count mongod
   never set.** Over its budget mongod 8.2.11 says "Concatentating array of
