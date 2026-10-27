@@ -517,7 +517,11 @@ impl GucMap {
     /// reads several times over (`track_counts`, the timeouts, the role
     /// ...) are looked up once per change of the map, not each time
     /// (RP-014).
-    pub(crate) fn memo<T: Clone + 'static>(&self, slot: GucSlot, read: impl FnOnce(&Self) -> T) -> T {
+    pub(crate) fn memo<T: Clone + 'static>(
+        &self,
+        slot: GucSlot,
+        read: impl FnOnce(&Self) -> T,
+    ) -> T {
         thread_local! {
             static MEMO: std::cell::RefCell<Vec<Option<(u64, Box<dyn std::any::Any>)>>> =
                 const { std::cell::RefCell::new(Vec::new()) };
@@ -11318,9 +11322,10 @@ impl PgHandler {
         };
         // The collection names are constants: the same address is the same
         // name, and only another address needs its text compared.
-        let same_collection =
-            |c: &str| std::ptr::eq(c.as_ptr(), collection.as_ptr()) && c.len() == collection.len()
-                || c == collection;
+        let same_collection = |c: &str| {
+            std::ptr::eq(c.as_ptr(), collection.as_ptr()) && c.len() == collection.len()
+                || c == collection
+        };
         if let Some(docs) = CATALOG_FRONT.with(|f| {
             f.borrow()
                 .iter()
@@ -31120,7 +31125,9 @@ impl PgHandler {
         } else {
             GucSlot::IdleSession
         };
-        let ms = settings.memo(slot, |s| s.get(guc).and_then(|v| parse_ms_guc(v)).unwrap_or(0));
+        let ms = settings.memo(slot, |s| {
+            s.get(guc).and_then(|v| parse_ms_guc(v)).unwrap_or(0)
+        });
         if ms <= 0 {
             return None;
         }
@@ -50177,9 +50184,8 @@ impl PgHandler {
         let binary = self
             .binary_results
             .load(std::sync::atomic::Ordering::Relaxed);
-        let valid = |(v, g, r, _): &DescribeEntry| {
-            *v == catalog_version && *g == generation && *r == role
-        };
+        let valid =
+            |(v, g, r, _): &DescribeEntry| *v == catalog_version && *g == generation && *r == role;
         {
             let last = self.describe_last.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((k, entry)) = last.as_ref() {

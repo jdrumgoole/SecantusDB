@@ -190,27 +190,27 @@ impl PgHandler {
             None => Vec::new(),
         };
         rows.map(|row| {
-                // With expression indexes, the row as `with_expr_fields`
-                // reads it back from its encoding, and fills.
-                let filled = if indexes.is_empty() {
-                    None
-                } else {
-                    let raw = crate::encode_doc(&row)
-                        .map_err(|e| Self::storage_err("could not encode a row", e))?;
-                    let mut d = decode_doc(&raw)
-                        .map_err(|e| Self::storage_err("could not read a row", e))?;
-                    Self::fill_expr_fields(&indexes, &mut d)?;
-                    Some(d)
-                };
-                let stored = match filled {
-                    Some(d) => crate::stored_form(&d),
-                    None => crate::stored_form_owned(row),
-                };
-                let bytes = bson::to_vec(&stored)
+            // With expression indexes, the row as `with_expr_fields`
+            // reads it back from its encoding, and fills.
+            let filled = if indexes.is_empty() {
+                None
+            } else {
+                let raw = crate::encode_doc(&row)
                     .map_err(|e| Self::storage_err("could not encode a row", e))?;
-                Ok((bytes, stored))
-            })
-            .collect()
+                let mut d =
+                    decode_doc(&raw).map_err(|e| Self::storage_err("could not read a row", e))?;
+                Self::fill_expr_fields(&indexes, &mut d)?;
+                Some(d)
+            };
+            let stored = match filled {
+                Some(d) => crate::stored_form(&d),
+                None => crate::stored_form_owned(row),
+            };
+            let bytes = bson::to_vec(&stored)
+                .map_err(|e| Self::storage_err("could not encode a row", e))?;
+            Ok((bytes, stored))
+        })
+        .collect()
     }
 
     /// Recompute the expression index fields of `table`'s rows matching

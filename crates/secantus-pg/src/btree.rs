@@ -672,8 +672,7 @@ impl PgHandler {
                 let mut descents = Vec::with_capacity(all.len());
                 let mut c: Vec<i64> = Vec::new();
                 for (key, _, ctid) in all {
-                    let (tids, descent) =
-                        t.candidate_tids_descending(&*shape, key, *ctid, pending);
+                    let (tids, descent) = t.candidate_tids_descending(&*shape, key, *ctid, pending);
                     c.extend(tids);
                     descents.push(descent);
                 }
@@ -682,10 +681,16 @@ impl PgHandler {
                 if !c.is_empty() || all.len() != 1 {
                     return Err(c);
                 }
-                let (key, unchanged, ctid) =
-                    keys.take().expect("the keys").pop().expect("one key");
+                let (key, unchanged, ctid) = keys.take().expect("the keys").pop().expect("one key");
                 t.ssi_events.clear();
-                t.insert_descended(&*shape, key, ctid, unchanged, &|_| false, descents.pop().flatten());
+                t.insert_descended(
+                    &*shape,
+                    key,
+                    ctid,
+                    unchanged,
+                    &|_| false,
+                    descents.pop().flatten(),
+                );
                 Ok(std::mem::take(&mut t.ssi_events))
             })?;
             let events = match done {

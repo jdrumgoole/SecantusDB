@@ -268,14 +268,16 @@ pub fn horizon() -> u64 {
 /// without the hook's text (every written row asks, RP-014).
 pub fn writer(storage: &Arc<Storage>, pid: i32) -> (Option<u64>, u32) {
     let mut all = clusters().lock().unwrap_or_else(|e| e.into_inner());
-    let xid = all.get_mut(&CURRENT.with(Cell::get)).map(|c| match c.running.get(&pid) {
-        Some(x) => *x,
-        None => {
-            let xid = take(c);
-            c.running.insert(pid, xid);
-            xid
-        }
-    });
+    let xid = all
+        .get_mut(&CURRENT.with(Cell::get))
+        .map(|c| match c.running.get(&pid) {
+            Some(x) => *x,
+            None => {
+                let xid = take(c);
+                c.running.insert(pid, xid);
+                xid
+            }
+        });
     let cid = match all.get_mut(&key(storage)) {
         Some(c) => {
             let entry = c.commands.entry(pid).or_insert((0, false));

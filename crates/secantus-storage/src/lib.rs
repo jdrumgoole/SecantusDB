@@ -7997,7 +7997,15 @@ impl Storage {
         // written at once into a buffer of the final size: appending field
         // by field converted and copied each value again (RP-014).
         let mut b = Vec::with_capacity(
-            4 + 2 * 8 + op.len() + ns.len() + ui.map_or(0, |u| 10 + u.len()) + 3 + o.len() + 4 + o2.len() + 1,
+            4 + 2 * 8
+                + op.len()
+                + ns.len()
+                + ui.map_or(0, |u| 10 + u.len())
+                + 3
+                + o.len()
+                + 4
+                + o2.len()
+                + 1,
         );
         b.extend_from_slice(&[0; 4]);
         for (key, value) in [(&b"op\0"[..], op), (&b"ns\0"[..], ns)] {
@@ -27039,7 +27047,10 @@ mod oplog_entry_bytes_tests {
             "wall",
             bson::RawBsonRef::DateTime(bson::DateTime::from_millis(-5)).to_raw_bson(),
         );
-        assert_eq!(append_ts_wall(entry.into_bytes(), ts, -5), appended.into_bytes());
+        assert_eq!(
+            append_ts_wall(entry.into_bytes(), ts, -5),
+            appended.into_bytes()
+        );
     }
 
     #[test]

@@ -1109,7 +1109,8 @@ impl BTree {
                         if p.tid.is_some()
                             && p.key.len() >= n
                             && key.len() >= n
-                            && (0..n).all(|a| shape.cmp_attr(a, &key[a], &p.key[a]) == Ordering::Equal)
+                            && (0..n)
+                                .all(|a| shape.cmp_attr(a, &key[a], &p.key[a]) == Ordering::Equal)
                         {
                             tid_free = false;
                         }
@@ -1224,8 +1225,7 @@ impl BTree {
         dead: &dyn Fn(i64) -> bool,
         descended: Option<Descent>,
     ) -> Descent {
-        let (first, path, tid_free) =
-            descended.unwrap_or_else(|| self.descend_tidless(shape, key));
+        let (first, path, tid_free) = descended.unwrap_or_else(|| self.descend_tidless(shape, key));
         let done = (first, path, tid_free);
         let mut page = first;
         loop {

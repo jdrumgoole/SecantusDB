@@ -2958,7 +2958,9 @@ pub(crate) fn text_key(sql: &str, path: &str, user: &str) -> u64 {
     path.hash(&mut h);
     user.hash(&mut h);
     let key = h.finish();
-    LAST.with(|l| *l.borrow_mut() = Some((sql.to_string(), path.to_string(), user.to_string(), key)));
+    LAST.with(|l| {
+        *l.borrow_mut() = Some((sql.to_string(), path.to_string(), user.to_string(), key))
+    });
     key
 }
 
