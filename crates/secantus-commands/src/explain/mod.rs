@@ -1081,17 +1081,50 @@ fn server_info(ctx: &CommandContext) -> Document {
 }
 
 fn server_parameters() -> Document {
+    // The memory budgets as `setParameter` left them (RM-211, RM-315).
+    let b = secantus_core::memlimit::budgets();
+    let int = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
     doc! {
         "internalQueryFacetBufferSizeBytes": 104_857_600_i32,
-        "internalQueryFacetMaxOutputDocSizeBytes": 104_857_600_i32,
-        "internalLookupStageIntermediateDocumentMaxSizeBytes": 104_857_600_i32,
-        "internalDocumentSourceGroupMaxMemoryBytes": 104_857_600_i32,
-        "internalQueryMaxBlockingSortMemoryUsageBytes": 104_857_600_i32,
+        "internalQueryFacetMaxOutputDocSizeBytes": int(b.facet),
+        "internalLookupStageIntermediateDocumentMaxSizeBytes": int(b.lookup),
+        "internalDocumentSourceGroupMaxMemoryBytes": int(b.group),
+        "internalQueryMaxBlockingSortMemoryUsageBytes": int(b.sort),
         "internalQueryProhibitBlockingMergeOnMongoS": 0_i32,
-        "internalQueryMaxAddToSetBytes": 104_857_600_i32,
-        "internalDocumentSourceSetWindowFieldsMaxMemoryBytes": 104_857_600_i32,
+        "internalQueryMaxAddToSetBytes": int(b.add_to_set),
+        "internalDocumentSourceSetWindowFieldsMaxMemoryBytes": int(b.window_fields),
         "internalQueryFrameworkControl": "trySbeRestricted",
         "internalQueryPlannerIgnoreIndexWithCollationForRegex": 1_i32,
+    }
+}
+
+/// A blocking stage's memory and spill counters in an explain, as mongod
+/// 8.2.11 lists them: a `$sort`'s, and a `$group`'s.
+fn spill_fields(stage: &mut Document, spilled: &secantus_core::memlimit::SpillReport) {
+    match stage.keys().next().map(String::as_str) {
+        Some("$sort") => {
+            stage.insert(
+                "totalDataSizeSortedBytesEstimate",
+                spilled.sort_total_data_size,
+            );
+            stage.insert("usedDisk", spilled.sort_spills > 0);
+            stage.insert("spills", spilled.sort_spills);
+            stage.insert(
+                "spilledDataStorageSize",
+                spilled.sort_spilled_data_storage_size,
+            );
+        }
+        Some("$group") => {
+            stage.insert("usedDisk", spilled.group_spills > 0);
+            stage.insert("spills", spilled.group_spills);
+            stage.insert(
+                "spilledDataStorageSize",
+                spilled.group_spilled_data_storage_size,
+            );
+            stage.insert("spilledBytes", spilled.group_spilled_bytes);
+            stage.insert("spilledRecords", spilled.group_spilled_records);
+        }
+        _ => {}
     }
 }
 
@@ -1101,6 +1134,27 @@ const DRY: &str = "explain.dry.run";
 
 /// How many documents come out of `pipeline` over `coll`.
 fn count_through(
+    ctx: &mut CommandContext,
+    coll: &str,
+    pipeline: &[Document],
+    options: &Document,
+) -> i64 {
+    count_and_spills(ctx, coll, pipeline, options).0
+}
+
+/// [`count_through`], and what the run spilled (RM-315).
+fn count_and_spills(
+    ctx: &mut CommandContext,
+    coll: &str,
+    pipeline: &[Document],
+    options: &Document,
+) -> (i64, secantus_core::memlimit::SpillReport) {
+    let (n, report) =
+        secantus_core::memlimit::captured(|| count_inline(ctx, coll, pipeline, options));
+    (n, report)
+}
+
+fn count_inline(
     ctx: &mut CommandContext,
     coll: &str,
     pipeline: &[Document],
@@ -1230,9 +1284,38 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
     let wanted = verbosity != Verbosity::QueryPlanner;
     // What each stage after the cursor returns: the pipeline run that far.
     let taken = r.pipeline.len() - s.rest.len();
+    // What each stage after the cursor spilled: the run through it less the
+    // run through the stage before (RM-211, RM-315).
+    let mut stage_spills: Vec<secantus_core::memlimit::SpillReport> = Vec::new();
     let mut stage_counts: Vec<i64> = if wanted {
+        let mut before = secantus_core::memlimit::SpillReport::default();
         (0..s.rest.len())
-            .map(|i| count_through(ctx, &s.coll, &r.pipeline[..taken + i + 1], &s.options))
+            .map(|i| {
+                // The stages after it decide what its documents keep, as
+                // they do in the whole run: a `$project` of what they read.
+                let mut prefix = r.pipeline[..taken + i + 1].to_vec();
+                let after: Vec<Bson> = r.pipeline[taken + i + 1..]
+                    .iter()
+                    .cloned()
+                    .map(Bson::Document)
+                    .collect();
+                if let (false, Some(fields)) =
+                    (after.is_empty(), secantus_core::downstream_fields(&after))
+                {
+                    let mut keep: Document =
+                        fields.iter().map(|f| (f.clone(), Bson::Int32(1))).collect();
+                    if !fields.contains("_id") {
+                        keep.insert("_id", 0);
+                    }
+                    if !keep.is_empty() {
+                        prefix.push(doc! { "$project": keep });
+                    }
+                }
+                let (n, report) = count_and_spills(ctx, &s.coll, &prefix, &s.options);
+                stage_spills.push(report.less(&before));
+                before = report;
+                n
+            })
             .collect()
     } else {
         vec![]
@@ -1366,6 +1449,9 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
         let mut stages = vec![Bson::Document(first)];
         for (i, stage) in s.rest.iter().enumerate() {
             for mut listed in shape::listed_stage(stage, &db) {
+                if let Some(spilled) = stage_spills.get(i) {
+                    spill_fields(&mut listed, spilled);
+                }
                 if let Some(n) = stage_counts.get(i) {
                     counted(&mut listed, *n);
                 }
@@ -1488,6 +1574,7 @@ fn dry(inner: &Document, name: &str) -> Document {
 
 /// `explain`.
 pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let _budgets = secantus_core::memlimit::with_budgets(crate::aggregate::budgets_of(ctx));
     let inner = match doc.get("explain") {
         None | Some(Bson::Null) => {
             return Err(err(

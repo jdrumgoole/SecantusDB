@@ -521,7 +521,7 @@ impl Capped {
         }
         self.mem += memlimit::classic_size(&v);
         self.items.push(v);
-        if memlimit::ACCUMULATOR_BASE + self.mem > memlimit::budgets().push {
+        if memlimit::PUSH_BASE + self.mem > memlimit::budgets().push {
             return Err(Fallback::mongo(
                 146,
                 format!(
@@ -581,10 +581,19 @@ impl Capped {
     /// `concatArraysCapped`).
     pub(crate) fn concat(&mut self, values: Vec<Bson>) -> R<()> {
         if crate::sbe::active() {
-            let added: usize = values.iter().map(memlimit::sbe_size).sum();
+            // SBE counts the operand array as one value (measured 8.2.11:
+            // `["x" * 100, 1]` is 129 bytes, nine more than its BSON).
+            let whole = Bson::Array(values);
+            let added = memlimit::sbe_size(&whole);
+            let Bson::Array(values) = whole else {
+                unreachable!("built as an array above")
+            };
             if self.mem + added >= memlimit::budgets().concat_arrays {
                 // mongod names the size of its two-slot state array here,
-                // not of the values (vm_builtin_agg.cpp, 8.2.1).
+                // not of the values (vm_builtin_agg.cpp, 8.2.1). The count
+                // it gives for the operand is a value it never set (8.2.11
+                // printed 87684434848907256); the operand's length stands in
+                // for that.
                 return Err(Fallback::mongo(
                     146,
                     format!(
@@ -607,7 +616,7 @@ impl Capped {
             unreachable!("built as an array above")
         };
         self.items.extend(values);
-        if memlimit::ACCUMULATOR_BASE + self.mem > memlimit::budgets().concat_arrays {
+        if memlimit::PUSH_BASE + self.mem > memlimit::budgets().concat_arrays {
             // mongod reports the limit as what was used (8.2.1's message).
             return Err(Fallback::mongo(
                 146,
@@ -1780,6 +1789,20 @@ pub fn downstream_fields(stages: &[Bson]) -> Option<std::collections::BTreeSet<S
                     }
                 }
             }
+            "$unwind" => {
+                let path = match spec {
+                    Bson::String(p) => p.as_str(),
+                    Bson::Document(d) => d.get_str("path").ok()?,
+                    _ => return None,
+                };
+                let path = path.strip_prefix('$')?;
+                fields.insert(top(path));
+                if let Some(Bson::String(index)) =
+                    spec.as_document().and_then(|d| d.get("includeArrayIndex"))
+                {
+                    fields.insert(top(index));
+                }
+            }
             "$unset" | "$skip" | "$limit" | crate::sbe::ENGINE_STAGE => {}
             _ => return None,
         }
@@ -2117,25 +2140,54 @@ fn expression_object_check(expr: &Bson) -> R<()> {
 /// mongod is known to keep is counted -- a `$firstN` keeps n values there,
 /// not every one this state collects -- so the estimate errs low, never
 /// refusing a `$group` mongod runs.
+/// [`acc_memory`] as the classic engine counts it, whatever engine is
+/// running (`$setWindowFields` always runs in the classic engine).
+pub(crate) fn acc_memory_classic(acc: &Acc) -> usize {
+    let _classic = crate::sbe::enter(false);
+    acc_memory(acc)
+}
+
 fn acc_memory(acc: &Acc) -> usize {
-    let base = if crate::sbe::active() {
-        0
-    } else {
-        memlimit::ACCUMULATOR_BASE
-    };
+    let sbe = crate::sbe::active();
+    let base = if sbe { 0 } else { classic_base(acc) };
     base + match acc {
         Acc::Push(c) | Acc::AddToSet(c) | Acc::ConcatArrays(c) | Acc::SetUnion(c) => c.mem,
-        Acc::Min(Some(v)) | Acc::Max(Some(v)) | Acc::First(Some(v)) | Acc::Last(Some(v)) => {
-            memlimit::engine_size(v)
-        }
-        Acc::MergeObjects(d) if !d.is_empty() => {
-            if crate::sbe::active() {
-                memlimit::sbe_size(&Bson::Null) + memlimit::bson_len(d)
-            } else {
-                memlimit::classic_size(&Bson::Null) + memlimit::document_size(d)
-            }
+        Acc::Min(Some(v)) | Acc::Max(Some(v)) => memlimit::engine_size(v),
+        // The classic `$first` / `$last` count themselves only.
+        Acc::First(Some(v)) | Acc::Last(Some(v)) if sbe => memlimit::sbe_size(v),
+        Acc::MergeObjects(d) if sbe && !d.is_empty() => {
+            memlimit::sbe_size(&Bson::Null) + memlimit::bson_len(d)
         }
         _ => 0,
+    }
+}
+
+/// What mongod's classic accumulator object counts for itself (its
+/// `sizeof`), read from 8.2.11's `explain` (`maxAccumulatorMemoryUsageBytes`
+/// over five documents, 2026-10-26) on the Linux x86-64 build, the
+/// exemplar: the macOS arm64 build differs for some (`$sum` 184, `$topN`
+/// 568, ...). The values a `$push`, `$addToSet`, `$min` or `$max` holds are
+/// counted on top.
+fn classic_base(acc: &Acc) -> usize {
+    match acc {
+        Acc::Sum(_) | Acc::Count(_) => 176,
+        Acc::Avg(_) => 152,
+        Acc::Min(_) | Acc::Max(_) => 104,
+        Acc::First(_) => 120,
+        Acc::Last(_) | Acc::MergeObjects(_) => 112,
+        Acc::Push(_) | Acc::ConcatArrays(_) => memlimit::PUSH_BASE,
+        Acc::AddToSet(_) | Acc::SetUnion(_) => memlimit::ACCUMULATOR_BASE,
+        Acc::StdDev { .. } => 128,
+        Acc::NElem { kind, .. } => match kind {
+            NElemKind::First | NElemKind::Last => 200,
+            NElemKind::Max | NElemKind::Min => 168,
+        },
+        Acc::TopN { kind, .. } => match kind {
+            TopNKind::Top | TopNKind::Bottom => 608,
+            TopNKind::TopN | TopNKind::BottomN => 640,
+        },
+        Acc::Percentile { .. } => 320,
+        Acc::Script => 0,
     }
 }
 
@@ -2227,6 +2279,7 @@ fn run_group(
                 std::mem::take(&mut ids),
                 std::mem::take(&mut states),
                 &mut spills,
+                mem,
             )?;
             mem = 0;
         }
@@ -2235,7 +2288,7 @@ fn run_group(
     if !spills.is_empty() {
         // What is still in memory is spilled too, and every group comes out
         // of the merge, in key order.
-        crate::group_spill::spill(ids, states, &mut spills)?;
+        crate::group_spill::spill(ids, states, &mut spills, mem)?;
         let fields: Vec<&str> = compiled.iter().map(|c| c.field).collect();
         return crate::group_spill::merge(spills, &fields);
     }
@@ -3063,6 +3116,29 @@ pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<V
         } else {
             pairs.push((eval(group_by, d, vars)?, d));
         }
+    }
+    // mongod sorts the group keys with its external sorter, held to
+    // `internalDocumentSourceBucketAutoMaxMemoryBytes` (RM-315): spilled, or
+    // refused with 292. What it keeps of each document is what the stage
+    // reads.
+    {
+        let mut fields = std::collections::BTreeSet::new();
+        let bounded = collect_fields(group_by, &mut fields)
+            && output_spec
+                .values()
+                .all(|acc| collect_fields(acc, &mut fields));
+        let sizing = crate::sorter::Sizing {
+            source: crate::sorter::SortSource::BucketAuto,
+            fields: bounded.then_some(&fields),
+            budget: memlimit::budgets().bucket_auto,
+            added: None,
+        };
+        let items: Vec<(Vec<Bson>, Document)> = pairs
+            .iter()
+            .map(|(v, d)| (vec![v.clone()], (*d).clone()))
+            .collect();
+        let cmp = |a: &[Bson], b: &[Bson]| crate::order::cmp(&a[0], &b[0]);
+        crate::sorter::blocking_sort(items, &cmp, &sizing, None)?;
     }
     let mut keyed: Vec<(Vec<u8>, Bson, &Document)> = Vec::with_capacity(pairs.len());
     for (v, d) in pairs {

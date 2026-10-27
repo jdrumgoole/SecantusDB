@@ -458,6 +458,9 @@ fn outcome(
                 // `usedDisk` here and its `$group`'s spill counts after
                 // `nreturned`. The counts are this server's own spills.
                 let spilled = secantus_core::memlimit::report();
+                if spilled.has_sort_stage {
+                    entry.insert("hasSortStage", true);
+                }
                 if spilled.used_disk {
                     entry.insert("usedDisk", true);
                 }
@@ -469,6 +472,16 @@ fn outcome(
                 }
                 entry.insert("numYield", 0_i32);
                 entry.insert("nreturned", int32(returned()));
+                if spilled.sort_spills > 0 {
+                    entry.insert("sortSpills", spilled.sort_spills);
+                    entry.insert("sortSpilledBytes", spilled.sort_spilled_bytes);
+                    entry.insert("sortSpilledRecords", spilled.sort_spilled_records);
+                    entry.insert(
+                        "sortSpilledDataStorageSize",
+                        spilled.sort_spilled_data_storage_size,
+                    );
+                    entry.insert("sortTotalDataSizeBytes", spilled.sort_total_data_size);
+                }
                 if spilled.group_spills > 0 {
                     entry.insert("groupSpills", spilled.group_spills);
                     entry.insert("groupSpilledBytes", spilled.group_spilled_bytes);

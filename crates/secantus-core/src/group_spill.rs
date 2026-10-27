@@ -85,7 +85,14 @@ impl Drop for Spills {
 }
 
 /// Write the groups in memory to a new run, sorted by key.
-pub(crate) fn spill(ids: Vec<Bson>, states: Vec<Vec<Acc>>, spills: &mut Spills) -> R<()> {
+/// `held`: mongod's estimate of the groups' memory, which it reports as the
+/// spill's `spilledBytes` (the file's size is `spilledDataStorageSize`).
+pub(crate) fn spill(
+    ids: Vec<Bson>,
+    states: Vec<Vec<Acc>>,
+    spills: &mut Spills,
+    held: usize,
+) -> R<()> {
     if ids.is_empty() {
         return Ok(());
     }
@@ -138,7 +145,7 @@ pub(crate) fn spill(ids: Vec<Bson>, states: Vec<Vec<Acc>>, spills: &mut Spills) 
     if let Some(run) = spills.runs.last_mut() {
         run.groups = records as usize;
     }
-    memlimit::record_group_spill(records, bytes, stored);
+    memlimit::record_group_spill(records, held as i64, stored.max(bytes));
     Ok(())
 }
 
