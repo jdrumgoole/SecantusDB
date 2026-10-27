@@ -68,15 +68,23 @@ connection thread; no WT cursor may outlive its call):
      `NAT_SEQ_TABLE`; not for a collection holding an `_id` whose key keeps
      entry format 4's bytes), covered plans (documents read to project,
      not counted), a LIMIT above the projection.
-   - Left: descending and collated indexes (their stored order is not
-     mongod's: a descending string field's inverted bytes leave `"a"` before
-     `"ab"`, and a collated string keys by a one-level fold -- an
-     entry-format change, which needs its own decision), multikey (the
-     RecordId set across batches; this store also writes whole-array keys,
-     and an element that is an array cannot be told from one), OR plans,
-     SORT_MERGE, `min`/`max`, `returnKey` / `showRecordId`, blocking sorts
-     (read all for the first batch, counted as read; the sort is the store's
-     comparator, private to `secantus-storage`).
+   - Done 2026-10-27 (branch `rust-mdb-rm080-streaming-cursors`): the
+     stream is a small executor of the plan's stages (COLLSCAN, IXSCAN,
+     FETCH, SKIP, OR, SORT_MERGE, a SORT of index keys below the FETCH),
+     each yielding at the end of a batch. Entry format 6 keys a descending
+     field inverted and terminated (`sortkey::DESC_END`), an empty leaf
+     array `undefined` and an element lacking the leaf null, so every
+     index's entries are mongod's keys in mongod's order (plus this store's
+     whole-array keys, which a multikey scan passes over by the document's
+     own keys); `_id` key format 2 keys every `_id` in mongod's order. A
+     collated index needed no change: its entries were already the
+     collation's sort keys. Descending, multikey and collated scans, OR,
+     SORT_MERGE (and the planner's `SORT_MERGE` for a rooted `$or` whose
+     branches give the sort), `min`/`max`, `returnKey` / `showRecordId` and
+     the sort of keys (whose documents are fetched as a batch reaches them,
+     as mongod's are) stream. A sort of whole documents is read whole for
+     the first batch, as mongod reads it.
+   - Left: a plan mongod picks by trial (RM-349), `$near` (RM-347).
 3. **`aggregate`.**
    - Done (2026-10-24, branch `rust-mdb-stream3`, `agg_stream.rs`): a
      pipeline of `$match`, `$project`, `$unset`, `$addFields` / `$set`,
@@ -111,12 +119,15 @@ connection thread; no WT cursor may outlive its call):
      (`CursorRegistry::set_reads`), not of the view; a cursor-stage cursor
      whose collection or index is dropped returns what it buffered and
      fails at the next read (`StreamCursor::source_gone`), as on mongod.
-   - Left: a time-series collection, `$meta`, `$geoNear`, `notablescan`; a
-     collated index bounded on strings; a DISTINCT_SCAN `$group` down a
-     descending or along a collated index (RM-309); `keysExamined` /
-     `docsExamined` on the `aggregate` command's own line; counts for
-     `count`, `distinct`, write statements and `findAndModify` from their
-     reads.
+   - Done (2026-10-27, branch `rust-mdb-rm080-streaming-cursors`): a
+     collated index bounded on strings, a DISTINCT_SCAN `$group` down a
+     descending or along a collated index (RM-309), `notablescan` (its
+     stages that read other collections checked as each batch runs them),
+     `{$meta: "recordId"}`, `"indexKey"` and `"sortKey"`.
+   - Left: a time-series collection (RM-348), `$geoNear` (RM-347);
+     `keysExamined` / `docsExamined` on the `aggregate` command's own line;
+     counts for `count`, `distinct`, write statements and `findAndModify`
+     from their reads.
 4. **`storage` on the line.** WiredTiger's per-session statistics
    (`timeWaitingMicros`, bytes read and written) for the operation (the last
    part of RM-023).

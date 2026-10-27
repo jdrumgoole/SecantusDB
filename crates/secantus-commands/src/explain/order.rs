@@ -75,6 +75,16 @@ fn access(node: &Node) -> &Node {
     }
 }
 
+/// Whether the plan sorts whole documents in memory: a sort above its
+/// FETCH, not one of index keys below it.
+fn sorts_documents(node: &Node) -> bool {
+    match access(node) {
+        Node::Sort { on_keys, .. } => !on_keys,
+        Node::Fetch { input, .. } => sorts_documents(input),
+        _ => false,
+    }
+}
+
 /// Whether the plan sorts what its scan returns.
 fn has_sort(node: &Node) -> bool {
     match access(node) {
@@ -791,11 +801,39 @@ pub(crate) fn plain_sort(sort: &Document) -> bool {
         })
 }
 
+/// Whether a filter names a geo query operator anywhere.
+fn mentions_geo(filter: &Document) -> bool {
+    fn walk(v: &Bson) -> bool {
+        match v {
+            Bson::Document(d) => d.iter().any(|(k, v)| {
+                matches!(
+                    k.as_str(),
+                    "$geoWithin" | "$geoIntersects" | "$within" | "$near" | "$nearSphere"
+                ) || walk(v)
+            }),
+            Bson::Array(items) => items.iter().any(walk),
+            _ => false,
+        }
+    }
+    filter
+        .iter()
+        .any(|(k, v)| matches!(k.as_str(), "$geoWithin" | "$geoIntersects" | "$within") || walk(v))
+}
+
+/// What a `find` asks of its plan beyond its query (`min` / `max`,
+/// `returnKey`, `showRecordId`).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct StreamFlags {
+    pub min_max: bool,
+    pub return_key: bool,
+    pub show_record_id: bool,
+}
+
 /// The plan mongod runs for a `find` that a streaming cursor can read
 /// (`stream::Stream`), or `None` to read it as before: a collection that
-/// streams, no collation, no geo predicate or `$near`, a plan nothing
-/// contests (choosing among several needs mongod's trial over the
-/// collection) and no in-memory sort.
+/// streams, no geo predicate or `$near`, a plan nothing contests (choosing
+/// among several needs mongod's trial over the collection) and no
+/// in-memory sort. Under a collation the plan is the collated one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn stream_plan(
     storage: &dyn Storage,
@@ -804,9 +842,8 @@ pub(crate) fn stream_plan(
     limit: i64,
     projection: Option<&Document>,
     batch_size: bool,
+    flags: StreamFlags,
 ) -> Result<Option<Node>, StorageError> {
-    // Under a collation the plan is the collated one; a scan of a collated
-    // index streams only over bounds without strings (`stream::streams`).
     if !storage.can_stream(ask.db, ask.coll)? {
         return Ok(None);
     }
@@ -832,9 +869,9 @@ pub(crate) fn stream_plan(
         limit,
         hint,
         collation: ask.collation,
-        min_max: false,
-        return_key: false,
-        show_record_id: false,
+        min_max: flags.min_max,
+        return_key: flags.return_key,
+        show_record_id: flags.show_record_id,
         batch_size,
         keys_only: false,
         wanted: None,
@@ -842,11 +879,19 @@ pub(crate) fn stream_plan(
         implies: &implied,
         trial: None,
     };
-    if plan::contested(&query, &catalog) {
+    if !flags.min_max && plan::contested(&query, &catalog) {
         return Ok(None);
     }
     let plan = plan::plan(&query, &catalog);
-    if has_sort(&plan) {
+    // A sort of whole documents the plan does in memory reads them all for
+    // the first batch, on mongod too: that read is the one made before. A
+    // sort of index keys below the FETCH streams (`stream::Stage::SortKeys`).
+    if sorts_documents(&plan) {
+        return Ok(None);
+    }
+    // An `$or` with a geo branch is read with each branch's geo scan
+    // (RM-151), which this planner does not plan: read as before.
+    if matches!(plan, Node::Subplan(_)) && mentions_geo(ask.filter) {
         return Ok(None);
     }
     // A geo index that would order a scan of the collection.

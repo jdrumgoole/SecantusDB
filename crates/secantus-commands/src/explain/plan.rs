@@ -726,15 +726,21 @@ fn access_of(chosen: IndexUse, parts: &[Document], q: &Query) -> Access {
     let fetch_filter = residual(&chosen, parts);
     let index = chosen.index.clone();
     if q.min_max {
+        // A sort the index gives walks it that way between `min` and `max`
+        // (mongod 8.2.11: `IXSCAN ... backward` for the reverse of the key).
+        let backward = sort
+            .filter(|_| !collation_differs(&index, q.collation))
+            .and_then(|s| serves_sort(&index, &chosen.bounds, s));
         return Access {
             scan: Node::IxScan(IxScan {
                 no_bounds: true,
+                backward: backward.unwrap_or(false),
                 ..IxScan::full(index.clone())
             }),
             fetch_filter,
             indexed: true,
             index: Some(index),
-            sorted: false,
+            sorted: backward.is_some(),
             subplan: false,
         };
     }
@@ -930,7 +936,38 @@ fn or_access(
     let mut inputs: Vec<Node> = scans.into_iter().map(fetched).collect();
     inputs.extend(own);
     inputs.extend(last);
+    if let Some(merged) = sort_of(q).and_then(|s| merge_branches(&inputs, s, q)) {
+        return Some((merged, None));
+    }
     Some((Node::Or(inputs), None))
+}
+
+/// The `$or`'s branches merged in the sort's order, when every branch's
+/// scan gives it: mongod 8.2.11 plans `SORT_MERGE` over the branches (each
+/// walked the way that gives the sort, a FETCH above one that filters) in
+/// place of the `OR` and the blocking `SORT` above it.
+fn merge_branches(inputs: &[Node], sort: &Document, q: &Query) -> Option<Node> {
+    let mut merged = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let mut input = input.clone();
+        let ix = match &mut input {
+            Node::IxScan(ix) => ix,
+            Node::Fetch { input, .. } => match input.as_mut() {
+                Node::IxScan(ix) => ix,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if collation_differs(&ix.index, q.collation) {
+            return None;
+        }
+        ix.backward = serves_sort(&ix.index, &ix.bounds, sort)?;
+        merged.push(input);
+    }
+    Some(Node::SortMerge {
+        pattern: sort.clone(),
+        inputs: merged,
+    })
 }
 
 fn access(q: &Query, catalog: &[Rc<IndexInfo>]) -> Access {
@@ -962,12 +999,13 @@ fn access(q: &Query, catalog: &[Rc<IndexInfo>]) -> Access {
         if let Ok(parsed) = only.get_array("$or") {
             if q.hint == Hint::None {
                 if let Some((scan, fetch_filter)) = or_access(parsed, &[], q, catalog) {
+                    let sorted = matches!(scan, Node::SortMerge { .. });
                     return Access {
                         scan,
                         fetch_filter,
                         indexed: true,
                         index: None,
-                        sorted: false,
+                        sorted,
                         subplan: true,
                     };
                 }
@@ -998,12 +1036,13 @@ fn access(q: &Query, catalog: &[Rc<IndexInfo>]) -> Access {
             .collect();
         if let Some((scan, recheck)) = or_access(branches, &rest, q, catalog) {
             rest.extend(recheck);
+            let sorted = matches!(scan, Node::SortMerge { .. });
             return Access {
                 scan,
                 fetch_filter: assemble(rest),
                 indexed: true,
                 index: None,
-                sorted: false,
+                sorted,
                 subplan: false,
             };
         }
@@ -1226,13 +1265,14 @@ fn candidates(
                     .collect();
                 if let Some((scan, recheck)) = or_access(branches, &rest, q, catalog) {
                     rest.extend(recheck);
+                    let sorted = matches!(scan, Node::SortMerge { .. });
                     out.push((
                         Access {
                             scan,
                             fetch_filter: assemble(rest),
                             indexed: true,
                             index: None,
-                            sorted: false,
+                            sorted,
                             subplan: false,
                         },
                         None,
@@ -1770,11 +1810,27 @@ fn wrap(a: Access, q: &Query) -> Node {
             (Some(ix), Some(p)) => covers(ix, p) && blocking.is_none_or(|s| in_key(s, ix)),
             _ => false,
         };
-    // A sort on fields the index holds runs on the keys, below the fetch.
+    // A sort on fields the index holds runs on the keys, below the fetch;
+    // over an `$or` of scans, when every scan's index holds them (mongod
+    // 8.2.11: `FETCH <- SORT <- OR <- IXSCAN...`).
+    fn keys_hold(
+        node: &Node,
+        s: &Document,
+        in_key: &dyn Fn(&Document, &IndexInfo) -> bool,
+    ) -> bool {
+        match node {
+            Node::IxScan(ix) => in_key(s, &ix.index),
+            Node::Or(inputs) => inputs.iter().all(|i| keys_hold(i, s, in_key)),
+            _ => false,
+        }
+    }
     let sort_on_keys = blocking.is_some_and(|s| {
         a.fetch_filter.is_none()
-            && matches!(a.scan, Node::IxScan(_))
-            && a.index.as_ref().is_some_and(|ix| in_key(s, ix))
+            && match &a.scan {
+                Node::IxScan(_) => a.index.as_ref().is_some_and(|ix| in_key(s, ix)),
+                or @ Node::Or(_) => keys_hold(or, s, &in_key),
+                _ => false,
+            }
     });
     let absorbed = (q.limit > 0).then_some(q.limit + q.skip);
     let sort_node = |input: Node, on_keys: bool| Node::Sort {

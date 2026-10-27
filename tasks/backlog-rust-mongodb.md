@@ -1524,19 +1524,6 @@ What is left, all on the RUST MongoDB server:
       server lists the `$match` alone (found 2026-10-24).
       Backlog-ID: RM-308
       Verify: tests/backlog/test_rm_found_2026_10_24.py::test_explain_lists_the_projection_a_limit_moved_past
-- [ ] **A `$group` read from a DISTINCT_SCAN this server does not stream
-      returns its groups in first-seen order.** mongod 8.2.11 returns the
-      groups of a `$groupByDistinctScan` in the scan's order. This server
-      streams the scan over an ascending, uncollated index of the
-      collection the command names, or of the collection beneath a view
-      (2026-10-25); down a descending index, or along a collated one with
-      the command's collation, it groups the documents in the order they
-      arrive: `{x: -1}`
-      gives `1, 2, 3, 0` where mongod gives `3, 2, 1, 0`, and the `$first`
-      of each group is the first document read, not the first the scan
-      reaches (found 2026-10-25).
-      Backlog-ID: RM-309
-      Verify: tests/backlog/test_rm_found_2026_10_25.py::test_a_distinct_scan_group_this_server_does_not_stream_keeps_the_scans_order
 - [ ] **`explain` of a sorted or filtered DISTINCT_SCAN `$group` lists no
       `rejectedPlans`.** mongod 8.2.11 tries each index that could answer
       it (with `$first` of `y` over `x_1`, `x_1_y_1` and `x_1_z_1`, after a
@@ -1625,39 +1612,50 @@ cursor options, `getMore`, `killCursors`, the cursors of `aggregate` and the
 listing commands, tailable cursors, `count`, `distinct`). The Rust server
 differs on 5 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: a cursor that does not stream yet is the
-      result as it was when the command ran.** It reads every matching
-      document and keeps the rest for `getMore`. mongod reads on as the
-      cursor is read, so its `getMore` sees a document inserted, changed or
-      deleted since. Since 2026-10-24 a `find` streams over a collection
-      scan either way (`$natural: -1` too), and over an ascending,
-      uncollated, non-multikey index either way, the `_id` index included,
-      with skip, limit, projection and covered plans; an `aggregate` streams
-      when its stages are `$match`, `$project`, `$unset`, `$addFields` /
-      `$set`, `$replaceRoot` / `$replaceWith`, `$unwind`, `$redact`, `$skip`,
-      `$limit`, `$lookup`, `$unionWith` and a `$sort` the plan reads in
-      order, batch by batch where mongod's planner takes the pipeline whole
-      (or pushes it into SBE), else through mongod's cursor-stage buffer (32
-      documents, doubling, up to 4 MB), and when it opens with a `$group`
-      mongod reads from a DISTINCT_SCAN; one asked for a first batch of none
-      runs at its first `getMore` (2026-10-25). Both read on through a view
-      and under a collation (2026-10-25), a collated index too when its
-      bounds hold only numbers or dates. What is left
-      (`tasks/streaming-cursors-plan.md` phases 2 and 3): a descending or
-      multikey index, and a collated one bounded on strings (this store's
-      keys for a descending string field and for a collated string are not
-      in mongod's order, so walking them would return the wrong order: an
-      entry-format change), OR plans and SORT_MERGE, `min` / `max`,
-      `returnKey` / `showRecordId`, blocking sorts; and in `aggregate`, a
-      time-series collection, `$meta`, `$geoNear` and `notablescan`. An `_id` walk is
-      not used for a collection holding an `_id` whose key keeps entry
-      format 4's encoding (a document, BinData, JavaScript, MaxKey); one
-      inserted after the cursor opened is returned
-      where its key falls, which among several such `_id`s need not be
-      mongod's order. Tests that write between batches see the difference;
-      so does memory, for a large result.
-      Backlog-ID: RM-080
-      Verify: tests/backlog/test_rm_057_084.py::test_descending_index_get_more_sees_writes_made_since_the_find, tests/backlog/test_rm_found_2026_10_25.py::test_a_cursor_over_a_collated_index_of_strings_reads_on
+- [ ] **RUST MongoDB server: a `$near` or `$geoNear` cursor is the result
+      as it was when the command ran.** mongod searches rings around the
+      centre as the cursor is read: the ring searched buffers its documents,
+      and a later ring is searched against the collection as it is then, so
+      a `getMore` returns a document inserted in a ring not yet searched and
+      not one deleted from it (`find` with `$near` and `batchSize: 1` over
+      points at 0..5 degrees, then an insert at 0.5 and 4.5 and a delete at
+      3: mongod 8.2.11 returns `0, 20, 1, 2, 4, 21, 5`; this server `0..5`).
+      The ring order itself is mongod's (`secantus_core::geoorder::near`, a
+      replay over the whole collection); what is missing is running it ring
+      by ring across batches, the search's state (rings, queue, increment)
+      kept between them, each ring reading the store as it is then, and an
+      aggregate's `$geoNear` through its cursor stage (found 2026-10-27,
+      RM-080's remainder).
+      Backlog-ID: RM-347
+      Verify: tests/backlog/test_rm_found_2026_10_27b.py::test_a_near_read_goes_ring_by_ring
+- [ ] **RUST MongoDB server: a time-series cursor is not read bucket by
+      bucket.** mongod reads a time-series collection's buckets through its
+      cursor stage (32 bucket documents first, twice as many at each refill)
+      and unpacks each as the cursor reaches it, so what a `getMore` returns
+      after a delete depends on how many buckets were buffered: over 4,000
+      measurements in 100 buckets, read one at a time and all deleted after
+      the first, mongod 8.2.11 returns 2,303 more. This server keeps
+      measurements as ordinary documents and works the buckets out when
+      asked (section 7.071, the derived buckets), so it has no bucket to
+      buffer; it reads 3,999. Depends on keeping buckets, or deriving them
+      stably enough to resume after one (found 2026-10-27, RM-080's
+      remainder).
+      Backlog-ID: RM-348
+      Verify: tests/backlog/test_rm_found_2026_10_27b.py::test_a_time_series_read_goes_bucket_by_bucket
+- [ ] **RUST MongoDB server: a cursor whose plan mongod picks by trial is
+      the result as it was when the command ran.** When two indexes could
+      answer a query, mongod runs both until one returns 101 documents (or
+      ends, or spends its works budget), keeps the winner's trial results
+      and then reads on from where the winner stopped; this server reads
+      everything at the command (`stream_plan` declines a contested plan).
+      Over 3,000 documents with `a_1` and `b_1` both usable, read two at a
+      time and all deleted after the first batch, mongod 8.2.11 returns 101
+      in all and this server 1,557. Streaming it means streaming the
+      winner after a buffer of its trial's results, with the trial's works
+      and results counted as mongod's are; RM-154 (the plan cache) works in
+      the same code (found 2026-10-27, RM-080's remainder).
+      Backlog-ID: RM-349
+      Verify: tests/backlog/test_rm_found_2026_10_27b.py::test_a_plan_mongod_tried_buffers_only_its_trial
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
   `$meta: "textScore"` sorts, an `explain: true` aggregate. Every
   `{$meta}` shape measured on 8.2.11 matches since 2026-10-17, except a

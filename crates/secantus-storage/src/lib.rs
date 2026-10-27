@@ -2933,8 +2933,10 @@ fn shell_value(v: &Bson) -> String {
                 &hex[20..]
             )
         }
-        // An empty array has no element to index, and its key is `undefined`.
+        // An empty array has no element to index, and its key is `undefined`
+        // (entry format 6 holds that key itself).
         Bson::Array(a) if a.is_empty() => "undefined".to_string(),
+        Bson::Undefined => "undefined".to_string(),
         // Every other type as mongod prints it: `new Date(<ms>)`,
         // `{ a: 1, b: "x" }`, `BinData(0, ABCD)`, `Timestamp(5, 6)`, `/a/i`.
         // These reached the client as Rust's `Debug` text (measured against
@@ -3175,7 +3177,8 @@ fn unescape_kb(esc: &[u8]) -> Vec<u8> {
 ///   Formats 1-3 keyed them by raw BSON, whose leading length made byte order
 ///   SIZE order, so ranges, partial-filter implication and sort walks over
 ///   document keys had to be refused. `_id` keys are NOT index entries and
-///   keep the old encoding (`sortkey::encode_id_key`).
+///   kept the old encoding until `_id` key format 2 (`sortkey::ID_KEY_FORMAT`,
+///   `Storage::upgrade_id_keys`).
 /// * 5 — BinData keys carry the subtype between length and bytes, and
 ///   JavaScript-with-scope has a rank of its own after JavaScript (14, which
 ///   moves MaxKey to 15) keyed by code then scope: mongod's order
@@ -3183,12 +3186,22 @@ fn unescape_kb(esc: &[u8]) -> Vec<u8> {
 ///   rebuilt when the store opens (`index_entries_outdated`); formats 1-3 are
 ///   still refused. The PG server's indexes record PostgreSQL's BinData order
 ///   instead (`BINDATA_ORDER_OPT`).
+/// * 6 — an index's entries are mongod's keys in mongod's order, so that a
+///   cursor can walk them and return what mongod's walk returns (RM-080,
+///   2026-10-27). A DESCENDING field's key is the ascending key inverted and
+///   then terminated (`sortkey::DESC_END`): inverted alone, `"a"` sorted
+///   before `"ab"` where the field's order has `"ab"` first. An empty leaf
+///   array is keyed `undefined` (after MinKey, before null), and an element
+///   on a dotted path that does not reach the leaf is keyed null in an index
+///   that is not sparse (`secantus_core::index_keys`); format 5 kept neither.
+///   The whole-array key this store writes besides mongod's keys stays. A
+///   format-5 index (and a format-4 one) is rebuilt when the store opens.
 ///
 /// The catalog is the only place this is visible — the WT `key_format` is
 /// `SSSu` for all three — so the marker is how an older store is detected
 /// (`reject_legacy_index_entry_format`). The deprecated Python servers' `_ENTRY_FORMAT`
 /// stays at 4: compatibility with them is no longer a constraint (2026-10-16).
-const ENTRY_FORMAT: i32 = 5;
+const ENTRY_FORMAT: i32 = 6;
 
 /// The oldest entry format an open brings up to date by rebuilding the index
 /// (`rebuild_outdated_indexes`) instead of refusing the store: 4, whose entries
@@ -3312,29 +3325,16 @@ fn compound_join(parts: &[Vec<u8>]) -> Vec<u8> {
 }
 
 /// Candidate index values for `field` in `doc`, plus whether the field makes
-/// the index multikey. Mirrors mongod's key generation: a scalar leaf gives
-/// itself; an array leaf gives one value per element *plus* the whole array
-/// (the key a whole-array equality probes); a path descending *through* an
-/// array — `prices.owner_id` over an array of subdocuments — gives one value
-/// per element's leaf and no whole-array key. A missing path indexes as null.
-/// Mirrors `storage._index_field_values`.
-fn index_field_values(doc: &Document, field: &str) -> (Vec<Bson>, bool) {
-    let (values, descended) = get_path_values(doc, field);
-    if values.is_empty() {
-        return (vec![Bson::Null], descended);
-    }
-    let mut out: Vec<Bson> = Vec::new();
-    let mut multikey = descended;
-    for v in values {
-        if let Bson::Array(arr) = v {
-            multikey = true;
-            out.extend(arr.iter().cloned());
-            out.push(v.clone());
-        } else {
-            out.push(v.clone());
-        }
-    }
-    (out, multikey)
+/// the index multikey: mongod's keys (`secantus_core::index_keys`: an array
+/// leaf's elements, `undefined` for an empty one, null for an element on the
+/// way that does not reach the leaf unless the index is `sparse`, null for a
+/// missing path) *plus* each whole leaf array, the key a whole-array
+/// equality probes (entry format 6).
+fn index_field_values(doc: &Document, field: &str, sparse: bool) -> (Vec<Bson>, bool) {
+    let keys = secantus_core::index_keys::field_keys(doc, field, sparse);
+    let mut out = keys.mongod;
+    out.extend(keys.whole_arrays);
+    (out, keys.multikey)
 }
 
 /// `has_path` that descends into arrays — the sparse-index gate. A sparse index
@@ -3817,57 +3817,27 @@ pub fn with_candidate_order<T>(order: Vec<i64>, f: impl FnOnce() -> T) -> T {
 }
 
 fn doc_makes_multikey(doc: &Document, key_spec: &Document) -> bool {
-    key_spec.keys().any(|f| index_field_values(doc, f).1)
-}
-
-/// Whether the path `parts` passes through an array one of whose elements
-/// does not reach the leaf: not a document, or a document without the field.
-fn element_lacks_leaf(value: &Bson, parts: &[&str], in_array: bool) -> bool {
-    let Some((first, rest)) = parts.split_first() else {
-        return false;
-    };
-    match value {
-        Bson::Document(d) => match d.get(*first) {
-            Some(next) => element_lacks_leaf(next, rest, in_array),
-            None => in_array,
-        },
-        Bson::Array(items) => items.iter().any(|item| match item {
-            Bson::Document(_) => element_lacks_leaf(item, parts, true),
-            _ => true,
-        }),
-        _ => in_array,
-    }
+    key_spec.keys().any(|f| index_field_values(doc, f, false).1)
 }
 
 /// How many keys mongod holds for `doc` in an index on `key_spec`: for each
 /// field, one per distinct value (an array's elements, or one for an empty
-/// array or a missing field), and their product across the fields. The
+/// array or a missing field, and a null for an element on the way that does
+/// not reach the leaf), and their product across the fields. The
 /// whole-array entry this store also keeps is not one of mongod's keys.
 fn reference_key_count(doc: &Document, key_spec: &Document, coll: Option<&Collation>) -> i64 {
     key_spec
         .keys()
         .map(|field| {
-            let (values, _) = get_path_values(doc, field);
             let mut seen: HashSet<Vec<u8>> = HashSet::new();
             let mut unencodable = 0i64;
-            let mut note = |v: &Bson| match enc_dir_c(v, 1, coll) {
-                Ok(key) => {
-                    seen.insert(key);
+            for v in secantus_core::index_keys::field_keys(doc, field, false).mongod {
+                match enc_dir_c(&v, 1, coll) {
+                    Ok(key) => {
+                        seen.insert(key);
+                    }
+                    Err(_) => unencodable += 1,
                 }
-                Err(_) => unencodable += 1,
-            };
-            for value in values {
-                match value {
-                    Bson::Array(items) if items.is_empty() => note(&Bson::Undefined),
-                    Bson::Array(items) => items.iter().for_each(&mut note),
-                    other => note(other),
-                }
-            }
-            // An element of an array on the way that has no such leaf is a
-            // null key to mongod (this store holds no entry for it).
-            let parts: Vec<&str> = field.split('.').collect();
-            if element_lacks_leaf(&Bson::Document(doc.clone()), &parts, false) {
-                note(&Bson::Null);
             }
             (seen.len() as i64 + unencodable).max(1)
         })
@@ -3906,7 +3876,7 @@ fn index_key_variants_c(
     // cartesian product below.
     let mut per_field: Vec<Vec<Bson>> = Vec::with_capacity(fields.len());
     for (f, d) in &fields {
-        let (cands, _multikey) = index_field_values(doc, f);
+        let (cands, _multikey) = index_field_values(doc, f, sparse);
         if cands.len() == 1 {
             per_field.push(cands);
             continue;
@@ -4004,7 +3974,7 @@ fn conflict_key_value(
         .collect();
     let per_field: Vec<Vec<Bson>> = fields
         .iter()
-        .map(|(f, _)| index_field_values(doc, f).0)
+        .map(|(f, _)| index_field_values(doc, f, false).0)
         .collect();
     let combos = per_field.iter().try_fold(1usize, |acc, c| {
         acc.checked_mul(c.len()).filter(|n| *n <= MAX_COMPOUND_KEYS)
@@ -6340,6 +6310,29 @@ fn load_stable_marker(session: &Session) -> Option<(i64, bool)> {
 /// `Storage::upgrade_number_keys`).
 const NUMBER_KEYS_META: &str = "numberKeys";
 
+/// The oplog-meta row recording a store's `_id` key format
+/// (`sortkey::ID_KEY_FORMAT`; see `Storage::upgrade_id_keys`).
+const ID_KEYS_META: &str = "idKeys";
+
+/// The `_id` key format a store's keys are in: 1 when it never recorded one
+/// (every store written before 2026-10-27).
+fn stored_id_key_format(session: &Session) -> Result<i32> {
+    let c = match session.open_cursor(OPLOG_META_TABLE, None) {
+        Ok(c) => c,
+        Err(e) if e.is_missing_table() || e.is_not_found() => return Ok(1),
+        Err(e) => return Err(e.into()),
+    };
+    c.set_key_s(ID_KEYS_META);
+    match c.search() {
+        Ok(()) => {
+            let d = decode_doc(&c.get_value_u()?)?;
+            Ok(d.get_i32("format").unwrap_or(1))
+        }
+        Err(e) if e.is_not_found() => Ok(1),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// The number-key format a store's keys are in: 1 when it never recorded
 /// one (every store written before 2026-10-15).
 fn stored_number_key_format(session: &Session) -> Result<i32> {
@@ -7133,6 +7126,7 @@ impl Storage {
         // Before anything looks a key up: crash recovery below replays writes
         // by `_id`.
         storage.upgrade_number_keys()?;
+        storage.upgrade_id_keys()?;
         if storage.data_nonlogged {
             // Crash recovery: the data tables rolled back to the last stable
             // checkpoint; the (WAL-logged) oplog has everything. Replay the
@@ -16512,6 +16506,187 @@ impl Storage {
         Ok(())
     }
 
+    /// Bring a store written with `_id` key format 1 to format 2
+    /// (`sortkey::ID_KEY_FORMAT`), once, before anything reads or writes
+    /// through its keys. Format 1 keyed a document `_id` by its raw BSON and a
+    /// BinData, JavaScript-with-scope or MaxKey `_id` by entry format 4's
+    /// bytes, so the `_id` index was not in mongod's order for them, and a
+    /// cursor walking it could not return what mongod's walk returns (RM-080).
+    /// The `_id` index row and the in-row `_id` key of each such document are
+    /// re-keyed; the `_id` claims keep their keys (they key a document by
+    /// value already). A store whose data tables are not logged is
+    /// checkpointed before the format is recorded, so that a crash cannot
+    /// leave the record without the keys it describes.
+    fn upgrade_id_keys(&self) -> Result<()> {
+        let session = self.conn.open_session()?;
+        if stored_id_key_format(&session)? >= sortkey::ID_KEY_FORMAT {
+            return Ok(());
+        }
+        self.rekey_format1_ids(&session)?;
+        if self.data_nonlogged && !self.in_memory {
+            self.checkpoint()?;
+        }
+        session.begin_transaction(None)?;
+        let outcome = (|| -> Result<()> {
+            let cur = session.open_cursor(OPLOG_META_TABLE, None)?;
+            cur.set_key_s(ID_KEYS_META);
+            cur.set_value_u(&encode_doc(&bson::doc! {"format": sortkey::ID_KEY_FORMAT})?);
+            cur.insert()?;
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => commit_stamped(&session, &self.oplog, self.timestamped)?,
+            Err(e) => {
+                if let Err(rollback) = session.rollback_transaction(None) {
+                    eprintln!(
+                        "secantus-storage: rolling back the _id key format record failed: \
+                         {rollback:?}"
+                    );
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-key every document whose `_id` key `_id` key format 1 wrote
+    /// otherwise than format 2: its row in the `_id` index and the `_id` key
+    /// framed into its document row. A time-series key keeps its 10-byte
+    /// suffix. Two documents whose `_id`s mongod calls equal (`{a: 1}` and
+    /// `{a: 1.0}`, which format 1 keyed apart) cannot both take the new key:
+    /// the one re-keyed first does, the other keeps its old key and stays
+    /// readable by a scan, and the count is logged -- as
+    /// `rekey_numeric_ids` does.
+    fn rekey_format1_ids(&self, session: &Session) -> Result<()> {
+        const CHUNK: usize = 500;
+        let mut rows: Vec<(String, String, Vec<u8>, i64)> = Vec::new();
+        {
+            let cur = match session.open_cursor(NAT_SEQ_TABLE, None) {
+                Ok(c) => c,
+                Err(e) if e.is_missing_table() || e.is_not_found() => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+            let mut more = cur.next()?;
+            while more {
+                let (db, coll, key) = cur.get_key_ssu()?;
+                if sortkey::may_be_format1_id_key(&key) {
+                    let rid = cur.get_value_q()?;
+                    rows.push((db, coll, key, rid));
+                }
+                more = cur.next()?;
+            }
+        }
+        let mut kept = 0u64;
+        let mut timeseries: HashMap<(String, String), bool> = HashMap::new();
+        for chunk in rows.chunks(CHUNK) {
+            session.begin_transaction(None)?;
+            let outcome = (|| -> Result<u64> {
+                let nat = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
+                let nat_del = session.open_cursor(NAT_SEQ_TABLE, None)?;
+                let mut kept = 0u64;
+                for (db, coll, old, rid) in chunk {
+                    let ts = match timeseries.get(&(db.clone(), coll.clone())) {
+                        Some(t) => *t,
+                        None => {
+                            let t = coll_meta(session, db, coll)?.timeseries;
+                            timeseries.insert((db.clone(), coll.clone()), t);
+                            t
+                        }
+                    };
+                    let docs = match session.open_cursor(&doc_table_for(db, coll), None) {
+                        Ok(c) => c,
+                        Err(e) if e.is_missing_table() => continue,
+                        Err(e) => return Err(e.into()),
+                    };
+                    docs.set_key_ssq(db, coll, *rid);
+                    match docs.search() {
+                        Ok(()) => {}
+                        // An `_id` row whose document is gone: nothing to key.
+                        Err(e) if e.is_not_found() => continue,
+                        Err(e) => return Err(e.into()),
+                    }
+                    let value = docs.get_value_u()?;
+                    let (framed, blob) = unframe_doc_value(&value)?;
+                    if framed != old.as_slice() {
+                        return Err(StorageError::Internal(format!(
+                            "document {rid} of '{db}.{coll}' holds another _id key than \
+                             its _id index row"
+                        )));
+                    }
+                    let raw = bson::RawDocument::from_bytes(blob)
+                        .map_err(|e| StorageError::Bson(e.to_string()))?;
+                    let id: Bson = raw
+                        .get("_id")
+                        .map_err(|e| StorageError::Bson(e.to_string()))?
+                        .ok_or_else(|| {
+                            StorageError::Internal(format!(
+                                "document {rid} of '{db}.{coll}' has no _id"
+                            ))
+                        })?
+                        .to_raw_bson()
+                        .try_into()
+                        .map_err(|e: bson::raw::Error| StorageError::Bson(e.to_string()))?;
+                    let mut new = id_key(&id)?;
+                    if ts {
+                        let suffix = old.len().saturating_sub(10);
+                        new.extend_from_slice(&old[suffix..]);
+                    }
+                    if new == *old {
+                        continue;
+                    }
+                    nat.reset()?;
+                    nat.set_key_ssu(db, coll, &new);
+                    nat.set_value_q(*rid);
+                    match nat.insert() {
+                        Ok(()) => {}
+                        Err(e) if e.is_duplicate_key() => {
+                            kept += 1;
+                            continue;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                    nat_del.reset()?;
+                    nat_del.set_key_ssu(db, coll, old);
+                    nat_del.remove()?;
+                    let blob = blob.to_vec();
+                    docs.reset()?;
+                    docs.set_key_ssq(db, coll, *rid);
+                    docs.set_value_u(&frame_doc_value(&new, &blob));
+                    docs.update()?;
+                    self.sizes.adjust(
+                        session,
+                        db,
+                        coll,
+                        Delta::replace((old.len(), blob.len()), (new.len(), blob.len())),
+                    );
+                }
+                Ok(kept)
+            })();
+            match outcome {
+                Ok(n) => {
+                    commit_stamped(session, &self.oplog, self.timestamped)?;
+                    kept += n;
+                }
+                Err(e) => {
+                    if let Err(rollback) = session.rollback_transaction(None) {
+                        eprintln!(
+                            "secantus-storage: rolling back an _id re-key chunk failed: \
+                             {rollback:?}"
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        if kept > 0 {
+            eprintln!(
+                "secantus-storage: {kept} stored _id values are equal to another stored _id \
+                 by value, and keep their earlier key"
+            );
+        }
+        Ok(())
+    }
+
     /// Drop every `_id` claim in `UNIQ_TABLE` (the index name `_id_`) and the
     /// two rows recording that they were all taken, so that the open takes
     /// them again under the current keys.
@@ -18176,11 +18351,13 @@ impl Storage {
     /// Whether `desc`'s entries answer `filter` where a MISSING value would.
     ///
     /// A dotted key over an array of documents (`p.q` over
-    /// `{p: [{q: 1}, {r: 1}]}`) holds an entry for each element that has the
+    /// `{p: [{q: 1}, {r: 1}]}`) held an entry for each element that has the
     /// leaf and none for one that does not, where mongod indexes that
     /// element as null and matches `{"p.q": null}` on it. So a predicate a
     /// missing value satisfies, on such a field of a multikey index, is not
     /// read from the entries: `find({"p.q": null})` left that document out.
+    /// Entry format 6 writes that null in an index that is not sparse; the
+    /// guard stays, which costs a collection scan and never an answer.
     fn holds_missing_leaves(
         &self,
         session: &Session,
@@ -22056,9 +22233,10 @@ impl Storage {
 
     /// Candidates for a predicate on `_id` that is not a point lookup -- a
     /// range, a negation, a type -- read from the `_id` index between the
-    /// predicate's bounds. That index keys a document `_id` by its raw BSON
-    /// (`sortkey::encode_id_key`), not by value, so its documents are read
-    /// whole and out of order.
+    /// predicate's bounds. `_id` key format 1 keyed a document `_id` by its
+    /// raw BSON, not by value; a store is re-keyed to format 2 when it opens
+    /// (`upgrade_id_keys`), but a document `_id` equal by value to another
+    /// keeps its old key, so documents are still read whole and out of order.
     fn try_id_range_id_keys(
         &self,
         session: &Session,
@@ -24021,6 +24199,132 @@ mod tests {
         );
     }
 
+    /// An index of entry format 5 -- a descending string keyed by its
+    /// inverted bytes alone, no `undefined` key for an empty array -- is
+    /// rebuilt when the store opens (RM-080), and its entries are then in
+    /// mongod's order: walking `{s: -1}` meets `"ab"` before `"a"`, as
+    /// mongod 8.2.11's walk does.
+    #[test]
+    fn open_rebuilds_an_entry_format_5_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("db");
+        std::fs::create_dir_all(&home).unwrap();
+        let home_s = home.to_str().unwrap();
+        {
+            let st = Storage::open(home_s).unwrap();
+            let docs = [(1, "a"), (2, "ab"), (3, ""), (4, "b")]
+                .into_iter()
+                .map(|(u, s)| encode_doc(&doc! {"_id": u, "u": u, "s": s, "t": []}).unwrap())
+                .collect();
+            st.insert("app", "c", docs, true).unwrap();
+            st.create_index("app", "c", "s_-1", &doc! {"s": -1i32}, &Document::new())
+                .unwrap();
+            st.create_index("app", "c", "t_1", &doc! {"t": 1i32}, &Document::new())
+                .unwrap();
+        }
+        for name in ["s_-1", "t_1"] {
+            age_index(home_s, "c", name, |o| {
+                o.insert("entryFormat", 5i32);
+            });
+        }
+        let st = Storage::open(home_s).unwrap();
+        for name in ["s_-1", "t_1"] {
+            let (_, _, opts) = st
+                .iter_indexes(&st.conn.open_session().unwrap(), "app", "c")
+                .unwrap()
+                .into_iter()
+                .find(|(n, _, _)| n == name)
+                .unwrap();
+            assert_eq!(opts.get_i32("entryFormat").ok(), Some(ENTRY_FORMAT));
+        }
+        let walk = st
+            .index_entries_from("app", "c", "s_-1", &[], None, 10, false)
+            .unwrap();
+        let order: Vec<i64> = walk.iter().map(|(_, rid)| *rid).collect();
+        // "b", "ab", "a", "": RecordIds 4, 2, 1, 3.
+        assert_eq!(order, vec![4, 2, 1, 3]);
+        let undefined = sortkey::encode_value(&Bson::Undefined, None).unwrap();
+        let walk = st
+            .index_entries_from("app", "c", "t_1", &undefined, None, 10, false)
+            .unwrap();
+        assert!(walk.iter().take(4).all(|(k, _)| *k == undefined));
+        assert_eq!(ids_of(&st, "c", doc! {"s": {"$lte": "ab"}}), vec![1, 2, 3]);
+        assert_eq!(ids_of(&st, "c", doc! {"t": []}), vec![1, 2, 3, 4]);
+    }
+
+    /// A store written with `_id` key format 1 -- a document `_id` keyed by
+    /// its raw BSON, a BinData one without its subtype, MaxKey at rank 14 --
+    /// is re-keyed when it opens (RM-080): the `_id` index is then in
+    /// mongod's order (`{a: 2, b: [3]}` before `{a: 5}`, which raw BSON's
+    /// length put after it), every document is still found by its `_id`, and
+    /// the format is recorded.
+    #[test]
+    fn open_rekeys_a_store_written_with_id_key_format_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        let uuid = |b: u8| {
+            Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Uuid,
+                bytes: vec![b; 16],
+            })
+        };
+        let ids = [
+            bson::bson!({"a": 5}),
+            bson::bson!({"a": 2, "b": [3]}),
+            uuid(2),
+            uuid(1),
+            Bson::MaxKey,
+            Bson::Int32(7),
+            Bson::String("s".into()),
+        ];
+        {
+            let st = Storage::open(home).unwrap();
+            sortkey::with_id_key_format_1(|| {
+                let blobs = ids
+                    .iter()
+                    .enumerate()
+                    .map(|(u, id)| {
+                        encode_doc(&doc! {"_id": id.clone(), "u": u as i32 + 1}).unwrap()
+                    })
+                    .collect();
+                let (n, errors) = st.insert("app", "i", blobs, true).unwrap();
+                assert!(errors.is_empty(), "{errors:?}");
+                assert_eq!(n, ids.len());
+            });
+            // A store this old recorded no `_id` key format.
+            let session = st.conn.open_session().unwrap();
+            let _raw = untimestamped(&session);
+            let meta = session.open_cursor(OPLOG_META_TABLE, None).unwrap();
+            meta.set_key_s(ID_KEYS_META);
+            meta.remove().unwrap();
+        }
+        let st = Storage::open(home).unwrap();
+        let session = st.conn.open_session().unwrap();
+        assert_eq!(
+            stored_id_key_format(&session).unwrap(),
+            sortkey::ID_KEY_FORMAT
+        );
+        let walk: Vec<i64> = st
+            .index_entries_from("app", "i", ID_INDEX_NAME, &[], None, 10, false)
+            .unwrap()
+            .into_iter()
+            .map(|(_, rid)| rid)
+            .collect();
+        // Number, string, {a: 2, b: [3]}, {a: 5}, the two UUIDs by bytes,
+        // MaxKey: mongod 8.2.11's order of these `_id`s.
+        assert_eq!(walk, vec![6, 7, 2, 1, 4, 3, 5]);
+        for (u, id) in ids.iter().enumerate() {
+            assert_eq!(
+                ids_of(&st, "i", doc! {"_id": id.clone()}),
+                vec![u as i32 + 1],
+                "{id}"
+            );
+        }
+        let check = st.check_collection("app", "i").unwrap();
+        let (_, missing, extra) = index_check(&check, ID_INDEX_NAME);
+        assert_eq!((missing, extra), (0, 0));
+    }
+
     /// An index built on a thread in PostgreSQL's BinData order (the PG
     /// server's) records it, keeps its keys in it when the MongoDB server
     /// writes, and serves only threads in that order: each server answers a
@@ -24790,20 +25094,28 @@ mod tests {
                 .unwrap()
         };
         {
-            // As an earlier version left it: the documents, and no claim.
-            // `d` holds two documents that version let in as different.
+            // As an earlier version left it: the documents, keyed by `_id`
+            // key format 1 (raw BSON), and no claim. `d` holds two documents
+            // that version let in as different.
             let s = open();
-            assert_eq!(
-                insert(&s, "c", doc! {"_id": {"a": 1i32}, "v": 1i32}),
-                (1, 0)
-            );
-            assert_eq!(insert(&s, "c", doc! {"_id": {"a": 2i32}}), (1, 0));
-            assert_eq!(insert(&s, "c", doc! {"_id": 7i32}), (1, 0));
-            assert_eq!(insert(&s, "d", doc! {"_id": {"k": 1i32}}), (1, 0));
-            strip_claims(&s);
-            assert_eq!(insert(&s, "d", doc! {"_id": {"k": 1.0}}), (1, 0));
+            sortkey::with_id_key_format_1(|| {
+                assert_eq!(
+                    insert(&s, "c", doc! {"_id": {"a": 1i32}, "v": 1i32}),
+                    (1, 0)
+                );
+                assert_eq!(insert(&s, "c", doc! {"_id": {"a": 2i32}}), (1, 0));
+                assert_eq!(insert(&s, "c", doc! {"_id": 7i32}), (1, 0));
+                assert_eq!(insert(&s, "d", doc! {"_id": {"k": 1i32}}), (1, 0));
+                strip_claims(&s);
+                assert_eq!(insert(&s, "d", doc! {"_id": {"k": 1.0}}), (1, 0));
+            });
             strip_claims(&s);
             assert!(claims(&s).is_empty());
+            let session = s.conn.open_session().unwrap();
+            let _raw = untimestamped(&session);
+            let meta = session.open_cursor(OPLOG_META_TABLE, None).unwrap();
+            meta.set_key_s(ID_KEYS_META);
+            meta.remove().unwrap();
         }
         {
             let s = open();
@@ -26410,8 +26722,27 @@ mod tests {
     fn variants_single_descending_inverts() {
         let v = index_key_variants(&doc! {"a": 5i32}, &doc! {"a": -1}, false).unwrap();
         assert_eq!(v.len(), 1);
-        assert_eq!(v[0], sortkey::invert_bytes(&ev(&Bson::Int32(5))));
+        // Entry format 6: inverted, then terminated.
+        let mut want = sortkey::invert_bytes(&ev(&Bson::Int32(5)));
+        want.extend_from_slice(sortkey::DESC_END);
+        assert_eq!(v[0], want);
         assert_ne!(v[0], ev(&Bson::Int32(5)));
+    }
+
+    /// Entry format 6 keys an empty leaf array by `undefined` and an element
+    /// on a dotted path that lacks the leaf by null, as mongod 8.2.11 does;
+    /// a sparse index gives that element nothing.
+    #[test]
+    fn variants_hold_mongods_undefined_and_null_keys() {
+        let v = index_key_variants(&doc! {"t": []}, &doc! {"t": 1}, false).unwrap();
+        assert!(v.contains(&ev(&Bson::Undefined)));
+        assert!(v.contains(&ev(&Bson::Array(vec![]))));
+        let d = doc! {"a": [{"c": 1}, {"b": 3}]};
+        let v = index_key_variants(&d, &doc! {"a.b": 1}, false).unwrap();
+        assert_eq!(v.len(), 2);
+        assert!(v.contains(&ev(&Bson::Null)));
+        let v = index_key_variants(&d, &doc! {"a.b": 1}, true).unwrap();
+        assert_eq!(v, vec![ev(&Bson::Int32(3))]);
     }
 
     #[test]

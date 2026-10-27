@@ -186,6 +186,9 @@ fn hint_refusal(ns: &str, s: &Shape) -> CommandError {
         } else {
             named
         },
+        batch_size: (!s.pipeline)
+            .then(|| s.options.get("batchSize").and_then(crate::util::as_i64))
+            .flatten(),
     };
     err(
         2,
@@ -752,6 +755,7 @@ pub(crate) fn distinct_group_read(
     db: &str,
     coll: &str,
     pipeline: &[Bson],
+    collation: Option<&Collation>,
 ) -> Result<Option<DistinctGroupRead>, crate::storage::StorageError> {
     let stages: Vec<Document> = pipeline
         .iter()
@@ -767,7 +771,7 @@ pub(crate) fn distinct_group_read(
     let catalog = catalog(storage, db, coll, None)?;
     let canonical = parsed::parsed_query(&s.filter);
     let implied = |partial: &Document| storage.query_implies_partial(&s.filter, partial);
-    let planned = distinct_group_with(&s, None, &catalog, |asked| {
+    let planned = distinct_group_with(&s, collation, &catalog, |asked| {
         let Ok(hint) = resolve_hint(asked.hint.as_ref(), &catalog) else {
             return Ok((Node::Eof(""), Vec::new()));
         };
@@ -778,7 +782,7 @@ pub(crate) fn distinct_group_read(
             skip: 0,
             limit: 0,
             hint,
-            collation: None,
+            collation,
             min_max: false,
             return_key: false,
             show_record_id: false,

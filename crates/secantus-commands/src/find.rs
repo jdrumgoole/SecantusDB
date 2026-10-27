@@ -683,6 +683,7 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             skip: doc.get("skip").and_then(as_i64),
             limit: doc.get("limit").and_then(as_i64),
             collation: doc.get_document("collation").ok().cloned(),
+            batch_size: doc.get("batchSize").and_then(as_i64),
         },
     };
     read.check_hint(storage, &ctx.db_name)?;
@@ -690,16 +691,51 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
     // A read that streams: its cursor reads on as `getMore` asks, from where
     // the last batch stopped (RM-080). The rest read whole, as before.
+    // `min` / `max` are refused as mongod refuses them before anything is
+    // read; a read that passes may stream.
+    let min_doc = doc
+        .get("min")
+        .and_then(Bson::as_document)
+        .filter(|d| !d.is_empty());
+    let max_doc = doc
+        .get("max")
+        .and_then(Bson::as_document)
+        .filter(|d| !d.is_empty());
+    let min_max_key = if min_doc.is_some() || max_doc.is_some() {
+        Some(check_min_max(
+            min_doc,
+            max_doc,
+            hint,
+            storage,
+            &ctx.db_name,
+            &coll,
+            &read.canonical(&ctx.db_name),
+        )?)
+    } else {
+        None
+    };
+    // A projection's `$meta` streams when it asks for what a streamed read
+    // keeps: each document's RecordId and the key it was found at.
+    let metas_stream = |p: &Document| {
+        fn ok(v: &Bson) -> bool {
+            match secantus_core::projection::meta_spec(v) {
+                Some(m) => matches!(m, "recordId" | "indexKey"),
+                None => match v {
+                    Bson::Document(d) => d.values().all(ok),
+                    Bson::Array(items) => items.iter().all(ok),
+                    _ => true,
+                },
+            }
+        }
+        p.values().all(ok)
+    };
     let streamable = !tailable
         && exists
-        && !doc.contains_key("min")
-        && !doc.contains_key("max")
-        && !bool_field(doc, "returnKey", false)
-        && !bool_field(doc, "showRecordId", false)
-        && !doc.get_document("projection").is_ok_and(|p| {
-            p.values()
-                .any(|v| secantus_core::projection::meta_spec(v).is_some())
-        })
+        && (min_doc.is_some() == doc.contains_key("min"))
+        && (max_doc.is_some() == doc.contains_key("max"))
+        && !doc
+            .get_document("projection")
+            .is_ok_and(|p| !metas_stream(p))
         && (natural_hint.is_some()
             || !matches!(doc.get("sort"), Some(Bson::Document(given))
                 if !given.is_empty() && !crate::explain::order::plain_sort(given)));
@@ -716,6 +752,10 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             let_vars: &let_vars,
             ns: &ns,
             collation: collation.as_ref(),
+            min: min_doc,
+            max: max_doc,
+            return_key: bool_field(doc, "returnKey", false),
+            show_record_id: bool_field(doc, "showRecordId", false),
         };
         if let Some(reply) = stream_find(ctx, doc, &asked)? {
             return Ok(reply);
@@ -831,16 +871,8 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // evaluated on the hinted index's key — applied to the index-ordered fetch
     // before skip/limit. (pymongo translates the legacy `$min`/`$max`/`$query`
     // filter wrapper into these top-level fields.)
-    let min_b = doc
-        .get("min")
-        .and_then(Bson::as_document)
-        .filter(|d| !d.is_empty());
-    let max_b = doc
-        .get("max")
-        .and_then(Bson::as_document)
-        .filter(|d| !d.is_empty());
-    if min_b.is_some() || max_b.is_some() {
-        docs = apply_min_max(docs, min_b, max_b, hint, storage, &ctx.db_name, &coll)?;
+    if let Some(key_spec) = &min_max_key {
+        docs = apply_min_max(docs, min_doc, max_doc, key_spec)?;
     }
 
     // skip / limit applied after the sorted fetch (the storage returns the full
@@ -1214,6 +1246,10 @@ struct StreamAsk<'a> {
     let_vars: &'a Document,
     ns: &'a str,
     collation: Option<&'a secantus_core::collation::Collation>,
+    min: Option<&'a Document>,
+    max: Option<&'a Document>,
+    return_key: bool,
+    show_record_id: bool,
 }
 
 /// A `find` cursor that reads on as `getMore` asks: the plan's read
@@ -1228,6 +1264,112 @@ struct FindStream {
     command: Document,
     /// The command's collation, which every batch reads under.
     collation: Option<secantus_core::collation::Collation>,
+    /// Each result is the key it was found at (`returnKey`).
+    return_key: bool,
+    /// Each result carries its RecordId (`showRecordId`).
+    show_record_id: bool,
+}
+
+/// A streamed batch made what the `find` asked for: each document's key
+/// (`returnKey`), or the document projected, with a projection's `$meta:
+/// "recordId"` / `"indexKey"` filled from what the read kept, and its
+/// RecordId after it (`showRecordId`). mongod ignores the projection under
+/// `returnKey`.
+fn shape_streamed(
+    cursor: &FindStream,
+    batch: crate::explain::stream::Batch,
+) -> Result<Vec<Vec<u8>>, CommandError> {
+    let crate::explain::stream::Batch {
+        docs, rids, keys, ..
+    } = batch;
+    if cursor.return_key {
+        let out: Vec<Document> = keys.into_iter().map(Option::unwrap_or_default).collect();
+        return crate::util::encode_docs(out);
+    }
+    let mut out: Vec<Document> = match &cursor.projection {
+        None if !cursor.show_record_id => return Ok(docs),
+        None => docs
+            .iter()
+            .map(|b| secantus_core::bsondoc::from_bytes(b.as_slice()))
+            .collect::<Result<_, _>>()
+            .map_err(|e| CommandError::new(1, "InternalError", e.to_string()))?,
+        Some(spec) => {
+            // A top-level `$meta` goes after the projected fields, where
+            // mongod puts it; one inside an expression reads a field the
+            // documents are given for the projection (`agg_meta`).
+            let mut metas: Vec<(String, &str)> = Vec::new();
+            let mut rewritten = Document::new();
+            let mut nested = false;
+            for (k, v) in spec {
+                match secantus_core::projection::meta_spec(v) {
+                    Some(m @ ("recordId" | "indexKey")) => metas.push((k.clone(), m)),
+                    Some(_) => {}
+                    None => {
+                        let mut v = v.clone();
+                        nested |= crate::agg_meta::replace(
+                            &mut v,
+                            "recordId",
+                            crate::agg_meta::RECORD_ID,
+                        );
+                        nested |= crate::agg_meta::replace(
+                            &mut v,
+                            "indexKey",
+                            crate::agg_meta::INDEX_KEY,
+                        );
+                        rewritten.insert(k.clone(), v);
+                        continue;
+                    }
+                }
+                rewritten.insert(k.clone(), v.clone());
+            }
+            let mut projected = if nested {
+                let mut originals: Vec<Document> = docs
+                    .iter()
+                    .map(|b| secantus_core::bsondoc::from_bytes(b.as_slice()))
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| CommandError::new(1, "InternalError", e.to_string()))?;
+                let ids: Vec<Option<i64>> = rids.iter().copied().map(Some).collect();
+                for (doc, key) in originals.iter_mut().zip(&keys) {
+                    if let Some(key) = key {
+                        doc.insert(crate::agg_meta::INDEX_KEY, Bson::Document(key.clone()));
+                    }
+                }
+                crate::agg_meta::attach(&mut originals, Some(&ids), None);
+                let mut out = project_to_docs(
+                    crate::util::encode_docs(originals)?,
+                    &rewritten,
+                    &cursor.filter,
+                    &cursor.vars,
+                    &cursor.ns,
+                )?;
+                for d in out.iter_mut() {
+                    d.remove(crate::agg_meta::RECORD_ID);
+                    d.remove(crate::agg_meta::INDEX_KEY);
+                }
+                out
+            } else {
+                project_to_docs(docs, spec, &cursor.filter, &cursor.vars, &cursor.ns)?
+            };
+            for (i, out) in projected.iter_mut().enumerate() {
+                for (field, meta) in &metas {
+                    let value = match *meta {
+                        "recordId" => Some(Bson::Int64(rids[i])),
+                        _ => keys[i].clone().map(Bson::Document),
+                    };
+                    if let Some(v) = value {
+                        out.insert(field.clone(), v);
+                    }
+                }
+            }
+            projected
+        }
+    };
+    if cursor.show_record_id {
+        for (doc, rid) in out.iter_mut().zip(&rids) {
+            doc.insert("$recordId", Bson::Int64(*rid));
+        }
+    }
+    crate::util::encode_docs(out)
 }
 
 impl crate::cursors::StreamCursor for FindStream {
@@ -1242,21 +1384,14 @@ impl crate::cursors::StreamCursor for FindStream {
             .stream
             .next_batch(storage, want, max_bytes)
             .map_err(|e| crate::util::read_exec_error(e, "find", &self.ns))?;
-        let docs = match &self.projection {
-            Some(spec) => crate::util::encode_docs(project_to_docs(
-                batch.docs,
-                spec,
-                &self.filter,
-                &self.vars,
-                &self.ns,
-            )?)?,
-            None => batch.docs,
-        };
+        let (exhausted, keys_examined, docs_examined) =
+            (batch.exhausted, batch.keys_examined, batch.docs_examined);
+        let docs = shape_streamed(self, batch)?;
         Ok(crate::cursors::StreamedBatch {
             docs,
-            exhausted: batch.exhausted,
-            keys_examined: batch.keys_examined,
-            docs_examined: batch.docs_examined,
+            exhausted,
+            keys_examined,
+            docs_examined,
         })
     }
 
@@ -1305,6 +1440,11 @@ fn stream_find(
         },
     };
     let read_error = |e| crate::util::read_exec_error(e, "find", asked.ns);
+    let flags = crate::explain::order::StreamFlags {
+        min_max: asked.min.is_some() || asked.max.is_some(),
+        return_key: asked.return_key,
+        show_record_id: asked.show_record_id,
+    };
     let Some(plan) = crate::explain::order::stream_plan(
         storage.as_ref(),
         &ask,
@@ -1312,18 +1452,38 @@ fn stream_find(
         limit,
         projection.as_ref(),
         doc.contains_key("batchSize"),
+        flags,
     )
     .map_err(read_error)?
     else {
         return Ok(None);
     };
-    let Some(stream) = crate::explain::stream::Stream::of_plan(
-        storage.as_ref(),
+    fn asks_index_key(v: &Bson) -> bool {
+        match v {
+            Bson::Document(d) => {
+                secantus_core::projection::meta_spec(v) == Some("indexKey")
+                    || d.values().any(asks_index_key)
+            }
+            Bson::Array(items) => items.iter().any(asks_index_key),
+            _ => false,
+        }
+    }
+    let wants_index_key = projection
+        .as_ref()
+        .is_some_and(|p| p.values().any(asks_index_key));
+    let opts = crate::explain::stream::Options {
+        keys: asked.return_key || wants_index_key,
+        min: asked.min,
+        max: asked.max,
+        collation: asked.collation,
+    };
+    let Some(stream) = crate::explain::stream::Stream::of_plan_with(
         &plan,
         &ctx.db_name,
         asked.coll,
         asked.filter,
         asked.let_vars,
+        &opts,
     )
     .map_err(read_error)?
     else {
@@ -1338,6 +1498,8 @@ fn stream_find(
         summary: crate::explain::summary::plan_summary(doc, ctx),
         command: doc.clone(),
         collation: asked.collation.cloned(),
+        return_key: asked.return_key,
+        show_record_id: asked.show_record_id,
     };
     // `batchSize: 0` asks for the cursor and no documents.
     let batch = if asked.batch_size == 0 {
@@ -1662,70 +1824,26 @@ fn tuple_cmp(
     Ok(Ordering::Equal)
 }
 
-/// A `min` / `max` refusal, under the prefix mongod's planner gives it.
-fn min_max_error(code: i32, ns: &str, reason: &str) -> CommandError {
+/// A `min` / `max` refusal, in mongod's planner's words for the query
+/// (RM-345: the query tree, sort, projection and paging it prints).
+fn min_max_error(code: i32, query: &crate::explain::CanonicalQuery, reason: &str) -> CommandError {
     CommandError::new(
         code,
         crate::util::error_code_name(code),
-        format!("error processing query: ns={ns} planner returned error :: caused by :: {reason}"),
+        query.planner_error(reason),
     )
 }
 
 /// Filter `docs` (already index-ordered) by the `min` (inclusive) / `max`
 /// (exclusive) bounds on the hinted index's keys.
-#[allow(clippy::too_many_arguments)]
 fn apply_min_max(
     docs: Vec<Vec<u8>>,
     min: Option<&Document>,
     max: Option<&Document>,
-    hint: Option<&Bson>,
-    storage: &dyn crate::storage::Storage,
-    db: &str,
-    coll: &str,
+    key_spec: &Document,
 ) -> Result<Vec<Vec<u8>>, CommandError> {
     use std::cmp::Ordering;
-    let ns = format!("{db}.{coll}");
-    let hint = hint.ok_or_else(|| {
-        min_max_error(
-            291,
-            &ns,
-            "When using min()/max() a hint of which index to use must be provided",
-        )
-    })?;
-    if matches!(hint, Bson::Document(h) if h.contains_key("$natural")) {
-        return Err(min_max_error(
-            291,
-            &ns,
-            "min and max are incompatible with $natural",
-        ));
-    }
-    let key_spec = resolve_index_key(storage, db, coll, hint)?;
-    // Each bound's fields must be a leading prefix of the hinted index's key,
-    // in the same order.
     let index_fields: Vec<&String> = key_spec.keys().collect();
-    for bound in [min, max].into_iter().flatten() {
-        let bf: Vec<&String> = bound.keys().collect();
-        let prefix_match =
-            bf.len() <= index_fields.len() && (0..bf.len()).all(|i| bf[i] == index_fields[i]);
-        if !prefix_match {
-            return Err(min_max_error(
-                51174,
-                &ns,
-                "The index chosen is not compatible with min/max",
-            ));
-        }
-    }
-    if let (Some(lo), Some(hi)) = (min, max) {
-        let low: Vec<Bson> = lo.values().cloned().collect();
-        if lo.len() == hi.len() && tuple_cmp(&low, hi, &key_spec)? != Ordering::Less {
-            return Err(min_max_error(
-                51175,
-                &ns,
-                "The value provided for min() does not come before the value provided for \
-                 max() in the hinted index",
-            ));
-        }
-    }
     let width = min
         .map_or(0, Document::len)
         .max(max.map_or(0, Document::len));
@@ -1744,11 +1862,11 @@ fn apply_min_max(
         let mut keep = false;
         for key in index_key_tuples(&d, fields) {
             let above = match min {
-                Some(m) => tuple_cmp(&key, m, &key_spec)? != Ordering::Less,
+                Some(m) => tuple_cmp(&key, m, key_spec)? != Ordering::Less,
                 None => true,
             };
             let below = match max {
-                Some(m) => tuple_cmp(&key, m, &key_spec)? == Ordering::Less,
+                Some(m) => tuple_cmp(&key, m, key_spec)? == Ordering::Less,
                 None => true,
             };
             if above && below {
@@ -1761,6 +1879,62 @@ fn apply_min_max(
         }
     }
     Ok(out)
+}
+
+/// What mongod refuses about `min` / `max` before it reads: no hint, a
+/// `$natural` hint, bounds that do not name the hinted index's key fields in
+/// its order, and a `min` not below `max`. The hinted index's key pattern
+/// when they pass.
+fn check_min_max(
+    min: Option<&Document>,
+    max: Option<&Document>,
+    hint: Option<&Bson>,
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    query: &crate::explain::CanonicalQuery,
+) -> Result<Document, CommandError> {
+    use std::cmp::Ordering;
+    let hint = hint.ok_or_else(|| {
+        min_max_error(
+            291,
+            query,
+            "When using min()/max() a hint of which index to use must be provided",
+        )
+    })?;
+    if matches!(hint, Bson::Document(h) if h.contains_key("$natural")) {
+        return Err(min_max_error(
+            291,
+            query,
+            "min and max are incompatible with $natural",
+        ));
+    }
+    let key_spec = resolve_index_key(storage, db, coll, hint)?;
+    // Each bound names every field of the hinted index's key, in its order:
+    // mongod 8.2.11 refuses a prefix with 51174 too (RM-345).
+    let index_fields: Vec<&String> = key_spec.keys().collect();
+    for bound in [min, max].into_iter().flatten() {
+        let bf: Vec<&String> = bound.keys().collect();
+        if bf != index_fields {
+            return Err(min_max_error(
+                51174,
+                query,
+                "The index chosen is not compatible with min/max",
+            ));
+        }
+    }
+    if let (Some(lo), Some(hi)) = (min, max) {
+        let low: Vec<Bson> = lo.values().cloned().collect();
+        if lo.len() == hi.len() && tuple_cmp(&low, hi, &key_spec)? != Ordering::Less {
+            return Err(min_max_error(
+                51175,
+                query,
+                "The value provided for min() does not come before the value provided for \
+                 max() in the hinted index",
+            ));
+        }
+    }
+    Ok(key_spec)
 }
 
 /// mongod's mixed-inclusion/exclusion projection error, if the spec mixes the

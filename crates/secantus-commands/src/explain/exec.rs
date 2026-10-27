@@ -138,8 +138,10 @@ pub(crate) type Entry = (Vec<Vec<u8>>, usize);
 /// first made one no other key starts with: its zero bytes escaped and a
 /// terminator added, as the entries table joins the parts of a compound key.
 pub(crate) fn directed(v: &Bson, reversed: bool, collation: Option<&Collation>) -> Vec<u8> {
+    // Under a collation every string takes it, one inside a document or an
+    // array too, as the index's entries hold them.
     let bytes = match (v, collation) {
-        (Bson::String(_), Some(_)) => {
+        (Bson::String(_) | Bson::Document(_) | Bson::Array(_), Some(_)) => {
             secantus_core::sortkey::encode_sort_value(v, collation).unwrap_or_default()
         }
         _ => sort_key(v),
