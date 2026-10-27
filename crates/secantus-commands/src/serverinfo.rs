@@ -639,6 +639,13 @@ fn parameters(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
         ),
         ("localLogicalSessionTimeoutMinutes", true, Bson::Int32(30)),
         ("logLevel", true, Bson::Int32(0)),
+        // An index build's sorters' memory, in megabytes (RM-187): mongod
+        // 8.2.11's default, a double.
+        (
+            "maxIndexBuildMemoryUsageMegabytes",
+            true,
+            Bson::Double(200.0),
+        ),
         (
             "maxTransactionLockRequestTimeoutMillis",
             true,

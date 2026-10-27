@@ -209,6 +209,19 @@ pub fn arm(max_time_ms: Option<i64>) -> Guard {
     Guard { previous }
 }
 
+/// Neither the budget nor the kill flag, until the guard drops: for work an
+/// operation must finish whatever happened to it -- the abort of an index
+/// build its own interruption caused (RM-187).
+pub fn suspend() -> (Guard, InterruptGuard) {
+    let budget = Guard {
+        previous: CURRENT.with(|c| c.replace(None)),
+    };
+    let interrupt = InterruptGuard {
+        previous: INTERRUPT.with(|c| c.borrow_mut().take()),
+    };
+    (budget, interrupt)
+}
+
 /// Has this thread's deadline passed? `false` when nothing is armed.
 pub fn expired() -> bool {
     CURRENT.with(|c| match c.get() {

@@ -132,6 +132,41 @@ pub struct DuplicateKey {
     pub extra: Option<Document>,
 }
 
+/// Why an index build was aborted, as `abortIndexBuild`'s `cause` records it
+/// (`extra`: a duplicate key's `keyPattern` / `keyValue`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexBuildAbort {
+    pub code: i32,
+    pub code_name: String,
+    pub errmsg: String,
+    pub extra: Document,
+}
+
+impl IndexBuildAbort {
+    pub fn new(code: i32, code_name: &str, errmsg: impl Into<String>) -> Self {
+        IndexBuildAbort {
+            code,
+            code_name: code_name.to_string(),
+            errmsg: errmsg.into(),
+            extra: Document::new(),
+        }
+    }
+}
+
+/// An index build in progress.
+#[derive(Debug, Clone)]
+pub struct IndexBuildInfo {
+    pub uuid: [u8; 16],
+    pub db: String,
+    pub coll: String,
+    /// Each index's spec, `{v, key, name, <options>}`.
+    pub indexes: Vec<Document>,
+    /// mongod's phase number and name.
+    pub phase: i32,
+    pub phase_str: String,
+    pub aborting: bool,
+}
+
 /// A storage failure, pre-classified by the adapter into the shape command
 /// handlers need to build mongod-faithful replies. The adapter maps the real
 /// `secantus_storage::StorageError` variants onto these.
@@ -851,6 +886,88 @@ pub trait Storage: Send + Sync {
     /// Drop every non-`_id` index; returns how many were dropped.
     fn drop_all_indexes(&self, _db: &str, _coll: &str) -> Result<usize, StorageError> {
         Ok(0)
+    }
+
+    // --- two-phase index builds (RM-187) ---
+    //
+    // A build over documents runs as mongod's does: set up (the indexes
+    // recorded, `startIndexBuild` logged, the collection's writes recorded
+    // for it from then on), scanned and drained with the collection taking
+    // writes, then committed (`commitIndexBuild`) or aborted
+    // (`abortIndexBuild`). A storage without them (the test fakes) answers
+    // `false` here and the handler creates each index in one step.
+
+    /// Whether this storage runs two-phase builds.
+    fn supports_index_builds(&self) -> bool {
+        false
+    }
+
+    /// Set up a build of `specs` (`(name, key, options)`) over `(db, coll)`
+    /// under `uuid`.
+    fn begin_index_build(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _uuid: [u8; 16],
+        _specs: &[(String, Document, Document)],
+        _member: &str,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::Internal(
+            "index builds are not supported".into(),
+        ))
+    }
+
+    /// Scan the collection into the build and drain the writes made
+    /// meanwhile; `memory_limit` bytes bound its sorters.
+    fn run_index_build(&self, _uuid: &[u8; 16], _memory_limit: usize) -> Result<(), StorageError> {
+        Err(StorageError::Internal(
+            "index builds are not supported".into(),
+        ))
+    }
+
+    /// Record that the build is ready to commit (`commitReadyMembers`).
+    fn index_build_ready(&self, _uuid: &[u8; 16], _member: &str) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// Commit the build; an error leaves it to be aborted.
+    fn commit_index_build(&self, _uuid: &[u8; 16]) -> Result<(), StorageError> {
+        Err(StorageError::Internal(
+            "index builds are not supported".into(),
+        ))
+    }
+
+    /// Abort the build for `cause`.
+    fn abort_index_build(
+        &self,
+        _uuid: &[u8; 16],
+        _cause: &IndexBuildAbort,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// Ask the builds over `db` (one collection, one build) to abort.
+    fn request_index_build_abort(
+        &self,
+        _db: &str,
+        _coll: Option<&str>,
+        _uuid: Option<&[u8; 16]>,
+        _cause: &IndexBuildAbort,
+    ) -> Vec<[u8; 16]> {
+        Vec::new()
+    }
+
+    /// Wait until none of `uuids` is running.
+    fn wait_index_builds_gone(&self, _uuids: &[[u8; 16]]) {}
+
+    /// The cause an abort of a running build was asked with.
+    fn index_build_abort_cause(&self, _uuid: &[u8; 16]) -> Option<IndexBuildAbort> {
+        None
+    }
+
+    /// The builds running over `db` / `(db, coll)` / everything.
+    fn index_builds(&self, _db: Option<&str>, _coll: Option<&str>) -> Vec<IndexBuildInfo> {
+        Vec::new()
     }
 
     /// Merge `opts` into an existing index's stored options (e.g. `prepareUnique`

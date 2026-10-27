@@ -60,6 +60,7 @@ pub mod distinct;
 mod explain;
 mod generic;
 mod hybrid;
+mod index_builds;
 mod index_filters;
 mod snapshot;
 pub use generic::db_field_problem;
@@ -2006,6 +2007,13 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
     // The statement's lock chain (mongod's hierarchy). A transaction
     // statement's chain was already taken with the transaction's owner,
     // which holds its collection locks to commit/abort — see `session`.
+    // A command that ends or is refused by an index build in progress meets
+    // it before it waits for its locks (RM-187).
+    if !ctx.txn_locks {
+        if let Some(reply) = index_builds::before_locks(doc, ctx) {
+            return reply;
+        }
+    }
     let _locks = if ctx.txn_locks {
         None
     } else {

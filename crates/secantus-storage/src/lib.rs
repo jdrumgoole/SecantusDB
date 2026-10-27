@@ -58,9 +58,11 @@ pub mod repair;
 pub mod replay;
 pub mod share_locks;
 
+mod index_build;
 mod scan_bounds;
 mod sizes;
 
+pub use index_build::{IndexBuildAbort, IndexBuildInfo, IndexBuildSpec};
 pub use sizes::CollectionSizes;
 use sizes::Delta;
 
@@ -1431,7 +1433,10 @@ fn data_table_cfg(base: &str, nonlogged: bool) -> String {
 /// that rolled back with the data tables would be useless. It is a single tiny
 /// row per checkpoint; its logging cost is nil.
 fn bootstrap_table_cfg(name: &str, base: &str, data_nonlogged: bool) -> String {
-    if name == OPLOG_META_TABLE {
+    // The index builds' records are always logged, like the oplog they are
+    // logged beside: a crash of a non-logged store must not lose the member
+    // a restarted build records itself as (RM-187).
+    if name == OPLOG_META_TABLE || name == index_build::BUILDS_TABLE {
         base.to_string()
     } else {
         data_table_cfg(base, data_nonlogged)
@@ -2402,6 +2407,11 @@ const BOOTSTRAP: &[(&str, &str)] = &[
         "key_format=S,value_format=u",
     ),
     (PREPARED_XACT_TABLE, "key_format=S,value_format=u"),
+    // In-progress index builds (RM-187): each build's record, kept until
+    // it commits or aborts so an open after a crash restarts it, and the
+    // writes made to its collection while it scans.
+    (index_build::BUILDS_TABLE, "key_format=u,value_format=u"),
+    (index_build::SIDE_TABLE, "key_format=u,value_format=u"),
 ];
 
 /// Durable record of every prepared (two-phase) transaction: `gid -> BSON
@@ -3381,6 +3391,33 @@ pub enum RouterAccess {
     Index { name: String, in_order: bool },
     /// Several indexes (an `$or`).
     Indexes,
+}
+
+/// An index's descriptor, from its catalog `options`: what a write keys
+/// it by and what the lookups read.
+fn index_desc_from(name: String, key_spec: Document, opts: &Document) -> IndexDesc {
+    let partial = opts
+        .get_document("partialFilterExpression")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .cloned();
+    let geo_2d = parse_geo_2d(&key_spec, opts);
+    let geo_sphere = parse_geo_sphere(&key_spec);
+    IndexDesc {
+        name,
+        key_spec,
+        sparse: opts.get_bool("sparse").unwrap_or(false),
+        hidden: opts.get_bool("hidden").unwrap_or(false),
+        collation: index_key_collation(opts),
+        unique: opts.get_bool("unique").unwrap_or(false),
+        prepare_unique: opts.get_bool("prepareUnique").unwrap_or(false),
+        partial,
+        geo_2d,
+        geo_sphere,
+        id_claim: false,
+        clustered: false,
+        key_order: index_bindata_order(opts),
+    }
 }
 
 fn no_geo_keys(doc: &Document, why: &str) -> String {
@@ -4816,6 +4853,9 @@ pub struct Storage {
     /// current by every write: mongod's size storer (RM-191, see
     /// [`sizes`]).
     sizes: sizes::SizeStorer,
+    /// Index builds in progress (RM-187): what writes to their collections
+    /// must also record, and what `listIndexes` / `currentOp` show.
+    index_builds: index_build::Registry,
 }
 
 /// Strictly-monotonic oplog bookkeeping: the next int64 seq to mint and the last
@@ -6965,6 +7005,7 @@ impl Storage {
             user_write_block: std::sync::RwLock::new(None),
             insert_groups: AtomicI64::new(0),
             sizes: sizes::SizeStorer::default(),
+            index_builds: index_build::Registry::default(),
         };
         // Before the store takes any write -- crash recovery's replay and the
         // upgrades below write documents, and each write moves the counts.
@@ -6998,6 +7039,9 @@ impl Storage {
         storage.backfill_document_id_claims()?;
         storage.backfill_collated_id_claims()?;
         storage.load_user_write_block()?;
+        // Index builds a crash or shutdown interrupted run again from the
+        // start, as mongod restarts them (RM-187).
+        storage.restart_index_builds()?;
         Ok(storage)
     }
 
@@ -11676,6 +11720,14 @@ impl Storage {
                     self.remove_index_entries(&session, db, coll, &removals)?;
                     self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
                 }
+                self.index_build_side_write(
+                    &session,
+                    db,
+                    coll,
+                    Some(&old_doc),
+                    Some(&doc),
+                    recordid,
+                )?;
                 // Oplog: a full-document replacement is op "u" with `o` = the new doc
                 // (the `$v:2` diff form is for operator-updates, which the storage layer
                 // doesn't expose). The pre-image (old doc) is stored when the collection
@@ -12084,6 +12136,26 @@ impl Storage {
     /// its registry row. Returns whether it existed. Emits an `op: "c"` `drop`
     /// oplog entry when it existed. Mirrors `storage.drop_collection`.
     pub fn drop_collection(&self, db: &str, coll: &str) -> Result<bool> {
+        // An index build over it is aborted first, as mongod's drop does
+        // (RM-187); the command layer asks before taking its locks, with
+        // the same cause, so this only finds builds a caller below it left.
+        if !self.index_builds(Some(db), Some(coll)).is_empty() {
+            let uuid = self
+                .collection_uuid(db, coll)
+                .ok()
+                .and_then(|u| <[u8; 16]>::try_from(u.as_slice()).ok())
+                .map(|u| bson::uuid::Uuid::from_bytes(u).to_string())
+                .unwrap_or_default();
+            self.abort_index_builds_and_wait(
+                db,
+                Some(coll),
+                &IndexBuildAbort::new(
+                    276,
+                    "IndexBuildAborted",
+                    format!("Collection {db}.{coll}({uuid}) is being dropped"),
+                ),
+            );
+        }
         // Planner writes made here are released once they are visible.
         let _planner = PlannerScope::new();
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -12197,7 +12269,13 @@ impl Storage {
         entry.insert("ns", format!("{db}.$cmd"));
         entry.insert("ui", uuid_binary(ui));
         entry.insert("o", Bson::Document(o));
-        // mongod's drop entry says how many documents went with it.
+        // mongod's drop entry says how many documents went with it, as an
+        // int32 while the count fits one (measured 8.2.11, 2026-10-26: 100
+        // documents are `{$numberInt: "100"}`).
+        let records = match i32::try_from(records) {
+            Ok(n) => Bson::Int32(n),
+            Err(_) => Bson::Int64(records),
+        };
         entry.insert("o2", bson::doc! {"numRecords": records});
         self.emit_oplog(session, vec![entry], vec![None])?;
         Ok(())
@@ -12331,6 +12409,13 @@ impl Storage {
     /// Emits one `op: "c"` `drop` per collection plus a final `dropDatabase: 1`
     /// command oplog entry (no `ui`). Mirrors `storage.drop_database`.
     pub fn drop_database(&self, db: &str) -> Result<()> {
+        // Its index builds are aborted first, as mongod's dropDatabase does
+        // (RM-187).
+        self.abort_index_builds_and_wait(
+            db,
+            None,
+            &IndexBuildAbort::new(276, "IndexBuildAborted", "dropDatabase command"),
+        );
         // Planner writes made here are released once they are visible.
         let _planner = PlannerScope::new();
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -13688,6 +13773,53 @@ impl Storage {
         key_spec: &Document,
         options: &Document,
     ) -> Result<Option<IndexPlan>> {
+        let Some(mut stored_options) =
+            self.index_stored_options(session, db, coll, name, key_spec, options, 0)?
+        else {
+            return Ok(None);
+        };
+        let geo = parse_geo_2d(key_spec, options);
+        let geo_sphere = parse_geo_sphere(key_spec);
+        let build_order = index_bindata_order(&stored_options);
+        let key_coll: Option<Collation> = if geo.is_none() && geo_sphere.is_none() {
+            options
+                .get_document("collation")
+                .ok()
+                .and_then(secantus_core::collation::parse)
+        } else {
+            None
+        };
+        self.plan_index_entries(
+            session,
+            db,
+            coll,
+            name,
+            key_spec,
+            options,
+            &mut stored_options,
+            build_order,
+            geo,
+            geo_sphere,
+            key_coll,
+        )
+    }
+
+    /// The catalog `options` a new index `name` is recorded with -- its
+    /// user options plus the entry formats, its build sequence (`seq_after`
+    /// further on for the later indexes of one build) and its key markers --
+    /// registering the collection if it is not. `None` when an identical
+    /// index exists already; a conflicting one is an error.
+    #[allow(clippy::too_many_arguments)]
+    fn index_stored_options(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+        key_spec: &Document,
+        options: &Document,
+        seq_after: i64,
+    ) -> Result<Option<Document>> {
         // It writes the index catalog.
         note_planner_write();
         let geo = parse_geo_2d(key_spec, options);
@@ -13746,7 +13878,6 @@ impl Storage {
         {
             stored_options.insert(BINDATA_ORDER_OPT, "bytes");
         }
-        let build_order = index_bindata_order(&stored_options);
         if !stored_options.contains_key(BUILD_SEQ) {
             let last = self
                 .iter_indexes(session, db, coll)?
@@ -13754,7 +13885,7 @@ impl Storage {
                 .map(|(_, _, o)| build_seq(o))
                 .max()
                 .unwrap_or(0);
-            stored_options.insert(BUILD_SEQ, last + 1);
+            stored_options.insert(BUILD_SEQ, last + 1 + seq_after);
         }
         // An index with a collation keys its entries by collation sort keys,
         // and says so in the catalog (see `COLLATION_KEYS`).
@@ -13772,6 +13903,26 @@ impl Storage {
         if geo.is_some() || geo_sphere.is_some() {
             stored_options.insert(GEO_KEYS, GEO_KEY_FORMAT);
         }
+        Ok(Some(stored_options))
+    }
+
+    /// The scan half of [`Self::plan_index`]: every entry the collection's
+    /// documents give the index, and its catalog row.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_index_entries(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+        key_spec: &Document,
+        options: &Document,
+        stored_options: &mut Document,
+        build_order: BinDataOrder,
+        geo: Option<Geo2d>,
+        geo_sphere: Option<GeoSphere>,
+        key_coll: Option<Collation>,
+    ) -> Result<Option<IndexPlan>> {
         let entries: Vec<(Vec<u8>, i64)> = if let Some(geo) = &geo {
             // 2d geo index: one geohash cell per point-valued doc. Always flagged
             // multikey so the regular (numeric) pickers skip it.
@@ -13905,7 +14056,7 @@ impl Storage {
         };
         let mut payload_doc = Document::new();
         payload_doc.insert("key", Bson::Document(key_spec.clone()));
-        payload_doc.insert("options", Bson::Document(stored_options));
+        payload_doc.insert("options", Bson::Document(stored_options.clone()));
         let payload = encode_doc(&payload_doc)?;
         Ok(Some(IndexPlan { payload, entries }))
     }
@@ -15153,6 +15304,8 @@ impl Storage {
         descs: &[IndexDesc],
         recordid: i64,
     ) -> Result<()> {
+        // An index being built over the collection records the write too.
+        self.index_build_side_write(session, db, coll, None, Some(doc), recordid)?;
         // A document `_id` is also claimed by value (see `document_id_claim`).
         let with_id_claim;
         let descs: &[IndexDesc] = match self.document_id_claim(session, db, coll, doc, descs)? {
@@ -15315,6 +15468,8 @@ impl Storage {
         descs: &[IndexDesc],
         recordid: i64,
     ) -> Result<()> {
+        // An index being built over the collection records the write too.
+        self.index_build_side_write(session, db, coll, Some(doc), None, recordid)?;
         // A document `_id` is also claimed by value (see `document_id_claim`).
         let with_id_claim;
         let descs: &[IndexDesc] = match self.document_id_claim(session, db, coll, doc, descs)? {
@@ -15505,30 +15660,7 @@ impl Storage {
         let mut descs: Vec<IndexDesc> = self
             .iter_indexes(session, db, coll)?
             .into_iter()
-            .map(|(name, key_spec, opts)| {
-                let partial = opts
-                    .get_document("partialFilterExpression")
-                    .ok()
-                    .filter(|d| !d.is_empty())
-                    .cloned();
-                let geo_2d = parse_geo_2d(&key_spec, &opts);
-                let geo_sphere = parse_geo_sphere(&key_spec);
-                IndexDesc {
-                    name,
-                    key_spec,
-                    sparse: opts.get_bool("sparse").unwrap_or(false),
-                    hidden: opts.get_bool("hidden").unwrap_or(false),
-                    collation: index_key_collation(&opts),
-                    unique: opts.get_bool("unique").unwrap_or(false),
-                    prepare_unique: opts.get_bool("prepareUnique").unwrap_or(false),
-                    partial,
-                    geo_2d,
-                    geo_sphere,
-                    id_claim: false,
-                    clustered: false,
-                    key_order: index_bindata_order(&opts),
-                }
-            })
+            .map(|(name, key_spec, opts)| index_desc_from(name, key_spec, &opts))
             .collect();
         descs.extend(self.id_claim_desc(session, db, coll)?);
         Ok(descs)
@@ -19400,6 +19532,7 @@ impl Storage {
             );
             self.remove_index_entries(session, db, coll, &removals)?;
             self.maybe_mark_multikey(session, db, coll, &new, &descs)?;
+            self.index_build_side_write(session, db, coll, Some(&doc), Some(&new), recordid)?;
             if oplog_on {
                 let o_owned: Vec<u8>;
                 // A PIPELINE update (no operator spec) is logged as a full
@@ -19575,6 +19708,14 @@ impl Storage {
                         );
                         self.remove_index_entries(&session, db, coll, &removals)?;
                         self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
+                        self.index_build_side_write(
+                            &session,
+                            db,
+                            coll,
+                            Some(&doc),
+                            Some(&new),
+                            recordid,
+                        )?;
                         if oplog_on {
                             // Replacement `o` is the whole new doc — reuse the
                             // `new_blob` we already encoded for the doc-table write

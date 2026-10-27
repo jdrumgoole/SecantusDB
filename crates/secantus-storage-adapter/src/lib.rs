@@ -1071,6 +1071,117 @@ impl CmdStorage for StorageAdapter {
         Ok(dropped)
     }
 
+    fn supports_index_builds(&self) -> bool {
+        true
+    }
+
+    fn begin_index_build(
+        &self,
+        db: &str,
+        coll: &str,
+        uuid: [u8; 16],
+        specs: &[(String, Document, Document)],
+        member: &str,
+    ) -> Result<(), StorageError> {
+        let specs: Vec<secantus_storage::IndexBuildSpec> = specs
+            .iter()
+            .map(|(name, key, options)| secantus_storage::IndexBuildSpec {
+                name: name.clone(),
+                key: key.clone(),
+                options: options.clone(),
+            })
+            .collect();
+        self.inner
+            .begin_index_build(db, coll, uuid, &specs, member)
+            .map_err(map_err)
+    }
+
+    fn run_index_build(&self, uuid: &[u8; 16], memory_limit: usize) -> Result<(), StorageError> {
+        self.inner
+            .run_index_build(uuid, memory_limit)
+            .map_err(map_err)
+    }
+
+    fn index_build_ready(&self, uuid: &[u8; 16], member: &str) -> Result<(), StorageError> {
+        self.inner.index_build_ready(uuid, member).map_err(map_err)
+    }
+
+    fn commit_index_build(&self, uuid: &[u8; 16]) -> Result<(), StorageError> {
+        let info = self
+            .inner
+            .index_builds(None, None)
+            .into_iter()
+            .find(|b| &b.uuid == uuid);
+        self.inner.commit_index_build(uuid).map_err(map_err)?;
+        if let Some(b) = info {
+            for spec in &b.indexes {
+                if let Ok(name) = spec.get_str("name") {
+                    self.index_created(&b.db, &b.coll, name);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn abort_index_build(
+        &self,
+        uuid: &[u8; 16],
+        cause: &secantus_commands::storage::IndexBuildAbort,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .abort_index_build(uuid, &wt_abort(cause))
+            .map_err(map_err)
+    }
+
+    fn request_index_build_abort(
+        &self,
+        db: &str,
+        coll: Option<&str>,
+        uuid: Option<&[u8; 16]>,
+        cause: &secantus_commands::storage::IndexBuildAbort,
+    ) -> Vec<[u8; 16]> {
+        self.inner
+            .request_index_build_abort(db, coll, uuid, &wt_abort(cause))
+    }
+
+    fn wait_index_builds_gone(&self, uuids: &[[u8; 16]]) {
+        self.inner.wait_index_builds_gone(uuids)
+    }
+
+    fn index_build_abort_cause(
+        &self,
+        uuid: &[u8; 16],
+    ) -> Option<secantus_commands::storage::IndexBuildAbort> {
+        self.inner.index_build_abort_cause(uuid).map(|a| {
+            secantus_commands::storage::IndexBuildAbort {
+                code: a.code,
+                code_name: a.code_name,
+                errmsg: a.errmsg,
+                extra: a.extra,
+            }
+        })
+    }
+
+    fn index_builds(
+        &self,
+        db: Option<&str>,
+        coll: Option<&str>,
+    ) -> Vec<secantus_commands::storage::IndexBuildInfo> {
+        self.inner
+            .index_builds(db, coll)
+            .into_iter()
+            .map(|b| secantus_commands::storage::IndexBuildInfo {
+                uuid: b.uuid,
+                db: b.db,
+                coll: b.coll,
+                indexes: b.indexes,
+                phase: b.phase,
+                phase_str: b.phase_str.to_string(),
+                aborting: b.aborting,
+            })
+            .collect()
+    }
+
     fn set_index_options(
         &self,
         db: &str,
@@ -1597,6 +1708,18 @@ fn to_hint(b: RawHint<'_>) -> Hint {
 }
 
 /// Translate a storage error into the command layer's pre-classified error.
+/// The command layer's abort cause, as the storage records it.
+fn wt_abort(
+    cause: &secantus_commands::storage::IndexBuildAbort,
+) -> secantus_storage::IndexBuildAbort {
+    secantus_storage::IndexBuildAbort {
+        code: cause.code,
+        code_name: cause.code_name.clone(),
+        errmsg: cause.errmsg.clone(),
+        extra: cause.extra.clone(),
+    }
+}
+
 fn map_err(e: WtError) -> StorageError {
     match e {
         // mongod's message, with the key rendered as the shell does (the Rust
