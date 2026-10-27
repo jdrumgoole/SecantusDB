@@ -2533,7 +2533,7 @@ fn array_field<'a>(doc: &'a Document, key: &str) -> &'a [Bson] {
 /// Encode a document to BSON bytes for the storage seam.
 fn encode_doc(d: &Document) -> Result<Vec<u8>, CommandError> {
     let mut bytes = Vec::new();
-    d.to_writer(&mut bytes).map_err(|e| {
+    crate::bsondoc::write(d, &mut bytes).map_err(|e| {
         CommandError::new(
             1,
             "InternalError",

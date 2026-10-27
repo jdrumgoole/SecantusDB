@@ -273,8 +273,7 @@ fn write_run(items: impl Iterator<Item = (Vec<Bson>, Document)>, sizing: &Sizing
     for (keys, d) in items {
         bytes += spilled_bytes(&keys, &d, sizing) as i64;
         let mut buf = Vec::new();
-        doc! { "k": keys, "d": d }
-            .to_writer(&mut buf)
+        crate::bsondoc::write(&doc! { "k": keys, "d": d }, &mut buf)
             .map_err(|e| io_error("encode a record for", &path, e))?;
         out.write_all(&buf)
             .map_err(|e| io_error("write", &path, e))?;

@@ -197,7 +197,7 @@ fn apply_entry_with(storage: &Storage, entry: &Document, strict: bool) -> Result
                 .get_document("o")
                 .map_err(|_| StorageError::Internal("replay: insert entry missing o".into()))?;
             let mut buf = Vec::new();
-            o.to_writer(&mut buf)
+            secantus_core::bsondoc::write(o, &mut buf)
                 .map_err(|e| StorageError::Bson(e.to_string()))?;
             if strict {
                 storage.insert_one(&db, &coll, &buf)?;

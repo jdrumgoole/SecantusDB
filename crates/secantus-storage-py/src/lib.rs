@@ -60,7 +60,7 @@ fn decode_doc(b: &[u8]) -> PyResult<Document> {
 /// Encode a `Document` to bytes (for return values).
 fn encode_doc(doc: &Document) -> PyResult<Vec<u8>> {
     let mut buf = Vec::new();
-    doc.to_writer(&mut buf)
+    secantus_storage::bsondoc::write(doc, &mut buf)
         .map_err(|e| PyValueError::new_err(format!("BSON encode error: {e}")))?;
     Ok(buf)
 }
@@ -403,7 +403,7 @@ impl RustStorage {
                 docs.iter()
                     .map(|d| {
                         let mut buf = Vec::new();
-                        d.to_writer(&mut buf)
+                        secantus_storage::bsondoc::write(d, &mut buf)
                             .map_err(|e| StorageError::Bson(e.to_string()))?;
                         Ok(buf)
                     })

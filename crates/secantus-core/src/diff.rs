@@ -578,14 +578,16 @@ fn binary_equal(a: &Bson, b: &Bson) -> bool {
     let mut db = Document::new();
     db.insert("", b.clone());
     let (mut ba, mut bb) = (Vec::new(), Vec::new());
-    da.to_writer(&mut ba).is_ok() && db.to_writer(&mut bb).is_ok() && ba == bb
+    crate::bsondoc::write(&da, &mut ba).is_ok()
+        && crate::bsondoc::write(&db, &mut bb).is_ok()
+        && ba == bb
 }
 
 fn bson_size(v: &Bson) -> usize {
     let mut d = Document::new();
     d.insert("", v.clone());
     let mut buf = Vec::new();
-    let _ = d.to_writer(&mut buf);
+    let _ = crate::bsondoc::write(&d, &mut buf);
     // document header (4) + type byte (1) + empty name's NUL (1) + trailer (1)
     buf.len().saturating_sub(7)
 }

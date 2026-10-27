@@ -90,6 +90,15 @@ const NAMED_ARGUMENT_OPS: &[&str] = &[
 
 /// `FieldPath::validateFieldName`: the bare status message for one field name.
 pub fn field_name_problem(name: &str) -> Option<(i32, String)> {
+    name_problem(name, false)
+}
+
+/// [`field_name_problem`] for a name that came from a document KEY, which may
+/// be the escape of a name that is not UTF-8 (`bsondoc::escape_key`). mongod
+/// accepts such a name; a NUL that is not that escape is still refused. A
+/// name from a string VALUE never takes this: a string can hold a NUL and
+/// two hex digits, and mongod refuses that.
+fn name_problem(name: &str, key: bool) -> Option<(i32, String)> {
     if name.is_empty() {
         return Some((
             15998,
@@ -102,7 +111,7 @@ pub fn field_name_problem(name: &str) -> Option<(i32, String)> {
             format!("FieldPath field names may not start with '$', given '{name}'."),
         ));
     }
-    if name.contains('\0') {
+    if name.contains('\0') && !(key && crate::bsondoc::key_bytes(name).is_some()) {
         return Some((
             16411,
             format!("FieldPath field names may not contain '\0', given '{name}'."),
@@ -119,14 +128,29 @@ pub fn field_name_problem(name: &str) -> Option<(i32, String)> {
 
 /// A field name refused, with the context mongod's `FieldPath` adds.
 pub fn field_name_error(name: &str) -> Option<Fallback> {
-    field_name_problem(name).map(|(code, msg)| {
+    name_error(name, false)
+}
+
+fn name_error(name: &str, key: bool) -> Option<Fallback> {
+    name_problem(name, key).map(|(code, msg)| {
         Fallback::mongo(code, format!("{FIELD_NAME_CONTEXT} :: caused by :: {msg}")).bare()
     })
+}
+
+/// [`field_path_error`] for a path that is a document KEY (a projection's or
+/// an `$addFields`' field, an object literal's name): an escaped name that is
+/// not UTF-8 is accepted (RM-222).
+pub fn key_path_error(path: &str) -> Option<Fallback> {
+    path_error(path, true)
 }
 
 /// The `FieldPath` constructor over a dotted path: 40352 for an empty path,
 /// 40353 for a trailing dot, then each component's name.
 pub fn field_path_error(path: &str) -> Option<Fallback> {
+    path_error(path, false)
+}
+
+fn path_error(path: &str, key: bool) -> Option<Fallback> {
     if path.is_empty() {
         return Some(
             Fallback::mongo(40352, "FieldPath cannot be constructed with empty string").bare(),
@@ -135,7 +159,7 @@ pub fn field_path_error(path: &str) -> Option<Fallback> {
     if path.ends_with('.') {
         return Some(Fallback::mongo(40353, "FieldPath must not end with a '.'.").bare());
     }
-    path.split('.').find_map(field_name_error)
+    path.split('.').find_map(|name| name_error(name, key))
 }
 
 /// `Expression::parseOperand`: any value in expression position.
@@ -196,9 +220,13 @@ fn argument(op: &str, arg: &Bson) -> R {
 /// `ExpressionObject::parse`: each field name is a valid `FieldPath` name and
 /// appears once; each value is an operand.
 pub fn object_literal(d: &Document) -> R {
+    // A string that is not UTF-8 is a constant, not an object (RM-222).
+    if crate::bsondoc::carrier_bytes(d).is_some() {
+        return Ok(());
+    }
     let mut seen = std::collections::HashSet::new();
     for (name, value) in d {
-        if let Some(e) = field_name_error(name) {
+        if let Some(e) = name_error(name, true) {
             return Err(e);
         }
         if !seen.insert(name.as_str()) {
@@ -225,14 +253,16 @@ pub fn add_fields_spec(spec: &Document) -> R {
     let raw = crate::query::bson_value_repr(&Bson::Document(spec.clone()));
     let mut seen = PathSet::default();
     for (name, value) in spec {
-        if let Some(e) = field_path_error(name) {
+        if let Some(e) = key_path_error(name) {
             return Err(e);
         }
         add_fields_element(value, name, &mut seen, &raw)?;
     }
     for (_, value) in spec {
         match value {
-            Bson::Document(d) => add_fields_object(d)?,
+            Bson::Document(d) if crate::bsondoc::carrier_bytes(d).is_none() => {
+                add_fields_object(d)?
+            }
             other => operand(other)?,
         }
     }
@@ -240,7 +270,10 @@ pub fn add_fields_spec(spec: &Document) -> R {
 }
 
 fn add_fields_element(value: &Bson, path: &str, seen: &mut PathSet, raw: &str) -> R {
-    let Bson::Document(level) = value else {
+    let Some(level) = value
+        .as_document()
+        .filter(|d| crate::bsondoc::carrier_bytes(d).is_none())
+    else {
         return seen.insert(path, raw);
     };
     for (name, child) in level {
@@ -433,13 +466,16 @@ impl ProjectionParse {
             return Ok(());
         }
         match value {
-            Bson::Document(d) => self.sub_object(name, d, parent),
+            // A string that is not UTF-8 is an expression, not a sub-object.
+            Bson::Document(d) if crate::bsondoc::carrier_bytes(d).is_none() => {
+                self.sub_object(name, d, parent)
+            }
             Bson::Int32(_)
             | Bson::Int64(_)
             | Bson::Double(_)
             | Bson::Decimal128(_)
             | Bson::Boolean(_) => {
-                if let Some(e) = field_path_error(name) {
+                if let Some(e) = key_path_error(name) {
                     return Err(e);
                 }
                 add_node(parent, name, Node::Leaf)?;
@@ -469,7 +505,7 @@ impl ProjectionParse {
             }
             other => {
                 operand(other)?;
-                if let Some(e) = field_path_error(name) {
+                if let Some(e) = key_path_error(name) {
                     return Err(e);
                 }
                 add_node(parent, name, Node::Leaf)?;
@@ -545,7 +581,7 @@ impl ProjectionParse {
                 Fallback::mongo(51270, format!("Invalid empty sub-projection: {name}")).bare(),
             );
         }
-        if let Some(e) = field_path_error(name) {
+        if let Some(e) = key_path_error(name) {
             return Err(e);
         }
         if let (1, Some(first)) = (d.len(), d.keys().next()) {

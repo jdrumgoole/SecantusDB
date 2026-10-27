@@ -573,7 +573,7 @@ fn write_document(
     if outcome.matched > 0 {
         return Ok(Outcome::Applied);
     }
-    let bytes = bson::to_vec(&doc).map_err(|e| error(1, e.to_string()))?;
+    let bytes = crate::bsondoc::to_vec(&doc).map_err(|e| error(1, e.to_string()))?;
     let (_, errors) = storage
         .insert(db, coll, vec![bytes], true)
         .map_err(crate::util::command_error)?;

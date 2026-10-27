@@ -144,7 +144,8 @@ fn match_clause_raw(
         // by staying raw — decode once and delegate this clause to the owned
         // matcher.
         "$expr" | "$jsonSchema" | "$alwaysTrue" | "$alwaysFalse" | "$sampleRate" => {
-            let doc: Document = raw.try_into().map_err(|_| Fallback::Defer)?;
+            // Lossless, so a string that is not UTF-8 decodes (RM-222).
+            let doc = crate::bsondoc::from_bytes(raw.as_bytes()).map_err(|_| Fallback::Defer)?;
             match_clause(&doc, key, cond, vars, coll)
         }
         // $where runs user JavaScript. SecantusDB embeds no script engine, and
@@ -180,6 +181,27 @@ fn match_clause_raw(
 /// The raw-BSON twin of [`resolve_path`], returning owned values plus each
 /// one's `expandable` flag (see [`Cand`]).
 fn resolve_path_raw(raw: &RawDocument, path: &str) -> Result<Vec<(Option<Bson>, bool)>, Fallback> {
+    match resolve_path_raw_strict(raw, path) {
+        Ok(found) => Ok(found),
+        // The crate's raw reader refuses a string or a name that is not
+        // UTF-8 (RM-222). Decode the document keeping those bytes and walk
+        // it as the owned matcher does; a document that does not decode at
+        // all still defers.
+        Err(Fallback::Defer) => {
+            let doc = crate::bsondoc::from_bytes(raw.as_bytes()).map_err(|_| Fallback::Defer)?;
+            Ok(resolve_path(&doc, path)
+                .into_iter()
+                .map(|c| (c.value.cloned(), c.expandable))
+                .collect())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn resolve_path_raw_strict(
+    raw: &RawDocument,
+    path: &str,
+) -> Result<Vec<(Option<Bson>, bool)>, Fallback> {
     let mut parts = path.split('.').peekable();
     let first = parts.next().unwrap_or("");
     let mut current: Vec<(Option<RawBsonRef>, bool)> =
@@ -835,6 +857,16 @@ fn field_matches_descend(
 /// is the optional sibling `$options` string. A non-string pattern/options, or
 /// a pattern neither regex engine can compile, signals `Fallback`.
 fn op_regex(values: &[Cand], pattern: &Bson, options: Option<&Bson>, descend: bool) -> R {
+    // A pattern that is not UTF-8 does not compile (measured 8.2.11,
+    // 2026-10-27: 51091 with PCRE2's verdict; RM-222).
+    if let Some(fault) = crate::bsondoc::as_invalid_utf8(pattern)
+        .map(|b| crate::rawstr::pcre2_utf8_error(b).unwrap_or("UTF-8 error"))
+    {
+        return Err(Fallback::mongo(
+            51091,
+            format!("Regular expression is invalid: {fault}"),
+        ));
+    }
     // mongod takes a string or a BSON regex and nothing else.
     if !matches!(pattern, Bson::String(_) | Bson::RegularExpression(_)) {
         return Err(Fallback::mongo(2, "$regex has to be a string"));
@@ -1522,6 +1554,15 @@ fn compare_values(
     if let (Some(c), Bson::String(x), Bson::String(y)) = (coll, a, b) {
         return Ok(Some(collation::compare(x, y, c).ok_or(Fallback::Defer)?));
     }
+    // Two strings, one of them not UTF-8 (RM-222): byte order, as mongod
+    // compares them, or the collation over their text.
+    if let Some((x, y)) = crate::bsondoc::carrier_pair(a, b) {
+        return Ok(Some(match coll {
+            Some(c) => collation::compare(&crate::bsondoc::lossy(x), &crate::bsondoc::lossy(y), c)
+                .ok_or(Fallback::Defer)?,
+            None => x.cmp(y),
+        }));
+    }
     // A document operand: Python's `<` on dicts raises TypeError — i.e. no match —
     // and mongod's range operators ($gt/$lt/…) are type-bracketed, so a
     // document-valued field never satisfies a scalar bound (and a document bound
@@ -1695,8 +1736,12 @@ fn matches_type(v: &Bson, spec: &Bson) -> bool {
             || code.map(|c| codes.contains(&c)).unwrap_or(false))
     };
     is(&["double"], &[1], matches!(v, Bson::Double(_)))
-        || is(&["string"], &[2], matches!(v, Bson::String(_)))
-        || is(&["object"], &[3], matches!(v, Bson::Document(_)))
+        || is(&["string"], &[2], crate::bsondoc::is_string(v))
+        || is(
+            &["object"],
+            &[3],
+            matches!(v, Bson::Document(_)) && !crate::bsondoc::is_string(v),
+        )
         || is(&["array"], &[4], matches!(v, Bson::Array(_)))
         || is(&["binData"], &[5], matches!(v, Bson::Binary(_)))
         || is(&["objectId"], &[7], matches!(v, Bson::ObjectId(_)))
@@ -1747,6 +1792,11 @@ fn matches_type(v: &Bson, spec: &Bson) -> bool {
 /// prints `new Date(<millis>)`. Probed across every BSON type against 8.2.11
 /// (2026-09-01); mirrors `secantus.bsontypes.bson_value_repr`.
 pub fn bson_value_repr(v: &Bson) -> String {
+    // A string that is not UTF-8 prints as the string it is, each invalid
+    // sequence replaced (mongod writes the raw bytes; RM-222).
+    if let Some(b) = crate::bsondoc::as_invalid_utf8(v) {
+        return format!("\"{}\"", crate::bsondoc::lossy(b));
+    }
     match v {
         Bson::Null | Bson::Undefined => "null".to_string(),
         Bson::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
@@ -1830,6 +1880,9 @@ pub fn fmt_double_parse(d: f64) -> String {
 }
 
 pub fn bson_type_name(v: &Bson) -> &'static str {
+    if crate::bsondoc::as_invalid_utf8(v).is_some() {
+        return "string";
+    }
     match v {
         Bson::Boolean(_) => "bool",
         Bson::Int64(_) => "long",

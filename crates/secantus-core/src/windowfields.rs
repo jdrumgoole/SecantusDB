@@ -233,7 +233,7 @@ pub(crate) fn set_window_fields_each(
         }
         let mut wrap = Document::new();
         wrap.insert("k", crate::collation::fold_active(key_val.clone()));
-        let key = bson::to_vec(&wrap).map_err(|_| Fallback::Defer)?;
+        let key = crate::bsondoc::to_vec(&wrap).map_err(|_| Fallback::Defer)?;
         let idx = *key_index.entry(key).or_insert_with(|| {
             partitions.push(Vec::new());
             keys.push(key_val);
@@ -660,8 +660,7 @@ impl CacheSpill {
         let mut bytes = 0i64;
         for d in docs {
             let mut buf = Vec::new();
-            d.to_writer(&mut buf)
-                .map_err(|e| io("encode a document for", &e))?;
+            crate::bsondoc::write(d, &mut buf).map_err(|e| io("encode a document for", &e))?;
             out.write_all(&buf).map_err(|e| io("write", &e))?;
             bytes += buf.len() as i64 + 32;
         }

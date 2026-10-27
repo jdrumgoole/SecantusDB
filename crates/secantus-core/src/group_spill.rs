@@ -125,8 +125,7 @@ pub(crate) fn spill(
         }
         let record = doc! { "k": id, "s": states };
         let mut buf = Vec::new();
-        record
-            .to_writer(&mut buf)
+        crate::bsondoc::write(&record, &mut buf)
             .map_err(|e| io_error("encode a group for", &path, e))?;
         out.write_all(&buf)
             .map_err(|e| io_error("write", &path, e))?;

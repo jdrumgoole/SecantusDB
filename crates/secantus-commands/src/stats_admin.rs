@@ -97,7 +97,7 @@ fn totals(ctx: &CommandContext, db: &str) -> Result<Totals, CommandError> {
         t.indexes += 1;
         for definition in crate::ts_buckets::view_definitions(storage, db)? {
             if definition.contains_key("viewOn") && !is_timeseries_definition(&definition) {
-                t.data_size += bson::to_vec(&definition).map_or(0, |b| b.len() as i64);
+                t.data_size += crate::bsondoc::to_vec(&definition).map_or(0, |b| b.len() as i64);
             }
         }
     }

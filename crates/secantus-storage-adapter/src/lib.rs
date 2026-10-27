@@ -467,7 +467,7 @@ impl CmdStorage for StorageAdapter {
         match changestreams::make_resume_token(&data) {
             Ok(doc) => {
                 let mut buf = Vec::new();
-                if doc.to_writer(&mut buf).is_ok() {
+                if secantus_commands::bsondoc::write(&doc, &mut buf).is_ok() {
                     buf
                 } else {
                     Vec::new()
@@ -1676,7 +1676,7 @@ fn push_event(
     };
     for frag in fragments {
         let mut buf = Vec::new();
-        frag.to_writer(&mut buf)
+        secantus_commands::bsondoc::write(&frag, &mut buf)
             .map_err(|e| StorageError::Internal(format!("event encode: {e}")))?;
         events.push(buf);
     }
@@ -1731,8 +1731,8 @@ fn map_err(e: WtError) -> StorageError {
             errmsg: conflict.errmsg(),
             exec: true,
             extra: conflict.extra(),
+            key_value: Some(conflict.reply_key_value()),
             key_pattern: Some(conflict.key_pattern),
-            key_value: Some(conflict.key_value),
         })),
         WtError::DuplicateId => StorageError::WriteError {
             code: 11000,

@@ -357,7 +357,7 @@ fn write(ctx: &CommandContext, db: &str, entry: &Document) {
                 .map_err(|e| format!("{e:?}"))?;
         }
         let mut bytes = Vec::new();
-        entry.to_writer(&mut bytes).map_err(|e| format!("{e:?}"))?;
+        crate::bsondoc::write(entry, &mut bytes).map_err(|e| format!("{e:?}"))?;
         let (_, errors) = storage
             .insert(db, PROFILE_COLLECTION, vec![bytes], true)
             .map_err(|e| format!("{e:?}"))?;
@@ -553,7 +553,7 @@ const MAX_COMMAND_BYTES: usize = 50 * 1024;
 /// abbreviated rendering of it, `{$truncated: "...", comment}` (strings of
 /// 160 characters or more cut to 150, the whole cut to 50 KB).
 fn abbreviated(command: &Document) -> Document {
-    let size = bson::to_vec(command).map_or(0, |b| b.len());
+    let size = crate::bsondoc::to_vec(command).map_or(0, |b| b.len());
     if size <= MAX_COMMAND_BYTES {
         return command.clone();
     }
@@ -621,7 +621,7 @@ fn failure(reply: &Document, entry: &mut Document) {
 /// The size of the reply on the wire: the frame's header and sections around
 /// the reply document, the cursor batch included.
 fn response_length(reply: &Document, ctx: &CommandContext) -> i32 {
-    let body = bson::to_vec(reply).map_or(0, |b| b.len());
+    let body = crate::bsondoc::to_vec(reply).map_or(0, |b| b.len());
     let batch = ctx.pending_batch.as_ref().map_or(0, |pending| {
         // The batch is an array element of the reply's `cursor`.
         let items: usize = pending

@@ -283,7 +283,7 @@ pub fn record_replset_config(
         }
         None => {
             let config = replset_config(set_name, &host_port, bson::oid::ObjectId::new());
-            let bytes = bson::to_vec(&config)
+            let bytes = crate::bsondoc::to_vec(&config)
                 .map_err(|e| crate::storage::StorageError::Internal(e.to_string()))?;
             storage.insert("local", "system.replset", vec![bytes], true)?;
         }

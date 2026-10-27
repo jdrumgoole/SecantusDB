@@ -815,7 +815,10 @@ fn with_retryable_session(
     let (Ok(lsid), Ok(txn)) = (rw.get_document("lsid"), rw.get_i64("txnNumber")) else {
         return entry;
     };
-    let key = (bson::to_vec(lsid).unwrap_or_default(), txn);
+    let key = (
+        secantus_core::bsondoc::to_vec(lsid).unwrap_or_default(),
+        txn,
+    );
     let prev = chains
         .get(&key)
         .cloned()
@@ -1084,7 +1087,9 @@ const PROFILE_COLLECTION: &str = "system.profile";
 fn oplog_entry_size(e: &OplogEntry) -> u64 {
     match e {
         OplogEntry::Raw(buf) => buf.as_bytes().len() as u64,
-        OplogEntry::Doc(d) => bson::to_vec(d).map(|v| v.len()).unwrap_or(0) as u64,
+        OplogEntry::Doc(d) => secantus_core::bsondoc::to_vec(d)
+            .map(|v| v.len())
+            .unwrap_or(0) as u64,
     }
 }
 
@@ -2184,6 +2189,7 @@ impl UniqueConflict {
             .zip(&hex)
             .map(|((k, v), is_hex)| match v {
                 Bson::String(h) if *is_hex => format!("{k}: \"CollationKey(0x{h})\""),
+                _ if invalid_utf8_hex(v).is_some() => format!("{k}: {}", shell_value(v)),
                 Bson::Document(_) | Bson::Array(_) => {
                     format!("{k}: {}", secantus_core::query::bson_value_repr(v))
                 }
@@ -2212,16 +2218,30 @@ impl UniqueConflict {
     fn hex_encoded(&self) -> Vec<bool> {
         self.key_value
             .values()
-            .map(|v| self.collation.is_some() && matches!(v, Bson::String(_)))
+            .map(|v| {
+                (self.collation.is_some() && matches!(v, Bson::String(_)))
+                    || invalid_utf8_hex(v).is_some()
+            })
             .collect()
+    }
+
+    /// `keyValue` as mongod replies with it ([`dup_key_value_reply`]).
+    pub fn reply_key_value(&self) -> Document {
+        dup_key_value_reply(&self.key_value).0
     }
 
     /// The reply fields mongod adds after `keyValue` for a collated index.
     pub fn extra(&self) -> Option<Document> {
         let Some(collation) = self.collation.as_ref() else {
-            return self
-                .clustered
-                .then(|| bson::doc! { "foundValue": Document::new() });
+            let hex = self.hex_encoded();
+            let mut out = Document::new();
+            if hex.iter().any(|h| *h) {
+                out.insert("hexEncoded", hex);
+            }
+            if self.clustered {
+                out.insert("foundValue", Document::new());
+            }
+            return (!out.is_empty()).then_some(out);
         };
         let mut out = Document::new();
         let hex = self.hex_encoded();
@@ -2684,13 +2704,11 @@ fn encode_doc(doc: &Document) -> Result<Vec<u8>> {
                 ordered.insert(k.clone(), v.clone());
             }
         }
-        ordered
-            .to_writer(&mut buf)
+        secantus_core::bsondoc::write(&ordered, &mut buf)
             .map_err(|e| StorageError::Bson(e.to_string()))?;
         return Ok(buf);
     }
-    doc.to_writer(&mut buf)
-        .map_err(|e| StorageError::Bson(e.to_string()))?;
+    secantus_core::bsondoc::write(doc, &mut buf).map_err(|e| StorageError::Bson(e.to_string()))?;
     Ok(buf)
 }
 
@@ -2826,6 +2844,11 @@ fn index_keys_equiv(a: &Document, b: &Document) -> bool {
 /// `dup key: { … }` fragment of an E11000 message (drivers like the PHP extension
 /// pin the text verbatim). Mirrors `storage._shell_value`.
 fn shell_value(v: &Bson) -> String {
+    // A string that is not UTF-8 is printed as its bytes in hex, as mongod
+    // prints it (`{ s: "0xfffe" }`, measured 8.2.11, 2026-10-27; RM-222).
+    if let Some(hex) = invalid_utf8_hex(v) {
+        return format!("\"0x{hex}\"");
+    }
     match v {
         Bson::Boolean(b) => {
             if *b {
@@ -2874,6 +2897,34 @@ fn shell_value(v: &Bson) -> String {
         // 8.2.11, 2026-10-12).
         other => secantus_core::query::bson_value_repr(other),
     }
+}
+
+/// The lowercase hex of a string's bytes when they are not UTF-8.
+fn invalid_utf8_hex(v: &Bson) -> Option<String> {
+    secantus_core::bsondoc::as_invalid_utf8(v)
+        .map(|bytes| bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// A duplicate key's `keyValue` as mongod replies with it, and which of its
+/// fields are hex: a string that is not UTF-8 is reported as the hex of its
+/// bytes, flagged in `hexEncoded` (measured 8.2.11, 2026-10-27: `keyValue:
+/// {s: "fffe"}, hexEncoded: [true]`; RM-222).
+pub fn dup_key_value_reply(key_value: &Document) -> (Document, Vec<bool>) {
+    let mut out = Document::new();
+    let mut hex = Vec::with_capacity(key_value.len());
+    for (k, v) in key_value {
+        match invalid_utf8_hex(v) {
+            Some(h) => {
+                out.insert(k.clone(), h);
+                hex.push(true);
+            }
+            None => {
+                out.insert(k.clone(), v.clone());
+                hex.push(false);
+            }
+        }
+    }
+    (out, hex)
 }
 
 /// Build mongod's E11000 duplicate-key `errmsg`:
@@ -11326,8 +11377,9 @@ impl Storage {
                         e.insert("code", 11000i32);
                         e.insert("errmsg", c.errmsg());
                         let extra = c.extra();
+                        let key_value = c.reply_key_value();
                         e.insert("keyPattern", Bson::Document(c.key_pattern));
-                        e.insert("keyValue", Bson::Document(c.key_value));
+                        e.insert("keyValue", Bson::Document(key_value));
                         e.extend(extra.unwrap_or_default());
                         errors.push(e);
                         if ordered {
@@ -11411,14 +11463,18 @@ impl Storage {
                                 Some(conflict) => {
                                     ed.insert(
                                         "keyValue",
-                                        Bson::Document(conflict.key_value.clone()),
+                                        Bson::Document(conflict.reply_key_value()),
                                     );
                                     if let Some(extra) = conflict.extra() {
                                         ed.extend(extra);
                                     }
                                 }
                                 None => {
-                                    ed.insert("keyValue", Bson::Document(key_value));
+                                    let (reply, hex) = dup_key_value_reply(&key_value);
+                                    ed.insert("keyValue", Bson::Document(reply));
+                                    if hex.iter().any(|h| *h) {
+                                        ed.insert("hexEncoded", hex);
+                                    }
                                     if clustered {
                                         ed.insert("foundValue", Document::new());
                                     }
@@ -11548,7 +11604,8 @@ impl Storage {
         if reason != "Unspecified" {
             row.insert("blockUserWritesReason", reason);
         }
-        let bytes = bson::to_vec(&row).map_err(|e| StorageError::Bson(e.to_string()))?;
+        let bytes =
+            secantus_core::bsondoc::to_vec(&row).map_err(|e| StorageError::Bson(e.to_string()))?;
         if !self.replace_by_id(
             WRITE_BLOCK_DB,
             WRITE_BLOCK_COLL,
@@ -13265,10 +13322,9 @@ impl Storage {
         let session = self.op_session()?;
         let mut out = Vec::with_capacity(docs.len());
         for bytes in docs {
-            let id = bson::RawDocument::from_bytes(bytes)
+            let id = secantus_core::bsondoc::fields(bytes, |key| key == "_id")
                 .ok()
-                .and_then(|d| d.get("_id").ok().flatten())
-                .and_then(|v| Bson::try_from(v).ok());
+                .and_then(|mut d| d.remove("_id"));
             let Some(id) = id else {
                 out.push(None);
                 continue;
@@ -18513,16 +18569,8 @@ impl Storage {
             .collect();
         let mut keyed: Vec<(Vec<SortPart>, usize)> = Vec::with_capacity(blobs.len());
         for (at, blob) in blobs.iter().enumerate() {
-            let raw =
-                bson::RawDocument::from_bytes(blob).map_err(|_| StorageError::QueryUnsupported)?;
-            let mut d = Document::new();
-            for elem in raw {
-                let (key, val) = elem.map_err(|_| StorageError::QueryUnsupported)?;
-                if tops.contains(&key) {
-                    let val = Bson::try_from(val).map_err(|_| StorageError::QueryUnsupported)?;
-                    d.insert(key.to_string(), val);
-                }
-            }
+            let d = secantus_core::bsondoc::fields(blob, |key| tops.contains(&key))
+                .map_err(|_| StorageError::QueryUnsupported)?;
             keyed.push((sort_key(&d, &spec, coll_opt)?, at));
         }
         keyed.sort_by(|a, b| compare_sort_keys(&a.0, &b.0, &spec));
@@ -22705,7 +22753,7 @@ fn retryable_stamp(position: usize) -> Option<bson::RawDocumentBuf> {
         let (lsid, txn, ids) = s.as_ref()?;
         let id = *ids.get(position)?;
         let mut rw = bson::RawDocumentBuf::new();
-        rw.append("lsid", bson::RawDocumentBuf::from_document(lsid).ok()?);
+        rw.append("lsid", secantus_core::bsondoc::to_raw(lsid).ok()?);
         rw.append("txnNumber", *txn);
         rw.append("stmtId", id);
         Some(rw)
@@ -22774,7 +22822,7 @@ fn stamp_oplog_session(entry: OplogEntry, lsid: &Document, txn: i64) -> Result<O
                 .get_str("op")
                 .is_ok_and(|op| matches!(op, "i" | "u" | "d"))
             {
-                let lsid_raw = bson::RawDocumentBuf::from_document(lsid)
+                let lsid_raw = secantus_core::bsondoc::to_raw(lsid)
                     .map_err(|e| StorageError::Bson(e.to_string()))?;
                 buf.append("lsid", bson::RawBson::Document(lsid_raw));
                 buf.append("txnNumber", bson::RawBsonRef::Int64(txn).to_raw_bson());
@@ -23306,7 +23354,10 @@ fn doc_was_modified(new: &Document, old: &Document, update_spec: Option<&Documen
             // byte for byte. One that leaves out the `_id` never is, so
             // mongod counts it as a modification even when every other field
             // is the same (measured 8.2.11, 2026-10-12).
-            return match (bson::to_vec(u), bson::to_vec(old)) {
+            return match (
+                secantus_core::bsondoc::to_vec(u),
+                secantus_core::bsondoc::to_vec(old),
+            ) {
                 (Ok(a), Ok(b)) => a != b,
                 _ => false,
             };
