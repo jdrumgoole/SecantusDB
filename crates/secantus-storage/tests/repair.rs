@@ -63,15 +63,40 @@ fn seeded(home: &Path, server_like: bool) {
     st.close().unwrap();
 }
 
-/// Overwrite 16 KB in the middle of a table's file.
+/// Overwrite 16 KB stripes of a table's file until WiredTiger's `verify`
+/// (the check `repair` runs) sees the damage. One stripe at a fixed offset
+/// is not enough: where it lands may be free space after a checkpoint,
+/// which `verify` rightly never reads, and the file's layout differs
+/// between platforms (a Linux CI run found nothing to salvage where macOS
+/// always did).
 fn damage(home: &Path, table: &str) {
     let path = home.join(format!("{}.wt", table.trim_start_matches("table:")));
     let len = std::fs::metadata(&path).unwrap().len();
     assert!(len > 64 * 1024, "{table} is only {len} bytes");
-    let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-    f.seek(SeekFrom::Start(len / 2)).unwrap();
-    f.write_all(&[0xde; 16 * 1024]).unwrap();
-    f.sync_all().unwrap();
+    const STRIPE: u64 = 16 * 1024;
+    for (num, den) in [(1, 2), (1, 3), (2, 3), (1, 4), (3, 4), (1, 5), (4, 5)] {
+        let at = (len * num / den) / 4096 * 4096;
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(at)).unwrap();
+        f.write_all(&[0xde; STRIPE as usize]).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        if !verifies(home, table) {
+            return;
+        }
+    }
+    panic!("WiredTiger's verify passed {table} after seven damaged stripes");
+}
+
+/// Whether `table` passes WiredTiger's `verify` on a bare connection.
+fn verifies(home: &Path, table: &str) -> bool {
+    let config = options(false).wt_config.unwrap();
+    let conn = secantus_wt::Connection::open(home.to_str().unwrap(), &config).unwrap();
+    let session = conn.open_session().unwrap();
+    let ok = session.verify(table, None).is_ok();
+    drop(session);
+    drop(conn);
+    ok
 }
 
 /// The collection's indexes agree with its documents; answers how many
