@@ -101,6 +101,27 @@ impl PgHandler {
 
     /// `shared_buffers`, in pages.
     pub(crate) fn buffer_pages(&self) -> usize {
+        thread_local! {
+            /// The answer for the settings generation it was read under
+            /// (unique across sessions): every page a write touches asks
+            /// (RP-014).
+            static MEMO: std::cell::Cell<(u64, usize)> = const { std::cell::Cell::new((0, 0)) };
+        }
+        let generation = self
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation();
+        let (g, pages) = MEMO.with(std::cell::Cell::get);
+        if g == generation && g != 0 {
+            return pages;
+        }
+        let pages = self.buffer_pages_read();
+        MEMO.with(|m| m.set((generation, pages)));
+        pages
+    }
+
+    fn buffer_pages_read(&self) -> usize {
         match self.stat_setting("shared_buffers") {
             Some(v) => {
                 let v = v.trim().to_ascii_lowercase();

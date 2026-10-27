@@ -7800,26 +7800,39 @@ impl Storage {
         o: &[u8],
         o2: &[u8],
     ) -> Result<bson::RawDocumentBuf> {
-        let mut buf = bson::RawDocumentBuf::new();
-        buf.append("op", bson::RawBsonRef::String(op).to_raw_bson());
-        buf.append("ns", bson::RawBsonRef::String(ns).to_raw_bson());
-        if let Some(u) = ui {
-            buf.append(
-                "ui",
-                bson::RawBsonRef::Binary(bson::raw::RawBinaryRef {
-                    subtype: BinarySubtype::Uuid,
-                    bytes: u,
-                })
-                .to_raw_bson(),
-            );
+        bson::RawDocument::from_bytes(o).map_err(|e| StorageError::Bson(e.to_string()))?;
+        bson::RawDocument::from_bytes(o2).map_err(|e| StorageError::Bson(e.to_string()))?;
+        // The bytes `RawDocumentBuf::append` writes for these five fields,
+        // written at once into a buffer of the final size: appending field
+        // by field converted and copied each value again (RP-014).
+        let mut b = Vec::with_capacity(
+            4 + 2 * 8 + op.len() + ns.len() + ui.map_or(0, |u| 10 + u.len()) + 3 + o.len() + 4 + o2.len() + 1,
+        );
+        b.extend_from_slice(&[0; 4]);
+        for (key, value) in [(&b"op\0"[..], op), (&b"ns\0"[..], ns)] {
+            b.push(0x02);
+            b.extend_from_slice(key);
+            b.extend_from_slice(&(value.len() as i32 + 1).to_le_bytes());
+            b.extend_from_slice(value.as_bytes());
+            b.push(0);
         }
-        let o_raw =
-            bson::RawDocument::from_bytes(o).map_err(|e| StorageError::Bson(e.to_string()))?;
-        let o2_raw =
-            bson::RawDocument::from_bytes(o2).map_err(|e| StorageError::Bson(e.to_string()))?;
-        buf.append("o", bson::RawBsonRef::Document(o_raw).to_raw_bson());
-        buf.append("o2", bson::RawBsonRef::Document(o2_raw).to_raw_bson());
-        Ok(buf)
+        if let Some(u) = ui {
+            b.push(0x05);
+            b.extend_from_slice(b"ui\0");
+            b.extend_from_slice(&(u.len() as i32).to_le_bytes());
+            b.push(u8::from(BinarySubtype::Uuid));
+            b.extend_from_slice(u);
+        }
+        b.push(0x03);
+        b.extend_from_slice(b"o\0");
+        b.extend_from_slice(o);
+        b.push(0x03);
+        b.extend_from_slice(b"o2\0");
+        b.extend_from_slice(o2);
+        b.push(0);
+        let len = b.len() as i32;
+        b[..4].copy_from_slice(&len.to_le_bytes());
+        bson::RawDocumentBuf::from_bytes(b).map_err(|e| StorageError::Bson(e.to_string()))
     }
 
     /// The oplog entry for a collection's creation, with the `_id` index
@@ -26374,5 +26387,70 @@ mod catalog_key_tests {
         }
         assert!(catalog_entry(&cache, "db", "col").is_none());
         assert!(catalog_entry(&cache, "dbcoll", "").is_none());
+    }
+}
+
+#[cfg(test)]
+mod oplog_entry_bytes_tests {
+    //! The insert path's raw oplog entries (RP-014): built at once, they are
+    //! the bytes field-by-field appends make, and their `op` / `ns` read off
+    //! the bytes are what `get_str` reads.
+    use super::*;
+
+    fn appended(op: &str, ns: &str, ui: Option<&[u8]>, o: &[u8], o2: &[u8]) -> Vec<u8> {
+        let mut buf = bson::RawDocumentBuf::new();
+        buf.append("op", bson::RawBsonRef::String(op).to_raw_bson());
+        buf.append("ns", bson::RawBsonRef::String(ns).to_raw_bson());
+        if let Some(u) = ui {
+            buf.append(
+                "ui",
+                bson::RawBsonRef::Binary(bson::raw::RawBinaryRef {
+                    subtype: BinarySubtype::Uuid,
+                    bytes: u,
+                })
+                .to_raw_bson(),
+            );
+        }
+        let o = bson::RawDocument::from_bytes(o).unwrap();
+        let o2 = bson::RawDocument::from_bytes(o2).unwrap();
+        buf.append("o", bson::RawBsonRef::Document(o).to_raw_bson());
+        buf.append("o2", bson::RawBsonRef::Document(o2).to_raw_bson());
+        buf.into_bytes()
+    }
+
+    #[test]
+    fn a_crud_entry_is_the_appended_bytes() {
+        let o = bson::to_vec(&bson::doc! {"_id": 7, "a": "x\u{0}y", "b": [1, 2]}).unwrap();
+        let o2 = bson::to_vec(&bson::doc! {"_id": 7}).unwrap();
+        let uuid = [9u8; 16];
+        for ui in [None, Some(&uuid[..])] {
+            for (op, ns) in [("i", "db.c"), ("d", "\u{e9}.\u{fc}"), ("u", "")] {
+                let built = Storage::oplog_entry_crud(op, ns, ui, &o, &o2).unwrap();
+                assert_eq!(built.as_bytes(), &appended(op, ns, ui, &o, &o2)[..]);
+                assert_eq!(raw_op_ns(&built), (Some(op), Some(ns)));
+            }
+        }
+        assert!(Storage::oplog_entry_crud("i", "db.c", None, b"\x05\0\0\0", &o2).is_err());
+    }
+
+    #[test]
+    fn op_and_ns_read_as_get_str_reads_them() {
+        let cases = [
+            bson::doc! {"op": "i", "ns": "db.c", "o": {}},
+            bson::doc! {"ns": "db.c", "op": "d"},
+            bson::doc! {"op": 1, "ns": "db.c"},
+            bson::doc! {"ts": 1, "op": "i", "ns": "db.c"},
+            bson::doc! {"op": "i"},
+            bson::doc! {"x": "y", "op": "u", "z": "w", "ns": "a.b"},
+            bson::doc! {},
+        ];
+        for d in cases {
+            let raw = bson::RawDocumentBuf::from_document(&d).unwrap();
+            assert_eq!(
+                raw_op_ns(&raw),
+                (raw.get_str("op").ok(), raw.get_str("ns").ok()),
+                "{d}"
+            );
+        }
     }
 }

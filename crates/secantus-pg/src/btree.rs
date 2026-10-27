@@ -109,6 +109,10 @@ impl Shape for IndexShape {
                 (Bson::Int64(x), Bson::Int64(y)) => x.cmp(y),
                 (Bson::Int32(x), Bson::Int64(y)) => i64::from(*x).cmp(y),
                 (Bson::Int64(x), Bson::Int32(y)) => x.cmp(&i64::from(*y)),
+                // As `compare_values` orders them, without its walk through
+                // the other kinds (a uuid or text key's every comparison).
+                (Bson::String(x), Bson::String(y)) => x.cmp(y),
+                (Bson::Binary(x), Bson::Binary(y)) => x.bytes.cmp(&y.bytes),
                 _ => crate::compare_values(a, b),
             },
         };

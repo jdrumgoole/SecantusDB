@@ -2190,6 +2190,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_tidless_descent_knows_when_a_tid_would_go_elsewhere() {
+        // Many duplicates, so pivots keep heap TIDs; built and grown.
+        let shape = Int { unique: false };
+        let built = BTree::build(&shape, keys((0..20000).map(|i| i % 7)));
+        let grown_dups = grown(&shape, (0..6000).map(|i| (i * 7919) % 13));
+        let distinct = grown(&shape, (0..6000).map(|i| (i * 7919) % 6007));
+        let mut sensitive = 0;
+        for t in [&built, &grown_dups, &distinct] {
+            for k in -1..15 {
+                let key = [Bson::Int32(k)];
+                let (leaf, path, tid_free) = t.descend_tidless(&shape, &key);
+                assert_eq!((leaf, path.clone()), t.descend(&shape, &key, i64::MIN));
+                if !tid_free {
+                    sensitive += 1;
+                    continue;
+                }
+                for i in [0usize, 1, 500, 5000, 19999, 1_000_000] {
+                    assert_eq!(
+                        t.descend(&shape, &key, tid(i)),
+                        (leaf, path.clone()),
+                        "key {k}, tid {i}"
+                    );
+                }
+            }
+        }
+        assert!(sensitive > 0, "no descent met a TID-keeping pivot");
+    }
+
     fn grown(shape: &dyn Shape, vals: impl Iterator<Item = i32>) -> BTree {
         let mut t = BTree::build(shape, Vec::new());
         for (i, v) in vals.enumerate() {

@@ -11252,11 +11252,16 @@ impl PgHandler {
                 ));
             });
         };
+        // The collection names are constants: the same address is the same
+        // name, and only another address needs its text compared.
+        let same_collection =
+            |c: &str| std::ptr::eq(c.as_ptr(), collection.as_ptr()) && c.len() == collection.len()
+                || c == collection;
         if let Some(docs) = CATALOG_FRONT.with(|f| {
             f.borrow()
                 .iter()
                 .find(|(s, d, c, v, _)| {
-                    *s == storage_id && *c == collection && *v == version && d == self.db()
+                    *s == storage_id && *v == version && same_collection(c) && d == self.db()
                 })
                 .map(|e| Arc::clone(&e.4))
         }) {
@@ -31019,7 +31024,12 @@ impl PgHandler {
         activity.state = state;
         activity.state_change = Some(now);
         if let Some(query) = query {
-            activity.query = query.to_string();
+            // Into the text's own buffer: a pipeline reports the same
+            // statement each time.
+            if activity.query != query {
+                activity.query.clear();
+                activity.query.push_str(query);
+            }
             activity.query_start = Some(now);
         }
     }
@@ -49692,6 +49702,11 @@ impl PgHandler {
         declared: Option<&Type>,
         value: &Bson,
     ) -> PgWireResult<()> {
+        // With no enum at all, no parameter is one: asked of every parameter
+        // of every Bind, so the list is not built to find that (RP-014).
+        if self.type_catalog_docs(Self::ENUM_COLLECTION)?.is_empty() {
+            return Ok(());
+        }
         let enums = self.enums()?;
         let by_oid = |oid: i64| enums.iter().find(|(_, o, _)| *o == oid);
         let found = match declared.map(|t| t.kind()) {
