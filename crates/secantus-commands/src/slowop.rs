@@ -74,6 +74,9 @@ struct Sink {
     locks: Option<std::sync::Arc<crate::lock_manager::LockManager>>,
     /// The client's address and port: the lines' `remote`.
     remote: Option<String>,
+    /// The server is a member of a replica set, whose lines print the
+    /// operation's read concern.
+    replicated: bool,
 }
 
 thread_local! {
@@ -91,6 +94,7 @@ pub fn enter(ctx: &CommandContext) -> SinkScope {
         logs: ctx.logs.clone(),
         locks: ctx.locks.clone(),
         remote: crate::opdebug::remote(ctx),
+        replicated: ctx.replica_set_name.is_some(),
     });
     SinkScope(SINK.with(|s| s.replace(sink)))
 }
@@ -110,6 +114,11 @@ pub(crate) fn armed() -> bool {
 /// The running command's client address and port, for a statement's line.
 pub(crate) fn remote() -> Option<String> {
     SINK.with(|s| s.borrow().as_ref().and_then(|s| s.remote.clone()))
+}
+
+/// Whether the running command's server is a member of a replica set.
+pub(crate) fn replicated() -> bool {
+    SINK.with(|s| s.borrow().as_ref().is_some_and(|s| s.replicated))
 }
 
 /// mongod's id for a `Slow query` line, whoever writes it.
@@ -339,7 +348,12 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
     out.insert("numYields", 0_i64);
     out.insert("reslen", response_length(reply, ctx));
     out.insert("locks", ctx.op_locks.clone().unwrap_or_default());
-    out.insert("readConcern", crate::opdebug::read_concern(request));
+    // A member of a replica set prints the concerns; a standalone has none
+    // (measured 8.2.11).
+    let replicated = ctx.replica_set_name.is_some();
+    if replicated {
+        out.insert("readConcern", crate::opdebug::read_concern(request));
+    }
     // A `getMore` runs under the write concern of the `aggregate` that
     // opened its cursor.
     let concerned = match ctx
@@ -350,7 +364,7 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
         Some(origin) if name == "getMore" => Some(origin),
         _ => crate::opdebug::takes_write_concern(name).then_some(request),
     };
-    if let Some(origin) = concerned.filter(|o| crate::opdebug::has_write_concern(o)) {
+    if let Some(origin) = concerned.filter(|o| replicated && crate::opdebug::has_write_concern(o)) {
         out.insert("writeConcern", crate::opdebug::write_concern(origin, ctx));
     }
     if let Some(ms) = ctx.write_concern_wait {

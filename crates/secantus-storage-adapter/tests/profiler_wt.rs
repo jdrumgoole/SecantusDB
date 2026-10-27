@@ -309,9 +309,23 @@ fn level_two_writes_each_operation_in_mongods_shape() {
         // A duplicate is a write error, not a failure of the command.
         assert_eq!(profiled[1].get_i32("ninserted"), Ok(1));
         assert!(!profiled[1].contains_key("ok"));
+        // A failed read: its locks and read concern, then the error
+        // (mongod 8.2.11, 2026-10-27).
         assert_eq!(
             keys(&profiled[2]),
-            with(&["op", "ns", "command", "numYield", "ok", "errMsg", "errName", "errCode"])
+            with(&[
+                "op",
+                "ns",
+                "command",
+                "numYield",
+                "locks",
+                "flowControl",
+                "readConcern",
+                "ok",
+                "errMsg",
+                "errName",
+                "errCode"
+            ])
         );
         assert_eq!(
             (

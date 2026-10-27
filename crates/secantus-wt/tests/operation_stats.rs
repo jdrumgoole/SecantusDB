@@ -14,7 +14,8 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 fn temp_home() -> std::path::PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("secantus-wt-opstats-{}-{}", std::process::id(), n));
+    let dir =
+        std::env::temp_dir().join(format!("secantus-wt-opstats-{}-{}", std::process::id(), n));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

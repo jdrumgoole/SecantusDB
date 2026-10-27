@@ -1458,37 +1458,50 @@ impl Stream {
         let command = (!filter.is_empty()).then(|| filter.clone());
         // A blocking sort of documents at the top sorts what the plan below
         // it returns, whose topmost FETCH matches the command's filter.
+        // A sort over what is no index scan sorts whole documents, whatever
+        // type mongod prints for it (a `findAndModify`'s SORT over a
+        // COLLSCAN is `default`).
+        let of_keys = |n: &Node| match n {
+            Node::IxScan(_) => true,
+            Node::Or(inputs) => inputs.iter().all(|i| matches!(i, Node::IxScan(_))),
+            _ => false,
+        };
         if let Node::Sort {
             pattern,
             limit: sort_limit,
-            on_keys: false,
+            on_keys,
             input,
         } = node
         {
-            let Some(mut below) = Stream::of_plan_with(input, db, coll, filter, vars, opts)? else {
-                return Ok(None);
-            };
-            let inner = std::mem::replace(
-                &mut below.root,
-                Stage::Coll(CollScan {
-                    after: None,
-                    backward: false,
-                    filter: None,
-                    buf: VecDeque::new(),
-                    end: true,
-                }),
-            );
-            below.root = Stage::SortDocs {
-                pattern: pattern.clone(),
-                limit: *sort_limit,
-                input: Box::new(inner),
-                sorted: None,
-                collation: opts.collation.cloned(),
-                budget: opts.sort_budget,
-            };
-            below.skip = skip;
-            below.limit = limit;
-            return Ok(Some(below));
+            if *on_keys && of_keys(input) {
+                // A sort of index keys below the FETCH: `stage_of`'s.
+            } else {
+                let Some(mut below) = Stream::of_plan_with(input, db, coll, filter, vars, opts)?
+                else {
+                    return Ok(None);
+                };
+                let inner = std::mem::replace(
+                    &mut below.root,
+                    Stage::Coll(CollScan {
+                        after: None,
+                        backward: false,
+                        filter: None,
+                        buf: VecDeque::new(),
+                        end: true,
+                    }),
+                );
+                below.root = Stage::SortDocs {
+                    pattern: pattern.clone(),
+                    limit: *sort_limit,
+                    input: Box::new(inner),
+                    sorted: None,
+                    collation: opts.collation.cloned(),
+                    budget: opts.sort_budget,
+                };
+                below.skip = skip;
+                below.limit = limit;
+                return Ok(Some(below));
+            }
         }
         // The topmost FETCH (or the collection scan) matches the command's
         // filter; a bare scan at the top is wrapped in a reading FETCH.

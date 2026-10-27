@@ -529,7 +529,8 @@ These are explicit non-goals. Don't add them without a reason.
       `Global` r 1 w 2, `Database` and `Collection` w 2, where this server's
       lock rounds (RM-299) take one of each; a statement of a transaction
       shows `{}` on mongod's line and the transaction's initial locks in its
-      entry. mongod also counts each write's flow control tickets
+      entry; an `aggregate` of `$documents` takes no lock on mongod, and the
+      global IS here. mongod also counts each write's flow control tickets
       (`flowControl: {acquireCount: 1}`); this server has no flow control
       and leaves the field off a write (a read's `flowControl: {}` is
       printed as mongod prints it). Measured 2026-10-27.

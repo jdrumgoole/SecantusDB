@@ -12025,7 +12025,7 @@ impl Storage {
                     // key is the canonical `id_key(_id)` — let the helper recompute it.
                     let (additions, removals) =
                         self.index_entry_diff(&old_doc, &doc, &descs, recordid)?;
-                        self.count_index_keys(&session, db, coll, Some(&old_doc), Some(&doc), &descs)?;
+                    self.count_index_keys(&session, db, coll, Some(&old_doc), Some(&doc), &descs)?;
                     self.insert_index_entries(&session, db, coll, &additions)?;
                     self.remove_index_entries(&session, db, coll, &removals)?;
                     self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
@@ -20267,7 +20267,7 @@ impl Storage {
                         // `index_entry_diff`), never a missing entry for this doc.
                         let (additions, removals) =
                             self.index_entry_diff(&doc, &new, &descs, recordid)?;
-                            self.count_index_keys(&session, db, coll, Some(&doc), Some(&new), &descs)?;
+                        self.count_index_keys(&session, db, coll, Some(&doc), Some(&new), &descs)?;
                         self.insert_index_entries(&session, db, coll, &additions)?;
                         // The doc stays at its RecordId (unchanged — `_id` is immutable);
                         // the framed value carries the id_key in-band.

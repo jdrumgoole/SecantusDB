@@ -11,6 +11,7 @@ logs every operation at 0.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import uuid
 from collections.abc import Callable
@@ -62,10 +63,9 @@ def logged(
     last = log[-1] if log else None
     db.command("profile", 2, slowms=-1 if is_mongod else 0)
     try:
-        try:
+        # A failing operation is logged too.
+        with contextlib.suppress(Exception):
             op(db)
-        except Exception:  # noqa: BLE001 - a failing operation is logged too
-            pass
     finally:
         db.command("profile", 0, slowms=100)
     log = client.admin.command("getLog", "global")["log"]

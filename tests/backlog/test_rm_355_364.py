@@ -16,10 +16,10 @@ from pymongo.write_concern import WriteConcern
 from tests.backlog.opdebug import logged, seed
 
 
-def _both(rust_mongo: Any, mongod: Any, op: Any, setup: Any = seed) -> dict:
+def _both(rust_mongo: Any, mongod_rs: Any, op: Any, setup: Any = seed) -> dict:
     return {
         "rust": logged(rust_mongo, False, setup, op),
-        "mongod": logged(mongod, True, setup, op),
+        "mongod": logged(mongod_rs, True, setup, op),
     }
 
 
@@ -66,7 +66,7 @@ _READS = {
 
 
 @pytest.mark.backlog_fixed("RM-023")
-def test_a_read_that_does_not_stream_counts_what_it_examined(rust_mongo: Any, mongod: Any) -> None:
+def test_a_read_that_does_not_stream_counts_what_it_examined(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line and profile entry for a `count` through a
     COUNT_SCAN (9 keys for 8 matches: the scan counts the call that finds
     its end), a `distinct`, an `aggregate` read whole for a `$group` and a
@@ -74,7 +74,7 @@ def test_a_read_that_does_not_stream_counts_what_it_examined(rust_mongo: Any, mo
     examined (measured 2026-10-27). This server's had none."""
     answers = {}
     for name, op in _READS.items():
-        got = _both(rust_mongo, mongod, op)
+        got = _both(rust_mongo, mongod_rs, op)
         answers[name] = {
             server: (_counts(_line(lines, name)), [_counts(e) for e in entries])
             for server, (lines, entries) in got.items()
@@ -97,7 +97,9 @@ _WRITES = {
 
 
 @pytest.mark.backlog_fixed("RM-023")
-def test_a_write_counts_what_it_examined_and_the_keys_it_wrote(rust_mongo: Any, mongod: Any) -> None:
+def test_a_write_counts_what_it_examined_and_the_keys_it_wrote(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
     """mongod 8.2.11's line for each update and delete statement, and for
     an insert and a `findAndModify`, carries what the statement's plan
     examined, its plan and cache key, and the index keys it inserted and
@@ -107,7 +109,7 @@ def test_a_write_counts_what_it_examined_and_the_keys_it_wrote(rust_mongo: Any, 
     fields = (*_COUNTED, "planSummary", "planCacheShapeHash", "planCacheKey")
     answers = {}
     for name, op in _WRITES.items():
-        got = _both(rust_mongo, mongod, op)
+        got = _both(rust_mongo, mongod_rs, op)
         answers[name] = {
             server: [
                 (c, attr.get("type"), {k: attr[k] for k in fields if k in attr})
@@ -122,7 +124,7 @@ def test_a_write_counts_what_it_examined_and_the_keys_it_wrote(rust_mongo: Any, 
 
 
 @pytest.mark.backlog_fixed("RM-023")
-def test_a_line_names_its_engine_concerns_and_collection(rust_mongo: Any, mongod: Any) -> None:
+def test_a_line_names_its_engine_concerns_and_collection(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for a `find` and for an insert under `{w: 1}`:
     `isFromUserConnection`, `collectionType`, `queryFramework`, the read
     concern and the write concern with their provenance, and the
@@ -152,7 +154,7 @@ def test_a_line_names_its_engine_concerns_and_collection(rust_mongo: Any, mongod
         "storage",
     }
     for name, op in ops.items():
-        got = _both(rust_mongo, mongod, op)
+        got = _both(rust_mongo, mongod_rs, op)
         lines = {s: _line(lines, name) for s, (lines, _) in got.items()}
         values = {s: {k: a.get(k) for k in shown} for s, a in lines.items()}
         order = {s: [k for k in a if k not in leave_out] for s, a in lines.items()}
@@ -223,13 +225,13 @@ def test_storage_says_what_the_engine_read(tmp_path: Any) -> None:
 
 
 @pytest.mark.backlog("RM-355")
-def test_a_line_says_what_execution_control_admitted(rust_mongo: Any, mongod: Any) -> None:
+def test_a_line_says_what_execution_control_admitted(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for every command carries `queues` (the
     ingress and execution admissions it took) and its `storage` section
     `timeWaitingMicros.storageExecutionMicros`, the time it waited for
     execution admission, so a `find` always has `storage` (measured
     2026-10-27). This server has no execution admission control."""
-    got = _both(rust_mongo, mongod, lambda d: list(d.c.find({"x": {"$gt": 1}})))
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.c.find({"x": {"$gt": 1}})))
     answers = {}
     for server, (lines, _) in got.items():
         attr = _line(lines, "find")
@@ -246,13 +248,13 @@ def test_a_line_says_what_execution_control_admitted(rust_mongo: Any, mongod: An
 
 
 @pytest.mark.backlog_fixed("RM-356")
-def test_explain_counts_the_end_of_a_count_scan(rust_mongo: Any, mongod: Any) -> None:
+def test_explain_counts_the_end_of_a_count_scan(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's COUNT_SCAN counts the call that finds its end as a
     key examined whether or not a key lies past its bounds: over keys 0 to
     11, `{x: {$gt: 3}}` examines 9 and `{x: 99}` 1 (measured 2026-10-27).
     This server's `explain` gave 8 and 0."""
     out = {}
-    for server, client in (("rust", rust_mongo), ("mongod", mongod)):
+    for server, client in (("rust", rust_mongo), ("mongod", mongod_rs)):
         db = client["rm356"]
         db.drop_collection("c")
         seed(db)
@@ -270,14 +272,14 @@ def test_explain_counts_the_end_of_a_count_scan(rust_mongo: Any, mongod: Any) ->
 
 
 @pytest.mark.backlog("RM-357")
-def test_a_write_reports_mongods_locks_and_flow_control(rust_mongo: Any, mongod: Any) -> None:
+def test_a_write_reports_mongods_locks_and_flow_control(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for an insert takes the replication state
     transition lock four times and the global lock in IX twice
     (`{ReplicationStateTransition: {w: 4}, Global: {r: 1, w: 2}, ...}`),
     and counts `flowControl: {acquireCount: 1}` (measured 2026-10-27).
     This server's lock rounds for a write are one of each, and it has no
     flow control."""
-    got = _both(rust_mongo, mongod, lambda d: d.c.insert_one({"_id": 100}))
+    got = _both(rust_mongo, mongod_rs, lambda d: d.c.insert_one({"_id": 100}))
     answers = {}
     for server, (lines, _) in got.items():
         attr = _line(lines, "insert")
@@ -289,11 +291,11 @@ def test_a_write_reports_mongods_locks_and_flow_control(rust_mongo: Any, mongod:
 
 
 @pytest.mark.backlog("RM-358")
-def test_a_read_names_its_query_shape(rust_mongo: Any, mongod: Any) -> None:
+def test_a_read_names_its_query_shape(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line and profile entry for a `find` carry
     `queryShapeHash`, the SHA-256 of the query's representative shape
     (measured 2026-10-27). This server computes no query shape."""
-    got = _both(rust_mongo, mongod, lambda d: list(d.c.find({"x": {"$gt": 1}})))
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.c.find({"x": {"$gt": 1}})))
     answers = {s: _line(lines, "find").get("queryShapeHash") for s, (lines, _) in got.items()}
     assert answers["mongod"]
     assert answers["rust"] == answers["mongod"]
@@ -303,7 +305,7 @@ def test_a_read_names_its_query_shape(rust_mongo: Any, mongod: Any) -> None:
 
 
 @pytest.mark.backlog("RM-359")
-def test_a_profile_entry_carries_the_execution_stats(rust_mongo: Any, mongod: Any) -> None:
+def test_a_profile_entry_carries_the_execution_stats(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's profile entry for a `find` carries `execStats`, the
     plan's stages with what each did (`FETCH` over `IXSCAN`, measured
     2026-10-27). This server's entry has none."""
@@ -315,7 +317,7 @@ def test_a_profile_entry_carries_the_execution_stats(rust_mongo: Any, mongod: An
             stats = stats.get("inputStage")
         return out
 
-    got = _both(rust_mongo, mongod, lambda d: list(d.c.find({"x": {"$gt": 1}})))
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.c.find({"x": {"$gt": 1}})))
     answers = {s: [stages(e.get("execStats")) for e in entries] for s, (_, entries) in got.items()}
     assert answers["mongod"] == [["FETCH", "IXSCAN"]]
     assert answers["rust"] == answers["mongod"]
@@ -325,11 +327,11 @@ def test_a_profile_entry_carries_the_execution_stats(rust_mongo: Any, mongod: An
 
 
 @pytest.mark.backlog("RM-360")
-def test_a_line_counts_its_interrupt_checks(rust_mongo: Any, mongod: Any) -> None:
+def test_a_line_counts_its_interrupt_checks(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for a command carries `numInterruptChecks`,
     how many times it checked whether it had been killed (5 for a `find`
     of ten documents through an index, measured 2026-10-27)."""
-    got = _both(rust_mongo, mongod, lambda d: list(d.c.find({"x": {"$gt": 1}})))
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.c.find({"x": {"$gt": 1}})))
     answers = {s: "numInterruptChecks" in _line(lines, "find") for s, (lines, _) in got.items()}
     assert answers["mongod"] is True
     assert answers["rust"] == answers["mongod"]
@@ -339,11 +341,11 @@ def test_a_line_counts_its_interrupt_checks(rust_mongo: Any, mongod: Any) -> Non
 
 
 @pytest.mark.backlog("RM-361")
-def test_a_write_says_how_long_it_held_its_oplog_slot(rust_mongo: Any, mongod: Any) -> None:
+def test_a_write_says_how_long_it_held_its_oplog_slot(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line and profile entry for an insert carry
     `totalOplogSlotDurationMicros`: how long the write held its oplog
     timestamp before committing (measured 2026-10-27)."""
-    got = _both(rust_mongo, mongod, lambda d: d.c.insert_one({"_id": 100}))
+    got = _both(rust_mongo, mongod_rs, lambda d: d.c.insert_one({"_id": 100}))
     answers = {
         s: ("totalOplogSlotDurationMicros" in _line(lines, "insert"))
         for s, (lines, _) in got.items()
@@ -356,7 +358,7 @@ def test_a_write_says_how_long_it_held_its_oplog_slot(rust_mongo: Any, mongod: A
 
 
 @pytest.mark.backlog("RM-362")
-def test_a_read_of_a_view_names_the_view_it_resolved(rust_mongo: Any, mongod: Any) -> None:
+def test_a_read_of_a_view_names_the_view_it_resolved(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for a `find` of a view carries
     `resolvedViews`: the view, its chain of namespaces and the pipeline it
     resolved to (measured 2026-10-27)."""
@@ -365,7 +367,7 @@ def test_a_read_of_a_view_names_the_view_it_resolved(rust_mongo: Any, mongod: An
         seed(db)
         db.command("create", "v", viewOn="c", pipeline=[])
 
-    got = _both(rust_mongo, mongod, lambda d: list(d.v.find({"x": 1})), setup)
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.v.find({"x": 1})), setup)
     answers = {}
     for server, (lines, _) in got.items():
         resolved = _line(lines, "find").get("resolvedViews")
@@ -380,7 +382,7 @@ def test_a_read_of_a_view_names_the_view_it_resolved(rust_mongo: Any, mongod: An
 
 
 @pytest.mark.backlog("RM-363")
-def test_a_contested_read_counts_what_it_examined(rust_mongo: Any, mongod: Any) -> None:
+def test_a_contested_read_counts_what_it_examined(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for a `find` two indexes could serve counts what
     the plan it chose by trial examined. This server reads such a plan
     through its store's router, and counts nothing."""
@@ -389,7 +391,7 @@ def test_a_contested_read_counts_what_it_examined(rust_mongo: Any, mongod: Any) 
         seed(db)
         db.c.create_index("y")
 
-    got = _both(rust_mongo, mongod, lambda d: list(d.c.find({"x": {"$gte": 2}, "y": 1})), setup)
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.c.find({"x": {"$gte": 2}, "y": 1})), setup)
     answers = {s: _counts(_line(lines, "find")) for s, (lines, _) in got.items()}
     assert "keysExamined" in answers["mongod"]
     assert answers["rust"] == answers["mongod"]
@@ -397,7 +399,7 @@ def test_a_contested_read_counts_what_it_examined(rust_mongo: Any, mongod: Any) 
 
 @pytest.mark.backlog("RM-363")
 def test_a_read_of_a_time_series_collection_counts_what_it_examined(
-    rust_mongo: Any, mongod: Any
+    rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11's line for a `find` of a time-series collection counts
     the buckets it examined (`keysExamined: 0, docsExamined: 0` over none,
@@ -406,21 +408,21 @@ def test_a_read_of_a_time_series_collection_counts_what_it_examined(
     def setup(db: Any) -> None:
         db.create_collection("ts", timeseries={"timeField": "t"})
 
-    got = _both(rust_mongo, mongod, lambda d: list(d.ts.find()), setup)
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.ts.find()), setup)
     answers = {s: _counts(_line(lines, "find")) for s, (lines, _) in got.items()}
     assert answers["mongod"].get("docsExamined") == 0
     assert answers["rust"] == answers["mongod"]
 
 
 @pytest.mark.backlog("RM-363")
-def test_creating_a_view_inserts_its_definition(rust_mongo: Any, mongod: Any) -> None:
+def test_creating_a_view_inserts_its_definition(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 creates a view by inserting its definition into
     `system.views`, and its `create` line counts that key
     (`keysInserted: 1`, measured 2026-10-27). This server keeps a view in
     its catalog and inserts nothing."""
     got = _both(
         rust_mongo,
-        mongod,
+        mongod_rs,
         lambda d: d.command("create", "v", viewOn="c", pipeline=[]),
     )
     answers = {s: _line(lines, "create").get("keysInserted") for s, (lines, _) in got.items()}
@@ -432,7 +434,7 @@ def test_creating_a_view_inserts_its_definition(rust_mongo: Any, mongod: Any) ->
 
 
 @pytest.mark.backlog("RM-364")
-def test_a_transaction_statement_counts_its_updates(rust_mongo: Any, mongod: Any) -> None:
+def test_a_transaction_statement_counts_its_updates(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for an insert inside a transaction counts, in
     `storage.data`, the dirty bytes and the updates the transaction holds
     so far (`txnBytesDirty`, `txnNumUpdates`, measured 2026-10-27). The
@@ -443,7 +445,7 @@ def test_a_transaction_statement_counts_its_updates(rust_mongo: Any, mongod: Any
         with db.client.start_session() as s, s.start_transaction():
             db.c.insert_one({"_id": 700}, session=s)
 
-    got = _both(rust_mongo, mongod, op)
+    got = _both(rust_mongo, mongod_rs, op)
     answers = {
         s: sorted(_line(lines, "insert").get("storage", {}).get("data", {}))
         for s, (lines, _) in got.items()

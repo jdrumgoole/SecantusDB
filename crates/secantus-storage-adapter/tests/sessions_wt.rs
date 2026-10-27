@@ -693,7 +693,7 @@ fn a_collection_created_in_a_transaction_is_registered_at_commit() {
                 .len(),
             1
         );
-        let cr = commit(c, 2, 1); assert_eq!(cr.get_f64("ok"), Ok(1.0), "{cr}");
+        assert_eq!(commit(c, 2, 1).get_f64("ok"), Ok(1.0));
         in_use(&commit(c, 1, 1));
         assert_eq!(ids(c, "n"), vec![2]);
 

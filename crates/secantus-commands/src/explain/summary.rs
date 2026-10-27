@@ -90,7 +90,10 @@ fn leaves(stage: &Document, out: &mut Vec<String>) {
 
 /// The `planSummary` for `request`, or `None` for a command with no plan.
 pub(crate) fn plan_summary(request: &Document, ctx: &CommandContext) -> Option<String> {
-    plan_info(request, ctx).summary
+    match ctx.storage().ok() {
+        Some(storage) => plan_info_with(storage, &ctx.db_name, request, false).summary,
+        None => None,
+    }
 }
 
 /// What a `Slow query` line and profile entry say of a command's plan
@@ -127,6 +130,16 @@ pub(crate) fn plan_info_in(
     db: &str,
     request: &Document,
 ) -> PlanInfo {
+    plan_info_with(storage, db, request, true)
+}
+
+/// [`plan_info_in`], with the cache key's hashes when `hashes`.
+fn plan_info_with(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    request: &Document,
+    hashes: bool,
+) -> PlanInfo {
     let name = request.keys().next().map(String::as_str).unwrap_or("");
     let mut out = PlanInfo::default();
     // A read of a view is the view's pipeline over its collection, with the
@@ -150,7 +163,7 @@ pub(crate) fn plan_info_in(
                 return out;
             };
             let resolved = doc! { "aggregate": base, "pipeline": pipeline, "cursor": {} };
-            let mut info = plan_info_in(storage, db, &resolved);
+            let mut info = plan_info_with(storage, db, &resolved, hashes);
             if name == "count" {
                 info.framework = None;
             }
@@ -250,8 +263,19 @@ pub(crate) fn plan_info_in(
     }
     let unkeyed =
         distinct_scan || matches!(node, Node::Express { .. } | Node::IdHack(_) | Node::Eof(_));
-    if !unkeyed {
-        out.hashes = super::cache_hashes(storage, db, &s, collation.as_ref(), &stages);
+    if hashes && !unkeyed {
+        // A `distinct` of every document keys the cache as a `find` of
+        // them does: its key is no part of the shape (measured 8.2.11:
+        // `distinct("z")` over no index on `z` prints the empty find's
+        // hashes, `distinct("z", {y: 1})` its own).
+        let keyed = if matches!(s.kind, Kind::Distinct(_)) && s.filter.is_empty() {
+            let mut find = s.clone();
+            find.kind = Kind::Find;
+            find
+        } else {
+            s.clone()
+        };
+        out.hashes = super::cache_hashes(storage, db, &keyed, collation.as_ref(), &stages);
     }
     out
 }

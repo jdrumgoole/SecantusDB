@@ -563,9 +563,12 @@ fn execution(name: &str, doc: &Document, ok: bool, ctx: &CommandContext, entry: 
     if let (true, Some(e)) = (ok, &ctx.exec_stats) {
         entry.insert("keysExamined", e.keys_examined);
         entry.insert("docsExamined", e.docs_examined);
-        if e.has_sort_stage {
-            entry.insert("hasSortStage", true);
-        }
+    }
+    if ok {
+        crate::slowop::spills(
+            ctx.exec_stats.as_ref().is_some_and(|e| e.has_sort_stage),
+            entry,
+        );
     }
     if ok {
         let shaped = crate::opdebug::planned_request(doc);
@@ -614,7 +617,10 @@ fn execution(name: &str, doc: &Document, ok: bool, ctx: &CommandContext, entry: 
         entry.insert("flowControl", Document::new());
     }
     entry.insert("locks", locks);
-    entry.insert("readConcern", crate::opdebug::read_concern(doc));
+    let replicated = ctx.replica_set_name.is_some();
+    if replicated {
+        entry.insert("readConcern", crate::opdebug::read_concern(doc));
+    }
     let concerned = match ctx
         .exec_stats
         .as_ref()
@@ -623,7 +629,7 @@ fn execution(name: &str, doc: &Document, ok: bool, ctx: &CommandContext, entry: 
         Some(origin) if name == "getMore" => Some(origin),
         _ => crate::opdebug::takes_write_concern(name).then_some(doc),
     };
-    if let Some(origin) = concerned.filter(|o| crate::opdebug::has_write_concern(o)) {
+    if let Some(origin) = concerned.filter(|o| replicated && crate::opdebug::has_write_concern(o)) {
         entry.insert("writeConcern", crate::opdebug::write_concern(origin, ctx));
     }
     if let Some(ms) = ctx.write_concern_wait {
@@ -878,7 +884,7 @@ struct Ran {
     took_global: bool,
     /// The plan cache key's hashes, where mongod keys the statement's query.
     hashes: Option<(String, String)>,
-    read_concern: Document,
+    read_concern: Option<Document>,
     storage: Option<Document>,
     remote: Option<String>,
 }
@@ -929,7 +935,9 @@ impl Statement {
         }
         attr.insert("numYields", 0_i64);
         attr.insert("locks", self.ran.locks.clone());
-        attr.insert("readConcern", self.ran.read_concern.clone());
+        if let Some(rc) = &self.ran.read_concern {
+            attr.insert("readConcern", rc.clone());
+        }
         if let Some(storage) = &self.ran.storage {
             attr.insert("storage", storage.clone());
         }
@@ -1002,7 +1010,9 @@ impl Statement {
         }
         entry.insert("locks", locks);
         // A write statement's flow control is RM-357's.
-        entry.insert("readConcern", self.ran.read_concern.clone());
+        if let Some(rc) = &self.ran.read_concern {
+            entry.insert("readConcern", rc.clone());
+        }
         if let Some(storage) = &self.ran.storage {
             entry.insert("storage", storage.clone());
         }
@@ -1175,7 +1185,7 @@ impl<'a> Statements<'a> {
             ),
             locks,
             took_global: crate::lock_manager::took_global(),
-            read_concern: self.read_concern.clone(),
+            read_concern: crate::slowop::replicated().then(|| self.read_concern.clone()),
             storage: now.as_ref().and_then(crate::opdebug::storage_section),
             remote: crate::slowop::remote(),
         }
