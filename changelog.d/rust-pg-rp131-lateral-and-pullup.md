@@ -40,4 +40,5 @@ the oid suffix to fit `NAMEDATALEN`, as PostgreSQL does.
 
 - `nameconcatoid(name, oid)` kept a long name whole and overran 63 bytes;
   it now cuts the name at a character boundary so `_<oid>` always fits, as
-  `name.c` does (`tests/backlog/test_rp131_names.py::test_nameconcatoid_cuts_the_name_not_the_suffix`).
+  `name.c` does. Fixes RP-305
+  (`tests/backlog/test_rp131_names.py::test_nameconcatoid_cuts_the_name_not_the_suffix`).

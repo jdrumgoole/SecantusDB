@@ -959,6 +959,23 @@ tests regression tests:
       Found while working RP-028.
       Backlog-ID: RP-299
       Verify: tests/backlog/test_rust_postgres_gaps.py::test_an_index_made_in_the_open_transaction_is_a_relation
+- [ ] **A cast to `name` keeps every byte**: `octet_length(repeat('a',
+      70)::name)` is 70 and `repeat('é', 40)::name` 80 bytes, where
+      PostgreSQL 15.19 cuts to NAMEDATALEN - 1 at a character boundary (63
+      and 62). Found while working RP-131.
+      Backlog-ID: RP-304
+      Verify: tests/backlog/test_rp131_names.py::test_a_cast_to_name_keeps_namedatalen_bytes
+- [ ] **A seven-relation join to a large DISTINCT subquery on an
+      expression key exhausts memory**: `element_types`' query with its row
+      IN written as a join to `(SELECT DISTINCT ...) "ANY_subquery"` (the
+      shape PostgreSQL's `convert_ANY_sublink_to_join` makes of it) built
+      about 5 GB of intermediate rows and the server was killed after 55 s;
+      PostgreSQL 15.19 answers it in milliseconds with a hash join over the
+      unique-ified inner. Found while working RP-131; the statement is
+      `tests/backlog/rp306_element_types_semijoin.sql`. No gap test yet: run as one, it would exhaust
+      the CI runner's memory, so the test must first bound the server.
+      Backlog-ID: RP-306
+      Verify: none -- reproducing it exhausts memory; a bounded gap test is still to be written
 - [ ] **OPEN — a cancel sent during a prepared statement was lost once in
       CI (2026-10-27).** `tests/backlog/test_rp_batch53.py::test_a_cancel_during_a_prepared_statements_parse_is_honoured[2.5]`
       (RP-215's regression test) failed on PR #2203's `pg-oracle (server)`
@@ -1297,31 +1314,33 @@ Found while measuring `pg_depend` (RP-105) against PostgreSQL 15.19. The gap
 tests are scenarios in `tests/backlog/test_rp_batch26.py`.
 
 - [ ] **OPEN — `information_schema.data_type_privileges` and
-      `element_types` take half a second or more** (optimised build without
-      LTO, a fresh database, `count(*)`): `routines` 0.10 s, `parameters`
-      0.21 s, `data_type_privileges` 0.50 s, `element_types` 0.85 s, where
-      PostgreSQL 15.19 takes 10-50 ms. The same build took 0.85, 1.0, 2.0
-      and 13.7 s before the top-ten batch's second pass (2026-10-27: a
-      hashed SubPlan for a row IN over an uncorrelated subquery,
-      `buildSubPlanHash` / `ExecHashSubPlan` with `findPartialMatch`'s NULL
-      rules and `subplan_is_hashable`; a per-expression memo of cast
-      targets and constant casts; unused view outputs pruned after
-      expansion; join rows projected to the keys read), and 3.1, 2.2, 5.6
-      and 62 s before its first. Every row of the four views is the same as
-      before and as 15.19's. What is left:
-      - a LATERAL `_pg_expandarray` item is planned again as SQL for each
-        of `pg_proc`'s 668 distinct argument arrays
-        (`PgHandler::lateral_rows`), where PostgreSQL plans its function
-        scan once (about 20% of `parameters`);
-      - the evaluator still asks operand types per row on operator paths
-        (`array_operand_mismatch`, `static_json_type`,
-        `typed_string_operand`);
-      - a view subquery's pruned outputs are still materialised as NULL
-        cells (`materialise_sub`), and a pruned body is planned alone first
-        to keep its parse errors (about 5% of `data_type_privileges`, 7% of
-        `element_types`);
-      - `element_types` runs `data_type_privileges` (0.5 s) while it is
-        planned; PostgreSQL pulls the IN up into a hash semi-join.
+      `element_types` take a quarter to half a second** (optimised build
+      without LTO, a fresh database, `count(*)`, interleaved runs):
+      `routines` 0.046 s, `parameters` 0.11 s, `data_type_privileges`
+      0.25 s, `element_types` 0.43 s, where PostgreSQL 15.19 takes 10-50
+      ms. The same build took 0.09, 0.21, 0.49 and 0.85 s before the
+      follow-up (2026-10-27: a LATERAL built-in function scan planned once,
+      `ExecReScanFunctionScan`; `nameconcatoid` as `name.c` has it; call
+      resolution, operator operand checks, value-less node types and
+      declared parameter types kept per planned expression; unread
+      FROM-subquery outputs left out of materialised rows, and join leaves
+      holding only carried columns; system views not trial-planned before
+      pruning), 0.85, 1.0, 2.0 and 13.7 s before the top-ten batch's second
+      pass, and 3.1, 2.2, 5.6 and 62 s before its first. Every row of the
+      four views is the same as before and as 15.19's. What is left:
+      - `element_types`' row IN is still a hashed SubPlan run while the
+        statement is planned. PostgreSQL pulls it up
+        (`convert_ANY_sublink_to_join`) and hash-joins the unique-ified
+        inner (Unique over Sort); here that needs a semi-join in `joins` /
+        `join_search` (see RP-306). Either way `element_types` costs at
+        least `data_type_privileges`;
+      - each view layer still materialises documents
+        (`materialise_sub_cells`, `lateral_rows`): building BSON documents
+        is the largest share left, about 25% of `routines`;
+      - the evaluator still asks operand types with the value in hand on
+        operator paths (`static_json_type`, `typed_string_operand`, the
+        bpchar check), and a domain cast clones the domain for every row
+        (`domains::user_domain`).
       Backlog-ID: RP-131
       Verify: none -- a performance budget; every answer matches PostgreSQL's
 

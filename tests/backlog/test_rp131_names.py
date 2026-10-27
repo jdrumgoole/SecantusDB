@@ -19,7 +19,7 @@ import pytest
 from tests.backlog.conftest import pg_answer
 
 
-@pytest.mark.backlog_fixed("RP-131")
+@pytest.mark.backlog_fixed("RP-305")
 def test_nameconcatoid_cuts_the_name_not_the_suffix(pg: Any) -> None:
     """A 60-byte name and the 6-byte `_12345` keep 57 bytes of the name; 40
     two-byte characters and `_4000000000` keep 26 characters, never half of
@@ -40,7 +40,7 @@ def test_nameconcatoid_cuts_the_name_not_the_suffix(pg: Any) -> None:
     )
 
 
-@pytest.mark.backlog("RP-TBD-NAME-CAST")
+@pytest.mark.backlog("RP-304")
 def test_a_cast_to_name_keeps_namedatalen_bytes(pg: Any) -> None:
     """`namein` keeps at most 63 bytes, cut back to a character boundary:
     70 ASCII letters keep 63, 40 two-byte characters keep 31 (62 bytes).
