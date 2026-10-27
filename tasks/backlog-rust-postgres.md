@@ -770,7 +770,30 @@ one beside it.
         against PostgreSQL's optimised one). **Decision for Joe**: deselect
         it on Linux by name with that reason, as Windows already does
         (PostgreSQL 30 s there), or keep it as a standing failure the
-        lane does not gate on.
+        lane does not gate on. **Joe (2026-10-27): keep optimising.**
+      - **Second pass, 2026-10-27 (`changelog.d/rust-pg-rp014-insert-cpu-2.md`):**
+        a further 18.6% of instructions retired (225.4G to 183.4G) and
+        17.3% of CPU (28.8 s to 23.8 s) on the development Mac's debug
+        build; the script there went from 9.8 s to 8.1 s, against
+        PostgreSQL 15.19's 7.6 s on a private cluster (16.7 s at the start
+        of the batch). **On `ubuntu-latest` it barely moved**: 49.9, 49.7
+        and 53.9 s against the runner's PostgreSQL's 23.4 to 24.1 s (run
+        40476352850). There the server's three connection threads are
+        flat out, 128 to 170 s of CPU a run (about 0.9 ms an insert,
+        against about 0.16 ms on the Mac); with commits not synced
+        (`SECANTUS_TEST_FAST_STORAGE=1`, a diagnostic only) the CPU is the
+        same, so it is not `fdatasync`. A `perf` profile there (AMD EPYC
+        7763, 2 cores / 4 threads, shared with the client) is flat: 96% in
+        the server's own code, no symbol above 0.6%, the allocator about
+        5%, `format!` about 0.7%; the VM exposes no instruction counter.
+        So that runner pays several times this Mac's cost per instruction
+        of debug code, and only less work an insert will close it. What
+        is left is spread thin (the second pass's spans, per connection
+        of 50,000 statements: storage's insert about 1.95 s, the row's
+        page models about 1.9 s, Bind 0.7 s, privileges + locks + plan
+        0.7 s, the statement wrapper 0.57 s); batching a pipeline's
+        Executes would change per-statement semantics (`cmin`,
+        `statement_timestamp`, where an error lands).
 
       What the lane gates, given that: a run that stopped short, and a
       test that fails over TLS, passes in the clear, **and fails over TLS
