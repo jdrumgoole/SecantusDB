@@ -660,8 +660,7 @@ impl CacheSpill {
         let mut bytes = 0i64;
         for d in docs {
             let mut buf = Vec::new();
-            d.to_writer(&mut buf)
-                .map_err(|e| io("encode a document for", &e))?;
+            crate::bsondoc::write(d, &mut buf).map_err(|e| io("encode a document for", &e))?;
             out.write_all(&buf).map_err(|e| io("write", &e))?;
             bytes += buf.len() as i64 + 32;
         }
