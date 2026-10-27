@@ -81,6 +81,7 @@ pub mod mongod_codes;
 mod mongod_commands;
 mod near;
 mod notablescan;
+mod opdebug;
 pub mod ops;
 pub mod params;
 mod privileges;
@@ -268,6 +269,22 @@ pub struct CommandContext {
     /// What a streamed read examined for this command's batch, for its
     /// `Slow query` line (RM-023).
     pub exec_stats: Option<ExecStats>,
+    /// What the store counted for this operation, taken when its handler
+    /// finished, before its profile entry is written (RM-023).
+    pub op_counts: Option<storage::OperationCounts>,
+    /// The locks the operation took, as its line prints them, taken with
+    /// [`Self::op_counts`].
+    pub op_locks: Option<Document>,
+    /// The time spent planning the operation's query, for the line's and
+    /// profile entry's `planningTimeMicros`.
+    pub planning_micros: Option<i64>,
+    /// How many documents a `findAndModify` changed, for its line.
+    pub modified: Option<i64>,
+    /// How long the operation waited for its write concern, in ms.
+    pub write_concern_wait: Option<i64>,
+    /// The CPU time the operation's thread spent on it, where mongod
+    /// measures it (Linux).
+    pub cpu_nanos: Option<i64>,
     /// The raw BSON byte slices of an `insert`'s kind-1 `documents` sequence,
     /// handed in by the server **un-decoded** so the insert handler can store the
     /// client's bytes verbatim (the raw-BSON write path) instead of paying a
@@ -303,6 +320,9 @@ pub struct ExecStats {
     /// A `getMore`'s plan summary and the command that opened its cursor.
     pub plan_summary: Option<String>,
     pub originating_command: Option<Document>,
+    /// The plan sorts in memory (`hasSortStage`), which every batch of its
+    /// cursor reports.
+    pub has_sort_stage: bool,
 }
 
 #[derive(Clone)]
@@ -348,6 +368,12 @@ impl CommandContext {
             awaited: std::cell::Cell::new(std::time::Duration::ZERO),
             pending_batch: None,
             exec_stats: None,
+            op_counts: None,
+            op_locks: None,
+            planning_micros: None,
+            modified: None,
+            write_concern_wait: None,
+            cpu_nanos: None,
             raw_insert_documents: None,
             locks: None,
             txn_locks: false,
@@ -840,6 +866,20 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     } else {
         0
     };
+    // What the store does for the operation is counted from here (RM-023).
+    let counting = ctx
+        .storage
+        .as_ref()
+        .and_then(|s| s.begin_operation_counts());
+    let planning = explain::planning_scope();
+    let cpu_started = opdebug::thread_cpu_nanos();
+    opdebug::take_examined();
+    ctx.op_counts = None;
+    ctx.op_locks = None;
+    ctx.planning_micros = None;
+    ctx.modified = None;
+    ctx.write_concern_wait = None;
+    ctx.cpu_nanos = None;
     ctx.profiling = profiler::begin(name, doc, ctx);
     let mut reply = dispatch_inner(doc, ctx);
     // An interrupted operation -- killed, or out of `maxTimeMS` -- answers
@@ -851,10 +891,20 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     // followed, and a SIGKILL lost writes acknowledged with `j: true`.
     if wants_journal(name, doc, client_wc, default_wc.as_ref()) {
         if let Some(storage) = &ctx.storage {
+            let waited = std::time::Instant::now();
             if let Err(e) = storage.flush_journal() {
                 // The write is not durable: that is the answer, not a
                 // footnote to an `ok: 1`.
                 reply = crate::util::command_error(e).into_reply();
+            } else if opdebug::wrote_something(name, &reply) {
+                // The wait for the write concern: on a member of one, for
+                // the journal to hold the write (mongod's
+                // `waitForWriteConcernDurationMillis`, RM-023). A wait under
+                // a millisecond is not printed: macOS mongod 8.2.11, whose
+                // journal sync takes 4-8 ms, prints it on every write, and
+                // Linux mongod 8.2.12, whose sync is quicker, on none.
+                let ms = waited.elapsed().as_millis() as i64;
+                ctx.write_concern_wait = (ms > 0).then_some(ms);
             }
         }
     }
@@ -903,6 +953,26 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     }
     attach_cluster_time_gossip(doc, &mut reply, ctx);
     order_write_reply(doc, &mut reply);
+    // What the operation counted, before its profile entry is written.
+    if ctx.exec_stats.is_none() && explain::summary::reads_no_collection(doc) {
+        opdebug::note_examined(0, 0, None);
+    }
+    if let (None, Some(mut examined)) = (&ctx.exec_stats, opdebug::take_examined()) {
+        // A read made whole hands its cursor over: open, or exhausted.
+        if let Ok(cursor) = reply.get_document("cursor") {
+            examined.cursor_id = cursor.get_i64("id").unwrap_or(0);
+            examined.exhausted = examined.cursor_id == 0;
+        }
+        ctx.exec_stats = Some(examined);
+    }
+    ctx.op_counts = ctx.storage.as_ref().and_then(|s| s.operation_counts());
+    ctx.op_locks = Some(lock_manager::operation_locks(false));
+    ctx.planning_micros = planning.micros();
+    ctx.cpu_nanos = cpu_started
+        .zip(opdebug::thread_cpu_nanos())
+        .map(|(began, now)| now - began);
+    drop(planning);
+    drop(counting);
     profiler::finish(name, doc, inner_n, &reply, ctx);
     reply
 }
@@ -1124,7 +1194,7 @@ fn wants_journal(
     }
 }
 
-fn takes_default_write_concern(name: &str, doc: &Document) -> bool {
+pub(crate) fn takes_default_write_concern(name: &str, doc: &Document) -> bool {
     match name {
         "insert"
         | "update"

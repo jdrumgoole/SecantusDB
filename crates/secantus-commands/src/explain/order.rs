@@ -827,6 +827,9 @@ pub(crate) struct StreamFlags {
     pub min_max: bool,
     pub return_key: bool,
     pub show_record_id: bool,
+    /// A sort of whole documents streams too (`stream::Stage::SortDocs`):
+    /// everything read for the first batch, as mongod's `SORT` reads it.
+    pub sorts_documents: bool,
 }
 
 /// The plan mongod runs for a `find` that a streaming cursor can read
@@ -884,9 +887,10 @@ pub(crate) fn stream_plan(
     }
     let plan = plan::plan(&query, &catalog);
     // A sort of whole documents the plan does in memory reads them all for
-    // the first batch, on mongod too: that read is the one made before. A
-    // sort of index keys below the FETCH streams (`stream::Stage::SortKeys`).
-    if sorts_documents(&plan) {
+    // the first batch, on mongod too (`stream::Stage::SortDocs`), when the
+    // caller reads it so. A sort of index keys below the FETCH streams
+    // (`stream::Stage::SortKeys`).
+    if sorts_documents(&plan) && !flags.sorts_documents {
         return Ok(None);
     }
     // An `$or` with a geo branch is read with each branch's geo scan
@@ -1780,4 +1784,259 @@ pub(crate) fn write_candidates(
             .map(|(recordid, _)| recordid)
             .collect(),
     ))
+}
+/// What a read other than a `find`'s plans for ([`counted_plan`]).
+#[derive(Clone, Copy)]
+pub(crate) enum Planned<'a> {
+    /// A `count`, with its `skip` and `limit`.
+    Count { skip: i64, limit: i64 },
+    /// A `distinct` of `key`.
+    Distinct(&'a str),
+    /// An update's or a delete's read: of one document or of every match
+    /// (`multi`), a `findAndModify`'s (`returns`, under the command's sort).
+    Write {
+        delete: bool,
+        multi: bool,
+        upsert: bool,
+        returns: bool,
+    },
+}
+
+/// The plan mongod runs for a `count`, a `distinct` or a write's read of
+/// `ask`, when a stream can run it (`stream::Stream`) and so count the keys
+/// and documents it examines as it reads (RM-023): the same conditions as a
+/// `find`'s ([`stream_plan`]), a sort of whole documents included. `None`:
+/// read as before.
+pub(crate) fn counted_plan(
+    storage: &dyn Storage,
+    ask: &Ask,
+    planned: Planned,
+) -> Result<Option<Node>, StorageError> {
+    if !storage.can_stream(ask.db, ask.coll)? {
+        return Ok(None);
+    }
+    if ask.sort.is_some_and(|s| !plain_sort(s)) {
+        return Ok(None);
+    }
+    if crate::near::find_near(ask.filter)?.is_some()
+        || geo::hinted_geo(storage, ask.db, ask.coll, ask.hint)?.is_some()
+    {
+        return Ok(None);
+    }
+    let catalog = ask_catalog(storage, ask)?;
+    let canonical = parsed::parsed_query(ask.filter);
+    let implied = |partial: &Document| storage.query_implies_partial(ask.filter, partial);
+    let Ok(hint) = resolve_hint(ask.hint, &catalog) else {
+        return Ok(None);
+    };
+    let (skip, limit) = match planned {
+        Planned::Count { skip, limit } => (skip, limit),
+        _ => (0, ask.limit),
+    };
+    let query = Query {
+        canonical: &canonical,
+        sort: ask.sort,
+        projection: None,
+        skip,
+        limit,
+        hint,
+        collation: ask.collation,
+        min_max: false,
+        return_key: false,
+        show_record_id: false,
+        batch_size: false,
+        keys_only: false,
+        wanted: None,
+        pipeline: false,
+        implies: &implied,
+        trial: None,
+    };
+    if plan::contested(&query, &catalog) {
+        return Ok(None);
+    }
+    let plan = match planned {
+        Planned::Count { .. } => plan::count(&query, &catalog),
+        Planned::Distinct(key) => plan::distinct(&query, &catalog, key, !ask.filter.is_empty()),
+        Planned::Write {
+            delete,
+            multi,
+            upsert,
+            returns,
+        } => plan::write(&query, &catalog, delete, multi, upsert, returns),
+    };
+    // What the plan reads, below the stage that counts, updates or deletes.
+    let read = match &plan {
+        Node::Count(input) | Node::Update(input) | Node::Delete { input, .. } => input.as_ref(),
+        other => other,
+    };
+    if matches!(read, Node::Subplan(_)) && mentions_geo(ask.filter) {
+        return Ok(None);
+    }
+    let elsewhere = !matches!(access(read), Node::CollScan { .. })
+        || ask
+            .hint
+            .is_some_and(|h| !matches!(h, Bson::Document(d) if d.is_empty()));
+    if geo::scan(storage, ask.db, ask.coll, ask.filter, None, elsewhere)?.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(plan))
+}
+
+/// What a write's read of its documents found, run as mongod's plan runs
+/// it ([`write_selection`]).
+pub(crate) struct Selection {
+    /// The documents' RecordIds, in the order the plan returns them: every
+    /// match for a write of many, the first (and a few after it, which the
+    /// write takes should the first no longer match when it runs) for a
+    /// write of one.
+    pub rids: Vec<i64>,
+    /// The first match itself, for a `findAndModify`.
+    pub first: Option<Vec<u8>>,
+    pub keys_examined: i64,
+    pub docs_examined: i64,
+    pub summary: String,
+}
+
+/// The read of a write's documents, run as mongod's plan for it runs
+/// (RM-023): its keys and documents examined as the plan examines them --
+/// up to the first match for a write of one, every match for a write of
+/// many. `None`: the plan is not one a stream runs, and the write reads as
+/// before.
+pub(crate) fn write_selection(
+    storage: &dyn Storage,
+    ask: &Ask,
+    planned: Planned,
+) -> Result<Option<Selection>, StorageError> {
+    let Planned::Write { multi, delete, .. } = planned else {
+        return Ok(None);
+    };
+    let Some(plan) = counted_plan(storage, ask, planned)? else {
+        return Ok(None);
+    };
+    let mut leaves_of = Vec::new();
+    super::summary::leaves_of(&plan, &mut leaves_of);
+    // The read below the UPDATE or DELETE stage.
+    let read = match &plan {
+        Node::Update(input) | Node::Delete { input, .. } => input.as_ref(),
+        other => other,
+    };
+    // An `_id` point write (`EXPRESS_IXSCAN`, `IDHACK`): one key and one
+    // document when it is there, none when it is not.
+    let point = match read {
+        Node::IdHack(value) => Some(value.clone()),
+        Node::ExpressWrite { value, .. } => Some(value.clone()),
+        _ => match &plan {
+            Node::ExpressWrite { value, .. } => Some(value.clone()),
+            _ => None,
+        },
+    };
+    if let Some(value) = point {
+        let found = storage.find(ask.db, ask.coll, &doc! { "_id": value }, None, None)?;
+        let n = i64::from(!found.is_empty());
+        let summary = match &plan {
+            Node::ExpressWrite { .. } => format!(
+                "EXPRESS_IXSCAN {{ _id: 1 }},{}",
+                if delete {
+                    "EXPRESS_DELETE"
+                } else {
+                    "EXPRESS_UPDATE"
+                }
+            ),
+            _ => "IDHACK".to_string(),
+        };
+        return Ok(Some(Selection {
+            rids: Vec::new(),
+            first: found.into_iter().next(),
+            keys_examined: n,
+            docs_examined: n,
+            summary,
+        }));
+    }
+    let opts = super::stream::Options {
+        collation: ask.collation,
+        sort_budget: Some((secantus_core::memlimit::budgets(), true)),
+        ..Default::default()
+    };
+    let Some(mut stream) =
+        super::stream::Stream::of_plan_with(read, ask.db, ask.coll, ask.filter, ask.vars, &opts)?
+    else {
+        return Ok(None);
+    };
+    let summary = leaves_of.join(", ");
+    if multi {
+        let all = stream.read_all(storage)?;
+        return Ok(Some(Selection {
+            rids: all.rids,
+            first: all.docs.into_iter().next(),
+            keys_examined: all.keys_examined,
+            docs_examined: all.docs_examined,
+            summary,
+        }));
+    }
+    // A write of one stops at the first match, and counts to there.
+    let batch = stream.next_batch(storage, 1, usize::MAX)?;
+    let (keys_examined, docs_examined) = (batch.keys_examined, batch.docs_examined);
+    let first = batch.docs.into_iter().next();
+    let mut rids = batch.rids;
+    if !rids.is_empty() && store_order_is_the_plans(storage, ask)? {
+        // The store, left to pick, takes the same document (RM-056): the
+        // write reads as it did, and no candidates are read for it.
+        rids.clear();
+    } else if !rids.is_empty() && !batch.exhausted {
+        // Should the first no longer match when the write runs, the write
+        // takes the next: read, and not counted, as the store's own read
+        // of its candidates was.
+        let more = stream.next_batch(storage, WRITE_CANDIDATES - 1, usize::MAX)?;
+        rids.extend(more.rids);
+    }
+    Ok(Some(Selection {
+        rids,
+        first,
+        keys_examined,
+        docs_examined,
+        summary,
+    }))
+}
+
+/// A read made whole as mongod's plan makes it ([`find_counted`]).
+pub(crate) struct Counted {
+    pub docs: Vec<Vec<u8>>,
+    pub keys_examined: i64,
+    pub docs_examined: i64,
+}
+
+/// [`find`], run as mongod's plan for the read runs when a stream can run
+/// it (RM-023): every document, in the plan's order (a sort of whole
+/// documents included), with the keys and documents it examined. `limit`
+/// is the plan's (0: none); `projection` decides whether the plan covers
+/// the read. `None`: read as before.
+pub(crate) fn find_counted(
+    storage: &dyn Storage,
+    ask: &Ask,
+    projection: Option<&Document>,
+) -> Result<Option<Counted>, StorageError> {
+    let flags = StreamFlags {
+        sorts_documents: true,
+        ..Default::default()
+    };
+    let Some(plan) = stream_plan(storage, ask, 0, ask.limit, projection, false, flags)? else {
+        return Ok(None);
+    };
+    // No budget here: the pipeline's leading `$sort` holds the sort to its
+    // budget and counts its spills, once (a second count doubled them).
+    let opts = super::stream::Options {
+        collation: ask.collation,
+        ..Default::default()
+    };
+    let Some(mut stream) =
+        super::stream::Stream::of_plan_with(&plan, ask.db, ask.coll, ask.filter, ask.vars, &opts)?
+    else {
+        return Ok(None);
+    };
+    let all = stream.read_all(storage)?;
+    Ok(Some(Counted {
+        docs: all.docs,
+        keys_examined: all.keys_examined,
+        docs_examined: all.docs_examined,
+    }))
 }

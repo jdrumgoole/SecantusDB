@@ -463,32 +463,60 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                 );
             }
         }
-        // Find the target (first match in sort order).
-        let candidates = crate::explain::order::find(
+        // Find the target (first match in sort order), read as mongod's plan
+        // reads it, counting what it examines (RM-023).
+        let hint = natural_hint.as_ref().or(argtypes::given_hint(doc));
+        let selection = crate::explain::order::write_selection(
             storage,
             &crate::explain::order::Ask {
                 db: &ctx.db_name,
                 coll: &coll,
                 filter: &query,
                 sort,
-                // The hint says which index is read, and so which
-                // matching document comes first.
-                hint: natural_hint.as_ref().or(argtypes::given_hint(doc)),
+                hint,
                 collation: collation.as_ref(),
                 vars: &let_vars,
                 limit: 1,
-                // The plan is made, and cached, once; a re-pick after a
-                // lost race reads it again. mongod's query carries a limit
-                // of one only under a sort.
-                asked: crate::near::Asked {
-                    limit: i64::from(sort.is_some_and(|s| !s.is_empty())),
-                    sort,
-                    cached: repick_count == 0,
-                    ..Default::default()
-                },
+                asked: Default::default(),
+            },
+            crate::explain::order::Planned::Write {
+                delete: is_remove,
+                multi: false,
+                upsert,
+                returns: true,
             },
         )
         .map_err(|e| crate::util::command_error_during(e, "findAndModify"))?;
+        let candidates = if let Some(sel) = selection {
+            crate::opdebug::note_examined(sel.keys_examined, sel.docs_examined, Some(sel.summary));
+            sel.first.into_iter().collect()
+        } else {
+            crate::explain::order::find(
+                storage,
+                &crate::explain::order::Ask {
+                    db: &ctx.db_name,
+                    coll: &coll,
+                    filter: &query,
+                    sort,
+                    // The hint says which index is read, and so which
+                    // matching document comes first.
+                    hint: natural_hint.as_ref().or(argtypes::given_hint(doc)),
+                    collation: collation.as_ref(),
+                    vars: &let_vars,
+                    limit: 1,
+                    // The plan is made, and cached, once; a re-pick after a
+                    // lost race reads it again. mongod's query carries a limit
+                    // of one only under a sort.
+                    asked: crate::near::Asked {
+                        limit: i64::from(sort.is_some_and(|s| !s.is_empty())),
+                        sort,
+                        cached: repick_count == 0,
+                        ..Default::default()
+                    },
+                },
+            )
+            .map_err(|e| crate::util::command_error_during(e, "findAndModify"))?
+        };
         let matched = candidates.into_iter().next();
 
         // No match.

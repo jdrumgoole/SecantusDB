@@ -762,6 +762,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                             batch_field: "firstBatch",
                             batch: opened.batch,
                         });
+                        ctx.exec_stats = Some(opened.stats);
                         return Ok(opened.reply);
                     }
                 }
@@ -788,6 +789,31 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 let front = crate::explain::pipeline_canonical(c, &read_pipeline);
                 let read = |sort: Option<&Document>, limit: i64| {
                     let moved = lead.filter.as_ref().filter(|_| sort.is_some());
+                    // Read as mongod's plan reads, counting what it examines
+                    // (RM-023), when a stream can run the plan.
+                    let counted = crate::explain::order::find_counted(
+                        storage,
+                        &crate::explain::order::Ask {
+                            db: &ctx.db_name,
+                            coll: c,
+                            filter: moved.unwrap_or(&filter),
+                            sort,
+                            hint,
+                            collation: collation.as_ref(),
+                            vars: &vars,
+                            limit,
+                            asked: Default::default(),
+                        },
+                        front.projection.as_ref(),
+                    )?;
+                    if let Some(counted) = counted {
+                        crate::opdebug::note_examined(
+                            counted.keys_examined,
+                            counted.docs_examined,
+                            None,
+                        );
+                        return Ok(counted.docs);
+                    }
                     crate::explain::order::find(
                         storage,
                         &crate::explain::order::Ask {

@@ -364,11 +364,18 @@ def test_slow_query_line_names_the_plan(rust_mongo: Any, mongod: Any) -> None:
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-023")
+@pytest.mark.backlog("RM-355")
 def test_slow_query_line_says_where_the_time_went(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `Slow query` line for a `find` carries
     `keysExamined`, `docsExamined` and `storage`, as well as what
-    `test_slow_query_line_names_the_plan` checks."""
+    `test_slow_query_line_names_the_plan` checks.
+
+    Since RM-023 (2026-10-27) this server's line has the counts, and a
+    `storage` section whenever WiredTiger's statistics for the operation's
+    sessions count something. mongod's always has one, for its execution
+    admission control's `storageExecutionMicros` (RM-355), which this
+    server does not have: a `find` of documents in the cache has no
+    `storage` here. The test is RM-355's now."""
     lines = _find_slow_lines(rust_mongo, mongod)
     answers = {
         name: sorted(k for k in _SLOW_LINE_ATTRS if k in attr) for name, attr in lines.items()

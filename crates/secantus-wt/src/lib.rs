@@ -148,6 +148,9 @@ unsafe fn item_bytes(it: &sys::WT_ITEM) -> Vec<u8> {
 /// A WiredTiger database connection. One per process (sessions are per-thread).
 pub struct Connection {
     ptr: *mut sys::WT_CONNECTION,
+    /// The connection keeps statistics (`statistics=(fast)` or more): its
+    /// sessions' can be read ([`Session::statistics`]).
+    stats: bool,
     /// The event handler WiredTiger was given. It writes its defaults into
     /// the callbacks left null, so the handler is the connection's own and
     /// outlives it: `Drop` closes the connection before this field drops.
@@ -198,6 +201,22 @@ fn event_handler() -> Box<sys::WT_EVENT_HANDLER> {
     })
 }
 
+/// Whether a connection opened with `config` keeps statistics: its
+/// `statistics=(...)` names a level other than `none` (WiredTiger's
+/// default is none). A statistics cursor on a connection that keeps none
+/// is refused (`EINVAL`).
+fn keeps_statistics(config: &str) -> bool {
+    let Some(at) = config.find("statistics=(") else {
+        return false;
+    };
+    let rest = &config[at + "statistics=(".len()..];
+    let levels = rest.split(')').next().unwrap_or("");
+    levels
+        .split(',')
+        .map(str::trim)
+        .any(|l| matches!(l, "all" | "fast" | "cache_walk" | "tree_walk"))
+}
+
 impl Connection {
     /// Open (creating if needed) a WiredTiger database rooted at `home` with the
     /// given config string (e.g. `"create,cache_size=256M,log=(enabled=true)"`).
@@ -211,6 +230,7 @@ impl Connection {
         })?;
         Ok(Connection {
             ptr,
+            stats: keeps_statistics(config),
             _handler: handler,
         })
     }
@@ -225,6 +245,7 @@ impl Connection {
             cursor_config: None,
             in_txn: Cell::new(false),
             txn_end: RefCell::new(Vec::new()),
+            stats: self.stats,
         })
     }
 }
@@ -284,6 +305,8 @@ pub struct Session {
     /// when it committed and `false` when it rolled back. See
     /// [`Session::on_transaction_end`].
     txn_end: RefCell<Vec<TxnEndHook>>,
+    /// Its connection keeps statistics.
+    stats: bool,
 }
 
 /// A callback run once when a transaction ends: `true` for a commit.
@@ -514,9 +537,219 @@ impl Session {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-operation statistics
+// ---------------------------------------------------------------------------
+
+/// What WiredTiger's per-session statistics counted for one operation: the
+/// numbers mongod reads from the operation's session for the `storage`
+/// section of its `Slow query` line and profile entry
+/// (`WiredTigerOperationStats`). Bytes, and microseconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OperationStats {
+    /// `bytes read into cache`.
+    pub bytes_read: i64,
+    /// `bytes written from cache`: pages the operation's own thread wrote
+    /// out (eviction it was drafted into).
+    pub bytes_written: i64,
+    /// `page read from disk to cache time (usecs)`.
+    pub read_micros: i64,
+    /// `page write from cache to disk time (usecs)`.
+    pub write_micros: i64,
+    /// `time waiting for cache (usecs)`.
+    pub cache_wait_micros: i64,
+    /// `schema lock wait time (usecs)`.
+    pub schema_lock_wait_micros: i64,
+    /// `dhandle lock wait time (usecs)`.
+    pub handle_lock_wait_micros: i64,
+    /// `dirty bytes in this txn`: what a transaction still running has
+    /// added to the cache. A transaction that has ended has none: this
+    /// engine keeps the count until the next one begins, so a session read
+    /// after its transaction ended gives none.
+    pub txn_bytes_dirty: i64,
+}
+
+impl OperationStats {
+    fn add(&mut self, o: &OperationStats) {
+        self.bytes_read += o.bytes_read;
+        self.bytes_written += o.bytes_written;
+        self.read_micros += o.read_micros;
+        self.write_micros += o.write_micros;
+        self.cache_wait_micros += o.cache_wait_micros;
+        self.schema_lock_wait_micros += o.schema_lock_wait_micros;
+        self.handle_lock_wait_micros += o.handle_lock_wait_micros;
+        self.txn_bytes_dirty += o.txn_bytes_dirty;
+    }
+}
+
+thread_local! {
+    /// The statistics of the operation running on this thread, summed over
+    /// every session it used; `None` while no operation counts them.
+    static OPERATION: Cell<Option<OperationStats>> = const { Cell::new(None) };
+}
+
+/// Counts the WiredTiger statistics of the operation running on this thread
+/// from its creation until it drops ([`operation_stats_scope`]).
+#[must_use = "the operation's statistics are counted while the scope lives"]
+pub struct OperationStatsScope {
+    previous: Option<OperationStats>,
+    /// What this scope counted goes on into the one it interrupted.
+    merge: bool,
+}
+
+/// Start counting this thread's operation's WiredTiger statistics: every
+/// session the thread closes adds its counts, and a long-lived session (a
+/// transaction's) adds them through [`Session::collect_operation_statistics`].
+/// The previous scope, if any, is resumed when this one drops.
+pub fn operation_stats_scope() -> OperationStatsScope {
+    OperationStatsScope {
+        previous: OPERATION.with(|o| o.replace(Some(OperationStats::default()))),
+        merge: true,
+    }
+}
+
+/// [`operation_stats_scope`] for an operation of its own run on this
+/// thread inside another (an index build mongod runs on a thread of its
+/// own): what it counts is its own and does not go on into the other.
+pub fn operation_stats_scope_apart() -> OperationStatsScope {
+    OperationStatsScope {
+        previous: OPERATION.with(|o| o.replace(Some(OperationStats::default()))),
+        merge: false,
+    }
+}
+
+impl OperationStatsScope {
+    /// What the operation has counted so far.
+    pub fn stats(&self) -> OperationStats {
+        OPERATION.with(Cell::get).unwrap_or_default()
+    }
+}
+
+impl Drop for OperationStatsScope {
+    /// An operation run inside another (a command a command runs) is part
+    /// of it: what it counted goes on into the outer one.
+    fn drop(&mut self) {
+        let merge = self.merge;
+        OPERATION.with(|o| {
+            let inner = o.get().unwrap_or_default();
+            o.set(self.previous.take().map(|mut outer| {
+                if merge {
+                    outer.add(&inner);
+                }
+                outer
+            }));
+        });
+    }
+}
+
+/// Whether this thread's operation is counting its statistics.
+pub fn operation_stats_armed() -> bool {
+    OPERATION.with(|o| o.get().is_some())
+}
+
+/// What this thread's operation has counted so far; `None` when it counts
+/// nothing.
+pub fn operation_stats() -> Option<OperationStats> {
+    OPERATION.with(Cell::get)
+}
+
+fn note_operation_stats(stats: &OperationStats) {
+    OPERATION.with(|o| {
+        if let Some(mut total) = o.get() {
+            total.add(stats);
+            o.set(Some(total));
+        }
+    });
+}
+
+impl Session {
+    /// This session's statistics (`statistics:session`), cleared afterwards
+    /// when `clear`. A session starts at zero when it opens.
+    pub fn statistics(&self, clear: bool) -> Result<OperationStats> {
+        if !self.stats {
+            return Ok(OperationStats::default());
+        }
+        let uri = CString::new("statistics:session").map_err(nul_err)?;
+        let cfg = CString::new(if clear { "statistics=(clear)" } else { "" }).map_err(nul_err)?;
+        let open = unsafe { (*self.ptr).open_cursor }.unwrap();
+        let mut cptr: *mut sys::WT_CURSOR = ptr::null_mut();
+        check(unsafe {
+            open(
+                self.ptr,
+                uri.as_ptr(),
+                ptr::null_mut(),
+                cfg.as_ptr(),
+                &mut cptr,
+            )
+        })?;
+        let cursor = Cursor {
+            ptr: cptr,
+            key_strs_hold: RefCell::new(Vec::new()),
+            key_bytes_hold: RefCell::new(Vec::new()),
+            val_bytes_hold: RefCell::new(Vec::new()),
+        };
+        let mut out = OperationStats::default();
+        while cursor.next()? {
+            let key = cursor.get_key_i()?;
+            let value = cursor.get_stat_value()?;
+            match key as u32 {
+                sys::WT_STAT_SESSION_BYTES_READ => out.bytes_read = value,
+                sys::WT_STAT_SESSION_BYTES_WRITE => out.bytes_written = value,
+                sys::WT_STAT_SESSION_READ_TIME => out.read_micros = value,
+                sys::WT_STAT_SESSION_WRITE_TIME => out.write_micros = value,
+                sys::WT_STAT_SESSION_CACHE_TIME => out.cache_wait_micros = value,
+                sys::WT_STAT_SESSION_LOCK_SCHEMA_WAIT => out.schema_lock_wait_micros = value,
+                sys::WT_STAT_SESSION_LOCK_DHANDLE_WAIT => out.handle_lock_wait_micros = value,
+                sys::WT_STAT_SESSION_TXN_BYTES_DIRTY => out.txn_bytes_dirty = value,
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// Add what this session counted since it last did so to the running
+    /// operation's statistics, and start it over: how a session that
+    /// outlives a statement (a transaction's) gives each statement its own
+    /// share. Nothing when no operation is counting.
+    pub fn collect_operation_statistics(&self) -> Result<()> {
+        if !self.stats || !operation_stats_armed() {
+            return Ok(());
+        }
+        let mut stats = self.statistics(true)?;
+        if !self.in_txn.get() {
+            stats.txn_bytes_dirty = 0;
+        }
+        note_operation_stats(&stats);
+        Ok(())
+    }
+
+    /// Start this session's statistics over, discarding what they held: a
+    /// long-lived session about to run a statement whose share is counted.
+    pub fn discard_statistics(&self) -> Result<()> {
+        if !self.stats || !operation_stats_armed() {
+            return Ok(());
+        }
+        self.statistics(true).map(|_| ())
+    }
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            // A session the running operation used gives it what it counted.
+            if self.stats && operation_stats_armed() {
+                match self.statistics(false) {
+                    // A transaction this session ran has ended, or ends
+                    // with the close: it holds no dirty bytes.
+                    Ok(mut stats) => {
+                        stats.txn_bytes_dirty = 0;
+                        note_operation_stats(&stats);
+                    }
+                    // Only the `Slow query` line's numbers are lost, but
+                    // never silently.
+                    Err(e) => eprintln!("secantus-wt: reading session statistics failed: {e}"),
+                }
+            }
             // Closing a session rolls back the transaction it is running.
             let running = self.in_txn.get();
             if let Some(close) = unsafe { (*self.ptr).close } {
@@ -668,6 +901,12 @@ impl Cursor {
         check(unsafe { cur_fn!(self, get_key)(self.ptr, &mut v as *mut i64) })?;
         Ok(v)
     }
+    /// `key_format=i` -- a `statistics:` cursor's key, the statistic's id.
+    pub fn get_key_i(&self) -> Result<i32> {
+        let mut v: c_int = 0;
+        check(unsafe { cur_fn!(self, get_key)(self.ptr, &mut v as *mut c_int) })?;
+        Ok(v)
+    }
     /// `key_format=III` -- a `log:` cursor's key: the record's log file
     /// number, its offset in the file, and its counter within the record.
     pub fn set_key_iii(&self, a: u32, b: u32, c: u32) {
@@ -791,6 +1030,17 @@ impl Cursor {
             cur_fn!(self, get_value)(self.ptr, &mut desc, &mut printable, &mut value as *mut i64)
         })?;
         Ok((owned(desc), value))
+    }
+
+    /// A `statistics:` cursor's value alone, with nothing copied out.
+    pub fn get_stat_value(&self) -> Result<i64> {
+        let mut desc: *const c_char = ptr::null();
+        let mut printable: *const c_char = ptr::null();
+        let mut value: i64 = 0;
+        check(unsafe {
+            cur_fn!(self, get_value)(self.ptr, &mut desc, &mut printable, &mut value as *mut i64)
+        })?;
+        Ok(value)
     }
 
     /// `value_format=S` — a single NUL-terminated string. Used by the `metadata:`
@@ -1022,5 +1272,18 @@ mod panic_handler_tests {
             stderr.contains("WiredTiger panic, aborting: injected"),
             "stderr: {stderr}"
         );
+    }
+}
+
+#[cfg(test)]
+mod statistics_config_tests {
+    use super::keeps_statistics;
+
+    #[test]
+    fn statistics_are_kept_at_a_level_other_than_none() {
+        assert!(keeps_statistics("create,statistics=(fast)"));
+        assert!(keeps_statistics("statistics=(all,clear),create"));
+        assert!(!keeps_statistics("create,cache_size=1M"));
+        assert!(!keeps_statistics("create,statistics=(none)"));
     }
 }

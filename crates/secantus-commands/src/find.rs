@@ -652,6 +652,11 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         || storage
             .collection_exists(&ctx.db_name, &coll)
             .unwrap_or(false);
+    // A collection that is not there is read by mongod's EOF plan, which
+    // examines nothing (RM-023).
+    if !exists {
+        crate::opdebug::note_examined(0, 0, None);
+    }
     if tailable && !exists {
         // Nothing to tail: an empty batch and no cursor, not an error.
         return Ok(doc! {
@@ -1402,6 +1407,10 @@ impl crate::cursors::StreamCursor for FindStream {
     fn originating_command(&self) -> Document {
         self.command.clone()
     }
+
+    fn has_sort_stage(&self) -> bool {
+        self.stream.has_sort_stage()
+    }
 }
 
 /// A `find` read through a streaming cursor: its first batch now, the rest
@@ -1444,6 +1453,7 @@ fn stream_find(
         min_max: asked.min.is_some() || asked.max.is_some(),
         return_key: asked.return_key,
         show_record_id: asked.show_record_id,
+        sorts_documents: true,
     };
     let Some(plan) = crate::explain::order::stream_plan(
         storage.as_ref(),
@@ -1476,6 +1486,10 @@ fn stream_find(
         min: asked.min,
         max: asked.max,
         collation: asked.collation,
+        sort_budget: Some((
+            crate::aggregate::budgets_of(ctx),
+            doc.get_bool("allowDiskUse").unwrap_or(true),
+        )),
     };
     let Some(stream) = crate::explain::stream::Stream::of_plan_with(
         &plan,
@@ -1519,6 +1533,7 @@ fn stream_find(
     if batch.docs.is_empty() && batch.exhausted {
         validate_empty_result(asked.filter, asked.let_vars, asked.collation)?;
     }
+    let has_sort_stage = cursor.stream.has_sort_stage();
     let cursor_id = if batch.exhausted || asked.single_batch {
         0
     } else {
@@ -1533,6 +1548,7 @@ fn stream_find(
         exhausted: batch.exhausted,
         plan_summary: None,
         originating_command: None,
+        has_sort_stage,
     });
     ctx.pending_batch = Some(crate::PendingBatch {
         batch_field: "firstBatch",

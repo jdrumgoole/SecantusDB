@@ -44,6 +44,7 @@ pub(crate) use node::IndexInfo;
 pub(crate) use node::Node;
 use node::{num, Stats};
 pub(crate) use parsed::parsed_query;
+pub(crate) use plan::{planning_scope, planning_spent};
 use plan::{Hint, Query};
 use secantus_core::collation::Collation;
 use secantus_core::query::bson_type_name;
@@ -629,6 +630,27 @@ fn cache_view(
     collation: Option<&Collation>,
     pipeline: &[Document],
 ) -> Option<CacheView> {
+    let key = cache_key_of(storage, db, s, canonical, collation, pipeline)?;
+    let active = plan_cache::place_of(storage, db, &s.coll)
+        .ok()
+        .flatten()
+        .and_then(|place| plan_cache::get(&place, &key))
+        .filter(|e| e.active)
+        .map(|e| e.solution);
+    Some(CacheView { key, active })
+}
+
+/// The plan cache key of the query `s` plans, made from the catalog alone:
+/// nothing of the cache is read, and nothing written (a collection's cache
+/// is reached through its UUID, which a read must not mint).
+fn cache_key_of(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    s: &Shape,
+    canonical: &Document,
+    collation: Option<&Collation>,
+    pipeline: &[Document],
+) -> Option<cache_key::CacheKey> {
     let full = catalog(storage, db, &s.coll, None).ok()?;
     let implies = |partial: &Document| storage.query_implies_partial(&s.filter, partial);
     let (projection, distinct) = match &s.kind {
@@ -656,14 +678,21 @@ fn cache_view(
         collation,
         implies: &implies,
     };
-    let key = cache_key::key_for(canonical, &parts, &ix)?;
-    let active = plan_cache::place_of(storage, db, &s.coll)
-        .ok()
-        .flatten()
-        .and_then(|place| plan_cache::get(&place, &key))
-        .filter(|e| e.active)
-        .map(|e| e.solution);
-    Some(CacheView { key, active })
+    cache_key::key_for(canonical, &parts, &ix)
+}
+
+/// The plan cache key mongod builds for the query `s` plans, as a `Slow
+/// query` line prints it: `(planCacheShapeHash, planCacheKey)` in hex.
+pub(crate) fn cache_hashes(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    s: &Shape,
+    collation: Option<&Collation>,
+    pipeline: &[Document],
+) -> Option<(String, String)> {
+    let canonical = parsed::parsed_query(&s.filter);
+    let key = cache_key_of(storage, db, s, &canonical, collation, pipeline)?;
+    Some((cache_key::hex(key.shape_hash), cache_key::hex(key.key_hash)))
 }
 
 fn query_planner(

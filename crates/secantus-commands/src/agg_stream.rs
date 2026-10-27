@@ -67,6 +67,8 @@ pub(crate) struct Ask<'a> {
 pub(crate) struct Opened {
     pub reply: Document,
     pub batch: Vec<Vec<u8>>,
+    /// What reading the first batch examined, for the command's line.
+    pub stats: crate::ExecStats,
 }
 
 /// Open `ask`'s cursor, when its pipeline streams. `None`: read it whole.
@@ -130,6 +132,13 @@ pub(crate) fn open(ctx: &CommandContext, ask: &Ask) -> Result<Option<Opened>, Co
     Ok(Some(Opened {
         reply,
         batch: batch.docs,
+        stats: crate::ExecStats {
+            keys_examined: batch.keys_examined,
+            docs_examined: batch.docs_examined,
+            cursor_id,
+            exhausted: batch.exhausted,
+            ..Default::default()
+        },
     }))
 }
 

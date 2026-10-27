@@ -252,6 +252,27 @@ pub struct ChangeStreamBatch {
     pub fatal: Option<(i32, String)>,
 }
 
+/// What the store counted for one operation (RM-023): WiredTiger's
+/// per-session statistics for every session it used -- bytes and
+/// microseconds -- and the index keys its writes inserted and deleted, as
+/// mongod counts them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OperationCounts {
+    pub bytes_read: i64,
+    pub bytes_written: i64,
+    pub read_micros: i64,
+    pub write_micros: i64,
+    pub cache_wait_micros: i64,
+    pub schema_lock_wait_micros: i64,
+    pub handle_lock_wait_micros: i64,
+    /// What a transaction still running has added to the cache.
+    pub txn_bytes_dirty: i64,
+    /// `None` when the operation inserted no index key: mongod prints the
+    /// count only for an operation that inserted documents or keys.
+    pub keys_inserted: Option<i64>,
+    pub keys_deleted: Option<i64>,
+}
+
 /// The storage operations the command handlers depend on. Bytes at the seam:
 /// documents go in/out as `bson::encode` bytes, as they come off the WT cursor.
 pub trait Storage: Send + Sync {
@@ -1242,6 +1263,26 @@ pub trait Storage: Send + Sync {
     /// and [`Self::index_entries_from`]. `false` when the store cannot.
     fn can_stream(&self, _db: &str, _coll: &str) -> Result<bool, StorageError> {
         Ok(false)
+    }
+
+    /// Start counting what the store does for the operation running on
+    /// this thread ([`OperationCounts`]), until the returned guard drops.
+    /// `None`: this store counts nothing (RM-023).
+    fn begin_operation_counts(&self) -> Option<Box<dyn std::any::Any>> {
+        None
+    }
+
+    /// [`Self::begin_operation_counts`] for an operation of its own run
+    /// inside the current one (an index build, which mongod runs on a
+    /// thread of its own): its counts do not go on into the current one's.
+    fn begin_operation_counts_apart(&self) -> Option<Box<dyn std::any::Any>> {
+        None
+    }
+
+    /// What the store has counted so far for the operation running on
+    /// this thread; `None` outside [`Self::begin_operation_counts`].
+    fn operation_counts(&self) -> Option<OperationCounts> {
+        None
     }
 
     /// Up to `max` documents after RecordId `after` (from the start when

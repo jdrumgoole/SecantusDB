@@ -257,8 +257,12 @@ fn level_two_writes_each_operation_in_mongods_shape() {
             head.iter().chain(common.iter()).copied().collect()
         };
         let find = &profiled[0];
-        // mongod 8.2.11 writes the plan after `millis` (2026-10-24), and
-        // the counts of a read that streams (an `_id` scan) after the command.
+        // mongod 8.2.11 writes the plan and its planning time after
+        // `millis` (2026-10-24), the counts of the read after the command,
+        // and the plan cache key, the engine, the locks and the read
+        // concern after them (RM-023, 2026-10-27). Its `queryShapeHash`
+        // (RM-358) and `execStats` (RM-359) are not written here, nor a
+        // `storage` section when WiredTiger counted nothing.
         let mut want = with(&[
             "op",
             "ns",
@@ -269,12 +273,23 @@ fn level_two_writes_each_operation_in_mongods_shape() {
             "cursorExhausted",
             "numYield",
             "nreturned",
+            "planCacheShapeHash",
+            "queryHash",
+            "planCacheKey",
+            "queryFramework",
+            "locks",
+            "flowControl",
         ]);
-        want.insert(
-            want.iter().position(|k| *k == "millis").unwrap() + 1,
-            "planSummary",
-        );
+        let after_millis = want.iter().position(|k| *k == "millis").unwrap() + 1;
+        want.insert(after_millis, "planSummary");
+        want.insert(after_millis + 1, "planningTimeMicros");
+        // `cpuNanos`, before `millis`, where mongod reads a thread's CPU
+        // clock: Linux.
+        if cfg!(target_os = "linux") {
+            want.insert(after_millis - 1, "cpuNanos");
+        }
         assert_eq!(keys(find), want);
+        assert_eq!(find.get_str("queryFramework"), Ok("classic"));
         assert_eq!(find.get_str("planSummary"), Ok("IXSCAN { _id: 1 }"));
         assert_eq!(
             (
@@ -294,10 +309,25 @@ fn level_two_writes_each_operation_in_mongods_shape() {
         // A duplicate is a write error, not a failure of the command.
         assert_eq!(profiled[1].get_i32("ninserted"), Ok(1));
         assert!(!profiled[1].contains_key("ok"));
-        assert_eq!(
-            keys(&profiled[2]),
-            with(&["op", "ns", "command", "numYield", "ok", "errMsg", "errName", "errCode"])
-        );
+        // A failed read: its locks, then the error (mongod 8.2.11,
+        // 2026-10-27; a standalone's, with no read concern).
+        let mut failed = with(&[
+            "op",
+            "ns",
+            "command",
+            "numYield",
+            "locks",
+            "flowControl",
+            "ok",
+            "errMsg",
+            "errName",
+            "errCode",
+        ]);
+        if cfg!(target_os = "linux") {
+            let millis = failed.iter().position(|k| *k == "millis").unwrap();
+            failed.insert(millis, "cpuNanos");
+        }
+        assert_eq!(keys(&profiled[2]), failed);
         assert_eq!(
             (
                 profiled[2].get_f64("ok"),
@@ -362,18 +392,49 @@ fn update_and_delete_are_profiled_by_statement() {
             &doc! {"q": {"_id": 2}, "u": {"$set": {"a": 1}}, "hint": {"_id": 1},
             "multi": false, "upsert": false}
         );
-        let tail = ["millis", "ts", "client", "allUsers", "user"];
+        // What the statement's plan examined and the keys it wrote, its plan
+        // cache key, locks and read concern, then its plan after `millis`
+        // (RM-023, mongod 8.2.11's order). A write's flow control is
+        // RM-357's.
         let mut want = vec![
             "op",
             "ns",
             "command",
+            "keysExamined",
+            "docsExamined",
             "nMatched",
             "nModified",
             "nUpserted",
+            "keysInserted",
+            "keysDeleted",
             "numYield",
+            "planCacheShapeHash",
+            "queryHash",
+            "planCacheKey",
+            "locks",
+            "millis",
+            "planSummary",
+            "planningTimeMicros",
+            "ts",
+            "client",
+            "allUsers",
+            "user",
         ];
-        want.extend(tail);
+        // A statement's own `cpuNanos`, before `millis`, on Linux (mongod
+        // 8.2.12).
+        if cfg!(target_os = "linux") {
+            let millis = want.iter().position(|k| *k == "millis").unwrap();
+            want.insert(millis, "cpuNanos");
+        }
         assert_eq!(keys(&profiled[0]), want);
+        assert_eq!(
+            (
+                profiled[0].get_i64("keysExamined"),
+                profiled[0].get_i64("docsExamined"),
+                profiled[0].get_str("planSummary"),
+            ),
+            (Ok(1), Ok(1), Ok("IXSCAN { _id: 1 }"))
+        );
         assert_eq!(
             (
                 profiled[1].get_i32("errCode"),

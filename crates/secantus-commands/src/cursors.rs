@@ -64,6 +64,10 @@ pub trait StreamCursor: Send {
     /// The command that opened the cursor (a `getMore` line's
     /// `originatingCommand`).
     fn originating_command(&self) -> Document;
+    /// The plan sorts in memory: mongod's `hasSortStage`, on every batch.
+    fn has_sort_stage(&self) -> bool {
+        false
+    }
     /// The command a cursor opened with a first batch of none runs at its
     /// first `getMore`, when it has run nothing yet.
     fn deferred(&self) -> Option<Document> {
@@ -1321,6 +1325,7 @@ fn stream_get_more(
         exhausted: batch.exhausted,
         plan_summary: stream.plan_summary(),
         originating_command: Some(stream.originating_command()),
+        has_sort_stage: stream.has_sort_stage(),
     });
     cursors.return_stream(cursor_id, stream, batch.exhausted);
     ctx.pending_batch = Some(crate::PendingBatch {
@@ -1398,6 +1403,7 @@ fn deferred_get_more(
         exhausted: opened == 0,
         plan_summary: None,
         originating_command: Some(command),
+        has_sort_stage: false,
     });
     let id = Bson::Int64(if opened == 0 { 0 } else { cursor_id });
     // A batch the pipeline streamed rides beside the reply.

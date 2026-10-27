@@ -419,6 +419,7 @@ impl LockManager {
     }
 
     fn count(&self, resource: &Resource, mode: Mode, waited: Option<Duration>) {
+        note_operation_lock(resource.kind(), mode, waited.is_some());
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let s = inner.stats.entry(resource.kind()).or_default();
         *s.acquire_count.entry(mode).or_default() += 1;
@@ -896,9 +897,92 @@ fn note_taken(resource: &Resource) {
     }
 }
 
+thread_local! {
+    /// The locks the operation running on this thread has taken, by
+    /// resource kind and mode, and how many of them waited: mongod's
+    /// per-operation `lockStats`, which its `Slow query` line and profile
+    /// entry print as `locks` (RM-023).
+    static OP_LOCKS: std::cell::RefCell<Vec<(&'static str, Mode, u64, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn note_operation_lock(kind: &'static str, mode: Mode, waited: bool) {
+    OP_LOCKS.with(|l| {
+        let mut l = l.borrow_mut();
+        match l.iter_mut().find(|(k, m, _, _)| *k == kind && *m == mode) {
+            Some(row) => {
+                row.2 += 1;
+                row.3 += u64::from(waited);
+            }
+            None => l.push((kind, mode, 1, u64::from(waited))),
+        }
+    });
+}
+
+/// mongod's `ResourceType` order, which `serverStatus.locks` and an
+/// operation's `locks` keep.
+const KIND_ORDER: [&str; 8] = [
+    "MultiDocumentTransactionsBarrier",
+    "ReplicationStateTransition",
+    "Global",
+    "Database",
+    "Collection",
+    "Metadata",
+    "Mutex",
+    "oplog",
+];
+
+/// The locks the operation running on this thread has taken so far, as
+/// mongod prints an operation's `locks`: per resource kind, in its order,
+/// `acquireCount` by mode (`r`, `w`, `R`, `W`), and `acquireWaitCount` for
+/// the modes that waited. `extra_global_is`: the global IS mongod takes
+/// after the line, to read the operation's storage statistics, which its
+/// profile entry counts.
+pub fn operation_locks(extra_global_is: bool) -> bson::Document {
+    let mut rows = OP_LOCKS.with(|l| l.borrow().clone());
+    if extra_global_is {
+        match rows
+            .iter_mut()
+            .find(|(k, m, _, _)| *k == "Global" && *m == Mode::Is)
+        {
+            Some(row) => row.2 += 1,
+            None => rows.push(("Global", Mode::Is, 1, 0)),
+        }
+    }
+    let mut kinds: Vec<&'static str> = rows.iter().map(|r| r.0).collect();
+    kinds.sort_by_key(|k| {
+        KIND_ORDER
+            .iter()
+            .position(|o| o == k)
+            .unwrap_or(KIND_ORDER.len())
+    });
+    kinds.dedup();
+    let mut out = bson::Document::new();
+    for kind in kinds {
+        let mut modes: Vec<&(&'static str, Mode, u64, u64)> =
+            rows.iter().filter(|r| r.0 == kind).collect();
+        modes.sort_by_key(|r| r.1);
+        let mut acquire = bson::Document::new();
+        let mut waits = bson::Document::new();
+        for (_, mode, n, waited) in modes {
+            acquire.insert(mode.letter(), *n as i64);
+            if *waited > 0 {
+                waits.insert(mode.letter(), *waited as i64);
+            }
+        }
+        let mut stats = bson::doc! { "acquireCount": acquire };
+        if !waits.is_empty() {
+            stats.insert("acquireWaitCount", waits);
+        }
+        out.insert(kind, stats);
+    }
+    out
+}
+
 /// An operation starts on this thread: it has taken no global lock yet.
 pub fn begin_operation() {
     TOOK_GLOBAL.with(|t| t.set(false));
+    OP_LOCKS.with(|l| l.borrow_mut().clear());
 }
 
 /// Whether the operation this thread runs has taken the global lock.
