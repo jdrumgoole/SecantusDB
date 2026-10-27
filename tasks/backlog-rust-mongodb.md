@@ -1078,8 +1078,11 @@ Still different:
       tests in `tests/backlog/test_rm_185_locks.py`). An index build's count
       of the global IS is not fixed on mongod: its build runs on a thread of
       its own and the command takes the IS each time it looks at it, 1 to 4
-      times in one shape measured; this server takes the least mongod was
-      seen to, and the tests compare that count as a floor. Still different:
+      times in one shape measured. This server takes mongod's usual count (2,
+      and 4 with every operation logged as slow: macOS 8.2.11 gave exactly
+      that in 20 of 20 runs; the Linux build sometimes polls once less), and
+      the tests accept any count mongod gave in its five runs for that one
+      lock (Joe, 2026-10-27). Still different:
       mongod takes a command's locks inside it, after it parses, so a
       malformed one (`{explain: 1}`, `{dataSize: 1}`) takes none, where this
       server takes the command's chain before running it;

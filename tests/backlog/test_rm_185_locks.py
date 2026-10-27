@@ -121,9 +121,13 @@ def _fresh(prefix: str) -> str:
 
 # mongod's index build runs on a thread of its own, and the command takes
 # the global IS each time it looks at the build: more the longer the build
-# takes (measured 1 to 4 on mongod 8.2.11 for one shape). Every other count
-# of a build is fixed, so the global IS is compared as a floor: mongod takes
-# at least as many as this server.
+# takes (measured 1 to 4 on mongod 8.2.11 for one shape). macOS 8.2.11 gives
+# 2, and 4 with every operation logged as slow, in 20 of 20 runs; the Linux
+# build (the exemplar) sometimes polls once less, so the least of five runs
+# is not a count this server can be held to. Every other count of a build is
+# fixed. So the global IS of a `createIndex` is compared as a range (Joe,
+# 2026-10-27): this server's count must be one of the counts mongod gave in
+# its five runs, least to most.
 _BUILD_POLLS = ("Global", "r")
 
 
@@ -132,8 +136,13 @@ def _same_counts(got: list, want: list) -> None:
     for (label, ours), (_, theirs) in zip(got, want, strict=True):
         ours, theirs = dict(ours), dict(theirs)
         if label.startswith("createIndex"):
-            assert ours.get(_BUILD_POLLS, 0) >= 1, label
-            assert theirs.get(_BUILD_POLLS, 0) >= ours.get(_BUILD_POLLS, 0), label
+            polls = [run.get(_BUILD_POLLS, 0) for run in _RUNS[label]]
+            mine = ours.get(_BUILD_POLLS, 0)
+            assert mine >= 1, label
+            assert min(polls) <= mine <= max(polls), (
+                f"{label!r}: this server took {_BUILD_POLLS} {mine} times; "
+                f"mongod's five runs took {polls}"
+            )
             ours.pop(_BUILD_POLLS, None)
             theirs.pop(_BUILD_POLLS, None)
         assert (label, ours) == (label, theirs), (
@@ -454,7 +463,7 @@ def test_a_slow_operation_takes_the_global_lock_to_log(rust_mongo: Any, mongod: 
     (measured 8.2.11, 2026-10-24: with `slowms` 0, `$merge` creating its
     target reads 8 global IS where it reads 2 with nothing logged). This
     server wrote the command's line and took no lock for it."""
-    assert _slow(rust_mongo) == _reference(_slow, mongod)
+    _same_counts(_slow(rust_mongo), _reference(_slow, mongod))
 
 
 def _log_line(line: str) -> dict:
