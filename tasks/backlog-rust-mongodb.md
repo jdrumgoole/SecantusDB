@@ -1278,11 +1278,17 @@ Still different, all 77:
       build before and 1.2 times an update by `_id`
       (`order::store_order_is_the_plans`); `{a: {$ne: 5}}` over `a_1` 0.7
       times, a regex prefix 0.01 times, now that the router reads the index.
-      The lever was mongod's plan cache, which landed 2026-10-27 (RM-154):
-      a shape's trial runs until its entry is active, and then only the
-      cached plan is worked, within ten times its works. Not re-measured
-      yet: the release builds to time it against 43463aa6 could not be made
-      on 2026-10-27 (the build machine's disk was full).
+      The plan cache landed 2026-10-27 (RM-154): a shape's trial runs until
+      its entry is active, then only the cached plan is worked, within ten
+      times its works. That bought little: debug builds, 2,000 documents,
+      median of 300 finds against 3b47b41a, `{a: 5, b: 3}` 24.3 -> 19.6 ms
+      and a range on both 28.7 -> 24.7 ms, where one index is 2.8 ms. The
+      cost is reading and decoding the collection and keying its index,
+      which checking the cached plan's works needs as the trial did.
+      (Release builds could not be made that day: the machine's disk was
+      full.) The lever left: keep a collection's trial documents and index
+      keys between reads, or count the cached plan's works over the index
+      itself.
       Backlog-ID: RM-056
       Verify: none -- performance budget (timings against an earlier build)
 - [ ] **A query SBE runs is not cached.** mongod 8.2.11 runs a `$match`
