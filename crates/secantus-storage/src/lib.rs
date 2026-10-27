@@ -24266,7 +24266,7 @@ mod tests {
                 bytes: vec![b; 16],
             })
         };
-        let ids = vec![
+        let ids = [
             bson::bson!({"a": 5}),
             bson::bson!({"a": 2, "b": [3]}),
             uuid(2),
@@ -24281,7 +24281,9 @@ mod tests {
                 let blobs = ids
                     .iter()
                     .enumerate()
-                    .map(|(u, id)| encode_doc(&doc! {"_id": id.clone(), "u": u as i32 + 1}).unwrap())
+                    .map(|(u, id)| {
+                        encode_doc(&doc! {"_id": id.clone(), "u": u as i32 + 1}).unwrap()
+                    })
                     .collect();
                 let (n, errors) = st.insert("app", "i", blobs, true).unwrap();
                 assert!(errors.is_empty(), "{errors:?}");
@@ -24296,7 +24298,10 @@ mod tests {
         }
         let st = Storage::open(home).unwrap();
         let session = st.conn.open_session().unwrap();
-        assert_eq!(stored_id_key_format(&session).unwrap(), sortkey::ID_KEY_FORMAT);
+        assert_eq!(
+            stored_id_key_format(&session).unwrap(),
+            sortkey::ID_KEY_FORMAT
+        );
         let walk: Vec<i64> = st
             .index_entries_from("app", "i", ID_INDEX_NAME, &[], None, 10, false)
             .unwrap()

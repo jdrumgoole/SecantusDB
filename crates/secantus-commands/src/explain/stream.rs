@@ -100,6 +100,8 @@ pub(crate) struct Options<'a> {
     /// `min` / `max`: where the hinted scan starts and stops.
     pub min: Option<&'a Document>,
     pub max: Option<&'a Document>,
+    /// The command's collation, which a sort of index keys compares under.
+    pub collation: Option<&'a Collation>,
 }
 
 /// What a scan knows of its index.
@@ -168,9 +170,9 @@ impl Cx<'_> {
 /// `doc` in that field of `meta`'s index (`secantus_core::index_keys`).
 fn mongod_key(meta: &IndexMeta, field: usize, doc: &Document, part: &[u8]) -> bool {
     let keys = secantus_core::index_keys::field_keys(doc, &meta.fields[field], meta.sparse);
-    keys.mongod.iter().any(|v| {
-        sortkey::encode_value(v, meta.collation.as_ref()).is_ok_and(|k| k == part)
-    })
+    keys.mongod
+        .iter()
+        .any(|v| sortkey::encode_value(v, meta.collation.as_ref()).is_ok_and(|k| k == part))
 }
 
 /// Whether every field of `entry` is one of mongod's keys for `blob`.
@@ -194,7 +196,10 @@ struct Entry {
 /// How a scan is bounded.
 enum Limits {
     /// The plan's index bounds, per field, in scan order.
-    Ranges { ranges: Vec<Ranges>, contiguous: bool },
+    Ranges {
+        ranges: Vec<Ranges>,
+        contiguous: bool,
+    },
     /// `min` (inclusive) to `max` (exclusive), as stored keys.
     MinMax {
         min: Option<Vec<u8>>,
@@ -316,7 +321,11 @@ impl IndexScan {
         match &self.limits {
             Limits::Ranges { ranges, .. } => outside_of(ranges, &e.scan),
             Limits::MinMax { min, max } => {
-                let (low, high) = if self.backward { (max, min) } else { (min, max) };
+                let (low, high) = if self.backward {
+                    (max, min)
+                } else {
+                    (min, max)
+                };
                 // Walking up, a key at or past `max` ends the scan; walking
                 // down, a key below `min` does. `max` itself is never in.
                 let past = if self.backward {
@@ -529,6 +538,30 @@ struct Merge {
     seen: HashSet<i64>,
 }
 
+/// A document's key under a sort pattern and a collation: each field's
+/// value (null when missing) as the collation orders it.
+fn collated_key(
+    pattern: &[(String, bool)],
+    blob: &[u8],
+    collation: &Collation,
+) -> Result<Vec<Vec<u8>>, StorageError> {
+    let doc = secantus_core::bsondoc::from_bytes(blob).map_err(undecodable)?;
+    Ok(pattern
+        .iter()
+        .map(|(field, descending)| {
+            let value = secantus_core::get_path(&doc, field)
+                .cloned()
+                .unwrap_or(Bson::Null);
+            let asc = sortkey::encode_sort_value(&value, Some(collation)).unwrap_or_default();
+            if *descending {
+                reversed_key(&asc)
+            } else {
+                asc
+            }
+        })
+        .collect())
+}
+
 /// A member's key under a sort pattern (each field, and whether it is
 /// descending), from the entry that found it.
 fn pattern_key(pattern: &[(String, bool)], m: &Member) -> Vec<Vec<u8>> {
@@ -620,6 +653,9 @@ enum Stage {
         limit: Option<i64>,
         input: Box<Stage>,
         sorted: Option<VecDeque<Member>>,
+        /// The command's collation: the keys' values compare under it, as
+        /// mongod's sort compares them whatever the index's collation.
+        collation: Option<Collation>,
     },
 }
 
@@ -689,11 +725,23 @@ impl Stage {
                 limit,
                 input,
                 sorted,
+                collation,
             } => {
                 if sorted.is_none() {
                     let mut all: Vec<(Vec<Vec<u8>>, Member)> = Vec::new();
                     while let Some(m) = input.next(cx)? {
-                        all.push((pattern_key(pattern, &m), m));
+                        let key = match collation {
+                            // The values the keys hold, compared under the
+                            // collation: read from the document as it is
+                            // at the sort (a key is not its value here),
+                            // which is no FETCH of mongod's, so not counted.
+                            Some(c) => match cx.read(m.rid)? {
+                                Some(blob) => collated_key(pattern, &blob, c)?,
+                                None => pattern_key(pattern, &m),
+                            },
+                            None => pattern_key(pattern, &m),
+                        };
+                        all.push((key, m));
                     }
                     all.sort_by(|a, b| a.0.cmp(&b.0));
                     if let Some(n) = limit.filter(|n| *n > 0) {
@@ -777,7 +825,10 @@ fn index_scan(ix: &IxScan, opts: &Options) -> Result<Option<IndexScan>, StorageE
         // `min` / `max` name every field of the index, in its order.
         let bound = |d: Option<&Document>| -> Result<Option<Vec<u8>>, ()> {
             let Some(d) = d else { return Ok(None) };
-            if d.keys().map(String::as_str).ne(meta.fields.iter().map(String::as_str)) {
+            if d.keys()
+                .map(String::as_str)
+                .ne(meta.fields.iter().map(String::as_str))
+            {
                 return Err(());
             }
             let values: Vec<(Bson, i32)> = d.values().cloned().zip(dirs.iter().copied()).collect();
@@ -863,10 +914,7 @@ fn streams(ix: &IxScan) -> bool {
 /// The stage `node` is, when it streams. `top`: the topmost FETCH, which
 /// matches the command's own filter (`command`); the others match their own.
 fn stage_of(
-    storage: &dyn Storage,
     node: &Node,
-    db: &str,
-    coll: &str,
     command: Option<&Document>,
     opts: &Options,
     covered: bool,
@@ -886,7 +934,7 @@ fn stage_of(
             end: false,
         })),
         Node::Fetch { filter, input } => {
-            let Some(input) = stage_of(storage, input, db, coll, None, opts, false)? else {
+            let Some(input) = stage_of(input, None, opts, false)? else {
                 return Ok(None);
             };
             let filter = match command {
@@ -903,7 +951,7 @@ fn stage_of(
         // filtered after it: the skipped keys are examined, their
         // documents never read (`FETCH <- SKIP <- IXSCAN`).
         Node::Skip(n, input) if command.is_none() => {
-            let Some(input) = stage_of(storage, input, db, coll, None, opts, false)? else {
+            let Some(input) = stage_of(input, None, opts, false)? else {
                 return Ok(None);
             };
             Some(Stage::Skip {
@@ -946,7 +994,7 @@ fn stage_of(
         Node::Or(inputs) => {
             let mut stages = Vec::with_capacity(inputs.len());
             for input in inputs {
-                let Some(s) = stage_of(storage, input, db, coll, None, opts, false)? else {
+                let Some(s) = stage_of(input, None, opts, false)? else {
                     return Ok(None);
                 };
                 stages.push(s);
@@ -978,7 +1026,7 @@ fn stage_of(
             if !holds(input, &pattern) {
                 return Ok(None);
             }
-            let Some(input) = stage_of(storage, input, db, coll, None, opts, false)? else {
+            let Some(input) = stage_of(input, None, opts, false)? else {
                 return Ok(None);
             };
             Some(Stage::SortKeys {
@@ -986,6 +1034,7 @@ fn stage_of(
                 limit: *limit,
                 input: Box::new(input),
                 sorted: None,
+                collation: opts.collation.cloned(),
             })
         }
         Node::SortMerge { pattern, inputs } => {
@@ -1009,7 +1058,7 @@ fn stage_of(
                 if !pattern.iter().all(|(f, _)| ix.index.position(f).is_some()) {
                     return Ok(None);
                 }
-                let Some(s) = stage_of(storage, input, db, coll, None, opts, false)? else {
+                let Some(s) = stage_of(input, None, opts, false)? else {
                     return Ok(None);
                 };
                 stages.push(s);
@@ -1056,19 +1105,17 @@ impl Stream {
     /// A FETCH below an OR keeps its own filter, which decides what the OR
     /// passes on and so remembers.
     pub(crate) fn of_plan(
-        storage: &dyn Storage,
         plan: &Node,
         db: &str,
         coll: &str,
         filter: &Document,
         vars: &Document,
     ) -> Result<Option<Stream>, StorageError> {
-        Stream::of_plan_with(storage, plan, db, coll, filter, vars, &Options::default())
+        Stream::of_plan_with(plan, db, coll, filter, vars, &Options::default())
     }
 
     /// [`Self::of_plan`], with what the read asks beyond the plan.
     pub(crate) fn of_plan_with(
-        storage: &dyn Storage,
         plan: &Node,
         db: &str,
         coll: &str,
@@ -1107,8 +1154,8 @@ impl Stream {
             _ => None,
         };
         let root = match top {
-            Some(f) => stage_of(storage, node, db, coll, Some(&f), opts, covered)?,
-            None => stage_of(storage, node, db, coll, None, opts, covered).map(|s| {
+            Some(f) => stage_of(node, Some(&f), opts, covered)?,
+            None => stage_of(node, None, opts, covered).map(|s| {
                 s.map(|s| match s {
                     already @ Stage::Fetch { .. } => already,
                     other => Stage::Fetch {

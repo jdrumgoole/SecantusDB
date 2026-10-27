@@ -186,6 +186,9 @@ fn hint_refusal(ns: &str, s: &Shape) -> CommandError {
         } else {
             named
         },
+        batch_size: (!s.pipeline)
+            .then(|| s.options.get("batchSize").and_then(crate::util::as_i64))
+            .flatten(),
     };
     err(
         2,

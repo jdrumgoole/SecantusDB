@@ -148,7 +148,7 @@ pub(crate) fn rewrite(pipeline: &[Bson], remaining: &mut Vec<Bson>) -> Rewritten
 }
 
 /// Whether `v` holds a `{$meta: kind}`.
-fn mentions(v: &Bson, kind: &str) -> bool {
+pub(crate) fn mentions(v: &Bson, kind: &str) -> bool {
     match v {
         Bson::Document(d) => {
             if d.len() == 1 {

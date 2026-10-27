@@ -810,8 +810,8 @@ mod tests {
         let spans = to_spans(&b, -1, plain);
         assert_eq!(spans.len(), 2);
         // The stored key of 3 (inverted, terminated) comes first.
-        let three = secantus_core::sortkey::encode_value_directed(&Bson::Int32(3), -1, None)
-            .unwrap();
+        let three =
+            secantus_core::sortkey::encode_value_directed(&Bson::Int32(3), -1, None).unwrap();
         assert_eq!(spans[0].lo, Some(three));
     }
 }

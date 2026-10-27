@@ -815,9 +815,9 @@ fn mentions_geo(filter: &Document) -> bool {
             _ => false,
         }
     }
-    filter.iter().any(|(k, v)| {
-        matches!(k.as_str(), "$geoWithin" | "$geoIntersects" | "$within") || walk(v)
-    })
+    filter
+        .iter()
+        .any(|(k, v)| matches!(k.as_str(), "$geoWithin" | "$geoIntersects" | "$within") || walk(v))
 }
 
 /// What a `find` asks of its plan beyond its query (`min` / `max`,

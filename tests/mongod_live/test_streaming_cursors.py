@@ -322,11 +322,7 @@ def min_max_compound_descending(cl: Any) -> list:
         c.insert_one({"_id": 21, "x": 0, "y": 7})
 
     cur = (
-        c.find()
-        .hint("x_1_y_-1")
-        .min([("x", 0), ("y", 6)])
-        .max([("x", 2), ("y", 5)])
-        .batch_size(2)
+        c.find().hint("x_1_y_-1").min([("x", 0), ("y", 6)]).max([("x", 2), ("y", 5)]).batch_size(2)
     )
     return _ids(_read(cur, 2, writes))
 
@@ -402,6 +398,22 @@ def keys_sort_of_an_or(cl: Any) -> list:
 
 def document_sort(cl: Any) -> list:
     return _keys_sort(cl, {"a": {"$gt": 0}}, [("z", 1), ("c", 1)])
+
+
+def keys_sort_under_a_collation(cl: Any) -> list:
+    """The keys of an index without the command's collation, sorted under
+    it below the FETCH: equal under strength 2, they keep the scan's order."""
+    c = _coll(cl)
+    words = ["ab", "Ac", "aB", "b", "AD", "a", "Ae", "abc", "x", "A"]
+    c.insert_many([{"_id": i, "w": w} for i, w in enumerate(words)])
+    c.create_index("w")
+
+    def writes() -> None:
+        c.delete_one({"_id": 0})
+        c.insert_one({"_id": 20, "w": "aa"})
+
+    cur = c.find({"w": {"$regex": "^a"}}, collation=COLLATION).sort("w", -1).batch_size(1)
+    return _ids(_read(cur, 1, writes))
 
 
 def id_documents(cl: Any) -> list:
@@ -485,6 +497,7 @@ SCENARIOS = [
     keys_sort,
     keys_sort_of_an_or,
     document_sort,
+    keys_sort_under_a_collation,
     id_documents,
     id_documents_in_a_range,
     aggregate_under_notablescan,

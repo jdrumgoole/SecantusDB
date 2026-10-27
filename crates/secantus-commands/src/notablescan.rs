@@ -62,6 +62,8 @@ pub(crate) struct Shown<'a> {
     pub skip: Option<i64>,
     pub limit: Option<i64>,
     pub collation: Option<Document>,
+    /// A `find`'s `batchSize`.
+    pub batch_size: Option<i64>,
 }
 
 impl Read<'_> {
@@ -76,6 +78,7 @@ impl Read<'_> {
             skip: self.shown.skip,
             limit: self.shown.limit,
             collation: self.shown.collation.as_ref(),
+            batch_size: self.shown.batch_size,
         }
     }
 
@@ -132,6 +135,7 @@ pub(crate) fn refusal(
         skip: shown.skip,
         limit: shown.limit,
         collation: shown.collation.as_ref(),
+        batch_size: shown.batch_size,
     };
     CommandError::new(291, "NoQueryExecutionPlans", query.planner_error(reason))
 }

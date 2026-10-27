@@ -15,7 +15,9 @@ fn client(server: &Server) -> Client {
 }
 
 fn coll(server: &Server, name: &str) -> Collection<Document> {
-    client(server).database("rm080").collection::<Document>(name)
+    client(server)
+        .database("rm080")
+        .collection::<Document>(name)
 }
 
 fn index(c: &Collection<Document>, keys: Document, options: Option<IndexOptions>) {
@@ -36,7 +38,9 @@ fn rest(cursor: Cursor<Document>) -> Vec<Document> {
 }
 
 fn ids(docs: &[Document]) -> Vec<Bson> {
-    docs.iter().map(|d| d.get("_id").cloned().unwrap()).collect()
+    docs.iter()
+        .map(|d| d.get("_id").cloned().unwrap())
+        .collect()
 }
 
 fn ints(v: &[i32]) -> Vec<Bson> {
@@ -56,11 +60,19 @@ fn a_descending_index_of_strings_reads_on() {
     let server = Server::start().expect("start");
     let c = coll(&server, "desc");
     let vals = ["a", "ab", "abc", "b", "ba", "c"];
-    c.insert_many(vals.iter().enumerate().map(|(i, s)| doc! {"_id": i as i32, "s": *s}))
+    c.insert_many(
+        vals.iter()
+            .enumerate()
+            .map(|(i, s)| doc! {"_id": i as i32, "s": *s}),
+    )
+    .run()
+    .unwrap();
+    index(&c, doc! {"s": -1}, None);
+    let mut cur = c
+        .find(doc! {"s": {"$gte": ""}})
+        .batch_size(2)
         .run()
         .unwrap();
-    index(&c, doc! {"s": -1}, None);
-    let mut cur = c.find(doc! {"s": {"$gte": ""}}).batch_size(2).run().unwrap();
     let mut got = take(&mut cur, 2);
     c.insert_one(doc! {"_id": 10, "s": "bb"}).run().unwrap();
     c.insert_one(doc! {"_id": 11, "s": "aba"}).run().unwrap();
@@ -81,11 +93,20 @@ fn a_descending_index_read_backward_reads_on() {
     let server = Server::start().expect("start");
     let c = coll(&server, "descback");
     let vals = ["a", "ab", "abc", "b", "ba", "c", ""];
-    c.insert_many(vals.iter().enumerate().map(|(i, s)| doc! {"_id": i as i32, "s": *s}))
+    c.insert_many(
+        vals.iter()
+            .enumerate()
+            .map(|(i, s)| doc! {"_id": i as i32, "s": *s}),
+    )
+    .run()
+    .unwrap();
+    index(&c, doc! {"s": -1}, None);
+    let mut cur = c
+        .find(doc! {})
+        .sort(doc! {"s": 1})
+        .batch_size(2)
         .run()
         .unwrap();
-    index(&c, doc! {"s": -1}, None);
-    let mut cur = c.find(doc! {}).sort(doc! {"s": 1}).batch_size(2).run().unwrap();
     let mut got = take(&mut cur, 2);
     c.insert_one(doc! {"_id": 11, "s": "aa"}).run().unwrap();
     c.insert_one(doc! {"_id": 12, "s": ""}).run().unwrap();
@@ -110,12 +131,18 @@ fn a_multikey_index_reads_on() {
     .run()
     .unwrap();
     index(&c, doc! {"t": 1}, None);
-    let mut cur = c.find(doc! {"t": {"$gte": "a"}}).batch_size(2).run().unwrap();
+    let mut cur = c
+        .find(doc! {"t": {"$gte": "a"}})
+        .batch_size(2)
+        .run()
+        .unwrap();
     let mut got = take(&mut cur, 2);
     c.update_one(doc! {"_id": 2}, doc! {"$push": {"t": "y"}})
         .run()
         .unwrap();
-    c.insert_one(doc! {"_id": 6, "t": ["c", "q"]}).run().unwrap();
+    c.insert_one(doc! {"_id": 6, "t": ["c", "q"]})
+        .run()
+        .unwrap();
     c.update_one(doc! {"_id": 4}, doc! {"$set": {"t": ["0"]}})
         .run()
         .unwrap();
@@ -134,7 +161,12 @@ fn a_multikey_index_reads_on() {
     .run()
     .unwrap();
     index(&c, doc! {"t": 1}, None);
-    let mut cur = c.find(doc! {}).hint(Hint::Keys(doc! {"t": 1})).batch_size(1).run().unwrap();
+    let mut cur = c
+        .find(doc! {})
+        .hint(Hint::Keys(doc! {"t": 1}))
+        .batch_size(1)
+        .run()
+        .unwrap();
     let mut got = take(&mut cur, 1);
     c.insert_one(doc! {"_id": 7, "t": []}).run().unwrap();
     c.insert_one(doc! {"_id": 8, "t": [[2]]}).run().unwrap();
@@ -165,8 +197,12 @@ fn a_missing_leaf_is_read_at_null() {
         .run()
         .unwrap();
     let mut got = take(&mut cur, 1);
-    c.insert_one(doc! {"_id": 6, "a": [{"c": 1}]}).run().unwrap();
-    c.insert_one(doc! {"_id": 7, "a": [{"b": 6}]}).run().unwrap();
+    c.insert_one(doc! {"_id": 6, "a": [{"c": 1}]})
+        .run()
+        .unwrap();
+    c.insert_one(doc! {"_id": 7, "a": [{"b": 6}]})
+        .run()
+        .unwrap();
     got.extend(rest(cur));
     assert_eq!(ids(&got), ints(&[1, 5, 6, 2, 4, 3, 7]));
 }
@@ -181,9 +217,13 @@ fn a_collated_index_of_strings_reads_on() {
         .strength(mongodb::options::CollationStrength::Secondary)
         .build();
     let vals = ["b", "A", "a", "B", "é", "e", "ab", "Ab", "c"];
-    c.insert_many(vals.iter().enumerate().map(|(i, s)| doc! {"_id": i as i32, "s": *s}))
-        .run()
-        .unwrap();
+    c.insert_many(
+        vals.iter()
+            .enumerate()
+            .map(|(i, s)| doc! {"_id": i as i32, "s": *s}),
+    )
+    .run()
+    .unwrap();
     index(
         &c,
         doc! {"s": 1},
@@ -220,12 +260,18 @@ fn or_and_sort_merge_plans_read_on() {
         .run()
         .unwrap();
     let mut got = take(&mut cur, 2);
-    c.insert_one(doc! {"_id": 20, "a": 3.5, "b": 100}).run().unwrap();
-    c.insert_one(doc! {"_id": 21, "a": -1, "b": 100}).run().unwrap();
+    c.insert_one(doc! {"_id": 20, "a": 3.5, "b": 100})
+        .run()
+        .unwrap();
+    c.insert_one(doc! {"_id": 21, "a": -1, "b": 100})
+        .run()
+        .unwrap();
     c.update_one(doc! {"_id": 0}, doc! {"$set": {"b": 0}})
         .run()
         .unwrap();
-    c.insert_one(doc! {"_id": 22, "a": 100, "b": 1}).run().unwrap();
+    c.insert_one(doc! {"_id": 22, "a": 100, "b": 1})
+        .run()
+        .unwrap();
     got.extend(rest(cur));
     assert_eq!(ids(&got), ints(&[0, 1, 2, 3, 20, 9, 22, 8]));
 
@@ -241,8 +287,12 @@ fn or_and_sort_merge_plans_read_on() {
         .run()
         .unwrap();
     let mut got = take(&mut cur, 2);
-    c.insert_one(doc! {"_id": 20, "a": 0, "c": 2.5}).run().unwrap();
-    c.insert_one(doc! {"_id": 21, "a": 1, "c": 0.5}).run().unwrap();
+    c.insert_one(doc! {"_id": 20, "a": 0, "c": 2.5})
+        .run()
+        .unwrap();
+    c.insert_one(doc! {"_id": 21, "a": 1, "c": 0.5})
+        .run()
+        .unwrap();
     c.delete_one(doc! {"_id": 4}).run().unwrap();
     got.extend(rest(cur));
     assert_eq!(ids(&got), ints(&[0, 1, 3, 6, 7, 9, 10]));
@@ -338,7 +388,9 @@ fn return_key_and_show_record_id_read_on() {
     c.insert_one(doc! {"_id": 20, "x": 4.5}).run().unwrap();
     got.extend(rest(cur));
     assert_eq!(ids(&got), ints(&[1, 2, 3, 4, 20, 5]));
-    assert!(got.iter().all(|d| matches!(d.get("$recordId"), Some(Bson::Int64(_)))));
+    assert!(got
+        .iter()
+        .all(|d| matches!(d.get("$recordId"), Some(Bson::Int64(_)))));
 }
 
 /// A sort of index keys below the FETCH reads every key for the first
@@ -386,7 +438,12 @@ fn the_id_index_of_documents_reads_on() {
     c.insert_many((0..5).map(|i| doc! {"_id": {"a": i}}))
         .run()
         .unwrap();
-    let mut cur = c.find(doc! {}).sort(doc! {"_id": 1}).batch_size(2).run().unwrap();
+    let mut cur = c
+        .find(doc! {})
+        .sort(doc! {"_id": 1})
+        .batch_size(2)
+        .run()
+        .unwrap();
     let mut got = take(&mut cur, 2);
     c.insert_one(doc! {"_id": {"a": 3.5}}).run().unwrap();
     c.insert_one(doc! {"_id": {"a": 0.5}}).run().unwrap();

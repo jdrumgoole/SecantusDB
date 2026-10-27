@@ -1813,7 +1813,11 @@ fn wrap(a: Access, q: &Query) -> Node {
     // A sort on fields the index holds runs on the keys, below the fetch;
     // over an `$or` of scans, when every scan's index holds them (mongod
     // 8.2.11: `FETCH <- SORT <- OR <- IXSCAN...`).
-    fn keys_hold(node: &Node, s: &Document, in_key: &dyn Fn(&Document, &IndexInfo) -> bool) -> bool {
+    fn keys_hold(
+        node: &Node,
+        s: &Document,
+        in_key: &dyn Fn(&Document, &IndexInfo) -> bool,
+    ) -> bool {
         match node {
             Node::IxScan(ix) => in_key(s, &ix.index),
             Node::Or(inputs) => inputs.iter().all(|i| keys_hold(i, s, in_key)),

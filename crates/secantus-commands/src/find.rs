@@ -683,6 +683,7 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             skip: doc.get("skip").and_then(as_i64),
             limit: doc.get("limit").and_then(as_i64),
             collation: doc.get_document("collation").ok().cloned(),
+            batch_size: doc.get("batchSize").and_then(as_i64),
         },
     };
     read.check_hint(storage, &ctx.db_name)?;
@@ -700,9 +701,19 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .get("max")
         .and_then(Bson::as_document)
         .filter(|d| !d.is_empty());
-    if min_doc.is_some() || max_doc.is_some() {
-        check_min_max(min_doc, max_doc, hint, storage, &ctx.db_name, &coll)?;
-    }
+    let min_max_key = if min_doc.is_some() || max_doc.is_some() {
+        Some(check_min_max(
+            min_doc,
+            max_doc,
+            hint,
+            storage,
+            &ctx.db_name,
+            &coll,
+            &read.canonical(&ctx.db_name),
+        )?)
+    } else {
+        None
+    };
     // A projection's `$meta` streams when it asks for what a streamed read
     // keeps: each document's RecordId and the key it was found at.
     let metas_stream = |p: &Document| {
@@ -722,7 +733,9 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         && exists
         && (min_doc.is_some() == doc.contains_key("min"))
         && (max_doc.is_some() == doc.contains_key("max"))
-        && !doc.get_document("projection").is_ok_and(|p| !metas_stream(p))
+        && !doc
+            .get_document("projection")
+            .is_ok_and(|p| !metas_stream(p))
         && (natural_hint.is_some()
             || !matches!(doc.get("sort"), Some(Bson::Document(given))
                 if !given.is_empty() && !crate::explain::order::plain_sort(given)));
@@ -858,16 +871,8 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // evaluated on the hinted index's key — applied to the index-ordered fetch
     // before skip/limit. (pymongo translates the legacy `$min`/`$max`/`$query`
     // filter wrapper into these top-level fields.)
-    let min_b = doc
-        .get("min")
-        .and_then(Bson::as_document)
-        .filter(|d| !d.is_empty());
-    let max_b = doc
-        .get("max")
-        .and_then(Bson::as_document)
-        .filter(|d| !d.is_empty());
-    if min_b.is_some() || max_b.is_some() {
-        docs = apply_min_max(docs, min_b, max_b, hint, storage, &ctx.db_name, &coll)?;
+    if let Some(key_spec) = &min_max_key {
+        docs = apply_min_max(docs, min_doc, max_doc, key_spec)?;
     }
 
     // skip / limit applied after the sorted fetch (the storage returns the full
@@ -1343,13 +1348,7 @@ fn shape_streamed(
                 }
                 out
             } else {
-                project_to_docs(
-                    docs,
-                    spec,
-                    &cursor.filter,
-                    &cursor.vars,
-                    &cursor.ns,
-                )?
+                project_to_docs(docs, spec, &cursor.filter, &cursor.vars, &cursor.ns)?
             };
             for (i, out) in projected.iter_mut().enumerate() {
                 for (field, meta) in &metas {
@@ -1476,9 +1475,9 @@ fn stream_find(
         keys: asked.return_key || wants_index_key,
         min: asked.min,
         max: asked.max,
+        collation: asked.collation,
     };
     let Some(stream) = crate::explain::stream::Stream::of_plan_with(
-        storage.as_ref(),
         &plan,
         &ctx.db_name,
         asked.coll,
@@ -1825,29 +1824,25 @@ fn tuple_cmp(
     Ok(Ordering::Equal)
 }
 
-/// A `min` / `max` refusal, under the prefix mongod's planner gives it.
-fn min_max_error(code: i32, ns: &str, reason: &str) -> CommandError {
+/// A `min` / `max` refusal, in mongod's planner's words for the query
+/// (RM-345: the query tree, sort, projection and paging it prints).
+fn min_max_error(code: i32, query: &crate::explain::CanonicalQuery, reason: &str) -> CommandError {
     CommandError::new(
         code,
         crate::util::error_code_name(code),
-        format!("error processing query: ns={ns} planner returned error :: caused by :: {reason}"),
+        query.planner_error(reason),
     )
 }
 
 /// Filter `docs` (already index-ordered) by the `min` (inclusive) / `max`
 /// (exclusive) bounds on the hinted index's keys.
-#[allow(clippy::too_many_arguments)]
 fn apply_min_max(
     docs: Vec<Vec<u8>>,
     min: Option<&Document>,
     max: Option<&Document>,
-    hint: Option<&Bson>,
-    storage: &dyn crate::storage::Storage,
-    db: &str,
-    coll: &str,
+    key_spec: &Document,
 ) -> Result<Vec<Vec<u8>>, CommandError> {
     use std::cmp::Ordering;
-    let key_spec = check_min_max(min, max, hint, storage, db, coll)?;
     let index_fields: Vec<&String> = key_spec.keys().collect();
     let width = min
         .map_or(0, Document::len)
@@ -1867,11 +1862,11 @@ fn apply_min_max(
         let mut keep = false;
         for key in index_key_tuples(&d, fields) {
             let above = match min {
-                Some(m) => tuple_cmp(&key, m, &key_spec)? != Ordering::Less,
+                Some(m) => tuple_cmp(&key, m, key_spec)? != Ordering::Less,
                 None => true,
             };
             let below = match max {
-                Some(m) => tuple_cmp(&key, m, &key_spec)? == Ordering::Less,
+                Some(m) => tuple_cmp(&key, m, key_spec)? == Ordering::Less,
                 None => true,
             };
             if above && below {
@@ -1887,9 +1882,9 @@ fn apply_min_max(
 }
 
 /// What mongod refuses about `min` / `max` before it reads: no hint, a
-/// `$natural` hint, bounds that are not a prefix of the hinted index's key,
-/// and a `min` not below `max`. The hinted index's key pattern when they
-/// pass.
+/// `$natural` hint, bounds that do not name the hinted index's key fields in
+/// its order, and a `min` not below `max`. The hinted index's key pattern
+/// when they pass.
 fn check_min_max(
     min: Option<&Document>,
     max: Option<&Document>,
@@ -1897,35 +1892,33 @@ fn check_min_max(
     storage: &dyn crate::storage::Storage,
     db: &str,
     coll: &str,
+    query: &crate::explain::CanonicalQuery,
 ) -> Result<Document, CommandError> {
     use std::cmp::Ordering;
-    let ns = format!("{db}.{coll}");
     let hint = hint.ok_or_else(|| {
         min_max_error(
             291,
-            &ns,
+            query,
             "When using min()/max() a hint of which index to use must be provided",
         )
     })?;
     if matches!(hint, Bson::Document(h) if h.contains_key("$natural")) {
         return Err(min_max_error(
             291,
-            &ns,
+            query,
             "min and max are incompatible with $natural",
         ));
     }
     let key_spec = resolve_index_key(storage, db, coll, hint)?;
-    // Each bound's fields must be a leading prefix of the hinted index's key,
-    // in the same order.
+    // Each bound names every field of the hinted index's key, in its order:
+    // mongod 8.2.11 refuses a prefix with 51174 too (RM-345).
     let index_fields: Vec<&String> = key_spec.keys().collect();
     for bound in [min, max].into_iter().flatten() {
         let bf: Vec<&String> = bound.keys().collect();
-        let prefix_match =
-            bf.len() <= index_fields.len() && (0..bf.len()).all(|i| bf[i] == index_fields[i]);
-        if !prefix_match {
+        if bf != index_fields {
             return Err(min_max_error(
                 51174,
-                &ns,
+                query,
                 "The index chosen is not compatible with min/max",
             ));
         }
@@ -1935,7 +1928,7 @@ fn check_min_max(
         if lo.len() == hi.len() && tuple_cmp(&low, hi, &key_spec)? != Ordering::Less {
             return Err(min_max_error(
                 51175,
-                &ns,
+                query,
                 "The value provided for min() does not come before the value provided for \
                  max() in the hinted index",
             ));

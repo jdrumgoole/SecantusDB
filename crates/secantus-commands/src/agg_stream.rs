@@ -220,20 +220,32 @@ fn build(
     } else {
         Default::default()
     };
+    // `{$meta: "sortKey"}`: from the `$sort` the plan reads in order, worked
+    // out for each document as a `$sort` stage leaves it (`agg_meta`).
+    if stages
+        .iter()
+        .any(|s| crate::agg_meta::mentions(s, "sortKey"))
+    {
+        match &query.sort {
+            Some(sort) => {
+                let mut with = vec![Bson::Document(doc! { "$sort": sort.clone() })];
+                with.append(&mut stages);
+                crate::agg_meta::rewrite_sort_metadata(&mut with);
+                // The plan sorted: what follows the `$sort` stays.
+                with.remove(0);
+                stages = with;
+            }
+            None => crate::agg_meta::rewrite_sort_metadata(&mut stages),
+        }
+    }
     let opts = crate::explain::stream::Options {
         keys: metas.index_key,
+        collation: ask.collation,
         ..Default::default()
     };
-    let Some(source) = Stream::of_plan_with(
-        storage,
-        &plan,
-        ask.db,
-        ask.coll,
-        &query.filter,
-        ask.vars,
-        &opts,
-    )
-    .map_err(read_error)?
+    let Some(source) =
+        Stream::of_plan_with(&plan, ask.db, ask.coll, &query.filter, ask.vars, &opts)
+            .map_err(read_error)?
     else {
         return Ok(None);
     };
@@ -270,7 +282,7 @@ fn distinct_group(
         filter,
     } = read;
     let Some(source) =
-        Stream::of_plan(storage, &plan, ask.db, ask.coll, &filter, ask.vars).map_err(read_error)?
+        Stream::of_plan(&plan, ask.db, ask.coll, &filter, ask.vars).map_err(read_error)?
     else {
         return Ok(None);
     };
@@ -318,12 +330,12 @@ fn mentions_meta(v: &Bson) -> bool {
     }
 }
 
-/// Every `$meta` in `v` asks for `recordId` or `indexKey`.
+/// Every `$meta` in `v` asks for `recordId`, `indexKey` or `sortKey`.
 fn only_kept_meta(v: &Bson) -> bool {
     match v {
         Bson::Document(d) => d.iter().all(|(k, v)| {
             if k == "$meta" {
-                matches!(v, Bson::String(s) if s == "recordId" || s == "indexKey")
+                matches!(v, Bson::String(s) if s == "recordId" || s == "indexKey" || s == "sortKey")
             } else {
                 only_kept_meta(v)
             }

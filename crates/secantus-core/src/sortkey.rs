@@ -427,7 +427,13 @@ pub fn with_id_key_format_1<T>(f: impl FnOnce() -> T) -> T {
 pub fn may_be_format1_id_key(key: &[u8]) -> bool {
     matches!(
         key.first(),
-        Some(&RANK_DOCUMENT | &RANK_ARRAY | &RANK_BINDATA | &RANK_JAVASCRIPT | &RANK_JAVASCRIPT_SCOPE)
+        Some(
+            &RANK_DOCUMENT
+                | &RANK_ARRAY
+                | &RANK_BINDATA
+                | &RANK_JAVASCRIPT
+                | &RANK_JAVASCRIPT_SCOPE
+        )
     )
 }
 
@@ -1107,9 +1113,18 @@ mod tests {
         d.to_writer(&mut raw).unwrap();
         let mut old = vec![RANK_DOCUMENT];
         old.extend(escape(&raw));
-        assert_eq!(encode_id_key_format_1(&Bson::Document(d.clone())).unwrap(), old);
-        assert_eq!(with_id_key_format_1(|| encode_id_key(&Bson::Document(d.clone()))).unwrap(), old);
-        assert_eq!(encode_id_key(&Bson::Document(d.clone())).unwrap(), ev(Bson::Document(d)));
+        assert_eq!(
+            encode_id_key_format_1(&Bson::Document(d.clone())).unwrap(),
+            old
+        );
+        assert_eq!(
+            with_id_key_format_1(|| encode_id_key(&Bson::Document(d.clone()))).unwrap(),
+            old
+        );
+        assert_eq!(
+            encode_id_key(&Bson::Document(d.clone())).unwrap(),
+            ev(Bson::Document(d))
+        );
         assert_eq!(encode_id_key(&Bson::Int32(5)).unwrap(), ev(Bson::Int32(5)));
         // A longer document is not a larger one.
         let small = encode_id_key(&bson::bson!({"a": 2, "b": [3]})).unwrap();
@@ -1124,7 +1139,9 @@ mod tests {
             encode_id_key(&bin).unwrap()
         });
         assert_eq!(mongod, pg);
-        assert!(may_be_format1_id_key(&encode_id_key_format_1(&bin).unwrap()));
+        assert!(may_be_format1_id_key(
+            &encode_id_key_format_1(&bin).unwrap()
+        ));
         assert!(!may_be_format1_id_key(&ev(Bson::Int32(5))));
     }
 

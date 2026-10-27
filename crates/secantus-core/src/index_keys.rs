@@ -128,7 +128,10 @@ mod tests {
         );
         assert_eq!(keys(doc! {}, "a", false), vec![Bson::Null]);
         let t = field_keys(&doc! {"t": [1, [2]]}, "t", false);
-        assert_eq!(t.mongod, vec![Bson::Int32(1), Bson::Array(vec![Bson::Int32(2)])]);
+        assert_eq!(
+            t.mongod,
+            vec![Bson::Int32(1), Bson::Array(vec![Bson::Int32(2)])]
+        );
         assert_eq!(t.whole_arrays.len(), 1);
         assert!(t.multikey);
     }
