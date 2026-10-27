@@ -2415,8 +2415,7 @@ def test_a_join_on_two_equivalence_classes_is_searched(pg: Any) -> None:
         for t, (mb, mc) in enumerate([(7, 5), (5, 3), (3, 4), (4, 6), (6, 5)]):
             pg.execute(f"create table rp028_s{t} (a int, b int, c int)")
             pg.execute(
-                f"insert into rp028_s{t} select i, i % {mb}, i % {mc}"
-                " from generate_series(1, 20) i"
+                f"insert into rp028_s{t} select i, i % {mb}, i % {mc} from generate_series(1, 20) i"
             )
         got = pg_answer(
             pg,

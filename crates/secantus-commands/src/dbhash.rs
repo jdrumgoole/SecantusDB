@@ -120,7 +120,7 @@ pub fn db_hash(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 });
                 let mut md5 = Md5::new();
                 for d in &docs {
-                    md5.update(bson::to_vec(d).map_err(|e| {
+                    md5.update(crate::bsondoc::to_vec(d).map_err(|e| {
                         CommandError::new(8, "UnknownError", format!("dbHash: {e}"))
                     })?);
                 }
@@ -199,7 +199,7 @@ pub fn db_hash(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let mut md5 = Md5::new();
         for definition in &definitions {
             md5.update(
-                bson::to_vec(definition)
+                crate::bsondoc::to_vec(definition)
                     .map_err(|e| CommandError::new(8, "UnknownError", format!("dbHash: {e}")))?,
             );
         }

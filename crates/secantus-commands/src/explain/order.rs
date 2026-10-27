@@ -914,6 +914,14 @@ fn untried_plan(storage: &dyn Storage, ask: &Ask) -> Option<Node> {
     Some(plan::plan(&query, &catalog))
 }
 
+/// Whether the plan for `ask` sorts in memory (a blocking `SORT`) rather
+/// than reading its sort from an index. With no index at all to plan over,
+/// it does.
+pub(crate) fn sorts_in_memory(storage: &dyn Storage, ask: &Ask) -> bool {
+    ask.sort.is_some_and(|s| !s.is_empty())
+        && untried_plan(storage, ask).is_none_or(|plan| has_sort(&plan))
+}
+
 /// The names of the indexes the plan for `ask` reads. A cursor left open
 /// over that plan is killed when one of them is dropped, as mongod's is.
 pub(crate) fn plan_indexes(storage: &dyn Storage, ask: &Ask) -> Vec<String> {

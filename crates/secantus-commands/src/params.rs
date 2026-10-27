@@ -100,6 +100,17 @@ pub enum ParamKind {
     /// (`ingressConnectionEstablishmentBurstCapacitySecs`). Any number type is
     /// taken; a bool, a string or null is not (mongod 8.2.11).
     DoubleAboveZero,
+    /// A whole number greater than the given value; `true` for a 32-bit
+    /// one (the aggregation memory budgets: 0, RM-211).
+    IntAbove(i64, bool),
+    /// A 64-bit whole number of at least the given value
+    /// (`internalLookupStageIntermediateDocumentMaxSizeBytes`, 16793600).
+    Int64AtLeast(i64),
+    /// `maxIndexBuildMemoryUsageMegabytes`: any number, stored as a double,
+    /// greater than zero and at least 50 (mongod 8.2.11, 2026-10-26: 0 and
+    /// -1 are "must be a positive value", 1 and 49 "Must be above minimum
+    /// of 50 MB", a fraction is kept).
+    BuildMemoryMegabytes,
 }
 
 /// `(name, kind)` for every runtime-settable parameter.
@@ -153,6 +164,53 @@ const SETTABLE: &[(&str, ParamKind)] = &[
     (
         "ingressConnectionEstablishmentMaxQueueDepth",
         ParamKind::Int32AtLeast(0),
+    ),
+    // The aggregation memory budgets (`secantus_core::memlimit::Budgets`),
+    // each read by every `aggregate` (RM-211). Types and bounds measured
+    // on mongod 8.2.11, 2026-10-26: `internalQueryMaxPushBytes` is an int,
+    // the rest longs; the `$lookup` result is at least 16793600 bytes.
+    (
+        "internalDocumentSourceBucketAutoMaxMemoryBytes",
+        ParamKind::IntAbove(0, false),
+    ),
+    (
+        "internalDocumentSourceGroupMaxMemoryBytes",
+        ParamKind::IntAbove(0, false),
+    ),
+    (
+        "internalDocumentSourceSetWindowFieldsMaxMemoryBytes",
+        ParamKind::IntAbove(0, false),
+    ),
+    (
+        "internalLookupStageIntermediateDocumentMaxSizeBytes",
+        ParamKind::Int64AtLeast(16_793_600),
+    ),
+    (
+        "internalQueryFacetMaxOutputDocSizeBytes",
+        ParamKind::IntAbove(0, false),
+    ),
+    (
+        "internalQueryMaxAddToSetBytes",
+        ParamKind::IntAbove(0, false),
+    ),
+    (
+        "internalQueryMaxConcatArraysBytes",
+        ParamKind::IntAbove(0, false),
+    ),
+    (
+        "internalQueryMaxBlockingSortMemoryUsageBytes",
+        ParamKind::Int32AtLeast(0),
+    ),
+    ("internalQueryMaxPushBytes", ParamKind::IntAbove(0, true)),
+    // An index build's sorters keep at most this much in memory before
+    // spilling to `<dbpath>/_tmp` (RM-187), read by every build.
+    (
+        "maxIndexBuildMemoryUsageMegabytes",
+        ParamKind::BuildMemoryMegabytes,
+    ),
+    (
+        "internalQueryMaxSetUnionBytes",
+        ParamKind::IntAbove(0, false),
     ),
 ];
 
@@ -356,6 +414,20 @@ impl ServerParams {
         self.values.lock().ok()?.get(name).cloned()
     }
 
+    /// The aggregation memory budgets, as `setParameter` left them (RM-211).
+    pub fn budgets(&self) -> secantus_core::memlimit::Budgets {
+        let mut budgets = secantus_core::memlimit::Budgets::default();
+        for name in secantus_core::memlimit::Budgets::PARAMETERS {
+            let bytes = match self.get(name) {
+                Some(Bson::Int32(n)) => i64::from(n),
+                Some(Bson::Int64(n)) => n,
+                _ => continue,
+            };
+            budgets.set(name, usize::try_from(bytes).unwrap_or(usize::MAX));
+        }
+        budgets
+    }
+
     /// The SCRAM-SHA-1 and SCRAM-SHA-256 iteration counts `setParameter`
     /// set, each `None` while it holds its default.
     pub fn scram_iterations(&self) -> (Option<u32>, Option<u32>) {
@@ -432,6 +504,19 @@ fn coerce(kind: ParamKind, value: &Bson) -> Option<Bson> {
             Some(d) if d > 0.0 => Some(Bson::Double(d)),
             _ => None,
         },
+        ParamKind::BuildMemoryMegabytes => match double(value) {
+            Some(d) if d >= 50.0 => Some(Bson::Double(d)),
+            _ => None,
+        },
+        ParamKind::IntAbove(min, int32) => match integral(value, int32) {
+            Ok(n) if n > min && int32 => Some(Bson::Int32(n as i32)),
+            Ok(n) if n > min => Some(Bson::Int64(n)),
+            _ => None,
+        },
+        ParamKind::Int64AtLeast(min) => match integral(value, false) {
+            Ok(n) if n >= min => Some(Bson::Int64(n)),
+            _ => None,
+        },
         ParamKind::PositiveInt => match whole(value) {
             Some(n) if n > 0 => Some(Bson::Int32(n.min(i64::from(i32::MAX)) as i32)),
             _ => None,
@@ -502,6 +587,17 @@ fn integral(value: &Bson, int32: bool) -> Result<i64, &'static str> {
 
 /// mongod's words for a value `coerce` refused (measured 8.2.11).
 fn refusal(kind: ParamKind, name: &str, value: &Bson) -> String {
+    let bound = match kind {
+        ParamKind::IntAbove(min, int32) => Some((min, int32, "greater than")),
+        ParamKind::Int64AtLeast(min) => Some((min, false, "greater than or equal to")),
+        _ => None,
+    };
+    if let Some((min, int32, relation)) = bound {
+        return match integral(value, int32) {
+            Err(why) => format!("Failed validating {name}: {why}"),
+            Ok(n) => format!("Invalid value for parameter {name}: {n} is not {relation} {min}"),
+        };
+    }
     let min = match kind {
         ParamKind::Int64 => Some(None),
         ParamKind::Int32AtLeast(min) => Some(Some(min)),
@@ -514,6 +610,13 @@ fn refusal(kind: ParamKind, name: &str, value: &Bson) -> String {
                 "Invalid value for parameter {name}: {n} is not greater than or equal to {}",
                 min.unwrap_or(1)
             ),
+        };
+    }
+    if kind == ParamKind::BuildMemoryMegabytes {
+        return match double(value) {
+            Some(d) if d <= 0.0 => format!("{name} must be a positive value"),
+            Some(_) => "Must be above minimum of 50 MB".to_string(),
+            None => format!("Failed validating {name}: Unable to coerce value to correct type"),
         };
     }
     if kind == ParamKind::DoubleAboveZero {
@@ -744,6 +847,46 @@ mod tests {
         assert_eq!(
             c.server_params.as_ref().unwrap().scram_iterations(),
             (Some(12000), Some(12000))
+        );
+    }
+
+    /// The aggregation memory budgets (mongod 8.2.11, 2026-10-26; RM-211):
+    /// above 0, the `$lookup` one at least 16793600, `internalQueryMaxPushBytes`
+    /// an int and the rest longs; and what is set is what `aggregate` reads.
+    #[test]
+    fn the_memory_budgets_coerce_and_refuse_as_mongod_does() {
+        let mut c = ctx();
+        let group = "internalDocumentSourceGroupMaxMemoryBytes";
+        set_parameter(&doc! {"setParameter": 1, group: 2.7}, &mut c).unwrap();
+        assert_eq!(
+            c.server_params.as_ref().unwrap().get(group),
+            Some(Bson::Int64(2))
+        );
+        assert_eq!(c.server_params.as_ref().unwrap().budgets().group, 2);
+        let e = set_parameter(&doc! {"setParameter": 1, group: 0}, &mut c).unwrap_err();
+        assert_eq!(
+            e.errmsg,
+            format!("Invalid value for parameter {group}: 0 is not greater than 0")
+        );
+        let push = "internalQueryMaxPushBytes";
+        let e = set_parameter(&doc! {"setParameter": 1, push: 1_i64 << 31}, &mut c).unwrap_err();
+        assert_eq!(
+            e.errmsg,
+            format!("Failed validating {push}: Out of bounds coercing to integral value")
+        );
+        set_parameter(&doc! {"setParameter": 1, push: true}, &mut c).unwrap();
+        assert_eq!(
+            c.server_params.as_ref().unwrap().get(push),
+            Some(Bson::Int32(1))
+        );
+        let lookup = "internalLookupStageIntermediateDocumentMaxSizeBytes";
+        let e = set_parameter(&doc! {"setParameter": 1, lookup: 16_793_599}, &mut c).unwrap_err();
+        assert_eq!(
+            e.errmsg,
+            format!(
+                "Invalid value for parameter {lookup}: 16793599 is not greater than or equal to \
+                 16793600"
+            )
         );
     }
 

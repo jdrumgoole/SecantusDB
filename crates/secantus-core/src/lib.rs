@@ -36,11 +36,14 @@ pub mod geoshape;
 pub mod heap;
 pub mod hybrid;
 pub mod logtime;
+pub mod memlimit;
 pub mod oid;
 pub mod projection;
 pub mod query;
+pub mod rawstr;
 pub mod s2legacy;
 pub mod sbe;
+pub mod sorter;
 pub mod sortkey;
 mod stl;
 pub(crate) mod timelib;
@@ -56,6 +59,7 @@ mod explain;
 pub mod expr_rewrite;
 mod fill;
 mod group;
+mod group_spill;
 mod hashed;
 mod jsonschema;
 mod numeric;
@@ -85,4 +89,6 @@ pub use numeric::{format_double_g, format_double_spec};
 // can decode just the top-level fields a `$group` reads from wide documents
 // ahead of the stage, instead of materializing every field. The `group` module
 // itself stays private.
-pub use group::{percentile_spec, pipeline_prefix_fields, referenced_top_level_fields};
+pub use group::{
+    downstream_fields, percentile_spec, pipeline_prefix_fields, referenced_top_level_fields,
+};

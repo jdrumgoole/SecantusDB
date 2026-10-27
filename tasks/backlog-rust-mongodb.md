@@ -663,17 +663,31 @@ about forty such points; these are the ones measured.
       name (`Fallback::mongo(code, msg)`) belongs.
       Backlog-ID: RM-226
       Verify: tests/backlog/test_rm_found_2026_10_21.py::test_window_spec_errors_carry_mongods_codes
-- [ ] **`killSessions` does not interrupt the command holding the session.**
-      mongod 8.2.11 interrupts a retryable update still running on the
-      session it kills: the update answers 11601 "operation was interrupted"
-      and does not apply. This server marks nothing: the update runs to the
-      end and applies. A command's kill flag is only polled between the
-      documents a scan reads, so interrupting one long evaluation, and
-      rolling a write back when it is killed, is the work; `killOp` has the
-      same limit. Found 2026-10-25 while fixing RM-230 (a retry now waits
-      for the attempt holding the session, so this is how a client ends one).
-      Backlog-ID: RM-313
-      Verify: tests/backlog/test_rm_found_2026_10_25.py::test_kill_sessions_interrupts_the_command_holding_the_session
+- [ ] **A multi-document write interrupted while it reads its candidates
+      writes nothing, where mongod keeps what it wrote.** mongod tests and
+      writes each document as its scan reaches it (a deleteMany a batch of
+      10 at a time), so one killed or out of `maxTimeMS` part-way has
+      written the documents before. This server reads every candidate before
+      it tests or writes one, and on a replica set first works out mongod's
+      order for a deleteMany by testing every document; an interrupt in
+      either leaves nothing written (mongod 8.2.11, 2026-10-27: a deleteMany
+      killed 1.5 s into 100 slow documents had deleted 20, this server 0; an
+      updateMany of 200,000 documents at `maxTimeMS: 5` had updated 1,536,
+      this server 0). An interrupt or a filter error once the documents are
+      read keeps the ones before, as mongod does (RM-313, RM-322). The work
+      is to stream the candidates into the write, and to carry the order's
+      tests into the delete rather than repeat them.
+      Backlog-ID: RM-323
+      Verify: tests/backlog/test_rm_found_2026_10_27.py::test_a_killed_delete_many_keeps_the_batches_it_deleted, tests/backlog/test_rm_found_2026_10_27.py::test_an_update_many_out_of_time_keeps_the_documents_it_updated
+- [ ] **`$currentOp` lists a running `bulkWrite` as the whole command.**
+      mongod 8.2.11 lists it as op `bulkWrite`, under the namespace of the
+      op it is running and that op as its `command` (`{update: 0, filter:
+      ...}` on `db.c`); this server lists op `command` on `admin.$cmd` with
+      the whole `bulkWrite` command. Found 2026-10-27 while comparing kills
+      (RM-313): a `$match` on the op's namespace finds mongod's and not this
+      server's.
+      Backlog-ID: RM-324
+      Verify: tests/backlog/test_rm_found_2026_10_27.py::test_current_op_lists_a_bulk_write_under_its_op
 - [ ] **`$near` returns documents tied at one distance in the macOS build's
       order, not the Linux build's.** mongod's builds disagree: for four
       points at distance 1, Linux x86-64 8.2.12 (CI) answers `[2, 1, 3, 0]`,
@@ -707,22 +721,56 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
   246 SnapshotUnavailable, by name, rather than answer as of now; without
   `atClusterTime` it reads the latest data, which is correct. `secantusd-rs`
   creates its stores the other way, mongod's (RM-210).
-- [ ] **Aggregation has no memory limits and nothing spills.** Over 110
-      one-megabyte documents mongod 8.2.11 refuses: `$group` with
-      `allowDiskUse: false` (292 QueryExceededMemoryLimitNoDiskUseAllowed),
-      an array past 100 MB from `$push` or `$addToSet` (146
-      ExceededMemoryLimit), `$setWindowFields` (5643011), a `$lookup`
-      result (4568) and `$facet` (4031700). This server runs every one,
-      holding it all in memory; `allowDiskUse` is only type-checked
-      (`aggregate.rs`). A blocking `$sort` already agrees. mongod's
-      mechanism is per-stage memory accounting with spilling to disk when
-      `allowDiskUse` permits it. **The cost is far past the data's size**
-      (measured 2026-10-21, debug build): the gap test's 110 MB of documents
-      take `secantusd-rs` to a 14.5 GB peak RSS, where mongod peaks at 90 MB
-      refusing them -- enough to kill a 16 GB CI runner, so CI's verifier
-      runs with `--skip RM-211`; run its gap test by hand.
-      Backlog-ID: RM-211
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_aggregation_memory_limits
+- [ ] **A spill's on-disk size is this server's file, not mongod's.**
+      The memory budgets spill as mongod 8.2.11 does -- the same spills,
+      records and bytes for a sort, a `$group` and a `$setWindowFields`
+      (RM-211, RM-315) -- but `spilledDataStorageSize` (the profile's
+      `sortSpilledDataStorageSize` / `groupSpilledDataStorageSize`, explain,
+      `serverStatus`'s `metrics.query`) is the size of this server's
+      uncompressed spill file. mongod's sorter compresses each run (130545
+      bytes for the 2461200 a 300-document sort spills) and a `$group` or
+      `$setWindowFields` spills to a WiredTiger table (4096 bytes).
+      Backlog-ID: RM-325
+      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_spill_storage_size
+- [ ] **A sort under a cursor stage reports its spills once, not per
+      batch.** When a query-layer sort feeds later stages through
+      mongod's cursor stage, 8.2.11's profile adds the sort's counters
+      again for every batch that stage reads: a `$setWindowFields` over 300
+      documents, whose sort spills 13 times (as its `explain` says), is
+      profiled with `sortSpills: 52` -- four batches of 32, 64, 128 and 256.
+      `metrics.query.sort.spillToDisk` also counts differently from the
+      spills (`+26` for a sort of 29). This server reports each sort once.
+      Backlog-ID: RM-326
+      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_sort_profile_per_batch
+- [ ] **`$setWindowFields` refuses at slightly the wrong budget for some
+      windows.** The partition cache and the functions are counted as mongod
+      8.2.11 counts them for whole-partition, `["unbounded", "current"]` and
+      `$shift` windows (exact, measured by bisecting the budget), but not
+      quite for others (measured against the macOS arm64 build): a removable
+      `[-5, 5]` `$sum` is refused 16 bytes above mongod's limit, `$rank` 5
+      bytes below it, a partitioned whole-partition window 458 bytes below,
+      and a removable `$push` of 400-byte strings 208 bytes above
+      (`5414201` / `5643011` in each case). The function's memory over a
+      window that drops documents is the part least measured. The sizes this
+      server uses are the Linux x86-64 build's, the exemplar; the macOS
+      build counts some accumulators differently (`$sum` 184, not 176).
+      Backlog-ID: RM-327
+      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_window_budget_residuals
+- [ ] **`explain` lacks the stages' own memory counters.** The spill
+      counters are there (a `SORT`'s, a `$sort`'s, a `$group`'s; RM-315), but
+      mongod 8.2.11 also lists a `$group`'s `maxAccumulatorMemoryUsageBytes`
+      and `totalOutputDataSizeBytes`, and shows `$setWindowFields` as the
+      `$_internalSetWindowFields` it runs, with `maxFunctionMemoryUsageBytes`,
+      `maxTotalMemoryUsageBytes` and its spill counters (with the `$sort` in
+      front of it in the cursor's plan). This server lists neither.
+      Backlog-ID: RM-328
+      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_explain_memory_counters
+- **Scope decision — SBE's `$concatArrays` refusal names a count mongod
+  never set.** Over its budget mongod 8.2.11 says "Concatentating array of
+  2 elements and N bytes with array of 87684434848907256 elements and M
+  bytes": the operand's element count is read from memory it never wrote.
+  This server gives the code and the byte counts as mongod computes them,
+  and the operand's length for that count.
 - `$convert` to binData subtype 2 (the deprecated "old binary") is
   written with the old format's inner length, as the bson crate writes
   every subtype-2 value. mongod 8.2.11 writes the bytes alone, which is not
@@ -753,7 +801,7 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
         options are not applied.
       Backlog-ID: RM-216
       Verify: none -- the missing fields are mongod's internal accounting; the registry's own tests are backlog_fixed
-- [ ] **Four commands mongod runs are 59 CommandNotFound here.**
+- [ ] **Three commands mongod runs are 59 CommandNotFound here.**
       mongod 8.2.11 (one-member replica set) answers each with success or
       an error of its own:
       - diagnostics: `getDiagnosticData` (mongod's FTDC sample);
@@ -761,12 +809,12 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
         is keyed by mongod's `queryShapeHash`, which is not a plain SHA-256
         of the shape's BSON -- the debug shape, representative literals and
         likely extra fields were tried, 2026-10-20 -- so the hash needs
-        mongod's own shape serialization first), `autoCompact` (needs
-        background compaction, which RM-192 lacks).
+        mongod's own shape serialization first).
 
       `filemd5` with `partialOk` is refused by name (115): its `md5state` is
-      mongod's own MD5 implementation's state. Thirteen of the original
-      seventeen landed 2026-10-20 (`applyOps`, `rotateCertificates`,
+      mongod's own MD5 implementation's state. `autoCompact` landed
+      2026-10-26 (RM-192's compaction, run in the background). Thirteen of
+      the original seventeen landed 2026-10-20 (`applyOps`, `rotateCertificates`,
       `validateDBMetadata`, `dbCheck`,
       `invalidateUserCache`, `replSetGetRBID`,
       `replSetFreeze`, `replSetMaintenance`, `dropConnections`,
@@ -786,14 +834,38 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       refuses `validateMode: "extraIndexKeysCheck"` (115).
       Backlog-ID: RM-219
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_commands_mongod_runs_are_commands_here
-- [ ] **A string that is not valid UTF-8 is refused.** An insert whose
-      string holds the bytes `0xff 0xfe` answers 1 "BSON error: utf-8
-      encoding error"; mongod 8.2.11 stores it (n: 1). Data mongod keeps is
-      refused, and data read back from a mongod dump could not be
-      restored. Reading strings as raw bytes where they are not inspected
-      would keep them.
+- [ ] **Text that is not UTF-8 outside a string value is still refused or
+      altered.** Since 2026-10-27 a string VALUE or a field NAME whose bytes
+      are not UTF-8 is kept, compared, indexed, matched and served byte for
+      byte (`bsondoc`'s carrier and escaped names;
+      `tests/mongod_live/test_invalid_utf8.py`). Left, each measured against
+      mongod 8.2.11:
+      - a collection (or database) name that is not UTF-8 is refused (73
+        "Collection name has invalid type string"); mongod creates it.
+        Storage keys its tables by a Rust `String` name;
+      - an error message that quotes such a string (`$convert`,
+        `$dateFromString`, `$toObjectId` ...) quotes it with U+FFFD for each
+        invalid sequence, where mongod writes the raw bytes; `$dateFromString`
+        then lists one "Unexpected character" per byte of each U+FFFD;
+      - JavaScript, a symbol, a regex, a DBPointer or JavaScript with a scope
+        whose text is not UTF-8 is refused (2 "invalid BSON in body");
+        mongod stores it;
+      - a NUL and two lowercase hex digits in a field name taken from a
+        string value elsewhere than `$setField`, `$rename` and a field path
+        (all three refuse it, as mongod does) would read as the escape of a
+        name that is not UTF-8. Not measured to happen: the other places a
+        string becomes a name refuse a NUL through `FieldPath`.
       Backlog-ID: RM-222
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_insert_string_with_invalid_utf8
+      Verify: tests/backlog/test_rm_222_invalid_utf8.py::test_collection_name_that_is_not_utf8, tests/backlog/test_rm_222_invalid_utf8.py::test_error_message_quotes_the_bytes, tests/backlog/test_rm_222_invalid_utf8.py::test_other_text_types_that_are_not_utf8
+- [ ] **A `$group` key that is an array sorts by its smallest element.**
+      `[{$group: {_id: "$s"}}, {$sort: {_id: 1}}]` over `s` values `["x",
+      "q"]`, `"b"`, `{x: 1}`, `"z"` returns `b, [x, q], z, {x: 1}`; mongod
+      8.2.11 returns `b, z, {x: 1}, [x, q]`, sorting the array as an array.
+      A find sort's rule (an array sorts by its smallest element ascending)
+      is applied to a `$sort` over a computed `_id`. Found 2026-10-27 while
+      working RM-222.
+      Backlog-ID: RM-329
+      Verify: tests/backlog/test_rm_222_invalid_utf8.py::test_sort_of_group_ids_that_are_arrays
 - [ ] **`local.oplog.rs` entries are not mongod's shape.** Since
       2026-10-20 an update (mongod's `$v: 2` diff, stored beside the
       change-stream description as `o.md`), a batch of inserts (one
@@ -803,32 +875,21 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       (`o2: {numRecords}`), a rename (`stayTemp`), a one-index
       `createIndexes` and a `dropIndexes` read as mongod 8.2.11 writes them,
       with its `t` and `v`, and a retryable insert, update or delete with
-      its session (`lsid`, `txnNumber`, `stmtId`, `prevOpTime`). Open:
-      - a `bulkWrite` command's writes carry no session (retryable
-        `insert` / `update` / `delete` / `findAndModify` carry theirs, a
-        `findAndModify` its `needsRetryImage` and its image in
-        `config.image_collection`, since 2026-10-20); and an image is never
-        deleted, where mongod deletes a session's image (an oplogged delete)
-        when its logical-session reaper expires the session, which this
-        server does not run;
-      - an index build over documents is one `createIndexes`, where mongod
-        writes, for the whole command's new indexes as ONE build (measured
-        8.2.11): an insert into `config.system.indexBuilds` (`{_id: build
-        uuid, collectionUUID, commitQuorum: "votingMembers", indexNames}`),
-        `startIndexBuild` (`{startIndexBuild: coll, indexBuildUUID,
-        indexes}`, with `ui`), an update adding `commitReadyMembers:
-        ["<host:port>"]`, then `commitIndexBuild` -- or, when the build
-        fails, `abortIndexBuild` with a `cause` (the error document, `ok:
-        false` first) -- and the row's delete. An empty collection, or one
-        the command creates, gets the single `createIndexes`. The commit has
-        to stay atomic with the catalog write (`commit_index`), the
-        handler's per-spec undo has to become one build's abort, and the
-        change-stream projector and replay have to read `commitIndexBuild`
-        as they read `createIndexes` now.
-      A tool that reads the oplog (`mongodump --oplog`, then
-      `mongorestore --oplogReplay`) gets entries mongod would not write.
+      its session (`lsid`, `txnNumber`, `stmtId`, `prevOpTime`). Since
+      2026-10-26 an index build over documents is mongod's two-phase build
+      in the oplog too (`config.system.indexBuilds` rows around
+      `startIndexBuild` and `commitIndexBuild`, or `abortIndexBuild` with
+      its cause; RM-187). Open: a `bulkWrite` command's writes carry no
+      session (retryable `insert` / `update` / `delete` / `findAndModify`
+      carry theirs, a `findAndModify` its `needsRetryImage` and its image in
+      `config.image_collection`, since 2026-10-20); and an image is never
+      deleted, where mongod deletes a session's image (an oplogged delete)
+      when its logical-session reaper expires the session, which this
+      server does not run. A tool that reads the oplog (`mongodump
+      --oplog`, then `mongorestore --oplogReplay`) gets entries mongod
+      would not write.
       Backlog-ID: RM-224
-      Verify: tests/backlog/test_rm_219_apply_ops.py::test_oplog_entries_have_mongods_shape
+      Verify: tests/backlog/test_rm_219_apply_ops.py::test_bulk_write_entries_carry_their_session
 
 ### 7.085 The shared Rust storage, audited -- 2026-10-20
 
@@ -838,43 +899,77 @@ mongod 8.2.11 with a `secantusd-rs` built from tree `af2629ec`; the rest
 were confirmed by reading the code path and need a fault no quick test can
 inject (a panic, a power loss, a failing checkpoint).
 
-- [ ] **An index build holds every write to its collection off until it
-      finishes.** The build is chunked now (fixed 2026-10-20: it had run as
-      one transaction and never returned under a small cache; at 32 MB it
-      builds over 300,000 300-byte documents in 4 s). But it still holds
-      the global storage lock and the collection lock from its first read
-      to its catalog row, so every DDL, and every write to that collection,
-      waits for the whole build. mongod 8.2.11's build lets writes go on: a
-      side table records the writes made while it scans, and they are
-      applied before the index commits, within
-      `maxIndexBuildMemoryUsageMegabytes`. A build that sorted externally
-      would also stop holding all its entries in memory at once.
-      Backlog-ID: RM-187
-      Verify: none -- a concurrency budget (writes during a long build), not an answer
-- [ ] **`count({})`, `collStats`, `dataSize` and `dbStats` walk every
-      row.** They stream now, in constant memory (fixed 2026-10-20: each
-      read the whole collection into a `Vec`, and `dbStats` did that three
-      times per collection). But each still takes time proportional to the
-      collection, where mongod answers all of them from its size-and-count
-      metadata (the size storer), kept up to date by every write. RM-080
-      covers `find` / `aggregate` cursors; RM-087 covers fast-count
-      visibility, not its cost.
-      Backlog-ID: RM-191
-      Verify: none -- a time budget, not an answer
-- [ ] **Disk space is never given back, and there is no repair path.**
-      `compact` answers `bytesFreed: 0` without doing anything
-      (`secantus-commands/src/capped_admin.rs`, "There is never anything to
-      free here"), and `secantus-wt` has no binding for
-      `WT_SESSION::compact`. Collections share the 16 document shards, one
-      index-entries table and the oplog shards, so a dropped or emptied
-      collection's pages are only ever reused inside those files. mongod runs
-      WiredTiger's compaction (and `autoCompact` in 8.x). The reply itself is
-      not testable from a small shape: on 40,000 documents with 95% deleted,
-      mongod 8.2.11 also reported `bytesFreed: 0`. There is no
-      `--repair` / salvage either; `secantus-pg/src/main.rs` already
-      recognises `WT_TRY_SALVAGE` and has nothing to offer.
-      Backlog-ID: RM-192
-      Verify: none -- reclaiming disk space; no small shape where mongod reports bytesFreed > 0 was found
+- **Scope decision — `compact` compacts the files a collection shares**
+  (2026-10-26, RM-192). mongod compacts a collection's own table and its
+  indexes'; here a collection's documents are rows in one of sixteen
+  document shards and its indexes rows in shared tables, so `compact`
+  compacts those files, gives back the free space in them whoever freed it
+  (a dropped neighbour's pages included), and answers `bytesFreed` as how
+  much they shrank -- mongod's measure, over the files this store keeps the
+  collection in. `freeSpaceTargetMB` is WiredTiger 11.3's check, made from
+  the block manager's free-bytes statistic before the vendored 11.2 is
+  asked (`crates/secantus-storage/src/compact.rs`).
+- [ ] **`compact`'s dry run does not estimate.** `{compact, dryRun: true}`
+      answers `estimatedBytesFreed: 0` and compacts nothing. mongod 8.2.11
+      runs WiredTiger 11.3's estimation phase and reports the statistic it
+      leaves; the vendored WiredTiger (11.2) has no estimation phase. mongod
+      answered 0 on every shape measured (2026-10-26: five collections of
+      6,000 to 200,000 documents, files of 13 to 155 MB with 12 to 103 MB
+      free, the default target and 1 MB), so no answer is known to differ.
+      Backlog-ID: RM-316
+      Verify: none -- no shape was found where mongod 8.2.11 estimates more than 0
+- [ ] **`autoCompact` cannot stop a file part-way, and judges files by the
+      bytes given back.** WiredTiger 11.3's background compaction server is
+      rebuilt over 11.2 (`crates/secantus-storage/src/auto_compact.rs`).
+      11.2 cannot interrupt a compaction, so disabling it lets the file in
+      hand finish (11.3 interrupts it and counts `background compact
+      interrupted`, never counted here), and closing the store waits for
+      that file. 11.2 does not count the bytes a compaction rewrote, so the
+      moving average that decides which files to skip for an hour -- and
+      `background compact moving average of bytes rewritten` -- is of the
+      bytes each pass gave back.
+      Backlog-ID: RM-317
+      Verify: none -- an interrupt is a timing inside WiredTiger, and the rewritten-bytes count is internal to it
+- [ ] **`--repair` leaves a resurrected duplicate where mongod moves it
+      aside.** When a salvage brings back a deleted document beside the
+      document that replaced it (same `_id`, another RecordId), the repair
+      keeps the earlier one in the `_id` index and says how many it left
+      out; mongod moves the other into `local.lost_and_found.<uuid>`, which
+      this server does not have, so the extra document stays in its
+      collection, readable by a scan and not by `_id`.
+      Backlog-ID: RM-318
+      Verify: none -- needs a salvage that brings back a deleted document beside its replacement, which no quick test can stage
+- [ ] **There is no `local.startup_log`.** mongod 8.2.11 keeps a capped
+      `local.startup_log` with one document per start (`hostname`,
+      `startTime`, `startTimeLocal`, `cmdLine`, `pid`, `buildinfo`); here
+      the collection does not exist, so `compact` of it is 26
+      NamespaceNotFound where mongod answers `bytesFreed`, and a tool that
+      reads when the server started finds nothing. Found by the RM-192 probe
+      (2026-10-26).
+      Backlog-ID: RM-319
+      Verify: tests/backlog/test_rm_192_compact.py::test_local_startup_log_records_each_start
+- [ ] **A transaction older than an index writes past it, and the index
+      misses the document.** A transaction whose snapshot was taken before
+      an index committed (on any collection) and that then writes to the
+      index's collection commits here, and the write reads the index list
+      from its snapshot, so the new index gets no entry for it: a query
+      through the index misses the document. mongod 8.2.11 refuses the
+      write: 112 WriteConflict "Unable to write to collection '<ns>' due to
+      catalog changes; please retry the operation", labelled
+      TransientTransactionError. Found 2026-10-26 while building RM-187; it
+      is older than the hybrid build (any `createIndexes`, and a PG `CREATE
+      INDEX` beside a PG transaction, is exposed). The fix is mongod's: a
+      write whose snapshot predates its collection's last catalog change is
+      a write conflict.
+      Backlog-ID: RM-320
+      Verify: tests/backlog/test_rm_index_build_gaps.py::test_a_transaction_older_than_an_index_cannot_write_past_it
+- [ ] **An index being built is not in `collStats` or `$indexStats`.**
+      mongod 8.2.11 counts an index whose build is still running in
+      `collStats` (`nindexes`, `indexSizes`) and lists it in `$indexStats`
+      with `building: true`; this server leaves it out of both until the
+      build commits (`listIndexes` lists it, since RM-187).
+      Backlog-ID: RM-321
+      Verify: tests/backlog/test_rm_index_build_gaps.py::test_a_building_index_counts_in_stats
 
 ### 7.084 What an authenticated user may run -- 2026-10-14
 
@@ -1550,9 +1645,7 @@ fields written out (the transaction state rules, what a transaction refuses,
 conflicts, collections made in a transaction, cursors, the session commands,
 retryable writes). The Rust server differs on 11 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: smaller differences.** A `count` with no query
-      does not see another session's uncommitted insert (mongod's fast count
-      does: it answered 3 for 2 committed documents). An error that names
+- [ ] **RUST MongoDB server: smaller differences.** An error that names
       the request or mongod's oplog entry has the code and a shorter text:
       40606 / 40607 / 40608 / 40611 / 40612 on an incompatible
       `findAndModify` retry (which cases refuse is mongod's since
@@ -1563,7 +1656,7 @@ retryable writes). The Rust server differs on 11 scenarios. What is left:
       answers a plain 50, which is what mongod 8.2.11 answered in 12 runs
       of 12; the `writeConcernError` one probe run saw did not recur.)
       Backlog-ID: RM-087
-      Verify: tests/backlog/test_rm_085_112.py::test_fast_count_sees_another_sessions_uncommitted_insert
+      Verify: tests/backlog/test_rm_085_112.py::test_statement_id_count_error_names_the_request
 
 ### 7.071 Time-series collections -- 2026-10-11
 
@@ -1603,6 +1696,10 @@ is left follows from that:
         Its sizes are of the derived buckets, not of compressed ones.
       - **An unsorted read of a time-series collection reads the whole
         collection** to place the measurements, whatever its filter.
+      - **`dbStats` counts a time-series collection's measurements**, not
+        its buckets, and does not count it as a view: mongod 8.2.11
+        answered `views: 2` for a database holding one view and one
+        time-series collection, this server `views: 1`.
       **Decided 2026-10-16 (Joe):** model mongod's server-wide bucket
       catalog, memory accounting across every collection included
       (`getCacheDerivedBucketMaxSize`), so buckets close for size as on

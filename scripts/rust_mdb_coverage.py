@@ -412,8 +412,6 @@ def main() -> int:
                 "--file",
                 "backlog-rust-mongodb.md",
                 "--regressions",
-                "--skip",
-                "RM-211",
             ],
             r"^=== ",
         ),

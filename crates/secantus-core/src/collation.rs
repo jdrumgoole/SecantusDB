@@ -849,6 +849,20 @@ pub fn active() -> Option<Collation> {
 
 /// Compare two strings under the active collation, or by code point when
 /// there is none.
+/// [`active_compare`] over a string's bytes, which may not be UTF-8
+/// (RM-222): byte order without a collation, as mongod compares strings;
+/// under one, the collation over the text with each invalid sequence
+/// replaced by U+FFFD.
+pub fn active_compare_bytes(a: &[u8], b: &[u8]) -> Ordering {
+    ACTIVE.with(|c| match &*c.borrow() {
+        Some(c) => c
+            .collator
+            .as_borrowed()
+            .compare(&String::from_utf8_lossy(a), &String::from_utf8_lossy(b)),
+        None => a.cmp(b),
+    })
+}
+
 pub fn active_compare(a: &str, b: &str) -> Ordering {
     ACTIVE.with(|c| match &*c.borrow() {
         Some(c) => c.collator.as_borrowed().compare(a, b),

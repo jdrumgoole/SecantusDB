@@ -16,6 +16,19 @@
 //! PostgreSQL the check runs once `deadlock_timeout` (1 s) into a wait, and
 //! of two sessions closing a cycle it is the one whose check runs first
 //! that fails.
+//!
+//! The RELEASER clears the edges, not only the waiter. PostgreSQL's
+//! `LockRelease` grants a waiter its lock (`ProcLockWakeup`) before the
+//! holder's COMMIT answers, so once that answer is in, `pg_blocking_pids`
+//! no longer names the holder. A waiter here wakes on its own poll, up to
+//! 10 ms (more under load) after the holder let go; until it did, its edge
+//! to the holder still stood and `pg_isolation_test_session_is_blocked`
+//! said it was blocked by a session whose COMMIT had already answered
+//! (48 of 50 times, measured 2026-10-27; PostgreSQL 15.19: none; RP-270). So a
+//! session ending its transaction removes itself from every wait on the
+//! locks it held (`released`), and a waiter reads its holders and records
+//! them under the graph's lock (`WaitGuard::set_with`), so a release can
+//! never land between the two and leave an edge behind.
 
 use std::sync::Mutex;
 
@@ -104,11 +117,27 @@ impl WaitGuard {
     /// resource tables exclude a session's own holds), and a self-edge is
     /// not a deadlock.
     pub fn set(&self, blockers: Vec<i32>) {
+        let mut waits = graph().waits.lock().unwrap_or_else(|e| e.into_inner());
+        self.record(&mut waits, blockers);
+    }
+
+    /// Read whom `pid` waits on with `holders` and record it, both under
+    /// the graph's lock: a holder that ends its transaction (`released`)
+    /// meanwhile is either read as gone or has its edge removed after this
+    /// records it, never left standing. Returns what `holders` answered.
+    /// `holders` must not take the graph's lock.
+    pub fn set_with(&self, holders: impl FnOnce() -> Vec<i32>) -> Vec<i32> {
+        let mut waits = graph().waits.lock().unwrap_or_else(|e| e.into_inner());
+        let blockers = holders();
+        self.record(&mut waits, blockers.clone());
+        blockers
+    }
+
+    fn record(&self, waits: &mut Vec<Wait>, blockers: Vec<i32>) {
         let mut blockers = blockers;
         blockers.retain(|b| *b != self.pid);
         blockers.sort_unstable();
         blockers.dedup();
-        let mut waits = graph().waits.lock().unwrap_or_else(|e| e.into_inner());
         waits.retain(|w| w.pid != self.pid);
         if !blockers.is_empty() {
             waits.push(Wait {
@@ -135,6 +164,20 @@ impl Drop for WaitGuard {
             .unwrap_or_else(|e| e.into_inner())
             .retain(|w| w.pid != self.pid);
     }
+}
+
+/// `pid` let go of every lock of `kind` it held (its transaction ended):
+/// no session waits on it for one any more. Called after the lock's own
+/// table has dropped `pid`'s holds and before the session answers, as
+/// PostgreSQL's releaser grants its waiters (see the module comment). A
+/// wait left with no blocker is over: its session is running again, and
+/// re-registers if it finds another holder.
+pub fn released(pid: i32, kind: WaitKind) {
+    let mut waits = graph().waits.lock().unwrap_or_else(|e| e.into_inner());
+    for w in waits.iter_mut().filter(|w| w.kind == kind) {
+        w.blockers.retain(|b| *b != pid);
+    }
+    waits.retain(|w| !w.blockers.is_empty());
 }
 
 /// The sessions `pid` is currently known to wait on, for
@@ -240,6 +283,39 @@ mod tests {
         assert!(!b.deadlocked(), "the cycle broke when A's wait ended");
         drop(b);
         drop(c);
+    }
+
+    #[test]
+    fn a_release_ends_the_waits_on_the_releaser() {
+        // A waits on B and C for rows, D on B for a table: B's transaction
+        // ends, and with it every row wait's edge to B -- not the table
+        // wait's, a lock B's row release did not let go of.
+        let a = WaitGuard::new(9_005_001, WaitKind::TransactionId);
+        let d = WaitGuard::new(9_005_004, WaitKind::Relation);
+        a.set(vec![9_005_002, 9_005_003]);
+        d.set(vec![9_005_002]);
+        released(9_005_002, WaitKind::TransactionId);
+        assert_eq!(blockers_of(9_005_001), vec![9_005_003]);
+        assert_eq!(blockers_of(9_005_004), vec![9_005_002]);
+        // C's ends too: A waits on nobody, so it is not waiting.
+        released(9_005_003, WaitKind::TransactionId);
+        assert_eq!(blockers_of(9_005_001), Vec::<i32>::new());
+        assert_eq!(wait_kind(9_005_001), None);
+        released(9_005_002, WaitKind::Relation);
+        assert_eq!(wait_kind(9_005_004), None);
+        drop(a);
+        drop(d);
+    }
+
+    #[test]
+    fn set_with_reads_the_holders_under_the_graphs_lock() {
+        let a = WaitGuard::new(9_006_001, WaitKind::TransactionId);
+        let got = a.set_with(|| vec![9_006_002]);
+        assert_eq!(got, vec![9_006_002]);
+        assert_eq!(blockers_of(9_006_001), vec![9_006_002]);
+        assert_eq!(a.set_with(Vec::new), Vec::<i32>::new());
+        assert_eq!(wait_kind(9_006_001), None);
+        drop(a);
     }
 
     #[test]

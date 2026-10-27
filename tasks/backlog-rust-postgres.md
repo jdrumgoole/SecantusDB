@@ -837,6 +837,19 @@ tests are scenarios in `tests/backlog/test_rp_batch30.py`, measured on a
 private 15.19 cluster. RP-133 .. RP-136 and RP-138 .. RP-142 were found and
 fixed in the same batch; their tests there are regression tests.
 
+## Found by the isolation flake (2026-10-27)
+
+Found while chasing `test_rp_isolation.py`'s CI flake ("another command is
+already in progress", and a worker killed at the 600 s per-test deadline),
+and fixed in the same batch; their tests in
+`tests/backlog/test_rp_lock_release.py` are regression tests:
+- RP-270: a lock waiter was still reported blocked
+  (`pg_isolation_test_session_is_blocked`, `pg_blocking_pids`) after its
+  holder's COMMIT had answered, 48 times of 50; PostgreSQL 15.19 never.
+- RP-271: an autocommit statement took no table lock, so a DROP TABLE ran
+  beside an autocommit UPDATE that had waited on a row, and the server
+  wedged for good: every later BEGIN waited too.
+
 ## Found by the top-ten batch (2026-10-26)
 
 Found while speeding up the `information_schema` views (RP-131), by
@@ -844,13 +857,13 @@ comparing `routines`, `parameters` and `element_types` with PostgreSQL 15.19
 row for row. The tests are in `tests/backlog/test_rp_catalog_identity.py`,
 measured with read-only queries on 15.19. Fixed in the same batch, their
 tests regression tests:
-- RP-270: 56 built-in `pg_type` rows differed from `initdb`'s: a
+- RP-300: 56 built-in `pg_type` rows differed from `initdb`'s: a
   fixed-length subscriptable type's `typelem` (`name`, `int2vector`,
   `oidvector`, `point`, `lseg`, `box`, `line`, `_record`), a range array's
   `typtype`, `_box`'s `typdelim`, ten types' `typcollation`, and NULL
   `typnotnull` / `typbasetype` / `typtypmod` on 26 pseudo-types. So
   `information_schema` called `int2vector` a plain type, not `ARRAY`.
-- RP-271: `format_type(18, NULL)` was `character` (`"char"` is meant), and a
+- RP-301: `format_type(18, NULL)` was `character` (`"char"` is meant), and a
   modifier on a type with no `typmodout` was dropped (`format_type(25, 7)`
   is `text(7)`).
 - RP-285 (found by RP-254's work): `pg_class.relam` was `btree` for every
@@ -873,7 +886,7 @@ tests regression tests:
       `element_types` lists the catalogs' text arrays without their
       collation. Changing `atttypid` is the delicate part: what a client is
       told a view column's type is follows it.
-      Backlog-ID: RP-272
+      Backlog-ID: RP-302
       Verify: tests/backlog/test_rp_catalog_identity.py::test_builtin_relations_attributes
 
 - [ ] **In autocommit, a join whose select list calls `nextval` takes one

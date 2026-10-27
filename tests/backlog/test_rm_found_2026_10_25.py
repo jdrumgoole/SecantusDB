@@ -575,7 +575,14 @@ def _killed_while_running(client: Any) -> tuple:
     first: list = []
     thread = threading.Thread(target=lambda: first.append(_op_msg(host, port, cmd)), daemon=True)
     thread.start()
-    time.sleep(0.3)
+    # Kill it once it runs: on a loaded box 0.3 s may not see it started.
+    running = {"aggregate": 1, "cursor": {}, "$db": "admin"}
+    running["pipeline"] = [{"$currentOp": {}}, {"$match": {"ns": "rm313.c", "op": "update"}}]
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        time.sleep(0.3)
+        if _op_msg(host, port, running)["cursor"]["firstBatch"]:
+            break
     killed = _op_msg(host, port, {"killSessions": [lsid], "$db": "admin"})
     thread.join(timeout=120)
     assert first, "the update never answered"
@@ -587,13 +594,15 @@ def _killed_while_running(client: Any) -> tuple:
     )
 
 
-@pytest.mark.backlog("RM-313")
+@pytest.mark.backlog_fixed("RM-313")
 def test_kill_sessions_interrupts_the_command_holding_the_session(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11: `killSessions` on a session whose retryable update is
     running interrupts that update (11601) and it does not apply; the kill
-    answers ok. The Rust server lets the update run to the end."""
+    answers ok. This server marked nothing on the session's operations, and
+    read a kill only between the documents a scan reads, so the update ran
+    to the end and applied."""
     theirs = _killed_while_running(mongod_rs)
     assert theirs == ((0.0, 11601), (1.0, None), 0), theirs  # the reference, as measured
     assert _killed_while_running(rust_mongo) == theirs

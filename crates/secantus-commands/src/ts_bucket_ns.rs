@@ -162,6 +162,8 @@ fn insert(doc: &Document, ctx: &CommandContext, layout: &Layout) -> Document {
     let ordered = !matches!(doc.get("ordered"), Some(Bson::Boolean(false)));
     let validator = ts_buckets::validator(&layout.time);
     let mut errors: Vec<Document> = Vec::new();
+    // A validator no interrupt reaches (RM-313).
+    let _opaque = secantus_core::deadline::opaque();
     for (index, d) in documents.iter().enumerate() {
         let is_bucket =
             secantus_core::query::matches(d, &validator, &Document::new(), None).unwrap_or(true);

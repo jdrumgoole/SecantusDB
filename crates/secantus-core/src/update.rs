@@ -120,8 +120,8 @@ fn rename_through_array<'a>(doc: &'a Document, path: &'a str) -> Option<&'a str>
 /// The same value, byte for byte: type, and the order of a document's fields.
 fn same_bytes(a: &Bson, b: &Bson) -> bool {
     match (
-        bson::to_vec(&doc! { "v": a.clone() }),
-        bson::to_vec(&doc! { "v": b.clone() }),
+        crate::bsondoc::to_vec(&doc! { "v": a.clone() }),
+        crate::bsondoc::to_vec(&doc! { "v": b.clone() }),
     ) {
         (Ok(x), Ok(y)) => x == y,
         _ => a == b,
@@ -1235,11 +1235,28 @@ fn apply_op(
         }
         "$rename" => {
             for (old, new) in payload {
+                let escaped;
                 let new = match new {
+                    // A NUL in the new name is refused (measured 8.2.11,
+                    // 2026-10-27); a NUL and two hex digits would otherwise
+                    // read as the escape of a name that is not UTF-8.
+                    Bson::String(s) if s.contains('\0') => {
+                        return Err(Fallback::mongo(
+                            9867600,
+                            "Field name can't contain null bytes",
+                        ));
+                    }
                     // `Code` is a `String` variant's neighbour in BSON but a
                     // distinct type; mongod refuses it, as it does every
                     // non-string.
                     Bson::String(s) => s.as_str(),
+                    // A name that is not UTF-8 renames to those bytes (RM-222).
+                    other if crate::bsondoc::as_invalid_utf8(other).is_some() => {
+                        escaped = crate::bsondoc::escape_key(
+                            crate::bsondoc::as_invalid_utf8(other).unwrap_or_default(),
+                        );
+                        escaped.as_str()
+                    }
                     other => {
                         return Err(Fallback::mongo(
                             2,

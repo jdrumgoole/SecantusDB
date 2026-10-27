@@ -27,6 +27,10 @@ pub const EMPTY_ARRAY_SORT_MARKER: Bson = Bson::Undefined;
 /// Ranks are spaced by 10 so the empty-array marker can sit *between* MinKey and
 /// Null, which is where mongod puts it. Relative order is otherwise unchanged.
 fn type_rank(v: &Bson) -> u8 {
+    // A string whose bytes are not UTF-8 (RM-222) is a string.
+    if crate::bsondoc::as_invalid_utf8(v).is_some() {
+        return 40;
+    }
     match v {
         Bson::MinKey => 10,
         Bson::Undefined => 15, // empty-array sort marker: above MinKey, below Null
@@ -168,6 +172,11 @@ pub fn cmp(a: &Bson, b: &Bson) -> Ordering {
     let (ra, rb) = (type_rank(a), type_rank(b));
     if ra != rb {
         return ra.cmp(&rb);
+    }
+    // Two strings, one of them not UTF-8 (RM-222): byte order, as mongod
+    // compares them, or the active collation over their text.
+    if let Some((x, y)) = crate::bsondoc::carrier_pair(a, b) {
+        return crate::collation::active_compare_bytes(x, y);
     }
     match (a, b) {
         // Two nulls / two MinKeys / two MaxKeys: Python's native `<` is False
@@ -391,7 +400,7 @@ fn db_pointer_value(v: &Bson) -> Option<Vec<u8>> {
     let mut doc = bson::Document::new();
     doc.insert("v", v.clone());
     let mut buf = Vec::new();
-    doc.to_writer(&mut buf).ok()?;
+    crate::bsondoc::write(&doc, &mut buf).ok()?;
     // 4 bytes of length, the type byte, `v` and its terminator, then the
     // value up to the document's own terminator.
     buf.get(7..buf.len().checked_sub(1)?).map(<[u8]>::to_vec)
@@ -432,6 +441,9 @@ pub fn bson_lt(a: &Bson, b: &Bson) -> Option<bool> {
     // None` to False first.
     if matches!(a, Bson::Null | Bson::Undefined) || matches!(b, Bson::Null | Bson::Undefined) {
         return Some(false);
+    }
+    if let Some((x, y)) = crate::bsondoc::carrier_pair(a, b) {
+        return Some(crate::collation::active_compare_bytes(x, y) == Ordering::Less);
     }
     match (a, b) {
         (Bson::Boolean(x), Bson::Boolean(y)) => Some(x < y),

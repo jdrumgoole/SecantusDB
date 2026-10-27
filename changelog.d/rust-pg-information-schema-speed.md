@@ -39,8 +39,8 @@ the one-byte `"char"` as `character`.
 - `pg_type`: a built-in type's `typtype`, `typdelim`, `typelem`,
   `typnotnull`, `typbasetype`, `typtypmod` and `typcollation` are now
   PostgreSQL 15.19's (`pg_type_identity.tsv`), so `information_schema` calls
-  `int2vector` and `oidvector` `ARRAY`. Fixes RP-270
+  `int2vector` and `oidvector` `ARRAY`. Fixes RP-300
   (`tests/backlog/test_rp_catalog_identity.py::test_builtin_types_carry_postgres_identity_columns`).
 - `format_type`: oid 18 is `"char"`, and a modifier on a type with no
-  `typmodout` is printed in parentheses (`text(7)`). Fixes RP-271
+  `typmodout` is printed in parentheses (`text(7)`). Fixes RP-301
   (`tests/backlog/test_rp_catalog_identity.py::test_format_type_of_the_one_byte_char`).

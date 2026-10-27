@@ -1240,12 +1240,10 @@ jobs:
         # test breaks rather than failing on its assertion (BROKEN).
         # `--file` keeps it to the RM items, so no PostgreSQL is needed.
         #
-        # `--skip RM-211`, a scope decision: that item IS the server's lack of
-        # aggregation memory limits, and its gap test drives secantusd-rs to
-        # ~14.5 GB RSS (110 MB of documents through $group / $push / $facet /
-        # $lookup), which on this 16 GB runner SIGTERMs the whole step (first
-        # run, 2026-10-21). What is lost: CI cannot see RM-211 turn FIXED?;
-        # `tools/backlog.py verify --id RM-211` still runs it on a 32 GB box.
+        # RM-211's regression test runs 110 MB of documents through $group /
+        # $push / $facet / $lookup; it ran here under `--skip RM-211` while
+        # the server had no memory budgets and took ~14.5 GB to do it. With
+        # the budgets it refuses as mongod does, under 1 GB.
         #
         # tests/mongod_live/ then compares the surface no backlog item
         # covers (window functions, change-stream images, retryable writes,
@@ -1259,7 +1257,7 @@ jobs:
           status=0
           uv run --no-project $deps \
             python tools/backlog.py verify --file backlog-rust-mongodb.md --regressions \
-            --skip RM-211 || status=1
+            || status=1
           uv run --no-project $deps \
             python -m pytest tests/mongod_live -m mongod_live -o addopts= -n auto \
             -p no:cacheprovider -q -rs || status=1

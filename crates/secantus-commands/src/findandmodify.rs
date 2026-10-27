@@ -446,6 +446,9 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     let mut repick_last_log = repick_started;
     let mut repick_count: u64 = 0;
     loop {
+        // An interrupt point: each pick, so a kill also ends a re-pick storm
+        // (RM-313).
+        secantus_core::deadline::check_now()?;
         if repick_count > 0 {
             let now = std::time::Instant::now();
             if now.duration_since(repick_last_log) >= std::time::Duration::from_secs(5) {
@@ -615,6 +618,8 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                     .cloned()
                     .unwrap_or_default();
                 if let Ok(post) = secantus_core::update::apply_update(&matched_doc, &upd, false) {
+                    // A validator no interrupt reaches (RM-313).
+                    let _opaque = secantus_core::deadline::opaque();
                     if !secantus_core::query::matches(&post, v, &Document::new(), None)
                         .unwrap_or(true)
                     {

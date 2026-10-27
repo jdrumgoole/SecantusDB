@@ -480,6 +480,7 @@ fn apply_entry(
             // changes, so the write is logged as an update of those fields.
             if let (Some(diff), true) = (diff, exists_doc) {
                 if let Some(v) = &validator {
+                    let _opaque = secantus_core::deadline::opaque();
                     if !secantus_core::query::matches(&post, v, &Document::new(), None)
                         .unwrap_or(true)
                     {
@@ -559,6 +560,8 @@ fn write_document(
     validator: Option<&Document>,
 ) -> Result<Outcome, CommandError> {
     if let Some(v) = validator {
+        // A validator no interrupt reaches (RM-313).
+        let _opaque = secantus_core::deadline::opaque();
         if !secantus_core::query::matches(&doc, v, &Document::new(), None).unwrap_or(true) {
             return Ok(Outcome::NotApplied);
         }
@@ -570,7 +573,7 @@ fn write_document(
     if outcome.matched > 0 {
         return Ok(Outcome::Applied);
     }
-    let bytes = bson::to_vec(&doc).map_err(|e| error(1, e.to_string()))?;
+    let bytes = crate::bsondoc::to_vec(&doc).map_err(|e| error(1, e.to_string()))?;
     let (_, errors) = storage
         .insert(db, coll, vec![bytes], true)
         .map_err(crate::util::command_error)?;

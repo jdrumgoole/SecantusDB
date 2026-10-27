@@ -356,6 +356,10 @@ fn leaf(path: &str, op: &str, arg: &Bson, level: usize, out: &mut String) {
 
 /// A value as `BSONElement::toString` prints it without its name.
 pub(crate) fn value(v: &Bson) -> String {
+    // A string that is not UTF-8 (RM-222), each invalid sequence replaced.
+    if let Some(b) = crate::bsondoc::as_invalid_utf8(v) {
+        return format!("\"{}\"", crate::bsondoc::lossy(b));
+    }
     match v {
         Bson::Double(d) => double(*d),
         Bson::String(s) => format!("\"{s}\""),

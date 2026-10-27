@@ -236,13 +236,38 @@ def _memory_limits(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-211")
+@pytest.mark.backlog_fixed("RM-211")
 def test_aggregation_memory_limits(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11, over 110 one-megabyte documents: 292 for `$group` with
     `allowDiskUse: false`, 146 for an array past 100 MB from `$push` /
     `$addToSet`, 5643011 for `$setWindowFields`, 4568 for a `$lookup`
     result and 4031700 for `$facet`."""
     assert _memory_limits(rust_mongo) == _memory_limits(mongod)
+
+
+def _sort_limits(client: Any) -> dict:
+    db = _db(client, "rmsort")
+    for start in range(0, 60, 10):
+        db.big.insert_many([{"_id": i, "s": _BIG} for i in range(start, start + 10)])
+    out = {}
+    for name, pipeline in {
+        "$sort": [{"$sort": {"s": 1, "_id": 1}}, {"$project": {"_id": 1}}],
+        "$bucketAuto": [{"$bucketAuto": {"groupBy": "$s", "buckets": 2}}],
+    }.items():
+        cmd = {"aggregate": "big", "pipeline": pipeline, "cursor": {}, "allowDiskUse": False}
+        got = answer(lambda cmd=cmd: len(db.command(cmd)["cursor"]["firstBatch"]))
+        out[name] = got[1] if got[0] == "err" else got[0]
+    got = answer(lambda: len(list(db.big.find({}, {"_id": 1}).sort("s").allow_disk_use(False))))
+    out["find"] = got[1] if got[0] == "err" else got[0]
+    client.drop_database("rmsort")
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-315")
+def test_blocking_sort_memory_limit(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11, sorting 60 one-megabyte documents by their 1 MB field
+    with `allowDiskUse: false`: 292 from `$sort`, `$bucketAuto` and `find`."""
+    assert _sort_limits(rust_mongo) == _sort_limits(mongod)
 
 
 # --------------------------------------------- RM-212 date arithmetic --
@@ -920,7 +945,7 @@ def _insert_invalid_utf8(client: Any) -> Any:
     return (reply.get("ok"), reply.get("n"), reply.get("code"))
 
 
-@pytest.mark.backlog("RM-222")
+@pytest.mark.backlog_fixed("RM-222")
 def test_insert_string_with_invalid_utf8(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 stores a document whose string holds bytes that are
     not UTF-8 (ok 1, n 1)."""

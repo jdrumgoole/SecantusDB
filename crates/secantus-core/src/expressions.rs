@@ -246,7 +246,24 @@ fn expr_path_in(value: &Bson, rest: &[&str]) -> Option<Bson> {
     }
 }
 
+/// A string that is not UTF-8 in expression position (RM-222): a field
+/// path when it starts with `$` -- the path's bytes name the field, whose
+/// key is held escaped -- and otherwise the constant it is. `None` for any
+/// other value. `missing` is what an absent path gives.
+fn eval_invalid_utf8(expr: &Bson, ctx: &Ctx, missing: Bson) -> Option<Bson> {
+    let b = crate::bsondoc::as_invalid_utf8(expr)?;
+    Some(match b {
+        [b'$', rest @ ..] if rest.first() != Some(&b'$') => {
+            expr_path(ctx.doc, &crate::bsondoc::escape_key(rest)).unwrap_or(missing)
+        }
+        _ => expr.clone(),
+    })
+}
+
 fn eval(expr: &Bson, ctx: &Ctx) -> R {
+    if let Some(v) = eval_invalid_utf8(expr, ctx, Bson::Null) {
+        return Ok(v);
+    }
     match expr {
         Bson::String(s) => {
             if let Some(var) = s.strip_prefix("$$") {
@@ -335,6 +352,9 @@ fn stamp_folded(fault: Fallback, arg: &Bson, ctx: &Ctx) -> Fallback {
 }
 
 fn eval_field_value(expr: &Bson, ctx: &Ctx) -> R {
+    if let Some(v) = eval_invalid_utf8(expr, ctx, Bson::Undefined) {
+        return Ok(v);
+    }
     if let Bson::String(s) = expr {
         if !s.starts_with("$$") {
             if let Some(path) = s.strip_prefix('$') {
@@ -3104,6 +3124,11 @@ fn op_expr_min(arg: &Bson, ctx: &Ctx) -> R {
 /// else through its ordinary stream form. Mirrors
 /// `expressions.py::_mongo_val_repr`.
 fn mongo_val_repr(v: &Bson) -> String {
+    // A string that is not UTF-8 prints as the string it is, each invalid
+    // sequence replaced (mongod writes the raw bytes; RM-222).
+    if let Some(b) = crate::bsondoc::as_invalid_utf8(v) {
+        return format!("\"{}\"", crate::bsondoc::lossy(b));
+    }
     match v {
         Bson::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
         Bson::String(s) => format!("\"{s}\""),
@@ -3223,13 +3248,17 @@ fn op_index_of_array(arg: &Bson, ctx: &Ctx) -> R {
 // --- strings ------------------------------------------------------------
 
 fn op_concat(arg: &Bson, ctx: &Ctx) -> R {
-    let mut out = String::new();
+    // Bytes, so a string that is not UTF-8 joins as it is (RM-222).
+    let mut out: Vec<u8> = Vec::new();
     for p in eval_args(arg, ctx)? {
         match p {
             // A null / missing operand short-circuits to a null result (mongod),
             // left-to-right.
             Bson::Null => return Ok(Bson::Null),
-            Bson::String(s) => out.push_str(&s),
+            Bson::String(s) => out.extend_from_slice(s.as_bytes()),
+            other if invalid_utf8(&other).is_some() => {
+                out.extend_from_slice(invalid_utf8(&other).unwrap_or_default())
+            }
             other => {
                 return Err(wrong_type(
                     16702,
@@ -3241,7 +3270,7 @@ fn op_concat(arg: &Bson, ctx: &Ctx) -> R {
             }
         }
     }
-    Ok(Bson::String(out))
+    Ok(bytes_string(out))
 }
 
 /// Render a double the way mongod streams one into a message, and into the
@@ -3334,20 +3363,44 @@ pub fn format_double_roundtrip(d: f64) -> String {
 /// `16007 can't convert from BSON type bool to String`, while `$toString` of
 /// the same bool is `"true"` (probed 8.2.11, 2026-09-02). The arms here mirror
 /// `coerce_to_string`'s.
+/// The bytes of a string that is not UTF-8 (RM-222).
+fn invalid_utf8(v: &Bson) -> Option<&[u8]> {
+    crate::bsondoc::as_invalid_utf8(v)
+}
+
+/// The bytes of a string of either form.
+fn str_bytes(v: &Bson) -> Option<&[u8]> {
+    crate::bsondoc::str_bytes(v)
+}
+
+/// The string of these bytes, of whichever form they need.
+fn bytes_string(b: Vec<u8>) -> Bson {
+    crate::bsondoc::string_from_bytes(b)
+}
+
+/// [`coerce_to_string`] as bytes, a string that is not UTF-8 included.
+fn coerce_to_bytes(v: &Bson) -> Result<Vec<u8>, Fallback> {
+    match invalid_utf8(v) {
+        Some(b) => Ok(b.to_vec()),
+        None => coerce_to_string(v).map(String::into_bytes),
+    }
+}
+
 fn is_case_convertible(v: &Bson) -> bool {
-    matches!(
-        v,
-        Bson::Null
-            | Bson::Undefined
-            | Bson::String(_)
-            | Bson::Int32(_)
-            | Bson::Int64(_)
-            | Bson::Double(_)
-            | Bson::Decimal128(_)
-            | Bson::DateTime(_)
-            | Bson::JavaScriptCode(_)
-            | Bson::Timestamp(_)
-    )
+    invalid_utf8(v).is_some()
+        || matches!(
+            v,
+            Bson::Null
+                | Bson::Undefined
+                | Bson::String(_)
+                | Bson::Int32(_)
+                | Bson::Int64(_)
+                | Bson::Double(_)
+                | Bson::Decimal128(_)
+                | Bson::DateTime(_)
+                | Bson::JavaScriptCode(_)
+                | Bson::Timestamp(_)
+        )
 }
 
 fn coerce_to_string(v: &Bson) -> Result<String, Fallback> {
@@ -3485,18 +3538,23 @@ fn op_to_case(arg: &Bson, ctx: &Ctx, upper: bool) -> R {
             ctx,
         ));
     }
-    let text = coerce_to_string(&v)?;
-    Ok(Bson::String(if upper {
-        text.to_ascii_uppercase()
+    let mut text = coerce_to_bytes(&v)?;
+    if upper {
+        text.make_ascii_uppercase()
     } else {
-        text.to_ascii_lowercase()
-    }))
+        text.make_ascii_lowercase()
+    }
+    Ok(bytes_string(text))
 }
 
 fn op_str_len_cp(arg: &Bson, ctx: &Ctx) -> R {
     let v = eval(arg, ctx)?;
     if let Bson::String(s) = &v {
         return Ok(Bson::Int32(s.chars().count() as i32));
+    }
+    // mongod counts every byte that is not a continuation byte (RM-222).
+    if let Some(b) = invalid_utf8(&v) {
+        return Ok(Bson::Int32(crate::rawstr::len_cp(b) as i32));
     }
     Err(wrong_type(
         34471,
@@ -3518,6 +3576,23 @@ fn op_split(arg: &Bson, ctx: &Ctx) -> R {
     let sep = eval(&a[1], ctx)?;
     if is_null(&s) || is_null(&sep) {
         return Ok(Bson::Null);
+    }
+    // Either side not UTF-8 (RM-222): split the bytes, as mongod does.
+    if let (Some(x), Some(y)) = (str_bytes(&s), str_bytes(&sep)) {
+        if invalid_utf8(&s).is_some() || invalid_utf8(&sep).is_some() {
+            if y.is_empty() {
+                return Err(Fallback::mongo(
+                    40087,
+                    "$split requires a non-empty separator",
+                ));
+            }
+            return Ok(Bson::Array(
+                crate::rawstr::split(x, y)
+                    .into_iter()
+                    .map(bytes_string)
+                    .collect(),
+            ));
+        }
     }
     let Bson::String(s) = &s else {
         return Err(wrong_type(
@@ -3576,7 +3651,11 @@ fn op_substr_cp(arg: &Bson, ctx: &Ctx) -> R {
             ),
         ));
     }
-    let s = coerce_to_string(&s)?;
+    let raw = invalid_utf8(&s).map(<[u8]>::to_vec);
+    let s = match raw {
+        Some(_) => String::new(),
+        None => coerce_to_string(&s)?,
+    };
     let start_v = eval(&a[1], ctx)?;
     let length_v = eval(&a[2], ctx)?;
     // These five refusals used to defer so Python would raise them, which is
@@ -3662,6 +3741,13 @@ fn op_substr_cp(arg: &Bson, ctx: &Ctx) -> R {
             "$substrCP: length must be a nonnegative integer.",
         ));
     }
+    // A string that is not UTF-8: mongod's own walk over its bytes, and its
+    // refusals (RM-222).
+    if let Some(raw) = raw {
+        return crate::rawstr::substr_cp(&raw, start as usize, length as usize)
+            .map(|b| bytes_string(b.to_vec()))
+            .map_err(|(code, msg)| Fallback::mongo(code, msg));
+    }
     let chars: Vec<char> = s.chars().collect();
     let clen = chars.len() as i64;
     let stop = if length < 0 {
@@ -3731,7 +3817,8 @@ fn op_merge_objects(arg: &Bson, ctx: &Ctx) -> R {
         for operand in operands {
             match operand {
                 Bson::Null => {}
-                Bson::Document(d) => {
+                // (A string that is not UTF-8 is not an object; RM-222.)
+                Bson::Document(d) if crate::bsondoc::carrier_bytes(&d).is_none() => {
                     for (k, v) in d {
                         result.insert(k, v);
                     }
@@ -3808,10 +3895,13 @@ fn op_get_field(arg: &Bson, ctx: &Ctx) -> R {
                 ));
             }
             let field_v = eval(fe, ctx)?;
-            let Bson::String(field) = &field_v else {
-                return Err(get_field_type_error(operand_type_name(fe, &field_v, ctx)));
+            // A name that is not UTF-8 reads the field of those bytes, whose
+            // key is held escaped (RM-222).
+            let field = match (&field_v, invalid_utf8(&field_v)) {
+                (Bson::String(field), _) => field.clone(),
+                (_, Some(b)) => crate::bsondoc::escape_key(b),
+                _ => return Err(get_field_type_error(operand_type_name(fe, &field_v, ctx))),
             };
-            let field = field.clone();
             // Evaluate `input` missing-aware: an input field-path that resolves
             // to a *missing* field makes the whole `$getField` "missing" (mongod
             // 6.0: input missing -> missing, input null -> null). We represent the
@@ -3859,10 +3949,12 @@ fn op_get_field(arg: &Bson, ctx: &Ctx) -> R {
         // (`Bson::Undefined`) — which a `$project`/`$addFields` computed field
         // omits rather than emitting as null. A field present with an explicit
         // null returns null.
-        Bson::Document(doc) => match doc.get(&field) {
-            Some(v) => Ok(v.clone()),
-            None => Ok(Bson::Undefined),
-        },
+        Bson::Document(doc) if crate::bsondoc::carrier_bytes(&doc).is_none() => {
+            match doc.get(&field) {
+                Some(v) => Ok(v.clone()),
+                None => Ok(Bson::Undefined),
+            }
+        }
         // A null input is null; any other non-document is MISSING, as an
         // absent field is. Measured 8.2.11, 2026-10-20 -- this answered null.
         Bson::Null => Ok(Bson::Null),
@@ -3905,6 +3997,20 @@ fn set_field_name_parse(d: &Document) -> Result<(), Fallback> {
     let Some(field) = d.get("field") else {
         return Ok(());
     };
+    // A name that is not UTF-8 is a constant string (RM-222).
+    if invalid_utf8(field).is_some() {
+        return Ok(());
+    }
+    // A NUL in a name from a string is refused (measured 8.2.11, 2026-10-27).
+    // It was let through to the key, where a NUL and two hex digits read as
+    // the escape of a name that is not UTF-8 and wrote other bytes.
+    if matches!(field, Bson::String(s) if s.contains('\0')) {
+        return Err(Fallback::mongo(
+            9534700,
+            "$setField: 'field' cannot contain an embedded null byte",
+        )
+        .bare());
+    }
     let constant = match field {
         // A field path or a system variable is refused, rendered as mongod
         // serializes it: `$a.b` is `$CURRENT.a.b`, `$$ROOT.a` is `$ROOT.a`.
@@ -3965,7 +4071,7 @@ fn op_unset_field(arg: &Bson, ctx: &Ctx) -> R {
     };
     match eval(ie, ctx)? {
         Bson::Null | Bson::Undefined => Ok(Bson::Null),
-        Bson::Document(mut doc) => {
+        Bson::Document(mut doc) if crate::bsondoc::carrier_bytes(&doc).is_none() => {
             doc.remove(&field);
             Ok(Bson::Document(doc))
         }
@@ -3990,14 +4096,24 @@ fn op_set_field(arg: &Bson, ctx: &Ctx) -> R {
     let (Some(fe), Some(ie), Some(ve)) = (d.get("field"), d.get("input"), d.get("value")) else {
         return Err(Fallback::Defer); // field/input/value all required
     };
-    let Bson::String(field) = eval(fe, ctx)? else {
-        return Err(Fallback::Defer);
+    // A name that is not UTF-8 sets the field of those bytes, its key held
+    // escaped (RM-222).
+    let field = match eval(fe, ctx)? {
+        Bson::String(field) => field,
+        v => match invalid_utf8(&v) {
+            Some(b) => crate::bsondoc::escape_key(b),
+            None => return Err(Fallback::Defer),
+        },
     };
     let input = eval(ie, ctx)?;
     if matches!(input, Bson::Null | Bson::Undefined) {
         return Ok(Bson::Null);
     }
-    let Bson::Document(mut doc) = input else {
+    let Some(mut doc) = input
+        .as_document()
+        .filter(|d| crate::bsondoc::carrier_bytes(d).is_none())
+        .cloned()
+    else {
         return Err(set_field_input_error());
     };
     // FIELD-VALUE position: mongod REMOVES the field for `$$REMOVE` and for an
@@ -4087,12 +4203,13 @@ fn op_zip(arg: &Bson, ctx: &Ctx) -> R {
 fn op_object_to_array(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
-        Bson::Document(d) => {
+        Bson::Document(d) if crate::bsondoc::carrier_bytes(&d).is_none() => {
             let arr = d
                 .into_iter()
                 .map(|(k, v)| {
                     let mut e = Document::new();
-                    e.insert("k".to_string(), Bson::String(k));
+                    // A name that is not UTF-8 is a string of its bytes.
+                    e.insert("k".to_string(), crate::bsondoc::key_string(k));
                     e.insert("v".to_string(), v);
                     Bson::Document(e)
                 })
@@ -4115,6 +4232,9 @@ fn op_object_to_array(arg: &Bson, ctx: &Ctx) -> R {
 /// of `ctx`'s scope (mirrors `_Ctx.with_var`). The document (so `$$ROOT` and
 /// bare `$field` paths) is unchanged — only the var scope grows.
 fn eval_with_vars(expr: &Bson, ctx: &Ctx, extra: &[(&str, Bson)]) -> R {
+    // One element of a `$map` / `$filter` / `$reduce`: an interrupt point,
+    // as it is in mongod (RM-313).
+    crate::deadline::check_expression()?;
     let mut vars = ctx.vars.clone();
     let mut per_doc = ctx.per_doc.to_vec();
     for (name, value) in extra {
@@ -4604,6 +4724,9 @@ fn op_binary_size(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
         Bson::String(s) => Ok(Bson::Int32(s.len() as i32)),
+        other if invalid_utf8(&other).is_some() => Ok(Bson::Int32(
+            invalid_utf8(&other).map_or(0, <[u8]>::len) as i32,
+        )),
         Bson::Binary(b) => Ok(Bson::Int32(b.bytes.len() as i32)),
         other => Err(wrong_type(
             51276,
@@ -4619,9 +4742,9 @@ fn op_binary_size(arg: &Bson, ctx: &Ctx) -> R {
 fn op_bson_size(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
-        Bson::Document(d) => {
+        Bson::Document(d) if crate::bsondoc::carrier_bytes(&d).is_none() => {
             let mut buf = Vec::new();
-            d.to_writer(&mut buf).map_err(|_| Fallback::Defer)?;
+            crate::bsondoc::write(&d, &mut buf).map_err(|_| Fallback::Defer)?;
             Ok(Bson::Int32(buf.len() as i32))
         }
         other => Err(wrong_type(
@@ -5409,6 +5532,13 @@ fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
         };
     }
     // Everything from here is a ConversionFailure that onError catches.
+    // A string that is not UTF-8 is parsed as its text with each invalid
+    // sequence replaced, which fails as mongod's parse of the bytes does
+    // (RM-222).
+    let date_string = match invalid_utf8(&date_string) {
+        Some(b) => Bson::String(String::from_utf8_lossy(b).into_owned()),
+        None => date_string,
+    };
     let converted = (|| -> Result<Option<i64>, FreeFormError> {
         let Bson::String(text) = &date_string else {
             return Err(FreeFormError::Conversion(format!(
@@ -7531,6 +7661,17 @@ fn nonfinite_conversion(d: f64) -> Fallback {
 }
 
 fn convert_value(value: &Bson, code: i32) -> Conv {
+    // A string that is not UTF-8 (RM-222) converts as a string: to a string
+    // it is itself, to a bool true, and to anything else it is parsed --
+    // which fails, as it does on mongod, with the message quoting the text
+    // with each invalid sequence replaced (mongod quotes the raw bytes).
+    if let Some(b) = invalid_utf8(value) {
+        return match code {
+            2 => Conv::Ok(value.clone()),
+            8 => Conv::Ok(Bson::Boolean(true)),
+            _ => convert_value(&Bson::String(String::from_utf8_lossy(b).into_owned()), code),
+        };
+    }
     match code {
         // double
         1 => match value {
@@ -8114,6 +8255,13 @@ fn check_regex_args(spec: &Document, ctx: &Ctx, op: &str) -> Result<bool, Fallba
         v if is_null(v) => return Ok(false),
         Bson::String(s) => (s.as_str(), ""),
         Bson::RegularExpression(r) => (r.pattern.as_str(), r.options.as_str()),
+        // A pattern that is not UTF-8 does not compile (RM-222).
+        v if invalid_utf8(v).is_some() => {
+            let fault = invalid_utf8(v)
+                .and_then(crate::rawstr::pcre2_utf8_error)
+                .unwrap_or("UTF-8 error");
+            return fail(51111, format!("Invalid Regex in {op}: {fault}"));
+        }
         _ => {
             return fail(
                 51105,
@@ -8157,6 +8305,21 @@ fn regex_input(spec: &Document, ctx: &Ctx, op: &str) -> Result<Option<String>, F
     Ok(match eval_opt(spec.get("input"), ctx)? {
         Bson::String(s) => Some(s),
         v if is_null(&v) => None,
+        // PCRE2 checks the subject is UTF-8 before it matches, and mongod
+        // reports the check's verdict (measured 8.2.11, 2026-10-27; RM-222).
+        v if invalid_utf8(&v).is_some() => {
+            let fault = invalid_utf8(&v)
+                .and_then(crate::rawstr::pcre2_utf8_error)
+                .unwrap_or("UTF-8 error");
+            return Err(Fallback::mongo(
+                51156,
+                format!(
+                    "Error occurred while executing the regular expression in {op}. Result \
+                     code: {fault}"
+                ),
+            )
+            .with_folded(false));
+        }
         _ => {
             return Err(
                 Fallback::mongo(51104, format!("{op} needs 'input' to be of type string"))
@@ -9656,6 +9819,9 @@ fn wrong_type(code: i32, template: &str, arg: &Bson, value: &Bson, ctx: &Ctx) ->
 
 /// The BSON type string mongod's `$type` reports for a value.
 fn type_name(v: &Bson) -> &'static str {
+    if crate::bsondoc::as_invalid_utf8(v).is_some() {
+        return "string";
+    }
     match v {
         Bson::Null => "null",
         Bson::Boolean(_) => "bool",
@@ -9734,7 +9900,7 @@ fn op_strcasecmp(arg: &Bson, ctx: &Ctx) -> R {
     if vals.len() != 2 {
         return Err(Fallback::Defer);
     }
-    let to_str = |v: &Bson| -> Result<String, Fallback> {
+    let to_str = |v: &Bson| -> Result<Vec<u8>, Fallback> {
         // mongod coerces each operand with the SAME rule `$toLower` uses -- a
         // double, date or Decimal128 all render, and only the types that rule
         // rejects are 16007. This listed int and long alone and deferred the
@@ -9749,7 +9915,10 @@ fn op_strcasecmp(arg: &Bson, ctx: &Ctx) -> R {
                 ),
             ));
         }
-        coerce_to_string(v).map(|t| t.to_ascii_uppercase())
+        coerce_to_bytes(v).map(|mut t| {
+            t.make_ascii_uppercase();
+            t
+        })
     };
     let (a, b) = (to_str(&vals[0])?, to_str(&vals[1])?);
     Ok(Bson::Int32(match a.cmp(&b) {
@@ -9780,7 +9949,8 @@ fn op_replace(arg: &Bson, ctx: &Ctx, all: bool) -> R {
         (&fv, "find", 10503901),
         (&rv, "replacement", 10503902),
     ] {
-        if !matches!(v, Bson::Null | Bson::Undefined | Bson::String(_)) {
+        if !matches!(v, Bson::Null | Bson::Undefined | Bson::String(_)) && invalid_utf8(v).is_none()
+        {
             return Err(Fallback::mongo(
                 code,
                 format!(
@@ -9789,6 +9959,15 @@ fn op_replace(arg: &Bson, ctx: &Ctx, all: bool) -> R {
                 ),
             ));
         }
+    }
+    // Any of the three not UTF-8 (RM-222): replace in the bytes.
+    if [&iv, &fv, &rv].iter().any(|v| invalid_utf8(v).is_some()) {
+        let (Some(input), Some(find), Some(with)) =
+            (str_bytes(&iv), str_bytes(&fv), str_bytes(&rv))
+        else {
+            return Ok(Bson::Null);
+        };
+        return Ok(bytes_string(crate::rawstr::replace(input, find, with, all)));
     }
     let (Bson::String(input), Bson::String(find), Bson::String(rep)) = (iv, fv, rv) else {
         return Ok(Bson::Null);
@@ -9923,8 +10102,8 @@ fn op_range(arg: &Bson, ctx: &Ctx) -> R {
 
 fn op_str_len_bytes(arg: &Bson, ctx: &Ctx) -> R {
     let v = eval(arg, ctx)?;
-    if let Bson::String(s) = &v {
-        return Ok(Bson::Int32(s.len() as i32)); // UTF-8 byte length
+    if let Some(b) = str_bytes(&v) {
+        return Ok(Bson::Int32(b.len() as i32)); // byte length
     }
     Err(wrong_type(
         34473,
@@ -9990,6 +10169,29 @@ fn op_index_of(arg: &Bson, ctx: &Ctx, bytes: bool) -> R {
         (40093, 40094)
     };
     let name = if bytes { "$indexOfBytes" } else { "$indexOfCP" };
+    // A string that is not UTF-8 on either side (RM-222): mongod's byte walk.
+    if let Some(hay) = str_bytes(&s) {
+        let needle_v = eval(&a[1], ctx)?;
+        if let Some(needle) = str_bytes(&needle_v) {
+            if invalid_utf8(&s).is_some() || invalid_utf8(&needle_v).is_some() {
+                let op = name;
+                let bound = |idx: usize, which: &str, ctx: &Ctx| -> Result<Option<i64>, Fallback> {
+                    if a.len() <= idx {
+                        return Ok(None);
+                    }
+                    index_of_pos(op, which, &eval(&a[idx], ctx)?).map(Some)
+                };
+                let start = bound(2, "starting", ctx)?.unwrap_or(0).max(0) as usize;
+                let end = bound(3, "ending", ctx)?.map(|e| e.max(0) as usize);
+                return Ok(Bson::Int32(if bytes {
+                    crate::rawstr::index_of_bytes(hay, needle, start, end)
+                } else {
+                    crate::rawstr::index_of_cp(hay, needle, start, end)
+                        .map_err(|(code, msg)| Fallback::mongo(code, msg))?
+                }));
+            }
+        }
+    }
     let Bson::String(s) = &s else {
         return Err(wrong_type(
             first_code,
@@ -10095,12 +10297,12 @@ fn op_substr_bytes(arg: &Bson, ctx: &Ctx) -> R {
             ),
         ));
     }
-    let s = coerce_to_string(&s)?;
+    let s = coerce_to_bytes(&s)?;
     let start_v = eval(&a[1], ctx)?;
     let length_v = eval(&a[2], ctx)?;
     let start = substr_bytes_index(&start_v, 16034, "starting index", &a[1], ctx)?;
     let length = substr_bytes_index(&length_v, 16035, "length", &a[2], ctx)?;
-    let bytes = s.as_bytes();
+    let bytes = s.as_slice();
     let blen = bytes.len() as i64;
     // A negative start is refused; a negative length means "to the end".
     // These four refusals deferred; mongod's texts, double space and all,
@@ -10143,12 +10345,10 @@ fn op_substr_bytes(arg: &Bson, ctx: &Ctx) -> R {
     } else {
         &bytes[s_i as usize..e_i as usize]
     };
-    // Python decodes with errors='replace'; we only handle clean UTF-8 and defer
-    // on a broken boundary (replacement granularity can differ from Python's).
-    match std::str::from_utf8(slice) {
-        Ok(st) => Ok(Bson::String(st.to_string())),
-        Err(_) => Err(Fallback::Defer),
-    }
+    // The bytes in range, as mongod returns them: the checks above keep a
+    // valid string's slice valid, and a string that is not UTF-8 keeps its
+    // bytes (RM-222).
+    Ok(bytes_string(slice.to_vec()))
 }
 
 /// The code points `$trim` / `$ltrim` / `$rtrim` strip when no `chars` is
@@ -10196,6 +10396,42 @@ fn op_trim(arg: &Bson, ctx: &Ctx, side: TrimSide) -> R {
             ),
         )
     };
+    // A string that is not UTF-8 in the input or the `chars` (RM-222): trim
+    // the bytes, splitting `chars` into code points as mongod does.
+    if invalid_utf8(&input).is_some()
+        || d.get("chars")
+            .is_some_and(|e| matches!(eval(e, ctx), Ok(ref v) if invalid_utf8(v).is_some()))
+    {
+        let Some(s) = str_bytes(&input) else {
+            return Err(refuse(50699, "its input", &input));
+        };
+        let chars = match d.get("chars") {
+            Some(e) => eval(e, ctx)?,
+            None => Bson::String(TRIM_WHITESPACE.iter().collect()),
+        };
+        if is_null(&chars) {
+            return Ok(Bson::Null);
+        }
+        let Some(cb) = str_bytes(&chars) else {
+            return Err(refuse(50700, "'chars'", &chars));
+        };
+        // mongod names the three operators together here (measured 8.2.11,
+        // 2026-10-27).
+        let points = crate::rawstr::trim_code_points(cb).map_err(|(code, msg)| {
+            Fallback::mongo(
+                code,
+                format!("Failed to parse \"chars\" argument to $trim/$ltrim/$rtrim: {msg}"),
+            )
+        })?;
+        let (left, right) = match side {
+            TrimSide::Both => (true, true),
+            TrimSide::Left => (true, false),
+            TrimSide::Right => (false, true),
+        };
+        return Ok(bytes_string(
+            crate::rawstr::trim(s, &points, left, right).to_vec(),
+        ));
+    }
     let Bson::String(s) = input else {
         return Err(refuse(50699, "its input", &input));
     };
@@ -10277,6 +10513,11 @@ fn op_array_to_object(arg: &Bson, ctx: &Ctx) -> R {
                         ),
                     ));
                 };
+                // A key that is not UTF-8 names the field of those bytes (RM-222).
+                if let Some(b) = invalid_utf8(k) {
+                    out.insert(crate::bsondoc::escape_key(b), v.clone());
+                    continue;
+                }
                 let Bson::String(k) = k else {
                     return Err(Fallback::mongo(
                         40394,
@@ -10305,6 +10546,10 @@ fn op_array_to_object(arg: &Bson, ctx: &Ctx) -> R {
                             pair.len()
                         ),
                     ));
+                }
+                if let Some(b) = invalid_utf8(&pair[0]) {
+                    out.insert(crate::bsondoc::escape_key(b), pair[1].clone());
+                    continue;
                 }
                 let Bson::String(k) = &pair[0] else {
                     return Err(Fallback::mongo(

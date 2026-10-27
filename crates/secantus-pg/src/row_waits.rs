@@ -58,12 +58,15 @@ pub fn wrote_collection(pid: i32, pred: impl Fn(&str, &str) -> bool) -> bool {
     })
 }
 
-/// `pid`'s transaction ended: it holds no rows.
+/// `pid`'s transaction ended: it holds no rows, and no session waits on
+/// it for one (`lock_manager::released`) once this returns -- before the
+/// COMMIT or ROLLBACK answers, as in PostgreSQL.
 pub fn forget(pid: i32) {
     holders()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&pid);
+    crate::lock_manager::released(pid, crate::lock_manager::WaitKind::TransactionId);
 }
 
 /// The lock strength the row wait of this thread is for: a statement that
@@ -161,9 +164,10 @@ impl Waiting {
         }
     }
 
-    /// Record whom `pid` now waits on.
-    pub fn set(&self, blockers: Vec<i32>) {
-        self.guard.set(blockers);
+    /// Read whom `pid` waits on with `holders` and record it in one step
+    /// (`lock_manager::WaitGuard::set_with`); returns the holders.
+    pub fn set_with(&self, holders: impl FnOnce() -> Vec<i32>) -> Vec<i32> {
+        self.guard.set_with(holders)
     }
 
     /// Does this wait close a cycle: a session it waits on waiting, directly
