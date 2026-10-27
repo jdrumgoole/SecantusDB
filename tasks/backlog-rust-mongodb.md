@@ -604,6 +604,26 @@ These are explicit non-goals. Don't add them without a reason.
       Backlog-ID: RM-364
       Verify: tests/backlog/test_rm_355_364.py::test_a_transaction_statement_counts_its_updates
 
+- [ ] **Counting what an operation examined costs every operation.** Since
+      RM-023 (#2208, 2026-10-27) every operation counts the keys and
+      documents it examines through the streaming executor and reads
+      WiredTiger's `statistics:session` for each session it used, whatever
+      `slowms` is (whether an operation is slow is known only at its end).
+      Release-build A/B against the build before, both servers running and
+      alternated round by round at load 2-6: `find_one` by `_id` +20%, an
+      index-range `find` +12%, `count` +28%, `update_one` +54%; of each,
+      10-14 points are the statistics read (about 1.5 us per session) and
+      the key counting, the rest the count and write paths now running
+      mongod's plan through the executor instead of the store's own count
+      or read. Levers that keep the model: read the session statistics
+      without opening a cursor; drop `count`'s third planning; let a
+      one-document write whose plan reads in the store's order take the
+      store's read. Counting only while the profiler or a low `slowms` is
+      armed would be a stand-in (a slow operation under the default would
+      log without counts): Joe's call, not taken. **Decided (Joe,
+      2026-10-27):** merge the faithful model and work the cost down.
+      Backlog-ID: RM-365
+      Verify: none -- a latency budget (A/B timings against the build before #2208)
 - [ ] **mongod's connection lines this server does not write.** Since
   RM-302 the log is mongod's structured log, and the lines this server
   writes -- `MongoDB starting`, `Waiting for connections`, `Connection
