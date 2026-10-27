@@ -2528,6 +2528,32 @@ def test_a_descending_order_by_under_a_limit_over_two_tables(pg: Any) -> None:
     assert got == ("ok", [(132, 6), (279, 6), (90, 6), (125, 6), (118, 6)])
 
 
+@pytest.mark.backlog("RP-307")
+def test_an_aggregate_over_a_joined_subquery_keeps_its_limit(pg: Any) -> None:
+    """PostgreSQL 15.19, two 20-row tables (`i, i%7, i%5` and `i, i%5,
+    i%3`): the join has 18 rows, and a FROM subquery's LIMIT 3 or OFFSET 15
+    leaves 3 for the aggregate above it. The aggregate path planned the
+    join through `plan_join_select`, whose `JoinSelect` has no limit or
+    offset, so both were parsed and dropped: 18."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp307_m0 (a int, b int, c int)")
+        pg.execute("create table rp307_m1 (a int, b int, c int)")
+        pg.execute("insert into rp307_m0 select i, i % 7, i % 5 from generate_series(1, 20) i")
+        pg.execute("insert into rp307_m1 select i, i % 5, i % 3 from generate_series(1, 20) i")
+        join = (
+            "select rp307_m0.a, rp307_m1.a as a1"
+            " from rp307_m0 join rp307_m1 on rp307_m0.b = rp307_m1.a"
+        )
+        got = [
+            pg_answer(pg, f"select count(*) from ({join} limit 3) s"),
+            pg_answer(pg, f"select count(*) from ({join} offset 15) s"),
+        ]
+    finally:
+        pg.execute("rollback")
+    assert got == [("ok", [(3,)]), ("ok", [(3,)])]
+
+
 # RP-047: the lock manager. Each test needs two sessions on one server, so
 # it opens its own connections to the module's `rust_pg`; the expected
 # values were measured on PostgreSQL 15.19 with two sessions on a private
